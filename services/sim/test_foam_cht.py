@@ -81,6 +81,10 @@ def test_multi_solid_seam():
     # per-solid kappa landed
     assert "kappa 8" in (c / "constant/board/thermophysicalProperties").read_text()
     assert "kappa 60" in (c / "constant/u1/thermophysicalProperties").read_text()
+    # Real thermal mass is written; the old rho=10/Cp=10 shortcut produced false steady fields.
+    thermo = (c / "constant/u1/thermophysicalProperties").read_text()
+    assert "rho 2700" in thermo
+    assert "Cp 900" in thermo
 
 
 def test_solid_validation_errors():
@@ -92,6 +96,15 @@ def test_solid_validation_errors():
             {"name": "x", "stl_path": stl}, {"name": "x", "stl_path": stl}])
     with pytest.raises(ValueError, match="no stl_path"):
         foam_cht.build_cht_case(tempfile.mkdtemp(), solids=[{"name": "y"}])
+    with pytest.raises(ValueError, match="positive total heat"):
+        foam_cht.build_cht_case(tempfile.mkdtemp(), solids=[
+            {"name": "passive", "stl_path": stl, "power_w": 0.0}])
+    with pytest.raises(ValueError, match="conductivity"):
+        foam_cht.build_cht_case(tempfile.mkdtemp(), solids=[
+            {"name": "bad", "stl_path": stl, "power_w": 1.0, "kappa_w_mk": 0.0}])
+    with pytest.raises(ValueError, match="absolute zero"):
+        foam_cht.build_cht_case(
+            tempfile.mkdtemp(), stl, inlet_temp_c=-300.0, power_w=1.0)
 
 
 def test_region_name_sanitization():

@@ -5,9 +5,11 @@
 
 #include <cmath>
 #include <map>
+#include <limits>
 #include <stdexcept>
 
 #include "hydraulic/schema.h"
+#include "piping/fluid_properties.h"
 #include "piping/schema.h"
 #include "piping/simhandoff.h"
 
@@ -41,17 +43,27 @@ ojson hydraulic_oil() {
 
 ojson estimate_line_dp(double flow_lpm, double id_mm, double length_mm, double rho,
                        double mu, double eps_m) {
-    if (flow_lpm <= 0 || id_mm <= 0 || length_mm <= 0) {
+    if (!std::isfinite(flow_lpm) || !std::isfinite(id_mm) ||
+        !std::isfinite(length_mm) || flow_lpm <= 0 || id_mm <= 0 ||
+        length_mm <= 0) {
         ojson out = ojson::object();
         out["ok"] = false;
-        out["reason"] = "flow_lpm, id_mm, length_mm must all be > 0";
+        out["reason"] = "flow_lpm, id_mm, length_mm must all be finite and > 0";
         return out;
+    }
+    if (!std::isfinite(rho) || !std::isfinite(mu) || !std::isfinite(eps_m) ||
+        rho <= 0 || mu <= 0 || eps_m < 0) {
+        return pyutil::jerr("rho and mu must be finite and > 0; eps_m must be finite and >= 0");
     }
     const double d_m = id_mm / 1000.0;
     const double area = M_PI / 4.0 * d_m * d_m;
     const double q_m3s = flow_lpm / 60000.0;
     const double v = q_m3s / area;
     const double re = rho * v * d_m / mu;
+    if (!std::isfinite(area) || area <= 0 || !std::isfinite(q_m3s) ||
+        !std::isfinite(v) || v <= 0 || !std::isfinite(re) || re <= 0) {
+        return pyutil::jerr("line pressure-drop calculation overflowed");
+    }
     double f;
     std::string regime;
     if (re < 2300.0) {
@@ -62,6 +74,9 @@ ojson estimate_line_dp(double flow_lpm, double id_mm, double length_mm, double r
         regime = "turbulent (Swamee-Jain)";
     }
     const double dp_pa = f * (length_mm / 1000.0) / d_m * 0.5 * rho * v * v;
+    if (!std::isfinite(f) || f <= 0 || !std::isfinite(dp_pa) || dp_pa < 0) {
+        return pyutil::jerr("line pressure-drop calculation overflowed");
+    }
     ojson out = ojson::object();
     out["ok"] = true;
     out["velocity_ms"] = pyround(v, 4);
@@ -81,8 +96,10 @@ ojson line_spec(const ojson& hose, const ojson& override_map, double default_id_
     auto pick = [&](const char* key, double def) {
         ojson v = override_map.is_object() ? override_map.value(key, ojson(nullptr))
                                            : ojson(nullptr);
-        if (v.is_null()) v = hose.value(key, ojson(nullptr));
-        return v.is_null() ? def : pyutil::to_double(v);
+        if (v.is_null() && hose.is_object()) v = hose.value(key, ojson(nullptr));
+        if (v.is_null()) return def;
+        return v.is_number() ? v.get<double>()
+                             : std::numeric_limits<double>::quiet_NaN();
     };
     ojson out = ojson::object();
     out["id_mm"] = pick("id_mm", default_id_mm);
@@ -102,9 +119,9 @@ ojson hoses_to_piping(const ojson& hyd_doc, double flow_lpm, double supply_press
     if (hoses.empty()) {
         return pyutil::jerr("hydraulic circuit has no hoses", "call hydraulic_add_hose first");
     }
-    const ojson overrides = lines.is_object() ? lines : ojson::object();
-    ojson fl = py_truthy(fluid) ? fluid : hydraulic_oil();
-
+    const ojson raw_fluid = py_truthy(fluid) ? fluid : hydraulic_oil();
+    ojson fl = piping::resolve_solver_fluid(raw_fluid);
+    if (!fl.value("ok", true) && fl.contains("reason")) return fl;
     ojson pdoc = piping::new_piping(
         py_str(hyd_doc.value("name", ojson("Hydraulic"))) + " - hose runs");
     ojson boundary = ojson::array();
@@ -116,13 +133,24 @@ ojson hoses_to_piping(const ojson& hyd_doc, double flow_lpm, double supply_press
     int i = 0;
     for (const auto& hose : hoses) {
         const ojson hose_id = hose.value("id", ojson(nullptr));
-        const ojson ov = overrides.is_object() && hose_id.is_string() &&
-                                 overrides.contains(hose_id.get<std::string>()) &&
-                                 py_truthy(overrides[hose_id.get<std::string>()])
-                             ? overrides[hose_id.get<std::string>()]
+        const ojson ov = lines.is_object() && hose_id.is_string() &&
+                                 lines.contains(hose_id.get<std::string>()) &&
+                                 py_truthy(lines[hose_id.get<std::string>()])
+                             ? lines[hose_id.get<std::string>()]
                              : ojson::object();
         const ojson spec =
             line_spec(hose, ov, default_id_mm, default_length_mm, flow_lpm);
+        const double id_mm = spec["id_mm"].get<double>();
+        const double length_mm = spec["length_mm"].get<double>();
+        const double line_flow_lpm = spec["flow_lpm"].get<double>();
+        if (!std::isfinite(id_mm) || id_mm <= 0 ||
+            !std::isfinite(length_mm) || length_mm <= 0 ||
+            !std::isfinite(line_flow_lpm) || line_flow_lpm <= 0) {
+            return pyutil::jerr(
+                "hose " + py_str(hose_id) +
+                " has invalid line geometry/flow",
+                "id_mm, length_mm, and flow_lpm must each be finite and > 0");
+        }
         const std::string rid = piping::next_id(pdoc, "r");
         const double y = i * kLineSpacingMm;
         const ojson name = hose.value("net_name", ojson(nullptr));
@@ -130,25 +158,33 @@ ojson hoses_to_piping(const ojson& hyd_doc, double flow_lpm, double supply_press
             rid,
             ojson::array({ojson::array({0.0, y, 0.0}),
                           ojson::array({spec["length_mm"], y, 0.0})}),
-            pyround(spec["id_mm"].get<double>() / 25.4, 4), "40",
-            py_truthy(name) ? name.get<std::string>() : rid, spec["id_mm"]);
+            pyround(id_mm / 25.4, 4), "40",
+            py_truthy(name) && name.is_string() ? name.get<std::string>() : rid, id_mm);
+        run["connections"] = hose.value("connections", ojson::array());
         pdoc["runs"].push_back(std::move(run));
-        const double q_m3h = spec["flow_lpm"].get<double>() * 60.0 / 1000.0;
+        const double q_m3h = line_flow_lpm * 60.0 / 1000.0;
         boundary.push_back({{"run", rid}, {"end", "start"}, {"pressure", supply_kpa}});
         boundary.push_back({{"run", rid}, {"end", "end"}, {"demand", q_m3h}});
         const ojson est = estimate_line_dp(
-            spec["flow_lpm"].get<double>(), spec["id_mm"].get<double>(),
-            spec["length_mm"].get<double>(), num(fl.value("rho", ojson(870.0)), 870.0),
-            num(fl.value("mu", ojson(0.0278)), 0.0278));
+            line_flow_lpm, id_mm, length_mm,
+            num(fl.value("rho", ojson(nullptr))),
+            num(fl.value("mu", ojson(nullptr))));
         if (!est.value("ok", false)) {
             warnings.push_back(py_str(hose_id) +
                                ": estimate failed: " + est.value("reason", std::string()));
+        }
+        if (est.value("ok", false) && est["velocity_ms"].get<double>() > 5.0) {
+            warnings.push_back(
+                py_str(hose_id) + ": velocity " +
+                fmt_f(est["velocity_ms"].get<double>(), 2) +
+                " m/s exceeds the 5 m/s general hydraulic-line advisory limit");
         }
         estimates[rid] = est;
         ojson row = ojson::object();
         row["hose_id"] = hose_id;
         row["net_name"] = hose.value("net_name", ojson(nullptr));
         row["run_id"] = rid;
+        row["connections"] = hose.value("connections", ojson::array());
         pyutil::update(row, spec);
         row["flow_m3h"] = pyround(q_m3h, 6);
         line_rows.push_back(std::move(row));
@@ -187,7 +223,7 @@ ojson piping_handoff_envelope(const ojson& hyd_doc, const ojson& net,
         conditions.push_back(sh::condition(
             rid + "_flow", "flow", row["flow_m3h"], "m3/h",
             "hydraulic hose " + py_str(row["hose_id"]) + " (" +
-                py_str(row["net_name"]) + ") flow_lpm",
+                py_str(row["net_name"]) + ") flow_lpm converted by x0.06 to m3/h",
             rid));
         const ojson est = net["estimates"].value(rid, ojson::object());
         if (est.value("ok", false)) {
@@ -205,6 +241,9 @@ ojson piping_handoff_envelope(const ojson& hyd_doc, const ojson& net,
     meta["boundary"] = net["boundary"];
     meta["fluid"] = net["fluid"];
     meta["lines"] = net["lines"];
+    meta["topology_model"] =
+        "independent_hose_line_cases (each run has its own fixed-pressure start "
+        "and prescribed-flow end; component-port continuity is provenance only)";
     return sh::build_handoff(
         "hydraulic_to_piping",
         sh::study_ref("hydraulic", "hydraulic_piping_handoff",
@@ -249,13 +288,21 @@ std::pair<ojson, ojson> verify_piping_envelope(const ojson& handoff,
         links[lk.value("id", std::string())] = lk;
     ojson checks = ojson::array();
     for (const auto& exp : handoff.value("expectations", ojson::array())) {
-        const std::string q = exp["quantity"].get<std::string>();
+        const std::string q = exp.value("quantity", std::string());
         const std::string rid =
             q.find(':') != std::string::npos ? q.substr(q.find(':') + 1) : q;
         auto it = links.find(rid);
-        if (it == links.end()) continue;
-        const double solved = std::abs(num(it->second.value("dp_kpa", ojson(0.0))));
-        const double est = pyutil::to_double(exp["value"]);
+        const ojson est_j = exp.value("value", ojson(nullptr));
+        if (it == links.end() || !est_j.is_number() ||
+            !std::isfinite(est_j.get<double>()) ||
+            !it->second.value("dp_kpa", ojson(nullptr)).is_number() ||
+            !std::isfinite(it->second["dp_kpa"].get<double>())) {
+            checks.push_back(
+                sh::check(q, "kPa", est_j, nullptr, nullptr, tolerance_pct, false));
+            continue;
+        }
+        const double solved = std::abs(it->second["dp_kpa"].get<double>());
+        const double est = est_j.get<double>();
         const double base = std::max(std::abs(solved), 1e-9);
         const double dev = std::abs(solved - est) / base * 100.0;
         checks.push_back(sh::check(q, "kPa", est, pyround(solved, 4), pyround(dev, 2),
@@ -296,14 +343,20 @@ ojson cylinder_mount_forces(double bore_mm, double rod_mm, double max_pressure_b
 }
 
 std::vector<double> unit3(const ojson& axis) {
-    const ojson src = axis.is_array() ? axis : ojson::array({0.0, 0.0, 1.0});
+    const ojson src = axis.is_null() ? ojson::array({0.0, 0.0, 1.0}) : axis;
+    if (!src.is_array() || src.size() != 3)
+        throw std::runtime_error("axis must be a 3-vector");
     std::vector<double> v;
-    for (const auto& c : src) v.push_back(pyutil::to_double(c));
-    if (v.size() != 3) throw std::runtime_error("axis must be a 3-vector");
+    for (const auto& c : src) {
+        if (!c.is_number() || !std::isfinite(c.get<double>()))
+            throw std::runtime_error("axis components must be finite numbers");
+        v.push_back(c.get<double>());
+    }
     double n = 0.0;
     for (double c : v) n += c * c;
     n = std::sqrt(n);
-    if (n <= 0) throw std::runtime_error("axis must be non-zero");
+    if (!std::isfinite(n) || n <= 0)
+        throw std::runtime_error("axis must be non-zero");
     for (double& c : v) c /= n;
     return v;
 }
@@ -373,48 +426,99 @@ ojson verify_fea_envelope(const ojson& handoff, double tolerance_pct,
     const ojson meta = handoff.value("meta", ojson(nullptr)).is_object()
                            ? handoff["meta"]
                            : ojson::object();
-    const ojson f = cylinder_mount_forces(
-        pyutil::to_double(meta.at("bore_mm")),
-        meta.value("rod_mm", ojson(0.0)).get<double>(),
-        pyutil::to_double(meta.at("max_pressure_bar")),
-        meta.value("efficiency", ojson(1.0)).get<double>());
-    std::map<std::string, double> want = {
-        {"extend_max_pressure", f["extend_n"].get<double>()},
-        {"retract_max_pressure", f["retract_n"].get<double>()},
+    auto finite_meta = [&](const char* key, double def, bool required) {
+        const ojson value = meta.value(key, required ? ojson(nullptr) : ojson(def));
+        return value.is_number() && std::isfinite(value.get<double>())
+                   ? value.get<double>()
+                   : std::numeric_limits<double>::quiet_NaN();
     };
-    const ojson axis = meta.value("axis", ojson(nullptr));
+    const double bore = finite_meta("bore_mm", 0.0, true);
+    const double rod = finite_meta("rod_mm", 0.0, false);
+    const double pressure = finite_meta("max_pressure_bar", 0.0, true);
+    const double efficiency = finite_meta("efficiency", 1.0, false);
+
     ojson checks = ojson::array();
     ojson warnings = ojson::array();
-    for (const auto& cond : handoff.value("conditions", ojson::array())) {
-        const ojson case_j = cond.value("case", ojson(nullptr));
-        if (cond.value("kind", ojson(nullptr)) != "force" || !case_j.is_string() ||
-            !want.count(case_j.get<std::string>()))
-            continue;
-        const std::string case_s = case_j.get<std::string>();
-        const ojson vec = cond["value"];
-        double mag = 0.0;
-        for (const auto& c : vec) {
-            const double d = pyutil::to_double(c);
-            mag += d * d;
+    if (!std::isfinite(bore) || !std::isfinite(rod) ||
+        !std::isfinite(pressure) || !std::isfinite(efficiency) ||
+        bore <= 0 || rod < 0 || rod >= bore || pressure <= 0 ||
+        efficiency <= 0 || efficiency > 1) {
+        checks.push_back(sh::check("handoff_metadata", "1", meta, nullptr, nullptr,
+                                   tolerance_pct, false));
+    } else {
+        const ojson f = cylinder_mount_forces(bore, rod, pressure, efficiency);
+        const std::map<std::string, double> want = {
+            {"extend_max_pressure", f["extend_n"].get<double>()},
+            {"retract_max_pressure", f["retract_n"].get<double>()},
+        };
+
+        std::vector<double> axis;
+        bool axis_ok = true;
+        try {
+            if (!meta.contains("axis"))
+                throw std::runtime_error("axis is missing");
+            axis = unit3(meta.value("axis", ojson(nullptr)));
+        } catch (const std::exception& e) {
+            axis_ok = false;
+            warnings.push_back(std::string("invalid cylinder axis provenance: ") + e.what());
+            checks.push_back(sh::check("cylinder_axis", "1",
+                                       meta.value("axis", ojson(nullptr)), nullptr,
+                                       nullptr, tolerance_pct, false));
         }
-        mag = std::sqrt(mag);
-        const double expect = want[case_s];
-        const double dev = std::abs(mag - expect) / std::max(expect, 1e-9) * 100.0;
-        checks.push_back(sh::check("mount_force:" + case_s, "N", pyround(expect, 3),
-                                   pyround(mag, 3), pyround(dev, 3), tolerance_pct,
-                                   dev <= tolerance_pct));
-        if (py_truthy(axis) && mag > 0) {
-            double dot = 0.0;
-            for (size_t k = 0; k < axis.size() && k < vec.size(); ++k)
-                dot += pyutil::to_double(axis[k]) * pyutil::to_double(vec[k]);
-            const double cosang = std::abs(dot) / mag;
-            if (cosang < 0.999) {
-                warnings.push_back(case_s +
-                                   ": force vector not colinear with cylinder axis (|cos| = " +
-                                   fmt_f(cosang, 4) + ")");
+
+        std::map<std::string, std::vector<ojson>> vectors;
+        for (const auto& cond : handoff.value("conditions", ojson::array())) {
+            const ojson case_j = cond.value("case", ojson(nullptr));
+            if (cond.value("kind", ojson(nullptr)) == "force" &&
+                case_j.is_string() && want.count(case_j.get<std::string>())) {
+                vectors[case_j.get<std::string>()].push_back(
+                    cond.value("value", ojson(nullptr)));
+            }
+        }
+
+        for (const auto& [case_s, expect] : want) {
+            const auto it = vectors.find(case_s);
+            const bool one = it != vectors.end() && it->second.size() == 1;
+            const ojson vec = one ? it->second.front() : ojson(nullptr);
+            bool vector_ok = vec.is_array() && vec.size() == 3;
+            double mag2 = 0.0;
+            if (vector_ok) {
+                for (const auto& c : vec) {
+                    if (!c.is_number() || !std::isfinite(c.get<double>())) {
+                        vector_ok = false;
+                        break;
+                    }
+                    mag2 += c.get<double>() * c.get<double>();
+                }
+            }
+            if (!one || !vector_ok || !std::isfinite(mag2)) {
+                checks.push_back(sh::check("mount_force:" + case_s, "N",
+                                           pyround(expect, 3), nullptr, nullptr,
+                                           tolerance_pct, false));
+                continue;
+            }
+            const double mag = std::sqrt(mag2);
+            const double dev =
+                std::abs(mag - expect) / std::max(expect, 1e-9) * 100.0;
+            checks.push_back(sh::check("mount_force:" + case_s, "N",
+                                       pyround(expect, 3), pyround(mag, 3),
+                                       pyround(dev, 3), tolerance_pct,
+                                       dev <= tolerance_pct));
+            if (axis_ok && mag > 0) {
+                double dot = 0.0;
+                for (size_t k = 0; k < axis.size(); ++k)
+                    dot += axis[k] * vec[k].get<double>();
+                const double cosang = std::abs(dot) / mag;
+                if (cosang < 0.999) {
+                    warnings.push_back(
+                        case_s +
+                        ": force vector not colinear with cylinder axis (|cos| = " +
+                        fmt_f(cosang, 4) + ")");
+                }
             }
         }
     }
+
     bool ok = !checks.empty();
     for (const auto& c : checks) ok = ok && c["pass"].get<bool>();
     const std::string verdict =
@@ -422,11 +526,10 @@ ojson verify_fea_envelope(const ojson& handoff, double tolerance_pct,
                  " mount-load case force magnitudes match the independent area x pressure "
                  "recompute within " +
                  py_str(tolerance_pct) + "%"
-           : "FAIL: mount-load force magnitude(s) deviate from the independent area x "
-             "pressure recompute";
+           : "FAIL: mount-load cases are missing, ambiguous, invalid, or deviate from the "
+             "independent area x pressure recompute";
     ojson advisories = nullptr;
     if (fea_result.is_object()) {
-        // fea_result.get("summary") or fea_result — a falsy summary falls back.
         const ojson summ_j = fea_result.value("summary", ojson(nullptr));
         const ojson summ = py_truthy(summ_j) ? summ_j : fea_result;
         ojson detail = ojson::object();
@@ -442,7 +545,8 @@ ojson verify_fea_envelope(const ojson& handoff, double tolerance_pct,
                             sh::study_ref("hydraulic", "hydraulic_fea_handoff"),
                             sh::study_ref("fea", "run_fea_static", nullptr, nullptr,
                                           handoff.value("id", ojson(nullptr))),
-                            checks, verdict, handoff.value("id", ojson(nullptr)), advisories,
+                            checks, verdict, handoff.value("id", ojson(nullptr)),
+                            advisories,
                             warnings.empty() ? ojson(nullptr) : warnings);
 }
 

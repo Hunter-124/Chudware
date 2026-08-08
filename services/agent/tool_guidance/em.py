@@ -6,31 +6,34 @@ from typing import Any
 ENTRIES: dict[str, dict[str, Any]] = {
     "em_status": {
         "prompt_note": (
-            "EM preflight: call before planning a full-wave run — reports whether "
-            "openEMS is installed and the default solver per analysis. Never fails."
+            "Capability probe before requesting full-wave work. builtin-fdfd eigenmode and "
+            "analytic-uniform driven/time-domain are expected built-ins; inspect solvers/defaults. "
+            "openEMS installed=false means full-wave is unavailable, never a successful fallback."
         ),
     },
     "em_eigenmode": {
         "prompt_note": (
-            "Needs standard='WR-90' or a waveguide JSON dict — empty cross-section "
-            "errors. fdfd runtime grows with resolution (40..200 sane); follow with "
-            "em_driven for S-params."
+            "Requires standard='WR-90' or waveguide JSON {shape,a_mm,b_mm,eps_r?}; default "
+            "solver is builtin-fdfd. Frequencies are GHz in the result. Refine resolution and "
+            "require TE10 error_vs_analytic_pct to settle before quoting cutoff; detail=True "
+            "includes field data."
         ),
         "timeout_s": 300,
     },
     "em_driven": {
         "prompt_note": (
-            "Analytic-uniform default is an ideal matched straight section — it shows "
-            "no mismatch/discontinuities. solver='openems' for real full-wave (check "
-            "em_status first); detail=True for full arrays."
+            "Uniform-guide default is analytic-uniform: ideal matched S21 propagation, not "
+            "evidence for a discontinuity or antenna. Frequencies are GHz, length is mm. "
+            "Call em_status before solver='openems'; absent openEMS returns ok:false/skipped. "
+            "detail=True returns full S-parameter arrays."
         ),
         "timeout_s": 600,
     },
     "em_timedomain": {
         "prompt_note": (
-            "For pulse delay/dispersion through a guide, not S-params (that's "
-            "em_driven). f0_ghz/bw_ghz=0 auto-derives the band from cutoff; raw "
-            "waveforms only with detail=True."
+            "Uniform-guide pulse delay/dispersion, not an S-parameter sweep. length is mm and "
+            "f0_ghz/bw_ghz are GHz; zero values auto-derive a band. Default is analytic "
+            "dispersive IFFT. Check em_status before openEMS; detail=True returns waveforms."
         ),
         "timeout_s": 600,
     },
@@ -43,9 +46,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "ecad_antenna_analyze": {
         "prompt_note": (
-            "Default want_fullwave=True runs a real FDTD S11 sweep when openEMS is "
-            "installed (minutes) — pass False for a fast analytic estimate; check "
-            "em_status first."
+            "Always returns a closed-form resonance estimate. want_fullwave=True additionally "
+            "uses openEMS only when installed; otherwise fullwave.skipped is evidence of no "
+            "full-wave result, not PASS. Frequencies are Hz. Refine n_freq/max_timesteps and "
+            "check the full-wave block before trusting S11."
         ),
         "timeout_s": 600,
     },

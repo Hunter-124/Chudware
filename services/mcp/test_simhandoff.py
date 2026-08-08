@@ -191,6 +191,52 @@ def test_validator_verify_rules():
     _assert_invalid(env4, "$.verdict")
 
 
+def test_handoff_rejects_non_finite_physical_values():
+    env = _handoff()
+    env["conditions"][0]["value"] = float("nan")
+    _assert_invalid(env, "$.conditions[0].value")
+    env2 = _handoff()
+    env2["expectations"][0]["value"] = float("inf")
+    _assert_invalid(env2, "$.expectations[0].value")
+    env3 = _verify()
+    env3["checks"][0]["source_value"] = float("nan")
+    _assert_invalid(env3, "$.checks[0].source_value")
+
+
+def test_check_builder_refuses_boolean_coercion_and_inconsistent_pass():
+    with pytest.raises(ValueError, match="boolean"):
+        sh.check("stress", "MPa", 1.0, 1.1, 10.0, 20.0, "false")
+    with pytest.raises(ValueError, match="contradicts"):
+        sh.check("stress", "MPa", 1.0, 2.0, 100.0, 20.0, True)
+
+
+def test_validator_checks_individual_pass_math_and_meaningful_geometry_refs():
+    env = _verify()
+    env["checks"][0]["pass"] = False
+    _assert_invalid(env, "contradicts deviation_pct")
+    handoff = _handoff()
+    handoff["geometry"][0]["path"] = ""
+    _assert_invalid(handoff, "non-empty path/doc_id/inline")
+
+
+def test_builders_refuse_empty_provenance_and_geometry_payloads():
+    with pytest.raises(ValueError, match="at least one"):
+        sh.geometry_ref("domain", "stl")
+    with pytest.raises(ValueError, match="non-empty"):
+        sh.study_ref(" ", "run")
+    with pytest.raises(ValueError, match="condition.value"):
+        sh.condition("fixture", "fixed", True, "1", "caller")
+
+
+
+def test_digest_and_metadata_allow_json_flags_but_reject_non_finite_numbers():
+    ref = sh.study_ref("cfd", "run", result_digest={"converged": True, "cd": 0.2})
+    assert ref["result_digest"]["converged"] is True
+    with pytest.raises(ValueError, match="finite"):
+        sh.study_ref("cfd", "run", result_digest={"cd": float("nan")})
+    with pytest.raises(ValueError, match="finite"):
+        sh.geometry_ref("domain", "inline", inline={"bbox": [0, float("inf")]})
+
 def test_attach_valid_and_invalid():
     res = {"ok": True, "x": 1}
     out = sh.attach(res, _verify())

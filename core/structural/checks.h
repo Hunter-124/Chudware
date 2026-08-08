@@ -25,6 +25,9 @@ struct CheckResult {
     std::string governing_limit;
     double dc_axial = 0.0;
     double dc_bending = 0.0;
+    double dc_bending_major = 0.0;
+    double dc_bending_minor = 0.0;
+    double dc_strength = 0.0;
 
     nlohmann::json to_dict() const;
 };

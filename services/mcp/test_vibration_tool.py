@@ -32,6 +32,9 @@ from mcp_server import cad_sim_tools  # T-RF8: run_fea_* tools live here now
 # ---------------------------------------------------------------------------
 
 def _fake_cb_call(method: str, params: dict | None = None) -> dict:
+    if method == "asm_world_bodies":
+        return {"bodies": [{"bbox": {"min": [0.0, 0.0, 0.0],
+                                     "max": [10.0, 10.0, 10.0]}}]}
     if method == "doc_export_step":
         return {"ok": True}
     if method == "sim_run_modal":
@@ -70,7 +73,12 @@ def freq_tool(monkeypatch):
     cad_tools.register_cad_tools(mcp)
     tool = mcp._tool_manager._tools.get("run_fea_frequency_response")
     assert tool is not None, "run_fea_frequency_response not registered"
-    return tool.fn
+
+    def one_mode_tool(*args, **kwargs):
+        kwargs.setdefault("n_modes", 1)
+        return tool.fn(*args, **kwargs)
+
+    return one_mode_tool
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +100,14 @@ def test_harmonic_response_spectrum(freq_tool):
     assert out["saved_to_study"] is True
 
 
-def test_default_sweep_is_200_points(freq_tool):
+def test_default_sweep_includes_log_grid_and_exact_modal_frequencies(freq_tool):
     out = json.loads(freq_tool(fixtures=["bottom"]))
     assert out["ok"] is True
-    assert len(out["harmonic"]["sweep_hz"]) == 200
-    assert out["harmonic"]["sweep_hz"][0] == pytest.approx(10.0)
-    assert out["harmonic"]["sweep_hz"][-1] == pytest.approx(2000.0)
+    sweep = out["harmonic"]["sweep_hz"]
+    assert len(sweep) == 201
+    assert sweep[0] == pytest.approx(10.0)
+    assert sweep[-1] == pytest.approx(2000.0)
+    assert 100.0 in sweep
 
 
 # ---------------------------------------------------------------------------

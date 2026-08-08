@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
@@ -10,8 +11,9 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <sstream>
-#include <thread>
+#include <utility>
 #include <unordered_set>
 
 #include "imgui.h"
@@ -349,21 +351,70 @@ static void clearTransientResult(Study &s) {
   s.summary.clear();
   s.banner.clear();
   s.resultSummary = nlohmann::json::object();
+  s.advResult = nlohmann::json::object();
   s.overlayPath.clear();
   s.freqs.clear();
+  s.frSweep.clear();
+  s.frAccel.clear();
   s.dragTrace.clear();
-  s.dragN = 0.0;
-  s.cd = 0.0;
-  s.frontalMm2 = 0.0;
+  s.dragN = s.liftN = s.sideN = 0.0;
+  s.cd = s.cl = s.ld = s.reynolds = 0.0;
+  s.frontalMm2 = s.refAreaMm2 = 0.0;
+  s.cpMin = s.cpMax = s.vmaxMps = 0.0;
+  s.flowFields.clear();
   s.solverNotes.clear();
+  s.nNodes = s.nElems = s.nDof = 0;
   // Motion study transient results.
   s.motionHasResult = false;
   s.motionPlaying = false;
   s.motionFrame = 0;
   s.motionLastTick = -1.0;
   s.motionTrajectory = nlohmann::json::array();
-  s.motionBodyNames.clear();
+  s.motionBodyIds.clear();
+  s.motionBodyLabels.clear();
   s.motionDriverUnit.clear();
+  s.motionRenderError.clear();
+}
+
+static bool studyReady(const Study &s, std::string &blocker);
+
+static bool finiteNumber(const nlohmann::json &j, const char *key, double &out) {
+  auto it = j.find(key);
+  if (it == j.end() || !it->is_number())
+    return false;
+  out = it->get<double>();
+  return std::isfinite(out);
+}
+
+// Same solid-content policy as the FeatureManager's require-non-empty guard: a loaded
+// viewport body wins, otherwise assemblies or non-reference features count. This lets a
+// free-free modal study reject an empty/sketch-only document before paying for an export.
+static bool hasSimulationGeometry(const AppState &st) {
+  if (!st.docBodyIds.empty())
+    return true;
+  const auto &tree = st.docMirror.tree();
+  if (!tree.is_object())
+    return false;
+  auto ci = tree.find("components");
+  if (ci != tree.end() && ci->is_array() && !ci->empty())
+    return true;
+  auto fi = tree.find("features");
+  if (fi == tree.end() || !fi->is_array())
+    return false;
+  for (const auto &f : *fi) {
+    if (!f.is_object() || f.value("suppressed", false))
+      continue;
+    const std::string type = f.value("type", std::string());
+    if (type.empty() || type == "plane" || type == "datum_plane" ||
+        type == "ref_plane" || type == "axis" || type == "datum_axis" ||
+        type == "ref_axis" || type == "point" || type == "datum_point" ||
+        type == "ref_point" || type == "csys" ||
+        type == "coordinate_system" || type == "ref_csys" ||
+        type == "sketch" || type == "sketch3d")
+      continue;
+    return true;
+  }
+  return false;
 }
 
 std::string SimWell::label() const {
@@ -480,15 +531,21 @@ std::string SimManager::addCustomMaterial(const Material &in) {
             {"yield_mpa", in.yield_mpa},
             {"ultimate_mpa", in.ultimate_mpa},
             {"endurance_mpa", in.endurance_mpa}};
-  // Ensure the directory exists, then write (best-effort).
+  // Ensure the directory exists, then verify the write before reporting the
+  // material as saved.
   try {
     std::filesystem::create_directories(
         std::filesystem::path(customMaterialsPath()).parent_path());
   } catch (...) {
+    return {};
   }
   std::ofstream o(customMaterialsPath(), std::ios::binary | std::ios::trunc);
-  if (o)
-    o << j.dump(2);
+  if (!o)
+    return {};
+  o << j.dump(2);
+  o.flush();
+  if (!o)
+    return {};
   materialsLoaded() = false; // force a merge-reload on next materials() access
   return key;
 }
@@ -854,6 +911,96 @@ double seBase(const Study &s, double matSe, double Sut) {
 }
 } // namespace
 
+namespace {
+bool simOriginActive(const AppState &st, const SimManager *manager,
+                     const std::string &docId) {
+  return st.simManager == manager && st.docMirror.hasDoc() &&
+         st.docMirror.docId() == docId;
+}
+
+bool simDocOpen(const AppState &st, const std::string &docId) {
+  return std::any_of(st.docTabs.begin(), st.docTabs.end(),
+                     [&](const AppState::DocTab &tab) {
+                       return tab.docId == docId;
+                     });
+}
+
+void markSimDocDirty(AppState &st, const std::string &docId) {
+  for (auto &tab : st.docTabs) {
+    if (tab.docId != docId)
+      continue;
+    tab.dirty = true;
+    tab.historyCleared = false;
+    if (tab.aiHandoff)
+      tab.userAdopted = true;
+    return;
+  }
+}
+bool simJsonBool(const nlohmann::json &value, const char *key,
+                 bool fallback) {
+  const auto it = value.find(key);
+  return it == value.end()
+             ? fallback
+             : (it->is_boolean() ? it->get<bool>() : false);
+}
+
+std::string simJsonText(const nlohmann::json &value, const char *primary,
+                        const char *secondary,
+                        const std::string &fallback) {
+  auto it = value.find(primary);
+  if (it != value.end() && it->is_string())
+    return it->get<std::string>();
+  it = value.find(secondary);
+  if (it != value.end() && it->is_string())
+    return it->get<std::string>();
+  return fallback;
+}
+
+std::string simPathSegment(std::string value) {
+  for (char &c : value) {
+    const unsigned char uc = static_cast<unsigned char>(c);
+    if (!std::isalnum(uc) && c != '-' && c != '_')
+      c = '_';
+  }
+  return value.empty() ? std::string("unknown") : value;
+}
+
+std::string staticModalStepPath(const std::string &docId,
+                                const std::string &studyId,
+                                std::uint64_t reservationToken) {
+  const std::string leaf =
+      "sim_" + simPathSegment(docId) + "_" + simPathSegment(studyId) + "_" +
+      std::to_string(reservationToken) + ".step";
+  // Relative paths are intentionally server-owned in daemon/WASM mode.
+  return engine::daemonMode() ? leaf : appdataAppDir() + "/cache/" + leaf;
+}
+} // namespace
+
+struct SimManager::StaticModalPrep {
+  struct Load {
+    bool pressure = false;
+    float vec[3] = {0.0f, 0.0f, -100.0f};
+    float pressureMpa = 0.1f;
+    std::vector<nlohmann::json> selectors;
+    std::vector<nlohmann::json> resolved;
+  };
+
+  core::SimClient *sim = nullptr;
+  std::uint64_t reservationToken = 0;
+  std::string docId;
+  std::string studyId;
+  std::string requestedStepPath;
+  std::string resolvedStepPath;
+  StudyType type = StudyType::Static;
+  int nModes = 6;
+  nlohmann::json material = nlohmann::json::object();
+  Study meshOptions;
+  std::vector<nlohmann::json> fixtureSelectors;
+  std::vector<nlohmann::json> fixtures;
+  std::vector<Load> loads;
+  std::size_t facesRemaining = 0;
+};
+
 // ---------------------------------------------------------------- ctor
 
 SimManager::SimManager() {}
@@ -1103,12 +1250,15 @@ void SimManager::refresh(AppState &st) {
   nlohmann::json res;
   std::string err;
   if (!st.worker.call("sim_study_list", {{"doc_id", st.docMirror.docId()}}, res,
-                      err, 15000)) {
-    st.addLog("[sim] sim_study_list failed: " + err);
+                      err, 15000) ||
+      !res.is_object() || res.contains("code") ||
+      !res.value("ok", true)) {
+    st.addLog("[sim] sim_study_list failed: " +
+              (res.is_object()
+                   ? res.value("message", res.value("error", err))
+                   : (err.empty() ? "invalid response" : err)));
     return;
   }
-  if (res.contains("code"))
-    return;
   // Preserve the transient (non-persisted) result fields across a refresh by
   // id.
   std::vector<Study> prev = std::move(studies_);
@@ -1122,14 +1272,27 @@ void SimManager::refresh(AppState &st) {
           s.banner = p.banner;
           s.dragTrace = p.dragTrace;
           s.resultSummary = p.resultSummary;
+          s.advResult = p.advResult;
           s.overlayPath = p.overlayPath;
           s.nNodes = p.nNodes;
           s.nElems = p.nElems;
           s.nDof = p.nDof;
           s.freqs = p.freqs;
+          s.frSweep = p.frSweep;
+          s.frAccel = p.frAccel;
           s.dragN = p.dragN;
+          s.liftN = p.liftN;
+          s.sideN = p.sideN;
           s.cd = p.cd;
+          s.cl = p.cl;
+          s.ld = p.ld;
+          s.reynolds = p.reynolds;
           s.frontalMm2 = p.frontalMm2;
+          s.refAreaMm2 = p.refAreaMm2;
+          s.cpMin = p.cpMin;
+          s.cpMax = p.cpMax;
+          s.vmaxMps = p.vmaxMps;
+          s.flowFields = p.flowFields;
           s.solverNotes = p.solverNotes;
           if (!p.summary.empty())
             s.summary = p.summary;
@@ -1137,9 +1300,12 @@ void SimManager::refresh(AppState &st) {
           s.motionHasResult = p.motionHasResult;
           s.motionPlaying = p.motionPlaying;
           s.motionFrame = p.motionFrame;
+          s.motionLastTick = p.motionLastTick;
           s.motionTrajectory = p.motionTrajectory;
           s.motionDriverUnit = p.motionDriverUnit;
-          s.motionBodyNames = p.motionBodyNames;
+          s.motionRenderError = p.motionRenderError;
+          s.motionBodyIds = p.motionBodyIds;
+          s.motionBodyLabels = p.motionBodyLabels;
           s.motionPlotBody = p.motionPlotBody;
           break;
         }
@@ -1152,20 +1318,31 @@ void SimManager::refresh(AppState &st) {
 }
 
 void SimManager::persist(AppState &st, Study &s) {
-  if (s.id.empty() || !st.docMirror.hasDoc())
+  if (!st.docMirror.hasDoc())
+    return;
+  persist(st, st.docMirror.docId(), s);
+}
+
+void SimManager::persist(AppState &st, const std::string &docId, Study &s) {
+  if (s.id.empty() || docId.empty())
     return;
   nlohmann::json res;
   std::string err;
-  nlohmann::json params = {{"doc_id", st.docMirror.docId()},
+  nlohmann::json params = {{"doc_id", docId},
                            {"study_id", s.id},
                            {"study", studyToJson(s)}};
   if (!st.worker.call("sim_study_edit", params, res, err, 15000) ||
-      res.contains("code")) {
-    st.addLog("[sim] sim_study_edit failed: " +
-              (res.contains("code") ? res.value("message", err) : err));
+      !res.is_object() || res.contains("code") ||
+      !res.value("ok", true)) {
+    st.addLog("[sim] sim_study_edit failed for " + docId + ": " +
+              (res.is_object()
+                   ? res.value("message", res.value("error", err))
+                   : (err.empty() ? "invalid response" : err)));
+    if (simOriginActive(st, this, docId))
+      st.toast(ui::ToastLevel::Error, "Could not save simulation setup");
     return;
   }
-  st.markActiveTabDirty();
+  markSimDocDirty(st, docId);
 }
 
 void SimManager::newStudy(AppState &st, StudyType t) {
@@ -1201,9 +1378,13 @@ void SimManager::newStudy(AppState &st, StudyType t) {
   nlohmann::json params = {{"doc_id", st.docMirror.docId()},
                            {"study", studyToJson(s)}};
   if (!st.worker.call("sim_study_add", params, res, err, 15000) ||
-      res.contains("code")) {
+      !res.is_object() || res.contains("code") ||
+      !res.value("ok", true)) {
     st.addLog("[sim] sim_study_add failed: " +
-              (res.contains("code") ? res.value("message", err) : err));
+              (res.is_object()
+                   ? res.value("message", res.value("error", err))
+                   : (err.empty() ? "invalid response" : err)));
+    st.toast(ui::ToastLevel::Error, "Could not create simulation study");
     return;
   }
   st.markActiveTabDirty();
@@ -1232,9 +1413,13 @@ void SimManager::deleteStudy(AppState &st, int i) {
   if (!st.worker.call("sim_study_delete",
                       {{"doc_id", st.docMirror.docId()}, {"study_id", id}}, res,
                       err, 15000) ||
-      res.contains("code")) {
+      !res.is_object() || res.contains("code") ||
+      !res.value("ok", true)) {
     st.addLog("[sim] sim_study_delete failed: " +
-              (res.contains("code") ? res.value("message", err) : err));
+              (res.is_object()
+                   ? res.value("message", res.value("error", err))
+                   : (err.empty() ? "invalid response" : err)));
+    st.toast(ui::ToastLevel::Error, "Could not delete simulation study");
     return;
   }
   st.markActiveTabDirty();
@@ -1613,6 +1798,29 @@ nlohmann::json SimManager::emWaveguideSpec() const {
 void SimManager::runEmForm(AppState &st) {
   if (emRunning_)
     return;
+  std::string blocker;
+  auto positive = [](float v) { return std::isfinite(v) && v > 0.0f; };
+  if (em_.stdIdx < 0 &&
+      ((em_.shape == 0 && (!positive(em_.a_mm) || !positive(em_.b_mm))) ||
+       (em_.shape == 1 && !positive(em_.radius_mm))))
+    blocker = "Waveguide dimensions must be finite and positive.";
+  else if (emForm_ != EmForm::Eigenmode && !positive(em_.lengthMm))
+    blocker = "Guide length must be finite and positive.";
+  else if (emForm_ == EmForm::Driven &&
+           (!positive(em_.fStartGhz) || !positive(em_.fStopGhz) ||
+            em_.fStopGhz <= em_.fStartGhz || em_.nFreq < 3))
+    blocker =
+        "Driven sweep needs positive increasing frequencies and at least 3 points.";
+  else if (emForm_ == EmForm::TimeDomain &&
+           (!positive(em_.f0Ghz) || !positive(em_.bwGhz)))
+    blocker = "Time-domain center frequency and bandwidth must be positive.";
+  else if (emForm_ == EmForm::Driven && em_.stlPath[0] &&
+           !std::filesystem::exists(em_.stlPath))
+    blocker = "The optional geometry STL path does not exist.";
+  if (!blocker.empty()) {
+    st.toast(ui::ToastLevel::Warn, blocker);
+    return;
+  }
   nlohmann::json params = emWaveguideSpec();
   std::string method;
   switch (emForm_) {
@@ -1650,56 +1858,99 @@ void SimManager::runEmForm(AppState &st) {
       method, params,
       [this, which](const core::RpcResult &r) {
         emRunning_ = false;
-        const bool ok =
-            r.ok && !r.result.contains("code") && r.result.value("ok", true);
+        bool ok = r.ok && r.result.is_object() &&
+                  !r.result.contains("code") &&
+                  r.result.value("ok", true);
         std::string err;
-        if (!ok) {
-          err = r.result.value(
-              "error", r.err.empty() ? std::string("EM solve failed") : r.err);
-        }
-        // Coerce a JSON number array to float, clamping non-finite entries (a
-        // matched-port S11 can come back as +/-inf/NaN from some adapters) so
-        // the auto-ranged plot stays sane.
-        auto toF = [](const nlohmann::json &a, std::vector<float> &out) {
+        if (!ok)
+          err = r.result.is_object()
+                    ? r.result.value(
+                          "error",
+                          r.err.empty() ? std::string("EM solve failed") : r.err)
+                    : (r.err.empty() ? "EM solve returned no result" : r.err);
+        auto toFinite = [](const nlohmann::json &a,
+                           std::vector<float> &out) {
           out.clear();
-          if (!a.is_array())
-            return;
+          if (!a.is_array() || a.empty())
+            return false;
           for (const auto &v : a) {
-            float f = v.is_number() ? (float)v.get<double>() : 0.0f;
-            if (!std::isfinite(f))
-              f = (f < 0 || (v.is_number() && v.get<double>() < 0)) ? -300.0f
-                                                                    : 300.0f;
-            out.push_back(f);
+            if (!v.is_number() || !std::isfinite(v.get<double>())) {
+              out.clear();
+              return false;
+            }
+            out.push_back((float)v.get<double>());
           }
+          return true;
         };
         if (which == EmForm::Eigenmode) {
+          const auto modes =
+              ok ? r.result.value("modes", nlohmann::json::array())
+                 : nlohmann::json::array();
+          if (ok && (!modes.is_array() || modes.empty())) {
+            ok = false;
+            err = "EM eigenmode solve returned no modes";
+          }
+          if (ok)
+            for (const auto &mode : modes) {
+              double fc = 0.0, kc = 0.0;
+              if (!mode.is_object() || !finiteNumber(mode, "fc_ghz", fc) ||
+                  fc <= 0.0 || !finiteNumber(mode, "kc_per_m", kc) ||
+                  kc <= 0.0) {
+                ok = false;
+                err = "EM eigenmode solve returned an invalid mode";
+                break;
+              }
+            }
           em_.eigResult = ok ? 1 : 0;
           em_.eigError = err;
-          em_.eigModes = ok ? r.result.value("modes", nlohmann::json::array())
-                            : nlohmann::json::array();
+          em_.eigModes = ok ? modes : nlohmann::json::array();
         } else if (which == EmForm::Driven) {
+          if (ok) {
+            const bool haveFreq =
+                toFinite(r.result.value("freq_ghz", nlohmann::json::array()),
+                         em_.drvFreq);
+            const bool haveS11 =
+                toFinite(r.result.value("s11_db", nlohmann::json::array()),
+                         em_.drvS11);
+            const bool haveS21 =
+                toFinite(r.result.value("s21_db", nlohmann::json::array()),
+                         em_.drvS21);
+            ok = haveFreq && haveS11 && haveS21 &&
+                 em_.drvFreq.size() == em_.drvS11.size() &&
+                 em_.drvFreq.size() == em_.drvS21.size();
+            if (!ok)
+              err = "EM driven solve returned empty, mismatched, or non-finite traces";
+          }
           em_.drvResult = ok ? 1 : 0;
           em_.drvError = err;
-          if (ok) {
-            toF(r.result.value("freq_ghz", nlohmann::json::array()),
-                em_.drvFreq);
-            toF(r.result.value("s11_db", nlohmann::json::array()), em_.drvS11);
-            toF(r.result.value("s21_db", nlohmann::json::array()), em_.drvS21);
-          } else {
+          if (!ok) {
             em_.drvFreq.clear();
             em_.drvS11.clear();
             em_.drvS21.clear();
           }
         } else {
+          if (ok) {
+            const auto ports =
+                r.result.value("ports", nlohmann::json::object());
+            const bool haveTime =
+                toFinite(r.result.value("t_ns", nlohmann::json::array()),
+                         em_.tdTime);
+            const bool haveP1 =
+                toFinite(ports.value("port1_v", nlohmann::json::array()),
+                         em_.tdPort1);
+            const bool haveP2 =
+                toFinite(ports.value("port2_v", nlohmann::json::array()),
+                         em_.tdPort2);
+            ok = haveTime && haveP1 && haveP2 &&
+                 em_.tdTime.size() == em_.tdPort1.size() &&
+                 em_.tdTime.size() == em_.tdPort2.size();
+            if (!ok)
+              err =
+                  "EM time-domain solve returned empty, mismatched, or non-finite traces";
+          }
           em_.tdResult = ok ? 1 : 0;
           em_.tdError = err;
-          if (ok) {
-            toF(r.result.value("t_ns", nlohmann::json::array()), em_.tdTime);
-            const auto &ports =
-                r.result.value("ports", nlohmann::json::object());
-            toF(ports.value("port1_v", nlohmann::json::array()), em_.tdPort1);
-            toF(ports.value("port2_v", nlohmann::json::array()), em_.tdPort2);
-          } else {
+          if (!ok) {
             em_.tdTime.clear();
             em_.tdPort1.clear();
             em_.tdPort2.clear();
@@ -1732,8 +1983,9 @@ void SimManager::drawEmLinePlot(const char *id, const std::vector<float> &x,
   const ImU32 c1 = IM_COL32(90, 170, 250, 255),
               c2 = IM_COL32(240, 140, 60, 255);
 
-  float xLo = x.front(), xHi = x.back();
-  if (xHi <= xLo)
+  const auto xRange = std::minmax_element(x.begin(), x.end());
+  float xLo = *xRange.first, xHi = *xRange.second;
+  if (xHi - xLo < 1e-9f)
     xHi = xLo + 1.0f;
   float yLo = 1e30f, yHi = -1e30f;
   auto span = [&](const std::vector<float> *y) {
@@ -2011,15 +2263,36 @@ void SimManager::drawEmPanel(AppState &st) {
   // ---- run ----
   ImGui::Spacing();
   ImGui::Separator();
-  if (emRunning_) {
-    ImGui::TextDisabled("Solving\xe2\x80\xa6");
+  std::string emBlocker;
+  auto positive = [](float v) { return std::isfinite(v) && v > 0.0f; };
+  if (em_.stdIdx < 0 &&
+      ((em_.shape == 0 && (!positive(em_.a_mm) || !positive(em_.b_mm))) ||
+       (em_.shape == 1 && !positive(em_.radius_mm))))
+    emBlocker = "Waveguide dimensions must be finite and positive.";
+  else if (emForm_ != EmForm::Eigenmode && !positive(em_.lengthMm))
+    emBlocker = "Guide length must be finite and positive.";
+  else if (emForm_ == EmForm::Driven &&
+           (!positive(em_.fStartGhz) || !positive(em_.fStopGhz) ||
+            em_.fStopGhz <= em_.fStartGhz || em_.nFreq < 3))
+    emBlocker =
+        "Driven sweep needs positive increasing frequencies and at least 3 points.";
+  else if (emForm_ == EmForm::TimeDomain &&
+           (!positive(em_.f0Ghz) || !positive(em_.bwGhz)))
+    emBlocker = "Time-domain center frequency and bandwidth must be positive.";
+  else if (emForm_ == EmForm::Driven && em_.stlPath[0] &&
+           !std::filesystem::exists(em_.stlPath))
+    emBlocker = "The optional geometry STL path does not exist.";
+  if (emRunning_ || !emBlocker.empty()) {
+    if (emRunning_)
+      ImGui::TextDisabled("Solving\xe2\x80\xa6");
     ImGui::BeginDisabled();
     ImGui::Button("Run", ImVec2(-FLT_MIN, 0));
     ImGui::EndDisabled();
-  } else {
-    if (ImGui::Button("Run", ImVec2(-FLT_MIN, 0)))
-      runEmForm(st);
+  } else if (ImGui::Button("Run", ImVec2(-FLT_MIN, 0))) {
+    runEmForm(st);
   }
+  if (!emBlocker.empty())
+    ImGui::TextWrapped("%s", emBlocker.c_str());
   simTip("Run the electromagnetics solve for this analysis (async — the panel "
          "stays responsive).");
 
@@ -2120,6 +2393,19 @@ void SimManager::configureActive(AppState &st, float density,
   if (!materialKey.empty())
     applyPartMaterial(st, studies_[sel_], materialKey);
   persist(st, studies_[sel_]);
+}
+
+void SimManager::configureActiveMotion(AppState &st, float start, float stop,
+                                       int steps) {
+  if (sel_ < 0 || sel_ >= (int)studies_.size())
+    return;
+  Study &s = studies_[sel_];
+  if (s.type != StudyType::Motion)
+    return;
+  s.motionStart = start;
+  s.motionStop = stop;
+  s.motionSteps = std::max(2, std::min(steps, 120));
+  persist(st, s);
 }
 
 void SimManager::configureActiveFlow(AppState &st, int fluid, float aoaDeg,
@@ -3383,13 +3669,89 @@ void SimManager::run(AppState &st, Study &s) {
   // Always re-seed material from the part so a FeatureManager / Mass Props
   // change is honored.
   resolveStudyMaterialFromDoc(st, s);
+  auto block = [&](const std::string &why) {
+    st.addLog("[sim] run blocked: " + why);
+    st.toast(ui::ToastLevel::Warn, why);
+  };
+  if (!st.docMirror.hasDoc()) {
+    block("Open a part or assembly before running a study.");
+    return;
+  }
+  if (!hasSimulationGeometry(st)) {
+    block("The active document has no solid geometry to simulate.");
+    return;
+  }
+  if (s.type == StudyType::Motion &&
+      (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size() ||
+       st.docTabs[st.activeTab].kind != AppState::DocTab::TabKind::Assembly)) {
+    block("Motion studies require the active document to be an assembly.");
+    return;
+  }
+  std::string readiness;
+  if (!studyReady(s, readiness)) {
+    block(readiness);
+    return;
+  }
 #ifdef __EMSCRIPTEN__
   if (isFlowFamily(s.type) || s.type == StudyType::Buckling ||
       s.type == StudyType::Contact || s.type == StudyType::FreqResponse) {
-    st.toast(ui::ToastLevel::Warn, "not available in the web version yet");
+    block("not available in the web version yet");
     return;
   }
 #endif
+  if ((isFlowFamily(s.type) && s.flowSolver == 1) ||
+      s.type == StudyType::Thermal) {
+    const nlohmann::json flowCaps =
+        st.simClient ? st.simClient->caps() : nlohmann::json::object();
+    if (!flowCaps.value("openfoam", false)) {
+      block("OpenFOAM is not routed by this desktop simulation backend. Use the LBM Flow solver; Thermal CFD is unavailable.");
+      return;
+    }
+  }
+  if (s.type == StudyType::Buckling || s.type == StudyType::Contact ||
+      s.type == StudyType::FreqResponse) {
+    if (capsStatus_ == 0) {
+      probeCaps(st);
+      block("Checking simulation capabilities; run again when the capability check completes.");
+      return;
+    }
+    if (capsStatus_ < 0) {
+      block("The advanced simulation capability probe failed; the worker route is unavailable.");
+      return;
+    }
+    if ((s.type == StudyType::Buckling || s.type == StudyType::Contact) &&
+        (!caps_.contains("ccx") || !caps_["ccx"].is_object() ||
+         !caps_["ccx"].value("found", false))) {
+      block(caps_.contains("ccx") && caps_["ccx"].is_object()
+                ? caps_["ccx"].value(
+                      "hint", std::string("CalculiX is unavailable."))
+                : std::string("CalculiX is unavailable."));
+      return;
+    }
+    if (s.type == StudyType::FreqResponse &&
+        (!caps_.contains("freq_response") ||
+         !caps_["freq_response"].is_object() ||
+         !caps_["freq_response"].value("available", false))) {
+      block(caps_.contains("freq_response") &&
+                    caps_["freq_response"].is_object()
+                ? caps_["freq_response"].value(
+                      "hint",
+                      std::string(
+                          "Vibration post-processing is unavailable."))
+                : std::string(
+                      "Vibration post-processing is unavailable."));
+      return;
+    }
+  }
+  if (s.type != StudyType::Motion && s.type != StudyType::Buckling &&
+      s.type != StudyType::Contact && !st.simClient) {
+    block("The simulation backend is unavailable.");
+    return;
+  }
+  if ((st.simClient && st.simClient->busy()) || advRunning_ || prepInFlight_) {
+    block("A simulation is already in progress.");
+    return;
+  }
   if (s.type == StudyType::Motion)
     runMotion(st, s);
   else if (isFlowFamily(s.type))
@@ -3425,9 +3787,11 @@ void SimManager::runFatigue(AppState &st, Study &s) {
         p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
     std::string e;
     if (!st.worker.call("doc_export_step", p, r, e, 60000) ||
-        r.contains("code")) {
+        !r.is_object() || r.contains("code") || !r.value("ok", true)) {
       st.addLog("[sim] export STEP failed: " +
-                (r.contains("code") ? r.value("message", e) : e));
+                (r.is_object()
+                     ? r.value("message", r.value("error", e))
+                     : e));
       st.toast(ui::ToastLevel::Error, "Simulation: export failed");
       return;
     }
@@ -3438,12 +3802,13 @@ void SimManager::runFatigue(AppState &st, Study &s) {
   for (const auto &p : s.fixtures.picks) {
     std::string e;
     auto fp = facePointsFor(st, p.selector, e);
-    if (!fp.is_null() && fp.contains("points"))
+    if (!fp.is_null() && fp.contains("points") && fp["points"].is_array() &&
+        !fp["points"].empty())
       fixtures.push_back(fp);
   }
-  if (fixtures.empty()) {
-    st.addLog("[sim] add at least one fixture face before running");
-    st.toast(ui::ToastLevel::Warn, "Add a fixture before running");
+  if (fixtures.size() != s.fixtures.picks.size()) {
+    st.toast(ui::ToastLevel::Warn,
+             "One or more fixture faces no longer resolve; reselect them");
     return;
   }
 
@@ -3482,10 +3847,13 @@ void SimManager::runFatigue(AppState &st, Study &s) {
   nlohmann::json loads = nlohmann::json::array();
   for (const auto &ld : s.loads) {
     nlohmann::json faces = nlohmann::json::array();
+    int resolvedFaces = 0;
     for (const auto &p : ld.faces.picks) {
       std::string e;
       auto fp = facePointsFor(st, p.selector, e);
-      if (!fp.is_null() && fp.contains("points")) {
+      if (!fp.is_null() && fp.contains("points") && fp["points"].is_array() &&
+          !fp["points"].empty()) {
+        ++resolvedFaces;
         if (faces.empty())
           faces = fp;
         else
@@ -3493,8 +3861,11 @@ void SimManager::runFatigue(AppState &st, Study &s) {
             faces["points"].push_back(pt);
       }
     }
-    if (faces.empty())
-      continue;
+    if (resolvedFaces != (int)ld.faces.picks.size()) {
+      st.toast(ui::ToastLevel::Warn,
+               "One or more load faces no longer resolve; reselect them");
+      return;
+    }
     nlohmann::json l = {{"faces", faces}};
     if (ld.pressure) {
       l["type"] = "pressure";
@@ -3526,6 +3897,7 @@ void SimManager::runFatigue(AppState &st, Study &s) {
   if (sim->launch("sim_run_fatigue", {{"study", study}}, note,
                   st.docMirror.docId())) {
     clearTransientResult(s);
+    persist(st, s);
     clearMeshPreview();
     resultShown_ = false;
     shownStudyId_.clear();
@@ -3539,74 +3911,71 @@ void SimManager::runFatigue(AppState &st, Study &s) {
 void SimManager::runStaticOrModal(AppState &st, Study &s) {
   if (!st.simClient)
     return;
-  auto *sim = st.simClient;
   if (!st.docMirror.hasDoc()) {
     st.addLog("[sim] no document to analyse");
     return;
   }
-  if (prepInFlight_ || sim->busy()) {
+
+  const std::string docId = st.docMirror.docId();
+  lastDocId_ = docId;
+  std::uint64_t reservationToken = 0;
+  if (prepInFlight_ ||
+      !st.simClient->tryReserve(docId, reservationToken)) {
     st.toast(ui::ToastLevel::Info, "A simulation is already in progress");
     return;
   }
 
-  // Snapshot study inputs on the UI thread, then run export + face_points +
-  // launch off-thread so the GL/main thread never blocks on 60s doc_export_step
-  // / N× doc_face_points (WASM-critical).
-  const std::string docId = st.docMirror.docId();
-  const std::string studyId = s.id;
-  const StudyType stype = s.type;
-  const int nModes = s.nModes;
-  const int meshOrder = s.meshOrder;
-  const std::string materialKey = s.materialKey;
-  const bool meshHex = s.meshHex;
-  const float meshFineness = s.meshFineness;
-  const bool meshCurvature = s.meshCurvature;
-  const float meshCurvPerCircle = s.meshCurvPerCircle;
-  const float meshTargetMm = s.meshTargetMm;
-  const float meshMinMm = s.meshMinMm;
-  const int meshAlgo = s.meshAlgo;
-  const bool meshOptimize = s.meshOptimize;
+  auto prep = std::make_shared<StaticModalPrep>();
+  prep->sim = st.simClient;
+  prep->reservationToken = reservationToken;
+  prep->docId = docId;
+  prep->studyId = s.id;
+  prep->type = s.type;
+  prep->nModes = s.nModes;
+  prep->requestedStepPath =
+      staticModalStepPath(docId, s.id, reservationToken);
+  prep->meshOptions.meshHex = s.meshHex;
+  prep->meshOptions.meshFineness = s.meshFineness;
+  prep->meshOptions.meshCurvature = s.meshCurvature;
+  prep->meshOptions.meshCurvPerCircle = s.meshCurvPerCircle;
+  prep->meshOptions.meshTargetMm = s.meshTargetMm;
+  prep->meshOptions.meshMinMm = s.meshMinMm;
+  prep->meshOptions.meshAlgo = s.meshAlgo;
+  prep->meshOptions.meshOptimize = s.meshOptimize;
+  prep->meshOptions.meshOrder = s.meshOrder;
 
-  struct FacePick {
-    nlohmann::json selector;
-  };
-  struct LoadSnap {
-    bool pressure = false;
-    float vec[3] = {0, 0, -100};
-    float pressureMpa = 0.1f;
-    std::vector<FacePick> faces;
-  };
-  std::vector<FacePick> fixPicks;
-  for (const auto &p : s.fixtures.picks)
-    fixPicks.push_back({p.selector});
-  std::vector<LoadSnap> loadSnaps;
-  if (stype == StudyType::Static) {
-    for (const auto &ld : s.loads) {
-      LoadSnap ls;
-      ls.pressure = ld.pressure;
-      ls.vec[0] = ld.vec[0];
-      ls.vec[1] = ld.vec[1];
-      ls.vec[2] = ld.vec[2];
-      ls.pressureMpa = ld.pressureMpa;
-      for (const auto &p : ld.faces.picks)
-        ls.faces.push_back({p.selector});
-      loadSnaps.push_back(std::move(ls));
+  for (const auto &pick : s.fixtures.picks)
+    prep->fixtureSelectors.push_back(pick.selector);
+  prep->fixtures.resize(prep->fixtureSelectors.size());
+  if (s.type == StudyType::Static) {
+    prep->loads.reserve(s.loads.size());
+    for (const auto &load : s.loads) {
+      StaticModalPrep::Load snap;
+      snap.pressure = load.pressure;
+      snap.vec[0] = load.vec[0];
+      snap.vec[1] = load.vec[1];
+      snap.vec[2] = load.vec[2];
+      snap.pressureMpa = load.pressureMpa;
+      for (const auto &pick : load.faces.picks)
+        snap.selectors.push_back(pick.selector);
+      snap.resolved.resize(snap.selectors.size());
+      prep->loads.push_back(std::move(snap));
     }
   }
 
-  nlohmann::json material = nlohmann::json::object();
-  int mi = materialIndexByKey(materialKey);
-  if (mi >= 0) {
-    const auto &m = materials()[mi];
-    material = {{"E_mpa", m.E_mpa},
-                {"nu", m.nu},
-                {"density_g_cm3", m.density_g_cm3},
-                {"yield_mpa", m.yield_mpa}};
+  const int materialIndex = materialIndexByKey(s.materialKey);
+  if (materialIndex >= 0) {
+    const auto &material = materials()[materialIndex];
+    prep->material = {{"E_mpa", material.E_mpa},
+                      {"nu", material.nu},
+                      {"density_g_cm3", material.density_g_cm3},
+                      {"yield_mpa", material.yield_mpa}};
   }
 
-  // Mark busy immediately so the Run button disables while prep runs.
+  staticModalPrep_ = prep;
   prepInFlight_ = true;
   clearTransientResult(s);
+  persist(st, docId, s);
   clearMeshPreview();
   resultShown_ = false;
   shownStudyId_.clear();
@@ -3616,127 +3985,202 @@ void SimManager::runStaticOrModal(AppState &st, Study &s) {
   st.status = "Sim: preparing\xe2\x80\xa6";
   st.statusKind = 0;
 
-  // Capture mesh-option fields the addMeshParams helper would read from Study.
-  Study meshOpts;
-  meshOpts.meshHex = meshHex;
-  meshOpts.meshFineness = meshFineness;
-  meshOpts.meshCurvature = meshCurvature;
-  meshOpts.meshCurvPerCircle = meshCurvPerCircle;
-  meshOpts.meshTargetMm = meshTargetMm;
-  meshOpts.meshMinMm = meshMinMm;
-  meshOpts.meshAlgo = meshAlgo;
-  meshOpts.meshOptimize = meshOptimize;
-  meshOpts.meshOrder = meshOrder;
-
-  std::thread([this, &st, sim, docId, studyId, stype, nModes, material,
-               fixPicks, loadSnaps, meshOpts]() {
-    auto failPrep = [this, &st](const std::string &msg) {
-      prepInFlight_ = false;
-      running_ = false;
-      st.toast(ui::ToastLevel::Error, msg);
-    };
-
-    // Empty path under daemon/WASM → server temp; desktop non-daemon keeps
-    // appdata cache path.
-    const std::string stepPath =
-        engine::daemonMode() ? std::string()
-                             : (appdataAppDir() + "/cache/sim_study.step");
-    nlohmann::json r, p = {{"doc_id", docId}, {"path", stepPath}};
-    std::string e;
-    if (!st.worker.call("doc_export_step", p, r, e, 60000) ||
-        r.contains("code")) {
-      failPrep("Simulation: export failed");
-      return;
-    }
-    const std::string resolved = r.value("path", stepPath);
-    lastStepPath_ = resolved;
-
-    auto facePts = [&](const nlohmann::json &selector,
-                       std::string &err) -> nlohmann::json {
-      nlohmann::json result;
-      nlohmann::json sel = selector;
-      if (sel.is_object())
-        sel.erase("_pick");
-      nlohmann::json params = {{"doc_id", docId}, {"selector", sel}};
-      if (!st.worker.call("doc_face_points", params, result, err, 30000))
-        return {};
-      if (result.contains("code")) {
-        err = result.value("message", std::string("face_points error"));
-        return {};
-      }
-      return result;
-    };
-
-    nlohmann::json fixtures = nlohmann::json::array();
-    for (const auto &fpick : fixPicks) {
-      std::string fe;
-      auto fp = facePts(fpick.selector, fe);
-      if (!fp.is_null() && fp.contains("points"))
-        fixtures.push_back(fp);
-    }
-    if (fixtures.empty()) {
-      failPrep("Add a fixture before running");
-      return;
-    }
-
-    nlohmann::json study = {
-        {"step_path", resolved},
-        {"material", material},
-        {"fixtures", fixtures},
-    };
-    Study meshStudy = meshOpts; // non-const for addMeshParams
-    addMeshParams(study, meshStudy,
-                  stype == StudyType::Static ? meshOpts.meshOrder : 1,
-                  /*allowHex=*/stype == StudyType::Static);
-
-    std::string note;
-    bool launched = false;
-    if (stype == StudyType::Static) {
-      nlohmann::json loads = nlohmann::json::array();
-      for (const auto &ld : loadSnaps) {
-        nlohmann::json faces = nlohmann::json::array();
-        for (const auto &pck : ld.faces) {
-          std::string fe;
-          auto fp = facePts(pck.selector, fe);
-          if (!fp.is_null() && fp.contains("points")) {
-            if (faces.empty())
-              faces = fp;
-            else
-              for (auto &pt : fp["points"])
-                faces["points"].push_back(pt);
-          }
+  st.rpc.call(
+      "doc_export_step",
+      {{"doc_id", docId}, {"path", prep->requestedStepPath}},
+      [this, &st, prep](const core::RpcResult &result) {
+        if (staticModalPrep_ != prep || !prepInFlight_)
+          return;
+        if (!simDocOpen(st, prep->docId)) {
+          failStaticModalPrep(st, prep,
+                              "Simulation cancelled: source document was closed");
+          return;
         }
-        if (faces.empty())
-          continue;
-        nlohmann::json l = {{"faces", faces}};
-        if (ld.pressure) {
-          l["type"] = "pressure";
-          l["magnitude"] = ld.pressureMpa;
-        } else {
-          l["type"] = "force";
-          l["vector"] = {ld.vec[0], ld.vec[1], ld.vec[2]};
+        if (!result.ok || !result.result.is_object() ||
+            result.result.contains("code") ||
+            !simJsonBool(result.result, "ok", true)) {
+          failStaticModalPrep(st, prep, "Simulation: export failed");
+          return;
         }
-        loads.push_back(l);
+        const auto pathIt = result.result.find("path");
+        if (pathIt != result.result.end() && !pathIt->is_string()) {
+          failStaticModalPrep(st, prep,
+                              "Simulation: export returned an invalid STEP path");
+          return;
+        }
+        prep->resolvedStepPath =
+            pathIt == result.result.end()
+                ? prep->requestedStepPath
+                : pathIt->get<std::string>();
+        if (prep->resolvedStepPath.empty()) {
+          failStaticModalPrep(st, prep,
+                              "Simulation: export returned no STEP path");
+          return;
+        }
+        lastStepPath_ = prep->resolvedStepPath;
+
+        prep->facesRemaining = prep->fixtureSelectors.size();
+        for (const auto &load : prep->loads)
+          prep->facesRemaining += load.selectors.size();
+        if (prep->facesRemaining == 0) {
+          finishStaticModalPrep(st, prep);
+          return;
+        }
+
+        auto queueFace = [this, &st, prep](const nlohmann::json &selector,
+                                           nlohmann::json *destination) {
+          nlohmann::json clean = selector;
+          if (clean.is_object())
+            clean.erase("_pick");
+          st.rpc.call(
+              "doc_face_points",
+              {{"doc_id", prep->docId}, {"selector", std::move(clean)}},
+              [this, &st, prep, destination](const core::RpcResult &faceResult) {
+                prepFaceResult(st, prep, faceResult, *destination);
+              },
+              30000);
+        };
+        for (std::size_t i = 0; i < prep->fixtureSelectors.size(); ++i)
+          queueFace(prep->fixtureSelectors[i], &prep->fixtures[i]);
+        for (auto &load : prep->loads)
+          for (std::size_t i = 0; i < load.selectors.size(); ++i)
+            queueFace(load.selectors[i], &load.resolved[i]);
+      },
+      60000);
+}
+
+void SimManager::failStaticModalPrep(
+    AppState &st, const std::shared_ptr<StaticModalPrep> &prep,
+    const std::string &message) {
+  if (staticModalPrep_ != prep)
+    return;
+  if (prep->reservationToken != 0) {
+    prep->sim->releaseReservation(prep->reservationToken);
+    prep->reservationToken = 0;
+  }
+  prepInFlight_ = false;
+  running_ = false;
+  runningStudy_ = -1;
+  runningStudyId_.clear();
+  for (auto &study : studies_) {
+    if (study.id != prep->studyId)
+      continue;
+    study.hasResult = false;
+    study.summary = message;
+    persist(st, prep->docId, study);
+    break;
+  }
+  st.addLog("[sim] " + message);
+  if (simOriginActive(st, this, prep->docId)) {
+    st.status = message;
+    st.statusKind = 2;
+    st.toast(ui::ToastLevel::Error, message);
+  }
+  staticModalPrep_.reset();
+}
+
+bool SimManager::prepFaceResult(
+    AppState &st, const std::shared_ptr<StaticModalPrep> &prep,
+    const core::RpcResult &result, nlohmann::json &destination) {
+  if (staticModalPrep_ != prep || !prepInFlight_)
+    return false;
+  if (!result.ok || !result.result.is_object() ||
+      result.result.contains("code") ||
+      !simJsonBool(result.result, "ok", true) ||
+      !result.result.contains("points") ||
+      !result.result["points"].is_array() ||
+      result.result["points"].empty()) {
+    const std::string detail =
+        result.result.is_object()
+            ? simJsonText(result.result, "message", "error",
+                          "face no longer resolves")
+            : (result.err.empty() ? std::string("face no longer resolves")
+                                  : result.err);
+    failStaticModalPrep(
+        st, prep,
+        "One or more selected faces no longer resolve; reselect them (" +
+            detail + ")");
+    return false;
+  }
+  destination = result.result;
+  if (--prep->facesRemaining == 0)
+    finishStaticModalPrep(st, prep);
+  return true;
+}
+
+void SimManager::finishStaticModalPrep(
+    AppState &st, const std::shared_ptr<StaticModalPrep> &prep) {
+  if (staticModalPrep_ != prep || !prepInFlight_)
+    return;
+  if (!simDocOpen(st, prep->docId)) {
+    failStaticModalPrep(st, prep,
+                        "Simulation cancelled: source document was closed");
+    return;
+  }
+  if (prep->type == StudyType::Static && prep->fixtures.empty()) {
+    failStaticModalPrep(st, prep, "Add a fixture before running");
+    return;
+  }
+
+  nlohmann::json fixtures = nlohmann::json::array();
+  for (const auto &face : prep->fixtures)
+    fixtures.push_back(face);
+  nlohmann::json study = {{"step_path", prep->resolvedStepPath},
+                          {"material", prep->material},
+                          {"fixtures", std::move(fixtures)}};
+  addMeshParams(study, prep->meshOptions,
+                prep->type == StudyType::Static
+                    ? prep->meshOptions.meshOrder
+                    : 1,
+                prep->type == StudyType::Static);
+
+  std::string note;
+  bool launched = false;
+  const std::uint64_t token = prep->reservationToken;
+  if (prep->type == StudyType::Static) {
+    nlohmann::json loads = nlohmann::json::array();
+    for (const auto &load : prep->loads) {
+      nlohmann::json points = nlohmann::json::array();
+      for (const auto &face : load.resolved) {
+        if (points.empty())
+          points = face;
+        else
+          for (const auto &point : face["points"])
+            points["points"].push_back(point);
       }
-      study["loads"] = loads;
-      launched = sim->launch("sim_run_static", {{"study", study}}, note, docId);
-    } else {
-      launched =
-          sim->launch("sim_run_modal", {{"study", study}, {"n_modes", nModes}},
-                      note, docId);
+      nlohmann::json item = {{"faces", std::move(points)}};
+      if (load.pressure) {
+        item["type"] = "pressure";
+        item["magnitude"] = load.pressureMpa;
+      } else {
+        item["type"] = "force";
+        item["vector"] = {load.vec[0], load.vec[1], load.vec[2]};
+      }
+      loads.push_back(std::move(item));
     }
-    prepInFlight_ = false;
-    if (!launched) {
-      running_ = false;
-      st.toast(ui::ToastLevel::Error,
-               note.empty() ? std::string("Simulation failed to start") : note);
-    } else {
-      // Prefer toast over addLog from a worker thread (addLog is not locked).
-      st.toast(ui::ToastLevel::Info,
-               note.empty() ? "Simulation started" : note);
-    }
-    (void)studyId;
-  }).detach();
+    study["loads"] = std::move(loads);
+    launched = prep->sim->launch("sim_run_static", {{"study", study}}, note,
+                                 prep->docId, token);
+  } else {
+    launched = prep->sim->launch(
+        "sim_run_modal", {{"study", study}, {"n_modes", prep->nModes}}, note,
+        prep->docId, token);
+  }
+  // A matching launch consumes the reservation on both success and failure.
+  prep->reservationToken = 0;
+  if (!launched) {
+    failStaticModalPrep(
+        st, prep,
+        note.empty() ? std::string("Simulation failed to start") : note);
+    return;
+  }
+
+  prepInFlight_ = false;
+  staticModalPrep_.reset();
+  st.addLog(note.empty() ? "[sim] simulation started" : note);
+  if (simOriginActive(st, this, prep->docId))
+    st.toast(ui::ToastLevel::Info,
+             note.empty() ? "Simulation started" : note);
 }
 
 void SimManager::runFlow(AppState &st, Study &s) {
@@ -3748,14 +4192,15 @@ void SimManager::runFlow(AppState &st, Study &s) {
     return;
   }
   const std::string stlPath = engine::daemonMode()
-                                  ? std::string(".stl")
+                                  ? std::string("sim_flow.stl")
                                   : (appdataAppDir() + "/cache/sim_flow.stl");
   nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stlPath}};
   std::string e;
   if (!st.worker.call("doc_export_step", p, r, e, 60000) ||
-      r.contains("code")) {
+      !r.is_object() || r.contains("code") || !r.value("ok", true)) {
     st.addLog("[sim] export STL failed: " +
-              (r.contains("code") ? r.value("message", e) : e));
+              (r.is_object() ? r.value("message", r.value("error", e)) : e));
+    st.toast(ui::ToastLevel::Error, "Simulation: STL export failed");
     return;
   }
   lastStepPath_ = r.value("path", stlPath);
@@ -3815,6 +4260,7 @@ void SimManager::runFlow(AppState &st, Study &s) {
   std::string note;
   if (sim->launch("sim_run_flow", params, note, st.docMirror.docId())) {
     clearTransientResult(s);
+    persist(st, s);
     clearMeshPreview();
     resultShown_ = false;
     shownStudyId_.clear();
@@ -3840,11 +4286,10 @@ void SimManager::clearResultOverlay(AppState &st) {
     st.renderer->setDeformScale(0.0f);
   }
   // The overlay is no longer on the renderer; syncResultView re-applies it if
-  // Results is still up.
+  // Results is shown again. Keep the per-document motion base cache: a DocSession owns this
+  // SimManager, and dropping it here made a later scrub upload an empty assembly.
   resultShown_ = false;
   shownStudyId_.clear();
-  // Release cached motion tessellation (populated in runMotion).
-  motionDocMesh_ = render::DocMesh{};
 }
 
 void SimManager::restoreModelMesh(AppState &st) {
@@ -3891,14 +4336,19 @@ void SimManager::syncResultView(AppState &st) {
   const bool onSimWs = st.activeWorkspace == AppState::Workspace::Simulate;
 
   // Motion studies manage the viewport via applyMotionFrame (setMeshes); they
-  // don't use the overlay path and must not trigger restoreModelMesh while
-  // their Results node is active.
+  // don't use the overlay path. Re-apply the current frame on a real view transition because
+  // leaving Results restored the editable base mesh while the per-document playback cache stayed.
   const bool motionActive = valid && studies_[sel_].type == StudyType::Motion &&
                             studies_[sel_].motionHasResult && onSimWs &&
                             node_ == SimNode::Results;
   if (motionActive) {
+    Study &motion = studies_[sel_];
+    if (!resultShown_ || shownStudyId_ != motion.id) {
+      applyMotionFrame(st, motion, motion.motionFrame);
+      motion.motionLastTick = -1.0;
+    }
     resultShown_ = true;
-    shownStudyId_ = studies_[sel_].id;
+    shownStudyId_ = motion.id;
     return;
   }
 
@@ -3949,17 +4399,51 @@ void SimManager::tick(AppState &st) {
   if (fwStatus_ == 0 && !fwProbeInflight_ &&
       st.activeWorkspace == AppState::Workspace::Simulate)
     probeFwStatus(st);
+  drainSimClientJob(st);
+}
+
+void SimManager::drainSimClientJob(AppState &st) {
   if (!st.simClient)
     return;
   auto *sim = st.simClient;
   auto &job = sim->job();
 
-  // Only consume events/completion for jobs THIS document launched.
+  // The frame loop ticks only the active manager. Route a shared-client job to
+  // the manager owned by its stable document id so tab switches cannot strand
+  // progress or a ready completion.
   const bool owns =
       (job.ownerDocId.empty() && running_) ||
-      (st.docMirror.hasDoc() && job.ownerDocId == st.docMirror.docId());
-  if (!owns)
+      (!job.ownerDocId.empty() && job.ownerDocId == lastDocId_);
+  if (!owns) {
+    if (!job.ownerDocId.empty()) {
+      for (auto &tab : st.docTabs) {
+        if (tab.docId != job.ownerDocId || !tab.session ||
+            !tab.session->sim || tab.session->sim.get() == this)
+          continue;
+        tab.session->sim->drainSimClientJob(st);
+        return;
+      }
+    }
+    // Keep a completed result parked while its owning tab still exists, but do
+    // not let a closed document's orphaned completion block every future run.
+    if (job.ready.load()) {
+      bool ownerStillOpen = false;
+      for (const auto &tab : st.docTabs)
+        ownerStillOpen = ownerStillOpen || tab.docId == job.ownerDocId;
+      if (!ownerStillOpen) {
+        job.ready = false;
+        running_ = false;
+        runningStudy_ = -1;
+        runningStudyId_.clear();
+        st.addLog("[sim] discarded completion for a closed document");
+      }
+    }
     return;
+  }
+  const bool uiActive =
+      job.ownerDocId.empty()
+          ? st.simManager == this
+          : simOriginActive(st, this, job.ownerDocId);
 
   {
     std::vector<core::SimProgress> evs;
@@ -3969,10 +4453,11 @@ void SimManager::tick(AppState &st) {
         evs.swap(job.events);
     }
     for (auto &ev : evs) {
-      if (!ev.text.empty())
+      if (uiActive && !ev.text.empty())
         st.status = "Sim: " + ev.text +
                     (ev.pct ? " (" + std::to_string(ev.pct) + "%)" : "");
-      st.statusKind = 0;
+      if (uiActive)
+        st.statusKind = sim->cancelRequested() ? 1 : 0;
       if (ev.hasTrace) {
         int traceStudy = -1;
         if (!runningStudyId_.empty()) {
@@ -3994,6 +4479,8 @@ void SimManager::tick(AppState &st) {
   if (job.ready.exchange(false)) {
     running_ = false;
     std::lock_guard<std::mutex> lk(job.mtx);
+    const std::string ownerDocId =
+        job.ownerDocId.empty() ? lastDocId_ : job.ownerDocId;
     int si = -1;
     if (!runningStudyId_.empty()) {
       for (int i = 0; i < (int)studies_.size(); ++i)
@@ -4005,18 +4492,39 @@ void SimManager::tick(AppState &st) {
     if (si < 0)
       si = runningStudy_;
     runningStudyId_.clear();
+    runningStudy_ = -1;
     if (si < 0 || si >= (int)studies_.size())
       return;
     Study &s = studies_[si];
     if (!job.ok) {
-      s.summary = "Run failed: " + job.error;
-      st.status = s.summary;
-      st.statusKind = 2;
+      if (job.cancelled) {
+        s.summary = "Run cancelled";
+        if (uiActive) {
+          st.status = s.summary;
+          st.statusKind = 1;
+        }
+      } else {
+        s.summary = "Run failed: " + job.error;
+        if (uiActive) {
+          st.status = s.summary;
+          st.statusKind = 2;
+        }
+      }
       st.addLog("[sim] " + s.summary);
+      persist(st, ownerDocId, s);
       return;
     }
     const auto &res = job.result;
-    s.hasResult = true;
+    s.hasResult = false;
+    auto rejectResult = [&](const std::string &why) {
+      s.summary = "Run failed: " + why;
+      if (uiActive) {
+        st.status = s.summary;
+        st.statusKind = 2;
+      }
+      st.addLog("[sim] " + s.summary);
+      persist(st, ownerDocId, s);
+    };
     clearMeshPreview(); // a fresh result supersedes any setup-time mesh preview
     // Echo whatever the solver reported it did (pressure area, fall-backs, …)
     // for transparency.
@@ -4026,18 +4534,53 @@ void SimManager::tick(AppState &st) {
         if (n.is_string())
           s.solverNotes.push_back(n.get<std::string>());
     if (isFlowFamily(s.type)) {
-      s.dragN = res.value("drag_n", 0.0);
-      s.liftN = res.value("lift_n", 0.0);
-      s.sideN = res.value("side_n", 0.0);
-      s.cd = res.value("cd", 0.0);
-      s.cl = res.value("cl", 0.0);
-      s.ld = res.value("ld", 0.0);
-      s.reynolds = res.value("reynolds", 0.0);
-      s.frontalMm2 = res.value("frontal_area_mm2", 0.0);
-      s.refAreaMm2 = res.value("ref_area_mm2", s.frontalMm2);
-      s.cpMin = res.value("cp_min", -1.0);
-      s.cpMax = res.value("cp_max", 1.0);
-      s.vmaxMps = res.value("vmax_mps", s.flowSpeed * 1.5);
+      const bool isThermal =
+          res.contains("scalar_fields") && res["scalar_fields"].is_array() &&
+          std::find(res["scalar_fields"].begin(), res["scalar_fields"].end(),
+                    "temperature") != res["scalar_fields"].end();
+      double drag = 0.0, lift = 0.0, side = 0.0, cd = 0.0, cl = 0.0,
+             re = 0.0, area = 0.0, cpMin = 0.0, cpMax = 0.0, vmax = 0.0;
+      const bool validCommon =
+          finiteNumber(res, "reynolds", re) && re > 0.0 &&
+          finiteNumber(res, "frontal_area_mm2", area) && area > 0.0 &&
+          finiteNumber(res, "cp_min", cpMin) &&
+          finiteNumber(res, "cp_max", cpMax) && cpMax >= cpMin &&
+          finiteNumber(res, "vmax_mps", vmax) && vmax >= 0.0;
+      const bool validForces =
+          isThermal || (finiteNumber(res, "drag_n", drag) &&
+                        finiteNumber(res, "lift_n", lift) &&
+                        finiteNumber(res, "side_n", side) &&
+                        finiteNumber(res, "cd", cd) &&
+                        finiteNumber(res, "cl", cl));
+      const bool diverged =
+          res.contains("diverged") && res["diverged"].is_boolean() &&
+          res["diverged"].get<bool>();
+      const bool converged =
+          res.contains("converged") && res["converged"].is_boolean() &&
+          res["converged"].get<bool>();
+      if (!validCommon || !validForces || diverged || !converged) {
+        rejectResult(diverged
+                         ? "flow solver reported divergence"
+                         : (!converged
+                                ? "flow solver did not converge"
+                                : "flow solver returned incomplete/non-finite fields"));
+        return;
+      }
+      s.dragN = drag;
+      s.liftN = lift;
+      s.sideN = side;
+      s.cd = cd;
+      s.cl = cl;
+      s.ld = (std::fabs(cd) > 1e-12) ? cl / cd : 0.0;
+      s.reynolds = re;
+      s.frontalMm2 = area;
+      s.refAreaMm2 = area;
+      double refArea = 0.0;
+      if (finiteNumber(res, "ref_area_mm2", refArea) && refArea > 0.0)
+        s.refAreaMm2 = refArea;
+      s.cpMin = cpMin;
+      s.cpMax = cpMax;
+      s.vmaxMps = vmax;
       s.flowFields.clear();
       if (res.contains("scalar_fields") && res["scalar_fields"].is_array())
         for (const auto &f : res["scalar_fields"])
@@ -4045,10 +4588,6 @@ void SimManager::tick(AppState &st) {
             s.flowFields.push_back(f.get<std::string>());
       // Thermal studies don't report drag; show the temperature/heat headline
       // from the banner.
-      bool isThermal = false;
-      for (const auto &f : s.flowFields)
-        if (f == "temperature")
-          isThermal = true;
       char buf[256];
       if (isThermal)
         std::snprintf(buf, sizeof(buf),
@@ -4059,18 +4598,36 @@ void SimManager::tick(AppState &st) {
                       "Drag %.3g N | Lift %.3g N | Cd %.3f | Cl %.3f", s.dragN,
                       s.liftN, s.cd, s.cl);
       s.summary = buf;
-      s.banner = res.value("reynolds_note", std::string());
-      // The overlay carries the MODEL (Cp-coloured) + streamline/slice lines,
-      // so the part stays visible — flow now rides the same overlay/colormap
-      // path as FEA instead of replacing the model with a body-less streamline
-      // file.
-      s.overlayPath =
-          res.value("overlay_aicm", res.value("lines_aicm", std::string()));
-      st.activeScalarField = isThermal ? "temperature" : "pressure_cp";
-      applyResultField(st, s);
-      resultShown_ = true;
-      shownStudyId_ = s.id;
-      rebuildFlowLines(st, s);
+      s.banner = res.contains("reynolds_note") &&
+                         res["reynolds_note"].is_string()
+                     ? res["reynolds_note"].get<std::string>()
+                     : std::string();
+      if (res.contains("warning") && res["warning"].is_string())
+        s.solverNotes.push_back(res["warning"].get<std::string>());
+      s.overlayPath.clear();
+      if (res.contains("overlay_aicm") && res["overlay_aicm"].is_string())
+        s.overlayPath = res["overlay_aicm"].get<std::string>();
+      else if (res.contains("lines_aicm") && res["lines_aicm"].is_string())
+        s.overlayPath = res["lines_aicm"].get<std::string>();
+      if (s.overlayPath.empty()) {
+        s.solverNotes.push_back(
+            "This solver route returns numeric CFD results only; no pressure "
+            "overlay or streamlines are available.");
+        if (uiActive)
+          restoreModelMesh(st);
+        resultShown_ = false;
+        shownStudyId_.clear();
+      } else if (uiActive) {
+        st.activeScalarField = isThermal ? "temperature" : "pressure_cp";
+        applyResultField(st, s);
+        resultShown_ = true;
+        shownStudyId_ = s.id;
+        rebuildFlowLines(st, s);
+      } else {
+        resultShown_ = false;
+        shownStudyId_.clear();
+      }
+      s.hasResult = true;
       st.addLog("[sim] flow done: " + s.summary);
     } else if (s.type == StudyType::ThermalFea) {
       // Conduction solve (steady or T-FIN18 transient): numeric summary only —
@@ -4082,6 +4639,21 @@ void SimManager::tick(AppState &st) {
       s.resultSummary = (res.contains("summary") && res["summary"].is_object())
                             ? res["summary"]
                             : nlohmann::json::object();
+      double maxTemp = 0.0, minTemp = 0.0;
+      const bool transient =
+          res.contains("transient") && res["transient"].is_boolean() &&
+          res["transient"].get<bool>();
+      double maxTime = 0.0, finalMax = 0.0;
+      if (s.nNodes <= 0 || s.nElems <= 0 ||
+          !finiteNumber(s.resultSummary, "max_temp_c", maxTemp) ||
+          !finiteNumber(s.resultSummary, "min_temp_c", minTemp) ||
+          (transient &&
+           (!finiteNumber(s.resultSummary, "max_temp_time_s", maxTime) ||
+            !finiteNumber(s.resultSummary, "final_max_temp_c", finalMax)))) {
+        rejectResult(
+            "thermal solver returned no finite temperature solution");
+        return;
+      }
       nlohmann::json adv = nlohmann::json::object();
       adv["summary"] = s.resultSummary;
       if (res.contains("flux_summary"))
@@ -4093,19 +4665,17 @@ void SimManager::tick(AppState &st) {
       if (res.contains("simhandoff"))
         adv["simhandoff"] = res["simhandoff"];
       s.advResult = adv;
-      const auto &sm = s.resultSummary;
       char buf[256];
-      if (res.value("transient", false))
+      if (transient)
         std::snprintf(
             buf, sizeof(buf),
             "peak %.1f degC @ %.1fs | final max %.1f degC | min %.1f degC",
-            sm.value("max_temp_c", 0.0), sm.value("max_temp_time_s", 0.0),
-            sm.value("final_max_temp_c", sm.value("max_temp_c", 0.0)),
-            sm.value("min_temp_c", 0.0));
+            maxTemp, maxTime, finalMax, minTemp);
       else
         std::snprintf(buf, sizeof(buf), "max %.1f degC | min %.1f degC",
-                      sm.value("max_temp_c", 0.0), sm.value("min_temp_c", 0.0));
+                      maxTemp, minTemp);
       s.summary = buf;
+      s.hasResult = true;
       st.addLog("[sim] thermal FEA done: " + s.summary);
     } else if (s.type == StudyType::FreqResponse) {
       // Stage 1 (modal eigen solve) landed — hand the mode shapes to the
@@ -4115,9 +4685,11 @@ void SimManager::tick(AppState &st) {
       s.nDof = res.value("n_dof", 0);
       s.freqs.clear();
       if (res.contains("freqs_hz") && res["freqs_hz"].is_array())
-        for (auto &v : res["freqs_hz"])
-          s.freqs.push_back((float)v.get<double>());
-      postFreqResponse(st, s, res);
+        for (const auto &v : res["freqs_hz"])
+          if (v.is_number() && std::isfinite(v.get<double>()))
+            s.freqs.push_back((float)v.get<double>());
+      postFreqResponse(st, s, res, ownerDocId);
+      return;
     } else {
       // Mesh / system size for the Results metric table + solver transparency.
       s.nNodes = res.value("n_nodes", 0);
@@ -4126,19 +4698,85 @@ void SimManager::tick(AppState &st) {
       s.resultSummary = (res.contains("summary") && res["summary"].is_object())
                             ? res["summary"]
                             : nlohmann::json::object();
-      s.overlayPath = res.value("overlay_aicm", std::string());
-      // Default the colormapped field for a fresh result + load it (one shared
-      // apply path).
-      st.activeScalarField = (s.type == StudyType::Modal)     ? "mode_amplitude"
-                             : (s.type == StudyType::Fatigue) ? "fatigue_fos"
-                                                              : "von_mises";
-      applyResultField(
-          st, s); // loads the overlay AND applies the auto deform scale
-      // syncResultView ran at the top of this tick (old state); mark the
-      // overlay shown for THIS study so it isn't redundantly reloaded next
-      // frame. node_ is set to Results below.
-      resultShown_ = true;
-      shownStudyId_ = s.id;
+      s.overlayPath =
+          res.contains("overlay_aicm") && res["overlay_aicm"].is_string()
+              ? res["overlay_aicm"].get<std::string>()
+              : std::string();
+      if (s.nNodes <= 0 || s.nDof <= 0 ||
+          (s.type != StudyType::Modal && s.nElems <= 0) ||
+          (s.type == StudyType::Modal &&
+           (!res.contains("freqs_hz") || !res["freqs_hz"].is_array() ||
+            res["freqs_hz"].empty())) ||
+          (s.type != StudyType::Modal && s.resultSummary.empty())) {
+        rejectResult("structural solver returned an incomplete result");
+        return;
+      }
+      if (s.type == StudyType::Modal) {
+        for (const auto &v : res["freqs_hz"]) {
+          if (!v.is_number() || !std::isfinite(v.get<double>()) ||
+              v.get<double>() < 0.0) {
+            rejectResult(
+                "modal solver returned a non-finite/negative frequency");
+            return;
+          }
+        }
+      } else if (s.type == StudyType::Fatigue) {
+        double se = 0.0, sut = 0.0;
+        const int method =
+            (s.fatigueMethod < 0 || s.fatigueMethod > 4)
+                ? 0
+                : s.fatigueMethod;
+        if (!finiteNumber(s.resultSummary, "se_corrected_mpa", se) ||
+            se <= 0.0 || !finiteNumber(s.resultSummary, "sut_mpa", sut) ||
+            sut <= 0.0 || !s.resultSummary.contains("theories") ||
+            !s.resultSummary["theories"].is_object() ||
+            !s.resultSummary["theories"].contains(kTheoryKeys[method]) ||
+            !s.resultSummary["theories"][kTheoryKeys[method]].is_object()) {
+          rejectResult("fatigue solver returned no finite fatigue audit");
+          return;
+        }
+        double sa = 0.0;
+        if (!finiteNumber(
+                s.resultSummary["theories"][kTheoryKeys[method]],
+                "sa_eq_mpa", sa) ||
+            sa <= 0.0) {
+          rejectResult(
+              "fatigue solver returned a zero or non-finite equivalent stress");
+          return;
+        }
+      } else {
+        double vm = 0.0, disp = 0.0, fos = 0.0;
+        if (!finiteNumber(s.resultSummary, "max_von_mises_mpa", vm) ||
+            vm <= 0.0 ||
+            !finiteNumber(s.resultSummary, "max_disp_mm", disp) ||
+            disp <= 0.0 || !finiteNumber(s.resultSummary, "min_fos", fos) ||
+            fos <= 0.0) {
+          rejectResult(
+              "static solver returned zero or non-finite response fields");
+          return;
+        }
+      }
+      // Numeric result cards are useful even when the routed C++ solver does
+      // not package an AICM field overlay. Apply an overlay only when one was
+      // actually returned; otherwise disclose the capability gap.
+      if (s.overlayPath.empty()) {
+        s.solverNotes.push_back(
+            "This solver route returned validated numeric results but no "
+            "viewport field overlay.");
+        resultShown_ = false;
+        shownStudyId_.clear();
+      } else if (uiActive) {
+        st.activeScalarField =
+            (s.type == StudyType::Modal)     ? "mode_amplitude"
+            : (s.type == StudyType::Fatigue) ? "fatigue_fos"
+                                             : "von_mises";
+        applyResultField(st, s);
+        resultShown_ = true;
+        shownStudyId_ = s.id;
+      } else {
+        resultShown_ = false;
+        shownStudyId_.clear();
+      }
       s.freqs.clear();
       if (s.type == StudyType::Modal && res.contains("freqs_hz") &&
           res["freqs_hz"].is_array()) {
@@ -4180,77 +4818,237 @@ void SimManager::tick(AppState &st) {
                       sm.value("max_disp_mm", 0.0), sm.value("min_fos", 0.0));
         s.summary = buf;
       }
+      s.hasResult = true;
       st.addLog("[sim] FEA done: " + s.summary);
     }
     // Cache the summary into the document so it reopens with the last-run
     // headline.
-    persist(st, s);
+    persist(st, ownerDocId, s);
     node_ = SimNode::Results;
   }
 }
 
-// ---- pre-flight readiness gate
-// ------------------------------------------------- Returns true when the study
-// is ready to run; populates `blocker` with the first unmet prerequisite when
-// returning false. Flow / Thermal are always ready (no material or fixtures
-// required by the solver — the flow pipeline handles them).
+// ---- pre-flight readiness gate ---------------------------------------------------------------
+// Returns true only when the values that the selected backend actually consumes are complete and
+// finite. run() repeats this gate, so ribbon commands cannot bypass the disabled panel button.
 static bool studyReady(const Study &s, std::string &blocker) {
-  if (s.type == StudyType::Motion)
-    return true; // Motion only needs a doc + optional mate-id
+  auto finite = [](double v) { return std::isfinite(v); };
+  if (s.type == StudyType::Motion) {
+    if (!finite(s.motionStart) || !finite(s.motionStop) ||
+        std::fabs(s.motionStop - s.motionStart) < 1e-9) {
+      blocker = "Motion needs distinct finite start and stop values.";
+      return false;
+    }
+    if (s.motionSteps < 2 || s.motionSteps > 120) {
+      blocker = "Motion steps must be between 2 and 120.";
+      return false;
+    }
+    return true;
+  }
 #ifdef __EMSCRIPTEN__
-  // Python-worker-only legs (flow/LBM/OpenFOAM, CalculiX proxies, vibration
-  // post) are not available in the browser client yet — gate honestly rather
-  // than failing mid-run.
   if (isFlowFamily(s.type) || s.type == StudyType::Buckling ||
       s.type == StudyType::Contact || s.type == StudyType::FreqResponse) {
     blocker = "not available in the web version yet";
     return false;
   }
 #endif
-  if (isFlowFamily(s.type))
+  if (isFlowFamily(s.type)) {
+    float rho = 0.0f, nu = 0.0f;
+    flowFluidProps(s, rho, nu);
+    if (!finite(s.flowSpeed) || s.flowSpeed <= 0.0f) {
+      blocker = "Flow speed must be finite and greater than zero.";
+      return false;
+    }
+    if (!finite(s.flowAoA) || !finite(s.flowSideslip) ||
+        s.flowDir < 0 || s.flowDir > 5 || s.flowPreset < 0 ||
+        s.flowPreset > 3 || s.flowFluid < 0 || s.flowFluid > 2) {
+      blocker = "Flow direction, fluid, preset, and angles must be valid.";
+      return false;
+    }
+    if (!finite(rho) || !finite(nu) || rho <= 0.0f || nu <= 0.0f) {
+      blocker = "Fluid density and kinematic viscosity must be finite and positive.";
+      return false;
+    }
+    const float rough = flowRoughnessUm(s);
+    if (!finite(rough) || rough < 0.0f || !finite(s.flowRefAreaMm2) ||
+        s.flowRefAreaMm2 < 0.0f) {
+      blocker = "Roughness and reference area must be finite and non-negative.";
+      return false;
+    }
+    if (s.type == StudyType::Thermal ||
+        (s.flowSolver == 1 && s.flowThermal)) {
+      if (!finite(s.flowInletTempC)) {
+        blocker = "Inlet temperature must be finite.";
+        return false;
+      }
+      if (s.flowThermalType == 1) {
+        if (!finite(s.flowSolidKappa) || s.flowSolidKappa <= 0.0f ||
+            !finite(s.flowPowerW) || s.flowPowerW <= 0.0f) {
+          blocker =
+              "Conjugate thermal CFD needs positive conductivity and dissipated power.";
+          return false;
+        }
+      } else if ((s.flowWallMode == 0 && !finite(s.flowWallTempC)) ||
+                 (s.flowWallMode == 1 &&
+                  (!finite(s.flowWallFluxWm2) ||
+                   std::fabs(s.flowWallFluxWm2) < 1e-12)) ||
+                 (s.flowWallMode == 2 &&
+                  (!finite(s.flowWallPowerW) || s.flowWallPowerW <= 0.0f))) {
+        blocker = "Set a finite, non-zero thermal wall excitation.";
+        return false;
+      }
+    }
     return true;
-  // T-FIN24 kinds: the ccx proxies need only a material (E, nu — dims come from
-  // the part bbox); thermal FEA needs at least one boundary condition;
-  // frequency response mirrors modal (fixtures optional — free-free is
-  // allowed).
-  if (s.type == StudyType::Buckling || s.type == StudyType::Contact) {
-    if (s.materialKey.empty()) {
-      blocker = "Material required — the proxy solve reads E and nu from it.";
+  }
+
+  const int mi = SimManager::materialIndexByKey(s.materialKey);
+  if (mi < 0) {
+    blocker = s.materialKey.empty()
+                  ? "Material required — pick a material before running."
+                  : "The part material is not in the simulation material library.";
+    return false;
+  }
+  const auto &mat = SimManager::materials()[mi];
+  if (!finite(mat.E_mpa) || mat.E_mpa <= 0.0 || !finite(mat.nu) ||
+      mat.nu <= -1.0 || mat.nu >= 0.5) {
+    blocker = "Material needs a positive Young's modulus and Poisson ratio below 0.5.";
+    return false;
+  }
+  if ((s.type == StudyType::Modal || s.type == StudyType::FreqResponse ||
+       (s.type == StudyType::ThermalFea && s.thermTransient)) &&
+      (!finite(mat.density_g_cm3) || mat.density_g_cm3 <= 0.0)) {
+    blocker = "This study needs a material with positive density.";
+    return false;
+  }
+  if (s.type == StudyType::Static || s.type == StudyType::Modal ||
+      s.type == StudyType::Fatigue || s.type == StudyType::ThermalFea ||
+      s.type == StudyType::FreqResponse) {
+    if (!finite(s.meshFineness) || s.meshFineness < 0.0f ||
+        s.meshFineness > 1.0f || !finite(s.meshTargetMm) ||
+        s.meshTargetMm < 0.0f || !finite(s.meshMinMm) ||
+        s.meshMinMm < 0.0f ||
+        (s.meshTargetMm > 0.0f && s.meshMinMm > s.meshTargetMm) ||
+        (s.meshOrder != 1 && s.meshOrder != 2)) {
+      blocker =
+          "Mesh controls must be finite; minimum size cannot exceed target size.";
+      return false;
+    }
+  }
+
+  if (s.type == StudyType::Buckling) {
+    if (!finite(s.bucklingLoadN) || s.bucklingLoadN <= 0.0f) {
+      blocker = "Buckling needs a finite positive compressive load.";
+      return false;
+    }
+    return true;
+  }
+  if (s.type == StudyType::Contact) {
+    if (!finite(s.contactPressureMpa) || s.contactPressureMpa <= 0.0f) {
+      blocker = "Contact needs a finite positive pressure.";
       return false;
     }
     return true;
   }
   if (s.type == StudyType::ThermalFea) {
-    if (s.fixtures.empty() && s.loads.empty()) {
-      blocker = "Add at least one thermal BC: a fixed-temperature face "
-                "(Fixtures) or a "
-                "flux/convection load.";
+    if (!finite(s.thermK) || s.thermK <= 0.0f) {
+      blocker = "Thermal FEA needs positive solid conductivity.";
       return false;
+    }
+    if (!finite(s.thermFixTempC) || !finite(s.thermTInitC)) {
+      blocker = "Thermal boundary and initial temperatures must be finite.";
+      return false;
+    }
+    if (s.thermTransient &&
+        (!finite(s.thermCp) || s.thermCp <= 0.0f ||
+         !finite(s.thermTEndS) || s.thermTEndS <= 0.0f ||
+         !finite(s.thermDtS) || s.thermDtS < 0.0f ||
+         (s.thermDtS > 0.0f && s.thermDtS > s.thermTEndS))) {
+      blocker = "Transient thermal FEA needs positive heat capacity and horizon; dt must be 0 or no greater than the horizon.";
+      return false;
+    }
+    if (s.fixtures.empty() && s.loads.empty()) {
+      blocker = "Add a fixed-temperature face or a flux/convection boundary.";
+      return false;
+    }
+    for (int i = 0; i < (int)s.loads.size(); ++i) {
+      const SimLoad &ld = s.loads[i];
+      if (ld.faces.empty()) {
+        blocker = "Thermal load " + std::to_string(i + 1) + " has no faces.";
+        return false;
+      }
+      if (ld.thermalKind == 1) {
+        if (!finite(ld.hWm2k) || ld.hWm2k <= 0.0f || !finite(ld.tAmbC)) {
+          blocker = "Convection loads need positive h and a finite ambient temperature.";
+          return false;
+        }
+      } else if (!finite(ld.fluxWm2) || std::fabs(ld.fluxWm2) < 1e-12) {
+        blocker = "Heat-flux loads must be finite and non-zero.";
+        return false;
+      }
+    }
+    if (!s.thermTransient && s.fixtures.empty()) {
+      bool hasConvection = false;
+      for (const auto &ld : s.loads)
+        hasConvection = hasConvection || ld.thermalKind == 1;
+      if (!hasConvection) {
+        blocker =
+            "Steady thermal FEA needs a fixed temperature or convection sink.";
+        return false;
+      }
     }
     return true;
   }
   if (s.type == StudyType::FreqResponse) {
-    if (s.materialKey.empty()) {
-      blocker = "Material required — mass and stiffness come from it.";
+    if (!finite(s.frBaseG) || s.frBaseG <= 0.0f || !finite(s.frZeta) ||
+        s.frZeta <= 0.0f || s.frZeta >= 1.0f) {
+      blocker = "Vibration needs positive base acceleration and damping between 0 and 1.";
       return false;
     }
-    return true;
+    return true; // fixtures remain optional: free-free modal basis is intentional
   }
-  if (s.materialKey.empty()) {
-    blocker = "Material required — pick a material before running.";
-    return false;
-  }
-  if (s.type != StudyType::Modal && s.fixtures.empty()) {
+  if (s.type == StudyType::Modal)
+    return true; // intentional free-free exception; no applied load is consumed
+
+  if (s.fixtures.empty()) {
     blocker = "At least one fixed face is required to constrain the part.";
     return false;
   }
+  if (s.loads.empty()) {
+    blocker = "Add at least one non-zero force or pressure load.";
+    return false;
+  }
+  for (int i = 0; i < (int)s.loads.size(); ++i) {
+    const SimLoad &ld = s.loads[i];
+    if (ld.faces.empty()) {
+      blocker = "Load " + std::to_string(i + 1) + " has no faces.";
+      return false;
+    }
+    if (ld.pressure) {
+      if (!finite(ld.pressureMpa) || ld.pressureMpa <= 0.0f) {
+        blocker = "Pressure loads must be finite and greater than zero.";
+        return false;
+      }
+    } else {
+      const double mag2 = (double)ld.vec[0] * ld.vec[0] +
+                          (double)ld.vec[1] * ld.vec[1] +
+                          (double)ld.vec[2] * ld.vec[2];
+      if (!finite(mag2) || mag2 <= 1e-18) {
+        blocker = "Force loads must have a finite non-zero vector.";
+        return false;
+      }
+    }
+  }
   if (s.type == StudyType::Fatigue) {
-    int mi = SimManager::materialIndexByKey(s.materialKey);
-    double matSut = (mi >= 0) ? SimManager::materials()[mi].ultimate_mpa : 0.0;
-    if (s.fatigueSut <= 0.0f && matSut <= 0.0) {
-      blocker = "Fatigue study needs ultimate strength (Sut) \xe2\x80\x94 set "
-                "it in Fatigue parameters "
-                "or choose a material with Sut data.";
+    const double matSut = mat.ultimate_mpa;
+    if ((!finite(s.fatigueSut) || s.fatigueSut <= 0.0f) &&
+        (!finite(matSut) || matSut <= 0.0)) {
+      blocker = "Fatigue needs ultimate strength (Sut) from the study or material.";
+      return false;
+    }
+    float lmin = 0.0f, lmax = 0.0f;
+    fatigueLoadFactors(s, lmin, lmax);
+    if (!finite(lmin) || !finite(lmax) || lmax <= lmin) {
+      blocker = "Fatigue load factors must be finite with maximum greater than minimum.";
       return false;
     }
   }
@@ -4409,12 +5207,33 @@ void SimManager::drawTreeBody(AppState &st) {
         hasAsm = true;
     }
     const bool mechDoc = st.docMirror.hasDoc();
-    const bool ccxMissing = capsStatus_ == 1 && caps_.contains("ccx") &&
-                            !caps_["ccx"].value("found", false);
+    const nlohmann::json flowCaps =
+        st.simClient ? st.simClient->caps() : nlohmann::json::object();
+    const bool openfoamMissing =
+        !flowCaps.is_object() || !flowCaps.value("openfoam", false);
+    const std::string openfoamHint =
+        "OpenFOAM is not routed by this desktop backend; thermal CFD is unavailable.";
+    const bool ccxMissing =
+        capsStatus_ == 1 &&
+        (!caps_.contains("ccx") || !caps_["ccx"].is_object() ||
+         !caps_["ccx"].value("found", false));
     const std::string ccxHint =
-        ccxMissing ? caps_["ccx"].value(
-                         "hint", std::string("CalculiX (ccx) not found."))
-                   : std::string();
+        ccxMissing && caps_.contains("ccx") && caps_["ccx"].is_object()
+            ? caps_["ccx"].value("hint",
+                                 std::string("CalculiX (ccx) not found."))
+            : std::string("CalculiX (ccx) not found.");
+    const bool vibrationMissing =
+        capsStatus_ == 1 &&
+        (!caps_.contains("freq_response") ||
+         !caps_["freq_response"].is_object() ||
+         !caps_["freq_response"].value("available", false));
+    const std::string vibrationHint =
+        vibrationMissing && caps_.contains("freq_response") &&
+                caps_["freq_response"].is_object()
+            ? caps_["freq_response"].value(
+                  "hint",
+                  std::string("Vibration post-processing is unavailable."))
+            : std::string("Vibration post-processing is unavailable.");
 #ifdef __EMSCRIPTEN__
     const bool webNoPy = true;
     const std::string webNoPyHint = "not available in the web version yet";
@@ -4438,8 +5257,9 @@ void SimManager::drawTreeBody(AppState &st) {
       kEntries.push_back(
           {Kind::Fea, StudyType::FreqResponse, "Vibration",
            studyTypeIcon(StudyType::FreqResponse),
-           "Harmonic base-excitation response (modal superposition).", webNoPy,
-           webNoPy ? webNoPyHint : std::string()});
+           "Harmonic base-excitation response (modal superposition).",
+           webNoPy || vibrationMissing,
+           webNoPy ? webNoPyHint : vibrationHint});
       kEntries.push_back({Kind::Fea, StudyType::Buckling, "Buckling",
                           studyTypeIcon(StudyType::Buckling),
                           "Critical load factors (CalculiX box proxy).",
@@ -4452,14 +5272,14 @@ void SimManager::drawTreeBody(AppState &st) {
                           webNoPy ? webNoPyHint : ccxHint});
       kEntries.push_back({Kind::Fea, StudyType::Flow, "Flow",
                           studyTypeIcon(StudyType::Flow),
-                          "External aerodynamics: drag, lift, streamlines. "
-                          "Fast (LBM) or accurate "
-                          "(OpenFOAM).",
+                          "External aerodynamics: deterministic numeric LBM "
+                          "drag and lift results.",
                           webNoPy, webNoPy ? webNoPyHint : std::string()});
       kEntries.push_back({Kind::Fea, StudyType::Thermal, "Thermal (CFD)",
                           studyTypeIcon(StudyType::Thermal),
                           "Heat transfer via OpenFOAM convection / CHT.",
-                          webNoPy, webNoPy ? webNoPyHint : std::string()});
+                          webNoPy || openfoamMissing,
+                          webNoPy ? webNoPyHint : openfoamHint});
       kEntries.push_back({Kind::Fea, StudyType::ThermalFea, "Thermal (FEA)",
                           studyTypeIcon(StudyType::ThermalFea),
                           "Conduction on the part: fixed temps, flux, "
@@ -4575,8 +5395,15 @@ void SimManager::drawTreeBody(AppState &st) {
         openElectronicsPanel(st);
       else if (chosenKind == Kind::Fw)
         openEmulationPanel(st);
-      else
+      else {
         newStudy(st, chosenType);
+        if (sel_ >= 0 && sel_ < (int)studies_.size()) {
+          node_ = SimNode::Study;
+          loadIdx_ = -1;
+          armedWell_ = -1;
+          panelOpen_ = true;
+        }
+      }
       ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();
@@ -4944,8 +5771,12 @@ void SimManager::drawCustomMaterialPopup(AppState &st, Study &s) {
            "lower for "
            "aluminum/non-ferrous. Leave as a fraction of Sut if unsure.");
     ImGui::Separator();
-    const bool ok =
-        cmName_[0] != '\0' && cmE_ > 0.0f && cmNu_ > 0.0f && cmNu_ < 0.5f;
+    const bool ok = cmName_[0] != '\0' && std::isfinite(cmE_) && cmE_ > 0.0f &&
+                    std::isfinite(cmNu_) && cmNu_ > 0.0f && cmNu_ < 0.5f &&
+                    std::isfinite(cmDensity_) && cmDensity_ >= 0.0f &&
+                    std::isfinite(cmYield_) && cmYield_ >= 0.0f &&
+                    std::isfinite(cmUlt_) && cmUlt_ >= 0.0f &&
+                    std::isfinite(cmEnd_) && cmEnd_ >= 0.0f;
     if (!ok)
       ImGui::BeginDisabled();
     if (ImGui::Button("Add", ImVec2(120.0f * S, 0))) {
@@ -4958,9 +5789,15 @@ void SimManager::drawCustomMaterialPopup(AppState &st, Study &s) {
       m.ultimate_mpa = cmUlt_;
       m.endurance_mpa = cmEnd_;
       // Custom material becomes the part's active material (set_material) too.
-      applyPartMaterial(st, s, addCustomMaterial(m));
-      persist(st, s);
-      ImGui::CloseCurrentPopup();
+      const std::string key = addCustomMaterial(m);
+      if (key.empty()) {
+        st.toast(ui::ToastLevel::Error,
+                 "Could not write the custom material library");
+      } else {
+        applyPartMaterial(st, s, key);
+        persist(st, s);
+        ImGui::CloseCurrentPopup();
+      }
     }
     if (!ok)
       ImGui::EndDisabled();
@@ -6390,10 +7227,13 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
   ImGui::PopFont();
   ImGui::Spacing();
 
-  // --- result-field selector (static + fatigue + flow expose multiple fields;
-  // switching is instant) ---
+  // --- result-field selector (static + fatigue + spatial flow results expose
+  // multiple fields; switching is instant). Numeric-only LBM results must not
+  // advertise plot fields that are absent from their result payload.
+  const bool hasFlowPlot =
+      isFlowFamily(s.type) && !s.flowFields.empty() && !s.overlayPath.empty();
   if (s.type == StudyType::Static || s.type == StudyType::Fatigue ||
-      isFlowFamily(s.type)) {
+      hasFlowPlot) {
     const ResultField *arr = (s.type == StudyType::Static)    ? kStaticFields
                              : (s.type == StudyType::Fatigue) ? kFatigueFields
                                                               : kFlowFields;
@@ -6483,6 +7323,7 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
       if (s.freqs.empty())
         row("Frequencies", "(none)");
     } else if (isFlowFamily(s.type) &&
+               (s.type == StudyType::Thermal || s.flowThermal) &&
                flowFieldPresent(s.flowFields, "temperature")) {
       // Thermal / CHT result: temperatures (degC), not forces. cpMin/cpMax
       // carry the surface (or solid) temperature range; the banner adds inlet +
@@ -7202,6 +8043,56 @@ void SimManager::drawForm(AppState &st, Study &s) {
         (st.simClient && st.simClient->busy()) || advRunning_ || prepInFlight_;
     std::string blocker;
     bool ready = studyReady(s, blocker);
+    if (ready && (!st.docMirror.hasDoc() || !hasSimulationGeometry(st))) {
+      ready = false;
+      blocker = "The active document has no solid geometry to simulate.";
+    }
+    if (ready && s.type == StudyType::Motion &&
+        (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size() ||
+         st.docTabs[st.activeTab].kind !=
+             AppState::DocTab::TabKind::Assembly)) {
+      ready = false;
+      blocker = "Motion studies require an active assembly document.";
+    }
+    if (ready && s.type != StudyType::Motion &&
+        s.type != StudyType::Buckling && s.type != StudyType::Contact &&
+        !st.simClient) {
+      ready = false;
+      blocker = "The simulation backend is unavailable.";
+    }
+    if (ready &&
+        ((isFlowFamily(s.type) && s.flowSolver == 1) ||
+         s.type == StudyType::Thermal)) {
+      const auto flowCaps =
+          st.simClient ? st.simClient->caps() : nlohmann::json::object();
+      if (!flowCaps.is_object() || !flowCaps.value("openfoam", false)) {
+        ready = false;
+        blocker =
+            "OpenFOAM is not routed by this backend; thermal CFD is unavailable.";
+      }
+    }
+    if (ready && (s.type == StudyType::Buckling ||
+                  s.type == StudyType::Contact ||
+                  s.type == StudyType::FreqResponse)) {
+      if (capsStatus_ <= 0) {
+        ready = false;
+        blocker = capsStatus_ == 0
+                      ? "Checking advanced simulation capabilities."
+                      : "Advanced simulation capability probe failed.";
+      } else if ((s.type == StudyType::Buckling ||
+                  s.type == StudyType::Contact) &&
+                 (!caps_.contains("ccx") || !caps_["ccx"].is_object() ||
+                  !caps_["ccx"].value("found", false))) {
+        ready = false;
+        blocker = "CalculiX is unavailable.";
+      } else if (s.type == StudyType::FreqResponse &&
+                 (!caps_.contains("freq_response") ||
+                  !caps_["freq_response"].is_object() ||
+                  !caps_["freq_response"].value("available", false))) {
+        ready = false;
+        blocker = "Vibration post-processing is unavailable.";
+      }
+    }
     const bool canRun = ready && !busy;
     if (!canRun)
       ImGui::BeginDisabled();
@@ -7216,10 +8107,22 @@ void SimManager::drawForm(AppState &st, Study &s) {
     else
       simTip("Mesh the part and solve. Results color the model and appear "
              "under Results.");
-    if (busy && st.simClient) {
-      ImGui::SameLine();
-      if (ImGui::SmallButton("Cancel"))
+    if (st.simClient && st.simClient->job().running.load()) {
+      if (st.simClient->cancelRequested()) {
+        ImGui::BeginDisabled();
+        ImGui::SmallButton("Cancel requested");
+        ImGui::EndDisabled();
+      } else if (ImGui::SmallButton("Cancel")) {
         st.simClient->cancel();
+        st.status = "Sim: cancellation requested; waiting for a checkpoint";
+        st.statusKind = 1;
+      }
+      ImGui::TextDisabled(
+          "Cancellation is cooperative and takes effect at the next solver "
+          "checkpoint.");
+    } else if (advRunning_ || prepInFlight_) {
+      ImGui::TextDisabled(
+          "This preparation/advanced stage has no cancellation route.");
     }
     // Live drag-convergence sparkline and final result summary
     if (!s.dragTrace.empty())
@@ -7239,13 +8142,119 @@ void SimManager::drawForm(AppState &st, Study &s) {
 // Motion studies drive ONE dimensional assembly mate across [start, stop] in
 // `steps` samples. simulate_motion is a synchronous worker RPC (same path as
 // sim_mesh / doc_export_step) that returns the full per-body world-transform
-// trajectory in one shot.  The result is cached in the Study and played back on
-// the main thread by tickMotion + applyMotionFrame, which CPU- transforms the
-// base-pose vertex positions and re-uploads via Renderer::setMeshes().
+// trajectory in one shot. The result is cached in the Study and played back on
+// the main thread by tickMotion + applyMotionFrame. The cached AICM is already
+// world-space, so playback applies frameWorld * inverse(cachedBaseWorld).
 //
 // Engine-side solve path: worker_router dispatches "simulate_motion" ->
 // engine.assemble.motion which calls solve_mates() at each driver step.  No
 // simClient / sim worker involved.
+
+using MotionMat4 = std::array<double, 16>;
+
+enum class MotionMatrixLayout { ColumnMajor, RowMajor };
+
+static double motionMatAt(const MotionMat4 &m, int row, int col) {
+  return m[static_cast<size_t>(col * 4 + row)];
+}
+
+static bool invertMotionMatrix(const MotionMat4 &in, MotionMat4 &out) {
+  double aug[4][8] = {};
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) {
+      const double v = motionMatAt(in, r, c);
+      if (!std::isfinite(v))
+        return false;
+      aug[r][c] = v;
+    }
+  for (int r = 0; r < 4; ++r)
+    aug[r][4 + r] = 1.0;
+
+  constexpr double pivotFloor = 1e-12;
+  for (int col = 0; col < 4; ++col) {
+    int pivot = col;
+    for (int r = col + 1; r < 4; ++r)
+      if (std::abs(aug[r][col]) > std::abs(aug[pivot][col]))
+        pivot = r;
+    if (!std::isfinite(aug[pivot][col]) ||
+        std::abs(aug[pivot][col]) <= pivotFloor)
+      return false;
+    if (pivot != col)
+      for (int c = 0; c < 8; ++c)
+        std::swap(aug[pivot][c], aug[col][c]);
+
+    const double divisor = aug[col][col];
+    for (int c = 0; c < 8; ++c)
+      aug[col][c] /= divisor;
+    for (int r = 0; r < 4; ++r) {
+      if (r == col)
+        continue;
+      const double factor = aug[r][col];
+      for (int c = 0; c < 8; ++c)
+        aug[r][c] -= factor * aug[col][c];
+    }
+  }
+
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) {
+      const double v = aug[r][4 + c];
+      if (!std::isfinite(v))
+        return false;
+      out[static_cast<size_t>(c * 4 + r)] = v;
+    }
+  return true;
+}
+
+static bool readMotionMatrix(const nlohmann::json &values,
+                             MotionMatrixLayout layout, MotionMat4 &out,
+                             std::string &err) {
+  if (!values.is_array() || values.size() != 16) {
+    err = "transform must contain exactly 16 numbers";
+    return false;
+  }
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) {
+      const size_t src = layout == MotionMatrixLayout::ColumnMajor
+                             ? static_cast<size_t>(c * 4 + r)
+                             : static_cast<size_t>(r * 4 + c);
+      if (!values[src].is_number()) {
+        err = "transform contains a non-numeric value";
+        return false;
+      }
+      const double v = values[src].get<double>();
+      if (!std::isfinite(v)) {
+        err = "transform contains a non-finite value";
+        return false;
+      }
+      out[static_cast<size_t>(c * 4 + r)] = v;
+    }
+
+  const double affineTol = 1e-6;
+  if (std::abs(motionMatAt(out, 3, 0)) > affineTol ||
+      std::abs(motionMatAt(out, 3, 1)) > affineTol ||
+      std::abs(motionMatAt(out, 3, 2)) > affineTol ||
+      std::abs(motionMatAt(out, 3, 3) - 1.0) > affineTol) {
+    err = "transform is not an affine world transform";
+    return false;
+  }
+  MotionMat4 inverse;
+  if (!invertMotionMatrix(out, inverse)) {
+    err = "transform is singular";
+    return false;
+  }
+  return true;
+}
+
+static MotionMat4 multiplyMotionMatrices(const MotionMat4 &a,
+                                         const MotionMat4 &b) {
+  MotionMat4 out{};
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c)
+      for (int k = 0; k < 4; ++k)
+        out[static_cast<size_t>(c * 4 + r)] +=
+            motionMatAt(a, r, k) * motionMatAt(b, k, c);
+  return out;
+}
 
 // ---------- runMotion
 // -------------------------------------------------------------------
@@ -7256,10 +8265,17 @@ void SimManager::runMotion(AppState &st, Study &s) {
              "Open an assembly with mates before running Motion");
     return;
   }
+  const std::string docId = st.docMirror.docId();
+  clearTransientResult(s);
+  motionDocMesh_ = render::DocMesh{};
+  motionCacheDocId_.clear();
+  motionComponentByBodyId_.clear();
+  motionInverseBaseWorldByComponentId_.clear();
+  persist(st, s);
+  restoreModelMesh(st);
 
-  // Build RPC params.
   nlohmann::json params = {
-      {"doc_id", st.docMirror.docId()},
+      {"doc_id", docId},
       {"start", s.motionStart},
       {"stop", s.motionStop},
       {"steps", std::max(2, std::min(s.motionSteps, 120))},
@@ -7271,65 +8287,119 @@ void SimManager::runMotion(AppState &st, Study &s) {
   st.status = "Motion: solving\xe2\x80\xa6";
   st.statusKind = 0;
 
+  auto failRun = [&](const std::string &message) {
+    s.motionPlaying = false;
+    s.summary = "Motion failed: " + message;
+    st.status = s.summary;
+    st.statusKind = 2;
+    st.addLog("[motion] " + s.summary);
+    st.toast(ui::ToastLevel::Error, s.summary);
+  };
+
   nlohmann::json result;
   std::string err;
   const bool ok =
       st.worker.call("simulate_motion", params, result, err, 120000);
-  if (!ok || result.contains("code")) {
-    const std::string msg =
-        result.contains("message") ? result.value("message", err) : err;
-    st.addLog("[motion] simulate_motion failed: " + msg);
-    st.toast(ui::ToastLevel::Error, msg.empty() ? "Motion solve failed" : msg);
-    s.summary = "Motion failed: " + msg;
+  if (!ok || !result.is_object() || result.contains("code")) {
+    failRun(result.is_object() && result.contains("message")
+                ? result.value("message", err)
+                : (err.empty() ? "motion solver returned no result" : err));
     return;
   }
   if (!result.value("ok", false)) {
-    const std::string msg = result.value("error", std::string("motion error"));
-    st.addLog("[motion] simulate_motion error: " + msg);
-    st.toast(ui::ToastLevel::Error, msg);
-    s.summary = "Motion failed: " + msg;
+    failRun(result.value("error", std::string("motion error")));
+    return;
+  }
+  if (!result.contains("doc_id") || !result["doc_id"].is_string() ||
+      result["doc_id"].get<std::string>() != docId) {
+    failRun("solver result belongs to a different document");
     return;
   }
 
-  // Parse trajectory.
-  s.motionTrajectory = result.value("trajectory", nlohmann::json::array());
+  // The native worker contract is column-major. Accept a trajectory only when every frame
+  // converged, every stable component id is present exactly once, and every transform is finite,
+  // affine, and invertible.
+  const nlohmann::json trajectory =
+      result.value("trajectory", nlohmann::json::array());
+  std::string trajectoryError;
+  std::unordered_set<std::string> expectedComponents;
+  if (!trajectory.is_array() || trajectory.size() < 2)
+    trajectoryError = "trajectory must contain at least two frames";
+  for (size_t fi = 0; trajectoryError.empty() && fi < trajectory.size(); ++fi) {
+    const auto &frameJ = trajectory[fi];
+    if (!frameJ.is_object() || !frameJ.value("converged", false) ||
+        !frameJ.contains("bodies") || !frameJ["bodies"].is_array() ||
+        frameJ["bodies"].empty()) {
+      trajectoryError = "frame " + std::to_string(fi) +
+                        " is incomplete or did not converge";
+      break;
+    }
+    std::unordered_set<std::string> frameComponents;
+    for (const auto &body : frameJ["bodies"]) {
+      if (!body.is_object() || !body.contains("component") ||
+          !body["component"].is_string()) {
+        trajectoryError = "frame " + std::to_string(fi) +
+                          " has a body without a stable component id";
+        break;
+      }
+      const std::string component = body["component"].get<std::string>();
+      if (component.empty() || !frameComponents.insert(component).second) {
+        trajectoryError = "frame " + std::to_string(fi) +
+                          " has an empty or duplicate component id";
+        break;
+      }
+      MotionMat4 parsed;
+      std::string matrixError;
+      if (!body.contains("transform") ||
+          !readMotionMatrix(body["transform"],
+                            MotionMatrixLayout::ColumnMajor, parsed,
+                            matrixError)) {
+        trajectoryError = "frame " + std::to_string(fi) + " component '" +
+                          component + "': " + matrixError;
+        break;
+      }
+    }
+    if (trajectoryError.empty()) {
+      if (fi == 0)
+        expectedComponents = std::move(frameComponents);
+      else if (frameComponents != expectedComponents)
+        trajectoryError = "frame " + std::to_string(fi) +
+                          " does not contain the same component ids as frame 0";
+    }
+  }
+  if (!trajectoryError.empty()) {
+    failRun(trajectoryError);
+    return;
+  }
+
+  s.motionTrajectory = trajectory;
   s.motionDriverUnit = "deg";
   if (result.contains("driver") && result["driver"].is_object())
     s.motionDriverUnit = result["driver"].value("unit", std::string("deg"));
   if (result.contains("mate_id") && result["mate_id"].is_string())
     s.motionMateId = result["mate_id"].get<std::string>();
 
-  const int nFrames = (int)s.motionTrajectory.size();
-  if (nFrames == 0) {
-    st.toast(ui::ToastLevel::Warn, "Motion: trajectory returned no frames");
-    s.summary = "Motion: no trajectory frames";
+  std::string cacheError;
+  if (!prepareMotionCache(st, s, cacheError)) {
+    s.motionRenderError = cacheError;
+    failRun("could not prepare playback geometry: " + cacheError);
     return;
   }
 
-  // Cache the base AICM tessellation so applyMotionFrame can re-upload
-  // transformed geometry.
-  motionDocMesh_ = render::DocMesh{};
-  {
-    std::string aicm, le;
-    if (!st.docMirror.activate(st.worker, st.docMirror.docId(), aicm, le) ||
-        aicm.empty()) {
-      st.addLog("[motion] could not get AICM for base mesh: " + le);
-    } else {
-      std::string pe;
-      if (!render::loadAicmFile(aicm, motionDocMesh_, pe) && !pe.empty())
-        st.addLog("[motion] AICM parse warning: " + pe);
-    }
-  }
-
-  // Build body-name order from frame 0.
-  s.motionBodyNames.clear();
-  if (!s.motionTrajectory.empty() && s.motionTrajectory[0].contains("bodies")) {
-    for (const auto &b : s.motionTrajectory[0]["bodies"])
-      if (b.contains("component") && b["component"].is_string())
-        s.motionBodyNames.push_back(b["component"].get<std::string>());
+  // Stable ids are lookup keys; display names never participate in the render join.
+  s.motionBodyIds.clear();
+  s.motionBodyLabels.clear();
+  for (const auto &body : s.motionTrajectory[0]["bodies"]) {
+    const std::string component = body["component"].get<std::string>();
+    std::string label = body.value("name", component);
+    if (label.empty())
+      label = component;
+    if (label != component)
+      label += " [" + component + "]";
+    s.motionBodyIds.push_back(component);
+    s.motionBodyLabels.push_back(std::move(label));
   }
   s.motionPlotBody = 0;
-
   buildMotionTrace(s);
 
   s.motionHasResult = true;
@@ -7337,8 +8407,8 @@ void SimManager::runMotion(AppState &st, Study &s) {
   s.motionPlaying = false;
   s.motionFrame = 0;
   s.motionLastTick = -1.0;
+  const int nFrames = static_cast<int>(s.motionTrajectory.size());
 
-  // Interference note.
   std::string ifNote;
   if (s.motionCheckInterference && result.contains("interference")) {
     const auto &inf = result["interference"];
@@ -7348,8 +8418,9 @@ void SimManager::runMotion(AppState &st, Study &s) {
       if (col >= 0) {
         std::snprintf(buf, sizeof(buf), " | first collision step %d", col);
         ifNote = buf;
-      } else
+      } else {
         ifNote = " | no collisions";
+      }
     }
   }
   char hdr[160];
@@ -7357,9 +8428,9 @@ void SimManager::runMotion(AppState &st, Study &s) {
       hdr, sizeof(hdr), "Motion: %d frames, %.1f\xe2\x80\x93%.1f %s%s", nFrames,
       s.motionStart, s.motionStop, s.motionDriverUnit.c_str(), ifNote.c_str());
   s.summary = hdr;
+  persist(st, s);
 
-  applyMotionFrame(st, s, 0);
-
+  const bool frameApplied = applyMotionFrame(st, s, 0);
   node_ = SimNode::Results;
   resultShown_ = true;
   shownStudyId_ = s.id;
@@ -7367,10 +8438,208 @@ void SimManager::runMotion(AppState &st, Study &s) {
   if (st.renderer)
     st.renderer->setColormapMode(false);
   st.legendOn = false;
+  if (!frameApplied)
+    return;
 
-  st.status = "Motion ready — " + s.summary;
+  st.status = "Motion ready \xe2\x80\x94 " + s.summary;
+  st.statusKind = ifNote.empty() ? 0 : 1;
   st.addLog("[motion] " + s.summary);
   st.toast(ui::ToastLevel::Info, hdr);
+}
+
+bool SimManager::prepareMotionCache(AppState &st, Study &s,
+                                    std::string &err) {
+  err.clear();
+  if (!st.docMirror.hasDoc()) {
+    err = "no active document";
+    return false;
+  }
+  const std::string docId = st.docMirror.docId();
+
+  // Keep the tessellation metadata from the same activation response as the AICM path. BODY
+  // stores a numeric body id and a display name, while tess.bodies carries the stable component
+  // id; joining those two by body_id avoids ambiguous/renamed component labels.
+  nlohmann::json activation;
+  std::string callError;
+  if (!st.worker.call("doc_activate", {{"doc_id", docId}}, activation,
+                      callError, 60000) ||
+      !activation.is_object() || activation.contains("code")) {
+    err = activation.is_object()
+              ? activation.value("message", callError)
+              : callError;
+    if (err.empty())
+      err = "doc_activate returned no base mesh";
+    return false;
+  }
+  std::string aicmPath;
+  if (!st.docMirror.adoptActivateResponse(docId, activation, aicmPath,
+                                          callError) ||
+      aicmPath.empty()) {
+    err = callError.empty() ? "activation response has no AICM path" : callError;
+    return false;
+  }
+
+  render::DocMesh parsedMesh;
+  std::string parseError;
+  if (!render::loadAicmFile(aicmPath, parsedMesh, parseError) ||
+      parsedMesh.empty()) {
+    err = parseError.empty() ? "base AICM contains no bodies" : parseError;
+    return false;
+  }
+
+  const auto tessIt = activation.find("tess");
+  if (tessIt == activation.end() || !tessIt->is_object() ||
+      !tessIt->contains("bodies") || !(*tessIt)["bodies"].is_array()) {
+    err = "activation response has no stable body metadata";
+    return false;
+  }
+  std::map<uint32_t, std::string> componentByBodyId;
+  for (const auto &meta : (*tessIt)["bodies"]) {
+    if (!meta.is_object() || !meta.contains("body_id") ||
+        !meta["body_id"].is_number_integer() ||
+        !meta.contains("component") || !meta["component"].is_string()) {
+      err = "activation body metadata is malformed";
+      return false;
+    }
+    const long long rawBodyId = meta["body_id"].get<long long>();
+    const std::string component = meta["component"].get<std::string>();
+    if (rawBodyId <= 0 ||
+        rawBodyId > static_cast<long long>(UINT32_MAX) || component.empty() ||
+        !componentByBodyId
+             .emplace(static_cast<uint32_t>(rawBodyId), component)
+             .second) {
+      err = "activation body metadata has an invalid or duplicate stable id";
+      return false;
+    }
+  }
+
+  std::map<std::string, MotionMat4> baseWorld;
+  const auto treeIt = activation.find("tree");
+  if (treeIt == activation.end() || !treeIt->is_object() ||
+      !treeIt->contains("components") ||
+      !(*treeIt)["components"].is_array()) {
+    err = "activation response has no assembly component transforms";
+    return false;
+  }
+  for (const auto &componentJ : (*treeIt)["components"]) {
+    if (!componentJ.is_object() || componentJ.value("suppressed", false))
+      continue;
+    const std::string component =
+        componentJ.value("id", std::string());
+    if (component.empty() || !componentJ.contains("transform"))
+      continue;
+    MotionMat4 world;
+    std::string matrixError;
+    if (!readMotionMatrix(componentJ["transform"],
+                          MotionMatrixLayout::RowMajor, world,
+                          matrixError)) {
+      err = "base transform for component '" + component + "': " +
+            matrixError;
+      return false;
+    }
+    if (!baseWorld.emplace(component, world).second) {
+      err = "assembly has duplicate component id '" + component + "'";
+      return false;
+    }
+  }
+
+  // Pattern-instance bodies have synthetic stable component ids and no row in tree.components.
+  // When the requested sweep contains the assembly's current driven value, that solved frame is
+  // the exact base pose for those instances.
+  double currentDriver = 0.0;
+  bool haveCurrentDriver = false;
+  if (treeIt->contains("mates") && (*treeIt)["mates"].is_array()) {
+    for (const auto &mate : (*treeIt)["mates"]) {
+      if (!mate.is_object() ||
+          mate.value("id", std::string()) != s.motionMateId ||
+          !mate.contains("value"))
+        continue;
+      const nlohmann::json *value = &mate["value"];
+      if (value->is_object() && value->contains("value"))
+        value = &(*value)["value"];
+      if (value->is_number()) {
+        currentDriver = value->get<double>();
+        haveCurrentDriver = std::isfinite(currentDriver);
+      }
+      break;
+    }
+  }
+  if (haveCurrentDriver) {
+    for (const auto &frameJ : s.motionTrajectory) {
+      if (!frameJ.contains("value") || !frameJ["value"].is_number())
+        continue;
+      const double frameValue = frameJ["value"].get<double>();
+      const double valueTol =
+          1e-9 * std::max({1.0, std::abs(currentDriver),
+                           std::abs(frameValue)});
+      if (!std::isfinite(frameValue) ||
+          std::abs(frameValue - currentDriver) > valueTol)
+        continue;
+      for (const auto &bodyJ : frameJ["bodies"]) {
+        const std::string component =
+            bodyJ.value("component", std::string());
+        if (component.empty() || baseWorld.count(component))
+          continue;
+        MotionMat4 world;
+        std::string matrixError;
+        if (!readMotionMatrix(bodyJ["transform"],
+                              MotionMatrixLayout::ColumnMajor, world,
+                              matrixError)) {
+          err = "base transform for component '" + component + "': " +
+                matrixError;
+          return false;
+        }
+        baseWorld.emplace(component, world);
+      }
+      break;
+    }
+  }
+
+  size_t renderableBodies = 0;
+  for (const auto &body : parsedMesh.bodies) {
+    if (body.pos.empty())
+      continue;
+    ++renderableBodies;
+    if (body.n_verts == 0 ||
+        body.pos.size() != static_cast<size_t>(body.n_verts) * 3 ||
+        (!body.nrm.empty() &&
+         body.nrm.size() != static_cast<size_t>(body.n_verts) * 3)) {
+      err = "base AICM body " + std::to_string(body.body_id) +
+            " has inconsistent vertex arrays";
+      return false;
+    }
+    const auto componentIt = componentByBodyId.find(body.body_id);
+    if (componentIt == componentByBodyId.end()) {
+      err = "base AICM body " + std::to_string(body.body_id) +
+            " has no stable component id";
+      return false;
+    }
+    if (!baseWorld.count(componentIt->second)) {
+      err = "base transform is unavailable for component '" +
+            componentIt->second + "'";
+      return false;
+    }
+  }
+  if (renderableBodies == 0) {
+    err = "base AICM contains no renderable bodies";
+    return false;
+  }
+  std::map<std::string, MotionMat4> inverseBaseWorld;
+  for (const auto &entry : baseWorld) {
+    MotionMat4 inverse;
+    if (!invertMotionMatrix(entry.second, inverse)) {
+      err = "base transform is not invertible for component '" +
+            entry.first + "'";
+      return false;
+    }
+    inverseBaseWorld.emplace(entry.first, inverse);
+  }
+
+  motionDocMesh_ = std::move(parsedMesh);
+  motionCacheDocId_ = docId;
+  motionComponentByBodyId_ = std::move(componentByBodyId);
+  motionInverseBaseWorldByComponentId_ = std::move(inverseBaseWorld);
+  return true;
 }
 
 // ---------- buildMotionTrace
@@ -7378,62 +8647,108 @@ void SimManager::runMotion(AppState &st, Study &s) {
 // trajectory parse; per-body traces are derived on demand in drawMotionResults.
 
 void SimManager::buildMotionTrace(Study &s) {
-  // Validate that each frame's bodies array is parseable: this surfaces JSON
-  // shape errors once at run time rather than silently in the draw loop.
-  for (const auto &frame : s.motionTrajectory) {
-    if (!frame.contains("bodies") || !frame["bodies"].is_array())
-      continue;
-    for (const auto &b : frame["bodies"]) {
-      if (!b.contains("transform") || !b["transform"].is_array())
-        continue;
-      if (b["transform"].size() < 16)
-        continue;
-      // One read to prove the values parse without throwing.
-      (void)b["transform"][0].get<double>();
-    }
-  }
-  // motionBodyNames is already set by runMotion before this call.
+  if (s.motionBodyLabels.size() != s.motionBodyIds.size())
+    s.motionBodyLabels = s.motionBodyIds;
+  if (s.motionBodyIds.empty())
+    s.motionPlotBody = 0;
+  else
+    s.motionPlotBody =
+        std::max(0, std::min(s.motionPlotBody,
+                             static_cast<int>(s.motionBodyIds.size()) - 1));
 }
 
-// ---------- applyMotionFrame
-// ----------------------------------------------------------- CPU-transforms
-// the cached base-pose vertex positions by each body's world transform from the
-// trajectory, then re-uploads via Renderer::setMeshes(). Transform convention
-// from simulate_motion: each body["transform"] is a row-major 4×4 float list
-// where row i, col j = T[i*4+j].  Translation = T[3], T[7], T[11].
+// ---------- applyMotionFrame -----------------------------------------------------------
+// CPU-transforms each cached world-space body by frameWorld * inverse(cachedBaseWorld), then
+// atomically re-uploads via Renderer::setMeshes(). Native simulate_motion transforms are
+// column-major 4x4 arrays (OpenGL convention); translation is T[12], T[13], T[14].
 
-void SimManager::applyMotionFrame(AppState &st, Study &s, int frame) {
-  if (!st.renderer)
-    return;
-  if (frame < 0 || frame >= (int)s.motionTrajectory.size())
-    return;
-  const auto &frameJ = s.motionTrajectory[frame];
-  if (!frameJ.contains("bodies") || !frameJ["bodies"].is_array())
-    return;
-
-  // Build name -> 4×4 row-major transform map.
-  struct Mat4r {
-    float m[16];
+bool SimManager::applyMotionFrame(AppState &st, Study &s, int frame) {
+  auto failPlayback = [&](const std::string &message) -> bool {
+    s.motionPlaying = false;
+    const bool firstReport = s.motionRenderError != message;
+    s.motionRenderError = message;
+    st.status = "Motion playback blocked: " + message;
+    st.statusKind = 2;
+    if (firstReport) {
+      st.addLog("[motion] " + st.status);
+      st.toast(ui::ToastLevel::Error, st.status);
+    }
+    return false;
   };
-  std::map<std::string, Mat4r> bodyXf;
-  for (const auto &b : frameJ["bodies"]) {
-    if (!b.contains("component") || !b.contains("transform"))
-      continue;
-    const auto &xf = b["transform"];
-    if (!xf.is_array() || xf.size() < 16)
-      continue;
-    Mat4r M;
-    for (int i = 0; i < 16; ++i)
-      M.m[i] = (float)xf[i].get<double>();
-    bodyXf[b["component"].get<std::string>()] = M;
+
+  if (!st.renderer)
+    return failPlayback("renderer is unavailable");
+  if (!st.docMirror.hasDoc())
+    return failPlayback("the owning document is no longer active");
+  if (frame < 0 || frame >= static_cast<int>(s.motionTrajectory.size()))
+    return failPlayback("requested frame is outside the trajectory");
+
+  if (motionDocMesh_.empty() ||
+      motionCacheDocId_ != st.docMirror.docId()) {
+    std::string cacheError;
+    if (!prepareMotionCache(st, s, cacheError))
+      return failPlayback("could not rebuild the base mesh: " + cacheError);
   }
 
-  // Build PartMesh list: transform each body's vertices; unknowns stay at
-  // identity.
+  const auto &frameJ = s.motionTrajectory[frame];
+  if (!frameJ.is_object() || !frameJ.contains("bodies") ||
+      !frameJ["bodies"].is_array())
+    return failPlayback("trajectory frame has no bodies array");
+
+  std::map<std::string, MotionMat4> frameWorldByComponent;
+  for (const auto &bodyJ : frameJ["bodies"]) {
+    if (!bodyJ.is_object() || !bodyJ.contains("component") ||
+        !bodyJ["component"].is_string() ||
+        !bodyJ.contains("transform"))
+      return failPlayback("trajectory body has no stable component transform");
+    const std::string component =
+        bodyJ["component"].get<std::string>();
+    MotionMat4 frameWorld;
+    std::string matrixError;
+    if (component.empty() ||
+        !readMotionMatrix(bodyJ["transform"],
+                          MotionMatrixLayout::ColumnMajor, frameWorld,
+                          matrixError))
+      return failPlayback("component '" + component + "': " + matrixError);
+    if (!frameWorldByComponent.emplace(component, frameWorld).second)
+      return failPlayback("trajectory frame repeats component id '" +
+                          component + "'");
+  }
+
+  // Build the whole upload before touching the renderer. Any identity, matrix, or vertex failure
+  // leaves the last known-good geometry in place instead of partially corrupting the assembly.
   std::vector<Renderer::PartMesh> parts;
   parts.reserve(motionDocMesh_.bodies.size());
-
   for (const auto &body : motionDocMesh_.bodies) {
+    if (body.pos.empty())
+      continue;
+    const auto componentIt =
+        motionComponentByBodyId_.find(body.body_id);
+    if (componentIt == motionComponentByBodyId_.end())
+      return failPlayback("AICM body " + std::to_string(body.body_id) +
+                          " has no stable component id");
+    const std::string &component = componentIt->second;
+    const auto frameIt = frameWorldByComponent.find(component);
+    const auto inverseBaseIt =
+        motionInverseBaseWorldByComponentId_.find(component);
+    if (frameIt == frameWorldByComponent.end())
+      return failPlayback("frame is missing component '" + component + "'");
+    if (inverseBaseIt == motionInverseBaseWorldByComponentId_.end())
+      return failPlayback("base pose is missing component '" + component + "'");
+
+    const MotionMat4 delta =
+        multiplyMotionMatrices(frameIt->second, inverseBaseIt->second);
+    MotionMat4 inverseDelta;
+    if (!invertMotionMatrix(delta, inverseDelta))
+      return failPlayback("relative transform for component '" + component +
+                          "' is non-finite or singular");
+
+    const size_t vertexFloats = static_cast<size_t>(body.n_verts) * 3;
+    if (body.n_verts == 0 || body.pos.size() != vertexFloats ||
+        (!body.nrm.empty() && body.nrm.size() != vertexFloats))
+      return failPlayback("AICM vertex arrays are invalid for component '" +
+                          component + "'");
+
     Renderer::PartMesh pm;
     pm.body_id = body.body_id;
     pm.color[0] = body.color[0];
@@ -7441,60 +8756,74 @@ void SimManager::applyMotionFrame(AppState &st, Study &s, int frame) {
     pm.color[2] = body.color[2];
     pm.metallic = body.metallic;
     pm.roughness = body.roughness;
+    pm.faces.reserve(body.faces.size());
+    for (const auto &face : body.faces)
+      pm.faces.push_back(
+          {face.face_id, face.first_tri, face.tri_count});
 
-    for (const auto &f : body.faces)
-      pm.faces.push_back({f.face_id, f.first_tri, f.tri_count});
-
-    const uint32_t nv = body.n_verts;
     Mesh mesh;
     mesh.indices = body.idx;
-    mesh.positions.resize(nv * 3);
-    mesh.normals.resize(nv * 3, 0.0f);
+    mesh.positions.resize(vertexFloats);
+    mesh.normals.resize(vertexFloats, 0.0f);
+    for (uint32_t vi = 0; vi < body.n_verts; ++vi) {
+      const float *p = &body.pos[static_cast<size_t>(vi) * 3];
+      if (!std::isfinite(p[0]) || !std::isfinite(p[1]) ||
+          !std::isfinite(p[2]))
+        return failPlayback("base vertices are non-finite for component '" +
+                            component + "'");
+      const double x = delta[0] * p[0] + delta[4] * p[1] +
+                       delta[8] * p[2] + delta[12];
+      const double y = delta[1] * p[0] + delta[5] * p[1] +
+                       delta[9] * p[2] + delta[13];
+      const double z = delta[2] * p[0] + delta[6] * p[1] +
+                       delta[10] * p[2] + delta[14];
+      if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+          std::abs(x) > FLT_MAX || std::abs(y) > FLT_MAX ||
+          std::abs(z) > FLT_MAX)
+        return failPlayback("transformed vertices overflow for component '" +
+                            component + "'");
+      const size_t out = static_cast<size_t>(vi) * 3;
+      mesh.positions[out] = static_cast<float>(x);
+      mesh.positions[out + 1] = static_cast<float>(y);
+      mesh.positions[out + 2] = static_cast<float>(z);
 
-    auto it = bodyXf.find(body.name);
-    if (it != bodyXf.end()) {
-      const float *M = it->second.m;
-      for (uint32_t vi = 0; vi < nv; ++vi) {
-        const float *p = &body.pos[vi * 3];
-        mesh.positions[vi * 3 + 0] =
-            M[0] * p[0] + M[1] * p[1] + M[2] * p[2] + M[3];
-        mesh.positions[vi * 3 + 1] =
-            M[4] * p[0] + M[5] * p[1] + M[6] * p[2] + M[7];
-        mesh.positions[vi * 3 + 2] =
-            M[8] * p[0] + M[9] * p[1] + M[10] * p[2] + M[11];
-        if (!body.nrm.empty()) {
-          const float *n = &body.nrm[vi * 3];
-          mesh.normals[vi * 3 + 0] = M[0] * n[0] + M[1] * n[1] + M[2] * n[2];
-          mesh.normals[vi * 3 + 1] = M[4] * n[0] + M[5] * n[1] + M[6] * n[2];
-          mesh.normals[vi * 3 + 2] = M[8] * n[0] + M[9] * n[1] + M[10] * n[2];
-        } else {
-          mesh.normals[vi * 3 + 1] = 1.0f; // default up normal
-        }
+      if (body.nrm.empty()) {
+        mesh.normals[out + 1] = 1.0f;
+        continue;
       }
-    } else {
-      // No transform for this body — copy as-is.
-      for (uint32_t vi = 0; vi < nv; ++vi) {
-        const float *p = &body.pos[vi * 3];
-        mesh.positions[vi * 3 + 0] = p[0];
-        mesh.positions[vi * 3 + 1] = p[1];
-        mesh.positions[vi * 3 + 2] = p[2];
-        if (!body.nrm.empty()) {
-          mesh.normals[vi * 3 + 0] = body.nrm[vi * 3];
-          mesh.normals[vi * 3 + 1] = body.nrm[vi * 3 + 1];
-          mesh.normals[vi * 3 + 2] = body.nrm[vi * 3 + 2];
-        } else {
-          mesh.normals[vi * 3 + 1] = 1.0f;
-        }
-      }
+      const float *n = &body.nrm[out];
+      if (!std::isfinite(n[0]) || !std::isfinite(n[1]) ||
+          !std::isfinite(n[2]))
+        return failPlayback("base normals are non-finite for component '" +
+                            component + "'");
+      double nx = inverseDelta[0] * n[0] + inverseDelta[1] * n[1] +
+                  inverseDelta[2] * n[2];
+      double ny = inverseDelta[4] * n[0] + inverseDelta[5] * n[1] +
+                  inverseDelta[6] * n[2];
+      double nz = inverseDelta[8] * n[0] + inverseDelta[9] * n[1] +
+                  inverseDelta[10] * n[2];
+      const double normalLength = std::sqrt(nx * nx + ny * ny + nz * nz);
+      if (!std::isfinite(normalLength) || normalLength <= 1e-12)
+        return failPlayback("normal transform is invalid for component '" +
+                            component + "'");
+      nx /= normalLength;
+      ny /= normalLength;
+      nz /= normalLength;
+      mesh.normals[out] = static_cast<float>(nx);
+      mesh.normals[out + 1] = static_cast<float>(ny);
+      mesh.normals[out + 2] = static_cast<float>(nz);
     }
     pm.mesh = std::move(mesh);
     parts.push_back(std::move(pm));
   }
+  if (parts.empty())
+    return failPlayback("base mesh contains no renderable bodies");
 
-  // Freeze camera framing so the view doesn't jump on each frame advance.
   st.renderer->setFramingFrozen(true);
   st.renderer->setMeshes(parts);
   st.renderer->setFramingFrozen(false);
+  s.motionRenderError.clear();
+  return true;
 }
 
 // ---------- scripted-shot motion helpers (CHUDWARE_SHOT=motion)
@@ -7505,6 +8834,13 @@ bool SimManager::motionHasResult() const {
     return false;
   const Study &s = studies_[sel_];
   return s.type == StudyType::Motion && s.motionHasResult;
+}
+
+bool SimManager::flowHasResult() const {
+  if (sel_ < 0 || sel_ >= (int)studies_.size())
+    return false;
+  const Study &s = studies_[sel_];
+  return isFlowFamily(s.type) && s.hasResult;
 }
 
 int SimManager::motionFrameCount() const {
@@ -7535,6 +8871,13 @@ void SimManager::tickMotion(AppState &st) {
   Study &s = studies_[sel_];
   if (s.type != StudyType::Motion || !s.motionHasResult || !s.motionPlaying)
     return;
+  // Playback owns the viewport only while this study's Results node is visible. Otherwise
+  // syncResultView has just restored the editable base mesh and no frame may overwrite it.
+  if (st.activeWorkspace != AppState::Workspace::Simulate ||
+      node_ != SimNode::Results) {
+    s.motionLastTick = -1.0;
+    return;
+  }
 
   const int nFrames = (int)s.motionTrajectory.size();
   if (nFrames <= 1)
@@ -7586,6 +8929,8 @@ void SimManager::drawMotionForm(AppState &st, Study &s) {
   mateIdBuf[sizeof(mateIdBuf) - 1] = '\0';
   if (ImGui::InputText("##motionMateId", mateIdBuf, sizeof(mateIdBuf)))
     s.motionMateId = mateIdBuf;
+  if (ImGui::IsItemDeactivatedAfterEdit())
+    persist(st, s);
   simTip("Mate ID to drive (e.g. \"m3\"). Leave blank to auto-pick the single "
          "drivable mate.");
 
@@ -7741,67 +9086,85 @@ void SimManager::drawMotionResults(AppState &st, Study &s) {
 
   ImGui::TextWrapped("%s", s.summary.c_str());
   ImGui::Spacing();
+  if (!s.motionRenderError.empty()) {
+    const auto &pal = ui::palette;
+    ImGui::PushStyleColor(
+        ImGuiCol_Text,
+        ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1.0f));
+    ImGui::TextWrapped("Playback blocked: %s", s.motionRenderError.c_str());
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+  }
 
   drawMotionTimeline(st, s);
   ImGui::Spacing();
 
-  // Per-body position trace (|translation| vs frame index).
-  if (!s.motionBodyNames.empty()) {
+  // Per-component position trace (|world translation| vs frame index). Stable component ids
+  // select trajectory rows; display names are labels only.
+  if (!s.motionBodyIds.empty()) {
     ImGui::PushFont(st.fonts.medium);
     ImGui::TextUnformatted("Position trace");
     ImGui::PopFont();
 
-    const int nBodies = (int)s.motionBodyNames.size();
+    const int nBodies = static_cast<int>(s.motionBodyIds.size());
     if (nBodies > 1) {
+      const char *preview =
+          s.motionPlotBody >= 0 && s.motionPlotBody < nBodies &&
+                  s.motionPlotBody <
+                      static_cast<int>(s.motionBodyLabels.size())
+              ? s.motionBodyLabels[s.motionPlotBody].c_str()
+              : "(none)";
       ImGui::SetNextItemWidth(-FLT_MIN);
-      if (ImGui::BeginCombo("##motionPlotBody",
-                            s.motionPlotBody < nBodies
-                                ? s.motionBodyNames[s.motionPlotBody].c_str()
-                                : "(none)")) {
+      if (ImGui::BeginCombo("##motionPlotBody", preview)) {
         for (int i = 0; i < nBodies; ++i) {
-          bool sel2 = (i == s.motionPlotBody);
-          if (ImGui::Selectable(s.motionBodyNames[i].c_str(), sel2))
+          const bool selected = i == s.motionPlotBody;
+          const char *label =
+              i < static_cast<int>(s.motionBodyLabels.size())
+                  ? s.motionBodyLabels[i].c_str()
+                  : s.motionBodyIds[i].c_str();
+          ImGui::PushID(s.motionBodyIds[i].c_str());
+          if (ImGui::Selectable(label, selected))
             s.motionPlotBody = i;
-          if (sel2)
+          if (selected)
             ImGui::SetItemDefaultFocus();
+          ImGui::PopID();
         }
         ImGui::EndCombo();
       }
-      simTip("Body whose position magnitude to plot vs frame.");
+      simTip("Component whose world-position magnitude to plot vs frame.");
     }
 
-    const std::string &plotBodyName = (s.motionPlotBody < nBodies)
-                                          ? s.motionBodyNames[s.motionPlotBody]
-                                          : std::string();
+    const std::string plotComponent =
+        s.motionPlotBody >= 0 && s.motionPlotBody < nBodies
+            ? s.motionBodyIds[s.motionPlotBody]
+            : std::string();
     std::vector<float> trace;
     trace.reserve(nFrames);
-    for (const auto &frame : s.motionTrajectory) {
-      float mag = 0.0f;
-      if (frame.contains("bodies")) {
-        for (const auto &b : frame["bodies"]) {
-          if (!b.contains("component") ||
-              b["component"].get<std::string>() != plotBodyName)
-            continue;
-          if (!b.contains("transform") || b["transform"].size() < 16)
-            break;
-          float tx = (float)b["transform"][3].get<double>();
-          float ty = (float)b["transform"][7].get<double>();
-          float tz = (float)b["transform"][11].get<double>();
-          mag = std::sqrt(tx * tx + ty * ty + tz * tz);
-          break;
-        }
+    for (const auto &frameJ : s.motionTrajectory) {
+      float magnitude = 0.0f;
+      for (const auto &bodyJ : frameJ["bodies"]) {
+        if (bodyJ.value("component", std::string()) != plotComponent)
+          continue;
+        const auto &transform = bodyJ["transform"];
+        const double tx = transform[12].get<double>();
+        const double ty = transform[13].get<double>();
+        const double tz = transform[14].get<double>();
+        magnitude = static_cast<float>(
+            std::sqrt(tx * tx + ty * ty + tz * tz));
+        break;
       }
-      trace.push_back(mag);
+      trace.push_back(magnitude);
     }
     if (!trace.empty()) {
       const float plotH = 60.0f * S;
-      ImGui::PlotLines("##motiontrace", trace.data(), (int)trace.size(), 0,
-                       "|pos| (mm)", FLT_MAX, FLT_MAX, ImVec2(-FLT_MIN, plotH));
-      // Vertical cursor at current frame.
+      ImGui::PlotLines("##motiontrace", trace.data(),
+                       static_cast<int>(trace.size()), 0, "|pos| (mm)",
+                       FLT_MAX, FLT_MAX, ImVec2(-FLT_MIN, plotH));
       if (nFrames > 1) {
         ImVec2 rMin = ImGui::GetItemRectMin(), rMax = ImGui::GetItemRectMax();
         float xCur = rMin.x + (rMax.x - rMin.x) *
-                                  ((float)s.motionFrame / (float)(nFrames - 1));
+                                  (static_cast<float>(s.motionFrame) /
+                                   static_cast<float>(nFrames - 1));
         ImGui::GetWindowDrawList()->AddLine(
             ImVec2(xCur, rMin.y), ImVec2(xCur, rMax.y),
             IM_COL32(255, 200, 80, 200), 1.5f * S);
@@ -7861,10 +9224,12 @@ void SimManager::probeCaps(AppState &st) {
       "sim_caps", nlohmann::json::object(),
       [this](const core::RpcResult &r) {
         capsInflight_ = false;
-        if (r.ok && r.result.is_object() && !r.result.contains("code")) {
+        if (r.ok && r.result.is_object() && !r.result.contains("code") &&
+            r.result.value("ok", true)) {
           caps_ = r.result;
           capsStatus_ = 1;
         } else {
+          caps_.clear();
           capsStatus_ = -1;
         }
       },
@@ -7891,9 +9256,18 @@ void SimManager::probeFwStatus(AppState &st) {
       "fw_status", nlohmann::json::object(),
       [this](const core::RpcResult &r) {
         fwProbeInflight_ = false;
-        if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+        if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+            !r.result.value("ok", true)) {
           fwStatus_ = -1;
-          fwHint_ = r.err.empty() ? "fw_status unavailable" : r.err;
+          fwCanEmulate_ = false;
+          fwHint_ = r.result.is_object()
+                        ? r.result.value(
+                              "error",
+                              r.result.value(
+                                  "message",
+                                  r.err.empty() ? "fw_status unavailable"
+                                                : r.err))
+                        : (r.err.empty() ? "fw_status unavailable" : r.err);
           return;
         }
         fwStatus_ = 1;
@@ -7918,7 +9292,9 @@ void SimManager::probeFwStatus(AppState &st) {
           fwsim_.projectsLoaded = true;
           fwsim_.projectIds.clear();
           fwsim_.projectNames.clear();
-          if (r.ok && r.result.is_object() && r.result.contains("projects") &&
+          if (r.ok && r.result.is_object() && !r.result.contains("code") &&
+              r.result.value("ok", true) &&
+              r.result.contains("projects") &&
               r.result["projects"].is_array()) {
             for (const auto &pr : r.result["projects"]) {
               fwsim_.projectIds.push_back(pr.value("id", std::string()));
@@ -7985,24 +9361,31 @@ void SimManager::runThermalFea(AppState &st, Study &s) {
         p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
     std::string e;
     if (!st.worker.call("doc_export_step", p, r, e, 60000) ||
-        r.contains("code")) {
+        !r.is_object() || r.contains("code") || !r.value("ok", true)) {
       st.addLog("[sim] export STEP failed: " +
-                (r.contains("code") ? r.value("message", e) : e));
+                (r.is_object()
+                     ? r.value("message", r.value("error", e))
+                     : e));
       st.toast(ui::ToastLevel::Error, "Simulation: export failed");
       return;
     }
     lastStepPath_ = r.value("path", stepPath);
   }
 
-  // Fixed-temperature (Dirichlet) faces.
+  // Fixed-temperature (Dirichlet) faces. Refuse stale selectors instead of
+  // silently solving a different boundary-value problem.
   nlohmann::json fixtures = nlohmann::json::array();
   for (const auto &pck : s.fixtures.picks) {
     std::string e;
     auto fp = facePointsFor(st, pck.selector, e);
-    if (!fp.is_null() && fp.contains("points")) {
-      fp["temp_c"] = s.thermFixTempC;
-      fixtures.push_back(fp);
+    if (fp.is_null() || !fp.contains("points") || fp["points"].empty()) {
+      st.toast(ui::ToastLevel::Error,
+               "A fixed-temperature face no longer resolves; reselect it");
+      st.addLog("[sim] thermal fixture resolution failed: " + e);
+      return;
     }
+    fp["temp_c"] = s.thermFixTempC;
+    fixtures.push_back(fp);
   }
   // Flux / convection loads.
   nlohmann::json loads = nlohmann::json::array();
@@ -8011,16 +9394,23 @@ void SimManager::runThermalFea(AppState &st, Study &s) {
     for (const auto &pck : ld.faces.picks) {
       std::string e;
       auto fp = facePointsFor(st, pck.selector, e);
-      if (!fp.is_null() && fp.contains("points")) {
-        if (faces.is_null())
-          faces = fp;
-        else
-          for (auto &pt : fp["points"])
-            faces["points"].push_back(pt);
+      if (fp.is_null() || !fp.contains("points") || fp["points"].empty()) {
+        st.toast(ui::ToastLevel::Error,
+                 "A thermal load face no longer resolves; reselect it");
+        st.addLog("[sim] thermal load resolution failed: " + e);
+        return;
       }
+      if (faces.is_null())
+        faces = fp;
+      else
+        for (auto &pt : fp["points"])
+          faces["points"].push_back(pt);
     }
-    if (faces.is_null())
-      continue;
+    if (faces.is_null() || faces["points"].empty()) {
+      st.toast(ui::ToastLevel::Error,
+               "Every thermal load needs at least one resolved face");
+      return;
+    }
     nlohmann::json l = {{"faces", faces}};
     if (ld.thermalKind == 1) {
       l["type"] = "convection";
@@ -8038,12 +9428,15 @@ void SimManager::runThermalFea(AppState &st, Study &s) {
     return;
   }
 
-  // Material: conductivity from the study; density from the picked material
-  // (transient mass).
-  double density = 2.7;
-  int mi = materialIndexByKey(s.materialKey);
-  if (mi >= 0 && materials()[mi].density_g_cm3 > 0)
-    density = materials()[mi].density_g_cm3;
+  // studyReady guarantees a library-resolved material with a positive density
+  // for transient conduction; never substitute an arbitrary material.
+  const int mi = materialIndexByKey(s.materialKey);
+  if (mi < 0 || (s.thermTransient && materials()[mi].density_g_cm3 <= 0)) {
+    st.toast(ui::ToastLevel::Error,
+             "Thermal material is missing required density data");
+    return;
+  }
+  const double density = materials()[mi].density_g_cm3;
   nlohmann::json study = {
       {"step_path", lastStepPath_},
       {"material",
@@ -8066,6 +9459,7 @@ void SimManager::runThermalFea(AppState &st, Study &s) {
   if (sim->launch("sim_run_thermal", {{"study", study}}, note,
                   st.docMirror.docId())) {
     clearTransientResult(s);
+    persist(st, s);
     clearMeshPreview();
     resultShown_ = false;
     shownStudyId_.clear();
@@ -8104,45 +9498,70 @@ void SimManager::runBuckling(AppState &st, Study &s) {
                            {"h_mm", h},          {"E_mpa", m.E_mpa},
                            {"nu", m.nu},         {"load_n", s.bucklingLoadN},
                            {"n_modes", s.nModes}};
+  clearTransientResult(s);
+  persist(st, s);
+  resultShown_ = false;
+  shownStudyId_.clear();
   advRunning_ = true;
   s.summary = "Solving (CalculiX)\xe2\x80\xa6";
   const std::string sid = s.id;
+  const std::string docId = st.docMirror.docId();
   st.rpc.call(
       "sim_run_buckling", params,
-      [this, &st, sid](const core::RpcResult &r) {
+      [this, &st, sid, docId](const core::RpcResult &r) {
         advRunning_ = false;
         for (auto &stu : studies_) {
           if (stu.id != sid)
             continue;
-          if (!r.ok || !r.result.is_object()) {
-            stu.summary = "Buckling run failed: " +
-                          (r.err.empty() ? "worker error" : r.err);
+          auto fail = [&](std::string message) {
+            stu.hasResult = false;
+            stu.summary = std::move(message);
+            persist(st, docId, stu);
             st.addLog("[sim] " + stu.summary);
+            if (simOriginActive(st, this, docId)) {
+              st.status = stu.summary;
+              st.statusKind = 2;
+              st.toast(ui::ToastLevel::Error, stu.summary);
+            }
+          };
+          if (!r.ok || !r.result.is_object()) {
+            fail("Buckling run failed: " +
+                 (r.err.empty() ? std::string("worker error") : r.err));
+            return;
+          }
+          if (!simJsonBool(r.result, "ok", false)) {
+            fail("Buckling: " +
+                 simJsonText(r.result, "error", "reason", "solve failed"));
+            return;
+          }
+          double l0 = 0.0, applied = 0.0;
+          if (!r.result.contains("load_factors") ||
+              !r.result["load_factors"].is_array() ||
+              r.result["load_factors"].empty() ||
+              !r.result["load_factors"][0].is_number() ||
+              !std::isfinite(
+                  l0 = r.result["load_factors"][0].get<double>()) ||
+              l0 <= 0.0 ||
+              !finiteNumber(r.result, "applied_load_n", applied) ||
+              applied <= 0.0) {
+            fail(
+                "Buckling run failed: solver returned no finite positive mode");
             return;
           }
           stu.advResult = r.result;
-          if (!r.result.value("ok", false)) {
-            stu.summary =
-                "Buckling: " +
-                r.result.value(
-                    "error",
-                    r.result.value("reason", std::string("solve failed")));
-            st.addLog("[sim] " + stu.summary);
-            return;
-          }
           stu.hasResult = true;
-          double l0 = 0.0;
-          if (r.result.contains("load_factors") &&
-              r.result["load_factors"].is_array() &&
-              !r.result["load_factors"].empty())
-            l0 = r.result["load_factors"][0].get<double>();
           char buf[160];
           std::snprintf(buf, sizeof(buf),
                         "lowest load factor %.3g (critical %.4g N)", l0,
-                        l0 * r.result.value("applied_load_n", 0.0));
+                        l0 * applied);
           stu.summary = buf;
+          persist(st, docId, stu);
           node_ = SimNode::Results;
           st.addLog("[sim] buckling done: " + stu.summary);
+          if (simOriginActive(st, this, docId)) {
+            st.status = "Buckling complete";
+            st.statusKind = 0;
+          }
           return;
         }
       },
@@ -8168,41 +9587,64 @@ void SimManager::runContact(AppState &st, Study &s) {
                            {"E_mpa", m.E_mpa},
                            {"nu", m.nu},
                            {"pressure_mpa", s.contactPressureMpa}};
+  clearTransientResult(s);
+  persist(st, s);
+  resultShown_ = false;
+  shownStudyId_.clear();
   advRunning_ = true;
   s.summary = "Solving (CalculiX)\xe2\x80\xa6";
   const std::string sid = s.id;
+  const std::string docId = st.docMirror.docId();
   st.rpc.call(
       "sim_run_contact", params,
-      [this, &st, sid](const core::RpcResult &r) {
+      [this, &st, sid, docId](const core::RpcResult &r) {
         advRunning_ = false;
         for (auto &stu : studies_) {
           if (stu.id != sid)
             continue;
-          if (!r.ok || !r.result.is_object()) {
-            stu.summary = "Contact run failed: " +
-                          (r.err.empty() ? "worker error" : r.err);
+          auto fail = [&](std::string message) {
+            stu.hasResult = false;
+            stu.summary = std::move(message);
+            persist(st, docId, stu);
             st.addLog("[sim] " + stu.summary);
+            if (simOriginActive(st, this, docId)) {
+              st.status = stu.summary;
+              st.statusKind = 2;
+              st.toast(ui::ToastLevel::Error, stu.summary);
+            }
+          };
+          if (!r.ok || !r.result.is_object()) {
+            fail("Contact run failed: " +
+                 (r.err.empty() ? std::string("worker error") : r.err));
+            return;
+          }
+          if (!simJsonBool(r.result, "ok", false)) {
+            fail("Contact: " +
+                 simJsonText(r.result, "error", "reason", "solve failed"));
+            return;
+          }
+          double applied = 0.0, reaction = 0.0;
+          if (!finiteNumber(r.result, "applied_load_n", applied) ||
+              applied <= 0.0 ||
+              !finiteNumber(r.result, "base_reaction_n", reaction)) {
+            fail(
+                "Contact run failed: solver returned no finite reaction audit");
             return;
           }
           stu.advResult = r.result;
-          if (!r.result.value("ok", false)) {
-            stu.summary =
-                "Contact: " +
-                r.result.value(
-                    "error",
-                    r.result.value("reason", std::string("solve failed")));
-            st.addLog("[sim] " + stu.summary);
-            return;
-          }
           stu.hasResult = true;
           char buf[160];
           std::snprintf(buf, sizeof(buf),
-                        "applied %.4g N | base reaction %.4g N",
-                        r.result.value("applied_load_n", 0.0),
-                        r.result.value("base_reaction_n", 0.0));
+                        "applied %.4g N | base reaction %.4g N", applied,
+                        reaction);
           stu.summary = buf;
+          persist(st, docId, stu);
           node_ = SimNode::Results;
           st.addLog("[sim] contact done: " + stu.summary);
+          if (simOriginActive(st, this, docId)) {
+            st.status = "Contact complete";
+            st.statusKind = 0;
+          }
           return;
         }
       },
@@ -8221,10 +9663,45 @@ void SimManager::runFreqResponse(AppState &st, Study &s) {
 }
 
 void SimManager::postFreqResponse(AppState &st, Study &s,
-                                  const nlohmann::json &modalRes) {
-  if (!modalRes.contains("mode_shapes") || !modalRes.contains("freqs_hz")) {
-    s.summary = "Vibration: modal solve returned no mode shapes";
+                                  const nlohmann::json &modalRes,
+                                  const std::string &docId) {
+  s.hasResult = false;
+  auto failNow = [&](std::string message) {
+    s.summary = std::move(message);
+    persist(st, docId, s);
     st.addLog("[sim] " + s.summary);
+    if (simOriginActive(st, this, docId)) {
+      st.status = s.summary;
+      st.statusKind = 2;
+      st.toast(ui::ToastLevel::Error, s.summary);
+    }
+  };
+  if (!modalRes.contains("mode_shapes") ||
+      !modalRes["mode_shapes"].is_array() || modalRes["mode_shapes"].empty() ||
+      !modalRes.contains("freqs_hz") || !modalRes["freqs_hz"].is_array() ||
+      modalRes["freqs_hz"].empty()) {
+    failNow("Vibration: modal solve returned no usable mode shapes");
+    return;
+  }
+  const int modalNodes = modalRes.value("n_nodes", 0);
+  const size_t expectedShapeValues =
+      modalNodes > 0
+          ? modalRes["freqs_hz"].size() * (size_t)modalNodes * 3u
+          : 0u;
+  bool finiteModalInput =
+      expectedShapeValues > 0 &&
+      modalRes["mode_shapes"].size() == expectedShapeValues;
+  for (const auto &v : modalRes["freqs_hz"])
+    finiteModalInput =
+        finiteModalInput && v.is_number() &&
+        std::isfinite(v.is_number() ? v.get<double>() : 0.0) &&
+        (v.is_number() ? v.get<double>() >= 0.0 : false);
+  for (const auto &v : modalRes["mode_shapes"])
+    finiteModalInput =
+        finiteModalInput && v.is_number() &&
+        std::isfinite(v.is_number() ? v.get<double>() : 0.0);
+  if (!finiteModalInput) {
+    failNow("Vibration: modal basis dimensions or values are invalid");
     return;
   }
   // Part mass from the solid volume at the material density (eval_mass, same
@@ -8233,16 +9710,18 @@ void SimManager::postFreqResponse(AppState &st, Study &s,
   double massKg = 0.0;
   int mi = materialIndexByKey(s.materialKey);
   const double dens = (mi >= 0) ? materials()[mi].density_g_cm3 : 0.0;
-  if (dens > 0 && st.docMirror.hasDoc()) {
+  if (dens > 0 && !docId.empty()) {
     nlohmann::json r,
-        p = {{"doc_id", st.docMirror.docId()}, {"density_g_cm3", dens}};
+        p = {{"doc_id", docId}, {"density_g_cm3", dens}};
     std::string e;
-    if (st.worker.call("eval_mass", p, r, e, 15000) && !r.contains("code"))
-      massKg = r.value("mass_g", 0.0) / 1000.0;
+    double massG = 0.0;
+    if (st.worker.call("eval_mass", p, r, e, 15000) && r.is_object() &&
+        !r.contains("code") && r.value("ok", true) &&
+        finiteNumber(r, "mass_g", massG))
+      massKg = massG / 1000.0;
   }
   if (massKg <= 0.0) {
-    s.summary = "Vibration: part mass unknown (set a material with density)";
-    st.addLog("[sim] " + s.summary);
+    failNow("Vibration: part mass unknown (set a material with density)");
     return;
   }
   double dir[3] = {0, 0, 0};
@@ -8261,46 +9740,86 @@ void SimManager::postFreqResponse(AppState &st, Study &s,
   const std::string sid = s.id;
   st.rpc.call(
       "sim_freq_response", params,
-      [this, &st, sid](const core::RpcResult &r) {
+      [this, &st, sid, docId](const core::RpcResult &r) {
         advRunning_ = false;
         for (auto &stu : studies_) {
           if (stu.id != sid)
             continue;
-          if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
-            stu.summary =
-                "Vibration post failed: " +
-                (r.ok ? r.result.value("error", std::string("worker error"))
-                      : r.err);
+          auto fail = [&](std::string message) {
+            stu.hasResult = false;
+            stu.summary = std::move(message);
+            persist(st, docId, stu);
             st.addLog("[sim] " + stu.summary);
+            if (simOriginActive(st, this, docId)) {
+              st.status = stu.summary;
+              st.statusKind = 2;
+              st.toast(ui::ToastLevel::Error, stu.summary);
+            }
+          };
+          if (!r.ok || !r.result.is_object() ||
+              !simJsonBool(r.result, "ok", false)) {
+            fail("Vibration post failed: " +
+                 (r.ok && r.result.is_object()
+                      ? simJsonText(r.result, "error", "reason", "worker error")
+                      : (r.err.empty() ? std::string("worker error")
+                                       : r.err)));
+            return;
+          }
+          stu.frSweep.clear();
+          stu.frAccel.clear();
+          if (!r.result.contains("harmonic") ||
+              !r.result["harmonic"].is_object()) {
+            fail("Vibration post failed: no harmonic response returned");
+            return;
+          }
+          const auto &hm = r.result["harmonic"];
+          const auto sweep =
+              hm.value("sweep_hz", nlohmann::json::array());
+          const auto accel =
+              hm.value("accel_g", nlohmann::json::array());
+          if (!sweep.is_array() || !accel.is_array() || sweep.empty() ||
+              sweep.size() != accel.size()) {
+            fail(
+                "Vibration post failed: response arrays are empty or mismatched");
+            return;
+          }
+          for (size_t i = 0; i < sweep.size(); ++i) {
+            if (!sweep[i].is_number() || !accel[i].is_number() ||
+                !std::isfinite(sweep[i].get<double>()) ||
+                !std::isfinite(accel[i].get<double>()) ||
+                sweep[i].get<double>() < 0.0 ||
+                accel[i].get<double>() < 0.0 ||
+                (i > 0 &&
+                 sweep[i].get<double>() <= sweep[i - 1].get<double>())) {
+              fail("Vibration post failed: response values are invalid or "
+                   "frequencies are not increasing");
+              return;
+            }
+            stu.frSweep.push_back((float)sweep[i].get<double>());
+            stu.frAccel.push_back((float)accel[i].get<double>());
+          }
+          double peakAccel = 0.0, peakFreq = 0.0;
+          if (!finiteNumber(hm, "peak_accel_g", peakAccel) ||
+              !finiteNumber(hm, "peak_freq_hz", peakFreq) ||
+              peakAccel < 0.0 || peakFreq < stu.frSweep.front() ||
+              peakFreq > stu.frSweep.back()) {
+            fail("Vibration post failed: peak response is invalid");
             return;
           }
           stu.advResult = r.result;
-          stu.frSweep.clear();
-          stu.frAccel.clear();
-          if (r.result.contains("harmonic") &&
-              r.result["harmonic"].is_object()) {
-            const auto &hm = r.result["harmonic"];
-            if (hm.contains("sweep_hz") && hm["sweep_hz"].is_array())
-              for (const auto &v : hm["sweep_hz"])
-                stu.frSweep.push_back((float)v.get<double>());
-            if (hm.contains("accel_g") && hm["accel_g"].is_array())
-              for (const auto &v : hm["accel_g"])
-                stu.frAccel.push_back((float)v.get<double>());
-            char buf[160];
-            std::snprintf(
-                buf, sizeof(buf), "peak %.2f g @ %.1f Hz (zeta %.3g)",
-                hm.value("peak_accel_g", 0.0), hm.value("peak_freq_hz", 0.0),
-                r.result.value("damping_assumption", std::string()).empty()
-                    ? 0.02
-                    : 0.0);
-            std::snprintf(buf, sizeof(buf), "peak %.2f g @ %.1f Hz",
-                          hm.value("peak_accel_g", 0.0),
-                          hm.value("peak_freq_hz", 0.0));
-            stu.summary = buf;
-          }
+          char buf[160];
+          std::snprintf(buf, sizeof(buf),
+                        "peak %.2f g @ %.1f Hz (zeta %.3g)", peakAccel,
+                        peakFreq, stu.frZeta);
+          stu.summary = buf;
           stu.hasResult = true;
+          persist(st, docId, stu);
           node_ = SimNode::Results;
           st.addLog("[sim] frequency response done: " + stu.summary);
+          if (simOriginActive(st, this, docId)) {
+            st.status = "Vibration response complete";
+            st.statusKind = 0;
+          }
           return;
         }
       },
@@ -8331,15 +9850,19 @@ void SimManager::drawAdvancedResults(AppState &st, Study &s) {
       ImGui::TableSetupColumn("Critical load (N)");
       ImGui::TableHeadersRow();
       const auto &fac = res["load_factors"];
-      const double P = res.value("applied_load_n", 0.0);
+      double P = 0.0;
+      finiteNumber(res, "applied_load_n", P);
       for (int i = 0; i < (int)fac.size(); ++i) {
+        if (!fac[i].is_number() || !std::isfinite(fac[i].get<double>()))
+          continue;
+        const double factor = fac[i].get<double>();
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         ImGui::Text("%d", i + 1);
         ImGui::TableSetColumnIndex(1);
-        ImGui::Text("%.4g", fac[i].get<double>());
+        ImGui::Text("%.4g", factor);
         ImGui::TableSetColumnIndex(2);
-        ImGui::Text("%.4g", fac[i].get<double>() * P);
+        ImGui::Text("%.4g", factor * P);
       }
       ImGui::EndTable();
     }
@@ -8348,8 +9871,16 @@ void SimManager::drawAdvancedResults(AppState &st, Study &s) {
     popDimText();
   } else if (s.type == StudyType::Contact && res.is_object()) {
     ImGui::SeparatorText("Contact conservation check");
-    ImGui::Text("Applied load: %.4g N", res.value("applied_load_n", 0.0));
-    ImGui::Text("Base reaction: %.4g N", res.value("base_reaction_n", 0.0));
+    double applied = 0.0, reaction = 0.0;
+    const bool haveApplied = finiteNumber(res, "applied_load_n", applied);
+    const bool haveReaction =
+        finiteNumber(res, "base_reaction_n", reaction);
+    if (haveApplied)
+      ImGui::Text("Applied load: %.4g N", applied);
+    if (haveReaction)
+      ImGui::Text("Base reaction: %.4g N", reaction);
+    if (!haveApplied || !haveReaction)
+      ImGui::TextDisabled("Reaction audit unavailable in this saved result.");
     pushDimText();
     ImGui::TextWrapped("%s", res.value("note", std::string()).c_str());
     popDimText();
@@ -8423,41 +9954,114 @@ void SimManager::selectElTrace(int idx) {
   el_.ys.clear();
   if (idx < 0 || idx >= (int)el_.probes.size())
     return;
-  const std::string &pr = el_.probes[idx];
-  const auto results = el_.raw.value("results", nlohmann::json::object());
-  if (results.contains("tran") && results["tran"].is_object()) {
-    const auto &tr = results["tran"];
-    if (tr.contains("x_t") && tr["x_t"].is_array() && tr.contains("traces") &&
-        tr["traces"].contains(pr)) {
-      for (const auto &v : tr["x_t"])
-        el_.xs.push_back((float)(v.get<double>() * 1e3));
-      for (const auto &v : tr["traces"][pr])
-        el_.ys.push_back((float)v.get<double>());
+  const std::string &probe = el_.probes[idx];
+  const auto results =
+      el_.raw.contains("results") && el_.raw["results"].is_object()
+          ? el_.raw["results"]
+          : nlohmann::json::object();
+  const nlohmann::json *x = nullptr;
+  const nlohmann::json *y = nullptr;
+  bool milliseconds = false, decibels = false;
+  if (el_.resultAnalysis == 3 && results.contains("tran") &&
+      results["tran"].is_object()) {
+    const auto &blk = results["tran"];
+    if (blk.contains("x_t") && blk["x_t"].is_array() &&
+        blk.contains("traces") && blk["traces"].is_object() &&
+        blk["traces"].contains(probe)) {
+      x = &blk["x_t"];
+      y = &blk["traces"][probe];
+      milliseconds = true;
     }
-  } else if (results.contains("ac") && results["ac"].is_object()) {
-    const auto &ac = results["ac"];
-    if (ac.contains("x_f") && ac["x_f"].is_array() && ac.contains("mag") &&
-        ac["mag"].contains(pr)) {
-      for (const auto &v : ac["x_f"])
-        el_.xs.push_back((float)v.get<double>());
-      for (const auto &v : ac["mag"][pr]) {
-        double m = v.is_number() ? v.get<double>() : 0.0;
-        el_.ys.push_back((float)(20.0 * std::log10(std::max(m, 1e-12))));
-      }
+  } else if (el_.resultAnalysis == 1 && results.contains("dc") &&
+             results["dc"].is_object()) {
+    const auto &blk = results["dc"];
+    if (blk.contains("x") && blk["x"].is_array() &&
+        blk.contains("traces") && blk["traces"].is_object() &&
+        blk["traces"].contains(probe)) {
+      x = &blk["x"];
+      y = &blk["traces"][probe];
     }
+  } else if (el_.resultAnalysis == 2 && results.contains("ac") &&
+             results["ac"].is_object()) {
+    const auto &blk = results["ac"];
+    if (blk.contains("x_f") && blk["x_f"].is_array() &&
+        blk.contains("mag") && blk["mag"].is_object() &&
+        blk["mag"].contains(probe)) {
+      x = &blk["x_f"];
+      y = &blk["mag"][probe];
+      decibels = true;
+    }
+  }
+  if (!x || !y || !y->is_array() || x->empty() || x->size() != y->size())
+    return;
+  for (size_t i = 0; i < x->size(); ++i) {
+    if (!(*x)[i].is_number() || !(*y)[i].is_number())
+      break;
+    double xv = (*x)[i].get<double>(), yv = (*y)[i].get<double>();
+    if (!std::isfinite(xv) || !std::isfinite(yv) ||
+        (decibels && yv < 0.0))
+      break;
+    el_.xs.push_back((float)(milliseconds ? xv * 1e3 : xv));
+    el_.ys.push_back(
+        (float)(decibels ? 20.0 * std::log10(std::max(yv, 1e-12)) : yv));
+  }
+  if (el_.xs.size() != x->size()) {
+    el_.xs.clear();
+    el_.ys.clear();
   }
 }
 
 void SimManager::runElectronics(AppState &st) {
-  if (el_.docTab < 0 || el_.docTab >= (int)st.docTabs.size())
+  if (elRunning_ || el_.docTab < 0 ||
+      el_.docTab >= (int)st.docTabs.size() ||
+      st.docTabs[el_.docTab].kind != AppState::DocTab::TabKind::Schematic ||
+      st.docTabs[el_.docTab].ecadDocId.empty()) {
+    st.toast(ui::ToastLevel::Warn, "Select an open schematic first");
     return;
+  }
+  std::string blocker;
+  if (el_.analysis == 1) {
+    const double span = (double)el_.dcStop - el_.dcStart;
+    if (!el_.dcSource[0])
+      blocker = "DC sweep needs a voltage/current source name.";
+    else if (!std::isfinite(el_.dcStart) || !std::isfinite(el_.dcStop) ||
+             !std::isfinite(el_.dcStep) || el_.dcStep == 0.0f ||
+             span == 0.0 || span * el_.dcStep < 0.0)
+      blocker =
+          "DC sweep needs a non-zero step directed from start toward stop.";
+    else if (std::fabs(span / el_.dcStep) > 1000000.0)
+      blocker = "DC sweep exceeds the one-million-point solver limit.";
+  } else if (el_.analysis == 2 &&
+             (!std::isfinite(el_.acStartHz) ||
+              !std::isfinite(el_.acStopHz) || el_.acStartHz <= 0.0f ||
+              el_.acStopHz <= el_.acStartHz || el_.acPoints < 2)) {
+    blocker =
+        "AC sweep needs positive increasing frequencies and at least 2 points.";
+  } else if (el_.analysis == 3 &&
+             (!std::isfinite(el_.tranStopMs) ||
+              !std::isfinite(el_.tranStepUs) || el_.tranStopMs <= 0.0f ||
+              el_.tranStepUs <= 0.0f ||
+              el_.tranStepUs * 1e-3f >= el_.tranStopMs)) {
+    blocker =
+        "Transient stop time must exceed a positive finite time step.";
+  }
+  if (!blocker.empty()) {
+    st.toast(ui::ToastLevel::Warn, blocker);
+    return;
+  }
   const std::string docId = st.docTabs[el_.docTab].ecadDocId;
-  if (docId.empty())
-    return;
+  const std::string docTitle = st.docTabs[el_.docTab].displayTitle();
+  const int analysis = el_.analysis;
   nlohmann::json analyses = nlohmann::json::array();
-  if (el_.analysis == 0)
+  if (analysis == 0)
     analyses.push_back({{"type", "op"}});
-  else if (el_.analysis == 2)
+  else if (analysis == 1)
+    analyses.push_back({{"type", "dc"},
+                        {"source", std::string(el_.dcSource)},
+                        {"start", el_.dcStart},
+                        {"stop", el_.dcStop},
+                        {"step", el_.dcStep}});
+  else if (analysis == 2)
     analyses.push_back({{"type", "ac"},
                         {"fstart", el_.acStartHz},
                         {"fstop", el_.acStopHz},
@@ -8468,43 +10072,76 @@ void SimManager::runElectronics(AppState &st) {
                         {"tstop", el_.tranStopMs * 1e-3}});
   elRunning_ = true;
   el_.result = -1;
+  el_.resultAnalysis = analysis;
+  el_.resultDocId = docId;
+  el_.resultDocTitle = docTitle;
   el_.error.clear();
   el_.headline.clear();
+  el_.raw = nlohmann::json::object();
+  el_.probes.clear();
+  el_.xs.clear();
+  el_.ys.clear();
   st.rpc.call(
       "ecad_simulate", {{"doc_id", docId}, {"study", {{"analyses", analyses}}}},
-      [this](const core::RpcResult &r) {
+      [this, docId, docTitle, analysis](const core::RpcResult &r) {
         elRunning_ = false;
-        if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+        if (el_.resultDocId != docId || el_.resultAnalysis != analysis)
+          return;
+        // Keep the worker payload for diagnostics even on a failed solve. A populated
+        // results object is not evidence of success: SPICE may return its last iterate
+        // while explicitly reporting non-convergence.
+        if (r.ok && r.result.is_object())
+          el_.raw = r.result;
+        const bool converged =
+            r.ok && r.result.is_object() &&
+            r.result.contains("converged") &&
+            r.result["converged"].is_boolean() &&
+            r.result["converged"].get<bool>();
+        if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+            !r.result.value("ok", true) || !converged) {
           el_.result = 0;
           el_.error =
-              r.ok ? r.result.value("message", std::string("simulation failed"))
-                   : r.err;
+              r.ok && r.result.is_object()
+                  ? r.result.value(
+                        "error",
+                        r.result.value(
+                            "message",
+                            r.result.value(
+                                "hint",
+                                std::string("circuit solver did not converge"))))
+                  : (r.err.empty() ? "simulation returned no result" : r.err);
+          if (el_.error.empty())
+            el_.error = converged ? "simulation failed"
+                                  : "circuit solver did not converge";
           return;
         }
-        if (!r.result.value("ok", true)) {
+        const auto results =
+            r.result.contains("results") && r.result["results"].is_object()
+                ? r.result["results"]
+                : nlohmann::json::object();
+        static const char *keys[4] = {"op", "dc", "ac", "tran"};
+        const char *key = keys[(analysis < 0 || analysis > 3) ? 0 : analysis];
+        if (!results.contains(key) || !results[key].is_object() ||
+            results[key].empty()) {
           el_.result = 0;
-          el_.error = r.result.value("error", std::string("simulation failed"));
+          el_.error =
+              std::string("solver returned no ") + key + " analysis payload";
           return;
         }
         el_.raw = r.result;
         el_.result = 1;
-        el_.headline = r.result.value("converged", false)
-                           ? "Converged"
-                           : "Completed (convergence warnings)";
-        // Collect the probe names from the analysis payload.
+        el_.resultDocTitle = docTitle;
+        el_.headline = "Converged";
         el_.probes.clear();
-        const auto results =
-            r.result.value("results", nlohmann::json::object());
-        const char *keys[2] = {"tran", "ac"};
-        for (const char *k : keys) {
-          if (!results.contains(k) || !results[k].is_object())
-            continue;
-          const auto &blk = results[k];
-          const char *tk = (std::string(k) == "tran") ? "traces" : "mag";
-          if (blk.contains(tk) && blk[tk].is_object())
-            for (auto it = blk[tk].begin(); it != blk[tk].end(); ++it)
-              el_.probes.push_back(it.key());
-        }
+        const auto &blk = results[key];
+        const char *traceKey =
+            analysis == 2 ? "mag" : (analysis == 0 ? nullptr : "traces");
+        if (traceKey && blk.contains(traceKey) &&
+            blk[traceKey].is_object())
+          for (auto it = blk[traceKey].begin(); it != blk[traceKey].end();
+               ++it)
+            el_.probes.push_back(it.key());
+        std::sort(el_.probes.begin(), el_.probes.end());
         selectElTrace(el_.probes.empty() ? -1 : 0);
       },
       60000);
@@ -8562,54 +10199,109 @@ void SimManager::drawElectronicsPanel(AppState &st) {
   }
   simTip("Which open schematic to simulate.");
 
-  static const char *kAn[3] = {"Operating point (DC)", "AC sweep", "Transient"};
-  int ai = (el_.analysis == 0) ? 0 : (el_.analysis == 2) ? 1 : 2;
+  static const char *kAn[4] = {"Operating point", "DC sweep", "AC sweep",
+                               "Transient"};
+  if (el_.analysis < 0 || el_.analysis > 3)
+    el_.analysis = 3;
   ImGui::SetNextItemWidth(-FLT_MIN);
-  if (ImGui::BeginCombo("##elan", kAn[ai])) {
-    if (ImGui::Selectable(kAn[0], ai == 0))
-      el_.analysis = 0;
-    if (ImGui::Selectable(kAn[1], ai == 1))
-      el_.analysis = 2;
-    if (ImGui::Selectable(kAn[2], ai == 2))
-      el_.analysis = 3;
+  if (ImGui::BeginCombo("##elan", kAn[el_.analysis])) {
+    for (int i = 0; i < 4; ++i)
+      if (ImGui::Selectable(kAn[i], el_.analysis == i))
+        el_.analysis = i;
     ImGui::EndCombo();
   }
-  if (el_.analysis == 3) {
+  if (el_.analysis == 1) {
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::InputFloat("##eltstop", &el_.tranStopMs, 0, 0, "t_stop = %.2f ms");
+    ImGui::InputTextWithHint("##eldcsrc", "source name (e.g. V1)",
+                             el_.dcSource, sizeof(el_.dcSource));
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::InputFloat("##eltstep", &el_.tranStepUs, 0, 0, "t_step = %.1f us");
+    ImGui::InputFloat("##eldcstart", &el_.dcStart, 0, 0, "start = %.6g");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputFloat("##eldcstop", &el_.dcStop, 0, 0, "stop = %.6g");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputFloat("##eldcstep", &el_.dcStep, 0, 0, "step = %.6g");
   } else if (el_.analysis == 2) {
     ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::InputFloat("##elfstart", &el_.acStartHz, 0, 0, "f_start = %.0f Hz");
     ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::InputFloat("##elfstop", &el_.acStopHz, 0, 0, "f_stop = %.0f Hz");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputInt("##elacn", &el_.acPoints, 0, 0);
+    simTip("Frequency sample count.");
+  } else if (el_.analysis == 3) {
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputFloat("##eltstop", &el_.tranStopMs, 0, 0, "t_stop = %.2f ms");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputFloat("##eltstep", &el_.tranStepUs, 0, 0, "t_step = %.1f us");
+  }
+
+  std::string elBlocker;
+  if (el_.analysis == 1) {
+    const double span = (double)el_.dcStop - el_.dcStart;
+    if (!el_.dcSource[0])
+      elBlocker = "DC sweep needs a voltage/current source name.";
+    else if (!std::isfinite(el_.dcStart) || !std::isfinite(el_.dcStop) ||
+             !std::isfinite(el_.dcStep) || el_.dcStep == 0.0f ||
+             span == 0.0 || span * el_.dcStep < 0.0)
+      elBlocker =
+          "DC step must be non-zero and directed from start toward stop.";
+    else if (std::fabs(span / el_.dcStep) > 1000000.0)
+      elBlocker = "DC sweep exceeds the one-million-point solver limit.";
+  } else if (el_.analysis == 2 &&
+             (!std::isfinite(el_.acStartHz) ||
+              !std::isfinite(el_.acStopHz) || el_.acStartHz <= 0.0f ||
+              el_.acStopHz <= el_.acStartHz || el_.acPoints < 2)) {
+    elBlocker =
+        "AC sweep needs positive increasing frequencies and at least 2 points.";
+  } else if (el_.analysis == 3 &&
+             (!std::isfinite(el_.tranStopMs) ||
+              !std::isfinite(el_.tranStepUs) || el_.tranStopMs <= 0.0f ||
+              el_.tranStepUs <= 0.0f ||
+              el_.tranStepUs * 1e-3f >= el_.tranStopMs)) {
+    elBlocker =
+        "Transient stop time must exceed a positive finite time step.";
   }
 
   ImGui::Spacing();
-  if (elRunning_) {
+  if (elRunning_ || !elBlocker.empty()) {
     ImGui::BeginDisabled();
-    ImGui::Button("Running\xe2\x80\xa6", ImVec2(-FLT_MIN, 0));
+    ImGui::Button(elRunning_ ? "Running\xe2\x80\xa6" : "Run",
+                  ImVec2(-FLT_MIN, 0));
     ImGui::EndDisabled();
   } else if (ImGui::Button("Run", ImVec2(-FLT_MIN, 0))) {
     runElectronics(st);
   }
+  if (!elBlocker.empty())
+    ImGui::TextWrapped("%s", elBlocker.c_str());
   simTip("Build the SPICE netlist from the schematic and solve (async). Probes "
-         "default to "
-         "every node voltage + source current.");
+         "default to every node voltage + source current.");
 
   ImGui::Spacing();
   ImGui::Separator();
-  if (el_.result == 0) {
+  const std::string currentDocId = st.docTabs[el_.docTab].ecadDocId;
+  const bool resultMatches =
+      el_.resultDocId.empty() || el_.resultDocId == currentDocId;
+  if (!resultMatches && el_.result >= 0) {
+    ImGui::TextWrapped("Last result belongs to %s. Run this schematic to replace it.",
+                       el_.resultDocTitle.c_str());
+  } else if (el_.result == 0) {
     ImGui::TextWrapped("Failed: %s", el_.error.c_str());
   } else if (el_.result == 1) {
     ImGui::TextUnformatted(el_.headline.c_str());
-    const auto results = el_.raw.value("results", nlohmann::json::object());
-    if (el_.analysis == 0 && results.contains("op") &&
+    if (el_.resultAnalysis >= 0 && el_.resultAnalysis < 4)
+      ImGui::TextDisabled("%s \xe2\x80\x94 %s",
+                          el_.resultDocTitle.c_str(),
+                          kAn[el_.resultAnalysis]);
+    const auto results =
+        el_.raw.contains("results") && el_.raw["results"].is_object()
+            ? el_.raw["results"]
+            : nlohmann::json::object();
+    if (el_.resultAnalysis == 0 && results.contains("op") &&
         results["op"].is_object()) {
       ImGui::SeparatorText("Operating point");
       for (auto it = results["op"].begin(); it != results["op"].end(); ++it)
-        if (it.value().is_number())
+        if (it.value().is_number() &&
+            std::isfinite(it.value().get<double>()))
           ImGui::Text("%s = %.6g", it.key().c_str(), it.value().get<double>());
     } else if (!el_.probes.empty()) {
       ImGui::SetNextItemWidth(-FLT_MIN);
@@ -8623,12 +10315,31 @@ void SimManager::drawElectronicsPanel(AppState &st) {
             selectElTrace(i);
         ImGui::EndCombo();
       }
-      if (!el_.xs.empty() && el_.xs.size() == el_.ys.size())
+      if (!el_.xs.empty() && el_.xs.size() == el_.ys.size()) {
+        const bool ac = el_.resultAnalysis == 2;
+        const bool tran = el_.resultAnalysis == 3;
         drawEmLinePlot("##elplot", el_.xs, &el_.ys,
-                       el_.analysis == 2 ? "mag (dB)" : "V / I", nullptr,
-                       nullptr, el_.analysis == 2 ? "f (Hz)" : "t (ms)",
-                       el_.analysis == 2 ? "dB" : "value");
+                       ac ? "mag (dB)" : "V / I", nullptr, nullptr,
+                       ac ? "f (Hz)" : (tran ? "t (ms)" : "source"),
+                       ac ? "dB" : "value");
+      } else {
+        ImGui::TextDisabled(
+            "Selected trace is empty or contains non-finite samples.");
+      }
     }
+    const auto convergence =
+        el_.raw.contains("convergence") && el_.raw["convergence"].is_object()
+            ? el_.raw["convergence"]
+            : nlohmann::json::object();
+    for (auto it = convergence.begin(); it != convergence.end(); ++it)
+      if (it.value().is_boolean() && !it.value().get<bool>())
+        ImGui::TextWrapped("Convergence warning: %s did not converge.",
+                           it.key().c_str());
+    for (const char *key : {"warnings", "log"})
+      if (el_.raw.contains(key) && el_.raw[key].is_array())
+        for (const auto &line : el_.raw[key])
+          if (line.is_string())
+            ImGui::TextWrapped("%s", line.get<std::string>().c_str());
   } else {
     ImGui::TextDisabled("Run to simulate the schematic.");
   }
@@ -8646,7 +10357,17 @@ void SimManager::openEmulationPanel(AppState &st) {
 void SimManager::runEmulation(AppState &st) {
   if (fwsim_.projIdx < 0 || fwsim_.projIdx >= (int)fwsim_.projectIds.size())
     return;
+  if (!std::isfinite(fwsim_.durationMs) || fwsim_.durationMs <= 0.0f ||
+      fwsim_.durationMs > 600000.0f) {
+    st.toast(ui::ToastLevel::Warn,
+             "Emulation duration must be between 0 and 600000 ms");
+    return;
+  }
   nlohmann::json p{{"project_id", fwsim_.projectIds[fwsim_.projIdx]}};
+  const double timeoutS = fwsim_.durationMs * 0.001 + 5.0;
+  p["timeout_s"] = timeoutS;
+  const int rpcTimeoutMs =
+      (int)std::ceil((timeoutS + 5.0) * 1000.0);
   nlohmann::json asserts = nlohmann::json::array();
   std::string buf(fwsim_.asserts);
   size_t start = 0;
@@ -8673,29 +10394,50 @@ void SimManager::runEmulation(AppState &st) {
       "fw_sim_run", p,
       [this](const core::RpcResult &r) {
         fwRunning_ = false;
-        if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+        if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+            !r.result.value("ok", true)) {
           fwsim_.result = 0;
           fwsim_.error =
-              r.ok ? r.result.value("message", std::string("emulation failed"))
-                   : r.err;
+              r.ok && r.result.is_object()
+                  ? r.result.value(
+                        "error",
+                        r.result.value("message",
+                                       std::string("emulation failed")))
+                  : (r.err.empty() ? "emulation returned no result" : r.err);
           return;
         }
-        fwsim_.result = r.result.value("passed", false) ? 1 : 0;
+        double elapsedMs = 0.0;
+        if (!r.result.contains("passed") ||
+            !r.result["passed"].is_boolean() ||
+            !finiteNumber(r.result, "ms", elapsedMs) || elapsedMs < 0.0) {
+          fwsim_.result = 0;
+          fwsim_.error =
+              "emulation returned an incomplete or non-finite result";
+          return;
+        }
+        const bool passed = r.result["passed"].get<bool>();
+        fwsim_.result = passed ? 1 : 0;
         char buf2[96];
         std::snprintf(buf2, sizeof(buf2), "%s  (%.0f ms emulated)",
-                      r.result.value("passed", false) ? "PASSED" : "NOT PASSED",
-                      r.result.value("ms", 0.0));
+                      passed ? "PASSED" : "NOT PASSED", elapsedMs);
         fwsim_.headline = buf2;
         if (r.result.contains("assertion_results") &&
             r.result["assertion_results"].is_array())
           for (const auto &a : r.result["assertion_results"]) {
             if (!a.is_object())
               continue;
-            std::string line = a.value("passed", false) ? "PASS  " : "FAIL  ";
-            line += a.value("assertion", std::string());
+            const bool assertionPassed =
+                a.contains("passed") && a["passed"].is_boolean() &&
+                a["passed"].get<bool>();
+            std::string line = assertionPassed ? "PASS  " : "FAIL  ";
+            if (a.contains("assertion") && a["assertion"].is_string())
+              line += a["assertion"].get<std::string>();
             fwsim_.uart.push_back(std::move(line));
           }
-        const std::string uart = r.result.value("uart_log", std::string());
+        const std::string uart =
+            r.result.contains("uart_log") && r.result["uart_log"].is_string()
+                ? r.result["uart_log"].get<std::string>()
+                : std::string();
         if (!uart.empty()) {
           std::istringstream is(uart);
           std::string ln;
@@ -8703,7 +10445,7 @@ void SimManager::runEmulation(AppState &st) {
             fwsim_.uart.push_back(ln);
         }
       },
-      120000);
+      rpcTimeoutMs);
 }
 
 void SimManager::drawEmulationPanel(AppState &st) {
@@ -8773,14 +10515,25 @@ void SimManager::drawEmulationPanel(AppState &st) {
       fwsim_.asserts, sizeof(fwsim_.asserts));
   simTip("Scenario assertions checked against the emulated run (UART text, "
          "GPIO levels).");
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  ImGui::DragFloat("##fwduration", &fwsim_.durationMs, 10.0f, 1.0f,
+                   600000.0f, "run = %.0f ms");
+  simTip("Requested target emulation time. The backend adds a five-second "
+         "startup/shutdown grace period.");
   ImGui::Spacing();
-  if (fwRunning_) {
+  const bool badDuration =
+      !std::isfinite(fwsim_.durationMs) || fwsim_.durationMs <= 0.0f ||
+      fwsim_.durationMs > 600000.0f;
+  if (fwRunning_ || badDuration) {
     ImGui::BeginDisabled();
-    ImGui::Button("Running\xe2\x80\xa6", ImVec2(-FLT_MIN, 0));
+    ImGui::Button(fwRunning_ ? "Running\xe2\x80\xa6" : "Run emulation",
+                  ImVec2(-FLT_MIN, 0));
     ImGui::EndDisabled();
   } else if (ImGui::Button("Run emulation", ImVec2(-FLT_MIN, 0))) {
     runEmulation(st);
   }
+  if (badDuration)
+    ImGui::TextWrapped("Duration must be between 0 and 600000 ms.");
   simTip(
       "Build (if needed) and run the firmware in Renode/QEMU with the scenario "
       "assertions (async).");
@@ -8808,19 +10561,123 @@ void SimManager::drawEmulationPanel(AppState &st) {
 // ---------------------------------------------------------------- cross-sim
 // handoff panel
 
+static bool handoffFiniteNumber(const nlohmann::json &row, const char *key,
+                                double *out = nullptr) {
+  if (!row.is_object() || !row.contains(key) || !row[key].is_number())
+    return false;
+  const double value = row[key].get<double>();
+  if (!std::isfinite(value))
+    return false;
+  if (out)
+    *out = value;
+  return true;
+}
+
+static bool usableHeatsinkRow(const nlohmann::json &row) {
+  double power = 0.0;
+  return row.is_object() && row.value("mapped", false) &&
+         row.contains("ref") && row["ref"].is_string() &&
+         !row["ref"].get_ref<const std::string &>().empty() &&
+         handoffFiniteNumber(row, "power_w", &power) && power > 0.0;
+}
+
+static const nlohmann::json *
+findHeatsinkRow(const nlohmann::json &result, const std::string &componentRef) {
+  if (componentRef.empty() || !result.is_object() ||
+      !result.contains("components") || !result["components"].is_array())
+    return nullptr;
+  for (const auto &row : result["components"])
+    if (row.is_object() && row.value("ref", std::string()) == componentRef)
+      return &row;
+  return nullptr;
+}
+
+int SimManager::resolveHandoffDocTab(const AppState &st) const {
+  if (ho_.ecadDocId.empty())
+    return -1;
+  for (int i = 0; i < (int)st.docTabs.size(); ++i)
+    if (st.docTabs[i].kind == AppState::DocTab::TabKind::PCB &&
+        st.docTabs[i].ecadDocId == ho_.ecadDocId)
+      return i;
+  return -1;
+}
+
+void SimManager::deriveHeatsinkTarget(const std::string &componentRef) {
+  ho_.heatsinkComponentRef = componentRef;
+  ho_.heatsinkTargetC = 0.0f;
+  const nlohmann::json *row = findHeatsinkRow(ho_.result, componentRef);
+  if (!row)
+    return;
+  double target = 0.0;
+  if (handoffFiniteNumber(*row, "tj_max_c", &target)) {
+    ho_.heatsinkTargetKind = 0;
+    ho_.heatsinkTargetC = (float)target;
+  } else if (handoffFiniteNumber(*row, "tj_c", &target)) {
+    ho_.heatsinkTargetKind = 0;
+    ho_.heatsinkTargetC = (float)target;
+  } else if (handoffFiniteNumber(*row, "t_case_c", &target)) {
+    ho_.heatsinkTargetKind = 1;
+    ho_.heatsinkTargetC = (float)target;
+  }
+}
+
+std::string SimManager::heatsinkSetupBlocker(const AppState &st) const {
+  if (resolveHandoffDocTab(st) < 0)
+    return "The source board is no longer open. Reopen it and start a new "
+           "thermal handoff.";
+  if (ho_.running)
+    return "Wait for the thermal handoff solve to finish.";
+  if (!ho_.heatsinkContextReady || !ho_.result.is_object() ||
+      !ho_.result.value("ok", false) || !ho_.result.value("solved", false) ||
+      ho_.result.value("doc_id", std::string()) != ho_.ecadDocId)
+    return "Run a successful thermal handoff for this board before picking a "
+           "heatsink.";
+  const nlohmann::json *row =
+      findHeatsinkRow(ho_.result, ho_.heatsinkComponentRef);
+  if (!row || !usableHeatsinkRow(*row))
+    return "Choose a mapped powered component from the thermal result.";
+  if (ho_.heatsinkTargetKind < 0 || ho_.heatsinkTargetKind > 1 ||
+      !std::isfinite(ho_.heatsinkTargetC))
+    return "Enter a finite junction or case temperature target.";
+  double ambient = 0.0;
+  if (!ho_.result.contains("environment") ||
+      !handoffFiniteNumber(ho_.result["environment"], "t_amb_c", &ambient))
+    return "The thermal handoff did not provide a finite ambient temperature.";
+  if (ho_.heatsinkTargetC <= ambient)
+    return "The heatsink target must be above the handoff ambient temperature.";
+  return {};
+}
+
 void SimManager::openHandoffPanel(AppState &st, int pcbTab) {
   handoffPanelOpen_ = true;
-  ho_.docTab = pcbTab;
+  std::string ecadId;
+  std::string title;
+  if (pcbTab >= 0 && pcbTab < (int)st.docTabs.size() &&
+      st.docTabs[pcbTab].kind == AppState::DocTab::TabKind::PCB) {
+    ecadId = st.docTabs[pcbTab].ecadDocId;
+    title = st.docTabs[pcbTab].displayTitle();
+  }
+  if (ecadId != ho_.ecadDocId) {
+    ho_.heatsinkComponentRef.clear();
+    ho_.heatsinkTargetC = 0.0f;
+    ho_.heatsinkContextReady = false;
+  }
+  ho_.ecadDocId = std::move(ecadId);
+  ho_.ecadDocTitle = std::move(title);
   probeCaps(st);
   st.leftPaneTab = AppState::LP_Simulation;
 }
 
 void SimManager::runEcadThermalHandoff(AppState &st) {
-  if (ho_.docTab < 0 || ho_.docTab >= (int)st.docTabs.size())
+  const int sourceTab = resolveHandoffDocTab(st);
+  if (sourceTab < 0) {
+    ho_.error =
+        "source board closed or was replaced; start a new handoff from an open "
+        "PCB";
     return;
-  const std::string ecadId = st.docTabs[ho_.docTab].ecadDocId;
-  if (ecadId.empty())
-    return;
+  }
+  const std::string ecadId = ho_.ecadDocId;
+  ho_.heatsinkContextReady = false;
   // Fetch the full board document (ecad_tree carries the doc verbatim) — sync
   // but light (the board JSON is already resident in the worker's session).
   nlohmann::json tree, boardDoc;
@@ -8844,15 +10701,41 @@ void SimManager::runEcadThermalHandoff(AppState &st) {
   ho_.error.clear();
   st.rpc.call(
       "ecad_thermal_handoff", params,
-      [this, &st](const core::RpcResult &r) {
+      [this, &st, ecadId](const core::RpcResult &r) {
         ho_.running = false;
+        if (ho_.ecadDocId != ecadId)
+          return;
         if (!r.ok || !r.result.is_object()) {
           ho_.error = r.err.empty() ? "worker error" : r.err;
           return;
         }
         ho_.result = r.result;
-        if (!r.result.value("ok", false))
+        ho_.heatsinkContextReady =
+            r.result.value("ok", false) &&
+            r.result.value("solved", false);
+        if (!r.result.value("ok", false)) {
           ho_.error = r.result.value("error", std::string("handoff failed"));
+        } else if (r.result.value("solved", false)) {
+          const nlohmann::json *selected =
+              findHeatsinkRow(ho_.result, ho_.heatsinkComponentRef);
+          if (!selected || !usableHeatsinkRow(*selected)) {
+            selected = nullptr;
+            if (ho_.result.contains("components") &&
+                ho_.result["components"].is_array())
+              for (const auto &row : ho_.result["components"])
+                if (usableHeatsinkRow(row)) {
+                  selected = &row;
+                  break;
+                }
+          }
+          if (selected)
+            deriveHeatsinkTarget(
+                selected->value("ref", std::string()));
+          else {
+            ho_.heatsinkComponentRef.clear();
+            ho_.heatsinkTargetC = 0.0f;
+          }
+        }
         st.addLog("[sim] ecad_thermal_handoff: " +
                   r.result.value("hint",
                                  r.result.value("error", std::string("done"))));
@@ -8861,13 +10744,34 @@ void SimManager::runEcadThermalHandoff(AppState &st) {
 }
 
 void SimManager::runHeatsinkSelect(AppState &st) {
+  const std::string blocker = heatsinkSetupBlocker(st);
+  if (!blocker.empty()) {
+    st.toast(ui::ToastLevel::Warn, blocker);
+    return;
+  }
+  nlohmann::json params = {
+      {"component_ref", ho_.heatsinkComponentRef},
+  };
+  if (ho_.heatsinkTargetKind == 0)
+    params["tj_target_c"] = ho_.heatsinkTargetC;
+  else
+    params["t_case_target_c"] = ho_.heatsinkTargetC;
+  const std::string ecadId = ho_.ecadDocId;
   ho_.heatsinkRunning = true;
   st.rpc.call(
-      "heatsink_select", nlohmann::json::object(),
-      [this](const core::RpcResult &r) {
+      "heatsink_select", params,
+      [this, ecadId](const core::RpcResult &r) {
         ho_.heatsinkRunning = false;
+        if (ho_.ecadDocId != ecadId)
+          return;
         ho_.heatsink =
-            r.ok ? r.result : nlohmann::json{{"ok", false}, {"error", r.err}};
+            r.ok && r.result.is_object()
+                ? r.result
+                : nlohmann::json{
+                      {"ok", false},
+                      {"error", r.err.empty()
+                                    ? "heatsink selection returned no result"
+                                    : r.err}};
       },
       300000);
 }
@@ -8890,8 +10794,21 @@ void SimManager::drawHandoffPanel(AppState &st) {
   ImGui::Separator();
   ImGui::Spacing();
 
-  if (ho_.docTab >= 0 && ho_.docTab < (int)st.docTabs.size())
-    ImGui::Text("Board: %s", st.docTabs[ho_.docTab].displayTitle().c_str());
+  const int sourceTab = resolveHandoffDocTab(st);
+  const bool sourceOpen = sourceTab >= 0;
+  if (sourceOpen) {
+    ImGui::Text("Board: %s", st.docTabs[sourceTab].displayTitle().c_str());
+  } else {
+    const std::string label =
+        !ho_.ecadDocTitle.empty() ? ho_.ecadDocTitle : ho_.ecadDocId;
+    ImGui::Text("Board: %s (not open)",
+                label.empty() ? "(source unavailable)" : label.c_str());
+    pushDimText();
+    ImGui::TextWrapped(
+        "The source board was closed or replaced. Reopen it and start a new "
+        "handoff; another tab will never be substituted.");
+    popDimText();
+  }
   static const char *kEnvLabels[3] = {"Still air (h=10)", "Forced air (h=50)",
                                       "Cold plate (bottom held)"};
   int ei = (ho_.envIdx < 0 || ho_.envIdx > 2) ? 0 : ho_.envIdx;
@@ -8924,44 +10841,127 @@ void SimManager::drawHandoffPanel(AppState &st) {
                   .c_str()
             : "worker unreachable (sim_caps probe failed)");
     popDimText();
-  } else if (ho_.running) {
-    ImGui::BeginDisabled();
-    ImGui::Button("Solving\xe2\x80\xa6", ImVec2(-FLT_MIN, 0));
-    ImGui::EndDisabled();
-  } else if (ImGui::Button("Send board to thermal FEA", ImVec2(-FLT_MIN, 0))) {
-    runEcadThermalHandoff(st);
+  } else {
+    const bool disabled = ho_.running || !sourceOpen;
+    if (disabled)
+      ImGui::BeginDisabled();
+    if (ImGui::Button(ho_.running ? "Solving\xe2\x80\xa6"
+                                  : "Send board to thermal FEA",
+                      ImVec2(-FLT_MIN, 0)) &&
+        !disabled)
+      runEcadThermalHandoff(st);
+    if (disabled)
+      ImGui::EndDisabled();
   }
 
-  // T-FIN17 forward seam: the button exists behind an endpoint-availability
-  // check and lights up the moment the heatsink selection loop lands in the
-  // worker.
+  // T-FIN17 forward seam. Selection is bound to a stable component reference
+  // from this board's solved handoff; the target remains editable because a
+  // part limit is not always present in ECAD metadata.
+  const bool handoffReady =
+      ho_.heatsinkContextReady && ho_.result.is_object() &&
+      ho_.result.value("ok", false) && ho_.result.value("solved", false) &&
+      ho_.result.value("doc_id", std::string()) == ho_.ecadDocId;
+  const nlohmann::json *selectedRow =
+      findHeatsinkRow(ho_.result, ho_.heatsinkComponentRef);
+  if (selectedRow && !usableHeatsinkRow(*selectedRow))
+    selectedRow = nullptr;
+  if (handoffReady && !selectedRow && ho_.result.contains("components") &&
+      ho_.result["components"].is_array()) {
+    for (const auto &row : ho_.result["components"])
+      if (usableHeatsinkRow(row)) {
+        deriveHeatsinkTarget(row.value("ref", std::string()));
+        selectedRow = &row;
+        break;
+      }
+  }
+
+  ImGui::SeparatorText("Heatsink setup");
+  if (handoffReady && selectedRow) {
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##hscomponent",
+                          ho_.heatsinkComponentRef.c_str())) {
+      for (const auto &row : ho_.result["components"]) {
+        if (!usableHeatsinkRow(row))
+          continue;
+        const std::string ref = row.value("ref", std::string());
+        if (ImGui::Selectable(ref.c_str(),
+                              ref == ho_.heatsinkComponentRef))
+          deriveHeatsinkTarget(ref);
+      }
+      ImGui::EndCombo();
+    }
+    simTip("Mapped powered component to cool. The stable ECAD reference is sent "
+           "to the selector.");
+
+    static const char *kTargetKinds[2] = {"Junction target (Tj)",
+                                          "Case target (Tcase)"};
+    if (ho_.heatsinkTargetKind < 0 || ho_.heatsinkTargetKind > 1)
+      ho_.heatsinkTargetKind = 0;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##hstargetkind",
+                          kTargetKinds[ho_.heatsinkTargetKind])) {
+      for (int i = 0; i < 2; ++i)
+        if (ImGui::Selectable(kTargetKinds[i],
+                              ho_.heatsinkTargetKind == i))
+          ho_.heatsinkTargetKind = i;
+      ImGui::EndCombo();
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputFloat("##hstarget", &ho_.heatsinkTargetC, 0.0f, 0.0f,
+                      "target = %.1f C");
+    simTip("Seeded from the component Tj limit when available, otherwise from "
+           "its solved temperature. Adjust to the design requirement.");
+  }
+
   const bool hsUp =
       capsStatus_ == 1 && caps_.contains("handoffs") &&
       caps_["handoffs"]["heatsink_select"].value("available", false);
+  const std::string setupBlocker = heatsinkSetupBlocker(st);
+  std::string hsReason;
   if (!hsUp)
+    hsReason =
+        capsStatus_ == 1
+            ? caps_["handoffs"]["heatsink_select"].value(
+                  "hint",
+                  std::string(
+                      "heatsink selection (T-FIN17) is not installed"))
+            : "heatsink selection capability is still unavailable";
+  else
+    hsReason = setupBlocker;
+  const bool hsDisabled =
+      !hsReason.empty() || ho_.heatsinkRunning;
+  if (hsDisabled)
     ImGui::BeginDisabled();
   if (ImGui::Button(ho_.heatsinkRunning ? "Picking\xe2\x80\xa6"
                                         : "Pick heatsink",
                     ImVec2(-FLT_MIN, 0)) &&
-      hsUp && !ho_.heatsinkRunning)
+      !hsDisabled)
     runHeatsinkSelect(st);
-  if (!hsUp)
+  if (hsDisabled)
     ImGui::EndDisabled();
-  if (!hsUp && ImGui::IsItemHovered())
-    ImGui::SetTooltip(
-        "%s",
-        capsStatus_ == 1
-            ? caps_["handoffs"]["heatsink_select"]
-                  .value("hint",
-                         std::string(
-                             "heatsink selection (T-FIN17) not installed yet"))
-                  .c_str()
-            : "heatsink selection (T-FIN17) not installed yet");
+  simTip(hsReason.c_str());
+  if (!hsReason.empty()) {
+    pushDimText();
+    ImGui::TextWrapped("%s", hsReason.c_str());
+    popDimText();
+  }
 
   ImGui::Spacing();
   ImGui::Separator();
   if (!ho_.error.empty())
     ImGui::TextWrapped("Failed: %s", ho_.error.c_str());
+  if (ho_.result.is_object()) {
+    const std::string resultDocId =
+        ho_.result.value("doc_id", std::string());
+    if (!resultDocId.empty() && resultDocId != ho_.ecadDocId) {
+      pushDimText();
+      ImGui::TextWrapped(
+          "The retained thermal result belongs to ECAD document %s, not the "
+          "currently selected source.",
+          resultDocId.c_str());
+      popDimText();
+    }
+  }
   if (ho_.result.is_object() && ho_.result.value("ok", false)) {
     if (ho_.result.value("solved", false)) {
       ImGui::SeparatorText("Component temperatures");

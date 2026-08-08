@@ -41,7 +41,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import shlex
 import subprocess
+import signal
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -92,30 +94,53 @@ class FoamRunner(ABC):
     def _pump(proc: "subprocess.Popen[str]", app: str, on_line: OnLine,
               timeout: Optional[float]) -> None:
         tail: List[str] = []
+        reader_errors: List[str] = []
+        fatal_lines: List[str] = []
 
         def reader() -> None:
             assert proc.stdout is not None
-            for raw in proc.stdout:
-                line = raw.rstrip("\n")
-                tail.append(line)
-                if len(tail) > 40:
-                    tail.pop(0)
-                if on_line is not None:
-                    try:
-                        on_line(line)
-                    except Exception:  # progress callbacks must never kill the run
-                        pass
+            try:
+                for raw in proc.stdout:
+                    line = raw.rstrip("\n")
+                    tail.append(line)
+                    if len(tail) > 40:
+                        tail.pop(0)
+                    upper = line.upper()
+                    if ("FOAM FATAL" in upper or
+                            ("FLOATING POINT EXCEPTION" in upper and "TRAPPING" not in upper) or
+                            "SEGMENTATION FAULT" in upper):
+                        fatal_lines.append(line)
+                    if on_line is not None:
+                        try:
+                            on_line(line)
+                        except Exception:
+                            pass  # progress callbacks must never kill the solver
+            except Exception as exc:
+                reader_errors.append(str(exc))
 
         t = threading.Thread(target=reader, daemon=True)
         t.start()
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            if os.name == "posix":
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    proc.kill()
+            else:
+                proc.kill()
+            proc.wait()
+            t.join(timeout=5)
             raise FoamError(app, -1, "timed out")
         t.join(timeout=5)
-        if proc.returncode != 0:
-            raise FoamError(app, proc.returncode or -1, "\n".join(tail[-12:]))
+        if t.is_alive():
+            raise FoamError(app, -1, "output reader did not finish")
+        if reader_errors:
+            raise FoamError(app, -1, "output reader failed: " + reader_errors[-1])
+        if proc.returncode != 0 or fatal_lines:
+            code = proc.returncode if proc.returncode not in (None, 0) else -1
+            raise FoamError(app, code, "\n".join(tail[-12:]))
 
 
 # --------------------------------------------------------------------------- WSL
@@ -192,7 +217,8 @@ class WslRunner(FoamRunner):
     def to_case_path(self, win_path: str) -> str:
         """Windows path -> WSL path via ``wslpath`` (fallback to /mnt heuristic)."""
         try:
-            r = subprocess.run(self._wsl_argv(f"wslpath -u '{win_path}'"),
+            quoted = shlex.quote(win_path)
+            r = subprocess.run(self._wsl_argv(f"wslpath -u {quoted}"),
                                capture_output=True, text=True, timeout=20)
             p = (r.stdout or "").strip()
             if p:
@@ -207,16 +233,18 @@ class WslRunner(FoamRunner):
             raise FoamError(app, -1, "no OpenFOAM in WSL")
         args = args or []
         wsl_case = self.to_case_path(case_dir)
-        argstr = " ".join(args)
+        app_argv = [app, *args]
         if np > 1:
-            cmd = f"cd '{wsl_case}' && mpirun -np {np} {app} -parallel {argstr}"
-        else:
-            cmd = f"cd '{wsl_case}' && {app} {argstr}"
-        proc = subprocess.Popen(
-            self._wsl_argv(self._sourced(cmd)),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
+            app_argv = ["mpirun", "-np", str(np), app, "-parallel", *args]
+        cmd = f"cd {shlex.quote(wsl_case)} && {shlex.join(app_argv)}"
+        try:
+            proc = subprocess.Popen(
+                self._wsl_argv(self._sourced(cmd)),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+        except OSError as exc:
+            raise FoamError(app, -1, str(exc)) from exc
         self._pump(proc, app, on_line, timeout)
 
 
@@ -280,7 +308,7 @@ class LinuxRunner(FoamRunner):
 
     def _probe(self, bashrc: str) -> Optional[str]:
         """Return the version string if ``simpleFoam`` resolves with this bashrc ('' = PATH)."""
-        pre = f"source '{bashrc}' >/dev/null 2>&1; " if bashrc else ""
+        pre = f"source {shlex.quote(bashrc)} >/dev/null 2>&1; " if bashrc else ""
         cmd = pre + "command -v simpleFoam >/dev/null 2>&1 && echo ${WM_PROJECT_VERSION:-unknown}"
         try:
             r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=30)
@@ -321,16 +349,20 @@ class LinuxRunner(FoamRunner):
         if not self.available():
             raise FoamError(app, -1, "no OpenFOAM on this Linux host")
         args = args or []
-        argstr = " ".join(args)
-        body = (f"cd '{case_dir}' && mpirun -np {np} {app} -parallel {argstr}" if np > 1
-                else f"cd '{case_dir}' && {app} {argstr}")
+        app_argv = [app, *args]
+        if np > 1:
+            app_argv = ["mpirun", "-np", str(np), app, "-parallel", *args]
+        body = f"cd {shlex.quote(case_dir)} && {shlex.join(app_argv)}"
         if self._bashrc:
-            body = f"source '{self._bashrc}' >/dev/null 2>&1; {body}"
-        proc = subprocess.Popen(
-            ["bash", "-c", body],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
+            body = f"source {shlex.quote(self._bashrc)} >/dev/null 2>&1; {body}"
+        try:
+            proc = subprocess.Popen(
+                ["bash", "-c", body],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, start_new_session=True,
+            )
+        except OSError as exc:
+            raise FoamError(app, -1, str(exc)) from exc
         self._pump(proc, app, on_line, timeout)
 
 
@@ -425,11 +457,14 @@ class NativeRunner(FoamRunner):
             argv = ["mpirun", "-np", str(np), exe, "-parallel", *args]
         else:
             argv = [exe, *args]
-        proc = subprocess.Popen(
-            argv, cwd=case_dir, env=self._child_env(),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=case_dir, env=self._child_env(),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+        except OSError as exc:
+            raise FoamError(app, -1, str(exc)) from exc
         self._pump(proc, app, on_line, timeout)
 
 

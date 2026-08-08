@@ -2,6 +2,7 @@
 #include "hydraulic/schema.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <set>
 
@@ -19,7 +20,9 @@ const std::set<std::string> kComponentTypes = {
 const std::set<std::string> kPortTypes = {"pressure", "tank",  "work_a",
                                           "work_b",   "drain", "generic"};
 
-bool is_num(const ojson& v) { return v.is_number() && !v.is_boolean(); }
+bool is_num(const ojson& v) {
+    return v.is_number() && !v.is_boolean() && std::isfinite(v.get<double>());
+}
 
 bool is_xy(const ojson& v) {
     if (!v.is_array() || v.size() != 2) return false;
@@ -209,6 +212,10 @@ std::vector<std::string> validate_hose(const ojson& hose,
     if (!conns.is_array()) {
         errs.push_back(loc + ".connections: must be a list");
     } else {
+        if (conns.size() < 2) {
+            errs.push_back(loc + ".connections: need >= 2 component-port references");
+        }
+        std::set<std::string> endpoints;
         for (size_t j = 0; j < conns.size(); ++j) {
             const auto& conn = conns[j];
             const std::string cj = loc + ".connections[" + std::to_string(j) + "]";
@@ -217,12 +224,22 @@ std::vector<std::string> validate_hose(const ojson& hose,
                 continue;
             }
             const ojson cid = conn.value("component_id", ojson(nullptr));
-            if (!cid.is_null() && !known(cid)) {
+            if (!cid.is_string() || cid.get<std::string>().empty()) {
+                errs.push_back(cj + ".component_id: required non-empty string");
+            } else if (!known(cid)) {
                 errs.push_back(cj + ".component_id: " + py_repr(cid) +
                                " not a known component");
             }
-            if (!conn.contains("port")) {
-                errs.push_back(cj + ".port: required");
+            const ojson port = conn.value("port", ojson(nullptr));
+            if (!port.is_string() || port.get<std::string>().empty()) {
+                errs.push_back(cj + ".port: required non-empty string");
+            }
+            if (cid.is_string() && port.is_string()) {
+                const std::string endpoint =
+                    cid.get<std::string>() + "\n" + port.get<std::string>();
+                if (!endpoints.insert(endpoint).second) {
+                    errs.push_back(cj + ": duplicate component-port reference");
+                }
             }
         }
     }
@@ -239,6 +256,15 @@ std::vector<std::string> validate_hydraulic(const ojson& doc) {
 
     if (!doc.value("id", ojson(nullptr)).is_string()) {
         errs.push_back("id: missing or not a string");
+    }
+    const ojson units = doc.value("units", ojson(nullptr));
+    if (!units.is_object() ||
+        units.value("pressure", ojson(nullptr)) != "bar" ||
+        units.value("flow", ojson(nullptr)) != "L/min" ||
+        units.value("force", ojson(nullptr)) != "kN" ||
+        units.value("position", ojson(nullptr)) != "mm") {
+        errs.push_back(
+            "units: expected pressure=bar, flow=L/min, force=kN, position=mm");
     }
 
     ojson components = doc.value("components", ojson::array());

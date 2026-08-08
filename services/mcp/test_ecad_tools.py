@@ -18,6 +18,7 @@ Run:  & ".../venv/Scripts/python.exe" -m mcp_server.test_ecad_tools
 from __future__ import annotations
 
 import json
+import math
 
 from mcp_server.ecad_tools import register_ecad_tools
 
@@ -59,7 +60,7 @@ def _assert_context(payload: dict, name: str) -> None:
 # --------------------------------------------------------------------------- tests
 
 
-def test_register() -> dict:
+def _register_tools() -> dict:
     mcp = _StubMCP()
     register_ecad_tools(mcp)
     expected = {
@@ -86,6 +87,9 @@ def test_register() -> dict:
     print(f"  registered {len(mcp.tools)} tools: {', '.join(sorted(mcp.tools))}")
     print("  [register] PASS")
     return mcp.tools
+
+def test_register() -> None:
+    _register_tools()
 
 
 def test_find_part(tools: dict) -> None:
@@ -128,7 +132,7 @@ def _build_divider(tools: dict) -> None:
     _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
 
 
-def test_place_and_wire(tools: dict) -> dict:
+def test_place_and_wire(tools: dict) -> None:
     """Build a divider: V1(10V) IN, R1 1k, R2 2k; with GND port -> V(OUT)=6.667V."""
     # Place R1 first and check the freshly-placed-pin context.
     r1 = _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=20, value="1k", angle=90)
@@ -165,7 +169,6 @@ def test_place_and_wire(tools: dict) -> dict:
     _assert_context(gp, "ecad_add_power")
     assert gp["net_size"] >= 2, f"GND port should bond to >=2 pins, got {gp['net_size']}"
     print(f"  GND port bonded {gp['net_size']} pins: {gp['net_members']}")
-    return tools
 
 
 def test_status(tools: dict) -> None:
@@ -671,6 +674,24 @@ def test_check_impedance_routed(tools: dict) -> None:
         _assert_context(r2, "ecad_check_impedance(net)")
         assert r2["ok"], f"check_impedance({net}) failed: {r2.get('error')}"
         assert "z0" in r2 and r2["z0"] > 0, f"Z0 should be positive, got {r2.get('z0')}"
+        if r2["kind"] == "microstrip":
+            expected_z0 = (
+                87.0 / math.sqrt(r2["er"] + 1.41)
+                * math.log(5.98 * r2["h"] / (0.8 * r2["width"] + r2["t"]))
+            )
+        else:
+            expected_z0 = (
+                60.0 / math.sqrt(r2["er"])
+                * math.log(4.0 * r2["h"]
+                           / (0.67 * math.pi * (0.8 * r2["width"] + r2["t"])))
+            )
+        assert abs(r2["z0"] - expected_z0) < 0.02, (r2, expected_z0)
+        expected_delay = 1.0e12 / 299792458000.0 * math.sqrt(r2["eeff"])
+        assert abs(r2["delay_ps_per_mm"] - expected_delay) < 0.002
+        assert r2["reference_layers"], "the assumed reference plane must be explicit"
+        bad_target = _call(
+            tools, "ecad_check_impedance", net_or_ref=net, target=0.0)
+        assert bad_target["ok"] is False and "target" in bad_target["error"]
         print(f"  check_impedance({net}): reading={r2.get('reading')!r}")
     print("  [check_impedance_routed] PASS")
 
@@ -1331,6 +1352,14 @@ def test_fin13_run_pdn(tools: dict) -> None:
     assert m["total_w"] > 0.1  # ~ I^2 R = 9 * ~0.05 ohm
     print(f"  FIN13: verdict={r['verdict']!r} total_i2r={m['total_w']:.3f} W "
           f"hotspots={len(net['hotspots'])}")
+    for kwargs in (
+            {"sink_overrides": {"U1": -1.0}},
+            {"resolution_mm": float("nan")},
+            {"j_limit_a_mm2": -1.0},
+            {"source_refs": ["NO_SUCH_SOURCE"]}):
+        params = {"net": "+5V", "source_refs": "J1", **kwargs}
+        invalid = _call(tools, "ecad_run_pdn", **params)
+        assert invalid["ok"] is False and invalid.get("error"), (kwargs, invalid)
 
     # a fat clean net must pass
     doc["nets"].append({"name": "+3V3", "class": "default"})
@@ -1450,7 +1479,7 @@ if pytest is not None:
     @pytest.fixture(scope="module")
     def tools(_no_live_provider):
         """Module-scoped registered ECAD tool dict (provider disabled like main())."""
-        return test_register()
+        return _register_tools()
 
 
 # --------------------------------------------------------------------------- T-FIN16 thermal handoff
@@ -1641,6 +1670,72 @@ def test_fin16_verify_thermal() -> None:
     print("  [fin16_verify_thermal] PASS")
 
 
+def test_fin16_conservation_and_incomplete_guards() -> None:
+    from mcp_server.ecad_thermal import (
+        airflow_deviation_table, build_component_table, build_heat_loads,
+        build_i2r_loads, map_component_temps, quasi_steady_transient,
+        theta_ja_checks)
+
+    bottom = [{
+        "ref": "U1", "power_w": {"typ": 2.0},
+        "fea": {"rect_mm": [0.0, 0.0, 2.0, 1.0], "top_area_mm2": 2.0,
+                "z_bot_mm": 0.0, "z_top_mm": 1.0, "side": "bottom"},
+    }]
+    loads, _conditions, sources, unpowered, unmapped = build_heat_loads(bottom)
+    assert not unpowered and not unmapped and sources[0]["power_w"] == 2.0
+    assert loads[0]["faces"]["face_normal"] == [0.0, 0.0, -1.0]
+    assert all(point[2] == 0.0 for point in loads[0]["faces"]["points"])
+    assert abs(loads[0]["magnitude"] * 2.0e-6 - 2.0) < 1e-12
+
+    pdn = {"nets": [{"i2r_map": {
+        "columns": ["layer", "x_mm", "y_mm", "p_w"],
+        "cell_size_mm": 1.0, "total_w": 2.0,
+        "cells": [["F.Cu", 1.0, 1.0, 0.5],
+                  ["B.Cu", 2.0, 2.0, 0.25]],
+        "vias": [],
+    }}]}
+    i2r, _condition, info = build_i2r_loads(
+        pdn, {"z_top_mm": 1.6, "z_bot_mm": 0.0})
+    assert len(i2r) == 2
+    assert info["included_w"] == 0.75 and info["omitted_w"] == 1.25, info
+    assert sum(load["magnitude"] * 1.0e-6 for load in i2r) == 0.75
+
+    exact = build_component_table(
+        [{"ref": "U1", "power_w": 2.0, "tj_c": 125.0,
+          "t_case_c": 115.0, "tj_max_c": 125.0}], 25.0)
+    assert exact[0]["margin_c"] == 0.0 and exact[0]["pass"] is True
+    try:
+        map_component_temps(bottom, [0.0, 0.0, 0.0], [25.0, 26.0])
+        raise AssertionError("mismatched nodal field must be rejected")
+    except ValueError:
+        pass
+    try:
+        quasi_steady_transient(
+            {"bbox_mm": [0, 0, 40, 30], "thickness_mm": -1.6},
+            {"rho_kg_m3": 1900, "cp_j_kgk": 1100},
+            {"h_w_m2k": 10, "t_amb_c": 25})
+        raise AssertionError("negative board thickness must be rejected")
+    except ValueError:
+        pass
+
+    # The public envelope stores one-decimal deviation, so that stored value must
+    # drive the pass bit at a rounding boundary.
+    theta_checks, _ = theta_ja_checks(
+        [{"ref": "U1", "power_w": 1.0, "theta_ja": 10.0,
+          "tj_c": 42.5049, "t_case_c": 42.5049}], 25.0, 75.0)
+    assert theta_checks[0]["deviation_pct"] == 75.0
+    assert theta_checks[0]["pass"] is True
+    table, airflow_checks, _ = airflow_deviation_table(
+        [{"ref": "U1", "t_case_c": 35.0}],
+        [{"ref": "U1", "power_w": 1.0, "t_peak_c": 39.0049,
+          "t_mean_c": 38.0}],
+        25.0, 25.0, 10.0, 40.0)
+    assert table[0]["deviation_pct"] == 40.0
+    assert table[0]["verdict"].startswith("sane")
+    assert airflow_checks[0]["pass"] is True
+    print("  [fin16_conservation_and_incomplete_guards] PASS")
+
+
 def test_fin16_live_solve() -> None:
     """T-FIN16 (live leg): full board -> solved temperature field with zero manual BC
     setup, when a sim-enabled libchudware is loadable. Honest skip otherwise."""
@@ -1693,6 +1788,74 @@ def _fin17_tools() -> dict:
     register_ecad_thermal_tools(stub)
     register_heatsink_tools(stub)
     return stub.tools
+
+
+def test_fin17_tim_physics_guards() -> None:
+    """Invalid TIM physics must fail before ranking, never score as a cold winner."""
+    from mcp_server.heatsink import (heatsink_select_from_params,
+                                     tim_resistance_c_per_w)
+
+    invalid_helper_inputs = [
+        (-0.01, 3.0, 100.0),
+        (float("nan"), 3.0, 100.0),
+        (float("inf"), 3.0, 100.0),
+        (0.1, 0.0, 100.0),
+        (0.1, -3.0, 100.0),
+        (0.1, float("nan"), 100.0),
+        (0.1, float("inf"), 100.0),
+        (0.1, 3.0, 0.0),
+        (0.1, 3.0, -100.0),
+        (0.1, 3.0, float("nan")),
+        (0.1, 3.0, float("inf")),
+    ]
+    for args in invalid_helper_inputs:
+        try:
+            tim_resistance_c_per_w(*args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid TIM inputs were accepted: {args!r}")
+    assert tim_resistance_c_per_w(0.0, 3.0, 100.0) == 0.0
+
+    for field, value in (
+            ("tim_t_mm", -0.01),
+            ("tim_t_mm", float("nan")),
+            ("tim_k_w_mk", 0.0),
+            ("tim_k_w_mk", float("inf"))):
+        out = heatsink_select_from_params({
+            "component_ref": "U1", "tj_target_c": 85.0, field: value})
+        assert out["ok"] is False and "invalid TIM physics" in out["error"], out
+        assert not ({"target_met", "winner", "best_achievable", "table"} & set(out)), out
+    print("  [fin17_tim_physics_guards] PASS")
+
+
+def test_fin17_invalid_contact_area_fails_before_candidate_scoring() -> None:
+    from mcp_server import ecad_thermal
+    from mcp_server.heatsink import heatsink_select_from_params
+
+    missing = object()
+    prior = ecad_thermal._THERMAL.get("last_ctx", missing)
+    ecad_thermal._THERMAL["last_ctx"] = {
+        "env": {"t_amb_c": 25.0},
+        "components": [{
+            "ref": "U1",
+            "power_w": {"typ": 3.0},
+            "fea": {"rect_mm": [0.0, 0.0, 5.0, 5.0],
+                    "top_area_mm2": float("nan")},
+        }],
+    }
+    try:
+        out = heatsink_select_from_params(
+            {"component_ref": "U1", "tj_target_c": 85.0})
+    finally:
+        if prior is missing:
+            ecad_thermal._THERMAL.pop("last_ctx", None)
+        else:
+            ecad_thermal._THERMAL["last_ctx"] = prior
+
+    assert out["ok"] is False and "invalid TIM/contact physics" in out["error"], out
+    assert "area_mm2 must be finite" in out["error"], out
+    assert not ({"target_met", "winner", "best_achievable", "table"} & set(out)), out
 
 
 def test_fin17_parametric_generator() -> None:
@@ -2006,7 +2169,7 @@ def main() -> None:
 
 
 def _run_all() -> None:
-    tools = test_register()
+    tools = _register_tools()
     test_find_part(tools)
     test_place_and_wire(tools)
     test_status(tools)
@@ -2063,6 +2226,7 @@ def _run_all() -> None:
     test_fin16_dry_run_handoff()
     test_fin16_trace_heating_toggle()
     test_fin16_verify_thermal()
+    test_fin16_conservation_and_incomplete_guards()
     test_fin16_live_solve()
     # T-FIN17 heatsink selection loop
     test_fin17_parametric_generator()
@@ -2194,11 +2358,12 @@ def test_fin19_verify_tool_and_envelope() -> None:
     envelope from explicit payloads (no engine, no OpenFOAM)."""
     from services.mcp import simhandoff as sh
     tools = _fin19_tools()
-    air = {"solved": True, "doc_id": "d1", "inlet": {"temp_c": 25.0, "speed_mps": 2.0},
+    air = {"ok": True, "solved": True, "map_back_complete": True,
+           "doc_id": "d1", "inlet": {"temp_c": 25.0, "speed_mps": 2.0},
            "components": [{"ref": "U1", "power_w": 2.0, "t_peak_c": 105.0,
                            "t_mean_c": 95.0}],
            "simhandoff": {"id": "h-123"}}
-    pre = {"solved": True, "doc_id": "d1",
+    pre = {"ok": True, "solved": True, "map_back_complete": True, "doc_id": "d1",
            "environment": {"h_w_m2k": 10.0, "t_amb_c": 25.0},
            "components": [{"ref": "U1", "t_case_c": 65.0}]}
     r = _call(tools, "ecad_verify_airflow", airflow_result=air, preset_result=pre)
@@ -2257,8 +2422,8 @@ def _fin19_openfoam_available() -> bool:
 
 def test_fin19_live_cht_smoke(tmp_path) -> None:
     """LIVE (gated): one tiny coarse CHT case through the T-SIM5 seam using the exact
-    solids build_airflow_solids emits — proves the STL export + multi-region seam end
-    to end. Skips cleanly without OpenFOAM. Takes minutes."""
+    multi-solid geometry/metadata shape build_airflow_solids emits. The test lowers only
+    thermal mass so the same steady endpoint is reached quickly. Skips without OpenFOAM."""
     if not _fin19_openfoam_available():
         print("  FIN19: OpenFOAM not available — live CHT smoke SKIPPED")
         return
@@ -2271,6 +2436,11 @@ def test_fin19_live_cht_smoke(tmp_path) -> None:
               "fea": {"rect_mm": [7.5, 7.5, 12.5, 12.5], "z_bot_mm": 1.6,
                       "z_top_mm": 2.6, "top_area_mm2": 25.0, "side": "top"}}]
     case = build_airflow_solids(board, material, comps, str(tmp_path))
+    # Thermal mass changes convergence time, not the steady CHT solution this smoke checks.
+    # Keep production defaults physical; accelerate only this live integration fixture.
+    for solid in case["solids"]:
+        solid["density_kgm3"] = 100.0
+        solid["specific_heat_j_kgk"] = 25.0
     res = run_openfoam_tunnel(
         None, direction=(1.0, 0.0, 0.0), speed_mps=2.0, preset="coarse",
         thermal={"enabled": True, "mode": "conjugate", "inlet_temp_c": 25.0,
@@ -2634,7 +2804,7 @@ def test_place_duplicate_ref_in_one_batch(tools: dict) -> None:
 
 def test_place_sim_params_kv_reaches_the_solver(tools: dict) -> None:
     """'waveform=SIN,amplitude=5,freq=1000' must drive a real transient, not DC."""
-    def _swing(sim_params) -> float:
+    def _run(sim_params) -> dict:
         _call(tools, "ecad_new_schematic", name="kvsim")
         kw = {"sim_params": sim_params} if sim_params else {}
         v = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
@@ -2645,17 +2815,17 @@ def test_place_sim_params_kv_reaches_the_solver(tools: dict) -> None:
         _call(tools, "ecad_wire", from_ref=v["ref"], from_pin="1", to_ref=r["ref"], to_pin="1")
         _call(tools, "ecad_wire", from_ref=v["ref"], from_pin="2", to_ref=r["ref"], to_pin="2")
         _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
-        s = _call(tools, "ecad_simulate", analysis="tran",
-                  params={"tstep": 2e-5, "tstop": 2e-3})
-        assert s["ok"], s
-        tr = s["tran"]["traces"]
-        return max(t["max"] - t["min"] for t in tr.values())
+        return _call(tools, "ecad_simulate", analysis="tran",
+                     params={"tstep": 2e-5, "tstop": 2e-3})
 
-    driven = _swing("waveform=SIN,amplitude=5,freq=1000")
-    flat = _swing(None)
-    assert flat < 1e-9, f"control run should be flat DC, got {flat}"
+    driven_result = _run("waveform=SIN,amplitude=5,freq=1000")
+    assert driven_result["ok"], driven_result
+    driven = max(t["max"] - t["min"] for t in driven_result["tran"]["traces"].values())
+    flat_result = _run(None)
+    assert flat_result["ok"] is False
+    assert "non-zero independent source" in " ".join(flat_result.get("sim_log", []))
     assert driven > 1.0, f"kv sim_params never reached the solver: swing={driven}"
-    print(f"  tran swing with kv SIN = {driven:.4f} V vs {flat:.4f} V without")
+    print(f"  tran swing with kv SIN = {driven:.4f} V; zero-drive control refused")
     print("  [place_sim_params_kv_reaches_the_solver] PASS")
 
 

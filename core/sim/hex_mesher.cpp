@@ -161,6 +161,11 @@ MeshOut mesh_box_hex(const TopoDS_Shape& shape, const MeshOptions& options) {
     chudware::prof::phases::StudyScope _study("mesh_hex");
     MeshOut out;
     out.nodes_per_elem = 8;
+    std::string option_error;
+    if (!validate_mesh_options(options, option_error)) {
+        out.error = "hex: " + option_error;
+        return out;
+    }
     if (shape.IsNull()) {
         out.error = "hex: STEP produced no shape";
         return out;
@@ -195,18 +200,31 @@ MeshOut mesh_box_hex(const TopoDS_Shape& shape, const MeshOptions& options) {
             zmin = std::min(zmin, p.Z());
         }
     }
+    if (!std::isfinite(xmin) || !std::isfinite(ymin) ||
+        !std::isfinite(zmin)) {
+        out.error = "hex: box has non-finite bounds";
+        return out;
+    }
 
     // --- grid sizing (same fineness model as the tet mesher) -------------------------
     const double fineness = std::min(
         1.0, std::max(0.0, options.density >= 0.0 ? options.density : options.fineness));
     const double diag = std::sqrt(Lx * Lx + Ly * Ly + Lz * Lz);
-    const bool explicit_size =
-        std::isfinite(options.target_size_mm) && options.target_size_mm > 0.0;
-    const double base = explicit_size ? options.target_size_mm : diag / (8.0 + 52.0 * fineness);
+    const bool explicit_size = options.target_size_mm > 0.0;
+    const double base =
+        explicit_size ? options.target_size_mm
+                      : diag / (8.0 + 52.0 * fineness);
+    if (!std::isfinite(base) || !(base > 0.0)) {
+        out.error = "hex: computed element size is non-finite or non-positive";
+        return out;
+    }
 
+    constexpr int kMaxDiv = 800000;
     auto ndiv = [&](double L) {
-        int n = static_cast<int>(std::lround(L / base));
-        return std::max(1, n);
+        const double raw = L / base;
+        if (!std::isfinite(raw) || raw > static_cast<double>(kMaxDiv))
+            return kMaxDiv;
+        return std::max(1, static_cast<int>(std::lround(raw)));
     };
     int nx = ndiv(Lx), ny = ndiv(Ly), nz = ndiv(Lz);
 

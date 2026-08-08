@@ -167,6 +167,63 @@ def test_harmonic_skips_rigid_body_modes():
     assert out["per_mode"][0]["freq_hz"] == pytest.approx(100.0)
 
 
+def test_harmonic_resonance_decreases_with_damping():
+    system = _sdof_mode(100.0)
+    lightly_damped = harmonic_response(
+        sweep_hz=[100.0], zeta=0.02, base_accel_g=1.0, **system)
+    more_damped = harmonic_response(
+        sweep_hz=[100.0], zeta=0.04, base_accel_g=1.0, **system)
+    ratio = lightly_damped["peak_accel_g"] / more_damped["peak_accel_g"]
+    # Absolute base-excitation transmissibility includes sqrt(1 + (2*zeta*r)^2)
+    # in the numerator, so the exact r=1 ratio is 1.995225..., not exactly 2.
+    expected_ratio = (
+        math.sqrt(1.0 + (2.0 * 0.02) ** 2) / (2.0 * 0.02)
+        / (math.sqrt(1.0 + (2.0 * 0.04) ** 2) / (2.0 * 0.04))
+    )
+    assert ratio == pytest.approx(expected_ratio, rel=1e-12)
+
+
+def test_default_worker_sweep_captures_exact_modal_resonance():
+    from ..sim.multiphysics_rpc import _sim_freq_response
+
+    frequency = 123.456
+    result = _sim_freq_response({
+        "freqs_hz": [frequency],
+        "mode_shapes": [0.0, 0.0, 1.0],
+        "n_nodes": 1,
+        "total_mass_kg": 1.0,
+        "excitation_dir": [0.0, 0.0, 1.0],
+        "zeta": 0.02,
+        "base_accel_g": 1.0,
+    })
+    assert result["ok"], result
+    assert result["harmonic"]["peak_freq_hz"] == pytest.approx(frequency)
+    assert result["harmonic"]["peak_accel_g"] == pytest.approx(25.019992, rel=1e-6)
+
+
+@pytest.mark.parametrize("override", [
+    {"zeta": 0.0},
+    {"base_accel_g": 0.0},
+    {"freqs_hz": [float("nan")]},
+    {"excitation_dir": [0.0, 0.0, 0.0]},
+])
+def test_worker_frequency_response_rejects_nonfinite_or_zero_excitation(override):
+    from ..sim.multiphysics_rpc import _sim_freq_response
+
+    params = {
+        "freqs_hz": [100.0],
+        "mode_shapes": [0.0, 0.0, 1.0],
+        "n_nodes": 1,
+        "total_mass_kg": 1.0,
+        "excitation_dir": [0.0, 0.0, 1.0],
+        "sweep_hz": [100.0],
+    }
+    params.update(override)
+    result = _sim_freq_response(params)
+    assert result["ok"] is False
+    assert "invalid frequency-response setup" in result["error"]
+
+
 # ---------------------------------------------------------------------------
 # Participation factors
 # ---------------------------------------------------------------------------
@@ -213,6 +270,21 @@ def test_psd_rejects_nonpositive():
         _interp_psd([], 10.0)
 
 
+def test_psd_rejects_duplicate_or_nonfinite_breakpoints():
+    with pytest.raises(ValueError, match="unique"):
+        _interp_psd([(20.0, 0.01), (20.0, 0.02)], 20.0)
+    with pytest.raises(ValueError, match="finite"):
+        _interp_psd([(20.0, float("inf"))], 20.0)
+
+
+@pytest.mark.parametrize("zeta", [0.0, -0.01, 1.0, float("nan")])
+def test_miles_rejects_invalid_damping(zeta):
+    with pytest.raises(ValueError, match="zeta"):
+        miles_response(
+            psd_breakpoints=[(10.0, 0.04), (2000.0, 0.04)],
+            zeta=zeta, **_sdof_mode(100.0))
+
+
 # ---------------------------------------------------------------------------
 # Spec verdict (DAG verify-node end condition)
 # ---------------------------------------------------------------------------
@@ -244,3 +316,12 @@ def test_spec_verdict_unknown_keys_fail_closed():
     v = evaluate_vibration_spec({"max_wiggle": 3.0},
                                 {"sweep_hz": [1.0], "peak_accel_g": 1.0}, None)
     assert v["passed"] is False
+
+
+def test_spec_verdict_fails_closed_on_nonfinite_limit():
+    verdict = evaluate_vibration_spec(
+        {"max_peak_accel_g": float("nan")},
+        {"sweep_hz": [100.0], "peak_accel_g": 1.0}, None)
+    assert verdict["passed"] is False
+    assert verdict["checks"][0]["limit"] is None
+    assert "finite" in verdict["checks"][0]["reason"]

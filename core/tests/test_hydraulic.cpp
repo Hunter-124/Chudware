@@ -10,6 +10,7 @@
 
 #define _USE_MATH_DEFINES
 #include <cmath>
+#include <limits>
 
 #include "hydraulic/bom.h"
 #include "hydraulic/handoff.h"
@@ -113,6 +114,24 @@ TEST_CASE("schema: validate_hydraulic") {
     CHECK(std::find_if(errs.begin(), errs.end(), [](const std::string& e) {
         return e.find("c999") != std::string::npos;
     }) != errs.end());
+
+    ojson bad_units = minimal_doc();
+    bad_units["units"]["flow"] = "m3/s";
+    CHECK_FALSE(validate_hydraulic(bad_units).empty());
+
+    ojson one_ended = minimal_doc();
+    one_ended["hoses"][0]["connections"].erase(1);
+    CHECK_FALSE(validate_hydraulic(one_ended).empty());
+
+    ojson duplicate_end = minimal_doc();
+    duplicate_end["hoses"][0]["connections"][1] =
+        duplicate_end["hoses"][0]["connections"][0];
+    CHECK_FALSE(validate_hydraulic(duplicate_end).empty());
+
+    ojson nonfinite = minimal_doc();
+    nonfinite["components"][0]["position"][0] =
+        std::numeric_limits<double>::infinity();
+    CHECK_FALSE(validate_hydraulic(nonfinite).empty());
 }
 
 // ── sizing hand-calcs (test_hydraulic.py) ────────────────────────────────────
@@ -134,6 +153,15 @@ TEST_CASE("size_cylinder: 50 mm bore @200 bar → ≈39.27 kN; envelope guards")
     CHECK(size_cylinder(0, 0, 100, 100)["reason"] == "bore_mm must be > 0");
     CHECK(size_cylinder(50, 50, 100, 100)["ok"] == false);
     CHECK(size_cylinder(50, 0, 100, 100, 50.0, 0.0)["ok"] == false);
+    const double area_m2 = r["area_bore_cm2"].get<double>() * 1e-4;
+    CHECK(r["extend_force_kn"].get<double>() ==
+          doctest::Approx(area_m2 * 200.0e5 / 1000.0).epsilon(2e-5));
+    CHECK(r["flow_extend_lpm"].get<double>() ==
+          doctest::Approx(area_m2 * 0.05 * 60000.0).epsilon(2e-5));
+    CHECK(size_cylinder(std::numeric_limits<double>::infinity(), 0, 100, 100)["ok"] ==
+          false);
+    CHECK(size_cylinder(50, 0, std::numeric_limits<double>::quiet_NaN(), 100)["ok"] ==
+          false);
 }
 
 TEST_CASE("size_pump: 10 L/min @200 bar η=0.85 → ≈3.33/3.92 kW; displacement") {
@@ -146,6 +174,11 @@ TEST_CASE("size_pump: 10 L/min @200 bar η=0.85 → ≈3.33/3.92 kW; displacemen
     CHECK(size_pump(20, 200)["torque_nm"].get<double>() > 0);
     CHECK(size_pump(0, 100)["ok"] == false);
     CHECK(size_pump(10, 100, 0.0)["ok"] == false);
+    CHECK(r["hydraulic_power_kw"].get<double>() ==
+          doctest::Approx((10.0 / 60000.0) * 200.0e5 / 1000.0).epsilon(2e-4));
+    CHECK(r["shaft_power_kw"].get<double>() ==
+          doctest::Approx(r["hydraulic_power_kw"].get<double>() / 0.85).epsilon(2e-4));
+    CHECK(size_pump(std::numeric_limits<double>::quiet_NaN(), 100)["ok"] == false);
 }
 
 TEST_CASE("size_accumulator: Boyle hand-calc + ordering guards") {
@@ -156,6 +189,8 @@ TEST_CASE("size_accumulator: Boyle hand-calc + ordering guards") {
           1e-3);
     CHECK(size_accumulator(150, 300, 150, 5)["ok"] == false);  // pre >= min
     CHECK(size_accumulator(100, 150, 200, 5)["ok"] == false);  // min >= max
+    CHECK(size_accumulator(100, 300, 150,
+                           std::numeric_limits<double>::infinity())["ok"] == false);
 }
 
 TEST_CASE("valve_flow: Kv conversion + guards") {
@@ -165,6 +200,7 @@ TEST_CASE("valve_flow: Kv conversion + guards") {
     CHECK(valve_flow(10, 0)["ok"] == false);
     CHECK(valve_flow(5, 8)["flow_lpm"].get<double>() >
           valve_flow(5, 2)["flow_lpm"].get<double>());
+    CHECK(valve_flow(5, std::numeric_limits<double>::infinity())["ok"] == false);
 }
 
 TEST_CASE("fmu_simulate: always the soft-fail skipped envelope (no FMI runtime)") {
@@ -236,6 +272,10 @@ TEST_CASE("estimate_line_dp: laminar + turbulent regimes") {
     const ojson turb = estimate_line_dp(200, 25, 5000, 998.2, 1.002e-3);
     CHECK(turb["regime"] == "turbulent (Swamee-Jain)");
     CHECK(estimate_line_dp(0, 12.7, 1000)["ok"] == false);
+    CHECK(estimate_line_dp(25, 12.7, 1000,
+                           std::numeric_limits<double>::quiet_NaN(), 0.0278)["ok"] == false);
+    CHECK(estimate_line_dp(std::numeric_limits<double>::max(), 12.7, 1000)["ok"] ==
+          false);
 }
 
 // ── dispatch envelopes ───────────────────────────────────────────────────────
@@ -291,6 +331,15 @@ TEST_CASE("dispatch: hydraulic_new / add_component / add_hose / bom envelopes") 
     CHECK(result["hose_id"] == "h1");
     CHECK(result["doc_hose_count"] == 1);
     doc = result["doc"];
+
+    REQUIRE(call("hydraulic_add_hose",
+                 ojson::object(
+                     {{"doc", doc},
+                      {"net_name", "BAD"},
+                      {"connections", ojson::parse(R"([{"component_id":"c999","port":"p1"},
+                                                       {"component_id":"c2","port":"p2"}])")}}),
+                 bad));
+    CHECK(bad["ok"] == false);
 
     REQUIRE(call("hydraulic_bom", ojson::object({{"doc", doc}}), result));
     REQUIRE(result["ok"] == true);
@@ -362,9 +411,11 @@ TEST_CASE("dispatch: hydraulic→piping handoff runs the live solve + verify") {
     CHECK(result["piping_doc"]["runs"].size() == 1);
     CHECK(result["solve"]["converged"] == true);
     CHECK(result["verify"]["pass"] == true);  // laminar: estimate == solve
-    CHECK(result["margin"]["pump_margin_solved_bar"].get<double>() ==
+    REQUIRE(result["margin"]["line_loss_solved_bar"].is_null());
+    REQUIRE(result["margin"]["per_line"].contains("r1"));
+    CHECK(result["margin"]["per_line"]["r1"]["pump_margin_solved_bar"].get<double>() ==
           doctest::Approx(20.0).epsilon(0.02));
-    CHECK(result["margin"]["pump_margin_solved_pct"].get<double>() ==
+    CHECK(result["margin"]["per_line"]["r1"]["pump_margin_solved_pct"].get<double>() ==
           doctest::Approx(9.52).epsilon(0.01));
 
     // verify step consumes the handoff + solve and rebuilds the envelope
@@ -381,8 +432,67 @@ TEST_CASE("dispatch: hydraulic→piping handoff runs the live solve + verify") {
     CHECK(v["simhandoff"]["kind"] == "verify");
     CHECK(v["simhandoff"]["coupling"] == "hydraulic_to_piping");
     CHECK(chudware::piping::simhandoff::validate_envelope(v["simhandoff"]).empty());
-    CHECK(v["margin"]["pump_margin_solved_bar"] ==
-          result["margin"]["pump_margin_solved_bar"]);
+    CHECK(v["margin"]["per_line"]["r1"]["pump_margin_solved_bar"] ==
+          result["margin"]["per_line"]["r1"]["pump_margin_solved_bar"]);
+
+    // The generated hose runs are independent cases.  Choose headroom between
+    // one line loss and the sum of two identical line losses: both real
+    // per-line margins remain positive while the old fabricated series margin
+    // would be negative.
+    ojson add_second;
+    REQUIRE(call("hydraulic_add_hose",
+                 ojson::object(
+                     {{"doc", doc},
+                      {"net_name", "RETURN_LINE"},
+                      {"connections", ojson::parse(R"([{"component_id":"c1","port":"p2"},
+                                                       {"component_id":"c2","port":"p2"}])")}}),
+                 add_second));
+    ojson two_hose;
+    REQUIRE(call("hydraulic_piping_handoff",
+                 ojson::object({{"doc", add_second["doc"]},
+                                {"supply_pressure_bar", 210.0},
+                                {"flow_lpm", 25.0},
+                                {"load_pressure_bar", 209.7}}),
+                 two_hose));
+    REQUIRE(two_hose["ok"] == true);
+    REQUIRE(two_hose["margin"]["per_line"].size() == 2);
+    CHECK(two_hose["margin"]["line_loss_solved_bar"].is_null());
+    CHECK(two_hose["margin"]["pump_margin_solved_bar"].is_null());
+    double independent_loss_sum_bar = 0.0;
+    for (auto it = two_hose["margin"]["per_line"].begin();
+         it != two_hose["margin"]["per_line"].end(); ++it) {
+        independent_loss_sum_bar += it->at("line_loss_solved_bar").get<double>();
+        CHECK(it->at("pump_margin_solved_bar").get<double>() > 0.0);
+    }
+    CHECK(210.0 - 209.7 - independent_loss_sum_bar < 0.0);
+
+    ojson wrong_link = result["solve"];
+    wrong_link["links"][0]["id"] = "unrelated_run";
+    const auto [missing_env, missing_checks] =
+        verify_piping_envelope(env, wrong_link, 30.0);
+    REQUIRE(missing_checks.size() == 1);
+    CHECK(missing_checks[0]["pass"] == false);
+    CHECK(missing_env["pass"] == false);
+
+    ojson not_converged = result["solve"];
+    not_converged["converged"] = false;
+    REQUIRE(call("hydraulic_verify_piping",
+                 ojson::object({{"handoff", env}, {"solve_result", not_converged}}), v));
+    CHECK(v["ok"] == false);
+
+    ojson failed_handoff;
+    REQUIRE(call(
+        "hydraulic_piping_handoff",
+        ojson::object(
+            {{"doc", doc},
+             {"supply_pressure_bar", 210.0},
+             {"flow_lpm", 25.0},
+             {"fluid", ojson::parse(
+                           R"({"name":"air","T":293.15,"P":101325})")}}),
+        failed_handoff));
+    CHECK(failed_handoff["ok"] == false);
+    CHECK(failed_handoff["stage"] == "solve_failed");
+    CHECK(failed_handoff["solve"]["ok"] == false);
 
     // no hoses -> contract-shaped
     ojson empty_doc;
@@ -428,6 +538,18 @@ TEST_CASE("dispatch: hydraulic→FEA handoff + verify envelopes") {
     REQUIRE(call("hydraulic_verify_fea", ojson::object({{"handoff", tampered}}), v));
     CHECK(v["pass"] == false);
 
+    ojson missing_case = env;
+    missing_case["conditions"].erase(1);
+    CHECK(verify_fea_envelope(missing_case, 0.5)["pass"] == false);
+
+    ojson duplicate_case = env;
+    duplicate_case["conditions"].push_back(duplicate_case["conditions"][0]);
+    CHECK(verify_fea_envelope(duplicate_case, 0.5)["pass"] == false);
+
+    ojson missing_axis = env;
+    missing_axis["meta"].erase("axis");
+    CHECK(verify_fea_envelope(missing_axis, 0.5)["pass"] == false);
+
     // guards
     REQUIRE(call("hydraulic_fea_handoff",
                  ojson::parse(R"({"bore_mm":50,"rod_mm":50,"max_pressure_bar":250})"),
@@ -438,6 +560,16 @@ TEST_CASE("dispatch: hydraulic→FEA handoff + verify envelopes") {
                  v));
     CHECK(v["ok"] == false);
     CHECK(v["hint"] == "axis must be a non-zero [x,y,z] vector");
+    REQUIRE(call("hydraulic_fea_handoff",
+                 ojson::parse(R"({"bore_mm":50,"max_pressure_bar":250,
+                                   "load_face":"same","fixture_face":"same"})"),
+                 v));
+    CHECK(v["ok"] == false);
+    REQUIRE(call("hydraulic_fea_handoff",
+                 ojson::parse(R"({"bore_mm":50,"max_pressure_bar":250,
+                                   "target_doc_id":42})"),
+                 v));
+    CHECK(v["ok"] == false);
     REQUIRE(call("hydraulic_verify_fea", ojson::object(), v));
     CHECK(v["reason"] == "no hydraulic→FEA handoff envelope");
 }

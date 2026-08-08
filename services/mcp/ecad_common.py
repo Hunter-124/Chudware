@@ -49,9 +49,12 @@ class OpError(Exception):
 
 
 def _rpc(method: str, params: dict | None = None) -> dict:
-    """One C++ core RPC with CoreError -> OpError translation (the ecad_* error contract)."""
+    """One serialized C++ core RPC with CoreError -> OpError translation."""
     try:
-        return cb.call(method, params or {})
+        # Core calls from handed-off and foreground ECAD tools share one bridge/session boundary.
+        # Provider-only budget jobs never touch this lock, so fallback/status remains responsive.
+        with _ECAD_OPERATION_LOCK:
+            return cb.call(method, params or {})
     except cb.CoreError as e:
         raise OpError(e.code or "engine_error", str(e),
                       e.detail if isinstance(e.detail, dict) else {}) from e
@@ -846,8 +849,17 @@ _ECAD: dict = {
 # ecad_design see the provider is busy and take the instant, deterministic recipe path instead of
 # stacking provider latency. A plain bool guarded by a Lock (no waiting) — the recipe path always
 # produces a verified schematic, so skipping the model here only costs the model's topology choice.
+import sys as _sys_ecad
 import threading as _threading
+import time as _time_ecad
 import uuid as _uuid_ecad
+
+from . import cad_common as _cad_jobs
+
+# The core bridge/session registry is not safe to enter concurrently.  Serialize every ECAD RPC;
+# get_job polling and provider-only budget work never touch this lock and remain responsive.
+_ECAD_OPERATION_LOCK = _threading.RLock()
+
 _PROVIDER_PLAN_LOCK = _threading.Lock()
 _PROVIDER_PLAN_BUSY = {"v": False}
 
@@ -988,48 +1000,123 @@ def _autosave_all_open_ecad() -> None:
 
 # --------------------------------------------------------------------------- heavy-tool budget
 #
-# A SYNCHRONOUS ecad_* tool that overruns the client's transport timeout gets the server killed
-# (-32001). The C++ side auto-backgrounds at _SYNC_SOLVE_BUDGET_S=45 (cad_tools); ecad_design
-# already uses a worker-thread + wall-clock deadline (_PLAN_BUDGET_S). Match that for the other
-# heavy ECAD tools (simulate / make_board / autoroute / fill / dfm): run the heavy work on a worker
-# thread with a deadline. If it finishes in time the result is returned inline (the common
-# small-board case is unchanged); if it overruns we return a clean "still running — simplify"
-# message instead of blocking until the client gives up and kills us. The doc is autosaved first,
-# so the abandoned (daemon) worker can keep running harmlessly.
-
+# Heavy ECAD calls share the already-exposed get_job(job_id) registry with CAD solves.  Fast
+# calls are removed from that registry before returning, so their synchronous contract is
+# unchanged.  Calls handed off after the budget remain retrievable until the shared TTL expires,
+# with an additional ECAD-specific count bound.  A cap on in-flight ECAD workers prevents an
+# unresponsive backend from creating an unbounded number of daemon threads.
 try:
-    _ECAD_HEAVY_BUDGET_S = float(os.environ.get("CHUDWARE_ECAD_HEAVY_BUDGET_S", "") or 30.0)
+    _ECAD_HEAVY_BUDGET_S = float(
+        os.environ.get("CHUDWARE_ECAD_HEAVY_BUDGET_S", "") or 30.0)
 except (TypeError, ValueError):
     _ECAD_HEAVY_BUDGET_S = 30.0
 if not (_ECAD_HEAVY_BUDGET_S > 0.0):
     _ECAD_HEAVY_BUDGET_S = 30.0
 
 
+try:
+    _ECAD_JOB_MAX_RUNNING = max(
+        1, int(os.environ.get("CHUDWARE_ECAD_MAX_RUNNING_JOBS", "") or 8))
+except (TypeError, ValueError):
+    _ECAD_JOB_MAX_RUNNING = 8
+try:
+    _ECAD_JOB_MAX_RETAINED = max(
+        1, int(os.environ.get("CHUDWARE_ECAD_MAX_RETAINED_JOBS", "") or 64))
+except (TypeError, ValueError):
+    _ECAD_JOB_MAX_RETAINED = 64
+
+_ECAD_BUDGET_LOCAL = _threading.local()
+
+
+def _trim_ecad_jobs_locked() -> None:
+    """Prune terminal ECAD jobs while ``cad_common._JOB_LOCK`` is held."""
+    _cad_jobs._evict_old_jobs()
+    completed = sorted(
+        (float(job.get("done_at") or 0.0), jid)
+        for jid, job in _cad_jobs._JOBS.items()
+        if job.get("owner") == "ecad" and job.get("status") in ("done", "error")
+    )
+    for _done_at, jid in completed[:-_ECAD_JOB_MAX_RETAINED]:
+        _cad_jobs._JOBS.pop(jid, None)
+
+
 def _run_with_budget(fn, budget_s: Optional[float] = None):
-    """Run ``fn()`` on a daemon worker thread with a wall-clock deadline.
+    """Run ``fn()`` on a bounded daemon worker and hand overruns to ``get_job``.
 
     Returns ``(status, value)``:
       * ``("done",  result)``    — fn returned within the budget
-      * ``("error", exception)`` — fn raised within the budget
-      * ``("timeout", None)``    — fn overran (still running in the background daemon)
+      * ``("error", exception)`` — fn raised within the budget, or the worker cap was reached
+      * ``("timeout", None)``    — fn continues as a retrievable in-process job
 
-    ECAD ops are bounded, so an overrun thread finishes on its own; we just stop WAITING on it.
+    Python cannot safely terminate a running thread.  Handed-off jobs therefore advertise
+    cancellation as unsupported and retain their eventual result/error instead of pretending
+    that cancellation succeeded.  The timeout formatter consumes the pending job identity from
+    the same tool-call frame, avoiding a process-global "last job" race between concurrent calls.
     """
+    _ECAD_BUDGET_LOCAL.pending = None
     if budget_s is None:
         budget_s = _ECAD_HEAVY_BUDGET_S
+    wait_s = max(1.0, float(budget_s))
+    caller = _sys_ecad._getframe(1)
+    caller_key = (id(caller), caller.f_code)
+    finished = _threading.Event()
     box: dict = {}
 
-    def _worker():
+    with _cad_jobs._JOB_LOCK:
+        _trim_ecad_jobs_locked()
+        running = sum(
+            1 for job in _cad_jobs._JOBS.values()
+            if job.get("owner") == "ecad" and job.get("status") == "running"
+        )
+        if running >= _ECAD_JOB_MAX_RUNNING:
+            return "error", RuntimeError(
+                f"ECAD background job limit reached ({_ECAD_JOB_MAX_RUNNING}); "
+                "poll the outstanding get_job results before starting more work")
+        jid = "job-" + _uuid_ecad.uuid4().hex[:12]
+        while jid in _cad_jobs._JOBS:
+            jid = "job-" + _uuid_ecad.uuid4().hex[:12]
+        _cad_jobs._JOBS[jid] = {
+            "status": "running",
+            "kind": "ecad-heavy",
+            "owner": "ecad",
+            "result": None,
+            "error": None,
+            "progress": {},
+            "started_at": _time_ecad.time(),
+            "done_at": None,
+            "cancel_supported": False,
+            "budget_s": wait_s,
+        }
+
+    def _worker() -> None:
         try:
             box["v"] = fn()
+            update = {"status": "done", "result": box["v"], "done_at": _time_ecad.time()}
         except Exception as exc:  # noqa: BLE001
             box["e"] = exc
+            update = {"status": "error", "error": str(exc), "done_at": _time_ecad.time()}
+        with _cad_jobs._JOB_LOCK:
+            job = _cad_jobs._JOBS.get(jid)
+            if job is not None:
+                job.update(update)
+                _trim_ecad_jobs_locked()
+        finished.set()
 
-    th = _threading.Thread(target=_worker, name="ecad-heavy", daemon=True)
-    th.start()
-    th.join(max(1.0, float(budget_s)))
-    if th.is_alive():
+    try:
+        _threading.Thread(
+            target=_worker, name=f"ecad-heavy-{jid[-6:]}", daemon=True).start()
+    except Exception as exc:  # noqa: BLE001
+        with _cad_jobs._JOB_LOCK:
+            _cad_jobs._JOBS.pop(jid, None)
+        return "error", exc
+
+    if not finished.wait(wait_s):
+        _ECAD_BUDGET_LOCAL.pending = (
+            caller_key, jid, _time_ecad.monotonic() + 5.0)
         return "timeout", None
+
+    with _cad_jobs._JOB_LOCK:
+        _cad_jobs._JOBS.pop(jid, None)
     if "e" in box:
         return "error", box["e"]
     return "done", box.get("v")
@@ -1066,14 +1153,63 @@ def _provider_reachable(provider, timeout_s: float = 0.6) -> bool:
 
 def _budget_timeout_err(what: str, *, simplify: str,
                         next_actions: list[str] | None = None, **extra) -> str:
-    """Clean 'still running — simplify' payload returned when a heavy ECAD tool overruns the budget,
-    instead of blocking until the client kills the server."""
+    """Return the retrievable job envelope for the immediately preceding budget handoff."""
+    pending = getattr(_ECAD_BUDGET_LOCAL, "pending", None)
+    _ECAD_BUDGET_LOCAL.pending = None
+    caller = _sys_ecad._getframe(1)
+    caller_key = (id(caller), caller.f_code)
+    if (not pending or pending[0] != caller_key
+            or _time_ecad.monotonic() > pending[2]):
+        return _err(
+            f"{what} budget handoff had no retrievable job context.",
+            hint="The operation was not reported as running; inspect the active document state.",
+            next_actions=["ecad_status()"],
+            status="error", auto_backgrounded=False, **extra)
+
+    jid = pending[1]
+    with _cad_jobs._JOB_LOCK:
+        job = _cad_jobs._JOBS.get(jid)
+        if job is None:
+            return _err(
+                f"{what} background job {jid!r} is no longer available.",
+                hint="Inspect the active document state before deciding whether to run it again.",
+                next_actions=["ecad_status()"],
+                status="error", auto_backgrounded=False, job_id=jid, **extra)
+        job["kind"] = what
+        budget = float(job.get("budget_s") or _ECAD_HEAVY_BUDGET_S)
+
+    # The worker can cross the finish line in the few instructions between the wait expiring
+    # and the tool formatting its response.  In that race, return the normal result/error rather
+    # than publishing a stale running state.
+    state = job.get("status")
+    if state == "done":
+        result = job.get("result")
+        if isinstance(result, str):
+            return result
+        if isinstance(result, dict):
+            return _dumps(result)
+        return _dumps({"ok": True, "job_id": jid, "status": "done", "result": result})
+    if state == "error":
+        return _err(
+            f"{what} failed in background: {job.get('error') or 'unknown error'}",
+            hint="Inspect the inputs and active document state before trying a corrected call.",
+            next_actions=["ecad_status()"],
+            status="error", auto_backgrounded=False, job_id=jid, **extra)
+
+    cancellation = {
+        "supported": False,
+        "requested": False,
+        "reason": ("This operation runs in a Python thread, which cannot be stopped safely. "
+                   "It will finish in the background and retain its result or error."),
+    }
     return _err(
-        f"{what} did not finish within the {_ECAD_HEAVY_BUDGET_S:.0f}s budget — it was left running "
-        "in the background to avoid a transport timeout that would kill the MCP server.",
-        hint=("Open documents were autosaved and are safe (they recover on restart). " + simplify),
-        next_actions=next_actions or ["ecad_status()"],
-        status="running", auto_backgrounded=True, budget_s=_ECAD_HEAVY_BUDGET_S, **extra)
+        f"{what} did not finish within the {budget:.0f}s budget — job {jid} is still running.",
+        hint=("Do not retry this mutating operation while its job is running. "
+              f"Poll get_job('{jid}') for the eventual result. " + simplify),
+        next_actions=[f"get_job('{jid}')"],
+        status="running", auto_backgrounded=True, budget_s=budget,
+        job_id=jid, retry_safe_while_running=False, cancel_supported=False,
+        cancellation=cancellation, **extra)
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -1364,83 +1500,172 @@ def _erc_lines(violations: list[dict]) -> list[str]:
 
 
 def _build_analysis(analysis: str, params: dict, circuit: dict) -> dict | None:
-    """Map a friendly analysis name + params dict to a sim.md §3 analysis dict, filling sane
-    defaults (a weak model usually under-specifies)."""
+    """Map a friendly analysis name to a validated sim.md §3 analysis dict."""
+    if not isinstance(params, dict):
+        raise OpError("invalid_op", "analysis params must be an object", {})
+
+    def bad(message: str):
+        raise OpError("invalid_op", f"invalid {a} analysis: {message}", {})
+
+    def finite(name: str, default: float) -> float:
+        raw = params.get(name, default)
+        if isinstance(raw, bool):
+            bad(f"{name} must be numeric, not boolean")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            bad(f"{name} must be numeric")
+        if not math.isfinite(value):
+            bad(f"{name} must be finite")
+        return value
+
+    def integer(name: str, default: int, minimum: int = 1) -> int:
+        raw = params.get(name, default)
+        if isinstance(raw, bool):
+            bad(f"{name} must be an integer >= {minimum}")
+        try:
+            numeric = float(raw)
+        except (TypeError, ValueError):
+            bad(f"{name} must be an integer >= {minimum}")
+        if not math.isfinite(numeric) or not numeric.is_integer() or numeric < minimum:
+            bad(f"{name} must be an integer >= {minimum}")
+        return int(numeric)
+
+    def frequency_spec(default_start: float, default_stop: float,
+                       default_points: int) -> tuple[str, int, float, float]:
+        sweep = str(params.get("sweep", "dec")).lower()
+        if sweep not in ("lin", "dec", "oct"):
+            bad("sweep must be one of 'lin', 'dec', or 'oct'")
+        points = integer("points", default_points)
+        fstart = finite("fstart", default_start)
+        fstop = finite("fstop", default_stop)
+        if not (0.0 < fstart < fstop):
+            bad("frequencies must satisfy 0 < fstart < fstop")
+        return sweep, points, fstart, fstop
+
+    if not isinstance(analysis, str):
+        raise OpError("invalid_op", "analysis must be a string", {})
     a = (analysis or "op").lower()
     if a == "op":
         return {"type": "op"}
     if a == "dc":
         src = params.get("source")
-        if not src:  # default to the first voltage source in the circuit
-            src = next((d["name"] for d in circuit.get("devices", []) if d.get("kind") == "V"),
-                       "V1")
-        return {"type": "dc", "source": src,
-                "start": float(params.get("start", 0.0)),
-                "stop": float(params.get("stop", 5.0)),
-                "step": float(params.get("step", (float(params.get("stop", 5.0)) -
-                                                  float(params.get("start", 0.0))) / 50 or 0.1))}
+        if not src:
+            src = next((d["name"] for d in circuit.get("devices", [])
+                        if d.get("kind") == "V"), None)
+        if not isinstance(src, str) or not src.strip():
+            bad("source must name an independent voltage source")
+        if not any(device.get("kind") == "V" and device.get("name") == src.strip()
+                   for device in circuit.get("devices", [])):
+            bad(f"source {src!r} is not an independent voltage source in the circuit")
+        start = finite("start", 0.0)
+        stop = finite("stop", 5.0)
+        if start == stop:
+            bad("start and stop must differ")
+        default_step = (stop - start) / 50.0
+        step = finite("step", default_step)
+        if step == 0.0 or (stop - start) * step <= 0.0:
+            bad("step must be non-zero and point from start toward stop")
+        return {"type": "dc", "source": src.strip(), "start": start,
+                "stop": stop, "step": step}
     if a == "tran":
-        tstop = float(params.get("tstop", 1e-3))
-        return {"type": "tran",
-                "tstep": float(params.get("tstep", tstop / 200)),
-                "tstop": tstop,
-                "tstart": float(params.get("tstart", 0.0)),
-                "uic": bool(params.get("uic", False))}
+        tstop = finite("tstop", 1e-3)
+        tstart = finite("tstart", 0.0)
+        tstep = finite("tstep", (tstop - tstart) / 200.0)
+        if tstart < 0.0 or tstop <= tstart:
+            bad("times must satisfy 0 <= tstart < tstop")
+        if tstep <= 0.0 or tstep > tstop - tstart:
+            bad("tstep must be > 0 and no larger than tstop-tstart")
+        uic = params.get("uic", False)
+        if not isinstance(uic, bool):
+            bad("uic must be boolean")
+        return {"type": "tran", "tstep": tstep, "tstop": tstop,
+                "tstart": tstart, "uic": uic}
     if a == "ac":
-        return {"type": "ac",
-                "sweep": params.get("sweep", "dec"),
-                "points": int(params.get("points", 20)),
-                "fstart": float(params.get("fstart", 1.0)),
-                "fstop": float(params.get("fstop", 1e6))}
-    # Advanced analyses: return a spec dict with the analysis type for routing.
+        sweep, points, fstart, fstop = frequency_spec(1.0, 1e6, 20)
+        return {"type": "ac", "sweep": sweep, "points": points,
+                "fstart": fstart, "fstop": fstop}
     if a == "four":
-        # Fourier/THD: needs a preceding tran. Default tran params if not supplied.
-        tstop = float(params.get("tstop", 1e-3))
-        f0 = float(params.get("f0", 1e3))
-        probe = params.get("probe")
-        an = {"type": "four", "f0": f0, "tstop": tstop,
-              "tstep": float(params.get("tstep", tstop / 400)),
-              "probe": probe, "nharm": int(params.get("nharm", 9))}
-        # Window: the solvers' own default is "as many whole periods as fit", which
-        # INCLUDES the start-up transient (a circuit starting from its op point reads
-        # phantom THD — measured 2.3% on a plain linear RC) and, worse, whether the
-        # first period gets included is a float-rounding lottery in int(tspan/period).
-        # Analyze the LAST whole periods excluding the first (SPICE .four convention
-        # is the last period only), unless the caller pins 'periods' explicitly.
+        tstop = finite("tstop", 1e-3)
+        f0 = finite("f0", 1e3)
+        tstep = finite("tstep", tstop / 400.0)
+        nharm = integer("nharm", 9)
+        if f0 <= 0.0 or tstop <= 0.0 or tstep <= 0.0 or tstep > tstop:
+            bad("f0, tstop, and tstep must be positive, with tstep <= tstop")
+        if tstop * f0 < 1.0:
+            bad("tstop must contain at least one fundamental period (tstop*f0 >= 1)")
+        an = {"type": "four", "f0": f0, "tstop": tstop, "tstep": tstep,
+              "probe": params.get("probe"), "nharm": nharm}
         if "periods" in params:
-            an["periods"] = int(params["periods"])
+            an["periods"] = integer("periods", 1)
         else:
             whole = int(round(tstop * f0))
             if whole >= 2:
                 an["periods"] = whole - 1
         return an
-    if a == "mc":
-        inner_name = params.get("inner", "op")
+    if a in ("mc", "temp"):
+        inner_name = str(params.get("inner", "op")).lower()
+        if inner_name not in ("op", "dc", "tran", "ac"):
+            bad("inner must be one of 'op', 'dc', 'tran', or 'ac'")
         inner_params = params.get("inner_params", {})
-        inner_an = _build_analysis(inner_name, inner_params, circuit) or {"type": "op"}
-        return {"type": "mc",
-                "runs": int(params.get("runs", 50)),
-                "analysis": inner_an,
-                "tol": params.get("tol"),
-                "probe": params.get("probe"),
-                "seed": int(params.get("seed", 42))}
-    if a == "temp":
-        inner_name = params.get("inner", "op")
-        inner_params = params.get("inner_params", {})
-        inner_an = _build_analysis(inner_name, inner_params, circuit) or {"type": "op"}
+        if not isinstance(inner_params, dict):
+            bad("inner_params must be an object")
+        inner_an = _build_analysis(inner_name, inner_params, circuit)
+        if a == "mc":
+            tol = params.get("tol")
+            if tol is not None:
+                if not isinstance(tol, dict):
+                    bad("tol must be an object of device-kind to fractional tolerance")
+                for key, value in tol.items():
+                    if isinstance(value, bool):
+                        bad(f"tol[{key!r}] must be numeric, not boolean")
+                    try:
+                        tolerance = float(value)
+                    except (TypeError, ValueError):
+                        bad(f"tol[{key!r}] must be numeric")
+                    if not math.isfinite(tolerance) or tolerance < 0.0:
+                        bad(f"tol[{key!r}] must be finite and >= 0")
+            result = {"type": "mc", "runs": integer("runs", 50),
+                      "analysis": inner_an, "tol": tol,
+                      "seed": integer("seed", 42, minimum=0)}
+            if params.get("probe") is not None:
+                result["probe"] = params["probe"]
+            return result
         vals = params.get("values", [-40.0, 27.0, 85.0])
-        # Carry the requested probe so the temp-sweep trend reports the node the caller asked for,
-        # not just the first node in probe_list (Bug E8).
-        return {"type": "temp", "values": [float(v) for v in vals], "analysis": inner_an,
-                "probe": params.get("probe")}
+        if not isinstance(vals, list) or len(vals) < 2:
+            bad("values must contain at least two temperatures in degrees C")
+        temperatures = []
+        for index, raw in enumerate(vals):
+            if isinstance(raw, bool):
+                bad(f"values[{index}] must be numeric, not boolean")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                bad(f"values[{index}] must be numeric")
+            if not math.isfinite(value) or value < -273.15:
+                bad(f"values[{index}] must be finite and >= -273.15 C")
+            temperatures.append(value)
+        if len(set(temperatures)) != len(temperatures):
+            bad("temperature sweep values must be distinct")
+        result = {"type": "temp", "values": temperatures, "analysis": inner_an}
+        if params.get("probe") is not None:
+            result["probe"] = params["probe"]
+        return result
     if a == "noise":
-        return {"type": "noise",
-                "output": params.get("output", "V(OUT)"),
-                "source": params.get("source"),
-                "fstart": float(params.get("fstart", 10.0)),
-                "fstop": float(params.get("fstop", 1e6)),
-                "points": int(params.get("points", 20)),
-                "sweep": params.get("sweep", "dec")}
+        sweep, points, fstart, fstop = frequency_spec(10.0, 1e6, 20)
+        output = params.get("output", "V(OUT)")
+        if not isinstance(output, str) or not output.strip():
+            bad("output must be a non-empty voltage probe")
+        source = params.get("source")
+        if source is not None:
+            if not isinstance(source, str) or not source.strip():
+                bad("source must name an independent voltage source")
+            if not any(device.get("kind") == "V" and device.get("name") == source.strip()
+                       for device in circuit.get("devices", [])):
+                bad(f"source {source!r} is not an independent voltage source in the circuit")
+            source = source.strip()
+        return {"type": "noise", "output": output.strip(), "source": source,
+                "fstart": fstart, "fstop": fstop, "points": points, "sweep": sweep}
     return None
 
 
@@ -1472,10 +1697,11 @@ def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
                         warnings=warns,
                         next_actions=["ecad_simulate('four', params={'f0':1e3,'tstop':5e-3,"
                                       "'probe':'V(OUT)'})"])
-        conv = bool(result.get("convergence", {}).get("four", False))
         harmonics = four.get("harmonics", [])
-        thd = float(four.get("thd_pct", 0.0))
-        h1 = harmonics[0][1] if harmonics else 0.0
+        thd = float(four.get("thd_pct", float("nan")))
+        h1 = harmonics[0][1] if harmonics else float("nan")
+        conv = (bool(result.get("convergence", {}).get("four", False))
+                and bool(harmonics) and _finite(thd) and _finite(h1))
         probe_used = four.get("probe", "?")
         dom = [f"H{n}={m:.4g} V" for n, m, _ in harmonics[:4]]
         reading = (f"{probe_used} @ f0={four.get('f0', '?'):.4g} Hz: "
@@ -1485,6 +1711,7 @@ def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
         return _dumps({
             "ok": conv, "doc_id": session.doc_id, "analysis": "four",
             "converged": conv,
+            **({} if conv else {"error": "four analysis did not converge or returned no finite harmonics"}),
             "device_count": len(circuit["devices"]),
             "four": four,
             "thd_pct": _round(thd), "h1_mag": _round(h1),
@@ -1521,10 +1748,17 @@ def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
                    f"mean={mean:.4g} V, sigma={std:.4g} V, "
                    f"range=[{mn:.4g}, {mx:.4g}] V "
                    f"(tolerances: {tol_str or 'defaults'})")
-        yield_pct = 100.0 * sum(1 for v in mc.get("values", []) if _finite(v)) / max(mc.get("runs", 1), 1)
+        values = mc.get("values", [])
+        requested_runs = int(mc.get("runs", 0) or 0)
+        yield_pct = (100.0 * sum(1 for v in values if _finite(v))
+                     / max(requested_runs, 1))
+        conv = (conv and requested_runs > 0 and len(values) == requested_runs
+                and all(_finite(v) for v in (mean, std, mn, mx))
+                and all(_finite(v) for v in values))
         return _dumps({
             "ok": conv, "doc_id": session.doc_id, "analysis": "mc",
             "converged": conv,
+            **({} if conv else {"error": "Monte-Carlo did not converge at every requested run"}),
             "device_count": len(circuit["devices"]),
             "mc": {k: (round(v, 6) if isinstance(v, float) else v)
                    for k, v in mc.items() if k != "values"},
@@ -1555,6 +1789,7 @@ def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
         conv = bool(result.get("convergence", {}).get("temp", False))
         points_data = temp_res.get("points", [])
         temps = temp_res.get("values", [])
+        conv = conv and bool(temps) and len(points_data) == len(temps)
         # Summarise the requested probe across temperatures (else the first probe).
         probe_used = req_probe or (probe_list[0] if probe_list else None)
         trend_vals: list[tuple[float, float]] = []
@@ -1564,6 +1799,8 @@ def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
                 v = op[probe_used]
                 if _finite(v):
                     trend_vals.append((pt["temp"], float(v)))
+        if probe_used:
+            conv = conv and len(trend_vals) == len(temps)
         if trend_vals and probe_used:
             first_t, first_v = trend_vals[0]
             last_t, last_v = trend_vals[-1]
@@ -1579,6 +1816,7 @@ def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
         return _dumps({
             "ok": conv, "doc_id": session.doc_id, "analysis": "temp",
             "converged": conv,
+            **({} if conv else {"error": "temperature sweep did not return every requested finite point"}),
             "device_count": len(circuit["devices"]),
             "temps": temps,
             "trend": [{"temp": t, probe_used or "probe": round(v, 6)}
@@ -1613,6 +1851,8 @@ def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
         output = noise.get("output", "?")
         # Peak noise density.
         peak_density = max((v for v in spectrum if _finite(v)), default=0.0)
+        conv = (conv and _finite(total_rms) and total_rms >= 0.0
+                and bool(freqs) and all(_finite(f) and float(f) > 0.0 for f in freqs))
         # Which resistor contributes most?
         dominant_r = max(per_r, key=lambda k: per_r[k]) if per_r else None
         reading = (f"Output noise at {output}: "
@@ -1624,6 +1864,7 @@ def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
         return _dumps({
             "ok": conv, "doc_id": session.doc_id, "analysis": "noise",
             "converged": conv,
+            **({} if conv else {"error": "noise analysis did not converge or returned invalid data"}),
             "device_count": len(circuit["devices"]),
             "output": output,
             # Significant-figure rounding so micro/nano-scale noise figures don't collapse to 0.0

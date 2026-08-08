@@ -12,8 +12,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
+#include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -22,6 +25,9 @@
 #include "doc/stepplus.h"
 #include "sim/fea_run.h"
 #include "sim/flow_run.h"
+#include "sim/numpy_rng.h"
+#include "sim/sim_cancel.h"
+#include "sim/solver_threads.h"
 #include "sim/sim_cache.h"
 #include "sim/spice.h"
 
@@ -105,6 +111,46 @@ fs::path tmp_path(const std::string& name) {
 }
 
 }  // namespace
+
+struct EnvGuard {
+    std::string name;
+    bool had_value = false;
+    std::string value;
+
+    explicit EnvGuard(const char* key) : name(key) {
+        if (const char* current = std::getenv(key)) {
+            had_value = true;
+            value = current;
+        }
+    }
+    ~EnvGuard() {
+#if defined(_WIN32)
+        _putenv_s(name.c_str(), had_value ? value.c_str() : "");
+#else
+        if (had_value)
+            setenv(name.c_str(), value.c_str(), 1);
+        else
+            unsetenv(name.c_str());
+#endif
+    }
+};
+
+struct CacheSidecarGuard {
+    fs::path dir;
+
+    explicit CacheSidecarGuard(const fs::path& path) : dir(path) {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        chudware::sim::cache::set_sidecar_dir(dir.string());
+        chudware::sim::cache::clear();
+    }
+    ~CacheSidecarGuard() {
+        chudware::sim::cache::clear();
+        chudware::sim::cache::set_sidecar_dir("");
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+};
 
 TEST_CASE("sim_cache: FEA static HIT / MISS / wall-times") {
     chudware::sim::cache::clear();
@@ -235,13 +281,15 @@ TEST_CASE("sim_cache: CFD HIT / invalidate-on-input-change") {
     std::vector<uint32_t> idx;
     unit_cube_tris(pos, idx);
     chudware::sim::FlowParams fp;
-    fp.cells = 24;     // tiny grid for a fast deterministic test
-    fp.n_steps = 40;
-    fp.velocity_ms = 10.0;
+    fp.cells = 32;
+    fp.n_steps = 500;
+    fp.velocity_ms = 0.1;
+    fp.nu_fluid = 1.0e-4;
 
     const auto t0 = std::chrono::steady_clock::now();
     auto r1 = chudware::sim::run_wind_tunnel({pos}, {idx}, fp);
     const double ms1 = ms_since(t0);
+    INFO("CFD cache setup error: ", r1.error);
     REQUIRE(r1.ok);
     const double drag1 = r1.drag_n;
     const double lift1 = r1.lift_n;
@@ -259,7 +307,7 @@ TEST_CASE("sim_cache: CFD HIT / invalidate-on-input-change") {
 
     // Input change (velocity) -> MISS (different forces, or at least a recompute path).
     chudware::sim::cache::Stats before = chudware::sim::cache::stats();
-    fp.velocity_ms = 20.0;
+    fp.velocity_ms = 0.2;
     auto r3 = chudware::sim::run_wind_tunnel({pos}, {idx}, fp);
     REQUIRE(r3.ok);
     chudware::sim::cache::Stats after = chudware::sim::cache::stats();
@@ -359,4 +407,155 @@ TEST_CASE("sim_cache: hash is stable and kind-scoped") {
     CHECK(modal != a);  // kinds never collide
     s["material"]["E_mpa"] = 100000.0;
     CHECK(chudware::sim::cache::hash_fea_study(Kind::FeaStatic, s) != a);
+}
+
+TEST_CASE("sim_cache: exact finite hashes never alias rounded inputs") {
+    json a = {{"mesh_fineness", 1.0}, {"solver", {{"tol", 1.0}}}};
+    json b = a;
+    b["solver"]["tol"] = std::nextafter(1.0, 2.0);
+    const std::string ha = chudware::sim::cache::hash_inputs(Kind::FeaStatic, a);
+    const std::string hb = chudware::sim::cache::hash_inputs(Kind::FeaStatic, b);
+    REQUIRE_FALSE(ha.empty());
+    CHECK(ha != hb);
+
+    json nonfinite = a;
+    nonfinite["solver"]["tol"] = std::numeric_limits<double>::quiet_NaN();
+    CHECK(chudware::sim::cache::hash_inputs(Kind::FeaStatic, nonfinite).empty());
+    CHECK_FALSE(chudware::sim::cache::store(Kind::FeaStatic, ha, nonfinite));
+
+    json missing_geometry = {{"step_path", "/definitely/not/a/chudware/model.step"}};
+    CHECK(chudware::sim::cache::hash_fea_study(Kind::FeaStatic, missing_geometry).empty());
+    CHECK(chudware::sim::cache::hash_fea_study(Kind::Cfd, a).empty());
+}
+
+TEST_CASE("sim_cache: kind isolation and corrupted sidecars fail closed") {
+    namespace cache = chudware::sim::cache;
+    CacheSidecarGuard sidecars(tmp_path("sidecars"));
+    const fs::path& dir = sidecars.dir;
+
+    const std::string hash = cache::hash_inputs(Kind::FeaStatic, json{{"case", 7}});
+    REQUIRE_FALSE(hash.empty());
+    REQUIRE(cache::store(Kind::FeaStatic, hash, json{{"value", 11}}));
+    REQUIRE(cache::store(Kind::FeaModal, hash, json{{"value", 22}}));
+    CHECK(cache::lookup(Kind::FeaStatic, hash).result.value("value", 0) == 11);
+    CHECK(cache::lookup(Kind::FeaModal, hash).result.value("value", 0) == 22);
+
+    cache::clear();
+    auto disk_hit = cache::lookup(Kind::FeaStatic, hash);
+    REQUIRE(disk_hit.hit);
+    CHECK(disk_hit.result.value("value", 0) == 11);
+
+    const fs::path sidecar = dir / ("fea_static_" + hash + ".json");
+    json envelope;
+    {
+        std::ifstream in(sidecar, std::ios::binary);
+        REQUIRE(in.good());
+        in >> envelope;
+    }
+    envelope["result"]["value"] = 99;  // valid JSON, invalid bound checksum
+    {
+        std::ofstream out(sidecar, std::ios::binary | std::ios::trunc);
+        out << envelope.dump();
+    }
+    cache::clear();
+    auto corrupt = cache::lookup(Kind::FeaStatic, hash);
+    CHECK_FALSE(corrupt.hit);
+    CHECK(corrupt.reason == "corrupt");
+
+    {
+        std::ofstream out(sidecar, std::ios::binary | std::ios::trunc);
+        out << "{\"engine\":";
+    }
+    cache::clear();
+    auto partial = cache::lookup(Kind::FeaStatic, hash);
+    CHECK_FALSE(partial.hit);
+    CHECK(partial.reason == "corrupt");
+
+    cache::clear();
+}
+
+TEST_CASE("sim_cache: result blobs bind every body byte and publish atomically") {
+    namespace cache = chudware::sim::cache;
+    const json payload = {{"ok", true}, {"value", 12345}};
+    std::string blob = cache::encode_result_blob(Kind::FeaStatic, "deadbeef", payload);
+    REQUIRE_FALSE(blob.empty());
+
+    const std::string original_blob = blob;
+    Kind kind = Kind::Em;
+    std::string hash = "unchanged";
+    json decoded = {{"sentinel", true}};
+    REQUIRE(cache::decode_result_blob(blob, kind, hash, decoded));
+    CHECK(kind == Kind::FeaStatic);
+    CHECK(hash == "deadbeef");
+    CHECK(decoded == payload);
+
+    const size_t value_pos = blob.rfind("12345");
+    REQUIRE(value_pos != std::string::npos);
+    blob[value_pos] = '9';  // body remains valid JSON; checksum must catch it
+    kind = Kind::Em;
+    hash = "unchanged";
+    const json sentinel = {{"sentinel", true}};
+    decoded = sentinel;
+    CHECK_FALSE(cache::decode_result_blob(blob, kind, hash, decoded));
+    CHECK(kind == Kind::Em);
+    CHECK(hash == "unchanged");
+    CHECK(decoded == sentinel);
+    blob = original_blob;
+    blob.resize(blob.size() - 1);
+    CHECK_FALSE(cache::decode_result_blob(blob, kind, hash, decoded));
+
+    json nonfinite = {{"value", std::numeric_limits<double>::infinity()}};
+    CHECK(cache::encode_result_blob(Kind::FeaStatic, "deadbeef", nonfinite).empty());
+}
+
+TEST_CASE("sim_cancel: reused job ids cannot unregister the newer generation") {
+    using namespace chudware::sim;
+    auto old_token = sim_job_register("sim-cache-cancel-generation");
+    REQUIRE(old_token);
+    auto new_token = sim_job_register("sim-cache-cancel-generation");
+    REQUIRE(new_token);
+    CHECK(old_token->load(std::memory_order_acquire));
+    CHECK_FALSE(new_token->load(std::memory_order_acquire));
+
+    sim_job_unregister("sim-cache-cancel-generation", old_token);
+    auto cancelled = sim_cancel("sim-cache-cancel-generation");
+    CHECK(cancelled.value("cancelled", false));
+    CHECK(new_token->load(std::memory_order_acquire));
+
+    sim_job_unregister("sim-cache-cancel-generation", new_token);
+    auto finished = sim_cancel("sim-cache-cancel-generation");
+    CHECK_FALSE(finished.value("cancelled", true));
+}
+
+TEST_CASE("numpy_rng: PCG64 and normal streams match NumPy reference vectors") {
+    chudware::sim::NumpyGenerator raw(0);
+    CHECK(raw.next_uint64() == 11749869230777074271ULL);
+
+    chudware::sim::NumpyGenerator normal(0);
+    const double expected[] = {0.1257302210933933, -0.1321048632913019,
+                               0.6404226504432821, 0.10490011715303971,
+                               -0.535669373161111};
+    for (double value : expected)
+        CHECK(normal.standard_normal() == doctest::Approx(value).epsilon(1e-15));
+}
+
+TEST_CASE("solver_threads: configured requests remain within the hard host cap") {
+    EnvGuard guard("CHUDWARE_FEA_THREADS");
+#if defined(_WIN32)
+    _putenv_s("CHUDWARE_FEA_THREADS", "999999");
+#else
+    setenv("CHUDWARE_FEA_THREADS", "999999", 1);
+#endif
+    const int configured = chudware::sim::governed_solver_threads();
+    CHECK(configured >= 1);
+    CHECK(configured <= 8);
+
+#if defined(_WIN32)
+    _putenv_s("CHUDWARE_FEA_THREADS", "999999999999999999999999999999");
+#else
+    setenv("CHUDWARE_FEA_THREADS", "999999999999999999999999999999", 1);
+#endif
+    const int overflowed = chudware::sim::governed_solver_threads();
+    CHECK(overflowed >= 1);
+    CHECK(overflowed <= 8);
 }

@@ -30,6 +30,8 @@ Graceful posture (firmware contract): expected failures come back as result payl
 
 from __future__ import annotations
 
+import json
+import math
 from typing import Callable, Optional
 
 
@@ -37,11 +39,37 @@ def _wrap(fn: Callable[[dict], dict]) -> Callable[[dict, Callable], dict]:
     def handler(params: dict, emit) -> dict:  # noqa: ANN001
         del emit
         try:
-            return fn(params or {})
-        except Exception as e:  # noqa: BLE001 — worker contract: payloads, not raises
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            result = fn(params or {})
+            if not isinstance(result, dict):
+                return {"ok": False,
+                        "error": f"{fn.__name__} returned a non-object result"}
+            json.dumps(result, allow_nan=False)
+            return result
+        except Exception as exc:  # noqa: BLE001 — worker contract: payloads, not raises
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     return handler
+
+
+def _finite_param(params: dict, key: str, default: float, *,
+                  positive: bool = False) -> float:
+    raw = default if params.get(key) is None else params[key]
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"{key} must be finite")
+    if positive and value <= 0.0:
+        raise ValueError(f"{key} must be > 0")
+    return value
+
+
+def _positive_int_param(params: dict, key: str, default: int) -> int:
+    raw = default if params.get(key) is None else params[key]
+    if isinstance(raw, bool):
+        raise ValueError(f"{key} must be a positive integer")
+    value = int(raw)
+    if value != float(raw) or value <= 0:
+        raise ValueError(f"{key} must be a positive integer")
+    return value
 
 
 # --------------------------------------------------------------------------- capability doctor
@@ -74,7 +102,8 @@ def _heatsink_endpoint() -> Optional[Callable]:
                                      else hs.TIM_K_W_MK_DEFAULT),
                     include_library=bool(p.get("include_library", True)),
                     include_parametric=bool(p.get("include_parametric", True)),
-                    max_candidates=int(p.get("max_candidates") or 8),
+                    max_candidates=int(p.get("max_candidates")
+                                       if p.get("max_candidates") is not None else 8),
                 )
             return _wrap_impl
     except Exception:  # noqa: BLE001
@@ -140,20 +169,28 @@ def _sim_caps(params: dict) -> dict:
 # --------------------------------------------------------------------------- ccx proxies
 
 def _sim_run_buckling(params: dict) -> dict:
-    """{L_mm,b_mm,h_mm, E_mpa, nu, load_n, n_modes} -> buckling load factors.
-    Box-proxy fixed-free Euler column, identical to the run_fea_buckling MCP tool."""
+    """Run the CalculiX box-proxy buckling study with validated physical inputs."""
+    try:
+        length = _finite_param(params, "L_mm", 100.0, positive=True)
+        width = _finite_param(params, "b_mm", 20.0, positive=True)
+        height = _finite_param(params, "h_mm", 20.0, positive=True)
+        modulus = _finite_param(params, "E_mpa", 200000.0, positive=True)
+        poisson = _finite_param(params, "nu", 0.3)
+        load = abs(_finite_param(params, "load_n", 1000.0))
+        n_modes = _positive_int_param(params, "n_modes", 4)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {"ok": False, "error": f"invalid buckling setup: {exc}"}
+    if not -1.0 < poisson < 0.5:
+        return {"ok": False, "error": "invalid buckling setup: nu must be between -1 and 0.5"}
+    if load == 0.0:
+        return {"ok": False, "error": "invalid buckling setup: load_n must be non-zero"}
+
     from services.mcp import fea_advanced as fa
     if fa.ccx_path() is None:
-        return fa._ccx_absent_result("linear buckling")  # noqa: SLF001 — shared helper
-    L = float(params.get("L_mm") or 100.0)
-    b = float(params.get("b_mm") or 20.0)
-    h = float(params.get("h_mm") or 20.0)
-    E = float(params.get("E_mpa") or 200000.0)
-    nu = float(params.get("nu") or 0.3)
-    P = max(1.0, abs(float(params.get("load_n") or 1000.0)))
-    n_modes = int(params.get("n_modes") or 4)
-    gen = fa.build_buckling_column_inp(L, b, h, E, nu, P, nz=4)
-    run = fa.run_ccx(gen["inp"], job="buckle")
+        return fa._ccx_absent_result("linear buckling")  # noqa: SLF001
+    generated = fa.build_buckling_column_inp(
+        length, width, height, modulus, poisson, load, nz=4)
+    run = fa.run_ccx(generated["inp"], job="buckle")
     if run.get("skipped"):
         return run
     if not run.get("ok") or not run.get("dat_path"):
@@ -161,97 +198,147 @@ def _sim_run_buckling(params: dict) -> dict:
                 or run.get("error", "ccx buckling run failed"),
                 "backend": run.get("backend")}
     factors = fa.parse_buckle_factors(run["dat_path"])[:n_modes]
+    if (not factors or any(not math.isfinite(float(f)) or float(f) <= 0.0
+                           for f in factors)):
+        return {"ok": False, "error": "CalculiX returned no finite positive buckling factors",
+                "backend": run.get("backend")}
+    expected = float(generated["expected_Pcr"])
+    if not math.isfinite(expected) or expected <= 0.0:
+        return {"ok": False, "error": "buckling reference calculation was non-finite",
+                "backend": run.get("backend")}
     return {"ok": True, "backend": run["backend"],
             "solver": "CalculiX *BUCKLE (box proxy, fixed-free column)",
-            "applied_load_n": P,
-            "load_factors": [round(f, 4) for f in factors],
-            "critical_loads_n": [round(f * P, 3) for f in factors],
-            "euler_reference_pcr_n": round(gen["expected_Pcr"], 3),
+            "applied_load_n": load,
+            "load_factors": [round(float(f), 4) for f in factors],
+            "critical_loads_n": [round(float(f) * load, 3) for f in factors],
+            "euler_reference_pcr_n": round(expected, 3),
             "note": "box-proxy Euler buckling estimate sized to the part bounding box; "
-                    "ccx GPL-2.0 subprocess. load_factor<1 = buckles below the applied "
-                    "load."}
+                    "ccx GPL-2.0 subprocess. load_factor<1 = buckles below the applied load."}
 
 
 def _sim_run_contact(params: dict) -> dict:
-    """{L_mm,b_mm,h_mm, E_mpa, nu, pressure_mpa} -> contact conservation check.
-    Two-block proxy, identical to the run_fea_contact MCP tool."""
+    """Run the CalculiX two-block contact proxy and require force balance."""
+    try:
+        length = _finite_param(params, "L_mm", 50.0, positive=True)
+        width = _finite_param(params, "b_mm", 50.0, positive=True)
+        height = _finite_param(params, "h_mm", 20.0, positive=True)
+        modulus = _finite_param(params, "E_mpa", 200000.0, positive=True)
+        poisson = _finite_param(params, "nu", 0.3)
+        pressure = _finite_param(params, "pressure_mpa", 1.0, positive=True)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {"ok": False, "error": f"invalid contact setup: {exc}"}
+    if not -1.0 < poisson < 0.5:
+        return {"ok": False, "error": "invalid contact setup: nu must be between -1 and 0.5"}
+
     from services.mcp import fea_advanced as fa
     if fa.ccx_path() is None:
         return fa._ccx_absent_result("nonlinear contact")  # noqa: SLF001
-    L = float(params.get("L_mm") or 50.0)
-    b = float(params.get("b_mm") or 50.0)
-    h = float(params.get("h_mm") or 20.0)
-    E = float(params.get("E_mpa") or 200000.0)
-    nu = float(params.get("nu") or 0.3)
-    pressure = float(params.get("pressure_mpa") or 1.0)
-    gen = fa.build_contact_block_inp(L, b, h, E, nu, pressure)
-    run = fa.run_ccx(gen["inp"], job="contact")
+    generated = fa.build_contact_block_inp(
+        length, width, height, modulus, poisson, pressure)
+    run = fa.run_ccx(generated["inp"], job="contact")
     if run.get("skipped"):
         return run
     if not run.get("ok") or not run.get("dat_path"):
         return {"ok": False, "error": run.get("stderr", "")[-400:]
                 or run.get("error", "ccx contact run failed"),
                 "backend": run.get("backend")}
-    rf = fa.parse_dat_nodal(run["dat_path"], "RF", gen["base_nodes"], component=3)
-    reaction = abs(rf * len(gen["base_nodes"])) if rf is not None else None
+    reaction_per_node = fa.parse_dat_nodal(
+        run["dat_path"], "RF", generated["base_nodes"], component=3)
+    if reaction_per_node is None or not math.isfinite(float(reaction_per_node)):
+        return {"ok": False, "error": "CalculiX contact result has no finite base reaction",
+                "backend": run.get("backend")}
+    reaction = abs(float(reaction_per_node) * len(generated["base_nodes"]))
+    applied = float(generated["applied_load_n"])
+    if not math.isfinite(applied) or applied <= 0.0:
+        return {"ok": False, "error": "contact applied load is non-finite",
+                "backend": run.get("backend")}
+    balance_pct = 100.0 * abs(reaction - applied) / applied
+    if balance_pct > 5.0:
+        return {"ok": False, "error": "contact solve failed force balance",
+                "backend": run.get("backend"),
+                "applied_load_n": round(applied, 3),
+                "base_reaction_n": round(reaction, 3),
+                "reaction_balance_error_pct": round(balance_pct, 3)}
     return {"ok": True, "backend": run["backend"],
             "solver": "CalculiX *STATIC,NLGEOM + *CONTACT PAIR (two-block proxy)",
-            "applied_load_n": round(gen["applied_load_n"], 3),
-            "base_reaction_n": (round(reaction, 3) if reaction is not None else None),
+            "applied_load_n": round(applied, 3),
+            "base_reaction_n": round(reaction, 3),
+            "reaction_balance_error_pct": round(balance_pct, 3),
             "note": "box-proxy contact conservation check sized to the part bounding "
-                    "box; base reaction should equal the applied load. ccx GPL-2.0 "
-                    "subprocess."}
+                    "box; base reaction should equal the applied load. ccx GPL-2.0 subprocess."}
 
 
 # --------------------------------------------------------------------------- frequency response
 
 def _sim_freq_response(params: dict) -> dict:
-    """Post-process a C++ core sim_run_modal result into harmonic + random vibration
-    response (run_fea_frequency_response's math). Params:
-      freqs_hz[], mode_shapes (flat n_modes*n_nodes*3), n_nodes, total_mass_kg,
-      excitation_dir?[3], sweep_hz?[], zeta?, base_accel_g?, psd_breakpoints?[[f,psd]],
-      vibration_spec?{max_peak_accel_g, max_grms}."""
+    """Validate and post-process a core modal result into harmonic and random response."""
     try:
         from ..sim.vibration import (
             evaluate_vibration_spec, harmonic_response, miles_response)
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"vibration post-processing unavailable: {e}",
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"vibration post-processing unavailable: {exc}",
                 "hint": "numpy is required for the frequency-response leg"}
-    freqs = [float(f) for f in params.get("freqs_hz") or []]
-    shapes = params.get("mode_shapes") or []
-    n_nodes = int(params.get("n_nodes") or 0)
-    mass = float(params.get("total_mass_kg") or 0.0)
-    if not freqs or not shapes or n_nodes <= 0:
-        return {"ok": False, "error": "need freqs_hz + mode_shapes + n_nodes from a "
-                                      "modal solve"}
-    if mass <= 0.0:
-        return {"ok": False, "error": "total_mass_kg must be > 0 — set a material with "
-                                      "density so the part mass is known"}
-    ex_dir = [float(x) for x in (params.get("excitation_dir") or [0.0, 0.0, 1.0])]
-    sweep = [float(f) for f in (params.get("sweep_hz") or [])]
-    if not sweep:  # default: 200 log-spaced points across the common vibe-test band
-        sweep = [10.0 * (2000.0 / 10.0) ** (i / 199.0) for i in range(200)]
-    zeta = float(params.get("zeta") or 0.02)
-    base_g = float(params.get("base_accel_g") or 1.0)
-    psd_in = params.get("psd_breakpoints")
-    harm = harmonic_response(freqs_hz=freqs, mode_shapes_flat=shapes, n_nodes=n_nodes,
-                             total_mass_kg=mass, excitation_dir=ex_dir, sweep_hz=sweep,
-                             zeta=zeta, base_accel_g=base_g)
-    if psd_in:
-        rand: dict = miles_response(freqs_hz=freqs, mode_shapes_flat=shapes,
-                                    n_nodes=n_nodes, total_mass_kg=mass,
-                                    excitation_dir=ex_dir,
-                                    psd_breakpoints=[(float(p[0]), float(p[1]))
-                                                     for p in psd_in],
-                                    zeta=zeta)
-        rand["ok"] = True
-    else:  # honest degrade — NEVER assume a default vibration profile
-        rand = {"ok": False, "reason": "no_psd_provided",
-                "hint": "Provide psd_breakpoints=[[f_hz, g2_per_hz], ...] for random-"
-                        "vibration GRMS via Miles' equation."}
-    verdict = evaluate_vibration_spec(params.get("vibration_spec"),
-                                      harm, rand if rand.get("ok") else None)
-    return {"ok": True, "freqs_hz": freqs, "harmonic": harm, "random": rand,
+
+    try:
+        raw_freqs = params.get("freqs_hz")
+        raw_shapes = params.get("mode_shapes")
+        if not isinstance(raw_freqs, (list, tuple)) or not raw_freqs:
+            raise ValueError("need freqs_hz from a modal solve")
+        if not isinstance(raw_shapes, (list, tuple)) or not raw_shapes:
+            raise ValueError("need mode_shapes from a modal solve")
+        freqs = [float(f) for f in raw_freqs]
+        if any(not math.isfinite(f) or f < 0.0 for f in freqs):
+            raise ValueError("freqs_hz must contain finite non-negative frequencies")
+        if not any(f >= 0.5 for f in freqs):
+            raise ValueError("modal result has no elastic mode at or above 0.5 Hz")
+        n_nodes = _positive_int_param(params, "n_nodes", 0)
+        mass = _finite_param(params, "total_mass_kg", 0.0, positive=True)
+        direction_raw = params.get("excitation_dir")
+        direction_raw = [0.0, 0.0, 1.0] if direction_raw is None else direction_raw
+        if not isinstance(direction_raw, (list, tuple)) or len(direction_raw) != 3:
+            raise ValueError("excitation_dir must contain three components")
+        excitation_dir = [float(value) for value in direction_raw]
+        if (any(not math.isfinite(value) for value in excitation_dir)
+                or not any(value != 0.0 for value in excitation_dir)):
+            raise ValueError("excitation_dir must be finite and non-zero")
+        zeta = _finite_param(params, "zeta", 0.02, positive=True)
+        if zeta >= 1.0:
+            raise ValueError("zeta must be less than 1 for modal resonance response")
+        base_accel = _finite_param(params, "base_accel_g", 1.0, positive=True)
+
+        raw_sweep = params.get("sweep_hz")
+        if raw_sweep:
+            sweep = [float(f) for f in raw_sweep]
+        else:
+            sweep = [10.0 * (2000.0 / 10.0) ** (i / 199.0) for i in range(200)]
+            sweep = sorted(set(sweep + [f for f in freqs if 10.0 <= f <= 2000.0]))
+        if not sweep or any(not math.isfinite(f) or f <= 0.0 for f in sweep):
+            raise ValueError("sweep_hz must contain finite positive frequencies")
+
+        harmonic = harmonic_response(
+            freqs_hz=freqs, mode_shapes_flat=raw_shapes, n_nodes=n_nodes,
+            total_mass_kg=mass, excitation_dir=excitation_dir, sweep_hz=sweep,
+            zeta=zeta, base_accel_g=base_accel)
+        psd_input = params.get("psd_breakpoints")
+        if psd_input:
+            random: dict = miles_response(
+                freqs_hz=freqs, mode_shapes_flat=raw_shapes, n_nodes=n_nodes,
+                total_mass_kg=mass, excitation_dir=excitation_dir,
+                psd_breakpoints=psd_input, zeta=zeta)
+            random["ok"] = True
+        else:
+            random = {"ok": False, "reason": "no_psd_provided",
+                      "hint": "Provide psd_breakpoints=[[f_hz, g2_per_hz], ...] for "
+                              "random-vibration GRMS via Miles' equation."}
+        spec = params.get("vibration_spec")
+        if spec is not None and not isinstance(spec, dict):
+            raise ValueError("vibration_spec must be an object")
+        verdict = evaluate_vibration_spec(
+            spec, harmonic, random if random.get("ok") else None)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {"ok": False, "error": f"invalid frequency-response setup: {exc}"}
+
+    return {"ok": True, "freqs_hz": freqs, "harmonic": harmonic, "random": random,
             "verdict": verdict,
             "damping_assumption": f"zeta={zeta} (Q={1.0 / (2.0 * zeta):g}) — assumed "
                                   "modal damping, not measured"}
@@ -260,24 +347,31 @@ def _sim_freq_response(params: dict) -> dict:
 # --------------------------------------------------------------------------- handoffs
 
 def _ecad_thermal_handoff(params: dict) -> dict:
-    """{board: <ECAD board doc JSON>, environment?, h_w_m2k?, t_amb_c?,
-    include_trace_heating?, transient?, mesh_fineness?, dry_run?, doc_id?} ->
-    thermal_handoff_impl result (same payload as the MCP tool, dict-shaped)."""
+    """Validate worker-only scalars before dispatching the shared ECAD thermal handoff."""
+    mesh_fineness = _finite_param(params, "mesh_fineness", 0.35, positive=True)
+    if mesh_fineness > 1.0:
+        return {"ok": False, "error": "mesh_fineness must be in (0, 1]"}
+    h_value = params.get("h_w_m2k")
+    if h_value is not None:
+        h_value = _finite_param(params, "h_w_m2k", 0.0, positive=True)
+    ambient = params.get("t_amb_c")
+    if ambient is not None:
+        ambient = _finite_param(params, "t_amb_c", 0.0)
     from services.mcp.ecad_thermal import thermal_handoff_impl
     return thermal_handoff_impl(
         params.get("board") or {},
         doc_id=str(params.get("doc_id") or ""),
         environment=str(params.get("environment") or "still_air"),
-        h_w_m2k=params.get("h_w_m2k"),
-        t_amb_c=params.get("t_amb_c"),
+        h_w_m2k=h_value,
+        t_amb_c=ambient,
         include_trace_heating=bool(params.get("include_trace_heating", False)),
         transient=params.get("transient"),
-        mesh_fineness=float(params.get("mesh_fineness") or 0.35),
+        mesh_fineness=mesh_fineness,
         dry_run=bool(params.get("dry_run", False)))
 
 
 def _heatsink_select(params: dict) -> dict:
-    """T-FIN17 forward seam: delegates when the heatsink selection impl exists."""
+    """Delegate only when the capability exists and require an object result."""
     fn = _heatsink_endpoint()
     if fn is None:
         return {"ok": False, "skipped": True,
@@ -285,11 +379,12 @@ def _heatsink_select(params: dict) -> dict:
                 "hint": "the 'Pick heatsink' action lights up when T-FIN17 lands"}
     out = fn(params or {})
     if isinstance(out, str):
-        import json as _json
         try:
-            out = _json.loads(out)
+            out = json.loads(out)
         except Exception:  # noqa: BLE001
-            out = {"ok": False, "error": "heatsink_select returned non-JSON output"}
+            return {"ok": False, "error": "heatsink_select returned non-JSON output"}
+    if not isinstance(out, dict):
+        return {"ok": False, "error": "heatsink_select returned a non-object result"}
     return out
 
 
@@ -302,8 +397,10 @@ def _piping_verify_cfd(params: dict) -> dict:
     if not isinstance(solve, dict) or not isinstance(cfd, dict):
         return {"ok": False, "error": "need solve_result (piping_solve output) and "
                                       "cfd_result (run_cfd_* output) dicts"}
-    return verify_pressure_drop(solve, cfd,
-                                tolerance_pct=float(params.get("tolerance_pct") or 20.0),
+    tolerance = _finite_param(params, "tolerance_pct", 20.0)
+    if tolerance < 0.0:
+        return {"ok": False, "error": "tolerance_pct must be finite and >= 0"}
+    return verify_pressure_drop(solve, cfd, tolerance_pct=tolerance,
                                 run_id=params.get("run_id"))
 
 

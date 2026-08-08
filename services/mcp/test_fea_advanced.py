@@ -31,8 +31,11 @@ def test_sn_life_finite_matches_shigley():
 
 def test_sn_life_runout_and_guards():
     assert fa.sn_life(150.0, 200.0, 400.0) == 1e6      # below endurance
-    assert fa.sn_life(0.0, 200.0, 400.0) == 1e6        # zero stress
-    assert fa.sn_life(300.0, 0.0, 400.0) == 1e6        # no endurance data
+    assert fa.sn_life(0.0, 200.0, 400.0) == 1e6        # zero applied stress
+    with pytest.raises(ValueError, match="both be > 0"):
+        fa.sn_life(300.0, 0.0, 400.0)                  # missing material data
+    with pytest.raises(ValueError, match=r"0.9\*Sut"):
+        fa.sn_life(390.0, 360.0, 400.0)                # singular/nonphysical S-N line
 
 
 def test_marin_factors_ranges():
@@ -63,12 +66,35 @@ def test_fatigue_summarize_regimes():
     assert out["cycles"] == out["theories"]["goodman"]["cycles"]
 
 
+@pytest.mark.parametrize(
+    "call,args",
+    [(fa.marin_ka, (400.0, 9)),
+     (fa.marin_kb, (0.0, 0)),
+     (fa.marin_kc, (9,)),
+     (fa.marin_kd, (float("nan"),)),
+     (fa.reliability_ke, (100.0,)),
+     (fa.corrected_endurance, (0.0, 400.0))])
+def test_fatigue_corrections_reject_values_they_used_to_clamp_or_default(call, args):
+    with pytest.raises(ValueError):
+        call(*args)
+
+
+def test_fatigue_summary_refuses_missing_or_zero_solver_theory_fields():
+    with pytest.raises(ValueError, match="absent"):
+        fa.fatigue_summarize(
+            {"goodman": {"sa_eq_mpa": 100.0}}, 200.0, 400.0, theory="gerber")
+    with pytest.raises(ValueError, match="non-positive"):
+        fa.fatigue_summarize(
+            {"goodman": {"sa_eq_mpa": 0.0}}, 200.0, 400.0, theory="goodman")
+
+
 # --------------------------------------------------------------------- .inp generators
 
 def test_thermal_inp_and_expected_mid_T():
     gen = fa.build_thermal_bar_inp(200.0, 20.0, 20.0, 50.0, 100.0, 0.0, nx=8)
     assert "*HEAT TRANSFER, STEADY STATE" in gen["inp"]
     assert "*CONDUCTIVITY" in gen["inp"]
+    assert "*CONDUCTIVITY\n0.050000000\n" in gen["inp"]  # W/mK -> W/mmK, once
     assert gen["expected_mid_T"] == 50.0
 
 
@@ -90,6 +116,23 @@ def test_contact_inp_two_disjoint_blocks():
     assert min(gen["top_nodes"]) > max(gen["base_nodes"])   # no id collision
 
 
+def test_generators_reject_degenerate_or_non_finite_inputs_before_meshing():
+    with pytest.raises(ValueError, match="must all be > 0"):
+        fa.build_thermal_bar_inp(0.0, 20.0, 20.0, 50.0, 100.0, 0.0)
+    with pytest.raises(ValueError, match="finite"):
+        fa.build_buckling_column_inp(
+            1000.0, 20.0, 20.0, float("inf"), 0.29, 5000.0)
+    with pytest.raises(ValueError, match="pressure"):
+        fa.build_contact_block_inp(20.0, 20.0, 10.0, 200000.0, 0.29, 0.0)
+
+
+def test_buckling_deck_requests_the_public_mode_count():
+    gen = fa.build_buckling_column_inp(
+        1000.0, 20.0, 20.0, 200000.0, 0.29, 5000.0,
+        nx=4, ny=2, nz=2, n_modes=7)
+    assert "*BUCKLE\n7\n" in gen["inp"]
+
+
 # --------------------------------------------------------------------- ccx runner
 
 def test_ccx_absent_degrades_honestly(monkeypatch):
@@ -102,6 +145,79 @@ def test_ccx_absent_result_shape():
     r = fa._ccx_absent_result("thermal")
     assert r["ok"] is False and r["skipped"] is True
     assert "GPL-2.0" in r["reason"] and r["backend"].startswith("calculix")
+
+
+def _fake_ccx_run(monkeypatch, tmp_path, outcome: str):
+    created: list = []
+
+    def fake_mkdtemp(prefix: str):
+        path = tmp_path / f"{prefix}{len(created)}"
+        path.mkdir()
+        created.append(path)
+        return str(path)
+
+    def fake_run(cmd, *, cwd, capture_output, text, timeout):
+        if outcome == "timeout":
+            raise fa.subprocess.TimeoutExpired(cmd, timeout)
+        if outcome == "launch":
+            raise OSError("cannot execute ccx")
+        dat_path = fa.Path(cwd) / f"{cmd[-1]}.dat"
+        dat_path.write_text(
+            " temperatures for set NMID and time  0.100000E+01\n\n"
+            " 5  50.0\n"
+            " 6  50.0\n\n")
+        return fa.subprocess.CompletedProcess(
+            cmd, 0 if outcome == "success" else 2,
+            stdout="Job finished" if outcome == "success" else "",
+            stderr="" if outcome == "success" else "solver failed")
+
+    monkeypatch.setattr(fa, "ccx_path", lambda: "/fake/ccx")
+    monkeypatch.setattr(fa.tempfile, "mkdtemp", fake_mkdtemp)
+    monkeypatch.setattr(fa.subprocess, "run", fake_run)
+    return created
+
+
+def test_run_ccx_default_keeps_success_outputs_through_parse_then_cleans(
+        monkeypatch, tmp_path):
+    created = _fake_ccx_run(monkeypatch, tmp_path, "success")
+    run = fa.run_ccx("*NODE\n5, 0, 0, 0\n6, 1, 0, 0\n", job="owned")
+    dat_path = run["dat_path"]
+    workdir = created[0]
+    assert run["ok"] is True and run["retained"] is False
+    assert run["workdir"] is None and dat_path
+    assert workdir.is_dir()
+    assert fa.parse_dat_nodal(dat_path, "NT", [5, 6]) == 50.0
+    assert workdir.is_dir(), "result path must remain valid for all caller parsing"
+
+    # The unretained result/path objects own the directory. Releasing the final
+    # output path is the end of the parsing lifetime and must remove it.
+    del run
+    del dat_path
+    import gc
+    gc.collect()
+    assert not workdir.exists()
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "launch", "solver"])
+def test_run_ccx_default_cleans_every_error_workdir(
+        monkeypatch, tmp_path, outcome):
+    created = _fake_ccx_run(monkeypatch, tmp_path, outcome)
+    run = fa.run_ccx("*NODE\n1, 0, 0, 0\n", job="failed")
+    assert run["ok"] is False and run["workdir"] is None
+    assert run["retained"] is False
+    assert created and not created[0].exists()
+    if outcome == "solver":
+        assert run["dat_path"] is None
+
+
+@pytest.mark.parametrize("outcome", ["success", "timeout", "launch", "solver"])
+def test_run_ccx_keep_dir_retains_and_reports_every_outcome(
+        monkeypatch, tmp_path, outcome):
+    created = _fake_ccx_run(monkeypatch, tmp_path, outcome)
+    run = fa.run_ccx("*NODE\n1, 0, 0, 0\n", job="kept", keep_dir=True)
+    assert run["workdir"] == str(created[0])
+    assert run["retained"] is True
+    assert created[0].is_dir()
 
 
 def test_dat_nodal_parser_averages():
@@ -121,6 +237,26 @@ def test_dat_nodal_parser_averages():
         fh.write(text)
     val = fa.parse_dat_nodal(p, "NT", [5, 6], component=1)
     assert val is not None and math.isclose(val, 50.0, abs_tol=1e-6)
+
+
+def test_dat_nodal_parser_refuses_an_incomplete_final_increment(tmp_path):
+    text = (
+        " temperatures for set NBASE and time  0.500000E+00\n\n"
+        " 5  10.0\n"
+        " 6  10.0\n\n"
+        " temperatures for set NBASE and time  0.100000E+01\n\n"
+        " 5  20.0\n\n"
+    )
+    path = tmp_path / "incomplete.dat"
+    path.write_text(text)
+    assert fa.parse_dat_nodal(str(path), "NT", [5, 6], component=1) is None
+
+
+def test_dat_nodal_parser_refuses_duplicate_requested_nodes(tmp_path):
+    path = tmp_path / "unused.dat"
+    path.write_text("")
+    with pytest.raises(ValueError, match="duplicate"):
+        fa.parse_dat_nodal(str(path), "RF", [5, 5], component=3)
 
 
 # --------------------------------------------------------------------- MCP tool degrade
@@ -170,3 +306,28 @@ def test_ccx_tools_skip_when_absent(monkeypatch):
     assert r_bk.get("skipped") is True
     r_ct = json.loads(fns["run_fea_contact"](1.0, doc_id="nope"))
     assert r_ct.get("skipped") is True
+
+
+@pytest.mark.parametrize(
+    "tool,kwargs,needle",
+    [("run_fea_modal", {"fixtures": [], "n_modes": 0, "doc_id": "nope"},
+      "positive integer"),
+     ("run_fea_frequency_response",
+      {"fixtures": ["bottom"], "base_accel_g": 0.0, "doc_id": "nope"},
+      "base_accel_g"),
+     ("run_fea_thermal",
+      {"hot_faces": [{"face": "+x", "temperature": 100}],
+       "cold_faces": [{"face": "-x", "temperature": 0}],
+       "conductivity_w_mk": 0.0, "doc_id": "nope"}, "conductivity_w_mk"),
+     ("run_fea_buckling",
+      {"fixtures": ["bottom"], "load": [{"face": "top", "force": [0, 0, -1]}],
+       "n_modes": 0, "doc_id": "nope"}, "positive integer"),
+     ("run_fea_contact", {"pressure_mpa": 0.0, "doc_id": "nope"}, "pressure_mpa"),
+     ("run_cfd_flow", {"velocity": 0.0, "doc_id": "nope"}, "velocity"),
+     ("run_cfd_flow", {"fluid": "steam", "doc_id": "nope"}, "fluid"),
+     ("run_cfd_accurate", {"fluid": "steam", "doc_id": "nope"}, "fluid"),
+     ("run_cfd_accurate", {"preset": "ultra", "doc_id": "nope"}, "preset")])
+def test_public_setup_guards_fail_before_document_or_backend_work(tool, kwargs, needle):
+    out = json.loads(_cad_tools()[tool](**kwargs))
+    assert out.get("ok") is False, out
+    assert needle in out.get("error", ""), out

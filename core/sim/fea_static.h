@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "sim/sim_cancel.h"
 
 namespace chudware::sim {
 
@@ -97,6 +98,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points,
                                  double yield_mpa, const std::vector<int>& fixed_nodes,
                                  const std::vector<double>& nodal_forces,
                                  int nodes_per_elem = 4,
-                                 const std::vector<BondSpring>& bond_springs = {});
+                                 const std::vector<BondSpring>& bond_springs = {},
+                                 const SimCancelToken& cancel_token = {});
 
 }  // namespace chudware::sim

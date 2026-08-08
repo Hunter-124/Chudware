@@ -29,8 +29,10 @@ import os
 import tempfile
 from typing import Dict, Optional
 
-from .adapters import EmAdapter, EmSolverError, resolve_cross_section, dominant_mode, \
-    sparam_payload
+from .adapters import (
+    EmAdapter, EmSolverError, _bounded_int, _finite_float, _positive_range,
+    _validate_result_finite, dominant_mode, resolve_cross_section, sparam_payload,
+)
 from .analytic import C0
 
 def _lines(lo: float, hi: float, step: float) -> list:
@@ -79,29 +81,55 @@ class OpenEmsAdapter(EmAdapter):
                                 "(circular ports tracked in T-SIM11)")
         md = dominant_mode(cs, spec.get("mode"))
         fc_hz = md["fc_hz"]
-        length_mm = float(spec.get("length_mm", 50.0))
-        f_start = float(spec.get("f_start_ghz", fc_hz / 1e9 * 0.8)) * 1e9
-        f_stop = float(spec.get("f_stop_ghz", fc_hz / 1e9 * 2.0)) * 1e9
+        length_mm = _finite_float(spec.get("length_mm", 50.0), "length_mm", positive=True)
+        start_ghz, stop_ghz = _positive_range(
+            spec, "f_start_ghz", "f_stop_ghz",
+            fc_hz / 1e9 * 0.8, fc_hz / 1e9 * 2.0)
+        f_start, f_stop = start_ghz * 1e9, stop_ghz * 1e9
+        if not math.isfinite(f_start) or not math.isfinite(f_stop):
+            raise EmSolverError("frequency range is outside the supported numeric range")
         if broadband:
             f_start = min(f_start, fc_hz * 0.5)
-        f0 = 0.5 * (f_start + f_stop)
         fbw = 0.5 * (f_stop - f_start)
-        if fbw <= 0:
-            raise EmSolverError("f_stop_ghz must exceed f_start_ghz")
+        f0 = f_start + fbw
+        if not math.isfinite(f0) or not math.isfinite(fbw) or fbw <= 0.0:
+            raise EmSolverError("openEMS excitation bandwidth is degenerate")
 
         a_mm, b_mm = cs["a_m"] * 1e3, cs["b_m"] * 1e3
-        # mesh: >= 20 cells per shortest wavelength, and >= 15 across the section
+        # Resolve both the shortest wavelength and the narrow wall; the old a-only
+        # limit left fewer than 15 cells across b in every canonical WR guide.
+        cells_per_wavelength = _bounded_int(
+            spec.get("cells_per_wavelength", 20), "cells_per_wavelength", 10, 200)
         lam_min_mm = C0 / (f_stop * math.sqrt(cs["eps_r"])) * 1e3
-        res_mm = min(lam_min_mm / float(spec.get("cells_per_wavelength", 20)),
-                     a_mm / 15.0)
+        res_mm = min(lam_min_mm / cells_per_wavelength, a_mm / 15.0, b_mm / 15.0)
+        if not math.isfinite(res_mm) or res_mm <= 0.0:
+            raise EmSolverError("openEMS mesh resolution is degenerate")
+        spans = {"x": a_mm, "y": b_mm, "z": length_mm}
+        ratios = {axis: span / res_mm for axis, span in spans.items()}
+        if any(not math.isfinite(ratio) for ratio in ratios.values()):
+            raise EmSolverError("openEMS mesh dimensions are outside the supported numeric range")
+        line_counts = {
+            axis: max(2, int(math.ceil(ratio)) + 1)
+            for axis, ratio in ratios.items()
+        }
+        mesh_cells = line_counts["x"] * line_counts["y"] * line_counts["z"]
+        if max(line_counts.values()) > 200_000 or mesh_cells > 5_000_000:
+            raise EmSolverError(
+                "openEMS mesh exceeds the adapter capability limit "
+                f"({line_counts}, {mesh_cells} cells)")
         mesh = {
             "x": _lines(0.0, a_mm, res_mm),
             "y": _lines(0.0, b_mm, res_mm),
             "z": _lines(0.0, length_mm, res_mm),
         }
-        # ports sit inboard of the PMLs; S21 reference length is their separation
-        z1 = round(length_mm * 0.15, 4)
-        z2 = round(length_mm * 0.85, 4)
+        # Ports occupy a finite propagation-direction box. Their measurement planes
+        # (the box stops in openEMS) remain at 15% and 85% of the guide, while the
+        # excitation boxes extend five target cells toward their respective PMLs.
+        z1 = round(length_mm * 0.15, 6)
+        z2 = round(length_mm * 0.85, 6)
+        port_depth = min(5.0 * res_mm, length_mm * 0.1)
+        if z2 <= z1 or not math.isfinite(port_depth) or port_depth <= 0.0:
+            raise EmSolverError("waveguide length is too short to separate the modal ports")
         plan = {
             "unit_m": 1e-3,
             "cross_section": cs,
@@ -111,26 +139,32 @@ class OpenEmsAdapter(EmAdapter):
             "boundaries": ["PEC", "PEC", "PEC", "PEC", "PML_8", "PML_8"],
             "excitation": {"type": "gaussian", "f0_hz": f0, "fc_hz": fbw},
             "freq": {"start_hz": f_start, "stop_hz": f_stop,
-                     "n": int(spec.get("n_freq", 201))},
+                     "n": _bounded_int(spec.get("n_freq", 201), "n_freq", 2, 100_001)},
             "ports": [
-                {"nr": 0, "z_mm": z1, "excite": 1, "mode": md["name"],
-                 "a_mm": a_mm, "b_mm": b_mm},
-                {"nr": 1, "z_mm": z2, "excite": 0, "mode": md["name"],
-                 "a_mm": a_mm, "b_mm": b_mm},
+                {"nr": 0, "start_z_mm": z1 - port_depth, "stop_z_mm": z1,
+                 "excite": 1, "mode": md["name"], "a_mm": a_mm, "b_mm": b_mm},
+                {"nr": 1, "start_z_mm": z2 + port_depth, "stop_z_mm": z2,
+                 "excite": 0, "mode": md["name"], "a_mm": a_mm, "b_mm": b_mm},
             ],
             "port_separation_mm": z2 - z1,
             "geometry": [],
-            "nr_ts": int(spec.get("max_timesteps", 200_000)),
-            "end_criteria": float(spec.get("end_criteria", 1e-4)),
+            "nr_ts": _bounded_int(spec.get("max_timesteps", 200_000),
+                                   "max_timesteps", 1, 10_000_000),
+            "end_criteria": _finite_float(
+                spec.get("end_criteria", 1e-4), "end_criteria", positive=True),
             "mesh": mesh,
         }
+        if plan["end_criteria"] >= 1.0:
+            raise EmSolverError("end_criteria must be less than 1")
         geom = spec.get("geometry") or {}
         if isinstance(geom, dict) and geom.get("stl_path"):
             path = str(geom["stl_path"])
             if not os.path.isfile(path):
                 raise EmSolverError(f"geometry stl_path not found: {path}")
-            plan["geometry"].append({"kind": "stl-metal", "path": path,
-                                     "priority": int(geom.get("priority", 10))})
+            plan["geometry"].append({
+                "kind": "stl-metal", "path": path,
+                "priority": _bounded_int(geom.get("priority", 10), "geometry.priority", 0, 1000),
+            })
         elif geom:
             raise EmSolverError(
                 "unsupported geometry spec — v1 supports {'stl_path': ...} (export the "
@@ -169,16 +203,31 @@ class OpenEmsAdapter(EmAdapter):
                 reader.ReadFile()
         ports = []
         for p in plan["ports"]:
-            start = [0.0, 0.0, p["z_mm"]]
-            stop = [p["a_mm"], p["b_mm"], p["z_mm"]]
+            start = [0.0, 0.0, p["start_z_mm"]]
+            stop = [p["a_mm"], p["b_mm"], p["stop_z_mm"]]
+            mesh.AddLine("z", [p["start_z_mm"], p["stop_z_mm"]])
             ports.append(fdtd.AddRectWaveGuidePort(
                 p["nr"], start, stop, "z", p["a_mm"] * plan["unit_m"],
                 p["b_mm"] * plan["unit_m"], p["mode"], excite=p["excite"]))
+        fr = plan["freq"]
+        # RectWGPort.CalcPort in openEMS 0.37 evaluates beta with a real sqrt and
+        # therefore returns NaNs at/below modal cutoff. Driven sweeps must fall back
+        # to the analytic uniform-guide model for that band. A time-domain run still
+        # uses its broadband excitation, but its reported modal spectrum is sampled
+        # only where the port impedance is defined by this binding.
+        if not want_time and fr["start_hz"] <= plan["fc_hz"]:
+            raise EmSolverError(
+                "openEMS RectWGPort post-processing requires f_start_ghz above "
+                f"the {plan['mode']} cutoff ({plan['fc_hz'] / 1e9:.6g} GHz); "
+                "use solver='analytic-uniform' for a sweep through cutoff")
+        spectrum_start = (max(fr["start_hz"], plan["fc_hz"] * (1.0 + 1e-9))
+                          if want_time else fr["start_hz"])
+        if spectrum_start >= fr["stop_hz"]:
+            raise EmSolverError(
+                "openEMS time-domain spectrum has no samples above modal cutoff")
+        freq = np.linspace(spectrum_start, fr["stop_hz"], fr["n"])
         sim_path = tempfile.mkdtemp(prefix="chudware_em_")
         fdtd.Run(sim_path, cleanup=True)
-
-        fr = plan["freq"]
-        freq = np.linspace(fr["start_hz"], fr["stop_hz"], fr["n"])
         for p in ports:
             p.CalcPort(sim_path, freq)
         out = {
@@ -205,43 +254,72 @@ class OpenEmsAdapter(EmAdapter):
         import numpy as np
         plan = self.build_plan(spec)
         raw = self._execute(plan, want_time=False)
-        freq = np.asarray(raw["freq_hz"], dtype=float)
-        inc = np.asarray(raw["p1_inc"], dtype=complex)
-        inc = np.where(np.abs(inc) < 1e-30, 1e-30, inc)
-        s11 = np.asarray(raw["p1_ref"], dtype=complex) / inc
-        s21 = np.asarray(raw["p2_ref"], dtype=complex) / inc
-        return {"solver": self.name, "cross_section": plan["cross_section"],
-                "mode": plan["mode"], "fc_ghz": plan["fc_hz"] / 1e9,
-                "length_mm": plan["length_mm"],
-                "port_separation_mm": plan["port_separation_mm"],
-                **sparam_payload(freq, s11, s21),
-                "solver_detail": {"method": "openEMS FDTD, modal waveguide ports",
-                                  "mesh_cells": [len(plan["mesh"][ax]) for ax in "xyz"],
-                                  "boundaries": plan["boundaries"]}}
+        freq, inc, reflected, transmitted = self._validated_spectra(raw)
+        s11 = reflected / inc
+        s21 = transmitted / inc
+        result = {"solver": self.name, "cross_section": plan["cross_section"],
+                  "mode": plan["mode"], "fc_ghz": plan["fc_hz"] / 1e9,
+                  "length_mm": plan["length_mm"],
+                  "port_separation_mm": plan["port_separation_mm"],
+                  **sparam_payload(freq, s11, s21),
+                  "solver_detail": {"method": "openEMS FDTD, modal waveguide ports",
+                                    "mesh_cells": [len(plan["mesh"][ax]) for ax in "xyz"],
+                                    "boundaries": plan["boundaries"]}}
+        _validate_result_finite(result)
+        return result
+
+    @staticmethod
+    def _validated_spectra(raw: dict):
+        import numpy as np
+        try:
+            freq = np.asarray(raw["freq_hz"], dtype=float)
+            inc = np.asarray(raw["p1_inc"], dtype=complex)
+            reflected = np.asarray(raw["p1_ref"], dtype=complex)
+            transmitted = np.asarray(raw["p2_ref"], dtype=complex)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EmSolverError(f"openEMS returned malformed port spectra: {exc}") from exc
+        arrays = (freq, inc, reflected, transmitted)
+        if any(a.ndim != 1 for a in arrays) or len(freq) < 2:
+            raise EmSolverError("openEMS port spectra must be one-dimensional with at least two samples")
+        if not (len(freq) == len(inc) == len(reflected) == len(transmitted)):
+            raise EmSolverError("openEMS port spectra have inconsistent sample counts")
+        if not np.all(np.isfinite(freq)) or np.any(freq <= 0.0) or np.any(np.diff(freq) <= 0.0):
+            raise EmSolverError("openEMS returned invalid frequency samples")
+        if not all(np.all(np.isfinite(a.real)) and np.all(np.isfinite(a.imag))
+                   for a in (inc, reflected, transmitted)):
+            raise EmSolverError("openEMS returned non-finite port spectra")
+        peak = float(np.max(np.abs(inc)))
+        if not math.isfinite(peak) or peak <= 0.0 or np.any(np.abs(inc) <= peak * 1e-15):
+            raise EmSolverError("openEMS incident-port spectrum is zero or numerically unusable")
+        return freq, inc, reflected, transmitted
 
     def timedomain(self, spec: dict) -> dict:
         import numpy as np
         plan = self.build_plan(spec, broadband=True)
         raw = self._execute(plan, want_time=True)
+        time = raw.get("time")
+        if not isinstance(time, dict):
+            raise EmSolverError(raw.get("time_error", "openEMS returned no time-domain signals"))
+        try:
+            t_s = np.asarray(time["t_s"], dtype=float)
+            port1 = np.asarray(time["port1_v"], dtype=float)
+            port2 = np.asarray(time["port2_v"], dtype=float)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EmSolverError(f"openEMS returned malformed time-domain signals: {exc}") from exc
+        if (t_s.ndim != 1 or len(t_s) < 2 or len(t_s) != len(port1) or len(t_s) != len(port2)
+                or not np.all(np.isfinite(t_s)) or not np.all(np.diff(t_s) > 0.0)
+                or not np.all(np.isfinite(port1)) or not np.all(np.isfinite(port2))):
+            raise EmSolverError("openEMS returned non-finite or inconsistent time-domain signals")
         result = {"solver": self.name, "cross_section": plan["cross_section"],
                   "mode": plan["mode"], "fc_ghz": plan["fc_hz"] / 1e9,
                   "length_mm": plan["length_mm"],
                   "excitation": {"f0_ghz": plan["excitation"]["f0_hz"] / 1e9,
                                  "bw_ghz": plan["excitation"]["fc_hz"] / 1e9,
                                  "shape": "gaussian-modulated sine"},
-                  "solver_detail": {"method": "openEMS FDTD broadband run"}}
-        time = raw.get("time")
-        if time:
-            t_ns = np.asarray(time["t_s"], dtype=float) * 1e9
-            result["t_ns"] = np.round(t_ns, 6).tolist()
-            result["ports"] = {"port1_v": time["port1_v"], "port2_v": time["port2_v"]}
-        else:
-            result["warning"] = raw.get("time_error", "no time signals captured")
-        # one broadband run also yields the spectrum — include it for free
-        freq = np.asarray(raw["freq_hz"], dtype=float)
-        inc = np.asarray(raw["p1_inc"], dtype=complex)
-        inc = np.where(np.abs(inc) < 1e-30, 1e-30, inc)
-        s11 = np.asarray(raw["p1_ref"], dtype=complex) / inc
-        s21 = np.asarray(raw["p2_ref"], dtype=complex) / inc
-        result["spectrum"] = sparam_payload(freq, s11, s21)
+                  "solver_detail": {"method": "openEMS FDTD broadband run"},
+                  "t_ns": np.round(t_s * 1e9, 6).tolist(),
+                  "ports": {"port1_v": port1.tolist(), "port2_v": port2.tolist()}}
+        freq, inc, reflected, transmitted = self._validated_spectra(raw)
+        result["spectrum"] = sparam_payload(freq, reflected / inc, transmitted / inc)
+        _validate_result_finite(result)
         return result

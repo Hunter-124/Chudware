@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
-"""Simulation backend audit — T-V1, extended T-SIM4 (live FEA + fatigue + thermal).
+"""Executable audit of the current simulation surface.
 
-Runs independent analytic checks against each simulation/analysis backend and
-prints per-tool verdicts: REAL, VALIDATED, STUB, or BROKEN.
+Each family runs a deterministic public-module or raw-RPC probe and prints an
+explicit verdict:
 
-REAL      = code implements real physics (evidence: source lines cited)
-VALIDATED = REAL + matches an independent hand-calc within tolerance
-STUB      = returns canned / constant / placeholder output
-BROKEN    = errors on reasonable input or returns physically wrong numbers
+REAL      = a capability or physical invariant was exercised successfully
+VALIDATED = numerical output matches an independent analytic/conservation anchor
+STUB      = a reachable backend returns placeholder output
+BROKEN    = an available backend errors, fails to converge, or returns wrong numbers
+SKIP      = a required optional dependency/backend is unavailable (with a reason)
 
-Independent reference values are derived from first principles INSIDE this script
-(never read from the engine under test), so a wrong docstring would be caught.
+Independent reference values are derived from first principles inside this
+script. Optional backends are isolated per family: an absent package or solver
+must produce SKIP, never PASS, and a BROKEN result always makes the process exit
+nonzero.
 
 Usage:
-    CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so \\
+    CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so \
         ~/.local/share/Chudware/mcp-venv/bin/python scripts/sim_audit.py
 
-Exit code: 0 if all checks pass or skip-with-reason; 1 if any BROKEN finding.
+Exit code: 0 if all executed checks pass; 1 if any check is BROKEN.
 """
 from __future__ import annotations
 
 import math
 import os
+import shutil
 import sys
 import time
 import traceback
 
-# Ensure the project root (containing engine/) is on sys.path regardless of
-# which directory the script is invoked from.
+# Ensure the project root (containing ``services``) is importable regardless of
+# which directory invokes this script.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _PROJECT_ROOT not in sys.path:
@@ -70,207 +74,185 @@ def _pct_err(got: float, exp: float) -> float:
 
 # ===========================================================================
 # FAMILY 1: Hydraulic cylinder / pump sizing
-# Pure-Python, no .so needed. Pure math, low risk.
+# Current C++ RPCs; libchudware is optional for the rest of the harness.
 # ===========================================================================
 
 def audit_hydraulic() -> None:
-    print("\n--- FAMILY: hydraulic (engine.hydraulic.solve) ---")
+    print("\n--- FAMILY: hydraulic (core hydraulic_size_* RPCs) ---")
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("hydraulic_size_cylinder", reason)
+        _skip("hydraulic_size_pump", reason)
+        return
+
+    bore_mm, rod_mm, pressure_bar = 50.0, 20.0, 200.0
+    stroke_mm, velocity_mm_s, efficiency = 100.0, 50.0, 0.95
+    area_m2 = math.pi / 4.0 * (bore_mm * 1e-3) ** 2
+    force_expected = area_m2 * pressure_bar * 1e5 * efficiency * 1e-3
+    flow_expected = area_m2 * velocity_mm_s * 1e-3 * 60.0 * 1000.0
     try:
-        from engine.hydraulic import solve as hyd
-
-        # --- cylinder sizing ---
-        # Independent check (first principles):
-        #   A_bore = pi/4 * (bore_mm * 1e-3)^2 (m^2)
-        #   F_ext  = A_bore * pressure_bar * 1e5 * efficiency (N) / 1000 (kN)
-        bore_mm = 50.0
-        pressure_bar = 200.0
-        stroke_mm = 100.0
-        efficiency = 0.95
-        A_bore_m2 = math.pi / 4.0 * (bore_mm * 1e-3) ** 2
-        F_ext_kn_expected = A_bore_m2 * pressure_bar * 1e5 * efficiency * 1e-3
-        # Flow: Q_ext = A_bore_m2 * velocity_m_s * 60 * 1000 (L/min)
-        velocity_mm_s = 50.0
-        velocity_m_s = velocity_mm_s * 1e-3
-        Q_ext_lpm_expected = A_bore_m2 * velocity_m_s * 60.0 * 1000.0
-
-        result = hyd.size_cylinder(bore_mm=bore_mm, pressure_bar=pressure_bar,
-                                   stroke_mm=stroke_mm, velocity_mm_s=velocity_mm_s,
-                                   efficiency=efficiency)
-        assert result.get("ok"), f"size_cylinder failed: {result}"
-        F_got = result["extend_force_kn"]
-        Q_got = result["flow_extend_lpm"]
-        f_err = _pct_err(F_got, F_ext_kn_expected)
-        q_err = _pct_err(Q_got, Q_ext_lpm_expected)
-        note = (f"bore={bore_mm}mm, P={pressure_bar}bar → "
-                f"F={F_got:.3f} kN (expect {F_ext_kn_expected:.3f}, err={f_err:.2f}%), "
-                f"Q={Q_got:.4f} L/min (expect {Q_ext_lpm_expected:.4f}, err={q_err:.2f}%)")
-        if f_err < 1.0 and q_err < 1.0:
-            _record("hydraulic_size_cylinder", "VALIDATED", note)
-        else:
+        result = cb.call("hydraulic_size_cylinder", {
+            "bore_mm": bore_mm, "rod_mm": rod_mm, "pressure_bar": pressure_bar,
+            "stroke_mm": stroke_mm, "velocity_mm_s": velocity_mm_s,
+            "efficiency": efficiency,
+        })
+        if not result.get("ok"):
             _record("hydraulic_size_cylinder", "BROKEN",
-                    f"mismatch > 1%: {note}")
-
-        # --- pump sizing ---
-        # Independent check:
-        #   displacement_cc = Q_lpm * 1000 / rpm  (cc/rev)
-        #   hyd_power_kw    = Q_m3s * dP_pa / 1000  (kW)
-        #   Q_m3s = Q_lpm / 60000
-        #   shaft_power_kw  = hyd_power_kw / efficiency
-        Q_lpm = 20.0
-        dP_bar = 200.0
-        rpm = 1450.0
-        eta = 0.85
-        disp_expected = Q_lpm * 1000.0 / rpm
-        Q_m3s = Q_lpm / 60000.0
-        dP_pa = dP_bar * 1e5
-        hyd_pwr = Q_m3s * dP_pa / 1000.0    # kW
-        shaft_pwr = hyd_pwr / eta
-
-        result2 = hyd.size_pump(flow_lpm=Q_lpm, pressure_bar=dP_bar,
-                                speed_rpm=rpm, efficiency=eta)
-        assert result2.get("ok"), f"size_pump failed: {result2}"
-        d_got = result2["displacement_cc_rev"]
-        p_got = result2["shaft_power_kw"]
-        d_err = _pct_err(d_got, disp_expected)
-        p_err = _pct_err(p_got, shaft_pwr)
-        note2 = (f"Q={Q_lpm} L/min, P={dP_bar} bar, N={rpm} rpm → "
-                 f"disp={d_got:.4f} cc/rev (expect {disp_expected:.4f}, err={d_err:.2f}%), "
-                 f"shaft_pwr={p_got:.4f} kW (expect {shaft_pwr:.4f}, err={p_err:.2f}%)")
-        if d_err < 1.0 and p_err < 1.0:
-            _record("hydraulic_size_pump", "VALIDATED", note2)
+                    f"reasonable sizing input was refused: {result}")
         else:
-            _record("hydraulic_size_pump", "BROKEN", f"mismatch >1%: {note2}")
+            force_got = float(result["extend_force_kn"])
+            flow_got = float(result["flow_extend_lpm"])
+            f_err = _pct_err(force_got, force_expected)
+            q_err = _pct_err(flow_got, flow_expected)
+            note = (f"A×P gives {force_got:.4f} kN vs {force_expected:.4f} "
+                    f"({f_err:.3f}%); A×v gives {flow_got:.4f} L/min vs "
+                    f"{flow_expected:.4f} ({q_err:.3f}%)")
+            _record("hydraulic_size_cylinder",
+                    "VALIDATED" if max(f_err, q_err) < 0.1 else "BROKEN", note)
+    except cb.CoreError as exc:
+        if "unknown method" in str(exc):
+            _skip("hydraulic_size_cylinder",
+                  "loaded libchudware does not expose hydraulic_size_cylinder")
+        else:
+            _record("hydraulic_size_cylinder", "BROKEN", f"CoreError: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        _record("hydraulic_size_cylinder", "BROKEN", f"runtime error: {exc}")
 
-        # Schema/management tools — not physics solvers, mark REAL
-        _record("hydraulic_new", "REAL",
-                "schema factory only, no physics (engine.hydraulic.schema)", executed=False)
-        _record("hydraulic_add_component", "REAL",
-                "schema mutation only", executed=False)
-        _record("hydraulic_add_hose", "REAL",
-                "schema mutation only", executed=False)
-        _record("hydraulic_bom", "REAL",
-                "BOM aggregation from schema, no physics", executed=False)
-
-    except Exception as exc:
-        _record("hydraulic_size_cylinder", "BROKEN",
-                f"import or runtime error: {exc}")
-        _record("hydraulic_size_pump", "BROKEN",
-                f"import or runtime error: {exc}")
+    flow_lpm, speed_rpm, eta = 20.0, 1450.0, 0.85
+    displacement_expected = flow_lpm * 1000.0 / speed_rpm
+    shaft_expected = (flow_lpm / 60000.0) * (pressure_bar * 1e5) / 1000.0 / eta
+    try:
+        result = cb.call("hydraulic_size_pump", {
+            "flow_lpm": flow_lpm, "pressure_bar": pressure_bar,
+            "speed_rpm": speed_rpm, "efficiency": eta,
+        })
+        if not result.get("ok"):
+            _record("hydraulic_size_pump", "BROKEN",
+                    f"reasonable sizing input was refused: {result}")
+        else:
+            disp_got = float(result["displacement_cc_rev"])
+            power_got = float(result["shaft_power_kw"])
+            d_err = _pct_err(disp_got, displacement_expected)
+            p_err = _pct_err(power_got, shaft_expected)
+            note = (f"Q/N gives {disp_got:.4f} cc/rev vs "
+                    f"{displacement_expected:.4f} ({d_err:.3f}%); QΔP/η gives "
+                    f"{power_got:.4f} kW vs {shaft_expected:.4f} ({p_err:.3f}%)")
+            _record("hydraulic_size_pump",
+                    "VALIDATED" if max(d_err, p_err) < 0.1 else "BROKEN", note)
+    except cb.CoreError as exc:
+        if "unknown method" in str(exc):
+            _skip("hydraulic_size_pump",
+                  "loaded libchudware does not expose hydraulic_size_pump")
+        else:
+            _record("hydraulic_size_pump", "BROKEN", f"CoreError: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        _record("hydraulic_size_pump", "BROKEN", f"runtime error: {exc}")
 
 
 # ===========================================================================
 # FAMILY 2: Piping network solver
-# Depends on 'fluids' (MIT). Degrades gracefully without it.
+# Current C++ Darcy-Weisbach network RPC; no legacy ``fluids`` dependency.
 # ===========================================================================
 
 def audit_piping() -> None:
-    print("\n--- FAMILY: piping (engine.piping.solve) ---")
+    print("\n--- FAMILY: piping (core piping_* RPCs) ---")
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("piping_solve", reason)
+        _skip("piping_fluid", reason)
+        _skip("piping_solve [input guard]", reason)
+        return
+
+    doc = {
+        "schema": "aicad.piping/1", "id": "sim-audit-pipe",
+        "name": "AuditNet", "units": {"system": "MMGS"}, "material": "A106-B",
+        "runs": [{
+            "id": "r1", "name": "main", "suppressed": False,
+            "path": [[0, 0, 0], [100000, 0, 0]], "nps": 2.0,
+            "schedule": "40", "material": None, "bend_radius": None,
+            "end_type": "BW", "bore_mm": None,
+        }],
+        "fittings": [],
+    }
+    boundary = [
+        {"run": "r1", "end": "start", "head": 10.0},
+        {"run": "r1", "end": "end", "head": 0.0},
+    ]
     try:
-        from engine.piping import solve as pip_solve
-
-        if not pip_solve.have_fluids():
-            _skip("piping_solve", "fluids library not installed (soft-fail degradation)",
-                  install="pip install fluids  # MIT license, in-process OK")
-            _skip("piping_operating_point",
-                  "fluids library not installed — same degradation path")
-            _skip("piping_report",
-                  "fluids library not installed — same degradation path")
-            # Mark internal solver as REAL (implements Darcy-Weisbach, verified by source read)
-            _record("piping_solve [source audit]", "REAL",
-                    "engine/piping/solve.py: Darcy-Weisbach + Colebrook friction, "
-                    "nodal head network (MNA analogue), K-factor fitting losses. "
-                    "Cannot execute without fluids dep; verdict from source read.",
-                    executed=False)
+        result = cb.call("piping_solve", {"doc": doc, "boundary": boundary})
+        links = result.get("links") or []
+        if not result.get("ok"):
+            _record("piping_solve", "BROKEN",
+                    f"valid single-pipe network failed: {result.get('reason') or result}")
+        elif not result.get("converged"):
+            _record("piping_solve", "BROKEN",
+                    f"network did not converge: iterations={result.get('iterations')}, "
+                    f"imbalance={result.get('max_imbalance_m3h')} m³/h")
+        elif len(links) != 1:
+            _record("piping_solve", "BROKEN",
+                    f"expected one solved link, received {len(links)}")
         else:
-            # fluids available — run a live check
-            from engine.piping import schema as pip_schema
-            doc = pip_schema.new_piping("AuditNet")
-            run = pip_schema.new_pipe_run(
-                id="r0",
-                path=[[0, 0, 0], [100000, 0, 0]],  # 100 m straight, in mm
-                nps=2.0,  # 2-inch NPS ~ DN50
-                schedule="40",
-                name="main",
-            )
-            doc["runs"].append(run)
-            # solve() takes a LIST of BC dicts ({'run','end','head'} — see
-            # _apply_boundary), not a node-id->head mapping.
-            boundary = [
-                {"run": "r0", "end": "start", "head": 10.0},
-                {"run": "r0", "end": "end", "head": 0.0},
-            ]
-            result = pip_solve.solve(doc, boundary=boundary)
+            link = links[0]
+            flow = float(link.get("flow_m3h", 0.0))
+            headloss = float(link.get("headloss_m", float("nan")))
+            energy_err = _pct_err(headloss, 10.0)
+            note = (f"100 m NPS2 Sch40: Q={flow:.4f} m³/h, Re="
+                    f"{link.get('reynolds')}, f={link.get('friction_factor')}; "
+                    f"headloss={headloss:.4f} m vs imposed 10 m "
+                    f"(energy-balance err={energy_err:.3f}%)")
+            _record("piping_solve",
+                    "VALIDATED" if flow > 0.0 and energy_err < 0.1 else "BROKEN",
+                    note)
+    except cb.CoreError as exc:
+        if "unknown method" in str(exc):
+            _skip("piping_solve", "loaded libchudware does not expose piping_solve")
+        else:
+            _record("piping_solve", "BROKEN", f"CoreError: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        _record("piping_solve", "BROKEN", f"runtime error: {exc}")
 
-            if not result.get("ok"):
-                _record("piping_solve", "BROKEN",
-                        f"solve returned not-ok: {result.get('reason')}")
-            else:
-                # Independent Darcy-Weisbach check (fully turbulent, Moody f ~ 0.02):
-                #   v = sqrt(dH*2g*D / (f*L))
-                #   Q = A*v
-                # (order-of-magnitude; exact f depends on Reynolds iteration)
-                links = result.get("links", [])
-                if links:
-                    Q_m3h = links[0].get("flow_m3h", 0.0)  # solver reports m3/h directly
-                    # Rough expected: dH=10m, f=0.02, L=100m, D=0.0525m (2" sched40)
-                    D = 0.0525
-                    f_approx = 0.02
-                    v_approx = math.sqrt(10.0 * 2 * 9.81 * D / (f_approx * 100.0))
-                    Q_expected = math.pi / 4 * D ** 2 * v_approx * 3600.0  # m3/h
-                    pct = _pct_err(Q_m3h, Q_expected)
-                    note = (f"dH=10m, L=100m, DN50 → Q={Q_m3h:.3f} m³/h "
-                            f"(Darcy-Weisbach rough estimate {Q_expected:.3f} m³/h, "
-                            f"~{pct:.0f}% from approx f)")
-                    # Wide tolerance because f depends on exact Re iteration
-                    if pct < 40.0:
-                        _record("piping_solve", "VALIDATED", note)
-                    else:
-                        _record("piping_solve", "BROKEN",
-                                f"flow too far from Darcy-Weisbach estimate: {note}")
-                else:
-                    _record("piping_solve", "REAL",
-                            "solve returned ok but no link flows in result")
+    try:
+        fluid = cb.call("piping_fluid", {"name": "water", "T": 293.15, "P": 101325.0})
+        rho, mu = float(fluid.get("rho", 0.0)), float(fluid.get("mu", 0.0))
+        note = f"water at 293.15 K: rho={rho:.3f} kg/m³, mu={mu:.6g} Pa·s"
+        _record("piping_fluid", "VALIDATED"
+                if fluid.get("ok") and abs(rho - 998.2) < 0.5
+                and abs(mu - 1.002e-3) < 1e-5 else "BROKEN", note)
+    except cb.CoreError as exc:
+        if "unknown method" in str(exc):
+            _skip("piping_fluid", "loaded libchudware does not expose piping_fluid")
+        else:
+            _record("piping_fluid", "BROKEN", f"CoreError: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        _record("piping_fluid", "BROKEN", f"runtime error: {exc}")
 
-        # operating_point / cfd tools
-        _record("piping_operating_point", "REAL",
-                "engine/piping/solve.py:operating_point — pump curve intersection + NPSH margin; "
-                "code verified real physics; runtime depends on fluids dep",
-                executed=False)
-        _record("piping_report", "REAL",
-                "engine/piping/solve.py:pressure_drop_report — K-factor breakdown per segment",
-                executed=False)
-        # Probe (not hardcode) the build123d/OCP kernel these three tools need.
-        try:
-            import build123d  # noqa: F401
-            from engine.piping import cfd_handoff as _cfd  # noqa: F401
-            _b3d_note = "build123d/OCP import OK; engine.piping.cfd_handoff imports clean"
-            _b3d_verdict = "REAL"
-        except Exception as _e:  # noqa: BLE001
-            _b3d_note = f"requires build123d/OCP kernel: {type(_e).__name__}: {_e}"
-            _b3d_verdict = "BROKEN"
-        _record("piping_internal_volume", _b3d_verdict, _b3d_note, executed=False)
-        _record("piping_cfd_handoff", _b3d_verdict,
-                _b3d_note + " (bore extraction path)", executed=False)
-        _record("piping_verify_cfd", _b3d_verdict, _b3d_note, executed=False)
-        _record("piping_fluid", "REAL",
-                "engine/piping/properties.py: CoolProp/thermo if available, else built-in table; "
-                "graceful degradation confirmed",
-                executed=False)
-
-    except Exception as exc:
-        _record("piping_solve", "BROKEN",
-                f"import or runtime error: {exc}")
+    try:
+        bad = cb.call("piping_solve", {"doc": doc})
+        reason_text = str(bad.get("reason") or bad.get("error") or "")
+        guarded = not bad.get("ok") and "boundary" in reason_text.lower()
+        _record("piping_solve [input guard]",
+                "VALIDATED" if guarded else "BROKEN",
+                f"missing boundary conditions {'refused' if guarded else 'not refused'}: "
+                f"{reason_text or bad}")
+    except cb.CoreError as exc:
+        if "unknown method" in str(exc):
+            _skip("piping_solve [input guard]",
+                  "loaded libchudware does not expose piping_solve")
+        else:
+            _record("piping_solve [input guard]", "BROKEN", f"CoreError: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        _record("piping_solve [input guard]", "BROKEN", f"runtime error: {exc}")
 
 
 # ===========================================================================
-# FAMILY 3: ECAD impedance (engine.ecad.impedance)
-# Pure Python + scipy. No .so, no ngspice needed.
+# FAMILY 3: ECAD impedance (services.ecad.impedance)
+# Pure Python + scipy. No .so or ngspice needed.
 # ===========================================================================
 
 def audit_ecad_impedance() -> None:
-    print("\n--- FAMILY: ECAD impedance (engine.ecad.impedance) ---")
+    print("\n--- FAMILY: ECAD impedance (services.ecad.impedance) ---")
     try:
-        from engine.ecad import impedance as ecad_imp
+        from services.ecad import impedance as ecad_imp
 
         # --- microstrip Z0 ---
         # Independent IPC-2141A surface-microstrip formula:
@@ -325,150 +307,146 @@ def audit_ecad_impedance() -> None:
             _record("ecad_check_diff_impedance", "BROKEN",
                     f"diff Z mismatch: {note3}")
 
+    except ModuleNotFoundError as exc:
+        _skip("ecad_check_impedance",
+              f"scipy dependency unavailable: {exc}",
+              install="pip install scipy")
     except Exception as exc:
         _record("ecad_check_impedance", "BROKEN",
-                f"import or runtime error: {exc}")
+                f"runtime error: {exc}")
         traceback.print_exc()
 
 
 # ===========================================================================
-# FAMILY 4: ECAD circuit simulation (engine.sim.circuit MNA solver)
-# Checks ecad_simulate and ecad_tf
+# FAMILY 4: ECAD circuit simulation (native C++ MNA + ngspice capability)
 # ===========================================================================
 
 def audit_ecad_sim() -> None:
-    print("\n--- FAMILY: ECAD circuit sim (engine.sim.circuit) ---")
-    try:
-        import numpy as np
-        from engine.sim.circuit import simulate
-
-        # --- RC low-pass AC (gate 8 format from test_circuit.py) ---
-        # R=1k, C=159.155nF → fc = 1/(2*pi*R*C) = 1000 Hz
-        # At f=fc: |H| = 1/sqrt(2) = -3.01 dB
-        R = 1000.0; C = 159.155e-9
-        fc_expected = 1.0 / (2.0 * math.pi * R * C)  # = 1000 Hz
-        H_fc_expected = 1.0 / math.sqrt(2.0)          # = 0.7071
-
-        circuit = {
-            "nodes": ["0", "IN", "OUT"],
-            "devices": [
-                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
-                 "params": {"ac": {"mag": 1.0, "phase": 0.0}}},
-                {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": R, "params": {}},
-                {"kind": "C", "name": "C1", "nodes": ["OUT", "0"], "value": C, "params": {}},
-            ],
-            "models": {}, "params": {"TEMP": 27},
-        }
-        study = {
-            "analyses": [{"type": "ac", "sweep": "dec", "points": 20,
-                          "fstart": 10, "fstop": 1e6}],
-            "probes": ["V(OUT)"],
-        }
-        result = simulate(circuit, study)
-
-        if not result.get("convergence", {}).get("ac"):
-            _record("ecad_simulate [ac]", "BROKEN",
-                    f"AC analysis did not converge: log={result.get('log', [])}")
-        else:
-            f = np.array(result["ac"]["x_f"])
-            mag = np.array(result["ac"]["mag"]["V(OUT)"])
-            H_fc_got = float(np.interp(fc_expected, f, mag))
-            err = _pct_err(H_fc_got, H_fc_expected)
-            note = (f"RC LP fc={fc_expected:.0f} Hz: "
-                    f"|H(fc)|={H_fc_got:.5f} (expect {H_fc_expected:.5f}, err={err:.2f}%)")
-            if err < 1.0:
-                _record("ecad_simulate [ac]", "VALIDATED", note)
+    print("\n--- FAMILY: ECAD circuit simulation (core sim_spice RPC) ---")
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("sim_spice [ac]", reason)
+        _skip("sim_spice [op]", reason)
+        _skip("sim_spice [tf]", reason)
+    else:
+        try:
+            resistance, capacitance = 1000.0, 159.155e-9
+            fc_expected = 1.0 / (2.0 * math.pi * resistance * capacitance)
+            h_expected = 1.0 / math.sqrt(2.0)
+            circuit = {
+                "nodes": ["0", "IN", "OUT"],
+                "devices": [
+                    {"kind": "V", "name": "V1", "nodes": ["IN", "0"],
+                     "value": 0.0, "params": {"ac": {"mag": 1.0, "phase": 0.0}}},
+                    {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"],
+                     "value": resistance, "params": {}},
+                    {"kind": "C", "name": "C1", "nodes": ["OUT", "0"],
+                     "value": capacitance, "params": {}},
+                ],
+                "models": {}, "params": {"TEMP": 27},
+            }
+            study = {"analyses": [{"type": "ac", "sweep": "lin", "points": 2,
+                                    "fstart": fc_expected, "fstop": 2.0 * fc_expected}],
+                     "probes": ["V(OUT)"]}
+            result = cb.call("sim_spice", {"circuit": circuit, "study": study})
+            if not result.get("convergence", {}).get("ac"):
+                _record("sim_spice [ac]", "BROKEN",
+                        f"AC solve did not converge: {result.get('log')}")
             else:
-                _record("ecad_simulate [ac]", "BROKEN",
-                        f"AC magnitude wrong at corner: {note}")
+                got = float(result["ac"]["mag"]["V(OUT)"][0])
+                err = _pct_err(got, h_expected)
+                _record("sim_spice [ac]", "VALIDATED" if err < 0.1 else "BROKEN",
+                        f"RC corner |H|={got:.7f} vs 1/sqrt(2)={h_expected:.7f} "
+                        f"(err={err:.4f}%)")
+        except cb.CoreError as exc:
+            if "unknown method" in str(exc):
+                _skip("sim_spice [ac]", "loaded libchudware does not expose sim_spice")
+            else:
+                _record("sim_spice [ac]", "BROKEN", f"CoreError: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            _record("sim_spice [ac]", "BROKEN", f"runtime error: {exc}")
 
-        # --- DC op-point: resistor divider (gate 1 format) ---
-        # 10V across R1=1k, R2=2k → V(OUT) = 10 * 2k/3k = 6.667 V
-        V_supply = 10.0
-        R1v = 1000.0; R2v = 2000.0
-        V_out_expected = V_supply * R2v / (R1v + R2v)
-
-        circuit2 = {
+        divider = {
             "nodes": ["0", "IN", "OUT"],
             "devices": [
                 {"kind": "V", "name": "V1", "nodes": ["IN", "0"],
-                 "value": V_supply, "params": {}},
+                 "value": 10.0, "params": {}},
                 {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"],
-                 "value": R1v, "params": {}},
+                 "value": 1000.0, "params": {}},
                 {"kind": "R", "name": "R2", "nodes": ["OUT", "0"],
-                 "value": R2v, "params": {}},
+                 "value": 2000.0, "params": {}},
             ],
             "models": {}, "params": {"TEMP": 27},
         }
-        study2 = {"analyses": [{"type": "op"}], "probes": ["V(OUT)", "I(V1)"]}
-        result2 = simulate(circuit2, study2)
-
-        if not result2.get("convergence", {}).get("op"):
-            _record("ecad_simulate [op]", "BROKEN",
-                    f"DC OP did not converge: log={result2.get('log', [])}")
-        else:
-            V_got = result2["op"]["V(OUT)"]
-            err2 = _pct_err(V_got, V_out_expected)
-            note2 = (f"R-divider: V(OUT)={V_got:.6f} V "
-                     f"(expect {V_out_expected:.6f} V, err={err2:.4f}%)")
-            if err2 < 0.01:
-                _record("ecad_simulate [op]", "VALIDATED", note2)
+        try:
+            result = cb.call("sim_spice", {
+                "circuit": divider,
+                "study": {"analyses": [
+                    {"type": "op"},
+                    {"type": "tf", "output": "V(OUT)", "source": "V1"},
+                ], "probes": ["V(OUT)"]},
+            })
+            op_ok = result.get("convergence", {}).get("op")
+            if not op_ok:
+                _record("sim_spice [op]", "BROKEN",
+                        f"DC operating point did not converge: {result.get('log')}")
             else:
-                _record("ecad_simulate [op]", "BROKEN",
-                        f"DC OP wrong: {note2}")
+                got = float(result["op"]["V(OUT)"])
+                expected = 10.0 * 2000.0 / 3000.0
+                err = _pct_err(got, expected)
+                _record("sim_spice [op]", "VALIDATED" if err < 0.01 else "BROKEN",
+                        f"divider Vout={got:.7f} V vs {expected:.7f} V "
+                        f"(err={err:.5f}%)")
+            tf_ok = result.get("convergence", {}).get("tf")
+            gain = (result.get("tf") or {}).get("gain")
+            gain_err = _pct_err(float(gain), 2.0 / 3.0) if gain is not None else math.inf
+            _record("sim_spice [tf]",
+                    "VALIDATED" if tf_ok and gain_err < 0.01 else "BROKEN",
+                    f"small-signal gain={gain} vs 2/3 (err={gain_err:.5f}%), "
+                    f"converged={bool(tf_ok)}")
+        except cb.CoreError as exc:
+            if "unknown method" in str(exc):
+                _skip("sim_spice [op]", "loaded libchudware does not expose sim_spice")
+                _skip("sim_spice [tf]", "loaded libchudware does not expose sim_spice")
+            else:
+                _record("sim_spice [op]", "BROKEN", f"CoreError: {exc}")
+                _record("sim_spice [tf]", "BROKEN", f"CoreError: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            _record("sim_spice [op]", "BROKEN", f"runtime error: {exc}")
+            _record("sim_spice [tf]", "BROKEN", f"runtime error: {exc}")
 
-        # ecad_tf wraps run_tf on the same MNA solver
-        _record("ecad_tf", "REAL",
-                "wraps engine.sim.circuit.run_tf — same MNA solver as ecad_simulate; "
-                "no independent tf check executed (solver validated via ac/op gates above)",
-                executed=False)
-
-    except ImportError as exc:
-        _skip("ecad_simulate", f"numpy/scipy not available: {exc}")
-        _skip("ecad_tf", f"numpy/scipy not available: {exc}")
-    except Exception as exc:
-        _record("ecad_simulate", "BROKEN",
-                f"unexpected error: {exc}")
-        traceback.print_exc()
-
-    # ngspice
-    import subprocess
-    r = subprocess.run(["which", "ngspice"], capture_output=True, text=True)
-    if not r.stdout.strip():
-        _record("ecad_simulate [ngspice path]", "SKIP",
-                "ngspice not found on PATH — SPICE netlist pass-through unavailable; "
-                "install: sudo dnf install ngspice  (GPL2; subprocess-only OK)",
-                executed=False)
+    ngspice = shutil.which("ngspice")
+    if ngspice:
+        _record("ngspice [capability]", "REAL",
+                f"subprocess backend found at {ngspice}; native MNA probes above are "
+                "independent of it")
     else:
-        _record("ecad_simulate [ngspice]", "REAL",
-                f"ngspice found at {r.stdout.strip()} — subprocess isolation path present",
-                executed=False)
+        _skip("ngspice [capability]",
+              "ngspice not found on PATH; external deck execution unavailable",
+              install="sudo dnf install ngspice (GPL-2.0 subprocess isolation)")
 
 
 # ===========================================================================
-# FAMILY 5: FEA static + modal + fatigue + thermal (core C++ via core_bridge)
-# Requires libchudware.so. T-SIM4 UPDATE: the CHUDWARE_WITH_NETGEN build
-# (core/build-occt-linux) registers sim_run_static/modal/fatigue/thermal
-# DIRECTLY on the raw cb.call() bridge (core/api/libchudware.cpp), so the audit
-# now solves LIVE when that build is staged. The T-V1-era "not exposed on the
-# raw bridge" finding only holds for the plain build-linux .so.
+# FAMILY 5: FEA static + modal (C++ core via core_bridge)
+# The full core/build-occt-linux library carries the Netgen-backed solve RPCs;
+# a smaller library may legitimately SKIP them but must never receive PASS.
 # ===========================================================================
 
 def _load_core_bridge():
-    """Import core_bridge (or return (None, reason))."""
+    """Import the package-qualified core bridge, or return ``(None, reason)``."""
     lib_path = os.environ.get("CHUDWARE_LIBCHUDWARE", "")
     if not lib_path or not os.path.exists(lib_path):
-        return None, ("CHUDWARE_LIBCHUDWARE not set or .so not found — "
-                      "export CHUDWARE_LIBCHUDWARE=core/build-occt-linux/bin/libchudware.so "
-                      "(the netgen build carries the FEA RPCs)")
-    mcp_path = os.path.join(_PROJECT_ROOT, "services", "mcp")
-    if mcp_path not in sys.path:
-        sys.path.insert(0, mcp_path)
+        return None, ("CHUDWARE_LIBCHUDWARE not set or .so not found — export "
+                      "CHUDWARE_LIBCHUDWARE=core/build-occt-linux/bin/libchudware.so "
+                      "(use build-linux when no Netgen FEA solve is needed)")
+    # A standalone audit should exercise the explicitly selected library, not an
+    # unrelated already-running daemon. An explicit caller override still wins.
+    os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
     try:
-        import core_bridge as cb  # noqa: PLC0415
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
         return cb, ""
     except Exception as exc:  # noqa: BLE001
-        return None, f"core_bridge import failed: {exc}"
+        return None, f"services.mcp.core_bridge import failed: {exc}"
 
 
 _CANTILEVER_CTX: dict = {}
@@ -527,7 +505,7 @@ def audit_fea() -> None:
         _skip("run_fea_static", reason)
         _skip("run_fea_modal", reason)
         return
-    from core_bridge import CoreError  # noqa: PLC0415
+    CoreError = cb.CoreError
 
     # Independent references (first principles, computed HERE):
     #   Euler-Bernoulli cantilever, square 50x50mm, L=1m, steel, P=1000N at tip:
@@ -567,17 +545,14 @@ def audit_fea() -> None:
             res = cb.call("sim_run_static", {"study": static_study})
         except CoreError as exc:
             if "unknown method" in str(exc):
-                # Plain (non-netgen) build: fall back to the T-V1 source-audit verdict.
-                _record("run_fea_static", "REAL",
-                        "geometry pre-step OK but this .so lacks the netgen FEA RPCs "
-                        "(sim_run_static: unknown method). Stage "
-                        "core/build-occt-linux/bin/libchudware.so to solve live. "
-                        f"E-B reference: delta={delta_expected_mm:.4f} mm.",
-                        executed=False)
-                _record("run_fea_modal", "REAL",
-                        "same build limitation — needs the CHUDWARE_WITH_NETGEN .so. "
-                        f"Beam-theory reference: f1={f1_expected_hz:.2f} Hz.",
-                        executed=False)
+                _skip("run_fea_static",
+                      "loaded libchudware lacks sim_run_static; use the "
+                      "CHUDWARE_WITH_NETGEN build at "
+                      "core/build-occt-linux/bin/libchudware.so")
+                _skip("run_fea_modal",
+                      "loaded libchudware lacks sim_run_modal; use the "
+                      "CHUDWARE_WITH_NETGEN build at "
+                      "core/build-occt-linux/bin/libchudware.so")
                 return
             raise
         if not res.get("ok"):
@@ -597,23 +572,101 @@ def audit_fea() -> None:
             _CANTILEVER_CTX["static_summary"] = res.get("summary") or {}
             _CANTILEVER_CTX["static_study"] = static_study
 
+        requested_modes = 4
         modal_study = {"step_path": ctx["step"], "material": _AUDIT_STEEL,
                        "fixtures": [ctx["fix_fp"]], "mesh_order": 2, "fineness": 0.5}
-        mres = cb.call("sim_run_modal", {"study": modal_study, "n_modes": 4})
-        if not mres.get("ok"):
-            _record("run_fea_modal", "BROKEN", f"live modal failed: {mres.get('error')}")
-        else:
-            freqs = mres.get("freqs_hz") or []
-            f1 = freqs[0] if freqs else None
-            err = _pct_err(f1, f1_expected_hz) if f1 is not None else 1e9
-            note = (f"LIVE modal solve: f1={f1:.2f} Hz "
-                    f"(beam theory {f1_expected_hz:.2f} Hz, err={err:.2f}%); "
-                    f"modes={['%.1f' % f for f in freqs]}")
-            if err < 10.0:
-                _record("run_fea_modal [live]", "VALIDATED", note)
+        try:
+            mres = cb.call(
+                "sim_run_modal",
+                {"study": modal_study, "n_modes": requested_modes},
+            )
+        except CoreError as exc:
+            if "unknown method" in str(exc):
+                _skip("run_fea_modal",
+                      "loaded libchudware lacks sim_run_modal; use the "
+                      "CHUDWARE_WITH_NETGEN build at "
+                      "core/build-occt-linux/bin/libchudware.so")
             else:
-                _record("run_fea_modal [live]", "BROKEN",
-                        f"f1 off beam theory by {err:.1f}%: {note}")
+                _record("run_fea_modal", "BROKEN", f"CoreError: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            _record("run_fea_modal", "BROKEN",
+                    f"unexpected live modal error: {exc}")
+        else:
+            if not mres.get("ok"):
+                _record("run_fea_modal", "BROKEN",
+                        f"live modal failed: {mres.get('error')}")
+            else:
+                def finite_number(value) -> bool:
+                    return (isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(float(value)))
+
+                issues = []
+                n_modes = mres.get("n_modes")
+                n_nodes = mres.get("n_nodes")
+                n_dof = mres.get("n_dof")
+                counts_ok = (
+                    isinstance(n_modes, int) and not isinstance(n_modes, bool)
+                    and n_modes == requested_modes
+                    and isinstance(n_nodes, int) and not isinstance(n_nodes, bool)
+                    and n_nodes > 0
+                )
+                if not counts_ok:
+                    issues.append(
+                        f"invalid mode/node counts n_modes={n_modes}, n_nodes={n_nodes}"
+                    )
+                if (not isinstance(n_dof, int) or isinstance(n_dof, bool)
+                        or not isinstance(n_nodes, int) or isinstance(n_nodes, bool)
+                        or n_dof != n_nodes * 3):
+                    issues.append(f"n_dof={n_dof} is inconsistent with n_nodes={n_nodes}")
+
+                freqs = mres.get("freqs_hz")
+                freqs_ok = (
+                    counts_ok and isinstance(freqs, list) and len(freqs) >= n_modes
+                    and all(finite_number(value) for value in freqs[:n_modes])
+                )
+                if not freqs_ok:
+                    issues.append("freqs_hz is incomplete or non-finite")
+                f1 = float(freqs[0]) if freqs_ok else None
+                err = _pct_err(f1, f1_expected_hz) if f1 is not None else math.inf
+
+                mode_shapes = mres.get("mode_shapes")
+                shape_required = n_modes * n_nodes * 3 if counts_ok else 0
+                shapes_ok = (
+                    counts_ok and isinstance(mode_shapes, list)
+                    and len(mode_shapes) >= shape_required
+                    and all(finite_number(value) for value in mode_shapes)
+                )
+                if not shapes_ok:
+                    actual = len(mode_shapes) if isinstance(mode_shapes, list) else None
+                    issues.append(
+                        f"mode_shapes must be a finite flat array with at least "
+                        f"{shape_required} values (got {actual})"
+                    )
+
+                mesh_type = mres.get("mesh_type_used")
+                if not isinstance(mesh_type, str) or not mesh_type.startswith("tet10"):
+                    issues.append(f"mesh_type_used={mesh_type!r}, expected tet10")
+                overlay = mres.get("overlay_aicm")
+                overlay_ok = isinstance(overlay, str) and bool(overlay)
+                if not overlay_ok:
+                    issues.append("STEP modal solve returned no overlay_aicm")
+
+                note = (
+                    f"LIVE modal solve: f1={f1} Hz "
+                    f"(beam theory {f1_expected_hz:.2f} Hz, err={err:.2f}%); "
+                    f"modes={n_modes}, nodes={n_nodes}, "
+                    f"shape_values="
+                    f"{len(mode_shapes) if isinstance(mode_shapes, list) else None}/"
+                    f"{shape_required}, mesh={mesh_type!r}, "
+                    f"overlay_bytes={len(overlay) if overlay_ok else 0}"
+                )
+                if err < 10.0 and not issues:
+                    _record("run_fea_modal [live]", "VALIDATED", note)
+                else:
+                    _record("run_fea_modal [live]", "BROKEN",
+                            f"incomplete or inaccurate modal response: {note}; "
+                            f"issues={'; '.join(issues) or 'frequency mismatch'}")
 
     except CoreError as exc:
         _record("run_fea_static", "BROKEN", f"CoreError: {exc}")
@@ -623,8 +676,7 @@ def audit_fea() -> None:
 
 
 # ===========================================================================
-# FAMILY 5b: FEA fatigue (T-SIM4) — S-N math anchors (pure Python, always run)
-# + live sim_run_fatigue engine cross-check when the netgen .so is staged.
+# FAMILY 6: FEA fatigue — pure S-N anchors plus optional live core cross-check
 # ===========================================================================
 
 def audit_fatigue() -> None:
@@ -676,7 +728,7 @@ def audit_fatigue() -> None:
     if cb is None:
         _skip("run_fea_fatigue [live]", reason)
         return
-    from core_bridge import CoreError  # noqa: PLC0415
+    CoreError = cb.CoreError
     study = _CANTILEVER_CTX.get("static_study")
     vm = (_CANTILEVER_CTX.get("static_summary") or {}).get("max_von_mises_mpa")
     if not study or vm is None:
@@ -719,8 +771,7 @@ def audit_fatigue() -> None:
 
 
 # ===========================================================================
-# FAMILY 5c: FEA thermal (T-SIM1 solver, audited by T-SIM4) — plane-wall
-# anchors (pure Python, always run) + live sim_run_thermal when staged.
+# FAMILY 7: Steady FEA thermal — plane-wall anchor plus optional live core solve
 # ===========================================================================
 
 def audit_thermal() -> None:
@@ -761,7 +812,7 @@ def audit_thermal() -> None:
     if cb is None:
         _skip("sim_run_thermal [live]", reason)
         return
-    from core_bridge import CoreError  # noqa: PLC0415
+    CoreError = cb.CoreError
     try:
         import tempfile
         L_mm, w_mm = 100.0, 20.0
@@ -829,160 +880,925 @@ def audit_thermal() -> None:
 
 
 # ===========================================================================
-# FAMILY 6: CFD (LBM built-in + OpenFOAM)
+# FAMILY 8: Transient thermal (live C++ RPC plus Python parity oracle)
+# ===========================================================================
+
+def audit_thermal_transient() -> None:
+    print("\n--- FAMILY: transient thermal (live sim_run_thermal RPC + Python oracle) ---")
+
+    # --- Production RPC: insulated tetra heated only by a surface flux --------
+    # With no fixed-temperature or convection boundary, conservation gives an
+    # implementation-independent volume-average temperature rise:
+    #
+    #   delta_T = q A t / (rho cp V)
+    #
+    # For one linear tetra with lumped capacitance, all four nodal masses are
+    # equal, so the arithmetic mean of the returned nodal field is exactly the
+    # volume average.  This specifically exercises the flux-only transient path
+    # that a steady thermal setup must reject.
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("sim_run_thermal [transient flux-only live]", reason)
+    else:
+        CoreError = cb.CoreError
+        try:
+            edge_mm = 10.0
+            edge_m = edge_mm * 1.0e-3
+            flux_w_m2 = 1000.0
+            rho_kg_m3 = 1000.0
+            cp_j_kgk = 1000.0
+            t_init_c = 20.0
+            t_end_s = 10.0
+            area_m2 = math.sqrt(3.0) * edge_m * edge_m / 2.0
+            volume_m3 = edge_m ** 3 / 6.0
+            rise_ref_c = (flux_w_m2 * area_m2 * t_end_s
+                          / (rho_kg_m3 * cp_j_kgk * volume_m3))
+
+            live_study = {
+                "points": [
+                    0.0, 0.0, 0.0,
+                    edge_mm, 0.0, 0.0,
+                    0.0, edge_mm, 0.0,
+                    0.0, 0.0, edge_mm,
+                ],
+                "tets": [0, 1, 2, 3],
+                "nodes_per_elem": 4,
+                "material": {
+                    "k_w_mk": 1.0,
+                    "rho_kg_m3": rho_kg_m3,
+                    "cp_j_kgk": cp_j_kgk,
+                },
+                "fixtures": [],
+                "loads": [{
+                    "type": "flux",
+                    "magnitude": flux_w_m2,
+                    "faces": {
+                        "points": [
+                            [edge_mm, 0.0, 0.0],
+                            [0.0, edge_mm, 0.0],
+                            [0.0, 0.0, edge_mm],
+                        ],
+                        "tol_mm": 1.0e-6,
+                    },
+                }],
+                "transient": {
+                    "t_end_s": t_end_s,
+                    "dt_s": 1.0,
+                    "t_init_c": t_init_c,
+                    "capacitance": "lumped",
+                    "frame_times_s": [0.0, 5.0, t_end_s],
+                },
+            }
+            response = cb.call("sim_run_thermal", {"study": live_study})
+            if not response.get("ok"):
+                _record("sim_run_thermal [transient flux-only live]", "BROKEN",
+                        f"production RPC rejected a well-posed flux-only transient: "
+                        f"{response.get('error') or response}")
+            else:
+                issues = []
+
+                def finite_number(value) -> bool:
+                    return (isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(float(value)))
+
+                if response.get("transient") is not True:
+                    issues.append("transient flag is not true")
+                for field, expected in {
+                    "n_nodes": 4, "n_dof": 4, "n_elems": 1, "n_steps": 10,
+                }.items():
+                    value = response.get(field)
+                    if not finite_number(value):
+                        issues.append(f"{field} is missing/non-finite")
+                    elif int(value) != expected:
+                        issues.append(f"{field}={value}, expected {expected}")
+
+                frames = response.get("frames")
+                frame_values = []
+                frame_times = []
+                if not isinstance(frames, list) or len(frames) != 3:
+                    issues.append("frames must contain the requested 0/5/10 s fields")
+                else:
+                    for index, frame in enumerate(frames):
+                        if not isinstance(frame, dict):
+                            issues.append(f"frame {index} is not an object")
+                            continue
+                        time_s = frame.get("t_s")
+                        values = frame.get("temperature")
+                        if not finite_number(time_s):
+                            issues.append(f"frame {index} time is missing/non-finite")
+                        else:
+                            frame_times.append(float(time_s))
+                        if (not isinstance(values, list) or len(values) != 4
+                                or not all(finite_number(v) for v in values)):
+                            issues.append(f"frame {index} temperature is incomplete/non-finite")
+                        else:
+                            frame_values.append([float(v) for v in values])
+                    if (len(frame_times) == 3
+                            and any(abs(got - expected) > 1.0e-9
+                                    for got, expected in zip(
+                                        frame_times, (0.0, 5.0, t_end_s)))):
+                        issues.append(f"frame times are {frame_times}, expected [0, 5, 10]")
+
+                final_field = response.get("temperature")
+                final_values = []
+                if (not isinstance(final_field, list) or len(final_field) != 4
+                        or not all(finite_number(v) for v in final_field)):
+                    issues.append("final temperature field is incomplete/non-finite")
+                else:
+                    final_values = [float(v) for v in final_field]
+                    if (len(frame_values) == 3
+                            and max(abs(a - b) for a, b in
+                                    zip(final_values, frame_values[-1])) > 1.0e-9):
+                        issues.append("final temperature does not match the last frame")
+
+                envelope = response.get("envelope_max")
+                if (not isinstance(envelope, list) or len(envelope) != 4
+                        or not all(finite_number(v) for v in envelope)):
+                    issues.append("envelope_max is incomplete/non-finite")
+
+                summary = response.get("summary")
+                if not isinstance(summary, dict):
+                    issues.append("summary is missing")
+                else:
+                    for field in ("max_temp_c", "max_temp_time_s", "min_temp_c",
+                                  "final_max_temp_c"):
+                        if not finite_number(summary.get(field)):
+                            issues.append(f"summary.{field} is missing/non-finite")
+
+                flux_summary = response.get("flux_summary")
+                if not isinstance(flux_summary, list) or len(flux_summary) != 1:
+                    issues.append("flux_summary must describe exactly one flux load")
+                else:
+                    flux_row = flux_summary[0]
+                    if (not isinstance(flux_row, dict)
+                            or flux_row.get("type") != "flux"
+                            or not finite_number(flux_row.get("q_w_m2"))
+                            or abs(float(flux_row.get("q_w_m2", 0.0)) - flux_w_m2)
+                            > 1.0e-9
+                            or flux_row.get("n_nodes") != 3):
+                        issues.append("flux_summary is incomplete or inconsistent")
+                if not isinstance(response.get("solver_notes"), list):
+                    issues.append("solver_notes is missing")
+                if not isinstance(response.get("mesh_type_used"), str):
+                    issues.append("mesh_type_used is missing")
+
+                rise_got_c = (sum(final_values) / len(final_values) - t_init_c
+                              if final_values else None)
+                rise_err = (_pct_err(rise_got_c, rise_ref_c)
+                            if rise_got_c is not None else math.inf)
+                complete = not issues
+                note = (
+                    f"LIVE flux-only insulated tetra: mean rise={rise_got_c} C vs "
+                    f"qAt/(rho*cp*V)={rise_ref_c:.9f} C "
+                    f"(err={rise_err:.6f}%); response "
+                    f"{'complete' if complete else 'invalid: ' + '; '.join(issues)}"
+                )
+                _record("sim_run_thermal [transient flux-only live]",
+                        "VALIDATED" if complete and rise_err < 0.1 else "BROKEN",
+                        note)
+        except CoreError as exc:
+            if "unknown method" in str(exc):
+                _skip("sim_run_thermal [transient flux-only live]",
+                      "loaded libchudware does not expose the production "
+                      "sim_run_thermal RPC")
+            else:
+                _record("sim_run_thermal [transient flux-only live]", "BROKEN",
+                        f"CoreError: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            _record("sim_run_thermal [transient flux-only live]", "BROKEN",
+                    f"unexpected production-RPC error: {exc}")
+            traceback.print_exc()
+
+    # --- Python parity oracle -------------------------------------------------
+    # These checks remain useful implementation coverage, but only the live row
+    # above may claim VALIDATED for the family.
+    try:
+        import numpy as np
+        from services.sim.fea_thermal_transient import box_mesh, solve_transient
+    except ModuleNotFoundError as exc:
+        _skip("thermal_transient [Python slab quench]",
+              f"dependency import failed: {exc}", install="pip install numpy")
+        _skip("thermal_transient [Python input guard]",
+              f"dependency import failed: {exc}", install="pip install numpy")
+    except Exception as exc:  # noqa: BLE001
+        _record("thermal_transient [Python slab quench]", "BROKEN",
+                f"module import failed: {exc}")
+        _record("thermal_transient [Python input guard]", "BROKEN",
+                f"module import failed: {exc}")
+    else:
+        # Both slab faces are quenched to 0 C from a uniform 100 C initial state.
+        # The mid-plane series solution is independent of the implementation.
+        length, conductivity, rho_cp, initial = 20.0, 0.05, 0.004, 100.0
+        alpha = conductivity / rho_cp
+        t_star = 0.3 * length * length / alpha
+        try:
+            points, tets, x0, xL = box_mesh(length, 8.0, 8.0, 16, 2, 2)
+        except Exception as exc:  # noqa: BLE001
+            _record("thermal_transient [Python slab quench]", "BROKEN",
+                    f"oracle mesh setup failed: {exc}")
+            _record("thermal_transient [Python input guard]", "BROKEN",
+                    f"oracle mesh setup failed: {exc}")
+        else:
+            fixed = x0 + xL
+            try:
+                result = solve_transient(
+                    points, tets, conductivity, fixed, [0.0] * len(fixed), [], [],
+                    rho_cp, t_end=t_star, dt=t_star / 240.0, t_init=initial)
+                if not result.ok:
+                    _record("thermal_transient [Python slab quench]", "BROKEN",
+                            f"well-posed solve failed: {result.error}")
+                elif not result.frames:
+                    _record("thermal_transient [Python slab quench]", "BROKEN",
+                            "solver returned no temperature frames")
+                else:
+                    _, temperatures = result.frames[-1]
+                    mids = [i for i, point in enumerate(points)
+                            if abs(float(point[0]) - length / 2.0) < 1e-9]
+                    got = float(np.mean(temperatures[mids]))
+                    reference = 0.0
+                    for mode in range(1, 200, 2):
+                        reference += (
+                            4.0 * initial / (mode * math.pi)
+                            * math.sin(mode * math.pi * 0.5)
+                            * math.exp(-alpha * mode * mode * math.pi * math.pi
+                                       * t_star / (length * length))
+                        )
+                    err = _pct_err(got, reference)
+                    envelope_ok = (abs(float(result.max_temp) - initial) < 1e-9
+                                   and abs(float(result.max_temp_time)) < 1e-12)
+                    note = (
+                        f"mid-plane T={got:.5f} C vs Fourier series "
+                        f"{reference:.5f} C (err={err:.3f}%); "
+                        f"initial-temperature envelope "
+                        f"{'preserved' if envelope_ok else 'wrong'}; "
+                        f"steps={result.n_steps}; Python oracle only"
+                    )
+                    _record("thermal_transient [Python slab quench]",
+                            "REAL" if err < 3.0 and envelope_ok else "BROKEN", note)
+            except Exception as exc:  # noqa: BLE001
+                _record("thermal_transient [Python slab quench]", "BROKEN",
+                        f"runtime error: {exc}")
+
+            try:
+                bad = solve_transient(
+                    points, tets, conductivity, [], [], [], [], rho_cp,
+                    t_end=1.0, dt=0.1, t_init=20.0)
+                guarded = (
+                    not bad.ok
+                    and ("boundary" in bad.error.lower()
+                         or "heat source" in bad.error.lower())
+                )
+                _record("thermal_transient [Python input guard]",
+                        "REAL" if guarded else "BROKEN",
+                        f"unforced/unconstrained Python setup "
+                        f"{'refused' if guarded else 'not refused'}: {bad.error!r}")
+            except Exception as exc:  # noqa: BLE001
+                _record("thermal_transient [Python input guard]", "BROKEN",
+                        f"guard raised instead of returning a result: {exc}")
+
+
+# ===========================================================================
+# FAMILY 9: Vibration / frequency response
+# ===========================================================================
+
+def audit_vibration() -> None:
+    print("\n--- FAMILY: vibration / frequency response (services.sim.vibration) ---")
+    try:
+        from services.sim.vibration import harmonic_response, miles_response
+        from services.sim.multiphysics_rpc import WORKER_METHODS
+    except ModuleNotFoundError as exc:
+        _skip("frequency_response [harmonic]", f"dependency import failed: {exc}",
+              install="pip install numpy")
+        _skip("frequency_response [Miles]", f"dependency import failed: {exc}",
+              install="pip install numpy")
+        _skip("frequency_response [input guard]", f"dependency import failed: {exc}",
+              install="pip install numpy")
+        return
+    except Exception as exc:  # noqa: BLE001
+        for name in ("frequency_response [harmonic]",
+                     "frequency_response [Miles]",
+                     "frequency_response [input guard]"):
+            _record(name, "BROKEN", f"module import failed: {exc}")
+        return
+
+    # Two equal-mass nodes, unit X mode shape. The 0 Hz mode must be skipped;
+    # the 20 Hz elastic mode has Gamma/m=1 exactly.
+    shapes = [
+        1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+    ]
+    zeta = 0.05
+    try:
+        harmonic = harmonic_response(
+            freqs_hz=[0.0, 20.0], mode_shapes_flat=shapes, n_nodes=2,
+            total_mass_kg=2.0, excitation_dir=[1.0, 0.0, 0.0],
+            sweep_hz=[10.0, 20.0, 30.0], zeta=zeta, base_accel_g=1.0)
+        expected = math.sqrt(1.0 + 4.0 * zeta * zeta) / (2.0 * zeta)
+        got = float(harmonic["peak_accel_g"])
+        err = _pct_err(got, expected)
+        rigid_skipped = len(harmonic.get("per_mode") or []) == 1
+        at_resonance = abs(float(harmonic.get("peak_freq_hz")) - 20.0) < 1e-12
+        note = (f"20 Hz SDOF resonance={got:.6f} g vs {expected:.6f} g "
+                f"(err={err:.5f}%); rigid mode skipped={rigid_skipped}")
+        _record("frequency_response [harmonic]",
+                "VALIDATED" if err < 0.01 and rigid_skipped and at_resonance
+                else "BROKEN", note)
+    except Exception as exc:  # noqa: BLE001
+        _record("frequency_response [harmonic]", "BROKEN", f"runtime error: {exc}")
+
+    try:
+        psd = 0.01
+        random = miles_response(
+            freqs_hz=[0.0, 20.0], mode_shapes_flat=shapes, n_nodes=2,
+            total_mass_kg=2.0, excitation_dir=[1.0, 0.0, 0.0],
+            psd_breakpoints=[[10.0, psd], [100.0, psd]], zeta=zeta)
+        expected = math.sqrt(math.pi / 2.0 * 20.0
+                             * (1.0 / (2.0 * zeta)) * psd)
+        got = float(random["total_grms"])
+        err = _pct_err(got, expected)
+        _record("frequency_response [Miles]",
+                "VALIDATED" if err < 0.01 else "BROKEN",
+                f"flat-PSD GRMS={got:.7f} vs Miles {expected:.7f} "
+                f"(err={err:.5f}%)")
+    except Exception as exc:  # noqa: BLE001
+        _record("frequency_response [Miles]", "BROKEN", f"runtime error: {exc}")
+
+    try:
+        bad = WORKER_METHODS["sim_freq_response"]({"freqs_hz": [20.0]}, lambda _: None)
+        guarded = not bad.get("ok") and "mode_shapes" in str(bad.get("error", ""))
+        _record("frequency_response [input guard]",
+                "VALIDATED" if guarded else "BROKEN",
+                f"incomplete modal input {'refused' if guarded else 'not refused'}: {bad}")
+    except Exception as exc:  # noqa: BLE001
+        _record("frequency_response [input guard]", "BROKEN",
+                f"worker RPC guard failed: {exc}")
+
+
+# ===========================================================================
+# FAMILY 10: Advanced FEA — CalculiX buckling/contact + input generators
+# ===========================================================================
+
+def _cload_sum(inp_text: str) -> float:
+    """Sum the third field of the first generated CalculiX ``*CLOAD`` block."""
+    lines = inp_text.splitlines()
+    start = next((i for i, line in enumerate(lines)
+                  if line.strip().upper() == "*CLOAD"), None)
+    if start is None:
+        raise ValueError("generated deck has no *CLOAD block")
+    total = 0.0
+    for line in lines[start + 1:]:
+        stripped = line.strip()
+        if stripped.startswith("*"):
+            break
+        if not stripped:
+            continue
+        fields = [field.strip() for field in stripped.split(",")]
+        if len(fields) < 3:
+            raise ValueError(f"malformed *CLOAD row: {line!r}")
+        total += float(fields[2])
+    return total
+
+
+def audit_advanced_fea() -> None:
+    print("\n--- FAMILY: advanced FEA (buckling/contact, CalculiX capability) ---")
+    try:
+        from services.mcp import fea_advanced as fa
+        from services.sim.multiphysics_rpc import WORKER_METHODS
+    except Exception as exc:  # noqa: BLE001
+        for name in ("fea_buckling [input]", "fea_contact [input]",
+                     "fea_buckling [CalculiX]", "fea_contact [CalculiX]"):
+            _record(name, "BROKEN", f"advanced FEA import failed: {exc}")
+        return
+
+    length, width, height = 1000.0, 20.0, 10.0
+    elastic_modulus, poisson, applied = 200000.0, 0.3, 100.0
+    try:
+        buckling = fa.build_buckling_column_inp(
+            length, width, height, elastic_modulus, poisson, applied,
+            nx=16, ny=2, nz=2)
+        inertia = min(width * height ** 3, height * width ** 3) / 12.0
+        euler = math.pi ** 2 * elastic_modulus * inertia / (2.0 * length) ** 2
+        pcr_err = _pct_err(float(buckling["expected_Pcr"]), euler)
+        load_err = _pct_err(abs(_cload_sum(buckling["inp"])), applied)
+        keywords_ok = "*BUCKLE" in buckling["inp"] and "TYPE=C3D8I" in buckling["inp"]
+        note = (f"generated fixed-free column: Pcr={buckling['expected_Pcr']:.6f} N "
+                f"vs Euler {euler:.6f} N (err={pcr_err:.6f}%); "
+                f"summed load err={load_err:.6f}%")
+        _record("fea_buckling [input]",
+                "VALIDATED" if pcr_err < 1e-8 and load_err < 1e-4 and keywords_ok
+                else "BROKEN", note)
+    except Exception as exc:  # noqa: BLE001
+        buckling = None
+        _record("fea_buckling [input]", "BROKEN", f"generator failed: {exc}")
+
+    contact_length, contact_width, pressure = 40.0, 30.0, 1.25
+    try:
+        contact = fa.build_contact_block_inp(
+            contact_length, contact_width, 10.0, elastic_modulus, poisson,
+            pressure, nx=3, ny=3, nz=2)
+        expected_load = pressure * contact_length * contact_width
+        load_err = _pct_err(abs(_cload_sum(contact["inp"])), expected_load)
+        keywords_ok = ("*CONTACT PAIR" in contact["inp"]
+                       and "*STEP, NLGEOM" in contact["inp"])
+        note = (f"generated two-block contact load={abs(_cload_sum(contact['inp'])):.6f} N "
+                f"vs pA={expected_load:.6f} N (err={load_err:.6f}%)")
+        _record("fea_contact [input]",
+                "VALIDATED" if load_err < 1e-6 and keywords_ok else "BROKEN", note)
+    except Exception as exc:  # noqa: BLE001
+        contact = None
+        _record("fea_contact [input]", "BROKEN", f"generator failed: {exc}")
+
+    try:
+        caps = WORKER_METHODS["sim_caps"]({}, lambda _: None)
+        ccx_cap = caps.get("ccx") or {}
+        ccx = fa.ccx_path()
+        if bool(ccx) != bool(ccx_cap.get("found")):
+            _record("CalculiX [capability]", "BROKEN",
+                    f"sim_caps and fea_advanced disagree: {ccx_cap}, path={ccx}")
+        elif ccx:
+            _record("CalculiX [capability]", "REAL",
+                    f"PATH probe found {ccx}")
+        else:
+            _skip("CalculiX [capability]",
+                  "CalculiX not found on PATH and CHUDWARE_CCX does not resolve",
+                  install="install ccx_2.20 or newer and put it on PATH")
+    except Exception as exc:  # noqa: BLE001
+        _record("CalculiX [capability]", "BROKEN", f"capability probe failed: {exc}")
+        ccx = None
+
+    if not ccx:
+        hint = ("install CalculiX (ccx_2.20 or newer), put it on PATH, or set "
+                "CHUDWARE_CCX=/full/path/to/ccx")
+        _skip("fea_buckling [CalculiX]",
+              "CalculiX not found; generated input was audited but no eigenvalue solve ran",
+              install=hint)
+        _skip("fea_contact [CalculiX]",
+              "CalculiX not found; generated input was audited but no nonlinear solve ran",
+              install=hint)
+        return
+
+    workdirs: list[str] = []
+    try:
+        if buckling is None:
+            _record("fea_buckling [CalculiX]", "BROKEN",
+                    "input generation failed; solver was not launched")
+        else:
+            run = fa.run_ccx(buckling["inp"], job="sim_audit_buckle", timeout=60.0)
+            if run.get("workdir"):
+                workdirs.append(run["workdir"])
+            if not run.get("ok") or not run.get("dat_path"):
+                _record("fea_buckling [CalculiX]", "BROKEN",
+                        f"ccx failed or emitted no .dat result: "
+                        f"{run.get('error') or run.get('stderr') or run.get('stdout')}")
+            else:
+                factors = fa.parse_buckle_factors(run["dat_path"])
+                got = factors[0] * applied if factors else None
+                err = (_pct_err(got, float(buckling["expected_Pcr"]))
+                       if got is not None else math.inf)
+                _record("fea_buckling [CalculiX]",
+                        "VALIDATED" if got is not None and err < 10.0 else "BROKEN",
+                        f"first critical load={got} N vs Euler "
+                        f"{buckling['expected_Pcr']:.6f} N (err={err:.3f}%)")
+    except Exception as exc:  # noqa: BLE001
+        _record("fea_buckling [CalculiX]", "BROKEN", f"solver error: {exc}")
+
+    try:
+        if contact is None:
+            _record("fea_contact [CalculiX]", "BROKEN",
+                    "input generation failed; solver was not launched")
+        else:
+            run = fa.run_ccx(contact["inp"], job="sim_audit_contact", timeout=60.0)
+            if run.get("workdir"):
+                workdirs.append(run["workdir"])
+            if not run.get("ok") or not run.get("dat_path"):
+                _record("fea_contact [CalculiX]", "BROKEN",
+                        f"ccx failed or emitted no .dat result: "
+                        f"{run.get('error') or run.get('stderr') or run.get('stdout')}")
+            else:
+                average = fa.parse_dat_nodal(
+                    run["dat_path"], "RF", contact["base_nodes"], component=3)
+                reaction = (abs(float(average) * len(contact["base_nodes"]))
+                            if average is not None else None)
+                expected = float(contact["applied_load_n"])
+                err = _pct_err(reaction, expected) if reaction is not None else math.inf
+                _record("fea_contact [CalculiX]",
+                        "VALIDATED" if reaction is not None and err < 5.0 else "BROKEN",
+                        f"base reaction={reaction} N vs applied {expected:.6f} N "
+                        f"(equilibrium err={err:.3f}%)")
+    except Exception as exc:  # noqa: BLE001
+        _record("fea_contact [CalculiX]", "BROKEN", f"solver error: {exc}")
+    finally:
+        for workdir in workdirs:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ===========================================================================
+# FAMILY 11: Assembly motion / rigid-body inverse dynamics
+# ===========================================================================
+
+def audit_motion() -> None:
+    print("\n--- FAMILY: motion / dynamics (core simulate_motion RPC) ---")
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("simulate_motion [kinematics]", reason)
+        _skip("simulate_motion [dynamics]", reason)
+        _skip("simulate_motion [input guard]", reason)
+        return
+
+    import tempfile
+    sidecar = tempfile.mkdtemp(prefix="sim_audit_motion_")
+    docs: list[str] = []
+    try:
+        part = cb.call("doc_new", {"kind": "part", "name": "audit_motion_bar"})["doc_id"]
+        docs.append(part)
+        built = cb.call("doc_apply_ops", {"doc_id": part, "ops": [{
+            "op": "add_feature", "feature": {
+                "type": "box", "name": "Bar",
+                "params": {
+                    "length": {"value": 40.0, "expr": None},
+                    "width": {"value": 4.0, "expr": None},
+                    "height": {"value": 4.0, "expr": None},
+                },
+            },
+        }]})
+        statuses = (built.get("rebuild") or {}).get("feature_status") or []
+        if not statuses or not all(row.get("ok") for row in statuses):
+            raise RuntimeError(f"motion bar rebuild failed: {statuses}")
+        faces = cb.call("doc_query", {
+            "doc_id": part, "query": {"of": "face"}}).get("matches") or []
+        x_face = max(faces, key=lambda row: abs(row.get("centroid", [0, 0, 0])[0]))
+        z_face = max(faces, key=lambda row: abs(row.get("centroid", [0, 0, 0])[2]))
+        path = os.path.join(sidecar, "bar.step+")
+        saved = cb.call("doc_save", {"doc_id": part, "path": path})
+        if not saved.get("ok", True):
+            raise RuntimeError(f"component save failed: {saved}")
+
+        assembly = cb.call(
+            "doc_new", {"kind": "assembly", "name": "audit_swing_arm"})["doc_id"]
+        docs.append(assembly)
+
+        def revision() -> int:
+            return int(cb.call("doc_tree", {"doc_id": assembly}).get("revision", 0))
+
+        ground_xf = [1, 0, 0, 0, 0, 1, 0, 200,
+                     0, 0, 1, 0, 0, 0, 0, 1]
+        cb.call("doc_apply_ops", {
+            "doc_id": assembly, "base_revision": revision(), "with_tess": False,
+            "ops": [
+                {"op": "asm_insert_component", "source": {"path": path},
+                 "name": "Ground", "fixed": True, "transform": ground_xf},
+                {"op": "asm_insert_component", "source": {"path": path},
+                 "name": "Arm", "fixed": False},
+            ],
+        })
+        mates = cb.call("doc_apply_ops", {
+            "doc_id": assembly, "base_revision": revision(), "with_tess": False,
+            "ops": [
+                {"op": "asm_add_mate", "mate": {
+                    "type": "angle", "align": "aligned", "suppressed": False,
+                    "refs": [{"component": "k1", "selector": x_face},
+                             {"component": "k2", "selector": x_face}],
+                    "value": {"value": 0.0, "expr": None},
+                }},
+                {"op": "asm_add_mate", "mate": {
+                    "type": "parallel", "align": "aligned", "suppressed": False,
+                    "refs": [{"component": "k1", "selector": z_face},
+                             {"component": "k2", "selector": z_face}],
+                }},
+            ],
+        })
+        mate_id = (mates.get("id_map") or {}).get("$0")
+        if not mate_id:
+            raise RuntimeError(f"driven mate id missing: {mates}")
+
+        result = cb.call("simulate_motion", {
+            "doc_id": assembly, "mate_id": mate_id, "start": 0.0, "stop": 90.0,
+            "steps": 8, "check_interference": False,
+            "dynamics": {"duration_s": 0.8, "default_density_g_cm3": 2.7,
+                         "gravity": [0.0, 0.0, 0.0],
+                         "damping": {"angular_nms_per_rad": 0.1}},
+        })
+        trajectory = result.get("trajectory") or []
+        transforms = []
+        for frame in trajectory:
+            arm = next((body for body in frame.get("bodies", [])
+                        if body.get("component") == "k2"), None)
+            if arm:
+                transforms.append(arm.get("transform") or [])
+        moved = (len(transforms) == 8 and
+                 max(abs(float(a) - float(b))
+                     for a, b in zip(transforms[0], transforms[-1])) > 0.5)
+        converged = len(trajectory) == 8 and all(
+            bool(frame.get("converged")) for frame in trajectory)
+        _record("simulate_motion [kinematics]",
+                "VALIDATED" if result.get("ok") and moved and converged else "BROKEN",
+                f"8-frame 0→90 deg sweep: moved={moved}, converged={converged}, "
+                f"driver={result.get('driver')}")
+
+        dynamics = result.get("dynamics") or {}
+        arm_body = next((body for body in dynamics.get("bodies", [])
+                         if body.get("component") == "k2"), None)
+        mass = float(arm_body["mass_kg"]) if arm_body else None
+        expected_mass = 40.0 * 4.0 * 4.0 * 2.7e-6
+        frames = dynamics.get("frames") or []
+        duration_ok = (len(frames) == 8
+                       and abs(float(frames[-1].get("t_s", -1.0)) - 0.8) < 1e-9)
+        reactions_ok = bool(dynamics.get("per_joint_worst")) and bool(
+            dynamics.get("worst_case"))
+        mass_err = _pct_err(mass, expected_mass) if mass is not None else math.inf
+        _record("simulate_motion [dynamics]",
+                "VALIDATED" if mass_err < 0.1 and duration_ok and reactions_ok
+                else "BROKEN",
+                f"geometry×density mass={mass} kg vs {expected_mass:.9f} kg "
+                f"(err={mass_err:.4f}%); duration_ok={duration_ok}, "
+                f"joint_reactions={reactions_ok}")
+
+        try:
+            normalized_result = cb.call("simulate_motion", {
+                "doc_id": assembly, "mate_id": mate_id, "start": 0.0, "stop": 1.0,
+                "steps": 1, "check_interference": False,
+            })
+            normalized_driver = normalized_result.get("driver") or {}
+            normalized_frames = normalized_result.get("trajectory") or []
+            normalized = (normalized_result.get("ok")
+                          and int(normalized_driver.get("steps", 0)) == 2
+                          and len(normalized_frames) == 2)
+            _record("simulate_motion [input normalization]",
+                    "VALIDATED" if normalized else "BROKEN",
+                    f"public RPC steps=1 normalized to "
+                    f"{normalized_driver.get('steps')} steps and "
+                    f"{len(normalized_frames)} frames")
+        except cb.CoreError as exc:
+            _record("simulate_motion [input normalization]", "BROKEN",
+                    f"public RPC rejected steps=1 instead of normalizing to 2: {exc}")
+    except cb.CoreError as exc:
+        if "unknown method" in str(exc):
+            _skip("simulate_motion [kinematics]",
+                  "loaded libchudware does not expose simulate_motion")
+            _skip("simulate_motion [dynamics]",
+                  "loaded libchudware does not expose simulate_motion dynamics")
+            _skip("simulate_motion [input guard]",
+                  "loaded libchudware does not expose simulate_motion")
+        else:
+            _record("simulate_motion [kinematics]", "BROKEN", f"CoreError: {exc}")
+            _record("simulate_motion [dynamics]", "BROKEN",
+                    "motion fixture or solve failed before dynamics completed")
+            _record("simulate_motion [input guard]", "BROKEN",
+                    "motion fixture failed before input guard could execute")
+    except Exception as exc:  # noqa: BLE001
+        _record("simulate_motion [kinematics]", "BROKEN", f"runtime error: {exc}")
+        _record("simulate_motion [dynamics]", "BROKEN",
+                "motion fixture or solve failed before dynamics completed")
+        _record("simulate_motion [input guard]", "BROKEN",
+                "motion fixture failed before input guard could execute")
+    finally:
+        for doc_id in reversed(docs):
+            try:
+                cb.call("doc_close", {"doc_id": doc_id})
+            except Exception:  # noqa: BLE001
+                pass
+        shutil.rmtree(sidecar, ignore_errors=True)
+
+
+# ===========================================================================
+# FAMILY 12: Electromagnetics — analytic + FDFD, optional openEMS
+# ===========================================================================
+
+def audit_em() -> None:
+    print("\n--- FAMILY: electromagnetics (analytic, FDFD, openEMS capability) ---")
+    try:
+        from services.sim.em.adapters import (
+            AnalyticAdapter, BuiltinFdfdAdapter, EmSolverError)
+        from services.sim.em.analytic import C0
+        from services.sim.em.openems_adapter import OpenEmsAdapter
+    except ModuleNotFoundError as exc:
+        for name in ("em_analytic [WR90]", "em_fdfd [WR90]",
+                     "em_adapter [input guard]", "em_openems [full-wave]"):
+            _skip(name, f"EM dependency import failed: {exc}",
+                  install="pip install numpy scipy")
+        return
+    except Exception as exc:  # noqa: BLE001
+        for name in ("em_analytic [WR90]", "em_fdfd [WR90]",
+                     "em_adapter [input guard]", "em_openems [full-wave]"):
+            _record(name, "BROKEN", f"EM module import failed: {exc}")
+        return
+
+    spec = {"standard": "WR90", "n_modes": 3}
+    expected_fc = C0 / (2.0 * 22.86e-3)
+    try:
+        result = AnalyticAdapter().eigenmode(spec)
+        got = float(result["modes"][0]["fc_hz"])
+        err = _pct_err(got, expected_fc)
+        _record("em_analytic [WR90]", "VALIDATED" if err < 1e-9 else "BROKEN",
+                f"TE10 cutoff={got / 1e9:.9f} GHz vs c/(2a)="
+                f"{expected_fc / 1e9:.9f} GHz (err={err:.9f}%)")
+    except Exception as exc:  # noqa: BLE001
+        _record("em_analytic [WR90]", "BROKEN", f"analytic solve failed: {exc}")
+
+    try:
+        result = BuiltinFdfdAdapter().eigenmode({
+            **spec, "resolution": 40, "fields": False})
+        modes = result.get("modes") or []
+        got = float(modes[0]["fc_hz"]) if modes else None
+        err = _pct_err(got, expected_fc) if got is not None else math.inf
+        _record("em_fdfd [WR90]",
+                "VALIDATED" if got is not None and err < 3.0 else "BROKEN",
+                f"40-cell scalar Helmholtz cutoff={got / 1e9 if got else None} GHz "
+                f"vs analytic {expected_fc / 1e9:.9f} GHz (err={err:.3f}%)")
+    except ModuleNotFoundError as exc:
+        _skip("em_fdfd [WR90]", f"FDFD dependency unavailable: {exc}",
+              install="pip install numpy scipy")
+    except Exception as exc:  # noqa: BLE001
+        _record("em_fdfd [WR90]", "BROKEN", f"FDFD solve failed: {exc}")
+
+    try:
+        AnalyticAdapter().eigenmode({
+            "waveguide": {"shape": "rectangular", "a_mm": 10.0, "b_mm": 20.0}})
+        _record("em_adapter [input guard]", "BROKEN",
+                "rectangular guide with b>a was accepted")
+    except EmSolverError as exc:
+        guarded = "broad-wall" in str(exc)
+        _record("em_adapter [input guard]",
+                "VALIDATED" if guarded else "BROKEN",
+                f"invalid geometry refusal: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        _record("em_adapter [input guard]", "BROKEN",
+                f"invalid geometry raised wrong error: {exc}")
+
+    openems = OpenEmsAdapter()
+    try:
+        plan = openems.build_plan({
+            "standard": "WR90", "length_mm": 50.0,
+            "f_start_ghz": 8.0, "f_stop_ghz": 12.0})
+        plan_ok = (plan.get("ports") is not None and plan.get("mesh") is not None)
+        _record("em_openems [input plan]",
+                "REAL" if plan_ok else "BROKEN",
+                "rectangular-guide mesh/port plan generated without launching the "
+                f"heavy solver; plan keys={sorted(plan)}")
+    except Exception as exc:  # noqa: BLE001
+        _record("em_openems [input plan]", "BROKEN", f"plan generation failed: {exc}")
+
+    availability = openems.available()
+    if not availability.get("installed"):
+        _skip("em_openems [full-wave]",
+              f"openEMS/CSXCAD unavailable: {availability.get('detail')}",
+              install=openems.install_hint)
+    else:
+        _skip("em_openems [full-wave]",
+              "openEMS is available, but a full 3-D FDTD solve is intentionally outside "
+              "the deterministic cheap normal audit; run the EM worker validation suite "
+              "for full-wave S-parameters")
+
+
+# ===========================================================================
+# FAMILY 13: CFD (low-level D3Q19 LBM + optional OpenFOAM)
 # ===========================================================================
 
 def audit_cfd() -> None:
-    print("\n--- FAMILY: CFD (LBM + OpenFOAM) ---")
+    print("\n--- FAMILY: CFD (core D3Q19 LBM + OpenFOAM capability) ---")
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("sim_lbm [deterministic kernel]", reason)
+    else:
+        nx, ny, nz = 20, 10, 10
+        solid = [
+            1 if 8 <= x <= 10 and 3 <= y <= 6 and 3 <= z <= 6 else 0
+            for x in range(nx) for y in range(ny) for z in range(nz)
+        ]
+        payload = {
+            "mask": {"nx": nx, "ny": ny, "nz": nz, "solid": solid},
+            "params": {"u_lat": 0.04, "tau0": 0.8, "voxel_mm": 1.0,
+                       "dx_m": 1.0e-3, "dt_s": 1.0e-4,
+                       "rho_air": 1.225, "backend": "cpu"},
+            "n_steps": 120,
+        }
+        try:
+            first = cb.call("sim_lbm", payload)
+            second = cb.call("sim_lbm", payload)
+            scalars = [
+                first.get("drag_n"), first.get("lift_n"), first.get("cd"),
+                first.get("frontal_area_mm2"),
+            ]
+            fields = ((first.get("rho") or []) + (first.get("ux") or [])
+                      + (first.get("uy") or []) + (first.get("uz") or []))
+            finite = (all(value is not None and math.isfinite(float(value))
+                          for value in scalars)
+                      and all(math.isfinite(float(value)) for value in fields))
+            deterministic = (first.get("drag_n") == second.get("drag_n")
+                             and first.get("cd") == second.get("cd"))
+            physical = (float(first.get("drag_n") or 0.0) > 0.0
+                        and float(first.get("frontal_area_mm2") or 0.0) > 0.0)
+            ok = (first.get("ok") and second.get("ok")
+                  and not first.get("diverged") and finite
+                  and deterministic and physical)
+            note = (f"20x10x10 lattice, 120 steps twice: drag="
+                    f"{first.get('drag_n')} N, Cd={first.get('cd')}, "
+                    f"backend={first.get('backend')}; finite={finite}, "
+                    f"bit-deterministic={deterministic}. This validates kernel "
+                    "stability/determinism, not absolute Cd or convergence.")
+            _record("sim_lbm [deterministic kernel]",
+                    "VALIDATED" if ok else "BROKEN", note)
+        except cb.CoreError as exc:
+            if "unknown method" in str(exc):
+                _skip("sim_lbm [deterministic kernel]",
+                      "loaded libchudware does not expose sim_lbm")
+            else:
+                _record("sim_lbm [deterministic kernel]", "BROKEN",
+                        f"CoreError: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            _record("sim_lbm [deterministic kernel]", "BROKEN",
+                    f"runtime error: {exc}")
+
     try:
-        from engine.sim.foam_runner import capabilities
+        from services.sim.foam_runner import capabilities
         caps = capabilities()
+    except Exception as exc:  # noqa: BLE001
+        _record("OpenFOAM [capability]", "BROKEN",
+                f"services.sim.foam_runner import/probe failed: {exc}")
+        return
 
-        lbm_ok = caps.get("lbm", False)
-        foam_ok = caps.get("openfoam", False)
+    if not caps.get("openfoam"):
+        _skip("OpenFOAM [RANS]",
+              "no working OpenFOAM runner detected by services.sim.foam_runner",
+              install="python -m tools.provision_openfoam --install (Linux user-space "
+                      "environment; Windows native blueCFD or WSL; subprocess only)")
+        return
 
-        if lbm_ok:
-            # LBM is built into the C++ core (cb.call("sim_run_flow"))
-            # Source audit: cad_tools.py calls cb.call("sim_run_flow", {...})
-            # The docstring explicitly warns: "ABSOLUTE Cd IS UNCALIBRATED" —
-            # the code is REAL (LBM physics implemented) but intentionally uncalibrated.
-            # Independent check: drag scales as V^2, Cd velocity-independent.
-            # Cannot run headless without building a part doc first; source-audit only.
-            _record("run_cfd_flow [lbm]", "REAL",
-                    "C++ LBM wind tunnel: cad_tools.py:run_cfd_flow calls "
-                    "cb.call('sim_run_flow'). Engine docstring states: 'ABSOLUTE Cd UNCALIBRATED "
-                    "— coarse voxel LBM staircased surface over-counts force'. REAL physics "
-                    "(LBM lattice solve), not validated for absolute Cd. "
-                    "Cannot run headless without a part doc; source-only verdict.",
-                    executed=False)
-        else:
-            _skip("run_cfd_flow [lbm]",
-                  "LBM reported not available in capabilities()")
-
-        if not foam_ok:
-            _skip("run_cfd_accurate",
-                  "OpenFOAM not installed on this machine",
-                  install="python -m tools.provision_openfoam --install  "
-                          "(Linux: user-space conda-forge env, no sudo; Windows: WSL "
-                          "openfoam2412 or blueCFD — GPL subprocess isolation, never linked)")
-        else:
-            _record("run_cfd_accurate [openfoam]", "REAL",
-                    f"OpenFOAM {caps.get('openfoam_version', 'unknown')} available "
-                    f"(kind={caps.get('openfoam_kind')}). Calls "
-                    "engine.sim.openfoam.run_openfoam_tunnel — RANS k-omega SST with prism "
-                    "layers. Validation gate: tools/foam_validation.py (sphere/cube Cd bands).",
-                    executed=False)
-            # LIVE validation leg (opt-in — a coarse sphere solve takes ~10-30 s):
-            #   CHUDWARE_SIM_AUDIT_LIVE_FOAM=1 python scripts/sim_audit.py
-            if os.environ.get("CHUDWARE_SIM_AUDIT_LIVE_FOAM"):
-                try:
-                    from tools.foam_validation import run_case
-                    res = run_case("sphere", "coarse")
-                    verdict = "REAL" if res["pass"] else "BROKEN"
-                    _record("run_cfd_accurate [live sphere]", verdict,
-                            f"sphere Cd={res['cd']:.3f} vs experimental ~{res['cd_ref']:.2f}, "
-                            f"accepted band {res['band']} -> "
-                            f"{'PASS' if res['pass'] else 'FAIL'} ({res['secs']:.0f}s, "
-                            f"Re {res['re']:.0f}).", executed=True)
-                except Exception as exc:  # noqa: BLE001
-                    _record("run_cfd_accurate [live sphere]", "BROKEN",
-                            f"live validation errored: {exc}")
-
-    except Exception as exc:
-        _record("run_cfd_flow", "BROKEN",
-                f"foam_runner import error: {exc}")
+    _record("OpenFOAM [capability]", "REAL",
+            f"runner kind={caps.get('openfoam_kind')}, "
+            f"version={caps.get('openfoam_version') or 'unknown'}")
+    if not os.environ.get("CHUDWARE_SIM_AUDIT_LIVE_FOAM"):
+        _skip("OpenFOAM [live sphere]",
+              "backend is available, but the 10–30 s RANS validation is opt-in; "
+              "set CHUDWARE_SIM_AUDIT_LIVE_FOAM=1")
+        return
+    try:
+        from tools.foam_validation import run_case
+        result = run_case("sphere", "coarse")
+        passed = bool(result.get("pass"))
+        _record("OpenFOAM [live sphere]",
+                "VALIDATED" if passed else "BROKEN",
+                f"Cd={result.get('cd')} vs reference {result.get('cd_ref')}, "
+                f"band={result.get('band')}, Re={result.get('re')}, "
+                f"elapsed={result.get('secs')} s")
+    except Exception as exc:  # noqa: BLE001
+        _record("OpenFOAM [live sphere]", "BROKEN",
+                f"live validation failed: {exc}")
 
 
 # ===========================================================================
-# FAMILY 7: Structural (engine.structural — PyNite-based)
+# FAMILY 14: Structural frame analysis + D/C checks
 # ===========================================================================
 
 def audit_structural() -> None:
-    print("\n--- FAMILY: structural (engine.structural, PyNite) ---")
+    print("\n--- FAMILY: structural (PyNite + services.structural.checks) ---")
     try:
-        import Pynite as PyNite  # PyNiteFEA installs module 'Pynite'
-        pynite_ok = True
-    except ImportError:
-        pynite_ok = False
-
-    if not pynite_ok:
-        _skip("struct_analyze",
-              "PyNite not installed in mcp-venv",
-              install="pip install PyNite  # MIT license, in-process OK")
-        _skip("struct_check",
-              "PyNite not installed in mcp-venv (structural checks depend on analysis)")
-
-        # Source audit: engine/structural/analysis.py uses PyNite for frame FE solve
-        _record("struct_analyze [source audit]", "REAL",
-                "engine/structural/analysis.py: uses PyNite FE for member forces/deflections "
-                "under ASCE 7 load combos. StructureDoc (v1 schema) → PyNite FEM → "
-                "AnalysisResult (N, mm, MPa). Cannot run without PyNite; verdict from source.",
-                executed=False)
-        _record("struct_check [source audit]", "REAL",
-                "engine/structural/checks.py: LRFD D/C ratio checks — "
-                "dc_ratio_axial, dc_ratio_bending, wood variants. Pure math, no PyNite needed "
-                "for checks themselves, but requires analysis results as input.",
-                executed=False)
-        return
-
-    # PyNite available — run a cantilever beam check
-    # Cantilever: L=3000mm (3m), W200x100 I-beam, steel, P=5000N at tip
-    # Expected: delta = P*L^3/(3*E*I)
-    # (engine.structural was ported to core/structural in T-RF19; this family audits
-    #  PyNite itself, no engine import needed.)
-    try:
-        import numpy as np
-        from Pynite import FEModel3D  # PyNiteFEA installs module "Pynite"
-
-        # Simple hand-built PyNite cantilever (bypasses StructureDoc to test PyNite directly)
-        model = FEModel3D()
-        model.add_material("steel", E=200000.0, G=77000.0, nu=0.3, rho=7.85e-3)
-        # W200x100 approx: Iy=113e6 mm^4, Iz=36.9e6 mm^4
-        # Use 50x200 rect for simpler independent check
-        b_r = 50.0; h_r = 200.0
-        A_r = b_r * h_r
-        # Pynite local axes for a member along global X: a global FZ (vertical) load
-        # bends the member ABOUT local y — so Iy must carry the b*h^3/12 (stiff) value
-        # for a section h tall in Z. (Verified empirically: swapping these gives exactly
-        # (h/b)^2 = 16x the deflection.)
-        Iy_r = b_r * h_r ** 3 / 12.0
-        Iz_r = h_r * b_r ** 3 / 12.0
-        J_r = 0.141 * b_r * h_r ** 3 / (b_r / h_r)  # approx torsion constant
-        L_r = 3000.0
-
-        model.add_node("A", 0, 0, 0)
-        model.add_node("B", L_r, 0, 0)
-        # Pynite >=1.0 API: sections are named objects (same call shape as
-        # engine/structural/analysis.py uses in production).
-        model.add_section("rect50x200", A_r, Iy_r, Iz_r, J_r)
-        model.add_member("m1", "A", "B", "steel", "rect50x200")
-        model.def_support("A", True, True, True, True, True, True)
-        model.add_node_load("B", "FZ", -5000.0)
-        model.analyze(check_statics=False)
-        delta_got = abs(model.nodes["B"].DZ["Combo 1"])  # Pynite 1.x: displacement dicts are DX/DY/DZ
-
-        E_r = 200000.0
-        I_r = Iy_r  # FZ load bends about local y (see axis note above)
-        delta_expected = 5000.0 * L_r ** 3 / (3.0 * E_r * I_r)
-
-        err = _pct_err(delta_got, delta_expected)
-        note = (f"PyNite cantilever 50x200mm, L=3000mm, P=5000N: "
-                f"delta={delta_got:.4f}mm (E-B: {delta_expected:.4f}mm, err={err:.2f}%)")
-        if err < 1.0:
-            _record("struct_analyze", "VALIDATED", note)
-        else:
+        from Pynite import FEModel3D
+    except ModuleNotFoundError as exc:
+        _skip("struct_analyze", f"PyNiteFEA unavailable: {exc}",
+              install="pip install PyNiteFEA (MIT, in-process)")
+    except Exception as exc:  # noqa: BLE001
+        _record("struct_analyze", "BROKEN", f"PyNite import failed: {exc}")
+    else:
+        try:
+            model = FEModel3D()
+            model.add_material("steel", E=200000.0, G=77000.0, nu=0.3, rho=7.85e-3)
+            width, height, length, load = 50.0, 200.0, 3000.0, 5000.0
+            area = width * height
+            iy = width * height ** 3 / 12.0
+            iz = height * width ** 3 / 12.0
+            torsion = 0.141 * width * height ** 3 / (width / height)
+            model.add_node("A", 0, 0, 0)
+            model.add_node("B", length, 0, 0)
+            model.add_section("rect50x200", area, iy, iz, torsion)
+            model.add_member("m1", "A", "B", "steel", "rect50x200")
+            model.def_support("A", True, True, True, True, True, True)
+            model.add_node_load("B", "FZ", -load)
+            model.analyze(check_statics=False)
+            got = abs(model.nodes["B"].DZ["Combo 1"])
+            expected = load * length ** 3 / (3.0 * 200000.0 * iy)
+            err = _pct_err(got, expected)
+            _record("struct_analyze", "VALIDATED" if err < 1.0 else "BROKEN",
+                    f"cantilever deflection={got:.6f} mm vs Euler-Bernoulli "
+                    f"{expected:.6f} mm (err={err:.4f}%)")
+        except Exception as exc:  # noqa: BLE001
             _record("struct_analyze", "BROKEN",
-                    f"PyNite deflection wrong: {note}")
+                    f"PyNite analysis failed: {exc}")
 
-        _record("struct_check", "REAL",
-                "engine/structural/checks.py: LRFD D/C ratio checks verified by source; "
-                "pure math using analysis output — no separate check needed",
-                executed=False)
-
-    except Exception as exc:
-        _record("struct_analyze", "BROKEN",
-                f"PyNite available but analysis failed: {exc}")
-        traceback.print_exc()
+    try:
+        from services.structural.checks import dc_ratio_axial
+        force, area, fy, phi = 100000.0, 1000.0, 250.0, 0.9
+        expected = force / (phi * area * fy)
+        got = dc_ratio_axial(force, area, fy, phi)
+        err = _pct_err(got, expected)
+        _record("struct_check [axial LRFD]",
+                "VALIDATED" if err < 1e-9 else "BROKEN",
+                f"D/C={got:.9f} vs P/(phi*A*Fy)={expected:.9f} "
+                f"(err={err:.9f}%)")
+    except Exception as exc:  # noqa: BLE001
+        _record("struct_check [axial LRFD]", "BROKEN",
+                f"services.structural.checks failed: {exc}")
 
 
 # ===========================================================================
@@ -991,33 +1807,50 @@ def audit_structural() -> None:
 
 def main() -> int:
     print("=" * 70)
-    print("sim_audit.py — T-V1 Simulation Backend Audit")
+    print("sim_audit.py — Current Simulation Surface Audit")
     print(f"Python: {sys.executable}")
-    print(f"CHUDWARE_LIBCHUDWARE: {os.environ.get('CHUDWARE_LIBCHUDWARE', '(not set)')}")
+    print(f"CHUDWARE_LIBCHUDWARE: "
+          f"{os.environ.get('CHUDWARE_LIBCHUDWARE', '(not set)')}")
     print("=" * 70)
 
+    families = (
+        audit_hydraulic,
+        audit_piping,
+        audit_ecad_impedance,
+        audit_ecad_sim,
+        audit_fea,
+        audit_fatigue,
+        audit_thermal,
+        audit_thermal_transient,
+        audit_vibration,
+        audit_advanced_fea,
+        audit_motion,
+        audit_em,
+        audit_cfd,
+        audit_structural,
+    )
     t0 = time.perf_counter()
-    audit_hydraulic()
-    audit_piping()
-    audit_ecad_impedance()
-    audit_ecad_sim()
-    audit_fea()
-    audit_fatigue()
-    audit_thermal()
-    audit_cfd()
-    audit_structural()
+    for audit in families:
+        try:
+            audit()
+        except Exception as exc:  # noqa: BLE001 — keep later families reachable
+            _record(audit.__name__, "BROKEN",
+                    f"unhandled family-level error: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
     elapsed = time.perf_counter() - t0
 
     print()
     print("=" * 70)
-    print(f"SUMMARY  executed={_EXECUTED}  skipped={_SKIPPED}  broken={_BROKEN}")
+    print(f"SUMMARY  families={len(families)}  checks={len(_RESULTS)}  "
+          f"executed={_EXECUTED}  skipped={_SKIPPED}  broken={_BROKEN}")
     print(f"Elapsed: {elapsed:.2f}s")
     print("=" * 70)
     print()
     print(f"{'Tool':<45} {'Verdict':<12} {'Note'}")
     print("-" * 120)
-    for r in _RESULTS:
-        print(f"  {r['tool']:<43} {r['verdict']:<12} {r['note'][:70]}")
+    for result in _RESULTS:
+        print(f"  {result['tool']:<43} {result['verdict']:<12} "
+              f"{result['note'][:70]}")
     print()
 
     if _EXECUTED == 0:

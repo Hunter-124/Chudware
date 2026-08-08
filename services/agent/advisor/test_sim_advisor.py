@@ -1,21 +1,9 @@
-"""Tests for T-W9 simulation verification advisor.
+"""Behavioral tests for finite advisor math, setup lint, and evidence-gated verdicts.
 
-Test coverage:
-  1. BC lint — no_fixture, all_fixed, dangling_ref, clean study
-  2. Mesh suggestion — with/without doc_geom hints
-  3. Beam anchor — confident geometry → anchor computed, low-aspect → None
-  4. Margin policy — PASS / WARN / FAIL verdicts across material classes
-  5. Divergence WARN — FEA >> anchor, FEA << anchor, in-range
-  6. Stage battery wiring — sim stage now includes sim_bc, sim_margin, etc.
-  7. Engine fix-provider wiring — sim_bc / sim_margin / sim_divergence kinds
-  8. describe_results integration — advisor verdict appended (in-app path only,
-     seeded via sim_study_add; no live solver; mock-prove documented)
-
-Anchor mock-prove note (citation honesty):
-    Tests 8 / 5 seed a study whose ``max_von_mises_mpa`` is set to a value that
-    is within 5× of beam_calc_raw for the same geometry.  This tests the postcheck
-    comparison logic without invoking the FEA solver.  The FEA solver does not run
-    headlessly in CI; that is the pre-existing condition documented in issue #16.
+The suite covers current public argument shapes across structural, thermal,
+vibration, CFD, motion, and EM setup. Analytic tests use literal closed-form
+references; seeded FEA values exercise advisor comparison logic only and do not
+claim to validate the solver backend.
 """
 from __future__ import annotations
 
@@ -28,14 +16,16 @@ from services.agent.advisor.sim_advisor import (
     DIVERGENCE_WARN_RATIO,
     _bc_issues,
     _beam_aspect_ok,
+    _mesh_convergence_evidence,
     _mesh_suggestion,
+    _surface_issues,
+    _thermal_bc_issues,
     compute_beam_anchor,
     narrate_postcheck,
     postcheck,
     precheck,
     resolve_material_class,
     thermal_anchor,
-    _thermal_bc_issues,
 )
 from services.research.calcs.beam import beam_calc_raw
 
@@ -90,6 +80,153 @@ class TestBcLint:
             if it["severity"] != "info":
                 assert it["candidate_fixes"], f"Non-info item lacks candidate_fixes: {it}"
 
+    def test_free_free_modal_has_no_fixture_or_load_blocker(self):
+        issues = _bc_issues({"type": "fea_modal", "fixtures": [], "loads": []})
+        assert issues == []
+
+    def test_zero_load_diagnostic_is_never_a_blocker(self):
+        items = precheck({
+            "type": "fea_static",
+            "fixtures": [],
+            "loads": [],
+            "zero_load_diagnostic": True,
+        })
+        zero = [item for item in items if "zero-load diagnostic" in item["finding"].lower()]
+        assert zero and zero[0]["severity"] == "info"
+        assert not any(item["severity"] == "blocker" for item in items)
+
+    def test_zero_force_entry_is_caught_as_no_load(self):
+        issues = _bc_issues({
+            "type": "fea_static",
+            "fixtures": ["bottom"],
+            "loads": [{"face": "top", "force": [0, 0, 0]}],
+        })
+        assert any(issue["kind"] == "no_load" for issue in issues)
+
+    def test_pressure_is_a_driving_load(self):
+        issues = _bc_issues({
+            "type": "fea_static",
+            "fixtures": ["bottom"],
+            "loads": [{"face": "top", "pressure": 0.5}],
+        })
+        assert not any(issue["kind"] == "no_load" for issue in issues)
+
+    def test_buckling_rejects_pressure_as_proxy_load(self):
+        issues = _surface_issues({
+            "type": "fea_buckling",
+            "load": [{"face": "top", "pressure": 1.0}],
+        })
+        assert any(issue["kind"] == "invalid_buckling_load" for issue in issues)
+
+    def test_contact_requires_positive_pressure(self):
+        issues = _surface_issues({"type": "fea_contact", "pressure_mpa": 0.0})
+        assert any(issue["kind"] == "invalid_contact_pressure" for issue in issues)
+
+
+    def test_cfd_uses_velocity_not_structural_loads(self):
+        issues = _surface_issues({"type": "cfd_flow", "velocity": 0.0, "fluid": "air"})
+        assert any(issue["kind"] == "invalid_excitation" for issue in issues)
+        assert not any(issue["kind"] == "no_fixture" for issue in _bc_issues(
+            {"type": "cfd_flow", "fixtures": [], "loads": []}
+        ))
+
+    def test_motion_requires_stop_and_two_samples(self):
+        issues = _surface_issues({"type": "motion", "steps": 1})
+        assert len([issue for issue in issues if issue["kind"] == "invalid_motion_range"]) == 2
+
+    def test_em_requires_real_cross_section(self):
+        issues = _surface_issues({"type": "em_eigenmode"})
+        assert any(issue["kind"] == "missing_em_geometry" for issue in issues)
+        assert _surface_issues({"type": "em_eigenmode", "standard": "WR-90"}) == []
+
+    def test_unavailable_backend_is_blocker_not_passable_fallback(self):
+        items = precheck({
+            "type": "em_driven",
+            "standard": "WR-90",
+            "solver": "openems",
+            "capabilities": {"openems": False},
+        })
+        backend = [item for item in items if item["check"] == "sim_bc"
+                   and "unavailable" in item["finding"]]
+        assert backend and backend[0]["severity"] == "blocker"
+        assert backend[0]["helper_tools"] == ["em_status"]
+
+    def test_actual_em_status_solver_list_blocks_absent_openems(self):
+        items = precheck({
+            "type": "em_driven",
+            "standard": "WR-90",
+            "solver": "openems",
+            "capabilities": {
+                "ok": True,
+                "solvers": [{"name": "openems", "installed": False}],
+            },
+        })
+        assert any(
+            item["severity"] == "blocker" and "unavailable" in item["finding"]
+            for item in items
+        )
+
+    def test_explicit_modal_material_requires_density(self):
+        issues = _surface_issues({
+            "type": "fea_modal",
+            "material": {"E_mpa": 70000, "nu": 0.33},
+        })
+        material = [issue for issue in issues if issue["kind"] == "missing_material_properties"]
+        assert material and "density_g_cm3" in material[0]["detail"]
+
+    def test_transient_thermal_material_requires_k_rho_cp(self):
+        issues = _surface_issues({
+            "type": "fea_thermal_transient",
+            "transient": {"t_end_s": 10},
+            "loads": [{"face": "top", "flux_w_m2": 1000}],
+            "material": {"E_mpa": 70000, "nu": 0.33, "density_g_cm3": 2.7},
+        })
+        detail = next(
+            issue["detail"] for issue in issues
+            if issue["kind"] == "missing_material_properties"
+        )
+        assert "cp_j_kgk" in detail and "conductivity_w_mk" in detail
+
+    def test_transient_top_level_thermal_overrides_satisfy_explicit_material(self):
+        issues = _surface_issues({
+            "type": "fea_thermal_transient",
+            "transient": {"t_end_s": 10},
+            "material": {"E_mpa": 70000, "nu": 0.33, "density_g_cm3": 2.7},
+            "conductivity_w_mk": 167.0,
+            "specific_heat_j_kgk": 896.0,
+        })
+        assert not any(issue["kind"] == "missing_material_properties" for issue in issues)
+
+    def test_transient_thermal_requires_positive_end_time(self):
+        issues = _surface_issues({
+            "type": "fea_thermal_transient",
+            "transient": {"t_end_s": 0},
+            "material": "steel",
+        })
+        assert any(issue["kind"] == "invalid_thermal_time" for issue in issues)
+
+    def test_invalid_top_level_thermal_override_is_not_accepted(self):
+        issues = _surface_issues({
+            "type": "fea_thermal_transient",
+            "transient": {"t_end_s": 10},
+            "material": {"E_mpa": 70000, "nu": 0.33, "density_g_cm3": 2.7},
+            "conductivity_w_mk": float("nan"),
+            "specific_heat_j_kgk": 896.0,
+        })
+        detail = next(
+            issue["detail"] for issue in issues
+            if issue["kind"] == "missing_material_properties"
+        )
+        assert "conductivity_w_mk" in detail
+
+    def test_invalid_named_material_override_is_not_accepted(self):
+        issues = _surface_issues({
+            "type": "fea_thermal_transient",
+            "transient": {"t_end_s": 10},
+            "material": "steel",
+            "specific_heat_j_kgk": -1.0,
+        })
+        assert any(issue["kind"] == "invalid_thermal_properties" for issue in issues)
 
 # ---------------------------------------------------------------------------
 # 2. Mesh suggestion
@@ -101,25 +238,54 @@ class TestMeshSuggestion:
         # No doc_geom — should not suggest for normal fineness
         assert _mesh_suggestion(study) is None
 
+    def test_public_mesh_preset_is_normalized(self):
+        assert _mesh_suggestion({"mesh_fineness": "fine"}) is None
+
     def test_very_coarse_mesh_triggers_suggestion(self):
         study = {"mesh_fineness": 0.05}
         suggestion = _mesh_suggestion(study)
         assert suggestion is not None
         assert "coarse" in suggestion.lower() or "0.05" in suggestion, suggestion
 
-    def test_doc_geom_fillet_suggests_finer_mesh(self):
-        study = {"mesh_fineness": 0.5}
-        doc_geom = {"min_fillet_radius_mm": 0.5}  # 0.5/5=0.1, target≈0.1; current 0.5 >> target*2
-        suggestion = _mesh_suggestion(study, doc_geom)
-        assert suggestion is not None, "Should suggest finer mesh for small fillet"
+    def test_doc_geom_reports_feature_without_fake_length_conversion(self):
+        suggestion = _mesh_suggestion(
+            {"mesh_fineness": 0.5},
+            {"min_fillet_radius_mm": 0.5},
+        )
+        assert suggestion is not None
+        assert "dimensionless" in suggestion
+        assert "<10%" in suggestion
 
-    def test_doc_geom_large_feature_no_suggestion(self):
-        # Min fillet 5mm → target_fine = min(0.9, 5/5)=0.9; current 0.8 is within 0.9*0.8..0.9*2
-        # (0.72..1.8) — no suggestion expected
-        study = {"mesh_fineness": 0.8}
-        doc_geom = {"min_fillet_radius_mm": 5.0}
-        suggestion = _mesh_suggestion(study, doc_geom)
-        assert suggestion is None, f"Unexpected suggestion: {suggestion}"
+    def test_numeric_two_mesh_evidence_suppresses_suggestion(self):
+        study = {
+            "mesh_fineness": 0.75,
+            "mesh_convergence": {"values": [100.0, 96.0], "tolerance_pct": 10.0},
+        }
+        evidence = _mesh_convergence_evidence(study)
+        assert evidence and evidence["stable"]
+        assert _mesh_suggestion(study, {"min_wall_mm": 0.5}) is None
+
+    def test_boolean_convergence_claim_is_not_evidence(self):
+        assert _mesh_convergence_evidence({"mesh_convergence": {"stable": True}}) is None
+
+    def test_loose_caller_tolerance_cannot_bless_large_change(self):
+        evidence = _mesh_convergence_evidence({
+            "mesh_convergence": {"values": [100.0, 60.0], "tolerance_pct": 90.0},
+        })
+        assert evidence and not evidence["stable"]
+        assert evidence["tolerance_pct"] == 10.0
+
+    def test_exactly_ten_percent_change_does_not_meet_less_than_ten_rule(self):
+        evidence = _mesh_convergence_evidence({
+            "mesh_convergence": {"values": [100.0, 90.0]},
+        })
+        assert evidence and evidence["relative_change_pct"] == pytest.approx(10.0)
+        assert not evidence["stable"]
+
+    def test_mesh_guidance_names_the_selected_solver_family(self):
+        items = precheck({"type": "fea_modal", "fixtures": [], "mesh_fineness": "coarse"})
+        mesh = next(item for item in items if item["check"] == "sim_mesh")
+        assert mesh["helper_tools"] == ["run_fea_modal"]
 
 
 # ---------------------------------------------------------------------------
@@ -131,16 +297,20 @@ class TestBeamAnchor:
         return {"x_mm": L, "y_mm": b, "z_mm": h}
 
     def test_confident_geometry_returns_anchor(self):
-        bbox = self._cantilever_bbox(L=200, b=20, h=20)  # aspect = 200/sqrt(20*20)=10 > 3
+        bbox = self._cantilever_bbox(L=200, b=20, h=20)  # aspect = 200/max(20,20)=10
         anchor = compute_beam_anchor(bbox, E_mpa=200000, load_n=1000)
         assert anchor is not None, "Expected anchor for aspect=10"
         assert anchor["max_stress_mpa"] > 0
         assert "aspect_ratio" in anchor
 
     def test_low_aspect_returns_none(self):
-        bbox = {"x_mm": 50, "y_mm": 40, "z_mm": 40}  # aspect = 50/sqrt(40*40)=1.25 < 3
+        bbox = {"x_mm": 50, "y_mm": 40, "z_mm": 40}  # aspect = 50/max(40,40)=1.25
         anchor = compute_beam_anchor(bbox, E_mpa=200000, load_n=1000)
         assert anchor is None, f"Expected None for low-aspect geometry, got {anchor}"
+
+    def test_flat_plate_is_not_misclassified_as_a_beam(self):
+        bbox = {"x_mm": 200, "y_mm": 100, "z_mm": 1}
+        assert compute_beam_anchor(bbox, E_mpa=200000, load_n=1000) is None
 
     def test_missing_bbox_returns_none(self):
         anchor = compute_beam_anchor({}, E_mpa=200000, load_n=1000)
@@ -161,32 +331,91 @@ class TestBeamAnchor:
         )
 
     def test_aspect_threshold_exactly_three(self):
-        # L=60, cross=sqrt(20*20)=20, aspect=3 → confident
+        # L=60, larger cross-section side=20, aspect=3 → confident
         bbox = {"x_mm": 60, "y_mm": 20, "z_mm": 20}
         confident, aspect, _ = _beam_aspect_ok(bbox)
         assert confident, f"Expected confident at aspect=3, got {aspect}"
 
     def test_aspect_below_three_not_confident(self):
-        # L=59, cross=sqrt(20*20)=20, aspect=2.95 → not confident
+        # L=59, larger cross-section side=20, aspect=2.95 → not confident
         bbox = {"x_mm": 59, "y_mm": 20, "z_mm": 20}
         confident, aspect, _ = _beam_aspect_ok(bbox)
         assert not confident, f"Expected not confident at aspect={aspect}"
 
+    def test_nonfinite_or_nonpositive_inputs_return_none(self):
+        bbox = self._cantilever_bbox()
+        assert compute_beam_anchor(bbox, E_mpa=float("inf"), load_n=1000) is None
+        assert compute_beam_anchor(bbox, E_mpa=200000, load_n=float("nan")) is None
+        assert compute_beam_anchor(bbox, E_mpa=200000, load_n=0) is None
+        assert compute_beam_anchor(
+            {"x_mm": float("inf"), "y_mm": 20, "z_mm": 20},
+            E_mpa=200000,
+            load_n=1000,
+        ) is None
+
+    def test_subnormal_cross_section_returns_not_confident(self):
+        confident, aspect, _ = _beam_aspect_ok(
+            {"x_mm": 1.0, "y_mm": 1e-323, "z_mm": 1e-323}
+        )
+        assert not confident and aspect == 0.0
+
+    def test_axial_force_is_not_mislabeled_as_bending_anchor(self):
+        anchor = compute_beam_anchor(
+            {"x_mm": 200, "y_mm": 10, "z_mm": 20},
+            E_mpa=200000,
+            load_n=1000,
+            load_vector_n=[1000, 0, 0],
+        )
+        assert anchor is None
+
+    def test_force_direction_selects_section_depth(self):
+        bbox = {"x_mm": 200, "y_mm": 10, "z_mm": 20}
+        anchor = compute_beam_anchor(
+            bbox, E_mpa=200000, load_n=1000, load_vector_n=[0, 0, -1000]
+        )
+        expected = beam_calc_raw(
+            support="cantilever", load="point", section="rect",
+            L_mm=200, E_mpa=200000, F_n=1000, b_mm=10, h_mm=20,
+        )
+        assert anchor is not None
+        assert anchor["load_axis"] == "z"
+        assert anchor["max_stress_mpa"] == pytest.approx(expected["max_stress_mpa"])
+
+
+    def test_precheck_requires_opposite_beam_end_faces(self):
+        items = precheck({
+            "type": "fea_static",
+            "fixtures": ["bottom"],
+            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+            "material": {"E_mpa": 200000, "nu": 0.3, "yield_mpa": 370},
+            "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
+        })
+        anchor = next(item for item in items if item["check"] == "sim_anchor")
+        assert anchor["_anchor"] is None
 
 # ---------------------------------------------------------------------------
 # 4. Margin policy
 # ---------------------------------------------------------------------------
 
 class TestMarginPolicy:
-    def _study(self, vm, yield_mpa, mat_name="Steel AISI 1018", ultimate_mpa=None):
-        mat = {"name": mat_name, "yield_mpa": yield_mpa, "E_mpa": 200000}
+    def _study(self, vm, yield_mpa, mat_name="Steel AISI 1018", ultimate_mpa=None,
+               *, evidence=True):
+        mat = {"name": mat_name, "yield_mpa": yield_mpa, "E_mpa": 200000, "nu": 0.29}
         if ultimate_mpa:
             mat["ultimate_mpa"] = ultimate_mpa
-        return {
+        study = {
             "type": "fea_static",
             "material": mat,
             "results": {"max_von_mises_mpa": vm},
+            "fixtures": ["left"],
+            "loads": [{"face": "right", "force": [0, 0, -100]}],
         }
+        if evidence:
+            study.update({
+                "mesh_fineness": 0.75,
+                "mesh_convergence": {"values": [vm * 1.04, vm], "tolerance_pct": 10.0},
+            })
+        return study
 
     def test_pass_verdict_steel(self):
         # Steel SF=1.5; design_stress = 50*1.5=75 ≤ yield=370 → PASS
@@ -196,13 +425,18 @@ class TestMarginPolicy:
         assert r["sf_used"] == 1.5
 
     def test_warn_verdict_steel(self):
-        # design_stress = 260*1.5=390 > yield=370, ≤ ultimate=440 → WARN
+        # 260 MPa is below nominal yield but above allowable=370/1.5.
         r = postcheck(self._study(vm=260, yield_mpa=370, ultimate_mpa=440))
         assert r["verdict"] == "WARN", r
 
-    def test_fail_verdict_steel(self):
-        # design_stress = 310*1.5=465 > ultimate=440 → FAIL
+    def test_nominal_stress_below_yield_is_warn_not_fracture(self):
+        # Required margin fails (310*1.5>370), but nominal 310 MPa is below yield.
         r = postcheck(self._study(vm=310, yield_mpa=370, ultimate_mpa=440))
+        assert r["verdict"] == "WARN", r
+        assert "fracture" not in r["items"][0]["finding"].lower()
+
+    def test_nominal_yield_is_fail(self):
+        r = postcheck(self._study(vm=380, yield_mpa=370, ultimate_mpa=440))
         assert r["verdict"] == "FAIL", r
 
     def test_polymer_sf_is_two(self):
@@ -220,7 +454,7 @@ class TestMarginPolicy:
         assert r["sf_used"] == 2.0, r
 
     def test_margin_verdict_items_have_severity(self):
-        r = postcheck(self._study(vm=310, yield_mpa=370, ultimate_mpa=440))
+        r = postcheck(self._study(vm=380, yield_mpa=370, ultimate_mpa=440))
         margin_items = [i for i in r["items"] if i["check"] == "sim_margin"]
         assert margin_items, "Expected sim_margin item"
         assert margin_items[0]["severity"] == "blocker", margin_items[0]
@@ -230,13 +464,103 @@ class TestMarginPolicy:
         margin_items = [i for i in r["items"] if i["check"] == "sim_margin"]
         assert margin_items[0]["severity"] == "info", margin_items[0]
 
-    def test_missing_yield_skips_verdict(self):
+    def test_missing_yield_withholds_verdict(self):
         study = {"type": "fea_static", "material": {"name": "steel"},
                  "results": {"max_von_mises_mpa": 50.0}}
         r = postcheck(study)
         margin_items = [i for i in r["items"] if i["check"] == "sim_margin"]
-        assert margin_items[0]["severity"] == "info"
-        assert "skipped" in margin_items[0]["finding"].lower()
+        assert r["verdict"] == "WARN"
+        assert r["confidence"] == "insufficient"
+        assert margin_items[0]["severity"] == "action"
+        assert "finite static margin" in margin_items[0]["finding"].lower()
+
+    def test_unresolved_named_material_withholds_without_crashing(self):
+        r = postcheck({
+            "type": "fea_static",
+            "material": "steel",
+            "results": {"max_von_mises_mpa": 50.0},
+        })
+        assert r["verdict"] == "WARN"
+        assert r["margin_mpa"] is None
+
+    def test_margin_is_against_allowable_not_raw_yield(self):
+        r = postcheck(self._study(vm=200, yield_mpa=370, ultimate_mpa=440))
+        assert r["margin_mpa"] == pytest.approx(370 / 1.5 - 200)
+        numbers = next(i["numbers"] for i in r["items"] if i["check"] == "sim_margin")
+        assert numbers["allowable_mpa"] == pytest.approx(round(370 / 1.5, 3))
+
+    def test_safe_single_mesh_is_warn_with_insufficient_confidence(self):
+        r = postcheck(self._study(vm=50, yield_mpa=370, ultimate_mpa=440, evidence=False))
+        assert r["verdict"] == "WARN"
+        assert r["confidence"] == "insufficient"
+        assert any(item["check"] == "sim_mesh"
+                   and item["severity"] == "action" for item in r["items"])
+
+    def test_stable_two_mesh_evidence_supports_pass(self):
+        r = postcheck(self._study(vm=50, yield_mpa=370, ultimate_mpa=440))
+        assert r["verdict"] == "PASS"
+        assert r["confidence"] == "supported"
+
+    def test_zero_load_diagnostic_cannot_become_capacity_pass(self):
+        study = self._study(vm=0, yield_mpa=370, ultimate_mpa=440)
+        study["loads"] = []
+        study["zero_load_diagnostic"] = True
+        r = postcheck(study)
+        assert r["verdict"] == "WARN"
+        assert r["confidence"] == "insufficient"
+
+    def test_invalid_explicit_material_cannot_support_pass(self):
+        study = self._study(vm=50, yield_mpa=370, ultimate_mpa=440)
+        study["material"].pop("nu")
+        r = postcheck(study)
+        assert r["verdict"] == "WARN"
+        assert r["confidence"] == "insufficient"
+
+    def test_reported_unavailable_backend_cannot_support_pass(self):
+        study = self._study(vm=50, yield_mpa=370, ultimate_mpa=440)
+        study["backend"] = "ccx"
+        study["capabilities"] = {"ccx": False}
+        r = postcheck(study)
+        assert r["verdict"] == "WARN"
+        assert r["confidence"] == "insufficient"
+
+    def test_public_mesh_preset_can_support_numeric_convergence(self):
+        study = self._study(vm=50, yield_mpa=370, ultimate_mpa=440)
+        study["mesh_fineness"] = "fine"
+        r = postcheck(study)
+        assert r["verdict"] == "PASS"
+        assert r["confidence"] == "supported"
+
+    @pytest.mark.parametrize("terminal", [
+        {"skipped": True},
+        {"state": "failed"},
+        {"partial": True},
+        {"results": {"max_von_mises_mpa": 50.0, "converged": False}},
+    ])
+    def test_unavailable_or_unfinished_result_never_passes(self, terminal):
+        study = self._study(vm=50, yield_mpa=370, ultimate_mpa=440)
+        if "results" in terminal:
+            study["results"].update(terminal["results"])
+        else:
+            study.update(terminal)
+        r = postcheck(study)
+        assert r["verdict"] == "WARN"
+        assert r["confidence"] == "insufficient"
+
+    def test_finite_extreme_values_remain_finite(self):
+        r = postcheck(self._study(vm=1e308, yield_mpa=1.0, evidence=False))
+        numbers = next(item["numbers"] for item in r["items"]
+                       if item["check"] == "sim_margin")
+        assert r["verdict"] == "FAIL"
+        assert math.isfinite(numbers["design_stress_mpa"])
+        assert math.isfinite(numbers["utilization"])
+        assert math.isfinite(numbers["margin_mpa"])
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), -1.0, True])
+    def test_nonfinite_or_negative_stress_never_passes(self, value):
+        r = postcheck(self._study(vm=value, yield_mpa=370, evidence=False))
+        assert r["verdict"] != "PASS"
+        assert r["margin_mpa"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +584,8 @@ class TestDivergenceWarn:
             "material": {"name": "Steel AISI 1018", "yield_mpa": 9999.0, "E_mpa": 200000},
             "results": {"max_von_mises_mpa": fea_vm},
             "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
-            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+            "fixtures": ["left"],
+            "loads": [{"face": "right", "force": [0, 0, -1000]}],
         }
         r = postcheck(study)
         div_items = [i for i in r["items"] if i["check"] == "sim_divergence"]
@@ -276,7 +601,8 @@ class TestDivergenceWarn:
             "material": {"name": "Steel AISI 1018", "yield_mpa": 9999.0, "E_mpa": 200000},
             "results": {"max_von_mises_mpa": fea_vm},
             "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
-            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+            "fixtures": ["left"],
+            "loads": [{"face": "right", "force": [0, 0, -1000]}],
         }
         r = postcheck(study)
         div_items = [i for i in r["items"] if i["check"] == "sim_divergence"]
@@ -291,7 +617,8 @@ class TestDivergenceWarn:
             "material": {"name": "Steel AISI 1018", "yield_mpa": 9999.0, "E_mpa": 200000},
             "results": {"max_von_mises_mpa": fea_vm},
             "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
-            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+            "fixtures": ["left"],
+            "loads": [{"face": "right", "force": [0, 0, -1000]}],
         }
         r = postcheck(study)
         div_items = [i for i in r["items"] if i["check"] == "sim_divergence"]
@@ -302,8 +629,8 @@ class TestDivergenceWarn:
         study = {
             "type": "fea_static",
             "material": {"name": "Steel AISI 1018", "yield_mpa": 9999.0, "E_mpa": 200000},
-            "fixtures": ["bottom"],
-            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+            "fixtures": ["left"],
+            "loads": [{"face": "right", "force": [0, 0, -1000]}],
             "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
             "results": {"max_von_mises_mpa": 150.0},
         }
@@ -395,8 +722,12 @@ class TestNarratePostcheck:
         r = postcheck({
             "type": "fea_static",
             "material": {"name": "Steel AISI 1018", "yield_mpa": 370, "E_mpa": 200000,
-                         "ultimate_mpa": 440},
+                         "nu": 0.29, "ultimate_mpa": 440},
             "results": {"max_von_mises_mpa": 50},
+            "fixtures": ["left"],
+            "loads": [{"face": "right", "force": [0, 0, -100]}],
+            "mesh_fineness": 0.75,
+            "mesh_convergence": {"values": [52.0, 50.0]},
         })
         text = narrate_postcheck(r)
         assert "PASS" in text, text
@@ -406,8 +737,8 @@ class TestNarratePostcheck:
         r = postcheck({
             "type": "fea_static",
             "material": {"name": "Steel AISI 1018", "yield_mpa": 370, "E_mpa": 200000,
-                         "ultimate_mpa": 440},
-            "results": {"max_von_mises_mpa": 310},
+                         "nu": 0.29, "ultimate_mpa": 440},
+            "results": {"max_von_mises_mpa": 380},
         })
         text = narrate_postcheck(r)
         assert "FAIL" in text, text
@@ -420,13 +751,15 @@ class TestNarratePostcheck:
         fea_vm = anchor_s * 10
         r = postcheck({
             "type": "fea_static",
-            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999, "E_mpa": 200000},
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999, "E_mpa": 200000,
+                         "nu": 0.29},
             "results": {"max_von_mises_mpa": fea_vm},
             "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
-            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+            "fixtures": ["left"],
+            "loads": [{"face": "right", "force": [0, 0, -1000]}],
         })
         text = narrate_postcheck(r)
-        assert "diverges" in text or "FEA" in text.lower(), text
+        assert "diverges" in text or "fea" in text.lower(), text
 
     def test_no_anchor_narration_when_geometry_not_beamlike(self):
         r = postcheck({
@@ -467,10 +800,12 @@ class TestCantileverAnchorMockProve:
         fea_vm = anchor_s * 1.5  # plausible: same order of magnitude
         study = {
             "type": "fea_static",
-            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999, "E_mpa": 200000},
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999, "E_mpa": 200000,
+                         "nu": 0.29},
             "results": {"max_von_mises_mpa": fea_vm},
             "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
-            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+            "fixtures": ["left"],
+            "loads": [{"face": "right", "force": [0, 0, -1000]}],
         }
         r = postcheck(study)
         div_items = [i for i in r["items"] if i["check"] == "sim_divergence"]
@@ -485,10 +820,12 @@ class TestCantileverAnchorMockProve:
         fea_vm = anchor_s * 10.0
         study = {
             "type": "fea_static",
-            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999, "E_mpa": 200000},
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999, "E_mpa": 200000,
+                         "nu": 0.29},
             "results": {"max_von_mises_mpa": fea_vm},
             "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
-            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+            "fixtures": ["left"],
+            "loads": [{"face": "right", "force": [0, 0, -1000]}],
         }
         r = postcheck(study)
         div_items = [i for i in r["items"] if i["check"] == "sim_divergence"]
@@ -536,63 +873,114 @@ class TestThermalAnchor:
     def test_bad_conductivity_returns_none(self):
         assert thermal_anchor(self._wall_bbox(), k_w_mk=0.0, t_hot_c=100.0, t_cold_c=20.0) is None
 
+
+    def test_subnormal_thickness_underflow_returns_none(self):
+        assert thermal_anchor(
+            self._wall_bbox(L_mm=1e-323), 50.0, 100.0, t_cold_c=20.0
+        ) is None
+
     def test_no_cold_datum_returns_none(self):
         # Only a hot face, no cold temp and no convection -> not confident.
         assert thermal_anchor(self._wall_bbox(), k_w_mk=50.0, t_hot_c=100.0) is None
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])
+    def test_nonfinite_or_negative_geometry_is_rejected(self, bad):
+        bbox = self._wall_bbox()
+        bbox["z_mm"] = bad
+        assert thermal_anchor(bbox, 50.0, 100.0, t_cold_c=20.0) is None
+
+    def test_infinite_conductivity_is_rejected(self):
+        assert thermal_anchor(self._wall_bbox(), float("inf"), 100.0,
+                              t_cold_c=20.0) is None
+
 
 # ---------------------------------------------------------------------------
-# 10. Thermal BC lint (singular temperature datum) — T-SIM1
+# 10. Thermal BC lint (steady versus transient public schemas) — T-SIM1
 # ---------------------------------------------------------------------------
 
 class TestThermalBcLint:
-    def test_pure_neumann_is_singular(self):
-        # Only a flux load, no fixed-T and no convection -> singular.
+    def test_flux_only_transient_is_well_posed(self):
         issues = _thermal_bc_issues({
-            "type": "thermal",
-            "fixtures": [],
-            "loads": [{"type": "flux", "magnitude": 500.0}],
+            "type": "fea_thermal_transient",
+            "transient": {"t_end_s": 10},
+            "hot_faces": [],
+            "cold_faces": [],
+            "loads": [{"face": "top", "flux_w_m2": 500.0}],
         })
-        kinds = [i["kind"] for i in issues]
-        assert "thermal_singular" in kinds, issues
+        assert issues == []
 
-    def test_convection_alone_is_not_singular(self):
-        # A convection film anchors the datum even with no fixed-T.
+    def test_undriven_transient_is_reported(self):
         issues = _thermal_bc_issues({
-            "type": "thermal",
-            "fixtures": [],
-            "loads": [{"type": "convection", "h": 25.0, "t_amb_c": 20.0}],
+            "type": "fea_thermal_transient",
+            "transient": {"t_end_s": 10},
+            "loads": [],
         })
-        kinds = [i["kind"] for i in issues]
-        assert "thermal_singular" not in kinds, issues
+        assert any(issue["kind"] == "thermal_no_load" for issue in issues)
 
-    def test_fixed_temp_is_not_singular(self):
+    def test_temperature_equal_to_initial_field_is_not_a_drive(self):
         issues = _thermal_bc_issues({
-            "type": "thermal",
-            "fixtures": [{"points": [[0, 0, 0]], "temp_c": 100.0}],
-            "loads": [{"type": "flux", "magnitude": 500.0}],
+            "type": "fea_thermal_transient",
+            "transient": {"t_end_s": 10, "t_init_c": 20.0},
+            "hot_faces": [{"face": "+z", "temperature": 20.0}],
+            "loads": [{"face": "-z", "h_w_m2k": 10.0, "t_amb_c": 20.0}],
         })
-        kinds = [i["kind"] for i in issues]
-        assert "thermal_singular" not in kinds, issues
+        assert any(issue["kind"] == "thermal_no_load" for issue in issues)
 
-    def test_precheck_routes_thermal_singular_as_blocker(self):
-        # A thermal study with no datum should raise a blocker BC item through precheck.
-        study = {"type": "thermal", "fixtures": [], "loads": [], "material": {"k_w_mk": 50.0}}
+    def test_undriven_transient_precheck_is_blocker(self):
+        items = precheck({
+            "type": "fea_thermal_transient",
+            "transient": {"t_end_s": 10},
+            "material": "steel",
+            "loads": [],
+        })
+        assert any(
+            item["check"] == "sim_bc" and item["severity"] == "blocker"
+            for item in items
+        )
+
+    def test_steady_requires_two_distinct_public_temperature_bcs(self):
+        issues = _thermal_bc_issues({
+            "type": "fea_thermal",
+            "hot_faces": [{"face": "+x", "temperature": 100.0}],
+            "cold_faces": [],
+        })
+        assert any(issue["kind"] == "thermal_steady_bcs" for issue in issues)
+
+    def test_steady_rejects_extra_temperature_faces_and_loads(self):
+        issues = _thermal_bc_issues({
+            "type": "fea_thermal",
+            "hot_faces": [
+                {"face": "+x", "temperature": 100.0},
+                {"face": "+y", "temperature": 80.0},
+            ],
+            "cold_faces": [{"face": "-x", "temperature": 20.0}],
+            "loads": [{"face": "+z", "flux_w_m2": 100.0}],
+        })
+        assert any(issue["kind"] == "thermal_steady_bcs" for issue in issues)
+
+    def test_steady_public_hot_and_cold_faces_are_valid(self):
+        issues = _thermal_bc_issues({
+            "type": "fea_thermal",
+            "hot_faces": [{"face": "+x", "temperature": 100.0}],
+            "cold_faces": [{"face": "-x", "temperature": 20.0}],
+        })
+        assert issues == []
+
+    def test_precheck_routes_invalid_steady_setup_as_blocker(self):
+        study = {"type": "fea_thermal", "hot_faces": [], "cold_faces": [],
+                 "material": {"conductivity_w_mk": 50.0}}
         items = precheck(study)
-        bc = [i for i in items if i["check"] == "sim_bc"]
-        assert any(i["severity"] == "blocker" for i in bc), bc
-        # And every non-info precheck item carries a candidate fix (§3 invariant).
-        for it in items:
-            if it["severity"] != "info":
-                assert it["candidate_fixes"], it
+        bc = [item for item in items if item["check"] == "sim_bc"]
+        assert any(item["severity"] == "blocker" for item in bc), bc
+        assert all(item["candidate_fixes"] for item in items if item["severity"] != "info")
 
     def test_precheck_emits_thermal_anchor(self):
         study = {
             "type": "thermal",
-            "material": {"k_w_mk": 50.0},
+            "material": {"E_mpa": 200000, "nu": 0.29, "k_w_mk": 50.0},
             "bbox": {"x_mm": 100, "y_mm": 100, "z_mm": 10},
-            "fixtures": [{"points": [[0, 0, 0]], "temp_c": 100.0},
-                         {"points": [[10, 0, 0]], "temp_c": 20.0}],
+            "hot_faces": [{"face": "+z", "temperature": 100.0}],
+            "cold_faces": [{"face": "-z", "temperature": 20.0}],
             "loads": [],
         }
         items = precheck(study)
@@ -600,6 +988,18 @@ class TestThermalBcLint:
         assert anchor_items, items
         assert anchor_items[0]["_anchor"] is not None
         assert anchor_items[0]["_anchor"]["mode"] == "conduction"
+
+    def test_precheck_rejects_thermal_anchor_across_non_thickness_faces(self):
+        study = {
+            "type": "thermal",
+            "material": {"E_mpa": 200000, "nu": 0.29, "k_w_mk": 50.0},
+            "bbox": {"x_mm": 100, "y_mm": 100, "z_mm": 10},
+            "hot_faces": [{"face": "+x", "temperature": 100.0}],
+            "cold_faces": [{"face": "-x", "temperature": 20.0}],
+            "loads": [],
+        }
+        anchor = next(item for item in precheck(study) if item["check"] == "sim_anchor")
+        assert anchor["_anchor"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -719,3 +1119,15 @@ class TestFatigueAnchor:
                               method="soderberg") is None
         # Unknown method.
         assert fatigue_anchor(200.0, 0.0, ultimate_mpa=400.0, method="gerber") is None
+
+    def test_explicit_nonfinite_endurance_is_not_silently_estimated(self):
+        assert fatigue_anchor(200.0, -200.0, ultimate_mpa=400.0,
+                              endurance_mpa=float("inf")) is None
+
+    def test_degenerate_sn_line_returns_none_instead_of_dividing_by_zero(self):
+        # Se == 0.9*Sut makes the two log-line anchor points coincide.
+        assert fatigue_anchor(380.0, -380.0, ultimate_mpa=400.0,
+                              endurance_mpa=360.0) is None
+
+    def test_overflowing_stress_range_returns_none(self):
+        assert fatigue_anchor(1e308, -1e308, ultimate_mpa=400.0) is None

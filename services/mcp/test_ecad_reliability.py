@@ -188,8 +188,53 @@ def test_band_and_deflection_math() -> None:
     # Z_rms(in) = 9.8*G/f^2 -> mm x3: at 100 Hz, 10 Grms -> 3*9.8*25.4*10/1e4 mm.
     z = deflection_3sigma_mm(10.0, 100.0)
     assert abs(z - 3.0 * 9.8 * 25.4 * 10.0 / 1e4) < 1e-12
-    assert deflection_3sigma_mm(1.0, 0.0) == 0.0
+    try:
+        deflection_3sigma_mm(1.0, 0.0)
+        raise AssertionError("zero frequency must be rejected")
+    except ValueError:
+        pass
     print("  [band_and_deflection_math] PASS")
+
+
+def test_invalid_inputs_and_exact_limit() -> None:
+    for args in (
+            ([100.0, float("nan")], 20.0, 2000.0),
+            ([100.0, 90.0], 20.0, 2000.0)):
+        try:
+            band_split(*args)
+            raise AssertionError(f"invalid modal frequencies accepted: {args[0]}")
+        except ValueError:
+            pass
+    try:
+        detect_mount_holes({}, [[0.0, 0.0, -1.0]])
+        raise AssertionError("negative mounting-hole diameter must be rejected")
+    except ValueError:
+        pass
+
+    board = {"bbox_mm": [0.0, 0.0, 100.0, 100.0], "thickness_mm": 1.6}
+    component = {
+        "ref": "U1", "fpid": "Package:SOIC-8", "pos_mm": [50.0, 50.0],
+        "angle_deg": 0.0,
+        "body": {"shape": "box", "l_mm": 5.0, "w_mm": 4.0, "h_mm": 1.5},
+        "fea": {"rect_mm": [47.5, 48.0, 52.5, 52.0]},
+    }
+    exact_limit_mm = (
+        0.00022 * (100.0 / 25.4)
+        / ((1.6 / 25.4) * math.sqrt(5.0 / 25.4)) * 25.4
+    )
+    exact = steinberg_screen([component], board, exact_limit_mm)
+    assert exact["table"][0]["pass"] is True, exact
+
+    tools = _tools()
+    for kwargs in (
+            {"n_modes": 0},
+            {"zeta": float("nan")},
+            {"mesh_fineness": -0.1},
+            {"psd_breakpoints": [[20.0, 0.04]]},
+            {"psd_breakpoints": [[20.0, 0.04], [10.0, 0.04]]}):
+        result = _call(tools, "ecad_vibe_check", **kwargs)
+        assert result["ok"] is False and result.get("error"), (kwargs, result)
+    print("  [invalid_inputs_and_exact_limit] PASS")
 
 
 # --------------------------------------------------------------------------- tool legs
@@ -307,6 +352,7 @@ def main() -> None:
     test_detect_mount_holes()
     test_steinberg_screen_pure()
     test_band_and_deflection_math()
+    test_invalid_inputs_and_exact_limit()
     test_dry_run()
     test_no_mounts_error()
     test_live_solve_and_heavy_regression()

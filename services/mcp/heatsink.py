@@ -186,9 +186,27 @@ def parametric_candidates(footprint_l_mm: float, footprint_w_mm: float,
 
 
 def tim_resistance_c_per_w(t_mm: float, k_w_mk: float, area_mm2: float) -> float:
-    """Bondline resistance R = t / (k A)."""
-    return (float(t_mm) * 1e-3) / (max(float(k_w_mk), 1e-9)
-                                   * max(float(area_mm2), 1e-9) * 1e-6)
+    """Bondline resistance ``R = t / (k A)`` for physically valid TIM inputs."""
+    values: dict[str, float] = {}
+    for name, value in (("t_mm", t_mm), ("k_w_mk", k_w_mk),
+                        ("area_mm2", area_mm2)):
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a finite number, got {value!r}")
+        try:
+            finite = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"{name} must be a finite number, got {value!r}") from None
+        if not math.isfinite(finite):
+            raise ValueError(f"{name} must be finite, got {value!r}")
+        values[name] = finite
+    if values["t_mm"] < 0.0:
+        raise ValueError("t_mm must be >= 0")
+    if values["k_w_mk"] <= 0.0:
+        raise ValueError("k_w_mk must be > 0")
+    if values["area_mm2"] <= 0.0:
+        raise ValueError("area_mm2 must be > 0")
+    return (values["t_mm"] * 1e-3) / (
+        values["k_w_mk"] * values["area_mm2"] * 1e-6)
 
 
 def library_candidates(env_name: str, h_w_m2k: float,
@@ -291,6 +309,18 @@ def heatsink_select_impl(component_ref: str,
     tool both call this; the MCP tool wraps with json.dumps.
     """
     warnings: list = []
+    try:
+        # Validate the public TIM inputs before context/candidate work. In particular,
+        # NaN must never flow through comparisons and masquerade as a winning score.
+        tim_resistance_c_per_w(tim_t_mm, tim_k_w_mk, 1.0)
+        tim_t_mm = float(tim_t_mm)
+        tim_k_w_mk = float(tim_k_w_mk)
+    except ValueError as exc:
+        return {"ok": False, "error": f"invalid TIM physics: {exc}",
+                "warnings": [],
+                "hint": "Use a finite non-negative bondline thickness and a finite "
+                        "positive TIM conductivity.",
+                "next_actions": []}
     ctx = et._THERMAL.get("last_ctx")
     if not isinstance(ctx, dict):
         return {"ok": False, "error": "no thermal context — run ecad_thermal_handoff() first",
@@ -325,7 +355,16 @@ def heatsink_select_impl(component_ref: str,
     fea = rec["fea"]
     rect = fea["rect_mm"]
     fp_l, fp_w = rect[2] - rect[0], rect[3] - rect[1]
-    a_top_mm2 = float(fea["top_area_mm2"])
+    try:
+        a_top_mm2 = float(fea["top_area_mm2"])
+        tim_resistance_c_per_w(tim_t_mm, tim_k_w_mk, a_top_mm2)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {"ok": False,
+                "error": f"invalid TIM/contact physics for {component_ref}: {exc}",
+                "warnings": warnings,
+                "hint": "The component top contact area must be finite and > 0 before "
+                        "heatsink candidates can be ranked.",
+                "next_actions": []}
     theta_jc = (rec.get("theta_c_per_w") or {}).get("jc")
 
     target_kind = "tj" if tj_target_c is not None else "t_case"
@@ -531,10 +570,10 @@ def heatsink_select_from_params(params: dict) -> dict:
         component_ref=str(p.get("component_ref") or ""),
         tj_target_c=p.get("tj_target_c"),
         t_case_target_c=p.get("t_case_target_c"),
-        tim_t_mm=float(p.get("tim_t_mm") if p.get("tim_t_mm") is not None
-                       else TIM_T_MM_DEFAULT),
-        tim_k_w_mk=float(p.get("tim_k_w_mk") if p.get("tim_k_w_mk") is not None
-                         else TIM_K_W_MK_DEFAULT),
+        tim_t_mm=(p.get("tim_t_mm") if p.get("tim_t_mm") is not None
+                  else TIM_T_MM_DEFAULT),
+        tim_k_w_mk=(p.get("tim_k_w_mk") if p.get("tim_k_w_mk") is not None
+                    else TIM_K_W_MK_DEFAULT),
         include_library=bool(p.get("include_library", True)),
         include_parametric=bool(p.get("include_parametric", True)),
         max_candidates=int(p.get("max_candidates") or 8),
@@ -663,15 +702,29 @@ def _resolve_candidate(cb, ctx: dict, conv_builder, fixtures: list, material: di
         return {"ok": False, "error": str(exc)}
     if not res.get("ok"):
         return {"ok": False, "error": res.get("error", "solve failed")}
-    rows = et.map_component_temps([rec], mesh["points"],
-                                  res.get("temperature") or [],
-                                  res.get("envelope_max"))
+    try:
+        rows = et.map_component_temps([rec], mesh["points"],
+                                      res.get("temperature") or [],
+                                      res.get("envelope_max"))
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "error": f"invalid thermal result: {exc}"}
     row = rows[0] if rows else {}
-    summary = res.get("summary", {})
+    t_case = row.get("t_case_c")
+    tj = row.get("tj_c")
+    if not row.get("mapped") or not isinstance(t_case, (int, float)) or not math.isfinite(t_case):
+        return {"ok": False,
+                "error": row.get("map_status") or "thermal result did not map to the candidate"}
+    if tj is not None and (not isinstance(tj, (int, float)) or not math.isfinite(tj)):
+        return {"ok": False, "error": "thermal result produced a non-finite junction temperature"}
+    summary = res.get("summary")
+    if not isinstance(summary, dict):
+        return {"ok": False, "error": "thermal result is missing its summary"}
+    board_max = summary.get("final_max_temp_c", summary.get("max_temp_c"))
+    if not isinstance(board_max, (int, float)) or not math.isfinite(board_max):
+        return {"ok": False, "error": "thermal result is missing a finite board maximum"}
     return {"ok": True,
             "h_eff_w_m2k": round(h_eff, 1),
-            "t_case_c": row.get("t_case_c"),
-            "tj_c": row.get("tj_c"),
-            "board_max_temp_c": summary.get("final_max_temp_c",
-                                            summary.get("max_temp_c")),
+            "t_case_c": t_case,
+            "tj_c": tj,
+            "board_max_temp_c": board_max,
             "summary": summary}

@@ -103,11 +103,15 @@ def _normalize_solids(stl_path: Optional[str], solids: Optional[List[dict]],
     if not solids:
         if not stl_path:
             raise ValueError("build_cht_case needs stl_path or a non-empty solids list")
-        return [{"name": "part", "stl_path": stl_path,
-                 "kappa_w_mk": solid_kappa, "power_w": power_w}]
+        solids = [{"name": "part", "stl_path": stl_path,
+                   "kappa_w_mk": solid_kappa, "power_w": power_w}]
+    if not isinstance(solids, list) or not solids:
+        raise ValueError("solids must be a non-empty list")
     out: List[dict] = []
     seen: set = set()
     for i, s in enumerate(solids):
+        if not isinstance(s, dict):
+            raise ValueError("each CHT solid must be a mapping")
         name = _sanitize_region(s.get("name") or f"solid{i}")
         if name in seen:
             raise ValueError(f"duplicate CHT solid region name {name!r}")
@@ -115,9 +119,18 @@ def _normalize_solids(stl_path: Optional[str], solids: Optional[List[dict]],
         sp = s.get("stl_path")
         if not sp:
             raise ValueError(f"CHT solid {name!r} has no stl_path")
-        out.append({"name": name, "stl_path": str(sp),
-                    "kappa_w_mk": float(s.get("kappa_w_mk", s.get("kappa", solid_kappa))),
-                    "power_w": float(s.get("power_w", 0.0))})
+        kappa = float(s.get("kappa_w_mk", s.get("kappa", solid_kappa)))
+        heat = float(s.get("power_w", power_w if len(solids) == 1 else 0.0))
+        density = float(s.get("density_kgm3", 2700.0))
+        cp = float(s.get("specific_heat_j_kgk", s.get("cp_j_kgk", 900.0)))
+        if (not all(math.isfinite(v) for v in (kappa, heat, density, cp)) or
+                kappa <= 0.0 or density <= 0.0 or cp <= 0.0 or heat < 0.0):
+            raise ValueError(
+                f"CHT solid {name!r} needs positive finite conductivity, density and heat "
+                "capacity, and non-negative power")
+        out.append({"name": name, "stl_path": str(sp), "kappa_w_mk": kappa,
+                    "power_w": heat, "density_kgm3": density,
+                    "specific_heat_j_kgk": cp})
     return out
 
 
@@ -132,21 +145,40 @@ def build_cht_case(case_dir: str, stl_path: Optional[str] = None,
     Single solid: pass ``stl_path`` (+ ``solid_kappa`` / ``power_w``) as before.
     Multi solid (T-FIN19): pass ``solids=[{name, stl_path, kappa_w_mk, power_w}, ...]``.
     """
-    pre = _PRESETS.get(preset, _PRESETS["coarse"])
+    if preset not in _PRESETS:
+        raise ValueError(f"unknown OpenFOAM preset {preset!r}")
+    pre = _PRESETS[preset]
     case = Path(case_dir)
+    vals = [speed_mps, aoa_deg, sideslip_deg, inlet_temp_c]
+    if not all(math.isfinite(float(v)) for v in vals) or float(speed_mps) <= 0.0:
+        raise ValueError("CHT speed must be positive; angles and inlet temperature must be finite")
+    speed_mps = float(speed_mps)
+    aoa_deg = float(aoa_deg)
+    sideslip_deg = float(sideslip_deg)
+    inlet_temp_c = float(inlet_temp_c)
+    d = np.asarray(direction, dtype=np.float64)
+    if d.shape != (3,) or not np.isfinite(d).all() or np.linalg.norm(d) <= 1e-12:
+        raise ValueError("direction must be a finite non-zero 3-vector")
     f = {"density_kgm3": 1.225, "kinematic_visc_m2s": 1.5e-5}
-    if fluid:
+    if fluid is not None:
+        if not isinstance(fluid, dict):
+            raise ValueError("fluid must be a mapping")
         f.update({k: v for k, v in fluid.items() if v is not None})
-    rho = float(f["density_kgm3"]) or 1.225
-    nu = float(f["kinematic_visc_m2s"]) or 1.5e-5
+    rho = float(f["density_kgm3"])
+    nu = float(f["kinematic_visc_m2s"])
+    if not math.isfinite(rho) or rho <= 0.0 or not math.isfinite(nu) or nu <= 0.0:
+        raise ValueError("fluid density and kinematic viscosity must be positive and finite")
     mu = nu * rho
-    Tin = inlet_temp_c + 273.15
-
+    Tin = float(inlet_temp_c) + 273.15
+    if not math.isfinite(Tin) or Tin <= 0.0:
+        raise ValueError("CHT inlet temperature must be above absolute zero")
     sol = _normalize_solids(stl_path, solids, solid_kappa, power_w)
     names = [s["name"] for s in sol]
     total_w = sum(s["power_w"] for s in sol)
+    if not math.isfinite(total_w) or total_w <= 0.0:
+        raise ValueError("CHT case needs a finite positive total heat source")
 
-    flow_dir = _compose_flow_dir(np.asarray(direction, float), aoa_deg, sideslip_deg)
+    flow_dir = _compose_flow_dir(d, float(aoa_deg), float(sideslip_deg))
 
     # Load every solid, force watertight, rotate ALL with the same alignment R (from the
     # combined geometry) so the shared frame transform in CHTInfo holds for all regions.
@@ -155,8 +187,10 @@ def build_cht_case(case_dir: str, stl_path: Optional[str] = None,
         m = trimesh.load(s["stl_path"], force="mesh")
         if not isinstance(m, trimesh.Trimesh):
             raise ValueError(f"STL {s['stl_path']} did not load as a single mesh")
+        if m.vertices.size == 0 or m.faces.size == 0 or not np.isfinite(m.vertices).all():
+            raise ValueError(f"STL {s['stl_path']} is empty or contains non-finite vertices")
         if not m.is_watertight:
-            m.fill_holes()        # CHT needs closed solids to define the inside cellZones
+            raise ValueError(f"STL {s['stl_path']} must be watertight for a CHT solid region")
         meshes.append(m)
     combined = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
     _, R = _align_to_x(combined, flow_dir)
@@ -173,6 +207,8 @@ def build_cht_case(case_dir: str, stl_path: Optional[str] = None,
     bb_min, bb_max = aligned_all.bounds
     size = bb_max - bb_min
     longest = float(np.max(size))
+    if not math.isfinite(longest) or longest <= 1e-9:
+        raise ValueError("CHT geometry has a degenerate bounding box")
     char_len_m = longest * 1e-3
     reynolds = speed_mps * char_len_m / nu
 
@@ -204,9 +240,16 @@ def build_cht_case(case_dir: str, stl_path: Optional[str] = None,
     k0 = 1.5 * (_TI * U) ** 2
     om0 = math.sqrt(k0) / (_CMU ** 0.25 * max(0.07 * char_len_m, 1e-6))
 
-    # ~3 fluid flow-through times is enough for the near-body flow (hence solid T) to converge.
-    flow_through = (box_size[0]) / max(U, 1e-3)
-    end_time = max(0.05, round(3.0 * flow_through, 4))
+    # Run for at least five flow-through and solid thermal-diffusion time scales. Three
+    # time constants left the coupled residual above the production 1e-3 acceptance gate
+    # on small electronics cases; five reaches the same physical steady-state criterion.
+    flow_through = box_size[0] / U
+    thermal_times = [
+        char_len_m * char_len_m * s["density_kgm3"] *
+        s["specific_heat_j_kgk"] / s["kappa_w_mk"] for s in sol
+    ]
+    physics_horizon = 5.0 * max([flow_through, *thermal_times])
+    end_time = math.nextafter(max(0.05, physics_horizon), math.inf)
 
     _write_blockmesh(case, box_min, box_max, nx, ny, nz)
     _write_cht_snappy(case, pre["refine"], fluid_seed, names, seeds_m)
@@ -221,7 +264,8 @@ def build_cht_case(case_dir: str, stl_path: Optional[str] = None,
     _write_fluid_system(case, names)
     _write_fluid_fields(case, U, k0, om0, Tin, names)
     for s in sol:
-        _write_solid_constant(case, s["name"], s["kappa_w_mk"])
+        _write_solid_constant(case, s["name"], s["kappa_w_mk"],
+                              s["density_kgm3"], s["specific_heat_j_kgk"])
         _write_solid_system(case, s["name"], s["power_w"])
         _write_solid_fields(case, s["name"], Tin)
 
@@ -234,7 +278,8 @@ def build_cht_case(case_dir: str, stl_path: Optional[str] = None,
         interface_solid=f"{first}_to_fluid",
         solid_regions=tuple(names),
         solids=tuple({"name": s["name"], "kappa_w_mk": s["kappa_w_mk"],
-                      "power_w": s["power_w"]} for s in sol),
+                      "power_w": s["power_w"], "density_kgm3": s["density_kgm3"],
+                      "specific_heat_j_kgk": s["specific_heat_j_kgk"]} for s in sol),
     )
 
 
@@ -314,16 +359,19 @@ def _write_fluid_constant(case: Path, mu: float, rho: float, names: List[str]) -
            "radiation off;\nradiationModel none;\n")
 
 
-def _write_solid_constant(case: Path, name: str, kappa: float) -> None:
-    # Real conductivity; artificially low rho*Cp so the transient reaches steady fast (the
-    # steady temperature is independent of thermal mass).
+def _write_solid_constant(case: Path, name: str, kappa: float,
+                          density: float, cp: float) -> None:
     _w(case / "constant" / name / "thermophysicalProperties",
-       _header("dictionary", "thermophysicalProperties", "constant/" + name) +
-       "thermoType\n{\n    type heSolidThermo; mixture pureMixture; transport constIso; thermo hConst;\n"
-       "    equationOfState rhoConst; specie specie; energy sensibleEnthalpy;\n}\n"
-       "mixture\n{\n    specie { molWeight 27; }\n"
-       f"    transport {{ kappa {kappa:.6g}; }}\n"
-       "    thermodynamics { Hf 0; Cp 10; }\n    equationOfState { rho 10; }\n}\n")
+       _header("dictionary", "thermophysicalProperties", f"constant/{name}") +
+       "thermoType\n{\n    type heSolidThermo;\n    mixture pureMixture;\n"
+       "    transport constIso;\n    thermo hConst;\n    equationOfState rhoConst;\n"
+       "    specie specie;\n    energy sensibleEnthalpy;\n}\n"
+       "mixture\n{\n"
+       f"    transport {{ kappa {kappa:.8g}; }}\n"
+       "    specie { molWeight 1; }\n"
+       f"    thermodynamics {{ Hf 0; Cp {cp:.8g}; }}\n"
+       f"    equationOfState {{ rho {density:.8g}; }}\n"
+       "}\n")
 
 
 def _write_g(case: Path) -> None:
@@ -337,8 +385,8 @@ def _write_g(case: Path) -> None:
 def _write_control_dict(case: Path, end_time: float) -> None:
     _w(case / "system" / "controlDict", _header("dictionary", "controlDict", "system") +
        "application chtMultiRegionFoam;\nstartFrom startTime; startTime 0; stopAt endTime;\n"
-       f"endTime {end_time:.6g}; deltaT 1e-4; writeControl adjustableRunTime; "
-       f"writeInterval {end_time:.6g}; purgeWrite 2;\n"
+       f"endTime {end_time!r}; deltaT 1e-4; writeControl adjustableRunTime; "
+       f"writeInterval {end_time!r}; purgeWrite 2;\n"
        "writeFormat ascii; writePrecision 7; runTimeModifiable true;\n"
        "adjustTimeStep yes; maxCo 5; maxDi 50; maxDeltaT 0.01;\n")
 
@@ -375,8 +423,10 @@ def _write_fluid_system(case: Path, names: List[str]) -> None:
        '    "(U|h|k|omega).*" { solver PBiCGStab; preconditioner DILU; tolerance 1e-7; relTol 0.1; }\n}\n'
        'PIMPLE { momentumPredictor on; nNonOrthogonalCorrectors 0; nCorrectors 2; transonic no; }\n'
        'relaxationFactors { equations { ".*" 1; } }\n')
-    _w(case / "system" / "fluid" / "fvOptions", _header("dictionary", "fvOptions", "system/fluid") +
-       "limitT\n{\n    type limitTemperature;\n    selectionMode all;\n    min 250;\n    max 1500;\n}\n")
+    # Do not clamp temperature with limitTemperature: clipping a divergent or
+    # genuinely out-of-range field would turn it into a finite-looking success.
+    _w(case / "system" / "fluid" / "fvOptions",
+       _header("dictionary", "fvOptions", "system/fluid"))
 
 
 def _write_solid_system(case: Path, name: str, power_w: float) -> None:
@@ -435,13 +485,13 @@ def _write_fluid_fields(case: Path, U: float, k0: float, om0: float, Tin: float,
        f"dimensions [0 2 -2 0 0 0 0];\ninternalField uniform {k0:.6g};\nboundaryField\n{{\n"
        f"    inlet {{ type fixedValue; value uniform {k0:.6g}; }}\n"
        f"    outlet {{ type inletOutlet; inletValue uniform {k0:.6g}; value uniform {k0:.6g}; }}\n"
-       "    sides { type slip; }\n"
+       "    sides { type zeroGradient; }\n"
        + per_iface("type kqRWallFunction; value uniform %g;" % k0) + "}\n")
     _w(z / "omega", _header("volScalarField", "omega", "0/fluid") +
        f"dimensions [0 0 -1 0 0 0 0];\ninternalField uniform {om0:.6g};\nboundaryField\n{{\n"
        f"    inlet {{ type fixedValue; value uniform {om0:.6g}; }}\n"
        f"    outlet {{ type inletOutlet; inletValue uniform {om0:.6g}; value uniform {om0:.6g}; }}\n"
-       "    sides { type slip; }\n"
+       "    sides { type zeroGradient; }\n"
        + per_iface("type omegaWallFunction; value uniform %g;" % om0) + "}\n")
     _w(z / "nut", _header("volScalarField", "nut", "0/fluid") +
        "dimensions [0 2 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField\n{\n"

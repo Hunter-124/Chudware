@@ -15,11 +15,8 @@ Complements test_thermal_transient.py — cases here pin DIFFERENT closed-form t
      convection vs 1-D fin theory with adiabatic tip:
      θ(L)/θ_b = 1/cosh(mL),  m = √(hP/(kA))             (Incropera Table 3.4 case B)
 
-Note on facesets: convection node sets are built PER PLANE. A single merged set that
-spans several boundary planes makes interior diagonal faces (all 3 corners boundary
-nodes on different planes) count as "surface" in the element-face enumeration — the
-kernel's documented node-set semantics, not a solver bug — which inflates the film
-area on coarse meshes.
+Boundary node sets may span several planes. Only true exterior tetrahedron faces are
+loaded; shared interior faces are excluded even when all three corners belong to the set.
 """
 
 from __future__ import annotations
@@ -29,6 +26,7 @@ import os
 import sys
 
 import numpy as np
+import pytest
 
 # realpath: pytest may collect this file through a symlinked package dir
 # (e.g. services/engine -> engine_oracle); dirname() without resolving
@@ -40,6 +38,26 @@ if _ROOT not in sys.path:
 
 from services.sim.fea_thermal_transient import (  # noqa: E402
     Convection, FluxLoad, box_mesh, solve_transient)
+
+
+def _lumped_capacity(pts, tets, rho_cp):
+    c = np.zeros(len(pts))
+    for el in tets:
+        a, b, cc, d = pts[el[0]], pts[el[1]], pts[el[2]], pts[el[3]]
+        vol = abs(np.linalg.det(np.stack([b - a, cc - a, d - a]))) / 6.0
+        c[el] += rho_cp * vol / 4.0
+    return c
+
+
+def _exterior_faces(tets):
+    faces = {}
+    local = ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3))
+    for el in tets:
+        for f in local:
+            cn = tuple(int(el[i]) for i in f)
+            key = tuple(sorted(cn))
+            faces.setdefault(key, []).append(cn)
+    return [owners[0] for owners in faces.values() if len(owners) == 1]
 
 
 def test_semi_infinite_solid_probe_matches_erf_solution():
@@ -71,15 +89,10 @@ def test_adiabatic_flux_heatup_conserves_energy_exactly():
     t_end = 5.0
     pts, tets, x0, _ = box_mesh(L, b, b, 6, 2, 2)
     r = solve_transient(pts, tets, k, [], [], [FluxLoad(nodes=x0, q=q)], [], rho_cp,
-                        t_end=t_end, dt=t_end / 50.0, t_init=T0)
+                        t_end=t_end, dt=0.7, t_init=T0)
     assert r.ok, r.error
     _, T = r.frames[-1]
-    # Lumped nodal capacitances c_i = Σ_tets rho_cp·V/4 (row-sum lumping, tet4).
-    c = np.zeros(len(pts))
-    for el in tets:
-        a, bb, cc, d = pts[el[0]], pts[el[1]], pts[el[2]], pts[el[3]]
-        vol = abs(np.linalg.det(np.stack([bb - a, cc - a, d - a]))) / 6.0
-        c[el] += rho_cp * vol / 4.0
+    c = _lumped_capacity(pts, tets, rho_cp)
     V, A = L * b * b, b * b
     # First law: ΔU = ρcp·V·ΔT_mean = E_in = q·A·t  →  ΔT_mean = q·A·t/(ρcp·V).
     dT_mean_ref = q * A * t_end / (rho_cp * V)
@@ -87,6 +100,67 @@ def test_adiabatic_flux_heatup_conserves_energy_exactly():
     assert abs(c.sum() - rho_cp * V) / (rho_cp * V) < 1e-12   # lumping partitions V
     assert abs(dT_mean_got - dT_mean_ref) / dT_mean_ref < 1e-9, \
         f"energy balance {dT_mean_got} vs {dT_mean_ref}"
+
+
+def test_merged_surface_flux_counts_only_exterior_area():
+    lx, ly, lz = 12.0, 8.0, 5.0
+    k, rho_cp, q, t0 = 0.05, 0.004, 0.01, 20.0
+    t_end = 1.3
+    pts, tets, _, _ = box_mesh(lx, ly, lz, 3, 2, 2)
+    result = solve_transient(
+        pts, tets, k, [], [],
+        [FluxLoad(nodes=list(range(len(pts))), q=q)], [], rho_cp,
+        t_end=t_end, dt=0.5, t_init=t0)
+    assert result.ok, result.error
+    _, temperatures = result.frames[-1]
+    c = _lumped_capacity(pts, tets, rho_cp)
+    exterior_area = 2.0 * (lx * ly + lx * lz + ly * lz)
+    energy_gain = float(np.dot(c, temperatures - t0))
+    assert energy_gain == pytest.approx(q * exterior_area * t_end, rel=1e-10)
+
+
+def test_convection_energy_loss_matches_backward_euler_boundary_flux():
+    lx, ly, lz = 10.0, 7.0, 4.0
+    k, rho_cp, h = 0.05, 0.004, 0.002
+    t0, t_amb, t_end = 80.0, 20.0, 0.3
+    pts, tets, _, _ = box_mesh(lx, ly, lz, 2, 2, 2)
+    result = solve_transient(
+        pts, tets, k, [], [], [],
+        [Convection(nodes=list(range(len(pts))), h=h, t_amb=t_amb)],
+        rho_cp, t_end=t_end, dt=1.0, t_init=t0)
+    assert result.ok, result.error
+    _, temperatures = result.frames[-1]
+    c = _lumped_capacity(pts, tets, rho_cp)
+    heat_loss_rate = 0.0
+    for cn in _exterior_faces(tets):
+        a, b, cc = pts[list(cn)]
+        area = 0.5 * float(np.linalg.norm(np.cross(b - a, cc - a)))
+        heat_loss_rate += h * area * float(np.mean(temperatures[list(cn)] - t_amb))
+    energy_change = float(np.dot(c, temperatures - t0))
+    assert energy_change < 0.0
+    assert energy_change == pytest.approx(-t_end * heat_loss_rate, rel=1e-10)
+
+
+def test_malformed_or_undriven_transient_setup_fails_closed():
+    pts, tets, x0, _ = box_mesh(10.0, 5.0, 5.0, 2, 1, 1)
+    no_driver = solve_transient(
+        pts, tets, 0.05, [], [], [], [], 0.004,
+        t_end=1.0, dt=0.1, t_init=20.0)
+    assert no_driver.ok is False
+    assert "boundary or heat source" in no_driver.error
+
+    zero_source = solve_transient(
+        pts, tets, 0.05, [], [], [FluxLoad(nodes=x0, q=0.0)], [], 0.004,
+        t_end=1.0, dt=0.1, t_init=20.0)
+    assert zero_source.ok is False
+    assert "non-zero" in zero_source.error
+
+    nonfinite_film = solve_transient(
+        pts, tets, 0.05, [], [], [],
+        [Convection(nodes=x0, h=float("nan"), t_amb=20.0)], 0.004,
+        t_end=1.0, dt=0.1, t_init=20.0)
+    assert nonfinite_film.ok is False
+    assert "finite" in nonfinite_film.error
 
 
 def test_fin_steady_limit_matches_1d_fin_theory():

@@ -133,6 +133,7 @@ def test_hoses_to_piping_valid_doc_exact_bores():
     # runs are spaced so endpoint snapping cannot merge lines
     ys = {r["path"][0][1] for r in pdoc["runs"]}
     assert len(ys) == 2
+    assert pdoc["runs"][0]["connections"] == _circuit()["hoses"][0]["connections"]
 
 
 def test_hoses_to_piping_line_overrides_beat_hose_fields():
@@ -167,6 +168,12 @@ def test_estimate_line_dp_turbulent_and_bad_inputs():
                               rho=998.0, mu=1.0e-3)  # water → turbulent
     assert est["ok"] and est["reynolds"] > 4000 and est["friction"] < 0.06
     assert not ht.estimate_line_dp(flow_lpm=0, id_mm=12.7, length_mm=1)["ok"]
+    assert not ht.estimate_line_dp(
+        flow_lpm=10, id_mm=12.7, length_mm=1, rho=math.nan)["ok"]
+    assert not ht.estimate_line_dp(
+        flow_lpm=10, id_mm=12.7, length_mm=1, mu=0)["ok"]
+    assert not ht.estimate_line_dp(
+        flow_lpm=float("1e308"), id_mm=12.7, length_mm=1)["ok"]
 
 
 # ── group 2: envelopes ────────────────────────────────────────────────────────
@@ -184,6 +191,7 @@ def test_piping_handoff_envelope_valid_and_inline_doc():
     assert {e["quantity"] for e in env["expectations"]} == \
         {"pressure_drop:r1", "pressure_drop:r2"}
     assert env["meta"]["boundary"] == net["boundary"]
+    assert "independent" in env["meta"]["topology_model"]
 
 
 def _mock_solve_from(net, factor=1.0):
@@ -207,6 +215,19 @@ def test_verify_piping_envelope_pass_and_fail():
     assert sh.validate_envelope(bad_env) == []
     assert not bad_env["pass"] and all(not c["pass"] for c in checks)
     assert bad_env["verdict"].startswith("FAIL")
+
+    partial = _mock_solve_from(net)
+    partial["links"].pop()
+    partial_env, partial_checks = ht._verify_piping_envelope(env, partial, 30.0)
+    assert not partial_env["pass"]
+    assert len(partial_checks) == 2 and any(not c["pass"] for c in partial_checks)
+    assert partial_env["warnings"]
+
+    edge_factor = 1.0 / (1.0 - 0.30004)
+    edge_env, edge_checks = ht._verify_piping_envelope(
+        env, _mock_solve_from(net, edge_factor), 30.0)
+    assert edge_checks[0]["deviation_pct"] == 30.0
+    assert edge_checks[0]["pass"] and edge_env["pass"]
 
 
 def test_fea_handoff_envelope_forces_and_cases():
@@ -252,6 +273,30 @@ def test_verify_fea_envelope_pass_direction_warning_and_fail():
                                  fea_result={"summary": {"min_fos": 2.4}})
     assert v3["pass"]
     assert v3["advisories"][0]["detail"]["min_fos"] == 2.4
+
+    missing = json.loads(json.dumps(env))
+    missing["conditions"] = [
+        c for c in missing["conditions"]
+        if c.get("case") != "retract_max_pressure"
+    ]
+    assert not ht._verify_fea_envelope(missing, 0.5)["pass"]
+
+    duplicate = json.loads(json.dumps(env))
+    duplicate["conditions"].append(json.loads(json.dumps(duplicate["conditions"][0])))
+    assert not ht._verify_fea_envelope(duplicate, 0.5)["pass"]
+
+    missing_axis = json.loads(json.dumps(env))
+    missing_axis["meta"].pop("axis")
+    assert not ht._verify_fea_envelope(missing_axis, 0.5)["pass"]
+
+    rounded_edge = json.loads(json.dumps(env))
+    for condition in rounded_edge["conditions"]:
+        if condition.get("case") == "extend_max_pressure":
+            condition["value"] = [
+                component * 1.005004 for component in condition["value"]]
+    edge_verify = ht._verify_fea_envelope(rounded_edge, 0.5)
+    assert edge_verify["checks"][0]["deviation_pct"] == 0.5
+    assert edge_verify["checks"][0]["pass"]
 
 
 # ── group 3: pump-margin feedback ─────────────────────────────────────────────
@@ -308,7 +353,14 @@ def test_tool_verify_piping_with_mock_solve():
     assert res["ok"] and res["pass"]
     assert sh.validate_envelope(res["simhandoff"]) == []
     assert res["simhandoff"]["kind"] == "verify"
-    assert res["margin"]["pump_margin_solved_bar"] is not None
+    assert res["margin"]["pump_margin_solved_bar"] is None
+    assert all(v["pump_margin_solved_bar"] is not None
+               for v in res["margin"]["per_line"].values())
+
+    mock_solve["converged"] = False
+    rejected = json.loads(tools["hydraulic_verify_piping"](
+        handoff=handoff_res["simhandoff"], solve_result=mock_solve))
+    assert not rejected["ok"]
 
 
 @pytest.mark.skipif(not _HAVE_CORE, reason="libchudware not staged — tool bodies are core RPCs")
@@ -340,6 +392,11 @@ def test_tool_fea_handoff_input_guards():
         bore_mm=50.0, max_pressure_bar=200.0, rod_mm=60.0))["ok"]
     assert not json.loads(tools["hydraulic_fea_handoff"](
         bore_mm=50.0, max_pressure_bar=200.0, axis=[0, 0, 0]))["ok"]
+    assert not json.loads(tools["hydraulic_fea_handoff"](
+        bore_mm=50.0, max_pressure_bar=200.0,
+        load_face="same", fixture_face="same"))["ok"]
+    assert not json.loads(tools["hydraulic_fea_handoff"](
+        bore_mm=50.0, max_pressure_bar=200.0, target_doc_id=42))["ok"]
 
 
 # ── group 5: piping_solve consumes the handoff ────────────────────────────────
@@ -369,6 +426,14 @@ def test_network_from_handoff_rejects_bad_envelopes():
     _, _, _, errs = pt.network_from_handoff(env2)
     assert any("inline piping doc" in e for e in errs)
     assert any("boundary missing" in e for e in errs)
+
+    for key, value in (
+            ("coupling", "piping_to_cfd"),
+            ("source", {"domain": "motion", "tool": "motion_fea_handoff"}),
+            ("target", {"domain": "fea", "tool": "run_fea_static"})):
+        wrong = json.loads(json.dumps(env))
+        wrong[key] = value
+        assert pt.network_from_handoff(wrong)[3]
 
 
 @pytest.mark.skipif(not _HAVE_CORE, reason="libchudware not staged — live 1D solve skipped")

@@ -1,4 +1,4 @@
-// core/sim/flow_run.h — geometry -> wind-tunnel LBM (drag/lift) in one call.
+// core/sim/flow_run.h — geometry -> wind-tunnel LBM forces in one call.
 //
 // Bridges triangle geometry to the D3Q19 LBM kernel (lbm.h): voxelize the triangle soup into a
 // Cartesian solid mask sized for a wind-tunnel domain, derive lattice params from a PHYSICAL inlet
@@ -35,9 +35,9 @@ struct FlowParams {
 };
 
 // Run a wind-tunnel LBM over the given bodies. Each body is a triangle soup: positions = flat
-// 3*nverts (mm), indices = flat 3*ntris into that body's positions. Returns the LbmResult
-// (drag_n, lift_n, cd, frontal_area_mm2, ...) plus reynolds in .error="" on success. ok=false with
-// an error string on a bad mesh / oversized domain / diverged solve. Never throws.
+// 3*nverts (mm), indices = flat 3*ntris into that body's positions. Returns all three
+// force components plus fields/diagnostics and writes Reynolds through the optional pointer.
+// Bad geometry, unstable setup, non-convergence, and divergence return ok=false; never throws.
 LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                           const std::vector<std::vector<uint32_t>>& body_idx,
                           const FlowParams& fp, double* reynolds_out = nullptr);
@@ -62,7 +62,6 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
 // cp_min, cp_max, vmax_mps, solver_notes, scalar_fields (empty). NOT PORTED: the overlay
 // package (flow_overlay AICM / streamlines / slice PNGs) — the result carries
 // "overlay_pending": true and no overlay_aicm; the panel degrades to forces-only.
-// side_n is 0.0: the C++ kernel's momentum exchange reports drag/lift only.
 // Failures return {"ok": false, "error", "code", "message"} (never throws).
 nlohmann::json run_flow_stl(const nlohmann::json& params);
 

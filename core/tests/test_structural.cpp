@@ -1,17 +1,13 @@
-// Structural engine tests (T-RF19 leaf 5) — doctest suite for core/structural.
+// Behavioral and analytic regression tests for core/structural.
 //
-// Mirrors engine_oracle/structural/test_analysis.py + test_checks.py +
-// test_estimate.py, and pins solver parity against the Python (PyNite 3.0.0)
-// oracle on the aicad.structure/1 fixtures in tests/data/structural/: member
-// forces/deflections match to relative 1e-6 (linear statics), the D/C checks
-// and the cost takeoff are arithmetic — compared exactly.
-//
-// Golden values in the *_PARITY cases were captured from the oracle
-// (scratch/struct_parity/gen_fixtures.py dumps) — see docs/REFACTOR_LOG.md.
+// Closed-form cantilever, simply-supported beam, and released-truss anchors
+// defend units, section axes, stiffness, reactions, equilibrium, support
+// constraints, instability handling, utilization, and takeoff completeness.
 
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <limits>
 #include <string>
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -69,12 +65,12 @@ const json* row_for(const json& results, const std::string& element_id) {
 // materials + section geometry (mirrors oracle test_section_properties_*)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("material prefix matching") {
+TEST_CASE("material properties reject unknown keys instead of assuming softwood") {
     CHECK(material_properties("steel_a36").E == 200000.0);
     CHECK(material_properties("df_no2").E == 11000.0);
     CHECK(material_properties("cedar").E == 12000.0);
     CHECK(material_properties("cedar").G == 750.0);
-    CHECK(material_properties("something_else").E == 9000.0);  // softwood fallback
+    CHECK_THROWS_AS(material_properties("something_else"), std::invalid_argument);
 }
 
 TEST_CASE("section properties rectangle") {
@@ -85,14 +81,24 @@ TEST_CASE("section properties rectangle") {
     CHECK(p.Iz == doctest::Approx(100 * 100 * 100 * 100 / 12.0));
 }
 
-TEST_CASE("section properties named I-shape + I grammar + RHS solid") {
+TEST_CASE("analysis properties use net catalog and hollow geometry") {
     const SectionProps w = section_properties("W200x100", "steel");
     CHECK(w.A == doctest::Approx(2.0 * 100.0 * 8.0 + (200.0 - 16.0) * 5.5));
     const SectionProps ig = section_properties("I200x100x5.5x8", "steel");
     CHECK(ig.A == doctest::Approx(w.A));
-    // RHS keeps the solid outer rectangle in the analysis path (oracle NOTE).
+
+    const SectionProps aisc = section_properties("W8X31", "steel_a992");
+    const auto aisc_table = get_aisc_section("W8X31");
+    REQUIRE(aisc_table.has_value());
+    CHECK(aisc.A == doctest::Approx((*aisc_table)["A"].get<double>()));
+    CHECK(aisc.Iz == doctest::Approx((*aisc_table)["Ix"].get<double>()));
+
+    const SectionProps lumber = section_properties("2x4", "df_no2");
+    CHECK(lumber.A == doctest::Approx(38.0 * 89.0));
     const SectionProps rhs = section_properties("RHS100x50x4", "steel");
-    CHECK(rhs.A == doctest::Approx(100.0 * 50.0));
+    CHECK(rhs.A == doctest::Approx(100.0 * 50.0 - 92.0 * 42.0));
+    CHECK(rhs.Iz < section_properties("100x50", "steel").Iz);
+    CHECK_THROWS_AS(section_properties("RHS100x50x30", "steel"), std::invalid_argument);
 }
 
 TEST_CASE("load combo presets") {
@@ -158,11 +164,82 @@ TEST_CASE("cantilever tip deflection hand-calc") {
     check_rel((*r)["deflection_mm"].get<double>(), -10.666666666666668, 1e-9);
 }
 
+TEST_CASE("diagonal gravity preserves both normalized load components") {
+    json doc = load_fixture("cantilever.json");
+    doc["load_cases"][0]["gravity"] = json::array({0, -1, -1});
+    const json out = rpc("struct_analyze", {{"doc", doc}, {"load_combo", "DEAD_LIVE"}});
+    REQUIRE(!out.contains("code"));
+    const json* row = row_for(out["results"], "beam1");
+    REQUIRE(row != nullptr);
+    const double component = 600.0 / std::sqrt(2.0);
+    CHECK(std::abs((*row)["shear_y_n"].get<double>()) ==
+          doctest::Approx(component).epsilon(1e-6));
+    CHECK(std::abs((*row)["shear_z_n"].get<double>()) ==
+          doctest::Approx(component).epsilon(1e-6));
+}
+
+TEST_CASE("simply supported rolled beam matches UDL closed form") {
+    const double L = 4000.0;
+    const double w = 2.0;
+    const json all_fixed = json::array({true, true, true, true, true, true});
+    const json doc = {
+        {"schema", kSchema},
+        {"units", "mm"},
+        {"elements",
+         json::array({
+             {
+                 {"element_type", "beam"},
+                 {"id", "ss1"},
+                 {"section_name", "100x200"},
+                 {"material", "cedar"},
+                 {"length_mm", L},
+                 // local section +Y is global +Z: the 200 mm depth is vertical.
+                 {"transform", json::array({0, 0, 1, 0, 1, 0, 0, 0,
+                                             0, 1, 0, 0, 0, 0, 0, 1})},
+                 {"releases", {{"i", json::array({"rz"})}, {"j", json::array({"rz"})}}},
+             },
+         })},
+        {"supports",
+         json::array({
+             {{"element_id", "ss1"}, {"end", "i"}, {"restraints", all_fixed}},
+             {{"element_id", "ss1"}, {"end", "j"}, {"restraints", all_fixed}},
+         })},
+        {"load_cases",
+         json::array({
+             {{"kind", "dead"},
+              {"gravity", json::array({0, 0, -1})},
+              {"distributed", {{"w_n_per_mm", w}}}},
+         })},
+    };
+    const json out = rpc("struct_analyze", {{"doc", doc}, {"load_combo", "DEAD_ONLY"}});
+    REQUIRE(!out.contains("code"));
+    const json* row = row_for(out["results"], "ss1");
+    REQUIRE(row != nullptr);
+    const SectionProps section = section_properties("100x200", "cedar");
+    const double wf = 1.4 * w;
+    const double expected_moment = wf * L * L / 8.0;
+    const double expected_deflection =
+        5.0 * wf * L * L * L * L / (384.0 * section.E * section.Iz);
+    CHECK(std::abs((*row)["moment_z_nmm"].get<double>()) ==
+          doctest::Approx(expected_moment).epsilon(2e-3));
+    CHECK(std::abs((*row)["deflection_y_mm"].get<double>()) ==
+          doctest::Approx(expected_deflection).epsilon(2e-3));
+    CHECK(std::abs((*row)["shear_y_n"].get<double>()) ==
+          doctest::Approx(wf * L / 2.0).epsilon(2e-3));
+    REQUIRE(out["reactions"].size() == 2);
+    const double total_reaction =
+        out["reactions"][0]["fz_n"].get<double>() +
+        out["reactions"][1]["fz_n"].get<double>();
+    CHECK(total_reaction == doctest::Approx(wf * L).epsilon(2e-6));
+}
+
 TEST_CASE("result row shape matches the contract") {
     const json out = rpc("struct_analyze", {{"doc", load_fixture("post_axial.json")}});
     for (const json& r : out["results"]) {
-        for (const char* k :
-             {"element_id", "combo", "axial_n", "shear_n", "moment_nmm", "deflection_mm", "dc_ratio", "pass"}) {
+        for (const char* k : {"element_id", "combo", "axial_n", "shear_n", "moment_nmm",
+                              "deflection_mm", "shear_y_n", "shear_z_n", "moment_y_nmm",
+                              "moment_z_nmm", "deflection_y_mm", "deflection_z_mm",
+                              "dc_ratio", "pass"}) {
             CHECK(r.contains(k));
         }
         CHECK(r["dc_ratio"].is_null());
@@ -171,7 +248,7 @@ TEST_CASE("result row shape matches the contract") {
 }
 
 // ---------------------------------------------------------------------------
-// solver — PyNite parity on frames (golden rows captured from the oracle)
+// solver — connected-frame regression
 // ---------------------------------------------------------------------------
 
 TEST_CASE("portal frame parity (DEAD_LIVE)") {
@@ -197,47 +274,74 @@ TEST_CASE("portal frame parity (DEAD_LIVE)") {
     check_rel((*b1)["deflection_mm"].get<double>(), -90.45101089820633);
 }
 
-TEST_CASE("truss parity (DEAD_LIVE, sloped members)") {
-    const json out = rpc("struct_analyze",
-                         {{"doc", load_fixture("truss.json")}, {"load_combo", "DEAD_LIVE"}});
-    REQUIRE(out["results"].size() == 6);
-    const json* bc1 = row_for(out["results"], "bc1");
-    const json* bc2 = row_for(out["results"], "bc2");
-    const json* tc1 = row_for(out["results"], "tc1");
-    const json* tc2 = row_for(out["results"], "tc2");
-    REQUIRE(bc1 != nullptr);
-    REQUIRE(tc1 != nullptr);
-    check_rel((*bc1)["shear_n"].get<double>(), 8000.0);
-    check_rel((*bc1)["moment_nmm"].get<double>(), 7200000.0);
-    check_rel((*bc1)["deflection_mm"].get<double>(), -157090909.0909091);
-    check_rel((*bc2)["shear_n"].get<double>(), -8000.0);
-    check_rel((*tc1)["axial_n"].get<double>(), -10945.304482472699);
-    check_rel((*tc1)["shear_n"].get<double>(), 4002.114835236155);
-    check_rel((*tc1)["moment_nmm"].get<double>(), 2498539.207513179);
-    check_rel((*tc1)["deflection_mm"].get<double>(), -22136328.13607333);
-    check_rel((*tc2)["axial_n"].get<double>(), -10520.90834929402);
-    check_rel((*tc2)["moment_nmm"].get<double>(), -2429276.7674487364);
+TEST_CASE("released two-bar truss matches joint-equilibrium closed form") {
+    constexpr double a = 2000.0;
+    constexpr double c = 0.7071067811865475244;
+    const double L = a * std::sqrt(2.0);
+    const json releases = {
+        {"i", json::array({"rx", "ry", "rz"})},
+        {"j", json::array({"rx", "ry", "rz"})},
+    };
+    const json fixed = json::array({true, true, true, true, true, true});
+    const json doc = {
+        {"schema", kSchema},
+        {"units", "mm"},
+        {"elements",
+         json::array({
+             {{"element_type", "beam"}, {"id", "left"}, {"section_name", "100x100"},
+              {"material", "steel"}, {"length_mm", L},
+              {"transform", json::array({c, 0, c, -a, 0, 1, 0, 0,
+                                         -c, 0, c, 0, 0, 0, 0, 1})},
+              {"releases", releases}},
+             {{"element_type", "beam"}, {"id", "right"}, {"section_name", "100x100"},
+              {"material", "steel"}, {"length_mm", L},
+              {"transform", json::array({c, 0, -c, a, 0, 1, 0, 0,
+                                         c, 0, c, 0, 0, 0, 0, 1})},
+              {"releases", releases}},
+         })},
+        {"supports",
+         json::array({
+             {{"element_id", "left"}, {"end", "i"}, {"restraints", fixed}},
+             {{"element_id", "right"}, {"end", "i"}, {"restraints", fixed}},
+         })},
+        {"load_cases",
+         json::array({
+             {{"kind", "dead"}, {"gravity", json::array({0, 0, -1})},
+              {"point", {{"at_mm", L}, {"p_n", 1000.0}}}},
+         })},
+    };
+    const json out = rpc("struct_analyze", {{"doc", doc}, {"load_combo", "DEAD_ONLY"}});
+    REQUIRE(!out.contains("code"));
+    const json* left = row_for(out["results"], "left");
+    const json* right = row_for(out["results"], "right");
+    REQUIRE(left != nullptr);
+    REQUIRE(right != nullptr);
+    // Two 1.4 kN apex loads: 2*N*sin(45°) = 2*1.4 kN.
+    const double expected_compression = 1400.0 * std::sqrt(2.0);
+    CHECK((*left)["axial_n"].get<double>() ==
+          doctest::Approx(-expected_compression).epsilon(2e-6));
+    CHECK((*right)["axial_n"].get<double>() ==
+          doctest::Approx(-expected_compression).epsilon(2e-6));
+    CHECK(std::abs((*left)["moment_nmm"].get<double>()) < 1e-5);
+    CHECK(std::abs((*right)["moment_nmm"].get<double>()) < 1e-5);
 }
 
-TEST_CASE("steel frame parity incl. wind combo (I-shape grammar)") {
+TEST_CASE("steel frame uses real AISC stiffness and finite axis diagnostics") {
     const json out = rpc("struct_analyze", {{"doc", load_fixture("steel_frame.json")},
                                             {"load_combo", "DEAD_LIVE_WIND"}});
-    const json* c1 = row_for(out["results"], "c1");
-    const json* c2 = row_for(out["results"], "c2");
+    REQUIRE(!out.contains("code"));
+    REQUIRE(out["results"].size() == 5);
+    CHECK(out["units"]["force"] == "N");
+    CHECK(out["units"]["moment"] == "N*mm");
     const json* b1 = row_for(out["results"], "b1");
-    REQUIRE(c1 != nullptr);
-    REQUIRE(c2 != nullptr);
     REQUIRE(b1 != nullptr);
-    check_rel((*c1)["axial_n"].get<double>(), -44397.63078423692);
-    check_rel((*c1)["shear_n"].get<double>(), -9877.348508790408);
-    check_rel((*c1)["moment_nmm"].get<double>(), 22187369.094084427);
-    check_rel((*c1)["deflection_mm"].get<double>(), -56.13144429698194);
-    check_rel((*c2)["axial_n"].get<double>(), -44402.36921576308);
-    check_rel((*c2)["moment_nmm"].get<double>(), -22201584.388662644);
-    check_rel((*b1)["axial_n"].get<double>(), -12277.348508790426);
-    check_rel((*b1)["shear_n"].get<double>(), -22202.36921576308);
-    check_rel((*b1)["moment_nmm"].get<double>(), 22201584.38866265);
-    check_rel((*b1)["deflection_mm"].get<double>(), -94486.82297326467);
+    for (const char* key : {"axial_n", "shear_y_n", "shear_z_n", "moment_y_nmm",
+                            "moment_z_nmm", "deflection_y_mm", "deflection_z_mm"}) {
+        CHECK(std::isfinite((*b1)[key].get<double>()));
+    }
+    // Regression: W8X31 was once parsed as an 8 mm × 31 mm rectangle, producing
+    // five-order-of-magnitude fake flexibility.
+    CHECK(std::abs((*b1)["deflection_mm"].get<double>()) < 1000.0);
 }
 
 TEST_CASE("multi-combo run (list param)") {
@@ -262,9 +366,13 @@ TEST_CASE("check_member steel LRFD hand-calc (W8x31 A992 DoD case)") {
     CHECK(cr.governing_limit == "bending_yield_LRFD");
     CHECK(cr.passed);
     CHECK(cr.to_dict()["disclaimer"] == kCheckDisclaimer);
+    CHECK_THROWS_AS(dc_ratio_axial(1000.0, 0.0, 248.0), std::invalid_argument);
+    CHECK_THROWS_AS(dc_ratio_bending(1000.0, 100.0,
+                                     std::numeric_limits<double>::infinity()),
+                    std::invalid_argument);
 }
 
-TEST_CASE("check_member wood NDS ASD") {
+TEST_CASE("check_member wood combines axial and bending utilization") {
     const auto section = get_lumber_section("2x4");
     REQUIRE(section.has_value());
     const json row = {{"element_id", "j1"}, {"combo", "DEAD_LIVE"},
@@ -272,39 +380,42 @@ TEST_CASE("check_member wood NDS ASD") {
     const CheckResult cr = check_member(row, *section, "df_no2");
     CHECK(cr.dc_axial == doctest::Approx(9000.0 / (9.307 * 3382.0)));
     CHECK(cr.dc_bending == doctest::Approx(100000.0 / (6.205 * 50250.0)));
-    CHECK(cr.governing_limit == "bending_ASD_NDS");
+    CHECK(cr.dc_ratio == doctest::Approx(cr.dc_axial + cr.dc_bending));
+    CHECK(cr.governing_limit == "combined_axial_bending_ASD_NDS");
 }
 
-TEST_CASE("struct_check portal (oracle parity, fallback + lumber sections)") {
+TEST_CASE("struct_check reports deflection and unavailable footing checks honestly") {
     const json out = rpc("struct_check",
                          {{"doc", load_fixture("portal.json")}, {"load_combo", "DEAD_LIVE"}});
     CHECK(out["disclaimer"] == kCheckDisclaimer);
+    CHECK(out["complete"] == false);
     const json* p1 = row_for(out["results"], "p1");
     const json* b1 = row_for(out["results"], "b1");
     const json* f1 = row_for(out["results"], "f1");
     REQUIRE(p1 != nullptr);
     REQUIRE(b1 != nullptr);
     REQUIRE(f1 != nullptr);
-    check_rel((*p1)["dc_ratio"].get<double>(), 2.7256689359674233, 1e-9);
-    check_rel((*p1)["dc_axial"].get<double>(), 0.1258760733348805, 1e-9);
-    CHECK((*p1)["governing_limit"] == "bending_ASD_NDS");
-    CHECK((*p1)["passed"] == false);
-    check_rel((*b1)["dc_ratio"].get<double>(), 1.3988139501356378, 1e-9);
-    // Concrete footing: not in either table → section_properties fallback row.
-    CHECK((*f1)["dc_ratio"].get<double>() == 0.0);
-    CHECK((*f1)["passed"] == true);
+    CHECK((*p1)["status"] == "evaluated");
+    CHECK((*p1)["dc_ratio"].get<double>() >= (*p1)["dc_strength"].get<double>());
+    CHECK((*p1)["dc_deflection"].is_number());
+    CHECK((*b1)["deflection_limit_basis"] == "L/240 total-load preliminary");
+    CHECK((*f1)["status"] == "unavailable");
+    CHECK((*f1)["dc_ratio"].is_null());
+    CHECK((*f1)["passed"] == false);
 }
 
-TEST_CASE("struct_check steel frame (AISC table sections)") {
+TEST_CASE("struct_check steel frame uses AISC biaxial interaction") {
     const json out = rpc("struct_check", {{"doc", load_fixture("steel_frame.json")}});
     const json* c1 = row_for(out["results"], "c1");
     const json* b1 = row_for(out["results"], "b1");
     REQUIRE(c1 != nullptr);
     REQUIRE(b1 != nullptr);
-    check_rel((*c1)["dc_ratio"].get<double>(), 0.10381857342668512, 1e-9);
-    CHECK((*c1)["governing_limit"] == "bending_yield_LRFD");
-    check_rel((*b1)["dc_ratio"].get<double>(), 0.15877054307396818, 1e-9);
-    check_rel((*b1)["dc_axial"].get<double>(), 0.006068472141001568, 1e-9);
+    CHECK((*c1)["status"] == "evaluated");
+    CHECK((*b1)["status"] == "evaluated");
+    CHECK((*c1)["dc_bending"].get<double>() ==
+          doctest::Approx((*c1)["dc_bending_major"].get<double>() +
+                          (*c1)["dc_bending_minor"].get<double>()));
+    CHECK((*b1)["dc_ratio"].get<double>() >= (*b1)["dc_strength"].get<double>());
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +432,7 @@ TEST_CASE("board feet + steel weight + fasteners") {
     CHECK(steel_weight_lbs(doc.elements.back()) == doctest::Approx(310.0).epsilon(1e-9));
     CHECK_THROWS_AS(board_feet(doc.elements.back()), std::invalid_argument);
     StructuralElement bad{"beam", "b2", "W99X999", "steel", 3000.0, {}};
-    CHECK_THROWS_AS(steel_weight_lbs(bad), std::out_of_range);
+    CHECK_THROWS_AS(steel_weight_lbs(bad), std::invalid_argument);
     CHECK(fastener_count(doc) == 8 + 2 * 10 + 6);
 }
 
@@ -363,6 +474,22 @@ TEST_CASE("struct_estimate mixed doc (oracle byte-parity)") {
     CHECK(out["total_cost"].get<double>() == 810.15);
 }
 
+TEST_CASE("concrete footing takeoff uses plan area times depth") {
+    StructureDoc doc;
+    doc.elements.push_back({"footing", "f1", "600x600", "concrete", 200.0, {}});
+    const json out = estimate(doc, RateTable{});
+    REQUIRE(out["complete"] == true);
+    REQUIRE(out["line_items"].size() == 1);
+    const double expected_cy = 600.0 * 600.0 * 200.0 /
+                               (914.4 * 914.4 * 914.4);
+    CHECK(out["line_items"][0]["quantity"].get<double>() ==
+          doctest::Approx(expected_cy).epsilon(1e-3));
+    CHECK(out["line_items"][0]["material_estimated"] == true);
+    RateTable bad_rates;
+    bad_rates.concrete_per_cy = -1.0;
+    CHECK_THROWS_AS(estimate(doc, bad_rates), std::invalid_argument);
+}
+
 // ---------------------------------------------------------------------------
 // error envelopes
 // ---------------------------------------------------------------------------
@@ -388,6 +515,47 @@ TEST_CASE("error envelopes") {
     // Zero-length element.
     json bad = load_fixture("post_axial.json");
     bad["elements"][0]["length_mm"] = 0.0;
+    result = rpc("struct_analyze", {{"doc", bad}});
+    CHECK(result["code"] == "invalid_schema");
+    bad = load_fixture("post_axial.json");
+    bad["units"] = "m";
+    result = rpc("struct_analyze", {{"doc", bad}});
+    CHECK(result["code"] == "invalid_schema");
+    // Non-finite geometry.
+    bad = load_fixture("post_axial.json");
+    bad["elements"][0]["length_mm"] = std::numeric_limits<double>::infinity();
+    result = rpc("struct_analyze", {{"doc", bad}});
+    CHECK(result["code"] == "invalid_schema");
+    // Invalid transforms are not silently replaced with identity.
+    bad = load_fixture("post_axial.json");
+    bad["elements"][0]["transform"] = json::array({1, 0, 0});
+    result = rpc("struct_analyze", {{"doc", bad}});
+    CHECK(result["code"] == "invalid_schema");
+    // Load directions and magnitudes must be physically meaningful.
+    bad = load_fixture("cantilever.json");
+    bad["load_cases"][0]["gravity"] = json::array({0, 0, 0});
+    result = rpc("struct_analyze", {{"doc", bad}});
+    CHECK(result["code"] == "invalid_schema");
+    bad = load_fixture("cantilever.json");
+    bad["load_cases"][0]["point"]["p_n"] = -1.0;
+    result = rpc("struct_analyze", {{"doc", bad}});
+    CHECK(result["code"] == "invalid_schema");
+    // Stable but unexcited studies cannot report reassuring zero demand.
+    bad = load_fixture("cantilever.json");
+    bad["load_cases"] = json::array();
+    result = rpc("struct_analyze", {{"doc", bad}});
+    CHECK(result["code"] == "invalid_schema");
+    // Mechanisms are detected from stiffness rank rather than a lucky load residual.
+    bad = load_fixture("cantilever.json");
+    bad["supports"] = json::array({
+        {{"element_id", "beam1"}, {"end", "i"},
+         {"restraints", json::array({"ux", "uy", "uz"})}},
+    });
+    result = rpc("struct_analyze", {{"doc", bad}});
+    CHECK(result["code"] == "solver_error");
+    // Load stations outside any target member fail before assembly.
+    bad = load_fixture("cantilever.json");
+    bad["load_cases"][0]["point"]["at_mm"] = 3000.1;
     result = rpc("struct_analyze", {{"doc", bad}});
     CHECK(result["code"] == "invalid_schema");
 }

@@ -3,6 +3,7 @@
 // Sutherland gases). Envelope strings match the oracle byte-for-byte.
 #include "piping/fluid_properties.h"
 
+#include <cmath>
 #include <algorithm>
 #include <cctype>
 
@@ -95,12 +96,16 @@ ojson builtin_props(const std::string& canon, double T, double P) {
               py_float(g->T_ref) + " K, S=" + py_float(g->S) +
               " K; White VFF Table 1-2 / CRC)";
     }
-    if (T <= 0) {
-        return jerr("absolute temperature must be > 0 K (got " + py_float(T) + ")");
+    if (!std::isfinite(T) || T <= 0) {
+        return jerr("absolute temperature must be finite and > 0 K (got " +
+                    py_float(T) + ")");
     }
     const double rho = P * g->M / (R_UNIVERSAL * T);  // ideal gas, Z≈1
     const double mu =
         g->mu_ref * std::pow(T / g->T_ref, 1.5) * (g->T_ref + g->S) / (T + g->S);
+    if (!std::isfinite(rho) || rho <= 0 || !std::isfinite(mu) || mu <= 0) {
+        return jerr("fluid property calculation overflowed");
+    }
     ojson out = ojson::object();
     out["rho"] = rho;
     out["mu"] = mu;
@@ -146,12 +151,14 @@ ojson fluid_properties(const ojson& name, double T, double P, const ojson& prefe
                     "supported: water, air, methane, natural_gas, nitrogen, "
                     "carbon_dioxide");
     }
-    if (T <= 0) {
-        return jerr("absolute temperature must be > 0 K (got " + py_float(T) + ")",
+    if (!std::isfinite(T) || T <= 0) {
+        return jerr("absolute temperature must be finite and > 0 K (got " +
+                        py_float(T) + ")",
                     "pass T in kelvin, e.g. T=293.15 for 20 °C");
     }
-    if (P <= 0) {
-        return jerr("absolute pressure must be > 0 Pa (got " + py_float(P) + ")",
+    if (!std::isfinite(P) || P <= 0) {
+        return jerr("absolute pressure must be finite and > 0 Pa (got " +
+                        py_float(P) + ")",
                     "pass P in pascals absolute, e.g. P=101325 for 1 atm");
     }
 
@@ -192,26 +199,64 @@ ojson resolve_solver_fluid(const ojson& fluid) {
         out["molar_mass"] = nullptr;
         return out;
     }
-    if (fluid.is_object() && fluid.contains("rho") && fluid.contains("mu")) {
-        ojson out = fluid;  // used verbatim (explicit override)
-        if (!out.contains("name")) out["name"] = fluid.value("name", std::string("custom"));
+    if (fluid.is_object() && (fluid.contains("rho") || fluid.contains("mu"))) {
+        const ojson rho_j = fluid.value("rho", ojson(nullptr));
+        const ojson mu_j = fluid.value("mu", ojson(nullptr));
+        if (!rho_j.is_number() || !mu_j.is_number() ||
+            !std::isfinite(rho_j.get<double>()) ||
+            !std::isfinite(mu_j.get<double>()) ||
+            rho_j.get<double>() <= 0 || mu_j.get<double>() <= 0) {
+            return jerr("custom fluid rho and mu must both be finite numbers > 0",
+                        "rho is kg/m3 and dynamic mu is Pa*s");
+        }
+        for (const char* key : {"pvap", "molar_mass", "T_K", "P_Pa"}) {
+            const ojson value = fluid.value(key, ojson(nullptr));
+            if (!value.is_null() &&
+                (!value.is_number() || !std::isfinite(value.get<double>()))) {
+                return jerr(std::string("custom fluid ") + key +
+                            " must be a finite number or null");
+            }
+        }
+        if (fluid.value("pvap", ojson(0.0)).is_number() &&
+            fluid.value("pvap", ojson(0.0)).get<double>() < 0) {
+            return jerr("custom fluid pvap must be >= 0 Pa");
+        }
+        if (!fluid.value("molar_mass", ojson(nullptr)).is_null() &&
+            fluid["molar_mass"].get<double>() <= 0) {
+            return jerr("custom fluid molar_mass must be > 0 kg/mol");
+        }
+        for (const char* key : {"T_K", "P_Pa"}) {
+            const ojson value = fluid.value(key, ojson(nullptr));
+            if (!value.is_null() && value.get<double>() <= 0) {
+                return jerr(std::string("custom fluid ") + key + " must be > 0");
+            }
+        }
+        ojson out = fluid;
+        if (!out.contains("name")) out["name"] = "custom";
         if (!out.contains("source")) out["source"] = "caller-supplied rho/mu";
-        if (!out.contains("pvap")) out["pvap"] = fluid.value("pvap", ojson(nullptr));
-        if (!out.contains("phase")) out["phase"] = fluid.value("phase", std::string("liquid"));
+        if (!out.contains("pvap")) out["pvap"] = nullptr;
+        if (!out.contains("phase")) out["phase"] = "liquid";
         return out;
     }
     if (fluid.is_object() && fluid.contains("name")) {
         double T = 293.15;
-        bool have_T = false;
         if (fluid.contains("T") && !fluid["T"].is_null()) {
-            T = pyutil::to_double(fluid["T"]);
-            have_T = true;
+            if (!fluid["T"].is_number())
+                return jerr("fluid T must be a finite number in kelvin");
+            T = fluid["T"].get<double>();
+        } else if (fluid.contains("T_C") && !fluid["T_C"].is_null()) {
+            if (!fluid["T_C"].is_number())
+                return jerr("fluid T_C must be a finite number in degrees C");
+            T = fluid["T_C"].get<double>() + T0_C;
         }
-        if (!have_T && fluid.contains("T_C")) {
-            T = pyutil::to_double(fluid["T_C"]) + T0_C;
-            have_T = true;
+        double P = P_ATM;
+        if (fluid.contains("P") && !fluid["P"].is_null()) {
+            if (!fluid["P"].is_number())
+                return jerr("fluid P must be a finite absolute pressure in Pa");
+            P = fluid["P"].get<double>();
         }
-        const double P = fluid.contains("P") ? pyutil::to_double(fluid["P"]) : P_ATM;
+        if (!std::isfinite(T) || !std::isfinite(P))
+            return jerr("fluid temperature and pressure must be finite");
         const ojson prefer = fluid.value("prefer", ojson(nullptr));
         const ojson p = fluid_properties(fluid["name"], T, P, prefer);
         if (!p.value("ok", false)) return p;

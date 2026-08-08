@@ -154,6 +154,38 @@ def test_build_case_max_iters_clamp_thermal():
     cd_txt = (Path(case) / "system" / "controlDict").read_text()
     assert "endTime         90;" in cd_txt
 
+def test_transient_cht_rejects_unsupported_iteration_cap():
+    from services.sim.openfoam import run_openfoam_tunnel
+
+    with pytest.raises(ValueError, match="not supported by transient CHT"):
+        run_openfoam_tunnel(
+            "unused.stl", max_steps=20,
+            thermal={"enabled": True, "mode": "conjugate"})
+
+
+def test_solver_log_parsers_track_convergence_and_nonfinite_forces():
+    from services.sim.openfoam import _cht_line, _solve_line
+
+    events = []
+    state = {"converged": False, "last_time": None, "invalid_output": None}
+    parse = _solve_line(lambda *args, **kwargs: events.append((args, kwargs)),
+                        100, 2.0, state)
+    parse("Time = 12")
+    parse("Cd: nan")
+    parse("SIMPLE solution converged in 12 iterations")
+    assert state["last_time"] == 12.0
+    assert state["converged"] is True
+    assert "non-finite" in state["invalid_output"]
+
+    cht_state = {"last_time": None, "current_residual": None}
+    parse_cht = _cht_line(lambda *args, **kwargs: None, 1.0, cht_state)
+    parse_cht("Time = 1")
+    parse_cht("smoothSolver:  Solving for T, Initial residual = 2e-5, Final residual = 1e-9")
+    parse_cht("smoothSolver:  Solving for Ux, Initial residual = 3e-4, Final residual = 1e-8")
+    assert cht_state["last_time"] == 1.0
+    assert cht_state["current_residual"] == pytest.approx(3e-4)
+
+
 
 # ---------------------------------------------------------------------------
 # runner availability: clean detection, clean refusal

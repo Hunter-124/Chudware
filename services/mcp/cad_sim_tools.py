@@ -13,15 +13,16 @@ from .cad_common import (
     require_list,
     require_mapping,
     _autosave_all_open,
+    _canonical_material_keys,
     _default_conductivity,
     _default_specific_heat,
     _doc,
     _dumps,
     _err,
-    _first_temperature,
     _merge_face_sets,
     _persist_study,
     _resolve_face_points,
+    _resolve_material_name,
     _resolve_material,
     _sid_match,
     _solve_sync_or_handoff,
@@ -92,11 +93,9 @@ _BC_SHAPE_HELP = ('accepted shapes: {"face": <query>, "force": [fx,fy,fz]} (N, w
 # mapped onto the dimensionless mesh_fineness). Every rename here is echoed in the tool's
 # `interpreted` channel, so the model can see what its key was read as.
 
-# Keys of a raw geometry QUERY / query-result match dict. Such a dict is passed straight to
-# the engine query grammar (core/doc/picks.h) and is NOT a BC wrapper, so it is never
-# key-checked: {"of":"face","side":"bottom"}, {"sid":...}, {"kind":"face","surf":"plane",...}.
-_QUERY_DICT_KEYS = frozenset({"of", "kind", "surf", "sid", "centroid", "hint_index",
-                              "area_or_len", "owner_feature"})
+# A raw geometry query has no `face`/`faces` wrapper key and is passed through unchanged,
+# e.g. {"of":"face","side":"bottom"} or {"kind":"face","surf":"plane",...}. Once a dict
+# carries a face-reference wrapper, every sibling is a BC field and is checked below.
 
 # The canonical keys a fixtures/loads/hot_faces/cold_faces item may carry, i.e. exactly the
 # keys the solver payload builders below and in run_fea_thermal actually READ.
@@ -147,6 +146,31 @@ _ITEM_KEY_ALIASES: dict[str, str] = {
 _FACE_REF_NORMS = frozenset(
     {"face", "faces"} | {n for n, c in _ITEM_KEY_ALIASES.items() if c in ("face", "faces")})
 
+# A dict with no face reference can still plainly be a boundary-condition wrapper: the
+# malformed live load carried type/magnitude/direction but omitted only its face. Detect those
+# shapes so they receive the face-reference diagnostic instead of being mistaken for a raw
+# geometry query. `kind="face"` remains a raw query; kind/type alone is a wrapper only when its
+# value names a boundary-condition kind.
+_BC_WRAPPER_TYPES = frozenset({
+    "fixed", "clamped", "encastre", "roller", "force", "pressure",
+})
+
+
+def _is_bc_wrapper(entry: dict) -> bool:
+    norms = {_norm_key(key) for key in entry}
+    if norms & _FACE_REF_NORMS:
+        return True
+    for norm in norms:
+        canon = _ITEM_KEY_ALIASES.get(norm, _CANON_ITEM_BY_NORM.get(norm))
+        if canon not in (None, "face", "faces", "type"):
+            return True
+    for key, value in entry.items():
+        norm = _norm_key(key)
+        canon = _ITEM_KEY_ALIASES.get(norm, _CANON_ITEM_BY_NORM.get(norm))
+        if canon == "type" and str(value).strip().lower() in _BC_WRAPPER_TYPES:
+            return True
+    return False
+
 # Face-RELATIVE direction words. See _norm_direction: these are REFUSED, not resolved.
 _FACE_RELATIVE_DIRS = frozenset({
     "normal", "facenormal", "normaltoface", "surfacenormal", "alongnormal", "alongthenormal",
@@ -159,21 +183,132 @@ def _norm_key(name) -> str:
     """Fold a dict key for matching: case / underscore / dash / space are noise."""
     return str(name).lower().replace("_", "").replace("-", "").replace(" ", "")
 
+_CANON_ITEM_BY_NORM = {_norm_key(k): k for k in _BC_ITEM_KEYS}
+_CANON_LABEL_BY_NORM = {_norm_key(k): k for k in _BC_ITEM_LABELS}
+
+def _finite_float(value, where: str) -> float:
+    """A real finite scalar, with the public argument named in the error."""
+    if isinstance(value, bool):
+        raise ValueError(f"{where} must be a finite number, got {value!r}.")
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{where} must be a finite number, got {value!r}.") from None
+    if not math.isfinite(out):
+        raise ValueError(f"{where} must be finite, got {value!r}.")
+    return out
+
+
+def _positive_int(value, where: str) -> int:
+    """A strictly-positive integer; do not silently truncate 3.7 to 3."""
+    if isinstance(value, bool):
+        raise ValueError(f"{where} must be a positive integer, got {value!r}.")
+    try:
+        out = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{where} must be a positive integer, got {value!r}.") from None
+    try:
+        exact = float(value)
+    except (TypeError, ValueError, OverflowError):
+        exact = float(out)
+    if out <= 0 or not math.isfinite(exact) or exact != out:
+        raise ValueError(f"{where} must be a positive integer, got {value!r}.")
+    return out
+
+
+_MATERIAL_INPUT_KEY_NORMS = frozenset({
+    "name", "e", "empa", "youngsmodulusmpa", "youngmodulusmpa",
+    "elasticmodulusmpa", "nu", "poisson", "poissonsratio", "poissonratio",
+    "yieldmpa", "yieldstrengthmpa", "sigmaympa", "densitygcm3", "density",
+    "rhogcm3", "ultimatempa", "endurancempa", "conductivitywmk", "kwmk",
+    "cpjkgk",
+})
+
+_THERMAL_MATERIAL_KEYS = {
+    "conductivitywmk": "conductivity_w_mk",
+    "kwmk": "conductivity_w_mk",
+    "cpjkgk": "cp_j_kgk",
+}
+
+
+def _canonical_thermal_material_keys(material: dict) -> dict:
+    """Canonicalize the thermal fields without invoking mechanical-property validation."""
+    mechanical = _canonical_material_keys(material)
+    out: dict = {}
+    aliased: dict = {}
+    for key, value in mechanical.items():
+        canon = _THERMAL_MATERIAL_KEYS.get(_norm_key(key))
+        if canon is None:
+            out[key] = value
+        elif key == canon:
+            out[canon] = value
+        else:
+            aliased[canon] = value
+    for canon, value in aliased.items():
+        out.setdefault(canon, value)
+    return out
+
+
+def _resolve_study_material(material, analysis: str, *,
+                            conductivity_w_mk=None, specific_heat_j_kgk=None) -> dict:
+    """Resolve a material and enforce only the properties the selected physics consumes."""
+    raw = coerce_json_or_repr(material)
+    if isinstance(raw, dict):
+        unknown = [k for k in raw if _norm_key(k) not in _MATERIAL_INPUT_KEY_NORMS]
+        if unknown:
+            raise ValueError(
+                f"material has unsupported properties {unknown!r}; refusing to ignore them. "
+                "Use E_mpa, nu, density_g_cm3, yield_mpa, ultimate_mpa, endurance_mpa, "
+                "conductivity_w_mk/k_w_mk, or cp_j_kgk.")
+
+    thermal = analysis in ("thermal_steady", "thermal_transient")
+    explicit = isinstance(raw, dict)
+    if thermal:
+        resolved = raw if explicit else _resolve_material_name(raw)
+        mat = _canonical_thermal_material_keys(resolved)
+        if conductivity_w_mk is not None:
+            mat["conductivity_w_mk"] = conductivity_w_mk
+        elif not explicit and mat.get("conductivity_w_mk") is None:
+            mat["conductivity_w_mk"] = _default_conductivity(mat, raw)
+        if analysis == "thermal_transient":
+            if specific_heat_j_kgk is not None:
+                mat["cp_j_kgk"] = specific_heat_j_kgk
+            elif not explicit and mat.get("cp_j_kgk") is None:
+                mat["cp_j_kgk"] = _default_specific_heat(mat, raw)
+    else:
+        mat = _resolve_material(raw)
+
+    required_by_analysis = {
+        "static": ("E_mpa", "nu", "yield_mpa"),
+        "fatigue": ("E_mpa", "nu", "yield_mpa", "ultimate_mpa", "endurance_mpa"),
+        "modal": ("E_mpa", "nu", "density_g_cm3"),
+        "frequency_response": ("E_mpa", "nu", "density_g_cm3"),
+        "thermal_steady": ("conductivity_w_mk",),
+        "thermal_transient": ("density_g_cm3", "conductivity_w_mk", "cp_j_kgk"),
+    }
+    for key in required_by_analysis.get(analysis, ()):
+        value = _finite_float(mat.get(key), f"material.{key}")
+        if key != "nu" and value <= 0.0:
+            raise ValueError(
+                f"{analysis} requires material.{key} > 0, got {mat.get(key)!r}. "
+                "Choose a material carrying that property or pass it explicitly.")
+        mat[key] = value
+    return mat
+
 
 def _canon_item_keys(e: dict, where: str, notes: Optional[list] = None) -> dict:
-    """Rename a BC item's key SPELLINGS onto the canonical ones, and refuse the rest.
+    """Rename a boundary-condition wrapper's key spellings onto the canonical ones.
 
-    Applies only to a BC WRAPPER — a dict carrying some spelling of a face reference. A raw
-    geometry query / query-result match dict is handed to the engine grammar verbatim and is
-    left completely alone.
+    A wrapper normally carries a face reference, but a malformed wrapper can omit only that
+    slot while still carrying unmistakable BC fields such as force, magnitude or temperature.
+    Those entries are canonicalized too so the caller receives the missing-face contract.
+    Raw geometry query / query-result match dicts are handed to the engine grammar verbatim.
 
     There is no catch-all: a key that is neither canonical, a known spelling, nor a cosmetic
     label is REFUSED naming the real vocabulary. Silently dropping it would hide a setting the
     caller believed it had applied, which is exactly the failure mode this file exists to
     prevent."""
-    if any(k in e for k in _QUERY_DICT_KEYS):
-        return e
-    if not any(_norm_key(k) in _FACE_REF_NORMS for k in e):
+    if not _is_bc_wrapper(e):
         return e
     out: dict = {}
     renamed: list = []
@@ -181,7 +316,15 @@ def _canon_item_keys(e: dict, where: str, notes: Optional[list] = None) -> dict:
         if k in _BC_ITEM_KEYS or k in _BC_ITEM_LABELS:
             out[k] = v
             continue
-        canon = _ITEM_KEY_ALIASES.get(_norm_key(k))
+        norm = _norm_key(k)
+        label = _CANON_LABEL_BY_NORM.get(norm)
+        if label is not None:
+            if label in out:
+                raise ValueError(f"{where}: duplicate descriptive key {k!r}/{label!r}.")
+            out[label] = v
+            renamed.append(f"{k!r} as {label!r}")
+            continue
+        canon = _ITEM_KEY_ALIASES.get(norm, _CANON_ITEM_BY_NORM.get(norm))
         if canon is None:
             raise ValueError(
                 f"{where}: unknown key {k!r} in this boundary-condition entry — it is not a "
@@ -215,18 +358,22 @@ def _interpreted(out: dict, notes: list) -> dict:
 
 
 def _norm_fineness(value, arg_name: str = "mesh_fineness") -> float:
-    """mesh_fineness as a 0..1 float, accepting the preset WORDS as well as a number."""
+    """mesh_fineness as a finite 0..1 float, accepting documented preset words."""
     if isinstance(value, str):
         key = value.strip().lower().replace("-", "_").replace(" ", "_")
         if key in _FINENESS_WORDS:
             return _FINENESS_WORDS[key]
-        try:
-            return float(value)
-        except ValueError:
+    try:
+        out = _finite_float(value, arg_name)
+    except ValueError:
+        if isinstance(value, str):
             raise ValueError(
                 f"{arg_name} must be a number 0..1 or one of "
                 f"{sorted(set(_FINENESS_WORDS))} — got {value!r}.") from None
-    return float(value)
+        raise
+    if not 0.0 <= out <= 1.0:
+        raise ValueError(f"{arg_name} must be in 0..1, got {value!r}.")
+    return out
 
 
 def _norm_direction(d, where: str) -> list:
@@ -258,22 +405,23 @@ def _norm_direction(d, where: str) -> list:
                 'along the face normal BY DEFINITION, use {"face": <query>, "pressure": '
                 "<MPa>} (inward on the face) instead of a force.")
         d = coerce_json_or_repr(d)
-    if isinstance(d, dict) and all(k in d for k in ("x", "y", "z")):
+    if isinstance(d, dict):
+        if set(d) != {"x", "y", "z"}:
+            raise ValueError(
+                f"{where}: direction object must contain exactly x, y, z; got "
+                f"{sorted(str(k) for k in d)}.")
         d = [d["x"], d["y"], d["z"]]
     if not isinstance(d, (list, tuple)) or len(d) != 3:
         raise ValueError(f"{where}: 'direction' must be [dx,dy,dz] (or one of "
                          f"{sorted(_AXIS_DIRS)}), got {raw!r}.")
-    try:
-        comps = [float(x) for x in d]
-    except (TypeError, ValueError):
-        raise ValueError(f"{where}: 'direction' components must be numbers, "
-                         f"got {raw!r}.") from None
+    comps = [_finite_float(x, f"{where}.direction[{i}]") for i, x in enumerate(d)]
     n = math.sqrt(sum(c * c for c in comps))
-    if n <= 1e-12:
-        raise ValueError(f"{where}: 'direction' {raw!r} has zero length — it cannot point "
-                         "anywhere, so the load is undefined. Give a real direction "
+    if not math.isfinite(n) or n <= 1e-12:
+        raise ValueError(f"{where}: 'direction' {raw!r} has zero length or a non-finite "
+                         "component — it cannot point anywhere. Give a real direction "
                          "[dx,dy,dz] (any length; it is normalized), or drop "
-                         "magnitude/direction and pass force:[fx,fy,fz] directly.")
+                         "magnitude/direction and pass "
+                         "force:[fx,fy,fz] directly.")
     return [c / n for c in comps]
 
 
@@ -302,77 +450,106 @@ def _split_face_list(e: dict, where: str) -> list:
     return [e]
 
 
+def _force_vector(value, where: str) -> list:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{where}: 'force' must be exactly [fx,fy,fz] in newtons, "
+                         f"got {value!r}.")
+    return [_finite_float(x, f"{where}.force[{i}]") for i, x in enumerate(value)]
+
+
 def _polar_to_force(e: dict, where: str) -> dict:
-    """`magnitude` (+ `direction`) -> the explicit `force` vector the solver payload wants.
+    """Normalize one mechanical load without discarding contradictory or unused fields."""
+    kind = str(e.get("type") or "").strip().lower().replace("-", "_")
+    if kind in ("vector", "vector_force", "load"):
+        kind = "force"
+    if kind and kind not in ("force", "pressure"):
+        raise ValueError(f"{where}: unsupported load type {e.get('type')!r}; use 'force' or "
+                         "'pressure'.")
+    has_force = "force" in e
+    has_pressure = "pressure" in e
+    if has_force and has_pressure:
+        raise ValueError(f"{where}: both 'force' and 'pressure' were supplied; pass exactly "
+                         "one because they are different load models.")
+    if "direction" in e and e.get("magnitude") is None:
+        raise ValueError(f"{where}: 'direction' is only meaningful with 'magnitude'; pass "
+                         "magnitude + direction or an explicit force vector.")
 
-    force = unit(direction) * magnitude. A supplied `force` that DISAGREES with the polar
-    form is ambiguous and rejected rather than silently resolved one way."""
+    if has_force:
+        given = _force_vector(e["force"], where)
+        if kind == "pressure":
+            raise ValueError(f"{where}: type 'pressure' contradicts the supplied force vector.")
+        if e.get("magnitude") is not None:
+            mag = _finite_float(e["magnitude"], f"{where}.magnitude")
+            if mag < 0.0:
+                raise ValueError(f"{where}: magnitude must be non-negative; put the sign in "
+                                 "the direction vector.")
+            if "direction" in e:
+                expected = [c * mag for c in _norm_direction(e["direction"], where)]
+                tol = 1e-6 * max(1.0, abs(mag))
+                if any(abs(a - b) > tol for a, b in zip(given, expected)):
+                    raise ValueError(
+                        f"{where}: 'force' {e['force']!r} disagrees with magnitude {mag:g} x "
+                        f"direction {e['direction']!r} — pass one representation.")
+            else:
+                nf = math.sqrt(sum(c * c for c in given))
+                if abs(nf - mag) > 1e-6 * max(1.0, abs(mag)):
+                    raise ValueError(f"{where}: force magnitude {nf:g} disagrees with "
+                                     f"'magnitude' {mag:g}; pass one representation.")
+        out = {k: v for k, v in e.items()
+               if k not in ("force", "magnitude", "direction", "type")}
+        out["force"] = given
+        return out
+
+    if has_pressure:
+        pressure = _finite_float(e["pressure"], f"{where}.pressure")
+        if kind == "force":
+            raise ValueError(f"{where}: type 'force' contradicts the supplied pressure.")
+        if "direction" in e:
+            raise ValueError(f"{where}: pressure acts along the face normal and takes no "
+                             "direction.")
+        if e.get("magnitude") is not None:
+            mag = _finite_float(e["magnitude"], f"{where}.magnitude")
+            if abs(pressure - mag) > 1e-6 * max(1.0, abs(mag)):
+                raise ValueError(f"{where}: pressure {pressure:g} and magnitude {mag:g} "
+                                 "disagree; pass one representation.")
+        out = {k: v for k, v in e.items()
+               if k not in ("pressure", "magnitude", "type")}
+        out["pressure"] = pressure
+        return out
+
     if e.get("magnitude") is None:
+        if kind:
+            raise ValueError(f"{where}: type {kind!r} was supplied without its load value. "
+                             + _BC_SHAPE_HELP)
         return e
-    try:
-        mag = float(e["magnitude"])
-    except (TypeError, ValueError):
-        raise ValueError(f"{where}: 'magnitude' must be a number, got {e['magnitude']!r}. "
-                         + _BC_SHAPE_HELP) from None
-    d = e.get("direction")
-    kind = str(e.get("type") or "").strip().lower()
-    is_pressure = kind.startswith("press")
-
-    if d is None:
-        if "force" in e:
-            vec = [float(x) for x in e["force"]]
-            nf = math.sqrt(sum(c * c for c in vec))
-            if abs(nf - mag) > 1e-6 * max(1.0, abs(mag)):
-                raise ValueError(
-                    f"{where}: 'force' {e['force']!r} has magnitude {nf:g} but 'magnitude' "
-                    f"says {mag:g} — those disagree, so which load was meant is ambiguous. "
-                    "Pass force:[fx,fy,fz] alone, or magnitude + direction alone.")
-            return {k: v for k, v in e.items() if k != "magnitude"}
-        if "pressure" in e:
-            if abs(float(e["pressure"]) - mag) > 1e-6 * max(1.0, abs(mag)):
-                raise ValueError(
-                    f"{where}: 'pressure' {e['pressure']!r} and 'magnitude' {mag:g} disagree "
-                    "— ambiguous. Pass one of them.")
-            return {k: v for k, v in e.items() if k != "magnitude"}
-        if is_pressure:
-            out = {k: v for k, v in e.items() if k not in ("magnitude", "type")}
-            out["pressure"] = mag
-            return out
-        raise ValueError(f"{where}: 'magnitude':{mag:g} was given with no 'direction', so the "
-                         "load has no orientation and cannot be built. " + _BC_SHAPE_HELP)
-
-    if is_pressure:
-        raise ValueError(f"{where}: type 'pressure' was given together with a 'direction' "
-                         f"{d!r} — pressure acts along the face normal and takes no direction. "
-                         "Pass pressure:<MPa> for a pressure, or force/magnitude+direction "
-                         "for a vector load.")
-    unit = _norm_direction(d, where)
-    vec = [c * mag for c in unit]
-    if "force" in e:
-        given = [float(x) for x in e["force"]]
-        tol = 1e-6 * max(1.0, abs(mag))
-        if len(given) != 3 or any(abs(a - b) > tol for a, b in zip(given, vec)):
-            raise ValueError(
-                f"{where}: 'force' {e['force']!r} disagrees with magnitude {mag:g} x "
-                f"direction {d!r} (= {[round(c, 6) for c in vec]}) — ambiguous. Pass "
-                "force:[fx,fy,fz] alone, or magnitude + direction alone.")
+    mag = _finite_float(e["magnitude"], f"{where}.magnitude")
+    if kind == "pressure":
+        if "direction" in e:
+            raise ValueError(f"{where}: pressure acts along the face normal and takes no "
+                             "direction.")
+        out = {k: v for k, v in e.items() if k not in ("magnitude", "type")}
+        out["pressure"] = mag
+        return out
+    if "direction" not in e:
+        raise ValueError(f"{where}: 'magnitude':{mag:g} was given with no 'direction', so "
+                         "the load has no orientation. " + _BC_SHAPE_HELP)
+    if mag < 0.0:
+        raise ValueError(f"{where}: magnitude must be non-negative; put the sign in the "
+                         "direction vector.")
+    unit = _norm_direction(e["direction"], where)
     out = {k: v for k, v in e.items() if k not in ("magnitude", "direction", "type")}
-    out["force"] = vec
+    out["force"] = [c * mag for c in unit]
     return out
 
 
 def _norm_bc_list(entries: list, arg_name: str, *, unwrap_query: bool = False,
                   notes: Optional[list] = None) -> list:
-    """Normalize a fixtures/loads list at the tool boundary. IDENTITY for entries already
-    in the accepted shape — the payload handed to the C++ solver is unchanged for inputs
-    that already worked.
+    """Normalize fixtures, mechanical loads and thermal BCs at the tool boundary.
 
-    unwrap_query: fixtures consume only the face QUERY, so a wrapper dict
-    ({"face": q, "type": "fixed"}) collapses to `q`; loads / hot_faces / cold_faces keep
-    their siblings (force, pressure, temperature, flux_w_m2, schedule, ...).
-    notes: appended to with one human-readable line per entry whose KEYS were renamed, so
-    the calling tool can echo the rename back in its `interpreted` channel — a rename the
-    model cannot see is a rename it will keep re-learning."""
+    Fixture wrappers are validated and unwrapped without ever entering mechanical-load
+    normalization. Other wrappers retain their siblings and normalize force representations.
+    Raw geometry queries remain byte-identical.
+    """
     out: list = []
     for i, raw in enumerate(entries):
         where = f"{arg_name}[{i}]"
@@ -380,16 +557,84 @@ def _norm_bc_list(entries: list, arg_name: str, *, unwrap_query: bool = False,
         if isinstance(e, str) and e.strip()[:1] == "{":
             e = coerce_json_or_repr(e)
         if not isinstance(e, dict):
-            out.append(raw)          # a bare query string / already-structured query
+            out.append(raw)
+            continue
+        wrapper = _is_bc_wrapper(e)
+        if not wrapper:
+            out.append(e)
             continue
         e = _canon_item_keys(e, where, notes)
+        if "face" not in e and "faces" not in e:
+            if arg_name == "loads":
+                raise ValueError(
+                    f"each load needs a 'face' query: {e!r}. " + _BC_SHAPE_HELP)
+            label = "fixture" if unwrap_query else f"{arg_name} entry"
+            raise ValueError(
+                f"{where}: each {label} needs a 'face' query; pass the target surface "
+                "under 'face' (one query) or 'faces' (a list).")
         for one in _split_face_list(e, where):
-            one = _polar_to_force(one, where)
-            if unwrap_query and "face" in one:
+            if unwrap_query:
+                extras = set(one) - {"face", "type"} - _BC_ITEM_LABELS
+                if extras:
+                    raise ValueError(
+                        f"{where}: fixture entries only support a face and type='fixed'; "
+                        f"unsupported fields {sorted(extras)!r} would otherwise be ignored.")
+                fixture_type = str(one.get("type") or "fixed").strip().lower()
+                if fixture_type not in ("fixed", "clamped", "encastre"):
+                    raise ValueError(
+                        f"{where}: unsupported fixture type {one.get('type')!r}; this solver "
+                        "supports only fully fixed/clamped faces.")
                 out.append(one["face"])
             else:
-                out.append(one)
+                out.append(_polar_to_force(one, where))
     return out
+
+def _reject_ignored_fields(entry: dict, allowed: set, where: str) -> None:
+    unknown = set(entry) - allowed - _BC_ITEM_LABELS
+    if unknown:
+        raise ValueError(
+            f"{where} has unsupported fields {sorted(unknown)!r}; refusing to ignore them. "
+            f"Accepted fields: {sorted(allowed)}.")
+
+
+def _validate_thermal_schedule(schedule, where: str) -> bool:
+    """Validate one flux schedule and return whether it is ever non-zero."""
+    if schedule is None:
+        return True
+    if not isinstance(schedule, dict):
+        raise ValueError(f"{where} must be an object, got {schedule!r}.")
+    has_duty = "duty" in schedule
+    has_points = "points" in schedule
+    if has_duty == has_points:
+        raise ValueError(f"{where} needs exactly one of 'duty' or 'points'.")
+    _reject_ignored_fields(schedule, {"duty", "points", "period_s"}, where)
+    period = None
+    if "period_s" in schedule:
+        period = _finite_float(schedule["period_s"], f"{where}.period_s")
+        if period <= 0.0:
+            raise ValueError(f"{where}.period_s must be > 0.")
+    if has_duty:
+        duty = _finite_float(schedule["duty"], f"{where}.duty")
+        if not 0.0 <= duty <= 1.0:
+            raise ValueError(f"{where}.duty must be in [0,1].")
+        if duty < 1.0 and period is None:
+            raise ValueError(f"{where} with duty < 1 needs period_s > 0.")
+        return duty > 0.0
+    points = schedule["points"]
+    if not isinstance(points, (list, tuple)) or not points:
+        raise ValueError(f"{where}.points must be a non-empty list of [t_s, scale] pairs.")
+    times: list = []
+    scales: list = []
+    for i, point in enumerate(points):
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise ValueError(f"{where}.points[{i}] must be [t_s, scale].")
+        times.append(_finite_float(point[0], f"{where}.points[{i}][0]"))
+        scales.append(_finite_float(point[1], f"{where}.points[{i}][1]"))
+    if times[0] != 0.0 or any(b <= a for a, b in zip(times, times[1:])):
+        raise ValueError(f"{where}.points times must start at 0 and be strictly ascending.")
+    if period is not None and period <= times[-1]:
+        raise ValueError(f"{where}.period_s must be greater than the last breakpoint.")
+    return any(abs(scale) > 0.0 for scale in scales)
 
 
 def _sim_face_points(doc_id: str, query) -> list:
@@ -420,6 +665,131 @@ def _sim_face_points(doc_id: str, query) -> list:
                 "Call describe_part(doc_id) for the face sid roster (F58db6d style, which "
                 "this tool accepts directly), or query_geometry(...) for a geometry query.")
     return _resolve_face_points(doc_id, query)
+
+def _require_sim_geometry(doc_id: str) -> list:
+    """Cheap setup gate shared by public solvers before export/meshing."""
+    result = cb.call("asm_world_bodies", {"doc_id": doc_id, "explode": False})
+    bodies = result.get("bodies") if isinstance(result, dict) else None
+    if not isinstance(bodies, list) or not bodies:
+        raise ValueError(
+            "simulation needs at least one solid body; the document has no resolvable "
+            "geometry. Build/import the part or assembly before creating a study.")
+    for index, body in enumerate(bodies):
+        bbox = body.get("bbox") if isinstance(body, dict) else None
+        lo = bbox.get("min") if isinstance(bbox, dict) else None
+        hi = bbox.get("max") if isinstance(bbox, dict) else None
+        if not (isinstance(lo, (list, tuple)) and isinstance(hi, (list, tuple))
+                and len(lo) == 3 and len(hi) == 3):
+            raise ValueError(
+                f"simulation body {index} has no finite 3-D bounding box; it cannot be meshed "
+                "as a solid.")
+        spans = [_finite_float(hi[i], f"body[{index}].bbox.max[{i}]")
+                 - _finite_float(lo[i], f"body[{index}].bbox.min[{i}]")
+                 for i in range(3)]
+        if any(span <= 1e-9 for span in spans):
+            raise ValueError(
+                f"simulation body {index} is degenerate ({spans!r} mm); solid FEA/CFD "
+                "requires non-zero span on all three axes.")
+    return bodies
+
+
+def _validate_flow_result(res: dict, expected_velocity: float) -> dict:
+    """Validate the physical scalar envelope of a successful fast-CFD solve."""
+    if not isinstance(res, dict):
+        raise ValueError("flow solver returned a non-object result")
+    if not isinstance(res.get("converged"), bool):
+        raise ValueError("flow solver returned no convergence status")
+    required = ("drag_n", "lift_n", "cd", "frontal_area_mm2", "reynolds",
+                "ref_length_mm", "velocity_ms", "residual", "voxel_mm")
+    values = {key: _finite_float(res.get(key), f"flow result.{key}")
+              for key in required}
+    for key in ("drag_n", "cd", "frontal_area_mm2", "reynolds",
+                "ref_length_mm", "velocity_ms", "voxel_mm"):
+        if values[key] <= 0.0:
+            raise ValueError(
+                f"flow result.{key} must be > 0 under a non-zero freestream; got "
+                f"{values[key]:g}. Refusing a degenerate zero-field result.")
+    if not math.isclose(values["velocity_ms"], expected_velocity, rel_tol=1e-9, abs_tol=1e-12):
+        raise ValueError(
+            f"flow result.velocity_ms={values['velocity_ms']:g} does not match the requested "
+            f"{expected_velocity:g} m/s")
+    for key in ("min_feature_mm", "min_feature_voxels"):
+        if key in res and res[key] is not None:
+            value = _finite_float(res[key], f"flow result.{key}")
+            if value <= 0.0:
+                raise ValueError(f"flow result.{key} must be > 0 when reported")
+    if "steps_run" in res:
+        _positive_int(res["steps_run"], "flow result.steps_run")
+    return values
+
+
+def _validate_transient_thermal_result(res: dict, t_end: float) -> dict:
+    """Validate a complete transient thermal envelope before persistence/reporting."""
+    counts = {key: _positive_int(res.get(key), f"thermal result.{key}")
+              for key in ("n_steps", "n_nodes", "n_elems")}
+    # Thermal n_dof is the number of free scalar unknowns, not total nodal DOFs. It can be
+    # zero for a fully prescribed field and must never exceed n_nodes.
+    if res.get("n_dof") is not None:
+        exact = _finite_float(res["n_dof"], "thermal result.n_dof")
+        n_dof = int(exact)
+        if exact != n_dof or n_dof < 0 or n_dof > counts["n_nodes"]:
+            raise ValueError(
+                "thermal result.n_dof must be an integer in [0,n_nodes]")
+        counts["n_dof"] = n_dof
+    frames = res.get("frames")
+    if not isinstance(frames, list) or not frames:
+        raise ValueError("thermal solver reported success but returned no frames")
+    frame_summaries: list[dict] = []
+    frame_fields: list[list[float]] = []
+    times: list[float] = []
+    for i, frame in enumerate(frames):
+        if not isinstance(frame, dict):
+            raise ValueError(f"thermal frame {i} is not an object")
+        temps = frame.get("temperature")
+        if not isinstance(temps, list) or len(temps) != counts["n_nodes"]:
+            got = len(temps) if isinstance(temps, list) else 0
+            raise ValueError(
+                f"thermal frame {i} contains {got}/{counts['n_nodes']} nodal temperatures")
+        clean = [_finite_float(value, f"thermal frame {i}.temperature[{j}]")
+                 for j, value in enumerate(temps)]
+        time_s = _finite_float(frame.get("t_s"), f"thermal frame {i}.t_s")
+        if time_s < 0.0 or time_s > t_end + 1e-6 * max(1.0, t_end):
+            raise ValueError(f"thermal frame {i} time lies outside [0,t_end_s]")
+        times.append(time_s)
+        frame_fields.append(clean)
+        frame_summaries.append({"t_s": time_s, "max_temp_c": round(max(clean), 3)})
+    if any(b <= a for a, b in zip(times, times[1:])):
+        raise ValueError("thermal result frame times are not strictly ascending")
+    if not math.isclose(times[-1], t_end, rel_tol=1e-6, abs_tol=1e-6):
+        raise ValueError(
+            f"thermal result ends at {times[-1]:g}s instead of requested t_end_s={t_end:g}")
+
+    summary_raw = res.get("summary")
+    if not isinstance(summary_raw, dict):
+        raise ValueError("thermal solver reported success without a summary")
+    summary_keys = ("max_temp_c", "max_temp_time_s", "min_temp_c", "final_max_temp_c")
+    summary = {key: _finite_float(summary_raw.get(key), f"thermal summary.{key}")
+               for key in summary_keys}
+    if summary["min_temp_c"] > summary["max_temp_c"]:
+        raise ValueError("thermal summary minimum exceeds its maximum")
+    time_tol = 1e-6 * max(1.0, t_end)
+    if not -time_tol <= summary["max_temp_time_s"] <= t_end + time_tol:
+        raise ValueError("thermal summary.max_temp_time_s lies outside [0,t_end_s]")
+
+    envelope = res.get("envelope_max")
+    if not isinstance(envelope, list) or len(envelope) != counts["n_nodes"]:
+        got = len(envelope) if isinstance(envelope, list) else 0
+        raise ValueError(
+            f"thermal envelope_max contains {got}/{counts['n_nodes']} nodal values")
+    envelope = [_finite_float(value, f"thermal envelope_max[{i}]")
+                for i, value in enumerate(envelope)]
+    tol = 1e-3 * max(1.0, abs(summary["max_temp_c"]))
+    if abs(max(envelope) - summary["max_temp_c"]) > tol:
+        raise ValueError("thermal summary.max_temp_c disagrees with envelope_max")
+    if abs(max(frame_fields[-1]) - summary["final_max_temp_c"]) > tol:
+        raise ValueError("thermal summary.final_max_temp_c disagrees with the final frame")
+    return {"counts": counts, "frames": frames, "frame_summaries": frame_summaries,
+            "summary": {**summary_raw, **summary}, "envelope_max": envelope}
 
 
 # ------------------------------------------------------- atomised solve pipeline (async jobs)
@@ -477,16 +847,22 @@ def _build_load_specs(d: str, loads: list, analysis: str) -> list:
     for ld in loads:
         if not isinstance(ld, dict) or "face" not in ld:
             raise ValueError(f"each load needs a 'face' query: {ld!r}. " + _BC_SHAPE_HELP)
+        unsupported = set(ld) - {"face", "force", "pressure"} - _BC_ITEM_LABELS
+        if unsupported:
+            raise ValueError(
+                f"{analysis} load has unsupported fields {sorted(unsupported)!r}; refusing "
+                "to ignore them. Mechanical loads accept face + exactly one of force or "
+                "pressure.")
         # Merge multiple face-point sets for this load (keeps face_normal/surface
         # hints exactly when they stay valid — see _merge_face_sets).
         merged = _merge_face_sets(_sim_face_points(d, ld["face"]))
         spec: dict = {"faces": merged}
         if "pressure" in ld:
             spec["type"] = "pressure"
-            spec["magnitude"] = float(ld["pressure"])
+            spec["magnitude"] = _finite_float(ld["pressure"], f"{analysis} load pressure")
         elif "force" in ld:
             spec["type"] = "force"
-            spec["vector"] = [float(x) for x in ld["force"]]
+            spec["vector"] = _force_vector(ld["force"], f"{analysis} load")
         else:
             raise ValueError(f"load needs 'force':[x,y,z] or 'pressure':<MPa>: {ld!r}. "
                              + _BC_SHAPE_HELP)
@@ -502,10 +878,33 @@ def _build_load_specs(d: str, loads: list, analysis: str) -> list:
             "nothing at all.")})
     return specs
 
+def _reject_fully_constrained_loads(fixture_sets: list, load_specs: list,
+                                    analysis: str) -> None:
+    """A load entirely on fixed sample points becomes a reaction-only zero field."""
+    fixed = {
+        tuple(float(c) for c in point)
+        for fs in fixture_sets for point in (fs.get("points") or [])
+        if isinstance(point, (list, tuple)) and len(point) == 3
+    }
+    for i, spec in enumerate(load_specs):
+        points = spec.get("faces", {}).get("points") or []
+        loaded = {
+            tuple(float(c) for c in point)
+            for point in points
+            if isinstance(point, (list, tuple)) and len(point) == 3
+        }
+        if loaded and loaded.issubset(fixed):
+            raise _StudyRefusal({"ok": False, "error": (
+                f"{analysis} load[{i}] is applied entirely on a fully fixed face. Its force "
+                "would be absorbed as a support reaction while the solved displacement/stress "
+                "field stays zero. Apply the load to a distinct free face, or change the "
+                "fixture to match the real support.")})
+
 
 def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes: list) -> dict:
     """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
     d = _doc(doc_id)
+    _require_sim_geometry(d)
     fixtures = require_list(fixtures, "fixtures",
                             'a list of face queries, e.g. ["bottom"] or '
                             '[{"of":"face","side":"bottom","pick":"largest"}]')
@@ -515,7 +914,7 @@ def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes:
     fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=notes)
     loads = _norm_bc_list(loads, "loads", notes=notes)
     mesh_fineness = _norm_fineness(mesh_fineness)
-    mat = _resolve_material(coerce_json_or_repr(material))
+    mat = _resolve_study_material(material, "static")
     # fixtures=[] and "fixtures that resolved to nothing" are DIFFERENT mistakes, and the
     # single old message diagnosed the wrong one — it told a caller who supplied no queries
     # at all to go check its queries with query_geometry(), buying a wasted retry.
@@ -527,9 +926,6 @@ def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes:
                              'solution to report. Pass the mounted face, e.g. fixtures='
                              '["bottom"]. fixtures=[] is only meaningful for run_fea_modal, '
                              "where it means a free-free modal solve."})
-    step = _tmp(".step")
-    cb.call("doc_export_step", {"doc_id": d, "path": step})
-
     fixture_sets: list = []
     for q in fixtures:
         fixture_sets.extend(_sim_face_points(d, q))
@@ -540,6 +936,10 @@ def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes:
                              "one fixed face. Use query_geometry() to confirm the face query."})
 
     load_specs = _build_load_specs(d, loads, "static FEA")
+    _reject_fully_constrained_loads(fixture_sets, load_specs, "static FEA")
+    # Export only after all setup validation and face resolution succeeds.
+    step = _tmp(".step")
+    cb.call("doc_export_step", {"doc_id": d, "path": step})
 
     study = {
         "step_path": step,
@@ -557,13 +957,12 @@ def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes:
 def _build_modal_study(fixtures, material, mesh_fineness, doc_id, notes: list) -> dict:
     """SETUP stage for run_fea_modal / sim_run(analysis="fea_modal")."""
     d = _doc(doc_id)
+    _require_sim_geometry(d)
     fixtures = require_list(fixtures, "fixtures",
                             'a list of face queries held fixed, e.g. ["bottom"]')
     fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=notes)
     mesh_fineness = _norm_fineness(mesh_fineness)
-    mat = _resolve_material(coerce_json_or_repr(material))
-    step = _tmp(".step")
-    cb.call("doc_export_step", {"doc_id": d, "path": step})
+    mat = _resolve_study_material(material, "modal")
     fixture_sets: list = []
     for q in fixtures:
         fixture_sets.extend(_sim_face_points(d, q))
@@ -577,6 +976,9 @@ def _build_modal_study(fixtures, material, mesh_fineness, doc_id, notes: list) -
                              "the face queries you provided didn't match any surface points. "
                              "Use query_geometry() to find the right face query, or pass "
                              "fixtures=[] for a free-free (unconstrained) solve."})
+    # Export only after all supplied fixtures have resolved.
+    step = _tmp(".step")
+    cb.call("doc_export_step", {"doc_id": d, "path": step})
     # 2nd-order (tet10) elements: quadratic bending accuracy — no spurious split on
     # a square section and no low-frequency bias the way tet4 had (Bug N-1).
     study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
@@ -598,6 +1000,32 @@ def _collect_static(ctx: dict, res: dict, notes: list) -> dict:
     mat = ctx.get("material") or {}
     if not res.get("ok"):
         return {"ok": False, "doc_id": d, "error": res.get("error", "solve failed")}
+    summary = res.get("summary")
+    if not isinstance(summary, dict):
+        return {"ok": False, "doc_id": d,
+                "error": "static solver reported success without a result summary."}
+    needed = ("max_von_mises_mpa", "max_disp_mm", "min_fos")
+    try:
+        values = {k: _finite_float(summary.get(k), f"summary.{k}") for k in needed}
+        counts = {k: _positive_int(res.get(k), k)
+                  for k in ("n_dof", "n_elems", "n_nodes")}
+    except ValueError as exc:
+        return {"ok": False, "doc_id": d,
+                "error": f"static solver returned an incomplete/non-finite result: {exc}"}
+    if any(values[k] < 0.0 for k in needed):
+        return {"ok": False, "doc_id": d,
+                "error": "static solver returned a negative stress, displacement, or factor "
+                         "of safety; the result is physically invalid."}
+    if values["max_von_mises_mpa"] == 0.0 and values["max_disp_mm"] == 0.0:
+        return {"ok": False, "doc_id": d,
+                "error": "a non-zero load produced an identically zero stress/displacement "
+                         "field; refusing false success. Confirm the load is not entirely on "
+                         "fixed nodes and that its face resolves onto the mesh."}
+    if counts["n_dof"] < 3 * counts["n_nodes"]:
+        return {"ok": False, "doc_id": d,
+                "error": "static solver returned an inconsistent mesh envelope: n_dof is "
+                         "smaller than three translational DOFs per node."}
+    summary = {**summary, **values}
     # Persist setup+results into the doc so they save inside the .step+.
     sid = _persist_study(d, {
         "type": "fea_static",
@@ -607,8 +1035,10 @@ def _collect_static(ctx: dict, res: dict, notes: list) -> dict:
         "fixtures": ctx.get("fixtures"),
         "loads": ctx.get("loads"),
         "mesh_fineness": ctx.get("mesh_fineness"),
-        "results": res.get("summary", {}),
-        "n_dof": res.get("n_dof"),
+        "results": summary,
+        "n_dof": counts["n_dof"], "n_elems": counts["n_elems"],
+        "n_nodes": counts["n_nodes"], "mesh": res.get("mesh_type_used"),
+        "solver_notes": res.get("solver_notes", []),
     })
     # The engine's sim_run_static reply also carries n_elems / n_nodes / mesh_type_used /
     # solver_notes; only n_dof was forwarded, so a caller could not see the mesh it just
@@ -616,15 +1046,15 @@ def _collect_static(ctx: dict, res: dict, notes: list) -> dict:
     # was dropped on the floor. Measured 2026-07-30: engine keys n_elems/n_nodes present,
     # reply had neither.
     out = {"ok": True, "doc_id": d, "material": mat.get("name", ctx.get("material_arg")),
-           "summary": res.get("summary", {}), "n_dof": res.get("n_dof"),
-           "n_elems": res.get("n_elems"), "n_nodes": res.get("n_nodes"),
+           "summary": summary, "n_dof": counts["n_dof"],
+           "n_elems": counts["n_elems"], "n_nodes": counts["n_nodes"],
            "mesh": res.get("mesh_type_used"),
            "saved_to_study": bool(sid)}
     if res.get("solver_notes"):
         out["solver_notes"] = res["solver_notes"]
     # min_fos saturates at 15 (core/sim/fea_static.cpp clamp_fos) — say so, otherwise a cap
     # is read as a computed margin.
-    if float((res.get("summary") or {}).get("min_fos") or 0.0) >= _FOS_CAP:
+    if values["min_fos"] >= _FOS_CAP:
         out["fos_note"] = (f"min_fos is reported at the solver's saturation cap ({_FOS_CAP}); "
                            "the true margin is at least that, not exactly that.")
     if not sid:
@@ -642,10 +1072,42 @@ def _n_rigid_modes(freqs: list) -> int:
 
 
 def _collect_modal(ctx: dict, freqs: list, n_modes: int, notes: list,
-                   note: Optional[str] = None) -> dict:
+                   note: Optional[str] = None, diagnostics: Optional[dict] = None) -> dict:
     """COLLECT stage for a modal solve."""
     d = ctx["doc"]
     mat = ctx.get("material") or {}
+    if len(freqs) < n_modes:
+        return {"ok": False, "doc_id": d,
+                "error": f"modal solver returned only {len(freqs)}/{n_modes} requested modes; "
+                         "refusing a partial mode list."}
+    try:
+        freqs = [_finite_float(f, f"freqs_hz[{i}]") for i, f in enumerate(freqs[:n_modes])]
+    except ValueError as exc:
+        return {"ok": False, "doc_id": d,
+                "error": f"modal solver returned a non-finite frequency: {exc}"}
+    if any(f < 0.0 for f in freqs):
+        return {"ok": False, "doc_id": d,
+                "error": "modal solver returned a negative frequency; the eigensolution is "
+                         "not physically reportable."}
+    if any(b < a for a, b in zip(freqs, freqs[1:])):
+        return {"ok": False, "doc_id": d,
+                "error": "modal solver returned frequencies out of ascending order; refusing "
+                         "a mode list whose numbering is not the requested lowest-first order."}
+    modal_meta: dict = {}
+    if diagnostics is not None:
+        try:
+            n_nodes = _positive_int(diagnostics.get("n_nodes"), "modal result.n_nodes")
+            n_dof = _positive_int(diagnostics.get("n_dof"), "modal result.n_dof")
+        except ValueError as exc:
+            return {"ok": False, "doc_id": d,
+                    "error": f"modal solver returned incomplete mesh diagnostics: {exc}"}
+        if n_dof < 3 * n_nodes:
+            return {"ok": False, "doc_id": d,
+                    "error": "modal solver returned an inconsistent mesh envelope: n_dof is "
+                             "smaller than three translational DOFs per node."}
+        modal_meta = {"n_nodes": n_nodes, "n_dof": n_dof,
+                      "mesh": diagnostics.get("mesh_type_used"),
+                      "solver_notes": diagnostics.get("solver_notes", [])}
     sid = _persist_study(d, {
         "type": "fea_modal",
         "name": f"Modal ({mat.get('name', ctx.get('material_arg'))})",
@@ -655,9 +1117,11 @@ def _collect_modal(ctx: dict, freqs: list, n_modes: int, notes: list,
         "n_modes": n_modes,
         "mesh_fineness": ctx.get("mesh_fineness"),
         "results": {"freqs_hz": freqs, "n_modes": len(freqs)},
+        **modal_meta,
     })
     out = {"ok": True, "doc_id": d, "material": mat.get("name", ctx.get("material_arg")),
-           "freqs_hz": freqs, "n_modes": len(freqs), "saved_to_study": bool(sid)}
+           "freqs_hz": freqs, "n_modes": len(freqs), "saved_to_study": bool(sid),
+           **modal_meta}
     if not sid:
         out["study_not_saved_reason"] = (
             f"the results could not be written into document {d} (it is not open in this "
@@ -682,6 +1146,19 @@ def _modal_rigid_note(freqs: list) -> Optional[str]:
     return (f"warning: free-free solve resolved only {n}/6 rigid-body modes — the mode list "
             "may be missing rigid modes (eigensolver degenerate-cluster limitation); "
             "elastic frequencies are unaffected")
+
+
+def _merge_default_frequency_sweep(sweep: list, modal_freqs: list) -> list:
+    """Add reportable in-band resonances to the default logarithmic sample grid."""
+    resonances: list[float] = []
+    for raw in modal_freqs:
+        try:
+            frequency = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(frequency) and 10.0 <= frequency <= 2000.0:
+            resonances.append(frequency)
+    return sorted(set(sweep + resonances))
 
 
 # Analyses whose SETUP produces a self-contained study (an exported STEP path + JSON), which
@@ -714,7 +1191,7 @@ def _collect_job(st: dict, raw: dict) -> dict:
                          "way the synchronous tool does (that would be a second job) — re-run "
                          "run_fea_modal synchronously if the rigid-mode count matters")
             freqs = freqs[:n]
-        return _collect_modal(meta, freqs, n, notes, note)
+        return _collect_modal(meta, freqs, n, notes, note, raw)
     return {"ok": False, "error": f"no result collector for job kind {kind!r}"}
 
 
@@ -771,7 +1248,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             if background:
                 jid = _start_job("fea_static", _solve)
                 return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
-                               "note": "solving on a worker thread — poll get_job(job_id)"})
+                               "note": "solving on a worker thread — poll get_job(job_id)",
+                               "next_actions": [f"get_job('{jid}')"]})
             return _dumps(_solve_sync_or_handoff("fea_static", _solve))
         except _StudyRefusal as r:
             return _dumps(r.payload)
@@ -796,6 +1274,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         background : if True, return a job_id and solve on a worker thread — poll get_job(job_id).
         """
         try:
+            n_modes = _positive_int(n_modes, "n_modes")
             bc_notes: list = []
             ctx = _build_modal_study(fixtures, material, mesh_fineness, doc_id, bc_notes)
             d = ctx["doc"]
@@ -830,13 +1309,14 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         res, freqs = retry, list(retry.get("freqs_hz", []))
                     note = _modal_rigid_note(freqs)
                     freqs = freqs[:n_modes]
-                return _collect_modal(ctx, freqs, n_modes, bc_notes, note)
+                return _collect_modal(ctx, freqs, n_modes, bc_notes, note, res)
 
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:
                 jid = _start_job("fea_modal", _solve)
                 return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
-                               "note": "solving on a worker thread — poll get_job(job_id)"})
+                               "note": "solving on a worker thread — poll get_job(job_id)",
+                               "next_actions": [f"get_job('{jid}')"]})
             return _dumps(_solve_sync_or_handoff("fea_modal", _solve))
         except _StudyRefusal as r:
             return _dumps(r.payload)
@@ -900,11 +1380,12 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 method = "sim_run_static"
                 params = {"study": ctx["study"]}
             else:
+                n_modes = _positive_int(n_modes, "n_modes")
                 ctx = _build_modal_study(fixtures, material, mesh_fineness, doc_id, notes)
-                ctx["n_modes"] = int(n_modes)
+                ctx["n_modes"] = n_modes
                 method = "sim_run_modal"
                 params = {"study": ctx["study"],
-                          "n_modes": _modal_solve_n(int(n_modes), ctx["free_free"])}
+                          "n_modes": _modal_solve_n(n_modes, ctx["free_free"])}
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             meta = {k: v for k, v in ctx.items() if k != "study"}
             meta["notes"] = notes
@@ -1025,7 +1506,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                         "be read — nothing can be reported honestly. Re-run "
                                         "the solve."})
             out = _collect_job(st, raw)
-            out.update(job_id=job_id, state="done", converged=True,
+            out.update(job_id=job_id, state="done", converged=bool(out.get("ok")),
                        elapsed_s=st.get("elapsed_s"))
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
@@ -1039,8 +1520,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         time. Jobs persist across agent turns, so this also shows solves an earlier turn
         started."""
         try:
+            limit = _positive_int(limit, "limit")
             rows = []
-            for j in simjobs.list_jobs(int(limit)):
+            for j in simjobs.list_jobs(limit):
                 meta = j.pop("meta", None) or {}
                 j["doc_id"] = meta.get("doc")
                 if meta.get("label"):
@@ -1074,7 +1556,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
         fixtures       : face queries held fixed (base/support) — same syntax as run_fea_modal.
         excitation_dir : base-excitation unit direction [dx,dy,dz]; default [0,0,1] (Z-up axis).
-        sweep_hz       : harmonic sweep points; default 200 log-spaced points, 10–2000 Hz.
+        sweep_hz       : harmonic sweep points; default 200 log-spaced points, 10–2000 Hz,
+                         plus every finite modal frequency inside that band.
         zeta           : modal damping ratio (default 0.02 = 2% — an assumption, echoed back).
         base_accel_g   : harmonic base input amplitude in g (default 1.0 = unit sweep).
         psd_breakpoints: [[f_hz, psd_g2_per_hz], ...] random-vibration input (log-log
@@ -1089,42 +1572,82 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         physical displacement/stress are NOT recovered (unit-normalized mode shapes).
         """
         try:
+            n_modes = _positive_int(n_modes, "n_modes")
+            zeta = _finite_float(zeta, "zeta")
+            if not 0.0 < zeta < 1.0:
+                raise ValueError(f"zeta must be a damping ratio in (0,1), got {zeta!r}.")
+            base_accel_g = _finite_float(base_accel_g, "base_accel_g")
+            if base_accel_g <= 0.0:
+                raise ValueError("base_accel_g must be > 0; a zero base excitation produces "
+                                 "an identically zero response, not an analysis.")
             d = _doc(doc_id)
+            _require_sim_geometry(d)
             fixtures = require_list(fixtures, "fixtures",
                                      'face queries held fixed, e.g. ["bottom"]')
             bc_notes: list = []
             fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=bc_notes)
+            if not fixtures:
+                raise ValueError(
+                    "frequency response needs at least one fixed support face; base excitation "
+                    "of a free-free body is undefined. Use run_fea_modal(fixtures=[]) only "
+                    "when free-free natural frequencies are the intended result.")
             mesh_fineness = _norm_fineness(mesh_fineness)
-            if excitation_dir is not None:
-                excitation_dir = require_list(excitation_dir, "excitation_dir",
-                                               "a 3-vector [dx,dy,dz]")
+            ex_dir = (_norm_direction(excitation_dir, "excitation_dir")
+                      if excitation_dir is not None else [0.0, 0.0, 1.0])
+            using_default_sweep = sweep_hz is None
             if sweep_hz is not None:
-                sweep_hz = require_list(sweep_hz, "sweep_hz", "a list of frequencies in Hz")
+                sweep_hz = require_list(sweep_hz, "sweep_hz",
+                                        "a non-empty list of positive frequencies in Hz")
+                if not sweep_hz:
+                    raise ValueError("sweep_hz must contain at least one frequency.")
+                sweep = [_finite_float(f, f"sweep_hz[{i}]")
+                         for i, f in enumerate(sweep_hz)]
+                if any(f <= 0.0 for f in sweep):
+                    raise ValueError("every sweep_hz frequency must be > 0 Hz.")
+            else:
+                sweep = [10.0 * (2000.0 / 10.0) ** (i / 199.0) for i in range(200)]
+            psd = None
             if psd_breakpoints is not None:
-                psd_breakpoints = require_list(psd_breakpoints, "psd_breakpoints",
-                                                "a list of [f_hz, psd_g2_per_hz] pairs")
+                psd_breakpoints = require_list(
+                    psd_breakpoints, "psd_breakpoints",
+                    "a non-empty list of [f_hz, psd_g2_per_hz] pairs")
+                if not psd_breakpoints:
+                    raise ValueError("psd_breakpoints cannot be empty when supplied.")
+                psd = []
+                for i, point in enumerate(psd_breakpoints):
+                    if not isinstance(point, (list, tuple)) or len(point) != 2:
+                        raise ValueError(f"psd_breakpoints[{i}] must be [f_hz, g2_per_hz].")
+                    f = _finite_float(point[0], f"psd_breakpoints[{i}][0]")
+                    level = _finite_float(point[1], f"psd_breakpoints[{i}][1]")
+                    if f <= 0.0 or level <= 0.0:
+                        raise ValueError("PSD frequencies and levels must both be > 0.")
+                    psd.append((f, level))
             if vibration_spec is not None:
                 vibration_spec = require_mapping(
                     vibration_spec, "vibration_spec",
                     'a dict like {"max_peak_accel_g": g} and/or {"max_grms": g}')
-            mat = _resolve_material(coerce_json_or_repr(material))
-            ex_dir = [float(x) for x in (excitation_dir or [0.0, 0.0, 1.0])]
-            if sweep_hz is not None:
-                sweep = [float(f) for f in sweep_hz]
-            else:  # default: 200 log-spaced points across the common vibe-test band
-                sweep = [10.0 * (2000.0 / 10.0) ** (i / 199.0) for i in range(200)]
-            psd = None
-            if psd_breakpoints is not None:
-                psd = [(float(p[0]), float(p[1])) for p in psd_breakpoints]
-            step = _tmp(".step")
-            cb.call("doc_export_step", {"doc_id": d, "path": step})
+                unknown = set(vibration_spec) - {"max_peak_accel_g", "max_grms"}
+                if unknown:
+                    raise ValueError(
+                        f"vibration_spec has unsupported keys {sorted(unknown)!r}; use "
+                        "max_peak_accel_g and/or max_grms.")
+                if not vibration_spec:
+                    raise ValueError("vibration_spec cannot be empty when supplied.")
+                for key, value in vibration_spec.items():
+                    limit = _finite_float(value, f"vibration_spec.{key}")
+                    if limit < 0.0:
+                        raise ValueError(f"vibration_spec.{key} must be >= 0.")
+                    vibration_spec[key] = limit
+            mat = _resolve_study_material(material, "frequency_response")
             fixture_sets: list = []
             for q in fixtures:
                 fixture_sets.extend(_sim_face_points(d, q))
-            if fixtures and not fixture_sets:
-                return _dumps({"ok": False, "error": "no fixture faces resolved — "
-                               "the face queries you provided didn't match any surface "
-                               "points. Use query_geometry() to find the right face query."})
+            if not fixture_sets:
+                raise ValueError(
+                    "no fixture faces resolved — use query_geometry() to confirm the fixed "
+                    "support face before running frequency response.")
+            step = _tmp(".step")
+            cb.call("doc_export_step", {"doc_id": d, "path": step})
             study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
                      "mesh_order": 2, "fineness": mesh_fineness}
 
@@ -1133,18 +1656,44 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 if not res.get("ok"):
                     return {"ok": False, "doc_id": d,
                             "error": res.get("error", "modal solve failed")}
-                freqs = res.get("freqs_hz", [])
-                shapes = res.get("mode_shapes", [])
-                n_nodes = int(res.get("n_nodes", 0))
-                if not freqs or not shapes or n_nodes <= 0:
+                freqs = res.get("freqs_hz")
+                shapes = res.get("mode_shapes")
+                try:
+                    n_nodes = _positive_int(res.get("n_nodes"), "modal result.n_nodes")
+                except ValueError as exc:
+                    return {"ok": False, "doc_id": d,
+                            "error": f"modal solve returned invalid node diagnostics: {exc}"}
+                if not isinstance(freqs, list) or len(freqs) < n_modes:
+                    got = len(freqs) if isinstance(freqs, list) else 0
+                    return {"ok": False, "doc_id": d, "error":
+                            f"modal solve returned only {got}/{n_modes} requested frequencies; "
+                            "refusing a partial frequency-response basis."}
+                try:
+                    freqs = [_finite_float(f, f"modal result.freqs_hz[{i}]")
+                             for i, f in enumerate(freqs)]
+                except ValueError as exc:
+                    return {"ok": False, "doc_id": d,
+                            "error": f"modal solve returned an invalid frequency: {exc}"}
+                if any(f < 0.0 for f in freqs):
+                    return {"ok": False, "doc_id": d,
+                            "error": "modal solve returned a negative frequency; refusing an "
+                                     "unphysical frequency-response basis."}
+                response_sweep = (_merge_default_frequency_sweep(sweep, freqs)
+                                  if using_default_sweep else sweep)
+                if not isinstance(shapes, list) or not shapes:
                     return {"ok": False, "doc_id": d, "error":
                             "modal solve returned no mode shapes — cannot build the "
                             "frequency response (need freqs_hz + mode_shapes + n_nodes)"}
                 # Total mass from the solid at the study material's density (eval_mass
                 # returns mass_g = volume_mm3 * density; kg = g / 1000).
-                dens = float(mat.get("density_g_cm3", 0.0))
+                dens = _finite_float(mat.get("density_g_cm3"), "material.density_g_cm3")
                 meas = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": dens})
-                total_mass_kg = float((meas or {}).get("mass_g") or 0.0) / 1000.0
+                try:
+                    total_mass_kg = _finite_float(
+                        (meas or {}).get("mass_g"), "eval_mass.mass_g") / 1000.0
+                except (AttributeError, ValueError) as exc:
+                    return {"ok": False, "doc_id": d, "error":
+                            f"could not determine a finite part mass: {exc}"}
                 if total_mass_kg <= 0.0:
                     return {"ok": False, "doc_id": d, "error":
                             "could not determine part mass (volume or density missing) — "
@@ -1156,7 +1705,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 harm = harmonic_response(
                     freqs_hz=freqs, mode_shapes_flat=shapes, n_nodes=n_nodes,
                     total_mass_kg=total_mass_kg, excitation_dir=ex_dir,
-                    sweep_hz=sweep, zeta=zeta, base_accel_g=base_accel_g)
+                    sweep_hz=response_sweep, zeta=zeta, base_accel_g=base_accel_g)
                 if psd is not None:
                     rand: dict = miles_response(
                         freqs_hz=freqs, mode_shapes_flat=shapes, n_nodes=n_nodes,
@@ -1170,7 +1719,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                     "vibration GRMS via Miles' equation."}
                 verdict = evaluate_vibration_spec(
                     vibration_spec, harm, rand if rand.get("ok") else None)
-                _persist_study(d, {
+                sid = _persist_study(d, {
                     "type": "fea_frequency_response",
                     "name": f"Frequency response ({mat.get('name', material)})",
                     "engine": "cpp+py_modal_superposition",
@@ -1182,19 +1731,24 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                 "total_grms": rand.get("total_grms"),
                                 "verdict": verdict},
                 })
-                return _interpreted(
-                    {"ok": True, "doc_id": d, "material": mat.get("name", material),
-                     "freqs_hz": freqs, "harmonic": harm, "random": rand,
-                     "verdict": verdict,
-                     "damping_assumption": f"zeta={zeta} (Q={1.0 / (2.0 * zeta):g}) — "
-                                           "assumed modal damping, not measured",
-                     "saved_to_study": True}, bc_notes)
+                out = {"ok": True, "doc_id": d, "material": mat.get("name", material),
+                       "freqs_hz": freqs, "harmonic": harm, "random": rand,
+                       "verdict": verdict,
+                       "damping_assumption": f"zeta={zeta} (Q={1.0 / (2.0 * zeta):g}) — "
+                                             "assumed modal damping, not measured",
+                       "saved_to_study": bool(sid)}
+                if not sid:
+                    out["study_not_saved_reason"] = (
+                        f"the results could not be written into document {d}; the response "
+                        "numbers are unaffected.")
+                return _interpreted(out, bc_notes)
 
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:
                 jid = _start_job("fea_frequency_response", _solve)
                 return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
-                               "note": "solving on a worker thread — poll get_job(job_id)"})
+                               "note": "solving on a worker thread — poll get_job(job_id)",
+                               "next_actions": [f"get_job('{jid}')"]})
             return _dumps(_solve_sync_or_handoff("fea_frequency_response", _solve))
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -1235,7 +1789,22 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         numbers as a fast directional estimate, not a certified coefficient.
         """
         try:
+            velocity = _finite_float(velocity, "velocity")
+            if velocity <= 0.0:
+                raise ValueError("velocity must be > 0 m/s; zero freestream produces a "
+                                 "zero-field study with undefined coefficients.")
+            aoa = _finite_float(aoa, "aoa")
+            fluid = str(fluid).strip().lower()
+            if fluid not in ("air", "water"):
+                raise ValueError(f"fluid must be 'air' or 'water', got {fluid!r}; refusing "
+                                 "to substitute air for an unknown fluid.")
+            cells = _positive_int(cells, "cells")
+            if cells < 16:
+                raise ValueError("cells must be at least 16; a coarser voxel grid cannot "
+                                 "resolve a useful flow field (48-200 is recommended).")
+            n_steps = _positive_int(n_steps, "n_steps")
             d = _doc(doc_id)
+            _require_sim_geometry(d)
             # Live-progress side-channel: the engine writes {pct,step,n_steps} to this file as the
             # LBM iterates; get_job reads it so a background run reports progress like OpenFOAM.
             prog_path = _tmp(".json")
@@ -1248,6 +1817,18 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 if not res.get("ok"):
                     return {"ok": False, "doc_id": d,
                             "error": res.get("error", "flow sim failed")}
+                if res.get("diverged"):
+                    return {"ok": False, "doc_id": d, "converged": False,
+                            "diverged": True,
+                            "error": res.get("warning") or
+                                     "flow solver diverged; no result is reportable. "
+                                     "Reduce velocity or refine the grid."}
+                try:
+                    _validate_flow_result(res, velocity)
+                except ValueError as exc:
+                    return {"ok": False, "doc_id": d,
+                            "error": f"flow solver returned an incomplete/non-finite or "
+                                     f"degenerate result: {exc}"}
                 out = {"ok": True, "doc_id": d}
                 for k in ("drag_n", "lift_n", "cd", "frontal_area_mm2", "reynolds",
                           "ref_length_mm", "velocity_ms", "aoa_deg", "fluid", "grid",
@@ -1255,7 +1836,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                           "min_feature_voxels", "steps_run", "diverged", "warning"):
                     if k in res:
                         out[k] = res[k]
-                _persist_study(d, {
+                sid = _persist_study(d, {
                     "type": "cfd_flow",
                     "name": f"CFD wind tunnel ({fluid}, {velocity} m/s, aoa {aoa})",
                     "engine": "cpp-lbm",
@@ -1263,14 +1844,15 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                "cells": cells, "n_steps": n_steps},
                     "results": {k: out[k] for k in out if k not in ("ok", "doc_id")},
                 })
-                out["saved_to_study"] = True
+                out["saved_to_study"] = bool(sid)
                 return out
 
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:
                 jid = _start_job("cfd_flow", _solve, progress=prog)
                 return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
-                               "note": "solving on a worker thread — poll get_job(job_id)"})
+                               "note": "solving on a worker thread — poll get_job(job_id)",
+                               "next_actions": [f"get_job('{jid}')"]})
             return _dumps(_solve_sync_or_handoff("cfd_flow", _solve, progress=prog))
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -1301,6 +1883,19 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         vmax_mps, converged, iters, notes}. If `converged` is false, raise the preset / iterations.
         """
         try:
+            velocity = _finite_float(velocity, "velocity")
+            if velocity <= 0.0:
+                raise ValueError("velocity must be > 0 m/s; zero freestream produces no "
+                                 "aerodynamic study.")
+            aoa = _finite_float(aoa, "aoa")
+            fluid = str(fluid).strip().lower()
+            if fluid not in ("air", "water"):
+                raise ValueError(f"fluid must be 'air' or 'water', got {fluid!r}; refusing "
+                                 "to silently use air.")
+            preset = str(preset).strip().lower()
+            if preset not in ("coarse", "medium", "fine", "xfine"):
+                return _dumps({"ok": False, "error": f"unknown preset {preset!r} — use "
+                               "coarse|medium|fine|xfine"})
             from services.sim.foam_runner import capabilities
             caps = capabilities()
             if not caps.get("openfoam"):
@@ -1314,10 +1909,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": False, "skipped": True, "reason": "openfoam_not_installed",
                                "error": "OpenFOAM is not available on this machine. Provision it "
                                f"with {how}. The coarse LBM run_cfd_flow still works."})
-            if preset not in ("coarse", "medium", "fine", "xfine"):
-                return _dumps({"ok": False, "error": f"unknown preset {preset!r} — use "
-                               "coarse|medium|fine|xfine"})
             d = _doc(doc_id)
+            _require_sim_geometry(d)
             # OpenFOAM meshes a watertight STL surface (build_case handles mm -> m).
             stl = _tmp(".stl")
             cb.call("export_file", {"doc_id": d, "path": stl, "format": "stl"})
@@ -1336,20 +1929,53 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                         speed_mps=float(velocity), preset=preset,
                                         aoa_deg=float(aoa), fluid=fluid_dict,
                                         on_progress=_on_progress)
-                return {"ok": True, "doc_id": d,
-                        "solver": f"OpenFOAM RANS (k-omega SST, {caps.get('openfoam_kind')})",
-                        "preset": preset, "cd": r.cd, "cl": r.cl, "ld": r.ld,
-                        "drag_n": r.drag_n, "lift_n": r.lift_n, "side_n": r.side_n,
-                        "reynolds": r.reynolds, "ref_area_mm2": r.ref_area_mm2,
-                        "vmax_mps": r.vmax_mps, "converged": (not r.diverged),
-                        "iters": r.steps_run, "notes": r.solver_notes,
-                        "velocity_ms": float(velocity), "aoa_deg": float(aoa), "fluid": fluid}
+                values = {
+                    "cd": _finite_float(r.cd, "OpenFOAM cd"),
+                    "cl": _finite_float(r.cl, "OpenFOAM cl"),
+                    "ld": _finite_float(r.ld, "OpenFOAM lift/drag"),
+                    "drag_n": _finite_float(r.drag_n, "OpenFOAM drag_n"),
+                    "lift_n": _finite_float(r.lift_n, "OpenFOAM lift_n"),
+                    "side_n": _finite_float(r.side_n, "OpenFOAM side_n"),
+                    "reynolds": _finite_float(r.reynolds, "OpenFOAM reynolds"),
+                    "ref_area_mm2": _finite_float(r.ref_area_mm2, "OpenFOAM ref_area_mm2"),
+                    "vmax_mps": _finite_float(r.vmax_mps, "OpenFOAM vmax_mps"),
+                }
+                if (values["drag_n"] <= 0.0 or values["cd"] <= 0.0
+                        or values["reynolds"] <= 0.0 or values["ref_area_mm2"] <= 0.0
+                        or values["vmax_mps"] <= 0.0):
+                    return {"ok": False, "doc_id": d, "converged": False,
+                            "error": "OpenFOAM returned a degenerate zero/negative drag, "
+                                     "coefficient, Reynolds number, reference area, or velocity; "
+                                     "no aerodynamic result is reportable."}
+                out = {"ok": not r.diverged, "doc_id": d,
+                       "solver": f"OpenFOAM RANS (k-omega SST, {caps.get('openfoam_kind')})",
+                       "preset": preset, **values, "converged": (not r.diverged),
+                       "iters": _positive_int(r.steps_run, "OpenFOAM iterations"),
+                       "notes": r.solver_notes, "velocity_ms": velocity,
+                       "aoa_deg": aoa, "fluid": fluid}
+                if r.diverged:
+                    out["error"] = ("OpenFOAM diverged; the diagnostic fields are retained "
+                                    "but must not be used as converged coefficients.")
+                    out["next_actions"] = ["retry with preset='medium' or lower velocity"]
+                    return out
+                sid = _persist_study(d, {
+                    "type": "cfd_openfoam",
+                    "name": f"OpenFOAM wind tunnel ({fluid}, {velocity} m/s, aoa {aoa})",
+                    "engine": "openfoam",
+                    "params": {"velocity": velocity, "aoa": aoa, "fluid": fluid,
+                               "preset": preset},
+                    "results": {k: v for k, v in out.items()
+                                if k not in ("ok", "doc_id")}})
+                out["saved_to_study"] = bool(sid)
+                return out
 
+            _autosave_all_open()
             jid = _start_job("cfd_openfoam", _solve, progress=prog)
             return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
                            "solver": caps.get("openfoam_version"), "preset": preset,
                            "note": "OpenFOAM RANS runs for minutes — poll get_job(job_id); it "
-                                   "reports live meshing/solve progress."})
+                                   "reports live meshing/solve progress.",
+                           "next_actions": [f"get_job('{jid}')"]})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -1364,29 +1990,33 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     # (skipped:true) when ccx is absent. See services/mcp/fea_advanced.py.
     # ================================================================
 
-    def _part_bbox_dims(d: str) -> tuple:
-        """Return (L, b, h) = the part's world bounding-box size (mm), sorted so
-        L is the longest span (the slender axis for beam/column proxies)."""
-        r = cb.call("asm_world_bodies", {"doc_id": d, "explode": False})
-        bodies = r.get("bodies", [])
-        if not bodies:
-            raise ValueError("no bodies in the document — build geometry first")
-        # Union of all body bboxes.
+    def _part_bbox_world_spans(d: str) -> tuple[float, float, float]:
+        """Return finite positive world-X/Y/Z union spans for proxy mappings."""
+        bodies = _require_sim_geometry(d)
         lo = [float("inf")] * 3
         hi = [float("-inf")] * 3
-        for bd in bodies:
-            bb = bd.get("bbox", {})
-            mn, mx = bb.get("min"), bb.get("max")
-            if not (mn and mx):
-                continue
-            for i in range(3):
-                lo[i] = min(lo[i], float(mn[i]))
-                hi[i] = max(hi[i], float(mx[i]))
-        size = sorted((hi[i] - lo[i] for i in range(3)), reverse=True)
-        if size[0] <= 0:
-            raise ValueError("degenerate bounding box")
-        return size[0], size[1] if size[1] > 0 else size[0], \
-            size[2] if size[2] > 0 else size[0]
+        for index, body in enumerate(bodies):
+            bbox = body["bbox"]
+            for axis in range(3):
+                lo[axis] = min(
+                    lo[axis],
+                    _finite_float(bbox["min"][axis],
+                                  f"body[{index}].bbox.min[{axis}]"))
+                hi[axis] = max(
+                    hi[axis],
+                    _finite_float(bbox["max"][axis],
+                                  f"body[{index}].bbox.max[{axis}]"))
+        spans = tuple(hi[axis] - lo[axis] for axis in range(3))
+        if any(not math.isfinite(span) or span <= 0.0 for span in spans):
+            raise ValueError(
+                f"part bounding box is missing or degenerate ({spans!r}); proxy solvers "
+                "require a finite 3-D solid with non-zero span on every axis.")
+        return spans
+
+    def _part_bbox_dims(d: str) -> tuple:
+        """Return longest-to-shortest bounding-box spans for orientation-free proxies."""
+        size = sorted(_part_bbox_world_spans(d), reverse=True)
+        return size[0], size[1], size[2]
 
 
 
@@ -1397,7 +2027,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         surface: str = "machined", reliability_pct: float = 50.0,
                         temperature_c: float = 20.0, theory: str = "goodman",
                         mesh_fineness: Union[float, str] = 0.5, doc_id: Optional[str] = None,
-                        background: bool = False) -> str:
+                        background: bool = False, load_case: str = "bending") -> str:
         """High-cycle fatigue life (S-N) on the current part — reuses the linear-static
         stress field, then applies mean-stress theory + Marin correction + Basquin life.
 
@@ -1418,6 +2048,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         surface        : "ground"|"machined"|"hot_rolled"|"as_forged" (Marin ka).
         reliability_pct: design reliability for ke (50/90/99/99.9...).
         theory         : which mean-stress theory to report at top level (default goodman).
+        load_case      : "bending" (default), "axial", or "torsion" for Marin kb/kc.
+                         Rectangular bending/torsion uses d_e=0.808*sqrt(b*h) from the
+                         two smaller bounding-box spans; axial uses kb=1.
 
         Returns {ok, regime: infinite|finite|static_overload, cycles, fos_endurance,
         se_corrected_mpa, theories{...}}. regime="infinite" ⇒ >1e6 cycles (runout).
@@ -1434,15 +2067,38 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=bc_notes)
             loads = _norm_bc_list(loads, "loads", notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
-            mat = _resolve_material(coerce_json_or_repr(material))
-            Sut = float(mat.get("ultimate_mpa") or 0.0)
-            Se_base = float(mat.get("endurance_mpa") or 0.0)
-            if Sut <= 0:
-                return _dumps({"ok": False, "error":
-                               f"material {mat.get('name', material)!r} has no ultimate_mpa — "
-                               "fatigue needs ultimate + endurance strength."})
-            step = _tmp(".step")
-            cb.call("doc_export_step", {"doc_id": d, "path": step})
+            mat = _resolve_study_material(material, "fatigue")
+            Sut = _finite_float(mat["ultimate_mpa"], "material.ultimate_mpa")
+            Se_base = _finite_float(mat["endurance_mpa"], "material.endurance_mpa")
+            surface = str(surface).strip().lower().replace("-", "_").replace(" ", "_")
+            surf_map = {"ground": 0, "machined": 1, "hot_rolled": 2, "as_forged": 3}
+            if surface not in surf_map:
+                raise ValueError(f"surface must be one of {sorted(surf_map)}, got {surface!r}.")
+            load_type = str(load_type).strip().lower().replace("-", "_")
+            if load_type not in ("reversed", "zero_based", "ratio"):
+                raise ValueError("load_type must be 'reversed', 'zero_based', or 'ratio'; "
+                                 f"got {load_type!r}.")
+            load_ratio = _finite_float(load_ratio, "load_ratio")
+            if load_type == "ratio" and load_ratio >= 1.0:
+                raise ValueError("load_ratio must be < 1 for a cyclic ratio study (R=min/max).")
+            theory = str(theory).strip().lower()
+            valid_theories = {"goodman", "gerber", "soderberg", "asme", "morrow"}
+            if theory not in valid_theories:
+                raise ValueError(f"theory must be one of {sorted(valid_theories)}, got "
+                                 f"{theory!r}.")
+            reliability_pct = _finite_float(reliability_pct, "reliability_pct")
+            if not 50.0 <= reliability_pct <= 99.999:
+                raise ValueError("reliability_pct must be in the supported Marin table range "
+                                 "50..99.999.")
+            temperature_c = _finite_float(temperature_c, "temperature_c")
+            if not 20.0 <= temperature_c <= 550.0:
+                raise ValueError("temperature_c must be in the supported Marin correction "
+                                 "range 20..550 °C; extrapolation is not supported.")
+            load_case = str(load_case).strip().lower()
+            load_case_map = {"bending": 0, "axial": 1, "torsion": 2}
+            if load_case not in load_case_map:
+                raise ValueError(f"load_case must be one of {sorted(load_case_map)}, got "
+                                 f"{load_case!r}.")
             fixture_sets: list = []
             for q in fixtures:
                 fixture_sets.extend(_sim_face_points(d, q))
@@ -1454,18 +2110,25 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "no fixture faces resolved — use query_geometry() to confirm the "
                     "face query.")})
             load_specs = _build_load_specs(d, loads, "fatigue")
-
-            surf_map = {"ground": 0, "machined": 1, "hot_rolled": 2, "as_forged": 3}
+            _reject_fully_constrained_loads(fixture_sets, load_specs, "fatigue FEA")
+            _, b, h = _part_bbox_dims(d)
+            diameter_mm = 0.808 * math.sqrt(b * h)
+            corr = fa.corrected_endurance(
+                Se_base, Sut, surface=surf_map[surface],
+                load_case=load_case_map[load_case], diameter_mm=diameter_mm,
+                temperature_c=temperature_c, reliability_pct=reliability_pct)
+            corr["diameter_mm"] = diameter_mm
+            corr["load_case"] = load_case
             lt_map = {"reversed": {"lmin": -1.0, "lmax": 1.0},
                       "zero_based": {"lmin": 0.0, "lmax": 1.0},
-                      "ratio": {"lmin": float(load_ratio), "lmax": 1.0}}
-            corr = fa.corrected_endurance(Se_base, Sut, surface=surf_map.get(surface, 1),
-                                          load_case=0, temperature_c=temperature_c,
-                                          reliability_pct=reliability_pct)
-            fat = {"ultimate_mpa": Sut, "yield_mpa": float(mat.get("yield_mpa") or 0.0),
+                      "ratio": {"lmin": load_ratio, "lmax": 1.0}}
+            fat = {"ultimate_mpa": Sut, "yield_mpa": float(mat["yield_mpa"]),
                    "se_corrected_mpa": corr["se_corrected_mpa"],
                    "se_base_mpa": corr["se_base_mpa"]}
-            fat.update(lt_map.get(load_type, lt_map["reversed"]))
+            fat.update(lt_map[load_type])
+            # Export only after all material/BC/fatigue setup checks have passed.
+            step = _tmp(".step")
+            cb.call("doc_export_step", {"doc_id": d, "path": step})
             study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
                      "loads": load_specs, "mesh_order": 2, "fineness": mesh_fineness,
                      "fatigue": fat}
@@ -1486,11 +2149,19 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     return {"ok": False, "doc_id": d,
                             "error": res.get("error", "fatigue solve failed")}
                 theories = res.get("summary", {}).get("theories", {})
+                if not isinstance(theories, dict) or not theories:
+                    return {"ok": False, "doc_id": d, "error":
+                            "fatigue solver returned no mean-stress theory results; no life "
+                            "or safety factor can be reported."}
+                if theory not in theories:
+                    return {"ok": False, "doc_id": d, "error":
+                            f"fatigue solver did not return the requested {theory!r} theory "
+                            f"(available: {sorted(theories)})."}
                 life = fa.fatigue_summarize(theories, corr["se_corrected_mpa"], Sut,
                                             theory=theory)
                 life.update({"ok": True, "doc_id": d, "marin": corr,
                              "material": mat.get("name", material)})
-                _persist_study(d, {
+                sid = _persist_study(d, {
                     "type": "fea_fatigue",
                     "name": f"Fatigue ({mat.get('name', material)}, {theory})",
                     "engine": "cpp",
@@ -1498,13 +2169,15 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "results": {"theories": life["theories"], "regime": life["regime"],
                                 "cycles": life["cycles"], "fos_endurance": life["fos_endurance"]},
                 })
-                life["saved_to_study"] = True
+                life["saved_to_study"] = bool(sid)
                 return _interpreted(life, bc_notes)
 
             _autosave_all_open()
             if background:
                 jid = _start_job("fea_fatigue", _solve)
-                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d})
+                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
+                               "note": "solving on a worker thread — poll get_job(job_id)",
+                               "next_actions": [f"get_job('{jid}')"]})
             return _dumps(_solve_sync_or_handoff("fea_fatigue", _solve))
         except _StudyRefusal as r:
             return _dumps(r.payload)
@@ -1577,140 +2250,223 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                       'a list of {"face": <query>, "temperature": <°C>}')
             cold_faces = require_list(cold_faces, "cold_faces",
                                        'a list of {"face": <query>, "temperature": <°C>}')
-            if loads is not None:
-                loads = require_list(loads, "loads",
-                                      'a list of {"face": <query>, "flux_w_m2": <q>} or '
-                                      '{"face": <query>, "h_w_m2k": <h>} entries')
-                loads = _norm_bc_list(loads, "loads", notes=bc_notes)
+            loads = ([] if loads is None else require_list(
+                loads, "loads", 'a list of {"face": <query>, "flux_w_m2": <q>} or '
+                '{"face": <query>, "h_w_m2k": <h>} entries'))
+            loads = _norm_bc_list(loads, "loads", notes=bc_notes)
             hot_faces = _norm_bc_list(hot_faces, "hot_faces", notes=bc_notes)
             cold_faces = _norm_bc_list(cold_faces, "cold_faces", notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
-            if transient is not None:
-                transient = require_mapping(transient, "transient",
-                                             'a dict like {"t_end_s": 60, "dt_s": 0.5}')
             material = coerce_json_or_repr(material)
+            if conductivity_w_mk is not None:
+                conductivity_w_mk = _finite_float(
+                    conductivity_w_mk, "conductivity_w_mk")
+                if conductivity_w_mk <= 0.0:
+                    raise ValueError("conductivity_w_mk must be > 0.")
+            if specific_heat_j_kgk is not None:
+                specific_heat_j_kgk = _finite_float(
+                    specific_heat_j_kgk, "specific_heat_j_kgk")
+                if specific_heat_j_kgk <= 0.0:
+                    raise ValueError("specific_heat_j_kgk must be > 0.")
             if transient is not None:
+                transient = require_mapping(
+                    transient, "transient",
+                    'a dict like {"t_end_s": 60, "dt_s": 0.5}')
+                unknown = set(transient) - {
+                    "t_end_s", "dt_s", "t_init_c", "frame_times_s", "capacitance"}
+                if unknown:
+                    raise ValueError(
+                        f"transient has unsupported fields {sorted(unknown)!r}; refusing to "
+                        "ignore them.")
+                if "t_end_s" not in transient:
+                    raise ValueError("transient needs t_end_s in seconds.")
+                t_end = _finite_float(transient["t_end_s"], "transient.t_end_s")
+                if t_end <= 0.0:
+                    raise ValueError("transient.t_end_s must be > 0.")
+                dt = (_finite_float(transient["dt_s"], "transient.dt_s")
+                      if transient.get("dt_s") is not None else 0.0)
+                if dt < 0.0 or dt > t_end:
+                    raise ValueError("transient.dt_s must be > 0 and <= t_end_s when supplied.")
+                if "dt_s" in transient and dt == 0.0:
+                    raise ValueError("transient.dt_s must be > 0 when supplied.")
+                t_init = _finite_float(transient.get("t_init_c", 20.0),
+                                       "transient.t_init_c")
+                frame_times_raw = transient.get("frame_times_s", [])
+                if not isinstance(frame_times_raw, (list, tuple)):
+                    raise ValueError("transient.frame_times_s must be a list.")
+                frame_times = [_finite_float(t, f"transient.frame_times_s[{i}]")
+                               for i, t in enumerate(frame_times_raw)]
+                if any(t < 0.0 or t > t_end for t in frame_times):
+                    raise ValueError("transient.frame_times_s must lie in [0,t_end_s].")
+                if any(b <= a for a, b in zip(frame_times, frame_times[1:])):
+                    raise ValueError("transient.frame_times_s must be strictly ascending.")
+                capacitance = str(transient.get("capacitance", "lumped")).strip().lower()
+                if capacitance not in ("lumped", "consistent"):
+                    raise ValueError("transient.capacitance must be 'lumped' or 'consistent'.")
+
                 d = _doc(doc_id)
-                mat = _resolve_material(material)
-                k_cond = (float(conductivity_w_mk) if conductivity_w_mk is not None
-                          else float(mat.get("conductivity_w_mk")
-                                     or _default_conductivity(mat, material)))
-                if not transient.get("t_end_s"):
-                    return _dumps({"ok": False, "error":
-                                   "transient needs a dict with t_end_s (seconds), e.g. "
-                                   "{\"t_end_s\": 60, \"dt_s\": 0.5}"})
-                cp = (float(specific_heat_j_kgk) if specific_heat_j_kgk is not None
-                      else float(mat.get("cp_j_kgk") or _default_specific_heat(mat, material)))
-                step = _tmp(".step")
-                cb.call("doc_export_step", {"doc_id": d, "path": step})
+                _require_sim_geometry(d)
+                mat = _resolve_study_material(
+                    material, "thermal_transient",
+                    conductivity_w_mk=conductivity_w_mk,
+                    specific_heat_j_kgk=specific_heat_j_kgk)
+                k_cond = mat["conductivity_w_mk"]
+                cp = mat["cp_j_kgk"]
 
                 def _faceset(q):
                     merged = _merge_face_sets(_sim_face_points(d, q))
                     return merged if merged["points"] else None
 
                 fixtures = []
-                for f in (list(hot_faces or []) + list(cold_faces or [])):
+                thermal_driving = False
+                for i, f in enumerate(list(hot_faces) + list(cold_faces)):
+                    where = f"temperature_faces[{i}]"
                     if not isinstance(f, dict) or "temperature" not in f or "face" not in f:
                         raise ValueError("each hot/cold face needs {'face': <query>, "
                                          f"'temperature': <°C>}}: {f!r}")
+                    _reject_ignored_fields(f, {"face", "temperature"}, where)
+                    temp = _finite_float(f["temperature"], f"{where}.temperature")
                     fs = _faceset(f["face"])
                     if fs is None:
-                        return _dumps({"ok": False, "error":
-                                       f"face query {f['face']!r} resolved to no faces — "
-                                       "use query_geometry() to confirm"})
-                    fs["temp_c"] = float(f["temperature"])
+                        raise ValueError(f"face query {f['face']!r} resolved to no faces — "
+                                         "use query_geometry() to confirm.")
+                    fs["temp_c"] = temp
                     fixtures.append(fs)
+                    thermal_driving = thermal_driving or abs(temp - t_init) > 0.0
 
                 load_specs = []
-                for ld in (loads or []):
+                for i, ld in enumerate(loads):
+                    where = f"loads[{i}]"
                     if not isinstance(ld, dict) or "face" not in ld:
                         raise ValueError(f"each thermal load needs a 'face' query: {ld!r}")
+                    has_flux = "flux_w_m2" in ld
+                    has_film = "h_w_m2k" in ld
+                    if has_flux == has_film:
+                        raise ValueError(f"{where} needs exactly one of flux_w_m2 or h_w_m2k.")
                     fs = _faceset(ld["face"])
                     if fs is None:
-                        return _dumps({"ok": False, "error":
-                                       f"load face query {ld['face']!r} resolved to no faces"})
-                    if "flux_w_m2" in ld:
-                        spec = {"faces": fs, "type": "flux",
-                                "magnitude": float(ld["flux_w_m2"])}
-                        if isinstance(ld.get("schedule"), dict):
+                        raise ValueError(f"load face query {ld['face']!r} resolved to no faces.")
+                    if has_flux:
+                        _reject_ignored_fields(ld, {"face", "flux_w_m2", "schedule"}, where)
+                        flux = _finite_float(ld["flux_w_m2"], f"{where}.flux_w_m2")
+                        active = _validate_thermal_schedule(ld.get("schedule"),
+                                                            f"{where}.schedule")
+                        spec = {"faces": fs, "type": "flux", "magnitude": flux}
+                        if "schedule" in ld:
                             spec["schedule"] = ld["schedule"]
-                    elif "h_w_m2k" in ld:
-                        spec = {"faces": fs, "type": "convection",
-                                "h": float(ld["h_w_m2k"]),
-                                "t_amb_c": float(ld.get("t_amb_c", 20.0))}
+                        thermal_driving = thermal_driving or (active and abs(flux) > 0.0)
                     else:
-                        raise ValueError("thermal load needs 'flux_w_m2' (+ optional "
-                                         f"'schedule') or 'h_w_m2k'/'t_amb_c': {ld!r}")
+                        _reject_ignored_fields(ld, {"face", "h_w_m2k", "t_amb_c"}, where)
+                        htc = _finite_float(ld["h_w_m2k"], f"{where}.h_w_m2k")
+                        if htc <= 0.0:
+                            raise ValueError(f"{where}.h_w_m2k must be > 0.")
+                        ambient = _finite_float(ld.get("t_amb_c", 20.0),
+                                                f"{where}.t_amb_c")
+                        spec = {"faces": fs, "type": "convection",
+                                "h": htc, "t_amb_c": ambient}
+                        thermal_driving = thermal_driving or abs(ambient - t_init) > 0.0
                     load_specs.append(spec)
 
-                # An adiabatic heat-up with no Dirichlet face is well-posed ONLY when a
-                # flux/convection load drives it. With neither, C dT/dt + K T = 0 from a
-                # uniform t_init has the constant solution: measured 2026-07-30,
-                # transient={"t_end_s":10,"dt_s":1} with no faces and no loads returned
-                # ok:true, max_temp_c 20.0 == t_init — an "answer" that is just the input.
-                if not fixtures and not load_specs:
-                    return _dumps({"ok": False, "error": (
-                        "the transient study has no thermal input at all — no hot/cold face "
-                        "held at a temperature and no flux/convection load, so the part just "
-                        f"stays at t_init_c ({float(transient.get('t_init_c', 20.0))} °C) for "
-                        "the whole run. Give it at least one Dirichlet face "
-                        '(hot_faces=[{"face":"+x","temperature":100}]) or one load '
-                        '(loads=[{"face":"top","flux_w_m2":5000}] / '
-                        '[{"face":"top","h_w_m2k":25,"t_amb_c":20}]).')})
+                if not thermal_driving:
+                    raise _StudyRefusal({"ok": False, "error": (
+                        "the transient study has no thermal input / non-zero excitation: every "
+                        "fixed temperature and convection ambient equals t_init_c, and every "
+                        "active heat flux is zero. The part would only echo its initial "
+                        "temperature. Supply a different face/ambient temperature or a "
+                        "non-zero scheduled flux.")})
 
+                step = _tmp(".step")
+                cb.call("doc_export_step", {"doc_id": d, "path": step})
                 study = {"step_path": step,
                          "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
                          "fixtures": fixtures, "loads": load_specs,
-                         "fineness": mesh_fineness,
-                         "transient": {
-                             "t_end_s": float(transient["t_end_s"]),
-                             "dt_s": float(transient.get("dt_s") or 0.0),
-                             "t_init_c": float(transient.get("t_init_c", 20.0)),
-                             "frame_times_s": [float(t) for t in
-                                               transient.get("frame_times_s", [])],
-                             "capacitance": transient.get("capacitance", "lumped"),
-                         }}
+                         "mesh_order": 2, "fineness": mesh_fineness,
+                         "transient": {"t_end_s": t_end, "dt_s": dt,
+                                       "t_init_c": t_init,
+                                       "frame_times_s": frame_times,
+                                       "capacitance": capacitance}}
                 res = cb.call("sim_run_thermal", {"study": study})
                 if not res.get("ok"):
                     return _dumps({"ok": False, "doc_id": d,
                                    "error": res.get("error", "transient thermal solve failed")})
-                frames = res.get("frames") or []
-                frame_summ = [{"t_s": fr.get("t_s"),
-                               "max_temp_c": round(max(fr.get("temperature") or [0.0]), 3)}
-                              for fr in frames]
+                try:
+                    checked = _validate_transient_thermal_result(res, t_end)
+                except ValueError as exc:
+                    return _dumps({"ok": False, "doc_id": d,
+                                   "error": f"thermal solver returned an incomplete/non-finite "
+                                            f"or inconsistent result: {exc}"})
+                frames = checked["frames"]
+                frame_summ = checked["frame_summaries"]
+                summary = checked["summary"]
+                counts = checked["counts"]
                 out = {"ok": True, "doc_id": d, "transient": True,
                        "solver": "C++ core transient conduction (backward Euler, "
-                                 f"{study['transient']['capacitance']} capacitance)",
+                                 f"{capacitance} capacitance)",
                        "material": mat.get("name", material),
                        "conductivity_w_mk": k_cond, "specific_heat_j_kgk": cp,
-                       "summary": res.get("summary", {}),
-                       "n_steps": res.get("n_steps"), "n_nodes": res.get("n_nodes"),
-                       "n_elems": res.get("n_elems"),
-                       "frames": frame_summ,
+                       "summary": summary,
+                       "n_steps": counts["n_steps"], "n_nodes": counts["n_nodes"],
+                       "n_elems": counts["n_elems"], "frames": frame_summ,
                        "solver_notes": res.get("solver_notes", []),
                        "note": "summary.max_temp_c is the PEAK over the whole run "
                                "(max-temp envelope), at summary.max_temp_time_s; "
                                "per-frame nodal fields persisted in the doc study."}
-                _persist_study(d, {"type": "fea_thermal_transient",
-                                   "name": f"Transient thermal ({mat.get('name', material)})",
-                                   "engine": "cpp",
-                                   "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
-                                   "transient": study["transient"],
-                                   "results": {"summary": res.get("summary", {}),
-                                               "frames": frames,
-                                               "envelope_max": res.get("envelope_max")}})
+                sid = _persist_study(d, {"type": "fea_thermal_transient",
+                                         "name": f"Transient thermal ({mat.get('name', material)})",
+                                         "engine": "cpp",
+                                         "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
+                                         "transient": study["transient"],
+                                         "results": {"summary": summary,
+                                                     "frames": frames,
+                                                     "envelope_max": checked["envelope_max"]}})
+                out["saved_to_study"] = bool(sid)
                 return _dumps(_interpreted(out, bc_notes))
 
+            if loads:
+                raise ValueError(
+                    "steady thermal box-proxy does not support flux/convection loads; pass "
+                    "transient={...} to run them on the real part mesh instead of silently "
+                    "dropping loads.")
+            if len(hot_faces) != 1 or len(cold_faces) != 1:
+                raise ValueError(
+                    "steady thermal box-proxy supports exactly one hot face and one cold "
+                    "face; use transient={...} for multiple real-mesh boundary faces.")
+            for label, entry in (("hot_faces[0]", hot_faces[0]),
+                                 ("cold_faces[0]", cold_faces[0])):
+                if not isinstance(entry, dict) or "face" not in entry or "temperature" not in entry:
+                    raise ValueError(f"{label} needs face + temperature.")
+                _reject_ignored_fields(entry, {"face", "temperature"}, label)
+            T_hot = _finite_float(hot_faces[0]["temperature"], "hot_faces[0].temperature")
+            T_cold = _finite_float(cold_faces[0]["temperature"], "cold_faces[0].temperature")
+            if T_hot == T_cold:
+                raise ValueError(
+                    "hot and cold temperatures are equal, so the steady solution is a "
+                    "constant input field with zero heat flow; provide a non-zero temperature "
+                    "difference.")
             from . import fea_advanced as fa
             if fa.ccx_path() is None:
                 return _dumps(fa._ccx_absent_result("thermal steady-state"))
             d = _doc(doc_id)
-            mat = _resolve_material(material)
-            k_cond = (float(conductivity_w_mk) if conductivity_w_mk is not None
-                      else float(mat.get("conductivity_w_mk") or _default_conductivity(mat, material)))
-            T_hot = _first_temperature(hot_faces, "hot_faces")
-            T_cold = _first_temperature(cold_faces, "cold_faces")
-            L, b, h = _part_bbox_dims(d)
+            mat = _resolve_study_material(
+                material, "thermal_steady", conductivity_w_mk=conductivity_w_mk)
+            k_cond = mat["conductivity_w_mk"]
+            hot_set = _merge_face_sets(_sim_face_points(d, hot_faces[0]["face"]))
+            cold_set = _merge_face_sets(_sim_face_points(d, cold_faces[0]["face"]))
+            if not hot_set["points"] or not cold_set["points"]:
+                raise ValueError("hot/cold face queries must both resolve to surface points.")
+
+            def _centroid(points):
+                return [sum(_finite_float(p[i], "face point") for p in points) / len(points)
+                        for i in range(3)]
+
+            hot_c = _centroid(hot_set["points"])
+            cold_c = _centroid(cold_set["points"])
+            L = math.sqrt(sum((a - b0) ** 2 for a, b0 in zip(hot_c, cold_c)))
+            if not math.isfinite(L) or L <= 1e-9:
+                raise ValueError(
+                    "hot and cold face centroids coincide; the 1-D box proxy cannot define "
+                    "a conduction length from those selections.")
+            _, b, h = _part_bbox_dims(d)
             gen = fa.build_thermal_bar_inp(L, b, h, k_cond, T_hot, T_cold)
             run = fa.run_ccx(gen["inp"], job="thermal")
             if run.get("skipped"):
@@ -1720,14 +2476,23 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                or run.get("error", "ccx thermal run failed"),
                                "backend": run.get("backend")})
             mid_T = fa.parse_dat_nodal(run["dat_path"], "NT", gen["mid_nodes"], component=1)
+            if mid_T is None or not math.isfinite(mid_T):
+                return _dumps({"ok": False, "doc_id": d, "backend": run["backend"],
+                               "error": "CalculiX completed but no finite mid-plane "
+                                        "temperature could be parsed; refusing a false-success "
+                                        "null result."})
             out = {"ok": True, "doc_id": d, "backend": run["backend"],
                    "solver": "CalculiX *HEAT TRANSFER, STEADY STATE (box proxy)",
                    "conductivity_w_mk": k_cond, "T_hot_c": T_hot, "T_cold_c": T_cold,
-                   "mid_plane_T_c": (round(mid_T, 3) if mid_T is not None else None),
+                   "boundary_separation_mm": L, "mid_plane_T_c": round(mid_T, 3),
                    "expected_mid_T_c": round(gen["expected_mid_T"], 3),
-                   "note": "box-proxy 1-D conduction estimate; ccx GPL-2.0 subprocess."}
-            _persist_study(d, {"type": "fea_thermal", "name": f"Thermal ({mat.get('name', material)})",
-                               "engine": "calculix", "results": out})
+                   "note": "1-D box proxy runs between the selected face centroids; "
+                           "ccx GPL-2.0 subprocess."}
+            sid = _persist_study(
+                d, {"type": "fea_thermal",
+                    "name": f"Thermal ({mat.get('name', material)})",
+                    "engine": "calculix", "results": out})
+            out["saved_to_study"] = bool(sid)
             return _dumps(_interpreted(out, bc_notes))
         except CoreError as e:
             return _err(e)
@@ -1758,39 +2523,122 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         CalculiX GPL-2.0 → subprocess-only. Absent ccx ⇒ {ok:false, skipped:true}.
         """
         try:
+            n_modes = _positive_int(n_modes, "n_modes")
             from . import fea_advanced as fa
             if fa.ccx_path() is None:
                 return _dumps(fa._ccx_absent_result("linear buckling"))
             d = _doc(doc_id)
-            load = require_list(load, "load",
-                                 'a single-item list [{"face": <query>, "force": [x,y,z]}]')
+            fixtures = require_list(
+                fixtures, "fixtures", 'one fixed face query, e.g. ["bottom"]')
+            load = require_list(
+                load, "load", 'a single-item list [{"face": <query>, "force": [x,y,z]}]')
             bc_notes: list = []
+            fixtures = _norm_bc_list(
+                fixtures, "fixtures", unwrap_query=True, notes=bc_notes)
             load = _norm_bc_list(load, "load", notes=bc_notes)
-            mat = _resolve_material(coerce_json_or_repr(material))
-            E = float(mat["E_mpa"]); nu = float(mat.get("nu", 0.3))
-            # A malformed load used to fall back to a hard-coded 1000 N SILENTLY (ok:true,
-            # a critical_loads_n the caller never asked for) — worse than a crash, because
-            # the response looked like a real answer to a different question. Teach the
-            # shape instead of guessing a magnitude the caller never supplied.
-            if not (load and isinstance(load[0], dict) and "force" in load[0]):
+            if len(fixtures) != 1:
                 raise ValueError(
-                    "load must be a single-item list [{'face': <query>, 'force': [x,y,z]}] "
-                    f"— got {load!r}. The force magnitude is what the buckling load factor "
-                    "scales; there is no safe default to assume. " + _BC_SHAPE_HELP)
-            vec = load[0]["force"]
-            P = math.sqrt(sum(float(x) ** 2 for x in vec))
-            # The surviving half of that same defect: `max(1.0, |F|)` turned force=[0,0,0]
-            # into a 1 N study and reported `applied_load_n: 1.0` plus a full
-            # critical_loads_n table (measured 2026-07-30). The clamp existed to keep the
-            # λ-scaling from dividing by zero; refusing is the honest way to do that.
+                    "buckling box-proxy supports exactly one clamped-end face query; "
+                    f"got {len(fixtures)}. Multiple independent fixtures cannot be mapped "
+                    "onto its fixed-free column model.")
+            if len(load) != 1 or not isinstance(load[0], dict):
+                raise ValueError(
+                    "load must be exactly one {'face': <query>, 'force': [x,y,z]} entry.")
+            _reject_ignored_fields(load[0], {"face", "force"}, "load[0]")
+            if "face" not in load[0] or "force" not in load[0]:
+                raise ValueError(
+                    "load must contain both face and force; there is no safe default "
+                    "buckling excitation.")
+            vec = _force_vector(load[0]["force"], "load[0]")
+            P = math.sqrt(sum(x * x for x in vec))
             if P <= 0.0:
                 raise ValueError(
-                    f"the buckling load is zero ({vec!r}). λ scales the APPLIED load, so a "
-                    "zero load makes every critical_loads_n zero and the answer "
-                    "meaningless. Pass the real compressive load, e.g. "
-                    "load=[{'face':'top','force':[0,0,-1000]}].")
-            L, b, h = _part_bbox_dims(d)
-            gen = fa.build_buckling_column_inp(L, b, h, E, nu, P, nz=4)
+                    "the buckling load is zero. λ scales the applied load, so every "
+                    "critical_loads_n value would be meaningless.")
+            mat = _resolve_study_material(material, "buckling")
+            E = _finite_float(mat["E_mpa"], "material.E_mpa")
+            nu = _finite_float(mat["nu"], "material.nu")
+            fixture_set = _merge_face_sets(_sim_face_points(d, fixtures[0]))
+            load_set = _merge_face_sets(_sim_face_points(d, load[0]["face"]))
+            if not fixture_set["points"] or not load_set["points"]:
+                raise ValueError("fixture and load face queries must both resolve.")
+            fixed_points = {
+                tuple(float(c) for c in point)
+                for point in fixture_set["points"]
+                if isinstance(point, (list, tuple)) and len(point) == 3
+            }
+            loaded_points = {
+                tuple(float(c) for c in point)
+                for point in load_set["points"]
+                if isinstance(point, (list, tuple)) and len(point) == 3
+            }
+            if loaded_points and loaded_points.issubset(fixed_points):
+                raise ValueError(
+                    "buckling fixture and load resolve to the same constrained face; the "
+                    "real load would be absorbed as a support reaction, while the proxy "
+                    "incorrectly places it on the free end.")
+            normal = load_set.get("face_normal")
+            fixture_normal = fixture_set.get("face_normal")
+            if not (isinstance(normal, (list, tuple)) and len(normal) == 3
+                    and isinstance(fixture_normal, (list, tuple))
+                    and len(fixture_normal) == 3):
+                raise ValueError(
+                    "buckling needs planar fixture/load end faces with outward normals so the "
+                    "fixed-free proxy axis can be mapped without guessing.")
+            unit_normal = _norm_direction(normal, "load[0].face_normal")
+            unit_fixture_normal = _norm_direction(
+                fixture_normal, "fixtures[0].face_normal")
+            face_opposition = sum(
+                a * b0 for a, b0 in zip(unit_normal, unit_fixture_normal))
+            if face_opposition > -0.99:
+                raise ValueError(
+                    "buckling fixture and load faces are not opposing parallel ends; the "
+                    f"normal dot product is {face_opposition:g}, but the box proxy requires "
+                    "approximately -1.")
+            normal_component = sum(a * b0 for a, b0 in zip(vec, unit_normal))
+            if normal_component >= -1e-9 * max(1.0, P):
+                raise ValueError(
+                    "buckling requires a compressive force pointing into the selected load "
+                    f"face; force·outward_normal={normal_component:g} N is tensile/tangential.")
+            tangential = math.sqrt(max(0.0, P * P - normal_component * normal_component))
+            if tangential > 1e-6 * P:
+                raise ValueError(
+                    "buckling box-proxy supports a purely axial compressive load; the supplied "
+                    f"force has {tangential:g} N tangential to the selected end face. Split "
+                    "shear/bending into a different analysis instead of silently mapping the "
+                    "full vector to axial compression.")
+            P = -normal_component
+
+            def _centroid(points, label):
+                return [sum(_finite_float(point[axis], label) for point in points) / len(points)
+                        for axis in range(3)]
+
+            fixture_c = _centroid(fixture_set["points"], "fixture face point")
+            load_c = _centroid(load_set["points"], "load face point")
+            delta = [load_c[axis] - fixture_c[axis] for axis in range(3)]
+            L = math.sqrt(sum(value * value for value in delta))
+            if not math.isfinite(L) or L <= 1e-9:
+                raise ValueError(
+                    "buckling fixture/load face centroids coincide; no column length can be "
+                    "mapped to the fixed-free proxy.")
+            axis_unit = [value / L for value in delta]
+            end_alignment = sum(a * b0 for a, b0 in zip(axis_unit, unit_normal))
+            if end_alignment < 0.99:
+                raise ValueError(
+                    "buckling fixture/load faces do not define a column axis aligned with the "
+                    f"load-face normal (alignment={end_alignment:g}); the box proxy cannot "
+                    "map those selections honestly.")
+            dominant_axis = max(range(3), key=lambda axis: abs(axis_unit[axis]))
+            if abs(axis_unit[dominant_axis]) < 0.99:
+                raise ValueError(
+                    "buckling box-proxy only supports a world-axis-aligned column; the selected "
+                    "end faces are rotated, so world bounding-box transverse dimensions would "
+                    "overstate the section.")
+            spans = _part_bbox_world_spans(d)
+            transverse = [spans[axis] for axis in range(3) if axis != dominant_axis]
+            b, h = transverse
+            gen = fa.build_buckling_column_inp(
+                L, b, h, E, nu, P, nz=4, n_modes=n_modes)
             run = fa.run_ccx(gen["inp"], job="buckle")
             if run.get("skipped"):
                 return _dumps(run)
@@ -1798,18 +2646,35 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": False, "error": run.get("stderr", "")[-400:]
                                or run.get("error", "ccx buckling run failed"),
                                "backend": run.get("backend")})
-            factors = fa.parse_buckle_factors(run["dat_path"])[:n_modes]
+            factors = fa.parse_buckle_factors(run["dat_path"])
+            if len(factors) < n_modes or any(
+                    not math.isfinite(f) or f <= 0.0 for f in factors[:n_modes]):
+                return _dumps({
+                    "ok": False, "doc_id": d, "backend": run["backend"],
+                    "error": f"CalculiX returned {len(factors)} usable buckling factors; "
+                             f"{n_modes} finite positive modes were requested. Refusing a "
+                             "partial/degenerate mode list."})
+            factors = factors[:n_modes]
             crit = [round(f * P, 3) for f in factors]
             out = {"ok": True, "doc_id": d, "backend": run["backend"],
                    "solver": "CalculiX *BUCKLE (box proxy, fixed-free column)",
                    "applied_load_n": P, "load_factors": [round(f, 4) for f in factors],
                    "critical_loads_n": crit,
                    "euler_reference_pcr_n": round(gen["expected_Pcr"], 3),
-                   "note": "box-proxy Euler buckling estimate; ccx GPL-2.0 subprocess. "
-                           "load_factor<1 ⇒ buckles below the applied load."}
-            _persist_study(d, {"type": "fea_buckling",
-                               "name": f"Buckling ({mat.get('name', material)})",
-                               "engine": "calculix", "results": out})
+                   "input_mapping": {
+                       "fixture_face": fixtures[0], "load_face": load[0]["face"],
+                       "force_dot_outward_normal_n": normal_component,
+                       "proxy_length_mm": L, "proxy_cross_section_mm": [b, h],
+                       "world_axis": ("x", "y", "z")[dominant_axis],
+                       "end_face_normal_alignment": end_alignment},
+                   "note": "box-proxy Euler buckling estimate after validating a real "
+                           "clamped face and inward compressive load face; ccx GPL-2.0 "
+                           "subprocess. load_factor<1 ⇒ buckles below the applied load."}
+            sid = _persist_study(
+                d, {"type": "fea_buckling",
+                    "name": f"Buckling ({mat.get('name', material)})",
+                    "engine": "calculix", "results": out})
+            out["saved_to_study"] = bool(sid)
             return _dumps(_interpreted(out, bc_notes))
         except CoreError as e:
             return _err(e)
@@ -1835,14 +2700,20 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         CalculiX GPL-2.0 → subprocess-only. Absent ccx ⇒ {ok:false, skipped:true}.
         """
         try:
+            pressure_mpa = _finite_float(pressure_mpa, "pressure_mpa")
+            if pressure_mpa <= 0.0:
+                raise ValueError(
+                    "pressure_mpa must be > 0; zero/negative pressure does not close and "
+                    "load the two-block contact proxy.")
             from . import fea_advanced as fa
             if fa.ccx_path() is None:
                 return _dumps(fa._ccx_absent_result("nonlinear contact"))
             d = _doc(doc_id)
-            mat = _resolve_material(coerce_json_or_repr(material))
-            E = float(mat["E_mpa"]); nu = float(mat.get("nu", 0.3))
+            mat = _resolve_study_material(material, "contact")
+            E = _finite_float(mat["E_mpa"], "material.E_mpa")
+            nu = _finite_float(mat["nu"], "material.nu")
             L, b, h = _part_bbox_dims(d)
-            gen = fa.build_contact_block_inp(L, b, h, E, nu, float(pressure_mpa))
+            gen = fa.build_contact_block_inp(L, b, h, E, nu, pressure_mpa)
             run = fa.run_ccx(gen["inp"], job="contact")
             if run.get("skipped"):
                 return _dumps(run)
@@ -1851,16 +2722,35 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                or run.get("error", "ccx contact run failed"),
                                "backend": run.get("backend")})
             rf = fa.parse_dat_nodal(run["dat_path"], "RF", gen["base_nodes"], component=3)
-            reaction = abs(rf * len(gen["base_nodes"])) if rf is not None else None
+            if rf is None or not math.isfinite(rf):
+                return _dumps({"ok": False, "doc_id": d, "backend": run["backend"],
+                               "error": "CalculiX completed but no finite base reaction "
+                                        "could be parsed; contact transmission is unverified."})
+            reaction = abs(rf * len(gen["base_nodes"]))
+            applied = gen["applied_load_n"]
+            balance_error = abs(reaction - applied) / applied * 100.0
+            if balance_error > 5.0:
+                return _dumps({
+                    "ok": False, "doc_id": d, "backend": run["backend"],
+                    "applied_load_n": round(applied, 3),
+                    "base_reaction_n": round(reaction, 3),
+                    "equilibrium_error_pct": round(balance_error, 3),
+                    "error": "contact result failed the load-conservation check (>5%); "
+                             "refusing to present it as a converged contact solve."})
             out = {"ok": True, "doc_id": d, "backend": run["backend"],
                    "solver": "CalculiX *STATIC,NLGEOM + *CONTACT PAIR (two-block proxy)",
-                   "applied_load_n": round(gen["applied_load_n"], 3),
-                   "base_reaction_n": (round(reaction, 3) if reaction is not None else None),
-                   "note": "box-proxy contact conservation check; base reaction should "
-                           "equal the applied load. ccx GPL-2.0 subprocess."}
-            _persist_study(d, {"type": "fea_contact",
-                               "name": f"Contact ({mat.get('name', material)})",
-                               "engine": "calculix", "results": out})
+                   "applied_load_n": round(applied, 3),
+                   "base_reaction_n": round(reaction, 3),
+                   "equilibrium_error_pct": round(balance_error, 3),
+                   "capability": "two-block bounding-box proxy; actual CAD contact pairs are "
+                                 "not mapped by this backend",
+                   "note": "box-proxy contact conservation check passed within 5%; "
+                           "ccx GPL-2.0 subprocess."}
+            sid = _persist_study(
+                d, {"type": "fea_contact",
+                    "name": f"Contact ({mat.get('name', material)})",
+                    "engine": "calculix", "results": out})
+            out["saved_to_study"] = bool(sid)
             return _dumps(out)
         except CoreError as e:
             return _err(e)

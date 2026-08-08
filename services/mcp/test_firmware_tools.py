@@ -277,6 +277,101 @@ def test_power_profile_without_a_trace_still_explains_itself(sim_spy):
     assert "power_profile" not in out
     assert [m for m, _ in seen] == ["fw_sim_run"]      # nothing fabricated
 
+@pytest.mark.parametrize(
+    ("argument", "value"),
+    [
+        ("run_s", -1.0),
+        ("run_s", float("nan")),
+        ("timeout_s", float("inf")),
+    ],
+)
+def test_simulation_rejects_invalid_time_bounds_before_rpc(sim_spy, argument, value):
+    tools, seen, _ = sim_spy
+    out = _call(tools, "fw_sim_run", project_id="p", **{argument: value})
+    assert out["code"] == "invalid_request"
+    assert not seen
+
+
+def test_simulation_rejects_bad_images_and_assertions_before_rpc(sim_spy, tmp_path):
+    tools, seen, _ = sim_spy
+    bad_elf = tmp_path / "bad.elf"
+    bad_elf.write_bytes(b"not an elf")
+    out = _call(tools, "fw_sim_run", project_id="p", elf_path=str(bad_elf))
+    assert out["code"] == "invalid_request" and "not an ELF" in out["hint"]
+    assert not seen
+
+    out = _call(tools, "fw_sim_run", project_id="p", assertions=[""])
+    assert out["code"] == "invalid_request" and "non-empty" in out["hint"]
+    assert not seen
+
+
+def test_sensor_tool_refuses_ambiguous_nonfinite_and_invalid_grids(sim_spy):
+    tools, seen, _ = sim_spy
+    profile = {"t_s": [0.0, 1.0], "altitude_m": [10.0, 11.0]}
+    sensors = [{"device": "bmp280"}]
+
+    out = _call(
+        tools, "fw_sensor_scenario", profile=profile, sim_result=profile,
+        sensor_map=sensors)
+    assert out["code"] == "invalid_request" and "not both" in out["hint"]
+    out = _call(
+        tools, "fw_sensor_scenario", profile=profile, sensor_map=sensors, dt_s=0.0)
+    assert out["code"] == "invalid_request" and "dt_s" in out["hint"]
+    out = _call(
+        tools, "fw_sensor_scenario", profile=profile, sensor_map=sensors,
+        duration_s=-1.0)
+    assert out["code"] == "invalid_request" and "duration_s" in out["hint"]
+    out = _call(
+        tools, "fw_sensor_scenario",
+        profile='{"t_s":[0, NaN], "altitude_m":[10,11]}',
+        sensor_map=sensors)
+    assert out["code"] == "invalid_request" and "$.t_s[1]" in out["hint"]
+    assert not seen
+
+
+def test_direct_emulator_tools_validate_setup_and_forward_valid_runs(sim_spy, tmp_path):
+    tools, seen, _ = sim_spy
+    elf = tmp_path / "app.elf"
+    header = bytearray(52)
+    header[:7] = b"\x7fELF\x01\x01\x01"
+    header[16:18] = (2).to_bytes(2, "little")   # ET_EXEC
+    header[18:20] = (83).to_bytes(2, "little")  # EM_AVR
+    elf.write_bytes(header)
+    resc = tmp_path / "app.resc"
+    resc.write_text("mach create\n", encoding="utf-8")
+
+    out = _call(
+        tools, "fw_emulate_simavr", elf_path=str(elf), mcu="atmega328p", run_s=0.5)
+    assert out == {}
+    assert seen[-1] == (
+        "fw_emulate_simavr",
+        {"elf_path": str(elf), "mcu": "atmega328p", "run_s": 0.5},
+    )
+
+    out = _call(
+        tools, "fw_emulate_renode", resc_path=str(resc), run_s=1.0, gdb=True,
+        gdb_port=4444, mi_commands=["-exec-step-instruction"])
+    assert out == {}
+    assert seen[-1] == (
+        "fw_emulate_renode",
+        {
+            "resc_path": str(resc),
+            "run_s": 1.0,
+            "gdb": True,
+            "gdb_port": 4444,
+            "mi_commands": ["-exec-step-instruction"],
+        },
+    )
+
+    seen.clear()
+    out = _call(
+        tools, "fw_emulate_simavr", elf_path=str(elf), mcu="atmega328p", run_s=-1.0)
+    assert out["code"] == "invalid_request"
+    out = _call(
+        tools, "fw_emulate_renode", resc_path=str(resc), mi_commands=["-exec-run"])
+    assert out["code"] == "invalid_request" and "gdb=True" in out["hint"]
+    assert not seen
+
 
 # ------------------------------------------------------------------ no catch-all
 

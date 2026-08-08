@@ -33,11 +33,12 @@
 //
 // integrated with IMPLICIT BACKWARD EULER at a fixed step dt:
 //     (K + C/dt) T^{n+1} = (C/dt) T^n + f(t^{n+1})
-// The iteration matrix A = K + C/dt is CONSTANT (fixed dt, constant material, constant
-// Dirichlet temperatures), so it is factored ONCE (Cholesky, SparseLU fallback — same
-// convention as the steady solver) and every step is a single back-substitution, even
-// when the loads are time-varying (only the RHS changes). Capacitance is LUMPED by
-// default (row-sum for tet4, HRZ diagonal scaling for tet10): a diagonal C keeps A in
+// For full-size steps the iteration matrix A = K + C/dt is constant and is
+// factored once; every step is then one back-substitution. When t_end is not an
+// integer multiple of dt, the final shorter step uses its actual duration and
+// its own one-off factorization, preserving the requested end-time energy.
+// Capacitance is LUMPED by default (row-sum for tet4, HRZ diagonal scaling for
+// tet10): a diagonal C keeps A in
 // K's sparsity pattern, and lumped capacitance + backward Euler is unconditionally
 // stable AND monotone (no spurious initial-transient oscillation at large dt), which is
 // the standard choice for conduction. A consistent C is available (lumped=false) for
@@ -47,6 +48,7 @@
 
 #include <string>
 #include <vector>
+#include "sim/sim_cancel.h"
 
 namespace chudware::sim {
 
@@ -136,12 +138,13 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
                                 const std::vector<double>& fixed_temps,
                                 const std::vector<ThermalFluxLoad>& fluxes,
                                 const std::vector<ThermalConvection>& convections,
-                                int nodes_per_elem = 4);
+                                int nodes_per_elem = 4,
+                                const SimCancelToken& cancel_token = {});
 
 struct ThermalTransientOptions {
     double rho_cp = 0.0;   // volumetric heat capacity rho*cp, J/(L^3·K); must be > 0
-    double t_end = 0.0;    // total simulated time, s; must be >= dt
-    double dt = 0.0;       // fixed backward-Euler step, s; must be > 0
+    double t_end = 0.0;    // total simulated time, s; must be > 0
+    double dt = 0.0;       // nominal backward-Euler step, s; must be > 0
     double t_init = 0.0;   // uniform initial temperature (used when init_temps is empty)
     std::vector<double> init_temps;   // optional per-node initial field (size n_nodes)
     std::vector<double> frame_times;  // times at which to record a full nodal frame; each
@@ -173,12 +176,11 @@ struct ThermalTransientResult {
 // Transient conduction with backward Euler (see the header comment). Unlike the steady
 // solver, a model with NO Dirichlet node and NO convection is WELL-POSED here (pure
 // adiabatic heating — the capacitance anchors the evolution), so no singularity guard.
-// Steady-state fea_thermal_solve() is untouched by this entry point (hard regression gate).
 ThermalTransientResult fea_thermal_transient(
     const std::vector<double>& points, const std::vector<int>& tets, double k_cond,
     const std::vector<int>& fixed_nodes, const std::vector<double>& fixed_temps,
     const std::vector<ThermalFluxLoad>& fluxes,
     const std::vector<ThermalConvection>& convections, const ThermalTransientOptions& opts,
-    int nodes_per_elem = 4);
+    int nodes_per_elem = 4, const SimCancelToken& cancel_token = {});
 
 }  // namespace chudware::sim

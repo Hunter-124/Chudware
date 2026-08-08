@@ -20,6 +20,7 @@ Circuit shape is FROZEN per docs/contracts/ecad/sim.md §1:
 
 from __future__ import annotations
 
+import math
 import re
 import warnings
 from typing import Any
@@ -52,12 +53,16 @@ def _parse_value(token: str) -> float:
     if not m:
         raise ValueError(f"Cannot parse SPICE value: {token!r}")
     num = float(m.group(1))
-    suf = (m.group(2) or "").lower()
-    return num * _SUFFIX.get(suf, 1.0)
+    value = num * _SUFFIX.get((m.group(2) or "").lower(), 1.0)
+    if not math.isfinite(value):
+        raise ValueError(f"SPICE value must be finite: {token!r}")
+    return value
 
 
 def _fmt_value(v: float) -> str:
     """Format a float back to a compact SPICE token (best suffix)."""
+    if not math.isfinite(float(v)):
+        raise ValueError("cannot format a non-finite SPICE value")
     if v == 0.0:
         return "0"
     abs_v = abs(v)
@@ -135,13 +140,15 @@ def _parse_source_params(tokens: list[str]) -> dict:
             # collect everything inside PULSE(...)
             full = " ".join(tokens[i:])
             inner = re.search(r"PULSE\(([^)]*)\)", full, re.IGNORECASE)
-            if inner:
-                vals = inner.group(1).split()
-                keys = ["v1", "v2", "td", "tr", "tf", "pw", "per"]
-                params["waveform"] = {"type": "PULSE",
-                                      **{k: _safe_val(v) for k, v in zip(keys, vals)}}
+            if not inner:
+                raise ValueError("PULSE source needs a closing parenthesis")
+            vals = inner.group(1).split()
+            if len(vals) < 2 or len(vals) > 7:
+                raise ValueError("PULSE source needs 2 to 7 numeric parameters")
+            keys = ["v1", "v2", "td", "tr", "tf", "pw", "per"]
+            params["waveform"] = {"type": "PULSE",
+                                  **{k: _safe_val(v) for k, v in zip(keys, vals)}}
             # skip to after closing paren
-            combined = " ".join(tokens[i:])
             skip = 1
             for j in range(i, len(tokens)):
                 if ")" in tokens[j]:
@@ -151,11 +158,14 @@ def _parse_source_params(tokens: list[str]) -> dict:
         elif tok.startswith("SIN(") or tok == "SIN":
             full = " ".join(tokens[i:])
             inner = re.search(r"SIN\(([^)]*)\)", full, re.IGNORECASE)
-            if inner:
-                vals = inner.group(1).split()
-                keys = ["vo", "va", "f", "td", "theta"]
-                params["waveform"] = {"type": "SIN",
-                                      **{k: _safe_val(v) for k, v in zip(keys, vals)}}
+            if not inner:
+                raise ValueError("SIN source needs a closing parenthesis")
+            vals = inner.group(1).split()
+            if len(vals) < 3 or len(vals) > 5:
+                raise ValueError("SIN source needs 3 to 5 numeric parameters")
+            keys = ["vo", "va", "f", "td", "theta"]
+            params["waveform"] = {"type": "SIN",
+                                  **{k: _safe_val(v) for k, v in zip(keys, vals)}}
             skip = 1
             for j in range(i, len(tokens)):
                 if ")" in tokens[j]:
@@ -165,12 +175,15 @@ def _parse_source_params(tokens: list[str]) -> dict:
         elif tok.startswith("PWL(") or tok == "PWL":
             full = " ".join(tokens[i:])
             inner = re.search(r"PWL\(([^)]*)\)", full, re.IGNORECASE)
-            if inner:
-                nums = inner.group(1).split()
-                pairs = []
-                for k in range(0, len(nums) - 1, 2):
-                    pairs.append((_safe_val(nums[k]), _safe_val(nums[k + 1])))
-                params["waveform"] = {"type": "PWL", "points": pairs}
+            if not inner:
+                raise ValueError("PWL source needs a closing parenthesis")
+            nums = inner.group(1).split()
+            if len(nums) < 4 or len(nums) % 2:
+                raise ValueError("PWL source needs at least two complete time/value pairs")
+            pairs = []
+            for k in range(0, len(nums), 2):
+                pairs.append((_safe_val(nums[k]), _safe_val(nums[k + 1])))
+            params["waveform"] = {"type": "PWL", "points": pairs}
             skip = 1
             for j in range(i, len(tokens)):
                 if ")" in tokens[j]:
@@ -178,27 +191,38 @@ def _parse_source_params(tokens: list[str]) -> dict:
                     break
             i += skip
         elif tok == "AC":
-            params["ac"] = {"mag": _safe_val(tokens[i + 1]) if i + 1 < len(tokens) else 1.0,
-                            "phase": _safe_val(tokens[i + 2]) if i + 2 < len(tokens) else 0.0}
-            i += 3
+            if i + 1 >= len(tokens):
+                raise ValueError("AC source needs a numeric magnitude")
+            magnitude = _safe_val(tokens[i + 1])
+            phase = 0.0
+            advance = 2
+            if i + 2 < len(tokens):
+                try:
+                    phase = _parse_value(tokens[i + 2])
+                    advance = 3
+                except ValueError:
+                    pass
+            params["ac"] = {"mag": magnitude, "phase": phase}
+            i += advance
         elif tok == "DC":
-            params["dc"] = _safe_val(tokens[i + 1]) if i + 1 < len(tokens) else 0.0
+            if i + 1 >= len(tokens):
+                raise ValueError("DC source needs a numeric value")
+            params["dc"] = _safe_val(tokens[i + 1])
             i += 2
         else:
-            # bare DC value
+            # A bare numeric token is a DC value. Anything else is malformed,
+            # not an instruction to manufacture a zero-valued source.
             try:
                 params["dc"] = _parse_value(tokens[i])
-            except ValueError:
-                pass
+            except ValueError as exc:
+                raise ValueError(f"unsupported source token {tokens[i]!r}") from exc
             i += 1
     return params
 
 
 def _safe_val(s: str) -> float:
-    try:
-        return _parse_value(s)
-    except ValueError:
-        return 0.0
+    """Parse a required numeric token without silently substituting zero."""
+    return _parse_value(s)
 
 
 # ---------------------------------------------------------------------------
@@ -230,44 +254,57 @@ def _parse_model_card(tokens: list[str]) -> tuple[str, str, dict]:
 # ---------------------------------------------------------------------------
 
 def _parse_analysis(keyword: str, tokens: list[str]) -> dict:
-    """Parse .tran/.dc/.ac/.op tokens into a study analysis dict."""
+    """Parse and validate .tran/.dc/.ac/.op tokens into a study analysis dict."""
     kw = keyword.upper()
     if kw == ".OP":
         return {"type": "op"}
     if kw == ".TRAN":
-        d: dict = {"type": "tran"}
-        if len(tokens) >= 1:
-            d["tstep"] = _safe_val(tokens[0])
-        if len(tokens) >= 2:
-            d["tstop"] = _safe_val(tokens[1])
-        if len(tokens) >= 3:
-            d["tstart"] = _safe_val(tokens[2])
-        d["uic"] = any(t.upper() == "UIC" for t in tokens)
-        return d
+        if len(tokens) < 2:
+            raise ValueError(".TRAN needs tstep and tstop")
+        tstep, tstop = _parse_value(tokens[0]), _parse_value(tokens[1])
+        if tstep <= 0.0 or tstop <= 0.0:
+            raise ValueError(".TRAN tstep and tstop must be greater than zero")
+        if tstop / tstep > 1_000_000:
+            raise ValueError(".TRAN exceeds 1000000 nominal steps")
+        analysis: dict[str, Any] = {"type": "tran", "tstep": tstep, "tstop": tstop}
+        if len(tokens) >= 3 and tokens[2].upper() != "UIC":
+            tstart = _parse_value(tokens[2])
+            if tstart < 0.0 or tstart >= tstop:
+                raise ValueError(".TRAN tstart must be non-negative and less than tstop")
+            analysis["tstart"] = tstart
+        analysis["uic"] = any(token.upper() == "UIC" for token in tokens)
+        return analysis
     if kw == ".DC":
-        # .DC Vsource start stop step
-        d = {"type": "dc"}
-        if len(tokens) >= 1:
-            d["source"] = tokens[0]
-        if len(tokens) >= 2:
-            d["start"] = _safe_val(tokens[1])
-        if len(tokens) >= 3:
-            d["stop"] = _safe_val(tokens[2])
-        if len(tokens) >= 4:
-            d["step"] = _safe_val(tokens[3])
-        return d
+        if len(tokens) < 4:
+            raise ValueError(".DC needs source, start, stop, and step")
+        start, stop, step = map(_parse_value, tokens[1:4])
+        if start != stop and (step == 0.0 or (stop - start) * step < 0.0):
+            raise ValueError(".DC step must be non-zero and point toward stop")
+        return {"type": "dc", "source": tokens[0],
+                "start": start, "stop": stop, "step": step}
     if kw == ".AC":
-        d = {"type": "ac"}
-        if len(tokens) >= 1:
-            d["sweep"] = tokens[0].lower()   # dec/lin/oct
-        if len(tokens) >= 2:
-            d["points"] = int(_safe_val(tokens[1]))
-        if len(tokens) >= 3:
-            d["fstart"] = _safe_val(tokens[2])
-        if len(tokens) >= 4:
-            d["fstop"] = _safe_val(tokens[3])
-        return d
-    return {"type": kw.lstrip(".")}
+        if len(tokens) < 4:
+            raise ValueError(".AC needs sweep, points, fstart, and fstop")
+        sweep = tokens[0].lower()
+        if sweep not in ("dec", "oct", "lin"):
+            raise ValueError(".AC sweep must be dec, oct, or lin")
+        points_value = _parse_value(tokens[1])
+        if int(points_value) != points_value or points_value < 1:
+            raise ValueError(".AC points must be a positive integer")
+        fstart, fstop = _parse_value(tokens[2]), _parse_value(tokens[3])
+        if fstart <= 0.0 or fstop <= fstart:
+            raise ValueError(".AC frequencies must be positive and increasing")
+        span = (math.log10(fstop) - math.log10(fstart)
+                if sweep == "dec"
+                else math.log2(fstop) - math.log2(fstart)
+                if sweep == "oct"
+                else 1.0)
+        samples = points_value if sweep == "lin" else points_value * span + 1.0
+        if not math.isfinite(samples) or samples > 1_000_000:
+            raise ValueError(".AC exceeds 1000000 frequency samples")
+        return {"type": "ac", "sweep": sweep, "points": int(points_value),
+                "fstart": fstart, "fstop": fstop}
+    raise ValueError(f"unsupported SPICE analysis {keyword!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -286,12 +323,13 @@ def _parse_element(tokens: list[str]) -> dict | None:
         if len(tokens) < 4:
             return None
         nodes = [_gnd(tokens[1]), _gnd(tokens[2])]
-        value: float | None = None
-        params: dict = {}
         try:
             value = _parse_value(tokens[3])
-        except ValueError:
-            pass
+        except ValueError as exc:
+            raise ValueError(f"{name}: invalid {kind_letter} value {tokens[3]!r}") from exc
+        if value <= 0.0:
+            raise ValueError(f"{name}: {kind_letter} value must be greater than zero")
+        params: dict[str, Any] = {}
         # extra params (e.g. ic= for C/L)
         for tok in tokens[4:]:
             m = re.match(r"(\w+)=(.+)", tok, re.IGNORECASE)
@@ -318,8 +356,8 @@ def _parse_element(tokens: list[str]) -> dict | None:
                 pass
         src_params = _parse_source_params(rest_tokens)
         # canonical DC value
-        if value is None and "DC" in src_params:
-            value = src_params.pop("DC")
+        if value is None and "dc" in src_params:
+            value = src_params.pop("dc")
         return _dev(kind_letter, name, nodes, value, None, src_params)
 
     if kind_letter == "D":
@@ -369,7 +407,7 @@ def _parse_element(tokens: list[str]) -> dict | None:
             return None
         nodes = [_gnd(tokens[1]), _gnd(tokens[2]),
                  _gnd(tokens[3]), _gnd(tokens[4])]
-        gain = _safe_val(tokens[5]) if len(tokens) > 5 else 1.0
+        gain = _parse_value(tokens[5])
         return _dev(kind_letter, name, nodes, None, None, {"gain": gain})
 
     if kind_letter in ("F", "H"):
@@ -378,17 +416,18 @@ def _parse_element(tokens: list[str]) -> dict | None:
             return None
         nodes = [_gnd(tokens[1]), _gnd(tokens[2])]
         ctrl = tokens[3]
-        gain = _safe_val(tokens[4]) if len(tokens) > 4 else 1.0
+        gain = _parse_value(tokens[4])
         return _dev(kind_letter, name, nodes, None, None,
                     {"gain": gain, "ctrl": ctrl})
 
     if kind_letter == "K":
-        # Kname  Lx  Ly  k     (mutual-inductance coupling between two inductors)
+        # Kname  Lx  Ly  k (mutual-inductance coupling between two inductors)
         if len(tokens) < 4:
             return None
         l1, l2 = tokens[1], tokens[2]
-        k = _safe_val(tokens[3])
-        # K has no nodes; carry the two inductor names + k in params (value = k for convenience).
+        k = _parse_value(tokens[3])
+        if abs(k) > 1.0:
+            raise ValueError(f"{name}: coupling coefficient must be in [-1, 1]")
         return _dev("K", name, [], k, None, {"inductors": [l1, l2], "k": k})
 
     if kind_letter == "B":
@@ -747,20 +786,31 @@ def netlist_to_spice_circuit(
     devices:   list[dict] = []
     models:    dict[str, dict] = {}
     params:    dict = {"TEMP": 27}
-    if sim_params:
+    if isinstance(sim_params, dict):
         params.update(sim_params)
+    elif sim_params is not None:
+        warn_msgs.append("sim_params must be an object — ignored")
 
     subckts = _sub.builtin_subckts()
     x_lines: list[str] = []  # X-instance cards to expand after the component loop
     vendor_x: list[dict] = []        # vendor-subckt X instances (ngspice backend only)
     vendor_includes: list[str] = []  # .lib/.subckt file paths to .include
 
-    for comp in netlist.get("components", []):
-        ref    = comp.get("ref", "?")
-        libid  = comp.get("libid", "")
-        value  = comp.get("value", "")
-        pins   = comp.get("pins", {})        # {pinnum_or_pinname: netname}
-        dnp    = comp.get("dnp", False)
+    components = netlist.get("components", []) if isinstance(netlist, dict) else []
+    if not isinstance(components, list):
+        return _make_circuit([], models, params), ["netlist.components must be an array"]
+    for comp in components:
+        if not isinstance(comp, dict):
+            warn_msgs.append("non-object component — skipped")
+            continue
+        ref = str(comp.get("ref") or "?")
+        libid = str(comp.get("libid") or "")
+        value = comp.get("value", "")
+        pins = comp.get("pins", {})
+        if not isinstance(pins, dict):
+            warn_msgs.append(f"{ref}: pins must be an object — skipped")
+            continue
+        dnp = bool(comp.get("dnp", False))
 
         if dnp:
             warn_msgs.append(f"{ref}: DNP — skipped")
@@ -769,6 +819,9 @@ def netlist_to_spice_circuit(
         # resolve sim dict — prefer one carried on the component,
         # fall back to the starter library's SymbolDef
         sim: dict | None = comp.get("sim")
+        if sim is not None and not isinstance(sim, dict):
+            warn_msgs.append(f"{ref}: sim model specification must be an object — skipped")
+            continue
         if sim is None:
             sym_def = SYMBOLS.get(libid)
             if sym_def:
@@ -777,14 +830,26 @@ def netlist_to_spice_circuit(
         if sim is None:
             warn_msgs.append(f"{ref} ({libid}): no sim model — skipped")
             continue
-
-        model_name: str = sim.get("model", "")
-
-        # Power / ground symbols — not real devices, skip silently
-        if model_name in ("GND", "VCC", "+5V", "+3V3", "-5V"):
+        if not isinstance(sim, dict):
+            warn_msgs.append(f"{ref}: resolved sim model must be an object — skipped")
             continue
 
-        pin_order: list[str] = sim.get("pin_order", [])
+        model_name = str(sim.get("model") or "")
+        model_upper = model_name.upper()
+        if not model_upper:
+            warn_msgs.append(f"{ref} ({libid}): empty sim model — skipped")
+            continue
+
+        # Power / ground symbols — not real devices, skip silently
+        if model_upper in ("GND", "VCC", "+5V", "+3V3", "-5V"):
+            continue
+
+        raw_pin_order = sim.get("pin_order", [])
+        if not isinstance(raw_pin_order, list) or not all(
+                isinstance(pin, (str, int)) for pin in raw_pin_order):
+            warn_msgs.append(f"{ref}: sim pin_order must be an array of pin names — skipped")
+            continue
+        pin_order: list[str] = [str(pin) for pin in raw_pin_order]
 
         # A sim.pin_order entry may be a pin NUMBER (matching the netlist's
         # number-keyed pins, e.g. R "1"/"2") OR a pin NAME (e.g. op-amp
@@ -798,28 +863,33 @@ def netlist_to_spice_circuit(
                 if _nm is not None and _num is not None:
                     name_to_num[str(_nm)] = str(_num)
 
-        # Build ordered node list
+        # Build ordered node list. A missing pin invalidates the component;
+        # never manufacture a literal "?" node and pass it to a backend.
         node_list: list[str] = []
+        unresolved = False
         for pname in pin_order:
             net = pins.get(pname)
             if net is None and pname in name_to_num:
-                net = pins.get(name_to_num[pname])      # pin_order gave a name
-            if net is None:
-                warn_msgs.append(
-                    f"{ref}: pin '{pname}' not found in netlist pins {list(pins.keys())}"
-                )
-                node_list.append("?")
+                net = pins.get(name_to_num[pname])
+            if not isinstance(net, str) or not net:
+                warn_msgs.append(f"{ref}: pin '{pname}' is unresolved — component skipped")
+                unresolved = True
             else:
                 node_list.append(_gnd(net))
+        if unresolved:
+            continue
 
-        # If pin_order is empty, fall back to sorted pin order
+        # If pin_order is empty, fall back to sorted pin order.
         if not pin_order:
-            node_list = [_gnd(net) for net in
-                         (pins[k] for k in sorted(pins.keys()))]
+            fallback = [pins[key] for key in sorted(pins.keys())]
+            if any(not isinstance(net, str) or not net for net in fallback):
+                warn_msgs.append(f"{ref}: unresolved net in fallback pin order — component skipped")
+                continue
+            node_list = [_gnd(net) for net in fallback]
 
         # ── subcircuit-backed parts → emit an X instance, expand later ──────
-        if model_name in ("SUBCKT", "OPAMP"):
-            sub_name = _resolve_subckt_name(model_name, sim)
+        if model_upper in ("SUBCKT", "OPAMP"):
+            sub_name = _resolve_subckt_name(model_upper, sim)
             sub_def = subckts.get(sub_name.upper())
             if sub_def is None:
                 # Vendor model attachment (T-FIN14): a component may carry a .lib/.subckt
@@ -840,31 +910,42 @@ def netlist_to_spice_circuit(
                 continue
             # Map this part's ordered nodes onto the subckt's ports, dropping extra (supply) pins
             # the behavioural model does not use (e.g. OPAMP V+/V- on the 5-pin KiCad symbol).
-            inst_nodes = _map_subckt_nodes(ref, model_name, node_list, sub_def.ports, warn_msgs)
+            inst_nodes = _map_subckt_nodes(ref, model_upper, node_list, sub_def.ports, warn_msgs)
             if inst_nodes is None:
                 continue
             x_lines.append(f"X{ref} {' '.join(inst_nodes)} {sub_def.name}")
             continue
 
-        # Parse value
+        # Parse finite numeric values from either schematic strings or JSON numbers.
         float_value: float | None = None
-        if value:
-            try:
-                float_value = _parse_value(value)
-            except ValueError:
-                pass
+        try:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                float_value = float(value)
+                if not math.isfinite(float_value):
+                    raise ValueError("non-finite")
+            elif value not in ("", None):
+                float_value = _parse_value(str(value))
+        except (TypeError, ValueError):
+            float_value = None
 
-        # Determine SPICE element name: use ref prefix + ref number
-        # Kind maps model_name → SPICE kind letter
-        kind = _model_to_kind(model_name, ref)
+        kind = _model_to_kind(model_upper, ref)
+        if kind in ("X", "OPAMP"):
+            warn_msgs.append(f"{ref} ({libid}): unsupported sim model '{model_name}' — skipped")
+            continue
+        expected_nodes = {"R": 2, "C": 2, "L": 2, "V": 2, "I": 2, "D": 2,
+                          "Q": 3, "M": 3, "E": 4, "G": 4, "F": 2, "H": 2,
+                          "S": 4}.get(kind)
+        if expected_nodes is None or len(node_list) < expected_nodes:
+            warn_msgs.append(
+                f"{ref}: sim model {model_name} needs at least {expected_nodes or 0} nodes — skipped")
+            continue
+        if kind in ("R", "C", "L") and (float_value is None or float_value <= 0.0):
+            warn_msgs.append(f"{ref}: invalid or non-positive {kind} value — skipped")
+            continue
 
-        dev_params: dict = {}
-        # Transistor polarity. _model_to_kind collapses NMOS/PMOS -> 'M' and NPN/PNP
-        # -> 'Q', and the schematic path attaches no .model card, so without this the
-        # solver's channel-type default (devices.py: dparams/model "type" falling back
-        # to nmos/npn) silently simulated every schematic PMOS/PNP with INVERTED
-        # polarity. Carry the type on device params — the seam both solvers read.
-        _pol = {"NMOS": "nmos", "PMOS": "pmos", "NPN": "npn", "PNP": "pnp"}.get(model_name)
+        carried_params = sim.get("params", {}) if isinstance(sim, dict) else {}
+        dev_params: dict = dict(carried_params) if isinstance(carried_params, dict) else {}
+        _pol = {"NMOS": "nmos", "PMOS": "pmos", "NPN": "npn", "PNP": "pnp"}.get(model_upper)
         if _pol:
             dev_params["type"] = _pol
         # Independent sources (V/I) may carry a small-signal AC magnitude so an AC
@@ -884,9 +965,13 @@ def netlist_to_spice_circuit(
                     ac_mag = _sa
             if ac_mag is not None:
                 try:
-                    dev_params["ac"] = {"mag": float(ac_mag), "phase": float(ac_phase)}
+                    magnitude = float(ac_mag)
+                    phase = float(ac_phase)
+                    if not math.isfinite(magnitude) or not math.isfinite(phase):
+                        raise ValueError("non-finite AC source")
+                    dev_params["ac"] = {"mag": magnitude, "phase": phase}
                 except (TypeError, ValueError):
-                    pass
+                    warn_msgs.append(f"{ref}: invalid AC magnitude/phase ignored")
 
         dev = _dev(kind, ref, node_list, float_value, None, dev_params)
         devices.append(dev)

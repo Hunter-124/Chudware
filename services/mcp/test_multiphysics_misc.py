@@ -344,6 +344,54 @@ def test_struct_check_payload_shape_and_disclaimer(tmp_path):
     assert row["dc_ratio"] is not None and row["dc_ratio"] > 0, row
 
 
+def test_struct_check_incomplete_payload_is_not_success(monkeypatch):
+    """Unavailable member checks remain visible, but make the common verdict false."""
+    from services.mcp import structural_tools as st
+
+    partial = {
+        "ok": True,
+        "complete": False,
+        "disclaimer": "preliminary only",
+        "results": [{
+            "element_id": "f1",
+            "status": "unavailable",
+            "reason": "soil bearing input missing",
+            "dc_ratio": None,
+            "passed": False,
+        }],
+    }
+    monkeypatch.setattr(st.cb, "call", lambda method, params: partial)
+    r = json.loads(st._struct_rpc("struct_check", {"doc_path": "partial.json"}))
+    assert r["ok"] is False and r["complete"] is False, r
+    assert r["results"] == partial["results"], r
+    assert r["results"][0]["reason"] == "soil bearing input missing"
+
+
+def test_struct_estimate_partial_total_is_not_success(monkeypatch):
+    """A useful subtotal survives without being mislabeled as a complete estimate."""
+    from services.mcp import structural_tools as st
+
+    partial = {
+        "ok": True,
+        "complete": False,
+        "total_is_partial": True,
+        "total_material_cost": 125.0,
+        "unestimated_element_ids": ["x2"],
+        "line_items": [{
+            "element_id": "x2",
+            "material_estimated": False,
+            "unavailable_reason": "no material quantity/rate model",
+        }],
+    }
+    monkeypatch.setattr(st.cb, "call", lambda method, params: partial)
+    r = json.loads(st._struct_rpc("struct_estimate", {"doc_path": "partial.json"}))
+    assert r["ok"] is False and r["complete"] is False, r
+    assert r["total_is_partial"] is True
+    assert r["total_material_cost"] == 125.0
+    assert r["unestimated_element_ids"] == ["x2"]
+    assert r["line_items"][0]["unavailable_reason"]
+
+
 # ══════════════════════════════ group 4: handoff seams (aicad.simhandoff/1) ════
 
 
@@ -525,61 +573,51 @@ def test_motion_kinematic_rotation_tracks_driver(tmp_path):
 
 
 @_ENGINE
-def test_motion_dynamics_mass_and_orientation_mate_semantics(tmp_path):
-    """Rigid-body dynamics block: (a) per-body mass from geometry x density
-    (V*rho: 40x4x4 mm bar @ 7.85 g/cm^3 -> 5.024 g); (b) frames span duration_s;
-    (c) CONTRACT FREEZE — orientation-only mates (angle/parallel) transmit ZERO
-    constraint FORCE (they constrain rotation only, so force reactions through
-    them are identically 0; only moments can be non-zero).
-
-    NOTE (finding, core scope): with gravity ON, the free body's weight m*g has no
-    force-carrying mate to react into, and the engine reports zero reactions with
-    NO warning — a motion_fea_handoff on such a topology silently applies zero
-    loads. Warning emission belongs in core/doc/motion_dynamics.cpp / session.cpp
-    (C++ core, outside this suite's edit scope)."""
+def test_motion_dynamics_rejects_orientation_only_force_path(tmp_path):
+    """An angle+parallel topology cannot react gravity and must say so explicitly."""
     asm, mate_id, arm = _swing_arm(tmp_path)
     r = _call("simulate_motion", {
         "doc_id": asm, "mate_id": mate_id, "start": 0.0, "stop": 60.0, "steps": 5,
         "check_interference": False,
         "dynamics": {"duration_s": 30.0, "default_density_g_cm3": 7.85,
                      "gravity": [0, 0, -9.81]}})
-    assert r["ok"], r
+    assert r["ok"] is False, r
     dyn = r.get("dynamics")
     assert dyn and dyn.get("frames"), r
-    m_arm = 40.0 * 4.0 * 4.0 * 1e-3 * 7.85 * 1e-3      # V(mm^3)*rho(g/cm^3) -> kg
+    assert dyn["ok"] is False and dyn["force_path_resolved"] is False, dyn
+    m_arm = 40.0 * 4.0 * 4.0 * 1e-3 * 7.85 * 1e-3
     masses = {b["component"]: b["mass_kg"] for b in dyn["bodies"]}
     assert math.isclose(masses[arm], m_arm, rel_tol=1e-3), masses
     frames = dyn["frames"]
     assert math.isclose(frames[-1]["t_s"], 30.0, abs_tol=1e-9), frames[-1]
     assert len(frames) == len(r["trajectory"]), (len(frames), len(r["trajectory"]))
-    # orientation-only mates: zero force, finite (possibly zero) moments
-    for fr in frames:
-        assert fr["reactions"], fr
-        for reac in fr["reactions"]:
-            assert reac["force_mag_n"] == 0.0, reac
-            assert all(math.isfinite(float(c)) for c in reac["moment_nm"]), reac
-    assert dyn.get("per_joint_worst") and dyn.get("worst_case"), dyn
+    for frame in frames:
+        assert frame["balanced"] is False, frame
+        assert frame["force_residual_n"] > 0.0, frame
+        for reaction in frame["reactions"]:
+            assert reaction["force_mag_n"] == 0.0, reaction
+            assert all(math.isfinite(float(c)) for c in reaction["moment_nm"]), reaction
+    assert any("unresolved force/moment path" in warning
+               for warning in dyn.get("warnings", [])), dyn
 
 
 @_ENGINE
-def test_motion_fea_handoff_seam_envelope(tmp_path):
-    """motion->FEA seam smoke (dry_run: no solve): valid aicad.simhandoff/1 envelope,
-    motion_to_fea coupling, case-labelled force conditions with provenance."""
+def test_motion_fea_handoff_rejects_unresolved_zero_force_path(tmp_path):
+    """The motion→FEA seam cannot turn zero reactions into a successful load case."""
     asm, mate_id, arm = _swing_arm(tmp_path)
+    tree = cb.call("doc_tree", {"doc_id": asm}).get("tree") or {}
+    drive = next(m for m in tree.get("mates", []) if m.get("id") == mate_id)
+    fixture_face = next(ref["selector"] for ref in drive.get("refs", [])
+                        if ref.get("component") == arm)
     r = _call("motion_fea_handoff", {
         "doc_id": asm, "component": arm,
-        "fixtures": [{"of": "face", "pick": "largest"}],
+        "fixtures": [fixture_face],
         "mate_id": mate_id, "start": 0.0, "stop": 60.0, "steps": 5,
         "dynamics": {"duration_s": 1.0, "default_density_g_cm3": 7.85},
         "dry_run": True})
-    assert r["ok"], r
-    env = r["simhandoff"]
-    assert sh.validate_envelope(env) == [], sh.validate_envelope(env)
-    assert env["coupling"] == "motion_to_fea"
-    assert env["source"]["domain"] == "motion" and env["target"]["domain"] == "fea"
-    forces = [c for c in env["conditions"] if c["kind"] == "force"]
-    assert forces and all(c["units"] == "N" and c.get("case") for c in forces), forces
-    assert r["fea"] is None and r["loads_applied"], r
+    assert r["ok"] is False, r
+    assert "unresolved force/moment path" in r["error"], r
+    assert "simhandoff" not in r and not r.get("loads_applied"), r
 
 
 if __name__ == "__main__":

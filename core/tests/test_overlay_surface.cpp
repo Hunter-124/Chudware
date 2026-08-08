@@ -15,11 +15,15 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <map>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "sim/overlay.h"
+#include "util/aicm_handoff.h"
 
 using chudware::sim::fea_surface_body;
 using chudware::sim::FeaSurface;
@@ -128,6 +132,86 @@ double mesh_centroid(const std::vector<float>& pos, double c[3]) {
     return static_cast<double>(nv);
 }
 
+uint16_t u16le(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0]) |
+           (static_cast<uint16_t>(p[1]) << 8);
+}
+
+uint32_t u32le(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+uint64_t u64le(const uint8_t* p) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) value |= static_cast<uint64_t>(p[i]) << (8 * i);
+    return value;
+}
+
+float f32le(const uint8_t* p) {
+    const uint32_t bits = u32le(p);
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+struct ScalarWire {
+    float min = 0.0f;
+    float max = 0.0f;
+    std::vector<float> values;
+};
+
+struct HandoffCleanup {
+    ~HandoffCleanup() { chudware::aicm_handoff::release_all(); }
+};
+
+bool read_scalar_wire(const std::string& uri, const std::string& wanted,
+                      ScalarWire& scalar) {
+    chudware::aicm_handoff::Mapping mapping;
+    std::string err;
+    if (!chudware::aicm_handoff::map(uri, mapping, err)) return false;
+    const uint8_t* data = mapping.data;
+    const size_t size = mapping.size;
+    bool found = false;
+    if (size >= 12 && std::memcmp(data, "AICM", 4) == 0) {
+        const uint32_t chunks = u32le(data + 8);
+        size_t off = 12;
+        for (uint32_t i = 0; i < chunks && off <= size; ++i) {
+            if (size - off < 12) break;
+            const uint8_t* tag = data + off;
+            const uint64_t payload_size = u64le(data + off + 4);
+            off += 12;
+            if (payload_size > size - off) break;
+            const uint8_t* payload = data + off;
+            if (std::memcmp(tag, "SCLR", 4) == 0 && payload_size >= 18) {
+                const uint16_t name_size = u16le(payload + 4);
+                const size_t metadata = 4 + 2 + static_cast<size_t>(name_size) + 4 + 4 + 4;
+                if (metadata <= payload_size) {
+                    const std::string name(reinterpret_cast<const char*>(payload + 6),
+                                           name_size);
+                    const uint8_t* range = payload + 6 + name_size;
+                    const uint32_t count = u32le(range + 8);
+                    if (count <= (payload_size - metadata) / 4 && name == wanted) {
+                        scalar.min = f32le(range);
+                        scalar.max = f32le(range + 4);
+                        scalar.values.resize(count);
+                        const uint8_t* values = range + 12;
+                        for (uint32_t j = 0; j < count; ++j)
+                            scalar.values[j] = f32le(values + static_cast<size_t>(j) * 4);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            off += static_cast<size_t>(payload_size);
+        }
+    }
+    chudware::aicm_handoff::unmap(mapping);
+    return found;
+}
+
 }  // namespace
 
 // ── tet4: vertices = unique boundary nodes; no interior node leaks ─────────────
@@ -225,4 +309,136 @@ TEST_CASE("fea_surface_body normals point outward (convex box)") {
         // Normals must be unit length.
         CHECK(std::sqrt(nx * nx + ny * ny + nz * nz) == doctest::Approx(1.0).epsilon(1e-4));
     }
+}
+
+TEST_CASE("fea_surface_body rejects malformed and non-finite meshes") {
+    const std::vector<double> points = {
+        0, 0, 0,
+        1, 0, 0,
+        0, 1, 0,
+        0, 0, 1,
+    };
+    const std::vector<int> tet = {0, 1, 2, 3};
+    CHECK_FALSE(fea_surface_body(points, tet, 4).body.pos.empty());
+
+    CHECK(fea_surface_body(points, {0, 1, 2, 4}, 4).body.pos.empty());
+    CHECK(fea_surface_body(points, {0, 1, 2}, 4).body.pos.empty());
+    CHECK(fea_surface_body(points, tet, 6).body.pos.empty());
+    CHECK(fea_surface_body(points, {0, 1, 1, 3}, 4).body.pos.empty());
+
+    std::vector<double> coplanar = points;
+    coplanar[3 * 3 + 2] = 0.0;
+    coplanar[3 * 3 + 0] = 0.25;
+    coplanar[3 * 3 + 1] = 0.25;
+    CHECK(fea_surface_body(coplanar, tet, 4).body.pos.empty());
+
+    std::vector<double> nonfinite = points;
+    nonfinite[0] = std::numeric_limits<double>::infinity();
+    CHECK(fea_surface_body(nonfinite, tet, 4).body.pos.empty());
+}
+
+TEST_CASE("fea_surface_body rejects non-manifold faces") {
+    const std::vector<double> points = {
+        0, 0, 0,
+        1, 0, 0,
+        0, 1, 0,
+        0, 0, 1,
+        0, 0, -1,
+        0.25, 0.25, 2,
+    };
+    const std::vector<int> three_on_one_face = {
+        0, 1, 2, 3,
+        0, 1, 2, 4,
+        0, 1, 2, 5,
+    };
+    FeaSurface fs = fea_surface_body(points, three_on_one_face, 4);
+    CHECK(fs.body.pos.empty());
+    CHECK(fs.surf_to_vol.empty());
+}
+
+TEST_CASE("map_to_surface preserves exact node correspondence and fails closed") {
+    const std::vector<double> volume = {
+        0, 0, 0,
+        2, 0, 0,
+        0, 2, 0,
+    };
+    const std::vector<double> surface = {
+        2, 0, 0,
+        0, 0, 0,
+        0, 2, 0,
+    };
+    const std::vector<double> vectors = {
+        10, 11, 12,
+        20, 21, 22,
+        30, 31, 32,
+    };
+    const std::vector<double> mapped =
+        chudware::sim::map_to_surface(surface, volume, vectors, 3);
+    CHECK(mapped == std::vector<double>{20, 21, 22, 10, 11, 12, 30, 31, 32});
+
+    CHECK(chudware::sim::map_to_surface(surface, volume, {1, 2}, 1).empty());
+    CHECK(chudware::sim::map_to_surface(surface, volume, vectors, 0).empty());
+    std::vector<double> bad_values = vectors;
+    bad_values[4] = std::numeric_limits<double>::quiet_NaN();
+    CHECK(chudware::sim::map_to_surface(surface, volume, bad_values, 3).empty());
+}
+
+TEST_CASE("overlay writers reject mismatched nodal fields") {
+    const std::vector<double> points = {
+        0, 0, 0,
+        1, 0, 0,
+        0, 1, 0,
+        0, 0, 1,
+    };
+    const std::vector<int> tet = {0, 1, 2, 3};
+    const std::vector<double> scalar(4, 1.0);
+
+    const std::vector<double> displacement(12, 0.0);
+    CHECK(chudware::sim::static_overlay(
+              "", points, tet, 4, {1.0, 2.0}, scalar, displacement,
+              {}, {}, {}, 200.0, nlohmann::json::object())
+              .empty());
+    CHECK(chudware::sim::fatigue_overlay(
+              "", points, tet, 4, scalar, {1.0, 2.0}, scalar)
+              .empty());
+    CHECK(chudware::sim::modal_overlay(
+              "", points, tet, 4, {0.0, 0.0, 0.0}, 10.0)
+              .empty());
+}
+
+TEST_CASE("static_overlay maps exact nodal stress and emits a finite honest range") {
+    const std::vector<double> points = {
+        0, 0, 0,
+        1, 0, 0,
+        0, 1, 0,
+        0, 0, 1,
+    };
+    const std::vector<int> tet = {0, 1, 2, 3};
+    const std::vector<double> stress = {10, 20, 30, 40};
+    const std::vector<double> displacement(12, 0.0);
+    const std::vector<double> disp_mag(4, 0.0);
+    const FeaSurface fs = fea_surface_body(points, tet, 4);
+    REQUIRE(fs.surf_to_vol.size() == 4);
+
+    HandoffCleanup cleanup;
+    const std::string uri = chudware::sim::static_overlay(
+        "", points, tet, 4, stress, disp_mag, displacement,
+        {}, {}, {}, 200.0, nlohmann::json::object());
+    REQUIRE_FALSE(uri.empty());
+    ScalarWire wire;
+    REQUIRE(read_scalar_wire(uri, "von_mises", wire));
+    REQUIRE(wire.values.size() == fs.surf_to_vol.size());
+    for (size_t i = 0; i < wire.values.size(); ++i)
+        CHECK(wire.values[i] ==
+              doctest::Approx(stress[static_cast<size_t>(fs.surf_to_vol[i])]));
+    CHECK(std::isfinite(wire.min));
+    CHECK(std::isfinite(wire.max));
+    CHECK(wire.min == doctest::Approx(0.0f));
+    CHECK(wire.max == doctest::Approx(40.0f));
+    CHECK(wire.max > wire.min);
+    ScalarWire zero_range;
+    REQUIRE(read_scalar_wire(uri, "displacement_mag", zero_range));
+    CHECK(std::isfinite(zero_range.min));
+    CHECK(std::isfinite(zero_range.max));
+    CHECK(zero_range.max > zero_range.min);
 }

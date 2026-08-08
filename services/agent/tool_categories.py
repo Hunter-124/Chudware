@@ -161,6 +161,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         # ("struct_estimate/struct_check first", bearing_life + gear_check for
         # mechanical sizing) plus the motion->FEA bridge. All advertised in the
         # playbooks, none of it in a pack. advertised_tool_audit, 2026-07-30.
+        "struct_analyze",
         "struct_estimate",
         "struct_check",
         "bearing_life",

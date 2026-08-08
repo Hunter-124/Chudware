@@ -646,32 +646,36 @@ nlohmann::json doc_dep_query(const std::string& source_doc_id, const std::string
 nlohmann::json doc_dep_notify(const std::string& source_doc_id, long new_revision);
 nlohmann::json doc_dep_unregister(const std::string& dep_doc_id, const std::string& kind);
 
-// Kinematic motion study: drive one dimensional mate across [start, stop] in `steps`
-// samples, re-solve the assembly mate graph at each sample, and collect per-body world
-// transforms for every frame. Optionally checks eval_interference at each step and
-// reports the first collision step. The driven mate is restored to its original value
-// when the study finishes. Pure math/kinematics — no meshing.
+// Kinematic motion study: drive one angle/distance mate across [start, stop] in
+// `steps` samples, solve the assembly mate graph on an immutable document snapshot,
+// and collect per-body world transforms for every frame. Optionally checks
+// interference and minimum-clearance violations at every sample. The live document,
+// revision, undo history, mate expression, warm state, and solved pose are untouched.
 //
 // Returns {ok, doc_id, mate_id, driver:{type,unit,start,stop,steps},
-//          trajectory:[{i, value, converged, bodies:[{name, transform:[16 floats col-major]}]}],
+//          trajectory:[{i,value,dof,converged,bodies:[{name,component,
+//                      transform:[16 floats col-major]}]}],
 //          interference:{checked, first_collision_step, first_collision_value, detail},
-//          summary}.
-// Throws OpError("invalid_op") on non-assembly doc, missing/non-drivable mate, or bad range.
+//          summary}. ok=false distinguishes any unresolved/non-converged frame.
+// Throws OpError("invalid_op") on non-assembly doc, missing/non-drivable mate,
+// non-finite range/clearance, or invalid dynamics setup.
 //
-// `dynamics` (T-FIN20): pass a JSON OBJECT to additionally run rigid-body INVERSE
-// dynamics over the swept trajectory (mass/inertia from body geometry × density,
-// gravity / applied loads / viscous damping; per-mate joint reaction wrenches solved
-// through the mate-type constraint-jacobian wrench bases — doc/motion_dynamics.h).
+// `dynamics`: pass a JSON OBJECT to additionally run rigid-body INVERSE dynamics
+// over the swept trajectory (mass/inertia from body geometry x density, gravity,
+// applied loads and viscous damping; per-mate reaction wrenches solved through the
+// mate constraint-Jacobian wrench bases in doc/motion_dynamics.h).
 // Keys (all optional): {duration_s (default 1.0 across the sweep),
 //   gravity:[3] m/s² (default [0,0,-9.81]), default_density_g_cm3 (default 7.85),
-//   densities:{component_id: g_cm3}, masses:{component_id: kg — overrides density},
+//   densities:{component_id: g/cm³}, masses:{component_id: kg},
 //   loads:[{component, force_n:[3], torque_nm:[3]}],
 //   damping:{linear_ns_per_m, angular_nms_per_rad}}.
-// The result then carries a "dynamics" block: {dt_s, duration_s, gravity, bodies,
-//   joints, frames:[{i, t_s, residual_n, reactions:[{mate_id, force_n:[3],
-//   moment_nm:[3], force_mag_n}]}], per_joint_worst, worst_case, warnings}.
-// Pass null / omit for the pre-existing KINEMATICS-ONLY behavior — the result is
-// then field-identical to before this feature existed (regression contract).
+// The block includes {ok,force_path_resolved,has_nonzero_reaction,dt_s,duration_s,
+//   bodies,joints,frames:[{i,t_s,force_residual_n,moment_residual_nm,balanced,
+//   reactions:[{mate_id,component_a,component_b,force_n:[3],moment_nm:[3],
+//   force_mag_n,moment_mag_nm}]}],per_joint_worst,per_joint_worst_moment,
+//   worst_case,worst_moment_case,warnings}. Reactions act on component_b from
+// component_a in world coordinates; force is N and moment is N·m.
+// Pass null / omit for the field-compatible kinematics-only behavior.
 nlohmann::json doc_simulate_motion(const std::string& doc_id,
                                    const std::string& mate_id,  // "" = auto-pick
                                    double start, double stop, int steps,

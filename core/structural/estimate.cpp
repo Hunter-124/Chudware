@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <initializer_list>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -36,7 +37,13 @@ const std::pair<const char*, double> kAiscLbsPerFt[] = {
     {"HSS4X4X1/4", 12.21}, {"HSS5X5X1/4", 15.62}, {"HSS6X6X1/4", 19.02},
 };
 
-double length_ft(const StructuralElement& el) { return el.length_mm / 304.8; }
+double length_ft(const StructuralElement& el) {
+    if (!std::isfinite(el.length_mm) || el.length_mm <= 0.0) {
+        throw std::invalid_argument("element '" + el.id +
+                                    "' length_mm must be finite and greater than zero");
+    }
+    return el.length_mm / 304.8;
+}
 
 // Python round(x, ndigits) — ties-to-even on the scaled value.
 double pyround(double v, int ndigits) {
@@ -69,6 +76,16 @@ bool is_lumber(const std::string& material) {
     return false;
 }
 
+bool is_steel(const std::string& material) {
+    const std::string mat = lower(material);
+    return mat.find("steel") != std::string::npos || mat.find("a36") != std::string::npos ||
+           mat.find("a992") != std::string::npos;
+}
+
+bool is_concrete(const std::string& material) {
+    return lower(material).find("concrete") != std::string::npos;
+}
+
 // Python int() semantics for the strict cases the oracle hits: optional sign
 // followed by digits, whole string consumed. Returns nullopt otherwise.
 std::optional<int> python_int(const std::string& s) {
@@ -89,7 +106,7 @@ std::optional<std::pair<int, int>> parse_nominal_lumber(const std::string& secti
     if (pos == std::string::npos) return std::nullopt;
     const auto t = python_int(name.substr(0, pos));
     const auto w = python_int(name.substr(pos + 1));
-    if (!t || !w) return std::nullopt;
+    if (!t || !w || *t <= 0 || *w <= 0) return std::nullopt;
     return std::make_pair(*t, *w);
 }
 
@@ -145,29 +162,51 @@ RateTable load_rates(const std::string& rates_path) {
     }
     if (path.empty()) return rates;
     std::ifstream fh(path);
-    if (!fh) return rates;  // unreadable → embedded defaults
+    if (!fh) throw std::invalid_argument("structural rate file is not readable: " + path);
     nlohmann::json j = nlohmann::json::parse(fh, nullptr, false);
-    if (j.is_discarded() || !j.is_object()) return rates;
+    if (j.is_discarded() || !j.is_object()) {
+        throw std::invalid_argument("structural rate file must contain a JSON object: " + path);
+    }
     auto num = [&j](const char* key, double& out) {
-        if (j.contains(key) && j[key].is_number()) out = j[key].get<double>();
+        if (!j.contains(key)) return;
+        if (!j[key].is_number()) {
+            throw std::invalid_argument(std::string("structural rate '") + key + "' must be numeric");
+        }
+        const double value = j[key].get<double>();
+        if (!std::isfinite(value) || value < 0.0) {
+            throw std::invalid_argument(std::string("structural rate '") + key +
+                                        "' must be finite and nonnegative");
+        }
+        out = value;
     };
     num("cedar_lumber_per_bf", rates.cedar_lumber_per_bf);
     num("steel_per_lb", rates.steel_per_lb);
     num("concrete_per_cy", rates.concrete_per_cy);
     num("labor_per_hr", rates.labor_per_hr);
     num("fastener_per_ea", rates.fastener_per_ea);
-    if (j.contains("_install_hours") && j["_install_hours"].is_object()) {
+    if (j.contains("_install_hours")) {
+        if (!j["_install_hours"].is_object()) {
+            throw std::invalid_argument("_install_hours must be a JSON object");
+        }
         for (const auto& [key, val] : j["_install_hours"].items()) {
-            if (!val.is_number() || (!key.empty() && key.front() == '_')) continue;
+            if (!key.empty() && key.front() == '_') continue;
+            if (!val.is_number()) {
+                throw std::invalid_argument("install hours for '" + key + "' must be numeric");
+            }
+            const double value = val.get<double>();
+            if (!std::isfinite(value) || value < 0.0) {
+                throw std::invalid_argument("install hours for '" + key +
+                                            "' must be finite and nonnegative");
+            }
             bool replaced = false;
             for (auto& [et, hrs] : rates.install_hours) {
                 if (et == key) {
-                    hrs = val.get<double>();
+                    hrs = value;
                     replaced = true;
                     break;
                 }
             }
-            if (!replaced) rates.install_hours.emplace_back(key, val.get<double>());
+            if (!replaced) rates.install_hours.emplace_back(key, value);
         }
     }
     return rates;
@@ -187,7 +226,13 @@ double steel_weight_lbs(const StructuralElement& el) {
     for (const auto& [name, lbs] : kAiscLbsPerFt) {
         if (key == name) return lbs * length_ft(el);
     }
-    throw std::out_of_range("Steel section '" + key + "' not in lbs/ft table.");
+    // Metric/custom sections have no designation weight. Derive mass once
+    // from the same net section area the stiffness solver uses.
+    const SectionProps props =
+        section_properties(el.section_name, el.material, el.element_type);
+    constexpr double steel_kg_per_mm3 = 7.85e-6;
+    constexpr double lb_per_kg = 2.2046226218487757;
+    return props.A * el.length_mm * steel_kg_per_mm3 * lb_per_kg;
 }
 
 int fastener_count(const StructureDoc& doc) {
@@ -210,42 +255,61 @@ int fastener_count(const StructureDoc& doc) {
 }
 
 nlohmann::json estimate(const StructureDoc& doc, const RateTable& rates) {
+    for (const auto& [name, value] :
+         std::initializer_list<std::pair<const char*, double>>{
+             {"cedar_lumber_per_bf", rates.cedar_lumber_per_bf},
+             {"steel_per_lb", rates.steel_per_lb},
+             {"concrete_per_cy", rates.concrete_per_cy},
+             {"labor_per_hr", rates.labor_per_hr},
+             {"fastener_per_ea", rates.fastener_per_ea},
+         }) {
+        if (!std::isfinite(value) || value < 0.0) {
+            throw std::invalid_argument(std::string("structural rate '") + name +
+                                        "' must be finite and nonnegative");
+        }
+    }
+    for (const auto& [element_type, hours] : rates.install_hours) {
+        if (!std::isfinite(hours) || hours < 0.0) {
+            throw std::invalid_argument("install hours for '" + element_type +
+                                        "' must be finite and nonnegative");
+        }
+    }
     nlohmann::json line_items = nlohmann::json::array();
+    nlohmann::json unestimated_ids = nlohmann::json::array();
+    bool complete = true;
     for (const StructuralElement& el : doc.elements) {
         const std::string& et = el.element_type;
         const std::string& mat = el.material;
         const double hrs = rates.install_hour(et);
 
-        double qty, unit_rate, mat_cost;
+        double qty = 0.0, unit_rate = 0.0, mat_cost = 0.0;
         std::string unit;
+        bool material_estimated = true;
+        std::string unavailable_reason;
         if (is_lumber(mat)) {
-            try {
-                qty = board_feet(el);
-            } catch (const std::invalid_argument&) {
-                qty = 0.0;  // unparseable size — skip material cost, keep labor
-            }
+            qty = board_feet(el);
             unit = "BF";
             unit_rate = rates.cedar_lumber_per_bf;
             mat_cost = pyround(qty * unit_rate, 2);
-        } else if ((et == "beam" || et == "column") && !is_lumber(mat)) {
-            try {
-                qty = steel_weight_lbs(el);
-            } catch (const std::out_of_range&) {
-                qty = 0.0;  // unknown section — unestimated
-            }
+        } else if (is_steel(mat) && et != "footing") {
+            qty = steel_weight_lbs(el);
             unit = "lbs";
             unit_rate = rates.steel_per_lb;
             mat_cost = pyround(qty * unit_rate, 2);
-        } else if (et == "footing") {
-            qty = 0.0;  // concrete volume not available from length alone
+        } else if (et == "footing" && is_concrete(mat)) {
+            const SectionProps props =
+                section_properties(el.section_name, el.material, el.element_type);
+            constexpr double cubic_mm_per_cubic_yard = 914.4 * 914.4 * 914.4;
+            qty = props.A * el.length_mm / cubic_mm_per_cubic_yard;
             unit = "cy";
             unit_rate = rates.concrete_per_cy;
-            mat_cost = 0.0;
+            mat_cost = pyround(qty * unit_rate, 2);
         } else {
-            qty = 0.0;
-            unit = "ea";
-            unit_rate = 0.0;
-            mat_cost = 0.0;
+            complete = false;
+            material_estimated = false;
+            unestimated_ids.push_back(el.id);
+            unit = "unavailable";
+            unavailable_reason = "no material quantity/rate model for this element and material";
         }
 
         const double labor_cost = pyround(hrs * rates.labor_per_hr, 2);
@@ -254,28 +318,36 @@ nlohmann::json estimate(const StructureDoc& doc, const RateTable& rates) {
         const std::string desc = title_case(et_title) + " — " + el.section_name + " × " +
                                  fmt2(length_ft(el)) + " ft " + mat;
 
-        line_items.push_back(line_dict(el.id, et, el.section_name, mat, pyround(qty, 4), unit,
-                                       unit_rate, mat_cost, hrs, labor_cost, desc));
+        nlohmann::json line =
+            line_dict(el.id, et, el.section_name, mat, pyround(qty, 4), unit, unit_rate,
+                      mat_cost, hrs, labor_cost, desc);
+        line["material_estimated"] = material_estimated;
+        if (!material_estimated) line["unavailable_reason"] = unavailable_reason;
+        line_items.push_back(std::move(line));
     }
 
     const int n_fasteners = fastener_count(doc);
     const double fastener_mat = pyround(n_fasteners * rates.fastener_per_ea, 2);
-    const nlohmann::json fastener_line = line_dict(
+    nlohmann::json fastener_line = line_dict(
         "__fasteners__", "fasteners", "", "hardware", static_cast<double>(n_fasteners), "ea",
         rates.fastener_per_ea, fastener_mat, 0.0, 0.0,
         "Structural fasteners — " + std::to_string(n_fasteners) +
             " ea (anchor bolts, hangers, screws)");
+    fastener_line["material_estimated"] = true;
 
     double total_mat = fastener_mat, total_labor = 0.0;
-    for (const nlohmann::json& ln : line_items) {
-        total_mat += ln["material_cost"].get<double>();
-        total_labor += ln["labor_cost"].get<double>();
+    for (const nlohmann::json& line : line_items) {
+        total_mat += line["material_cost"].get<double>();
+        total_labor += line["labor_cost"].get<double>();
     }
     total_mat = pyround(total_mat, 2);
     total_labor = pyround(total_labor, 2);
 
     return {{"line_items", std::move(line_items)},
-            {"fastener_line", fastener_line},
+            {"fastener_line", std::move(fastener_line)},
+            {"complete", complete},
+            {"total_is_partial", !complete},
+            {"unestimated_element_ids", std::move(unestimated_ids)},
             {"total_material_cost", total_mat},
             {"total_labor_cost", total_labor},
             {"total_cost", pyround(total_mat + total_labor, 2)},

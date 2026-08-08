@@ -5,12 +5,13 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <set>
 #include <stdexcept>
+#include <utility>
 
 #include "structural/checks.h"
 #include "structural/estimate.h"
 #include "structural/model.h"
-#include "structural/sections.h"
 #include "structural/solver.h"
 
 namespace chudware::structural {
@@ -42,12 +43,22 @@ nlohmann::json doc_json_from_params(const nlohmann::json& params) {
 // mirrors analysis.analyze_doc's str|list acceptance.
 std::vector<LoadCombo> combos_from_params(const nlohmann::json& params) {
     std::vector<LoadCombo> combos;
+    std::set<std::string> seen;
     const nlohmann::json lc = params.contains("load_combo") ? params["load_combo"]
                                                             : nlohmann::json("DEAD_LIVE");
+    auto add_combo = [&](const nlohmann::json& name) {
+        if (!name.is_string()) throw std::invalid_argument("load_combo names must be strings");
+        const LoadCombo combo = get_combo(name.get<std::string>());
+        if (!seen.insert(combo.name).second) {
+            throw std::invalid_argument("duplicate load_combo '" + combo.name + "'");
+        }
+        combos.push_back(combo);
+    };
     if (lc.is_array()) {
-        for (const nlohmann::json& name : lc) combos.push_back(get_combo(name.get<std::string>()));
+        if (lc.empty()) throw std::invalid_argument("load_combo list must not be empty");
+        for (const nlohmann::json& name : lc) add_combo(name);
     } else {
-        combos.push_back(get_combo(lc.get<std::string>()));
+        add_combo(lc);
     }
     return combos;
 }
@@ -55,36 +66,48 @@ std::vector<LoadCombo> combos_from_params(const nlohmann::json& params) {
 nlohmann::json rpc_analyze(const nlohmann::json& params) {
     const StructureDoc doc = structure_doc_from_dict(doc_json_from_params(params));
     const std::vector<LoadCombo> combos = combos_from_params(params);
-    const std::vector<AnalysisRow> rows = analyze_doc(doc, combos);
+    std::vector<ReactionRow> reaction_rows;
+    const std::vector<AnalysisRow> rows = analyze_doc(doc, combos, &reaction_rows);
     nlohmann::json results = nlohmann::json::array();
-    for (const AnalysisRow& r : rows) results.push_back(r.to_dict());
+    for (const AnalysisRow& row : rows) results.push_back(row.to_dict());
+    nlohmann::json reactions = nlohmann::json::array();
+    for (const ReactionRow& reaction : reaction_rows) reactions.push_back(reaction.to_dict());
     return {{"load_combo", params.value("load_combo", nlohmann::json("DEAD_LIVE"))},
-            {"results", std::move(results)}};
+            {"units", {{"force", "N"}, {"moment", "N*mm"}, {"displacement", "mm"}}},
+            {"results", std::move(results)},
+            {"reactions", std::move(reactions)}};
 }
 
-// Section resolution per element — mirrors the _section_for closure in
-// structural_tools.struct_check: AISC table → lumber table → brep-dims
-// fallback from section_properties (Sx approximated from Iz / sqrt(A)).
+// Resolve strength properties in the same local major/minor axes used by the
+// frame solver. Sx pairs with moment_z; Sy pairs with moment_y.
 nlohmann::json section_for(const StructuralElement& el) {
-    std::string sname = el.section_name;
-    // Python: (el.section_name or "").strip().upper().replace(" ", "") — the
-    // lookups redo their own normalization, so passing the raw name is fine.
-    if (auto s = get_aisc_section(sname)) return *s;
-    if (auto s = get_lumber_section(sname)) return *s;
-    const SectionProps props = section_properties(el.section_name, el.material, el.element_type);
-    const double sx_approx =
-        props.A > 0.0 ? 2.0 * props.Iz / std::max(std::sqrt(props.A), 1.0) : 0.0;
-    return {{"A", props.A}, {"Sx", sx_approx}, {"Sy", sx_approx}, {"Ix", props.Iy}};
+    const SectionProps props =
+        section_properties(el.section_name, el.material, el.element_type);
+    return {{"A", props.A},
+            {"Sx", props.S_major},
+            {"Sy", props.S_minor},
+            {"Ix", props.Iz},
+            {"Iy", props.Iy}};
 }
 
 nlohmann::json rpc_check(const nlohmann::json& params) {
     const StructureDoc doc = structure_doc_from_dict(doc_json_from_params(params));
     const std::vector<LoadCombo> combos = combos_from_params(params);
     const std::vector<AnalysisRow> rows = analyze_doc(doc, combos);
+    std::vector<LoadCombo> service_combos;
+    service_combos.reserve(combos.size());
+    for (const LoadCombo& combo : combos) {
+        service_combos.push_back({combo.name,
+                                  combo.dead != 0.0 ? 1.0 : 0.0,
+                                  combo.live != 0.0 ? 1.0 : 0.0,
+                                  combo.wind != 0.0 ? 1.0 : 0.0,
+                                  combo.snow != 0.0 ? 1.0 : 0.0});
+    }
+    const std::vector<AnalysisRow> service_rows = analyze_doc(doc, service_combos);
 
     nlohmann::json results = nlohmann::json::array();
+    bool complete = true;
     for (const AnalysisRow& row : rows) {
-        const nlohmann::json row_dict = row.to_dict();
         const StructuralElement* el = nullptr;
         for (const StructuralElement& e : doc.elements) {
             if (e.id == row.element_id) {
@@ -92,11 +115,74 @@ nlohmann::json rpc_check(const nlohmann::json& params) {
                 break;
             }
         }
-        const nlohmann::json section = el ? section_for(*el) : nlohmann::json::object();
-        const std::string material = el ? el->material : "steel";
-        results.push_back(check_member(row_dict, section, material).to_dict());
+        if (!el) throw std::runtime_error("analysis returned an unknown structural element");
+
+        if (el->element_type == "footing") {
+            complete = false;
+            results.push_back({
+                {"element_id", row.element_id},
+                {"combo", row.combo},
+                {"dc_ratio", nullptr},
+                {"passed", false},
+                {"governing_limit", "check_unavailable"},
+                {"dc_axial", nullptr},
+                {"dc_bending", nullptr},
+                {"dc_deflection", nullptr},
+                {"status", "unavailable"},
+                {"reason", "footing capacity requires soil bearing and reinforced-concrete design inputs"},
+                {"disclaimer", kCheckDisclaimer},
+            });
+            continue;
+        }
+
+        nlohmann::json checked;
+        try {
+            checked = check_member(row.to_dict(), section_for(*el), el->material).to_dict();
+        } catch (const std::invalid_argument& e) {
+            complete = false;
+            results.push_back({
+                {"element_id", row.element_id},
+                {"combo", row.combo},
+                {"dc_ratio", nullptr},
+                {"passed", false},
+                {"governing_limit", "check_unavailable"},
+                {"dc_axial", nullptr},
+                {"dc_bending", nullptr},
+                {"dc_deflection", nullptr},
+                {"status", "unavailable"},
+                {"reason", e.what()},
+                {"disclaimer", kCheckDisclaimer},
+            });
+            continue;
+        }
+        const AnalysisRow* service_row = nullptr;
+        for (const AnalysisRow& candidate : service_rows) {
+            if (candidate.element_id == row.element_id && candidate.combo == row.combo) {
+                service_row = &candidate;
+                break;
+            }
+        }
+        if (!service_row) throw std::runtime_error("serviceability result is missing");
+        const double deflection_limit_mm = el->length_mm / 240.0;
+        const double service_deflection_mm = std::abs(service_row->deflection_mm);
+        const double dc_deflection = service_deflection_mm / deflection_limit_mm;
+        checked["dc_deflection"] = dc_deflection;
+        checked["service_deflection_mm"] = service_deflection_mm;
+        checked["deflection_limit_mm"] = deflection_limit_mm;
+        checked["deflection_limit_basis"] = "L/240 total-load preliminary";
+        checked["deflection_load_basis"] =
+            "unfactored service components corresponding to selected strength combo";
+        checked["status"] = "evaluated";
+        if (dc_deflection > checked["dc_ratio"].get<double>()) {
+            checked["dc_ratio"] = dc_deflection;
+            checked["passed"] = dc_deflection <= 1.0;
+            checked["governing_limit"] = "deflection_L_over_240";
+        }
+        results.push_back(std::move(checked));
     }
     return {{"load_combo", params.value("load_combo", nlohmann::json("DEAD_LIVE"))},
+            {"units", {{"force", "N"}, {"moment", "N*mm"}, {"displacement", "mm"}}},
+            {"complete", complete},
             {"disclaimer", kCheckDisclaimer},
             {"results", std::move(results)}};
 }

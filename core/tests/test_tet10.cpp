@@ -215,3 +215,48 @@ TEST_CASE("tet10 cantilever bending beats tet4 (shear-lock relief)") {
 }
 
 }  // namespace
+
+TEST_CASE("static: zero excitation is rejected instead of returning a zero field") {
+    BoxMesh mesh = make_box_tet4(1, 1, 1, 1.0, 1.0, 1.0);
+    const int n_nodes = static_cast<int>(mesh.points.size() / 3);
+    std::vector<double> forces(static_cast<size_t>(n_nodes) * 3, 0.0);
+    const auto result = fea_static_solve(
+        mesh.points, mesh.tets, 200000.0, 0.3, 250.0, {0, 3, 4, 7},
+        forces, 4);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("non-zero") != std::string::npos);
+}
+
+TEST_CASE("static: invalid yield strength and degenerate elements are rejected") {
+    BoxMesh mesh = make_box_tet4(1, 1, 1, 1.0, 1.0, 1.0);
+    const int n_nodes = static_cast<int>(mesh.points.size() / 3);
+    std::vector<double> forces(static_cast<size_t>(n_nodes) * 3, 0.0);
+    forces[1 * 3] = 1.0;
+    CHECK_FALSE(fea_static_solve(
+                    mesh.points, mesh.tets, 200000.0, 0.3, 0.0,
+                    {0, 3, 4, 7}, forces, 4)
+                    .ok);
+
+    const std::vector<double> planar = {
+        0, 0, 0,  1, 0, 0,  0, 1, 0,  1, 1, 0};
+    const std::vector<int> tet = {0, 1, 2, 3};
+    std::vector<double> planar_forces(12, 0.0);
+    planar_forces[3] = 1.0;
+    const auto result = fea_static_solve(
+        planar, tet, 200000.0, 0.3, 250.0, {0}, planar_forces, 4);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("degenerate") != std::string::npos);
+}
+
+TEST_CASE("static: a pre-cancelled token aborts before assembly") {
+    BoxMesh mesh = make_box_tet4(1, 1, 1, 1.0, 1.0, 1.0);
+    const int n_nodes = static_cast<int>(mesh.points.size() / 3);
+    std::vector<double> forces(static_cast<size_t>(n_nodes) * 3, 0.0);
+    forces[1 * 3] = 1.0;
+    auto token = std::make_shared<std::atomic<bool>>(true);
+    const auto result = fea_static_solve(
+        mesh.points, mesh.tets, 200000.0, 0.3, 250.0, {0, 3, 4, 7},
+        forces, 4, {}, token);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("cancelled") != std::string::npos);
+}

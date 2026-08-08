@@ -98,15 +98,45 @@ def solve_eigenmodes(shape: str, a_m: float, b_m: float, n_modes: int = 6,
     {type, name, fc_hz, kc_per_m, [field]}; rectangular modes are labeled (m,n)
     by matching kc against the analytic table.
     """
+    if shape not in ("rectangular", "circular"):
+        raise ValueError(f"unsupported cross-section shape {shape!r}")
+    try:
+        a_m = float(a_m)
+        b_m = float(b_m)
+        eps_r = float(eps_r)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("a_m, b_m, and eps_r must be finite positive numbers") from exc
+    for value, name in ((a_m, "a_m"), (b_m, "b_m"), (eps_r, "eps_r")):
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be finite and greater than zero")
+    def bounded_integer(value, name):
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer in [1, 512]")
+        try:
+            numeric = float(value)
+            integer = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        if not math.isfinite(numeric) or numeric != integer:
+            raise ValueError(f"{name} must be an integer")
+        return integer
+    n_modes = bounded_integer(n_modes, "n_modes")
+    resolution = bounded_integer(resolution, "resolution")
+    if not 1 <= n_modes <= 40:
+        raise ValueError("n_modes must be an integer in [1, 40]")
+    if not 24 <= resolution <= 512:
+        raise ValueError("resolution must be an integer in [24, 512]")
     if shape == "circular":
         b_eff = a_m
-        aspect = 1.0
+        nx = ny = int(resolution)
+    elif a_m >= b_m:
+        b_eff = b_m
+        nx = int(resolution)
+        ny = max(12, int(round(nx * b_m / a_m)))
     else:
         b_eff = b_m
-        aspect = b_m / a_m
-    nx = max(24, int(resolution))
-    ny = max(12, int(round(nx * aspect)))
-
+        ny = int(resolution)
+        nx = max(12, int(round(ny * a_m / b_m)))
     mask, hx, hy = _domain_mask(shape, a_m, b_eff, nx, ny)
     k = max(n_modes + 2, 8)
 
@@ -147,6 +177,9 @@ def solve_eigenmodes(shape: str, a_m: float, b_m: float, n_modes: int = 6,
 
     modes.sort(key=lambda md: md["fc_hz"])
     modes = modes[:n_modes]
+    if not modes or any(not math.isfinite(md["fc_hz"]) or md["fc_hz"] <= 0.0
+                        for md in modes):
+        raise RuntimeError("FDFD eigensolver produced no finite positive modes")
     _label_modes(modes, shape, a_m, b_eff, eps_r)
     return {
         "modes": modes,
@@ -168,7 +201,7 @@ def _label_modes(modes: List[dict], shape: str, a_m: float, b_m: float,
     one table entry.
     """
     table = (rect_mode_table(a_m, b_m, 40, eps_r) if shape == "rectangular"
-             else circ_mode_table(a_m, 40, eps_r))
+             else circ_mode_table(a_m, 24, eps_r))
     used: set = set()
     for md in modes:
         cands = sorted(

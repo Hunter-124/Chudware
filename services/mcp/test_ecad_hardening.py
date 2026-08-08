@@ -2,9 +2,8 @@
 
 These cover the transport-timeout survival work: a synchronous ecad_* tool that overruns the
 client's per-call timeout gets the MCP server killed (-32001), and ECAD docs (Python, in-memory)
-would be lost. The fixes are (1) a worker-thread + wall-clock budget on the heavy tools that returns
-a clean "still running — simplify" payload instead of blocking, and (2) autosave/recovery so a kill
-never loses open work.
+would be lost. The fixes are (1) a bounded worker-thread lifecycle whose timeout envelope names a
+durably retrievable in-process job, and (2) autosave/recovery so a kill never loses open work.
 
 Self-contained: tools are registered against a stub mcp (no FastMCP / stdio server needed).
 Run:  python -m pytest mcp_server/test_ecad_hardening.py -q
@@ -40,6 +39,21 @@ def _tools() -> dict:
     return mcp.tools
 
 
+_GET_JOB_TOOL = None
+
+
+def _get_job(job_id: str) -> dict:
+    """Poll through the same existing MCP get_job surface used by production."""
+    global _GET_JOB_TOOL
+    if _GET_JOB_TOOL is None:
+        from mcp_server.cad_doc_tools import register_cad_doc_tools
+
+        mcp = _StubMCP()
+        register_cad_doc_tools(mcp)
+        _GET_JOB_TOOL = mcp.tools["get_job"]
+    return json.loads(_GET_JOB_TOOL(job_id=job_id))
+
+
 def _call(_tools: dict, _name: str, **kw) -> dict:
     # underscore-prefixed so a tool's own ``name=`` kwarg never collides
     return json.loads(_tools[_name](**kw))
@@ -54,42 +68,222 @@ def test_run_with_budget_done_error_timeout() -> None:
     st, val = et._run_with_budget(lambda: (_ for _ in ()).throw(ValueError("boom")))
     assert st == "error" and isinstance(val, ValueError)
 
+    gate = et._threading.Event()
     t0 = time.time()
-    st, val = et._run_with_budget(lambda: time.sleep(5) or "late", budget_s=1)
+    st, val = et._run_with_budget(lambda: gate.wait(5) or "late", budget_s=1)
     dt = time.time() - t0
     assert st == "timeout" and val is None
     assert dt < 3, f"budget guard did not return promptly: {dt:.1f}s"
+    p = json.loads(et._budget_timeout_err("unit work", simplify="Use smaller input."))
+    gate.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if _get_job(p["job_id"]).get("status") == "done":
+            break
+        time.sleep(0.01)
+    assert _get_job(p["job_id"])["status"] == "done"
 
 
-def test_budget_timeout_payload_shape() -> None:
+def test_timeout_formatter_without_a_job_never_claims_running() -> None:
+    p = json.loads(et._budget_timeout_err("autoroute", simplify="Use a coarser pitch."))
+    assert p["status"] == "error"
+    assert p["auto_backgrounded"] is False
+
+
+def test_budget_timeout_payload_identifies_retrievable_bounded_job() -> None:
+    gate = et._threading.Event()
+
+    def _late_result() -> dict:
+        gate.wait(5)
+        return {"ok": True, "answer": 42}
+
+    # Keep the formatter in the same tool-call frame as _run_with_budget, matching every
+    # production caller.  The returned running envelope must identify the exact handed-off job.
+    st, val = et._run_with_budget(_late_result, budget_s=1)
+    assert st == "timeout" and val is None
     p = json.loads(et._budget_timeout_err(
         "autoroute", simplify="Use a coarser pitch.",
         next_actions=["ecad_autoroute(pitch=0.3)"], doc_id="abc"))
     assert p["ok"] is False
     assert p["status"] == "running" and p["auto_backgrounded"] is True
-    assert p["doc_id"] == "abc"
+    assert p["doc_id"] == "abc" and p["job_id"]
     assert "autoroute" in p["error"] and "budget" in p["error"].lower()
-    assert p["next_actions"] and p["hint"]
+    assert p["next_actions"] == [f"get_job('{p['job_id']}')"]
+    assert p["retry_safe_while_running"] is False
+    assert p["cancel_supported"] is False
+    assert p["cancellation"]["supported"] is False
+    assert "cannot be stopped safely" in p["cancellation"]["reason"]
+    assert _get_job(p["job_id"])["status"] == "running"
+
+    gate.set()
+    deadline = time.monotonic() + 2
+    job = {}
+    while time.monotonic() < deadline:
+        job = _get_job(p["job_id"])
+        if job.get("status") == "done":
+            break
+        time.sleep(0.01)
+    assert job["status"] == "done"
+    assert job["result"] == {"ok": True, "answer": 42}
+
+
+def test_budget_job_error_persists_for_retrieval() -> None:
+    gate = et._threading.Event()
+
+    def _late_error() -> None:
+        gate.wait(5)
+        raise ValueError("late boom")
+
+    st, val = et._run_with_budget(_late_error, budget_s=1)
+    assert st == "timeout" and val is None
+    p = json.loads(et._budget_timeout_err("simulation", simplify="Use fewer points."))
+    gate.set()
+    deadline = time.monotonic() + 2
+    job = {}
+    while time.monotonic() < deadline:
+        job = _get_job(p["job_id"])
+        if job.get("status") == "error":
+            break
+        time.sleep(0.01)
+    assert job["status"] == "error"
+    assert job["ok"] is False
+    assert job["error"] == "late boom"
+
+
+def test_budget_worker_count_is_capped() -> None:
+    gate = et._threading.Event()
+    old_limit = et._ECAD_JOB_MAX_RUNNING
+    with et._cad_jobs._JOB_LOCK:
+        baseline = sum(
+            1 for job in et._cad_jobs._JOBS.values()
+            if job.get("owner") == "ecad" and job.get("status") == "running")
+    et._ECAD_JOB_MAX_RUNNING = baseline + 1
+    try:
+        st, _ = et._run_with_budget(lambda: gate.wait(5), budget_s=1)
+        assert st == "timeout"
+        first = json.loads(et._budget_timeout_err("zone fill", simplify="Use a smaller zone."))
+        et._ECAD_JOB_MAX_RUNNING = 1
+        called = []
+        st2, err = et._run_with_budget(lambda: called.append(True), budget_s=1)
+        assert st2 == "error" and isinstance(err, RuntimeError)
+        assert "limit reached" in str(err) and not called
+    finally:
+        et._ECAD_JOB_MAX_RUNNING = old_limit
+        gate.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if _get_job(first["job_id"]).get("status") == "done":
+            break
+        time.sleep(0.01)
+    assert _get_job(first["job_id"])["status"] == "done"
+
+
+def test_core_rpc_boundary_serializes_handed_off_and_foreground_calls() -> None:
+    release = et._threading.Event()
+    slow_entered = et._threading.Event()
+    foreground_entered = et._threading.Event()
+    foreground_done = et._threading.Event()
+    foreground_result: dict = {}
+    orig_call = et.cb.call
+    thread = None
+    p: dict = {}
+
+    def _fake_call(method, params):  # noqa: ANN001
+        if method == "slow":
+            slow_entered.set()
+            release.wait(5)
+        elif method == "foreground":
+            foreground_entered.set()
+        return {"ok": True, "method": method}
+
+    def _foreground() -> None:
+        try:
+            foreground_result.update(et._rpc("foreground"))
+        finally:
+            foreground_done.set()
+
+    et.cb.call = _fake_call
+    try:
+        st, _ = et._run_with_budget(lambda: et._rpc("slow"), budget_s=1)
+        assert st == "timeout" and slow_entered.is_set()
+        p = json.loads(et._budget_timeout_err("core call", simplify="Use smaller input."))
+        thread = et._threading.Thread(target=_foreground, daemon=True)
+        thread.start()
+        assert not foreground_entered.wait(0.1), (
+            "foreground ECAD RPC entered core_bridge while the handed-off call still owned it")
+    finally:
+        release.set()
+        if thread is not None:
+            thread.join(2)
+        et.cb.call = orig_call
+
+    assert foreground_done.is_set()
+    assert foreground_result["method"] == "foreground"
+    deadline = time.monotonic() + 2
+    job = {}
+    while time.monotonic() < deadline:
+        job = _get_job(p["job_id"])
+        if job.get("status") == "done":
+            break
+        time.sleep(0.01)
+    assert job["status"] == "done"
+
+
+def test_terminal_job_retention_has_a_hard_count_bound() -> None:
+    old_limit = et._ECAD_JOB_MAX_RETAINED
+    old_id = "job-test-ecad-old"
+    new_id = "job-test-ecad-new"
+    now = time.time()
+    with et._cad_jobs._JOB_LOCK:
+        et._cad_jobs._evict_old_jobs()
+        existing = sum(
+            1 for job in et._cad_jobs._JOBS.values()
+            if job.get("owner") == "ecad" and job.get("status") in ("done", "error"))
+        et._ECAD_JOB_MAX_RETAINED = existing + 1
+        et._cad_jobs._JOBS[old_id] = {
+            "owner": "ecad", "status": "done", "done_at": -1.0,
+            "kind": "test", "result": 1, "error": None,
+        }
+        et._cad_jobs._JOBS[new_id] = {
+            "owner": "ecad", "status": "done", "done_at": now,
+            "kind": "test", "result": 2, "error": None,
+        }
+        try:
+            et._trim_ecad_jobs_locked()
+            assert old_id not in et._cad_jobs._JOBS
+            assert new_id in et._cad_jobs._JOBS
+            retained = sum(
+                1 for job in et._cad_jobs._JOBS.values()
+                if job.get("owner") == "ecad"
+                and job.get("status") in ("done", "error"))
+            assert retained <= et._ECAD_JOB_MAX_RETAINED
+        finally:
+            et._cad_jobs._JOBS.pop(old_id, None)
+            et._cad_jobs._JOBS.pop(new_id, None)
+            et._ECAD_JOB_MAX_RETAINED = old_limit
 
 
 # --------------------------------------------------------------------------- heavy-tool fallback
 
 
 def test_autoroute_overrun_returns_clean_message() -> None:
-    """A router that runs past the budget must yield a clean 'still running' payload, NOT hang the
-    call until the client kills the server."""
-    import mcp_server.ecad_pcb_tools as _pcb_tools  # T-RF20: the tool RPCs via ecad_common._rpc
+    """A router overrun returns a job and the test drains that worker before teardown."""
+    import mcp_server.ecad_pcb_tools as _pcb_tools  # T-RF20: tool RPCs via ecad_common._rpc
 
     tools = _tools()
     _call(tools, "ecad_new_pcb", name="HeavyBoard")
 
     orig = _pcb_tools._rpc
     orig_budget = et._ECAD_HEAVY_BUDGET_S
-    et._ECAD_HEAVY_BUDGET_S = 1.0  # tiny budget for the test
+    gate = et._threading.Event()
+    et._ECAD_HEAVY_BUDGET_S = 1.0
+    p: dict = {}
+    drained: dict = {}
 
     def _slow_rpc(method, params=None):  # noqa: ANN001
         if method == "ecad_autoroute":
-            time.sleep(5)
+            gate.wait(5)
+            return {"ok": True, "routed": True}
         return orig(method, params)
 
     _pcb_tools._rpc = _slow_rpc
@@ -98,6 +292,14 @@ def test_autoroute_overrun_returns_clean_message() -> None:
         p = _call(tools, "ecad_autoroute")
         dt = time.time() - t0
     finally:
+        gate.set()
+        jid = p.get("job_id")
+        deadline = time.monotonic() + 2
+        while jid and time.monotonic() < deadline:
+            drained = _get_job(jid)
+            if drained.get("status") in ("done", "error"):
+                break
+            time.sleep(0.01)
         _pcb_tools._rpc = orig
         et._ECAD_HEAVY_BUDGET_S = orig_budget
 
@@ -105,11 +307,12 @@ def test_autoroute_overrun_returns_clean_message() -> None:
     assert p["ok"] is False and p.get("status") == "running"
     assert p.get("auto_backgrounded") is True
     assert "budget" in p["error"].lower()
+    assert drained.get("status") == "done"
 
 
 def test_simulate_overrun_returns_clean_message() -> None:
-    """ecad_simulate must budget-guard the solver call the same way."""
-    import mcp_server.ecad_sim_tools as _sim_tools  # T-RF20: tool runs the C++ sim via _sim_run
+    """ecad_simulate hands off safely and its test worker is drained before teardown."""
+    import mcp_server.ecad_sim_tools as _sim_tools  # T-RF20: tool runs C++ sim via _sim_run
 
     tools = _tools()
     # minimal sim-able schematic: a source + resistor to ground (recipe via ecad_design is heavy;
@@ -123,11 +326,14 @@ def test_simulate_overrun_returns_clean_message() -> None:
 
     orig = _sim_tools._sim_run
     orig_budget = et._ECAD_HEAVY_BUDGET_S
+    gate = et._threading.Event()
     et._ECAD_HEAVY_BUDGET_S = 1.0
+    p: dict = {}
+    drained: dict = {}
 
-    def _slow_sim(circuit, study, **kw):  # noqa: ANN001 — **kw: tool passes backend= (T-FIN14)
-        time.sleep(5)
-        return orig(circuit, study, **kw)
+    def _slow_sim(circuit, study, **kw):  # noqa: ANN001, ARG001
+        gate.wait(5)
+        return {"ok": True, "converged": True, "test": True}
 
     _sim_tools._sim_run = _slow_sim
     try:
@@ -135,12 +341,57 @@ def test_simulate_overrun_returns_clean_message() -> None:
         p = _call(tools, "ecad_simulate", analysis="op")
         dt = time.time() - t0
     finally:
+        gate.set()
+        jid = p.get("job_id")
+        deadline = time.monotonic() + 2
+        while jid and time.monotonic() < deadline:
+            drained = _get_job(jid)
+            if drained.get("status") in ("done", "error"):
+                break
+            time.sleep(0.01)
         _sim_tools._sim_run = orig
         et._ECAD_HEAVY_BUDGET_S = orig_budget
 
     assert dt < 3, f"ecad_simulate hung past its budget ({dt:.1f}s)"
     assert p["ok"] is False and p.get("status") == "running"
     assert "budget" in p["error"].lower()
+    assert drained.get("status") == "done"
+
+
+def test_nonconvergence_is_not_reported_as_success() -> None:
+    """A completed backend call with convergence=false is an analysis failure."""
+    import mcp_server.ecad_sim_tools as _sim_tools
+
+    tools = _tools()
+    _call(tools, "ecad_new_schematic", name="Nonconverged")
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
+          x=0, y=0, ref="V1", value="5")
+    _call(tools, "ecad_place_symbol", libid="Device:R",
+          x=10, y=0, ref="R1", value="1k")
+    _call(tools, "ecad_wire", from_ref="V1", from_pin="1", to_ref="R1", to_pin="1")
+
+    original = _sim_tools._sim_run
+
+    def _nonconverged(_circuit, study, **_kw):  # noqa: ANN001
+        analysis = study["analyses"][0]["type"]
+        if analysis == "tf":
+            return {"backend": "mna", "convergence": {"tf": False},
+                    "tf": {"gain": 1.0, "rin": 1000.0, "rout": 1000.0},
+                    "log": ["singular matrix"]}
+        return {"backend": "mna", "convergence": {analysis: False},
+                analysis: {}, "log": ["singular matrix"]}
+
+    _sim_tools._sim_run = _nonconverged
+    try:
+        simulation = _call(tools, "ecad_simulate", analysis="op")
+        transfer = _call(tools, "ecad_tf", output="V(N$1)", source="V1")
+    finally:
+        _sim_tools._sim_run = original
+
+    assert simulation["ok"] is False and simulation["converged"] is False
+    assert "converge" in simulation["error"].lower()
+    assert transfer["ok"] is False and transfer["converged"] is False
+    assert "converge" in transfer["error"].lower()
 
 
 # --------------------------------------------------------------------------- MCP autosave integ.
@@ -288,11 +539,12 @@ class _SlowProvider:
     def __init__(self, delay_s: float = 30.0):
         self.delay_s = delay_s
         self.calls = 0
+        self.release = et._threading.Event()
         self.base_url = "http://127.0.0.1:9/v1"  # unused — reachability is monkeypatched
 
     def complete(self, system, messages):  # noqa: ANN001
         self.calls += 1
-        time.sleep(self.delay_s)
+        self.release.wait(self.delay_s)
         return '{"components":[], "nets":{}, "study":{"analysis":"op","expect":{}}}'
 
 
@@ -314,11 +566,25 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
 
     # Snapshot session registry size so we can assert only ONE new sch was built.
     before_ids = {s.doc_id for s in esess.iter_sessions()}
+    with et._cad_jobs._JOB_LOCK:
+        before_job_ids = set(et._cad_jobs._JOBS)
+    plan_job_ids: set[str] = set()
+    drained_plan_jobs: dict[str, dict] = {}
     try:
         t0 = time.time()
         p = _call(tools, "ecad_design", request="5V voltage divider with 2.5V output")
         dt = time.time() - t0
     finally:
+        slow.release.set()
+        with et._cad_jobs._JOB_LOCK:
+            plan_job_ids = set(et._cad_jobs._JOBS) - before_job_ids
+        for jid in plan_job_ids:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                drained_plan_jobs[jid] = _get_job(jid)
+                if drained_plan_jobs[jid].get("status") in ("done", "error"):
+                    break
+                time.sleep(0.01)
         if orig_get is not None:
             _cfg.get_provider = orig_get  # type: ignore[attr-defined]
         et_sim._provider_reachable = orig_reach  # type: ignore[assignment]
@@ -326,6 +592,9 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
             os.environ.pop("CHUDWARE_ECAD_PLAN_BUDGET_S", None)
         else:
             os.environ["CHUDWARE_ECAD_PLAN_BUDGET_S"] = orig_budget
+    assert plan_job_ids
+    assert all(job.get("status") in ("done", "error")
+               for job in drained_plan_jobs.values())
 
     # Must return well under the 30 s MCP transport deadline (plan budget 1 s + build ~2 s).
     assert dt < 8.0, f"slow-provider design hung for {dt:.1f}s (would trip transport timeout)"

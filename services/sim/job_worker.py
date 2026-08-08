@@ -30,7 +30,7 @@ from services.sim import jobs as J
 
 def _atomic_write(path: Path, obj: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj), encoding="utf-8")
+    tmp.write_text(json.dumps(obj, allow_nan=False), encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -55,16 +55,18 @@ def main(argv: list) -> int:
     lock = threading.Lock()
 
     def emit(snapshot: dict) -> None:
-        """Publish a partial snapshot. Always labelled — see the module docstring."""
+        """Publish a labelled, finite partial snapshot."""
+        if not isinstance(snapshot, dict):
+            raise ValueError("partial snapshot must be an object")
         with lock:
             latest.update(snapshot)
             body = dict(latest)
-        body.update(partial=True, converged=False, job_id=job_id,
-                    elapsed_s=round(time.time() - t0, 3))
-        try:
-            _atomic_write(partial_path, body)
-        except OSError:
-            pass  # a partial snapshot is best-effort; never fail the solve over it
+            body.update(partial=True, converged=False, job_id=job_id,
+                        elapsed_s=round(time.time() - t0, 3))
+            try:
+                _atomic_write(partial_path, body)
+            except (OSError, TypeError, ValueError):
+                pass
 
     # Solvers that publish live progress to a file of their own (the LBM CFD path writes
     # {pct, step, n_steps}) get it folded into the same partial channel.
@@ -74,8 +76,13 @@ def main(argv: list) -> int:
     def _watch() -> None:
         while not stop.wait(0.5):
             try:
-                emit(json.loads(Path(prog_file).read_text(encoding="utf-8")))
-            except (OSError, ValueError):
+                snapshot = json.loads(
+                    Path(prog_file).read_text(encoding="utf-8"),
+                    parse_constant=lambda token: (_ for _ in ()).throw(
+                        ValueError(f"non-finite JSON constant {token}")))
+                if isinstance(snapshot, dict):
+                    emit(snapshot)
+            except (OSError, TypeError, ValueError):
                 continue
 
     if prog_file:
@@ -86,10 +93,17 @@ def main(argv: list) -> int:
 
     def _run() -> None:
         try:
-            res = fn(payload, emit)
-            outcome["result"] = res
-        except BaseException as e:  # noqa: BLE001 — the child's job is to REPORT the failure
-            outcome["error"] = f"{type(e).__name__}: {e}"
+            result = fn(payload, emit)
+            if not isinstance(result, dict):
+                raise TypeError("simulation stage must return a result object")
+            json.dumps(result, allow_nan=False)
+            outcome["result"] = result
+            if result.get("ok") is not True:
+                outcome["error"] = str(
+                    result.get("error") or result.get("reason") or result.get("hint") or
+                    "simulation stage did not confirm ok=true")
+        except BaseException as exc:  # noqa: BLE001 — child must report every failure
+            outcome["error"] = f"{type(exc).__name__}: {exc}"
             outcome["traceback"] = traceback.format_exc()[-2000:]
         finally:
             finished.set()

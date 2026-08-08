@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <map>
 #include <stdexcept>
+#include <utility>
 
 namespace chudware::firmware {
 namespace {
@@ -253,10 +254,56 @@ double pitot_dynamic_pressure_pa(double airspeed_m_s, double rho = kPitotRho0) {
     return 0.5 * rho * airspeed_m_s * airspeed_m_s;
 }
 
-int pitot_raw_counts(double airspeed_m_s) {
-    double q = pitot_dynamic_pressure_pa(airspeed_m_s);
+int pitot_raw_counts(double airspeed_m_s, double rho) {
+    double q = pitot_dynamic_pressure_pa(airspeed_m_s, rho);
     return std::max(0, std::min(4095, static_cast<int>(
                        std::lround(4095.0 * q / kPitotQFullscalePa))));
+}
+
+bool finite3(const std::array<double, 3>& values) {
+    return std::all_of(values.begin(), values.end(),
+                       [](double value) { return std::isfinite(value); });
+}
+
+void validate_origin(double lat_deg, double lon_deg, double alt_m) {
+    if (!std::isfinite(lat_deg) || lat_deg <= -90.0 || lat_deg >= 90.0)
+        throw std::invalid_argument("origin_lat_deg must be finite and strictly between -90 and 90");
+    if (!std::isfinite(lon_deg) || lon_deg < -180.0 || lon_deg > 180.0)
+        throw std::invalid_argument("origin_lon_deg must be finite and within [-180, 180]");
+    if (!std::isfinite(alt_m))
+        throw std::invalid_argument("origin_alt_m must be finite");
+}
+
+void validate_sample(const TrajectorySample& sample, size_t index) {
+    const std::string prefix = "sample[" + std::to_string(index) + "]";
+    if (!std::isfinite(sample.t_s) || sample.t_s < 0.0)
+        throw std::invalid_argument(prefix + ".t_s must be finite and non-negative");
+    if (!finite3(sample.pos_ned_m) || !finite3(sample.vel_ned_m_s) ||
+        !finite3(sample.accel_ned_m_s2) || !finite3(sample.omega_body_rad_s))
+        throw std::invalid_argument(prefix + " kinematic vectors must contain finite values");
+    if (!std::all_of(sample.quat_body_from_ned.begin(), sample.quat_body_from_ned.end(),
+                     [](double value) { return std::isfinite(value); }))
+        throw std::invalid_argument(prefix + ".quat_body_from_ned must contain finite values");
+    const double qnorm = std::sqrt(
+        sample.quat_body_from_ned[0] * sample.quat_body_from_ned[0] +
+        sample.quat_body_from_ned[1] * sample.quat_body_from_ned[1] +
+        sample.quat_body_from_ned[2] * sample.quat_body_from_ned[2] +
+        sample.quat_body_from_ned[3] * sample.quat_body_from_ned[3]);
+    if (qnorm < 1e-12)
+        throw std::invalid_argument(prefix + ".quat_body_from_ned must have non-zero norm");
+    if (!std::isfinite(sample.temperature_c) || sample.temperature_c <= -273.15)
+        throw std::invalid_argument(prefix + ".temperature_c must be finite and above absolute zero");
+}
+
+void validate_samples(const std::vector<TrajectorySample>& samples) {
+    if (samples.empty()) throw std::invalid_argument("sensor series needs at least one sample");
+    if (samples.size() > 100000)
+        throw std::invalid_argument("sensor series exceeds the 100000-sample limit");
+    for (size_t i = 0; i < samples.size(); ++i) {
+        validate_sample(samples[i], i);
+        if (i > 0 && samples[i].t_s <= samples[i - 1].t_s)
+            throw std::invalid_argument("sample times must be strictly increasing");
+    }
 }
 
 }  // namespace
@@ -300,62 +347,187 @@ std::array<double, 3> ned_to_body(const std::array<double, 4>& q_body_from_ned,
 FlightProfile FlightProfile::from_dict(const nlohmann::json& d) {
     if (!d.is_object())
         throw std::invalid_argument("flight profile must be a dict or FlightProfile");
+    if (d.contains("samples") &&
+        ((d.contains("t_s") && !d["t_s"].is_null()) ||
+         (d.contains("time_s") && !d["time_s"].is_null())))
+        throw std::invalid_argument("flight profile must provide samples or a time array, not both");
+
+    if (d.contains("samples")) {
+        const nlohmann::json& rows = d["samples"];
+        if (!rows.is_array() || rows.empty())
+            throw std::invalid_argument("flight profile 'samples' must be a non-empty array");
+        if (rows.size() > 100000)
+            throw std::invalid_argument("flight profile exceeds the 100000-sample input limit");
+        nlohmann::json flat = nlohmann::json::object();
+        for (const char* key : {"origin_lat_deg", "origin_lon_deg", "origin_alt_m"})
+            if (d.contains(key)) flat[key] = d[key];
+        flat["t_s"] = nlohmann::json::array();
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (!rows[i].is_object())
+                throw std::invalid_argument("samples[" + std::to_string(i) + "] must be an object");
+            if (rows[i].contains("t_s"))
+                flat["t_s"].push_back(rows[i]["t_s"]);
+            else if (rows[i].contains("time_s"))
+                flat["t_s"].push_back(rows[i]["time_s"]);
+            else
+                throw std::invalid_argument("samples[" + std::to_string(i) + "] needs t_s");
+        }
+        struct Field {
+            const char* canonical;
+            std::vector<const char*> aliases;
+        };
+        const std::vector<Field> fields = {
+            {"pos_ned_m", {"pos_ned_m", "position_ned_m", "pos"}},
+            {"altitude_m", {"altitude_m"}},
+            {"vel_ned_m_s", {"vel_ned_m_s", "velocity_ned_m_s", "vel"}},
+            {"accel_ned_m_s2", {"accel_ned_m_s2", "acceleration_ned_m_s2"}},
+            {"quat_body_from_ned", {"quat_body_from_ned", "quat"}},
+            {"omega_body_rad_s", {"omega_body_rad_s", "omega_rad_s", "gyro_rad_s"}},
+            {"temperature_c", {"temperature_c", "temp_c"}},
+            {"airspeed_m_s", {"airspeed_m_s"}},
+            {"yaw_rad", {"yaw_rad", "heading_rad"}},
+            {"pitch_rad", {"pitch_rad"}},
+            {"roll_rad", {"roll_rad"}},
+            {"yaw_deg", {"yaw_deg"}},
+            {"pitch_deg", {"pitch_deg"}},
+            {"roll_deg", {"roll_deg"}},
+        };
+        for (const auto& field : fields) {
+            bool present = false;
+            for (const auto& row : rows)
+                for (const char* alias : field.aliases)
+                    if (row.contains(alias) && !row[alias].is_null()) present = true;
+            if (!present) continue;
+            flat[field.canonical] = nlohmann::json::array();
+            for (size_t i = 0; i < rows.size(); ++i) {
+                const nlohmann::json* value = nullptr;
+                for (const char* alias : field.aliases)
+                    if (rows[i].contains(alias) && !rows[i][alias].is_null()) {
+                        value = &rows[i][alias];
+                        break;
+                    }
+                if (!value)
+                    throw std::invalid_argument(
+                        "samples[" + std::to_string(i) + "] is missing '" +
+                        std::string(field.canonical) + "' while other samples provide it");
+                flat[field.canonical].push_back(*value);
+            }
+        }
+        return FlightProfile::from_dict(flat);
+    }
+    const bool has_pos =
+        d.contains("pos_ned_m") || d.contains("position_ned_m") || d.contains("pos");
+    if (has_pos && d.contains("altitude_m") && !d["altitude_m"].is_null())
+        throw std::invalid_argument("flight profile must provide pos_ned_m or altitude_m, not both");
+    const bool has_quat = d.contains("quat_body_from_ned") || d.contains("quat");
+    const bool has_euler =
+        d.contains("yaw_rad") || d.contains("heading_rad") || d.contains("pitch_rad") ||
+        d.contains("roll_rad") || d.contains("yaw_deg") || d.contains("pitch_deg") ||
+        d.contains("roll_deg");
+    if (has_quat && has_euler)
+        throw std::invalid_argument("flight profile must provide quaternion or Euler attitude, not both");
+    if ((d.contains("t_s") && !d["t_s"].is_null()) &&
+        (d.contains("time_s") && !d["time_s"].is_null()))
+        throw std::invalid_argument("flight profile must provide t_s or time_s, not both");
+    for (const auto& [radians, degrees] :
+         {std::pair<const char*, const char*>{"yaw_rad", "yaw_deg"},
+          {"pitch_rad", "pitch_deg"}, {"roll_rad", "roll_deg"}})
+        if (d.contains(radians) && !d[radians].is_null() &&
+            d.contains(degrees) && !d[degrees].is_null())
+            throw std::invalid_argument(
+                "flight profile must not mix " + std::string(radians) + " with " + degrees);
+
     FlightProfile out;
-    auto origins = [&]() {
-        out.origin_lat_deg = d.value("origin_lat_deg", 37.0);
-        out.origin_lon_deg = d.value("origin_lon_deg", -122.0);
-        out.origin_alt_m = d.value("origin_alt_m", 0.0);
-    };
+    out.origin_lat_deg = d.value("origin_lat_deg", 37.0);
+    out.origin_lon_deg = d.value("origin_lon_deg", -122.0);
+    out.origin_alt_m = d.value("origin_alt_m", 0.0);
+    validate_origin(out.origin_lat_deg, out.origin_lon_deg, out.origin_alt_m);
+
     std::vector<double> t;
     for (const char* key : {"t_s", "time_s"}) {
-        if (d.contains(key) && d[key].is_array() && !d[key].empty()) {
-            for (const auto& v : d[key]) t.push_back(v.get<double>());
-            break;
+        if (!d.contains(key) || d[key].is_null()) continue;
+        if (!d[key].is_array() || d[key].empty())
+            throw std::invalid_argument("flight profile '" + std::string(key) +
+                                        "' must be a non-empty array");
+        for (const auto& value : d[key]) {
+            if (!value.is_number())
+                throw std::invalid_argument("flight profile times must be numeric seconds");
+            t.push_back(value.get<double>());
         }
+        break;
     }
     if (t.empty()) throw std::runtime_error("flight profile needs non-empty 't_s' (or 'samples')");
-    size_t n = t.size();
+    if (t.size() > 100000)
+        throw std::invalid_argument("flight profile exceeds the 100000-sample input limit");
+    for (size_t i = 0; i < t.size(); ++i) {
+        if (!std::isfinite(t[i]) || t[i] < 0.0)
+            throw std::invalid_argument("flight profile t_s values must be finite and non-negative");
+        if (i > 0 && t[i] <= t[i - 1])
+            throw std::invalid_argument("flight profile t_s values must be strictly increasing");
+    }
+    const size_t n = t.size();
 
     auto col = [&](std::initializer_list<const char*> keys,
                    std::initializer_list<const char*> alt_keys) -> std::vector<nlohmann::json> {
         std::vector<const char*> all(keys);
         all.insert(all.end(), alt_keys.begin(), alt_keys.end());
-        for (const char* k : all) {
-            if (d.contains(k) && !d[k].is_null()) {
-                const nlohmann::json& vals = d[k];
-                if (vals.is_number())
-                    return std::vector<nlohmann::json>(n, vals.get<double>());
-                if (!vals.is_array() || vals.size() != n)
-                    throw std::runtime_error("profile '" + std::string(k) + "' length " +
-                                             std::to_string(vals.is_array() ? vals.size() : 0) +
-                                             " != len(t_s)=" + std::to_string(n));
-                return vals.get<std::vector<nlohmann::json>>();
-            }
+        for (const char* key : all) {
+            if (!d.contains(key) || d[key].is_null()) continue;
+            const nlohmann::json& values = d[key];
+            if (values.is_number())
+                return std::vector<nlohmann::json>(n, values.get<double>());
+            if (!values.is_array() || values.size() != n)
+                throw std::runtime_error("profile '" + std::string(key) + "' length " +
+                                         std::to_string(values.is_array() ? values.size() : 0) +
+                                         " != len(t_s)=" + std::to_string(n));
+            return values.get<std::vector<nlohmann::json>>();
         }
         return {};
     };
 
-    auto vec3 = [](const nlohmann::json& v, const std::array<double, 3>& dflt) {
-        if (!v.is_array() || v.size() < 3) return dflt;
-        return std::array<double, 3>{v[0].get<double>(), v[1].get<double>(), v[2].get<double>()};
+    auto vec3 = [](const nlohmann::json& value, const std::array<double, 3>& dflt,
+                   const std::string& field) {
+        if (value.is_null()) return dflt;
+        if (!value.is_array() || value.size() != 3)
+            throw std::invalid_argument(field + " must contain exactly 3 numeric values");
+        std::array<double, 3> out{};
+        for (size_t i = 0; i < out.size(); ++i) {
+            if (!value[i].is_number())
+                throw std::invalid_argument(field + " must contain exactly 3 numeric values");
+            out[i] = value[i].get<double>();
+        }
+        return out;
     };
-    auto vec4 = [](const nlohmann::json& v) {
-        if (!v.is_array() || v.size() < 4)
-            return std::array<double, 4>{1.0, 0.0, 0.0, 0.0};
-        return std::array<double, 4>{v[0].get<double>(), v[1].get<double>(), v[2].get<double>(),
-                                     v[3].get<double>()};
+    auto vec4 = [](const nlohmann::json& value, const std::string& field) {
+        if (!value.is_array() || value.size() != 4)
+            throw std::invalid_argument(field + " must contain exactly 4 numeric values");
+        std::array<double, 4> out{};
+        for (size_t i = 0; i < out.size(); ++i) {
+            if (!value[i].is_number())
+                throw std::invalid_argument(field + " must contain exactly 4 numeric values");
+            out[i] = value[i].get<double>();
+        }
+        return out;
+    };
+    auto scalar_at = [](const std::vector<nlohmann::json>& values, size_t i, double dflt,
+                        const std::string& field) {
+        if (values.empty()) return dflt;
+        if (!values[i].is_number())
+            throw std::invalid_argument(field + " must contain numeric values");
+        const double value = values[i].get<double>();
+        if (!std::isfinite(value))
+            throw std::invalid_argument(field + " must contain finite values");
+        return value;
     };
 
     auto pos = col({"pos_ned_m"}, {"position_ned_m", "pos"});
-    // altitude-only profiles: pos_ned = (0,0,-alt)
-    if (d.contains("altitude_m") && !d.contains("pos_ned_m") && !d.contains("position_ned_m")) {
+    if (d.contains("altitude_m") && !d.contains("pos_ned_m") &&
+        !d.contains("position_ned_m") && !d.contains("pos")) {
         pos.clear();
-        const nlohmann::json& alts = d["altitude_m"];
-        if (alts.is_number()) {
-            for (size_t i = 0; i < n; ++i)
-                pos.push_back({0.0, 0.0, -alts.get<double>()});
-        } else {
-            for (const auto& a : alts) pos.push_back({0.0, 0.0, -a.get<double>()});
+        auto altitudes = col({"altitude_m"}, {});
+        for (size_t i = 0; i < n; ++i) {
+            const double altitude = scalar_at(altitudes, i, 0.0, "altitude_m");
+            pos.push_back({0.0, 0.0, out.origin_alt_m - altitude});
         }
     }
     auto vel = col({"vel_ned_m_s"}, {"velocity_ned_m_s", "vel"});
@@ -370,59 +542,59 @@ FlightProfile FlightProfile::from_dict(const nlohmann::json& d) {
         auto yaw = col({"yaw_rad"}, {"heading_rad"});
         auto pitch = col({"pitch_rad"}, {});
         auto roll = col({"roll_rad"}, {});
-        auto deg_col = [&](const char* key, std::vector<nlohmann::json>& c) {
+        auto degrees = [&](const char* key, std::vector<nlohmann::json>& values) {
             if (!d.contains(key)) return;
-            c.clear();
-            const nlohmann::json& vals = d[key];
-            if (vals.is_number()) {
-                for (size_t i = 0; i < n; ++i) c.push_back(vals.get<double>() * kDeg2Rad);
-            } else {
-                for (const auto& v : vals) c.push_back(v.get<double>() * kDeg2Rad);
+            values = col({key}, {});
+            for (auto& value : values) {
+                if (!value.is_number())
+                    throw std::invalid_argument(std::string(key) + " must contain numeric values");
+                value = value.get<double>() * kDeg2Rad;
             }
         };
-        deg_col("yaw_deg", yaw);
-        deg_col("pitch_deg", pitch);
-        deg_col("roll_deg", roll);
-        auto scalar_at = [](const std::vector<nlohmann::json>& c, size_t i, double dflt) {
-            if (c.empty()) return dflt;
-            return c[i].is_number() ? c[i].get<double>() : dflt;
-        };
+        degrees("yaw_deg", yaw);
+        degrees("pitch_deg", pitch);
+        degrees("roll_deg", roll);
         for (size_t i = 0; i < n; ++i) {
-            auto q = quat_from_euler_zyx(scalar_at(yaw, i, 0.0), scalar_at(pitch, i, 0.0),
-                                         scalar_at(roll, i, 0.0));
+            auto q = quat_from_euler_zyx(
+                scalar_at(yaw, i, 0.0, "yaw"), scalar_at(pitch, i, 0.0, "pitch"),
+                scalar_at(roll, i, 0.0, "roll"));
             quats.push_back({q[0], q[1], q[2], q[3]});
         }
     }
 
-    auto scalar_at = [](const std::vector<nlohmann::json>& c, size_t i, double dflt) {
-        if (c.empty()) return dflt;
-        if (c[i].is_number()) return c[i].get<double>();
-        if (c[i].is_array() && !c[i].empty()) return c[i][0].get<double>();
-        return dflt;
-    };
+    out.samples.reserve(n);
     for (size_t i = 0; i < n; ++i) {
-        TrajectorySample s;
-        s.t_s = t[i];
-        s.pos_ned_m = vec3(pos.empty() ? nlohmann::json() : pos[i], {0.0, 0.0, 0.0});
-        s.vel_ned_m_s = vec3(vel.empty() ? nlohmann::json() : vel[i], {0.0, 0.0, 0.0});
-        s.accel_ned_m_s2 = vec3(acc.empty() ? nlohmann::json() : acc[i], {0.0, 0.0, 0.0});
-        s.quat_body_from_ned = quats.empty() ? std::array<double, 4>{1, 0, 0, 0}
-                                             : vec4(quats[i]);
-        s.omega_body_rad_s = vec3(omega.empty() ? nlohmann::json() : omega[i], {0.0, 0.0, 0.0});
-        s.temperature_c = scalar_at(temp, i, 25.0);
-        out.samples.push_back(s);
+        TrajectorySample sample;
+        sample.t_s = t[i];
+        sample.pos_ned_m = vec3(
+            pos.empty() ? nlohmann::json() : pos[i], {0.0, 0.0, 0.0}, "pos_ned_m");
+        sample.vel_ned_m_s = vec3(
+            vel.empty() ? nlohmann::json() : vel[i], {0.0, 0.0, 0.0}, "vel_ned_m_s");
+        sample.accel_ned_m_s2 = vec3(
+            acc.empty() ? nlohmann::json() : acc[i], {0.0, 0.0, 0.0}, "accel_ned_m_s2");
+        sample.quat_body_from_ned =
+            quats.empty() ? std::array<double, 4>{1.0, 0.0, 0.0, 0.0}
+                          : vec4(quats[i], "quat_body_from_ned");
+        sample.omega_body_rad_s = vec3(
+            omega.empty() ? nlohmann::json() : omega[i], {0.0, 0.0, 0.0},
+            "omega_body_rad_s");
+        sample.temperature_c = scalar_at(temp, i, 25.0, "temperature_c");
+        out.samples.push_back(sample);
     }
+
     if (d.contains("airspeed_m_s") && !d["airspeed_m_s"].is_null()) {
+        const auto values = col({"airspeed_m_s"}, {});
         std::vector<double> airspeed;
-        const nlohmann::json& a = d["airspeed_m_s"];
-        if (a.is_number()) {
-            airspeed.assign(n, a.get<double>());
-        } else {
-            for (const auto& v : a) airspeed.push_back(v.get<double>());
+        airspeed.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            const double value = scalar_at(values, i, 0.0, "airspeed_m_s");
+            if (value < 0.0)
+                throw std::invalid_argument("airspeed_m_s must be non-negative");
+            airspeed.push_back(value);
         }
-        out.airspeed_m_s = airspeed;
+        out.airspeed_m_s = std::move(airspeed);
     }
-    origins();
+    validate_samples(out.samples);
     return out;
 }
 
@@ -437,6 +609,7 @@ double isa_temperature_c(double altitude_m) {
 }
 
 nlohmann::json mpu6050_series(const std::vector<TrajectorySample>& samples) {
+    validate_samples(samples);
     nlohmann::json out = nlohmann::json::array();
     for (const auto& s : samples) {
         auto regs = mpu6050_registers(s);
@@ -456,10 +629,14 @@ nlohmann::json mpu6050_series(const std::vector<TrajectorySample>& samples) {
     return out;
 }
 
-nlohmann::json bmp280_series(const std::vector<TrajectorySample>& samples) {
+nlohmann::json bmp280_series(const std::vector<TrajectorySample>& samples,
+                             double origin_alt_m) {
+    validate_samples(samples);
+    if (!std::isfinite(origin_alt_m))
+        throw std::invalid_argument("origin_alt_m must be finite");
     nlohmann::json out = nlohmann::json::array();
     for (const auto& s : samples) {
-        double alt = -s.pos_ned_m[2];  // NED down → altitude up
+        double alt = origin_alt_m - s.pos_ned_m[2];  // NED down → altitude up
         double p = isa_pressure_pa(alt);
         auto regs = bmp280_registers(alt, s.temperature_c, kBmpCal);
         nlohmann::json registers = nlohmann::json::object();
@@ -476,6 +653,7 @@ nlohmann::json bmp280_series(const std::vector<TrajectorySample>& samples) {
 }
 
 nlohmann::json lis3mdl_series(const std::vector<TrajectorySample>& samples) {
+    validate_samples(samples);
     nlohmann::json out = nlohmann::json::array();
     for (const auto& s : samples) {
         auto q = quat_normalize(s.quat_body_from_ned);
@@ -503,6 +681,8 @@ nlohmann::json lis3mdl_series(const std::vector<TrajectorySample>& samples) {
 
 nlohmann::json gnss_series(const std::vector<TrajectorySample>& samples,
                            double origin_lat_deg, double origin_lon_deg, double origin_alt_m) {
+    validate_samples(samples);
+    validate_origin(origin_lat_deg, origin_lon_deg, origin_alt_m);
     nlohmann::json out = nlohmann::json::array();
     for (const auto& s : samples) {
         nlohmann::json fix = gnss_fix(s, origin_lat_deg, origin_lon_deg, origin_alt_m);
@@ -521,19 +701,30 @@ nlohmann::json gnss_series(const std::vector<TrajectorySample>& samples,
 }
 
 nlohmann::json pitot_series(const std::vector<TrajectorySample>& samples,
-                            const std::optional<std::vector<double>>& airspeed_m_s) {
+                            const std::optional<std::vector<double>>& airspeed_m_s,
+                            double origin_alt_m) {
+    validate_samples(samples);
+    if (!std::isfinite(origin_alt_m))
+        throw std::invalid_argument("origin_alt_m must be finite");
+    if (airspeed_m_s && airspeed_m_s->size() != samples.size())
+        throw std::invalid_argument("airspeed_m_s length must match sensor sample count");
     nlohmann::json out = nlohmann::json::array();
     for (size_t i = 0; i < samples.size(); ++i) {
         const auto& s = samples[i];
-        double tas = airspeed_m_s ? (*airspeed_m_s)[std::min(i, airspeed_m_s->size() - 1)]
-                                  : airspeed_from_ned(s);
-        int counts = pitot_raw_counts(tas);
+        double tas = airspeed_m_s ? (*airspeed_m_s)[i] : airspeed_from_ned(s);
+        if (!std::isfinite(tas) || tas < 0.0)
+            throw std::invalid_argument("airspeed_m_s must contain finite non-negative values");
+        const double altitude_m = origin_alt_m - s.pos_ned_m[2];
+        const double density =
+            isa_pressure_pa(altitude_m) / (kIsaR * (s.temperature_c + 273.15));
+        int counts = pitot_raw_counts(tas, density);
         int raw16 = counts << 4;
         int b0 = (raw16 >> 8) & 0xFF, b1 = raw16 & 0xFF;
         out.push_back({
             {"t_s", s.t_s},      {"t_ms", s.t_s * 1000.0},  {"device", "pitot"},
             {"airspeed_m_s", tas},
-            {"q_pa", pitot_dynamic_pressure_pa(tas)},
+            {"q_pa", pitot_dynamic_pressure_pa(tas, density)},
+            {"density_kg_m3", density},
             {"counts", counts},  {"response", {b0, b1}},
             {"registers", {{"0", b0}, {"1", b1}}},
         });

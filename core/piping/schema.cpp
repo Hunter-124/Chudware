@@ -2,6 +2,7 @@
 #include "piping/schema.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <set>
 
@@ -21,7 +22,9 @@ const std::set<std::string> kMaterials = {"A106-B", "A53-B", "A312-304", "A312-3
                                           "A333-6", "PVC", "CPVC", "copper"};
 const std::set<std::string> kEndTypes = {"BW", "SW", "THD", "FLG"};
 
-bool is_num(const ojson& v) { return v.is_number() && !v.is_boolean(); }
+bool is_num(const ojson& v) {
+    return v.is_number() && !v.is_boolean() && std::isfinite(v.get<double>());
+}
 
 bool in_num_set(const ojson& v, std::initializer_list<double> vals) {
     if (!is_num(v)) return false;
@@ -211,6 +214,10 @@ std::vector<std::string> validate_run(const ojson& run, const std::string& loc) 
                                "]: zero-length segment (duplicate point)");
             }
         }
+        if (is_xyz(path.front()) && is_xyz(path.back()) &&
+            path.front() == path.back()) {
+            errs.push_back(loc + ".path: start and end points must be distinct");
+        }
     }
     check_size(run, loc, errs);
     check_schedule(run, loc, errs);
@@ -297,6 +304,10 @@ std::vector<std::string> validate_piping(const ojson& doc) {
                                         : ojson(nullptr))};
     }
     if (!doc.value("id", ojson(nullptr)).is_string()) errs.push_back("id: missing");
+    const ojson units = doc.value("units", ojson(nullptr));
+    if (!units.is_object() || units.value("system", ojson(nullptr)) != "MMGS") {
+        errs.push_back("units.system: expected 'MMGS' (path and bore dimensions are mm)");
+    }
     check_material(doc, "doc", errs);
 
     ojson runs = doc.value("runs", ojson::array());

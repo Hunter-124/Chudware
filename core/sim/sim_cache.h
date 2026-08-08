@@ -2,9 +2,9 @@
 // SPICE / CFD (and a reserved EM kind). Process-wide + optional on-disk sidecar;
 // the .step+ studies/<id>/results.npz seam lives in doc/stepplus (20 MB cap).
 //
-// Keys are FNV-1a of a CANONICAL dump of every solve input. A HIT returns the
-// stored result (O(load)); ANY input change is a MISS. Never serves a stale
-// result. Respects resource_governor::low_memory_now() (honest disable).
+// Keys digest an exact canonical dump of every finite solve input plus the cache
+// engine/schema version. A HIT returns the stored result; ANY input change is a
+// MISS. Non-finite inputs/results are not cached.
 #pragma once
 
 #include <map>
@@ -29,14 +29,15 @@ enum class Kind {
 
 const char* kind_name(Kind k);
 
-// Run-stable FNV-1a hex of a canonical JSON dump of `inputs` (floats rounded to
-// 6 dp; keys sorted by nlohmann::json). For FEA studies that carry a step_path,
-// prefer hash_fea_study so the STEP *contents* (not the path string) fold in.
+// Run-stable digest of a canonical JSON dump of `inputs` (object keys are sorted
+// by nlohmann::json; finite floating-point values are preserved exactly). Returns
+// empty for non-finite input. For FEA studies carrying a step_path, prefer
+// hash_fea_study so the STEP contents fold in.
 std::string hash_inputs(Kind kind, const nlohmann::json& inputs);
 
 // FEA study hash: canonical study JSON with step_path replaced by a content
-// fingerprint of the file (or the path string when the file is unreadable).
-// `kind` must be FeaStatic / FeaModal / FeaThermal so the three analyses never collide.
+// fingerprint of the file. Unreadable files return an empty key, disabling
+// reuse rather than trusting a path string. Only FEA kinds are accepted.
 std::string hash_fea_study(Kind kind, const nlohmann::json& study);
 
 // SPICE: circuit + study (analyses/probes/options). CFD: geometry + FlowParams.
@@ -50,9 +51,8 @@ struct Lookup {
     std::string reason = "miss";
     std::string input_hash;
 };
-
-// Process-wide lookup/store. On low_memory_now() lookup is always a miss and
-// store is a no-op (honest). store refuses payloads larger than the 20 MB cap.
+// Process-wide lookup/store. Low-memory mode always misses/drops; store also
+// rejects non-finite or payloads larger than the 20 MB cap.
 Lookup lookup(Kind kind, const std::string& input_hash);
 bool store(Kind kind, const std::string& input_hash, const nlohmann::json& result);
 
@@ -68,7 +68,7 @@ struct Stats {
     std::uint64_t hits = 0;
     std::uint64_t misses = 0;
     std::uint64_t stores = 0;
-    std::uint64_t drops = 0;  // refused (too large / low mem / disabled)
+    std::uint64_t drops = 0;  // refused (invalid / too large / low memory)
 };
 Stats stats();
 void reset_stats();
@@ -79,14 +79,12 @@ std::string sim_cache_engine_key();
 
 // Encode/decode a study result blob for studies/<id>/results.npz:
 //   "AICRES1" magic · u32 header_len · header JSON · result JSON
-// Header: {engine, input_hash, kind, solved:true, bytes}.
-// Returns empty string when the payload would exceed kMaxStudyResultBytes or
-// when low_memory_now() is set (honest drop).
+// Header binds engine, input_hash, kind, solved, exact body byte count and checksum.
+// Returns empty for invalid/non-finite/oversized payloads or low-memory mode.
 std::string encode_result_blob(Kind kind, const std::string& input_hash,
                                const nlohmann::json& result);
-// Validates engine key + solved flag. Returns false on any mismatch/corrupt
-// (caller treats as cache miss). Does NOT re-check input_hash equality — the
-// caller supplies the expected hash and compares.
+// Validates every bound header field and the body checksum before publishing outputs.
+// The caller still compares input_hash_out with its current expected hash.
 bool decode_result_blob(const std::string& blob, Kind& kind_out,
                         std::string& input_hash_out, nlohmann::json& result_out);
 

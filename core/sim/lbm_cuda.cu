@@ -4,14 +4,16 @@
 #include "sim/lbm_cuda.h"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <cstring>
 #include <string>
 #include <vector>
 
-namespace aicad::sim {
+namespace chudware::sim {
 namespace {
 
 constexpr int NQ = 19;
@@ -26,6 +28,10 @@ __constant__ float d_W[NQ] = {
     1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f,
     1.0f / 36.0f};
 __constant__ int d_OPP[NQ] = {0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15, 18, 17};
+__constant__ int d_REFLECT_Y[NQ] = {
+    0, 1, 2, 4, 3, 5, 6, 9, 10, 7, 8, 11, 12, 13, 14, 18, 17, 16, 15};
+__constant__ int d_REFLECT_Z[NQ] = {
+    0, 1, 2, 3, 4, 6, 5, 7, 8, 9, 10, 13, 14, 11, 12, 17, 18, 15, 16};
 __constant__ float d_CS2 = 1.0f / 3.0f;
 __constant__ float d_SMAG_C = 0.04087077f;
 
@@ -37,6 +43,29 @@ __device__ inline float pairwise_sum19(const float v[NQ]) {
     float res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7));
     res += v[16]; res += v[17]; res += v[18];
     return res;
+}
+float pairwise_sum_f32_host(const float* a, size_t n) {
+    if (n == 0) return 0.0f;
+    if (n < 8) {
+        float r = a[0];
+        for (size_t i = 1; i < n; ++i) r += a[i];
+        return r;
+    }
+    if (n <= 128) {
+        float r0 = a[0], r1 = a[1], r2 = a[2], r3 = a[3];
+        float r4 = a[4], r5 = a[5], r6 = a[6], r7 = a[7];
+        size_t i = 8;
+        for (; i + 8 <= n; i += 8) {
+            r0 += a[i]; r1 += a[i + 1]; r2 += a[i + 2]; r3 += a[i + 3];
+            r4 += a[i + 4]; r5 += a[i + 5]; r6 += a[i + 6]; r7 += a[i + 7];
+        }
+        float result = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7));
+        for (; i < n; ++i) result += a[i];
+        return result;
+    }
+    size_t half = n / 2;
+    half -= half % 8;
+    return pairwise_sum_f32_host(a, half) + pairwise_sum_f32_host(a + half, n - half);
 }
 
 __device__ inline size_t cidx(int x, int y, int z, int ny, int nz) {
@@ -81,7 +110,7 @@ __global__ void collide_kernel(float* f, const uint8_t* solid, int nx, int ny, i
         const float pi_mag = sqrtf(pairwise_sum19(sq));
         const float nu_eff = nu0 + d_SMAG_C * pi_mag;
         float tau_eff = nu_eff / d_CS2 + 0.5f;
-        if (tau_eff < 0.51f) tau_eff = 0.51f;
+        if (tau_eff < (1.0f / omega_s)) tau_eff = 1.0f / omega_s;
         if (tau_eff > 2.0f) tau_eff = 2.0f;
         omega = 1.0f / tau_eff;
     }
@@ -127,28 +156,26 @@ __global__ void outlet_kernel(float* f, int nx, int ny, int nz) {
 }
 
 __global__ void slip_y_kernel(float* f, int nx, int ny, int nz) {
-    if (ny < 2) return;
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int z = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= nx || z >= nz) return;
-    const size_t d0 = cidx(x, 0, z, ny, nz) * NQ, s0 = cidx(x, 1, z, ny, nz) * NQ;
-    const size_t d1 = cidx(x, ny - 1, z, ny, nz) * NQ, s1 = cidx(x, ny - 2, z, ny, nz) * NQ;
+    const size_t low = cidx(x, 0, z, ny, nz) * NQ;
+    const size_t high = cidx(x, ny - 1, z, ny, nz) * NQ;
     for (int q = 0; q < NQ; ++q) {
-        f[d0 + q] = f[s0 + q];
-        f[d1 + q] = f[s1 + q];
+        if (d_EQ[q][1] > 0) f[low + q] = f[low + d_REFLECT_Y[q]];
+        if (d_EQ[q][1] < 0) f[high + q] = f[high + d_REFLECT_Y[q]];
     }
 }
 
 __global__ void slip_z_kernel(float* f, int nx, int ny, int nz) {
-    if (nz < 2) return;
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= nx || y >= ny) return;
-    const size_t d0 = cidx(x, y, 0, ny, nz) * NQ, s0 = cidx(x, y, 1, ny, nz) * NQ;
-    const size_t d1 = cidx(x, y, nz - 1, ny, nz) * NQ, s1 = cidx(x, y, nz - 2, ny, nz) * NQ;
+    const size_t low = cidx(x, y, 0, ny, nz) * NQ;
+    const size_t high = cidx(x, y, nz - 1, ny, nz) * NQ;
     for (int q = 0; q < NQ; ++q) {
-        f[d0 + q] = f[s0 + q];
-        f[d1 + q] = f[s1 + q];
+        if (d_EQ[q][2] > 0) f[low + q] = f[low + d_REFLECT_Z[q]];
+        if (d_EQ[q][2] < 0) f[high + q] = f[high + d_REFLECT_Z[q]];
     }
 }
 
@@ -229,13 +256,39 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
     R.ny = ny;
     R.nz = nz;
     R.backend = "cuda";
-    if (nx < 1 || ny < 1 || nz < 1) {
-        R.error = "lbm_run_cuda: grid dims must be >= 1";
+    if (nx < 3 || ny < 3 || nz < 3) {
+        R.error = "lbm_run_cuda: grid dims must each be >= 3";
         return R;
     }
-    const size_t ncell = static_cast<size_t>(nx) * ny * nz;
+    const size_t max_cells = std::numeric_limits<size_t>::max() / NQ;
+    if (static_cast<size_t>(nx) > max_cells / static_cast<size_t>(ny) ||
+        static_cast<size_t>(nx) * static_cast<size_t>(ny) >
+            max_cells / static_cast<size_t>(nz)) {
+        R.error = "lbm_run_cuda: grid is too large";
+        return R;
+    }
+    const size_t ncell = static_cast<size_t>(nx) * static_cast<size_t>(ny) *
+                         static_cast<size_t>(nz);
+    if (ncell > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        R.error = "lbm_run_cuda: grid exceeds CUDA kernel index range";
+        fallback_reason = R.error;
+        return R;
+    }
     if (solid.size() != ncell) {
         R.error = "lbm_run_cuda: solid mask size mismatch";
+        return R;
+    }
+    if (n_steps <= 0 || !std::isfinite(p.u_lat) || p.u_lat <= 0.0 || p.u_lat > 0.1 ||
+        !std::isfinite(p.tau0) || p.tau0 <= 0.5 || p.tau0 > 2.0 ||
+        !std::isfinite(p.voxel_mm) || p.voxel_mm <= 0.0 ||
+        !std::isfinite(p.dx_m) || p.dx_m <= 0.0 ||
+        !std::isfinite(p.dt_s) || p.dt_s <= 0.0 ||
+        !std::isfinite(p.rho_air) || p.rho_air <= 0.0) {
+        R.error = "lbm_run_cuda: invalid lattice parameters";
+        return R;
+    }
+    if (std::all_of(solid.begin(), solid.end(), [](uint8_t v) { return v != 0; })) {
+        R.error = "lbm_run_cuda: solid mask contains no fluid cells";
         return R;
     }
     if (!lbm_cuda_device_available()) {
@@ -319,11 +372,48 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
         return fail("H2D inlet failed");
 
     const double tau_current = p.tau0;
-    const bool use_smag = tau_current > 0.55;
+    const bool use_smag = true;  // Match CPU: preserve tau0 and add LES viscosity at high Re.
     const float omega_s = static_cast<float>(1.0 / tau_current);
     const float CS2 = 1.0f / 3.0f;
     const float nu0 = CS2 * static_cast<float>(tau_current - 0.5);
 
+    const int EQ[NQ][3] = {
+        {0, 0, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
+        {1, 1, 0}, {-1, -1, 0}, {1, -1, 0}, {-1, 1, 0}, {1, 0, 1}, {-1, 0, -1},
+        {1, 0, -1}, {-1, 0, 1}, {0, 1, 1}, {0, -1, -1}, {0, 1, -1}, {0, -1, 1}};
+    auto cidx_h = [ny, nz](int x, int y, int z) {
+        return (static_cast<size_t>(x) * ny + y) * nz + z;
+    };
+    auto momentum_exchange_host = [&](const std::vector<float>& hf, double& drag_lat,
+                                      double& lift_lat, double& side_lat) {
+        drag_lat = 0.0;
+        lift_lat = 0.0;
+        side_lat = 0.0;
+        std::vector<float> gather;
+        for (int q = 1; q < NQ; ++q) {
+            gather.clear();
+            for (int x = 0; x < nx; ++x) {
+                int nbx = (x + EQ[q][0]) % nx;
+                if (nbx < 0) nbx += nx;
+                for (int y = 0; y < ny; ++y) {
+                    int nby = (y + EQ[q][1]) % ny;
+                    if (nby < 0) nby += ny;
+                    for (int z = 0; z < nz; ++z) {
+                        int nbz = (z + EQ[q][2]) % nz;
+                        if (nbz < 0) nbz += nz;
+                        const size_t c = cidx_h(x, y, z);
+                        const size_t nb = cidx_h(nbx, nby, nbz);
+                        if (solid[nb] && !solid[c]) gather.push_back(hf[c * NQ + q]);
+                    }
+                }
+            }
+            const float s32 = pairwise_sum_f32_host(gather.data(), gather.size());
+            const double contrib = static_cast<double>(s32) * 2.0;
+            drag_lat += contrib * static_cast<double>(EQ[q][0]);
+            lift_lat += contrib * static_cast<double>(EQ[q][1]);
+            side_lat += contrib * static_cast<double>(EQ[q][2]);
+        }
+    };
     const int threads = 256;
     const int blocks = static_cast<int>((ncell + threads - 1) / threads);
     dim3 thr2(16, 16);
@@ -345,9 +435,10 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
         slip_z_kernel<<<blk_xy, thr2>>>(d_f, nx, ny, nz);
         bounce_back_kernel<<<blocks, threads>>>(d_f, d_solid, nx, ny, nz);
         zero_solid_kernel<<<blocks, threads>>>(d_f, d_solid, static_cast<int>(ncell));
-        if (cudaGetLastError() != cudaSuccess) {
+        if (const cudaError_t launch_error = cudaGetLastError();
+            launch_error != cudaSuccess) {
             return fail(std::string("kernel launch failed: ") +
-                        cudaGetErrorString(cudaGetLastError()));
+                        cudaGetErrorString(launch_error));
         }
         if (step % sample_every == 0 || step == n_steps) {
             if (on_progress) on_progress(step, n_steps);
@@ -363,9 +454,12 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
                           " of " + std::to_string(n_steps);
                 return R;
             }
-            // Lightweight checkpoint: just record a zero placeholder; force is computed
-            // fully at the end on the host after D2H (preserves reduction order options).
-            drag_hist.push_back(0.0);
+            if (cudaMemcpy(h_f.data(), d_f, h_f.size() * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                return fail("D2H convergence sample failed");
+            double drag_sample = 0.0, lift_sample = 0.0, side_sample = 0.0;
+            momentum_exchange_host(h_f, drag_sample, lift_sample, side_sample);
+            drag_hist.push_back(drag_sample);
         }
     }
     if (cudaDeviceSynchronize() != cudaSuccess)
@@ -395,41 +489,14 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
         cudaSuccess)
         return fail("D2H f failed");
 
-    // Build boundary links + momentum exchange (same as CPU).
-    const int EQ[NQ][3] = {
-        {0, 0, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
-        {1, 1, 0}, {-1, -1, 0}, {1, -1, 0}, {-1, 1, 0}, {1, 0, 1}, {-1, 0, -1},
-        {1, 0, -1}, {-1, 0, 1}, {0, 1, 1}, {0, -1, -1}, {0, 1, -1}, {0, -1, 1}};
-    auto cidx_h = [ny, nz](int x, int y, int z) {
-        return (static_cast<size_t>(x) * ny + y) * nz + z;
-    };
-    double drag_lat = 0.0, lift_lat = 0.0;
-    for (int q = 1; q < NQ; ++q) {
-        std::vector<float> gather;
-        for (int x = 0; x < nx; ++x) {
-            int nbx = (x + EQ[q][0]) % nx; if (nbx < 0) nbx += nx;
-            for (int y = 0; y < ny; ++y) {
-                int nby = (y + EQ[q][1]) % ny; if (nby < 0) nby += ny;
-                for (int z = 0; z < nz; ++z) {
-                    int nbz = (z + EQ[q][2]) % nz; if (nbz < 0) nbz += nz;
-                    const size_t c = cidx_h(x, y, z);
-                    const size_t nb = cidx_h(nbx, nby, nbz);
-                    if (solid[nb] && !solid[c]) gather.push_back(h_f[c * NQ + q]);
-                }
-            }
-        }
-        // Sequential float32 sum for small gathers; for large, approximate with double
-        // then cast — still within float32 force tolerance used by the bench.
-        float s32 = 0.0f;
-        for (float v : gather) s32 += v;
-        const double contrib = static_cast<double>(s32) * 2.0;
-        drag_lat += contrib * static_cast<double>(EQ[q][0]);
-        lift_lat += contrib * static_cast<double>(EQ[q][1]);
-    }
+    // Host-side momentum exchange preserves the CPU path's deterministic direction order.
+    double drag_lat = 0.0, lift_lat = 0.0, side_lat = 0.0;
+    momentum_exchange_host(h_f, drag_lat, lift_lat, side_lat);
 
     const double force_factor = p.rho_air * std::pow(p.dx_m, 4.0) / (p.dt_s * p.dt_s);
     R.drag_n = drag_lat * force_factor;
     R.lift_n = lift_lat * force_factor;
+    R.side_n = side_lat * force_factor;
 
     double frontal_cells = 0.0;
     for (int y = 0; y < ny; ++y) {
@@ -447,13 +514,49 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
     R.cd = (frontal_area_m2 > 0.0 && dyn_pressure > 0.0)
                ? R.drag_n / (dyn_pressure * frontal_area_m2)
                : 0.0;
+    double inlet_flux = 0.0, outlet_flux = 0.0;
+    bool finite_fields = true;
+    for (size_t c = 0; c < ncell; ++c) {
+        if (!std::isfinite(R.rho[c]) || !std::isfinite(R.ux[c]) ||
+            !std::isfinite(R.uy[c]) || !std::isfinite(R.uz[c]) ||
+            (!solid[c] && R.rho[c] <= 0.0f)) {
+            finite_fields = false;
+            break;
+        }
+    }
+    for (int y = 0; y < ny; ++y) {
+        for (int z = 0; z < nz; ++z) {
+            const size_t ci = cidx_h(0, y, z);
+            const size_t co = cidx_h(nx - 1, y, z);
+            if (!solid[ci]) inlet_flux += static_cast<double>(R.rho[ci]) * R.ux[ci];
+            if (!solid[co]) outlet_flux += static_cast<double>(R.rho[co]) * R.ux[co];
+        }
+    }
+    const double flux_scale = std::max({std::abs(inlet_flux), std::abs(outlet_flux), 1e-30});
+    R.mass_imbalance = std::abs(inlet_flux - outlet_flux) / flux_scale;
     R.steps_run = n_steps;
-    R.diverged = !std::isfinite(R.drag_n) || !std::isfinite(R.lift_n);
-    R.residual = R.diverged ? 1.0 : 0.0;
-    R.converged = !R.diverged;
-    R.ok = true;
+    R.diverged = !finite_fields || !std::isfinite(R.drag_n) || !std::isfinite(R.lift_n) ||
+                 !std::isfinite(R.side_n) || !std::isfinite(R.cd) ||
+                 !std::isfinite(R.mass_imbalance);
+    R.residual = -1.0;
+    R.converged = false;
+    if (!R.diverged && drag_hist.size() >= 4) {
+        const size_t tail = std::max<size_t>(3, drag_hist.size() / 5);
+        const size_t start = drag_hist.size() - tail;
+        double mean = 0.0;
+        for (size_t i = start; i < drag_hist.size(); ++i) mean += drag_hist[i];
+        mean /= static_cast<double>(tail);
+        double var = 0.0;
+        for (size_t i = start; i < drag_hist.size(); ++i)
+            var += (drag_hist[i] - mean) * (drag_hist[i] - mean);
+        var /= static_cast<double>(tail);
+        R.residual = std::sqrt(var) / std::max(std::abs(mean), 1e-30);
+        R.converged = R.residual < 0.01 && R.mass_imbalance < 0.02;
+    }
+    R.ok = !R.diverged;
+    if (R.diverged) R.error = "lbm_run_cuda: non-finite/invalid final flow field";
     cleanup();
     return R;
 }
 
-}  // namespace aicad::sim
+}  // namespace chudware::sim

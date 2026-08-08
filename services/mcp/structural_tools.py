@@ -1,8 +1,8 @@
 """Structural analysis MCP tools (T-D2 + T-D3) — member forces, deflections, D/C ratios.
 
-  struct_analyze(doc_path, load_combo)  -> member forces + deflections for an aicad.structure/1 doc
-  struct_check(doc_path, load_combo)    -> D/C ratio checks (axial yield + bending) per member
-  struct_estimate(doc_path)             -> line-item cost estimate (ENR rate table)
+  struct_analyze(doc_path, load_combo)          -> member forces, deflections, reactions
+  struct_check(doc_path, load_combo)            -> strength + deflection utilization
+  struct_estimate(doc_path, rates_path="")      -> completeness-aware cost estimate
 
 All three are dispatched to the C++ core (libchudware ``struct_*`` RPCs, ``core/structural/``)
 via ``core_bridge`` — the legacy Python oracle (``engine_oracle/structural/``) is no longer
@@ -50,84 +50,70 @@ def _struct_rpc(method: str, params: dict) -> str:
             "code": r["code"],
             "detail": r.get("detail"),
         })
+    if not isinstance(r, dict):
+        return _dumps({"ok": False, "error": f"{method} returned a non-object payload"})
+    if method in ("struct_check", "struct_estimate"):
+        # ``complete`` is the core's authoritative coverage verdict.  Keep every
+        # partial row/total and its reason, but do not let a transport-level wrapper
+        # turn unavailable checks or a partial estimate into a successful result.
+        return _dumps({**r, "ok": r.get("complete") is True})
     return _dumps({"ok": True, **r})
 
 
 def register_structural_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def struct_analyze(doc_path: str, load_combo: str = "DEAD_LIVE") -> str:
-        """Run member-force & deflection analysis on a structural document.
+        """Run member-force and deflection analysis on a structural document.
 
         Args:
-            doc_path: path to a JSON ``aicad.structure/1`` document (elements + load_cases).
-            load_combo: ASCE 7 combo name — ``DEAD_ONLY`` (1.4D), ``DEAD_LIVE`` (1.2D+1.6L),
-                or ``DEAD_LIVE_WIND`` (1.2D+1.6L+0.5W).
+            doc_path: Path to a JSON ``aicad.structure/1`` document.
+            load_combo: ``DEAD_ONLY`` (1.4D), ``DEAD_LIVE`` (1.2D+1.6L), or
+                ``DEAD_LIVE_WIND`` (1.2D+1.6L+0.5W).
 
-        Returns JSON ``{ok, load_combo, results:[{element_id, axial_n, shear_n, moment_nmm,
-        deflection_mm, dc_ratio, pass}, ...]}`` — one row per member (axial +tension, forces in N,
-        moments in N·mm, deflections in mm). ``dc_ratio``/``pass`` are null here; struct_check
-        fills them.
+        Returns JSON ``{ok, load_combo, units, results:[...], reactions:[...]}`` with
+        legacy governing force/deflection channels plus additive local-axis components
+        and support reactions. Forces are N, moments N·mm, and deflections mm.
+        ``dc_ratio``/``pass`` stay null here.
         """
         return _struct_rpc("struct_analyze", {"doc_path": doc_path, "load_combo": load_combo})
 
     @mcp.tool()
     def struct_check(doc_path: str, load_combo: str = "DEAD_LIVE") -> str:
-        """Demand/capacity ratio check for every member in a structural document.
+        """Return preliminary strength and serviceability utilization by member.
 
-        Runs the ``struct_check`` RPC (C++ core, ``core/structural/``) under the requested
-        ASCE 7 load combination: member-force analysis, then simplified AISC LRFD (steel)
-        or NDS ASD (wood) D/C checks per member.
+        The C++ core evaluates AISC LRFD (steel) or NDS ASD (wood)
+        axial/biaxial-bending interaction and an explicitly reported total-load L/240
+        deflection check. Unsupported checks, such as a footing without soil and
+        reinforcement inputs, return ``status:"unavailable"`` and ``passed:false``.
 
         Args:
-            doc_path:   Path to a JSON ``aicad.structure/1`` document.
-            load_combo: ASCE 7 combo — ``DEAD_ONLY``, ``DEAD_LIVE`` (default), or
-                        ``DEAD_LIVE_WIND``.
+            doc_path: Path to a JSON ``aicad.structure/1`` document.
+            load_combo: ``DEAD_ONLY``, ``DEAD_LIVE`` (default), or
+                ``DEAD_LIVE_WIND``.
 
-        Returns
-        -------
-        JSON ``{ok, load_combo, disclaimer, results:[{element_id, combo, dc_ratio, passed,
-        governing_limit, dc_axial, dc_bending, disclaimer}, ...]}``.
-
-        * ``dc_ratio`` ≤ 1.0 → ``passed=true``.
-        * ``governing_limit`` is ``axial_yield_LRFD`` / ``bending_yield_LRFD`` (steel) or
-          ``axial_compression_ASD_NDS`` / ``bending_ASD_NDS`` (wood).
-        * Every result row and the top-level response carry the mandatory disclaimer:
-          "Preliminary check — not sealed engineering. Verify with a licensed structural engineer
-          before construction."
-
-        Steel check uses AISC LRFD elastic (φFy, φ=0.90); wood uses NDS ASD allowable stresses
-        (Douglas Fir-Larch No.2 defaults; no load-duration / wet-service adjustments).  These are
-        *preliminary estimates only* — see disclaimer.
+        Returns JSON ``{ok, load_combo, units, complete, disclaimer, results:[...]}``.
+        ``complete`` is false, and therefore common ``ok`` is false, when any requested
+        capacity check is unavailable. Partial results and their reasons are retained.
+        Results are preliminary and retain the mandatory licensed-engineer disclaimer.
         """
         return _struct_rpc("struct_check", {"doc_path": doc_path, "load_combo": load_combo})
 
     @mcp.tool()
-    def struct_estimate(doc_path: str) -> str:
-        """Line-item cost estimate for a structural document (T-D5).
+    def struct_estimate(doc_path: str, rates_path: str = "") -> str:
+        """Estimate structural material and installation costs from a dated rate table.
 
-        Runs quantity takeoff (board-feet for lumber, weight for steel, fastener count) and
-        multiplies by the ENR Q4-2025 national average rate table (user-overridable).
-
-        All costs are **preliminary budget figures from a rate table** — not vendor prices.
-        Costs for vendor-sourced parts come from ``bom_price``; do not mix the two.
+        Quantities are board-feet for lumber, net-section weight for steel, concrete
+        volume for footings, and explicit fastener assumptions. Costs are preliminary
+        budget figures, not vendor prices.
 
         Args:
             doc_path: Path to a JSON ``aicad.structure/1`` document.
+            rates_path: Optional JSON rate-table override. Unreadable, malformed,
+                negative, or non-finite overrides fail rather than silently falling back.
 
-        Returns JSON ``{ok, line_items:[{element_id, element_type, section_name, material,
-        quantity, unit, unit_rate, material_cost, labor_hours, labor_cost, description}],
-        fastener_line:{...}, total_material_cost, total_labor_cost, total_cost, currency,
-        rate_table_date, disclaimer}``.
-
-        Raises
-        ------
-        Returns ``{ok:False, error, code}`` when the C++ core is unavailable (libchudware not
-        staged / stale lib without the ``struct_estimate`` dispatch) or on invalid doc
-        path/schema.
-
-        Note: registration is in ``structural_tools.py`` (not server.py) to keep all
-        ``struct_*`` tools co-located.  This is consistent with the existing pattern —
-        deviation from the task's literal "Files touched: server.py" is intentional and
-        recorded in work/tasks/T-D5.md.
+        Returns JSON ``{ok, complete, total_is_partial, unestimated_element_ids,
+        line_items, fastener_line, total_material_cost, total_labor_cost, total_cost,
+        currency, rate_table_date, disclaimer}``. Common ``ok`` follows ``complete``;
+        incomplete estimates retain useful partial line items, totals, and reasons.
         """
-        return _struct_rpc("struct_estimate", {"doc_path": doc_path})
+        return _struct_rpc("struct_estimate", {"doc_path": doc_path, "rates_path": rates_path})

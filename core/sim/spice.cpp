@@ -5,9 +5,10 @@
 // and AC sweep. The node-index construction, branch-row allocation, per-device stamps,
 // the time-stepping loop (BE bootstrap, source breakpoints), Newton damping/limiting, and
 // probe evaluation mirror engine/sim/circuit.py + engine/sim/devices.py. The dense
-// PartialPivLU solve matches numpy's linalg.solve for the small systems these circuits
-// produce. Nonlinear devices ported: Diode (D), BJT (Q, Ebers-Moll), MOSFET (M, level-1
-// with constant Cgs/Cgd/Cds), voltage-controlled Switch (S). Mutual inductance (K) and
+// FullPivLU solve rejects rank-deficient or inaccurate systems instead of reporting false
+// success for the small systems these circuits produce. Nonlinear devices ported: Diode
+// (D), BJT (Q, Ebers-Moll), MOSFET (M, level-1 with constant Cgs/Cgd/Cds),
+// voltage-controlled Switch (S). Mutual inductance (K) and
 // behavioral (B) are implemented here; deck parsing and subckt expansion live in
 // sim/netlist.cpp.
 
@@ -21,6 +22,8 @@
 #include <cctype>
 #include <cmath>
 #include <complex>
+#include <cstdint>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -52,6 +55,17 @@ std::string lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower((unsigned char)c));
     return s;
 }
+std::string normalize_node_alias(std::string name) {
+    std::string bare = lower(std::move(name));
+    if (!bare.empty() && bare[0] == '+') bare.erase(0, 1);
+    for (const std::string tag : {std::string("net_"), std::string("n$")}) {
+        size_t pos = 0;
+        while ((pos = bare.find(tag, pos)) != std::string::npos)
+            bare.erase(pos, tag.size());
+    }
+    return bare;
+}
+
 
 bool is_ground(const std::string& n) {
     // Case-insensitive ground aliases, mirroring circuit.py::_Sim.resolve_node
@@ -69,13 +83,7 @@ inline int resolve_node_tolerant(const std::map<std::string, int>& index,
     auto it = index.find(name);
     if (it != index.end()) return it->second;
     if (is_ground(name)) return -1;
-    std::string bare = lower(name);
-    // strip a leading '+' and the net_/n$ decorations the schematic emitters add
-    if (!bare.empty() && bare[0] == '+') bare.erase(0, 1);
-    for (const std::string tag : {std::string("net_"), std::string("n$")}) {
-        size_t pos = 0;
-        while ((pos = bare.find(tag, pos)) != std::string::npos) bare.erase(pos, tag.size());
-    }
+    const std::string bare = normalize_node_alias(name);
     for (const std::string& cand : {bare, upper(bare)}) {
         it = index.find(cand);
         if (it != index.end()) return it->second;
@@ -98,6 +106,10 @@ double as_num(const json& v, double dflt = 0.0) { return v.is_number() ? v.get<d
 double dev_value(const json& d, double dflt = 0.0) {
     return (d.contains("value") && d["value"].is_number()) ? d["value"].get<double>() : dflt;
 }
+std::string device_model_name(const json& d) {
+    return d.contains("model") && d["model"].is_string()
+               ? d["model"].get<std::string>() : std::string();
+}
 const json& params_of(const json& d) {
     static const json empty = json::object();
     return (d.contains("params") && d["params"].is_object()) ? d["params"] : empty;
@@ -111,7 +123,7 @@ double vt_of(double temp_c) { return kBoltz * (temp_c + 273.15) / kQ; }
 double mp(const json& d, const json& models, const char* key, double dflt) {
     const json& dp = params_of(d);
     if (dp.contains(key) && dp[key].is_number()) return dp[key].get<double>();
-    std::string mname = d.value("model", std::string());
+    std::string mname = device_model_name(d);
     if (!mname.empty() && models.contains(mname) && models[mname].is_object()) {
         const json& m = models[mname];
         for (const std::string& k : {std::string(key), upper(key), lower(key)})
@@ -123,7 +135,7 @@ double mp(const json& d, const json& models, const char* key, double dflt) {
 // Read a string model/device param: model card wins, then device params, then default
 // (matches the BJT/MOSFET `type` lookup order in devices.py).
 std::string model_str(const json& d, const json& models, const char* key, const std::string& dflt) {
-    std::string mname = d.value("model", std::string());
+    std::string mname = device_model_name(d);
     if (!mname.empty() && models.contains(mname) && models[mname].is_object()) {
         const json& m = models[mname];
         if (m.contains(key) && m[key].is_string()) return m[key].get<std::string>();
@@ -256,11 +268,11 @@ std::vector<double> freq_grid(const json& an) {
         }
     };
     if (sweep == "dec") {
-        double ndec = std::log10(fstop / fstart);
+        double ndec = std::log10(fstop) - std::log10(fstart);
         int nf = std::max(2, (int)std::lround(points * ndec) + 1);
         logspace(std::log10(fstart), std::log10(fstop), nf);
     } else if (sweep == "oct") {
-        double noct = std::log2(fstop / fstart);
+        double noct = std::log2(fstop) - std::log2(fstart);
         int nf = std::max(2, (int)std::lround(points * noct) + 1);
         logspace(std::log10(fstart), std::log10(fstop), nf);
     } else {
@@ -361,7 +373,8 @@ struct Mna {
     void I(int i, double v) { if (i >= 0) z[i] += v; }
 };
 
-// Solve A x = z densely (= numpy.linalg.solve). Returns false on a non-finite solution.
+// Solve A x = z densely. Full pivoting detects rank loss; the residual check
+// prevents a finite-looking answer from a singular/ill-conditioned system.
 bool solve_dense(const Mna& mna, std::vector<double>& x) {
     if (mna.dim == 0) { x.clear(); return true; }
     Eigen::MatrixXd Am(mna.dim, mna.dim);
@@ -370,11 +383,35 @@ bool solve_dense(const Mna& mna, std::vector<double>& x) {
         zv(i) = mna.z[i];
         for (int j = 0; j < mna.dim; ++j) Am(i, j) = mna.A[i][j];
     }
-    Eigen::VectorXd xv = Am.partialPivLu().solve(zv);
+    if (!Am.allFinite() || !zv.allFinite()) return false;
+    Eigen::FullPivLU<Eigen::MatrixXd> lu(Am);
+    if (!lu.isInvertible()) return false;
+    const Eigen::VectorXd xv = lu.solve(zv);
     if (!xv.allFinite()) return false;
+    const double residual = (Am * xv - zv).lpNorm<Eigen::Infinity>();
+    const double scale = std::max(1.0, zv.lpNorm<Eigen::Infinity>());
+    if (!std::isfinite(residual) || residual > 1e-9 * scale) return false;
     x.assign(mna.dim, 0.0);
     for (int i = 0; i < mna.dim; ++i) x[i] = xv(i);
     return true;
+}
+
+bool solve_dense_complex(const Eigen::MatrixXcd& matrix, const Eigen::VectorXcd& rhs,
+                         Eigen::VectorXcd& solution) {
+    if (matrix.rows() == 0) {
+        solution.resize(0);
+        return true;
+    }
+    if (matrix.rows() != matrix.cols() || rhs.size() != matrix.rows() ||
+        !matrix.allFinite() || !rhs.allFinite())
+        return false;
+    Eigen::FullPivLU<Eigen::MatrixXcd> lu(matrix);
+    if (!lu.isInvertible()) return false;
+    solution = lu.solve(rhs);
+    if (!solution.allFinite()) return false;
+    const double residual = (matrix * solution - rhs).lpNorm<Eigen::Infinity>();
+    const double scale = std::max(1.0, rhs.lpNorm<Eigen::Infinity>());
+    return std::isfinite(residual) && residual <= 1e-9 * scale;
 }
 
 double src_scale_of(const std::map<std::string, double>& sc, const std::string& name) {
@@ -435,24 +472,30 @@ void stamp_linear(const Setup& s, Mna& mna, const json& d, double t,
         mna.I(a, -i); mna.I(b, i);
     } else if (kind == "E") {
         int op = N(0), on = N(1), cp = N(2), cn = N(3), br = s.branch_of.at(name);
-        double gain = dev_value(d, 1.0);
+        double gain = (d.contains("value") && d["value"].is_number())
+                          ? d["value"].get<double>()
+                          : mp(d, s.models, "gain", 1.0);
         mna.G(op, br, 1.0); mna.G(on, br, -1.0);
         mna.G(br, op, 1.0); mna.G(br, on, -1.0);
         mna.G(br, cp, -gain); mna.G(br, cn, gain);
     } else if (kind == "G") {
         int op = N(0), on = N(1), cp = N(2), cn = N(3);
-        double gm = dev_value(d, 1.0);
+        double gm = (d.contains("value") && d["value"].is_number())
+                        ? d["value"].get<double>()
+                        : mp(d, s.models, "gain", 1.0);
         mna.G(op, cp, gm); mna.G(op, cn, -gm); mna.G(on, cp, -gm); mna.G(on, cn, gm);
     } else if (kind == "F") {  // CCCS: mirror the control V-source branch current * gain
         int op = N(0), on = N(1);
-        std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
+        std::string ctrl = params_of(d).value(
+            "control", params_of(d).value("ctrl", device_model_name(d)));
         double gain = (d.contains("value") && d["value"].is_number()) ? d["value"].get<double>()
                                                                        : mp(d, s.models, "gain", 1.0);
         int cbr = find_branch(s, ctrl);
         if (cbr >= 0) { mna.G(op, cbr, gain); mna.G(on, cbr, -gain); }
     } else if (kind == "H") {  // CCVS: V(op,on) = r * I(control)
         int op = N(0), on = N(1), br = s.branch_of.at(name);
-        std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
+        std::string ctrl = params_of(d).value(
+            "control", params_of(d).value("ctrl", device_model_name(d)));
         double r = (d.contains("value") && d["value"].is_number()) ? d["value"].get<double>()
                                                                     : mp(d, s.models, "gain", 1.0);
         mna.G(op, br, 1.0); mna.G(on, br, -1.0);
@@ -673,7 +716,7 @@ double switch_g_of(const Setup& s, const json& d, double vc) {
     double roff = mp(d, s.models, "roff", mp(d, s.models, "ROFF", 1e12));
     if (roff < ron) roff = ron;
     const json& dp = params_of(d);
-    std::string mname = d.value("model", std::string());
+    std::string mname = device_model_name(d);
     const json* model = nullptr;
     if (!mname.empty() && s.models.contains(mname) && s.models[mname].is_object())
         model = &s.models[mname];
@@ -1033,10 +1076,677 @@ json eval_probe(const Setup& s, const std::vector<double>& x, const std::string&
     return i == -2 ? json(nullptr) : json(val(i));
 }
 
+bool json_numbers_finite(const json& value, const std::string& path, std::string& error) {
+    if (value.is_number()) {
+        const double v = value.get<double>();
+        if (!std::isfinite(v)) {
+            error = path + " must be finite";
+            return false;
+        }
+        return true;
+    }
+    if (value.is_array()) {
+        for (std::size_t i = 0; i < value.size(); ++i)
+            if (!json_numbers_finite(value[i], path + "[" + std::to_string(i) + "]", error))
+                return false;
+    } else if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it)
+            if (!json_numbers_finite(it.value(), path + "." + it.key(), error)) return false;
+    }
+    return true;
+}
+
+int required_node_count(const std::string& kind) {
+    if (kind == "R" || kind == "C" || kind == "L" || kind == "V" || kind == "I" ||
+        kind == "D" || kind == "F" || kind == "H" || kind == "B")
+        return 2;
+    if (kind == "Q" || kind == "OPAMP") return 3;
+    if (kind == "E" || kind == "G" || kind == "S" || kind == "T") return 4;
+    if (kind == "M") return 3;
+    if (kind == "K") return 0;
+    return -1;
+}
+
+bool analysis_number(const json& analysis, const char* key, double dflt, double& out) {
+    const json value = analysis.value(key, json(dflt));
+    if (!value.is_number()) return false;
+    out = value.get<double>();
+    return std::isfinite(out);
+}
+
+bool scrub_nonfinite_json(json& value) {
+    bool changed = false;
+    if (value.is_number_float() && !std::isfinite(value.get<double>())) {
+        value = nullptr;
+        return true;
+    }
+    if (value.is_array()) {
+        for (json& child : value) changed = scrub_nonfinite_json(child) || changed;
+    } else if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it)
+            changed = scrub_nonfinite_json(it.value()) || changed;
+    }
+    return changed;
+}
+
+std::string validate_spice_inputs(const json& circuit, const json& study) {
+    if (!circuit.is_object()) return "circuit must be an object";
+    if (!study.is_object()) return "study must be an object";
+    if (!circuit.contains("devices") || !circuit["devices"].is_array() ||
+        circuit["devices"].empty())
+        return "circuit.devices must be a non-empty array";
+    if (!study.contains("analyses") || !study["analyses"].is_array() ||
+        study["analyses"].empty())
+        return "study.analyses must be a non-empty array";
+    if (study.contains("probes")) {
+        if (!study["probes"].is_array()) return "study.probes must be an array";
+        for (const json& probe : study["probes"])
+            if (!probe.is_string() || trim(probe.get<std::string>()).empty())
+                return "every study probe must be a non-empty string";
+    }
+    std::string finite_error;
+    if (!json_numbers_finite(circuit, "circuit", finite_error) ||
+        !json_numbers_finite(study, "study", finite_error))
+        return finite_error;
+    auto valid_seed = [](const json& owner) {
+        if (!owner.contains("seed")) return true;
+        const json& seed = owner["seed"];
+        if (seed.is_number_unsigned()) return true;
+        return seed.is_number_integer() && seed.get<std::int64_t>() >= 0;
+    };
+    if (!valid_seed(study))
+        return "study.seed must be a non-negative integer";
+    if (circuit.contains("nodes")) {
+        if (!circuit["nodes"].is_array()) return "circuit.nodes must be an array";
+        for (const json& node : circuit["nodes"])
+            if (!node.is_string() || trim(node.get<std::string>()).empty())
+                return "every circuit node must be a non-empty string";
+    }
+    if (study.contains("options")) {
+        if (!study["options"].is_object()) return "study.options must be an object";
+        const json& options = study["options"];
+        if (!valid_seed(options))
+            return "study.options.seed must be a non-negative integer";
+        auto positive_option = [&](const char* key, double dflt) -> bool {
+            const json value = options.value(key, json(dflt));
+            return value.is_number() && std::isfinite(value.get<double>()) &&
+                   value.get<double>() > 0.0;
+        };
+        if (!positive_option("reltol", 1e-3) || !positive_option("vntol", 1e-6))
+            return "reltol and vntol must be finite and greater than zero";
+        const json gmin = options.value("gmin", json(1e-12));
+        if (!gmin.is_number() || !std::isfinite(gmin.get<double>()) || gmin.get<double>() < 0.0)
+            return "gmin must be finite and non-negative";
+        const json maxiter = options.value("maxiter", json(100));
+        if (!maxiter.is_number_integer() || maxiter.get<long long>() < 1 ||
+            maxiter.get<long long>() > 100000)
+            return "maxiter must be an integer in [1, 100000]";
+        if (options.contains("temp") &&
+            (!options["temp"].is_number() || options["temp"].get<double>() <= -273.15))
+            return "temperature must exceed absolute zero";
+    }
+
+    std::set<std::string> device_names;
+    std::set<std::string> branch_names;
+    std::set<std::string> inductor_names;
+    if (circuit.contains("models") && !circuit["models"].is_object())
+        return "circuit.models must be an object";
+    static const json empty_models = json::object();
+    const json& validation_models =
+        circuit.contains("models") ? circuit["models"] : empty_models;
+    for (auto it = validation_models.begin(); it != validation_models.end(); ++it) {
+        if (!it.value().is_object()) return "model '" + it.key() + "' must be an object";
+        if (it.value().contains("type") && !it.value()["type"].is_string())
+            return "model '" + it.key() + "' type must be a string";
+        for (auto param = it.value().begin(); param != it.value().end(); ++param)
+            if (param.key() != "type" && !param.value().is_number())
+                return "model '" + it.key() + "' parameter '" + param.key() +
+                       "' must be numeric";
+    }
+    if (circuit.contains("params") && !circuit["params"].is_object())
+        return "circuit.params must be an object";
+    if (circuit.contains("params") && circuit["params"].contains("TEMP") &&
+        (!circuit["params"]["TEMP"].is_number() ||
+         circuit["params"]["TEMP"].get<double>() <= -273.15))
+        return "circuit TEMP must be numeric and exceed absolute zero";
+    bool has_ac_excitation = false;
+    bool has_source_or_initial_excitation = false;
+    bool has_resistor = false;
+    for (std::size_t i = 0; i < circuit["devices"].size(); ++i) {
+        const json& d = circuit["devices"][i];
+        const std::string where = "circuit.devices[" + std::to_string(i) + "]";
+        if (!d.is_object()) return where + " must be an object";
+        if (!d.contains("kind") || !d["kind"].is_string()) return where + ".kind must be a string";
+        if (!d.contains("name") || !d["name"].is_string() ||
+            trim(d["name"].get<std::string>()).empty())
+            return where + ".name must be a non-empty string";
+        const std::string kind = upper(d["kind"].get<std::string>());
+        const std::string name = d["name"].get<std::string>();
+        const int need = required_node_count(kind);
+        if (need < 0) return name + ": unsupported device kind '" + kind + "'";
+        if (d["kind"].get<std::string>() != kind)
+            return name + ": device kind must use canonical uppercase spelling";
+        if (d.contains("params") && !d["params"].is_object())
+            return name + ": params must be an object";
+        if (d.contains("model") && !d["model"].is_null() && !d["model"].is_string())
+            return name + ": model must be a string or null";
+        if (!device_names.insert(name).second) return "duplicate device name '" + name + "'";
+        if (!d.contains("nodes") || !d["nodes"].is_array() ||
+            d["nodes"].size() < static_cast<std::size_t>(need))
+            return name + ": device kind " + kind + " needs at least " + std::to_string(need) +
+                   " nodes";
+        for (const json& node : d["nodes"])
+            if (!node.is_string() || trim(node.get<std::string>()).empty() ||
+                node.get<std::string>() == "?")
+                return name + ": every node must be a resolved non-empty string";
+        if (kind == "R" || kind == "C" || kind == "L") {
+            if (!d.contains("value") || !d["value"].is_number())
+                return name + ": " + kind + " needs a numeric value";
+            const double value = d["value"].get<double>();
+            if (value <= 0.0) return name + ": " + kind + " value must be greater than zero";
+            if (kind == "R") has_resistor = true;
+            const json& p = params_of(d);
+            if ((kind == "C" || kind == "L") && p.contains("ic")) {
+                if (!p["ic"].is_number()) return name + ": initial condition must be numeric";
+                if (p["ic"].get<double>() != 0.0) has_source_or_initial_excitation = true;
+            }
+        }
+        if (kind == "E" || kind == "G" || kind == "F" || kind == "H") {
+            const json& p = params_of(d);
+            const bool have_gain = (d.contains("value") && d["value"].is_number()) ||
+                                   (p.contains("gain") && p["gain"].is_number());
+            if (!have_gain) return name + ": " + kind + " needs a numeric gain";
+        }
+        if (kind == "V" || kind == "L" || kind == "E" || kind == "H" ||
+            kind == "OPAMP" || (kind == "B" && b_src_type(d) == "V"))
+            branch_names.insert(name);
+        if (kind == "L") inductor_names.insert(name);
+        if (kind == "V" || kind == "I") {
+            const json& p = params_of(d);
+            double bias = dev_value(d, 0.0);
+            if (p.contains("dc")) {
+                if (!p["dc"].is_number()) return name + ": DC excitation must be numeric";
+                bias = p["dc"].get<double>();
+            }
+            if (bias != 0.0) has_source_or_initial_excitation = true;
+            if (p.contains("ac")) {
+                if (!p["ac"].is_object())
+                    return name + ": AC excitation must be an object";
+                if (!p["ac"].contains("mag") || !p["ac"]["mag"].is_number() ||
+                    (p["ac"].contains("phase") && !p["ac"]["phase"].is_number()))
+                    return name + ": AC excitation needs numeric mag and phase";
+                if (p["ac"]["mag"].get<double>() != 0.0) has_ac_excitation = true;
+            }
+            if (p.contains("waveform")) {
+                if (!p["waveform"].is_object()) return name + ": waveform must be an object";
+                const json& wf = p["waveform"];
+                if (!wf.contains("type") || !wf["type"].is_string())
+                    return name + ": waveform type must be a string";
+                const std::string type = upper(wf["type"].get<std::string>());
+                if (type != "DC" && type != "PULSE" && type != "SIN" && type != "PWL")
+                    return name + ": unsupported waveform type '" + type + "'";
+                for (const char* key : {"v1", "v2", "td", "tr", "tf", "pw", "per",
+                                        "vo", "va", "f", "theta"}) {
+                    if (wf.contains(key) && !wf[key].is_number())
+                        return name + ": waveform parameter '" + key + "' must be numeric";
+                }
+                for (const char* key : {"v1", "v2", "vo", "va"})
+                    if (wf.contains(key) && wf[key].get<double>() != 0.0)
+                        has_source_or_initial_excitation = true;
+                if (type == "PULSE") {
+                    for (const char* key : {"td", "tr", "tf", "pw", "per"})
+                        if (wf.contains(key) && wf[key].get<double>() < 0.0)
+                            return name + ": PULSE timing parameters must be non-negative";
+                }
+                if (type == "SIN") {
+                    if (wf.contains("td") && wf["td"].get<double>() < 0.0)
+                        return name + ": SIN delay must be non-negative";
+                    if (wf.contains("va") && wf["va"].get<double>() != 0.0 &&
+                        (!wf.contains("f") || wf["f"].get<double>() <= 0.0))
+                        return name + ": non-zero SIN excitation needs a positive frequency";
+                }
+                if (wf.contains("ac")) {
+                    if (!wf["ac"].is_object() || !wf["ac"].contains("mag") ||
+                        !wf["ac"]["mag"].is_number() ||
+                        (wf["ac"].contains("phase") && !wf["ac"]["phase"].is_number()))
+                        return name + ": waveform AC excitation needs numeric mag and phase";
+                    if (wf["ac"]["mag"].get<double>() != 0.0) has_ac_excitation = true;
+                }
+                if (type == "PWL") {
+                    if (!wf.contains("points") || !wf["points"].is_array() ||
+                        wf["points"].size() < 2)
+                        return name + ": PWL needs at least two points";
+                    double previous = -std::numeric_limits<double>::infinity();
+                    for (const json& point : wf["points"]) {
+                        if (!point.is_array() || point.size() != 2 || !point[0].is_number() ||
+                            !point[1].is_number())
+                            return name + ": every PWL point must be [time, value]";
+                        const double time = point[0].get<double>();
+                        if (time < 0.0 || time <= previous)
+                            return name + ": PWL times must be non-negative and strictly increasing";
+                        previous = time;
+                        if (point[1].get<double>() != 0.0)
+                            has_source_or_initial_excitation = true;
+                    }
+                }
+            }
+        }
+        const json& p = params_of(d);
+        if (p.contains("type") && !p["type"].is_string())
+            return name + ": device type parameter must be a string";
+        auto param_is_numeric = [&](const char* key) {
+            if (p.contains(key) && !p[key].is_number()) return false;
+            if (d.contains("model") && d["model"].is_string() &&
+                validation_models.contains(d["model"].get<std::string>())) {
+                const json& model = validation_models[d["model"].get<std::string>()];
+                if (model.contains(key) && !model[key].is_number()) return false;
+            }
+            return true;
+        };
+        if (kind == "D") {
+            for (const char* key : {"IS", "N", "RS", "BV", "CJO"})
+                if (!param_is_numeric(key)) return name + ": diode parameters must be numeric";
+            if (mp(d, validation_models, "IS", 1e-14) <= 0.0 ||
+                mp(d, validation_models, "N", 1.0) <= 0.0 ||
+                mp(d, validation_models, "RS", 0.0) < 0.0 ||
+                mp(d, validation_models, "CJO", 0.0) < 0.0)
+                return name + ": diode parameters are physically degenerate";
+        } else if (kind == "Q") {
+            for (const char* key : {"IS", "BF", "BR", "CJE", "CJC"})
+                if (!param_is_numeric(key)) return name + ": BJT parameters must be numeric";
+            if (mp(d, validation_models, "IS", 1e-15) <= 0.0 ||
+                mp(d, validation_models, "BF", 100.0) <= 0.0 ||
+                mp(d, validation_models, "BR", 1.0) <= 0.0 ||
+                mp(d, validation_models, "CJE", 0.0) < 0.0 ||
+                mp(d, validation_models, "CJC", 0.0) < 0.0)
+                return name + ": BJT parameters are physically degenerate";
+        } else if (kind == "M") {
+            for (const char* key : {"KP", "W", "L", "CGS", "CGD", "CDS"})
+                if (!param_is_numeric(key)) return name + ": MOS parameters must be numeric";
+            if (mp(d, validation_models, "KP", 1e-3) < 0.0 ||
+                mp(d, validation_models, "W", 1e-4) <= 0.0 ||
+                mp(d, validation_models, "L", 1e-4) <= 0.0 ||
+                mp(d, validation_models, "CGS", 0.0) < 0.0 ||
+                mp(d, validation_models, "CGD", 0.0) < 0.0 ||
+                mp(d, validation_models, "CDS", 0.0) < 0.0)
+                return name + ": MOS parameters are physically degenerate";
+            if (d["nodes"].size() > 3) {
+                const std::string source = d["nodes"][2].get<std::string>();
+                const std::string bulk = d["nodes"][3].get<std::string>();
+                if (!((is_ground(source) && is_ground(bulk)) ||
+                      lower(trim(source)) == lower(trim(bulk))))
+                    return name + ": separate MOS bulk nodes are not supported; tie bulk to source";
+            }
+        } else if (kind == "S") {
+            for (const char* key : {"ron", "roff", "vt", "vh"})
+                if (!param_is_numeric(key)) return name + ": switch parameters must be numeric";
+            if (mp(d, validation_models, "ron", 1.0) <= 0.0 ||
+                mp(d, validation_models, "roff", 1e12) <= 0.0)
+                return name + ": switch ron and roff must be positive";
+        } else if (kind == "T") {
+            for (const char* key : {"z0", "td"})
+                if (!param_is_numeric(key)) return name + ": transmission-line parameters must be numeric";
+            if (mp(d, validation_models, "z0", 50.0) <= 0.0 ||
+                mp(d, validation_models, "td", 1e-9) <= 0.0)
+                return name + ": transmission-line z0 and td must be positive";
+        } else if (kind == "B") {
+            if (!p.contains("expr") || !p["expr"].is_string() ||
+                trim(p["expr"].get<std::string>()).empty())
+                return name + ": behavioral source needs a non-empty expression";
+            if (p.contains("btype") && (!p["btype"].is_string() ||
+                (upper(p["btype"].get<std::string>()) != "V" &&
+                 upper(p["btype"].get<std::string>()) != "I")))
+                return name + ": behavioral source type must be V or I";
+            has_source_or_initial_excitation = true;
+        }
+    }
+    for (const json& d : circuit["devices"]) {
+        const std::string kind = upper(d["kind"].get<std::string>());
+        const std::string name = d["name"].get<std::string>();
+        const json& p = params_of(d);
+        if (kind == "F" || kind == "H") {
+            const std::string control =
+                p.value("control", p.value("ctrl", device_model_name(d)));
+            if (control.empty() || !branch_names.count(control))
+                return name + ": control source '" + control + "' has no MNA branch";
+        } else if (kind == "K") {
+            if (!p.contains("inductors") || !p["inductors"].is_array() ||
+                p["inductors"].size() != 2 || !p["inductors"][0].is_string() ||
+                !p["inductors"][1].is_string())
+                return name + ": K coupling needs exactly two inductor names";
+            const std::string first = p["inductors"][0].get<std::string>();
+            const std::string second = p["inductors"][1].get<std::string>();
+            if (first == second || !inductor_names.count(first) || !inductor_names.count(second))
+                return name + ": K coupling references invalid inductors";
+            const double coupling = dev_value(d, as_num(p.value("k", json(1.0)), 1.0));
+            if (std::abs(coupling) > 1.0) return name + ": coupling coefficient must be in [-1, 1]";
+        }
+    }
+
+    std::set<std::string> known_nodes;
+    known_nodes.insert("0");
+    for (const json& d : circuit["devices"])
+        for (const json& node : d["nodes"]) known_nodes.insert(lower(node.get<std::string>()));
+    if (circuit.contains("nodes"))
+        for (const json& node : circuit["nodes"]) known_nodes.insert(lower(node.get<std::string>()));
+    auto node_known = [&](const std::string& node) {
+        const std::string key = normalize_node_alias(trim(node));
+        if (is_ground(key) || known_nodes.count(key) != 0) return true;
+        return std::any_of(known_nodes.begin(), known_nodes.end(),
+                           [&](const std::string& candidate) {
+                               return normalize_node_alias(candidate) == key;
+                           });
+    };
+    auto voltage_probe_known = [&](const std::string& probe) {
+        const std::string p = trim(probe);
+        const std::string up = upper(p);
+        if (up.rfind("V(", 0) == 0 && p.size() >= 4 && p.back() == ')') {
+            const std::string inner = p.substr(2, p.size() - 3);
+            const std::size_t comma = inner.find(',');
+            return comma == std::string::npos
+                       ? node_known(inner)
+                       : node_known(inner.substr(0, comma)) && node_known(inner.substr(comma + 1));
+        }
+        return node_known(p);
+    };
+    if (study.contains("probes")) {
+        for (const json& probe_json : study["probes"]) {
+            const std::string probe = trim(probe_json.get<std::string>());
+            const std::string up = upper(probe);
+            if (up.rfind("V(", 0) == 0 && probe.back() == ')') {
+                const std::string inner = probe.substr(2, probe.size() - 3);
+                const std::size_t comma = inner.find(',');
+                if (comma == std::string::npos) {
+                    if (!node_known(inner)) return "probe '" + probe + "' references an unknown node";
+                } else if (!node_known(inner.substr(0, comma)) ||
+                           !node_known(inner.substr(comma + 1))) {
+                    return "probe '" + probe + "' references an unknown node";
+                }
+            } else if (up.rfind("I(", 0) == 0 && probe.back() == ')') {
+                const std::string name = trim(probe.substr(2, probe.size() - 3));
+                bool supported = branch_names.count(name) != 0;
+                for (const json& d : circuit["devices"])
+                    supported = supported ||
+                                (d["name"] == name && upper(d["kind"].get<std::string>()) == "R");
+                if (!supported) return "probe '" + probe + "' has no measurable branch current";
+            } else if (!node_known(probe)) {
+                return "probe '" + probe + "' is not a known node or V(...)/I(...) probe";
+            }
+        }
+    }
+
+    auto validate_step = [&](const json& spec) -> std::string {
+        if (!spec.is_object()) return "step specification must be an object";
+        if (!spec.contains("param") || !spec["param"].is_string() ||
+            trim(spec["param"].get<std::string>()).empty())
+            return "step analysis needs a non-empty param";
+        const std::string param = spec["param"].get<std::string>();
+        bool exists = device_names.count(param) != 0;
+        if (circuit.contains("params") && circuit["params"].is_object())
+            for (const std::string& key : {param, upper(param), lower(param)})
+                exists = exists || circuit["params"].contains(key);
+        if (!exists) return "step parameter '" + param + "' does not name a device or circuit param";
+        if (spec.contains("values")) {
+            if (!spec["values"].is_array() || spec["values"].empty())
+                return "step values must be a non-empty array";
+            for (const json& value : spec["values"])
+                if (!value.is_number() || !std::isfinite(value.get<double>()))
+                    return "step values must all be finite numbers";
+            if (spec["values"].size() > 1'000'001) return "step sweep exceeds 1000001 points";
+            return "";
+        }
+        double start, stop, step;
+        if (!analysis_number(spec, "start", 0.0, start) ||
+            !analysis_number(spec, "stop", 0.0, stop) ||
+            !analysis_number(spec, "step", 0.0, step) ||
+            (start != stop && (step == 0.0 || (stop - start) * step < 0.0)))
+            return "step sweep needs finite start/stop and a non-zero step toward stop";
+        return "";
+    };
+    if (study.contains("step")) {
+        const std::string error = validate_step(study["step"]);
+        if (!error.empty()) return error;
+    }
+
+    bool requests_ac = false;
+    bool requests_source_excitation = false;
+    bool has_sweep_excitation = false;
+    for (const json& analysis : study["analyses"]) {
+        if (!analysis.is_object()) return "every analysis must be an object";
+        if (!analysis.contains("type") || !analysis["type"].is_string())
+            return "every analysis needs a string type";
+        const std::string type = lower(analysis["type"].get<std::string>());
+        if (type.empty()) return "every analysis needs a type";
+        if (type == "dc") {
+            if (!analysis.contains("source") || !analysis["source"].is_string())
+                return "dc analysis needs a string source";
+            const std::string source = analysis["source"].get<std::string>();
+            bool source_found = false;
+            for (const json& d : circuit["devices"]) {
+                const std::string kind = upper(d["kind"].get<std::string>());
+                if (d["name"].get<std::string>() == source && (kind == "V" || kind == "I"))
+                    source_found = true;
+            }
+            if (!source_found) return "dc source '" + source + "' is not an independent V/I source";
+            double start = 0.0, stop = 0.0, step = 0.0;
+            if (!analysis_number(analysis, "start", 0.0, start) ||
+                !analysis_number(analysis, "stop", 0.0, stop) ||
+                !analysis_number(analysis, "step", (stop - start) / 50.0, step) ||
+                (start != stop && (step == 0.0 || (stop - start) * step < 0.0)))
+                return "dc sweep needs finite start/stop and a non-zero step toward stop";
+            if (start != stop) {
+                const double count = std::floor(std::abs((stop - start) / step)) + 1.0;
+                if (count > 1'000'001.0) return "dc sweep exceeds 1000001 points";
+            }
+            has_sweep_excitation = has_sweep_excitation || start != 0.0 || stop != 0.0;
+            requests_source_excitation = true;
+        } else if (type == "tran") {
+            double tstep, tstop;
+            if (!analysis_number(analysis, "tstep", 1e-6, tstep) ||
+                !analysis_number(analysis, "tstop", 1e-3, tstop) ||
+                tstep <= 0.0 || tstop <= 0.0)
+                return "transient tstep and tstop must be finite and greater than zero";
+            if (tstop / tstep > 1'000'000.0) return "transient exceeds 1000000 nominal steps";
+            double tstart = 0.0;
+            if (!analysis_number(analysis, "tstart", 0.0, tstart) ||
+                tstart < 0.0 || tstart >= tstop)
+                return "transient tstart must be finite, non-negative, and less than tstop";
+            if (analysis.contains("uic") && !analysis["uic"].is_boolean())
+                return "transient uic must be a boolean";
+            requests_source_excitation = true;
+        } else if (type == "ac" || type == "noise") {
+            double start, stop, points;
+            if (analysis.contains("sweep") && !analysis["sweep"].is_string())
+                return type + " sweep must be a string";
+            const std::string sweep = lower(analysis.value("sweep", std::string("dec")));
+            if (sweep != "dec" && sweep != "oct" && sweep != "lin")
+                return type + " sweep must be dec, oct, or lin";
+            if (!analysis_number(analysis, "fstart", 1.0, start) ||
+                !analysis_number(analysis, "fstop", 1e6, stop) ||
+                !analysis_number(analysis, "points", 10.0, points) ||
+                start <= 0.0 || stop <= start || points < 1.0 || std::floor(points) != points)
+                return type + " sweep needs positive increasing frequencies and integer points";
+            const double span = sweep == "dec"
+                                    ? std::log10(stop) - std::log10(start)
+                                    : (sweep == "oct"
+                                           ? std::log2(stop) - std::log2(start)
+                                           : 1.0);
+            const double sample_count = sweep == "lin" ? points : points * span + 1.0;
+            if (!std::isfinite(sample_count) || sample_count > 1'000'000.0)
+                return type + " sweep exceeds 1000000 frequency samples";
+            requests_ac = requests_ac || type == "ac";
+            if (type == "noise") {
+                if (!has_resistor) return "noise analysis needs at least one resistor";
+                if (analysis.contains("output") && !analysis["output"].is_string())
+                    return "noise output must be a string voltage probe";
+                const std::string output =
+                    analysis.contains("output") && analysis["output"].is_string()
+                        ? analysis["output"].get<std::string>() : "V(OUT)";
+                if (!voltage_probe_known(output))
+                    return "noise output '" + output + "' references an unknown node";
+            }
+        } else if (type == "step") {
+            const std::string error = validate_step(analysis);
+            if (!error.empty()) return error;
+            if (study["analyses"].size() == 1)
+                return "step analysis needs another analysis to run at each value";
+        } else if (type == "tf") {
+            if (!analysis.contains("source") || !analysis["source"].is_string())
+                return "tf analysis needs a string source";
+            const std::string source = analysis["source"].get<std::string>();
+            bool source_found = false;
+            for (const json& d : circuit["devices"]) {
+                const std::string kind = d["kind"].get<std::string>();
+                source_found = source_found ||
+                               (d["name"].get<std::string>() == source &&
+                                (kind == "V" || kind == "I"));
+            }
+            if (!source_found) return "tf source '" + source + "' is not an independent V/I source";
+            if (analysis.contains("output") && !analysis["output"].is_string())
+                return "tf output must be a string voltage probe";
+            const std::string output =
+                analysis.contains("output") && analysis["output"].is_string()
+                    ? analysis["output"].get<std::string>() : "V(OUT)";
+            if (!voltage_probe_known(output))
+                return "tf output '" + output + "' references an unknown node";
+        } else if (type == "four") {
+            double f0 = 0.0;
+            if (!analysis_number(analysis, "f0", 0.0, f0) || f0 <= 0.0)
+                return "four analysis needs a finite f0 greater than zero";
+            double nharm = 9.0, periods = 1.0;
+            if (!analysis_number(analysis, "nharm", 9.0, nharm) ||
+                nharm < 1.0 || nharm > 64.0 || std::floor(nharm) != nharm)
+                return "four nharm must be an integer in [1, 64]";
+            if (analysis.contains("periods") &&
+                (!analysis_number(analysis, "periods", 1.0, periods) ||
+                 periods < 1.0 || periods > 1'000'000.0 || std::floor(periods) != periods))
+                return "four periods must be a positive integer";
+            if (analysis.contains("probe") &&
+                (!analysis["probe"].is_string() ||
+                 !voltage_probe_known(analysis["probe"].get<std::string>())))
+                return "four analysis probe must reference a known voltage";
+            requests_source_excitation = true;
+        } else if (type == "mc") {
+            double runs = 0.0;
+            if (!analysis_number(analysis, "runs", 100.0, runs) ||
+                runs < 1.0 || runs > 100000.0 || std::floor(runs) != runs)
+                return "mc runs must be an integer in [1, 100000]";
+            if (!valid_seed(analysis))
+                return "mc seed must be a non-negative integer";
+            if (analysis.contains("probe") &&
+                (!analysis["probe"].is_string() ||
+                 trim(analysis["probe"].get<std::string>()).empty()))
+                return "mc probe must be a non-empty string";
+            if (analysis.contains("tol")) {
+                const json& tol = analysis["tol"];
+                if (tol.is_number()) {
+                    if (tol.get<double>() < 0.0) return "mc tolerance must be non-negative";
+                } else if (tol.is_object()) {
+                    for (auto it = tol.begin(); it != tol.end(); ++it)
+                        if (!it.value().is_number() || it.value().get<double>() < 0.0)
+                            return "mc tolerances must be non-negative numbers";
+                } else {
+                    return "mc tolerance must be a number or object";
+                }
+            }
+            if (analysis.contains("analysis") && !analysis["analysis"].is_object())
+                return "mc inner analysis must be an object";
+            const json inner = analysis.contains("analysis")
+                                   ? analysis["analysis"] : json{{"type", "op"}};
+            const std::string inner_type =
+                inner.contains("type") && inner["type"].is_string()
+                    ? lower(inner["type"].get<std::string>()) : std::string();
+            if (inner_type == "mc" || inner_type == "temp" || inner_type == "step")
+                return "mc inner analysis cannot be mc, temp, or step";
+            json nested_probes =
+                study.contains("probes") ? study["probes"] : json::array();
+            if (analysis.contains("probe") && analysis["probe"].is_string()) {
+                bool found = false;
+                for (const json& probe : nested_probes)
+                    found = found || probe == analysis["probe"];
+                if (!found) nested_probes.push_back(analysis["probe"]);
+            }
+            json nested_study = {
+                {"analyses", json::array({inner})},
+                {"probes", nested_probes},
+            };
+            if (study.contains("options")) nested_study["options"] = study["options"];
+            const std::string nested_error = validate_spice_inputs(circuit, nested_study);
+            if (!nested_error.empty()) return "mc inner analysis: " + nested_error;
+        } else if (type == "temp") {
+            if (analysis.contains("values")) {
+                if (!analysis["values"].is_array() || analysis["values"].empty())
+                    return "temp values must be a non-empty array";
+                if (analysis["values"].size() > 1'000'001)
+                    return "temp sweep exceeds 1000001 points";
+                for (const json& value : analysis["values"])
+                    if (!value.is_number() || value.get<double>() <= -273.15)
+                        return "every temperature must exceed absolute zero";
+            } else {
+                double start = 27.0, stop = 27.0, step = 0.0;
+                if (!analysis_number(analysis, "start", 27.0, start) ||
+                    !analysis_number(analysis, "stop", 27.0, stop) ||
+                    !analysis_number(analysis, "step", 0.0, step) ||
+                    start <= -273.15 || stop <= -273.15 ||
+                    (start != stop && (step == 0.0 || (stop - start) * step < 0.0)))
+                    return "temp sweep needs valid temperatures and a step toward stop";
+                if (start != stop) {
+                    const double count = std::floor(std::abs((stop - start) / step)) + 1.0;
+                    if (count > 1'000'001.0) return "temp sweep exceeds 1000001 points";
+                }
+            }
+            if (analysis.contains("analysis") && !analysis["analysis"].is_object())
+                return "temp inner analysis must be an object";
+            const json inner = analysis.contains("analysis")
+                                   ? analysis["analysis"] : json{{"type", "op"}};
+            const std::string inner_type =
+                inner.contains("type") && inner["type"].is_string()
+                    ? lower(inner["type"].get<std::string>()) : std::string();
+            if (inner_type == "mc" || inner_type == "temp" || inner_type == "step")
+                return "temp inner analysis cannot be mc, temp, or step";
+            json nested_study = {
+                {"analyses", json::array({inner})},
+                {"probes", study.contains("probes") ? study["probes"] : json::array()},
+            };
+            if (study.contains("options")) nested_study["options"] = study["options"];
+            const std::string nested_error = validate_spice_inputs(circuit, nested_study);
+            if (!nested_error.empty()) return "temp inner analysis: " + nested_error;
+        } else if (type != "op") {
+            return "unsupported analysis type '" + type + "'";
+        } else {
+            requests_source_excitation = true;
+        }
+    }
+    if (requests_ac && !has_ac_excitation)
+        return "ac analysis needs a non-zero AC magnitude on an independent source";
+    if (requests_source_excitation && !has_source_or_initial_excitation &&
+        !has_sweep_excitation && !(requests_ac && has_ac_excitation))
+        return "analysis needs a non-zero independent source or reactive initial condition";
+    return "";
+}
+
 }  // namespace
 
 json spice_simulate(const json& circuit, const json& study) {
-    const std::string input_hash = chudware::sim::cache::hash_spice(circuit, study);
+    std::string setup_error;
+    try {
+        setup_error = validate_spice_inputs(circuit, study);
+    } catch (const std::exception& exc) {
+        setup_error = std::string("invalid input: ") + exc.what();
+    }
+    if (!setup_error.empty()) {
+        return json{{"log", json::array({"setup: " + setup_error})},
+                    {"convergence", json{{"setup", false}}},
+                    {"error", setup_error},
+                    {"cache_hit", false},
+                    {"cache_reason", "invalid_input"},
+                    {"input_hash", nullptr}};
+    }
+    // Salt the cache key whenever numerical semantics change. This prevents a
+    // sidecar produced by an older solver from being returned as fresh success.
+    json cache_study = study;
+    cache_study["_solver_revision"] = 5;
+    const std::string input_hash = chudware::sim::cache::hash_spice(circuit, cache_study);
     {
         auto hit = chudware::sim::cache::lookup(chudware::sim::cache::Kind::Spice, input_hash);
         if (hit.hit) {
@@ -1048,6 +1758,12 @@ json spice_simulate(const json& circuit, const json& study) {
         }
     }
     auto finish = [&](json result) -> json {
+        // Never publish NaN/Inf as a successful numeric field. Analysis-specific
+        // failure paths use null; this is the last-resort guard for arithmetic overflow.
+        if (scrub_nonfinite_json(result)) {
+            result["convergence"]["finite"] = false;
+            result["log"].push_back("result: non-finite values replaced with null");
+        }
         // Strip transient cache tags before storing so stored payload is clean.
         result.erase("cache_hit");
         result.erase("cache_reason");
@@ -1382,22 +2098,26 @@ json spice_simulate(const json& circuit, const json& study) {
                 if (!null_sources) { cd ph = ac_phasor(d); Iz(a0, -ph); Iz(b0, ph); }
             } else if (kind == "E") {
                 int op = N(d, 0), on = N(d, 1), cp = N(d, 2), cn = N(d, 3), br = s.branch_of.at(name);
-                cd gain(dev_value(d, 1.0), 0.0);
+                cd gain((d.contains("value") && d["value"].is_number())
+                            ? d["value"].get<double>() : mp(d, s.models, "gain", 1.0), 0.0);
                 G(op, br, 1.0); G(on, br, -1.0); G(br, op, 1.0); G(br, on, -1.0);
                 G(br, cp, -gain); G(br, cn, gain);
             } else if (kind == "G") {
                 int op = N(d, 0), on = N(d, 1), cp = N(d, 2), cn = N(d, 3);
-                cd gm(dev_value(d, 1.0), 0.0);
+                cd gm((d.contains("value") && d["value"].is_number())
+                          ? d["value"].get<double>() : mp(d, s.models, "gain", 1.0), 0.0);
                 G(op, cp, gm); G(op, cn, -gm); G(on, cp, -gm); G(on, cn, gm);
             } else if (kind == "F") {
-                std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
+                std::string ctrl = params_of(d).value(
+                    "control", params_of(d).value("ctrl", device_model_name(d)));
                 double gain = (d.contains("value") && d["value"].is_number())
                                   ? d["value"].get<double>() : mp(d, s.models, "gain", 1.0);
                 int cbr = find_branch(s, ctrl);
                 if (cbr >= 0) { G(a0, cbr, cd(gain, 0.0)); G(b0, cbr, cd(-gain, 0.0)); }
             } else if (kind == "H") {
                 int br = s.branch_of.at(name);
-                std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
+                std::string ctrl = params_of(d).value(
+                    "control", params_of(d).value("ctrl", device_model_name(d)));
                 double r = (d.contains("value") && d["value"].is_number())
                                ? d["value"].get<double>() : mp(d, s.models, "gain", 1.0);
                 G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
@@ -1463,6 +2183,27 @@ json spice_simulate(const json& circuit, const json& study) {
                             G(a0, kv.first, cd(kv.second, 0.0));
                             G(b0, kv.first, cd(-kv.second, 0.0));
                         }
+                    }
+                }
+            } else if (kind == "D" || kind == "Q") {
+                // Small-signal conductance is the DC Jacobian at the converged
+                // bias point. The RHS companion offset is intentionally omitted.
+                Mna jac(dim);
+                if (kind == "D") {
+                    stamp_diode_dc(s, jac, d, x_op, last_vd);
+                } else {
+                    stamp_bjt_dc(s, jac, d, x_op);
+                }
+                for (int row = 0; row < dim; ++row)
+                    for (int col = 0; col < dim; ++col)
+                        if (jac.A[row][col] != 0.0)
+                            G(row, col, cd(jac.A[row][col], 0.0));
+                if (kind == "D") {
+                    const double cjo = mp(d, s.models, "CJO", 0.0);
+                    if (cjo > 0.0) {
+                        const cd y(0.0, omega * cjo);
+                        G(a0, a0, y); G(b0, b0, y);
+                        G(a0, b0, -y); G(b0, a0, -y);
                     }
                 }
             } else if (kind == "M") {
@@ -1547,9 +2288,12 @@ json spice_simulate(const json& circuit, const json& study) {
         double start = as_num(spec.value("start", json(0.0)), 0.0);
         double stop = as_num(spec.value("stop", json(0.0)), 0.0);
         double step = as_num(spec.value("step", json(0.0)), 0.0);
-        if (step == 0.0) return {start};
-        int n = (int)std::lround((stop - start) / step) + 1;
-        for (int i = 0; i < std::max(n, 1); ++i) out.push_back(start + i * step);
+        out.push_back(start);
+        if (start == stop) return out;
+        for (double value = start + step;
+             (step > 0.0 ? value <= stop : value >= stop) && out.size() <= 1'000'000;
+             value = start + step * static_cast<double>(out.size()))
+            out.push_back(value);
         return out;
     };
     // Apply a stepped parameter to a circuit JSON in place (circuit.py::_apply_step_param).
@@ -1574,8 +2318,9 @@ json spice_simulate(const json& circuit, const json& study) {
     } else {
         json filtered = json::array();
         for (const json& a : analyses) {
-            if (step_spec.is_null() && a.value("type", std::string()) == "step") step_spec = a;
-            else if (a.value("type", std::string()) != "step") filtered.push_back(a);
+            if (step_spec.is_null() &&
+                lower(a.value("type", std::string())) == "step") step_spec = a;
+            else if (lower(a.value("type", std::string())) != "step") filtered.push_back(a);
         }
         if (!step_spec.is_null()) inner_analyses = filtered;
     }
@@ -1610,7 +2355,7 @@ json spice_simulate(const json& circuit, const json& study) {
     // mc / temp additive entries.
     json mc_spec = nullptr, temp_spec = nullptr;
     for (const json& a : inner_analyses) {
-        std::string t = a.value("type", std::string());
+        std::string t = lower(a.value("type", std::string()));
         if (mc_spec.is_null() && t == "mc") mc_spec = a;
         if (temp_spec.is_null() && t == "temp") temp_spec = a;
     }
@@ -1625,15 +2370,18 @@ json spice_simulate(const json& circuit, const json& study) {
             double stop = as_num(temp_spec.value("stop", json(27.0)), 27.0);
             double step = as_num(temp_spec.value("step", json(0.0)), 0.0);
             temps = {start};
-            if (step != 0.0) {
-                int n = (int)std::lround((stop - start) / step) + 1;
-                temps.clear();
-                for (int i = 0; i < std::max(n, 1); ++i) temps.push_back(start + i * step);
+            if (start != stop) {
+                for (double value = start + step;
+                     (step > 0.0 ? value <= stop : value >= stop) &&
+                     temps.size() <= 1'000'000;
+                     value = start + step * static_cast<double>(temps.size()))
+                    temps.push_back(value);
             }
         }
         json inner = temp_spec.contains("analysis") && temp_spec["analysis"].is_object()
                          ? temp_spec["analysis"] : json{{"type", "op"}};
         json points = json::array();
+        bool temp_ok = !temps.empty();
         for (double tc : temps) {
             json c = circuit;
             if (!c["params"].is_object()) c["params"] = json::object();
@@ -1647,22 +2395,29 @@ json spice_simulate(const json& circuit, const json& study) {
             json entry = {{"temp", tc}};
             for (const char* k : {"op", "dc", "tran", "ac", "convergence"})
                 if (res.contains(k)) entry[k] = res[k];
+            const json convergence_map =
+                res.value("convergence", json::object());
+            for (const auto& convergence : convergence_map.items())
+                if (!convergence.value().is_boolean() || !convergence.value().get<bool>())
+                    temp_ok = false;
             points.push_back(entry);
         }
         log("temp: swept " + std::to_string(temps.size()) + " points");
         result["temp"] = {{"values", temps}, {"points", points}};
-        result["convergence"]["temp"] = !points.empty();
+        result["convergence"]["temp"] = temp_ok;
         // Run any remaining (non-temp) analyses on the nominal circuit too.
         json rest = json::array();
         for (const json& a : inner_analyses)
-            if (a.value("type", std::string()) != "temp") rest.push_back(a);
+            if (lower(a.value("type", std::string())) != "temp") rest.push_back(a);
         if (!rest.empty()) {
             json sub_study = {{"analyses", rest}, {"probes", probes}};
             if (study.contains("options")) sub_study["options"] = study["options"];
             json sub = spice_simulate(circuit, sub_study);
             for (const char* k : {"op", "dc", "tran", "ac", "tf", "four", "noise"})
                 if (sub.contains(k)) result[k] = sub[k];
-            for (auto& kv : sub.value("convergence", json::object()).items())
+            const json convergence_map =
+                sub.value("convergence", json::object());
+            for (const auto& kv : convergence_map.items())
                 result["convergence"][kv.key()] = kv.value();
         }
         return finish(std::move(result));
@@ -1696,34 +2451,45 @@ json spice_simulate(const json& circuit, const json& study) {
             tol = {{"R", 0.01}, {"C", 0.05}, {"L", 0.05}, {"V", 0.0}, {"I", 0.0}};
         }
 
-        // seed = int(an.get("seed", seed_default)); seed_default = study/options "seed" or 12345.
-        long long seed_default = 12345;
-        if (options.contains("seed") && options["seed"].is_number())
-            seed_default = (long long)as_num(options["seed"], 12345);
-        if (study.contains("seed") && study["seed"].is_number())
-            seed_default = (long long)as_num(study["seed"], (double)seed_default);
-        long long seed = an.contains("seed") && an["seed"].is_number()
-                             ? (long long)as_num(an["seed"], (double)seed_default)
-                             : seed_default;
+        auto read_seed = [](const json& value) -> std::uint64_t {
+            return value.is_number_unsigned()
+                       ? value.get<std::uint64_t>()
+                       : static_cast<std::uint64_t>(value.get<std::int64_t>());
+        };
+        std::uint64_t seed_default = 12345;
+        if (options.contains("seed")) seed_default = read_seed(options["seed"]);
+        if (study.contains("seed")) seed_default = read_seed(study["seed"]);
+        const std::uint64_t seed =
+            an.contains("seed") ? read_seed(an["seed"]) : seed_default;
 
         if (probe.empty()) {
             log("mc: no probe specified and none default");
-            result["mc"] = {{"values", json::array()}, {"mean", std::nan("")},
-                            {"std", std::nan("")}, {"min", std::nan("")},
-                            {"max", std::nan("")}, {"runs", 0}};
+            result["mc"] = {{"values", json::array()}, {"mean", nullptr},
+                            {"std", nullptr}, {"min", nullptr},
+                            {"max", nullptr}, {"runs", 0}};
             result["convergence"]["mc"] = false;
             return finish(std::move(result));
         }
 
         // Extract the key scalar for `probe` from a single inner result, priority
         // op -> tran final -> ac peak -> dc final (analysis_ext.py::_scalar_from_result).
+        // Payloads may contain partial diagnostics (notably tran's t=0 sample), so a
+        // finite value is usable only when that analysis' authoritative flag is true.
         auto scalar_from_result = [&](const json& res) -> std::pair<double, bool> {
-            if (res.contains("op") && res["op"].is_object() && res["op"].contains(probe)) {
+            auto converged = [&](const char* analysis) {
+                if (!res.contains("convergence") || !res["convergence"].is_object())
+                    return false;
+                const json& state = res["convergence"];
+                return state.contains(analysis) && state[analysis].is_boolean() &&
+                       state[analysis].get<bool>();
+            };
+            if (converged("op") && res.contains("op") && res["op"].is_object() &&
+                res["op"].contains(probe)) {
                 const json& v = res["op"][probe];
                 if (v.is_number()) { double d = v.get<double>();
                     if (std::isfinite(d)) return {d, true}; }
             }
-            if (res.contains("tran") && res["tran"].is_object()) {
+            if (converged("tran") && res.contains("tran") && res["tran"].is_object()) {
                 const json& tr = res["tran"].value("traces", json::object());
                 if (tr.contains(probe) && tr[probe].is_array() && !tr[probe].empty()) {
                     const json& v = tr[probe].back();
@@ -1731,7 +2497,7 @@ json spice_simulate(const json& circuit, const json& study) {
                         if (std::isfinite(d)) return {d, true}; }
                 }
             }
-            if (res.contains("ac") && res["ac"].is_object()) {
+            if (converged("ac") && res.contains("ac") && res["ac"].is_object()) {
                 const json& mag = res["ac"].value("mag", json::object());
                 if (mag.contains(probe) && mag[probe].is_array() && !mag[probe].empty()) {
                     double best = -std::numeric_limits<double>::infinity();
@@ -1742,7 +2508,7 @@ json spice_simulate(const json& circuit, const json& study) {
                     if (any) return {best, true};
                 }
             }
-            if (res.contains("dc") && res["dc"].is_object()) {
+            if (converged("dc") && res.contains("dc") && res["dc"].is_object()) {
                 const json& tr = res["dc"].value("traces", json::object());
                 if (tr.contains(probe) && tr[probe].is_array() && !tr[probe].empty()) {
                     double last = 0.0; bool any = false;
@@ -1755,9 +2521,11 @@ json spice_simulate(const json& circuit, const json& study) {
             return {0.0, false};
         };
 
-        NumpyGenerator rng(static_cast<uint64_t>(seed));
+        NumpyGenerator rng(seed);
         std::vector<double> values;
         int n_ok = 0;
+        int failure_diagnostics = 0;
+        constexpr int kMaxFailureDiagnostics = 8;
         json inner_probes = json::array({probe});
         for (int run = 0; run < runs; ++run) {
             json c = circuit;
@@ -1784,15 +2552,29 @@ json spice_simulate(const json& circuit, const json& study) {
             if (study.contains("options")) sub_study["options"] = study["options"];
             json res = spice_simulate(c, sub_study);
             auto [sc, got] = scalar_from_result(res);
-            if (got && std::isfinite(sc)) { values.push_back(sc); ++n_ok; }
+            if (got && std::isfinite(sc)) {
+                values.push_back(sc);
+                ++n_ok;
+            } else if (failure_diagnostics < kMaxFailureDiagnostics) {
+                std::string detail = "inner analysis did not converge or produced no finite scalar";
+                const json& sub_log = res.value("log", json::array());
+                if (sub_log.is_array() && !sub_log.empty() && sub_log.back().is_string())
+                    detail += ": " + sub_log.back().get<std::string>();
+                log("mc: run " + std::to_string(run + 1) + " rejected: " + detail);
+                ++failure_diagnostics;
+            }
         }
+        if (runs - n_ok > failure_diagnostics)
+            log("mc: " + std::to_string(runs - n_ok - failure_diagnostics) +
+                " additional failed-run diagnostics omitted");
 
         if (values.empty()) {
-            log("mc: " + std::to_string(runs) + " runs produced no finite samples for " + probe);
-            result["mc"] = {{"values", json::array()}, {"mean", std::nan("")},
-                            {"std", std::nan("")}, {"min", std::nan("")},
-                            {"max", std::nan("")}, {"runs", 0}, {"probe", probe},
-                            {"seed", seed}};
+            log("mc: " + std::to_string(runs) + " runs produced no converged finite samples for " + probe);
+            result["mc"] = {{"values", json::array()}, {"mean", nullptr},
+                            {"std", nullptr}, {"min", nullptr},
+                            {"max", nullptr}, {"runs", 0}, {"requested_runs", runs},
+                            {"attempted_runs", runs}, {"failed_runs", runs},
+                            {"probe", probe}, {"seed", seed}};
             result["convergence"]["mc"] = false;
         } else {
             // numpy mean / std(ddof=1) / min / max.
@@ -1808,29 +2590,33 @@ json spice_simulate(const json& circuit, const json& study) {
             json tol_out = json::object();
             for (auto& kv : tol) tol_out[kv.first] = kv.second;
             result["mc"] = {{"probe", probe}, {"seed", seed}, {"runs", n_ok},
-                            {"values", values}, {"mean", mean}, {"std", stddev},
+                            {"requested_runs", runs}, {"attempted_runs", runs},
+                            {"failed_runs", runs - n_ok}, {"values", values},
+                            {"mean", mean}, {"std", stddev},
                             {"min", vmin}, {"max", vmax}, {"tol", tol_out}};
-            result["convergence"]["mc"] = n_ok > 0;
+            result["convergence"]["mc"] = n_ok == runs;
         }
 
         // Run any remaining (non-mc) analyses on the nominal circuit too.
         json rest = json::array();
         for (const json& a : inner_analyses)
-            if (a.value("type", std::string()) != "mc") rest.push_back(a);
+            if (lower(a.value("type", std::string())) != "mc") rest.push_back(a);
         if (!rest.empty()) {
             json sub_study = {{"analyses", rest}, {"probes", probes}};
             if (study.contains("options")) sub_study["options"] = study["options"];
             json sub = spice_simulate(circuit, sub_study);
             for (const char* k : {"op", "dc", "tran", "ac", "tf", "four", "noise"})
                 if (sub.contains(k)) result[k] = sub[k];
-            for (auto& kv : sub.value("convergence", json::object()).items())
+            const json convergence_map =
+                sub.value("convergence", json::object());
+            for (const auto& kv : convergence_map.items())
                 result["convergence"][kv.key()] = kv.value();
         }
         return finish(std::move(result));
     }
 
     for (const json& a : inner_analyses) {
-        std::string atype = a.value("type", std::string());
+        std::string atype = lower(a.value("type", std::string()));
         if (atype == "step" || atype == "mc" || atype == "temp") continue;
         if (atype == "op") {
             std::vector<double> x;
@@ -1844,7 +2630,7 @@ json spice_simulate(const json& circuit, const json& study) {
                 result["op"] = op;
             } else {
                 json op = json::object();
-                for (const json& pr : probes) op[pr.get<std::string>()] = std::nan("");
+                for (const json& pr : probes) op[pr.get<std::string>()] = nullptr;
                 result["op"] = op;
             }
         } else if (atype == "dc") {
@@ -1854,17 +2640,21 @@ json spice_simulate(const json& circuit, const json& study) {
             double stop = as_num(a.value("stop", json(0.0)), 0.0);
             double dflt_step = (stop - start) / 50.0;
             double step = as_num(a.value("step", json(dflt_step)), dflt_step);
-            if (step == 0.0) { step = dflt_step != 0.0 ? dflt_step : 1.0; }
-            int n = (int)std::lround((stop - start) / step) + 1;
-            std::vector<double> xs;
-            for (int i = 0; i < n; ++i) xs.push_back(start + i * step);
+            std::vector<double> xs{start};
+            if (start != stop) {
+                for (double value = start + step;
+                     (step > 0.0 ? value <= stop : value >= stop) &&
+                     xs.size() <= 1'000'000;
+                     value = start + step * static_cast<double>(xs.size()))
+                    xs.push_back(value);
+            }
             bool found = false;
             for (const json& d : devices) {
                 std::string k = d.value("kind", std::string());
                 if (d.value("name", std::string()) == src && (k == "V" || k == "I")) found = true;
             }
-            std::map<std::string, std::vector<double>> traces;
-            for (const json& pr : probes) traces[pr.get<std::string>()];
+            std::map<std::string, json> traces;
+            for (const json& pr : probes) traces[pr.get<std::string>()] = json::array();
             bool converged = found;
             if (!found) log("dc: source '" + src + "' not found (V/I sweep only)");
             std::vector<double> guess;
@@ -1874,13 +2664,13 @@ json spice_simulate(const json& circuit, const json& study) {
                     std::vector<double> x;
                     if (!solve_dc_op_full(x, guess, ov)) {
                         converged = false;
-                        for (const json& pr : probes) traces[pr.get<std::string>()].push_back(std::nan(""));
+                        for (const json& pr : probes) traces[pr.get<std::string>()].push_back(nullptr);
                         continue;
                     }
                     guess = x;
                     for (const json& pr : probes) {
                         json v = eval_probe(s, x, pr.get<std::string>());
-                        traces[pr.get<std::string>()].push_back(v.is_number() ? v.get<double>() : std::nan(""));
+                        traces[pr.get<std::string>()].push_back(v.is_number() ? v : json(nullptr));
                     }
                 }
             }
@@ -1892,6 +2682,7 @@ json spice_simulate(const json& circuit, const json& study) {
             // ---- transient (trapezoidal + BE bootstrap), inner Newton for nonlinear ----
             double tstep = as_num(a.value("tstep", json(1e-6)), 1e-6);
             double tstop = as_num(a.value("tstop", json(1e-3)), 1e-3);
+            double tstart = as_num(a.value("tstart", json(0.0)), 0.0);
             bool uic = a.value("uic", false);
 
             std::map<std::string, TranState> st;
@@ -1919,6 +2710,7 @@ json spice_simulate(const json& circuit, const json& study) {
             }
 
             std::set<double> bpset;
+            if (tstart > 0.0) bpset.insert(tstart);
             for (const json& d : devices) {
                 std::string kind = d.value("kind", std::string());
                 if (kind == "V" || kind == "I") source_breakpoints(d, tstop, bpset);
@@ -2137,18 +2929,23 @@ json spice_simulate(const json& circuit, const json& study) {
                     xx = xnew;
                 }
                 out = xx;
-                return true;  // accept last iterate (Python returns it with a non-conv note)
+                return false;
             };
 
             // Non-uic: seed reactive history from the op point (hist["_t"] is still 0.0 here).
             if (!uic) update_state(x, tstep, true, 0.0);
 
-            std::vector<double> times{0.0};
+            std::vector<double> times;
             std::map<std::string, std::vector<double>> traces;
-            for (const json& pr : probes) {
-                std::string p = pr.get<std::string>();
-                json v0 = eval_probe(s, x, p);
-                traces[p] = {v0.is_number() ? v0.get<double>() : 0.0};
+            for (const json& pr : probes)
+                traces[pr.get<std::string>()] = {};
+            if (tstart <= 0.0) {
+                times.push_back(0.0);
+                for (const json& pr : probes) {
+                    std::string p = pr.get<std::string>();
+                    json v0 = eval_probe(s, x, p);
+                    traces[p].push_back(v0.is_number() ? v0.get<double>() : 0.0);
+                }
             }
 
             Mna mna(dim);
@@ -2179,17 +2976,23 @@ json spice_simulate(const json& circuit, const json& study) {
                 update_state(xn, dt, trap, tnew);
                 x = xn;
                 t = tnew;
-                times.push_back(t);
-                for (const json& pr : probes) {
-                    std::string p = pr.get<std::string>();
-                    json v = eval_probe(s, x, p);
-                    traces[p].push_back(v.is_number() ? v.get<double>() : 0.0);
+                if (t + 1e-18 >= tstart) {
+                    times.push_back(t);
+                    for (const json& pr : probes) {
+                        std::string p = pr.get<std::string>();
+                        json v = eval_probe(s, x, p);
+                        traces[p].push_back(v.is_number() ? v.get<double>() : 0.0);
+                    }
                 }
                 first = false;
                 if (next_bp < breakpoints.size() && std::abs(t - breakpoints[next_bp]) < 1e-18) {
                     ++next_bp;
                     first = true;  // re-bootstrap BE after a source breakpoint
                 }
+            }
+            if (converged && t < tstop - 1e-15) {
+                log("tran: maximum step count reached before tstop");
+                converged = false;
             }
             json tr = {{"x_t", times}, {"traces", json::object()}};
             for (const json& pr : probes) tr["traces"][pr.get<std::string>()] = traces[pr.get<std::string>()];
@@ -2198,32 +3001,38 @@ json spice_simulate(const json& circuit, const json& study) {
         } else if (atype == "ac") {
             // ---- AC sweep: complex MNA (G + jwC) per frequency, linearized about DC op ----
             std::vector<double> x_op(dim, 0.0);
-            if (has_nonlinear) {
-                if (!solve_dc_op(x_op)) { x_op.assign(dim, 0.0); log("ac: DC op for linearization failed"); }
+            bool ac_ok = true;
+            if (has_nonlinear && !solve_dc_op(x_op)) {
+                x_op.assign(dim, 0.0);
+                ac_ok = false;
+                log("ac: DC op for linearization failed");
             }
             std::vector<double> freqs = freq_grid(a);
-            std::map<std::string, std::vector<double>> mag, phase;
-            for (const json& pr : probes) { mag[pr.get<std::string>()]; phase[pr.get<std::string>()]; }
-            bool ac_ok = true;
+            std::map<std::string, json> mag, phase;
+            for (const json& pr : probes) {
+                mag[pr.get<std::string>()] = json::array();
+                phase[pr.get<std::string>()] = json::array();
+            }
             Eigen::MatrixXcd A(dim, dim);
             Eigen::VectorXcd z(dim);
             for (double f : freqs) {
                 double omega = 2.0 * kPi * f;
                 stamp_ac_complex(A, z, omega, x_op, /*null_sources=*/false);
-                Eigen::VectorXcd xv = A.partialPivLu().solve(z);
-                bool fin = xv.allFinite();
-                if (!fin) ac_ok = false;
+                Eigen::VectorXcd xv;
+                const bool finite_solution = ac_ok && solve_dense_complex(A, z, xv);
+                if (!finite_solution) ac_ok = false;
                 std::vector<cd> xc(dim);
-                for (int i = 0; i < dim; ++i) xc[i] = fin ? xv(i) : cd(0, 0);
+                for (int i = 0; i < dim; ++i)
+                    xc[i] = finite_solution ? xv(i) : cd(0, 0);
                 for (const json& pr : probes) {
                     bool got = false;
                     cd v = eval_probe_complex(xc, pr.get<std::string>(), got);
-                    if (got && fin) {
+                    if (got && finite_solution) {
                         mag[pr.get<std::string>()].push_back(std::abs(v));
                         phase[pr.get<std::string>()].push_back(std::atan2(v.imag(), v.real()) * 180.0 / kPi);
                     } else {
-                        mag[pr.get<std::string>()].push_back(std::nan(""));
-                        phase[pr.get<std::string>()].push_back(std::nan(""));
+                        mag[pr.get<std::string>()].push_back(nullptr);
+                        phase[pr.get<std::string>()].push_back(nullptr);
                     }
                 }
             }
@@ -2239,14 +3048,17 @@ json spice_simulate(const json& circuit, const json& study) {
             std::string output = a.contains("output") && a["output"].is_string()
                                      ? a["output"].get<std::string>() : "V(OUT)";
             std::string source = a.value("source", std::string());
-            auto nan_tf = [&]() {
-                result["tf"] = {{"gain", std::nan("")}, {"rin", std::nan("")},
-                                {"rout", std::nan("")}, {"output", output}, {"source", source}};
+            auto failed_tf = [&]() {
+                result["tf"] = {{"gain", nullptr}, {"rin", nullptr},
+                                {"rout", nullptr}, {"output", output}, {"source", source}};
             };
 
+            bool tf_ok = true;
             std::vector<double> x_op(dim, 0.0);
-            if (has_nonlinear) {
-                if (!solve_dc_op(x_op)) { x_op.assign(dim, 0.0); log("tf: DC op for linearization failed"); }
+            if (has_nonlinear && !solve_dc_op(x_op)) {
+                x_op.assign(dim, 0.0);
+                tf_ok = false;
+                log("tf: DC op for linearization failed");
             }
 
             // Resolve the output node pair (V(node) or V(a,b)). Only voltage outputs are valid.
@@ -2255,19 +3067,28 @@ json spice_simulate(const json& circuit, const json& study) {
                 std::string p = trim(output), up = upper(p);
                 if (up.rfind("I(", 0) == 0) {  // only voltage outputs are meaningful for .tf
                     log("tf: output '" + output + "' must be a voltage probe V(node) or V(a,b)");
-                    nan_tf();
+                    failed_tf();
                     result["convergence"]["tf"] = false;
                     continue;
                 }
                 if (up.rfind("V(", 0) == 0 && p.back() == ')') {
                     std::string inner = p.substr(2, p.size() - 3);
                     auto comma = inner.find(',');
-                    if (comma == std::string::npos) { oi = s.nodeRow(trim(inner)); oj = -1; }
-                    else { oi = s.nodeRow(trim(inner.substr(0, comma)));
-                           oj = s.nodeRow(trim(inner.substr(comma + 1))); }
-                } else { oi = s.nodeRow(p); oj = -1; }
-                if (oi == -2) oi = -1;
-                if (oj == -2) oj = -1;
+                    if (comma == std::string::npos) {
+                        oi = s.nodeRow(trim(inner));
+                    } else {
+                        oi = s.nodeRow(trim(inner.substr(0, comma)));
+                        oj = s.nodeRow(trim(inner.substr(comma + 1)));
+                    }
+                } else {
+                    oi = s.nodeRow(p);
+                }
+                if (oi == -2 || oj == -2) {
+                    log("tf: output '" + output + "' references an unknown node");
+                    failed_tf();
+                    result["convergence"]["tf"] = false;
+                    continue;
+                }
             }
 
             // Locate the source device (must be an independent V or I).
@@ -2277,7 +3098,7 @@ json spice_simulate(const json& circuit, const json& study) {
             std::string src_kind = src_dev ? src_dev->value("kind", std::string()) : "";
             if (!src_dev || (src_kind != "V" && src_kind != "I")) {
                 log("tf: source '" + source + "' must name an independent V or I source");
-                nan_tf();
+                failed_tf();
                 result["convergence"]["tf"] = false;
                 continue;
             }
@@ -2290,8 +3111,7 @@ json spice_simulate(const json& circuit, const json& study) {
                 auto cval = [&](int k) -> cd { return (k < 0 || k >= (int)xc.size()) ? cd(0, 0) : xc[k]; };
                 return cval(i) - cval(j);
             };
-            bool tf_ok = true;
-            double gain = std::nan(""), rin = std::nan(""), rout = std::nan("");
+            double gain = 0.0, rin = 0.0, rout = 0.0;
 
             // --- gain + rin: unit drive of the chosen source, all others nulled ---
             stamp_ac_complex(A, z, 0.0, x_op, /*null_sources=*/true);
@@ -2302,8 +3122,11 @@ json spice_simulate(const json& circuit, const json& study) {
                 if (sb >= 0) z(sb) += cd(-1.0, 0.0);
             }
             {
-                Eigen::VectorXcd xv = A.partialPivLu().solve(z);
-                if (!xv.allFinite()) { tf_ok = false; log("tf: gain solve singular"); }
+                Eigen::VectorXcd xv;
+                if (!solve_dense_complex(A, z, xv)) {
+                    tf_ok = false;
+                    log("tf: gain solve singular");
+                }
                 else {
                     std::vector<cd> xc(dim);
                     for (int i = 0; i < dim; ++i) xc[i] = xv(i);
@@ -2326,8 +3149,11 @@ json spice_simulate(const json& circuit, const json& study) {
             if (oi >= 0) z(oi) += cd(1.0, 0.0);
             if (oj >= 0) z(oj) += cd(-1.0, 0.0);
             {
-                Eigen::VectorXcd xv = A.partialPivLu().solve(z);
-                if (!xv.allFinite()) { tf_ok = false; log("tf: rout solve singular"); }
+                Eigen::VectorXcd xv;
+                if (!solve_dense_complex(A, z, xv)) {
+                    tf_ok = false;
+                    log("tf: rout solve singular");
+                }
                 else {
                     std::vector<cd> xc(dim);
                     for (int i = 0; i < dim; ++i) xc[i] = xv(i);
@@ -2335,11 +3161,19 @@ json spice_simulate(const json& circuit, const json& study) {
                 }
             }
 
-            // JSON has no Infinity: an open input (rin=inf) serializes as null, where the
-            // Python solver surfaced a huge number. Clamp to 1e30 on the success path.
-            auto clamp_tf = [&](double v) { return (tf_ok && !std::isfinite(v)) ? 1e30 : v; };
-            result["tf"] = {{"gain", gain}, {"rin", clamp_tf(rin)}, {"rout", clamp_tf(rout)},
-                            {"output", output}, {"source", source}};
+            if (!std::isfinite(gain) || !std::isfinite(rout)) tf_ok = false;
+            if (tf_ok) {
+                const bool rin_open_circuit = !std::isfinite(rin);
+                if (rin_open_circuit) {
+                    rin = 1e30;  // compatibility sentinel, explicitly diagnosed below
+                    log("tf: input resistance is unbounded (open circuit)");
+                }
+                result["tf"] = {{"gain", gain}, {"rin", rin}, {"rout", rout},
+                                {"rin_open_circuit", rin_open_circuit},
+                                {"output", output}, {"source", source}};
+            } else {
+                failed_tf();
+            }
             result["convergence"]["tf"] = tf_ok;
         } else if (atype == "noise") {
             // ---- resistor-thermal output noise (analysis_ext.py::run_noise) ----
@@ -2374,28 +3208,33 @@ json spice_simulate(const json& circuit, const json& study) {
             }
 
             std::vector<double> x_op(dim, 0.0);
-            if (has_nonlinear) { if (!solve_dc_op(x_op)) x_op.assign(dim, 0.0); }
+            bool noise_ok = true;
+            if (has_nonlinear && !solve_dc_op(x_op)) {
+                x_op.assign(dim, 0.0);
+                noise_ok = false;
+                log("noise: DC op for linearization failed");
+            }
 
             std::vector<double> onoise_psd(freqs.size(), 0.0);
             std::map<std::string, std::vector<double>> per_spec;
             for (const auto& rn : resnodes) per_spec[rn.name] = std::vector<double>(freqs.size(), 0.0);
-            bool noise_ok = true;
+            // noise_ok may already be false when nonlinear bias failed.
             Eigen::MatrixXcd A(dim, dim);
             Eigen::VectorXcd z(dim);
             for (std::size_t fi = 0; fi < freqs.size(); ++fi) {
                 double omega = 2.0 * kPi * freqs[fi];
                 for (const auto& rn : resnodes) {
                     if (rn.r <= 0.0) continue;
-                    // NB: the Python oracle (analysis_ext.run_noise) stamps EVERY device's AC
-                    // contribution — INCLUDING independent-source excitations — then adds the 1 A
-                    // test injection across R_k. It does NOT null the sources first. We mirror that
-                    // (null_sources=false) so the transfer impedance matches bit-for-bit, even
-                    // though a textbook noise analysis would zero the sources.
-                    stamp_ac_complex(A, z, omega, x_op, /*null_sources=*/false);
+                    // Noise transfer functions are computed with every independent
+                    // source nulled, then a unit test current is injected across R_k.
+                    stamp_ac_complex(A, z, omega, x_op, /*null_sources=*/true);
                     if (rn.a >= 0) z(rn.a) += cd(1.0, 0.0);
                     if (rn.b >= 0) z(rn.b) += cd(-1.0, 0.0);
-                    Eigen::VectorXcd xv = A.partialPivLu().solve(z);
-                    if (!xv.allFinite()) { noise_ok = false; continue; }
+                    Eigen::VectorXcd xv;
+                    if (!solve_dense_complex(A, z, xv)) {
+                        noise_ok = false;
+                        continue;
+                    }
                     std::vector<cd> xc(dim);
                     for (int i = 0; i < dim; ++i) xc[i] = xv(i);
                     bool got = false;
@@ -2435,8 +3274,18 @@ json spice_simulate(const json& circuit, const json& study) {
             // Use a preceding tran result if present; else run a tran from this spec's own
             // tstep/tstop (recursively, matching circuit.py::_run_analyses).
             json tran_res;
+            bool tran_converged = false;
+            std::string tran_failure_detail;
+            auto has_converged_tran = [](const json& source) {
+                if (!source.contains("convergence") || !source["convergence"].is_object())
+                    return false;
+                const json& convergence = source["convergence"];
+                return convergence.contains("tran") && convergence["tran"].is_boolean() &&
+                       convergence["tran"].get<bool>();
+            };
             if (result.contains("tran")) {
                 tran_res = result["tran"];
+                tran_converged = has_converged_tran(result);
             } else {
                 std::string fprobe = a.value("probe", std::string());
                 json tprobes = probes;
@@ -2450,13 +3299,28 @@ json spice_simulate(const json& circuit, const json& study) {
                 if (study.contains("options")) sub_study["options"] = study["options"];
                 json sub = spice_simulate(circuit, sub_study);
                 tran_res = sub.value("tran", json::object());
+                tran_converged = has_converged_tran(sub);
+                if (!tran_converged) {
+                    const json& sub_log = sub.value("log", json::array());
+                    if (sub_log.is_array() && !sub_log.empty() && sub_log.back().is_string())
+                        tran_failure_detail = ": " + sub_log.back().get<std::string>();
+                }
                 result["tran"] = tran_res;
-                result["convergence"]["tran"] = sub.value("convergence", json::object()).value("tran", false);
+                result["convergence"]["tran"] = tran_converged;
             }
 
             // -- run_fourier --
             bool four_ok = false;
             do {
+                if (!tran_converged) {
+                    if (tran_res.is_object() && !tran_res.empty())
+                        log("four: transient prerequisite did not converge; partial trace retained and Fourier skipped" +
+                            tran_failure_detail);
+                    else
+                        log("four: no converged transient prerequisite available; Fourier skipped" +
+                            tran_failure_detail);
+                    break;
+                }
                 if (!tran_res.is_object() || tran_res.empty()) { log("four: no transient result to analyze"); break; }
                 double f0 = as_num(a.value("f0", json(0.0)), 0.0);
                 if (f0 <= 0.0) { log("four: f0 must be > 0"); break; }

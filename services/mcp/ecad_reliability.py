@@ -122,56 +122,81 @@ def _err(reason: str, hint: str = "", next_actions: Optional[list] = None,
 
 
 def detect_mount_holes(board: dict, user_holes: Optional[list] = None) -> list:
-    """Find board mounting holes -> [{x_mm, y_mm, d_mm, ref, source}].
-
-    Priority:
-      * ``user_holes`` — [[x, y], ...] or [[x, y, drill_d], ...] used verbatim
-        (default drill 3.2 mm = M3 clearance) with source "user".
-      * footprints whose fpid or ref names a mounting hole ("mountinghole", "mtg",
-        "mount") — every drilled pad they carry.
-      * NPTH (np_tht) pads with drill >= 1.5 mm anywhere on the board.
-      * un-netted plated (tht) pads with drill >= 2.0 mm (screw holes drawn as
-        plated pads).
-    Deduplicated by position (0.1 mm). Empty list = nothing detected (caller errors).
-    """
-    if user_holes:
+    """Find finite positive board mounting holes, honoring an explicit user list."""
+    if not isinstance(board, dict):
+        raise ValueError("board must be an object")
+    if user_holes is not None:
+        if not isinstance(user_holes, list):
+            raise ValueError("mount_holes must be a list")
         out = []
-        for i, h in enumerate(user_holes):
-            x, y = float(h[0]), float(h[1])
-            d = float(h[2]) if len(h) > 2 and h[2] else 3.2
-            out.append({"x_mm": x, "y_mm": y, "d_mm": d,
+        for i, hole in enumerate(user_holes):
+            if not isinstance(hole, list) or len(hole) not in (2, 3):
+                raise ValueError(
+                    f"mount_holes[{i}] must be [x_mm, y_mm] or [x_mm, y_mm, drill_d_mm]")
+            try:
+                x, y = float(hole[0]), float(hole[1])
+                diameter = float(hole[2]) if len(hole) == 3 else 3.2
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"mount_holes[{i}] values must be numeric mm") from exc
+            if (not all(math.isfinite(v) for v in (x, y, diameter))
+                    or diameter <= 0.0):
+                raise ValueError(
+                    f"mount_holes[{i}] coordinates must be finite and diameter > 0")
+            out.append({"x_mm": x, "y_mm": y, "d_mm": diameter,
                         "ref": f"user{i + 1}", "source": "user"})
         return out
 
     from mcp_server.ecad_common import _pad_world as pad_world  # pad local frame -> board frame
 
+    footprints = board.get("footprints", []) or []
+    if not isinstance(footprints, list):
+        raise ValueError("board footprints must be a list")
     found: list = []
 
-    def _add(x: float, y: float, d: float, ref: str, source: str) -> None:
-        for f in found:
-            if abs(f["x_mm"] - x) < 0.1 and abs(f["y_mm"] - y) < 0.1:
+    def _add(x: float, y: float, diameter: float, ref: str, source: str) -> None:
+        if (not all(math.isfinite(v) for v in (x, y, diameter))
+                or diameter <= 0.0):
+            raise ValueError(f"{ref} mounting-hole geometry must be finite and positive")
+        for prior in found:
+            if abs(prior["x_mm"] - x) < 0.1 and abs(prior["y_mm"] - y) < 0.1:
                 return
         found.append({"x_mm": round(x, 4), "y_mm": round(y, 4),
-                      "d_mm": round(d, 4), "ref": ref, "source": source})
+                      "d_mm": round(diameter, 4), "ref": ref, "source": source})
 
-    for fp in board.get("footprints", []) or []:
-        ref = str(fp.get("ref") or fp.get("id") or "?")
-        fpid = str(fp.get("fpid") or "").lower()
-        named = any(k in fpid for k in ("mountinghole", "mounting_hole", "mtg", "mount"))
-        for pad in fp.get("pads", []) or []:
+    for footprint in footprints:
+        if not isinstance(footprint, dict):
+            raise ValueError("board footprints must contain objects")
+        ref = str(footprint.get("ref") or footprint.get("id") or "?")
+        fpid = str(footprint.get("fpid") or "").lower()
+        named = any(
+            key in fpid for key in ("mountinghole", "mounting_hole", "mtg", "mount"))
+        pads = footprint.get("pads", []) or []
+        if not isinstance(pads, list):
+            raise ValueError(f"{ref} pads must be a list")
+        for pad in pads:
+            if not isinstance(pad, dict):
+                raise ValueError(f"{ref} pads must contain objects")
             drill = pad.get("drill") or {}
-            dia = float(drill.get("diameter", 0.0) or 0.0)
-            if dia <= 0.0:
+            if not isinstance(drill, dict):
+                raise ValueError(f"{ref} pad drill must be an object")
+            try:
+                diameter = float(drill.get("diameter", 0.0) or 0.0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{ref} drill diameter must be numeric mm") from exc
+            if not math.isfinite(diameter) or diameter < 0.0:
+                raise ValueError(f"{ref} drill diameter must be finite and >= 0 mm")
+            if diameter == 0.0:
                 continue
-            wx, wy = pad_world(fp, pad)
+            wx, wy = [float(v) for v in pad_world(footprint, pad)]
             ptype = pad.get("type", "smd")
             netted = bool(pad.get("net"))
             if named:
-                _add(wx, wy, dia, ref, "mounting_hole_footprint")
-            elif ptype == "np_tht" and dia >= _NPTH_MIN_DRILL_MM:
-                _add(wx, wy, dia, ref, "npth_pad")
-            elif ptype == "tht" and not netted and dia >= _UNNETTED_THT_MIN_DRILL_MM:
-                _add(wx, wy, dia, ref, "unnetted_tht_pad")
+                _add(wx, wy, diameter, ref, "mounting_hole_footprint")
+            elif ptype == "np_tht" and diameter >= _NPTH_MIN_DRILL_MM:
+                _add(wx, wy, diameter, ref, "npth_pad")
+            elif (ptype == "tht" and not netted
+                  and diameter >= _UNNETTED_THT_MIN_DRILL_MM):
+                _add(wx, wy, diameter, ref, "unnetted_tht_pad")
     return found
 
 
@@ -201,68 +226,103 @@ def mount_fixture_facesets(holes: list, board_geo: dict) -> list:
 
 
 def component_mass_g(rec: dict) -> Optional[float]:
-    """Estimated component mass (g): explicit eng metadata mass when present, else
-    full package dims x the mold-compound density assumption. None when the body was
-    never placed (no dims to estimate from)."""
+    """Return an explicit or finite positive package-volume mass estimate in grams."""
+    if not isinstance(rec, dict):
+        raise ValueError("component mass records must be objects")
     for key in ("mass_g", "mass_grams"):
-        v = rec.get(key)
-        if isinstance(v, (int, float)) and v > 0:
-            return float(v)
+        value = rec.get(key)
+        if value is None:
+            continue
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value)) or value <= 0.0):
+            raise ValueError(f"{rec.get('ref') or '?'} {key} must be finite and > 0 g")
+        return float(value)
     body = rec.get("body") or {}
     fea = rec.get("fea") or {}
-    h = fea.get("h_full_mm") or body.get("h_mm")
-    if not h:
+    if not isinstance(body, dict) or not isinstance(fea, dict):
+        raise ValueError(f"{rec.get('ref') or '?'} body/fea metadata must be objects")
+    raw_h = fea.get("h_full_mm") or body.get("h_mm")
+    if raw_h is None:
         return None
-    if body.get("shape") == "cylinder" and body.get("d_mm"):
-        vol_mm3 = math.pi * (float(body["d_mm"]) / 2.0) ** 2 * float(h)
-    elif body.get("l_mm") and body.get("w_mm"):
-        vol_mm3 = float(body["l_mm"]) * float(body["w_mm"]) * float(h)
-    elif fea.get("top_area_mm2"):
-        vol_mm3 = float(fea["top_area_mm2"]) * float(h)
-    else:
-        return None
-    return vol_mm3 * _COMPONENT_RHO_G_CM3 / 1000.0  # mm3 * g/cm3 / 1000 = g
+    try:
+        height = float(raw_h)
+        if body.get("shape") == "cylinder" and body.get("d_mm") is not None:
+            diameter = float(body["d_mm"])
+            dims = (height, diameter)
+            volume_mm3 = math.pi * (diameter / 2.0) ** 2 * height
+        elif body.get("l_mm") is not None and body.get("w_mm") is not None:
+            length, width = float(body["l_mm"]), float(body["w_mm"])
+            dims = (height, length, width)
+            volume_mm3 = length * width * height
+        elif fea.get("top_area_mm2") is not None:
+            area = float(fea["top_area_mm2"])
+            dims = (height, area)
+            volume_mm3 = area * height
+        else:
+            return None
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{rec.get('ref') or '?'} package dimensions must be numeric") from exc
+    if not all(math.isfinite(v) and v > 0.0 for v in dims):
+        raise ValueError(
+            f"{rec.get('ref') or '?'} package dimensions must be finite and > 0 mm")
+    mass = volume_mm3 * _COMPONENT_RHO_G_CM3 / 1000.0
+    if not math.isfinite(mass) or mass <= 0.0:
+        raise ValueError(f"{rec.get('ref') or '?'} derived component mass is invalid")
+    return mass
 
 
 def build_mass_model(built: dict) -> dict:
-    """Mass-corrected effective density for the fused solid.
-
-    board mass = homogenized rho x substrate volume; component masses via
-    :func:`component_mass_g`; effective density = total mass / fused solid volume.
-    Returns {board_mass_g, component_masses:[{ref, mass_g}], total_mass_g,
-    fused_volume_mm3, density_g_cm3, assumptions:[...]}.
-    """
-    board_geo = built["board"]
-    rho_kg_m3 = float(built["material"]["rho_kg_m3"])
-    sub_vol_mm3 = float(board_geo["outline_area_mm2"]) * float(board_geo["thickness_mm"])
-    board_mass_g = rho_kg_m3 * sub_vol_mm3 * 1e-6  # kg/m3 * mm3 * 1e-9 m3/mm3 * 1e3 g/kg
+    """Build a finite, mass-conserving effective density for the fused solid."""
+    try:
+        board_geo = built["board"]
+        material = built["material"]
+        components = built["components"]
+        summary = built["summary"]
+        rho_kg_m3 = float(material["rho_kg_m3"])
+        outline_area = float(board_geo["outline_area_mm2"])
+        thickness = float(board_geo["thickness_mm"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("FEA mass metadata is malformed") from exc
+    if not isinstance(components, list) or not isinstance(summary, dict):
+        raise ValueError("FEA components/summary mass metadata is malformed")
+    if (not all(math.isfinite(v) and v > 0.0
+                for v in (rho_kg_m3, outline_area, thickness))):
+        raise ValueError("board density, area, and thickness must be finite and > 0")
+    sub_vol_mm3 = outline_area * thickness
+    board_mass_g = rho_kg_m3 * sub_vol_mm3 * 1e-6
     comp_masses = []
     unmassed = []
     total = board_mass_g
-    for rec in built["components"]:
+    for rec in components:
         ref = rec.get("ref") or rec.get("id") or "?"
-        m = component_mass_g(rec)
-        if m is None:
+        mass = component_mass_g(rec)
+        if mass is None:
             unmassed.append(ref)
             continue
-        comp_masses.append({"ref": ref, "mass_g": round(m, 4)})
-        total += m
-    fused_vol = float(built["summary"].get("board_volume") or 0.0) or sub_vol_mm3
-    dens = total / fused_vol * 1000.0  # g/mm3 -> g/cm3 (x1000 mm3 per cm3)
+        comp_masses.append({"ref": ref, "mass_g": round(mass, 4)})
+        total += mass
+    try:
+        fused_vol = float(summary.get("board_volume") or sub_vol_mm3)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("fused board volume must be numeric") from exc
+    if not math.isfinite(fused_vol) or fused_vol <= 0.0:
+        raise ValueError("fused board volume must be finite and > 0 mm³")
+    density = total / fused_vol * 1000.0
+    if not math.isfinite(total) or total <= 0.0 or not math.isfinite(density) or density <= 0:
+        raise ValueError("derived total mass/density must be finite and > 0")
     return {
         "board_mass_g": round(board_mass_g, 3),
         "component_masses": comp_masses,
         "unmassed_refs": unmassed,
         "total_mass_g": round(total, 3),
         "fused_volume_mm3": round(fused_vol, 2),
-        "density_g_cm3": round(dens, 5),
+        "density_g_cm3": round(density, 5),
         "assumptions": [
             f"component masses = package dims x {_COMPONENT_RHO_G_CM3} g/cm3 "
             "mold-compound density assumption (explicit eng mass metadata wins when "
             "present)",
-            "effective density scaled so the fused FEA solid (flattened component "
-            "caps) carries the estimated TOTAL board+component mass — mass is "
-            "globally correct, its spatial distribution approximate",
+            "effective density scaled so the fused FEA solid carries the estimated "
+            "TOTAL board+component mass; spatial distribution remains approximate",
         ] + ([f"{len(unmassed)} component(s) have no body dims and contribute NO "
               f"mass: {', '.join(unmassed)}"] if unmassed else []),
     }
@@ -285,98 +345,146 @@ def steinberg_c(rec: dict) -> float:
 
 
 def position_factor(x: float, y: float, bbox: list) -> float:
-    """Steinberg relative position factor r: sin(pi*X/a)*sin(pi*Y/b) — 1.0 at the
-    board center, 0.707 at an edge-centered half point, 0.5 at a quarter point.
-    Floored at 0.1 (a component ON a clamped edge barely deflects; avoid div/0)."""
-    x0, y0, x1, y1 = [float(v) for v in bbox]
-    a = max(x1 - x0, 1e-6)
-    b = max(y1 - y0, 1e-6)
+    """Steinberg relative position factor, floored at 0.1 near a clamped edge."""
+    try:
+        x, y = float(x), float(y)
+        values = [float(v) for v in bbox]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("component position and board bbox must be numeric") from exc
+    if (len(values) != 4 or not all(math.isfinite(v) for v in [x, y] + values)
+            or values[2] <= values[0] or values[3] <= values[1]):
+        raise ValueError("component position and board bbox must be finite/non-degenerate")
+    x0, y0, x1, y1 = values
+    a = x1 - x0
+    b = y1 - y0
     r = math.sin(math.pi * min(max((x - x0) / a, 0.0), 1.0)) * \
         math.sin(math.pi * min(max((y - y0) / b, 0.0), 1.0))
     return max(r, 0.1)
 
 
 def steinberg_screen(components: list, board_geo: dict, z3_mm: float) -> dict:
-    """Per-component Steinberg 3-sigma deflection-limit screen.
-
-    ``z3_mm`` is the estimated 3-sigma board deflection (single amplitude, mm). Per
-    component: Z_allow = 0.00022*B/(C*h*r*sqrt(L)) (inch inputs, converted), margin =
-    Z_allow / z3_mm; pass when margin > 1. Components without body dims are UNCHECKED
-    (honesty), never assumed OK. Returns {table, n_fail, n_unchecked, citation,
-    heuristic: True}.
-    """
-    x0, y0, x1, y1 = [float(v) for v in board_geo["bbox_mm"]]
-    h_in = float(board_geo["thickness_mm"]) / _MM_PER_IN
+    """Screen finite component geometry against the Steinberg 3-sigma limit."""
+    if not isinstance(components, list) or not isinstance(board_geo, dict):
+        raise ValueError("components and board geometry must be structured")
+    try:
+        bbox = [float(v) for v in board_geo["bbox_mm"]]
+        thickness = float(board_geo["thickness_mm"])
+        z3_mm = float(z3_mm)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Steinberg board/deflection inputs must be numeric") from exc
+    if (len(bbox) != 4 or not all(math.isfinite(v) for v in bbox + [thickness, z3_mm])
+            or bbox[2] <= bbox[0] or bbox[3] <= bbox[1] or thickness <= 0.0
+            or z3_mm <= 0.0):
+        raise ValueError(
+            "Steinberg board dimensions and 3-sigma deflection must be finite and > 0")
+    x0, y0, x1, y1 = bbox
+    h_in = thickness / _MM_PER_IN
     table = []
     n_fail = 0
     n_unchecked = 0
     for rec in components:
+        if not isinstance(rec, dict):
+            raise ValueError("Steinberg component records must be objects")
         ref = rec.get("ref") or rec.get("id") or "?"
         fea = rec.get("fea") or {}
         body = rec.get("body") or {}
+        if not isinstance(fea, dict) or not isinstance(body, dict):
+            raise ValueError(f"{ref} body/FEA metadata must be objects")
         entry: dict = {"ref": ref, "C": steinberg_c(rec), "L_mm": None, "r": None,
                        "z_allow_3sigma_mm": None, "z_est_3sigma_mm": round(z3_mm, 5),
                        "margin": None, "pass": None}
-        # Component length L: longest package dim (worst case), else pad-extent rect.
-        if body.get("shape") == "cylinder" and body.get("d_mm"):
-            length_mm = float(body["d_mm"])
-        elif body.get("l_mm") and body.get("w_mm"):
-            length_mm = max(float(body["l_mm"]), float(body["w_mm"]))
-        elif fea.get("rect_mm"):
-            r_ = fea["rect_mm"]
-            length_mm = max(r_[2] - r_[0], r_[3] - r_[1])
-        else:
-            entry["basis"] = "no body dims — UNCHECKED"
-            n_unchecked += 1
-            table.append(entry)
-            continue
-        pos = rec.get("pos_mm") or [(x0 + x1) / 2.0, (y0 + y1) / 2.0]
-        # B: board edge length parallel to the component's long axis. Rotation is
-        # binned to the nearest axis (screening resolution).
-        ang = float(rec.get("angle_deg") or 0.0) % 180.0
-        along_x = ang < 45.0 or ang >= 135.0
-        if body.get("l_mm") and body.get("w_mm") and float(body["w_mm"]) > float(body["l_mm"]):
-            along_x = not along_x  # long axis is the footprint's w
+        try:
+            if body.get("shape") == "cylinder" and body.get("d_mm") is not None:
+                length_mm = float(body["d_mm"])
+            elif body.get("l_mm") is not None and body.get("w_mm") is not None:
+                length_mm = max(float(body["l_mm"]), float(body["w_mm"]))
+            elif fea.get("rect_mm") is not None:
+                rect = [float(v) for v in fea["rect_mm"]]
+                if len(rect) != 4:
+                    raise ValueError
+                length_mm = max(rect[2] - rect[0], rect[3] - rect[1])
+            else:
+                entry["basis"] = "no body dims — UNCHECKED"
+                n_unchecked += 1
+                table.append(entry)
+                continue
+            pos = rec.get("pos_mm") or [(x0 + x1) / 2.0, (y0 + y1) / 2.0]
+            if not isinstance(pos, list) or len(pos) != 2:
+                raise ValueError
+            pos_x, pos_y = float(pos[0]), float(pos[1])
+            angle = float(rec.get("angle_deg") or 0.0) % 180.0
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{ref} Steinberg geometry must be numeric") from exc
+        if (not all(math.isfinite(v) for v in (length_mm, pos_x, pos_y, angle))
+                or length_mm <= 0.0):
+            raise ValueError(f"{ref} Steinberg geometry must be finite and positive")
+        along_x = angle < 45.0 or angle >= 135.0
+        if (body.get("l_mm") is not None and body.get("w_mm") is not None
+                and float(body["w_mm"]) > float(body["l_mm"])):
+            along_x = not along_x
         b_mm = (x1 - x0) if along_x else (y1 - y0)
-        r = position_factor(float(pos[0]), float(pos[1]), board_geo["bbox_mm"])
+        factor = position_factor(pos_x, pos_y, bbox)
         c = entry["C"]
         z_allow_in = 0.00022 * (b_mm / _MM_PER_IN) / (
-            c * h_in * r * math.sqrt(max(length_mm, 1e-6) / _MM_PER_IN))
+            c * h_in * factor * math.sqrt(length_mm / _MM_PER_IN))
         z_allow_mm = z_allow_in * _MM_PER_IN
-        margin = float(z_allow_mm / z3_mm) if z3_mm > 0 else float("inf")
-        ok = bool(margin > 1.0)
-        if not ok:
+        margin = z_allow_mm / z3_mm
+        if not math.isfinite(z_allow_mm) or z_allow_mm <= 0.0 or not math.isfinite(margin):
+            raise ValueError(f"{ref} derived Steinberg limit is invalid")
+        passed = margin >= 1.0
+        if not passed:
             n_fail += 1
         entry.update({"L_mm": round(length_mm, 3), "B_mm": round(b_mm, 3),
-                      "r": round(r, 4), "z_allow_3sigma_mm": round(z_allow_mm, 5),
-                      "margin": round(margin, 3) if math.isfinite(margin) else None,
-                      "pass": ok})
+                      "r": round(factor, 4), "z_allow_3sigma_mm": round(z_allow_mm, 5),
+                      "margin": round(margin, 3), "pass": passed})
         table.append(entry)
     return {"table": table, "n_fail": n_fail, "n_unchecked": n_unchecked,
             "citation": STEINBERG_CITATION, "heuristic": True}
 
 
 def band_split(freqs: list, lo: float, hi: float) -> tuple:
-    """(modes_table, in_band_freqs): every elastic mode tagged in/out of band.
-    Rigid-body modes (< 0.5 Hz) are tagged but excluded from the band verdict."""
+    """Validate modal frequencies and tag rigid/elastic modes inside the band."""
+    try:
+        lo, hi = float(lo), float(hi)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("modal band limits must be numeric") from exc
+    if not math.isfinite(lo) or not math.isfinite(hi) or not 0.0 < lo < hi:
+        raise ValueError("modal band must satisfy finite 0 < lo < hi")
+    if not isinstance(freqs, list):
+        raise ValueError("modal frequencies must be a list")
     modes = []
     in_band = []
-    for i, f in enumerate(freqs):
-        f = float(f)
-        rigid = f < 0.5
-        inside = (not rigid) and lo <= f <= hi
-        modes.append({"mode": i + 1, "freq_hz": round(f, 2),
+    previous = -1.0
+    for i, raw in enumerate(freqs):
+        try:
+            freq = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"mode {i + 1} frequency must be numeric") from exc
+        if not math.isfinite(freq) or freq < 0.0 or freq < previous:
+            raise ValueError("modal frequencies must be finite, non-negative, and sorted")
+        previous = freq
+        rigid = freq < 0.5
+        inside = (not rigid) and lo <= freq <= hi
+        modes.append({"mode": i + 1, "freq_hz": round(freq, 2),
                       "rigid_body": rigid, "in_band": inside})
         if inside:
-            in_band.append(f)
+            in_band.append(freq)
     return modes, in_band
 
 
 def deflection_3sigma_mm(grms: float, freq_hz: float) -> float:
-    """Steinberg dynamic deflection: Z_rms(mm) = 248.9 * Grms / f^2, x3 for 3-sigma."""
-    if freq_hz <= 0:
-        return 0.0
-    return 3.0 * _DEFLECT_MM_G_F2 * grms / (freq_hz * freq_hz)
+    """Steinberg dynamic deflection: 3 * 248.9 * Grms / f², in millimetres."""
+    try:
+        grms, freq_hz = float(grms), float(freq_hz)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Grms and frequency must be numeric") from exc
+    if (not math.isfinite(grms) or grms <= 0.0
+            or not math.isfinite(freq_hz) or freq_hz <= 0.0):
+        raise ValueError("Grms and frequency must be finite and > 0")
+    value = 3.0 * _DEFLECT_MM_G_F2 * grms / (freq_hz * freq_hz)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("derived 3-sigma deflection must be finite and > 0")
+    return value
 
 
 # --------------------------------------------------------------------------- registration
@@ -442,15 +550,66 @@ def register_ecad_reliability_tools(mcp) -> None:
         # user_holes`) — float('[') then crashed with a message naming neither this
         # argument nor the shape it wanted. Coerce up front so a real string error
         # names the argument, and a genuine list/repr-list is read correctly.
-        if isinstance(psd_breakpoints, str) and psd_breakpoints.strip():
-            psd_breakpoints = require_list(
-                psd_breakpoints, "psd_breakpoints",
-                "a list of [f_hz, g2_per_hz] pairs, e.g. [[20, 0.04], [350, 0.04]]")
-        if isinstance(mount_holes, str) and mount_holes.strip():
-            mount_holes = require_list(
-                mount_holes, "mount_holes",
-                "a list of [x_mm, y_mm] or [x_mm, y_mm, drill_d_mm] points, e.g. "
-                "[[3, 3], [37, 3], [37, 27], [3, 27]]")
+        try:
+            if isinstance(psd_breakpoints, str) and psd_breakpoints.strip():
+                psd_breakpoints = require_list(
+                    psd_breakpoints, "psd_breakpoints",
+                    "a list of [f_hz, g2_per_hz] pairs")
+            if isinstance(mount_holes, str) and mount_holes.strip():
+                mount_holes = require_list(
+                    mount_holes, "mount_holes",
+                    "a list of [x_mm, y_mm] or [x_mm, y_mm, drill_d_mm] points")
+        except (TypeError, ValueError) as exc:
+            return _err(str(exc))
+        if psd_breakpoints is not None and not isinstance(psd_breakpoints, list):
+            return _err("psd_breakpoints must be a list or null")
+        if mount_holes is not None and not isinstance(mount_holes, list):
+            return _err("mount_holes must be a list or null")
+        try:
+            lo, hi = float(band_lo_hz), float(band_hi_hz)
+            zeta = float(zeta)
+            mesh_fineness = float(mesh_fineness)
+        except (TypeError, ValueError):
+            return _err("band limits, zeta, and mesh_fineness must be numeric")
+        if not math.isfinite(lo) or not math.isfinite(hi) or not 0.0 < lo < hi:
+            return _err(f"bad excitation band [{lo}, {hi}] Hz — need finite 0 < lo < hi")
+        if not math.isfinite(zeta) or not 0.0 < zeta <= 1.0:
+            return _err("zeta must be a finite damping ratio in (0, 1]")
+        if not math.isfinite(mesh_fineness) or not 0.0 < mesh_fineness <= 1.0:
+            return _err("mesh_fineness must be finite and in (0, 1]")
+        if (isinstance(n_modes, bool) or not isinstance(n_modes, int)
+                or not 1 <= n_modes <= 100):
+            return _err("n_modes must be an integer in [1, 100]")
+
+        if psd_breakpoints is None:
+            psd = [[lo, _DEFAULT_PSD_G2_HZ], [hi, _DEFAULT_PSD_G2_HZ]]
+            psd_note = (f"DEFAULT flat {_DEFAULT_PSD_G2_HZ} g^2/Hz over "
+                        f"{lo:g}-{hi:g} Hz (NAVMAT P-9492-class screening level, "
+                        "simplified flat profile — pass psd_breakpoints for the real "
+                        "qualification spectrum)")
+            warnings.append(f"random-vibe input is a default screen: {psd_note}")
+        else:
+            if len(psd_breakpoints) < 2:
+                return _err("psd_breakpoints needs at least two points")
+            psd = []
+            previous = -1.0
+            for index, point in enumerate(psd_breakpoints):
+                if not isinstance(point, list) or len(point) != 2:
+                    return _err(
+                        f"psd_breakpoints[{index}] must be [f_hz, g2_per_hz]")
+                try:
+                    frequency, density = float(point[0]), float(point[1])
+                except (TypeError, ValueError):
+                    return _err(f"psd_breakpoints[{index}] values must be numeric")
+                if (not math.isfinite(frequency) or frequency <= previous
+                        or frequency <= 0.0 or not math.isfinite(density)
+                        or density <= 0.0):
+                    return _err("PSD frequencies must be finite, positive, strictly "
+                                "increasing; densities must be finite and > 0 g²/Hz")
+                psd.append([frequency, density])
+                previous = frequency
+            psd_note = "caller-supplied PSD"
+
         try:
             session = _get_pcb(doc_id or None)
         except OpError as e:
@@ -458,16 +617,14 @@ def register_ecad_reliability_tools(mcp) -> None:
                         next_actions=["ecad_new_pcb('myboard')", "ecad_make_board(...)"])
         board_doc = session.doc
 
-        lo, hi = float(band_lo_hz), float(band_hi_hz)
-        if not (0.0 < lo < hi):
-            return _err(f"bad excitation band [{lo}, {hi}] Hz — need 0 < lo < hi")
-
         # ── mount holes -> fixed BCs ─────────────────────────────────────────
         try:
             holes = detect_mount_holes(board_doc, mount_holes)
         except ImportError as e:
             return _err(f"3D kernel unavailable (ImportError: {e})",
                         hint="OCP/build123d not installed.", available=False)
+        except ValueError as e:
+            return _err(f"invalid mounting-hole setup: {e}")
         if not holes:
             return _err(
                 "no mounting holes found — a free-floating board has no mounted modes",
@@ -494,25 +651,34 @@ def register_ecad_reliability_tools(mcp) -> None:
         except Exception as e:  # noqa: BLE001
             return _err(f"FEA solid build failed: {type(e).__name__}: {e}")
 
-        board_geo = built["board"]
-        components = built["components"]
-        warnings.extend(built["summary"].get("warnings", []))
-
-        mass_model = build_mass_model(built)
-        material = structural_material(mass_model)
-        fixtures = mount_fixture_facesets(holes, board_geo)
-
-        # ── excitation input ────────────────────────────────────────────────
-        if psd_breakpoints is not None:
-            psd = [[float(p[0]), float(p[1])] for p in psd_breakpoints]
-            psd_note = "caller-supplied PSD"
-        else:
-            psd = [[lo, _DEFAULT_PSD_G2_HZ], [hi, _DEFAULT_PSD_G2_HZ]]
-            psd_note = (f"DEFAULT flat {_DEFAULT_PSD_G2_HZ} g^2/Hz over "
-                        f"{lo:g}-{hi:g} Hz (NAVMAT P-9492-class screening level, "
-                        "simplified flat profile — pass psd_breakpoints for the real "
-                        "qualification spectrum)")
-            warnings.append(f"random-vibe input is a default screen: {psd_note}")
+        try:
+            board_geo = built["board"]
+            components = built["components"]
+            built_summary = built["summary"]
+            built_assumptions = built["assumptions"]
+            if (not isinstance(built_summary, dict)
+                    or not isinstance(built_summary.get("warnings", []), list)
+                    or not isinstance(built_assumptions, list)):
+                raise ValueError("FEA builder returned malformed summary/assumptions")
+            if not isinstance(board_geo, dict) or not isinstance(components, list):
+                raise ValueError("FEA builder returned malformed board/components")
+            bbox = [float(v) for v in board_geo["bbox_mm"]]
+            if (len(bbox) != 4 or not all(math.isfinite(v) for v in bbox)
+                    or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]):
+                raise ValueError("board bbox must be finite and non-degenerate")
+            outside = [
+                hole["ref"] for hole in holes
+                if not (bbox[0] <= hole["x_mm"] <= bbox[2]
+                        and bbox[1] <= hole["y_mm"] <= bbox[3])
+            ]
+            if outside:
+                raise ValueError("mount holes outside the board bbox: " + ", ".join(outside))
+            mass_model = build_mass_model(built)
+            material = structural_material(mass_model)
+            fixtures = mount_fixture_facesets(holes, board_geo)
+            warnings.extend(built_summary.get("warnings", []))
+        except (KeyError, TypeError, ValueError) as exc:
+            return _err(f"invalid structural setup: {exc}")
 
         assumptions = [
             f"structural material: isotropic FR4+Cu laminate screen, E = "
@@ -522,7 +688,9 @@ def register_ecad_reliability_tools(mcp) -> None:
             f"{_MOUNT_LAND_MM} mm land annulus on both faces at each hole "
             "(drill bores are omitted from the FEA solid)",
         ] + mass_model["assumptions"] + [
-            a for a in built["assumptions"] if "fused" in a or "flattened" in a]
+            assumption for assumption in built_assumptions
+            if isinstance(assumption, str)
+            and ("fused" in assumption or "flattened" in assumption)]
 
         # ── simhandoff envelope ─────────────────────────────────────────────
         conditions = [
@@ -578,28 +746,53 @@ def register_ecad_reliability_tools(mcp) -> None:
         if cb is not None:
             study = {"step_path": built["step_path"], "material": material,
                      "fixtures": fixtures, "mesh_order": 2,
-                     "fineness": float(mesh_fineness)}
+                     "fineness": mesh_fineness}
             try:
-                res = cb.call("sim_run_modal", {"study": study,
-                                                "n_modes": int(n_modes)})
+                res = cb.call("sim_run_modal", {"study": study, "n_modes": n_modes})
             except Exception as e:  # noqa: BLE001
                 res = {"ok": False, "error": str(e)}
-            solve_err = None if res.get("ok") else res.get("error", "modal solve failed")
+            if not isinstance(res, dict):
+                solve_err = "modal solver returned a non-object response"
+            else:
+                solve_err = None if res.get("ok") else res.get(
+                    "error", "modal solve did not converge")
         if cb is None or solve_err:
             _VIBE["last"] = None
+            reason = f"FEA leg unavailable: {solve_err}" if cb is None else \
+                f"modal solve failed: {solve_err}"
             return _dumps(sh.attach({
-                **base, "solved": False, "dry_run": False,
-                "error_solve": f"FEA leg unavailable: {solve_err}",
-                "hint": "geometry + fixtures + envelope are valid; the mesher/solver "
-                        "(libchudware with Netgen) is not available in this environment.",
-                "next_actions": ["set CHUDWARE_LIBCHUDWARE to a sim-enabled libchudware build "
-                                 "and retry"],
+                **base, "ok": False, "solved": False, "dry_run": False,
+                "available": cb is not None, "error": reason, "error_solve": reason,
+                "hint": ("the core mesher/solver is unavailable" if cb is None else
+                         "the modal solver failed or did not converge"),
+                "next_actions": [
+                    "set CHUDWARE_LIBCHUDWARE to a sim-enabled build and retry"
+                    if cb is None else
+                    "check mount fixtures/material/mesh_fineness and retry"
+                ],
             }, envelope))
 
-        freqs = [float(f) for f in res.get("freqs_hz", [])]
-        modes, in_band = band_split(freqs, lo, hi)
-        elastic = [f for f in freqs if f >= 0.5]
-        f1 = elastic[0] if elastic else None
+        try:
+            raw_freqs = res.get("freqs_hz")
+            if not isinstance(raw_freqs, list):
+                raise ValueError("freqs_hz must be a list")
+            freqs = [float(freq) for freq in raw_freqs]
+            modes, in_band = band_split(freqs, lo, hi)
+        except (TypeError, ValueError) as exc:
+            _VIBE["last"] = None
+            return _dumps(sh.attach({
+                **base, "ok": False, "solved": False, "dry_run": False,
+                "error": f"invalid modal solver result: {exc}",
+            }, envelope))
+        elastic = [freq for freq in freqs if freq >= 0.5]
+        if not elastic:
+            _VIBE["last"] = None
+            return _dumps(sh.attach({
+                **base, "ok": False, "solved": False, "dry_run": False,
+                "error": "modal solver returned no elastic modes",
+                "modes": modes,
+            }, envelope))
+        f1 = elastic[0]
         band_verdict = (
             f"FLAG: {len(in_band)} natural frequenc"
             f"{'y' if len(in_band) == 1 else 'ies'} inside the {lo:g}-{hi:g} Hz "
@@ -607,88 +800,118 @@ def register_ecad_reliability_tools(mcp) -> None:
             "resonant amplification expected under this environment"
             if in_band else
             f"CLEAR: no natural frequency inside the {lo:g}-{hi:g} Hz excitation band "
-            f"(first elastic mode {f1:.0f} Hz)" if f1 else
-            "CLEAR: no elastic modes returned")
+            f"(first elastic mode {f1:.0f} Hz)")
 
         # ── response at the worst in-band mode + deflection screen ─────────
         deflect: dict = {"available": False}
         response: dict = {"available": False}
+        response_error = None
         try:
             from services.sim.vibration import miles_response  # STAYS (T-RF20): no C++ counterpart
-            shapes = res.get("mode_shapes") or []
-            n_nodes = int(res.get("n_nodes", 0))
-            if shapes and n_nodes > 0:
-                rand = miles_response(
-                    freqs_hz=freqs, mode_shapes_flat=shapes, n_nodes=n_nodes,
-                    total_mass_kg=mass_model["total_mass_g"] / 1000.0,
-                    excitation_dir=[0.0, 0.0, 1.0], psd_breakpoints=psd, zeta=zeta)
-                # Coerce numpy scalars (participation math) to JSON-safe floats.
-                per_mode = [{k: (float(v) if isinstance(v, (int, float)) else v)
-                             for k, v in m.items()} for m in rand["per_mode"]]
-                pm_in = [m for m in per_mode if lo <= m["freq_hz"] <= hi]
-                pool = pm_in or per_mode
-                worst = max(pool, key=lambda m: m["grms"]) if pool else None
-                response = {
-                    "available": True,
-                    "worst_mode": worst,
-                    "worst_mode_in_band": bool(pm_in),
-                    "per_mode": per_mode,
-                    "total_grms": round(float(rand["total_grms"]), 4),
-                    "zeta": zeta, "Q": float(rand["Q"]),
-                    "citation": rand["citation"],
-                    "limitations": rand["limitations"],
+            shapes = res.get("mode_shapes")
+            n_nodes = res.get("n_nodes")
+            if (not isinstance(shapes, list) or not shapes
+                    or isinstance(n_nodes, bool) or not isinstance(n_nodes, int)
+                    or n_nodes <= 0):
+                raise ValueError("modal solve returned no valid mode shapes/n_nodes")
+            rand = miles_response(
+                freqs_hz=freqs, mode_shapes_flat=shapes, n_nodes=n_nodes,
+                total_mass_kg=mass_model["total_mass_g"] / 1000.0,
+                excitation_dir=[0.0, 0.0, 1.0],
+                psd_breakpoints=psd, zeta=zeta)
+            per_mode = []
+            for mode in rand["per_mode"]:
+                converted = {
+                    key: (float(value) if isinstance(value, (int, float)) else value)
+                    for key, value in mode.items()
                 }
-                if worst is not None:
-                    z3 = deflection_3sigma_mm(worst["grms"], worst["freq_hz"])
-                    screen = steinberg_screen(components, board_geo, z3)
-                    n_ok = sum(1 for e in screen["table"] if e["pass"])
-                    verdict = (
-                        f"{'FAIL' if screen['n_fail'] else 'PASS'} (HEURISTIC): "
-                        f"3-sigma board deflection {z3:.4f} mm at the worst "
-                        f"{'in-band ' if pm_in else ''}mode "
-                        f"({worst['freq_hz']:.0f} Hz, {worst['grms']:.2f} Grms) — "
-                        f"{n_ok} component(s) within the Steinberg deflection limit, "
-                        f"{screen['n_fail']} over, {screen['n_unchecked']} unchecked. "
-                        f"{screen['citation']}")
-                    deflect = {"available": True,
-                               "z_3sigma_mm": round(z3, 5),
-                               "at_freq_hz": round(worst["freq_hz"], 2),
-                               "mode_grms": round(worst["grms"], 4),
-                               **screen, "verdict": verdict,
-                               "pass": screen["n_fail"] == 0}
-                    if not pm_in:
-                        deflect["note"] = ("no mode inside the excitation band — "
-                                           "screened at the worst overall mode "
-                                           "(conservatively informative)")
-            else:
-                warnings.append("modal solve returned no mode shapes — response + "
-                                "deflection screen unavailable (modes table only)")
-        except ImportError as e:
-            warnings.append(f"services.sim.vibration unavailable ({e}) — response + "
-                            "deflection screen skipped")
+                if (not isinstance(converted.get("freq_hz"), (int, float))
+                        or not math.isfinite(float(converted["freq_hz"]))
+                        or converted["freq_hz"] <= 0.0
+                        or not isinstance(converted.get("grms"), (int, float))
+                        or not math.isfinite(float(converted["grms"]))
+                        or converted["grms"] < 0.0):
+                    raise ValueError(
+                        "random-response frequency must be > 0 and Grms must be >= 0")
+                per_mode.append(converted)
+            pm_in = [mode for mode in per_mode if lo <= mode["freq_hz"] <= hi]
+            pool = pm_in or per_mode
+            if not pool:
+                raise ValueError("random response returned no participating modes")
+            worst = max(pool, key=lambda mode: mode["grms"])
+            total_grms = float(rand["total_grms"])
+            quality = float(rand["Q"])
+            if (not math.isfinite(total_grms) or total_grms <= 0.0
+                    or not math.isfinite(quality) or quality <= 0.0):
+                raise ValueError("random-response total Grms/Q must be finite and > 0")
+            response = {
+                "available": True,
+                "worst_mode": worst,
+                "worst_mode_in_band": bool(pm_in),
+                "per_mode": per_mode,
+                "total_grms": round(total_grms, 4),
+                "zeta": zeta, "Q": quality,
+                "citation": rand["citation"],
+                "limitations": rand["limitations"],
+            }
+            z3 = deflection_3sigma_mm(worst["grms"], worst["freq_hz"])
+            screen = steinberg_screen(components, board_geo, z3)
+            n_ok = sum(1 for entry in screen["table"] if entry["pass"] is True)
+            screen_complete = bool(screen["table"]) and screen["n_unchecked"] == 0
+            screen_pass = screen_complete and screen["n_fail"] == 0
+            verdict = (
+                f"{'PASS' if screen_pass else 'INCOMPLETE/FAIL'} (HEURISTIC): "
+                f"3-sigma board deflection {z3:.4f} mm at the worst "
+                f"{'in-band ' if pm_in else ''}mode "
+                f"({worst['freq_hz']:.0f} Hz, {worst['grms']:.2f} Grms) — "
+                f"{n_ok} component(s) within the Steinberg deflection limit, "
+                f"{screen['n_fail']} over, {screen['n_unchecked']} unchecked. "
+                f"{screen['citation']}")
+            deflect = {
+                "available": True, "complete": screen_complete,
+                "z_3sigma_mm": round(z3, 5),
+                "at_freq_hz": round(worst["freq_hz"], 2),
+                "mode_grms": round(worst["grms"], 4),
+                **screen, "verdict": verdict, "pass": screen_pass,
+            }
+            if not pm_in:
+                deflect["note"] = (
+                    "no mode inside the excitation band — screened at the worst "
+                    "overall mode (conservatively informative)")
+        except (ImportError, KeyError, TypeError, ValueError) as exc:
+            response_error = f"response/deflection unavailable: {type(exc).__name__}: {exc}"
+            warnings.append(response_error)
 
+        complete = bool(response.get("available") and deflect.get("complete"))
+        passed = bool(complete and not in_band and deflect.get("pass"))
         result = sh.attach({
-            **base, "solved": True, "dry_run": False,
+            **base, "ok": complete, "solved": True, "dry_run": False,
+            "complete": complete, "pass": passed,
             "solver": "C++ core modal (tet10) + Miles'-equation modal response",
             "n_nodes": res.get("n_nodes"), "n_dof": res.get("n_dof"),
-            "modes": modes,
-            "f1_hz": round(f1, 2) if f1 else None,
+            "modes": modes, "f1_hz": round(f1, 2),
             "band": {"lo_hz": lo, "hi_hz": hi,
-                     "in_band_freqs_hz": [round(f, 2) for f in in_band],
-                     "verdict": band_verdict},
-            "response": response,
-            "deflection_screen": deflect,
+                     "in_band_freqs_hz": [round(freq, 2) for freq in in_band],
+                     "pass": not in_band, "verdict": band_verdict},
+            "response": response, "deflection_screen": deflect,
             "warnings": warnings,
             "hint": (f"solved: f1 = {f1:.0f} Hz; {band_verdict.split(':')[0]} in band; "
-                     + (f"deflection screen {'PASS' if deflect.get('pass') else 'FAIL'} "
-                        f"(z3 = {deflect.get('z_3sigma_mm')} mm)" if deflect.get("available")
-                        else "deflection screen unavailable")) if f1 else band_verdict,
+                     + (f"deflection screen "
+                        f"{'PASS' if deflect.get('pass') else 'INCOMPLETE/FAIL'} "
+                        f"(z3 = {deflect.get('z_3sigma_mm')} mm)"
+                        if deflect.get("available") else
+                        "deflection screen unavailable")),
             "next_actions": (
+                ["repair missing response/mode-shape/component-limit data and re-run"]
+                if not complete else
                 ["stiffen the board (thicker laminate / extra mount) or move heavy "
                  "parts toward the mounts, then re-run ecad_vibe_check()"]
-                if (in_band or (deflect.get("available") and not deflect.get("pass")))
-                else ["margins OK at the screening level — re-run with the real "
-                      "qualification psd_breakpoints before sign-off"]),
+                if not passed else
+                ["margins OK at the screening level — re-run with the real "
+                 "qualification psd_breakpoints before sign-off"]),
         }, envelope)
-        _VIBE["last"] = result
+        if not complete:
+            result["error"] = response_error or (
+                "deflection screen incomplete because component geometry was unchecked")
+        _VIBE["last"] = result if complete else None
         return _dumps(result)

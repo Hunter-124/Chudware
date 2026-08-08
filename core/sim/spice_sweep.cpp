@@ -27,6 +27,26 @@ std::string lower(std::string s) {
     return s;
 }
 
+
+json sweep_error(double value, const std::string& message) {
+    return json{{"value", std::isfinite(value) ? json(value) : json(nullptr)},
+                {"error", message},
+                {"log", json::array({"sweep: " + message})},
+                {"convergence", json{{"sweep", false}}},
+                {"cache_hit", false},
+                {"cache_reason", "invalid_input"}};
+}
+
+bool parameter_exists(const json& circuit, const std::string& param) {
+    if (param.empty() || !circuit.is_object()) return false;
+    if (circuit.contains("devices") && circuit["devices"].is_array())
+        for (const json& device : circuit["devices"])
+            if (device.is_object() && device.value("name", std::string()) == param) return true;
+    if (circuit.contains("params") && circuit["params"].is_object())
+        for (const std::string& key : {param, upper(param), lower(param)})
+            if (circuit["params"].contains(key)) return true;
+    return false;
+}
 // Mirror spice.cpp's apply_step_param: device name match sets value; else circuit
 // params (case-insensitive key, or insert as-is).
 void apply_step_param(json& circ, const std::string& param, double value) {
@@ -89,6 +109,9 @@ uint64_t estimate_sweep_bytes(const json& circuit, int n_points) {
 }
 
 json run_one(const json& circuit, const std::string& param, double value, const json& study) {
+    if (!std::isfinite(value)) return sweep_error(value, "sweep values must be finite");
+    if (!parameter_exists(circuit, param))
+        return sweep_error(value, "parameter '" + param + "' does not name a device or circuit param");
     json c = circuit;  // deep copy
     apply_step_param(c, param, value);
     json res = spice_simulate(c, study);

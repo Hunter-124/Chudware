@@ -20,11 +20,14 @@
 #include "util/thread_pool.h"
 #include "prof/phases.h"  // per-phase timers (StudyScope "lbm")
 
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <new>
 #include <cstdlib>
 #include <thread>
 #ifdef CHUDWARE_HAVE_OPENMP
@@ -150,13 +153,46 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     R.nx = nx;
     R.ny = ny;
     R.nz = nz;
-    if (nx < 1 || ny < 1 || nz < 1) {
-        R.error = "lbm_run: grid dims must be >= 1";
+    try {
+    if (nx < 3 || ny < 3 || nz < 3) {
+        R.error = "lbm_run: grid dims must each be >= 3";
         return R;
     }
-    const std::size_t ncell = static_cast<std::size_t>(nx) * ny * nz;
+    const std::size_t max_cells = std::numeric_limits<std::size_t>::max() / NQ;
+    if (static_cast<std::size_t>(nx) > max_cells / static_cast<std::size_t>(ny) ||
+        static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) >
+            max_cells / static_cast<std::size_t>(nz)) {
+        R.error = "lbm_run: grid is too large";
+        return R;
+    }
+    const std::size_t ncell = static_cast<std::size_t>(nx) *
+                              static_cast<std::size_t>(ny) *
+                              static_cast<std::size_t>(nz);
     if (solid.size() != ncell) {
         R.error = "lbm_run: solid mask size mismatch";
+        return R;
+    }
+    if (n_steps <= 0) {
+        R.error = "lbm_run: n_steps must be positive";
+        return R;
+    }
+    if (!std::isfinite(p.u_lat) || p.u_lat <= 0.0 || p.u_lat > 0.1) {
+        R.error = "lbm_run: u_lat must be finite and in (0, 0.1]";
+        return R;
+    }
+    if (!std::isfinite(p.tau0) || p.tau0 <= 0.5 || p.tau0 > 2.0) {
+        R.error = "lbm_run: tau0 must be finite and in (0.5, 2.0]";
+        return R;
+    }
+    if (!std::isfinite(p.voxel_mm) || p.voxel_mm <= 0.0 ||
+        !std::isfinite(p.dx_m) || p.dx_m <= 0.0 ||
+        !std::isfinite(p.dt_s) || p.dt_s <= 0.0 ||
+        !std::isfinite(p.rho_air) || p.rho_air <= 0.0) {
+        R.error = "lbm_run: voxel_mm, dx_m, dt_s, and rho_air must be finite and positive";
+        return R;
+    }
+    if (std::all_of(solid.begin(), solid.end(), [](uint8_t v) { return v != 0; })) {
+        R.error = "lbm_run: solid mask contains no fluid cells";
         return R;
     }
 
@@ -168,6 +204,10 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         else want = "auto";
     }
     for (char& c : want) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    if (want != "auto" && want != "cpu" && want != "cuda") {
+        R.error = "lbm_run: backend must be 'auto', 'cpu', or 'cuda'";
+        return R;
+    }
     R.backend = "cpu";
 #ifdef CHUDWARE_WITH_CUDA
     const bool try_cuda = (want == "cuda" || want == "auto");
@@ -195,9 +235,6 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         }
     } else if (want == "cpu") {
         // explicit CPU
-    } else {
-        R.backend_fallback = "unknown backend '" + want + "', using CPU";
-    }
 #else
     if (want == "cuda") {
         R.backend_fallback = "CUDA not built into this libchudware (CHUDWARE_WITH_CUDA=OFF)";
@@ -387,28 +424,29 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     for (std::size_t c = 0; c < ncell; ++c)
         if (solid[c]) solid_cells.push_back(c);
 
-    // ---- momentum-exchange drag/lift (lattice units) ----------------------------
-    // For each boundary link: contrib = sum_over_cells(f[cell,q]) * 2.0 (float64 sum
-    // of float32 f values per the oracle's np.sum -> np.float64). drag += contrib*ex,
-    // lift += contrib*ey.
+    // For each boundary link: contrib = sum_over_cells(f[solid_destination,q]) * 2.0
+    // (float64 sum of float32 f values per the oracle's np.sum -> np.float64). Resolve
+    // all three lattice axes so public flow results do not fabricate a zero side force.
     std::vector<float> gather;  // scratch for the gathered f_q values per link
     auto momentum_exchange = [&](const std::vector<float>& F, double& drag_lat,
-                                 double& lift_lat) {
-        // The oracle accumulates into np.float64 drag_lat/lift_lat. For each link:
+                                 double& lift_lat, double& side_lat) {
+        // The oracle accumulates into np.float64 force components. For each link:
         //   contrib = float(np.sum(f_q)) * 2.0  where f_q is the gathered float32
-        // array f[cells, q]; np.sum of a float32 array returns float32 (numpy's
-        // pairwise_sum) which is THEN promoted to python float64 by float(...).
+        // array f[solid_destinations, q]; np.sum of a float32 array returns float32
+        // (numpy's pairwise_sum) which is THEN promoted to python float64 by float(...).
         drag_lat = 0.0;
         lift_lat = 0.0;
+        side_lat = 0.0;
         for (const Link& lk : links) {
             const int q = lk.q;
             gather.resize(lk.cells.size());
             for (std::size_t i = 0; i < lk.cells.size(); ++i)
-                gather[i] = F[lk.cells[i] * sz_q + q];
+                gather[i] = F[lk.nbs[i] * sz_q + q];
             const float s32 = pairwise_sum_f32(gather.data(), gather.size());
             const double contrib = static_cast<double>(s32) * 2.0;
             drag_lat += contrib * static_cast<double>(EQ[q][0]);
             lift_lat += contrib * static_cast<double>(EQ[q][1]);
+            side_lat += contrib * static_cast<double>(EQ[q][2]);
         }
     };
 
@@ -416,7 +454,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     // because the gate runs a fixed small N below divergence). nu0 uses python float
     // (double) tau0; smag uses float32.
     const double tau_current = p.tau0;
-    const bool use_smag = tau_current > 0.55;
+    const bool use_smag = true;  // LES is needed most when molecular tau is close to 0.5.
     const float omega_s = static_cast<float>(1.0 / tau_current);  // float32(1.0/tau)
     // _smag_tau internals are ALL float32 (oracle: _CS2 is float32, so nu0 is float32;
     // smag = (_CS_SMAG**2 * sqrt(float32(2.0))) * pi_mag is float32). nu0 = _CS2 *
@@ -438,12 +476,17 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         }
     }
 
-    // Convergence sampling: record the drag at ~50 checkpoints through the run so we can report a
-    // residual (how settled the force is) WITHOUT an early exit (the full n_steps still run, so the
-    // lattice walk stays bit-identical to the oracle for the parity gate).
-    std::vector<double> drag_hist;
-    const int sample_every = std::max(1, n_steps / 50);
+    // Match the production Python solver's steady-force estimator: sample every ten
+    // steps before bounce-back, retain the final fifth of the run (at least 50 steps),
+    // and measure drift between the two half-window means. Raw coefficient of variation
+    // incorrectly rejects a physically settled periodic wake.
+    std::vector<std::array<double, 3>> force_hist;
+    const int convergence_window = std::max(50, n_steps / 5);
+    const int force_window_samples = std::max(5, (convergence_window + 9) / 10);
+    std::array<double, 3> mean_force_lat{0.0, 0.0, 0.0};
+    double force_drift = std::numeric_limits<double>::infinity();
 
+    bool converged_in_loop = false;
     const auto t_loop0 = std::chrono::steady_clock::now();
     chudware::prof::phases::add("init", std::chrono::duration<double, std::milli>(
                                          t_loop0 - t_init0).count());
@@ -489,7 +532,8 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             }
             if (use_smag) {
                 // _smag_tau: pi_mag = sqrt(sum_q (f-feq)^2); nu_eff = nu0 + Cs^2*sqrt2*pi;
-                // tau_eff = float32(nu_eff/cs2 + 0.5) clipped [0.51,2.0]; omega=1/tau_eff.
+                // tau_eff retains the physical molecular floor tau0; only the upper stability
+                // bound is clipped. Raising the floor to 0.51 silently changed Reynolds number.
                 float sq[NQ];
                 for (int q = 0; q < NQ; ++q) {
                     const float fn = f[base + q] - feq_c[q];
@@ -499,7 +543,8 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                 const float smag = SMAG_C * pi_mag;
                 const float nu_eff = nu0 + smag;  // float32
                 float tau_eff = nu_eff / CS2 + 0.5f;
-                if (tau_eff < 0.51f) tau_eff = 0.51f;
+                if (tau_eff < static_cast<float>(tau_current))
+                    tau_eff = static_cast<float>(tau_current);
                 if (tau_eff > 2.0f) tau_eff = 2.0f;
                 const float omega = 1.0f / tau_eff;  // float32(1.0)/tau_arr
                 for (int q = 0; q < NQ; ++q)
@@ -539,30 +584,79 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             }
         }
 
-        // Lateral slip (mirror / zero-gradient copy): y=0<-y=1, y=Ny-1<-y=Ny-2,
-        // z=0<-z=1, z=Nz-1<-z=Nz-2. Order matters (oracle does Y faces then Z faces).
-        if (ny >= 2) {
-            for (int x = 0; x < nx; ++x) {
-                for (int z = 0; z < nz; ++z) {
-                    const std::size_t d0 = fidx(x, 0, z, 0), s0 = fidx(x, 1, z, 0);
-                    const std::size_t d1 = fidx(x, ny - 1, z, 0), s1 = fidx(x, ny - 2, z, 0);
-                    for (int q = 0; q < NQ; ++q) {
-                        f[d0 + q] = f[s0 + q];
-                        f[d1 + q] = f[s1 + q];
-                    }
+        // Lateral slip: specularly reflect only populations whose normal velocity
+        // points into the domain. A zero-gradient plane copy is not a slip wall: it
+        // imports the adjacent plane's normal momentum and permits lateral mass flux.
+        // Order matters at edges (Y faces, then Z faces).
+        static constexpr int REFLECT_Y[NQ] = {
+            0, 1, 2, 4, 3, 5, 6, 9, 10, 7, 8, 11, 12, 13, 14, 18, 17, 16, 15};
+        static constexpr int REFLECT_Z[NQ] = {
+            0, 1, 2, 3, 4, 6, 5, 7, 8, 9, 10, 13, 14, 11, 12, 17, 18, 15, 16};
+        for (int x = 0; x < nx; ++x) {
+            for (int z = 0; z < nz; ++z) {
+                const std::size_t low = fidx(x, 0, z, 0);
+                const std::size_t high = fidx(x, ny - 1, z, 0);
+                for (int q = 0; q < NQ; ++q) {
+                    if (EQ[q][1] > 0) f[low + q] = f[low + REFLECT_Y[q]];
+                    if (EQ[q][1] < 0) f[high + q] = f[high + REFLECT_Y[q]];
                 }
             }
         }
-        if (nz >= 2) {
-            for (int x = 0; x < nx; ++x) {
-                for (int y = 0; y < ny; ++y) {
-                    const std::size_t d0 = fidx(x, y, 0, 0), s0 = fidx(x, y, 1, 0);
-                    const std::size_t d1 = fidx(x, y, nz - 1, 0), s1 = fidx(x, y, nz - 2, 0);
-                    for (int q = 0; q < NQ; ++q) {
-                        f[d0 + q] = f[s0 + q];
-                        f[d1 + q] = f[s1 + q];
-                    }
+        for (int x = 0; x < nx; ++x) {
+            for (int y = 0; y < ny; ++y) {
+                const std::size_t low = fidx(x, y, 0, 0);
+                const std::size_t high = fidx(x, y, nz - 1, 0);
+                for (int q = 0; q < NQ; ++q) {
+                    if (EQ[q][2] > 0) f[low + q] = f[low + REFLECT_Z[q]];
+                    if (EQ[q][2] < 0) f[high + q] = f[high + REFLECT_Z[q]];
                 }
+            }
+        }
+
+        // Sample momentum exchange BEFORE bounce-back mutates the fluid-side population.
+        // The post-bounce f[fluid,q] belongs to an unrelated upstream population and adds
+        // a free-stream bias to both the force and its convergence history.
+        const bool sampled_force = step % 10 == 0 || step == n_steps;
+        if (sampled_force) {
+            const auto t_cv0 = std::chrono::steady_clock::now();
+            double d = 0.0, l = 0.0, s = 0.0;
+            momentum_exchange(f, d, l, s);
+            force_hist.push_back({d, l, s});
+            if (static_cast<int>(force_hist.size()) > force_window_samples)
+                force_hist.erase(force_hist.begin());
+            mean_force_lat = {0.0, 0.0, 0.0};
+            for (const auto& sample : force_hist)
+                for (int c = 0; c < 3; ++c) mean_force_lat[c] += sample[c];
+            for (double& component : mean_force_lat)
+                component /= static_cast<double>(force_hist.size());
+            const std::size_t half = force_hist.size() / 2;
+            if (half >= 2) {
+                double early_drag = 0.0, late_drag = 0.0;
+                for (std::size_t i = 0; i < half; ++i) {
+                    early_drag += force_hist[i][0];
+                    late_drag += force_hist[force_hist.size() - half + i][0];
+                }
+                early_drag /= static_cast<double>(half);
+                late_drag /= static_cast<double>(half);
+                force_drift = std::abs(late_drag - early_drag) /
+                              std::max(std::abs(mean_force_lat[0]), 1e-30);
+            }
+            convergence_ms += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t_cv0).count();
+            if (on_progress) on_progress(step, n_steps);
+            if (should_cancel && should_cancel()) {
+                R.ok = false;
+                R.steps_run = step;
+                R.error = "cancelled by sim_cancel at step " + std::to_string(step) +
+                          " of " + std::to_string(n_steps);
+                return R;
+            }
+            if (chudware::governor::low_memory_now()) {
+                R.ok = false;
+                R.error = "CFD run stopped at step " + std::to_string(step) +
+                          ": host memory critically low (governor) — close other "
+                          "applications and re-run";
+                return R;
             }
         }
 
@@ -602,46 +696,50 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             }
         }
 
-        // Sample the (lattice) drag at checkpoints for the convergence residual. Read-only — it
-        // gathers from f and never writes it, so the solve is unchanged. Timed into the
-        // accumulated "convergence" phase (~50 checkpoints/run: two clock reads each = noise).
-        if (step % sample_every == 0 || step == n_steps) {
-            const auto t_cv0 = std::chrono::steady_clock::now();
-            double d = 0.0, l = 0.0;
-            momentum_exchange(f, d, l);
-            drag_hist.push_back(d);
-            convergence_ms += std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - t_cv0).count();
-            if (on_progress) on_progress(step, n_steps);  // live progress (read-only)
-            // Cooperative cancel (sim_cancel): stop at the checkpoint, reporting the steps
-            // actually run. Parity-safe — the gate never passes a cancel hook.
-            if (should_cancel && should_cancel()) {
-                R.ok = false;
-                R.steps_run = step;
-                R.error = "cancelled by sim_cancel at step " + std::to_string(step) +
-                          " of " + std::to_string(n_steps);
-                return R;
+        // Match the production solver's early-stop contract.  Once the force-window
+        // drift settles, verify continuity on the current post-bounce field; continuing
+        // far past this point can move a periodic wake into a different lattice phase
+        // and falsely report a previously converged run as unconverged.
+        if (sampled_force &&
+            static_cast<int>(force_hist.size()) >= force_window_samples &&
+            step > n_steps / 5 && force_drift < 0.01 &&
+            (links.empty() || mean_force_lat[0] > 0.0)) {
+            macros(f);
+            double inlet = 0.0;
+            double outlet = 0.0;
+            for (int y = 0; y < ny; ++y) {
+                for (int z = 0; z < nz; ++z) {
+                    const std::size_t ci = cidx(0, y, z);
+                    const std::size_t co = cidx(nx - 1, y, z);
+                    if (!solid[ci]) inlet += static_cast<double>(rho[ci]) * ux[ci];
+                    if (!solid[co]) outlet += static_cast<double>(rho[co]) * ux[co];
+                }
             }
-            // Emergency stop (governor): the HOST is nearly out of memory — the lattice
-            // itself was admitted up-front, so this means some other process is eating
-            // RAM. Stop gracefully at this checkpoint instead of letting the OS swap or
-            // OOM-kill the app. Never trips in the parity gate (fixed small grids, and
-            // CHUDWARE_GOVERNOR=0 disables outright).
-            if (chudware::governor::low_memory_now()) {
-                R.ok = false;
-                R.error = "CFD run stopped at step " + std::to_string(step) +
-                          ": host memory critically low (governor) — close other "
-                          "applications and re-run";
-                return R;
+            const double scale =
+                std::max({std::abs(inlet), std::abs(outlet), 1e-30});
+            const double continuity = std::abs(inlet - outlet) / scale;
+            if (std::isfinite(continuity) && continuity < 0.02) {
+                converged_in_loop = true;
+                break;
             }
         }
+
     }
-    step = n_steps;  // loop exits with step == n_steps+1; oracle's `step` is last value
+    if (step > n_steps) step = n_steps;
     chudware::prof::phases::add("loop", std::chrono::duration<double, std::milli>(
                                          std::chrono::steady_clock::now() - t_loop0).count(),
                              static_cast<unsigned long long>(n_steps > 0 ? n_steps : 0));
     chudware::prof::phases::add("convergence", convergence_ms,
-                             static_cast<unsigned long long>(drag_hist.size()));
+                             static_cast<unsigned long long>(force_hist.size()));
+    if (!std::all_of(f.begin(), f.end(), [](float v) {
+            return std::isfinite(v) && std::abs(v) <= 1.0e6f;
+        })) {
+        R.ok = false;
+        R.diverged = true;
+        R.residual = 1.0;
+        R.error = "lbm_run: non-finite or unbounded lattice population";
+        return R;
+    }
     // Post-processing to function exit ("output"): final macros + drag/Cd + residual.
     chudware::prof::phases::PhaseScope _p_output("output");
 
@@ -651,9 +749,31 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     R.ux = ux;
     R.uy = uy;
     R.uz = uz;
+    bool finite_fields = true;
+    for (std::size_t c = 0; c < ncell; ++c) {
+        if (!std::isfinite(rho[c]) || !std::isfinite(ux[c]) ||
+            !std::isfinite(uy[c]) || !std::isfinite(uz[c]) ||
+            (!solid[c] && rho[c] <= 0.0f)) {
+            finite_fields = false;
+            break;
+        }
+    }
+    double inlet_flux = 0.0;
+    double outlet_flux = 0.0;
+    for (int y = 0; y < ny; ++y) {
+        for (int z = 0; z < nz; ++z) {
+            const std::size_t ci = cidx(0, y, z);
+            const std::size_t co = cidx(nx - 1, y, z);
+            if (!solid[ci]) inlet_flux += static_cast<double>(rho[ci]) * ux[ci];
+            if (!solid[co]) outlet_flux += static_cast<double>(rho[co]) * ux[co];
+        }
+    }
+    const double flux_scale = std::max({std::abs(inlet_flux), std::abs(outlet_flux), 1e-30});
+    R.mass_imbalance = std::abs(inlet_flux - outlet_flux) / flux_scale;
 
-    double drag_lat = 0.0, lift_lat = 0.0;
-    momentum_exchange(f, drag_lat, lift_lat);
+    const double drag_lat = mean_force_lat[0];
+    const double lift_lat = mean_force_lat[1];
+    const double side_lat = mean_force_lat[2];
     // Lattice force -> SI force. The momentum-exchange sum is a force in lattice units (momentum
     // per lattice timestep, dt_lat=1), so the conversion is the LBM force factor
     //   C_F = rho * dx^4 / dt^2     (mass=rho*dx^3, accel=dx/dt^2).
@@ -663,6 +783,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     const double force_factor = p.rho_air * std::pow(p.dx_m, 4.0) / (p.dt_s * p.dt_s);
     R.drag_n = drag_lat * force_factor;
     R.lift_n = lift_lat * force_factor;
+    R.side_n = side_lat * force_factor;
 
     // Frontal area: solid.any(axis=0) over (Ny,Nz) * voxel_mm^2.
     double frontal_cells = 0.0;
@@ -692,30 +813,41 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     R.steps_run = step;
     R.diverged = false;
 
-    // Convergence residual: coefficient of variation of the drag over the last fifth of the
-    // sampled history. Small => the force has settled; large => still developing (treat the numbers
-    // as under-converged). NaN/Inf in the drag => diverged.
-    if (!std::isfinite(R.drag_n) || !std::isfinite(R.lift_n)) {
+    // A voxel boundary produces a small lattice-phase oscillation. Treat the force as
+    // settled when consecutive half-window MEANS stop drifting, rather than requiring
+    // every instantaneous sample in a periodic wake to be nearly identical.
+    const bool force_convergence_available =
+        static_cast<int>(force_hist.size()) >= force_window_samples &&
+        std::isfinite(force_drift);
+    if (!finite_fields || !std::isfinite(R.drag_n) || !std::isfinite(R.lift_n) ||
+        !std::isfinite(R.side_n) || !std::isfinite(R.cd) ||
+        !std::isfinite(R.mass_imbalance)) {
         R.diverged = true;
         R.residual = 1.0;
         R.converged = false;
-    } else if (drag_hist.size() >= 4) {
-        const std::size_t tail = std::max<std::size_t>(3, drag_hist.size() / 5);
-        const std::size_t start = drag_hist.size() - tail;
-        double mean = 0.0;
-        for (std::size_t i = start; i < drag_hist.size(); ++i) mean += drag_hist[i];
-        mean /= static_cast<double>(tail);
-        double var = 0.0;
-        for (std::size_t i = start; i < drag_hist.size(); ++i)
-            var += (drag_hist[i] - mean) * (drag_hist[i] - mean);
-        var /= static_cast<double>(tail);
-        const double denom = std::abs(mean) > 1e-30 ? std::abs(mean) : 1e-30;
-        R.residual = std::sqrt(var) / denom;
-        R.converged = R.residual < 0.01;  // <1% variation over the tail
+        R.error = "lbm_run: non-finite/invalid final flow field";
+    } else {
+        // A short diagnostic run can finish before it has enough samples to judge
+        // force convergence. That is a valid, finite result, just not a converged one.
+        R.residual = force_convergence_available ? force_drift : 1.0;
+        R.converged =
+            converged_in_loop ||
+            (force_convergence_available && R.residual < 0.01 &&
+             R.mass_imbalance < 0.02);
     }
 
-    R.ok = true;
+    R.ok = !R.diverged;
+    if (R.ok && on_progress && step < n_steps) on_progress(n_steps, n_steps);
     return R;
+    } catch (const std::bad_alloc&) {
+        R.ok = false;
+        R.error = "lbm_run: allocation failed for requested lattice";
+        return R;
+    } catch (const std::exception& e) {
+        R.ok = false;
+        R.error = std::string("lbm_run: solver failed: ") + e.what();
+        return R;
+    }
 }
 
 bool lbm_cuda_available() {

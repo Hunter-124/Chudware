@@ -35,19 +35,18 @@ struct RateTable {
 };
 
 // Load the rate table: explicit path → $CHUDWARE_STRUCTURAL_RATES → embedded
-// defaults. A found file is merged over the defaults (per-key override).
+// defaults. Invalid requested overrides fail; valid files merge per key.
 RateTable load_rates(const std::string& rates_path = "");
 
-// Quantity helpers (mirror estimate.py; both throw std::invalid_argument /
-// std::out_of_range like the oracle's ValueError / KeyError).
+// Quantity helpers validate positive finite member geometry and recognized
+// section grammars.
 double board_feet(const StructuralElement& el);
 double steel_weight_lbs(const StructuralElement& el);
 int fastener_count(const StructureDoc& doc);
 
-// Full estimate (mirrors estimate.estimate + takeoff). Returns the JSON the
-// MCP tool emits minus the transport wrapper: {line_items, fastener_line,
-// total_material_cost, total_labor_cost, total_cost, currency,
-// rate_table_date, disclaimer}.
+// Full quantity/rate estimate. The compatible totals remain, with additive
+// completeness and per-line material-estimation diagnostics so partial cost
+// coverage cannot look final.
 nlohmann::json estimate(const StructureDoc& doc, const RateTable& rates);
 
 }  // namespace chudware::structural

@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
+#include <map>
 #include <unordered_set>
 
 #include <Eigen/Dense>
@@ -116,54 +118,97 @@ const FaceTab kTetFaces[4] = {
     {{0, 2, 3}, {6, 8, 7}},  // edges (0,2)=6 (2,3)=8 (3,0)=7
     {{1, 2, 3}, {5, 8, 9}},  // edges (1,2)=5 (2,3)=8 (3,1)=9
 };
+using TriFaceKey = std::array<int, 3>;
 
-// A flat triangle's area from its three corner coords.
-double tri_area(const Vec3& a, const Vec3& b, const Vec3& c) {
-    return 0.5 * ((b - a).cross(c - a)).norm();
+TriFaceKey tri_face_key(const int* el, const FaceTab& ft) {
+    TriFaceKey key{el[ft.corner[0]], el[ft.corner[1]], el[ft.corner[2]]};
+    std::sort(key.begin(), key.end());
+    return key;
 }
 
-// Consistent surface load weights ∫N_i dS for one boundary triangle (tri3 for tet4, tri6 for
-// tet10) of area A. tri3: A/3 per corner. tri6: corners A/... — the exact quadratic
-// moments are ∫N_corner dS = 0, ∫N_mid dS = A/3 (same rule fea_run uses for tractions).
-// Writes the 3 corner + 3 mid weights (mid unused for tet4).
-void tri_load_weights(bool tet10, double A, double wc[3], double wm[3]) {
-    if (tet10) {
-        for (int i = 0; i < 3; ++i) { wc[i] = 0.0; wm[i] = A / 3.0; }
-    } else {
-        for (int i = 0; i < 3; ++i) { wc[i] = A / 3.0; wm[i] = 0.0; }
+std::map<TriFaceKey, int> face_owner_counts(const std::vector<int>& tets, int stride) {
+    std::map<TriFaceKey, int> counts;
+    const int n_elems = static_cast<int>(tets.size() / static_cast<size_t>(stride));
+    for (int e = 0; e < n_elems; ++e) {
+        const int* el = &tets[static_cast<size_t>(e) * stride];
+        for (const FaceTab& ft : kTetFaces) ++counts[tri_face_key(el, ft)];
     }
+    return counts;
 }
 
-// Consistent surface MASS matrix ∫N_i N_j dS for one boundary triangle, needed for the
-// convection term h∫N N dS. For a flat linear tri3 the standard result is
-//     M = (A/12) [[2,1,1],[1,2,1],[1,1,2]]        (3x3, corner nodes)
-// For a flat quadratic tri6 the closed form (area-coord moments over the reference triangle,
-// mapped by the constant area A) is the tabulated 6x6 matrix below (Zienkiewicz, "The Finite
-// Element Method", surface consistent mass for a 6-node triangle):
-//     order [c0,c1,c2, m01,m12,m20], symmetric.
-// M_tri6 = (A/180) * S  with S the integer matrix hard-coded here.
-// Fills M (6x6); for tet4 only the top-left 3x3 (corner) block is populated.
-void tri_surface_mass(bool tet10, double A, Eigen::Matrix<double, 6, 6>& M) {
-    M.setZero();
+int selected_exterior_faces(const std::vector<int>& tets, int stride,
+                            const std::map<TriFaceKey, int>& owners,
+                            const std::unordered_set<int>& nodes) {
+    int selected = 0;
+    const int n_elems = static_cast<int>(tets.size() / static_cast<size_t>(stride));
+    for (int e = 0; e < n_elems; ++e) {
+        const int* el = &tets[static_cast<size_t>(e) * stride];
+        for (const FaceTab& ft : kTetFaces) {
+            const auto own = owners.find(tri_face_key(el, ft));
+            if (own == owners.end() || own->second != 1) continue;
+            bool all = true;
+            for (int i = 0; i < 3; ++i) all = all && nodes.count(el[ft.corner[i]]);
+            if (all) ++selected;
+        }
+    }
+    return selected;
+}
+
+// Surface integrals for a linear tri3 or quadratic isoparametric tri6:
+//   weights_i = ∫N_i dS, mass_ij = ∫N_i N_j dS.
+// A curved tri6 has a varying surface Jacobian, so the flat-face closed form is wrong.
+// A 5x5 Gauss-Legendre Duffy rule integrates the mapped face deterministically; it reduces
+// to the standard tri3/flat-tri6 values to roundoff.
+bool tri_surface_terms(const std::array<Vec3, 6>& p, bool tet10,
+                       Eigen::Matrix<double, 6, 1>& weights,
+                       Eigen::Matrix<double, 6, 6>& mass, double& area) {
+    weights.setZero();
+    mass.setZero();
+    area = 0.0;
     if (!tet10) {
-        const double c = A / 12.0;
+        area = 0.5 * ((p[1] - p[0]).cross(p[2] - p[0])).norm();
+        if (!(area > 0.0) || !std::isfinite(area)) return false;
+        weights.head<3>().setConstant(area / 3.0);
         for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < 3; ++j) M(i, j) = c * (i == j ? 2.0 : 1.0);
-        return;
+            for (int j = 0; j < 3; ++j)
+                mass(i, j) = area / 12.0 * (i == j ? 2.0 : 1.0);
+        return true;
     }
-    // tri6 consistent surface mass, integer template S (rows/cols: c0 c1 c2 m01 m12 m20).
-    // ∫_ref N_i N_j dA multiplied by 2A (2*ref-area normalisation) gives A/180 * S.
-    static const double S[6][6] = {
-        { 6.0, -1.0, -1.0,  0.0, -4.0,  0.0},
-        {-1.0,  6.0, -1.0,  0.0,  0.0, -4.0},
-        {-1.0, -1.0,  6.0, -4.0,  0.0,  0.0},
-        { 0.0,  0.0, -4.0, 32.0, 16.0, 16.0},
-        {-4.0,  0.0,  0.0, 16.0, 32.0, 16.0},
-        { 0.0, -4.0,  0.0, 16.0, 16.0, 32.0},
-    };
-    const double c = A / 180.0;
-    for (int i = 0; i < 6; ++i)
-        for (int j = 0; j < 6; ++j) M(i, j) = c * S[i][j];
+    static constexpr double x[5] = {
+        0.0469100770306680, 0.2307653449471585, 0.5,
+        0.7692346550528415, 0.9530899229693320};
+    static constexpr double w[5] = {
+        0.1184634425280945, 0.2393143352496832, 0.2844444444444444,
+        0.2393143352496832, 0.1184634425280945};
+    for (int iu = 0; iu < 5; ++iu)
+        for (int iv = 0; iv < 5; ++iv) {
+            const double r = x[iu];
+            const double s = (1.0 - r) * x[iv];
+            const double L0 = 1.0 - r - s;
+            Eigen::Matrix<double, 6, 1> N;
+            N << L0 * (2.0 * L0 - 1.0), r * (2.0 * r - 1.0),
+                s * (2.0 * s - 1.0), 4.0 * L0 * r, 4.0 * r * s,
+                4.0 * s * L0;
+            Eigen::Matrix<double, 6, 1> dNr, dNs;
+            dNr << 1.0 - 4.0 * L0, 4.0 * r - 1.0, 0.0,
+                4.0 * (L0 - r), 4.0 * s, -4.0 * s;
+            dNs << 1.0 - 4.0 * L0, 0.0, 4.0 * s - 1.0,
+                -4.0 * r, 4.0 * r, 4.0 * (L0 - s);
+            Vec3 xr = Vec3::Zero(), xs = Vec3::Zero();
+            for (int i = 0; i < 6; ++i) {
+                xr += p[i] * dNr(i);
+                xs += p[i] * dNs(i);
+            }
+            const double jac = xr.cross(xs).norm();
+            if (!(jac > 0.0) || !std::isfinite(jac)) return false;
+            const double dS =
+                jac * (1.0 - r) * w[iu] * w[iv];
+            area += dS;
+            weights.noalias() += dS * N;
+            mass.noalias() += dS * (N * N.transpose());
+        }
+    return std::isfinite(area) && area > 0.0 && weights.allFinite() &&
+           mass.allFinite();
 }
 
 }  // namespace
@@ -173,10 +218,18 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
                                 const std::vector<double>& fixed_temps,
                                 const std::vector<ThermalFluxLoad>& fluxes,
                                 const std::vector<ThermalConvection>& convections,
-                                int nodes_per_elem) {
+                                int nodes_per_elem, const SimCancelToken& cancel_token) {
     ThermalResult res;
     const int n_nodes = static_cast<int>(points.size() / 3);
     res.n_nodes = n_nodes;
+    auto cancelled = [&]() {
+        return cancel_token && cancel_token->load(std::memory_order_relaxed);
+    };
+    auto cancel_result = [&]() {
+        res.error = "fea_thermal: cancelled";
+        return res;
+    };
+    if (cancelled()) return cancel_result();
     if (n_nodes == 0 || tets.empty()) { res.error = "fea_thermal: empty mesh"; return res; }
     if (points.size() % 3 != 0) {
         res.error = "fea_thermal: points length must be divisible by 3";
@@ -211,13 +264,91 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
     auto node_pt = [&](int nid) {
         return Vec3(points[nid * 3], points[nid * 3 + 1], points[nid * 3 + 2]);
     };
+    const auto face_owners = face_owner_counts(tets, stride);
+    for (const auto& fl : fluxes) {
+        if (!std::isfinite(fl.q) || (!fl.nodes.empty() && fl.q == 0.0)) {
+            res.error =
+                "fea_thermal: heat flux must be finite and non-zero when selected";
+            return res;
+        }
+        for (int nid : fl.nodes)
+            if (nid < 0 || nid >= n_nodes) {
+                res.error = "fea_thermal: flux node index out of range";
+                return res;
+            }
+        if (!fl.nodes.empty()) {
+            const std::unordered_set<int> ns(fl.nodes.begin(), fl.nodes.end());
+            if (selected_exterior_faces(tets, stride, face_owners, ns) == 0) {
+                res.error = "fea_thermal: flux selection contains no exterior mesh face";
+                return res;
+            }
+        }
+    }
+    for (const auto& cv : convections) {
+        if (!std::isfinite(cv.h) || cv.h <= 0.0 || !std::isfinite(cv.t_amb)) {
+            res.error = "fea_thermal: convection requires finite h>0 and ambient temperature";
+            return res;
+        }
+        for (int nid : cv.nodes)
+            if (nid < 0 || nid >= n_nodes) {
+                res.error = "fea_thermal: convection node index out of range";
+                return res;
+            }
+        if (cv.nodes.empty()) {
+            res.error = "fea_thermal: convection node set is empty";
+            return res;
+        }
+        const std::unordered_set<int> ns(cv.nodes.begin(), cv.nodes.end());
+        if (selected_exterior_faces(tets, stride, face_owners, ns) == 0) {
+            res.error = "fea_thermal: convection selection contains no exterior mesh face";
+            return res;
+        }
+    }
+    // Validate the complete domain even when every temperature DOF is prescribed; a
+    // fully-prescribed field must not turn a degenerate mesh into an apparent success.
+    const TetGauss4 preflight_gauss;
+    for (int e = 0; e < n_elems; ++e) {
+        if (tet10) {
+            std::array<Vec3, 10> ep;
+            for (int j = 0; j < 10; ++j) ep[j] = node_pt(tets[e * 10 + j]);
+            double sign = 0.0;
+            for (int g = 0; g < 4; ++g) {
+                Eigen::Matrix<double, 10, 3> grad;
+                double detJ = 0.0;
+                if (!tet10_grad_at(ep, preflight_gauss.pt[g][0],
+                                   preflight_gauss.pt[g][1],
+                                   preflight_gauss.pt[g][2], grad, detJ) ||
+                    !std::isfinite(detJ) || (sign != 0.0 && sign * detJ <= 0.0)) {
+                    res.error = "fea_thermal: degenerate or inverted element " +
+                                std::to_string(e);
+                    return res;
+                }
+                sign = detJ;
+            }
+        } else {
+            std::array<Vec3, 4> ep;
+            for (int j = 0; j < 4; ++j) ep[j] = node_pt(tets[e * 4 + j]);
+            Eigen::Matrix<double, 4, 3> grad;
+            double volume = 0.0;
+            if (!tet4_grad(ep, grad, volume)) {
+                res.error = "fea_thermal: degenerate element " + std::to_string(e);
+                return res;
+            }
+        }
+        if ((e & 255) == 0 && cancelled()) return cancel_result();
+    }
 
     // ── Singularity guard: a floating datum. A pure-Neumann problem (no Dirichlet node AND
     // no convection face) has no unique steady temperature — reject it up front. (The
     // advisor precheck lints this before dispatch; this is the belt-and-suspenders backstop.)
     bool has_convection = false;
-    for (const auto& cv : convections)
-        if (cv.h > 0.0 && !cv.nodes.empty()) { has_convection = true; break; }
+    for (const auto& cv : convections) {
+        const std::unordered_set<int> ns(cv.nodes.begin(), cv.nodes.end());
+        if (selected_exterior_faces(tets, stride, face_owners, ns) > 0) {
+            has_convection = true;
+            break;
+        }
+    }
     if (fixed_nodes.empty() && !has_convection) {
         res.error = "fea_thermal: no fixed-temperature node and no convection — singular "
                     "(temperature datum undefined). Add a fixed temperature or a convection BC.";
@@ -231,6 +362,10 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
         const int nid = fixed_nodes[i];
         if (nid < 0 || nid >= n_nodes) { res.error = "fea_thermal: fixed node out of range"; return res; }
         if (!std::isfinite(fixed_temps[i])) { res.error = "fea_thermal: fixed temperature not finite"; return res; }
+        if (is_fixed[nid] && pres_temp[nid] != fixed_temps[i]) {
+            res.error = "fea_thermal: conflicting temperatures prescribed at one node";
+            return res;
+        }
         is_fixed[nid] = 1;
         pres_temp[nid] = fixed_temps[i];
     }
@@ -284,7 +419,10 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
                 }
                 Ke += (dNxyz * dNxyz.transpose()) * (k_cond * std::abs(detJ) * gauss.w[g]);
             }
-            if (!ok_elem) continue;
+            if (!ok_elem) {
+                res.error = "fea_thermal: degenerate or inverted element " + std::to_string(e);
+                return res;
+            }
             for (int a = 0; a < 10; ++a)
                 for (int b = 0; b < 10; ++b) add_KK(tn[a], tn[b], Ke(a, b));
         }
@@ -295,7 +433,10 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
             for (int j = 0; j < 4; ++j) { tn[j] = tets[e * 4 + j]; ep[j] = node_pt(tn[j]); }
             Eigen::Matrix<double, 4, 3> dNxyz;
             double vol;
-            if (!tet4_grad(ep, dNxyz, vol)) continue;
+            if (!tet4_grad(ep, dNxyz, vol)) {
+                res.error = "fea_thermal: degenerate element " + std::to_string(e);
+                return res;
+            }
             // Constant gradients -> Ke = k * vol * (dN)(dN)^T.
             Eigen::Matrix<double, 4, 4> Ke = (dNxyz * dNxyz.transpose()) * (k_cond * vol);
             for (int a = 0; a < 4; ++a)
@@ -308,62 +449,73 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
     // all inside the target node set. We add:
     //   flux:        f_i += q · ∫N_i dS
     //   convection:  K_ij += h · ∫N_i N_j dS ; f_i += h·T_amb · ∫N_i dS
-    auto surface_pass = [&](const std::unordered_set<int>& node_set, bool do_flux, double q,
-                            bool do_conv, double h, double t_amb) {
+    auto surface_pass = [&](const std::unordered_set<int>& node_set, bool do_flux,
+                            double q, bool do_conv, double h, double t_amb) {
         for (int e = 0; e < n_elems; ++e) {
+            if ((e & 255) == 0 && cancelled()) return true;
             const int* el = &tets[e * stride];
             for (int fidx = 0; fidx < 4; ++fidx) {
+                const auto own =
+                    face_owners.find(tri_face_key(el, kTetFaces[fidx]));
+                if (own == face_owners.end() || own->second != 1) continue;
                 const FaceTab& ft = kTetFaces[fidx];
-                int cn[3];
+                int fn[6] = {el[ft.corner[0]], el[ft.corner[1]],
+                             el[ft.corner[2]], -1, -1, -1};
                 bool all_in = true;
-                for (int i = 0; i < 3; ++i) {
-                    cn[i] = el[ft.corner[i]];
-                    if (!node_set.count(cn[i])) { all_in = false; break; }
-                }
+                for (int i = 0; i < 3; ++i)
+                    if (!node_set.count(fn[i])) {
+                        all_in = false;
+                        break;
+                    }
                 if (!all_in) continue;
-                const double A = tri_area(node_pt(cn[0]), node_pt(cn[1]), node_pt(cn[2]));
-                if (A < 1e-12) continue;
-                // Local node ids on this face: corners then (tet10) mid-edge nodes.
-                int fn[6] = {cn[0], cn[1], cn[2], -1, -1, -1};
-                if (tet10) for (int i = 0; i < 3; ++i) fn[3 + i] = el[ft.mid[i]];
+                if (tet10)
+                    for (int i = 0; i < 3; ++i) fn[3 + i] = el[ft.mid[i]];
                 const int nfn = tet10 ? 6 : 3;
-                double wc[3], wm[3];
-                tri_load_weights(tet10, A, wc, wm);
-                const double w[6] = {wc[0], wc[1], wc[2], wm[0], wm[1], wm[2]};
+                std::array<Vec3, 6> fp{};
+                for (int i = 0; i < nfn; ++i) fp[i] = node_pt(fn[i]);
+                Eigen::Matrix<double, 6, 1> weights;
+                Eigen::Matrix<double, 6, 6> surface_mass;
+                double area = 0.0;
+                if (!tri_surface_terms(fp, tet10, weights, surface_mass, area))
+                    return false;
                 if (do_flux)
                     for (int i = 0; i < nfn; ++i) {
                         const int ri = reduced[fn[i]];
-                        if (ri >= 0) f(ri) += q * w[i];
+                        if (ri >= 0) f(ri) += q * weights(i);
                     }
-                if (do_conv) {
-                    Eigen::Matrix<double, 6, 6> Ms;
-                    tri_surface_mass(tet10, A, Ms);
+                if (do_conv)
                     for (int i = 0; i < nfn; ++i) {
-                        // convection load h·T_amb·∫N_i dS
                         const int ri = reduced[fn[i]];
-                        if (ri >= 0) f(ri) += h * t_amb * w[i];
-                        // convection matrix h·∫N_i N_j dS
-                        for (int j = 0; j < nfn; ++j) add_KK(fn[i], fn[j], h * Ms(i, j));
+                        if (ri >= 0) f(ri) += h * t_amb * weights(i);
+                        for (int j = 0; j < nfn; ++j)
+                            add_KK(fn[i], fn[j], h * surface_mass(i, j));
                     }
-                }
             }
         }
+        return true;
     };
 
     // Each flux load contributes its OWN surface pass with its OWN magnitude — superposition
     // over independent sources (the previous single-set/single-q form overwrote q when a
     // study carried more than one flux load; see the C3 defect note in the header).
     for (const auto& fl : fluxes) {
-        if (fl.nodes.empty() || !std::isfinite(fl.q) || fl.q == 0.0) continue;
+        if (fl.nodes.empty() || fl.q == 0.0) continue;
         std::unordered_set<int> fs(fl.nodes.begin(), fl.nodes.end());
-        surface_pass(fs, /*do_flux*/ true, fl.q, /*do_conv*/ false, 0.0, 0.0);
+        if (!surface_pass(fs, /*do_flux*/ true, fl.q, /*do_conv*/ false,
+                          0.0, 0.0)) {
+            res.error = "fea_thermal: invalid exterior surface element";
+            return res;
+        }
     }
     for (const auto& cv : convections) {
-        if (cv.h <= 0.0 || cv.nodes.empty() || !std::isfinite(cv.h) || !std::isfinite(cv.t_amb))
-            continue;
         std::unordered_set<int> cs(cv.nodes.begin(), cv.nodes.end());
-        surface_pass(cs, /*do_flux*/ false, 0.0, /*do_conv*/ true, cv.h, cv.t_amb);
+        if (!surface_pass(cs, /*do_flux*/ false, 0.0, /*do_conv*/ true,
+                          cv.h, cv.t_amb)) {
+            res.error = "fea_thermal: invalid exterior surface element";
+            return res;
+        }
     }
+    if (cancelled()) return cancel_result();
 
     // ── Assemble + solve the reduced SPD system Kff * Tf = f ─────────────────────────────
     Eigen::SparseMatrix<double> Kff(n_free, n_free);
@@ -412,6 +564,7 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
         Tf = lu.solve(f);
         if (lu.info() != Eigen::Success) { res.error = "fea_thermal: sparse solve failed"; return res; }
     }
+    if (cancelled()) return cancel_result();
 
     // Scatter back to the full field (fixed nodes carry their prescribed temperature).
     res.temperature.assign(n_nodes, 0.0);
@@ -430,8 +583,8 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
 }
 
 // Legacy single-flux entry point: one node set, one magnitude. Delegates to the per-load
-// overload with exactly one ThermalFluxLoad, so results are bit-for-bit identical to the
-// historical behaviour (same surface pass, same guards).
+// overload with exactly one ThermalFluxLoad, so both public signatures share one validated
+// implementation and produce identical results.
 ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::vector<int>& tets,
                                 double k_cond, const std::vector<int>& fixed_nodes,
                                 const std::vector<double>& fixed_temps,
@@ -451,78 +604,70 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
 
 // ═════════════════════════════ Transient (T-FIN18) ═══════════════════════════════════════
 //
-// NOTE ON DUPLICATION: the conductivity/surface assembly below intentionally repeats the
-// steady solver's loops instead of refactoring them into a shared helper. The steady path
-// is under a HARD bit-for-bit regression gate; keeping fea_thermal_solve() byte-identical
-// (same triplet emission order, same summation order) is worth ~100 duplicated lines.
+// Conductivity and surface assembly intentionally mirror the steady solver so the same
+// element and exterior-face rules apply to both paths.
 
 namespace {
 
-// Element capacitance matrices (constant-Jacobian straight tets; mid-edge nodes at edge
-// midpoints — what both the box promoter and the mesher produce; curved boundary tet10s
-// see a small, mesh-converging approximation).
-//
-// tet4 consistent: C = rho_cp·V/20 · (1+δij). Row-sum lumped: rho_cp·V/4 per node.
-//
-// tet10: shape functions are quadratics in the volume coordinates L0..L3, so every entry
-// ∫ N_i N_j dV is an exact volume-coordinate moment  ∫ L0^a L1^b L2^c L3^d dV =
-// 6V·a!b!c!d!/(a+b+c+d+3)!  — evaluated below by expanding each N as monomial terms
-// (corner: 2L² − L; mid(a,b): 4·La·Lb). No quadrature, no tabulated magic matrix.
-//
-// tet10 LUMPED uses HRZ (diagonal scaling): row-sum lumping fails for tet10 because
-// ∫N_corner dV = −V/20 < 0. HRZ: lump_i = diag_i · V/Σdiag. With diag_corner = ∫N_c² = V/70
-// and diag_mid = ∫N_m² = 8V/105, Σdiag = 18V/35, so lump_corner = V/36, lump_mid = 4V/27
-// (checks: 4·V/36 + 6·4V/27 = V).
-struct Tet10Term {
-    double coef;
-    int e[4];  // exponents of L0..L3
-};
-
-std::vector<Tet10Term> tet10_shape_terms(int n) {
-    if (n < 4) {
-        Tet10Term a{2.0, {0, 0, 0, 0}}, b{-1.0, {0, 0, 0, 0}};
-        a.e[n] = 2;
-        b.e[n] = 1;
-        return {a, b};
-    }
-    static const int LE[6][2] = {{0, 1}, {1, 2}, {2, 0}, {3, 0}, {3, 2}, {3, 1}};
-    Tet10Term m{4.0, {0, 0, 0, 0}};
-    m.e[LE[n - 4][0]] += 1;
-    m.e[LE[n - 4][1]] += 1;
-    return {m};
-}
-
-// ∫ L0^a L1^b L2^c L3^d dV over a straight tet of volume V.
-double tet_moment(int a, int b, int c, int d, double V) {
-    auto fact = [](int n) {
-        double f = 1.0;
-        for (int i = 2; i <= n; ++i) f *= i;
-        return f;
-    };
-    return 6.0 * V * fact(a) * fact(b) * fact(c) * fact(d) / fact(a + b + c + d + 3);
-}
-
-// Consistent tet10 capacitance/V template  T_ij = (1/V) ∫ N_i N_j dV, computed once.
-const Eigen::Matrix<double, 10, 10>& tet10_mass_template() {
-    static const Eigen::Matrix<double, 10, 10> T = [] {
-        Eigen::Matrix<double, 10, 10> M;
-        for (int i = 0; i < 10; ++i) {
-            const auto ti = tet10_shape_terms(i);
-            for (int j = i; j < 10; ++j) {
-                const auto tj = tet10_shape_terms(j);
-                double v = 0.0;
-                for (const auto& a : ti)
-                    for (const auto& b : tj)
-                        v += a.coef * b.coef *
-                             tet_moment(a.e[0] + b.e[0], a.e[1] + b.e[1], a.e[2] + b.e[2],
-                                        a.e[3] + b.e[3], 1.0);
-                M(i, j) = v;
-                M(j, i) = v;
+// Curved tet10 capacitance. det(J) is cubic for a quadratic isoparametric map, so
+// N_i*N_j*det(J) has degree at most seven. The 5x5x5 Gauss-Legendre Duffy rule integrates
+// that polynomial exactly while also checking the Jacobian throughout the element.
+// For lumped capacitance, HRZ scales the positive consistent diagonal to the integrated
+// physical volume; unlike row-sum lumping it cannot create negative corner masses.
+bool tet10_capacitance(const std::array<Vec3, 10>& ep, double rho_cp, bool lumped,
+                       Eigen::Matrix<double, 10, 10>& C) {
+    static constexpr double x[5] = {
+        0.0469100770306680, 0.2307653449471585, 0.5,
+        0.7692346550528415, 0.9530899229693320};
+    static constexpr double w[5] = {
+        0.1184634425280945, 0.2393143352496832, 0.2844444444444444,
+        0.2393143352496832, 0.1184634425280945};
+    C.setZero();
+    double volume = 0.0;
+    double jacobian_sign = 0.0;
+    for (int iu = 0; iu < 5; ++iu)
+        for (int iv = 0; iv < 5; ++iv)
+            for (int iw = 0; iw < 5; ++iw) {
+                const double u = x[iu], v = x[iv], q = x[iw];
+                const double r = u;
+                const double s = (1.0 - u) * v;
+                const double t = (1.0 - u) * (1.0 - v) * q;
+                const double L[4] = {1.0 - r - s - t, r, s, t};
+                Eigen::Matrix<double, 10, 1> N;
+                for (int i = 0; i < 4; ++i)
+                    N(i) = L[i] * (2.0 * L[i] - 1.0);
+                N(4) = 4.0 * L[0] * L[1];
+                N(5) = 4.0 * L[1] * L[2];
+                N(6) = 4.0 * L[2] * L[0];
+                N(7) = 4.0 * L[3] * L[0];
+                N(8) = 4.0 * L[3] * L[2];
+                N(9) = 4.0 * L[3] * L[1];
+                const Eigen::Matrix<double, 10, 3> dNrst = tet10_dN(r, s, t);
+                Eigen::Matrix3d J = Eigen::Matrix3d::Zero();
+                for (int n = 0; n < 10; ++n) J += ep[n] * dNrst.row(n);
+                const double detJ = J.determinant();
+                if (!std::isfinite(detJ) || !(std::abs(detJ) > 0.0) ||
+                    (jacobian_sign != 0.0 && jacobian_sign * detJ <= 0.0))
+                    return false;
+                jacobian_sign = detJ;
+                const double dV =
+                    std::abs(detJ) * (1.0 - u) * (1.0 - u) * (1.0 - v) *
+                    w[iu] * w[iv] * w[iw];
+                volume += dV;
+                C.noalias() += (rho_cp * dV) * (N * N.transpose());
             }
-        }
-        return M;
-    }();
-    return T;
+    if (!(volume > 0.0) || !std::isfinite(volume) || !C.allFinite())
+        return false;
+    if (lumped) {
+        const double diagonal_sum = C.diagonal().sum();
+        if (!(diagonal_sum > 0.0) || !std::isfinite(diagonal_sum))
+            return false;
+        const Eigen::Matrix<double, 10, 1> diagonal = C.diagonal();
+        C.setZero();
+        for (int i = 0; i < 10; ++i)
+            C(i, i) = rho_cp * volume * diagonal(i) / diagonal_sum;
+    }
+    return C.allFinite();
 }
 
 }  // namespace
@@ -542,16 +687,27 @@ double thermal_schedule_scale(const ThermalSchedule& sched, double t) {
     }
     return s;
 }
-
 ThermalTransientResult fea_thermal_transient(
     const std::vector<double>& points, const std::vector<int>& tets, double k_cond,
     const std::vector<int>& fixed_nodes, const std::vector<double>& fixed_temps,
-    const std::vector<ThermalFluxLoad>& fluxes, const std::vector<ThermalConvection>& convections,
-    const ThermalTransientOptions& opts, int nodes_per_elem) {
+    const std::vector<ThermalFluxLoad>& fluxes,
+    const std::vector<ThermalConvection>& convections, const ThermalTransientOptions& opts,
+    int nodes_per_elem, const SimCancelToken& cancel_token) {
     ThermalTransientResult res;
     const int n_nodes = static_cast<int>(points.size() / 3);
     res.n_nodes = n_nodes;
-    if (n_nodes == 0 || tets.empty()) { res.error = "fea_thermal_transient: empty mesh"; return res; }
+    auto cancelled = [&]() {
+        return cancel_token && cancel_token->load(std::memory_order_relaxed);
+    };
+    auto cancel_result = [&]() {
+        res.error = "fea_thermal_transient: cancelled";
+        return res;
+    };
+    if (cancelled()) return cancel_result();
+    if (n_nodes == 0 || tets.empty()) {
+        res.error = "fea_thermal_transient: empty mesh";
+        return res;
+    }
     if (points.size() % 3 != 0) {
         res.error = "fea_thermal_transient: points length must be divisible by 3";
         return res;
@@ -576,15 +732,32 @@ ThermalTransientResult fea_thermal_transient(
         res.error = "fea_thermal_transient: time step dt must be > 0";
         return res;
     }
-    if (!std::isfinite(opts.t_end) || opts.t_end < opts.dt) {
-        res.error = "fea_thermal_transient: t_end must be >= dt";
+    if (!std::isfinite(opts.t_end) || opts.t_end <= 0.0) {
+        res.error = "fea_thermal_transient: t_end must be finite and > 0";
         return res;
     }
-    const long long n_steps_ll = static_cast<long long>(std::ceil(opts.t_end / opts.dt - 1e-9));
-    if (n_steps_ll > 1000000) {
-        res.error = "fea_thermal_transient: t_end/dt exceeds 1e6 steps — coarsen dt";
+    if (!std::isfinite(opts.t_init)) {
+        res.error = "fea_thermal_transient: initial temperature must be finite";
         return res;
     }
+    const double step_ratio = opts.t_end / opts.dt;
+    if (!std::isfinite(step_ratio)) {
+        res.error = "fea_thermal_transient: step count must be finite and in [1,1e6]";
+        return res;
+    }
+    const double nearest_steps = std::round(step_ratio);
+    const double step_tol =
+        16.0 * std::numeric_limits<double>::epsilon() *
+        std::max(1.0, std::abs(step_ratio));
+    const double n_steps_d =
+        std::abs(step_ratio - nearest_steps) <= step_tol
+            ? nearest_steps
+            : std::ceil(step_ratio);
+    if (!std::isfinite(n_steps_d) || n_steps_d < 1.0 || n_steps_d > 1000000.0) {
+        res.error = "fea_thermal_transient: step count must be finite and in [1,1e6]";
+        return res;
+    }
+    const long long n_steps_ll = static_cast<long long>(n_steps_d);
     if (fixed_nodes.size() != fixed_temps.size()) {
         res.error = "fea_thermal_transient: fixed_nodes and fixed_temps length mismatch";
         return res;
@@ -594,41 +767,121 @@ ThermalTransientResult fea_thermal_transient(
         return res;
     }
     for (double x : points)
-        if (!std::isfinite(x)) { res.error = "fea_thermal_transient: mesh coordinates must be finite"; return res; }
+        if (!std::isfinite(x)) {
+            res.error = "fea_thermal_transient: mesh coordinates must be finite";
+            return res;
+        }
     for (int nid : tets)
-        if (nid < 0 || nid >= n_nodes) { res.error = "fea_thermal_transient: tet node index out of range"; return res; }
+        if (nid < 0 || nid >= n_nodes) {
+            res.error = "fea_thermal_transient: element node index out of range";
+            return res;
+        }
+    for (double v : opts.init_temps)
+        if (!std::isfinite(v)) {
+            res.error = "fea_thermal_transient: init_temps must be finite";
+            return res;
+        }
+    for (double v : opts.frame_times)
+        if (!std::isfinite(v) || v < 0.0 || v > opts.t_end) {
+            res.error =
+                "fea_thermal_transient: frame times must be finite and within [0,t_end]";
+            return res;
+        }
     for (const auto& fl : fluxes) {
+        if (!std::isfinite(fl.q) || (!fl.nodes.empty() && fl.q == 0.0)) {
+            res.error =
+                "fea_thermal_transient: heat flux must be finite and non-zero "
+                "when selected";
+            return res;
+        }
+        for (int nid : fl.nodes)
+            if (nid < 0 || nid >= n_nodes) {
+                res.error = "fea_thermal_transient: flux node index out of range";
+                return res;
+            }
         if (fl.schedule.times.size() != fl.schedule.scales.size()) {
             res.error = "fea_thermal_transient: schedule times/scales length mismatch";
             return res;
         }
-        for (size_t i = 1; i < fl.schedule.times.size(); ++i)
-            if (!(fl.schedule.times[i] > fl.schedule.times[i - 1])) {
-                res.error = "fea_thermal_transient: schedule times must be strictly ascending";
+        for (size_t i = 0; i < fl.schedule.times.size(); ++i) {
+            if (!std::isfinite(fl.schedule.times[i]) || fl.schedule.times[i] < 0.0 ||
+                (i > 0 && !(fl.schedule.times[i] > fl.schedule.times[i - 1]))) {
+                res.error =
+                    "fea_thermal_transient: schedule times must be finite, non-negative and "
+                    "strictly ascending";
                 return res;
             }
+            if (!std::isfinite(fl.schedule.scales[i])) {
+                res.error = "fea_thermal_transient: schedule scales must be finite";
+                return res;
+            }
+        }
         if (!fl.schedule.times.empty() && fl.schedule.times.front() != 0.0) {
             res.error = "fea_thermal_transient: schedule times must start at 0";
             return res;
         }
+        if (!std::isfinite(fl.schedule.period) || fl.schedule.period < 0.0 ||
+            (fl.schedule.period > 0.0 && !fl.schedule.times.empty() &&
+             fl.schedule.times.back() >= fl.schedule.period)) {
+            res.error =
+                "fea_thermal_transient: schedule period must be finite, non-negative and "
+                "greater than the final breakpoint";
+            return res;
+        }
+    }
+    for (const auto& cv : convections) {
+        if (!std::isfinite(cv.h) || cv.h <= 0.0 || !std::isfinite(cv.t_amb) ||
+            cv.nodes.empty()) {
+            res.error =
+                "fea_thermal_transient: convection requires nodes, finite h>0 and ambient";
+            return res;
+        }
+        for (int nid : cv.nodes)
+            if (nid < 0 || nid >= n_nodes) {
+                res.error = "fea_thermal_transient: convection node index out of range";
+                return res;
+            }
     }
 
-    const bool tet10 = (nodes_per_elem == 10);
+    const bool tet10 = nodes_per_elem == 10;
     const int stride = nodes_per_elem;
-    const int n_elems = static_cast<int>(tets.size() / stride);
+    const int n_elems = static_cast<int>(tets.size() / static_cast<size_t>(stride));
     res.n_elems = n_elems;
-
     auto node_pt = [&](int nid) {
         return Vec3(points[nid * 3], points[nid * 3 + 1], points[nid * 3 + 2]);
     };
+    const auto face_owners = face_owner_counts(tets, stride);
+    for (const auto& fl : fluxes) {
+        if (fl.nodes.empty()) continue;
+        const std::unordered_set<int> ns(fl.nodes.begin(), fl.nodes.end());
+        if (selected_exterior_faces(tets, stride, face_owners, ns) == 0) {
+            res.error =
+                "fea_thermal_transient: flux selection contains no exterior mesh face";
+            return res;
+        }
+    }
+    for (const auto& cv : convections) {
+        const std::unordered_set<int> ns(cv.nodes.begin(), cv.nodes.end());
+        if (selected_exterior_faces(tets, stride, face_owners, ns) == 0) {
+            res.error =
+                "fea_thermal_transient: convection selection contains no exterior mesh face";
+            return res;
+        }
+    }
 
-    // Dirichlet map + free-DOF numbering (constant-in-time prescribed temperatures).
     std::vector<char> is_fixed(n_nodes, 0);
     std::vector<double> pres_temp(n_nodes, 0.0);
     for (size_t i = 0; i < fixed_nodes.size(); ++i) {
         const int nid = fixed_nodes[i];
-        if (nid < 0 || nid >= n_nodes) { res.error = "fea_thermal_transient: fixed node out of range"; return res; }
-        if (!std::isfinite(fixed_temps[i])) { res.error = "fea_thermal_transient: fixed temperature not finite"; return res; }
+        if (nid < 0 || nid >= n_nodes || !std::isfinite(fixed_temps[i])) {
+            res.error = "fea_thermal_transient: invalid fixed temperature node/value";
+            return res;
+        }
+        if (is_fixed[nid] && pres_temp[nid] != fixed_temps[i]) {
+            res.error =
+                "fea_thermal_transient: conflicting temperatures prescribed at one node";
+            return res;
+        }
         is_fixed[nid] = 1;
         pres_temp[nid] = fixed_temps[i];
     }
@@ -638,111 +891,142 @@ ThermalTransientResult fea_thermal_transient(
         if (!is_fixed[i]) reduced[i] = n_free++;
     res.n_dof = n_free;
 
-    // ── Assembly: Kff + constant base load (Dirichlet move + convection), capacitance C,
-    // and one load vector PER scheduled flux (so only scale factors change per step).
     std::vector<Eigen::Triplet<double>> ktrips;
-    std::vector<Eigen::Triplet<double>> ctrips;                 // consistent C only
-    Eigen::VectorXd c_lump = Eigen::VectorXd::Zero(n_free);     // lumped C diagonal
+    std::vector<Eigen::Triplet<double>> ctrips;
+    Eigen::VectorXd c_lump = Eigen::VectorXd::Zero(n_free);
     Eigen::VectorXd f_base = Eigen::VectorXd::Zero(n_free);
     const TetGauss4 gauss;
-
     auto add_K = [&](int a_node, int b_node, double kab) {
         const int ra = reduced[a_node];
         if (ra < 0) return;
         const int rb = reduced[b_node];
-        if (rb >= 0) ktrips.emplace_back(ra, rb, kab);
-        else f_base(ra) -= kab * pres_temp[b_node];
+        if (rb >= 0)
+            ktrips.emplace_back(ra, rb, kab);
+        else
+            f_base(ra) -= kab * pres_temp[b_node];
     };
-    // Capacitance couplings to fixed nodes vanish (C multiplies dT/dt and prescribed
-    // temperatures are constant), so only the free-free block is kept.
     auto add_C = [&](int a_node, int b_node, double cab) {
-        const int ra = reduced[a_node];
-        const int rb = reduced[b_node];
+        const int ra = reduced[a_node], rb = reduced[b_node];
         if (ra < 0 || rb < 0) return;
-        if (opts.lumped) { if (ra == rb) c_lump(ra) += cab; }
-        else ctrips.emplace_back(ra, rb, cab);
+        if (opts.lumped) {
+            if (ra == rb) c_lump(ra) += cab;
+        } else {
+            ctrips.emplace_back(ra, rb, cab);
+        }
     };
 
     if (tet10) {
-        const auto& Tm = tet10_mass_template();
         for (int e = 0; e < n_elems; ++e) {
             std::array<Vec3, 10> ep;
             std::array<int, 10> tn;
-            for (int j = 0; j < 10; ++j) { tn[j] = tets[e * 10 + j]; ep[j] = node_pt(tn[j]); }
-            Eigen::Matrix<double, 10, 10> Ke = Eigen::Matrix<double, 10, 10>::Zero();
-            bool ok_elem = true;
-            double vol6 = 0.0;  // Σ|detJ|·w over the rule = element volume
+            for (int j = 0; j < 10; ++j) {
+                tn[j] = tets[e * 10 + j];
+                ep[j] = node_pt(tn[j]);
+            }
+            Eigen::Matrix<double, 10, 10> Ke =
+                Eigen::Matrix<double, 10, 10>::Zero();
+            double sign = 0.0;
             for (int g = 0; g < 4; ++g) {
                 Eigen::Matrix<double, 10, 3> dNxyz;
-                double detJ;
-                if (!tet10_grad_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], dNxyz, detJ)) {
-                    ok_elem = false;
-                    break;
+                double detJ = 0.0;
+                if (!tet10_grad_at(ep, gauss.pt[g][0], gauss.pt[g][1],
+                                   gauss.pt[g][2], dNxyz, detJ) ||
+                    !std::isfinite(detJ) || (sign != 0.0 && sign * detJ <= 0.0)) {
+                    res.error =
+                        "fea_thermal_transient: degenerate or inverted element " +
+                        std::to_string(e);
+                    return res;
                 }
-                Ke += (dNxyz * dNxyz.transpose()) * (k_cond * std::abs(detJ) * gauss.w[g]);
-                vol6 += std::abs(detJ) * gauss.w[g];
+                sign = detJ;
+                Ke += (dNxyz * dNxyz.transpose()) *
+                      (k_cond * std::abs(detJ) * gauss.w[g]);
             }
-            if (!ok_elem) continue;
-            const double V = vol6;
+            if (!Ke.allFinite()) {
+                res.error = "fea_thermal_transient: invalid element " + std::to_string(e);
+                return res;
+            }
             for (int a = 0; a < 10; ++a)
                 for (int b = 0; b < 10; ++b) add_K(tn[a], tn[b], Ke(a, b));
-            if (opts.lumped) {
-                // HRZ diagonal (derivation in the comment above): corners V/36, mids 4V/27.
-                for (int a = 0; a < 10; ++a)
-                    add_C(tn[a], tn[a], opts.rho_cp * V * (a < 4 ? 1.0 / 36.0 : 4.0 / 27.0));
-            } else {
-                for (int a = 0; a < 10; ++a)
-                    for (int b = 0; b < 10; ++b) add_C(tn[a], tn[b], opts.rho_cp * V * Tm(a, b));
+            Eigen::Matrix<double, 10, 10> Ce;
+            if (!tet10_capacitance(ep, opts.rho_cp, opts.lumped, Ce)) {
+                res.error =
+                    "fea_thermal_transient: degenerate or inverted element " +
+                    std::to_string(e);
+                return res;
             }
+            for (int a = 0; a < 10; ++a)
+                for (int b = 0; b < 10; ++b)
+                    add_C(tn[a], tn[b], Ce(a, b));
+            if ((e & 255) == 0 && cancelled()) return cancel_result();
         }
     } else {
         for (int e = 0; e < n_elems; ++e) {
             std::array<Vec3, 4> ep;
             std::array<int, 4> tn;
-            for (int j = 0; j < 4; ++j) { tn[j] = tets[e * 4 + j]; ep[j] = node_pt(tn[j]); }
+            for (int j = 0; j < 4; ++j) {
+                tn[j] = tets[e * 4 + j];
+                ep[j] = node_pt(tn[j]);
+            }
             Eigen::Matrix<double, 4, 3> dNxyz;
-            double vol;
-            if (!tet4_grad(ep, dNxyz, vol)) continue;
-            Eigen::Matrix<double, 4, 4> Ke = (dNxyz * dNxyz.transpose()) * (k_cond * vol);
+            double volume = 0.0;
+            if (!tet4_grad(ep, dNxyz, volume)) {
+                res.error =
+                    "fea_thermal_transient: degenerate element " + std::to_string(e);
+                return res;
+            }
+            const Eigen::Matrix<double, 4, 4> Ke =
+                (dNxyz * dNxyz.transpose()) * (k_cond * volume);
             for (int a = 0; a < 4; ++a)
                 for (int b = 0; b < 4; ++b) add_K(tn[a], tn[b], Ke(a, b));
             if (opts.lumped) {
-                for (int a = 0; a < 4; ++a) add_C(tn[a], tn[a], opts.rho_cp * vol / 4.0);
+                for (int a = 0; a < 4; ++a)
+                    add_C(tn[a], tn[a], opts.rho_cp * volume / 4.0);
             } else {
                 for (int a = 0; a < 4; ++a)
                     for (int b = 0; b < 4; ++b)
-                        add_C(tn[a], tn[b], opts.rho_cp * vol / 20.0 * (a == b ? 2.0 : 1.0));
+                        add_C(tn[a], tn[b],
+                              opts.rho_cp * volume / 20.0 *
+                                  (a == b ? 2.0 : 1.0));
             }
+            if ((e & 255) == 0 && cancelled()) return cancel_result();
         }
     }
 
-    // Surface terms. Convection is time-constant here (matrix into K, load into f_base);
-    // each flux load gets its OWN consistent load vector for per-step scaling.
+    auto selected_face = [&](const int* el, int fidx,
+                             const std::unordered_set<int>& nodes) {
+        const FaceTab& ft = kTetFaces[fidx];
+        const auto own = face_owners.find(tri_face_key(el, ft));
+        if (own == face_owners.end() || own->second != 1) return false;
+        for (int i = 0; i < 3; ++i)
+            if (!nodes.count(el[ft.corner[i]])) return false;
+        return true;
+    };
+    bool surface_valid = true;
     auto surface_flux_vec = [&](const std::vector<int>& nodes, double q) {
         Eigen::VectorXd fv = Eigen::VectorXd::Zero(n_free);
-        std::unordered_set<int> node_set(nodes.begin(), nodes.end());
-        for (int e = 0; e < n_elems; ++e) {
-            const int* el = &tets[e * stride];
+        const std::unordered_set<int> node_set(nodes.begin(), nodes.end());
+        for (int e = 0; e < n_elems && surface_valid; ++e) {
+            const int* el = &tets[static_cast<size_t>(e) * stride];
             for (int fidx = 0; fidx < 4; ++fidx) {
+                if (!selected_face(el, fidx, node_set)) continue;
                 const FaceTab& ft = kTetFaces[fidx];
-                int cn[3];
-                bool all_in = true;
-                for (int i = 0; i < 3; ++i) {
-                    cn[i] = el[ft.corner[i]];
-                    if (!node_set.count(cn[i])) { all_in = false; break; }
-                }
-                if (!all_in) continue;
-                const double A = tri_area(node_pt(cn[0]), node_pt(cn[1]), node_pt(cn[2]));
-                if (A < 1e-12) continue;
-                int fn[6] = {cn[0], cn[1], cn[2], -1, -1, -1};
-                if (tet10) for (int i = 0; i < 3; ++i) fn[3 + i] = el[ft.mid[i]];
+                int fn[6] = {el[ft.corner[0]], el[ft.corner[1]],
+                             el[ft.corner[2]], -1, -1, -1};
+                if (tet10)
+                    for (int i = 0; i < 3; ++i) fn[3 + i] = el[ft.mid[i]];
                 const int nfn = tet10 ? 6 : 3;
-                double wc[3], wm[3];
-                tri_load_weights(tet10, A, wc, wm);
-                const double w[6] = {wc[0], wc[1], wc[2], wm[0], wm[1], wm[2]};
+                std::array<Vec3, 6> fp{};
+                for (int i = 0; i < nfn; ++i) fp[i] = node_pt(fn[i]);
+                Eigen::Matrix<double, 6, 1> weights;
+                Eigen::Matrix<double, 6, 6> surface_mass;
+                double area = 0.0;
+                if (!tri_surface_terms(fp, tet10, weights, surface_mass, area)) {
+                    surface_valid = false;
+                    break;
+                }
                 for (int i = 0; i < nfn; ++i) {
                     const int ri = reduced[fn[i]];
-                    if (ri >= 0) fv(ri) += q * w[i];
+                    if (ri >= 0) fv(ri) += q * weights(i);
                 }
             }
         }
@@ -750,97 +1034,93 @@ ThermalTransientResult fea_thermal_transient(
     };
 
     for (const auto& cv : convections) {
-        if (cv.h <= 0.0 || cv.nodes.empty() || !std::isfinite(cv.h) || !std::isfinite(cv.t_amb))
-            continue;
-        std::unordered_set<int> cs(cv.nodes.begin(), cv.nodes.end());
+        const std::unordered_set<int> nodes(cv.nodes.begin(), cv.nodes.end());
         for (int e = 0; e < n_elems; ++e) {
-            const int* el = &tets[e * stride];
+            const int* el = &tets[static_cast<size_t>(e) * stride];
             for (int fidx = 0; fidx < 4; ++fidx) {
+                if (!selected_face(el, fidx, nodes)) continue;
                 const FaceTab& ft = kTetFaces[fidx];
-                int cn[3];
-                bool all_in = true;
-                for (int i = 0; i < 3; ++i) {
-                    cn[i] = el[ft.corner[i]];
-                    if (!cs.count(cn[i])) { all_in = false; break; }
-                }
-                if (!all_in) continue;
-                const double A = tri_area(node_pt(cn[0]), node_pt(cn[1]), node_pt(cn[2]));
-                if (A < 1e-12) continue;
-                int fn[6] = {cn[0], cn[1], cn[2], -1, -1, -1};
-                if (tet10) for (int i = 0; i < 3; ++i) fn[3 + i] = el[ft.mid[i]];
+                int fn[6] = {el[ft.corner[0]], el[ft.corner[1]],
+                             el[ft.corner[2]], -1, -1, -1};
+                if (tet10)
+                    for (int i = 0; i < 3; ++i) fn[3 + i] = el[ft.mid[i]];
                 const int nfn = tet10 ? 6 : 3;
-                double wc[3], wm[3];
-                tri_load_weights(tet10, A, wc, wm);
-                const double w[6] = {wc[0], wc[1], wc[2], wm[0], wm[1], wm[2]};
-                Eigen::Matrix<double, 6, 6> Ms;
-                tri_surface_mass(tet10, A, Ms);
+                std::array<Vec3, 6> fp{};
+                for (int i = 0; i < nfn; ++i) fp[i] = node_pt(fn[i]);
+                Eigen::Matrix<double, 6, 1> weights;
+                Eigen::Matrix<double, 6, 6> surface_mass;
+                double area = 0.0;
+                if (!tri_surface_terms(fp, tet10, weights, surface_mass, area)) {
+                    res.error =
+                        "fea_thermal_transient: invalid exterior surface element";
+                    return res;
+                }
                 for (int i = 0; i < nfn; ++i) {
                     const int ri = reduced[fn[i]];
-                    if (ri >= 0) f_base(ri) += cv.h * cv.t_amb * w[i];
-                    for (int j = 0; j < nfn; ++j) add_K(fn[i], fn[j], cv.h * Ms(i, j));
+                    if (ri >= 0)
+                        f_base(ri) += cv.h * cv.t_amb * weights(i);
+                    for (int j = 0; j < nfn; ++j)
+                        add_K(fn[i], fn[j], cv.h * surface_mass(i, j));
                 }
             }
         }
     }
-
     std::vector<Eigen::VectorXd> flux_vecs;
     flux_vecs.reserve(fluxes.size());
     for (const auto& fl : fluxes) {
-        if (fl.nodes.empty() || !std::isfinite(fl.q) || fl.q == 0.0)
+        if (fl.nodes.empty() || fl.q == 0.0)
             flux_vecs.emplace_back(Eigen::VectorXd::Zero(n_free));
         else
             flux_vecs.push_back(surface_flux_vec(fl.nodes, fl.q));
     }
+    if (!surface_valid) {
+        res.error = "fea_thermal_transient: invalid exterior surface element";
+        return res;
+    }
+    if (cancelled()) return cancel_result();
 
-    // ── Initial field ─────────────────────────────────────────────────────────────────────
     std::vector<double> T_full(n_nodes, opts.t_init);
     if (!opts.init_temps.empty()) T_full = opts.init_temps;
     for (int i = 0; i < n_nodes; ++i)
         if (is_fixed[i]) T_full[i] = pres_temp[i];
-
     res.envelope_max = T_full;
     double gmax = T_full[0], gmin = T_full[0], gmax_t = 0.0;
-    for (double v : T_full) { gmax = std::max(gmax, v); gmin = std::min(gmin, v); }
-
-    // Requested frame times, sorted; t=0 records the initial field.
+    for (double v : T_full) {
+        gmax = std::max(gmax, v);
+        gmin = std::min(gmin, v);
+    }
     std::vector<double> want = opts.frame_times;
     std::sort(want.begin(), want.end());
     size_t want_i = 0;
-    while (want_i < want.size() && want[want_i] <= 0.0) {
+    if (!want.empty() && want.front() == 0.0) {
         res.frames.push_back({0.0, T_full});
-        // collapse duplicate <=0 requests into one initial frame
-        while (want_i < want.size() && want[want_i] <= 0.0) ++want_i;
+        while (want_i < want.size() && want[want_i] == 0.0) ++want_i;
     }
-
     const int n_steps = static_cast<int>(n_steps_ll);
     res.n_steps = n_steps;
-
     if (n_free == 0) {
-        // Fully prescribed field: nothing evolves; frames are the Dirichlet data.
-        for (; want_i < want.size(); ++want_i) res.frames.push_back({want[want_i], T_full});
+        for (; want_i < want.size(); ++want_i)
+            res.frames.push_back({want[want_i], T_full});
         if (res.frames.empty() || res.frames.back().time != opts.t_end)
             res.frames.push_back({opts.t_end, T_full});
-        res.max_temp = gmax; res.min_temp = gmin; res.max_temp_time = 0.0;
+        res.max_temp = gmax;
+        res.min_temp = gmin;
+        res.max_temp_time = 0.0;
         res.ok = true;
         return res;
     }
 
-    // ── Iteration matrix A = Kff + Cff/dt, factored ONCE (Cholesky → SparseLU fallback,
-    // matching the steady solver's convention). Fixed dt + constant material + constant
-    // Dirichlet data keep A constant for the whole run even under scheduled loads.
-    Eigen::SparseMatrix<double> A(n_free, n_free);
-    {
-        std::vector<Eigen::Triplet<double>> atrips = ktrips;
-        if (opts.lumped) {
-            for (int i = 0; i < n_free; ++i)
-                if (c_lump(i) != 0.0) atrips.emplace_back(i, i, c_lump(i) / opts.dt);
-        } else {
-            for (const auto& t : ctrips)
-                atrips.emplace_back(t.row(), t.col(), t.value() / opts.dt);
-        }
-        A.setFromTriplets(atrips.begin(), atrips.end());
-        A.makeCompressed();
+    std::vector<Eigen::Triplet<double>> atrips = ktrips;
+    if (opts.lumped) {
+        for (int i = 0; i < n_free; ++i)
+            if (c_lump(i) > 0.0) atrips.emplace_back(i, i, c_lump(i) / opts.dt);
+    } else {
+        for (const auto& t : ctrips)
+            atrips.emplace_back(t.row(), t.col(), t.value() / opts.dt);
     }
+    Eigen::SparseMatrix<double> A(n_free, n_free);
+    A.setFromTriplets(atrips.begin(), atrips.end());
+    A.makeCompressed();
     if (A.nonZeros() == 0) {
         res.error = "fea_thermal_transient: no valid elements contributed";
         return res;
@@ -850,11 +1130,6 @@ ThermalTransientResult fea_thermal_transient(
         Cff.setFromTriplets(ctrips.begin(), ctrips.end());
         Cff.makeCompressed();
     }
-
-    // P2: factor A once with the fastest available ladder — CHOLMOD supernodal LLT
-    // (BLAS3, multithreaded; A = Kff + Cff/dt is SPD) → SimplicialLDLT → SparseLU.
-    // The one factorization is amortized over EVERY backward-Euler step, so this is
-    // where the transient solver's wall-clock actually lives.
 #ifdef CHUDWARE_WITH_CHOLMOD
     Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> chol;
     bool use_chol = false;
@@ -875,55 +1150,91 @@ ThermalTransientResult fea_thermal_transient(
             lu.analyzePattern(A);
             lu.factorize(A);
             if (lu.info() != Eigen::Success) {
-                res.error = "fea_thermal_transient: iteration-matrix factorization failed";
+                res.error =
+                    "fea_thermal_transient: iteration-matrix factorization failed";
                 return res;
             }
         }
     }
+    if (cancelled()) return cancel_result();
 
     Eigen::VectorXd Tf(n_free);
     for (int i = 0; i < n_nodes; ++i)
         if (reduced[i] >= 0) Tf(reduced[i]) = T_full[i];
-
     for (int n = 1; n <= n_steps; ++n) {
-        const double t_next = std::min(static_cast<double>(n) * opts.dt, opts.t_end);
+        if (cancelled()) return cancel_result();
+        const double t_prev = static_cast<double>(n - 1) * opts.dt;
+        const double t_next =
+            std::min(static_cast<double>(n) * opts.dt, opts.t_end);
+        const double dt_step = t_next - t_prev;
+        const bool partial_step =
+            std::abs(dt_step - opts.dt) >
+            16.0 * std::numeric_limits<double>::epsilon() * opts.dt;
         Eigen::VectorXd rhs = f_base;
-        if (opts.lumped) rhs += (c_lump.array() * Tf.array()).matrix() / opts.dt;
-        else rhs += (Cff * Tf) / opts.dt;
+        if (opts.lumped)
+            rhs += (c_lump.array() * Tf.array()).matrix() / dt_step;
+        else
+            rhs += (Cff * Tf) / dt_step;
         for (size_t k = 0; k < fluxes.size(); ++k) {
-            const double s = thermal_schedule_scale(fluxes[k].schedule, t_next);
-            if (s != 0.0) rhs += s * flux_vecs[k];
+            const double scale =
+                thermal_schedule_scale(fluxes[k].schedule, t_next);
+            if (scale != 0.0) rhs += scale * flux_vecs[k];
         }
-        bool step_ok;
-#ifdef CHUDWARE_WITH_CHOLMOD
-        if (use_chol) {
-            Tf = chol.solve(rhs);
-            step_ok = (chol.info() == Eigen::Success);
-        } else
-#endif
-        if (use_ldlt) {
-            Tf = ldlt.solve(rhs);
-            step_ok = (ldlt.info() == Eigen::Success);
+        bool step_ok = false;
+        if (partial_step) {
+            std::vector<Eigen::Triplet<double>> step_trips = ktrips;
+            if (opts.lumped) {
+                for (int i = 0; i < n_free; ++i)
+                    if (c_lump(i) > 0.0)
+                        step_trips.emplace_back(i, i, c_lump(i) / dt_step);
+            } else {
+                for (const auto& t : ctrips)
+                    step_trips.emplace_back(t.row(), t.col(),
+                                            t.value() / dt_step);
+            }
+            Eigen::SparseMatrix<double> A_step(n_free, n_free);
+            A_step.setFromTriplets(step_trips.begin(), step_trips.end());
+            A_step.makeCompressed();
+            Eigen::SparseLU<Eigen::SparseMatrix<double>> step_lu;
+            step_lu.analyzePattern(A_step);
+            step_lu.factorize(A_step);
+            if (step_lu.info() == Eigen::Success) {
+                Tf = step_lu.solve(rhs);
+                step_ok = step_lu.info() == Eigen::Success;
+            }
         } else {
-            Tf = lu.solve(rhs);
-            step_ok = (lu.info() == Eigen::Success);
+#ifdef CHUDWARE_WITH_CHOLMOD
+            if (use_chol) {
+                Tf = chol.solve(rhs);
+                step_ok = chol.info() == Eigen::Success;
+            } else
+#endif
+            if (use_ldlt) {
+                Tf = ldlt.solve(rhs);
+                step_ok = ldlt.info() == Eigen::Success;
+            } else {
+                Tf = lu.solve(rhs);
+                step_ok = lu.info() == Eigen::Success;
+            }
         }
-        if (!step_ok) {
-            res.error = "fea_thermal_transient: sparse solve failed at step " + std::to_string(n);
-            return res;
-        }
-        if (!Tf.allFinite()) {
-            res.error = "fea_thermal_transient: non-finite temperature at step " + std::to_string(n);
+        if (!step_ok || !Tf.allFinite()) {
+            res.error =
+                "fea_thermal_transient: sparse solve failed at step " +
+                std::to_string(n);
             return res;
         }
         for (int i = 0; i < n_nodes; ++i)
             if (reduced[i] >= 0) T_full[i] = Tf(reduced[i]);
         for (int i = 0; i < n_nodes; ++i) {
-            if (T_full[i] > res.envelope_max[i]) res.envelope_max[i] = T_full[i];
-            if (T_full[i] > gmax) { gmax = T_full[i]; gmax_t = t_next; }
+            if (T_full[i] > res.envelope_max[i])
+                res.envelope_max[i] = T_full[i];
+            if (T_full[i] > gmax) {
+                gmax = T_full[i];
+                gmax_t = t_next;
+            }
             if (T_full[i] < gmin) gmin = T_full[i];
         }
-        const bool last = (n == n_steps);
+        const bool last = n == n_steps;
         bool record = last;
         while (want_i < want.size() && want[want_i] <= t_next + 1e-12) {
             record = true;
@@ -931,7 +1242,6 @@ ThermalTransientResult fea_thermal_transient(
         }
         if (record) res.frames.push_back({t_next, T_full});
     }
-
     res.max_temp = gmax;
     res.min_temp = gmin;
     res.max_temp_time = gmax_t;

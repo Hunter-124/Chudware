@@ -243,6 +243,49 @@ def test_vendor_opamp_demo() -> None:
     print("vendor op-amp .subckt attachment simulates via ngspice (buffer=2.5V)  OK")
 
 
+def test_parser_and_schematic_validation() -> None:
+    from services.sim.spice import netlist_to_spice_circuit, parse_spice_deck
+
+    try:
+        parse_spice_deck("R1 in 0 not-a-number\nV1 in 0 1\n.op\n")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("malformed passive value was silently accepted")
+    for malformed in ("R1 in 0 -1\n", "V1 in 0 PWL(0 0 1)\n"):
+        try:
+            parse_spice_deck(malformed)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"malformed deck was silently accepted: {malformed!r}")
+
+    passive, _ = parse_spice_deck("C1 in 0 1u IC=2\nV1 in 0 1\n.op\n")
+    assert passive["devices"][0]["params"]["ic"] == 2.0
+
+    controlled, _ = parse_spice_deck(
+        "V1 in 0 1\nE1 out 0 in 0 2\nF1 out2 0 V1 3\nR1 out 0 1k\n.op\n")
+    mixed, _ = parse_spice_deck("Vmix in 0 AC 2 DC 1\n")
+    assert mixed["devices"][0]["value"] == 1.0
+    assert mixed["devices"][0]["params"]["ac"] == {"mag": 2.0, "phase": 0.0}
+    assert controlled["devices"][1]["params"]["gain"] == 2.0
+    assert controlled["devices"][2]["params"] == {"gain": 3.0, "ctrl": "V1"}
+
+    circuit, warnings = netlist_to_spice_circuit({"components": [
+        {"ref": "Q1", "libid": "Device:Q_NPN", "value": "",
+         "pins": {"B": "NB", "C": "NC", "E": "NE"}},
+        {"ref": "M1", "libid": "Device:NMOS", "value": "",
+         "pins": {"G": "NG", "D": "ND", "S": "NS"}},
+        {"ref": "Rbad", "libid": "Device:R", "value": "1k",
+         "pins": {"1": "N1"}},
+    ]})
+    assert circuit["devices"][0]["nodes"] == ["NC", "NB", "NE"]
+    assert circuit["devices"][1]["nodes"] == ["ND", "NG", "NS"]
+    assert len(circuit["devices"]) == 2
+    assert any("component skipped" in warning for warning in warnings)
+    print("SPICE parser rejects malformed values; schematic pins map safely  OK")
+
+
 # =============================================================================
 
 def main() -> None:
@@ -250,9 +293,10 @@ def main() -> None:
     gates = [
         ("Gate 1: honest degrade without ngspice", test_degrade_without_ngspice, False),
         ("Gate 2: default backend is mna", test_default_is_mna, False),
-        ("Gate 3: divider parity (live)", test_parity_divider, True),
-        ("Gate 4: RC filter parity (live)", test_parity_rc_filter, True),
-        ("Gate 5: vendor op-amp demo (live)", test_vendor_opamp_demo, True),
+        ("Gate 3: parser and schematic validation", test_parser_and_schematic_validation, False),
+        ("Gate 4: divider parity (live)", test_parity_divider, True),
+        ("Gate 5: RC filter parity (live)", test_parity_rc_filter, True),
+        ("Gate 6: vendor op-amp demo (live)", test_vendor_opamp_demo, True),
     ]
     live_ok = ng.ngspice_available()
     skipped = 0

@@ -1,6 +1,6 @@
-// C++ port of engine/doc/mate_solver.py. Residual/Jacobian formulas are copied
-// from the Python so the two stay at parity under tools/mate_diff.py. See mate.h
-// for the coverage scope. OCCT-free: only solver/Eigen/json.
+// 3D rigid-transform mate residuals and Jacobians. The implementation started
+// from the Python solver, but correctness fixes here are authoritative rather
+// than constrained to preserve defective oracle behavior.
 #include "mate/mate.h"
 
 #include "sim/numpy_rng.h"
@@ -315,8 +315,12 @@ private:
     double param(const std::string& key, double dflt) const {
         if (!params_.is_object() || !params_.contains(key)) return dflt;
         const json& v = params_[key];
-        if (v.is_number()) return v.get<double>();
-        return dflt;
+        if (!v.is_number())
+            throw std::runtime_error("mate parameter '" + key + "' must be numeric");
+        const double out = v.get<double>();
+        if (!std::isfinite(out))
+            throw std::runtime_error("mate parameter '" + key + "' must be finite");
+        return out;
     }
 
     Vector3d axis_world(const std::string& which) const {
@@ -469,6 +473,8 @@ private:
     }
 
     Built angle() {
+        if (!std::isfinite(value_))
+            throw std::runtime_error("angle value must be finite");
         Vector3d da_l = ga_.dir_vector();
         Vector3d db_l = gb_.dir_vector();
         double target = std::cos(deg2rad(value_));
@@ -531,6 +537,8 @@ private:
     // ----- distance -------------------------------------------------------
     Built distance() {
         bool use_plane = (ga_.kind == "plane") || (gb_.kind == "plane");
+        if (!std::isfinite(value_))
+            throw std::runtime_error("distance value must be finite");
         Vector3d n_l = (ga_.kind == "plane") ? ga_.normal : gb_.normal;
         bool n_on_a = (ga_.kind == "plane");
         Vector3d pa_l = ga_.point, pb_l = gb_.point;
@@ -768,6 +776,8 @@ private:
         Vector3d pa_l = ga_.point, pb_l = gb_.point;
         double lo = param("min", 0.0);
         double hi = param("max", 0.0);
+        if (lo > hi)
+            throw std::runtime_error("distance limit min must be <= max");
         auto self = this;
 
         auto gap_and_row = [=](const VectorXd& xs, double& gap, MatrixXd& row) {
@@ -817,6 +827,8 @@ private:
         Vector3d db_l = gb_.dir_vector();
         double lo = deg2rad(param("min", 0.0));
         double hi = deg2rad(param("max", 0.0));
+        if (lo > hi)
+            throw std::runtime_error("angle limit min must be <= max");
         auto self = this;
         auto angle_and_row = [=](const VectorXd& xs, double& ang, MatrixXd& row) {
             Vector3d da, db; MatrixXd Jda, Jdb;
@@ -864,15 +876,20 @@ private:
 
     // ===================================================================== MECHANICAL MATES
 
-    // theta = (w - w0)·â (w0 == 0). Returns scalar fn + row fn.
+    // Incremental rotation about the initial world axis.  Subtracting the
+    // current solve's warm-start orientation preserves the authored gear phase
+    // and makes coupled mates transmit only the rotation introduced by this
+    // solve.  Using absolute Rodrigues coordinates forced an unchanged,
+    // initially rotated mechanism to jump to an arbitrary zero-phase pose.
     void theta_row(const std::string& which,
                    std::function<double(const VectorXd&)>& theta_fn,
                    std::function<MatrixXd(const VectorXd&)>& row_fn) const {
         Vector3d ax = axis_world(which);
+        const Vector3d w0 = (which == "a") ? fa_->w0 : fb_->w0;
         auto self = this;
         theta_fn = [=](const VectorXd& xs) {
             VectorXd x6 = (which == "a") ? self->xa(xs) : self->xb(xs);
-            return double(x6.segment(3, 3).dot(ax));
+            return double((x6.segment(3, 3) - w0).dot(ax));
         };
         row_fn = [=](const VectorXd& xs) {
             MatrixXd r6 = MatrixXd::Zero(1, 6);
@@ -883,6 +900,8 @@ private:
 
     Built gear() {
         double ratio = param("ratio", 1.0);
+        if (std::abs(ratio) <= 1e-12)
+            throw std::runtime_error("gear ratio must be finite and non-zero");
         std::function<double(const VectorXd&)> theta_a, theta_b;
         std::function<MatrixXd(const VectorXd&)> row_a, row_b;
         theta_row("a", theta_a, row_a);
@@ -899,6 +918,8 @@ private:
 
     Built rack_pinion() {
         double pr = param("pitch_radius", ga_.radius != 0.0 ? ga_.radius : 1.0);
+        if (pr <= 0.0)
+            throw std::runtime_error("rack/pinion pitch_radius must be finite and > 0");
         std::function<double(const VectorXd&)> theta_a;
         std::function<MatrixXd(const VectorXd&)> row_a;
         theta_row("a", theta_a, row_a);
@@ -926,6 +947,8 @@ private:
 
     Built screw() {
         double pitch = param("pitch", 1.0);
+        if (std::abs(pitch) <= 1e-12)
+            throw std::runtime_error("screw pitch must be finite and non-zero");
         double k = pitch / (2.0 * kPi);
         std::function<double(const VectorXd&)> theta_a, theta_b;
         std::function<MatrixXd(const VectorXd&)> rowt_a, rowt_b;
@@ -981,6 +1004,8 @@ private:
         }
         double lo = deg2rad(param("min", 0.0));
         double hi = deg2rad(param("max", 360.0));
+        if (lo > hi)
+            throw std::runtime_error("hinge limit min must be <= max");
         auto self = this;
         auto swing = [=](const VectorXd& xs, double& ang, MatrixXd& row) {
             Vector3d ma, mb; MatrixXd Jma, Jmb;
@@ -999,13 +1024,17 @@ private:
             self->wd("b", xs, db_l, db, Jd);
             self->wp("a", xs, pa_l, pa, Jd);
             self->wp("b", xs, pb_l, pb, Jd);
-            VectorXd r(5);
+            VectorXd r(6);
             r.head(2) = two_indep_cross(da, sign * db);
-            r.segment(2, 2) = perp_residual2(da, pb - pa);
+            // A revolute joint makes the two axis origins coincident.  The old
+            // two-component perpendicular residual left translation along the
+            // hinge axis free, so "hinge" actually behaved as a cylindrical
+            // joint and motion sweeps could drift axially.
+            r.segment(2, 3) = pb - pa;
             double ang; MatrixXd row; swing(xs, ang, row);
-            if (ang < lo) r(4) = ang - lo;
-            else if (ang > hi) r(4) = ang - hi;
-            else r(4) = 0.0;
+            if (ang < lo) r(5) = ang - lo;
+            else if (ang > hi) r(5) = ang - hi;
+            else r(5) = 0.0;
             return r;
         };
         J jfunc = [=](const VectorXd& xs) {
@@ -1014,20 +1043,18 @@ private:
             self->wd("b", xs, db_l, db, Jdb);
             self->wp("a", xs, pa_l, pa, Jpa);
             self->wp("b", xs, pb_l, pb, Jpb);
-            MatrixXd Jm = self->empty_jac(5);
+            MatrixXd Jm = self->empty_jac(6);
             Vector3d sdb = sign * db;
             MatrixXd cross_jac = self->place("a", (-skew(sdb) * Jda).eval())
                 + self->place("b", (skew(da) * (sign * Jdb)).eval());
             Jm.block(0, 0, 2, self->icols()) = two_indep_cross_jac(da, sdb, cross_jac);
-            Vector3d diff = pb - pa;
-            MatrixXd Jdiff = self->place("b", Jpb) - self->place("a", Jpa);
-            Jm.block(2, 0, 2, self->icols()) =
-                perp_residual2_jac(da, self->place("a", Jda), diff, Jdiff);
+            Jm.block(2, 0, 3, self->icols()) =
+                self->place("b", Jpb) - self->place("a", Jpa);
             double ang; MatrixXd row; swing(xs, ang, row);
-            if (ang < lo || ang > hi) Jm.block(4, 0, 1, self->icols()) = row;
+            if (ang < lo || ang > hi) Jm.block(5, 0, 1, self->icols()) = row;
             return Jm;
         };
-        return {rfunc, jfunc, 5};
+        return {rfunc, jfunc, 6};
     }
 
     Built slot() {

@@ -250,3 +250,38 @@ TEST_CASE("modal: free-free rigid cluster survives even when n_modes < 6") {
     REQUIRE(r.freqs_hz.size() == 4);
     for (double f : r.freqs_hz) CHECK(f < 0.5);  // the 4 lowest are all rigid (~0 Hz)
 }
+
+
+TEST_CASE("modal: degenerate elements are rejected before eigensolve") {
+    const std::vector<double> points = {
+        0, 0, 0,  1, 0, 0,  0, 1, 0,  1, 1, 0};
+    const std::vector<int> tets = {0, 1, 2, 3};
+    const auto result = chudware::sim::fea_modal_solve(
+        points, tets, 210000.0, 0.3, 7.85, {}, 1, 4);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("degenerate") != std::string::npos);
+}
+
+TEST_CASE("modal: invalid material and connectivity fail deterministically") {
+    const std::vector<double> points = {
+        0, 0, 0,  1, 0, 0,  0, 1, 0,  0, 0, 1};
+    const std::vector<int> valid = {0, 1, 2, 3};
+    CHECK_FALSE(chudware::sim::fea_modal_solve(
+                    points, valid, 210000.0, 0.3, 0.0, {}, 1, 4)
+                    .ok);
+    const std::vector<int> invalid = {0, 1, 2, 4};
+    const auto result = chudware::sim::fea_modal_solve(
+        points, invalid, 210000.0, 0.3, 7.85, {}, 1, 4);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("index") != std::string::npos);
+}
+
+TEST_CASE("modal: a pre-cancelled token aborts before assembly") {
+    Mesh mesh = beam_mesh(10.0, 2.0, 2, 1, 1);
+    auto token = std::make_shared<std::atomic<bool>>(true);
+    const auto result = chudware::sim::fea_modal_solve(
+        mesh.pts, mesh.tets, 210000.0, 0.3, 7.85, mesh.fixed, 2, 4,
+        token);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("cancelled") != std::string::npos);
+}

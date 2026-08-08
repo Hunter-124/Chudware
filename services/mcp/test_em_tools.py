@@ -121,6 +121,29 @@ class TestEmMcpTools(unittest.TestCase):
         self.assertNotIn("Traceback", json.dumps(r))
         self.assertNotIn("traceback", str(r.get("error", "")).lower())
 
+    def test_openems_numerical_failure_is_not_misreported_as_missing(self):
+        raw = {
+            "ok": False,
+            "error": "openEMS incident-port spectrum is numerically unusable",
+            "solvers": [{"name": "openems", "installed": True}],
+        }
+        original = em_tools.WORKER_METHODS["em_driven"]
+        em_tools.WORKER_METHODS["em_driven"] = lambda _params, _emit: raw
+        try:
+            failure = _call(
+                self.tools, "em_driven", standard="WR-90", solver="openems")
+            self.assertFalse(failure["ok"])
+            self.assertFalse(failure.get("skipped", False))
+            self.assertEqual(failure["error"], raw["error"])
+
+            raw["solvers"][0]["installed"] = False
+            missing = _call(
+                self.tools, "em_driven", standard="WR-90", solver="openems")
+            self.assertTrue(missing["skipped"])
+            self.assertEqual(missing["skip_reason"], "openems_not_installed")
+        finally:
+            em_tools.WORKER_METHODS["em_driven"] = original
+
     def test_em_timedomain_compact(self):
         r = _call(self.tools, "em_timedomain", standard="WR90", length_mm=80,
                   solver="analytic-uniform")
@@ -138,6 +161,25 @@ class TestEmMcpTools(unittest.TestCase):
         # Field preview grids are 2-D arrays of floats — should not appear.
         self.assertNotIn('"field"', blob)
         self.assertNotIn('"preview"', blob)
+
+    def test_invalid_numeric_arguments_return_error_envelopes(self):
+        r = _call(self.tools, "em_driven", standard="WR90",
+                  length_mm=math.nan, solver="analytic-uniform")
+        self.assertFalse(r["ok"])
+        self.assertIn("finite", r["error"])
+
+        r = _call(self.tools, "em_eigenmode", standard="WR90", n_modes=0)
+        self.assertFalse(r["ok"])
+        self.assertIn("integer", r["error"])
+
+        r = _call(self.tools, "em_timedomain", standard="WR90",
+                  bw_ghz=-1, solver="analytic-uniform")
+        self.assertFalse(r["ok"])
+
+    def test_invalid_waveguide_json_is_not_forwarded(self):
+        r = _call(self.tools, "em_eigenmode", waveguide="{bad json")
+        self.assertFalse(r["ok"])
+        self.assertIn("JSON invalid", r["error"])
 
 
 if __name__ == "__main__":

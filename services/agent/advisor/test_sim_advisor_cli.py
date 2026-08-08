@@ -1,9 +1,8 @@
-"""Tests for the T-SIM3 sim_advisor CLI shim (GUI <-> T-W9 advisor seam).
+"""Behavioral tests for the sim_advisor JSON CLI seam.
 
-The shim is a pure JSON passthrough over sim_advisor.precheck/postcheck plus the
-optional ledger artifact event (inspectability rule). Tests run it exactly the
-way the C++ GUI does — a subprocess with JSON on stdin — so the seam itself is
-what's proven, not a python-level import.
+The shim is exercised as an external process with JSON on stdin so serialization,
+block-gate environment handling, confidence evidence, and optional ledger output
+are covered at the public boundary rather than by importing ``main``.
 """
 from __future__ import annotations
 
@@ -64,7 +63,7 @@ class TestPostcheckMode:
     def test_fail_verdict_and_narration(self):
         rc, out = _run({"mode": "postcheck",
                         "study": {"type": "static",
-                                  "results": {"max_von_mises_mpa": 300.0},
+                                  "results": {"max_von_mises_mpa": 380.0},
                                   "material": {"name": "Steel AISI 1018",
                                                "yield_mpa": 370.0,
                                                "ultimate_mpa": 440.0}}})
@@ -79,9 +78,26 @@ class TestPostcheckMode:
                         "study": {"type": "static",
                                   "results": {"max_von_mises_mpa": 100.0},
                                   "material": {"name": "Steel AISI 1018",
+                                               "E_mpa": 200000.0,
+                                               "nu": 0.29,
                                                "yield_mpa": 370.0,
-                                               "ultimate_mpa": 440.0}}})
+                                               "ultimate_mpa": 440.0},
+                                  "fixtures": ["left"],
+                                  "loads": [{"face": "right", "force": [0, 0, -100]}],
+                                  "mesh_fineness": 0.75,
+                                  "mesh_convergence": {"values": [105.0, 100.0]}}})
         assert rc == 0 and out["verdict"] == "PASS"
+        assert out["confidence"] == "supported"
+
+    def test_favorable_single_mesh_withholds_pass(self):
+        rc, out = _run({"mode": "postcheck",
+                        "study": {"type": "static",
+                                  "results": {"max_von_mises_mpa": 100.0},
+                                  "material": {"name": "Steel AISI 1018",
+                                               "yield_mpa": 370.0}}})
+        assert rc == 0 and out["verdict"] == "WARN"
+        assert out["confidence"] == "insufficient"
+        assert "PASS withheld" in out["narration"]
 
     def test_bad_mode_fails_cleanly(self):
         rc, out = _run({"mode": "nope", "study": {}})

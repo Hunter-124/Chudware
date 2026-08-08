@@ -196,20 +196,36 @@ def estimate_line_dp(*, flow_lpm: float, id_mm: float, length_mm: float,
     Swamee–Jain explicit Colebrook approximation above. Returns
     ``{ok, velocity_ms, reynolds, friction, regime, dp_kpa}``.
     """
+    values = (flow_lpm, id_mm, length_mm, rho, mu, eps_m)
+    if not all(isinstance(v, (int, float)) and math.isfinite(float(v))
+               for v in values):
+        return {"ok": False, "reason": "line-loss inputs must all be finite numbers"}
     if flow_lpm <= 0 or id_mm <= 0 or length_mm <= 0:
-        return {"ok": False, "reason": "flow_lpm, id_mm, length_mm must all be > 0"}
-    d_m = id_mm / 1000.0
-    area = math.pi / 4.0 * d_m ** 2
-    q_m3s = flow_lpm / 60_000.0
-    v = q_m3s / area
-    re = rho * v * d_m / mu
-    if re < 2300.0:
-        f = 64.0 / max(re, 1e-9)
-        regime = "laminar"
-    else:
-        f = 0.25 / math.log10(eps_m / (3.7 * d_m) + 5.74 / re ** 0.9) ** 2
-        regime = "turbulent (Swamee-Jain)"
-    dp_pa = f * (length_mm / 1000.0) / d_m * 0.5 * rho * v ** 2
+        return {"ok": False,
+                "reason": "flow_lpm, id_mm, length_mm must all be finite and > 0"}
+    if rho <= 0 or mu <= 0 or eps_m < 0:
+        return {"ok": False,
+                "reason": "rho and mu must be > 0; eps_m must be >= 0"}
+    try:
+        d_m = id_mm / 1000.0
+        area = math.pi / 4.0 * d_m ** 2
+        q_m3s = flow_lpm / 60_000.0
+        v = q_m3s / area
+        re = rho * v * d_m / mu
+        if re < 2300.0:
+            f = 64.0 / max(re, 1e-9)
+            regime = "laminar"
+        else:
+            f = 0.25 / math.log10(
+                eps_m / (3.7 * d_m) + 5.74 / re ** 0.9) ** 2
+            regime = "turbulent (Swamee-Jain)"
+        dp_pa = f * (length_mm / 1000.0) / d_m * 0.5 * rho * v ** 2
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return {"ok": False, "reason": "line pressure-drop calculation overflowed"}
+    if (not all(math.isfinite(v) for v in (area, q_m3s, v, re, f, dp_pa))
+            or area <= 0 or q_m3s <= 0 or v <= 0 or re <= 0
+            or f <= 0 or dp_pa < 0):
+        return {"ok": False, "reason": "line pressure-drop calculation overflowed"}
     return {
         "ok": True,
         "velocity_ms": round(v, 4),
@@ -238,7 +254,8 @@ def _piping_handoff_envelope(hyd_doc: dict, net: dict,
         rid = row["run_id"]
         conditions.append(sh.condition(
             f"{rid}_flow", "flow", row["flow_m3h"], "m3/h",
-            f"hydraulic hose {row['hose_id']} ({row['net_name']}) flow_lpm",
+            f"hydraulic hose {row['hose_id']} ({row['net_name']}) flow_lpm "
+            "converted by x0.06 to m3/h",
             applied_to=rid))
         est = net["estimates"].get(rid) or {}
         if est.get("ok"):
@@ -257,9 +274,12 @@ def _piping_handoff_envelope(hyd_doc: dict, net: dict,
                                   derived_by="hoses_to_piping", units="mm")],
         conditions=conditions,
         expectations=expectations or None,
-        warnings=net.get("warnings") or None,
         meta={"boundary": net["boundary"], "fluid": net["fluid"],
-              "lines": net["lines"]})
+              "lines": net["lines"],
+              "topology_model": (
+                  "independent_hose_line_cases (each run has its own "
+                  "fixed-pressure start and prescribed-flow end; component-port "
+                  "continuity is provenance only)")})
 
 
 def _margin_update(supply_pressure_bar: float, load_pressure_bar: Optional[float],
@@ -292,38 +312,56 @@ def _verify_piping_envelope(handoff: dict, solve_res: dict,
     """
     links = {lk.get("id"): lk for lk in solve_res.get("links", [])}
     checks = []
+    unavailable = []
     for exp in handoff.get("expectations") or []:
-        q = exp["quantity"]
+        q = exp.get("quantity", "")
         rid = q.split(":", 1)[1] if ":" in q else q
         lk = links.get(rid)
-        if lk is None:
+        try:
+            solved = abs(float(lk["dp_kpa"])) if lk is not None else math.nan
+            est = float(exp["value"])
+        except (KeyError, TypeError, ValueError):
+            solved = est = math.nan
+        if not math.isfinite(solved) or not math.isfinite(est):
+            unavailable.append(
+                f"{q or rid}: comparison unavailable (missing or non-finite "
+                "estimate/solved pressure drop)")
+            checks.append(sh.check(f"availability:{q or rid}", "1", 1.0, 0.0,
+                                   100.0, 0.0, False))
             continue
-        solved = abs(float(lk.get("dp_kpa", 0.0)))
-        est = float(exp["value"])
         base = max(abs(solved), 1e-9)
-        dev = abs(solved - est) / base * 100.0
+        stored_dev = round(abs(solved - est) / base * 100.0, 2)
         checks.append(sh.check(q, "kPa", est, round(solved, 4),
-                               round(dev, 2), tolerance_pct, dev <= tolerance_pct))
-    n_pass = sum(1 for c in checks if c["pass"])
-    verdict = (f"PASS: {n_pass}/{len(checks)} hose-line dP estimates within "
-               f"{tolerance_pct}% of the piping 1D solve"
-               if checks and n_pass == len(checks) else
-               f"FAIL: {len(checks) - n_pass}/{len(checks)} hose-line dP estimates "
-               f"deviate more than {tolerance_pct}% from the piping 1D solve")
+                               stored_dev, tolerance_pct,
+                               stored_dev <= tolerance_pct))
+    if unavailable:
+        verdict = ("FAIL: pressure-drop verification unavailable for "
+                   f"{len(unavailable)} expected hose line(s)")
+    else:
+        n_pass = sum(1 for c in checks if c["pass"])
+        verdict = (f"PASS: {n_pass}/{len(checks)} hose-line dP estimates within "
+                   f"{tolerance_pct}% of the piping 1D solve"
+                   if checks and n_pass == len(checks) else
+                   f"FAIL: {len(checks) - n_pass}/{len(checks)} hose-line dP estimates "
+                   f"deviate more than {tolerance_pct}% from the piping 1D solve")
     env = sh.build_verify(
         "hydraulic_to_piping",
         sh.study_ref("hydraulic", "hydraulic_piping_handoff"),
         sh.study_ref("piping", "piping_solve", handoff_id=handoff.get("id")),
-        checks, verdict, handoff_id=handoff.get("id"))
+        checks, verdict, handoff_id=handoff.get("id"),
+        warnings=unavailable or None)
     return env, checks
 
 
 def _unit3(axis) -> list:
-    v = [float(c) for c in (axis or [0.0, 0.0, 1.0])]
-    if len(v) != 3:
+    source = [0.0, 0.0, 1.0] if axis is None else axis
+    if not isinstance(source, (list, tuple)) or len(source) != 3:
         raise ValueError("axis must be a 3-vector")
+    v = [float(c) for c in source]
+    if not all(math.isfinite(c) for c in v):
+        raise ValueError("axis components must be finite")
     n = math.sqrt(sum(c * c for c in v))
-    if n <= 0:
+    if not math.isfinite(n) or n <= 0:
         raise ValueError("axis must be non-zero")
     return [c / n for c in v]
 
@@ -396,43 +434,82 @@ def _fea_handoff_envelope(*, bore_mm: float, rod_mm: float, max_pressure_bar: fl
 
 def _verify_fea_envelope(handoff: dict, tolerance_pct: float,
                          fea_result: Optional[dict] = None) -> dict:
-    """Verify envelope for hydraulic→FEA: independently recompute A×P mount forces
-    from the envelope's meta and compare against |force| of each case condition —
-    the cross-check that the load case landed with the correct force magnitude.
-    Direction (colinearity with the cylinder axis) is checked into warnings.
-    ``fea_result`` (a run_fea_static summary), when given, rides as an advisory.
-    """
+    """Verify both unambiguous cylinder load cases against independent A×P math."""
     meta = handoff.get("meta") or {}
-    f = _cylinder_mount_forces(bore_mm=float(meta["bore_mm"]),
-                               rod_mm=float(meta.get("rod_mm", 0.0)),
-                               max_pressure_bar=float(meta["max_pressure_bar"]),
-                               efficiency=float(meta.get("efficiency", 1.0)))
-    want = {"extend_max_pressure": f["extend_n"],
-            "retract_max_pressure": f["retract_n"]}
-    axis = meta.get("axis")
     checks = []
     warnings: list = []
-    for cond in handoff.get("conditions", []):
+    unavailable: list = []
+    try:
+        bore = float(meta["bore_mm"])
+        rod = float(meta.get("rod_mm", 0.0))
+        pressure = float(meta["max_pressure_bar"])
+        efficiency = float(meta.get("efficiency", 1.0))
+        if (not all(math.isfinite(v) for v in
+                    (bore, rod, pressure, efficiency)) or
+                bore <= 0 or rod < 0 or rod >= bore or pressure <= 0 or
+                not 0 < efficiency <= 1):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        unavailable.append(
+            "hydraulic→FEA comparison unavailable: handoff metadata is "
+            "missing or physically invalid")
+        checks.append(sh.check("availability:handoff_metadata", "1", 1.0, 0.0,
+                               100.0, 0.0, False))
+        want = {}
+        axis = None
+    else:
+        f = _cylinder_mount_forces(
+            bore_mm=bore, rod_mm=rod, max_pressure_bar=pressure,
+            efficiency=efficiency)
+        want = {"extend_max_pressure": f["extend_n"],
+                "retract_max_pressure": f["retract_n"]}
+        try:
+            if "axis" not in meta:
+                raise ValueError("axis is missing")
+            axis = _unit3(meta["axis"])
+        except (TypeError, ValueError) as exc:
+            axis = None
+            message = f"invalid cylinder axis provenance: {exc}"
+            unavailable.append(message)
+            checks.append(sh.check("availability:cylinder_axis", "1", 1.0, 0.0,
+                                   100.0, 0.0, False))
+
+    vectors = {case: [] for case in want}
+    for cond in handoff.get("conditions") or []:
         case = cond.get("case")
-        if cond.get("kind") != "force" or case not in want:
+        if cond.get("kind") == "force" and case in vectors:
+            vectors[case].append(cond.get("value"))
+    for case, expect in want.items():
+        candidates = vectors[case]
+        vec = candidates[0] if len(candidates) == 1 else None
+        try:
+            if not isinstance(vec, list) or len(vec) != 3:
+                raise ValueError
+            numbers = [float(c) for c in vec]
+            if not all(math.isfinite(c) for c in numbers):
+                raise ValueError
+        except (TypeError, ValueError):
+            unavailable.append(
+                f"{case}: comparison unavailable because exactly one finite "
+                "3-vector force condition is required")
+            checks.append(sh.check(f"availability:mount_force:{case}", "1",
+                                   1.0, 0.0, 100.0, 0.0, False))
             continue
-        vec = cond["value"]
-        mag = math.sqrt(sum(float(c) ** 2 for c in vec))
-        expect = want[case]
-        dev = abs(mag - expect) / max(expect, 1e-9) * 100.0
+        mag = math.sqrt(sum(c * c for c in numbers))
+        stored_dev = round(abs(mag - expect) / max(expect, 1e-9) * 100.0, 3)
         checks.append(sh.check(f"mount_force:{case}", "N", round(expect, 3),
-                               round(mag, 3), round(dev, 3), tolerance_pct,
-                               dev <= tolerance_pct))
-        if axis and mag > 0:
-            cosang = abs(sum(float(a) * float(c) for a, c in zip(axis, vec))) / mag
+                               round(mag, 3), stored_dev, tolerance_pct,
+                               stored_dev <= tolerance_pct))
+        if axis is not None and mag > 0:
+            cosang = abs(sum(a * c for a, c in zip(axis, numbers))) / mag
             if cosang < 0.999:
                 warnings.append(f"{case}: force vector not colinear with cylinder "
                                 f"axis (|cos| = {cosang:.4f})")
     ok = bool(checks) and all(c["pass"] for c in checks)
     verdict = (f"PASS: all {len(checks)} mount-load case force magnitudes match "
                f"the independent area x pressure recompute within {tolerance_pct}%"
-               if ok else "FAIL: mount-load force magnitude(s) deviate from the "
-                          "independent area x pressure recompute")
+               if ok else "FAIL: mount-load cases are missing, ambiguous, invalid, "
+                          "or deviate from the independent area x pressure recompute")
     advisories = None
     if isinstance(fea_result, dict):
         summ = fea_result.get("summary") or fea_result
@@ -445,7 +522,7 @@ def _verify_fea_envelope(handoff: dict, tolerance_pct: float,
         sh.study_ref("hydraulic", "hydraulic_fea_handoff"),
         sh.study_ref("fea", "run_fea_static", handoff_id=handoff.get("id")),
         checks, verdict, handoff_id=handoff.get("id"),
-        advisories=advisories, warnings=warnings or None)
+        advisories=advisories, warnings=(warnings + unavailable) or None)
 
 
 def register_hydraulic_tools(mcp) -> None:

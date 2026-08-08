@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,9 @@ def _stub_install(tmp: Path) -> Path:
         ("simpleFoam", 'echo "stub simpleFoam"\n'),
         ("blockMesh", 'echo "stub blockMesh in $(pwd)"\n'),
         ("failFoam", 'echo "boom" >&2\nexit 3\n'),
+        ("fatalFoam", 'echo "FOAM FATAL IO ERROR: bad dictionary"\nexit 0\n'),
+        ("bannerFoam", 'echo "trapFpe : Enabling floating point exception trapping"\n'),
+        ("slowFoam", 'sleep 30\n'),
     ):
         p = bindir / app
         p.write_text("#!/bin/sh\n" + body)
@@ -105,6 +109,23 @@ def test_linux_runner_runs_and_streams():
         r.run(case, "failFoam")
     assert ei.value.code == 3
     assert "boom" in ei.value.tail
+    # Some OpenFOAM wrappers return zero even after printing a fatal banner.
+    with pytest.raises(fr.FoamError) as fatal:
+        r.run(case, "fatalFoam")
+    assert "FOAM FATAL IO ERROR" in fatal.value.tail
+    # Normal OpenFOAM startup advertises exception trapping; it is not a solver fault.
+    r.run(case, "bannerFoam")
+    started = time.monotonic()
+    with pytest.raises(fr.FoamError, match="timed out"):
+        r.run(case, "slowFoam", timeout=0.05)
+    assert time.monotonic() - started < 2.0
+
+    # Shell quoting must preserve case paths containing spaces and apostrophes.
+    quoted_case = Path(tempfile.mkdtemp()) / "case with ' quote"
+    quoted_case.mkdir()
+    lines.clear()
+    r.run(str(quoted_case), "blockMesh", on_line=lines.append)
+    assert any(str(quoted_case) in ln for ln in lines)
 
 
 @pytest.mark.skipif(not _POSIX, reason="LinuxRunner is posix-only")

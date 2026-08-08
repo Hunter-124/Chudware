@@ -13,6 +13,7 @@
 
 #include <string>
 #include <vector>
+#include "sim/sim_cancel.h"
 
 namespace chudware::sim {
 
@@ -33,6 +34,7 @@ struct FeaModalResult {
 FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vector<int>& tets,
                                double E_mpa, double nu, double density_g_cm3,
                                const std::vector<int>& fixed_nodes, int n_modes,
-                               int nodes_per_elem = 4);
+                               int nodes_per_elem = 4,
+                               const SimCancelToken& cancel_token = {});
 
 }  // namespace chudware::sim

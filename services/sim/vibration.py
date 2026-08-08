@@ -77,6 +77,34 @@ _LIMITATIONS = ("Lumped (equal-distribution) nodal mass; unit-max-normalized mod
 # Building blocks
 # ---------------------------------------------------------------------------
 
+def _damping_ratio(value: float) -> float:
+    zeta = float(value)
+    if not math.isfinite(zeta) or not 0.0 < zeta < 1.0:
+        raise ValueError("zeta must be finite and between 0 and 1")
+    return zeta
+
+
+def _validated_psd_points(
+    psd_breakpoints: Sequence[Sequence[float]],
+) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for index, point in enumerate(psd_breakpoints):
+        if len(point) != 2:
+            raise ValueError(f"PSD breakpoint {index} must be [frequency_hz, g2_per_hz]")
+        frequency, density = float(point[0]), float(point[1])
+        if not math.isfinite(frequency) or not math.isfinite(density):
+            raise ValueError("PSD breakpoints must be finite")
+        if frequency <= 0.0 or density <= 0.0:
+            raise ValueError("PSD breakpoints must have positive frequency and PSD")
+        points.append((frequency, density))
+    if not points:
+        raise ValueError("psd_breakpoints is empty")
+    points.sort()
+    if any(right[0] <= left[0] for left, right in zip(points, points[1:])):
+        raise ValueError("PSD breakpoint frequencies must be unique")
+    return points
+
+
 def lumped_mass_vector(n_nodes: int, total_mass_kg: float) -> np.ndarray:
     """Equal-distribution lumped nodal mass: total mass / n_nodes at every node.
 
@@ -84,11 +112,12 @@ def lumped_mass_vector(n_nodes: int, total_mass_kg: float) -> np.ndarray:
     (uniform-density parts — the only current material model — are unaffected in
     aggregate). See module docstring, limitation 1.
     """
-    if n_nodes <= 0:
-        raise ValueError("n_nodes must be positive")
-    if total_mass_kg <= 0.0:
-        raise ValueError("total_mass_kg must be positive")
-    return np.full(n_nodes, total_mass_kg / n_nodes)
+    if isinstance(n_nodes, bool) or int(n_nodes) != n_nodes or n_nodes <= 0:
+        raise ValueError("n_nodes must be a positive integer")
+    total_mass_kg = float(total_mass_kg)
+    if not math.isfinite(total_mass_kg) or total_mass_kg <= 0.0:
+        raise ValueError("total_mass_kg must be finite and positive")
+    return np.full(int(n_nodes), total_mass_kg / int(n_nodes))
 
 
 def modal_participation(
@@ -96,74 +125,79 @@ def modal_participation(
     mass_vec: np.ndarray,      # (n_nodes,)
     excitation_dir: Sequence[float],  # (3,) unit vector
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Participation factors Gamma_n = phi_n^T M r and generalized masses m_n = phi_n^T M phi_n.
-
-    r is the rigid-body influence vector: excitation_dir replicated at every node.
-    Reference: Craig & Kurdila [2], Sec. 12.3.
-
-    Returns (gamma, gen_mass), each shape (n_modes,).
-    """
-    d = np.asarray(excitation_dir, dtype=float)
-    nrm = np.linalg.norm(d)
-    if nrm == 0.0:
+    """Participation factors Gamma_n and generalized masses for each mode."""
+    shapes = np.asarray(mode_shapes, dtype=float)
+    mass = np.asarray(mass_vec, dtype=float)
+    if shapes.ndim != 3 or shapes.shape[2] != 3:
+        raise ValueError("mode_shapes must have shape (n_modes, n_nodes, 3)")
+    if mass.ndim != 1 or mass.shape[0] != shapes.shape[1]:
+        raise ValueError("mass_vec length must equal the mode-shape node count")
+    if not np.all(np.isfinite(shapes)):
+        raise ValueError("mode_shapes must be finite")
+    if not np.all(np.isfinite(mass)) or np.any(mass <= 0.0):
+        raise ValueError("mass_vec entries must be finite and positive")
+    direction = np.asarray(excitation_dir, dtype=float)
+    if direction.shape != (3,) or not np.all(np.isfinite(direction)):
+        raise ValueError("excitation_dir must contain three finite components")
+    norm = float(np.linalg.norm(direction))
+    if not math.isfinite(norm) or norm == 0.0:
         raise ValueError("excitation_dir must be a non-zero vector")
-    d = d / nrm
-    # phi . (M r): M diagonal per node (same mass on x/y/z DOFs of a node).
-    #   Gamma_n = sum_i m_i * (phi_n[i] . d)
-    proj = mode_shapes @ d                       # (n_modes, n_nodes)
-    gamma = proj @ mass_vec                      # (n_modes,)
-    # m_n = sum_i m_i * |phi_n[i]|^2
-    gen_mass = np.einsum("mnc,mnc,n->m", mode_shapes, mode_shapes, mass_vec)
+    direction = direction / norm
+    projection = shapes @ direction
+    gamma = projection @ mass
+    gen_mass = np.einsum("mnc,mnc,n->m", shapes, shapes, mass)
     return gamma, gen_mass
 
 
 def sdof_transmissibility(freq_hz: float, sweep_hz: Sequence[float], zeta: float) -> np.ndarray:
-    """|T(r)| = sqrt((1+(2z r)^2) / ((1-r^2)^2 + (2z r)^2)), r = f/fn.
-
-    Harris & Piersol [3], Ch. 2, Eq. 2.41. At r=1 this equals sqrt(1+4z^2)/(2z) ~= Q.
-    """
-    if freq_hz <= 0.0:
-        raise ValueError("freq_hz must be positive")
-    if zeta <= 0.0:
-        raise ValueError("zeta must be positive")
-    r = np.asarray(sweep_hz, dtype=float) / freq_hz
-    num = 1.0 + (2.0 * zeta * r) ** 2
-    den = (1.0 - r * r) ** 2 + (2.0 * zeta * r) ** 2
-    return np.sqrt(num / den)
+    """|T(r)| for absolute acceleration under harmonic base excitation."""
+    freq_hz = float(freq_hz)
+    if not math.isfinite(freq_hz) or freq_hz <= 0.0:
+        raise ValueError("freq_hz must be finite and positive")
+    zeta = _damping_ratio(zeta)
+    sweep = np.asarray(sweep_hz, dtype=float)
+    if (sweep.ndim != 1 or sweep.size == 0 or not np.all(np.isfinite(sweep))
+            or np.any(sweep <= 0.0)):
+        raise ValueError("sweep_hz must contain finite positive frequencies")
+    ratio = sweep / freq_hz
+    numerator = 1.0 + (2.0 * zeta * ratio) ** 2
+    denominator = (1.0 - ratio * ratio) ** 2 + (2.0 * zeta * ratio) ** 2
+    result = np.sqrt(numerator / denominator)
+    if not np.all(np.isfinite(result)):
+        raise ValueError("transmissibility calculation produced non-finite values")
+    return result
 
 
 def _interp_psd(psd_breakpoints: Sequence[Sequence[float]], f_hz: float) -> float:
-    """Log-log interpolate a PSD breakpoint table [(f_hz, g2_per_hz), ...] at f_hz.
-
-    Standard vibration-spec convention (test PSDs are straight lines on log-log axes,
-    i.e. constant dB/octave slopes). Flat extrapolation outside the table range.
-    """
-    pts = sorted((float(f), float(w)) for f, w in psd_breakpoints)
-    if not pts:
-        raise ValueError("psd_breakpoints is empty")
-    for f, w in pts:
-        if f <= 0.0 or w <= 0.0:
-            raise ValueError("PSD breakpoints must have positive frequency and PSD")
-    if f_hz <= pts[0][0]:
-        return pts[0][1]
-    if f_hz >= pts[-1][0]:
-        return pts[-1][1]
-    for (f0, w0), (f1, w1) in zip(pts, pts[1:]):
+    """Log-log interpolate a PSD table, with flat endpoint extrapolation."""
+    points = _validated_psd_points(psd_breakpoints)
+    f_hz = float(f_hz)
+    if not math.isfinite(f_hz) or f_hz <= 0.0:
+        raise ValueError("PSD interpolation frequency must be finite and positive")
+    if f_hz <= points[0][0]:
+        return points[0][1]
+    if f_hz >= points[-1][0]:
+        return points[-1][1]
+    for (f0, w0), (f1, w1) in zip(points, points[1:]):
         if f0 <= f_hz <= f1:
-            if f0 == f1:
-                return w0
-            t = (math.log(f_hz) - math.log(f0)) / (math.log(f1) - math.log(f0))
-            return math.exp(math.log(w0) + t * (math.log(w1) - math.log(w0)))
-    return pts[-1][1]  # unreachable
+            fraction = (math.log(f_hz) - math.log(f0)) / (math.log(f1) - math.log(f0))
+            return math.exp(math.log(w0) + fraction * (math.log(w1) - math.log(w0)))
+    raise RuntimeError("validated PSD interpolation interval was not found")
 
 
 def _reshape_modes(mode_shapes_flat: Sequence[float], n_modes: int, n_nodes: int) -> np.ndarray:
-    """Reshape the C++ solver's flat mode-shape array (n_modes*n_nodes*3, row-major)."""
+    """Reshape and validate the C++ solver's row-major mode-shape array."""
+    if isinstance(n_nodes, bool) or int(n_nodes) != n_nodes or n_nodes <= 0:
+        raise ValueError("n_nodes must be a positive integer")
+    if n_modes <= 0:
+        raise ValueError("at least one natural frequency is required")
     arr = np.asarray(mode_shapes_flat, dtype=float)
-    expect = n_modes * n_nodes * 3
-    if arr.size != expect:
+    expect = n_modes * int(n_nodes) * 3
+    if arr.ndim != 1 or arr.size != expect:
         raise ValueError(f"mode_shapes length {arr.size} != n_modes*n_nodes*3 = {expect}")
-    return arr.reshape(n_modes, n_nodes, 3)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("mode_shapes must be finite")
+    return arr.reshape(n_modes, int(n_nodes), 3)
 
 
 # ---------------------------------------------------------------------------
@@ -180,42 +214,57 @@ def harmonic_response(
     zeta: float = 0.02,
     base_accel_g: float = 1.0,
 ) -> dict[str, Any]:
-    """Harmonic base-excitation response spectrum by SDOF-per-mode modal superposition.
+    """Harmonic base-excitation response spectrum by modal superposition."""
+    freqs = np.asarray(freqs_hz, dtype=float)
+    if freqs.ndim != 1 or freqs.size == 0 or not np.all(np.isfinite(freqs)):
+        raise ValueError("freqs_hz must contain finite natural frequencies")
+    if np.any(freqs < 0.0):
+        raise ValueError("freqs_hz cannot contain negative frequencies")
+    zeta = _damping_ratio(zeta)
+    base_accel_g = float(base_accel_g)
+    if not math.isfinite(base_accel_g) or base_accel_g <= 0.0:
+        raise ValueError("base_accel_g must be finite and > 0")
+    sweep = np.asarray(sweep_hz, dtype=float)
+    if (sweep.ndim != 1 or sweep.size == 0 or not np.all(np.isfinite(sweep))
+            or np.any(sweep <= 0.0)):
+        raise ValueError("sweep_hz must contain finite positive frequencies")
 
-    Skips rigid-body modes (< 0.5 Hz — free-free solves emit ~0 Hz modes).
-    Returns peak response acceleration (g) vs sweep frequency, SRSS across modes.
-    """
-    freqs = [float(f) for f in freqs_hz]
-    n_modes = len(freqs)
-    shapes = _reshape_modes(mode_shapes_flat, n_modes, n_nodes)
+    shapes = _reshape_modes(mode_shapes_flat, len(freqs), n_nodes)
     mass = lumped_mass_vector(n_nodes, total_mass_kg)
     gamma, gen_mass = modal_participation(shapes, mass, excitation_dir)
 
-    sweep = np.asarray(sweep_hz, dtype=float)
     total_sq = np.zeros_like(sweep)
     per_mode: list[dict[str, Any]] = []
+    has_participating_mode = False
     for n, fn in enumerate(freqs):
-        if fn < 0.5:  # rigid-body mode — no elastic amplification
+        if fn < 0.5:
             continue
-        if gen_mass[n] <= 0.0:
+        if not math.isfinite(float(gen_mass[n])) or gen_mass[n] <= 0.0:
             continue
-        amp = abs(gamma[n]) / gen_mass[n]          # participation amplification
-        t = sdof_transmissibility(fn, sweep, zeta)
-        a_n = amp * t * base_accel_g               # (n_sweep,) response accel, g
-        total_sq += a_n * a_n
+        amp = abs(float(gamma[n])) / float(gen_mass[n])
+        has_participating_mode = has_participating_mode or amp > 0.0
+        transmissibility = sdof_transmissibility(float(fn), sweep, zeta)
+        response = amp * transmissibility * base_accel_g
+        total_sq += response * response
         per_mode.append({
             "mode": n,
-            "freq_hz": fn,
+            "freq_hz": float(fn),
             "gamma_over_m": amp,
-            "peak_accel_g": float(a_n.max()),
+            "peak_accel_g": float(response.max()),
         })
+    if not per_mode:
+        raise ValueError("modal result contains no elastic modes at or above 0.5 Hz")
+    if not has_participating_mode:
+        raise ValueError("no elastic mode participates in the requested excitation direction")
     total = np.sqrt(total_sq)
-    peak_idx = int(total.argmax()) if total.size else 0
+    if not np.all(np.isfinite(total)):
+        raise ValueError("harmonic response produced non-finite acceleration")
+    peak_idx = int(total.argmax())
     return {
         "sweep_hz": sweep.tolist(),
         "accel_g": total.tolist(),
-        "peak_accel_g": float(total.max()) if total.size else 0.0,
-        "peak_freq_hz": float(sweep[peak_idx]) if total.size else None,
+        "peak_accel_g": float(total[peak_idx]),
+        "peak_freq_hz": float(sweep[peak_idx]),
         "per_mode": per_mode,
         "zeta": zeta,
         "base_accel_g": base_accel_g,
@@ -239,41 +288,51 @@ def miles_response(
     psd_breakpoints: Sequence[Sequence[float]],
     zeta: float = 0.02,
 ) -> dict[str, Any]:
-    """Random-vibration GRMS by Miles' equation per mode, participation-scaled, SRSS total.
-
-    GRMS_n = (|Gamma_n|/m_n) * sqrt(pi/2 * fn * Q * W(fn)),  Q = 1/(2 zeta).
-    Steinberg [1], Eq. 6.6. APPROXIMATION — see module docstring.
-    """
-    freqs = [float(f) for f in freqs_hz]
-    n_modes = len(freqs)
-    shapes = _reshape_modes(mode_shapes_flat, n_modes, n_nodes)
+    """Random-vibration GRMS by Miles' equation and modal SRSS."""
+    freqs = np.asarray(freqs_hz, dtype=float)
+    if freqs.ndim != 1 or freqs.size == 0 or not np.all(np.isfinite(freqs)):
+        raise ValueError("freqs_hz must contain finite natural frequencies")
+    if np.any(freqs < 0.0):
+        raise ValueError("freqs_hz cannot contain negative frequencies")
+    zeta = _damping_ratio(zeta)
+    points = _validated_psd_points(psd_breakpoints)
+    shapes = _reshape_modes(mode_shapes_flat, len(freqs), n_nodes)
     mass = lumped_mass_vector(n_nodes, total_mass_kg)
     gamma, gen_mass = modal_participation(shapes, mass, excitation_dir)
 
-    q = 1.0 / (2.0 * zeta)
+    quality = 1.0 / (2.0 * zeta)
     per_mode: list[dict[str, Any]] = []
     total_sq = 0.0
+    has_participating_mode = False
     for n, fn in enumerate(freqs):
         if fn < 0.5 or gen_mass[n] <= 0.0:
             continue
-        w = _interp_psd(psd_breakpoints, fn)
-        amp = abs(gamma[n]) / gen_mass[n]
-        grms_sdof = math.sqrt(math.pi / 2.0 * fn * q * w)
+        density = _interp_psd(points, float(fn))
+        amp = abs(float(gamma[n])) / float(gen_mass[n])
+        has_participating_mode = has_participating_mode or amp > 0.0
+        grms_sdof = math.sqrt(math.pi / 2.0 * float(fn) * quality * density)
         grms = amp * grms_sdof
         total_sq += grms * grms
         per_mode.append({
             "mode": n,
-            "freq_hz": fn,
-            "psd_at_fn_g2_per_hz": w,
-            "Q": q,
+            "freq_hz": float(fn),
+            "psd_at_fn_g2_per_hz": density,
+            "Q": quality,
             "gamma_over_m": amp,
             "grms_sdof": grms_sdof,
             "grms": grms,
         })
+    if not per_mode:
+        raise ValueError("modal result contains no elastic modes at or above 0.5 Hz")
+    if not has_participating_mode:
+        raise ValueError("no elastic mode participates in the requested excitation direction")
+    total_grms = math.sqrt(total_sq)
+    if not math.isfinite(total_grms):
+        raise ValueError("Miles response produced a non-finite GRMS value")
     return {
         "per_mode": per_mode,
-        "total_grms": math.sqrt(total_sq),
-        "Q": q,
+        "total_grms": total_grms,
+        "Q": quality,
         "zeta": zeta,
         "method": "miles_equation",
         "combination": "SRSS",
@@ -291,44 +350,60 @@ def evaluate_vibration_spec(
     harmonic: Optional[dict[str, Any]],
     random: Optional[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
-    """Pass/fail verdict against a vibration spec requirement (DAG verify-node end condition).
-
-    spec keys (both optional, at least one required for a verdict):
-      max_peak_accel_g : harmonic peak response acceleration limit (g)
-      max_grms         : random total GRMS limit (g)
-
-    Returns None when spec is None/empty (no gate requested). A spec limit that
-    references a result mode that wasn't run FAILS closed with a reason.
-    """
+    """Evaluate finite, non-negative acceleration limits and fail closed."""
     if not spec:
         return None
     checks: list[dict[str, Any]] = []
     passed = True
-    if "max_peak_accel_g" in spec:
-        limit = float(spec["max_peak_accel_g"])
-        if harmonic is None or not harmonic.get("sweep_hz"):
-            checks.append({"check": "max_peak_accel_g", "limit": limit, "actual": None,
-                           "passed": False, "reason": "harmonic response not computed"})
-            passed = False
-        else:
-            actual = float(harmonic["peak_accel_g"])
-            ok = actual <= limit
-            checks.append({"check": "max_peak_accel_g", "limit": limit,
-                           "actual": actual, "passed": ok})
-            passed = passed and ok
-    if "max_grms" in spec:
-        limit = float(spec["max_grms"])
-        if random is None or not random.get("ok", True) or "total_grms" not in random:
-            checks.append({"check": "max_grms", "limit": limit, "actual": None,
+
+    def limit_value(key: str) -> Optional[float]:
+        nonlocal passed
+        try:
+            value = float(spec[key])
+        except (TypeError, ValueError):
+            value = math.nan
+        if not math.isfinite(value) or value < 0.0:
+            checks.append({"check": key, "limit": None, "actual": None,
                            "passed": False,
-                           "reason": "random (PSD) response not computed — provide psd_breakpoints"})
+                           "reason": f"{key} must be a finite non-negative limit"})
             passed = False
-        else:
-            actual = float(random["total_grms"])
-            ok = actual <= limit
-            checks.append({"check": "max_grms", "limit": limit,
-                           "actual": actual, "passed": ok})
-            passed = passed and ok
+            return None
+        return value
+
+    if "max_peak_accel_g" in spec:
+        limit = limit_value("max_peak_accel_g")
+        if limit is not None:
+            if harmonic is None or not harmonic.get("sweep_hz"):
+                checks.append({"check": "max_peak_accel_g", "limit": limit, "actual": None,
+                               "passed": False, "reason": "harmonic response not computed"})
+                passed = False
+            else:
+                actual = float(harmonic.get("peak_accel_g", math.nan))
+                ok = math.isfinite(actual) and actual <= limit
+                check = {"check": "max_peak_accel_g", "limit": limit,
+                         "actual": actual if math.isfinite(actual) else None, "passed": ok}
+                if not math.isfinite(actual):
+                    check["reason"] = "harmonic response is non-finite"
+                checks.append(check)
+                passed = passed and ok
+    if "max_grms" in spec:
+        limit = limit_value("max_grms")
+        if limit is not None:
+            if random is None or not random.get("ok", True) or "total_grms" not in random:
+                checks.append({"check": "max_grms", "limit": limit, "actual": None,
+                               "passed": False,
+                               "reason": "random (PSD) response not computed — "
+                                         "provide psd_breakpoints"})
+                passed = False
+            else:
+                actual = float(random.get("total_grms", math.nan))
+                ok = math.isfinite(actual) and actual <= limit
+                check = {"check": "max_grms", "limit": limit,
+                         "actual": actual if math.isfinite(actual) else None, "passed": ok}
+                if not math.isfinite(actual):
+                    check["reason"] = "random response is non-finite"
+                checks.append(check)
+                passed = passed and ok
     if not checks:
         return {"passed": False, "checks": [],
                 "reason": "vibration_spec had no recognized keys "

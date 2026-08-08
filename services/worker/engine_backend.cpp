@@ -48,8 +48,10 @@ std::mutex g_runClientMtx;                          // guards g_runClient creati
 // keeps holding g_client until it actually returns, so the UI stays wedged. Give the long
 // run its OWN connection instead; hostd serves each connection on its own thread and its
 // doc registry gates multi-writer overlap (same rationale as the cancel/steer side
-// sockets), so concurrent edits are safe. Only one long run is live at a time
-// (WorkerClient::callMtx_), so one reserved connection suffices.
+// sockets), so concurrent edits are safe. Agent and simulation WorkerClient
+// instances have separate call mutexes; if two long runs overlap, EngineClient
+// serializes them on this reserved connection instead of starving the GUI
+// connection.
 //
 // Both naming variants must match: the host RPC names (agent_run_v2 / agent_mission_v1)
 // reach engine::call directly when the C++ agent is OFF, but with it ON WorkerClient's
@@ -57,7 +59,10 @@ std::mutex g_runClientMtx;                          // guards g_runClient creati
 // engine::call — miss either and the run silently falls back to the shared client.
 bool isLongRunMethod(const std::string& method) {
     return method == "agent_run" || method == "agent_run_v2" ||
-           method == "agent_mission" || method == "agent_mission_v1";
+           method == "agent_mission" || method == "agent_mission_v1" ||
+           method == "sim_mesh" || method == "sim_run_static" ||
+           method == "sim_run_modal" || method == "sim_run_fatigue" ||
+           method == "sim_run_thermal" || method == "sim_run_flow";
 }
 
 // Lazily open (and reuse) the dedicated long-run connection. nullptr on connect failure —
@@ -301,12 +306,16 @@ static bool callDispatch(chudware_ipc::EngineClient* cl, const std::string& meth
 
 bool call(const std::string& method, const json& params, json& result, std::string& err,
           int timeoutMs, const std::function<void(const json&)>& onEvent) {
+    // Initialize daemon mode before copying g_client. A first short request reaches this
+    // function before any other daemonMode() caller, so copying first would pass the
+    // pre-initialization nullptr into callDispatch even though initOnce then armed daemon mode.
     // Long streaming runs go on a dedicated connection so they never hold the shared GUI
     // client's call mutex (needed by the GL thread for attach_doc / doc_discard / event
     // drains) — otherwise a live run freezes the UI until it unwinds. Fall back to the
-    // shared client if the dedicated connection can't be established.
-    chudware_ipc::EngineClient* cl = g_client;
-    if (daemonMode() && isLongRunMethod(method)) {
+    // initialized shared client if the dedicated connection can't be established.
+    const bool useDaemon = daemonMode();
+    chudware_ipc::EngineClient* cl = useDaemon ? g_client : nullptr;
+    if (useDaemon && isLongRunMethod(method)) {
         if (auto* rc = runClient()) cl = rc;
     }
     bool ok = callDispatch(cl, method, params, result, err, timeoutMs, onEvent);

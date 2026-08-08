@@ -16,6 +16,7 @@ outside the fs_* workspace jail, so fs_write cannot reach it) → build with a r
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -36,6 +37,78 @@ def _err(reason: str, hint: str = "", **extra) -> dict:
         out["hint"] = hint
     out.update(extra)
     return out
+
+
+def _nonfinite_path(value, path: str = "$") -> str:
+    """Return the first nested path containing NaN/Inf, or ``""`` when finite."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if not math.isfinite(float(value)):
+                return path
+        except (OverflowError, TypeError, ValueError):
+            return path
+    if isinstance(value, dict):
+        for key, child in value.items():
+            found = _nonfinite_path(child, f"{path}.{key}")
+            if found:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            found = _nonfinite_path(child, f"{path}[{index}]")
+            if found:
+                return found
+    return ""
+
+
+def _finite_number(value, *, positive: bool = False, nonnegative: bool = False) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    if not math.isfinite(number):
+        return False
+    if positive:
+        return number > 0.0
+    if nonnegative:
+        return number >= 0.0
+    return True
+
+
+def _file_problem(raw_path, label: str, *, elf: bool = False,
+                  expected_machine: Optional[int] = None) -> str:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return f"{label} must be a non-empty path"
+    try:
+        path = Path(raw_path).expanduser()
+        if not path.is_file():
+            return f"{label} does not name a regular file: {path}"
+    except (OSError, ValueError) as exc:
+        return f"{label} is not a usable path: {exc}"
+    if elf:
+        try:
+            with path.open("rb") as stream:
+                header = stream.read(20)
+            if len(header) != 20 or header[:4] != b"\x7fELF":
+                return f"{label} is not an ELF image: {path}"
+            if header[4] not in (1, 2) or header[5] not in (1, 2) or header[6] != 1:
+                return f"{label} has an invalid ELF identification header: {path}"
+            byteorder = "little" if header[5] == 1 else "big"
+            image_type = int.from_bytes(header[16:18], byteorder)
+            machine = int.from_bytes(header[18:20], byteorder)
+            if image_type not in (2, 3) or machine == 0:
+                return f"{label} is not an executable ELF image: {path}"
+            if expected_machine is not None and machine != expected_machine:
+                return (
+                    f"{label} targets ELF machine {machine}, "
+                    f"expected {expected_machine}: {path}"
+                )
+            if path.stat().st_size < (52 if header[4] == 1 else 64):
+                return f"{label} has a truncated ELF header: {path}"
+        except OSError as exc:
+            return f"{label} cannot be read: {exc}"
+    return ""
 
 
 # --------------------------------------------------------------------- project roots
@@ -437,6 +510,27 @@ def register_firmware_tools(mcp) -> None:
         Falls back gracefully when neither Renode nor QEMU is installed (``passed=False``,
         ``uart_log`` explains what's missing). Run ``fw_build`` first to produce the ELF.
         """
+        if not isinstance(project_id, str) or not project_id.strip():
+            return _dumps(_err("invalid_request", "project_id must be a non-empty string"))
+        if elf_path:
+            problem = _file_problem(elf_path, "elf_path", elf=True)
+            if problem:
+                return _dumps(_err("invalid_request", problem))
+        if not _finite_number(run_s, nonnegative=True):
+            return _dumps(_err(
+                "invalid_request", "run_s must be finite and non-negative (0 uses the engine default)"))
+        if not _finite_number(timeout_s, nonnegative=True):
+            return _dumps(_err(
+                "invalid_request", "timeout_s must be finite and non-negative (0 uses the engine default)"))
+        if assertions is not None:
+            if not isinstance(assertions, list) or any(
+                    not isinstance(item, str) or not item.strip() for item in assertions):
+                return _dumps(_err(
+                    "invalid_request", "assertions must be a list of non-empty strings"))
+        bad_path = _nonfinite_path(scenario)
+        if bad_path:
+            return _dumps(_err(
+                "invalid_request", f"scenario contains a non-finite number at {bad_path}"))
         p: dict = {"project_id": project_id}
         if elf_path:
             p["elf_path"] = elf_path
@@ -445,13 +539,13 @@ def register_firmware_tools(mcp) -> None:
         if assertions:
             p["assertions"] = assertions
         notes: list[str] = []
-        if timeout_s > 0:
+        if float(timeout_s) > 0:
             p["timeout_s"] = float(timeout_s)
-            if run_s > 0:
+            if float(run_s) > 0:
                 notes.append(
                     f"run_s={run_s} ignored: explicit timeout_s={timeout_s} wins "
                     f"(target runs for timeout_s-{_SIM_HARNESS_MARGIN_S:g}s)")
-        elif run_s > 0:
+        elif float(run_s) > 0:
             p["timeout_s"] = float(run_s) + _SIM_HARNESS_MARGIN_S
             notes.append(
                 f"run_s={run_s} applied as timeout_s={p['timeout_s']:g} — the emulated "
@@ -690,17 +784,24 @@ def register_firmware_tools(mcp) -> None:
                 dt_s=0.05)
             fw_sim_run(project_id, scenario=sc["scenario"], assertions=[...])
         """
-        p: dict = {"dt_s": float(dt_s)}
-        if duration_s and float(duration_s) > 0:
-            p["duration_s"] = float(duration_s)
-        if name:
-            p["name"] = name
-        if sensor_map:
-            p["sensor_map"] = sensor_map
-        # profile / sim_result may arrive as JSON strings from the MCP wire
-        def _parse(blob: str):
-            if not blob:
-                return None
+        if not _finite_number(dt_s, positive=True):
+            return _dumps(_err("invalid_request", "dt_s must be finite and greater than zero"))
+        if not _finite_number(duration_s, nonnegative=True):
+            return _dumps(_err(
+                "invalid_request", "duration_s must be finite and non-negative (0 uses the profile span)"))
+        if not isinstance(sensor_map, list) or not sensor_map:
+            return _dumps(_err("invalid_request", "sensor_map must be a non-empty list"))
+        if any(not isinstance(entry, dict) for entry in sensor_map):
+            return _dumps(_err("invalid_request", "every sensor_map entry must be an object"))
+        has_profile = profile not in ("", None)
+        has_sim_result = sim_result not in ("", None)
+        if has_profile and has_sim_result:
+            return _dumps(_err(
+                "invalid_request", "pass profile or sim_result, not both (profile would otherwise win)"))
+        if not has_profile and not has_sim_result:
+            return _dumps(_err("invalid_request", "profile or sim_result is required"))
+
+        def _parse(blob):
             if isinstance(blob, (dict, list)):
                 return blob
             try:
@@ -708,16 +809,27 @@ def register_firmware_tools(mcp) -> None:
             except (TypeError, json.JSONDecodeError) as exc:
                 return _err("invalid_request", f"profile is not valid JSON: {exc}")
 
-        if profile:
-            parsed = _parse(profile)
-            if isinstance(parsed, dict) and parsed.get("code"):
-                return _dumps(parsed)
-            p["profile"] = parsed
-        if sim_result:
-            parsed = _parse(sim_result)
-            if isinstance(parsed, dict) and parsed.get("code"):
-                return _dumps(parsed)
-            p["sim_result"] = parsed
+        parsed = _parse(profile if has_profile else sim_result)
+        if isinstance(parsed, dict) and parsed.get("code"):
+            return _dumps(parsed)
+        if not isinstance(parsed, (dict, list)):
+            return _dumps(_err(
+                "invalid_request", "profile must decode to a JSON object or sample array"))
+        bad_path = _nonfinite_path(parsed)
+        if bad_path:
+            return _dumps(_err(
+                "invalid_request", f"profile contains a non-finite number at {bad_path}"))
+        bad_sensor_path = _nonfinite_path(sensor_map)
+        if bad_sensor_path:
+            return _dumps(_err(
+                "invalid_request", f"sensor_map contains a non-finite number at {bad_sensor_path}"))
+
+        p: dict = {"dt_s": float(dt_s), "sensor_map": sensor_map}
+        if float(duration_s) > 0:
+            p["duration_s"] = float(duration_s)
+        if name:
+            p["name"] = name
+        p["profile" if has_profile else "sim_result"] = parsed
         return _dumps(cb.call("fw_sensor_scenario", p))
 
     # -----------------------------------------------------------------------
@@ -845,9 +957,28 @@ def register_firmware_tools(mcp) -> None:
         [~] Software-only — no hardware required, but needs `simavr` (and `avr-gdb` for
         gdb=True) on PATH.
         """
+        problem = _file_problem(
+            elf_path, "elf_path", elf=True, expected_machine=83)  # EM_AVR
+        if problem:
+            return _dumps(_err("invalid_request", problem))
+        if not isinstance(mcu, str) or not mcu.strip():
+            return _dumps(_err("invalid_request", "mcu must be a non-empty string"))
+        if not _finite_number(run_s, positive=True):
+            return _dumps(_err("invalid_request", "run_s must be finite and greater than zero"))
+        if not isinstance(gdb_port, int) or isinstance(gdb_port, bool) or not 1 <= gdb_port <= 65535:
+            return _dumps(_err("invalid_request", "gdb_port must be an integer in 1..65535"))
+        if mi_commands is not None and (
+                not isinstance(mi_commands, list) or
+                any(not isinstance(command, str) or not command.strip()
+                    for command in mi_commands)):
+            return _dumps(_err(
+                "invalid_request", "mi_commands must be a list of non-empty strings"))
+        if not gdb and (gdb_port != 1234 or mi_commands):
+            return _dumps(_err(
+                "invalid_request", "gdb_port and mi_commands require gdb=True"))
         p: dict = {"elf_path": elf_path, "mcu": mcu}
-        if run_s != 2.0:
-            p["run_s"] = run_s
+        if float(run_s) != 2.0:
+            p["run_s"] = float(run_s)
         if gdb:
             p["gdb"] = True
             if gdb_port != 1234:
@@ -877,9 +1008,25 @@ def register_firmware_tools(mcp) -> None:
 
         [~] Software-only — no hardware required, but needs `renode` (.NET runtime) on PATH.
         """
+        problem = _file_problem(resc_path, "resc_path")
+        if problem:
+            return _dumps(_err("invalid_request", problem))
+        if not _finite_number(run_s, positive=True):
+            return _dumps(_err("invalid_request", "run_s must be finite and greater than zero"))
+        if not isinstance(gdb_port, int) or isinstance(gdb_port, bool) or not 1 <= gdb_port <= 65535:
+            return _dumps(_err("invalid_request", "gdb_port must be an integer in 1..65535"))
+        if mi_commands is not None and (
+                not isinstance(mi_commands, list) or
+                any(not isinstance(command, str) or not command.strip()
+                    for command in mi_commands)):
+            return _dumps(_err(
+                "invalid_request", "mi_commands must be a list of non-empty strings"))
+        if not gdb and (gdb_port != 3333 or mi_commands):
+            return _dumps(_err(
+                "invalid_request", "gdb_port and mi_commands require gdb=True"))
         p: dict = {"resc_path": resc_path}
-        if run_s != 2.0:
-            p["run_s"] = run_s
+        if float(run_s) != 2.0:
+            p["run_s"] = float(run_s)
         if gdb:
             p["gdb"] = True
             if gdb_port != 3333:

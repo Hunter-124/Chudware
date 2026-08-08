@@ -6,8 +6,58 @@
 **Script:** `scripts/sim_audit.py` (re-runnable; 8 checks executed, 23 skipped with reason)
 
 ---
+## Full-suite follow-up — 2026-08-07
 
-## Executive Summary
+The production C++ core, Python simulation engines, MCP workflows, and desktop setup/results
+surfaces were audited together rather than source-inspected in isolation. The live audit now
+executes 42 of 43 checks with zero broken findings. openEMS/CSXCAD is installed and its real
+WR-90 solve passes the EM worker suite; the normal audit intentionally skips that comparatively
+heavy full-wave run after validating its plan. The provisioned OpenFOAM v2412 path was exercised,
+not merely probed: the coarse sphere case converged at $Re=10{,}000$ with $C_d=0.329$ inside the
+accepted steady-RANS band $[0.25, 0.55]$.
+
+Key corrections include: physically valid FEA setup/load/constraint handling and tet10 result
+accounting; thermal, modal, fatigue, assembly, hydraulic, piping, SPICE, ECAD, CHT, motion, and
+firmware workflow completion; deterministic cancellation/cache/error contracts; and live result
+validation instead of fabricated or empty success envelopes. The LBM path now samples momentum
+exchange on the solid destination before bounce-back, uses a window-mean convergence estimator,
+stops only on positive passive-body drag plus mass continuity, and applies a disclosed
+$\tau=0.55$ stability floor. It reports both physical and effective lattice Reynolds numbers and
+invalidates older cached results. OpenFOAM's current flat `force.dat` format is accepted alongside
+the legacy nested-vector format.
+
+The desktop flow workflow now exports an actual `.stl`, reports numeric-only LBM results without
+fake plot/temperature fields, preserves the editable model when no contour exists, and displays
+the reduced-Re limitation prominently. The motion smoke now creates both components in one
+revision-safe transaction, grounds the base, drives a resolved distance mate through 24
+collision-free frames, and visibly advances playback. Headless `flow`, `fea`, and `motion`
+scenarios completed against the freshly built in-process engine.
+
+Verification at this checkpoint:
+
+- `services/sim`: **168 passed, 5 skipped** (the skips are optional external capabilities).
+- End-to-end MCP simulation workflows: **173 passed**.
+- EM adapter/worker suite: **28 passed**, including the installed openEMS full-wave solve.
+- Focused native simulation targets: **15/15 passed**.
+- `scripts/sim_audit.py`: **43 checks, 42 executed, 1 intentionally skipped, 0 broken** with
+  live OpenFOAM.
+
+Re-run the live audit from the repository root:
+
+```bash
+CHUDWARE_ENGINE_DAEMON=0 \
+CHUDWARE_LIBCHUDWARE="$PWD/core/build-occt-linux/bin/libchudware.so" \
+CHUDWARE_SIM_AUDIT_LIVE_FOAM=1 \
+.venv-mcp/bin/python -X utf8 scripts/sim_audit.py
+```
+
+The detailed 2026-07-02 tables below are retained as historical baseline; their provisioning and
+raw-bridge limitations are superseded by this follow-up.
+
+---
+
+
+## Original Executive Summary (2026-07-02)
 
 | Verdict | Count | Tools |
 |---------|-------|-------|

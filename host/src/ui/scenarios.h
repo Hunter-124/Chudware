@@ -180,9 +180,9 @@ private:
     bool wsDirReady = false;
     std::string wsSavePath, wsCapture;
 
-    // ---------- motion scenario (CHUDWARE_SHOT=motion) ----------
-    // Builds a 2-body assembly with an angle mate, runs a Motion study, captures t0/t1/t2
-    // where body positions differ. Proves kinematic motion playback is end-to-end live.
+    // Builds a grounded 2-body assembly with a distance mate, runs a Motion study,
+    // and captures t0/t1/t2 where body positions differ. Proves kinematic motion
+    // playback is end-to-end live.
     void runMotion(AppState& st);
     bool mtInit = false, mtWant = false, mtDone = false;
     int  mtStep = 0, mtSettle = 0;
@@ -190,7 +190,7 @@ private:
     std::string mtSavePath, mtCapture;
     std::string mtBasePath, mtArmPath;   // authored part AICM paths
     std::string mtAsmDoc;                // assembly doc id
-    std::string mtK2;                    // second component id (the arm)
+    std::string mtK1, mtK2;               // grounded base and moving arm component ids
     bool mtRunOk = false;                // motion solve succeeded
 };
 

@@ -14,6 +14,7 @@
 
 #include <array>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,7 +24,10 @@
 
 struct AppState;
 
-namespace core { class SimClient; }
+namespace core {
+class SimClient;
+struct RpcResult;
+}
 
 namespace ui {
 
@@ -173,8 +177,8 @@ struct Study {
 
     // ---- Motion study (StudyType::Motion) ----
     // Drives ONE dimensional assembly mate across [motionStart, motionStop] in `motionSteps`
-    // samples; re-solves the mate graph at each step. The per-body 4×4 world transforms are
-    // cached in motionTrajectory and played back with setBodyTransforms().
+    // samples; re-solves the mate graph at each step. Per-component world transforms are keyed
+    // by stable component id and played back against a cached world-space AICM base pose.
     std::string motionMateId;           // mate id to drive (empty = auto-pick single drivable mate)
     float motionStart = 0.0f;           // driver start value (deg or mm)
     float motionStop  = 360.0f;         // driver stop value
@@ -188,12 +192,13 @@ struct Study {
     bool  motionPlaying   = false;
     int   motionFrame     = 0;          // current displayed frame
     double motionLastTick = -1.0;       // ImGui::GetTime() at last frame advance
-    nlohmann::json motionTrajectory;    // array of {i, value, converged, bodies:[{name, transform}]}
+    nlohmann::json motionTrajectory;    // [{i,value,converged,bodies:[{component,name,transform}]}]
     std::string motionDriverUnit;       // "deg" or "mm"
-    // Per-body translation magnitude trace (|t| per frame) for the position plot.
-    // Keyed by body name; built once after runMotion and plotted in the Results panel.
-    std::vector<std::string> motionBodyNames;   // body display order (from frame 0)
-    int  motionPlotBody = 0;                    // which body to show in the trace plot
+    std::string motionRenderError;      // non-empty when cache/transform validation blocks playback
+    // Stable ids drive trajectory lookup; names are presentation-only labels in the Results combo.
+    std::vector<std::string> motionBodyIds;
+    std::vector<std::string> motionBodyLabels;
+    int  motionPlotBody = 0;            // which stable component id to show in the trace plot
 
     // Result state (transient — regenerated on Run; never persisted).
     bool hasResult = false;
@@ -314,8 +319,14 @@ public:
     // Advance the active motion study to a specific frame and upload transforms to the viewport.
     // No-op when motionHasResult() is false.
     void applyMotionFramePublic(AppState& st, int frame);
+    // Scripted-shot helper: set the selected motion study's dimensional sweep.
+    void configureActiveMotion(AppState& st, float start, float stop, int steps);
     // Scripted-shot helper (CHUDWARE_SHOT=flow): set the active flow study's fluid / angles / resolution.
     void configureActiveFlow(AppState& st, int fluid, float aoaDeg, float sideslipDeg, int preset);
+    // True when the selected flow study has a successful numeric result.  The fast
+    // C++ LBM route may legitimately have no contour overlay, so scripted/live
+    // verification must not equate "no colormap" with solver failure.
+    bool flowHasResult() const;
 
     // Material lookup (singleton: built-in engine/sim/materials.json + user custom_materials.json).
     struct Material {
@@ -366,6 +377,7 @@ private:
     // engine mutation
     void newStudy(AppState& st, StudyType t);
     void persist(AppState& st, Study& s);          // sim_study_edit for one study
+    void persist(AppState& st, const std::string& docId, Study& s);
     void deleteStudy(AppState& st, int i);
     static nlohmann::json studyToJson(const Study& s);
     static Study studyFromJson(const nlohmann::json& j);
@@ -376,16 +388,20 @@ private:
 
     // run
     void run(AppState& st, Study& s);
+    void drainSimClientJob(AppState& st);
     void runStaticOrModal(AppState& st, Study& s);
     void runFlow(AppState& st, Study& s);
     void runFatigue(AppState& st, Study& s);
     // Motion study: call simulate_motion synchronously on the worker, parse the trajectory,
     // show frame 0 and navigate to Results. runMotion is called once from run().
     void runMotion(AppState& st, Study& s);
-    // Apply one trajectory frame to the renderer: CPU-transform each body's cached positions by
-    // the row-major 4×4 from the trajectory, then re-upload via st.setBodyTransforms().
-    void applyMotionFrame(AppState& st, Study& s, int frame);
-    // Build the per-body position-magnitude trace for the plot from the stored trajectory.
+    // Cache the active document's world-space AICM plus its stable body-id -> component-id join and
+    // the world transform already baked into each body's vertices.
+    bool prepareMotionCache(AppState& st, Study& s, std::string& err);
+    // Apply frameWorld * inverse(cachedBaseWorld) to the cached world-space vertices, validate the
+    // complete frame, then atomically re-upload it. Returns false without touching the renderer.
+    bool applyMotionFrame(AppState& st, Study& s, int frame);
+    // Validate the per-component position-magnitude trace inputs.
     void buildMotionTrace(Study& s);
     // Inline form for a Motion study (mate-id / range / steps / interference / fps / loop).
     void drawMotionForm(AppState& st, Study& s);
@@ -504,13 +520,18 @@ private:
         int  docTab = -1;             // docTabs index of the schematic to simulate
         int  analysis = 3;            // 0 op, 1 dc, 2 ac, 3 tran
         float tranStopMs = 5.0f, tranStepUs = 50.0f;
+        char  dcSource[64] = "V1";
+        float dcStart = 0.0f, dcStop = 5.0f, dcStep = 0.1f;
         float acStartHz = 10.0f, acStopHz = 1e6f; int acPoints = 61;
-        // Result (transient). ok<0 unrun, 0 error, 1 ok.
+        // Result (transient). ok<0 unrun, 0 error, 1 ok. resultDocId/resultDocTitle
+        // bind the payload to the schematic that launched it even if tabs are reordered or
+        // the user selects another schematic before the async callback drains.
         int  result = -1;
-        std::string error, headline;
+        int  resultAnalysis = -1;
+        std::string error, headline, resultDocId, resultDocTitle;
         std::vector<std::string> probes;   // trace names available in the last result
         int  probeIdx = 0;
-        std::vector<float> xs, ys;         // active trace (tran: t/V, ac: f/dB)
+        std::vector<float> xs, ys;         // active trace (tran/dc voltage, ac dB)
         nlohmann::json raw;                // full ecad_simulate payload
     };
     ElState el_;
@@ -528,7 +549,7 @@ private:
         std::vector<std::string> projectIds, projectNames;
         int  projIdx = 0;
         char asserts[256] = "";
-        float durationMs = 200.0f;
+        float durationMs = 1000.0f; // requested target run time; backend timeout adds 5 s grace
         int  result = -1;             // <0 unrun, 0 error, 1 ok
         std::string error, headline;
         std::vector<std::string> uart; // UART console tail from the run
@@ -543,13 +564,20 @@ private:
     // Cross-sim handoff panel (aicad.simhandoff/1 seam): ECAD board -> thermal FEA
     // (ecad_thermal_handoff worker mirror) + the T-FIN17 heatsink pick forward seam.
     struct HandoffState {
-        int  docTab = -1;             // docTabs index of the PCB tab
+        // Stable ECAD identity. The docTabs vector is presentation order only and may
+        // reorder or reuse an index after the source board closes.
+        std::string ecadDocId;
+        std::string ecadDocTitle;
         int  envIdx = 0;              // 0 still_air, 1 forced_air, 2 cold_plate
         bool traceHeating = false;
         bool running = false;
         std::string error;
         nlohmann::json result;        // last ecad_thermal_handoff payload
         nlohmann::json heatsink;      // last heatsink_select payload (T-FIN17)
+        std::string heatsinkComponentRef;
+        int heatsinkTargetKind = 0;   // 0 junction (Tj), 1 case (Tcase)
+        float heatsinkTargetC = 0.0f;
+        bool heatsinkContextReady = false;
         bool heatsinkRunning = false;
     };
     HandoffState ho_;
@@ -558,13 +586,17 @@ private:
     void drawHandoffPanel(AppState& st);
     void runEcadThermalHandoff(AppState& st);
     void runHeatsinkSelect(AppState& st);
+    int resolveHandoffDocTab(const AppState& st) const;
+    void deriveHeatsinkTarget(const std::string& componentRef);
+    std::string heatsinkSetupBlocker(const AppState& st) const;
 
     // T-FIN24 runs.
     void runThermalFea(AppState& st, Study& s);       // SimClient sim_run_thermal
     void runBuckling(AppState& st, Study& s);         // worker sim_run_buckling (async rpc)
     void runContact(AppState& st, Study& s);          // worker sim_run_contact (async rpc)
     void runFreqResponse(AppState& st, Study& s);     // modal solve, post in tick completion
-    void postFreqResponse(AppState& st, Study& s, const nlohmann::json& modalRes);
+    void postFreqResponse(AppState& st, Study& s, const nlohmann::json& modalRes,
+                          const std::string& docId);
     bool advRunning_ = false;                          // an async worker study run in flight
     // Model bbox from the face-centroid cache (proxy dims for buckling/contact).
     bool modelBbox(AppState& st, float lo[3], float hi[3]) const;
@@ -581,8 +613,15 @@ private:
     bool running_ = false;          // a run launched by THIS manager is in flight
     int  runningStudy_ = -1;        // index of the study that launched the in-flight run
     std::string runningStudyId_;    // stable id of the launched study (survives refresh/reorder)
-    // True while export + face-points prep runs on a background thread (before SimClient::launch).
-    // Keeps the Run button disabled without blocking the UI thread on web/daemon.
+    // Export + selector resolution run through AsyncRpc. Its callbacks are drained on the UI
+    // thread, and closed DocSessions remain retired until that queue drains.
+    struct StaticModalPrep;
+    void failStaticModalPrep(AppState& st, const std::shared_ptr<StaticModalPrep>& prep,
+                             const std::string& message);
+    void finishStaticModalPrep(AppState& st, const std::shared_ptr<StaticModalPrep>& prep);
+    bool prepFaceResult(AppState& st, const std::shared_ptr<StaticModalPrep>& prep,
+                        const core::RpcResult& result, nlohmann::json& destination);
+    std::shared_ptr<StaticModalPrep> staticModalPrep_;
     bool prepInFlight_ = false;
     // After loadDocMeshAsync for a result overlay, finish legend/deform once drain commits.
     std::string pendingOverlayStudyId_;
@@ -618,10 +657,14 @@ private:
     double flowLinesVmax_ = 1.0;           // speed range the bands were built against
     void rebuildFlowLines(AppState& st, Study& s);  // (re)parse the overlay AICM into the band arrays
 
-    // Motion study: CPU-side cached DocMesh so applyMotionFrame can re-upload with per-body
-    // transforms without re-parsing the AICM each frame. Populated in runMotion(), cleared in
-    // clearResultOverlay(). The PartMesh rebuilding mirrors AppState::loadDocMesh's shaded path.
+    // Motion study: this SimManager is owned by one DocSession, so keeping the cache here preserves
+    // playback across workspace/document-tab switches without leaking it to another document.
+    // AICM vertices are world-space; base transforms are keyed by stable component id and removed
+    // from each requested frame before upload.
     render::DocMesh motionDocMesh_;
+    std::string motionCacheDocId_;
+    std::map<uint32_t, std::string> motionComponentByBodyId_;
+    std::map<std::string, std::array<double, 16>> motionInverseBaseWorldByComponentId_;
 
     // Custom-material editor scratch (filled by the "+ New material…" popup).
     char cmName_[64] = "";

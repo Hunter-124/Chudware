@@ -6844,3 +6844,25 @@ gateway suite (272 passed, 4 skipped), a native application build, the completed
 `/app` redirect plus relative asset fetch, exact v2 chat round-trip, role-aware provider privacy,
 admin provider enumeration, standard-user provider denial, and a live Kimi begin/poll/cancel flow
 against an isolated credential store.
+
+## 2026-08-07 — Full simulation-suite accuracy and workflow audit
+
+The complete simulation surface was exercised from native kernels through MCP and desktop
+workflows. Static/modal/thermal/fatigue FEA setup and tet10 accounting, assembly handoff,
+hydraulics/piping, SPICE/ECAD jobs, CHT, motion dynamics, cancellation, caching, and structured
+failure envelopes were corrected and cross-checked against independent analytic anchors. The CFD
+path now exports a real STL, samples pre-bounce solid-link momentum, time-averages the settled
+force, requires continuity and positive passive-body drag, invalidates stale solver caches, and
+discloses its $\tau=0.55$ reduced-Re stability model. OpenFOAM v2412 flat force tables are parsed
+alongside legacy tables; the live coarse sphere returned $C_d=0.329$ at $Re=10{,}000$, inside the
+accepted steady-RANS band.
+
+The Simulation Manager no longer presents numeric-only LBM output as fake temperature/plot data
+or drops the editable model when no contour exists. Its flow smoke reaches a visible force and
+coefficient table with the physical/effective Reynolds disclosure. The motion smoke now authors a
+grounded two-body assembly in one revision-safe operation, drives a resolved distance mate across
+24 collision-free frames, and visibly advances playback. Final reruns completed with 168 Python
+simulation tests passed (5 optional skips), 173 end-to-end MCP workflow tests passed, the 28-test
+EM suite passing against the installed openEMS full-wave backend, all 15 focused native targets
+passed, and the live audit at 42/43 executed with its heavy openEMS leg intentionally skipped and
+zero broken findings.

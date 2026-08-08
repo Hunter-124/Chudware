@@ -22,6 +22,7 @@
 
 #include <array>
 #include <cmath>
+#include <limits>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -75,17 +76,13 @@ AsmInfo make_distance_mate_assembly(const fs::path& step_a, const fs::path& step
     if (cid_a.empty()) cid_a = "k1";
     if (cid_b.empty()) cid_b = "k2";
 
-    // Add a distance mate. The refs point to the two components (no selectors);
-    // the selector fields are null so they will dangle at solve time — that is fine
-    // for our purposes (we just need the mate classified as "distance" so it is
-    // drivable and validate_document accepts it).
+    // Add a resolved plane-distance mate. Face selectors are in each imported
+    // component's local geometry coordinates (the second STEP box itself starts
+    // at x=40), so the +Z face centroids below resolve exactly.
     //
     // validate_document requires:
     //   - refs: distance takes 2 entries, each with component + selector.
     //   - value: must be a dim object {value, expr}.
-    // Face selectors require centroid:[x,y,z]. Pick a point on the +Z face of
-    // each box (z=10). The selector will dangle at solve time (no matching topo)
-    // but validate_document will accept it.
     json sel_a = {{"kind", "face"}, {"centroid", json::array({5.0, 5.0, 10.0})}};
     json sel_b = {{"kind", "face"}, {"centroid", json::array({45.0, 5.0, 10.0})}};
     json refs = json::array({
@@ -186,6 +183,15 @@ TEST_CASE("doc_simulate_motion: trajectory shape + frame count") {
         CHECK_MESSAGE(moved, "body transforms did not change across the sweep "
                      "— the mate may be dangling or the solver is not moving bodies");
     }
+    // The study is genuinely read-only: no revision bump, tree/value/transform
+    // mutation, or restore-shaped residue.
+    const json before = doc::doc_tree(ai.doc_id);
+    json again = doc::doc_simulate_motion(
+        ai.doc_id, ai.mate_id, 15.0, 35.0, 3, false, 0.0);
+    REQUIRE(again.value("ok", false));
+    const json after = doc::doc_tree(ai.doc_id);
+    CHECK(after.at("revision") == before.at("revision"));
+    CHECK(after.at("tree") == before.at("tree"));
 
     fs::remove(pa);
     fs::remove(pb);
@@ -213,11 +219,9 @@ TEST_CASE("doc_simulate_motion: kinematics-only result carries NO dynamics block
     fs::remove(pb);
 }
 
-TEST_CASE("doc_simulate_motion: dynamics request adds a dynamics block") {
-    // Smoke: dynamics options produce the block with bodies + frames. (The mate
-    // selectors in this fixture dangle, so no joints resolve — that must be a
-    // WARNING, never a failure; the analytic joint-reaction V&V lives in
-    // test_motion_dynamics.cpp.)
+TEST_CASE("doc_simulate_motion: underconstrained dynamics reports an incomplete force path") {
+    // A plane-distance mate constrains only one translation. It can carry the gravity
+    // force component, but cannot balance the offset moment or free rotational DOFs.
     fs::path pa = make_box_step("dyn_a", 0.0);
     fs::path pb = make_box_step("dyn_b", 40.0);
     AsmInfo ai = make_distance_mate_assembly(pa, pb);
@@ -229,16 +233,30 @@ TEST_CASE("doc_simulate_motion: dynamics request adds a dynamics block") {
     };
     json result = doc::doc_simulate_motion(ai.doc_id, ai.mate_id,
                                            10.0, 50.0, 5, false, 0.0, dyn);
-    REQUIRE(result.value("ok", false));
+    INFO("motion result: ", result.dump(2));
+    CHECK_FALSE(result.value("ok", true));
     REQUIRE(result.contains("dynamics"));
     const json& d = result["dynamics"];
     CHECK(d.contains("bodies"));
     CHECK(d.contains("frames"));
-    CHECK(d.contains("warnings"));
+    CHECK_FALSE(d.value("ok", true));
+    CHECK_FALSE(d.value("force_path_resolved", true));
     // Both boxes got mass from geometry x density (10x10x10 mm at 2.7 g/cm3 = 2.7 g).
     REQUIRE((int)d["bodies"].size() == 2);
     for (const json& b : d["bodies"])
         CHECK(std::abs(b.value("mass_kg", 0.0) - 0.0027) < 1e-6);
+    // OCCT reports MatrixOfInertia about COM already. A 10 mm cube has
+    // Ixx=Iyy=Izz=m*L^2/6; translating the source geometry must not trigger a
+    // second parallel-axis subtraction or produce negative inertia.
+    const double expected_i = 0.0027 * 0.01 * 0.01 / 6.0;
+    for (const json& b : d["bodies"]) {
+        const json& inertia = b.at("inertia_com_kg_m2");
+        REQUIRE(inertia.size() == 9);
+        CHECK(std::abs(inertia[0].get<double>() - expected_i) < 1e-10);
+        CHECK(std::abs(inertia[4].get<double>() - expected_i) < 1e-10);
+        CHECK(std::abs(inertia[8].get<double>() - expected_i) < 1e-10);
+        CHECK(std::abs(inertia[1].get<double>()) < 1e-12);
+    }
     // One dynamics frame per kept trajectory sample, timestamped across duration_s.
     CHECK((int)d["frames"].size() == (int)result["trajectory"].size());
     if (!d["frames"].empty())
@@ -266,4 +284,38 @@ TEST_CASE("doc_simulate_motion: steps < 2 throws") {
         CHECK(std::string(e.what()).find("steps") != std::string::npos);
     }
     CHECK(threw);
+}
+
+TEST_CASE("doc_simulate_motion: invalid finite/timing/dynamics setup is rejected") {
+    fs::path pa = make_box_step("invalid_a", 0.0);
+    fs::path pb = make_box_step("invalid_b", 40.0);
+    AsmInfo ai = make_distance_mate_assembly(pa, pb);
+
+    CHECK_THROWS_AS(
+        doc::doc_simulate_motion(
+            ai.doc_id, ai.mate_id,
+            std::numeric_limits<double>::quiet_NaN(), 20.0, 3, false, 0.0),
+        chudware::doc::OpError);
+    CHECK_THROWS_AS(
+        doc::doc_simulate_motion(ai.doc_id, ai.mate_id, 10.0, 20.0, 3,
+                                 false, -0.01),
+        chudware::doc::OpError);
+    CHECK_THROWS_AS(
+        doc::doc_simulate_motion(
+            ai.doc_id, ai.mate_id, 10.0, 20.0, 2, false, 0.0,
+            json::object()),
+        chudware::doc::OpError);
+    CHECK_THROWS_AS(
+        doc::doc_simulate_motion(
+            ai.doc_id, ai.mate_id, 10.0, 20.0, 3, false, 0.0,
+            json{{"duration_s", 0.0}}),
+        chudware::doc::OpError);
+    CHECK_THROWS_AS(
+        doc::doc_simulate_motion(
+            ai.doc_id, ai.mate_id, 10.0, 20.0, 3, false, 0.0,
+            json{{"masses", {{ai.cid_b, -1.0}}}}),
+        chudware::doc::OpError);
+
+    fs::remove(pa);
+    fs::remove(pb);
 }

@@ -310,11 +310,69 @@ TetQuality tet_quality(const std::vector<double>& p, int a, int b, int c, int d)
     return q;
 }
 
-void fill_quality(MeshOut& out) {
+double det3(const double j[3][3]) {
+    return j[0][0] * (j[1][1] * j[2][2] - j[1][2] * j[2][1]) -
+           j[0][1] * (j[1][0] * j[2][2] - j[1][2] * j[2][0]) +
+           j[0][2] * (j[1][0] * j[2][1] - j[1][1] * j[2][0]);
+}
+
+bool tet10_jacobians_valid(const MeshOut& out, const int* t,
+                           double det_tol) {
+    constexpr double a = 0.5854101966249685;
+    constexpr double b = 0.1381966011250105;
+    constexpr double gp[4][3] = {
+        {b, b, b}, {a, b, b}, {b, a, b}, {b, b, a}};
+    double sign = 0.0;
+    for (const auto& p : gp) {
+        const double r = p[0], s = p[1], u = p[2];
+        const double L[4] = {1.0 - r - s - u, r, s, u};
+        constexpr double g[4][3] = {
+            {-1.0, -1.0, -1.0}, {1.0, 0.0, 0.0},
+            {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
+        double dn[10][3]{};
+        for (int c = 0; c < 4; ++c)
+            for (int d = 0; d < 3; ++d)
+                dn[c][d] = (4.0 * L[c] - 1.0) * g[c][d];
+        constexpr int edge[6][2] = {
+            {0, 1}, {1, 2}, {2, 0}, {3, 0}, {3, 2}, {3, 1}};
+        for (int e = 0; e < 6; ++e)
+            for (int d = 0; d < 3; ++d)
+                dn[4 + e][d] =
+                    4.0 * (L[edge[e][0]] * g[edge[e][1]][d] +
+                           L[edge[e][1]] * g[edge[e][0]][d]);
+        double j[3][3]{};
+        for (int n = 0; n < 10; ++n)
+            for (int xyz = 0; xyz < 3; ++xyz)
+                for (int d = 0; d < 3; ++d)
+                    j[xyz][d] +=
+                        out.points[static_cast<size_t>(t[n]) * 3 + xyz] *
+                        dn[n][d];
+        const double det = det3(j);
+        if (!std::isfinite(det) || !(std::abs(det) > det_tol))
+            return false;
+        if (sign == 0.0)
+            sign = det;
+        else if (det * sign <= 0.0)
+            return false;
+    }
+    return true;
+}
+
+bool fill_quality(MeshOut& out) {
     const int stride = out.nodes_per_elem == 10 ? 10 : 4;
+    if (out.points.empty() || out.points.size() % 3 != 0 ||
+        out.tets.empty() ||
+        out.tets.size() % static_cast<size_t>(stride) != 0) {
+        out.error = "mesh quality: malformed point or element arrays";
+        return false;
+    }
+    for (double coordinate : out.points)
+        if (!std::isfinite(coordinate)) {
+            out.error = "mesh quality: non-finite node coordinate";
+            return false;
+        }
     const size_t n = out.tets.size() / static_cast<size_t>(stride);
     out.aspect_hist.assign(10, 0);
-    if (n == 0) return;
     double min_vol = std::numeric_limits<double>::infinity();
     double max_ratio = 0.0;       // legacy longest/shortest edge ratio
     double a_min = std::numeric_limits<double>::infinity();
@@ -324,8 +382,40 @@ void fill_quality(MeshOut& out) {
     static const int ED[6][2] = {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
     for (size_t e = 0; e < n; ++e) {
         const int* t = &out.tets[e * static_cast<size_t>(stride)];
-        const double vol = std::abs(tet_volume6(out.points, t[0], t[1], t[2], t[3])) / 6.0;
-        if (vol > 0.0 && vol < min_vol) min_vol = vol;
+        const int n_nodes = static_cast<int>(out.points.size() / 3);
+        for (int k = 0; k < stride; ++k)
+            if (t[k] < 0 || t[k] >= n_nodes) {
+                out.error = "mesh quality: element " + std::to_string(e) +
+                            " contains an invalid node index";
+                return false;
+            }
+        bool repeated_corner = false;
+        for (int a = 0; a < 4; ++a)
+            for (int b = a + 1; b < 4; ++b)
+                repeated_corner = repeated_corner || t[a] == t[b];
+        if (repeated_corner) {
+            out.error = "mesh quality: element " + std::to_string(e) +
+                        " has repeated corner nodes";
+            return false;
+        }
+        const double det6 =
+            tet_volume6(out.points, t[0], t[1], t[2], t[3]);
+        double corner_scale = 0.0;
+        for (const auto& ed : ED)
+            corner_scale = std::max(
+                corner_scale,
+                edge_len(out.points, t[ed[0]], t[ed[1]]));
+        const double det_tol =
+            64.0 * std::numeric_limits<double>::epsilon() *
+            std::max(1.0, corner_scale * corner_scale * corner_scale);
+        if (!std::isfinite(det6) || !(std::abs(det6) > det_tol) ||
+            (stride == 10 && !tet10_jacobians_valid(out, t, det_tol))) {
+            out.error = "mesh quality: element " + std::to_string(e) +
+                        " is degenerate, inverted, or has a sign-changing Jacobian";
+            return false;
+        }
+        const double vol = std::abs(det6) / 6.0;
+        if (vol < min_vol) min_vol = vol;
         double lo = std::numeric_limits<double>::infinity(), hi = 0.0;
         for (const auto& ed : ED) {
             const double L = edge_len(out.points, t[ed[0]], t[ed[1]]);
@@ -337,7 +427,12 @@ void fill_quality(MeshOut& out) {
         if (std::isfinite(lo) && lo > 0.0) max_ratio = std::max(max_ratio, hi / lo);
 
         const TetQuality q = tet_quality(out.points, t[0], t[1], t[2], t[3]);
-        if (!std::isfinite(q.aspect)) continue;  // skip degenerate from the stats
+        if (!std::isfinite(q.aspect) || !std::isfinite(q.sjac) ||
+            !(q.sjac > 0.0)) {
+            out.error = "mesh quality: element " + std::to_string(e) +
+                        " has invalid quality metrics";
+            return false;
+        }
         ++counted;
         a_min = std::min(a_min, q.aspect);
         a_max = std::max(a_max, q.aspect);
@@ -357,9 +452,54 @@ void fill_quality(MeshOut& out) {
     out.aspect_avg = counted ? a_sum / static_cast<double>(counted) : 0.0;
     out.jacobian_min = std::isfinite(j_min) ? j_min : 0.0;
     out.pct_poor = counted ? 100.0 * static_cast<double>(poor) / static_cast<double>(counted) : 0.0;
+    return counted == n;
 }
 
 }  // namespace
+bool validate_mesh_options(const MeshOptions& options, std::string& error) {
+    if (!std::isfinite(options.fineness) || options.fineness < 0.0 ||
+        options.fineness > 1.0) {
+        error = "mesh options: fineness must be finite and in [0,1]";
+        return false;
+    }
+    if (!std::isfinite(options.density) ||
+        (options.density >= 0.0 && options.density > 1.0)) {
+        error =
+            "mesh options: density must be finite and in [0,1] when set";
+        return false;
+    }
+    if (options.order != 1 && options.order != 2) {
+        error = "mesh options: order must be 1 or 2";
+        return false;
+    }
+    if (!std::isfinite(options.curv_elems_per_circle) ||
+        !(options.curv_elems_per_circle > 0.0)) {
+        error =
+            "mesh options: curv_elems_per_circle must be finite and positive";
+        return false;
+    }
+    const double sizes[] = {options.target_size_mm, options.min_size_mm,
+                            options.max_size_mm};
+    for (double size : sizes)
+        if (!std::isfinite(size) || size < 0.0) {
+            error =
+                "mesh options: target/min/max sizes must be finite and non-negative";
+            return false;
+        }
+    if (options.min_size_mm > 0.0 && options.max_size_mm > 0.0 &&
+        options.min_size_mm > options.max_size_mm) {
+        error = "mesh options: min_size_mm cannot exceed max_size_mm";
+        return false;
+    }
+    if (!std::isfinite(options.thin_wall_layers) ||
+        !(options.thin_wall_layers > 0.0)) {
+        error =
+            "mesh options: thin_wall_layers must be finite and positive";
+        return false;
+    }
+    return true;
+}
+
 
 MeshOut mesh_step(const std::string& step_path, double density, int order) {
     MeshOptions options;
@@ -627,6 +767,19 @@ MeshOut mesh_step_single(const std::string& step_path, const MeshOptions& option
 }  // namespace
 
 MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
+    std::string option_error;
+    if (!validate_mesh_options(options, option_error)) {
+        MeshOut invalid;
+        invalid.nodes_per_elem =
+            options.structured ? 8 : (options.order == 2 ? 10 : 4);
+        invalid.error = option_error;
+        return invalid;
+    }
+    if (step_path.empty()) {
+        MeshOut invalid;
+        invalid.error = "mesh: STEP path must not be empty";
+        return invalid;
+    }
     // P4: parse the STEP ONCE and thread the shape through classify/pick/hex/netgen.
     TopoDS_Shape shape = read_step_shape(step_path);
 
@@ -672,38 +825,22 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
         // geometry), but the fuse of really-interfering assemblies produces boolean
         // pathology no mesher route survived (Netgen: unterminated OCC surface meshing on
         // the monolith, silently dropped domains and segfaults on the direct STL fill,
-        // deterministic per-cluster failures after seam welding). Bonding is the SOLVER's
-        // job instead: fea_run's gap ties join every cross-part node pair within the bond
-        // gap — touching faces AND interference overlaps give abundant tie pairs. Element
-        // sizing is pinned from the WHOLE assembly so parts mesh at a consistent size.
+        // deterministic per-cluster failures after seam welding). Contact is the SOLVER's
+        // job and must be requested explicitly; the mesher only preserves each solid.
+        // Element sizing is derived per part so thin bodies retain valid through-thickness
+        // resolution.
         std::vector<TopoDS_Shape> fsolids;
         for (TopExp_Explorer e(shape, TopAbs_SOLID); e.More(); e.Next())
             fsolids.push_back(e.Current());
         MeshOptions bopt = options;
-        // Assemblies default to FIRST-ORDER tets: tet10's second-order surface elevation
-        // is the step that keeps failing on thin/curved assembly parts (a fender shell
-        // meshes fine as tet4 and refuses as tet10), and for a bonded load-path study the
-        // discretization error is dominated by the gap-tie idealization anyway.
-        // resolve_mesh takes the stride from the RESULT, so the solver follows.
-        // CHUDWARE_ASM_TET10=1 opts back in.
-        std::string order_note;
-        if (bopt.order == 2) {
-            const char* o2 = std::getenv("CHUDWARE_ASM_TET10");
-            if (!(o2 && *o2 && *o2 != '0')) {
-                bopt.order = 1;
-                order_note = "assembly meshed first-order (tet4) — tet10 elevation is "
-                             "unreliable on assembly parts (CHUDWARE_ASM_TET10=1 forces it)";
-            }
-        }
         // Sizing is deliberately PER PART (auto): pinning the assembly-wide size as an
         // explicit target bypassed the auto-mode "never exceed the part's smallest real
         // dimension" clamp, which handed a thin-walled body tub 180 mm elements and
         // stopped Netgen cold. Auto mode re-derives a sane size per part (thin parts get
         // thin-wall sizing; the governor caps totals), at the cost of some size variation
         // across parts — correct beats uniform.
-        // Per-part volumes: an UNMESHABLE part is skipped (with a loud note) when it is
-        // a negligible fraction of the assembly — a corrupt cosmetic sliver in a WIP doc
-        // must not kill a vehicle-level study — and a hard failure otherwise.
+        // Per-part volumes are diagnostic only. An assembly result is complete
+        // only when every solid contributes a valid volume mesh.
         std::vector<double> vols(fsolids.size(), 0.0);
         double vol_total = 0.0;
         for (std::size_t i = 0; i < fsolids.size(); ++i) {
@@ -716,7 +853,6 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
             }
             vol_total += vols[i];
         }
-        std::vector<int> skipped;
         MeshOut merged;
         merged.nodes_per_elem = (bopt.order == 2) ? 10 : 4;
         bool all_ok = true;
@@ -741,12 +877,13 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
                 // Tessellation routes FIRST: they carry the manifold + enclosed-volume trust
                 // gates, so garbage geometry fails CLEANLY before any netgen code runs.
                 for (double ds : {1.0, 0.55, 1.8}) {
-                    gen = mesh_stl_netgen(sol, bopt, &shape, ds);
+                    gen = mesh_stl_netgen(sol, bopt, &sol, ds);
                     if (gen.ok) break;
                 }
                 if (!gen.ok) {
                     for (double ds : {1.0, 0.55}) {
-                        gen = mesh_stl_netgen(sol, bopt, &shape, ds, /*force_direct=*/true);
+                        gen = mesh_stl_netgen(sol, bopt, &sol, ds,
+                                              /*force_direct=*/true);
                         if (gen.ok) break;
                     }
                 }
@@ -790,7 +927,8 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
                             }
                             if (!resolid.IsNull()) {
                                 for (double ds : {1.0, 0.55}) {
-                                    gen = mesh_stl_netgen(resolid, bopt, &shape, ds);
+                                    gen =
+                                        mesh_stl_netgen(resolid, bopt, &resolid, ds);
                                     if (gen.ok) break;
                                 }
                                 if (gen.ok && trace)
@@ -812,29 +950,6 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
                     vol_total > 1e-9
                         ? vols[static_cast<std::size_t>(solid_no - 1)] / vol_total
                         : 1.0;
-                // Skip threshold for unmeshable parts (% of assembly volume).
-                // Default 0.5%; CHUDWARE_FEA_SKIP_UNMESHABLE_PCT overrides.
-                double skip_pct = 0.5;
-                if (const char* sp = std::getenv("CHUDWARE_FEA_SKIP_UNMESHABLE_PCT")) {
-                    const double v = std::atof(sp);
-                    if (v >= 0.0) skip_pct = v;
-                }
-                if (trace) {
-                    Bnd_Box pb;
-                    try { BRepBndLib::Add(sol, pb); } catch (...) {}
-                    double x0=0,y0=0,z0=0,x1=0,y1=0,z1=0;
-                    if (!pb.IsVoid()) pb.Get(x0,y0,z0,x1,y1,z1);
-                    std::fprintf(stderr,
-                        "[mesh_step] part %d FAILED: vol=%.1f mm3 (%.3f%% of assembly) "
-                        "bbox=[%.0f,%.0f,%.0f]..[%.0f,%.0f,%.0f]\n",
-                        solid_no, vols[static_cast<std::size_t>(solid_no - 1)],
-                        vfrac * 100.0, x0, y0, z0, x1, y1, z1);
-                    std::fflush(stderr);
-                }
-                if (vfrac * 100.0 < skip_pct) {
-                    skipped.push_back(solid_no);
-                    continue;  // negligible unmeshable part: skip, note below
-                }
                 {
                     Bnd_Box pb;
                     try { BRepBndLib::Add(sol, pb); } catch (...) {}
@@ -879,25 +994,19 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
             merged.n_nodes = static_cast<int>(merged.points.size() / 3);
             merged.n_elems =
                 static_cast<int>(merged.tets.size() / merged.nodes_per_elem);
-            if (merged.n_elems > 0) {
-                fill_quality(merged);
-                merged.ok = true;
-                bonded_note = "assembly meshed per part: " + std::to_string(n_solids) +
-                              " solid bodies (bonded by solver gap ties)";
-                if (!order_note.empty()) bonded_note += "; " + order_note;
-                if (!skipped.empty()) {
-                    std::string sk;
-                    for (int i : skipped) sk += (sk.empty() ? "" : ",") + std::to_string(i);
-                    bonded_note += "; WARNING: " + std::to_string(skipped.size()) +
-                                   " unmeshable negligible-volume part(s) skipped (#" + sk +
-                                   " — below the unmeshable-part skip threshold; "
-                                   "check their geometry)";
-                }
-                out = std::move(merged);
-                trace_stage("per-solid assembly mesh: ok");
-            } else {
+            if (merged.n_elems <= 0) {
                 out.ok = false;
                 out.error = "assembly produced no volume elements";
+            } else if (!fill_quality(merged)) {
+                out = std::move(merged);
+                out.ok = false;
+            } else {
+                merged.ok = true;
+                bonded_note =
+                    "assembly meshed per part: " + std::to_string(n_solids) +
+                    " separate solid bodies (contact is solver-defined)";
+                out = std::move(merged);
+                trace_stage("per-solid assembly mesh: ok");
             }
         }
     } else {
@@ -908,10 +1017,9 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
             out.note = out.note.empty() ? bonded_note : (bonded_note + "; " + out.note);
         if (!out.ok)
             out.error += " [the STEP contains " + std::to_string(n_solids) +
-                         " solid bodies (assembly): bodies were " +
-                         (bonded_note.empty() ? std::string("NOT bondable (fuse failed)")
-                                              : std::string("fused for bonded meshing")) +
-                         " — check for invalid/self-intersecting component geometry]";
+                         " solid bodies (assembly): every body must produce a complete "
+                         "per-part volume mesh; check the named body's invalid, open, or "
+                         "self-intersecting geometry]";
     }
     return out;
 }
@@ -1306,7 +1414,10 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
     out.n_elems = static_cast<int>(out.tets.size() / npe);
     out.mesh_type_used = order2 ? (options.quad_surface ? "tet10-quad-surface" : "tet10")
                                 : (options.quad_surface ? "tet4-quad-surface" : "tet4");
-    fill_quality(out);
+    if (!fill_quality(out)) {
+        out.ok = false;
+        return out;
+    }
     out.ok = true;
     mesh_cache_note_generation();
     return out;
@@ -1564,7 +1675,10 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
         out.n_nodes = static_cast<int>(out.points.size() / 3);
         out.n_elems = static_cast<int>(out.tets.size() / npe);
         out.mesh_type_used = type_tag;
-        fill_quality(out);
+        if (!fill_quality(out)) {
+            out.ok = false;
+            return false;
+        }
         out.ok = true;
         mesh_cache_note_generation();
         return true;

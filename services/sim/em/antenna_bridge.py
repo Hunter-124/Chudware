@@ -180,7 +180,9 @@ def fullwave_s11(
         builds CSXCAD geometry and calls openEMS.
     """
     avail = openems_available()
-    if force_skip or not avail.get("installed"):
+    # An injected runner is an explicit execution backend (used by deterministic
+    # physics tests and embedders), so host openEMS availability must not bypass it.
+    if force_skip or (_execute is None and not avail.get("installed")):
         return {
             "ok": False,
             "skipped": True,

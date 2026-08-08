@@ -16,11 +16,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <map>
 #include <optional>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace chudware::sim {
@@ -84,22 +86,30 @@ const std::regex& suffix_re() {
 
 // Returns nullopt on a token that doesn't match (Python raises ValueError).
 std::optional<double> parse_value(const std::string& token) {
-    std::string t = strip(token);
-    std::smatch m;
-    if (!std::regex_match(t, m, suffix_re())) return std::nullopt;
-    double num = std::stod(m[1].str());
-    std::string suf = lower(m[2].matched ? m[2].str() : std::string());
-    if (!suf.empty()) {
-        auto it = suffix_table().find(suf);
-        if (it != suffix_table().end()) num *= it->second;
+    const std::string text = strip(token);
+    std::smatch match;
+    if (!std::regex_match(text, match, suffix_re())) return std::nullopt;
+    double number = 0.0;
+    try {
+        number = std::stod(match[1].str());
+    } catch (...) {
+        return std::nullopt;
     }
-    return num;
+    const std::string suffix =
+        lower(match[2].matched ? match[2].str() : std::string());
+    if (!suffix.empty()) {
+        auto it = suffix_table().find(suffix);
+        if (it != suffix_table().end()) number *= it->second;
+    }
+    return std::isfinite(number) ? std::optional<double>(number) : std::nullopt;
 }
 
-// spice._safe_val: parse, defaulting to 0.0 on failure.
+// Required numeric fields reject malformed/non-finite tokens instead of
+// manufacturing a physically meaningful-looking zero.
 double safe_val(const std::string& s) {
-    auto v = parse_value(s);
-    return v ? *v : 0.0;
+    auto value = parse_value(s);
+    if (!value) throw std::invalid_argument("invalid SPICE numeric token '" + s + "'");
+    return *value;
 }
 
 // spice._gnd: "0"/"gnd" (case-insensitive) -> "0", else the original name.
@@ -226,47 +236,66 @@ json parse_source_params(const std::vector<std::string>& tokens) {
         std::string tok = upper(tokens[i]);
         if (starts_with(tok, "PULSE(") || tok == "PULSE") {
             std::string full = join_from(i), inner;
-            if (paren_inner(full, "PULSE", inner)) {
-                std::vector<std::string> vals = ws_split(inner);
-                static const char* keys[] = {"v1", "v2", "td", "tr", "tf", "pw", "per"};
-                json wf = {{"type", "PULSE"}};
-                for (size_t k = 0; k < vals.size() && k < 7; ++k) wf[keys[k]] = safe_val(vals[k]);
-                params["waveform"] = wf;
-            }
+            if (!paren_inner(full, "PULSE", inner))
+                throw std::invalid_argument("PULSE source needs a closing parenthesis");
+            std::vector<std::string> vals = ws_split(inner);
+            if (vals.size() < 2 || vals.size() > 7)
+                throw std::invalid_argument("PULSE source needs 2 to 7 numeric parameters");
+            static const char* keys[] = {"v1", "v2", "td", "tr", "tf", "pw", "per"};
+            json wf = {{"type", "PULSE"}};
+            for (size_t k = 0; k < vals.size(); ++k) wf[keys[k]] = safe_val(vals[k]);
+            params["waveform"] = wf;
             i += skip_to_paren(i);
         } else if (starts_with(tok, "SIN(") || tok == "SIN") {
             std::string full = join_from(i), inner;
-            if (paren_inner(full, "SIN", inner)) {
-                std::vector<std::string> vals = ws_split(inner);
-                static const char* keys[] = {"vo", "va", "f", "td", "theta"};
-                json wf = {{"type", "SIN"}};
-                for (size_t k = 0; k < vals.size() && k < 5; ++k) wf[keys[k]] = safe_val(vals[k]);
-                params["waveform"] = wf;
-            }
+            if (!paren_inner(full, "SIN", inner))
+                throw std::invalid_argument("SIN source needs a closing parenthesis");
+            std::vector<std::string> vals = ws_split(inner);
+            if (vals.size() < 3 || vals.size() > 5)
+                throw std::invalid_argument("SIN source needs 3 to 5 numeric parameters");
+            static const char* keys[] = {"vo", "va", "f", "td", "theta"};
+            json wf = {{"type", "SIN"}};
+            for (size_t k = 0; k < vals.size(); ++k) wf[keys[k]] = safe_val(vals[k]);
+            params["waveform"] = wf;
             i += skip_to_paren(i);
         } else if (starts_with(tok, "PWL(") || tok == "PWL") {
             std::string full = join_from(i), inner;
-            if (paren_inner(full, "PWL", inner)) {
-                std::vector<std::string> nums = ws_split(inner);
-                json pairs = json::array();
-                for (size_t k = 0; k + 1 < nums.size(); k += 2)
-                    pairs.push_back(json::array({safe_val(nums[k]), safe_val(nums[k + 1])}));
-                params["waveform"] = {{"type", "PWL"}, {"points", pairs}};
-            }
+            if (!paren_inner(full, "PWL", inner))
+                throw std::invalid_argument("PWL source needs a closing parenthesis");
+            std::vector<std::string> nums = ws_split(inner);
+            if (nums.size() < 4 || nums.size() % 2 != 0)
+                throw std::invalid_argument(
+                    "PWL source needs at least two complete time/value pairs");
+            json pairs = json::array();
+            for (size_t k = 0; k < nums.size(); k += 2)
+                pairs.push_back(json::array({safe_val(nums[k]), safe_val(nums[k + 1])}));
+            params["waveform"] = {{"type", "PWL"}, {"points", pairs}};
             i += skip_to_paren(i);
         } else if (tok == "AC") {
-            json ac;
-            ac["mag"] = (i + 1 < tokens.size()) ? safe_val(tokens[i + 1]) : 1.0;
-            ac["phase"] = (i + 2 < tokens.size()) ? safe_val(tokens[i + 2]) : 0.0;
+            if (i + 1 >= tokens.size())
+                throw std::invalid_argument("AC source needs a numeric magnitude");
+            json ac = {{"mag", safe_val(tokens[i + 1])}, {"phase", 0.0}};
+            size_t advance = 2;
+            if (i + 2 < tokens.size()) {
+                auto phase = parse_value(tokens[i + 2]);
+                if (phase) {
+                    ac["phase"] = *phase;
+                    advance = 3;
+                }
+            }
             params["ac"] = ac;
-            i += 3;
+            i += advance;
         } else if (tok == "DC") {
-            params["dc"] = (i + 1 < tokens.size()) ? safe_val(tokens[i + 1]) : 0.0;
+            if (i + 1 >= tokens.size())
+                throw std::invalid_argument("DC source needs a numeric value");
+            params["dc"] = safe_val(tokens[i + 1]);
             i += 2;
         } else {
-            // bare DC value
+            // A bare numeric token is a DC value; unknown source syntax is invalid.
             auto v = parse_value(tokens[i]);
-            if (v) params["dc"] = *v;
+            if (!v)
+                throw std::invalid_argument("unsupported source token '" + tokens[i] + "'");
+            params["dc"] = *v;
             i += 1;
         }
     }
@@ -351,7 +380,12 @@ json parse_element(const std::vector<std::string>& tokens) {
         json value = nullptr;
         json params = json::object();
         auto v = parse_value(tokens[3]);
-        if (v) value = *v;
+        if (!v) throw std::invalid_argument(name + ": invalid " + std::string(1, kl) +
+                                            " value '" + tokens[3] + "'");
+        value = *v;
+        if (*v <= 0.0)
+            throw std::invalid_argument(name + ": " + std::string(1, kl) +
+                                        " value must be greater than zero");
         for (size_t t = 4; t < tokens.size(); ++t) {
             std::string k, vstr;
             if (match_kv(tokens[t], k, vstr, /*icase*/ true)) {
@@ -382,9 +416,9 @@ json parse_element(const std::vector<std::string>& tokens) {
             }
         }
         json src = parse_source_params(rest);
-        if (value.is_null() && src.contains("DC")) {
-            value = src["DC"];
-            src.erase("DC");
+        if (value.is_null() && src.contains("dc")) {
+            value = src["dc"];
+            src.erase("dc");
         }
         return make_dev(std::string(1, kl), name, nodes, value, nullptr, src);
     }
@@ -449,6 +483,8 @@ json parse_element(const std::vector<std::string>& tokens) {
         if (tokens.size() < 4) return json(nullptr);
         std::string l1 = tokens[1], l2 = tokens[2];
         double k = safe_val(tokens[3]);
+        if (std::abs(k) > 1.0)
+            throw std::invalid_argument(name + ": coupling coefficient must be in [-1, 1]");
         return make_dev("K", name, std::vector<std::string>{}, k, nullptr,
                         json{{"inductors", json::array({l1, l2})}, {"k", k}});
     }
@@ -879,7 +915,7 @@ std::string model_to_kind(const std::string& model_name, const std::string& ref)
         {"NPN", "Q"}, {"PNP", "Q"}, {"NMOS", "M"}, {"PMOS", "M"},
         {"OPAMP", "OPAMP"}, {"S", "S"},
     };
-    auto it = kmap.find(model_name);
+    auto it = kmap.find(upper(model_name));
     if (it != kmap.end()) return it->second;
     char letter = ref.empty() ? 'X' : (char)std::toupper((unsigned char)ref[0]);
     static const std::string spice_letters = "RCLVIDQMEGFH";
@@ -930,25 +966,25 @@ const std::map<std::string, SymbolSim>& symbol_sim_table() {
                                   {"params", json{{"IS", 2.3e-19}, {"N", 2.0}, {"RS", 2.0}}}},
                              {{"K", "K"}, {"A", "A"}}};
         m["Device:Zener"] = {json{{"model", "D"}, {"pin_order", d_order}}, {{"K", "K"}, {"A", "A"}}};
-        // BJTs: pins numbered "B"/"C"/"E" (number == name), pin_order [B, C, E].
-        json q_order = json::array({"B", "C", "E"});
+        // BJTs use the solver's SPICE order [C, B, E].
+        json q_order = json::array({"C", "B", "E"});
         m["Device:Q_NPN"] = {json{{"model", "NPN"}, {"pin_order", q_order}},
                              {{"B", "B"}, {"C", "C"}, {"E", "E"}}};
         m["Device:Q_PNP"] = {json{{"model", "PNP"}, {"pin_order", q_order}},
                              {{"B", "B"}, {"C", "C"}, {"E", "E"}}};
-        // MOSFETs: pins numbered "G"/"D"/"S" (number == name), pin_order [G, D, S].
-        json fet_order = json::array({"G", "D", "S"});
+        // MOSFETs use the solver's order [D, G, S].
+        json fet_order = json::array({"D", "G", "S"});
         m["Device:NMOS"] = {json{{"model", "NMOS"}, {"pin_order", fet_order}},
                             {{"G", "G"}, {"D", "D"}, {"S", "S"}}};
         m["Device:PMOS"] = {json{{"model", "PMOS"}, {"pin_order", fet_order}},
                             {{"G", "G"}, {"D", "D"}, {"S", "S"}}};
-        // Dual op-amp: number-keyed pins (1,2,3,5,6,7,8,4) with NAMEd pin_order.
-        // name->number from the symbol's pins (later pins win on duplicate names,
-        // mirroring Python's dict build order: unit2 IN-/IN+/OUT, then V+/V-).
+        // The built-in OPAMP is an ideal three-terminal model. Supply pins stay on the
+        // multi-unit schematic symbol for package/ERC work, but are not solver terminals.
+        // Unit 1 is the default; the ECAD netlist seam also emits placed-unit name aliases.
         m["Amplifier_Operational:OPAMP_dual"] = {
             json{{"model", "OPAMP"},
-                 {"pin_order", json::array({"IN+", "IN-", "V+", "V-", "OUT"})}},
-            {{"IN-", "5"}, {"IN+", "6"}, {"OUT", "7"}, {"V+", "8"}, {"V-", "4"}}};
+                 {"pin_order", json::array({"IN+", "IN-", "OUT"})}},
+            {{"IN-", "1"}, {"IN+", "2"}, {"OUT", "3"}}};
         // NE555 SUBCKT: number-keyed pins 1..8 with NAMEd pin_order.
         m["Timer:NE555"] = {
             json{{"model", "SUBCKT"},
@@ -1030,12 +1066,18 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
                             : json::array();
 
     for (const json& comp : comps) {
-        std::string ref = comp.value("ref", std::string("?"));
-        std::string libid = comp.value("libid", std::string());
-        std::string value = comp.value("value", std::string());
+        if (!comp.is_object()) {
+            warn_msgs.push_back("non-object component — skipped");
+            continue;
+        }
+        std::string ref = comp.contains("ref") && comp["ref"].is_string()
+                              ? comp["ref"].get<std::string>() : "?";
+        std::string libid = comp.contains("libid") && comp["libid"].is_string()
+                                ? comp["libid"].get<std::string>() : "";
+        const json value_token = comp.contains("value") ? comp["value"] : json("");
         json pins = comp.contains("pins") && comp["pins"].is_object() ? comp["pins"]
                                                                       : json::object();
-        bool dnp = comp.value("dnp", false);
+        bool dnp = comp.contains("dnp") && comp["dnp"].is_boolean() && comp["dnp"].get<bool>();
 
         if (dnp) {
             warn_msgs.push_back(ref + ": DNP — skipped");
@@ -1047,6 +1089,10 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
         // (engine/sim/spice.py: comp.get("sim") or SYMBOLS[libid]["sim"]).
         const std::map<std::string, SymbolSim>& sym_tbl = symbol_sim_table();
         auto sym_it = sym_tbl.find(libid);
+        if (comp.contains("sim") && !comp["sim"].is_null() && !comp["sim"].is_object()) {
+            warn_msgs.push_back(ref + ": sim model specification must be an object — skipped");
+            continue;
+        }
         json sim = comp.contains("sim") && comp["sim"].is_object() ? comp["sim"] : json(nullptr);
         if (sim.is_null() && sym_it != sym_tbl.end()) sim = sym_it->second.sim;
         if (sim.is_null()) {
@@ -1054,11 +1100,17 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
             continue;
         }
 
-        std::string model_name = sim.value("model", std::string());
+        std::string model_name = sim.contains("model") && sim["model"].is_string()
+                                     ? sim["model"].get<std::string>() : "";
+        const std::string model_upper = upper(model_name);
+        if (model_upper.empty()) {
+            warn_msgs.push_back(ref + " (" + libid + "): empty sim model — skipped");
+            continue;
+        }
 
         // Power / ground symbols — not real devices, skip silently.
-        if (model_name == "GND" || model_name == "VCC" || model_name == "+5V" ||
-            model_name == "+3V3" || model_name == "-5V")
+        if (model_upper == "GND" || model_upper == "VCC" || model_upper == "+5V" ||
+            model_upper == "+3V3" || model_upper == "-5V")
             continue;
 
         std::vector<std::string> pin_order;
@@ -1080,8 +1132,10 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
                 name_to_num[it.key()] = it.value().is_string() ? it.value().get<std::string>()
                                                                : it.value().dump();
 
-        // Build the ordered node list.
+        // Build the ordered node list. A missing pin invalidates the component;
+        // never manufacture a literal "?" node and let the solver report success.
         std::vector<std::string> node_list;
+        bool unresolved_pin = false;
         for (const std::string& pname : pin_order) {
             const json* net = pins.contains(pname) ? &pins[pname] : nullptr;
             if (net == nullptr) {
@@ -1090,34 +1144,38 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
                     net = &pins[nit->second];
             }
             if (net == nullptr) {
-                std::string keys;
-                bool f = true;
-                for (auto it = pins.begin(); it != pins.end(); ++it) {
-                    if (!f) keys += ", ";
-                    f = false;
-                    keys += "'" + it.key() + "'";
-                }
-                warn_msgs.push_back(ref + ": pin '" + pname +
-                                    "' not found in netlist pins [" + keys + "]");
-                node_list.push_back("?");
+                warn_msgs.push_back(ref + ": pin '" + pname + "' not found — component skipped");
+                unresolved_pin = true;
+            } else if (!net->is_string() || net->get<std::string>().empty()) {
+                warn_msgs.push_back(ref + ": pin '" + pname + "' has no resolved net — component skipped");
+                unresolved_pin = true;
             } else {
-                node_list.push_back(gnd(net->is_string() ? net->get<std::string>() : net->dump()));
+                node_list.push_back(gnd(net->get<std::string>()));
             }
         }
+        if (unresolved_pin) continue;
 
         // If pin_order is empty, fall back to sorted pin order (pins keys are sorted).
         if (pin_order.empty()) {
             std::vector<std::string> keys;
             for (auto it = pins.begin(); it != pins.end(); ++it) keys.push_back(it.key());
             std::sort(keys.begin(), keys.end());
-            for (const std::string& k : keys)
-                node_list.push_back(gnd(pins[k].is_string() ? pins[k].get<std::string>()
-                                                            : pins[k].dump()));
+            for (const std::string& k : keys) {
+                if (!pins[k].is_string() || pins[k].get<std::string>().empty()) {
+                    unresolved_pin = true;
+                    break;
+                }
+                node_list.push_back(gnd(pins[k].get<std::string>()));
+            }
+            if (unresolved_pin) {
+                warn_msgs.push_back(ref + ": unresolved net in fallback pin order — component skipped");
+                continue;
+            }
         }
 
         // Subcircuit-backed parts -> emit an X instance, expand later.
-        if (model_name == "SUBCKT" || model_name == "OPAMP") {
-            std::string sub_name = resolve_subckt_name(model_name, sim);
+        if (model_upper == "SUBCKT" || model_upper == "OPAMP") {
+            std::string sub_name = resolve_subckt_name(model_upper, sim);
             auto sit = subckts.find(upper(sub_name));
             if (sit == subckts.end()) {
                 warn_msgs.push_back(ref + " (" + libid + "): subckt '" + sub_name +
@@ -1125,7 +1183,7 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
                 continue;
             }
             std::vector<std::string> inst_nodes;
-            if (!map_subckt_nodes(ref, model_name, node_list, sit->second.ports, inst_nodes,
+            if (!map_subckt_nodes(ref, model_upper, node_list, sit->second.ports, inst_nodes,
                                   warn_msgs))
                 continue;
             std::string line = "X" + ref;
@@ -1135,19 +1193,66 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
             continue;
         }
 
-        // Parse value (best-effort; leave null on failure, matching the oracle).
         json float_value = nullptr;
-        if (!value.empty()) {
-            auto fv = parse_value(value);
-            if (fv) float_value = *fv;
+        if (value_token.is_number()) {
+            const double numeric = value_token.get<double>();
+            if (std::isfinite(numeric)) float_value = numeric;
+        } else if (value_token.is_string() && !value_token.get<std::string>().empty()) {
+            auto parsed = parse_value(value_token.get<std::string>());
+            if (parsed && std::isfinite(*parsed)) float_value = *parsed;
         }
 
-        std::string kind = model_to_kind(model_name, ref);
-        // Device parameters carried by the sim spec (symbol library or an inline comp["sim"]),
-        // e.g. the LED's junction model. Empty for every part that does not declare any.
+        std::string kind = model_to_kind(model_upper, ref);
+        if (kind == "X" || kind == "OPAMP") {
+            warn_msgs.push_back(ref + " (" + libid + "): unsupported sim model '" +
+                                model_name + "' — skipped");
+            continue;
+        }
+        const int expected = kind == "Q" || kind == "M" ? 3 : node_count(kind[0]);
+        if (expected < 0 || node_list.size() < static_cast<std::size_t>(expected)) {
+            warn_msgs.push_back(ref + ": sim model " + model_name + " needs at least " +
+                                std::to_string(std::max(expected, 0)) + " nodes — skipped");
+            continue;
+        }
+        if ((kind == "R" || kind == "C" || kind == "L") &&
+            (float_value.is_null() || float_value.get<double>() <= 0.0)) {
+            warn_msgs.push_back(ref + ": invalid or non-positive " + kind + " value — skipped");
+            continue;
+        }
         json dev_params = sim.contains("params") && sim["params"].is_object()
-                              ? sim["params"]
-                              : json::object();
+                              ? sim["params"] : json::object();
+        if (model_upper == "NMOS") dev_params["type"] = "nmos";
+        if (model_upper == "PMOS") dev_params["type"] = "pmos";
+        if (model_upper == "NPN") dev_params["type"] = "npn";
+        if (model_upper == "PNP") dev_params["type"] = "pnp";
+        if (kind == "V" || kind == "I") {
+            const json ac_mag = comp.contains("ac_mag") ? comp["ac_mag"] :
+                                (sim.contains("ac") ? sim["ac"] : json(nullptr));
+            if (ac_mag.is_number()) {
+                const json phase_json = comp.value("ac_phase", json(0.0));
+                if (phase_json.is_number() && std::isfinite(ac_mag.get<double>()) &&
+                    std::isfinite(phase_json.get<double>())) {
+                    dev_params["ac"] = {
+                        {"mag", ac_mag.get<double>()},
+                        {"phase", phase_json.get<double>()},
+                    };
+                } else {
+                    warn_msgs.push_back(ref + ": invalid AC magnitude/phase ignored");
+                }
+            } else if (ac_mag.is_object() && ac_mag.contains("mag") &&
+                       ac_mag["mag"].is_number() &&
+                       (!ac_mag.contains("phase") || ac_mag["phase"].is_number()) &&
+                       std::isfinite(ac_mag["mag"].get<double>()) &&
+                       (!ac_mag.contains("phase") ||
+                        std::isfinite(ac_mag["phase"].get<double>()))) {
+                dev_params["ac"] = {
+                    {"mag", ac_mag["mag"]},
+                    {"phase", ac_mag.contains("phase") ? ac_mag["phase"] : json(0.0)},
+                };
+            } else if (!ac_mag.is_null()) {
+                warn_msgs.push_back(ref + ": invalid AC magnitude/phase ignored");
+            }
+        }
         devices.push_back(make_dev(kind, ref, node_list, float_value, nullptr, dev_params));
     }
 

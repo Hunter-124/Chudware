@@ -5,6 +5,8 @@ from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from typing import Optional
 from typing import Union
 import os
+import copy
+import math
 
 from .cad_common import (
     _CUR,
@@ -23,6 +25,7 @@ from .cad_common import (
     _pick_best_doc,
     _publish_current,
     _resolve_face_points,
+    _resolve_one_selector,
     _resolve_material,
     _strip_version_suffix,
     _tmp,
@@ -366,9 +369,8 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
     # (revolute/prismatic freedom is provided by concentric/coincident/slot mates that have
     # no value; you drive the DIMENSIONAL mate that parameterizes that freedom.)
     _DRIVABLE_MATE_TYPES = {
-        "angle": "deg", "angle_limit": "deg",
-        "distance": "mm", "distance_limit": "mm",
-        "gear": "ratio", "rack_pinion": "mm", "screw": "mm",
+        "angle": "deg",
+        "distance": "mm",
     }
 
 
@@ -381,22 +383,6 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
 
 
 
-    def _asm_body_transforms(doc_id: str) -> list:
-        """Per-component world 4x4 transform (row-major 16) after the current solve.
-
-        Read from doc_tree's components[].transform — the pose doc_solve_mates writes back
-        (NOT asm_world_bodies, which only returns bboxes; a bbox cannot orient a body for
-        animation, so the trajectory carries the full transform instead)."""
-        tr = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
-        comps = tr.get("components") if isinstance(tr, dict) else None
-        out = []
-        for c in (comps or []):
-            if c.get("suppressed"):
-                continue
-            out.append({"component": c.get("id"),
-                        "name": c.get("name") or c.get("id"),
-                        "transform": c.get("transform")})
-        return out
 
 
 
@@ -419,43 +405,45 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         Scope: kinematics by default; pass `dynamics` (even {}) to ALSO run rigid-body inverse
         dynamics over the swept trajectory — mass/inertia from each component's geometry x
         density, gravity, applied forces/torques and simple viscous damping, with per-mate JOINT
-        REACTION forces/moments solved through the mate constraint jacobian. Contact dynamics is
-        still out of scope.
+        REACTION forces/moments solved through the mate constraint jacobian. Tangent/cam mates
+        contribute their instantaneous normal reaction only; unilateral lift-off/impact/contact
+        integration remains out of scope.
 
-        dynamics : None (default) = kinematics only, result unchanged. A dict (may be empty —
-                  all keys optional) turns on dynamics and adds a `dynamics` block:
+        dynamics : None (default) = kinematics only. A dict (may be empty — all keys
+                  optional) adds a `dynamics` block:
                   {duration_s (sweep wall-time, default 1.0), gravity:[3] m/s² (default
                   [0,0,-9.81]), default_density_g_cm3 (default 7.85 steel),
-                  densities:{component_id: g_cm3}, masses:{component_id: kg},
+                  densities:{component_id: g/cm³}, masses:{component_id: kg},
                   loads:[{component, force_n:[3], torque_nm:[3]}],
                   damping:{linear_ns_per_m, angular_nms_per_rad}}.
-                  The block carries per-frame per-mate reactions ({mate_id, force_n:[3] N,
-                  moment_nm:[3] N·m, force_mag_n}), per_joint_worst, worst_case and warnings —
-                  feed it to motion_fea_handoff to stress the worst-loaded link. (`loop` extra
-                  samples are not part of the dynamics timeline.)
+                  The block reports ok/force_path_resolved plus per-frame mate reactions
+                  ({mate_id, component_a, component_b, force_n:[3] N,
+                  moment_nm:[3] N·m, force_mag_n, moment_mag_nm}), separate force and
+                  moment residuals, worst-force/worst-moment summaries and warnings.
+                  `loop`'s closing playback sample is not part of the dynamics timeline.
 
-        mate_id : which mate to drive. Must be a DIMENSIONAL mate whose value means motion —
-                  one of angle / angle_limit (deg), distance / distance_limit (mm),
-                  gear / rack_pinion / screw. A revolute/concentric/slot mate has no value to
-                  sweep: drive the angle/distance mate that dimensions that joint instead. Omit
-                  to have the tool pick the single drivable mate if there is exactly one.
+        mate_id : which mate to drive. The mate solver's scalar driven dimensions are
+                  angle (deg) and distance (mm). Limit and mechanical-coupling mates store
+                  bounds/ratio/pitch rather than a scalar target, so claiming their `value`
+                  was drivable produced a stationary false-success sweep; drive an angle
+                  or distance mate that parameterizes the mechanism instead. Omit to
+                  auto-pick when exactly one drivable mate exists.
         start,stop : the value range to sweep (in the mate's unit — deg or mm). Omit `start` to
                   begin at the mate's current value. `stop` is required.
-        steps   : number of SAMPLES across [start, stop] inclusive (>=2). More = finer/smoother
-                  and safer against branch flips on tight mechanisms.
-        loop    : if True, append a final sample back at `start` (close the cycle, e.g. a crank
-                  0->360->0) so playback loops seamlessly.
-        check_interference : run check_interference (eval_interference) at EACH step and flag the
-                  FIRST step whose bodies clash. Reuses the existing interference engine — this
-                  tool never reimplements collision. min_clearance_mm is forwarded to it.
+        steps   : number of SAMPLES across [start, stop] inclusive (>=2, >=3 with dynamics).
+                  More samples improve finite-difference accuracy and branch continuity.
+        loop    : if True, append the already-solved start pose as one final playback sample,
+                  closing the cycle without changing the dynamics time map.
+        check_interference : evaluate every sample and flag the FIRST solid overlap or
+                  below-minimum-clearance pair. min_clearance_mm is in mm.
 
         Returns {ok, doc_id, mate_id, driver:{type,unit,start,stop,steps,samples},
                  trajectory:[{i, value, dof, converged, bodies:[{component,name,transform}]}],
                  interference:{checked, first_collision_step, first_collision_value, detail},
-                 summary}. Each `transform` is the body's world 4x4 (row-major 16) at that sample
-        — the per-step per-body pose a viewer needs to animate the mechanism (the GUI-playback
-        seam; see cad_guide('motion')). The driven mate is RESTORED to its original value when
-        the study finishes (a study reads motion; it does not leave the assembly moved).
+                 summary}. Each `transform` is the body's world 4x4 (row-major 16). ok=false
+        distinguishes any unresolved/non-converged frame. The engine solves on an immutable
+        assembly snapshot, so the live mate value/expression, component transforms, revision,
+        undo history, dirty state and warm state never change.
         """
         try:
             d = _doc(doc_id)
@@ -496,111 +484,84 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             def _cur_value(m: dict) -> float:
                 v = m.get("value")
                 if isinstance(v, dict):
-                    return float(v.get("value", 0.0))
-                if isinstance(v, (int, float)):
-                    return float(v)
-                return 0.0
+                    v = v.get("value")
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise ValueError(
+                        f"simulate_motion: mate '{mate_id}' has no numeric driven value.")
+                value = float(v)
+                if not math.isfinite(value):
+                    raise ValueError(
+                        f"simulate_motion: mate '{mate_id}' has a non-finite driven value.")
+                return value
 
-            orig_value = _cur_value(mate)
             if start is None:
-                start = orig_value
+                start = _cur_value(mate)
             if stop is None:
                 raise ValueError("simulate_motion: `stop` is required (the end of the sweep).")
+            start = float(start)
+            stop = float(stop)
+            if not math.isfinite(start) or not math.isfinite(stop):
+                raise ValueError("simulate_motion: start and stop must be finite.")
             steps = int(steps)
             if steps < 2:
                 raise ValueError("simulate_motion: `steps` must be >= 2.")
+            min_clearance_mm = float(min_clearance_mm)
+            if not math.isfinite(min_clearance_mm) or min_clearance_mm < 0.0:
+                raise ValueError(
+                    "simulate_motion: min_clearance_mm must be finite and non-negative.")
 
-            samples = [start + (stop - start) * i / (steps - 1) for i in range(steps)]
-            if loop:
-                samples.append(start)
-
-            def _set_and_solve(val: float) -> dict:
-                cb.call("doc_apply_ops", {
-                    "doc_id": d,
-                    "base_revision": cb.call("doc_tree", {"doc_id": d}).get("revision", 0),
-                    "ops": [{"op": "asm_edit_mate", "id": mate_id, "value": {"value": float(val)}}],
-                    "with_tess": False})
-                return cb.call("doc_solve_mates", {"doc_id": d})
-
-            trajectory = []
-            first_collision_step = None
-            first_collision_value = None
-            first_collision_detail = None
-            try:
-                for i, val in enumerate(samples):
-                    sm = _set_and_solve(val)
-                    status = (sm.get("rebuild") or {}).get("doc_status") or {}
-                    mate_stat = (sm.get("rebuild") or {}).get("mates")
-                    converged = True
-                    dof = None
-                    if isinstance(status, dict):
-                        dof = status.get("dof")
-                    if isinstance(mate_stat, list):
-                        converged = all(s.get("status") in ("ok", "redundant")
-                                        for s in mate_stat)
-                    frame = {"i": i, "value": round(val, 9),
-                             "converged": bool(converged),
-                             "bodies": _asm_body_transforms(d)}
-                    if dof is not None:
-                        frame["dof"] = dof
-                    if check_interference:
-                        clash = cb.call("eval_interference",
-                                        {"doc_id": d, "include_coincident": False,
-                                         "min_clearance_mm": float(min_clearance_mm)})
-                        inters = clash.get("interferences") or []
-                        frame["interference"] = bool(inters)
-                        if inters and first_collision_step is None:
-                            first_collision_step = i
-                            first_collision_value = round(val, 9)
-                            first_collision_detail = inters
-                    trajectory.append(frame)
-            finally:
-                # ALWAYS restore the mechanism to where it started — a study is non-destructive.
-                try:
-                    _set_and_solve(orig_value)
-                except Exception:  # noqa: BLE001
-                    pass
-
-            _publish_current(d)
-
-            if check_interference and first_collision_step is not None:
-                summary = (f"drove {mtype} mate '{mate_id}' {start:g}->{stop:g} {unit} over "
-                           f"{len(samples)} samples; INTERFERENCE first at step "
-                           f"{first_collision_step} (value {first_collision_value:g} {unit}).")
-            elif check_interference:
-                summary = (f"drove {mtype} mate '{mate_id}' {start:g}->{stop:g} {unit} over "
-                           f"{len(samples)} samples; no interference across the sweep.")
-            else:
-                summary = (f"drove {mtype} mate '{mate_id}' {start:g}->{stop:g} {unit} over "
-                           f"{len(samples)} samples (interference check skipped).")
-
-            out = {
-                "ok": True, "doc_id": d, "mate_id": mate_id,
-                "driver": {"type": mtype, "unit": unit, "start": start, "stop": stop,
-                           "steps": steps, "samples": len(samples), "loop": bool(loop)},
-                "trajectory": trajectory,
-                "interference": {"checked": bool(check_interference),
-                                 "first_collision_step": first_collision_step,
-                                 "first_collision_value": first_collision_value,
-                                 "detail": first_collision_detail},
-                "summary": summary,
+            payload = {
+                "doc_id": d,
+                "mate_id": mate_id,
+                "start": start,
+                "stop": stop,
+                "steps": steps,
+                "check_interference": bool(check_interference),
+                "min_clearance_mm": min_clearance_mm,
             }
-            # T-FIN20: rigid-body inverse dynamics on the SAME sweep (engine-side).
-            # Kinematics-only calls never reach this branch — their result shape is
-            # regression-frozen above.
             if dynamics is not None:
-                # LIVE-DIALECT guard: a stringified `dynamics` dict used to fail the bare
-                # isinstance() check and get silently replaced with {} — turning dynamics ON
-                # but discarding every config the model actually sent, with no error at all
-                # (the class-5 "reports success but did the wrong thing" failure). Coerce first.
                 dyn = coerce_json_or_repr(dynamics)
-                r_dyn = cb.call("simulate_motion", {
-                    "doc_id": d, "mate_id": mate_id, "start": float(start),
-                    "stop": float(stop), "steps": int(steps),
-                    "check_interference": False, "min_clearance_mm": 0.0,
-                    "dynamics": dyn if isinstance(dyn, dict) else {}})
-                out["dynamics"] = r_dyn.get("dynamics") or {
-                    "warnings": ["engine returned no dynamics block"]}
+                if not isinstance(dyn, dict):
+                    raise ValueError("simulate_motion: dynamics must be an object/dict.")
+                payload["dynamics"] = dyn
+
+            # The engine solves on a private assembly snapshot: no apply/restore cycle,
+            # revision churn, undo pollution, expression loss, or silent restore failure.
+            out = cb.call("simulate_motion", payload)
+
+            # Engine trajectory matrices are column-major for the native viewport.
+            # This MCP tool's established public shape is row-major, so transpose the
+            # representation (not the transform) at the seam.
+            for frame in out.get("trajectory") or []:
+                for body in frame.get("bodies") or []:
+                    cm = body.get("transform")
+                    if not isinstance(cm, list) or len(cm) != 16:
+                        raise ValueError(
+                            "simulate_motion: engine returned an invalid body transform.")
+                    body["transform"] = [
+                        cm[c * 4 + r] for r in range(4) for c in range(4)
+                    ]
+
+            trajectory = out.get("trajectory") or []
+            if loop and trajectory:
+                closing = copy.deepcopy(trajectory[0])
+                closing["i"] = len(trajectory)
+                closing["value"] = start
+                trajectory.append(closing)
+                out["trajectory"] = trajectory
+
+            driver = out.setdefault("driver", {})
+            driver.update({
+                "type": mtype,
+                "unit": unit,
+                "start": start,
+                "stop": stop,
+                "steps": steps,
+                "samples": len(trajectory),
+                "loop": bool(loop),
+            })
+            if loop and out.get("summary"):
+                out["summary"] += "; loop closure reuses the solved start pose"
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -615,62 +576,103 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                            dynamics: Optional[dict] = None,
                            material: Union[str, dict] = "steel",
                            mesh_fineness: float = 0.5, dry_run: bool = False,
-                           doc_id: Optional[str] = None) -> str:
-        """Motion → static FEA handoff: "is this link strong enough at the worst instant?"
-        in one call (aicad.simhandoff/1, coupling `motion_to_fea`).
+                           doc_id: Optional[str] = None,
+                           fixture_mate_id: Optional[str] = None,
+                           body_load_face: Optional[Union[str, dict]] = None) -> str:
+        """Motion → static FEA handoff for one isolated moving component.
 
-        Pipeline: (1) runs the motion study WITH rigid-body dynamics (simulate_motion +
-        dynamics — mass/inertia from geometry x density, gravity, joint reactions via the
-        mate constraint jacobian); (2) picks the WORST-CASE frame (or the frame nearest a
-        time you pass in `at`) for the joints touching the selected component; (3) opens
-        that component's part file and applies each joint reaction as a FORCE on the mate
-        face (load placed at the joint face via the mate ref's stored face centroid);
-        (4) runs run_fea_static on it. The result embeds a validated handoff envelope
-        under `simhandoff` with one condition per reaction force/moment, `case`-labelled
-        with the chosen frame/time, full provenance, and the FEA study records the
-        handoff id — closing the chain motion study → handoff → static study.
+        The fixed face must be the face of exactly one solved mate that joins the
+        selected component to a fixed assembly component.  That mate's reaction is
+        deliberately omitted from the FEA loads because the fixed boundary supplies
+        it.  All other joint reactions are applied at their mate faces.
 
-        component : the assembly component to stress-check — its id ("k2") or name ("Arm").
-        fixtures  : face queries held fixed on THAT COMPONENT's part (run_fea_static
-                    vocabulary, e.g. ["bottom"] or [{"of":"face","near":[x,y,z]}]).
-                    Fix the face(s) of the joint you consider grounded; the OTHER joints'
-                    reactions are applied as loads.
-        mate_id / start / stop / steps : the motion sweep (same semantics as
-                    simulate_motion; stop required, start defaults to current value).
-        at        : "worst" (default) = frame with the peak reaction force magnitude on
-                    this component's joints; or a time in seconds (float) to pick the
-                    nearest frame.
-        dynamics  : simulate_motion dynamics options (duration_s, gravity, densities,
-                    masses, loads, damping). Defaults apply when omitted.
-        dry_run   : if True, build the loads + envelope but SKIP the FEA solve (fast
-                    inspection / no solver required).
+        Inverse dynamics also balances gravity, acceleration, damping and explicit
+        body loads.  Their combined equivalent wrench is recovered from joint
+        equilibrium and must be represented in the static study.  When its force is
+        non-zero, ``body_load_face`` is required: it names one non-fixed face on which
+        the equivalent force can be placed.  The face's line of action must reproduce
+        the equivalent moment; otherwise this face-force-only solver cannot represent
+        the snapshot and the handoff refuses instead of dropping a couple.
 
-        Returns {ok, doc_id (assembly), part_doc_id, frame:{i, t_s}, loads_applied,
-        fea (run_fea_static summary or null when dry_run), simhandoff}. Moment reactions
-        are recorded in the envelope (units N*m) but only forces are applied to the
-        static study (point-moment loads are not supported by the solver — a warning is
-        attached when a significant moment is dropped).
+        ``fixture_mate_id`` may be omitted only when the fixture face identifies one
+        grounded mate unambiguously.  ``fixture_mate_id`` and ``body_load_face`` are
+        intentionally separate from ``mate_id`` (the driven mate) and ``fixtures``;
+        no caller input is silently reinterpreted.
+
+        Returns the applied local-N loads plus ``setup_diagnostics`` and
+        ``balance_diagnostics``.  ``dry_run`` performs every setup/balance check and
+        builds the handoff envelope but skips the FEA solve.
         """
         try:
             d = _doc(doc_id)
-            # LIVE-DIALECT guard: `fixtures` is iterated bare (`for q in fixtures`) below —
-            # a stringified list ("[{'of': 'face', ...}]") would silently iterate its
-            # CHARACTERS instead of raising cleanly. Coerce/type-check up front.
-            fixtures = require_list(fixtures, "fixtures",
-                                     'a list of face queries, e.g. ["bottom"] or '
-                                     '[{"of":"face","near":[x,y,z]}]')
-            # Same "no specific mate" placeholder as simulate_motion (mate_id="" / "none" /
-            # "null") — normalize BEFORE it's used to pick `start`'s default below, or the
-            # literal-string lookup silently misses and `start` is computed from the wrong
-            # (or no) mate while the later simulate_motion call auto-picks a different one.
+            fixtures = require_list(
+                fixtures, "fixtures",
+                'a one-item list naming the grounded mate face, e.g. ["bottom"] or '
+                '[{"of":"face","near":[x,y,z]}]')
+            if len(fixtures) != 1:
+                raise ValueError(
+                    "motion_fea_handoff: fixtures must resolve one grounded mate face; "
+                    "multiple fixed faces cannot be associated with one omitted reaction.")
             mate_id = _normalize_optional_slot(mate_id)
+            fixture_mate_id = _normalize_optional_slot(fixture_mate_id)
             if stop is None:
                 raise ValueError("motion_fea_handoff: `stop` is required (end of the sweep).")
+            stop = float(stop)
+            if not math.isfinite(stop):
+                raise ValueError("motion_fea_handoff: stop must be finite.")
+            steps = int(steps)
+            if steps < 3:
+                raise ValueError(
+                    "motion_fea_handoff: steps must be >= 3 for acceleration dynamics.")
+            mesh_fineness = float(mesh_fineness)
+            if not math.isfinite(mesh_fineness) or mesh_fineness <= 0.0:
+                raise ValueError(
+                    "motion_fea_handoff: mesh_fineness must be finite and > 0.")
+            dyn_opts = coerce_json_or_repr({} if dynamics is None else dynamics)
+            if not isinstance(dyn_opts, dict):
+                raise ValueError("motion_fea_handoff: dynamics must be an object/dict.")
+
             mates = _asm_mates(d)
             if not mates:
                 raise ValueError("motion_fea_handoff: document has no mates.")
+            mate_by_id = {m.get("id"): m for m in mates if m.get("id")}
+            drivable = [m for m in mates
+                        if m.get("type") in _DRIVABLE_MATE_TYPES and not m.get("suppressed")]
+            if mate_id is None:
+                if len(drivable) != 1:
+                    ids = ", ".join(str(m.get("id")) for m in drivable) or "none"
+                    raise ValueError(
+                        "motion_fea_handoff: mate_id may be omitted only when exactly one "
+                        f"angle/distance mate is drivable (candidates: {ids}).")
+                driven = drivable[0]
+                mate_id = driven.get("id")
+            else:
+                driven = next((m for m in drivable if m.get("id") == mate_id), None)
+                if driven is None:
+                    raise ValueError(
+                        f"motion_fea_handoff: mate '{mate_id}' is not a drivable "
+                        "angle/distance mate.")
 
-            # --- resolve the component (id or name) --------------------------
+            def _mate_value(m: dict) -> float:
+                value = m.get("value")
+                if isinstance(value, dict):
+                    value = value.get("value")
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise ValueError(
+                        f"motion_fea_handoff: mate '{mate_id}' has no numeric value.")
+                value = float(value)
+                if not math.isfinite(value):
+                    raise ValueError(
+                        f"motion_fea_handoff: mate '{mate_id}' value is non-finite.")
+                return value
+
+            if start is None:
+                start = _mate_value(driven)
+            start = float(start)
+            if not math.isfinite(start):
+                raise ValueError("motion_fea_handoff: start must be finite.")
+
+            # --- resolve the isolated component and its two explicit load faces ----
             tr = cb.call("doc_tree", {"doc_id": d}).get("tree") or {}
             comps = [c for c in (tr.get("components") or []) if not c.get("suppressed")]
             comp = next((c for c in comps if c.get("id") == component or
@@ -680,103 +682,492 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 raise ValueError(f"motion_fea_handoff: component '{component}' not found. "
                                  f"Components: {ids}")
             cid = comp.get("id")
+            if comp.get("fixed"):
+                raise ValueError(
+                    "motion_fea_handoff: the isolated component must be moving, not fixed.")
             src_path = (comp.get("source") or {}).get("path") or ""
             if not src_path or not os.path.exists(src_path):
                 raise ValueError(f"motion_fea_handoff: component '{cid}' has no readable "
                                  f"source file ({src_path!r}) to run FEA on.")
+            part_doc = cb.call("doc_open", {"path": src_path}).get("doc_id")
+            if not part_doc:
+                raise ValueError("motion_fea_handoff: component part could not be opened.")
+            fixture_selector = _resolve_one_selector(part_doc, fixtures[0], kind="face")
+            fixture_sets = _resolve_face_points(part_doc, fixture_selector)
 
-            # --- default `start` to the driven mate's current value ------------
-            if start is None:
-                cand = [m for m in mates if m.get("id") == mate_id] if mate_id else \
-                       [m for m in mates
-                        if m.get("type") in _DRIVABLE_MATE_TYPES and not m.get("suppressed")]
-                v = (cand[0].get("value") if cand else None)
-                start = float(v.get("value", 0.0)) if isinstance(v, dict) else \
-                        float(v) if isinstance(v, (int, float)) else 0.0
+            def _finite_vec(raw, label):
+                if not isinstance(raw, list) or len(raw) != 3:
+                    raise ValueError(f"motion_fea_handoff: {label} must have 3 components.")
+                vec = [float(x) for x in raw]
+                if not all(math.isfinite(x) for x in vec):
+                    raise ValueError(f"motion_fea_handoff: {label} must be finite.")
+                return vec
 
-            # --- motion study WITH dynamics (engine-side sweep) ---------------
-            dyn_opts = dict(dynamics) if isinstance(dynamics, dict) else {}
+            def _centroid(selector):
+                if not isinstance(selector, dict) or selector.get("kind") != "face":
+                    return None
+                raw = selector.get("centroid")
+                if not isinstance(raw, list) or len(raw) != 3:
+                    return None
+                if not all(isinstance(x, (int, float)) and not isinstance(x, bool) and
+                           math.isfinite(float(x)) for x in raw):
+                    return None
+                return [float(x) for x in raw]
+
+            def _same_face(left, right):
+                left_sid, right_sid = left.get("sid"), right.get("sid")
+                if left_sid and right_sid:
+                    return left_sid == right_sid
+                lc, rc = _centroid(left), _centroid(right)
+                if lc is None or rc is None:
+                    return False
+                if math.sqrt(sum((a - b) ** 2 for a, b in zip(lc, rc))) > 1e-6:
+                    return False
+                ln, rn = left.get("normal"), right.get("normal")
+                if (isinstance(ln, list) and len(ln) == 3 and
+                        isinstance(rn, list) and len(rn) == 3):
+                    ln, rn = _finite_vec(ln, "fixture face normal"), _finite_vec(
+                        rn, "mate face normal")
+                    lmag = math.sqrt(sum(x * x for x in ln))
+                    rmag = math.sqrt(sum(x * x for x in rn))
+                    if lmag <= 1e-12 or rmag <= 1e-12:
+                        return False
+                    if sum(a * b for a, b in zip(ln, rn)) / (lmag * rmag) < 1.0 - 1e-6:
+                        return False
+                return True
+
+            if _centroid(fixture_selector) is None:
+                raise ValueError(
+                    "motion_fea_handoff: fixture query must resolve one stable face with "
+                    "a finite centroid; tied/predicate-only fixture queries are ambiguous.")
+
+            # --- motion study WITH dynamics (engine-side immutable sweep) ---------
             r_mot = cb.call("simulate_motion", {
-                "doc_id": d, "mate_id": mate_id or "", "start": float(start),
-                "stop": float(stop), "steps": int(steps),
+                "doc_id": d, "mate_id": mate_id, "start": start,
+                "stop": stop, "steps": steps,
                 "check_interference": False, "min_clearance_mm": 0.0,
                 "dynamics": dyn_opts})
             dyn = r_mot.get("dynamics") or {}
+            if dyn and (not dyn.get("ok") or not dyn.get("force_path_resolved")):
+                return _dumps({
+                    "ok": False,
+                    "error": "motion dynamics has an unresolved force/moment path; "
+                             "refusing to create FEA loads",
+                    "warnings": dyn.get("warnings")})
+            if not r_mot.get("ok"):
+                return _dumps({
+                    "ok": False,
+                    "error": r_mot.get("error", "motion sweep did not converge"),
+                    "warnings": dyn.get("warnings")})
             frames = dyn.get("frames") or []
-            if not frames:
-                return _dumps({"ok": False, "error": "motion dynamics produced no frames",
-                               "warnings": dyn.get("warnings")})
+            if not frames or not all(fr.get("balanced") for fr in frames):
+                return _dumps({
+                    "ok": False,
+                    "error": "motion dynamics produced no fully balanced frame set",
+                    "warnings": dyn.get("warnings")})
             drv_mate = r_mot.get("mate_id")
 
-            # --- joints touching this component -------------------------------
-            touch_mids = set()
-            sel_by_mid = {}
+            # Every solved joint on this body must have one stable component-side ref.
+            component_refs = {}
             for m in mates:
-                for ref in (m.get("refs") or []):
-                    if isinstance(ref, dict) and ref.get("component") == cid:
-                        touch_mids.add(m.get("id"))
-                        sel_by_mid[m.get("id")] = ref.get("selector") or {}
-            have = {r.get("mate_id") for r in frames[0].get("reactions", [])}
-            touch_mids &= have
+                refs = [ref for ref in (m.get("refs") or [])
+                        if isinstance(ref, dict) and ref.get("component") == cid]
+                if refs:
+                    component_refs[m.get("id")] = refs
+            joint_meta = {j.get("mate_id"): j for j in (dyn.get("joints") or [])}
+            touch_mids = {
+                mid for mid, joint in joint_meta.items()
+                if cid in (joint.get("component_a"), joint.get("component_b"))
+            }
             if not touch_mids:
-                return _dumps({"ok": False, "error":
-                               f"no solved joint reactions touch component '{cid}' — its "
-                               "mates may be dangling (see dynamics.warnings).",
-                               "warnings": dyn.get("warnings")})
+                return _dumps({
+                    "ok": False,
+                    "error": f"no solved joint reactions touch component '{cid}'",
+                    "warnings": dyn.get("warnings")})
+            bad_refs = [mid for mid in sorted(touch_mids)
+                        if len(component_refs.get(mid) or []) != 1]
+            if bad_refs:
+                return _dumps({
+                    "ok": False,
+                    "error": "each solved joint on the isolated component must have exactly "
+                             f"one component-side face reference; invalid mates: {bad_refs}",
+                    "warnings": dyn.get("warnings")})
+            selectors = {mid: component_refs[mid][0].get("selector") or {}
+                         for mid in touch_mids}
+            invalid_faces = [mid for mid, selector in selectors.items()
+                             if _centroid(selector) is None]
+            if invalid_faces:
+                return _dumps({
+                    "ok": False,
+                    "error": "joint reaction faces are missing stable finite face selectors "
+                             f"on component '{cid}': {sorted(invalid_faces)}",
+                    "warnings": dyn.get("warnings")})
 
-            # --- pick the frame ------------------------------------------------
+            fixed_ids = {c.get("id") for c in comps if c.get("fixed")}
+
+            def _is_grounded_fixture(mid):
+                mate = mate_by_id.get(mid) or {}
+                other_ids = {
+                    ref.get("component") for ref in (mate.get("refs") or [])
+                    if isinstance(ref, dict) and ref.get("component") != cid
+                }
+                return (len(other_ids) == 1 and next(iter(other_ids)) in fixed_ids and
+                        _same_face(selectors[mid], fixture_selector))
+
+            fixture_candidates = sorted(mid for mid in touch_mids
+                                        if _is_grounded_fixture(mid))
+            setup_diagnostics = {
+                "fixture_face": fixture_selector,
+                "fixture_mate_candidates": fixture_candidates,
+                "fixture_mate_id": fixture_mate_id,
+                "fixture_reaction_omitted_from_loads": False,
+                "body_load_face": None,
+            }
+            if len(fixture_candidates) != 1:
+                return _dumps({
+                    "ok": False,
+                    "error": "fixture face must identify exactly one solved mate to a "
+                             "fixed component; duplicate or missing grounded mates are an "
+                             f"ambiguous boundary (candidates: {fixture_candidates})",
+                    "setup_diagnostics": setup_diagnostics,
+                    "warnings": dyn.get("warnings")})
+            resolved_fixture_mate_id = fixture_candidates[0]
+            if (fixture_mate_id is not None and
+                    fixture_mate_id != resolved_fixture_mate_id):
+                return _dumps({
+                    "ok": False,
+                    "error": f"fixture_mate_id '{fixture_mate_id}' is not the solved mate "
+                             "joining the requested fixture face to a fixed component",
+                    "setup_diagnostics": setup_diagnostics,
+                    "warnings": dyn.get("warnings")})
+            fixture_mate_id = resolved_fixture_mate_id
+            setup_diagnostics["fixture_mate_id"] = fixture_mate_id
+            setup_diagnostics["fixture_reaction_omitted_from_loads"] = True
+
             def _peak(fr: dict) -> float:
-                return max((r.get("force_mag_n", 0.0) for r in fr.get("reactions", [])
-                            if r.get("mate_id") in touch_mids), default=0.0)
-            if isinstance(at, str) and at == "worst":
+                peak = 0.0
+                for reaction in fr.get("reactions") or []:
+                    if reaction.get("mate_id") not in touch_mids:
+                        continue
+                    vec = _finite_vec(reaction.get("force_n"), "reaction force_n")
+                    peak = max(peak, math.sqrt(sum(x * x for x in vec)))
+                return peak
+
+            if isinstance(at, str):
+                if at != "worst":
+                    raise ValueError("motion_fea_handoff: at must be 'worst' or a time in s.")
                 frame = max(frames, key=_peak)
             else:
                 t_want = float(at)
-                frame = min(frames, key=lambda fr: abs(fr.get("t_s", 0.0) - t_want))
+                if not math.isfinite(t_want):
+                    raise ValueError("motion_fea_handoff: at time must be finite.")
+                t_min = float(frames[0].get("t_s", 0.0))
+                t_max = float(frames[-1].get("t_s", 0.0))
+                if t_want < t_min or t_want > t_max:
+                    raise ValueError(
+                        f"motion_fea_handoff: at={t_want:g}s is outside "
+                        f"[{t_min:g},{t_max:g}]s.")
+                frame = min(frames, key=lambda fr: abs(float(fr.get("t_s", 0.0)) -
+                                                        t_want))
             fi, ft = int(frame.get("i", 0)), float(frame.get("t_s", 0.0))
+            if _peak(frame) <= 1e-12:
+                return _dumps({
+                    "ok": False,
+                    "error": f"selected frame {fi} has zero force reactions on component "
+                             f"'{cid}'; refusing a zero-load FEA handoff",
+                    "setup_diagnostics": setup_diagnostics,
+                    "warnings": dyn.get("warnings")})
             case = f"frame{fi}@t{ft:.6g}s"
 
-            # --- build loads + envelope conditions ------------------------------
-            conditions = []
-            loads = []
-            warnings = list(dyn.get("warnings") or [])
-            for r in frame.get("reactions", []):
-                mid = r.get("mate_id")
+            # Dynamics reactions are world-frame and act on component_b.  Rotate
+            # them into the isolated part and form each joint wrench about its local
+            # origin (mate selectors are local mm; moments use metres).
+            trajectory_frame = next(
+                (fr for fr in (r_mot.get("trajectory") or [])
+                 if int(fr.get("i", -1)) == fi), None)
+            pose = next(
+                (b.get("transform") for b in ((trajectory_frame or {}).get("bodies") or [])
+                 if b.get("component") == cid), None)
+            if not isinstance(pose, list) or len(pose) != 16:
+                raise ValueError(
+                    "motion_fea_handoff: selected component pose is unavailable.")
+            pose = [float(x) for x in pose]  # engine convention: column-major
+            if not all(math.isfinite(x) for x in pose):
+                raise ValueError(
+                    "motion_fea_handoff: selected component pose is non-finite.")
+
+            def _world_to_local(vec):
+                return [sum(pose[c * 4 + r] * vec[r] for r in range(3))
+                        for c in range(3)]
+
+            def _vadd(left, right):
+                return [a + b for a, b in zip(left, right)]
+
+            def _vsub(left, right):
+                return [a - b for a, b in zip(left, right)]
+
+            def _vneg(vec):
+                return [-x for x in vec]
+
+            def _cross(left, right):
+                return [left[1] * right[2] - left[2] * right[1],
+                        left[2] * right[0] - left[0] * right[2],
+                        left[0] * right[1] - left[1] * right[0]]
+
+            def _norm(vec):
+                return math.sqrt(sum(x * x for x in vec))
+
+            reaction_rows = []
+            for reaction in frame.get("reactions") or []:
+                mid = reaction.get("mate_id")
                 if mid not in touch_mids:
                     continue
-                f_vec = [float(x) for x in (r.get("force_n") or [0, 0, 0])]
-                m_vec = [float(x) for x in (r.get("moment_nm") or [0, 0, 0])]
-                centroid = (sel_by_mid.get(mid) or {}).get("centroid")
-                applied_to = (f"{cid}:face@{centroid}" if centroid else cid)
-                prov = (f"simulate_motion dynamics frame {fi} (t={ft:.6g}s) joint '{mid}' "
-                        f"reaction on component '{cid}'")
-                conditions.append(sh.condition(
-                    f"{mid}_reaction_force", "force", f_vec, "N", prov,
-                    applied_to=applied_to, case=case))
-                if any(abs(x) > 1e-9 for x in m_vec):
-                    conditions.append(sh.condition(
-                        f"{mid}_reaction_moment", "moment", m_vec, "N*m", prov,
-                        applied_to=applied_to, case=case))
-                    if max(abs(x) for x in m_vec) > 1e-3:
-                        warnings.append(
-                            f"joint '{mid}' carries a moment {m_vec} N*m that is NOT "
-                            "applied to the static study (force loads only)")
-                if centroid:
-                    loads.append({"face": {"of": "face", "near": centroid}, "force": f_vec,
-                                  "mate_id": mid})
+                meta = joint_meta[mid]
+                if cid == meta.get("component_b"):
+                    sign = 1.0
+                elif cid == meta.get("component_a"):
+                    sign = -1.0
                 else:
-                    warnings.append(f"mate '{mid}' ref has no stored face centroid — its "
-                                    "reaction force was not applied as an FEA load")
+                    continue
+                force_world = [sign * x for x in
+                               _finite_vec(reaction.get("force_n"), "reaction force_n")]
+                moment_world = [sign * x for x in
+                                _finite_vec(reaction.get("moment_nm"), "reaction moment_nm")]
+                force_local = _world_to_local(force_world)
+                moment_local = _world_to_local(moment_world)
+                centroid = _centroid(selectors[mid])
+                arm_m = [x * 1e-3 for x in centroid]
+                wrench_moment = _vadd(moment_local, _cross(arm_m, force_local))
+                reaction_rows.append({
+                    "mate_id": mid,
+                    "selector": selectors[mid],
+                    "centroid_mm": centroid,
+                    "force_world_n": force_world,
+                    "force_local_n": force_local,
+                    "joint_moment_local_nm": moment_local,
+                    "wrench_moment_about_origin_local_nm": wrench_moment,
+                })
+            fixture_reaction = next(
+                (row for row in reaction_rows if row["mate_id"] == fixture_mate_id), None)
+            if fixture_reaction is None:
+                return _dumps({
+                    "ok": False,
+                    "error": f"selected frame has no reaction for fixture mate "
+                             f"'{fixture_mate_id}'",
+                    "setup_diagnostics": setup_diagnostics,
+                    "warnings": dyn.get("warnings")})
+
+            zero = [0.0, 0.0, 0.0]
+            joint_force_sum = list(zero)
+            joint_moment_sum = list(zero)
+            for row in reaction_rows:
+                joint_force_sum = _vadd(joint_force_sum, row["force_local_n"])
+                joint_moment_sum = _vadd(
+                    joint_moment_sum,
+                    row["wrench_moment_about_origin_local_nm"])
+            body_force = _vneg(joint_force_sum)
+            body_moment = _vneg(joint_moment_sum)
+            moment_scale = max(
+                [1.0, _norm(body_moment)] +
+                [_norm(row["wrench_moment_about_origin_local_nm"])
+                 for row in reaction_rows])
+            force_tol = 1e-10 + 1e-8 * max(1.0, _norm(joint_force_sum))
+            moment_tol = 1e-9 + 1e-6 * moment_scale
+            balance_diagnostics = {
+                "source_frame_balanced": bool(frame.get("balanced")),
+                "source_force_residual_n": frame.get("force_residual_n"),
+                "source_moment_residual_nm": frame.get("moment_residual_nm"),
+                "joint_force_sum_local_n": joint_force_sum,
+                "joint_moment_sum_about_origin_local_nm": joint_moment_sum,
+                "equivalent_body_inertial_force_local_n": body_force,
+                "equivalent_body_inertial_moment_about_origin_local_nm": body_moment,
+                "omitted_fixture_reaction": fixture_reaction,
+            }
+
+            # A non-fixture joint couple cannot be represented by the static solver's
+            # face-force load.  Refuse rather than silently dropping it.
+            unsupported_couples = [
+                {"mate_id": row["mate_id"],
+                 "moment_local_nm": row["joint_moment_local_nm"]}
+                for row in reaction_rows
+                if row["mate_id"] != fixture_mate_id and
+                _norm(row["joint_moment_local_nm"]) > moment_tol
+            ]
+            if unsupported_couples:
+                balance_diagnostics["unsupported_nonfixture_joint_couples"] = (
+                    unsupported_couples)
+                return _dumps({
+                    "ok": False,
+                    "error": "non-fixture joint reactions include pure moments that the "
+                             "face-force static solver cannot apply",
+                    "setup_diagnostics": setup_diagnostics,
+                    "balance_diagnostics": balance_diagnostics,
+                    "warnings": dyn.get("warnings")})
+
+            conditions = [
+                sh.condition(
+                    f"{fixture_mate_id}_fixed_support", "fixed_support", 1.0, "1",
+                    f"fixture face associated with grounded mate '{fixture_mate_id}'; "
+                    "its motion reaction is intentionally omitted",
+                    applied_to=f"{cid}:face@{fixture_reaction['centroid_mm']}", case=case)
+            ]
+            loads = []
+            warnings = list(dyn.get("warnings") or [])
+            represented_joint_force = list(zero)
+            represented_joint_moment = list(zero)
+            for row in reaction_rows:
+                if row["mate_id"] == fixture_mate_id:
+                    continue
+                if _norm(row["force_local_n"]) <= force_tol:
+                    continue
+                mid = row["mate_id"]
+                face = {"of": "face", "near": row["centroid_mm"]}
+                provenance = (
+                    f"simulate_motion dynamics frame {fi} (t={ft:.6g}s) joint '{mid}' "
+                    f"reaction on component '{cid}', transformed world to component-local")
+                conditions.append(sh.condition(
+                    f"{mid}_reaction_force", "force", row["force_local_n"], "N",
+                    provenance, applied_to=f"{cid}:face@{row['centroid_mm']}", case=case))
+                loads.append({
+                    "kind": "joint_reaction",
+                    "source": f"mate '{mid}'",
+                    "face": face,
+                    "force": row["force_local_n"],
+                    "units": "N",
+                    "force_world_n": row["force_world_n"],
+                    "mate_id": mid})
+                represented_joint_force = _vadd(
+                    represented_joint_force, row["force_local_n"])
+                represented_joint_moment = _vadd(
+                    represented_joint_moment,
+                    _cross([x * 1e-3 for x in row["centroid_mm"]],
+                           row["force_local_n"]))
+
+            represented_body_moment = list(zero)
+            if _norm(body_force) > force_tol:
+                if body_load_face is None:
+                    balance_diagnostics["body_load_representation_complete"] = False
+                    return _dumps({
+                        "ok": False,
+                        "error": "body_load_face is required to apply the non-zero equivalent "
+                                 "gravity/inertial/body-load resultant",
+                        "required_body_load": {
+                            "force_local_n": body_force,
+                            "moment_about_origin_local_nm": body_moment},
+                        "setup_diagnostics": setup_diagnostics,
+                        "balance_diagnostics": balance_diagnostics,
+                        "warnings": warnings})
+                body_selector = _resolve_one_selector(part_doc, body_load_face, kind="face")
+                if _same_face(body_selector, fixture_selector):
+                    return _dumps({
+                        "ok": False,
+                        "error": "body_load_face must be distinct from the fixed fixture face; "
+                                 "a load on constrained nodes would not stress the component",
+                        "setup_diagnostics": setup_diagnostics,
+                        "balance_diagnostics": balance_diagnostics,
+                        "warnings": warnings})
+                body_centroid = _centroid(body_selector)
+                if body_centroid is None:
+                    raise ValueError(
+                        "motion_fea_handoff: body_load_face lacks a finite face centroid.")
+                represented_body_moment = _cross(
+                    [x * 1e-3 for x in body_centroid], body_force)
+                body_moment_error = _vsub(represented_body_moment, body_moment)
+                if _norm(body_moment_error) > moment_tol:
+                    balance_diagnostics.update({
+                        "body_load_representation_complete": False,
+                        "body_load_face_moment_local_nm": represented_body_moment,
+                        "body_load_moment_error_nm": _norm(body_moment_error),
+                        "body_load_moment_tolerance_nm": moment_tol,
+                    })
+                    return _dumps({
+                        "ok": False,
+                        "error": "body_load_face line of action does not reproduce the "
+                                 "required equivalent body/inertial moment; choose a face on "
+                                 "the resultant line of action",
+                        "setup_diagnostics": setup_diagnostics,
+                        "balance_diagnostics": balance_diagnostics,
+                        "warnings": warnings})
+                setup_diagnostics["body_load_face"] = body_selector
+                provenance = (
+                    f"negative sum of all joint wrenches on component '{cid}' at motion "
+                    f"frame {fi} (t={ft:.6g}s), representing gravity, inertia, damping "
+                    "and explicit dynamics loads")
+                conditions.append(sh.condition(
+                    "equivalent_body_inertial_force", "equivalent_body_inertial_force",
+                    body_force, "N", provenance,
+                    applied_to=f"{cid}:face@{body_centroid}", case=case))
+                loads.append({
+                    "kind": "equivalent_body_inertial",
+                    "source": "inverse-dynamics joint-wrench balance",
+                    "face": body_selector,
+                    "force": body_force,
+                    "units": "N",
+                    "equivalent_moment_about_origin_nm": body_moment})
+                warnings.append(
+                    "equivalent gravity/inertial/body resultant is applied as a "
+                    "statically equivalent face force, not a distributed body load")
+            elif _norm(body_moment) > moment_tol:
+                balance_diagnostics["body_load_representation_complete"] = False
+                return _dumps({
+                    "ok": False,
+                    "error": "inverse dynamics requires a pure equivalent body/inertial "
+                             "couple, which the face-force static solver cannot apply",
+                    "setup_diagnostics": setup_diagnostics,
+                    "balance_diagnostics": balance_diagnostics,
+                    "warnings": warnings})
+
             if not loads:
-                return _dumps({"ok": False, "error":
-                               "no reaction could be placed on a face of the component "
-                               "(mate refs carry no face centroids)",
-                               "warnings": warnings})
+                return _dumps({
+                    "ok": False,
+                    "error": "isolated snapshot has no non-zero representable load after "
+                             "omitting the fixture reaction",
+                    "setup_diagnostics": setup_diagnostics,
+                    "balance_diagnostics": balance_diagnostics,
+                    "warnings": warnings})
 
-            # --- open the component part ----------------------------------------
-            part_doc = cb.call("doc_open", {"path": src_path}).get("doc_id")
+            applied_force = _vadd(represented_joint_force, body_force)
+            applied_moment = _vadd(represented_joint_moment, represented_body_moment)
+            force_closure = _vadd(
+                applied_force, fixture_reaction["force_local_n"])
+            moment_closure = _vadd(
+                applied_moment,
+                fixture_reaction["wrench_moment_about_origin_local_nm"])
+            balance_diagnostics.update({
+                "body_load_representation_complete": True,
+                "body_load_face_moment_local_nm": represented_body_moment,
+                "applied_nonfixture_force_sum_local_n": applied_force,
+                "applied_nonfixture_moment_sum_about_origin_local_nm": applied_moment,
+                "force_closure_residual_n": _norm(force_closure),
+                "moment_closure_residual_nm": _norm(moment_closure),
+                "expected_fixture_boundary_reaction_force_local_n":
+                    fixture_reaction["force_local_n"],
+                "expected_fixture_boundary_reaction_moment_about_origin_local_nm":
+                    fixture_reaction["wrench_moment_about_origin_local_nm"],
+            })
+            if (_norm(force_closure) > force_tol or
+                    _norm(moment_closure) > moment_tol):
+                return _dumps({
+                    "ok": False,
+                    "error": "isolated static load set does not close against the omitted "
+                             "fixture reaction",
+                    "setup_diagnostics": setup_diagnostics,
+                    "balance_diagnostics": balance_diagnostics,
+                    "warnings": warnings})
 
-            # --- envelope (aicad.simhandoff/1) ------------------------------------
+            load_specs = []
+            for load in loads:
+                faces = _merge_face_sets(_resolve_face_points(part_doc, load["face"]))
+                if not faces:
+                    return _dumps({
+                        "ok": False,
+                        "error": f"{load['source']} face did not resolve on the component part",
+                        "setup_diagnostics": setup_diagnostics,
+                        "balance_diagnostics": balance_diagnostics,
+                        "warnings": warnings})
+                load_specs.append({"faces": faces, "type": "force",
+                                   "vector": load["force"]})
+
             env = sh.build_handoff(
                 "motion_to_fea",
                 sh.study_ref("motion", "simulate_motion", doc_id=d,
@@ -792,49 +1183,52 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 conditions=conditions,
                 warnings=warnings or None,
                 meta={"at": at if isinstance(at, str) else float(at),
-                      "case": case, "material": material if isinstance(material, str)
-                      else "custom"})
+                      "case": case,
+                      "fixture_mate_id": fixture_mate_id,
+                      "material": material if isinstance(material, str) else "custom"})
 
-            result = {"ok": True, "doc_id": d, "component": cid,
-                      "part_doc_id": part_doc, "frame": {"i": fi, "t_s": ft},
-                      "loads_applied": loads, "warnings": warnings, "fea": None}
+            result = {
+                "ok": True,
+                "doc_id": d,
+                "component": cid,
+                "part_doc_id": part_doc,
+                "frame": {"i": fi, "t_s": ft},
+                "loads_applied": loads,
+                "setup_diagnostics": setup_diagnostics,
+                "balance_diagnostics": balance_diagnostics,
+                "warnings": warnings,
+                "fea": None,
+            }
             if dry_run:
-                result["note"] = "dry_run: loads + envelope built, FEA solve skipped"
+                result["note"] = "dry_run: balanced loads + envelope built, FEA solve skipped"
                 return _dumps(sh.attach(result, env))
 
-            # --- static FEA on the component (same path as run_fea_static) --------
             mat = _resolve_material(material)
             step = _tmp(".step")
             cb.call("doc_export_step", {"doc_id": part_doc, "path": step})
-            fixture_sets: list = []
-            for q in fixtures:
-                fixture_sets.extend(_resolve_face_points(part_doc, q))
-            if not fixture_sets:
-                return _dumps({"ok": False, "error": "no fixture faces resolved on the "
-                               "component part — check the fixture queries."})
-            load_specs = []
-            for ld in loads:
-                faces = _resolve_face_points(part_doc, ld["face"])
-                load_specs.append({"faces": _merge_face_sets(faces), "type": "force",
-                                   "vector": ld["force"]})
             study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
                      "loads": load_specs, "mesh_order": 2, "fineness": mesh_fineness}
             _autosave_all_open()
             res = cb.call("sim_run_static", {"study": study})
             if not res.get("ok"):
+                result["ok"] = False
                 result["fea"] = {"ok": False, "error": res.get("error", "solve failed")}
                 return _dumps(sh.attach(result, env))
             _persist_study(part_doc, {
                 "type": "fea_static",
-                "name": f"Motion reactions {case} ({mat.get('name', material)})",
+                "name": f"Motion isolated snapshot {case} ({mat.get('name', material)})",
                 "engine": "cpp", "material": mat, "fixtures": fixtures,
-                "loads": [{"face": ld["face"], "force": ld["force"]} for ld in loads],
+                "fixture_mate_id": fixture_mate_id,
+                "loads": [{"kind": ld["kind"], "face": ld["face"],
+                           "force": ld["force"], "units": "N"}
+                          for ld in loads],
                 "mesh_fineness": mesh_fineness,
                 "results": res.get("summary", {}), "n_dof": res.get("n_dof"),
                 "simhandoff_id": env.get("id"),
             })
             result["fea"] = {"ok": True, "summary": res.get("summary", {}),
-                             "n_dof": res.get("n_dof"), "material": mat.get("name", material)}
+                             "n_dof": res.get("n_dof"),
+                             "material": mat.get("name", material)}
             return _dumps(sh.attach(result, env))
         except Exception as e:  # noqa: BLE001
             return _err(e)

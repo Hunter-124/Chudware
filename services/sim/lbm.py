@@ -2,10 +2,9 @@
 
 Lattice → SI scaling (documented here as required):
 ----------------------------------------------------
-  dx  = physical voxel size in metres = domain_length_m / N_cells_along_flow
-  dt  = dx / (cs * u_phys / u_lat)
-      where cs = lattice speed of sound = 1/sqrt(3) in lattice units,
-            u_phys = inlet speed in m/s, u_lat = target lattice inlet speed ≤ 0.1
+  dx  = physical voxel size in metres
+  dt  = u_lat * dx / u_phys
+      where u_phys = inlet speed in m/s and u_lat = 0.05 (Mach ≈ 0.087)
 
   Kinematic viscosity (SI):
     nu_lat = cs^2 * (tau - 0.5)     [lattice units, cs^2=1/3]
@@ -17,13 +16,10 @@ Lattice → SI scaling (documented here as required):
       ΔP_lat  = (f_i_out + f_i_in) * e_i_alpha  (dimensionless, rho_lat=1 normalised)
     Summing over all boundary links and the flow direction alpha:
       drag_lat = Σ ΔP_lat * e_i_x  (dimensionless accumulation)
-    Physical force (N) — Aidun & Clausen 2010 derivation:
-      Each f_i carries momentum flux rho_ref * f_i_lat * c_i * dx^2 through the face
-      where c_i = e_i * dx/dt (physical velocity, m/s), dx^2 = face area
-      Summing: drag_n = rho_ref * drag_lat * (dx/dt) * dx^2
-                      = rho_ref * drag_lat * dx^3 / dt
-      with rho_ref ≈ 1.225 kg/m^3 (air, sea level)
-    Note: an incorrect formula of rho*dx^4/dt^2 is off by a factor of c=dx/dt.
+    Physical force uses the LBM force scale (mass * acceleration):
+      drag_n = rho_ref * drag_lat * dx^4 / dt^2
+    because one lattice mass unit is rho_ref*dx^3 and one lattice acceleration unit is dx/dt^2.
+    This gives the required physical V^2 force scaling when dt=u_lat*dx/V.
 
   Drag coefficient:
     Cd = drag_n / (0.5 * rho_phys * u_phys^2 * frontal_area_m2)
@@ -36,23 +32,24 @@ Turbulence:
   estimated from the second-order moment of the non-equilibrium distribution.
 
 Boundary conditions:
-  Inlet  (x=0 face)        : prescribed velocity BC (Zou-He equilibrium injection)
+  Inlet  (x=0 face)        : prescribed equilibrium velocity injection
   Outlet (x=Nx-1 face)     : zero-gradient (copy from x=Nx-2 plane)
   Lateral (y,z faces)      : slip (mirror, no friction) — documented choice
   Solid cells              : half-way bounce-back
 
 Numerical stability guards:
-  - u_lat ≤ 0.1 (Mach guard at construction time; enforced by scaling)
-  - tau ≥ 0.51 (viscosity floor; clamped at init)
-  - NaN/divergence watchdog every ~50 steps:
-      first trigger  → halve (tau-0.5) toward tau=1 and continue
-      second trigger → abort, set diverged=True, return partial results
+  - fixed u_lat=0.05 (<0.1 low-Mach bound)
+  - molecular tau must be finite in (0.500001, 2]; it is never silently clamped
+  - Smagorinsky adds eddy viscosity while preserving molecular tau as its lower bound
+  - any non-finite/unbounded population aborts; no reset or altered-viscosity retry is reported
+  - convergence requires <1% drift between half-window mean drag values and <2% mass imbalance
   - Memory guard: refuse if domain would exceed ~2 GB at float32 (19 fields × 4 bytes)
 """
 
 from __future__ import annotations
 
 import dataclasses
+import math
 import time
 from typing import Callable, List, Optional, Tuple
 
@@ -99,6 +96,12 @@ _W: np.ndarray = np.array([
 # Opposite direction index for bounce-back
 _OPP: np.ndarray = np.array([
     0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15, 18, 17
+], dtype=np.int32)
+_REFLECT_Y: np.ndarray = np.array([
+    0, 1, 2, 4, 3, 5, 6, 9, 10, 7, 8, 11, 12, 13, 14, 18, 17, 16, 15
+], dtype=np.int32)
+_REFLECT_Z: np.ndarray = np.array([
+    0, 1, 2, 3, 4, 6, 5, 7, 8, 9, 10, 13, 14, 11, 12, 17, 18, 15, 16
 ], dtype=np.int32)
 
 _NQ = 19
@@ -156,7 +159,7 @@ class FlowResult:
     cd:                 float
     frontal_area_mm2:   float
     reynolds_note:      str
-    trace:              List[Tuple[int, float]]    # (step, drag_n)
+    trace:              List[Tuple[int, float]]    # (step, window-mean drag_n)
     slices:             List[np.ndarray]           # [x_mid, y_mid, z_mid] 2D vmag arrays
     slice_transforms:   List[np.ndarray]           # 3 × (4,4) float64 world→lattice transforms
     streamline_points:  List[np.ndarray]           # list of (N,3) float32 WORLD mm coords
@@ -195,6 +198,9 @@ class FlowResult:
     # Scalar fields available in `overlay_path` (e.g. ["pressure_cp","velocity"] for aero or
     # ["temperature","velocity"] for thermal).  Empty -> the worker derives the LBM defaults.
     scalar_fields:      List[str] = dataclasses.field(default_factory=list)
+    converged:           bool = False
+    residual:            float = -1.0   # relative drift between half-window mean drag
+    mass_imbalance:      float = -1.0
 
     def save_npz(self, path: str) -> None:
         """Save all arrays + scalars to a compressed .npz file."""
@@ -207,12 +213,23 @@ class FlowResult:
             path,
             drag_n=np.float32(self.drag_n),
             lift_n=np.float32(self.lift_n),
+            side_n=np.float32(self.side_n),
+            cl=np.float32(self.cl),
+            ld=np.float32(self.ld),
+            reynolds=np.float64(self.reynolds),
+            ref_area_mm2=np.float64(self.ref_area_mm2),
+            cp_min=np.float32(self.cp_min),
+            cp_max=np.float32(self.cp_max),
+            vmax_mps=np.float32(self.vmax_mps),
             cd=np.float32(self.cd),
             frontal_area_mm2=np.float32(self.frontal_area_mm2),
             reynolds_note=np.bytes_(self.reynolds_note.encode()),
             trace=trace_arr,
             diverged=np.bool_(self.diverged),
             steps_run=np.int32(self.steps_run),
+            converged=np.bool_(self.converged),
+            residual=np.float64(self.residual),
+            mass_imbalance=np.float64(self.mass_imbalance),
             **sl_pts, **sl_spd, **sl_xfm, **sl_arr,
         )
 
@@ -274,8 +291,45 @@ def _smag_tau(f: np.ndarray, feq: np.ndarray, tau0: float) -> np.ndarray:
     smag  = (_CS_SMAG ** 2) * np.sqrt(np.float32(2.0)) * pi_mag
     nu_eff = nu0 + smag
     tau_eff = (nu_eff / _CS2 + np.float32(0.5)).astype(np.float32)
-    tau_eff = np.clip(tau_eff, np.float32(0.51), np.float32(2.0))
-    return tau_eff
+    return np.clip(tau_eff, np.float32(tau0), np.float32(2.0))
+
+
+def _force_scale_si(density_kgm3: float, dx_m: float, dt_s: float) -> float:
+    """Return the three-dimensional LBM lattice-force unit in newtons."""
+    return float(density_kgm3 * dx_m**4 / (dt_s * dt_s))
+
+
+def _force_coefficient(
+    force_n: float,
+    density_kgm3: float,
+    speed_mps: float,
+    ref_area_mm2: float,
+) -> float:
+    """Nondimensionalize a force using dynamic pressure and reference area."""
+    denominator = 0.5 * density_kgm3 * speed_mps**2 * ref_area_mm2 * 1e-6
+    return float(force_n / denominator) if denominator > 0.0 else 0.0
+
+
+def _steady_force_estimate(
+    samples: List[Tuple[float, float, float]],
+) -> Tuple[Tuple[float, float, float], float]:
+    """Return the window-mean force and drift between its two half means.
+
+    Momentum exchange on a voxel boundary has a small lattice-phase
+    oscillation.  A steady force is therefore the time average over a complete
+    sampling window; convergence measures drift between consecutive half-window
+    means rather than rejecting a settled periodic signal by its raw variance.
+    """
+    values = np.asarray(samples, dtype=np.float64)
+    mean = np.mean(values, axis=0)
+    force_mean = (float(mean[0]), float(mean[1]), float(mean[2]))
+    half = len(samples) // 2
+    if half < 2:
+        return force_mean, math.inf
+    early_drag = float(np.mean(values[:half, 0]))
+    late_drag = float(np.mean(values[-half:, 0]))
+    drift = abs(late_drag - early_drag) / max(abs(force_mean[0]), 1e-30)
+    return force_mean, float(drift)
 
 
 # ---------------------------------------------------------------------------
@@ -318,24 +372,59 @@ def run_wind_tunnel(
     """
     if preset not in _PRESETS:
         raise ValueError(f"Unknown preset {preset!r}; choose from {list(_PRESETS)}")
+    scalar_inputs = {
+        "speed_mps": speed_mps, "aoa_deg": aoa_deg, "sideslip_deg": sideslip_deg,
+        "roughness_um": roughness_um, "ref_area_mm2": ref_area_mm2,
+    }
+    try:
+        scalar_inputs = {k: float(v) for k, v in scalar_inputs.items()}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("flow scalar inputs must be numeric") from exc
+    if (not all(np.isfinite(v) for v in scalar_inputs.values())
+            or scalar_inputs["speed_mps"] <= 0.0
+            or scalar_inputs["roughness_um"] < 0.0
+            or scalar_inputs["ref_area_mm2"] < 0.0):
+        raise ValueError("speed must be positive; angles, roughness and reference area must be finite")
+    speed_mps = scalar_inputs["speed_mps"]
+    aoa_deg = scalar_inputs["aoa_deg"]
+    sideslip_deg = scalar_inputs["sideslip_deg"]
+    roughness_um = scalar_inputs["roughness_um"]
+    ref_area_mm2 = scalar_inputs["ref_area_mm2"]
+    if max_steps is not None:
+        try:
+            parsed_steps = int(max_steps)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("max_steps must be a positive integer") from exc
+        if isinstance(max_steps, bool) or parsed_steps != max_steps or parsed_steps <= 0:
+            raise ValueError("max_steps must be a positive integer")
+        max_steps = parsed_steps
 
     # Resolve fluid properties (back-compat: None -> air).
     _fluid = dict(_DEFAULT_FLUID)
-    if fluid:
+    if fluid is not None:
+        if not isinstance(fluid, dict):
+            raise ValueError("fluid must be a mapping")
         _fluid.update({k: v for k, v in fluid.items() if v is not None})
-    fluid_name = str(_fluid.get("name", "air"))
-    rho_fluid = float(_fluid.get("density_kgm3", _RHO_AIR_KGM3))
-    nu_fluid = float(_fluid.get("kinematic_visc_m2s", _NU_AIR_M2S))
-    if rho_fluid <= 0.0:
-        rho_fluid = _RHO_AIR_KGM3
-    if nu_fluid <= 0.0:
-        nu_fluid = _NU_AIR_M2S
+    fluid_name = str(_fluid.get("name", _DEFAULT_FLUID["name"]))
+    try:
+        rho_fluid = float(_fluid.get("density_kgm3", _RHO_AIR_KGM3))
+        nu_fluid = float(_fluid.get("kinematic_visc_m2s", _NU_AIR_M2S))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("fluid density and viscosity must be numeric") from exc
+    if (not np.isfinite(rho_fluid) or rho_fluid <= 0.0 or
+            not np.isfinite(nu_fluid) or nu_fluid <= 0.0):
+        raise ValueError("fluid density and kinematic viscosity must be positive and finite")
 
     solver_notes: List[str] = []
 
     # Compose the true incoming flow direction (base axis + AoA + sideslip), world space.
     base_axis = np.asarray(direction, dtype=np.float64)
-    base_axis /= (np.linalg.norm(base_axis) + 1e-12)
+    if base_axis.shape != (3,) or not np.isfinite(base_axis).all():
+        raise ValueError("direction must be a finite 3-vector")
+    base_norm = float(np.linalg.norm(base_axis))
+    if base_norm <= 1e-12:
+        raise ValueError("direction must be non-zero")
+    base_axis /= base_norm
     flow_dir = _compose_flow_dir(base_axis, aoa_deg, sideslip_deg)
 
     def _progress(stage: str, pct: int, text: str, trace_point: Optional[dict] = None) -> None:
@@ -353,6 +442,12 @@ def run_wind_tunnel(
     mesh = trimesh.load(stl_path, force="mesh")
     if not isinstance(mesh, trimesh.Trimesh):
         raise ValueError("STL did not produce a single trimesh.Trimesh")
+    if mesh.vertices.size == 0 or mesh.faces.size == 0:
+        raise ValueError("STL contains no triangles")
+    if not np.isfinite(mesh.vertices).all():
+        raise ValueError("STL contains non-finite vertices")
+    if not mesh.is_watertight:
+        raise ValueError("STL must be watertight for solid voxelization")
 
     # Align mesh so the (AoA/sideslip-rotated) flow direction == +X.
     mesh, R = _align_to_x(mesh, flow_dir)
@@ -363,6 +458,8 @@ def run_wind_tunnel(
     bbox_max = mesh.bounds[1]    # mm
     part_size = bbox_max - bbox_min  # mm
     longest_axis = float(np.max(part_size))  # mm
+    if not np.isfinite(longest_axis) or longest_axis <= 1e-9:
+        raise ValueError("STL has a degenerate bounding box")
 
     # Voxel pitch in mm to fit preset cells along longest axis
     # (domain is larger; this sets the resolution)
@@ -421,6 +518,10 @@ def run_wind_tunnel(
     iz = np.round((solid_vox_idx[:, 2] * pitch + solid_origin[2]) / voxel_mm).astype(int)
     valid = (ix >= 0) & (ix < Nx) & (iy >= 0) & (iy < Ny) & (iz >= 0) & (iz < Nz)
     solid_mask[ix[valid], iy[valid], iz[valid]] = True
+    if not solid_mask.any():
+        raise ValueError("voxelization produced no solid cells")
+    if solid_mask.all():
+        raise ValueError("voxelization produced no fluid cells")
 
     _progress("voxelize", 15, f"Solid cells: {int(solid_mask.sum())}")
 
@@ -434,24 +535,21 @@ def run_wind_tunnel(
     # dx in metres
     dx_m = voxel_mm * 1e-3
 
-    # Target lattice inlet speed ≤ 0.1 (Mach guard)
-    u_lat = min(0.1, speed_mps / (np.sqrt(3.0) * speed_mps + 1e-12) * 0.1)
-    # Simpler: scale so u_lat = 0.05 (conservative)
+    # Conservative low-Mach lattice inlet speed.
     u_lat = np.float32(0.05)
 
-    # Physical time step
-    dt_s = u_lat * dx_m / speed_mps  # u_lat = speed_mps * dt/dx  → dt = u_lat*dx/speed
-
-    # Lattice kinematic viscosity from the PHYSICAL Reynolds number (fluid-dependent).
+    # Physical time step and molecular lattice viscosity. Convert exactly once:
+    # nu_lat = nu_phys*dt/dx² and tau = 0.5 + nu_lat/cs².
+    dt_s = float(u_lat) * dx_m / speed_mps
     L_char_m = longest_axis * 1e-3
-    reynolds = speed_mps * L_char_m / nu_fluid if nu_fluid > 0 else 0.0
-    Re_target = reynolds
-    nu_lat = u_lat * L_char_m / dx_m / Re_target if Re_target > 0 else _CS2 * 0.5
-    # Clamp for stability
-    nu_lat = max(nu_lat, _CS2 * 0.01)
+    reynolds = speed_mps * L_char_m / nu_fluid
+    nu_lat = nu_fluid * dt_s / (dx_m * dx_m)
     tau0 = float(nu_lat / _CS2 + 0.5)
-    tau0 = max(tau0, 0.51)
-    tau0 = min(tau0, 1.99)  # very high tau → over-damped but stable
+    if not np.isfinite(tau0) or tau0 <= 0.500001 or tau0 > 2.0:
+        raise ValueError(
+            f"flow setup is outside the BGK stability range (tau={tau0:.8g}); "
+            "refine the grid, reduce speed, or increase viscosity"
+        )
 
     # Conversion factor lattice force → Newtons (uses the FLUID density).
     # The momentum-exchange sum is a force in LATTICE units (momentum per lattice timestep,
@@ -460,7 +558,7 @@ def run_wind_tunnel(
     # The previous rho*dx^3/dt was short by one factor of dx/dt = c (= speed/u_lat), which made the
     # physical V^2 drag come out ∝ V^1 (and Cd ∝ 1/V). With dt = u_lat*dx/speed this now reproduces
     # drag = Cd * 0.5 * rho * V^2 * A. (lbm.cpp force_factor matches this exactly.)
-    force_factor = float(rho_fluid * dx_m**4 / (dt_s * dt_s))
+    force_factor = _force_scale_si(rho_fluid, dx_m, dt_s)
 
     # ── Roughness skin-friction multiplier (qualitative) ──
     # Ks (sand-grain) in metres; L_char in metres (consistent units for L/Ks).
@@ -504,26 +602,30 @@ def run_wind_tunnel(
     # Zero out solid interior (they never contribute to dynamics)
     f[solid_mask] = 0.0
 
-    step_cap = max_steps if max_steps is not None else _PRESETS[preset]["steps"]
-    convergence_window = max(20, step_cap // 5)
+    step_cap = max_steps if max_steps is not None else int(_PRESETS[preset]["steps"])
+    convergence_window = max(50, step_cap // 5)
+    force_window_samples = max(5, int(math.ceil(convergence_window / 10.0)))
 
     trace: List[Tuple[int, float]] = []
     diverged = False
-    watchdog_count = 0
     tau_current = tau0
+    converged = False
+    residual = math.inf
 
     _progress("solve", 25, f"Starting LBM ({step_cap} steps cap)...")
 
     # Pre-build boundary-link list for momentum-exchange drag calculation
-    # boundary links: fluid cell adjacent to solid cell
-    # (ix_fluid, iy_fluid, iz_fluid, q) where e_q points from fluid → solid
+    # Each entry identifies a solid destination and the population direction
+    # that streams into it from an adjacent fluid cell.
     bound_links = _build_boundary_links(solid_mask, Nx, Ny, Nz)
 
     # ------------------------------------------------------------------
     # 4. Time-stepping loop
     # ------------------------------------------------------------------
     t_start = time.monotonic()
-    last_drags: List[float] = []
+    force_history_lat: List[Tuple[float, float, float]] = []
+    last_force_lat: Optional[Tuple[float, float, float]] = None
+    force_drift = math.inf
     step = 0
 
     for step in range(1, step_cap + 1):
@@ -531,15 +633,11 @@ def run_wind_tunnel(
         rho, ux, uy, uz = _macros(f)
         feq = _feq_fast(rho, ux, uy, uz)
 
-        if tau_current > 0.55:
-            # Full Smagorinsky
-            tau_arr = _smag_tau(f, feq, tau_current)
-            omega = np.float32(1.0) / tau_arr
-            f = f - omega[..., np.newaxis] * (f - feq)
-        else:
-            # Simple BGK (already viscous enough)
-            omega_s = np.float32(1.0 / tau_current)
-            f = f - omega_s * (f - feq)
+        # Smagorinsky LES is required most at high Reynolds number (tau close to 0.5).
+        # _smag_tau preserves the physical molecular tau0 instead of silently raising it.
+        tau_arr = _smag_tau(f, feq, tau_current)
+        omega = np.float32(1.0) / tau_arr
+        f = f - omega[..., np.newaxis] * (f - feq)
 
         f = f.astype(np.float32)
 
@@ -547,7 +645,7 @@ def run_wind_tunnel(
         f = _stream(f)
 
         # --- Boundary conditions ---
-        # Inlet (x=0): Zou-He velocity BC
+        # Inlet (x=0): prescribed equilibrium velocity
         _inlet_bc(f, u_lat)
 
         # Outlet (x=Nx-1): zero-gradient
@@ -555,6 +653,17 @@ def run_wind_tunnel(
 
         # Lateral slip (mirror)
         _lateral_slip(f, Ny, Nz)
+
+        # Momentum exchange must sample the population that has just streamed
+        # from the fluid cell into its solid neighbour.  Once bounce-back has
+        # run, f[fluid, q] is an unrelated population streamed from the next
+        # upstream fluid cell and carries an O(u) free-stream bias.
+        sampled_force = step % 10 == 0 or step == step_cap
+        if sampled_force:
+            force_history_lat.append(_momentum_exchange(f, bound_links))
+            if len(force_history_lat) > force_window_samples:
+                force_history_lat.pop(0)
+            last_force_lat, force_drift = _steady_force_estimate(force_history_lat)
 
         # Solid half-way bounce-back
         _bounce_back(f, solid_mask)
@@ -565,34 +674,16 @@ def run_wind_tunnel(
         # --- NaN/divergence watchdog (every 50 steps) ---
         if step % 50 == 0:
             if not np.isfinite(f).all() or float(np.abs(f).max()) > 1e6:
-                watchdog_count += 1
-                if watchdog_count == 1:
-                    # Halve excess tau toward 1.0
-                    tau_current = tau_current * 0.5 + 0.5
-                    tau_current = max(tau_current, 0.51)
-                    # Reset distributions to equilibrium
-                    rho = np.ones((Nx, Ny, Nz), dtype=np.float32)
-                    ux  = np.full((Nx, Ny, Nz), u_lat, dtype=np.float32)
-                    uy  = np.zeros((Nx, Ny, Nz), dtype=np.float32)
-                    uz  = np.zeros((Nx, Ny, Nz), dtype=np.float32)
-                    f   = _feq_fast(rho, ux, uy, uz)
-                    f[solid_mask] = 0.0
-                    _progress("solve", int(step / step_cap * 80), f"Watchdog 1: tau->{tau_current:.3f}, resetting...")
-                else:
-                    # Second failure — abort
-                    diverged = True
-                    _progress("solve", int(step / step_cap * 80), "Watchdog 2: aborting (diverged).")
-                    break
+                diverged = True
+                _progress("solve", int(step / step_cap * 80),
+                          "Aborting: non-finite or unbounded lattice populations.")
+                break
 
-        # --- Drag calculation (momentum exchange) ---
-        if step % 10 == 0 or step == step_cap:
-            drag_lat, lift_lat, _span_lat = _momentum_exchange(f, bound_links)
-            drag_n_raw = drag_lat * force_factor
-            lift_n_raw = lift_lat * force_factor
-            trace.append((step, float(drag_n_raw)))
-            last_drags.append(float(drag_n_raw))
-            if len(last_drags) > convergence_window // 10:
-                last_drags.pop(0)
+        # --- Time-averaged drag estimate from pre-bounce momentum exchange ---
+        if sampled_force:
+            drag_lat, lift_lat, _span_lat = last_force_lat
+            drag_n_estimate = drag_lat * force_factor
+            trace.append((step, float(drag_n_estimate)))
 
         # --- Progress reporting (every ~50 steps) ---
         if step % 50 == 0:
@@ -601,14 +692,24 @@ def run_wind_tunnel(
             _progress("solve", pct, f"Step {step}/{step_cap}, drag={td[1]:.3f} N",
                        trace_point={"step": td[0], "drag": td[1]})
 
-        # --- Convergence check ---
-        if len(last_drags) >= convergence_window // 10 and step > step_cap // 5:
-            d_arr = np.array(last_drags[-max(5, len(last_drags)//5):])
-            d_mean = float(np.mean(np.abs(d_arr)))
-            d_var  = float(np.std(d_arr))
-            if d_mean > 1e-12 and d_var / d_mean < 0.02:
-                _progress("solve", 82, f"Converged at step {step}: drag={d_arr.mean():.4f} N (var {d_var/d_mean*100:.1f}%)")
-                break
+        # --- Convergence check: force settling and continuity must both pass ---
+        if (sampled_force and len(force_history_lat) >= force_window_samples
+                and step > step_cap // 5):
+            residual = force_drift
+            if residual < 0.01:
+                rho_c, ux_c, _uy_c, _uz_c = _macros(f)
+                fluid_c = ~solid_mask
+                inlet_c = float(np.sum((rho_c[0] * ux_c[0])[fluid_c[0]], dtype=np.float64))
+                outlet_c = float(np.sum((rho_c[-1] * ux_c[-1])[fluid_c[-1]], dtype=np.float64))
+                continuity = abs(inlet_c - outlet_c) / max(
+                    abs(inlet_c), abs(outlet_c), 1e-30)
+                if np.isfinite(continuity) and continuity < 0.02:
+                    converged = True
+                    _progress("solve", 82,
+                              f"Converged at step {step}: drag={drag_n_estimate:.4f} N "
+                              f"(residual {residual*100:.2f}%, "
+                              f"mass imbalance {continuity*100:.2f}%)")
+                    break
 
     # ------------------------------------------------------------------
     # 5. Post-processing
@@ -616,6 +717,24 @@ def run_wind_tunnel(
     _progress("post", 85, "Computing macroscopic fields...")
 
     rho_f, ux_f, uy_f, uz_f = _macros(f)
+    fluid = ~solid_mask
+    finite_fields = (np.isfinite(rho_f).all() and np.isfinite(ux_f).all() and
+                     np.isfinite(uy_f).all() and np.isfinite(uz_f).all() and
+                     bool(np.all(rho_f[fluid] > 0.0)))
+    inlet_flux = float(np.sum((rho_f[0] * ux_f[0])[fluid[0]], dtype=np.float64))
+    outlet_flux = float(np.sum((rho_f[-1] * ux_f[-1])[fluid[-1]], dtype=np.float64))
+    mass_imbalance = abs(inlet_flux - outlet_flux) / max(
+        abs(inlet_flux), abs(outlet_flux), 1e-30)
+    if diverged or not finite_fields or not np.isfinite(mass_imbalance):
+        raise RuntimeError(f"LBM diverged at step {step}")
+    if not converged:
+        residual = force_drift
+        raise RuntimeError(
+            f"LBM did not converge in {step_cap} steps "
+            f"(drag residual={residual:.6g}, mass imbalance={mass_imbalance:.6g})")
+    if mass_imbalance >= 0.02:
+        raise RuntimeError(
+            f"LBM continuity check failed (mass imbalance={mass_imbalance:.6g})")
     vmag = np.sqrt(ux_f**2 + uy_f**2 + uz_f**2)
 
     # Convert lattice velocity to physical (m/s)
@@ -624,7 +743,9 @@ def run_wind_tunnel(
 
     # ── Force decomposition in WORLD coords ──
     # Lattice force (aligned frame, +X = flow). Rotate back to world via R^T.
-    fx_lat, fy_lat, fz_lat = _momentum_exchange(f, bound_links)
+    if last_force_lat is None:
+        raise RuntimeError("LBM produced no momentum-exchange force sample")
+    fx_lat, fy_lat, fz_lat = last_force_lat
     F_aligned = np.array([fx_lat, fy_lat, fz_lat], dtype=np.float64) * force_factor
     F_world = R.T @ F_aligned
 
@@ -650,14 +771,8 @@ def run_wind_tunnel(
     # ── Coefficients ──
     ref_area_used_mm2 = float(ref_area_mm2) if ref_area_mm2 and ref_area_mm2 > 0.0 else frontal_area_mm2
     ref_area_src = "user" if (ref_area_mm2 and ref_area_mm2 > 0.0) else "auto-frontal"
-    ref_area_m2 = ref_area_used_mm2 * 1e-6
-    dyn_pressure = 0.5 * rho_fluid * speed_mps**2  # q
-    if ref_area_m2 > 0.0 and dyn_pressure > 0.0:
-        cd = drag_n / (dyn_pressure * ref_area_m2)
-        cl = lift_n / (dyn_pressure * ref_area_m2)
-    else:
-        cd = 0.0
-        cl = 0.0
+    cd = _force_coefficient(drag_n, rho_fluid, speed_mps, ref_area_used_mm2)
+    cl = _force_coefficient(lift_n, rho_fluid, speed_mps, ref_area_used_mm2)
     ld = (lift_n / drag_n) if abs(drag_n) > 1e-9 else 0.0
 
     vmax_mps = float(np.max(vmag_phys)) if vmag_phys.size else 0.0
@@ -762,6 +877,9 @@ def run_wind_tunnel(
         u_lat=float(u_lat),
         slice_world_polys=slice_world_polys,
         slice_world_speeds=slice_world_speeds,
+        converged=converged,
+        residual=float(residual),
+        mass_imbalance=float(mass_imbalance),
     )
 
 
@@ -832,15 +950,12 @@ def _macros(f: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
 
 
 def _inlet_bc(f: np.ndarray, u_lat: float) -> None:
-    """Zou-He velocity BC at x=0 (inlet). Modifies f in-place."""
-    # Prescribed: ux=u_lat, uy=uz=0
-    # Density from momentum balance (Zou-He 1997)
-    # For x=0 face, incoming directions are those with ex>0: 1,7,9,11,13
-    # ρ = 1/(1 - u_lat) * [f0 + f3 + f4 + f5 + f6 + 2*(f2+f8+f10+f12+f14)]
-    # Simplified: set rho=1, reconstruct non-equilibrium remainder
+    """Inject a prescribed equilibrium velocity at x=0. Modifies f in-place."""
+    # This is deliberately an equilibrium injection, not a Zou-He
+    # non-equilibrium reconstruction. Keep the name honest so callers do not
+    # assume pressure information is recovered from outgoing populations.
     u = np.float32(u_lat)
     rho_in = np.float32(1.0)
-    # Pure equilibrium injection (simpler, stable):
     feq_in = _feq_fast(
         np.full(f.shape[1:3], rho_in, dtype=np.float32),
         np.full(f.shape[1:3], u,     dtype=np.float32),
@@ -851,15 +966,21 @@ def _inlet_bc(f: np.ndarray, u_lat: float) -> None:
 
 
 def _lateral_slip(f: np.ndarray, Ny: int, Nz: int) -> None:
-    """Slip (mirror) boundary on Y and Z faces. Modifies f in-place."""
-    # Y faces (slip = specular reflect uy component):
-    # At y=0: incoming dirs with ey<0 reflect to ey>0
-    # Simpler: copy plane 1 → 0 and plane Ny-2 → Ny-1 (zero-gradient slip)
-    f[:, 0,    :, :] = f[:, 1,    :, :]
-    f[:, -1,   :, :] = f[:, -2,   :, :]
-    # Z faces
-    f[:, :,  0, :] = f[:, :,  1, :]
-    f[:, :, -1, :] = f[:, :, -2, :]
+    """Apply specular slip reflection on Y and Z faces in-place."""
+    del Ny, Nz  # dimensions are carried by f; retained for call compatibility
+    # Only populations pointing into the domain are reconstructed. Copying a
+    # neighbouring plane would be a zero-gradient boundary and can carry normal
+    # momentum through what is meant to be an impermeable slip face.
+    for q in range(_NQ):
+        if _EQ[q, 1] > 0:
+            f[:, 0, :, q] = f[:, 0, :, _REFLECT_Y[q]]
+        if _EQ[q, 1] < 0:
+            f[:, -1, :, q] = f[:, -1, :, _REFLECT_Y[q]]
+    for q in range(_NQ):
+        if _EQ[q, 2] > 0:
+            f[:, :, 0, q] = f[:, :, 0, _REFLECT_Z[q]]
+        if _EQ[q, 2] < 0:
+            f[:, :, -1, q] = f[:, :, -1, _REFLECT_Z[q]]
 
 
 def _bounce_back(f: np.ndarray, solid_mask: np.ndarray) -> None:
@@ -886,49 +1007,43 @@ def _bounce_back(f: np.ndarray, solid_mask: np.ndarray) -> None:
 
 def _build_boundary_links(
     solid_mask: np.ndarray, Nx: int, Ny: int, Nz: int
-) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]]:
-    """Build list of boundary links for momentum exchange drag calculation.
+) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
+    """Build the solid destinations of fluid-to-solid lattice links.
 
-    Each entry: (ix_fluid, iy_fluid, iz_fluid, q, q_opp)
-    where q points from fluid toward solid.
+    Each entry is ``(ix_solid, iy_solid, iz_solid, q)``.  After streaming and
+    before bounce-back, ``f[ix_solid, iy_solid, iz_solid, q]`` is precisely the
+    population that crossed the boundary in direction ``q``.
     """
     links = []
     for q in range(1, _NQ):
         ex, ey, ez = int(_EQ[q, 0]), int(_EQ[q, 1]), int(_EQ[q, 2])
-        # Solid cell = fluid + e
         solid_shifted = np.roll(solid_mask, shift=(-ex, -ey, -ez), axis=(0, 1, 2))
-        fluid_boundary = solid_shifted & ~solid_mask
-        idxs = np.where(fluid_boundary)
+        idxs = np.where(solid_shifted & ~solid_mask)
         if len(idxs[0]) > 0:
-            links.append((idxs[0], idxs[1], idxs[2], q, int(_OPP[q])))
+            ix_s = (idxs[0] + ex) % Nx
+            iy_s = (idxs[1] + ey) % Ny
+            iz_s = (idxs[2] + ez) % Nz
+            links.append((ix_s, iy_s, iz_s, q))
     return links
 
 
 def _momentum_exchange(
     f: np.ndarray,
-    bound_links: List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]],
+    bound_links: List[Tuple[np.ndarray, np.ndarray, np.ndarray, int]],
 ) -> Tuple[float, float, float]:
-    """Compute the full lattice force vector via momentum exchange.
+    """Compute lattice force from populations streamed into the solid.
 
-    Returns (fx_lat, fy_lat, fz_lat) in dimensionless lattice units.  Lattice +X is the
-    aligned flow direction; the caller rotates this back to world via R^T.
+    This function must be called after streaming and before bounce-back/solid
+    clearing.  For a stationary half-way bounce-back wall, the population
+    arriving at the solid is reflected with opposite momentum, transferring
+    ``2 * f_i * e_i`` to the solid on each boundary link.
     """
     drag_lat = np.float64(0.0)
     lift_lat = np.float64(0.0)
     span_lat = np.float64(0.0)
-    for ix_f, iy_f, iz_f, q, q_opp in bound_links:
-        # Half-way bounce-back momentum exchange (Ladd 1994 / Aidun 2010):
-        # f[fluid, q] streams toward solid; the solid returns f[fluid, q_opp]
-        # Net momentum transferred to solid per timestep per link:
-        #   delta_p = 2 * f_q * e_q   (each bounce reverses f_q*e_q momentum twice)
-        # In practice we use f_q (pre-bounce value at fluid cell, direction toward solid)
-        # summed with the opp-direction that came back from the wall.
-        # Force on solid = sum of (f_toward_solid + f_from_solid) * e_toward  [per link]
-        # Since e_from = -e_toward:  contrib = f_q * e_x - f_opp * (-e_x) = (f_q + f_opp)*e_x
-        # BUT our f[fluid, opp] after bounce-back = what was in the solid = pre-stream f[fluid,q]
-        # So f_q + f_opp ≈ 2*f_q.  Use only f_q (simpler, avoids double-counting with opp links).
-        f_q = f[ix_f, iy_f, iz_f, q]
-        contrib = float(np.sum(f_q)) * 2.0   # factor 2 for momentum reversal
+    for ix_s, iy_s, iz_s, q in bound_links:
+        f_into_solid = f[ix_s, iy_s, iz_s, q]
+        contrib = float(np.sum(f_into_solid)) * 2.0
         drag_lat += contrib * float(_EQ[q, 0])
         lift_lat += contrib * float(_EQ[q, 1])
         span_lat += contrib * float(_EQ[q, 2])

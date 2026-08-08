@@ -479,7 +479,7 @@ def _make_symbols() -> dict:
         pins=opamp_pins,
         graphics=opamp_graphics_u12,
         units_count=3,
-        sim={"model": "OPAMP", "pin_order": ["IN+", "IN-", "V+", "V-", "OUT"]},
+        sim={"model": "OPAMP", "pin_order": ["IN+", "IN-", "OUT"]},
         footprint_filters=["SOIC-8*", "DIP-8*"],
     )
 

@@ -29,13 +29,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "sim_run": {
         "prompt_note": (
-            "Starts a CANCELLABLE background solve and returns a job_id "
-            "immediately — use it instead of blocking when a solve may run "
-            "minutes. analysis is 'fea_static' or 'fea_modal' ONLY; "
-            "anything else is refused by name. Needs the same "
-            "fixtures/loads as run_fea_static. Then: sim_status(job_id) "
-            "until done, sim_results(job_id). Jobs persist, so a later turn "
-            "can collect one."
+            "Cancellable process job for analysis='fea_static' or 'fea_modal' ONLY. "
+            "Static needs fixtures plus a non-zero loads list; modal takes the fixtures "
+            "argument but fixtures=[] intentionally requests free-free modes and takes no loads. Poll "
+            "sim_status, then sim_results; an unavailable/failed backend never becomes PASS."
         ),
     },
     "sim_status": {
@@ -188,89 +185,97 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "run_cfd_accurate": {
         "prompt_note": (
-            "The trustworthy absolute Cd/Cl path — needs OpenFOAM and takes "
-            "minutes. Always returns a job_id immediately; poll get_job. "
-            "Start preset='coarse'."
+            "OpenFOAM external-aero RANS; the tool capability-checks first and returns "
+            "ok:false, skipped:true when unavailable. Always returns job_id when started; "
+            "poll get_job. Inputs are velocity m/s, aoa degrees, fluid air|water. Start "
+            "preset='coarse', then refine; only quote Cd/Cl when converged is true."
         ),
     },
     "run_cfd_flow": {
         "prompt_note": (
-            "Directional LBM for A-vs-B trends, not certified Cd (use "
-            "run_cfd_accurate). No material= argument — the medium is "
-            "fluid='air'|'water'. Check min_feature_voxels >= ~8; "
-            "background=True for cells>=120."
+            "Built-in directional LBM: velocity is m/s, aoa degrees, fluid is air|water; "
+            "freestream +X and lift +Z. Check V² force scaling/dynamic pressure, but absolute "
+            "Cd is uncalibrated. Require converged=true and min_feature_voxels>=~8, then "
+            "refine cells; use run_cfd_accurate for absolute coefficients. background=True for cells>=120."
         ),
         "timeout_s": 300,
     },
     "run_fea_buckling": {
         "prompt_note": (
-            "ccx box-proxy column, not the real geometry; lambda scales "
-            "the applied load (lambda<1 means buckles). Needs CalculiX — "
-            "absent ccx returns ok:false, skipped."
+            "CalculiX fixed-free BOX PROXY, not real CAD stress/buckling. Pass exactly "
+            "one fixture face and one inward axial force in N on one load face; pressure, "
+            "shear, and tension are rejected. lambda*applied_load is Pcr; lambda<1 fails. "
+            "The tool returns ok:false, skipped:true when ccx is unavailable; compare "
+            "euler_reference_pcr_n."
         ),
-        # Synchronous ccx subprocess solve, same solver class as run_fea_modal
-        # (already 300s) — a fine-mesh eigenvalue run can grind for minutes.
         "timeout_s": 300,
     },
     "run_fea_contact": {
         "prompt_note": (
-            "ccx two-block proxy proving load transfer across an "
-            "interface, not your actual contact pair; needs CalculiX. Use "
-            "run_fea_static for real stresses."
+            "CalculiX TWO-BLOCK PROXY proving contact load transfer, not the document's "
+            "actual contact pair. pressure_mpa must be finite and >0 MPa. Require "
+            "base_reaction_n≈applied_load_n; ok:false or skipped:true means no verified "
+            "contact result. Use run_fea_static for real-part stresses."
         ),
-        # Synchronous NONLINEAR (NLGEOM) ccx subprocess solve — the slowest of
-        # the fea_advanced proxies; give it the same budget as the other ccx runs.
         "timeout_s": 300,
     },
     "run_fea_fatigue": {
         "prompt_note": (
-            "Reuses the static stress field — pass the same fixtures/loads "
-            "as run_fea_static. regime='infinite' means >1e6 cycles; "
-            "compare the theories block."
+            "Runs real static FEA then S-N postprocessing. Needs the same mounted faces and "
+            "non-zero N/MPa loads as run_fea_static plus material ultimate_mpa and "
+            "endurance_mpa. State load_type/load_ratio, surface, reliability and theory; "
+            "regime='infinite' means >1e6-cycle runout, not immortal. Refine the static mesh."
         ),
         "timeout_s": 300,
     },
     "run_fea_frequency_response": {
         "prompt_note": (
-            "Modal-superposition vibration on the held part; without "
-            "psd_breakpoints the random field degrades. Set vibration_spec "
-            "for a pass/fail verdict."
+            "Base-excited modal superposition. fixtures must represent the mount; "
+            "excitation_dir is a unit direction, base_accel_g is g, damping zeta is assumed, "
+            "and material density drives Hz. Response peaks should align with returned modal "
+            "Hz. PSD breakpoints are g²/Hz; no PSD means random.ok=false and no "
+            "vibration_spec means verdict=null. Output is acceleration only, not stress/deflection."
         ),
         "timeout_s": 300,
     },
     "run_fea_modal": {
         "prompt_note": (
-            "Fix the part like it is mounted — an unconstrained part "
-            "returns rigid-body modes near 0 Hz. Density drives the "
-            "frequencies, and it comes from material= (registry name or "
-            "dict), not from set_material."
+            "Material density drives Hz. fixtures=[] is a legitimate free-free solve: expect "
+            "six near-zero rigid-body modes before elastic modes; otherwise fix it exactly as "
+            "mounted. Compare the first elastic mode to a justified beam/order anchor and across "
+            "mesh_fineness presets; properties come from material=, never set_material."
         ),
         "timeout_s": 300,
     },
     "run_fea_static": {
         "prompt_note": (
-            "Workhorse stress check; query_geometry first to confirm "
-            "fixture/load faces resolve. Material properties enter HERE and "
-            "only here: material='aluminum' (registry name) or "
-            "material={'E_mpa':70000,'nu':0.33,'density_g_cm3':2.7,"
-            "'yield_mpa':250}; set_material sets appearance only. min_fos>1 "
-            "holds; background=True for fine meshes."
+            "Real-part linear static FEA. Confirm face queries first. fixtures must react a "
+            "non-zero load: force vectors/magnitude are N, pressure is MPa; zero loads are "
+            "refused and there is no gravity/self-weight term. An explicit material dict needs "
+            "E_mpa, nu, and yield_mpa; named registry materials resolve them. set_material is "
+            "appearance only. Repeat at a finer mesh and compare governing stress/deflection "
+            "(<10% change) before PASS."
         ),
         "timeout_s": 300,
     },
     "run_fea_thermal": {
         "prompt_note": (
-            "Steady state is a ccx box-proxy estimate; pass "
-            "transient={t_end_s,...} for the real-mesh C++ solve with "
-            "flux/convection schedules."
+            "Steady default is a CalculiX 1-D BOX PROXY: exactly one hot_faces and one "
+            "cold_faces entry need {face,temperature °C}; temperatures must differ and loads "
+            "are rejected. Compare mid_plane_T to the linear Fourier anchor; ccx absent "
+            "returns SKIP. Steady needs conductivity_w_mk/k_w_mk in W/(m·K). "
+            "transient={t_end_s,dt_s,...} uses the real tet mesh with flux_w_m2 or "
+            "h_w_m2k/t_amb_c; flux-only heat-up is valid and needs conductivity, "
+            "density_g_cm3, and cp_j_kgk/specific_heat_j_kgk in J/(kg·K)."
         ),
         "timeout_s": 300,
     },
     "simulate_motion": {
         "prompt_note": (
-            "Drive an angle/distance mate (revolute/concentric have no "
-            "value to sweep). Per-step interference dominates runtime — "
-            "False for a fast pass."
+            "Kinematic sweep of one dimensional mate. stop is required; angle ranges are "
+            "degrees, distance ranges mm, steps>=2. fixtures/loads do not apply. "
+            "check_interference samples each step, so refine steps near first contact. "
+            "dynamics={} adds inverse-dynamics reactions but not contact dynamics."
         ),
         "timeout_s": 300,
     },

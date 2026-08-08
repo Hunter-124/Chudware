@@ -115,6 +115,10 @@ struct MeshOptions {
     // bbox dimension of a thin-wall part (drives the element-size formula).
     double thin_wall_layers = 4.0;
 };
+// Validate every numerical sizing/control input before STEP parsing or meshing.
+// Returns false with a stable diagnostic instead of allowing NaN/Inf to reach
+// bounding-box arithmetic, integer grid sizing, or Netgen.
+bool validate_mesh_options(const MeshOptions& options, std::string& error);
 
 // Aspect-ratio threshold above which an element is counted "poor" (SolidWorks-style).
 inline constexpr double kPoorAspect = 10.0;

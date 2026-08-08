@@ -1,24 +1,9 @@
-"""Assembly / multi-body FEA regression suite (asm-fea F1+F2, 2026-07-12).
+"""Assembly / multi-body FEA regression suite.
 
-Root cause pair fixed here, witnessed end-to-end on a tiny 2-body doc:
-
-  F1  doc_query / doc_face_points resolved ONLY against bodies[-1] (bridge.py's
-      single-body-era policy), so on a multi-body doc a fixture/load face query could
-      never address any other component — constraints on an assembly's wheels literally
-      could not resolve (they landed on whatever body compiled last). Both now resolve
-      across the WHOLE document; the selector resolver gained an exact-snapshot fast
-      path so a legitimately-picked face among near-identical siblings (4 wheels) does
-      not dangle as "symmetric ambiguity".
-
-  F2  mesh_step handed Netgen the raw multi-solid compound; touching/overlapping bodies
-      produce intersecting boundary meshes and the volume mesher aborts with "boundary
-      mesh is overlapping" (surfaced as the misleading "check that the geometry is a
-      valid closed solid"). Multi-solid STEPs are now FUSED + UnifySameDomain'd into one
-      bonded solid before meshing (bonded-contact semantics; outer faces keep their
-      world position so facesets still resolve).
-
-Kept smoke-priced: two small overlapping boxes, coarse mesh. Skips honestly when the
-staged libchudware lacks the FEA RPCs (same probe idiom as test_fea_live_bridge).
+The engine resolves document selectors across every body, meshes imported assemblies
+per solid, and requires contact to be declared explicitly. Meshing disconnected solids
+must remain reliable without silently fusing them; a static solve spanning bodies must
+set ``bond_gap_mm`` only when bonded contact is physically intended.
 """
 from __future__ import annotations
 
@@ -116,21 +101,19 @@ def test_exact_selector_not_ambiguous_among_siblings(two_body):
         assert fp.get("points"), (m.get("centroid"), fp)
 
 
-def test_mesh_multi_solid_step_bonds_and_meshes(two_body, tmp_path):
-    """The exported 2-solid STEP (5mm overlap) meshes via the bonded fuse — raw Netgen
-    on the compound aborts with overlapping boundary meshes."""
+def test_mesh_multi_solid_step_preserves_separate_parts(two_body, tmp_path):
+    """The exported 2-solid STEP meshes each part without inventing contact semantics."""
     step = str(tmp_path / "two_body.step")
     cb.call("doc_export_step", {"doc_id": two_body, "path": step})
     m = cb.call("sim_mesh", {"step_path": step, "fineness": 0.4, "order": 1})
     assert m.get("ok"), m.get("error")
     assert m.get("n_elems", 0) > 0 and m.get("n_nodes", 0) > 0, \
         {k: m.get(k) for k in ("n_elems", "n_nodes", "note")}
-    assert "bonded" in (m.get("note") or ""), m.get("note")
+    assert "separate solid bodies" in (m.get("note") or ""), m.get("note")
 
 
-def test_static_solve_across_bonded_interface(two_body, tmp_path):
-    """Fix body A's far face, load body B's far face: load must transfer across the
-    bonded interface and produce a finite, nonzero solution."""
+def test_static_solve_across_explicit_bonded_interface(two_body, tmp_path):
+    """An explicit bond transfers load between the overlapping imported bodies."""
     if not _has_fea():
         pytest.skip("engine lacks FEA static RPCs")
     step = str(tmp_path / "two_body_solve.step")
@@ -154,6 +137,7 @@ def test_static_solve_across_bonded_interface(two_body, tmp_path):
         "loads": [{"type": "force", "vector": [0.0, 0.0, -200.0], "faces": load}],
         "mesh_order": 1,
         "fineness": 0.4,
+        "bond_gap_mm": 5.1,
     }
     res = cb.call("sim_run_static", {"study": study})
     assert res.get("ok"), res.get("error")

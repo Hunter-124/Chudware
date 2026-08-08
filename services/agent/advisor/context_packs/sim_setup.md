@@ -1,17 +1,41 @@
 # Simulation setup context pack
-# Tools: run_fea_static/modal/fatigue/thermal/buckling/contact, run_cfd_flow/accurate,
-#        simulate_motion, describe_results, set_material, research_eng_calc, research_material_lookup
+# Tools: run_fea_*, run_cfd_flow/accurate, sim_run/status/results, simulate_motion,
+#        em_status/eigenmode/driven/timedomain, query_geometry, describe_results
 
-## Discipline
-1. Anchor FIRST — closed-form order-of-magnitude (research_eng_calc beam/plate) before any solve. Ledger the estimate.
-2. One load case per study. Mixed cases hide which load broke it.
-3. Fixtures and loads on NAMED faces that exist (describe_part). Fix every pre-sim advisory lint before running.
-4. Mesh from feature size; halve once near stress concentrations if first result is singular.
-5. After run: describe_results; compare to anchor (~2–3× credible; >5× = setup bug first).
-6. Verdict per criterion with margin vs pass rule; FAIL names face/feature in plain words.
+## Before launch
+1. State one criterion/case/pass rule and all units. FEA properties enter through
+   `material=`; `set_material` is appearance only. Explicit FEA dicts always need
+   E/nu; add yield for static/fatigue, density for modal/frequency/transient thermal,
+   ultimate/endurance for fatigue, conductivity_w_mk/k_w_mk for steady thermal, and
+   conductivity plus cp_j_kgk (or top-level specific_heat_j_kgk) for transient.
+   Registry material names resolve their stored properties. Confirm every face query.
+2. Anchor before solving, or record `no anchor`. Force is N, pressure MPa, geometry
+   mm. Never turn pressure into force without measured area.
+3. Static/fatigue need a mount and non-zero force N or pressure MPa. Buckling needs
+   one mount plus one inward axial force N; its proxy rejects pressure/shear/tension.
+   Modal takes no load; `fixtures=[]` is intentional free-free with six rigid modes.
+4. Steady thermal is a CalculiX 1-D box proxy with exactly one hot face and one
+   cold face at distinct °C values; it rejects loads. Transient is real-mesh and
+   accepts W/m² flux or W/(m²·K) convection. Flux-only transient heat-up is valid.
+5. CFD uses m/s and air|water; LBM is trends only. Motion uses degrees/mm and
+   `stop`+`steps>=2`. EM uses GHz/mm (antenna APIs use Hz) and needs `em_status`
+   before openEMS.
 
-## Common traps
-- All-fixed body / missing loads → meaningless stress field.
-- Hand-typed material props — use set_material / research_material_lookup.
-- Modal without excitation comparison is trivia.
-- CFD: check inlet/outlet BCs and units before trusting drag/pressure.
+## Useful independent anchors
+- Static: beam stress/deflection only for a justified support/load path. Modal:
+  beam first-mode order and separation from the named excitation.
+- Thermal: 1-D Fourier flux/mid-plane temperature. Vibration: resonance at modal
+  Hz and SDOF/Miles order only with stated damping/PSD.
+- CFD: dynamic pressure and V² force scaling, not an invented absolute Cd. Motion:
+  endpoint/loop closure, clearance, and force/reaction balance.
+- EM: rectangular-guide TE10 cutoff or antenna closed-form resonance; analytic-
+  uniform S21 cannot validate a discontinuity.
+
+## Evidence
+- Run a cheap discretization and a finer one; report mesh/cells/resolution and
+  require the governing result to settle (normally <10%) or match an independent
+  analytic anchor. A single favorable mesh is not confidence.
+- Treat `ok:false`, SKIP, failed/cancelled, `converged:false`, missing PSD/verdict,
+  or unavailable backend as no result.
+- Static margin is `yield/SF - stress`. Missing required margin is not nominal
+  yielding; yielding begins at yield and fracture language requires ultimate.

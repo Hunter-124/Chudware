@@ -70,13 +70,16 @@ double isa_pressure_pa(double altitude_m);
 double isa_temperature_c(double altitude_m);
 
 // Per-sample sensor series (each row is a dict with t_s/t_ms/device/response
-// plus model-specific fields — mirrors the Python shapes).
+// plus model-specific fields). Barometer/pitot convert NED down to absolute
+// altitude using origin_alt_m; pitot density follows ISA pressure and sample temperature.
 nlohmann::json mpu6050_series(const std::vector<TrajectorySample>& samples);
-nlohmann::json bmp280_series(const std::vector<TrajectorySample>& samples);
+nlohmann::json bmp280_series(const std::vector<TrajectorySample>& samples,
+                             double origin_alt_m = 0.0);
 nlohmann::json lis3mdl_series(const std::vector<TrajectorySample>& samples);
 nlohmann::json gnss_series(const std::vector<TrajectorySample>& samples,
                            double origin_lat_deg, double origin_lon_deg, double origin_alt_m);
 nlohmann::json pitot_series(const std::vector<TrajectorySample>& samples,
-                            const std::optional<std::vector<double>>& airspeed_m_s);
+                            const std::optional<std::vector<double>>& airspeed_m_s,
+                            double origin_alt_m = 0.0);
 
 }  // namespace chudware::firmware

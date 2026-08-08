@@ -34,6 +34,7 @@ pipeline be split into *setup* (parent, needs the live doc) -> *solve* (child, p
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import signal
@@ -207,6 +208,127 @@ STAGES: dict[str, Callable[[dict, Callable[[dict], None]], dict]] = {
 }
 
 
+def _json_text(value: Any, label: str) -> str:
+    try:
+        return json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be finite JSON data: {exc}") from None
+
+
+def _validate_core_rpc_payload(payload: dict) -> None:
+    method = payload.get("method")
+    if method not in ("sim_run_static", "sim_run_modal"):
+        raise ValueError("core_rpc method must be sim_run_static or sim_run_modal")
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        raise ValueError("core_rpc payload needs a params object")
+    study = params.get("study")
+    if not isinstance(study, dict):
+        raise ValueError(f"{method} params need a study object")
+    step_path = study.get("step_path")
+    if not isinstance(step_path, str) or not step_path.strip():
+        raise ValueError(f"{method} study needs a STEP geometry path")
+    geometry = Path(step_path)
+    try:
+        geometry_ready = geometry.is_file() and geometry.stat().st_size > 0
+    except OSError:
+        geometry_ready = False
+    if not geometry_ready:
+        raise ValueError(f"{method} STEP geometry is unavailable: {step_path}")
+    material = study.get("material")
+    if not isinstance(material, dict) or not material:
+        raise ValueError(f"{method} study needs a material object")
+    required_material = ("E_mpa", "nu", "yield_mpa") if method == "sim_run_static" \
+        else ("E_mpa", "nu", "density_g_cm3")
+    for key in required_material:
+        try:
+            value = float(material[key])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise ValueError(f"{method} material needs finite {key}") from None
+        if not math.isfinite(value):
+            raise ValueError(f"{method} material needs finite {key}")
+        if key != "nu" and value <= 0.0:
+            raise ValueError(f"{method} material {key} must be > 0")
+        if key == "nu" and not -1.0 < value < 0.5:
+            raise ValueError(f"{method} material nu must be between -1 and 0.5")
+    fixtures = study.get("fixtures")
+    if not isinstance(fixtures, list):
+        raise ValueError(f"{method} study fixtures must be a list")
+    if method == "sim_run_static":
+        if not fixtures:
+            raise ValueError("sim_run_static needs at least one fixture")
+        loads = study.get("loads")
+        if not isinstance(loads, list) or not loads:
+            raise ValueError("sim_run_static needs at least one non-zero load")
+        driven = False
+        for load in loads:
+            if not isinstance(load, dict) or not load.get("faces"):
+                raise ValueError("every static load needs resolved faces")
+            if load.get("type") == "pressure":
+                magnitude = float(load.get("magnitude", 0.0))
+                driven = driven or math.isfinite(magnitude) and magnitude != 0.0
+            elif load.get("type") == "force":
+                vector = load.get("vector")
+                if not isinstance(vector, list) or len(vector) != 3:
+                    raise ValueError("static force load needs a three-component vector")
+                values = [float(value) for value in vector]
+                driven = driven or all(math.isfinite(value) for value in values) \
+                    and any(value != 0.0 for value in values)
+            else:
+                raise ValueError("static load type must be pressure or force")
+        if not driven:
+            raise ValueError("sim_run_static needs at least one non-zero load")
+    else:
+        n_modes = params.get("n_modes")
+        if isinstance(n_modes, bool):
+            raise ValueError("sim_run_modal n_modes must be a positive integer")
+        try:
+            parsed_modes = int(n_modes)
+            exact_modes = float(n_modes)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("sim_run_modal n_modes must be a positive integer") from None
+        if parsed_modes <= 0 or not math.isfinite(exact_modes) or exact_modes != parsed_modes:
+            raise ValueError("sim_run_modal n_modes must be a positive integer")
+
+    from services.mcp import core_bridge as cb  # noqa: PLC0415
+    if not cb.available():
+        raise ValueError("core simulation backend is unavailable in the job worker process")
+    try:
+        probe = cb.call(method, {})
+    except Exception as exc:
+        raise ValueError(f"core simulation backend cannot dispatch {method}: {exc}") from None
+    probe_error = str(probe.get("error") or probe.get("message") or "").lower()
+    if (probe.get("ok") is False
+            and any(token in probe_error for token in
+                    ("unknown method", "solver unavailable", "not compiled"))):
+        raise ValueError(f"core simulation backend cannot dispatch {method}: {probe_error}")
+
+
+def _validate_start(kind: str, stage: str, payload: dict, meta: Optional[dict]) -> tuple[str, str]:
+    if not isinstance(kind, str) or not kind.strip():
+        raise ValueError("job kind must be a non-empty string")
+    if stage not in STAGES:
+        raise ValueError(f"unknown stage {stage!r}; known: {sorted(STAGES)}")
+    if not isinstance(payload, dict):
+        raise ValueError("job payload must be an object")
+    if meta is not None and not isinstance(meta, dict):
+        raise ValueError("job metadata must be an object")
+    if stage == "core_rpc":
+        _validate_core_rpc_payload(payload)
+    elif stage == "selftest_sleep":
+        seconds = float(payload.get("seconds", 5.0))
+        steps = payload.get("steps", 10)
+        if not math.isfinite(seconds) or seconds <= 0.0:
+            raise ValueError("selftest_sleep seconds must be finite and > 0")
+        if isinstance(steps, bool):
+            raise ValueError("selftest_sleep steps must be a positive integer")
+        parsed_steps = int(steps)
+        if parsed_steps <= 0 or float(steps) != parsed_steps:
+            raise ValueError("selftest_sleep steps must be a positive integer")
+    return (_json_text({"stage": stage, "kind": kind, "payload": payload}, "job payload"),
+            _json_text(meta or {}, "job metadata"))
+
+
 # ---------------------------------------------------------------- start
 
 def _prune(conn: sqlite3.Connection) -> None:
@@ -221,43 +343,44 @@ def _prune(conn: sqlite3.Connection) -> None:
 
 
 def start(kind: str, stage: str, payload: dict, meta: Optional[dict] = None) -> dict:
-    """Spawn a child process for `stage` and return ``{job_id, state, pid, ...}``.
-
-    Returns as soon as the child is forked — it does NOT wait for the stage to begin.
-    """
-    if stage not in STAGES:
-        raise ValueError(f"unknown stage {stage!r}; known: {sorted(STAGES)}")
+    """Validate setup, spawn one stage process, and return its durable job id."""
+    payload_json, meta_json = _validate_start(kind, stage, payload, meta)
     job_id = "sim-" + uuid.uuid4().hex[:12]
     d = job_dir(job_id)
     d.mkdir(parents=True, exist_ok=True)
-    (d / "payload.json").write_text(
-        json.dumps({"stage": stage, "kind": kind, "payload": payload}), encoding="utf-8")
-
-    now = time.time()
-    with _db() as conn:
-        _prune(conn)
-        conn.execute(
-            "INSERT INTO jobs(job_id,kind,stage,state,created_at,started_at,meta)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (job_id, kind, stage, QUEUED, now, now, json.dumps(meta or {})))
+    try:
+        (d / "payload.json").write_text(payload_json, encoding="utf-8")
+        now = time.time()
+        with _db() as conn:
+            _prune(conn)
+            conn.execute(
+                "INSERT INTO jobs(job_id,kind,stage,state,created_at,started_at,meta)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (job_id, kind, stage, QUEUED, now, now, meta_json))
+    except Exception:
+        shutil.rmtree(d, ignore_errors=True)
+        raise
 
     env = dict(os.environ)
-    # The whole reason the solve is out-of-process: it must die when we kill it. Routing
-    # it through the shared daemon would leave the daemon solving after a "cancel".
     env["CHUDWARE_ENGINE_DAEMON"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
     repo_root = Path(__file__).resolve().parents[2]
     env["PYTHONPATH"] = os.pathsep.join(
         [str(repo_root), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
-    log = open(d / "worker.log", "wb")  # noqa: SIM115 — handed to the child, closed below
     try:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "services.sim.job_worker", job_id],
-            cwd=str(repo_root), env=env, stdout=log, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True)  # own process GROUP: kill takes its children too
-    finally:
-        log.close()
+        log = open(d / "worker.log", "wb")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "services.sim.job_worker", job_id],
+                cwd=str(repo_root), env=env, stdout=log, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, start_new_session=True)
+        finally:
+            log.close()
+    except Exception:
+        with _db() as conn:
+            conn.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
+        shutil.rmtree(d, ignore_errors=True)
+        raise
     _set(job_id, state=RUNNING, pid=proc.pid, pgid=proc.pid,
          proc_key=_proc_key(proc.pid))
     _LOCAL_PROCS[job_id] = proc
@@ -274,9 +397,13 @@ _LOCAL_PROCS: dict[str, subprocess.Popen] = {}
 
 def _read_json(p: Path) -> Optional[dict]:
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        value = json.loads(
+            p.read_text(encoding="utf-8"),
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {token}")))
     except (OSError, ValueError):
         return None
+    return value if isinstance(value, dict) else None
 
 
 UNKNOWN_JOB_HELP = (
@@ -293,7 +420,7 @@ def unknown(job_id: str) -> dict:
 
 
 def _reconcile(row: sqlite3.Row) -> dict:
-    """Row + on-disk truth -> the CURRENT state. Never reports a verdict it didn't check."""
+    """Adopt terminal verdicts from both spool data and live process truth."""
     job_id = row["job_id"]
     state = row["state"]
     d = job_dir(job_id)
@@ -301,38 +428,59 @@ def _reconcile(row: sqlite3.Row) -> dict:
                  "state": state, "pid": row["pid"],
                  "started_at": row["started_at"], "done_at": row["done_at"],
                  "meta": _read_json_str(row["meta"])}
-    if state in TERMINAL:
+    if state in (FAILED, CANCELLED):
         if row["error"]:
             out["error"] = row["error"]
         return out
 
-    fin = _read_json(d / "result.json")
-    if fin is not None:
-        # The child finished; adopt its verdict and make it durable.
-        if fin.get("error") is not None:
-            state, err = FAILED, str(fin["error"])
+    finished = _read_json(d / "result.json")
+    if state == DONE:
+        if row["cancel_requested"]:
+            error = "cancelled by sim_cancel"
+            _set(job_id, state=CANCELLED, error=error)
+            out.update(state=CANCELLED, error=error)
+            return out
+        result = finished.get("result") if finished is not None else None
+        if (finished is not None and finished.get("error") is None
+                and isinstance(result, dict) and result.get("ok") is True):
+            return out
+        error = "completed job result artifact is missing, malformed, or failed"
+        _set(job_id, state=FAILED, error=error)
+        out.update(state=FAILED, error=error)
+        return out
+    if finished is not None:
+        result = finished.get("result")
+        if row["cancel_requested"]:
+            state, error = CANCELLED, "cancelled by sim_cancel"
+        elif finished.get("error") is not None:
+            state, error = FAILED, str(finished["error"])
+        elif not isinstance(result, dict):
+            state, error = FAILED, "worker result file contains no result object"
+        elif result.get("ok") is not True:
+            detail = (result.get("error") or result.get("reason") or result.get("hint")
+                      or "stage did not confirm ok=true")
+            state, error = FAILED, str(detail)
         else:
-            state, err = DONE, None
-        done_at = float(fin.get("done_at") or time.time())
-        _set(job_id, state=state, error=err, done_at=done_at)
+            state, error = DONE, None
+        done_at = float(finished.get("done_at") or time.time())
+        _set(job_id, state=state, error=error, done_at=done_at)
         out.update(state=state, done_at=done_at)
-        if err:
-            out["error"] = err
+        if error:
+            out["error"] = error
         _reap(job_id)
         return out
 
     if not pid_alive(row["pid"], row["proc_key"]):
-        # No result file and no process: the worker died. Say exactly that — do NOT
-        # report "done", and do NOT report "running" for a corpse.
         if row["cancel_requested"]:
-            state, err = CANCELLED, "cancelled by sim_cancel"
+            state, error = CANCELLED, "cancelled by sim_cancel"
         else:
             state = FAILED
             tail = _log_tail(job_id)
-            err = ("the solver process exited without writing a result"
-                   + (f"; last output: {tail}" if tail else ""))
-        _set(job_id, state=state, error=err, done_at=time.time())
-        out.update(state=state, error=err, done_at=time.time())
+            error = ("the solver process exited without writing a result"
+                     + (f"; last output: {tail}" if tail else ""))
+        done_at = time.time()
+        _set(job_id, state=state, error=error, done_at=done_at)
+        out.update(state=state, error=error, done_at=done_at)
         _reap(job_id)
         return out
 
@@ -342,8 +490,11 @@ def _reconcile(row: sqlite3.Row) -> dict:
 
 def _read_json_str(s) -> dict:
     try:
-        v = json.loads(s or "{}")
-        return v if isinstance(v, dict) else {}
+        value = json.loads(
+            s or "{}",
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant {token}")))
+        return value if isinstance(value, dict) else {}
     except ValueError:
         return {}
 
@@ -377,7 +528,7 @@ def status(job_id: str) -> dict:
     prog = _read_json(job_dir(job_id) / "partial.json")
     if prog:
         st["progress"] = {k: v for k, v in prog.items() if k != "partial"}
-    st["ok"] = st["state"] != FAILED
+    st["ok"] = st["state"] not in (FAILED, CANCELLED)
     return st
 
 
@@ -387,11 +538,15 @@ def partial(job_id: str) -> Optional[dict]:
 
 
 def raw_result(job_id: str) -> Optional[dict]:
-    """The stage's return value for a finished job, else None."""
-    fin = _read_json(job_dir(job_id) / "result.json")
-    if fin is None or fin.get("error") is not None:
+    """The stage result only when the durable state is successfully done."""
+    row = _row(job_id)
+    if row is None or _reconcile(row).get("state") != DONE:
         return None
-    return fin.get("result")
+    finished = _read_json(job_dir(job_id) / "result.json")
+    if finished is None or finished.get("error") is not None:
+        return None
+    result = finished.get("result")
+    return result if isinstance(result, dict) and result.get("ok") is True else None
 
 
 def list_jobs(limit: int = 20) -> list:
@@ -404,30 +559,27 @@ def list_jobs(limit: int = 20) -> list:
 # ---------------------------------------------------------------- cancel
 
 def cancel(job_id: str, timeout_s: float = 5.0) -> dict:
-    """Terminate a job's process GROUP and verify it is gone before saying `cancelled`.
-
-    SIGTERM first (the worker flushes its partial snapshot and exits), SIGKILL if it is
-    still there. The reply carries the evidence — `pid`, `signals`, `pid_alive_after` —
-    because "cancelled" is worthless without proof the solver actually stopped.
-    """
+    """Terminate the entire process group and prove no solver child survived."""
     row = _row(job_id)
     if row is None:
         return unknown(job_id)
-    st = _reconcile(row)
-    if st["state"] in TERMINAL:
-        return {"ok": True, "job_id": job_id, "state": st["state"], "terminated": False,
-                "note": f"job already finished as {st['state']} — nothing to cancel"}
+    current = _reconcile(row)
+    if current["state"] in TERMINAL:
+        return {"ok": True, "job_id": job_id, "state": current["state"],
+                "terminated": False,
+                "note": f"job already finished as {current['state']} — nothing to cancel"}
 
     pid, pgid = row["pid"], row["pgid"] or row["pid"]
     key = row["proc_key"]
     _set(job_id, cancel_requested=1)
     signals: list = []
 
-    def _alive() -> bool:
-        return pid_alive(pid, key)
+    def alive() -> bool:
+        return pid_alive(pid, key) or _group_alive(pgid)
 
-    for sig, grace in ((signal.SIGTERM, min(3.0, timeout_s)), (signal.SIGKILL, timeout_s)):
-        if not _alive():
+    for sig, grace in ((signal.SIGTERM, min(3.0, timeout_s)),
+                       (signal.SIGKILL, timeout_s)):
+        if not alive():
             break
         try:
             os.killpg(int(pgid), sig)
@@ -442,22 +594,24 @@ def cancel(job_id: str, timeout_s: float = 5.0) -> dict:
         deadline = time.time() + max(0.2, grace)
         while time.time() < deadline:
             _reap_nb(job_id)
-            if not _alive():
+            if not alive():
                 break
             time.sleep(0.05)
 
     _reap_nb(job_id)
-    still = _alive()
+    pid_still_alive = pid_alive(pid, key)
+    group_still_alive = _group_alive(pgid)
+    still_alive = pid_still_alive or group_still_alive
     now = time.time()
-    state = RUNNING if still else CANCELLED
-    err = None if still else "cancelled by sim_cancel"
-    _set(job_id, state=state, error=err, done_at=None if still else now)
-    out = {"ok": not still, "job_id": job_id, "state": state, "pid": pid,
-           "signals": signals, "pid_alive_after": still, "terminated": not still,
-           "group_alive_after": _group_alive(pgid)}
-    if still:
-        out["error"] = (f"pid {pid} is STILL ALIVE after {signals or ['no signal']} — the "
-                        "solver was not stopped; do not treat this job as cancelled")
+    state = RUNNING if still_alive else CANCELLED
+    error = None if still_alive else "cancelled by sim_cancel"
+    _set(job_id, state=state, error=error, done_at=None if still_alive else now)
+    out = {"ok": not still_alive, "job_id": job_id, "state": state, "pid": pid,
+           "signals": signals, "pid_alive_after": pid_still_alive,
+           "group_alive_after": group_still_alive, "terminated": not still_alive}
+    if still_alive:
+        out["error"] = (f"solver process group is STILL ALIVE after "
+                        f"{signals or ['no signal']} — do not treat this job as cancelled")
     return out
 
 

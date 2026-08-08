@@ -255,6 +255,7 @@ def test_flow_doc_cube_end_to_end():
         assert not res["diverged"]
         assert res["drag_n"] > 0.0
         assert abs(res["lift_n"]) < 0.05 * res["drag_n"]   # symmetric cube
+        assert abs(res["side_n"]) < 0.05 * res["drag_n"]
         # Voxelized frontal area vs the true 40x40 mm face: staircase quantization
         # at ~4.2 mm pitch allows ~15%.
         assert abs(res["frontal_area_mm2"] - 1600.0) / 1600.0 < 0.15
@@ -262,8 +263,10 @@ def test_flow_doc_cube_end_to_end():
         assert res["reynolds"] == pytest.approx(10.0 * 0.040 / 1.5e-5, rel=1e-6)
         assert res["ref_length_mm"] == pytest.approx(40.0, rel=1e-6)
         assert math.isfinite(res["cd"]) and res["cd"] > 0.0
-        assert res["steps_run"] == 800
-        assert isinstance(res.get("converged"), bool)
+        assert 0 < res["steps_run"] <= 800
+        assert res["converged"]
+        assert "effective lattice Re" in res["warning"]
+        assert res["mass_imbalance"] < 0.02
     finally:
         try:
             cb.call("doc_close", {"doc_id": doc})

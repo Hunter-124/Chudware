@@ -3,7 +3,7 @@
 Total target runtime: < 4 minutes.
 
 Tests:
-  1. sphere_basic   -sphere at coarse preset (capped steps), no NaN, Cd in [0.15, 1.2], drag > 0
+  1. sphere_basic   -sphere at coarse preset (capped steps), finite/converged, 0.05 < Cd < 5
   2. flat_plate     -thin plate drag > sphere drag at same preset/speed
   3. stability      -400 extra steps on sphere still finite
   4. determinism    -same inputs produce identical drag (bit-exact)
@@ -38,7 +38,21 @@ _ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from services.sim.lbm import run_wind_tunnel, FlowResult
+from services.sim.lbm import (
+    FlowResult,
+    _build_boundary_links,
+    _force_coefficient,
+    _force_scale_si,
+    _lateral_slip,
+    _momentum_exchange,
+    _steady_force_estimate,
+    run_wind_tunnel,
+)
+_TEST_FLUID = {
+    "name": "viscous-test-fluid",
+    "density_kgm3": 1.225,
+    "kinematic_visc_m2s": 1.0e-3,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -59,9 +73,10 @@ def result() -> FlowResult:
         return run_wind_tunnel(
             stl_path=stl,
             direction=(1.0, 0.0, 0.0),
-            speed_mps=10.0,
+            speed_mps=1.0,
             preset="coarse",
-            max_steps=300,
+            max_steps=600,
+            fluid=_TEST_FLUID,
         )
     finally:
         os.unlink(stl)
@@ -126,27 +141,41 @@ def _print_result(name: str, r: FlowResult, elapsed: float) -> None:
 # Test 1: Sphere basic
 # ---------------------------------------------------------------------------
 
-def test_sphere_basic() -> FlowResult:
-    print("\n[test_sphere_basic] sphere r=20mm, coarse, 300 steps cap...")
+def _sphere_basic_result() -> FlowResult:
+    print("\n[test_sphere_basic] sphere r=20mm, stable low-Re case...")
     stl = _make_sphere_stl(radius_mm=20.0)
     try:
         t0 = time.monotonic()
         result = run_wind_tunnel(
             stl_path=stl,
             direction=(1.0, 0.0, 0.0),
-            speed_mps=10.0,
+            speed_mps=1.0,
             preset="coarse",
-            max_steps=300,
+            max_steps=600,
+            fluid=_TEST_FLUID,
         )
         elapsed = time.monotonic() - t0
         _print_result("sphere", result, elapsed)
 
         assert not result.diverged, f"FAIL: diverged=True"
         assert _no_nan(result), "FAIL: NaN/Inf in result"
-        assert result.drag_n > 0.0, f"FAIL: drag_n={result.drag_n} not > 0"
-        assert 0.15 < result.cd < 1.2, (
-            f"FAIL: cd={result.cd:.3f} outside [0.15, 1.2] (qualitative band)"
+        assert result.converged, "FAIL: solver did not report convergence"
+        assert result.residual < 0.01, (
+            f"FAIL: settled-force mean drift {result.residual:.3%} exceeds 1%"
         )
+        assert result.mass_imbalance < 0.02, (
+            f"FAIL: mass imbalance {result.mass_imbalance:.3%} exceeds 2%"
+        )
+        assert result.drag_n > 0.0, f"FAIL: drag_n={result.drag_n} not > 0"
+        assert 0.05 < result.cd < 5.0, (
+            f"FAIL: cd={result.cd:.3f} outside broad low-Re qualitative band"
+        )
+        assert result.ref_area_mm2 == pytest.approx(result.frontal_area_mm2)
+        expected_drag_n = (
+            result.cd * 0.5 * _TEST_FLUID["density_kgm3"] * 1.0**2
+            * result.ref_area_mm2 * 1e-6
+        )
+        assert result.drag_n == pytest.approx(expected_drag_n)
         assert result.frontal_area_mm2 > 0.0, "FAIL: frontal_area_mm2 <= 0"
         assert len(result.trace) > 0, "FAIL: empty trace"
         assert len(result.slices) == 3, "FAIL: expected 3 velocity slices"
@@ -158,6 +187,9 @@ def test_sphere_basic() -> FlowResult:
         return result
     finally:
         os.unlink(stl)
+
+def test_sphere_basic() -> None:
+    _sphere_basic_result()
 
 
 # ---------------------------------------------------------------------------
@@ -173,16 +205,18 @@ def test_flat_plate_vs_sphere(sphere_drag: float) -> None:
     and validates the same physics intent: high-blockage body > streamlined body.
     See C07 report for full analysis.
     """
-    print(f"\n[test_flat_plate_vs_sphere] cube 40x40x40mm (bluff body), coarse, 400 steps cap...")
+    print("\n[test_flat_plate_vs_sphere] cube 40x40x40mm (bluff body), coarse, "
+          "1500 steps cap...")
     stl = _make_plate_stl(size_mm=40.0, thickness_mm=40.0)
     try:
         t0 = time.monotonic()
         result = run_wind_tunnel(
             stl_path=stl,
             direction=(1.0, 0.0, 0.0),
-            speed_mps=10.0,
+            speed_mps=1.0,
             preset="coarse",
-            max_steps=400,
+            max_steps=1500,
+            fluid=_TEST_FLUID,
         )
         elapsed = time.monotonic() - t0
         _print_result("cube", result, elapsed)
@@ -211,9 +245,10 @@ def test_stability() -> None:
         result = run_wind_tunnel(
             stl_path=stl,
             direction=(1.0, 0.0, 0.0),
-            speed_mps=10.0,
+            speed_mps=1.0,
             preset="coarse",
-            max_steps=400,
+            max_steps=600,
+            fluid=_TEST_FLUID,
         )
         elapsed = time.monotonic() - t0
         _print_result("stability", result, elapsed)
@@ -237,9 +272,11 @@ def test_determinism() -> None:
     try:
         t0 = time.monotonic()
         r1 = run_wind_tunnel(stl_path=stl, direction=(1.0, 0.0, 0.0),
-                             speed_mps=10.0, preset="coarse", max_steps=150)
+                             speed_mps=1.0, preset="coarse", max_steps=400,
+                             fluid=_TEST_FLUID)
         r2 = run_wind_tunnel(stl_path=stl, direction=(1.0, 0.0, 0.0),
-                             speed_mps=10.0, preset="coarse", max_steps=150)
+                             speed_mps=1.0, preset="coarse", max_steps=400,
+                             fluid=_TEST_FLUID)
         elapsed = time.monotonic() - t0
         print(f"  run1 drag={r1.drag_n:.6f} N, run2 drag={r2.drag_n:.6f} N, elapsed={elapsed:.1f}s")
         assert r1.drag_n == r2.drag_n, (
@@ -264,8 +301,11 @@ def test_save_npz(result: FlowResult) -> None:
         with np.load(tmp_path, allow_pickle=False) as data:
             assert "drag_n" in data, "FAIL: drag_n not in npz"
             assert "cd" in data, "FAIL: cd not in npz"
+            assert "side_n" in data, "FAIL: side_n not in npz"
+            assert "mass_imbalance" in data, "FAIL: mass_imbalance not in npz"
             assert "trace" in data, "FAIL: trace not in npz"
             assert abs(float(data["drag_n"]) - result.drag_n) < 1e-4, "FAIL: drag_n mismatch in npz"
+            assert abs(float(data["side_n"]) - result.side_n) < 1e-4, "FAIL: side_n mismatch in npz"
             keys = sorted(data.keys())
         print(f"  npz keys: {keys}")
         print("  PASS")
@@ -288,12 +328,13 @@ def test_aero_upgrade() -> None:
         result = run_wind_tunnel(
             stl_path=stl,
             direction=(1.0, 0.0, 0.0),
-            speed_mps=5.0,
+            speed_mps=0.1,
             preset="coarse",
-            max_steps=120,
+            max_steps=500,
             aoa_deg=10.0,
             sideslip_deg=5.0,
-            fluid={"name": "water", "density_kgm3": 998.0, "kinematic_visc_m2s": 1.0e-6},
+            fluid={"name": "water-like", "density_kgm3": 998.0,
+                   "kinematic_visc_m2s": 1.0e-4},
             roughness_um=50.0,
             ref_area_mm2=0.0,  # auto-frontal
         )
@@ -349,19 +390,106 @@ def test_aero_upgrade() -> None:
 # Test 6: Memory guard
 # ---------------------------------------------------------------------------
 
-def test_memory_guard() -> None:
-    print("\n[test_memory_guard] expect MemoryError for oversize domain...")
-    stl = _make_sphere_stl(radius_mm=5000.0)  # huge sphere → huge domain
+def test_invalid_and_unconverged_setups_are_refused() -> None:
+    stl = _make_sphere_stl(radius_mm=20.0)
     try:
-        try:
-            run_wind_tunnel(stl_path=stl, preset="xfine", speed_mps=10.0, max_steps=1)
-            # If it didn't raise, check if domain would actually exceed 2 GB
-            print("  NOTE: memory guard did not trigger (domain fits in 2 GB at this size)")
-        except MemoryError as e:
-            print(f"  MemoryError raised correctly: {e}")
-        print("  PASS")
+        for kwargs in (
+            {"speed_mps": 0.0},
+            {"direction": (0.0, 0.0, 0.0)},
+            {"fluid": {"density_kgm3": -1.0, "kinematic_visc_m2s": 1e-3}},
+            {"max_steps": 0},
+        ):
+            with pytest.raises(ValueError):
+                run_wind_tunnel(stl_path=stl, preset="coarse", **kwargs)
+        with pytest.raises(RuntimeError, match="did not converge"):
+            run_wind_tunnel(
+                stl_path=stl, speed_mps=1.0, preset="coarse", max_steps=1,
+                fluid=_TEST_FLUID)
     finally:
         os.unlink(stl)
+
+
+def test_lateral_slip_is_specular_and_impermeable() -> None:
+    f = np.arange(2 * 3 * 3 * 19, dtype=np.float32).reshape(2, 3, 3, 19)
+    original = f.copy()
+    _lateral_slip(f, 3, 3)
+
+    # Low/high Y reconstruct only the incoming normal population from the
+    # same-cell population with reversed Y velocity.
+    assert f[0, 0, 1, 3] == original[0, 0, 1, 4]
+    assert f[0, 0, 1, 4] == original[0, 0, 1, 4]
+    assert f[0, -1, 1, 4] == original[0, -1, 1, 3]
+    # Low/high Z likewise reverse Z without importing an adjacent plane.
+    assert f[0, 1, 0, 5] == original[0, 1, 0, 6]
+    assert f[0, 1, 0, 6] == original[0, 1, 0, 6]
+    assert f[0, 1, -1, 6] == original[0, 1, -1, 5]
+
+
+def test_momentum_exchange_uses_population_streamed_into_solid() -> None:
+    solid = np.zeros((5, 5, 5), dtype=bool)
+    solid[2, 2, 2] = True
+    links = _build_boundary_links(solid, 5, 5, 5)
+
+    # Direction 1 is +X.  The population at the solid destination is the one
+    # that crossed the wall link during streaming.  A large value at the
+    # adjacent fluid cell must not contaminate the force.
+    f = np.zeros((5, 5, 5, 19), dtype=np.float32)
+    f[2, 2, 2, 1] = np.float32(0.75)
+    f[1, 2, 2, 1] = np.float32(100.0)
+    fx, fy, fz = _momentum_exchange(f, links)
+
+    assert fx == pytest.approx(1.5)
+    assert fy == pytest.approx(0.0)
+    assert fz == pytest.approx(0.0)
+
+
+def test_steady_force_estimator_averages_lattice_oscillation() -> None:
+    samples = [
+        (1.02, 0.3, -0.3),
+        (0.98, -0.1, 0.1),
+        (1.00, 0.1, 0.2),
+        (1.03, 0.2, -0.2),
+        (0.96, 0.0, 0.2),
+        (1.01, 0.1, 0.0),
+    ]
+    force_mean, drift = _steady_force_estimate(samples)
+
+    # Both half-window means are 1.0 despite the persistent lattice-scale
+    # oscillation.  All three returned components are full-window averages,
+    # rather than the final instantaneous sample.
+    assert force_mean == pytest.approx((1.0, 0.1, 0.0))
+    assert drift == pytest.approx(0.0)
+    drifting = [(1.0, 0.0, 0.0)] * 3 + [(1.03, 0.0, 0.0)] * 3
+    _mean, drifting_residual = _steady_force_estimate(drifting)
+    assert drifting_residual > 0.01
+
+
+def test_lattice_force_and_coefficient_scaling() -> None:
+    lattice_force = 0.125
+    dx_m = 0.004
+    u_lat = 0.05
+    density = 1.2
+    speed = 2.0
+    area_mm2 = 1500.0
+
+    dt_s = u_lat * dx_m / speed
+    force_n = lattice_force * _force_scale_si(density, dx_m, dt_s)
+    scaled_density = 3.0 * density
+    scaled_speed = 2.0 * speed
+    scaled_dt_s = u_lat * dx_m / scaled_speed
+    scaled_force_n = lattice_force * _force_scale_si(
+        scaled_density, dx_m, scaled_dt_s)
+
+    # At fixed lattice solution, SI force is proportional to rho*U^2.  The
+    # corresponding coefficient is invariant, and doubling only the reference
+    # area halves the coefficient.
+    assert scaled_force_n == pytest.approx(12.0 * force_n)
+    cd = _force_coefficient(force_n, density, speed, area_mm2)
+    scaled_cd = _force_coefficient(
+        scaled_force_n, scaled_density, scaled_speed, area_mm2)
+    assert scaled_cd == pytest.approx(cd)
+    assert _force_coefficient(
+        force_n, density, speed, 2.0 * area_mm2) == pytest.approx(0.5 * cd)
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +527,7 @@ def main() -> None:
     # Test 1: sphere basic
     sphere_result = None
     try:
-        sphere_result = test_sphere_basic()
+        sphere_result = _sphere_basic_result()
     except Exception as e:
         failures.append(("test_sphere_basic", e))
         traceback.print_exc()
@@ -443,9 +571,23 @@ def main() -> None:
 
     # Test 6: memory guard (informational, won't fail suite)
     try:
-        test_memory_guard()
+        test_invalid_and_unconverged_setups_are_refused()
     except Exception as e:
-        failures.append(("test_memory_guard", e))
+        failures.append(("test_invalid_and_unconverged_setups_are_refused", e))
+        traceback.print_exc()
+
+    try:
+        test_lateral_slip_is_specular_and_impermeable()
+    except Exception as e:
+        failures.append(("test_lateral_slip_is_specular_and_impermeable", e))
+        traceback.print_exc()
+
+    try:
+        test_momentum_exchange_uses_population_streamed_into_solid()
+        test_steady_force_estimator_averages_lattice_oscillation()
+        test_lattice_force_and_coefficient_scaling()
+    except Exception as e:
+        failures.append(("test_force_accounting_and_scaling", e))
         traceback.print_exc()
 
     # Timing (informational, 100 steps each)

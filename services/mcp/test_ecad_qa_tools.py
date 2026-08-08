@@ -187,7 +187,7 @@ def _add_wire(wid: str, pts: list, sheet: str = "sh1") -> None:
 # --------------------------------------------------------------------------- registration
 
 
-def test_register() -> dict:
+def test_register() -> None:
     tools = _register()
     assert "ecad_lint_schematic" in tools, sorted(tools)
     import inspect
@@ -196,7 +196,6 @@ def test_register() -> dict:
         "ecad_lint_schematic must never declare **kwargs (it disables the arg reconciler)"
     assert set(sig.parameters) == {"doc_id", "max_per_kind"}, list(sig.parameters)
     print("  [register] PASS")
-    return tools
 
 
 def test_registered_under_family_ecad_and_count_went_up() -> None:
@@ -661,7 +660,8 @@ if pytest is not None:
 
 def main() -> None:
     print("ECAD schematic drawing-quality (sch_qa) tests")
-    t = test_register()
+    t = _register()
+    test_register()
     test_registered_under_family_ecad_and_count_went_up()
     test_reachable_from_the_general_lane()
     test_clean_schematic_has_zero_findings(t)

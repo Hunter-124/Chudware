@@ -1,23 +1,38 @@
-SIMULATION — set up, anchor, run, and interpret FEA/CFD/motion honestly.
+SIMULATION — define one case, check capability, anchor, refine, then interpret.
 
-STUDY KINDS:
-  run_fea_static     linear static stress/disp under loads+fixtures
-  run_fea_modal      natural frequencies / mode shapes
-  run_fea_thermal    steady/transient thermal
-  run_fea_buckling   eigenvalue buckling
-  run_fea_fatigue    cyclic life estimate (needs stress history)
-  run_fea_contact    nonlinear contact
-  run_cfd_flow       steady flow (drag/pressure/velocity)
-  run_cfd_accurate   higher-fidelity CFD when coarse pass is done
-  simulate_motion    rigid-body / mechanism motion
+REAL-PART:
+  run_fea_static/fatigue/modal/frequency_response; transient run_fea_thermal;
+  run_cfd_flow; simulate_motion.
+PROXY/ANALYTIC:
+  steady thermal + buckling/contact are CalculiX box/two-block proxies;
+  EM defaults are builtin FDFD eigenmode or analytic-uniform guide response.
 
-BC / MESH RULES:
-  - Fixtures + loads on NAMED faces (describe_part first). One load case per study.
-  - Mesh from feature size; refine once at concentrations. Coarse first for sanity.
-  - Material via set_material / research_material_lookup — never hand-type E, ν, ρ.
+SETUP:
+  - Confirm face queries. FEA properties enter via material=; set_material is
+    appearance only. Explicit dicts need E/nu; add yield for static/fatigue, density
+    for modal/frequency/transient thermal, ultimate/endurance for fatigue,
+    conductivity_w_mk/k_w_mk for steady thermal, and conductivity plus cp_j_kgk (or
+    top-level specific_heat_j_kgk) for transient. Force N, pressure MPa, geometry mm.
+  - Static/fatigue: mounted face + non-zero force N or pressure MPa. Buckling:
+    one mount + one inward axial force N; its proxy rejects pressure/shear/tension.
+    Modal: no load; fixtures=[] is valid free-free (expect six near-zero rigid modes).
+  - Vibration: excitation_dir, base_accel_g, zeta; PSD is g²/Hz. No PSD means no
+    random result; the tool does not recover stress/deflection.
+  - Thermal steady: exactly one hot and one cold face at distinct °C values; loads
+    are rejected. Transient: seconds plus W/m² flux or W/(m²·K) convection;
+    flux-only transient heat-up is valid.
+  - CFD: m/s, air|water, +X flow/+Z lift. Motion: stop required, degrees/mm,
+    steps>=2. EM: em_status before openEMS; guide tools use GHz/mm, antennas Hz.
 
-SANITY:
-  - Closed-form anchor (research_eng_calc) BEFORE solve; ledger it.
-  - Result vs anchor within ~2–3× → credible; >5× → fix BCs/units/material first.
-  - Reaction balance / free-body check after static; first modes vs known excitation for modal.
-  - describe_results after every run; FAIL names face/feature in plain words.
+ANCHORS:
+  beam only for justified support/load; Fourier q=kΔT/L; modal/resonance order;
+  CFD dynamic pressure/V²; motion closure/clearance; EM TE10/antenna resonance.
+  Analytic-uniform S21 does not validate a discontinuity.
+
+EVIDENCE:
+  - Refine mesh/cells/resolution and require the governing result to settle
+    (normally <10%) or agree in order with an independent pre-solve anchor.
+  - LBM absolute Cd is uncalibrated; use run_cfd_accurate for absolute Cd/Cl.
+  - ok:false, SKIP, failed/cancelled, converged:false, verdict:null = no proof.
+  - Static margin = yield/SF - stress. Below allowable is margin failure, not
+    yielding; yielding starts at yield, fracture language at ultimate.

@@ -3,50 +3,54 @@ id: sim_study
 stage: sim
 # Owning role: sim_engineer. Helper tools ⊆ sim_engineer.tool_allowlist.
 steps:
-  - id: setup_material
-    goal: read the criterion being proved and set the material from the registry (never typed by hand)
-    helper_tools: [ledger_get, set_material, research_material_lookup]
+  - id: define_case
+    goal: state the criterion, one load/excitation case, units, and pass rule
+    helper_tools: [ledger_get, research_material_lookup]
     checklist:
-      - AC id, load case, and pass rule stated
-      - material set from the registry; sourced values recorded if the registry lacked it
+      - material/fluid and every input unit stated
+      - solver material chosen through material=; set_material not used for properties
     output:
       type: object
-      required: [criterion_id, material]
+      required: [criterion_id, setup_summary]
   - id: anchor
-    goal: ANCHOR FIRST — estimate expected order of magnitude with a closed-form calc before any solve
+    goal: record a justified independent order-of-magnitude anchor before seeing solver output
     helper_tools: [research_eng_calc, measure_part]
     checklist:
-      - closed-form anchor written to the ledger (e.g. "expect ~40 MPa at the root, cantilever approx")
-      - if no approximation maps, "no anchor" recorded honestly — never a fabricated anchor
+      - anchor and assumptions recorded, or "no anchor" recorded honestly
+      - no pressure-to-force conversion without a measured loaded area
     output:
       type: object
       required: [anchor]
-  - id: setup_bcs
-    goal: fixtures and loads on named faces that exist; fix every pre-sim advisory item before running
-    helper_tools: [describe_part, ledger_note]
+  - id: setup
+    goal: match the actual tool schema and confirm every geometry reference
+    helper_tools: [query_geometry, describe_part, em_status, ledger_note]
     checklist:
-      - fixtures/loads on named faces (no dangling refs, no all-fixed body, no missing load)
-      - mesh per the advisory's feature-size suggestion
+      - static/fatigue have mounted faces and non-zero force N or pressure MPa
+      - buckling has one mount and one inward axial force N; no pressure/shear/tension
+      - free-free modal uses fixtures=[] intentionally and expects six rigid modes
+      - thermal/vibration/CFD/motion/EM use their excitation fields and units, not fake fixtures/loads
+      - requested external backend capability checked; unavailable means SKIP
     output:
       type: object
       required: [setup_summary]
-  - id: run_read
-    goal: run one load case per study, then read results and compare to the anchor
-    helper_tools: [run_fea_static, run_fea_modal, run_cfd_flow, describe_results]
+  - id: run_refine_read
+    goal: run a cheap pass and a refinement, then read only completed/converged envelopes
+    helper_tools: [run_fea_static, run_fea_modal, run_fea_fatigue, run_fea_frequency_response, run_fea_thermal, run_fea_buckling, run_fea_contact, run_cfd_flow, run_cfd_accurate, simulate_motion, em_eigenmode, em_driven, em_timedomain, describe_results]
     checklist:
-      - one load case per study (mixed cases hide which load broke it)
-      - result within ~2-3x anchor = credible; beyond ~5x = suspect SETUP first (BCs/units/material)
-      - solver, mesh size, element count reported exactly; non-convergence/skips stated
+      - one case per study; solver/backend and discretization reported
+      - ok:false, skipped, failed/cancelled, converged:false, random.ok:false, and verdict:null not called PASS
+      - governing value changes <10% on refinement, or independent anchor supports its order of magnitude
+      - proxy/analytic-only tool limitations stated
     output:
       type: object
       required: [studies]
   - id: verdict
-    goal: verdict per criterion with margin and the failure location in face/feature words
+    goal: verdict per criterion with evidence, allowable margin, and actionable location
     helper_tools: [struct_analyze, ledger_note]
     checklist:
-      - PASS/WARN/FAIL with numbers and margin vs the pass rule
-      - FAIL names the location in face/feature words so the fixer can act
-      - design suggestions routed AS EVIDENCE via the failure card, never edited into geometry
+      - margin=yield/SF-stress; exceeding allowable is not mislabeled as yielding
+      - nominal stress >= yield is yielding; fracture language only at/above ultimate
+      - PASS names convergence/anchor evidence; FAIL names the face/feature or response mode
     output:
       type: object
       required: [verdicts]

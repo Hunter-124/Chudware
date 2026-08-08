@@ -15,12 +15,16 @@
 #include "firmware/powerprofile.h"
 #include "firmware/project.h"
 #include "firmware/scenario.h"
+#include "firmware/sensor_models.h"
+#include "firmware/sim_sensor_bridge.h"
 #include "firmware/subprocess.h"
 
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -476,7 +480,7 @@ TEST_CASE("emulator parsers: gpio/uart events + ODR snapshot (pure)") {
     json ev = chudware::firmware::parse_gpio_events(raw);
     REQUIRE(ev.size() == 4);
     CHECK(ev[0].value("pin", "") == "PA5");
-    CHECK(ev[0]["t_ms"].is_null());          // Renode hook prints carry no t
+    CHECK(ev[0]["t_ms"].is_null());  // never substitute host time for a missing target time
     CHECK(ev[1].value("t_ms", 0.0) == 10.0);
     CHECK(ev[2].value("t_ms", 0.0) == 2.5);  // us
     CHECK(ev[3].value("t_ms", 0.0) == 1000.0);  // s
@@ -501,6 +505,203 @@ TEST_CASE("emulator parsers: gpio/uart events + ODR snapshot (pure)") {
     json states = chudware::firmware::derive_gpio_states(ev, odr);
     CHECK(states.value("PA5", -1) == 1);
     CHECK(states.value("PB3", -1) == 0);
+}
+
+TEST_CASE("emulator traces are bounded, ordered, and disclose truncation") {
+    std::ostringstream raw;
+    for (int i = 0; i < 5000; ++i)
+        raw << "CHUDWARE_GPIO_EVT PA5=" << (i % 2) << " t=" << i << "ms\n";
+    json events = chudware::firmware::parse_gpio_events(raw.str());
+    REQUIRE(events.size() == 4096);
+    REQUIRE(events[2047].value("type", "") == "trace_truncated");
+    CHECK(events[2047].value("dropped", 0) == 905);
+    for (size_t i = 1; i < events.size(); ++i)
+        CHECK(events[i - 1].value("seq", -1LL) <= events[i].value("seq", -1LL));
+
+    json states = chudware::firmware::derive_gpio_states(events, json::object());
+    CHECK(states.value("PA5", -1) == 1);  // the retained tail preserves final state
+    json assertions = chudware::firmware::evaluate_assertions(
+        raw.str(), states, {"toggles:PA5<5000"}, events, json::array());
+    REQUIRE(assertions.size() == 1);
+    CHECK(assertions[0].value("passed", true) == false);
+    CHECK(assertions[0].value("detail", "").find("event limit") != std::string::npos);
+
+    fs::path elf = fs::temp_directory_path() / "chudware_bounded_trace.elf";
+    std::ofstream(elf, std::ios::binary | std::ios::trunc) << "trace fixture";
+    auto trace_path = chudware::firmware::write_trace_artifact(
+        elf.string(), "test", raw.str(), events, states);
+    REQUIRE(trace_path.has_value());
+    json trace = read_json(*trace_path);
+    CHECK(trace.value("truncated", false) == true);
+    CHECK(trace["events"].size() == 4096);
+    for (size_t i = 1; i < trace["events"].size(); ++i)
+        CHECK(trace["events"][i - 1].value("seq", -1LL) <=
+              trace["events"][i].value("seq", -1LL));
+    std::error_code ec;
+    fs::remove(*trace_path, ec);
+    fs::remove(elf, ec);
+}
+
+TEST_CASE("emulator rejects invalid setup before probing a backend") {
+    fs::path bad = fs::temp_directory_path() / "chudware_invalid_firmware.elf";
+    std::ofstream(bad, std::ios::binary | std::ios::trunc) << "not an elf";
+
+    auto result = chudware::firmware::run_simulation(bad.string(), "cortex-m4", {}, 30.0);
+    CHECK(result.passed == false);
+    CHECK(result.uart_log.find("invalid_image:") == 0);
+
+    result = chudware::firmware::run_simulation(
+        bad.string(), "cortex-m4", {"gpio:PZ99=1"}, 30.0);
+    CHECK(result.passed == false);
+    CHECK(result.uart_log.find("invalid_setup:") == 0);
+    CHECK(result.uart_log.find("invalid pin") != std::string::npos);
+
+    result = chudware::firmware::run_simulation(
+        bad.string(), "cortex-m4", {"uart:ready"},
+        std::numeric_limits<double>::infinity());
+    CHECK(result.passed == false);
+    CHECK(result.uart_log.find("invalid_setup: timeout_s") == 0);
+
+    std::error_code ec;
+    fs::remove(bad, ec);
+}
+
+TEST_CASE("Renode script preserves sub-second precision and uses only supported GPIO snapshots") {
+    fs::path dir = fs::temp_directory_path() / "chudware-renode-resc";
+    fs::create_directories(dir);
+    fs::path platform = dir / "platform.repl";
+    std::ofstream(platform, std::ios::binary | std::ios::trunc)
+        << "gpioPortA: GPIOPort.STM32_GPIOPort @ sysbus 0x40020000\n";
+
+    std::string script = chudware::firmware::build_resc(
+        "firmware.elf", platform.string(), 1.025, {{'A', 5}},
+        {{"base", 0x40020000}, {"stride", 0x400}, {"odr_offset", 0x14}}, {}, {});
+    CHECK(script.find("sleep 1.025\n") != std::string::npos);
+    CHECK(script.find("AddStateChangedHook") == std::string::npos);
+    CHECK(script.find("CHUDWARE_GPIO_ODR_BEGIN A") != std::string::npos);
+    CHECK(script.find("CHUDWARE_GPIO_ODR_END A") != std::string::npos);
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+TEST_CASE("Renode capability-refuses untimestamped GPIO and byte-FIFO register streams") {
+#ifndef _WIN32
+    fs::path dir = fs::temp_directory_path() /
+                   ("chudware-renode-capability-" + std::to_string(static_cast<long long>(
+                        std::chrono::steady_clock::now().time_since_epoch().count())));
+    fs::create_directories(dir);
+    fs::path invoked = dir / "invoked";
+    fs::path renode = dir / "renode";
+    {
+        std::ofstream script(renode, std::ios::binary | std::ios::trunc);
+        script << "#!/bin/sh\n"
+                  "echo invoked > "
+               << invoked.string() << "\n"
+                  "exit 0\n";
+    }
+    fs::permissions(renode, fs::perms::owner_all, fs::perm_options::add);
+    fs::path elf = dir / "valid.elf";
+    {
+        std::ofstream image(elf, std::ios::binary | std::ios::trunc);
+        char header[52] = {};
+        header[0] = '\x7f';
+        header[1] = 'E';
+        header[2] = 'L';
+        header[3] = 'F';
+        header[4] = 1;
+        header[5] = 1;
+        header[6] = 1;
+        header[16] = 2;
+        header[18] = 40;
+        image.write(header, sizeof(header));
+    }
+
+    const char* old_raw = std::getenv("PATH");
+    const std::optional<std::string> old_path =
+        old_raw ? std::optional<std::string>(old_raw) : std::nullopt;
+    set_env("PATH", dir.string());
+    auto timed = chudware::firmware::run_simulation(
+        elf.string(), "stm32f4",
+        {"gpio:PA5=1@>10ms", "toggles:PA5>=2", "period:PA5=10ms+-1ms"}, 2.0);
+    json sensor_scenario = chudware::firmware::build_sensor_scenario(
+        {{"t_s", {0.0, 0.1}}, {"altitude_m", {100.0, 101.0}}},
+        json::array({{{"device", "mpu6050"}}}), json(), 0.1, "register-map");
+    auto sensor = chudware::firmware::run_simulation(
+        elf.string(), "stm32f4", {}, 2.0, sensor_scenario);
+    if (old_path)
+        set_env("PATH", *old_path);
+    else
+        unset_env("PATH");
+
+    CHECK(timed.passed == false);
+    CHECK(timed.uart_log.find("platform_capability:") == 0);
+    CHECK(timed.uart_log.find("timestamped GPIO observation is unavailable") !=
+          std::string::npos);
+    REQUIRE(timed.assertion_results.size() == 3);
+    for (const auto& assertion : timed.assertion_results)
+        CHECK(assertion.value("detail", "").find("unsupported") != std::string::npos);
+
+    CHECK(sensor.passed == false);
+    CHECK(sensor.uart_log.find("scenario_unsupported:") == 0);
+    CHECK(sensor.uart_log.find("register-addressed") != std::string::npos);
+    CHECK(sensor.uart_log.find("stale byte bursts") != std::string::npos);
+    CHECK_FALSE(fs::exists(invoked));
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+#else
+    CHECK(true);
+#endif
+}
+
+TEST_CASE("backend process faults cannot become successful simulation") {
+#ifndef _WIN32
+    fs::path dir = fs::temp_directory_path() / "chudware-fault-emulator";
+    fs::create_directories(dir);
+    fs::path qemu = dir / "qemu-system-arm";
+    {
+        std::ofstream script(qemu, std::ios::binary | std::ios::trunc);
+        script << "#!/bin/sh\n"
+                  "echo synthetic-emulator-fault >&2\n"
+                  "exit 7\n";
+    }
+    fs::permissions(qemu, fs::perms::owner_all, fs::perm_options::add);
+    fs::path elf = dir / "valid.elf";
+    {
+        std::ofstream image(elf, std::ios::binary | std::ios::trunc);
+        char header[52] = {};
+        header[0] = '\x7f';
+        header[1] = 'E';
+        header[2] = 'L';
+        header[3] = 'F';
+        header[4] = 1;   // ELFCLASS32
+        header[5] = 1;   // little-endian
+        header[6] = 1;   // current ELF version
+        header[16] = 2;  // ET_EXEC
+        header[18] = 40; // EM_ARM
+        image.write(header, sizeof(header));
+    }
+
+    const char* old_raw = std::getenv("PATH");
+    const std::optional<std::string> old_path =
+        old_raw ? std::optional<std::string>(old_raw) : std::nullopt;
+    set_env("PATH", dir.string());
+    auto result = chudware::firmware::run_simulation(
+        elf.string(), "cortex-m4", {}, 2.0);
+    if (old_path)
+        set_env("PATH", *old_path);
+    else
+        unset_env("PATH");
+
+    CHECK(result.passed == false);
+    CHECK(result.uart_log.find("emulator_fault: qemu-system-arm exited with code 7") == 0);
+    CHECK(result.uart_log.find("synthetic-emulator-fault") != std::string::npos);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+#else
+    CHECK(true);
+#endif
 }
 
 TEST_CASE("evaluate_assertions: full grammar (pure)") {
@@ -728,19 +929,16 @@ TEST_CASE("fw_sim_run LIVE: QEMU semihosting path (honest skip without tools)") 
     CHECK(trace.value("source", "") == "renode");
     CHECK(trace.contains("events"));
 
-    // A uart: assertion exceeds the generic platform's capability → QEMU
-    // semihosting fallback (T-FIN2 gate), which really launches QEMU on the
-    // freshly-built ELF. NOTE (oracle gap, verified identical in Python):
-    // this QEMU build writes semihosting output to STDERR and both engines
-    // capture stdout only, so no UART text lands in uart_log — the assertion
-    // fails the same way in both.
+    // A uart: assertion exceeds the generic Renode platform's capability, so the
+    // gate selects QEMU semihosting. QEMU writes this target's semihosting stream
+    // to STDERR; the emulator must merge both subprocess streams rather than
+    // reporting a false missing-UART failure.
     r = call("fw_sim_run", {{"project_id", pid},
                             {"elf_path", elf},
                             {"assertions", json::array({"uart:hello world"})},
                             {"timeout_s", 180.0}});
-    CHECK(r.value("passed", true) == false);
-    CHECK(r["assertion_results"][0]["detail"].get<std::string>() ==
-          "'hello world' not found in uart_log");
+    CHECK(r.value("passed", false) == true);
+    CHECK(r.value("uart_log", std::string()).find("hello world") != std::string::npos);
 }
 
 TEST_CASE("fw_sim_run LIVE: Renode UART path on stm32f4 (honest skip without tools)") {
@@ -864,6 +1062,18 @@ TEST_CASE("fw_sensor_scenario: bridge builds a valid scenario + envelopes") {
     CHECK(imu.value("address", 0) == 0x68);
     CHECK(imu["samples"].size() == 3);
     CHECK(imu["samples"][0]["response"].size() == 14);
+    REQUIRE(imu["samples"][0]["registers"].is_object());
+    CHECK(imu["samples"][0]["registers"].value("117", -1) == 0x68);  // WHO_AM_I
+    for (int offset = 0; offset < 14; ++offset)
+        CHECK(imu["samples"][0]["registers"].value(std::to_string(0x3B + offset), -1) ==
+              imu["samples"][0]["response"][offset].get<int>());
+    for (const auto& sample : imu["samples"]) {
+        CHECK(sample.contains("t_ms"));
+        CHECK(sample["registers"].is_object());
+    }
+    const json& baro = r["scenario"]["tracks"][1];
+    CHECK(baro["samples"][0]["registers"].value("208", -1) == 0x58);  // CHIP_ID
+    CHECK(baro["samples"][0]["registers"] != baro["samples"][2]["registers"]);
     // GNSS went uart_rx with NMEA text.
     const json& gnss = r["scenario"]["tracks"][2];
     CHECK(gnss.value("kind", "") == "uart_rx");
@@ -879,6 +1089,108 @@ TEST_CASE("fw_sensor_scenario: bridge builds a valid scenario + envelopes") {
              {{"profile", profile},
               {"sensor_map", json::array({{{"device", "fluxcapacitor"}}})}});
     CHECK(r.value("code", "") == "invalid_request");
+}
+
+TEST_CASE("sensor models preserve units, altitude reference, and deterministic stepping") {
+    using namespace chudware::firmware;
+    json profile_json = {
+        {"t_s", {0.0, 1.0}},
+        {"pos_ned_m", json::array({json::array({0.0, 0.0, 0.0}),
+                                    json::array({10.0, 0.0, 0.0})})},
+        {"vel_ned_m_s", json::array({json::array({50.0, 0.0, 0.0}),
+                                      json::array({50.0, 0.0, 0.0})})},
+        {"airspeed_m_s", {50.0, 50.0}},
+        {"temperature_c", 15.0},
+        {"origin_alt_m", 1000.0},
+    };
+    FlightProfile profile = FlightProfile::from_dict(profile_json);
+    json baro = bmp280_series(profile.samples, profile.origin_alt_m);
+    REQUIRE(baro.size() == 2);
+    CHECK(baro[0].value("t_ms", -1.0) == doctest::Approx(0.0));
+    CHECK(baro[1].value("t_ms", -1.0) == doctest::Approx(1000.0));
+    CHECK(baro[0].value("altitude_m", 0.0) == doctest::Approx(1000.0));
+    CHECK(baro[0].value("pressure_pa", 0.0) == doctest::Approx(isa_pressure_pa(1000.0)));
+
+    json pitot = pitot_series(profile.samples, profile.airspeed_m_s, profile.origin_alt_m);
+    const double expected_density =
+        isa_pressure_pa(1000.0) / (kIsaR * (15.0 + 273.15));
+    CHECK(pitot[0].value("density_kg_m3", 0.0) == doctest::Approx(expected_density));
+    CHECK(pitot[0].value("q_pa", 0.0) ==
+          doctest::Approx(0.5 * expected_density * 50.0 * 50.0));
+
+    json sensor_map = json::array({
+        {{"device", "bmp280"}},
+        {{"device", "pitot"}},
+    });
+    json first = build_sensor_scenario(profile_json, sensor_map, json(), 0.25, "fixed");
+    json second = build_sensor_scenario(profile_json, sensor_map, json(), 0.25, "fixed");
+    CHECK(first == second);
+    CHECK(first["meta"].value("n_samples", 0) == 5);
+    CHECK(first["tracks"][0]["samples"][4].value("t_ms", 0.0) ==
+          doctest::Approx(1000.0));
+
+    json sample_rows = json::array({
+        {{"t_s", 0.0}, {"temperature_c", 20.0}},
+        {{"t_s", 1.0}, {"temperature_c", 21.0}},
+    });
+    json from_rows = build_sensor_scenario(
+        sample_rows, json::array({{{"device", "bmp280"}}}), json(), 1.0, "rows");
+    CHECK(from_rows["meta"].value("n_samples", 0) == 2);
+}
+
+TEST_CASE("sensor scenario setup rejects meaningless or unbounded inputs") {
+    using namespace chudware::firmware;
+    const json valid = {
+        {"t_s", {0.0, 1.0}},
+        {"altitude_m", {100.0, 101.0}},
+        {"airspeed_m_s", {10.0, 10.0}},
+    };
+    const json one_sensor = json::array({{{"device", "bmp280"}}});
+
+    CHECK_THROWS_AS(
+        FlightProfile::from_dict({{"t_s", {0.0, 0.0}}}), std::invalid_argument);
+    CHECK_THROWS_AS(
+        FlightProfile::from_dict({
+            {"t_s", {0.0, 1.0}},
+            {"altitude_m", {100.0}},
+        }), std::runtime_error);
+    CHECK_THROWS_AS(
+        FlightProfile::from_dict({
+            {"t_s", {0.0}},
+            {"quat_body_from_ned", json::array({json::array({0.0, 0.0, 0.0, 0.0})})},
+        }), std::invalid_argument);
+    CHECK_THROWS_AS(
+        FlightProfile::from_dict({
+            {"t_s", {0.0}},
+            {"airspeed_m_s", {-1.0}},
+        }), std::invalid_argument);
+
+    CHECK_THROWS_AS(
+        build_sensor_scenario(valid, one_sensor, json(), 0.0, "bad-dt"),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        build_sensor_scenario(valid, one_sensor, -1.0, 0.1, "bad-duration"),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        build_sensor_scenario(
+            valid, json::array({{{"device", "bmp280"}, {"address", 0x80}}}),
+            json(), 0.1, "bad-address"),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        build_sensor_scenario(
+            valid, json::array({
+                {{"device", "bmp280"}, {"bus", "i2c1"}, {"address", 0x40}},
+                {{"device", "pitot"}, {"bus", "i2c1"}, {"address", 0x40}},
+            }), json(), 0.1, "conflict"),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        build_sensor_scenario(
+            valid, json::array({{{"device", "bmp280"}, {"kind", "uart_rx"}}}),
+            json(), 0.1, "bad-kind"),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        build_sensor_scenario(valid, one_sensor, 100.0, 0.001, "too-many"),
+        std::invalid_argument);
 }
 
 TEST_CASE("fw_verify_board: emulate=true takes the live path") {
@@ -905,13 +1217,10 @@ TEST_CASE("fw_verify_board: emulate=true takes the live path") {
     });
     REQUIRE(r.value("ok", false) == true);
     INFO("dynamic: ", r["dynamic"].dump());
-    // The live QEMU run really launched (this is the live path, not the
-    // deferred degrade — the R4a first increment returned a "not ported yet"
-    // reason here). On THIS box the oracle's QEMU capture gap (semihosting →
-    // stderr) means no pin events come back, so BOTH engines report the same
-    // honest degrade; the parity harness diffs this exact case.
-    CHECK(r["dynamic"].value("ran", true) == false);
-    CHECK(r["dynamic"].value("reason", "") == "emulation produced no pin events");
+    // The semihosting stream is merged from stdout/stderr and the canonical trace marker
+    // is parsed into a real dynamic GPIO event.
+    CHECK(r["dynamic"].value("ran", false) == true);
+    CHECK(r["dynamic"].value("source", "") == "emulation");
     // The no-ELF degrade is still intact:
     json proj2 = call("fw_new_project", {{"mcu_family", "stm32f4"}});
     r = call("fw_verify_board", {

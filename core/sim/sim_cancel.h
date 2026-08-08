@@ -19,11 +19,15 @@ namespace sim {
 // Shared cancel flag a running sim job polls between steps.
 using SimCancelToken = std::shared_ptr<std::atomic<bool>>;
 
-// Register a running sim job so sim_cancel(job_id) can find it. Returns the token the job
-// polls; re-registering an id supersedes the old run's token. An empty job_id is an
-// anonymous run: returns nullptr and registers nothing (not cancellable).
+// Register a running generation and return the flag it polls. Reusing an id first
+// cancels the previous generation, then installs the new token, so at most one
+// uncancelled generation owns an id. Empty ids are anonymous and return nullptr.
 SimCancelToken sim_job_register(const std::string& job_id);
-void sim_job_unregister(const std::string& job_id);
+
+// Remove only the generation identified by `token`. This identity check is required:
+// an older run can finish after its id has been reused and must not unregister the
+// newer run. Empty ids/tokens and stale generations are harmless no-ops.
+void sim_job_unregister(const std::string& job_id, const SimCancelToken& token);
 
 // The sim_cancel RPC body: {job_id} -> {ok, cancelled, job_id}. Mirrors agent::cancel_run:
 // an unknown or already-finished job is NOT an error — it returns ok:true, cancelled:false

@@ -64,6 +64,18 @@ class TestAnalytic(unittest.TestCase):
         vg = analytic.C0 * math.sqrt(1 - (WR90_TE10_HZ / f0) ** 2)
         self.assertAlmostEqual((t_out - t_in) * 1e9, L / vg * 1e9, delta=0.15)
 
+    def test_non_finite_and_degenerate_inputs_are_rejected(self):
+        with self.assertRaises(ValueError):
+            analytic.rect_cutoff_hz(math.nan, 0.01, 1, 0)
+        with self.assertRaises(ValueError):
+            analytic.uniform_section_sparams(np.array([10e9]), WR90_TE10_HZ, 0.0)
+        with self.assertRaises(ValueError):
+            analytic.gamma(np.array([1e9, math.inf]), WR90_TE10_HZ)
+        with self.assertRaises(ValueError):
+            analytic.rect_te_field(0.02, 0.01, 0, 0)
+        with self.assertRaises(ValueError):
+            analytic.rect_te_field(0.02, 0.01, 1, 0, nx=1)
+
 
 class TestFdfd(unittest.TestCase):
     def test_wr90_validation(self):
@@ -90,6 +102,13 @@ class TestFdfd(unittest.TestCase):
         self.assertLessEqual(len(field), 48)
         self.assertLessEqual(max(abs(v) for row in field for v in row), 1.0)
 
+    def test_solver_rejects_invalid_grid_requests(self):
+        with self.assertRaises(ValueError):
+            fdfd.solve_eigenmodes("rectangular", 0.02286, 0.01016,
+                                  n_modes=0)
+        with self.assertRaises(ValueError):
+            fdfd.solve_eigenmodes("rectangular", math.nan, 0.01016)
+
 
 class TestAdapters(unittest.TestCase):
     def test_cross_section_resolution(self):
@@ -100,6 +119,20 @@ class TestAdapters(unittest.TestCase):
         with self.assertRaises(EmSolverError):
             resolve_cross_section({"waveguide": {"a_mm": 22.86}})
 
+
+    def test_public_spec_validation_rejects_bad_dimensions_and_ranges(self):
+        with self.assertRaises(EmSolverError):
+            resolve_cross_section(
+                {"waveguide": {"shape": "rectangular", "a_mm": math.nan, "b_mm": 10}})
+        with self.assertRaises(EmSolverError):
+            resolve_cross_section(
+                {"waveguide": {"shape": "rectangular", "a_mm": 10, "b_mm": 20}})
+        with self.assertRaises(EmSolverError):
+            AnalyticAdapter().driven(
+                {"standard": "WR90", "f_start_ghz": 12, "f_stop_ghz": 8})
+        with self.assertRaises(EmSolverError):
+            BuiltinFdfdAdapter().eigenmode(
+                {"standard": "WR90", "resolution": 12})
     def test_registry_and_selection(self):
         names = [ad.name for ad in registry()]
         self.assertEqual(names[0], "openems")           # preference order
@@ -178,6 +211,7 @@ class TestOpenEmsPipeline(unittest.TestCase):
         dz = plan["mesh"]["z"][1] - plan["mesh"]["z"][0]
         self.assertLessEqual(dz, lam_mm / 20 + 1e-9)
         self.assertGreaterEqual(len(plan["mesh"]["x"]), 15)
+        self.assertGreaterEqual(len(plan["mesh"]["y"]), 16)
 
     def test_plan_rejects_bad_specs(self):
         ad = OpenEmsAdapter()
@@ -207,6 +241,24 @@ class TestOpenEmsPipeline(unittest.TestCase):
         self.assertEqual(len(res["ports"]["port1_v"]), len(res["t_ns"]))
         self.assertIn("spectrum", res)
         self.assertGreater(np.max(np.abs(res["ports"]["port2_v"])), 0.05)
+
+    def test_openems_rejects_zero_incident_spectrum(self):
+        raw = {
+            "freq_hz": [8e9, 9e9],
+            "p1_inc": [0j, 0j],
+            "p1_ref": [0j, 0j],
+            "p2_ref": [0j, 0j],
+        }
+        with self.assertRaisesRegex(EmSolverError, "incident-port spectrum"):
+            OpenEmsAdapter._validated_spectra(raw)
+
+    def test_openems_rejects_missing_time_signals(self):
+        class _NoTime(_MockedOpenEms):
+            def _execute(self, plan, want_time=False):
+                return super()._execute(plan, want_time=False)
+
+        with self.assertRaisesRegex(EmSolverError, "time-domain"):
+            _NoTime().timedomain({"standard": "WR90", "length_mm": 100})
 
     def test_live_openems_if_installed(self):
         """REAL WR-90 FDTD validation — runs only where openEMS exists."""
@@ -259,6 +311,15 @@ class TestWorkerRpc(unittest.TestCase):
         self.assertIn("solvers", res)  # capability report rides along on failure
         res = WORKER_METHODS["em_eigenmode"]({}, None)
         self.assertFalse(res["ok"])   # no waveguide spec
+
+    def test_rpc_rejects_non_finite_and_degenerate_inputs(self):
+        result = WORKER_METHODS["em_driven"](
+            {"standard": "WR90", "length_mm": math.nan}, None)
+        self.assertFalse(result["ok"])
+        self.assertIn("finite", result["error"])
+        result = WORKER_METHODS["em_eigenmode"](
+            {"standard": "WR90", "n_modes": 0}, None)
+        self.assertFalse(result["ok"])
 
 
 if __name__ == "__main__":

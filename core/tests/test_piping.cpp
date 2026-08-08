@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <limits>
 #include <vector>
 
 #include "piping/catalog.h"
@@ -81,6 +82,10 @@ TEST_CASE("properties: unknown fluid / bad state soft-fail") {
     CHECK(fluid_properties("unobtanium")["reason"] == "unknown fluid 'unobtanium'");
     CHECK(fluid_properties("air", -5.0)["ok"] == false);
     CHECK(fluid_properties("air", 293.15, -1.0)["ok"] == false);
+    CHECK(fluid_properties("air", std::numeric_limits<double>::quiet_NaN())["ok"] ==
+          false);
+    CHECK(fluid_properties("air", 293.15,
+                           std::numeric_limits<double>::infinity())["ok"] == false);
 }
 
 TEST_CASE("properties: resolve_solver_fluid shapes") {
@@ -98,6 +103,16 @@ TEST_CASE("properties: resolve_solver_fluid shapes") {
     const ojson c = resolve_solver_fluid(ojson::parse(R"({"name": "water", "T_C": 20.0})"));
     CHECK(std::abs(c["rho"].get<double>() - 998.2) < 0.1);
     CHECK(resolve_solver_fluid(ojson::parse(R"({"foo": 1})"))["ok"] == false);
+    CHECK(resolve_solver_fluid(ojson::parse(R"({"rho":0.0,"mu":0.001})"))["ok"] ==
+          false);
+    CHECK(resolve_solver_fluid(ojson::parse(R"({"rho":998.0,"mu":-0.001})"))["ok"] ==
+          false);
+    CHECK(resolve_solver_fluid(ojson::parse(R"({"rho":998.0})"))["ok"] == false);
+    ojson nonfinite_fluid = ojson::object(
+        {{"rho", 998.0}, {"mu", std::numeric_limits<double>::infinity()}});
+    CHECK(resolve_solver_fluid(nonfinite_fluid)["ok"] == false);
+    CHECK(resolve_solver_fluid(
+              ojson::parse(R"({"rho":998.0,"mu":0.001,"T_K":0.0})"))["ok"] == false);
 }
 
 // ── schema (test_schema.py) ──────────────────────────────────────────────────
@@ -167,6 +182,24 @@ TEST_CASE("schema: validators") {
     CHECK(std::find_if(errs.begin(), errs.end(), [](const std::string& e) {
         return e.find("ELBOW_ANGLES") != std::string::npos;
     }) != errs.end());
+
+    ojson wrong_units = doc;
+    wrong_units["units"]["system"] = "SI";
+    CHECK_FALSE(validate_piping(wrong_units).empty());
+
+    ojson nonfinite = doc;
+    nonfinite["runs"][0]["path"][1][0] =
+        std::numeric_limits<double>::quiet_NaN();
+    CHECK_FALSE(validate_piping(nonfinite).empty());
+
+    ojson bad_bore = doc;
+    bad_bore["runs"][0]["bore_mm"] = std::numeric_limits<double>::infinity();
+    CHECK_FALSE(validate_piping(bad_bore).empty());
+
+    ojson closed = new_piping("closed");
+    closed["runs"].push_back(new_pipe_run(
+        "r1", ojson::parse("[[0,0,0],[1000,0,0],[0,0,0]]"), 2, "40"));
+    CHECK_FALSE(validate_piping(closed).empty());
 }
 
 // ── catalog (test_catalog.py) ────────────────────────────────────────────────
@@ -223,6 +256,10 @@ TEST_CASE("solve: single pipe Darcy drop") {
     CHECK(std::abs(res["links"][0]["dp_kpa"].get<double>() - 200.0) < 1.0);
     CHECK(res["links"][0]["flow_m3h"].get<double>() > 0);
     CHECK(std::abs(res["max_imbalance_m3h"].get<double>()) < 1e-3);
+    const double p0 = res["nodes"][0]["pressure_kpa"].get<double>();
+    const double p1 = res["nodes"][1]["pressure_kpa"].get<double>();
+    CHECK(std::abs(std::abs(p0 - p1) -
+                   std::abs(res["links"][0]["dp_kpa"].get<double>())) < 0.01);
 }
 
 TEST_CASE("solve: series mass conservation + elbow K lands on one run") {
@@ -316,6 +353,11 @@ TEST_CASE("solve: pump curves, affinity laws, pump in network") {
     CHECK(std::abs(p2["max_flow"].get<double>() - 75.0) < 1e-6);       // Q' = Q·0.5
     CHECK(load_pump_curve("")["ok"] == false);
     CHECK(load_pump_curve("x,y\n1,2\n3,4\n")["ok"] == false);
+    CHECK(load_pump_curve(curve, 0.0)["ok"] == false);
+    CHECK(load_pump_curve("flow,head\n0,50\nnan,40\n")["ok"] == false);
+    CHECK(load_pump_curve("flow,head\n0,50\n0,40\n")["ok"] == false);
+    CHECK(load_pump_curve("flow,head\n0,40\n10,50\n")["ok"] == false);
+    CHECK(load_pump_curve("flow,head\n0,50\n10,-1\n")["ok"] == false);
 
     ojson doc = new_piping("pumpnet");
     doc["runs"].push_back(
@@ -348,6 +390,49 @@ TEST_CASE("solve: soft failures are contract-shaped") {
                              R"([{"node":"n0","pressure":100},{"node":"n1","pressure":50}])"));
     CHECK(c["ok"] == false);
     CHECK(c.contains("errors"));
+
+    // (d) every disconnected component needs its own fixed reference
+    ojson disconnected = new_piping("disconnected");
+    disconnected["runs"].push_back(
+        new_pipe_run("r1", ojson::parse("[[0,0,0],[1000,0,0]]"), 2, "40"));
+    disconnected["runs"].push_back(
+        new_pipe_run("r2", ojson::parse("[[10000,0,0],[11000,0,0]]"), 2, "40"));
+    ojson d = solve(disconnected, ojson::parse(
+        R"([{"node":"n0","pressure":100},{"node":"n1","demand":1}])"));
+    CHECK(d["ok"] == false);
+    CHECK(d["reason"].get<std::string>().find("disconnected") != std::string::npos);
+
+    // (e) ambiguous/conflicting and non-finite boundaries are rejected
+    CHECK(solve(single_pipe_doc(), ojson::parse(
+              R"([{"node":"n0","pressure":100,"demand":1}])"))["ok"] == false);
+    CHECK(solve(single_pipe_doc(), ojson::parse(
+              R"([{"node":"n0","pressure":100},{"node":"n0","head":10}])"))["ok"] ==
+          false);
+    ojson nonfinite_boundary = ojson::array(
+        {ojson::object({{"node", "n0"},
+                        {"pressure", std::numeric_limits<double>::infinity()}})});
+    CHECK(solve(single_pipe_doc(), nonfinite_boundary)["ok"] == false);
+
+    // (f) unsupported catalog dimensions never silently invent a bore
+    ojson overflowing_boundary = ojson::array(
+        {ojson::object({{"node", "n0"},
+                        {"pressure", std::numeric_limits<double>::max()}})});
+    CHECK(solve(single_pipe_doc(), overflowing_boundary)["ok"] == false);
+    ojson unsupported = new_piping("unsupported");
+    unsupported["runs"].push_back(
+        new_pipe_run("r1", ojson::parse("[[0,0,0],[1000,0,0]]"), 7.25, "40"));
+    CHECK(solve(unsupported, ojson::parse(
+              R"([{"node":"n0","pressure":100},{"node":"n1","pressure":50}])"))["ok"] ==
+          false);
+
+    // (g) exhausting the iteration budget is an explicit failure, not success
+    const ojson exhausted = solve(
+        single_pipe_doc(),
+        ojson::parse(R"([{"node":"n0","pressure":500},{"node":"n1","demand":50}])"),
+        nullptr, nullptr, "liquid", 0.5, 1);
+    CHECK(exhausted["ok"] == false);
+    CHECK(exhausted["converged"] == false);
+    CHECK(exhausted["iterations"] == 1);
 }
 
 TEST_CASE("solve: laminar hose line follows Hagen-Poiseuille, not the square law") {
@@ -379,6 +464,55 @@ TEST_CASE("solve: per-segment pressure-drop report with K breakdown") {
     CHECK(rep["segments"][0]["breakdown"][0]["item"] == "pipe friction");
     // no result and no boundary -> contract-shaped
     CHECK(pressure_drop_report(doc)["ok"] == false);
+    CHECK(rep["fluid"]["rho"].get<double>() ==
+          doctest::Approx(res["fluid"]["rho"].get<double>()));
+    ojson claimed = res;
+    claimed["converged"] = false;
+    CHECK(pressure_drop_report(doc, claimed)["ok"] == false);
+    ojson missing_link = res;
+    missing_link["links"] = ojson::array();
+    CHECK(pressure_drop_report(doc, missing_link)["ok"] == false);
+
+    const ojson oil = ojson::parse(
+        R"({"name":"test_oil","rho":850.0,"mu":0.005,"source":"fixture"})");
+    const ojson oil_res = solve(
+        doc,
+        ojson::parse(R"([{"node":"n0","pressure":300},{"node":"n1","pressure":100}])"),
+        oil);
+    REQUIRE(oil_res["ok"] == true);
+    const ojson oil_rep = pressure_drop_report(doc, oil_res);
+    REQUIRE(oil_rep["ok"] == true);
+    CHECK(oil_rep["fluid"]["rho"] == 850.0);
+    CHECK(oil_rep["fluid"]["source"] == "fixture");
+}
+
+TEST_CASE("pressure report: parallel branches are path totals, not a series sum") {
+    ojson doc = new_piping("parallel-report");
+    doc["runs"].push_back(
+        new_pipe_run("r1", ojson::parse("[[0,0,0],[10000,0,0]]"), 2, "40"));
+    doc["runs"].push_back(new_pipe_run(
+        "r2", ojson::parse("[[0,0,0],[5000,5000,0],[10000,0,0]]"), 2, "40"));
+    const ojson res = solve(
+        doc, ojson::parse(
+                 R"([{"node":"n0","pressure":300},{"node":"n1","demand":40}])"));
+    REQUIRE(res["ok"] == true);
+    REQUIRE(res["converged"] == true);
+
+    const ojson rep = pressure_drop_report(doc, res);
+    REQUIRE(rep["ok"] == true);
+    REQUIRE(rep["path_analysis"]["complete"] == true);
+    REQUIRE(rep["path_totals"].size() == 2);
+    double segment_sum = 0.0;
+    for (const auto& segment : rep["segments"])
+        segment_sum += segment["dp_kpa"].get<double>();
+    double governing = 0.0;
+    for (const auto& path : rep["path_totals"])
+        governing = std::max(governing, path["total_dp_kpa"].get<double>());
+    CHECK(rep["total_dp_kpa"].get<double>() == doctest::Approx(governing));
+    CHECK(rep["governing_path"]["total_dp_kpa"].get<double>() ==
+          doctest::Approx(governing));
+    CHECK(rep["governing_path"]["link_ids"].size() == 1);
+    CHECK(governing < segment_sum * 0.75);
 }
 
 // ── gas network solve (test_solve.py) ────────────────────────────────────────
@@ -442,7 +576,14 @@ TEST_CASE("solve gas: series mass conservation + named-fluid requirement") {
                           ojson::parse(R"({"rho":1.2,"mu":1.8e-5})"), nullptr, "gas");
     CHECK(r["ok"] == false);
     CHECK(r["reason"].get<std::string>().find("compressible") != std::string::npos);
+    ojson overflowing_gas_boundary = ojson::array(
+        {ojson::object({{"node", "n0"},
+                        {"pressure_abs", std::numeric_limits<double>::max()}})});
+    CHECK(solve(doc3, overflowing_gas_boundary,
+                ojson::parse(R"({"name":"methane","T":288.15,"P":3.0e6})"),
+                nullptr, "gas")["ok"] == false);
 }
+
 
 // ── operating point + NPSH (test_solve.py) ───────────────────────────────────
 
@@ -475,17 +616,80 @@ TEST_CASE("operating point: duty point, NPSH margin, no-intersection, derived cu
     CHECK(op["ok"] == false);
     CHECK(op["reason"].get<std::string>().find("shutoff") != std::string::npos);
 
-    // Derived system curve from a network solve at the reference demand.
+    CHECK(operating_point(kPumpCsv,
+                          ojson::parse(R"({"static_head_m":20.0,"k":-0.001})"))["ok"] ==
+          false);
+    CHECK(operating_point(kPumpCsv,
+                          ojson::parse(R"({"static_head_m":20.0,"k":0.002})"),
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                          0.0)["ok"] == false);
+
+    ojson bad_suction = operating_point(
+        kPumpCsv, ojson::parse(R"({"static_head_m":20.0,"k":0.002})"),
+        nullptr, nullptr, ojson::parse(R"({"name":"water","T":293.15})"),
+        nullptr, ojson("flow,npshr\n0,2\n50,2.5\n100,4\n150,7\n"),
+        ojson::parse(R"({"pressure_kpa":50.0,"friction_m":-1.0})"));
+    CHECK(bad_suction["ok"] == false);
+
+    ojson short_npshr = operating_point(
+        kPumpCsv, ojson::parse(R"({"static_head_m":20.0,"k":0.002})"),
+        nullptr, nullptr, ojson::parse(R"({"name":"water","T":293.15})"),
+        nullptr, ojson("flow,npshr\n0,2\n50,2.5\n"),
+        ojson::parse(R"({"pressure_kpa":50.0})"));
+    CHECK(short_npshr["ok"] == false);
+
+    ojson cavitating = operating_point(
+        kPumpCsv, ojson::parse(R"({"static_head_m":20.0,"k":0.002})"),
+        nullptr, nullptr, ojson::parse(R"({"name":"water","T":293.15})"),
+        nullptr, ojson("flow,npshr\n0,2\n50,2.5\n100,4\n150,7\n"),
+        ojson::parse(R"({"pressure_kpa":-100.0})"));
+    REQUIRE(cavitating["ok"] == true);
+    CHECK(cavitating["npsh"]["cavitation_risk"] == true);
+    CHECK_FALSE(cavitating["warnings"].empty());
+
+    // A demand boundary does not define its zero-flow terminal pressure.
     ojson doc = new_piping("opnet");
     doc["runs"].push_back(
         new_pipe_run("r1", ojson::parse("[[0,0,0],[30000,0,0]]"), 3, "40"));
     op = operating_point(kPumpCsv, nullptr, doc,
-                         ojson::parse(R"([{"node":"n0","head":5.0},
+                         ojson::parse(R"([{"node":"n0","pressure":0.0},
                                           {"node":"n1","demand":40.0}])"),
+                         nullptr, 40.0);
+    CHECK(op["ok"] == false);
+    CHECK(op["reason"].get<std::string>().find("terminal-pressure") !=
+          std::string::npos);
+
+    op = operating_point(kPumpCsv, nullptr, doc,
+                         ojson::parse(R"([{"node":"n0","pressure":0.0},
+                                          {"node":"n1","demand":40.0,
+                                           "terminal_pressure_kpa":0.0}])"),
                          nullptr, 40.0);
     REQUIRE(op["ok"] == true);
     CHECK(op["duty_point"]["flow_m3h"].get<double>() > 0);
     CHECK(op["system_curve"].contains("derived_from"));
+
+    // Atmospheric source to atmospheric terminal 10 m higher requires +10 m
+    // static head.  Five metres of source total head reduces that requirement
+    // to +5 m rather than increasing it.
+    ojson lift = new_piping("lift");
+    lift["runs"].push_back(
+        new_pipe_run("r1", ojson::parse("[[0,0,0],[0,0,10000]]"), 8, "40"));
+    op = operating_point(kPumpCsv, nullptr, lift,
+                         ojson::parse(R"([{"node":"n0","head":0.0},
+                                          {"node":"n1","demand":40.0,
+                                           "terminal_pressure_kpa":0.0}])"),
+                         nullptr, 40.0);
+    REQUIRE(op["ok"] == true);
+    CHECK(op["system_curve"]["static_head_m"].get<double>() ==
+          doctest::Approx(10.0));
+    op = operating_point(kPumpCsv, nullptr, lift,
+                         ojson::parse(R"([{"node":"n0","head":5.0},
+                                          {"node":"n1","demand":40.0,
+                                           "terminal_pressure_kpa":0.0}])"),
+                         nullptr, 40.0);
+    REQUIRE(op["ok"] == true);
+    CHECK(op["system_curve"]["static_head_m"].get<double>() ==
+          doctest::Approx(5.0));
 }
 
 // ── CFD handoff (test_cfd_handoff.py) ────────────────────────────────────────
@@ -503,6 +707,27 @@ TEST_CASE("cfd: boundary extraction from a solve result") {
     CHECK(bc["inlet_link"] == "r1");
     CHECK(bc["outlet_node"] == "n1");
     CHECK(cfd_boundary_from_solve(ojson::parse(R"({"ok": false})"))["ok"] == false);
+}
+
+TEST_CASE("cfd: reversed solved flow uses the signed upstream endpoint") {
+    const ojson doc = single_pipe_doc();
+    const ojson res = solve(
+        doc, ojson::parse(
+                 R"([{"node":"n0","pressure":100},{"node":"n1","pressure":300}])"));
+    REQUIRE(res["ok"] == true);
+    REQUIRE(res["links"][0]["flow_m3h"].get<double>() < 0.0);
+    const ojson bc = cfd_boundary_from_solve(res, "r1");
+    REQUIRE(bc["ok"] == true);
+    CHECK(bc["flow_direction"] == "to_from");
+    CHECK(bc["inlet_node"] == "n1");
+    CHECK(bc["outlet_node"] == "n0");
+    CHECK(bc["inlet_pressure_kpa"].get<double>() ==
+          doctest::Approx(300.0).epsilon(0.01));
+    CHECK(bc["outlet_pressure_kpa"].get<double>() ==
+          doctest::Approx(100.0).epsilon(0.01));
+    CHECK(bc["pressure_drop_1d_kpa"].get<double>() > 0.0);
+    CHECK(bc["pressure_drop_1d_kpa"].get<double>() ==
+          doctest::Approx(std::abs(res["links"][0]["dp_kpa"].get<double>())));
 }
 
 TEST_CASE("cfd: verify 1D vs 3D pressure drop + velocity advisory") {

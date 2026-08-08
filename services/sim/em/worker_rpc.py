@@ -1,5 +1,6 @@
-"""EM simulation worker RPC surface — em_status / em_eigenmode / em_driven / em_timedomain.
+"""EM simulation worker RPC surface with automatic solver fallback.
 
+em_status / em_eigenmode / em_driven / em_timedomain.
 Registered in engine_oracle/worker.py alongside the other Python-side sim
 surfaces (the OpenFOAM CFD bridge pattern).  The host GUI reaches these over
 the standard worker seam (services/worker WorkerClient stdio JSON-RPC); the
@@ -22,7 +23,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from .adapters import EmSolverError, registry, select_adapter
+from .adapters import EmSolverError, _validate_result_finite, registry, select_adapter
 
 
 def _status(params: dict, _emit: Optional[Callable] = None) -> dict:
@@ -41,17 +42,54 @@ def _status(params: dict, _emit: Optional[Callable] = None) -> dict:
 
 
 def _run(analysis: str, params: dict) -> dict:
-    params = params or {}
-    try:
-        ad = select_adapter(analysis, params.get("solver"))
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return {"ok": False, "analysis": analysis, "error": "parameters must be an object"}
+
+    def _invoke(ad) -> dict:
         result = getattr(ad, analysis)(params)
-        return {"ok": True, "analysis": analysis, **result}
-    except EmSolverError as exc:
-        return {"ok": False, "analysis": analysis, "error": str(exc),
-                "solvers": [ad.info() for ad in registry()]}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "analysis": analysis,
-                "error": f"{type(exc).__name__}: {exc}"}
+        if not isinstance(result, dict):
+            raise EmSolverError(f"{ad.name} returned a non-object result")
+        _validate_result_finite(result)
+        return result
+
+    requested = params.get("solver")
+    automatic = requested in (None, "", "auto")
+    if not automatic:
+        try:
+            ad = select_adapter(analysis, requested)
+            return {"ok": True, "analysis": analysis, **_invoke(ad)}
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc) if isinstance(exc, EmSolverError) else (
+                f"{type(exc).__name__}: {exc}")
+            return {"ok": False, "analysis": analysis, "error": message,
+                    "solvers": [candidate.info() for candidate in registry()]}
+
+    failures = []
+    for ad in registry():
+        if analysis not in ad.capabilities or not ad.available().get("installed"):
+            continue
+        try:
+            result = _invoke(ad)
+            payload = {"ok": True, "analysis": analysis, **result}
+            if failures:
+                payload["solver_fallback"] = {
+                    "selected": ad.name,
+                    "failed_attempts": failures,
+                }
+            return payload
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc) if isinstance(exc, EmSolverError) else (
+                f"{type(exc).__name__}: {exc}")
+            failures.append({"solver": ad.name, "error": message})
+
+    detail = "; ".join(
+        f"{failure['solver']}: {failure['error']}" for failure in failures)
+    return {"ok": False, "analysis": analysis,
+            "error": (f"all automatic {analysis} solvers failed: {detail}"
+                      if failures else f"no installed solver offers {analysis!r} analysis"),
+            "solvers": [ad.info() for ad in registry()]}
 
 
 def _eigenmode(params: dict, _emit: Optional[Callable] = None) -> dict:

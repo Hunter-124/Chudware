@@ -32,7 +32,8 @@ ojson cfd_boundary_from_solve(const ojson& solve_result, const ojson& inlet_run_
     }
     if (nodes.empty()) return jerr("solve_result has no nodes");
 
-    // pick inlet link
+    // Pick the CFD inlet link.  Link orientation is only geometry provenance;
+    // signed solved flow below determines its actual upstream endpoint.
     ojson inlet_link = nullptr;
     if (!inlet_run_id.is_null()) {
         for (const auto& lk : links)
@@ -54,11 +55,39 @@ ojson cfd_boundary_from_solve(const ojson& solve_result, const ojson& inlet_run_
         }
     }
 
-    // pick outlet node: lowest pressure when not named
+    const ojson flow_j = inlet_link.value("flow_m3h", ojson(nullptr));
+    if (!flow_j.is_number() || !std::isfinite(flow_j.get<double>())) {
+        return jerr("selected inlet link has no finite signed flow_m3h",
+                    "rerun piping_solve and pass its converged result");
+    }
+    const double signed_flow_m3h = flow_j.get<double>();
+    if (signed_flow_m3h == 0.0) {
+        return jerr("selected inlet link has zero solved flow; upstream is ambiguous",
+                    "choose a non-zero-flow inlet_run_id or correct the piping boundaries");
+    }
+    const bool along_geometry = signed_flow_m3h > 0.0;
+    const ojson upstream_node_id =
+        inlet_link.value(along_geometry ? "from" : "to", ojson(nullptr));
+    const ojson downstream_node_id =
+        inlet_link.value(along_geometry ? "to" : "from", ojson(nullptr));
+
+    auto find_node = [&](const ojson& id) {
+        for (const auto& nd : nodes)
+            if (nd.value("id", ojson(nullptr)) == id) return nd;
+        return ojson(nullptr);
+    };
+    const ojson inlet_node = find_node(upstream_node_id);
+    if (inlet_node.is_null()) {
+        return jerr("upstream inlet node " + py_repr(upstream_node_id) +
+                    " not found in solve result nodes");
+    }
+
+    // With no explicit outlet, the selected link's signed downstream endpoint
+    // is the only unambiguous comparison.  An explicit outlet remains allowed
+    // for a larger CFD domain.
     ojson outlet_node = nullptr;
     if (!outlet_node_id.is_null()) {
-        for (const auto& nd : nodes)
-            if (nd.value("id", ojson(nullptr)) == outlet_node_id) outlet_node = nd;
+        outlet_node = find_node(outlet_node_id);
         if (outlet_node.is_null()) {
             ojson ids = ojson::array();
             for (const auto& nd : nodes) ids.push_back(nd.value("id", ojson(nullptr)));
@@ -67,30 +96,44 @@ ojson cfd_boundary_from_solve(const ojson& solve_result, const ojson& inlet_run_
                         "available node ids: " + py_repr(ids));
         }
     } else {
-        double best = 0.0;
-        for (const auto& nd : nodes) {
-            const double p = num(nd.value("pressure_kpa", ojson(0.0)));
-            if (outlet_node.is_null() || p < best) {
-                best = p;
-                outlet_node = nd;
-            }
+        outlet_node = find_node(downstream_node_id);
+        if (outlet_node.is_null()) {
+            return jerr("downstream outlet node " + py_repr(downstream_node_id) +
+                        " not found in solve result nodes");
         }
     }
-
-    // inlet node: the "from" end of the inlet link (highest pressure)
-    const ojson inlet_node_id = inlet_link.value("from", ojson(nullptr));
-    ojson inlet_node = nullptr;
-    for (const auto& nd : nodes)
-        if (nd.value("id", ojson(nullptr)) == inlet_node_id) inlet_node = nd;
-    if (inlet_node.is_null()) {
-        return jerr("inlet node " + py_repr(inlet_node_id) + " not found in solve result nodes");
+    if (outlet_node.value("id", ojson(nullptr)) == upstream_node_id) {
+        return jerr("CFD inlet and outlet resolve to the same upstream node",
+                    "choose an outlet downstream of the signed solved flow");
     }
 
     const double inlet_v_ms = std::abs(num(inlet_link.value("velocity_ms", ojson(0.0))));
     const double inlet_p_kpa = num(inlet_node.value("pressure_kpa", ojson(0.0)));
     const double outlet_p_kpa = num(outlet_node.value("pressure_kpa", ojson(0.0)));
-    const double dp_1d = inlet_p_kpa - outlet_p_kpa;
+    const bool selected_link_outlet =
+        outlet_node.value("id", ojson(nullptr)) == downstream_node_id;
+    const ojson link_dp_j = inlet_link.value("dp_kpa", ojson(nullptr));
+    const bool finite_link_dp =
+        link_dp_j.is_number() && std::isfinite(link_dp_j.get<double>());
+    const double dp_1d =
+        selected_link_outlet && finite_link_dp
+            ? std::abs(link_dp_j.get<double>())
+            : std::abs(inlet_p_kpa - outlet_p_kpa);
     const double ref_dia_mm = num(inlet_link.value("id_mm", ojson(0.0)));
+
+    ojson warnings = ojson::array();
+    if (selected_link_outlet && inlet_p_kpa <= outlet_p_kpa && dp_1d > 0.0) {
+        warnings.push_back(
+            "downstream static pressure is not lower (elevation or pump assistance is "
+            "present); pressure_drop_1d_kpa uses the selected link's positive total-head "
+            "loss");
+    }
+    if (!outlet_node_id.is_null() && !selected_link_outlet) {
+        warnings.push_back(
+            "explicit outlet is beyond the selected inlet link; pressure_drop_1d_kpa is "
+            "the absolute endpoint static-pressure difference because no unique network "
+            "path was selected");
+    }
 
     ojson out = ojson::object();
     out["ok"] = true;
@@ -98,10 +141,17 @@ ojson cfd_boundary_from_solve(const ojson& solve_result, const ojson& inlet_run_
     out["inlet_pressure_kpa"] = pyround(inlet_p_kpa, 3);
     out["outlet_pressure_kpa"] = pyround(outlet_p_kpa, 3);
     out["pressure_drop_1d_kpa"] = pyround(dp_1d, 3);
+    out["pressure_drop_basis"] =
+        selected_link_outlet && finite_link_dp ? "selected_link_total_head_loss"
+                                               : "absolute_endpoint_static_pressure";
     out["fluid"] = solve_result.value("fluid", ojson::object());
     out["ref_diameter_mm"] = pyround(ref_dia_mm, 3);
     out["inlet_link"] = inlet_link.value("id", ojson(nullptr));
+    out["inlet_node"] = upstream_node_id;
     out["outlet_node"] = outlet_node.value("id", ojson(nullptr));
+    out["signed_flow_m3h"] = signed_flow_m3h;
+    out["flow_direction"] = along_geometry ? "from_to" : "to_from";
+    out["warnings"] = std::move(warnings);
     out["hint"] =
         "Use inlet_velocity_ms as the CFD inlet BC; outlet_pressure_kpa as the "
         "CFD outlet pressure (relative); compare CFD pressure drop to "

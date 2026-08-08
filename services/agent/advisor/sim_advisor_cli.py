@@ -1,27 +1,20 @@
-"""One-shot CLI shim over sim_advisor for non-Python callers (T-SIM3 GUI wiring).
+"""One-shot JSON CLI over :mod:`sim_advisor` for host or harness callers.
 
-The ImGui GUI (ui/imgui/src/ui/sim_manager.cpp) shells out to this module at
-Run-dispatch time (precheck) and at result-arrival time (postcheck). Contract:
+Contract::
 
     python3 -m services.agent.advisor.sim_advisor_cli
-        stdin:  {"mode": "precheck",  "study": {...}, "doc_geom": {...}?,
-                 "ledger_run_id": "r_..."?, "study_id": "study-..."?}
-             |  {"mode": "postcheck", "study": {...}, "precheck_items": [...]?,
-                 "ledger_run_id": "r_..."?, "study_id": "study-..."?}
-        stdout: {"ok": true, "items": [...]}                       (precheck)
-             |  {"ok": true, "verdict": ..., "narration": ..., ...} (postcheck)
-        exit 0 on success, non-zero + {"ok": false, "error": ...} on failure.
+        stdin:  {"mode": "precheck", "study": {...}, "doc_geom": {...}?}
+             |  {"mode": "postcheck", "study": {...}, "precheck_items": [...]?}
+        stdout: {"ok": true, "items": [...], "block_enabled": bool}
+             |  {"ok": true, "verdict": ..., "confidence": ...,
+                 "narration": ..., "items": [...]}
 
-Pure passthrough — all policy/logic lives in sim_advisor.py (T-W9); this file
-only decodes/encodes JSON so the C++ side never re-implements advisor rules.
-The ``_anchor`` passthrough key is kept in precheck output so the caller can
-round-trip it back into postcheck (`precheck_items`) unchanged.
+The shim only decodes/encodes JSON. Setup policy, finite math, convergence evidence,
+and analytic anchors live in sim_advisor.py. ``_anchor`` remains in precheck output so
+a caller can round-trip the same independently computed anchor into postcheck.
 
-Ledger (inspectability rule): when the caller supplies ``ledger_run_id`` (the GUI
-passes CHUDWARE_MISSION_RUN_ID when a mission context exists), one ``artifact``
-event (kind ``study`` — contracts/advisor.md §2 shape) is appended to that run's
-design ledger recording the advisory outcome. Ledger failures never fail the
-advisory call (best-effort, mirrors Ledger._save()).
+When ``ledger_run_id`` is supplied, a best-effort study artifact event records the
+outcome. Ledger failure never changes advisor success.
 """
 from __future__ import annotations
 
@@ -78,7 +71,7 @@ def main() -> int:
             out = res
             _emit_ledger_event(
                 req, mode,
-                f"verdict {res.get('verdict')} "
+                f"verdict {res.get('verdict')}, confidence {res.get('confidence')} "
                 f"({res.get('mat_class')}, SF={res.get('sf_used')})")
         else:
             raise ValueError(f"unknown mode {mode!r} (want precheck|postcheck)")

@@ -13,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <thread>
 
 #include <chrono>
 #include <cstdint>
@@ -42,6 +43,7 @@ struct SimJobResult {
     std::string method;                   // the sim_* method that ran
     std::string ownerDocId;               // doc id that launched this job (so the right tab consumes it)
     bool ok = false;
+    bool cancelled = false;
     nlohmann::json result;
     std::string error;
     std::string errorCode;                // structured-error code (worker envelope) if any
@@ -52,15 +54,28 @@ struct SimJobResult {
 
 class SimClient {
 public:
+    SimClient() = default;
+    ~SimClient();
+    SimClient(const SimClient&) = delete;
+    SimClient& operator=(const SimClient&) = delete;
+
     // Spawn the sim worker if it isn't running (lazy). Returns true if running afterwards.
     // `consoleNote` receives a human line on (re)spawn / failure for the app log.
     bool ensureStarted(std::string& consoleNote);
 
-    bool started() const { return worker_.started(); }
-    void stop() { worker_.stop(); }
+    bool started() const;
+    // Idempotent terminal shutdown: consume any reservation, request cancellation, abort
+    // daemon transport, and join all owned operations before stopping the worker.
+    void stop();
 
-    // True while a study is in flight (one job at a time).
-    bool busy() const { return job_.running.load(); }
+    // True while a study is reserved, in flight, or its completion is waiting for the owning
+    // SimManager. A pending completion must block a new launch, otherwise launch()
+    // clears job_.ready and silently discards the first study's result. A reservation closes
+    // the prep-to-launch TOCTOU across document managers without pretending a solve is running.
+    bool busy() const {
+        return reservationToken_.load() != 0 || cancelInFlight_.load() ||
+               job_.running.load() || job_.ready.load();
+    }
 
     // Thread-safe progress readouts consumed by the status bar while busy() == true.
     // stage()       — current solver phase ("mesh", "assemble", "solve", "post", …)
@@ -70,31 +85,60 @@ public:
     std::string recentLog() const;
     float       elapsedSeconds() const;
 
+    // Atomically reserve the one global solver slot for asynchronous study preparation.
+    // Tokens are scoped to this client and must be presented by the same owner at launch.
+    // A matching launch consumes its reservation even when backend startup or thread creation
+    // fails; releaseReservation is for preparation failures that never reach launch.
+    bool tryReserve(const std::string& ownerDocId, std::uint64_t& token);
+    void releaseReservation(std::uint64_t token);
+
     // Launch a sim_* method on a background thread. `params` is the full RPC params object
     // (e.g. {"study": {...}} or {"stl_path":..., "direction":..., ...}). The job streams
     // sim_progress into job().events and latches job().ready when done. No-op (returns false)
-    // if a job is already running or the worker can't be started.
-    // `ownerDocId` tags the job so the originating document's SimManager (and only it) consumes the
-    // completion, even if the user switched tabs mid-run.
+    // if a job is already running, a completion is still pending, or the backend can't start.
+    // A nonzero reservation token must match both the active token and owner; tokenless launches
+    // cannot bypass another manager's preparation reservation. `ownerDocId` tags the job so the
+    // originating document's SimManager (and only it) consumes the completion, even if the user
+    // switched tabs mid-run.
     bool launch(const std::string& method, nlohmann::json params, std::string& consoleNote,
-                const std::string& ownerDocId = "");
+                const std::string& ownerDocId = "", std::uint64_t reservationToken = 0);
 
-    // Best-effort cancel of the in-flight job (sends sim_cancel on a detached thread).
+    // Request cooperative cancellation of the in-flight C++ route. Delivery
+    // bypasses the long-run connection; the solver observes it at its next
+    // registered checkpoint (not necessarily inside a factorization).
     void cancel();
+    bool cancelRequested() const { return cancelRequested_.load(); }
 
-    // Which simulation engines are available, e.g. {lbm:true, openfoam:true,
-    // openfoam_kind:"wsl", openfoam_version:"..."}. Queried once (lazily, only when idle) and
-    // cached; returns {} until the first successful probe. Used to gate the Flow solver
-    // selector so OpenFOAM is offered only when it's actually provisioned.
+    // Which flow engines this client can actually route. The retired Python sim child is no
+    // longer available to this WorkerClient; the in-process/hostd C++ flow path is LBM-only.
+    // Cached after the C++ backend is proven loadable, so the UI never offers an unreachable
+    // OpenFOAM path or turns a failed capability probe into a permanent ambiguous {}.
     nlohmann::json caps();
 
     SimJobResult& job() { return job_; }
 
 private:
+    // operationMtx_ serializes reservation transitions and owned thread handles. Operation
+    // threads never acquire it, so stop() can abort their transport and join without deadlock.
+    mutable std::mutex operationMtx_;
+    std::thread launchThread_;
+    std::thread cancelThread_;
+    std::atomic<bool> stopping_{false};
+
     WorkerClient worker_;
     SimJobResult job_;
-    std::string curJobId_;
-    std::mutex startMtx_;
+    std::string curJobId_;                    // guarded by operationMtx_
+    std::atomic<bool> cancelRequested_{false};
+    std::atomic<bool> cancelInFlight_{false};
+    std::atomic<bool> workerFailed_{false};
+
+    std::atomic<std::uint64_t> reservationToken_{0};
+    std::string reservationOwnerDocId_;       // guarded by operationMtx_
+    std::uint64_t nextReservationToken_ = 1;  // guarded by operationMtx_
+
+    void startCancelLocked(bool allowSettled = false);
+
+    mutable std::mutex startMtx_;
 
     std::mutex capsMtx_;
     nlohmann::json capsCache_;

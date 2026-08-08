@@ -2173,6 +2173,83 @@ def _build_swinging_arm_assembly(tmp_path) -> tuple:
     drive_mate_id = r.get("id_map", {}).get("$0")
     return asm, drive_mate_id, "k2"
 
+def _build_sliding_block_assembly(tmp_path) -> tuple:
+    """Fixed cube + translating cube on one driven plane-distance mate.
+
+    The mate normal passes through both COMs, so it is a determinate force path
+    for gravity/translation and a clean motion→FEA load fixture.
+    """
+    cube, faces = _bar_part("MotionSliderCube", 10, 10, 10, str(tmp_path))
+    asm = cb.call("doc_new", {"name": "MotionSlider", "kind": "assembly"})["doc_id"]
+
+    def rev():
+        return cb.call("doc_tree", {"doc_id": asm}).get("revision", 0)
+
+    cb.call("doc_apply_ops", {
+        "doc_id": asm, "base_revision": rev(), "with_tess": False,
+        "ops": [
+            {"op": "asm_insert_component", "source": {"path": cube},
+             "name": "Ground", "fixed": True},
+            {"op": "asm_insert_component", "source": {"path": cube},
+             "name": "Slider", "fixed": False,
+             "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 20, 0, 0, 0, 1]},
+        ]})
+    top = max(faces, key=lambda f: f.get("centroid", [0, 0, 0])[2])
+    bottom = min(faces, key=lambda f: f.get("centroid", [0, 0, 0])[2])
+    added = cb.call("doc_apply_ops", {
+        "doc_id": asm, "base_revision": rev(), "with_tess": False,
+        "ops": [{"op": "asm_add_mate", "mate": {
+            "type": "distance", "align": "aligned", "suppressed": False,
+            "refs": [{"component": "k1", "selector": top},
+                     {"component": "k2", "selector": bottom}],
+            "value": {"value": 10.0}}}]})
+    return asm, added.get("id_map", {}).get("$0"), "k2"
+
+
+def _build_rotated_slider_assembly(tmp_path) -> tuple:
+    """90°-about-Z slider, listed as mate component_a, with a local-X force path."""
+    cube, faces = _bar_part("MotionRotatedSliderCube", 10, 10, 10, str(tmp_path))
+    asm = cb.call("doc_new", {"name": "MotionRotatedSlider", "kind": "assembly"})["doc_id"]
+
+    def rev():
+        return cb.call("doc_tree", {"doc_id": asm}).get("revision", 0)
+
+    cb.call("doc_apply_ops", {
+        "doc_id": asm, "base_revision": rev(), "with_tess": False,
+        "ops": [
+            {"op": "asm_insert_component", "source": {"path": cube},
+             "name": "Ground", "fixed": True},
+            {"op": "asm_insert_component", "source": {"path": cube},
+             "name": "RotatedSlider", "fixed": False,
+             "transform": [0, -1, 0, 0, 1, 0, 0, -15,
+                           0, 0, 1, 0, 0, 0, 0, 1]},
+        ]})
+    side = max(faces, key=lambda f: f.get("centroid", [0, 0, 0])[0])
+    ground_side = max(faces, key=lambda f: f.get("centroid", [0, 0, 0])[1])
+    moving_rail = max(faces, key=lambda f: f.get("centroid", [0, 0, 0])[1])
+    ground_rail = min(faces, key=lambda f: f.get("centroid", [0, 0, 0])[0])
+    top = max(faces, key=lambda f: f.get("centroid", [0, 0, 0])[2])
+    added = cb.call("doc_apply_ops", {
+        "doc_id": asm, "base_revision": rev(), "with_tess": False,
+        "ops": [
+            {"op": "asm_add_mate", "mate": {
+                "type": "distance", "align": "aligned", "suppressed": False,
+                # Selected moving component is deliberately ref0/component_a.
+                "refs": [{"component": "k2", "selector": side},
+                         {"component": "k1", "selector": ground_side}],
+                "value": {"value": 10.0}}},
+            {"op": "asm_add_mate", "mate": {
+                # Two orthogonal plane constraints eliminate the free in-plane
+                # translations and rotations left by the driven distance mate.
+                "type": "coincident", "align": "aligned", "suppressed": False,
+                "refs": [{"component": "k2", "selector": moving_rail},
+                         {"component": "k1", "selector": ground_rail}]}},
+            {"op": "asm_add_mate", "mate": {
+                "type": "coincident", "align": "aligned", "suppressed": False,
+                "refs": [{"component": "k2", "selector": top},
+                         {"component": "k1", "selector": top}]}},
+        ]})
+    return asm, added.get("id_map", {}).get("$0"), "k2"
 
 def test_simulate_motion_trajectory_and_swept_interference(tmp_path):
     """simulate_motion drives the angle mate 0->150 deg, returns a per-body trajectory whose
@@ -2220,23 +2297,20 @@ def test_simulate_motion_trajectory_and_swept_interference(tmp_path):
     assert pair == {"Arm", "Obstacle"}, f"unexpected clash pair {pair}: {inter}"
 
 
-def test_simulate_motion_restores_original_mate_value(tmp_path):
-    """A motion study is non-destructive: after the sweep the driven mate is back at its start
-    value and the assembly is where it began."""
+def test_simulate_motion_is_snapshot_read_only_and_loop_closes_exactly(tmp_path):
+    """Sweep/loop leaves revision, mate expression, transforms and whole tree untouched."""
     asm, mate_id, _ = _build_swinging_arm_assembly(tmp_path)
-
-    def mate_value():
-        mates = (cb.call("doc_tree", {"doc_id": asm}).get("tree") or {}).get("mates") or []
-        m = next(mm for mm in mates if mm.get("id") == mate_id)
-        v = m.get("value")
-        return v.get("value") if isinstance(v, dict) else v
-
-    assert mate_value() == 0.0
+    before = cb.call("doc_tree", {"doc_id": asm})
     r, _ = _call("simulate_motion", {"doc_id": asm, "mate_id": mate_id,
                                      "start": 0.0, "stop": 90.0, "steps": 7,
-                                     "check_interference": False})
+                                     "loop": True, "check_interference": False})
     assert r["ok"], r
-    assert mate_value() == 0.0, "driven mate must be restored to its original value after a study"
+    assert len(r["trajectory"]) == 8
+    assert r["trajectory"][-1]["value"] == 0.0
+    assert r["trajectory"][-1]["bodies"] == r["trajectory"][0]["bodies"]
+    after = cb.call("doc_tree", {"doc_id": asm})
+    assert after["revision"] == before["revision"]
+    assert after["tree"] == before["tree"]
 
 
 def test_simulate_motion_autopicks_single_drivable_mate(tmp_path):
@@ -2278,58 +2352,122 @@ def test_simulate_motion_kinematics_only_has_no_dynamics_key(tmp_path):
 
 
 def test_simulate_motion_dynamics_block(tmp_path):
-    """dynamics={} adds the rigid-body block: per-component mass from geometry x density,
-    per-frame joint reactions for the resolved mates (the angle drive + the parallel lock),
-    per_joint_worst + worst_case summaries (T-FIN20)."""
-    asm, mate_id, _ = _build_swinging_arm_assembly(tmp_path)
+    """A determinate slider produces balanced, non-zero N reactions and COM inertia."""
+    asm, mate_id, slider = _build_sliding_block_assembly(tmp_path)
     r, _ = _call("simulate_motion", {
-        "doc_id": asm, "mate_id": mate_id, "start": 0.0, "stop": 90.0, "steps": 8,
+        "doc_id": asm, "mate_id": mate_id, "start": 10.0, "stop": 20.0, "steps": 8,
         "check_interference": False,
         "dynamics": {"duration_s": 0.8, "default_density_g_cm3": 2.7,
                      "gravity": [0, 0, -9.81]}})
     assert r["ok"], r
     dyn = r.get("dynamics")
-    assert dyn, r
-    # Every non-pattern component got a mass (Bar 40x4x4 mm @2.7 = 1.728 g; Obstacle 2.7 g).
+    assert dyn and dyn["ok"] and dyn["force_path_resolved"], r
     masses = {b["component"]: b["mass_kg"] for b in dyn["bodies"]}
-    assert len(masses) == 3, masses
-    assert any(abs(m - 0.001728) < 1e-6 for m in masses.values()), masses
-    # Frames span duration_s and carry reactions for the resolved mates.
+    assert set(masses) == {"k1", slider}, masses
+    assert all(abs(m - 0.0027) < 1e-6 for m in masses.values()), masses
+    assert all(len(b["inertia_com_kg_m2"]) == 9 for b in dyn["bodies"])
     frames = dyn["frames"]
     assert len(frames) == len(r["trajectory"])
     assert abs(frames[-1]["t_s"] - 0.8) < 1e-9
-    mids = {x["mate_id"] for x in frames[0]["reactions"]}
-    assert mate_id in mids, (mids, dyn.get("warnings"))
-    assert dyn.get("worst_case"), dyn
-    assert dyn.get("per_joint_worst"), dyn
+    assert all(fr["balanced"] and fr["force_residual_n"] < 1e-8 for fr in frames)
+    reactions = [reaction for frame in frames for reaction in frame["reactions"]
+                 if reaction["mate_id"] == mate_id]
+    assert reactions and max(x["force_mag_n"] for x in reactions) > 0.0
+    assert dyn.get("worst_case") and dyn.get("per_joint_worst"), dyn
 
 
 def test_motion_fea_handoff_dry_run(tmp_path):
-    """motion_fea_handoff (dry_run): worst-case joint reactions become face loads on the
-    selected component and a VALID aicad.simhandoff/1 envelope (coupling motion_to_fea,
-    case-labelled conditions with provenance) is attached (T-FIN20)."""
+    """The grounded mate reaction is a boundary reaction, never a duplicate load."""
     from mcp_server import simhandoff as sh
 
-    asm, mate_id, arm = _build_swinging_arm_assembly(tmp_path)
+    asm, mate_id, slider = _build_sliding_block_assembly(tmp_path)
     r, _ = _call("motion_fea_handoff", {
-        "doc_id": asm, "component": arm, "fixtures": [{"of": "face", "pick": "largest"}],
-        "mate_id": mate_id, "start": 0.0, "stop": 90.0, "steps": 8,
+        "doc_id": asm, "component": slider, "fixtures": ["bottom"],
+        "body_load_face": "top",
+        "mate_id": mate_id, "start": 10.0, "stop": 20.0, "steps": 8,
         "dynamics": {"duration_s": 0.8, "default_density_g_cm3": 7.85},
         "dry_run": True})
     assert r["ok"], r
-    assert r["component"] == arm
-    assert r["part_doc_id"]
-    assert r["loads_applied"], r
+    assert r["component"] == slider and r["part_doc_id"]
+    setup = r["setup_diagnostics"]
+    assert setup["fixture_mate_id"] == mate_id
+    assert setup["fixture_reaction_omitted_from_loads"] is True
+    assert not any(load.get("mate_id") == mate_id for load in r["loads_applied"]), r
+    body_loads = [load for load in r["loads_applied"]
+                  if load["kind"] == "equivalent_body_inertial"]
+    assert len(body_loads) == 1, r
+    for load in r["loads_applied"]:
+        assert load["units"] == "N"
+        assert math.sqrt(sum(x * x for x in load["force"])) > 0.0
+        assert all(math.isfinite(x) for x in load["force"])
+    balance = r["balance_diagnostics"]
+    assert balance["body_load_representation_complete"] is True
+    assert balance["force_closure_residual_n"] < 1e-8, balance
+    assert balance["moment_closure_residual_nm"] < 1e-8, balance
+    omitted = balance["omitted_fixture_reaction"]["force_local_n"]
+    assert all(math.isclose(body_loads[0]["force"][i], -omitted[i],
+                            rel_tol=1e-9, abs_tol=1e-12)
+               for i in range(3)), (body_loads[0], omitted)
     env = r.get("simhandoff")
     assert env and env.get("coupling") == "motion_to_fea", env
     assert sh.validate_envelope(env) == [], sh.validate_envelope(env)
     conds = env["conditions"]
-    assert any(c["kind"] == "force" and c["units"] == "N" for c in conds), conds
-    assert all(c.get("case") for c in conds), conds
-    assert all("simulate_motion" in c["provenance"] for c in conds), conds
+    assert any(c["kind"] == "fixed_support" for c in conds), conds
+    assert any(c["kind"] == "equivalent_body_inertial_force" and c["units"] == "N"
+               for c in conds), conds
+    assert all(c.get("case") for c in conds)
     assert env["source"]["domain"] == "motion" and env["target"]["domain"] == "fea", env
-    # dry_run never solves.
     assert r["fea"] is None, r
+
+def test_motion_fea_handoff_uses_selected_body_sign_and_local_basis(tmp_path):
+    """The equivalent load closes the rotated body's omitted local fixture reaction."""
+    asm, mate_id, slider = _build_rotated_slider_assembly(tmp_path)
+    r, _ = _call("motion_fea_handoff", {
+        "doc_id": asm, "component": slider, "fixtures": ["right"],
+        "body_load_face": "left",
+        "mate_id": mate_id, "start": 10.0, "stop": 20.0, "steps": 7,
+        "dynamics": {"duration_s": 1.0, "gravity": [0, -9.81, 0]},
+        "dry_run": True})
+    assert r["ok"], r
+    load = next(ld for ld in r["loads_applied"]
+                if ld["kind"] == "equivalent_body_inertial")
+    local_force = load["force"]
+    fixture_force = r["balance_diagnostics"]["omitted_fixture_reaction"]["force_local_n"]
+    assert abs(local_force[0]) > 0.0 and abs(local_force[1]) < 1e-8, load
+    assert all(math.isclose(local_force[i], -fixture_force[i],
+                            rel_tol=1e-9, abs_tol=1e-10)
+               for i in range(3)), (load, fixture_force)
+    assert r["balance_diagnostics"]["force_closure_residual_n"] < 1e-8
+    assert r["balance_diagnostics"]["moment_closure_residual_nm"] < 1e-8
+
+
+def test_motion_fea_handoff_requires_body_resultant_face(tmp_path):
+    """A balanced motion frame is incomplete for static FEA without its body load."""
+    asm, mate_id, slider = _build_sliding_block_assembly(tmp_path)
+    r, _ = _call("motion_fea_handoff", {
+        "doc_id": asm, "component": slider, "fixtures": ["bottom"],
+        "mate_id": mate_id, "start": 10.0, "stop": 20.0, "steps": 7,
+        "dynamics": {"duration_s": 1.0},
+        "dry_run": True})
+    assert r["ok"] is False, r
+    assert "body_load_face is required" in r["error"], r
+    assert r["required_body_load"]["force_local_n"], r
+    assert r["balance_diagnostics"]["body_load_representation_complete"] is False
+
+
+def test_motion_fea_handoff_refuses_fixture_unrelated_to_grounded_mate(tmp_path):
+    """A fixed face cannot stand in for a different joint's reaction by guesswork."""
+    asm, mate_id, slider = _build_sliding_block_assembly(tmp_path)
+    r, _ = _call("motion_fea_handoff", {
+        "doc_id": asm, "component": slider, "fixtures": ["top"],
+        "body_load_face": "bottom",
+        "fixture_mate_id": mate_id,
+        "mate_id": mate_id, "start": 10.0, "stop": 20.0, "steps": 7,
+        "dynamics": {"duration_s": 1.0},
+        "dry_run": True})
+    assert r["ok"] is False, r
+    assert "fixture face must identify exactly one solved mate" in r["error"], r
+    assert r["setup_diagnostics"]["fixture_mate_candidates"] == []
 
 
 # ================================================================ W2 hole-frame determinism

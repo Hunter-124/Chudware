@@ -119,28 +119,62 @@ def build_case(case_dir: str, stl_path: str,
     The part wall carries the chosen thermal BC; everything else (mesh, domain, turbulence)
     matches the aero case so results are comparable.
     """
-    pre = _PRESETS.get(preset, _PRESETS["coarse"])
+    if preset not in _PRESETS:
+        raise ValueError(f"unknown OpenFOAM preset {preset!r}")
+    pre = _PRESETS[preset]
     case = Path(case_dir)
 
-    # Fluid props (mirror lbm defaults).
+    vals = np.asarray([speed_mps, aoa_deg, sideslip_deg, ref_area_mm2], dtype=np.float64)
+    if not np.isfinite(vals).all() or float(speed_mps) <= 0.0 or float(ref_area_mm2) < 0.0:
+        raise ValueError("speed must be positive; angles and reference area must be finite")
+    speed_mps = float(speed_mps)
+    aoa_deg = float(aoa_deg)
+    sideslip_deg = float(sideslip_deg)
+    ref_area_mm2 = float(ref_area_mm2)
+    d = np.asarray(direction, dtype=np.float64)
+    if d.shape != (3,) or not np.isfinite(d).all() or np.linalg.norm(d) <= 1e-12:
+        raise ValueError("direction must be a finite non-zero 3-vector")
+    if isinstance(n_proc, bool) or int(n_proc) != n_proc or int(n_proc) < 1:
+        raise ValueError("n_proc must be a positive integer")
+    n_proc = int(n_proc)
+    if max_iters is not None:
+        if isinstance(max_iters, bool) or int(max_iters) != max_iters or int(max_iters) <= 0:
+            raise ValueError("max_iters must be a positive integer")
+        max_iters = int(max_iters)
+
+    # Fluid props (mirror lbm defaults); explicit bad values are never replaced silently.
     f = {"density_kgm3": 1.225, "kinematic_visc_m2s": 1.5e-5}
-    if fluid:
+    if fluid is not None:
+        if not isinstance(fluid, dict):
+            raise ValueError("fluid must be a mapping")
         f.update({k: v for k, v in fluid.items() if v is not None})
-    rho = float(f["density_kgm3"]) or 1.225
-    nu = float(f["kinematic_visc_m2s"]) or 1.5e-5
+    rho = float(f["density_kgm3"])
+    nu = float(f["kinematic_visc_m2s"])
+    if not math.isfinite(rho) or rho <= 0.0 or not math.isfinite(nu) or nu <= 0.0:
+        raise ValueError("fluid density and kinematic viscosity must be positive and finite")
+    if thermal is not None and not isinstance(thermal, dict):
+        raise ValueError("thermal must be a mapping")
 
     # Flow direction (base + AoA + sideslip), then align part so flow -> +X.
-    flow_dir = _compose_flow_dir(np.asarray(direction, float), aoa_deg, sideslip_deg)
+    flow_dir = _compose_flow_dir(d, float(aoa_deg), float(sideslip_deg))
     world_mesh = trimesh.load(stl_path, force="mesh")
     if not isinstance(world_mesh, trimesh.Trimesh):
         raise ValueError("STL did not load as a single mesh")
+    if world_mesh.vertices.size == 0 or world_mesh.faces.size == 0:
+        raise ValueError("STL contains no triangles")
+    if not np.isfinite(world_mesh.vertices).all():
+        raise ValueError("STL contains non-finite vertices")
+    if not world_mesh.is_watertight:
+        raise ValueError("STL must be watertight for snappyHexMesh")
     aligned, R = _align_to_x(world_mesh, flow_dir)     # rotation about origin (mm)
 
     bb_min, bb_max = aligned.bounds                    # mm
     size = bb_max - bb_min                             # mm
     longest = float(np.max(size))
+    if not math.isfinite(longest) or longest <= 1e-9:
+        raise ValueError("STL has a degenerate bounding box")
     char_len_m = longest * 1e-3
-    reynolds = speed_mps * char_len_m / nu
+    reynolds = float(speed_mps) * char_len_m / nu
 
     # Domain padding (mm) — same convention as the LBM wind tunnel.
     up = max(longest, 10.0)
@@ -154,6 +188,8 @@ def build_case(case_dir: str, stl_path: str,
     # aligned mesh (flow is +X), in mm².  Robust union area via trimesh's 2D projection.
     frontal_mm2 = _projected_area_mm2(aligned)
     ref_mm2 = ref_area_mm2 if ref_area_mm2 > 0 else frontal_mm2
+    if not math.isfinite(frontal_mm2) or frontal_mm2 <= 0.0:
+        raise ValueError("flow-aligned geometry has zero/non-finite projected area")
     aref_m2 = max(ref_mm2 * 1e-6, 1e-9)
 
     # --- constant/triSurface/part.stl : aligned + scaled to metres ---
@@ -184,12 +220,28 @@ def build_case(case_dir: str, stl_path: str,
            0.5 * (box_min_m[2] + box_max_m[2]))
 
     iters = pre["iters"]
-    # Optional solver-iteration cap (mirrors lbm.run_wind_tunnel's max_steps): endTime and
-    # the write interval both follow the clamped count, so a capped case still writes its
-    # final fields. Used by smoke tests/benches to bound a live solve's wall clock.
-    if max_iters is not None and max_iters > 0:
-        iters = min(iters, int(max_iters))
+    if max_iters is not None:
+        iters = min(iters, max_iters)
     th = thermal if (thermal and thermal.get("enabled")) else None
+    if th is not None:
+        mode = str(th.get("wall_mode", "temp"))
+        inlet_c = float(th.get("inlet_temp_c", 20.0))
+        if (mode not in {"temp", "flux", "power"} or not math.isfinite(inlet_c) or
+                inlet_c <= -273.15):
+            raise ValueError("thermal wall_mode must be valid and inlet temperature above 0 K")
+        if mode == "temp":
+            wall_c = float(th.get("wall_temp_c", 80.0))
+            if not math.isfinite(wall_c) or wall_c <= -273.15 or wall_c == inlet_c:
+                raise ValueError(
+                    "fixed-temperature thermal case needs temperatures above 0 K and a delta")
+        elif mode == "flux":
+            qwall = float(th.get("wall_flux_w_m2", 0.0))
+            if not math.isfinite(qwall) or qwall == 0.0:
+                raise ValueError("wall heat-flux thermal case needs a finite non-zero flux")
+        else:
+            power = float(th.get("wall_power_w", 0.0))
+            if not math.isfinite(power) or power == 0.0:
+                raise ValueError("wall-power thermal case needs finite non-zero power")
 
     # ---- mesh dicts (identical for aero and thermal) ----
     _write_blockmesh(case, box_min_m, box_max_m, nx, ny, nz)
@@ -388,6 +440,12 @@ def _write_control_dict(case: Path, iters, rho, u, aref_m2, lref_m) -> None:
         "        CofR            (0 0 0);\n        pitchAxis       (0 1 0);\n"
         f"        magUInf         {u:.6g};\n        lRef            {lref_m:.6g};\n"
         f"        Aref            {aref_m2:.6g};\n    }}\n"
+        "    forces\n    {\n        type            forces;\n"
+        "        libs            (\"libforces.so\");\n        writeControl    timeStep;\n"
+        "        writeInterval   1;\n        patches         (part);\n"
+        "        rho             rhoInf;\n"
+        f"        rhoInf          {rho:.6g};\n"
+        "        CofR            (0 0 0);\n    }\n"
         "}\n"
     )
     _w(case / "system" / "controlDict", body)
@@ -454,7 +512,7 @@ def _write_fields(case: Path, u, k0, omega0, nut0) -> None:
        "boundaryField\n{\n"
        "    inlet   { type zeroGradient; }\n"
        "    outlet  { type fixedValue; value uniform 0; }\n"
-       "    sides   { type slip; }\n"
+       "    sides   { type zeroGradient; }\n"
        "    part    { type zeroGradient; }\n}\n")
     # k
     _w(z / "k", _header("volScalarField", "k", "0") +
@@ -463,7 +521,7 @@ def _write_fields(case: Path, u, k0, omega0, nut0) -> None:
        "boundaryField\n{\n"
        f"    inlet   {{ type fixedValue; value uniform {k0:.6g}; }}\n"
        f"    outlet  {{ type inletOutlet; inletValue uniform {k0:.6g}; value uniform {k0:.6g}; }}\n"
-       "    sides   { type slip; }\n"
+       "    sides   { type zeroGradient; }\n"
        f"    part    {{ type kqRWallFunction; value uniform {k0:.6g}; }}\n}}\n")
     # omega
     _w(z / "omega", _header("volScalarField", "omega", "0") +
@@ -472,7 +530,7 @@ def _write_fields(case: Path, u, k0, omega0, nut0) -> None:
        "boundaryField\n{\n"
        f"    inlet   {{ type fixedValue; value uniform {omega0:.6g}; }}\n"
        f"    outlet  {{ type inletOutlet; inletValue uniform {omega0:.6g}; value uniform {omega0:.6g}; }}\n"
-       "    sides   { type slip; }\n"
+       "    sides   { type zeroGradient; }\n"
        f"    part    {{ type omegaWallFunction; value uniform {omega0:.6g}; }}\n}}\n")
     # nut
     _w(z / "nut", _header("volScalarField", "nut", "0") +
@@ -640,7 +698,7 @@ def _write_fields_thermal(case: Path, u, k0, omega0, nut0, inlet_t, wall_mode,
        "boundaryField\n{\n"
        f"    inlet   {{ type fixedValue; value uniform {k0:.6g}; }}\n"
        f"    outlet  {{ type inletOutlet; inletValue uniform {k0:.6g}; value uniform {k0:.6g}; }}\n"
-       "    sides   { type slip; }\n"
+       "    sides   { type zeroGradient; }\n"
        f"    part    {{ type kqRWallFunction; value uniform {k0:.6g}; }}\n}}\n")
     # omega
     _w(z / "omega", _header("volScalarField", "omega", "0") +
@@ -648,7 +706,7 @@ def _write_fields_thermal(case: Path, u, k0, omega0, nut0, inlet_t, wall_mode,
        "boundaryField\n{\n"
        f"    inlet   {{ type fixedValue; value uniform {omega0:.6g}; }}\n"
        f"    outlet  {{ type inletOutlet; inletValue uniform {omega0:.6g}; value uniform {omega0:.6g}; }}\n"
-       "    sides   { type slip; }\n"
+       "    sides   { type zeroGradient; }\n"
        f"    part    {{ type omegaWallFunction; value uniform {omega0:.6g}; }}\n}}\n")
     # nut
     _w(z / "nut", _header("volScalarField", "nut", "0") +

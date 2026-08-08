@@ -14,9 +14,9 @@
 namespace chudware::firmware {
 
 // Build a validated aicad.fwscenario/1 dict from a FlightProfile / trajectory
-// dict / CFD summary + sensor map. Throws std::invalid_argument /
-// std::runtime_error on malformed input (the RPC maps these to
-// invalid_request, like Python's TypeError/ValueError).
+// dict / CFD summary + sensor map. Time inputs are seconds; generated track times
+// are milliseconds. Invalid/non-finite setup and outputs above 10000 samples throw
+// std::invalid_argument / std::runtime_error before track allocation.
 nlohmann::json build_sensor_scenario(const nlohmann::json& sim_result_or_profile,
                                      const nlohmann::json& sensor_map,
                                      const nlohmann::json& duration_s,  // null → profile span

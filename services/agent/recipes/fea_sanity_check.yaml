@@ -3,17 +3,22 @@ id: fea_sanity_check
 title: FEA sanity check
 domains: [sim]
 keywords: [FEA, stress, static, mesh, fixture, anchor]
-summary: Anchor, one load case, static FEA, compare to closed-form.
+summary: Define one load case, anchor it, run two real meshes, and report a supported margin.
 steps:
-  - tool: set_material
-    note: Registry material.
+  - tool: research_material_lookup
+    note: Choose a sourced registry material for the solver material= argument; set_material is appearance only.
+  - tool: query_geometry
+    note: Resolve the mounted and loaded face queries before solving.
   - tool: research_eng_calc
-    note: Closed-form anchor; ledger expected stress.
-  - tool: describe_part
-    note: Name fixture and load faces.
+    note: Record a justified closed-form anchor in MPa/mm, or explicitly record no anchor.
   - tool: run_fea_static
-    note: One load case; coarse mesh first.
+    note: First pass; fixtures react one non-zero load (force N or pressure MPa), mesh_fineness=0.5.
+  - tool: run_fea_static
+    note: Refinement pass at mesh_fineness=0.75 with the identical setup.
   - tool: describe_results
-    note: Compare to anchor within ~2-3x.
+    note: Compare governing stress/deflection; require <10% change or an independent anchor before PASS.
 verify:
-  - anchor recorded
+  - criterion, units, load case, and material argument recorded
+  - result is ok and backend did not skip/fail
+  - mesh sizes/element counts and convergence comparison recorded
+  - margin uses allowable=yield/SF; no unsupported yielding/fracture claim

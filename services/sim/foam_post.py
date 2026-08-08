@@ -2,8 +2,8 @@
 
 Reads the converged case with pyvista's native OpenFOAM reader (no foamToVTK hop) and:
 
-* parses ``postProcessing/forceCoeffs/.../coefficient.dat`` for Cd / Cl, turning them into
-  drag / lift forces via the same reference area the UI passed;
+* parses ``forceCoeffs`` for Cd / Cl and ``forces`` for the resolved side force,
+  never replacing missing solver output with a fabricated zero;
 * maps the part-patch kinematic pressure to a per-vertex Cp on the world-space surface and
   packs it as the ``pressure_cp`` SCLR chunk;
 * integrates a few forward streamlines through the volume and packs them as a ``streamlines``
@@ -16,6 +16,7 @@ The overlay AICM is written with the *same* tessellate helpers the LBM overlay u
 from __future__ import annotations
 
 import math
+import re
 import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -27,47 +28,164 @@ from services.sim.foam_case import CaseInfo
 
 # --------------------------------------------------------------------------- forces
 
-def parse_coefficients(case_dir: str) -> Tuple[float, float]:
-    """Return (Cd, Cl) from the last row of the forceCoeffs coefficient.dat.
+def parse_coefficients(case_dir: str, expected_time: Optional[float] = None) -> Tuple[float, float]:
+    """Return finite (Cd, Cl) from the newest forceCoeffs row.
 
-    coefficient.dat columns: time  Cd  Cd(f)  Cd(r)  Cl  Cl(f)  Cl(r)  Cm...  (ESI v2412).
-    Falls back to (0, 0) if the file is missing/empty.
+    Missing, malformed, stale or non-finite force output is a failed solve, never a zero-force
+    success. ``expected_time`` pins the row to the solver iteration observed on stdout.
     """
     pp = Path(case_dir) / "postProcessing"
-    dats = list(pp.glob("forceCoeffs*/**/coefficient.dat")) or list(pp.glob("**/coefficient.dat"))
+    dats = sorted(pp.glob("forceCoeffs*/**/coefficient.dat"))
     if not dats:
-        return 0.0, 0.0
-    last = None
-    for line in dats[0].read_text(errors="ignore").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        last = line
-    if not last:
-        return 0.0, 0.0
-    cols = last.split()
-    try:
-        cd = float(cols[1])
-        cl = float(cols[4])
-        return cd, cl
-    except (IndexError, ValueError):
-        return 0.0, 0.0
+        dats = sorted(pp.glob("**/coefficient.dat"))
+    rows: List[Tuple[float, float, float]] = []
+    seen_times: List[float] = []
+    for dat in dats:
+        cd_col: Optional[int] = None
+        cl_col: Optional[int] = None
+        for line in dat.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                header = line.lstrip("#").split()
+                if header and header[0].lower() == "time":
+                    try:
+                        cd_col = header.index("Cd")
+                        cl_col = header.index("Cl")
+                    except ValueError:
+                        cd_col = cl_col = None
+                continue
+            cols = line.split()
+            try:
+                time_value = float(cols[0])
+            except (IndexError, ValueError):
+                continue
+            if not math.isfinite(time_value):
+                continue
+            seen_times.append(time_value)
+            if cd_col is None or cl_col is None:
+                continue
+            try:
+                cd, cl = float(cols[cd_col]), float(cols[cl_col])
+            except (IndexError, ValueError):
+                continue
+            if math.isfinite(cd) and math.isfinite(cl):
+                rows.append((time_value, cd, cl))
+    if not rows:
+        raise ValueError("forceCoeffs produced no finite coefficient rows")
+    time_value, cd, cl = max(rows, key=lambda row: row[0])
+    if seen_times and time_value + 1e-9 < max(seen_times):
+        raise ValueError("latest forceCoeffs row is malformed or non-finite")
+    if expected_time is not None:
+        expected = float(expected_time)
+        if not math.isfinite(expected) or time_value + 1e-9 < expected:
+            raise ValueError(
+                f"forceCoeffs output is stale (latest {time_value}, solver reached {expected})")
+    return cd, cl
+
+_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+_FORCE_ROW = re.compile(
+    rf"^\s*({_NUMBER})\s+\(\(\s*({_NUMBER})\s+({_NUMBER})\s+({_NUMBER})\s*\)"
+    rf"\s*\(\s*({_NUMBER})\s+({_NUMBER})\s+({_NUMBER})\s*\)"
+    rf"(?:\s*\(\s*({_NUMBER})\s+({_NUMBER})\s+({_NUMBER})\s*\))?\s*\)"
+)
+
+
+def parse_forces(case_dir: str, expected_time: Optional[float] = None) -> Tuple[float, float, float]:
+    """Return the newest finite total (drag, side, lift) force vector in case axes."""
+    pp = Path(case_dir) / "postProcessing"
+    dats = sorted(pp.glob("forces*/**/force*.dat"))
+    if not dats:
+        dats = sorted(pp.glob("**/force*.dat"))
+    rows: List[Tuple[float, float, float, float]] = []
+    seen_times: List[float] = []
+    for dat in dats:
+        total_cols: Optional[Tuple[int, int, int]] = None
+        for line in dat.read_text(errors="ignore").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                header = stripped.lstrip("#").split()
+                if header and header[0].lower() == "time":
+                    try:
+                        total_cols = (
+                            header.index("total_x"),
+                            header.index("total_y"),
+                            header.index("total_z"),
+                        )
+                    except ValueError:
+                        total_cols = None
+                continue
+            try:
+                seen_time = float(stripped.split(maxsplit=1)[0])
+                if math.isfinite(seen_time):
+                    seen_times.append(seen_time)
+            except (IndexError, ValueError):
+                pass
+            if total_cols is not None:
+                cols = stripped.split()
+                try:
+                    values = (
+                        float(cols[0]),
+                        float(cols[total_cols[0]]),
+                        float(cols[total_cols[1]]),
+                        float(cols[total_cols[2]]),
+                    )
+                except (IndexError, ValueError):
+                    continue
+                if all(math.isfinite(value) for value in values):
+                    rows.append(values)
+                continue
+            match = _FORCE_ROW.match(line)
+            if match is None:
+                continue
+            values = [float(value) if value is not None else 0.0
+                      for value in match.groups()]
+            time_value = values[0]
+            force = (
+                values[1] + values[4] + values[7],
+                values[2] + values[5] + values[8],
+                values[3] + values[6] + values[9],
+            )
+            if math.isfinite(time_value) and all(math.isfinite(value) for value in force):
+                rows.append((time_value, *force))
+    if not rows:
+        raise ValueError("forces produced no finite force rows")
+    time_value, drag_n, side_n, lift_n = max(rows, key=lambda row: row[0])
+    if seen_times and time_value + 1e-9 < max(seen_times):
+        raise ValueError("latest forces row is malformed or non-finite")
+    if expected_time is not None:
+        expected = float(expected_time)
+        if not math.isfinite(expected) or time_value + 1e-9 < expected:
+            raise ValueError(
+                f"forces output is stale (latest {time_value}, solver reached {expected})")
+    return drag_n, side_n, lift_n
 
 
 # --------------------------------------------------------------------------- pyvista read
 
-def _read_case(case_dir: str):
-    """Open the case at its last time step.  Returns (internalMesh, {patch: poly})."""
+def _read_case(case_dir: str, expected_time: Optional[float] = None):
+    """Open the case at its current final time; return (internalMesh, {patch: poly})."""
     import pyvista as pv
 
     foam = Path(case_dir) / "case.foam"
     if not foam.exists():
         foam.write_text("")
     reader = pv.OpenFOAMReader(str(foam))
-    if reader.time_values:
-        reader.set_active_time_value(reader.time_values[-1])
+    times = [float(t) for t in reader.time_values if math.isfinite(float(t))]
+    if not times:
+        raise ValueError("OpenFOAM case contains no finite result time")
+    latest = max(times)
+    if expected_time is not None and latest + 1e-9 < float(expected_time):
+        raise ValueError(
+            f"OpenFOAM fields are stale (latest {latest}, solver reached {expected_time})")
+    reader.set_active_time_value(latest)
     reader.cell_to_point_creation = True
     ds = reader.read()
+    if "internalMesh" not in ds.keys():
+        raise ValueError("OpenFOAM result has no internalMesh")
     internal = ds["internalMesh"]
     patches = {}
     if "boundary" in ds.keys():
@@ -95,26 +213,28 @@ def _cp_on_surface(world_verts_mm: np.ndarray, info: CaseInfo, part_poly, q_kin:
     return (_sample_on_surface(world_verts_mm, info, part_poly, p_kin) / max(q_kin, 1e-9)).astype(np.float32)
 
 
-def parse_wall_heat_flux(case_dir: str):
-    """Total wall heat flow (W) from the wallHeatFlux function object, or None."""
+def parse_wall_heat_flux(case_dir: str, expected_time: Optional[float] = None):
+    """Return finite total wall heat flow from the newest current output row, or None."""
     pp = Path(case_dir) / "postProcessing"
-    dats = list(pp.glob("wallHeatFlux*/**/wallHeatFlux.dat"))
-    if not dats:
+    dats = sorted(pp.glob("wallHeatFlux*/**/wallHeatFlux.dat"))
+    rows: List[Tuple[float, float]] = []
+    for dat in dats:
+        for line in dat.read_text(errors="ignore").splitlines():
+            cols = line.strip().split()
+            if not cols or cols[0].startswith("#"):
+                continue
+            try:
+                time_value, heat = float(cols[0]), float(cols[-1])
+            except (IndexError, ValueError):
+                continue
+            if math.isfinite(time_value) and math.isfinite(heat):
+                rows.append((time_value, heat))
+    if not rows:
         return None
-    last = None
-    for line in dats[0].read_text(errors="ignore").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        last = s
-    if not last:
+    time_value, heat = max(rows, key=lambda row: row[0])
+    if expected_time is not None and time_value + 1e-9 < float(expected_time):
         return None
-    # columns: Time patch min max integral  (integral = total heat flow in W)
-    cols = last.split()
-    try:
-        return float(cols[-1])
-    except (IndexError, ValueError):
-        return None
+    return heat
 
 
 def _streamlines(internal, info: CaseInfo, n_seeds: int = 60
@@ -180,27 +300,29 @@ def build_overlay(stl_path: str, info: CaseInfo, internal, patches,
     scalar_fields: List[str] = []
     part = patches.get(info.part_patch)
 
+    if part is None:
+        raise ValueError(f"OpenFOAM result is missing boundary patch {info.part_patch!r}")
     if info.thermal:
-        if part is not None and "T" in part.point_data:
-            try:
-                t_c = _sample_on_surface(surf, info, part,
-                                         np.asarray(part.point_data["T"], dtype=np.float64) - 273.15)
-                lo, hi = (temp_range or (float(t_c.min()), float(t_c.max())))
-                chunks.append(tess.scalar_chunk(1, "temperature", t_c.astype(np.float32),
-                                                vmin=lo, vmax=hi))
-                scalar_fields.append("temperature")
-            except Exception:
-                pass
+        if "T" not in part.point_data:
+            raise ValueError("OpenFOAM thermal result is missing wall temperature")
+        t_c = _sample_on_surface(
+            surf, info, part, np.asarray(part.point_data["T"], dtype=np.float64) - 273.15)
+        if not np.isfinite(t_c).all():
+            raise ValueError("OpenFOAM wall temperature contains non-finite values")
+        lo, hi = (temp_range or (float(t_c.min()), float(t_c.max())))
+        chunks.append(tess.scalar_chunk(1, "temperature", t_c.astype(np.float32),
+                                        vmin=lo, vmax=hi))
+        scalar_fields.append("temperature")
     else:
+        if "p" not in part.point_data:
+            raise ValueError("OpenFOAM aero result is missing wall pressure")
         q_kin = 0.5 * info.speed_mps * info.speed_mps
-        if part is not None and "p" in part.point_data:
-            try:
-                cp = np.clip(_cp_on_surface(surf, info, part, q_kin), cp_min, cp_max)
-                chunks.append(tess.scalar_chunk(1, "pressure_cp", cp, vmin=cp_min, vmax=cp_max))
-                scalar_fields.append("pressure_cp")
-            except Exception:
-                pass
-
+        cp = _cp_on_surface(surf, info, part, q_kin)
+        if not np.isfinite(cp).all():
+            raise ValueError("OpenFOAM wall pressure contains non-finite values")
+        cp = np.clip(cp, cp_min, cp_max)
+        chunks.append(tess.scalar_chunk(1, "pressure_cp", cp, vmin=cp_min, vmax=cp_max))
+        scalar_fields.append("pressure_cp")
     sl_pts, sl_spd, _ = _streamlines(internal, info)
     if sl_pts:
         ch = ov.streamlines_chunk(sl_pts, sl_spd)
@@ -245,7 +367,7 @@ def _xyz_and_T(ds):
     return None, None
 
 
-def postprocess_cht(case_dir: str, stl_path: str, info):
+def postprocess_cht(case_dir: str, stl_path: str, info, residual: Optional[float] = None):
     """Assemble a FlowResult from a finished chtMultiRegionFoam (CHT) run.
 
     Reads the solid region temperature (foamToVTK export), reports the part's hot/mean
@@ -270,8 +392,11 @@ def postprocess_cht(case_dir: str, stl_path: str, info):
         solid = _read_vtm_combined(cd / "VTK" / reg)
         xyz, Tsolid = _xyz_and_T(solid)
         if Tsolid is None or not Tsolid.size:
-            per_region.append(f"{reg}: no data")
-            continue
+            raise ValueError(f"CHT output for region {reg!r} has no temperature field")
+        if (xyz is None or not np.isfinite(xyz).all() or not np.isfinite(Tsolid).all() or
+                np.any(Tsolid <= 0.0)):
+            raise ValueError(
+                f"CHT output for region {reg!r} contains non-finite/incomplete/unphysical data")
         Tc = Tsolid - 273.15
         rmin, rmax, rmean = float(Tc.min()), float(Tc.max()), float(Tc.mean())
         per_region.append(f"{reg}: {rmean:.0f} C mean, {rmax:.0f} C peak")
@@ -285,6 +410,9 @@ def postprocess_cht(case_dir: str, stl_path: str, info):
             all_xyz.append(xyz)
             all_T.append(Tsolid)
 
+    all_tc = np.concatenate(all_T) - 273.15
+    t_min, t_max, t_mean = (float(all_tc.min()), float(all_tc.max()),
+                            float(all_tc.mean()))
     # Surface temperature overlay: map the solids' outer-surface (boundary patch) T onto the
     # world STL vertices.  Prefer the boundary patches; fall back to the solid cell fields.
     bt = ov._tessellate_stl_world(stl_path)
@@ -313,18 +441,20 @@ def postprocess_cht(case_dir: str, stl_path: str, info):
         src_T = np.concatenate(all_T)
     else:
         src_xyz, src_T = None, None
-    try:
-        if src_xyz is not None and src_T.size:
-            from scipy.spatial import cKDTree
-            Tc_b = src_T - 273.15
-            tree = cKDTree(src_xyz)
-            _, idx = tree.query(info.world_mm_to_case_m(surf), k=1)
-            t_surf = Tc_b[idx].astype(np.float32)
-            lo, hi = float(min(Tin_c, t_surf.min())), float(max(t_surf.max(), Tin_c + 1.0))
-            chunks.append(tess.scalar_chunk(1, "temperature", t_surf, vmin=lo, vmax=hi))
-            scalar_fields.append("temperature")
-    except Exception:
-        pass
+    if src_xyz is None or src_T is None or not src_T.size:
+        raise ValueError("CHT output has no surface or volume temperature samples")
+    if not np.isfinite(src_xyz).all() or not np.isfinite(src_T).all():
+        raise ValueError("CHT temperature handoff contains non-finite samples")
+    from scipy.spatial import cKDTree
+    Tc_b = src_T - 273.15
+    tree = cKDTree(src_xyz)
+    _, idx = tree.query(info.world_mm_to_case_m(surf), k=1)
+    t_surf = Tc_b[idx].astype(np.float32)
+    if not np.isfinite(t_surf).all():
+        raise ValueError("CHT surface interpolation produced non-finite temperatures")
+    lo, hi = float(min(Tin_c, t_surf.min())), float(max(t_surf.max(), Tin_c + 1.0))
+    chunks.append(tess.scalar_chunk(1, "temperature", t_surf, vmin=lo, vmax=hi))
+    scalar_fields.append("temperature")
 
     with tempfile.NamedTemporaryFile(suffix=".aicm", delete=False) as tf:
         overlay_path = tf.name
@@ -334,9 +464,16 @@ def postprocess_cht(case_dir: str, stl_path: str, info):
     re_note = (f"OpenFOAM CHT (conjugate) - Re {info.reynolds:,.0f}; {info.power_w:.1f} W in {what} "
                f"(k={info.solid_kappa:.0f} W/mK), inlet {Tin_c:.0f} C -> part {t_mean:.0f} C "
                f"(peak {t_max:.0f} C).")
-    notes = [f"chtMultiRegionFoam coupled solid+fluid; solid temperature {t_min:.0f}-{t_max:.0f} C."]
-    if len(regions) > 1:
-        notes.append("per-region: " + "; ".join(per_region) + ".")
+    residual_note = (
+        f"final coupled residual {float(residual):.3g} met the 1e-3 acceptance gate"
+        if residual is not None and math.isfinite(float(residual)) and float(residual) >= 0.0
+        else "final coupled residual was not reported")
+    notes = [
+        f"chtMultiRegionFoam physics-derived transient horizon {info.end_time:.4g} s "
+        f"completed; {residual_note}.",
+        "per-region: " + "; ".join(per_region) + ".",
+        f"solid temperature {t_min:.0f}-{t_max:.0f} C.",
+    ]
     return FlowResult(
         drag_n=0.0, lift_n=0.0, cd=0.0, frontal_area_mm2=info.frontal_area_mm2,
         reynolds_note=re_note, trace=[], slices=[], slice_transforms=[],
@@ -344,47 +481,71 @@ def postprocess_cht(case_dir: str, stl_path: str, info):
         diverged=False, steps_run=0, side_n=0.0, cl=0.0, ld=0.0, reynolds=info.reynolds,
         ref_area_mm2=info.frontal_area_mm2, cp_min=t_min, cp_max=t_max, vmax_mps=info.speed_mps,
         solver_notes=notes, overlay_path=overlay_path, scalar_fields=scalar_fields,
+        converged=True, residual=float(residual if residual is not None else -1.0),
+        mass_imbalance=-1.0,
     )
 
 
 def postprocess(case_dir: str, stl_path: str, info: CaseInfo, converged: bool,
-                solver_notes: Optional[List[str]] = None):
-    """Assemble a FlowResult from a finished OpenFOAM run."""
+                solver_notes: Optional[List[str]] = None,
+                expected_time: Optional[float] = None):
+    """Assemble a FlowResult from a current, converged OpenFOAM run."""
     from services.sim.lbm import FlowResult
+    if not converged:
+        raise ValueError("OpenFOAM solver did not converge")
 
-    internal, patches = _read_case(case_dir)
+    actual_steps = (int(round(float(expected_time)))
+                    if expected_time is not None and math.isfinite(float(expected_time))
+                    else 0)
+    internal, patches = _read_case(case_dir, expected_time=expected_time)
     part = patches.get(info.part_patch)
-    U = np.asarray(internal.point_data.get("U", np.zeros((1, 3))), dtype=np.float64)
-    vmax = float(np.linalg.norm(U, axis=1).max()) if U.size else info.speed_mps
+    if info.part_patch not in patches:
+        raise ValueError(f"OpenFOAM result is missing boundary patch {info.part_patch!r}")
+    part = patches[info.part_patch]
+    if "U" not in internal.point_data:
+        raise ValueError("OpenFOAM result is missing velocity field U")
+    U = np.asarray(internal.point_data["U"], dtype=np.float64)
+    if U.ndim != 2 or U.shape[1] != 3 or not U.size or not np.isfinite(U).all():
+        raise ValueError("OpenFOAM velocity field is empty or non-finite")
+    vmax = float(np.linalg.norm(U, axis=1).max())
     notes = list(solver_notes or [])
-    conv = "converged" if converged else "did not fully converge"
 
     if info.thermal:
         # Temperature legend (degC) from the part wall.
         t_lo, t_hi = info.inlet_temp_k - 273.15, info.inlet_temp_k - 273.15 + 1.0
-        if part is not None and "T" in part.point_data:
-            t_c = np.asarray(part.point_data["T"], dtype=np.float64) - 273.15
-            if t_c.size:
-                t_lo, t_hi = float(t_c.min()), float(t_c.max())
-        heat_w = parse_wall_heat_flux(case_dir)
+        if "T" not in part.point_data:
+            raise ValueError("OpenFOAM thermal result is missing wall temperature")
+        t_c = np.asarray(part.point_data["T"], dtype=np.float64) - 273.15
+        if (not t_c.size or not np.isfinite(t_c).all() or
+                np.any(t_c <= -273.15)):
+            raise ValueError("OpenFOAM wall temperature is empty, non-finite, or below 0 K")
+        heat_w = parse_wall_heat_flux(case_dir, expected_time=expected_time)
+        if heat_w is None or not math.isfinite(heat_w):
+            raise ValueError("wallHeatFlux produced no finite current result")
         overlay_path, scalar_fields, sl_pts, sl_spd = build_overlay(
             stl_path, info, internal, patches, -1.0, 1.0, temp_range=(t_lo, t_hi))
-        heat_txt = f", wall heat flow {heat_w:.1f} W" if heat_w is not None else ""
+        heat_txt = f", wall heat flow {heat_w:.1f} W"
         re_note = (f"OpenFOAM buoyant RANS - Re {info.reynolds:,.0f}; inlet "
                    f"{info.inlet_temp_k - 273.15:.0f} C; surface T {t_lo:.0f}-{t_hi:.0f} C{heat_txt}.")
-        notes.append(f"OpenFOAM {info.iters}-iter buoyant RANS (k-omega SST, heat transfer); {conv}.")
+        notes.append(
+            f"OpenFOAM buoyant RANS converged after {actual_steps} SIMPLE iterations "
+            f"(cap {info.iters}; k-omega SST, heat transfer).")
         return FlowResult(
             drag_n=0.0, lift_n=0.0, cd=0.0, frontal_area_mm2=info.frontal_area_mm2,
             reynolds_note=re_note, trace=[], slices=[], slice_transforms=[],
             streamline_points=sl_pts, streamline_speeds=sl_spd,
-            diverged=not converged, steps_run=info.iters,
-            side_n=0.0, cl=0.0, ld=0.0, reynolds=info.reynolds, ref_area_mm2=info.ref_area_mm2,
+            diverged=False, steps_run=actual_steps,
+            side_n=0.0, cl=0.0, ld=0.0, reynolds=info.reynolds,
+            ref_area_mm2=info.ref_area_mm2,
             cp_min=t_lo, cp_max=t_hi, vmax_mps=vmax, solver_notes=notes,
             overlay_path=overlay_path, scalar_fields=scalar_fields,
+            converged=True, residual=-1.0, mass_imbalance=-1.0,
         )
 
     # ---- aero ----
-    cd, cl = parse_coefficients(case_dir)
+    cd, cl = parse_coefficients(case_dir, expected_time=expected_time)
+    _raw_drag_n, side_n, _raw_lift_n = parse_forces(
+        case_dir, expected_time=expected_time)
     q = 0.5 * info.rho_kgm3 * info.speed_mps ** 2
     aref_m2 = max(info.ref_area_mm2 * 1e-6, 1e-9)
     drag_n = cd * q * aref_m2
@@ -392,25 +553,31 @@ def postprocess(case_dir: str, stl_path: str, info: CaseInfo, converged: bool,
     ld = (cl / cd) if abs(cd) > 1e-9 else 0.0
 
     cp_min, cp_max = -1.0, 1.0
-    if part is not None and "p" in part.point_data:
-        q_kin = max(0.5 * info.speed_mps ** 2, 1e-9)
-        cp_all = np.asarray(part.point_data["p"], dtype=np.float64) / q_kin
-        if cp_all.size:
-            cp_min = float(min(-0.5, np.percentile(cp_all, 1)))
-            cp_max = float(max(1.0, np.percentile(cp_all, 99)))
+    if "p" not in part.point_data:
+        raise ValueError("OpenFOAM aero result is missing wall pressure")
+    q_kin = max(0.5 * info.speed_mps ** 2, 1e-9)
+    cp_all = np.asarray(part.point_data["p"], dtype=np.float64) / q_kin
+    if not cp_all.size or not np.isfinite(cp_all).all():
+        raise ValueError("OpenFOAM wall pressure is empty or non-finite")
+    cp_min = float(min(-0.5, np.percentile(cp_all, 1)))
+    cp_max = float(max(1.0, np.percentile(cp_all, 99)))
 
     overlay_path, scalar_fields, sl_pts, sl_spd = build_overlay(
         stl_path, info, internal, patches, cp_min, cp_max)
 
-    notes.append(f"OpenFOAM {info.iters}-iter RANS (k-omega SST); {conv}.")
+    notes.append(
+        f"OpenFOAM RANS converged after {actual_steps} SIMPLE iterations "
+        f"(cap {info.iters}; k-omega SST).")
     re_note = (f"OpenFOAM RANS - Re {info.reynolds:,.0f}; "
                f"Cd {cd:.3f}, Cl {cl:.3f} on Aref {info.ref_area_mm2:.0f} mm2.")
     return FlowResult(
         drag_n=drag_n, lift_n=lift_n, cd=cd, frontal_area_mm2=info.frontal_area_mm2,
         reynolds_note=re_note, trace=[], slices=[], slice_transforms=[],
         streamline_points=sl_pts, streamline_speeds=sl_spd,
-        diverged=not converged, steps_run=info.iters,
-        side_n=0.0, cl=cl, ld=ld, reynolds=info.reynolds, ref_area_mm2=info.ref_area_mm2,
+        diverged=False, steps_run=actual_steps,
+        side_n=side_n, cl=cl, ld=ld, reynolds=info.reynolds,
+        ref_area_mm2=info.ref_area_mm2,
         cp_min=cp_min, cp_max=cp_max, vmax_mps=vmax, solver_notes=notes,
         overlay_path=overlay_path, scalar_fields=scalar_fields,
+        converged=True, residual=-1.0, mass_imbalance=-1.0,
     )

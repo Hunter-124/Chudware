@@ -104,16 +104,17 @@ int fea_assembly_threads(int n_elems) {
 #endif
 }
 
-// Deterministic parallel element assembly (P1). Emits the IDENTICAL triplet sequence the
-// serial loop produced: pass 1 assigns every element a contiguous slot sized from its
-// free-DOF count alone (pure reduced[] lookups, no geometry), pass 2 fills the slots in
-// parallel. A degenerate element (ke_fn false — the serial code `continue`d) leaves its
-// slot as default (0,0,0.0) triplets, which add exactly 0.0 into K(0,0) — numerically
-// neutral. Exact-sized allocation also replaces the old full n*edof^2 over-reserve.
+// Deterministic parallel element assembly (P1). Emits the IDENTICAL triplet
+// sequence the serial loop produced: pass 1 assigns every element a contiguous
+// slot sized from its free-DOF count alone, pass 2 fills those slots in parallel.
+// The public preflight has already rejected every invalid element, so a failed
+// element callback here is only a defensive path and the caller rejects the
+// resulting unusable matrix rather than treating a partial domain as success.
 template <int NPE, class KeFn>
 void assemble_elements_par(int n_tets, const std::vector<int>& tets,
                            const std::vector<int>& reduced,
-                           std::vector<Eigen::Triplet<double>>& trips, KeFn&& ke_fn) {
+                           std::vector<Eigen::Triplet<double>>& trips, KeFn&& ke_fn,
+                           const SimCancelToken& cancel_token) {
     constexpr int EDOF = NPE * 3;
     std::vector<std::size_t> off(static_cast<std::size_t>(n_tets) + 1, 0);
     for (int e = 0; e < n_tets; ++e) {
@@ -131,6 +132,7 @@ void assemble_elements_par(int n_tets, const std::vector<int>& tets,
 #pragma omp parallel for schedule(static) num_threads(nthreads) if (nthreads > 1)
 #endif
     for (int e = 0; e < n_tets; ++e) {
+        if (cancel_token && cancel_token->load(std::memory_order_relaxed)) continue;
         Eigen::Matrix<double, EDOF, EDOF> Ke;
         if (!ke_fn(e, Ke)) continue;  // degenerate: zero-filled slot stays (neutral)
         int dof_map[EDOF];
@@ -479,6 +481,7 @@ struct PreparedSystem {
     int n_free = 0;
     int n_dof = 0;
     std::unique_ptr<FactorSolver> solver;
+    mutable std::mutex solve_mtx;
     std::size_t nnz = 0;
     size_t bytes() const {
         return reduced.size() * sizeof(int) + nnz * (sizeof(double) + sizeof(int)) * 4 + 4096;
@@ -541,10 +544,19 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
                                  const std::vector<int>& fixed_nodes,
                                  const std::vector<double>& nodal_forces,
                                  int nodes_per_elem,
-                                 const std::vector<BondSpring>& bond_springs) {
+                                 const std::vector<BondSpring>& bond_springs,
+                                 const SimCancelToken& cancel_token) {
     FeaProf prof;
     FeaStaticResult res;
     const int n_nodes = static_cast<int>(points.size() / 3);
+    auto cancelled = [&]() {
+        return cancel_token && cancel_token->load(std::memory_order_relaxed);
+    };
+    auto cancel_result = [&]() {
+        res.error = "fea_static: cancelled";
+        return res;
+    };
+    if (cancelled()) return cancel_result();
     const int n_dof = n_nodes * 3;
     res.n_dof = n_dof;
     if (n_nodes == 0 || tets.empty()) {
@@ -572,6 +584,10 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         res.error = "fea_static: material requires E>0 and -1<nu<0.5";
         return res;
     }
+    if (!std::isfinite(yield_mpa) || yield_mpa <= 0.0) {
+        res.error = "fea_static: yield strength must be finite and > 0";
+        return res;
+    }
     for (double x : points) {
         if (!std::isfinite(x)) {
             res.error = "fea_static: mesh coordinates must be finite";
@@ -593,16 +609,83 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
             return res;
         }
     }
+    for (int nid : fixed_nodes) {
+        if (nid < 0 || nid >= n_nodes) {
+            res.error = "fea_static: fixed node index out of range";
+            return res;
+        }
+    }
+    for (const BondSpring& s : bond_springs) {
+        if (s.a < 0 || s.a >= n_nodes || s.b < 0 || s.b >= n_nodes || s.a == s.b ||
+            !std::isfinite(s.k) || s.k <= 0.0) {
+            res.error = "fea_static: invalid bond spring";
+            return res;
+        }
+    }
 
     double lam, mu;
     lame(E_mpa, nu, lam, mu);
     const Eigen::Matrix<double, 6, 6> C = elasticity(lam, mu);
+    if (!C.allFinite()) {
+        res.error = "fea_static: material constants overflowed";
+        return res;
+    }
 
     auto node_pt = [&](int nid) {
         return Eigen::Vector3d(points[nid * 3], points[nid * 3 + 1], points[nid * 3 + 2]);
     };
     const int n_tets = static_cast<int>(tets.size() / stride);
     const TetGauss4 gauss;
+    // Validate every element before assembly. Silently skipping one bad element changes the
+    // domain and can leave a plausible-looking solution on only part of the requested mesh.
+    for (int e = 0; e < n_tets; ++e) {
+        bool valid = true;
+        if (hex8) {
+            const HexGauss8 hg;
+            std::array<Eigen::Vector3d, 8> ep;
+            for (int j = 0; j < 8; ++j) ep[j] = node_pt(tets[e * 8 + j]);
+            double sign = 0.0;
+            for (int g = 0; g < 8; ++g) {
+                Eigen::Matrix<double, 6, 24> B;
+                double detJ = 0.0;
+                if (!hex8_B_at(ep, hg.pt[g][0], hg.pt[g][1],
+                               hg.pt[g][2], B, detJ) ||
+                    !std::isfinite(detJ) ||
+                    (sign != 0.0 && detJ * sign <= 0.0)) {
+                    valid = false;
+                    break;
+                }
+                sign = detJ;
+            }
+        } else if (tet10) {
+            std::array<Eigen::Vector3d, 10> ep;
+            for (int j = 0; j < 10; ++j) ep[j] = node_pt(tets[e * 10 + j]);
+            double sign = 0.0;
+            for (int g = 0; g < 4; ++g) {
+                Eigen::Matrix<double, 6, 30> B;
+                Eigen::Matrix<double, 10, 3> dNxyz;
+                double detJ = 0.0;
+                if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B,
+                                detJ, dNxyz) ||
+                    !std::isfinite(detJ) || (sign != 0.0 && detJ * sign <= 0.0)) {
+                    valid = false;
+                    break;
+                }
+                sign = detJ;
+            }
+        } else {
+            std::array<Eigen::Vector3d, 4> ep;
+            for (int j = 0; j < 4; ++j) ep[j] = node_pt(tets[e * 4 + j]);
+            Eigen::Matrix<double, 6, 12> B;
+            double vol = 0.0;
+            valid = tet4_B(ep, B, vol) && std::isfinite(vol);
+        }
+        if (!valid) {
+            res.error = "fea_static: degenerate or inverted element " + std::to_string(e);
+            return res;
+        }
+        if ((e & 255) == 0 && cancelled()) return cancel_result();
+    }
 
     // Fixed-DOF mask + reduced (free) DOF numbering: dof -> reduced index, or -1 if fixed.
     // tet10/hex8: try prepared-system cache first (load-only repeats skip assembly+factorize).
@@ -642,10 +725,18 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         Eigen::VectorXd ff(n_free);
         for (int d = 0; d < n_dof; ++d)
             if (reduced[d] >= 0) ff(reduced[d]) = nodal_forces[d];
+        if (!(ff.squaredNorm() > 0.0)) {
+            res.error = "fea_static: no non-zero force acts on a free DOF";
+            return res;
+        }
+        if (cancelled()) return cancel_result();
         prof.mark("build-rhs-only");
         const int nthreads = fea_solver_threads(n_free);
         apply_solver_thread_cap(nthreads);
-        uf = prepared->solver->solve(ff);
+        {
+            std::lock_guard<std::mutex> solve_lock(prepared->solve_mtx);
+            uf = prepared->solver->solve(ff);
+        }
         if (uf.size() == n_free) {
             solved = true;
             prof.mark("factor-cache back-substitute");
@@ -704,7 +795,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
                     Ke += B.transpose() * C * B * (std::abs(detJ) * hg.w[g]);
                 }
                 return true;
-            });
+            }, cancel_token);
         } else if (!tet10) {
             // ── tet4 path (parity-critical: element math UNCHANGED) ──────────────
             assemble_elements_par<4>(n_tets, tets, reduced, trips,
@@ -716,7 +807,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
                 if (!tet4_B(ep, B, vol)) return false;
                 Ke = B.transpose() * C * B * vol;
                 return true;
-            });
+            }, cancel_token);
         } else {
             // ── tet10 path (quadratic isoparametric, 4-point Gauss) ──────────────
             assemble_elements_par<10>(n_tets, tets, reduced, trips,
@@ -728,16 +819,17 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
                     Eigen::Matrix<double, 6, 30> B;
                     double detJ;
                     Eigen::Matrix<double, 10, 3> dNxyz;
-                    if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B, detJ,
-                                    dNxyz))
+                    if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B,
+                                    detJ, dNxyz))
                         return false;
                     Ke += B.transpose() * C * B * (std::abs(detJ) * gauss.w[g]);
                 }
                 return true;
-            });
+            }, cancel_token);
         }
 
         prof.mark("assemble-elements");
+        if (cancelled()) return cancel_result();
         // Bonded gap ties (asm-fea): append penalty-spring stiffness AFTER element assembly —
         // 3 diagonal DOF springs per pair, off-diagonal coupling only when both sides are
         // free. A tie into a fixed node grounds the free side, which is the correct penalty
@@ -778,6 +870,11 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         Eigen::VectorXd ff(n_free);
         for (int d = 0; d < n_dof; ++d)
             if (reduced[d] >= 0) ff(reduced[d]) = nodal_forces[d];
+        if (!(ff.squaredNorm() > 0.0)) {
+            res.error = "fea_static: no non-zero force acts on a free DOF";
+            return res;
+        }
+        if (cancelled()) return cancel_result();
 
         // The reduced stiffness is symmetric positive-definite. For tet10 (large systems, no Python
         // parity oracle) use a Cholesky factorization (SimplicialLDLT) — markedly faster + lower memory
@@ -896,6 +993,7 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
             }
             solved = true;
         }
+        if (cancelled()) return cancel_result();
     }
 
     if (!solved) {
@@ -1039,6 +1137,15 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
             vm_accum[nid] += s.vm; vm_count[nid] += 1;
             sx_accum[nid] += s.sx;  sy_accum[nid] += s.sy;  sz_accum[nid] += s.sz;
             txy_accum[nid] += s.txy; tyz_accum[nid] += s.tyz; txz_accum[nid] += s.txz;
+        }
+    }
+    if (cancelled()) return cancel_result();
+    for (const ElemStress& s : es) {
+        if (!s.ok || !std::isfinite(s.vm) || !std::isfinite(s.sx) ||
+            !std::isfinite(s.sy) || !std::isfinite(s.sz) ||
+            !std::isfinite(s.txy) || !std::isfinite(s.tyz) || !std::isfinite(s.txz)) {
+            res.error = "fea_static: stress recovery failed for an element";
+            return res;
         }
     }
     res.von_mises.assign(n_nodes, 0.0);

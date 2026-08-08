@@ -28,11 +28,12 @@ struct SimResult {
 // ── pure parsing (no I/O) ───────────────────────────────────────────────────
 
 // CHUDWARE_GPIO_EVT lines → [{"type","seq","t_ms","pin","level"}] (t_ms null when
-// the emitting side had no timestamp).
+// the emitting side had no timestamp). Bounded to 4096 ordered entries; over-limit
+// streams retain head+tail with a trace_truncated diagnostic entry.
 nlohmann::json parse_gpio_events(const std::string& text);
 
 // Non-marker, non-trace lines → [{"type":"uart","seq","t_ms","text"}],
-// time-stamped from CHUDWARE_T_MARK markers.
+// time-stamped from CHUDWARE_T_MARK markers and bounded like GPIO events.
 nlohmann::json parse_uart_events(const std::string& text);
 
 // Renode ODR snapshot blocks → {"PA0": 0, ..., "PA15": 0}.
@@ -47,8 +48,9 @@ nlohmann::json derive_gpio_states(const nlohmann::json& events,
 std::vector<std::pair<char, int>> pins_from_assertions(
     const std::vector<std::string>& assertions);
 
-// Write the aicad.firmware.trace/1 artifact next to the ELF (atomic
-// tmp+replace; null on any failure or when the ELF does not exist).
+// Write the bounded aicad.firmware.trace/1 artifact next to the ELF (atomic
+// tmp+replace; null on any failure or when the ELF does not exist). The additive
+// `truncated` field discloses event-limit clipping.
 std::optional<std::string> write_trace_artifact(const std::string& elf_path,
                                                 const std::string& source,
                                                 const std::string& uart_log,

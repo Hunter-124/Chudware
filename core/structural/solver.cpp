@@ -4,11 +4,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <map>
 #include <set>
 #include <stdexcept>
 #include <tuple>
+#include <utility>
 
 #include <Eigen/Dense>
 
@@ -25,6 +27,12 @@ using Mat12 = std::array<std::array<double, 12>, 12>;
 double round10(double v) { return std::nearbyint(v * 1e10) / 1e10; }
 // Python's round(x, 3) — node-merge coincidence key (1e-3 mm).
 double round3(double v) { return std::nearbyint(v * 1e3) / 1e3; }
+
+std::string lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
 
 // math.isclose with the Python defaults rel_tol=1e-9, abs_tol=0.0.
 bool py_isclose(double a, double b) {
@@ -58,19 +66,19 @@ struct DistLoad {
 
 struct Node {
     double x, y, z;
-    bool fixed = false;  // all 6 DOFs restrained (oracle v1 support model)
+    std::array<bool, 6> restrained{};
 };
 
 struct Member {
     std::string name;
     int i_node, j_node;
     SectionProps props;
+    std::array<bool, 12> releases{};
     std::vector<PtLoad> pt_loads;
     std::vector<DistLoad> dist_loads;
 
-    // Cached geometry
     double L = 0.0;
-    Mat3 dir_cos{};  // rows: local x, y, z in global coordinates
+    Mat3 dir_cos{};  // rows: local member x/y/z in global coordinates
 
     double length() const { return L; }
 };
@@ -80,42 +88,25 @@ struct Model {
     std::vector<Member> members;
 };
 
-// Direction cosines — line-for-line port of Member3D.T() (rotation is always
-// 0 on the oracle path: add_member is never given an aux node / roll angle).
-void compute_transform(Member& m, const Node& ni, const Node& nj) {
-    const double Xi = ni.x, Yi = ni.y, Zi = ni.z;
-    const double Xj = nj.x, Yj = nj.y, Zj = nj.z;
-    const double L = std::sqrt((Xj - Xi) * (Xj - Xi) + (Yj - Yi) * (Yj - Yi) + (Zj - Zi) * (Zj - Zi));
-    m.L = L;
-    const Vec3 x = {(Xj - Xi) / L, (Yj - Yi) / L, (Zj - Zi) / L};
-    Vec3 y, z;
-    if (py_isclose(Xi, Xj) && py_isclose(Zi, Zj)) {
-        // Vertical members: keep the local y-axis in the XY plane.
-        if (Yj > Yi) {
-            y = {-1.0, 0.0, 0.0};
-        } else {
-            y = {1.0, 0.0, 0.0};
-        }
-        z = {0.0, 0.0, 1.0};
-    } else if (py_isclose(Yi, Yj)) {
-        // Horizontal members.
-        y = {0.0, 1.0, 0.0};
-        z = normalized(cross(x, y));
-    } else {
-        // Neither vertical nor horizontal.
-        const Vec3 proj = {Xj - Xi, 0.0, Zj - Zi};
-        if (Yj > Yi) {
-            z = normalized(cross(proj, x));
-        } else {
-            z = normalized(cross(x, proj));
-        }
-        y = normalized(cross(z, x));
+// The document transform defines section roll: its local +Z column is the
+// member axis and its local +Y column is the section major-depth direction.
+// Solver local x/y/z therefore map to document +Z/+Y/-X respectively.
+void compute_transform(Member& m, const StructuralElement& el, const Node& ni, const Node& nj) {
+    const Vec3 delta = {nj.x - ni.x, nj.y - ni.y, nj.z - ni.z};
+    m.L = std::sqrt(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
+    if (!std::isfinite(m.L) || m.L <= 0.0) {
+        throw std::invalid_argument("element '" + el.id + "' has invalid transformed length");
     }
+    const Vec3 x = normalized(delta);
+    Vec3 y = normalized({el.transform[1], el.transform[5], el.transform[9]});
+    double dot = x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    y = normalized({y[0] - dot * x[0], y[1] - dot * x[1], y[2] - dot * x[2]});
+    const Vec3 z = normalized(cross(x, y));
     m.dir_cos = {x, y, z};
 }
 
-// Local 12x12 elastic stiffness — Member3D._ke_unc() (no end releases on the
-// oracle path, so condensation is the identity and ke == _ke_unc).
+// Unreleased local 12x12 elastic stiffness. Requested member-end releases are
+// statically condensed immediately after this matrix is formed.
 Mat12 local_stiffness(const Member& m) {
     const double E = m.props.E, G = m.props.G;
     const double A = m.props.A, Iy = m.props.Iy, Iz = m.props.Iz, J = m.props.J;
@@ -141,6 +132,112 @@ Mat12 local_stiffness(const Member& m) {
     set(10, 2, -c2); set(10, 4, n2); set(10, 8, c2); set(10, 10, n1);
     set(11, 1, b2); set(11, 5, m2); set(11, 7, -b2); set(11, 11, m1);
     return k;
+}
+
+std::vector<int> released_dofs(const Member& m) {
+    std::vector<int> out;
+    for (int i = 0; i < 12; ++i) {
+        if (m.releases[i]) out.push_back(i);
+    }
+    return out;
+}
+
+Mat12 condense_stiffness(const Member& m, const Mat12& unc) {
+    const std::vector<int> q = released_dofs(m);
+    if (q.empty()) return unc;
+    std::vector<int> r;
+    for (int i = 0; i < 12; ++i) {
+        if (!m.releases[i]) r.push_back(i);
+    }
+    Mat12 condensed{};
+    if (r.empty()) return condensed;
+
+    Eigen::MatrixXd Kqq(q.size(), q.size());
+    Eigen::MatrixXd Kqr(q.size(), r.size());
+    Eigen::MatrixXd Krq(r.size(), q.size());
+    Eigen::MatrixXd Krr(r.size(), r.size());
+    for (size_t i = 0; i < q.size(); ++i) {
+        for (size_t j = 0; j < q.size(); ++j) Kqq(i, j) = unc[q[i]][q[j]];
+        for (size_t j = 0; j < r.size(); ++j) Kqr(i, j) = unc[q[i]][r[j]];
+    }
+    for (size_t i = 0; i < r.size(); ++i) {
+        for (size_t j = 0; j < q.size(); ++j) Krq(i, j) = unc[r[i]][q[j]];
+        for (size_t j = 0; j < r.size(); ++j) Krr(i, j) = unc[r[i]][r[j]];
+    }
+    const Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> cod(Kqq);
+    const Eigen::MatrixXd X = cod.solve(Kqr);
+    if (!(Kqq * X - Kqr).allFinite() ||
+        (Kqq * X - Kqr).norm() > 1e-9 * (1.0 + Kqr.norm())) {
+        throw std::invalid_argument("member '" + m.name +
+                                    "' releases cannot be statically condensed");
+    }
+    const Eigen::MatrixXd Kc = Krr - Krq * X;
+    for (size_t i = 0; i < r.size(); ++i) {
+        for (size_t j = 0; j < r.size(); ++j) condensed[r[i]][r[j]] = Kc(i, j);
+    }
+    return condensed;
+}
+
+Vec12 condense_fer(const Member& m, const Mat12& unc, const Vec12& fer_unc_vec) {
+    const std::vector<int> q = released_dofs(m);
+    if (q.empty()) return fer_unc_vec;
+    std::vector<int> r;
+    for (int i = 0; i < 12; ++i) {
+        if (!m.releases[i]) r.push_back(i);
+    }
+    Vec12 condensed{};
+    if (r.empty()) return condensed;
+
+    Eigen::MatrixXd Kqq(q.size(), q.size());
+    Eigen::MatrixXd Krq(r.size(), q.size());
+    Eigen::VectorXd fq(q.size());
+    for (size_t i = 0; i < q.size(); ++i) {
+        fq(i) = fer_unc_vec[q[i]];
+        for (size_t j = 0; j < q.size(); ++j) Kqq(i, j) = unc[q[i]][q[j]];
+    }
+    for (size_t i = 0; i < r.size(); ++i) {
+        for (size_t j = 0; j < q.size(); ++j) Krq(i, j) = unc[r[i]][q[j]];
+    }
+    const Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> cod(Kqq);
+    const Eigen::VectorXd x = cod.solve(fq);
+    if (!(Kqq * x - fq).allFinite() ||
+        (Kqq * x - fq).norm() > 1e-9 * (1.0 + fq.norm())) {
+        throw std::invalid_argument("loads on member '" + m.name +
+                                    "' act on an unsupported released DOF");
+    }
+    for (size_t i = 0; i < r.size(); ++i) {
+        condensed[r[i]] = fer_unc_vec[r[i]] - Krq.row(i).dot(x);
+    }
+    return condensed;
+}
+
+void recover_released_displacements(const Member& m, const Mat12& unc,
+                                    const Vec12& fer_unc_vec, Vec12& d) {
+    const std::vector<int> q = released_dofs(m);
+    if (q.empty()) return;
+    std::vector<int> r;
+    for (int i = 0; i < 12; ++i) {
+        if (!m.releases[i]) r.push_back(i);
+    }
+    Eigen::MatrixXd Kqq(q.size(), q.size());
+    Eigen::MatrixXd Kqr(q.size(), r.size());
+    Eigen::VectorXd fq(q.size());
+    Eigen::VectorXd dr(r.size());
+    for (size_t i = 0; i < q.size(); ++i) {
+        fq(i) = fer_unc_vec[q[i]];
+        for (size_t j = 0; j < q.size(); ++j) Kqq(i, j) = unc[q[i]][q[j]];
+        for (size_t j = 0; j < r.size(); ++j) Kqr(i, j) = unc[q[i]][r[j]];
+    }
+    for (size_t i = 0; i < r.size(); ++i) dr(i) = d[r[i]];
+    const Eigen::VectorXd rhs = -(Kqr * dr + fq);
+    const Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> cod(Kqq);
+    const Eigen::VectorXd dq = cod.solve(rhs);
+    if (!dq.allFinite() ||
+        (Kqq * dq - rhs).norm() > 1e-9 * (1.0 + rhs.norm())) {
+        throw std::runtime_error("released displacement recovery failed for member '" +
+                                 m.name + "'");
+    }
+    for (size_t i = 0; i < q.size(); ++i) d[q[i]] = dq(i);
 }
 
 // ------------------------------------------------------------ fixed-end reactions
@@ -235,11 +332,13 @@ Vec12 fer_unc(const Member& m, const std::vector<std::pair<std::string, double>>
 
 // ---------------------------------------------------------------- model build
 
-// Mirrors analysis.build_pynite_model: one member per element (named by
-// element id), node merge at 1e-3 mm, footings fixed / else lowest node fixed.
+// One member per element, node merge at 1e-3 mm. Explicit supports use global
+// DOFs at an element end; legacy documents retain footing/lowest-node support
+// inference only when no explicit support list is present.
 Model build_model(const StructureDoc& doc) {
     Model model;
     std::map<std::tuple<double, double, double>, int> node_index;
+    std::map<std::string, size_t> member_index;
 
     auto get_node = [&](const Vec3& p) {
         const auto key = std::make_tuple(round3(p[0]), round3(p[1]), round3(p[2]));
@@ -247,7 +346,7 @@ Model build_model(const StructureDoc& doc) {
         if (it != node_index.end()) return it->second;
         const int idx = static_cast<int>(model.nodes.size());
         node_index[key] = idx;
-        model.nodes.push_back({p[0], p[1], p[2], false});
+        model.nodes.push_back({p[0], p[1], p[2], {}});
         return idx;
     };
 
@@ -265,79 +364,125 @@ Model build_model(const StructureDoc& doc) {
         m.i_node = get_node(p0);
         m.j_node = get_node(p1);
         m.props = section_properties(el.section_name, el.material, el.element_type);
-        compute_transform(m, model.nodes[m.i_node], model.nodes[m.j_node]);
+        m.releases = el.end_releases;
+        compute_transform(m, el, model.nodes[m.i_node], model.nodes[m.j_node]);
         if (el.element_type == "footing") {
             footing_nodes.insert(m.i_node);
             footing_nodes.insert(m.j_node);
         }
+        member_index[m.name] = model.members.size();
         model.members.push_back(std::move(m));
     }
 
-    if (!footing_nodes.empty()) {
-        for (int n : footing_nodes) model.nodes[n].fixed = true;
-    } else if (!model.nodes.empty()) {
-        // The single lowest node (min by z, then y, then x) fixed as ground.
+    if (!doc.supports.empty()) {
+        for (const StructuralSupport& support : doc.supports) {
+            const auto found = member_index.find(support.element_id);
+            if (found == member_index.end()) {
+                throw std::invalid_argument("support references unknown element '" +
+                                            support.element_id + "'");
+            }
+            const Member& member = model.members[found->second];
+            Node& node = model.nodes[support.at_j ? member.j_node : member.i_node];
+            for (int d = 0; d < 6; ++d) node.restrained[d] = node.restrained[d] || support.restrained[d];
+        }
+    } else if (!footing_nodes.empty()) {
+        for (int n : footing_nodes) model.nodes[n].restrained.fill(true);
+    } else {
         int lowest = 0;
         for (int i = 1; i < static_cast<int>(model.nodes.size()); ++i) {
             const Node& a = model.nodes[i];
             const Node& b = model.nodes[lowest];
             if (std::tie(a.z, a.y, a.x) < std::tie(b.z, b.y, b.x)) lowest = i;
         }
-        model.nodes[lowest].fixed = true;
+        model.nodes[lowest].restrained.fill(true);
     }
     return model;
 }
 
-// Mirrors analysis.apply_load_cases (v1 mapping: each load case applies to
-// every non-footing member, in the dominant gravity direction).
+// Each contract load case applies to every non-footing member. `gravity` is a
+// direction vector, so preserve all components and normalize exactly once.
 void apply_load_cases(Model& model, const std::vector<nlohmann::json>& load_cases,
                       const std::set<std::string>& footing_ids) {
     static const char* kAxes = "XYZ";
     for (const nlohmann::json& lc : load_cases) {
-        // Python: lc.get("kind") or "dead" — null / missing / "" all map to "dead".
-        std::string kind = "dead";
-        if (lc.contains("kind") && lc["kind"].is_string() && !lc["kind"].get<std::string>().empty()) {
-            kind = lc["kind"].get<std::string>();
+        std::string kind = lower(lc.value("kind", std::string("dead")));
+        if (kind != "dead" && kind != "live" && kind != "wind" && kind != "snow") {
+            throw std::invalid_argument("unsupported load-case kind '" + kind + "'");
         }
         Vec3 g = {0.0, 0.0, -1.0};
-        if (lc.contains("gravity") && lc["gravity"].is_array() && lc["gravity"].size() == 3) {
-            for (int i = 0; i < 3; ++i) g[i] = lc["gravity"][i].get<double>();
+        if (lc.contains("gravity")) {
+            if (!lc["gravity"].is_array() || lc["gravity"].size() != 3) {
+                throw std::invalid_argument("load-case gravity must contain exactly three numbers");
+            }
+            for (int i = 0; i < 3; ++i) {
+                if (!lc["gravity"][i].is_number()) {
+                    throw std::invalid_argument("load-case gravity entries must be numeric");
+                }
+                g[i] = lc["gravity"][i].get<double>();
+            }
         }
-        int idx = 0;
-        for (int i = 1; i < 3; ++i) {
-            if (std::abs(g[i]) > std::abs(g[idx])) idx = i;
+        const double gnorm =
+            std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+        if (!std::isfinite(gnorm) || gnorm <= 0.0) {
+            throw std::invalid_argument("load-case gravity must be a finite nonzero direction");
         }
-        double sign;
-        if (g[idx] == 0.0) {
-            idx = 2;
-            sign = -1.0;
-        } else {
-            sign = g[idx] < 0 ? -1.0 : 1.0;
-        }
-        const char axis = kAxes[idx];
-        const double factor = lc.value("factor", 1.0);
+        for (double& component : g) component /= gnorm;
 
-        const bool has_dist = lc.contains("distributed") && lc["distributed"].is_object() &&
-                              lc["distributed"].contains("w_n_per_mm") &&
-                              !lc["distributed"]["w_n_per_mm"].is_null();
-        const bool has_pt = lc.contains("point") && lc["point"].is_object() &&
-                            lc["point"].contains("p_n") && !lc["point"]["p_n"].is_null();
+        const double factor = lc.value("factor", 1.0);
+        if (!std::isfinite(factor) || factor < 0.0) {
+            throw std::invalid_argument("load-case factor must be finite and nonnegative");
+        }
+        const bool has_dist = lc.contains("distributed");
+        const bool has_pt = lc.contains("point");
+        if (!has_dist && !has_pt) {
+            throw std::invalid_argument("load case '" + kind +
+                                        "' must define a distributed or point load");
+        }
+        double w = 0.0, p = 0.0;
+        if (has_dist) {
+            if (!lc["distributed"].is_object() ||
+                !lc["distributed"].contains("w_n_per_mm") ||
+                !lc["distributed"]["w_n_per_mm"].is_number()) {
+                throw std::invalid_argument("distributed load requires numeric w_n_per_mm");
+            }
+            w = lc["distributed"]["w_n_per_mm"].get<double>();
+            if (!std::isfinite(w) || w < 0.0) {
+                throw std::invalid_argument("distributed w_n_per_mm must be finite and nonnegative");
+            }
+        }
+        if (has_pt) {
+            if (!lc["point"].is_object() || !lc["point"].contains("p_n") ||
+                !lc["point"]["p_n"].is_number()) {
+                throw std::invalid_argument("point load requires numeric p_n");
+            }
+            p = lc["point"]["p_n"].get<double>();
+            if (!std::isfinite(p) || p < 0.0) {
+                throw std::invalid_argument("point p_n must be finite and nonnegative");
+            }
+        }
 
         for (Member& m : model.members) {
             if (footing_ids.count(m.name)) continue;
-            if (has_dist) {
-                const double w = lc["distributed"]["w_n_per_mm"].get<double>();
-                const double mag = sign * std::abs(w) * factor;
-                m.dist_loads.push_back({axis, mag, mag, 0.0, m.L, kind});
-            }
-            if (has_pt) {
-                const double p = lc["point"]["p_n"].get<double>();
-                double x = m.L;
-                if (lc["point"].contains("at_mm") && !lc["point"]["at_mm"].is_null()) {
-                    x = lc["point"]["at_mm"].get<double>();
+            double x = m.L;
+            if (has_pt && lc["point"].contains("at_mm")) {
+                if (!lc["point"]["at_mm"].is_number()) {
+                    throw std::invalid_argument("point at_mm must be numeric");
                 }
-                const double mag = sign * std::abs(p) * factor;
-                m.pt_loads.push_back({axis, mag, x, kind});
+                x = lc["point"]["at_mm"].get<double>();
+                if (!std::isfinite(x) || x < 0.0 || x > m.L) {
+                    throw std::invalid_argument("point at_mm lies outside member '" + m.name + "'");
+                }
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+                if (g[axis] == 0.0) continue;
+                if (has_dist && w * factor != 0.0) {
+                    const double mag = g[axis] * w * factor;
+                    m.dist_loads.push_back({kAxes[axis], mag, mag, 0.0, m.L, kind});
+                }
+                if (has_pt && p * factor != 0.0) {
+                    const double mag = g[axis] * p * factor;
+                    m.pt_loads.push_back({kAxes[axis], mag, x, kind});
+                }
             }
         }
     }
@@ -647,10 +792,14 @@ AnalysisRow member_extract(const Member& m, const SegmentedMember& sm, const std
         mom_max_y = std::max(mom_max_y, mr.second);
         mom_min_y = std::min(mom_min_y, mr.first);
     }
-    const double shear = max_mag({shear_max_y, shear_min_y, shear_max_z, shear_min_z});
-    const double moment = max_mag({mom_max_z, mom_min_z, mom_max_y, mom_min_y});
+    const double shear_y = max_mag({shear_max_y, shear_min_y});
+    const double shear_z = max_mag({shear_max_z, shear_min_z});
+    const double moment_z = max_mag({mom_max_z, mom_min_z});
+    const double moment_y = max_mag({mom_max_y, mom_min_y});
+    const double shear = max_mag({shear_y, shear_z});
+    const double moment = max_mag({moment_z, moment_y});
 
-    // max/min deflection — PyNite samples 100 points (i/99·L, including both ends).
+    // max/min deflection — sampled at 100 stations, including both ends.
     double dmax_y = seg_eval(sm.segs_z, 0.0, L, [](const SegZ& s, double xs) { return s.deflection(xs); });
     double dmin_y = dmax_y;
     double dmax_z = seg_eval(sm.segs_y, 0.0, L, [](const SegY& s, double xs) { return s.deflection(xs); });
@@ -664,21 +813,51 @@ AnalysisRow member_extract(const Member& m, const SegmentedMember& sm, const std
         dmax_z = std::max(dmax_z, dz);
         dmin_z = std::min(dmin_z, dz);
     }
-    const double defl = max_mag({dmax_y, dmin_y, dmax_z, dmin_z});
+    const double defl_y = max_mag({dmax_y, dmin_y});
+    const double defl_z = max_mag({dmax_z, dmin_z});
+    const double defl = max_mag({defl_y, defl_z});
 
-    return {m.name, combo, axial, shear, moment, defl};
+    return {m.name, combo, axial, shear, moment, defl,
+            shear_y, shear_z, moment_y, moment_z, defl_y, defl_z};
 }
 
 }  // namespace
 
 nlohmann::json AnalysisRow::to_dict() const {
-    return {{"element_id", element_id}, {"combo", combo},       {"axial_n", axial_n},
-            {"shear_n", shear_n},       {"moment_nmm", moment_nmm}, {"deflection_mm", deflection_mm},
-            {"dc_ratio", nullptr},      {"pass", nullptr}};
+    return {{"element_id", element_id},
+            {"combo", combo},
+            {"axial_n", axial_n},
+            {"shear_n", shear_n},
+            {"moment_nmm", moment_nmm},
+            {"deflection_mm", deflection_mm},
+            {"shear_y_n", shear_y_n},
+            {"shear_z_n", shear_z_n},
+            {"moment_y_nmm", moment_y_nmm},
+            {"moment_z_nmm", moment_z_nmm},
+            {"deflection_y_mm", deflection_y_mm},
+            {"deflection_z_mm", deflection_z_mm},
+            {"dc_ratio", nullptr},
+            {"pass", nullptr}};
 }
 
-std::vector<AnalysisRow> analyze_doc(const StructureDoc& doc,
-                                     const std::vector<LoadCombo>& combos) {
+nlohmann::json ReactionRow::to_dict() const {
+    return {{"combo", combo},
+            {"x_mm", x_mm},
+            {"y_mm", y_mm},
+            {"z_mm", z_mm},
+            {"fx_n", fx_n},
+            {"fy_n", fy_n},
+            {"fz_n", fz_n},
+            {"mx_nmm", mx_nmm},
+            {"my_nmm", my_nmm},
+            {"mz_nmm", mz_nmm}};
+}
+
+std::vector<AnalysisRow> analyze_doc(
+    const StructureDoc& doc, const std::vector<LoadCombo>& combos,
+    std::vector<ReactionRow>* reactions) {
+    if (combos.empty()) throw std::invalid_argument("at least one load combination is required");
+    if (reactions) reactions->clear();
     Model model = build_model(doc);
 
     std::set<std::string> footing_ids;
@@ -687,26 +866,26 @@ std::vector<AnalysisRow> analyze_doc(const StructureDoc& doc,
     }
     apply_load_cases(model, doc.load_cases, footing_ids);
 
-    // DOF numbering: node insertion order (PyNite _renumber). Fixed support
-    // DOFs are partitioned out (D2 = 0 with the v1 all-fixed support model).
     const int n_nodes = static_cast<int>(model.nodes.size());
     std::vector<int> dof_map(6 * n_nodes, -1);
     int n_free = 0;
     for (int n = 0; n < n_nodes; ++n) {
-        if (model.nodes[n].fixed) continue;
-        for (int d = 0; d < 6; ++d) dof_map[6 * n + d] = n_free++;
+        for (int d = 0; d < 6; ++d) {
+            if (!model.nodes[n].restrained[d]) dof_map[6 * n + d] = n_free++;
+        }
     }
 
-    // Assemble the free-free global stiffness once (member elastic stiffness is
-    // combo-independent).
     Eigen::MatrixXd K = Eigen::MatrixXd::Zero(n_free, n_free);
+    std::vector<Mat12> k_unc_locals;
     std::vector<Mat12> k_locals;
+    k_unc_locals.reserve(model.members.size());
     k_locals.reserve(model.members.size());
     for (const Member& m : model.members) {
-        const Mat12 kl = local_stiffness(m);
+        const Mat12 k_unc = local_stiffness(m);
+        const Mat12 kl = condense_stiffness(m, k_unc);
+        k_unc_locals.push_back(k_unc);
         k_locals.push_back(kl);
         const int nodes[2] = {m.i_node, m.j_node};
-        // Ke_global = T^T · ke · T (T block-diagonal with dirCos).
         for (int bi = 0; bi < 2; ++bi) {
             for (int bj = 0; bj < 2; ++bj) {
                 for (int r = 0; r < 6; ++r) {
@@ -715,10 +894,6 @@ std::vector<AnalysisRow> analyze_doc(const StructureDoc& doc,
                     for (int c = 0; c < 6; ++c) {
                         const int gc = 6 * nodes[bj] + c;
                         if (dof_map[gc] < 0) continue;
-                        // (T^T ke T)[6bi+r][6bj+c] with T block-diagonal:
-                        // T[p][q] = dirCos[p%3][q%3] when p/3 == q/3, else 0 —
-                        // so T[a][6bi+r] = dirCos[a%3][r%3] (transpose on the
-                        // outer index).
                         double sum = 0.0;
                         for (int a = 0; a < 6; ++a) {
                             if (a / 3 != r / 3) continue;
@@ -735,20 +910,44 @@ std::vector<AnalysisRow> analyze_doc(const StructureDoc& doc,
             }
         }
     }
+    if (!K.allFinite()) throw std::runtime_error("assembled stiffness matrix is non-finite");
+
+    // Released node rotations can be deliberately inactive. Remove only rows
+    // with no assembled stiffness; rank-test every participating DOF so a
+    // zero-load mechanism cannot hide behind a zero residual.
+    std::vector<int> active;
+    const double k_scale = n_free > 0 ? K.cwiseAbs().maxCoeff() : 0.0;
+    const double inactive_tol = std::max(1e-12, k_scale * 1e-15);
+    for (int i = 0; i < n_free; ++i) {
+        if (K.row(i).cwiseAbs().maxCoeff() > inactive_tol) active.push_back(i);
+    }
+    Eigen::MatrixXd K_active(active.size(), active.size());
+    for (size_t i = 0; i < active.size(); ++i) {
+        for (size_t j = 0; j < active.size(); ++j) K_active(i, j) = K(active[i], active[j]);
+    }
+    Eigen::FullPivLU<Eigen::MatrixXd> lu(K_active);
+    if (!active.empty() && lu.rank() < static_cast<Eigen::Index>(active.size())) {
+        throw std::runtime_error(
+            "The stiffness matrix is singular, which indicates that the structure is unstable.");
+    }
 
     std::vector<AnalysisRow> results;
     for (const LoadCombo& combo : combos) {
-        auto factors = combo.factors();
-        if (factors.empty()) factors.emplace_back("dead", 1.0);
-
-        // Global fixed-end-reaction load vector: P1 - FER1 (P1 = 0 — no nodal
-        // loads on the oracle path). FER_global = T^T · fer_local.
+        std::vector<std::array<double, 6>> nodal_reactions(n_nodes);
+        const auto factors = combo.factors();
         Eigen::VectorXd rhs = Eigen::VectorXd::Zero(n_free);
+        std::vector<Vec12> fer_unc_locals;
         std::vector<Vec12> fer_locals;
+        fer_unc_locals.reserve(model.members.size());
         fer_locals.reserve(model.members.size());
-        for (const Member& m : model.members) {
-            const Vec12 fl = fer_unc(m, factors);
-            fer_locals.push_back(fl);
+        double applied_load_measure = 0.0;
+        for (size_t mi = 0; mi < model.members.size(); ++mi) {
+            const Member& m = model.members[mi];
+            const Vec12 f_unc = fer_unc(m, factors);
+            for (double value : f_unc) applied_load_measure += std::abs(value);
+            fer_unc_locals.push_back(f_unc);
+            fer_locals.push_back(condense_fer(m, k_unc_locals[mi], f_unc));
+            const Vec12& fl = fer_locals.back();
             const int nodes[2] = {m.i_node, m.j_node};
             for (int bi = 0; bi < 2; ++bi) {
                 for (int r = 0; r < 6; ++r) {
@@ -757,33 +956,45 @@ std::vector<AnalysisRow> analyze_doc(const StructureDoc& doc,
                     double sum = 0.0;
                     for (int a = 0; a < 6; ++a) {
                         if (a / 3 != r / 3) continue;
-                        // (T^T fer)[6bi+r] = Σ_a T[a][6bi+r]·fer[6bi+a]
                         sum += m.dir_cos[a % 3][r % 3] * fl[6 * bi + a];
                     }
                     rhs(dof_map[gr]) -= sum;
                 }
             }
         }
+        if (!std::isfinite(applied_load_measure) || applied_load_measure == 0.0) {
+            throw std::invalid_argument("load combination '" + combo.name +
+                                        "' has no nonzero applicable loads");
+        }
 
-        Eigen::VectorXd D1 = Eigen::VectorXd::Zero(n_free);
-        if (n_free > 0) {
-            Eigen::LDLT<Eigen::MatrixXd> ldlt(K);
-            D1 = ldlt.solve(rhs);
-            // Singularity / instability check (PyNite raises ValueError).
-            if (!D1.allFinite() || (K * D1 - rhs).norm() > 1e-6 * (1.0 + rhs.norm())) {
+        std::vector<bool> is_active(n_free, false);
+        for (int i : active) is_active[i] = true;
+        for (int i = 0; i < n_free; ++i) {
+            if (!is_active[i] && std::abs(rhs(i)) > 1e-9 * (1.0 + rhs.norm())) {
                 throw std::runtime_error(
-                    "The stiffness matrix is singular, which indicates that the structure is unstable.");
+                    "A load acts on an unrestrained DOF with no member stiffness.");
             }
+        }
+        Eigen::VectorXd rhs_active(active.size());
+        for (size_t i = 0; i < active.size(); ++i) rhs_active(i) = rhs(active[i]);
+        Eigen::VectorXd D1 = Eigen::VectorXd::Zero(n_free);
+        if (!active.empty()) {
+            const Eigen::VectorXd solved = lu.solve(rhs_active);
+            if (!solved.allFinite() ||
+                (K_active * solved - rhs_active).norm() >
+                    1e-8 * (1.0 + rhs_active.norm())) {
+                throw std::runtime_error(
+                    "The stiffness solve did not converge to equilibrium.");
+            }
+            for (size_t i = 0; i < active.size(); ++i) D1(active[i]) = solved(i);
         }
 
         for (size_t mi = 0; mi < model.members.size(); ++mi) {
             const Member& m = model.members[mi];
-            // Member global end displacements → local: d = T · D.
             Vec12 d{};
             const int nodes[2] = {m.i_node, m.j_node};
             for (int bi = 0; bi < 2; ++bi) {
                 for (int r = 0; r < 6; ++r) {
-                    // d_local[6bi+r] = Σ_a T[r][a]·D_global[6bi+a], T block-diagonal dirCos.
                     double sum = 0.0;
                     for (int a = 0; a < 6; ++a) {
                         if (a / 3 != r / 3) continue;
@@ -794,15 +1005,56 @@ std::vector<AnalysisRow> analyze_doc(const StructureDoc& doc,
                     d[6 * bi + r] = sum;
                 }
             }
-            // f = ke · d + fer.
+            recover_released_displacements(m, k_unc_locals[mi], fer_unc_locals[mi], d);
             Vec12 f{};
             for (int r = 0; r < 12; ++r) {
                 double sum = 0.0;
-                for (int c = 0; c < 12; ++c) sum += k_locals[mi][r][c] * d[c];
-                f[r] = sum + fer_locals[mi][r];
+                for (int c = 0; c < 12; ++c) sum += k_unc_locals[mi][r][c] * d[c];
+                f[r] = sum + fer_unc_locals[mi][r];
             }
-            const SegmentedMember sm = segment_member(m, f, fer_locals[mi], d, factors);
-            results.push_back(member_extract(m, sm, combo.name));
+            for (int bi = 0; bi < 2; ++bi) {
+                const int node = nodes[bi];
+                for (int global_dof = 0; global_dof < 6; ++global_dof) {
+                    double value = 0.0;
+                    for (int local_dof = 0; local_dof < 6; ++local_dof) {
+                        if (local_dof / 3 != global_dof / 3) continue;
+                        value += m.dir_cos[local_dof % 3][global_dof % 3] *
+                                 f[6 * bi + local_dof];
+                    }
+                    nodal_reactions[node][global_dof] += value;
+                }
+            }
+            const SegmentedMember sm =
+                segment_member(m, f, fer_unc_locals[mi], d, factors);
+            AnalysisRow row = member_extract(m, sm, combo.name);
+            const nlohmann::json serialized = row.to_dict();
+            for (const char* key : {"axial_n", "shear_n", "moment_nmm", "deflection_mm",
+                                    "shear_y_n", "shear_z_n", "moment_y_nmm",
+                                    "moment_z_nmm", "deflection_y_mm", "deflection_z_mm"}) {
+                if (!std::isfinite(serialized[key].get<double>())) {
+                    throw std::runtime_error("non-finite structural result for member '" + m.name +
+                                             "'");
+                }
+            }
+            results.push_back(std::move(row));
+        }
+        if (reactions) {
+            for (int node_index = 0; node_index < n_nodes; ++node_index) {
+                const Node& node = model.nodes[node_index];
+                if (std::none_of(node.restrained.begin(), node.restrained.end(),
+                                 [](bool value) { return value; })) {
+                    continue;
+                }
+                const auto& force = nodal_reactions[node_index];
+                ReactionRow reaction{combo.name, node.x, node.y, node.z};
+                reaction.fx_n = node.restrained[0] ? force[0] : 0.0;
+                reaction.fy_n = node.restrained[1] ? force[1] : 0.0;
+                reaction.fz_n = node.restrained[2] ? force[2] : 0.0;
+                reaction.mx_nmm = node.restrained[3] ? force[3] : 0.0;
+                reaction.my_nmm = node.restrained[4] ? force[4] : 0.0;
+                reaction.mz_nmm = node.restrained[5] ? force[5] : 0.0;
+                reactions->push_back(std::move(reaction));
+            }
         }
     }
     return results;

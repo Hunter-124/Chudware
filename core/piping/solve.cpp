@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <sstream>
 
@@ -102,6 +103,7 @@ struct Link {
     double eps = 4.6e-5;
     double kfit = 0.0;  // summed fitting K
     std::vector<ojson> kbreak;
+    std::vector<ojson> fittings;
     ojson pump = nullptr;  // optional pump dict (head-vs-flow)
     double flow = 1e-4;    // m³/s (liquid) / kg/s (gas) current iterate
     double fd = 0.02;
@@ -230,6 +232,21 @@ std::pair<double, std::string> fitting_K(const ojson& ft, double d_m, double fd)
     if (ftype == "elbow") return {0.3, "default(elbow)"};  // fluids-absent fallback
     return {0.0, "default(none)"};
 }
+void refresh_link_fittings(Link& lk) {
+    lk.kfit = 0.0;
+    lk.kbreak.clear();
+    for (const auto& ft : lk.fittings) {
+        auto [K, method] = fitting_K(ft, lk.d_m, lk.fd);
+        lk.kfit += K;
+        ojson kb = ojson::object();
+        kb["fitting"] = ft.value("id", ojson(nullptr));
+        kb["type"] = ft.value("type", ojson(nullptr));
+        kb["K"] = pyround(K, 4);
+        kb["method"] = method;
+        lk.kbreak.push_back(std::move(kb));
+    }
+}
+
 
 NetCtx build_network(const ojson& doc, const ojson& fluid, double tol) {
     NetCtx ctx;
@@ -254,6 +271,11 @@ NetCtx build_network(const ojson& doc, const ojson& fluid, double tol) {
         lk.a = run_ep[ri].first;
         lk.b = run_ep[ri].second;
         lk.length_m = polyline_length_mm(run["path"]) / 1000.0;
+        if (!std::isfinite(lk.length_m)) {
+            ctx.err = jerr(lk.id + ": run length calculation overflowed",
+                           "use finite coordinates with physically meaningful magnitudes");
+            return ctx;
+        }
         const ojson bore_override = run.value("bore_mm", ojson(nullptr));
         if (py_truthy(bore_override)) {
             // Explicit inner diameter (mm) — externally-supplied networks (e.g.
@@ -263,17 +285,22 @@ NetCtx build_network(const ojson& doc, const ojson& fluid, double tol) {
             const ojson spec = nearest_pipe(run.value("nps", ojson(nullptr)),
                                             run.value("schedule", std::string("40")));
             if (!spec.value("ok", false)) {
-                ctx.warnings.push_back(lk.id + ": " + spec.value("reason", std::string()));
-                // fall back to nps inches as bore so the network stays solvable
-                const ojson nps = run.value("nps", ojson(nullptr));
-                const double bore_mm =
-                    (py_truthy(nps) ? pyutil::to_double(nps) : 1.0) * 25.4;
-                lk.d_m = bore_mm / 1000.0;
+                ctx.err = jerr(
+                    lk.id + ": pipe size/schedule has no catalog dimensions",
+                    spec.value("reason", std::string()) +
+                        "; supply a valid catalog NPS/schedule or explicit bore_mm");
+                return ctx;
             } else {
                 lk.d_m = spec["inner_dia"].get<double>() / 1000.0;
             }
         }
         lk.area = M_PI * lk.d_m * lk.d_m / 4.0;
+        if (!std::isfinite(lk.d_m) || lk.d_m <= 0 ||
+            !std::isfinite(lk.area) || lk.area <= 0) {
+            ctx.err = jerr(lk.id + ": pipe bore/area calculation is invalid",
+                           "use a finite positive bore_mm or supported catalog size");
+            return ctx;
+        }
         const ojson mat = run.value("material", ojson(nullptr));
         const ojson mat_eff = py_truthy(mat) ? mat : doc_material;
         lk.eps = roughness_for(mat_eff.is_string() ? mat_eff.get<std::string>() : "");
@@ -308,14 +335,7 @@ NetCtx build_network(const ojson& doc, const ojson& fluid, double tol) {
         bool placed = false;
         for (size_t i = 0; i < ctx.links.size() && i < nonzero_runs.size(); ++i) {
             if (point_on_polyline(origin, (*nonzero_runs[i])["path"], tol)) {
-                auto [K, method] = fitting_K(ft, ctx.links[i].d_m, ctx.links[i].fd);
-                ctx.links[i].kfit += K;
-                ojson kb = ojson::object();
-                kb["fitting"] = ft.value("id", ojson(nullptr));
-                kb["type"] = ft.value("type", ojson(nullptr));
-                kb["K"] = pyround(K, 4);
-                kb["method"] = method;
-                ctx.links[i].kbreak.push_back(std::move(kb));
+                ctx.links[i].fittings.push_back(ft);
                 placed = true;
                 break;
             }
@@ -326,6 +346,7 @@ NetCtx build_network(const ojson& doc, const ojson& fluid, double tol) {
                                    " not on any run — K ignored");
         }
     }
+    for (auto& lk : ctx.links) refresh_link_fittings(lk);
 
     ctx.ok = true;
     return ctx;
@@ -365,34 +386,143 @@ int resolve_node(const ojson& ref, const NetCtx& ctx, double tol) {
     return -1;
 }
 
+bool finite_number(const ojson& value) {
+    return value.is_number() && !value.is_boolean() &&
+           std::isfinite(value.get<double>());
+}
+
+ojson boundary_list(const ojson& boundary) {
+    if (boundary.is_array()) return boundary;
+    if (boundary.is_object() && boundary.value("nodes", ojson(nullptr)).is_array())
+        return boundary["nodes"];
+    return nullptr;
+}
+
+ojson validate_boundary_ref(const ojson& bc) {
+    if (!bc.is_object()) return jerr("each boundary condition must be an object");
+    const int refs = static_cast<int>(bc.contains("node")) +
+                     static_cast<int>(bc.contains("at")) +
+                     static_cast<int>(bc.contains("run"));
+    if (refs != 1) {
+        return jerr("each boundary condition must use exactly one node reference",
+                    "use one of 'node', 'at', or 'run'+'end'");
+    }
+    if (bc.contains("node") &&
+        (!bc["node"].is_string() || bc["node"].get<std::string>().empty()))
+        return jerr("boundary node must be a non-empty string");
+    if (bc.contains("at")) {
+        const ojson at = bc["at"];
+        if (!at.is_array() || at.size() != 3)
+            return jerr("boundary at must be a finite [x,y,z] point in mm");
+        for (const auto& coordinate : at)
+            if (!finite_number(coordinate))
+                return jerr("boundary at must be a finite [x,y,z] point in mm");
+    }
+    if (bc.contains("run")) {
+        if (!bc["run"].is_string() || bc["run"].get<std::string>().empty())
+            return jerr("boundary run must be a non-empty string");
+        const std::string end = bc.value("end", std::string("start"));
+        if (end != "start" && end != "end")
+            return jerr("boundary run end must be 'start' or 'end'");
+    }
+    return nullptr;
+}
+
 ojson apply_boundary(NetCtx& ctx, const ojson& boundary, double tol, double rho) {
-    const ojson bcs = boundary.is_array() ? boundary : boundary.value("nodes", ojson::array());
+    const ojson bcs = boundary_list(boundary);
+    if (!bcs.is_array() || bcs.empty())
+        return jerr("boundary conditions must be a non-empty list");
     int n_fixed = 0;
+    std::map<int, std::string> assigned;
     for (const auto& bc : bcs) {
+        if (ojson err = validate_boundary_ref(bc); !err.is_null()) return err;
+        const int conditions = static_cast<int>(bc.contains("head")) +
+                               static_cast<int>(bc.contains("pressure")) +
+                               static_cast<int>(bc.contains("demand")) +
+                               static_cast<int>(bc.contains("demand_lps"));
+        if (conditions != 1) {
+            return jerr(
+                "each liquid boundary condition must specify exactly one value",
+                "use one of head, pressure, demand, or demand_lps");
+        }
+        const char* key = bc.contains("head")       ? "head"
+                          : bc.contains("pressure") ? "pressure"
+                          : bc.contains("demand")   ? "demand"
+                                                   : "demand_lps";
+        if (!finite_number(bc[key]))
+            return jerr(std::string("boundary ") + key + " must be finite");
+        if (std::string(key) == "pressure" &&
+            bc[key].get<double>() <= -P_ATM / 1000.0) {
+            return jerr("boundary gauge pressure implies non-positive absolute pressure");
+        }
+
         const int idx = resolve_node(bc, ctx, tol);
         if (idx < 0) {
             return jerr("boundary reference " + py_repr(bc) + " did not resolve to a node",
                         "use {'node':'n0'} / {'at':[x,y,z]} / {'run':'r1','end':'start'}");
         }
         Node& nd = ctx.nodes[idx];
-        const double z = nd.xyz[2] / 1000.0;
-        if (bc.is_object() && bc.contains("head")) {
+        const bool fixed = std::string(key) == "head" || std::string(key) == "pressure";
+        auto prior = assigned.find(idx);
+        if (prior != assigned.end() &&
+            (fixed || prior->second == "fixed")) {
+            return jerr("node " + nd.id +
+                        " has conflicting or duplicate fixed/demand boundary conditions");
+        }
+        if (fixed) {
+            assigned[idx] = "fixed";
+            const double z = nd.xyz[2] / 1000.0;
             nd.fixed = true;
-            nd.head = pyutil::to_double(bc["head"]);
+            nd.head = std::string(key) == "head"
+                          ? bc[key].get<double>()
+                          : z + bc[key].get<double>() * 1000.0 / (rho * kG);
+            const double pressure_pa = rho * kG * (nd.head - z);
+            if (!std::isfinite(nd.head) || !std::isfinite(pressure_pa)) {
+                return jerr("liquid boundary pressure/head conversion overflowed");
+            }
             ++n_fixed;
-        } else if (bc.is_object() && bc.contains("pressure")) {  // kPa gauge -> head
-            nd.fixed = true;
-            nd.head = z + pyutil::to_double(bc["pressure"]) * 1000.0 / (rho * kG);
-            ++n_fixed;
-        } else if (bc.is_object() && bc.contains("demand")) {  // m³/h leaving (+)
-            nd.demand += pyutil::to_double(bc["demand"]) / 3600.0;
-        } else if (bc.is_object() && bc.contains("demand_lps")) {
-            nd.demand += pyutil::to_double(bc["demand_lps"]) / 1000.0;
+        } else {
+            assigned[idx] = "demand";
+            nd.demand += std::string(key) == "demand"
+                             ? bc[key].get<double>() / 3600.0
+                             : bc[key].get<double>() / 1000.0;
         }
     }
     if (n_fixed == 0) {
         return jerr("network under-constrained: no fixed-head/pressure node",
                     "give at least one boundary with 'pressure' (kPa) or 'head' (m)");
+    }
+    return nullptr;
+}
+
+ojson validate_anchored_components(const NetCtx& ctx,
+                                   const std::string& pressure_kind) {
+    std::vector<std::vector<int>> adjacent(ctx.nodes.size());
+    for (const auto& lk : ctx.links) {
+        adjacent[lk.a].push_back(lk.b);
+        adjacent[lk.b].push_back(lk.a);
+    }
+    std::vector<bool> seen(ctx.nodes.size(), false);
+    for (const auto& start : ctx.nodes) {
+        if (seen[start.idx]) continue;
+        std::vector<int> stack{start.idx};
+        seen[start.idx] = true;
+        bool anchored = false;
+        for (size_t cursor = 0; cursor < stack.size(); ++cursor) {
+            const int node = stack[cursor];
+            anchored = anchored || ctx.nodes[node].fixed;
+            for (int next : adjacent[node]) {
+                if (!seen[next]) {
+                    seen[next] = true;
+                    stack.push_back(next);
+                }
+            }
+        }
+        if (!anchored) {
+            return jerr("disconnected network component at " + start.id +
+                            " has no fixed-" + pressure_kind + " boundary",
+                        "each connected component must contain a fixed pressure/head node");
+        }
     }
     return nullptr;
 }
@@ -455,6 +585,9 @@ ojson load_pump_curve_json(const ojson& src, double speed_ratio,
 
 ojson load_pump_curve(const std::string& csv_source, double speed_ratio,
                       const std::string& flow_col, const std::string& head_col) {
+    if (!std::isfinite(speed_ratio) || speed_ratio <= 0) {
+        return jerr("pump curve speed_ratio must be finite and > 0");
+    }
     std::string text;
     {
         std::ifstream fh(csv_source);
@@ -467,8 +600,6 @@ ojson load_pump_curve(const std::string& csv_source, double speed_ratio,
         }
     }
 
-    // csv.DictReader semantics: first row is the header (an empty first row
-    // yields NO fieldnames -> "empty" error, exactly like the oracle).
     std::vector<std::string> lines;
     {
         std::istringstream in(text);
@@ -483,7 +614,7 @@ ojson load_pump_curve(const std::string& csv_source, double speed_ratio,
                     "need a header row with flow,head columns");
     }
     const std::vector<std::string> fieldnames = split_csv_line(lines[0]);
-    std::map<std::string, std::string> fmap;  // strip().lower() -> original
+    std::map<std::string, std::string> fmap;
     for (const auto& c : fieldnames) fmap[lower_str(trim(c))] = c;
     auto find_col = [&](const std::string& want) -> std::string {
         auto it = fmap.find(lower_str(want));
@@ -501,9 +632,11 @@ ojson load_pump_curve(const std::string& csv_source, double speed_ratio,
         return jerr("pump curve needs '" + flow_col + "' and '" + head_col + "' columns",
                     "found columns: " + py_repr(cols));
     }
+
     const double r = speed_ratio;
     std::vector<std::array<double, 2>> pts;
     for (size_t li = 1; li < lines.size(); ++li) {
+        if (trim(lines[li]).empty()) continue;
         const auto cells = split_csv_line(lines[li]);
         std::string qstr, hstr;
         bool have_q = false, have_h = false;
@@ -517,28 +650,87 @@ ojson load_pump_curve(const std::string& csv_source, double speed_ratio,
                 have_h = true;
             }
         }
-        double q, h;
-        if (!have_q || !have_h || !py_float_parse(qstr, q) || !py_float_parse(hstr, h))
-            continue;
-        pts.push_back({q * r, h * r * r});
+        double q = 0.0, h = 0.0;
+        if (!have_q || !have_h || !py_float_parse(qstr, q) ||
+            !py_float_parse(hstr, h) || !std::isfinite(q) ||
+            !std::isfinite(h)) {
+            return jerr("pump curve row " + std::to_string(li + 1) +
+                            " has missing, non-numeric, or non-finite data",
+                        "every non-empty row must provide finite flow/head values");
+        }
+        if (q < 0 || h < 0) {
+            return jerr("pump curve flow/head values must be >= 0");
+        }
+        const double scaled_q = q * r;
+        const double scaled_h = h * r * r;
+        if (!std::isfinite(scaled_q) || !std::isfinite(scaled_h))
+            return jerr("pump curve affinity scaling overflowed");
+        pts.push_back({scaled_q, scaled_h});
     }
     if (pts.size() < 2) {
         return jerr("pump curve needs >= 2 valid points", "check numeric flow/head cells");
     }
     std::stable_sort(pts.begin(), pts.end(),
                      [](const auto& a, const auto& b) { return a[0] < b[0]; });
+    const bool npshr = lower_str(head_col).find("npshr") != std::string::npos;
+    for (size_t i = 1; i < pts.size(); ++i) {
+        if (!(pts[i][0] > pts[i - 1][0])) {
+            return jerr("pump curve flow values must be strictly increasing and unique");
+        }
+        if ((!npshr && pts[i][1] > pts[i - 1][1]) ||
+            (npshr && pts[i][1] < pts[i - 1][1])) {
+            return jerr(npshr
+                            ? "NPSHr curve must be non-decreasing with flow"
+                            : "pump head curve must be non-increasing with flow");
+        }
+    }
     ojson points = ojson::array();
     for (const auto& p : pts) points.push_back(ojson::array({p[0], p[1]}));
     ojson out = ojson::object();
     out["ok"] = true;
     out["points"] = std::move(points);
     out["shutoff_head"] = pts[0][1];
-    out["max_flow"] = pts[pts.size() - 1][0];
+    out["max_flow"] = pts.back()[0];
     out["speed_ratio"] = r;
     return out;
 }
 
 namespace {
+ojson validate_curve_object(const ojson& curve, bool npshr = false) {
+    const ojson pts = curve.value("points", ojson(nullptr));
+    if (!curve.is_object() || !curve.value("ok", false) ||
+        !pts.is_array() || pts.size() < 2) {
+        return jerr("pump curve object must contain >= 2 points");
+    }
+    double prior_q = -1.0;
+    double prior_y = 0.0;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        const ojson point = pts[i];
+        if (!point.is_array() || point.size() != 2 ||
+            !finite_number(point[0]) || !finite_number(point[1]) ||
+            point[0].get<double>() < 0 || point[1].get<double>() < 0) {
+            return jerr("pump curve points must be finite non-negative [flow, value] pairs");
+        }
+        const double q = point[0].get<double>();
+        const double y = point[1].get<double>();
+        if (i > 0 && (!(q > prior_q) ||
+                      (!npshr && y > prior_y) ||
+                      (npshr && y < prior_y))) {
+            return jerr(npshr
+                            ? "NPSHr curve needs strictly increasing flow and "
+                              "non-decreasing NPSHr"
+                            : "pump curve needs strictly increasing flow and "
+                              "non-increasing head");
+        }
+        prior_q = q;
+        prior_y = y;
+    }
+    const ojson speed = curve.value("speed_ratio", ojson(1.0));
+    if (!finite_number(speed) || speed.get<double>() <= 0)
+        return jerr("pump curve speed_ratio must be finite and > 0");
+    return nullptr;
+}
+
 
 // Pump head (m) and slope d(head)/dQ (m per m³/s) at a flow magnitude (m³/s):
 // piecewise-linear over the curve, flat extrapolation past both ends.
@@ -566,8 +758,17 @@ double pump_head(const ojson& pump, double flow_m3s) {
 }
 
 ojson attach_pumps(NetCtx& ctx, const ojson& pumps) {
-    for (const auto& spec : pumps.is_array() ? pumps : ojson::array()) {
-        const std::string run_id = spec.value("run", std::string());
+    if (pumps.is_null()) return nullptr;
+    if (!pumps.is_array()) return jerr("pumps must be a list");
+    std::map<std::string, bool> attached;
+    for (const auto& spec : pumps) {
+        if (!spec.is_object()) return jerr("each pump specification must be an object");
+        const ojson run = spec.value("run", ojson(nullptr));
+        if (!run.is_string() || run.get<std::string>().empty())
+            return jerr("pump run must be a non-empty string");
+        const std::string run_id = run.get<std::string>();
+        if (attached[run_id])
+            return jerr("multiple pumps on run " + py_repr(run_id) + " are ambiguous");
         Link* lk = nullptr;
         for (auto& l : ctx.links)
             if (l.id == run_id) lk = &l;
@@ -577,19 +778,27 @@ ojson attach_pumps(NetCtx& ctx, const ojson& pumps) {
             return jerr("pump references unknown run " + py_repr(run_id),
                         "runs available: " + py_repr(ids));
         }
+        const std::string direction = spec.value("direction", std::string("a_to_b"));
+        if (direction != "a_to_b" && direction != "b_to_a")
+            return jerr("pump direction must be 'a_to_b' or 'b_to_a'");
+        const ojson speed = spec.value("speed_ratio", ojson(1.0));
+        if (!finite_number(speed) || speed.get<double>() <= 0)
+            return jerr("pump speed_ratio must be finite and > 0");
+
         const ojson curve = spec.value("curve", ojson(nullptr));
         ojson pump = nullptr;
         if (curve.is_object() && curve.value("ok", false)) {
+            if (ojson err = validate_curve_object(curve); !err.is_null()) return err;
             pump = curve;
         } else if (py_truthy(curve)) {
-            pump = load_pump_curve_json(curve, spec.value("speed_ratio", 1.0), "flow",
-                                        "head");
+            pump = load_pump_curve_json(curve, speed.get<double>(), "flow", "head");
         }
         if (pump.is_null() || !pump.value("ok", false)) {
             return pump.is_object() ? pump : jerr("pump missing 'curve'");
         }
-        pump["sign"] = spec.value("direction", std::string()) == "b_to_a" ? -1.0 : 1.0;
+        pump["sign"] = direction == "b_to_a" ? -1.0 : 1.0;
         lk->pump = std::move(pump);
+        attached[run_id] = true;
     }
     return nullptr;
 }
@@ -731,6 +940,7 @@ double finalize_flows(std::vector<Node>& nodes, std::vector<Link>& links,
         double dmax = 0.0;
         for (auto& lk : links) {
             lk.fd = friction_factor_lk(lk, std::max(std::abs(lk.flow), kMinAbsQ), mu, rho);
+            refresh_link_fittings(lk);
             const double q = link_flow(lk, H[lk.a] - H[lk.b]).first;
             dmax = std::max(dmax, std::abs(q - lk.flow));
             lk.flow = q;
@@ -795,6 +1005,16 @@ ojson assemble_result(const NetCtx& ctx, const std::vector<Node>& nodes,
                                  : ojson(0.0);
         link_out.push_back(std::move(row));
     }
+    ojson warnings = ctx.warnings;
+    for (const auto& row : link_out) {
+        const double velocity = std::abs(row["velocity_ms"].get<double>());
+        if (velocity > 3.0) {
+            warnings.push_back(
+                row["id"].get<std::string>() + ": liquid velocity " +
+                fmt_f(velocity, 2) +
+                " m/s exceeds the 3 m/s general erosion/noise advisory limit");
+        }
+    }
     ojson hint = nullptr;
     ojson next_actions = ojson::array();
     if (!converged) {
@@ -813,14 +1033,15 @@ ojson assemble_result(const NetCtx& ctx, const std::vector<Node>& nodes,
     fluid_out["phase"] = fl.value("phase", std::string("liquid"));
 
     ojson out = ojson::object();
-    out["ok"] = true;
+    out["ok"] = converged;
+    if (!converged) out["reason"] = "piping solver did not converge";
     out["converged"] = converged;
     out["iterations"] = it;
     out["max_imbalance_m3h"] = pyround(max_imbalance * 3600.0, 6);
     out["fluid"] = std::move(fluid_out);
     out["nodes"] = std::move(node_out);
     out["links"] = std::move(link_out);
-    out["warnings"] = ctx.warnings;
+    out["warnings"] = std::move(warnings);
     out["hint"] = hint;
     out["next_actions"] = next_actions;
     return out;
@@ -834,7 +1055,17 @@ ojson solve(const ojson& doc, const ojson& boundary, const ojson& fluid,
     std::string nt = network_type;
     std::transform(nt.begin(), nt.end(), nt.begin(),
                    [](unsigned char c) { return std::tolower(c); });
+    if (nt != "liquid" && nt != "incompressible" &&
+        nt != "gas" && nt != "compressible") {
+        return jerr("network_type must be 'liquid' or 'gas'");
+    }
+    if (!std::isfinite(tol_mm) || tol_mm <= 0 ||
+        max_iter <= 0 || !std::isfinite(tol_head) || tol_head <= 0) {
+        return jerr("tol_mm, max_iter, and solver tolerance must be finite and > 0");
+    }
     if (nt == "gas" || nt == "compressible") {
+        if (py_truthy(pumps))
+            return jerr("pumps are not supported by the gas-network solver");
         return solve_gas(doc, boundary, fluid, tol_mm, max_iter);
     }
     const auto verrs = validate_piping(doc);
@@ -849,12 +1080,18 @@ ojson solve(const ojson& doc, const ojson& boundary, const ojson& fluid,
 
     const ojson fl = resolve_solver_fluid(fluid);
     if (!fl.value("ok", true) && fl.contains("reason")) return fl;
+    if (fl.value("phase", std::string("liquid")) == "gas") {
+        return jerr("named gas fluid requires network_type='gas'",
+                    "the liquid solver assumes incompressible density");
+    }
     const double rho = fl["rho"].get<double>();
     const double mu = fl["mu"].get<double>();
 
     NetCtx ctx = build_network(doc, fl, tol_mm);
     if (!ctx.ok) return ctx.err;
     if (ojson err = apply_boundary(ctx, boundary, tol_mm, rho); !err.is_null()) return err;
+    if (ojson err = validate_anchored_components(ctx, "head/pressure"); !err.is_null())
+        return err;
     if (ojson err = attach_pumps(ctx, pumps); !err.is_null()) return err;
 
     std::vector<Node>& nodes = ctx.nodes;
@@ -908,8 +1145,11 @@ ojson solve(const ojson& doc, const ojson& boundary, const ojson& fluid,
 
     if (nfree) {
         for (it = 1; it <= max_iter; ++it) {
-            for (auto& lk : links)
-                lk.fd = friction_factor_lk(lk, std::max(std::abs(lk.flow), kMinAbsQ), mu, rho);
+            for (auto& lk : links) {
+                lk.fd =
+                    friction_factor_lk(lk, std::max(std::abs(lk.flow), kMinAbsQ), mu, rho);
+                refresh_link_fittings(lk);
+            }
 
             std::vector<std::vector<double>> J(nfree, std::vector<double>(nfree, 0.0));
             std::vector<double> e(nfree, 0.0);
@@ -966,12 +1206,18 @@ ojson solve(const ojson& doc, const ojson& boundary, const ojson& fluid,
     }
 
     const double max_imbalance = finalize_flows(nodes, links, H, mu, rho);
-    return assemble_result(ctx, nodes, links, H, fl, converged, it, max_imbalance);
+    converged = converged && std::isfinite(max_imbalance) &&
+                max_imbalance <= tol_q;
+    const int iterations_run = nfree ? std::min(it, max_iter) : 0;
+    return assemble_result(ctx, nodes, links, H, fl, converged,
+                           iterations_run, max_imbalance);
 }
 
 ojson pressure_drop_report(const ojson& doc, const ojson& result_in,
                            const ojson& boundary, const ojson& fluid,
                            const ojson& pumps, double tol_mm) {
+    if (!std::isfinite(tol_mm) || tol_mm <= 0)
+        return jerr("tol_mm must be finite and > 0");
     ojson result = result_in;
     if (result.is_null()) {
         if (boundary.is_null()) {
@@ -982,13 +1228,14 @@ ojson pressure_drop_report(const ojson& doc, const ojson& result_in,
         result = solve(doc, boundary, fluid, pumps, "liquid", tol_mm);
     }
     if (!result.value("ok", false)) return result;
+    if (!result.value("converged", false))
+        return jerr("cannot report a non-converged piping solve",
+                    "rerun piping_solve with valid connected boundaries");
 
-    // dict(WATER); fl.update(fluid or {}) — NOT the sourced resolver.
-    ojson fl = ojson::object();
-    fl["name"] = "water";
-    fl["rho"] = 998.2;
-    fl["mu"] = 1.002e-3;
-    if (py_truthy(fluid)) pyutil::update(fl, fluid);
+    const ojson report_fluid =
+        py_truthy(fluid) ? fluid : result.value("fluid", ojson(nullptr));
+    const ojson fl = resolve_solver_fluid(report_fluid);
+    if (!fl.value("ok", true) && fl.contains("reason")) return fl;
     const double rho = fl["rho"].get<double>();
     const double mu = fl["mu"].get<double>();
     NetCtx ctx = build_network(doc, fl, tol_mm);
@@ -998,14 +1245,18 @@ ojson pressure_drop_report(const ojson& doc, const ojson& result_in,
     for (const auto& lk : result["links"]) link_res[lk["id"].get<std::string>()] = lk;
 
     ojson segments = ojson::array();
-    double total_dp = 0.0;
+    std::map<std::string, double> segment_loss_kpa;
     for (auto& lk : ctx.links) {
         auto it = link_res.find(lk.id);
-        if (it == link_res.end()) continue;
+        if (it == link_res.end()) {
+            return jerr("solve result is missing link " + py_repr(lk.id),
+                        "report doc and solve result must describe the same network");
+        }
         const ojson& lr = it->second;
         const double q = lr["flow_m3h"].get<double>() / 3600.0;
         const double v = lk.area ? q / lk.area : 0.0;
         lk.fd = friction_factor_lk(lk, std::max(std::abs(q), kMinAbsQ), mu, rho);
+        refresh_link_fittings(lk);
         // friction component (fluids K_from_f / dP_from_K)
         const double k_fric = lk.d_m ? lk.fd * lk.length_m / lk.d_m : 0.0;
         const double dp_fric = k_fric * 0.5 * rho * std::abs(v) * std::abs(v);
@@ -1032,7 +1283,8 @@ ojson pressure_drop_report(const ojson& doc, const ojson& result_in,
             breakdown.push_back(std::move(b));
             seg_dp += dp_k;
         }
-        total_dp += seg_dp;
+        const double seg_dp_kpa = seg_dp / 1000.0;
+        segment_loss_kpa[lk.id] = seg_dp_kpa;
         ojson seg = ojson::object();
         seg["id"] = lk.id;
         seg["from"] = lr["from"];
@@ -1043,29 +1295,190 @@ ojson pressure_drop_report(const ojson& doc, const ojson& result_in,
         seg["velocity_ms"] = lr["velocity_ms"];
         seg["k_friction"] = pyround(k_fric, 4);
         seg["k_fittings"] = pyround(lk.kfit, 4);
-        seg["dp_kpa"] = pyround(seg_dp / 1000.0, 4);
+        seg["dp_kpa"] = pyround(seg_dp_kpa, 4);
         seg["breakdown"] = std::move(breakdown);
         segments.push_back(std::move(seg));
     }
+
+    // Resolve the actual source-to-terminal topology from signed solved flow.
+    // A network total is a path sum, never the sum of every link in the model.
+    struct ReportArc {
+        std::string link_id;
+        std::string to;
+        double loss_kpa = 0.0;
+    };
+    constexpr double kReportFlowEpsM3h = 1e-9;
+    std::map<std::string, std::vector<ReportArc>> downstream;
+    std::map<std::string, double> net_outflow_m3h;
+    ojson diagnostics = ojson::array();
+    for (const auto& lr : result["links"]) {
+        const std::string id = lr["id"].get<std::string>();
+        const std::string from = lr["from"].get<std::string>();
+        const std::string to = lr["to"].get<std::string>();
+        const double q_m3h = lr["flow_m3h"].get<double>();
+        if (!std::isfinite(q_m3h)) {
+            diagnostics.push_back("link " + id +
+                                  " has non-finite solved flow; path direction is undefined");
+            continue;
+        }
+        if (std::abs(q_m3h) <= kReportFlowEpsM3h) {
+            diagnostics.push_back("link " + id +
+                                  " has zero solved flow and was excluded from path totals");
+            continue;
+        }
+        const bool forward = q_m3h > 0.0;
+        const std::string& upstream = forward ? from : to;
+        const std::string& downstream_node = forward ? to : from;
+        auto loss_it = segment_loss_kpa.find(id);
+        if (loss_it == segment_loss_kpa.end()) {
+            return jerr("solve result contains unknown link " + py_repr(id),
+                        "report doc and solve result must describe the same network");
+        }
+        downstream[upstream].push_back({id, downstream_node, loss_it->second});
+        net_outflow_m3h[upstream] += std::abs(q_m3h);
+        net_outflow_m3h[downstream_node] -= std::abs(q_m3h);
+    }
+
+    std::vector<std::string> sources;
+    std::vector<std::string> terminals;
+    std::map<std::string, std::string> terminal_kind;
+    for (const auto& node : result.value("nodes", ojson::array())) {
+        const std::string id = node["id"].get<std::string>();
+        const double demand_m3h = node.value("demand_m3h", 0.0);
+        const bool fixed = node.value("fixed", false);
+        const double net_out = net_outflow_m3h[id];
+        if ((fixed && net_out > kReportFlowEpsM3h) ||
+            demand_m3h < -kReportFlowEpsM3h) {
+            sources.push_back(id);
+        }
+        if (demand_m3h > kReportFlowEpsM3h) {
+            terminals.push_back(id);
+            terminal_kind[id] = "demand";
+        } else if (fixed && net_out < -kReportFlowEpsM3h) {
+            terminals.push_back(id);
+            terminal_kind[id] = "fixed_pressure_sink";
+        }
+    }
+    if (sources.empty()) {
+        diagnostics.push_back(
+            "no solved-flow source could be identified (expected a fixed node with net "
+            "outflow or a negative-demand injection)");
+    }
+    if (terminals.empty()) {
+        diagnostics.push_back(
+            "no demand terminal or fixed-pressure sink could be identified");
+    }
+
+    constexpr size_t kMaxReportPaths = 4096;
+    ojson paths = ojson::array();
+    std::map<std::string, bool> reached_terminal;
+    std::vector<std::string> link_path;
+    std::vector<std::string> node_path;
+    std::map<std::string, bool> visited;
+    bool truncated = false;
+    double governing_total = -1.0;
+    ojson governing_path = nullptr;
+    for (const std::string& source : sources) {
+        for (const std::string& terminal : terminals) {
+            link_path.clear();
+            node_path = {source};
+            visited.clear();
+            visited[source] = true;
+            std::function<void(const std::string&, double)> walk =
+                [&](const std::string& node, double total_kpa) {
+                    if (paths.size() >= kMaxReportPaths) {
+                        truncated = true;
+                        return;
+                    }
+                    if (node == terminal) {
+                        ojson path = ojson::object();
+                        path["source_node"] = source;
+                        path["terminal_node"] = terminal;
+                        path["terminal_kind"] = terminal_kind[terminal];
+                        path["link_ids"] = link_path;
+                        path["node_ids"] = node_path;
+                        path["total_dp_kpa"] = pyround(total_kpa, 4);
+                        reached_terminal[terminal] = true;
+                        if (total_kpa > governing_total) {
+                            governing_total = total_kpa;
+                            governing_path = path;
+                        }
+                        paths.push_back(std::move(path));
+                        return;
+                    }
+                    auto it = downstream.find(node);
+                    if (it == downstream.end()) return;
+                    for (const ReportArc& arc : it->second) {
+                        if (visited[arc.to]) continue;
+                        visited[arc.to] = true;
+                        link_path.push_back(arc.link_id);
+                        node_path.push_back(arc.to);
+                        walk(arc.to, total_kpa + arc.loss_kpa);
+                        node_path.pop_back();
+                        link_path.pop_back();
+                        visited[arc.to] = false;
+                        if (truncated) return;
+                    }
+                };
+            walk(source, 0.0);
+            if (truncated) break;
+        }
+        if (truncated) break;
+    }
+    if (truncated) {
+        diagnostics.push_back(
+            "source-to-terminal path enumeration exceeded 4096 simple paths; "
+            "the governing path is not proven");
+    }
+    for (const std::string& terminal : terminals) {
+        if (!reached_terminal[terminal]) {
+            diagnostics.push_back("terminal " + terminal +
+                                  " has no directed solved-flow path from an identified source");
+        }
+    }
+    bool every_terminal_reached = !terminals.empty();
+    for (const std::string& terminal : terminals)
+        every_terminal_reached = every_terminal_reached && reached_terminal[terminal];
+    const bool path_complete = !paths.empty() && !truncated && every_terminal_reached;
 
     ojson fluid_out = ojson::object();
     fluid_out["name"] = fl.value("name", std::string("custom"));
     fluid_out["rho"] = fl["rho"];
     fluid_out["mu"] = fl["mu"];
+    fluid_out["source"] = fl.value("source", ojson(nullptr));
+    fluid_out["phase"] = fl.value("phase", std::string("liquid"));
+
+    ojson warnings = ctx.warnings;
+    for (const auto& diagnostic : diagnostics) warnings.push_back(diagnostic);
+    ojson path_analysis = ojson::object();
+    path_analysis["complete"] = path_complete;
+    path_analysis["sources"] = sources;
+    path_analysis["terminals"] = terminals;
+    path_analysis["path_count"] = paths.size();
+    path_analysis["diagnostics"] = diagnostics;
 
     ojson out = ojson::object();
-    out["ok"] = true;
+    out["ok"] = path_complete;
     out["fluid"] = std::move(fluid_out);
     out["segments"] = std::move(segments);
-    out["total_dp_kpa"] = pyround(total_dp / 1000.0, 4);
-    out["converged"] = result.value("converged", ojson(nullptr));
-    out["warnings"] = ctx.warnings;
-    out["hint"] = result.value("converged", false)
-                      ? ojson(nullptr)
-                      : ojson("underlying solve did not converge — pressures/flows are "
-                              "approximate");
-    out["next_actions"] =
-        ojson::array({"deliver the pressure-drop table or size a pump for total_dp_kpa"});
+    out["path_totals"] = std::move(paths);
+    out["governing_path"] = governing_path;
+    out["total_dp_kpa"] =
+        path_complete ? ojson(pyround(governing_total, 4)) : ojson(nullptr);
+    out["path_analysis"] = std::move(path_analysis);
+    out["converged"] = true;
+    out["warnings"] = std::move(warnings);
+    out["hint"] =
+        path_complete
+            ? ojson(nullptr)
+            : ojson("select or correct a source-to-demand flow path before sizing a pump");
+    if (!path_complete) {
+        out["reason"] =
+            "pressure-drop path total is ambiguous or incomplete; per-segment details remain "
+            "available";
+    }
+    out["next_actions"] = ojson::array(
+        {"use governing_path.total_dp_kpa for the worst resolved source-to-demand path"});
     return out;
 }
 
@@ -1098,33 +1511,69 @@ std::pair<double, double> gas_link_flow(const Link& lk, double dphi, double coef
 
 // Fixed absolute-pressure² nodes + mass demands; reuses Node.head for φ and
 // Node.demand for the mass demand (kg/s leaving).
-ojson apply_gas_boundary(NetCtx& ctx, const ojson& boundary, double tol, double rho_std) {
-    const ojson bcs = boundary.is_array() ? boundary : boundary.value("nodes", ojson::array());
+ojson apply_gas_boundary(NetCtx& ctx, const ojson& boundary, double tol,
+                         double rho_std) {
+    const ojson bcs = boundary_list(boundary);
+    if (!bcs.is_array() || bcs.empty())
+        return jerr("gas boundary conditions must be a non-empty list");
     int n_fixed = 0;
+    std::map<int, std::string> assigned;
     for (const auto& bc : bcs) {
+        if (ojson err = validate_boundary_ref(bc); !err.is_null()) return err;
+        const int conditions = static_cast<int>(bc.contains("pressure_abs")) +
+                               static_cast<int>(bc.contains("pressure")) +
+                               static_cast<int>(bc.contains("mass_demand")) +
+                               static_cast<int>(bc.contains("std_demand")) +
+                               static_cast<int>(bc.contains("demand"));
+        if (conditions != 1) {
+            return jerr(
+                "each gas boundary condition must specify exactly one value",
+                "use pressure_abs, pressure, mass_demand, std_demand, or demand");
+        }
+        const char* key = bc.contains("pressure_abs") ? "pressure_abs"
+                          : bc.contains("pressure")   ? "pressure"
+                          : bc.contains("mass_demand") ? "mass_demand"
+                          : bc.contains("std_demand")  ? "std_demand"
+                                                       : "demand";
+        if (!finite_number(bc[key]))
+            return jerr(std::string("gas boundary ") + key + " must be finite");
+        double p_abs = 0.0;
+        const bool fixed = std::string(key) == "pressure_abs" ||
+                           std::string(key) == "pressure";
+        if (fixed) {
+            p_abs = std::string(key) == "pressure_abs"
+                        ? bc[key].get<double>() * 1000.0
+                        : bc[key].get<double>() * 1000.0 + P_ATM;
+            if (!std::isfinite(p_abs) || p_abs <= 0)
+                return jerr("gas boundary absolute pressure must be > 0 Pa");
+        }
+
         const int idx = resolve_node(bc, ctx, tol);
         if (idx < 0) {
             return jerr("boundary reference " + py_repr(bc) + " did not resolve to a node",
                         "use {'node':'n0'} / {'at':[x,y,z]} / {'run':'r1','end':'start'}");
         }
         Node& nd = ctx.nodes[idx];
-        if (bc.is_object() && bc.contains("pressure_abs")) {  // kPa absolute
-            const double p_abs = pyutil::to_double(bc["pressure_abs"]) * 1000.0;
+        auto prior = assigned.find(idx);
+        if (prior != assigned.end() &&
+            (fixed || prior->second == "fixed")) {
+            return jerr("node " + nd.id +
+                        " has conflicting or duplicate gas boundary conditions");
+        }
+        if (fixed) {
+            assigned[idx] = "fixed";
             nd.fixed = true;
             nd.head = p_abs * p_abs;
+            if (!std::isfinite(nd.head)) {
+                return jerr("gas boundary pressure-squared conversion overflowed");
+            }
             ++n_fixed;
-        } else if (bc.is_object() && bc.contains("pressure")) {  // kPa gauge -> absolute
-            const double p_abs = pyutil::to_double(bc["pressure"]) * 1000.0 + P_ATM;
-            nd.fixed = true;
-            nd.head = p_abs * p_abs;
-            ++n_fixed;
-        } else if (bc.is_object() && bc.contains("mass_demand")) {  // kg/h leaving (+)
-            nd.demand += pyutil::to_double(bc["mass_demand"]) / 3600.0;
-        } else if (bc.is_object() &&
-                   (bc.contains("std_demand") || bc.contains("demand"))) {  // Nm³/h
-            const double q_std = pyutil::to_double(
-                bc.contains("std_demand") ? bc["std_demand"] : bc["demand"]);
-            nd.demand += q_std * rho_std / 3600.0;
+        } else {
+            assigned[idx] = "demand";
+            if (std::string(key) == "mass_demand")
+                nd.demand += bc[key].get<double>() / 3600.0;
+            else
+                nd.demand += bc[key].get<double>() * rho_std / 3600.0;
         }
     }
     if (n_fixed == 0) {
@@ -1191,7 +1640,8 @@ ojson assemble_gas_result(const NetCtx& ctx, const std::vector<Node>& nodes,
     fluid_out["source"] = fl.value("source", ojson(nullptr));
 
     ojson out = ojson::object();
-    out["ok"] = true;
+    out["ok"] = converged;
+    if (!converged) out["reason"] = "gas piping solver did not converge";
     out["network_type"] = "gas";
     out["converged"] = converged;
     out["iterations"] = it;
@@ -1216,6 +1666,10 @@ ojson assemble_gas_result(const NetCtx& ctx, const std::vector<Node>& nodes,
 
 ojson solve_gas(const ojson& doc, const ojson& boundary, const ojson& fluid,
                 double tol_mm, int max_iter, double tol_mass) {
+    if (!std::isfinite(tol_mm) || tol_mm <= 0 || max_iter <= 0 ||
+        !std::isfinite(tol_mass) || tol_mass <= 0) {
+        return jerr("tol_mm, max_iter, and tol_mass must be finite and > 0");
+    }
     const auto verrs = validate_piping(doc);
     if (!verrs.empty()) {
         ojson errs = ojson::array();
@@ -1243,6 +1697,8 @@ ojson solve_gas(const ojson& doc, const ojson& boundary, const ojson& fluid,
     NetCtx ctx = build_network(doc, fl, tol_mm);
     if (!ctx.ok) return ctx.err;
     if (ojson err = apply_gas_boundary(ctx, boundary, tol_mm, rho_std); !err.is_null())
+        return err;
+    if (ojson err = validate_anchored_components(ctx, "pressure"); !err.is_null())
         return err;
 
     std::vector<Node>& nodes = ctx.nodes;
@@ -1292,8 +1748,11 @@ ojson solve_gas(const ojson& doc, const ojson& boundary, const ojson& fluid,
     int it = 0;
     if (nfree) {
         for (it = 1; it <= max_iter; ++it) {
-            for (auto& lk : links)
-                lk.fd = gas_friction_factor(lk, std::max(std::abs(lk.flow), 1e-9), mu);
+            for (auto& lk : links) {
+                lk.fd =
+                    gas_friction_factor(lk, std::max(std::abs(lk.flow), 1e-9), mu);
+                refresh_link_fittings(lk);
+            }
 
             std::vector<std::vector<double>> J(nfree, std::vector<double>(nfree, 0.0));
             std::vector<double> e(nfree, 0.0);
@@ -1355,6 +1814,7 @@ ojson solve_gas(const ojson& doc, const ojson& boundary, const ojson& fluid,
         double dmax = 0.0;
         for (auto& lk : links) {
             lk.fd = gas_friction_factor(lk, std::max(std::abs(lk.flow), 1e-9), mu);
+            refresh_link_fittings(lk);
             const double m =
                 gas_link_flow(lk, phi[lk.a] - phi[lk.b], coef[lk.id], phi_floor).first;
             dmax = std::max(dmax, std::abs(m - lk.flow));
@@ -1372,9 +1832,14 @@ ojson solve_gas(const ojson& doc, const ojson& boundary, const ojson& fluid,
     double max_imbalance = 0.0;
     for (const auto& nd : nodes)
         if (!nd.fixed) max_imbalance = std::max(max_imbalance, std::abs(imbalance[nd.idx]));
+    for (double value : phi)
+        converged = converged && std::isfinite(value) && value > 0;
+    converged = converged && std::isfinite(max_imbalance) &&
+                max_imbalance <= tol_mass;
+    const int iterations_run = nfree ? std::min(it, max_iter) : 0;
 
-    return assemble_gas_result(ctx, nodes, links, phi, fl, M, T, mu, rho_std, converged,
-                               it, max_imbalance);
+    return assemble_gas_result(ctx, nodes, links, phi, fl, M, T, mu, rho_std,
+                               converged, iterations_run, max_imbalance);
 }
 
 // ── pump/system operating point + NPSH margin ─────────────────────────────────
@@ -1408,49 +1873,99 @@ double interp_curve(const ojson& pts, double x) {
 // Fit static + k·Q² from a network solve at a reference demand. Returns
 // (system, derived_meta) or (null, contract-shaped err).
 std::pair<ojson, ojson> derive_system_curve(const ojson& doc, const ojson& boundary,
-                                            const ojson& fluid, const ojson& q_ref_m3h) {
-    const double q_ref = py_truthy(q_ref_m3h) ? pyutil::to_double(q_ref_m3h) : 50.0;
-    ojson demand_bc = nullptr, fixed_bc = nullptr;
-    const ojson bcs = boundary.is_array() ? boundary : boundary.value("nodes", ojson::array());
+                                            const ojson& fluid,
+                                            const ojson& q_ref_m3h) {
+    const double q_ref =
+        q_ref_m3h.is_null() ? 50.0
+                            : (finite_number(q_ref_m3h)
+                                   ? q_ref_m3h.get<double>()
+                                   : std::numeric_limits<double>::quiet_NaN());
+    if (!std::isfinite(q_ref) || q_ref <= 0) {
+        return {nullptr, jerr("q_ref_m3h must be finite and > 0")};
+    }
+    const ojson bcs = boundary_list(boundary);
+    if (!bcs.is_array()) {
+        return {nullptr, jerr("cannot derive a system curve",
+                              "boundary must be a list")};
+    }
+    int demand_count = 0;
+    int fixed_count = 0;
+    ojson terminal_pressure_kpa = nullptr;
     ojson probe = ojson::array();
     for (const auto& bc : bcs) {
         ojson b = bc;
-        if (bc.is_object() && (bc.contains("demand") || bc.contains("demand_lps"))) {
+        if (bc.is_object() &&
+            (bc.contains("demand") || bc.contains("demand_lps"))) {
+            ++demand_count;
             b = ojson::object();
             for (auto it = bc.begin(); it != bc.end(); ++it)
-                if (it.key() != "demand" && it.key() != "demand_lps") b[it.key()] = it.value();
+                if (it.key() != "demand" && it.key() != "demand_lps")
+                    b[it.key()] = it.value();
             b["demand"] = q_ref;
-            demand_bc = b;
-        } else if (bc.is_object() && (bc.contains("pressure") || bc.contains("head"))) {
-            fixed_bc = bc;
+            if (bc.contains("terminal_pressure_kpa")) {
+                if (!finite_number(bc["terminal_pressure_kpa"]) ||
+                    bc["terminal_pressure_kpa"].get<double>() <=
+                        -P_ATM / 1000.0) {
+                    return {nullptr,
+                            jerr("terminal_pressure_kpa must be finite and imply "
+                                 "positive absolute pressure")};
+                }
+                terminal_pressure_kpa = bc["terminal_pressure_kpa"];
+            }
+        } else if (bc.is_object() &&
+                   (bc.contains("pressure") || bc.contains("head"))) {
+            ++fixed_count;
         }
         probe.push_back(b);
     }
-    if (demand_bc.is_null() || fixed_bc.is_null()) {
+    if (demand_count != 1 || fixed_count != 1) {
         return {nullptr,
                 jerr("cannot derive a system curve",
-                     "boundary needs one fixed pressure/head node and one demand node "
-                     "(the operating flow), or pass system={'static_head_m','k'}")};
+                     "boundary needs exactly one fixed pressure/head node and exactly "
+                     "one demand node, or pass system={'static_head_m','k'}")};
+    }
+    if (terminal_pressure_kpa.is_null()) {
+        return {
+            nullptr,
+            jerr("cannot derive static system head without a terminal-pressure assumption",
+                 "add terminal_pressure_kpa to the demand boundary (use 0 for an "
+                 "atmospheric discharge), or pass system={'static_head_m','k'}")};
     }
     const ojson res = solve(doc, probe, fluid);
     if (!res.value("ok", false)) return {nullptr, res};
-    double total_loss_m = 0.0;
-    for (const auto& l : res["links"]) total_loss_m += l["headloss_m"].get<double>();
-    const double k = q_ref ? total_loss_m / (q_ref * q_ref) : 0.0;
+
     double fixed_head = 0.0;
-    for (const auto& n : res["nodes"])
+    double demand_head = 0.0;
+    double z_demand = 0.0;
+    bool found_fixed = false;
+    bool found_demand = false;
+    for (const auto& n : res["nodes"]) {
         if (n.value("fixed", false)) {
             fixed_head = n["head_m"].get<double>();
-            break;
+            found_fixed = true;
         }
-    double z_demand = 0.0;
-    for (const auto& n : res["nodes"]) {
         if (std::abs(n["demand_m3h"].get<double>() - q_ref) < 1e-3) {
+            demand_head = n["head_m"].get<double>();
             z_demand = n["xyz"][2].get<double>() / 1000.0;
-            break;
+            found_demand = true;
         }
     }
-    const double static_head = fixed_head - z_demand;
+    if (!found_fixed || !found_demand) {
+        return {nullptr, jerr("cannot identify fixed and demand nodes in system-curve probe")};
+    }
+    // The solved source-to-demand total-head difference is the friction loss at
+    // q_ref.  The zero-flow static requirement is instead the terminal total
+    // head required by the caller minus the total head already available at the
+    // source.  Keeping these terms separate gives a +10 m requirement for an
+    // atmospheric outlet 10 m above an atmospheric source, and subtracts source
+    // pressure assistance with the correct sign.
+    const double total_loss_m = std::abs(fixed_head - demand_head);
+    const double k = total_loss_m / (q_ref * q_ref);
+    const double rho = res["fluid"]["rho"].get<double>();
+    const double terminal_pressure = terminal_pressure_kpa.get<double>();
+    const double terminal_total_head =
+        z_demand + terminal_pressure * 1000.0 / (rho * kG);
+    const double static_head = terminal_total_head - fixed_head;
     ojson system = ojson::object();
     system["static_head_m"] = static_head;
     system["k"] = k;
@@ -1458,6 +1973,10 @@ std::pair<ojson, ojson> derive_system_curve(const ojson& doc, const ojson& bound
     meta["q_ref_m3h"] = q_ref;
     meta["total_loss_m"] = pyround(total_loss_m, 4);
     meta["static_head_m"] = pyround(static_head, 4);
+    meta["source_total_head_m"] = pyround(fixed_head, 4);
+    meta["destination_elevation_m"] = pyround(z_demand, 4);
+    meta["terminal_pressure_kpa"] = terminal_pressure;
+    meta["terminal_total_head_m"] = pyround(terminal_total_head, 4);
     meta["k"] = k;
     return {system, meta};
 }
@@ -1476,6 +1995,11 @@ ojson npsh_margin(double q_m3h, const ojson& suction, const ojson& fluid,
         out["hint"] = "pass suction={'pressure_kpa','elevation_m','friction_m'} for NPSHa";
         return out;
     }
+    if (!suction.is_object()) {
+        ojson out = nulls();
+        out["reason"] = "suction must be an object";
+        return out;
+    }
     const ojson fl = resolve_solver_fluid(fluid);
     if (!fl.value("ok", true) && fl.contains("reason")) {
         ojson out = nulls();
@@ -1483,12 +2007,39 @@ ojson npsh_margin(double q_m3h, const ojson& suction, const ojson& fluid,
         return out;
     }
     const double rho = fl["rho"].get<double>();
-    const double p_atm =
-        (suction.value("atm_kpa", ojson(P_ATM / 1000.0))).get<double>() * 1000.0;
-    const double p_suct_g = suction.value("pressure_kpa", 0.0) * 1000.0;
+    auto finite_suction = [&](const char* key, double def) {
+        const ojson value = suction.value(key, ojson(def));
+        return finite_number(value) ? value.get<double>()
+                                    : std::numeric_limits<double>::quiet_NaN();
+    };
+    const double atm_kpa = finite_suction("atm_kpa", P_ATM / 1000.0);
+    const double pressure_kpa = finite_suction("pressure_kpa", 0.0);
+    const double z = finite_suction("elevation_m", 0.0);
+    const double h_fric = finite_suction("friction_m", 0.0);
+    if (!std::isfinite(atm_kpa) || atm_kpa <= 0 ||
+        !std::isfinite(pressure_kpa) || !std::isfinite(z) ||
+        !std::isfinite(h_fric) || h_fric < 0) {
+        ojson out = nulls();
+        out["reason"] =
+            "suction pressures/elevation must be finite, atm_kpa > 0, and friction_m >= 0";
+        return out;
+    }
+    const double p_atm = atm_kpa * 1000.0;
+    const double p_suct_g = pressure_kpa * 1000.0;
+    if (p_atm + p_suct_g <= 0) {
+        ojson out = nulls();
+        out["reason"] = "suction gauge pressure implies non-positive absolute pressure";
+        return out;
+    }
     double p_vap;
     ojson pvap_src;
     if (suction.contains("pvap_kpa")) {
+        if (!finite_number(suction["pvap_kpa"]) ||
+            suction["pvap_kpa"].get<double>() < 0) {
+            ojson out = nulls();
+            out["reason"] = "suction pvap_kpa must be finite and >= 0";
+            return out;
+        }
         p_vap = suction["pvap_kpa"].get<double>() * 1000.0;
         pvap_src = "caller-supplied";
     } else {
@@ -1501,22 +2052,43 @@ ojson npsh_margin(double q_m3h, const ojson& suction, const ojson& fluid,
         p_vap = fl["pvap"].get<double>();
         pvap_src = fl.value("source", ojson(nullptr));
     }
-    const double z = suction.value("elevation_m", 0.0);
-    const double h_fric = suction.value("friction_m", 0.0);
-    const double npsha = (p_atm + p_suct_g - p_vap) / (rho * kG) + z - h_fric;
+    const double npsha =
+        (p_atm + p_suct_g - p_vap) / (rho * kG) + z - h_fric;
+    if (!std::isfinite(npsha)) {
+        ojson out = nulls();
+        out["reason"] = "NPSHa calculation produced a non-finite value";
+        return out;
+    }
 
     double npshr = kNoInterp;
     if (!npshr_curve.is_null()) {
-        const ojson curve = !npshr_curve.is_object()
-                                ? load_pump_curve_json(npshr_curve, 1.0, "flow", "npshr")
-                                : npshr_curve;
-        if (curve.value("ok", false)) npshr = interp_curve(curve["points"], q_m3h);
+        ojson curve = npshr_curve;
+        if (!curve.is_object())
+            curve = load_pump_curve_json(curve, 1.0, "flow", "npshr");
+        if (!curve.value("ok", false)) {
+            ojson out = nulls();
+            out["reason"] = curve.value("reason", std::string("invalid NPSHr curve"));
+            return out;
+        }
+        if (ojson err = validate_curve_object(curve, true); !err.is_null()) {
+            ojson out = nulls();
+            out["reason"] = err["reason"];
+            return out;
+        }
+        npshr = interp_curve(curve["points"], q_m3h);
+        if (std::isnan(npshr)) {
+            ojson out = nulls();
+            out["reason"] = "NPSHr curve does not cover the duty-point flow";
+            return out;
+        }
     }
     const bool have_r = !std::isnan(npshr);
     ojson out = ojson::object();
+    out["ok"] = true;
     out["npsha_m"] = pyround(npsha, 4);
     out["npshr_m"] = have_r ? ojson(pyround(npshr, 4)) : ojson(nullptr);
     out["margin_m"] = have_r ? ojson(pyround(npsha - npshr, 4)) : ojson(nullptr);
+    out["cavitation_risk"] = npsha <= 0 || (have_r && npsha <= npshr);
     out["rho_kgm3"] = rho;
     out["pvap_pa"] = pyround(p_vap, 3);
     out["pvap_source"] = pvap_src;
@@ -1529,9 +2101,15 @@ ojson npsh_margin(double q_m3h, const ojson& suction, const ojson& fluid,
 ojson operating_point(const ojson& pump_curve, const ojson& system_in, const ojson& doc,
                       const ojson& boundary, const ojson& fluid, const ojson& q_ref_m3h,
                       const ojson& npshr_curve, const ojson& suction, double speed_ratio) {
+    if (!std::isfinite(speed_ratio) || speed_ratio <= 0)
+        return jerr("speed_ratio must be finite and > 0");
     ojson pump = nullptr;
     if (pump_curve.is_object() && pump_curve.value("ok", false)) {
+        if (ojson err = validate_curve_object(pump_curve); !err.is_null()) return err;
         pump = pump_curve;
+        if (!pump.contains("shutoff_head")) pump["shutoff_head"] = pump["points"][0][1];
+        if (!pump.contains("max_flow")) pump["max_flow"] = pump["points"].back()[0];
+        if (!pump.contains("speed_ratio")) pump["speed_ratio"] = speed_ratio;
     } else {
         pump = load_pump_curve_json(pump_curve, speed_ratio, "flow", "head");
     }
@@ -1551,6 +2129,13 @@ ojson operating_point(const ojson& pump_curve, const ojson& system_in, const ojs
         system = sys;
         derived = meta;
     }
+    if (!system.is_object()) return jerr("system curve must be an object");
+    const ojson static_head_j = system.value("static_head_m", ojson(0.0));
+    const ojson k_j = system.value("k", ojson(0.0));
+    if (!finite_number(static_head_j) || !finite_number(k_j) ||
+        k_j.get<double>() < 0) {
+        return jerr("system static_head_m must be finite and k must be finite and >= 0");
+    }
 
     // Intersect: g(Q) = H_pump(Q) − H_sys(Q). Bisect over the pump's flow range.
     const ojson& pts = pump["points"];
@@ -1558,9 +2143,11 @@ ojson operating_point(const ojson& pump_curve, const ojson& system_in, const ojs
     auto g = [&](double q) { return pump_head(pump, q / 3600.0) - system_head(system, q); };
     double q_lo = q_lo0, q_hi = q_hi0;
     const double g_lo = g(q_lo), g_hi = g(q_hi);
+    if (!std::isfinite(g_lo) || !std::isfinite(g_hi))
+        return jerr("pump/system curve evaluation produced a non-finite value");
     if (g_lo < 0) {
         ojson out = jerr(
-            "no operating point: system head exceeds pump shutoff head at zero flow",
+            "no operating point: system head exceeds pump shutoff head at minimum curve flow",
             "the pump cannot meet the static lift — raise pump speed or lower static head");
         out["shutoff_head_m"] = pump["shutoff_head"];
         out["static_head_m"] = system.value("static_head_m", ojson(nullptr));
@@ -1607,11 +2194,18 @@ ojson operating_point(const ojson& pump_curve, const ojson& system_in, const ojs
     if (!derived.is_null()) out["system_curve"]["derived_from"] = derived;
 
     const ojson npsh = npsh_margin(q_star, suction, fluid, npshr_curve);
+    if (!suction.is_null() && npsh.contains("reason")) {
+        ojson err = jerr("invalid suction/NPSH setup: " +
+                         npsh["reason"].get<std::string>());
+        err["npsh"] = npsh;
+        return err;
+    }
     out["npsh"] = npsh;
-    if (!npsh.value("margin_m", ojson(nullptr)).is_null() &&
-        npsh["margin_m"].get<double>() < 0) {
-        out["warnings"].push_back("NPSH margin negative — cavitation risk at the duty point");
-        ojson na = ojson::array({"raise suction pressure / lower NPSHr — cavitation risk"});
+    if (npsh.value("cavitation_risk", false)) {
+        out["warnings"].push_back(
+            "NPSHa is non-positive or does not exceed NPSHr — cavitation risk at the duty point");
+        ojson na = ojson::array(
+            {"raise suction pressure / reduce suction losses / lower NPSHr — cavitation risk"});
         for (const auto& a : out["next_actions"]) na.push_back(a);
         out["next_actions"] = std::move(na);
     }

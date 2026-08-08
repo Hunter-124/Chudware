@@ -700,6 +700,11 @@ void ScenarioRunner::tick(AppState& st) {
                 feaSettle = 3; ++feaStep; break;
             }
             case 1: {  // Static study + resolved fixture/load faces (-X end / +X end)
+                st.activeWorkspace = AppState::Workspace::Simulate;
+                st.leftPaneTab = AppState::LP_Simulation;
+                st.showRibbon = true;
+                st.showSimulationTools = true;
+                st.ribbonTab = AppState::RT_Simulation;
                 if (st.simManager) {
                     st.simManager->handleCommand(st, "sim_new_static");
                     st.simManager->configureActive(st, 0.2f, "steel_1018");
@@ -886,9 +891,8 @@ void ScenarioRunner::tick(AppState& st) {
         st.camShotDone = true;
     }
 
-    // ---------- external-flow scenario (CHUDWARE_SHOT=flow) ----------
     // new part -> fuselage-ish bar 80x20x20 -> Flow study (water, 10 deg AoA, coarse) -> run ->
-    // wait for the result colormap (Cp on the model + streamlines over it) -> capture.
+    // wait for the numeric result (and a contour if the selected solver provides one) -> capture.
     if (st.wantFlow && st.workerStarted && !st.flowShotDone) {
         if (st.simManager) st.simManager->tick(st);  // pump so completion lands while we wait
         if (flowSettle > 0) { --flowSettle; }
@@ -911,6 +915,11 @@ void ScenarioRunner::tick(AppState& st) {
                 flowSettle = 3; ++flowStep; break;
             }
             case 1: {  // Flow study: water, 10 deg AoA, coarse preset
+                st.activeWorkspace = AppState::Workspace::Simulate;
+                st.leftPaneTab = AppState::LP_Simulation;
+                st.showRibbon = true;
+                st.showSimulationTools = true;
+                st.ribbonTab = AppState::RT_Simulation;
                 if (st.simManager) {
                     st.simManager->handleCommand(st, "sim_new_flow");
                     st.simManager->configureActiveFlow(st, /*fluid=water*/1, /*aoa*/10.0f,
@@ -928,11 +937,17 @@ void ScenarioRunner::tick(AppState& st) {
             }
             case 3: {  // Wait for completion (cap ~180 s — coarse LBM)
                 ++flowWaitFrames;
-                if (st.colormapOn || flowWaitFrames > 10800) {
-                    std::printf("flow: result ready colormap=%d legend=%d (%d frames)\n",
+                const bool numericReady =
+                    st.simManager && st.simManager->flowHasResult();
+                if (numericReady) {
+                    std::printf("flow: result ready numeric=1 colormap=%d legend=%d (%d frames)\n",
                                 (int)st.colormapOn, (int)st.legendOn, flowWaitFrames);
                     std::fflush(stdout);
                     ++flowStep;
+                } else if (flowWaitFrames > 10800) {
+                    std::fprintf(stderr,
+                                 "flow: FAILED — numeric result did not arrive within 180 s\n");
+                    st.flowShotDone = true;
                 }
                 break;
             }
@@ -2204,7 +2219,6 @@ void ScenarioRunner::runMotion(AppState& st) {
         return true;
     };
 
-    AsmPanels* ap = st.asmPanels;
 
     switch (mtStep) {
         case 0: {
@@ -2229,66 +2243,76 @@ void ScenarioRunner::runMotion(AppState& st) {
             mtSettle = 2; ++mtStep; break;
         }
         case 1: {
-            // new_assembly + insert base (fixed) + arm (offset so it's visible separately).
-            if (!ap) { std::printf("motion: no AsmPanels — skip\n"); std::fflush(stdout);
-                st.motionShotDone = true; break; }
+            // Insert both components in one revision-safe operation. The base is grounded;
+            // the arm starts 60 mm above it and remains free for the dimensional mate.
             std::string err;
             if (!st.docMirror.newAssembly(st.worker, err)) {
-                std::printf("motion: new_assembly FAILED: %s\n", err.c_str()); std::fflush(stdout);
-                st.motionShotDone = true; break;
+                std::printf("motion: new_assembly FAILED: %s\n", err.c_str());
+                std::fflush(stdout);
+                st.motionShotDone = true;
+                break;
             }
             mtAsmDoc = st.docMirror.docId();
-            std::string aicm;
-            ap->insertComponent(st, mtBasePath, nullptr, aicm);
-            // Place the arm offset so it doesn't overlap the base initially.
             nlohmann::json off = nlohmann::json::array(
-                {1,0,0,0, 0,1,0,0, 0,0,1,60, 0,0,0,1});  // +60mm in Z
-            ap->insertComponent(st, mtArmPath, off, aicm);
-            // Grab the second component id.
-            const auto& tr = st.docMirror.tree();
-            if (tr.contains("components") && tr["components"].is_array() &&
-                tr["components"].size() >= 2)
-                mtK2 = tr["components"][1].value("id", std::string());
-            std::printf("motion: assembly %s, arm=%s\n", mtAsmDoc.c_str(), mtK2.c_str());
+                {1,0,0,0, 0,1,0,0, 0,0,1,60, 0,0,0,1});
+            nlohmann::json ops = nlohmann::json::array({
+                {{"op","asm_insert_component"},{"source",{{"path",mtBasePath}}},
+                 {"name","Ground"},{"fixed",true}},
+                {{"op","asm_insert_component"},{"source",{{"path",mtArmPath}}},
+                 {"name","Arm"},{"fixed",false},{"transform",off}},
+            });
+            auto r = st.docMirror.applyOps(st.worker, ops);
+            mtK1 = r.id_map.value("$0", std::string());
+            mtK2 = r.id_map.value("$1", std::string());
+            if (!r.ok || mtK1.empty() || mtK2.empty()) {
+                std::printf("motion: component insert FAILED: %s\n",
+                            r.error_message.c_str());
+                std::fflush(stdout);
+                st.motionShotDone = true;
+                break;
+            }
+            if (!r.aicm_path.empty()) {
+                std::string le;
+                st.loadDocMesh(r.aicm_path, le);
+            }
+            std::printf("motion: assembly %s, base=%s arm=%s\n",
+                        mtAsmDoc.c_str(), mtK1.c_str(), mtK2.c_str());
             std::fflush(stdout);
             st.yaw = 25; st.pitch = 18; st.zoom = 1.0f;
             mtSettle = kSettle; ++mtStep; break;
         }
         case 2: {
-            // Add an angle mate between top face of base (body 1) and front face of arm (body 2).
-            // An angle mate is the drivable dimensional mate for motion studies.
-            if (!ap) { st.motionShotDone = true; break; }
-            auto resolveAsm = [&](int bodyId, const char* kind, int topo,
-                                  std::string& comp) -> nlohmann::json {
-                std::string e;
-                std::string s = st.docMirror.resolvePickAsm(st.worker, bodyId, kind, topo, comp, e);
-                if (s.empty()) return nlohmann::json();
-                try { return nlohmann::json::parse(s); } catch (...) { return nlohmann::json(); }
-            };
-            // Find a planar face on base (body 1) and a planar face on arm (body 2).
-            std::string cBase, cArm;
-            nlohmann::json baseFace, armFace;
-            for (int t = 1; t <= 20; ++t) {
-                std::string c; nlohmann::json s = resolveAsm(1, "face", t, c);
-                if (!s.is_object()) break;
-                if (s.value("surf","") == "plane" && baseFace.is_null()) { baseFace = s; cBase = c; }
+            // A resolved plane-distance mate is a proven drivable DOF. Selectors are
+            // expressed in each centered component's local geometry coordinates.
+            nlohmann::json baseFace = {
+                {"kind","face"},{"centroid",nlohmann::json::array({0.0,0.0,5.0})}};
+            nlohmann::json armFace = {
+                {"kind","face"},{"centroid",nlohmann::json::array({0.0,0.0,25.0})}};
+            nlohmann::json refs = nlohmann::json::array({
+                {{"component",mtK1},{"selector",baseFace}},
+                {{"component",mtK2},{"selector",armFace}},
+            });
+            nlohmann::json ops = nlohmann::json::array({{
+                {"op","asm_add_mate"},
+                {"mate",{{"type","distance"},
+                         {"value",{{"value",60.0},{"expr",nullptr}}},
+                         {"align","aligned"},{"suppressed",false},{"refs",refs}}}
+            }});
+            auto r = st.docMirror.applyOps(st.worker, ops);
+            const std::string mateId = r.id_map.value("$0", std::string());
+            if (!r.ok || mateId.empty()) {
+                std::printf("motion: distance mate FAILED: %s\n",
+                            r.error_message.c_str());
+                std::fflush(stdout);
+                st.motionShotDone = true;
+                break;
             }
-            for (int t = 1; t <= 20; ++t) {
-                std::string c; nlohmann::json s = resolveAsm(2, "face", t, c);
-                if (!s.is_object()) break;
-                if (s.value("surf","") == "plane" && armFace.is_null()) { armFace = s; cArm = c; }
+            if (!r.aicm_path.empty()) {
+                std::string le;
+                st.loadDocMesh(r.aicm_path, le);
             }
-            std::string aicm;
-            if (baseFace.is_object() && armFace.is_object()) {
-                nlohmann::json refs = nlohmann::json::array();
-                refs.push_back({{"component", cBase}, {"selector", baseFace}});
-                refs.push_back({{"component", cArm},  {"selector", armFace}});
-                ap->addMate(st, "angle", "aligned", refs, aicm);
-                std::printf("motion: angle mate added base=%s arm=%s\n",
-                            cBase.c_str(), cArm.c_str());
-            } else {
-                std::printf("motion: WARNING planar faces not found — motion may fail\n");
-            }
+            std::printf("motion: distance mate %s added base=%s arm=%s\n",
+                        mateId.c_str(), mtK1.c_str(), mtK2.c_str());
             std::fflush(stdout);
             mtSettle = kSettle; ++mtStep; break;
         }
@@ -2298,6 +2322,7 @@ void ScenarioRunner::runMotion(AppState& st) {
             st.leftPaneTab     = AppState::LP_Simulation;
             if (st.simManager) {
                 st.simManager->handleCommand(st, "sim_new_motion");
+                st.simManager->configureActiveMotion(st, 60.0f, 100.0f, 24);
                 std::printf("motion: Motion study created\n"); std::fflush(stdout);
             } else {
                 std::printf("motion: WARNING no simManager\n"); std::fflush(stdout);

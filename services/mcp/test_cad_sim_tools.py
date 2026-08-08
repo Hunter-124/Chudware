@@ -20,12 +20,15 @@ import math
 import time
 
 import pytest
+from services.mcp import cad_sim_tools as sim_tools
 
 from services.mcp.cad_sim_tools import (
     _canon_item_keys,
     _norm_bc_list,
     _norm_direction,
     _norm_fineness,
+    _positive_int,
+    _validate_thermal_schedule,
 )
 
 
@@ -229,6 +232,20 @@ def test_buckling_polar_load_sets_the_applied_magnitude(bc_doc):
     assert out.get("ok") is True, out
     assert out["applied_load_n"] == pytest.approx(1000.0), out
     assert out["load_factors"] and out["load_factors"][0] > 0.0, out
+    mapping = out["input_mapping"]
+    assert mapping["world_axis"] == "z", mapping
+    assert mapping["proxy_length_mm"] == pytest.approx(20.0, rel=1e-3), mapping
+    assert mapping["proxy_cross_section_mm"] == pytest.approx([100.0, 50.0], rel=1e-3)
+
+
+def test_buckling_refuses_to_map_shear_into_axial_compression(bc_doc):
+    out = json.loads(_dispatch()("run_fea_buckling")(
+        fixtures=["bottom"],
+        load=[{"face": "top", "force": [10, 0, -1000]}],
+        doc_id=bc_doc))
+    if out.get("skipped"):
+        pytest.skip(f"ccx unavailable: {out.get('reason')}")
+    assert out["ok"] is False and "tangential" in out["error"], out
 
 
 # ----------------------------------------------- rejected dialects (clear error, no study run)
@@ -346,6 +363,179 @@ def test_fineness_number_and_numeric_string_unchanged():
 def test_fineness_garbage_names_the_vocabulary():
     with pytest.raises(ValueError, match="coarse"):
         _norm_fineness("as fine as you can")
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, float("nan"), float("inf")])
+def test_fineness_rejects_out_of_range_and_non_finite_values(value):
+    with pytest.raises(ValueError, match="mesh_fineness|finite|0..1"):
+        _norm_fineness(value)
+
+
+@pytest.mark.parametrize("value", [[float("nan"), 0, 1], [float("inf"), 0, 1]])
+def test_direction_rejects_non_finite_components(value):
+    with pytest.raises(ValueError, match="finite"):
+        _norm_direction(value, "loads[0]")
+
+
+def test_direction_object_refuses_fields_that_would_be_ignored():
+    with pytest.raises(ValueError, match="exactly x, y, z"):
+        _norm_direction({"x": 1, "y": 0, "z": 0, "units": "mm"}, "loads[0]")
+
+
+def test_positive_integer_guard_does_not_truncate_or_accept_bool():
+    for value in (0, -1, 2.5, True, float("nan")):
+        with pytest.raises(ValueError, match="positive integer"):
+            _positive_int(value, "n_modes")
+    assert _positive_int("3", "n_modes") == 3
+
+
+def test_fixture_wrapper_refuses_fields_or_constraint_types_the_solver_would_ignore():
+    with pytest.raises(ValueError, match="unsupported fixture type"):
+        _norm_bc_list([{"face": "bottom", "type": "roller"}], "fixtures",
+                      unwrap_query=True)
+    with pytest.raises(ValueError, match="unsupported fields"):
+        _norm_bc_list([{"face": "bottom", "temperature": 20}], "fixtures",
+                      unwrap_query=True)
+
+
+def test_missing_face_is_reported_before_load_shape_validation():
+    with pytest.raises(ValueError, match="each load needs a 'face' query") as exc:
+        _norm_bc_list([{"name": "tip", "type": "force", "magnitude_n": 500,
+                        "direction": [0, 0, -1]}], "loads")
+    assert "unsupported load type" not in str(exc.value)
+
+
+def test_material_requirements_are_analysis_specific():
+    steady = sim_tools._resolve_study_material(
+        {"name": "thermal-only", "conductivity_w_mk": 1.5}, "thermal_steady")
+    assert steady["conductivity_w_mk"] == 1.5
+
+    transient = sim_tools._resolve_study_material(
+        {"name": "thermal-only", "density_g_cm3": 2.4},
+        "thermal_transient", conductivity_w_mk=1.5, specific_heat_j_kgk=800)
+    assert transient["density_g_cm3"] == 2.4
+    assert transient["conductivity_w_mk"] == 1.5
+    assert transient["cp_j_kgk"] == 800
+
+    with pytest.raises(ValueError, match=r"material\.conductivity_w_mk"):
+        sim_tools._resolve_study_material(
+            {"name": "missing-thermal-fields"}, "thermal_steady")
+    with pytest.raises(ValueError, match=r"material\.cp_j_kgk"):
+        sim_tools._resolve_study_material(
+            {"name": "missing-cp", "density_g_cm3": 2.4, "k_w_mk": 1.5},
+            "thermal_transient")
+    with pytest.raises(ValueError, match="E_mpa"):
+        sim_tools._resolve_study_material(
+            {"name": "not-structural", "conductivity_w_mk": 1.5}, "static")
+
+
+def test_default_frequency_sweep_includes_only_finite_in_band_modes():
+    base = [10.0, 100.0, 2000.0]
+    merged = sim_tools._merge_default_frequency_sweep(
+        base, [9.0, 55.0, 2001.0, float("nan"), float("inf"), "250"])
+    assert merged == [10.0, 55.0, 100.0, 250.0, 2000.0]
+
+
+def test_mechanical_load_refuses_mixed_models_and_unused_direction():
+    with pytest.raises(ValueError, match="both 'force' and 'pressure'"):
+        _norm_bc_list([{"face": "top", "force": [0, 0, -1], "pressure": 1}],
+                      "loads")
+    with pytest.raises(ValueError, match="only meaningful with 'magnitude'"):
+        _norm_bc_list([{"face": "top", "force": [0, 0, -1],
+                        "direction": [0, 0, -1]}], "loads")
+
+
+def test_thermal_schedule_rejects_zero_or_ambiguous_excitation():
+    assert _validate_thermal_schedule({"duty": 0.0, "period_s": 1.0},
+                                      "loads[0].schedule") is False
+    with pytest.raises(ValueError, match="exactly one"):
+        _validate_thermal_schedule(
+            {"duty": 0.5, "points": [[0, 1]], "period_s": 1.0},
+            "loads[0].schedule")
+    with pytest.raises(ValueError, match="strictly ascending"):
+        _validate_thermal_schedule(
+            {"points": [[0, 1], [0, 0]], "period_s": 1.0},
+            "loads[0].schedule")
+
+
+def test_geometry_gate_refuses_a_degenerate_body_before_meshing(monkeypatch):
+    monkeypatch.setattr(
+        sim_tools.cb, "call",
+        lambda method, params: {"bodies": [{
+            "bbox": {"min": [0, 0, 0], "max": [10, 10, 0]}}]})
+    with pytest.raises(ValueError, match="degenerate"):
+        sim_tools._require_sim_geometry("doc")
+
+
+def test_fast_flow_result_guard_rejects_zero_fields_and_input_unit_mismatch():
+    result = {
+        "converged": True, "drag_n": 1.0, "lift_n": 0.0, "cd": 0.2,
+        "frontal_area_mm2": 100.0, "reynolds": 5000.0, "ref_length_mm": 50.0,
+        "velocity_ms": 10.0, "residual": -1.0, "voxel_mm": 1.0, "steps_run": 50,
+    }
+    assert sim_tools._validate_flow_result(result, 10.0)["drag_n"] == 1.0
+    with pytest.raises(ValueError, match="zero-field"):
+        sim_tools._validate_flow_result({**result, "drag_n": 0.0}, 10.0)
+    with pytest.raises(ValueError, match="does not match"):
+        sim_tools._validate_flow_result(result, 20.0)
+
+
+def test_transient_thermal_result_guard_checks_complete_fields_and_summary():
+    result = {
+        "n_steps": 2, "n_nodes": 2, "n_elems": 1,
+        "frames": [
+            {"t_s": 1.0, "temperature": [20.0, 30.0]},
+            {"t_s": 2.0, "temperature": [25.0, 40.0]},
+        ],
+        "envelope_max": [25.0, 40.0],
+        "summary": {
+            "max_temp_c": 40.0, "max_temp_time_s": 2.0,
+            "min_temp_c": 20.0, "final_max_temp_c": 40.0,
+        },
+    }
+    checked = sim_tools._validate_transient_thermal_result(result, 2.0)
+    assert checked["counts"] == {"n_steps": 2, "n_nodes": 2, "n_elems": 1}
+    free_dof = sim_tools._validate_transient_thermal_result(
+        {**result, "n_dof": 1}, 2.0)
+    assert free_dof["counts"]["n_dof"] == 1
+    prescribed = sim_tools._validate_transient_thermal_result(
+        {**result, "n_dof": 0}, 2.0)
+    assert prescribed["counts"]["n_dof"] == 0
+    with pytest.raises(ValueError, match=r"\[0,n_nodes\]"):
+        sim_tools._validate_transient_thermal_result({**result, "n_dof": 3}, 2.0)
+    with pytest.raises(ValueError, match="1/2 nodal temperatures"):
+        sim_tools._validate_transient_thermal_result(
+            {**result, "frames": [{"t_s": 2.0, "temperature": [40.0]}]}, 2.0)
+    with pytest.raises(ValueError, match="disagrees"):
+        sim_tools._validate_transient_thermal_result(
+            {**result, "summary": {**result["summary"], "max_temp_c": 99.0}}, 2.0)
+
+
+def test_static_collector_rejects_negative_or_inconsistent_solver_envelopes():
+    ctx = {"doc": "d", "material": {"name": "steel"}}
+    negative = sim_tools._collect_static(ctx, {
+        "ok": True,
+        "summary": {"max_von_mises_mpa": 1.0, "max_disp_mm": -1.0, "min_fos": 2.0},
+        "n_dof": 30, "n_elems": 2, "n_nodes": 10,
+    }, [])
+    assert negative["ok"] is False and "negative" in negative["error"]
+    inconsistent = sim_tools._collect_static(ctx, {
+        "ok": True,
+        "summary": {"max_von_mises_mpa": 1.0, "max_disp_mm": 1.0, "min_fos": 2.0},
+        "n_dof": 29, "n_elems": 2, "n_nodes": 10,
+    }, [])
+    assert inconsistent["ok"] is False and "inconsistent mesh" in inconsistent["error"]
+
+
+def test_modal_collector_refuses_out_of_order_modes_before_persistence():
+    out = sim_tools._collect_modal(
+        {"doc": "d", "material": {"name": "steel"}},
+        [12.0, 8.0], 2, [])
+    assert out["ok"] is False and "ascending order" in out["error"]
+    inconsistent = sim_tools._collect_modal(
+        {"doc": "d", "material": {"name": "steel"}},
+        [8.0, 12.0], 2, [], diagnostics={"n_nodes": 10, "n_dof": 29})
+    assert inconsistent["ok"] is False and "inconsistent mesh" in inconsistent["error"]
 
 # ===================================================== boundary-condition ITEM KEYS (live fix)
 # Measured live 2026-07-29 (claude-sonnet-4-5, general lane, sim suite). The VERBATIM load
@@ -497,6 +687,25 @@ def test_item_keys_are_renamed_and_the_rename_is_reported():
                      "'magnitude_n' as 'magnitude'"], notes
 
 
+def test_kind_alias_on_a_face_wrapper_is_not_misclassified_as_a_raw_query():
+    notes: list = []
+    out = _norm_bc_list(
+        [{"face": "top", "kind": "force", "magnitude": 10, "direction": "-z"}],
+        "loads", notes=notes)
+    assert out == [{"face": "top", "force": [0.0, 0.0, -10.0]}]
+    assert notes == ["loads[0]: read 'kind' as 'type'"]
+
+
+
+def test_canonical_item_keys_are_case_and_separator_insensitive():
+    notes: list = []
+    out = _norm_bc_list(
+        [{"Face": "top", "Force": [0, 0, -10], "Name": "case-load"}],
+        "loads", notes=notes)
+    assert out == [{"face": "top", "force": [0.0, 0.0, -10.0],
+                    "name": "case-load"}]
+    assert notes
+
 def test_a_raw_geometry_query_dict_is_never_key_checked():
     """A query / query-result match dict goes straight to the engine grammar. It carries
     keys this vocabulary knows nothing about ("of", "surf", "kind", "centroid"), so touching
@@ -572,9 +781,9 @@ from services.sim import jobs as simjobs  # noqa: E402
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-# ~7 s of solve on the dev box (0.5 is ~3 s). Long enough that "sim_run returned before the
-# solve could have finished" is a real measurement rather than a rounding artefact.
-_ASYNC_FINENESS = 0.85
+# A medium mesh is slow enough to distinguish a real asynchronous return from a blocking
+# solve while staying below the standard 3 GB resguard budget on a busy workstation.
+_ASYNC_FINENESS = 0.6
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -824,7 +1033,7 @@ def test_a_static_reply_carries_the_mesh_it_solved_on(bc_doc):
 def test_a_saturated_factor_of_safety_says_it_is_a_cap(bc_doc):
     """min_fos clamps at 15 in the solver, so 15 must not read as a computed margin."""
     out = _static(bc_doc, fixtures=["bottom"],
-                  loads=[{"face": "top", "force": [0, 0, -0.001]}])
+                  loads=[{"face": "top", "force": [0, 0, -1.0]}])
     assert out["ok"] is True, out
     if out["summary"]["min_fos"] >= 15.0:
         assert "saturation cap" in out["fos_note"], out

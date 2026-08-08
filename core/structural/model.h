@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <utility>
 
 namespace chudware::structural {
 
@@ -23,13 +24,24 @@ struct StructuralElement {
     std::string section_name;
     std::string material;
     double length_mm = 0.0;
-    std::array<double, 16> transform;  // row-major 4x4 (identity default)
+    std::array<double, 16> transform;  // row-major rigid 4x4 placement
+    // Local member DOFs [ux, uy, uz, rx, ry, rz] at i then j. A true entry
+    // releases that member-end force from the connected node.
+    std::array<bool, 12> end_releases{};
+};
+
+struct StructuralSupport {
+    std::string element_id;
+    bool at_j = false;
+    // Restrained GLOBAL DOFs [ux, uy, uz, rx, ry, rz].
+    std::array<bool, 6> restrained{};
 };
 
 struct StructureDoc {
     std::string name = "Structure1";
     std::string units = "mm";
     std::vector<StructuralElement> elements;
+    std::vector<StructuralSupport> supports;
     std::vector<nlohmann::json> load_cases;  // contract §3 load-case dicts
 };
 
@@ -37,9 +49,9 @@ extern const char* kSchema;  // "aicad.structure/1"
 
 bool is_structure(const nlohmann::json& doc);
 
-// Parse an aicad.structure/1 dict. Throws std::invalid_argument on a schema
-// mismatch / unknown element_type (mirrors StructureDoc.from_dict /
-// element_from_dict).
+// Parse and validate an aicad.structure/1 dict, including canonical units,
+// finite rigid transforms, unique IDs, optional supports/releases, and load
+// container shape. Throws std::invalid_argument for invalid setup.
 StructureDoc structure_doc_from_dict(const nlohmann::json& d);
 
 // Global coordinates of the element's local (0,0,0) and (0,0,length_mm)
@@ -53,19 +65,20 @@ struct MaterialProps {
     double E, G, nu;  // MPa
 };
 
-// (E, G, nu) for a material key, prefix-matched exactly like
-// analysis.material_properties (dict insertion order matters).
+// (E, G, nu) for a supported material family. Unknown keys are rejected
+// rather than assigned an arbitrary softwood stiffness.
 MaterialProps material_properties(const std::string& material);
 
 // ---------------------------------------------------------------- sections
 
 struct SectionProps {
     double E, G, nu, A, Iy, Iz, J;
+    double S_major, S_minor;  // elastic section moduli paired with Iz / Iy
 };
 
-// Full member-stiffness property set for a section spec + material (mirrors
-// analysis.section_properties, including the RHS solid-outer-rectangle note
-// and the per-element-type default fallback).
+// Net section properties for AISC/lumber catalog shapes and validated solid,
+// hollow rectangular, circular hollow, and I-section grammars. Unknown or
+// physically impossible sections are rejected.
 SectionProps section_properties(const std::string& section_name, const std::string& material,
                                 const std::string& element_type = "");
 

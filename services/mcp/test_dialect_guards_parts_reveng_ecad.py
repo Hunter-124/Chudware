@@ -184,25 +184,23 @@ def test_airflow_handoff_enclosure_string_never_silently_dropped(pcb_doc_id):
 # --------------------------------------------------------------------------- ecad_reliability.py
 
 def test_vibe_check_psd_breakpoints_string_rejected_not_crashed(pcb_doc_id):
-    """LIVE CRASH class: `for p in psd_breakpoints` over a stringified list iterated
-    CHARACTER BY CHARACTER, then `float(p[0])` on a single '[' char crashed with
-    "could not convert string to float: '['" — a message naming neither the
-    argument nor the accepted shape. Must now teach (a ValueError naming the
-    argument), never crash blind."""
+    """Malformed PSD input returns the live tool's structured teaching envelope."""
     vibe = _bind("ecad_vibe_check")
-    with pytest.raises(ValueError) as ei:
-        vibe(doc_id=pcb_doc_id, psd_breakpoints="not-a-list", dry_run=True)
-    msg = str(ei.value)
+    out = _as_dict(vibe(
+        doc_id=pcb_doc_id, psd_breakpoints="not-a-list", dry_run=True))
+    assert out.get("ok") is False, out
+    msg = str(out.get("error") or out.get("reason") or "")
     assert "could not convert string to float" not in msg
     assert "psd_breakpoints" in msg and "str" in msg
 
 
 def test_vibe_check_mount_holes_string_rejected_not_crashed(pcb_doc_id):
-    """Same LIVE CRASH class for mount_holes (detect_mount_holes' `float(h[0])`)."""
+    """Malformed mount holes use the same structured live-tool error contract."""
     vibe = _bind("ecad_vibe_check")
-    with pytest.raises(ValueError) as ei:
-        vibe(doc_id=pcb_doc_id, mount_holes="not-a-list", dry_run=True)
-    msg = str(ei.value)
+    out = _as_dict(vibe(
+        doc_id=pcb_doc_id, mount_holes="not-a-list", dry_run=True))
+    assert out.get("ok") is False, out
+    msg = str(out.get("error") or out.get("reason") or "")
     assert "could not convert string to float" not in msg
     assert "mount_holes" in msg and "str" in msg
 
@@ -224,35 +222,31 @@ def test_vibe_check_psd_breakpoints_accepts_python_repr_list(pcb_doc_id):
 # --------------------------------------------------------------------------- ecad_sim_tools.py
 
 def test_ecad_simulate_params_rejects_bad_string_with_teaching_error_not_crash(sch_doc_id):
-    """LIVE CRASH class: `_build_analysis(analysis, params or {}, circuit)` and the
-    AC auto-drive path both do `.get()` on `params` — a bare string used to blow up
-    with 'str' object has no attribute 'get'. Must now teach (a ValueError naming
-    the argument), never crash blind."""
+    """Malformed analysis params return a structured, argument-specific error."""
     simulate = _bind("ecad_simulate")
-    with pytest.raises(ValueError) as ei:
-        simulate(analysis="op", params="not-a-dict", doc_id=sch_doc_id)
-    msg = str(ei.value)
+    out = _as_dict(simulate(
+        analysis="op", params="not-a-dict", doc_id=sch_doc_id))
+    assert out.get("ok") is False, out
+    msg = str(out.get("error") or out.get("reason") or "")
     assert "'str' object has no attribute 'get'" not in msg
     assert "params" in msg and "str" in msg
 
 
 def test_ecad_simulate_probes_string_never_silently_iterated_char_by_char(sch_doc_id):
-    """SILENT WRONG BEHAVIOR class: `list(probes)` on a stringified probe list built
-    single-character garbage probe names with no error at all. Must now teach."""
+    """A probe string is rejected through the uniform live-tool envelope."""
     simulate = _bind("ecad_simulate")
-    with pytest.raises(ValueError) as ei:
-        simulate(analysis="op", probes="not-a-list", doc_id=sch_doc_id)
-    assert "probes" in str(ei.value)
+    out = _as_dict(simulate(
+        analysis="op", probes="not-a-list", doc_id=sch_doc_id))
+    assert out.get("ok") is False, out
+    assert "probes" in str(out.get("error") or out.get("reason") or "")
 
 
 def test_ecad_sweep_values_error_names_the_type_received(sch_doc_id):
-    """CONTENTLESS-ERROR class: the old error ("needs a non-empty 'values' list")
-    named neither the value nor its type. A malformed string now teaches via
-    require_list's ValueError, which names both."""
+    """A malformed sweep list names the argument, value, and received type."""
     sweep = _bind("ecad_sweep")
-    with pytest.raises(ValueError) as ei:
-        sweep(param="R1", values="banana", doc_id=sch_doc_id)
-    msg = str(ei.value)
+    out = _as_dict(sweep(param="R1", values="banana", doc_id=sch_doc_id))
+    assert out.get("ok") is False, out
+    msg = str(out.get("error") or out.get("reason") or "")
     assert "values" in msg and "str" in msg and "banana" in msg
 
 

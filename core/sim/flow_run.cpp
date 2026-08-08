@@ -12,15 +12,19 @@
 
 #include <algorithm>
 #include <chrono>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <exception>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <limits>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -88,6 +92,16 @@ void voxelize_body(const std::vector<float>& pos, const std::vector<uint32_t>& i
             auto& xs = col[(size_t)iy * Nz + iz];
             if (xs.size() < 2) continue;
             std::sort(xs.begin(), xs.end());
+            // A scanline exactly on the shared diagonal of a triangulated face intersects both
+            // coplanar triangles at the same X. Count that geometric crossing once; otherwise
+            // [entry,entry,exit,exit] pairs into two zero-thickness fills and opens a leak.
+            const double merge_eps = std::max(1e-9, voxel * 1e-7);
+            size_t out = 0;
+            for (double x : xs) {
+                if (out == 0 || std::abs(x - xs[out - 1]) > merge_eps)
+                    xs[out++] = x;
+            }
+            xs.resize(out);
             // Fill between consecutive entry/exit pairs (parity).
             for (size_t k = 0; k + 1 < xs.size(); k += 2) {
                 int ix0 = std::max(0, (int)std::floor(xs[k] / voxel));
@@ -116,10 +130,12 @@ nlohmann::json lbm_to_json(const LbmResult& R) {
         {"cd", R.cd},
         {"drag_n", R.drag_n},
         {"lift_n", R.lift_n},
+        {"side_n", R.side_n},
         {"frontal_area_mm2", R.frontal_area_mm2},
         {"steps_run", R.steps_run},
         {"diverged", R.diverged},
         {"residual", R.residual},
+        {"mass_imbalance", R.mass_imbalance},
         {"converged", R.converged},
         {"voxel_mm", R.voxel_mm},
         {"ref_length_mm", R.ref_length_mm},
@@ -145,10 +161,12 @@ LbmResult lbm_from_json(const nlohmann::json& j) {
     R.cd = j.value("cd", 0.0);
     R.drag_n = j.value("drag_n", 0.0);
     R.lift_n = j.value("lift_n", 0.0);
+    R.side_n = j.value("side_n", 0.0);
     R.frontal_area_mm2 = j.value("frontal_area_mm2", 0.0);
     R.steps_run = j.value("steps_run", 0);
     R.diverged = j.value("diverged", false);
     R.residual = j.value("residual", -1.0);
+    R.mass_imbalance = j.value("mass_imbalance", -1.0);
     R.converged = j.value("converged", false);
     R.voxel_mm = j.value("voxel_mm", 0.0);
     R.ref_length_mm = j.value("ref_length_mm", 0.0);
@@ -173,6 +191,7 @@ std::string cfd_input_hash(const std::vector<std::vector<float>>& body_pos,
         bodies.push_back(std::move(body));
     }
     nlohmann::json inputs = {
+        {"solver_revision", 5},
         {"bodies", bodies},
         {"velocity_ms", fp.velocity_ms},
         {"aoa_deg", fp.aoa_deg},
@@ -190,15 +209,99 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                           const std::vector<std::vector<uint32_t>>& body_idx, const FlowParams& fp,
                           double* reynolds_out) {
     LbmResult R;
-    if (body_pos.empty()) { R.ok = false; R.error = "no geometry"; return R; }
+    try {
+    if (body_pos.empty()) { R.error = "no geometry"; return R; }
+    if (body_pos.size() != body_idx.size()) {
+        R.error = "geometry body/triangle-list count mismatch";
+        return R;
+    }
+    if (!std::isfinite(fp.velocity_ms) || fp.velocity_ms <= 0.0 ||
+        !std::isfinite(fp.nu_fluid) || fp.nu_fluid <= 0.0 ||
+        !std::isfinite(fp.rho_fluid) || fp.rho_fluid <= 0.0 ||
+        !std::isfinite(fp.aoa_deg) || fp.cells < 16 || fp.n_steps <= 0) {
+        R.error = "invalid flow parameters: speed, density, viscosity and steps must be "
+                  "positive and finite; cells must be >= 16";
+        return R;
+    }
+    std::vector<std::vector<uint32_t>> valid_body_idx(body_idx.size());
+    for (size_t b = 0; b < body_pos.size(); ++b) {
+        const auto& p = body_pos[b];
+        const auto& input_idx = body_idx[b];
+        auto& idx = valid_body_idx[b];
+        if (p.size() < 9 || p.size() % 3 != 0 ||
+            input_idx.size() < 3 || input_idx.size() % 3 != 0) {
+            R.error = "malformed triangle geometry";
+            return R;
+        }
+        if (!std::all_of(p.begin(), p.end(), [](float v) { return std::isfinite(v); })) {
+            R.error = "geometry contains non-finite coordinates";
+            return R;
+        }
+        const size_t nverts = p.size() / 3;
+        for (uint32_t i : input_idx) {
+            if (static_cast<size_t>(i) >= nverts) {
+                R.error = "geometry triangle index out of range";
+                return R;
+            }
+        }
+        idx.reserve(input_idx.size());
+        for (size_t t = 0; t < input_idx.size(); t += 3) {
+            const size_t ia = static_cast<size_t>(input_idx[t]) * 3;
+            const size_t ib = static_cast<size_t>(input_idx[t + 1]) * 3;
+            const size_t ic = static_cast<size_t>(input_idx[t + 2]) * 3;
+            const double abx = p[ib] - p[ia], aby = p[ib + 1] - p[ia + 1];
+            const double abz = p[ib + 2] - p[ia + 2];
+            const double acx = p[ic] - p[ia], acy = p[ic + 1] - p[ia + 1];
+            const double acz = p[ic + 2] - p[ia + 2];
+            const double cx = aby * acz - abz * acy;
+            const double cy = abz * acx - abx * acz;
+            const double cz = abx * acy - aby * acx;
+            // OCCT tessellation can emit zero-area padding facets around seams. They
+            // carry no surface area and are safe to discard; the closed-manifold check
+            // below still rejects any resulting hole or otherwise incomplete shell.
+            if (cx * cx + cy * cy + cz * cz <= 1e-24) continue;
+            idx.push_back(input_idx[t]);
+            idx.push_back(input_idx[t + 1]);
+            idx.push_back(input_idx[t + 2]);
+        }
+        if (idx.empty()) {
+            R.error = "geometry contains no non-degenerate triangles";
+            return R;
+        }
+        using VertexKey = std::array<uint32_t, 3>;
+        auto vertex_key = [&](uint32_t vi) {
+            VertexKey key{};
+            for (size_t axis = 0; axis < 3; ++axis) {
+                float value = p[static_cast<size_t>(vi) * 3 + axis];
+                if (value == 0.0f) value = 0.0f;  // canonicalize negative zero
+                std::memcpy(&key[axis], &value, sizeof(value));
+            }
+            return key;
+        };
+        std::map<std::pair<VertexKey, VertexKey>, int> edge_counts;
+        for (size_t t = 0; t < idx.size(); t += 3) {
+            for (int e = 0; e < 3; ++e) {
+                VertexKey a = vertex_key(idx[t + e]);
+                VertexKey c = vertex_key(idx[t + (e + 1) % 3]);
+                if (c < a) std::swap(a, c);
+                ++edge_counts[{a, c}];
+            }
+        }
+        if (std::any_of(edge_counts.begin(), edge_counts.end(),
+                        [](const auto& edge) { return edge.second != 2; })) {
+            R.error = "geometry is not a closed two-manifold triangle surface";
+            return R;
+        }
+    }
 
     // Cancel registration (sim_cancel): an empty job_id is an anonymous run and registers
     // nothing. The guard unregisters on every return path (cache hit, error, cancel, done).
     const SimCancelToken cancel_tok = sim_job_register(fp.job_id);
     struct JobGuard {
         const std::string& id;
-        ~JobGuard() { sim_job_unregister(id); }
-    } _job_guard{fp.job_id};
+        const SimCancelToken& token;
+        ~JobGuard() { sim_job_unregister(id, token); }
+    } _job_guard{fp.job_id, cancel_tok};
     std::function<bool()> should_cancel;
     if (cancel_tok) should_cancel = [cancel_tok] { return cancel_tok->load(); };
 
@@ -220,8 +323,10 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                         hi[2] = std::max(hi[2], (double)p[i + 2]);
                     }
                 const double longest = std::max({hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]});
-                const double speed = std::max(fp.velocity_ms, 1e-6);
-                *reynolds_out = (fp.nu_fluid > 0) ? speed * (longest * 1e-3) / fp.nu_fluid : 0.0;
+                *reynolds_out =
+                    (fp.nu_fluid > 0)
+                        ? fp.velocity_ms * (longest * 1e-3) / fp.nu_fluid
+                        : 0.0;
             }
             return R;
         }
@@ -322,30 +427,63 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
         }
     }
 
+    // Keep anonymous/direct calls safe even when the adaptive governor is disabled.
+    // The mask is allocated before lbm_run can apply its own size checks, so validate
+    // multiplication and an absolute 8 GiB lattice ceiling here.
+    constexpr size_t kHardMaxCells = (size_t{8} << 30) / 256;
+    if (static_cast<size_t>(Nx) >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(Ny) ||
+        static_cast<size_t>(Nx) * static_cast<size_t>(Ny) >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(Nz)) {
+        R.error = "CFD grid dimensions overflow addressable memory";
+        return R;
+    }
+    const size_t ncell = static_cast<size_t>(Nx) * static_cast<size_t>(Ny) *
+                         static_cast<size_t>(Nz);
+    if (ncell > kHardMaxCells) {
+        R.error = "CFD grid exceeds the absolute 8 GiB lattice safety limit";
+        return R;
+    }
     // Offset geometry into the domain corner with the pads, then voxelize each body (OR).
     double off[3] = {up - lo[0], lat - lo[1], lat - lo[2]};
-    std::vector<uint8_t> mask((size_t)Nx * Ny * Nz, 0);
+    std::vector<uint8_t> mask(ncell, 0);
     for (size_t b = 0; b < pos.size(); ++b) {
         std::vector<float> shifted = pos[b];
         for (size_t i = 0; i + 2 < shifted.size(); i += 3) {
             shifted[i] += (float)off[0]; shifted[i + 1] += (float)off[1]; shifted[i + 2] += (float)off[2];
         }
-        voxelize_body(shifted, body_idx[b], mask, Nx, Ny, Nz, voxel);
+        voxelize_body(shifted, valid_body_idx[b], mask, Nx, Ny, Nz, voxel);
     }
     size_t solid_cells = 0;
     for (uint8_t m : mask) solid_cells += m;
     if (solid_cells == 0) { R.ok = false; R.error = "voxelization produced no solid cells"; return R; }
 
     // Lattice params from the physical inlet speed (mirror lbm.py).
-    double speed = std::max(fp.velocity_ms, 1e-6);
-    double dx_m = voxel * 1e-3;
-    double u_lat = 0.05;
-    double dt_s = u_lat * dx_m / speed;
-    double L_char_m = longest * 1e-3;
-    double reynolds = (fp.nu_fluid > 0) ? speed * L_char_m / fp.nu_fluid : 0.0;
-    double nu_lat = (reynolds > 0) ? u_lat * L_char_m / dx_m / reynolds : kCs2 * 0.5;
-    nu_lat = std::max(nu_lat, kCs2 * 0.01);
-    double tau0 = std::min(1.99, std::max(0.51, nu_lat / kCs2 + 0.5));
+    const double speed = fp.velocity_ms;
+    const double dx_m = voxel * 1e-3;
+    constexpr double u_lat = 0.05;
+    const double dt_s = u_lat * dx_m / speed;
+    const double L_char_m = longest * 1e-3;
+    const double reynolds = speed * L_char_m / fp.nu_fluid;
+    const double requested_nu_lat = fp.nu_fluid * dt_s / (dx_m * dx_m);
+    // BGK becomes numerically fragile as tau approaches 0.5.  The fast LBM route is
+    // intentionally a qualitative reduced-Re model at high physical Reynolds numbers:
+    // keep at least the validated tau floor below, and disclose the resulting
+    // effective Reynolds number.
+    // tau=0.55 is the validated stability floor for the single-relaxation-time
+    // kernel; lower values keep too little numerical viscosity for a bounded
+    // coarse lattice and do not settle within the advertised presets.
+    constexpr double kMinTau = 0.55;
+    const double nu_lat = std::max(requested_nu_lat, kCs2 * (kMinTau - 0.5));
+    const bool viscosity_limited = nu_lat > requested_nu_lat * (1.0 + 1e-12);
+    const double tau0 = nu_lat / kCs2 + 0.5;
+    if (!std::isfinite(reynolds) || !std::isfinite(tau0) ||
+        tau0 <= 0.500001 || tau0 > 2.0) {
+        R.error = "flow setup is outside the BGK stability range: tau=" +
+                  std::to_string(tau0) +
+                  " (refine the grid, reduce speed, or increase viscosity)";
+        return R;
+    }
     if (reynolds_out) *reynolds_out = reynolds;
 
     LbmParams lp;
@@ -378,7 +516,7 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     const auto t_solve0 = std::chrono::steady_clock::now();
     chudware::prof::phases::add("voxelize", std::chrono::duration<double, std::milli>(
                                              t_solve0 - t_setup0).count());
-    R = lbm_run(mask, Nx, Ny, Nz, lp, std::max(1, fp.n_steps), on_progress, should_cancel);
+    R = lbm_run(mask, Nx, Ny, Nz, lp, fp.n_steps, on_progress, should_cancel);
     chudware::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - t_solve0).count());
 
@@ -400,10 +538,37 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                     "under-resolved (lift/forces unreliable). Raise `cells` so the thinnest "
                     "feature spans >= 8 voxels, or simulate the wing/section alone.";
     }
+    if (viscosity_limited) {
+        const double effective_re =
+            u_lat * (L_char_m / dx_m) / nu_lat;
+        char buf[256];
+        std::snprintf(
+            buf, sizeof buf,
+            "LBM stability viscosity raised tau to %.3f: effective lattice Re %.0f "
+            "versus physical Re %.0f. Forces are qualitative; use OpenFOAM for "
+            "engineering high-Reynolds predictions.",
+            tau0, effective_re, reynolds);
+        R.warning = R.warning.empty() ? std::string(buf) : (R.warning + "; " + buf);
+    }
     if (!governor_note.empty())
         R.warning = R.warning.empty() ? governor_note : (R.warning + "; " + governor_note);
+    if (R.ok && !R.converged) {
+        R.ok = false;
+        R.error = "flow solve did not converge: drag residual=" +
+                  std::to_string(R.residual) + ", mass imbalance=" +
+                  std::to_string(R.mass_imbalance);
+    }
     if (R.ok) chudware::sim::cache::store(chudware::sim::cache::Kind::Cfd, input_hash, lbm_to_json(R));
     return R;
+    } catch (const std::bad_alloc&) {
+        R.ok = false;
+        R.error = "CFD allocation failed for the requested grid";
+        return R;
+    } catch (const std::exception& e) {
+        R.ok = false;
+        R.error = std::string("CFD setup/solve failed: ") + e.what();
+        return R;
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────────────────────
@@ -475,6 +640,11 @@ bool load_stl_soup(const std::string& path, std::vector<float>& pos,
             std::memcpy(pos.data() + (size_t)t * 9, rec + 12, 9 * sizeof(float));
         }
     }
+    if (pos.empty() ||
+        !std::all_of(pos.begin(), pos.end(), [](float v) { return std::isfinite(v); })) {
+        err = pos.empty() ? "STL contains no triangles" : "STL contains non-finite vertices";
+        return false;
+    }
     const size_t ntri = pos.size() / 9;
     idx.resize(ntri * 3);
     for (uint32_t i = 0; i < (uint32_t)(ntri * 3); ++i) idx[i] = i;
@@ -514,12 +684,16 @@ nlohmann::json flow_error(const std::string& code, const std::string& msg) {
 }  // namespace
 
 nlohmann::json run_flow_stl(const nlohmann::json& params) {
+    try {
     // The OpenFOAM bridge was a Python-worker feature (engine.sim.openfoam); the C++ core is
     // LBM-only. Fail loud rather than silently running the wrong solver.
     const std::string solver = params.value("solver", std::string("lbm"));
-    if (solver == "openfoam")
-        return flow_error("unsupported_solver",
-                          "OpenFOAM is not available in the C++ flow core (LBM only).");
+    if (solver != "lbm") {
+        if (solver == "openfoam")
+            return flow_error("unsupported_solver",
+                              "OpenFOAM is not available in the C++ flow core (LBM only).");
+        return flow_error("invalid_params", "solver must be 'lbm'");
+    }
 
     const std::string stl_path = params.value("stl_path", std::string());
     if (stl_path.empty()) return flow_error("invalid_params", "sim_run_flow_stl: missing stl_path");
@@ -535,33 +709,48 @@ nlohmann::json run_flow_stl(const nlohmann::json& params) {
     const double sideslip_deg = params.value("sideslip_deg", 0.0);
     const double roughness_um = params.value("roughness_um", 0.0);
     const double ref_area_mm2 = params.value("ref_area_mm2", 0.0);
+    if (!std::isfinite(speed_mps) || speed_mps <= 0.0 ||
+        !std::isfinite(aoa_deg) || !std::isfinite(sideslip_deg) ||
+        !std::isfinite(roughness_um) || roughness_um < 0.0 ||
+        !std::isfinite(ref_area_mm2) || ref_area_mm2 < 0.0) {
+        return flow_error("invalid_params",
+                          "speed must be positive; angles/roughness/reference area must be finite");
+    }
 
     bool preset_known = true;
     const FlowPreset preset = flow_preset(params.value("preset", std::string("coarse")), preset_known);
     if (!preset_known)
         return flow_error("invalid_params", "unknown preset (coarse|medium|fine|xfine)");
 
-    // Fluid (default air; non-positive values fall back like the oracle).
+    // Fluid (default air). Explicit invalid values are rejected rather than silently replaced.
     std::string fluid_name = "air";
     double rho_fluid = 1.225, nu_fluid = 1.5e-5;
-    if (params.contains("fluid") && params["fluid"].is_object()) {
+    if (params.contains("fluid")) {
+        if (!params["fluid"].is_object())
+            return flow_error("invalid_params", "fluid must be an object");
         const auto& fl = params["fluid"];
         fluid_name = fl.value("name", fluid_name);
         rho_fluid = fl.value("density_kgm3", rho_fluid);
         nu_fluid = fl.value("kinematic_visc_m2s", nu_fluid);
     }
-    if (rho_fluid <= 0.0) rho_fluid = 1.225;
-    if (nu_fluid <= 0.0) nu_fluid = 1.5e-5;
+    if (!std::isfinite(rho_fluid) || rho_fluid <= 0.0 ||
+        !std::isfinite(nu_fluid) || nu_fluid <= 0.0)
+        return flow_error("invalid_params", "fluid density and kinematic viscosity must be positive");
 
     // Align the composed flow direction to the tunnel's +X. run_wind_tunnel assumes flow on
     // CAD-X with lift on CAD-Z (it axis-swaps Z->LBM-Y), so rotate the soup into an
     // orthonormal (drag, side, lift) basis: drag=flow_dir -> +X, side -> +Y, lift -> +Z.
     // AoA/sideslip are baked into flow_dir, so FlowParams.aoa_deg stays 0.
     Vec3 base{1.0, 0.0, 0.0};
-    if (params.contains("direction") && params["direction"].is_array() &&
-        params["direction"].size() == 3)
+    if (params.contains("direction")) {
+        if (!params["direction"].is_array() || params["direction"].size() != 3)
+            return flow_error("invalid_params", "direction must be a 3-vector");
         base = {params["direction"][0].get<double>(), params["direction"][1].get<double>(),
                 params["direction"][2].get<double>()};
+    }
+    if (!std::isfinite(base.x) || !std::isfinite(base.y) || !std::isfinite(base.z) ||
+        vnorm(base) <= 1e-12)
+        return flow_error("invalid_params", "direction must be finite and non-zero");
     const Vec3 drag_dir = compose_flow_dir(base, aoa_deg, sideslip_deg);
     Vec3 side_raw = vcross({0.0, 0.0, 1.0}, drag_dir);
     if (vnorm(side_raw) < 1e-9) side_raw = vcross({1.0, 0.0, 0.0}, drag_dir);
@@ -583,12 +772,25 @@ nlohmann::json run_flow_stl(const nlohmann::json& params) {
     fp.rho_fluid = rho_fluid;
     fp.cells = params.value("cells", preset.cells);
     fp.n_steps = params.value("n_steps", preset.steps);
+    if (fp.cells < 16 || fp.n_steps <= 0)
+        return flow_error("invalid_params", "cells must be >= 16 and n_steps must be positive");
     fp.progress_path = params.value("progress_path", std::string());
     fp.job_id = params.value("job_id", std::string());
 
     double reynolds = 0.0;
     LbmResult R = run_wind_tunnel({pos}, {idx}, fp, &reynolds);
-    if (!R.ok) return flow_error("sim_flow_error", R.error.empty() ? "flow solve failed" : R.error);
+    if (!R.ok) {
+        const std::string code = R.diverged ? "solver_diverged" :
+                                 (!R.converged && R.residual >= 0.0 ? "not_converged" :
+                                  "sim_flow_error");
+        nlohmann::json err = flow_error(code, R.error.empty() ? "flow solve failed" : R.error);
+        err["diverged"] = R.diverged;
+        err["converged"] = R.converged;
+        err["steps_run"] = R.steps_run;
+        err["residual"] = R.residual;
+        err["mass_imbalance"] = R.mass_imbalance;
+        return err;
+    }
 
     // ── Roughness skin-friction multiplier (qualitative) — mirror lbm.py ──
     std::vector<std::string> notes;
@@ -641,20 +843,22 @@ nlohmann::json run_flow_stl(const nlohmann::json& params) {
     const double u_lat = 0.05, cs2 = 1.0 / 3.0;
     const double dx_m = R.voxel_mm * 1e-3;
     const double dt_s = (speed_mps > 0.0) ? u_lat * dx_m / speed_mps : 0.0;
-    double nu_lat = (reynolds > 0.0) ? u_lat * L_char_m / dx_m / reynolds : cs2 * 0.5;
-    nu_lat = std::max(nu_lat, cs2 * 0.01);
-    const double tau0 = std::min(1.99, std::max(0.51, nu_lat / cs2 + 0.5));
+    const double requested_nu_lat = nu_fluid * dt_s / (dx_m * dx_m);
+    constexpr double kMinTau = 0.55;
+    const double nu_lat = std::max(requested_nu_lat, cs2 * (kMinTau - 0.5));
+    const double tau0 = nu_lat / cs2 + 0.5;
+    const double effective_re =
+        (nu_lat > 0.0 && dx_m > 0.0) ? u_lat * (L_char_m / dx_m) / nu_lat : 0.0;
     std::snprintf(nbuf, sizeof nbuf,
                   "Domain %dx%dx%d, voxel %.2f mm; fluid %s (rho=%.1f kg/m^3, nu=%.2e m^2/s); "
-                  "Re=%.0f; u_lat=%.3f, tau=%.3f; AoA=%.1f deg, sideslip=%.1f deg; "
-                  "ref area=%.1f mm^2 (%s).",
+                  "physical Re=%.0f, effective LBM Re=%.0f; u_lat=%.3f, tau=%.3f; "
+                  "AoA=%.1f deg, sideslip=%.1f deg; ref area=%.1f mm^2 (%s).",
                   R.nx, R.ny, R.nz, R.voxel_mm, fluid_name.c_str(), rho_fluid, nu_fluid,
-                  reynolds, u_lat, tau0, aoa_deg, sideslip_deg, ref_area_used_mm2, ref_area_src);
+                  reynolds, effective_re, u_lat, tau0, aoa_deg, sideslip_deg,
+                  ref_area_used_mm2, ref_area_src);
     notes.insert(notes.begin(), nbuf);
     notes.push_back(
         "QUALITATIVE LBM (Smagorinsky LES, half-way bounce-back) - not a validated CFD result.");
-    // side_n: the C++ kernel's momentum exchange reports drag/lift only (no span force yet).
-    notes.push_back("Side force not reported by the C++ LBM kernel (side_n=0).");
     notes.push_back("Flow overlay (Cp colormap / streamlines / slice PNGs) not yet ported to the "
                     "C++ core — forces only this run.");
     if (!R.warning.empty()) notes.push_back(R.warning);
@@ -663,11 +867,12 @@ nlohmann::json run_flow_stl(const nlohmann::json& params) {
     {
         char rbuf[384];
         std::snprintf(rbuf, sizeof rbuf,
-                      "%s Re ~%.0f (u_lat=%.3f, tau=%.3f, Nu_lat=%.4f, dx=%.2f mm, dt=%.3f us, "
+                      "%s physical Re ~%.0f; effective LBM Re ~%.0f "
+                      "(u_lat=%.3f, tau=%.3f, Nu_lat=%.4f, dx=%.2f mm, dt=%.3f us, "
                       "rho=%.1f kg/m^3, nu=%.2e m^2/s) - QUALITATIVE result; use a full CFD "
                       "solver for engineering decisions.",
-                      fluid_name.c_str(), reynolds, u_lat, tau0, nu_lat, dx_m * 1e3, dt_s * 1e6,
-                      rho_fluid, nu_fluid);
+                      fluid_name.c_str(), reynolds, effective_re, u_lat, tau0, nu_lat,
+                      dx_m * 1e3, dt_s * 1e6, rho_fluid, nu_fluid);
         reynolds_note = rbuf;
     }
 
@@ -675,7 +880,7 @@ nlohmann::json run_flow_stl(const nlohmann::json& params) {
         {"ok", true},
         {"drag_n", drag_n},
         {"lift_n", lift_n},
-        {"side_n", 0.0},
+        {"side_n", R.side_n},
         {"cd", cd},
         {"cl", cl},
         {"ld", ld},
@@ -696,6 +901,7 @@ nlohmann::json run_flow_stl(const nlohmann::json& params) {
         {"steps_run", R.steps_run},
         {"converged", R.converged},
         {"residual", R.residual},
+        {"mass_imbalance", R.mass_imbalance},
         {"voxel_mm", R.voxel_mm},
         {"min_feature_mm", R.min_feature_mm},
         {"min_feature_voxels", R.min_feature_voxels},
@@ -703,6 +909,11 @@ nlohmann::json run_flow_stl(const nlohmann::json& params) {
     };
     if (!R.warning.empty()) out["warning"] = R.warning;
     return out;
+    } catch (const nlohmann::json::exception& e) {
+        return flow_error("invalid_params", std::string("invalid flow parameter type: ") + e.what());
+    } catch (const std::exception& e) {
+        return flow_error("sim_flow_error", e.what());
+    }
 }
 
 }  // namespace sim

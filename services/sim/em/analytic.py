@@ -24,6 +24,26 @@ MU0 = 4.0e-7 * math.pi          # vacuum permeability, H/m (classical SI definit
 EPS0 = 1.0 / (MU0 * C0**2)      # vacuum permittivity from c = 1/sqrt(mu0*eps0)
 ETA0 = MU0 * C0                 # free-space wave impedance eta0 = sqrt(mu0/eps0) ~ 376.73 ohm
 
+def _positive_finite(value: float, name: str) -> float:
+    out = float(value)
+    if not math.isfinite(out) or out <= 0.0:
+        raise ValueError(f"{name} must be finite and greater than zero")
+    return out
+
+
+def _positive_int(value: int, name: str, maximum: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer in [1, {maximum}]")
+    try:
+        numeric = float(value)
+        integer = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be an integer in [1, {maximum}]") from exc
+    if (not math.isfinite(numeric) or numeric != integer or
+            not 1 <= integer <= maximum):
+        raise ValueError(f"{name} must be an integer in [1, {maximum}]")
+    return integer
+
 # ---------------------------------------------------------------- standard guides
 # EIA rectangular waveguide standards: name -> (a_mm, b_mm). a is the broad wall.
 STANDARD_WAVEGUIDES: Dict[str, Tuple[float, float]] = {
@@ -77,15 +97,24 @@ _BESSEL_ROOTS = {
 
 def rect_cutoff_hz(a_m: float, b_m: float, m: int, n: int, eps_r: float = 1.0) -> float:
     """Cutoff of TE/TM mn in a hollow rectangular guide (a = broad wall, metres)."""
+    a_m = _positive_finite(a_m, "a_m")
+    b_m = _positive_finite(b_m, "b_m")
+    eps_r = _positive_finite(eps_r, "eps_r")
+    if isinstance(m, bool) or isinstance(n, bool) or int(m) != m or int(n) != n or m < 0 or n < 0:
+        raise ValueError("mode indices m and n must be non-negative integers")
     if m == 0 and n == 0:
         raise ValueError("TE00/TM00 does not exist")
     kc = math.pi * math.hypot(m / a_m, n / b_m)
-    return C0 / math.sqrt(eps_r) * kc / (2.0 * math.pi)
+    cutoff = C0 / math.sqrt(eps_r) * kc / (2.0 * math.pi)
+    if not math.isfinite(cutoff) or cutoff <= 0.0:
+        raise ValueError("rectangular cutoff is outside the supported numeric range")
+    return cutoff
 
 
 def rect_mode_table(a_m: float, b_m: float, n_modes: int = 6,
                     eps_r: float = 1.0) -> List[dict]:
     """First ``n_modes`` TE+TM modes of a rectangular guide, sorted by cutoff."""
+    n_modes = _positive_int(n_modes, "n_modes", 40)
     modes: List[dict] = []
     for m in range(0, 7):
         for n in range(0, 7):
@@ -104,6 +133,9 @@ def rect_mode_table(a_m: float, b_m: float, n_modes: int = 6,
 
 def circ_mode_table(radius_m: float, n_modes: int = 6, eps_r: float = 1.0) -> List[dict]:
     """First ``n_modes`` TE+TM modes of a circular guide of radius ``radius_m``."""
+    radius_m = _positive_finite(radius_m, "radius_m")
+    eps_r = _positive_finite(eps_r, "eps_r")
+    n_modes = _positive_int(n_modes, "n_modes", 24)
     modes: List[dict] = []
     for n, roots in _BESSEL_DERIV_ROOTS.items():
         for m, p in enumerate(roots, start=1):
@@ -129,6 +161,9 @@ def te_wave_impedance(f_hz: float, fc_hz: float, eps_r: float = 1.0) -> float:
     Z_TE = k*eta/beta = eta / sqrt(1 - (fc/f)^2), eta = eta0/sqrt(eps_r).
     Below (or at) cutoff there is no propagating wave -> ValueError.
     """
+    f_hz = _positive_finite(f_hz, "f_hz")
+    fc_hz = _positive_finite(fc_hz, "fc_hz")
+    eps_r = _positive_finite(eps_r, "eps_r")
     if f_hz <= fc_hz:
         raise ValueError(f"TE wave impedance undefined at/below cutoff "
                          f"({f_hz:.4g} Hz <= fc {fc_hz:.4g} Hz)")
@@ -142,8 +177,11 @@ def parallel_plate_z0(w_m: float, d_m: float, eps_r: float = 1.0) -> float:
     Z0 = eta*d/w with eta = eta0/sqrt(eps_r) — plate width w, separation d,
     fringing fields neglected (valid for w >> d).
     """
-    if w_m <= 0 or d_m <= 0 or eps_r < 1.0:
-        raise ValueError("parallel_plate_z0 needs w > 0, d > 0, eps_r >= 1")
+    w_m = _positive_finite(w_m, "w_m")
+    d_m = _positive_finite(d_m, "d_m")
+    eps_r = _positive_finite(eps_r, "eps_r")
+    if eps_r < 1.0:
+        raise ValueError("parallel_plate_z0 needs eps_r >= 1")
     return ETA0 / math.sqrt(eps_r) * d_m / w_m
 
 
@@ -157,8 +195,11 @@ def microstrip_z0(w_m: float, h_m: float, eps_r: float) -> Dict[str, float]:
 
     Returns {"z0": ohm, "eps_eff": ..., "model": "microstrip-hammerstad"}.
     """
-    if w_m <= 0 or h_m <= 0 or eps_r < 1.0:
-        raise ValueError("microstrip_z0 needs w > 0, h > 0, eps_r >= 1")
+    w_m = _positive_finite(w_m, "w_m")
+    h_m = _positive_finite(h_m, "h_m")
+    eps_r = _positive_finite(eps_r, "eps_r")
+    if eps_r < 1.0:
+        raise ValueError("microstrip_z0 needs eps_r >= 1")
     u = w_m / h_m
     eps_e = (eps_r + 1.0) / 2.0 + (eps_r - 1.0) / 2.0 / math.sqrt(1.0 + 12.0 / u)
     if u <= 1.0:
@@ -174,16 +215,22 @@ def microstrip_z0(w_m: float, h_m: float, eps_r: float) -> Dict[str, float]:
 def gamma(f_hz: np.ndarray, fc_hz: float, eps_r: float = 1.0) -> np.ndarray:
     """Complex propagation constant of a single hollow-guide mode (lossless walls).
 
-    gamma = alpha + j*beta;  evanescent (real) below cutoff, propagating above.
+    gamma = alpha + j*beta; evanescent (real) below cutoff, propagating above.
     """
     f = np.asarray(f_hz, dtype=float)
+    fc_hz = _positive_finite(fc_hz, "fc_hz")
+    eps_r = _positive_finite(eps_r, "eps_r")
+    if f.ndim != 1 or f.size == 0 or not np.all(np.isfinite(f)) or np.any(f < 0.0):
+        raise ValueError("f_hz must be a non-empty finite one-dimensional non-negative array")
     k = 2.0 * np.pi * f * math.sqrt(eps_r) / C0
     kc = 2.0 * math.pi * fc_hz * math.sqrt(eps_r) / C0
     arg = k**2 - kc**2
-    g = np.where(arg >= 0.0,
-                 1j * np.sqrt(np.maximum(arg, 0.0)),
-                 np.sqrt(np.maximum(-arg, 0.0)) + 0j)
-    return g
+    result = np.where(arg >= 0.0,
+                      1j * np.sqrt(np.maximum(arg, 0.0)),
+                      np.sqrt(np.maximum(-arg, 0.0)) + 0j)
+    if not np.all(np.isfinite(result.real)) or not np.all(np.isfinite(result.imag)):
+        raise ValueError("propagation constant is outside the supported numeric range")
+    return result
 
 
 def uniform_section_sparams(f_hz: np.ndarray, fc_hz: float, length_m: float,
@@ -195,17 +242,31 @@ def uniform_section_sparams(f_hz: np.ndarray, fc_hz: float, length_m: float,
     |S21| = 1 with linear-in-beta phase.  This is the trusted reference the FDTD
     validation compares against.
     """
+    length_m = _positive_finite(length_m, "length_m")
     g = gamma(f_hz, fc_hz, eps_r)
     s21 = np.exp(-g * length_m)
     s11 = np.zeros_like(s21)
+    if not np.all(np.isfinite(s21)):
+        raise ValueError("uniform-section response is non-finite")
     return s11, s21
 
 
 def gaussian_pulse(t_s: np.ndarray, f0_hz: float, fc_bw_hz: float) -> np.ndarray:
     """openEMS-style Gaussian-modulated sine: centre f0, 20 dB bandwidth ~ fc_bw."""
+    t_s = np.asarray(t_s, dtype=float)
+    f0_hz = _positive_finite(f0_hz, "f0_hz")
+    fc_bw_hz = _positive_finite(fc_bw_hz, "fc_bw_hz")
+    if t_s.ndim != 1 or t_s.size == 0 or not np.all(np.isfinite(t_s)):
+        raise ValueError("t_s must be a non-empty finite one-dimensional array")
     t0 = 3.0 / (2.0 * math.pi * fc_bw_hz) * 3.0
     tau = 3.0 / (2.0 * math.pi * fc_bw_hz)
-    return np.sin(2.0 * np.pi * f0_hz * (t_s - t0)) * np.exp(-((t_s - t0) / tau) ** 2)
+    if not math.isfinite(t0) or not math.isfinite(tau) or tau <= 0.0:
+        raise ValueError("pulse bandwidth is outside the supported numeric range")
+    pulse = (np.sin(2.0 * np.pi * f0_hz * (t_s - t0)) *
+             np.exp(-((t_s - t0) / tau) ** 2))
+    if not np.all(np.isfinite(pulse)):
+        raise ValueError("Gaussian pulse is non-finite")
+    return pulse
 
 
 def timedomain_response(fc_hz: float, length_m: float, f0_hz: float, bw_hz: float,
@@ -215,20 +276,44 @@ def timedomain_response(fc_hz: float, length_m: float, f0_hz: float, bw_hz: floa
 
     Returns dict with t_s, v_in (excitation), v_out (transmitted waveform).
     """
+    fc_hz = _positive_finite(fc_hz, "fc_hz")
+    length_m = _positive_finite(length_m, "length_m")
+    f0_hz = _positive_finite(f0_hz, "f0_hz")
+    bw_hz = _positive_finite(bw_hz, "bw_hz")
+    eps_r = _positive_finite(eps_r, "eps_r")
+    n_samples = _positive_int(n_samples, "n_samples", 1_000_000)
+    if n_samples < 8:
+        raise ValueError("n_samples must be at least 8")
     f_max = f0_hz + 4.0 * bw_hz
+    if not math.isfinite(f_max):
+        raise ValueError("time-domain frequency span is outside the supported numeric range")
     dt = 1.0 / (8.0 * f_max)
+    if not math.isfinite(dt) or dt <= 0.0:
+        raise ValueError("time-domain sample interval is degenerate")
     t = np.arange(n_samples) * dt
     v_in = gaussian_pulse(t, f0_hz, bw_hz)
     spec = np.fft.rfft(v_in)
     freqs = np.fft.rfftfreq(n_samples, dt)
     _, s21 = uniform_section_sparams(freqs, fc_hz, length_m, eps_r)
     v_out = np.fft.irfft(spec * s21, n=n_samples)
+    if not np.all(np.isfinite(v_out)):
+        raise ValueError("time-domain response is non-finite")
     return {"t_s": t, "v_in": v_in, "v_out": v_out}
 
 
 def rect_te_field(a_m: float, b_m: float, m: int, n: int,
                   nx: int = 32, ny: int = 16) -> np.ndarray:
     """|Hz| of TEmn on an nx x ny preview grid (unit peak). For mode-preview payloads."""
+    a_m = _positive_finite(a_m, "a_m")
+    b_m = _positive_finite(b_m, "b_m")
+    nx = _positive_int(nx, "nx", 4096)
+    ny = _positive_int(ny, "ny", 4096)
+    if isinstance(m, bool) or isinstance(n, bool) or int(m) != m or int(n) != n or m < 0 or n < 0:
+        raise ValueError("mode indices m and n must be non-negative integers")
+    if m == 0 and n == 0:
+        raise ValueError("TE00 does not exist")
+    if nx < 2 or ny < 2:
+        raise ValueError("field preview dimensions must both be at least 2")
     x = np.linspace(0.0, a_m, nx)
     y = np.linspace(0.0, b_m, ny)
     X, Y = np.meshgrid(x, y, indexing="ij")

@@ -165,67 +165,52 @@ bool tet10_B_at(const std::array<Eigen::Vector3d, 10>& ep, double r, double s, d
     return true;
 }
 
-// Exact N_i N_j moments over a tet, in units of (integral / element-volume). N_i is a
-// quadratic polynomial in the barycentric coords; the monomial integral is
-//   ∫ L0^a L1^b L2^c L3^d dV = V * 6 * a!b!c!d! / (a+b+c+d+3)!  (so dividing by V gives the
-// per-unit-volume moment). This is degree-4-EXACT — a 4-point (degree-2) Gauss rule would
-// under-integrate the quartic N_i N_j and corrupt the mass DISTRIBUTION, so we keep the
-// closed form for the natural-coordinate part and supply the true element volume separately.
-const Eigen::Matrix<double, 10, 10>& tet10_mass_unit_moments() {
-    static const Eigen::Matrix<double, 10, 10> M = [] {
-        struct Term { double c; int e[4]; };
-        const std::array<std::vector<Term>, 10> N = {{
-            {{2.0, {2, 0, 0, 0}}, {-1.0, {1, 0, 0, 0}}},  // N0 = L0(2L0-1)
-            {{2.0, {0, 2, 0, 0}}, {-1.0, {0, 1, 0, 0}}},  // N1 = L1(2L1-1)
-            {{2.0, {0, 0, 2, 0}}, {-1.0, {0, 0, 1, 0}}},  // N2 = L2(2L2-1)
-            {{2.0, {0, 0, 0, 2}}, {-1.0, {0, 0, 0, 1}}},  // N3 = L3(2L3-1)
-            {{4.0, {1, 1, 0, 0}}},                        // N4 = 4 L0 L1
-            {{4.0, {0, 1, 1, 0}}},                        // N5 = 4 L1 L2
-            {{4.0, {1, 0, 1, 0}}},                        // N6 = 4 L2 L0
-            {{4.0, {1, 0, 0, 1}}},                        // N7 = 4 L3 L0
-            {{4.0, {0, 0, 1, 1}}},                        // N8 = 4 L3 L2
-            {{4.0, {0, 1, 0, 1}}},                        // N9 = 4 L3 L1
-        }};
-        auto fact = [](int n) { double f = 1.0; for (int i = 2; i <= n; ++i) f *= i; return f; };
-        auto moment = [&](int a, int b, int c, int d) {  // integral / V
-            return 6.0 * fact(a) * fact(b) * fact(c) * fact(d) / fact(a + b + c + d + 3);
-        };
-        Eigen::Matrix<double, 10, 10> m;
-        for (int i = 0; i < 10; ++i)
-            for (int j = 0; j < 10; ++j) {
-                double s = 0.0;
-                for (const Term& ti : N[i])
-                    for (const Term& tj : N[j])
-                        s += ti.c * tj.c * moment(ti.e[0] + tj.e[0], ti.e[1] + tj.e[1],
-                                                  ti.e[2] + tj.e[2], ti.e[3] + tj.e[3]);
-                m(i, j) = s;
-            }
-        return m;
-    }();
-    return M;
-}
 
-// Consistent tet10 mass M_ij = rho * (∫ det(J) dV_ref) * unit_moment_ij. The unit moments
-// carry the EXACT (degree-4) natural-coordinate distribution; the scalar volume factor is
-// the element's TRUE mapped volume, integrated with the SAME 4-point Gauss rule used for
-// the stiffness (det(J) is at most cubic in the natural coords, so the degree-2 rule is a
-// good volume quadrature and is EXACT for a straight-edged tet, where det(J) is constant).
-// The old code multiplied the moments by a single CORNER-tet volume (e1·(e2×e3)/6), which
-// equals the true volume only for a straight element; on a curved / high-aspect tet10
-// the corner volume mis-states the inertia and the modal frequency reads high (Bug F3).
-// Using the Gauss-integrated mapped volume keeps the validated straight-section / N-1
-// results unchanged (det(J) constant there) while correcting curved/distorted elements.
+// Consistent tet10 mass for a quadratic isoparametric element. For curved elements det(J)
+// varies over the element and cannot be pulled out as one scalar volume multiplier: doing so
+// preserves total mass but puts it on the wrong nodes. A 5x5x5 Gauss-Legendre Duffy rule is
+// degree-7 exact after the cube-to-tet Jacobian, covering N_i*N_j (degree 4) times detJ
+// (degree <=3). Straight elements produce the same closed-form matrix to roundoff.
 Eigen::Matrix<double, 10, 10> tet10_mass_consistent(
-    double rho, const std::array<Eigen::Vector3d, 10>& ep, const TetGauss4& gauss) {
-    double vol = 0.0;
-    for (int g = 0; g < 4; ++g) {
-        const Eigen::Matrix<double, 10, 3> dNrst = tet10_dN(gauss.pt[g][0], gauss.pt[g][1],
-                                                            gauss.pt[g][2]);
-        Eigen::Matrix3d J = Eigen::Matrix3d::Zero();
-        for (int n = 0; n < 10; ++n) J += ep[n] * dNrst.row(n);
-        vol += gauss.w[g] * std::abs(J.determinant());
-    }
-    return (rho * vol) * tet10_mass_unit_moments();
+    double rho, const std::array<Eigen::Vector3d, 10>& ep, const TetGauss4&) {
+    static constexpr double x[5] = {
+        0.0469100770306680, 0.2307653449471585, 0.5,
+        0.7692346550528415, 0.9530899229693320};
+    static constexpr double w[5] = {
+        0.1184634425280945, 0.2393143352496832, 0.2844444444444444,
+        0.2393143352496832, 0.1184634425280945};
+    Eigen::Matrix<double, 10, 10> M = Eigen::Matrix<double, 10, 10>::Zero();
+    double jacobian_sign = 0.0;
+    for (int iu = 0; iu < 5; ++iu)
+        for (int iv = 0; iv < 5; ++iv)
+            for (int iw = 0; iw < 5; ++iw) {
+                const double u = x[iu], v = x[iv], q = x[iw];
+                const double r = u;
+                const double s = (1.0 - u) * v;
+                const double t = (1.0 - u) * (1.0 - v) * q;
+                const double L[4] = {1.0 - r - s - t, r, s, t};
+                Eigen::Matrix<double, 10, 1> N;
+                for (int i = 0; i < 4; ++i) N(i) = L[i] * (2.0 * L[i] - 1.0);
+                N(4) = 4.0 * L[0] * L[1];
+                N(5) = 4.0 * L[1] * L[2];
+                N(6) = 4.0 * L[2] * L[0];
+                N(7) = 4.0 * L[3] * L[0];
+                N(8) = 4.0 * L[3] * L[2];
+                N(9) = 4.0 * L[3] * L[1];
+                const Eigen::Matrix<double, 10, 3> dNrst = tet10_dN(r, s, t);
+                Eigen::Matrix3d J = Eigen::Matrix3d::Zero();
+                for (int n = 0; n < 10; ++n) J += ep[n] * dNrst.row(n);
+                const double detJ = J.determinant();
+                if (!std::isfinite(detJ) || !(std::abs(detJ) > 0.0) ||
+                    (jacobian_sign != 0.0 &&
+                     jacobian_sign * detJ <= 0.0))
+                    return Eigen::Matrix<double, 10, 10>::Zero();
+                jacobian_sign = detJ;
+                const double dV = std::abs(detJ) * (1.0 - u) * (1.0 - u) *
+                                  (1.0 - v) * w[iu] * w[iv] * w[iw];
+                M.noalias() += (rho * dV) * (N * N.transpose());
+            }
+    return M;
 }
 
 }  // namespace
@@ -233,13 +218,25 @@ Eigen::Matrix<double, 10, 10> tet10_mass_consistent(
 FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vector<int>& tets,
                                double E_mpa, double nu, double density_g_cm3,
                                const std::vector<int>& fixed_nodes, int n_modes,
-                               int nodes_per_elem) {
+                               int nodes_per_elem, const SimCancelToken& cancel_token) {
     FeaModalResult res;
     const int n_nodes = static_cast<int>(points.size() / 3);
     const int n_dof = n_nodes * 3;
     res.n_nodes = n_nodes;
     res.n_dof = n_dof;
+    auto cancelled = [&]() {
+        return cancel_token && cancel_token->load(std::memory_order_relaxed);
+    };
+    auto cancel_result = [&]() {
+        res.error = "fea_modal: cancelled";
+        return res;
+    };
+    if (cancelled()) return cancel_result();
     if (n_nodes == 0 || tets.empty()) { res.error = "fea_modal: empty mesh"; return res; }
+    if (points.size() % 3 != 0) {
+        res.error = "fea_modal: points length must be divisible by 3";
+        return res;
+    }
     if (nodes_per_elem != 4 && nodes_per_elem != 10) {
         res.error = "fea_modal: nodes_per_elem must be 4 (tet4) or 10 (tet10)";
         return res;
@@ -248,10 +245,41 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
         res.error = "fea_modal: tets length must be divisible by nodes_per_elem";
         return res;
     }
+    if (n_modes <= 0) {
+        res.error = "fea_modal: n_modes must be > 0";
+        return res;
+    }
+    if (!std::isfinite(E_mpa) || E_mpa <= 0.0 || !std::isfinite(nu) || nu <= -1.0 ||
+        nu >= 0.5 || !std::isfinite(density_g_cm3) || density_g_cm3 <= 0.0) {
+        res.error = "fea_modal: material requires finite E>0, -1<nu<0.5 and density>0";
+        return res;
+    }
+    for (double x : points) {
+        if (!std::isfinite(x)) {
+            res.error = "fea_modal: mesh coordinates must be finite";
+            return res;
+        }
+    }
+    for (int nid : tets) {
+        if (nid < 0 || nid >= n_nodes) {
+            res.error = "fea_modal: element node index out of range";
+            return res;
+        }
+    }
+    for (int nid : fixed_nodes) {
+        if (nid < 0 || nid >= n_nodes) {
+            res.error = "fea_modal: fixed node index out of range";
+            return res;
+        }
+    }
 
     double lam, mu;
     lame(E_mpa, nu, lam, mu);
     const Eigen::Matrix<double, 6, 6> C = elasticity(lam, mu);
+    if (!C.allFinite()) {
+        res.error = "fea_modal: material constants overflowed";
+        return res;
+    }
     const double density = density_g_cm3 * 1e-3;  // g/cm^3 -> g/mm^3
 
     auto node_pt = [&](int nid) {
@@ -288,7 +316,10 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
             for (int j = 0; j < 4; ++j) { tn[j] = tets[e * 4 + j]; ep[j] = node_pt(tn[j]); }
             Eigen::Matrix<double, 6, 12> B;
             double vol;
-            if (!tet4_B(ep, B, vol)) continue;
+            if (!tet4_B(ep, B, vol) || !std::isfinite(vol)) {
+                res.error = "fea_modal: degenerate element " + std::to_string(e);
+                return res;
+            }
             Eigen::Matrix<double, 12, 12> Ke = B.transpose() * C * B * vol;
             int dof_map[12];
             for (int j = 0; j < 4; ++j)
@@ -315,6 +346,7 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
                         mtrips.emplace_back(ra, rb, coef);
                     }
                 }
+            if ((e & 255) == 0 && cancelled()) return cancel_result();
         }
     } else {  // tet10
         const TetGauss4 gauss;
@@ -325,24 +357,36 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
             // Stiffness Ke (30x30): sum_g w_g * detJ_g * B_g^T C B_g.
             Eigen::Matrix<double, 30, 30> Ke = Eigen::Matrix<double, 30, 30>::Zero();
             bool ok = true;
+            double jacobian_sign = 0.0;
             for (int g = 0; g < 4; ++g) {
                 Eigen::Matrix<double, 6, 30> B;
                 double detJ;
-                if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B, detJ)) {
-                    ok = false; break;
+                if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1],
+                                gauss.pt[g][2], B, detJ) ||
+                    !std::isfinite(detJ) ||
+                    (jacobian_sign != 0.0 &&
+                     jacobian_sign * detJ <= 0.0)) {
+                    ok = false;
+                    break;
                 }
+                jacobian_sign = detJ;
                 // |detJ|: the element connectivity may be negatively oriented (a CW tet);
                 // the physical volume is positive, so use the magnitude (mirrors fea_static).
                 Ke += (gauss.w[g] * std::abs(detJ)) * (B.transpose() * C * B);
             }
-            if (!ok) continue;
-            // Consistent mass (10x10 scalar) = rho * (Gauss-integrated MAPPED volume) *
-            // exact N_iN_j moments — same Gauss rule/Jacobian as the stiffness for the volume
-            // factor, so the mass tracks the element's actual geometry (cures the high-aspect
-            // over-frequency, Bug F3). Skip a degenerate element (zero mapped volume).
+            if (!ok) {
+                res.error = "fea_modal: degenerate or inverted element " + std::to_string(e);
+                return res;
+            }
+            // Consistent mapped mass is integrated with a degree-7-exact Duffy
+            // rule. Its helper also rejects a non-finite, degenerate, or
+            // sign-changing Jacobian anywhere in that denser integration grid.
             const Eigen::Matrix<double, 10, 10> Ms =
                 tet10_mass_consistent(density, ep, gauss);
-            if (!(Ms.trace() > 0.0)) continue;
+            if (!(Ms.trace() > 0.0) || !Ms.allFinite()) {
+                res.error = "fea_modal: invalid mass matrix for element " + std::to_string(e);
+                return res;
+            }
             int dof_map[30];
             for (int j = 0; j < 10; ++j)
                 for (int k = 0; k < 3; ++k) dof_map[j * 3 + k] = tn[j] * 3 + k;
@@ -365,6 +409,7 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
                         mtrips.emplace_back(ra, rb, coef);
                     }
                 }
+            if ((e & 255) == 0 && cancelled()) return cancel_result();
         }
     }
     Eigen::SparseMatrix<double> Kff(n_free, n_free);
@@ -373,6 +418,11 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
     Eigen::SparseMatrix<double> Mff(n_free, n_free);
     Mff.setFromTriplets(mtrips.begin(), mtrips.end());
     Mff.makeCompressed();
+    if (Kff.nonZeros() == 0 || Mff.nonZeros() == 0) {
+        res.error = "fea_modal: no valid element stiffness or mass";
+        return res;
+    }
+    if (cancelled()) return cancel_result();
 
     // Shift-invert generalized eigensolve for the lowest modes. A SMALL NEGATIVE spectral
     // shift sigma makes (K - sigma*M) = (K + |sigma|*M) strictly positive-definite, so the
@@ -402,6 +452,11 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
     for (int i = 0; i < n_free; ++i) { kdiag += Kff.coeff(i, i); mdiag += Mff.coeff(i, i); }
     const double evscale = (mdiag > 0.0) ? kdiag / mdiag : 1.0;
     const double sigma = -1e-5 * evscale;
+    if (!std::isfinite(kdiag) || !std::isfinite(mdiag) || !(kdiag > 0.0) ||
+        !(mdiag > 0.0) || !std::isfinite(evscale) || !(evscale > 0.0)) {
+        res.error = "fea_modal: assembled stiffness/mass is non-finite or degenerate";
+        return res;
+    }
 
     using BOpType = Spectra::SparseSymMatProd<double>;
     BOpType Bop(Mff);
@@ -441,24 +496,40 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
             return false;
         }
     };
-    auto n_rigid = [&] {  // rigid-body modes read ≈0 Hz; elastic modes are orders above
+    const double rigid_eigenvalue_tol = 1e-8 * evscale;
+    auto n_rigid = [&] {
         int n = 0;
-        for (int i = 0; i < evals.size(); ++i) {
-            const double f = std::sqrt(std::max(evals(i), 0.0) * 1e6) / (2.0 * kPi);
-            if (f < 0.5) ++n;
-        }
+        for (int i = 0; i < evals.size(); ++i)
+            if (std::abs(evals(i)) <= rigid_eigenvalue_tol) ++n;
         return n;
     };
     if (!eigensolve(k_solve)) {
         res.error = "fea_modal: eigensolve did not converge";
         return res;
     }
+    if (cancelled()) return cancel_result();
     if (free_free) {
         for (int attempt = 0; attempt < 2 && n_rigid() < std::min(6, k_solve); ++attempt) {
             const int bigger = std::min(k_solve + 6, n_free - 2);
             if (bigger <= k_solve) break;
             k_solve = bigger;
             if (!eigensolve(k_solve)) break;  // keep the last good result
+        }
+    }
+    if (free_free && n_rigid() < 6) {
+        res.error = "fea_modal: eigensolve did not resolve all 6 rigid-body modes";
+        return res;
+    }
+    if (evals.size() < k_req || evecs.cols() < k_req || !evals.allFinite() ||
+        !evecs.allFinite()) {
+        res.error = "fea_modal: eigensolve returned incomplete or non-finite modes";
+        return res;
+    }
+    const double negative_tol = 1e-9 * evscale;
+    for (int i = 0; i < evals.size(); ++i) {
+        if (evals(i) < -negative_tol) {
+            res.error = "fea_modal: materially negative eigenvalue (unstable/invalid model)";
+            return res;
         }
     }
     const int k = std::min(static_cast<int>(evals.size()), k_req);  // truncate over-request
@@ -491,6 +562,13 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
                 scale = std::max(scale, std::abs(v));
             }
         double inv = scale > 0.0 ? 1.0 / scale : 1.0;
+        if (!(scale > 0.0) || !std::isfinite(scale)) {
+            res.error = "fea_modal: eigenvector normalization failed";
+            res.freqs_hz.clear();
+            res.mode_shapes.clear();
+            res.n_modes = 0;
+            return res;
+        }
         for (int i = 0; i < n_nodes; ++i)
             for (int c = 0; c < 3; ++c)
                 res.mode_shapes[(static_cast<std::size_t>(m) * n_nodes + i) * 3 + c] =

@@ -38,6 +38,57 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+
+class _CcxWorkdirOwner:
+    """Lifetime owner for an unretained successful CalculiX work directory."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._remove = shutil.rmtree
+        self._cleaned = False
+
+    def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        self._remove(self.path, ignore_errors=True)
+
+    def __del__(self):
+        self.cleanup()
+
+
+class _OwnedCcxPath(str):
+    """Path whose lifetime keeps its containing CCX directory available to parsers."""
+
+    def __new__(cls, path: str, owner: _CcxWorkdirOwner):
+        value = super().__new__(cls, path)
+        value._ccx_owner = owner
+        return value
+
+def _finite(value, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be a finite number, got {value!r}") from None
+    if not math.isfinite(out):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return out
+
+
+def _positive_int(value, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    try:
+        out = int(value)
+        exact = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}") from None
+    if out <= 0 or not math.isfinite(exact) or exact != out:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return out
+
 # CalculiX solver discovery: PATH only. No bundled binary, no linked library.
 _CCX_NAMES = ("ccx", "ccx_2.20", "ccx_2.21", "ccx_2.19", "calculix")
 
@@ -81,50 +132,80 @@ def run_ccx(inp_text: str, job: str = "job", timeout: float = 300.0,
     rival ccx runner). Returns
     ``{ok, returncode, workdir, dat_path, frd_path, sta_path, stdout, stderr}``
     or ``{ok: False, skipped: True, ...}`` when ccx is absent. The caller parses
-    the .dat / .frd. ``keep_dir=True`` leaves the temp dir for debugging.
+    the .dat / .frd. By default successful result paths own the directory until
+    the paths/result leave scope, so existing post-return parsers can finish and
+    the directory is then removed. Errors are cleaned before return.
+    ``keep_dir=True`` is the only mode that retains and reports the workdir.
     """
+    if not isinstance(inp_text, str) or not inp_text.strip():
+        raise ValueError("inp_text must be a non-empty CalculiX deck")
+    if not isinstance(job, str) or not job or any(
+            not (c.isalnum() or c in "_-") for c in job):
+        raise ValueError("job may contain only letters, digits, '_' and '-'")
+    timeout = _finite(timeout, "timeout")
+    if timeout <= 0.0:
+        raise ValueError("timeout must be > 0 seconds")
+    if not isinstance(keep_dir, bool):
+        raise ValueError("keep_dir must be a boolean")
     ccx = ccx_path()
     if not ccx:
         return _ccx_absent_result("this analysis")
     workdir = tempfile.mkdtemp(prefix="chudware_ccx_")
-    inp_path = os.path.join(workdir, f"{job}.inp")
-    Path(inp_path).write_text(inp_text, encoding="utf-8")
+    owner: Optional[_CcxWorkdirOwner] = None
     try:
-        proc = subprocess.run(
-            [ccx, "-i", job], cwd=workdir, capture_output=True, text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"ccx timed out after {timeout:.0f}s",
-                "workdir": workdir, "backend": "calculix (ccx)"}
-    except OSError as exc:
-        return {"ok": False, "error": f"ccx subprocess error: {exc}",
-                "workdir": workdir, "backend": "calculix (ccx)"}
-    dat = os.path.join(workdir, f"{job}.dat")
-    frd = os.path.join(workdir, f"{job}.frd")
-    sta = os.path.join(workdir, f"{job}.sta")
-    ok = proc.returncode == 0
-
-    def _nonempty(p: str) -> Optional[str]:
-        # ccx 2.23 exits 0 on an unparseable deck (only *WARNING "card image cannot
-        # be interpreted" on stdout, "Job finished") and still touches a ZERO-BYTE
-        # .dat — reporting that path would make callers treat a no-op run as a
-        # solved study (e.g. buckling would return ok with an empty factor list).
-        # A 0-byte result file is never a result; hide it so callers hit their
-        # honest "ccx run failed" branch.
+        inp_path = os.path.join(workdir, f"{job}.inp")
+        Path(inp_path).write_text(inp_text, encoding="utf-8")
         try:
-            return p if os.path.getsize(p) > 0 else None
-        except OSError:
-            return None
+            proc = subprocess.run(
+                [ccx, "-i", job], cwd=workdir, capture_output=True, text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"ccx timed out after {timeout:.0f}s",
+                    "workdir": workdir if keep_dir else None,
+                    "retained": keep_dir, "backend": "calculix (ccx)"}
+        except OSError as exc:
+            return {"ok": False, "error": f"ccx subprocess error: {exc}",
+                    "workdir": workdir if keep_dir else None,
+                    "retained": keep_dir, "backend": "calculix (ccx)"}
+        dat = os.path.join(workdir, f"{job}.dat")
+        frd = os.path.join(workdir, f"{job}.frd")
+        sta = os.path.join(workdir, f"{job}.sta")
+        ok = proc.returncode == 0
 
-    return {
-        "ok": ok, "returncode": proc.returncode, "workdir": workdir,
-        "dat_path": _nonempty(dat),
-        "frd_path": _nonempty(frd),
-        "sta_path": _nonempty(sta),
-        "stdout": proc.stdout, "stderr": proc.stderr,
-        "backend": f"calculix ({os.path.basename(ccx)})",
-    }
+        def _nonempty(path: str) -> Optional[str]:
+            # ccx 2.23 exits 0 on an unparseable deck (only *WARNING "card image
+            # cannot be interpreted" on stdout, "Job finished") and still touches
+            # a ZERO-BYTE .dat. A 0-byte file is never a result.
+            try:
+                return path if os.path.getsize(path) > 0 else None
+            except OSError:
+                return None
+
+        paths = [_nonempty(dat), _nonempty(frd), _nonempty(sta)]
+        if not ok and not keep_dir:
+            # Solver-error artifacts are diagnostics, not parseable result paths.
+            paths = [None, None, None]
+        elif ok and not keep_dir and any(paths):
+            owner = _CcxWorkdirOwner(workdir)
+            paths = [_OwnedCcxPath(path, owner) if path is not None else None
+                     for path in paths]
+
+        return {
+            "ok": ok, "returncode": proc.returncode,
+            "workdir": workdir if keep_dir else None,
+            "retained": keep_dir,
+            "dat_path": paths[0],
+            "frd_path": paths[1],
+            "sta_path": paths[2],
+            "stdout": proc.stdout, "stderr": proc.stderr,
+            "backend": f"calculix ({os.path.basename(ccx)})",
+        }
+    finally:
+        # A successful unretained run transfers ownership to its result path(s);
+        # every other unretained exit cleans synchronously, including exceptions.
+        if not keep_dir and owner is None:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 # =====================================================================
@@ -149,32 +230,43 @@ _MARIN_KA_B = (-0.085, -0.265, -0.718, -0.995)
 
 
 def marin_ka(Sut: float, surface: int) -> float:
-    """Marin surface factor ka = A*Sut^b, capped at 1 (Shigley 6-19). Mirrors host."""
-    i = surface if 0 <= surface <= 3 else 1
-    ka = _MARIN_KA_A[i] * (Sut ** _MARIN_KA_B[i])
+    """Marin surface factor ka = A*Sut^b, capped at 1 (Shigley 6-19)."""
+    Sut = _finite(Sut, "Sut")
+    if Sut <= 0.0:
+        raise ValueError("Sut must be > 0 MPa")
+    if surface not in range(4):
+        raise ValueError("surface must be 0..3")
+    ka = _MARIN_KA_A[surface] * (Sut ** _MARIN_KA_B[surface])
     return min(ka, 1.0)
 
 
 def marin_kb(d_mm: float, load_case: int) -> float:
-    """Marin size factor kb (axial=1; else Shigley 6-20). Mirrors host."""
+    """Marin size factor kb (axial=1; else Shigley 6-20)."""
+    d_mm = _finite(d_mm, "diameter_mm")
+    if load_case not in (0, 1, 2):
+        raise ValueError("load_case must be 0 (bending), 1 (axial), or 2 (torsion)")
+    if d_mm <= 0.0:
+        raise ValueError("diameter_mm must be > 0")
     if load_case == 1:
         return 1.0
-    if d_mm <= 0:
-        d_mm = 7.62
-    if d_mm < 2.79:
-        d_mm = 2.79
-    if d_mm <= 51.0:
-        return (d_mm / 7.62) ** -0.107
-    return 1.51 * (d_mm ** -0.157)
+    d_eff = max(d_mm, 2.79)
+    if d_eff <= 51.0:
+        return (d_eff / 7.62) ** -0.107
+    return 1.51 * (d_eff ** -0.157)
 
 
 def marin_kc(load_case: int) -> float:
-    """Marin load factor kc (0.85 axial, 0.59 torsion, else 1). Mirrors host."""
+    """Marin load factor kc (0.85 axial, 0.59 torsion, else 1)."""
+    if load_case not in (0, 1, 2):
+        raise ValueError("load_case must be 0 (bending), 1 (axial), or 2 (torsion)")
     return 0.85 if load_case == 1 else (0.59 if load_case == 2 else 1.0)
 
 
 def marin_kd(T_c: float) -> float:
     """Marin temperature factor kd, interpolated (Shigley 6-21). Mirrors host."""
+    T_c = _finite(T_c, "temperature_c")
+    if not 20.0 <= T_c <= 550.0:
+        raise ValueError("temperature_c must be in the supported range 20..550")
     Ts = (20.0, 100.0, 200.0, 300.0, 400.0, 500.0, 550.0)
     kd = (1.0, 1.020, 1.025, 0.975, 0.90, 0.825, 0.76)
     if T_c <= Ts[0]:
@@ -188,6 +280,9 @@ def marin_kd(T_c: float) -> float:
 
 def reliability_ke(R_pct: float) -> float:
     """Reliability factor ke (Shigley 6-4), interpolated. Mirrors host."""
+    R_pct = _finite(R_pct, "reliability_pct")
+    if not 50.0 <= R_pct <= 99.999:
+        raise ValueError("reliability_pct must be in the supported range 50..99.999")
     R = (50.0, 90.0, 95.0, 99.0, 99.9, 99.99, 99.999)
     ke = (1.000, 0.897, 0.868, 0.814, 0.753, 0.702, 0.659)
     if R_pct <= R[0]:
@@ -204,7 +299,14 @@ def sn_life(sa_eq: float, Se: float, Sut: float) -> float:
     high-cycle S-N line (a=(0.9Sut)²/Se, b=-⅓·log10(0.9Sut/Se)); ≥1e6 = runout.
 
     EXACT mirror of host/src/ui/sim_manager.cpp `sn_life` — do not diverge."""
-    if Se <= 0 or Sut <= 0 or sa_eq <= 0:
+    sa_eq = _finite(sa_eq, "sa_eq")
+    Se = _finite(Se, "Se")
+    Sut = _finite(Sut, "Sut")
+    if Se <= 0.0 or Sut <= 0.0:
+        raise ValueError("Se and Sut must both be > 0 MPa")
+    if Se >= 0.9 * Sut:
+        raise ValueError("Se must be below 0.9*Sut for the Shigley high-cycle S-N line")
+    if sa_eq <= 0.0:
         return 1e6
     if sa_eq <= Se:
         return 1e6
@@ -221,14 +323,20 @@ def corrected_endurance(Se_base: float, Sut: float, *, surface: int = 1,
                         reliability_pct: float = 50.0) -> dict:
     """Apply the Marin factors + reliability to an uncorrected endurance limit Se'.
     Returns {se_corrected_mpa, ka, kb, kc, kd, ke}. Mirrors the host correction chain."""
-    if Se_base <= 0:
-        Se_base = min(0.5 * Sut, 700.0)   # seBase fallback (host)
+    Se_base = _finite(Se_base, "Se_base")
+    Sut = _finite(Sut, "Sut")
+    if Se_base <= 0.0 or Sut <= 0.0:
+        raise ValueError("Se_base and Sut must both be > 0 MPa")
     ka = marin_ka(Sut, surface)
     kb = marin_kb(diameter_mm, load_case)
     kc = marin_kc(load_case)
     kd = marin_kd(temperature_c)
     ke = reliability_ke(reliability_pct)
     Se = Se_base * ka * kb * kc * kd * ke
+    if not math.isfinite(Se) or Se <= 0.0 or Se >= 0.9 * Sut:
+        raise ValueError(
+            "corrected endurance must be finite, positive, and below 0.9*Sut for "
+            "the Shigley high-cycle S-N line")
     return {"se_corrected_mpa": Se, "se_base_mpa": Se_base,
             "ka": ka, "kb": kb, "kc": kc, "kd": kd, "ke": ke}
 
@@ -243,10 +351,22 @@ def fatigue_summarize(theories: dict, Se: float, Sut: float,
     theories : {name: {"sa_eq_mpa": float}} exactly as `sim_run_fatigue` returns
                under summary.theories.
     """
+    if not isinstance(theories, dict) or not theories:
+        raise ValueError("theories must be a non-empty result mapping")
+    Se = _finite(Se, "Se")
+    Sut = _finite(Sut, "Sut")
+    if Se <= 0.0 or Sut <= 0.0:
+        raise ValueError("Se and Sut must be > 0 MPa")
+    if theory not in theories:
+        raise ValueError(f"requested theory {theory!r} is absent")
     out: dict = {"selected_theory": theory, "se_corrected_mpa": round(Se, 3),
                  "ultimate_mpa": round(Sut, 3), "theories": {}}
     for name, tv in theories.items():
-        sa_eq = float(tv.get("sa_eq_mpa", 0.0))
+        if not isinstance(tv, dict) or "sa_eq_mpa" not in tv:
+            raise ValueError(f"theory {name!r} is missing sa_eq_mpa")
+        sa_eq = _finite(tv["sa_eq_mpa"], f"theories.{name}.sa_eq_mpa")
+        if sa_eq <= 0.0:
+            raise ValueError(f"theory {name!r} returned non-positive equivalent stress")
         N = sn_life(sa_eq, Se, Sut)
         regime = "infinite" if (sa_eq <= Se or N >= 1e6) else (
             "static_overload" if sa_eq >= Sut else "finite")
@@ -272,6 +392,11 @@ def _hex_box_nodes_elems(L: float, b: float, h: float,
                          nx: int, ny: int, nz: int) -> tuple[list, list, int, int, int]:
     """Structured C3D8 hex grid on an L×b×h box. Returns (node_lines, elem_lines,
     nnx, nny, nnz) as .inp text fragments. x∈[0,L], y∈[0,b], z∈[0,h]. Clean-room."""
+    L, b, h = (_finite(L, "L"), _finite(b, "b"), _finite(h, "h"))
+    if min(L, b, h) <= 0.0:
+        raise ValueError("L, b, and h must all be > 0")
+    nx, ny, nz = (_positive_int(nx, "nx"), _positive_int(ny, "ny"),
+                  _positive_int(nz, "nz"))
     nnx, nny, nnz = nx + 1, ny + 1, nz + 1
 
     def nid(i: int, j: int, k: int) -> int:
@@ -319,8 +444,15 @@ def build_thermal_bar_inp(L: float, b: float, h: float, k_cond: float,
                           T_hot: float, T_cold: float,
                           nx: int = 40, ny: int = 3, nz: int = 3) -> dict:
     """1-D steady conduction along x: face x=0 held at T_hot, face x=L at T_cold.
-    Clean-room *HEAT TRANSFER, STEADY STATE .inp. Returns {inp, hot_nodes, cold_nodes,
-    mid_nodes, expected_mid_T}."""
+    ``k_cond`` is public W/(m*K); the N-mm-s-K CalculiX deck converts it once to
+    W/(mm*K). Returns {inp, hot_nodes, cold_nodes, mid_nodes, expected_mid_T}."""
+    k_cond = _finite(k_cond, "k_cond")
+    T_hot = _finite(T_hot, "T_hot")
+    T_cold = _finite(T_cold, "T_cold")
+    if k_cond <= 0.0:
+        raise ValueError("k_cond must be > 0")
+    if T_hot == T_cold:
+        raise ValueError("T_hot and T_cold must differ")
     node_lines, elem_lines, nnx, nny, nnz = _hex_box_nodes_elems(L, b, h, nx, ny, nz)
     nid = _nid_fn(nnx, nny)
     hot = [nid(0, j, k) for k in range(nnz) for j in range(nny)]
@@ -333,7 +465,9 @@ def build_thermal_bar_inp(L: float, b: float, h: float, k_cond: float,
         "*NSET, NSET=NCOLD", *_set_lines(cold),
         "*NSET, NSET=NMID", *_set_lines(mid),
         "*MATERIAL, NAME=MAT",
-        "*CONDUCTIVITY", f"{k_cond:.6f}",
+        # The deck is consistently N-mm-s-K, so W/(m*K) must become W/(mm*K)
+        # exactly once. Fixed-temperature-only results hid this 1000x unit error.
+        "*CONDUCTIVITY", f"{k_cond / 1000.0:.9f}",
         "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
         "*STEP",
         "*HEAT TRANSFER, STEADY STATE",
@@ -349,7 +483,8 @@ def build_thermal_bar_inp(L: float, b: float, h: float, k_cond: float,
 
 
 def build_buckling_column_inp(L: float, b: float, h: float, E: float, nu: float,
-                              P: float, nx: int = 40, ny: int = 4, nz: int = 4) -> dict:
+                              P: float, nx: int = 40, ny: int = 4, nz: int = 4,
+                              n_modes: int = 4) -> dict:
     """Fixed-free column buckling: base x=0 encastre, axial compressive load -x on the
     x=L end. Clean-room *BUCKLE .inp. Returns {inp, expected_Pcr, tip_nodes} where
     Pcr is the Euler fixed-free critical load; ccx returns the load FACTOR λ so
@@ -360,6 +495,12 @@ def build_buckling_column_inp(L: float, b: float, h: float, E: float, nu: float,
     critical load by 40-60% at these mesh densities (measured: +61.8% at
     L/h=50, nx=40); C3D8I removes the parasitic shear and lands within <1% of
     Pcr = π²EI/(2L)² (Timoshenko & Gere, Theory of Elastic Stability, K=2)."""
+    E, nu, P = (_finite(E, "E"), _finite(nu, "nu"), _finite(P, "P"))
+    n_modes = _positive_int(n_modes, "n_modes")
+    if E <= 0.0 or P <= 0.0:
+        raise ValueError("E and P must both be > 0")
+    if not -1.0 < nu < 0.5:
+        raise ValueError("nu must be in (-1, 0.5)")
     node_lines, elem_lines, nnx, nny, nnz = _hex_box_nodes_elems(L, b, h, nx, ny, nz)
     elem_lines = [ln.replace("TYPE=C3D8,", "TYPE=C3D8I,") for ln in elem_lines]
     nid = _nid_fn(nnx, nny)
@@ -375,7 +516,7 @@ def build_buckling_column_inp(L: float, b: float, h: float, E: float, nu: float,
         "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
         "*BOUNDARY", "NFIX, 1, 3, 0.0",
         "*STEP",
-        "*BUCKLE", "4",
+        "*BUCKLE", str(n_modes),
         "*CLOAD",
     ]
     lines += [f"{n}, 1, {-per:.6f}" for n in tip]
@@ -405,6 +546,12 @@ def build_contact_block_inp(L: float, b: float, h: float, E: float, nu: float,
     upper block's bottom; the INDEPENDENT (master) surface is an element-face
     surface on the lower block's top (CalculiX wants the master as *SURFACE
     TYPE=ELEMENT for node-to-surface contact)."""
+    E, nu, pressure = (_finite(E, "E"), _finite(nu, "nu"),
+                       _finite(pressure, "pressure"))
+    if E <= 0.0 or pressure <= 0.0:
+        raise ValueError("E and pressure must both be > 0")
+    if not -1.0 < nu < 0.5:
+        raise ValueError("nu must be in (-1, 0.5)")
     # --- lower block: z∈[0,h], ids 1..n_per, elems 1..e_per ---
     lower_nodes, lower_elems_raw, nnx, nny, nnz = _hex_box_nodes_elems(
         L, b, h, nx, ny, nz)
@@ -501,35 +648,40 @@ _DAT_HEADER_KEYWORD = {
 
 def parse_dat_nodal(dat_path: str, key: str, node_set: list,
                     component: int = 1) -> Optional[float]:
-    """Parse a ccx *NODE PRINT .dat block for the variable `key` (CalculiX names:
-    "NT" temperature, "U" displacement, "RF" reaction force). Return the averaged
-    value of the given 1-based `component` column over `node_set`, taken from the
-    LAST matching result block in the file. None if nothing parsed.
+    """Parse the last complete ccx *NODE PRINT block and average a node component.
 
-    ccx labels the result block with a natural-language header ("temperatures for
-    set NMID", "forces (reaction) ..."), NOT the terse variable name, so we match on
-    the mapped keyword (with the raw key as a fallback).
+    ``key`` uses CalculiX names ("NT" temperature, "U" displacement, "RF"
+    reaction force). The requested component is 1-based after the node id.
+    Returning a partial node set would corrupt conservation checks: contact multiplies
+    this average by the requested node count, so one missing row otherwise invents the
+    missing reactions. A missing, malformed, duplicate, or non-finite row therefore
+    returns ``None`` rather than a plausible partial result.
 
-    LAST block only: a multi-increment step (*STATIC with automatic incrementation,
-    NLGEOM contact) prints one block PER converged increment — averaging across all
-    of them mixes partial-load states into the answer (measured: the two-block
-    contact base reaction came out 53% below the applied load because increments at
-    5%..96% load were averaged in; the final time=1.0 block alone balances the load
-    exactly). Single-block outputs (steady thermal, static) are unaffected."""
-    want = set(node_set)
-    vals: list = []
+    The LAST matching block is required because a multi-increment NLGEOM step prints
+    one block per converged increment; averaging across partial-load increments
+    understates the final reaction."""
+    component = _positive_int(component, "component")
+    if not node_set:
+        return None
+    ids = [_positive_int(nid, f"node_set[{i}]") for i, nid in enumerate(node_set)]
+    want = set(ids)
+    if len(want) != len(ids):
+        raise ValueError("node_set must not contain duplicate node ids")
+    vals: dict[int, float] = {}
+    known_key = key.upper() in _DAT_HEADER_KEYWORD
     kw = _DAT_HEADER_KEYWORD.get(key.upper(), key.lower())
     lines = Path(dat_path).read_text().splitlines()
     i = 0
     while i < len(lines):
         header = lines[i].strip()
         hl = header.lower()
-        if (kw in hl or key.upper() in header.upper()) and header:
-            # ccx puts one or more blank lines between the header and the data rows;
-            # scan forward through the block, skipping blanks, until data STARTS then
-            # ends (a blank line after data began, or a non-numeric header line).
+        is_result_header = (kw in hl if known_key else key.lower() in hl)
+        if header and is_result_header:
+            # ccx puts blank lines between the header and data. Once rows start,
+            # the first non-numeric row ends this result block.
             j = i + 1
-            block_vals: list = []
+            block_vals: dict[int, float] = {}
+            invalid_target_row = False
             started = False
             while j < len(lines):
                 row = lines[j]
@@ -539,22 +691,28 @@ def parse_dat_nodal(dat_path: str, key: str, node_set: list,
                     started = True
                     try:
                         nid = int(parts[0])
-                        col = component  # 1-based column after the node id
-                        if nid in want and len(parts) > col:
-                            block_vals.append(float(parts[col]))
-                    except (ValueError, IndexError):
-                        pass
+                    except ValueError:
+                        nid = -1
+                    if nid in want:
+                        if nid in block_vals or len(parts) <= component:
+                            invalid_target_row = True
+                        else:
+                            try:
+                                block_vals[nid] = float(parts[component])
+                            except ValueError:
+                                invalid_target_row = True
                 elif started:
-                    break  # data block ended
+                    break
                 j += 1
-            if block_vals:
-                vals = block_vals  # keep the LAST matching block (final increment)
-                i = j
-                continue
+            # Keep the LAST matching block even when it is incomplete, so an
+            # earlier complete increment cannot masquerade as the final result.
+            vals = {} if invalid_target_row else block_vals
+            i = j
+            continue
         i += 1
-    if not vals:
+    if set(vals) != want or any(not math.isfinite(v) for v in vals.values()):
         return None
-    return sum(vals) / len(vals)
+    return sum(vals.values()) / len(vals)
 
 
 def parse_buckle_factors(dat_path: str) -> list:
@@ -577,11 +735,15 @@ def parse_buckle_factors(dat_path: str) -> list:
             if len(parts) >= 2:
                 try:
                     int(parts[0])
-                    factors.append(float(parts[1]))
-                    continue
+                    factor = float(parts[1])
                 except ValueError:
                     if factors:
                         break
+                    continue
+                if not math.isfinite(factor):
+                    raise ValueError("non-finite CalculiX buckling factor")
+                factors.append(factor)
+                continue
             elif factors:
                 break
     return factors

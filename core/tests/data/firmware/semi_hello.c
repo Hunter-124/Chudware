@@ -7,7 +7,7 @@
  * the vector table below.
  *
  * Lines printed (both machine-parseable by the emulator's parsers):
- *   AICAD_GPIO_EVT PA5=1 t=10ms   (a stamped gpio event, firmware-side shim idiom)
+ *   CHUDWARE_GPIO_EVT PA5=1 t=10ms   (a stamped gpio event, firmware-side shim idiom)
  *   hello world                   (the uart: assertion target)
  */
 #include <stdint.h>
@@ -43,7 +43,7 @@ void (* const g_pfnVectors[])(void) = {
 
 void Reset_Handler(void)
 {
-    semihost_call(SYS_WRITE0, "AICAD_GPIO_EVT PA5=1 t=10ms\n");
+    semihost_call(SYS_WRITE0, "CHUDWARE_GPIO_EVT PA5=1 t=10ms\n");
     semihost_call(SYS_WRITE0, "hello world\n");
     semihost_call(SYS_EXIT, (const void *)(uintptr_t)ADP_STOPPED_APPLICATION_EXIT);
     for (;;) {

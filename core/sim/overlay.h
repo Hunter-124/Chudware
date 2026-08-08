@@ -45,10 +45,10 @@ struct FeaSurface {
 FeaSurface fea_surface_body(const std::vector<double>& vol_points,
                             const std::vector<int>& tets, int nodes_per_elem);
 
-// For each surface vertex (surf_xyz, m*3), take the value(s) of the nearest volume
-// node (vol_xyz, n*3) — brute-force kNN=1 with first-minimum tie-break (np.argmin).
-// `dim` is the values stride (1 for scalar fields, 3 for vector fields); vol_values
-// is n*dim flat. Returns m*dim flat. Mirrors engine/sim/overlay._map_to_surface.
+// For each finite surface vertex (surf_xyz, m*3), take the exact value(s) of the
+// nearest finite volume node (vol_xyz, n*3), with first-minimum tie-break. `dim`
+// is the values stride and vol_values must contain exactly n*dim finite values.
+// Malformed/non-finite inputs return empty rather than fabricating zero samples.
 std::vector<double> map_to_surface(const std::vector<double>& surf_xyz,
                                    const std::vector<double>& vol_xyz,
                                    const std::vector<double>& vol_values, int dim);
@@ -64,16 +64,16 @@ std::vector<double> map_to_surface(const std::vector<double>& surf_xyz,
 // mesh is pathologically fine — lower mesh_fineness or use draft (order 1) meshing.
 //
 // Build the static-result overlay AICM and write it to a temp .aicm; returns the
-// absolute path (empty string on any failure — best-effort, never throws). Mirrors
-// engine/sim/overlay.static_overlay: SCLR(von_mises 0..max_vm), SCLR(disp_mag
-// 0..max_disp), SCLR(fos 0..5), DISP(scale_hint). vol_points/displacement are n*3,
-// von_mises/disp_mag are n. `summary` supplies max_von_mises_mpa / max_disp_mm
-// (falls back to the field max when absent), `yield_mpa` the FoS numerator.
+// absolute path (empty string on any failure — best-effort, never throws).
+// Input stress fields/yield are MPa and displacement fields/coordinates are mm;
+// chunk names remain the stable public selectors while the GUI supplies those
+// canonical display units. Legend ranges come from the exact finite mapped field
+// and are always non-degenerate; rounded summary values never clip contours.
 //
-// Additive: the principal1/principal3/max_shear VOLUME-node arrays (each length n,
-// may be empty) are mapped to the surface and emitted as extra SCLR chunks ("p1",
-// "p3", "max_shear"), plus per-component displacement chunks ("disp_x/y/z"). The
-// original four chunks are emitted first, unchanged, so existing consumers are safe.
+// Optional principal1/principal3/max_shear VOLUME-node arrays (each exactly n or
+// empty) are emitted only when supplied. Derived principal criteria require both
+// principal fields; missing data is never represented as a fabricated zero field.
+// Per-component displacement chunks remain available as disp_x/y/z.
 std::string static_overlay(const std::string& step_path,
                            const std::vector<double>& vol_points,
                            const std::vector<int>& tets, int nodes_per_elem,
@@ -86,10 +86,9 @@ std::string static_overlay(const std::string& step_path,
                            double yield_mpa, const nlohmann::json& summary);
 
 // Build the fatigue-result overlay AICM (best-effort, never throws; "" on failure).
-// Mirrors static_overlay's structure (tessellate + map_to_surface + write_aicm), but
-// carries only SCLR chunks (no displacement): "fatigue_fos" (0..5), "life_log10"
-// (field min..max, log10 cycles), "von_mises" (0..field max, the peak stress driving
-// the fatigue calc). All input volume arrays are length n (per node).
+// Carries "fatigue_fos", "life_log10" (dimensionless log10 cycles), and
+// "von_mises" (MPa). Every input is an exact finite per-node array and each
+// legend range covers the actual mapped values without degeneracy.
 std::string fatigue_overlay(const std::string& step_path,
                             const std::vector<double>& vol_points,
                             const std::vector<int>& tets, int nodes_per_elem,
@@ -97,9 +96,8 @@ std::string fatigue_overlay(const std::string& step_path,
                             const std::vector<double>& life_log10,
                             const std::vector<double>& von_mises_peak);
 
-// Build a single-mode modal overlay: SCLR(mode_amplitude 0..norm) + DISP(scale_hint).
-// mode_shape is n*3. Returns the temp .aicm path ("" on failure). Mirrors
-// engine/sim/overlay.modal_overlay.
+// Build a single-mode modal overlay: dimensionless normalized eigenvector
+// amplitude plus DISP(scale_hint). mode_shape is exactly n*3 finite values.
 std::string modal_overlay(const std::string& step_path,
                           const std::vector<double>& vol_points,
                           const std::vector<int>& tets, int nodes_per_elem,

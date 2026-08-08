@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -136,4 +137,25 @@ TEST_CASE("curvature refinement increases circumferential resolution") {
     // Both remain valid regardless of the curvature setting (no inverted tets).
     CHECK(m_lo.jacobian_min > 0.0);
     CHECK(m_hi.jacobian_min > 0.0);
+}
+
+TEST_CASE("invalid mesh controls fail before STEP parsing") {
+    MeshOptions options;
+    options.fineness = std::numeric_limits<double>::quiet_NaN();
+    MeshOut result = mesh_step("/path/that/must/not/be/read.step", options);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("fineness") != std::string::npos);
+
+    options = MeshOptions{};
+    options.order = 3;
+    result = mesh_step("/path/that/must/not/be/read.step", options);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("order") != std::string::npos);
+
+    options = MeshOptions{};
+    options.min_size_mm = 2.0;
+    options.max_size_mm = 1.0;
+    std::string error;
+    CHECK_FALSE(validate_mesh_options(options, error));
+    CHECK(error.find("min_size_mm") != std::string::npos);
 }

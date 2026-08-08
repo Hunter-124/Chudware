@@ -19,8 +19,9 @@ namespace chudware::firmware {
 namespace {
 
 constexpr size_t kUartCap = 32000;
+constexpr size_t kEventCap = 4096;
 
-// CHUDWARE_GPIO_EVT <PIN>=<level>[ t=<num>[ms|us|s]] — emitted by BOTH backends.
+// CHUDWARE_GPIO_EVT <PIN>=<level>[ t=<num>[ms|us|s]] — target-emitted events only.
 const std::regex kGpioEvtRe(
     R"(CHUDWARE_GPIO_EVT\s+([A-Za-z_][A-Za-z0-9_]*)=([01])(?:\s+t=([0-9]+(?:\.[0-9]+)?)(ms|us|s)?)?)");
 const std::regex kOdrBeginRe(R"(CHUDWARE_GPIO_ODR_BEGIN\s+([A-K]))");
@@ -60,24 +61,206 @@ std::vector<std::string> split_lines(const std::string& text) {
     return out;
 }
 
+nlohmann::json bound_events(const nlohmann::json& events) {
+    if (!events.is_array() || events.size() <= kEventCap) return events;
+    constexpr size_t kFirst = (kEventCap - 1) / 2;
+    constexpr size_t kLast = kEventCap - 1 - kFirst;
+    nlohmann::json out = nlohmann::json::array();
+    for (size_t i = 0; i < kFirst; ++i) out.push_back(events[i]);
+    out.push_back({
+        {"type", "trace_truncated"},
+        {"seq", events[kFirst].value("seq", static_cast<long long>(kFirst))},
+        {"t_ms", nullptr},
+        {"dropped", events.size() - kFirst - kLast},
+    });
+    for (size_t i = events.size() - kLast; i < events.size(); ++i) out.push_back(events[i]);
+    return out;
+}
+
+bool events_truncated(const nlohmann::json& events) {
+    if (!events.is_array()) return false;
+    return std::any_of(events.begin(), events.end(), [](const nlohmann::json& event) {
+        return event.value("type", std::string()) == "trace_truncated";
+    });
+}
+
 std::string trim(const std::string& s) {
     size_t b = s.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) return "";
     return s.substr(b, s.find_last_not_of(" \t\r\n") - b + 1);
 }
 
-SimResult emulator_not_found(const std::string& binary,
-                             std::chrono::steady_clock::time_point t0) {
-    SimResult r;
-    r.passed = false;
-    r.uart_log = "emulator_not_found: '" + binary + "' is not installed / not on PATH";
-    r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    return r;
-}
 
 nlohmann::json assertion_result(const std::string& name, bool passed,
                                 const std::string& detail) {
     return {{"name", name}, {"passed", passed}, {"detail", detail}};
+}
+
+SimResult refused_result(const std::string& reason,
+                         const std::vector<std::string>& assertions,
+                         std::chrono::steady_clock::time_point t0) {
+    SimResult r;
+    r.passed = false;
+    r.uart_log = reason;
+    const std::string summary = reason.substr(0, reason.find('\n'));
+    for (const auto& assertion : assertions)
+        r.assertion_results.push_back(
+            assertion_result(assertion, false, "not evaluated: " + summary));
+    r.ms = std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0)
+               .count();
+    return r;
+}
+
+std::string image_error(const std::string& elf_path, unsigned expected_machine) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (elf_path.empty()) return "invalid_image: ELF path is empty";
+    if (!fs::is_regular_file(elf_path, ec))
+        return "invalid_image: '" + elf_path + "' is not a regular file";
+    std::ifstream in(elf_path, std::ios::binary);
+    unsigned char header[20] = {};
+    in.read(reinterpret_cast<char*>(header), sizeof(header));
+    if (in.gcount() != static_cast<std::streamsize>(sizeof(header)) ||
+        header[0] != 0x7f || header[1] != 'E' || header[2] != 'L' || header[3] != 'F')
+        return "invalid_image: '" + elf_path + "' is not an ELF image";
+    if ((header[4] != 1 && header[4] != 2) ||
+        (header[5] != 1 && header[5] != 2) || header[6] != 1)
+        return "invalid_image: '" + elf_path + "' has an invalid ELF identification header";
+    const auto u16 = [&](size_t offset) {
+        if (header[5] == 1)
+            return static_cast<unsigned>(header[offset]) |
+                   (static_cast<unsigned>(header[offset + 1]) << 8);
+        return (static_cast<unsigned>(header[offset]) << 8) |
+               static_cast<unsigned>(header[offset + 1]);
+    };
+    const unsigned type = u16(16);
+    const unsigned machine = u16(18);
+    if ((type != 2 && type != 3) || machine == 0)
+        return "invalid_image: '" + elf_path + "' is not an executable ELF image";
+    if (machine != expected_machine)
+        return "invalid_image: '" + elf_path + "' targets ELF machine " +
+               std::to_string(machine) + ", expected " + std::to_string(expected_machine);
+    const auto minimum_size = header[4] == 1 ? 52ULL : 64ULL;
+    if (fs::file_size(elf_path, ec) < minimum_size || ec)
+        return "invalid_image: '" + elf_path + "' has a truncated ELF header";
+    return "";
+}
+
+bool valid_stm32_pin(const std::string& pin) {
+    std::smatch m;
+    return std::regex_match(pin, m, kStm32PinRe) && std::stoi(m[2].str()) <= 15;
+}
+
+bool finite_number(const std::string& text, bool positive) {
+    try {
+        const double value = std::stod(text);
+        return std::isfinite(value) && (positive ? value > 0.0 : value >= 0.0);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool bounded_integer(const std::string& text) {
+    try {
+        (void)std::stol(text);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::vector<std::string> assertion_errors(const std::vector<std::string>& assertions) {
+    std::vector<std::string> errors;
+    for (const auto& raw : assertions) {
+        const std::string assertion = trim(raw);
+        std::string pin;
+        if (assertion.empty()) {
+            errors.push_back("assertion must not be empty");
+            continue;
+        }
+        if (assertion.rfind("gpio:", 0) == 0) {
+            const std::string spec = trim(assertion.substr(5));
+            std::smatch m;
+            if (std::regex_match(spec, m, kGpioTimeRe)) {
+                pin = trim(m[1].str());
+                const std::string level = trim(m[2].str());
+                if (level != "0" && level != "1")
+                    errors.push_back("'" + assertion + "' has invalid logic level '" + level + "'");
+                if (!finite_number(m[4].str(), false))
+                    errors.push_back("'" + assertion + "' has an invalid event time");
+            } else {
+                const size_t eq = spec.find('=');
+                if (eq == std::string::npos || spec.find('=', eq + 1) != std::string::npos) {
+                    errors.push_back("'" + assertion + "' must be gpio:PIN=0 or gpio:PIN=1");
+                    continue;
+                }
+                pin = trim(spec.substr(0, eq));
+                const std::string level = trim(spec.substr(eq + 1));
+                if (level != "0" && level != "1")
+                    errors.push_back("'" + assertion + "' has invalid logic level '" + level + "'");
+            }
+        } else if (assertion.rfind("toggles:", 0) == 0) {
+            const std::string spec = trim(assertion.substr(8));
+            std::smatch m;
+            if (!std::regex_match(spec, m, kTogglesRe)) {
+                errors.push_back("'" + assertion + "' has invalid toggle assertion syntax");
+                continue;
+            }
+            pin = m[1].str();
+            if (!bounded_integer(m[3].str()))
+                errors.push_back("'" + assertion + "' has an out-of-range toggle count");
+        } else if (assertion.rfind("period:", 0) == 0) {
+            const std::string spec = trim(assertion.substr(7));
+            std::smatch m;
+            if (!std::regex_match(spec, m, kPeriodRe)) {
+                errors.push_back("'" + assertion + "' has invalid period assertion syntax");
+                continue;
+            }
+            pin = m[1].str();
+            if (!finite_number(m[2].str(), true) || !finite_number(m[3].str(), false))
+                errors.push_back("'" + assertion +
+                                 "' requires finite positive period and non-negative tolerance");
+        } else if (assertion.rfind("uart_within:", 0) == 0) {
+            const std::string spec = trim(assertion.substr(12));
+            std::smatch m;
+            if (!std::regex_match(spec, m, kUartWithinRe) ||
+                trim(m[1].str()).empty() || !finite_number(m[2].str(), false))
+                errors.push_back("'" + assertion + "' has invalid timed UART assertion syntax");
+        } else if (assertion.rfind("uart:", 0) == 0 && assertion.size() == 5) {
+            errors.push_back("uart assertion text must not be empty");
+        }
+        if (!pin.empty() && !valid_stm32_pin(pin))
+            errors.push_back("'" + assertion + "' uses invalid pin '" + pin +
+                             "' (expected PA0..PK15)");
+    }
+    return errors;
+}
+
+bool requires_timestamped_gpio_observation(const std::string& raw) {
+    const std::string assertion = trim(raw);
+    if (assertion.rfind("toggles:", 0) == 0 || assertion.rfind("period:", 0) == 0)
+        return true;
+    if (assertion.rfind("gpio:", 0) != 0) return false;
+    const std::string spec = trim(assertion.substr(5));
+    std::smatch match;
+    return std::regex_match(spec, match, kGpioTimeRe);
+}
+
+std::string register_stream_capability_error(const nlohmann::json& scenario) {
+    if (!scenario.is_object() || !scenario.contains("tracks") ||
+        !scenario["tracks"].is_array())
+        return "";
+    for (const auto& track : scenario["tracks"]) {
+        if (track.is_object() &&
+            track.value("kind", std::string()) == "i2c_register_stream") {
+            return "register-addressed i2c_register_stream is unsupported by the current "
+                   "Renode backend: Mocks.DummyI2CSlave exposes only a sequential response "
+                   "FIFO, so it cannot answer register-address reads or atomically replace "
+                   "timestamped register maps; refusing instead of queueing stale byte bursts";
+        }
+    }
+    return "";
 }
 
 int count_toggles(const nlohmann::json& gpio_events, const std::string& pin) {
@@ -90,13 +273,30 @@ int count_toggles(const nlohmann::json& gpio_events, const std::string& pin) {
     return n;
 }
 
+nlohmann::json final_gpio_states(const std::string& text,
+                                 const nlohmann::json& odr_states) {
+    nlohmann::json states = nlohmann::json::object();
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+        std::smatch match;
+        if (std::regex_search(line, match, kGpioEvtRe))
+            states[match[1].str()] = std::stoi(match[2].str());
+    }
+    if (odr_states.is_object())
+        for (auto& [pin, level] : odr_states.items()) states[pin] = level;
+    return states;
+}
+
 // Renode backend (emulator.py::RenodeEmulator.run).
 SimResult run_renode(const std::string& elf_path, const std::string& platform_file,
                      const std::vector<std::string>& assertions, double timeout_s,
                      const nlohmann::json& gpio_regmap, const nlohmann::json& scenario,
                      const nlohmann::json& mcu_caps) {
     auto t0 = std::chrono::steady_clock::now();
-    if (which("renode").empty()) return emulator_not_found("renode", t0);
+    if (which("renode").empty())
+        return refused_result(
+            "emulator_not_found: 'renode' is not installed / not on PATH", assertions, t0);
 
     double run_seconds = std::max(1.0, timeout_s - 5.0);
     auto gpio_pins = pins_from_assertions(assertions);
@@ -162,27 +362,36 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
     fs::remove(resc_path, ec);
     if (!scenario_dir.empty()) fs::remove_all(scenario_dir, ec);
 
-    if (rr.not_found) return emulator_not_found("renode", t0);
-    if (rr.timed_out) {
-        SimResult r;
-        r.passed = false;
-        r.uart_log = "timeout: renode exceeded " +
-                     std::to_string(static_cast<long long>(timeout_s)) + "s";
-        r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-                   .count();
-        return r;
-    }
+    if (rr.not_found)
+        return refused_result(
+            "emulator_not_found: 'renode' is not installed / not on PATH", assertions, t0);
+    if (rr.timed_out)
+        return refused_result(
+            "timeout: renode exceeded " + fmt_g(timeout_s) + "s", assertions, t0);
     std::string raw = rr.stdout_text;
-    if (rr.returncode != 0 && rr.returncode != 1) raw += rr.stderr_text;
+    if (!rr.stderr_text.empty()) {
+        if (!raw.empty() && raw.back() != '\n') raw += '\n';
+        raw += rr.stderr_text;
+    }
 
     std::string uart_log = cap(raw);
     nlohmann::json gpio_events = parse_gpio_events(raw);
-    nlohmann::json gpio_states = derive_gpio_states(gpio_events, parse_renode_gpio_odr(raw));
+    nlohmann::json gpio_states = final_gpio_states(raw, parse_renode_gpio_odr(raw));
     nlohmann::json uart_events = parse_uart_events(raw);
     auto trace_path = write_trace_artifact(elf_path, "renode", raw, gpio_events, gpio_states);
     SimResult r;
+    if (rr.returncode != 0) {
+        r = refused_result(
+            cap("emulator_fault: renode exited with code " +
+                std::to_string(rr.returncode) + "\n" + raw),
+            assertions, t0);
+        r.gpio_states = gpio_states;
+        r.gpio_events = gpio_events;
+        r.trace_path = trace_path;
+        return r;
+    }
     r.assertion_results =
-        evaluate_assertions(uart_log, gpio_states, assertions, gpio_events, uart_events);
+        evaluate_assertions(raw, gpio_states, assertions, gpio_events, uart_events);
     r.passed = true;
     for (const auto& a : r.assertion_results)
         if (!a.value("passed", false)) {
@@ -201,31 +410,45 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
 SimResult run_qemu(const std::string& elf_path, double timeout_s,
                    const std::vector<std::string>& assertions) {
     auto t0 = std::chrono::steady_clock::now();
-    if (which("qemu-system-arm").empty()) return emulator_not_found("qemu-system-arm", t0);
+    if (which("qemu-system-arm").empty())
+        return refused_result(
+            "emulator_not_found: 'qemu-system-arm' is not installed / not on PATH",
+            assertions, t0);
     std::vector<std::string> cmd = {
         "qemu-system-arm", "-M", "mps2-an385", "-cpu", "cortex-m3",
         "-kernel", elf_path, "-semihosting",
         "-semihosting-config", "enable=on,target=native", "-nographic", "-no-reboot",
     };
     RunResult rr = run_capture(cmd, "", timeout_s);
-    if (rr.not_found) return emulator_not_found("qemu-system-arm", t0);
-    if (rr.timed_out) {
-        SimResult r;
-        r.passed = false;
-        r.uart_log = "timeout: qemu-system-arm exceeded " +
-                     std::to_string(static_cast<long long>(timeout_s)) + "s";
-        r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-                   .count();
-        return r;
-    }
+    if (rr.not_found)
+        return refused_result(
+            "emulator_not_found: 'qemu-system-arm' is not installed / not on PATH",
+            assertions, t0);
+    if (rr.timed_out)
+        return refused_result(
+            "timeout: qemu-system-arm exceeded " + fmt_g(timeout_s) + "s", assertions, t0);
     std::string raw = rr.stdout_text;
+    if (!rr.stderr_text.empty()) {
+        if (!raw.empty() && raw.back() != '\n') raw += '\n';
+        raw += rr.stderr_text;
+    }
     std::string uart_log = cap(raw);
     nlohmann::json gpio_events = parse_gpio_events(raw);
-    nlohmann::json gpio_states = derive_gpio_states(gpio_events, nlohmann::json::object());
+    nlohmann::json gpio_states = final_gpio_states(raw, nlohmann::json::object());
     auto trace_path = write_trace_artifact(elf_path, "qemu", raw, gpio_events, gpio_states);
     SimResult r;
-    r.assertion_results = evaluate_assertions(uart_log, gpio_states, assertions, gpio_events,
-                                              parse_uart_events(raw));
+    if (rr.returncode != 0) {
+        r = refused_result(
+            cap("emulator_fault: qemu-system-arm exited with code " +
+                std::to_string(rr.returncode) + "\n" + raw),
+            assertions, t0);
+        r.gpio_states = gpio_states;
+        r.gpio_events = gpio_events;
+        r.trace_path = trace_path;
+        return r;
+    }
+    r.assertion_results = evaluate_assertions(
+        raw, gpio_states, assertions, gpio_events, parse_uart_events(raw));
     r.passed = true;
     for (const auto& a : r.assertion_results)
         if (!a.value("passed", false)) {
@@ -294,8 +517,13 @@ nlohmann::json parse_gpio_events(const std::string& text) {
         if (!std::regex_search(lines[i], m, kGpioEvtRe)) continue;
         nlohmann::json t_ms = nullptr;
         if (m[3].matched) {
-            double t = std::stod(m[3].str());
-            t_ms = to_ms(t, m[4].matched ? m[4].str() : "ms");
+            try {
+                const double converted =
+                    to_ms(std::stod(m[3].str()), m[4].matched ? m[4].str() : "ms");
+                if (std::isfinite(converted)) t_ms = converted;
+            } catch (...) {
+                t_ms = nullptr;
+            }
         }
         events.push_back({{"type", "gpio"},
                           {"seq", static_cast<long long>(i)},
@@ -303,7 +531,7 @@ nlohmann::json parse_gpio_events(const std::string& text) {
                           {"pin", m[1].str()},
                           {"level", std::stoi(m[2].str())}});
     }
-    return events;
+    return bound_events(events);
 }
 
 nlohmann::json parse_uart_events(const std::string& text) {
@@ -313,7 +541,12 @@ nlohmann::json parse_uart_events(const std::string& text) {
     for (size_t i = 0; i < lines.size(); ++i) {
         std::smatch m;
         if (std::regex_search(lines[i], m, kTMarkRe)) {
-            t_ms = std::stod(m[1].str());
+            try {
+                const double parsed = std::stod(m[1].str());
+                if (std::isfinite(parsed)) t_ms = parsed;
+            } catch (...) {
+                t_ms = nullptr;
+            }
             continue;
         }
         std::string s = trim(lines[i]);
@@ -325,7 +558,7 @@ nlohmann::json parse_uart_events(const std::string& text) {
                           {"t_ms", t_ms},
                           {"text", s}});
     }
-    return events;
+    return bound_events(events);
 }
 
 nlohmann::json parse_renode_gpio_odr(const std::string& text) {
@@ -352,8 +585,12 @@ nlohmann::json parse_renode_gpio_odr(const std::string& text) {
             continue;
         }
         if (in_block && !have_value && std::regex_search(line, m, kHexRe)) {
-            value = std::stoll(m[0].str(), nullptr, 16);
-            have_value = true;
+            try {
+                value = std::stoll(m[0].str(), nullptr, 16);
+                have_value = true;
+            } catch (...) {
+                have_value = false;
+            }
         }
     }
     return states;
@@ -409,7 +646,7 @@ std::optional<std::string> write_trace_artifact(const std::string& elf_path,
     try {
         namespace fs = std::filesystem;
         std::error_code ec;
-        if (!fs::exists(elf_path, ec)) return std::nullopt;
+        if (!fs::is_regular_file(elf_path, ec)) return std::nullopt;
         nlohmann::json events = nlohmann::json::array();
         for (const auto& e : gpio_events) events.push_back(e);
         for (const auto& e : parse_uart_events(uart_log)) events.push_back(e);
@@ -417,6 +654,8 @@ std::optional<std::string> write_trace_artifact(const std::string& elf_path,
                          [](const nlohmann::json& a, const nlohmann::json& b) {
                              return a.value("seq", 0LL) < b.value("seq", 0LL);
                          });
+        events = bound_events(events);
+        const bool truncated = events_truncated(events);
         nlohmann::json payload = {
             {"schema", "aicad.firmware.trace/1"},
             {"source", source},
@@ -425,17 +664,35 @@ std::optional<std::string> write_trace_artifact(const std::string& elf_path,
                                  .count()},
             {"events", events},
             {"gpio_final", gpio_states},
+            {"truncated", truncated},
         };
         fs::path out = elf_path;
         out += ".trace.json";
         fs::path tmp = out;
         tmp += ".tmp";
         {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            f << payload.dump(2);
+            std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+            if (!file) return std::nullopt;
+            file << payload.dump(2);
+            file.flush();
+            if (!file) {
+                fs::remove(tmp, ec);
+                return std::nullopt;
+            }
         }
         fs::rename(tmp, out, ec);
-        if (ec) return std::nullopt;
+        if (ec && fs::is_regular_file(out)) {
+            std::error_code remove_ec;
+            fs::remove(out, remove_ec);
+            if (!remove_ec) {
+                ec.clear();
+                fs::rename(tmp, out, ec);
+            }
+        }
+        if (ec) {
+            fs::remove(tmp, ec);
+            return std::nullopt;
+        }
         return out.string();
     } catch (...) {
         return std::nullopt;
@@ -452,10 +709,16 @@ nlohmann::json evaluate_assertions(const std::string& uart_log,
                                                                   : nlohmann::json::array();
     const nlohmann::json& uart_events = uart_events_in.is_array() ? uart_events_in
                                                                   : nlohmann::json::array();
+    const bool gpio_trace_truncated = events_truncated(gpio_events);
 
     for (const auto& raw_assertion : assertions) {
         std::string a = trim(raw_assertion);
         if (a.rfind("toggles:", 0) == 0) {
+            if (gpio_trace_truncated) {
+                results.push_back(assertion_result(
+                    a, false, "not evaluated: GPIO trace exceeded the event limit"));
+                continue;
+            }
             std::smatch m;
             std::string spec = trim(a.substr(8));
             if (!std::regex_match(spec, m, kTogglesRe)) {
@@ -475,6 +738,11 @@ nlohmann::json evaluate_assertions(const std::string& uart_log,
             continue;
         }
         if (a.rfind("period:", 0) == 0) {
+            if (gpio_trace_truncated) {
+                results.push_back(assertion_result(
+                    a, false, "not evaluated: GPIO trace exceeded the event limit"));
+                continue;
+            }
             std::smatch m;
             std::string spec = trim(a.substr(7));
             if (!std::regex_match(spec, m, kPeriodRe)) {
@@ -673,7 +941,7 @@ std::string build_resc(const std::string& elf_path, const std::string& platform_
         }
     }
 
-    // Only wire hooks/reads for ports the platform actually declares.
+    // Only retain pins whose final state can be read from a declared GPIO port.
     std::vector<std::pair<char, int>> gpio_pins;
     for (const auto& [p, n] : gpio_pins_in) {
         if (platform_text.find(std::string("gpioPort") + p) != std::string::npos)
@@ -692,19 +960,12 @@ std::string build_resc(const std::string& elf_path, const std::string& platform_
     for (const auto& l : scenario_setup_lines) lines.push_back(l);
     lines.push_back("sysbus LoadELF @" + elf_path);
     if (!uart_name.empty()) lines.push_back("showAnalyzer sysbus." + uart_name);
-    for (const auto& [port, num] : gpio_pins) {
-        lines.push_back("sysbus.gpioPort" + std::string(1, port) + " AddStateChangedHook " +
-                        std::to_string(num) + " \"print('CHUDWARE_GPIO_EVT P" + port +
-                        std::to_string(num) + "=%d' % (1 if state else 0))\"");
-    }
     lines.push_back("start");
     if (!scenario_timeline.empty()) {
         for (const auto& l : timeline_resc_lines(scenario_timeline, run_seconds))
             lines.push_back(l);
     } else {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%.1f", run_seconds);
-        lines.push_back(std::string("sleep ") + buf);
+        lines.push_back("sleep " + fmt_g(run_seconds));
     }
     std::set<char> ports;
     for (const auto& [p, _] : gpio_pins) ports.insert(p);
@@ -726,6 +987,22 @@ SimResult run_simulation(const std::string& elf_path, const std::string& mcu_fam
                          const std::vector<std::string>& assertions, double timeout_s,
                          const nlohmann::json& scenario) {
     auto t0 = std::chrono::steady_clock::now();
+    if (!std::isfinite(timeout_s) || timeout_s <= 0.0)
+        return refused_result(
+            "invalid_setup: timeout_s must be finite and greater than zero", assertions, t0);
+    const auto setup_errors = assertion_errors(assertions);
+    if (!setup_errors.empty()) {
+        std::string joined;
+        for (const auto& error : setup_errors) {
+            if (!joined.empty()) joined += "; ";
+            joined += error;
+        }
+        return refused_result("invalid_setup: " + joined, assertions, t0);
+    }
+    if (!scenario.is_null() && !scenario.is_object())
+        return refused_result(
+            "invalid_setup: scenario must be a validated aicad.fwscenario/1 object",
+            assertions, t0);
     nlohmann::json caps = get_capabilities(mcu_family);
 
     if (caps.value("emulation", std::string()) == "none") {
@@ -733,12 +1010,31 @@ SimResult run_simulation(const std::string& elf_path, const std::string& mcu_fam
         return unsupported_result(caps, assertions, all,
                                   "no emulation path for this family (build + flash only)", t0);
     }
+    const std::string invalid_image = image_error(elf_path, 40);  // EM_ARM
+    if (!invalid_image.empty()) return refused_result(invalid_image, assertions, t0);
+    const std::string scenario_capability_error =
+        register_stream_capability_error(scenario);
+    if (!scenario_capability_error.empty())
+        return refused_result(
+            "scenario_unsupported: " + scenario_capability_error, assertions, t0);
 
     std::string platform = get_platform_file(mcu_family);
     bool have_renode = !which("renode").empty();
     bool have_qemu = !which("qemu-system-arm").empty();
 
     if (have_renode && !platform.empty()) {
+        std::set<std::string> untimestampable;
+        for (const auto& assertion : assertions)
+            if (requires_timestamped_gpio_observation(assertion))
+                untimestampable.insert(assertion);
+        if (!untimestampable.empty()) {
+            return unsupported_result(
+                caps, assertions, untimestampable,
+                "timestamped GPIO observation is unavailable on the supported Renode "
+                "1.16.1 command surface; AddStateChangedHook is unsupported and the final "
+                "ODR snapshot carries state but no emulator time",
+                t0);
+        }
         std::set<std::string> unsupported;
         for (const auto& a : assertions) {
             std::string cap_needed = assertion_capability(a);
@@ -791,15 +1087,10 @@ SimResult run_simulation(const std::string& elf_path, const std::string& mcu_fam
         }
         return run_qemu(elf_path, timeout_s, assertions);
     }
-    SimResult r;
-    r.passed = false;
-    r.uart_log =
+    return refused_result(
         "emulator_not_found: neither 'renode' nor 'qemu-system-arm' found on PATH. Install "
-        "Renode (https://renode.io) or QEMU for live emulation. Tests that mock the subprocess "
-        "run without either.";
-    r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-               .count();
-    return r;
+        "Renode (https://renode.io) or QEMU for live emulation.",
+        assertions, t0);
 }
 
 }  // namespace chudware::firmware

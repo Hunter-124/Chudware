@@ -15,6 +15,7 @@
 #include <array>
 #include <cmath>
 #include <map>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -442,6 +443,17 @@ TEST_CASE("thermal transient: invalid inputs rejected; frames land at requested 
     opts.dt = -1.0;  // invalid
     auto r2 = chudware::sim::fea_thermal_transient(m.pts, m.tets, 0.05, fixed, temps, {}, {}, opts, 4);
     CHECK_FALSE(r2.ok);
+    opts.dt = 1.0e-308;
+    opts.t_end = 1.0e308;
+    const auto extreme_ratio = chudware::sim::fea_thermal_transient(
+        m.pts, m.tets, 0.05, fixed, temps, {}, {}, opts, 4);
+    const auto repeated_extreme_ratio = chudware::sim::fea_thermal_transient(
+        m.pts, m.tets, 0.05, fixed, temps, {}, {}, opts, 4);
+    CHECK_FALSE(extreme_ratio.ok);
+    CHECK_FALSE(repeated_extreme_ratio.ok);
+    CHECK(extreme_ratio.error.find("step count") != std::string::npos);
+    CHECK(repeated_extreme_ratio.error == extreme_ratio.error);
+    opts.t_end = 1.0;
     opts.dt = 0.1;
     opts.t_init = 50.0;
     opts.frame_times = {0.0, 0.35, 0.75};
@@ -536,4 +548,81 @@ TEST_CASE("thermal: legacy single-flux entry point delegates identically") {
     REQUIRE(legacy.temperature.size() == perload.temperature.size());
     for (size_t i = 0; i < legacy.temperature.size(); ++i)
         CHECK(legacy.temperature[i] == perload.temperature[i]);  // bit-for-bit
+}
+
+TEST_CASE("thermal: a selected interior face is rejected rather than heated") {
+    const std::vector<double> points = {
+        0, 0, 0,  1, 0, 0,  0, 1, 0,  0, 0, 1,  0, 0, -1};
+    const std::vector<int> tets = {0, 1, 2, 3, 0, 2, 1, 4};
+    chudware::sim::ThermalFluxLoad flux;
+    flux.nodes = {0, 1, 2};
+    flux.q = 0.1;
+    const auto result = chudware::sim::fea_thermal_solve(
+        points, tets, 1.0, {3}, {0.0}, {flux}, {}, 4);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("exterior") != std::string::npos);
+}
+
+TEST_CASE("thermal transient: final partial step uses its actual duration") {
+    const std::vector<double> points = {
+        0, 0, 0,  1, 0, 0,  0, 1, 0,  0, 0, 1};
+    const std::vector<int> tets = {0, 1, 2, 3};
+    chudware::sim::ThermalFluxLoad flux;
+    flux.nodes = {0, 1, 2, 3};
+    flux.q = 0.1;
+    chudware::sim::ThermalTransientOptions opts;
+    opts.rho_cp = 2.0;
+    opts.t_init = 10.0;
+    opts.dt = 1.0;
+    opts.t_end = 1.5;
+    const auto result = chudware::sim::fea_thermal_transient(
+        points, tets, 1.0, {}, {}, {flux}, {}, opts, 4);
+    REQUIRE(result.ok);
+    REQUIRE(!result.frames.empty());
+    const auto& final = result.frames.back().temperature;
+    double mean = 0.0;
+    for (double temperature : final) mean += temperature;
+    mean /= static_cast<double>(final.size());
+    const double area = 0.5 * (3.0 + std::sqrt(3.0));
+    const double volume = 1.0 / 6.0;
+    const double expected =
+        opts.t_init + flux.q * area * opts.t_end / (opts.rho_cp * volume);
+    CHECK(mean == doctest::Approx(expected).epsilon(1e-10));
+
+    opts.t_end = 0.5;
+    const auto shorter_than_nominal_step =
+        chudware::sim::fea_thermal_transient(
+            points, tets, 1.0, {}, {}, {flux}, {}, opts, 4);
+    REQUIRE(shorter_than_nominal_step.ok);
+    REQUIRE(shorter_than_nominal_step.n_steps == 1);
+    const auto& short_final = shorter_than_nominal_step.frames.back().temperature;
+    double short_mean = 0.0;
+    for (double temperature : short_final) short_mean += temperature;
+    short_mean /= static_cast<double>(short_final.size());
+    const double short_expected =
+        opts.t_init + flux.q * area * opts.t_end / (opts.rho_cp * volume);
+    CHECK(short_mean == doctest::Approx(short_expected).epsilon(1e-10));
+}
+
+TEST_CASE("thermal: degenerate elements fail instead of contributing zero") {
+    const std::vector<double> points = {
+        0, 0, 0,  1, 0, 0,  0, 1, 0,  1, 1, 0};
+    const std::vector<int> tets = {0, 1, 2, 3};
+    const auto result = chudware::sim::fea_thermal_solve(
+        points, tets, 1.0, {0}, {0.0}, {}, {}, 4);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("degenerate") != std::string::npos);
+}
+
+TEST_CASE("thermal: a pre-cancelled token aborts before assembly") {
+    Box mesh = box_mesh(2.0, 1.0, 1.0, 2, 1, 1);
+    chudware::sim::ThermalFluxLoad flux;
+    flux.nodes = mesh.xL;
+    flux.q = 0.1;
+    auto token = std::make_shared<std::atomic<bool>>(true);
+    const auto result = chudware::sim::fea_thermal_solve(
+        mesh.pts, mesh.tets, 1.0, mesh.x0, uniform(mesh.x0.size(), 0.0),
+        {flux}, {}, 4, token);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("cancelled") != std::string::npos);
 }

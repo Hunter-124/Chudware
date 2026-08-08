@@ -2,6 +2,7 @@
 // hydraulic_tools.py tool bodies (minus MCP session bookkeeping). The piping
 // solve inside hydraulic_piping_handoff always runs live here (the C++ core
 // IS the solver — there is no fluids-absent "solve_pending" stage).
+#include <cmath>
 #include "hydraulic/hydraulic.h"
 
 #include "hydraulic/bom.h"
@@ -40,6 +41,78 @@ ojson errs_to_json(const std::vector<std::string>& errs) {
     for (const auto& e : errs) out.push_back(e);
     return out;
 }
+ojson estimate_dp_by_run(const ojson& estimates) {
+    ojson out = ojson::object();
+    if (!estimates.is_object()) return out;
+    for (auto it = estimates.begin(); it != estimates.end(); ++it) {
+        const ojson dp = it->value("dp_kpa", ojson(nullptr));
+        if (it->value("ok", false) && dp.is_number() &&
+            std::isfinite(dp.get<double>())) {
+            out[it.key()] = std::abs(dp.get<double>());
+        }
+    }
+    return out;
+}
+
+ojson expectation_dp_by_run(const ojson& expectations) {
+    ojson out = ojson::object();
+    if (!expectations.is_array()) return out;
+    for (const auto& exp : expectations) {
+        const std::string quantity = exp.value("quantity", std::string());
+        const size_t colon = quantity.find(':');
+        const std::string run_id =
+            colon == std::string::npos ? quantity : quantity.substr(colon + 1);
+        const ojson value = exp.value("value", ojson(nullptr));
+        if (!run_id.empty() && value.is_number() &&
+            std::isfinite(value.get<double>())) {
+            out[run_id] = std::abs(value.get<double>());
+        }
+    }
+    return out;
+}
+
+ojson independent_line_margins(double supply_pressure_bar,
+                               const ojson& load_pressure_bar,
+                               const ojson& estimated_dp_kpa_by_run,
+                               const ojson& solve_result) {
+    ojson per_line = ojson::object();
+    for (const auto& link : solve_result.value("links", ojson::array())) {
+        const std::string run_id = link.value("id", std::string());
+        if (run_id.empty()) continue;
+        ojson estimated_bar = nullptr;
+        const ojson estimated_kpa =
+            estimated_dp_kpa_by_run.value(run_id, ojson(nullptr));
+        if (estimated_kpa.is_number() &&
+            std::isfinite(estimated_kpa.get<double>())) {
+            estimated_bar = pyround(std::abs(estimated_kpa.get<double>()) / 100.0, 4);
+        }
+        ojson solved_bar = nullptr;
+        const ojson solved_kpa = link.value("dp_kpa", ojson(nullptr));
+        if (solved_kpa.is_number() && std::isfinite(solved_kpa.get<double>())) {
+            solved_bar = pyround(std::abs(solved_kpa.get<double>()) / 100.0, 4);
+        }
+        ojson row =
+            margin_update(supply_pressure_bar, load_pressure_bar, estimated_bar, solved_bar);
+        row["run_id"] = run_id;
+        row["topology_role"] = "independent_hose_line_case";
+        per_line[run_id] = std::move(row);
+    }
+
+    ojson out = ojson::object();
+    out["topology_model"] = "independent_hose_line_cases";
+    out["per_line"] = std::move(per_line);
+    // Preserve the old scalar field names as explicit unavailable values so a
+    // caller cannot accidentally interpret independent cases as one series path.
+    out["line_loss_estimate_bar"] = nullptr;
+    out["line_loss_solved_bar"] = nullptr;
+    out["pump_margin_estimate_bar"] = nullptr;
+    out["pump_margin_solved_bar"] = nullptr;
+    out["pump_margin_solved_pct"] = nullptr;
+    out["diagnostic"] =
+        "aggregate line loss and pump margin are not defined: each generated hose "
+        "is an independent fixed-pressure/prescribed-flow case; inspect per_line";
+    return out;
+}
 
 ojson m_new(const ojson& params) {
     const ojson name = get(params, "name");
@@ -65,6 +138,20 @@ ojson m_add_component(const ojson& params) {
         return jerr("no active hydraulic circuit",
                     "call hydraulic_new first, or pass doc=<circuit>");
     }
+    const auto base_errs = validate_doc_errs(d);
+    if (!base_errs.empty()) {
+        ojson out = jerr("hydraulic document failed schema validation");
+        out["errors"] = errs_to_json(base_errs);
+        return out;
+    }
+    if (!p.is_null() && !p.is_object()) return jerr("params must be an object");
+    if (!s.is_null() && !s.is_object()) return jerr("sourcing must be an object");
+    const double x = num(get(params, "x"), 0.0);
+    const double y = num(get(params, "y"), 0.0);
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+        return jerr("component x and y must be finite");
+    }
+
     const std::string type = get(params, "type").is_string()
                                  ? get(params, "type").get<std::string>()
                                  : py_str(get(params, "type"));
@@ -80,13 +167,17 @@ ojson m_add_component(const ojson& params) {
     const ojson name = get(params, "name");
     ojson comp = new_component(comp_id, type,
                                name.is_string() ? name.get<std::string>() : "",
-                               num(get(params, "x"), 0.0), num(get(params, "y"), 0.0),
-                               p.is_object() ? p : ojson::object());
+                               x, y, p.is_object() ? p : ojson::object());
     if (py_truthy(s)) pyutil::update(comp["sourcing"], s);
 
     doc["components"].push_back(comp);
 
     const auto errs = validate_doc_errs(doc);
+    if (!errs.empty()) {
+        ojson invalid = jerr("component would make hydraulic document invalid");
+        invalid["errors"] = errs_to_json(errs);
+        return invalid;
+    }
     ojson out = ojson::object();
     out["ok"] = true;
     out["component_id"] = comp_id;
@@ -113,6 +204,12 @@ ojson m_add_hose(const ojson& params) {
                     "e.g. [{\"component_id\":\"c1\",\"port\":\"p1\"},"
                     "{\"component_id\":\"c2\",\"port\":\"p1\"}]");
     }
+    const auto base_errs = validate_doc_errs(d);
+    if (!base_errs.empty()) {
+        ojson out = jerr("hydraulic document failed schema validation");
+        out["errors"] = errs_to_json(base_errs);
+        return out;
+    }
 
     ojson doc = d;
     const std::string hose_id = next_id(doc, "h");
@@ -122,6 +219,11 @@ ojson m_add_hose(const ojson& params) {
     doc["hoses"].push_back(hose);
 
     const auto errs = validate_doc_errs(doc);
+    if (!errs.empty()) {
+        ojson invalid = jerr("hose would make hydraulic document invalid");
+        invalid["errors"] = errs_to_json(errs);
+        return invalid;
+    }
     ojson out = ojson::object();
     out["ok"] = true;
     out["hose_id"] = hose_id;
@@ -223,25 +325,37 @@ ojson m_piping_handoff(const ojson& params) {
     if (supply_pressure_bar <= 0 || flow_lpm <= 0) {
         return jerr("supply_pressure_bar and flow_lpm must be > 0");
     }
+    if (!std::isfinite(supply_pressure_bar) || !std::isfinite(flow_lpm)) {
+        return jerr("supply_pressure_bar and flow_lpm must be finite");
+    }
+    if (!std::isfinite(supply_pressure_bar * 100.0) ||
+        !std::isfinite(flow_lpm * 0.06)) {
+        return jerr("hydraulic-to-piping unit conversion overflowed");
+    }
+    const double default_id_mm = num(get(params, "default_id_mm"), 12.7);
+    const double default_length_mm = num(get(params, "default_length_mm"), 1000.0);
+    if (!std::isfinite(default_id_mm) || default_id_mm <= 0 ||
+        !std::isfinite(default_length_mm) || default_length_mm <= 0) {
+        return jerr("default_id_mm and default_length_mm must be finite and > 0");
+    }
+    const ojson load_pressure = get(params, "load_pressure_bar");
+    if (!load_pressure.is_null() &&
+        (!load_pressure.is_number() ||
+         !std::isfinite(load_pressure.get<double>()) ||
+         load_pressure.get<double>() < 0)) {
+        return jerr("load_pressure_bar must be a finite number >= 0 or null");
+    }
+    const double tolerance_pct = num(get(params, "tolerance_pct"), 30.0);
+    if (!std::isfinite(tolerance_pct) || tolerance_pct < 0) {
+        return jerr("tolerance_pct must be finite and >= 0");
+    }
+
 
     ojson net = hoses_to_piping(d, flow_lpm, supply_pressure_bar, ln,
-                                num(get(params, "default_id_mm"), 12.7),
-                                num(get(params, "default_length_mm"), 1000.0), fl);
+                                default_id_mm, default_length_mm, fl);
     if (!net.value("ok", false)) return net;
 
     const ojson env = piping_handoff_envelope(d, net, supply_pressure_bar);
-    ojson est_loss_bar = nullptr;
-    {
-        double sum = 0.0;
-        int n = 0;
-        for (auto it = net["estimates"].begin(); it != net["estimates"].end(); ++it) {
-            if (it->value("ok", false)) {
-                sum += (*it)["dp_kpa"].get<double>();
-                ++n;
-            }
-        }
-        if (n > 0) est_loss_bar = pyround(sum / 100.0, 4);
-    }
 
     ojson base = ojson::object();
     base["ok"] = true;
@@ -251,21 +365,24 @@ ojson m_piping_handoff(const ojson& params) {
     base["lines"] = net["lines"];
     base["estimates"] = net["estimates"];
     base["warnings"] = net["warnings"];
+    if (net["lines"].size() > 1) {
+        base["warnings"].push_back(
+            "hose runs are independent line cases; no aggregate series pressure loss "
+            "or pump margin is reported");
+    }
 
     // The C++ core IS the solver: the live solve always runs here.
     ojson solve_res = piping::solve(net["piping_doc"], net["boundary"], net["fluid"]);
     if (!solve_res.value("ok", false)) {
+        base["ok"] = false;
+        base["reason"] =
+            solve_res.value("reason", std::string("piping solve failed"));
         base["stage"] = "solve_failed";
         base["solve"] = solve_res;
         return sh::attach(std::move(base), env);
     }
 
-    const double tolerance_pct = num(get(params, "tolerance_pct"), 30.0);
     auto [verify_env, checks] = verify_piping_envelope(env, solve_res, tolerance_pct);
-    double solved_sum = 0.0;
-    for (const auto& lk : solve_res["links"])
-        solved_sum += std::abs(num(lk.value("dp_kpa", ojson(0.0)), 0.0));
-    const ojson solved_loss_bar = pyround(solved_sum / 100.0, 4);
 
     ojson per_line = ojson::object();
     for (const auto& lk : solve_res["links"])
@@ -279,13 +396,14 @@ ojson m_piping_handoff(const ojson& params) {
     base["stage"] = "solved";
     base["solve"] = solve_res;
     base["per_line_dp_kpa"] = std::move(per_line);
-    base["margin"] = margin_update(supply_pressure_bar, get(params, "load_pressure_bar"),
-                                   est_loss_bar, solved_loss_bar);
+    base["margin"] = independent_line_margins(
+        supply_pressure_bar, load_pressure, estimate_dp_by_run(net["estimates"]),
+        solve_res);
     base["verify"] = std::move(verify);
     base["next_actions"] = ojson::array(
         {"hydraulic_verify_piping() to get the full verify envelope",
-         "hydraulic_size_pump(flow_lpm, supply_pressure_bar) if the margin "
-         "went negative — hose losses are now real, not estimated"});
+         "inspect margin.per_line and resize the pump if any actual circuit-line "
+         "margin is negative"});
     return sh::attach(std::move(base), env);
 }
 
@@ -300,40 +418,54 @@ ojson m_verify_piping(const ojson& params) {
                     "call hydraulic_piping_handoff first, or pass "
                     "handoff=<result or its simhandoff envelope>");
     }
-    if (!srs.is_object() || !py_truthy(srs.value("links", ojson(nullptr)))) {
-        return jerr("no piping solve result with links to verify against",
-                    "pass solve_result=<piping_solve output>");
+    const auto envelope_errs = sh::validate_envelope(h);
+    if (!envelope_errs.empty() ||
+        h.value("coupling", ojson(nullptr)) != "hydraulic_to_piping") {
+        ojson out = jerr("invalid hydraulic→piping handoff envelope");
+        out["errors"] = errs_to_json(envelope_errs);
+        return out;
+    }
+    if (!srs.is_object() || !srs.value("ok", false) ||
+        !srs.value("converged", false) ||
+        !py_truthy(srs.value("links", ojson(nullptr)))) {
+        return jerr("no converged piping solve result with links to verify against",
+                    "pass a successful piping_solve output with converged=true");
     }
 
     const double tolerance_pct = num(get(params, "tolerance_pct"), 30.0);
+    if (!std::isfinite(tolerance_pct) || tolerance_pct < 0) {
+        return jerr("tolerance_pct must be finite and >= 0");
+    }
     auto [env, checks] = verify_piping_envelope(h, srs, tolerance_pct);
     if (checks.empty()) {
         return jerr("no comparable lines (expectations vs solve links)",
                     "the handoff had no dP expectations or the solve "
                     "links don't match its run ids");
     }
-    double solved_sum = 0.0;
-    for (const auto& lk : srs["links"])
-        solved_sum += std::abs(num(lk.value("dp_kpa", ojson(0.0)), 0.0));
-    const ojson solved_loss_bar = pyround(solved_sum / 100.0, 4);
-    ojson est_loss_bar = nullptr;
-    const ojson exps = h.value("expectations", ojson(nullptr));
-    if (py_truthy(exps)) {
-        double sum = 0.0;
-        for (const auto& e : exps) sum += pyutil::to_double(e["value"]);
-        est_loss_bar = pyround(sum / 100.0, 4);
-    }
     const ojson supply = get(params, "supply_pressure_bar");
+    if (!supply.is_null() &&
+        (!supply.is_number() || !std::isfinite(supply.get<double>()) ||
+         supply.get<double>() <= 0)) {
+        return jerr("supply_pressure_bar must be a finite number > 0 or null");
+    }
+    const ojson load = get(params, "load_pressure_bar");
+    if (!load.is_null() &&
+        (!load.is_number() || !std::isfinite(load.get<double>()) ||
+         load.get<double>() < 0)) {
+        return jerr("load_pressure_bar must be a finite number >= 0 or null");
+    }
     ojson result = ojson::object();
     result["ok"] = true;
     result["pass"] = env["pass"];
     result["verdict"] = env["verdict"];
     result["checks"] = checks;
     result["tolerance_pct"] = tolerance_pct;
-    result["margin"] = !supply.is_null()
-                           ? margin_update(supply.get<double>(), get(params, "load_pressure_bar"),
-                                           est_loss_bar, solved_loss_bar)
-                           : ojson(nullptr);
+    result["margin"] =
+        !supply.is_null()
+            ? independent_line_margins(
+                  supply.get<double>(), load,
+                  expectation_dp_by_run(h.value("expectations", ojson::array())), srs)
+            : ojson(nullptr);
     result["warnings"] = ojson::array();
     return sh::attach(std::move(result), env);
 }
@@ -350,21 +482,48 @@ ojson m_fea_handoff(const ojson& params) {
     const double max_pressure_bar = num(get(params, "max_pressure_bar"), 0.0);
     const double rod_mm = num(get(params, "rod_mm"), 0.0);
     const double efficiency = num(get(params, "efficiency"), 1.0);
+    if (!std::isfinite(bore_mm) || !std::isfinite(max_pressure_bar) ||
+        !std::isfinite(rod_mm) || !std::isfinite(efficiency)) {
+        return jerr("cylinder geometry, pressure, and efficiency must be finite");
+    }
     if (bore_mm <= 0 || max_pressure_bar <= 0) {
         return jerr("bore_mm and max_pressure_bar must be > 0");
     }
     if (rod_mm < 0 || rod_mm >= bore_mm) return jerr("rod_mm must be in [0, bore_mm)");
     if (!(0.0 < efficiency && efficiency <= 1.0)) return jerr("efficiency must be in (0, 1]");
-
     const ojson d = get(params, "doc");
-    const ojson doc_id = d.is_object() ? d.value("id", ojson(nullptr)) : ojson(nullptr);
-    const ojson target_doc_id = get(params, "target_doc_id");
+    if (!d.is_null()) {
+        const auto doc_errs = validate_doc_errs(d);
+        if (!doc_errs.empty()) {
+            ojson out = jerr("hydraulic document failed schema validation");
+            out["errors"] = errs_to_json(doc_errs);
+            return out;
+        }
+    }
     const std::string load_face = get(params, "load_face").is_string()
                                       ? get(params, "load_face").get<std::string>()
                                       : "the cylinder mount face";
     const std::string fixture_face = get(params, "fixture_face").is_string()
                                          ? get(params, "fixture_face").get<std::string>()
                                          : "the base";
+    if (load_face.empty() || fixture_face.empty() || load_face == fixture_face) {
+        return jerr("load_face and fixture_face must be non-empty distinct face queries");
+    }
+    const ojson forces = cylinder_mount_forces(bore_mm, rod_mm, max_pressure_bar, efficiency);
+    if (!forces.value("extend_n", ojson(nullptr)).is_number() ||
+        !forces.value("retract_n", ojson(nullptr)).is_number() ||
+        !std::isfinite(forces["extend_n"].get<double>()) ||
+        !std::isfinite(forces["retract_n"].get<double>())) {
+        return jerr("cylinder mount-force calculation overflowed");
+    }
+
+
+    const ojson doc_id = d.is_object() ? d.value("id", ojson(nullptr)) : ojson(nullptr);
+    const ojson target_doc_id = get(params, "target_doc_id");
+    if (!target_doc_id.is_null() &&
+        (!target_doc_id.is_string() || target_doc_id.get<std::string>().empty())) {
+        return jerr("target_doc_id must be a non-empty string when provided");
+    }
     const ojson env = fea_handoff_envelope(bore_mm, rod_mm, max_pressure_bar, ax,
                                            efficiency, load_face, fixture_face, doc_id,
                                            target_doc_id);
@@ -384,11 +543,11 @@ ojson m_fea_handoff(const ojson& params) {
     std::sort(cases.begin(), cases.end(),
               [](const ojson& a, const ojson& b) { return a.get<std::string>() < b.get<std::string>(); });
 
-    const ojson forces = env["source"]["result_digest"];
+    const ojson force_digest = env["source"]["result_digest"];
     ojson result = ojson::object();
     result["ok"] = true;
-    result["extend_force_n"] = forces["extend_force_n"];
-    result["retract_force_n"] = forces["retract_force_n"];
+    result["extend_force_n"] = force_digest["extend_force_n"];
+    result["retract_force_n"] = force_digest["retract_force_n"];
     result["axis"] = ojson::array({ax[0], ax[1], ax[2]});
     result["cases"] = std::move(cases);
     result["fea_args"] = std::move(fea_args);
@@ -415,7 +574,17 @@ ojson m_verify_fea(const ojson& params) {
                     "call hydraulic_fea_handoff first, or pass "
                     "handoff=<result or its simhandoff envelope>");
     }
+    const auto envelope_errs = sh::validate_envelope(h);
+    if (!envelope_errs.empty() ||
+        h.value("coupling", ojson(nullptr)) != "hydraulic_to_fea") {
+        ojson out = jerr("invalid hydraulic→FEA handoff envelope");
+        out["errors"] = errs_to_json(envelope_errs);
+        return out;
+    }
     const double tolerance_pct = num(get(params, "tolerance_pct"), 0.5);
+    if (!std::isfinite(tolerance_pct) || tolerance_pct < 0) {
+        return jerr("tolerance_pct must be finite and >= 0");
+    }
     const ojson env = verify_fea_envelope(h, tolerance_pct, fr);
     ojson result = ojson::object();
     result["ok"] = true;

@@ -39,6 +39,19 @@ std::tuple<ojson, ojson, ojson, std::vector<std::string>> network_from_handoff(o
     if (env.value("kind", ojson(nullptr)) != "handoff") {
         return {nullptr, nullptr, nullptr, {"source_handoff must be a handoff envelope"}};
     }
+    if (env.value("coupling", ojson(nullptr)) != "hydraulic_to_piping") {
+        errs.push_back("source_handoff coupling must be 'hydraulic_to_piping'");
+    }
+    const ojson source = env.value("source", ojson::object());
+    const ojson target = env.value("target", ojson::object());
+    if (!source.is_object() || source.value("domain", ojson(nullptr)) != "hydraulic") {
+        errs.push_back("source_handoff source.domain must be 'hydraulic'");
+    }
+    if (!target.is_object() || target.value("domain", ojson(nullptr)) != "piping" ||
+        target.value("tool", ojson(nullptr)) != "piping_solve") {
+        errs.push_back(
+            "source_handoff target must identify piping/piping_solve");
+    }
     ojson doc = nullptr;
     for (const auto& g : env.value("geometry", ojson::array())) {
         if (g.value("kind", ojson(nullptr)) == "doc" &&
@@ -103,7 +116,7 @@ ojson m_piping_solve(const ojson& params) {
     ojson handoff_id = nullptr;
     if (!env.is_null()) {
         auto [hdoc, hbc, hfl, herrs] = network_from_handoff(env);
-        if (!herrs.empty() && (d.is_null() || bc.is_null())) {
+        if (!herrs.empty()) {
             ojson out = jerr("could not consume source_handoff",
                              "pass a hydraulic_piping_handoff result or its simhandoff "
                              "envelope");

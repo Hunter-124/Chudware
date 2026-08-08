@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include "sim/sim_cancel.h"
 
 namespace chudware::sim {
 
@@ -80,6 +81,14 @@ std::vector<int> nodes_in_faceset_surface(const std::vector<double>& points,
 // Summary scalars are rounded to match the oracle (vm .4, disp .6, fos .4).
 // Never throws: a bad mesh / unsolvable model returns {ok:false, error}.
 nlohmann::json fea_run_static(const nlohmann::json& study);
+
+namespace detail {
+// Reuse an enclosing study's cancellation token without replacing its job-id
+// registration. This keeps composite studies (fatigue -> static) continuously
+// cancellable while the static wrapper runs.
+nlohmann::json fea_run_static_with_cancel_token(
+    const nlohmann::json& study, const SimCancelToken& token);
+}  // namespace detail
 
 // Combined modal run. `study` carries the same mesh + material + fixtures
 // fields (loads are ignored — modal is fixtures-only). Returns

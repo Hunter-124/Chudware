@@ -51,7 +51,7 @@ bool overlay_within_cap(const aicm::AicmBody& bt, const char* where) {
     return false;
 }
 
-// (n_verts*3) surface vertex positions (float pos -> double), like _surface_verts.
+// Surface vertex positions promoted to double for deformation metadata.
 std::vector<double> surface_verts(const aicm::AicmBody& bt) {
     std::vector<double> out(bt.pos.size());
     for (size_t i = 0; i < bt.pos.size(); ++i) out[i] = static_cast<double>(bt.pos[i]);
@@ -68,62 +68,119 @@ std::string publish_overlay_aicm(const aicm::AicmBody& bt,
     return chudware::aicm_handoff::publish("overlay_" + std::to_string(n), blob);
 }
 
-// double -> float vector (chunk payloads are float32, like the np.float32 cast in
-// scalar_chunk/disp_chunk).
-std::vector<float> to_f32(const std::vector<double>& v) {
-    std::vector<float> out(v.size());
-    for (size_t i = 0; i < v.size(); ++i) out[i] = static_cast<float>(v[i]);
-    return out;
+bool finite_f32(double x) {
+    return std::isfinite(x) &&
+           std::abs(x) <= static_cast<double>(std::numeric_limits<float>::max());
 }
 
-double field_max(const std::vector<double>& v) {
-    double mx = -std::numeric_limits<double>::infinity();
-    for (double x : v) if (x > mx) mx = x;
-    return std::isfinite(mx) ? mx : 0.0;
-}
-
-double field_min(const std::vector<double>& v) {
-    double mn = std::numeric_limits<double>::infinity();
-    for (double x : v) if (x < mn) mn = x;
-    return std::isfinite(mn) ? mn : 0.0;
-}
-
-// bbox diagonal of surface verts (||max - min||), 1.0 if empty — like overlay.py.
-double bbox_diag(const std::vector<double>& surf) {
-    const size_t m = surf.size() / 3;
-    if (m == 0) return 1.0;
-    double lo[3], hi[3];
-    for (int k = 0; k < 3; ++k) {
-        lo[k] = std::numeric_limits<double>::max();
-        hi[k] = -std::numeric_limits<double>::max();
-    }
-    for (size_t i = 0; i < m; ++i)
-        for (int k = 0; k < 3; ++k) {
-            double c = surf[3 * i + k];
-            if (c < lo[k]) lo[k] = c;
-            if (c > hi[k]) hi[k] = c;
+bool to_f32_exact(const std::vector<double>& v, std::vector<float>& out) {
+    out.clear();
+    out.reserve(v.size());
+    for (double x : v) {
+        if (!finite_f32(x)) {
+            out.clear();
+            return false;
         }
-    double dx = hi[0] - lo[0], dy = hi[1] - lo[1], dz = hi[2] - lo[2];
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
+        out.push_back(static_cast<float>(x));
+    }
+    return true;
 }
 
-// Map a per-VOLUME-NODE field to the FEA boundary surface by DIRECT INDEXING through
-// surf_to_vol (field_surf[i*dim+k] = field_vol[surf_to_vol[i]*dim+k]). Relies on the
-// solver's per-node arrays sharing vol_points' node order (same deterministic mesh).
-// Out-of-range / short fields are filled 0 rather than crashing (assert-guarded).
-std::vector<double> map_to_surface_direct(const std::vector<int>& surf_to_vol,
-                                          const std::vector<double>& vol_values, int dim) {
-    const size_t m = surf_to_vol.size();
-    const size_t d = static_cast<size_t>(dim);
-    std::vector<double> out(m * d, 0.0);
-    const size_t n_vals = vol_values.size() / d;  // number of source nodes
-    for (size_t i = 0; i < m; ++i) {
-        const int g = surf_to_vol[i];
-        if (g < 0 || static_cast<size_t>(g) >= n_vals) continue;  // safe skip -> 0
-        for (size_t k = 0; k < d; ++k)
-            out[i * d + k] = vol_values[static_cast<size_t>(g) * d + k];
+bool finite_field(const std::vector<double>& v, size_t nodes, size_t dim) {
+    if (dim == 0 || nodes > std::numeric_limits<size_t>::max() / dim ||
+        v.size() != nodes * dim)
+        return false;
+    for (double x : v)
+        if (!finite_f32(x)) return false;
+    return true;
+}
+
+struct ScalarRange {
+    float min = 0.0f;
+    float max = 1.0f;
+};
+
+bool scalar_range(const std::vector<double>& v, bool include_zero, ScalarRange& range) {
+    if (v.empty()) return false;
+    double mn = std::numeric_limits<double>::infinity();
+    double mx = -std::numeric_limits<double>::infinity();
+    for (double x : v) {
+        if (!finite_f32(x)) return false;
+        mn = std::min(mn, x);
+        mx = std::max(mx, x);
     }
-    return out;
+    if (include_zero) {
+        mn = std::min(mn, 0.0);
+        mx = std::max(mx, 0.0);
+    }
+    range.min = static_cast<float>(mn);
+    range.max = static_cast<float>(mx);
+    if (!(range.max > range.min)) {
+        if (range.min == 0.0f) {
+            range.max = 1.0f;
+        } else {
+            range.min = std::nextafter(range.min, -std::numeric_limits<float>::infinity());
+            range.max = std::nextafter(range.max, std::numeric_limits<float>::infinity());
+        }
+    }
+    return std::isfinite(range.min) && std::isfinite(range.max) && range.max > range.min;
+}
+
+// bbox diagonal of finite surface verts. Invalid/degenerate geometry returns 0.
+double bbox_diag(const std::vector<double>& surf) {
+    if (surf.empty() || surf.size() % 3 != 0) return 0.0;
+    double lo[3] = {surf[0], surf[1], surf[2]};
+    double hi[3] = {surf[0], surf[1], surf[2]};
+    for (double c : surf)
+        if (!std::isfinite(c)) return 0.0;
+    for (size_t i = 1; i < surf.size() / 3; ++i)
+        for (int k = 0; k < 3; ++k) {
+            const double c = surf[3 * i + static_cast<size_t>(k)];
+            lo[k] = std::min(lo[k], c);
+            hi[k] = std::max(hi[k], c);
+        }
+    const double dx = hi[0] - lo[0], dy = hi[1] - lo[1], dz = hi[2] - lo[2];
+    const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
+    return std::isfinite(diag) ? diag : 0.0;
+}
+
+// Exact per-node mapping. A short/malformed/non-finite field invalidates the
+// overlay; silently zero-filling would attach values to the wrong surface nodes.
+bool map_to_surface_direct(const std::vector<int>& surf_to_vol,
+                           const std::vector<double>& vol_values, size_t vol_nodes,
+                           size_t dim, std::vector<double>& out) {
+    if (!finite_field(vol_values, vol_nodes, dim)) return false;
+    if (surf_to_vol.size() > std::numeric_limits<size_t>::max() / dim) return false;
+    out.resize(surf_to_vol.size() * dim);
+    for (size_t i = 0; i < surf_to_vol.size(); ++i) {
+        const int g = surf_to_vol[i];
+        if (g < 0 || static_cast<size_t>(g) >= vol_nodes) {
+            out.clear();
+            return false;
+        }
+        for (size_t k = 0; k < dim; ++k)
+            out[i * dim + k] = vol_values[static_cast<size_t>(g) * dim + k];
+    }
+    return true;
+}
+
+bool append_scalar(std::vector<std::vector<uint8_t>>& chunks, const char* name,
+                   const std::vector<double>& values, bool include_zero) {
+    std::vector<float> f32;
+    ScalarRange range;
+    if (!to_f32_exact(values, f32) || !scalar_range(values, include_zero, range))
+        return false;
+    chunks.push_back(aicm::scalar_chunk(1, name, f32, range.min, range.max));
+    return !chunks.back().empty();
+}
+
+bool append_displacement(std::vector<std::vector<uint8_t>>& chunks, double scale_hint,
+                         const std::vector<double>& displacement) {
+    if (!finite_f32(scale_hint) || !(scale_hint > 0.0)) return false;
+    std::vector<float> f32;
+    if (!to_f32_exact(displacement, f32) || f32.empty()) return false;
+    chunks.push_back(aicm::disp_chunk(1, static_cast<float>(scale_hint), f32));
+    return !chunks.back().empty();
 }
 
 }  // namespace
@@ -131,17 +188,49 @@ std::vector<double> map_to_surface_direct(const std::vector<int>& surf_to_vol,
 FeaSurface fea_surface_body(const std::vector<double>& vol_points,
                             const std::vector<int>& tets, int nodes_per_elem) {
     FeaSurface fs;
+    if (nodes_per_elem != 4 && nodes_per_elem != 8 && nodes_per_elem != 10)
+        return fs;
+    const bool hex = nodes_per_elem == 8;
+    const size_t stride = static_cast<size_t>(nodes_per_elem);
+    if (vol_points.empty() || vol_points.size() % 3 != 0 ||
+        tets.empty() || tets.size() % stride != 0)
+        return fs;
+    const size_t n_nodes = vol_points.size() / 3;
+    const size_t n_tets = tets.size() / stride;
+    for (double c : vol_points)
+        if (!finite_f32(c)) return FeaSurface{};
+    auto corner_jacobian = [&](size_t e) {
+        const int* el = &tets[e * stride];
+        const int i0 = el[0], i1 = el[1];
+        const int i2 = hex ? el[3] : el[2];
+        const int i3 = hex ? el[4] : el[3];
+        const double* p0 = &vol_points[static_cast<size_t>(i0) * 3];
+        const double* p1 = &vol_points[static_cast<size_t>(i1) * 3];
+        const double* p2 = &vol_points[static_cast<size_t>(i2) * 3];
+        const double* p3 = &vol_points[static_cast<size_t>(i3) * 3];
+        const double a[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+        const double b[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+        const double c[3] = {p3[0] - p0[0], p3[1] - p0[1], p3[2] - p0[2]};
+        return a[0] * (b[1] * c[2] - b[2] * c[1]) -
+               a[1] * (b[0] * c[2] - b[2] * c[0]) +
+               a[2] * (b[0] * c[1] - b[1] * c[0]);
+    };
+    for (size_t e = 0; e < n_tets; ++e) {
+        for (size_t j = 0; j < stride; ++j) {
+            const int g = tets[e * stride + j];
+            if (g < 0 || static_cast<size_t>(g) >= n_nodes) return FeaSurface{};
+            for (size_t k = 0; k < j; ++k)
+                if (tets[e * stride + k] == g) return FeaSurface{};
+        }
+        const double jacobian = corner_jacobian(e);
+        if (!std::isfinite(jacobian) || jacobian == 0.0) return FeaSurface{};
+    }
+
     fs.body.body_id = 1;
     fs.body.name = "Body1";
     fs.body.color[0] = 0.71f;
     fs.body.color[1] = 0.76f;
     fs.body.color[2] = 0.82f;
-
-    const bool hex = (nodes_per_elem == 8);
-    const int stride = (nodes_per_elem == 10) ? 10 : (hex ? 8 : 4);
-    const size_t n_tets = (stride > 0) ? (tets.size() / static_cast<size_t>(stride)) : 0;
-    const size_t n_nodes = vol_points.size() / 3;
-    if (n_tets == 0 || n_nodes == 0) return fs;
 
     // The 4 triangular faces of a tet (corner locals) + the opposite corner local for
     // each (used to orient the face outward).
@@ -163,14 +252,22 @@ FeaSurface fea_surface_body(const std::vector<double>& vol_points,
 
     // ── Pass 1: count occurrences of each tet-face key (sorted global corner ids). ──
     std::map<std::array<int, 3>, int> face_count;
+    std::map<std::array<int, 3>, std::array<int, 3>> face_mids;
     if (!hex)
         for (size_t e = 0; e < n_tets; ++e) {
-            const int* t = &tets[e * static_cast<size_t>(stride)];
+            const int* t = &tets[e * stride];
             for (int f = 0; f < 4; ++f) {
                 std::array<int, 3> key = {t[FACE_LOCAL[f][0]], t[FACE_LOCAL[f][1]],
                                           t[FACE_LOCAL[f][2]]};
                 std::sort(key.begin(), key.end());
-                ++face_count[key];
+                if (++face_count[key] > 2) return FeaSurface{};
+                if (nodes_per_elem == 10) {
+                    std::array<int, 3> mids = {t[FACE_MID[f][0]], t[FACE_MID[f][1]],
+                                               t[FACE_MID[f][2]]};
+                    std::sort(mids.begin(), mids.end());
+                    auto [it, inserted] = face_mids.emplace(key, mids);
+                    if (!inserted && it->second != mids) return FeaSurface{};
+                }
             }
         }
 
@@ -259,6 +356,10 @@ FeaSurface fea_surface_body(const std::vector<double>& vol_points,
                 ++qcount[key];
             }
         }
+        for (const auto& [key, count] : qcount) {
+            (void)key;
+            if (count > 2) return FeaSurface{};
+        }
         for (size_t e = 0; e < n_tets; ++e) {
             const int* t = &tets[e * static_cast<size_t>(stride)];
             double cen[3] = {0, 0, 0};
@@ -290,15 +391,17 @@ FeaSurface fea_surface_body(const std::vector<double>& vol_points,
         }
     }
 
-    // ── Per-vertex normals: accumulate each triangle's (un-normalized) geometric
-    //    normal onto its 3 vertices (area-weighted), then normalize (guard -> +Z). ──
+    // Per-vertex normals use double accumulation so large-but-finite coordinates
+    // cannot overflow a float accumulator. Degenerate rendered triangles fail closed.
     const size_t nv = fs.body.pos.size() / 3;
-    fs.body.nrm.assign(nv * 3, 0.0f);
     const size_t ntri = fs.body.idx.size() / 3;
+    if (nv == 0 || ntri == 0 || fs.surf_to_vol.size() != nv) return FeaSurface{};
+    std::vector<double> normal_accum(nv * 3, 0.0);
     for (size_t ti = 0; ti < ntri; ++ti) {
         const uint32_t ia = fs.body.idx[ti * 3 + 0];
         const uint32_t ib = fs.body.idx[ti * 3 + 1];
         const uint32_t ic = fs.body.idx[ti * 3 + 2];
+        if (ia >= nv || ib >= nv || ic >= nv) return FeaSurface{};
         const float* PA = &fs.body.pos[ia * 3];
         const float* PB = &fs.body.pos[ib * 3];
         const float* PC = &fs.body.pos[ic * 3];
@@ -307,24 +410,24 @@ FeaSurface fea_surface_body(const std::vector<double>& vol_points,
         const double nx = u[1] * v[2] - u[2] * v[1];
         const double ny = u[2] * v[0] - u[0] * v[2];
         const double nz = u[0] * v[1] - u[1] * v[0];
+        const double area2 = nx * nx + ny * ny + nz * nz;
+        if (!std::isfinite(area2) || !(area2 > 0.0)) return FeaSurface{};
         for (uint32_t vi : {ia, ib, ic}) {
-            fs.body.nrm[vi * 3 + 0] += static_cast<float>(nx);
-            fs.body.nrm[vi * 3 + 1] += static_cast<float>(ny);
-            fs.body.nrm[vi * 3 + 2] += static_cast<float>(nz);
+            normal_accum[vi * 3 + 0] += nx;
+            normal_accum[vi * 3 + 1] += ny;
+            normal_accum[vi * 3 + 2] += nz;
         }
     }
+    fs.body.nrm.resize(nv * 3);
     for (size_t i = 0; i < nv; ++i) {
-        float* N = &fs.body.nrm[i * 3];
-        const double len = std::sqrt(static_cast<double>(N[0]) * N[0] +
-                                     static_cast<double>(N[1]) * N[1] +
-                                     static_cast<double>(N[2]) * N[2]);
-        if (len > 1e-20) {
-            N[0] = static_cast<float>(N[0] / len);
-            N[1] = static_cast<float>(N[1] / len);
-            N[2] = static_cast<float>(N[2] / len);
-        } else {
-            N[0] = 0.0f; N[1] = 0.0f; N[2] = 1.0f;
-        }
+        const double nx = normal_accum[i * 3 + 0];
+        const double ny = normal_accum[i * 3 + 1];
+        const double nz = normal_accum[i * 3 + 2];
+        const double len = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (!std::isfinite(len) || !(len > 0.0)) return FeaSurface{};
+        fs.body.nrm[i * 3 + 0] = static_cast<float>(nx / len);
+        fs.body.nrm[i * 3 + 1] = static_cast<float>(ny / len);
+        fs.body.nrm[i * 3 + 2] = static_cast<float>(nz / len);
     }
     return fs;
 }
@@ -332,15 +435,25 @@ FeaSurface fea_surface_body(const std::vector<double>& vol_points,
 std::vector<double> map_to_surface(const std::vector<double>& surf_xyz,
                                    const std::vector<double>& vol_xyz,
                                    const std::vector<double>& vol_values, int dim) {
+    if (dim <= 0 || surf_xyz.size() % 3 != 0 || vol_xyz.empty() ||
+        vol_xyz.size() % 3 != 0)
+        return {};
     const size_t m = surf_xyz.size() / 3;
     const size_t n = vol_xyz.size() / 3;
-    std::vector<double> out(m * static_cast<size_t>(dim), 0.0);
-    if (n == 0) return out;
+    const size_t d = static_cast<size_t>(dim);
+    if (!finite_field(vol_values, n, d) ||
+        m > std::numeric_limits<size_t>::max() / d)
+        return {};
+    for (double c : surf_xyz)
+        if (!finite_f32(c)) return {};
+    for (double c : vol_xyz)
+        if (!finite_f32(c)) return {};
+
+    std::vector<double> out(m * d);
     for (size_t i = 0; i < m; ++i) {
         const double sx = surf_xyz[3 * i + 0];
         const double sy = surf_xyz[3 * i + 1];
         const double sz = surf_xyz[3 * i + 2];
-        // Nearest volume node, first-minimum tie-break (np.argmin returns first min).
         double best = std::numeric_limits<double>::infinity();
         size_t best_j = 0;
         for (size_t j = 0; j < n; ++j) {
@@ -348,14 +461,14 @@ std::vector<double> map_to_surface(const std::vector<double>& surf_xyz,
             const double dy = sy - vol_xyz[3 * j + 1];
             const double dz = sz - vol_xyz[3 * j + 2];
             const double d2 = dx * dx + dy * dy + dz * dz;
+            if (!std::isfinite(d2)) return {};
             if (d2 < best) {
                 best = d2;
                 best_j = j;
             }
         }
-        for (int k = 0; k < dim; ++k)
-            out[i * static_cast<size_t>(dim) + k] =
-                vol_values[best_j * static_cast<size_t>(dim) + k];
+        for (size_t k = 0; k < d; ++k)
+            out[i * d + k] = vol_values[best_j * d + k];
     }
     return out;
 }
@@ -370,117 +483,105 @@ std::string static_overlay(const std::string& step_path,
                            const std::vector<double>& principal3,
                            const std::vector<double>& max_shear,
                            double yield_mpa, const nlohmann::json& summary) {
-    (void)step_path;  // surface now comes from the FEA boundary mesh, not the STEP.
+    (void)step_path;
+    (void)summary;  // rounded summaries must never define exact contour ranges.
     try {
-        chudware::prof::phases::StudyScope _study("overlay_static");  // total overlay-build time
+        chudware::prof::phases::StudyScope _study("overlay_static");
+        if (!std::isfinite(yield_mpa) || !(yield_mpa > 0.0)) return {};
         FeaSurface fs = fea_surface_body(vol_points, tets, nodes_per_elem);
         aicm::AicmBody bt = fs.body;
-        if (!overlay_within_cap(bt, "static_overlay")) return std::string();
-        std::vector<double> surf = surface_verts(bt);
+        const size_t vol_nodes = vol_points.size() / 3;
+        if (bt.pos.empty() || fs.surf_to_vol.empty() ||
+            !overlay_within_cap(bt, "static_overlay"))
+            return {};
 
-        std::vector<double> vm_s = map_to_surface_direct(fs.surf_to_vol, von_mises, 1);
-        std::vector<double> dm_s = map_to_surface_direct(fs.surf_to_vol, disp_mag, 1);
-        std::vector<double> dvec_s = map_to_surface_direct(fs.surf_to_vol, displacement, 3);
-
-        // fos = clip(yield/vm where vm>1e-9 else 15, 0..15).
-        std::vector<double> fos_s(vm_s.size());
-        for (size_t i = 0; i < vm_s.size(); ++i) {
-            double f = (vm_s[i] > 1e-9) ? (yield_mpa / vm_s[i]) : 15.0;
-            if (f < 0.0) f = 0.0;
-            if (f > 15.0) f = 15.0;
-            fos_s[i] = f;
+        std::vector<double> vm_s, dm_s, dvec_s;
+        if (!map_to_surface_direct(fs.surf_to_vol, von_mises, vol_nodes, 1, vm_s) ||
+            !map_to_surface_direct(fs.surf_to_vol, disp_mag, vol_nodes, 1, dm_s) ||
+            !map_to_surface_direct(fs.surf_to_vol, displacement, vol_nodes, 3, dvec_s))
+            return {};
+        for (size_t i = 0; i < dm_s.size(); ++i) {
+            const double magnitude =
+                std::hypot(dvec_s[3 * i + 0],
+                           std::hypot(dvec_s[3 * i + 1], dvec_s[3 * i + 2]));
+            const double tolerance = 1e-10 * std::max(1.0, magnitude);
+            if (!finite_f32(magnitude) || std::abs(dm_s[i] - magnitude) > tolerance)
+                return {};
         }
+        for (double x : vm_s)
+            if (x < 0.0) return {};
+        for (double x : dm_s)
+            if (x < 0.0) return {};
 
-        // scale_hint: peak displacement ~10% of bbox diagonal at scale 1.
-        const double bb_diag = bbox_diag(surf);
-        const double peak_dm = field_max(dm_s);
-        const double peak = (!dm_s.empty() && peak_dm > 1e-12) ? peak_dm : 1.0;
-        const double scale_hint = (peak > 1e-12) ? (0.1 * bb_diag / peak) : 1.0;
+        std::vector<double> fos_s(vm_s.size());
+        for (size_t i = 0; i < vm_s.size(); ++i)
+            fos_s[i] = std::clamp(vm_s[i] > 1e-9 ? yield_mpa / vm_s[i] : 15.0,
+                                  0.0, 15.0);
 
-        // vmin/vmax sourcing matches overlay.py: from summary, else field max.
-        const double vmax_vm =
-            summary.contains("max_von_mises_mpa") && summary["max_von_mises_mpa"].is_number()
-                ? summary["max_von_mises_mpa"].get<double>()
-                : field_max(vm_s);
-        const double vmax_dm =
-            summary.contains("max_disp_mm") && summary["max_disp_mm"].is_number()
-                ? summary["max_disp_mm"].get<double>()
-                : field_max(dm_s);
+        const double bb_diag = bbox_diag(surface_verts(bt));
+        if (!(bb_diag > 0.0)) return {};
+        const double peak_dm = *std::max_element(dm_s.begin(), dm_s.end());
+        const double scale_hint = peak_dm > 1e-12 ? 0.1 * bb_diag / peak_dm : 1.0;
 
         std::vector<std::vector<uint8_t>> chunks;
-        chunks.push_back(aicm::scalar_chunk(1, "von_mises", to_f32(vm_s), 0.0f,
-                                            static_cast<float>(vmax_vm)));
-        chunks.push_back(aicm::scalar_chunk(1, "displacement_mag", to_f32(dm_s), 0.0f,
-                                            static_cast<float>(vmax_dm)));
-        chunks.push_back(aicm::scalar_chunk(1, "fos", to_f32(fos_s), 0.0f, 5.0f));
-        chunks.push_back(
-            aicm::disp_chunk(1, static_cast<float>(scale_hint), to_f32(dvec_s)));
+        if (!append_scalar(chunks, "von_mises", vm_s, true) ||
+            !append_scalar(chunks, "displacement_mag", dm_s, true) ||
+            !append_scalar(chunks, "fos", fos_s, true) ||
+            !append_displacement(chunks, scale_hint, dvec_s))
+            return {};
 
-        // ── Additive scalar chunks (mapped from the volume to the surface) ────
-        // Signed principal stresses use the field min/max as the legend range.
-        std::vector<double> p1_s = map_to_surface_direct(fs.surf_to_vol, principal1, 1);
-        std::vector<double> p3_s = map_to_surface_direct(fs.surf_to_vol, principal3, 1);
-        std::vector<double> ms_s = map_to_surface_direct(fs.surf_to_vol, max_shear, 1);
-        chunks.push_back(aicm::scalar_chunk(1, "p1", to_f32(p1_s),
-                                            static_cast<float>(field_min(p1_s)),
-                                            static_cast<float>(field_max(p1_s))));
-        chunks.push_back(aicm::scalar_chunk(1, "p3", to_f32(p3_s),
-                                            static_cast<float>(field_min(p3_s)),
-                                            static_cast<float>(field_max(p3_s))));
-        chunks.push_back(aicm::scalar_chunk(1, "max_shear", to_f32(ms_s), 0.0f,
-                                            static_cast<float>(field_max(ms_s))));
-
-        // Per-component displacement, sliced out of the already-mapped dvec_s (dim=3).
-        const size_t m_surf = dvec_s.size() / 3;
-        std::vector<double> dx_s(m_surf), dy_s(m_surf), dz_s(m_surf);
-        for (size_t i = 0; i < m_surf; ++i) {
+        const size_t m = fs.surf_to_vol.size();
+        std::vector<double> dx_s(m), dy_s(m), dz_s(m);
+        for (size_t i = 0; i < m; ++i) {
             dx_s[i] = dvec_s[3 * i + 0];
             dy_s[i] = dvec_s[3 * i + 1];
             dz_s[i] = dvec_s[3 * i + 2];
         }
-        chunks.push_back(aicm::scalar_chunk(1, "disp_x", to_f32(dx_s),
-                                            static_cast<float>(field_min(dx_s)),
-                                            static_cast<float>(field_max(dx_s))));
-        chunks.push_back(aicm::scalar_chunk(1, "disp_y", to_f32(dy_s),
-                                            static_cast<float>(field_min(dy_s)),
-                                            static_cast<float>(field_max(dy_s))));
-        chunks.push_back(aicm::scalar_chunk(1, "disp_z", to_f32(dz_s),
-                                            static_cast<float>(field_min(dz_s)),
-                                            static_cast<float>(field_max(dz_s))));
+        if (!append_scalar(chunks, "disp_x", dx_s, false) ||
+            !append_scalar(chunks, "disp_y", dy_s, false) ||
+            !append_scalar(chunks, "disp_z", dz_s, false))
+            return {};
 
-        // ── Additive failure-criterion chunks ────────────────────────────────
-        // Derived from the already-mapped surface principal stresses, so they
-        // are sampled at the same surface vertices as p1/p3 (no extra kNN pass).
-        //   tresca        = p1 - p3        (max-shear-stress / Tresca equivalent)
-        //   abs_principal = max(|p1|,|p3|) (max-normal-stress / Rankine)
-        //   fos_tresca    = clamp(yield / max(tresca,1e-9), 0, 15)
-        //   fos_rankine   = clamp(yield / max(abs_principal,1e-9), 0, 15)
-        std::vector<double> tr_s(p1_s.size()), ap_s(p1_s.size());
-        std::vector<double> fos_tr(p1_s.size()), fos_rk(p1_s.size());
-        for (size_t i = 0; i < p1_s.size(); ++i) {
-            const double tr = p1_s[i] - p3_s[i];
-            const double ap = std::max(std::abs(p1_s[i]), std::abs(p3_s[i]));
-            tr_s[i] = tr;
-            ap_s[i] = ap;
-            double ft = yield_mpa / std::max(tr, 1e-9);
-            double fr = yield_mpa / std::max(ap, 1e-9);
-            if (ft < 0.0) ft = 0.0;
-            if (ft > 15.0) ft = 15.0;
-            if (fr < 0.0) fr = 0.0;
-            if (fr > 15.0) fr = 15.0;
-            fos_tr[i] = ft;
-            fos_rk[i] = fr;
+        std::vector<double> p1_s, p3_s;
+        if (!principal1.empty()) {
+            if (!map_to_surface_direct(fs.surf_to_vol, principal1, vol_nodes, 1, p1_s) ||
+                !append_scalar(chunks, "p1", p1_s, false))
+                return {};
         }
-        chunks.push_back(aicm::scalar_chunk(1, "tresca", to_f32(tr_s), 0.0f,
-                                            static_cast<float>(field_max(tr_s))));
-        chunks.push_back(aicm::scalar_chunk(1, "abs_principal", to_f32(ap_s), 0.0f,
-                                            static_cast<float>(field_max(ap_s))));
-        chunks.push_back(aicm::scalar_chunk(1, "fos_tresca", to_f32(fos_tr), 0.0f, 5.0f));
-        chunks.push_back(aicm::scalar_chunk(1, "fos_rankine", to_f32(fos_rk), 0.0f, 5.0f));
+        if (!principal3.empty()) {
+            if (!map_to_surface_direct(fs.surf_to_vol, principal3, vol_nodes, 1, p3_s) ||
+                !append_scalar(chunks, "p3", p3_s, false))
+                return {};
+        }
+        if (!max_shear.empty()) {
+            std::vector<double> ms_s;
+            if (!map_to_surface_direct(fs.surf_to_vol, max_shear, vol_nodes, 1, ms_s) ||
+                !append_scalar(chunks, "max_shear", ms_s, true))
+                return {};
+        }
 
+        // Derived criteria exist only when both principal fields exist. Empty
+        // optional inputs must not become fabricated all-zero contour fields.
+        if (!p1_s.empty() && !p3_s.empty()) {
+            std::vector<double> tr_s(m), ap_s(m), fos_tr(m), fos_rk(m);
+            for (size_t i = 0; i < m; ++i) {
+                const double tr = p1_s[i] - p3_s[i];
+                const double ap = std::max(std::abs(p1_s[i]), std::abs(p3_s[i]));
+                if (!finite_f32(tr) || !finite_f32(ap) || tr < 0.0) return {};
+                tr_s[i] = tr;
+                ap_s[i] = ap;
+                fos_tr[i] = std::clamp(yield_mpa / std::max(tr, 1e-9), 0.0, 15.0);
+                fos_rk[i] = std::clamp(yield_mpa / std::max(ap, 1e-9), 0.0, 15.0);
+            }
+            if (!append_scalar(chunks, "tresca", tr_s, true) ||
+                !append_scalar(chunks, "abs_principal", ap_s, true) ||
+                !append_scalar(chunks, "fos_tresca", fos_tr, true) ||
+                !append_scalar(chunks, "fos_rankine", fos_rk, true))
+                return {};
+        }
         return publish_overlay_aicm(bt, chunks);
     } catch (...) {
-        return std::string();
+        return {};
     }
 }
 
@@ -490,28 +591,34 @@ std::string fatigue_overlay(const std::string& step_path,
                             const std::vector<double>& fatigue_fos,
                             const std::vector<double>& life_log10,
                             const std::vector<double>& von_mises_peak) {
-    (void)step_path;  // surface now comes from the FEA boundary mesh, not the STEP.
+    (void)step_path;
     try {
-        chudware::prof::phases::StudyScope _study("overlay_fatigue");  // total overlay-build time
+        chudware::prof::phases::StudyScope _study("overlay_fatigue");
         FeaSurface fs = fea_surface_body(vol_points, tets, nodes_per_elem);
         aicm::AicmBody bt = fs.body;
-        if (!overlay_within_cap(bt, "fatigue_overlay")) return std::string();
+        const size_t vol_nodes = vol_points.size() / 3;
+        if (bt.pos.empty() || fs.surf_to_vol.empty() ||
+            !overlay_within_cap(bt, "fatigue_overlay"))
+            return {};
 
-        std::vector<double> ff_s = map_to_surface_direct(fs.surf_to_vol, fatigue_fos, 1);
-        std::vector<double> life_s = map_to_surface_direct(fs.surf_to_vol, life_log10, 1);
-        std::vector<double> vm_s = map_to_surface_direct(fs.surf_to_vol, von_mises_peak, 1);
+        std::vector<double> ff_s, life_s, vm_s;
+        if (!map_to_surface_direct(fs.surf_to_vol, fatigue_fos, vol_nodes, 1, ff_s) ||
+            !map_to_surface_direct(fs.surf_to_vol, life_log10, vol_nodes, 1, life_s) ||
+            !map_to_surface_direct(fs.surf_to_vol, von_mises_peak, vol_nodes, 1, vm_s))
+            return {};
+        for (double x : ff_s)
+            if (x < 0.0) return {};
+        for (double x : vm_s)
+            if (x < 0.0) return {};
 
         std::vector<std::vector<uint8_t>> chunks;
-        chunks.push_back(aicm::scalar_chunk(1, "fatigue_fos", to_f32(ff_s), 0.0f, 5.0f));
-        chunks.push_back(aicm::scalar_chunk(1, "life_log10", to_f32(life_s),
-                                            static_cast<float>(field_min(life_s)),
-                                            static_cast<float>(field_max(life_s))));
-        chunks.push_back(aicm::scalar_chunk(1, "von_mises", to_f32(vm_s), 0.0f,
-                                            static_cast<float>(field_max(vm_s))));
-
+        if (!append_scalar(chunks, "fatigue_fos", ff_s, true) ||
+            !append_scalar(chunks, "life_log10", life_s, false) ||
+            !append_scalar(chunks, "von_mises", vm_s, true))
+            return {};
         return publish_overlay_aicm(bt, chunks);
     } catch (...) {
-        return std::string();
+        return {};
     }
 }
 
@@ -519,37 +626,39 @@ std::string modal_overlay(const std::string& step_path,
                           const std::vector<double>& vol_points,
                           const std::vector<int>& tets, int nodes_per_elem,
                           const std::vector<double>& mode_shape, double freq_hz) {
-    (void)freq_hz;  // freq is metadata only (Python takes it but does not encode it).
-    (void)step_path;  // surface now comes from the FEA boundary mesh, not the STEP.
+    (void)step_path;
     try {
-        chudware::prof::phases::StudyScope _study("overlay_modal");  // total overlay-build time
+        chudware::prof::phases::StudyScope _study("overlay_modal");
+        if (!std::isfinite(freq_hz) || freq_hz < 0.0) return {};
         FeaSurface fs = fea_surface_body(vol_points, tets, nodes_per_elem);
         aicm::AicmBody bt = fs.body;
-        if (!overlay_within_cap(bt, "modal_overlay")) return std::string();
-        std::vector<double> surf = surface_verts(bt);
+        const size_t vol_nodes = vol_points.size() / 3;
+        if (bt.pos.empty() || fs.surf_to_vol.empty() ||
+            !overlay_within_cap(bt, "modal_overlay"))
+            return {};
 
-        std::vector<double> dvec_s = map_to_surface_direct(fs.surf_to_vol, mode_shape, 3);
-        const size_t m = dvec_s.size() / 3;
+        std::vector<double> dvec_s;
+        if (!map_to_surface_direct(fs.surf_to_vol, mode_shape, vol_nodes, 3, dvec_s))
+            return {};
+        const size_t m = fs.surf_to_vol.size();
         std::vector<double> mag(m);
         for (size_t i = 0; i < m; ++i) {
-            double x = dvec_s[3 * i + 0], y = dvec_s[3 * i + 1], z = dvec_s[3 * i + 2];
-            mag[i] = std::sqrt(x * x + y * y + z * z);
+            mag[i] = std::hypot(dvec_s[3 * i + 0],
+                                std::hypot(dvec_s[3 * i + 1], dvec_s[3 * i + 2]));
+            if (!finite_f32(mag[i])) return {};
         }
-        const double peak_mag = field_max(mag);
-        const double norm = (!mag.empty() && peak_mag > 1e-12) ? peak_mag : 1.0;
-
-        const double bb_diag = bbox_diag(surf);
-        const double scale_hint = (norm > 1e-12) ? (0.15 * bb_diag / norm) : 1.0;
+        const double peak_mag = *std::max_element(mag.begin(), mag.end());
+        const double bb_diag = bbox_diag(surface_verts(bt));
+        if (!(bb_diag > 0.0)) return {};
+        const double scale_hint = peak_mag > 1e-12 ? 0.15 * bb_diag / peak_mag : 1.0;
 
         std::vector<std::vector<uint8_t>> chunks;
-        chunks.push_back(aicm::scalar_chunk(1, "mode_amplitude", to_f32(mag), 0.0f,
-                                            static_cast<float>(norm)));
-        chunks.push_back(
-            aicm::disp_chunk(1, static_cast<float>(scale_hint), to_f32(dvec_s)));
-
+        if (!append_scalar(chunks, "mode_amplitude", mag, true) ||
+            !append_displacement(chunks, scale_hint, dvec_s))
+            return {};
         return publish_overlay_aicm(bt, chunks);
     } catch (...) {
-        return std::string();
+        return {};
     }
 }
 

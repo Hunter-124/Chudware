@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <limits>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -217,6 +218,24 @@ TEST_CASE("spice_sweep: big sweep parallel not slower than serial + multi-worker
     put_env("CHUDWARE_SIM_THREADS", "2");
     (void)chudware::pool::reconfigure_shared(0, "spice_sweep_test_restore");
     put_env("CHUDWARE_SIM_THREADS", nullptr);
+}
+
+TEST_CASE("spice_sweep: invalid parameter and non-finite point fail honestly") {
+    const json circuit = divider_circuit();
+    const json study = op_study();
+
+    const auto unknown =
+        spice_sweep_serial(circuit, "DOES_NOT_EXIST", std::vector<double>{1.0}, study);
+    REQUIRE(unknown.size() == 1);
+    CHECK_FALSE(unknown[0]["convergence"]["sweep"].get<bool>());
+    CHECK(unknown[0].value("cache_reason", std::string()) == "invalid_input");
+
+    const auto nonfinite = spice_sweep_serial(
+        circuit, "R1",
+        std::vector<double>{std::numeric_limits<double>::quiet_NaN()}, study);
+    REQUIRE(nonfinite.size() == 1);
+    CHECK_FALSE(nonfinite[0]["convergence"]["sweep"].get<bool>());
+    CHECK(nonfinite[0]["value"].is_null());
 }
 
 TEST_CASE("spice_sweep: empty values returns empty") {

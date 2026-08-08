@@ -45,19 +45,26 @@ struct BodyProps {
 };
 
 // One joint (mate) between body_a and body_b (index into bodies; -1 = world).
-// anchor/axis are expressed in body_a's LOCAL frame (world frame when body_a < 0),
-// so they ride along with the mechanism as it moves.
+// Each anchor is expressed in its owning body's LOCAL frame (world when the body
+// index is -1).  Separate anchors preserve the correct moment arm for dimensional
+// and contact constraints whose two reference points need not coincide.
 //
-// type ∈ { revolute, cylindrical, prismatic, spherical, planar, parallel, fixed,
-//          drive_moment, drive_force } — see wrench_basis() in the .cpp for the
-// exact transmitted-wrench subspace of each.
+// type ∈ { revolute, cylindrical, prismatic, spherical, planar, parallel,
+//          perpendicular, contact, fixed, drive_moment, drive_force } — see
+// wrench_basis() in the .cpp for the exact transmitted-wrench subspace.
 struct JointDef {
     std::string id;                                        // mate id
     std::string type = "fixed";
     int body_a = -1;
     int body_b = -1;
-    Eigen::Vector3d anchor_local = Eigen::Vector3d::Zero();  // m
-    Eigen::Vector3d axis_local = Eigen::Vector3d::UnitZ();   // unit
+    Eigen::Vector3d anchor_local = Eigen::Vector3d::Zero();  // on body_a, m
+    Eigen::Vector3d anchor_b_local = Eigen::Vector3d::Zero();// on body_b, m
+    bool has_anchor_b = false;
+    Eigen::Vector3d axis_local = Eigen::Vector3d::UnitZ();   // unit, body_a/world
+    // Optional exact world-frame axis per trajectory frame. Session-built mates
+    // use this for constraints whose Jacobian direction changes relative to body_a
+    // (point distance, contact and angle); synthetic callers may leave it empty.
+    std::vector<Eigen::Vector3d> axis_world_per_frame;
 };
 
 // Constant external load applied to one body (world frame, at its COM).
@@ -89,16 +96,20 @@ struct FrameDyn {
     std::vector<Eigen::Vector3d> omega;     // rad/s
     std::vector<Eigen::Vector3d> accel;     // m/s²
     std::vector<Eigen::Vector3d> alpha;     // rad/s²
-    double residual = 0.0;                  // ‖Ax−b‖ unbalance (N-ish mixed norm)
+    double residual = 0.0;                  // legacy combined wrench residual
+    double force_residual_n = 0.0;
+    double moment_residual_nm = 0.0;
+    bool balanced = false;
 };
 
 struct DynResult {
+    bool ok = false;                        // valid input and every frame balanced
     std::vector<FrameDyn> frames;
     std::vector<std::string> warnings;
 };
 
-// Solve. All bodies must carry the same number of poses (≥ 3 for usable
-// accelerations; 2 is accepted but ends copy their single interior estimate).
+// Solve. Invalid/non-finite inputs are rejected with ok=false, warnings, and no
+// frames. At least three poses are required for an acceleration-based solve.
 DynResult solve_inverse_dynamics(const std::vector<BodyProps>& bodies,
                                  const std::vector<JointDef>& joints,
                                  const Options& opt);

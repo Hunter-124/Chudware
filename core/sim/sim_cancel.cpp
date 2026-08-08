@@ -16,14 +16,22 @@ SimCancelToken sim_job_register(const std::string& job_id) {
     if (job_id.empty()) return nullptr;
     auto tok = std::make_shared<std::atomic<bool>>(false);
     std::lock_guard<std::mutex> lk(g_sim_jobs_mtx);
-    g_sim_jobs[job_id] = tok;
+    auto it = g_sim_jobs.find(job_id);
+    if (it != g_sim_jobs.end()) {
+        // Reuse cannot leave two uncancelled generations addressable by one id.
+        it->second->store(true, std::memory_order_release);
+        it->second = tok;
+    } else {
+        g_sim_jobs.emplace(job_id, tok);
+    }
     return tok;
 }
 
-void sim_job_unregister(const std::string& job_id) {
-    if (job_id.empty()) return;
+void sim_job_unregister(const std::string& job_id, const SimCancelToken& token) {
+    if (job_id.empty() || !token) return;
     std::lock_guard<std::mutex> lk(g_sim_jobs_mtx);
-    g_sim_jobs.erase(job_id);
+    auto it = g_sim_jobs.find(job_id);
+    if (it != g_sim_jobs.end() && it->second == token) g_sim_jobs.erase(it);
 }
 
 nlohmann::json sim_cancel(const std::string& job_id) {
@@ -35,7 +43,7 @@ nlohmann::json sim_cancel(const std::string& job_id) {
     }
     if (!tok)
         return nlohmann::json{{"ok", true}, {"cancelled", false}, {"job_id", job_id}};
-    tok->store(true);
+    tok->store(true, std::memory_order_release);
     return nlohmann::json{{"ok", true}, {"cancelled", true}, {"job_id", job_id}};
 }
 

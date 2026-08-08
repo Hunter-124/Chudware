@@ -210,6 +210,17 @@ def test_rlc_resonance_peak():
     assert sim["ok"] and sim["converged"], sim.get("sim_log")
     assert any("AC" in w for w in sim["warnings"]), \
         "auto AC-drive must be announced (Bug E-1 guard)"
+    missing_source = _call(
+        "ecad_simulate", analysis="ac",
+        params={"sweep": "dec", "points": 20, "fstart": 100, "fstop": 1e6,
+                "source": "NO_SUCH_SOURCE"},
+        doc_id=doc)
+    assert missing_source["ok"] is False and "source" in missing_source["error"].lower()
+    bad_band = _call(
+        "ecad_simulate", analysis="ac",
+        params={"sweep": "dec", "points": 20, "fstart": 1e6, "fstop": 100},
+        doc_id=doc)
+    assert bad_band["ok"] is False and "fstart" in bad_band["error"]
 
     # Peak location on a fine grid around f0 (grid-limited tolerance).
     circuit = _circuit_of(doc)
@@ -419,6 +430,8 @@ def test_tf_divider():
     assert abs(r["gain"] - 2.0 / 3.0) < 1e-3          # R2/(R1+R2)
     assert abs(r["rin"] - 3000.0) < 1.0               # R1+R2 seen by V1
     assert abs(r["rout"] - (1000.0 * 2000.0) / 3000.0) < 1.0  # R1||R2
+    missing = _call("ecad_tf", output=midprobe, source="NO_SOURCE", doc_id=doc)
+    assert missing["ok"] is False and "source" in missing["error"].lower()
 
 
 def test_sweep_and_guard():
@@ -437,6 +450,12 @@ def test_sweep_and_guard():
 
     bad = _call("ecad_sweep", param="R1", doc_id=doc)
     assert not bad["ok"] and bad["next_actions"], "must fail with guidance"
+    for kwargs in (
+            {"param": "R1", "values": [1000.0]},
+            {"param": "R1", "values": [1000.0, float("nan")]},
+            {"param": "R1", "values": [1000.0, 2000.0], "analysis": "noise"}):
+        invalid = _call("ecad_sweep", doc_id=doc, **kwargs)
+        assert invalid["ok"] is False and invalid.get("error"), (kwargs, invalid)
 
 
 # --------------------------------------------------------------------------- four (THD)

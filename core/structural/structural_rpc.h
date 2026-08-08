@@ -5,10 +5,10 @@
 // services/mcp/structural_tools.py: dict in → dict out, expected failures come
 // back INSIDE the result as the {code, message, detail} error envelope.
 //
-// Ported methods:
-//   struct_analyze  {doc|doc_path, load_combo}      → {load_combo, results}
-//   struct_check    {doc|doc_path, load_combo}      → {load_combo, disclaimer, results}
-//   struct_estimate {doc|doc_path, rates_path?}     → {line_items, fastener_line, totals…}
+// Methods:
+//   struct_analyze  {doc|doc_path, load_combo}  → {load_combo, units, results, reactions}
+//   struct_check    {doc|doc_path, load_combo}  → {load_combo, complete, disclaimer, results}
+//   struct_estimate {doc|doc_path, rates_path?} → {complete, line_items, fastener_line, totals…}
 #pragma once
 
 #include <string>

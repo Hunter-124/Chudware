@@ -2918,47 +2918,34 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 study["step_path"].is_string()) {
                 const std::string step_path = study["step_path"].get<std::string>();
                 if (std::filesystem::exists(step_path) && res.contains("von_mises")) {
-                    std::vector<double> vol = flat_doubles(study.value("points", json::array()));
+                    // A STEP-backed solve always meshes the STEP with the active options;
+                    // caller-supplied inline points/tets are intentionally ignored by
+                    // resolve_mesh. Recover that exact cached mesh for the overlay too.
+                    std::vector<double> vol;
                     std::vector<int> tets;
                     int npe = 4;
-                    if (vol.empty()) {
-                        // Inline points absent: re-mesh to recover the volume node coords
-                        // AND the tet connectivity (the boundary-surface overlay needs the
-                        // tets). The mesh is deterministic so node coords + tets match the
-                        // solved result.
-                        chudware::sim::MeshOptions opts;
-                        opts.fineness = study.value("fineness", 0.5);
-                        opts.density = study.value("density", -1.0);  // legacy alias
-                        opts.order = study.value("mesh_order", study.value("order", 1));
-                        opts.curvature = study.value("curvature", true);
-                        opts.curv_elems_per_circle = study.value("curv_elems_per_circle", 12.0);
-                        opts.target_size_mm = study.value("target_size_mm", 0.0);
-                        opts.min_size_mm = study.value("min_size_mm", 0.0);
-                        opts.max_size_mm = study.value("max_size_mm", 0.0);
-                        opts.optimize = study.value("optimize", true);
-                        opts.algorithm3d = study.value("algorithm3d", 1);
-                        opts.structured = study.value(
-                            "structured", study.value("mesh_type", std::string()) == "hex");
-                        opts.auto_type = study.value("auto_type", false);
-                        opts.quad_surface = study.value("quad_surface", false);
-                        opts.fallback_to_tet = study.value("fallback_to_tet", true);
-                        opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
-                        // Cached: the solve just meshed this same STEP+options via
-                        // resolve_mesh -> mesh_step_cached, so the cached call is a hit and
-                        // the overlay no longer pays a full duplicate mesh (measured ~75% of
-                        // sim_run_static wall time on a small part). Content+options keyed,
-                        // so the recovered nodes/tets are exactly the solved mesh.
-                        auto mo = chudware::sim::mesh_step_cached_ptr(step_path, opts);
-                        if (mo->ok) {
-                            vol = mo->points;
-                            tets = mo->tets;
-                            npe = mo->nodes_per_elem;
-                        }
-                    } else {
-                        // Inline mesh: read the connectivity + element order off the study.
-                        tets = flat_ints(study.value("tets", json::array()));
-                        npe = study.value("nodes_per_elem",
-                                          study.value("mesh_order", 1) == 2 ? 10 : 4);
+                    chudware::sim::MeshOptions opts;
+                    opts.fineness = study.value("fineness", 0.5);
+                    opts.density = study.value("density", -1.0);  // legacy alias
+                    opts.order = study.value("mesh_order", study.value("order", 1));
+                    opts.curvature = study.value("curvature", true);
+                    opts.curv_elems_per_circle = study.value("curv_elems_per_circle", 12.0);
+                    opts.target_size_mm = study.value("target_size_mm", 0.0);
+                    opts.min_size_mm = study.value("min_size_mm", 0.0);
+                    opts.max_size_mm = study.value("max_size_mm", 0.0);
+                    opts.optimize = study.value("optimize", true);
+                    opts.algorithm3d = study.value("algorithm3d", 1);
+                    opts.structured = study.value(
+                        "structured", study.value("mesh_type", std::string()) == "hex");
+                    opts.auto_type = study.value("auto_type", false);
+                    opts.quad_surface = study.value("quad_surface", false);
+                    opts.fallback_to_tet = study.value("fallback_to_tet", true);
+                    opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
+                    auto mo = chudware::sim::mesh_step_cached_ptr(step_path, opts);
+                    if (mo->ok) {
+                        vol = mo->points;
+                        tets = mo->tets;
+                        npe = mo->nodes_per_elem;
                     }
                     std::vector<double> vm = flat_doubles(res.value("von_mises", json::array()));
                     std::vector<double> dm = flat_doubles(res.value("disp_magnitude", json::array()));
@@ -3015,46 +3002,52 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     res["mode_shapes"].is_array() && !res["mode_shapes"].empty() &&
                     res.contains("freqs_hz") && res["freqs_hz"].is_array() &&
                     !res["freqs_hz"].empty()) {
-                    std::vector<double> vol = flat_doubles(study.value("points", json::array()));
+                    // fea_run_modal defaults STEP studies to tet10. Recover the same
+                    // content/options-keyed mesh rather than reinterpreting it as tet4.
+                    std::vector<double> vol;
                     std::vector<int> tets;
-                    int npe = 4;  // modal is always order 1 (tet4)
-                    if (vol.empty() && study.contains("step_path")) {
-                        // Inline points absent: re-mesh to get the volume node coords AND
-                        // the tet connectivity (the boundary-surface overlay needs them).
-                        chudware::sim::MeshOptions opts;
-                        opts.fineness = study.value("fineness", 0.5);
-                        opts.density = study.value("density", -1.0);  // legacy alias
-                        opts.order = 1;
-                        opts.curvature = study.value("curvature", true);
-                        opts.curv_elems_per_circle = study.value("curv_elems_per_circle", 12.0);
-                        opts.target_size_mm = study.value("target_size_mm", 0.0);
-                        opts.min_size_mm = study.value("min_size_mm", 0.0);
-                        opts.max_size_mm = study.value("max_size_mm", 0.0);
-                        opts.optimize = study.value("optimize", true);
-                        opts.algorithm3d = study.value("algorithm3d", 1);
-                        opts.auto_type = study.value("auto_type", false);
-                        opts.quad_surface = study.value("quad_surface", false);
-                        opts.fallback_to_tet = study.value("fallback_to_tet", true);
-                        opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
-                        // Cached: the solve just meshed this same STEP+options via
-                        // resolve_mesh -> mesh_step_cached, so the cached call is a hit and
-                        // the overlay no longer pays a full duplicate mesh (measured ~75% of
-                        // sim_run_static wall time on a small part). Content+options keyed,
-                        // so the recovered nodes/tets are exactly the solved mesh.
-                        auto mo = chudware::sim::mesh_step_cached_ptr(step_path, opts);
-                        if (mo->ok) {
-                            vol = mo->points;
-                            tets = mo->tets;
-                            npe = mo->nodes_per_elem;
-                        }
-                    } else {
-                        tets = flat_ints(study.value("tets", json::array()));
+                    int npe = 4;
+                    chudware::sim::MeshOptions opts;
+                    opts.fineness = study.value("fineness", 0.5);
+                    opts.density = study.value("density", -1.0);  // legacy alias
+                    opts.order = study.value("mesh_order", 2);
+                    opts.curvature = study.value("curvature", true);
+                    opts.curv_elems_per_circle = study.value("curv_elems_per_circle", 12.0);
+                    opts.target_size_mm = study.value("target_size_mm", 0.0);
+                    opts.min_size_mm = study.value("min_size_mm", 0.0);
+                    opts.max_size_mm = study.value("max_size_mm", 0.0);
+                    opts.optimize = study.value("optimize", true);
+                    opts.algorithm3d = study.value("algorithm3d", 1);
+                    opts.structured = study.value(
+                        "structured", study.value("mesh_type", std::string()) == "hex");
+                    opts.auto_type = study.value("auto_type", false);
+                    opts.quad_surface = study.value("quad_surface", false);
+                    opts.fallback_to_tet = study.value("fallback_to_tet", true);
+                    opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
+                    auto mo = chudware::sim::mesh_step_cached_ptr(step_path, opts);
+                    if (mo->ok) {
+                        vol = mo->points;
+                        tets = mo->tets;
+                        npe = mo->nodes_per_elem;
                     }
-                    std::vector<double> mode0 = flat_doubles(res["mode_shapes"][0]);
-                    double freq = res["freqs_hz"][0].get<double>();
-                    std::string ov =
-                        chudware::sim::modal_overlay(step_path, vol, tets, npe, mode0, freq);
-                    if (!ov.empty()) res["overlay_aicm"] = ov;
+
+                    // mode_shapes is serialized as one flat [mode][node][xyz] array.
+                    // Extract exactly the first mode; indexing the JSON array first
+                    // produces a scalar and silently yielded an empty overlay.
+                    const int n_nodes = res.value("n_nodes", 0);
+                    const std::vector<double> modes = flat_doubles(res["mode_shapes"]);
+                    const size_t mode_size =
+                        n_nodes > 0 ? static_cast<size_t>(n_nodes) * 3u : 0u;
+                    const double freq = res["freqs_hz"][0].get<double>();
+                    if (mode_size > 0 && modes.size() >= mode_size &&
+                        std::isfinite(freq) &&
+                        std::all_of(modes.begin(), modes.begin() + mode_size,
+                                    [](double value) { return std::isfinite(value); })) {
+                        std::vector<double> mode0(modes.begin(), modes.begin() + mode_size);
+                        std::string ov = chudware::sim::modal_overlay(
+                            step_path, vol, tets, npe, mode0, freq);
+                        if (!ov.empty()) res["overlay_aicm"] = ov;
+                    }
                 }
             }
             return emit(std::move(res), out_json, 0);
@@ -3403,6 +3396,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 json flow{{"ok", true},
                           {"drag_n", r.drag_n},
                           {"lift_n", r.lift_n},
+                          {"side_n", r.side_n},
                           {"cd", r.cd},
                           {"frontal_area_mm2", r.frontal_area_mm2},
                           {"reynolds", re},
@@ -3414,6 +3408,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                           {"diverged", r.diverged},
                           {"converged", r.converged},
                           {"residual", r.residual},
+                          {"mass_imbalance", r.mass_imbalance},
                           {"voxel_mm", r.voxel_mm},
                           {"min_feature_mm", r.min_feature_mm},
                           {"min_feature_voxels", r.min_feature_voxels},

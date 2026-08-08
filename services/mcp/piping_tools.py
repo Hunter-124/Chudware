@@ -139,6 +139,14 @@ def network_from_handoff(env: Any) -> "tuple[Optional[dict], Optional[list], Opt
         return None, None, None, [f"source_handoff invalid: {e}" for e in verrs]
     if env.get("kind") != "handoff":
         return None, None, None, ["source_handoff must be a handoff envelope"]
+    if env.get("coupling") != "hydraulic_to_piping":
+        errs.append("source_handoff coupling must be 'hydraulic_to_piping'")
+    source = env.get("source") or {}
+    target = env.get("target") or {}
+    if source.get("domain") != "hydraulic":
+        errs.append("source_handoff source.domain must be 'hydraulic'")
+    if target.get("domain") != "piping" or target.get("tool") != "piping_solve":
+        errs.append("source_handoff target must identify piping/piping_solve")
     doc = None
     for g in env.get("geometry", []):
         if g.get("kind") == "doc" and isinstance(g.get("inline"), dict):

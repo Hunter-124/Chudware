@@ -1,21 +1,21 @@
-// 3D rigid-transform mate solver — C++ port of engine/doc/mate_solver.py.
+// 3D rigid-transform mate solver.
 //
 // SolidWorks-style assembly mates solved as a least-squares constraint system on
-// the SAME shared numeric core (chudware::solver, the C++ port of nsolve). Each
-// floating component is parameterized by 6 variables: a translation t = (tx,ty,tz)
-// (mm) and an absolute rotation vector w = (wx,wy,wz) (Rodrigues / exp map). Fixed
-// components are pinned and contribute no variables.
+// the shared C++ numeric core. Each floating component is parameterized by 6
+// variables: translation t = (tx,ty,tz) in mm and an absolute rotation vector
+// w = (wx,wy,wz) using Rodrigues / exp-map coordinates. Fixed components are
+// pinned and contribute no variables.
 //
-// Mirrors mate_solver.py line-by-line so the two stay at parity under the
-// differential harness (tools/mate_diff.py): same rotation convention (incl. the
-// small-angle series paths), same residual/Jacobian blocks for all 18 mate types
-// (coincident, parallel, perpendicular, concentric, distance, angle, tangent,
-// lock, width, symmetric, distance_limit, angle_limit, profile_center, gear,
-// rack_pinion, screw, hinge, slot, cam_follower), same per-mate redundant/
-// conflicting classification, and the same antipodal-start escape retry.
+// The residual/Jacobian structure originated in engine/doc/mate_solver.py and
+// covers coincident, parallel, perpendicular, concentric, distance, angle,
+// tangent, lock, width, symmetric, distance_limit, angle_limit, profile_center,
+// gear, rack_pinion, screw, hinge, slot and cam_follower. This implementation
+// also contains C++-side correctness fixes (including a true revolute hinge and
+// warm-start-relative mechanical coupling), so Python-oracle parity is not a
+// correctness requirement.
 //
-// dict-in / dict-out via nlohmann::json mirroring the Python dicts so the harness
-// can pass fixtures through verbatim. OCCT-free (only solver/Eigen/json).
+// Dict-in/dict-out via nlohmann::json keeps the document and harness seams
+// simple. OCCT-free (only solver/Eigen/json).
 #pragma once
 
 #include <nlohmann/json.hpp>

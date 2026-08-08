@@ -1007,19 +1007,28 @@ bool WorkerClient::callViaSideClient(const std::string &method,
 bool WorkerClient::callImpl(const std::string &method, const json &params,
                             json &result, std::string &err, int timeoutMs,
                             const EventFn &onEvent) {
-  // agent_cancel/agent_steer must reach the engine WHILE an agent_run is
-  // blocked on this client. Skip callMtx_ so Stop/Steer can reach the
-  // process-wide registry mid-provider-call. Concurrent with the run's own call
-  // — safe because cancel/steer only touch the registry
-  // (+ atomic flag / queued string; no shared socket write on the in-flight
-  // agent RPC).
-  const bool isCancel = (method == "agent_cancel" || method == "agent_steer");
+  // Agent control and an in-process C++ sim_cancel must reach the engine WHILE
+  // their corresponding long call is blocked on this WorkerClient. The normal
+  // callMtx_ serialization makes a cancellation queued behind the work it is
+  // supposed to stop. Keep Python-worker sim_cancel serialized: its stdio pipe
+  // cannot safely carry concurrent requests.
+  const bool isAgentControl =
+      (method == "agent_cancel" || method == "agent_steer");
+  const bool isCppSimCancel =
+      (method == "sim_cancel" && routeSimToCpp(method, params));
+  const bool bypassCallMutex = isAgentControl || isCppSimCancel;
   // The long streaming runs keep full serialization: two runs must never
   // overlap (they would interleave ops on the same doc in the daemon).
   const bool isLongRun =
       (method == "agent_run_v2" || method == "agent_mission_v1");
   std::unique_lock<std::mutex> lk(callMtx_, std::defer_lock);
-  if (!isCancel && !isLongRun && engine::daemonMode()) {
+  if (isCppSimCancel && engine::daemonMode()) {
+    // The shared EngineClient serializes socket calls internally, so it is
+    // blocked behind the solve even after bypassing callMtx_. Use the same
+    // short-lived daemon side channel as agent Stop/Steer.
+    return callViaSideClient(method, params, result, err, timeoutMs, onEvent);
+  }
+  if (!bypassCallMutex && !isLongRun && engine::daemonMode()) {
     // Engine-bound call arriving while another call holds callMtx_ —
     // typically a multi-minute agent_run: the GUI thread makes config_list /
     // doc_tree / pick calls on normal interaction, and blocking it behind
@@ -1040,7 +1049,7 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     if (engineBound && !lk.try_lock())
       return callViaSideClient(method, params, result, err, timeoutMs, onEvent);
   }
-  if (!isCancel && !lk.owns_lock())
+  if (!bypassCallMutex && !lk.owns_lock())
     lk.lock();
   if (abort_.load()) { // C39: app is tearing down — intentional, no errorSink
                        // toast

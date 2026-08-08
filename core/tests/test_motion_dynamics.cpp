@@ -23,8 +23,10 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <limits>
 #include <vector>
 
+#include "mate/mate.h"
 #include "doc/motion_dynamics.h"
 
 namespace md = chudware::doc::motiondyn;
@@ -98,6 +100,7 @@ TEST_CASE("pendulum: uniform rotation — centripetal pin reaction + gravity tor
         CHECK(std::abs(pinr.moment_nm.z()) < 1e-6);
         // System is determinate in-plane: no unbalance left.
         CHECK(res.frames[(size_t)f].residual < 1e-6);
+        CHECK(res.frames[(size_t)f].balanced);
     }
 }
 
@@ -150,6 +153,7 @@ TEST_CASE("pendulum: oscillating — tangential terms + full drive-torque law") 
         CHECK((pinr.force_n - expF).norm() < 0.02 * (expF.norm() + 1.0));
         CHECK(std::abs(drvr.moment_nm.z() - expT) <
               0.02 * (std::abs(expT) + m * g * r));
+        CHECK(res.frames[(size_t)f].balanced);
     }
 }
 
@@ -250,16 +254,203 @@ TEST_CASE("slider-crank: rod-pin reaction along the rod, guide normal, drive pow
         // Power balance: τ·Ω = m_s·ẍ·ẋ (massless linkage, no gravity).
         CHECK(std::abs(fD.moment_nm.z() * W - ms * acc * vel) < 0.02 * Fscale * r * W);
         CHECK(res.frames[(size_t)f].residual < 1e-6);
+        CHECK(res.frames[(size_t)f].balanced);
     }
 }
 
 // ---------------------------------------------------------------------------
-TEST_CASE("degenerate inputs stay soft") {
+TEST_CASE("translation: finite differences, applied force and damping match closed form") {
+    // x(t)=0.5*a*t^2, v=a*t. A drive-force constraint along X must provide
+    // F = m*a - F_applied + c*v exactly (quadratic position stencils).
+    const double m = 3.0, a = 2.5, applied = 1.25, damping = 0.4, dt = 0.01;
+    const int nf = 101;
+    md::BodyProps body;
+    body.id = "slider";
+    body.mass_kg = m;
+    body.inertia_local = Matrix3d::Zero();  // point-mass translation
+    for (int f = 0; f < nf; ++f) {
+        const double t = f * dt;
+        body.poses.push_back(pose(Matrix3d::Identity(),
+                                  Vector3d(0.5 * a * t * t, 0, 0)));
+    }
+    md::JointDef drive;
+    drive.id = "drive";
+    drive.type = "drive_force";
+    drive.body_a = -1;
+    drive.body_b = 0;
+    drive.axis_local = Vector3d::UnitX();
     md::Options opt;
-    CHECK(md::solve_inverse_dynamics({}, {}, opt).warnings.size() == 1);
+    opt.dt = dt;
+    opt.gravity = Vector3d::Zero();
+    opt.damping_lin = damping;
+    md::AppliedLoad load;
+    load.body = 0;
+    load.force_n = Vector3d(applied, 0, 0);
+    opt.loads.push_back(load);
 
-    md::BodyProps one;
-    one.id = "b"; one.mass_kg = 1.0;
-    one.poses.push_back(Matrix4d::Identity());  // single frame: too short
-    CHECK(md::solve_inverse_dynamics({one}, {}, opt).frames.empty());
+    md::DynResult res = md::solve_inverse_dynamics({body}, {drive}, opt);
+    REQUIRE(res.ok);
+    REQUIRE((int)res.frames.size() == nf);
+    for (int f = 0; f < nf; f += 10) {
+        const double t = f * dt;
+        const double expected = m * a - applied + damping * a * t;
+        CAPTURE(f);
+        CHECK(std::abs(res.frames[(size_t)f].vel[0].x() - a * t) < 1e-10);
+        CHECK(std::abs(res.frames[(size_t)f].accel[0].x() - a) < 1e-9);
+        CHECK(std::abs(res.frames[(size_t)f].reactions[0].force_n.x() - expected) < 1e-9);
+        CHECK(res.frames[(size_t)f].balanced);
+    }
+}
+
+TEST_CASE("unresolved force path is explicit failure, never a zero-reaction success") {
+    md::BodyProps body;
+    body.id = "unsupported";
+    body.mass_kg = 2.0;
+    body.inertia_local = 0.01 * Matrix3d::Identity();
+    body.poses.assign(3, Matrix4d::Identity());
+
+    // Orientation-only constraint cannot react gravity.
+    md::JointDef orient;
+    orient.id = "angle";
+    orient.type = "drive_moment";
+    orient.body_a = -1;
+    orient.body_b = 0;
+    orient.axis_local = Vector3d::UnitZ();
+    md::Options opt;
+    opt.dt = 0.1;
+    opt.gravity = Vector3d(0, 0, -9.81);
+
+    md::DynResult res = md::solve_inverse_dynamics({body}, {orient}, opt);
+    CHECK_FALSE(res.ok);
+    REQUIRE(res.frames.size() == 3);
+    for (const md::FrameDyn& frame : res.frames) {
+        CHECK_FALSE(frame.balanced);
+        CHECK(std::abs(frame.force_residual_n - 2.0 * 9.81) < 1e-10);
+        CHECK(frame.reactions[0].force_n.norm() == 0.0);
+    }
+    REQUIRE_FALSE(res.warnings.empty());
+    CHECK(res.warnings.back().find("unresolved force/moment path") != std::string::npos);
+}
+
+TEST_CASE("invalid timing, mass, inertia, pose and load data are rejected") {
+    md::BodyProps body;
+    body.id = "b";
+    body.mass_kg = 1.0;
+    body.inertia_local = Matrix3d::Zero();
+    body.poses.assign(3, Matrix4d::Identity());
+    md::Options opt;
+    opt.dt = 0.1;
+
+    CHECK(md::solve_inverse_dynamics({}, {}, opt).frames.empty());
+
+    md::BodyProps two_frames = body;
+    two_frames.poses.resize(2);
+    CHECK_FALSE(md::solve_inverse_dynamics({two_frames}, {}, opt).ok);
+
+    md::Options bad_dt = opt;
+    bad_dt.dt = 0.0;
+    CHECK_FALSE(md::solve_inverse_dynamics({body}, {}, bad_dt).ok);
+
+    md::BodyProps bad_mass = body;
+    bad_mass.mass_kg = -1.0;
+    CHECK_FALSE(md::solve_inverse_dynamics({bad_mass}, {}, opt).ok);
+
+    md::BodyProps bad_inertia = body;
+    bad_inertia.inertia_local = Matrix3d::Identity();
+    bad_inertia.inertia_local(2, 2) = 3.0;  // violates Izz <= Ixx + Iyy
+    CHECK_FALSE(md::solve_inverse_dynamics({bad_inertia}, {}, opt).ok);
+
+    md::BodyProps bad_pose = body;
+    bad_pose.poses[1](0, 0) = 2.0;  // scale is not a rigid pose
+    CHECK_FALSE(md::solve_inverse_dynamics({bad_pose}, {}, opt).ok);
+
+    md::Options bad_load = opt;
+    md::AppliedLoad load;
+    load.body = 0;
+    load.force_n.x() = std::numeric_limits<double>::quiet_NaN();
+    bad_load.loads.push_back(load);
+    CHECK_FALSE(md::solve_inverse_dynamics({body}, {}, bad_load).ok);
+}
+
+TEST_CASE("hinge constrains axial translation while preserving its rotational DOF") {
+    using nlohmann::json;
+    const std::vector<double> identity = {
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    std::vector<double> shifted = identity;
+    shifted[11] = 12.0;  // along the hinge Z axis
+    json components = json::array({
+        {{"id", "ground"}, {"fixed", true}, {"transform", identity}},
+        {{"id", "link"}, {"fixed", false}, {"transform", shifted}}});
+    json mates = json::array({
+        {{"id", "hinge"}, {"type", "hinge"}, {"align", "aligned"},
+         {"refs", json::array({json{{"component", "ground"}},
+                               json{{"component", "link"}}})}}});
+    chudware::mate::MateGeom axis;
+    axis.kind = "axis";
+    axis.point = Vector3d::Zero();
+    axis.direction = Vector3d::UnitZ();
+    chudware::mate::ResolvedGeometry geometry;
+    geometry[{"hinge", 0}] = axis;
+    geometry[{"hinge", 1}] = axis;
+
+    chudware::mate::MateSolveResult solved =
+        chudware::mate::solve_mates(components, mates, geometry);
+    REQUIRE(solved.converged);
+    REQUIRE(solved.transforms.count("link") == 1);
+    CHECK(std::abs(solved.transforms.at("link")[3]) < 1e-8);
+    CHECK(std::abs(solved.transforms.at("link")[7]) < 1e-8);
+    CHECK(std::abs(solved.transforms.at("link")[11]) < 1e-8);
+    CHECK(solved.dof == 1);
+}
+
+TEST_CASE("gear coupling preserves its authored phase and rejects a zero ratio") {
+    using nlohmann::json;
+    auto transform_z = [](double angle) {
+        const double c = std::cos(angle), s = std::sin(angle);
+        return std::vector<double>{
+            c, -s, 0, 0,
+            s,  c, 0, 0,
+            0,  0, 1, 0,
+            0,  0, 0, 1};
+    };
+    const std::vector<double> ground_pose = transform_z(0.4);
+    const std::vector<double> gear_pose = transform_z(0.7);
+    json components = json::array({
+        {{"id", "ground"}, {"fixed", true}, {"transform", ground_pose}},
+        {{"id", "gear"}, {"fixed", false}, {"transform", gear_pose}}});
+    json mates = json::array({
+        {{"id", "pair"}, {"type", "gear"}, {"align", "aligned"},
+         {"refs", json::array({json{{"component", "ground"}},
+                               json{{"component", "gear"}}})},
+         {"value", {{"ratio", 2.0}}}}});
+    chudware::mate::MateGeom axis;
+    axis.kind = "axis";
+    axis.direction = Vector3d::UnitZ();
+    chudware::mate::ResolvedGeometry geometry;
+    geometry[{"pair", 0}] = axis;
+    geometry[{"pair", 1}] = axis;
+
+    const chudware::mate::MateSolveResult unchanged =
+        chudware::mate::solve_mates(components, mates, geometry);
+    REQUIRE(unchanged.converged);
+    REQUIRE(unchanged.transforms.count("gear") == 1);
+    const std::vector<double>& solved_pose = unchanged.transforms.at("gear");
+    REQUIRE(solved_pose.size() == gear_pose.size());
+    for (size_t i = 0; i < gear_pose.size(); ++i) {
+        CAPTURE(i);
+        CHECK(std::abs(solved_pose[i] - gear_pose[i]) < 1e-10);
+    }
+
+    mates[0]["value"]["ratio"] = 0.0;
+    const chudware::mate::MateSolveResult invalid =
+        chudware::mate::solve_mates(components, mates, geometry);
+    REQUIRE(invalid.mate_status.size() == 1);
+    CHECK(invalid.mate_status[0].status == "unresolved");
+
+    mates[0]["type"] = "distance_limit";
+    mates[0]["value"] = {{"min", 5.0}, {"max", 1.0}};
+    const chudware::mate::MateSolveResult reversed_limit =
+        chudware::mate::solve_mates(components, mates, geometry);
+    REQUIRE(reversed_limit.mate_status.size() == 1);
+    CHECK(reversed_limit.mate_status[0].status == "unresolved");
 }

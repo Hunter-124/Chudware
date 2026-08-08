@@ -12,6 +12,7 @@ openEMS-absent is an honest skip envelope (never a traceback). Registration is d
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Optional
 
 from services.sim.em import analytic
@@ -72,6 +73,29 @@ def _call_worker(method: str, params: dict) -> dict:
                 "analysis": method.replace("em_", "")}
 
 
+
+def _finite_arg(value: Any, name: str, *, allow_default_zero: bool = False) -> Optional[str]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return f"{name} must be a number"
+    if not math.isfinite(number):
+        return f"{name} must be finite"
+    if number <= 0.0 and not (allow_default_zero and number == 0.0):
+        return f"{name} must be greater than zero"
+    return None
+
+def _int_arg(value: Any, name: str, lo: int, hi: int) -> tuple[Optional[int], Optional[str]]:
+    if isinstance(value, bool):
+        return None, f"{name} must be an integer in [{lo}, {hi}]"
+    try:
+        number = float(value)
+        integer = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None, f"{name} must be an integer in [{lo}, {hi}]"
+    if not math.isfinite(number) or number != integer or not lo <= integer <= hi:
+        return None, f"{name} must be an integer in [{lo}, {hi}]"
+    return integer, None
 
 def _standard_te10_ref_hz(standard: Optional[str], waveguide: Optional[dict]) -> Optional[float]:
     """Closed-form dominant-mode cutoff for error-vs-analytic reporting."""
@@ -194,25 +218,20 @@ def _compact_timedomain(raw: dict, *, detail: bool) -> dict:
     return out
 
 
-def _is_openems_missing(raw: dict) -> bool:
+def _is_openems_missing(raw: dict, *, requested: bool = False) -> bool:
     if raw.get("ok"):
         return False
     err = str(raw.get("error") or "").lower()
-    if "openems" in err and any(tok in err for tok in (
-            "not installed", "import failed", "no module", "unavailable", "not available")):
+    if "openems" in err and any(token in err for token in (
+            "not installed", "import failed", "no module", "cannot import",
+            "not available", "backend unavailable")):
         return True
-    # Explicit solver=openems with adapter unavailable surfaces via solvers list.
-    if raw.get("solver") == "openems" and not raw.get("ok"):
-        return True
-    solvers = raw.get("solvers") or []
-    if any(isinstance(s, dict) and s.get("name") == "openems"
-           and not s.get("installed") for s in solvers):
-        if "openems" in err or raw.get("analysis") in ("driven", "timedomain"):
-            # Only treat as openEMS-skip when the request targeted it or the error names it.
-            if "openems" in err or (isinstance(raw.get("params"), dict)
-                                    and raw["params"].get("solver") == "openems"):
+    if requested:
+        for solver in raw.get("solvers") or []:
+            if (isinstance(solver, dict) and solver.get("name") == "openems"
+                    and not solver.get("installed")):
                 return True
-    return "openems" in err and ("install" in err or "import" in err or "not" in err)
+    return False
 
 
 def register_em_tools(mcp) -> None:
@@ -264,9 +283,15 @@ def register_em_tools(mcp) -> None:
         ``error_vs_analytic_pct`` for TE10 when a rectangular standard is used. Field meshes
         are omitted unless ``detail``/``verbose`` is True (or ``fields=True``).
         """
+        n_modes_i, error = _int_arg(n_modes, "n_modes", 1, 40)
+        if error:
+            return _err(error, next_actions=["em_eigenmode(standard='WR-90', n_modes=3)"])
+        resolution_i, error = _int_arg(resolution, "resolution", 24, 512)
+        if error:
+            return _err(error, next_actions=["em_eigenmode(standard='WR-90', resolution=80)"])
         params: dict[str, Any] = {
-            "n_modes": int(n_modes),
-            "resolution": int(resolution),
+            "n_modes": n_modes_i,
+            "resolution": resolution_i,
             "fields": bool(fields or detail or verbose),
         }
         if standard:
@@ -323,10 +348,20 @@ def register_em_tools(mcp) -> None:
         the result is an honest skip envelope (never a traceback). Default payload is
         summary scalars (mid-band S21/S11, extrema); pass ``detail=True`` for full arrays.
         """
-        params: dict[str, Any] = {
-            "length_mm": float(length_mm),
-            "n_freq": int(n_freq),
-        }
+        for value, name, default_zero in (
+                (length_mm, "length_mm", False),
+                (f_start_ghz, "f_start_ghz", True),
+                (f_stop_ghz, "f_stop_ghz", True)):
+            error = _finite_arg(value, name, allow_default_zero=default_zero)
+            if error:
+                return _err(error, next_actions=["em_driven(standard='WR-90', length_mm=50)"])
+        length_value = float(length_mm)
+        start_value = float(f_start_ghz)
+        stop_value = float(f_stop_ghz)
+        n_freq_i, error = _int_arg(n_freq, "n_freq", 2, 100_001)
+        if error:
+            return _err(error, next_actions=["em_driven(standard='WR-90', n_freq=21)"])
+        params: dict[str, Any] = {"length_mm": length_value, "n_freq": n_freq_i}
         if standard:
             params["standard"] = standard
         if waveguide:
@@ -335,16 +370,21 @@ def register_em_tools(mcp) -> None:
             except json.JSONDecodeError as exc:
                 return _err(f"waveguide JSON invalid: {exc}",
                             next_actions=["em_driven(standard='WR-90', length_mm=50)"])
-        if f_start_ghz > 0:
-            params["f_start_ghz"] = float(f_start_ghz)
-        if f_stop_ghz > 0:
-            params["f_stop_ghz"] = float(f_stop_ghz)
+        if start_value > 0:
+            params["f_start_ghz"] = start_value
+        if stop_value > 0:
+            params["f_stop_ghz"] = stop_value
         if mode:
             params["mode"] = mode
         if solver:
             params["solver"] = solver
         if geometry:
-            params["geometry"] = json.loads(geometry) if geometry.startswith("{") else {"stl_path": geometry}
+            try:
+                params["geometry"] = (
+                    json.loads(geometry) if geometry.startswith("{") else {"stl_path": geometry})
+            except json.JSONDecodeError as exc:
+                return _err(f"geometry JSON invalid: {exc}",
+                            next_actions=["em_driven(standard='WR-90', length_mm=50)"])
         if not standard and not waveguide and not geometry:
             return _err("pass standard= (e.g. 'WR-90') or waveguide=/geometry=",
                         hint="em_driven needs a guide cross-section or STL geometry.",
@@ -353,13 +393,10 @@ def register_em_tools(mcp) -> None:
         raw = _call_worker("em_driven", params)
         if not raw.get("ok"):
             err = str(raw.get("error") or "em_driven failed")
-            # Honest openEMS skip when the binary/module is absent.
-            if solver == "openems" or "openems" in err.lower():
+            if _is_openems_missing(raw, requested=solver == "openems"):
                 solvers = raw.get("solvers") or []
                 openems_info = next((s for s in solvers if s.get("name") == "openems"), None)
-                installed = bool(openems_info and openems_info.get("installed"))
-                if not installed or "openems" in err.lower():
-                    return _dumps({
+                return _dumps({
                         "ok": False,
                         "skipped": True,
                         "skip_reason": "openems_not_installed",
@@ -377,7 +414,7 @@ def register_em_tools(mcp) -> None:
                         ],
                         "solvers": solvers,
                         "analysis": "driven",
-                    })
+                })
             return _err(err, hint="Use analytic-uniform for straight sections, or install openEMS.",
                         next_actions=["em_driven(standard='WR-90', solver='analytic-uniform')",
                                       "em_status()"],
@@ -406,7 +443,17 @@ def register_em_tools(mcp) -> None:
         Returns peak/delay summary scalars; raw port waveforms only when ``detail=True``.
         openEMS-absent with ``solver='openems'`` returns an honest skip envelope.
         """
-        params: dict[str, Any] = {"length_mm": float(length_mm)}
+        for value, name, default_zero in (
+                (length_mm, "length_mm", False),
+                (f0_ghz, "f0_ghz", True),
+                (bw_ghz, "bw_ghz", True)):
+            error = _finite_arg(value, name, allow_default_zero=default_zero)
+            if error:
+                return _err(error, next_actions=["em_timedomain(standard='WR-90', length_mm=80)"])
+        length_value = float(length_mm)
+        f0_value = float(f0_ghz)
+        bw_value = float(bw_ghz)
+        params: dict[str, Any] = {"length_mm": length_value}
         if standard:
             params["standard"] = standard
         if waveguide:
@@ -415,10 +462,10 @@ def register_em_tools(mcp) -> None:
             except json.JSONDecodeError as exc:
                 return _err(f"waveguide JSON invalid: {exc}",
                             next_actions=["em_timedomain(standard='WR-90', length_mm=80)"])
-        if f0_ghz > 0:
-            params["f0_ghz"] = float(f0_ghz)
-        if bw_ghz > 0:
-            params["bw_ghz"] = float(bw_ghz)
+        if f0_value > 0:
+            params["f0_ghz"] = f0_value
+        if bw_value > 0:
+            params["bw_ghz"] = bw_value
         if mode:
             params["mode"] = mode
         if solver:
@@ -430,12 +477,10 @@ def register_em_tools(mcp) -> None:
         raw = _call_worker("em_timedomain", params)
         if not raw.get("ok"):
             err = str(raw.get("error") or "em_timedomain failed")
-            if solver == "openems" or "openems" in err.lower():
+            if _is_openems_missing(raw, requested=solver == "openems"):
                 solvers = raw.get("solvers") or []
                 openems_info = next((s for s in solvers if s.get("name") == "openems"), None)
-                installed = bool(openems_info and openems_info.get("installed"))
-                if not installed or "openems" in err.lower():
-                    return _dumps({
+                return _dumps({
                         "ok": False,
                         "skipped": True,
                         "skip_reason": "openems_not_installed",
@@ -453,7 +498,7 @@ def register_em_tools(mcp) -> None:
                         ],
                         "solvers": solvers,
                         "analysis": "timedomain",
-                    })
+                })
             return _err(err, next_actions=["em_timedomain(standard='WR-90', solver='analytic-uniform')",
                                            "em_status()"],
                         solvers=raw.get("solvers"))

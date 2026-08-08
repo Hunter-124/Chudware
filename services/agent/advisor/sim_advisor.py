@@ -1,35 +1,25 @@
-"""Simulation verification advisor — precheck (BC lint + mesh hint + hand-calc anchor)
-and postcheck (margin-policy verdict + implausibility WARN + geometry suggestion) (T-W9).
+"""Pure simulation setup and result advisor.
 
-Design (per advisor review 2026-07-04):
+``precheck`` lints normalized current-tool arguments without imposing structural
+fixtures/loads on families that do not use them. In particular, free-free modal and
+flux-only transient thermal are valid, while static/fatigue/buckling need a reacted
+non-zero load. Optional capability evidence can block a requested unavailable backend.
 
-  * **Pure functions over a normalized input** — mirrors engine.py's pattern.
-    No I/O in the hot path; the caller supplies a ``StudySpec`` (pre-dispatch) or a
-    ``StudyResult`` (post-dispatch) dict, plus an optional ``DocGeom`` hint.
-  * **Wired through T-W5** (stages.py + engine.py): findings become ``engine.Finding``
-    objects with kind ``"sim_bc"`` / ``"sim_margin"`` / ``"sim_divergence"`` /
-    ``"sim_mesh"``; fix-providers registered in ``engine._FIX_PROVIDERS``; check-ids
-    added to the ``sim`` battery in ``stages.py``.
-  * **Beam anchor**: ``services.research.calcs.beam.beam_calc_raw`` is the
-    hand-calc primitive.  The doc→beam mapping is *confident* only when:
-      - aspect ratio L/√(A) > 3 (long-axis dominant geometry)
-      - load pattern is a plausible cantilever or simply-supported point/UDL
-    When the mapping is ambiguous the anchor is ``None`` — "no anchor" is the common
-    path; the postcheck never skips the margin verdict just because anchor is absent.
-  * **Precheck-blocks-dispatch** is a deliberate deviation from the freedom rule
-    (§9.3/§10): BC-lint blockers stop dispatch when the guard is config-enabled.
-    This is documented here rather than in the contract so the contract stays frozen.
-    Gate: ``CHUDWARE_SIM_PRECHECK_BLOCK`` env var, default ``"1"`` (enabled).
+Analytic helpers return ``None`` rather than non-finite or unjustified numbers. The beam
+anchor is limited to a finite, slender rectangular-bbox mapping with a force load;
+pressure is not converted without area. Thermal and fatigue anchors state their units
+and handbook equations.
 
-Anchor mock-prove note (citation honesty):
-    The FEA solver does not run headlessly in CI.  The FEA-vs-beam-anchor divergence
-    test seeds a cantilever study with a known ``max_von_mises_mpa`` via
-    ``sim_study_add`` (same path as a real solve) and calls postcheck against it.
-    The anchor is computed by beam_calc_raw with the same geometry inputs.
-    This proves the comparison logic; it does NOT verify the FEA solver itself.
+``postcheck`` separates the nominal yield policy from physical interpretation:
+``margin_mpa = yield_mpa / SF - stress``. Exceeding that allowable is not called
+yielding; nominal stress must reach yield, and fracture language requires ultimate.
+An overall PASS additionally needs a reacted non-zero setup with valid explicit material
+properties, a reported mesh, and either numeric two-mesh convergence or a same-order
+independent anchor. Missing/failed/skipped/non-converged evidence is WARN, never PASS.
 
-Contract reference: contracts/advisor.md §3 (advisory item shape), §5 (failure card),
-§9 (injection rules).  BC-blocker deviation: this file, above.
+Blocker emission is gated by ``CHUDWARE_SIM_PRECHECK_BLOCK`` (default enabled).
+Returned items follow the existing advisor item shape; the optional ``_anchor`` key is
+private round-trip data for postcheck.
 """
 from __future__ import annotations
 
@@ -73,6 +63,37 @@ def resolve_material_class(mat_name: str) -> dict:
     return policy["general"]
 
 
+def _finite_float(value, *, positive: bool = False, nonnegative: bool = False) -> Optional[float]:
+    """Return a finite float satisfying the requested sign constraint, else ``None``."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if positive and number <= 0.0:
+        return None
+    if nonnegative and number < 0.0:
+        return None
+    return number
+
+
+def _mesh_fineness_value(value) -> Optional[float]:
+    """Normalize the public numeric/preset mesh argument without inventing a length."""
+    if isinstance(value, str):
+        preset = {
+            "coarse": 0.25,
+            "medium": 0.5,
+            "fine": 0.75,
+            "finest": 1.0,
+        }.get(value.strip().lower())
+        if preset is not None:
+            return preset
+    return _finite_float(value)
+
+
 # ---------------------------------------------------------------------------
 # Beam anchor helper
 # ---------------------------------------------------------------------------
@@ -80,24 +101,28 @@ def resolve_material_class(mat_name: str) -> dict:
 def _beam_aspect_ok(bbox: dict) -> tuple[bool, float, str]:
     """Return (confident, aspect_ratio, axis) for a bounding-box dict.
 
-    Confident when the longest axis is ≥ 3× the cross-section size.
-    The bbox dict has keys like ``x_mm``, ``y_mm``, ``z_mm`` (lengths, not coords).
+    Confident when the longest axis is ≥ 3× the larger cross-section side, so a
+    thin plate is not mistaken for a beam.
     Returns (False, 0.0, "") when the bbox is missing or degenerate.
     """
     dims = {}
     for ax in ("x", "y", "z"):
-        v = bbox.get(f"{ax}_mm") or bbox.get(ax)
-        if v and float(v) > 0:
-            dims[ax] = float(v)
-    if len(dims) < 2:
+        raw = bbox.get(f"{ax}_mm")
+        if raw is None:
+            raw = bbox.get(ax)
+        value = _finite_float(raw, positive=True)
+        if value is not None:
+            dims[ax] = value
+    if len(dims) < 3:
         return False, 0.0, ""
     sorted_axes = sorted(dims, key=lambda k: -dims[k])
     longest = dims[sorted_axes[0]]
-    second = dims[sorted_axes[1]]
-    if second <= 0:
+    cross_size = dims[sorted_axes[1]]
+    if cross_size <= 0.0 or not math.isfinite(cross_size):
         return False, 0.0, ""
-    cross_size = math.sqrt(second * dims.get(sorted_axes[2], second))
-    aspect = longest / cross_size if cross_size > 0 else 0.0
+    aspect = longest / cross_size
+    if not math.isfinite(aspect):
+        return False, 0.0, ""
     return aspect >= 3.0, aspect, sorted_axes[0]
 
 
@@ -108,25 +133,19 @@ def compute_beam_anchor(
     support: str = "cantilever",
     load: str = "point",
     section: str = "rect",
+    load_vector_n: Optional[list[float]] = None,
 ) -> Optional[dict]:
-    """Compute a beam anchor stress using beam_calc_raw.
+    """Compute a slender rectangular-beam stress anchor.
 
-    Returns a dict with ``max_stress_mpa`` and provenance fields, or ``None`` when the
-    geometry mapping is not confident (aspect ratio too low, missing bbox, bad inputs).
-
-    Parameters
-    ----------
-    bbox : dict
-        Keys ``x_mm``, ``y_mm``, ``z_mm`` (bounding box side lengths in mm).
-    E_mpa : float
-        Young's modulus from the material record.
-    load_n : float
-        Total applied load in N (sum of all load magnitudes).
-    support, load, section : str
-        Beam model assumptions.  Caller chooses based on load pattern.
+    ``load_vector_n`` is optional for compatibility with explicit hand-calc callers.
+    When supplied (the precheck path), it must be a single transverse, axis-aligned
+    force. Its direction selects section depth ``h``; axial or diagonal loading returns
+    ``None`` rather than attaching false confidence to the wrong section modulus.
     """
     confident, aspect, long_ax = _beam_aspect_ok(bbox)
-    if not confident:
+    modulus = _finite_float(E_mpa, positive=True)
+    force = _finite_float(load_n, positive=True)
+    if not confident or modulus is None or force is None:
         return None
 
     try:
@@ -134,11 +153,37 @@ def compute_beam_anchor(
     except ImportError:
         return None
 
-    dims = {ax: float(bbox.get(f"{ax}_mm") or bbox.get(ax, 0)) for ax in ("x", "y", "z")}
+    dims = {}
+    for ax in ("x", "y", "z"):
+        raw = bbox.get(f"{ax}_mm")
+        if raw is None:
+            raw = bbox.get(ax)
+        dims[ax] = float(raw)
     sorted_axes = sorted(dims, key=lambda k: -dims[k])
-    L = dims[sorted_axes[0]]
-    b = dims.get(sorted_axes[1], L / 4)
-    h = dims.get(sorted_axes[2], b)
+    L = dims[long_ax]
+    cross_axes = [axis for axis in ("x", "y", "z") if axis != long_ax]
+    load_axis = None
+    if load_vector_n is not None:
+        if not isinstance(load_vector_n, (list, tuple)) or len(load_vector_n) != 3:
+            return None
+        vector = [_finite_float(component) for component in load_vector_n]
+        if any(component is None for component in vector):
+            return None
+        vector_mag = math.sqrt(sum(component * component for component in vector))
+        if vector_mag <= 0.0 or abs(vector_mag - force) > max(1e-9, 0.01 * force):
+            return None
+        components = dict(zip(("x", "y", "z"), (abs(component) for component in vector)))
+        if components[long_ax] > 0.1 * vector_mag:
+            return None
+        load_axis = max(cross_axes, key=lambda axis: components[axis])
+        other_axis = next(axis for axis in cross_axes if axis != load_axis)
+        if components[other_axis] > 0.1 * vector_mag:
+            return None
+        h = dims[load_axis]
+        b = dims[other_axis]
+    else:
+        b = dims[sorted_axes[1]]
+        h = dims[sorted_axes[2]]
 
     try:
         raw = beam_calc_raw(
@@ -146,12 +191,12 @@ def compute_beam_anchor(
             load=load,
             section=section,
             L_mm=L,
-            E_mpa=E_mpa,
-            F_n=load_n,
+            E_mpa=modulus,
+            F_n=force,
             b_mm=b,
             h_mm=h,
         )
-    except (ValueError, ZeroDivisionError):
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError):
         return None
 
     if not math.isfinite(raw.get("max_stress_mpa", float("nan"))):
@@ -166,6 +211,7 @@ def compute_beam_anchor(
         "b_mm": b,
         "h_mm": h,
         "aspect_ratio": round(aspect, 2),
+        "load_axis": load_axis,
         "source": "beam_calc_raw (Shigley §3-4)",
     }
 
@@ -215,45 +261,55 @@ def thermal_anchor(
     """
     dims = {}
     for ax in ("x", "y", "z"):
-        v = bbox.get(f"{ax}_mm") or bbox.get(ax)
-        if v and float(v) > 0:
-            dims[ax] = float(v)
-    if len(dims) < 3 or not (k_w_mk and float(k_w_mk) > 0):
-        return None
-    if not math.isfinite(float(t_hot_c)):
+        raw = bbox.get(f"{ax}_mm")
+        if raw is None:
+            raw = bbox.get(ax)
+        value = _finite_float(raw, positive=True)
+        if value is not None:
+            dims[ax] = value
+    k = _finite_float(k_w_mk, positive=True)
+    hot = _finite_float(t_hot_c)
+    if len(dims) < 3 or k is None or hot is None:
         return None
 
     sorted_axes = sorted(dims, key=lambda a: dims[a])  # ascending
-    L_mm = dims[sorted_axes[0]]                          # thinnest side = through-thickness
+    L_mm = dims[sorted_axes[0]]                        # thinnest side = through-thickness
     L_m = L_mm / 1000.0
-    if L_m <= 0:
+    if L_m <= 0.0 or not math.isfinite(L_m):
         return None
-    k = float(k_w_mk)
 
-    if t_cold_c is not None and math.isfinite(float(t_cold_c)):
+    cold = _finite_float(t_cold_c) if t_cold_c is not None else None
+    if cold is not None:
         # Dirichlet–Dirichlet plane wall.
-        q = k * (float(t_hot_c) - float(t_cold_c)) / L_m
+        q = k * (hot - cold) / L_m
+        if not math.isfinite(q):
+            return None
         return {
             "mode": "conduction",
             "q_w_m2": q,
-            "t_hot_c": float(t_hot_c),
-            "t_cold_c": float(t_cold_c),
+            "t_hot_c": hot,
+            "t_cold_c": cold,
             "L_mm": L_mm,
             "k_w_mk": k,
             "source": "1D plane wall q=kΔT/L (Incropera, Fundamentals of Heat & Mass Transfer §3.1)",
         }
-    if (h_w_m2k is not None and float(h_w_m2k) > 0
-            and t_amb_c is not None and math.isfinite(float(t_amb_c))):
+    h = _finite_float(h_w_m2k, positive=True) if h_w_m2k is not None else None
+    ambient = _finite_float(t_amb_c) if t_amb_c is not None else None
+    if h is not None and ambient is not None:
         # Dirichlet–Robin (series resistance) plane wall.
-        h = float(h_w_m2k)
-        q = (float(t_hot_c) - float(t_amb_c)) / (L_m / k + 1.0 / h)
-        t_cold = float(t_amb_c) + q / h
+        resistance = L_m / k + 1.0 / h
+        if resistance <= 0.0 or not math.isfinite(resistance):
+            return None
+        q = (hot - ambient) / resistance
+        t_cold = ambient + q / h
+        if not (math.isfinite(q) and math.isfinite(t_cold)):
+            return None
         return {
             "mode": "convection",
             "q_w_m2": q,
-            "t_hot_c": float(t_hot_c),
+            "t_hot_c": hot,
             "t_cold_c": t_cold,
-            "t_amb_c": float(t_amb_c),
+            "t_amb_c": ambient,
             "h_w_m2k": h,
             "L_mm": L_mm,
             "k_w_mk": k,
@@ -322,31 +378,25 @@ def fatigue_anchor(
     method : str
         ``"goodman"`` (default) or ``"soderberg"``.
     """
-    try:
-        smax = float(sigma_max_mpa)
-        smin = float(sigma_min_mpa)
-        sut = float(ultimate_mpa)
-    except (TypeError, ValueError):
-        return None
-    if not (math.isfinite(smax) and math.isfinite(smin) and math.isfinite(sut)):
-        return None
-    if sut <= 0 or smax < smin:
+    smax = _finite_float(sigma_max_mpa)
+    smin = _finite_float(sigma_min_mpa)
+    sut = _finite_float(ultimate_mpa, positive=True)
+    if smax is None or smin is None or sut is None or smax < smin:
         return None
     method = (method or "").lower()
     if method not in ("goodman", "soderberg"):
         return None
-    sy = None
-    if yield_mpa is not None:
-        sy = float(yield_mpa)
-        if not (math.isfinite(sy) and sy > 0):
-            sy = None
+    sy = _finite_float(yield_mpa, positive=True) if yield_mpa is not None else None
     if method == "soderberg" and sy is None:
         return None
 
     # Endurance limit: given (already Marin-corrected by the caller) or the
-    # unmodified Shigley Eq. 6-8 estimate.
-    if endurance_mpa is not None and float(endurance_mpa) > 0:
-        se = float(endurance_mpa)
+    # unmodified Shigley Eq. 6-8 estimate. An explicitly invalid value is not
+    # silently replaced by an estimate.
+    if endurance_mpa is not None:
+        se = _finite_float(endurance_mpa, positive=True)
+        if se is None:
+            return None
         se_source = "given (caller-corrected)"
     else:
         se = 0.5 * sut if sut <= 1400.0 else 700.0
@@ -354,6 +404,8 @@ def fatigue_anchor(
 
     sa = (smax - smin) / 2.0
     sm = (smax + smin) / 2.0
+    if not (math.isfinite(sa) and math.isfinite(sm)):
+        return None
     sm_eff = max(sm, 0.0)  # compressive mean -> no benefit (matches engine)
 
     out = {
@@ -382,24 +434,45 @@ def fatigue_anchor(
         return out
 
     sa_eq = sa / denom
+    if not math.isfinite(sa_eq):
+        return None
+    fos_endurance = se / sa_eq
+    if not math.isfinite(fos_endurance):
+        return None
     out["sa_eq_mpa"] = sa_eq
-    out["fos_endurance"] = se / sa_eq
+    out["fos_endurance"] = fos_endurance
 
     # S-N life (Shigley Eq. 6-14..6-16, f=0.9). Same clamps as the host mirror
     # (services/mcp/fea_advanced.py sn_life) so cross-checks agree bit-for-bit.
     if sa_eq <= se:
         out.update({"regime": "infinite", "cycles": None})
         return out
+    if sa_eq >= sut:
+        out.update({"regime": "static_overload", "cycles": 1})
+        return out
     f = 0.9
-    a = (f * sut) ** 2 / se
-    b = -(1.0 / 3.0) * math.log10((f * sut) / se)
-    n = (sa_eq / a) ** (1.0 / b)
+    ratio = (f * sut) / se
+    if not math.isfinite(ratio) or ratio <= 1.0:
+        # The two S-N anchor points coincide or reverse; the log-line has no
+        # physically meaningful negative slope.
+        return None
+    try:
+        a = (f * sut) ** 2 / se
+    except OverflowError:
+        return None
+    if not math.isfinite(a) or a <= 0.0:
+        return None
+    b = -(1.0 / 3.0) * math.log10(ratio)
+    try:
+        n = (sa_eq / a) ** (1.0 / b)
+    except (OverflowError, ZeroDivisionError):
+        return None
     if not math.isfinite(n) or n < 1.0:
         n = 1.0
     if n > 1e6:
         n = 1e6
     out["cycles"] = n
-    out["regime"] = "static_overload" if sa_eq >= sut else "finite"
+    out["regime"] = "finite"
     return out
 
 
@@ -407,158 +480,589 @@ def fatigue_anchor(
 # BC lint helpers
 # ---------------------------------------------------------------------------
 
+def _study_kind(study: dict) -> str:
+    return str(study.get("type") or study.get("study_kind") or "").strip().lower()
+
+
+def _zero_load_diagnostic(study: dict) -> bool:
+    purpose = str(study.get("purpose") or "").strip().lower()
+    return bool(study.get("zero_load_diagnostic")) or purpose in {
+        "zero_load_diagnostic", "zero-load diagnostic", "null_load_check",
+    }
+
+
+def _load_is_nonzero(load: object) -> bool:
+    """Recognise public and normalized structural-load shapes without mixing units."""
+    if not isinstance(load, dict):
+        return False
+    for key in ("pressure", "magnitude"):
+        value = _finite_float(load.get(key))
+        if value is not None and value != 0.0:
+            return True
+    vector = load.get("force")
+    if vector is None:
+        vector = load.get("vector")
+    if isinstance(vector, (list, tuple)):
+        return any((_finite_float(component) or 0.0) != 0.0 for component in vector)
+    return False
+
+
 def _bc_issues(study: dict) -> list[dict]:
-    """Deterministic BC checks on a study spec dict.
-
-    Returns a list of issue dicts ``{kind, detail}``.  Empty = clean.
-
-    Rules
-    -----
-    - At least one fixture required.
-    - At least one load required.
-    - No fixture may reference a face that appears in the ``dangling_refs`` list
-      (caller populates from a doc-query; pass ``[]`` when unavailable).
-    - Body must not be fully constrained on all faces (all-fixed check: when the
-      fixture list contains only the string ``"all"`` or a single entry equal to
-      ``"all_faces"``).
-    """
+    """Deterministic structural BC checks matched to each public solver surface."""
     issues = []
+    kind = _study_kind(study)
     fixtures = study.get("fixtures") or []
-    loads = study.get("loads") or []
+    raw_loads = study.get("loads")
+    if raw_loads is None:
+        raw_loads = study.get("load")
+    loads = raw_loads if isinstance(raw_loads, list) else ([raw_loads] if raw_loads else [])
     dangling = study.get("dangling_refs") or []
 
-    if not fixtures:
-        issues.append({"kind": "no_fixture",
-                       "detail": "Study has no fixtures — the solver will treat the body as free-floating."})
-    if not loads:
-        issues.append({"kind": "no_load",
-                       "detail": "Study has no loads — solve would produce zero stress everywhere."})
+    fixture_required = (
+        "static" in kind or "fatigue" in kind or "buckling" in kind
+        or "frequency_response" in kind or "vibration" in kind
+    ) and "modal" not in kind
+    load_required = "static" in kind or "fatigue" in kind or "buckling" in kind
+    diagnostic = _zero_load_diagnostic(study)
 
-    # All-fixed check: body fully rigid-constrained
-    if fixtures and all(f in ("all", "all_faces") for f in fixtures):
-        issues.append({"kind": "all_fixed",
-                       "detail": "All faces are fixed — the body is over-constrained; FEA will return "
-                                 "trivially zero displacement but stress may be unreliable."})
+    if fixture_required and not fixtures and not diagnostic:
+        issues.append({
+            "kind": "no_fixture",
+            "detail": "No fixtures were supplied. This study needs a mounted face; without "
+                      "a fixture its structural solve has rigid-body motion.",
+        })
+    if load_required and not any(_load_is_nonzero(load) for load in loads):
+        if diagnostic:
+            issues.append({
+                "kind": "zero_load_diagnostic",
+                "detail": (
+                    "Intentional zero-load diagnostic recorded. Do not interpret zero stress "
+                    "or saturated FoS as capacity; structural solver tools refuse zero-load runs."
+                ),
+            })
+        else:
+            issues.append({
+                "kind": "no_load",
+                "detail": (
+                    "Study has no loads with a supported non-zero excitation. Static/fatigue "
+                    "and buckling tools refuse this setup rather than returning capacity "
+                    "evidence."
+                ),
+            })
 
-    # Dangling reference check
-    for ref in dangling:
-        issues.append({"kind": "dangling_ref",
-                       "detail": f"Fixture/load reference {ref!r} cannot be resolved to a face id in "
-                                 "the current doc — the study may silently ignore this constraint."})
+    # Empty fixtures are intentional for run_fea_modal: a free-free solve should expose six
+    # near-zero rigid-body modes before the elastic modes.
+    if fixture_required and fixtures and not diagnostic \
+            and all(f in ("all", "all_faces") for f in fixtures):
+        issues.append({
+            "kind": "all_fixed",
+            "detail": (
+                "All faces are fixed — displacement is suppressed and the stress field does "
+                "not represent a physical mount."
+            ),
+        })
 
+    for ref in ([] if diagnostic else dangling):
+        issues.append({
+            "kind": "dangling_ref",
+            "detail": (
+                f"Fixture/load reference {ref!r} does not resolve to a current face. "
+                "Use query_geometry before launching the solver."
+            ),
+        })
     return issues
 
 
 def _is_thermal(study: dict) -> bool:
-    """True when the study is a steady-state thermal (conduction) study."""
-    t = (study.get("type") or "").lower()
-    return "thermal" in t or study.get("study_kind") == "thermal"
+    """True for either steady or transient thermal studies."""
+    return "thermal" in _study_kind(study)
 
 
 def _thermal_bc_issues(study: dict) -> list[dict]:
-    """Deterministic BC checks for a thermal (conduction) study.
-
-    Returns a list of ``{kind, detail}`` issue dicts. Empty = clean.
-
-    The load-bearing lint is the SINGULARITY check: steady conduction has a floating
-    temperature datum unless SOMETHING anchors it. That anchor is a Dirichlet fixed-temperature
-    BC OR a convection (Robin) film — NOT a heat flux. A pure-Neumann problem (only fluxes, or
-    nothing) is singular and the solver rejects it, so we flag it before dispatch.
-
-    (Task DoD phrased this as "no fixed-T and no flux = singular"; the physically correct
-    condition is "no fixed-T and no convection" — a flux does not fix the datum, and convection
-    does. The lint matches what actually makes the conductivity matrix singular. Deviation noted
-    in the T-SIM1 work note.)
-    """
+    """Lint the actual run_fea_thermal steady/transient boundary shapes."""
     issues = []
-    fixtures = study.get("fixtures") or []
+    transient = bool(study.get("transient")) or "transient" in _study_kind(study)
+    generic_fixtures = list(study.get("fixtures") or [])
+    hot_faces = list(study.get("hot_faces") or [])
+    cold_faces = list(study.get("cold_faces") or [])
+    fixtures = generic_fixtures + hot_faces + cold_faces
     loads = study.get("loads") or []
 
-    # A thermal fixture is Dirichlet only when it carries a temperature.
-    has_fixed_temp = any(
-        isinstance(fx, dict) and fx.get("temp_c") is not None for fx in fixtures
+    fixed_temps = []
+    for fixture in fixtures:
+        if not isinstance(fixture, dict):
+            continue
+        raw = fixture.get("temp_c")
+        if raw is None:
+            raw = fixture.get("temperature")
+        value = _finite_float(raw)
+        if value is not None:
+            fixed_temps.append(value)
+    transient_spec = study.get("transient")
+    t_init = _finite_float(
+        transient_spec.get("t_init_c", 20.0)
+        if isinstance(transient_spec, dict) else 20.0
+    )
+    has_fixed_drive = bool(
+        transient and t_init is not None
+        and any(temp != t_init for temp in fixed_temps)
     )
     has_convection = any(
-        isinstance(ld, dict) and (ld.get("type") == "convection")
-        and (ld.get("h") or 0) > 0
-        for ld in loads
+        isinstance(load, dict)
+        and _finite_float(
+            load.get("h") if load.get("h") is not None else load.get("h_w_m2k"),
+            positive=True,
+        ) is not None
+        and t_init is not None
+        and _finite_float(load.get("t_amb_c", 20.0)) not in (None, t_init)
+        for load in loads
     )
     has_flux = any(
-        isinstance(ld, dict) and ld.get("type") == "flux" and (ld.get("magnitude") or 0) != 0
-        for ld in loads
+        isinstance(load, dict)
+        and (_finite_float(
+            load.get("magnitude")
+            if load.get("magnitude") is not None else load.get("flux_w_m2")
+        ) or 0.0) != 0.0
+        for load in loads
     )
 
-    if not has_fixed_temp and not has_convection:
-        issues.append({
-            "kind": "thermal_singular",
-            "detail": (
-                "Thermal study has no fixed-temperature BC and no convection film — the "
-                "temperature datum is undefined (pure-Neumann conduction is singular). Add a "
-                "fixed temperature or a convection boundary. A heat flux alone does not anchor "
-                "the datum."
-            ),
-        })
-    if not has_fixed_temp and not has_flux and not has_convection:
-        issues.append({
-            "kind": "thermal_no_load",
-            "detail": (
-                "Thermal study has no heat input (no flux, no convection) and no imposed "
-                "temperature difference — the solve is trivial (uniform temperature)."
-            ),
-        })
+    if transient:
+        if not has_fixed_drive and not has_flux and not has_convection:
+            issues.append({
+                "kind": "thermal_no_load",
+                "detail": (
+                    "Transient thermal study has no non-zero thermal input relative to "
+                    "t_init_c, so it would only echo its initial field."
+                ),
+            })
+    else:
+        public_shape = "hot_faces" in study or "cold_faces" in study
+        invalid_public_pair = public_shape and (
+            len(hot_faces) != 1 or len(cold_faces) != 1
+        )
+        if invalid_public_pair or len(set(fixed_temps)) < 2 or loads:
+            issues.append({
+                "kind": "thermal_steady_bcs",
+                "detail": (
+                    "Steady run_fea_thermal is a 1-D CalculiX box proxy and requires exactly "
+                    "one hot_faces entry and one cold_faces entry with distinct temperatures. "
+                    "It rejects flux/convection loads; use the transient real-mesh path."
+                ),
+            })
     return issues
 
 
 def _thermal_bc_fix(kind: str) -> dict:
-    """Candidate fix for a thermal BC-lint issue kind."""
-    if kind == "thermal_singular":
+    """Candidate fix using the public run_fea_thermal argument names."""
+    if kind == "thermal_steady_bcs":
         return {
-            "action": "add_thermal_datum",
-            "params": {"hint": "Fix a face temperature (temp_c) or add a convection film "
-                               "(type='convection', h, t_amb_c) to anchor the temperature."},
-            "basis": "Steady conduction needs a Dirichlet or Robin BC to fix the datum.",
-            "predicted_effect": "Conductivity matrix becomes non-singular; solve proceeds.",
+            "action": "add_thermal_dirichlet_pair",
+            "params": {
+                "hint": (
+                    "Pass exactly one hot_faces and one cold_faces entry as "
+                    "{'face': <query>, 'temperature': <°C>} with distinct temperatures; "
+                    "do not pass loads to the steady proxy."
+                )
+            },
+            "basis": "The steady public tool is a hot-end/cold-end 1-D box-proxy solve.",
+            "predicted_effect": "A finite steady temperature gradient is defined.",
             "confidence": "heuristic",
         }
     return {
-        "action": "add_heat_input",
-        "params": {"hint": "Add a heat flux, a convection film, or a temperature difference."},
-        "basis": "No heat input + no ΔT ⇒ a uniform-temperature trivial result.",
-        "predicted_effect": "A meaningful temperature field is computed.",
+        "action": "add_transient_heat_input",
+        "params": {
+            "hint": (
+                "Add a fixed-temperature face, flux_w_m2, or h_w_m2k/t_amb_c load "
+                "to the transient study."
+            )
+        },
+        "basis": "Without thermal input, transient temperature stays at t_init_c.",
+        "predicted_effect": "A driven temperature history is computed.",
         "confidence": "heuristic",
     }
 
 
+def _mesh_convergence_evidence(study: dict) -> Optional[dict]:
+    """Return numeric two-mesh evidence using a strict change gate capped at 10%."""
+    evidence = study.get("mesh_convergence")
+    if not isinstance(evidence, dict):
+        return None
+    requested_tolerance = _finite_float(evidence.get("tolerance_pct", 10.0), positive=True)
+    if requested_tolerance is None:
+        return None
+    tolerance = min(requested_tolerance, 10.0)
+    values = evidence.get("values")
+    if isinstance(values, list) and len(values) >= 2:
+        coarse = _finite_float(values[-2])
+        fine = _finite_float(values[-1])
+    else:
+        coarse = _finite_float(evidence.get("coarse_value"))
+        fine = _finite_float(evidence.get("fine_value"))
+    if coarse is None or fine is None:
+        return None
+    denom = max(abs(coarse), abs(fine), 1e-12)
+    change_pct = abs(fine - coarse) / denom * 100.0
+    if not math.isfinite(change_pct):
+        return None
+    return {
+        "coarse_value": coarse,
+        "fine_value": fine,
+        "relative_change_pct": change_pct,
+        "tolerance_pct": tolerance,
+        "stable": change_pct < tolerance,
+    }
+
+
 def _mesh_suggestion(study: dict, doc_geom: Optional[dict] = None) -> Optional[str]:
-    """Return a mesh-size suggestion string, or None when no suggestion is warranted.
-
-    Uses min_fillet_radius or min_wall_mm from doc_geom if provided, else the
-    study's mesh_fineness (a coarse signal).  The suggestion is purely advisory
-    (never a blocker) and is emitted as an ``info`` Finding.
-
-    The returned string is the suggestion text, not an advisory item.
-    """
-    current_fine = float(study.get("mesh_fineness") or 0.5)
-    if doc_geom:
-        min_fillet = doc_geom.get("min_fillet_radius_mm")
-        min_wall = doc_geom.get("min_wall_mm")
-        feature_size = None
-        if min_fillet and float(min_fillet) > 0:
-            feature_size = float(min_fillet)
-        elif min_wall and float(min_wall) > 0:
-            feature_size = float(min_wall)
+    """Advise convergence without pretending dimensionless fineness is a length."""
+    current = _mesh_fineness_value(study.get("mesh_fineness", 0.5))
+    if current is None or not 0.0 <= current <= 1.0:
+        return "mesh_fineness must be 0..1 or coarse|medium|fine|finest."
+    if _mesh_convergence_evidence(study) is not None:
+        return None
+    feature_size = None
+    for key in ("min_fillet_radius_mm", "min_wall_mm"):
+        if doc_geom:
+            feature_size = _finite_float(doc_geom.get(key), positive=True)
         if feature_size is not None:
-            # Rule of thumb: at least 2 elements across the smallest feature.
-            target_fine = min(0.9, max(0.1, round(feature_size / 5.0, 2)))
-            if current_fine < target_fine * 0.8 or current_fine > target_fine * 2.0:
-                return (f"Min feature size ≈ {feature_size:.2f} mm — "
-                        f"suggested mesh_fineness ≈ {target_fine:.2f} "
-                        f"(current {current_fine:.2f}).")
-    # Fallback: coarse mesh warning
-    if current_fine < 0.2:
-        return (f"mesh_fineness {current_fine:.2f} is very coarse — "
-                "consider ≥ 0.3 for preliminary accuracy.")
+            break
+    if feature_size is not None:
+        return (
+            f"Smallest reported feature is {feature_size:.3g} mm, but mesh_fineness is "
+            "dimensionless and cannot be converted to a unit-correct element size. Run at "
+            f"{current:.2f} and a finer preset (typically 0.75), report n_elems, and require "
+            "<10% change in the governing result."
+        )
+    if current <= 0.25:
+        return (
+            f"mesh_fineness {current:.2f} is a coarse screening mesh. Repeat at a finer preset "
+            "and require <10% change before claiming a converged value."
+        )
     return None
+
+
+def _surface_issues(study: dict) -> list[dict]:
+    """Lint excitation/range fields that replace structural loads in other families."""
+    kind = _study_kind(study)
+    issues = []
+    diagnostic = _zero_load_diagnostic(study)
+    if "cfd" in kind or kind in ("flow", "run_cfd_flow", "run_cfd_accurate"):
+        velocity = _finite_float(study.get("velocity", study.get("velocity_ms", 10.0)))
+        if (velocity is None or velocity <= 0.0) and not diagnostic:
+            issues.append({
+                "kind": "invalid_excitation",
+                "detail": "CFD freestream velocity must be finite and >0 m/s for a driven flow study.",
+                "tool": "run_cfd_flow",
+            })
+        fluid = str(study.get("fluid") or "air").lower()
+        if fluid not in ("air", "water"):
+            issues.append({
+                "kind": "invalid_fluid",
+                "detail": "run_cfd_flow/run_cfd_accurate accept fluid='air' or fluid='water' only.",
+                "tool": "run_cfd_flow",
+            })
+    if "motion" in kind:
+        stop = _finite_float(study.get("stop"))
+        steps = _finite_float(study.get("steps", 24), positive=True)
+        if stop is None:
+            issues.append({
+                "kind": "invalid_motion_range",
+                "detail": "simulate_motion requires stop in the driven mate's unit (degrees or mm).",
+                "tool": "simulate_motion",
+            })
+        if steps is None or steps < 2:
+            issues.append({
+                "kind": "invalid_motion_range",
+                "detail": "simulate_motion needs at least two samples across the sweep.",
+                "tool": "simulate_motion",
+            })
+    if "frequency_response" in kind or "vibration" in kind:
+        direction = study.get("excitation_dir", [0.0, 0.0, 1.0])
+        direction_drives = (
+            isinstance(direction, (list, tuple))
+            and len(direction) == 3
+            and any((_finite_float(value) or 0.0) != 0.0 for value in direction)
+        )
+        harmonic = (_finite_float(study.get("base_accel_g", 1.0)) or 0.0) != 0.0
+        random_input = bool(study.get("psd_breakpoints"))
+        if (not direction_drives or not (harmonic or random_input)) and not diagnostic:
+            issues.append({
+                "kind": "invalid_excitation",
+                "detail": (
+                    "Frequency response needs a non-zero excitation_dir and either non-zero "
+                    "base_accel_g or psd_breakpoints in g²/Hz."
+                ),
+                "tool": "run_fea_frequency_response",
+            })
+    if kind.startswith("em_") and kind != "em_status":
+        has_cross_section = bool(study.get("standard") or study.get("waveguide"))
+        if kind == "em_driven":
+            has_cross_section = has_cross_section or bool(study.get("geometry"))
+        if not has_cross_section:
+            issues.append({
+                "kind": "missing_em_geometry",
+                "detail": (
+                    f"{kind} requires standard='WR-90', a waveguide JSON cross-section"
+                    + (", or geometry for em_driven." if kind == "em_driven" else ".")
+                ),
+                "tool": kind,
+            })
+    thermal = "thermal" in kind
+    if "buckling" in kind:
+        raw_buckling_loads = study.get("load")
+        if raw_buckling_loads is None:
+            raw_buckling_loads = study.get("loads")
+        buckling_loads = (
+            raw_buckling_loads
+            if isinstance(raw_buckling_loads, list)
+            else ([raw_buckling_loads] if raw_buckling_loads else [])
+        )
+        if _single_force_vector_n(buckling_loads) is None:
+            issues.append({
+                "kind": "invalid_buckling_load",
+                "detail": (
+                    "run_fea_buckling needs exactly one inward axial force in N on one load "
+                    "face; pressure, multiple loads, shear, and tension cannot map to its proxy."
+                ),
+                "tool": "run_fea_buckling",
+            })
+    if "contact" in kind and _finite_float(
+        study.get("pressure_mpa", 1.0), positive=True
+    ) is None:
+        issues.append({
+            "kind": "invalid_contact_pressure",
+            "detail": "run_fea_contact pressure_mpa must be finite and >0 MPa.",
+            "tool": "run_fea_contact",
+        })
+    transient_thermal = thermal and (
+        bool(study.get("transient")) or "transient" in kind
+    )
+    if transient_thermal:
+        transient_spec = study.get("transient")
+        t_end = (
+            transient_spec.get("t_end_s")
+            if isinstance(transient_spec, dict)
+            else study.get("t_end_s")
+        )
+        if _finite_float(t_end, positive=True) is None:
+            issues.append({
+                "kind": "invalid_thermal_time",
+                "detail": "Transient run_fea_thermal requires finite transient.t_end_s > 0 seconds.",
+                "tool": "run_fea_thermal",
+            })
+    material = study.get("material")
+    if thermal and not isinstance(material, dict):
+        invalid_overrides = []
+        conductivity_override = study.get("conductivity_w_mk")
+        if (
+            conductivity_override is not None
+            and _finite_float(conductivity_override, positive=True) is None
+        ):
+            invalid_overrides.append("conductivity_w_mk")
+        specific_heat_override = study.get("specific_heat_j_kgk")
+        if (
+            transient_thermal
+            and specific_heat_override is not None
+            and _finite_float(specific_heat_override, positive=True) is None
+        ):
+            invalid_overrides.append("specific_heat_j_kgk")
+        if invalid_overrides:
+            issues.append({
+                "kind": "invalid_thermal_properties",
+                "detail": (
+                    "Thermal property overrides must be finite and >0: "
+                    + ", ".join(invalid_overrides)
+                    + "."
+                ),
+                "tool": "run_fea_thermal",
+                "blocker": True,
+            })
+    if isinstance(material, dict):
+        # Every cad_sim_tools FEA path resolves E and nu even when the primary physics is
+        # thermal. Named materials are resolved by the tool; only explicit dicts can be
+        # checked here without guessing registry contents.
+        fea = any(token in kind for token in (
+            "static", "modal", "fatigue", "frequency_response", "vibration",
+            "thermal", "buckling", "contact",
+        ))
+        required = ["E_mpa", "nu"] if fea else []
+        if "static" in kind or "fatigue" in kind:
+            required.append("yield_mpa")
+        if any(token in kind for token in ("modal", "frequency_response", "vibration")):
+            required.append("density_g_cm3")
+        if "fatigue" in kind:
+            required.extend(("ultimate_mpa", "endurance_mpa"))
+        if transient_thermal:
+            required.append("density_g_cm3")
+        missing = []
+        for key in dict.fromkeys(required):
+            value = _finite_float(material.get(key))
+            if value is None or (key != "nu" and value <= 0.0):
+                missing.append(key)
+        nu = _finite_float(material.get("nu"))
+        if "nu" in required and nu is not None and not -1.0 < nu < 0.5:
+            if "nu" not in missing:
+                missing.append("nu")
+        if thermal:
+            conductivity = study.get("conductivity_w_mk")
+            if conductivity is None:
+                conductivity = material.get(
+                    "conductivity_w_mk", material.get("k_w_mk")
+                )
+            if _finite_float(conductivity, positive=True) is None:
+                missing.append("conductivity_w_mk")
+            if transient_thermal:
+                specific_heat = study.get("specific_heat_j_kgk")
+                if specific_heat is None:
+                    specific_heat = material.get("cp_j_kgk")
+                if _finite_float(specific_heat, positive=True) is None:
+                    missing.append("cp_j_kgk/specific_heat_j_kgk")
+        if missing:
+            issues.append({
+                "kind": "missing_material_properties",
+                "detail": (
+                    "Explicit material dict has missing/invalid properties: "
+                    + ", ".join(missing)
+                    + ". Use a registry material or sourced values in the documented units."
+                ),
+                "tool": "research_material_lookup",
+                "blocker": True,
+            })
+    return issues
+
+
+def _surface_fix(issue: dict) -> dict:
+    return {
+        "action": "correct_study_arguments",
+        "params": {"hint": issue["detail"]},
+        "basis": "The requested tool cannot produce a meaningful driven study from this setup.",
+        "predicted_effect": "The solver receives a finite excitation/range in its documented units.",
+        "confidence": "heuristic",
+    }
+
+
+def _backend_issue(study: dict) -> Optional[dict]:
+    """Return an unavailable-backend issue when a capability probe supplied evidence."""
+    requested = str(study.get("solver") or study.get("backend") or "").strip().lower()
+    unavailable = study.get("backend_available") is False
+    capabilities = study.get("capabilities")
+    if requested and isinstance(capabilities, dict):
+        available = capabilities.get(requested)
+        if available is None and isinstance(capabilities.get("solvers"), list):
+            match = next((
+                entry for entry in capabilities["solvers"]
+                if isinstance(entry, dict)
+                and str(entry.get("name") or "").strip().lower() == requested
+            ), None)
+            available = match
+        if isinstance(available, dict):
+            available = available.get("installed", available.get("available"))
+        unavailable = unavailable or available is False
+    if not unavailable:
+        return None
+    kind = _study_kind(study)
+    probe = "em_status" if kind.startswith("em_") or "electromag" in kind else None
+    return {
+        "kind": "backend_unavailable",
+        "detail": (
+            f"Requested backend {requested or '<unspecified>'!r} is unavailable. "
+            "Do not launch it or reinterpret its SKIP/error as a solved study."
+        ),
+        "probe": probe,
+    }
+
+
+def _axis_side(ref: object) -> Optional[tuple[str, int]]:
+    """Map common query_geometry side vocabulary to (axis, sign)."""
+    if isinstance(ref, dict):
+        if "face" in ref:
+            return _axis_side(ref["face"])
+        ref = ref.get("side")
+    if not isinstance(ref, str):
+        return None
+    token = ref.strip().lower().replace(" ", "")
+    mapping = {
+        "left": ("x", -1), "-x": ("x", -1),
+        "right": ("x", 1), "+x": ("x", 1),
+        "back": ("y", -1), "-y": ("y", -1),
+        "front": ("y", 1), "+y": ("y", 1),
+        "bottom": ("z", -1), "-z": ("z", -1),
+        "top": ("z", 1), "+z": ("z", 1),
+    }
+    return mapping.get(token)
+
+
+
+
+def _thermal_face_mapping_confident(bbox: dict, first_ref: object, second_ref: object) -> bool:
+    """Require opposed named faces across the bbox thickness for an automatic 1-D anchor."""
+    dims = {}
+    for axis in ("x", "y", "z"):
+        raw = bbox.get(f"{axis}_mm")
+        if raw is None:
+            raw = bbox.get(axis)
+        value = _finite_float(raw, positive=True)
+        if value is None:
+            return False
+        dims[axis] = value
+    first = _axis_side(first_ref)
+    second = _axis_side(second_ref)
+    if not first or not second or first[0] != second[0] or first[1] == second[1]:
+        return False
+    return math.isclose(dims[first[0]], min(dims.values()), rel_tol=1e-12, abs_tol=0.0)
+
+
+def _cantilever_mapping_confident(study: dict, bbox: dict) -> bool:
+    """Require opposite end-face queries before auto-claiming a cantilever anchor."""
+    fixtures = study.get("fixtures") or []
+    loads = study.get("loads") or []
+    if len(fixtures) != 1 or len(loads) != 1 or not isinstance(loads[0], dict):
+        return False
+    confident, _, long_axis = _beam_aspect_ok(bbox)
+    if not confident:
+        return False
+    fixed_side = _axis_side(fixtures[0])
+    loaded_side = _axis_side(loads[0].get("face"))
+    return bool(
+        fixed_side and loaded_side
+        and fixed_side[0] == long_axis == loaded_side[0]
+        and fixed_side[1] == -loaded_side[1]
+    )
+
+
+def _single_force_vector_n(loads: list) -> Optional[list[float]]:
+    """Return one finite public/normalized force vector in N, else ``None``."""
+    if not isinstance(loads, list) or len(loads) != 1 or not isinstance(loads[0], dict):
+        return None
+    load = loads[0]
+    if "pressure" in load or load.get("type") == "pressure":
+        return None
+    vector = load.get("force")
+    if vector is None:
+        vector = load.get("vector")
+    if isinstance(vector, (list, tuple)) and len(vector) == 3:
+        values = [_finite_float(component) for component in vector]
+        return None if any(value is None for value in values) else values
+    magnitude = _finite_float(load.get("magnitude"), positive=True)
+    direction = load.get("direction")
+    if magnitude is None or not isinstance(direction, (list, tuple)) or len(direction) != 3:
+        return None
+    components = [_finite_float(component) for component in direction]
+    if any(component is None for component in components):
+        return None
+    norm = math.sqrt(sum(component * component for component in components))
+    if norm <= 0.0 or not math.isfinite(norm):
+        return None
+    return [magnitude * component / norm for component in components]
+
+
+def _total_force_n(loads: list) -> Optional[float]:
+    """Magnitude of one force load in N; multi-load/pressure cases have no beam anchor."""
+    vector = _single_force_vector_n(loads)
+    if vector is None:
+        return None
+    magnitude = math.sqrt(sum(component * component for component in vector))
+    return magnitude if math.isfinite(magnitude) else None
 
 
 # ---------------------------------------------------------------------------
@@ -567,71 +1071,114 @@ def _mesh_suggestion(study: dict, doc_geom: Optional[dict] = None) -> Optional[s
 
 #: When True, BC-lint ``blocker`` items STOP dispatch before the solve.
 #: This is a deliberate deviation from the §9.3/§10 freedom rule — see module docstring.
-PRECHECK_BLOCK_ENABLED: bool = os.environ.get("CHUDWARE_SIM_PRECHECK_BLOCK", "1") not in ("0", "false")
+PRECHECK_BLOCK_ENABLED: bool = (
+    os.environ.get("CHUDWARE_SIM_PRECHECK_BLOCK", "1").strip().lower()
+    not in ("0", "false", "off", "no")
+)
 
 
 def precheck(study: dict, doc_geom: Optional[dict] = None) -> list[dict]:
-    """Pre-dispatch sanity checks on *study*.
+    """Pre-dispatch setup checks over the normalized arguments of current sim tools.
 
-    Returns a list of ``aicad.advisory/1``-shaped items (same shape as
-    ``engine._finding_to_item`` output).  Callers inject these directly or pass them
-    through ``build_advisory``.
-
-    Parameters
-    ----------
-    study : dict
-        A study spec — must include ``type``, ``fixtures`` (list of str),
-        ``loads`` (list of dicts with ``force`` list), and optionally
-        ``dangling_refs`` (list of unresolvable face refs from a prior doc-query),
-        ``mesh_fineness`` (float), ``material`` (dict with ``E_mpa``),
-        ``bbox`` (dict with ``x_mm/y_mm/z_mm``).
-    doc_geom : dict | None
-        Optional geometry hints from a prior doc-query:
-        ``min_fillet_radius_mm``, ``min_wall_mm``.
+    Static/fatigue require a mounted face and non-zero force/pressure; buckling requires
+    one mount and one axial force. Modal deliberately permits ``fixtures=[]`` for a
+    free-free solve. Steady and transient thermal paths are linted separately because
+    their boundary requirements differ. ``backend_available``/``capabilities`` are
+    optional inputs from a real capability probe; absence is unknown, never available.
     """
     items: list[dict] = []
+    kind = _study_kind(study)
     thermal = _is_thermal(study)
 
     # --- BC lint ---
     if thermal:
-        # Thermal studies lint for the singular temperature datum (no fixed-T + no convection).
         for issue in _thermal_bc_issues(study):
-            kind = issue["kind"]
-            is_blocker = kind == "thermal_singular" and PRECHECK_BLOCK_ENABLED
-            sev = "blocker" if is_blocker else "action"
+            issue_kind = issue["kind"]
+            is_blocker = PRECHECK_BLOCK_ENABLED
             items.append({
                 "schema": "aicad.advisory/1",
                 "check": "sim_bc",
-                "severity": sev,
+                "severity": "blocker" if is_blocker else "action",
                 "finding": issue["detail"],
                 "refs": {},
                 "numbers": {},
-                "candidate_fixes": [_thermal_bc_fix(kind)],
-                "helper_tools": ["run_fea_static", "describe_part"],
+                "candidate_fixes": [_thermal_bc_fix(issue_kind)],
+                "helper_tools": ["run_fea_thermal", "query_geometry"],
                 "source": {"kind": "heuristic", "detail": "sim_advisor.precheck (thermal)"},
             })
     else:
         for issue in _bc_issues(study):
-            kind = issue["kind"]
-            # blocker kinds that halt dispatch (config-gated)
-            is_blocker = kind in ("no_fixture", "no_load", "dangling_ref") and PRECHECK_BLOCK_ENABLED
-            sev = "blocker" if is_blocker else "action"
-            item = {
+            issue_kind = issue["kind"]
+            diagnostic = issue_kind == "zero_load_diagnostic"
+            is_blocker = (
+                issue_kind in ("no_fixture", "no_load", "dangling_ref")
+                and PRECHECK_BLOCK_ENABLED
+            )
+            items.append({
                 "schema": "aicad.advisory/1",
                 "check": "sim_bc",
-                "severity": sev,
+                "severity": "info" if diagnostic else ("blocker" if is_blocker else "action"),
                 "finding": issue["detail"],
                 "refs": {},
                 "numbers": {},
-                "candidate_fixes": [_bc_fix(kind)],
-                "helper_tools": ["run_fea_static", "describe_part"],
+                "candidate_fixes": [] if diagnostic else [_bc_fix(issue_kind)],
+                "helper_tools": ["query_geometry"],
                 "source": {"kind": "heuristic", "detail": "sim_advisor.precheck"},
-            }
-            items.append(item)
+            })
 
-    # --- Mesh size suggestion ---
-    mesh_hint = _mesh_suggestion(study, doc_geom)
+    for issue in _surface_issues(study):
+        items.append({
+            "schema": "aicad.advisory/1",
+            "check": "sim_bc",
+            "severity": (
+                "blocker" if issue.get("blocker", True) and PRECHECK_BLOCK_ENABLED else "action"
+            ),
+            "finding": issue["detail"],
+            "refs": {},
+            "numbers": {},
+            "candidate_fixes": [_surface_fix(issue)],
+            "helper_tools": [issue["tool"]],
+            "source": {"kind": "schema", "detail": "current public tool arguments"},
+        })
+
+    backend_issue = _backend_issue(study)
+    if backend_issue:
+        probe = backend_issue.get("probe")
+        items.append({
+            "schema": "aicad.advisory/1",
+            "check": "sim_bc",
+            "severity": "blocker" if PRECHECK_BLOCK_ENABLED else "action",
+            "finding": backend_issue["detail"],
+            "refs": {},
+            "numbers": {},
+            "candidate_fixes": [{
+                "action": "select_available_backend",
+                "params": {"hint": "Run the capability/status probe, then select an installed backend."},
+                "basis": "The requested solver was reported unavailable.",
+                "predicted_effect": "The next run uses a backend that can execute.",
+                "confidence": "measured",
+            }],
+            "helper_tools": [probe] if probe else [],
+            "source": {"kind": "runtime", "detail": "caller-supplied capability result"},
+        })
+
+    # --- Mesh/convergence suggestion (only tools whose public path uses a real FEA mesh) ---
+    mesh_path = (
+        any(token in kind for token in ("static", "modal", "fatigue", "frequency_response"))
+        or ("thermal" in kind and (bool(study.get("transient")) or "transient" in kind))
+    )
+    mesh_hint = _mesh_suggestion(study, doc_geom) if mesh_path else None
     if mesh_hint:
+        if "modal" in kind:
+            mesh_tool = "run_fea_modal"
+        elif "fatigue" in kind:
+            mesh_tool = "run_fea_fatigue"
+        elif "frequency_response" in kind or "vibration" in kind:
+            mesh_tool = "run_fea_frequency_response"
+        elif "thermal" in kind:
+            mesh_tool = "run_fea_thermal"
+        else:
+            mesh_tool = "run_fea_static"
         items.append({
             "schema": "aicad.advisory/1",
             "check": "sim_mesh",
@@ -640,74 +1187,105 @@ def precheck(study: dict, doc_geom: Optional[dict] = None) -> list[dict]:
             "refs": {},
             "numbers": {"mesh_fineness": study.get("mesh_fineness")},
             "candidate_fixes": [],
-            "helper_tools": ["run_fea_static"],
+            "helper_tools": [mesh_tool],
             "source": {"kind": "heuristic", "detail": "sim_advisor.precheck"},
         })
 
     # --- Hand-calc anchor (order-of-magnitude cross-check) ---
-    mat = study.get("material") or {}
+    material_value = study.get("material")
+    mat = material_value if isinstance(material_value, dict) else {}
     bbox = study.get("bbox")
     loads = study.get("loads") or []
 
     if thermal:
-        # Thermal anchor: 1D plane-wall Fourier reference from the fixed-T + BC set.
-        k_w_mk = mat.get("k_w_mk") or study.get("k_w_mk")
-        fixtures = study.get("fixtures") or []
-        fixed_temps = [float(fx["temp_c"]) for fx in fixtures
-                       if isinstance(fx, dict) and fx.get("temp_c") is not None]
-        conv = next((ld for ld in loads
-                     if isinstance(ld, dict) and ld.get("type") == "convection"), None)
-        t_anchor = None
-        if k_w_mk and fixed_temps:
-            t_hot = max(fixed_temps)
-            if len(fixed_temps) >= 2:
-                t_anchor = thermal_anchor(bbox or {}, float(k_w_mk), t_hot,
-                                          t_cold_c=min(fixed_temps))
-            elif conv is not None and (conv.get("h") or 0) > 0:
-                t_anchor = thermal_anchor(bbox or {}, float(k_w_mk), t_hot,
-                                          h_w_m2k=float(conv.get("h")),
-                                          t_amb_c=float(conv.get("t_amb_c", 20.0)))
-        anchor_detail = (
-            f"Thermal anchor ({t_anchor['mode']}): wall flux {t_anchor['q_w_m2']:.1f} W/m² "
-            f"(L={t_anchor['L_mm']:.1f} mm, k={t_anchor['k_w_mk']:.1f} W/m·K, "
-            f"cold face ≈ {t_anchor['t_cold_c']:.1f} °C); source: {t_anchor['source']}."
-            if t_anchor else
-            "No thermal anchor — need a bbox, conductivity, and either two fixed-temperature "
-            "faces or a fixed face + convection to map to a 1D plane wall. FEA result will not "
-            "be cross-checked."
+        conductivity = (
+            mat.get("k_w_mk") or mat.get("conductivity_w_mk")
+            or study.get("k_w_mk") or study.get("conductivity_w_mk")
+        )
+        fixtures = list(study.get("fixtures") or [])
+        fixtures += list(study.get("hot_faces") or [])
+        fixtures += list(study.get("cold_faces") or [])
+        temperature_bcs = []
+        for fixture in fixtures:
+            if not isinstance(fixture, dict):
+                continue
+            raw = fixture.get("temp_c")
+            if raw is None:
+                raw = fixture.get("temperature")
+            value = _finite_float(raw)
+            if value is not None:
+                temperature_bcs.append((value, fixture))
+        convection = next((
+            load for load in loads
+            if isinstance(load, dict)
+            and (load.get("type") == "convection" or load.get("h_w_m2k") is not None)
+        ), None)
+        anchor = None
+        if conductivity is not None and temperature_bcs:
+            hot, hot_bc = max(temperature_bcs, key=lambda entry: entry[0])
+            cold, cold_bc = min(temperature_bcs, key=lambda entry: entry[0])
+            if hot != cold and _thermal_face_mapping_confident(
+                bbox or {}, hot_bc, cold_bc
+            ):
+                anchor = thermal_anchor(bbox or {}, conductivity, hot, t_cold_c=cold)
+            elif convection is not None and _thermal_face_mapping_confident(
+                bbox or {}, hot_bc, convection
+            ):
+                h = convection.get("h")
+                if h is None:
+                    h = convection.get("h_w_m2k")
+                anchor = thermal_anchor(
+                    bbox or {}, conductivity, hot, h_w_m2k=h,
+                    t_amb_c=convection.get("t_amb_c", 20.0),
+                )
+        detail = (
+            f"Thermal anchor ({anchor['mode']}): wall flux {anchor['q_w_m2']:.1f} W/m² "
+            f"(L={anchor['L_mm']:.1f} mm, k={anchor['k_w_mk']:.1f} W/m·K, "
+            f"cold face ≈ {anchor['t_cold_c']:.1f} °C); source: {anchor['source']}."
+            if anchor else
+            "No 1-D thermal anchor: need bbox/conductivity and opposed named faces across "
+            "the shortest bbox dimension, with two fixed temperatures or fixed-plus-convection."
         )
         items.append({
             "schema": "aicad.advisory/1",
             "check": "sim_anchor",
             "severity": "info",
-            "finding": anchor_detail,
+            "finding": detail,
             "refs": {},
-            "numbers": {"anchor_flux_w_m2": t_anchor["q_w_m2"] if t_anchor else None,
-                        "anchor_cold_face_c": t_anchor["t_cold_c"] if t_anchor else None},
+            "numbers": {
+                "anchor_flux_w_m2": anchor["q_w_m2"] if anchor else None,
+                "anchor_cold_face_c": anchor["t_cold_c"] if anchor else None,
+            },
             "candidate_fixes": [],
             "helper_tools": [],
             "source": {"kind": "calc", "detail": "thermal_anchor (1D plane wall)"},
-            "_anchor": t_anchor,
+            "_anchor": anchor,
         })
         return items
 
-    E_mpa = mat.get("E_mpa")
-    total_load_n = 0.0
-    for ld in loads:
-        force = ld.get("force") or [0, 0, 0]
-        total_load_n += math.sqrt(sum(float(v) ** 2 for v in force))
+    # Beam stress is not an anchor for modal, CFD, motion, contact, buckling, or EM.
+    if not ("static" in kind or "fatigue" in kind):
+        return items
 
+    E_mpa = mat.get("E_mpa")
+    load_vector_n = _single_force_vector_n(loads)
+    total_load_n = _total_force_n(loads)
     anchor = None
-    if E_mpa and bbox and total_load_n > 0:
-        anchor = compute_beam_anchor(bbox, float(E_mpa), total_load_n)
+    if (
+        E_mpa is not None and bbox and total_load_n is not None and total_load_n > 0.0
+        and _cantilever_mapping_confident(study, bbox)
+    ):
+        anchor = compute_beam_anchor(
+            bbox, E_mpa, total_load_n, load_vector_n=load_vector_n
+        )
 
     anchor_detail = (
         f"Beam anchor: {anchor['max_stress_mpa']:.2f} MPa (cantilever, rect section, "
-        f"L={anchor.get('L_mm', '?'):.1f} mm, aspect={anchor.get('aspect_ratio', '?')}); "
-        f"source: {anchor.get('source', 'beam_calc_raw')}."
+        f"L={anchor.get('L_mm', '?'):.1f} mm, aspect={anchor.get('aspect_ratio', '?')}, "
+        f"load axis={anchor.get('load_axis')}); source: {anchor.get('source', 'beam_calc_raw')}."
         if anchor else
-        "No beam anchor — geometry does not map confidently to a beam/plate approximation "
-        "(aspect ratio < 3 or missing bbox/load). FEA result will not be cross-checked."
+        "No beam anchor — need a slender bbox, one transverse force, and opposite named "
+        "end-face fixture/load queries to justify a cantilever mapping."
     )
     items.append({
         "schema": "aicad.advisory/1",
@@ -738,9 +1316,9 @@ def _bc_fix(kind: str) -> dict:
     if kind == "no_load":
         return {
             "action": "add_load",
-            "params": {"hint": "Add a force or pressure on the loaded face."},
-            "basis": "No load ⇒ trivially zero stress result.",
-            "predicted_effect": "Meaningful stress field computed.",
+            "params": {"hint": "Add a supported non-zero load on the loaded face."},
+            "basis": "The structural tools refuse a zero-load study; zero stress is not capacity.",
+            "predicted_effect": "A driven, physically interpretable stress field can be computed.",
             "confidence": "heuristic",
         }
     if kind == "all_fixed":
@@ -755,8 +1333,8 @@ def _bc_fix(kind: str) -> dict:
     return {
         "action": "resolve_face_ref",
         "params": {"hint": "Verify the fixture/load face id against the current doc geometry."},
-        "basis": "Unresolvable refs are silently dropped by the solver, giving wrong BCs.",
-        "predicted_effect": "Correct boundary condition applied.",
+        "basis": "Current FEA tools reject face queries that resolve to no surface points.",
+        "predicted_effect": "The requested boundary condition resolves and is applied.",
         "confidence": "heuristic",
     }
 
@@ -766,9 +1344,15 @@ def _bc_fix(kind: str) -> dict:
 # ---------------------------------------------------------------------------
 
 #: Maximum ratio of FEA stress to beam-anchor stress before emitting a divergence WARN.
-DIVERGENCE_WARN_RATIO: float = float(
-    os.environ.get("CHUDWARE_SIM_DIVERGENCE_RATIO",
-                   str(_load_policy().get("_doc", {}).get("divergence_warn_ratio", 5.0)))
+_DIVERGENCE_CONFIG = _finite_float(
+    os.environ.get(
+        "CHUDWARE_SIM_DIVERGENCE_RATIO",
+        str(_load_policy().get("_doc", {}).get("divergence_warn_ratio", 5.0)),
+    ),
+    positive=True,
+)
+DIVERGENCE_WARN_RATIO: float = (
+    _DIVERGENCE_CONFIG if _DIVERGENCE_CONFIG is not None and _DIVERGENCE_CONFIG > 1.0 else 5.0
 )
 
 
@@ -777,78 +1361,145 @@ def postcheck(
     precheck_items: Optional[list[dict]] = None,
     doc_geom: Optional[dict] = None,
 ) -> dict:
-    """Post-solve analysis of *study* results.
+    """Post-solve static margin and confidence analysis.
 
-    Returns a dict::
+    ``study.results.max_von_mises_mpa`` and ``study.material.yield_mpa`` are MPa.
+    ``margin_mpa`` is measured against ``yield/SF``, not raw yield. A favorable margin
+    becomes overall PASS only when the solver completed, the reacted setup and explicit
+    material properties are valid, a mesh is reported, and either ``mesh_convergence``
+    contains two finite governing values within tolerance or the independent beam anchor
+    agrees within ``DIVERGENCE_WARN_RATIO``.
 
-        {
-            "verdict":   "PASS" | "WARN" | "FAIL",
-            "sf_used":   float,
-            "mat_class": str,
-            "margin_mpa": float | None,
-            "anchor_stress_mpa": float | None,
-            "divergence_ratio": float | None,
-            "items": [ aicad.advisory/1-shaped dicts ],
-        }
-
-    Parameters
-    ----------
-    study : dict
-        A completed study record (same shape as the ``_seed_static_study`` fixture
-        in ``test_gsl_tools.py``).  Must include ``results.max_von_mises_mpa``,
-        ``material.yield_mpa`` / ``material.E_mpa``, and optionally ``material.name``.
-    precheck_items : list | None
-        Items returned by :func:`precheck` for this study.  When present, the anchor
-        is extracted from the ``sim_anchor`` item so precheck + postcheck share one
-        anchor computation.  When absent, postcheck recomputes from ``study.bbox``.
-    doc_geom : dict | None
-        Optional geometry hints; used for anchor recomputation if precheck_items absent.
+    ``precheck_items`` may carry the exact pre-solve ``_anchor``. Without it, a beam
+    anchor is recomputed only for finite force loads and a justified slender bbox.
+    ``doc_geom`` remains accepted for caller compatibility; postcheck does not infer
+    convergence from geometry hints.
     """
     results = study.get("results") or {}
-    mat = study.get("material") or {}
-    vm = results.get("max_von_mises_mpa")
-    yield_mpa = mat.get("yield_mpa")
-    ultimate_mpa = mat.get("ultimate_mpa")
+    kind = _study_kind(study)
+    material_value = study.get("material")
+    mat = material_value if isinstance(material_value, dict) else {}
+    vm = _finite_float(results.get("max_von_mises_mpa"), nonnegative=True)
+    yield_mpa = _finite_float(mat.get("yield_mpa"), positive=True)
+    ultimate_mpa = _finite_float(mat.get("ultimate_mpa"), positive=True)
     mat_name = mat.get("name") or "unknown"
 
     policy_rec = resolve_material_class(mat_name)
-    sf = policy_rec["sf_yield"]
+    sf = _finite_float(policy_rec.get("sf_yield"), positive=True) or 2.0
     mat_class = policy_rec["class"]
 
     items: list[dict] = []
-    verdict = "PASS"
+    verdict = "WARN"
     margin_mpa = None
     divergence_ratio = None
 
-    # --- Margin verdict ---
+    # --- Independent analytic anchor ---
+    anchor = _extract_anchor(precheck_items)
+    if anchor is None:
+        E_mpa = mat.get("E_mpa")
+        bbox = study.get("bbox")
+        loads = study.get("loads") or []
+        load_vector_n = _single_force_vector_n(loads)
+        total_load_n = _total_force_n(loads)
+        if (
+            E_mpa is not None and bbox and total_load_n is not None and total_load_n > 0.0
+            and _cantilever_mapping_confident(study, bbox)
+        ):
+            anchor = compute_beam_anchor(
+                bbox, E_mpa, total_load_n, load_vector_n=load_vector_n
+            )
+    anchor_stress = (
+        _finite_float(anchor.get("max_stress_mpa"), positive=True)
+        if isinstance(anchor, dict) else None
+    )
+    if anchor_stress is not None and vm is not None:
+        divergence_ratio = vm / anchor_stress
+        if not math.isfinite(divergence_ratio):
+            divergence_ratio = None
+
+    mesh_fineness = _mesh_fineness_value(study.get("mesh_fineness"))
+    n_elems = _finite_float(
+        study.get("n_elems", results.get("n_elems")), positive=True
+    )
+    mesh_reported = (
+        (mesh_fineness is not None and 0.0 <= mesh_fineness <= 1.0)
+        or n_elems is not None
+    )
+    mesh_convergence = _mesh_convergence_evidence(study)
+    mesh_stable = bool(mesh_convergence and mesh_convergence["stable"])
+    anchor_consistent = bool(
+        divergence_ratio is not None
+        and 1.0 / DIVERGENCE_WARN_RATIO <= divergence_ratio <= DIVERGENCE_WARN_RATIO
+    )
+    state = str(study.get("state") or results.get("state") or "").lower()
+    solver_completed = (
+        study.get("ok") is not False
+        and results.get("ok") is not False
+        and study.get("backend_available") is not False
+        and not study.get("skipped")
+        and not results.get("skipped")
+        and not study.get("partial")
+        and not results.get("partial")
+        and state not in ("queued", "running", "failed", "cancelled")
+        and results.get("converged") is not False
+    )
+    setup_issues = _bc_issues(study) if (
+        "static" in kind or "fatigue" in kind
+    ) else []
+    surface_blockers = [
+        issue for issue in _surface_issues(study) if issue.get("blocker", True)
+    ]
+    backend_valid = _backend_issue(study) is None
+    setup_valid = not setup_issues and not surface_blockers
+    confidence_supported = bool(
+        solver_completed and setup_valid and backend_valid and mesh_reported
+        and (mesh_stable or anchor_consistent)
+    )
+
+    # --- Unit-correct static margin verdict ---
     if vm is not None and yield_mpa is not None:
-        margin_mpa = yield_mpa - vm
+        allowable_mpa = yield_mpa / sf
+        margin_mpa = allowable_mpa - vm
         design_stress = vm * sf
-        if design_stress <= yield_mpa:
-            verdict = "PASS"
-            verdict_detail = (
-                f"Max stress {vm:.2f} MPa × SF {sf:.1f} = {design_stress:.2f} MPa "
-                f"≤ yield {yield_mpa:.1f} MPa — PASS."
-            )
-            sev = "info"
-        elif ultimate_mpa is not None and design_stress <= ultimate_mpa:
-            verdict = "WARN"
-            verdict_detail = (
-                f"Max stress {vm:.2f} MPa × SF {sf:.1f} = {design_stress:.2f} MPa "
-                f"exceeds yield {yield_mpa:.1f} MPa but ≤ ultimate {ultimate_mpa:.1f} MPa — "
-                f"WARN: permanent deformation predicted under design load."
-            )
-            sev = "action"
-        else:
+        finite_design_stress = design_stress if math.isfinite(design_stress) else None
+        raw_utilization = (
+            finite_design_stress / yield_mpa if finite_design_stress is not None else None
+        )
+        utilization = (
+            raw_utilization
+            if raw_utilization is not None and math.isfinite(raw_utilization)
+            else None
+        )
+        if vm >= yield_mpa:
             verdict = "FAIL"
-            ult_str = f"(ultimate {ultimate_mpa:.1f} MPa)" if ultimate_mpa else ""
+            failure = (
+                f" and exceeds ultimate {ultimate_mpa:.1f} MPa (fracture risk)"
+                if ultimate_mpa is not None and vm >= ultimate_mpa else
+                " (nominal yielding predicted)"
+            )
             verdict_detail = (
-                f"Max stress {vm:.2f} MPa × SF {sf:.1f} = {design_stress:.2f} MPa "
-                f"exceeds yield {yield_mpa:.1f} MPa {ult_str} — FAIL: fracture risk."
+                f"Max stress {vm:.2f} MPa exceeds yield {yield_mpa:.2f} MPa{failure} — FAIL."
             )
             sev = "blocker"
+            fix = _margin_fix(verdict, mat_class, sf)
+        elif design_stress > yield_mpa:
+            verdict = "WARN"
+            verdict_detail = (
+                f"Max stress {vm:.2f} MPa is below yield, but exceeds the policy allowable "
+                f"{allowable_mpa:.2f} MPa (= yield {yield_mpa:.2f}/SF {sf:.2f}) by "
+                f"{-margin_mpa:.2f} MPa — required design margin is not met."
+            )
+            sev = "action"
+            fix = _margin_fix(verdict, mat_class, sf)
+        else:
+            verdict = "PASS" if confidence_supported else "WARN"
+            verdict_detail = (
+                f"Max stress {vm:.2f} MPa is {margin_mpa:.2f} MPa below the policy allowable "
+                f"{allowable_mpa:.2f} MPa (= yield {yield_mpa:.2f}/SF {sf:.2f})."
+            )
+            sev = "info"
+            fix = None
 
-        fix = _margin_fix(verdict, mat_class, sf)
         margin_item: dict = {
             "schema": "aicad.advisory/1",
             "check": "sim_margin",
@@ -858,8 +1509,12 @@ def postcheck(
             "numbers": {
                 "max_stress_mpa": vm,
                 "yield_mpa": yield_mpa,
+                "allowable_mpa": round(allowable_mpa, 3),
                 "sf_yield": sf,
-                "design_stress_mpa": round(design_stress, 3),
+                "design_stress_mpa": (
+                    round(finite_design_stress, 3) if finite_design_stress is not None else None
+                ),
+                "utilization": round(utilization, 6) if utilization is not None else None,
                 "margin_mpa": round(margin_mpa, 3),
                 "mat_class": mat_class,
             },
@@ -867,71 +1522,114 @@ def postcheck(
             "helper_tools": ["describe_results", "run_fea_static"],
             "source": {"kind": "table", "detail": f"margin_policy.json [{mat_class}]"},
         }
-        # §3 invariant: non-info must carry ≥1 fix
-        if sev != "info" and not margin_item["candidate_fixes"]:
-            margin_item["severity"] = "info"
         items.append(margin_item)
     else:
         items.append({
             "schema": "aicad.advisory/1",
             "check": "sim_margin",
-            "severity": "info",
-            "finding": "Margin verdict skipped — max_von_mises_mpa or yield_mpa not in study record.",
+            "severity": "action",
+            "finding": (
+                "No finite static margin can be computed: max_von_mises_mpa must be finite "
+                "and non-negative, and yield_mpa must be finite and >0."
+            ),
             "refs": {},
             "numbers": {},
-            "candidate_fixes": [],
-            "helper_tools": ["run_fea_static"],
+            "candidate_fixes": [{
+                "action": "supply_finite_strength_results",
+                "params": {"hint": "Use the solver summary MPa values and a material with yield_mpa."},
+                "basis": "A missing/NaN/negative stress or strength cannot define a safety margin.",
+                "predicted_effect": "The advisor can compute a finite allowable and utilization.",
+                "confidence": "measured",
+            }],
+            "helper_tools": ["run_fea_static", "describe_results"],
             "source": {"kind": "heuristic", "detail": "sim_advisor.postcheck"},
         })
 
     # --- Beam-anchor divergence check ---
-    anchor = _extract_anchor(precheck_items)
-    if anchor is None:
-        # Recompute anchor when precheck_items not supplied
-        E_mpa = mat.get("E_mpa")
-        bbox = study.get("bbox")
-        loads = study.get("loads") or []
-        total_load_n = 0.0
-        for ld in loads:
-            force = ld.get("force") or [0, 0, 0]
-            total_load_n += math.sqrt(sum(float(v) ** 2 for v in force))
-        if E_mpa and bbox and total_load_n > 0:
-            anchor = compute_beam_anchor(bbox, float(E_mpa), total_load_n)
+    if divergence_ratio is not None and (
+        divergence_ratio > DIVERGENCE_WARN_RATIO
+        or divergence_ratio < 1.0 / DIVERGENCE_WARN_RATIO
+    ):
+        if divergence_ratio == 0.0:
+            ratio_str = "zero while"
+        elif divergence_ratio > 1.0:
+            ratio_str = f"{divergence_ratio:.1f}×"
+        else:
+            ratio_str = f"{1.0 / divergence_ratio:.1f}× lower than"
+        items.append({
+            "schema": "aicad.advisory/1",
+            "check": "sim_divergence",
+            "severity": "action",
+            "finding": (
+                f"FEA result ({vm:.2f} MPa) is {ratio_str} the beam anchor "
+                f"({anchor_stress:.2f} MPa). Check units, BCs, load path, and mesh."
+            ),
+            "refs": {},
+            "numbers": {
+                "fea_stress_mpa": vm,
+                "anchor_stress_mpa": anchor_stress,
+                "divergence_ratio": round(divergence_ratio, 6),
+                "warn_threshold": DIVERGENCE_WARN_RATIO,
+            },
+            "candidate_fixes": [{
+                "action": "review_bc_load_units_and_mesh",
+                "params": {"hint": "Confirm N/MPa/mm inputs, face queries, and repeat on a finer mesh."},
+                "basis": "FEA and the independent beam anchor disagree by more than the threshold.",
+                "predicted_effect": "The discrepancy is explained or reduced with corrected setup.",
+                "confidence": "heuristic",
+            }],
+            "helper_tools": ["run_fea_static", "describe_results"],
+            "source": {"kind": "calc", "detail": "beam_calc_raw cross-check"},
+        })
+        if verdict == "PASS":
+            verdict = "WARN"
 
-    anchor_stress = anchor["max_stress_mpa"] if anchor else None
-    if anchor_stress is not None and vm is not None and anchor_stress > 0:
-        divergence_ratio = vm / anchor_stress
-        if divergence_ratio > DIVERGENCE_WARN_RATIO or divergence_ratio < 1.0 / DIVERGENCE_WARN_RATIO:
-            direction = "higher" if divergence_ratio > 1 else "lower"
-            ratio_str = f"{divergence_ratio:.1f}×" if divergence_ratio > 1 else f"{1/divergence_ratio:.1f}× lower"
-            items.append({
-                "schema": "aicad.advisory/1",
-                "check": "sim_divergence",
-                "severity": "action",
-                "finding": (
-                    f"FEA result ({vm:.2f} MPa) is {ratio_str} the beam-anchor estimate "
-                    f"({anchor_stress:.2f} MPa) — result may be implausible; check BCs and loads."
+    if not confidence_supported:
+        missing = []
+        if not solver_completed:
+            missing.append("completed/converged solver result")
+        if not setup_valid:
+            missing.append("reacted non-zero structural setup")
+        if not backend_valid:
+            missing.append("available requested backend")
+        if not mesh_reported:
+            missing.append("reported mesh_fineness or n_elems")
+        if not mesh_stable and not anchor_consistent:
+            missing.append("stable two-mesh comparison or consistent analytic anchor")
+        items.append({
+            "schema": "aicad.advisory/1",
+            "check": "sim_mesh",
+            "severity": "action",
+            "finding": (
+                "Overall PASS withheld: missing " + ", ".join(missing)
+                + ". A favorable one-mesh margin is not convergence evidence."
+            ),
+            "refs": {},
+            "numbers": {
+                "mesh_reported": mesh_reported,
+                "mesh_relative_change_pct": (
+                    round(mesh_convergence["relative_change_pct"], 6)
+                    if mesh_convergence else None
                 ),
-                "refs": {},
-                "numbers": {
-                    "fea_stress_mpa": vm,
-                    "anchor_stress_mpa": anchor_stress,
-                    "divergence_ratio": round(divergence_ratio, 3),
-                    "warn_threshold": DIVERGENCE_WARN_RATIO,
+                "anchor_consistent": anchor_consistent,
+            },
+            "candidate_fixes": [{
+                "action": "run_mesh_convergence_or_anchor",
+                "params": {
+                    "hint": (
+                        "Repeat with a finer mesh and pass mesh_convergence values; require "
+                        "<10% change, or supply an independent analytic anchor."
+                    )
                 },
-                "candidate_fixes": [{
-                    "action": "review_bc_and_loads",
-                    "params": {"hint": "Verify fixture faces and load magnitudes match the physical setup."},
-                    "basis": (f"FEA/beam ratio {divergence_ratio:.1f}× exceeds the "
-                              f"{DIVERGENCE_WARN_RATIO:.0f}× plausibility threshold."),
-                    "predicted_effect": "Result converges with the hand-calc order of magnitude.",
-                    "confidence": "heuristic",
-                }],
-                "helper_tools": ["run_fea_static", "describe_results"],
-                "source": {"kind": "calc", "detail": "beam_calc_raw cross-check"},
-            })
-            if verdict == "PASS":
-                verdict = "WARN"
+                "basis": "A single discretization can look safe while its peak stress is unresolved.",
+                "predicted_effect": "A PASS, if retained, has numeric verification evidence.",
+                "confidence": "heuristic",
+            }],
+            "helper_tools": ["run_fea_static", "describe_results"],
+            "source": {"kind": "heuristic", "detail": "sim_advisor.postcheck evidence gate"},
+        })
+        if verdict == "PASS":
+            verdict = "WARN"
 
     # --- Geometry-linked suggestion (fillet/sharp-edge Kt pattern) ---
     max_stress_face = (study.get("results") or {}).get("max_stress_face") or {}
@@ -943,19 +1641,18 @@ def postcheck(
             "check": "sim_margin",
             "severity": "hint",
             "finding": (
-                f"Max stress located at {face_type} on feature '{feature_name}' — "
-                "stress concentration (Kt) likely elevated. "
-                "Consider increasing the fillet radius to reduce Kt "
-                "(Shigley §6-8: Kt ≈ 1 + 2√(d/r) for sharp notches)."
+                f"Max stress is at a {face_type} on feature '{feature_name}'. This may be a "
+                "real stress concentration or a singular idealization; refine locally and "
+                "check whether the peak converges before changing geometry."
             ),
             "refs": {"feature": feature_name, "face_type": face_type},
             "numbers": {},
             "candidate_fixes": [{
                 "action": "edit_feature_param",
                 "params": {"feature": feature_name, "param": "fillet_radius",
-                           "hint": "Increase fillet radius to lower stress concentration."},
-                "basis": "Shigley §6-8 Kt analysis: larger radius → lower Kt → lower local stress.",
-                "predicted_effect": "Reduced peak stress at the fillet/notch; re-run FEA to verify.",
+                           "hint": "Only increase the radius after a local mesh-convergence check."},
+                "basis": "A larger radius often reduces a geometric concentration, but no Kt is inferred here.",
+                "predicted_effect": "Potentially lower converged peak stress; re-run to measure it.",
                 "confidence": "heuristic",
             }],
             "helper_tools": ["run_fea_static", "describe_results"],
@@ -964,11 +1661,13 @@ def postcheck(
 
     return {
         "verdict": verdict,
+        "confidence": "supported" if confidence_supported else "insufficient",
         "sf_used": sf,
         "mat_class": mat_class,
         "margin_mpa": margin_mpa,
         "anchor_stress_mpa": anchor_stress,
         "divergence_ratio": divergence_ratio,
+        "mesh_convergence": mesh_convergence,
         "items": items,
     }
 
@@ -990,19 +1689,19 @@ def _margin_fix(verdict: str, mat_class: str, sf: float) -> Optional[dict]:
     if verdict == "WARN":
         return {
             "action": "redesign_cross_section",
-            "params": {"hint": f"Increase section modulus to bring design stress below yield "
-                                f"(target: max_stress × {sf:.1f} ≤ yield)."},
-            "basis": f"margin_policy [{mat_class}] SF={sf:.1f}; design stress exceeds yield.",
-            "predicted_effect": "Stress in elastic range under design load.",
+            "params": {"hint": f"Increase section modulus to meet "
+                                f"max_stress × {sf:.1f} ≤ yield."},
+            "basis": f"margin_policy [{mat_class}] SF={sf:.1f}; the required allowable is exceeded.",
+            "predicted_effect": "The design meets the required nominal yield margin.",
             "confidence": "heuristic",
         }
     # FAIL
     return {
         "action": "redesign_or_change_material",
-        "params": {"hint": f"Significantly reduce stress or upgrade material "
-                           f"(target: max_stress × {sf:.1f} ≤ yield)."},
-        "basis": f"margin_policy [{mat_class}] SF={sf:.1f}; design stress exceeds ultimate — fracture risk.",
-        "predicted_effect": "Part survives design load.",
+        "params": {"hint": f"Reduce nominal stress below yield and then meet "
+                           f"max_stress × {sf:.1f} ≤ yield."},
+        "basis": f"Nominal stress reached yield for margin_policy [{mat_class}].",
+        "predicted_effect": "Nominal loading returns to the elastic range with design margin.",
         "confidence": "heuristic",
     }
 
@@ -1020,28 +1719,33 @@ def narrate_postcheck(postcheck_result: dict) -> str:
     Caller (gsl_tools._describe_results_text) appends this before the source line.
     """
     lines = []
-    verdict = postcheck_result.get("verdict", "PASS")
+    verdict = postcheck_result.get("verdict", "WARN")
     sf = postcheck_result.get("sf_used")
     mat_class = postcheck_result.get("mat_class", "general")
+    confidence = postcheck_result.get("confidence", "insufficient")
     anchor = postcheck_result.get("anchor_stress_mpa")
     div_ratio = postcheck_result.get("divergence_ratio")
 
-    lines.append(f"\nAdvisor verdict ({mat_class}, SF={sf:.1f}): {verdict}")
+    sf_text = f"{sf:.1f}" if isinstance(sf, (int, float)) and math.isfinite(sf) else "unknown"
+    lines.append(
+        f"\nAdvisor verdict ({mat_class}, SF={sf_text}, confidence={confidence}): {verdict}"
+    )
 
     if anchor is not None:
         if div_ratio is not None and (
             div_ratio > DIVERGENCE_WARN_RATIO or div_ratio < 1.0 / DIVERGENCE_WARN_RATIO
         ):
             lines.append(
-                f"  Beam anchor: {anchor:.2f} MPa — FEA diverges {div_ratio:.1f}×; verify BCs."
+                f"  Beam anchor: {anchor:.2f} MPa — ratio {div_ratio:.3g}; verify BCs/units/mesh."
             )
         else:
-            lines.append(f"  Beam anchor: {anchor:.2f} MPa — consistent with FEA.")
+            lines.append(f"  Beam anchor: {anchor:.2f} MPa — same order of magnitude as FEA.")
     else:
-        lines.append("  Beam anchor: not computed (geometry not beam-like or data missing).")
+        lines.append("  Beam anchor: not computed (geometry/load mapping not justified).")
 
     for it in postcheck_result.get("items", []):
-        if it.get("check") in ("sim_margin", "sim_divergence") and it.get("severity") != "info":
+        if it.get("check") in ("sim_margin", "sim_divergence", "sim_mesh") \
+                and it.get("severity") != "info":
             lines.append(f"  [{it['severity'].upper()}] {it['finding']}")
 
     return "\n".join(lines)

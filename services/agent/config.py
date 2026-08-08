@@ -592,6 +592,15 @@ DEFAULT_TOOL_FAMILIES = (
     "shell", "sim", "workspace",
 )
 
+# Families that resolve OFF unless config explicitly enables them (MFG-FAM-1).
+# The Manufacture family reaches real machines — motion, spindle power, heaters —
+# so it is never enabled by omission: not when `agent.role_tools` is absent, not
+# when a role lists it, and not when the family is not yet in
+# DEFAULT_TOOL_FAMILIES. Only an explicit `agent.tool_families.<fam> = true`
+# opens it. Listed here BEFORE its tools exist so no registration wave can ship
+# a default-on machine-control surface.
+DEFAULT_OFF_TOOL_FAMILIES = ("manufacture",)
+
 # ---------------------------------------------------------------------------
 # Per-role default tool families (Settings → AI → Tools)
 # agent.role_tools: { "default": ["cad", "files", ...], "task": [...], ... }
@@ -999,6 +1008,8 @@ def get_tool_families(cfg: dict | None = None) -> dict[str, bool]:
     for fam in DEFAULT_TOOL_FAMILIES:
         if fam in raw and isinstance(raw[fam], bool):
             out[fam] = raw[fam]
+        elif fam in DEFAULT_OFF_TOOL_FAMILIES:
+            out[fam] = False
         elif role_union is not None:
             out[fam] = fam in role_union
         else:
@@ -1006,6 +1017,11 @@ def get_tool_families(cfg: dict | None = None) -> dict[str, bool]:
     for k, v in raw.items():
         if k not in out:
             out[str(k)] = bool(v)
+    # MFG-FAM-1: default-off families stay off unless config says otherwise, even
+    # when they are not (yet) listed in DEFAULT_TOOL_FAMILIES.
+    for fam in DEFAULT_OFF_TOOL_FAMILIES:
+        if not (fam in raw and isinstance(raw[fam], bool)):
+            out[fam] = False
     return out
 
 

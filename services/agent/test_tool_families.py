@@ -6,9 +6,14 @@ import services.mcp.tool_registry as reg
 
 
 def test_get_tool_families_defaults_all_on():
+    """Every family is on by omission, except the explicit default-off set."""
     fams = cfg.get_tool_families({})
     assert fams
-    assert all(fams.values())
+    for fam, on in fams.items():
+        if fam in cfg.DEFAULT_OFF_TOOL_FAMILIES:
+            assert on is False, f"{fam} must stay off by omission"
+        else:
+            assert on is True, f"{fam} regressed to default-off"
     assert "cad" in fams and "em" in fams
 
 

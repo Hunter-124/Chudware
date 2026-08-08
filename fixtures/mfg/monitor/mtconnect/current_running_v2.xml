@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:2.0" xmlns:vendor="urn:example:vendor">
+  <Header creationTime="2026-08-08T12:00:01Z" sender="fixture-agent" instanceId="42" firstSequence="1" lastSequence="4" nextSequence="5"/>
+  <Streams>
+    <DeviceStream name="mill-one" uuid="urn:uuid:11111111-2222-3333-4444-555555555555">
+      <ComponentStream component="Device" name="mill-one" componentId="d1">
+        <Events>
+          <Availability dataItemId="avail" timestamp="2026-08-08T12:00:00.100000000Z" sequence="1">AVAILABLE</Availability>
+        </Events>
+      </ComponentStream>
+      <ComponentStream component="Controller" name="controller" componentId="ctrl">
+        <Events>
+          <Execution dataItemId="exec" timestamp="2026-08-08T12:00:00.200000000Z" sequence="2">ACTIVE</Execution>
+        </Events>
+        <Condition>
+          <Normal dataItemId="system" timestamp="2026-08-08T12:00:00.400000000Z" sequence="4" nativeCode="0">Normal</Normal>
+        </Condition>
+      </ComponentStream>
+      <ComponentStream component="Linear" name="X" componentId="x">
+        <Samples>
+          <Position dataItemId="x_pos" timestamp="2026-08-08T12:00:00.300000000Z" sequence="3" subType="ACTUAL" vendor:confidence="high">12.5</Position>
+        </Samples>
+      </ComponentStream>
+    </DeviceStream>
+  </Streams>
+</MTConnectStreams>

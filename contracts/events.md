@@ -55,3 +55,39 @@ Rules specific to telemetry events:
 - Producers MUST NOT emit events after their final response line.
 - Consumers MUST tolerate unknown kinds and unknown data keys (skip).
 - `pct` is 0–100 int; omit when indeterminate.
+
+
+### 5.1 Manufacturing subscription-lane amendment (`MFG-SUB-1`, `MFG-OBS-1`)
+
+The §5 prohibition on post-final-response events remains the default. One explicit exception exists:
+an accepted `mfg_device_subscribe` or `mfg_event_subscribe` call establishes a subscription lane. That
+lane MAY emit event-envelope lines after the accepting call's final response for as long as the
+subscription lives. The accepting response carries `{subscribed:true,from_seq}`; reconnecting
+consumers recover durable ordering from `from_seq`/`mfg_event_query`, not from best-effort delivery.
+
+A connection whose first `hello` declares `client:"observer"` may read, query, and establish these
+lanes, but MUST reach no write dispatch path, may not own a command lease, and may not issue run or
+approval mutations. Unknown event kinds remain skippable.
+
+### 5.2 Manufacturing gateway kinds (`mfg.*`)
+
+| kind | data |
+|---|---|
+| `mfg.gateway.epoch` | `{epoch,process_start_id,epoch_floor_seq,reconciled:{falsified,superseded,invariant}}` |
+| `mfg.device.state` | `{device_id,state:FreshValue<DeviceState>,raw}` |
+| `mfg.device.snapshot` | `{device_id,snapshot:FreshValue<ControllerSnapshot>}` |
+| `mfg.device.alarm` | `{device_id,alarm:{code,class,text},raw}` |
+| `mfg.device.lease` | `{device_id,lease,change:"granted"\|"released"\|"expired"\|"preempted"}` |
+| `mfg.device.foreign_client_detected` | `{device_id,evidence}` |
+| `mfg.device.capability_changed` | `{device_id,capability:CapabilityReport,downgraded[]}` |
+| `mfg.run.state` | `{run_id,state,at_seq,cause}` |
+| `mfg.run.gate_report` | `{run_id,gate_report_ref,verdict,rejecting[]}` |
+| `mfg.approval.issued` | `{approval_id,run_id,at_seq}` |
+| `mfg.approval.burned` | `{approval_id,run_id,initiator,at_seq}` |
+| `mfg.approval.revoked` | `{approval_id,run_id?,initiator?,at_seq}` |
+| `mfg.result.falsified` | `{class:"falsified",reason,why,affected[],at_seq}` |
+| `mfg.result.superseded` | `{class:"superseded",reason,why,affected[],at_seq,superseded_by}` |
+
+All durable seq values originate in the gateway journal. Consumers branch on invalidation `class`,
+never on the event name. Invalidation applies only to affected rows with `seq<=at_seq`; falsification
+clears, while supersession retains and points forward.

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:9.9">
+  <Header creationTime="2026-08-08T12:00:00Z" sender="future-agent" instanceId="99" firstSequence="1" lastSequence="1" nextSequence="2"/>
+  <Streams/>
+</MTConnectStreams>

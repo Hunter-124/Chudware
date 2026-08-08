@@ -594,3 +594,65 @@ The `message` value and every entry in a compaction's `messages` array are the v
 uncapped provider message dictionaries. Nothing in this raw log is ever truncated, summarized,
 or pruned. It is distinct from the display transcript, `<id>.transcript.jsonl`, which remains a
 human-readable lifecycle-and-reply stream.
+
+
+## 7. Manufacturing gateway (mfg_*)
+
+This section amends §5.1 and allocates all manufacturing sections. The `hello.params.client`
+vocabulary additionally accepts `observer`. An observer connection may use read/query/subscribe
+methods, but MUST reach no write dispatch path, cannot claim a `commander` lease, and cannot issue a
+run or approval mutation (`MFG-OBS-1`).
+
+Every gateway response uses the structured error envelope from `contracts/doc_ops.md` §5. Successful
+results carry `result_seq` and `epoch`; every referenceable result row carries its establishing
+durable `seq`. Canonical shared types and full schemas are in
+`contracts/manufacturing_gateway.md`.
+
+| method | params → result |
+|---|---|
+| `mfg_device_list` | `{}` → `{devices:[{device_id,machine_class,state,capability_summary,lease}]}` |
+| `mfg_device_describe` | `{device_id}` → `{identity,fingerprint_sha256,capability,transport,policy}` |
+| `mfg_device_claim` | `{device_id,role:"commander"|"observer",ttl_ms?}` → `{lease}` or Tier-0 refusal |
+| `mfg_device_release` | `{lease_id}` → `{released:true}` |
+| `mfg_device_heartbeat` | `{lease_id}` → `{lease,ttl_ms}` |
+| `mfg_device_snapshot` | `{device_id}` → `{snapshot:FreshValue<ControllerSnapshot>,raw}` |
+| `mfg_device_subscribe` | `{device_id,kinds[]}` → `{subscribed:true,from_seq}` and establishes a subscription lane |
+| `mfg_capability_report` | `{device_id}` → `CapabilityReport` |
+| `mfg_policy_get` | `{device_id}` → `{machine_class,attendance_allowed[],spindle_authority,max_exercisable_by,emulator_stage_passed}` |
+| `mfg_run_propose` | `{device_id,artifact:{path\|bytes_ref,kind},job,snapshot}` → `{run_id,state:"draft",tier0,gate_report_ref}` |
+| `mfg_run_submit` | `{run_id}` → `{state:"awaiting_approval"\|"draft",gate_report_ref}` |
+| `mfg_approval_issue` | `{run_id,approver_auth,exercisable_by,expiry_ttl_ms,attendance,spindle_confirmation?}` → `ApprovalBinding`; human seats only |
+| `mfg_approval_revoke` | `{approval_id,reason}` → `{revoked:true,at_seq}` plus falsification push |
+| `mfg_approval_describe` | `{approval_id}` → frozen `ApprovalBinding` |
+| `mfg_run_start` | `{run_id,approval_id,initiator}` → `{state,nonce_burned_at_seq,gate_report_ref}` or named refusal |
+| `mfg_run_hold` | `{run_id,kind:"feed_hold"\|"controlled_stop"\|"door_suspend",initiator}` → `{state,at_seq}` |
+| `mfg_run_resume` | `{run_id,initiator}` → `{state}` or named no-resume refusal |
+| `mfg_run_abort` | `{run_id,initiator}` → `{state:"aborting"}` |
+| `mfg_run_describe` | `{run_id}` → `{state,approval_id,initiator,gate_report_ref,artifact_hash,timeline_from_seq}` |
+| `mfg_run_list` | `{device_id?,state?,limit?}` → `{runs[]}` |
+| `mfg_event_query` | `{from_seq,kinds[]?,subject?,limit?}` → `{records[],head_seq,waiver_rates}` |
+| `mfg_event_subscribe` | `{from_seq,kinds[]?}` → `{subscribed:true,from_seq}` and establishes a subscription lane |
+| `mfg_tier0_register` | `{domain_id,schema_version,rows[]}` → `{registered,rejected[],totality,at_seq}` |
+| `mfg_event_append` | `{domain_id,kind,subject,result_kind,body,raw?,derived_from?}` → `{seq,epoch,ref}` |
+| `mfg_result_invalidate` | `{domain_id,class,reason,why,affected[],superseded_by?}` → `{at_seq}` |
+
+`mfg_run_propose` and `mfg_run_submit` never touch a device. No method in this section jogs, homes,
+zeroes, unlocks, changes an override, or writes controller settings.
+
+### Manufacturing section allocation (`MFG-SECT-1`)
+
+The contract is append-only. Each domain owns exactly its allocated future section; no domain chooses
+another number.
+
+| section | domain | contents |
+|---|---|---|
+| `## 7. Manufacturing gateway (mfg_*)` | gateway | gateway methods above |
+| `## 8. Manufacturing monitor (read-only)` | monitoring | `mfg_monitor_*` |
+| `## 9. Manufacturing cutting` | cutting | `mfg_cut_*` |
+| `## 10. Manufacturing turning` | turning | `mfg_turn_*` |
+| `## 11. Manufacturing PnP` | PnP | `mfg_pnp_*` |
+| `## 12. Manufacturing robot` | robot | `mfg_robot_*` |
+| `## 13. Manufacturing twin` | twin | `mfg_twin_*` |
+| `## 14. Manufacturing additive` | additive | `mfg_print_*` |
+| `## 15. Manufacturing metrology` | metrology | `mfg_metrology_*` |
+| `## 16. Manufacturing perception` | perception | `mfg_perception_*` |

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectDevices xmlns="urn:mtconnect.org:MTConnectDevices:2.0" xmlns:vendor="urn:example:vendor" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Header creationTime="2026-08-08T12:00:00Z" sender="fixture-agent" instanceId="42" version="2.0.0"/>
+  <Devices>
+    <Device id="d1" name="mill-one" uuid="urn:uuid:11111111-2222-3333-4444-555555555555">
+      <Description manufacturer="Fixture Works">Deterministic monitor fixture</Description>
+      <DataItems>
+        <DataItem id="avail" name="availability" category="EVENT" type="AVAILABILITY"/>
+      </DataItems>
+      <Components>
+        <Controller id="ctrl" name="controller">
+          <DataItems>
+            <DataItem id="exec" name="execution" category="EVENT" type="EXECUTION"/>
+            <DataItem id="system" name="system" category="CONDITION" type="SYSTEM"/>
+          </DataItems>
+        </Controller>
+        <Linear id="x" name="X">
+          <DataItems>
+            <DataItem id="x_pos" name="Xact" category="SAMPLE" type="POSITION" subType="ACTUAL" nativeUnits="MILLIMETER" vendor:channel="primary"/>
+          </DataItems>
+        </Linear>
+      </Components>
+    </Device>
+  </Devices>
+</MTConnectDevices>

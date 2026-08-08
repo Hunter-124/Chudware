@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:2.0">
+  <Header sender="broken-agent" instanceId="1">
+  <Streams>
+</MTConnectStreams>

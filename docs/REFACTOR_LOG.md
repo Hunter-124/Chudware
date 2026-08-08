@@ -6867,3 +6867,47 @@ simulation tests passed (5 optional skips), 173 end-to-end MCP workflow tests pa
 EM suite passing against the installed openEMS full-wave backend, all 15 focused native targets
 passed, and the live audit at 42/43 executed with its heavy openEMS leg intentionally skipped and
 zero broken findings.
+
+## 2026-08-08 — Manufacturing overhaul, phase P1/P2 foundation
+
+The Manufacture overhaul (real machine control, deterministic physical twin, additive with an
+internally modifiable slicer, probing/metrology, a home-grown predictive perception model, and the
+breadth tracks) now has a persisted design corpus under `docs/manufacturing/` — `README.md` is the
+index, `01_definition_of_done.md` the 20 acceptance criteria, `10_gateway.md` the schema authority
+that owns every shared type and the `MFG-*` rule ids the other documents cite.
+
+Landed this phase. `services/agent/config.py` gained `DEFAULT_OFF_TOOL_FAMILIES`, so the
+`manufacture` family resolves OFF by omission — with no config, with `role_tools` present and
+silent, with a role listing it, and even before the family joins `DEFAULT_TOOL_FAMILIES` (that
+entry lands with the first Manufacture tool, because `test_registration_catalog` forbids a phantom
+family). `contracts/manufacturing_gateway.md` is the new canonical contract; `contracts/worker_rpc.md`
+and `contracts/events.md` took append-only sections plus the `observer` client kind and the
+subscription-lane amendment. `core/device/{device_id,controller_snapshot,capability,transport}.h`
+carry identity minting, `MachineFingerprint`, the canonical `DeviceState`/`RunState` strings with a
+transition validator that refuses transparent resume after reset/alarm/hard-limit/disconnect, the
+capability truth vocabulary, and a read-only/command transport split with no I/O. `core/manufacturing/`
+adds the sole `FreshValue<T>` codec (null-unless-ok, gap→unknown, `ttl_ms:null` for non-decaying
+durable rows), a single-writer append-only JSONL journal that is the only source of durable `seq`
+(torn-tail recovery, monotonic reopen, replay), a total durable-result-kind registry over all ten
+domains including each `<domain>.capability`, and the idempotent `at_seq`-scoped falsified/superseded
+engine. `core/device/grbl_protocol.{h,cpp}` is a pure syscall-free Grbl 1.1 codec (status fields,
+full error/alarm tables, setting maps, realtime bytes, character-counting RX accounting) with raw-line
+retention and explicit refusal on malformed input.
+
+Python side: `services/manufacturing/slicer/**` is the arms-length PrusaSlicer sidecar seam —
+request/result/provenance, deterministic profile hashing, an AGPL corresponding-source manifest
+verifier, and `fixtures/mfg/print/fake_slicer.py` so tests never need the real binary;
+`services/manufacturing/monitor/**` parses MTConnect read-only into canonical rows with
+UNAVAILABLE/gap→unknown, falsify + retain-as-last-ok conditions, and a structural test proving no
+command path exists; `services/perception/**` + `training/perception/**` implement the
+Forecast-to-Compress MLDP — numpy reference forward pass, optional Torch parity, multi-horizon and
+uncertainty heads, variance-normalized surprise, advisory-only evidence packets, dataset manifests
+that reject missing consent/license/redaction fields, and a fixed-seed CPU train/eval path.
+
+Gates: `test_mfg_foundation` 329 assertions and `test_grbl_protocol` 16,011 assertions pass;
+`pytest services/manufacturing services/perception training/perception` is 45 passed / 1 skipped
+(optional `onnx` absent); `scripts/check.py` all 8 gates PASS.
+
+Deferred by design, not omission: no transport opens a device, no arbiter/lease/approval path exists
+yet, no MCP tool is registered, and nothing advertises physical `execute` — that is phases P3–P7,
+and P7 is hardware-attended.

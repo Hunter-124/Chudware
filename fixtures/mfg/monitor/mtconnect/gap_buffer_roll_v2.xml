@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:2.0">
+  <Header creationTime="2026-08-08T12:00:04Z" sender="fixture-agent" instanceId="42" firstSequence="20" lastSequence="20" nextSequence="21"/>
+  <Streams>
+    <DeviceStream name="mill-one" uuid="urn:uuid:11111111-2222-3333-4444-555555555555">
+      <ComponentStream component="Linear" name="X" componentId="x">
+        <Samples>
+          <Position dataItemId="x_pos" timestamp="2026-08-08T12:00:04.000000000Z" sequence="20">99.0</Position>
+        </Samples>
+      </ComponentStream>
+    </DeviceStream>
+  </Streams>
+</MTConnectStreams>

@@ -2174,3 +2174,30 @@ if(TARGET test_nsolve)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME motion_dynamics COMMAND test_motion_dynamics)
 endif()
+
+# Manufacturing gateway foundation and pure Grbl codec. This library deliberately contains no
+# transport implementation or physical execute path.
+add_library(chudware_manufacturing STATIC
+  device/grbl_protocol.cpp
+  manufacturing/journal.cpp
+  manufacturing/result_registry.cpp
+  manufacturing/invalidation.cpp)
+target_compile_features(chudware_manufacturing PUBLIC cxx_std_20)
+target_include_directories(chudware_manufacturing PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_manufacturing PUBLIC nlohmann_json::nlohmann_json)
+
+add_executable(test_mfg_foundation tests/test_mfg_foundation.cpp)
+target_include_directories(test_mfg_foundation PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_mfg_foundation PRIVATE chudware_manufacturing)
+set_target_properties(test_mfg_foundation PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_mfg_foundation COMMAND test_mfg_foundation)
+
+add_executable(test_grbl_protocol tests/test_grbl_protocol.cpp)
+target_include_directories(test_grbl_protocol PRIVATE ${doctest_SOURCE_DIR})
+target_compile_definitions(test_grbl_protocol PRIVATE
+  CHUDWARE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_link_libraries(test_grbl_protocol PRIVATE chudware_manufacturing)
+set_target_properties(test_grbl_protocol PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_grbl_protocol COMMAND test_grbl_protocol)

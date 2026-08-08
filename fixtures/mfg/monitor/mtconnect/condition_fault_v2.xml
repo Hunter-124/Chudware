@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:2.0">
+  <Header creationTime="2026-08-08T12:00:03Z" sender="fixture-agent" instanceId="42" firstSequence="1" lastSequence="5" nextSequence="6"/>
+  <Streams>
+    <DeviceStream name="mill-one" uuid="urn:uuid:11111111-2222-3333-4444-555555555555">
+      <ComponentStream component="Controller" name="controller" componentId="ctrl">
+        <Condition>
+          <Fault dataItemId="system" timestamp="2026-08-08T12:00:02.000000000Z" sequence="5" nativeCode="E42" nativeSeverity="CRITICAL" qualifier="HIGH">Fixture spindle fault</Fault>
+        </Condition>
+      </ComponentStream>
+    </DeviceStream>
+  </Streams>
+</MTConnectStreams>

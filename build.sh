@@ -97,17 +97,27 @@ report_engine_staleness() {
             echo "[build]       ninja -C core/build-linux bin/libchudware.so   # or ./build.sh all"
         fi
     done
-    # The daemon is a SEPARATE binary that links the same core libs, so every core
-    # source (hostd/ included) is one of its inputs. It went unchecked entirely until
-    # 2026-07-30, when a user hit duplicate "AI: <part>"/"<part>2" tabs against a
-    # four-day-old chudware-hostd while libchudware.so was current.
+    # The daemon is a SEPARATE executable that dlopens the staged libchudware; it does not
+    # link the engine's simulation/modeling objects (see the chudware-hostd target below).
+    # Only daemon sources and its CppCore loader can make the executable stale. Comparing
+    # every engine source here made a successful lib-only rebuild permanently fail this
+    # gate even though the fresh library is the artifact that contains those changes.
     for consumer in "$ROOT/core/build-occt-linux/bin/chudware-hostd" \
                     "$ROOT/core/build-linux/bin/chudware-hostd" \
                     "$ROOT/services/dist/Chudware/chudware-hostd"; do
         [ -f "$consumer" ] || continue
-        hit="$(find "$ROOT/core" -type d -name 'build*' -prune -o \
+        hit="$(find "$ROOT/core/hostd" -type f \
                 \( -name '*.cpp' -o -name '*.h' \) -newer "$consumer" -print -quit \
                 2>/dev/null || true)"
+        if [ -z "$hit" ]; then
+            for input in "$ROOT/services/worker/cpp_core.cpp" \
+                         "$ROOT/services/worker/cpp_core.h"; do
+                if [ -f "$input" ] && [ "$input" -nt "$consumer" ]; then
+                    hit="$input"
+                    break
+                fi
+            done
+        fi
         if [ -n "$hit" ]; then
             stale=1
             echo "[build] WARN: STALE DAEMON ${consumer#"$ROOT"/} is older than ${hit#"$ROOT"/}."

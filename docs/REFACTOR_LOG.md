@@ -6782,19 +6782,6 @@ clean `./build.sh`, `test_cam_mirror PASS`, theme lint at zero findings, and the
 `CHUDWARE_SHOT=cam` flow: part revision 1, CAM doc `cam1`, 3 operations, 394 NC lines, framed
 simulation loaded, 95.5 s playback, and a successful 1340x838 capture.
 
-## 2026-08-07 — Parts Library live sourcing reliability
-
-The Parts Library scraper now discovers the shipped lowercase CEF host, bounds live vendor
-navigation three-wide, keeps transient failures out of the vendor-result cache, and reports failed
-vendors with correct attribution instead of a false done state. Ten drifted vendor adapters were
-live-refreshed against their current routes and rendered markup; HIWIN uses its cached public
-sitemap and Future Electronics uses same-origin autocomplete where the normal result surface is
-not capturable. A full uncached sweep exercised all 59 adapters: 42 returned usable results, 16
-honestly reported login/challenge/bot-wall degradation, and the sole parser miss was fixed and
-rechecked. The standard-parts benchmark indexed 3,184 records in 61.8 ms cold / 5.9 ms warm,
-searched in 0.66 ms mean with MRR 1.0 and 20/20 hits, and the isolated browser/parts gate passed
-801 tests with 81 live-only skips. A real nine-vendor bearing search painted results in 4.4 s cold
-and 52.6 ms warm, while the Parts Library headless workspace smoke produced a 1340x838 capture.
 ## 2026-08-07 — harness policy audit: one effective prompt, grant, and child-lane contract
 
 A parallel read-only audit of rules, skills, prompts, dispatch, budgets, guardrails, and
@@ -6823,6 +6810,20 @@ reviewer no-tool-one-shot refusal, prompt override isolation, global prompt/outp
 skill role gates, cross-process pack creation, and xAI/OpenRouter tier normalization. The
 focused contract gate passed 317 tests; an actual prompt-preview smoke rendered 24 effective
 tools in 22,660 characters with no fictional ledger/stage blocks.
+
+## 2026-08-07 — Parts Library live sourcing reliability
+
+The Parts Library scraper now discovers the shipped lowercase CEF host, bounds live vendor
+navigation three-wide, keeps transient failures out of the vendor-result cache, and reports failed
+vendors with correct attribution instead of a false done state. Ten drifted vendor adapters were
+live-refreshed against their current routes and rendered markup; HIWIN uses its cached public
+sitemap and Future Electronics uses same-origin autocomplete where the normal result surface is
+not capturable. A full uncached sweep exercised all 59 adapters: 42 returned usable results, 16
+honestly reported login/challenge/bot-wall degradation, and the sole parser miss was fixed and
+rechecked. The standard-parts benchmark indexed 3,184 records in 61.8 ms cold / 5.9 ms warm,
+searched in 0.66 ms mean with MRR 1.0 and 20/20 hits, and the isolated browser/parts gate passed
+801 tests with 81 live-only skips. A real nine-vendor bearing search painted results in 4.4 s cold
+and 52.6 ms warm, while the Parts Library headless workspace smoke produced a 1340x838 capture.
 
 ## 2026-08-07 — Webservice settings, provider auth, and rollout hardening
 

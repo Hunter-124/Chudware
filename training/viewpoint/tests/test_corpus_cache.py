@@ -44,10 +44,13 @@ def test_cache_hit_is_bit_identical_to_fresh_generation(tmp_path):
     _assert_batches_identical(hit.batch, fresh)
 
 
-def test_every_addressed_generator_input_changes_the_key():
+def test_every_addressed_generator_input_misses_the_cache(tmp_path):
     config = CorpusConfig(parts=3, examples_per_part=1, candidates=3, seed=23, image_size=(32, 32))
     base = corpus_inputs("full", config, part_indices=(0, 1, 2))
-    base_key = cache_key(base)
+    batch = generate_oracle_corpus_for_indices(config, (0, 1, 2), workers=1)
+    cache_dir = tmp_path / "cache"
+    initial = load_or_build(base, lambda: batch, cache_dir=cache_dir)
+    assert not initial.hit
 
     changes = (
         {**base, "part_count": 4},
@@ -62,8 +65,10 @@ def test_every_addressed_generator_input_changes_the_key():
         {**base, "generator_config": replace(config, examples_per_part=2)},
         {**base, "generator_config": replace(config, image_size=(64, 32))},
     )
-    assert all(cache_key(changed) != base_key for changed in changes)
-    assert len({cache_key(changed) for changed in changes}) == len(changes)
+    misses = [load_or_build(changed, lambda: batch, cache_dir=cache_dir) for changed in changes]
+    assert all(not result.hit for result in misses)
+    assert all(result.key != initial.key for result in misses)
+    assert len({result.key for result in misses}) == len(changes)
 
 
 def test_cuda_corpus_is_bit_identical_to_numpy_reference():

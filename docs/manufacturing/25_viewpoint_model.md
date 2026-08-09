@@ -48,10 +48,15 @@ python3 -X utf8 -m training.viewpoint.information \
   --output-report training/viewpoint/information_asymmetry_report.json
 ```
 
-`train`, `scale`, `information`, and `sequential` select `cuda` by default when optional Torch
-reports CUDA available; otherwise they select `cpu`. Each prints `DEVICE: <actual>` before its
-report, records the actual device in JSON, and rejects an unavailable explicit CUDA request rather
-than silently calling the run a GPU run. `--device cpu` is the reference-path override.
+`train`, `scale`, `information`, and `sequential` select `cuda` for oracle/evaluation work by
+default when optional Torch reports CUDA available; otherwise they select `cpu`. Each prints both
+`DEVICE: <actual>` and `fit_backend: <actual>` and records them in JSON, so the mixed reference
+configuration cannot masquerade as an all-GPU run. Published headline numbers use CUDA for the
+expensive, bit-identical oracle batches and `torch-cpu` with four threads for the deterministic fit
+reference. `--device cpu` forces the NumPy oracle reference. `--fit-device cuda` keeps a fully
+deterministic fixed-seed CUDA-fit path for exploration (`CUBLAS_WORKSPACE_CONFIG=:4096:8` and
+`torch.use_deterministic_algorithms(True)`), but its numbers are not comparable to the CPU-fit
+reference.
 
 Generated corpora are content-addressed under `scratch/viewpoint-cache/`. The address includes the
 complete generator configuration and part indices, including part count, seed, sampler, candidate
@@ -64,6 +69,52 @@ The runtime sets `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, a
 the caller has not set them. It caps worker processes at six. CUDA corpus and sequential evaluation
 use one host process so they do not create competing CUDA contexts; that process batches all
 candidate oracle requests for a scene onto the GPU.
+
+The fit backend is part of result provenance, not an interchangeable implementation detail. On the
+same bit-identical 5,000-part corpus, the exploratory CUDA fit moved validation aggregate from
+0.468744 to 0.459555 and locked-test policy aggregate from 0.403032 to 0.402567. Repeating that CUDA
+fit at a fixed seed is bit-identical, but changing fit backend changes floating-point reduction order
+and the optimization trajectory. The roughly 0.009 validation swing is useful scale for interpreting
+any single run's third decimal.
+
+The controlled before/after timing used the same seed, 120 epochs, 2,000 bootstrap samples, and a
+one-point 50-part ladder. The reduced ladder was deliberate: it measures both backends without
+repeating a workstation-hostile full CPU sweep. `CPU%` is GNU `time` process CPU utilization, so it
+also shows the load left on the host; CUDA rows still include corpus assembly, Torch CPU fitting, and
+NumPy policy inference.
+
+| command | corpus path | actual oracle device | wall seconds | CPU% |
+|---|---|---|---:|---:|
+| `scale` | cold reference | CPU / NumPy | 89.57 | 65% |
+| `scale` | cold accelerated | CUDA | 111.32 | 134% |
+| `scale` | warm content cache | CUDA selected; no oracle recompute | 52.61 | 278% |
+| `information` | cold reference | CPU / NumPy | 112.42 | 53% |
+| `information` | cold accelerated | CUDA | 73.42 | 104% |
+| `information` | warm content cache | CUDA selected; no corpus oracle recompute | 23.53 | 115% |
+
+The reduced `scale` corpus is too small to amortize CUDA startup and the deliberately single CUDA
+host process, so its cold wall time is slower even though it avoids the six-process CPU load. The
+limited-information command is 1.53× faster cold, and its warm cache is 4.78× faster than the cold
+CPU reference. After removing only device/backend provenance and output paths, CPU, cold-CUDA, and
+warm-CUDA result payloads have zero differing numeric values.
+
+The full standard commands above were also rerun with the mixed reference defaults. The warm-cache
+`scale` run took 130.45 seconds and reproduced the prior result subtree exactly: zero differing lines,
+including 0.46874353289604187 validation aggregate and 0.4030321204301083 locked-test policy
+aggregate. The resumed `information` result-producing stage took 451.13 seconds after corpus
+generation had populated the cache; it reproduced the validation curve exactly and emitted the
+documented one-look aggregates. Both commands printed:
+
+```text
+DEVICE: cuda
+fit_backend: torch-cpu
+```
+
+What remains CPU-bound is explicit: procedural part construction, candidate-set construction,
+observation rendering and encoding, cache serialization, bootstrap/report assembly, the published
+Torch CPU fit, and NumPy policy scoring/selection. Ray-triangle oracle labels—including full
+best-of-N pools and the K-look candidate pool—are the GPU-intensive portion. A warm-cache run does
+not recompute those labels, so fitting and policy/report work dominate its CPU percentage.
 
 The full-information expansion keeps the original 50 × 6 × 32 training rows unchanged and adds one
 8-candidate target row per new part. Validation and locked test remain 11 × 6 × 32 at 320 px. The

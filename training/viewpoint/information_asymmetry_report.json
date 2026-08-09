@@ -1,4 +1,51 @@
 {
+  "corpus_cache": [
+    {
+      "key": "767511ac1a1e3aa259dde7dc21a2ccc06a2a19ed138a889be99827dd07ea3db8",
+      "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/limited-767511ac1a1e3aa259dde7dc21a2ccc06a2a19ed138a889be99827dd07ea3db8.npz",
+      "status": "hit"
+    },
+    {
+      "key": "7113abe6f6a1de3f85282141ebc066de7c250015e0c8fb24fa3ca009f251a0d2",
+      "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/limited-7113abe6f6a1de3f85282141ebc066de7c250015e0c8fb24fa3ca009f251a0d2.npz",
+      "status": "hit"
+    },
+    {
+      "key": "02677eb517b71bcb744ba69529ba8f45debd15c15d4fa4630d7166fabe3a9a09",
+      "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/limited-02677eb517b71bcb744ba69529ba8f45debd15c15d4fa4630d7166fabe3a9a09.npz",
+      "status": "hit"
+    },
+    {
+      "key": "da049add89d1f8f5aeaaa95b955707597e3e11373b1d67314f52f81137888f9f",
+      "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/limited-da049add89d1f8f5aeaaa95b955707597e3e11373b1d67314f52f81137888f9f.npz",
+      "status": "hit"
+    },
+    {
+      "key": "81e108247a639cc31d695fb4251d8c25d63154253a367d074c36e906e4cd1a3c",
+      "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/limited-81e108247a639cc31d695fb4251d8c25d63154253a367d074c36e906e4cd1a3c.npz",
+      "status": "hit"
+    },
+    {
+      "key": "9d5647839dfc403bf114ebf3c2bb443a3b77f388e4bb5006a4ba8452676c40a1",
+      "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/limited-9d5647839dfc403bf114ebf3c2bb443a3b77f388e4bb5006a4ba8452676c40a1.npz",
+      "status": "miss"
+    },
+    {
+      "key": "493c78e032918a4206fd895405248728a03b6b04fe1a8e83e801622d6a90e840",
+      "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/limited-493c78e032918a4206fd895405248728a03b6b04fe1a8e83e801622d6a90e840.npz",
+      "status": "miss"
+    },
+    {
+      "key": "5d2cd4c0134e970c19e54dd6c3ffe07015aa584ea18daf23c341fec010772858",
+      "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/limited-5d2cd4c0134e970c19e54dd6c3ffe07015aa584ea18daf23c341fec010772858.npz",
+      "status": "miss"
+    },
+    {
+      "key": "29472427784be55ae021f69f6e037fb03bce460978060175be89819286985816",
+      "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/limited-29472427784be55ae021f69f6e037fb03bce460978060175be89819286985816.npz",
+      "status": "miss"
+    }
+  ],
   "information_boundary": {
     "common_initial_observation": true,
     "oracle_input": "full analytic mesh, exact feature, and all candidate evaluations",
@@ -1328,6 +1375,12 @@
   "seed": 1729,
   "sequential_matched_budget": {
     "depth_only": {
+      "additional_render_budgets": [
+        1,
+        2,
+        4,
+        8
+      ],
       "bootstrap_samples": 2000,
       "bootstrap_unit": "part_id",
       "budget_unit": "additional camera render after the common initial observation",
@@ -1446,8 +1499,8 @@
               "fixed_isometric_aggregate": 0.4724987920592813,
               "full_information_oracle": 0.7805334329605103,
               "parts": 11,
-              "policy_aggregate": 0.5612441949984607,
-              "policy_oracle_regret": 0.2192892660112942,
+              "policy_aggregate": 0.5626322293982786,
+              "policy_oracle_regret": 0.21790123161147623,
               "random_aggregate": 0.4724987920592813
             },
             "hard": {
@@ -1464,8 +1517,8 @@
               "fixed_isometric_aggregate": 0.2729894968991478,
               "full_information_oracle": 0.48371806740760803,
               "parts": 10,
-              "policy_aggregate": 0.329969165691485,
-              "policy_oracle_regret": 0.15374889923259616,
+              "policy_aggregate": 0.3307317450332145,
+              "policy_oracle_regret": 0.15298631989086667,
               "random_aggregate": 0.2729894968991478
             }
           },
@@ -1482,14 +1535,14 @@
             }
           },
           "full_information_oracle_regret": {
-            "mean": 0.20056007334002943,
+            "mean": 0.19992524774914439,
             "mean_ci": [
-              0.14303169441973848,
-              0.24860972124292993
+              0.1418473480551532,
+              0.24843098162955632
             ],
             "quantiles": {
               "max": 0.8544538021087646,
-              "median": 0.020949244499206543,
+              "median": 0.001971632242202759,
               "min": 0.0,
               "p10": 0.0,
               "p25": 0.0,
@@ -1510,7 +1563,7 @@
             }
           },
           "policy": {
-            "aggregate": 0.33560416164497536,
+            "aggregate": 0.3362389872358604,
             "quantiles": {
               "max": 0.844963550567627,
               "median": 0.45995137095451355,
@@ -1533,16 +1586,16 @@
               "p90": 0.5845647752285004
             },
             "diagnosis": "higher mean from infrequent larger wins",
-            "mean_delta": 0.034900580448183144,
+            "mean_delta": 0.03553540603906819,
             "mean_delta_ci": [
-              -0.05268205804185885,
-              0.10509369414807719
+              -0.052179220526225166,
+              0.10581436246972183
             ],
-            "mean_loss_magnitude": 0.34730008900875137,
-            "mean_win_magnitude": 0.5331522321535481,
-            "policy_aggregate": 0.33560416164497536,
-            "strict_loss_rate": 0.3181818181818182,
-            "strict_win_rate": 0.2727272727272727,
+            "mean_loss_magnitude": 0.3634852642193437,
+            "mean_win_magnitude": 0.5060548464718618,
+            "policy_aggregate": 0.3362389872358604,
+            "strict_loss_rate": 0.30303030303030304,
+            "strict_win_rate": 0.2878787878787879,
             "tie_rate": 0.4090909090909091
           }
         },
@@ -1553,8 +1606,8 @@
               "fixed_isometric_aggregate": 0.706626460832708,
               "full_information_oracle": 0.7805334329605103,
               "parts": 11,
-              "policy_aggregate": 0.6674385842155007,
-              "policy_oracle_regret": 0.11309487679425408,
+              "policy_aggregate": 0.7173564328866846,
+              "policy_oracle_regret": 0.06317702812307022,
               "random_aggregate": 0.706626460832708
             },
             "hard": {
@@ -1562,8 +1615,8 @@
               "fixed_isometric_aggregate": 0.32355618000030517,
               "full_information_oracle": 0.42034146189689636,
               "parts": 11,
-              "policy_aggregate": 0.3038603615760803,
-              "policy_oracle_regret": 0.11648112297058105,
+              "policy_aggregate": 0.3276791548728943,
+              "policy_oracle_regret": 0.09266232967376709,
               "random_aggregate": 0.32355618000030517
             },
             "medium": {
@@ -1571,8 +1624,8 @@
               "fixed_isometric_aggregate": 0.37008633092045784,
               "full_information_oracle": 0.48371806740760803,
               "parts": 10,
-              "policy_aggregate": 0.4190678621331851,
-              "policy_oracle_regret": 0.0646502027908961,
+              "policy_aggregate": 0.4142996457715829,
+              "policy_oracle_regret": 0.06941841915249825,
               "random_aggregate": 0.37008633092045784
             }
           },
@@ -1589,10 +1642,10 @@
             }
           },
           "full_information_oracle_regret": {
-            "mean": 0.09676130070830836,
+            "mean": 0.07661529969085347,
             "mean_ci": [
-              0.05312050693865979,
-              0.14053203215201696
+              0.036917125320795816,
+              0.11888642004041959
             ],
             "quantiles": {
               "max": 0.8544538021087646,
@@ -1600,8 +1653,8 @@
               "min": 0.0,
               "p10": 0.0,
               "p25": 0.0,
-              "p75": 0.05811475217342377,
-              "p90": 0.5650450140237808
+              "p75": 0.030594855546951294,
+              "p90": 0.1741972416639328
             }
           },
           "one_shot_random_best": {
@@ -1617,15 +1670,15 @@
             }
           },
           "policy": {
-            "aggregate": 0.4394029342766964,
+            "aggregate": 0.4595489352941513,
             "quantiles": {
               "max": 0.9116832613945007,
-              "median": 0.5648568570613861,
+              "median": 0.5845647752285004,
               "min": 0.0,
               "p10": 0.0,
               "p25": 0.0,
               "p75": 0.7049630880355835,
-              "p90": 0.773943156003952
+              "p90": 0.7835821509361267
             }
           },
           "policy_vs_one_shot_random": {
@@ -1634,23 +1687,23 @@
               "max": 0.6488920450210571,
               "median": 0.0,
               "min": -0.8544538021087646,
-              "p10": -0.12634684145450592,
+              "p10": -0.07534027099609375,
               "p25": 0.0,
               "p75": 0.0,
               "p90": 0.1534654200077057
             },
             "diagnosis": "higher mean from infrequent larger wins",
-            "mean_delta": 0.00025708160617134786,
+            "mean_delta": 0.020403082623626247,
             "mean_delta_ci": [
-              -0.07305801501779843,
-              0.06530801216987041
+              -0.039132745372075006,
+              0.07550190452373388
             ],
-            "mean_loss_magnitude": 0.2839768869536264,
-            "mean_win_magnitude": 0.2661762535572052,
-            "policy_aggregate": 0.4394029342766964,
-            "strict_loss_rate": 0.21212121212121213,
+            "mean_loss_magnitude": 0.22622444977362952,
+            "mean_win_magnitude": 0.2707531233628591,
+            "policy_aggregate": 0.4595489352941513,
+            "strict_loss_rate": 0.18181818181818182,
             "strict_win_rate": 0.22727272727272727,
-            "tie_rate": 0.5606060606060606
+            "tie_rate": 0.5909090909090909
           }
         },
         "8": {
@@ -1762,8 +1815,13 @@
         }
       },
       "candidate_pool": 8,
-      "common_initial_observation": "fixed calibrated isometric camera; excluded from both additional-render budgets",
+      "candidate_pool_exhausted_at": 8,
+      "common_initial_observation": "fixed calibrated isometric camera; counted once for both methods",
+      "common_initial_render_count": 1,
       "confidence": 0.95,
+      "device": "cuda",
+      "fit_backend": "torch-cpu",
+      "fit_stage": "prefit_weights_loaded",
       "generator_version": "viewpoint-mechanical-parts/1.0.0",
       "information_level": "depth_only",
       "look_budgets": [
@@ -2435,7 +2493,9 @@
         ]
       ],
       "one_shot_schedule": "seeded random permutation fixed before any render outcome",
+      "oracle_backend": "cuda",
       "oracle_information": "full geometry and all candidate labels",
+      "policy_backend": "numpy-cpu",
       "policy_schedule": "adaptive; every next camera is scored from the accumulated observation",
       "policy_selection_indices": [
         [
@@ -2475,17 +2535,17 @@
           7,
           2,
           1,
-          6,
-          5
+          5,
+          6
         ],
         [
           1,
           5,
           6,
-          3,
-          2,
           0,
           7,
+          3,
+          2,
           4
         ],
         [
@@ -2534,9 +2594,9 @@
           0,
           4,
           2,
-          6,
+          3,
           5,
-          3
+          6
         ],
         [
           6,
@@ -2561,12 +2621,12 @@
         [
           6,
           4,
+          5,
+          0,
           3,
           1,
-          5,
-          7,
-          0,
-          2
+          2,
+          7
         ],
         [
           7,
@@ -2602,10 +2662,10 @@
           4,
           5,
           0,
-          7,
           1,
-          2,
           6,
+          7,
+          2,
           3
         ],
         [
@@ -2642,10 +2702,10 @@
           6,
           5,
           4,
-          2,
-          3,
-          7,
           0,
+          7,
+          3,
+          2,
           1
         ],
         [
@@ -2670,12 +2730,12 @@
         ],
         [
           2,
-          6,
           5,
           7,
           1,
           4,
           0,
+          6,
           3
         ],
         [
@@ -2695,8 +2755,8 @@
           3,
           7,
           4,
-          6,
-          0
+          0,
+          6
         ],
         [
           6,
@@ -2731,12 +2791,12 @@
         [
           0,
           5,
-          4,
+          2,
           7,
           6,
-          2,
           1,
-          3
+          3,
+          4
         ],
         [
           7,
@@ -2750,22 +2810,22 @@
         ],
         [
           7,
-          3,
-          6,
-          0,
+          2,
           1,
-          5,
+          0,
+          6,
           4,
-          2
+          3,
+          5
         ],
         [
           4,
           1,
           0,
           6,
-          3,
-          7,
           5,
+          7,
+          3,
           2
         ],
         [
@@ -2811,11 +2871,11 @@
         [
           7,
           3,
-          6,
           2,
           1,
           4,
           0,
+          6,
           5
         ],
         [
@@ -2841,11 +2901,11 @@
         [
           7,
           3,
-          2,
+          4,
           5,
           6,
+          2,
           1,
-          4,
           0
         ],
         [
@@ -2872,9 +2932,9 @@
           5,
           3,
           4,
+          6,
           0,
           1,
-          6,
           2,
           7
         ],
@@ -2893,10 +2953,10 @@
           1,
           7,
           2,
-          6,
-          5,
+          4,
           3,
-          4
+          5,
+          6
         ],
         [
           5,
@@ -2905,20 +2965,20 @@
           3,
           0,
           7,
-          1,
-          2
-        ],
-        [
-          5,
           2,
-          7,
-          6,
-          4,
-          0,
-          3,
           1
         ],
         [
+          5,
+          2,
+          1,
+          0,
+          6,
+          7,
+          3,
+          4
+        ],
+        [
           3,
           1,
           2,
@@ -2932,83 +2992,83 @@
           4,
           3,
           7,
+          0,
+          1,
+          2,
+          6,
+          5
+        ],
+        [
+          6,
+          7,
+          0,
           5,
+          3,
+          2,
+          1,
+          4
+        ],
+        [
+          7,
+          4,
+          5,
+          2,
+          1,
+          0,
+          6,
+          3
+        ],
+        [
+          1,
+          5,
+          0,
+          6,
+          2,
+          3,
+          7,
+          4
+        ],
+        [
+          0,
+          1,
+          7,
+          6,
+          4,
+          3,
+          2,
+          5
+        ],
+        [
+          7,
+          3,
+          6,
+          1,
+          2,
+          0,
+          4,
+          5
+        ],
+        [
+          2,
+          1,
+          4,
+          5,
+          0,
+          7,
+          6,
+          3
+        ],
+        [
+          5,
+          4,
+          3,
+          7,
           0,
           1,
           2,
           6
         ],
         [
-          6,
-          7,
-          0,
-          5,
-          3,
-          2,
-          1,
-          4
-        ],
-        [
-          7,
-          4,
-          2,
-          1,
-          0,
-          6,
-          5,
-          3
-        ],
-        [
-          1,
-          5,
-          0,
-          6,
-          2,
-          7,
-          3,
-          4
-        ],
-        [
-          0,
-          1,
-          7,
-          6,
-          4,
-          3,
-          2,
-          5
-        ],
-        [
-          7,
-          2,
-          1,
-          3,
-          6,
-          5,
-          4,
-          0
-        ],
-        [
-          2,
-          1,
-          4,
-          5,
-          0,
-          7,
-          6,
-          3
-        ],
-        [
-          5,
-          4,
-          3,
-          7,
-          0,
-          1,
-          2,
-          6
-        ],
-        [
           0,
           3,
           4,
@@ -3021,24 +3081,24 @@
         [
           4,
           1,
-          5,
-          7,
           3,
           0,
-          2,
-          6
-        ],
-        [
+          5,
+          7,
           6,
-          1,
-          5,
-          3,
-          7,
-          0,
-          4,
           2
         ],
         [
+          6,
+          1,
+          5,
+          3,
+          4,
+          2,
+          0,
+          7
+        ],
+        [
           3,
           2,
           6,
@@ -3050,12 +3110,12 @@
         ],
         [
           0,
-          2,
           3,
           6,
           4,
           1,
           5,
+          2,
           7
         ],
         [
@@ -3099,11 +3159,54 @@
           1
         ]
       ],
+      "render_accounting": {
+        "1": {
+          "common_initial": 1,
+          "one_shot_random_additional": 1,
+          "one_shot_random_total": 2,
+          "policy_additional": 1,
+          "policy_total": 2
+        },
+        "2": {
+          "common_initial": 1,
+          "one_shot_random_additional": 2,
+          "one_shot_random_total": 3,
+          "policy_additional": 2,
+          "policy_total": 3
+        },
+        "4": {
+          "common_initial": 1,
+          "one_shot_random_additional": 4,
+          "one_shot_random_total": 5,
+          "policy_additional": 4,
+          "policy_total": 5
+        },
+        "8": {
+          "common_initial": 1,
+          "one_shot_random_additional": 8,
+          "one_shot_random_total": 9,
+          "policy_additional": 8,
+          "policy_total": 9
+        }
+      },
       "seed": 1729,
       "test_examples": 66,
-      "test_parts": 11
+      "test_parts": 11,
+      "total_render_budgets": [
+        2,
+        3,
+        5,
+        9
+      ],
+      "workers": 1
     },
     "depth_plus_prior": {
+      "additional_render_budgets": [
+        1,
+        2,
+        4,
+        8
+      ],
       "bootstrap_samples": 2000,
       "bootstrap_unit": "part_id",
       "budget_unit": "additional camera render after the common initial observation",
@@ -3222,8 +3325,8 @@
               "fixed_isometric_aggregate": 0.4724987920592813,
               "full_information_oracle": 0.7805334329605103,
               "parts": 11,
-              "policy_aggregate": 0.5280251573113834,
-              "policy_oracle_regret": 0.25250830369837146,
+              "policy_aggregate": 0.5053954720497131,
+              "policy_oracle_regret": 0.2751379889600417,
               "random_aggregate": 0.4724987920592813
             },
             "hard": {
@@ -3240,8 +3343,8 @@
               "fixed_isometric_aggregate": 0.2729894968991478,
               "full_information_oracle": 0.48371806740760803,
               "parts": 10,
-              "policy_aggregate": 0.2748894755107661,
-              "policy_oracle_regret": 0.20882858941331506,
+              "policy_aggregate": 0.30428473046049476,
+              "policy_oracle_regret": 0.17943333446358642,
               "random_aggregate": 0.2729894968991478
             }
           },
@@ -3258,14 +3361,14 @@
             }
           },
           "full_information_oracle_regret": {
-            "mean": 0.2040666833407048,
+            "mean": 0.19920635804759734,
             "mean_ci": [
-              0.1626426102903982,
-              0.248980500862341
+              0.15653799320712236,
+              0.24682892388099748
             ],
             "quantiles": {
               "max": 0.8544538021087646,
-              "median": 0.020949244499206543,
+              "median": 0.0064470767974853516,
               "min": 0.0,
               "p10": 0.0,
               "p25": 0.0,
@@ -3286,37 +3389,37 @@
             }
           },
           "policy": {
-            "aggregate": 0.3320975516443,
+            "aggregate": 0.3369578769374074,
             "quantiles": {
               "max": 0.9116832613945007,
               "median": 0.5053379535675049,
               "min": 0.0,
               "p10": 0.0,
               "p25": 0.0,
-              "p75": 0.6030401885509491,
-              "p90": 0.6787921786308289
+              "p75": 0.6060380786657333,
+              "p90": 0.7227583825588226
             }
           },
           "policy_vs_one_shot_random": {
             "baseline_aggregate": 0.3007035811967922,
             "delta_quantiles": {
-              "max": 0.752156674861908,
+              "max": 0.7901617884635925,
               "median": 0.0,
               "min": -0.8544538021087646,
               "p10": -0.3834121823310852,
               "p25": 0.0,
               "p75": 0.045528337359428406,
-              "p90": 0.5824735462665558
+              "p90": 0.5901570916175842
             },
             "diagnosis": "higher mean from infrequent larger wins",
-            "mean_delta": 0.031393970447507774,
+            "mean_delta": 0.036254295740615235,
             "mean_delta_ci": [
-              -0.04881705264843095,
-              0.09342881026818896
+              -0.03178512174212797,
+              0.09529243233670112
             ],
-            "mean_loss_magnitude": 0.39277764433063567,
-            "mean_win_magnitude": 0.43981286099082545,
-            "policy_aggregate": 0.3320975516443,
+            "mean_loss_magnitude": 0.38954667397774756,
+            "mean_win_magnitude": 0.4539752790802403,
+            "policy_aggregate": 0.3369578769374074,
             "strict_loss_rate": 0.24242424242424243,
             "strict_win_rate": 0.2878787878787879,
             "tie_rate": 0.4696969696969697
@@ -3329,8 +3432,8 @@
               "fixed_isometric_aggregate": 0.706626460832708,
               "full_information_oracle": 0.7805334329605103,
               "parts": 11,
-              "policy_aggregate": 0.6940035714822657,
-              "policy_oracle_regret": 0.08652988952748916,
+              "policy_aggregate": 0.7441774080781376,
+              "policy_oracle_regret": 0.03635605293161729,
               "random_aggregate": 0.706626460832708
             },
             "hard": {
@@ -3338,8 +3441,8 @@
               "fixed_isometric_aggregate": 0.32355618000030517,
               "full_information_oracle": 0.42034146189689636,
               "parts": 11,
-              "policy_aggregate": 0.3141674506664276,
-              "policy_oracle_regret": 0.10617403388023376,
+              "policy_aggregate": 0.308466774225235,
+              "policy_oracle_regret": 0.11187471032142639,
               "random_aggregate": 0.32355618000030517
             },
             "medium": {
@@ -3347,8 +3450,8 @@
               "fixed_isometric_aggregate": 0.37008633092045784,
               "full_information_oracle": 0.48371806740760803,
               "parts": 10,
-              "policy_aggregate": 0.40677835171421367,
-              "policy_oracle_regret": 0.07693971320986748,
+              "policy_aggregate": 0.4108740451435248,
+              "policy_oracle_regret": 0.07284401978055637,
               "random_aggregate": 0.37008633092045784
             }
           },
@@ -3365,10 +3468,10 @@
             }
           },
           "full_information_oracle_regret": {
-            "mean": 0.09048351645469666,
+            "mean": 0.07822995655464404,
             "mean_ci": [
-              0.06060723025690426,
-              0.12206996576578327
+              0.049442048856254785,
+              0.10818025714746027
             ],
             "quantiles": {
               "max": 0.8544538021087646,
@@ -3377,7 +3480,7 @@
               "p10": 0.0,
               "p25": 0.0,
               "p75": 0.030976861715316772,
-              "p90": 0.3305249959230423
+              "p90": 0.27899977564811707
             }
           },
           "one_shot_random_best": {
@@ -3393,15 +3496,15 @@
             }
           },
           "policy": {
-            "aggregate": 0.4456807185303081,
+            "aggregate": 0.4579342784303607,
             "quantiles": {
               "max": 0.9116832613945007,
               "median": 0.5865402519702911,
               "min": 0.0,
               "p10": 0.0,
               "p25": 0.0,
-              "p75": 0.6858489066362381,
-              "p90": 0.7527813017368317
+              "p75": 0.7016376703977585,
+              "p90": 0.7626748383045197
             }
           },
           "policy_vs_one_shot_random": {
@@ -3410,23 +3513,23 @@
               "max": 0.7028154730796814,
               "median": 0.0,
               "min": -0.8544538021087646,
-              "p10": -0.27899977564811707,
+              "p10": -0.208754301071167,
               "p25": 0.0,
-              "p75": 0.01585930585861206,
+              "p75": 0.03689578175544739,
               "p90": 0.4985491782426834
             },
             "diagnosis": "higher mean from infrequent larger wins",
-            "mean_delta": 0.006534865859783057,
+            "mean_delta": 0.018788425759835678,
             "mean_delta_ci": [
-              -0.05917029039877829,
-              0.07295201360953577
+              -0.0434949886731126,
+              0.07817540799803804
             ],
-            "mean_loss_magnitude": 0.3098109997808933,
-            "mean_win_magnitude": 0.29934873017999863,
-            "policy_aggregate": 0.4456807185303081,
+            "mean_loss_magnitude": 0.270419854670763,
+            "mean_win_magnitude": 0.2929870407832296,
+            "policy_aggregate": 0.4579342784303607,
             "strict_loss_rate": 0.24242424242424243,
-            "strict_win_rate": 0.2727272727272727,
-            "tie_rate": 0.48484848484848486
+            "strict_win_rate": 0.2878787878787879,
+            "tie_rate": 0.4696969696969697
           }
         },
         "8": {
@@ -3538,8 +3641,13 @@
         }
       },
       "candidate_pool": 8,
-      "common_initial_observation": "fixed calibrated isometric camera; excluded from both additional-render budgets",
+      "candidate_pool_exhausted_at": 8,
+      "common_initial_observation": "fixed calibrated isometric camera; counted once for both methods",
+      "common_initial_render_count": 1,
       "confidence": 0.95,
+      "device": "cuda",
+      "fit_backend": "torch-cpu",
+      "fit_stage": "prefit_weights_loaded",
       "generator_version": "viewpoint-mechanical-parts/1.0.0",
       "information_level": "depth_plus_prior",
       "look_budgets": [
@@ -4211,7 +4319,9 @@
         ]
       ],
       "one_shot_schedule": "seeded random permutation fixed before any render outcome",
+      "oracle_backend": "cuda",
       "oracle_information": "full geometry and all candidate labels",
+      "policy_backend": "numpy-cpu",
       "policy_schedule": "adaptive; every next camera is scored from the accumulated observation",
       "policy_selection_indices": [
         [
@@ -4266,13 +4376,13 @@
         ],
         [
           2,
-          1,
-          0,
-          4,
           5,
           3,
-          7,
-          6
+          4,
+          0,
+          6,
+          1,
+          7
         ],
         [
           3,
@@ -4280,19 +4390,19 @@
           2,
           1,
           7,
-          4,
           0,
+          4,
           5
         ],
         [
           1,
           3,
           5,
-          2,
-          6,
           7,
+          2,
           0,
-          4
+          4,
+          6
         ],
         [
           1,
@@ -4309,10 +4419,10 @@
           4,
           0,
           7,
-          6,
-          5,
           1,
-          3
+          3,
+          5,
+          6
         ],
         [
           5,
@@ -4338,11 +4448,11 @@
           4,
           5,
           7,
-          3,
-          1,
           6,
-          0,
-          2
+          1,
+          3,
+          2,
+          0
         ],
         [
           7,
@@ -4369,10 +4479,10 @@
           3,
           6,
           2,
-          5,
           1,
-          7,
-          4
+          5,
+          4,
+          7
         ],
         [
           4,
@@ -4380,8 +4490,8 @@
           0,
           5,
           1,
-          2,
           6,
+          2,
           7
         ],
         [
@@ -4427,31 +4537,31 @@
         [
           3,
           6,
+          1,
+          0,
           4,
           7,
-          1,
-          5,
-          0,
-          2
+          2,
+          5
         ],
         [
           6,
           5,
           7,
           3,
-          1,
           4,
           2,
-          0
+          0,
+          1
         ],
         [
           2,
           6,
           5,
-          0,
-          4,
-          7,
           1,
+          7,
+          4,
+          0,
           3
         ],
         [
@@ -4471,15 +4581,15 @@
           5,
           3,
           4,
-          6,
-          0
+          0,
+          6
         ],
         [
           1,
-          7,
           3,
-          2,
+          7,
           4,
+          2,
           5,
           0,
           6
@@ -4508,11 +4618,11 @@
           0,
           4,
           7,
-          6,
-          2,
           5,
-          3,
-          1
+          2,
+          6,
+          1,
+          3
         ],
         [
           6,
@@ -4529,10 +4639,10 @@
           0,
           6,
           4,
-          3,
+          2,
           1,
           5,
-          2
+          3
         ],
         [
           3,
@@ -4587,12 +4697,12 @@
         [
           7,
           3,
-          6,
-          1,
           2,
-          5,
+          1,
+          6,
+          0,
           4,
-          0
+          5
         ],
         [
           1,
@@ -4607,11 +4717,11 @@
         [
           7,
           0,
+          4,
           2,
           6,
           1,
           3,
-          4,
           5
         ],
         [
@@ -4626,13 +4736,13 @@
         ],
         [
           2,
-          0,
-          1,
           7,
           5,
+          1,
+          0,
+          3,
           4,
-          6,
-          3
+          6
         ],
         [
           2,
@@ -4668,19 +4778,19 @@
           1,
           2,
           7,
-          0,
           4,
           5,
           3,
+          0,
           6
         ],
         [
           5,
-          4,
-          7,
-          3,
-          6,
           0,
+          6,
+          3,
+          7,
+          4,
           1,
           2
         ],
@@ -4708,20 +4818,20 @@
           5,
           3,
           6,
-          4,
-          1,
-          0,
           7,
-          2
+          0,
+          1,
+          2,
+          4
         ],
         [
           6,
-          2,
-          5,
           7,
-          0,
-          1,
+          5,
           3,
+          1,
+          0,
+          2,
           4
         ],
         [
@@ -4729,10 +4839,10 @@
           4,
           2,
           5,
-          3,
-          0,
           1,
-          6
+          0,
+          6,
+          3
         ],
         [
           6,
@@ -4746,12 +4856,12 @@
         ],
         [
           5,
-          6,
-          0,
           1,
+          0,
           2,
-          3,
+          6,
           4,
+          3,
           7
         ],
         [
@@ -4780,17 +4890,17 @@
           3,
           1,
           7,
-          0,
           2,
+          0,
           6
         ],
         [
           0,
-          2,
-          7,
           3,
-          4,
+          7,
           5,
+          4,
+          2,
           1,
           6
         ],
@@ -4821,18 +4931,18 @@
           2,
           4,
           6,
-          1,
-          7
+          7,
+          1
         ],
         [
           2,
           6,
           0,
-          3,
           4,
           1,
-          7,
-          5
+          3,
+          5,
+          7
         ],
         [
           6,
@@ -4860,8 +4970,8 @@
           5,
           4,
           1,
-          3,
           0,
+          3,
           6
         ],
         [
@@ -4875,11 +4985,54 @@
           5
         ]
       ],
+      "render_accounting": {
+        "1": {
+          "common_initial": 1,
+          "one_shot_random_additional": 1,
+          "one_shot_random_total": 2,
+          "policy_additional": 1,
+          "policy_total": 2
+        },
+        "2": {
+          "common_initial": 1,
+          "one_shot_random_additional": 2,
+          "one_shot_random_total": 3,
+          "policy_additional": 2,
+          "policy_total": 3
+        },
+        "4": {
+          "common_initial": 1,
+          "one_shot_random_additional": 4,
+          "one_shot_random_total": 5,
+          "policy_additional": 4,
+          "policy_total": 5
+        },
+        "8": {
+          "common_initial": 1,
+          "one_shot_random_additional": 8,
+          "one_shot_random_total": 9,
+          "policy_additional": 8,
+          "policy_total": 9
+        }
+      },
       "seed": 1729,
       "test_examples": 66,
-      "test_parts": 11
+      "test_parts": 11,
+      "total_render_budgets": [
+        2,
+        3,
+        5,
+        9
+      ],
+      "workers": 1
     },
     "sparse_points": {
+      "additional_render_budgets": [
+        1,
+        2,
+        4,
+        8
+      ],
       "bootstrap_samples": 2000,
       "bootstrap_unit": "part_id",
       "budget_unit": "additional camera render after the common initial observation",
@@ -5016,8 +5169,8 @@
               "fixed_isometric_aggregate": 0.2729894968991478,
               "full_information_oracle": 0.48371806740760803,
               "parts": 10,
-              "policy_aggregate": 0.33206730568781495,
-              "policy_oracle_regret": 0.15165075923626622,
+              "policy_aggregate": 0.30485039685542387,
+              "policy_oracle_regret": 0.1788676680686573,
               "random_aggregate": 0.2729894968991478
             }
           },
@@ -5034,18 +5187,18 @@
             }
           },
           "full_information_oracle_regret": {
-            "mean": 0.20366243120621552,
+            "mean": 0.21355948896344865,
             "mean_ci": [
-              0.12492648377788793,
-              0.2830758188258517
+              0.13351765895742135,
+              0.29182481994908865
             ],
             "quantiles": {
               "max": 0.8544538021087646,
-              "median": 0.03828418254852295,
+              "median": 0.057771533727645874,
               "min": 0.0,
               "p10": 0.0,
               "p25": 0.0,
-              "p75": 0.34300675243139267,
+              "p75": 0.4559405446052551,
               "p90": 0.6948677599430084
             }
           },
@@ -5062,15 +5215,15 @@
             }
           },
           "policy": {
-            "aggregate": 0.33250180377878924,
+            "aggregate": 0.32260474602155614,
             "quantiles": {
               "max": 0.9116832613945007,
-              "median": 0.4571160525083542,
+              "median": 0.38388851284980774,
               "min": 0.0,
               "p10": 0.0,
               "p25": 0.0,
               "p75": 0.598746046423912,
-              "p90": 0.7411026060581207
+              "p90": 0.7051280438899994
             }
           },
           "policy_vs_one_shot_random": {
@@ -5081,20 +5234,20 @@
               "min": -0.8544538021087646,
               "p10": -0.3834121823310852,
               "p25": 0.0,
-              "p75": 0.04977506399154663,
+              "p75": 0.045528337359428406,
               "p90": 0.5683966875076294
             },
             "diagnosis": "higher mean from infrequent larger wins",
-            "mean_delta": 0.03179822258199706,
+            "mean_delta": 0.021901164824763935,
             "mean_delta_ci": [
-              -0.04411917975257064,
-              0.09950899576598946
+              -0.050151773664930996,
+              0.08408489560877727
             ],
-            "mean_loss_magnitude": 0.4020997943977515,
-            "mean_win_magnitude": 0.4065089803189039,
-            "policy_aggregate": 0.33250180377878924,
-            "strict_loss_rate": 0.22727272727272727,
-            "strict_win_rate": 0.30303030303030304,
+            "mean_loss_magnitude": 0.38484563515521586,
+            "mean_win_magnitude": 0.40015826531146703,
+            "policy_aggregate": 0.32260474602155614,
+            "strict_loss_rate": 0.24242424242424243,
+            "strict_win_rate": 0.2878787878787879,
             "tie_rate": 0.4696969696969697
           }
         },
@@ -5105,8 +5258,8 @@
               "fixed_isometric_aggregate": 0.706626460832708,
               "full_information_oracle": 0.7805334329605103,
               "parts": 11,
-              "policy_aggregate": 0.652535641894621,
-              "policy_oracle_regret": 0.12799781911513386,
+              "policy_aggregate": 0.6607604657902437,
+              "policy_oracle_regret": 0.11977299521951114,
               "random_aggregate": 0.706626460832708
             },
             "hard": {
@@ -5123,8 +5276,8 @@
               "fixed_isometric_aggregate": 0.37008633092045784,
               "full_information_oracle": 0.48371806740760803,
               "parts": 10,
-              "policy_aggregate": 0.37997686862945557,
-              "policy_oracle_regret": 0.1037411962946256,
+              "policy_aggregate": 0.38291574890414876,
+              "policy_oracle_regret": 0.10080231601993243,
               "random_aggregate": 0.37008633092045784
             }
           },
@@ -5141,10 +5294,10 @@
             }
           },
           "full_information_oracle_regret": {
-            "mean": 0.10471179629817154,
+            "mean": 0.10152459731607726,
             "mean_ci": [
-              0.044089245976823746,
-              0.17077526690607722
+              0.04697226816506098,
+              0.15752864165062247
             ],
             "quantiles": {
               "max": 0.7348150610923767,
@@ -5152,7 +5305,7 @@
               "min": 0.0,
               "p10": 0.0,
               "p25": 0.0,
-              "p75": 0.0835646241903305,
+              "p75": 0.023082122206687927,
               "p90": 0.573898658156395
             }
           },
@@ -5169,14 +5322,14 @@
             }
           },
           "policy": {
-            "aggregate": 0.43145243868683325,
+            "aggregate": 0.4346396376689275,
             "quantiles": {
               "max": 0.9116832613945007,
               "median": 0.5754826664924622,
               "min": 0.0,
               "p10": 0.0,
               "p25": 0.0,
-              "p75": 0.6953082084655762,
+              "p75": 0.7316699177026749,
               "p90": 0.7992767691612244
             }
           },
@@ -5192,17 +5345,17 @@
               "p90": 0.1534654200077057
             },
             "diagnosis": "lower mean with at most half strict wins",
-            "mean_delta": -0.007693413983691822,
+            "mean_delta": -0.004506215001597549,
             "mean_delta_ci": [
-              -0.0784312628209591,
-              0.05253016910318154
+              -0.06911931124826272,
+              0.04672112238000739
             ],
-            "mean_loss_magnitude": 0.3361244077483813,
-            "mean_win_magnitude": 0.235048504670461,
-            "policy_aggregate": 0.43145243868683325,
-            "strict_loss_rate": 0.18181818181818182,
-            "strict_win_rate": 0.22727272727272727,
-            "tie_rate": 0.5909090909090909
+            "mean_loss_magnitude": 0.38936708867549896,
+            "mean_win_magnitude": 0.22476629354059696,
+            "policy_aggregate": 0.4346396376689275,
+            "strict_loss_rate": 0.15151515151515152,
+            "strict_win_rate": 0.24242424242424243,
+            "tie_rate": 0.6060606060606061
           }
         },
         "8": {
@@ -5314,8 +5467,13 @@
         }
       },
       "candidate_pool": 8,
-      "common_initial_observation": "fixed calibrated isometric camera; excluded from both additional-render budgets",
+      "candidate_pool_exhausted_at": 8,
+      "common_initial_observation": "fixed calibrated isometric camera; counted once for both methods",
+      "common_initial_render_count": 1,
       "confidence": 0.95,
+      "device": "cuda",
+      "fit_backend": "torch-cpu",
+      "fit_stage": "prefit_weights_loaded",
       "generator_version": "viewpoint-mechanical-parts/1.0.0",
       "information_level": "sparse_points",
       "look_budgets": [
@@ -5987,7 +6145,9 @@
         ]
       ],
       "one_shot_schedule": "seeded random permutation fixed before any render outcome",
+      "oracle_backend": "cuda",
       "oracle_information": "full geometry and all candidate labels",
+      "policy_backend": "numpy-cpu",
       "policy_schedule": "adaptive; every next camera is scored from the accumulated observation",
       "policy_selection_indices": [
         [
@@ -5995,9 +6155,9 @@
           2,
           1,
           4,
+          3,
           6,
           7,
-          3,
           5
         ],
         [
@@ -6076,38 +6236,38 @@
           6,
           5,
           4,
-          7,
           0,
+          7,
           3
         ],
         [
           4,
           5,
-          1,
-          2,
           3,
           7,
-          6,
-          0
-        ],
-        [
-          6,
-          7,
-          3,
-          5,
-          4,
           1,
           2,
-          0
-        ],
-        [
-          2,
-          5,
-          1,
-          6,
           0,
-          4,
+          6
+        ],
+        [
+          6,
           7,
+          3,
+          5,
+          4,
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          7,
+          5,
+          4,
+          1,
+          6,
           3
         ],
         [
@@ -6135,9 +6295,9 @@
           1,
           6,
           4,
+          5,
           0,
           3,
-          5,
           7
         ],
         [
@@ -6154,11 +6314,11 @@
           4,
           3,
           0,
-          2,
           1,
           6,
           7,
-          5
+          5,
+          2
         ],
         [
           3,
@@ -6196,18 +6356,18 @@
           2,
           5,
           4,
-          1,
           0,
+          1,
           3
         ],
         [
           4,
           3,
           7,
-          6,
           0,
           1,
           5,
+          6,
           2
         ],
         [
@@ -6235,9 +6395,9 @@
           4,
           6,
           2,
-          0,
           5,
           7,
+          0,
           3
         ],
         [
@@ -6267,8 +6427,8 @@
           0,
           1,
           2,
-          5,
-          4
+          4,
+          5
         ],
         [
           7,
@@ -6283,10 +6443,10 @@
         [
           0,
           4,
+          6,
           2,
           5,
           7,
-          6,
           1,
           3
         ],
@@ -6334,20 +6494,20 @@
           2,
           6,
           1,
-          7,
-          5,
-          0,
           3,
-          4
+          5,
+          7,
+          4,
+          0
         ],
         [
           6,
           2,
           7,
-          5,
           3,
           1,
           0,
+          5,
           4
         ],
         [
@@ -6355,20 +6515,20 @@
           5,
           0,
           6,
-          1,
-          2,
           3,
+          2,
+          1,
           7
         ],
         [
           3,
           7,
           1,
-          2,
-          5,
           4,
+          2,
           6,
-          0
+          0,
+          5
         ],
         [
           1,
@@ -6396,8 +6556,8 @@
           5,
           7,
           2,
-          0,
           4,
+          0,
           6
         ],
         [
@@ -6405,213 +6565,213 @@
           1,
           7,
           2,
-          5,
-          4,
-          6,
-          3
-        ],
-        [
-          2,
-          3,
-          7,
-          5,
-          1,
-          6,
-          4,
-          0
-        ],
-        [
-          4,
-          2,
-          3,
-          5,
-          7,
-          0,
-          6,
-          1
-        ],
-        [
-          6,
-          2,
-          5,
-          1,
-          3,
-          4,
-          7,
-          0
-        ],
-        [
-          5,
-          2,
-          0,
-          4,
-          7,
-          1,
-          3,
-          6
-        ],
-        [
-          4,
-          0,
           6,
           3,
-          1,
-          2,
           5,
-          7
-        ],
-        [
-          2,
-          6,
-          4,
-          5,
-          7,
-          0,
-          1,
-          3
-        ],
-        [
-          5,
-          7,
-          0,
-          3,
-          4,
-          2,
-          6,
-          1
-        ],
-        [
-          3,
-          6,
-          0,
-          2,
-          4,
-          1,
-          5,
-          7
-        ],
-        [
-          6,
-          2,
-          0,
-          7,
-          5,
-          3,
-          1,
           4
         ],
         [
+          2,
+          6,
+          5,
           7,
-          2,
-          4,
-          6,
-          0,
           1,
-          5,
-          3
-        ],
-        [
-          1,
-          6,
-          4,
-          5,
-          0,
           3,
-          2,
-          7
-        ],
-        [
-          5,
-          2,
-          1,
-          7,
           4,
-          6,
-          3,
           0
         ],
         [
-          5,
-          7,
-          6,
-          1,
           4,
           2,
           3,
-          0
-        ],
-        [
-          1,
-          2,
-          7,
-          0,
-          3,
-          5,
-          6,
-          4
-        ],
-        [
-          5,
-          4,
-          2,
-          7,
-          3,
           0,
           1,
-          6
-        ],
-        [
-          1,
-          5,
-          3,
-          0,
-          2,
           7,
           6,
-          4
-        ],
-        [
-          4,
-          3,
-          7,
-          1,
-          5,
-          0,
-          2,
-          6
-        ],
-        [
-          5,
-          6,
-          0,
-          4,
-          1,
-          3,
-          7,
-          2
-        ],
-        [
-          2,
-          4,
-          6,
-          5,
-          0,
-          3,
-          1,
-          7
-        ],
-        [
-          2,
-          0,
-          1,
-          6,
-          4,
-          3,
-          7,
           5
         ],
         [
           6,
+          2,
+          5,
+          1,
+          3,
+          4,
+          7,
+          0
+        ],
+        [
+          5,
+          2,
+          0,
+          4,
+          7,
+          1,
+          3,
+          6
+        ],
+        [
+          4,
+          0,
+          6,
+          3,
+          1,
+          2,
+          5,
+          7
+        ],
+        [
+          2,
+          6,
+          4,
+          5,
+          7,
+          0,
+          1,
+          3
+        ],
+        [
+          5,
+          7,
+          2,
+          4,
+          0,
+          3,
+          1,
+          6
+        ],
+        [
+          3,
+          6,
+          0,
+          2,
+          4,
+          1,
+          5,
+          7
+        ],
+        [
+          6,
+          2,
+          0,
+          7,
+          5,
+          3,
+          1,
+          4
+        ],
+        [
+          7,
+          2,
+          4,
+          6,
+          0,
+          1,
+          3,
+          5
+        ],
+        [
+          1,
+          4,
+          6,
+          5,
+          0,
+          3,
+          2,
+          7
+        ],
+        [
+          5,
+          2,
+          1,
+          7,
+          4,
+          6,
+          0,
+          3
+        ],
+        [
+          5,
+          7,
+          6,
+          1,
+          2,
+          3,
+          4,
+          0
+        ],
+        [
+          1,
+          2,
+          7,
+          0,
+          3,
+          5,
+          6,
+          4
+        ],
+        [
+          5,
+          4,
+          2,
+          7,
+          3,
+          0,
+          1,
+          6
+        ],
+        [
+          1,
+          5,
+          3,
+          0,
+          2,
+          7,
+          6,
+          4
+        ],
+        [
+          4,
+          3,
+          7,
+          1,
+          5,
+          0,
+          2,
+          6
+        ],
+        [
+          5,
+          6,
+          4,
+          1,
+          3,
+          7,
+          0,
+          2
+        ],
+        [
+          2,
+          4,
+          6,
+          5,
+          0,
+          3,
+          7,
+          1
+        ],
+        [
+          2,
+          0,
+          1,
+          6,
+          3,
+          4,
+          5,
+          7
+        ],
+        [
+          6,
           1,
           5,
           3,
@@ -6644,16 +6804,53 @@
           7,
           5,
           0,
-          1,
-          4,
+          3,
           2,
-          6,
-          3
+          4,
+          1,
+          6
         ]
       ],
+      "render_accounting": {
+        "1": {
+          "common_initial": 1,
+          "one_shot_random_additional": 1,
+          "one_shot_random_total": 2,
+          "policy_additional": 1,
+          "policy_total": 2
+        },
+        "2": {
+          "common_initial": 1,
+          "one_shot_random_additional": 2,
+          "one_shot_random_total": 3,
+          "policy_additional": 2,
+          "policy_total": 3
+        },
+        "4": {
+          "common_initial": 1,
+          "one_shot_random_additional": 4,
+          "one_shot_random_total": 5,
+          "policy_additional": 4,
+          "policy_total": 5
+        },
+        "8": {
+          "common_initial": 1,
+          "one_shot_random_additional": 8,
+          "one_shot_random_total": 9,
+          "policy_additional": 8,
+          "policy_total": 9
+        }
+      },
       "seed": 1729,
       "test_examples": 66,
-      "test_parts": 11
+      "test_parts": 11,
+      "total_render_budgets": [
+        2,
+        3,
+        5,
+        9
+      ],
+      "workers": 1
     }
   },
   "split": {
@@ -6664,15 +6861,18 @@
     "validation_parts": 11
   },
   "training": {
-    "device": "cpu",
+    "device": "cuda",
     "epochs": 120,
+    "fit_backend": "torch-cpu",
+    "fit_results_comparable_to_reference": true,
     "holdout_candidates": 16,
     "image_size": [
       96,
       96
     ],
     "train_candidates": 8,
-    "weight_decay": 0.001
+    "weight_decay": 0.001,
+    "workers": 1
   },
   "validation_regret_curve": [
     {

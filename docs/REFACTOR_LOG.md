@@ -7375,3 +7375,43 @@ denser reliable returns, validated without oracle leakage.
 
 Gates: `pytest training/viewpoint services/viewpoint` 77 passed; 17 passed / 3 skipped with Torch
 unimportable.
+
+## 2026-08-08 — Viewpoint pipeline: corpus cache, CUDA defaults, and a determinism ruling
+
+The oracle work now runs on the GPU by default and the same corpus is no longer regenerated on every
+run. `training/viewpoint/corpus_cache.py` is a SHA-256 content-addressed NPZ cache under
+`scratch/viewpoint-cache`, keyed on the complete generator dataclass plus exact part indices, seed,
+candidate count, sampler version, mechanical-generator version, oracle version and both schema
+versions — so any change to any of those misses, with atomic publication, corrupt-entry rebuild and
+scratch-confined invalidation. `train`, `scale`, `information` and `sequential` default oracle
+generation to CUDA when available, print the device they ACTUALLY used, and record cache hit/miss plus
+the key, so a silent CPU fallback cannot masquerade as a GPU run.
+
+A determinism problem surfaced and was ruled on rather than papered over: a CUDA fit changed published
+numbers (validation aggregate .468744 → .459555, test policy .403032 → .402567) even though oracle
+labels are bit-identical CUDA-versus-NumPy. The cause is the CUDA AdamW/matmul trajectory, not the
+geometry. Since the fit is the CHEAP part and the oracle is where all the cost is, the reference
+configuration keeps the fit on Torch-CPU while CUDA drives corpus generation and sequential
+evaluation; every report prints `DEVICE: cuda` alongside `fit_backend: torch-cpu`. `--fit-device cuda`
+remains available for exploration and is explicitly labelled as not comparable to the CPU reference
+numbers. Cross-device bit-identity is not promised because it does not exist; the contract is
+reproducibility for a given (fit_backend, seed) pair. The .009 swing from backend nondeterminism alone
+is recorded in the doc as useful context for how much weight any single run's third decimal deserves.
+
+Controlled timings, reduced 50-part ladder, seed 1729, 120 epochs, niced, six BLAS threads —
+deliberately measured rather than quoting an earlier uncontrolled 63-minute task wall clock:
+
+| command | cold CPU | cold CUDA | warm cache |
+|---|---:|---:|---:|
+| `scale` | 89.6 s | 111.3 s | **52.6 s** |
+| `information` | 112.4 s | 73.4 s | **23.5 s** |
+
+Honest reading: at this small ladder CUDA LOSES on `scale` (111 s vs 90 s) because launch and
+marshalling overhead dominates a tiny workload; it wins on `information`, and the cache wins decisively
+on both. The 8.7x oracle throughput figure holds at corpus scale, not at 50 parts. Result parity was
+verified in every direction: 0 numeric differences CPU vs cold CUDA, and 0 cold CUDA vs warm cache,
+with the only JSON deltas being weights paths and device provenance.
+
+Gates: `pytest training/viewpoint` 27 passed. Still CPU-bound and named as such: part generation,
+camera sampling, feature extraction, projection, clipping, hull construction, signature comparison and
+serialization.

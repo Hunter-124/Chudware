@@ -63,13 +63,13 @@ def fit_policy(
         raise RuntimeError("Stage-1 training requires optional Torch; NumPy inference does not") from exc
     if epochs <= 0 or learning_rate <= 0 or rank_temperature <= 0:
         raise ValueError("epochs, learning_rate, and rank_temperature must be positive")
-    torch.use_deterministic_algorithms(True)
     torch.manual_seed(seed)
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"requested {device!r}, but Torch reports no CUDA device")
     actual_device = torch.device(device)
+    torch.use_deterministic_algorithms(actual_device.type == "cuda")
     if actual_device.type == "cpu":
-        torch.set_num_threads(max(1, min(6, torch.get_num_threads())))
+        torch.set_num_threads(max(1, min(4, torch.get_num_threads())))
     model = build_torch_policy(seed=seed).to(actual_device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     inputs = _torch_inputs(train, torch, actual_device)

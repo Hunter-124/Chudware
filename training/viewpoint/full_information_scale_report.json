@@ -12,33 +12,35 @@
     {
       "key": "f6762744ed26bbed7db7ef4f4069598357260322ecfb4186ff57bb490dc6abc0",
       "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/full-f6762744ed26bbed7db7ef4f4069598357260322ecfb4186ff57bb490dc6abc0.npz",
-      "status": "miss"
+      "status": "hit"
     },
     {
       "key": "de36a40a23e136029cd976a8abd9591e48f506b35ede8c466fe5fd0849631419",
       "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/full-de36a40a23e136029cd976a8abd9591e48f506b35ede8c466fe5fd0849631419.npz",
-      "status": "miss"
+      "status": "hit"
     },
     {
       "key": "54b77363174e5adefda9ab707e9f70fe3f3ad0e0c55fd24a5463f57e5c2ca226",
       "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/full-54b77363174e5adefda9ab707e9f70fe3f3ad0e0c55fd24a5463f57e5c2ca226.npz",
-      "status": "miss"
+      "status": "hit"
     },
     {
       "key": "4f88a8b6af78107f26fd2a17d8fa118af05f648e6f518ba3c0001c3c94dfd513",
       "path": "/home/hunter/Repositories/CAD/scratch/viewpoint-cache/full-4f88a8b6af78107f26fd2a17d8fa118af05f648e6f518ba3c0001c3c94dfd513.npz",
-      "status": "miss"
+      "status": "hit"
     }
   ],
   "device": "cuda",
   "epochs": 120,
+  "fit_backend": "torch-cpu",
+  "fit_results_comparable_to_reference": true,
   "generator_version": "viewpoint-mechanical-parts/1.0.0",
   "regularization_trials": [
     {
       "auxiliary_regression_weight": 0.0,
       "best_epoch": 53,
       "best_validation_aggregate": 0.4382847845554352,
-      "loss": 0.09200936555862427,
+      "loss": 0.09172406792640686,
       "train_aggregate": 0.3566166162490845,
       "train_oracle_upper_bound": 0.5210285782814026,
       "train_regret": 0.16441196203231812,
@@ -52,7 +54,7 @@
       "auxiliary_regression_weight": 0.0,
       "best_epoch": 53,
       "best_validation_aggregate": 0.4382847845554352,
-      "loss": 0.09200936555862427,
+      "loss": 0.09172406792640686,
       "train_aggregate": 0.3566166162490845,
       "train_oracle_upper_bound": 0.5210285782814026,
       "train_regret": 0.16441196203231812,
@@ -66,7 +68,7 @@
       "auxiliary_regression_weight": 0.0,
       "best_epoch": 54,
       "best_validation_aggregate": 0.4399571120738983,
-      "loss": 0.09205211699008942,
+      "loss": 0.09224893897771835,
       "train_aggregate": 0.3619098663330078,
       "train_oracle_upper_bound": 0.5210285782814026,
       "train_regret": 0.15911871194839478,
@@ -80,7 +82,7 @@
       "auxiliary_regression_weight": 0.0,
       "best_epoch": 59,
       "best_validation_aggregate": 0.44306278228759766,
-      "loss": 0.09211166203022003,
+      "loss": 0.09224893152713776,
       "train_aggregate": 0.36310315132141113,
       "train_oracle_upper_bound": 0.5210285782814026,
       "train_regret": 0.15792542695999146,
@@ -103,8 +105,8 @@
         "fixed_isometric_aggregate": 0.2904019057750702,
         "full_information_oracle": 0.8646847009658813,
         "parts": 11,
-        "policy_aggregate": 0.7333866953849792,
-        "policy_oracle_regret": 0.13129805028438568,
+        "policy_aggregate": 0.7351917624473572,
+        "policy_oracle_regret": 0.12949296832084656,
         "random_aggregate": 0.3927432894706726
       },
       "hard": {
@@ -151,10 +153,10 @@
       }
     },
     "full_information_oracle_regret": {
-      "mean": 0.27556753158569336,
+      "mean": 0.2751026153564453,
       "mean_ci": [
-        0.2145473260432482,
-        0.349846065044403
+        0.2136352274566889,
+        0.34963053613901135
       ],
       "quantiles": {
         "max": 0.9582351446151733,
@@ -167,7 +169,7 @@
       }
     },
     "policy": {
-      "aggregate": 0.40256717801094055,
+      "aggregate": 0.4030321204301083,
       "quantiles": {
         "max": 0.8887686133384705,
         "median": 0.5793857574462891,
@@ -175,7 +177,7 @@
         "p10": 0.0,
         "p25": 0.0,
         "p75": 0.7574654072523117,
-        "p90": 0.7920409739017487
+        "p90": 0.7980095744132996
       }
     },
     "policy_vs_fixed_isometric": {
@@ -187,17 +189,17 @@
         "p10": 0.0,
         "p25": 0.0,
         "p75": 0.606964960694313,
-        "p90": 0.7691170573234558
+        "p90": 0.775955855846405
       },
       "diagnosis": "higher mean from infrequent larger wins",
-      "mean_delta": 0.22662508848941687,
+      "mean_delta": 0.2270900309085846,
       "mean_delta_ci": [
-        0.128524062782526,
-        0.3124993152916431
+        0.12898899391293525,
+        0.31315382197499275
       ],
       "mean_loss_magnitude": 0.2138806382815043,
-      "mean_win_magnitude": 0.5600186093100186,
-      "policy_aggregate": 0.40256720781326294,
+      "mean_win_magnitude": 0.5610767541260555,
+      "policy_aggregate": 0.403032124042511,
       "strict_loss_rate": 0.09090909090909091,
       "strict_win_rate": 0.4393939393939394,
       "tie_rate": 0.4696969696969697
@@ -211,17 +213,17 @@
         "p10": 0.0,
         "p25": 0.0,
         "p75": 0.7012820541858673,
-        "p90": 0.7843622863292694
+        "p90": 0.7880914807319641
       },
       "diagnosis": "higher mean from infrequent larger wins",
-      "mean_delta": 0.27114842425693164,
+      "mean_delta": 0.27161336667609937,
       "mean_delta_ci": [
-        0.20424293577671052,
-        0.32997784242033956
+        0.20448806285858157,
+        0.33062134236097335
       ],
       "mean_loss_magnitude": 0.13804970184961954,
-      "mean_win_magnitude": 0.604003039098555,
-      "policy_aggregate": 0.40256720781326294,
+      "mean_win_magnitude": 0.6049929165071056,
+      "policy_aggregate": 0.403032124042511,
       "strict_loss_rate": 0.09090909090909091,
       "strict_win_rate": 0.4696969696969697,
       "tie_rate": 0.4393939393939394
@@ -413,7 +415,7 @@
         31,
         11,
         15,
-        7,
+        6,
         18,
         22,
         22,
@@ -545,7 +547,7 @@
       "auxiliary_regression_weight": 0.0,
       "best_epoch": 53,
       "best_validation_aggregate": 0.43804407119750977,
-      "loss": 0.08417876064777374,
+      "loss": 0.08480779826641083,
       "train_aggregate": 0.39342454075813293,
       "train_examples": 300,
       "train_oracle_upper_bound": 0.5770065188407898,
@@ -560,7 +562,7 @@
       "auxiliary_regression_weight": 0.0,
       "best_epoch": 59,
       "best_validation_aggregate": 0.44306278228759766,
-      "loss": 0.09211166203022003,
+      "loss": 0.09224893152713776,
       "train_aggregate": 0.36310315132141113,
       "train_examples": 450,
       "train_oracle_upper_bound": 0.5210285782814026,
@@ -573,33 +575,33 @@
     },
     {
       "auxiliary_regression_weight": 0.0,
-      "best_epoch": 99,
-      "best_validation_aggregate": 0.4378894567489624,
-      "loss": 0.11759854108095169,
-      "train_aggregate": 0.34830570220947266,
+      "best_epoch": 119,
+      "best_validation_aggregate": 0.4393405020236969,
+      "loss": 0.11782926321029663,
+      "train_aggregate": 0.3583320081233978,
       "train_examples": 1250,
       "train_oracle_upper_bound": 0.4701518416404724,
       "train_parts": 1000,
-      "train_regret": 0.12184613943099976,
-      "train_validation_gap": -0.08958375453948975,
-      "validation_aggregate": 0.4378894567489624,
+      "train_regret": 0.11181983351707458,
+      "train_validation_gap": -0.08100849390029907,
+      "validation_aggregate": 0.4393405020236969,
       "validation_oracle_upper_bound": 0.654163658618927,
-      "validation_regret": 0.2162742018699646
+      "validation_regret": 0.2148231565952301
     },
     {
       "auxiliary_regression_weight": 0.0,
       "best_epoch": 95,
-      "best_validation_aggregate": 0.45955464243888855,
-      "loss": 0.16847263276576996,
-      "train_aggregate": 0.3202553391456604,
+      "best_validation_aggregate": 0.46874353289604187,
+      "loss": 0.1684713512659073,
+      "train_aggregate": 0.32005858421325684,
       "train_examples": 5250,
       "train_oracle_upper_bound": 0.43859076499938965,
       "train_parts": 5000,
-      "train_regret": 0.11833542585372925,
-      "train_validation_gap": -0.13929930329322815,
-      "validation_aggregate": 0.45955464243888855,
+      "train_regret": 0.11853218078613281,
+      "train_validation_gap": -0.14868494868278503,
+      "validation_aggregate": 0.46874353289604187,
       "validation_oracle_upper_bound": 0.654163658618927,
-      "validation_regret": 0.19460901618003845
+      "validation_regret": 0.18542012572288513
     }
   ],
   "weights": "training/viewpoint/full_information_scale_weights.npz",

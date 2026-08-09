@@ -8,12 +8,14 @@ import pytest
 from services.viewpoint.oracle import evaluate
 from services.viewpoint.parts import generate_part
 from services.viewpoint.sampling import generate_benchmark_candidate_set
+from .benchmark import run_benchmark
 
 from . import (
     CorruptionConfig,
     DepthOnlyObservation,
     DepthPlusPriorObservation,
     FullObservation,
+    INFORMATION_LEVELS,
     ObservationConfig,
     SequentialObserver,
     SparsePointsObservation,
@@ -107,8 +109,24 @@ def test_sequential_observer_accumulates_k_looks_and_outcomes() -> None:
     point_counts = [len(result.accumulated_points) for result in results]
     assert point_counts == sorted(point_counts)
     assert point_counts[-1] > point_counts[0]
-    assert results[-1].visits[-1].visibility_estimate == results[-1].visibility_estimate
+    assert all(
+        result.visibility_estimate == max(record.visibility_estimate for record in result.visits)
+        for result in results
+    )
     assert results[-1].visits[-1].valid_return_fraction == results[-1].valid_return_fraction
+
+
+def test_sequential_visibility_retains_a_better_earlier_look() -> None:
+    part = generate_part(0, seed=1729)
+    feature_id = part.target_feature_ids[0]
+    cameras = generate_benchmark_candidate_set(
+        part.scene, feature_id, 8, seed=1729, image_size=(160, 120)
+    )
+    first, second = SequentialObserver(
+        part.scene, feature_id, level="depth_only", seed=81
+    ).looks(cameras[:2])
+    assert second.visits[-1].visibility_estimate < first.visibility_estimate
+    assert second.visibility_estimate == first.visibility_estimate
 
 
 def test_each_corruption_is_independently_measurable() -> None:
@@ -214,3 +232,29 @@ def test_information_metric_quantifies_visibility_signal_without_leaking_label()
         "estimate_mean",
         "oracle_mean",
     }
+
+
+def test_accumulated_information_audit_reports_all_levels_and_sequence_budgets() -> None:
+    report = run_benchmark(
+        parts=1,
+        looks_per_part=8,
+        candidate_pool=8,
+        targets_per_part=2,
+        seed=1729,
+    )
+    accumulation = report["accumulation"]
+    assert accumulation["checkpoints"] == [1, 2, 4, 8]
+    assert accumulation["sequence_samples"] == 2
+    for sequence in ("random", "oracle_best_next"):
+        levels = accumulation["sequences"][sequence]["levels"]
+        assert set(levels) == set(INFORMATION_LEVELS)
+        assert all(set(by_budget) == {"1", "2", "4", "8"} for by_budget in levels.values())
+        assert all(
+            by_budget["pearson_correlation"] == pytest.approx(1.0)
+            for by_budget in levels["full"].values()
+        )
+    diagnostics = accumulation["fusion_diagnostics"]
+    assert diagnostics["same_ray_resampling"] is False
+    assert diagnostics["evidence_overwritten"] is False
+    assert diagnostics["nan_poisoning"] is False
+    assert diagnostics["feature_neighbourhood_coverage_increases"] is True

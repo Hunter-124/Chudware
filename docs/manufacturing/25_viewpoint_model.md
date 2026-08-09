@@ -188,44 +188,78 @@ Each cell is `policy / random / fixed / full oracle (regret)`.
 
 Easy features drive most wins. Medium and hard regret remain large under every observation level.
 
-## Sequential K-look evaluation
+## Sequential K-look diagnosis
 
-For every example, the learned schedule starts from the common initial camera, scores unvisited
-candidates from the current observation, takes the selected look, adds only that sensor result, and
-repeats. The one-shot baseline commits to one seeded random permutation before seeing any render and
-retains the best result in its first K entries. Both therefore spend K additional camera renders.
-The oracle remains the best of the full eight-candidate pool.
+The budget is matched explicitly. Both methods receive and are charged for one common fixed
+calibrated initial render. They then spend exactly K additional renders: the learned policy chooses
+adaptively from the accumulated observation, while the baseline commits to one seeded random
+permutation before seeing any outcome. Thus the total-render curve is 2, 3, 5, and 9 renders at
+K = 1, 2, 4, and 8. Neither method receives a render that the other is charged for.
 
-| observation | K | adaptive policy | one-shot random best | full oracle | policy−random, 95% part CI | oracle regret, 95% part CI |
-|---|---:|---:|---:|---:|---:|---:|
-| depth_only | 1 | 0.285545 | 0.181710 | 0.536164 | +0.103835 [+0.021234, +0.204482] | 0.250620 [0.189542, 0.307806] |
-| depth_only | 2 | 0.335604 | 0.300704 | 0.536164 | +0.034901 [-0.052682, +0.105094] | 0.200560 [0.143032, 0.248610] |
-| depth_only | 4 | 0.439403 | 0.439146 | 0.536164 | +0.000257 [-0.073058, +0.065308] | 0.096761 [0.053121, 0.140532] |
-| depth_only | 8 | 0.536164 | 0.536164 | 0.536164 | 0.000000 [0, 0] | 0.000000 [0, 0] |
-| depth_plus_prior | 1 | 0.207592 | 0.181710 | 0.536164 | +0.025882 [-0.057621, +0.130828] | 0.328572 [0.268233, 0.384802] |
-| depth_plus_prior | 2 | 0.332098 | 0.300704 | 0.536164 | +0.031394 [-0.048817, +0.093429] | 0.204067 [0.162643, 0.248981] |
-| depth_plus_prior | 4 | 0.445681 | 0.439146 | 0.536164 | +0.006535 [-0.059170, +0.072952] | 0.090484 [0.060607, 0.122070] |
-| depth_plus_prior | 8 | 0.536164 | 0.536164 | 0.536164 | 0.000000 [0, 0] | 0.000000 [0, 0] |
-| sparse_points | 1 | 0.234119 | 0.181710 | 0.536164 | +0.052409 [-0.032985, +0.153750] | 0.302045 [0.214468, 0.387561] |
-| sparse_points | 2 | 0.332502 | 0.300704 | 0.536164 | +0.031798 [-0.044119, +0.099509] | 0.203662 [0.124926, 0.283076] |
-| sparse_points | 4 | 0.431452 | 0.439146 | 0.536164 | -0.007693 [-0.078431, +0.052530] | 0.104712 [0.044089, 0.170775] |
-| sparse_points | 8 | 0.536164 | 0.536164 | 0.536164 | 0.000000 [0, 0] | 0.000000 [0, 0] |
+### Does history reach the scorer?
 
-K=8 is a sanity endpoint: both methods exhaust all eight candidates, so equality with the oracle is
-mechanical and not evidence for learning. Depth-only wins at K=1. At K=2 and K=4 every interval for
-adaptive policy minus one-shot search includes zero; sparse points is slightly worse at K=4. The
-policy therefore fails the sequential product bar.
+Yes. The direct regression test holds the physical candidate set and final camera fixed, constructs
+two different prior-look histories, and then freezes the encoded candidate tensor as well. The
+encoded history tokens differ and the checked-in depth-plus-prior policy's score vector differs.
+History reaches the network; the sequential null was not caused by a disconnected history input.
 
-At the nontrivial K=4 budget, difficulty is:
+The audit did find a perception-side fusion bug: `SequentialObserver` accumulated points but exposed
+the current frame's scalar visibility estimate as if it described the accumulation. It now exposes
+running-max visibility while retaining per-frame values in `VisitRecord`. No oracle value enters an
+observation.
 
-| observation | easy policy / random / oracle | medium policy / random / oracle | hard policy / random / oracle |
-|---|---:|---:|---:|
-| depth_only | .667439 / .706626 / .780533 | .419068 / .370086 / .483718 | .303860 / .323556 / .420341 |
-| depth_plus_prior | .694004 / .706626 / .780533 | .406778 / .370086 / .483718 | .314167 / .323556 / .420341 |
-| sparse_points | .652536 / .706626 / .780533 | .379977 / .370086 / .483718 | .330532 / .323556 / .420341 |
+### Information gained per look after the fusion fix
 
-The adaptive schedules help medium examples slightly but give that gain back on easy or hard rows.
-No difficulty slice establishes a general sequential advantage.
+The observation audit used 64 targets (eight locked parts × eight targets), a 16-pose pool, and seed
+1729. Cells are Pearson correlation with true visibility / mutual information. `random` uses a seeded
+random pose order; `oracle-best-next` is a diagnostic upper schedule, not a deployable policy.
+
+```bash
+OMP_NUM_THREADS=6 MKL_NUM_THREADS=6 nice -n 15 \
+  python3 -X utf8 -m services.viewpoint.observation.benchmark \
+  --parts 8 --looks-per-part 8 --candidate-pool 16 --targets-per-part 8 --seed 1729
+```
+
+| schedule | observation | K=1 | K=2 | K=4 | K=8 |
+|---|---|---:|---:|---:|---:|
+| random | full control | 1.000 / 1.545656 | 1.000 / 1.916232 | 1.000 / 2.281081 | 1.000 / 1.990990 |
+| random | depth | .339616 / .401623 | .480747 / .509220 | .437611 / .762341 | .414709 / .601681 |
+| random | depth plus prior | .339616 / .401623 | .480747 / .509220 | .437611 / .762341 | .414709 / .601681 |
+| random | sparse points | .087567 / .236962 | .043274 / .211427 | .124012 / .260194 | -.044104 / .250068 |
+| oracle-best-next | full control | 1.000 / 1.892095 | 1.000 / 1.892095 | 1.000 / 1.892095 | 1.000 / 1.892095 |
+| oracle-best-next | depth | .324439 / .396737 | .548835 / .587884 | .646541 / .684142 | .557667 / .623922 |
+| oracle-best-next | depth plus prior | .324439 / .396737 | .548835 / .587884 | .646541 / .684142 | .557667 / .623922 |
+| oracle-best-next | sparse points | -.136968 / .288306 | -.152799 / .292308 | -.005349 / .368864 | -.010955 / .212573 |
+
+Depth accumulation contains real information: random ordering improves from r=.340 at K=1 to .481
+at K=2, and the diagnostic best-next schedule reaches .647 at K=4. It is not monotonic, however;
+random depth falls to .438/.415 at K=4/K=8 and best-next falls to .558 at K=8. Depth plus prior is
+numerically identical to depth, so accumulated points add no visibility information under this
+estimator. Sparse points never establish useful correlation. The fusion has signal, but perception
+still caps and sometimes degrades that signal.
+
+### Why the original eight-candidate null was not a valid product finding
+
+After the fusion fix, the original eight-pose experiment is:
+
+| observation | K | adaptive policy | random best | policy−random, 95% whole-part CI |
+|---|---:|---:|---:|---:|
+| depth | 1 | .285545 | .181710 | +.103835 [+.021234, +.204482] |
+| depth | 2 | .336239 | .300704 | +.035535 [-.052179, +.105814] |
+| depth | 4 | .459549 | .439146 | +.020403 [-.039133, +.075502] |
+| depth | 8 | .536164 | .536164 | 0 [0, 0] |
+| depth plus prior | 1 | .207592 | .181710 | +.025882 [-.057621, +.130828] |
+| depth plus prior | 2 | .336958 | .300704 | +.036254 [-.031785, +.095292] |
+| depth plus prior | 4 | .457934 | .439146 | +.018788 [-.043495, +.078175] |
+| depth plus prior | 8 | .536164 | .536164 | 0 [0, 0] |
+| sparse points | 1 | .234119 | .181710 | +.052409 [-.032985, +.153750] |
+| sparse points | 2 | .322605 | .300704 | +.021901 [-.050152, +.084085] |
+| sparse points | 4 | .434640 | .439146 | -.004506 [-.069119, +.046721] |
+| sparse points | 8 | .536164 | .536164 | 0 [0, 0] |
+
+At K=4 the random schedule has already sampled half the pool. At K=8 every method exhausts the pool
+and mechanically equals its .536164 oracle. That endpoint proves accounting, not learning, and the
+small pool leaves too little selection problem to support a sequential-product verdict.
 
 ## Model and objective
 

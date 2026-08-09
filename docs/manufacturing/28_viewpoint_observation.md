@@ -79,9 +79,9 @@ prior voxel size are explicit in `ObservationConfig`.
 
 Visibility is a geometric line-of-sight readout, not target-region occupancy. The synthetic target
 hypothesis is projected into the sensor grid, and each target ray compares its expected **range**
-against the observed range at that ray. A closer return is an occluder. `depth_plus_prior` also
-reprojects the accumulated world points into the candidate camera and takes visibility supported by
-either the current frame or the prior reconstruction. `sparse_points` uses the nearest attempted ray
+against the observed range at that ray. A closer return is an occluder. `depth_plus_prior` carries the
+finite-only voxel union as geometry, but prior points are not allowed to prove current line of sight:
+a stale point behind a newly observed boss is not a valid visibility return. `sparse_points` uses the nearest attempted ray
 within a support radius derived from its sampling density. `full` casts those target rays directly
 against the complete mesh; this intentionally reconstructs the full-information visibility ceiling
 without importing or attaching an `InspectabilityLabel`. Confusing forward-axis projection depth
@@ -108,9 +108,10 @@ or a real target detector.
 
 `SequentialObserver.look(camera)` captures one new frame and returns an observation whose `visits`
 includes that current look. Thus calls 1 through K return histories of lengths 1 through K. Each
-`VisitRecord` contains only the requested pose and outcomes inferred from that frame. For
-`depth_plus_prior`, `accumulated_points` is the voxelized union of finite visible returns from all
-looks so far. No oracle value is used to update state.
+`VisitRecord.visibility_estimate` is the outcome of that frame; the observation-level
+`visibility_estimate` is the running maximum over the visits. For `depth_plus_prior`,
+`accumulated_points` is the voxelized union of finite visible returns from all looks so far. No
+oracle value is used to update either state.
 
 This supports the deployment-realistic loop:
 
@@ -126,42 +127,97 @@ teacher's mesh or labels.
 
 ## Measured information audit
 
-The deterministic audit below used eight generated parts, eight looks per part, seed 1729, and no
-corruption. Samples remain grouped by `part_id`; no pose or feature row is treated as an independent
-split unit. The oracle appears only on the evaluation side as
-`1 - occlusion_fraction`. The observation-side readout is the declared
-`visibility_estimate`, independently reconstructed per level by the line-of-sight computations
-above; the analytic value is never passed into a camera-limited observation.
+The deterministic audit below kept the eight locked parts and used eight target features per part,
+giving 64 sequence samples grouped by `part_id`. Each target had a seeded 16-camera pool. A random
+sequence is a permutation fixed before observing any return. The `oracle_best_next` sequence orders
+that pool by the frozen oracle's true visibility; because the measured objective is best visibility
+seen so far, it establishes the best-camera ceiling at its first look. At K=1, 2, 4 and 8, the audit
+compares the running maximum observation estimate with the running maximum
+`1 - occlusion_fraction`. The oracle appears only after capture on this evaluation side.
 
 ```bash
-python3 -X utf8 -m services.viewpoint.observation.benchmark \
-  --parts 8 --looks-per-part 8 --seed 1729
+OMP_NUM_THREADS=6 MKL_NUM_THREADS=6 nice -n 15 \
+  python3 -X utf8 -m services.viewpoint.observation.benchmark \
+  --parts 8 --looks-per-part 8 --candidate-pool 16 --targets-per-part 8 --seed 1729
 ```
 
-| information level | samples | Pearson correlation with oracle visibility | empirical MI (bits) | estimate mean | oracle mean |
+The unchanged pooled one-look check remains:
+
+| information level | samples | Pearson correlation | MI (bits) | estimate mean | oracle mean |
 |---|---:|---:|---:|---:|---:|
 | `full` | 64 | 1.000000 | 1.799199 | 0.261719 | 0.261719 |
 | `depth_only` | 64 | 0.583859 | 0.756250 | 0.167643 | 0.261719 |
-| `depth_plus_prior` | 64 | 0.595711 | 0.771570 | 0.171875 | 0.261719 |
+| `depth_plus_prior` | 64 | 0.583859 | 0.756250 | 0.167643 | 0.261719 |
 | `sparse_points` | 64 | 0.139067 | 0.461442 | 0.245768 | 0.261719 |
 
-Mutual information is empirical after fixed eight-bin discretization on `[0, 1]`; 64 samples are too
-few to interpret small differences as population effects. The `full` equality is the required
-sanity check: mesh-ray occlusion reconstructs the unchanged oracle visibility ceiling. The two depth
-levels recover materially more of that signal than the original proxy (correlation 0.584/0.596
-rather than 0.153), while prior accumulation gives a small measured increase. Sparse sampling is
-properly ordered as the weakest signal. Its estimate mean is now 0.246 against oracle mean 0.262,
-instead of the selection-biased 0.674 produced when only valid returns were sampled. Its MI remains
-nonzero, but the low correlation is an explicit limitation rather than a favorable sparse-policy
-claim. No threshold or metric was selected to make a policy win.
+The K-look results are correlation / empirical eight-bin MI in bits:
 
-These numbers are intentionally not compared as if they were policy aggregate quality. The current
-full-information candidate ranker reports train selected aggregate 0.545 versus oracle 0.577,
-validation regret 0.213, and policy-from-32 test aggregate 0.341 versus best-of-4 oracle 0.349. This
-observation audit measures a different axis: how much oracle visibility is recoverable from a
-camera-limited signal. The next valid policy evaluation is **limited-information policy versus the
-unchanged full-information oracle**, at matched pose/look budgets, with results grouped and split by
-whole part.
+| random sequence level | K=1 | K=2 | K=4 | K=8 |
+|---|---:|---:|---:|---:|
+| `full` | 1.000000 / 1.545656 | 1.000000 / 1.916232 | 1.000000 / 2.281081 | 1.000000 / 1.990990 |
+| `depth_only` | 0.339616 / 0.401623 | 0.480747 / 0.509220 | 0.437611 / 0.762341 | 0.414709 / 0.601681 |
+| `depth_plus_prior` | 0.339616 / 0.401623 | 0.480747 / 0.509220 | 0.437611 / 0.762341 | 0.414709 / 0.601681 |
+| `sparse_points` | 0.087567 / 0.236962 | 0.043274 / 0.211427 | 0.124012 / 0.260194 | -0.044104 / 0.250068 |
+
+| oracle-best-next sequence level | K=1 | K=2 | K=4 | K=8 |
+|---|---:|---:|---:|---:|
+| `full` | 1.000000 / 1.892095 | 1.000000 / 1.892095 | 1.000000 / 1.892095 | 1.000000 / 1.892095 |
+| `depth_only` | 0.324439 / 0.396737 | 0.548835 / 0.587884 | 0.646541 / 0.684142 | 0.557667 / 0.623922 |
+| `depth_plus_prior` | 0.324439 / 0.396737 | 0.548835 / 0.587884 | 0.646541 / 0.684142 | 0.557667 / 0.623922 |
+| `sparse_points` | -0.136968 / 0.288306 | -0.152799 / 0.292308 | -0.005349 / 0.368864 | -0.010955 / 0.212573 |
+
+K=1 in the sequence table is one random row per target and therefore is not the same sampling
+distribution as the pooled 0.584 one-look check. Small MI differences remain descriptive: 64
+whole-part-grouped rows do not make them population estimates.
+
+### What the fusion diagnosis found
+
+- **A real scalar fusion defect was fixed.** The point cloud accumulated, but the observation-level
+  scalar described only the current camera, so the policy's scalar channel discarded all earlier
+  outcomes. It now reports the running best while `VisitRecord` remains per-frame. The old
+  reproject-and-OR path was also removed: a prior point cannot establish that a target is visible
+  through an occluder in the current frame.
+- **Later looks are not the same capture.** Every eight-look sequence used eight unique camera
+  positions. Consecutive forward-axis separation averaged 90.046 degrees for random order and 77.664
+  degrees for oracle order (minimum 0.800 and 3.943 degrees respectively).
+- **Evidence is combined, not overwritten.** Mean finite voxel counts grew
+  67.25 -> 127.78 -> 251.75 -> 524.27 for random order and
+  65.05 -> 133.62 -> 262.05 -> 514.67 for oracle order at K=1/2/4/8.
+- **NaNs do not poison fusion.** Invalid returns are filtered before voxel union; every accumulated
+  point in all 512 audited sequence/checkpoint observations was finite.
+- **Feature-neighbourhood coverage does increase.** Within one coarse sensor-pixel footprint, mean
+  weighted support grew 0.420 -> 0.734 -> 0.911 -> 0.996 for random order and
+  0.606 -> 0.896 -> 0.990 -> 1.000 for oracle order.
+
+Thus motion adds some measurable information through K=4 under the best-next order, but not
+monotonically. The strongest depth result is only correlation 0.647 / MI 0.684 at K=4; it falls to
+0.558 / 0.624 at K=8 even though physical neighbourhood coverage reaches 1.0. Random ordering peaks
+at correlation 0.481 at K=2 (MI peaks at 0.762 at K=4) and ends at 0.415 / 0.602. The identical
+`depth_only` and `depth_plus_prior` scalar rows are intentional after the fix: accumulated points are
+extra geometry for a policy, not permission to manufacture line-of-sight evidence. A 24 x 32 depth
+camera cannot identify a surface hidden behind a boss from that look; moving exposes the
+neighbourhood, but the coarse returns still do not reliably associate the best visible surface with
+the target. Raising these figures with the frozen oracle's sample mask would violate the information
+boundary.
+
+### Ceiling and honest policy-gap attribution
+
+The best measured observation ceiling is therefore the oracle-ordered K=4 depth correlation of
+**0.647**, not 1.0 and not a monotonically improving K=8 claim. For one explicitly labeled diagnostic
+attribution, linearly attenuating the 0.638 full-information ceiling from the 0.123 random baseline by
+that correlation gives `0.123 + 0.647 * (0.638 - 0.123) = 0.456`. On that approximation, observation
+quality accounts for **0.182 of the 0.337 policy-to-oracle gap, or 54.0%**; the remaining 0.155
+(46.0%) is selection/policy headroom. The deployment-realistic random K=8 correlation of 0.415 gives
+a lower estimated ceiling of 0.337 and attributes 0.301, or 89.4%, of the gap to observation quality.
+These are diagnostic estimates, not causal bounds: correlation of the visibility component cannot
+identify aggregate policy quality.
+
+Both comparison bars remain necessary. The limited policy's 0.301 is 2.45x random (0.123) and 1.75x
+the fixed isometric view (0.172), so it is useful under deployable information. In the same breath, it
+recovers only 47.2% of the 0.638 full-information oracle ceiling, limited-information data scaling
+saturates at validation regret 0.346 / 0.344 / 0.351 for 200 / 1,000 / 5,000 parts, and sequential
+K=4 adds nothing within whole-part uncertainty (depth 0.439 vs random 0.439, prior 0.446 vs 0.439,
+sparse 0.431 vs 0.439; every delta interval crosses zero).
 
 ## What remains unproven
 

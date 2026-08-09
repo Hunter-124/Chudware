@@ -331,24 +331,6 @@ def _sparse_visibility(
     return float(np.clip(np.sum(weights[visible]), 0.0, 1.0))
 
 
-def _cloud_range_map(points: np.ndarray, camera: CameraPose, config: ObservationConfig) -> np.ndarray:
-    depth = np.full(config.depth_height * config.depth_width, np.inf, dtype=np.float64)
-    if len(points):
-        projection = project_points(points, camera)
-        ranges = np.linalg.norm(points - camera.position, axis=1)
-        rows = np.floor(projection.pixels[:, 1] / camera.image_height_px * config.depth_height).astype(np.int64)
-        columns = np.floor(projection.pixels[:, 0] / camera.image_width_px * config.depth_width).astype(np.int64)
-        inside = (
-            (projection.depth > camera.near)
-            & (rows >= 0)
-            & (rows < config.depth_height)
-            & (columns >= 0)
-            & (columns < config.depth_width)
-        )
-        flat_indices = rows[inside] * config.depth_width + columns[inside]
-        np.minimum.at(depth, flat_indices, ranges[inside])
-    depth[~np.isfinite(depth)] = np.nan
-    return depth.reshape((config.depth_height, config.depth_width))
 
 
 def _level_evidence(
@@ -376,10 +358,7 @@ def _level_evidence(
     elif level == "sparse_points":
         visibility = _sparse_visibility(scene, feature_id, frame.effective_camera, frame, config)
     else:
-        current_visibility = _depth_visibility(scene, feature_id, frame.effective_camera, frame.depth, config)
-        prior_depth = _cloud_range_map(accumulated_points, camera, config)
-        prior_visibility = _depth_visibility(scene, feature_id, camera, prior_depth, config)
-        visibility = max(current_visibility, prior_visibility)
+        visibility = _depth_visibility(scene, feature_id, frame.effective_camera, frame.depth, config)
     return visibility, accumulated_points, accumulated_normals
 
 
@@ -477,7 +456,11 @@ def observe(
 
 
 class SequentialObserver:
-    """Stateful K-look sensor; each look records outcomes and fuses only observed surfaces."""
+    """Stateful K-look sensor with per-frame visits and a running-best visibility estimate.
+
+    Finite surface returns are voxel-unioned for the prior level. ``VisitRecord`` values remain
+    outcomes of one frame; the returned observation's scalar summarizes all visits so far.
+    """
 
     def __init__(
         self,
@@ -527,6 +510,7 @@ class SequentialObserver:
             feature_confidence=region.confidence,
         )
         visits = self._visits + (visit,)
+        accumulated_visibility = max(record.visibility_estimate for record in visits)
         result = _build_observation(
             self._scene,
             camera,
@@ -534,7 +518,7 @@ class SequentialObserver:
             frame,
             region,
             visits,
-            visibility,
+            accumulated_visibility,
             accumulated_points,
             accumulated_normals,
         )

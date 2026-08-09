@@ -7274,3 +7274,37 @@ contention artifact recorded earlier, in code this work never touched.
 Note for future runs on this box: `/tmp` is a 16 GB tmpfs sitting at 81 % from other sessions' build
 scratch, and GCC assembling large TUs there fails with "Disk quota exceeded". Build and test with
 `TMPDIR=$PWD/core/build-linux/tmp`.
+
+## 2026-08-08 — Viewpoint observation: the sequential null was partly a defect
+
+Chasing the sequential null result found a real bug rather than a property of the problem. The
+observation package's public `visibility_estimate` described only the CURRENT camera even though the
+observer had accumulated a history — so a policy given four looks was, for that scalar, still being
+handed one. It now returns the running best across looks. A second defect went the other way: prior
+accumulated points were being reprojected and OR-ed into visibility, which lets stale geometry
+manufacture line-of-sight evidence through an occluder; that was removed, and accumulated points are
+now finite-only voxel-union geometry that cannot claim current visibility.
+
+An earlier blocker was also fixed on the way: the level readouts all returned identical numbers
+because the proxy compared raycast RANGES against forward-axis projection depth. Per-level
+line-of-sight occlusion now runs from each level's own data, and `full` correlates 1.000 with the
+frozen oracle — the sanity check that proves the estimator, which the old proxy failed at 0.153.
+
+With that fixed, accumulation genuinely does add information. Depth-level correlation with true
+visibility under oracle-chosen look ordering: K=1 0.324, K=2 0.549, K=4 0.647 — then DOWN to 0.558 at
+K=8, which is non-monotonic and reported as such rather than smoothed. Random ordering is weaker
+throughout (0.340 / 0.481 / 0.438 / 0.415). Four fusion-defect hypotheses were tested and eliminated
+with numbers: looks are not resampling the same rays (mean consecutive angle 90.0° random / 77.7°
+oracle), fusion is not overwriting (finite voxels grow 67 → 524), NaN misses are not poisoning
+anything (all 512 checkpoint observations finite), and neighbourhood support does grow (0.420 → 0.996).
+
+The useful number this produces is the gap decomposition. At the best depth ceiling (oracle K=4,
+r=0.647) observation quality accounts for 0.182 of the 0.337 policy-versus-oracle gap — **54 %** —
+leaving 46 % as policy headroom. Under random K=8 ordering it accounts for 89 %. It is a labelled
+diagnostic estimate, not a causal bound, and is documented that way.
+
+So the earlier sequential null had two causes stacked: an 8-candidate pool that let random search
+exhaust the space, and a history-blind scalar. Both are fixed; the corrected 256-pool sequential run
+is in flight.
+
+Gates: `pytest services/viewpoint` 50 passed, frozen oracle/geometry/sampling/parts/dataset untouched.

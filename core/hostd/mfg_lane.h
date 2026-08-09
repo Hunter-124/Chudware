@@ -34,7 +34,8 @@ public:
         std::function<nlohmann::json(const std::string&, const nlohmann::json&)>;
 
     explicit ManufacturingLane(std::filesystem::path state_directory,
-                               bool emulator_endpoint_is_physical = false);
+                               bool emulator_endpoint_is_physical = false,
+                               std::function<uint64_t()> monotonic_clock = {});
     ~ManufacturingLane();
 
     ManufacturingLane(const ManufacturingLane&) = delete;
@@ -49,10 +50,11 @@ public:
 private:
     class SteadyClock final : public Clock {
     public:
+        explicit SteadyClock(std::function<uint64_t()> source = {});
         uint64_t mono_ns() const override;
         void advance_ns(uint64_t amount) { offset_ns_.fetch_add(amount); }
-
     private:
+        std::function<uint64_t()> source_;
         std::atomic<uint64_t> offset_ns_{0};
     };
 
@@ -112,6 +114,12 @@ private:
     std::vector<DeviceCandidate> deviceCandidates() const;
     std::optional<DeviceCandidate> findCandidate(std::string_view device_id) const;
     void selectTransport(const DeviceCandidate& candidate);
+    void invalidateSelectedDeviceRecords(std::string_view previous_device_id);
+    void observeMachineIdentity(device::ControllerIdentitySnapshot identity,
+                                device::MachineFingerprint fingerprint);
+    void failExpiredClaimSafely();
+    MachinePolicy lanePolicy() const;
+    Initiator authenticatedInitiator(const LeaseOwner& caller) const;
     void reconcileAllowlistEpoch();
     bool isPrinter() const;
     nlohmann::json workerParams() const;
@@ -147,7 +155,6 @@ private:
     static ExercisableBy parseExercisableBy(std::string_view value);
     static AttendanceMode parseAttendanceMode(std::string_view value);
     static SpindleAuthority parseSpindleAuthority(std::string_view value);
-    static Initiator parseInitiator(const nlohmann::json& value);
 
     mutable std::mutex mutex_;
     EventSink event_sink_;
@@ -161,8 +168,10 @@ private:
     Arbiter arbiter_;
     LeaseRegistry leases_;
     ResultRegistry result_registry_;
-    device::ControllerIdentitySnapshot advertised_identity_;
-    device::MachineFingerprint advertised_fingerprint_;
+    device::ControllerIdentitySnapshot emulator_identity_;
+    device::MachineFingerprint emulator_fingerprint_;
+    device::ControllerIdentitySnapshot current_identity_;
+    std::optional<device::MachineFingerprint> current_machine_fingerprint_;
     device::DeviceId device_id_;
     device::Endpoint endpoint_;
     device::MachineClass machine_class_ = device::MachineClass::Emulated;
@@ -173,6 +182,7 @@ private:
     nlohmann::json printer_capability_;
     bool connected_ = false;
     bool terminal_claim_ = false;
+    std::optional<CommandLease> active_claim_;
     std::map<std::string, ArtifactRecord, std::less<>> artifacts_;
     std::map<std::string, RunRecord, std::less<>> runs_;
     std::map<std::string, ApprovalProposal, std::less<>> proposals_;

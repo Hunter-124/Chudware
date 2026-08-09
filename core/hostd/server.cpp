@@ -10,6 +10,7 @@
 #ifdef _WIN32
 #include <process.h>  // _getpid
 #else
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
@@ -28,6 +29,23 @@ static long selfPid() {
 #else
     return (long)::getpid();
 #endif
+}
+static std::string authenticatedPeerIdentity(const ClientConn& c) {
+#if defined(__linux__)
+    struct ucred credential {};
+    socklen_t size = sizeof(credential);
+    if (c.conn.fd() >= 0 &&
+        ::getsockopt(c.conn.fd(), SOL_SOCKET, SO_PEERCRED,
+                     &credential, &size) == 0 &&
+        size == sizeof(credential))
+        return "uid:" + std::to_string(credential.uid);
+#elif !defined(_WIN32)
+    return "uid:" + std::to_string(::geteuid());
+#endif
+    // Windows named pipes are created with a same-user SID DACL and reject remote
+    // clients. The server-side security boundary is therefore the local OS account,
+    // never a name supplied in the hello payload.
+    return "local-os-account";
 }
 
 static long long monoMs() {
@@ -500,13 +518,11 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         c.kind = params.value("client", "unknown");
         c.pid = params.value("pid", 0L);
         if (c.kind == "gui") guiDetached_ = false;  // GUI (re)attached: full linger again
-        // Optional multi-user identity: params.user = {id, display}.
-        c.userId.clear();
-        c.userDisplay.clear();
-        if (params.contains("user") && params["user"].is_object()) {
-            c.userId = params["user"].value("id", std::string());
-            c.userDisplay = params["user"].value("display", std::string());
-        }
+        // Manufacturing authority and document attribution use the authenticated
+        // local peer credential. `hello.user` is display metadata supplied by the
+        // client and is never accepted as an identity assertion.
+        c.userId = authenticatedPeerIdentity(c);
+        c.userDisplay = c.userId;
         return json{{"proto", 1},
                     {"abi", core::cpp_core().abiVersion()},
                     {"git_rev", buildId_},
@@ -523,9 +539,10 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0}};
     }
     if (method == "ping") return json{{"ok", true}};
+    const std::string authenticatedSeat = authenticatedPeerIdentity(c);
     const chudware::mfg::LeaseOwner mfgCaller{
         c.kind.empty() ? "unknown" : c.kind,
-        c.userId.empty() ? "local-seat" : c.userId,
+        authenticatedSeat,
         "hostd-client:" + std::to_string(c.id)};
     if (auto result = chudware::mfg::lane().handle(method, params, mfgCaller)) {
         isError = result->is_error;

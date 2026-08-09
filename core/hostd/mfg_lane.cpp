@@ -135,10 +135,9 @@ json policyJson(const MachinePolicy& policy) {
             {"feedback_relay_commissioned", policy.feedback_relay_commissioned},
             {"emulator_stage_passed", "E3"}, {"revision", policy.revision}};
 }
-MachinePolicy lanePolicy() {
-    auto policy = default_policy(device::MachineClass::Emulated);
-    policy.max_exercisable_by = ExercisableBy::HumanOrAgent;
-    return policy;
+bool virtualQualificationEndpoint(const gateway::AllowlistEntry& entry) {
+    const auto origin = entry.connection.find("origin");
+    return origin != entry.connection.end() && origin->second == "virtual";
 }
 
 
@@ -171,24 +170,33 @@ json initiatorJson(const InitiatorProvenance& value) {
 }
 
 }  // namespace
+ManufacturingLane::SteadyClock::SteadyClock(std::function<uint64_t()> source)
+    : source_(std::move(source)) {}
+
 
 uint64_t ManufacturingLane::SteadyClock::mono_ns() const {
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count()) +
-        offset_ns_.load();
+    const uint64_t base = source_
+        ? source_()
+        : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count());
+    return base + offset_ns_.load();
 }
 
 ManufacturingLane::ManufacturingLane(std::filesystem::path state_directory,
-                                     bool emulator_endpoint_is_physical)
+                                     bool emulator_endpoint_is_physical,
+                                     std::function<uint64_t()> monotonic_clock)
     : epoch_(device::LaneEpoch::mint("manufacturing")),
       journal_((std::filesystem::create_directories(state_directory), state_directory), epoch_),
       allowlist_(state_directory / "device_allowlist.tsv"),
       observed_allowlist_epoch_(allowlist_.epoch()),
+      clock_(std::move(monotonic_clock)),
       arbiter_(journal_, clock_, nonces_), leases_(journal_),
       result_registry_(ResultRegistry::manufacturingDefaults()),
-      advertised_identity_(advertisedIdentity()),
-      advertised_fingerprint_(device::MachineFingerprint::from_identity(advertised_identity_)),
-      device_id_(device::DeviceId::mint(device::MachineClass::Emulated, advertised_fingerprint_)),
+      emulator_identity_(advertisedIdentity()),
+      emulator_fingerprint_(device::MachineFingerprint::from_identity(emulator_identity_)),
+      current_identity_(emulator_identity_),
+      current_machine_fingerprint_(emulator_fingerprint_),
+      device_id_(device::DeviceId::mint(device::MachineClass::Emulated, emulator_fingerprint_)),
       endpoint_{"mfg-emulator", "inproc://mfg-emulator", emulator_endpoint_is_physical} {
     DeviceCandidate emulator{device_id_.str(), device::MachineClass::Emulated,
                              device::TransportKind::Emulator, endpoint_, true, std::nullopt};
@@ -234,6 +242,7 @@ std::optional<LaneRpcResult> ManufacturingLane::handle(std::string_view method,
         if (!allowlist_.reload(&reload_why))
             return refuse("mfg_device_allowlist_invalid", reload_why);
         reconcileAllowlistEpoch();
+        failExpiredClaimSafely();
         return route(method, params, caller);
     } catch (const std::invalid_argument& error) {
         return refuse("mfg_invalid_params", error.what());
@@ -262,7 +271,7 @@ LaneRpcResult ManufacturingLane::refuse(std::string code, std::string message,
 std::vector<ManufacturingLane::DeviceCandidate> ManufacturingLane::deviceCandidates() const {
     std::vector<DeviceCandidate> candidates;
     candidates.push_back({device::DeviceId::mint(device::MachineClass::Emulated,
-                                                  advertised_fingerprint_).str(),
+                                                  emulator_fingerprint_).str(),
                           device::MachineClass::Emulated, device::TransportKind::Emulator,
                           {"mfg-emulator", "inproc://mfg-emulator",
                            endpoint_.endpoint_is_physical &&
@@ -276,7 +285,8 @@ std::vector<ManufacturingLane::DeviceCandidate> ManufacturingLane::deviceCandida
         candidate.device_id = candidateId(entry.machine_class, entry.endpoint);
         candidate.machine_class = entry.machine_class;
         candidate.transport_kind = entry.endpoint.transport;
-        candidate.endpoint = {candidate.device_id, endpointAddress(entry), true};
+        candidate.endpoint = {candidate.device_id, endpointAddress(entry),
+                              !virtualQualificationEndpoint(entry)};
         candidate.allowlisted = true;
         candidate.allowlist_entry = entry;
         candidates.push_back(std::move(candidate));
@@ -310,6 +320,9 @@ std::optional<ManufacturingLane::DeviceCandidate> ManufacturingLane::findCandida
 }
 
 void ManufacturingLane::selectTransport(const DeviceCandidate& candidate) {
+    const std::string previous_device_id = device_id_.str();
+    if (!previous_device_id.empty() && previous_device_id != candidate.device_id)
+        invalidateSelectedDeviceRecords(previous_device_id);
     if (adapter_) adapter_->close();
     else if (transport_) transport_->close();
     adapter_.reset();
@@ -324,6 +337,15 @@ void ManufacturingLane::selectTransport(const DeviceCandidate& candidate) {
     const auto parsed_id = device::DeviceId::parse(candidate.device_id);
     if (!parsed_id) throw std::invalid_argument("candidate has invalid device_id");
     device_id_ = *parsed_id;
+
+    current_identity_ = emulator_identity_;
+    current_identity_.machine_class = machine_class_;
+    current_identity_.transport_kind = std::string(device::to_string(transport_kind_));
+    current_identity_.transport_endpoint_id = endpoint_.endpoint_id;
+    current_machine_fingerprint_ =
+        transport_kind_ == device::TransportKind::Emulator
+            ? std::optional<device::MachineFingerprint>(emulator_fingerprint_)
+            : std::nullopt;
 
     switch (transport_kind_) {
         case device::TransportKind::Emulator:
@@ -348,9 +370,145 @@ void ManufacturingLane::selectTransport(const DeviceCandidate& candidate) {
             *transport_, [this] { return clock_.mono_ns(); }, std::move(config),
             "manufacturing");
     }
-    advertised_identity_.machine_class = machine_class_;
-    advertised_identity_.transport_kind = std::string(device::to_string(transport_kind_));
-    advertised_identity_.transport_endpoint_id = endpoint_.endpoint_id;
+}
+
+void ManufacturingLane::invalidateSelectedDeviceRecords(
+    std::string_view previous_device_id) {
+    std::vector<std::string> affected;
+    for (auto& [approval_id, approval] : approvals_) {
+        if (approval.machine.device_id != previous_device_id) continue;
+        approval.nonce.state = NonceState::Void;
+        affected.push_back(approval_id);
+    }
+    for (auto& [run_id, run] : runs_) {
+        if (run.device_id != previous_device_id) continue;
+        const bool active = run.state == device::RunState::Running ||
+                            run.state == device::RunState::Holding ||
+                            run.state == device::RunState::Held ||
+                            run.state == device::RunState::Aborting;
+        if (active) arbiter_.record_discontinuity(
+            run_id, device::RunDiscontinuity::Disconnect);
+        run.discontinuity = active ? device::RunDiscontinuity::Disconnect
+                                  : device::RunDiscontinuity::None;
+        run.state = active ? device::RunState::Faulted : device::RunState::Abandoned;
+        affected.push_back(run_id);
+    }
+    std::erase_if(proposals_, [&](const auto& item) {
+        const auto run = runs_.find(item.second.run_id);
+        return run != runs_.end() && run->second.device_id == previous_device_id;
+    });
+    if (affected.empty()) return;
+    InvalidationNotice notice;
+    notice.classification = InvalidationClass::Falsified;
+    notice.reason = "selected_device_changed";
+    notice.why = "device-scoped authorization was invalidated when command ownership selected another device";
+    notice.affected = std::move(affected);
+    notice.at_seq = journal_.head() + 1;
+    notice.at_seq = appendEvent("mfg.result.falsified",
+                                std::string(previous_device_id), notice);
+    invalidations_.push_back(std::move(notice));
+}
+
+void ManufacturingLane::observeMachineIdentity(
+    device::ControllerIdentitySnapshot identity,
+    device::MachineFingerprint fingerprint) {
+    if (current_machine_fingerprint_ &&
+        current_machine_fingerprint_->str() != fingerprint.str()) {
+        std::vector<std::string> affected;
+        for (auto& [approval_id, approval] : approvals_) {
+            if (approval.machine.device_id != device_id_.str() ||
+                approval.nonce.state == NonceState::Void) continue;
+            approval.nonce.state = NonceState::Void;
+            affected.push_back(approval_id);
+            const auto run = runs_.find(approval.run_id);
+            if (run != runs_.end()) {
+                run->second.approval_id.clear();
+                run->second.gate_report_ref.clear();
+                run->second.state = device::RunState::Draft;
+                affected.push_back(run->first);
+            }
+        }
+        if (!affected.empty()) {
+            InvalidationNotice notice;
+            notice.classification = InvalidationClass::Falsified;
+            notice.reason = "observed_machine_fingerprint_changed";
+            notice.why = "the controller identified at connect no longer matches the approved machine";
+            notice.affected = std::move(affected);
+            notice.at_seq = journal_.head() + 1;
+            notice.at_seq = appendEvent("mfg.result.falsified",
+                                        device_id_.str(), notice);
+            invalidations_.push_back(std::move(notice));
+        }
+    }
+    current_identity_ = std::move(identity);
+    current_machine_fingerprint_ = std::move(fingerprint);
+}
+
+void ManufacturingLane::failExpiredClaimSafely() {
+    if (!active_claim_) return;
+    const auto current = leases_.describe(device_id_.str(), clock_.mono_ns());
+    if (current && current->lease_id == active_claim_->lease_id) {
+        active_claim_ = *current;
+        return;
+    }
+
+    const CommandLease expired = *active_claim_;
+    if (connected_) {
+        if (isPrinter() && worker_call_) {
+            try {
+                worker_call_("mfg_printer_adapter_cancel",
+                             {{"adapter_id", device_id_.str()}});
+            } catch (...) {
+            }
+        } else if (adapter_) {
+            (void)adapter_->abort();
+        }
+        closeActiveDevice("commander lease expired");
+    }
+    terminal_claim_ = true;
+    std::vector<std::string> affected{expired.lease_id, device_id_.str()};
+    for (auto& [run_id, run] : runs_) {
+        if (run.device_id != device_id_.str()) continue;
+        const bool active = run.state == device::RunState::Running ||
+                            run.state == device::RunState::Holding ||
+                            run.state == device::RunState::Held ||
+                            run.state == device::RunState::Aborting;
+        if (!active) continue;
+        arbiter_.record_discontinuity(run_id, device::RunDiscontinuity::Disconnect);
+        run.discontinuity = device::RunDiscontinuity::Disconnect;
+        run.state = device::RunState::Faulted;
+        appendEvent("mfg.run.state", run_id,
+                    {{"run_id", run_id}, {"state", "faulted"},
+                     {"cause", "commander_lease_expired"}, {"terminal", true}});
+        affected.push_back(run_id);
+    }
+    InvalidationNotice notice;
+    notice.classification = InvalidationClass::Falsified;
+    notice.reason = "commander_lease_expired";
+    notice.why = "the authenticated command owner stopped renewing its lease; the active device was failed closed";
+    notice.affected = std::move(affected);
+    notice.at_seq = journal_.head() + 1;
+    notice.at_seq = appendEvent("mfg.result.falsified", expired.lease_id, notice);
+    invalidations_.push_back(std::move(notice));
+    active_claim_.reset();
+}
+
+MachinePolicy ManufacturingLane::lanePolicy() const {
+    auto policy = default_policy(machine_class_);
+    if (!endpoint_.endpoint_is_physical)
+        policy.max_exercisable_by = ExercisableBy::HumanOrAgent;
+    return policy;
+}
+
+Initiator ManufacturingLane::authenticatedInitiator(const LeaseOwner& caller) const {
+    Initiator out;
+    out.kind = caller.client_kind == "agent" || caller.client_kind == "mcp"
+        ? gates::InitiatorKind::Agent
+        : gates::InitiatorKind::Human;
+    out.identity = caller.seat;
+    out.seat = caller.seat;
+    if (out.kind == gates::InitiatorKind::Agent) out.agent_run_id = caller.session;
+    return out;
 }
 
 bool ManufacturingLane::isPrinter() const {
@@ -440,6 +598,7 @@ void ManufacturingLane::reconcileAllowlistEpoch() {
         closeActiveDevice("allowlist epoch changed");
         const auto released = leases_.release(active->lease_id, active->owner, clock_.mono_ns());
         (void)released;
+        active_claim_.reset();
         InvalidationNotice notice;
         notice.classification = InvalidationClass::Falsified;
         notice.reason = "allowlist_epoch_changed";
@@ -658,6 +817,10 @@ json ManufacturingLane::capabilityJson() const {
             {{"level", "execute"}, {"truth", "assumed"}, {"evidence_ref", json::array()},
              {"emulator_stage", "E3"}, {"missing_level", "execute"},
              {"why", "physical execute requires an attended hardware pilot"}};
+    } else {
+        const json base = capabilityReport();
+        capability["max_advertised"] = "execute";
+        capability["levels"]["execute"] = base["levels"]["execute"];
     }
     capability["levels"]["safety_integration"] =
         {{"level", "safety_integration"}, {"truth", "unsupported"},
@@ -803,7 +966,9 @@ json ManufacturingLane::gateReportJson(const gates::GateReport& report) const {
 gates::GateReport ManufacturingLane::computePreflight(RunRecord& run,
                                                         const ArtifactRecord& artifact) {
     gates::GateInput input;
-    input.machine_class = device::MachineClass::Emulated;
+    const auto authorization_machine_class = endpoint_.endpoint_is_physical
+        ? machine_class_ : device::MachineClass::Emulated;
+    input.machine_class = authorization_machine_class;
     input.artifact_kind = artifact.kind;
     FreshValue<device::ControllerSnapshot> snapshot;
     if (adapter_) snapshot = adapter_->snapshot();
@@ -817,33 +982,43 @@ gates::GateReport ManufacturingLane::computePreflight(RunRecord& run,
         snapshot.seq = journal_.head();
         snapshot.age_ms = 0;
         snapshot.ttl_ms = 5000;
-        snapshot.src = endpoint_.endpoint_is_physical ? FreshSource::Probed : FreshSource::Simulated;
+        snapshot.src = endpoint_.endpoint_is_physical ? FreshSource::Probed
+                                                      : FreshSource::Simulated;
         snapshot.state = FreshState::Ok;
         snapshot.normalize();
     }
+    const auto execute_truth = endpoint_.endpoint_is_physical
+        ? device::CapabilityTruthValue::Assumed
+        : device::CapabilityTruthValue::Verified;
     gates::Stage1Check controller;
     controller.name = "controller_snapshot";
     controller.subject = {device_id_.str(), "dev", epoch_.epoch, true, true,
-                          device_id_.str(), device::MachineClass::Emulated};
+                          device_id_.str(), authorization_machine_class};
     controller.candidate.offered_as = gates::Admission::ProbedEvidence;
-    controller.candidate.fresh = gates::metadata(snapshot, "emulator", "manufacturing");
-    controller.candidate.execute_truth = device::CapabilityTruthValue::Verified;
+    controller.candidate.fresh = gates::metadata(
+        snapshot, std::string(device::to_string(transport_kind_)), "manufacturing");
+    controller.candidate.execute_truth = execute_truth;
     controller.candidate.approval_device_id = device_id_.str();
     controller.accepts = {{"dev"}, {gates::Admission::ProbedEvidence}};
     input.stage1.push_back(std::move(controller));
     auto& facts = input.facts;
+    const std::string fingerprint =
+        current_machine_fingerprint_ ? current_machine_fingerprint_->str() : std::string();
+    const bool simulated_qualification = !endpoint_.endpoint_is_physical;
     facts.artifact_hash = artifact.hash_sha256;
     facts.approved_artifact_hash = artifact.hash_sha256;
-    facts.machine_fingerprint = advertised_fingerprint_.str();
-    facts.approved_machine_fingerprint = advertised_fingerprint_.str();
+    facts.machine_fingerprint = fingerprint;
+    facts.approved_machine_fingerprint = fingerprint;
     facts.envelope_min = {0, 0, 0};
     facts.envelope_max = {0, 0, 0};
     facts.travel_min = {0, 0, 0};
-    facts.travel_max = {300, 300, 80};
+    facts.travel_max = simulated_qualification
+        ? std::array<double, 3>{300, 300, 80}
+        : std::array<double, 3>{0, 0, 0};
     facts.wcs_evidence_seq = std::max<device::Seq>(run.job.setup_revision_seq, 1);
     facts.setup_revision_seq = run.job.setup_revision_seq;
-    facts.attendance_policy_satisfied = true;
-    facts.spindle_authority_satisfied = true;
+    facts.attendance_policy_satisfied = simulated_qualification;
+    facts.spindle_authority_satisfied = simulated_qualification;
     facts.alarm_after_preflight = false;
     facts.nonce_unburned = true;
     facts.exercisable_by = ExercisableBy::HumanOnly;
@@ -852,9 +1027,9 @@ gates::GateReport ManufacturingLane::computePreflight(RunRecord& run,
     facts.approval_expiry_mono_ns = facts.now_mono_ns + 300000000000ULL;
     facts.emulator_stage_passed = device::EmulatorStage::E3;
     facts.emulator_stage_required = device::EmulatorStage::E3;
-    facts.interlock_closed = true;
-    facts.feedhold_ack_hold0_observed = true;
-    facts.metrology_tier = 2;
+    facts.interlock_closed = simulated_qualification;
+    facts.feedhold_ack_hold0_observed = simulated_qualification;
+    facts.metrology_tier = simulated_qualification ? 2 : 0;
     facts.slicer_profile_hash = artifact.slicer_profile_hash;
     facts.approved_slicer_profile_hash = artifact.slicer_profile_hash;
 
@@ -875,25 +1050,44 @@ RunAuthorization ManufacturingLane::authorizationFor(const RunRecord& run,
     auth.run_id = run.run_id;
     auth.approval_id = approval.approval_id;
     auth.state = device::RunState::Approved;
-    auth.current_inputs = {approval.machine, approval.artifact, approval.job, approval.snapshot,
-                           approval.preflight, approval.policy_revision, true};
+    auth.current_inputs = {
+        {device_id_.str(), current_machine_fingerprint_
+                               ? current_machine_fingerprint_->str() : std::string()},
+        approval.artifact, approval.job, approval.snapshot,
+        approval.preflight, approval.policy_revision, true};
     auth.gate_report_ref = run.gate_report_ref;
     auto& context = auth.tier0_context;
     context.action = tier0::Action::RunStart;
     context.artifact_kind = artifact.kind;
-    context.machine_class = device::MachineClass::Emulated;
+    context.machine_class = endpoint_.endpoint_is_physical
+        ? machine_class_ : device::MachineClass::Emulated;
     context.policy = lanePolicy();
     context.policy.revision = approval.policy_revision;
-    context.execute_capability = {device::CapabilityLevel::Execute,
-        device::CapabilityTruthValue::Verified, {"res:emulator_e3:built_in"},
-        device::EmulatorStage::E3, std::nullopt, {}};
+    context.execute_capability = {
+        device::CapabilityLevel::Execute,
+        endpoint_.endpoint_is_physical ? device::CapabilityTruthValue::Assumed
+                                       : device::CapabilityTruthValue::Verified,
+        endpoint_.endpoint_is_physical
+            ? std::vector<std::string>{}
+            : std::vector<std::string>{
+                  transport_kind_ == device::TransportKind::Emulator
+                      ? "res:emulator_e3:built_in"
+                      : "res:virtual_qualification"},
+        device::EmulatorStage::E3,
+        endpoint_.endpoint_is_physical
+            ? std::optional<device::CapabilityLevel>(device::CapabilityLevel::Execute)
+            : std::nullopt,
+        endpoint_.endpoint_is_physical
+            ? "physical execute requires an attended hardware pilot" : ""};
     context.emulator_stage_passed = device::EmulatorStage::E3;
     context.commander_lease_held_by_caller = true;
-    context.wcs_established_this_setup = true;
-    context.bed_origin_declared_by_firmware = true;
+    context.wcs_established_this_setup = !endpoint_.endpoint_is_physical;
+    context.bed_origin_declared_by_firmware = !endpoint_.endpoint_is_physical;
 
     auto& input = auth.gate_input;
-    input.machine_class = device::MachineClass::Emulated;
+    const auto authorization_machine_class = endpoint_.endpoint_is_physical
+        ? machine_class_ : device::MachineClass::Emulated;
+    input.machine_class = authorization_machine_class;
     input.artifact_kind = artifact.kind;
     FreshValue<device::ControllerSnapshot> snapshot;
     if (adapter_) snapshot = adapter_->snapshot();
@@ -907,45 +1101,54 @@ RunAuthorization ManufacturingLane::authorizationFor(const RunRecord& run,
         snapshot.seq = journal_.head();
         snapshot.age_ms = 0;
         snapshot.ttl_ms = 5000;
-        snapshot.src = endpoint_.endpoint_is_physical ? FreshSource::Probed : FreshSource::Simulated;
+        snapshot.src = endpoint_.endpoint_is_physical ? FreshSource::Probed
+                                                      : FreshSource::Simulated;
         snapshot.state = FreshState::Ok;
         snapshot.normalize();
     }
+    const auto execute_truth = endpoint_.endpoint_is_physical
+        ? device::CapabilityTruthValue::Assumed
+        : device::CapabilityTruthValue::Verified;
     gates::Stage1Check controller;
     controller.name = "controller_snapshot";
     controller.subject = {device_id_.str(), "dev", epoch_.epoch, true, true,
-                          device_id_.str(), device::MachineClass::Emulated};
+                          device_id_.str(), authorization_machine_class};
     controller.candidate.offered_as = gates::Admission::ProbedEvidence;
-    controller.candidate.fresh = gates::metadata(snapshot, "emulator", "manufacturing");
-    controller.candidate.execute_truth = device::CapabilityTruthValue::Verified;
+    controller.candidate.fresh = gates::metadata(
+        snapshot, std::string(device::to_string(transport_kind_)), "manufacturing");
+    controller.candidate.execute_truth = execute_truth;
     controller.candidate.approval_device_id = device_id_.str();
     controller.accepts = {{"dev"}, {gates::Admission::ProbedEvidence}};
     input.stage1.push_back(std::move(controller));
     auto& facts = input.facts;
+    const bool simulated_qualification = !endpoint_.endpoint_is_physical;
     facts.artifact_hash = artifact.hash_sha256;
-    facts.approved_artifact_hash = artifact.hash_sha256;
-    facts.machine_fingerprint = advertised_fingerprint_.str();
-    facts.approved_machine_fingerprint = advertised_fingerprint_.str();
+    facts.approved_artifact_hash = approval.artifact.hash_sha256;
+    facts.machine_fingerprint =
+        current_machine_fingerprint_ ? current_machine_fingerprint_->str() : std::string();
+    facts.approved_machine_fingerprint = approval.machine.fingerprint_sha256;
     facts.envelope_min = {0, 0, 0};
     facts.envelope_max = {0, 0, 0};
     facts.travel_min = {0, 0, 0};
-    facts.travel_max = {300, 300, 80};
+    facts.travel_max = simulated_qualification
+        ? std::array<double, 3>{300, 300, 80}
+        : std::array<double, 3>{0, 0, 0};
     facts.wcs_evidence_seq = std::max<device::Seq>(approval.job.setup_revision_seq, 1);
     facts.setup_revision_seq = approval.job.setup_revision_seq;
-    facts.attendance_policy_satisfied = true;
-    facts.spindle_authority_satisfied = true;
+    facts.attendance_policy_satisfied = simulated_qualification;
+    facts.spindle_authority_satisfied = simulated_qualification;
     facts.alarm_after_preflight = false;
-    facts.nonce_unburned = true;
+    facts.nonce_unburned = approval.nonce.state == NonceState::Unburned;
     facts.exercisable_by = approval.exercisable_by;
     facts.now_mono_ns = clock_.mono_ns();
     facts.approval_expiry_mono_ns = approval.expiry.t_mono_ns;
     facts.emulator_stage_passed = device::EmulatorStage::E3;
     facts.emulator_stage_required = device::EmulatorStage::E3;
-    facts.interlock_closed = true;
-    facts.feedhold_ack_hold0_observed = true;
-    facts.metrology_tier = 2;
+    facts.interlock_closed = simulated_qualification;
+    facts.feedhold_ack_hold0_observed = simulated_qualification;
+    facts.metrology_tier = simulated_qualification ? 2 : 0;
     facts.slicer_profile_hash = artifact.slicer_profile_hash;
-    facts.approved_slicer_profile_hash = artifact.slicer_profile_hash;
+    facts.approved_slicer_profile_hash = approval.artifact.slicer_profile_hash;
     return auth;
 }
 
@@ -976,23 +1179,6 @@ SpindleAuthority ManufacturingLane::parseSpindleAuthority(std::string_view value
     throw std::invalid_argument("invalid spindle_authority");
 }
 
-Initiator ManufacturingLane::parseInitiator(const json& value) {
-    if (!value.is_object()) throw std::invalid_argument("initiator object is required");
-    Initiator out;
-    const std::string kind = value.value("kind", std::string{});
-    if (kind == "human") out.kind = gates::InitiatorKind::Human;
-    else if (kind == "agent") out.kind = gates::InitiatorKind::Agent;
-    else throw std::invalid_argument("initiator.kind must be human or agent");
-    out.identity = value.value("identity", std::string{});
-    out.seat = value.value("seat", std::string{});
-    if (out.identity.empty() || out.seat.empty())
-        throw std::invalid_argument("initiator identity and seat are required");
-    if (value.contains("agent_run_id") && !value.at("agent_run_id").is_null())
-        out.agent_run_id = value.at("agent_run_id").get<std::string>();
-    if (out.kind == gates::InitiatorKind::Agent && !out.agent_run_id)
-        throw std::invalid_argument("agent initiator requires agent_run_id");
-    return out;
-}
 
 LaneRpcResult ManufacturingLane::route(std::string_view method, const json& params,
                                        const LeaseOwner& caller) {
@@ -1038,8 +1224,9 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
     if (method == "mfg_device_describe") {
         if (!validDevice(params, failure)) return failure;
         serviceDevice();
-        return ok({{"identity", advertised_identity_.canonical()},
-                   {"fingerprint_sha256", advertised_fingerprint_.str()},
+        return ok({{"identity", current_identity_.canonical()},
+                   {"fingerprint_sha256", current_machine_fingerprint_
+                        ? json(current_machine_fingerprint_->str()) : json(nullptr)},
                    {"capability", capabilityJson()},
                    {"transport", {{"kind", device::to_string(transport_kind_)},
                                   {"endpoint_id", endpoint_.endpoint_id},
@@ -1076,8 +1263,9 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         if (!current) selectTransport(*candidate);
         const LeaseOwner& owner = caller;
         const uint64_t ttl = params.value("ttl_ms", 15000ULL);
+        const uint64_t heartbeat = std::min<uint64_t>(3000, std::max<uint64_t>(1, ttl / 3));
         const auto claimed = leases_.claim(device_id_.str(), owner, clock_.mono_ns(), ttl,
-                                           std::min<uint64_t>(3000, ttl),
+                                           heartbeat,
                                            std::string(device::to_string(transport_kind_)),
                                            endpoint_.endpoint_id);
         if (!claimed.ok)
@@ -1087,6 +1275,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
                                      {"seat", claimed.current_owner->seat},
                                      {"session", claimed.current_owner->session}}
                               : json(nullptr)}});
+        active_claim_ = *claimed.lease;
         const auto seq = journal_.head();
         json public_lease = leaseJson(*claimed.lease);
         public_lease.erase("lease_id");
@@ -1096,11 +1285,36 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         return ok({{"lease", leaseJson(*claimed.lease)},
                    {"transport", device::to_string(transport_kind_)}});
     }
+    if (method == "mfg_device_heartbeat") {
+        if (!validDevice(params, failure)) return failure;
+        const std::string lease_id = params.value("lease_id", std::string{});
+        if (!active_claim_ || lease_id.empty())
+            return refuse("lease.not_found_or_expired",
+                          "heartbeat requires an active commander lease");
+        const auto renewed = leases_.renew(
+            lease_id, caller, clock_.mono_ns(), active_claim_->ttl_ms);
+        if (!renewed.ok)
+            return refuse(renewed.code, renewed.why,
+                          {{"current_owner", renewed.current_owner
+                              ? json{{"client_kind", renewed.current_owner->client_kind},
+                                     {"seat", renewed.current_owner->seat},
+                                     {"session", renewed.current_owner->session}}
+                              : json(nullptr)}});
+        active_claim_ = *renewed.lease;
+        const auto seq = journal_.head();
+        json public_lease = leaseJson(*renewed.lease);
+        public_lease.erase("lease_id");
+        publishEvent("mfg.device.lease", device_id_.str(), seq,
+                     {{"device_id", device_id_.str()}, {"lease", std::move(public_lease)},
+                      {"change", "renewed"}});
+        return ok({{"lease", leaseJson(*renewed.lease)}});
+    }
     if (method == "mfg_device_release") {
         if (!requireLease(params, caller, failure)) return failure;
         const auto active = leases_.describe(device_id_.str(), clock_.mono_ns());
         const auto released = leases_.release(active->lease_id, caller, clock_.mono_ns());
         if (!released.ok) return refuse(released.code, released.why);
+        active_claim_.reset();
         const auto seq = journal_.head();
         json public_lease = leaseJson(*active);
         public_lease.erase("lease_id");
@@ -1128,11 +1342,21 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
             }
             printer_capability_ = probe->value("report", json::object());
             stripWorkerAuthority(printer_capability_);
+            const json observed_identity{
+                {"machine_class", device::to_string(machine_class_)},
+                {"transport_kind", device::to_string(transport_kind_)},
+                {"transport_endpoint_id", endpoint_.endpoint_id},
+                {"printer_subject_id",
+                 printer_capability_.value("subject_id", std::string{})}};
+            observeMachineIdentity(
+                current_identity_,
+                device::MachineFingerprint::from_identity(observed_identity));
             connected_ = true;
             appendEvent("mfg.device.state", device_id_.str(),
                         {{"device_id", device_id_.str()}, {"state", deviceState()},
                          {"raw", "printer adapter probed"}});
             return ok({{"connected", true}, {"device_id", device_id_.str()},
+                       {"fingerprint_sha256", current_machine_fingerprint_->str()},
                        {"capability", capabilityJson()}});
         }
         const auto opened = adapter_->open(endpoint_);
@@ -1164,11 +1388,12 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
             return refuse("mfg_device_identification_failed",
                           "controller did not publish an idle snapshot");
         }
+        observeMachineIdentity(*adapter_->identity(), *adapter_->fingerprint());
         const auto snapshot = adapter_->snapshot();
         appendEvent("mfg.device.snapshot", device_id_.str(),
                     {{"device_id", device_id_.str()}, {"snapshot", snapshot}});
         return ok({{"connected", true}, {"device_id", device_id_.str()},
-                   {"fingerprint_sha256", adapter_->fingerprint()->str()}});
+                   {"fingerprint_sha256", current_machine_fingerprint_->str()}});
     }
     if (method == "mfg_device_disconnect") {
         if (!requireLease(params, caller, failure)) return failure;
@@ -1342,17 +1567,26 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
     if (method == "mfg_preflight_run") {
         if (!requireLease(params, caller, failure)) return failure;
         if (!connected_) return refuse("mfg_transport_not_connected",
-                                       "preflight requires a connected emulator snapshot");
+                                       "preflight requires a connected identified device");
         serviceDevice();
         const std::string artifact_id = params.value("artifact_id", std::string{});
         const auto artifact_it = artifacts_.find(artifact_id);
         if (artifact_it == artifacts_.end())
             return refuse("mfg_artifact_not_found", "artifact_id is not registered");
+        if (artifact_it->second.device_id != device_id_.str())
+            return refuse("mfg_artifact_device_mismatch",
+                          "artifact is bound to a different selected device");
+        if (!current_machine_fingerprint_)
+            return refuse("mfg_device_identification_required",
+                          "preflight requires an observed machine fingerprint");
         RunRecord* run = nullptr;
         const std::string requested_run = params.value("run_id", std::string{});
         if (!requested_run.empty()) {
             const auto existing = runs_.find(requested_run);
             if (existing == runs_.end()) return refuse("mfg_run_not_found", "run_id is not registered");
+            if (existing->second.device_id != device_id_.str())
+                return refuse("mfg_run_device_mismatch",
+                              "run is bound to a different selected device");
             if (existing->second.artifact_id != artifact_id)
                 return refuse("mfg_run_artifact_mismatch", "run is bound to a different artifact");
             run = &existing->second;
@@ -1381,7 +1615,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         tier0::Context tier;
         tier.action = tier0::Action::RunSubmit;
         tier.artifact_kind = artifact_it->second.kind;
-        tier.machine_class = device::MachineClass::Emulated;
+        tier.machine_class = machine_class_;
         tier.artifact_present = true;
         tier.artifact_hashed = !artifact_it->second.hash_sha256.empty();
         tier.post_profile_bound = artifact_it->second.kind == tier0::ArtifactKind::PrintJob ||
@@ -1410,6 +1644,9 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         const std::string run_id = params.value("run_id", std::string{});
         const auto run = runs_.find(run_id);
         if (run == runs_.end()) return refuse("mfg_run_not_found", "run_id is not registered");
+        if (run->second.device_id != device_id_.str())
+            return refuse("mfg_run_device_mismatch",
+                          "approval proposal run is bound to a different selected device");
         if (run->second.gate_report_ref.empty())
             return refuse("mfg_preflight_missing", "approval proposal requires a preflight report");
         ApprovalProposal proposal;
@@ -1419,7 +1656,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         proposal.expiry_ttl_ms = params.value("expiry_ttl_ms", 300000ULL);
         const auto attendance = params.value("attendance", json::object());
         proposal.attendance.mode = parseAttendanceMode(attendance.value("mode", "physical_attended"));
-        proposal.attendance.attested_by = attendance.value("attested_by", std::string{});
+        proposal.attendance.attested_by = caller.seat;
         proposal.spindle_authority = parseSpindleAuthority(
             params.value("spindle_authority", "not_applicable"));
         const auto policy = lanePolicy();
@@ -1440,20 +1677,30 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         const auto proposal = proposals_.find(proposal_id);
         if (proposal == proposals_.end())
             return refuse("mfg_approval_proposal_not_found", "proposal_id is not registered");
-        const auto auth = params.value("approver_auth", json::object());
-        const std::string identity = auth.value("identity", std::string{});
-        const std::string method_auth = auth.value("auth", std::string{});
-        if (identity.empty() || method_auth.empty())
+        if (params.contains("approver_auth"))
+            return refuse("mfg_approval_identity_assertion_forbidden",
+                          "approver identity is derived from the authenticated connection, not request parameters");
+        if (caller.seat.empty() || caller.session.empty())
             return refuse("mfg_approval_human_auth_required",
-                          "approval creation requires authenticated human identity and auth method");
+                          "approval creation requires a server-authenticated connection identity");
         const auto run_it = runs_.find(proposal->second.run_id);
+        if (run_it == runs_.end() || run_it->second.device_id != device_id_.str())
+            return refuse("mfg_run_device_mismatch",
+                          "approval run is bound to a different selected device");
         const auto artifact_it = artifacts_.find(run_it->second.artifact_id);
+        if (artifact_it == artifacts_.end() ||
+            artifact_it->second.device_id != device_id_.str())
+            return refuse("mfg_artifact_device_mismatch",
+                          "approval artifact is bound to a different selected device");
+        if (!current_machine_fingerprint_)
+            return refuse("mfg_device_identification_required",
+                          "approval requires an observed machine fingerprint");
         const auto report_it = gate_reports_.find(run_it->second.gate_report_ref);
         ApprovalBinding approval;
         approval.approval_id = device::ApprovalId::mint().str();
         approval.run_id = run_it->second.run_id;
         approval.issued_at_seq = journal_.head() + 1;
-        approval.machine = {device_id_.str(), advertised_fingerprint_.str()};
+        approval.machine = {device_id_.str(), current_machine_fingerprint_->str()};
         approval.artifact = {artifact_it->second.hash_sha256, artifact_it->second.bytes,
                              artifact_it->second.kind, artifact_it->second.post_profile_id,
                              artifact_it->second.post_profile_hash,
@@ -1462,7 +1709,8 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         approval.snapshot = run_it->second.snapshot;
         approval.preflight = {{run_it->second.gate_report_ref}, run_it->second.gate_report_ref,
                               report_it->second.seq};
-        approval.approver = {identity, method_auth, clock_.mono_ns()};
+        approval.approver = {caller.seat, "hostd_authenticated_connection",
+                             clock_.mono_ns()};
         approval.expiry = {approval.approver.at_mono_ns +
                                proposal->second.expiry_ttl_ms * 1000000ULL,
                            proposal->second.expiry_ttl_ms};
@@ -1529,7 +1777,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
     }
     if (method == "mfg_run_start") {
         if (!requireLease(params, caller, failure)) return failure;
-        if (endpoint_.endpoint_is_physical && !isPrinter())
+        if (endpoint_.endpoint_is_physical)
             return refuse("mfg_physical_execute_not_qualified",
                           "physical execute is not advertised or enabled");
         if (!connected_) return refuse("mfg_transport_not_connected", "run start requires a connected device");
@@ -1537,15 +1785,39 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         const std::string approval_id = params.value("approval_id", std::string{});
         const auto run = runs_.find(run_id);
         if (run == runs_.end()) return refuse("mfg_run_not_found", "run_id is not registered");
+        if (run->second.device_id != device_id_.str())
+            return refuse("mfg_run_device_mismatch",
+                          "run is bound to a different selected device");
+        const auto artifact = artifacts_.find(run->second.artifact_id);
+        if (artifact == artifacts_.end() ||
+            artifact->second.device_id != device_id_.str() ||
+            artifact->second.device_id != run->second.device_id)
+            return refuse("mfg_artifact_device_mismatch",
+                          "run artifact is not bound to the selected device");
         const auto approval = approvals_.find(approval_id);
         if (approval == approvals_.end() || approval->second.nonce.state == NonceState::Void)
             return refuse("approval.revoked_or_missing", "approval is absent or revoked");
+        if (approval->second.run_id != run_id ||
+            run->second.approval_id != approval_id)
+            return refuse("mfg_run_approval_mismatch",
+                          "approval is not bound to this run");
+        if (approval->second.machine.device_id != device_id_.str())
+            return refuse("mfg_approval_device_mismatch",
+                          "approval is bound to a different selected device");
+        if (!current_machine_fingerprint_ ||
+            approval->second.machine.fingerprint_sha256 !=
+                current_machine_fingerprint_->str())
+            return refuse("mfg_approval_machine_fingerprint_mismatch",
+                          "approval is bound to a different observed controller fingerprint");
+        if (params.contains("initiator"))
+            return refuse("mfg_initiator_identity_assertion_forbidden",
+                          "initiator identity is derived from the authenticated connection, not request parameters");
         if (isPrinter() && !worker_call_)
             return refuse("mfg_printer_worker_unavailable",
                           "mfg_printer_adapter_start worker callback is not configured",
                           {{"method", "mfg_printer_adapter_start"}});
         serviceDevice();
-        const auto initiator = parseInitiator(params.at("initiator"));
+        const auto initiator = authenticatedInitiator(caller);
         const auto before = journal_.head();
         const auto outcome = arbiter_.start(run_id, approval_id, initiator);
         for (const auto& record : journal_.replay(before + 1))
@@ -1602,7 +1874,10 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
     }
     if (method == "mfg_run_hold") {
         if (!requireLease(params, caller, failure)) return failure;
-        const auto initiator = parseInitiator(params.at("initiator"));
+        if (params.contains("initiator"))
+            return refuse("mfg_initiator_identity_assertion_forbidden",
+                          "initiator identity is derived from the authenticated connection, not request parameters");
+        const auto initiator = authenticatedInitiator(caller);
         const std::string run_id = params.value("run_id", std::string{});
         const auto lane_run = runs_.find(run_id);
         if (lane_run != runs_.end() &&
@@ -1641,7 +1916,10 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
     }
     if (method == "mfg_run_resume") {
         if (!requireLease(params, caller, failure)) return failure;
-        const auto initiator = parseInitiator(params.at("initiator"));
+        if (params.contains("initiator"))
+            return refuse("mfg_initiator_identity_assertion_forbidden",
+                          "initiator identity is derived from the authenticated connection, not request parameters");
+        const auto initiator = authenticatedInitiator(caller);
         const std::string run_id = params.value("run_id", std::string{});
         serviceDevice();
         const auto lane_run = runs_.find(run_id);
@@ -1684,7 +1962,10 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
     }
     if (method == "mfg_run_abort") {
         if (!requireLease(params, caller, failure)) return failure;
-        const auto initiator = parseInitiator(params.at("initiator"));
+        if (params.contains("initiator"))
+            return refuse("mfg_initiator_identity_assertion_forbidden",
+                          "initiator identity is derived from the authenticated connection, not request parameters");
+        const auto initiator = authenticatedInitiator(caller);
         const std::string run_id = params.value("run_id", std::string{});
         if (isPrinter() && !worker_call_)
             return refuse("mfg_printer_worker_unavailable",

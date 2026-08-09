@@ -120,25 +120,23 @@ struct LaneRig {
              {"attendance", {{"mode", "physical_attended"}, {"attested_by", "operator"}}}});
         const auto proposal_id = proposed.at("proposal").at("proposal_id").get<std::string>();
         const auto created = call(lane, "mfg_approval_create",
-            {{"device_id", device_id}, {"lease_id", lease_id}, {"proposal_id", proposal_id},
-             {"approver_auth", {{"identity", "operator"}, {"auth", "os_seat+pin"}}}});
+            {{"device_id", device_id}, {"lease_id", lease_id},
+             {"proposal_id", proposal_id}});
         return created.at("approval").at("approval_id").get<std::string>();
     }
 
     json start(const std::string& run_id, const std::string& approval_id,
                std::string kind, bool expect_error = false) {
-        json initiator{{"kind", kind}, {"identity", kind == "agent" ? "planner" : "operator"},
-                       {"seat", kind == "agent" ? "agent-seat" : "human-seat"}};
-        if (kind == "agent") initiator["agent_run_id"] = "agent-run:test";
-        return call(lane, "mfg_run_start",
-            {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
-             {"approval_id", approval_id}, {"initiator", std::move(initiator)}}, expect_error);
+        json params{{"device_id", device_id}, {"lease_id", lease_id},
+                    {"run_id", run_id}, {"approval_id", approval_id}};
+        if (kind == "agent")
+            params["initiator"] = {{"kind", "agent"}, {"identity", "forged-agent"},
+                                   {"seat", "forged-seat"},
+                                   {"agent_run_id", "forged-agent-run"}};
+        return call(lane, "mfg_run_start", std::move(params), expect_error);
     }
 };
 
-json humanInitiator() {
-    return {{"kind", "human"}, {"identity", "operator"}, {"seat", "human-seat"}};
-}
 
 struct StartedPrinterRun {
     std::string run_id;
@@ -167,13 +165,12 @@ StartedPrinterRun startPrinterRun(ManufacturingLane& lane,
     const auto approval = call(
         lane, "mfg_approval_create",
         {{"device_id", device_id}, {"lease_id", lease_id},
-         {"proposal_id", proposal.at("proposal").at("proposal_id")},
-         {"approver_auth", {{"identity", "operator"}, {"auth", "os_seat+pin"}}}});
+         {"proposal_id", proposal.at("proposal").at("proposal_id")}});
     const std::string approval_id = approval.at("approval").at("approval_id");
     const auto started = call(
         lane, "mfg_run_start",
         {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
-         {"approval_id", approval_id}, {"initiator", humanInitiator()}});
+         {"approval_id", approval_id}});
     REQUIRE(started.at("state") == "running");
     return {run_id, approval_id};
 }
@@ -322,7 +319,7 @@ TEST_CASE("preflight is seq stamped, complete, and reproducible") {
     CHECK(reread.at("gate_report") == b);
 }
 
-TEST_CASE("arbiter names human only agent refusal and nonce is single use") {
+TEST_CASE("request-asserted initiator is refused and authenticated nonce is single use") {
     LaneRig rig;
     rig.claim();
     rig.connect();
@@ -332,9 +329,7 @@ TEST_CASE("arbiter names human only agent refusal and nonce is single use") {
     const auto approval_id = rig.approval(run_id, "human_only");
 
     const auto refused = rig.start(run_id, approval_id, "agent", true);
-    CHECK(refused.at("code").get<std::string>().find(
-              "exercisable_by_permits_initiator") != std::string::npos);
-    CHECK(refused.at("detail").at("gate_report").at("verdict") == "fail");
+    CHECK(refused.at("code") == "mfg_initiator_identity_assertion_forbidden");
 
     const auto started = rig.start(run_id, approval_id, "human");
     CHECK(started.at("state") == "running");
@@ -359,15 +354,15 @@ TEST_CASE("hold and abort are accepted but alarm permanently forbids resume") {
     const auto preflight = rig.preflight(artifact_id);
     const auto run_id = preflight.at("run_id").get<std::string>();
     const auto approval_id = rig.approval(run_id, "human_or_agent");
-    REQUIRE(rig.start(run_id, approval_id, "agent").at("state") == "running");
+    REQUIRE(rig.start(run_id, approval_id, "human").at("state") == "running");
 
     const auto held = call(rig.lane, "mfg_run_hold",
-        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}, {"run_id", run_id},
-         {"kind", "feed_hold"}, {"initiator", humanInitiator()}});
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"run_id", run_id}, {"kind", "feed_hold"}});
     CHECK(held.at("state") == "held");
     const auto resume_without_discontinuity = call(rig.lane, "mfg_run_resume",
-        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}, {"run_id", run_id},
-         {"initiator", humanInitiator()}}, true);
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"run_id", run_id}}, true);
     CHECK(resume_without_discontinuity.at("code") == "resume_requires_new_authored_run");
     CHECK(resume_without_discontinuity.at("detail").at("discontinuity") == "none");
     CHECK(resume_without_discontinuity.at("message").get<std::string>().find(
@@ -378,14 +373,14 @@ TEST_CASE("hold and abort are accepted but alarm permanently forbids resume") {
         {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}, {"fault", "alarm"}});
     CHECK(alarm.at("snapshot").at("v").at("state") == "alarm");
     const auto resume = call(rig.lane, "mfg_run_resume",
-        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}, {"run_id", run_id},
-         {"initiator", humanInitiator()}}, true);
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"run_id", run_id}}, true);
     CHECK(resume.at("code") == "no_alarm_since_hold");
     CHECK(resume.at("message").get<std::string>().find("author a new run") != std::string::npos);
 
     const auto aborted = call(rig.lane, "mfg_run_abort",
-        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}, {"run_id", run_id},
-         {"initiator", humanInitiator()}});
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"run_id", run_id}});
     CHECK(aborted.at("state") == "aborting");
 }
 
@@ -437,7 +432,7 @@ TEST_CASE("alarm hard limit and disconnect terminate a running emulator stream")
         const auto preflight = rig.preflight(artifact_id);
         const std::string run_id = preflight.at("run_id");
         const auto approval_id = rig.approval(run_id, "human_or_agent");
-        REQUIRE(rig.start(run_id, approval_id, "agent").at("state") == "running");
+        REQUIRE(rig.start(run_id, approval_id, "human").at("state") == "running");
 
         call(rig.lane, "mfg_emulator_fault_inject",
              {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
@@ -449,7 +444,7 @@ TEST_CASE("alarm hard limit and disconnect terminate a running emulator stream")
         const auto resume = call(
             rig.lane, "mfg_run_resume",
             {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
-             {"run_id", run_id}, {"initiator", humanInitiator()}},
+             {"run_id", run_id}},
             true);
         CHECK(resume.at("code") == fault_case.resume_code);
         CHECK(resume.at("detail").at("discontinuity") ==
@@ -481,6 +476,100 @@ TEST_CASE("emulator fault injection is structurally barred from physical endpoin
     const auto refused = call(lane, "mfg_emulator_fault_inject",
         {{"device_id", device_id}, {"lease_id", lease_id}, {"fault", "alarm"}}, true);
     CHECK(refused.at("code") == "mfg_emulator_fault_physical_endpoint_forbidden");
+    const auto start_refused = call(
+        lane, "mfg_run_start",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"run_id", "run:physical"}, {"approval_id", "approval:physical"}},
+        true);
+    CHECK(start_refused.at("code") == "mfg_physical_execute_not_qualified");
+}
+
+TEST_CASE("approval identity assertions are refused and host identity is stamped") {
+    LaneRig rig;
+    rig.claim();
+    rig.connect();
+    const auto artifact_id = rig.registerArtifact();
+    const auto preflight = rig.preflight(artifact_id);
+    const std::string run_id = preflight.at("run_id");
+    const auto proposed = call(
+        rig.lane, "mfg_approval_propose",
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"run_id", run_id}, {"exercisable_by", "human_only"}});
+    const std::string proposal_id = proposed.at("proposal").at("proposal_id");
+    const auto forged = call(
+        rig.lane, "mfg_approval_create",
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"proposal_id", proposal_id},
+         {"approver_auth", {{"identity", "administrator"},
+                            {"auth", "caller-asserted"}}}},
+        true);
+    CHECK(forged.at("code") == "mfg_approval_identity_assertion_forbidden");
+
+    const auto created = call(
+        rig.lane, "mfg_approval_create",
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"proposal_id", proposal_id}});
+    CHECK(created.at("approval").at("approver").at("identity") == "test-seat");
+    CHECK(created.at("approval").at("approver").at("auth") ==
+          "hostd_authenticated_connection");
+}
+
+TEST_CASE("heartbeat renews the authenticated lease and expiry fails the active run closed") {
+    TempDirectory temp;
+    std::uint64_t now_ns = 1'000'000'000ULL;
+    ManufacturingLane lane(temp.path, false, [&] { return now_ns; });
+    const std::string device_id =
+        call(lane, "mfg_device_list").at("devices").at(0).at("device_id");
+    const auto claimed = call(
+        lane, "mfg_device_claim",
+        {{"device_id", device_id}, {"ttl_ms", 1000ULL}});
+    const std::string lease_id = claimed.at("lease").at("lease_id");
+    CHECK(claimed.at("lease").at("heartbeat_ms") == 333);
+    call(lane, "mfg_device_connect",
+         {{"device_id", device_id}, {"lease_id", lease_id}});
+    const auto artifact = call(
+        lane, "mfg_artifact_register",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"artifact", {{"kind", "nc"},
+                       {"lines", json::array({"G90", "G1 X1 F100", "G1 X2"})}}}});
+    const auto preflight = call(
+        lane, "mfg_preflight_run",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"artifact_id", artifact.at("artifact").at("artifact_id")}});
+    const std::string run_id = preflight.at("run_id");
+    const auto proposal = call(
+        lane, "mfg_approval_propose",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"run_id", run_id}, {"exercisable_by", "human_only"}});
+    const auto approval = call(
+        lane, "mfg_approval_create",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"proposal_id", proposal.at("proposal").at("proposal_id")}});
+    call(lane, "mfg_run_start",
+         {{"device_id", device_id}, {"lease_id", lease_id},
+          {"run_id", run_id},
+          {"approval_id", approval.at("approval").at("approval_id")}});
+
+    now_ns += 300'000'000ULL;
+    call(lane, "mfg_device_heartbeat",
+         {{"device_id", device_id}, {"lease_id", lease_id}});
+    now_ns += 700'000'000ULL;
+    const auto survived = call(
+        lane, "mfg_device_heartbeat",
+        {{"device_id", device_id}, {"lease_id", lease_id}});
+    CHECK(survived.at("lease").at("lease_id") == lease_id);
+
+    now_ns += 1'001'000'000ULL;
+    const auto expired = call(
+        lane, "mfg_device_heartbeat",
+        {{"device_id", device_id}, {"lease_id", lease_id}}, true);
+    CHECK(expired.at("code") == "lease.not_found_or_expired");
+    const auto run = call(lane, "mfg_run_describe", {{"run_id", run_id}});
+    CHECK(run.at("run").at("state") == "faulted");
+    CHECK(run.at("run").at("discontinuity") == "disconnect");
+    const auto device = call(lane, "mfg_device_describe",
+                             {{"device_id", device_id}});
+    CHECK_FALSE(device.at("transport").at("connected"));
 }
 
 
@@ -570,6 +659,131 @@ TEST_CASE("unknown non allowlisted claim is refused by commissioning name") {
     CHECK(refused.at("message").get<std::string>().find("allowlisted") != std::string::npos);
 }
 
+TEST_CASE("observed controller fingerprint change falsifies its approval") {
+    TempDirectory temp;
+    auto entry = commissioned(chudware::device::TransportKind::Tcp,
+                              chudware::device::MachineClass::FdmPrinterEnclosed,
+                              "fingerprint");
+    entry.connection["adapter_kind"] = "moonraker";
+    entry.connection["origin"] = "virtual";
+    seedAllowlist(temp.path, entry);
+    ManufacturingLane lane(temp.path);
+    std::string subject = "printer:controller-a";
+    lane.setWorkerCall([&](const std::string& method, const json&) {
+        if (method == "mfg_printer_adapter_probe")
+            return json{{"ok", true},
+                        {"report", {{"subject_id", subject},
+                                    {"max_advertised", "execute"},
+                                    {"levels", json::array()}}}};
+        return json{{"ok", true}};
+    });
+    const auto candidate = findTransport(call(lane, "mfg_device_list"), "tcp");
+    const std::string device_id = candidate.at("device_id");
+    const auto claimed = call(lane, "mfg_device_claim",
+                              {{"device_id", device_id}});
+    const std::string lease_id = claimed.at("lease").at("lease_id");
+    const auto first_connect = call(
+        lane, "mfg_device_connect",
+        {{"device_id", device_id}, {"lease_id", lease_id}});
+    const std::string first_fingerprint = first_connect.at("fingerprint_sha256");
+    const auto artifact = call(
+        lane, "mfg_artifact_register",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"artifact", {{"kind", "print_job"}, {"content", "G28\n"},
+                       {"slicer_profile_hash", "slicer:fingerprint"}}}});
+    const auto preflight = call(
+        lane, "mfg_preflight_run",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"artifact_id", artifact.at("artifact").at("artifact_id")}});
+    const std::string run_id = preflight.at("run_id");
+    const auto proposal = call(
+        lane, "mfg_approval_propose",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"run_id", run_id}});
+    const auto approval = call(
+        lane, "mfg_approval_create",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"proposal_id", proposal.at("proposal").at("proposal_id")}});
+    const std::string approval_id = approval.at("approval").at("approval_id");
+    CHECK(approval.at("approval").at("machine").at("fingerprint_sha256") ==
+          first_fingerprint);
+
+    call(lane, "mfg_device_disconnect",
+         {{"device_id", device_id}, {"lease_id", lease_id}});
+    subject = "printer:controller-b";
+    const auto second_connect = call(
+        lane, "mfg_device_connect",
+        {{"device_id", device_id}, {"lease_id", lease_id}});
+    CHECK(second_connect.at("fingerprint_sha256") != first_fingerprint);
+    const auto inspected = call(
+        lane, "mfg_approval_inspect", {{"approval_id", approval_id}});
+    CHECK(inspected.at("approval").at("status") == "revoked");
+    const auto invalidations = call(
+        lane, "mfg_result_invalidations", {{"affected", approval_id}});
+    REQUIRE(invalidations.at("invalidations").size() == 1);
+    CHECK(invalidations.at("invalidations").at(0).at("reason") ==
+          "observed_machine_fingerprint_changed");
+}
+
+TEST_CASE("run artifact and approval cannot cross the selected device boundary") {
+    TempDirectory temp;
+    auto entry = commissioned(chudware::device::TransportKind::Tcp,
+                              chudware::device::MachineClass::FdmPrinterEnclosed,
+                              "cross-device");
+    entry.connection["adapter_kind"] = "moonraker";
+    entry.connection["origin"] = "virtual";
+    seedAllowlist(temp.path, entry);
+    ManufacturingLane lane(temp.path);
+    lane.setWorkerCall([](const std::string& method, const json&) {
+        if (method == "mfg_printer_adapter_probe")
+            return json{{"ok", true},
+                        {"report", {{"subject_id", "printer:device-b"},
+                                    {"max_advertised", "execute"},
+                                    {"levels", json::array()}}}};
+        return json{{"ok", true}};
+    });
+    const auto listed = call(lane, "mfg_device_list");
+    const std::string device_a = findTransport(listed, "emulator").at("device_id");
+    const std::string device_b = findTransport(listed, "tcp").at("device_id");
+    const auto claim_a = call(lane, "mfg_device_claim",
+                              {{"device_id", device_a}});
+    const std::string lease_a = claim_a.at("lease").at("lease_id");
+    call(lane, "mfg_device_connect",
+         {{"device_id", device_a}, {"lease_id", lease_a}});
+    const auto artifact = call(
+        lane, "mfg_artifact_register",
+        {{"device_id", device_a}, {"lease_id", lease_a},
+         {"artifact", {{"kind", "nc"}, {"content", "G0 X0\n"}}}});
+    const auto preflight = call(
+        lane, "mfg_preflight_run",
+        {{"device_id", device_a}, {"lease_id", lease_a},
+         {"artifact_id", artifact.at("artifact").at("artifact_id")}});
+    const std::string run_id = preflight.at("run_id");
+    const auto proposal = call(
+        lane, "mfg_approval_propose",
+        {{"device_id", device_a}, {"lease_id", lease_a},
+         {"run_id", run_id}});
+    const auto approval = call(
+        lane, "mfg_approval_create",
+        {{"device_id", device_a}, {"lease_id", lease_a},
+         {"proposal_id", proposal.at("proposal").at("proposal_id")}});
+    const std::string approval_id = approval.at("approval").at("approval_id");
+    call(lane, "mfg_device_release",
+         {{"device_id", device_a}, {"lease_id", lease_a}});
+
+    const auto claim_b = call(lane, "mfg_device_claim",
+                              {{"device_id", device_b}});
+    const std::string lease_b = claim_b.at("lease").at("lease_id");
+    call(lane, "mfg_device_connect",
+         {{"device_id", device_b}, {"lease_id", lease_b}});
+    const auto refused = call(
+        lane, "mfg_run_start",
+        {{"device_id", device_b}, {"lease_id", lease_b},
+         {"run_id", run_id}, {"approval_id", approval_id}},
+        true);
+    CHECK(refused.at("code") == "mfg_run_device_mismatch");
+}
+
 TEST_CASE("allowlist epoch change closes and falsifies an active claim") {
     LaneRig rig;
     rig.claim();
@@ -606,6 +820,7 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
                               "printer");
     entry.connection["adapter_kind"] = "moonraker";
     entry.connection["auth_mode"] = "trusted_host";
+    entry.connection["origin"] = "virtual";
     seedAllowlist(temp.path, entry);
     ManufacturingLane lane(temp.path);
     std::vector<std::string> methods;
@@ -652,13 +867,10 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
           "http://127.0.0.1:39007");
     const auto capability = call(lane, "mfg_device_capability",
                                  {{"device_id", device_id}});
-    CHECK(capability.at("capability").at("max_advertised") == "transport");
+    CHECK_FALSE(candidate.at("transport").at("endpoint_is_physical"));
+    CHECK(capability.at("capability").at("max_advertised") == "execute");
     CHECK(capability.at("capability").at("levels").at("execute").at("truth") ==
-          "assumed");
-    CHECK(capability.at("capability").at("levels").at("execute").at("missing_level") ==
-          "execute");
-    CHECK(capability.at("capability").at("levels").at("safety_integration").at("truth") ==
-          "unsupported");
+          "verified");
 
     const auto telemetry = call(lane, "mfg_telemetry_snapshot",
                                 {{"device_id", device_id}});
@@ -688,8 +900,7 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
     const auto approval = call(
         lane, "mfg_approval_create",
         {{"device_id", device_id}, {"lease_id", lease_id},
-         {"proposal_id", proposal.at("proposal").at("proposal_id")},
-         {"approver_auth", {{"identity", "operator"}, {"auth", "os_seat+pin"}}}});
+         {"proposal_id", proposal.at("proposal").at("proposal_id")}});
     const std::string approval_id = approval.at("approval").at("approval_id");
 
     const auto refused = call(
@@ -699,15 +910,14 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
          {"initiator", {{"kind", "agent"}, {"identity", "planner"},
                         {"seat", "agent-seat"}, {"agent_run_id", "agent:test"}}}},
         true);
-    CHECK(refused.at("code").get<std::string>().find(
-              "exercisable_by_permits_initiator") != std::string::npos);
+    CHECK(refused.at("code") == "mfg_initiator_identity_assertion_forbidden");
     CHECK(std::find(methods.begin(), methods.end(), "mfg_printer_adapter_start") ==
           methods.end());
 
     const auto started = call(
         lane, "mfg_run_start",
         {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
-         {"approval_id", approval_id}, {"initiator", humanInitiator()}});
+         {"approval_id", approval_id}});
     CHECK(started.at("state") == "running");
     REQUIRE(arguments.count("mfg_printer_adapter_start") == 1);
     const auto& token =
@@ -719,14 +929,13 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
 
     const auto held = call(
         lane, "mfg_run_hold",
-        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
-         {"kind", "feed_hold"}, {"initiator", humanInitiator()}});
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"run_id", run_id}, {"kind", "feed_hold"}});
     CHECK(held.at("state") == "held");
     CHECK(methods.back() == "mfg_printer_adapter_pause");
     const auto aborted = call(
         lane, "mfg_run_abort",
-        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
-         {"initiator", humanInitiator()}});
+        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id}});
     CHECK(aborted.at("state") == "aborting");
     CHECK(methods.back() == "mfg_printer_adapter_cancel");
     call(lane, "mfg_device_disconnect",
@@ -741,6 +950,7 @@ TEST_CASE("printer terminal telemetry faults the run and raises attention") {
                               "terminal-printer");
     entry.connection["adapter_kind"] = "moonraker";
     entry.connection["auth_mode"] = "trusted_host";
+    entry.connection["origin"] = "virtual";
     seedAllowlist(temp.path, entry);
     ManufacturingLane lane(temp.path);
     bool terminal_snapshot = false;
@@ -808,14 +1018,14 @@ TEST_CASE("printer terminal telemetry faults the run and raises attention") {
     }));
     const auto resume = call(
         lane, "mfg_run_resume",
-        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run.run_id},
-         {"initiator", humanInitiator()}},
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"run_id", run.run_id}},
         true);
     CHECK(resume.at("code") == "no_alarm_since_hold");
     const auto hold = call(
         lane, "mfg_run_hold",
-        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run.run_id},
-         {"kind", "feed_hold"}, {"initiator", humanInitiator()}},
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"run_id", run.run_id}, {"kind", "feed_hold"}},
         true);
     CHECK(hold.at("code") == "run.terminal");
     const auto reconnect = call(

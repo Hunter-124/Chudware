@@ -7121,3 +7121,79 @@ no longer reports a stale consumed engine. Repo maps refreshed: `.claude/skills/
 gained the manufacturing rows plus the binding rules (family default-OFF, arbiter-only approval,
 deny-by-default allowlist, sole `FreshValue<T>`, journal-only seq, no physical `execute` before the
 pilot, `mfg_run_resume` refuses only), and `gui-workspaces` gained the Manufacture workspace row.
+
+## 2026-08-08 — Manufacturing: the four CRITICAL review findings closed
+
+`docs/manufacturing/24_code_review.md` said the subsystem was not fit to sit behind hardware. Its
+four criticals plus the lease-heartbeat gap are now closed, each made structurally impossible rather
+than merely checked.
+
+Physical execute: the old guard rejected only non-printers, so every allowlisted physical printer
+walked past a ceiling the same lane advertised as `assumed` — and `computePreflight`/`authorizationFor`
+hardcoded `MachineClass::Emulated` with verified execute and passing interlock/feed-hold/metrology
+facts, so preflight could not catch it. Every `endpoint_is_physical` start now fails closed with
+`mfg_physical_execute_not_qualified`, authorization facts derive from the actually-selected device,
+and a virtual qualification endpoint must declare `origin=virtual` in the allowlist instead of the
+printer class being exempted wholesale.
+
+Identity: approver and initiator were self-asserted request fields, and `server.cpp` took the user
+name from the client's own `hello`, so a lease holder could claim to be any human and exercise a
+human-only approval. Both assertions are now rejected outright; provenance derives from the
+authenticated hostd peer (Linux `SO_PEERCRED`) bound to the connection and its lease owner.
+
+Fingerprint: approvals bound `advertised_fingerprint_`, seeded from the built-in emulator identity and
+never recomputed when `selectTransport` changed the endpoint — so gates compared the advertised value
+to itself and a controller swapped at the same address could execute someone else's approval. The
+identity observed during connect is now the current fingerprint, and a change invalidates approvals,
+resets affected runs and appends falsification records.
+
+Device binding: start verified that ids existed but never that the run's, the artifact's and the
+approval's device matched the claimed one, and those records survived release, so an artifact authored
+for device A could start on device B. All bindings are enforced at start and device-scoped records are
+invalidated whenever the selection changes.
+
+Leases: 15-second TTLs advertised a 3-second heartbeat that had no RPC and never called
+`LeaseRegistry::renew`, so hold and abort could be refused while a job was still running.
+`mfg_device_heartbeat` renews only for the owning connection, the GUI emits it from the manufacture
+request pump, and expiry now closes the device and faults the active run deterministically instead of
+stranding it.
+
+Gates: `test_mfg_lane` 27 cases / 840 assertions; `ctest -R 'mfg|grbl|twin|print_model|device_lane|
+transport|cam'` 11/11; `qualify_mfg_e3.py` 9/9 in 0.57 s; `qualify_mfg_printer.sh` 8/8 in 0.79 s;
+`./build.sh` links; `scripts/check.py` 8/8.
+
+The reviewer's blocking verdict is answered. Physical execute stays refused by name until the E4-E6
+pilot actually happens — that is now a deliberate gate rather than an unimplemented one.
+
+## 2026-08-08 — New workstream: the learned viewpoint policy
+
+Direction correction from the user, and my own reporting was the cause: I had been calling the
+telemetry forecaster "the perception work" while he meant a perceptron — a real network — and the idea
+he actually wants is sharper than what I was building. In his words: deterministic perspective view
+shots are terrible and never work, so a network should decide the angle and offset such that the
+geometry that matters can actually be inspected — in CAD and in the real world. He also proposed the
+data flywheel that makes it trainable: the harness offers several candidate renders, the consuming
+model scores which one let it answer, and those scores become preference labels.
+
+That splits cleanly into a two-tier curriculum, which is the architectural claim: geometry is
+learnable from physics, usefulness is not. Stage 1 labels come free and exact from the CAD kernel;
+Stage 2 labels can only come from a consumer of the image.
+
+`services/viewpoint/**` is Stage 1: validated mesh/feature/pose primitives, and a transparent
+inspectability label with seven named components (in-frame coverage, sampled ray-triangle occlusion,
+foreshortening, apparent pixel scale, silhouette exposure, clipping/depth validity, projected
+ambiguity) rather than one opaque score, plus seeded samplers and a versioned dataset with geometry
+hash and full provenance. `services/viewpoint/feedback/**` is the Stage-2 protocol: pairwise
+preference is the authoritative label with rubric scores as bounded diagnostics, candidate order is
+randomized per request with the permutation recorded, abstention cannot produce a label, an exact
+binomial test catches a position-biased scorer, and low inter-rater agreement excludes a record
+instead of quietly poisoning training. `training/viewpoint/**` is the policy and Stage-1 training.
+
+First honest numbers, and they say the benchmark is not yet good enough. Against the fixed isometric
+view the policy scores 0.9287 vs 0.4253 with an 85.7 % strict win rate, which confirms the thesis with
+a number. Against best-of-8 random poses it scores 0.9287 vs 0.9163 with a strict win rate of only
+28.6 %, four of seven oracle components saturate at 1.0, and the locked test set is 14 examples of
+procedural cuboids. Brute-force search is therefore nearly optimal, which means the corpus is too easy
+to demonstrate anything. Two follow-ups are in flight: a genuinely occluding part generator with
+non-saturating components, and a re-framed headline metric — policy@1 against best-of-N random, whose
+crossover N states directly how many renders the expensive downstream model is saved.

@@ -1,6 +1,7 @@
 #include "manufacture_panel.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -25,6 +26,21 @@ namespace ui {
 namespace {
 
 using json = nlohmann::json;
+struct LeaseHeartbeatState {
+    std::string deviceId;
+    std::string leaseId;
+    std::uint64_t intervalMs = 0;
+    std::chrono::steady_clock::time_point next;
+
+    void clear() {
+        deviceId.clear();
+        leaseId.clear();
+        intervalMs = 0;
+        next = {};
+    }
+};
+
+LeaseHeartbeatState leaseHeartbeat;
 
 std::string resultReason(const core::RpcResult& result) {
     if (!result.err.empty()) return result.err;
@@ -149,10 +165,18 @@ void drawModeBanner(AppState& st, const ManufactureRegion& region) {
     } else {
         if (ImGui::Button("Return to Offline Simulation")) {
             const std::string deviceId = st.mfg.liveDeviceId;
+            json release{{"device_id", deviceId}};
+            if (const MfgDevice* device = st.mfgMirror->device(deviceId);
+                device && !device->leaseId.empty())
+                release["lease_id"] = device->leaseId;
+            else if (leaseHeartbeat.deviceId == deviceId &&
+                     !leaseHeartbeat.leaseId.empty())
+                release["lease_id"] = leaseHeartbeat.leaseId;
             st.mfg.mode = MfgUi::Mode::OfflineSimulation;
             st.mfg.liveDeviceId.clear();
+            leaseHeartbeat.clear();
             if (!deviceId.empty())
-                queueManufactureRequest(st, "mfg_device_release", {{"device_id", deviceId}},
+                queueManufactureRequest(st, "mfg_device_release", std::move(release),
                                         "leave_live");
         }
         ImGui::SameLine(0, metrics::U(2));
@@ -312,6 +336,12 @@ void drawOperatorDrawer(AppState& st, const ManufactureRegion& region) {
 
 void queueManufactureRequest(AppState& st, std::string method, json params,
                              std::string context) {
+    // Human provenance is authenticated and stamped by hostd. Request payloads
+    // never carry approver or initiator identity assertions.
+    if (method == "mfg_approval_create") params.erase("approver_auth");
+    if (method == "mfg_run_start" || method == "mfg_run_hold" ||
+        method == "mfg_run_resume" || method == "mfg_run_abort")
+        params.erase("initiator");
     const std::string signature = method + "\n" + params.dump();
     const bool duplicate = std::any_of(st.mfg.requests.begin(), st.mfg.requests.end(),
         [&](const MfgUi::Request& request) {
@@ -323,6 +353,18 @@ void queueManufactureRequest(AppState& st, std::string method, json params,
 }
 
 void dispatchManufactureRequests(AppState& st) {
+    if (st.mfg.mode == MfgUi::Mode::LiveMachine &&
+        !leaseHeartbeat.deviceId.empty() && !leaseHeartbeat.leaseId.empty() &&
+        leaseHeartbeat.intervalMs > 0 &&
+        std::chrono::steady_clock::now() >= leaseHeartbeat.next) {
+        leaseHeartbeat.next = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(leaseHeartbeat.intervalMs);
+        queueManufactureRequest(
+            st, "mfg_device_heartbeat",
+            {{"device_id", leaseHeartbeat.deviceId},
+             {"lease_id", leaseHeartbeat.leaseId}},
+            "lease_heartbeat");
+    }
     if (st.mfg.requestInFlight || st.mfg.requests.empty() || !st.workerStarted || !st.mfgMirror)
         return;
 
@@ -346,12 +388,23 @@ void dispatchManufactureRequests(AppState& st) {
                     : resultReason(result);
                 if (method == "mfg_device_list" && !result.ok)
                     app->mfgMirror->markGatewayError(app->mfg.lastError);
+                if (context == "lease_heartbeat") {
+                    app->mfg.mode = MfgUi::Mode::OfflineSimulation;
+                    app->mfg.liveDeviceId.clear();
+                    leaseHeartbeat.clear();
+                }
                 return;
             }
 
             if (context == "enter_live") {
                 app->mfg.mode = MfgUi::Mode::LiveMachine;
                 app->mfg.liveDeviceId = app->mfg.selectedDeviceId;
+                const json lease = result.result.value("lease", json::object());
+                leaseHeartbeat.deviceId = app->mfg.liveDeviceId;
+                leaseHeartbeat.leaseId = lease.value("lease_id", std::string());
+                leaseHeartbeat.intervalMs = lease.value("heartbeat_ms", 0ULL);
+                leaseHeartbeat.next = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(leaseHeartbeat.intervalMs);
                 queueManufactureRequest(*app, "mfg_device_describe",
                                         {{"device_id", app->mfg.liveDeviceId}});
             } else if (context == "approval_propose" || context == "approval_propose_open") {
@@ -371,6 +424,12 @@ void dispatchManufactureRequests(AppState& st) {
                 if (!app->mfg.selectedRunId.empty())
                     queueManufactureRequest(*app, "mfg_run_describe",
                                             {{"run_id", app->mfg.selectedRunId}});
+            } else if (context == "lease_heartbeat") {
+                const json lease = result.result.value("lease", json::object());
+                leaseHeartbeat.intervalMs =
+                    lease.value("heartbeat_ms", leaseHeartbeat.intervalMs);
+                leaseHeartbeat.next = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(leaseHeartbeat.intervalMs);
             }
         });
 }

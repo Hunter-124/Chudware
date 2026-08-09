@@ -24,7 +24,7 @@ from fixtures.mfg.printers import VirtualPrinter
 
 STEP_NAMES = [
     "printer discovery is allowlisted and unopened",
-    "connect denial and physical capability clamp are named",
+    "connect denial and virtual execute scope are named",
     "printer telemetry is FreshValue and failed responses become unknown",
     "print artifact preflight is seq-stamped",
     "human-only approval, nonce, and post-arbiter start are enforced",
@@ -243,7 +243,6 @@ def propose_and_create(ctx: Context, run_id: str) -> RunBinding:
             "draft proposal unexpectedly carries approval authority")
     created = ctx.client.call("mfg_approval_create", {
         **lease_params(ctx), "proposal_id": proposal_id,
-        "approver_auth": {"identity": "qualification-operator", "auth": "private-seat+pin"},
     })
     approval = created.get("approval")
     require(isinstance(approval, dict), "approval binding is missing")
@@ -252,10 +251,10 @@ def propose_and_create(ctx: Context, run_id: str) -> RunBinding:
     return RunBinding(run_id, approval_id)
 
 
-def start(ctx: Context, binding: RunBinding, initiator: dict[str, str]) -> dict[str, Any]:
+def start(ctx: Context, binding: RunBinding, _initiator: dict[str, str]) -> dict[str, Any]:
     return ctx.client.call("mfg_run_start", {
         **lease_params(ctx), "run_id": binding.run_id,
-        "approval_id": binding.approval_id, "initiator": initiator,
+        "approval_id": binding.approval_id,
     })
 
 
@@ -274,6 +273,8 @@ def step1(ctx: Context) -> None:
     require(isinstance(printer, dict), "commissioned printer candidate is absent")
     require(printer.get("allowlisted") is True, "printer candidate is not allowlisted")
     require(printer.get("lease") == {}, "discovery unexpectedly created a printer lease")
+    require(printer.get("transport", {}).get("endpoint_is_physical") is False,
+            "virtual qualification endpoint was represented as physical")
     assert_fresh_value(printer.get("state"), "declared")
     require(printer["state"]["state"] == "unknown",
             "unopened printer discovery did not remain unknown")
@@ -297,12 +298,12 @@ def step2(ctx: Context) -> None:
     require(isinstance(report, dict), "printer connect returned no capability report")
     execute = capability_level(report, "execute")
     safety = capability_level(report, "safety_integration")
-    require(execute.get("truth") == "assumed" and execute.get("missing_level") == "execute",
-            "printer execute was not clamped to assumed/missing execute")
+    require(execute.get("truth") == "verified",
+            "virtual printer execute was not verified in simulation scope")
     require(safety.get("truth") == "unsupported",
             "printer incorrectly advertises safety integration")
-    require(report.get("max_advertised") != "execute",
-            "printer advertises physical execute before pilot qualification")
+    require(report.get("max_advertised") == "execute",
+            "virtual qualification printer did not advertise simulated execute")
     require(request_count(ctx, "GET", "/printer/info") >= 1 and
             request_count(ctx, "GET", "/printer/objects/query") >= 1,
             "connect did not probe the real virtual Moonraker endpoints")
@@ -356,14 +357,14 @@ def step4(ctx: Context) -> None:
 def step5(ctx: Context) -> None:
     run_id = ctx.observations["primary_run_id"]
     ctx.client.refuse("mfg_run_start", {
-        **lease_params(ctx), "run_id": run_id, "approval_id": "", "initiator": human(),
+        **lease_params(ctx), "run_id": run_id, "approval_id": "",
     }, code="approval.revoked_or_missing")
     binding = propose_and_create(ctx, run_id)
     starts_before = request_count(ctx, "POST", "/printer/print/start")
     ctx.client.refuse("mfg_run_start", {
         **lease_params(ctx), "run_id": run_id, "approval_id": binding.approval_id,
         "initiator": agent(),
-    }, code_contains="exercisable_by_permits_initiator")
+    }, code="mfg_initiator_identity_assertion_forbidden")
     require(request_count(ctx, "POST", "/printer/print/start") == starts_before,
             "agent-refused start reached the printer adapter")
     started = start(ctx, binding, human())
@@ -377,7 +378,6 @@ def step5(ctx: Context) -> None:
     # No approval or lease authority is sent to the vendor endpoint.
     ctx.client.refuse("mfg_run_start", {
         **lease_params(ctx), "run_id": run_id, "approval_id": binding.approval_id,
-        "initiator": human(),
     }, code_contains="approval.present_unexpired_unburned")
     inspected = ctx.client.call("mfg_approval_inspect", {"approval_id": binding.approval_id})
     require(inspected.get("approval", {}).get("status") == "burned",
@@ -390,7 +390,6 @@ def step6(ctx: Context) -> None:
     pauses = request_count(ctx, "POST", "/printer/print/pause")
     held = ctx.client.call("mfg_run_hold", {
         **lease_params(ctx), "run_id": ctx.primary.run_id, "kind": "feed_hold",
-        "initiator": human(),
     })
     require(held.get("state") == "held", "printer hold did not enter held")
     require(request_count(ctx, "POST", "/printer/print/pause") == pauses + 1,
@@ -400,7 +399,7 @@ def step6(ctx: Context) -> None:
 
     cancels = request_count(ctx, "POST", "/printer/print/cancel")
     aborted = ctx.client.call("mfg_run_abort", {
-        **lease_params(ctx), "run_id": ctx.primary.run_id, "initiator": human(),
+        **lease_params(ctx), "run_id": ctx.primary.run_id,
     })
     require(aborted.get("state") in {"aborting", "aborted"},
             "printer abort did not enter an abort state")
@@ -427,7 +426,7 @@ def step7(ctx: Context) -> None:
     require(described.get("state") == "faulted",
             f"printer-side failure ended as {described.get('state')!r}, not faulted")
     refused = ctx.client.refuse("mfg_run_resume", {
-        **lease_params(ctx), "run_id": run_id, "initiator": human(),
+        **lease_params(ctx), "run_id": run_id,
     }, code="no_alarm_since_hold")
     require(refused.get("detail", {}).get("discontinuity") == "alarm",
             "resume refusal did not name the alarm discontinuity")
@@ -560,7 +559,7 @@ def run(hostd: Path) -> int:
             f"tcp\taddress=127.0.0.1\tport={port}"
             "\tmachine_class=fdm_printer_enclosed"
             "\tadapter_kind=moonraker\tauth_mode=trusted_host"
-            "\tnote=private virtual printer qualification\n",
+            "\torigin=virtual\tnote=private virtual printer qualification\n",
             encoding="utf-8",
         )
         env = dict(os.environ)

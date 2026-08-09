@@ -205,7 +205,6 @@ def propose_and_create(ctx: Context, run_id: str, exercisable_by: str) -> tuple[
     require(isinstance(proposal_id, str) and proposal_id, "approval proposal has no id")
     created = ctx.client.call("mfg_approval_create", {
         **lease_params(ctx), "proposal_id": proposal_id,
-        "approver_auth": {"identity": "qualification-operator", "auth": "private-seat+pin"},
     })
     approval = created.get("approval")
     require(isinstance(approval, dict), "approval binding is missing")
@@ -214,10 +213,10 @@ def propose_and_create(ctx: Context, run_id: str, exercisable_by: str) -> tuple[
     return proposal, approval_id
 
 
-def start(ctx: Context, binding: RunBinding, initiator: dict[str, str]) -> dict[str, Any]:
+def start(ctx: Context, binding: RunBinding, _initiator: dict[str, str]) -> dict[str, Any]:
     return ctx.client.call("mfg_run_start", {
         **lease_params(ctx), "run_id": binding.run_id,
-        "approval_id": binding.approval_id, "initiator": initiator,
+        "approval_id": binding.approval_id,
     })
 
 
@@ -264,8 +263,11 @@ def step2(ctx: Context) -> None:
     refused = ctx.client.refuse("mfg_device_claim", {
         "device_id": ctx.emulator_id, "owner": owner("owner-b"), "ttl_ms": 120_000,
     }, code="lease.takeover_refused")
-    require(refused.get("detail", {}).get("current_owner", {}).get("session") == "owner-a",
-            "takeover refusal did not name the current owner")
+    current_owner = refused.get("detail", {}).get("current_owner", {})
+    require(str(current_owner.get("session", "")).startswith("hostd-client:")
+            and str(current_owner.get("seat", "")).startswith("uid:")
+            and current_owner.get("session") != "owner-b",
+            "takeover refusal did not name the server-authenticated current owner")
     released = ctx.client.call("mfg_device_release", {
         "device_id": ctx.emulator_id, "lease_id": first,
     })
@@ -310,7 +312,7 @@ def step5(ctx: Context) -> None:
     run_id = ctx.observations["run_id"]
     require(isinstance(run_id, str) and run_id, "preflight run id is missing")
     ctx.client.refuse("mfg_run_start", {
-        **lease_params(ctx), "run_id": run_id, "approval_id": "", "initiator": human(),
+        **lease_params(ctx), "run_id": run_id, "approval_id": "",
     }, code="approval.revoked_or_missing")
 
 
@@ -329,7 +331,6 @@ def step6(ctx: Context) -> None:
             "draft proposal unexpectedly carries approval authority")
     created = ctx.client.call("mfg_approval_create", {
         **lease_params(ctx), "proposal_id": proposal["proposal_id"],
-        "approver_auth": {"identity": "qualification-operator", "auth": "private-seat+pin"},
     })
     approval = created.get("approval")
     require(isinstance(approval, dict), "approval creation returned no binding")
@@ -337,14 +338,13 @@ def step6(ctx: Context) -> None:
     ctx.client.refuse("mfg_run_start", {
         **lease_params(ctx), "run_id": run_id, "approval_id": binding.approval_id,
         "initiator": agent(),
-    }, code_contains="exercisable_by_permits_initiator")
+    }, code="mfg_initiator_identity_assertion_forbidden")
     started = start(ctx, binding, human())
     require(started.get("state") == "running", "human-authorized start did not enter running")
     require(isinstance(started.get("nonce_burned_at_seq"), int)
             and started["nonce_burned_at_seq"] > 0, "successful start did not burn the nonce")
     ctx.client.refuse("mfg_run_start", {
         **lease_params(ctx), "run_id": run_id, "approval_id": binding.approval_id,
-        "initiator": human(),
     }, code_contains="approval.present_unexpired_unburned")
     inspected = ctx.client.call("mfg_approval_inspect", {"approval_id": binding.approval_id})
     require(inspected.get("approval", {}).get("status") == "burned",
@@ -401,7 +401,7 @@ def step8(ctx: Context) -> None:
     require(terminal.get("state") == "faulted",
             f"alarm run ended as {terminal.get('state')!r}, not faulted")
     refused = ctx.client.refuse("mfg_run_resume", {
-        **lease_params(ctx), "run_id": fault_run, "initiator": human(),
+        **lease_params(ctx), "run_id": fault_run,
     }, code="no_alarm_since_hold")
     require(refused.get("detail", {}).get("discontinuity") == "alarm",
             "resume refusal did not name the alarm discontinuity")
@@ -420,8 +420,7 @@ def step8(ctx: Context) -> None:
             {ctx.primary.run_id, fault_run}, "recovery reused an old RunId")
     ctx.client.refuse("mfg_run_start", {
         **lease_params(ctx), "run_id": recovery_run, "approval_id": fault_approval,
-        "initiator": human(),
-    }, code="run.not_found")
+    }, code="mfg_run_approval_mismatch")
     old_approval = ctx.client.call(
         "mfg_approval_inspect", {"approval_id": fault_approval})
     require(old_approval.get("approval", {}).get("status") == "burned",

@@ -6955,3 +6955,54 @@ Gates: `ctest -R 'test_mfg_foundation|test_grbl_protocol|test_device_lane|test_m
 
 Still deferred: no real serial/TCP/WS transport, no gateway process or RPC dispatch, no MCP tools, no
 GUI surface, and nothing advertises physical `execute`.
+
+## 2026-08-08 — Manufacturing overhaul, phase P4 reach + breadth
+
+The manufacturing core is now reachable from the daemon, agents, and the GUI, and the breadth tracks
+landed.
+
+Integrator decision recorded here so it is not mistaken for an omission: the design's separate
+`chudware-mfgd` process is DEFERRED to P5, when real serial/TCP/WebSocket transports arrive and
+process isolation starts to earn its cost. For P4 the lane lives inside `chudware-hostd` as
+`core/hostd/mfg_lane.{h,cpp}` — compiled into `chudware_manufacturing` so the daemon and
+`test_mfg_lane` share exactly one definition. The safety properties are unchanged: one lane object
+owns a device, the arbiter is still the only approval validator, and no transport reaches hardware.
+
+The lane serves the binding `mfg_*` surface (device list/describe/capability/claim/release/connect,
+telemetry snapshot, artifact register, preflight, gate report, approval propose/create/inspect/revoke,
+run start/hold/abort/list/describe, journal query, result invalidations) and broadcasts `mfg.*` events
+with the canonical invalidation envelope. Two additions were approved with conditions and tested:
+`mfg_run_resume` exists ONLY to refuse — it has no success path and names the discontinuity plus the
+requirement of a new authored run — and `mfg_emulator_fault_inject` refuses unless the endpoint is
+non-physical, so it can never reach hardware. Neither is exposed over MCP.
+
+`services/mcp/mfg_tools.py` registers 15 tools through `view(mcp, "manufacture")`: 9 read, 3
+write/propose, and exactly 3 motion tools. `tool_registry` gained `RISK_MOTION`/`RISK_SAFETY` with
+EXPLICIT membership — no lexical pattern can mint motion risk, an unlisted `mfg` tool stays `write`,
+and `_SAFETY_TOOLS` is deliberately empty. `mfg_approval_create` has no MCP tool at all: a model may
+propose an approval, never grant one. The family joined `DEFAULT_TOOL_FAMILIES` now that real tools
+exist and stays in `DEFAULT_OFF_TOOL_FAMILIES`.
+
+`host/src/ui/manufacture/**` is the operator surface: a persistent Offline Simulation vs Live Machine
+banner (entering Live requires explicitly claiming the command lease), a device list rendering all
+nine capability levels with truth chips that name `missing_level`, a run panel showing durable run
+state with the seq-stamped gate report including every Stage-2 row and named waivers, and an approval
+dialog whose `exercisable_by` selector defaults to human-only under the commissioning ceiling. The
+mirror enforces `FreshValue` at its boundary, so a non-ok value is cleared and last-good is visibly
+demoted rather than repainted as current. `CHUDWARE_SHOT=manufacture` seeds a hardware-free fixture;
+the first render clipped the banner to "FLINE SIMULATION" and that was fixed and re-verified.
+
+`core/cam/turn/process.*` adds honest single-spindle XZ turning (diameter/radius semantics, G18,
+feed-per-rev, CSS, threading, lathe footer) and `core/cam/cut/process.*` adds separate laser, plasma
+and waterjet process profiles with their own process state instead of overloading spindle RPM;
+operations advertised without executable semantics now refuse by name. `services/manufacturing/pnp/**`
+does OpenPnP job interchange plus a virtual placement run, and `services/manufacturing/robot/**` does
+URDF/SRDF import, FK, reachability/singularity, collision and deterministic mock replay — with every
+execute/transport/safety method name reserved as a permanent named refusal.
+
+Gates: `ctest` 94/94 — the one parallel-run failure, `mesher_advanced`, is a wall-clock ceiling under
+`-j6` CPU contention in FEA/meshing (untouched by this work) and passes standalone in 56 s;
+`pytest services/manufacturing services/perception training/perception services/mcp/test_mfg_tools.py`
+81 passed / 1 skipped; `./build.sh` links; `scripts/check.py` all 8 gates PASS.
+
+Still deferred: real transports, printer adapters, the split-out daemon, and any physical `execute`.

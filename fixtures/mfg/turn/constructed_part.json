@@ -1,0 +1,5 @@
+{
+  "stock": {"radius_mm": 20.0, "z_min_mm": -40.0, "z_max_mm": 0.0, "lineage_id": "stock:turn-fixture-001"},
+  "profile_radius_mm": [[0.0, 15.0], [-20.0, 12.0], [-40.0, 12.0]],
+  "thread": {"major_radius_mm": 10.0, "z_start_mm": -2.0, "z_end_mm": -22.0, "pitch_mm": 1.5, "depth_mm": 0.9, "first_infeed_mm": 0.3, "passes": 4, "spring_passes": 1}
+}

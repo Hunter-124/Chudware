@@ -196,6 +196,13 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/cam/cam_mirror.cpp
   src/ui/cam/cam_panel.cpp
   # --- end CAM ---
+  # --- Manufacture: device / run / approval operator surfaces (mfg_* lane mirror) ---
+  src/ui/manufacture/mfg_mirror.cpp
+  src/ui/manufacture/manufacture_panel.cpp
+  src/ui/manufacture/device_panel.cpp
+  src/ui/manufacture/run_panel.cpp
+  src/ui/manufacture/approval_dialog.cpp
+  # --- end Manufacture ---
   # --- C25: mouse gesture wheel + S shortcut bar ---
   src/ui/mouse_gestures.cpp
   src/ui/camera_anim.cpp   # C25 W2-D: eased camera tween (presets / Normal-To / zoom-to-fit)

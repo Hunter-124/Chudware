@@ -42,6 +42,7 @@ struct PostConfig {
     std::string units_imperial = "G20";
     std::string abs_mode = "G90";
     std::string plane_xy = "G17";
+    std::string plane_xz = "G18";
 
     // motion
     bool arcs_supported = true;
@@ -113,14 +114,18 @@ struct PostConfig {
     NumFmt rpm{0, false, true, false};
     NumFmt arc{3, true, true, false};
 
-    // turning / lathe
+    // turning / lathe (Move::to.x is always an internal radius in mm)
     bool lathe = false;
-    bool diameter_mode = true;          // X = diameter (true) vs radius
+    bool diameter_mode = true;
+    std::string diameter_on = "G7";
+    std::string radius_on = "G8";
     std::string css_on = "G96";
     std::string css_off = "G97";
-    std::string css_clamp = "G50";      // spindle max-rpm clamp emitted before G96 (Fanuc/Haas: G50 S<max>)
-    std::string feed_per_rev = "G99";   // turning feed mode
-    std::string feed_per_min = "G98";
+    std::string css_clamp = "G50";
+    std::string feed_per_rev = "G95";
+    std::string feed_per_min = "G94";
+    std::string thread_cycle = "G76";
+    bool turn_arc_ik = true;
 
     json to_json() const;
     static PostConfig from_json(const json&);

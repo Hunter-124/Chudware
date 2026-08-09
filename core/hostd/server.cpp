@@ -15,6 +15,7 @@
 
 #include "../../services/worker/cpp_core.h"
 #include "hostd_log.h"
+#include "mfg_lane.h"
 #include "worker_bridge.h"
 
 namespace hostd {
@@ -63,6 +64,8 @@ Server::Server(chudware_ipc::IpcListener listener, std::string buildId)
         sendEventToAll(line);
         touch();  // a child exit restarts the linger countdown
     });
+    chudware::mfg::lane().setEventSink(
+        [this](const std::string& line) { sendEventToAll(line); });
     touch();
     // Fast-tier (interactive RPC) watchdog ceiling; 0 disables that tier. The long tier's far
     // more generous ceiling is engineWatchdogLongMs() above; see engine_watchdog.h for the split.
@@ -509,6 +512,10 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0}};
     }
     if (method == "ping") return json{{"ok", true}};
+    if (auto result = chudware::mfg::lane().handle(method, params)) {
+        isError = result->is_error;
+        return std::move(result->body);
+    }
     // TEST-ONLY (env-gated; neither name is ever a real client RPC): register an
     // in-flight engine call and sleep, to exercise the watchdog end-to-end.
     // "agent_test_stall" registers under an agent_* name so agentWorkInFlight() —

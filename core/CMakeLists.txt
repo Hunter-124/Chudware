@@ -290,7 +290,9 @@ add_library(chudware_cam STATIC
   cam/post.cpp
   cam/stock_sim.cpp
   cam/audit.cpp
-  cam/session.cpp)
+  cam/session.cpp
+  cam/turn/process.cpp              # single-spindle XZ turning process model
+  cam/cut/process.cpp)              # laser / plasma / waterjet process profiles
 target_include_directories(chudware_cam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_cam PUBLIC
   chudware_clipper2 chudware_miniz nlohmann_json::nlohmann_json)
@@ -2080,6 +2082,8 @@ if(CHUDWARE_WITH_OCCT)
     hostd/doc_registry.cpp
     hostd/autosave.cpp
     hostd/hostd_log.cpp
+    # hostd/mfg_lane.cpp is compiled into chudware_manufacturing, not here, so the daemon
+    # and test_mfg_lane share exactly one definition of the single-owner device lane.
     hostd/tray_icon.cpp               # optional Linux AppIndicator status cube
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport_win.cpp
@@ -2089,7 +2093,8 @@ if(CHUDWARE_WITH_OCCT)
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker/cpp_core.cpp)
   target_include_directories(chudware-hostd PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
-  target_link_libraries(chudware-hostd PRIVATE nlohmann_json::nlohmann_json chudware_miniz)
+  target_link_libraries(chudware-hostd PRIVATE
+    nlohmann_json::nlohmann_json chudware_miniz chudware_manufacturing)
   if(WIN32)
     # advapi32: pipe DACL (SetEntriesInAclW), token/SID (OpenProcessToken,
     # ConvertSidToStringSidW, CreateWellKnownSid). Everything else (named pipes,
@@ -2189,7 +2194,8 @@ add_library(chudware_manufacturing STATIC
   manufacturing/gates.cpp
   manufacturing/approval.cpp
   manufacturing/lease.cpp
-  manufacturing/arbiter.cpp)
+  manufacturing/arbiter.cpp
+  hostd/mfg_lane.cpp)               # single-owner device lane behind the mfg_* RPCs
 target_compile_features(chudware_manufacturing PUBLIC cxx_std_20)
 target_include_directories(chudware_manufacturing PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_manufacturing PUBLIC nlohmann_json::nlohmann_json)
@@ -2221,7 +2227,8 @@ add_library(chudware_print STATIC print/model.cpp)
 target_compile_features(chudware_print PUBLIC cxx_std_20)
 target_link_libraries(chudware_print PUBLIC chudware_manufacturing)
 
-foreach(_mfg_test test_device_lane test_mfg_authorization test_twin test_print_model)
+foreach(_mfg_test test_device_lane test_mfg_authorization test_twin test_print_model
+                  test_mfg_lane)
   add_executable(${_mfg_test} tests/${_mfg_test}.cpp)
   target_include_directories(${_mfg_test} PRIVATE ${doctest_SOURCE_DIR})
   target_compile_definitions(${_mfg_test} PRIVATE
@@ -2234,3 +2241,14 @@ target_link_libraries(test_device_lane PRIVATE chudware_manufacturing)
 target_link_libraries(test_mfg_authorization PRIVATE chudware_manufacturing)
 target_link_libraries(test_twin PRIVATE chudware_twin)
 target_link_libraries(test_print_model PRIVATE chudware_print)
+target_link_libraries(test_mfg_lane PRIVATE chudware_manufacturing)
+
+# Turning + laser/plasma/waterjet process models. Reads the checked-in fixtures directly.
+add_executable(test_cam_processes tests/test_cam_processes.cpp)
+target_include_directories(test_cam_processes PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_cam_processes PRIVATE chudware_cam)
+target_compile_definitions(test_cam_processes PRIVATE
+  CHUDWARE_MFG_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/mfg")
+set_target_properties(test_cam_processes PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME cam_processes COMMAND test_cam_processes)

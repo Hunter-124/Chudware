@@ -1051,20 +1051,29 @@ richness, never coverage.
 
 | MCP tool | risk | wraps |
 |---|---|---|
-| `list_mfg_devices` | `read` | `mfg_device_list` |
-| `describe_mfg_device` | `read` | `mfg_device_describe` + `mfg_capability_report` |
-| `get_mfg_device_status` | `read` | `mfg_device_snapshot` |
-| `describe_mfg_policy` | `read` | `mfg_policy_get` |
-| `propose_mfg_run` | `write` | `mfg_run_propose` (no device I/O) |
-| `describe_mfg_run` | `read` | `mfg_run_describe` + gate report |
-| `request_mfg_run_start` | `motion` | `mfg_run_start` — arbiter revalidates; refused unless the binding says `human_or_agent` |
+| `mfg_device_list` | `read` | `mfg_device_list` |
+| `mfg_device_describe` | `read` | `mfg_device_describe` |
+| `mfg_device_capability` | `read` | `mfg_device_capability` |
+| `mfg_telemetry_snapshot` | `read` | `mfg_telemetry_snapshot` |
+| `mfg_gate_report` | `read` | `mfg_gate_report` |
+| `mfg_run_list` | `read` | `mfg_run_list` |
+| `mfg_run_describe` | `read` | `mfg_run_describe` |
+| `mfg_journal_query` | `read` | `mfg_journal_query` |
+| `mfg_approval_inspect` | `read` | `mfg_approval_inspect` |
+| `mfg_artifact_register` | `write` | `mfg_artifact_register` — immutable registration; no device I/O |
+| `mfg_preflight_run` | `write` | `mfg_preflight_run` — Tier-0 plus seq-stamped Stage 1/2 report |
+| `mfg_approval_propose` | `write` | `mfg_approval_propose` — creates an unapproved draft binding only |
+| `request_mfg_run_start` | `motion` | `mfg_run_start` — arbiter revalidates; refused unless the human binding says `human_or_agent` |
 | `request_mfg_hold` | `motion` | `mfg_run_hold` |
 | `request_mfg_abort` | `motion` | `mfg_run_abort` |
-| `list_mfg_events` | `read` | `mfg_event_query` |
 
-**Absent by design (no model allow path, DoD 15):** approve/amend/revoke approval, resume, jog, home,
-zero/set-WCS, unlock (`$X`), override, interlock bypass, settings write, firmware write, E-stop, lease
-preempt, waiver grant.
+Every wrapper returns the daemon result or structured refusal unchanged, including its `reason` and
+`hint`; the shared family guard runs before the wrapper, so a disabled-family call reaches neither
+the daemon bridge nor its transport retry path.
+
+**Absent by design (no model allow path, DoD 15):** `mfg_approval_create` (the human approval act),
+amend/revoke approval, resume, jog, home, zero/set-WCS, unlock (`$X`), override, interlock bypass,
+settings write, firmware write, E-stop, lease preempt, waiver grant.
 
 `services/mcp/tool_registry.py` append-only change:
 
@@ -1079,20 +1088,24 @@ _MOTION_TOOLS = frozenset({"request_mfg_run_start", "request_mfg_hold", "request
 _SAFETY_TOOLS = frozenset()     # empty on purpose: no safety-class tool is exposed to models
 ```
 
-and one clause at the top of `deny_reason`, before the family/allow-list logic:
+and one clause in `deny_reason`, after the family check (so an OFF family consistently returns the
+family refusal) and before default-open/allow-list handling:
 
 ```python
     if name in _SAFETY_TOOLS:
         return f"tool {name!r} is safety-class: no model dispatch path exists"
-    if name in _MOTION_TOOLS and not _motion_membership_allows(name):
-        return (f"tool {name!r} is motion-class and requires explicit membership "
-                f"(CHUDWARE_TOOLS_ALLOW / DAG tools list); default-open does not apply")
+    if name in _MOTION_TOOLS:
+        motion_allow = _current_allow()
+        if motion_allow is None or name not in motion_allow:
+            return (f"tool {name!r} is motion-class and requires explicit membership "
+                    f"(CHUDWARE_TOOLS_ALLOW / DAG tools list); default-open does not apply")
 ```
 
 This closes the audit's "default-open" finding for motion specifically: `allow is None` returning
 `None` (line 324-325) still means default-open for read/write, but motion class requires explicit
-membership. `classify_risk` is untouched, so the existing lexical taxonomy and every existing tool's
-class are byte-for-byte unchanged. The audit's second finding (CAM tools bypass the `doc_id` lease
+membership. `classify_risk` adds only the explicit manufacturing read and motion memberships; its
+pre-existing lexical taxonomy and every pre-existing tool's result remain byte-for-byte unchanged.
+The audit's second finding (CAM tools bypass the `doc_id` lease
 seam because they hide the job in process-global `_CAM`) is avoided here structurally: every `mfg_*`
 tool takes an explicit `device_id`/`run_id`, holds no process-global current device, and the real
 mutual exclusion is the gateway lease, not the MCP guard.

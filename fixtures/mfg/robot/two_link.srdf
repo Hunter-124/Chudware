@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<robot name="two_link">
+  <group name="arm">
+    <chain base_link="base" tip_link="tool" />
+  </group>
+  <group_state name="home" group="arm">
+    <joint name="shoulder" value="0" />
+    <joint name="elbow" value="0" />
+  </group_state>
+  <end_effector name="tool" parent_link="tool" group="arm" />
+  <disable_collisions link1="base" link2="link1" reason="Adjacent" />
+</robot>

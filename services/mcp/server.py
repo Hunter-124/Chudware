@@ -364,6 +364,12 @@ register_cam_tools(_reg.view(mcp, "cam"))
 from mcp_server.cam_audit import register_cam_audit_tools
 register_cam_audit_tools(_reg.view(mcp, "cam"))
 
+# Manufacture gateway: read/propose/request-only surface over chudware-hostd's
+# single-owner lane. The family is known but default-off; no approval-create,
+# resume, jog, override, unlock, or safety-class tool is registered.
+from mcp_server.mfg_tools import register_mfg_tools
+register_mfg_tools(_reg.view(mcp, "manufacture"))
+
 # Doc diff — semantic feature-level diff between two document revisions (T-H2).
 from mcp_server.doc_diff_tools import register_doc_diff_tools
 register_doc_diff_tools(_reg.view(mcp, "cad"))

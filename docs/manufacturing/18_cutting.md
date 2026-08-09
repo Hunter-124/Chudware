@@ -1,16 +1,22 @@
 # 2D Cutting-Process Architecture — Laser / Plasma / Waterjet
 
-Design-only. No repository file was edited. Scope was exactly `core/cam/model.h`,
-`core/cam/op_cut.cpp`, `core/cam/post.cpp`, `core/cam/stock_sim.cpp`,
-`services/mcp/cam_tools.py`, `agent://CamKernelAudit`, `agent://ManufacturingBreadth`,
-plus `local://manufacturing-decisions.md` and `local://manufacturing-dod-v4.md`.
-Anything outside that set is marked `[INFERENCE]`.
+P4 core implementation is under `core/cam/cut/**`, with concrete `ProcessKind::Laser`,
+`ProcessKind::Plasma`, and `ProcessKind::Waterjet` profiles and direct headless coverage
+in `core/tests/test_cam_processes.cpp`. The implementation keeps process setpoints typed
+and unit-bearing; no cut family stores power in spindle RPM.
 
 Path ruling honored: production GUI only under `host/src/ui/manufacture/**`; cross-domain
 service root `services/manufacturing/**`; domain engine under `core/cam/cut/**`; RPCs
 `mfg_*`, events `mfg.*`; `host/src/ui/cam/**` extended only through one named seam.
 (This supersedes the flat `core/cam/process_cut.*` names in my earlier IRC claim; the
 engine lives in `core/cam/cut/**` so it cannot collide with `core/cam/turn/**`.)
+
+Implemented scope is bounded and offline: laser vector planning, GRBL laser-mode post and
+independent re-parser; plasma pierce/arc/THC/corner/void/breakaway ledger replay; and exact-row
+waterjet recipes plus LinuxCNC digital/analog-output post. Waterjet jet-lag and taper
+compensation refuse by name. No family claims process physics, monitoring, transport,
+execution, or safety integration; only levels backed by the implemented offline path are
+declared pending gateway-stamped procedural evidence.
 
 Gateway rules are cited by **stable rule id** only, never by gateway section number: the register that
 resolves every id used below is **Appendix A.1**, and `test_mfg_contracts.cpp` plus every cut test key on
@@ -130,50 +136,24 @@ statement is **Appendix A.2**, recorded identically in
 **`core/cam/model.h`** — appends only. No field reordered, renamed, retyped, or removed
 (ABI + `.cam+` + C-ABI JSON are append-only, per DoD §16 and `model.h:14-16`).
 
-- `OpType`: append `CutLaser`, `CutPlasma`, `CutWaterjet` **after** `Cut2D` (`model.h:237`).
-- `MoveKind`: append `ProcessOn`, `ProcessOff`, `ProcessSet`, `ProcessWait`, `ProbeTouch`
-  **after** `ToolChange` (`model.h:346`).
-- `Move`: append `std::optional<ProcessSetpoint> process;` and
-  `std::optional<WaitCondition> wait;` (`model.h:349-360`).
-- `Machine`: append `std::optional<CutHead> cut_head;` beside the existing `kerf`
-  (`model.h:132-133`). `kerf` is retained but demoted to a *fallback* and gains a
-  provenance sibling in the head record; the head's `kerf_mm` + `kerf_source` wins.
-- `Operation`: append `std::optional<CutProcessProfile> cut;` (`model.h:314-321`). The
-  legacy scalar block (`power`, `pierce_*`, `kerf_override`, `feed_rate`, `passes`) stays
-  in the document format for old `.cam+` files and is **removed from every API surface**.
-- `to_string`/`*_from_string` rows for the appended enum values (`model.h:406-427`).
-- `tool_class()` (`model.h:429-431`) unchanged; head cutting data no longer flows through
-  the mill CuttingDB at all — see §6.
+- P4 keeps the persisted `OpType::Cut2D` geometry carrier for compatibility; concrete
+  family identity is mandatory in `cut::Profile`/`cut::ProcessKind`, so no new persisted
+  operation id can silently default to laser.
+- Process transitions live in `cut::PlanMove` with an optional unit-bearing
+  `ProcessSetpoint`; they are deliberately not represented by `Move::spindle_rpm`.
+- Head kerf and process settings live in the concrete profile. `MachineKind` remains the
+  compatibility check at the existing `gen_cut2d` seam.
 
-**Legacy migration, stated explicitly (no silent reinterpretation):**
-`Cut2D` remains a valid *document* value and is resolved at load to the concrete op type
-by machine kind, emitting `mfg.cut.invalidated{class:"superseded", superseded_by:<new op
-type>}`. Legacy `power` is migrated **only** for `MachineKind::Laser` (0..1 fraction is
-the same quantity), with `Provenance::legacy_migrated`. For `Plasma` and `Waterjet` the
-legacy `power` value is **rejected**, not converted: 0.5 is neither 50 A nor 240 MPa, and
-guessing is precisely the overload being deleted. The refusal names the field to supply
-(`plasma.current_a`, `waterjet.pressure_mpa`).
+**Legacy boundary:** `OpType::Cut2D` remains the persisted geometry carrier and the legacy
+generic CAM generator still resolves the head from `MachineKind`. New process planning
+never reads the legacy unitless `Operation::power`; callers must construct a typed profile,
+so a plasma current or waterjet pressure cannot be inferred from a laser fraction.
 
-**`core/cam/post.cpp` / `post.h`**
-
-- Add `PowerBinding` to `PostConfig` (a map `CutPowerChannel → {word, mode, min, max,
-  unit, scale, requires[]}`) and `post_dialect_or_error(id)` alongside the existing
-  `post_dialect(id)`. The silent GRBL degradation at `post.cpp:158-162` stays for the
-  legacy mill entry point but **all `mfg_cut_*` paths use the erroring variant**.
-- Replace the `head` branch — `post.cpp:401-402`, `:454-470`, `:482` — with a single call
-  into `post_cut.cpp`. The footer line `:487` is **excluded from this workstream's edit set**:
-  it is `cam.turn`'s exclusively for this wave (Appendix A.2), so cutting makes no edit there
-  and instead *consumes* the footer behaviour turning's deletion of `!g.lathe` produces — the
-  process-off word for a cut head is emitted by the `post_cut.cpp` call above rather than by
-  the inline laser condition on that line, and
-  `fixtures/mfg/cut/programs/laser_grbl_expected.nc` is the golden that pins the resulting
-  footer. Those three regions are the *only* part of `post_setup` this workstream touches;
-  they do not intersect the lathe/CSS region (`post.cpp:403-410`) nor the diameter-mode
-  formatting (`post.cpp:229-232`, `:252-254`), both of which are `cam.turn`'s.
-- Delete `op->power * c.power_max` rendered via `g.c.rpm` (`post.cpp:460`). Power gets its
-  own `NumFmt power` and its own word from the binding.
-- `post_dialects_json` (`post.cpp:169-175`) gains `process: ["laser"|"plasma"|"waterjet"]`
-  and `power_bindings`, so the advertised truth matches the emitted truth.
+**Posting boundary:** process-aware NC is emitted by `cut::post_laser_grbl` and
+`cut::post_waterjet_linuxcnc`, not by overloading the generic spindle words. Both consume
+`VectorPlan` process transitions. Plasma deliberately has no post capability until a
+qualified controller dialect exists. The shared generic post footer no longer emits a
+spindle-off word for any cut-head machine; each process post owns its process-off sequence.
 
 **`core/cam/stock_sim.cpp`** — one guard, inserted immediately after the zero-extent check
 (`stock_sim.cpp:188-191`) and **before** the lathe branch (`:197`):

@@ -1,0 +1,22 @@
+<?xml version='1.0' encoding='utf-8'?>
+<openpnp-board version="1.1" id="demo-board" name="Controller" revision="A">
+  <dimensions units="Millimeters" x="100" y="80" />
+  <packages>
+    <package id="0402" name="0402" width="1" length="0.5" height="0.35" compatible_nozzles="N1" pick_offset_x="0" pick_offset_y="0" pick_rotation="0" />
+  </packages>
+  <placements>
+    <placement id="R1" ref_des="R1" side="Top" type="Placement" enabled="true" part_id="RES-10K" package_id="0402">
+      <location units="Millimeters" x="10.25" y="20.5" z="0" rotation="90" />
+      <part id="RES-10K" />
+    </placement>
+    <placement id="R2" ref_des="R2" side="Bottom" type="Placement" enabled="false" part_id="RES-10K" package_id="0402">
+      <location units="Millimeters" x="30" y="40" z="0" rotation="180" />
+      <part id="RES-10K" />
+    </placement>
+  </placements>
+  <fiducials>
+    <placement id="F1" side="Top" type="Fiducial" enabled="true" diameter="1" scope="board">
+      <location units="Millimeters" x="5" y="5" z="0" rotation="0" />
+    </placement>
+  </fiducials>
+</openpnp-board>

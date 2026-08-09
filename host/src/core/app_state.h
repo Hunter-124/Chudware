@@ -57,6 +57,7 @@ class EvaluateDialogs;  // Measure / Mass Properties / Section dialogs — owned
 // buffers) lives on each Schematic/PCB DocTab. Its full definition stays in ecad_panel.cpp (it
 // owns EcadMirror/EcadCanvas); AppState only needs an opaque pointer so app_state.h stays light.
 struct EcadEditorState;
+class MfgMirror;
 }  // namespace ui
 
 #include <memory>  // std::shared_ptr<ui::EcadEditorState> on each ECAD DocTab
@@ -810,6 +811,29 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
 // One line "Parts: a, b, c" with each name tinted its assembly color.
 void drawPartsLine(const std::vector<PartInfo>& parts);
 
+// Manufacture operator surface owns only presentation/request state. Authoritative
+// device/run/approval state lives in ui::MfgMirror and the hostd manufacturing lane.
+struct MfgUi {
+    enum class Mode { OfflineSimulation, LiveMachine };
+    struct Request {
+        std::string method;
+        nlohmann::json params;
+        std::string context;
+    };
+
+    Mode mode = Mode::OfflineSimulation;
+    std::string selectedDeviceId;
+    std::string selectedRunId;
+    std::string liveDeviceId;
+    std::string approvalRequestId;
+    std::string lastError;
+    std::deque<Request> requests;
+    bool requestInFlight = false;
+    bool bootstrapQueued = false;
+    bool openApprovalDialog = false;
+    int exercisableBy = 0;  // 0=human_only, 1=human_or_agent
+};
+
 // ---------------- app-state aggregate ----------------
 // Every long-lived run_gui() local, bundled so the title-bar / panels / modals (each in its own
 // translation unit) can share one mutable state object. Field declaration order and defaults match
@@ -1066,6 +1090,10 @@ struct AppState {
     // auto-select that session. Additive + optional: even unread, the RE tab's
     // session list surfaces the new session, so the handoff still works.
     std::string pendingRevengSessionId;
+    // Manufacturing UI seam: exactly one presentation/request bundle plus one
+    // read-only mirror fed by RPC completions and the hostd event drain.
+    MfgUi mfg;
+    std::shared_ptr<ui::MfgMirror> mfgMirror;
     // Multi-document: sessions of CLOSED tabs that may still have an async RPC in flight. A
     // DocSession's PropertyManager / SketchMode / EvaluateDialogs capture `this` in their st.rpc
     // completion lambdas (live preview, AI assist, sketch overview/regions, evaluate). Destroying the

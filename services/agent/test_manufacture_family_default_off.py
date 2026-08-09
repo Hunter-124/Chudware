@@ -15,12 +15,8 @@ FAMILY = "manufacture"
 
 
 def test_family_is_registered() -> None:
+    assert FAMILY in cfg.DEFAULT_TOOL_FAMILIES
     assert FAMILY in cfg.DEFAULT_OFF_TOOL_FAMILIES
-    # Deliberately NOT yet in DEFAULT_TOOL_FAMILIES: that tuple is asserted by
-    # services/mcp/test_registration_catalog.py to hold no phantom family, so the
-    # entry lands in the wave registering the first Manufacture tool. The
-    # default-off guarantee must not depend on that ordering.
-    assert FAMILY not in cfg.DEFAULT_TOOL_FAMILIES
 
 
 def test_off_with_empty_config() -> None:
@@ -64,7 +60,9 @@ def test_explicit_false_still_wins() -> None:
 
 
 def test_no_other_family_became_default_off() -> None:
+    assert cfg.DEFAULT_OFF_TOOL_FAMILIES == (FAMILY,)
     fams = cfg.get_tool_families({})
     for fam in cfg.DEFAULT_TOOL_FAMILIES:
-        assert fam not in cfg.DEFAULT_OFF_TOOL_FAMILIES
+        if fam in cfg.DEFAULT_OFF_TOOL_FAMILIES:
+            continue
         assert fams[fam] is True, f"{fam} regressed to default-off"

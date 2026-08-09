@@ -84,6 +84,10 @@ struct Stock {
     TriMesh solid;
     // material being machined (cutting-data DB id; drives feeds & speeds).
     std::string material = "aluminum";
+    // Durable lineage ids are caller-assigned for source stock and simulator-derived
+    // for remnants. They identify provenance only; they are never approval evidence.
+    std::string lineage_id;
+    std::string parent_lineage_id;
 
     json to_json() const;
     static Stock from_json(const json&);

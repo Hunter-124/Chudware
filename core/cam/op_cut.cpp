@@ -43,6 +43,19 @@ static Vec2 unit2(double dx, double dy) {
 GenResult gen_cut2d(const Operation& opIn, const OpContext& ctx) {
     GenResult res;
     Operation op = resolved_op(opIn, ctx);
+    const bool head = ctx.machine.kind == MachineKind::Laser ||
+                      ctx.machine.kind == MachineKind::Plasma ||
+                      ctx.machine.kind == MachineKind::Waterjet;
+    if (!head) {
+        res.ok = false;
+        res.error = "cut_head_machine_required";
+        return res;
+    }
+    if (op.pierce_height + 1e-9 < op.cut_height) {
+        res.ok = false;
+        res.error = "cut_pierce_height_below_cut_height";
+        return res;
+    }
 
     std::vector<Path2> contours = op_contours(op);
     if (contours.empty()) {
@@ -59,11 +72,9 @@ GenResult gen_cut2d(const Operation& opIn, const OpContext& ctx) {
     // Plunge rate for head height changes; default to half the cut feed.
     const double plunge_f = op.plunge     > 0.0 ? op.plunge     : cut_feed * 0.5;
 
-    // Absolute Z of the head standoffs (material top + standoff mm).
-    // pierce_height must be >= cut_height — clamp silently if not.
+    // Absolute Z of the explicitly validated head standoffs.
     const double cut_z    = op.heights.top + op.cut_height;
-    const double pierce_z = op.heights.top +
-                            std::max(op.pierce_height, op.cut_height);
+    const double pierce_z = op.heights.top + op.pierce_height;
 
     PathBuilder pb(op.heights, cut_feed, plunge_f, 5000.0);
     pb.set_spindle(0);   // laser / plasma / waterjet: no spindle

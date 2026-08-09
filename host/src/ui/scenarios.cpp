@@ -25,6 +25,7 @@
 #include "cam/cam_panel.h"  // camLoadJob (CAM copilot fast-path scenario)
 #include "asm_panels.h"
 #include "evaluate_dialogs.h"
+#include "manufacture/manufacture_panel.h"
 #include "property_manager.h"
 #include "sim_manager.h"
 #include "sketch_mode.h"
@@ -51,6 +52,25 @@ void writeBackbufferPng(const char* path, int dw, int dh, const char* mirrorPath
 namespace ui {
 
 void ScenarioRunner::tick(AppState& st) {
+    // ---------- manufacturing operator scenario (CHUDWARE_SHOT=manufacture) ----------
+    // A hardware-free mirror fixture exercises the explicit Offline banner,
+    // capability truth, stale/last-good telemetry, Stage-2 verdicts and a named
+    // waiver. Reassert the workspace because startup document restoration may
+    // otherwise pull a non-model shot back to Model.
+    static bool manufactureInit = false;
+    static bool manufactureShot = false;
+    if (!manufactureInit) {
+        manufactureInit = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        manufactureShot = st.shot && mode && std::strcmp(mode, "manufacture") == 0;
+        if (manufactureShot) seedManufactureScenario(st);
+    }
+    if (manufactureShot) {
+        st.showRibbon = true;
+        st.ribbonTab = AppState::RT_Manufacture;
+        st.activeWorkspace = AppState::Workspace::Manufacture;
+    }
+
     // ---------- C17 M1 integration scenario (CHUDWARE_SHOT=m1) ----------
     // Frame-driven state machine: each step issues scripted ops through the REAL worker
     // (DocMirror), loads the rebuilt mesh, and requests a screenshot into scratch/m1_shots/.

@@ -38,6 +38,8 @@ struct SimResult {
     int rapid_collisions = 0;          // rapid moves intersecting remaining stock
     int holder_collisions = 0;         // cutting moves whose shank/holder body hits stock
     std::vector<std::string> warnings;
+    std::string stock_lineage_in;
+    std::string stock_lineage_out;
     // the simulated remaining-stock heightfield (for display / stock-to-stock rest)
     HeightField remaining;
     // equal-interval snapshots (aicad.cam_sim_frames/1); empty when options.frames==0

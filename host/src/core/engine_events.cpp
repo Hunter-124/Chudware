@@ -21,6 +21,7 @@
 #include "../render/aicm_loader.h"
 #include "../ui/property_manager.h"
 #include "../ui/reveng/reveng_internal.h"  // RevEngEvent / feedRevEngEvent / RevEngState
+#include "../ui/manufacture/mfg_mirror.h"
 #include "../ui/sketch_mode.h"
 
 namespace core {
@@ -364,6 +365,13 @@ void handleEvent(AppState& st, const json& evt) {
     const json& d = evt.contains("data") && evt["data"].is_object() ? evt["data"]
                                                                     : json::object();
     const std::string docId = d.value("doc_id", std::string());
+    // Manufacturing is a dedicated hostd lane, but its events arrive through
+    // the same per-frame daemon drain. Feed the read-only GUI mirror and keep
+    // them out of unrelated document/agent routing.
+    if (name.rfind("mfg.", 0) == 0) {
+        if (st.mfgMirror) st.mfgMirror->feedEvent(evt);
+        return;
+    }
 
     // Live agent-run streaming (daemon mode): hostd pushes each emitted run event as
     // {"event":"agent.event","data":<ev>}. Route it into the OWNING run's event queue (matched

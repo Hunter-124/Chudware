@@ -125,6 +125,8 @@ inline void wasmBootDom(const char *msg) {
 #include "ui/file_dialog.h" // W14: native Save-As for 2D export (flat-pattern DXF)
 #include "ui/file_explorer.h" // Wave 3: File Explorer + workspace/recent helpers
 #include "ui/firmware/fw_workspace.h" // T-FIN5 Firmware workspace (drawFirmwareWorkspace + shot fixture)
+#include "ui/manufacture/manufacture_panel.h" // P4 manufacturing operator surface + RPC dispatch
+#include "ui/manufacture/mfg_mirror.h" // complete read-only manufacturing mirror type
 #include "ui/icons.h"
 #include "ui/layout.h" // Wave 1C/1D: buildDefaultLayout + tabbed left pane (drawLeftPane)
 #include "ui/property_manager.h"
@@ -1946,6 +1948,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
   // ---------- application state (bundles what were run_gui locals) ----------
   AppState st;
+  st.mfgMirror = std::make_shared<ui::MfgMirror>();
 #ifdef __EMSCRIPTEN__
   wasmInstallTouchTracker();
   if (g_wasmMobile) {
@@ -3857,6 +3860,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // the GL thread, before this frame's panels draw, so results land like any
     // other state.
     st.rpc.drain();
+    // Manufacturing panels enqueue intent only. Dispatch after the prior frame's
+    // callbacks drain, before hostd events update the read-only mirror.
+    ui::dispatchManufactureRequests(st);
     // T-PERF3: commit mesh loads that finished disk-parse on the loader thread
     // (GL upload only here; stale gens dropped so keep-last-good stays on
     // screen).
@@ -6178,6 +6184,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ui::drawViewportPanel(st, io, busy);
       }
     }
+    // Manufacture's operator drawer overlays the existing native viewport. It
+    // owns no geometry canvas and draws after the viewport so its controls and
+    // explicit Offline/Live banner remain reachable.
+    if (!webActive && ws == WS::Manufacture)
+      ui::drawManufacturePanel(st);
 
     if (!wsFullBody) {
       // ---- ECAD editor (Electronics workspace or when an ECAD doc is open)

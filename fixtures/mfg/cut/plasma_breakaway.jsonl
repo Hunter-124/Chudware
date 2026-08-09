@@ -1,0 +1,5 @@
+{"event":"arm","state":"ok"}
+{"event":"probe_contact","state":"ok"}
+{"event":"arc_ok","state":"ok"}
+{"event":"pierce_elapsed","state":"ok"}
+{"event":"breakaway","state":"ok"}

@@ -161,10 +161,13 @@ struct CapabilityReport {
     CapabilityLevel max_advertised = CapabilityLevel::Plan;
     EmulatorStage emulator_stage_passed = EmulatorStage::None;
 
+    // C++17-clean on purpose: this header is included from `chudware_cam`, which still
+    // compiles as gnu++17, so no std::map::contains here.
     bool complete() const {
-        for (const auto level : capability_levels)
-            if (!levels.contains(level) || levels.at(level).level != level || !levels.at(level).valid())
-                return false;
+        for (const auto level : capability_levels) {
+            const auto it = levels.find(level);
+            if (it == levels.end() || it->second.level != level || !it->second.valid()) return false;
+        }
         return true;
     }
 };

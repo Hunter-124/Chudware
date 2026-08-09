@@ -1,0 +1,13 @@
+[
+  {
+    "material": "aluminum-6061",
+    "thickness_mm": 6.0,
+    "orifice_mm": 0.25,
+    "mixing_tube_mm": 0.76,
+    "pressure_mpa": 350.0,
+    "abrasive_g_min": 300.0,
+    "kerf_mm": 0.9,
+    "feed_mm_min": 220.0,
+    "provenance": "fixture:vendor-declared-row"
+  }
+]

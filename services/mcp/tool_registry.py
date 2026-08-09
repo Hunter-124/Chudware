@@ -25,7 +25,9 @@ RISK_READ = "read"
 RISK_WRITE = "write"
 RISK_SPEND = "spend"
 RISK_EXTERNAL = "external"
-RISKS = (RISK_READ, RISK_WRITE, RISK_SPEND, RISK_EXTERNAL)
+RISK_MOTION = "motion"
+RISK_SAFETY = "safety"
+RISKS = (RISK_READ, RISK_WRITE, RISK_SPEND, RISK_EXTERNAL, RISK_MOTION, RISK_SAFETY)
 
 # Name-pattern risk classifier. Checked most-sensitive first so `export_*`/`*_post`
 # outrank a generic write verb. A tool that matches nothing defaults to WRITE
@@ -56,6 +58,11 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               # match a read prefix, so classify explicitly. fs_write/fs_edit/run_shell
               # stay unclassified -> RISK_WRITE.
               "fs_read", "fs_list", "fs_glob", "fs_grep",
+              # Manufacturing observations. Their mfg_* namespace deliberately
+              # carries no lexical authority; read access is exact-membership.
+              "mfg_device_list", "mfg_device_describe", "mfg_device_capability",
+              "mfg_telemetry_snapshot", "mfg_gate_report", "mfg_run_list",
+              "mfg_run_describe", "mfg_journal_query", "mfg_approval_inspect",
               # Research tools (research_tools.py): read-only lookups, not mutators —
               # no "research_" prefix in _READ_PREFIXES so classify explicitly.
               "research_web_search", "research_fetch_page"}
@@ -69,9 +76,23 @@ _RISK_OVERRIDES: dict[str, str] = {
     "submit_bug_report": RISK_WRITE,
 }
 
+# Motion and safety classifications are explicit membership only. A newly added
+# manufacturing tool therefore retains the fail-safe WRITE default until a
+# human deliberately adds it here; no name pattern can mint physical authority.
+_MOTION_TOOLS = frozenset({
+    "request_mfg_run_start",
+    "request_mfg_hold",
+    "request_mfg_abort",
+})
+_SAFETY_TOOLS = frozenset()  # Deliberately empty: models get no safety-class tool.
+
 
 def classify_risk(name: str) -> str:
     """Derive the risk class for a tool *name* (contract §6)."""
+    if name in _SAFETY_TOOLS:
+        return RISK_SAFETY
+    if name in _MOTION_TOOLS:
+        return RISK_MOTION
     if name in _RISK_OVERRIDES:
         return _RISK_OVERRIDES[name]
     if name in _READ_EXACT:
@@ -315,6 +336,13 @@ def deny_reason(name: str) -> str | None:
                         f"config agent.tool_families")
     except Exception:
         pass
+    if name in _SAFETY_TOOLS:
+        return f"tool {name!r} is safety-class: no model dispatch path exists"
+    if name in _MOTION_TOOLS:
+        motion_allow = _current_allow()
+        if motion_allow is None or name not in motion_allow:
+            return (f"tool {name!r} is motion-class and requires explicit membership "
+                    f"(CHUDWARE_TOOLS_ALLOW / DAG tools list); default-open does not apply")
     risk = (_CATALOG.get(name) or {}).get("risk") or classify_risk(name)
     deny_risk = _current_deny_risk()
     if deny_risk and risk in deny_risk:

@@ -588,17 +588,16 @@ def proactive_advisor_enabled(cfg: dict | None = None) -> bool:
 # ---------------------------------------------------------------------------
 DEFAULT_TOOL_FAMILIES = (
     "advisor", "cad", "cam", "ecad", "em", "files", "gsl", "intake", "ledger",
-    "mission", "office", "org", "parts", "plm", "recon", "research", "reveng",
-    "shell", "sim", "workspace",
+    "manufacture", "mission", "office", "org", "parts", "plm", "recon", "research",
+    "reveng", "shell", "sim", "workspace",
 )
 
 # Families that resolve OFF unless config explicitly enables them (MFG-FAM-1).
 # The Manufacture family reaches real machines — motion, spindle power, heaters —
 # so it is never enabled by omission: not when `agent.role_tools` is absent, not
-# when a role lists it, and not when the family is not yet in
-# DEFAULT_TOOL_FAMILIES. Only an explicit `agent.tool_families.<fam> = true`
-# opens it. Listed here BEFORE its tools exist so no registration wave can ship
-# a default-on machine-control surface.
+# when a role lists it. Only an explicit `agent.tool_families.<fam> = true`
+# opens it. It remains listed in DEFAULT_TOOL_FAMILIES so the Settings catalog
+# can render the real tools while this tuple keeps their family closed.
 DEFAULT_OFF_TOOL_FAMILIES = ("manufacture",)
 
 # ---------------------------------------------------------------------------
@@ -989,7 +988,8 @@ def get_tool_families(cfg: dict | None = None) -> dict[str, bool]:
 
     When ``agent.role_tools`` is present, a family is enabled if ANY harness
     role lists it (union). Legacy ``agent.tool_families`` still wins as an
-    explicit False kill-switch for a family. Missing everything → all on.
+    explicit False kill-switch for a family. Missing everything enables all
+    families except those named in ``DEFAULT_OFF_TOOL_FAMILIES``.
     """
     c = cfg if isinstance(cfg, dict) else load_config()
     agent = c.get("agent") if isinstance(c.get("agent"), dict) else {}

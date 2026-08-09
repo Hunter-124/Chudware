@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <sstream>
 
 namespace chudware {
 namespace cam {
@@ -93,6 +96,18 @@ bool field_z_equal(const HeightField& a, const HeightField& b) {
             if (a.raw(i, j) != b.raw(i, j)) return false;
     return true;
 }
+std::string lineage_hash(const Stock& stock, const std::vector<Toolpath>& toolpaths) {
+    std::string bytes = stock.lineage_id.empty() ? stock.to_json().dump() : stock.lineage_id;
+    for (const auto& path : toolpaths) bytes += path.to_json().dump();
+    uint64_t hash = 1469598103934665603ULL;
+    for (const unsigned char byte : bytes) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    std::ostringstream out;
+    out << "stock:" << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return out.str();
+}
 }  // namespace
 
 double estimate_time(const Toolpath& tp, const Machine& m) {
@@ -156,6 +171,7 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
                          const SimOptions& opt) {
     SimResult res;
     const Stock& st = setup.stock;
+    res.stock_lineage_in = st.lineage_id.empty() ? "unbound_source_stock" : st.lineage_id;
     double res_mm = opt.resolution > 0 ? opt.resolution : 0.5;
 
     // resolve stock bounds + bottom + analytic volume
@@ -187,6 +203,13 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
     }
     if (hi.x <= lo.x || hi.y <= lo.y || top <= bottom) {
         res.ok = false; res.error = "stock has zero extent"; return res;
+    }
+    if (setup.machine.kind == MachineKind::Laser ||
+        setup.machine.kind == MachineKind::Plasma ||
+        setup.machine.kind == MachineKind::Waterjet) {
+        res.ok = false;
+        res.error = "cut_process_physics_unmodelled_use_vector_fidelity_only";
+        return res;
     }
 
     // ── turning: axisymmetric radial-profile sim ──────────────────────────────
@@ -241,6 +264,7 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
             total += estimate_time(tp, setup.machine);
         }
         res.cycle_time_s = total;
+        res.stock_lineage_out = lineage_hash(st, toolpaths);
         return res;
     }
 
@@ -496,7 +520,8 @@ json SimResult::to_json(bool include_field) const {
            {"remaining_volume_mm3", remaining_volume_mm3}, {"stock_volume_mm3", stock_volume_mm3},
            {"machined_fraction", machined_fraction}, {"cycle_time_s", cycle_time_s},
            {"gouges", gouges}, {"max_gouge_mm", max_gouge_mm}, {"rapid_collisions", rapid_collisions},
-           {"holder_collisions", holder_collisions}, {"warnings", warnings}};
+           {"holder_collisions", holder_collisions}, {"warnings", warnings},
+           {"stock_lineage_in", stock_lineage_in}, {"stock_lineage_out", stock_lineage_out}};
     if (include_field && remaining.nx() > 0) {
         json zs = json::array();
         for (int jj = 0; jj < remaining.ny(); ++jj)

@@ -1,11 +1,20 @@
 # Manufacturing Turning Architecture — Honest Single-Spindle XZ Turning
 
-Owner: `TurningArchitecture`. Domain id: **`cam.turn`**. Design-only — no repository file was edited, and
-no build, test, gate, formatter or git command ran.
+Owner: `TurningArchitecture`. Domain id: **`cam.turn`**. P4 core implementation landed under
+`core/cam/turn/**` with direct headless coverage in `core/tests/test_cam_processes.cpp`.
 
 Evidence base: `core/cam/model.h`, `core/cam/op_turn.cpp`, `core/cam/post.cpp`, `core/cam/stock_sim.cpp`,
 `services/mcp/cam_tools.py`, `agent://CamKernelAudit`, `agent://ManufacturingBreadth`,
 `local://manufacturing-decisions.md`, `local://manufacturing-dod-v4.md`.
+
+P4 implementation scope is deliberately offline: single-spindle XZ validation, declared
+workholding and insert geometry, radius-internal/explicit diameter-or-radius NC semantics,
+feed-per-revolution, CSS with an RPM clamp, degressive threading geometry, LinuxCNC-lathe
+post output (`G18`, `G7`/`G8`, `G95`, `G96`, `G76`, and `M5`), and axisymmetric remnant
+lineage through `stock_sim`. P4 uses an explicit lathe override on the existing LinuxCNC
+dialect; the planned `linuxcnc_lathe` registry id remains unadvertised until interpreter
+qualification exists. Capability rows remain declared until gateway-stamped procedural
+evidence exists; parse, monitor, transport, execute, and safety integration are unsupported.
 
 Session rulings honoured:
 * Production GUI only under `host/src/ui/manufacture/**`; no `ui/mfg`, no new canvas. `host/src/ui/cam/**`

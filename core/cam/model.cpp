@@ -205,7 +205,8 @@ json Stock::to_json() const {
     json j{{"type", cam::to_string(type)}, {"min", cam::to_json(min)}, {"max", cam::to_json(max)},
            {"off_xy", off_xy}, {"off_ztop", off_ztop}, {"off_zbot", off_zbot},
            {"base", cam::to_json(base)}, {"radius", radius}, {"height", height},
-           {"off_radial", off_radial}, {"off_axial", off_axial}, {"material", material}};
+           {"off_radial", off_radial}, {"off_axial", off_axial}, {"material", material},
+           {"lineage_id", lineage_id}, {"parent_lineage_id", parent_lineage_id}};
     if (!solid.verts.empty()) j["solid"] = cam::to_json(solid);
     return j;
 }
@@ -224,6 +225,8 @@ Stock Stock::from_json(const json& j) {
     s.off_axial = num(j.value("off_axial", json(0.0)));
     if (j.contains("solid")) s.solid = trimesh_from_json(j["solid"]);
     s.material = j.value("material", std::string("aluminum"));
+    s.lineage_id = j.value("lineage_id", std::string());
+    s.parent_lineage_id = j.value("parent_lineage_id", std::string());
     return s;
 }
 

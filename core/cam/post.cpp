@@ -42,6 +42,9 @@ json PostConfig::to_json() const {
                 {"arcs_ijk", arcs_ijk}, {"r_for_arcs", r_for_arcs}, {"canned_drill", canned_drill},
                 {"work_offset", work_offset}, {"comp_supported", comp_supported},
                 {"laser_mode", laser_mode}, {"lathe", lathe}, {"diameter_mode", diameter_mode},
+                {"plane_xz", plane_xz}, {"diameter_on", diameter_on}, {"radius_on", radius_on},
+                {"feed_per_rev", feed_per_rev}, {"feed_per_min", feed_per_min},
+                {"thread_cycle", thread_cycle}, {"turn_arc_ik", turn_arc_ik},
                 {"program_stop", program_stop}, {"tool_change", tool_change}};
 }
 PostConfig PostConfig::from_json(const json& j) {
@@ -55,7 +58,10 @@ PostConfig PostConfig::from_json(const json& j) {
     B("work_offset", c.work_offset); B("comp_supported", c.comp_supported);
     B("laser_mode", c.laser_mode); B("lathe", c.lathe); B("diameter_mode", c.diameter_mode);
     S("program_stop", c.program_stop); S("tool_change", c.tool_change);
+    S("plane_xz", c.plane_xz); S("diameter_on", c.diameter_on); S("radius_on", c.radius_on);
     S("css_on", c.css_on); S("css_off", c.css_off); S("css_clamp", c.css_clamp);
+    S("feed_per_rev", c.feed_per_rev); S("feed_per_min", c.feed_per_min);
+    S("thread_cycle", c.thread_cycle); B("turn_arc_ik", c.turn_arc_ik);
     S("spindle_cw", c.spindle_cw); S("spindle_ccw", c.spindle_ccw); S("spindle_off", c.spindle_off);
     S("coolant_flood", c.coolant_flood); S("coolant_mist", c.coolant_mist); S("coolant_off", c.coolant_off);
     S("comment_open", c.comment_open); S("comment_close", c.comment_close);
@@ -252,15 +258,19 @@ struct NcGen {
         if (lathe) {
             double xval = diameter ? m.to.x * 2.0 : m.to.x;
             b << " " << axis("X", xval, c.xyz) << " " << axis("Z", m.to.z, c.xyz);
+            if (!c.turn_arc_ik) return;
+            b << " " << axis("I", m.center.x - pos.x, c.arc)
+              << " " << axis("K", m.center.z - pos.z, c.arc);
         } else {
             b << " " << axis("X", m.to.x, c.xyz) << " " << axis("Y", m.to.y, c.xyz);
             if (std::fabs(m.to.z - pos.z) > 5e-7) b << " " << axis("Z", m.to.z, c.xyz);
-        }
-        if (c.r_for_arcs && !c.arcs_ijk) {
-            double r = std::hypot(pos.x - m.center.x, pos.y - m.center.y);
-            b << " " << axis("R", r, c.arc);
-        } else {
-            b << " " << axis("I", m.center.x - pos.x, c.arc) << " " << axis("J", m.center.y - pos.y, c.arc);
+            if (c.r_for_arcs && !c.arcs_ijk) {
+                double r = std::hypot(pos.x - m.center.x, pos.y - m.center.y);
+                b << " " << axis("R", r, c.arc);
+            } else {
+                b << " " << axis("I", m.center.x - pos.x, c.arc)
+                  << " " << axis("J", m.center.y - pos.y, c.arc);
+            }
         }
         if (m.feed > 0 && (!c.modal_feed || std::fabs(m.feed - last_feed) > 1e-6)) {
             b << " " << axis("F", m.feed, c.feed);
@@ -340,6 +350,16 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
         if (opt.overrides.contains("diameter_mode")) c.diameter_mode = ov.diameter_mode;
         if (opt.overrides.contains("css_clamp")) c.css_clamp = ov.css_clamp;
     }
+    if (setup.machine.kind == MachineKind::Lathe && !c.lathe) {
+        res.ok = false;
+        res.error = "turn_dialect_not_lathe";
+        return res;
+    }
+    if (setup.machine.kind != MachineKind::Lathe && c.lathe) {
+        res.ok = false;
+        res.error = "turn_dialect_requires_lathe";
+        return res;
+    }
     NcGen g(c, opt);
     bool metric = opt.metric;
 
@@ -358,7 +378,12 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
     if (!c.program_begin.empty()) g.blk(c.program_begin);
     g.blk(metric ? c.units_metric : c.units_imperial);
     g.blk(c.abs_mode);
-    if (!g.lathe) g.blk(c.plane_xy);
+    if (g.lathe) {
+        g.blk(c.plane_xz);
+        g.blk(c.diameter_mode ? c.diameter_on : c.radius_on);
+    } else {
+        g.blk(c.plane_xy);
+    }
     if (c.comp_supported) g.blk(c.comp_off);
     if (c.canned_drill) g.blk(c.cycle_cancel);
 
@@ -398,15 +423,24 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
                     g.blk("G" + std::to_string(w.offset));
             }
         }
+        if (g.lathe && op)
+            g.blk(op->extra.value("feed_mode", std::string("per_min")) == "per_rev"
+                      ? c.feed_per_rev : c.feed_per_min);
         bool head = (setup.machine.kind == MachineKind::Laser || setup.machine.kind == MachineKind::Plasma ||
                      setup.machine.kind == MachineKind::Waterjet);
         if (g.lathe && op && op->surface_speed_mode == "css") {
-            // clamp max spindle rpm BEFORE engaging constant-surface-speed, or the
-            // spindle overspeeds as the turned diameter approaches zero (D9). Fanuc/Haas
-            // require G50 S<max> immediately ahead of G96.
-            if (!c.css_clamp.empty() && op->max_turn_rpm > 0)
+            if (op->max_turn_rpm <= 0 || op->css <= 0) {
+                res.ok = false;
+                res.error = "turn_css_requires_speed_and_rpm_clamp";
+                return res;
+            }
+            if (!c.css_clamp.empty())
                 g.blk(c.css_clamp + " S" + fmt_num(op->max_turn_rpm, g.c.rpm));
-            g.blk(c.css_on + " S" + fmt_num(op->css > 0 ? op->css : rpm, g.c.rpm));
+            std::ostringstream css;
+            css << c.css_on << " S" << fmt_num(op->css, g.c.rpm);
+            if (c.css_clamp.empty()) css << " D" << fmt_num(op->max_turn_rpm, g.c.rpm);
+            g.blk(css.str());
+            g.last_rpm = rpm;
         }
         if (!head && rpm > 0 && rpm != g.last_rpm) g.spindle(rpm, op ? op->spindle_dir : 1);
         if (!head && op) g.coolant(op->coolant);
@@ -445,6 +479,42 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
             drilled_canned = true;
         }
 
+        if (op && op->type == OpType::TurnThread) {
+            if (c.thread_cycle.empty()) {
+                res.ok = false;
+                res.error = "turn_thread_cycle_unsupported";
+                return res;
+            }
+            if (op->thread_pitch <= 0 || op->thread_depth <= 0 || op->infeed <= 0) {
+                res.ok = false;
+                res.error = "turn_thread_cycle_parameters_required";
+                return res;
+            }
+            double z_end = op->heights.bottom;
+            double major_r = setup.stock.radius;
+            if (op->geometry.contains("profile") && !op->geometry["profile"].empty()) {
+                major_r = 0;
+                for (const auto& point : op->geometry["profile"])
+                    if (point.is_array() && point.size() >= 2)
+                        major_r = std::max(major_r, point[1].get<double>());
+                z_end = op->geometry["profile"].back()[0].get<double>();
+            }
+            std::ostringstream cycle;
+            cycle << c.thread_cycle
+                  << " P" << fmt_num(op->thread_pitch, c.feed)
+                  << " Z" << fmt_num(z_end, c.xyz)
+                  << " I" << fmt_num(op->id_op ? op->thread_depth : -op->thread_depth, c.arc)
+                  << " J" << fmt_num(op->infeed, c.arc)
+                  << " K" << fmt_num(op->thread_depth, c.arc)
+                  << " H" << std::max(0, op->finish_passes);
+            if (major_r <= 0) {
+                res.ok = false;
+                res.error = "turn_thread_major_radius_required";
+                return res;
+            }
+            g.blk(cycle.str());
+            drilled_canned = true;
+        }
         // ── general move emission ──
         if (!drilled_canned) {
             for (const Move& m : tp.moves) {
@@ -484,7 +554,10 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
     }
 
     // ── footer ──
-    if (!g.lathe && !( setup.machine.kind == MachineKind::Laser )) g.blk(g.c.spindle_off);
+    if (setup.machine.kind != MachineKind::Laser &&
+        setup.machine.kind != MachineKind::Plasma &&
+        setup.machine.kind != MachineKind::Waterjet)
+        g.blk(g.c.spindle_off);
     g.blk(c.coolant_off);
     if (!c.program_end.empty()) g.blk(c.program_end);
     g.blk(c.program_stop);

@@ -1,0 +1,10 @@
+{"event":"arm","state":"ok"}
+{"event":"probe_contact","state":"ok"}
+{"event":"arc_ok","state":"ok"}
+{"event":"pierce_elapsed","state":"ok"}
+{"event":"thc_enable","state":"ok"}
+{"event":"corner_enter","state":"ok"}
+{"event":"corner_exit","state":"ok"}
+{"event":"void_enter","state":"ok"}
+{"event":"void_exit","state":"ok"}
+{"event":"stop","state":"ok"}

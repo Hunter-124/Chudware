@@ -96,6 +96,18 @@ std::string base64Encode(std::string_view input) {
     return out;
 }
 
+std::string_view discontinuityName(device::RunDiscontinuity value) {
+    switch (value) {
+        case device::RunDiscontinuity::None: return "none";
+        case device::RunDiscontinuity::Reset: return "reset";
+        case device::RunDiscontinuity::Alarm: return "alarm";
+        case device::RunDiscontinuity::HardLimit: return "hard_limit";
+        case device::RunDiscontinuity::Disconnect: return "disconnect";
+        case device::RunDiscontinuity::PowerLoss: return "power_loss";
+    }
+    return "unknown";
+}
+
 void stripWorkerAuthority(json& value) {
     if (value.is_array()) {
         for (auto& item : value) stripWorkerAuthority(item);
@@ -522,6 +534,48 @@ device::Seq ManufacturingLane::appendEvent(std::string kind, std::string subject
 void ManufacturingLane::serviceDevice() {
     if (!connected_ || !adapter_) return;
     adapter_->service(journal_.head());
+    const auto discontinuity = adapter_->discontinuity();
+    const auto progress = adapter_->streamProgress();
+    if (discontinuity != device::RunDiscontinuity::None) {
+        terminal_claim_ = true;
+        if (discontinuity == device::RunDiscontinuity::Disconnect)
+            connected_ = false;
+    }
+    for (auto& [run_id, run] : runs_) {
+        const bool active = run.state == device::RunState::Running ||
+                            run.state == device::RunState::Holding ||
+                            run.state == device::RunState::Held ||
+                            run.state == device::RunState::Aborting;
+        if (!active) continue;
+        if (discontinuity != device::RunDiscontinuity::None) {
+            run.discontinuity = discontinuity;
+            arbiter_.record_discontinuity(run_id, discontinuity);
+            run.state = run.state == device::RunState::Aborting &&
+                                discontinuity == device::RunDiscontinuity::Reset
+                            ? device::RunState::Aborted
+                            : device::RunState::Faulted;
+            appendEvent("mfg.run.state", run_id,
+                        {{"run_id", run_id}, {"state", device::to_string(run.state)},
+                         {"cause", discontinuityName(discontinuity)},
+                         {"terminal", true}});
+            continue;
+        }
+        if (run.state == device::RunState::Running && progress.complete) {
+            if (!run.completion_observed) {
+                run.completion_observed = true;
+                continue;
+            }
+            run.state = device::RunState::Completing;
+            appendEvent("mfg.run.state", run_id,
+                        {{"run_id", run_id}, {"state", "completing"},
+                         {"cause", "program_stream_complete"}});
+            run.state = device::RunState::Completed;
+            appendEvent("mfg.run.state", run_id,
+                        {{"run_id", run_id}, {"state", "completed"},
+                         {"cause", "controller_acknowledged_program"},
+                         {"terminal", true}});
+        }
+    }
 }
 
 device::CapabilityReport ManufacturingLane::capabilityReport() const {
@@ -637,6 +691,7 @@ json ManufacturingLane::runJson(const RunRecord& run) const {
                {"approval_id", run.approval_id.empty() ? json(nullptr) : json(run.approval_id)},
                {"gate_report_ref", run.gate_report_ref.empty() ? json(nullptr) : json(run.gate_report_ref)},
                {"artifact_hash", artifacts_.at(run.artifact_id).hash_sha256},
+               {"discontinuity", discontinuityName(run.discontinuity)},
                {"timeline_from_seq", run.created_at_seq}, {"seq", run.created_at_seq}};
     value["job"] = {{"job_id", run.job.job_id}, {"setup_revision", run.job.setup_revision},
                     {"setup_revision_seq", run.job.setup_revision_seq},
@@ -1499,25 +1554,34 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         if (!requireLease(params, failure)) return failure;
         const auto initiator = parseInitiator(params.at("initiator"));
         const std::string run_id = params.value("run_id", std::string{});
-        const auto run = arbiter_.describe_run(run_id);
-        if (!run) return refuse("run.not_found", "run is not registered");
-        if (run->state != device::RunState::Held)
-            return refuse("run.not_held", "resume refusal applies only to a held run");
-        std::string discontinuity = "none";
+        serviceDevice();
+        const auto lane_run = runs_.find(run_id);
+        if (lane_run == runs_.end())
+            return refuse("run.not_found", "run is not registered");
+        const auto arbiter_run = arbiter_.describe_run(run_id);
+        if (!arbiter_run) return refuse("run.not_found", "run is not registered");
+        const auto observed_discontinuity =
+            lane_run->second.discontinuity != device::RunDiscontinuity::None
+                ? lane_run->second.discontinuity
+                : arbiter_run->discontinuity_since_hold;
+        std::string discontinuity(discontinuityName(observed_discontinuity));
         std::string code = "resume_requires_new_authored_run";
-        switch (run->discontinuity_since_hold) {
+        switch (observed_discontinuity) {
             case device::RunDiscontinuity::None: break;
             case device::RunDiscontinuity::Reset:
-                discontinuity = "reset"; code = "resume_forbidden_after_reset"; break;
+                code = "resume_forbidden_after_reset"; break;
             case device::RunDiscontinuity::Alarm:
-                discontinuity = "alarm"; code = "no_alarm_since_hold"; break;
+                code = "no_alarm_since_hold"; break;
             case device::RunDiscontinuity::HardLimit:
-                discontinuity = "hard_limit"; code = "resume_forbidden_after_hard_limit"; break;
+                code = "resume_forbidden_after_hard_limit"; break;
             case device::RunDiscontinuity::Disconnect:
-                discontinuity = "disconnect"; code = "resume_forbidden_after_disconnect"; break;
+                code = "resume_forbidden_after_disconnect"; break;
             case device::RunDiscontinuity::PowerLoss:
-                discontinuity = "power_loss"; code = "resume_forbidden_after_power_loss"; break;
+                code = "resume_forbidden_after_power_loss"; break;
         }
+        if (observed_discontinuity == device::RunDiscontinuity::None &&
+            arbiter_run->state != device::RunState::Held)
+            return refuse("run.not_held", "resume refusal applies only to a held run");
         const auto seq = appendEvent("mfg.arbiter.attempt", run_id,
             {{"action", "resume"},
              {"initiator", {{"kind", initiator.kind == gates::InitiatorKind::Human ? "human" : "agent"},
@@ -1567,6 +1631,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         return ok({{"runs", std::move(rows)}});
     }
     if (method == "mfg_run_describe") {
+        serviceDevice();
         const std::string run_id = params.value("run_id", std::string{});
         const auto run = runs_.find(run_id);
         if (run == runs_.end()) return refuse("mfg_run_not_found", "run_id is not registered");
@@ -1720,12 +1785,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
             return refuse("mfg_emulator_transport_unavailable",
                           "the active claim does not own an emulator transport");
         emulator->injectFault(value);
-        adapter_->service(journal_.head());
-        if (discontinuity != device::RunDiscontinuity::None) {
-            for (auto& [id, run] : runs_)
-                if (run.state == device::RunState::Held)
-                    arbiter_.record_discontinuity(id, discontinuity);
-        }
+        serviceDevice();
         const auto snapshot = adapter_->snapshot();
         appendEvent(fault == "alarm" || fault == "hard_limit" ? "mfg.device.alarm" : "mfg.device.state",
                     device_id_.str(), {{"device_id", device_id_.str()}, {"snapshot", snapshot},

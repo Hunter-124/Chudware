@@ -45,6 +45,10 @@ Trust build.sh/gate.sh and this map over AGENTS.md's repo-map rows where they co
 | Dir | What it is |
 |---|---|
 | `core/` | Pure C++/CUDA kernel → `libchudware`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. Public API seam: `core/api/libchudware.h` (append-only) |
+| `core/device/**` | Device identity and capability truth; transports, Grbl codec/adapter, and emulator |
+| `core/manufacturing/**` | Journal + durable sequence, result registry, invalidation, tier0, policy, gates, approval, lease, and arbiter |
+| `core/twin/**` | Manufacturing digital twin |
+| `core/print/**` | Additive-print model |
 | `engine_oracle/` (symlink `engine/`) | Python parity oracle (build123d on OpenCASCADE) — frozen while `core/` strangles it out; kept in lockstep via parity corpus; deleted last |
 | `host/` | **The production GUI** — C++ GLFW/ImGui desktop app. `host/src/app.cpp` frame loop, `host/src/ui/` panels (52k LOC), `host/src/core/app_state.h` central data model. Details: the gui-* skills |
 | `ui/viewport/` | Shared OpenGL render module (renderer/mesh/camera, id-pass picking, AICM loader) |
@@ -52,10 +56,13 @@ Trust build.sh/gate.sh and this map over AGENTS.md's repo-map rows where they co
 | `services/mcp/` (symlink `mcp_server/`) | MCP server exposing the engine to external agents (Claude Code etc.) |
 | `services/worker/` | Engine routing seam: WorkerClient / DocMirror / bootstrap |
 | `services/installer/` (symlink `installer/`) | Provisioning, MCP self-registration, packaging |
+| `services/manufacturing/**` | Gateway transports + allowlist, printer adapters, slicer, monitor, metrology, notification, PnP, and robot services |
+| `services/perception/**`, `training/perception/**` | Perception model/runtime and reproducible training pipeline |
 | `contracts/` | **Frozen interface contracts — THE seams. Append-only.** `worker_rpc.md`, `doc_ops.md`, `feature_params.md`, `icons.md`, `parts.md`, `ecad/`, … (`contracts/README.md`) |
 | `corpora/` | Consolidated test fixtures (sketch/render/sw_parity); root symlinks keep legacy paths |
 | `scripts/` | Gates & audits: `gate.sh`, `check.py`, `gui_lint.py`, `icon_pipeline.py` |
 | `docs/` | Design docs, `PLAN.md`, `CPP_MIGRATION.md`, `REFACTOR_LOG.md` (one-paragraph handoffs go here) |
+| `docs/manufacturing/**` | Manufacturing subsystem design corpus |
 | `work/` | Task board (`work/tools/work.py`) + backlog cards `work/backlog/T-*.md` |
 | `assets/` | Icons + generators (`make_icons.py`, `pack_icons.py`), logo |
 | `tools/`, `benchmarks/`, `training/`, `dag/`, `deliverables/` | Dev tools, benches, ML training, DAG missions, deliverable templates |
@@ -100,6 +107,14 @@ judgment).
   (`engine_oracle/`) and parity corpus need the same change — lockstep is the contract.
 - Notable multi-file efforts get a one-paragraph handoff appended to `docs/REFACTOR_LOG.md`
   (files touched, deferred items, gotchas).
+
+### Manufacturing rules that bind every change
+
+- The `manufacture` MCP family is default-OFF.
+- The arbiter is the only approval validator; the device allowlist denies by default.
+- `FreshValue<T>` is the sole external freshness shape, and the journal is the sole source of durable `seq`.
+- Nothing may advertise physical `execute` or `safety_integration` before the E4–E6 pilot.
+- `mfg_run_resume` exists only to refuse.
 
 ## Daemon / mission lifecycle (don't regress these)
 

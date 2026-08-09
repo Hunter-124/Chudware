@@ -7093,3 +7093,31 @@ services/mcp/test_mfg_tools.py` 109 passed / 1 skipped; `./build.sh` links; `scr
 
 Unchanged and deliberate: no physical device has been opened, `execute` is `assumed` everywhere, and
 the E4–E6 hardware pilot remains the gate before any of that changes.
+
+## 2026-08-08 — Manufacturing overhaul: E3 end-to-end qualification (and the bug it found)
+
+`scripts/qualify_mfg_e3.py` drives a REAL private `chudware-hostd` over its IPC socket through the
+entire manufacturing lifecycle on the emulator lane and prints a per-step table, exiting non-zero on
+any deviation. It is opt-in and is NOT called from `scripts/gate.sh`, so it adds no gate SKIP.
+
+It immediately earned its keep by finding a real defect: `mfg_lane`'s `serviceDevice` only called
+`adapter_->service()` and `mfg_run_describe` never synchronized, so a started run stayed `running`
+forever — it never reached a terminal state and an injected alarm never terminated it. Fixed in the
+lane: describe now services and synchronizes, a completed stream journals `completing → completed`,
+and alarm / hard-limit / disconnect injection immediately terminalizes the active run as `faulted`
+with the discontinuity named, after which `mfg_run_resume` refuses by name and a same-lease reconnect
+refuses `mfg_transport_terminal`. Lane suite is now 18 cases / 501 assertions.
+
+A second correction came out of writing the qualification honestly: the original step-9 assertion
+("execute is always assumed") was wrong for the emulator, which legitimately earns `execute: verified`
+for the EMULATED class at E1–E3. The step now asserts both halves — emulated scope explicit with
+`safety_integration: unsupported`, and a genuinely physical endpoint shape (an allowlisted serial
+by-id path, never opened) clamped to `execute: assumed` with `missing_level:"execute"`. Faking a
+loopback as physical was rejected because it would have made the test lie.
+
+Verified: 9/9 steps PASS in 0.6 s, private daemon stopped and temp state removed, no stray process.
+`ctest -R 'mfg|transport'` green. Restaged `services/dist/Chudware/chudware-hostd` so `./build.sh core`
+no longer reports a stale consumed engine. Repo maps refreshed: `.claude/skills/chudware-dev/SKILL.md`
+gained the manufacturing rows plus the binding rules (family default-OFF, arbiter-only approval,
+deny-by-default allowlist, sole `FreshValue<T>`, journal-only seq, no physical `execute` before the
+pilot, `mfg_run_resume` refuses only), and `gui-workspaces` gained the Manufacture workspace row.

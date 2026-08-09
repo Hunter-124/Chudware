@@ -78,6 +78,8 @@ private:
         std::string gate_report_ref;
         std::string approval_id;
         std::optional<InitiatorProvenance> initiator;
+        device::RunDiscontinuity discontinuity = device::RunDiscontinuity::None;
+        bool completion_observed = false;
         device::Seq created_at_seq = 0;
     };
 

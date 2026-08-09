@@ -290,6 +290,78 @@ TEST_CASE("hold and abort are accepted but alarm permanently forbids resume") {
          {"initiator", humanInitiator()}});
     CHECK(aborted.at("state") == "aborting");
 }
+
+TEST_CASE("run describe deterministically advances a completed emulator stream") {
+    LaneRig rig;
+    rig.claim();
+    rig.connect();
+    const auto artifact_id = rig.registerArtifact();
+    const auto preflight = rig.preflight(artifact_id);
+    const std::string run_id = preflight.at("run_id");
+    const auto approval_id = rig.approval(run_id, "human_only");
+    REQUIRE(rig.start(run_id, approval_id, "human").at("state") == "running");
+
+    json described;
+    for (int poll = 0; poll < 64; ++poll) {
+        described = call(rig.lane, "mfg_run_describe", {{"run_id", run_id}});
+        if (described.at("run").at("state") == "completed") break;
+    }
+    CHECK(described.at("run").at("state") == "completed");
+    CHECK(described.at("run").at("discontinuity") == "none");
+    const auto terminal_events = call(
+        rig.lane, "mfg_journal_query",
+        {{"subject", run_id}, {"kinds", json::array({"mfg.run.state"})}});
+    CHECK(std::any_of(
+        terminal_events.at("records").begin(), terminal_events.at("records").end(),
+        [](const json& record) {
+            return record.at("body").value("state", std::string{}) == "completed" &&
+                   record.at("body").value("terminal", false);
+        }));
+}
+
+TEST_CASE("alarm hard limit and disconnect terminate a running emulator stream") {
+    struct FaultCase {
+        const char* fault;
+        const char* discontinuity;
+        const char* resume_code;
+    };
+    const FaultCase cases[] = {
+        {"alarm", "alarm", "no_alarm_since_hold"},
+        {"hard_limit", "hard_limit", "resume_forbidden_after_hard_limit"},
+        {"disconnect", "disconnect", "resume_forbidden_after_disconnect"},
+    };
+    for (const auto& fault_case : cases) {
+        CAPTURE(fault_case.fault);
+        LaneRig rig;
+        rig.claim();
+        rig.connect();
+        const auto artifact_id = rig.registerArtifact();
+        const auto preflight = rig.preflight(artifact_id);
+        const std::string run_id = preflight.at("run_id");
+        const auto approval_id = rig.approval(run_id, "human_or_agent");
+        REQUIRE(rig.start(run_id, approval_id, "agent").at("state") == "running");
+
+        call(rig.lane, "mfg_emulator_fault_inject",
+             {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+              {"fault", fault_case.fault}});
+        const auto described =
+            call(rig.lane, "mfg_run_describe", {{"run_id", run_id}});
+        CHECK(described.at("run").at("state") == "faulted");
+        CHECK(described.at("run").at("discontinuity") == fault_case.discontinuity);
+        const auto resume = call(
+            rig.lane, "mfg_run_resume",
+            {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+             {"run_id", run_id}, {"initiator", humanInitiator()}},
+            true);
+        CHECK(resume.at("code") == fault_case.resume_code);
+        CHECK(resume.at("detail").at("discontinuity") ==
+              fault_case.discontinuity);
+        const auto reopen = call(
+            rig.lane, "mfg_device_connect",
+            {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}}, true);
+        CHECK(reopen.at("code") == "mfg_transport_terminal");
+    }
+}
 TEST_CASE("emulator fault injection is structurally barred from physical endpoints") {
     TempDirectory temp;
     ManufacturingLane lane(temp.path, true);

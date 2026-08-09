@@ -1741,6 +1741,22 @@ if(CHUDWARE_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(render_view PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Exact perspective camera (doc_render_view.camera_pose.v1) -----------------
+  # Drives the C ABI: a hand-projected cube silhouette, the apparent-scale ratio only a
+  # perspective camera can produce, frustum clipping, every named degeneracy refusal, and
+  # pinned pre-change hashes proving the legacy orthographic specs stayed byte-identical.
+  add_executable(test_render_camera
+    tests/test_render_camera.cpp)
+  target_include_directories(test_render_camera PRIVATE
+    ${doctest_SOURCE_DIR})
+  target_link_libraries(test_render_camera PRIVATE
+    chudware chudware_miniz nlohmann_json::nlohmann_json)
+  set_target_properties(test_render_camera PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME render_camera COMMAND test_render_camera)
+  set_tests_properties(render_camera PROPERTIES
+    ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- Per-body appearance (task 04: set_appearance op + AICM colour/material bake) ---
   # Ports the set_appearance op into the C++ core and bakes doc["appearances"] onto tessellated
   # bodies; the test drives the op end to end (doc field + both tess paths + .step+ round-trip).

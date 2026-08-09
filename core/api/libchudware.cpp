@@ -1156,7 +1156,11 @@ static int chudware_call_inner(const char* method, const char* params_json, char
 
     try {
         if (m == "ping") {
-            return emit(json{{"ok", true}, {"abi", chudware_abi_version()}, {"echo", params}},
+            return emit(json{{"ok", true},
+                             {"abi", chudware_abi_version()},
+                             {"capabilities",
+                              json::array({"doc_render_view.camera_pose.v1"})},
+                             {"echo", params}},
                         out_json, 0);
         }
         // --- sampling profiler control (see core/prof/sampler.{h,cpp}) ----------

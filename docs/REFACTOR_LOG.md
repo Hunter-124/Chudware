@@ -7238,3 +7238,39 @@ this — against random@1 the higher mean comes from infrequent large wins plus 
 ties, not per-example dominance. The planned redesign scores candidate poses instead of imagining one,
 which also matches the deployment shape (the harness renders N, the policy ranks them) and the shape
 of the Stage-2 preference data already built.
+
+## 2026-08-08 — Exact perspective camera for doc_render_view
+
+The viewpoint policy reasons in perspective — position, target, up, vertical FOV, near/far — because
+real cameras do, but the engine could only render direction-only ORTHOGRAPHIC views. A pose the policy
+chose therefore could not be turned into the image it was scored on, and nothing would transfer to a
+webcam. `services/viewpoint/render/**` was written against the contract and refused by name until this
+landed.
+
+`core/doc/session.cpp` now accepts `view.camera = {position, target, up, vertical_fov_deg, near, far,
+width, height}` as AUTHORITATIVE: applied exactly, with no auto-fit, no bbox re-framing and no
+orthographic substitution. Only the image size may clamp, and it reports when it did. The perspective
+path shares the shading/triangle/depth/blend code with the orthographic one rather than becoming a
+second renderer, clips against all six frustum planes, and uses reciprocal depth. Degenerate input —
+up parallel to the view direction, zero-length direction, non-positive FOV, `near >= far`, subnormal
+FOV overflow — is a named refusal, never a silent fallback view. `ping` advertises
+`doc_render_view.camera_pose.v1`; the response echoes the exact applied camera and the locked document
+revision so a client can prove the pixels correspond to the pose it asked for, plus a reprojectable
+perspective `frame` block documented alongside the unchanged orthographic form in append-only
+`contracts/worker_rpc.md` §17.
+
+Back-compatibility was the real risk here: `doc_render_view` feeds icon generation, agent part
+inspection and GUI previews, so a silent framing change would have corrupted all three. All 29 PNGs
+from the existing representative render-view suite were regenerated before and after and their SHA-256
+manifests diff clean — every image byte-identical. `test_render_view` still passes 10 cases / 151
+assertions.
+
+Gates: new `test_render_camera` 7 cases / 160 assertions (hand-projected cube silhouette, the
+apparent-scale ratio orthographic cannot produce, frustum clipping, every named degeneracy, capability
+and revision echo, clamp reporting, pinned legacy hashes); `ctest` 96/96 — the two failures in the
+parallel run, `kicad_import` and `mesher_advanced`, both pass standalone and are the same `-j` CPU/temp
+contention artifact recorded earlier, in code this work never touched.
+
+Note for future runs on this box: `/tmp` is a 16 GB tmpfs sitting at 81 % from other sessions' build
+scratch, and GCC assembling large TUs there fails with "Disk quota exceeded". Build and test with
+`TMPDIR=$PWD/core/build-linux/tmp`.

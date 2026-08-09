@@ -656,3 +656,129 @@ another number.
 | `## 14. Manufacturing additive` | additive | `mfg_print_*` |
 | `## 15. Manufacturing metrology` | metrology | `mfg_metrology_*` |
 | `## 16. Manufacturing perception` | perception | `mfg_perception_*` |
+
+## 17. Exact perspective document camera (append-only, 2026-08-09)
+
+`ping.result.capabilities` includes `doc_render_view.camera_pose.v1` when the running worker
+implements this section. The capability applies to the existing `doc_render_view` method; it does
+not allocate a second renderer.
+
+When `view.camera` is present it is authoritative. Its request form is:
+
+```json
+{
+  "camera": {
+    "projection": "perspective",
+    "position": [40.0, 20.0, 30.0],
+    "target": [0.0, 0.0, 5.0],
+    "up": [0.0, 0.0, 1.0],
+    "vertical_fov_deg": 45.0,
+    "near": 0.1,
+    "far": 1000.0
+  },
+  "width": 640,
+  "height": 480
+}
+```
+
+For compatibility with direct renderer callers, integer `width` and `height` MAY instead be
+nested in `camera`; nested values win if both forms are supplied. Image dimensions are the only
+camera-related values that clamp, to `[64,2048]`. A successful response reports the applied
+dimensions in `camera.image_width_px` / `camera.image_height_px`, sets `image_size_clamped`, and,
+when clamped, includes `requested_image_width_px` / `requested_image_height_px`. Position, target,
+up, FOV, and clip planes never clamp or auto-fit.
+
+The exact camera uses WCS coordinates. Let `forward = normalize(target-position)`,
+`right = normalize(cross(forward,normalize(up)))`, and `true_up = cross(right,forward)`. The
+rasterizer uses vertical FOV and aspect ratio exactly, clips triangles against the near, far, and
+four side-frustum planes (`near <= depth <= far`), and performs reciprocal-depth testing. It does
+not replace the target with a body centre, choose another up vector, frame a bounding box, or
+substitute orthographic projection. A
+`camera` request combined with legacy `focus` is refused rather than silently changing either
+contract.
+
+A successful exact-camera response retains the legacy render fields and adds:
+
+```json
+{
+  "capability": "doc_render_view.camera_pose.v1",
+  "camera": {
+    "position": [40.0, 20.0, 30.0],
+    "target": [0.0, 0.0, 5.0],
+    "up": [0.0, 0.0, 1.0],
+    "vertical_fov_deg": 45.0,
+    "image_width_px": 640,
+    "image_height_px": 480,
+    "near": 0.1,
+    "far": 1000.0
+  },
+  "revision": 17,
+  "image_size_clamped": false
+}
+```
+
+`camera` is the exact applied pose and projection, and `revision` is the document revision held
+under the render lock while the mesh and pixels are produced.
+
+### 17.1 Perspective `frame`
+
+An exact-camera response returns this reprojectable frame:
+
+```json
+{
+  "projection": "perspective",
+  "position": [0.0, -10.0, 0.0],
+  "right": [1.0, 0.0, 0.0],
+  "up": [0.0, 0.0, 1.0],
+  "forward": [0.0, 1.0, 0.0],
+  "vertical_fov_deg": 45.0,
+  "tan_half_vertical_fov": 0.41421356237309503,
+  "focal_length_px": 579.4112549695428,
+  "principal_x_px": 320.0,
+  "principal_y_px": 240.0,
+  "near": 0.1,
+  "far": 1000.0,
+  "width": 640,
+  "height": 480
+}
+```
+
+The example basis is the resolved orthonormal basis for a camera at `[0,-10,0]` aimed at the
+origin with WCS +Z image-up. To project WCS point `p`, compute `q=p-position`,
+`depth=dot(q,forward)`,
+`x=dot(q,right)`, and `y=dot(q,up)`. If depth is outside `[near,far]` the point is clipped.
+Otherwise:
+
+```text
+pixel_x = principal_x_px + focal_length_px * x / depth
+pixel_y = principal_y_px - focal_length_px * y / depth
+```
+
+This differs from the unchanged orthographic frame. Orthographic frames have no `projection` key
+and retain `{center,right,up,dir,scale,cu,cv,width,height,clip_depth,focused,clip_near}` with:
+
+```text
+q = p-center
+pixel_x = (dot(q,right)-cu)*scale + width/2
+pixel_y = height/2 - (dot(q,up)-cv)*scale
+```
+
+Orthographic apparent scale is depth-independent; perspective apparent scale is proportional to
+`1/depth`.
+
+### 17.2 Named exact-camera refusals
+
+Exact-camera validation returns `ok:false`, an empty `path`, and one of these stable `code` values;
+it never falls back to a named/ISO view:
+
+| code | condition |
+|---|---|
+| `camera_invalid` | camera is not an object, or pose vectors are missing/non-finite |
+| `camera_projection_unsupported` | an explicit projection is not `perspective` |
+| `camera_zero_direction` | position and target coincide |
+| `camera_up_degenerate` | up has zero length |
+| `camera_up_parallel` | up is parallel to the view direction |
+| `camera_fov_invalid` | vertical FOV is outside `(0,179)` or cannot yield a finite focal length |
+| `camera_clip_range_invalid` | clip range does not satisfy `0 < near < far` |
+| `camera_image_size_invalid` | a supplied image dimension is not an integer |
+| `camera_focus_conflict` | authoritative camera and legacy auto-fit focus are both present |

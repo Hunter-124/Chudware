@@ -6436,11 +6436,28 @@ bool orient_tint(double nx, double ny, double nz, unsigned char out[3]) {
 }
 
 // ---- view spec resolution (task 03: on-request viewing angles) --------------------------------
-// A camera for the rasterizer is a single direction `dir` = scene-center -> camera (the existing
-// code's `d`). Named views match the SAME convention the vision-review face labels use
-// (front = looking at the -Y face, right = +X, top = +Z), so "front"/"right"/"top" mean exactly
-// what the model already queries geometry by. iso keeps the legacy front-right-top-ish corner.
-struct ResolvedView { RV3 dir; std::string name; };
+// A legacy camera is a single direction `dir` = scene-center -> camera (the existing code's `d`).
+// An exact perspective camera retains its full WCS pose and projection parameters; doc_render_view
+// passes it through to the same rasterizer instead of auto-fitting the scene.
+struct PerspectiveCamera {
+    RV3 position{0, 0, 0};
+    RV3 target{0, 0, 0};
+    RV3 up{0, 0, 1};       // exact request value; basis derivation normalizes a private copy
+    RV3 forward{0, 0, -1}; // position -> target
+    RV3 right{1, 0, 0};
+    RV3 true_up{0, 1, 0};
+    double vertical_fov_deg = 0;
+    double near_plane = 0;
+    double far_plane = 0;
+};
+
+struct ResolvedView {
+    RV3 dir;
+    std::string name;
+    std::optional<PerspectiveCamera> camera;
+    std::string refusal_code;
+    std::string refusal_reason;
+};
 
 inline RV3 dir_from_az_el(double az_deg, double el_deg) {
     // az measured from the -Y (front) axis toward +X (right); el above the XY plane toward +Z.
@@ -6450,43 +6467,135 @@ inline RV3 dir_from_az_el(double az_deg, double el_deg) {
     return rnorm({std::cos(e) * std::sin(a), -std::cos(e) * std::cos(a), std::sin(e)});
 }
 
-// Resolve a view spec to a camera direction + a short display name. Accepts (in priority order):
-//   - a bare string name:           "front"|"back"|"top"|"bottom"|"left"|"right"|"iso"
-//   - {"view":"front"}              same set, object form
-//   - {"azimuth":a,"elevation":e}   parametric angle in degrees (the on-request angle)
-//   - {"dir":[x,y,z]}               explicit camera direction (scene -> camera), any length
-// Anything unrecognised falls back to iso. Pure + header-free so it is unit-testable.
+// Resolve a view spec to either the legacy direction camera or an exact perspective pose.
+// Existing malformed/unknown legacy specs deliberately retain their ISO fallback. Once `camera`
+// is present, however, it is authoritative: malformed or degenerate values are named refusals.
 ResolvedView resolve_view_spec(const nlohmann::json& v) {
-    auto named = [](const std::string& s) -> ResolvedView {
+    auto legacy = [](RV3 dir, std::string name) -> ResolvedView {
+        return {dir, std::move(name), std::nullopt, std::string(), std::string()};
+    };
+    auto refuse = [](const char* code, const char* reason) -> ResolvedView {
+        return {{0, 0, 0}, "PERSPECTIVE", std::nullopt, code, reason};
+    };
+    auto named = [&](const std::string& s) -> ResolvedView {
         std::string n;
         for (char c : s) n += (char)std::toupper((unsigned char)c);
-        if (n == "FRONT")  return {{0, -1, 0}, "FRONT"};
-        if (n == "BACK")   return {{0, 1, 0}, "BACK"};
-        if (n == "TOP")    return {{0, 0, 1}, "TOP"};
-        if (n == "BOTTOM") return {{0, 0, -1}, "BOTTOM"};
-        if (n == "RIGHT")  return {{1, 0, 0}, "RIGHT"};
-        if (n == "LEFT")   return {{-1, 0, 0}, "LEFT"};
-        return {rnorm({1.0, 1.0, 0.8}), "ISO"};  // iso / unknown
+        if (n == "FRONT")  return legacy({0, -1, 0}, "FRONT");
+        if (n == "BACK")   return legacy({0, 1, 0}, "BACK");
+        if (n == "TOP")    return legacy({0, 0, 1}, "TOP");
+        if (n == "BOTTOM") return legacy({0, 0, -1}, "BOTTOM");
+        if (n == "RIGHT")  return legacy({1, 0, 0}, "RIGHT");
+        if (n == "LEFT")   return legacy({-1, 0, 0}, "LEFT");
+        return legacy(rnorm({1.0, 1.0, 0.8}), "ISO");  // iso / unknown
     };
     if (v.is_string()) return named(v.get<std::string>());
     if (v.is_object()) {
+        const auto camera_it = v.find("camera");
+        if (camera_it != v.end()) {
+            if (!camera_it->is_object())
+                return refuse("camera_invalid", "view.camera must be an object");
+            const json& cj = *camera_it;
+            if (cj.contains("projection") &&
+                (!cj.at("projection").is_string() ||
+                 cj.at("projection").get<std::string>() != "perspective"))
+                return refuse("camera_projection_unsupported",
+                              "view.camera.projection must be perspective");
+            auto vec3 = [](const json& value, RV3& out) {
+                if (!value.is_array() || value.size() != 3) return false;
+                for (int i = 0; i < 3; ++i)
+                    if (!value[i].is_number() ||
+                        !std::isfinite(value[i].get<double>())) return false;
+                out = {value[0].get<double>(), value[1].get<double>(),
+                       value[2].get<double>()};
+                return true;
+            };
+            PerspectiveCamera camera;
+            if (!cj.contains("position") || !vec3(cj.at("position"), camera.position) ||
+                !cj.contains("target") || !vec3(cj.at("target"), camera.target) ||
+                !cj.contains("up") || !vec3(cj.at("up"), camera.up))
+                return refuse("camera_invalid",
+                              "camera position, target, and up must be finite 3-vectors");
+            auto stable_unit = [](RV3 value, RV3& out) {
+                const double magnitude = std::max(
+                    {std::abs(value.x), std::abs(value.y), std::abs(value.z)});
+                if (!(magnitude > 0.0) || !std::isfinite(magnitude)) return false;
+                value = {value.x / magnitude, value.y / magnitude, value.z / magnitude};
+                const double length = std::sqrt(rdot(value, value));
+                if (!(length > 0.0) || !std::isfinite(length)) return false;
+                out = {value.x / length, value.y / length, value.z / length};
+                return true;
+            };
+            RV3 forward_raw = rsub(camera.target, camera.position);
+            if (!std::isfinite(forward_raw.x) || !std::isfinite(forward_raw.y) ||
+                !std::isfinite(forward_raw.z)) {
+                const double coordinate_scale = std::max(
+                    {std::abs(camera.position.x), std::abs(camera.position.y),
+                     std::abs(camera.position.z), std::abs(camera.target.x),
+                     std::abs(camera.target.y), std::abs(camera.target.z)});
+                forward_raw = {
+                    camera.target.x / coordinate_scale - camera.position.x / coordinate_scale,
+                    camera.target.y / coordinate_scale - camera.position.y / coordinate_scale,
+                    camera.target.z / coordinate_scale - camera.position.z / coordinate_scale,
+                };
+            }
+            if (!stable_unit(forward_raw, camera.forward))
+                return refuse("camera_zero_direction",
+                              "camera position and target must differ");
+            RV3 normalized_up;
+            if (!stable_unit(camera.up, normalized_up))
+                return refuse("camera_up_degenerate", "camera up must be non-zero");
+            const RV3 right_raw = rcross(camera.forward, normalized_up);
+            if (!stable_unit(right_raw, camera.right))
+                return refuse("camera_up_parallel",
+                              "camera up must not be parallel to the view direction");
+            camera.true_up = rcross(camera.right, camera.forward);
+            if (!cj.contains("vertical_fov_deg") ||
+                !cj.at("vertical_fov_deg").is_number()) {
+                return refuse("camera_fov_invalid",
+                              "camera vertical_fov_deg must be in (0, 179)");
+            }
+            camera.vertical_fov_deg = cj.at("vertical_fov_deg").get<double>();
+            const double tan_half_fov = std::tan(
+                camera.vertical_fov_deg * 3.14159265358979323846 / 360.0);
+            const double min_tan_for_viewport =
+                1024.0 / std::numeric_limits<double>::max();
+            if (!std::isfinite(camera.vertical_fov_deg) ||
+                !(camera.vertical_fov_deg > 0.0 && camera.vertical_fov_deg < 179.0) ||
+                !std::isfinite(tan_half_fov) || !(tan_half_fov >= min_tan_for_viewport))
+                return refuse("camera_fov_invalid",
+                              "camera vertical_fov_deg must yield a finite focal length");
+            if (!cj.contains("near") || !cj.at("near").is_number() ||
+                !cj.contains("far") || !cj.at("far").is_number())
+                return refuse("camera_clip_range_invalid",
+                              "camera clipping range must satisfy 0 < near < far");
+            camera.near_plane = cj.at("near").get<double>();
+            camera.far_plane = cj.at("far").get<double>();
+            if (!std::isfinite(camera.near_plane) || !std::isfinite(camera.far_plane) ||
+                !(camera.near_plane > 0.0 && camera.near_plane < camera.far_plane))
+                return refuse("camera_clip_range_invalid",
+                              "camera clipping range must satisfy 0 < near < far");
+            const RV3 scene_to_camera{-camera.forward.x, -camera.forward.y, -camera.forward.z};
+            ResolvedView out = legacy(scene_to_camera, "PERSPECTIVE");
+            out.camera = camera;
+            return out;
+        }
         if (v.contains("dir") && v.at("dir").is_array() && v.at("dir").size() >= 3) {
             const auto& a = v.at("dir");
             RV3 dir = rnorm({a[0].get<double>(), a[1].get<double>(), a[2].get<double>()});
             if (rdot(dir, dir) > 1e-9)
-                return {dir, v.value("name", std::string("VIEW"))};
+                return legacy(dir, v.value("name", std::string("VIEW")));
         }
         if (v.contains("azimuth") || v.contains("elevation")) {
             double az = v.value("azimuth", 0.0), el = v.value("elevation", 0.0);
             RV3 dir = dir_from_az_el(az, el);
-            // Compact "AZ45 EL35" name so the header tells the model exactly what it asked for.
             std::string nm = "AZ" + std::to_string((long)std::lround(az)) +
                              " EL" + std::to_string((long)std::lround(el));
-            return {dir, nm};
+            return legacy(dir, nm);
         }
-        if (v.contains("view") && v.at("view").is_string()) return named(v.at("view").get<std::string>());
+        if (v.contains("view") && v.at("view").is_string())
+            return named(v.at("view").get<std::string>());
     }
-    return {rnorm({1.0, 1.0, 0.8}), "ISO"};
+    return legacy(rnorm({1.0, 1.0, 0.8}), "ISO");
 }
 
 // ---- explicit close-up framing (feature emphasis) -------------------------------------
@@ -6547,7 +6656,9 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                         const std::vector<aicm::AicmBody>* frame_from = nullptr,
                         int min_painted = -1,
                         const RenderFocus* focus = nullptr,
-                        RenderFrame* out_frame = nullptr) {
+                        RenderFrame* out_frame = nullptr,
+                        const PerspectiveCamera* perspective_camera = nullptr) {
+    const bool perspective = perspective_camera != nullptr;
     // Camera framing reference: the drawn set unless the caller supplied a stable frame set.
     const std::vector<aicm::AicmBody>& frame_bodies =
         (frame_from && !frame_from->empty()) ? *frame_from : bodies;
@@ -6561,24 +6672,33 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             any = true;
         }
     if (!any) return false;
-    RV3 c = focus ? RV3{(focus->lo.x + focus->hi.x) / 2, (focus->lo.y + focus->hi.y) / 2,
-                        (focus->lo.z + focus->hi.z) / 2}
-                  : RV3{(lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2};
-    RV3 d = rnorm(viewDir);                   // view dir (scene -> camera)
-    if (rdot(d, d) < 0.5) d = rnorm({1.0, 1.0, 0.8});  // degenerate spec -> iso
-    // Robust screen-up reference: world +Z, except for a top/bottom view (d ~ ±Z), where +Z is
-    // parallel to the view dir and rcross would collapse — fall back to world +Y there.
+    RV3 c = perspective ? perspective_camera->position
+                        : (focus ? RV3{(focus->lo.x + focus->hi.x) / 2,
+                                      (focus->lo.y + focus->hi.y) / 2,
+                                      (focus->lo.z + focus->hi.z) / 2}
+                                 : RV3{(lo.x + hi.x) / 2, (lo.y + hi.y) / 2,
+                                       (lo.z + hi.z) / 2});
+    RV3 d = perspective
+                ? RV3{-perspective_camera->forward.x, -perspective_camera->forward.y,
+                      -perspective_camera->forward.z}
+                : rnorm(viewDir);  // legacy view dir (scene -> camera)
+    if (!perspective && rdot(d, d) < 0.5)
+        d = rnorm({1.0, 1.0, 0.8});  // degenerate legacy spec -> iso
+    // Legacy views retain their robust world-up choice byte-for-byte. An exact camera instead
+    // uses the requested up to derive the same right/true-up basis as CameraPose.
     RV3 upRef = (std::abs(d.z) > 0.985) ? RV3{0, 1, 0} : RV3{0, 0, 1};
-    RV3 r = rnorm(rcross(upRef, d));
-    RV3 u = rcross(d, r);
+    RV3 r = perspective ? perspective_camera->right : rnorm(rcross(upRef, d));
+    RV3 u = perspective ? perspective_camera->true_up : rcross(d, r);
     RV3 light = rnorm({0.4, 0.5, 1.0});
     auto proj = [&](double x, double y, double z, double& pu, double& pv, double& pd) {
         RV3 p = rsub({x, y, z}, c);
-        pu = rdot(p, r); pv = rdot(p, u); pd = rdot(p, d);
+        pu = rdot(p, r);
+        pv = rdot(p, u);
+        pd = perspective ? rdot(p, perspective_camera->forward) : rdot(p, d);
     };
     double minu = 1e30, maxu = -1e30, minv = 1e30, maxv = -1e30;
-    // Fit extents: the focus box's 8 projected corners, else every framing vertex.
-    if (focus) {
+    // Perspective poses are authoritative and never enter either fitting loop.
+    if (!perspective && focus) {
         for (int k = 0; k < 8; ++k) {
             double pu, pv, pd;
             proj((k & 1) ? focus->hi.x : focus->lo.x,
@@ -6587,14 +6707,13 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             minu = std::min(minu, pu); maxu = std::max(maxu, pu);
             minv = std::min(minv, pv); maxv = std::max(maxv, pv);
         }
-        // A degenerate box (a planar face seen edge-on, a single vertex) still needs a window.
         const double span = std::max({maxu - minu, maxv - minv, 1e-3});
         if (maxu - minu < span * 0.02) { double m = (minu + maxu) / 2; minu = m - span * 0.01; maxu = m + span * 0.01; }
         if (maxv - minv < span * 0.02) { double m = (minv + maxv) / 2; minv = m - span * 0.01; maxv = m + span * 0.01; }
         const double pad = std::max(focus->margin, 0.0);
         const double du = (maxu - minu) * pad, dv = (maxv - minv) * pad;
         minu -= du; maxu += du; minv -= dv; maxv += dv;
-    } else {
+    } else if (!perspective) {
         for (const auto& b : frame_bodies)
             for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
                 double pu, pv, pd; proj(b.pos[i], b.pos[i + 1], b.pos[i + 2], pu, pv, pd);
@@ -6602,15 +6721,17 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                 minv = std::min(minv, pv); maxv = std::max(maxv, pv);
             }
     }
-    // The 0.85 auto-fit shrink is a whole-part courtesy margin; a focus box carries its own
-    // explicit `margin`, so applying both would silently under-zoom every close-up.
     const double fit = focus ? 1.0 : 0.85;
-    double scale = fit * std::min(W / std::max(maxu - minu, 1e-6), H / std::max(maxv - minv, 1e-6));
-    double cu = (minu + maxu) / 2, cv = (minv + maxv) / 2;
-    // Near-clip plane: the front face of the focus box. Depth is dot(p - c, d) — LARGER is nearer
-    // the camera — so anything above this is between the camera and the feature and gets cut.
+    double scale = perspective
+        ? (H * 0.5) / std::tan(perspective_camera->vertical_fov_deg *
+                               3.14159265358979323846 / 360.0)
+        : fit * std::min(W / std::max(maxu - minu, 1e-6),
+                         H / std::max(maxv - minv, 1e-6));
+    double cu = perspective ? 0.0 : (minu + maxu) / 2;
+    double cv = perspective ? 0.0 : (minv + maxv) / 2;
+    // Legacy focus cutaway depth. Perspective clipping is handled against near/far below.
     double clip_depth = 1e30;
-    if (focus && focus->clip_near) {
+    if (!perspective && focus && focus->clip_near) {
         double dmax = -1e30;
         for (int k = 0; k < 8; ++k) {
             double pu, pv, pd;
@@ -6624,13 +6745,89 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
     if (out_frame)
         *out_frame = RenderFrame{c, r, u, d, scale, cu, cv, W, H, clip_depth,
                                  clip_depth < 1e29};
-    auto toScreen = [&](double pu, double pv, double& sx, double& sy) {
-        sx = (pu - cu) * scale + W / 2.0;
-        sy = H / 2.0 - (pv - cv) * scale;
+    auto toScreen = [&](double pu, double pv, double pd, double& sx, double& sy) {
+        if (perspective) {
+            sx = pu * scale / pd + W / 2.0;
+            sy = H / 2.0 - pv * scale / pd;
+        } else {
+            sx = (pu - cu) * scale + W / 2.0;
+            sy = H / 2.0 - (pv - cv) * scale;
+        }
     };
     std::vector<unsigned char> img((size_t)W * H * 3, 245);  // light-grey background
     std::vector<double> zbuf((size_t)W * H, -1e30);
     long painted = 0;
+    struct ProjectedVertex { double pu, pv, pd; };
+    auto clip_halfspace = [](const std::vector<ProjectedVertex>& input,
+                             const auto& signed_distance) {
+        std::vector<ProjectedVertex> output;
+        if (input.empty()) return output;
+        ProjectedVertex previous = input.back();
+        double previous_distance = signed_distance(previous);
+        bool previous_inside = previous_distance >= 0.0;
+        for (const ProjectedVertex& current : input) {
+            const double current_distance = signed_distance(current);
+            const bool current_inside = current_distance >= 0.0;
+            if (current_inside != previous_inside) {
+                const double t = previous_distance /
+                                 (previous_distance - current_distance);
+                output.push_back({
+                    previous.pu + t * (current.pu - previous.pu),
+                    previous.pv + t * (current.pv - previous.pv),
+                    previous.pd + t * (current.pd - previous.pd),
+                });
+            }
+            if (current_inside) output.push_back(current);
+            previous = current;
+            previous_distance = current_distance;
+            previous_inside = current_inside;
+        }
+        return output;
+    };
+    // Projection/clipping feeds this one edge-function/depth/blend raster path for both camera
+    // kinds. Perspective supplies reciprocal depth; orthographic supplies its legacy linear depth.
+    auto raster_triangle = [&](const ProjectedVertex& p0, const ProjectedVertex& p1,
+                               const ProjectedVertex& p2, unsigned char R, unsigned char G,
+                               unsigned char B, unsigned char balpha) {
+        double su0, sv0, su1, sv1, su2, sv2;
+        toScreen(p0.pu, p0.pv, p0.pd, su0, sv0);
+        toScreen(p1.pu, p1.pv, p1.pd, su1, sv1);
+        toScreen(p2.pu, p2.pv, p2.pd, su2, sv2);
+        int minx = (int)std::floor(std::min({su0, su1, su2}));
+        int maxx = (int)std::ceil(std::max({su0, su1, su2}));
+        int miny = (int)std::floor(std::min({sv0, sv1, sv2}));
+        int maxy = (int)std::ceil(std::max({sv0, sv1, sv2}));
+        minx = std::max(minx, 0); miny = std::max(miny, 0);
+        maxx = std::min(maxx, W - 1); maxy = std::min(maxy, H - 1);
+        double area = (su1 - su0) * (sv2 - sv0) - (su2 - su0) * (sv1 - sv0);
+        if (std::abs(area) < 1e-9) return;
+        const double d0 = perspective ? 1.0 / p0.pd : p0.pd;
+        const double d1 = perspective ? 1.0 / p1.pd : p1.pd;
+        const double d2 = perspective ? 1.0 / p2.pd : p2.pd;
+        for (int py = miny; py <= maxy; ++py)
+            for (int px = minx; px <= maxx; ++px) {
+                double fx = px + 0.5, fy = py + 0.5;
+                double a0 = ((su1 - fx) * (sv2 - fy) - (su2 - fx) * (sv1 - fy)) / area;
+                double a1 = ((su2 - fx) * (sv0 - fy) - (su0 - fx) * (sv2 - fy)) / area;
+                double a2 = 1.0 - a0 - a1;
+                if (a0 < 0 || a1 < 0 || a2 < 0) continue;
+                double depth = a0 * d0 + a1 * d1 + a2 * d2;
+                if (!perspective && depth > clip_depth) continue;
+                size_t pi = (size_t)py * W + px;
+                if (depth > zbuf[pi]) {
+                    zbuf[pi] = depth;
+                    if (balpha >= 255) {
+                        img[pi * 3] = R; img[pi * 3 + 1] = G; img[pi * 3 + 2] = B;
+                    } else {
+                        const int a = balpha, ia = 255 - balpha;
+                        img[pi * 3] = (unsigned char)((a * R + ia * img[pi * 3]) / 255);
+                        img[pi * 3 + 1] = (unsigned char)((a * G + ia * img[pi * 3 + 1]) / 255);
+                        img[pi * 3 + 2] = (unsigned char)((a * B + ia * img[pi * 3 + 2]) / 255);
+                    }
+                    ++painted;
+                }
+            }
+    };
     for (size_t bi = 0; bi < bodies.size(); ++bi) {
         const aicm::AicmBody& b = bodies[bi];
         const unsigned char balpha =
@@ -6715,42 +6912,37 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             unsigned char R = (unsigned char)std::min(255.0, cr * 255 * lam);
             unsigned char G = (unsigned char)std::min(255.0, cg * 255 * lam);
             unsigned char B = (unsigned char)std::min(255.0, cb * 255 * lam);
-            double su0, sv0, su1, sv1, su2, sv2, d0, d1, d2, pu, pv;
-            proj(w0.x, w0.y, w0.z, pu, pv, d0); toScreen(pu, pv, su0, sv0);
-            proj(w1.x, w1.y, w1.z, pu, pv, d1); toScreen(pu, pv, su1, sv1);
-            proj(w2.x, w2.y, w2.z, pu, pv, d2); toScreen(pu, pv, su2, sv2);
-            int minx = (int)std::floor(std::min({su0, su1, su2}));
-            int maxx = (int)std::ceil(std::max({su0, su1, su2}));
-            int miny = (int)std::floor(std::min({sv0, sv1, sv2}));
-            int maxy = (int)std::ceil(std::max({sv0, sv1, sv2}));
-            minx = std::max(minx, 0); miny = std::max(miny, 0);
-            maxx = std::min(maxx, W - 1); maxy = std::min(maxy, H - 1);
-            double area = (su1 - su0) * (sv2 - sv0) - (su2 - su0) * (sv1 - sv0);
-            if (std::abs(area) < 1e-9) continue;
-            for (int py = miny; py <= maxy; ++py)
-                for (int px = minx; px <= maxx; ++px) {
-                    double fx = px + 0.5, fy = py + 0.5;
-                    double a0 = ((su1 - fx) * (sv2 - fy) - (su2 - fx) * (sv1 - fy)) / area;
-                    double a1 = ((su2 - fx) * (sv0 - fy) - (su0 - fx) * (sv2 - fy)) / area;
-                    double a2 = 1.0 - a0 - a1;
-                    if (a0 < 0 || a1 < 0 || a2 < 0) continue;
-                    double depth = a0 * d0 + a1 * d1 + a2 * d2;
-                    // Cutaway: this fragment sits between the camera and the focus box.
-                    if (depth > clip_depth) continue;
-                    size_t pi = (size_t)py * W + px;
-                    if (depth > zbuf[pi]) {
-                        zbuf[pi] = depth;
-                        if (balpha >= 255) {
-                            img[pi * 3] = R; img[pi * 3 + 1] = G; img[pi * 3 + 2] = B;
-                        } else {
-                            const int a = balpha, ia = 255 - balpha;
-                            img[pi * 3] = (unsigned char)((a * R + ia * img[pi * 3]) / 255);
-                            img[pi * 3 + 1] = (unsigned char)((a * G + ia * img[pi * 3 + 1]) / 255);
-                            img[pi * 3 + 2] = (unsigned char)((a * B + ia * img[pi * 3 + 2]) / 255);
-                        }
-                        ++painted;
-                    }
-                }
+            ProjectedVertex p0, p1, p2;
+            proj(w0.x, w0.y, w0.z, p0.pu, p0.pv, p0.pd);
+            proj(w1.x, w1.y, w1.z, p1.pu, p1.pv, p1.pd);
+            proj(w2.x, w2.y, w2.z, p2.pu, p2.pv, p2.pd);
+            if (!perspective) {
+                raster_triangle(p0, p1, p2, R, G, B, balpha);
+                continue;
+            }
+            std::vector<ProjectedVertex> polygon{p0, p1, p2};
+            const double tan_y = 0.5 * H / scale;
+            const double tan_x = tan_y * W / H;
+            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+                return p.pd - perspective_camera->near_plane;
+            });
+            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+                return perspective_camera->far_plane - p.pd;
+            });
+            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+                return p.pu + p.pd * tan_x;
+            });
+            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+                return p.pd * tan_x - p.pu;
+            });
+            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+                return p.pv + p.pd * tan_y;
+            });
+            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+                return p.pd * tan_y - p.pv;
+            });
+            for (size_t k = 1; k + 1 < polygon.size(); ++k)
+                raster_triangle(polygon[0], polygon[k], polygon[k + 1], R, G, B, balpha);
         }
     }
     const long paint_floor = (min_painted >= 0) ? (long)min_painted : (long)(W * H) / 400;
@@ -6764,7 +6956,14 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
         if (rdot(lb.normal, d) < 0.15) continue;  // face points away from camera -> skip
         double pu, pv, pd, sx, sy;
         proj(lb.anchor.x, lb.anchor.y, lb.anchor.z, pu, pv, pd);
-        toScreen(pu, pv, sx, sy);
+        if (perspective) {
+            const double half_width_at_depth = pd * W * 0.5 / scale;
+            const double half_height_at_depth = pd * H * 0.5 / scale;
+            if (pd < perspective_camera->near_plane || pd > perspective_camera->far_plane ||
+                std::abs(pu) > half_width_at_depth || std::abs(pv) > half_height_at_depth)
+                continue;
+        }
+        toScreen(pu, pv, pd, sx, sy);
         int ix = (int)std::lround(sx), iy = (int)std::lround(sy);
         // A label whose anchor projects OUTSIDE the frame is a lie: the text below is clamped
         // back inside, so a close-up used to sprout a giant "R" belonging to a face metres away.
@@ -6985,40 +7184,85 @@ json doc_render_png(const std::string& doc_id, const std::string& out_path, bool
     }
 }
 
-// doc_render_view (task 03): render ONE on-request view to a PNG. `view` is any spec accepted by
-// resolve_view_spec — a named view ("front"/"top"/"iso"/...), an {"azimuth","elevation"} angle, or
-// an explicit {"dir":[x,y,z]}. The image is labelled with the resolved view name + bbox dims so the
-// model can reason about orientation/scale. Back-compatible: callers that want the legacy iso shot
-// keep using doc_render_png.
+// Render one requested view through the shared software rasterizer. Legacy named, azimuth/
+// elevation, direction, size, and focus specs retain their orthographic auto-fit path. A
+// `view.camera` object selects the authoritative perspective path: position, target, up, FOV, and
+// near/far are validated without fallback or clamping, while width/height alone clamp to 64..2048.
 //
-// The object form also accepts CLOSE-UP framing, so a feature review is a real render instead of a
-// magnified 30-px patch of a whole-part shot:
+// Legacy responses keep the orthographic `{center,right,up,dir,scale,cu,cv,...}` frame. Perspective
+// responses identify `projection:"perspective"` and return position, forward/right/true-up,
+// focal/principal-point, viewport, and clip range so WCS points can be reprojected exactly. They
+// also echo the applied camera, capability, and locked document revision.
+//
+// The legacy object form accepts CLOSE-UP framing:
 //   "width" / "height"   image size in pixels (default 512x400, clamped to 64..2048)
-//   "focus": {"min":[x,y,z], "max":[x,y,z]}     — world AABB to frame, or
-//            {"center":[x,y,z], "radius": r}    — equivalent cube
-//            "margin": 0.15                     — padding as a fraction of its projected size
-//            "clip_near": false                 — cut away everything in front of the box
-// Returns {ok, path, view, dims, dir[, frame]}, where `frame` is the exact orthographic
-// projection used ({center, right, up, dir, scale, cu, cv, width, height}) so an overlay can
-// reproject world points onto these pixels without re-deriving the camera.
-// `annotate=false` drops the orientation tint / face callouts / axis triad for a clean shot.
+//   "focus": {"min":[x,y,z], "max":[x,y,z]} or {"center":[x,y,z], "radius":r}
+//            "margin":0.15, "clip_near":false
+// Exact cameras refuse `focus` because honoring both would silently reframe or clip the pose.
+// `annotate=false` drops orientation tint, face callouts, and the axis triad.
 json doc_render_view(const std::string& doc_id, const std::string& out_path,
                      const nlohmann::json& view, bool annotate) {
     try {
         DocLock lk;
         Session& s = require_session(doc_id);
-        std::vector<aicm::AicmBody> bodies = tessellate_session_bodies(s);
-        if (bodies.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
         ResolvedView rv = resolve_view_spec(view);
-        std::string dims = bbox_dims_label(bodies);
+        if (!rv.refusal_code.empty())
+            return json{{"ok", false}, {"code", rv.refusal_code},
+                        {"reason", rv.refusal_reason}, {"path", std::string()}};
+        if (rv.camera && view.is_object() && view.contains("focus"))
+            return json{{"ok", false}, {"code", "camera_focus_conflict"},
+                        {"reason", "exact perspective camera cannot be combined with auto-fit focus"},
+                        {"path", std::string()}};
 
         int W = 512, H = 400;
-        RenderFocus fbox;
-        bool has_focus = false;
-        if (view.is_object()) {
-            auto clampi = [](int v, int lo2, int hi2) { return std::max(lo2, std::min(v, hi2)); };
+        json requested_W = W, requested_H = H;
+        bool image_size_clamped = false;
+        if (view.is_object() && rv.camera) {
+            const json& camera = view.at("camera");
+            auto read_dimension = [&](const char* key, const char* alias, int fallback,
+                                      json& requested, int& applied) -> bool {
+                const json* value = nullptr;
+                if (camera.contains(key)) value = &camera.at(key);
+                else if (camera.contains(alias)) value = &camera.at(alias);
+                else if (view.contains(key)) value = &view.at(key);
+                if (!value) {
+                    requested = fallback;
+                    applied = fallback;
+                    return true;
+                }
+                if (!value->is_number_integer()) return false;
+                requested = *value;
+                if (value->is_number_unsigned()) {
+                    const unsigned long long raw = value->get<unsigned long long>();
+                    applied = raw > 2048 ? 2048 : (raw < 64 ? 64 : static_cast<int>(raw));
+                } else {
+                    const long long raw = value->get<long long>();
+                    applied = raw < 64 ? 64 : (raw > 2048 ? 2048 : static_cast<int>(raw));
+                }
+                return true;
+            };
+            if (!read_dimension("width", "image_width_px", 512, requested_W, W) ||
+                !read_dimension("height", "image_height_px", 400, requested_H, H))
+                return json{{"ok", false}, {"code", "camera_image_size_invalid"},
+                            {"reason", "camera image width and height must be integers"},
+                            {"path", std::string()}};
+            image_size_clamped = requested_W != W || requested_H != H;
+        } else if (view.is_object()) {
+            auto clampi = [](int v, int lo2, int hi2) {
+                return std::max(lo2, std::min(v, hi2));
+            };
             W = clampi(view.value("width", 512), 64, 2048);
             H = clampi(view.value("height", 400), 64, 2048);
+            requested_W = W;
+            requested_H = H;
+        }
+
+        std::vector<aicm::AicmBody> bodies = tessellate_session_bodies(s);
+        if (bodies.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
+        std::string dims = bbox_dims_label(bodies);
+        RenderFocus fbox;
+        bool has_focus = false;
+        if (view.is_object() && !rv.camera) {
             const auto it = view.find("focus");
             if (it != view.end() && it->is_object()) {
                 const json& f = *it;
@@ -7042,19 +7286,17 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
                     }
                 }
                 if (has_focus) {
-                    // Tolerate an inverted box rather than rendering an empty frame.
-                    fbox.lo = RV3{std::min(lo.x, hi.x), std::min(lo.y, hi.y), std::min(lo.z, hi.z)};
-                    fbox.hi = RV3{std::max(lo.x, hi.x), std::max(lo.y, hi.y), std::max(lo.z, hi.z)};
+                    fbox.lo = RV3{std::min(lo.x, hi.x), std::min(lo.y, hi.y),
+                                  std::min(lo.z, hi.z)};
+                    fbox.hi = RV3{std::max(lo.x, hi.x), std::max(lo.y, hi.y),
+                                  std::max(lo.z, hi.z)};
                     fbox.margin = std::max(0.0, std::min(f.value("margin", 0.15), 4.0));
                     fbox.clip_near = f.value("clip_near", false);
                 }
             }
         }
 
-        // A close-up must not head itself with the WHOLE part's dimensions — on a Ø5 bore in a
-        // 120 mm plate that reads as a 120 mm field of view and is simply false. Focused renders
-        // report the framed box instead, and the caller's scale bar carries the true field.
-        std::string header = rv.name;
+        std::string header = (rv.camera && !annotate) ? std::string() : rv.name;
         if (has_focus) {
             auto fmt1 = [](double v) -> std::string {
                 if (v >= 9.95) return std::to_string((long)std::lround(v));
@@ -7062,32 +7304,48 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
                 return std::to_string(tenths / 10) + "." + std::to_string(tenths % 10);
             };
             header += "  FOCUS " + fmt1(fbox.hi.x - fbox.lo.x) + " X "
-                      + fmt1(fbox.hi.y - fbox.lo.y) + " X " + fmt1(fbox.hi.z - fbox.lo.z) + " MM";
+                      + fmt1(fbox.hi.y - fbox.lo.y) + " X "
+                      + fmt1(fbox.hi.z - fbox.lo.z) + " MM";
             if (fbox.clip_near) header += "  CUTAWAY";
-        } else if (!dims.empty()) {
+        } else if (!header.empty() && !dims.empty()) {
             header += "  " + dims;
         }
         std::vector<RenderLabel> labels;
         if (annotate) labels = principal_face_labels(s);
         std::vector<unsigned char> img;
         RenderFrame frame;
-        // A focused close-up is legitimately sparse (a cutaway of a Ø5 bore paints a few hundred
-        // pixels), so the whole-part "nothing drawn" floor would report it as a failed render.
+        const PerspectiveCamera* camera = rv.camera ? &*rv.camera : nullptr;
+        const int min_painted = (has_focus || camera) ? 1 : -1;
         bool ok = render_view_to_rgb(bodies, labels, W, H, rv.dir, header, img,
                                      annotate, /*body_alpha=*/nullptr,
-                                     /*frame_from=*/nullptr, /*min_painted=*/has_focus ? 1 : -1,
-                                     has_focus ? &fbox : nullptr, &frame);
+                                     /*frame_from=*/nullptr, min_painted,
+                                     has_focus ? &fbox : nullptr, &frame, camera);
         if (ok) {
             std::string png = encode_png_rgb(W, H, img);
             std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
             ok = (bool)f && (f.write(png.data(), (std::streamsize)png.size()), (bool)f);
         }
-        // Echo the resolved camera direction (scene -> camera) so the model knows the EXACT angle it
-        // got — handy for a named/az-el request and the contract the test pins the convention on.
         json out{{"ok", ok}, {"path", ok ? out_path : std::string()},
                  {"view", rv.name}, {"dims", dims},
                  {"dir", json::array({rv.dir.x, rv.dir.y, rv.dir.z})}};
-        if (frame.W > 0)
+        if (frame.W > 0 && camera) {
+            const double tan_half_fov = std::tan(
+                camera->vertical_fov_deg * 3.14159265358979323846 / 360.0);
+            out["frame"] = json{
+                {"projection", "perspective"},
+                {"position", json::array({camera->position.x, camera->position.y,
+                                           camera->position.z})},
+                {"right", json::array({frame.r.x, frame.r.y, frame.r.z})},
+                {"up", json::array({frame.u.x, frame.u.y, frame.u.z})},
+                {"forward", json::array({camera->forward.x, camera->forward.y,
+                                          camera->forward.z})},
+                {"vertical_fov_deg", camera->vertical_fov_deg},
+                {"tan_half_vertical_fov", tan_half_fov},
+                {"focal_length_px", frame.scale},
+                {"principal_x_px", W / 2.0}, {"principal_y_px", H / 2.0},
+                {"near", camera->near_plane}, {"far", camera->far_plane},
+                {"width", W}, {"height", H}};
+        } else if (frame.W > 0) {
             out["frame"] = json{
                 {"center", json::array({frame.center.x, frame.center.y, frame.center.z})},
                 {"right", json::array({frame.r.x, frame.r.y, frame.r.z})},
@@ -7097,9 +7355,29 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
                 {"width", frame.W}, {"height", frame.H},
                 {"clip_depth", frame.clipped ? frame.clip_depth : 0.0},
                 {"focused", has_focus}, {"clip_near", frame.clipped}};
+        }
+        if (ok && camera) {
+            out["capability"] = "doc_render_view.camera_pose.v1";
+            out["camera"] = json{
+                {"position", json::array({camera->position.x, camera->position.y,
+                                           camera->position.z})},
+                {"target", json::array({camera->target.x, camera->target.y, camera->target.z})},
+                {"up", json::array({camera->up.x, camera->up.y, camera->up.z})},
+                {"vertical_fov_deg", camera->vertical_fov_deg},
+                {"image_width_px", W}, {"image_height_px", H},
+                {"near", camera->near_plane}, {"far", camera->far_plane}};
+            out["revision"] = s.revision;
+            out["image_size_clamped"] = image_size_clamped;
+            if (image_size_clamped) {
+                out["requested_image_width_px"] = requested_W;
+                out["requested_image_height_px"] = requested_H;
+            }
+        }
         return out;
     } catch (const OpError& e) {
         return json{{"ok", false}, {"error", e.what()}, {"code", e.code}};
+    } catch (const std::exception& e) {
+        return json{{"ok", false}, {"reason", "render exception"}, {"error", e.what()}};
     } catch (...) {
         return json{{"ok", false}, {"reason", "render exception"}};
     }

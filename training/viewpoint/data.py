@@ -329,3 +329,25 @@ def split_by_part(
     assert set(train.part_ids).isdisjoint(test.part_ids)
     assert set(validation.part_ids).isdisjoint(test.part_ids)
     return train, validation, test
+
+
+def locked_expansion_part_indices(
+    train_parts: int,
+    *,
+    seed: int = 1729,
+    base_parts: int = 72,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Preserve the original locked holdouts while adding procedural train parts."""
+    if base_parts != 72:
+        raise ValueError("the comparable locked split is defined on exactly 72 base parts")
+    base_train_count = int(round(base_parts * 0.7))
+    validation_count = int(round(base_parts * 0.15))
+    test_count = base_parts - base_train_count - validation_count
+    if train_parts < base_train_count:
+        raise ValueError(f"train_parts must be at least the locked base count {base_train_count}")
+    order = np.random.default_rng(seed).permutation(base_parts)
+    train = tuple(int(value) for value in order[:base_train_count])
+    validation = tuple(int(value) for value in order[base_train_count:base_train_count + validation_count])
+    test = tuple(int(value) for value in order[-test_count:])
+    extra = tuple(range(base_parts, base_parts + train_parts - base_train_count))
+    return train + extra, validation, test

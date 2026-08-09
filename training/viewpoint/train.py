@@ -69,6 +69,11 @@ def fit_policy(
     model = build_torch_policy(seed=seed).to(actual_device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     inputs = _torch_inputs(train, torch, actual_device)
+    # Keep masked logits finite while forming all pairwise differences.  The
+    # explicit pair mask below excludes padded candidates; propagating ``-inf``
+    # through ``predicted[:, :, None] - predicted[:, None, :]`` would otherwise
+    # create NaN gradients at padded/padded pairs.
+    inputs.pop("candidate_mask")
     target_quality = torch.as_tensor(
         weighted_geometric_mean(train.components),
         dtype=torch.float32,

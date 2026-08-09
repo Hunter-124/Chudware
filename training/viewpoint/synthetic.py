@@ -78,9 +78,9 @@ def _pad_geometry(rows: list[Array], masks: list[Array]) -> tuple[Array, Array, 
     return geometry, geometry_mask, feature_mask
 
 
-def _example_rows(config: CorpusConfig) -> list[tuple[int, int, PartExample]]:
+def _example_rows(config: CorpusConfig, part_indices: tuple[int, ...]) -> list[tuple[int, int, PartExample]]:
     rows: list[tuple[int, int, PartExample]] = []
-    for part_index in range(config.parts):
+    for part_index in part_indices:
         examples = generate_part_examples(
             part_index,
             config.examples_per_part,
@@ -90,23 +90,10 @@ def _example_rows(config: CorpusConfig) -> list[tuple[int, int, PartExample]]:
     return rows
 
 
-def generate_oracle_corpus(config: CorpusConfig = CorpusConfig()) -> ViewpointBatch:
-    """Generate labels from occluding mechanical parts and the geometric oracle.
-
-    All examples for one ``part_id`` share one generated scene. Candidate pools are
-    generated once at their maximum render budget; best-of-N baselines consume nested
-    prefixes without regenerating poses.
-    """
-    config.validate()
-    part_ids: list[str] = []
-    difficulties: list[str] = []
-    tasks: list[Array] = []
-    geometry_rows: list[Array] = []
-    target_masks: list[Array] = []
-    candidate_rows: list[Array] = []
-    component_rows: list[Array] = []
-
-    for part_index, example_index, example in _example_rows(config):
+def _part_rows(payload: tuple[CorpusConfig, int]) -> list[tuple[object, ...]]:
+    config, part_index = payload
+    result: list[tuple[object, ...]] = []
+    for _, example_index, example in _example_rows(config, (part_index,)):
         scene = example.scene
         vertices = scene.mesh.vertices
         scene_center = vertices.mean(axis=0)
@@ -120,39 +107,89 @@ def generate_oracle_corpus(config: CorpusConfig = CorpusConfig()) -> ViewpointBa
         )
         geometry, target_mask = _geometry_tokens(scene, example.target_id)
         labels = [evaluate(scene, example.target_id, pose).quality_components() for pose in poses]
-        part_ids.append(example.part_id)
-        difficulties.append(example.difficulty)
-        tasks.append(encode_task(example.feature_kind, example.question_kind))
-        geometry_rows.append(geometry)
-        target_masks.append(target_mask)
-        candidate_rows.append(np.stack([
-            encode_candidate(
-                scene,
-                example.target_id,
-                pose,
-                part_center=scene_center,
-                part_radius=radius,
-            )
-            for pose in poses
-        ]))
-        component_rows.append(np.asarray([
-            [label[name] for name in COMPONENTS]
-            for label in labels
-        ], np.float32))
+        result.append((
+            example.part_id,
+            example.difficulty,
+            encode_task(example.feature_kind, example.question_kind),
+            geometry,
+            target_mask,
+            np.stack([
+                encode_candidate(
+                    scene,
+                    example.target_id,
+                    pose,
+                    part_center=scene_center,
+                    part_radius=radius,
+                )
+                for pose in poses
+            ]),
+            np.asarray([
+                [label[name] for name in COMPONENTS]
+                for label in labels
+            ], np.float32),
+        ))
+    return result
 
-    geometry, geometry_mask, feature_mask = _pad_geometry(geometry_rows, target_masks)
+
+def generate_oracle_corpus_for_indices(
+    config: CorpusConfig,
+    part_indices: tuple[int, ...],
+    *,
+    workers: int = 1,
+) -> ViewpointBatch:
+    """Generate selected part identities, optionally in deterministic worker processes."""
+    config.validate()
+    if not part_indices or any(int(index) < 0 for index in part_indices):
+        raise ValueError("part_indices must contain non-negative values")
+    if len(set(part_indices)) != len(part_indices):
+        raise ValueError("part_indices must be unique")
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+    payloads = [(config, int(index)) for index in part_indices]
+    if workers == 1:
+        grouped_rows = map(_part_rows, payloads)
+        rows = [row for group in grouped_rows for row in group]
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            grouped_rows = executor.map(
+                _part_rows,
+                payloads,
+                chunksize=max(1, len(payloads) // (workers * 16)),
+            )
+            rows = [row for group in grouped_rows for row in group]
+    geometry, geometry_mask, feature_mask = _pad_geometry(
+        [np.asarray(row[3]) for row in rows],
+        [np.asarray(row[4]) for row in rows],
+    )
     batch = ViewpointBatch(
-        part_ids=tuple(part_ids),
-        task=np.stack(tasks),
+        part_ids=tuple(str(row[0]) for row in rows),
+        task=np.stack([row[2] for row in rows]),
         geometry=geometry,
         geometry_mask=geometry_mask,
         feature_mask=feature_mask,
-        candidates=np.stack(candidate_rows),
-        candidate_mask=np.ones((len(part_ids), config.candidates), bool),
-        components=np.stack(component_rows),
-        difficulties=tuple(difficulties),
+        candidates=np.stack([row[5] for row in rows]),
+        candidate_mask=np.ones((len(rows), config.candidates), bool),
+        components=np.stack([row[6] for row in rows]),
+        difficulties=tuple(str(row[1]) for row in rows),
     )
     return batch.validate()
 
 
-__all__ = ["CorpusConfig", "GENERATOR_VERSION", "generate_oracle_corpus"]
+def generate_oracle_corpus(config: CorpusConfig = CorpusConfig()) -> ViewpointBatch:
+    """Generate labels from occluding mechanical parts and the geometric oracle.
+
+    All examples for one ``part_id`` share one generated scene. Candidate pools are
+    generated once at their maximum render budget; best-of-N baselines consume nested
+    prefixes without regenerating poses.
+    """
+    return generate_oracle_corpus_for_indices(config, tuple(range(config.parts)))
+
+
+__all__ = [
+    "CorpusConfig",
+    "GENERATOR_VERSION",
+    "generate_oracle_corpus",
+    "generate_oracle_corpus_for_indices",
+]

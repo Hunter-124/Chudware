@@ -1,0 +1,811 @@
+{
+  "architecture": {
+    "channels": "RGB plus normalized depth and explicit valid-depth mask",
+    "conditioning": "one projected 8-D coarse FeatureRegion2D prior token per candidate",
+    "license_provenance": {
+      "architecture": "repository-original compact residual convolutional trunk",
+      "external_encoder_code": null,
+      "pretrained_weights": null,
+      "torch_license_evidence": "PyTorch LICENSE (BSD-3-Clause), https://github.com/pytorch/pytorch/blob/main/LICENSE",
+      "torch_runtime_license": "BSD-3-Clause"
+    },
+    "objective": "unchanged consequence-weighted pairwise RankNet",
+    "ranker": "existing task/query/cross-attention/fusion scalar candidate-ranking head",
+    "rationale": "small synthetic corpus and 96x96 renders favor a compact from-scratch trunk; GroupNorm is stable at four rows (64 candidate images) per step; no mismatched natural-image pretraining is introduced",
+    "trunk": "three-stage compact residual CNN with GroupNorm and SiLU; 32/64/96 channels"
+  },
+  "corpus": {
+    "cache_hits": 432,
+    "config": {
+      "cache_dir": "scratch/viewpoint-pixels",
+      "candidates": 16,
+      "examples_per_part": 6,
+      "include_depth": true,
+      "oracle_image_size": [
+        96,
+        96
+      ],
+      "part_indices": null,
+      "parts": 72,
+      "resolution": [
+        96,
+        96
+      ],
+      "seed": 1729
+    },
+    "generation_seconds": 984.3769907039168,
+    "manifest_path": "scratch/viewpoint-pixels/manifest.json",
+    "oracle_version": "viewpoint-geometric-oracle/1.0.0",
+    "renderer_version": "viewpoint-pixel-raster/1.0.0; engine-perspective-v1"
+  },
+  "device_line": "device=cuda (NVIDIA GeForce RTX 3080 Ti); torch=2.12.1+cu129; CUDA=12.9; gpu_resident_corpus=true",
+  "established_bars": {
+    "depth_policy": 0.300661,
+    "depth_visibility_correlation": 0.584,
+    "fixed_isometric": 0.171608,
+    "full_information_oracle": 0.638062,
+    "greedy_geometric": 0.169855,
+    "random": 0.122591
+  },
+  "locked_bar_validation": {
+    "depth_policy": {
+      "delta": 1.7644309996400764e-07,
+      "established": 0.300661,
+      "matched": true,
+      "observed": 0.3006611764431
+    },
+    "fixed_isometric": {
+      "delta": -1.9272136689285624e-07,
+      "established": 0.171608,
+      "matched": true,
+      "observed": 0.17160780727863312
+    },
+    "full_information_oracle": {
+      "delta": 1.790885925112562e-07,
+      "established": 0.638062,
+      "matched": true,
+      "observed": 0.6380621790885925
+    },
+    "greedy_geometric": {
+      "delta": 4.3072223662732334e-07,
+      "established": 0.169855,
+      "matched": true,
+      "observed": 0.16985543072223663
+    },
+    "random": {
+      "delta": 0.043040830692291254,
+      "established": 0.122591,
+      "matched": false,
+      "note": "checked-in .122591 random scalar is retained as the requested historical bar; its saved/current selection indices reproduce .165632, so no paired row vector is claimed",
+      "observed": 0.16563183069229126
+    }
+  },
+  "locked_test": {
+    "bootstrap_samples": 2000,
+    "bootstrap_unit": "part_id",
+    "difficulty": {
+      "easy": {
+        "depth_policy": 0.509366512298584,
+        "examples": 17,
+        "fixed_isometric": 0.34171992540359497,
+        "full_information_oracle": 0.8148561120033264,
+        "greedy_geometric": 0.40239548683166504,
+        "parts": 11,
+        "pixel_policy": 0.40557414293289185,
+        "random": 0.12259098887443542,
+        "random_aligned_rerun": 0.29022812843322754
+      },
+      "hard": {
+        "depth_policy": 0.2225724458694458,
+        "examples": 25,
+        "fixed_isometric": 0.0954975113272667,
+        "full_information_oracle": 0.5131000876426697,
+        "greedy_geometric": 0.1196720227599144,
+        "parts": 11,
+        "pixel_policy": 0.10212243348360062,
+        "random": 0.12259099632501602,
+        "random_aligned_rerun": 0.07243675738573074
+      },
+      "medium": {
+        "depth_policy": 0.23417063057422638,
+        "examples": 24,
+        "fixed_isometric": 0.13039328157901764,
+        "full_information_oracle": 0.643001914024353,
+        "greedy_geometric": 0.057413917034864426,
+        "parts": 10,
+        "pixel_policy": 0.19273436069488525,
+        "random": 0.12259099632501602,
+        "random_aligned_rerun": 0.17445433139801025
+      }
+    },
+    "pixel_minus": {
+      "depth_policy": {
+        "ci95": [
+          -0.1518605977296829,
+          -0.02396107292734087
+        ],
+        "ci_kind": "paired whole-part bootstrap",
+        "mean": -0.08742713928222656
+      },
+      "fixed_isometric": {
+        "ci95": [
+          -0.04172333218157291,
+          0.13542695716023437
+        ],
+        "ci_kind": "paired whole-part bootstrap",
+        "mean": 0.0416262224316597
+      },
+      "full_information_oracle": {
+        "ci95": [
+          -0.48522782474756243,
+          -0.3556213177740574
+        ],
+        "ci_kind": "paired whole-part bootstrap",
+        "mean": -0.4248281419277191
+      },
+      "greedy_geometric": {
+        "ci95": [
+          -0.02431769883260131,
+          0.10180821437388655
+        ],
+        "ci_kind": "paired whole-part bootstrap",
+        "mean": 0.04337860271334648
+      },
+      "random": {
+        "ci95": [
+          0.03271710556000471,
+          0.16385585144162174
+        ],
+        "ci_kind": "historical-reference-shifted whole-part pixel bootstrap",
+        "mean": 0.0906430259346962
+      }
+    },
+    "random_reference_note": "The requested .122591 historical random bar is reported as a fixed reference. Current and saved seeded selection indices on these labels yield .165632, so the random delta interval shifts the pixel policy's whole-part bootstrap rather than claiming a fabricated paired random vector.",
+    "selection_indices": {
+      "depth_policy": [
+        3,
+        12,
+        9,
+        14,
+        10,
+        2,
+        9,
+        14,
+        13,
+        0,
+        5,
+        5,
+        13,
+        10,
+        13,
+        12,
+        12,
+        0,
+        9,
+        13,
+        11,
+        12,
+        12,
+        0,
+        10,
+        7,
+        1,
+        10,
+        7,
+        10,
+        9,
+        8,
+        13,
+        3,
+        15,
+        3,
+        15,
+        0,
+        10,
+        8,
+        2,
+        15,
+        11,
+        14,
+        6,
+        8,
+        9,
+        2,
+        10,
+        7,
+        15,
+        0,
+        11,
+        6,
+        0,
+        13,
+        0,
+        3,
+        1,
+        14,
+        10,
+        2,
+        15,
+        14,
+        4,
+        6
+      ],
+      "fixed_isometric": [
+        12,
+        1,
+        9,
+        7,
+        3,
+        12,
+        12,
+        15,
+        12,
+        2,
+        12,
+        12,
+        8,
+        3,
+        5,
+        10,
+        8,
+        5,
+        3,
+        2,
+        15,
+        13,
+        13,
+        15,
+        2,
+        0,
+        10,
+        9,
+        2,
+        0,
+        5,
+        9,
+        6,
+        2,
+        15,
+        14,
+        5,
+        1,
+        5,
+        8,
+        15,
+        4,
+        10,
+        7,
+        15,
+        11,
+        15,
+        2,
+        3,
+        1,
+        14,
+        13,
+        12,
+        1,
+        2,
+        4,
+        12,
+        0,
+        10,
+        6,
+        6,
+        13,
+        7,
+        15,
+        0,
+        13
+      ],
+      "full_information_oracle": [
+        12,
+        12,
+        10,
+        8,
+        8,
+        5,
+        12,
+        15,
+        13,
+        7,
+        11,
+        12,
+        11,
+        13,
+        6,
+        15,
+        14,
+        6,
+        10,
+        14,
+        11,
+        1,
+        7,
+        0,
+        6,
+        14,
+        3,
+        0,
+        0,
+        9,
+        14,
+        6,
+        4,
+        8,
+        0,
+        15,
+        0,
+        13,
+        0,
+        8,
+        8,
+        12,
+        2,
+        10,
+        0,
+        0,
+        5,
+        5,
+        10,
+        2,
+        13,
+        6,
+        3,
+        7,
+        0,
+        12,
+        12,
+        6,
+        12,
+        5,
+        0,
+        8,
+        6,
+        5,
+        4,
+        5
+      ],
+      "greedy_geometric": [
+        13,
+        6,
+        13,
+        6,
+        6,
+        14,
+        5,
+        6,
+        7,
+        14,
+        9,
+        15,
+        4,
+        12,
+        13,
+        6,
+        10,
+        0,
+        1,
+        7,
+        13,
+        4,
+        7,
+        13,
+        1,
+        10,
+        3,
+        5,
+        14,
+        13,
+        1,
+        14,
+        8,
+        13,
+        6,
+        5,
+        15,
+        13,
+        12,
+        13,
+        1,
+        1,
+        2,
+        4,
+        8,
+        1,
+        14,
+        7,
+        4,
+        13,
+        5,
+        12,
+        4,
+        0,
+        7,
+        11,
+        6,
+        13,
+        15,
+        13,
+        4,
+        5,
+        14,
+        3,
+        2,
+        3
+      ],
+      "pixel_policy": [
+        9,
+        12,
+        4,
+        6,
+        10,
+        4,
+        4,
+        0,
+        4,
+        7,
+        4,
+        6,
+        10,
+        3,
+        10,
+        11,
+        11,
+        0,
+        10,
+        0,
+        1,
+        9,
+        8,
+        10,
+        4,
+        6,
+        15,
+        6,
+        2,
+        10,
+        10,
+        4,
+        12,
+        12,
+        15,
+        12,
+        0,
+        11,
+        4,
+        10,
+        14,
+        10,
+        8,
+        2,
+        15,
+        8,
+        14,
+        5,
+        7,
+        12,
+        11,
+        1,
+        9,
+        13,
+        0,
+        8,
+        0,
+        3,
+        1,
+        7,
+        4,
+        14,
+        14,
+        7,
+        6,
+        15
+      ],
+      "random_aligned_rerun": [
+        6,
+        12,
+        0,
+        8,
+        5,
+        12,
+        15,
+        8,
+        10,
+        1,
+        1,
+        14,
+        10,
+        5,
+        6,
+        13,
+        15,
+        9,
+        15,
+        10,
+        15,
+        13,
+        14,
+        7,
+        4,
+        4,
+        13,
+        9,
+        9,
+        0,
+        9,
+        14,
+        8,
+        10,
+        4,
+        10,
+        0,
+        8,
+        12,
+        5,
+        6,
+        15,
+        9,
+        10,
+        10,
+        8,
+        12,
+        10,
+        0,
+        10,
+        4,
+        5,
+        7,
+        10,
+        1,
+        11,
+        1,
+        15,
+        2,
+        7,
+        5,
+        14,
+        15,
+        15,
+        12,
+        12
+      ]
+    },
+    "systems": {
+      "depth_policy": {
+        "ci95": [
+          0.23674096390604973,
+          0.3648554980754851
+        ],
+        "mean": 0.3006611764431
+      },
+      "fixed_isometric": {
+        "ci95": [
+          0.08437074925750494,
+          0.2670987024903295
+        ],
+        "mean": 0.17160780727863312
+      },
+      "full_information_oracle": {
+        "ci95": [
+          0.6054287269711495,
+          0.6699720740318298
+        ],
+        "mean": 0.6380621790885925
+      },
+      "greedy_geometric": {
+        "ci95": [
+          0.11104098949581384,
+          0.23775889612734316
+        ],
+        "mean": 0.16985543072223663
+      },
+      "pixel_policy": {
+        "ci95": [
+          0.15554661378264428,
+          0.28629227504134175
+        ],
+        "mean": 0.2132340371608734
+      },
+      "random": {
+        "ci95": [
+          0.12259100377559662,
+          0.12259100377559662
+        ],
+        "mean": 0.12259100377559662
+      },
+      "random_aligned_rerun": {
+        "ci95": [
+          0.10105955936014652,
+          0.2332750421017408
+        ],
+        "mean": 0.16563183069229126
+      }
+    },
+    "test_examples": 66,
+    "test_parts": 11
+  },
+  "schema": "training.viewpoint.pixel-experiment/v1",
+  "training": {
+    "batch_rows": 4,
+    "best_epoch": 20,
+    "best_validation_aggregate": 0.2421533167362213,
+    "cuda_version": "12.9",
+    "curve": [
+      {
+        "epoch": 1,
+        "rank_loss": 5.267754955291748,
+        "train_aggregate": 0.21284805238246918,
+        "validation_aggregate": 0.1727757602930069
+      },
+      {
+        "epoch": 2,
+        "rank_loss": 1.684179391860962,
+        "train_aggregate": 0.23043447732925415,
+        "validation_aggregate": 0.19133663177490234
+      },
+      {
+        "epoch": 3,
+        "rank_loss": 1.2438013410568238,
+        "train_aggregate": 0.22190552949905396,
+        "validation_aggregate": 0.17594259977340698
+      },
+      {
+        "epoch": 4,
+        "rank_loss": 1.1077543592453003,
+        "train_aggregate": 0.2301260232925415,
+        "validation_aggregate": 0.18932004272937775
+      },
+      {
+        "epoch": 5,
+        "rank_loss": 0.8409980535507202,
+        "train_aggregate": 0.24098512530326843,
+        "validation_aggregate": 0.19843289256095886
+      },
+      {
+        "epoch": 6,
+        "rank_loss": 0.8378630542755127,
+        "train_aggregate": 0.26839327812194824,
+        "validation_aggregate": 0.15276047587394714
+      },
+      {
+        "epoch": 7,
+        "rank_loss": 0.7883123135566712,
+        "train_aggregate": 0.290316104888916,
+        "validation_aggregate": 0.18930158019065857
+      },
+      {
+        "epoch": 8,
+        "rank_loss": 0.6366674661636352,
+        "train_aggregate": 0.24157750606536865,
+        "validation_aggregate": 0.17189720273017883
+      },
+      {
+        "epoch": 9,
+        "rank_loss": 0.5913420677185058,
+        "train_aggregate": 0.23665210604667664,
+        "validation_aggregate": 0.1281185895204544
+      },
+      {
+        "epoch": 10,
+        "rank_loss": 0.7314615774154664,
+        "train_aggregate": 0.3425726592540741,
+        "validation_aggregate": 0.18195897340774536
+      },
+      {
+        "epoch": 11,
+        "rank_loss": 0.5508009386062622,
+        "train_aggregate": 0.40393131971359253,
+        "validation_aggregate": 0.19965146481990814
+      },
+      {
+        "epoch": 12,
+        "rank_loss": 0.5087952470779419,
+        "train_aggregate": 0.32269206643104553,
+        "validation_aggregate": 0.23626871407032013
+      },
+      {
+        "epoch": 13,
+        "rank_loss": 0.5178621363639831,
+        "train_aggregate": 0.4091821610927582,
+        "validation_aggregate": 0.20600247383117676
+      },
+      {
+        "epoch": 14,
+        "rank_loss": 0.469582861661911,
+        "train_aggregate": 0.37775012850761414,
+        "validation_aggregate": 0.19926606118679047
+      },
+      {
+        "epoch": 15,
+        "rank_loss": 0.4232229506969452,
+        "train_aggregate": 0.36475399136543274,
+        "validation_aggregate": 0.21893058717250824
+      },
+      {
+        "epoch": 16,
+        "rank_loss": 0.42764463543891906,
+        "train_aggregate": 0.359884649515152,
+        "validation_aggregate": 0.2225395292043686
+      },
+      {
+        "epoch": 17,
+        "rank_loss": 0.43568328857421873,
+        "train_aggregate": 0.3723140358924866,
+        "validation_aggregate": 0.18135765194892883
+      },
+      {
+        "epoch": 18,
+        "rank_loss": 0.4158414340019226,
+        "train_aggregate": 0.4052164554595947,
+        "validation_aggregate": 0.21905718743801117
+      },
+      {
+        "epoch": 19,
+        "rank_loss": 0.3811420798301697,
+        "train_aggregate": 0.39874252676963806,
+        "validation_aggregate": 0.15916971862316132
+      },
+      {
+        "epoch": 20,
+        "rank_loss": 0.40032676219940183,
+        "train_aggregate": 0.4697073698043823,
+        "validation_aggregate": 0.2421533167362213
+      },
+      {
+        "epoch": 21,
+        "rank_loss": 0.3476760196685791,
+        "train_aggregate": 0.40915077924728394,
+        "validation_aggregate": 0.1880033016204834
+      },
+      {
+        "epoch": 22,
+        "rank_loss": 0.29968117356300356,
+        "train_aggregate": 0.4496835768222809,
+        "validation_aggregate": 0.22344814240932465
+      },
+      {
+        "epoch": 23,
+        "rank_loss": 0.2968078172206879,
+        "train_aggregate": 0.4526379108428955,
+        "validation_aggregate": 0.2401566356420517
+      },
+      {
+        "epoch": 24,
+        "rank_loss": 0.30306985378265383,
+        "train_aggregate": 0.39613303542137146,
+        "validation_aggregate": 0.22930821776390076
+      }
+    ],
+    "device": "cuda",
+    "device_name": "NVIDIA GeForce RTX 3080 Ti",
+    "elapsed_seconds": 10.169141988000774,
+    "epochs": 24,
+    "gpu_resident_corpus": true,
+    "learning_rate": 0.0008,
+    "rank_temperature": 0.1,
+    "seed": 1729,
+    "torch_version": "2.12.1+cu129",
+    "train_examples": 50,
+    "weight_decay": 0.0001
+  },
+  "verdict": {
+    "information_bar": "does not beat .584 depth visibility correlation",
+    "same_information_bar": "does not beat hand-computed depth observation",
+    "teacher_bar": "remains below full-information oracle ceiling"
+  },
+  "visibility_information": {
+    "audit_parts": 8,
+    "audit_samples": 64,
+    "beats_depth_reference": false,
+    "depth_reference_correlation": 0.584,
+    "encoder_training_part_overlap": 5,
+    "oracle_target": "frozen oracle visibility component; label-side only",
+    "pearson_correlation": -0.017062136355626475,
+    "probe": "fixed ridge linear readout over frozen mean/max/prior encoder features",
+    "probe_training_part_overlap": 0,
+    "ridge": 0.01,
+    "train_samples": 720
+  },
+  "what_remains_unproven": "Synthetic rendered candidates do not establish generalization to real cameras, unseen topology families, materials, lighting, calibration drift, or downstream human/model answer quality."
+}

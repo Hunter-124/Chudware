@@ -7415,3 +7415,41 @@ with the only JSON deltas being weights paths and device provenance.
 Gates: `pytest training/viewpoint` 27 passed. Still CPU-bound and named as such: part generation,
 camera sampling, feature extraction, projection, clipping, hull construction, signature comparison and
 serialization.
+
+## 2026-08-08 — Viewpoint pixels: learned features do not beat hand-computed geometry (yet), and why
+
+`services/viewpoint/pixels/**` renders the candidate corpus through the exact perspective camera:
+432 rows / 6,912 images at 96x96, splits disjoint by part (50/11/11), the locked test parts present,
+310 MiB content-addressed and resumable, labels generated through the CUDA oracle. Two things make it
+trustworthy: the in-process rasteriser was checked against the ENGINE renderer and agrees exactly —
+foreground IoU 1.0, RGB MAE 0.0 over 3,608 pixels — and a leakage test asserts the inference sample
+carries only RGB, normalized depth + valid mask, 16-D camera descriptors, the 8-D uncertainty-bearing
+`FeatureRegion2D` prior, task/query one-hots and the candidate mask. No mesh, no exact feature
+position/axis/normal/extent, no oracle components, no occlusion data, no target lookup key.
+
+`training/viewpoint/pixel_model.py` is a from-scratch compact residual CNN (32/64/96 channels,
+GroupNorm, SiLU, two 3x3 residual blocks per stage) over RGB-D per candidate, feeding the EXISTING
+task-conditioned ranking head with the same objective, so observation representation is the only
+variable. No third-party encoder or pretrained weights; PyTorch is runtime-only under BSD-3-Clause.
+Trained GPU-resident on CUDA.
+
+The verdict it printed, verbatim: "does not beat hand-computed depth observation; remains below
+full-information oracle ceiling; does not beat .584 depth visibility correlation."
+
+But the honest reading is that this run did not actually test the hypothesis. The curve shows training
+aggregate climbing .213 → ~.40 while validation stays pinned around .15-.22 — textbook overfitting on
+a 50-row / 800-render training slice, with the whole fit taking 10 seconds. What was measured is "can
+a conv trunk generalize from a few hundred ranking examples", and the answer is no. Whether learned
+pixels beat hand-computed geometry as a REPRESENTATION is still unanswered, because data volume is
+confounded with representation.
+
+A contract question was ruled on during the work: the corpus slice had stripped the task vector,
+reading "nothing else" as excluding it. Restored — the no-leakage rule governs what the SENSOR reveals,
+not what the user asks, and a deployed system knows its own query. Removing it would have changed two
+variables at once. The boundary is now explicit: the task may name WHICH feature and its class, never
+its position, axis, extent or normal; that stays with the coarse uncertainty-bearing prior.
+
+Next step is therefore a materially larger pixel corpus rather than another architecture change, since
+corpus generation is now GPU-labelled, cached and resumable. If a conv encoder given enough data still
+fails to beat .584 visibility correlation, then learned pixels are not the answer either and the
+diagnosis moves on.

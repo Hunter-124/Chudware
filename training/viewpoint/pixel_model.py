@@ -17,6 +17,7 @@ class PixelModelSpec:
     prior_dim: int = 8
     stem_channels: int = 32
     stage_channels: tuple[int, int, int] = (32, 64, 96)
+    dropout: float = 0.10
     ranker: ModelSpec = ModelSpec()
 
     @property
@@ -30,6 +31,8 @@ class PixelModelSpec:
             raise ValueError("pixel model dimensions must be positive")
         if len(self.stage_channels) != 3 or any(value <= 0 for value in self.stage_channels):
             raise ValueError("stage_channels must contain three positive widths")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
         self.ranker.validate()
         return self
 
@@ -109,6 +112,7 @@ def build_pixel_policy(*, spec: PixelModelSpec | None = None, seed: int = 1729) 
                 previous = width
             self.trunk = torch.nn.Sequential(*stages)
             self.token_projection = torch.nn.Conv2d(previous, actual.ranker.geometry_dim, 1)
+            self.spatial_dropout = torch.nn.Dropout2d(actual.dropout)
             self.prior_projection = torch.nn.Sequential(
                 torch.nn.Linear(actual.prior_dim, 32),
                 torch.nn.SiLU(),
@@ -126,8 +130,10 @@ def build_pixel_policy(*, spec: PixelModelSpec | None = None, seed: int = 1729) 
             if rgb.ndim != 5 or rgb.shape[-1] != 3:
                 raise ValueError("rgb must have shape [batch,candidate,height,width,3]")
             image = rgb.float().permute(0, 1, 4, 2, 3)
-            if rgb.dtype == torch.uint8 or float(image.detach().max()) > 1.0:
+            if rgb.dtype == torch.uint8:
                 image = image / 255.0
+            elif not torch.is_floating_point(rgb):
+                raise ValueError("rgb must be uint8 or normalized floating point")
             image = image * 2.0 - 1.0
             if not actual.use_depth:
                 if depth is not None or depth_mask is not None:
@@ -155,7 +161,9 @@ def build_pixel_policy(*, spec: PixelModelSpec | None = None, seed: int = 1729) 
             batch, candidates = image.shape[:2]
             if coarse_prior.shape != (batch, candidates, actual.prior_dim):
                 raise ValueError("coarse_prior violates PixelModelSpec")
-            encoded = self.token_projection(self.trunk(self.stem(image.reshape(-1, *image.shape[2:]))))
+            encoded = self.spatial_dropout(
+                self.token_projection(self.trunk(self.stem(image.reshape(-1, *image.shape[2:]))))
+            )
             spatial = encoded.flatten(2).transpose(1, 2)
             prior = self.prior_projection(coarse_prior.float().reshape(-1, actual.prior_dim))[:, None, :]
             geometry = torch.cat((spatial, prior), dim=1)

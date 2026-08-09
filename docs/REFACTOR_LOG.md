@@ -7504,3 +7504,38 @@ pixel corpus trustworthy, so deleting or skipping it was not an option.
 Verified independently from a cold shell, three consecutive runs: `pytest services/viewpoint` 61 passed
 (17.45 s / 17.32 s / 17.49 s), and 57 passed / 4 skipped with Torch unimportable. The isolated engine
 agreement test passes in 1.03 s.
+
+## 2026-08-08 — Learned pixels do NOT beat hand-computed geometry. Verdict, with the confound removed
+
+The pixel hypothesis has a real answer now. Training on the full enlarged corpus — 3,000 rows / 48,000
+renders, CUDA, seed 1729, five-stage cumulative ablation, epoch-level atomic resume because the harness
+kills a process at 600 s — first confirmed the earlier run really was data-starved: validation moved
+from roughly .22 on the 50-row slice to **.294317** (best at epoch 17). The confound was genuine and it
+is gone.
+
+With it gone, the answer is negative on both counts.
+
+On the end metric, the pixel policy scores **.304987 [.242461, .367679]** against the hand-computed
+depth observation's **.300661**, a paired delta of **+.004326 [-.036438, +.048991]** — the interval
+crosses zero, so the two representations are statistically indistinguishable. On the representational
+claim this path existed to beat, it loses decisively: the learned representation's implied visibility
+correlates **r = .308** with the frozen oracle's true visibility, against hand-computed depth's
+**.584**. Every regularization intervention hurt: augmentation −.003113, weight decay −.004112,
+dropout −.012425, early stopping no change (15 vs 24 epochs). The model is representation-limited, not
+data-limited.
+
+So a from-scratch conv trunk over 96x96 renders does not learn occlusion reasoning as well as an
+explicit raycast does. In hindsight that is not surprising — explicit geometry is a strong inductive
+bias, and 500 procedural parts is thin for learning 3D reasoning from pixels — but it had to be
+measured rather than assumed, and the earlier 50-row run could not have told us.
+
+Consequence for the project, decided rather than deferred: hand-computed geometric observation stays
+the production representation, and the pixel path is closed as a negative result rather than iterated
+with a pretrained encoder and higher resolution. The remaining unexplored lever is the one no oracle
+can supply and no amount of geometry can substitute for — whether a view is USEFUL, measured by the
+model consuming it. Geometric inspectability and answer usefulness are not the same quantity, and
+nothing in this effort has yet tested whether the first predicts the second. That is Stage 2, it is the
+user's own flywheel idea, and it is the actual contribution.
+
+Gates: `pytest training/viewpoint services/viewpoint` 30 passed in the training slice, full suite green;
+20 passed / 8 skipped with Torch unimportable.

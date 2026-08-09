@@ -11,13 +11,13 @@
     },
     "objective": "unchanged consequence-weighted pairwise RankNet",
     "ranker": "existing task/query/cross-attention/fusion scalar candidate-ranking head",
-    "rationale": "small synthetic corpus and 96x96 renders favor a compact from-scratch trunk; GroupNorm is stable at four rows (64 candidate images) per step; no mismatched natural-image pretraining is introduced",
+    "rationale": "the full synthetic training split and 96x96 renders are evaluated with a compact from-scratch trunk; no mismatched natural-image pretraining is introduced",
     "trunk": "three-stage compact residual CNN with GroupNorm and SiLU; 32/64/96 channels"
   },
   "corpus": {
-    "cache_hits": 432,
+    "cache_hits": 3132,
     "config": {
-      "cache_dir": "scratch/viewpoint-pixels",
+      "cache_dir": "scratch/viewpoint-pixels-large",
       "candidates": 16,
       "examples_per_part": 6,
       "include_depth": true,
@@ -26,19 +26,26 @@
         96
       ],
       "part_indices": null,
-      "parts": 72,
+      "parts": 522,
       "resolution": [
         96,
         96
       ],
       "seed": 1729
     },
-    "generation_seconds": 984.3769907039168,
-    "manifest_path": "scratch/viewpoint-pixels/manifest.json",
+    "generation_seconds": 1016.9362711019057,
+    "manifest_path": "scratch/viewpoint-pixels-large/manifest.json",
     "oracle_version": "viewpoint-geometric-oracle/1.0.0",
-    "renderer_version": "viewpoint-pixel-raster/1.0.0; engine-perspective-v1"
+    "renderer_version": "viewpoint-pixel-raster/1.1.0; engine-perspective-v1; cuda-batch-v1",
+    "split_rows": {
+      "test": 66,
+      "train": 3000,
+      "validation": 66
+    },
+    "total_renders": 50112,
+    "total_rows": 3132
   },
-  "device_line": "device=cuda (NVIDIA GeForce RTX 3080 Ti); torch=2.12.1+cu129; CUDA=12.9; gpu_resident_corpus=true",
+  "device_line": "device=cuda (NVIDIA GeForce RTX 3080 Ti); fit_backend=torch-cuda-conv-ranknet; torch=2.12.1+cu129; CUDA=12.9; gpu_resident_corpus=true",
   "established_bars": {
     "depth_policy": 0.300661,
     "depth_visibility_correlation": 0.584,
@@ -91,7 +98,7 @@
         "full_information_oracle": 0.8148561120033264,
         "greedy_geometric": 0.40239548683166504,
         "parts": 11,
-        "pixel_policy": 0.40557414293289185,
+        "pixel_policy": 0.5508772134780884,
         "random": 0.12259098887443542,
         "random_aligned_rerun": 0.29022812843322754
       },
@@ -102,7 +109,7 @@
         "full_information_oracle": 0.5131000876426697,
         "greedy_geometric": 0.1196720227599144,
         "parts": 11,
-        "pixel_policy": 0.10212243348360062,
+        "pixel_policy": 0.14967837929725647,
         "random": 0.12259099632501602,
         "random_aligned_rerun": 0.07243675738573074
       },
@@ -113,7 +120,7 @@
         "full_information_oracle": 0.643001914024353,
         "greedy_geometric": 0.057413917034864426,
         "parts": 10,
-        "pixel_policy": 0.19273436069488525,
+        "pixel_policy": 0.2925948202610016,
         "random": 0.12259099632501602,
         "random_aligned_rerun": 0.17445433139801025
       }
@@ -121,43 +128,43 @@
     "pixel_minus": {
       "depth_policy": {
         "ci95": [
-          -0.1518605977296829,
-          -0.02396107292734087
+          -0.03643774474039674,
+          0.048990993667393914
         ],
         "ci_kind": "paired whole-part bootstrap",
-        "mean": -0.08742713928222656
+        "mean": 0.0043259272351861
       },
       "fixed_isometric": {
         "ci95": [
-          -0.04172333218157291,
-          0.13542695716023437
+          0.03246027557179332,
+          0.24139463379979129
         ],
         "ci_kind": "paired whole-part bootstrap",
-        "mean": 0.0416262224316597
+        "mean": 0.13337929546833038
       },
       "full_information_oracle": {
         "ci95": [
-          -0.48522782474756243,
-          -0.3556213177740574
+          -0.3866630710661411,
+          -0.283707208186388
         ],
         "ci_kind": "paired whole-part bootstrap",
-        "mean": -0.4248281419277191
+        "mean": -0.33307504653930664
       },
       "greedy_geometric": {
         "ci95": [
-          -0.02431769883260131,
-          0.10180821437388655
+          0.08665108159184456,
+          0.1818695683032274
         ],
         "ci_kind": "paired whole-part bootstrap",
-        "mean": 0.04337860271334648
+        "mean": 0.13513167202472687
       },
       "random": {
         "ci95": [
-          0.03271710556000471,
-          0.16385585144162174
+          0.12466077227145433,
+          0.24283083453774443
         ],
         "ci_kind": "historical-reference-shifted whole-part pixel bootstrap",
-        "mean": 0.0906430259346962
+        "mean": 0.18239609897136688
       }
     },
     "random_reference_note": "The requested .122591 historical random bar is reported as a fixed reference. Current and saved seeded selection indices on these labels yield .165632, so the random delta interval shifts the pixel policy's whole-part bootstrap rather than claiming a fabricated paired random vector.",
@@ -436,71 +443,71 @@
       ],
       "pixel_policy": [
         9,
-        12,
-        4,
-        6,
-        10,
-        4,
-        4,
-        0,
-        4,
-        7,
-        4,
-        6,
-        10,
-        3,
-        10,
-        11,
-        11,
-        0,
-        10,
-        0,
-        1,
-        9,
-        8,
-        10,
-        4,
-        6,
-        15,
-        6,
-        2,
-        10,
-        10,
-        4,
-        12,
-        12,
-        15,
-        12,
-        0,
-        11,
-        4,
-        10,
         14,
-        10,
-        8,
-        2,
-        15,
-        8,
         14,
+        6,
         5,
+        1,
+        13,
+        8,
+        13,
+        14,
+        13,
         7,
-        12,
+        9,
+        2,
+        11,
+        15,
+        5,
+        15,
+        10,
+        6,
+        2,
+        6,
         11,
         1,
-        9,
-        13,
-        0,
-        8,
-        0,
-        3,
-        1,
+        12,
         7,
+        14,
+        7,
+        1,
+        8,
+        1,
+        15,
+        4,
+        2,
+        15,
+        2,
+        0,
+        11,
+        12,
         4,
         14,
-        14,
-        7,
+        11,
+        1,
+        12,
+        0,
+        9,
+        3,
+        5,
+        10,
         6,
-        15
+        11,
+        11,
+        13,
+        12,
+        15,
+        2,
+        2,
+        5,
+        6,
+        0,
+        11,
+        14,
+        12,
+        1,
+        3,
+        11
       ],
       "random_aligned_rerun": [
         6,
@@ -602,10 +609,10 @@
       },
       "pixel_policy": {
         "ci95": [
-          0.15554661378264428,
-          0.28629227504134175
+          0.2424609910696745,
+          0.36767902895808213
         ],
-        "mean": 0.2132340371608734
+        "mean": 0.3049871027469635
       },
       "random": {
         "ci95": [
@@ -625,174 +632,298 @@
     "test_examples": 66,
     "test_parts": 11
   },
-  "schema": "training.viewpoint.pixel-experiment/v1",
+  "regularization_ablation": [
+    {
+      "best_epoch": 17,
+      "best_validation_aggregate": 0.29431667923927307,
+      "cumulative_settings": {
+        "augmentation": false,
+        "dropout": 0.0,
+        "early_stopping_patience": null,
+        "weight_decay": 0.0
+      },
+      "effect": "reference",
+      "epochs_completed": 24,
+      "intervention": "unregularized",
+      "selected_for_locked_test": true,
+      "validation_delta_from_previous": null
+    },
+    {
+      "best_epoch": 24,
+      "best_validation_aggregate": 0.2912035286426544,
+      "cumulative_settings": {
+        "augmentation": true,
+        "dropout": 0.0,
+        "early_stopping_patience": null,
+        "weight_decay": 0.0
+      },
+      "effect": "decreased",
+      "epochs_completed": 24,
+      "intervention": "photometric_crop_shift",
+      "selected_for_locked_test": false,
+      "validation_delta_from_previous": -0.0031131505966186523
+    },
+    {
+      "best_epoch": 9,
+      "best_validation_aggregate": 0.2870919406414032,
+      "cumulative_settings": {
+        "augmentation": true,
+        "dropout": 0.0,
+        "early_stopping_patience": null,
+        "weight_decay": 0.0001
+      },
+      "effect": "decreased",
+      "epochs_completed": 24,
+      "intervention": "weight_decay",
+      "selected_for_locked_test": false,
+      "validation_delta_from_previous": -0.004111588001251221
+    },
+    {
+      "best_epoch": 10,
+      "best_validation_aggregate": 0.27466726303100586,
+      "cumulative_settings": {
+        "augmentation": true,
+        "dropout": 0.1,
+        "early_stopping_patience": null,
+        "weight_decay": 0.0001
+      },
+      "effect": "decreased",
+      "epochs_completed": 24,
+      "intervention": "dropout",
+      "selected_for_locked_test": false,
+      "validation_delta_from_previous": -0.012424677610397339
+    },
+    {
+      "best_epoch": 10,
+      "best_validation_aggregate": 0.27466726303100586,
+      "cumulative_settings": {
+        "augmentation": true,
+        "dropout": 0.1,
+        "early_stopping_patience": 5,
+        "weight_decay": 0.0001
+      },
+      "effect": "no_change",
+      "epochs_completed": 15,
+      "intervention": "early_stopping",
+      "selected_for_locked_test": false,
+      "validation_delta_from_previous": 0.0
+    }
+  ],
+  "schema": "training.viewpoint.pixel-experiment/v2",
+  "selected_recipe": "unregularized",
   "training": {
-    "batch_rows": 4,
-    "best_epoch": 20,
-    "best_validation_aggregate": 0.2421533167362213,
+    "augmentation": {
+      "enabled": false,
+      "flips": false,
+      "max_crop_shift_pixels": 0,
+      "photometric_brightness_contrast": 0.0,
+      "rotations": false
+    },
+    "batch_rows": 16,
+    "best_epoch": 17,
+    "best_validation_aggregate": 0.29431667923927307,
     "cuda_version": "12.9",
     "curve": [
       {
         "epoch": 1,
-        "rank_loss": 5.267754955291748,
-        "train_aggregate": 0.21284805238246918,
-        "validation_aggregate": 0.1727757602930069
+        "is_best": true,
+        "rank_loss": 1.0410431246757508,
+        "train_aggregate": 0.18474692106246948,
+        "validation_aggregate": 0.2038312703371048
       },
       {
         "epoch": 2,
-        "rank_loss": 1.684179391860962,
-        "train_aggregate": 0.23043447732925415,
-        "validation_aggregate": 0.19133663177490234
+        "is_best": true,
+        "rank_loss": 0.667410452524821,
+        "train_aggregate": 0.2028522491455078,
+        "validation_aggregate": 0.23893152177333832
       },
       {
         "epoch": 3,
-        "rank_loss": 1.2438013410568238,
-        "train_aggregate": 0.22190552949905396,
-        "validation_aggregate": 0.17594259977340698
+        "is_best": true,
+        "rank_loss": 0.6536936651865641,
+        "train_aggregate": 0.20721854269504547,
+        "validation_aggregate": 0.24062545597553253
       },
       {
         "epoch": 4,
-        "rank_loss": 1.1077543592453003,
-        "train_aggregate": 0.2301260232925415,
-        "validation_aggregate": 0.18932004272937775
+        "is_best": false,
+        "rank_loss": 0.6183967677752177,
+        "train_aggregate": 0.20765246450901031,
+        "validation_aggregate": 0.2297995537519455
       },
       {
         "epoch": 5,
-        "rank_loss": 0.8409980535507202,
-        "train_aggregate": 0.24098512530326843,
-        "validation_aggregate": 0.19843289256095886
+        "is_best": false,
+        "rank_loss": 0.5985772797266642,
+        "train_aggregate": 0.21578000485897064,
+        "validation_aggregate": 0.22253431379795074
       },
       {
         "epoch": 6,
-        "rank_loss": 0.8378630542755127,
-        "train_aggregate": 0.26839327812194824,
-        "validation_aggregate": 0.15276047587394714
+        "is_best": true,
+        "rank_loss": 0.5826003750165304,
+        "train_aggregate": 0.2212723344564438,
+        "validation_aggregate": 0.263773113489151
       },
       {
         "epoch": 7,
-        "rank_loss": 0.7883123135566712,
-        "train_aggregate": 0.290316104888916,
-        "validation_aggregate": 0.18930158019065857
+        "is_best": false,
+        "rank_loss": 0.5805844225883484,
+        "train_aggregate": 0.22433404624462128,
+        "validation_aggregate": 0.23389814794063568
       },
       {
         "epoch": 8,
-        "rank_loss": 0.6366674661636352,
-        "train_aggregate": 0.24157750606536865,
-        "validation_aggregate": 0.17189720273017883
+        "is_best": false,
+        "rank_loss": 0.5783369399706523,
+        "train_aggregate": 0.22671256959438324,
+        "validation_aggregate": 0.2494906187057495
       },
       {
         "epoch": 9,
-        "rank_loss": 0.5913420677185058,
-        "train_aggregate": 0.23665210604667664,
-        "validation_aggregate": 0.1281185895204544
+        "is_best": true,
+        "rank_loss": 0.5652133049964905,
+        "train_aggregate": 0.22868025302886963,
+        "validation_aggregate": 0.2789227366447449
       },
       {
         "epoch": 10,
-        "rank_loss": 0.7314615774154664,
-        "train_aggregate": 0.3425726592540741,
-        "validation_aggregate": 0.18195897340774536
+        "is_best": false,
+        "rank_loss": 0.5614361702601115,
+        "train_aggregate": 0.23235222697257996,
+        "validation_aggregate": 0.26479634642601013
       },
       {
         "epoch": 11,
-        "rank_loss": 0.5508009386062622,
-        "train_aggregate": 0.40393131971359253,
-        "validation_aggregate": 0.19965146481990814
+        "is_best": false,
+        "rank_loss": 0.5574312351544698,
+        "train_aggregate": 0.23709110915660858,
+        "validation_aggregate": 0.2410987764596939
       },
       {
         "epoch": 12,
-        "rank_loss": 0.5087952470779419,
-        "train_aggregate": 0.32269206643104553,
-        "validation_aggregate": 0.23626871407032013
+        "is_best": false,
+        "rank_loss": 0.5564815169175465,
+        "train_aggregate": 0.24158979952335358,
+        "validation_aggregate": 0.27392280101776123
       },
       {
         "epoch": 13,
-        "rank_loss": 0.5178621363639831,
-        "train_aggregate": 0.4091821610927582,
-        "validation_aggregate": 0.20600247383117676
+        "is_best": false,
+        "rank_loss": 0.55289572985967,
+        "train_aggregate": 0.24534358084201813,
+        "validation_aggregate": 0.25177329778671265
       },
       {
         "epoch": 14,
-        "rank_loss": 0.469582861661911,
-        "train_aggregate": 0.37775012850761414,
-        "validation_aggregate": 0.19926606118679047
+        "is_best": false,
+        "rank_loss": 0.5484970088005066,
+        "train_aggregate": 0.24726934731006622,
+        "validation_aggregate": 0.2523171603679657
       },
       {
         "epoch": 15,
-        "rank_loss": 0.4232229506969452,
-        "train_aggregate": 0.36475399136543274,
-        "validation_aggregate": 0.21893058717250824
+        "is_best": false,
+        "rank_loss": 0.5497154355049133,
+        "train_aggregate": 0.24722859263420105,
+        "validation_aggregate": 0.2673742473125458
       },
       {
         "epoch": 16,
-        "rank_loss": 0.42764463543891906,
-        "train_aggregate": 0.359884649515152,
-        "validation_aggregate": 0.2225395292043686
+        "is_best": false,
+        "rank_loss": 0.5440454365412394,
+        "train_aggregate": 0.24811436235904694,
+        "validation_aggregate": 0.23582953214645386
       },
       {
         "epoch": 17,
-        "rank_loss": 0.43568328857421873,
-        "train_aggregate": 0.3723140358924866,
-        "validation_aggregate": 0.18135765194892883
+        "is_best": true,
+        "rank_loss": 0.5386052422523498,
+        "train_aggregate": 0.2516710162162781,
+        "validation_aggregate": 0.29431667923927307
       },
       {
         "epoch": 18,
-        "rank_loss": 0.4158414340019226,
-        "train_aggregate": 0.4052164554595947,
-        "validation_aggregate": 0.21905718743801117
+        "is_best": false,
+        "rank_loss": 0.5384877080917359,
+        "train_aggregate": 0.2559898793697357,
+        "validation_aggregate": 0.2823754549026489
       },
       {
         "epoch": 19,
-        "rank_loss": 0.3811420798301697,
-        "train_aggregate": 0.39874252676963806,
-        "validation_aggregate": 0.15916971862316132
+        "is_best": false,
+        "rank_loss": 0.5339885910352071,
+        "train_aggregate": 0.25507256388664246,
+        "validation_aggregate": 0.26667913794517517
       },
       {
         "epoch": 20,
-        "rank_loss": 0.40032676219940183,
-        "train_aggregate": 0.4697073698043823,
-        "validation_aggregate": 0.2421533167362213
+        "is_best": false,
+        "rank_loss": 0.5349624303181966,
+        "train_aggregate": 0.2616197168827057,
+        "validation_aggregate": 0.25216108560562134
       },
       {
         "epoch": 21,
-        "rank_loss": 0.3476760196685791,
-        "train_aggregate": 0.40915077924728394,
-        "validation_aggregate": 0.1880033016204834
+        "is_best": false,
+        "rank_loss": 0.5316936362584432,
+        "train_aggregate": 0.2559027373790741,
+        "validation_aggregate": 0.2815980315208435
       },
       {
         "epoch": 22,
-        "rank_loss": 0.29968117356300356,
-        "train_aggregate": 0.4496835768222809,
-        "validation_aggregate": 0.22344814240932465
+        "is_best": false,
+        "rank_loss": 0.5271621855894725,
+        "train_aggregate": 0.26675036549568176,
+        "validation_aggregate": 0.2553471028804779
       },
       {
         "epoch": 23,
-        "rank_loss": 0.2968078172206879,
-        "train_aggregate": 0.4526379108428955,
-        "validation_aggregate": 0.2401566356420517
+        "is_best": false,
+        "rank_loss": 0.5273992787996928,
+        "train_aggregate": 0.27238211035728455,
+        "validation_aggregate": 0.24345222115516663
       },
       {
         "epoch": 24,
-        "rank_loss": 0.30306985378265383,
-        "train_aggregate": 0.39613303542137146,
-        "validation_aggregate": 0.22930821776390076
+        "is_best": false,
+        "rank_loss": 0.5199257877667744,
+        "train_aggregate": 0.2781195342540741,
+        "validation_aggregate": 0.2532557547092438
       }
     ],
     "device": "cuda",
     "device_name": "NVIDIA GeForce RTX 3080 Ti",
-    "elapsed_seconds": 10.169141988000774,
-    "epochs": 24,
+    "dropout": 0.0,
+    "early_stopping_min_delta": 0.0,
+    "early_stopping_patience": null,
+    "elapsed_seconds": 345.53622775999975,
+    "epochs_completed": 24,
+    "fit_backend": "torch-cuda-conv-ranknet",
     "gpu_resident_corpus": true,
     "learning_rate": 0.0008,
     "rank_temperature": 0.1,
+    "requested_epochs": 24,
     "seed": 1729,
+    "stopped_early": false,
     "torch_version": "2.12.1+cu129",
-    "train_examples": 50,
-    "weight_decay": 0.0001
+    "train_examples": 3000,
+    "train_parts": 500,
+    "train_renders": 48000,
+    "validation_examples": 66,
+    "validation_parts": 11,
+    "validation_renders": 1056,
+    "weight_decay": 0.0
   },
   "verdict": {
+    "best_checkpoint_generalization_gap": -0.042645663022994995,
     "information_bar": "does not beat .584 depth visibility correlation",
-    "same_information_bar": "does not beat hand-computed depth observation",
-    "teacher_bar": "remains below full-information oracle ceiling"
+    "limitation_diagnosis": "representation-limited: the enlarged-data curve removes the gross train/validation overfit, but the frozen visibility readout remains below the direct .584 representation bar",
+    "next_experiment": "train-only visibility-supervised encoder pretraining, then a frozen trunk with the unchanged RankNet head",
+    "same_information_bar": "pixel point estimate exceeds hand-computed depth, but the paired whole-part interval crosses zero",
+    "teacher_bar": "remains below full-information oracle ceiling",
+    "two_bar_verdict": "Pixels narrowly clear the hand-computed depth point estimate (0.304987 vs 0.300661, delta +0.004326 with 95% whole-part CI [-0.036438, +0.048991]) but remain below the 0.638062 oracle ceiling and fail the direct visibility bar (0.308412 vs .584). This unlocks a larger-part replication and downstream answer-quality study, not replacement of geometry. Representation-limited: the enlarged-data curve removes the gross train/validation overfit, but the frozen visibility readout remains below the direct .584 representation bar. Next experiment: train-only visibility-supervised encoder pretraining, then a frozen trunk with the unchanged RankNet head."
   },
   "visibility_information": {
     "audit_parts": 8,
@@ -801,11 +932,11 @@
     "depth_reference_correlation": 0.584,
     "encoder_training_part_overlap": 5,
     "oracle_target": "frozen oracle visibility component; label-side only",
-    "pearson_correlation": -0.017062136355626475,
+    "pearson_correlation": 0.30841212314827565,
     "probe": "fixed ridge linear readout over frozen mean/max/prior encoder features",
     "probe_training_part_overlap": 0,
     "ridge": 0.01,
-    "train_samples": 720
+    "train_samples": 47520
   },
   "what_remains_unproven": "Synthetic rendered candidates do not establish generalization to real cameras, unseen topology families, materials, lighting, calibration drift, or downstream human/model answer quality."
 }

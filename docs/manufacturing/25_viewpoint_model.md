@@ -10,21 +10,16 @@ The result must be read against two bars side by side. Neither substitutes for t
 
 | bar | comparison | measured result | verdict |
 |---|---|---|---|
-| **(a) Product-relevant: alternatives at the same limited-information level** | Pixel encoder versus the best one-look depth policy, blind random, fixed isometric, and the hand-engineered greedy heuristic | Pixel is .213234 [.155547, .286292], below depth .300661 [.236741, .364855] by -.087427 [-.151861, -.023961]. It is above the requested historical random scalar .122591 by +.090643 [.032717, .163856], but does not establish a paired win over fixed .171608 (+.041626 [-.041723, .135427]) or greedy .169855 (+.043379 [-.024318, .101808]). | **Fail for the representation intervention.** The prior depth encoder remains the best product-relevant policy on the locked split. |
-| **(b) Student-versus-teacher check: limited-information policy versus full-information oracle ceiling** | Pixel encoder versus the unchanged oracle with exact mesh, feature/occlusion geometry, and all labels | .213234 versus .638062 [.605429, .669972]: 33.4% of the ceiling, with paired regret .424828 [.355621, .485228]. | **Fail.** Learned pixels neither approach the teacher nor reduce its gap relative to depth. The oracle was not weakened or exposed at inference. |
+| **(a) Product-relevant: alternatives at the same limited-information level** | Pixel encoder versus the best one-look depth policy, blind random, fixed isometric, and the hand-engineered greedy heuristic | Pixel is .304987 [.242461, .367679], narrowly above depth .300661 [.236741, .364855] by +.004326 [-.036438, +.048991]. It is above the historical random scalar .122591 by +.182396 [.124661, .242831], fixed .171608 by +.133379 [.032460, .241395], and greedy .169855 by +.135132 [.086651, .181870]. | **Point-estimate pass, not a resolved depth win.** The whole-part interval crosses zero against depth, while the wins over fixed and greedy do not. |
+| **(b) Student-versus-teacher check: limited-information policy versus full-information oracle ceiling** | Pixel encoder versus the unchanged oracle with exact mesh, feature/occlusion geometry, and all labels | .304987 versus .638062 [.605429, .669972]: 47.8% of the ceiling, with paired regret .333075 [.283707, .386663]. | **Fail.** Learned pixels remain decisively below the full-information teacher. The oracle was not weakened or exposed at inference. |
 
-**Two-bar verdict:** the earlier depth policy still earns continued evaluation against same-information
-alternatives, but this pixel encoder does not replace it. Pixel is significantly worse than depth and
-remains decisively below the full-information teacher. It also fails the intervention's direct
-information bar: its frozen-feature visibility probe has $r=-.017$ versus the hand-computed depth
-estimate's $.584$.
-
-The diagnosis remains observation/perception information rather than disconnected history, but the
-first raw-pixel intervention did **not** solve it. Its falling RankNet loss alongside a widening
-train/validation score gap shows representation overfit on the frozen 50-part training set. The next
-predeclared experiment is train-only visibility-supervised encoder pretraining, followed by a frozen
-trunk and the same unchanged RankNet head/objective. That tests whether explicit perception
-supervision can raise the $.584$ information bar without tuning the ranking task to the locked test.
+**Two-bar verdict:** Pixels narrowly clear the hand-computed depth point estimate (.304987 vs
+.300661, delta +.004326 with 95% whole-part CI [-.036438, +.048991]) but remain below the
+.638062 oracle ceiling and fail the direct visibility bar (.308412 vs .584). This unlocks a
+larger-part replication and downstream answer-quality study, not replacement of geometry. The
+enlarged-data curve removes the gross train/validation overfit, so the remaining failure is
+representation-limited. Next experiment: train-only visibility-supervised encoder pretraining,
+then a frozen trunk with the unchanged RankNet head.
 
 ## Reproducible protocol
 
@@ -369,7 +364,7 @@ history wiring.
 
 ## Raw-pixel encoder intervention
 
-### Controlled architecture and license
+### Controlled architecture, data, and regularization
 
 The intervention changes the observation representation and nothing else. Each offered 96 × 96
 candidate render contributes RGB, normalized perspective depth, and an explicit valid-depth mask.
@@ -378,124 +373,146 @@ SiLU, then projects its spatial map to the existing 18-dimensional observation-t
 MLP projects the uncertainty-bearing eight-value `FeatureRegion2D` prior into one additional token.
 The 16-value camera-only descriptor is projected to the existing 48-dimensional candidate width.
 Each candidate then passes through the **existing** task/query/cross-attention/fusion scalar ranking
-head. Task class/question metadata remains structurally separate from pixels and contains no exact
-feature position, axis, normal, or extent. Candidate component labels and true visibility exist only
-on the training/evaluation target side.
+head and unchanged consequence-weighted pairwise RankNet objective. Task metadata contains no exact
+feature position, axis, normal, or extent. Candidate component labels and true visibility remain
+training/evaluation-side only.
 
-This small from-scratch trunk was chosen over a natural-image pretrained network because the
-controlled fit has only 50 training rows (800 candidate renders), the inputs include synthetic depth,
-and an off-domain pretrained backbone would introduce another experimental variable. There is no
-third-party encoder code and no pretrained weight license. PyTorch is the only external model
+The enlarged content-addressed manifest contains 522 parts, 3,132 rows, and 50,112 renders. The fit
+uses **every one of the 3,000 train rows: 500 parts and 48,000 candidate renders**, rather than the
+previous 50-row/800-render slice. Validation remains 66 rows/1,056 renders from 11 parts and the
+locked test remains 66 rows/1,056 renders from the same 11 parts as the `.300661` run.
+
+The predeclared cumulative regularization ablation uses seeded RGB brightness/contrast jitter,
+integer in-plane crop/shift up to four pixels with RGB, depth, and validity transformed together,
+AdamW weight decay `1e-4`, spatial dropout `.10`, and validation early stopping with patience five.
+Flips and rotations are forbidden because they would alter the geometric meaning of a viewpoint.
+All recipes use the same seed, 24-epoch cap, full training split, ranking head, and objective.
+The locked test recipe is selected only by best validation aggregate.
+
+There is no third-party encoder code or pretrained weight license. PyTorch is the only external model
 runtime; its permissive three-clause BSD grant is recorded in the official
 [PyTorch LICENSE](https://github.com/pytorch/pytorch/blob/main/LICENSE). The repository-original
 trunk carries the repository's own source provenance.
 
-The corpus materializes six rows for every part so validation/test match the prior run, but training
-uses only `example_index=0` from each of the same 50 training parts. Validation remains 66 rows from
-11 parts and the locked test remains 66 rows from the same 11 parts. Thus task, candidate set,
-ranking head, objective, train identities/count, validation, and test are held fixed against
-`.300661`; only the observation representation changes.
-
-### CUDA run and curve
+### CUDA run, ablation, and curve
 
 ```bash
 OMP_NUM_THREADS=6 MKL_NUM_THREADS=6 nice -n 15 \
   python3 -X utf8 -m training.viewpoint.pixel_train \
-  --parts 72 --examples-per-part 6 --candidates 16 \
-  --width 96 --height 96 --epochs 24 --batch-rows 4 \
-  --workers 6 --device cuda --seed 1729 --bootstrap-samples 2000 \
-  --cache-dir scratch/viewpoint-pixels \
+  --parts 522 --examples-per-part 6 --candidates 16 \
+  --width 96 --height 96 --epochs 24 --batch-rows 16 \
+  --learning-rate 0.0008 --weight-decay 0.0001 --dropout 0.10 \
+  --photometric-jitter 0.08 --max-crop-pixels 4 \
+  --early-stopping-patience 5 --workers 6 --device cuda --seed 1729 \
+  --bootstrap-samples 2000 --cache-dir scratch/viewpoint-pixels-large \
   --output-report training/viewpoint/pixel_encoder_report.json \
   --output-weights training/viewpoint/pixel_encoder_weights.pt
 ```
 
-Actual device line:
+The trainer writes atomic per-epoch and per-ablation checkpoints under
+`scratch/viewpoint-pixels-large/training-checkpoints-v2`, so a bounded wall-clock restart resumes the
+same optimizer, data-order, augmentation, CPU RNG, and CUDA RNG state.
+
+Actual device/backend line:
 
 ```text
-device=cuda (NVIDIA GeForce RTX 3080 Ti); torch=2.12.1+cu129; CUDA=12.9; gpu_resident_corpus=true
+device=cuda (NVIDIA GeForce RTX 3080 Ti); fit_backend=torch-cuda-conv-ranknet; torch=2.12.1+cu129; CUDA=12.9; gpu_resident_corpus=true
 ```
 
-The best validation checkpoint is epoch 20 at `.242153`. Loss falls while the train-selection score
-rises far above validation, which is direct evidence of overfit rather than an excuse to tune on the
-locked test.
+| cumulative intervention | best epoch / completed | best validation | delta from previous | result |
+|---|---:|---:|---:|---|
+| none | 17 / 24 | **.294317** | — | validation-selected recipe |
+| + photometric jitter and crop/shift | 24 / 24 | .291204 | -.003113 | decreased validation |
+| + weight decay `1e-4` | 9 / 24 | .287092 | -.004112 | decreased validation |
+| + spatial dropout `.10` | 10 / 24 | .274667 | -.012425 | decreased validation |
+| + early stopping, patience 5 | 10 / 15 | .274667 | .000000 | no validation movement; saved nine epochs |
+
+None of the regularizers helped validation on the well-fed corpus. Augmentation, weight decay, and
+dropout each lowered it; early stopping reproduced the same best checkpoint while reducing compute.
+The honest validation-selected locked-test recipe is therefore the no-regularization reference, not
+the worse fully regularized recipe. This is validation selection, not tuning to the locked test.
+
+Its complete curve is:
 
 | epoch | RankNet loss | train aggregate | validation aggregate |
 |---:|---:|---:|---:|
-| 1 | 5.267755 | .212848 | .172776 |
-| 2 | 1.684179 | .230434 | .191337 |
-| 3 | 1.243801 | .221906 | .175943 |
-| 4 | 1.107754 | .230126 | .189320 |
-| 5 | .840998 | .240985 | .198433 |
-| 6 | .837863 | .268393 | .152760 |
-| 7 | .788312 | .290316 | .189302 |
-| 8 | .636667 | .241578 | .171897 |
-| 9 | .591342 | .236652 | .128119 |
-| 10 | .731462 | .342573 | .181959 |
-| 11 | .550801 | .403931 | .199651 |
-| 12 | .508795 | .322692 | .236269 |
-| 13 | .517862 | .409182 | .206002 |
-| 14 | .469583 | .377750 | .199266 |
-| 15 | .423223 | .364754 | .218931 |
-| 16 | .427645 | .359885 | .222540 |
-| 17 | .435683 | .372314 | .181358 |
-| 18 | .415841 | .405216 | .219057 |
-| 19 | .381142 | .398743 | .159170 |
-| **20** | **.400327** | **.469707** | **.242153** |
-| 21 | .347676 | .409151 | .188003 |
-| 22 | .299681 | .449684 | .223448 |
-| 23 | .296808 | .452638 | .240157 |
-| 24 | .303070 | .396133 | .229308 |
+| 1 | 1.041043 | .184747 | .203831 |
+| 2 | .667410 | .202852 | .238932 |
+| 3 | .653694 | .207219 | .240625 |
+| 4 | .618397 | .207652 | .229800 |
+| 5 | .598577 | .215780 | .222534 |
+| 6 | .582600 | .221272 | .263773 |
+| 7 | .580584 | .224334 | .233898 |
+| 8 | .578337 | .226713 | .249491 |
+| 9 | .565213 | .228680 | .278923 |
+| 10 | .561436 | .232352 | .264796 |
+| 11 | .557431 | .237091 | .241099 |
+| 12 | .556482 | .241590 | .273923 |
+| 13 | .552896 | .245344 | .251773 |
+| 14 | .548497 | .247269 | .252317 |
+| 15 | .549715 | .247229 | .267374 |
+| 16 | .544045 | .248114 | .235830 |
+| **17** | **.538605** | **.251671** | **.294317** |
+| 18 | .538488 | .255990 | .282375 |
+| 19 | .533989 | .255073 | .266679 |
+| 20 | .534962 | .261620 | .252161 |
+| 21 | .531694 | .255903 | .281598 |
+| 22 | .527162 | .266750 | .255347 |
+| 23 | .527399 | .272382 | .243452 |
+| 24 | .519926 | .278120 | .253256 |
+
+The old 50-row run reached about `.47` train against `.24` validation. Here validation is above train
+at the selected epoch and the final gap is only `.025`, despite steadily falling loss. Enlarging the
+data removed the gross memorization signature. The remaining low visibility readout is therefore a
+representation limitation, not evidence that the fit merely needs more examples of the same
+topology.
 
 ### Locked-test comparison
 
-All intervals below resample complete `part_id` groups 2,000 times. Pixel-versus-depth/fixed/greedy/
-oracle intervals are paired on the exact 66 rows. Four frozen values reproduce to less than
-`5e-7`: depth `.300661176`, fixed `.171607807`, greedy `.169855431`, and oracle `.638062179`.
+All intervals resample complete `part_id` groups 2,000 times. Pixel-versus-depth/fixed/greedy/oracle
+intervals are paired on the exact 66 locked rows. Depth `.300661176`, fixed `.171607807`, greedy
+`.169855431`, and oracle `.638062179` reproduce the established bars.
 
 | system | aggregate, 95% whole-part CI | pixel minus system, 95% whole-part CI |
 |---|---:|---:|
-| **pixel encoder** | **.213234 [.155547, .286292]** | — |
-| hand-computed depth policy | .300661 [.236741, .364855] | **-.087427 [-.151861, -.023961]** |
-| requested historical random reference | .122591 | +.090643 [.032717, .163856] |
-| seeded random, current aligned rerun | .165632 [.101060, .233275] | +.047602 [-.030462, .132407] |
-| fixed isometric | .171608 [.084371, .267099] | +.041626 [-.041723, .135427] |
-| greedy geometric | .169855 [.111041, .237759] | +.043379 [-.024318, .101808] |
-| full-information oracle ceiling | .638062 [.605429, .669972] | **-.424828 [-.485228, -.355621]** |
+| **pixel encoder** | **.304987 [.242461, .367679]** | — |
+| hand-computed depth policy | .300661 [.236741, .364855] | +.004326 [-.036438, +.048991] |
+| requested historical random reference | .122591 | +.182396 [.124661, .242831] |
+| fixed isometric | .171608 [.084371, .267099] | +.133379 [.032460, .241395] |
+| greedy geometric | .169855 [.111041, .237759] | +.135132 [.086651, .181870] |
+| full-information oracle ceiling | .638062 [.605429, .669972] | -.333075 [-.386663, -.283707] |
 
-There is one historical-artifact caveat that must not be hidden. The checked-in report's requested
-random point is `.122591`, but both its saved selection indices and a current seed-1729 regeneration
-score `.165632` against the frozen labels. No paired `.122591` row vector can therefore be honestly
-recovered. Its displayed delta interval shifts the pixel policy's whole-part bootstrap by that fixed
-historical scalar; it is not presented as a fabricated paired interval. The aligned `.165632` rerun
-is included separately, and its genuine paired interval crosses zero.
+The pixel point estimate is `.004326` above depth, but the paired interval crosses zero; this is not
+a resolved replacement win on only 11 independent test parts. Pixel does establish paired wins over
+fixed isometric and greedy. The requested `.122591` random number remains a fixed historical
+reference because its saved/current aligned selection indices reproduce `.165632`; its interval is
+a shifted pixel bootstrap rather than a fabricated paired random vector.
 
 ### Difficulty slice
 
 | difficulty | examples / parts | pixel | depth | random reference | fixed | greedy | oracle |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| easy | 17 / 11 | .405574 | .509367 | .122591 | .341720 | .402395 | .814856 |
-| medium | 24 / 10 | .192734 | .234171 | .122591 | .130393 | .057414 | .643002 |
-| hard | 25 / 11 | .102122 | .222572 | .122591 | .095498 | .119672 | .513100 |
+| easy | 17 / 11 | .550877 | .509367 | .122591 | .341720 | .402395 | .814856 |
+| medium | 24 / 10 | .292595 | .234171 | .122591 | .130393 | .057414 | .643002 |
+| hard | 25 / 11 | .149678 | .222572 | .122591 | .095498 | .119672 | .513100 |
 
-Pixels are not uniformly useless: the easy slice approaches greedy. They collapse on hard examples,
-however, and trail depth in every slice. That pattern is consistent with learning render appearance
-without learning robust feature visibility.
+Pixels now lead depth on easy and medium rows, but still collapse on hard rows. That explains how the
+aggregate can narrowly pass depth without proving robust feature visibility.
 
 ### Direct information test and verdict
 
 After ranking training, a fixed ridge-`.01` linear readout is fit over frozen mean/max/prior encoder
-features using training visibility labels only. Audit part identities are excluded from the readout
-fit. On the exact frozen eight-part × eight-view audit, its Pearson correlation with the frozen
-oracle's true visibility is **-.017062**, not better than the hand-computed depth estimate's **.584**.
-The probe fit uses 720 candidate samples and the audit uses 64. Five of the eight audit identities
-did occur in ranker training even though none occurs in the probe fit, so this diagnostic is if
-anything favorable to the encoder; it still fails.
+features using training visibility labels only. Audit identities are excluded from that readout fit.
+The probe uses 47,520 training candidate samples and the exact frozen 64-sample, eight-part audit.
+Its Pearson correlation with the frozen oracle's true visibility is **.308412**, improved from the
+50-row run's `-.017062` but still far below the hand-computed depth estimate's **.584**.
 
-The intervention fails both established bars. It does not beat the same-information depth policy,
-and it captures only 33.4% of the full-information oracle ceiling. The next experiment is
-train-only visibility-supervised encoder pretraining followed by freezing the trunk and retraining
-the unchanged RankNet head. That directly targets the failed `.584` information bar while preserving
-the locked ranking task and keeping oracle visibility on the training-target side only.
+Pixels therefore clear only the ranking point estimate, not the direct representation bar. They
+reach 47.8% of the full-information oracle ceiling, and their +.004326 depth delta remains unresolved
+under whole-part resampling. The point result unlocks a larger-part replication and a downstream
+answer-quality study, not replacement of geometry. The next named experiment is train-only
+visibility-supervised encoder pretraining followed by a frozen trunk and the unchanged RankNet head.
+That directly targets the failed `.584` bar without tuning the ranking task to the locked test.
 
 ## Model and objective
 
@@ -525,9 +542,9 @@ later pair mask excludes them. The NumPy path never imports Torch.
 - `FeatureRegion2D` is a deliberately quantized synthetic hypothesis produced from the known target.
   A real detector that finds the user's intended feature under occlusion has not been built or
   evaluated. Workspace bounds are also supplied by the synthetic sensor.
-- The generator varies parameters and rotations but keeps one mechanical topology family. The pixel
-  trunk was trained on only 50 procedural identities; its validation gap and hard-slice collapse do
-  not establish generalization to unseen topology.
+- The generator varies parameters and rotations across 500 training identities but keeps one
+  mechanical topology family. The hard-slice collapse does not establish generalization to unseen
+  topology.
 - Candidate pixels are deterministic synthetic rasterizations. Materials, texture, lighting changes,
   sensor noise, calibration drift, and the domain gap to a real camera have not been evaluated.
 - The visibility audit has only 64 samples. Its probe excludes all audit identities, but the ranking
@@ -541,5 +558,6 @@ The next justified work is not another oracle concession, part-count sweep, or l
 hyperparameter search. It is train-only visibility-supervised pretraining, freezing the resulting
 trunk, and rerunning the unchanged ranking head once. Only if that representation clears the `.584`
 information bar and improves validation should it receive another predeclared locked-test run,
-followed by real-camera answer-quality evaluation. Until then, the depth policy remains the better
-limited-information representation and neither learned policy is a product dependency.
+followed by real-camera answer-quality evaluation. Until then, hand-computed depth remains the better
+visibility representation even though the pixel ranker's locked point estimate is narrowly higher;
+neither learned policy is a product dependency.

@@ -45,16 +45,20 @@ documents cite.
 
 Cross-domain phases. Gateway-internal wave ids (`W1.1` …) are `10_gateway.md` §19.
 
-| phase | contents | unblocks |
+| phase | status | contents |
 |---|---|---|
-| **P0** | baseline landed (`scripts: scope hostd staleness inputs`, `docs: restore refactor log ordering`) | — |
-| **P1** | gateway `W1.1` + `W1.2`: contract, `core/device/*.h`, `FreshValue<T>`, journal + seq + result registry (all ten domains' kinds) + invalidation, family default-off, contract section allocation | everything |
-| **P2** | parallel domain cores: `grbl_protocol` (W2.1), twin core, additive model + slicer sidecar, metrology schemas, perception schemas + training core, monitoring adapter, turning, cutting, PnP, robot | P3, P4 |
-| **P3** | authorization path: `tier0` + `policy`, `gates`, `approval` + `lease` + `arbiter`, `grbl_adapter` + `emulator_transport` (E1–E3) | P4 |
-| **P4** | process + reach: `chudware-mfgd`, `gateway_rpc.py` bridge, `mfg_tools.py` + risk classes, host `manufacture/**` panels | P5 |
-| **P5** | real transports (serial/TCP/WS), Moonraker → OctoPrint → PrusaLink, per-domain UI surfaces | P6, P7 |
-| **P6** | perception data capture, training runs, published model/training core | — |
-| **P7** | E4→E6 pilot campaign on real hardware, then `execute` advertisement | commercial machine control |
+| **P0** | landed | baseline (`scripts: scope hostd staleness inputs`, `docs: restore refactor log ordering`) |
+| **P1** | landed | `contracts/manufacturing_gateway.md`, `core/device/*.h`, `FreshValue<T>`, journal + durable seq + ten-domain result registry + invalidation, `manufacture` family default-off, contract section allocation |
+| **P2** | landed | `grbl_protocol`, twin core, additive model, slicer sidecar, metrology core, perception + training core, MTConnect monitor, turning, cutting, PnP, robot |
+| **P3** | landed | `tier0` + `policy`, `gates`, `approval` + `lease` + `arbiter`, `grbl_adapter` + `emulator_transport` (E1–E3) |
+| **P4** | landed | `core/hostd/mfg_lane` serving the `mfg_*` surface, `services/mcp/mfg_tools.py` + motion/safety risk classes, `host/src/ui/manufacture/**` operator surfaces |
+| **P5** | next | real transports (serial/TCP/WS), Moonraker → OctoPrint → PrusaLink, notifications/attention, per-domain UI surfaces, split-out `chudware-mfgd` |
+| **P6** | planned | perception capture on real jobs, training runs, published model + training core |
+| **P7** | blocked on hardware | E4→E6 pilot campaign, then and only then `execute` advertisement |
+
+**P4 deviation, deliberate:** the separate `chudware-mfgd` process is deferred to P5. The lane runs
+inside `chudware-hostd` today; one lane object still owns a device, the arbiter is still the only
+approval validator, and no transport reaches hardware, so the safety properties are unchanged.
 
 `P7` is operator-attended and hardware-gated by design: nothing before it may advertise
 `execute` on a physical machine.

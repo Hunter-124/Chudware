@@ -1,0 +1,498 @@
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest/doctest.h>
+
+#include "device/grbl_adapter.h"
+#include "manufacturing/gateway/device_allowlist.h"
+#include "manufacturing/gateway/transport_tcp.h"
+#include "manufacturing/gateway/transport_ws.h"
+
+#include <arpa/inet.h>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <functional>
+#include <netinet/in.h>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <sys/socket.h>
+#include <thread>
+#include <unistd.h>
+#include <utility>
+#include <vector>
+
+using namespace std::chrono_literals;
+using chudware::device::Endpoint;
+using chudware::device::MachineClass;
+using chudware::device::TransportEvent;
+using chudware::device::TransportKind;
+using chudware::mfg::gateway::AllowlistEntry;
+using chudware::mfg::gateway::DeviceAllowlist;
+using chudware::mfg::gateway::EndpointIdentity;
+using chudware::mfg::gateway::TcpTransport;
+using chudware::mfg::gateway::WebSocketTransport;
+using chudware::mfg::gateway::WebSocketTransportConfig;
+
+namespace {
+
+std::span<const std::byte> bytes(std::string_view text) {
+    return std::as_bytes(std::span(text));
+}
+
+std::string text(std::span<const std::byte> value) {
+    return {reinterpret_cast<const char*>(value.data()), value.size()};
+}
+
+void send_all(int socket, std::span<const std::byte> data) {
+    std::size_t offset = 0;
+    while (offset < data.size()) {
+        const ssize_t count = ::send(socket, data.data() + offset, data.size() - offset, MSG_NOSIGNAL);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) throw std::runtime_error("fake server send failed");
+        offset += static_cast<std::size_t>(count);
+    }
+}
+
+void send_all(int socket, std::string_view data) { send_all(socket, bytes(data)); }
+
+std::vector<std::byte> recv_exact(int socket, std::size_t size) {
+    std::vector<std::byte> result(size);
+    std::size_t offset = 0;
+    while (offset < size) {
+        const ssize_t count = ::recv(socket, result.data() + offset, size - offset, 0);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) throw std::runtime_error("fake server receive failed");
+        offset += static_cast<std::size_t>(count);
+    }
+    return result;
+}
+
+std::string recv_until(int socket, std::string_view marker, std::size_t limit = 16384) {
+    std::string result;
+    while (result.find(marker) == std::string::npos) {
+        char buffer[1024];
+        const ssize_t count = ::recv(socket, buffer, sizeof(buffer), 0);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) throw std::runtime_error("fake server receive-until failed");
+        result.append(buffer, static_cast<std::size_t>(count));
+        if (result.size() > limit) throw std::runtime_error("fake server request too large");
+    }
+    return result;
+}
+
+std::string header_value(const std::string& request, std::string_view name) {
+    const std::string needle = std::string("\r\n") + std::string(name) + ":";
+    const auto begin = request.find(needle);
+    if (begin == std::string::npos) throw std::runtime_error("missing fake request header");
+    const auto value_begin = request.find_first_not_of(" \t", begin + needle.size());
+    const auto end = request.find("\r\n", value_begin);
+    return request.substr(value_begin, end - value_begin);
+}
+
+struct ClientFrame {
+    bool masked = false;
+    bool fin = false;
+    std::uint8_t opcode = 0;
+    std::vector<std::byte> payload;
+};
+
+ClientFrame recv_client_frame(int socket) {
+    const auto first = recv_exact(socket, 2);
+    ClientFrame result;
+    const auto a = std::to_integer<std::uint8_t>(first[0]);
+    const auto b = std::to_integer<std::uint8_t>(first[1]);
+    result.fin = (a & 0x80) != 0;
+    result.opcode = a & 0x0f;
+    result.masked = (b & 0x80) != 0;
+    std::uint64_t length = b & 0x7f;
+    if (length == 126) {
+        const auto extended = recv_exact(socket, 2);
+        length = (static_cast<std::uint64_t>(std::to_integer<std::uint8_t>(extended[0])) << 8) |
+                 std::to_integer<std::uint8_t>(extended[1]);
+    } else if (length == 127) {
+        const auto extended = recv_exact(socket, 8);
+        length = 0;
+        for (const auto byte : extended)
+            length = (length << 8) | std::to_integer<std::uint8_t>(byte);
+    }
+    if (length > 1024 * 1024) throw std::runtime_error("unexpected large client frame");
+    std::vector<std::byte> mask;
+    if (result.masked) mask = recv_exact(socket, 4);
+    result.payload = recv_exact(socket, static_cast<std::size_t>(length));
+    if (result.masked) {
+        for (std::size_t i = 0; i < result.payload.size(); ++i)
+            result.payload[i] ^= mask[i % 4];
+    }
+    return result;
+}
+
+std::vector<std::byte> server_frame(std::uint8_t opcode, std::span<const std::byte> payload,
+                                    bool fin = true, bool masked = false) {
+    std::vector<std::byte> result;
+    result.push_back(static_cast<std::byte>((fin ? 0x80 : 0) | opcode));
+    if (payload.size() <= 125) {
+        result.push_back(static_cast<std::byte>((masked ? 0x80 : 0) | payload.size()));
+    } else {
+        result.push_back(static_cast<std::byte>((masked ? 0x80 : 0) | 126));
+        result.push_back(static_cast<std::byte>(payload.size() >> 8));
+        result.push_back(static_cast<std::byte>(payload.size()));
+    }
+    if (masked) {
+        const std::array<std::byte, 4> mask{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+        result.insert(result.end(), mask.begin(), mask.end());
+        for (std::size_t i = 0; i < payload.size(); ++i) result.push_back(payload[i] ^ mask[i % 4]);
+    } else {
+        result.insert(result.end(), payload.begin(), payload.end());
+    }
+    return result;
+}
+
+class FakeServer {
+public:
+    using Handler = std::function<void(int)>;
+
+    explicit FakeServer(Handler handler) {
+        listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listener_ < 0) throw std::runtime_error("socket failed");
+        int enabled = 1;
+        setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        if (::bind(listener_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+            ::listen(listener_, 1) != 0)
+            throw std::runtime_error("bind/listen failed");
+        socklen_t size = sizeof(address);
+        if (getsockname(listener_, reinterpret_cast<sockaddr*>(&address), &size) != 0)
+            throw std::runtime_error("getsockname failed");
+        port_ = ntohs(address.sin_port);
+        thread_ = std::thread([this, handler = std::move(handler)] {
+            try {
+                const int peer = ::accept(listener_, nullptr, nullptr);
+                if (peer < 0) throw std::runtime_error("accept failed");
+                handler(peer);
+                ::close(peer);
+            } catch (...) {
+                failure_ = std::current_exception();
+            }
+            ::close(listener_);
+            listener_ = -1;
+        });
+    }
+
+    ~FakeServer() {
+        if (thread_.joinable()) thread_.join();
+        if (listener_ >= 0) ::close(listener_);
+    }
+
+    std::uint16_t port() const { return port_; }
+
+    void finish() {
+        if (thread_.joinable()) thread_.join();
+        if (failure_) std::rethrow_exception(failure_);
+    }
+
+private:
+    int listener_ = -1;
+    std::uint16_t port_ = 0;
+    std::thread thread_;
+    std::exception_ptr failure_;
+};
+
+class CommissionedEndpoint {
+private:
+    static std::atomic<unsigned> counter_;
+    std::filesystem::path file_;
+
+public:
+    CommissionedEndpoint(TransportKind kind, std::uint16_t port, std::string path = {})
+        : file_(std::filesystem::temp_directory_path() /
+                ("chudware-net-allowlist-" + std::to_string(::getpid()) + "-" +
+                 std::to_string(counter_.fetch_add(1)))),
+          allowlist(file_) {
+        AllowlistEntry entry;
+        entry.endpoint = EndpointIdentity::network(kind, "127.0.0.1", port);
+        entry.machine_class = MachineClass::OpenFrameMill;
+        if (!path.empty()) entry.connection["path"] = std::move(path);
+        entry.operator_note = "in-process transport fixture";
+        std::string why;
+        if (!allowlist.upsert(entry, &why)) throw std::runtime_error(why);
+    }
+
+    ~CommissionedEndpoint() {
+        std::error_code ignored;
+        std::filesystem::remove(file_, ignored);
+    }
+
+    DeviceAllowlist allowlist;
+};
+std::atomic<unsigned> CommissionedEndpoint::counter_{0};
+
+std::string ws_upgrade(int peer, std::string_view accept_override = {},
+                       std::string_view extra_header = {}) {
+    const std::string request = recv_until(peer, "\r\n\r\n");
+    const std::string key = header_value(request, "Sec-WebSocket-Key");
+    const std::string accept = accept_override.empty()
+                                   ? WebSocketTransport::handshakeAcceptForTest(key)
+                                   : std::string(accept_override);
+    send_all(peer, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                   "Connection: Upgrade\r\nSec-WebSocket-Accept: " +
+                       accept + "\r\n" + std::string(extra_header) + "\r\n");
+    return request;
+}
+
+Endpoint tcp_endpoint(std::uint16_t port, bool physical = false) {
+    return {"tcp-fixture", "tcp://127.0.0.1:" + std::to_string(port), physical};
+}
+
+Endpoint ws_endpoint(std::uint16_t port, bool physical = false) {
+    return {"ws-fixture", "ws://127.0.0.1:" + std::to_string(port) + "/fluidnc", physical};
+}
+
+std::vector<TransportEvent> poll_until(chudware::device::IReadTransport& transport,
+                                       std::size_t minimum = 1) {
+    std::vector<TransportEvent> result;
+    const auto end = std::chrono::steady_clock::now() + 2s;
+    while (result.size() < minimum && std::chrono::steady_clock::now() < end) {
+        auto batch = transport.poll(std::chrono::steady_clock::now() + 100ms);
+        result.insert(result.end(), std::make_move_iterator(batch.events.begin()),
+                      std::make_move_iterator(batch.events.end()));
+    }
+    return result;
+}
+
+}  // namespace
+
+TEST_CASE("RFC 6455 SHA-1 and Accept vectors are exact") {
+    CHECK(WebSocketTransport::sha1Base64ForTest("") == "2jmj7l5rSw0yVb/vlWAYkK/YBwk=");
+    CHECK(WebSocketTransport::sha1Base64ForTest("abc") == "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=");
+    CHECK(WebSocketTransport::handshakeAcceptForTest("dGhlIHNhbXBsZSBub25jZQ==") ==
+          "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+}
+
+TEST_CASE("TCP round trip is non-blocking, commissioned, simulated, and capped at transport") {
+    FakeServer server([](int peer) {
+        const auto request = recv_exact(peer, 5);
+        send_all(peer, request);
+        std::this_thread::sleep_for(50ms);
+    });
+    CommissionedEndpoint commissioned(TransportKind::Tcp, server.port());
+    TcpTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill, 1s);
+    const Endpoint endpoint = tcp_endpoint(server.port(), false);
+
+    chudware::device::GrblAdapter adapter(transport, [] { return std::uint64_t{1}; });
+    REQUIRE(adapter.open(endpoint).ok);
+    CHECK(adapter.snapshot().src == chudware::mfg::FreshSource::Simulated);
+    const auto capabilities = adapter.capabilityEvidence();
+    CHECK(capabilities.max_advertised == chudware::device::CapabilityLevel::Transport);
+    CHECK(capabilities.levels.at(chudware::device::CapabilityLevel::Execute).truth !=
+          chudware::device::CapabilityTruthValue::Verified);
+
+    const auto written = transport.write(bytes("hello"));
+    REQUIRE(written.ok);
+    REQUIRE(written.bytes_written == 5);
+    const auto events = poll_until(transport);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().kind == TransportEvent::Kind::Data);
+    CHECK(text(events.front().data) == "hello");
+    transport.close();
+    server.finish();
+}
+
+TEST_CASE("TCP refuses uncommissioned endpoints before any connection attempt") {
+    const auto file = std::filesystem::temp_directory_path() /
+                      ("chudware-net-deny-" + std::to_string(::getpid()));
+    std::error_code ignored;
+    std::filesystem::remove(file, ignored);
+    DeviceAllowlist allowlist(file);
+    TcpTransport transport(allowlist, MachineClass::OpenFrameMill, 100ms);
+    const auto result = transport.open(tcp_endpoint(23, true));
+    CHECK_FALSE(result.ok);
+    CHECK(result.why.find("commissioning refused") != std::string::npos);
+    std::filesystem::remove(file, ignored);
+}
+
+TEST_CASE("TCP detects a peer half-close as terminal device_lost") {
+    FakeServer server([](int peer) {
+        (void)recv_exact(peer, 1);
+        if (::shutdown(peer, SHUT_WR) != 0) throw std::runtime_error("shutdown failed");
+        std::this_thread::sleep_for(50ms);
+    });
+    CommissionedEndpoint commissioned(TransportKind::Tcp, server.port());
+    TcpTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill, 1s);
+    REQUIRE(transport.open(tcp_endpoint(server.port())).ok);
+    REQUIRE(transport.write(bytes("x")).ok);
+    const auto events = poll_until(transport);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.back().kind == TransportEvent::Kind::Closed);
+    CHECK(events.back().why.find("device_lost") != std::string::npos);
+    CHECK_FALSE(transport.write(bytes("resume")).ok);
+    server.finish();
+}
+
+TEST_CASE("TCP peer reset is terminal device_lost and never reconnects itself") {
+    FakeServer server([](int peer) {
+        const auto request = recv_exact(peer, 1);
+        (void)request;
+        linger reset{1, 0};
+        setsockopt(peer, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+    });
+    CommissionedEndpoint commissioned(TransportKind::Tcp, server.port());
+    TcpTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill, 1s);
+    REQUIRE(transport.open(tcp_endpoint(server.port())).ok);
+    REQUIRE(transport.write(bytes("x")).ok);
+    const auto events = poll_until(transport);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.back().kind == TransportEvent::Kind::Error);
+    CHECK(events.back().why.find("device_lost") != std::string::npos);
+    CHECK_FALSE(transport.write(bytes("resume")).ok);
+    server.finish();
+}
+
+TEST_CASE("WebSocket handshake accepts exact Accept and refuses bad Accept or extensions") {
+    SUBCASE("accepted") {
+        FakeServer server([](int peer) {
+            ws_upgrade(peer);
+            (void)recv_client_frame(peer);
+        });
+        CommissionedEndpoint commissioned(TransportKind::WebSocket, server.port(), "/fluidnc");
+        WebSocketTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill);
+        REQUIRE(transport.open(ws_endpoint(server.port())).ok);
+        transport.close();
+        server.finish();
+    }
+    SUBCASE("bad Accept") {
+        FakeServer server([](int peer) {
+            ws_upgrade(peer, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+            std::this_thread::sleep_for(20ms);
+        });
+        CommissionedEndpoint commissioned(TransportKind::WebSocket, server.port(), "/fluidnc");
+        WebSocketTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill);
+        const auto result = transport.open(ws_endpoint(server.port()));
+        CHECK_FALSE(result.ok);
+        CHECK(result.why.find("bad Sec-WebSocket-Accept") != std::string::npos);
+        server.finish();
+    }
+    SUBCASE("unsupported extension") {
+        FakeServer server([](int peer) {
+            ws_upgrade(peer, {}, "Sec-WebSocket-Extensions: permessage-deflate\r\n");
+            std::this_thread::sleep_for(20ms);
+        });
+        CommissionedEndpoint commissioned(TransportKind::WebSocket, server.port(), "/fluidnc");
+        WebSocketTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill);
+        const auto result = transport.open(ws_endpoint(server.port()));
+        CHECK_FALSE(result.ok);
+        CHECK(result.why.find("unsupported extension") != std::string::npos);
+        server.finish();
+    }
+}
+
+TEST_CASE("WebSocket client text and binary frames are masked") {
+    std::atomic<bool> text_masked{false};
+    std::atomic<bool> binary_masked{false};
+    FakeServer server([&](int peer) {
+        ws_upgrade(peer);
+        const auto first = recv_client_frame(peer);
+        const auto second = recv_client_frame(peer);
+        text_masked = first.masked && first.fin && first.opcode == 0x1 && text(first.payload) == "hello";
+        binary_masked = second.masked && second.fin && second.opcode == 0x2 &&
+                        second.payload == std::vector<std::byte>{std::byte{0}, std::byte{0xff}};
+    });
+    CommissionedEndpoint commissioned(TransportKind::WebSocket, server.port(), "/fluidnc");
+    WebSocketTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill);
+    REQUIRE(transport.open(ws_endpoint(server.port())).ok);
+    REQUIRE(transport.writeText("hello").ok);
+    const std::array<std::byte, 2> binary{std::byte{0}, std::byte{0xff}};
+    REQUIRE(transport.writeBinary(binary).ok);
+    server.finish();
+    CHECK(text_masked.load());
+    CHECK(binary_masked.load());
+    transport.close();
+}
+
+TEST_CASE("WebSocket reassembles text, answers ping, and echoes server close status") {
+    std::atomic<bool> pong_ok{false};
+    std::atomic<bool> close_echo_ok{false};
+    FakeServer server([&](int peer) {
+        ws_upgrade(peer);
+        const auto first = server_frame(0x1, bytes("hel"), false);
+        const auto ping = server_frame(0x9, bytes("probe"));
+        send_all(peer, first);
+        send_all(peer, ping);
+        const auto pong = recv_client_frame(peer);
+        pong_ok = pong.masked && pong.fin && pong.opcode == 0xa && text(pong.payload) == "probe";
+        send_all(peer, server_frame(0x0, bytes("lo")));
+        const std::array<std::byte, 2> close_payload{std::byte{0x03}, std::byte{0xe9}};
+        send_all(peer, server_frame(0x8, close_payload));
+        const auto close = recv_client_frame(peer);
+        close_echo_ok = close.masked && close.opcode == 0x8 &&
+                        std::equal(close.payload.begin(), close.payload.end(),
+                                   close_payload.begin(), close_payload.end());
+    });
+    CommissionedEndpoint commissioned(TransportKind::WebSocket, server.port(), "/fluidnc");
+    WebSocketTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill);
+    REQUIRE(transport.open(ws_endpoint(server.port())).ok);
+    const auto events = poll_until(transport, 2);
+    REQUIRE(events.size() == 2);
+    CHECK(events[0].kind == TransportEvent::Kind::Data);
+    CHECK(text(events[0].data) == "hello");
+    CHECK(events[0].raw == "text");
+    CHECK(events[1].kind == TransportEvent::Kind::Closed);
+    CHECK(events[1].why.find("1001") != std::string::npos);
+    CHECK(transport.lastCloseCode() == 1001);
+    server.finish();
+    CHECK(pong_ok.load());
+    CHECK(close_echo_ok.load());
+}
+
+TEST_CASE("WebSocket refuses oversized and invalid frames with protocol close") {
+    SUBCASE("oversized") {
+        std::atomic<std::uint16_t> close_code{0};
+        FakeServer server([&](int peer) {
+            ws_upgrade(peer);
+            std::this_thread::sleep_for(20ms);
+            send_all(peer, server_frame(0x2, bytes("123456789")));
+            const auto close = recv_client_frame(peer);
+            if (close.payload.size() >= 2)
+                close_code = (std::to_integer<std::uint8_t>(close.payload[0]) << 8) |
+                             std::to_integer<std::uint8_t>(close.payload[1]);
+        });
+        CommissionedEndpoint commissioned(TransportKind::WebSocket, server.port(), "/fluidnc");
+        WebSocketTransportConfig config;
+        config.max_frame_bytes = 8;
+        config.max_message_bytes = 16;
+        WebSocketTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill, config);
+        REQUIRE(transport.open(ws_endpoint(server.port())).ok);
+        const auto events = poll_until(transport);
+        REQUIRE_FALSE(events.empty());
+        CHECK(events.back().kind == TransportEvent::Kind::Error);
+        CHECK(events.back().why.find("refusal") != std::string::npos);
+        server.finish();
+        CHECK(close_code.load() == 1009);
+    }
+    SUBCASE("masked server frame") {
+        std::atomic<std::uint16_t> close_code{0};
+        FakeServer server([&](int peer) {
+            ws_upgrade(peer);
+            std::this_thread::sleep_for(20ms);
+            send_all(peer, server_frame(0x1, bytes("bad"), true, true));
+            const auto close = recv_client_frame(peer);
+            if (close.payload.size() >= 2)
+                close_code = (std::to_integer<std::uint8_t>(close.payload[0]) << 8) |
+                             std::to_integer<std::uint8_t>(close.payload[1]);
+        });
+        CommissionedEndpoint commissioned(TransportKind::WebSocket, server.port(), "/fluidnc");
+        WebSocketTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill);
+        REQUIRE(transport.open(ws_endpoint(server.port())).ok);
+        const auto events = poll_until(transport);
+        REQUIRE_FALSE(events.empty());
+        CHECK(events.back().why.find("server frame is masked") != std::string::npos);
+        server.finish();
+        CHECK(close_code.load() == 1002);
+    }
+}

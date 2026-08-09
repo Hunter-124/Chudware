@@ -144,6 +144,12 @@ _register("em", ["services.sim.em.worker_rpc"], "WORKER_METHODS")
 # ---- Multi-physics seam ----
 _register("multiphysics", ["services.sim.multiphysics_rpc"], "WORKER_METHODS")
 
+# ---- Manufacturing printer adapters (Moonraker / OctoPrint / PrusaLink) ----
+# HTTP+WebSocket clients live in Python; the hostd manufacturing lane stays the sole
+# owner of device claims, approval validation, durable seq and events.
+_register("mfg_printers", ["services.manufacturing.printers.worker_rpc"],
+          "WORKER_METHODS", structured=True)
+
 
 def _emit(obj: dict) -> None:
     # Backstop: a tool result carrying a non-JSON object (e.g. fastmcp Image)

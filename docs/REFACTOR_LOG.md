@@ -7006,3 +7006,53 @@ Gates: `ctest` 94/94 — the one parallel-run failure, `mesher_advanced`, is a w
 81 passed / 1 skipped; `./build.sh` links; `scripts/check.py` all 8 gates PASS.
 
 Still deferred: real transports, printer adapters, the split-out daemon, and any physical `execute`.
+
+## 2026-08-08 — Manufacturing overhaul, phase P5 transports, printers, attention, capture
+
+Real I/O landed, still behind a deny-by-default commissioning gate.
+
+`services/manufacturing/gateway/device_allowlist.{h,cpp}` is the gate: a durable, human-authored TSV
+naming either a serial device (stable by-id path, or Windows port + VID/PID/serial) or a network
+endpoint (transport kind + host + port), each with machine class, connection parameters and an
+operator note. Enumeration returns candidates; only an allowlisted entry may be OPENED, a refusal
+embeds the exact line the operator would add, and an entry change bumps the lane epoch.
+`transport_serial` is a real POSIX+Windows serial `ITransport` — exclusive open via `O_EXCL` + `flock`
++ `TIOCEXCL` (CreateFile on Windows), raw termios/DCB, bounded non-blocking reads, partial-write
+completion, and explicit `device_lost` on disconnect. `transport_tcp` and `transport_ws` add FluidNC
+telnet and a from-scratch RFC 6455 client: real `Sec-WebSocket-Accept` handshake, masked client
+frames, continuation reassembly, UTF-8 validation, ping/pong, close codes, and refusal of malformed
+or oversized frames. The SHA-1 it needs is private to that TU, marked not-general-purpose, and pinned
+against the RFC 6455 §1.3 vector. Everything is tested with no hardware and no network: a pty pair for
+serial, an in-process server on `127.0.0.1:0` for TCP/WS. Connection loss stays terminal — there is no
+reconnect that resumes motion.
+
+`services/manufacturing/printers/**` implements Moonraker, OctoPrint and capability-probed PrusaLink
+over stdlib HTTP plus a stdlib websocket subscription, with in-process virtual printers as fixtures.
+Recorded here as a deliberate deviation from the design's C++ adapter: writing an HTTP+WebSocket client
+in C++ with no new dependencies is not worth the cost, so adapters are Python reached through the
+existing `hostd/worker_bridge` seam and registered in `services/worker_main.py`. The lane remains the
+sole owner of device claims, approval validation, durable seq and events; an adapter's `start` only
+checks that an opaque post-arbiter token is present and never validates it.
+
+`services/manufacturing/notify/**` is the attention path: durable items raised from `mfg.*` events,
+never auto-dismissed by time, deduplicated into an occurrence count, replayed from the journal across
+restart, and delivered in-app plus desktop plus webhook with bounded retry, per-channel rate limiting
+and a delivery record — so an undelivered critical item is VISIBLE rather than silently lost. Webhook
+payloads carry links, never secrets or media. `host/src/ui/manufacture/attention_panel.{h,cpp}` renders
+open items newest-first and only acknowledges; it resolves nothing locally. Its header originally used
+`std::span`, which the C++17 host target rejects — replaced with a pointer+count view.
+
+`services/perception/capture/**` wires capture into Forecast-to-Compress: bounded rolling buffer with a
+memory ceiling, feature extraction through the existing vision primitives, monotonic-time fusion that
+MARKS a gap instead of interpolating across it, event-centric persistence, redaction applied before
+write, and deterministic offline replay into training windows. Capture never gates, never proposes an
+offset, and a capture failure degrades to a recorded gap rather than a machine action.
+
+Gates: `ctest -R 'mfg|grbl|twin|print_model|device_lane|transport|cam'` 11/11 pass;
+`pytest services/manufacturing services/perception training/perception services/mcp/test_mfg_tools.py`
+109 passed / 1 skipped; `./build.sh` links; `CHUDWARE_SHOT=manufacture` renders; `scripts/check.py` 8/8.
+
+Outstanding for the next phase, and deliberately not faked: the lane still constructs the emulator
+transport directly, so selecting a serial/TCP/WS transport for a claimed device needs an owned
+`ITransport` seam in `mfg_lane`; the printer adapter, attention and capture hooks into the lane are
+likewise not wired yet. No physical device has been opened, and `execute` remains `assumed`.

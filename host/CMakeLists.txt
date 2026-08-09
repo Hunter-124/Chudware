@@ -202,6 +202,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/manufacture/device_panel.cpp
   src/ui/manufacture/run_panel.cpp
   src/ui/manufacture/approval_dialog.cpp
+  src/ui/manufacture/attention_panel.cpp
   # --- end Manufacture ---
   # --- C25: mouse gesture wheel + S shortcut bar ---
   src/ui/mouse_gestures.cpp

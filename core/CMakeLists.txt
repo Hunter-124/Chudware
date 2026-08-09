@@ -2195,10 +2195,21 @@ add_library(chudware_manufacturing STATIC
   manufacturing/approval.cpp
   manufacturing/lease.cpp
   manufacturing/arbiter.cpp
-  hostd/mfg_lane.cpp)               # single-owner device lane behind the mfg_* RPCs
+  hostd/mfg_lane.cpp                # single-owner device lane behind the mfg_* RPCs
+  # Real transports. Deny-by-default: every open is gated by the commissioning allowlist.
+  ${CMAKE_CURRENT_SOURCE_DIR}/../services/manufacturing/gateway/device_allowlist.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../services/manufacturing/gateway/transport_serial.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../services/manufacturing/gateway/transport_tcp.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../services/manufacturing/gateway/transport_ws.cpp)
 target_compile_features(chudware_manufacturing PUBLIC cxx_std_20)
-target_include_directories(chudware_manufacturing PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(chudware_manufacturing PUBLIC nlohmann_json::nlohmann_json)
+target_include_directories(chudware_manufacturing PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../services)
+find_package(Threads REQUIRED)
+target_link_libraries(chudware_manufacturing PUBLIC
+  nlohmann_json::nlohmann_json Threads::Threads)
+if(WIN32)
+  target_link_libraries(chudware_manufacturing PUBLIC ws2_32)
+endif()
 
 add_executable(test_mfg_foundation tests/test_mfg_foundation.cpp)
 target_include_directories(test_mfg_foundation PRIVATE ${doctest_SOURCE_DIR})
@@ -2228,7 +2239,7 @@ target_compile_features(chudware_print PUBLIC cxx_std_20)
 target_link_libraries(chudware_print PUBLIC chudware_manufacturing)
 
 foreach(_mfg_test test_device_lane test_mfg_authorization test_twin test_print_model
-                  test_mfg_lane)
+                  test_mfg_lane test_transport_serial test_transport_net)
   add_executable(${_mfg_test} tests/${_mfg_test}.cpp)
   target_include_directories(${_mfg_test} PRIVATE ${doctest_SOURCE_DIR})
   target_compile_definitions(${_mfg_test} PRIVATE
@@ -2242,6 +2253,8 @@ target_link_libraries(test_mfg_authorization PRIVATE chudware_manufacturing)
 target_link_libraries(test_twin PRIVATE chudware_twin)
 target_link_libraries(test_print_model PRIVATE chudware_print)
 target_link_libraries(test_mfg_lane PRIVATE chudware_manufacturing)
+target_link_libraries(test_transport_serial PRIVATE chudware_manufacturing)
+target_link_libraries(test_transport_net PRIVATE chudware_manufacturing)
 
 # Turning + laser/plasma/waterjet process models. Reads the checked-in fixtures directly.
 add_executable(test_cam_processes tests/test_cam_processes.cpp)

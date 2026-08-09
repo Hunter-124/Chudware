@@ -2,7 +2,7 @@ import numpy as np
 
 from services.viewpoint.oracle import DEFAULT_WEIGHTS
 from training.viewpoint.baselines import all_baselines, random_search_baselines
-from training.viewpoint.metrics import compute_equivalence_report, evaluation_report
+from training.viewpoint.metrics import compute_equivalence_report, deployed_evaluation_report, evaluation_report
 from training.viewpoint.model import COMPONENTS, weighted_geometric_mean
 from training.viewpoint.synthetic import CorpusConfig, generate_oracle_corpus
 
@@ -51,3 +51,22 @@ def test_compute_equivalence_is_part_bootstrapped_and_reports_distributions():
         assert set(comparison["delta_quantiles"]) == {
             "min", "p10", "p25", "median", "p75", "p90", "max",
         }
+
+
+def test_deployed_report_compares_policy_random_and_oracle_at_every_budget():
+    batch = generate_oracle_corpus(
+        CorpusConfig(parts=3, examples_per_part=1, candidates=32, seed=61, image_size=(72, 72)),
+    )
+    oracle_scores = weighted_geometric_mean(batch.components)
+    report = deployed_evaluation_report(
+        batch,
+        oracle_scores,
+        bootstrap_samples=16,
+        bootstrap_seed=4,
+    )
+    assert report["render_budgets"] == [1, 2, 4, 8, 16, 32]
+    for budget in report["by_budget"].values():
+        assert budget["regret"]["mean"] == 0.0
+        assert budget["regret"]["mean_ci"] == [0.0, 0.0]
+        assert set(budget["difficulty"]) <= {"easy", "medium", "hard"}
+        assert "delta_quantiles" in budget["policy_vs_random"]

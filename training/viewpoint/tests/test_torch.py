@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from training.viewpoint.model import NumpyViewpointPolicy
+from training.viewpoint.model import ModelSpec, NumpyViewpointPolicy
 from training.viewpoint.torch_model import build_torch_policy
 
 
@@ -15,7 +15,7 @@ def _inputs():
         "geometry": rng.normal(size=(2, 4, 18)).astype(np.float32),
         "geometry_mask": np.asarray([[1, 1, 1, 0], [1, 1, 1, 1]], bool),
         "feature_mask": np.asarray([[0, 1, 0, 0], [0, 0, 1, 0]], bool),
-        "candidates": rng.normal(size=(2, 6, 12)).astype(np.float32),
+        "candidates": rng.normal(size=(2, 6, ModelSpec().candidate_dim)).astype(np.float32),
         "candidate_mask": np.asarray([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1]], bool),
     }
 

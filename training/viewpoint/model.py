@@ -26,8 +26,8 @@ class ModelSpec:
 
     task_dim: int = 14
     geometry_dim: int = 18
-    candidate_dim: int = 12
-    hidden_dim: int = 32
+    candidate_dim: int = 48
+    hidden_dim: int = 96
     component_count: int = len(COMPONENTS)
 
     def validate(self) -> "ModelSpec":
@@ -75,7 +75,7 @@ class PolicyWeights:
             query_w=matrix(2 * h, h), query_b=np.zeros(h, np.float32),
             feature_bias=np.asarray(1.0, np.float32),
             fuse_w=matrix(5 * h, h), fuse_b=np.zeros(h, np.float32),
-            out_w=matrix(h, spec.component_count), out_b=np.zeros(spec.component_count, np.float32),
+            out_w=matrix(h, 1)[:, 0], out_b=np.asarray(0.0, np.float32),
         )
 
     def arrays(self) -> Mapping[str, Array]:
@@ -103,10 +103,6 @@ def _silu(value: Array) -> Array:
     return value / (1.0 + np.exp(-clipped))
 
 
-def _sigmoid(value: Array) -> Array:
-    return 1.0 / (1.0 + np.exp(-np.clip(value, -30.0, 30.0)))
-
-
 def weighted_geometric_mean(components: Array, weights: Array | None = None) -> Array:
     values = np.asarray(components, np.float32)
     if values.shape[-1] != len(COMPONENTS):
@@ -119,11 +115,12 @@ def weighted_geometric_mean(components: Array, weights: Array | None = None) -> 
 
 
 class NumpyViewpointPolicy:
-    """Dependency-light reference forward pass for feature-conditioned ranking.
+    """Dependency-light reference forward pass for feature-conditioned scoring.
 
-    Geometry tokens are an unordered set.  Candidate-conditioned cross-attention
-    makes each pose ask a different occlusion/layout question of that set.  The
-    output is seven component probabilities; selection uses their geometric mean.
+    Geometry tokens are an unordered set. Candidate-conditioned cross-attention
+    lets each offered pose ask a different layout question, while the candidate
+    vector carries explicit coarse depth and visibility evidence. The scalar
+    output is an unconstrained ranking logit, not a regressed pose or oracle score.
     """
 
     def __init__(self, weights: PolicyWeights, spec: ModelSpec | None = None):
@@ -145,7 +142,7 @@ class NumpyViewpointPolicy:
             "cand_w": (s.candidate_dim, h), "cand_b": (h,),
             "query_w": (2 * h, h), "query_b": (h,), "feature_bias": (),
             "fuse_w": (5 * h, h), "fuse_b": (h,),
-            "out_w": (h, s.component_count), "out_b": (s.component_count,),
+            "out_w": (h,), "out_b": (),
         }
         for name, shape in expected.items():
             value = np.asarray(getattr(w, name))
@@ -198,19 +195,15 @@ class NumpyViewpointPolicy:
         context = np.einsum("bng,bgh->bnh", attention, values)
         fusion = np.concatenate((cand_h, repeated_task, context, cand_h * context, np.abs(cand_h - context)), axis=-1)
         hidden = _silu(fusion @ w.fuse_w + w.fuse_b)
-        output = _sigmoid(hidden @ w.out_w + w.out_b).astype(np.float32)
+        output = (hidden @ w.out_w + w.out_b).astype(np.float32)
         if candidate_mask is not None:
             valid = np.asarray(candidate_mask, bool)
             if valid.shape != candidates.shape[:2] or np.any(~valid.any(axis=1)):
                 raise ValueError("candidate_mask must match candidates and leave one valid candidate per item")
-            output = np.where(valid[..., None], output, 0.0)
+            output = np.where(valid, output, -np.inf)
         return output
 
-    def select(self, *args: Array, component_weights: Array | None = None, **kwargs: Array) -> tuple[Array, Array, Array]:
-        components = self.forward(*args, **kwargs)
-        scores = weighted_geometric_mean(components, component_weights)
-        candidate_mask = kwargs.get("candidate_mask")
-        if candidate_mask is not None:
-            scores = np.where(np.asarray(candidate_mask, bool), scores, -np.inf)
+    def select(self, *args: Array, **kwargs: Array) -> tuple[Array, Array]:
+        scores = self.forward(*args, **kwargs)
         selected = np.argmax(scores, axis=1).astype(np.int64)
-        return selected, scores, components
+        return selected, scores

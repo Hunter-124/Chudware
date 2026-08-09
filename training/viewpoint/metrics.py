@@ -221,3 +221,123 @@ def evaluation_report(
             bootstrap_samples=bootstrap_samples, seed=bootstrap_seed,
         )
     return report
+
+
+def _prefix_argmax(scores: Array, mask: Array, n: int) -> Array:
+    result = np.empty(scores.shape[0], np.int64)
+    for row in range(scores.shape[0]):
+        valid = np.flatnonzero(mask[row])
+        offered = valid[: min(n, len(valid))]
+        result[row] = offered[int(np.argmax(scores[row, offered]))]
+    return result
+
+
+def _bootstrap_mean_ci(
+    batch: ViewpointBatch,
+    values: Array,
+    *,
+    samples: int,
+    confidence: float,
+    seed: int,
+) -> list[float]:
+    means = [
+        float(np.mean(values[rows]))
+        for rows in _part_bootstrap_rows(batch, samples=samples, seed=seed)
+    ]
+    return _confidence_interval(np.asarray(means, np.float64), confidence)
+
+
+def deployed_evaluation_report(
+    batch: ViewpointBatch,
+    predicted_scores: Array,
+    *,
+    budgets: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
+    random_seed: int = 1729,
+    bootstrap_samples: int = 2000,
+    confidence: float = 0.95,
+    bootstrap_seed: int = 271828,
+) -> dict[str, object]:
+    """Evaluate the scorer exactly as deployed on nested offered candidate sets."""
+    scores = np.asarray(predicted_scores, np.float32)
+    if scores.shape != batch.candidate_mask.shape:
+        raise ValueError("predicted_scores must match the candidate mask")
+    if tuple(sorted(set(budgets))) != budgets or any(n <= 0 for n in budgets):
+        raise ValueError("budgets must be unique, positive, and increasing")
+    actual = weighted_geometric_mean(batch.components)
+    rows = np.arange(len(batch.part_ids))
+    rngs = {
+        n: np.random.default_rng(np.random.SeedSequence((random_seed, n, 0xA11CE)))
+        for n in budgets
+    }
+    difficulty_labels = batch.difficulties or tuple("unlabeled" for _ in batch.part_ids)
+    by_budget: dict[str, object] = {}
+    selections: dict[str, dict[str, Array]] = {}
+
+    for n in budgets:
+        policy = _prefix_argmax(scores, batch.candidate_mask, n)
+        oracle = _prefix_argmax(actual, batch.candidate_mask, n)
+        random = np.empty(len(rows), np.int64)
+        for row in rows:
+            valid = np.flatnonzero(batch.candidate_mask[row])
+            offered = valid[: min(n, len(valid))]
+            random[row] = offered[int(rngs[n].integers(len(offered)))]
+        policy_score = actual[rows, policy]
+        random_score = actual[rows, random]
+        oracle_score = actual[rows, oracle]
+        delta = policy_score - random_score
+        regret = oracle_score - policy_score
+        vs_random = _comparison(policy_score, random_score)
+        vs_random["mean_delta_ci"] = _bootstrap_mean_ci(
+            batch,
+            delta,
+            samples=bootstrap_samples,
+            confidence=confidence,
+            seed=bootstrap_seed + n,
+        )
+        difficulty: dict[str, object] = {}
+        labels = np.asarray(difficulty_labels, dtype=object)
+        for label in sorted(set(difficulty_labels)):
+            selected_rows = np.flatnonzero(labels == label)
+            difficulty[label] = {
+                "examples": int(len(selected_rows)),
+                "parts": int(len(set(batch.part_ids[int(row)] for row in selected_rows))),
+                "policy_aggregate": float(np.mean(policy_score[selected_rows])),
+                "random_aggregate": float(np.mean(random_score[selected_rows])),
+                "oracle_upper_bound": float(np.mean(oracle_score[selected_rows])),
+                "mean_regret": float(np.mean(regret[selected_rows])),
+                "strict_win_rate_vs_random": float(np.mean(delta[selected_rows] > 0.0)),
+            }
+        by_budget[str(n)] = {
+            "policy_selected": summarize_selection(batch, policy),
+            "random_selected": summarize_selection(batch, random),
+            "oracle_upper_bound": summarize_selection(batch, oracle),
+            "policy_vs_random": vs_random,
+            "regret": {
+                "mean": float(np.mean(regret)),
+                "mean_ci": _bootstrap_mean_ci(
+                    batch,
+                    regret,
+                    samples=bootstrap_samples,
+                    confidence=confidence,
+                    seed=bootstrap_seed + 1000 + n,
+                ),
+                "quantiles": _quantiles(regret),
+                "oracle_match_rate": float(np.mean(regret == 0.0)),
+            },
+            "difficulty": difficulty,
+        }
+        selections[str(n)] = {"policy": policy, "random": random, "oracle": oracle}
+
+    return {
+        "render_budgets": list(budgets),
+        "test_examples": len(batch.part_ids),
+        "test_parts": len(set(batch.part_ids)),
+        "bootstrap_unit": "part_id",
+        "bootstrap_samples": bootstrap_samples,
+        "confidence": confidence,
+        "by_budget": by_budget,
+        "selection_indices": {
+            n: {name: values.tolist() for name, values in selection.items()}
+            for n, selection in selections.items()
+        },
+    }

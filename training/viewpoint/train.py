@@ -7,10 +7,10 @@ from typing import Any
 
 import numpy as np
 
-from .baselines import RANDOM_RENDER_BUDGETS, all_baselines, random_search_baselines
+from .baselines import RANDOM_RENDER_BUDGETS, all_baselines
 from .data import ViewpointBatch, split_by_part
-from .metrics import evaluation_report
-from .model import DEFAULT_COMPONENT_WEIGHTS, NumpyViewpointPolicy, weighted_geometric_mean
+from .metrics import deployed_evaluation_report, evaluation_report
+from .model import NumpyViewpointPolicy, weighted_geometric_mean
 from .synthetic import GENERATOR_VERSION, CorpusConfig, generate_oracle_corpus
 from .torch_model import build_torch_policy
 
@@ -31,9 +31,15 @@ def _torch_inputs(batch: ViewpointBatch, torch: Any, device: Any) -> dict[str, A
 def _chosen_oracle_mean(model: Any, batch: ViewpointBatch, torch: Any, device: Any) -> float:
     with torch.no_grad():
         predicted = model(**_torch_inputs(batch, torch, device)).cpu().numpy()
-    selected = np.argmax(weighted_geometric_mean(predicted), axis=1)
+    selected = np.argmax(predicted, axis=1)
     actual = batch.components[np.arange(len(selected)), selected]
     return float(np.mean(weighted_geometric_mean(actual)))
+
+
+def _oracle_upper_mean(batch: ViewpointBatch) -> float:
+    quality = weighted_geometric_mean(batch.components)
+    quality = np.where(batch.candidate_mask, quality, -np.inf)
+    return float(np.mean(np.max(quality, axis=1)))
 
 
 def fit_policy(
@@ -41,14 +47,13 @@ def fit_policy(
     validation: ViewpointBatch,
     *,
     seed: int = DEFAULT_SEED,
-    epochs: int = 350,
-    learning_rate: float = 3.0e-3,
+    epochs: int = 500,
+    learning_rate: float = 2.0e-3,
     weight_decay: float = 1.0e-5,
-    component_loss_weight: float = 0.4,
-    rank_temperature: float = 0.12,
+    rank_temperature: float = 0.10,
     device: str = "cpu",
-) -> tuple[NumpyViewpointPolicy, dict[str, float]]:
-    """Learn all policy matrices end-to-end with component + listwise losses."""
+) -> tuple[NumpyViewpointPolicy, dict[str, float | int]]:
+    """Fit candidate ordering with a consequence-weighted pairwise RankNet loss."""
     try:
         import torch
     except ImportError as exc:
@@ -64,41 +69,62 @@ def fit_policy(
     model = build_torch_policy(seed=seed).to(actual_device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     inputs = _torch_inputs(train, torch, actual_device)
-    target = torch.as_tensor(train.components, dtype=torch.float32, device=actual_device)
+    target_quality = torch.as_tensor(
+        weighted_geometric_mean(train.components),
+        dtype=torch.float32,
+        device=actual_device,
+    )
     mask = torch.as_tensor(train.candidate_mask, dtype=torch.bool, device=actual_device)
-    weights = torch.as_tensor(DEFAULT_COMPONENT_WEIGHTS, dtype=torch.float32, device=actual_device)
-    target_utility = (torch.log(target.clamp_min(1.0e-6)) * weights).sum(dim=-1) / weights.sum()
-    target_distribution = torch.softmax(target_utility.masked_fill(~mask, -1.0e9) / rank_temperature, dim=1)
+    target_delta = target_quality[:, :, None] - target_quality[:, None, :]
+    pair_mask = mask[:, :, None] & mask[:, None, :]
+    pair_mask &= torch.triu(torch.ones_like(pair_mask), diagonal=1)
+    pair_mask &= torch.abs(target_delta) > 1.0e-7
+    pair_weight = torch.abs(target_delta)
 
     best_validation = -np.inf
     best_state: dict[str, Any] | None = None
+    best_epoch = 0
     final_loss = np.inf
-    for _ in range(epochs):
+    for epoch in range(epochs):
         optimizer.zero_grad(set_to_none=True)
         predicted = model(**inputs)
-        component_loss = torch.nn.functional.smooth_l1_loss(predicted[mask], target[mask])
-        predicted_utility = (torch.log(predicted.clamp_min(1.0e-6)) * weights).sum(dim=-1) / weights.sum()
-        log_probability = torch.log_softmax(predicted_utility.masked_fill(~mask, -1.0e9) / rank_temperature, dim=1)
-        rank_loss = -(target_distribution * log_probability).sum(dim=1).mean()
-        loss = rank_loss + component_loss_weight * component_loss
+        predicted_delta = predicted[:, :, None] - predicted[:, None, :]
+        signed_margin = torch.sign(target_delta) * predicted_delta / rank_temperature
+        pair_loss = torch.nn.functional.softplus(-signed_margin)
+        loss = (pair_loss[pair_mask] * pair_weight[pair_mask]).sum() / pair_weight[pair_mask].sum()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         final_loss = float(loss.detach())
         validation_score = _chosen_oracle_mean(model, validation, torch, actual_device)
-        if validation_score > best_validation:
+        if validation_score >= best_validation:
             best_validation = validation_score
+            best_epoch = epoch + 1
             best_state = {name: value.detach().clone() for name, value in model.state_dict().items()}
     if best_state is None:
         raise RuntimeError("training did not produce a finite validation checkpoint")
     model.load_state_dict(best_state)
-    return model.to_numpy_reference(), {"loss": final_loss, "best_validation_aggregate": best_validation}
+    train_aggregate = _chosen_oracle_mean(model, train, torch, actual_device)
+    validation_aggregate = _chosen_oracle_mean(model, validation, torch, actual_device)
+    return model.to_numpy_reference(), {
+        "loss": final_loss,
+        "best_epoch": best_epoch,
+        "train_aggregate": train_aggregate,
+        "train_oracle_upper_bound": _oracle_upper_mean(train),
+        "train_regret": _oracle_upper_mean(train) - train_aggregate,
+        "validation_aggregate": validation_aggregate,
+        "validation_oracle_upper_bound": _oracle_upper_mean(validation),
+        "validation_regret": _oracle_upper_mean(validation) - validation_aggregate,
+        "train_validation_gap": train_aggregate - validation_aggregate,
+        "best_validation_aggregate": best_validation,
+        "auxiliary_regression_weight": 0.0,
+    }
 
 
 def run_stage1(
     *,
     corpus: CorpusConfig = CorpusConfig(),
-    epochs: int = 350,
+    epochs: int = 500,
     seed: int = DEFAULT_SEED,
     output_weights: str | Path | None = None,
     device: str = "cpu",
@@ -107,15 +133,26 @@ def run_stage1(
     batch = generate_oracle_corpus(corpus)
     train, validation, test = split_by_part(batch, seed=seed)
     policy, training = fit_policy(train, validation, seed=seed, epochs=epochs, device=device)
-    selected, _, _ = policy.select(**test.model_inputs())
-    random_baselines = random_search_baselines(test)
+    predicted_scores = policy.forward(**test.model_inputs())
+    selected = np.argmax(predicted_scores, axis=1)
     baselines = all_baselines(test, random_budgets=RANDOM_RENDER_BUDGETS)
-    report = evaluation_report(
-        test, selected, baselines,
-        random_budgets=random_baselines,
-        bootstrap_samples=bootstrap_samples,
-        bootstrap_seed=seed + 1,
-    )
+    report = {
+        "deployed": deployed_evaluation_report(
+            test,
+            predicted_scores,
+            budgets=RANDOM_RENDER_BUDGETS,
+            random_seed=seed,
+            bootstrap_samples=bootstrap_samples,
+            bootstrap_seed=seed + 1,
+        ),
+        "legacy_policy_at_32_candidates": evaluation_report(
+            test,
+            selected,
+            baselines,
+            bootstrap_samples=bootstrap_samples,
+            bootstrap_seed=seed + 1,
+        ),
+    }
     report.update({
         "seed": seed,
         "split": {
@@ -146,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--parts", type=int, default=72)
     parser.add_argument("--examples-per-part", type=int, default=6)
     parser.add_argument("--candidates", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=350)
+    parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--image-size", type=int, default=320, help="square oracle image size")
     parser.add_argument("--device", default="cpu", help="Torch optimizer device; oracle generation remains CPU")

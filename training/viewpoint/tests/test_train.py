@@ -14,7 +14,9 @@ def test_stage1_updates_real_network_weights_end_to_end():
     train, validation, _ = split_by_part(corpus, seed=73, train_fraction=0.5, validation_fraction=0.2)
     model, report = fit_policy(train, validation, seed=73, epochs=3)
     assert np.isfinite(report["loss"])
-    assert np.isfinite(report["best_validation_aggregate"])
+    assert np.isfinite(report["train_aggregate"])
+    assert np.isfinite(report["validation_aggregate"])
+    assert report["auxiliary_regression_weight"] == 0.0
     initial = PolicyWeights.random(ModelSpec(), seed=73).arrays()
     trained = model.weights.arrays()
     changed = sum(np.any(trained[name] != initial[name]) for name in initial)

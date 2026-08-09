@@ -10,7 +10,7 @@ def _inputs(seed=3):
         "geometry": rng.normal(size=(2, 5, 18)).astype(np.float32),
         "geometry_mask": np.asarray([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]], bool),
         "feature_mask": np.asarray([[0, 1, 0, 0, 0], [0, 0, 1, 0, 0]], bool),
-        "candidates": rng.normal(size=(2, 7, 12)).astype(np.float32),
+        "candidates": rng.normal(size=(2, 7, ModelSpec().candidate_dim)).astype(np.float32),
         "candidate_mask": np.asarray([[1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 1]], bool),
     }
 
@@ -18,11 +18,10 @@ def _inputs(seed=3):
 def test_numpy_forward_is_finite_and_selects_only_valid_candidates():
     model = NumpyViewpointPolicy.random(seed=7)
     inputs = _inputs()
-    selected, scores, components = model.select(**inputs)
-    assert components.shape == (2, 7, 7)
-    assert np.isfinite(components).all()
-    assert np.all((components >= 0.0) & (components <= 1.0))
+    selected, scores = model.select(**inputs)
     assert scores.shape == (2, 7)
+    assert np.isfinite(scores[inputs["candidate_mask"]]).all()
+    assert np.all(np.isneginf(scores[~inputs["candidate_mask"]]))
     assert inputs["candidate_mask"][np.arange(2), selected].all()
 
 

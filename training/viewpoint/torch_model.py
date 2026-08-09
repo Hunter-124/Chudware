@@ -62,9 +62,9 @@ def build_torch_policy(
             context = torch.einsum("bng,bgh->bnh", attention, values)
             fusion = torch.cat((cand_h, task_h, context, cand_h * context, torch.abs(cand_h - context)), dim=-1)
             hidden = self.silu(fusion @ self.fuse_w + self.fuse_b)
-            output = torch.sigmoid(hidden @ self.out_w + self.out_b)
+            output = hidden @ self.out_w + self.out_b
             if candidate_mask is not None:
-                output = output.masked_fill(~candidate_mask[..., None].bool(), 0.0)
+                output = output.masked_fill(~candidate_mask.bool(), -torch.inf)
             return output
 
         def to_numpy_reference(self) -> NumpyViewpointPolicy:

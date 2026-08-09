@@ -9,7 +9,7 @@ from services.viewpoint.oracle import evaluate
 from services.viewpoint.parts import GENERATOR_VERSION, PartExample, generate_part_examples
 from services.viewpoint.sampling import generate_benchmark_candidate_set
 
-from .data import FEATURE_KINDS, ViewpointBatch, encode_camera_pose, encode_task
+from .data import FEATURE_KINDS, ViewpointBatch, encode_candidate, encode_task
 from .model import COMPONENTS
 
 Array = np.ndarray
@@ -126,7 +126,13 @@ def generate_oracle_corpus(config: CorpusConfig = CorpusConfig()) -> ViewpointBa
         geometry_rows.append(geometry)
         target_masks.append(target_mask)
         candidate_rows.append(np.stack([
-            encode_camera_pose(pose, part_center=scene_center, part_radius=radius)
+            encode_candidate(
+                scene,
+                example.target_id,
+                pose,
+                part_center=scene_center,
+                part_radius=radius,
+            )
             for pose in poses
         ]))
         component_rows.append(np.asarray([

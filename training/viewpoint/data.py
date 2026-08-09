@@ -5,6 +5,8 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
+from services.viewpoint.geometry import CameraPose, Scene, project_points, unit
+
 from .model import ModelSpec
 
 Array = np.ndarray
@@ -50,6 +52,183 @@ def encode_camera_pose(pose: object, *, part_center: Array, part_radius: float) 
     width = max(float(getattr(pose, "image_width_px")), 1.0)
     height = max(float(getattr(pose, "image_height_px")), 1.0)
     return np.concatenate((forward, up, offset, [np.log(distance), fov, np.log(width / height)])).astype(np.float32)
+
+
+def _canonical_feature_frame(scene: Scene, target_id: str) -> tuple[Array, Array, Array, Array, Array]:
+    feature = scene.feature(target_id)
+    points = scene.feature_points(feature)
+    center = scene.feature_center(feature)
+    if feature.orientation is not None:
+        axis = np.asarray(feature.orientation, np.float64)
+    else:
+        centered = points - center
+        covariance = centered.T @ centered
+        axis = np.linalg.eigh(covariance)[1][:, -1] if np.any(covariance) else np.asarray((0.0, 0.0, 1.0))
+    axis = unit(axis, name="feature axis")
+    dominant = int(np.argmax(np.abs(axis)))
+    if axis[dominant] < 0.0:
+        axis = -axis
+    anchors = np.eye(3, dtype=np.float64)
+    reference = anchors[int(np.argmin(np.abs(anchors @ axis)))]
+    tangent = unit(np.cross(axis, reference), name="feature tangent")
+    bitangent = np.cross(axis, tangent)
+    return center, axis, tangent, bitangent, points
+
+
+def _ray_pattern_points(center: Array, tangent: Array, bitangent: Array, points: Array) -> Array:
+    """Choose a fixed center-plus-eight-extrema pattern on the target feature."""
+    centered = points - center
+    rows = [center]
+    for angle in np.arange(8, dtype=np.float64) * (np.pi / 4.0):
+        direction = np.cos(angle) * tangent + np.sin(angle) * bitangent
+        rows.append(points[int(np.argmax(centered @ direction))])
+    return np.asarray(rows, np.float64)
+
+
+def _ray_visibility_pattern(
+    scene: Scene,
+    target_id: str,
+    camera_position: Array,
+    targets: Array,
+    *,
+    part_radius: float,
+) -> tuple[Array, Array]:
+    """Return coarse visibility and first-hit depth for rays toward target landmarks."""
+    target_feature = scene.feature(target_id)
+    triangle_mask = np.ones(len(scene.mesh.triangles), dtype=bool)
+    if target_feature.triangle_indices:
+        triangle_mask[np.asarray(target_feature.triangle_indices, np.int64)] = False
+    triangles = scene.mesh.vertices[scene.mesh.triangles[triangle_mask]]
+    visibility = np.ones(len(targets), np.float32)
+    hit_depth = np.ones(len(targets), np.float32)
+    if not len(triangles):
+        return visibility, hit_depth
+
+    edge1 = triangles[:, 1] - triangles[:, 0]
+    edge2 = triangles[:, 2] - triangles[:, 0]
+    origin = np.asarray(camera_position, np.float64)
+    epsilon = max(float(part_radius) * 1.0e-7, 1.0e-9)
+    for row, target in enumerate(targets):
+        segment = target - origin
+        target_distance = float(np.linalg.norm(segment))
+        if target_distance <= epsilon:
+            continue
+        direction = segment / target_distance
+        pvec = np.cross(np.broadcast_to(direction, edge2.shape), edge2)
+        determinant = np.einsum("ij,ij->i", edge1, pvec)
+        valid = np.abs(determinant) > 1.0e-12
+        inverse = np.zeros_like(determinant)
+        inverse[valid] = 1.0 / determinant[valid]
+        tvec = origin - triangles[:, 0]
+        bary_u = np.einsum("ij,ij->i", tvec, pvec) * inverse
+        qvec = np.cross(tvec, edge1)
+        bary_v = np.einsum("j,ij->i", direction, qvec) * inverse
+        distance = np.einsum("ij,ij->i", edge2, qvec) * inverse
+        hits = (
+            valid
+            & (bary_u >= 0.0)
+            & (bary_v >= 0.0)
+            & (bary_u + bary_v <= 1.0)
+            & (distance > epsilon)
+            & (distance < target_distance - epsilon)
+        )
+        if np.any(hits):
+            nearest = float(np.min(distance[hits]))
+            visibility[row] = 0.0
+            hit_depth[row] = np.clip(nearest / target_distance, 0.0, 1.0)
+    return visibility, hit_depth
+
+
+def encode_candidate(
+    scene: Scene,
+    target_id: str,
+    pose: CameraPose,
+    *,
+    part_center: Array | None = None,
+    part_radius: float | None = None,
+) -> Array:
+    """Encode a pose together with cheap candidate-conditioned visibility evidence.
+
+    The first twelve values preserve the continuous forward/up pose contract.
+    The remaining values are view-dependent: target-relative directions, apparent
+    extent, and a fixed nine-ray depth/visibility pattern. No oracle score enters
+    this encoding.
+    """
+    vertices = scene.mesh.vertices
+    center = vertices.mean(axis=0) if part_center is None else np.asarray(part_center, np.float64)
+    radius = (
+        max(float(np.linalg.norm(vertices - center, axis=1).max()), 1.0e-6)
+        if part_radius is None
+        else max(float(part_radius), 1.0e-6)
+    )
+    feature_center, axis, tangent, bitangent, points = _canonical_feature_frame(scene, target_id)
+    base = encode_camera_pose(pose, part_center=center, part_radius=radius)
+    camera_from_feature = unit(pose.position - feature_center, name="feature-to-camera direction")
+    local_direction = np.asarray(
+        (
+            np.dot(camera_from_feature, tangent),
+            np.dot(camera_from_feature, bitangent),
+            np.dot(camera_from_feature, axis),
+        ),
+        np.float32,
+    )
+    axis_in_camera = np.asarray(
+        (np.dot(axis, pose.right), np.dot(axis, pose.true_up), np.dot(axis, pose.forward)),
+        np.float32,
+    )
+    distance = max(float(np.linalg.norm(pose.position - feature_center)), 1.0e-6)
+    feature_extent = max(float(np.linalg.norm(points - feature_center, axis=1).max()), radius * 1.0e-6)
+    apparent_scale = feature_extent / (distance * np.tan(np.deg2rad(pose.vertical_fov_deg) * 0.5))
+    distance_scale = np.asarray((np.log(distance / radius), np.log1p(apparent_scale)), np.float32)
+
+    projection = project_points(points, pose)
+    front = projection.depth > 0.0
+    if np.any(front):
+        ndc = projection.ndc[front]
+        ndc_center = np.clip(ndc.mean(axis=0), -4.0, 4.0)
+        ndc_span = np.clip(np.ptp(ndc, axis=0), 0.0, 8.0) / 4.0
+        in_frame = np.mean(np.all(np.abs(ndc) <= 1.0, axis=1))
+    else:
+        ndc_center = np.zeros(2, np.float64)
+        ndc_span = np.zeros(2, np.float64)
+        in_frame = 0.0
+    projection_features = np.asarray(
+        (*ndc_center, *ndc_span, in_frame, np.mean(front)),
+        np.float32,
+    )
+
+    ray_targets = _ray_pattern_points(feature_center, tangent, bitangent, points)
+    visibility, hit_depth = _ray_visibility_pattern(
+        scene,
+        target_id,
+        pose.position,
+        ray_targets,
+        part_radius=radius,
+    )
+    ray_summary = np.asarray(
+        (
+            visibility.mean(),
+            hit_depth.mean(),
+            hit_depth.min(),
+            hit_depth.std(),
+        ),
+        np.float32,
+    )
+    encoded = np.concatenate(
+        (
+            base,
+            local_direction,
+            axis_in_camera,
+            distance_scale,
+            projection_features,
+            visibility,
+            hit_depth,
+            ray_summary,
+        )
+    ).astype(np.float32)
+    if encoded.shape != (48,) or not np.isfinite(encoded).all():
+        raise RuntimeError("candidate encoding contract produced an invalid vector")
+    return encoded
 
 
 @dataclass(frozen=True)

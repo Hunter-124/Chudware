@@ -42,6 +42,19 @@ def best_of_n_random(batch: ViewpointBatch, n: int = 8) -> Array:
     return result
 
 
+def random_from_n(batch: ViewpointBatch, n: int, *, seed: int = 1729) -> Array:
+    """Choose one offered pose uniformly from each seeded prefix of length N."""
+    if n <= 0:
+        raise ValueError("n must be positive")
+    rng = np.random.default_rng(np.random.SeedSequence((seed, n, 0xA11CE)))
+    result = np.empty(len(batch.part_ids), np.int64)
+    for row in range(len(batch.part_ids)):
+        valid = np.flatnonzero(batch.candidate_mask[row])
+        offered = valid[: min(n, len(valid))]
+        result[row] = offered[int(rng.integers(len(offered)))]
+    return result
+
+
 def greedy_geometric(batch: ViewpointBatch) -> Array:
     """Single-step hand-engineered aim/alignment/scale proxy, with no labels."""
     result = np.empty(len(batch.part_ids), np.int64)
@@ -73,6 +86,18 @@ def random_search_baselines(
     if tuple(sorted(set(budgets))) != budgets:
         raise ValueError("random-search budgets must be unique and increasing")
     return {n: best_of_n_random(batch, n=n) for n in budgets}
+
+
+def random_choice_baselines(
+    batch: ViewpointBatch,
+    budgets: tuple[int, ...] = RANDOM_RENDER_BUDGETS,
+    *,
+    seed: int = 1729,
+) -> dict[int, Array]:
+    """Return deterministic uniform choices from each nested candidate prefix."""
+    if tuple(sorted(set(budgets))) != budgets:
+        raise ValueError("random-choice budgets must be unique and increasing")
+    return {n: random_from_n(batch, n, seed=seed) for n in budgets}
 
 
 

@@ -7308,3 +7308,35 @@ exhaust the space, and a history-blind scalar. Both are fixed; the corrected 256
 is in flight.
 
 Gates: `pytest services/viewpoint` 50 passed, frozen oracle/geometry/sampling/parts/dataset untouched.
+
+## 2026-08-08 — Viewpoint oracle gets a GPU backend (and the GPU was never being used)
+
+Root cause of the CPU load first: the installed Torch was `2.12.1+cpu`, a CPU-only build, so
+`torch.cuda.is_available()` was False and every training run in this effort — including a 63-minute
+sweep — ran on the CPU while the RTX 3080 Ti sat idle. Replaced with `2.12.1+cu129`; verified
+`cuda True`, 20x 4096^3 matmul in 0.18 s. Two environment traps worth recording: `/tmp` is a 16 GB
+tmpfs near its quota, which broke both a GCC assembly step and the pip install ("Disk quota
+exceeded") until `TMPDIR` was pointed at `~/.local/tmp` and `core/build-linux/tmp`; and this box has
+6 cores / 12 threads, not 6 threads, which had led to an over-tight worker cap.
+
+CUDA alone was not the answer, though, because Torch only accelerated the model fit — the cheap part.
+A profile of the real cost settled it: ray-triangle intersection nested inside occlusion and ambiguity
+dominated (`_ray_hits` 265,400 calls / 71 %, `_ambiguity` 77.7 %, `_occlusion_fraction` 72.3 % of a
+59.8 s workload), while part generation was 0.6 %. So `services/viewpoint/accel/**` batches that
+predicate across candidates and scene features on Torch, dispatching CUDA → Torch-CPU → the frozen
+NumPy path via `evaluate_many(scene, requests, device="auto")`.
+
+Parity was the acceptance bar, not speed, because the oracle IS the benchmark. Across 144 comparisons
+including grazing rays, zero-area projections, fully occluded features and NaN misses, the maximum
+absolute error on all seven components is **exactly 0.0**, with zero ambiguous-ID mismatches, against a
+stated 5e-12 tolerance. The frozen modules were not touched and no hook into `oracle.py` was needed.
+
+Throughput: 21.4 labels/s NumPy-CPU → 65.7 Torch-CPU → **187.1 CUDA**, an 8.7x end-to-end gain; a
+5000-part corpus projects to 233 s instead of 1888 s. Honest remainder, and it is not small: part
+generation, camera sampling, feature extraction, projection, clipping, hull construction,
+visual-signature comparison, label assembly and serialization are all still CPU-bound. The dominant
+predicate moved; the pipeline around it did not.
+
+Gates: `pytest services/viewpoint` 55 passed; 51 passed / 4 skipped with Torch unimportable, so the
+optional-dependency contract holds. Observed 22 % GPU utilisation and 5.6 GB VRAM during the suite,
+which is the load leaving the CPU.

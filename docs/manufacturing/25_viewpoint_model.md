@@ -50,9 +50,9 @@ python3 -X utf8 -m training.viewpoint.information \
 The full-information expansion keeps the original 50 × 6 × 32 training rows unchanged and adds one
 8-candidate target row per new part. Validation and locked test remain 11 × 6 × 32 at 320 px. The
 limited-information run uses one initial observation and eight candidates per training part; the
-validation and locked test sets have six targets per part and 16 candidates at 96 px. The sequential
-benchmark uses eight candidates. Its K value counts **additional** renders after the same common
-fixed calibrated initial camera for both methods.
+validation and locked test sets have six targets per part and 16 candidates at 96 px. The original
+sequential benchmark used eight candidates; the corrected curve uses 256. K counts **additional**
+renders after the same common fixed calibrated initial camera for both methods.
 
 Every interval below is a 95% percentile interval from 2,000 seeded resamples of whole parts. The
 oracle remains the maximum measured analytic quality over the entire relevant candidate pool; it is

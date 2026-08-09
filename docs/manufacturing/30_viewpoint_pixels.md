@@ -62,9 +62,14 @@ clean-shot material, world light, and background. A 12-part / 192-view scalar-ve
 check found 192/192 byte-identical RGB frames, minimum foreground IoU 1.0, maximum RGB MAE
 0.0, and maximum absolute depth error 0.0.
 
-`compare_with_engine` split a generated mechanical part into connected triangle shells,
-imported every shell into the real engine, and rendered the same pose through
-`RenderRequest`/`doc_render_view`. The post-change 160 x 120 agreement result was:
+`compare_with_engine` splits a generated mechanical part into connected triangle shells,
+imports every shell into the real engine, and renders the same pose through
+`RenderRequest`/`doc_render_view`. The native probe runs in an exec-created worker process:
+five reproducible in-suite crashes placed the fault in OCCT's TBB parallel mesher
+(`NCollection_IncAllocator` through `BRepMesh_FaceDiscret`) after CUDA/TBB initialization.
+Process isolation keeps that native allocator state out of the Torch-loaded test process;
+a worker signal is reported as a mandatory parity failure rather than killing pytest. The
+post-change 160 x 120 agreement result was:
 
 ```text
 part_id:                       mechanical_000006c1_0000
@@ -188,13 +193,16 @@ python3 -X utf8 -m pytest \
 .                                                                        [100%]
 1 passed in 0.45s
 
-python3 -X utf8 -m pytest services/viewpoint -q
+OMP_NUM_THREADS=6 MKL_NUM_THREADS=6 nice -n 15 \
+  python3 -X utf8 -m pytest services/viewpoint -q
 .............................................................            [100%]
-61 passed in 18.20s
+61 passed in 18.62s
+# Two immediate repetitions: 61 passed in 18.35s; 61 passed in 17.53s.
 
-PYTHONPATH=scratch/no-torch python3 -X utf8 -m pytest services/viewpoint -q
+OMP_NUM_THREADS=6 MKL_NUM_THREADS=6 nice -n 15 \
+  env PYTHONPATH=scratch/no-torch python3 -X utf8 -m pytest services/viewpoint -q
 ssss.........................................................            [100%]
-57 passed, 4 skipped in 11.65s
+57 passed, 4 skipped in 12.02s
 ```
 
 ## Honest remaining uncertainty

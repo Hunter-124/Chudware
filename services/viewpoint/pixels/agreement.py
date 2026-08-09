@@ -1,10 +1,12 @@
-"""One-shot proof that the in-process pixels agree with the exact engine renderer."""
+"""Subprocess-isolated proof that corpus pixels agree with the exact engine renderer."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 import ctypes
 import json
 from pathlib import Path
+import subprocess
+import sys
 from typing import Iterable
 
 import numpy as np
@@ -87,7 +89,7 @@ class _Engine:
         return value
 
 
-def compare_with_engine(
+def _compare_with_engine_in_process(
     *,
     part_index: int = 0,
     seed: int = 1729,
@@ -95,12 +97,7 @@ def compare_with_engine(
     library: Path = Path("core/build-linux/bin/libchudware.so"),
     output_dir: Path = Path("scratch/viewpoint-pixels/agreement"),
 ) -> RendererAgreement:
-    """Import one benchmark mesh into the real engine and compare exact-camera pixels.
-
-    Foreground IoU is the primary pixel-level geometry metric.  RGB MAE over the union is
-    reported separately because OCCT re-tessellates imported shells and can assign face normals
-    differently even when projected coverage agrees.
-    """
+    """Run the native engine probe inside the dedicated agreement worker process."""
     library = library.resolve()
     if not library.exists():
         raise FileNotFoundError(f"engine library not found: {library}")
@@ -164,6 +161,58 @@ def compare_with_engine(
         union,
         engine_path,
     )
+
+
+def compare_with_engine(
+    *,
+    part_index: int = 0,
+    seed: int = 1729,
+    resolution: tuple[int, int] = (160, 120),
+    library: Path = Path("core/build-linux/bin/libchudware.so"),
+    output_dir: Path = Path("scratch/viewpoint-pixels/agreement"),
+) -> RendererAgreement:
+    """Run engine parity in a clean process, isolated from CUDA and native thread pools.
+
+    OCCT's parallel mesher is not safe after CUDA Torch/TBB have initialized in the same
+    Python process.  A worker crash becomes an ordinary test failure with captured stderr
+    instead of terminating the entire pytest process.
+    """
+    library = library.resolve()
+    if not library.exists():
+        raise FileNotFoundError(f"engine library not found: {library}")
+    payload = {
+        "part_index": int(part_index),
+        "seed": int(seed),
+        "resolution": [int(resolution[0]), int(resolution[1])],
+        "library": str(library),
+        "output_dir": str(output_dir.resolve()),
+    }
+    completed = subprocess.run(
+        [sys.executable, "-X", "utf8", "-m", "services.viewpoint.pixels.agreement_worker"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        timeout=180.0,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "no worker diagnostics"
+        raise RuntimeError(f"engine agreement worker failed with exit {completed.returncode}: {detail}")
+    try:
+        value = json.loads(completed.stdout)
+        return RendererAgreement(
+            part_id=str(value["part_id"]),
+            candidate_index=int(value["candidate_index"]),
+            resolution=(int(value["resolution"][0]), int(value["resolution"][1])),
+            foreground_iou=float(value["foreground_iou"]),
+            rgb_mae_union=float(value["rgb_mae_union"]),
+            matching_foreground_pixels=int(value["matching_foreground_pixels"]),
+            union_foreground_pixels=int(value["union_foreground_pixels"]),
+            engine_path=Path(value["engine_path"]),
+            rasterizer_version=str(value["rasterizer_version"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"engine agreement worker returned invalid JSON: {completed.stdout!r}") from exc
 
 
 __all__ = ["RendererAgreement", "compare_with_engine"]

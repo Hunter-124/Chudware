@@ -7480,3 +7480,27 @@ generator/renderer/oracle versions, so none of the 2.2 GB is committed.
 Gates: `pytest services/viewpoint` green, and green with Torch unimportable. The retrain on the full
 3,000-row training set is the actual test of whether learned pixels beat .584 visibility correlation
 and the .300661 hand-computed depth baseline; that result is still pending and is not claimed here.
+
+## 2026-08-08 — OCCT's parallel mesher and CUDA cannot share a process (real segfault, worth remembering)
+
+My verification run of the viewpoint suite segfaulted reproducibly at
+`services/viewpoint/pixels/test_pixels.py::test_fast_rasterizer_matches_real_engine_pixels` — three
+runs in a row, unaffected by `-p no:cacheprovider`, in a slice that had been reported green. The
+coredump backtrace (PID 980403 plus four siblings) lands in OCCT's parallel mesher allocator:
+`NCollection_IncAllocator::IBlock` → `AllocateOptimal` → `BRepMesh_VertexTool::Add` →
+`BRepMesh_BaseMeshAlgo::Perform` → `BRepMesh_FaceDiscret::process` under `OSD_Parallel`/TBB, in a
+process that simultaneously held live `libcuda` threads.
+
+So this is native allocator corruption when OCCT's TBB-parallel tessellation runs inside a process that
+has also initialised CUDA — not Python logic, not the manifest, and not specific to this test. Anything
+in this repo that tessellates through `libchudware` in the same process as CUDA Torch is exposed to it,
+which is new territory now that CUDA is actually in use.
+
+The fix keeps the parity check mandatory rather than skipping the inconvenient test: `compare_with_engine`
+now execs a clean `agreement_worker` subprocess, and a nonzero exit or fatal signal surfaces as a normal
+`RuntimeError` carrying the child's stderr. Engine-renderer parity is the single property that makes the
+pixel corpus trustworthy, so deleting or skipping it was not an option.
+
+Verified independently from a cold shell, three consecutive runs: `pytest services/viewpoint` 61 passed
+(17.45 s / 17.32 s / 17.49 s), and 57 passed / 4 skipped with Torch unimportable. The isolated engine
+agreement test passes in 1.03 s.

@@ -3,55 +3,20 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 import numpy as np
 
+from .corpus_cache import CachedCorpus, corpus_inputs, invalidate, load_or_build
 from .data import ViewpointBatch, locked_expansion_part_indices
 from .model import NumpyViewpointPolicy
+from .runtime import DEFAULT_CACHE_DIR, default_device, generation_workers, report_device, resolve_device
 from .synthetic import CorpusConfig, GENERATOR_VERSION, generate_oracle_corpus_for_indices
 from .train import fit_policy
 
 DEFAULT_LADDER = (50, 200, 1000, 5000)
 
 
-def _save_batch(path: Path, batch: ViewpointBatch) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        path,
-        part_ids=np.asarray(batch.part_ids),
-        task=batch.task,
-        geometry=batch.geometry,
-        geometry_mask=batch.geometry_mask,
-        feature_mask=batch.feature_mask,
-        candidates=batch.candidates,
-        candidate_mask=batch.candidate_mask,
-        components=batch.components,
-        difficulties=np.asarray(batch.difficulties),
-    )
-
-
-def _load_batch(path: Path) -> ViewpointBatch:
-    with np.load(path, allow_pickle=False) as data:
-        return ViewpointBatch(
-            part_ids=tuple(str(value) for value in data["part_ids"]),
-            task=data["task"],
-            geometry=data["geometry"],
-            geometry_mask=data["geometry_mask"],
-            feature_mask=data["feature_mask"],
-            candidates=data["candidates"],
-            candidate_mask=data["candidate_mask"],
-            components=data["components"],
-            difficulties=tuple(str(value) for value in data["difficulties"]),
-        ).validate()
-
-
-def _cached_batch(path: Path, build: Any) -> ViewpointBatch:
-    if path.exists():
-        return _load_batch(path)
-    batch = build()
-    _save_batch(path, batch)
-    return batch
 
 
 def _pad_candidates(batch: ViewpointBatch, count: int) -> ViewpointBatch:
@@ -142,35 +107,41 @@ def run_scaling_ladder(
     seed: int = 1729,
     epochs: int = 300,
     workers: int = 6,
-    device: str = "cpu",
-    cache_dir: Path = Path("scratch/viewpoint-scale"),
+    device: str | None = None,
+    fit_device: str | None = "cpu",
+    cache_dir: Path = DEFAULT_CACHE_DIR,
     selected_weight_decay: float | None = None,
     output_weights: Path | None = None,
 ) -> dict[str, object]:
     if tuple(sorted(set(ladder))) != ladder or ladder[0] != 50:
         raise ValueError("the ladder must be unique, increasing, and begin at the locked 50-part baseline")
+    actual_device = resolve_device(device)
+    actual_workers = generation_workers(actual_device, workers)
+    actual_fit_device = resolve_device(fit_device)
+    fit_backend = "torch-cuda" if actual_fit_device.startswith("cuda") else "torch-cpu"
     train_indices, validation_indices, test_indices = locked_expansion_part_indices(ladder[-1], seed=seed)
     base_indices = train_indices[:50]
     extra_indices = train_indices[50:]
     base_config = CorpusConfig(parts=50, examples_per_part=6, candidates=32, seed=seed, image_size=(320, 320))
     extra_config = CorpusConfig(parts=max(3, len(extra_indices)), examples_per_part=1, candidates=8, seed=seed, image_size=(320, 320))
     holdout_config = CorpusConfig(parts=11, examples_per_part=6, candidates=32, seed=seed, image_size=(320, 320))
-    base = _cached_batch(
-        cache_dir / "full_base_train_50x6x32.npz",
-        lambda: generate_oracle_corpus_for_indices(base_config, base_indices, workers=workers),
-    )
-    extras = _cached_batch(
-        cache_dir / f"full_extra_train_{len(extra_indices)}x1x8.npz",
-        lambda: generate_oracle_corpus_for_indices(extra_config, extra_indices, workers=workers),
-    ) if extra_indices else None
-    validation = _cached_batch(
-        cache_dir / "full_locked_validation_11x6x32.npz",
-        lambda: generate_oracle_corpus_for_indices(holdout_config, validation_indices, workers=workers),
-    )
-    test = _cached_batch(
-        cache_dir / "full_locked_test_11x6x32.npz",
-        lambda: generate_oracle_corpus_for_indices(holdout_config, test_indices, workers=workers),
-    )
+    cached: list[CachedCorpus] = []
+
+    def cached_batch(config: CorpusConfig, indices: tuple[int, ...]) -> ViewpointBatch:
+        result = load_or_build(
+            corpus_inputs("full", config, part_indices=indices),
+            lambda: generate_oracle_corpus_for_indices(
+                config, indices, workers=actual_workers, device=actual_device,
+            ),
+            cache_dir=cache_dir,
+        )
+        cached.append(result)
+        return result.batch
+
+    base = cached_batch(base_config, base_indices)
+    extras = cached_batch(extra_config, extra_indices) if extra_indices else None
+    validation = cached_batch(holdout_config, validation_indices)
+    test = cached_batch(holdout_config, test_indices)
     all_train = base if extras is None else _concatenate_same_shape((base, _pad_candidates(extras, 32)))
 
     regularization_trials: list[dict[str, object]] = []
@@ -180,7 +151,7 @@ def run_scaling_ladder(
     for decay in (0.0, 1.0e-5, 1.0e-4, 1.0e-3):
         _, metrics = _fit_once(
             trial_batch, validation,
-            seed=seed, epochs=epochs, weight_decay=decay, device=device,
+            seed=seed, epochs=epochs, weight_decay=decay, device=actual_fit_device,
         )
         regularization_trials.append({"weight_decay": decay, **metrics})
     if selected_weight_decay is None:
@@ -194,7 +165,7 @@ def run_scaling_ladder(
         train = _subset_parts(all_train, _part_ids_for_indices(indices, seed))
         policy, metrics = _fit_once(
             train, validation,
-            seed=seed, epochs=epochs, weight_decay=selected_weight_decay, device=device,
+            seed=seed, epochs=epochs, weight_decay=selected_weight_decay, device=actual_fit_device,
         )
         curve.append({
             "train_parts": part_count,
@@ -247,7 +218,18 @@ def run_scaling_ladder(
             "image_size": [320, 320],
         },
         "epochs": epochs,
-        "device": device,
+        "device": actual_device,
+        "fit_backend": fit_backend,
+        "fit_results_comparable_to_reference": fit_backend == "torch-cpu",
+        "workers": actual_workers,
+        "corpus_cache": [
+            {
+                "status": "hit" if item.hit else "miss",
+                "key": item.key,
+                "path": str(item.path),
+            }
+            for item in cached
+        ],
         "regularization_trials_at_parts": trial_parts,
         "regularization_trials": regularization_trials,
         "selected_weight_decay": selected_weight_decay,
@@ -272,22 +254,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--workers", type=int, default=6)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--cache-dir", type=Path, default=Path("scratch/viewpoint-scale"))
+    parser.add_argument("--device", default=default_device(), help="actual compute device; defaults to CUDA when available")
+    parser.add_argument(
+        "--fit-device", default="cpu",
+        help="optimizer device; CPU is the published reference, CUDA is exploratory",
+    )
+    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument("--invalidate-cache", action="store_true")
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--output-weights", type=Path)
     parser.add_argument("--output-report", type=Path)
     args = parser.parse_args(argv)
+    if args.invalidate_cache:
+        invalidate(args.cache_dir)
     report = run_scaling_ladder(
         ladder=tuple(args.ladder),
         seed=args.seed,
         epochs=args.epochs,
         workers=args.workers,
         device=args.device,
+        fit_device=args.fit_device,
         cache_dir=args.cache_dir,
         selected_weight_decay=args.weight_decay,
         output_weights=args.output_weights,
     )
+    report_device(str(report["device"]), str(report["fit_backend"]))
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output_report is not None:
         args.output_report.parent.mkdir(parents=True, exist_ok=True)

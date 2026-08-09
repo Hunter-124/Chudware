@@ -5,6 +5,7 @@ from typing import Sequence
 
 import numpy as np
 
+from services.viewpoint.accel import evaluate_many
 from services.viewpoint.geometry import CameraPose, Scene, unit
 from services.viewpoint.observation import (
     CorruptionConfig,
@@ -17,12 +18,12 @@ from services.viewpoint.observation import (
     WorkspaceBounds,
     observe,
 )
-from services.viewpoint.oracle import evaluate
 from services.viewpoint.parts import GENERATOR_VERSION, generate_part_examples
 from services.viewpoint.sampling import generate_benchmark_candidate_set
 
 from .data import ViewpointBatch, encode_camera_pose, encode_task
 from .model import COMPONENTS
+from .runtime import generation_workers, oracle_device, resolve_device
 
 Array = np.ndarray
 LIMITED_INFORMATION_LEVELS: tuple[InformationLevel, ...] = (
@@ -311,8 +312,8 @@ def _observation_seed(seed: int, part_index: int, example_index: int) -> int:
 
 
 
-def _limited_part_rows(payload: tuple[LimitedCorpusConfig, int]) -> list[tuple[object, ...]]:
-    config, part_index = payload
+def _limited_part_rows(payload: tuple[LimitedCorpusConfig, int, str]) -> list[tuple[object, ...]]:
+    config, part_index, device = payload
     rows: list[tuple[object, ...]] = []
     examples = generate_part_examples(part_index, config.examples_per_part, seed=config.seed)
     for example_index, example in enumerate(examples):
@@ -334,7 +335,11 @@ def _limited_part_rows(payload: tuple[LimitedCorpusConfig, int]) -> list[tuple[o
             image_size=config.image_size,
         )
         geometry, geometry_mask, feature_mask = encode_observation(observation)
-        labels = [evaluate(example.scene, example.target_id, pose).quality_components() for pose in poses]
+        labels = evaluate_many(
+            example.scene,
+            tuple((example.target_id, pose) for pose in poses),
+            device=device,
+        )
         rows.append((
             example.part_id,
             example.difficulty,
@@ -343,17 +348,26 @@ def _limited_part_rows(payload: tuple[LimitedCorpusConfig, int]) -> list[tuple[o
             geometry_mask,
             feature_mask,
             encode_observation_candidates(observation, poses),
-            np.asarray([[label[name] for name in COMPONENTS] for label in labels], np.float32),
+            np.asarray([
+                [label.quality_components()[name] for name in COMPONENTS]
+                for label in labels
+            ], np.float32),
         ))
     return rows
 
 
-def generate_limited_corpus(config: LimitedCorpusConfig, *, workers: int = 1) -> ViewpointBatch:
+def generate_limited_corpus(
+    config: LimitedCorpusConfig,
+    *,
+    workers: int = 6,
+    device: str | None = None,
+) -> ViewpointBatch:
     """Generate oracle labels while exposing only camera observations to the policy."""
     config.validate()
-    if workers <= 0:
-        raise ValueError("workers must be positive")
-    payloads = [(config, int(index)) for index in config.part_indices]
+    actual_device = resolve_device(device)
+    workers = generation_workers(actual_device, workers)
+    accelerator_device = oracle_device(actual_device)
+    payloads = [(config, int(index), accelerator_device) for index in config.part_indices]
     if workers == 1:
         grouped = map(_limited_part_rows, payloads)
         rows = [row for group in grouped for row in group]

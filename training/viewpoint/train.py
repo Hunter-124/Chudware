@@ -11,7 +11,9 @@ from .baselines import RANDOM_RENDER_BUDGETS, all_baselines
 from .data import ViewpointBatch, split_by_part
 from .metrics import deployed_evaluation_report, evaluation_report
 from .model import NumpyViewpointPolicy, weighted_geometric_mean
-from .synthetic import GENERATOR_VERSION, CorpusConfig, generate_oracle_corpus
+from .corpus_cache import corpus_inputs, invalidate, load_or_build
+from .runtime import DEFAULT_CACHE_DIR, default_device, generation_workers, report_device, resolve_device
+from .synthetic import GENERATOR_VERSION, CorpusConfig, generate_oracle_corpus_for_indices
 from .torch_model import build_torch_policy
 
 DEFAULT_SEED = 1729
@@ -51,21 +53,23 @@ def fit_policy(
     learning_rate: float = 2.0e-3,
     weight_decay: float = 1.0e-5,
     rank_temperature: float = 0.10,
-    device: str = "cpu",
+    device: str | None = "cpu",
 ) -> tuple[NumpyViewpointPolicy, dict[str, float | int]]:
     """Fit candidate ordering with a consequence-weighted pairwise RankNet loss."""
+    device = resolve_device(device)
     try:
         import torch
     except ImportError as exc:
         raise RuntimeError("Stage-1 training requires optional Torch; NumPy inference does not") from exc
     if epochs <= 0 or learning_rate <= 0 or rank_temperature <= 0:
         raise ValueError("epochs, learning_rate, and rank_temperature must be positive")
+    torch.use_deterministic_algorithms(True)
     torch.manual_seed(seed)
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"requested {device!r}, but Torch reports no CUDA device")
     actual_device = torch.device(device)
     if actual_device.type == "cpu":
-        torch.set_num_threads(max(1, min(4, torch.get_num_threads())))
+        torch.set_num_threads(max(1, min(6, torch.get_num_threads())))
     model = build_torch_policy(seed=seed).to(actual_device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     inputs = _torch_inputs(train, torch, actual_device)
@@ -132,12 +136,29 @@ def run_stage1(
     epochs: int = 500,
     seed: int = DEFAULT_SEED,
     output_weights: str | Path | None = None,
-    device: str = "cpu",
+    device: str | None = None,
+    fit_device: str | None = "cpu",
+    workers: int = 6,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
     bootstrap_samples: int = 2000,
 ) -> dict[str, object]:
-    batch = generate_oracle_corpus(corpus)
+    actual_device = resolve_device(device)
+    actual_fit_device = resolve_device(fit_device)
+    fit_backend = "torch-cuda" if actual_fit_device.startswith("cuda") else "torch-cpu"
+    actual_workers = generation_workers(actual_device, workers)
+    part_indices = tuple(range(corpus.parts))
+    cached = load_or_build(
+        corpus_inputs("full", corpus, part_indices=part_indices),
+        lambda: generate_oracle_corpus_for_indices(
+            corpus, part_indices, workers=actual_workers, device=actual_device,
+        ),
+        cache_dir=cache_dir,
+    )
+    batch = cached.batch
     train, validation, test = split_by_part(batch, seed=seed)
-    policy, training = fit_policy(train, validation, seed=seed, epochs=epochs, device=device)
+    policy, training = fit_policy(
+        train, validation, seed=seed, epochs=epochs, device=actual_fit_device,
+    )
     predicted_scores = policy.forward(**test.model_inputs())
     selected = np.argmax(predicted_scores, axis=1)
     baselines = all_baselines(test, random_budgets=RANDOM_RENDER_BUDGETS)
@@ -175,7 +196,15 @@ def run_stage1(
             "candidates": corpus.candidates,
         },
         "training": training,
-        "device": device,
+        "device": actual_device,
+        "fit_backend": fit_backend,
+        "fit_results_comparable_to_reference": fit_backend == "torch-cpu",
+        "workers": actual_workers,
+        "corpus_cache": {
+            "status": "hit" if cached.hit else "miss",
+            "key": cached.key,
+            "path": str(cached.path),
+        },
     })
     if output_weights is not None:
         policy.weights.save(output_weights, policy.spec)
@@ -191,11 +220,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--image-size", type=int, default=320, help="square oracle image size")
-    parser.add_argument("--device", default="cpu", help="Torch optimizer device; oracle generation remains CPU")
+    parser.add_argument("--device", default=default_device(), help="actual compute device; defaults to CUDA when available")
+    parser.add_argument(
+        "--fit-device", default="cpu",
+        help="optimizer device; CPU is the published reference, CUDA is exploratory",
+    )
+    parser.add_argument("--workers", type=int, default=6, help="corpus workers (capped at 6)")
+    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument("--invalidate-cache", action="store_true")
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
     parser.add_argument("--output-weights", type=Path)
     parser.add_argument("--output-report", type=Path)
     args = parser.parse_args(argv)
+    if args.invalidate_cache:
+        invalidate(args.cache_dir)
     report = run_stage1(
         corpus=CorpusConfig(
             parts=args.parts, examples_per_part=args.examples_per_part,
@@ -203,8 +241,10 @@ def main(argv: list[str] | None = None) -> int:
             image_size=(args.image_size, args.image_size),
         ),
         epochs=args.epochs, seed=args.seed, output_weights=args.output_weights, device=args.device,
+        fit_device=args.fit_device, workers=args.workers, cache_dir=args.cache_dir,
         bootstrap_samples=args.bootstrap_samples,
     )
+    report_device(str(report["device"]), str(report["fit_backend"]))
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output_report is not None:
         args.output_report.write_text(rendered + "\n", encoding="utf-8")

@@ -7340,3 +7340,38 @@ predicate moved; the pipeline around it did not.
 Gates: `pytest services/viewpoint` 55 passed; 51 passed / 4 skipped with Torch unimportable, so the
 optional-dependency contract holds. Observed 22 % GPU utilisation and 5.6 GB VRAM during the suite,
 which is the load leaving the CPU.
+
+## 2026-08-08 — Viewpoint sequential: corrected benchmark, and the two-bar verdict
+
+The corrected sequential run finished on CUDA — 66 examples, 11 locked parts, a 256-pose pool decoupled
+from K, K in {1,2,4,8}, 2,000 whole-part bootstraps, 401 s — and the earlier null is explained rather
+than repeated. Two stacked causes: the old 8-candidate pool (at K=4 random already sampled half of it;
+at K=8 every method exhausted it and trivially tied the oracle), and the history-blind
+`visibility_estimate` fixed in the previous entry. Both are documented in place so the artifact is
+visible instead of buried. Budget equality between policy and baseline was re-verified, and four fusion
+defect hypotheses were eliminated with measurements rather than argument.
+
+The verdict is now stated against two bars, neither allowed to bury the other.
+
+**(a) Product-relevant — same-information alternatives.** Best one-look depth policy .300661 against
+blind random .122591 (2.45x), fixed isometric .171608 (1.75x) and the hand-engineered greedy geometric
+heuristic .169855 (1.77x); whole-part deltas +.178070 [.102354, .254252], +.129053 [.020345, .236038],
++.130806 [.077625, .189148]. On the corrected 256-pose sequential benchmark every observation level
+beats matched random at K=2 with intervals excluding zero. The policy learns real deployable signal,
+and the earlier "does not earn its existence" line was measured against the wrong comparison.
+
+**(b) Student-versus-teacher — full-information oracle ceiling.** The same policy reaches only 47.1 %
+of .638062, regret .337401 [.280749, .396614]; validation regret is flat at .346/.344/.351 across
+200/1k/5k parts; every corrected sequential oracle-regret interval stays wholly positive; and
+sequential value is non-monotonic (best-next depth peaks .647 at K=4 then falls to .558 at K=8).
+
+So it earns continued product evaluation and does NOT earn product dependency or deployment. The
+binding constraint is named and measured: observation/perception information, not the policy or the
+history plumbing. Depth-level visibility correlates .584 with truth at one look and only .647 at the
+K=4 peak; depth-plus-prior is identical to depth; sparse points are effectively uninformative. More
+procedural parts cannot move it — that is what the flat scaling curve means. What can move it is a
+better observation representation: learned image/depth features, calibrated visibility uncertainty, or
+denser reliable returns, validated without oracle leakage.
+
+Gates: `pytest training/viewpoint services/viewpoint` 77 passed; 17 passed / 3 skipped with Torch
+unimportable.

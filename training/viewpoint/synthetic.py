@@ -5,12 +5,13 @@ from dataclasses import dataclass
 import numpy as np
 
 from services.viewpoint.geometry import Scene
-from services.viewpoint.oracle import evaluate
+from services.viewpoint.accel import evaluate_many
 from services.viewpoint.parts import GENERATOR_VERSION, PartExample, generate_part_examples
 from services.viewpoint.sampling import generate_benchmark_candidate_set
 
 from .data import FEATURE_KINDS, ViewpointBatch, encode_candidate, encode_task
 from .model import COMPONENTS
+from .runtime import generation_workers, oracle_device, resolve_device
 
 Array = np.ndarray
 
@@ -90,8 +91,8 @@ def _example_rows(config: CorpusConfig, part_indices: tuple[int, ...]) -> list[t
     return rows
 
 
-def _part_rows(payload: tuple[CorpusConfig, int]) -> list[tuple[object, ...]]:
-    config, part_index = payload
+def _part_rows(payload: tuple[CorpusConfig, int, str]) -> list[tuple[object, ...]]:
+    config, part_index, device = payload
     result: list[tuple[object, ...]] = []
     for _, example_index, example in _example_rows(config, (part_index,)):
         scene = example.scene
@@ -106,7 +107,11 @@ def _part_rows(payload: tuple[CorpusConfig, int]) -> list[tuple[object, ...]]:
             image_size=config.image_size,
         )
         geometry, target_mask = _geometry_tokens(scene, example.target_id)
-        labels = [evaluate(scene, example.target_id, pose).quality_components() for pose in poses]
+        labels = evaluate_many(
+            scene,
+            tuple((example.target_id, pose) for pose in poses),
+            device=device,
+        )
         result.append((
             example.part_id,
             example.difficulty,
@@ -124,7 +129,7 @@ def _part_rows(payload: tuple[CorpusConfig, int]) -> list[tuple[object, ...]]:
                 for pose in poses
             ]),
             np.asarray([
-                [label[name] for name in COMPONENTS]
+                [label.quality_components()[name] for name in COMPONENTS]
                 for label in labels
             ], np.float32),
         ))
@@ -135,7 +140,8 @@ def generate_oracle_corpus_for_indices(
     config: CorpusConfig,
     part_indices: tuple[int, ...],
     *,
-    workers: int = 1,
+    workers: int = 6,
+    device: str | None = None,
 ) -> ViewpointBatch:
     """Generate selected part identities, optionally in deterministic worker processes."""
     config.validate()
@@ -143,9 +149,10 @@ def generate_oracle_corpus_for_indices(
         raise ValueError("part_indices must contain non-negative values")
     if len(set(part_indices)) != len(part_indices):
         raise ValueError("part_indices must be unique")
-    if workers <= 0:
-        raise ValueError("workers must be positive")
-    payloads = [(config, int(index)) for index in part_indices]
+    actual_device = resolve_device(device)
+    workers = generation_workers(actual_device, workers)
+    accelerator_device = oracle_device(actual_device)
+    payloads = [(config, int(index), accelerator_device) for index in part_indices]
     if workers == 1:
         grouped_rows = map(_part_rows, payloads)
         rows = [row for group in grouped_rows for row in group]
@@ -177,14 +184,24 @@ def generate_oracle_corpus_for_indices(
     return batch.validate()
 
 
-def generate_oracle_corpus(config: CorpusConfig = CorpusConfig()) -> ViewpointBatch:
+def generate_oracle_corpus(
+    config: CorpusConfig = CorpusConfig(),
+    *,
+    workers: int = 6,
+    device: str | None = None,
+) -> ViewpointBatch:
     """Generate labels from occluding mechanical parts and the geometric oracle.
 
     All examples for one ``part_id`` share one generated scene. Candidate pools are
     generated once at their maximum render budget; best-of-N baselines consume nested
     prefixes without regenerating poses.
     """
-    return generate_oracle_corpus_for_indices(config, tuple(range(config.parts)))
+    return generate_oracle_corpus_for_indices(
+        config,
+        tuple(range(config.parts)),
+        workers=workers,
+        device=device,
+    )
 
 
 __all__ = [

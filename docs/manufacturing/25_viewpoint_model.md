@@ -6,25 +6,26 @@ The policy ranks a bounded camera candidate set for a feature/question pair. It 
 pose. That architectural decision remains correct: inspectability is multimodal, and ranking avoids
 averaging several good views into one bad pose.
 
-The evaluation question has changed. Comparing a learned policy with the analytic oracle while both
-receive exact CAD geometry is a student-versus-teacher check on the teacher's home turf. The oracle
-has the exact mesh, exact feature, exact occlusion geometry, and every candidate evaluation. It is
-cheap and unbeatable in that setting. That comparison is useful for debugging fit, but it is **not**
-the product claim.
+The result must be read against two bars side by side. Neither substitutes for the other:
 
-The product-relevant bar is:
+| bar | comparison | measured result | verdict |
+|---|---|---|---|
+| **(a) Product-relevant: alternatives at the same limited-information level** | Best one-look depth policy versus blind random, fixed isometric, and the hand-engineered greedy geometric heuristic | .300661 versus .122591 (2.45×), .171608 (1.75×), and .169855 (1.77×). Whole-part policy deltas are +.178070 [.102354, .254252], +.129053 [.020345, .236038], and +.130806 [.077625, .189148]. On the corrected 256-pose sequential benchmark, every observation level beats matched random at K=2; some later-budget wins remain significant. | The policy clearly learns useful deployable signal. The old “does not earn its existence” conclusion is not supported against the alternatives that actually exist in a workspace. |
+| **(b) Student-versus-teacher check: limited-information policy versus full-information oracle ceiling** | Same depth policy versus an oracle with the exact mesh, exact feature and occlusion geometry, and all candidate labels | .300661 versus .638062: only 47.1% of the ceiling, with regret .337401 [.280749, .396614]. At 200/1k/5k parts validation regret is .346391/.344456/.350980, and every corrected sequential oracle-regret interval remains wholly positive. | The teacher gap is still large, data scaling has saturated, and sequential gains do not close it. The oracle must not be weakened or leaked into observations. |
 
-1. how close a policy with camera-limited information gets to the unchanged full-information oracle;
-2. whether an adaptive K-look policy uses accumulated observations to beat a non-adaptive one-shot
-   search schedule at the same render budget; and
-3. eventually, whether selected views improve downstream task answers, for which the geometric
-   oracle cannot supply labels.
+**Verdict from this run:** the policy earns continued product evaluation against same-information
+alternatives, but it does **not** yet earn product dependency or deployment. The positive result is
+real—2.45× random, 1.75× fixed isometric, 1.77× greedy, plus matched-budget sequential wins in the
+large pool—and so are the limits: only ~47% of the oracle ceiling, wholly positive regret intervals,
+no gain from more procedural parts, and non-monotonic sequential value.
 
-**Verdict from this run: the policy does not yet earn its existence for the product setting.** It
-beats blind one-view random and usually beats fixed isometric, so it learns signal. It remains far
-from the full-information oracle, adding parts does not reduce limited-information validation regret,
-and at K=2 or K=4 no sequential policy beats one-shot random search with a whole-part confidence
-interval excluding zero. This is an honest negative result, not a reason to weaken the oracle.
+The binding constraint is observation/perception information, not a disconnected history input.
+Depth-level visibility correlates only .584 with truth in the one-look sensor audit; after the fusion
+fix, deliberately informative accumulated looks peak at only .647 by K=4, depth plus prior is
+identical to depth, and sparse points remain effectively uninformative. What can move the result is a
+better observation representation and fusion—learned image/depth features, calibrated visibility
+uncertainty, or denser reliable returns—validated without oracle leakage. More of the current
+procedural data cannot.
 
 ## Reproducible protocol
 
@@ -33,19 +34,36 @@ a split. The original 72-part split remains embedded exactly: 50 original traini
 validation parts, and the same 11 locked test parts. Procedural additions start at part index 72 and
 belong only to training.
 
-The two reported runs were:
+The two result-producing runs remain:
 
 ```bash
 python3 -X utf8 -m training.viewpoint.scale \
-  --ladder 50 200 1000 5000 --epochs 120 --workers 6 --device cpu \
+  --ladder 50 200 1000 5000 --epochs 120 \
   --output-weights training/viewpoint/full_information_scale_weights.npz \
   --output-report training/viewpoint/full_information_scale_report.json
 
 python3 -X utf8 -m training.viewpoint.information \
   --train-parts 5000 --part-ladder 200 1000 5000 --epochs 120 \
-  --weight-decay 0.001 --workers 6 --device cpu --bootstrap-samples 2000 \
+  --weight-decay 0.001 --bootstrap-samples 2000 \
   --output-report training/viewpoint/information_asymmetry_report.json
 ```
+
+`train`, `scale`, `information`, and `sequential` select `cuda` by default when optional Torch
+reports CUDA available; otherwise they select `cpu`. Each prints `DEVICE: <actual>` before its
+report, records the actual device in JSON, and rejects an unavailable explicit CUDA request rather
+than silently calling the run a GPU run. `--device cpu` is the reference-path override.
+
+Generated corpora are content-addressed under `scratch/viewpoint-cache/`. The address includes the
+complete generator configuration and part indices, including part count, seed, sampler, candidate
+count, mechanical-part generator version, oracle version, oracle dataset schema version, and cache
+schema version. Delete that disposable directory, or pass `--invalidate-cache` to `train`, `scale`,
+or `information`, to invalidate every cached corpus. A changed keyed input produces a different
+address instead of trusting a descriptive filename.
+
+The runtime sets `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `TMPDIR` only when
+the caller has not set them. It caps worker processes at six. CUDA corpus and sequential evaluation
+use one host process so they do not create competing CUDA contexts; that process batches all
+candidate oracle requests for a scene onto the GPU.
 
 The full-information expansion keeps the original 50 × 6 × 32 training rows unchanged and adds one
 8-candidate target row per new part. Validation and locked test remain 11 × 6 × 32 at 320 px. The
@@ -261,6 +279,44 @@ At K=4 the random schedule has already sampled half the pool. At K=8 every metho
 and mechanically equals its .536164 oracle. That endpoint proves accounting, not learning, and the
 small pool leaves too little selection problem to support a sequential-product verdict.
 
+### Corrected 256-candidate curve
+
+The corrected benchmark keeps all 66 locked examples (six targets on each of 11 parts), decouples
+the 256-pose candidate pool from K, and uses the fixed fusion. At K=8 each method samples only 3.125%
+of the pool rather than exhausting it. Oracle labels were generated by the CUDA-batched backend,
+which is numerically checked against the frozen NumPy oracle; policy inference remains NumPy CPU.
+
+```bash
+OMP_NUM_THREADS=6 MKL_NUM_THREADS=6 nice -n 15 \
+  python3 -X utf8 -m training.viewpoint.sequential \
+  --device cuda --workers 6 --candidates 256 --budgets 1 2 4 8 \
+  --bootstrap-samples 2000 \
+  --output-report scratch/viewpoint-sequential-256-full.json
+```
+
+| observation | K | adaptive policy | random best | policy−random, 95% whole-part CI | full oracle regret, 95% whole-part CI |
+|---|---:|---:|---:|---:|---:|
+| depth | 1 | .237287 | .119363 | +.117924 [+.032653, +.188934] | .578173 [.515018, .637063] |
+| depth | 2 | .315452 | .188829 | +.126624 [+.051561, +.199804] | .500008 [.446072, .565139] |
+| depth | 4 | .399364 | .345238 | +.054126 [-.055164, +.162596] | .416097 [.368915, .465193] |
+| depth | 8 | .483900 | .482026 | +.001873 [-.058695, +.074713] | .331561 [.275731, .387423] |
+| depth plus prior | 1 | .235221 | .119363 | +.115857 [+.047652, +.194021] | .580240 [.495448, .663707] |
+| depth plus prior | 2 | .323848 | .188829 | +.135019 [+.070306, +.196610] | .491613 [.439932, .541681] |
+| depth plus prior | 4 | .424271 | .345238 | +.079034 [-.014626, +.177093] | .391189 [.357442, .426317] |
+| depth plus prior | 8 | .524233 | .482026 | +.042207 [+.001921, +.084185] | .291227 [.251322, .335097] |
+| sparse points | 1 | .222488 | .119363 | +.103124 [+.005655, +.196992] | .592973 [.502025, .675015] |
+| sparse points | 2 | .349469 | .188829 | +.160640 [+.074726, +.256205] | .465992 [.388818, .554451] |
+| sparse points | 4 | .448018 | .345238 | +.102781 [+.010239, +.194934] | .367442 [.301074, .432456] |
+| sparse points | 8 | .520291 | .482026 | +.038265 [-.010803, +.085449] | .295169 [.242089, .349748] |
+
+The large-pool result overturns the blanket sequential null. All three policies beat matched random
+at K=2 with whole-part intervals excluding zero; depth plus prior still wins at K=8, and sparse
+points wins at K=4. The curve is not a monotonic policy success: depth loses significance by K=4,
+depth plus prior loses it at K=4 before a small K=8 win, and sparse loses it at K=8. The sequential
+policy can add value, but which observation helps at which budget is unstable and every oracle-regret
+interval is decisively positive. The finding belongs primarily to perception/fusion, not to missing
+history wiring.
+
 ## Model and objective
 
 The neural scorer is unchanged in kind. A task MLP embeds feature/question semantics. Geometry or
@@ -298,8 +354,10 @@ later pair mask excludes them. The NumPy path never imports Torch.
 - Collision-free camera motion, reachability, temporal smoothness, lighting, material appearance,
   real depth noise, and camera calibration drift are not in this benchmark.
 
-The next justified work is not another oracle concession. It is a representation experiment on
-training/validation only that makes accumulated observations change the ranking usefully, followed
-by a predeclared locked-test rerun, and then real-camera/answer-quality evaluation. Until either the
-limited-information regret closes materially or adaptive K-look selection beats matched one-shot
-search, the learned policy remains an informative research result rather than a product dependency.
+The next justified work is not another oracle concession or another part-count sweep. It is a
+training/validation-only representation and fusion experiment that raises accumulated observation
+fidelity, followed by a predeclared locked-test rerun and then real-camera answer-quality evaluation.
+Adaptive K-look selection now beats matched one-shot search at several budgets, but the gains are
+non-monotonic and limited-information regret remains large. Until those gains are stable and improve
+the downstream task, the learned policy remains an informative research result rather than a product
+dependency.

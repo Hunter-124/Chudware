@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-pytest.importorskip("torch", reason="optional Torch training dependency is not installed", exc_type=ImportError)
+torch = pytest.importorskip("torch", reason="optional Torch training dependency is not installed", exc_type=ImportError)
 
 from training.viewpoint.data import ViewpointBatch, split_by_part
 from training.viewpoint.model import ModelSpec, PolicyWeights
@@ -47,3 +47,19 @@ def test_pairwise_training_keeps_padded_candidate_gradients_finite():
     model, report = fit_policy(train, validation, seed=79, epochs=3)
     assert np.isfinite(report["loss"])
     assert all(np.isfinite(value).all() for value in model.weights.arrays().values())
+
+def test_cuda_fit_repeats_bit_identically_at_fixed_seed():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    corpus = generate_oracle_corpus(
+        CorpusConfig(parts=6, examples_per_part=1, candidates=4, seed=83, image_size=(64, 64)),
+        device="cpu",
+    )
+    train, validation, _ = split_by_part(
+        corpus, seed=83, train_fraction=0.5, validation_fraction=0.2,
+    )
+    first, first_report = fit_policy(train, validation, seed=83, epochs=3, device="cuda")
+    second, second_report = fit_policy(train, validation, seed=83, epochs=3, device="cuda")
+    assert first_report == second_report
+    for name, first_value in first.weights.arrays().items():
+        assert np.array_equal(first_value, second.weights.arrays()[name]), name

@@ -71,7 +71,8 @@ def test_content_addressed_generation_resumes_and_keeps_parts_unmixed(tmp_path: 
         first.part_ids[i] for i, split in enumerate(first.splits) if split == "validation"
     )
     manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
-    assert manifest["config"]["corpus_generator_version"] == "viewpoint-pixel-corpus/1.4.0"
+    assert manifest["config"]["corpus_generator_version"] == "viewpoint-pixel-corpus/1.5.0"
+    assert manifest["corpus_generator_version"] == "viewpoint-pixel-corpus/1.5.0"
     assert manifest["entries"][0]["candidate_seed"] == int(
         np.random.SeedSequence((73, 0, 0, 0x1A11)).generate_state(1, dtype=np.uint32)[0]
     )

@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate the camera-limited viewpoint pixel corpus")
     parser.add_argument("--agreement", action="store_true", help="run the real-engine raster agreement probe")
     parser.add_argument("--visibility-audit", action="store_true", help="generate the frozen pooled 8x8 audit")
-    parser.add_argument("--parts", type=int, default=72)
+    parser.add_argument("--parts", type=int, default=522)
     parser.add_argument("--examples-per-part", type=int, default=6)
     parser.add_argument("--candidates", type=int, default=16)
     parser.add_argument("--seed", type=int, default=1729)
@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--height", type=int, default=96)
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu", "numpy"), default="auto")
-    parser.add_argument("--cache-dir", type=Path, default=Path("scratch/viewpoint-pixels"))
+    parser.add_argument("--cache-dir", type=Path, default=Path("scratch/viewpoint-pixels-large"))
     args = parser.parse_args(argv)
     if args.agreement:
         result = compare_with_engine(seed=args.seed, resolution=(args.width, args.height))

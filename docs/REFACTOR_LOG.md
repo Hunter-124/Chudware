@@ -7453,3 +7453,30 @@ Next step is therefore a materially larger pixel corpus rather than another arch
 corpus generation is now GPU-labelled, cached and resumable. If a conv encoder given enough data still
 fails to beat .584 visibility correlation, then learned pixels are not the answer either and the
 diagnosis moves on.
+
+## 2026-08-08 — Viewpoint pixel corpus scaled 10x, generation 7x faster
+
+The pixel experiment's confound was corpus size, so the corpus grew and generation got cheap enough to
+make that practical. A profile named the cost honestly: rasterisation was 84.8 % of it, oracle
+labelling 12.6 %, everything else under 1 % each. Rasterisation now has a lazy-Torch float64 CUDA path
+batching all candidates per row, with the exact scalar NumPy path preserved as the fallback.
+
+Throughput 0.439 → **3.110 rows/s**, a 7.08x gain. The enlarged corpus is 522 parts / 3,132 rows /
+50,112 images at 96x96, 1.85 GiB, generated in 1,007 s across one timeout and one resume that reused
+1,951 already-published rows — the atomic row-level resumability earned its keep. Training grew
+300 → **3,000 rows** and 4,800 → 48,000 renders; validation and test stayed at 11 parts / 66 rows each.
+
+The identity checks are what make the enlarged corpus comparable rather than a new experiment. All 132
+locked validation/test rows match the previous manifest on split, part id, input object AND target
+object — byte-identical, not merely equivalent. The CUDA rasteriser was probed against the scalar path
+over 12 parts / 192 views: 192 RGB-exact, minimum foreground IoU 1.0, maximum RGB MAE 0.0, maximum
+depth absolute error 0.0. Engine-renderer agreement was re-verified after the rewrite at 160x120:
+foreground IoU 1.0, RGB MAE 0.0 over 6,648 pixels. Frozen-oracle component parity remains 0.0 max
+absolute error, and the baseline candidate indices are unchanged.
+
+Corpus lives in gitignored `scratch/viewpoint-pixels-large/` and is regenerable from the recorded
+generator/renderer/oracle versions, so none of the 2.2 GB is committed.
+
+Gates: `pytest services/viewpoint` green, and green with Torch unimportable. The retrain on the full
+3,000-row training set is the actual test of whether learned pixels beat .584 visibility correlation
+and the .300661 hand-computed depth baseline; that result is still pending and is not claimed here.

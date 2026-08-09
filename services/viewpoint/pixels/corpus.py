@@ -17,10 +17,10 @@ from services.viewpoint.oracle import ORACLE_VERSION
 from services.viewpoint.parts import GENERATOR_VERSION, PartExample, generate_part, generate_part_examples
 from services.viewpoint.sampling import generate_benchmark_candidate_set
 
-from .raster import RASTERIZER_VERSION, decode_png, encode_png, image_digest, rasterize
+from .raster import RASTERIZER_VERSION, decode_png, encode_png, image_digest, rasterize, rasterize_many
 from .schema import COMPONENTS, PIXEL_SCHEMA_VERSION, PixelCorpus, PixelCorpusConfig, PixelInputs, PixelTargets
 
-_CORPUS_GENERATOR_VERSION = "viewpoint-pixel-corpus/1.4.0"
+_CORPUS_GENERATOR_VERSION = "viewpoint-pixel-corpus/1.5.0"
 _FEATURE_KINDS = ("face", "edge", "hole", "boss", "pocket", "region")
 _QUESTION_KINDS = ("presence", "dimension", "surface", "clearance", "orientation", "identity")
 _FORBIDDEN_INPUT_KEYS = frozenset({
@@ -183,8 +183,11 @@ def _row_payload(
     *,
     device: str,
     cameras: list[object] | None = None,
+    profile: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any], np.ndarray, dict[str, int], str]:
+    profile = {} if profile is None else profile
     if cameras is None:
+        stage_started = time.perf_counter()
         cameras = generate_benchmark_candidate_set(
             example.scene,
             example.target_id,
@@ -192,12 +195,15 @@ def _row_payload(
             seed=_candidate_seed(config, part_index, example_index),
             image_size=config.oracle_image_size,
         )
+        profile["sampling"] = profile.get("sampling", 0.0) + time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
     labels, backend = evaluate_many(
         example.scene,
         tuple((example.target_id, camera) for camera in cameras),
         device=device,
         return_info=True,
     )
+    profile["oracle_labelling"] = profile.get("oracle_labelling", 0.0) + time.perf_counter() - stage_started
     if device == "cuda" and backend.backend != "cuda":
         raise RuntimeError(f"CUDA oracle requested but observed {backend.backend}")
     image_hashes: list[str] = []
@@ -205,18 +211,24 @@ def _row_payload(
     camera_rows: list[list[float]] = []
     prior_rows: list[list[float]] = []
     rendered: list[tuple[bytes, bytes | None]] = []
-    for candidate_index, camera in enumerate(cameras):
-        frame = rasterize(example.scene.mesh, camera, resolution=config.resolution)
+    stage_started = time.perf_counter()
+    frames = rasterize_many(example.scene.mesh, cameras, resolution=config.resolution, device=device)
+    profile["rasterisation"] = profile.get("rasterisation", 0.0) + time.perf_counter() - stage_started
+    for candidate_index, (camera, frame) in enumerate(zip(cameras, frames)):
+        encoding_started = time.perf_counter()
         png = encode_png(frame.rgb)
         depth_content = None
         if config.include_depth:
             packed = np.concatenate((frame.depth.reshape(-1).view(np.uint8), np.packbits(frame.depth_mask.reshape(-1))))
             depth_content = _npy_content(packed)
+        profile["encoding"] = profile.get("encoding", 0.0) + time.perf_counter() - encoding_started
         rendered.append((png, depth_content))
         image_hashes.append(image_digest(png))
         depth_hashes.append(hashlib.sha256(depth_content).hexdigest() if depth_content is not None else "")
         camera_rows.append(_camera_vector(camera).tolist())
+        prior_started = time.perf_counter()
         prior_rows.append(_coarse_prior(example, camera, seed=_observation_seed(config, part_index, example_index, candidate_index)).tolist())
+        profile["coarse_prior"] = profile.get("coarse_prior", 0.0) + time.perf_counter() - prior_started
     input_record: dict[str, Any] = {
         "schema": PIXEL_SCHEMA_VERSION + "/input",
         "resolution": list(config.resolution),
@@ -254,6 +266,7 @@ def _load_manifest(path: Path, corpus_id: str, payload: dict[str, object]) -> di
             "config": payload,
             "seed": payload["seed"],
             "renderer_version": RASTERIZER_VERSION,
+            "corpus_generator_version": _CORPUS_GENERATOR_VERSION,
             "oracle_version": ORACLE_VERSION,
             "part_generator_version": GENERATOR_VERSION,
             "entries": [],
@@ -346,9 +359,9 @@ def _materialize(root: Path, manifest: dict[str, Any]) -> PixelCorpus:
 def generate_pixel_corpus(config: PixelCorpusConfig = PixelCorpusConfig(), *, workers: int = 6, device: str = "auto") -> PixelCorpus:
     """Generate or resume the exact corpus, then materialize it for training.
 
-    The CUDA accelerator labels rows in batches.  Rendering stays in-process because a row is
-    only sixteen 160x120 views and process transfer would dominate it; ``workers`` is bounded
-    now so a future renderer cannot silently violate workstation manners.
+    The dominant raster depth test is batched across every row's candidate views on CUDA.
+    Torch is imported only when that backend is selected; CPU/NumPy generation remains the
+    exact, Torch-free fallback. ``workers`` remains bounded for workstation manners.
     """
     config.validate()
     if not 1 <= int(workers) <= 6:
@@ -364,6 +377,7 @@ def generate_pixel_corpus(config: PixelCorpusConfig = PixelCorpusConfig(), *, wo
     cache_hits = len(existing)
     split_map = _split_map(config.seed)
     part_indices = config.part_indices if config.part_indices is not None else tuple(range(config.parts))
+    profile = {str(key): float(value) for key, value in manifest.get("profile_seconds", {}).items()}
     started = time.perf_counter()
     for part_index in part_indices:
         examples = generate_part_examples(part_index, config.examples_per_part, seed=config.seed)
@@ -371,8 +385,16 @@ def generate_pixel_corpus(config: PixelCorpusConfig = PixelCorpusConfig(), *, wo
             row_id = hashlib.sha256(_canonical_json((corpus_id, int(part_index), example_index))).hexdigest()
             if row_id in existing:
                 continue
-            input_record, target, baselines, backend = _row_payload(config, int(part_index), example_index, example, device=device)
+            input_record, target, baselines, backend = _row_payload(
+                config,
+                int(part_index),
+                example_index,
+                example,
+                device=device,
+                profile=profile,
+            )
             rendered = input_record.pop("_rendered")
+            io_started = time.perf_counter()
             for (png, depth_content), image_hash, depth_hash in zip(rendered, input_record["images"], input_record["depth"] or [""] * len(rendered)):
                 _atomic_bytes(root / "objects" / "images" / f"{image_hash}.png", png)
                 if depth_content is not None:
@@ -381,6 +403,7 @@ def generate_pixel_corpus(config: PixelCorpusConfig = PixelCorpusConfig(), *, wo
             input_content = _canonical_json(input_record)
             input_object = _put_object(root, "inputs", "json", input_content)
             target_object = _put_object(root, "targets", "npy", _npy_content(target))
+            profile["object_io"] = profile.get("object_io", 0.0) + time.perf_counter() - io_started
             split = split_map.get(int(part_index), "train")
             manifest["entries"].append({
                 "row_id": row_id,
@@ -399,9 +422,13 @@ def generate_pixel_corpus(config: PixelCorpusConfig = PixelCorpusConfig(), *, wo
             manifest["generation_seconds"] = float(manifest.get("generation_seconds", 0.0)) + (time.perf_counter() - started)
             started = time.perf_counter()
             manifest["cache_hits"] = cache_hits
+            manifest["profile_seconds"] = profile
+            manifest_started = time.perf_counter()
             _atomic_json(manifest_path, manifest)
+            profile["manifest_writes"] = profile.get("manifest_writes", 0.0) + time.perf_counter() - manifest_started
     manifest["generation_seconds"] = float(manifest.get("generation_seconds", 0.0)) + (time.perf_counter() - started)
     manifest["cache_hits"] = cache_hits
+    manifest["profile_seconds"] = profile
     split_counts = {name: sum(1 for entry in manifest["entries"] if entry["split"] == name) for name in ("train", "validation", "test")}
     split_parts = {name: sorted({entry["part_id"] for entry in manifest["entries"] if entry["split"] == name}) for name in split_counts}
     manifest["statistics"] = {
@@ -412,6 +439,8 @@ def generate_pixel_corpus(config: PixelCorpusConfig = PixelCorpusConfig(), *, wo
         "parts_per_split": {name: len(values) for name, values in split_parts.items()},
         "part_ids_per_split": split_parts,
         "resolution": list(config.resolution),
+        "profile_seconds": profile,
+        "rows_per_second": len(manifest["entries"]) / max(float(manifest.get("generation_seconds", 0.0)), 1.0e-12),
     }
     _atomic_json(manifest_path, manifest)
     return _materialize(root, manifest)

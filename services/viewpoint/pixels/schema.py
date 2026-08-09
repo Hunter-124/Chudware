@@ -28,13 +28,13 @@ class PixelCorpusConfig:
     by ``training.viewpoint.observation_data.LimitedCorpusConfig``.
     """
 
-    parts: int = 72
+    parts: int = 522
     examples_per_part: int = 6
     candidates: int = 16
     seed: int = 1729
     resolution: tuple[int, int] = (96, 96)
     oracle_image_size: tuple[int, int] = (96, 96)
-    cache_dir: Path = Path("scratch/viewpoint-pixels")
+    cache_dir: Path = Path("scratch/viewpoint-pixels-large")
     include_depth: bool = True
     part_indices: tuple[int, ...] | None = None
 

@@ -1,0 +1,7 @@
+# OPC UA Part 6 NodeId binary vectors (name hex)
+two_byte_i42 002a
+four_byte_ns2_i500 0102f401
+numeric_ns300_i70000 022c0170110100
+string_ns2_axis 0302000400000041786973
+guid_ns1 04010033221100554477668899aabbccddeeff
+bytes_ns4 050400030000000001ff

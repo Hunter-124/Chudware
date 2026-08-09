@@ -6,9 +6,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
+from types import SimpleNamespace
 
 import pytest
 
+import services.manufacturing.notify.channels as channels_module
 from services.manufacturing.notify import (
     AttentionService,
     AttentionStore,
@@ -167,7 +169,10 @@ def test_webhook_uses_allowlist_redacts_secrets_and_never_carries_raw_media() ->
             store,
             DeliveryManager(
                 store,
-                [WebhookChannel(f"http://127.0.0.1:{server.server_port}/attention")],
+                [WebhookChannel(
+                    f"http://127.0.0.1:{server.server_port}/attention",
+                    allow_private_networks=True,
+                )],
                 policies={"webhook": ChannelPolicy(max_attempts=1)},
             ),
         )
@@ -198,6 +203,133 @@ def test_webhook_uses_allowlist_redacts_secrets_and_never_carries_raw_media() ->
     assert payload["links"] == [
         "https://example.test/run/01?token=%5BREDACTED%5D&view=attention"
     ]
+
+
+@pytest.mark.parametrize(
+    ("address", "reason"),
+    [
+        ("127.0.0.1", "loopback"),
+        ("169.254.169.254", "link-local"),
+        ("10.23.0.8", "private"),
+        ("240.0.0.1", "reserved"),
+    ],
+)
+def test_webhook_refuses_non_public_resolved_addresses_by_name(
+    monkeypatch: pytest.MonkeyPatch, address: str, reason: str
+) -> None:
+    monkeypatch.setattr(
+        channels_module.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (
+                channels_module.socket.AF_INET,
+                channels_module.socket.SOCK_STREAM,
+                channels_module.socket.IPPROTO_TCP,
+                "",
+                (address, 80),
+            )
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match=rf"{reason} address"):
+        WebhookChannel("http://webhook.test/attention").deliver({"id": "attn:test"})
+
+
+class _RedirectCapture(BaseHTTPRequestHandler):
+    paths: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib callback name
+        self.paths.append(self.path)
+        self.send_response(302)
+        self.send_header("Location", "/internal-admin")
+        self.end_headers()
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
+        self.paths.append(self.path)
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        return None
+
+
+def test_webhook_redirect_is_refused_instead_of_followed() -> None:
+    _RedirectCapture.paths.clear()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectCapture)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        channel = WebhookChannel(
+            f"http://127.0.0.1:{server.server_port}/redirect",
+            allow_private_networks=True,
+        )
+        with pytest.raises(RuntimeError, match=r"redirect refused.*HTTP 302"):
+            channel.deliver({"id": "attn:test"})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert _RedirectCapture.paths == ["/redirect"]
+
+
+def test_macos_notification_passes_hostile_text_only_as_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[list[str]] = []
+    monkeypatch.setattr(channels_module.sys, "platform", "darwin")
+    monkeypatch.setattr(channels_module.shutil, "which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(
+        channels_module.subprocess,
+        "run",
+        lambda command, **_kwargs: captured.append(list(command))
+        or SimpleNamespace(returncode=0, stderr=""),
+    )
+    hostile = '\\" & do shell script "touch /tmp/owned" & "'
+    payload = {"severity": "critical", "device": "dev:mill:1", "reason": "alarm", "why": hostile}
+
+    DesktopChannel().deliver(payload)
+
+    title = "Chudware · critical · machine needs you"
+    body = f"dev:mill:1 · alarm\n{hostile}"
+    assert captured == [[
+        "osascript",
+        "-e",
+        "on run argv",
+        "-e",
+        "display notification (item 1 of argv) with title (item 2 of argv)",
+        "-e",
+        "end run",
+        "--",
+        body,
+        title,
+    ]]
+    assert hostile not in captured[0][2:7]
+
+
+def test_linux_notification_terminates_options_before_hostile_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[list[str]] = []
+    monkeypatch.setattr(channels_module.sys, "platform", "linux")
+    monkeypatch.setattr(channels_module.shutil, "which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(
+        channels_module.subprocess,
+        "run",
+        lambda command, **_kwargs: captured.append(list(command))
+        or SimpleNamespace(returncode=0, stderr=""),
+    )
+    payload = {"severity": "warning", "device": "--icon=owned", "reason": "alarm", "why": "inspect"}
+
+    DesktopChannel().deliver(payload)
+
+    assert captured == [[
+        "notify-send",
+        "--app-name=Chudware",
+        "--",
+        "Chudware · warning · machine needs you",
+        "--icon=owned · alarm\ninspect",
+    ]]
 
 
 def test_in_app_queue_and_desktop_adapter_are_real_bounded_channels() -> None:

@@ -11,6 +11,7 @@ from services.vision import frames as vision_frames
 from services.vision import measure as vision_measure
 
 from .evidence import AdvisoryObservation, AdvisoryTier, DeviceIdentity, QualifiedTier
+from .limits import MAX_METROLOGY_ITEMS, MetrologyResourceRefusal
 from .probe import MachineArtifactStudy, RepeatabilityStudy, StylusQualification
 
 
@@ -88,6 +89,11 @@ def _sample_stdev(values: Sequence[float]) -> float:
 
 def a2_uncertainty(inputs: A2Inputs) -> float:
     """Expanded A2 uncertainty from the station's own artifact field study."""
+    if len(inputs.artifact_field_errors_mm) > MAX_METROLOGY_ITEMS:
+        raise MetrologyResourceRefusal(
+            "artifact_field_errors_limit",
+            f"artifact field errors exceed the {MAX_METROLOGY_ITEMS} item limit",
+        )
     if len(inputs.artifact_field_errors_mm) < 5:
         raise ValueError("A2 needs artifact verification at five or more field positions")
     if inputs.px_per_mm <= 0:

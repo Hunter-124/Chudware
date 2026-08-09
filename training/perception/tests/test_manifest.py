@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from training.perception.manifest import load_manifest, validate_manifest
+from training.perception.manifest import load_manifest, publication_eligible, validate_manifest
 
 
 FIXTURE = Path("fixtures/mfg/perception/manifest.json")
@@ -40,3 +40,28 @@ def test_manifest_rejects_group_leakage_and_synthetic_test_data():
     leaked["split"] = "calib"
     with pytest.raises(ValueError, match="synthetic records may appear only in train"):
         validate_manifest([train, leaked])
+
+
+
+def test_publication_requires_reviewed_rights_references_and_redaction():
+    record = _record()
+    record["redaction_applied"] = True
+    approved_licenses = {record["license_ref"]}
+    approved_consents = {record["consent_ref"]}
+    assert publication_eligible(
+        record,
+        approved_license_refs=approved_licenses,
+        approved_consent_refs=approved_consents,
+    )
+    assert not publication_eligible(
+        record,
+        approved_license_refs=set(),
+        approved_consent_refs=approved_consents,
+    )
+    restricted = copy.deepcopy(record)
+    restricted["export_restricted"] = True
+    assert not publication_eligible(
+        restricted,
+        approved_license_refs=approved_licenses,
+        approved_consent_refs=approved_consents,
+    )

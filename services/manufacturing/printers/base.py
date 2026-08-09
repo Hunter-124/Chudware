@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Mapping
+import hashlib
+import json
 import threading
 import time
 from typing import Any
@@ -19,6 +21,17 @@ from .model import (
 )
 
 _MISSING = object()
+SNAPSHOT_FIELDS = (
+    "device_state",
+    "job_state",
+    "job_name",
+    "progress",
+    "nozzle_temperature_c",
+    "nozzle_target_c",
+    "bed_temperature_c",
+    "bed_target_c",
+)
+_MAX_JOURNALED_RAW_BYTES = 64 * 1024
 
 
 class PrinterAdapter(ABC):
@@ -92,13 +105,13 @@ class PrinterAdapter(ABC):
         raw: Any,
         why: str | None = None,
     ) -> dict[str, Any]:
+        del raw  # Vendor payload is attached once by _finish_snapshot, never once per field.
         available = value is not _MISSING and value is not None
         row = fresh_row(
             field=field,
             value=None if value is _MISSING else value,
             available=available,
             why=why,
-            raw=raw,
             src=self.config.src,
             ttl_ms=self.config.telemetry_ttl_ms,
             redactor=self.redactor,
@@ -107,6 +120,28 @@ class PrinterAdapter(ABC):
         if available:
             self._last_ok[field] = {"v": row["v"], "t_mono_ns": row["t_mono_ns"], "seq": row["seq"]}
         return row
+
+    def _finish_snapshot(self, rows: list[dict[str, Any]], raw: Any) -> list[dict[str, Any]]:
+        clean = self.redactor.value(raw)
+        encoded = json.dumps(clean, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if len(encoded) > _MAX_JOURNALED_RAW_BYTES:
+            clean = {
+                "truncated": True,
+                "original_bytes": len(encoded),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "preview": encoded[:4096].decode("utf-8", errors="replace"),
+            }
+        if rows:
+            rows[0]["raw"] = clean
+        return rows
+
+    def _unknown_snapshot(self, error: Exception) -> list[dict[str, Any]]:
+        detail = self.redactor.text(error)
+        reason_code = str(getattr(error, "reason_code", "transport_error"))
+        why = f"{reason_code}: {self.adapter_kind} telemetry unavailable: {detail}"
+        raw = {"transport_error": {"code": reason_code, "detail": detail}}
+        rows = [self._row(field, raw=raw, why=why) for field in SNAPSHOT_FIELDS]
+        return self._finish_snapshot(rows, raw)
 
     def _command_result(self, command: str, raw: Any = None) -> dict[str, Any]:
         return {

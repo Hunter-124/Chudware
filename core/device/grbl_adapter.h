@@ -41,6 +41,8 @@ struct GrblAdapterConfig {
     std::uint64_t poll_interval_ns = 200'000'000;  // 5 Hz maximum.
     std::uint64_t freshness_ttl_ms = 600;
     std::size_t rx_capacity = GrblRxAccounting::kDefaultRxCapacity;
+    // Zero derives the inbound line ceiling from rx_capacity.
+    std::size_t max_rx_line_bytes = 0;
     std::vector<std::string> installed_accessories;
 };
 
@@ -48,6 +50,7 @@ struct GrblAdapterConfig {
 // no approval authority; callers may only reach transport/parse capability here.
 class GrblAdapter {
 public:
+    static constexpr std::size_t kMaxRetainedRawBytes = 256;
     using MonotonicClock = std::function<std::uint64_t()>;
 
     GrblAdapter(ITransport& transport, MonotonicClock clock,

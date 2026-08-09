@@ -24,6 +24,8 @@ struct SerialTransportOptions {
     std::size_t max_read_bytes = 64 * 1024;
     std::chrono::milliseconds write_timeout{2000};
     std::string operator_note = "operator commissioned serial controller";
+    std::string posix_by_id_root = "/dev/serial/by-id";
+    std::string posix_sysfs_tty_root = "/sys/class/tty";
 };
 
 // Real OS serial I/O. Authorization happens before the OS open call. The class

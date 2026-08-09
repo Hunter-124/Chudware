@@ -9,6 +9,7 @@ import math
 from typing import Iterable, Mapping, Sequence
 
 from .evidence import QualifiedObservation, QualifiedTier
+from .limits import bounded_tuple
 
 Vector3 = tuple[float, float, float]
 
@@ -87,7 +88,7 @@ class OffsetProposal:
 
 
 def _qualified_only(observations: Iterable[QualifiedObservation]) -> tuple[QualifiedObservation, ...]:
-    result = tuple(observations)
+    result = bounded_tuple(observations, label="offset_observations")
     if not result:
         raise ValueError("offset proposal requires qualified observations")
     # Exact nominal type deliberately refuses AdvisoryObservation and user-defined lookalikes.

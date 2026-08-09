@@ -12,6 +12,7 @@ import binascii
 from collections.abc import Callable, Mapping
 import threading
 from typing import Any
+from urllib.parse import urlsplit
 
 from .base import PrinterAdapter
 from .model import AdapterError, Artifact, AuthConfig, EndpointConfig
@@ -25,6 +26,7 @@ _ADAPTER_TYPES: dict[str, type[PrinterAdapter]] = {
     "prusalink": PrusaLinkAdapter,
 }
 _ADAPTERS: dict[str, PrinterAdapter] = {}
+_PROBED: set[str] = set()
 _LOCK = threading.RLock()
 
 
@@ -44,6 +46,26 @@ def _get(params: Mapping[str, Any]) -> PrinterAdapter:
     return adapter
 
 
+def _get_probed(params: Mapping[str, Any]) -> PrinterAdapter:
+    adapter_id = _adapter_id(params)
+    adapter = _get(params)
+    with _LOCK:
+        connected = adapter_id in _PROBED
+    if not connected:
+        raise ValueError(f"printer adapter {adapter_id!r} is not connected; probe it first")
+    return adapter
+
+
+def _endpoint_origin(value: Any) -> tuple[str, str, int]:
+    if not isinstance(value, str):
+        raise ValueError("base_url and expected_base_url must be strings")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("base_url and expected_base_url must be absolute http(s) URLs")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return parsed.scheme, parsed.hostname.lower().rstrip("."), port
+
+
 def _open(params: Mapping[str, Any]) -> dict[str, Any]:
     adapter_id = _adapter_id(params)
     kind = params.get("kind")
@@ -54,6 +76,10 @@ def _open(params: Mapping[str, Any]) -> dict[str, Any]:
     auth = params.get("auth")
     if not isinstance(endpoint, Mapping) or not isinstance(auth, Mapping):
         raise ValueError("endpoint and auth must be objects")
+    base_url = endpoint.get("base_url")
+    expected_base_url = endpoint.get("expected_base_url")
+    if _endpoint_origin(base_url) != _endpoint_origin(expected_base_url):
+        raise ValueError("base_url does not match the lane-supplied expected endpoint")
     auth_config = AuthConfig(
         mode=auth.get("mode"),
         api_key=auth.get("api_key"),
@@ -61,7 +87,7 @@ def _open(params: Mapping[str, Any]) -> dict[str, Any]:
         password=auth.get("password"),
     )
     config = EndpointConfig(
-        base_url=endpoint.get("base_url"),
+        base_url=base_url,
         auth=auth_config,
         endpoint_is_physical=endpoint.get("endpoint_is_physical"),
         origin=endpoint.get("origin", "live"),
@@ -80,15 +106,20 @@ def _close(params: Mapping[str, Any]) -> dict[str, Any]:
     adapter_id = _adapter_id(params)
     with _LOCK:
         removed = _ADAPTERS.pop(adapter_id, None)
+        _PROBED.discard(adapter_id)
     return {"ok": True, "adapter_id": adapter_id, "closed": removed is not None}
 
 
 def _probe(params: Mapping[str, Any]) -> dict[str, Any]:
-    return {"ok": True, "report": _get(params).probe()}
+    adapter_id = _adapter_id(params)
+    report = _get(params).probe()
+    with _LOCK:
+        _PROBED.add(adapter_id)
+    return {"ok": True, "report": report}
 
 
 def _snapshot(params: Mapping[str, Any]) -> dict[str, Any]:
-    return {"ok": True, "rows": _get(params).snapshot()}
+    return {"ok": True, "rows": _get_probed(params).snapshot()}
 
 
 def _upload(params: Mapping[str, Any]) -> dict[str, Any]:
@@ -104,7 +135,7 @@ def _upload(params: Mapping[str, Any]) -> dict[str, Any]:
         original_name=params.get("original_name", "print.gcode"),
         sha256=params.get("sha256"),
     )
-    return {"ok": True, "remote_artifact": _get(params).upload(artifact)}
+    return {"ok": True, "remote_artifact": _get_probed(params).upload(artifact)}
 
 
 def _start(params: Mapping[str, Any]) -> dict[str, Any]:
@@ -113,20 +144,20 @@ def _start(params: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("remote_artifact must be an object")
     return {
         "ok": True,
-        "command": _get(params).start(remote, authorization_token=params.get("authorization_token")),
+        "command": _get_probed(params).start(remote, authorization_token=params.get("authorization_token")),
     }
 
 
 def _pause(params: Mapping[str, Any]) -> dict[str, Any]:
-    return {"ok": True, "command": _get(params).pause()}
+    return {"ok": True, "command": _get_probed(params).pause()}
 
 
 def _resume(params: Mapping[str, Any]) -> dict[str, Any]:
-    return {"ok": True, "command": _get(params).resume()}
+    return {"ok": True, "command": _get_probed(params).resume()}
 
 
 def _cancel(params: Mapping[str, Any]) -> dict[str, Any]:
-    return {"ok": True, "command": _get(params).cancel()}
+    return {"ok": True, "command": _get_probed(params).cancel()}
 
 
 def _handler(fn: Callable[[Mapping[str, Any]], dict[str, Any]]) -> Callable[[dict[str, Any], Any], dict[str, Any]]:

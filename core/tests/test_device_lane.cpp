@@ -5,8 +5,11 @@
 #include "device/grbl_adapter.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -61,6 +64,67 @@ struct LaneHarness {
         FAIL("emulator did not produce a fresh identified idle snapshot");
     }
 };
+struct ScriptedTransport final : ITransport {
+    std::optional<TransportEvent> next;
+
+    OpenResult open(const Endpoint&) override { return {true, {}}; }
+    void close() override {}
+    WriteResult write(std::span<const std::byte> bytes) override {
+        return {true, bytes.size(), {}};
+    }
+    PollResult poll(Deadline) override {
+        if (!next) return {};
+        PollResult result{{std::move(*next)}};
+        next.reset();
+        return result;
+    }
+    TransportKind kind() const override { return TransportKind::Emulator; }
+
+    void supply(std::string_view text) {
+        TransportEvent event;
+        event.kind = TransportEvent::Kind::Data;
+        const auto bytes = std::as_bytes(std::span(text));
+        event.data.assign(bytes.begin(), bytes.end());
+        next = std::move(event);
+    }
+};
+
+TEST_CASE("terminator-free Grbl input terminalizes at the RX line ceiling") {
+    ScriptedTransport transport;
+    std::uint64_t now = 0;
+    GrblAdapterConfig config;
+    config.rx_capacity = 128;
+    GrblAdapter adapter(transport, [&] { return now; }, config);
+    REQUIRE(adapter.open({"flood", "inproc://flood", false}).ok);
+
+    transport.supply(std::string(4096, 'X'));
+    adapter.service(1);
+
+    CHECK(adapter.terminalReason().find("rx_overflow") != std::string::npos);
+    CHECK(adapter.terminalReason().find("128 bytes") != std::string::npos);
+    const auto snapshot = adapter.snapshot();
+    REQUIRE(snapshot.v);
+    CHECK(snapshot.v->state == DeviceState::Fault);
+    CHECK(snapshot.v->raw.size() <= GrblAdapter::kMaxRetainedRawBytes);
+    CHECK(snapshot.v->raw.ends_with("...[truncated]"));
+}
+
+TEST_CASE("verbatim unparseable Grbl raw is bounded and visibly marked truncated") {
+    ScriptedTransport transport;
+    GrblAdapterConfig config;
+    config.max_rx_line_bytes = 1024;
+    GrblAdapter adapter(transport, [] { return std::uint64_t{0}; }, config);
+    REQUIRE(adapter.open({"raw", "inproc://raw", false}).ok);
+
+    transport.supply(std::string(600, '%') + "\r");
+    adapter.service(1);
+
+    CHECK(adapter.terminalReason().find("unparseable") != std::string::npos);
+    const auto snapshot = adapter.snapshot();
+    REQUIRE(snapshot.v);
+    CHECK(snapshot.v->raw.size() == GrblAdapter::kMaxRetainedRawBytes);
+    CHECK(snapshot.v->raw.ends_with("...[truncated]"));
+}
 
 TEST_CASE("identify binds banner, build options, settings, and a stable reconnect fingerprint") {
     LaneHarness lane;

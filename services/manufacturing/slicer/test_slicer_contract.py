@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import pytest
 
 from services.manufacturing.slicer.contract import (
+    MAX_CANONICAL_BYTES,
+    MAX_SLICE_COLLECTION_ITEMS,
+    ContractValidationError,
     Determinism,
     ModelRef,
     ProfileRef,
@@ -143,3 +147,28 @@ def test_every_filament_and_process_field_participates_in_hash() -> None:
     }
     for field_name, value in process_changes.items():
         assert replace(process, **{field_name: value}).profile_hash != process.profile_hash, field_name
+
+
+def test_oversized_profile_payload_is_a_named_refusal() -> None:
+    with pytest.raises(ContractValidationError, match="canonical_input_bytes"):
+        ProcessProfile(
+            id="hostile",
+            name="Hostile",
+            rev=1,
+            typed={},
+            raw_bundle={"payload": "x" * (MAX_CANONICAL_BYTES + 1)},
+        )
+
+
+def test_slice_request_refuses_oversized_model_collection_before_sorting() -> None:
+    model = ModelRef("m", "/tmp/model.stl", "a" * 64)
+    with pytest.raises(ContractValidationError, match="slice_collection_limit"):
+        SliceRequest(
+            project_id="p",
+            project_rev=1,
+            plate_id="plate",
+            sidecar_build_id="build",
+            profiles=_profile_refs(),
+            models=(model,) * (MAX_SLICE_COLLECTION_ITEMS + 1),
+            determinism=Determinism(1),
+        )

@@ -9,7 +9,12 @@ import numpy as np
 
 from services.perception.reference import NumpyMLDP, surprise_score
 from .data import WindowBatch
-from .metrics import calibration_metrics, event_metrics, horizon_errors
+from .metrics import (
+    calibration_metrics,
+    event_metrics,
+    horizon_errors,
+    precursor_event_scores,
+)
 from .synthetic import generate_synthetic_corpus
 
 
@@ -21,15 +26,31 @@ def evaluate_model(
 ) -> dict[str, float | int]:
     windows.validate(model.spec)
     output = model.forward(windows.model_inputs())
-    surprise = surprise_score(windows.target_latent, output["z_hat"], output["z_logvar"])
+    surprise = surprise_score(
+        windows.target_latent, output["z_hat"], output["z_logvar"]
+    )
+    if "event_threshold" in calibration:
+        event_score = precursor_event_scores(output["event_bnd"])
+        event_threshold = float(calibration["event_threshold"])
+    else:
+        event_score = surprise
+        event_threshold = float(calibration["surprise_center"])
     result: dict[str, float | int] = {}
-    result.update(horizon_errors(windows.target_latent, output["z_hat"], model.spec.horizons))
-    result.update(calibration_metrics(windows.target_latent, output["z_hat"], output["z_logvar"]))
+    result.update(
+        horizon_errors(
+            windows.target_latent, output["z_hat"], model.spec.horizons
+        )
+    )
+    result.update(
+        calibration_metrics(
+            windows.target_latent, output["z_hat"], output["z_logvar"]
+        )
+    )
     result.update(
         event_metrics(
             windows.event_label,
-            surprise,
-            threshold=float(calibration["surprise_center"]),
+            event_score,
+            threshold=event_threshold,
         )
     )
     result["mean_surprise_nll"] = float(np.mean(surprise))

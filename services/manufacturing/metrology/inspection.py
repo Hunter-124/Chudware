@@ -9,6 +9,7 @@ import math
 from typing import Iterable, Sequence
 
 from .evidence import AdvisoryObservation, QualifiedObservation, QualifiedTier
+from .limits import MAX_METROLOGY_ITEMS, MetrologyResourceRefusal, bounded_tuple
 
 
 class InspectionMethod(str, Enum):
@@ -191,7 +192,7 @@ def screen_advisory(characteristic: Characteristic,
 
 
 def overall_verdict(results: Iterable[CharacteristicResult]) -> Verdict:
-    values = tuple(results)
+    values = bounded_tuple(results, label="inspection_results")
     if not values:
         raise ValueError("inspection result needs characteristic results")
     if any(item.verdict is Verdict.FAIL for item in values):
@@ -203,6 +204,11 @@ def overall_verdict(results: Iterable[CharacteristicResult]) -> Verdict:
 
 def build_inspection_result(plan: InspectionPlan,
                             results: Sequence[CharacteristicResult]) -> InspectionResult:
+    if len(results) > MAX_METROLOGY_ITEMS or len(plan.characteristics) > MAX_METROLOGY_ITEMS:
+        raise MetrologyResourceRefusal(
+            "inspection_result_limit",
+            f"inspection exceeds the {MAX_METROLOGY_ITEMS} result limit",
+        )
     if {item.id for item in plan.characteristics} != {item.characteristic_id for item in results}:
         raise ValueError("inspection results must exactly cover the plan")
     ordered = tuple(sorted(results, key=lambda item: item.characteristic_id))

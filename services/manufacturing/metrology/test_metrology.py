@@ -271,3 +271,28 @@ def test_no_metrology_module_function_can_emit_a_controller_write():
                 assert name not in forbidden_calls, f"I/O call {name} in {path.name}"
     exported_functions = {name for name, value in vars(m).items() if inspect.isfunction(value)}
     assert not exported_functions & {"apply_offset", "controller_write", "write_offset"}
+
+
+
+def test_metrology_fit_refuses_unbounded_sample_input_by_name():
+    with pytest.raises(m.MetrologyResourceRefusal) as caught:
+        m.RepeatabilityStudy.run(
+            "-Z",
+            (float(index) for index in range(m.MAX_METROLOGY_ITEMS + 1)),
+            max_sigma_mm=1.0,
+            established_at=NOW,
+        )
+    assert caught.value.code == "repeatability_samples_limit"
+
+
+def test_metrology_uncertainty_refuses_oversized_field_study():
+    raw = json.loads((FIXTURES / "tier_cases.json").read_text(encoding="utf-8"))
+    inputs = m.A2Inputs(
+        **{
+            **raw["a2_pass"],
+            "artifact_field_errors_mm": (0.0,) * (m.MAX_METROLOGY_ITEMS + 1),
+        }
+    )
+    with pytest.raises(m.MetrologyResourceRefusal) as caught:
+        m.a2_uncertainty(inputs)
+    assert caught.value.code == "artifact_field_errors_limit"

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from .contract import ContractValidationError, validate_sha256
+from .sidecar import ResolvedBinary, resolve_binary
 
 
 @dataclass(frozen=True)
@@ -142,11 +142,10 @@ def validate_manifest(manifest: CorrespondingSourceManifest) -> tuple[str, ...]:
 
 
 def hash_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    resolved = resolve_binary(path, environ={})
+    if not isinstance(resolved, ResolvedBinary):
+        raise ValueError(f"{resolved.code}: {resolved.message}")
+    return resolved.sha256
 
 
 def verify_distributed_sidecar(
@@ -159,12 +158,12 @@ def verify_distributed_sidecar(
     """Verify manifest completeness and that it belongs to these distributed bytes."""
 
     errors = list(validate_manifest(manifest))
-    binary_path = Path(binary)
+    resolved = resolve_binary(binary, environ={})
     actual_hash: str | None = None
-    if not binary_path.is_file():
-        errors.append(f"distributed sidecar not found: {binary_path}")
+    if not isinstance(resolved, ResolvedBinary):
+        errors.append(f"{resolved.code}: {resolved.message}")
     else:
-        actual_hash = hash_file(binary_path)
+        actual_hash = resolved.sha256
         if actual_hash != manifest.binary_sha256:
             errors.append("distributed sidecar hash does not match manifest")
     if reported_version is not None and reported_version != manifest.sidecar_version:

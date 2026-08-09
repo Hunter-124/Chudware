@@ -7,13 +7,14 @@ import math
 from typing import Iterable, Mapping, Sequence
 
 from .evidence import AdvisoryObservation, QualifiedObservation, QualifiedTier
+from .limits import bounded_tuple
 from .transform import Pose
 
 Vector3 = tuple[float, float, float]
 
 
 def _require_qualified(observations: Iterable[QualifiedObservation]) -> tuple[QualifiedObservation, ...]:
-    values = tuple(observations)
+    values = bounded_tuple(observations, label="registration_observations")
     if not values:
         raise ValueError("registration requires qualified observations")
     if any(type(value) is not QualifiedObservation for value in values):
@@ -116,5 +117,7 @@ def register_workspace(*, workspace_id: str,
                        keep_out_volumes: Iterable[KeepOutVolume]) -> WorkspaceRegistration:
     evidence = _require_qualified(observations)
     roots = tuple(dict.fromkeys(root for item in evidence for root in (item.id, *item.derived_from)))
-    return WorkspaceRegistration(workspace_id, dict(fixture_frames), tuple(keep_out_volumes),
+    frames = dict(bounded_tuple(fixture_frames.items(), label="fixture_frames"))
+    volumes = bounded_tuple(keep_out_volumes, label="keep_out_volumes")
+    return WorkspaceRegistration(workspace_id, frames, volumes,
                                  tuple(item.id for item in evidence), roots)

@@ -33,8 +33,15 @@ def build_torch_model(reference: NumpyMLDP | None = None, *, spec: ModelSpec | N
         def __init__(self) -> None:
             super().__init__()
             self.spec = s
+            self.reference_seed = ref.seed
+            self.parameter_names = tuple(ref.parameters)
             for name, value in ref.parameters.items():
-                self.register_buffer(name, torch.from_numpy(np.asarray(value, np.float32).copy()))
+                self.register_parameter(
+                    name,
+                    torch.nn.Parameter(
+                        torch.from_numpy(np.asarray(value, np.float32).copy())
+                    ),
+                )
 
         def _encode(self, inputs: dict[str, Any]) -> tuple[Any, Any, Any]:
             cam_feat = inputs["cam_feat"].float()
@@ -109,6 +116,20 @@ def build_torch_model(reference: NumpyMLDP | None = None, *, spec: ModelSpec | N
             return (
                 z_hat, z_logvar, snr_hat, snr_logvar, state_logit,
                 anomaly, event_bnd, importance, cam_rel, retain,
+            )
+
+        def to_numpy_reference(self) -> NumpyMLDP:
+            """Export the current learned parameters into the frozen numpy format."""
+            parameters = {
+                name: getattr(self, name).detach().cpu().numpy().astype(
+                    np.float32, copy=True
+                )
+                for name in self.parameter_names
+            }
+            return NumpyMLDP(
+                self.spec,
+                seed=self.reference_seed,
+                parameters=parameters,
             )
 
     return TorchMLDP()

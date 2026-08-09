@@ -16,10 +16,15 @@ ControllerSnapshot priorOrDefault(const mfg::FreshValue<ControllerSnapshot>& val
     return {};
 }
 
-std::string bytesToString(std::span<const std::byte> bytes) {
-    std::string result;
-    result.reserve(bytes.size());
-    for (const auto byte : bytes) result.push_back(static_cast<char>(std::to_integer<unsigned char>(byte)));
+constexpr std::string_view kRawTruncatedMarker = "...[truncated]";
+
+std::string boundedRaw(std::string_view raw, bool known_truncated = false) {
+    if (!known_truncated && raw.size() <= GrblAdapter::kMaxRetainedRawBytes)
+        return std::string(raw);
+    const std::size_t prefix_bytes =
+        GrblAdapter::kMaxRetainedRawBytes - kRawTruncatedMarker.size();
+    std::string result(raw.substr(0, std::min(raw.size(), prefix_bytes)));
+    result += kRawTruncatedMarker;
     return result;
 }
 
@@ -35,6 +40,11 @@ GrblAdapter::GrblAdapter(ITransport& transport, MonotonicClock clock,
     if (!clock_) throw std::invalid_argument("GrblAdapter requires a monotonic clock");
     config_.poll_interval_ns = std::max(config_.poll_interval_ns, kFiveHzIntervalNs);
     if (config_.freshness_ttl_ms == 0) config_.freshness_ttl_ms = 1;
+    if (config_.max_rx_line_bytes == 0) {
+        config_.max_rx_line_bytes = config_.rx_capacity == 0
+                                        ? GrblRxAccounting::kDefaultRxCapacity
+                                        : config_.rx_capacity;
+    }
     latest_.ttl_ms = config_.freshness_ttl_ms;
     latest_.why = "device lane has not opened";
 }
@@ -306,20 +316,39 @@ void GrblAdapter::processEvent(const TransportEvent& event, Seq journal_seq) {
 }
 
 void GrblAdapter::processBytes(std::span<const std::byte> bytes, Seq journal_seq) {
-    input_bytes_ += bytesToString(bytes);
-    while (true) {
-        const auto end = input_bytes_.find_first_of("\r\n");
-        if (end == std::string::npos) break;
-        std::string line = input_bytes_.substr(0, end);
-        std::size_t consumed = end + 1;
-        while (consumed < input_bytes_.size() &&
-               (input_bytes_[consumed] == '\r' || input_bytes_[consumed] == '\n')) ++consumed;
-        input_bytes_.erase(0, consumed);
-        if (!line.empty()) processLine(line, journal_seq);
+    for (const std::byte byte : bytes) {
+        const char ch = static_cast<char>(std::to_integer<unsigned char>(byte));
+        if (ch == '\r' || ch == '\n') {
+            if (input_bytes_.empty()) continue;
+            std::string line = std::move(input_bytes_);
+            input_bytes_.clear();
+            processLine(line, journal_seq);
+            if (!terminal_reason_.empty()) return;
+            continue;
+        }
+        if (input_bytes_.size() >= config_.max_rx_line_bytes) {
+            const std::string retained = boundedRaw(input_bytes_, true);
+            input_bytes_.clear();
+            markTerminal(
+                DeviceState::Fault, RunDiscontinuity::None,
+                "rx_overflow: inbound Grbl line exceeded " +
+                    std::to_string(config_.max_rx_line_bytes) + " bytes (Grbl error 11)",
+                retained, journal_seq);
+            return;
+        }
+        input_bytes_.push_back(ch);
     }
 }
 
 void GrblAdapter::processLine(std::string_view line, Seq journal_seq) {
+    if (line.size() > config_.max_rx_line_bytes) {
+        markTerminal(
+            DeviceState::Fault, RunDiscontinuity::None,
+            "rx_overflow: inbound Grbl line exceeded " +
+                std::to_string(config_.max_rx_line_bytes) + " bytes (Grbl error 11)",
+            boundedRaw(line, true), journal_seq);
+        return;
+    }
     if (line.starts_with("<")) {
         const auto parsed = parseStatusReport(line);
         if (!parsed) {
@@ -380,7 +409,7 @@ void GrblAdapter::processStatus(const GrblStatus& status, std::string_view raw, 
         snapshot.buffer.rx = static_cast<int>(status.buffer->rx_available);
     }
     if (status.line_number) snapshot.line = *status.line_number;
-    snapshot.raw = std::string(raw);
+    snapshot.raw = boundedRaw(raw);
 
     if (snapshot.state == DeviceState::Alarm && terminal_reason_.empty()) {
         markTerminal(DeviceState::Alarm, RunDiscontinuity::Alarm,
@@ -498,7 +527,7 @@ void GrblAdapter::markTerminal(DeviceState state, RunDiscontinuity discontinuity
     ControllerSnapshot snapshot = priorOrDefault(latest_);
     if (device_id_) snapshot.device_id = device_id_->str();
     snapshot.state = state;
-    snapshot.raw = std::string(raw);
+    snapshot.raw = boundedRaw(raw);
     if (state == DeviceState::Alarm) snapshot.alarm = reason;
     publish(std::move(snapshot), journal_seq, false);
     discontinuity_ = discontinuity;

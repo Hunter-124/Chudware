@@ -9,6 +9,7 @@ import json
 import re
 import threading
 import struct
+import time
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -31,6 +32,11 @@ class VirtualPrinter:
         self.telemetry_gap = False
         self.malformed_paths: set[str] = set()
         self.html_error_paths: set[str] = set()
+        self.timeout_paths: set[str] = set()
+        self.timeout_delay_s = 0.25
+        self.oversized_paths: set[str] = set()
+        self.raw_blob_bytes = 0
+        self.octoprint_upload_path_override: str | None = None
         self.log_lines: list[str] = []
         self.requests: list[dict[str, Any]] = []
         self.prusa_job_endpoint = False
@@ -75,11 +81,20 @@ class VirtualPrinter:
                 parsed = urlsplit(self.path)
                 path = parsed.path
                 fixture.requests.append({"method": method, "path": path})
+                if path in fixture.timeout_paths:
+                    time.sleep(fixture.timeout_delay_s)
                 if path in fixture.html_error_paths:
                     self._send_bytes(500, b"<html>vendor failed</html>", "text/html")
                     return
                 if path in fixture.malformed_paths:
                     self._send_bytes(200, b'{"broken":', "application/json")
+                    return
+                if path in fixture.oversized_paths:
+                    self._send_bytes(
+                        200,
+                        b'{"blob":"' + (b"x" * ((1 << 20) + 32)) + b'"}',
+                        "application/json",
+                    )
                     return
                 if fixture.api_key and self.headers.get("X-Api-Key") != fixture.api_key:
                     self.send_response(401)
@@ -112,6 +127,8 @@ class VirtualPrinter:
                         "toolhead": {"position": [1.0, 2.0, 3.0]},
                         "fan": {"speed": 0.5},
                     }
+                    if fixture.raw_blob_bytes:
+                        objects["vendor_blob"] = "x" * fixture.raw_blob_bytes
                     if fixture.telemetry_gap:
                         objects.pop("virtual_sdcard")
                         objects.pop("extruder")
@@ -194,7 +211,8 @@ class VirtualPrinter:
                     return
                 if method == "POST" and path == "/api/files/local":
                     fixture.remote_name = self._multipart_filename(body) or fixture.remote_name
-                    self._json(201, {"files": {"local": {"name": fixture.remote_name, "path": fixture.remote_name}}})
+                    remote_path = fixture.octoprint_upload_path_override or fixture.remote_name
+                    self._json(201, {"files": {"local": {"name": fixture.remote_name, "path": remote_path}}})
                     return
                 if method == "POST" and path.startswith("/api/files/local/"):
                     payload = self._body_json(body)
@@ -346,7 +364,10 @@ class VirtualPrinter:
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
         self._server = _Server(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, name=f"virtual-{self.kind}", daemon=True)

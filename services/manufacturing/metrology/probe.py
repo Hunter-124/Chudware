@@ -11,6 +11,7 @@ import statistics
 from typing import Iterable, Mapping, Sequence
 
 from .evidence import EvidenceClass
+from .limits import MAX_METROLOGY_ITEMS, MetrologyResourceRefusal, bounded_tuple
 
 Vector3 = tuple[float, float, float]
 DIRECTIONS = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
@@ -233,7 +234,10 @@ class RepeatabilityStudy:
     def run(cls, direction: str, samples_mm: Iterable[float], *,
             max_sigma_mm: float, established_at: datetime | None = None,
             validity_days: int = 30, derived_from: Iterable[str] = ()) -> "RepeatabilityStudy":
-        samples = tuple(float(value) for value in samples_mm)
+        samples = bounded_tuple(
+            (float(value) for value in samples_mm),
+            label="repeatability_samples",
+        )
         if direction not in DIRECTIONS:
             raise ValueError("repeatability direction must be an axis direction")
         if any(not math.isfinite(value) for value in samples):
@@ -246,7 +250,7 @@ class RepeatabilityStudy:
         if start.tzinfo is None:
             raise ValueError("established_at must be timezone-aware")
         admitted = len(samples) >= 10 and sigma <= max_sigma_mm
-        roots = tuple(dict.fromkeys(derived_from))
+        roots = tuple(dict.fromkeys(bounded_tuple(derived_from, label="repeatability_roots")))
         payload = {"direction": direction, "samples": samples, "max_sigma": max_sigma_mm,
                    "derived_from": roots}
         return cls(_digest(payload), direction, samples, mean, sigma, 2.0 * sigma,
@@ -273,6 +277,11 @@ class StylusQualification:
             passes: int, pass_agreement_mm: float, artifact_ref: str,
             established_at: datetime | None = None, validity_days: int = 30,
             derived_from: Iterable[str] = ()) -> "StylusQualification":
+        if len(directional_pretravel_mm) > MAX_METROLOGY_ITEMS:
+            raise MetrologyResourceRefusal(
+                "directional_pretravel_limit",
+                f"directional pretravel exceeds the {MAX_METROLOGY_ITEMS} item limit",
+            )
         if certified_diameter_mm <= 0 or fitted_diameter_mm <= 0 or nominal_ball_radius_mm <= 0:
             raise ValueError("qualification dimensions must be positive")
         if residual_rms_mm < 0 or residual_rms_mm > residual_limit_mm:
@@ -290,7 +299,11 @@ class StylusQualification:
         # Directional pretravel is expected to vary.  Isotropy is established by the fitted
         # spherical/ring artifact residual, not by pretending directional pretravel is equal.
         isotropic = True
-        roots = tuple(dict.fromkeys((artifact_ref, *derived_from)))
+        roots = tuple(
+            dict.fromkeys(
+                (artifact_ref, *bounded_tuple(derived_from, label="qualification_roots"))
+            )
+        )
         payload = {"certified": certified_diameter_mm, "fitted": fitted_diameter_mm,
                    "nominal_radius": nominal_ball_radius_mm, "residual": residual_rms_mm,
                    "pretravel": dict(directional_pretravel_mm), "passes": passes,
@@ -318,7 +331,10 @@ class MachineArtifactStudy:
             certificate_uncertainty_mm: float | None, environment_recorded: bool,
             max_abs_error_mm: float, established_at: datetime | None = None,
             validity_days: int = 90, derived_from: Iterable[str] = ()) -> "MachineArtifactStudy":
-        errors = tuple(float(value) for value in errors_mm)
+        errors = bounded_tuple(
+            (float(value) for value in errors_mm),
+            label="artifact_errors",
+        )
         if any(not math.isfinite(value) for value in errors):
             raise ValueError("artifact errors must be finite")
         start = established_at or datetime.now(timezone.utc)
@@ -328,7 +344,7 @@ class MachineArtifactStudy:
         admitted = (measured and certificate_uncertainty_mm is not None
                     and certificate_uncertainty_mm >= 0 and environment_recorded
                     and max(abs(value) for value in errors) <= max_abs_error_mm)
-        roots = tuple(dict.fromkeys(derived_from))
+        roots = tuple(dict.fromkeys(bounded_tuple(derived_from, label="artifact_roots")))
         return cls(_digest({"errors": errors, "orientations": orientations,
                             "certificate_uncertainty": certificate_uncertainty_mm,
                             "environment": environment_recorded,

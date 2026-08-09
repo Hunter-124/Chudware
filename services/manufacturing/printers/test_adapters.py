@@ -17,6 +17,8 @@ from services.manufacturing.printers import (
     ProtocolError,
     PrusaLinkAdapter,
 )
+from services.manufacturing.printers.model import Redactor
+from services.manufacturing.printers.websocket import JsonWebSocket
 
 
 def config(server: VirtualPrinter, auth: AuthConfig | None = None) -> EndpointConfig:
@@ -186,6 +188,29 @@ def test_prusalink_uses_only_capability_probed_routes() -> None:
         assert by_field(adapter.snapshot())["job_state"]["v"] == "running"
         adapter.cancel()
         assert by_field(adapter.snapshot())["job_state"]["v"] == "aborted"
+
+
+def test_octoprint_rejects_vendor_supplied_path_traversal() -> None:
+    with VirtualPrinter("octoprint") as server:
+        server.octoprint_upload_path_override = "../api/job"
+        adapter = OctoPrintAdapter(config(server))
+        adapter.probe()
+        with pytest.raises(ProtocolError, match="unsafe remote path"):
+            adapter.upload(Artifact(b"G1 X4\n"))
+        assert not any(request["path"].endswith("/api/job") and request["method"] == "POST" for request in server.requests)
+
+
+def test_websocket_rejects_interleaved_data_and_excessive_continuations() -> None:
+    websocket = JsonWebSocket("http://localhost", "/websocket", {}, 0.1, Redactor())
+    interleaved = iter([(False, 0x1, b"{"), (True, 0x1, b"{}")])
+    websocket._recv_frame = lambda: next(interleaved)  # type: ignore[method-assign]
+    with pytest.raises(ProtocolError, match="interleaved"):
+        websocket.recv_json()
+
+    excessive = iter([(False, 0x1, b"{")] + [(False, 0x0, b"")] * 256)
+    websocket._recv_frame = lambda: next(excessive)  # type: ignore[method-assign]
+    with pytest.raises(ProtocolError, match="frame limit"):
+        websocket.recv_json()
 
 
 @pytest.mark.parametrize(

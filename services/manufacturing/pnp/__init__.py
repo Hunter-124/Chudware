@@ -4,7 +4,10 @@ from .model import (
     Board, CalibrationRecord, Feeder, Fiducial, Nozzle, Package, Panel,
     PanelInstance, Placement, PnpJob, placement_count,
 )
-from .openpnp import export_openpnp_job, import_openpnp_job
-from .simulator import PlacementOutcome, PnpEvidenceSummary, VirtualPnpMachine, VirtualPnpRun
+from .openpnp import OpenPnpRefusal, export_openpnp_job, import_openpnp_job
+from .simulator import (
+    PlacementOutcome, PnpEvidenceSummary, PnpResourceRefusal, VirtualPnpMachine,
+    VirtualPnpRun,
+)
 
 __all__ = [name for name in globals() if not name.startswith("_")]

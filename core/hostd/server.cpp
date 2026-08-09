@@ -523,7 +523,11 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0}};
     }
     if (method == "ping") return json{{"ok", true}};
-    if (auto result = chudware::mfg::lane().handle(method, params)) {
+    const chudware::mfg::LeaseOwner mfgCaller{
+        c.kind.empty() ? "unknown" : c.kind,
+        c.userId.empty() ? "local-seat" : c.userId,
+        "hostd-client:" + std::to_string(c.id)};
+    if (auto result = chudware::mfg::lane().handle(method, params, mfgCaller)) {
         isError = result->is_error;
         return std::move(result->body);
     }

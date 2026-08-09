@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 from pathlib import Path
+import time
 
 from services.manufacturing.slicer.contract import (
     Determinism,
@@ -11,7 +13,11 @@ from services.manufacturing.slicer.contract import (
     SliceRequest,
     SliceResult,
 )
-from services.manufacturing.slicer.sidecar import SLICER_ENV_VAR, invoke_sidecar
+from services.manufacturing.slicer.sidecar import (
+    MAX_MODEL_BYTES,
+    SLICER_ENV_VAR,
+    invoke_sidecar,
+)
 
 
 FAKE_SLICER = Path(__file__).resolve().parents[3] / "fixtures/mfg/print/fake_slicer.py"
@@ -73,13 +79,153 @@ def test_identical_requests_have_identical_artifact_hash_and_provenance(tmp_path
 
 
 def test_malformed_sidecar_output_is_a_refusal(tmp_path: Path) -> None:
+    script = tmp_path / "malformed.py"
+    script.write_text(
+        "import argparse\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--request'); p.add_argument('--output'); p.add_argument('--result')\n"
+        "a=p.parse_args()\n"
+        "open(a.result, 'w', encoding='utf-8').write('{')\n",
+        encoding="utf-8",
+    )
     result = invoke_sidecar(
         _request(tmp_path),
         tmp_path / "work",
-        binary=FAKE_SLICER,
-        environ={"CHUDWARE_FAKE_SLICER_MODE": "malformed"},
+        binary=script,
     )
 
     assert isinstance(result, SliceRefusal)
     assert result.code == "malformed_sidecar_output"
     assert "traceback" not in result.message.lower()
+    assert result.detail is None
+
+
+def test_binary_and_model_symlinks_are_named_refusals(tmp_path: Path) -> None:
+    binary_link = tmp_path / "slicer-link.py"
+    binary_link.symlink_to(FAKE_SLICER)
+    binary_result = invoke_sidecar(_request(tmp_path), tmp_path / "work-a", binary=binary_link)
+    assert isinstance(binary_result, SliceRefusal)
+    assert binary_result.code == "slicer_binary_symlink"
+    assert str(FAKE_SLICER) not in binary_result.message
+
+    real_model = tmp_path / "real.stl"
+    real_model.write_bytes(b"solid x\nendsolid x\n")
+    model_link = tmp_path / "linked.stl"
+    model_link.symlink_to(real_model)
+    linked = replace(
+        _request(tmp_path),
+        models=(
+            ModelRef(
+                "cube",
+                str(model_link),
+                hashlib.sha256(real_model.read_bytes()).hexdigest(),
+            ),
+        ),
+    )
+    model_result = invoke_sidecar(linked, tmp_path / "work-b", binary=FAKE_SLICER)
+    assert isinstance(model_result, SliceRefusal)
+    assert model_result.code == "model_input_symlink"
+
+
+def test_model_traversal_and_oversize_are_named_refusals(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    traversing = replace(
+        request,
+        models=(
+            replace(
+                request.models[0],
+                path=str(tmp_path / "models" / ".." / "cube.stl"),
+            ),
+        ),
+    )
+    traversal_result = invoke_sidecar(
+        traversing,
+        tmp_path / "work-c",
+        binary=FAKE_SLICER,
+    )
+    assert isinstance(traversal_result, SliceRefusal)
+    assert traversal_result.code == "model_path_traversal"
+
+    oversized = tmp_path / "oversized.stl"
+    with oversized.open("wb") as stream:
+        stream.truncate(MAX_MODEL_BYTES + 1)
+    oversized_request = replace(
+        request,
+        models=(replace(request.models[0], path=str(oversized), mesh_sha256="0" * 64),),
+    )
+    oversized_result = invoke_sidecar(
+        oversized_request,
+        tmp_path / "work-d",
+        binary=FAKE_SLICER,
+    )
+    assert isinstance(oversized_result, SliceRefusal)
+    assert oversized_result.code == "model_input_too_large"
+
+
+def test_environment_is_scrubbed_and_refusal_does_not_leak_secret_or_path(tmp_path: Path) -> None:
+    script = tmp_path / "env-check.py"
+    script.write_text(
+        "import os, sys\n"
+        "sys.exit(90 if os.getenv('AWS_SECRET_ACCESS_KEY') or os.getenv('HOME') else 7)\n",
+        encoding="utf-8",
+    )
+    secret = "not-for-child"
+    result = invoke_sidecar(
+        _request(tmp_path),
+        tmp_path / "work-env",
+        binary=script,
+        environ={"AWS_SECRET_ACCESS_KEY": secret, "HOME": str(tmp_path / "private")},
+    )
+    assert isinstance(result, SliceRefusal)
+    assert result.code == "slicer_failed"
+    assert result.detail == "exit=7"
+    assert secret not in result.message
+    assert str(tmp_path) not in result.message
+
+
+def test_stdout_ceiling_is_terminal_and_named(tmp_path: Path) -> None:
+    script = tmp_path / "noisy.py"
+    script.write_text(
+        "import os\n"
+        "os.write(1, b'x' * 8192)\n",
+        encoding="utf-8",
+    )
+    result = invoke_sidecar(
+        _request(tmp_path),
+        tmp_path / "work-output",
+        binary=script,
+        max_capture_bytes=1024,
+    )
+    assert isinstance(result, SliceRefusal)
+    assert result.code == "slicer_output_limit"
+
+
+def test_timeout_kills_the_entire_process_group_without_orphan(tmp_path: Path) -> None:
+    script = tmp_path / "hang.py"
+    script.write_text(
+        "import pathlib, signal, subprocess, sys, time\n"
+        "child=subprocess.Popen([sys.executable, '-c', "
+        "\"import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)\"])\n"
+        "pathlib.Path('child.pid').write_text(str(child.pid), encoding='ascii')\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    request = _request(tmp_path)
+    result = invoke_sidecar(
+        request,
+        tmp_path / "work-timeout",
+        binary=script,
+        timeout_s=0.1,
+    )
+    assert isinstance(result, SliceRefusal)
+    assert result.code == "slicer_timeout"
+    pid = int(
+        (tmp_path / "work-timeout" / request.request_id / "child.pid").read_text(
+            encoding="ascii"
+        )
+    )
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and Path(f"/proc/{pid}").exists():
+        time.sleep(0.01)
+    assert not Path(f"/proc/{pid}").exists()

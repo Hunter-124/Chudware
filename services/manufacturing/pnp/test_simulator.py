@@ -1,9 +1,11 @@
+import pytest
+
 from .capability import capability_report
 from .model import (
     Board, CalibrationRecord, Feeder, Nozzle, Package, Panel, PanelInstance,
     Placement, PnpJob,
 )
-from .simulator import VirtualPnpMachine
+from .simulator import PnpResourceRefusal, VirtualPnpMachine
 
 
 def _job() -> PnpJob:
@@ -34,6 +36,31 @@ def test_virtual_run_accounts_for_every_placement_outcome() -> None:
     assert run.evidence.advisory_only is True
     assert run.evidence.satisfies_execute_gate is False
     assert run.evidence.deterministic_digest == VirtualPnpMachine().run(_job(), fault_placement_ids={"R3"}).evidence.deterministic_digest
+
+
+def test_virtual_run_refuses_cartesian_outcome_blowup() -> None:
+    base = _job()
+    placement = base.board.placements[0]
+    instance = PanelInstance("copy", 0.0, 0.0)
+    oversized = PnpJob(
+        base.id,
+        Board(
+            base.board.id,
+            base.board.name,
+            base.board.revision,
+            base.board.width_mm,
+            base.board.height_mm,
+            placements=(placement,) * 1_001,
+        ),
+        base.packages,
+        base.feeders,
+        base.nozzles,
+        base.calibrations,
+        Panel("large", base.board.id, (instance,) * 1_000),
+    )
+    with pytest.raises(PnpResourceRefusal) as caught:
+        VirtualPnpMachine().run(oversized)
+    assert caught.value.code == "pnp_simulation_limit"
 
 
 def test_pnp_capability_is_capped_and_execute_side_is_unsupported() -> None:

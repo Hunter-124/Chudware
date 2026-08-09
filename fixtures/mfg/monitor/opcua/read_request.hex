@@ -1,0 +1,4 @@
+# OPC UA ReadRequest DefaultBinary including type NodeId.
+# auth ns=1;i=101, requestHandle=42, maxAge=0, Both timestamps,
+# Value attribute for ns=2;i=1001 and ns=2;i=1002.
+010077020101650000202d702d27dd012a00000000000000ffffffff88130000000000000000000000000002000000020000000102e9030d000000ffffffff0000ffffffff0102ea030d000000ffffffff0000ffffffff

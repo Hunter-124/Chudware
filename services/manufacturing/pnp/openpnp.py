@@ -5,7 +5,11 @@ code, start a JVM, discover devices, or expose a driver.
 """
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
+import stat
+import tempfile
 import xml.etree.ElementTree as ET
 
 from .model import (
@@ -16,7 +20,95 @@ from .model import (
 _VERSION = "1.1"
 _UNITS = "Millimeters"
 _CHUDWARE_NS = "urn:chudware:pnp:1"
+MAX_XML_BYTES = 4 * 1024 * 1024
+MAX_ELEMENTS = 100_000
 ET.register_namespace("chudware", _CHUDWARE_NS)
+
+class OpenPnpRefusal(ValueError):
+    """Named refusal for unsafe or resource-exhausting OpenPnP input."""
+
+    def __init__(self, code: str, reason: str) -> None:
+        super().__init__(f"{code}: {reason}")
+        self.code = code
+        self.reason = reason
+
+
+def _safe_path(
+    source: str | Path,
+    *,
+    label: str,
+    root: Path | None = None,
+    require_relative: bool = False,
+) -> Path:
+    raw = Path(source).expanduser()
+    if ".." in raw.parts:
+        raise OpenPnpRefusal(f"{label}_traversal", f"{label} may not contain parent traversal")
+    if require_relative and raw.is_absolute():
+        raise OpenPnpRefusal(f"{label}_absolute", f"{label} must be relative")
+    candidate = raw if raw.is_absolute() else (root or Path.cwd()) / raw
+    candidate = Path(os.path.abspath(candidate))
+    if root is not None and not candidate.is_relative_to(root):
+        raise OpenPnpRefusal(f"{label}_escape", f"{label} is outside the allowed root")
+    current = Path(candidate.anchor)
+    for component in candidate.parts[1:]:
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            raise OpenPnpRefusal(f"{label}_missing", f"{label} is missing") from None
+        except OSError:
+            raise OpenPnpRefusal(f"{label}_unreadable", f"{label} could not be inspected") from None
+        if stat.S_ISLNK(mode):
+            raise OpenPnpRefusal(f"{label}_symlink", f"{label} may not use symlinks")
+    return candidate
+
+
+def _read_xml(path: Path, *, label: str) -> ET.Element:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise OpenPnpRefusal(f"{label}_symlink", f"{label} may not use symlinks") from None
+        raise OpenPnpRefusal(f"{label}_unreadable", f"{label} could not be read") from None
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OpenPnpRefusal(f"{label}_not_regular", f"{label} must be a regular file")
+        if metadata.st_size > MAX_XML_BYTES:
+            raise OpenPnpRefusal(
+                f"{label}_too_large",
+                f"{label} exceeds the {MAX_XML_BYTES} byte limit",
+            )
+        payload = bytearray()
+        while chunk := os.read(fd, min(1024 * 1024, MAX_XML_BYTES + 1 - len(payload))):
+            payload.extend(chunk)
+            if len(payload) > MAX_XML_BYTES:
+                raise OpenPnpRefusal(
+                    f"{label}_too_large",
+                    f"{label} exceeds the {MAX_XML_BYTES} byte limit",
+                )
+    finally:
+        os.close(fd)
+    try:
+        text = bytes(payload).decode("utf-8")
+    except UnicodeDecodeError:
+        raise OpenPnpRefusal(f"{label}_encoding", f"{label} is not UTF-8") from None
+    folded = text.casefold()
+    if "<!doctype" in folded or "<!entity" in folded:
+        raise OpenPnpRefusal(
+            f"{label}_declaration",
+            f"{label} may not contain DTD or entity declarations",
+        )
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        raise OpenPnpRefusal(f"{label}_malformed", f"{label} is not well-formed XML") from None
+    if sum(1 for _ in root.iter()) > MAX_ELEMENTS:
+        raise OpenPnpRefusal(
+            f"{label}_element_limit",
+            f"{label} exceeds the {MAX_ELEMENTS} element limit",
+        )
+    return root
 
 
 def _f(value: float) -> str:
@@ -28,8 +120,51 @@ def _location(parent: ET.Element, x: float, y: float, rotation: float = 0.0) -> 
 
 
 def _write_xml(root: ET.Element, path: Path) -> None:
-    ET.indent(root, space="  ")
-    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True, short_empty_elements=True)
+    temporary: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _safe_path(path.parent, label="openpnp_output_directory")
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(mode):
+                raise OpenPnpRefusal(
+                    "openpnp_output_symlink",
+                    "OpenPnP output may not replace or follow a symlink",
+                )
+            if not stat.S_ISREG(mode):
+                raise OpenPnpRefusal(
+                    "openpnp_output_not_regular",
+                    "OpenPnP output must be a regular file",
+                )
+        ET.indent(root, space="  ")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            dir=path.parent,
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as stream:
+            ET.ElementTree(root).write(
+                stream,
+                encoding="utf-8",
+                xml_declaration=True,
+                short_empty_elements=True,
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OpenPnpRefusal:
+        raise
+    except OSError:
+        raise OpenPnpRefusal(
+            "openpnp_output_unavailable",
+            "OpenPnP output could not be written",
+        ) from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def export_openpnp_job(job: PnpJob, path: str | Path) -> Path:
@@ -38,8 +173,28 @@ def export_openpnp_job(job: PnpJob, path: str | Path) -> Path:
     Chudware-only metadata is stored in namespaced attributes/elements. OpenPnP
     readers ignore those while this importer uses them for lossless round trips.
     """
+    instances = (
+        job.panel.instances
+        if job.panel is not None
+        else (PanelInstance(id=f"{job.board.id}-1", x_mm=0.0, y_mm=0.0),)
+    )
+    element_count = (
+        10
+        + len(job.packages)
+        + 3 * len(job.board.placements)
+        + 2 * len(job.board.fiducials)
+        + 2 * len(instances)
+        + len(job.feeders)
+        + len(job.nozzles)
+        + len(job.calibrations)
+        + (2 * len(job.panel.fiducials) + 2 if job.panel is not None else 0)
+    )
+    if element_count > MAX_ELEMENTS:
+        raise OpenPnpRefusal(
+            "openpnp_export_element_limit",
+            f"OpenPnP export exceeds the {MAX_ELEMENTS} element limit",
+        )
     job_path = Path(path)
-    job_path.parent.mkdir(parents=True, exist_ok=True)
     board_path = job_path.with_name(f"{job.board.id}.board.xml")
 
     board_root = ET.Element(
@@ -98,11 +253,6 @@ def export_openpnp_job(job: PnpJob, path: str | Path) -> Path:
 
     root = ET.Element("openpnp-job", version=_VERSION, id=job.id)
     locations = ET.SubElement(root, "board-locations")
-    instances = (
-        job.panel.instances
-        if job.panel is not None
-        else (PanelInstance(id=f"{job.board.id}-1", x_mm=0.0, y_mm=0.0),)
-    )
     for instance in instances:
         node = ET.SubElement(
             locations,
@@ -194,10 +344,18 @@ def _parse_location(parent: ET.Element) -> tuple[float, float, float]:
     return _float(node, "x") * scale, _float(node, "y") * scale, _float(node, "rotation", 0.0)
 
 
-def import_openpnp_job(path: str | Path) -> PnpJob:
-    """Parse an OpenPnP job and the board files it references."""
-    job_path = Path(path)
-    root = ET.parse(job_path).getroot()
+def import_openpnp_job(
+    path: str | Path,
+    *,
+    root_dir: str | Path | None = None,
+) -> PnpJob:
+    """Parse bounded OpenPnP XML without following paths outside its input root."""
+    lexical = Path(path).expanduser()
+    root_path = None
+    if root_dir is not None:
+        root_path = _safe_path(root_dir, label="openpnp_root")
+    job_path = _safe_path(lexical, label="openpnp_job", root=root_path)
+    root = _read_xml(job_path, label="openpnp_job")
     if root.tag != "openpnp-job":
         raise ValueError("expected OpenPnP <openpnp-job> root")
     board_locations = root.findall("./board-locations/board-location")
@@ -206,7 +364,13 @@ def import_openpnp_job(path: str | Path) -> PnpJob:
     board_file = _required(board_locations[0], "board_file")
     if any(_required(node, "board_file") != board_file for node in board_locations):
         raise ValueError("this offline interchange supports one board revision per job")
-    board_root = ET.parse(job_path.parent / board_file).getroot()
+    board_path = _safe_path(
+        board_file,
+        label="openpnp_board",
+        root=job_path.parent,
+        require_relative=True,
+    )
+    board_root = _read_xml(board_path, label="openpnp_board")
     if board_root.tag != "openpnp-board":
         raise ValueError("referenced file is not an OpenPnP board")
 

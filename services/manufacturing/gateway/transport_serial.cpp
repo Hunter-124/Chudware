@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <string_view>
 #include <thread>
@@ -23,6 +24,7 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -95,6 +97,102 @@ std::optional<speed_t> termiosBaud(std::uint32_t baud) {
         default: return std::nullopt;
     }
 }
+
+bool pathWithin(const std::filesystem::path& path, const std::filesystem::path& root) {
+    std::error_code error;
+    const auto absolute_path = std::filesystem::absolute(path, error).lexically_normal();
+    if (error) return false;
+    const auto absolute_root = std::filesystem::absolute(root, error).lexically_normal();
+    if (error) return false;
+    auto path_part = absolute_path.begin();
+    for (auto root_part = absolute_root.begin(); root_part != absolute_root.end(); ++root_part) {
+        if (path_part == absolute_path.end() || *path_part != *root_part) return false;
+        ++path_part;
+    }
+    return true;
+}
+
+bool resolvePosixSerialTarget(const std::filesystem::path& address,
+                              const SerialTransportOptions& options,
+                              std::filesystem::path& target, std::string& why) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(address, error);
+    if (error) {
+        why = "serial path inspection failed: " + error.message();
+        return false;
+    }
+    if (!std::filesystem::is_symlink(status)) {
+        target = address;
+        return true;
+    }
+    if (!pathWithin(address, options.posix_by_id_root)) {
+        why = "serial symlink refused: path is outside the commissioned by-id directory";
+        return false;
+    }
+    target = std::filesystem::canonical(address, error);
+    if (error) {
+        why = "serial by-id resolution refused: " + error.message();
+        return false;
+    }
+    return true;
+}
+
+std::optional<std::string> readSysfsAttribute(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    if (!input.is_open()) return std::nullopt;
+    std::string value;
+    std::getline(input, value);
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
+        value.pop_back();
+    const auto begin = std::find_if_not(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isspace(ch);
+    });
+    value.erase(value.begin(), begin);
+    if (value.empty()) return std::nullopt;
+    return value;
+}
+
+std::optional<EndpointIdentity> posixUsbIdentity(
+    std::string_view commissioned_address, const std::filesystem::path& target,
+    const SerialTransportOptions& options, std::string& why) {
+    std::filesystem::path cursor =
+        std::filesystem::path(options.posix_sysfs_tty_root) / target.filename() / "device";
+    std::error_code error;
+    if (!std::filesystem::exists(cursor, error) || error) {
+        why = "serial USB identity refused: sysfs device path is unavailable";
+        return std::nullopt;
+    }
+    cursor = std::filesystem::canonical(cursor, error);
+    if (error) {
+        why = "serial USB identity refused: sysfs device path cannot be resolved";
+        return std::nullopt;
+    }
+    for (unsigned depth = 0; depth < 16; ++depth) {
+        const auto vid = readSysfsAttribute(cursor / "idVendor");
+        const auto pid = readSysfsAttribute(cursor / "idProduct");
+        const auto serial = readSysfsAttribute(cursor / "serial");
+        const unsigned present = static_cast<unsigned>(vid.has_value()) +
+                                 static_cast<unsigned>(pid.has_value()) +
+                                 static_cast<unsigned>(serial.has_value());
+        if (present != 0) {
+            if (present != 3) {
+                why = "serial USB identity refused: sysfs USB tuple is incomplete";
+                return std::nullopt;
+            }
+            return EndpointIdentity::serial(std::string(commissioned_address), *vid, *pid,
+                                            *serial);
+        }
+        const auto parent = cursor.parent_path();
+        if (parent == cursor || parent.empty()) break;
+        cursor = parent;
+    }
+    why = "serial USB identity refused: sysfs USB tuple is unavailable";
+    return std::nullopt;
+}
+
+std::string usbTuple(const EndpointIdentity& identity) {
+    return identity.usb_vid + ":" + identity.usb_pid + ":" + identity.usb_serial;
+}
 #endif
 
 }  // namespace
@@ -125,6 +223,42 @@ device::OpenResult SerialTransport::open(const device::Endpoint& endpoint) {
             break;
         }
     }
+#else
+    std::filesystem::path open_target;
+    std::string identity_why;
+    if (!resolvePosixSerialTarget(identity.address, options_, open_target, identity_why))
+        return {false, std::move(identity_why)};
+
+    bool commissioned_usb_tuple = false;
+    for (const auto& entry : allowlist_.entries()) {
+        if (entry.endpoint.transport == device::TransportKind::Serial &&
+            entry.endpoint.address == identity.address &&
+            entry.machine_class == machine_class_ &&
+            !entry.endpoint.usb_vid.empty()) {
+            commissioned_usb_tuple = true;
+            break;
+        }
+    }
+    if (commissioned_usb_tuple) {
+        const auto observed =
+            posixUsbIdentity(identity.address, open_target, options_, identity_why);
+        if (!observed) return {false, std::move(identity_why)};
+        const bool matched = std::any_of(
+            allowlist_.entries().begin(), allowlist_.entries().end(),
+            [&](const AllowlistEntry& entry) {
+                return entry.endpoint.transport == device::TransportKind::Serial &&
+                       entry.endpoint.address == identity.address &&
+                       entry.machine_class == machine_class_ &&
+                       entry.endpoint.usb_vid == observed->usb_vid &&
+                       entry.endpoint.usb_pid == observed->usb_pid &&
+                       entry.endpoint.usb_serial == observed->usb_serial;
+            });
+        if (!matched) {
+            return {false, "serial USB identity mismatch: observed " + usbTuple(*observed) +
+                               " does not match the commissioned tuple"};
+        }
+        identity = *observed;
+    }
 #endif
     CommissioningCandidate commissioning{
         identity,
@@ -153,12 +287,23 @@ device::OpenResult SerialTransport::open(const device::Endpoint& endpoint) {
     }
     handle_ = reinterpret_cast<std::intptr_t>(file);
 #else
-    const int fd = ::open(identity.address.c_str(),
-                          O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC | O_EXCL);
+    const int fd = ::open(open_target.c_str(),
+                          O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
         if (errno == EBUSY || errno == EACCES)
             return {false, "serial exclusive open refused: port is already claimed"};
         return {false, "serial open failed: " + std::string(std::strerror(errno))};
+    }
+    struct stat descriptor_status {};
+    if (::fstat(fd, &descriptor_status) != 0) {
+        const int error = errno;
+        ::close(fd);
+        return {false, "serial descriptor validation failed: " +
+                           std::string(std::strerror(error))};
+    }
+    if (!S_ISCHR(descriptor_status.st_mode)) {
+        ::close(fd);
+        return {false, "serial open refused: endpoint is not a character device"};
     }
     if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
         const int error = errno;

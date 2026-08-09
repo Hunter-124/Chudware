@@ -7,14 +7,19 @@ in-process slicer API and this module has no printer transport or execution path
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
+import selectors
 import shlex
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 from typing import Any, Mapping
 
 from .contract import (
@@ -30,6 +35,12 @@ from .contract import (
 
 SLICER_ENV_VAR = "CHUDWARE_SLICER_BIN"
 _SIDECAR_RESULT_SCHEMA = "chudware.slicer_sidecar_result/1"
+MAX_MODEL_BYTES = 512 * 1024 * 1024
+MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024
+MAX_SIDECAR_RESULT_BYTES = 4 * 1024 * 1024
+MAX_CAPTURE_BYTES = 1024 * 1024
+MAX_BINARY_BYTES = 512 * 1024 * 1024
+_SAFE_ENV_KEYS = frozenset({"LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ"})
 
 
 @dataclass(frozen=True)
@@ -38,12 +49,59 @@ class ResolvedBinary:
     sha256: str
 
 
-def _hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+class _SecurePathError(ValueError):
+    def __init__(self, code: str, reason: str) -> None:
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
+class _ProcessLimitError(RuntimeError):
+    def __init__(self, code: str, reason: str) -> None:
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
+def _absolute_without_symlinks(path: str | Path, *, label: str) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    candidate = Path(os.path.abspath(candidate))
+    current = Path(candidate.anchor)
+    for component in candidate.parts[1:]:
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            raise _SecurePathError(f"{label}_missing", f"{label} is missing") from None
+        if stat.S_ISLNK(mode):
+            raise _SecurePathError(f"{label}_symlink", f"{label} may not use symlinks")
+    return candidate
+
+
+def _hash_file(path: Path, *, limit: int, label: str) -> str:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise _SecurePathError(f"{label}_symlink", f"{label} may not use symlinks") from None
+        raise
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _SecurePathError(f"{label}_not_regular", f"{label} must be a regular file")
+        if metadata.st_size > limit:
+            raise _SecurePathError(
+                f"{label}_too_large",
+                f"{label} exceeds the {limit} byte limit",
+            )
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, 1024 * 1024):
             digest.update(chunk)
-    return digest.hexdigest()
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
 
 
 def resolve_binary(
@@ -51,7 +109,7 @@ def resolve_binary(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> ResolvedBinary | SliceRefusal:
-    """Resolve settings first, then CHUDWARE_SLICER_BIN, without guessing a fallback."""
+    """Resolve an explicit binary without PATH lookup or symlink traversal."""
 
     environment = os.environ if environ is None else environ
     selected = str(configured_path) if configured_path is not None else environment.get(SLICER_ENV_VAR)
@@ -61,29 +119,27 @@ def resolve_binary(
             message=f"Slicing requires {SLICER_ENV_VAR} or an explicit slicer settings path.",
             missing_prerequisite=SLICER_ENV_VAR,
         )
-    path = Path(selected).expanduser().resolve()
-    if not path.is_file():
-        return SliceRefusal(
-            code="slicer_binary_unavailable",
-            message=f"The slicer configured by {SLICER_ENV_VAR} is not a file.",
-            missing_prerequisite=SLICER_ENV_VAR,
-            detail=str(path),
-        )
-    if path.suffix != ".py" and not os.access(path, os.X_OK):
-        return SliceRefusal(
-            code="slicer_binary_not_executable",
-            message=f"The slicer configured by {SLICER_ENV_VAR} is not executable.",
-            missing_prerequisite=SLICER_ENV_VAR,
-            detail=str(path),
-        )
     try:
-        return ResolvedBinary(path=path, sha256=_hash_file(path))
-    except OSError as exc:
+        path = _absolute_without_symlinks(selected, label="slicer_binary")
+        if path.suffix != ".py" and not os.access(path, os.X_OK):
+            return SliceRefusal(
+                code="slicer_binary_not_executable",
+                message=f"The slicer configured by {SLICER_ENV_VAR} is not executable.",
+                missing_prerequisite=SLICER_ENV_VAR,
+            )
+        digest = _hash_file(path, limit=MAX_BINARY_BYTES, label="slicer_binary")
+        return ResolvedBinary(path=path, sha256=digest)
+    except _SecurePathError as exc:
+        return SliceRefusal(
+            code=exc.code,
+            message=exc.reason,
+            missing_prerequisite=SLICER_ENV_VAR,
+        )
+    except OSError:
         return SliceRefusal(
             code="slicer_binary_unreadable",
-            message=f"The slicer configured by {SLICER_ENV_VAR} cannot be hashed.",
+            message=f"The slicer configured by {SLICER_ENV_VAR} cannot be read.",
             missing_prerequisite=SLICER_ENV_VAR,
-            detail=str(exc),
         )
 
 
@@ -110,9 +166,84 @@ def build_argv(
 
 def _atomic_write(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".part")
-    temporary.write_bytes(payload)
-    os.replace(temporary, path)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+def _read_limited(path: Path, *, limit: int, label: str) -> bytes:
+    try:
+        _absolute_without_symlinks(path, label=label)
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise _SecurePathError(f"{label}_symlink", f"{label} may not use symlinks") from None
+        raise
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _SecurePathError(f"{label}_not_regular", f"{label} must be a regular file")
+        if metadata.st_size > limit:
+            raise _SecurePathError(f"{label}_too_large", f"{label} exceeds the {limit} byte limit")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(fd, min(1024 * 1024, limit + 1 - total)):
+            total += len(chunk)
+            if total > limit:
+                raise _SecurePathError(f"{label}_too_large", f"{label} exceeds the {limit} byte limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _stage_binary(resolved: ResolvedBinary, work_dir: Path) -> ResolvedBinary:
+    suffix = ".py" if resolved.path.suffix == ".py" else ""
+    staged = work_dir / f"slicer-bin{suffix}"
+    source_fd = os.open(resolved.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".slicer-bin.", dir=work_dir)
+    temporary = Path(temporary_name)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with os.fdopen(descriptor, "wb") as target:
+            while chunk := os.read(source_fd, 1024 * 1024):
+                total += len(chunk)
+                if total > MAX_BINARY_BYTES:
+                    raise _SecurePathError(
+                        "slicer_binary_too_large",
+                        f"slicer_binary exceeds the {MAX_BINARY_BYTES} byte limit",
+                    )
+                digest.update(chunk)
+                target.write(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        if digest.hexdigest() != resolved.sha256:
+            raise _SecurePathError(
+                "slicer_binary_changed",
+                "The slicer binary changed while it was being prepared.",
+            )
+        temporary.chmod(0o700)
+        os.replace(temporary, staged)
+        return ResolvedBinary(staged, resolved.sha256)
+    finally:
+        os.close(source_fd)
+        temporary.unlink(missing_ok=True)
+
+
+def _scrubbed_environment(source: Mapping[str, str] | None) -> dict[str, str]:
+    provided = os.environ if source is None else source
+    environment = {key: provided[key] for key in _SAFE_ENV_KEYS if key in provided}
+    environment["PATH"] = ""
+    environment["PYTHONHASHSEED"] = "0"
+    return environment
 
 
 def _refusal(
@@ -132,21 +263,79 @@ def _refusal(
 
 
 def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=1.0)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + 1.0
+    group_alive = True
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            group_alive = False
+            break
+        time.sleep(0.01)
+    if group_alive:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
         process.wait()
 
 
-def _decode_tail(payload: bytes, limit: int = 8192) -> str:
-    return payload[-limit:].decode("utf-8", errors="replace")
+def _communicate_bounded(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout_s: float,
+    limit: int,
+) -> tuple[bytes, bytes]:
+    if process.stdout is None or process.stderr is None:
+        raise RuntimeError("slicer pipes were not created")
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout_s
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _ProcessLimitError(
+                    "slicer_timeout",
+                    "The slicer exceeded its wall-clock time limit.",
+                )
+            events = selector.select(remaining)
+            if not events:
+                continue
+            for key, _ in events:
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                target = streams[stream]
+                if len(target) + len(chunk) > limit:
+                    name = "stdout" if stream is process.stdout else "stderr"
+                    raise _ProcessLimitError(
+                        "slicer_output_limit",
+                        f"The slicer exceeded the {limit} byte {name} limit.",
+                    )
+                target.extend(chunk)
+        process.wait()
+        return bytes(streams[process.stdout]), bytes(streams[process.stderr])
+    except _ProcessLimitError:
+        _stop_process_group(process)
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
 
 
 def _number(payload: Mapping[str, Any], name: str) -> int | float:
@@ -188,10 +377,11 @@ def _parse_success(
     if not isinstance(artifact_payload, Mapping):
         raise ContractValidationError("sidecar result is missing artifact metadata")
     reported_path = artifact_payload.get("path")
-    if not isinstance(reported_path, str) or Path(reported_path).resolve() != output_part.resolve():
+    if (
+        not isinstance(reported_path, str)
+        or Path(os.path.abspath(reported_path)) != output_part
+    ):
         raise ContractValidationError("sidecar artifact path does not match the requested output")
-    if not output_part.is_file():
-        raise ContractValidationError("sidecar reported success without writing the artifact")
 
     identity = payload.get("sidecar")
     if not isinstance(identity, Mapping):
@@ -230,8 +420,8 @@ def _parse_success(
     if not isinstance(raw_warnings, list) or any(not isinstance(item, str) for item in raw_warnings):
         raise ContractValidationError("sidecar warnings must be a list of strings")
 
-    output_hash = _hash_file(output_part)
-    output_size = output_part.stat().st_size
+    output_hash = _hash_file(output_part, limit=MAX_ARTIFACT_BYTES, label="slicer_artifact")
+    output_size = output_part.lstat().st_size
     os.replace(output_part, output_final)
     profile_hashes = {
         f"{profile.kind}:{profile.id}": profile.bundle_sha256 for profile in request.profiles
@@ -268,6 +458,8 @@ def invoke_sidecar(
     binary: str | Path | None = None,
     timeout_s: float = 60.0,
     environ: Mapping[str, str] | None = None,
+    input_root: str | Path | None = None,
+    max_capture_bytes: int = MAX_CAPTURE_BYTES,
 ) -> SliceResult | SliceRefusal:
     """Run one deterministic generate-class slice and return data, never a traceback."""
 
@@ -276,69 +468,116 @@ def invoke_sidecar(
         return resolved
     if timeout_s <= 0:
         return SliceRefusal(code="invalid_timeout", message="Slicer timeout must be positive.")
+    if max_capture_bytes <= 0:
+        return SliceRefusal(
+            code="invalid_output_limit",
+            message="Slicer stdout and stderr limits must be positive.",
+        )
 
-    work_dir = Path(work_root).resolve() / request.request_id
-    request_path = work_dir / "request.json"
-    output_dir = work_dir / "out"
-    extension = request.output_format
-    output_part = output_dir / f"{request.request_id}.{extension}.part"
-    output_final = output_dir / f"{request.request_id}.{extension}"
-    sidecar_result_path = work_dir / "sidecar_result.json"
-
+    raw_work_root = Path(work_root).expanduser()
+    if ".." in raw_work_root.parts:
+        return SliceRefusal(
+            code="work_root_traversal",
+            message="The slicer working root may not contain parent traversal.",
+        )
+    work_dir: Path | None = None
     try:
+        if not raw_work_root.is_absolute():
+            raw_work_root = Path.cwd() / raw_work_root
+        raw_work_root.mkdir(parents=True, exist_ok=True)
+        secure_work_root = _absolute_without_symlinks(raw_work_root, label="work_root")
+        allowed_root = _absolute_without_symlinks(
+            input_root if input_root is not None else secure_work_root.parent,
+            label="model_root",
+        )
+        work_dir = secure_work_root / request.request_id
+        request_path = work_dir / "request.json"
+        output_dir = work_dir / "out"
+        extension = request.output_format
+        output_part = output_dir / f"{request.request_id}.{extension}.part"
+        output_final = output_dir / f"{request.request_id}.{extension}"
+        sidecar_result_path = work_dir / "sidecar_result.json"
+
         work_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
+        _absolute_without_symlinks(work_dir, label="work_directory")
+        _absolute_without_symlinks(output_dir, label="output_directory")
+        staged_binary = _stage_binary(resolved, work_dir)
+
         input_hashes: dict[str, str] = {}
         for model in request.models:
-            model_path = Path(model.path).expanduser().resolve()
-            if not model_path.is_file():
+            raw_model_path = Path(model.path).expanduser()
+            if not raw_model_path.is_absolute():
                 return _refusal(
-                    "missing_model_input",
-                    "A model input referenced by the slice request is missing.",
-                    detail=f"{model.id}: {model_path}",
+                    "model_path_not_absolute",
+                    "Model input paths must be absolute.",
                     work_dir=work_dir,
                 )
-            actual_hash = _hash_file(model_path)
+            if ".." in raw_model_path.parts:
+                return _refusal(
+                    "model_path_traversal",
+                    "Model input paths may not contain parent traversal.",
+                    work_dir=work_dir,
+                )
+            try:
+                model_path = _absolute_without_symlinks(raw_model_path, label="model_input")
+            except _SecurePathError as exc:
+                return _refusal(exc.code, exc.reason, work_dir=work_dir)
+            if not model_path.is_relative_to(allowed_root):
+                return _refusal(
+                    "model_path_escape",
+                    "A model input is outside the allowed model root.",
+                    work_dir=work_dir,
+                )
+            try:
+                actual_hash = _hash_file(
+                    model_path,
+                    limit=MAX_MODEL_BYTES,
+                    label="model_input",
+                )
+            except _SecurePathError as exc:
+                return _refusal(exc.code, exc.reason, work_dir=work_dir)
             if actual_hash != model.mesh_sha256:
                 return _refusal(
                     "model_hash_mismatch",
                     "A model input no longer matches its content hash.",
-                    detail=model.id,
                     work_dir=work_dir,
                 )
             input_hashes[model.id] = actual_hash
 
-        _atomic_write(request_path, canonical_json(request.to_dict()))
+        request_payload = canonical_json(request.to_dict())
+        if len(request_payload) > MAX_SIDECAR_RESULT_BYTES:
+            return _refusal(
+                "slice_request_too_large",
+                f"The slice request exceeds the {MAX_SIDECAR_RESULT_BYTES} byte limit.",
+                work_dir=work_dir,
+            )
+        _atomic_write(request_path, request_payload)
         for stale_path in (output_part, sidecar_result_path):
-            try:
-                stale_path.unlink()
-            except FileNotFoundError:
-                pass
-        argv = build_argv(resolved, request_path, output_part, sidecar_result_path)
+            stale_path.unlink(missing_ok=True)
+        argv = build_argv(staged_binary, request_path, output_part, sidecar_result_path)
         _atomic_write(work_dir / "cmd.txt", (shlex.join(argv) + "\n").encode("utf-8"))
 
-        child_env = dict(os.environ)
-        if environ is not None:
-            child_env.update(environ)
         process = subprocess.Popen(
             argv,
             cwd=work_dir,
-            env=child_env,
+            env=_scrubbed_environment(environ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
         try:
-            stdout, stderr = process.communicate(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            _stop_process_group(process)
-            stdout, stderr = process.communicate()
-            _atomic_write(work_dir / "stdout.log", stdout)
-            _atomic_write(work_dir / "stderr.log", stderr)
+            stdout, stderr = _communicate_bounded(
+                process,
+                timeout_s=timeout_s,
+                limit=max_capture_bytes,
+            )
+        except _ProcessLimitError as exc:
+            _atomic_write(work_dir / "stdout.log", b"")
+            _atomic_write(work_dir / "stderr.log", b"")
             return _refusal(
-                "slicer_timeout",
-                "The slicer exceeded its time limit and its process group was stopped.",
-                detail=_decode_tail(stderr),
+                exc.code,
+                exc.reason + " Its process group was stopped.",
                 work_dir=work_dir,
             )
         _atomic_write(work_dir / "stdout.log", stdout)
@@ -347,17 +586,22 @@ def invoke_sidecar(
             return _refusal(
                 "slicer_failed",
                 "The slicer exited without producing an accepted artifact.",
-                detail=f"exit={process.returncode}; stderr={_decode_tail(stderr)}",
+                detail=f"exit={process.returncode}",
                 work_dir=work_dir,
             )
-        if not sidecar_result_path.is_file():
+        if not sidecar_result_path.exists():
             return _refusal(
                 "malformed_sidecar_output",
                 "The slicer did not emit its required result JSON.",
                 work_dir=work_dir,
             )
         try:
-            raw = json.loads(sidecar_result_path.read_text(encoding="utf-8"))
+            result_bytes = _read_limited(
+                sidecar_result_path,
+                limit=MAX_SIDECAR_RESULT_BYTES,
+                label="sidecar_result",
+            )
+            raw = json.loads(result_bytes)
             if not isinstance(raw, Mapping):
                 raise ContractValidationError("sidecar result must be a JSON object")
             result = _parse_success(
@@ -368,19 +612,29 @@ def invoke_sidecar(
                 output_final=output_final,
                 input_hashes=input_hashes,
             )
-        except (OSError, UnicodeError, json.JSONDecodeError, ContractValidationError, KeyError, TypeError, ValueError) as exc:
+        except _SecurePathError as exc:
+            return _refusal(exc.code, exc.reason, work_dir=work_dir)
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            ContractValidationError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
             return _refusal(
                 "malformed_sidecar_output",
                 "The slicer result did not satisfy the slice contract.",
-                detail=str(exc),
                 work_dir=work_dir,
             )
         _atomic_write(work_dir / "result.json", canonical_json(result.to_dict()))
         return result
-    except OSError as exc:
+    except _SecurePathError as exc:
+        return _refusal(exc.code, exc.reason, work_dir=work_dir)
+    except OSError:
         return _refusal(
             "sidecar_io_failure",
             "The slicer working directory or process could not be used.",
-            detail=str(exc),
             work_dir=work_dir,
         )

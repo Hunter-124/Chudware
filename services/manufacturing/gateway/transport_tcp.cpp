@@ -3,13 +3,17 @@
 #include "device_allowlist.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <optional>
 #include <limits>
 #include <string>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -18,6 +22,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -78,6 +83,160 @@ struct HostPort {
     std::string port_text;
     std::uint16_t port = 0;
 };
+enum class AddressClass { Invalid, Loopback, Local, Public };
+
+std::string_view address_class_name(AddressClass value) {
+    switch (value) {
+        case AddressClass::Loopback: return "loopback";
+        case AddressClass::Local: return "local";
+        case AddressClass::Public: return "public";
+        case AddressClass::Invalid: return "invalid";
+    }
+    return "invalid";
+}
+
+AddressClass classify_ipv4(std::uint32_t network_address) {
+    const std::uint32_t address = ntohl(network_address);
+    const std::uint8_t first = static_cast<std::uint8_t>(address >> 24);
+    const std::uint8_t second = static_cast<std::uint8_t>(address >> 16);
+    if (first == 0 || first >= 224 || address == 0xffffffffU) return AddressClass::Invalid;
+    if (first == 127) return AddressClass::Loopback;
+    if (first == 10 || (first == 172 && second >= 16 && second <= 31) ||
+        (first == 192 && second == 168) || (first == 169 && second == 254))
+        return AddressClass::Local;
+    return AddressClass::Public;
+}
+
+AddressClass classify_ipv6(const in6_addr& address) {
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(&address);
+    bool all_zero = true;
+    for (std::size_t i = 0; i < 15; ++i) all_zero = all_zero && bytes[i] == 0;
+    if (all_zero && bytes[15] == 0) return AddressClass::Invalid;
+    if (all_zero && bytes[15] == 1) return AddressClass::Loopback;
+    if (bytes[0] == 0xff) return AddressClass::Invalid;
+    if ((bytes[0] & 0xfe) == 0xfc || (bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80))
+        return AddressClass::Local;
+    bool mapped = true;
+    for (std::size_t i = 0; i < 10; ++i) mapped = mapped && bytes[i] == 0;
+    mapped = mapped && bytes[10] == 0xff && bytes[11] == 0xff;
+    if (mapped) {
+        std::uint32_t ipv4 = 0;
+        std::memcpy(&ipv4, bytes + 12, sizeof(ipv4));
+        return classify_ipv4(ipv4);
+    }
+    return AddressClass::Public;
+}
+
+AddressClass classify_sockaddr(const sockaddr* address) {
+    if (address->sa_family == AF_INET)
+        return classify_ipv4(reinterpret_cast<const sockaddr_in*>(address)->sin_addr.s_addr);
+    if (address->sa_family == AF_INET6)
+        return classify_ipv6(reinterpret_cast<const sockaddr_in6*>(address)->sin6_addr);
+    return AddressClass::Invalid;
+}
+
+std::optional<AddressClass> commissioned_address_class(
+    std::string host, const AllowlistEntry& entry, std::string& why) {
+    if (const auto scope = host.find('%'); scope != std::string::npos) host.resize(scope);
+    in_addr ipv4{};
+    if (inet_pton(AF_INET, host.c_str(), &ipv4) == 1) return classify_ipv4(ipv4.s_addr);
+    in6_addr ipv6{};
+    if (inet_pton(AF_INET6, host.c_str(), &ipv6) == 1) return classify_ipv6(ipv6);
+
+    const auto field = entry.connection.find("address_class");
+    if (field == entry.connection.end()) {
+        why = "TCP resolution refused: commissioned DNS host requires address_class="
+              "loopback, local, or public";
+        return std::nullopt;
+    }
+    std::string value = field->second;
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (value == "loopback") return AddressClass::Loopback;
+    if (value == "local") return AddressClass::Local;
+    if (value == "public") return AddressClass::Public;
+    why = "TCP resolution refused: commissioned DNS address_class is invalid: " +
+          field->second;
+    return std::nullopt;
+}
+
+struct ResolvedAddress {
+    sockaddr_storage storage{};
+    int length = 0;
+    int family = AF_UNSPEC;
+    int socket_type = SOCK_STREAM;
+    int protocol = IPPROTO_TCP;
+    std::string numeric;
+
+    const sockaddr* address() const {
+        return reinterpret_cast<const sockaddr*>(&storage);
+    }
+};
+
+bool resolve_addresses(std::string_view host, std::string_view port,
+                       const TcpTransport::NameResolver& resolver,
+                       std::vector<ResolvedAddress>& result, std::string& why) {
+    std::vector<std::string> lookup_hosts;
+    int flags = 0;
+    if (resolver) {
+        try {
+            lookup_hosts = resolver(host);
+        } catch (const std::exception& error) {
+            why = "TCP endpoint resolution refused: resolver failed: " + std::string(error.what());
+            return false;
+        } catch (...) {
+            why = "TCP endpoint resolution refused: resolver failed";
+            return false;
+        }
+        if (lookup_hosts.empty()) {
+            why = "TCP endpoint resolution refused: resolver returned no addresses";
+            return false;
+        }
+        flags = AI_NUMERICHOST;
+    } else {
+        lookup_hosts.emplace_back(host);
+    }
+
+    for (const std::string& lookup_host : lookup_hosts) {
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        hints.ai_flags = flags;
+        addrinfo* addresses = nullptr;
+        const int lookup = getaddrinfo(lookup_host.c_str(), std::string(port).c_str(),
+                                       &hints, &addresses);
+        if (lookup != 0) {
+            why = std::string("TCP endpoint resolution failed: ") + gai_strerror(lookup);
+            return false;
+        }
+        for (const addrinfo* candidate = addresses; candidate != nullptr;
+             candidate = candidate->ai_next) {
+            if (candidate->ai_addrlen > sizeof(sockaddr_storage)) continue;
+            ResolvedAddress resolved;
+            std::memcpy(&resolved.storage, candidate->ai_addr, candidate->ai_addrlen);
+            resolved.length = static_cast<int>(candidate->ai_addrlen);
+            resolved.family = candidate->ai_family;
+            resolved.socket_type = candidate->ai_socktype;
+            resolved.protocol = candidate->ai_protocol;
+            std::array<char, NI_MAXHOST> numeric{};
+            if (getnameinfo(candidate->ai_addr, candidate->ai_addrlen, numeric.data(),
+                            static_cast<socklen_t>(numeric.size()), nullptr, 0,
+                            NI_NUMERICHOST) == 0)
+                resolved.numeric = numeric.data();
+            else
+                resolved.numeric = "<unknown>";
+            result.push_back(std::move(resolved));
+        }
+        freeaddrinfo(addresses);
+    }
+    if (result.empty()) {
+        why = "TCP endpoint resolution refused: resolver returned no compatible addresses";
+        return false;
+    }
+    return true;
+}
 
 bool parse_host_port(std::string address, HostPort& result, std::string& why) {
     const auto scheme = address.find("://");
@@ -176,6 +335,7 @@ struct TcpTransport::Impl {
     std::chrono::milliseconds connect_timeout;
     device::MachineClass machine_class;
     device::TransportKind commissioning_kind;
+    TcpTransport::NameResolver resolver;
     Socket socket = kInvalidSocket;
     bool terminal_event_pending = false;
     device::TransportEvent terminal_event;
@@ -194,9 +354,10 @@ struct TcpTransport::Impl {
 #endif
 
     Impl(DeviceAllowlist& list, device::MachineClass machine,
-         std::chrono::milliseconds timeout, device::TransportKind kind)
+         std::chrono::milliseconds timeout, device::TransportKind kind,
+         TcpTransport::NameResolver name_resolver)
         : allowlist(list), connect_timeout(timeout), machine_class(machine),
-          commissioning_kind(kind) {}
+          commissioning_kind(kind), resolver(std::move(name_resolver)) {}
 
     void drop_socket() {
         if (socket != kInvalidSocket) {
@@ -218,9 +379,10 @@ struct TcpTransport::Impl {
 
 TcpTransport::TcpTransport(DeviceAllowlist& allowlist, device::MachineClass machine_class,
                            std::chrono::milliseconds connect_timeout,
-                           device::TransportKind commissioning_kind)
+                           device::TransportKind commissioning_kind,
+                           NameResolver resolver)
     : impl_(std::make_unique<Impl>(allowlist, machine_class, connect_timeout,
-                                   commissioning_kind)) {}
+                                   commissioning_kind, std::move(resolver))) {}
 TcpTransport::~TcpTransport() = default;
 TcpTransport::TcpTransport(TcpTransport&&) noexcept = default;
 TcpTransport& TcpTransport::operator=(TcpTransport&&) noexcept = default;
@@ -252,20 +414,31 @@ device::OpenResult TcpTransport::open(const device::Endpoint& endpoint) {
     if (!impl_->winsock.ok) return {false, "Winsock initialization failed"};
 #endif
 
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    addrinfo* addresses = nullptr;
-    const int lookup = getaddrinfo(endpoint_address.host.c_str(), endpoint_address.port_text.c_str(),
-                                   &hints, &addresses);
-    if (lookup != 0)
-        return {false, std::string("TCP endpoint resolution failed: ") + gai_strerror(lookup)};
+    std::vector<ResolvedAddress> addresses;
+    if (!resolve_addresses(endpoint_address.host, endpoint_address.port_text,
+                           impl_->resolver, addresses, why))
+        return {false, std::move(why)};
+    const auto commissioned_class =
+        commissioned_address_class(endpoint_address.host, *authorization.entry, why);
+    if (!commissioned_class) return {false, std::move(why)};
+    for (const auto& address : addresses) {
+        const AddressClass resolved_class = classify_sockaddr(address.address());
+        if (resolved_class == AddressClass::Invalid ||
+            resolved_class != *commissioned_class) {
+            return {
+                false,
+                "TCP resolution refused: resolved address " + address.numeric + " is " +
+                    std::string(address_class_name(resolved_class)) +
+                    " but commissioned host " + endpoint_address.host + " is " +
+                    std::string(address_class_name(*commissioned_class)),
+            };
+        }
+    }
 
     std::string last_error = "no compatible address";
     const auto deadline = std::chrono::steady_clock::now() + impl_->connect_timeout;
-    for (addrinfo* candidate = addresses; candidate != nullptr; candidate = candidate->ai_next) {
-        Socket socket = ::socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
+    for (const ResolvedAddress& candidate : addresses) {
+        Socket socket = ::socket(candidate.family, candidate.socket_type, candidate.protocol);
         if (socket == kInvalidSocket) {
             last_error = error_text(socket_error());
             continue;
@@ -281,8 +454,7 @@ device::OpenResult TcpTransport::open(const device::Endpoint& endpoint) {
         setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
 #endif
-        int connected = ::connect(socket, candidate->ai_addr,
-                                  static_cast<decltype(candidate->ai_addrlen)>(candidate->ai_addrlen));
+        int connected = ::connect(socket, candidate.address(), candidate.length);
         if (connected != 0) {
             const int connect_error = socket_error();
             if (!connect_pending(connect_error)) {
@@ -337,7 +509,7 @@ device::OpenResult TcpTransport::open(const device::Endpoint& endpoint) {
         impl_->socket = socket;
         break;
     }
-    freeaddrinfo(addresses);
+    addresses.clear();
     if (impl_->socket == kInvalidSocket) return {false, "TCP connect failed: " + last_error};
     return {true, {}};
 }
@@ -410,19 +582,26 @@ device::PollResult TcpTransport::poll(device::Deadline deadline) {
                         "device_lost: TCP poll failed: " + error_text(error));
     } else if (ready > 0) {
         bool saw_eof = false;
+        std::size_t bytes_polled = 0;
         for (;;) {
-            std::array<std::byte, 16 * 1024> buffer{};
+            if (bytes_polled >= kMaxPollBytes ||
+                (deadline != device::Deadline::max() &&
+                 deadline_timeout_ms(deadline) == 0))
+                break;
+            std::array<std::byte, 16 * 1024> buffer;
+            const std::size_t available =
+                std::min(buffer.size(), kMaxPollBytes - bytes_polled);
 #ifdef _WIN32
             const int count = ::recv(impl_->socket, reinterpret_cast<char*>(buffer.data()),
-                                     static_cast<int>(buffer.size()), 0);
+                                     static_cast<int>(available), 0);
 #else
-            const ssize_t count = ::recv(impl_->socket, buffer.data(), buffer.size(), 0);
+            const ssize_t count = ::recv(impl_->socket, buffer.data(), available, 0);
 #endif
             if (count > 0) {
                 device::TransportEvent event;
                 event.kind = device::TransportEvent::Kind::Data;
                 event.data.assign(buffer.begin(), buffer.begin() + count);
-                event.raw.assign(reinterpret_cast<const char*>(event.data.data()), event.data.size());
+                bytes_polled += static_cast<std::size_t>(count);
                 result.events.push_back(std::move(event));
                 continue;
             }

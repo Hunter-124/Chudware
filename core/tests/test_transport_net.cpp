@@ -210,15 +210,19 @@ private:
     std::filesystem::path file_;
 
 public:
-    CommissionedEndpoint(TransportKind kind, std::uint16_t port, std::string path = {})
+    CommissionedEndpoint(TransportKind kind, std::uint16_t port, std::string path = {},
+                         std::string host = "127.0.0.1",
+                         std::string address_class = {})
         : file_(std::filesystem::temp_directory_path() /
                 ("chudware-net-allowlist-" + std::to_string(::getpid()) + "-" +
                  std::to_string(counter_.fetch_add(1)))),
           allowlist(file_) {
         AllowlistEntry entry;
-        entry.endpoint = EndpointIdentity::network(kind, "127.0.0.1", port);
+        entry.endpoint = EndpointIdentity::network(kind, std::move(host), port);
         entry.machine_class = MachineClass::OpenFrameMill;
         if (!path.empty()) entry.connection["path"] = std::move(path);
+        if (!address_class.empty())
+            entry.connection["address_class"] = std::move(address_class);
         entry.operator_note = "in-process transport fixture";
         std::string why;
         if (!allowlist.upsert(entry, &why)) throw std::runtime_error(why);
@@ -300,8 +304,64 @@ TEST_CASE("TCP round trip is non-blocking, commissioned, simulated, and capped a
     REQUIRE_FALSE(events.empty());
     CHECK(events.front().kind == TransportEvent::Kind::Data);
     CHECK(text(events.front().data) == "hello");
+    CHECK(events.front().raw.empty());
     transport.close();
     server.finish();
+}
+
+TEST_CASE("TCP flood is capped per poll, carries no raw copy, and honors an expired deadline") {
+    FakeServer server([](int peer) {
+        std::array<std::byte, 16 * 1024> chunk{};
+        std::size_t sent = 0;
+        while (sent < 2 * 1024 * 1024) {
+            const ssize_t count =
+                ::send(peer, chunk.data(), chunk.size(), MSG_NOSIGNAL);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) break;
+            sent += static_cast<std::size_t>(count);
+        }
+    });
+    CommissionedEndpoint commissioned(TransportKind::Tcp, server.port());
+    TcpTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill, 1s);
+    REQUIRE(transport.open(tcp_endpoint(server.port())).ok);
+    std::this_thread::sleep_for(20ms);
+
+    const auto first = transport.poll(std::chrono::steady_clock::now() + 1s);
+    std::size_t first_bytes = 0;
+    for (const auto& event : first.events) {
+        if (event.kind != TransportEvent::Kind::Data) continue;
+        first_bytes += event.data.size();
+        CHECK(event.raw.empty());
+    }
+    CHECK(first_bytes == TcpTransport::kMaxPollBytes);
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto expired = transport.poll(started);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    std::size_t expired_bytes = 0;
+    for (const auto& event : expired.events)
+        if (event.kind == TransportEvent::Kind::Data) expired_bytes += event.data.size();
+    CHECK(expired_bytes == 0);
+    CHECK(elapsed < 100ms);
+    transport.close();
+    server.finish();
+}
+
+TEST_CASE("TCP refuses hostile DNS resolution outside the commissioned address class") {
+    CommissionedEndpoint commissioned(TransportKind::Tcp, 45678, {}, "printer.internal",
+                                      "local");
+    TcpTransport transport(
+        commissioned.allowlist, MachineClass::OpenFrameMill, 100ms, TransportKind::Tcp,
+        [](std::string_view host) {
+            CHECK(host == "printer.internal");
+            return std::vector<std::string>{"203.0.113.10"};
+        });
+    const auto result =
+        transport.open({"hostile-dns", "tcp://printer.internal:45678", true});
+    CHECK_FALSE(result.ok);
+    CHECK(result.why.find("TCP resolution refused") != std::string::npos);
+    CHECK(result.why.find("public") != std::string::npos);
+    CHECK(result.why.find("local") != std::string::npos);
 }
 
 TEST_CASE("TCP refuses uncommissioned endpoints before any connection attempt") {

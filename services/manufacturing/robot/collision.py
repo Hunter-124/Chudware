@@ -7,6 +7,15 @@ from typing import Iterable
 from .kinematics import forward_kinematics, pose_translation
 from .model import BoxObstacle, CellModel, Vector3
 
+MAX_COLLISION_PAIR_CHECKS = 1_000_000
+
+
+class CollisionResourceRefusal(ValueError):
+    def __init__(self, code: str, reason: str) -> None:
+        super().__init__(f"{code}: {reason}")
+        self.code = code
+        self.reason = reason
+
 
 @dataclass(frozen=True)
 class CollisionContact:
@@ -27,6 +36,12 @@ class CollisionResult:
 def check_collisions(cell: CellModel, joint_values: Iterable[float]) -> CollisionResult:
     fk = forward_kinematics(cell.chain, joint_values, cell.tcp)
     points = [pose_translation(fk.link_poses[link]) for link in cell.chain.links]
+    pair_checks = max(0, len(points) - 1) * len(cell.obstacles)
+    if pair_checks > MAX_COLLISION_PAIR_CHECKS:
+        raise CollisionResourceRefusal(
+            "collision_pair_limit",
+            f"collision analysis exceeds the {MAX_COLLISION_PAIR_CHECKS} pair-check limit",
+        )
     contacts: list[CollisionContact] = []
     for index, (start, end) in enumerate(zip(points, points[1:])):
         link_id = cell.chain.links[index + 1]

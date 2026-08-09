@@ -131,26 +131,32 @@ class PrusaLinkAdapter(PrinterAdapter):
 
     def snapshot(self) -> list[dict[str, Any]]:
         self._require_operation("snapshot")
-        status = self.http.request_json("GET", "/api/v1/status")
-        if not isinstance(status, Mapping) or not isinstance(status.get("printer"), Mapping):
-            raise ProtocolError("PrusaLink status response lacks required printer object")
-        printer = status["printer"]
-        job = status.get("job") if isinstance(status.get("job"), Mapping) else {}
-        raw = status
-        vendor_state = printer.get("state")
-        folded = vendor_state.upper() if isinstance(vendor_state, str) else ""
-        device = _DEVICE_STATE.get(folded)
-        run = _JOB_STATE.get(folded)
-        return [
-            self._row("device_state", device if device is not None else _MISSING, raw=raw, why=f"unmapped PrusaLink state {vendor_state!r}"),
-            self._row("job_state", run if run is not None else _MISSING, raw=raw, why=f"unmapped PrusaLink job state {vendor_state!r}"),
-            self._row("job_name", string_or_missing(nested(job, "file", "display_name")), raw=raw),
-            self._row("progress", percent_fraction(job.get("progress")), raw=raw),
-            self._row("nozzle_temperature_c", number_or_missing(printer.get("temp_nozzle")), raw=raw),
-            self._row("nozzle_target_c", number_or_missing(printer.get("target_nozzle")), raw=raw),
-            self._row("bed_temperature_c", number_or_missing(printer.get("temp_bed")), raw=raw),
-            self._row("bed_target_c", number_or_missing(printer.get("target_bed")), raw=raw),
-        ]
+        try:
+            status = self.http.request_json("GET", "/api/v1/status")
+            if not isinstance(status, Mapping) or not isinstance(status.get("printer"), Mapping):
+                raise ProtocolError(
+                    "PrusaLink status response lacks required printer object",
+                    reason_code="malformed_body",
+                )
+            printer = status["printer"]
+            job = status.get("job") if isinstance(status.get("job"), Mapping) else {}
+            raw = status
+            vendor_state = printer.get("state")
+            folded = vendor_state.upper() if isinstance(vendor_state, str) else ""
+            device = _DEVICE_STATE.get(folded)
+            run = _JOB_STATE.get(folded)
+            return self._finish_snapshot([
+                self._row("device_state", device if device is not None else _MISSING, raw=raw, why=f"unmapped PrusaLink state {vendor_state!r}"),
+                self._row("job_state", run if run is not None else _MISSING, raw=raw, why=f"unmapped PrusaLink job state {vendor_state!r}"),
+                self._row("job_name", string_or_missing(nested(job, "file", "display_name")), raw=raw),
+                self._row("progress", percent_fraction(job.get("progress")), raw=raw),
+                self._row("nozzle_temperature_c", number_or_missing(printer.get("temp_nozzle")), raw=raw),
+                self._row("nozzle_target_c", number_or_missing(printer.get("target_nozzle")), raw=raw),
+                self._row("bed_temperature_c", number_or_missing(printer.get("temp_bed")), raw=raw),
+                self._row("bed_target_c", number_or_missing(printer.get("target_bed")), raw=raw),
+            ], raw)
+        except ProtocolError as error:
+            return self._unknown_snapshot(error)
 
     def upload(self, artifact: Artifact) -> dict[str, Any]:
         self._require_operation("upload")

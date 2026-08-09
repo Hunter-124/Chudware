@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from pathlib import Path
 
@@ -214,6 +215,44 @@ def test_offline_replay_is_deterministic_and_identical_to_session_windows(tmp_pa
         for line in (tmp_path / "windows.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert persisted == list(first.windows)
+
+
+def test_replay_refuses_clip_whose_bytes_miss_manifest_sha256(tmp_path: Path):
+    session = _session(tmp_path)
+    _record_event_session(session)
+    session.finalize()
+    clip_path = next((tmp_path / "clips").glob("*.json"))
+    clip = json.loads(clip_path.read_text(encoding="utf-8"))
+    clip["event_kind"] = "tampered"
+    clip_path.write_bytes(
+        json.dumps(clip, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    )
+
+    with pytest.raises(ValueError, match=rf"clip {clip_path.name} sha256 mismatch"):
+        replay_session(tmp_path)
+
+
+def test_replay_refuses_clip_whose_canonical_body_misses_clip_id(tmp_path: Path):
+    session = _session(tmp_path)
+    _record_event_session(session)
+    session.finalize()
+    clip_path = next((tmp_path / "clips").glob("*.json"))
+    clip = json.loads(clip_path.read_text(encoding="utf-8"))
+    clip["event_kind"] = "tampered"
+    encoded = json.dumps(
+        clip, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    clip_path.write_bytes(encoded)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[0]["sha256"] = hashlib.sha256(encoded).hexdigest()
+    manifest[0]["bytes"] = len(encoded)
+    manifest_path.write_bytes(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    )
+
+    with pytest.raises(ValueError, match=rf"clip {clip_path.name} clip_id mismatch"):
+        replay_session(tmp_path)
 
 
 class _CrashingExtractor:

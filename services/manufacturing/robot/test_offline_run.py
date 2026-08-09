@@ -1,10 +1,16 @@
 from pathlib import Path
+import pytest
 
 from .capability import capability_report
-from .collision import check_collisions
-from .model import BoxObstacle, CellModel
+from .collision import CollisionResourceRefusal, check_collisions
+from .model import BoxObstacle, CellModel, RobotChain, RobotJoint
 from .safety_boundary import RESERVED_METHOD_NAMES, RESERVED_REFUSALS, ReservedMethodRefusal, refuse_reserved_method
-from .trajectory import export_trajectory, mock_controller_run, preview_trajectory
+from .trajectory import (
+    RobotResourceRefusal,
+    export_trajectory,
+    mock_controller_run,
+    preview_trajectory,
+)
 from .urdf import import_urdf
 
 FIXTURES = Path(__file__).parents[3] / "fixtures" / "mfg" / "robot"
@@ -47,6 +53,42 @@ def test_trajectory_preview_export_and_mock_replay_are_deterministic(tmp_path: P
     csv_path = export_trajectory(trajectory, tmp_path / "preview.csv")
     assert '"not_for_execution": true' in json_path.read_text(encoding="utf-8")
     assert csv_path.read_text(encoding="utf-8").startswith("# not_for_execution=true")
+
+
+def test_trajectory_point_ceiling_refuses_before_allocation() -> None:
+    with pytest.raises(RobotResourceRefusal) as caught:
+        preview_trajectory(
+            _chain(),
+            ((0.0, 0.0), (1.0, 0.0)),
+            sample_period_s=1e-9,
+        )
+    assert caught.value.code == "trajectory_point_limit"
+
+
+def test_trajectory_export_refuses_symlink_target(tmp_path: Path) -> None:
+    trajectory = preview_trajectory(_chain(), ((0.0, 0.0), (0.1, 0.1)))
+    protected = tmp_path / "protected.json"
+    protected.write_text("keep", encoding="utf-8")
+    target = tmp_path / "preview.json"
+    target.symlink_to(protected)
+    with pytest.raises(RobotResourceRefusal) as caught:
+        export_trajectory(trajectory, target)
+    assert caught.value.code == "trajectory_path_symlink"
+    assert protected.read_text(encoding="utf-8") == "keep"
+
+
+def test_collision_pair_ceiling_refuses_cartesian_blowup() -> None:
+    links = tuple(f"l{index}" for index in range(1_002))
+    joints = tuple(
+        RobotJoint(f"j{index}", "fixed", links[index], links[index + 1])
+        for index in range(1_001)
+    )
+    chain = RobotChain("large", links[0], links[-1], links, joints)
+    obstacle = BoxObstacle("box", (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0))
+    cell = CellModel("large", chain, obstacles=(obstacle,) * 1_000)
+    with pytest.raises(CollisionResourceRefusal) as caught:
+        check_collisions(cell, ())
+    assert caught.value.code == "collision_pair_limit"
 
 
 def test_every_reserved_execute_transport_safety_name_refuses_by_name() -> None:

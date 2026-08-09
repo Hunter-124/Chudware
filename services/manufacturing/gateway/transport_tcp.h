@@ -1,9 +1,14 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <memory>
+#include <functional>
 #include <span>
 
+#include <string>
+#include <string_view>
+#include <vector>
 #include "device/device_id.h"
 
 #include "device/transport.h"
@@ -14,11 +19,14 @@ class DeviceAllowlist;
 
 class TcpTransport final : public device::ITransport {
 public:
+    using NameResolver = std::function<std::vector<std::string>(std::string_view)>;
+    static constexpr std::size_t kMaxPollBytes = 256 * 1024;
     explicit TcpTransport(DeviceAllowlist& allowlist, device::MachineClass machine_class,
                           std::chrono::milliseconds connect_timeout =
                               std::chrono::milliseconds{3000},
                           device::TransportKind commissioning_kind =
-                              device::TransportKind::Tcp);
+                              device::TransportKind::Tcp,
+                          NameResolver resolver = {});
     ~TcpTransport() override;
 
     TcpTransport(const TcpTransport&) = delete;

@@ -15,3 +15,7 @@ def test_synthetic_corpus_is_deterministic_valid_and_contains_events():
     assert first.windows.event_label.any()
     assert (~first.windows.event_label).any()
     assert first.anomaly_ticks == second.anomaly_ticks
+    assert first.regimes == second.regimes
+    assert first.split_labels == second.split_labels
+    assert set(first.regimes) == {"steady_cut", "material_change", "wear_ramp"}
+    assert set(first.split_labels) == {"train", "calibration", "test_locked"}

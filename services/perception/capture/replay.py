@@ -36,8 +36,39 @@ def _load_manifest(path: Path) -> list[dict[str, Any]]:
     return [record.to_dict() for record in validate_manifest(records)]
 
 
-def _load_clip(path: Path, extractor: FrameFeatureExtractor) -> tuple[dict[str, Any], tuple[FrameSample, ...]]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+def _load_clip(
+    path: Path,
+    extractor: FrameFeatureExtractor,
+    manifest_record: Mapping[str, Any],
+) -> tuple[dict[str, Any], tuple[FrameSample, ...]]:
+    encoded = path.read_bytes()
+    actual_sha256 = hashlib.sha256(encoded).hexdigest()
+    if actual_sha256 != str(manifest_record["sha256"]).lower():
+        raise ValueError(f"clip {path.name} sha256 mismatch")
+    raw = json.loads(encoded)
+    if not isinstance(raw, dict):
+        raise ValueError(f"clip {path.name} body must be an object")
+    claimed_clip_id = raw.get("clip_id")
+    canonical_body = dict(raw)
+    canonical_body.pop("clip_id", None)
+    try:
+        derived_clip_id = hashlib.sha256(
+            json.dumps(
+                canonical_body,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"clip {path.name} clip_id mismatch") from exc
+    if (
+        not isinstance(claimed_clip_id, str)
+        or claimed_clip_id != derived_clip_id
+        or claimed_clip_id != manifest_record["clip_id"]
+        or claimed_clip_id != path.stem
+    ):
+        raise ValueError(f"clip {path.name} clip_id mismatch")
     if raw.get("src") != ADVISORY_SOURCE:
         raise ValueError("capture clips must be advisory")
     samples: list[FrameSample] = []
@@ -101,9 +132,10 @@ def replay_session(root: str | Path, *, stride_ticks: int = 1) -> ReplayResult:
     extractor = FrameFeatureExtractor(spec)
     grouped: dict[str, list[tuple[dict[str, Any], tuple[FrameSample, ...]]]] = {}
     for clip_path in sorted((root_path / "clips").glob("*.json")):
-        clip, samples = _load_clip(clip_path, extractor)
-        if clip["clip_id"] not in manifest_by_clip:
-            raise ValueError(f"clip {clip['clip_id']} is absent from the landed manifest")
+        manifest_record = manifest_by_clip.get(clip_path.stem)
+        if manifest_record is None:
+            raise ValueError(f"clip {clip_path.name} is absent from the landed manifest")
+        clip, samples = _load_clip(clip_path, extractor, manifest_record)
         grouped.setdefault(str(clip["event_id"]), []).append((clip, samples))
 
     telemetry = [TelemetrySample.from_record(raw) for raw in _read_jsonl(root_path / "telemetry.jsonl")]

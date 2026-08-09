@@ -7,7 +7,13 @@ from .kinematics import (
     UnreachableTargetError, analyze_singularity, forward_kinematics,
     pose_translation, require_reachable,
 )
-from .urdf import import_srdf, import_urdf
+from .urdf import (
+    MAX_ELEMENTS,
+    MAX_XML_BYTES,
+    RobotXmlRefusal,
+    import_srdf,
+    import_urdf,
+)
 
 FIXTURES = Path(__file__).parents[3] / "fixtures" / "mfg" / "robot"
 
@@ -44,3 +50,48 @@ def test_singularity_detection_distinguishes_stretched_and_bent() -> None:
     chain = import_urdf(FIXTURES / "two_link.urdf")
     assert analyze_singularity(chain, (0.0, 0.0)).singular is True
     assert analyze_singularity(chain, (math.pi / 2.0, -math.pi / 2.0)).singular is False
+
+
+def test_robot_xml_forbids_doctype_and_entities() -> None:
+    hostile = (
+        '<!DOCTYPE robot [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+        '<robot name="x">&xxe;</robot>'
+    )
+    with pytest.raises(RobotXmlRefusal) as caught:
+        import_urdf(hostile)
+    assert caught.value.code == "robot_xml_declaration"
+    assert "/etc/passwd" not in caught.value.reason
+
+
+def test_robot_xml_refuses_traversal_symlink_and_oversize(tmp_path: Path) -> None:
+    robot = tmp_path / "robot.urdf"
+    robot.write_text(
+        '<robot name="x"><link name="a"/><link name="b"/>'
+        '<joint name="j" type="fixed"><parent link="a"/><child link="b"/></joint>'
+        '</robot>',
+        encoding="utf-8",
+    )
+    traversing = tmp_path / "nested" / ".." / "robot.urdf"
+    with pytest.raises(RobotXmlRefusal) as traversal:
+        import_urdf(traversing)
+    assert traversal.value.code == "robot_xml_traversal"
+
+    linked = tmp_path / "linked.urdf"
+    linked.symlink_to(robot)
+    with pytest.raises(RobotXmlRefusal) as symlink:
+        import_urdf(linked)
+    assert symlink.value.code == "robot_xml_symlink"
+
+    oversized = tmp_path / "oversized.urdf"
+    with oversized.open("wb") as stream:
+        stream.truncate(MAX_XML_BYTES + 1)
+    with pytest.raises(RobotXmlRefusal) as size:
+        import_urdf(oversized)
+    assert size.value.code == "robot_xml_too_large"
+
+
+def test_robot_xml_refuses_excessive_element_count() -> None:
+    payload = '<robot name="x">' + "<link/>" * MAX_ELEMENTS + "</robot>"
+    with pytest.raises(RobotXmlRefusal) as caught:
+        import_urdf(payload)
+    assert caught.value.code == "robot_xml_element_limit"

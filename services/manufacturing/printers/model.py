@@ -68,7 +68,9 @@ class ConfigurationError(AdapterError):
 
 
 class ProtocolError(AdapterError):
-    pass
+    def __init__(self, message: str, *, reason_code: str = "protocol_error") -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 class UnsupportedOperation(AdapterError):
@@ -269,7 +271,6 @@ def fresh_row(
     value: Any,
     available: bool,
     why: str | None,
-    raw: Any,
     src: SourceTruth,
     ttl_ms: int,
     redactor: Redactor,
@@ -288,7 +289,6 @@ def fresh_row(
             "src": src,
             "why": None,
             "last_ok": None,
-            "raw": redactor.value(raw),
         }
     return {
         "field": field,
@@ -301,5 +301,4 @@ def fresh_row(
         "src": src,
         "why": why or f"{field} absent from vendor telemetry",
         "last_ok": redactor.value(last_ok),
-        "raw": redactor.value(raw),
     }

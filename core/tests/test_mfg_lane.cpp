@@ -60,8 +60,10 @@ json findTransport(const json& listed, std::string_view kind) {
 }
 
 json call(ManufacturingLane& lane, std::string_view method, json params = json::object(),
-          bool expect_error = false) {
-    const auto handled = lane.handle(method, params);
+          bool expect_error = false,
+          chudware::mfg::LeaseOwner caller =
+              {"test", "test-seat", "test-session"}) {
+    const auto handled = lane.handle(method, params, caller);
     REQUIRE(handled.has_value());
     INFO("method=" << method << " body=" << handled->body.dump());
     CHECK(handled->is_error == expect_error);
@@ -138,13 +140,52 @@ json humanInitiator() {
     return {{"kind", "human"}, {"identity", "operator"}, {"seat", "human-seat"}};
 }
 
+struct StartedPrinterRun {
+    std::string run_id;
+    std::string approval_id;
+};
+
+StartedPrinterRun startPrinterRun(ManufacturingLane& lane,
+                                  const std::string& device_id,
+                                  const std::string& lease_id) {
+    const auto artifact = call(
+        lane, "mfg_artifact_register",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"artifact", {{"kind", "print_job"}, {"lines", json::array({"G28", "G1 X1"})},
+                       {"slicer_profile_hash", "slicer:terminal"}}}});
+    const auto preflight = call(
+        lane, "mfg_preflight_run",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"artifact_id", artifact.at("artifact").at("artifact_id")},
+         {"job", {{"job_id", "job:terminal"}, {"setup_revision", 1}, {"quantity", 1}}}});
+    const std::string run_id = preflight.at("run_id");
+    const auto proposal = call(
+        lane, "mfg_approval_propose",
+        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
+         {"exercisable_by", "human_only"}, {"expiry_ttl_ms", 60000},
+         {"attendance", {{"mode", "physical_attended"}, {"attested_by", "operator"}}}});
+    const auto approval = call(
+        lane, "mfg_approval_create",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"proposal_id", proposal.at("proposal").at("proposal_id")},
+         {"approver_auth", {{"identity", "operator"}, {"auth", "os_seat+pin"}}}});
+    const std::string approval_id = approval.at("approval").at("approval_id");
+    const auto started = call(
+        lane, "mfg_run_start",
+        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
+         {"approval_id", approval_id}, {"initiator", humanInitiator()}});
+    REQUIRE(started.at("state") == "running");
+    return {run_id, approval_id};
+}
+
 }  // namespace
 
 TEST_CASE("manufacturing lane does not intercept non manufacturing methods") {
     TempDirectory temp;
     ManufacturingLane lane(temp.path);
-    CHECK_FALSE(lane.handle("doc_list", json::object()).has_value());
-    const auto unknown = lane.handle("mfg_not_a_method", json::object());
+    const chudware::mfg::LeaseOwner caller{"test", "seat", "session"};
+    CHECK_FALSE(lane.handle("doc_list", json::object(), caller).has_value());
+    const auto unknown = lane.handle("mfg_not_a_method", json::object(), caller);
     REQUIRE(unknown.has_value());
     CHECK(unknown->is_error);
     CHECK(unknown->body.at("code") == "mfg_unknown_method");
@@ -152,26 +193,83 @@ TEST_CASE("manufacturing lane does not intercept non manufacturing methods") {
 
 TEST_CASE("commander claim is exclusive and every write requires the lease") {
     LaneRig rig;
-    rig.claim("first");
+    const chudware::mfg::LeaseOwner first{"test", "test-seat", "first"};
+    const chudware::mfg::LeaseOwner second{"test", "other", "second"};
+    const auto first_claim = call(
+        rig.lane, "mfg_device_claim", {{"device_id", rig.device_id}}, false, first);
+    rig.lease_id = first_claim.at("lease").at("lease_id");
     const auto refused = call(rig.lane, "mfg_device_claim",
-        {{"device_id", rig.device_id},
-         {"owner", {{"client_kind", "test"}, {"seat", "other"}, {"session", "second"}}}},
-        true);
+                              {{"device_id", rig.device_id}}, true, second);
     CHECK(refused.at("code") == "lease.takeover_refused");
     CHECK(refused.at("detail").at("current_owner").at("session") == "first");
 
     const auto unclaimed = call(rig.lane, "mfg_artifact_register",
         {{"device_id", rig.device_id},
-         {"artifact", {{"kind", "nc"}, {"content", "G0 X0\n"}}}}, true);
+         {"artifact", {{"kind", "nc"}, {"content", "G0 X0\n"}}}}, true, second);
     CHECK(unclaimed.at("code") == "lease.commander_held_by_caller");
     CHECK(unclaimed.at("detail").at("prerequisite") == "lease.commander_held_by_caller");
     const auto released = call(rig.lane, "mfg_device_release",
-        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}});
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}}, false, first);
     CHECK(released.at("released"));
     const auto takeover = call(rig.lane, "mfg_device_claim",
-        {{"device_id", rig.device_id},
-         {"owner", {{"client_kind", "test"}, {"seat", "other"}, {"session", "second"}}}});
+                               {{"device_id", rig.device_id}}, false, second);
     CHECK(takeover.at("lease").at("owner").at("session") == "second");
+}
+
+TEST_CASE("lease bearer value is caller-bound and redacted from observers") {
+    TempDirectory temp;
+    ManufacturingLane lane(temp.path);
+    const chudware::mfg::LeaseOwner human{"gui", "operator", "human-session"};
+    const chudware::mfg::LeaseOwner attacker{"mcp", "agent", "agent-session"};
+    const auto listed = call(lane, "mfg_device_list", json::object(), false, human);
+    const std::string device_id = listed.at("devices").at(0).at("device_id");
+    std::vector<json> events;
+    lane.setEventSink([&](const std::string& line) {
+        events.push_back(json::parse(line));
+    });
+    const auto claimed = call(
+        lane, "mfg_device_claim", {{"device_id", device_id}}, false, human);
+    const std::string lease_id = claimed.at("lease").at("lease_id");
+    REQUIRE(events.size() == 1);
+    CHECK_FALSE(events.at(0).at("data").at("lease").contains("lease_id"));
+
+    const auto owner_view =
+        call(lane, "mfg_device_list", json::object(), false, human);
+    CHECK(owner_view.at("devices").at(0).at("lease").at("lease_id") == lease_id);
+    const auto attacker_view =
+        call(lane, "mfg_device_list", json::object(), false, attacker);
+    CHECK_FALSE(attacker_view.at("devices").at(0).at("lease").contains("lease_id"));
+
+    const auto stolen_write = call(
+        lane, "mfg_artifact_register",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"artifact", {{"kind", "nc"}, {"content", "G0 X0\n"}}}},
+        true, attacker);
+    CHECK(stolen_write.at("code") == "lease.commander_held_by_caller");
+    const auto stolen_release = call(
+        lane, "mfg_device_release",
+        {{"device_id", device_id}, {"lease_id", lease_id}}, true, attacker);
+    CHECK(stolen_release.at("code") == "lease.commander_held_by_caller");
+    const auto forged_attention = call(
+        lane, "mfg_attention_raise",
+        {{"reason", "forged"}, {"why", "not the commander"}}, true, attacker);
+    CHECK(forged_attention.at("code") == "lease.commander_held_by_caller");
+    const auto journal_read =
+        call(lane, "mfg_journal_query", json::object(), true, attacker);
+    CHECK(journal_read.at("code") == "lease.commander_held_by_caller");
+}
+
+TEST_CASE("artifact registration rejects filesystem path sources") {
+    LaneRig rig;
+    rig.claim();
+    const auto refused = call(
+        rig.lane, "mfg_artifact_register",
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"artifact", {{"kind", "nc"}, {"path", "/etc/passwd"}}}},
+        true);
+    CHECK(refused.at("code") == "mfg_artifact_content_missing");
+    CHECK(refused.at("message").get<std::string>().find("content or lines") !=
+          std::string::npos);
 }
 
 TEST_CASE("reads before connect are explicit unknown FreshValues") {
@@ -521,15 +619,15 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
                          {{"subject_id", "worker-controlled"},
                           {"max_advertised", "execute"},
                           {"levels",
-                           {{"execute", {{"level", "execute"}, {"truth", "verified"}}},
-                            {"safety_integration",
-                             {{"level", "safety_integration"},
-                              {"truth", "verified"}}}}}}}};
+                           json::array(
+                               {{{"level", "execute"}, {"truth", "verified"}},
+                                {{"level", "safety_integration"},
+                                 {"truth", "verified"}}})}}}};
         if (method == "mfg_printer_adapter_snapshot")
             return json{{"ok", true},
                         {"rows", json::array(
-                             {{{"name", "state"}, {"v", "printing"}, {"seq", 999},
-                               {"approval_id", "worker-forged"}}})}};
+                             {{{"field", "job_state"}, {"v", "printing"}, {"seq", 999},
+                               {"src", "simulated"}, {"approval_id", "worker-forged"}}})}};
         if (method == "mfg_printer_adapter_upload")
             return json{{"ok", true},
                         {"remote_artifact", {{"path", "remote/print.gcode"}}}};
@@ -547,6 +645,11 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
          {{"device_id", device_id}, {"lease_id", lease_id}});
     CHECK(methods.at(0) == "mfg_printer_adapter_open");
     CHECK(methods.at(1) == "mfg_printer_adapter_probe");
+    CHECK(arguments.at("mfg_printer_adapter_open").at("endpoint").at("base_url") ==
+          arguments.at("mfg_printer_adapter_open").at("endpoint").at(
+              "expected_base_url"));
+    CHECK(arguments.at("mfg_printer_adapter_open").at("endpoint").at("base_url") ==
+          "http://127.0.0.1:39007");
     const auto capability = call(lane, "mfg_device_capability",
                                  {{"device_id", device_id}});
     CHECK(capability.at("capability").at("max_advertised") == "transport");
@@ -561,7 +664,8 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
                                 {{"device_id", device_id}});
     CHECK(methods.back() == "mfg_printer_adapter_snapshot");
     const auto& row = telemetry.at("snapshot").at("v").at("rows").at(0);
-    CHECK_FALSE(row.contains("seq"));
+    CHECK(row.at("seq") == telemetry.at("snapshot").at("seq"));
+    CHECK(row.at("seq") != 999);
     CHECK_FALSE(row.contains("approval_id"));
 
     const auto artifact = call(
@@ -630,6 +734,129 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
     CHECK(methods.back() == "mfg_printer_adapter_close");
 }
 
+TEST_CASE("printer terminal telemetry faults the run and raises attention") {
+    TempDirectory temp;
+    auto entry = commissioned(chudware::device::TransportKind::Tcp,
+                              chudware::device::MachineClass::FdmPrinterEnclosed,
+                              "terminal-printer");
+    entry.connection["adapter_kind"] = "moonraker";
+    entry.connection["auth_mode"] = "trusted_host";
+    seedAllowlist(temp.path, entry);
+    ManufacturingLane lane(temp.path);
+    bool terminal_snapshot = false;
+    lane.setWorkerCall([&](const std::string& method, const json&) {
+        if (method == "mfg_printer_adapter_probe")
+            return json{{"ok", true},
+                        {"report",
+                         {{"subject_id", "printer:real-shape"},
+                          {"max_advertised", "transport"},
+                          {"levels",
+                           json::array(
+                               {{{"level", "monitor"}, {"truth", "verified"}},
+                                {{"level", "transport"}, {"truth", "verified"}},
+                                {{"level", "execute"}, {"truth", "verified"}}})}}}};
+        if (method == "mfg_printer_adapter_snapshot")
+            return json{
+                {"ok", true},
+                {"rows",
+                 json::array(
+                     {{{"field", "device_state"},
+                       {"v", terminal_snapshot ? "alarm" : "idle"},
+                       {"state", "ok"}, {"t_mono_ns", 123}, {"seq", 999},
+                       {"age_ms", 0}, {"ttl_ms", 5000}, {"src", "simulated"},
+                       {"why", nullptr}, {"last_ok", nullptr},
+                       {"raw", json::object()}}})}};
+        if (method == "mfg_printer_adapter_upload")
+            return json{{"ok", true},
+                        {"remote_artifact", {{"path", "remote/terminal.gcode"}}}};
+        return json{{"ok", true}};
+    });
+    const auto candidate = findTransport(call(lane, "mfg_device_list"), "tcp");
+    const std::string device_id = candidate.at("device_id");
+    const auto claimed = call(
+        lane, "mfg_device_claim",
+        {{"device_id", device_id},
+         {"owner", {{"client_kind", "test"}, {"seat", "seat"},
+                    {"session", "terminal-printer"}}}});
+    const std::string lease_id = claimed.at("lease").at("lease_id");
+    call(lane, "mfg_device_connect",
+         {{"device_id", device_id}, {"lease_id", lease_id}});
+    const auto run = startPrinterRun(lane, device_id, lease_id);
+
+    std::vector<json> events;
+    lane.setEventSink([&](const std::string& line) {
+        events.push_back(json::parse(line));
+    });
+    terminal_snapshot = true;
+    const auto telemetry = call(
+        lane, "mfg_telemetry_snapshot", {{"device_id", device_id}});
+    const auto& row = telemetry.at("snapshot").at("v").at("rows").at(0);
+    CHECK(telemetry.at("snapshot").at("src") == "simulated");
+    CHECK(row.at("seq") == telemetry.at("snapshot").at("seq"));
+    CHECK(row.at("seq") != 999);
+    const auto described =
+        call(lane, "mfg_run_describe", {{"run_id", run.run_id}});
+    CHECK(described.at("run").at("state") == "faulted");
+    CHECK(described.at("run").at("discontinuity") == "alarm");
+    const auto attention = call(lane, "mfg_attention_list");
+    REQUIRE(attention.at("attention").size() == 1);
+    CHECK(attention.at("attention").at(0).at("reason") ==
+          "printer_terminal_fault");
+    CHECK(std::any_of(events.begin(), events.end(), [](const json& event) {
+        return event.at("event") == "mfg.attention" &&
+               event.at("data").at("action") == "raised";
+    }));
+    const auto resume = call(
+        lane, "mfg_run_resume",
+        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run.run_id},
+         {"initiator", humanInitiator()}},
+        true);
+    CHECK(resume.at("code") == "no_alarm_since_hold");
+    const auto hold = call(
+        lane, "mfg_run_hold",
+        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run.run_id},
+         {"kind", "feed_hold"}, {"initiator", humanInitiator()}},
+        true);
+    CHECK(hold.at("code") == "run.terminal");
+    const auto reconnect = call(
+        lane, "mfg_device_connect",
+        {{"device_id", device_id}, {"lease_id", lease_id}}, true);
+    CHECK(reconnect.at("code") == "mfg_transport_terminal");
+}
+
+TEST_CASE("printer connect preserves worker origin mismatch refusal") {
+    TempDirectory temp;
+    auto entry = commissioned(chudware::device::TransportKind::Tcp,
+                              chudware::device::MachineClass::FdmPrinterOpen,
+                              "origin-mismatch");
+    entry.connection["adapter_kind"] = "moonraker";
+    entry.connection["auth_mode"] = "trusted_host";
+    seedAllowlist(temp.path, entry);
+    ManufacturingLane lane(temp.path);
+    lane.setWorkerCall([](const std::string& method, const json& params) {
+        if (method == "mfg_printer_adapter_open") {
+            CHECK(params.at("endpoint").at("base_url") ==
+                  params.at("endpoint").at("expected_base_url"));
+            return json{{"ok", false}, {"error", "OriginMismatch"},
+                        {"message",
+                         "base_url does not match the lane-supplied expected endpoint"}};
+        }
+        return json{{"ok", true}};
+    });
+    const auto candidate = findTransport(call(lane, "mfg_device_list"), "tcp");
+    const auto claimed =
+        call(lane, "mfg_device_claim", {{"device_id", candidate.at("device_id")}});
+    const auto refused = call(
+        lane, "mfg_device_connect",
+        {{"device_id", candidate.at("device_id")},
+         {"lease_id", claimed.at("lease").at("lease_id")}},
+        true);
+    CHECK(refused.at("code") == "mfg_printer_worker_refused");
+    CHECK(refused.at("detail").at("method") == "mfg_printer_adapter_open");
+    CHECK(refused.at("detail").at("why").get<std::string>().find(
+              "expected endpoint") != std::string::npos);
+}
+
 TEST_CASE("printer connect names the missing worker method") {
     TempDirectory temp;
     seedAllowlist(temp.path, commissioned(
@@ -650,9 +877,39 @@ TEST_CASE("printer connect names the missing worker method") {
     CHECK(refused.at("detail").at("method") == "mfg_printer_adapter_open");
 }
 
+TEST_CASE("attention mutations enforce text and delivery history bounds") {
+    LaneRig rig;
+    rig.claim();
+    const auto oversized = call(
+        rig.lane, "mfg_attention_raise",
+        {{"id", "attention:oversized"}, {"reason", std::string(129, 'r')},
+         {"why", "bounded"}}, true);
+    CHECK(oversized.at("code") == "mfg_attention_invalid");
+    call(rig.lane, "mfg_attention_raise",
+         {{"id", "attention:bounded"}, {"reason", "delivery_test"},
+          {"why", "exercise the per-item delivery bound"}});
+    for (int attempt = 1; attempt <= 64; ++attempt) {
+        call(rig.lane, "mfg_attention_delivery",
+             {{"id", "attention:bounded"},
+              {"delivery", {{"channel", "desktop"}, {"attempt", attempt},
+                            {"status", "delivered"}}}});
+    }
+    const auto overflow = call(
+        rig.lane, "mfg_attention_delivery",
+        {{"id", "attention:bounded"},
+         {"delivery", {{"channel", "desktop"}, {"attempt", 65},
+                       {"status", "delivered"}}}},
+        true);
+    CHECK(overflow.at("code") == "mfg_attention_delivery_capacity");
+}
 TEST_CASE("attention lifecycle is durable and published on the lane stream") {
+
     TempDirectory temp;
     ManufacturingLane lane(temp.path);
+    const auto listed_devices = call(lane, "mfg_device_list");
+    const auto device_id =
+        listed_devices.at("devices").at(0).at("device_id").get<std::string>();
+    call(lane, "mfg_device_claim", {{"device_id", device_id}});
     std::vector<json> events;
     lane.setEventSink([&](const std::string& line) {
         events.push_back(json::parse(line));
@@ -672,7 +929,7 @@ TEST_CASE("attention lifecycle is durable and published on the lane stream") {
     CHECK(delivered.at("attention").at("deliveries").at(0).at("seq") != 999);
     const auto acknowledged = call(
         lane, "mfg_attention_ack", {{"id", "attention:test"}, {"by", "operator"}});
-    CHECK(acknowledged.at("attention").at("acknowledged_by") == "operator");
+    CHECK(acknowledged.at("attention").at("acknowledged_by") == "test-seat");
     const auto resolved = call(
         lane, "mfg_attention_resolve", {{"id", "attention:test"}});
     CHECK(resolved.at("attention").at("resolved_seq").get<std::uint64_t>() >

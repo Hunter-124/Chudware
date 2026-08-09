@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import json
 import logging
 import secrets
+import socket
 from typing import Any, Iterable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
@@ -22,6 +24,7 @@ from .model import AuthConfig, ProtocolError, Redactor
 
 _LOG = logging.getLogger(__name__)
 _MAX_ERROR_BYTES = 512
+_MAX_RESPONSE_BYTES = 1 << 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +42,30 @@ class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
         del req, fp, code, msg, headers, newurl
         return None
+
+
+def _transport_reason(error: BaseException) -> str:
+    reason = error.reason if isinstance(error, URLError) else error
+    text = str(reason).lower()
+    if isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in text:
+        return "timeout"
+    if (
+        isinstance(reason, ConnectionRefusedError)
+        or getattr(reason, "errno", None) == errno.ECONNREFUSED
+        or "connection refused" in text
+    ):
+        return "connect_refused"
+    return "transport_error"
+
+
+def _read_bounded(stream: Any) -> bytes:
+    body = stream.read(_MAX_RESPONSE_BYTES + 1)
+    if len(body) > _MAX_RESPONSE_BYTES:
+        raise ProtocolError(
+            f"printer HTTP response exceeded {_MAX_RESPONSE_BYTES} bytes",
+            reason_code="response_too_large",
+        )
+    return body
 
 
 class HttpClient:
@@ -78,17 +105,21 @@ class HttpClient:
         allowed = frozenset(expected)
         try:
             with self._opener.open(request, timeout=self.timeout_s) as response:
-                result = HttpResponse(response.status, dict(response.headers.items()), response.read())
+                result = HttpResponse(response.status, dict(response.headers.items()), _read_bounded(response))
         except HTTPError as exc:
-            result = HttpResponse(exc.code, dict(exc.headers.items()), exc.read())
+            result = HttpResponse(exc.code, dict(exc.headers.items()), _read_bounded(exc))
         except (URLError, TimeoutError, OSError) as exc:
-            raise ProtocolError(f"printer HTTP transport failed: {self.redactor.text(exc)}") from exc
+            raise ProtocolError(
+                f"printer HTTP transport failed: {self.redactor.text(exc)}",
+                reason_code=_transport_reason(exc),
+            ) from exc
         _LOG.debug("printer HTTP %s %s -> %d", method.upper(), "/" + relative.split("?", 1)[0], result.status)
         if result.status not in allowed:
             excerpt = self.redactor.text(result.body[:_MAX_ERROR_BYTES].decode("utf-8", errors="replace"))
             raise ProtocolError(
                 f"printer HTTP {method.upper()} refused with status {result.status}; "
-                f"content-type={result.content_type or 'missing'}; body={excerpt!r}"
+                f"content-type={result.content_type or 'missing'}; body={excerpt!r}",
+                reason_code=f"http_{result.status}",
             )
         return result
 
@@ -115,14 +146,21 @@ class HttpClient:
         if response.content_type != "application/json":
             raise ProtocolError(
                 f"printer HTTP {method.upper()} returned non-JSON content-type "
-                f"{response.content_type or 'missing'}"
+                f"{response.content_type or 'missing'}",
+                reason_code="malformed_body",
             )
         try:
             value = json.loads(response.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ProtocolError(f"printer HTTP {method.upper()} returned malformed JSON") from exc
+            raise ProtocolError(
+                f"printer HTTP {method.upper()} returned malformed JSON",
+                reason_code="malformed_body",
+            ) from exc
         if not isinstance(value, (dict, list)):
-            raise ProtocolError(f"printer HTTP {method.upper()} JSON root must be an object or array")
+            raise ProtocolError(
+                f"printer HTTP {method.upper()} JSON root must be an object or array",
+                reason_code="malformed_body",
+            )
         return self.redactor.value(value)
 
     def multipart(

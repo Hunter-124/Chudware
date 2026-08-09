@@ -16,6 +16,7 @@ from .model import ProtocolError, Redactor
 
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _MAX_MESSAGE = 4 * 1024 * 1024
+_MAX_FRAMES_PER_MESSAGE = 256
 
 
 class JsonWebSocket:
@@ -80,8 +81,12 @@ class JsonWebSocket:
     def recv_json(self) -> Any:
         fragments = bytearray()
         expecting_continuation = False
+        frame_count = 0
         while True:
             final, opcode, payload = self._recv_frame()
+            frame_count += 1
+            if frame_count > _MAX_FRAMES_PER_MESSAGE:
+                raise ProtocolError("Moonraker websocket message exceeded frame limit")
             if opcode == 0x8:
                 raise ProtocolError("Moonraker websocket closed")
             if opcode == 0x9:
@@ -90,6 +95,8 @@ class JsonWebSocket:
             if opcode == 0xA:
                 continue
             if opcode == 0x1:
+                if expecting_continuation:
+                    raise ProtocolError("Moonraker websocket interleaved a data frame")
                 fragments = bytearray(payload)
                 expecting_continuation = not final
             elif opcode == 0x0 and expecting_continuation:

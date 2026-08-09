@@ -12,6 +12,10 @@ from typing import Any, Mapping, Sequence
 _SHA256_LEN = 64
 _PROFILE_KINDS = frozenset({"printer", "filament", "process"})
 _OUTPUT_FORMATS = frozenset({"gcode", "bgcode", "3mf"})
+MAX_CANONICAL_BYTES = 4 * 1024 * 1024
+MAX_CANONICAL_ITEMS = 100_000
+MAX_CANONICAL_DEPTH = 64
+MAX_SLICE_COLLECTION_ITEMS = 10_000
 
 
 class ContractValidationError(ValueError):
@@ -30,6 +34,45 @@ def validate_sha256(value: str, field_name: str = "sha256") -> None:
         or any(ch not in "0123456789abcdef" for ch in value)
     ):
         raise ContractValidationError(f"{field_name} must be a lowercase SHA-256 hex digest")
+
+def _validate_canonical_shape(
+    value: Any,
+    *,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> None:
+    if depth > MAX_CANONICAL_DEPTH:
+        raise ContractValidationError(
+            f"canonical_input_depth: input exceeds depth {MAX_CANONICAL_DEPTH}"
+        )
+    if budget is None:
+        budget = [0, 0]
+    budget[0] += 1
+    if budget[0] > MAX_CANONICAL_ITEMS:
+        raise ContractValidationError(
+            f"canonical_input_limit: input exceeds {MAX_CANONICAL_ITEMS} items"
+        )
+    if isinstance(value, (str, Path)):
+        budget[1] += len(str(value).encode("utf-8"))
+    elif isinstance(value, Mapping):
+        if len(value) > MAX_CANONICAL_ITEMS:
+            raise ContractValidationError(
+                f"canonical_input_limit: input exceeds {MAX_CANONICAL_ITEMS} items"
+            )
+        for key, item in value.items():
+            _validate_canonical_shape(key, depth=depth + 1, budget=budget)
+            _validate_canonical_shape(item, depth=depth + 1, budget=budget)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        if len(value) > MAX_CANONICAL_ITEMS:
+            raise ContractValidationError(
+                f"canonical_input_limit: input exceeds {MAX_CANONICAL_ITEMS} items"
+            )
+        for item in value:
+            _validate_canonical_shape(item, depth=depth + 1, budget=budget)
+    if budget[1] > MAX_CANONICAL_BYTES:
+        raise ContractValidationError(
+            f"canonical_input_bytes: input exceeds {MAX_CANONICAL_BYTES} bytes"
+        )
 
 
 def _canonical_text(value: Any) -> str:
@@ -63,9 +106,15 @@ def _canonical_text(value: Any) -> str:
 
 
 def canonical_json(value: Any) -> bytes:
-    """Return canonical UTF-8 JSON with sorted keys and round-trip floats."""
+    """Return bounded canonical UTF-8 JSON with sorted keys and round-trip floats."""
 
-    return _canonical_text(value).encode("utf-8")
+    _validate_canonical_shape(value)
+    encoded = _canonical_text(value).encode("utf-8")
+    if len(encoded) > MAX_CANONICAL_BYTES:
+        raise ContractValidationError(
+            f"canonical_input_bytes: input exceeds {MAX_CANONICAL_BYTES} bytes"
+        )
+    return encoded
 
 
 def content_sha256(value: Any) -> str:
@@ -163,6 +212,15 @@ class SliceRequest:
     request_id: str = field(init=False)
 
     def __post_init__(self) -> None:
+        if (
+            len(self.models) > MAX_SLICE_COLLECTION_ITEMS
+            or len(self.profiles) > MAX_SLICE_COLLECTION_ITEMS
+            or len(self.thumbnails) > MAX_SLICE_COLLECTION_ITEMS
+        ):
+            raise ContractValidationError(
+                "slice_collection_limit: request collections exceed "
+                f"{MAX_SLICE_COLLECTION_ITEMS} items"
+            )
         _require_text(self.project_id, "project_id")
         _require_text(self.plate_id, "plate_id")
         _require_text(self.sidecar_build_id, "sidecar_build_id")

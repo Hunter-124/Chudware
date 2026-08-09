@@ -5,11 +5,22 @@ from __future__ import annotations
 from collections.abc import Mapping
 import hashlib
 import json
+import re
 from typing import Any
 from urllib.parse import quote
 
 from .base import PrinterAdapter, _MISSING, nested, number_or_missing, percent_fraction, string_or_missing
 from .model import Artifact, EndpointConfig, ProtocolError, capability_report, operation_truth
+
+_SAFE_REMOTE_PATH = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+def _validated_remote_path(value: Any) -> str:
+    if not isinstance(value, str) or not value or value.startswith("/") or not _SAFE_REMOTE_PATH.fullmatch(value):
+        raise ProtocolError("OctoPrint returned an unsafe remote path")
+    if any(segment in {"", ".", ".."} for segment in value.split("/")):
+        raise ProtocolError("OctoPrint returned an unsafe remote path")
+    return value
 
 _DEVICE_STATE = {
     "operational": "idle",
@@ -92,33 +103,39 @@ class OctoPrintAdapter(PrinterAdapter):
         )
 
     def snapshot(self) -> list[dict[str, Any]]:
-        printer = self.http.request_json("GET", "/api/printer")
-        job = self.http.request_json("GET", "/api/job")
-        if not isinstance(printer, Mapping) or not isinstance(job, Mapping):
-            raise ProtocolError("OctoPrint snapshot endpoints must return JSON objects")
-        raw = {"printer": printer, "job": job}
-        vendor_state = nested(printer, "state", "text")
-        if not isinstance(vendor_state, str):
-            vendor_state = job.get("state")
-        folded = vendor_state.strip().lower() if isinstance(vendor_state, str) else ""
-        device = _DEVICE_STATE.get(folded)
-        run = _JOB_STATE.get(folded)
-        tool = nested(printer, "temperature", "tool0")
-        if not isinstance(tool, Mapping):
-            tool = {}
-        bed = nested(printer, "temperature", "bed")
-        if not isinstance(bed, Mapping):
-            bed = {}
-        return [
-            self._row("device_state", device if device is not None else _MISSING, raw=raw, why=f"unmapped OctoPrint state {vendor_state!r}"),
-            self._row("job_state", run if run is not None else _MISSING, raw=raw, why=f"unmapped OctoPrint job state {vendor_state!r}"),
-            self._row("job_name", string_or_missing(nested(job, "job", "file", "name")), raw=raw),
-            self._row("progress", percent_fraction(nested(job, "progress", "completion")), raw=raw),
-            self._row("nozzle_temperature_c", number_or_missing(tool.get("actual")), raw=raw),
-            self._row("nozzle_target_c", number_or_missing(tool.get("target")), raw=raw),
-            self._row("bed_temperature_c", number_or_missing(bed.get("actual")), raw=raw),
-            self._row("bed_target_c", number_or_missing(bed.get("target")), raw=raw),
-        ]
+        try:
+            printer = self.http.request_json("GET", "/api/printer")
+            job = self.http.request_json("GET", "/api/job")
+            if not isinstance(printer, Mapping) or not isinstance(job, Mapping):
+                raise ProtocolError(
+                    "OctoPrint snapshot endpoints must return JSON objects",
+                    reason_code="malformed_body",
+                )
+            raw = {"printer": printer, "job": job}
+            vendor_state = nested(printer, "state", "text")
+            if not isinstance(vendor_state, str):
+                vendor_state = job.get("state")
+            folded = vendor_state.strip().lower() if isinstance(vendor_state, str) else ""
+            device = _DEVICE_STATE.get(folded)
+            run = _JOB_STATE.get(folded)
+            tool = nested(printer, "temperature", "tool0")
+            if not isinstance(tool, Mapping):
+                tool = {}
+            bed = nested(printer, "temperature", "bed")
+            if not isinstance(bed, Mapping):
+                bed = {}
+            return self._finish_snapshot([
+                self._row("device_state", device if device is not None else _MISSING, raw=raw, why=f"unmapped OctoPrint state {vendor_state!r}"),
+                self._row("job_state", run if run is not None else _MISSING, raw=raw, why=f"unmapped OctoPrint job state {vendor_state!r}"),
+                self._row("job_name", string_or_missing(nested(job, "job", "file", "name")), raw=raw),
+                self._row("progress", percent_fraction(nested(job, "progress", "completion")), raw=raw),
+                self._row("nozzle_temperature_c", number_or_missing(tool.get("actual")), raw=raw),
+                self._row("nozzle_target_c", number_or_missing(tool.get("target")), raw=raw),
+                self._row("bed_temperature_c", number_or_missing(bed.get("actual")), raw=raw),
+                self._row("bed_target_c", number_or_missing(bed.get("target")), raw=raw),
+            ], raw)
+        except ProtocolError as error:
+            return self._unknown_snapshot(error)
 
     def upload(self, artifact: Artifact) -> dict[str, Any]:
         self._require_operation("upload")
@@ -134,9 +151,7 @@ class OctoPrintAdapter(PrinterAdapter):
         local = nested(payload, "files", "local")
         if not isinstance(local, Mapping):
             raise ProtocolError("OctoPrint upload response lacks files.local")
-        remote_path = local.get("path") or local.get("name")
-        if not isinstance(remote_path, str) or not remote_path:
-            raise ProtocolError("OctoPrint upload response lacks a remote path")
+        remote_path = _validated_remote_path(local.get("path") or local.get("name"))
         return {
             "adapter_kind": self.adapter_kind,
             "remote_path": remote_path,
@@ -148,9 +163,7 @@ class OctoPrintAdapter(PrinterAdapter):
     def start(self, remote_artifact: Mapping[str, Any], authorization_token: str | None = None) -> dict[str, Any]:
         self._require_authorization(authorization_token)
         self._require_operation("start")
-        remote_path = remote_artifact.get("remote_path")
-        if not isinstance(remote_path, str) or not remote_path:
-            raise ProtocolError("OctoPrint start requires a staged remote_path")
+        remote_path = _validated_remote_path(remote_artifact.get("remote_path"))
         selected = self.http.request_json(
             "POST",
             "/api/files/local/" + quote(remote_path, safe="/"),

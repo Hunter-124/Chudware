@@ -9,6 +9,7 @@ from .inspection import (
     InspectionPlan, InspectionResult, Tolerance, Verdict, build_inspection_result,
     evaluate_conformance, guardbanded_verdict, overall_verdict, screen_advisory,
 )
+from .limits import MAX_METROLOGY_ITEMS, MetrologyResourceRefusal
 from .offsets import (
     LocalityBlock, LocalityUse, OffsetProposal, OffsetTarget, OffsetTargetKind,
     guard_locality, propose_offset, propose_tool_offset, propose_wcs_offset,

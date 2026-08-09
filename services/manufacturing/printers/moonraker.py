@@ -78,17 +78,26 @@ class MoonrakerAdapter(PrinterAdapter):
         )
 
     def snapshot(self) -> list[dict[str, Any]]:
-        if self._info is None:
-            info_envelope = self.http.request_json("GET", "/printer/info")
-            info = nested(info_envelope, "result")
-            if not isinstance(info, Mapping):
-                raise ProtocolError("Moonraker /printer/info response lacks result object")
-            self._info = dict(info)
-        envelope = self.http.request_json("GET", f"/printer/objects/query?{_OBJECTS}")
-        status = nested(envelope, "result", "status")
-        if not isinstance(status, Mapping):
-            raise ProtocolError("Moonraker object query response lacks result.status")
-        return self._rows(status, self._info)
+        try:
+            if self._info is None:
+                info_envelope = self.http.request_json("GET", "/printer/info")
+                info = nested(info_envelope, "result")
+                if not isinstance(info, Mapping):
+                    raise ProtocolError(
+                        "Moonraker /printer/info response lacks result object",
+                        reason_code="malformed_body",
+                    )
+                self._info = dict(info)
+            envelope = self.http.request_json("GET", f"/printer/objects/query?{_OBJECTS}")
+            status = nested(envelope, "result", "status")
+            if not isinstance(status, Mapping):
+                raise ProtocolError(
+                    "Moonraker object query response lacks result.status",
+                    reason_code="malformed_body",
+                )
+            return self._rows(status, self._info)
+        except ProtocolError as error:
+            return self._unknown_snapshot(error)
 
     def upload(self, artifact: Artifact) -> dict[str, Any]:
         self._require_operation("upload")
@@ -167,7 +176,6 @@ class MoonrakerAdapter(PrinterAdapter):
                         "event": "snapshot",
                         "transport": "websocket",
                         "rows": self._rows(status, self._info or {}),
-                        "raw": self.redactor.value(message),
                     }
                 return
         except (ProtocolError, TimeoutError, OSError):
@@ -198,7 +206,7 @@ class MoonrakerAdapter(PrinterAdapter):
         device = _JOB_DEVICE_STATE.get(str(vendor_job).lower()) if isinstance(vendor_job, str) else None
         device = device or (_DEVICE_STATE.get(str(vendor_device).lower()) if isinstance(vendor_device, str) else None)
         job = _JOB_STATE.get(str(vendor_job).lower()) if isinstance(vendor_job, str) else None
-        return [
+        return self._finish_snapshot([
             self._row("device_state", device if device is not None else _MISSING, raw=raw, why=f"unmapped Moonraker state {vendor_job or vendor_device!r}"),
             self._row("job_state", job if job is not None else _MISSING, raw=raw, why=f"unmapped Moonraker job state {vendor_job!r}"),
             self._row("job_name", string_or_missing(print_stats.get("filename")), raw=raw),
@@ -207,4 +215,4 @@ class MoonrakerAdapter(PrinterAdapter):
             self._row("nozzle_target_c", number_or_missing(extruder.get("target")), raw=raw),
             self._row("bed_temperature_c", number_or_missing(bed.get("temperature")), raw=raw),
             self._row("bed_target_c", number_or_missing(bed.get("target")), raw=raw),
-        ]
+        ], raw)

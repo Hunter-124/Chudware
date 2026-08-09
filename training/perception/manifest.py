@@ -92,6 +92,28 @@ class ManifestRecord:
         return dict(self.values)
 
 
+def publication_eligible(
+    record: ManifestRecord | Mapping[str, Any],
+    *,
+    approved_license_refs: set[str] | frozenset[str],
+    approved_consent_refs: set[str] | frozenset[str],
+) -> bool:
+    """Return whether a reviewed record may enter a public dataset subset.
+
+    References are checked against release-specific approval sets so a merely
+    non-empty manifest string can never be mistaken for legal review.
+    """
+    parsed = record if isinstance(record, ManifestRecord) else ManifestRecord.from_dict(record)
+    values = parsed.values
+    return (
+        not values["export_restricted"]
+        and values["redaction_applied"]
+        and values["license"] in {"owned", "licensed", "synthetic"}
+        and values["license_ref"] in approved_license_refs
+        and values["consent_ref"] in approved_consent_refs
+    )
+
+
 def validate_manifest(records: Sequence[Mapping[str, Any]]) -> list[ManifestRecord]:
     parsed = [ManifestRecord.from_dict(record) for record in records]
     clip_ids = [record.values["clip_id"] for record in parsed]

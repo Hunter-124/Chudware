@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from itertools import islice
 from typing import Iterable
 
 from .model import Matrix4, RobotChain, ToolCenterPoint, Vector3
@@ -76,8 +77,8 @@ def axis_rotation(axis: Vector3, angle: float) -> Matrix4:
 
 
 def _joint_values(chain: RobotChain, values: Iterable[float]) -> dict[str, float]:
-    supplied = tuple(float(value) for value in values)
     movable = chain.movable_joints
+    supplied = tuple(float(value) for value in islice(values, len(movable) + 1))
     if len(supplied) != len(movable):
         raise ValueError(f"expected {len(movable)} joint values, got {len(supplied)}")
     result = dict(zip((joint.name for joint in movable), supplied))

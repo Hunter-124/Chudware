@@ -7,10 +7,21 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import hashlib
+from itertools import islice
 import json
 from typing import Iterable
 
 from .model import Nozzle, Package, PnpJob, Placement
+
+MAX_FAULT_IDS = 100_000
+MAX_SIMULATION_OUTCOMES = 1_000_000
+
+
+class PnpResourceRefusal(ValueError):
+    def __init__(self, code: str, reason: str) -> None:
+        super().__init__(f"{code}: {reason}")
+        self.code = code
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -47,7 +58,13 @@ class VirtualPnpMachine:
     driver = "virtual_null"
 
     def run(self, job: PnpJob, *, fault_placement_ids: Iterable[str] = ()) -> VirtualPnpRun:
-        fault_ids = frozenset(fault_placement_ids)
+        fault_values = tuple(islice(fault_placement_ids, MAX_FAULT_IDS + 1))
+        if len(fault_values) > MAX_FAULT_IDS:
+            raise PnpResourceRefusal(
+                "pnp_fault_id_limit",
+                f"fault injection exceeds the {MAX_FAULT_IDS} item limit",
+            )
+        fault_ids = frozenset(fault_values)
         package_map = job.package_map()
         feeders = job.feeder_map()
         nozzles = job.nozzles
@@ -57,6 +74,12 @@ class VirtualPnpMachine:
             else ()
         )
         instance_ids = tuple(item.id for item in instances) or (job.board.id,)
+        outcome_count = len(instance_ids) * len(job.board.placements)
+        if outcome_count > MAX_SIMULATION_OUTCOMES:
+            raise PnpResourceRefusal(
+                "pnp_simulation_limit",
+                f"simulation exceeds the {MAX_SIMULATION_OUTCOMES} outcome limit",
+            )
         outcomes: list[PlacementOutcome] = []
         tick = 0
         for instance_id in instance_ids:

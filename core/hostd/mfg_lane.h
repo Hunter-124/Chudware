@@ -41,7 +41,8 @@ public:
     ManufacturingLane& operator=(const ManufacturingLane&) = delete;
 
     std::optional<LaneRpcResult> handle(std::string_view method,
-                                        const nlohmann::json& params);
+                                        const nlohmann::json& params,
+                                        const LeaseOwner& caller);
     void setEventSink(EventSink sink);
     void setWorkerCall(WorkerCall call);
 
@@ -102,7 +103,8 @@ private:
         std::optional<gateway::AllowlistEntry> allowlist_entry;
     };
 
-    LaneRpcResult route(std::string_view method, const nlohmann::json& params);
+    LaneRpcResult route(std::string_view method, const nlohmann::json& params,
+                        const LeaseOwner& caller);
     LaneRpcResult ok(nlohmann::json fields = nlohmann::json::object()) const;
     LaneRpcResult refuse(std::string code, std::string message,
                          nlohmann::json detail = nlohmann::json::object()) const;
@@ -121,7 +123,9 @@ private:
     void restoreAttention();
     void applyAttention(const JournalRecord& record);
     bool validDevice(const nlohmann::json& params, LaneRpcResult& refusal) const;
-    bool requireLease(const nlohmann::json& params, LaneRpcResult& refusal);
+    bool requireLease(const nlohmann::json& params, const LeaseOwner& caller,
+                      LaneRpcResult& refusal);
+    bool requireCommander(const LeaseOwner& caller, LaneRpcResult& refusal);
     device::Seq appendEvent(std::string kind, std::string subject,
                             nlohmann::json body, nlohmann::json raw = nullptr);
     void publishEvent(std::string_view kind, std::string_view subject,

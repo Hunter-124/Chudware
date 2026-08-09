@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -169,6 +170,84 @@ struct PseudoTerminal {
         master = -1;
     }
 };
+void writeTextFile(const std::filesystem::path& path, std::string_view value) {
+    std::ofstream output(path);
+    REQUIRE(output.is_open());
+    output << value << '\n';
+}
+
+TEST_CASE("POSIX serial refuses generic symlinks and non-character devices by name") {
+    TempDirectory temporary;
+    DeviceAllowlist allowlist(temporary.path / "devices.allowlist");
+    PseudoTerminal pty;
+    std::string why;
+
+    const auto symlink_path = temporary.path / "serial-alias";
+    std::filesystem::create_symlink(pty.slave_path, symlink_path);
+    auto symlink_entry = serialEntry(symlink_path.string());
+    REQUIRE(allowlist.upsert(symlink_entry, &why));
+
+    SerialTransportOptions options;
+    options.operator_note = symlink_entry.operator_note;
+    options.posix_by_id_root = (temporary.path / "by-id").string();
+    SerialTransport transport(allowlist, MachineClass::Emulated, options);
+    const auto symlink_result =
+        transport.open({"symlink", symlink_path.string(), false});
+    CHECK_FALSE(symlink_result.ok);
+    CHECK(symlink_result.why.find("serial symlink refused") != std::string::npos);
+
+    const auto regular_path = temporary.path / "not-a-tty";
+    writeTextFile(regular_path, "not a serial device");
+    auto regular_entry = serialEntry(regular_path.string());
+    REQUIRE(allowlist.upsert(regular_entry, &why));
+    const auto regular_result =
+        transport.open({"regular", regular_path.string(), false});
+    CHECK_FALSE(regular_result.ok);
+    CHECK(regular_result.why.find("not a character device") != std::string::npos);
+}
+
+TEST_CASE("POSIX by-id serial open verifies the commissioned sysfs USB tuple") {
+    TempDirectory temporary;
+    DeviceAllowlist allowlist(temporary.path / "devices.allowlist");
+    PseudoTerminal pty;
+    const auto by_id_root = temporary.path / "by-id";
+    std::filesystem::create_directories(by_id_root);
+    const auto by_id_path = by_id_root / "usb-controller";
+    std::filesystem::create_symlink(pty.slave_path, by_id_path);
+
+    const auto sysfs_root = temporary.path / "sys-class-tty";
+    const auto sysfs_device =
+        sysfs_root / std::filesystem::path(pty.slave_path).filename() / "device";
+    std::filesystem::create_directories(sysfs_device);
+    writeTextFile(sysfs_device / "idVendor", "1A86");
+    writeTextFile(sysfs_device / "idProduct", "7523");
+    writeTextFile(sysfs_device / "serial", "CONTROLLER-42");
+
+    AllowlistEntry entry{
+        EndpointIdentity::serial(by_id_path.string(), "1a86", "7523", "CONTROLLER-42"),
+        MachineClass::Emulated,
+        {{"baud", "115200"}},
+        "USB tuple fixture",
+    };
+    std::string why;
+    REQUIRE(allowlist.upsert(entry, &why));
+
+    SerialTransportOptions options;
+    options.operator_note = entry.operator_note;
+    options.posix_by_id_root = by_id_root.string();
+    options.posix_sysfs_tty_root = sysfs_root.string();
+    SerialTransport transport(allowlist, MachineClass::Emulated, options);
+    const Endpoint endpoint{"usb-grbl", by_id_path.string(), false};
+    const auto matched = transport.open(endpoint);
+    REQUIRE_MESSAGE(matched.ok, matched.why);
+    transport.close();
+
+    writeTextFile(sysfs_device / "serial", "SUBSTITUTED-DEVICE");
+    const auto mismatched = transport.open(endpoint);
+    CHECK_FALSE(mismatched.ok);
+    CHECK(mismatched.why.find("serial USB identity mismatch") != std::string::npos);
+    CHECK(mismatched.why.find("SUBSTITUTED-DEVICE") != std::string::npos);
+}
 
 
 TEST_CASE("POSIX serial transport enforces allowlist and exclusive ownership") {

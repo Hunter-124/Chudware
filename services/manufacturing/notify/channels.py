@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import errno
+import http.client
+import ipaddress
 import json
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import deque
 from dataclasses import dataclass
@@ -125,34 +130,205 @@ class DesktopChannel:
     @staticmethod
     def _platform_command(title: str, body: str) -> list[str]:
         if sys.platform.startswith("linux") and shutil.which("notify-send"):
-            return ["notify-send", "--app-name=Chudware", title, body]
+            return ["notify-send", "--app-name=Chudware", "--", title, body]
         if sys.platform == "darwin" and shutil.which("osascript"):
-            script = 'display notification "' + body.replace('"', '\\"') + '" with title "' + title.replace('"', '\\"') + '"'
-            return ["osascript", "-e", script]
+            return [
+                "osascript",
+                "-e",
+                "on run argv",
+                "-e",
+                "display notification (item 1 of argv) with title (item 2 of argv)",
+                "-e",
+                "end run",
+                "--",
+                body,
+                title,
+            ]
         raise RuntimeError("desktop notifications are unavailable on this host")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+_ResolvedTarget = tuple[int, int, int, tuple[Any, ...]]
+
+
+def _connect_to_resolved(
+    connection: http.client.HTTPConnection, target: _ResolvedTarget
+) -> None:
+    family, socktype, proto, sockaddr = target
+    sys.audit("http.client.connect", connection, connection.host, connection.port)
+    sock = socket.socket(family, socktype, proto)
+    try:
+        sock.settimeout(connection.timeout)
+        if connection.source_address:
+            sock.bind(connection.source_address)
+        sock.connect(sockaddr)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as exc:
+            if exc.errno != errno.ENOPROTOOPT:
+                raise
+        connection.sock = sock
+        if connection._tunnel_host:
+            connection._tunnel()
+    except BaseException:
+        sock.close()
+        raise
+
+
+class _ResolvedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, *, resolved_target: _ResolvedTarget, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._resolved_target = resolved_target
+
+    def connect(self) -> None:
+        _connect_to_resolved(self, self._resolved_target)
+
+
+class _ResolvedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, *, resolved_target: _ResolvedTarget, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._resolved_target = resolved_target
+
+    def connect(self) -> None:
+        _connect_to_resolved(self, self._resolved_target)
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+class _ResolvedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, target: _ResolvedTarget) -> None:
+        super().__init__()
+        self._target = target
+
+    def http_open(self, request: urllib.request.Request) -> Any:
+        def connection(host: str, **kwargs: Any) -> _ResolvedHTTPConnection:
+            return _ResolvedHTTPConnection(host, resolved_target=self._target, **kwargs)
+
+        return self.do_open(connection, request)
+
+
+class _ResolvedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, target: _ResolvedTarget) -> None:
+        super().__init__()
+        self._target = target
+
+    def https_open(self, request: urllib.request.Request) -> Any:
+        def connection(host: str, **kwargs: Any) -> _ResolvedHTTPSConnection:
+            return _ResolvedHTTPSConnection(host, resolved_target=self._target, **kwargs)
+
+        return self.do_open(connection, request, context=self._context)
 
 
 class WebhookChannel:
     name = "webhook"
 
-    def __init__(self, url: str, *, timeout_s: float = 5.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        timeout_s: float = 5.0,
+        allow_private_networks: bool = False,
+    ) -> None:
         parsed = urlsplit(url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("webhook URL must be http(s)")
+        try:
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("webhook URL port is invalid") from exc
         self._url = url
+        self._hostname = parsed.hostname
+        self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
         self._timeout_s = timeout_s
+        self._allow_private_networks = allow_private_networks
+
+    def _resolve_target(self) -> _ResolvedTarget:
+        try:
+            answers = socket.getaddrinfo(
+                self._hostname,
+                self._port,
+                type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP,
+            )
+        except socket.gaierror as exc:
+            raise RuntimeError(
+                f"webhook target resolution failed for {self._hostname}: {exc}"
+            ) from exc
+        targets: list[_ResolvedTarget] = []
+        for family, socktype, proto, _canonical_name, sockaddr in answers:
+            if family not in {socket.AF_INET, socket.AF_INET6}:
+                continue
+            try:
+                address = ipaddress.ip_address(str(sockaddr[0]).split("%", 1)[0])
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"webhook target resolution returned an invalid address for {self._hostname}"
+                ) from exc
+            if address.is_unspecified:
+                raise RuntimeError(f"webhook target resolves to unspecified address {address}")
+            if address.is_multicast:
+                raise RuntimeError(f"webhook target resolves to multicast address {address}")
+            if not self._allow_private_networks:
+                refusal = next(
+                    (
+                        name
+                        for name, blocked in (
+                            ("loopback", address.is_loopback),
+                            ("link-local", address.is_link_local),
+                            ("reserved", address.is_reserved),
+                            ("private", address.is_private),
+                        )
+                        if blocked
+                    ),
+                    None,
+                )
+                if refusal:
+                    raise RuntimeError(
+                        f"webhook target resolves to {refusal} address {address}"
+                    )
+            targets.append((family, socktype, proto, sockaddr))
+        if not targets:
+            raise RuntimeError(
+                f"webhook target resolution returned no usable addresses for {self._hostname}"
+            )
+        return targets[0]
 
     def deliver(self, payload: Mapping[str, Any]) -> None:
+        target = self._resolve_target()
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _ResolvedHTTPHandler(target),
+            _ResolvedHTTPSHandler(target),
+            _NoRedirect(),
+        )
         request = urllib.request.Request(
             self._url,
             data=json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             headers={"Content-Type": "application/json", "User-Agent": "Chudware-Manufacturing/1"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self._timeout_s) as response:
-            if not 200 <= response.status < 300:
-                raise RuntimeError(f"webhook returned HTTP {response.status}")
-            response.read(1)
+        try:
+            with opener.open(request, timeout=self._timeout_s) as response:
+                if not 200 <= response.status < 300:
+                    raise RuntimeError(f"webhook returned HTTP {response.status}")
+                response.read(1)
+        except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise RuntimeError(f"webhook redirect refused with HTTP {exc.code}") from exc
+            raise RuntimeError(f"webhook returned HTTP {exc.code}") from exc
 
 
 @dataclass(frozen=True, slots=True)

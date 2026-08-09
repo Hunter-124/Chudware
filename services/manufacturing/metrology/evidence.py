@@ -11,6 +11,7 @@ from hashlib import sha256
 import json
 import math
 from typing import Any, ClassVar, Iterable
+from .limits import bounded_tuple
 
 
 class EvidenceClass(str, Enum):
@@ -103,8 +104,8 @@ class UncertaintyBudget:
 
     @classmethod
     def measured(cls, components: Iterable[UncertaintyComponent], *, k: float = 2.0) -> "UncertaintyBudget":
-        """Compute the GUM root-sum-square from input measurements; no tier table is used."""
-        return cls(tuple(components), k)
+        """Compute the GUM root-sum-square from bounded input measurements."""
+        return cls(bounded_tuple(components, label="uncertainty_components"), k)
 
     @property
     def basis(self) -> ComponentSource:
@@ -121,7 +122,7 @@ def _content_id(payload: dict[str, Any]) -> str:
 
 
 def _roots(derived_from: Iterable[str]) -> tuple[str, ...]:
-    roots = tuple(dict.fromkeys(derived_from))
+    roots = tuple(dict.fromkeys(bounded_tuple(derived_from, label="evidence_roots")))
     if any(not root for root in roots):
         raise ValueError("derived_from roots must not be empty strings")
     return roots

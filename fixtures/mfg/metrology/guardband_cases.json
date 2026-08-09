@@ -1,0 +1,8 @@
+[
+  {"measured_mm": 20.03, "nominal_mm": 20.0, "lower_mm": -0.05, "upper_mm": 0.05, "U_mm": 0.02, "verdict": "pass"},
+  {"measured_mm": 20.0300001, "nominal_mm": 20.0, "lower_mm": -0.05, "upper_mm": 0.05, "U_mm": 0.02, "verdict": "indeterminate"},
+  {"measured_mm": 20.07, "nominal_mm": 20.0, "lower_mm": -0.05, "upper_mm": 0.05, "U_mm": 0.02, "verdict": "indeterminate"},
+  {"measured_mm": 20.0700001, "nominal_mm": 20.0, "lower_mm": -0.05, "upper_mm": 0.05, "U_mm": 0.02, "verdict": "fail"},
+  {"measured_mm": 19.97, "nominal_mm": 20.0, "lower_mm": -0.05, "upper_mm": 0.05, "U_mm": 0.02, "verdict": "pass"},
+  {"measured_mm": 19.9299999, "nominal_mm": 20.0, "lower_mm": -0.05, "upper_mm": 0.05, "U_mm": 0.02, "verdict": "fail"}
+]

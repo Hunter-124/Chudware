@@ -1,0 +1,6 @@
+{
+  "a1_pass": {"inlier_ratio": 0.9, "residual_rms_px": 1.0, "coverage": 0.4, "planarity_cov": 0.1, "endpoints_in_expanded_hull": true, "hull_growth_board_diagonal": 0.2, "px_per_mm": 20.0, "length_mm": 50.0},
+  "a1_fail": {"inlier_ratio": 0.79, "residual_rms_px": 1.0, "coverage": 0.4, "planarity_cov": 0.1, "endpoints_in_expanded_hull": true, "hull_growth_board_diagonal": 0.2, "px_per_mm": 20.0, "length_mm": 50.0},
+  "a2_pass": {"view_count": 12, "reprojection_rms_px": 0.4, "controls_locked": true, "controls_readback_verified": true, "station_profile_live": true, "artifact_verification_live": true, "artifact_field_errors_mm": [-0.02, -0.01, 0.0, 0.01, 0.02], "px_per_mm": 20.0, "image_coverage": 0.65, "depth_bands": 3},
+  "a2_fail": {"view_count": 11, "reprojection_rms_px": 0.4, "controls_locked": true, "controls_readback_verified": true, "station_profile_live": true, "artifact_verification_live": true, "artifact_field_errors_mm": [-0.02, -0.01, 0.0, 0.01, 0.02], "px_per_mm": 20.0, "image_coverage": 0.65, "depth_bands": 3}
+}

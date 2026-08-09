@@ -2179,9 +2179,17 @@ endif()
 # transport implementation or physical execute path.
 add_library(chudware_manufacturing STATIC
   device/grbl_protocol.cpp
+  device/grbl_adapter.cpp
+  device/emulator_transport.cpp
   manufacturing/journal.cpp
   manufacturing/result_registry.cpp
-  manufacturing/invalidation.cpp)
+  manufacturing/invalidation.cpp
+  manufacturing/tier0.cpp
+  manufacturing/policy.cpp
+  manufacturing/gates.cpp
+  manufacturing/approval.cpp
+  manufacturing/lease.cpp
+  manufacturing/arbiter.cpp)
 target_compile_features(chudware_manufacturing PUBLIC cxx_std_20)
 target_include_directories(chudware_manufacturing PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_manufacturing PUBLIC nlohmann_json::nlohmann_json)
@@ -2201,3 +2209,28 @@ target_link_libraries(test_grbl_protocol PRIVATE chudware_manufacturing)
 set_target_properties(test_grbl_protocol PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_grbl_protocol COMMAND test_grbl_protocol)
+
+# Deterministic engineering twin: integer-tick only, links the SHARED Grbl codec so program
+# semantics cannot drift from the real device lane. Produces no execute-side authorization.
+add_library(chudware_twin STATIC twin/twin.cpp)
+target_compile_features(chudware_twin PUBLIC cxx_std_20)
+target_link_libraries(chudware_twin PUBLIC chudware_manufacturing)
+
+# Additive authoring / durable model. No transport, no upload, no start/pause/cancel.
+add_library(chudware_print STATIC print/model.cpp)
+target_compile_features(chudware_print PUBLIC cxx_std_20)
+target_link_libraries(chudware_print PUBLIC chudware_manufacturing)
+
+foreach(_mfg_test test_device_lane test_mfg_authorization test_twin test_print_model)
+  add_executable(${_mfg_test} tests/${_mfg_test}.cpp)
+  target_include_directories(${_mfg_test} PRIVATE ${doctest_SOURCE_DIR})
+  target_compile_definitions(${_mfg_test} PRIVATE
+    CHUDWARE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+  set_target_properties(${_mfg_test} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME ${_mfg_test} COMMAND ${_mfg_test})
+endforeach()
+target_link_libraries(test_device_lane PRIVATE chudware_manufacturing)
+target_link_libraries(test_mfg_authorization PRIVATE chudware_manufacturing)
+target_link_libraries(test_twin PRIVATE chudware_twin)
+target_link_libraries(test_print_model PRIVATE chudware_print)

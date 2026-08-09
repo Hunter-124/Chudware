@@ -6911,3 +6911,47 @@ Gates: `test_mfg_foundation` 329 assertions and `test_grbl_protocol` 16,011 asse
 Deferred by design, not omission: no transport opens a device, no arbiter/lease/approval path exists
 yet, no MCP tool is registered, and nothing advertises physical `execute` — that is phases P3–P7,
 and P7 is hardware-attended.
+
+## 2026-08-08 — Manufacturing overhaul, phase P3 authorization path + domain cores
+
+The hardware-free device lane and the deterministic authorization core landed. `core/device/grbl_adapter.{h,cpp}`
+binds the pure codec to `ControllerSnapshot`: identify into a `MachineFingerprint`, character-counted
+program streaming, hold/abort/reset as protocol operations, alarms and hard limits as terminal
+discontinuities that forbid transparent resume, lane-epoch bump on reopen, poll gaps painting
+`unknown` instead of last-good, and capability evidence capped at `parse`/`transport`.
+`core/device/emulator_transport.{h,cpp}` is a deterministic in-process `ITransport` speaking real Grbl
+1.1 with injectable alarm/hard-limit/door/disconnect/garbage/overflow faults; its endpoint is
+non-physical, so everything it produces is `src:"simulated"` and can never satisfy an execute-side gate.
+
+`core/manufacturing/{tier0,policy,gates,approval,lease,arbiter}.{h,cpp}` is the safety heart:
+artifact-dependent, machine-class-scoped Tier-0 construction refusals that name the missing capability
+or artifact; commissioning-owned machine-class policy (attendance, spindle authority requiring
+commanded *and* observed feedback, the `exercisable_by` ceiling); two-stage gates where Stage 1 admits
+only fresh probed evidence or a bound procedural fact and is never sufficient, and Stage 2 is
+`pass|fail|not_applicable` with durable named waivers and a seq-stamped report; `ApprovalBinding` with
+a one-shot nonce, `max_starts=1`, expiry and fingerprint-change falsification; an exclusive per-device
+command lease; and the arbiter as the ONLY validator of approval, with an injected clock and journal,
+recorded initiator provenance, and no path that resumes after a discontinuity.
+
+`core/twin/**` is the deterministic engineering twin — integer ticks only, snapshot/restore with a
+determinism hash, 3-axis kinematics driven by the SHARED Grbl codec so program semantics cannot drift
+from the real lane, heightfield material removal, typed collision and fault events, virtual sensors and
+cameras that are always `simulated`, a record/replay format, a `reset/step/observe/seed` training
+wrapper, and an honest `FidelityDeclaration`. A test asserts no twin-authored string claims
+certification, "collision-free", "provably safe", or "virtual commissioning".
+
+`core/print/**` is the additive durable model (project, plate placement, object instances by artifact
+hash, profile refs by id+hash, slice artifacts, immutable run records, monitoring rows) with
+`record_index` explicitly distinct from journal `seq`, and compile-time structural assertions that no
+open/upload/start/pause/cancel entry point exists. `services/manufacturing/metrology/**` makes the
+evidence boundary structural rather than documentary: advisory (camera) and qualified (probe)
+observations are different types with no converting constructor, the offset and conformance APIs accept
+only qualified observations, the A0–A2 and Q0–Q3 ladders compute uncertainty from measured inputs, and
+a locality guard refuses a Q2 offset used for datum transfer or a Q3 conformance claim.
+
+Gates: `ctest -R 'test_mfg_foundation|test_grbl_protocol|test_device_lane|test_mfg_authorization|test_twin|test_print_model'`
+6/6 pass; `pytest services/manufacturing` 41 passed; `pytest services/agent` 3347 passed / 7 skipped;
+`scripts/check.py` all 8 gates PASS.
+
+Still deferred: no real serial/TCP/WS transport, no gateway process or RPC dispatch, no MCP tools, no
+GUI surface, and nothing advertises physical `execute`.

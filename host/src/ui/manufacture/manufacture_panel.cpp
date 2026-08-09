@@ -1,14 +1,17 @@
 #include "manufacture_panel.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "imgui.h"
 #include "imgui_internal.h"
 
+#include "attention_panel.h"
 #include "approval_dialog.h"
 #include "device_panel.h"
 #include "mfg_mirror.h"
@@ -179,6 +182,46 @@ void endOperatorChild(const char* stableId) {
     ImGui::EndChild();
 }
 
+const std::string& signedInActor() {
+    static const std::string actor = [] {
+        const char* value = std::getenv("USER");
+        if (!value || !*value) value = std::getenv("USERNAME");
+        return value && *value ? std::string(value) : std::string();
+    }();
+    return actor;
+}
+
+void acknowledgeAttention(void* context, std::string_view itemId,
+                          std::string_view actor) {
+    auto* app = static_cast<AppState*>(context);
+    if (!app || itemId.empty() || actor.empty()) return;
+    queueManufactureRequest(*app, "mfg_attention_ack",
+                            {{"id", std::string(itemId)}, {"by", std::string(actor)}},
+                            "attention_ack");
+}
+
+std::size_t unacknowledgedCriticalCount(const MfgMirror& mirror) {
+    return static_cast<std::size_t>(std::count_if(
+        mirror.attention().begin(), mirror.attention().end(),
+        [](const MfgAttentionRow& item) {
+            return item.severity == "critical" && item.acknowledgedSeq == 0 &&
+                   item.resolvedSeq == 0;
+        }));
+}
+
+void drawAttentionBody(AppState& st) {
+    static const MfgAttentionRow emptyRow;
+    const std::vector<MfgAttentionRow>& rows = st.mfgMirror->attention();
+    MfgAttentionPanelInput input;
+    input.itemsData = rows.empty() ? &emptyRow : rows.data();
+    input.itemsCount = rows.size();
+    input.actor = signedInActor();
+    input.requestInFlight = st.mfg.requestInFlight;
+    input.acknowledgeContext = &st;
+    input.acknowledge = acknowledgeAttention;
+    drawManufactureAttentionPanel(input);
+}
+
 void drawOperatorDrawer(AppState& st, const ManufactureRegion& region) {
     const float bannerHeight = metrics::U(19);
     const float gap = metrics::U(2);
@@ -210,28 +253,54 @@ void drawOperatorDrawer(AppState& st, const ManufactureRegion& region) {
         drawInlineWarning(why);
     }
 
-    const float width = ImGui::GetContentRegionAvail().x;
-    const bool sideBySide = width >= metrics::U(210);
-    if (sideBySide) {
-        const float columnWidth = (width - gap) * 0.5f;
-        beginOperatorChild("##mfg_devices", ImVec2(columnWidth, 0));
-        drawManufactureDevicePanel(st);
-        endOperatorChild("mfg_devices_scroll");
-        ImGui::SameLine(0, gap);
-        beginOperatorChild("##mfg_runs", ImVec2(0, 0));
-        drawManufactureRunPanel(st);
-        endOperatorChild("mfg_runs_scroll");
-    } else if (ImGui::BeginTabBar("##mfg_operator_tabs")) {
+    const std::size_t criticalCount = st.mfgMirror
+                                          ? unacknowledgedCriticalCount(*st.mfgMirror)
+                                          : 0;
+    if (criticalCount > 0) {
+        ImGui::PushStyleColor(
+            ImGuiCol_Text,
+            ImVec4(palette.statusErr[0], palette.statusErr[1],
+                   palette.statusErr[2], palette.statusErr[3]));
+        ImGui::Text("%zu unacknowledged critical attention item%s",
+                    criticalCount, criticalCount == 1 ? "" : "s");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0, metrics::U(2));
+        ImGui::TextDisabled("Open Attention before operating the machine.");
+    }
+
+    if (ImGui::BeginTabBar("##mfg_operator_tabs")) {
         if (ImGui::BeginTabItem("Devices")) {
-            beginOperatorChild("##mfg_devices_narrow", ImVec2(0, 0));
+            beginOperatorChild("##mfg_devices", ImVec2(0, 0));
             drawManufactureDevicePanel(st);
-            endOperatorChild("mfg_devices_narrow_scroll");
+            endOperatorChild("mfg_devices_scroll");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Run")) {
-            beginOperatorChild("##mfg_runs_narrow", ImVec2(0, 0));
+            beginOperatorChild("##mfg_runs", ImVec2(0, 0));
             drawManufactureRunPanel(st);
-            endOperatorChild("mfg_runs_narrow_scroll");
+            endOperatorChild("mfg_runs_scroll");
+            ImGui::EndTabItem();
+        }
+
+        const std::string attentionLabel = criticalCount > 0
+            ? "Attention (" + std::to_string(criticalCount) + " critical)###mfg_attention"
+            : "Attention###mfg_attention";
+        ImGui::PushStyleColor(
+            ImGuiCol_Text,
+            criticalCount > 0
+                ? ImVec4(palette.statusErr[0], palette.statusErr[1],
+                         palette.statusErr[2], palette.statusErr[3])
+                : ImVec4(palette.text[0], palette.text[1],
+                         palette.text[2], palette.text[3]));
+        const ImGuiTabItemFlags attentionFlags =
+            st.shot ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+        const bool attentionOpen =
+            ImGui::BeginTabItem(attentionLabel.c_str(), nullptr, attentionFlags);
+        ImGui::PopStyleColor();
+        if (attentionOpen) {
+            beginOperatorChild("##mfg_attention", ImVec2(0, 0));
+            drawAttentionBody(st);
+            endOperatorChild("mfg_attention_scroll");
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -324,6 +393,8 @@ void drawManufacturePanel(AppState& st) {
         st.mfg.bootstrapQueued = true;
         queueManufactureRequest(st, "mfg_device_list", json::object(), "bootstrap_devices");
         queueManufactureRequest(st, "mfg_run_list", json::object(), "bootstrap_runs");
+        queueManufactureRequest(st, "mfg_attention_list", json::object(),
+                                "bootstrap_attention");
     }
 
     const ManufactureRegion region = operatorRegion();

@@ -133,6 +133,35 @@ TEST_CASE("work position and feed-only forms are supported independently") {
   CHECK_FALSE(parsed.value.line_number);
 }
 
+TEST_CASE("all documented pin and accessory codes parse in arbitrary order") {
+  const auto pins = parseStatusReport("<Idle|Pn:SRHY|MPos:0,0,0>");
+  CAPTURE(pins.reason);
+  REQUIRE(pins);
+  REQUIRE(pins.value.pins);
+  CHECK_FALSE(pins.value.pins->x_limit);
+  CHECK(pins.value.pins->y_limit);
+  CHECK_FALSE(pins.value.pins->z_limit);
+  CHECK_FALSE(pins.value.pins->probe);
+  CHECK_FALSE(pins.value.pins->door);
+  CHECK(pins.value.pins->hold);
+  CHECK(pins.value.pins->soft_reset);
+  CHECK(pins.value.pins->cycle_start);
+
+  const auto clockwise = parseStatusReport("<Run|A:S|MPos:0,0,0>");
+  CAPTURE(clockwise.reason);
+  REQUIRE(clockwise);
+  REQUIRE(clockwise.value.accessories);
+  CHECK(clockwise.value.accessories->spindle_cw);
+  CHECK_FALSE(clockwise.value.accessories->spindle_ccw);
+
+  const auto counterclockwise = parseStatusReport("<Run|MPos:0,0,0|A:C>");
+  CAPTURE(counterclockwise.reason);
+  REQUIRE(counterclockwise);
+  REQUIRE(counterclockwise.value.accessories);
+  CHECK_FALSE(counterclockwise.value.accessories->spindle_cw);
+  CHECK(counterclockwise.value.accessories->spindle_ccw);
+}
+
 TEST_CASE("all response and alarm codes use the Grbl 1.1 tables") {
   constexpr std::array error_codes{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
                                    20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,

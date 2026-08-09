@@ -4,6 +4,7 @@
 #include <array>
 #include <sstream>
 #include <utility>
+#include <limits>
 
 namespace ui {
 namespace {
@@ -77,6 +78,81 @@ MfgCommandAffordance parseAffordance(const json& controls, const char* name) {
         value.reason = "The gateway disabled this command without an enablement decision.";
     if (value.enabled) value.reason.clear();
     return value;
+}
+
+const json& attentionObject(const json& value) {
+    if (!value.is_object()) return value;
+    for (const char* key : {"attention", "item"}) {
+        const auto it = value.find(key);
+        if (it != value.end() && it->is_object()) return *it;
+    }
+    return value;
+}
+
+std::uint32_t attentionCount(const json& value, const char* key,
+                             std::uint32_t fallback = 1) {
+    const std::uint64_t raw = u64(value, key);
+    if (raw == 0) return fallback;
+    return static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(raw, std::numeric_limits<std::uint32_t>::max()));
+}
+
+MfgAttentionDelivery parseAttentionDelivery(const json& value,
+                                            std::uint64_t fallbackSeq = 0) {
+    MfgAttentionDelivery out;
+    out.channel = text(value, "channel");
+    out.status = text(value, "status");
+    out.error = text(value, "error");
+    out.seq = u64(value, "seq");
+    if (out.seq == 0) out.seq = fallbackSeq;
+    return out;
+}
+
+MfgAttentionRow parseAttentionRow(const json& value, std::uint64_t fallbackSeq = 0) {
+    const json& row = attentionObject(value);
+    MfgAttentionRow out;
+    out.id = text(row, "id");
+    out.severity = text(row, "severity");
+    out.device = text(row, "device");
+    out.run = text(row, "run");
+    out.reason = text(row, "reason");
+    out.why = text(row, "why");
+    out.raisedSeq = u64(row, "raised_seq");
+    if (out.raisedSeq == 0) out.raisedSeq = fallbackSeq;
+    out.acknowledgedBy = text(row, "acknowledged_by");
+    out.acknowledgedSeq = u64(row, "acknowledged_seq");
+    out.resolvedSeq = u64(row, "resolved_seq");
+    out.occurrenceCount = attentionCount(row, "occurrence_count");
+
+    const auto deliveries = row.find("deliveries");
+    if (deliveries != row.end() && deliveries->is_array()) {
+        out.deliveries.reserve(deliveries->size());
+        for (const json& delivery : *deliveries) {
+            if (delivery.is_object())
+                out.deliveries.push_back(parseAttentionDelivery(delivery));
+        }
+        std::stable_sort(out.deliveries.begin(), out.deliveries.end(),
+                         [](const MfgAttentionDelivery& left,
+                            const MfgAttentionDelivery& right) {
+                             return left.seq < right.seq;
+                         });
+    }
+    return out;
+}
+
+MfgAttentionRow* findAttention(std::vector<MfgAttentionRow>& rows,
+                               const std::string& id) {
+    const auto it = std::find_if(rows.begin(), rows.end(),
+                                 [&](const MfgAttentionRow& row) {
+                                     return row.id == id;
+                                 });
+    return it == rows.end() ? nullptr : &*it;
+}
+
+int severityRank(const std::string& severity) {
+    if (severity == "critical") return 2;
+    if (severity == "warning") return 1;
+    return 0;
 }
 
 }  // namespace
@@ -387,6 +463,144 @@ void MfgMirror::ingestApproval(const json& row) {
     else approval_.binding = approval;
 }
 
+void MfgMirror::ingestAttentionList(const json& result) {
+    const auto rows = result.find("attention");
+    if (rows == result.end() || !rows->is_array()) return;
+
+    std::vector<MfgAttentionRow> next;
+    next.reserve(rows->size());
+    std::uint64_t baselineSeq = u64(result, "result_seq");
+    for (const json& row : *rows) {
+        if (!row.is_object()) continue;
+        MfgAttentionRow item = parseAttentionRow(row);
+        if (item.id.empty()) continue;
+        baselineSeq = std::max(baselineSeq, item.raisedSeq);
+        baselineSeq = std::max(baselineSeq, item.acknowledgedSeq);
+        baselineSeq = std::max(baselineSeq, item.resolvedSeq);
+        for (const MfgAttentionDelivery& delivery : item.deliveries)
+            baselineSeq = std::max(baselineSeq, delivery.seq);
+        next.push_back(std::move(item));
+    }
+
+    attentionBaseline_ = std::move(next);
+    attentionBaselineSeq_ = baselineSeq;
+    attentionEvents_.erase(
+        std::remove_if(attentionEvents_.begin(), attentionEvents_.end(),
+                       [&](const auto& event) {
+                           return event.first <= attentionBaselineSeq_;
+                       }),
+        attentionEvents_.end());
+    rebuildAttention();
+}
+
+void MfgMirror::ingestAttentionEvent(const json& event, std::uint64_t seq) {
+    if (seq == 0 || seq <= attentionBaselineSeq_) return;
+
+    const json& data = event.find("data") != event.end() && event["data"].is_object()
+                           ? event["data"] : event;
+    const json& body = data.find("body") != data.end() && data["body"].is_object()
+                           ? data["body"] : data;
+    json normalized = body;
+    if (normalized.find("attention") == normalized.end()) {
+        const auto attention = data.find("attention");
+        if (attention != data.end() && attention->is_object())
+            normalized["attention"] = *attention;
+    }
+    if (text(normalized, "id").empty()) {
+        std::string subject = text(data, "subject");
+        if (subject.empty()) subject = text(event, "subject");
+        if (!subject.empty()) normalized["id"] = std::move(subject);
+    }
+
+    const auto position = std::lower_bound(
+        attentionEvents_.begin(), attentionEvents_.end(), seq,
+        [](const auto& stored, std::uint64_t candidate) {
+            return stored.first < candidate;
+        });
+    if (position != attentionEvents_.end() && position->first == seq) return;
+    attentionEvents_.insert(position, {seq, std::move(normalized)});
+    rebuildAttention();
+}
+
+void MfgMirror::rebuildAttention() {
+    attention_ = attentionBaseline_;
+    for (const auto& stored : attentionEvents_) {
+        const std::uint64_t seq = stored.first;
+        const json& body = stored.second;
+        const json& record = attentionObject(body);
+        const std::string action = text(body, "action");
+        std::string id = text(body, "id");
+        if (id.empty()) id = text(record, "id");
+        if (id.empty()) continue;
+
+        MfgAttentionRow* item = findAttention(attention_, id);
+        if (action == "raised") {
+            if (item) continue;
+            MfgAttentionRow raised = parseAttentionRow(body, seq);
+            if (raised.id.empty()) raised.id = id;
+            attention_.push_back(std::move(raised));
+            continue;
+        }
+
+        if (!item && record.find("raised_seq") != record.end()) {
+            MfgAttentionRow projected = parseAttentionRow(record);
+            if (projected.id.empty()) projected.id = id;
+            attention_.push_back(std::move(projected));
+            item = &attention_.back();
+        }
+        if (!item) continue;
+
+        if (action == "occurred") {
+            const std::uint64_t projectedCount = u64(record, "occurrence_count");
+            if (projectedCount > 0) {
+                item->occurrenceCount = attentionCount(record, "occurrence_count");
+            } else {
+                const std::uint64_t sum =
+                    static_cast<std::uint64_t>(item->occurrenceCount) +
+                    attentionCount(body, "count");
+                item->occurrenceCount = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(
+                        sum, std::numeric_limits<std::uint32_t>::max()));
+            }
+
+            std::string severity = text(body, "severity");
+            if (severity.empty()) severity = text(record, "severity");
+            if (severityRank(severity) > severityRank(item->severity))
+                item->severity = std::move(severity);
+            std::string why = text(body, "why");
+            if (why.empty()) why = text(record, "why");
+            if (!why.empty()) item->why = std::move(why);
+        } else if (action == "acknowledged") {
+            std::string actor = text(body, "by");
+            if (actor.empty()) actor = text(record, "acknowledged_by");
+            item->acknowledgedBy = std::move(actor);
+            item->acknowledgedSeq = u64(record, "acknowledged_seq");
+            if (item->acknowledgedSeq == 0) item->acknowledgedSeq = seq;
+        } else if (action == "resolved") {
+            item->resolvedSeq = u64(record, "resolved_seq");
+            if (item->resolvedSeq == 0) item->resolvedSeq = seq;
+        } else if (action == "delivery") {
+            const auto delivery = body.find("delivery");
+            if (delivery != body.end() && delivery->is_object()) {
+                item->deliveries.push_back(parseAttentionDelivery(*delivery, seq));
+            } else if (!text(body, "channel").empty()) {
+                item->deliveries.push_back(parseAttentionDelivery(body, seq));
+            } else {
+                const auto deliveries = record.find("deliveries");
+                if (deliveries != record.end() && deliveries->is_array())
+                    item->deliveries = parseAttentionRow(record).deliveries;
+            }
+        }
+    }
+
+    std::stable_sort(attention_.begin(), attention_.end(),
+                     [](const MfgAttentionRow& left, const MfgAttentionRow& right) {
+                         if (left.raisedSeq != right.raisedSeq)
+                             return left.raisedSeq > right.raisedSeq;
+                         return left.id < right.id;
+                     });
+}
+
 void MfgMirror::ingestRpc(const std::string& method, const json& wire) {
     const json& result = payloadOf(wire);
     gatewayReachable_ = true;
@@ -414,6 +628,8 @@ void MfgMirror::ingestRpc(const std::string& method, const json& wire) {
     } else if (method == "mfg_run_list") {
         const auto rows = result.find("runs");
         if (rows != result.end() && rows->is_array()) for (const json& row : *rows) ingestRun(row);
+    } else if (method == "mfg_attention_list") {
+        ingestAttentionList(result);
     } else if (method == "mfg_run_describe") {
         ingestRun(result.contains("run") && result["run"].is_object() ? result["run"] : result);
     } else if (method == "mfg_gate_report" || method == "mfg_preflight_run") {
@@ -446,13 +662,23 @@ void MfgMirror::invalidateTelemetry(const std::string& why) {
 }
 
 void MfgMirror::feedEvent(const json& event) {
-    const std::string name = text(event, "event");
-    const json& data = event.contains("data") && event["data"].is_object()
+    std::string name = text(event, "event");
+    if (name.empty()) name = text(event, "kind");
+    const json& data = event.find("data") != event.end() && event["data"].is_object()
                            ? event["data"] : event;
-    const std::uint64_t seq = std::max(u64(data, "seq"), u64(data, "at_seq"));
+    const json& body = data.find("body") != data.end() && data["body"].is_object()
+                           ? data["body"] : data;
+    const std::uint64_t seq = std::max(
+        {u64(event, "seq"), u64(event, "at_seq"), u64(data, "seq"),
+         u64(data, "at_seq"), u64(body, "seq"), u64(body, "at_seq")});
     if (seq > latestSeq_) latestSeq_ = seq;
     gatewayReachable_ = true;
     gatewayWhy_.clear();
+
+    if (name == "mfg.attention") {
+        ingestAttentionEvent(event, seq);
+        return;
+    }
 
     if (name == "mfg.gateway.epoch") {
         const std::uint64_t next = u64(data, "epoch");
@@ -497,6 +723,10 @@ void MfgMirror::markGatewayError(std::string why) {
 void MfgMirror::seedManufactureShot() {
     devices_.clear();
     runs_.clear();
+    attentionBaselineSeq_ = 0;
+    attentionBaseline_.clear();
+    attentionEvents_.clear();
+    attention_.clear();
     gatewayReachable_ = true;
     gatewayWhy_.clear();
     epoch_ = 7;
@@ -570,6 +800,47 @@ void MfgMirror::seedManufactureShot() {
                                                 {"evidence_set_digest", "sha256:1433ed7a"},
                                                 {"max_starts", 1},
                                                 {"exercisable_by", "human_only"}}}}}});
+
+    const json raised = {{"event", "mfg.attention"}, {"seq", 1837},
+                         {"subject", "attn:shot:spindle"},
+                         {"body", {{"action", "raised"},
+                                   {"id", "attn:shot:spindle"},
+                                   {"severity", "critical"},
+                                   {"device", "dev:open_frame_router:2f7a91c40e12"},
+                                   {"run", "run:shot:0042"},
+                                   {"reason", "Spindle load spike"},
+                                   {"why", "Measured spindle load crossed the commissioned limit."},
+                                   {"occurrence_count", 1}}}};
+    const json occurred = {{"event", "mfg.attention"}, {"seq", 1838},
+                           {"subject", "attn:shot:spindle"},
+                           {"body", {{"action", "occurred"},
+                                     {"id", "attn:shot:spindle"}, {"count", 2},
+                                     {"severity", "critical"},
+                                     {"why", "The overload recurred twice during the same run."}}}};
+    feedEvent(occurred);  // Deliberately delivered before seq 1837.
+    feedEvent(raised);
+    feedEvent(occurred);  // Journal replay is idempotent by seq.
+    feedEvent({{"event", "mfg.attention"}, {"seq", 1839},
+               {"subject", "attn:shot:spindle"},
+               {"body", {{"action", "delivery"}, {"id", "attn:shot:spindle"},
+                         {"channel", "operator_console"}, {"attempt", 1},
+                         {"status", "delivered"}}}});
+    feedEvent({{"event", "mfg.attention"}, {"seq", 1840},
+               {"subject", "attn:shot:spindle"},
+               {"body", {{"action", "delivery"}, {"id", "attn:shot:spindle"},
+                         {"channel", "sms"}, {"attempt", 1}, {"status", "failed"},
+                         {"error", "No commissioned SMS recipient"}}}});
+    feedEvent({{"event", "mfg.attention"}, {"seq", 1841},
+               {"subject", "attn:shot:door"},
+               {"body", {{"action", "raised"}, {"id", "attn:shot:door"},
+                         {"severity", "warning"},
+                         {"device", "dev:open_frame_router:2f7a91c40e12"},
+                         {"run", "run:shot:0042"}, {"reason", "Door check requested"},
+                         {"why", "The operator confirmed the open-frame exclusion zone."}}}});
+    feedEvent({{"event", "mfg.attention"}, {"seq", 1842},
+               {"subject", "attn:shot:door"},
+               {"body", {{"action", "acknowledged"}, {"id", "attn:shot:door"},
+                         {"by", "operator@example.com"}}}});
 }
 
 }  // namespace ui

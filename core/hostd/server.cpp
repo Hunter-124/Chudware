@@ -66,6 +66,17 @@ Server::Server(chudware_ipc::IpcListener listener, std::string buildId)
     });
     chudware::mfg::lane().setEventSink(
         [this](const std::string& line) { sendEventToAll(line); });
+    // Printer adapters (Moonraker/OctoPrint/PrusaLink) are Python; the lane reaches them
+    // through this injected seam because chudware_manufacturing is a static library and
+    // WorkerBridge only exists in the daemon. The lane still owns claims, approval, seq.
+    chudware::mfg::lane().setWorkerCall(
+        [](const std::string& method, const nlohmann::json& params) {
+            nlohmann::json result;
+            std::string err;
+            if (!WorkerBridge::instance().call(method, params, result, err))
+                throw std::runtime_error(err.empty() ? "worker call failed" : err);
+            return result;
+        });
     touch();
     // Fast-tier (interactive RPC) watchdog ceiling; 0 disables that tier. The long tier's far
     // more generous ceiling is engineWatchdogLongMs() above; see engine_watchdog.h for the split.

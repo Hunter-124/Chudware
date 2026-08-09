@@ -7056,3 +7056,40 @@ Outstanding for the next phase, and deliberately not faked: the lane still const
 transport directly, so selecting a serial/TCP/WS transport for a claimed device needs an owned
 `ITransport` seam in `mfg_lane`; the printer adapter, attention and capture hooks into the lane are
 likewise not wired yet. No physical device has been opened, and `execute` remains `assumed`.
+
+## 2026-08-08 — Manufacturing overhaul, P5 integration: the lane now selects a real transport
+
+The parts from the previous entry are wired together, which was the honest gap it recorded.
+
+`core/hostd/mfg_lane` no longer hard-binds the emulator. It owns a
+`std::unique_ptr<device::ITransport>` selected at claim time from the allowlist entry's transport
+kind — emulator, serial, TCP or WebSocket — and rebinds `GrblAdapter` onto whichever was chosen.
+Emulator stays the default and is the ONLY kind reachable with no allowlist entry, so the
+hardware-free path can never regress into an accidental real open. The lane owns
+`DeviceAllowlist(state_directory / "device_allowlist.tsv")`; `mfg_device_list` marks each enumerated
+candidate allowlisted or not WITHOUT opening it, and an observed epoch change bumps the lane epoch,
+publishes `mfg.gateway.epoch`, closes the active transport and falsifies the claim.
+
+Printer adapters are reached through an injected `setWorkerCall` seam rather than a link-time
+dependency — `chudware_manufacturing` is a static library and `WorkerBridge` only exists in the
+daemon, so `Server`'s constructor now installs the callback beside the existing event sink. Connect
+routes to `mfg_printer_adapter_open`/`_probe`, telemetry reconciles through `_snapshot`, hold maps to
+`_pause`, abort to `_cancel`, and `_start` is called only after `arbiter.start()` succeeded, carrying
+an opaque post-arbiter token. Worker-asserted authority is stripped: an adapter that claims
+`execute: verified` is still clamped to `assumed` with `missing_level:"execute"`, and with no callback
+installed the printer methods refuse by name instead of crashing.
+
+Attention is served by the lane (`mfg_attention_raise/list/ack/resolve/delivery`), journaled and
+published as canonical `mfg.attention` actions with authoritative seq — the Python `AttentionService`
+never opens the lane journal. The GUI mirror projects those rows in seq order, idempotently on replay,
+behind an Attention tab with a persistent unacknowledged-critical indicator; a row is never removed
+optimistically on click. Verified in the `manufacture` shot: red indicator, `Attention (1 critical)`,
+a 3-occurrence critical item with device/run/raised-seq, a visibly FAILED sms delivery rather than a
+silently dropped one, and an Acknowledge control naming the actor.
+
+Gates: `ctest -R 'mfg|grbl|twin|print_model|device_lane|transport|cam'` 11/11; the lane's own suite is
+16 cases / 363 assertions; `pytest services/manufacturing services/perception training/perception
+services/mcp/test_mfg_tools.py` 109 passed / 1 skipped; `./build.sh` links; `scripts/check.py` 8/8.
+
+Unchanged and deliberate: no physical device has been opened, `execute` is `assumed` everywhere, and
+the E4–E6 hardware pilot remains the gate before any of that changes.

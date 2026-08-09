@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <string>
+#include <map>
 #include <vector>
 
 #include "hostd/mfg_lane.h"
@@ -21,6 +22,42 @@ struct TempDirectory {
         std::filesystem::remove_all(path, ignored);
     }
 };
+
+chudware::mfg::gateway::AllowlistEntry commissioned(
+    chudware::device::TransportKind kind,
+    chudware::device::MachineClass machine_class,
+    std::string suffix = {}) {
+    using namespace chudware;
+    mfg::gateway::AllowlistEntry entry;
+    entry.machine_class = machine_class;
+    entry.operator_note = "test commissioning";
+    if (kind == device::TransportKind::Serial) {
+        entry.endpoint = mfg::gateway::EndpointIdentity::serial(
+            "/tmp/chudware-test-serial" + suffix);
+        entry.connection["baud"] = "115200";
+    } else {
+        entry.endpoint = mfg::gateway::EndpointIdentity::network(
+            kind, "127.0.0.1", static_cast<std::uint16_t>(39000 + suffix.size()));
+        if (kind == device::TransportKind::WebSocket) entry.connection["path"] = "/ws";
+    }
+    return entry;
+}
+
+void seedAllowlist(const std::filesystem::path& directory,
+                   const chudware::mfg::gateway::AllowlistEntry& entry) {
+    chudware::mfg::gateway::DeviceAllowlist allowlist(
+        directory / "device_allowlist.tsv");
+    std::string why;
+    REQUIRE(allowlist.upsert(entry, &why));
+    INFO(why);
+}
+
+json findTransport(const json& listed, std::string_view kind) {
+    for (const auto& row : listed.at("devices"))
+        if (row.at("transport").at("kind") == kind) return row;
+    FAIL("transport candidate not found: " << kind);
+    return nullptr;
+}
 
 json call(ManufacturingLane& lane, std::string_view method, json params = json::object(),
           bool expect_error = false) {
@@ -262,7 +299,9 @@ TEST_CASE("emulator fault injection is structurally barred from physical endpoin
     CHECK(described.at("transport").at("endpoint_is_physical"));
     const auto capability = call(lane, "mfg_device_capability", {{"device_id", device_id}});
     CHECK(capability.at("capability").at("max_advertised") == "transport");
-    CHECK(capability.at("capability").at("levels").at("execute").at("truth") == "unsupported");
+    CHECK(capability.at("capability").at("levels").at("execute").at("truth") == "assumed");
+    CHECK(capability.at("capability").at("levels").at("execute").at("missing_level") ==
+          "execute");
     CHECK_FALSE(capability.at("capability").at("levels").at("execute").at("why")
                     .get<std::string>().empty());
     const auto claimed = call(lane, "mfg_device_claim",
@@ -309,4 +348,279 @@ TEST_CASE("events and invalidation query preserve class and at_seq") {
         return event.at("event") == "mfg.result.falsified" &&
                event.at("data").at("at_seq") == at_seq;
     }));
+}
+
+TEST_CASE("emulator is the default candidate without commissioning") {
+    TempDirectory temp;
+    ManufacturingLane lane(temp.path);
+    const auto listed = call(lane, "mfg_device_list");
+    const auto emulator = findTransport(listed, "emulator");
+    CHECK(emulator.at("allowlisted"));
+    const auto claimed = call(
+        lane, "mfg_device_claim",
+        {{"device_id", emulator.at("device_id")},
+         {"owner", {{"client_kind", "test"}, {"seat", "seat"}, {"session", "default"}}}});
+    CHECK(claimed.at("transport") == "emulator");
+}
+
+TEST_CASE("commissioned claims select serial tcp and websocket transports") {
+    const std::vector<std::pair<chudware::device::TransportKind, std::string>> transports{
+        {chudware::device::TransportKind::Serial, "serial"},
+        {chudware::device::TransportKind::Tcp, "tcp"},
+        {chudware::device::TransportKind::WebSocket, "websocket"}};
+    for (const auto& [kind, name] : transports) {
+        CAPTURE(name);
+        TempDirectory temp;
+        seedAllowlist(temp.path, commissioned(
+            kind, chudware::device::MachineClass::OpenFrameMill, name));
+        ManufacturingLane lane(temp.path);
+        const auto candidate = findTransport(call(lane, "mfg_device_list"), name);
+        REQUIRE(candidate.at("allowlisted"));
+        const auto claimed = call(
+            lane, "mfg_device_claim",
+            {{"device_id", candidate.at("device_id")},
+             {"owner", {{"client_kind", "test"}, {"seat", "seat"}, {"session", name}}}});
+        CHECK(claimed.at("transport") == name);
+        const auto described = call(
+            lane, "mfg_device_describe", {{"device_id", candidate.at("device_id")}});
+        CHECK(described.at("transport").at("kind") == name);
+        CHECK(described.at("transport").at("endpoint_is_physical"));
+    }
+}
+
+TEST_CASE("unknown non allowlisted claim is refused by commissioning name") {
+    TempDirectory temp;
+    ManufacturingLane lane(temp.path);
+    const auto refused = call(
+        lane, "mfg_device_claim",
+        {{"device_id", "dev:open_frame_mill:000000000000"},
+         {"owner", {{"client_kind", "test"}, {"seat", "seat"}, {"session", "denied"}}}},
+        true);
+    CHECK(refused.at("code") == "mfg_device_not_allowlisted");
+    CHECK(refused.at("message").get<std::string>().find("allowlisted") != std::string::npos);
+}
+
+TEST_CASE("allowlist epoch change closes and falsifies an active claim") {
+    LaneRig rig;
+    rig.claim();
+    rig.connect();
+    const auto before = call(rig.lane, "mfg_device_describe",
+                             {{"device_id", rig.device_id}});
+    const auto epoch_before = before.at("epoch").at("epoch").get<unsigned>();
+
+    seedAllowlist(rig.temp.path, commissioned(
+        chudware::device::TransportKind::Tcp,
+        chudware::device::MachineClass::OpenFrameMill, "epoch"));
+    const auto listed = call(rig.lane, "mfg_device_list");
+    CHECK(listed.at("epoch").at("epoch").get<unsigned>() == epoch_before + 1);
+    const auto telemetry = call(rig.lane, "mfg_telemetry_snapshot",
+                                {{"device_id", rig.device_id}});
+    CHECK(telemetry.at("snapshot").at("state") == "unknown");
+    const auto stale_write = call(
+        rig.lane, "mfg_artifact_register",
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"artifact", {{"kind", "nc"}, {"content", "G0 X0\n"}}}},
+        true);
+    CHECK(stale_write.at("code") == "lease.commander_held_by_caller");
+    const auto invalidations = call(
+        rig.lane, "mfg_result_invalidations", {{"affected", rig.lease_id}});
+    REQUIRE(invalidations.at("invalidations").size() == 1);
+    CHECK(invalidations.at("invalidations").at(0).at("reason") ==
+          "allowlist_epoch_changed");
+}
+
+TEST_CASE("printer adapters route through the injected worker after arbitration") {
+    TempDirectory temp;
+    auto entry = commissioned(chudware::device::TransportKind::Tcp,
+                              chudware::device::MachineClass::FdmPrinterEnclosed,
+                              "printer");
+    entry.connection["adapter_kind"] = "moonraker";
+    entry.connection["auth_mode"] = "trusted_host";
+    seedAllowlist(temp.path, entry);
+    ManufacturingLane lane(temp.path);
+    std::vector<std::string> methods;
+    std::map<std::string, json, std::less<>> arguments;
+    lane.setWorkerCall([&](const std::string& method, const json& params) {
+        methods.push_back(method);
+        arguments[method] = params;
+        if (method == "mfg_printer_adapter_probe")
+            return json{{"ok", true},
+                        {"report",
+                         {{"subject_id", "worker-controlled"},
+                          {"max_advertised", "execute"},
+                          {"levels",
+                           {{"execute", {{"level", "execute"}, {"truth", "verified"}}},
+                            {"safety_integration",
+                             {{"level", "safety_integration"},
+                              {"truth", "verified"}}}}}}}};
+        if (method == "mfg_printer_adapter_snapshot")
+            return json{{"ok", true},
+                        {"rows", json::array(
+                             {{{"name", "state"}, {"v", "printing"}, {"seq", 999},
+                               {"approval_id", "worker-forged"}}})}};
+        if (method == "mfg_printer_adapter_upload")
+            return json{{"ok", true},
+                        {"remote_artifact", {{"path", "remote/print.gcode"}}}};
+        return json{{"ok", true}};
+    });
+
+    const auto candidate = findTransport(call(lane, "mfg_device_list"), "tcp");
+    const std::string device_id = candidate.at("device_id");
+    const auto claimed = call(
+        lane, "mfg_device_claim",
+        {{"device_id", device_id},
+         {"owner", {{"client_kind", "test"}, {"seat", "seat"}, {"session", "printer"}}}});
+    const std::string lease_id = claimed.at("lease").at("lease_id");
+    call(lane, "mfg_device_connect",
+         {{"device_id", device_id}, {"lease_id", lease_id}});
+    CHECK(methods.at(0) == "mfg_printer_adapter_open");
+    CHECK(methods.at(1) == "mfg_printer_adapter_probe");
+    const auto capability = call(lane, "mfg_device_capability",
+                                 {{"device_id", device_id}});
+    CHECK(capability.at("capability").at("max_advertised") == "transport");
+    CHECK(capability.at("capability").at("levels").at("execute").at("truth") ==
+          "assumed");
+    CHECK(capability.at("capability").at("levels").at("execute").at("missing_level") ==
+          "execute");
+    CHECK(capability.at("capability").at("levels").at("safety_integration").at("truth") ==
+          "unsupported");
+
+    const auto telemetry = call(lane, "mfg_telemetry_snapshot",
+                                {{"device_id", device_id}});
+    CHECK(methods.back() == "mfg_printer_adapter_snapshot");
+    const auto& row = telemetry.at("snapshot").at("v").at("rows").at(0);
+    CHECK_FALSE(row.contains("seq"));
+    CHECK_FALSE(row.contains("approval_id"));
+
+    const auto artifact = call(
+        lane, "mfg_artifact_register",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"artifact", {{"kind", "print_job"}, {"lines", json::array({"G28", "G1 X1"})},
+                       {"slicer_profile_hash", "slicer:test"}}}});
+    const std::string artifact_id = artifact.at("artifact").at("artifact_id");
+    const auto preflight = call(
+        lane, "mfg_preflight_run",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"artifact_id", artifact_id},
+         {"job", {{"job_id", "job:printer"}, {"setup_revision", 1}, {"quantity", 1}}}});
+    const std::string run_id = preflight.at("run_id");
+    const auto proposal = call(
+        lane, "mfg_approval_propose",
+        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
+         {"exercisable_by", "human_only"}, {"expiry_ttl_ms", 60000},
+         {"attendance", {{"mode", "physical_attended"}, {"attested_by", "operator"}}}});
+    const auto approval = call(
+        lane, "mfg_approval_create",
+        {{"device_id", device_id}, {"lease_id", lease_id},
+         {"proposal_id", proposal.at("proposal").at("proposal_id")},
+         {"approver_auth", {{"identity", "operator"}, {"auth", "os_seat+pin"}}}});
+    const std::string approval_id = approval.at("approval").at("approval_id");
+
+    const auto refused = call(
+        lane, "mfg_run_start",
+        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
+         {"approval_id", approval_id},
+         {"initiator", {{"kind", "agent"}, {"identity", "planner"},
+                        {"seat", "agent-seat"}, {"agent_run_id", "agent:test"}}}},
+        true);
+    CHECK(refused.at("code").get<std::string>().find(
+              "exercisable_by_permits_initiator") != std::string::npos);
+    CHECK(std::find(methods.begin(), methods.end(), "mfg_printer_adapter_start") ==
+          methods.end());
+
+    const auto started = call(
+        lane, "mfg_run_start",
+        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
+         {"approval_id", approval_id}, {"initiator", humanInitiator()}});
+    CHECK(started.at("state") == "running");
+    REQUIRE(arguments.count("mfg_printer_adapter_start") == 1);
+    const auto& token =
+        arguments.at("mfg_printer_adapter_start").at("authorization_token");
+    CHECK(token.is_string());
+    CHECK(token.get<std::string>().rfind("run-token:", 0) == 0);
+    CHECK_FALSE(arguments.at("mfg_printer_adapter_start").contains("approval_id"));
+    CHECK_FALSE(arguments.at("mfg_printer_adapter_start").contains("lease_id"));
+
+    const auto held = call(
+        lane, "mfg_run_hold",
+        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
+         {"kind", "feed_hold"}, {"initiator", humanInitiator()}});
+    CHECK(held.at("state") == "held");
+    CHECK(methods.back() == "mfg_printer_adapter_pause");
+    const auto aborted = call(
+        lane, "mfg_run_abort",
+        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
+         {"initiator", humanInitiator()}});
+    CHECK(aborted.at("state") == "aborting");
+    CHECK(methods.back() == "mfg_printer_adapter_cancel");
+    call(lane, "mfg_device_disconnect",
+         {{"device_id", device_id}, {"lease_id", lease_id}});
+    CHECK(methods.back() == "mfg_printer_adapter_close");
+}
+
+TEST_CASE("printer connect names the missing worker method") {
+    TempDirectory temp;
+    seedAllowlist(temp.path, commissioned(
+        chudware::device::TransportKind::Tcp,
+        chudware::device::MachineClass::FdmPrinterOpen, "missing-worker"));
+    ManufacturingLane lane(temp.path);
+    const auto candidate = findTransport(call(lane, "mfg_device_list"), "tcp");
+    const auto claimed = call(
+        lane, "mfg_device_claim",
+        {{"device_id", candidate.at("device_id")},
+         {"owner", {{"client_kind", "test"}, {"seat", "seat"}, {"session", "printer"}}}});
+    const auto refused = call(
+        lane, "mfg_device_connect",
+        {{"device_id", candidate.at("device_id")},
+         {"lease_id", claimed.at("lease").at("lease_id")}},
+        true);
+    CHECK(refused.at("code") == "mfg_printer_worker_unavailable");
+    CHECK(refused.at("detail").at("method") == "mfg_printer_adapter_open");
+}
+
+TEST_CASE("attention lifecycle is durable and published on the lane stream") {
+    TempDirectory temp;
+    ManufacturingLane lane(temp.path);
+    std::vector<json> events;
+    lane.setEventSink([&](const std::string& line) {
+        events.push_back(json::parse(line));
+    });
+    const auto raised = call(
+        lane, "mfg_attention_raise",
+        {{"id", "attention:test"}, {"severity", "critical"}, {"device", "dev:test"},
+         {"run", "run:test"}, {"reason", "operator_required"},
+         {"why", "clear the build plate"}});
+    CHECK(raised.at("attention").at("raised_seq").get<std::uint64_t>() > 0);
+    const auto delivered = call(
+        lane, "mfg_attention_delivery",
+        {{"id", "attention:test"},
+         {"delivery", {{"channel", "desktop"}, {"attempt", 1},
+                       {"status", "delivered"}, {"seq", 999}}}});
+    REQUIRE(delivered.at("attention").at("deliveries").size() == 1);
+    CHECK(delivered.at("attention").at("deliveries").at(0).at("seq") != 999);
+    const auto acknowledged = call(
+        lane, "mfg_attention_ack", {{"id", "attention:test"}, {"by", "operator"}});
+    CHECK(acknowledged.at("attention").at("acknowledged_by") == "operator");
+    const auto resolved = call(
+        lane, "mfg_attention_resolve", {{"id", "attention:test"}});
+    CHECK(resolved.at("attention").at("resolved_seq").get<std::uint64_t>() >
+          acknowledged.at("attention").at("acknowledged_seq").get<std::uint64_t>());
+    const auto listed = call(lane, "mfg_attention_list");
+    REQUIRE(listed.at("attention").size() == 1);
+    CHECK(listed.at("attention").at(0).at("id") == "attention:test");
+    const auto journal = call(
+        lane, "mfg_journal_query", {{"kinds", json::array({"mfg.attention"})}});
+    REQUIRE(journal.at("records").size() == 4);
+    CHECK(journal.at("records").at(0).at("body").at("action") == "raised");
+    CHECK(journal.at("records").at(1).at("body").at("action") == "delivery");
+    CHECK(journal.at("records").at(1).at("body").at("delivery").at("channel") ==
+          "desktop");
+    CHECK(journal.at("records").at(2).at("body").at("action") == "acknowledged");
+    CHECK(journal.at("records").at(3).at("body").at("action") == "resolved");
+    REQUIRE(events.size() == 4);
+    CHECK(events.at(0).at("event") == "mfg.attention");
+    CHECK(events.at(0).at("data").at("action") == "raised");
+    CHECK(events.at(1).at("data").at("action") == "delivery");
+    CHECK(events.at(2).at("data").at("action") == "acknowledged");
+    CHECK(events.at(3).at("data").at("action") == "resolved");
 }

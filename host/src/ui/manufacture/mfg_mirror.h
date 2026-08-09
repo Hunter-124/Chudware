@@ -4,8 +4,10 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include <nlohmann/json.hpp>
+#include "attention_panel.h"
 
 namespace ui {
 
@@ -138,6 +140,7 @@ public:
     const std::vector<MfgDevice>& devices() const { return devices_; }
     const std::vector<MfgRun>& runs() const { return runs_; }
     const MfgApproval& approval() const { return approval_; }
+    const std::vector<MfgAttentionRow>& attention() const { return attention_; }
 
     MfgDevice* device(const std::string& id);
     const MfgDevice* device(const std::string& id) const;
@@ -152,6 +155,9 @@ private:
     void ingestRun(const nlohmann::json& row);
     void ingestGate(MfgGateReport& gate, const nlohmann::json& report);
     void ingestApproval(const nlohmann::json& row);
+    void ingestAttentionList(const nlohmann::json& result);
+    void ingestAttentionEvent(const nlohmann::json& event, std::uint64_t seq);
+    void rebuildAttention();
     void invalidateTelemetry(const std::string& why);
 
     bool gatewayReachable_ = false;
@@ -161,6 +167,10 @@ private:
     std::vector<MfgDevice> devices_;
     std::vector<MfgRun> runs_;
     MfgApproval approval_;
+    std::uint64_t attentionBaselineSeq_ = 0;
+    std::vector<MfgAttentionRow> attentionBaseline_;
+    std::vector<std::pair<std::uint64_t, nlohmann::json>> attentionEvents_;
+    std::vector<MfgAttentionRow> attention_;
 };
 
 }  // namespace ui

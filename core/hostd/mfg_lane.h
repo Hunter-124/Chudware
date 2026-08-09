@@ -13,9 +13,9 @@
 
 #include <nlohmann/json.hpp>
 
-#include "device/emulator_transport.h"
 #include "device/grbl_adapter.h"
 #include "manufacturing/arbiter.h"
+#include "manufacturing/gateway/device_allowlist.h"
 #include "manufacturing/invalidation.h"
 #include "manufacturing/lease.h"
 #include "manufacturing/result_registry.h"
@@ -30,6 +30,8 @@ struct LaneRpcResult {
 class ManufacturingLane {
 public:
     using EventSink = std::function<void(const std::string&)>;
+    using WorkerCall =
+        std::function<nlohmann::json(const std::string&, const nlohmann::json&)>;
 
     explicit ManufacturingLane(std::filesystem::path state_directory,
                                bool emulator_endpoint_is_physical = false);
@@ -41,6 +43,7 @@ public:
     std::optional<LaneRpcResult> handle(std::string_view method,
                                         const nlohmann::json& params);
     void setEventSink(EventSink sink);
+    void setWorkerCall(WorkerCall call);
 
 private:
     class SteadyClock final : public Clock {
@@ -88,11 +91,33 @@ private:
         device::Seq seq = 0;
     };
 
+    struct DeviceCandidate {
+        std::string device_id;
+        device::MachineClass machine_class = device::MachineClass::Emulated;
+        device::TransportKind transport_kind = device::TransportKind::Emulator;
+        device::Endpoint endpoint;
+        bool allowlisted = false;
+        std::optional<gateway::AllowlistEntry> allowlist_entry;
+    };
+
     LaneRpcResult route(std::string_view method, const nlohmann::json& params);
     LaneRpcResult ok(nlohmann::json fields = nlohmann::json::object()) const;
     LaneRpcResult refuse(std::string code, std::string message,
                          nlohmann::json detail = nlohmann::json::object()) const;
 
+    std::vector<DeviceCandidate> deviceCandidates() const;
+    std::optional<DeviceCandidate> findCandidate(std::string_view device_id) const;
+    void selectTransport(const DeviceCandidate& candidate);
+    void reconcileAllowlistEpoch();
+    bool isPrinter() const;
+    nlohmann::json workerParams() const;
+    std::optional<nlohmann::json> callWorker(const std::string& method,
+                                             const nlohmann::json& params,
+                                             LaneRpcResult& refusal);
+    nlohmann::json capabilityJson() const;
+    void closeActiveDevice(std::string_view why);
+    void restoreAttention();
+    void applyAttention(const JournalRecord& record);
     bool validDevice(const nlohmann::json& params, LaneRpcResult& refusal) const;
     bool requireLease(const nlohmann::json& params, LaneRpcResult& refusal);
     device::Seq appendEvent(std::string kind, std::string subject,
@@ -120,8 +145,11 @@ private:
 
     mutable std::mutex mutex_;
     EventSink event_sink_;
+    WorkerCall worker_call_;
     device::LaneEpoch epoch_;
     Journal journal_;
+    gateway::DeviceAllowlist allowlist_;
+    std::uint64_t observed_allowlist_epoch_ = 0;
     SteadyClock clock_;
     NonceLedger nonces_;
     Arbiter arbiter_;
@@ -131,15 +159,21 @@ private:
     device::MachineFingerprint advertised_fingerprint_;
     device::DeviceId device_id_;
     device::Endpoint endpoint_;
-    device::EmulatorTransport emulator_;
-    device::GrblAdapter adapter_;
+    device::MachineClass machine_class_ = device::MachineClass::Emulated;
+    device::TransportKind transport_kind_ = device::TransportKind::Emulator;
+    std::optional<gateway::AllowlistEntry> selected_allowlist_entry_;
+    std::unique_ptr<device::ITransport> transport_;
+    std::unique_ptr<device::GrblAdapter> adapter_;
+    nlohmann::json printer_capability_;
     bool connected_ = false;
+    bool terminal_claim_ = false;
     std::map<std::string, ArtifactRecord, std::less<>> artifacts_;
     std::map<std::string, RunRecord, std::less<>> runs_;
     std::map<std::string, ApprovalProposal, std::less<>> proposals_;
     std::map<std::string, ApprovalBinding, std::less<>> approvals_;
     std::map<std::string, gates::GateReport, std::less<>> gate_reports_;
     std::vector<InvalidationNotice> invalidations_;
+    std::map<std::string, nlohmann::json, std::less<>> attention_;
 };
 
 ManufacturingLane& lane();

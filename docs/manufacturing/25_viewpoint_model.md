@@ -25,32 +25,85 @@ This is a real neural policy. Every projection, cross-attention query, fusion ma
 head is learned jointly with AdamW and back-propagation. There is no ridge fit and candidate choice
 is not the greedy baseline in disguise.
 
-## Measured deterministic failure
+## Compute-equivalence result on the mechanical-part corpus
 
-The reproducible CPU run was:
+The defensible claim is compute equivalence, not mean aggregate in isolation. The policy uses
+structured geometry to select one camera, then the expensive downstream consumer receives one
+render. Random search renders `N` seeded poses and receives an oracle choice of the best. The
+reproducible CPU run was:
 
 ```bash
-python3 -X utf8 -m training.viewpoint.train --parts 48 --examples-per-part 2 --candidates 24 --epochs 500 --image-size 256
+python3 -X utf8 -m training.viewpoint.train \
+  --parts 72 --examples-per-part 6 --candidates 32 --epochs 350 \
+  --seed 1729 --image-size 320 --device cpu --bootstrap-samples 5000 \
+  --output-weights training/viewpoint/stage1_hard_weights.npz \
+  --output-report training/viewpoint/stage1_hard_report.json
 ```
 
-Seed was 1729. Whole `part_id` values were shuffled into 34 train, 7 validation, and 7 test
-parts; overlap was zero. The locked test contains 14 feature/task examples and was not used for
-checkpoint selection. Values below are arithmetic means over selected poses. “Aggregate” is the
-oracle's weighted geometric mean, with canonical weights `(1, 1.25, 1, 1, .75, 1.25, .5)`.
+Whole `part_id` values split into 50 train, 11 validation, and 11 locked-test parts with zero
+overlap. The test set has **66 feature/task examples**, up from 14, and was not used for checkpoint
+selection. Confidence intervals resample whole parts, not rows, for 5,000 seeded bootstrap samples.
+Aggregate is the oracle's weighted geometric mean with canonical weights
+`(1, 1.25, 1, 1, .75, 1.25, .5)`.
 
-| chooser | aggregate | coverage | visibility | foreshortening | scale | silhouette | depth | uniqueness |
+| chooser | policy@1 aggregate | random@N aggregate | policy - random, mean | 95% part-bootstrap CI | strict win | strict loss | tie |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| random@1 | 0.264853 | 0.164971 | +0.099882 | [-0.002967, +0.212689] | 27.27% | 16.67% | 56.06% |
+| random@2 | 0.264853 | 0.217183 | +0.047670 | [-0.052209, +0.164570] | 27.27% | 21.21% | 51.52% |
+| random@4 | 0.264853 | 0.349344 | -0.084491 | [-0.209388, +0.032274] | 21.21% | 34.85% | 43.94% |
+| random@8 | 0.264853 | 0.463487 | -0.198635 | [-0.342727, -0.052367] | 12.12% | 48.48% | 39.39% |
+| random@16 | 0.264853 | 0.603040 | -0.338187 | [-0.430545, -0.246754] | 4.55% | 65.15% | 30.30% |
+| random@32 | 0.264853 | 0.678135 | -0.413282 | [-0.494798, -0.320218] | 0.00% | 78.79% | 21.21% |
+
+The discrete point crossover is **N=4**: random search first matches/exceeds the policy mean after
+four renders. Its 95% part-bootstrap interval is **[1, 8]**. Thus “one policy render equals four
+random renders” is only a point estimate; the interval includes one, so this run does not establish
+a compute saving.
+
+The distribution explains the mean/win-rate pathology. Values below are per-example
+`policy aggregate - baseline aggregate`.
+
+| baseline | mean win magnitude | mean loss magnitude | p10 | p25 | median | p75 | p90 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| random@1 | 0.636045 | 0.441509 | -0.323012 | 0.000000 | 0.000000 | 0.035058 | 0.819765 |
+| random@2 | 0.520216 | 0.444121 | -0.539078 | 0.000000 | 0.000000 | 0.029235 | 0.724240 |
+| random@4 | 0.444089 | 0.512768 | -0.727171 | -0.147935 | 0.000000 | 0.000000 | 0.455845 |
+| random@8 | 0.430680 | 0.517354 | -0.815380 | -0.558598 | 0.000000 | 0.000000 | 0.058661 |
+| random@16 | 0.062971 | 0.523471 | -0.849907 | -0.742944 | -0.164289 | 0.000000 | 0.000000 |
+| random@32 | 0.000000 | 0.524550 | -0.853211 | -0.786654 | -0.495248 | -0.018056 | 0.000000 |
+
+Against random@1 and random@2, the policy wins infrequently but by more when it wins, while more
+than half the examples tie at zero. That produces a higher point mean with only 27.27% strict wins.
+At random@8 and above the pathology disappears in the unfavorable direction: losses are both more
+frequent and larger. The other one-render baselines show the same rare-large-win pattern:
+
+| baseline | baseline mean | policy mean | strict win/loss/tie | mean win/loss magnitude | delta p10/median/p90 |
+|---|---:|---:|---:|---:|---:|
+| fixed isometric | 0.175942 | 0.264853 | 31.82% / 15.15% / 53.03% | 0.558412 / 0.585856 | -0.551487 / 0 / 0.796919 |
+| greedy geometric | 0.191288 | 0.264853 | 28.79% / 13.64% / 57.58% | 0.524008 / 0.566768 | -0.135236 / 0 / 0.753001 |
+
+### Difficulty slices
+
+| difficulty | examples (parts) | policy@1 | random@1 mean / strict win | random@2 | random@4 | random@8 | random@16 | random@32 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| learned policy | **0.928693** | 1.000000 | 1.000000 | 0.844227 | 1.000000 | 0.688615 | 1.000000 | 1.000000 |
-| fixed isometric | 0.425314 | 1.000000 | 0.500000 | 0.580917 | 1.000000 | 0.567262 | 1.000000 | 1.000000 |
-| best-of-8 random | 0.916260 | 1.000000 | 1.000000 | 0.825909 | 1.000000 | 0.637530 | 1.000000 | 1.000000 |
-| greedy geometric | 0.484824 | 1.000000 | 0.500000 | 0.981252 | 1.000000 | 0.512969 | 1.000000 | 1.000000 |
+| easy | 17 (11) | 0.565518 | 0.293389 / 58.82% | 0.425008 / 58.82% | 0.590748 / 41.18% | 0.703681 / 23.53% | 0.836911 / 11.76% | 0.864685 / 0.00% |
+| medium | 24 (10) | 0.096644 | 0.156194 / 8.33% | 0.206547 / 8.33% | 0.264318 / 8.33% | 0.303138 / 4.17% | 0.431864 / 0.00% | 0.545750 / 0.00% |
+| hard | 25 (11) | 0.221881 | 0.086072 / 24.00% | 0.086072 / 24.00% | 0.266814 / 20.00% | 0.454091 / 12.00% | 0.608335 / 4.00% | 0.678370 / 0.00% |
 
-The status-quo isometric view loses 0.503380 aggregate and exposes only 50% mean visibility in this
-corpus. The learned policy's **strict** per-example win rates are 85.7143% against isometric,
-28.5714% against best-of-8 random, and 50.0000% against greedy. Thus the learned policy has the
-highest mean aggregate here, but it does **not** beat best-of-8 on most individual examples and it
-only ties the greedy baseline's win/loss rate. Those facts are not hidden by the aggregate.
-Four components saturate on these simple cuboids; this run does not establish broad CAD quality.
+The policy's point crossover is N=4 on easy and hard rows, but N=1 on medium rows. This is not a
+policy that uniquely unlocks hard features: it has its strongest absolute score and only
+majority-strict wins on easy rows, while medium rows lose even to one random render.
+
+The old cuboid run remains useful as a failure audit: policy mean 0.928693 exceeded random@8
+0.916260 while strict wins were only 28.57%, and coverage, scale, depth, and uniqueness were exactly
+1.0. On the new held-out corpus the policy means are respectively 0.946970, 0.779359, 0.960606, and
+0.893939, with exact-1 saturation rates 93.94%, 42.42%, 95.45%, and 89.39%. Scale now measures
+meaningful variation; coverage, depth, and uniqueness remain too often saturated and must not be
+treated as four independent pieces of evidence.
+
+**Decision:** the current policy does **not** earn its existence over brute-force search. The N=4
+point crossover is too uncertain, random@1 parity is inside the confidence interval, strict wins are
+low, and the result collapses on medium difficulty.
 
 ## Architecture: Feature-Conditioned Set Ranker
 
@@ -79,26 +132,26 @@ license and model-card provenance must be recorded before adoption.
 
 ### Geometry and feature conditioning
 
-Each geometry token is 16 `float32` values:
+Each geometry token is 18 `float32` values:
 
 | slice | meaning |
 |---|---|
 | `0:3` | feature center relative to part center, divided by part bounding radius |
 | `3:6` | feature half-extent divided by bounding radius |
 | `6:9` | unit feature normal/axis, or zero when not applicable |
-| `9:13` | face/edge/hole/boss one-hot |
-| `13` | `log1p(feature_area / radius²)` |
-| `14` | normalized radial position |
-| `15` | normalized triangle support |
+| `9:15` | face/edge/hole/boss/pocket/region one-hot |
+| `15` | `log1p(feature_area / radius²)` |
+| `16` | normalized radial position |
+| `17` | normalized triangle support |
 
 `geometry_mask[B,G]` removes padding and `feature_mask[B,G]` identifies the feature being asked
 about. Shared token weights plus radius normalization are the generalization mechanism across parts;
-no fixed mesh size is required. Production extraction must preserve the same normalization and may
-supply more tokens than the procedural corpus.
+no fixed mesh size is required. These summary tokens do not encode adjacency, concavity, or explicit
+line-of-sight blockers.
 
 ### Task encoding
 
-`task[B,12]` contains a four-way feature kind, six-way question kind
+`task[B,14]` contains a six-way feature kind, six-way question kind
 (`presence`, `dimension`, `surface`, `clearance`, `orientation`, `identity`), minimum useful scale,
 and requested detail. Stage 1 supplies all fields, but its geometric oracle is intentionally blind
 to natural-language usefulness. Consequently the question-kind dimensions get no trustworthy
@@ -124,8 +177,8 @@ does not need to reconstruct a rotation matrix or repair a predicted pose.
 
 | tensor | shape | dtype | contract |
 |---|---|---|---|
-| task | `[B,12]` | float32 | finite task encoding |
-| geometry | `[B,G,16]` | float32 | finite normalized tokens |
+| task | `[B,14]` | float32 | finite task encoding |
+| geometry | `[B,G,18]` | float32 | finite normalized tokens |
 | geometry_mask | `[B,G]` | bool | at least one valid token |
 | feature_mask | `[B,G]` | bool | at least one marked valid feature token |
 | candidates | `[B,N,12]` | float32 | continuous valid-pose encodings |
@@ -138,9 +191,10 @@ uniqueness`, exactly matching `InspectabilityLabel.quality_components()`.
 
 ## Training objective and split discipline
 
-`generate_oracle_corpus` constructs seeded procedural parts, obtains diverse cameras from
-`generate_candidate_set`, and obtains every target exclusively from
-`services.viewpoint.oracle.evaluate`. Training minimizes:
+`generate_oracle_corpus` consumes seeded occluding mechanical parts and their `easy`/`medium`/`hard`
+feature labels from `services.viewpoint.parts`. It calls `generate_benchmark_candidate_set` once at
+the maximum render budget and uses nested prefixes for the random-search curve. Every target comes
+exclusively from `services.viewpoint.oracle.evaluate`. Training minimizes:
 
 1. Smooth-L1 loss on all seven component predictions; and
 2. listwise cross-entropy from the oracle aggregate distribution to the predicted aggregate
@@ -158,15 +212,18 @@ test is opened only for the final policy/baseline report.
 
 ## Baselines and metrics
 
-- **Fixed isometric:** candidate whose forward direction is closest to looking from `(+1,+1,+1)`.
-- **Best-of-8 random:** stable seeded random subset of eight offered poses, with the geometric oracle
-  allowed to choose the best. This is intentionally strong and spends eight free oracle calls.
-- **Greedy geometric:** no labels; one step combining feature-axis alignment, target centering,
-  distance, and FOV proxies.
+- **Fixed isometric:** one render at the offered camera nearest the historical `(+1,+1,+1)` view.
+- **Random@N:** `N` nested, seeded random render attempts for `N in {1,2,4,8,16,32}`, with the
+  geometric oracle allowed to choose the best. This deliberately gives search its real compute cost.
+- **Greedy geometric:** one render chosen without labels by feature-axis alignment, target
+  centering, distance, and FOV proxies.
 
-Every chooser reports the seven selected-pose components and aggregate. Policy win-rate is the
-fraction with strictly greater oracle aggregate; ties are not wins. The benchmark does not compare
-predicted component calibration, LLM answer correctness, render latency, or camera transition cost.
+Every baseline reports its mean selected-pose aggregate, strict policy win/loss/tie rates, positive
+and negative mean magnitudes, and delta quantiles. The headline crossover is the first tested `N`
+whose random-search mean reaches policy@1. Its 95% interval comes from resampling whole test parts.
+Difficulty labels are reported separately. The benchmark still does not measure LLM answer
+correctness, wall-clock renderer differences, camera transition cost, or predicted-component
+calibration.
 
 ## Two-stage curriculum
 
@@ -204,37 +261,44 @@ Quick CPU validation:
 
 ```bash
 python3 -X utf8 -m pytest training/viewpoint -q
-python3 -X utf8 -m training.viewpoint.train --parts 12 --examples-per-part 1 --candidates 8 --epochs 40 --image-size 128
-```
-
-The final reproduced 48-part run completed in 30.64 seconds on the development workstation CPU, including
-oracle labeling and 500 epochs. A larger 3080 Ti run is:
-
-```bash
 python3 -X utf8 -m training.viewpoint.train \
-  --device cuda --parts 512 --examples-per-part 4 --candidates 64 \
-  --epochs 1200 --image-size 640 \
-  --output-weights training/viewpoint/viewpoint_stage1.npz \
-  --output-report training/viewpoint/viewpoint_stage1_report.json
+  --parts 6 --examples-per-part 1 --candidates 32 --epochs 3 \
+  --image-size 72 --bootstrap-samples 64
 ```
 
-Oracle label generation remains CPU work; CUDA accelerates only gradient training. Memory is roughly
-linear in `B*G*N*hidden` for attention plus the component targets. This full-batch reference path is
-appropriate for the stated run; substantially larger corpora need a part-grouped mini-batch loader,
-not silent example-level shuffling.
+The reproduced 72-part CPU run took 483.22 seconds, including mechanical-part generation, 13,824
+oracle pose labels, 350 full-batch epochs, and 5,000 bootstrap samples. Oracle label generation
+remains CPU work; CUDA accelerates only gradient training. Memory is roughly linear in
+`B*G*N*hidden` for attention plus component targets. Substantially larger corpora need a
+part-grouped mini-batch loader, not silent example-level shuffling.
 
-## Honest limitations
+## Honest limitations and next experiment
 
-- The benchmark has only 48 procedural cuboids and 14 locked test examples; it is an executable
-  architecture benchmark, not evidence of production generalization.
-- Coverage, scale, depth, and uniqueness saturate in the reported corpus. More varied assemblies,
-  tiny features, clipping, repeated geometry, and real occluders are required.
+- The locked result has 66 examples but only 11 independent test parts. The part-bootstrap interval
+  correctly remains broad; this is not production-generalization evidence.
+- Three components still saturate on most selected examples: coverage 93.94%, depth 95.45%, and
+  uniqueness 89.39%. The aggregate therefore contains less independent signal than seven names
+  imply.
 - Candidate ranking cannot recover a useful view absent from the candidate set.
-- The structured encoder currently covers face/edge/hole/boss; production pocket/region token
-  semantics are not yet specified.
-- Stage 1 cannot label whether an LLM answered correctly and does not prove question-conditioned
-  usefulness. Stage 2 is only a seam.
+- Stage 1 cannot label whether an LLM answered correctly. Question-kind conditioning is
+  unidentifiable under a task-blind geometric oracle; Stage 2 remains only a seam.
 - No collision-free camera path, temporal smoothness, multi-view set selection, uncertainty
   calibration, or real-image encoder is implemented.
-- The benchmark reports one fixed seed and no confidence interval. The strict win rates explicitly
-  show that higher mean aggregate does not mean per-example dominance.
+
+The next experiment is an ablation, not a promised win. The observed median-zero policy and weak
+medium slice are consistent with four concrete architectural limits, but this run does not identify
+which is causal:
+
+1. **Capacity:** the single 32-wide attention/fusion block may be too small for target/occluder
+   interactions. Compare width/depth under the same locked split.
+2. **Geometry encoding:** center, extent, axis, kind, area, radius, and triangle count omit topology,
+   concavity, adjacency, and explicit target-to-camera blocker clearance. Add target-centered
+   occlusion/adjacency channels before adding a raster encoder.
+3. **Conditioning:** remove question-kind dimensions during geometric pretraining or supply a
+   genuinely task-dependent label; do not ask a task-blind oracle to supervise them.
+4. **Loss:** many candidates have zero aggregate and many selections tie. Compare the current
+   smooth-L1 plus soft listwise loss with top-k regret or pairwise margins using stratified nonzero
+   hard negatives.
+
+Run those as predeclared ablations on the same part split. A harder benchmark that the policy loses
+is the useful result here; changing the generator or tuning against the locked test would erase it.

@@ -9,7 +9,7 @@ from services.viewpoint.oracle import evaluate
 from services.viewpoint.parts import GENERATOR_VERSION, PartExample, generate_part_examples
 from services.viewpoint.sampling import generate_benchmark_candidate_set
 
-from .data import FEATURE_KINDS, QUESTION_KINDS, ViewpointBatch, encode_camera_pose, encode_task
+from .data import FEATURE_KINDS, ViewpointBatch, encode_camera_pose, encode_task
 from .model import COMPONENTS
 
 Array = np.ndarray
@@ -17,14 +17,14 @@ Array = np.ndarray
 
 @dataclass(frozen=True)
 class CorpusConfig:
-    parts: int = 96
+    parts: int = 72
     examples_per_part: int = 6
     candidates: int = 32
     seed: int = 1729
     image_size: tuple[int, int] = (320, 240)
 
     def validate(self) -> "CorpusConfig":
-    tokens = np.zeros((len(scene.features), 18), np.float32)
+        if self.parts < 3 or self.examples_per_part <= 0 or self.candidates < 3:
             raise ValueError("corpus requires >=3 parts, positive examples, and >=3 candidates")
         if min(self.image_size) <= 0:
             raise ValueError("image dimensions must be positive")
@@ -35,7 +35,7 @@ def _geometry_tokens(scene: Scene, target_id: str) -> tuple[Array, Array]:
     vertices = scene.mesh.vertices
     center = vertices.mean(axis=0)
     radius = max(float(np.linalg.norm(vertices - center, axis=1).max()), 1.0e-6)
-    tokens = np.zeros((len(scene.features), 16), np.float32)
+    tokens = np.zeros((len(scene.features), 18), np.float32)
     feature_mask = np.zeros(len(scene.features), bool)
     for row, feature in enumerate(scene.features):
         points = scene.feature_points(feature)
@@ -47,16 +47,16 @@ def _geometry_tokens(scene: Scene, target_id: str) -> tuple[Array, Array]:
         kind = feature.kind if feature.kind in FEATURE_KINDS else "face"
         tokens[row, 9 + FEATURE_KINDS.index(kind)] = 1.0
         if feature.triangle_indices:
-        tokens[row, 15] = np.log1p(area / (radius * radius))
-        tokens[row, 16] = np.linalg.norm(local_center - center) / radius
-        tokens[row, 17] = len(feature.triangle_indices) / 2.0
+            triangles = scene.mesh.vertices[scene.mesh.triangles[np.asarray(feature.triangle_indices)]]
+            area = 0.5 * np.linalg.norm(
+                np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]),
                 axis=1,
             ).sum()
         else:
             area = 0.0
-        tokens[row, 13] = np.log1p(area / (radius * radius))
-        tokens[row, 14] = np.linalg.norm(local_center - center) / radius
-        tokens[row, 15] = len(feature.triangle_indices) / 2.0
+        tokens[row, 15] = np.log1p(area / (radius * radius))
+        tokens[row, 16] = np.linalg.norm(local_center - center) / radius
+        tokens[row, 17] = len(feature.triangle_indices) / 2.0
         feature_mask[row] = feature.feature_id == target_id
     return tokens, feature_mask
 
@@ -78,9 +78,7 @@ def _pad_geometry(rows: list[Array], masks: list[Array]) -> tuple[Array, Array, 
     return geometry, geometry_mask, feature_mask
 
 
-def _example_rows(
-    config: CorpusConfig,
-) -> list[tuple[int, int, PartExample]]:
+def _example_rows(config: CorpusConfig) -> list[tuple[int, int, PartExample]]:
     rows: list[tuple[int, int, PartExample]] = []
     for part_index in range(config.parts):
         examples = generate_part_examples(
@@ -110,7 +108,6 @@ def generate_oracle_corpus(config: CorpusConfig = CorpusConfig()) -> ViewpointBa
 
     for part_index, example_index, example in _example_rows(config):
         scene = example.scene
-        feature = scene.feature(example.target_id)
         vertices = scene.mesh.vertices
         scene_center = vertices.mean(axis=0)
         radius = max(float(np.linalg.norm(vertices - scene_center, axis=1).max()), 1.0e-6)

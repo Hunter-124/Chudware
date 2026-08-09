@@ -14,6 +14,9 @@ def test_oracle_corpus_is_seeded_normalized_and_baselines_are_measured():
     np.testing.assert_array_equal(first.candidates, second.candidates)
     np.testing.assert_array_equal(first.components, second.components)
     assert np.all((first.components >= 0.0) & (first.components <= 1.0))
+    assert len(first.difficulties) == len(first.part_ids)
+    assert set(first.difficulties) <= {"easy", "medium", "hard"}
+    assert np.all(first.geometry_mask.sum(axis=1) > 6)
     baselines = all_baselines(first, random_n=3)
     report = evaluation_report(first, baselines["greedy_geometric"], baselines)
     assert set(report["policy"]["components"]) == set(COMPONENTS)

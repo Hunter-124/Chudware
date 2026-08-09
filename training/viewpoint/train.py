@@ -11,7 +11,7 @@ from .baselines import RANDOM_RENDER_BUDGETS, all_baselines, random_search_basel
 from .data import ViewpointBatch, split_by_part
 from .metrics import evaluation_report
 from .model import DEFAULT_COMPONENT_WEIGHTS, NumpyViewpointPolicy, weighted_geometric_mean
-from .synthetic import CorpusConfig, generate_oracle_corpus
+from .synthetic import GENERATOR_VERSION, CorpusConfig, generate_oracle_corpus
 from .torch_model import build_torch_policy
 
 DEFAULT_SEED = 1729
@@ -123,9 +123,11 @@ def run_stage1(
             "train_parts": len(set(train.part_ids)),
             "validation_parts": len(set(validation.part_ids)),
             "test_parts": len(set(test.part_ids)),
+            "test_examples": len(test.part_ids),
             "overlap": 0,
         },
         "corpus": {
+            "generator_version": GENERATOR_VERSION,
             "parts": corpus.parts,
             "examples_per_part": corpus.examples_per_part,
             "candidates": corpus.candidates,
@@ -141,7 +143,7 @@ def run_stage1(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train the Stage-1 task-conditioned viewpoint ranker")
-    parser.add_argument("--parts", type=int, default=96)
+    parser.add_argument("--parts", type=int, default=72)
     parser.add_argument("--examples-per-part", type=int, default=6)
     parser.add_argument("--candidates", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=350)

@@ -13,457 +13,1609 @@
     {
       "part_id": "mechanical_000006c1_0000",
       "part_index": 0,
-      "geometry_sha256": "95d84f0076eb0fbf13ff9ddfea65a82dcf094162fd7f2de4ada8a61b220916e1",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "a1eda9332e52f5a007581cff4c2bc80165a88966b9b8f738ad69b641d7db9bf3",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0001",
       "part_index": 1,
-      "geometry_sha256": "f7a220352bad3cc2b6ab12ac387a52e1a0616b4a3778ffb527dd2d58c35a99a1",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "862ce14d896a0405c874c4870be0c48851482236e6b645676739e0ed9fbdc924",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0002",
       "part_index": 2,
-      "geometry_sha256": "1cae7bdb14aa3a3235d1251b49d50562b6ab749be8e822ffd903e2eb5e4bb783",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "749c33c30a6af937db82c73208f707669e6a99933b3c26351034054c060a6f2f",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0003",
       "part_index": 3,
-      "geometry_sha256": "f9be3e822a23fc39b90f0a867803a4b6e468863267e386a6d2c52270a3992136",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "23c5ba5cf5c2a982e10524d41b1135beb26c02ab22007e8961c9cb3d8feda176",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0004",
       "part_index": 4,
-      "geometry_sha256": "c54598f5cacb8ac3b7cf1d01b653a376d94dd9294df21d9408c3176d5e7e1c70",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "253dd9df4f21deb1470cfee36f821b34e4a9c9b06789e34c4e9058ee778c2176",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0005",
       "part_index": 5,
-      "geometry_sha256": "89e0d3f34d5a953da137df8b7b8bb0967138477536511301f532eedd747dac20",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "cb83b13cf62d2ba8797b8737ffb104cae936b089c888f65fd4fc5a16ac26ac60",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0006",
       "part_index": 6,
-      "geometry_sha256": "ca03add1db402237870aa130cdcf6d103c00a520e2785a8a0c7ba3e748d7c6b1",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "d3e2cf25b475916b136734de88ba7262ed59e54be9b3c07c3fc839848b702491",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0007",
       "part_index": 7,
-      "geometry_sha256": "bad9478826b84d0a12b07ec8ac0ea97876012dc8c46ea6776eb695d56f86afb8",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "631e523b2cbdfb559cb5ad2b6808c4ed6f90272ab0b5f9d58bc7bb845a981c49",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0008",
       "part_index": 8,
-      "geometry_sha256": "0d3e8134639d3f08c67c5fdf1d8fd36eb9a1c95cd05f09dbb7ae9497cc0f9f3c",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "faac6d0d2c19c7d876d5c5effe27911a9dfb95a8056d6c9d3ae7a3ff892d059b",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0009",
       "part_index": 9,
-      "geometry_sha256": "0fec16040e9cb7ee1995927175a49d06e46834f85ffe2d6d428ec9d0defeb417",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "2f251575c93773a1da5c63b96a67b240f08845584511e0dbb89d5e0ae1e58d62",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0010",
       "part_index": 10,
-      "geometry_sha256": "fea93debaa6cb05f3a482d7cc1068fdb9712370ada73c6a09474a15bcf3e32c0",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "c072bca16bc7b1ab002398b0bf03bfa2185b78e4d741f25950400befd230ff5b",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0011",
       "part_index": 11,
-      "geometry_sha256": "419aea63295f72aaedb1ef4d479761fd63be646be74b8226425367186a88da4e",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "c1e8f777db0b81190edfcfc949756210bae600962e0cea9e636d1d00a5660c61",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0012",
       "part_index": 12,
-      "geometry_sha256": "2c183eb522b776b035796f539f76a150b19c816c4a1f4a0bd84c676211656af8",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "9049b87c84c00e9cf2b0771e2cf96e4610fbb3585cfe7ef565d83c185a590edc",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0013",
       "part_index": 13,
-      "geometry_sha256": "e53b180ad766e9f992e29e2c6199a734699ac0f3bf2d05282c8d157758cd7ef9",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "d4916a912cd9d6539faae011aa1559b6f5104374504633163125049ea26e16ba",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0014",
       "part_index": 14,
-      "geometry_sha256": "f97c35e29b2fc1428b907e912181285cd47fd454aa1a7f80ede9db6d1d6da417",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "c1c2a902df0a8dc3f9d4b11857585b78bd7fb95e4221d20f40e611375d91d680",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0015",
       "part_index": 15,
-      "geometry_sha256": "a8c56f89e63c43ca22829b396903e39e825f02419b1cc4512ed4b08248327cde",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "508b13c2a17b75ba9575961c2f60cc4ace2e791dd26e6a1913189d1aa8f58097",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0016",
       "part_index": 16,
-      "geometry_sha256": "512d6a25b4a495cc11261baafc5e6154fc33300b8c24c657f33041e0c63ef4c9",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "d38de04475f2ec893319c7bf77e22c2f0fa7d227b02c8de99d1c2ae215520a39",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0017",
       "part_index": 17,
-      "geometry_sha256": "34a92a1c3f2ac2812e5975c89988b3f4be05f365d4aec5336e26e69f37d0bc95",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "48d96ce9304d2a8fbd3390d6165048dd2bad5360d32fc89020c0a2d850712da9",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0018",
       "part_index": 18,
-      "geometry_sha256": "255a3ec5c42b6bab8d8b3caa0ec843d583fecdfa538102e976ebebdfe2597deb",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "f75adb4cafcc0e51b536cf0f12a60c13d82e35dbb59b051087493fa948bd21d5",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0019",
       "part_index": 19,
-      "geometry_sha256": "9e4fed40e754aae0b7e1168d5f7567a9cbb23feba30ffc43d49462f6bbfcf3f1",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "4e35b6f597ab146a3cb6c9c2c58ce4f309fb4cec78c25ce5494b94e76ab714ba",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0020",
       "part_index": 20,
-      "geometry_sha256": "ce00a0c661ad896ec816a4619c63ff52ae6fcf15cfc143f9975855c105e339c5",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "8ea1cbd4608527e1e0ab1b5b52612f348db9a3abf9bc7719d69fa21c5247688a",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0021",
       "part_index": 21,
-      "geometry_sha256": "d9379b94c3bd58fdcf817586ddfa850b303530f7db99d7378652567460919592",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "70778997c7af5397645127c3dfad7c2b2e44142e7d58dc658707d345a80f34d9",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0022",
       "part_index": 22,
-      "geometry_sha256": "ff6159737e07b23a6b3839b7f2a6d854cf0b7f00a6c7194069a8fea71312e527",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "6fe5dcc917b42637c47d59723d87a714bb4efa1167bd01e32f5fa8f493a0d930",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     },
     {
       "part_id": "mechanical_000006c1_0023",
       "part_index": 23,
-      "geometry_sha256": "d5cfeef80a0b48f00bca2b8f43f557bf0c04c075a8dae28e5cc01233a4d6cb12",
-      "target_feature_ids": [
-        "datum_face",
-        "inspection_boss",
-        "boss_shadowed_hole",
-        "deep_counterbore",
-        "deep_pocket_floor",
-        "angled_face_hole",
-        "concave_rib_edge",
-        "through_hole_counterbore_end",
-        "through_hole_plain_end",
-        "underside_overhang_hole",
-        "ambiguous_twin_left",
-        "ambiguous_twin_right"
+      "geometry_sha256": "b8c111c87b4998b64f4a3a89f0d0701cedf6f8ee5a6e9f96e730de7ec07d0b60",
+      "features": [
+        {
+          "feature_id": "datum_face",
+          "kind": "face",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "inspection_boss",
+          "kind": "boss",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "boss_shadowed_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "deep_counterbore",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "deep_pocket_floor",
+          "kind": "pocket",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "angled_face_hole",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "concave_rib_edge",
+          "kind": "edge",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "through_hole_counterbore_end",
+          "kind": "hole",
+          "difficulty": "easy"
+        },
+        {
+          "feature_id": "through_hole_plain_end",
+          "kind": "hole",
+          "difficulty": "medium"
+        },
+        {
+          "feature_id": "underside_overhang_hole",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_left",
+          "kind": "hole",
+          "difficulty": "hard"
+        },
+        {
+          "feature_id": "ambiguous_twin_right",
+          "kind": "hole",
+          "difficulty": "hard"
+        }
       ]
     }
   ]

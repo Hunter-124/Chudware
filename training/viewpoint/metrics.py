@@ -32,6 +32,10 @@ def summarize_selection(batch: ViewpointBatch, indices: Array) -> dict[str, obje
         "aggregate": float(np.mean(aggregate)),
         "aggregate_quantiles": _quantiles(aggregate),
         "components": {name: float(np.mean(components[:, i])) for i, name in enumerate(COMPONENTS)},
+        "component_saturation_rate": {
+            name: float(np.mean(components[:, i] >= 1.0 - 1.0e-7))
+            for i, name in enumerate(COMPONENTS)
+        },
     }
 
 

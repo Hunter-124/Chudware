@@ -147,6 +147,14 @@ def _ring(center: np.ndarray, radius: float, axis: np.ndarray, count: int = 12, 
     return np.asarray(center) + radius * (np.cos(angle)[:, None] * first + np.sin(angle)[:, None] * second)
 
 
+def _annular_face(builder: _MeshBuilder, center: np.ndarray, inner_radius: float, outer_radius: float, axis: np.ndarray) -> None:
+    inner = _ring(center, inner_radius, axis, count=12)
+    outer = _ring(center, outer_radius, axis, count=12)
+    for index in range(12):
+        nxt = (index + 1) % 12
+        builder.quad(np.asarray((inner[index], outer[index], outer[nxt], inner[nxt])))
+
+
 def _rotation(rng: np.random.Generator) -> np.ndarray:
     axis = unit(rng.normal(size=3), name="part rotation axis")
     angle = float(rng.uniform(-np.pi, np.pi))
@@ -251,6 +259,7 @@ def generate_part(part_index: int, *, seed: int = 1729) -> GeneratedPart:
     angled_center = np.asarray((*station[4], 0.05 * scale))
     angled_axis = unit(np.asarray((rng.uniform(0.45, 0.75), rng.uniform(-0.28, 0.28), 1.0)), name="angled-hole axis")
     angled_depth = float(rng.uniform(0.9, 1.35)) * scale
+    _annular_face(builder, angled_center, 0.34 * scale, 1.0 * scale, angled_axis)
     builder.cylinder(angled_center + angled_axis * angled_depth * 0.5, float(rng.uniform(0.42, 0.58)) * scale, angled_depth, angled_axis, caps=False)
     builder.box(angled_center + np.asarray((0.7 * scale, 0.0, 0.45 * scale)), np.asarray((0.22, 1.8, 1.45)) * scale)
     features.append(_feature("angled_face_hole", "hole", "medium", points=_ring(angled_center, 0.27 * scale, angled_axis, phase=float(rng.uniform(0.0, np.pi))), orientation=angled_axis))

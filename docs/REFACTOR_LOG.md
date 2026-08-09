@@ -7197,3 +7197,44 @@ procedural cuboids. Brute-force search is therefore nearly optimal, which means 
 to demonstrate anything. Two follow-ups are in flight: a genuinely occluding part generator with
 non-saturating components, and a re-framed headline metric — policy@1 against best-of-N random, whose
 crossover N states directly how many renders the expensive downstream model is saved.
+
+## 2026-08-08 — Viewpoint policy: the hard benchmark, and the policy fails it
+
+The easy benchmark was replaced and the honest answer changed sign. Recorded here because the failure
+is more informative than the earlier apparent win.
+
+`services/viewpoint/parts.py` generates mechanical parts with genuine self-occlusion — bosses
+shadowing holes, axial counterbores and deep pockets, an oblique hole on a tilted annular face, ribs
+and webs in concave corners, asymmetric through-hole ends, an underside-overhang hole, and
+context-dependent ambiguous twins — with each target labelled easy/medium/hard. Benchmark poses now
+vary framing, distance, FOV and clipping, so no oracle component had to be excluded to stop it
+saturating: coverage fell 1.000 → 0.938, scale 1.000 → 0.769 (100 % → 43 % exactly-1), uniqueness
+1.000 → 0.823, visibility 0.496 → 0.289, silhouette 0.507 → 0.204. Locked fixture: 24 parts, 288
+labelled features (72 easy / 96 medium / 120 hard).
+
+The difficulty is real. Best-of-N random on the held-out set now reads N=1 0.165, N=2 0.217, N=4
+0.349, N=8 0.463, N=16 0.603, N=32 0.678 — against 0.916 for best-of-8 on the old corpus. Brute-force
+search is no longer nearly optimal.
+
+And the policy does not beat it. On 66 locked examples from 11 held-out parts (50/11/11 part split,
+zero overlap, 5,000 whole-part bootstrap samples): policy@1 = 0.265 against random@1 0.165 (delta
++0.100, CI [-0.003, +0.213]), random@4 0.349 (-0.084), random@8 0.463 (-0.199, CI excludes zero),
+random@32 0.678 (-0.413, strict win rate 0 %). It beats fixed isometric (0.176) and the greedy
+geometric heuristic (0.191), but the point crossover of N=4 has a bootstrap CI of [1, 8] — an interval
+that includes one render, so **there is no demonstrated compute saving**. Sliced by difficulty it wins
+on easy (0.566 vs 0.293), loses outright on medium (0.097 vs 0.156), and is only modest on hard (0.222
+vs 0.086). Best validation aggregate during training was 0.325, so it is underfitting, not merely
+generalizing badly.
+
+Verdict: on a benchmark hard enough to be worth solving, the current policy does not earn its
+existence over brute-force search. The `docs/manufacturing/25_viewpoint_model.md` verdict says so
+plainly.
+
+Diagnosis for the next iteration, which is architectural rather than a tuning matter. Direct pose
+regression is the prime suspect: several distinct viewpoints are equally good for one feature, and a
+network trained to regress a single pose under an L2-style objective converges toward the mean of a
+multimodal target, which for a sphere of good poses is a bad pose. The distribution table supports
+this — against random@1 the higher mean comes from infrequent large wins plus a majority of exact-zero
+ties, not per-example dominance. The planned redesign scores candidate poses instead of imagining one,
+which also matches the deployment shape (the harness renders N, the policy ranks them) and the shape
+of the Stage-2 preference data already built.

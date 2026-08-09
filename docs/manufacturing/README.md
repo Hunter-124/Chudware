@@ -52,13 +52,21 @@ Cross-domain phases. Gateway-internal wave ids (`W1.1` …) are `10_gateway.md` 
 | **P2** | landed | `grbl_protocol`, twin core, additive model, slicer sidecar, metrology core, perception + training core, MTConnect monitor, turning, cutting, PnP, robot |
 | **P3** | landed | `tier0` + `policy`, `gates`, `approval` + `lease` + `arbiter`, `grbl_adapter` + `emulator_transport` (E1–E3) |
 | **P4** | landed | `core/hostd/mfg_lane` serving the `mfg_*` surface, `services/mcp/mfg_tools.py` + motion/safety risk classes, `host/src/ui/manufacture/**` operator surfaces |
-| **P5** | next | real transports (serial/TCP/WS), Moonraker → OctoPrint → PrusaLink, notifications/attention, per-domain UI surfaces, split-out `chudware-mfgd` |
-| **P6** | planned | perception capture on real jobs, training runs, published model + training core |
-| **P7** | blocked on hardware | E4→E6 pilot campaign, then and only then `execute` advertisement |
+| **P5** | landed | serial/TCP/WebSocket transports behind a deny-by-default commissioning allowlist, Moonraker/OctoPrint/PrusaLink adapters, durable attention + notification path, perception capture, and the lane transport-selection seam |
+| **P6** | next | perception capture on real jobs, training runs, published model + training core |
+| **P7** | blocked on hardware | E4–E6 pilot campaign, then and only then `execute` advertisement |
 
-**P4 deviation, deliberate:** the separate `chudware-mfgd` process is deferred to P5. The lane runs
-inside `chudware-hostd` today; one lane object still owns a device, the arbiter is still the only
-approval validator, and no transport reaches hardware, so the safety properties are unchanged.
+**Two deliberate deviations from the design, both standing:**
+
+1. **No separate `chudware-mfgd` process.** The lane runs inside `chudware-hostd`. The safety
+   property the split existed to guarantee is preserved structurally: exactly one lane object owns a
+   device, opening one requires a commissioning allowlist entry, and the arbiter remains the only
+   approval validator. Revisit only if a device driver turns out to need fault isolation from the
+   document daemon.
+2. **Printer adapters are Python** (`services/manufacturing/printers/**`), reached through an
+   injected worker-call seam. An HTTP + WebSocket client in C++ with no new dependencies is not worth
+   its cost. The lane still owns claims, approval, durable seq and events, and strips any authority a
+   worker result tries to assert.
 
 `P7` is operator-attended and hardware-gated by design: nothing before it may advertise
 `execute` on a physical machine.

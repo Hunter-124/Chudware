@@ -101,3 +101,43 @@ Thus the blind control is within 0.000797 absolute accuracy of chance and is ind
 ## Honest scope
 
 The reported relationship above is an inserted scripted control, not evidence that geometric inspectability predicts a real model's answer correctness. What remains unproven is the central empirical hypothesis: a real image-capable model must be run through `CandidateObservation` on the bound 50,112 renders, after which the same analysis can report whether any component or the frozen aggregate actually predicts useful answers. A weak or absent relationship is a valid result and no threshold in this package is tuned to make the oracle win.
+
+## Live-model probe (2026-08-08) — preliminary, underpowered, and pointed the wrong way
+
+The scripted controls validate the instrument; they cannot answer what the instrument exists for.
+This is the first run where a REAL vision model answered the benchmark from real renders.
+
+**Method.** `services/viewpoint/usefulness/trial_pack.py` emits a model-facing pack: one PNG per
+trial plus `questions.json` carrying only the `PublicQuestion`. Ground truth and every oracle value
+stay in a separate `answers.json` the answering model never reads. Trials are stratified by aggregate
+**value** rather than rank, because the candidate distribution is heavily zero-inflated and equal-count
+rank bands put nearly every trial at 0.000 — a correlation measured on that sample would report a null
+for want of spread rather than for want of a relationship. Pixels and oracle labels are regenerated
+together at the viewing resolution (384x384), not upscaled from the 96x96 encoder corpus, because the
+oracle's `scale` component is resolution-coupled and at 96x96 these features are barely legible.
+
+**Result, n=18, aggregate spanning 0.000-0.848.** Accuracy 0.722 against a per-trial chance baseline
+of 0.472 (13/18, one-sided binomial p=0.029), so the model is genuinely reading the images. But:
+
+| relationship | value |
+|---|---:|
+| pearson(aggregate inspectability, correct) | **+0.064**, 95 % CI [-0.415, +0.516] |
+| pearson(visibility component, correct) | **-0.205** |
+| accuracy on low inspectability (agg < 0.2) | 0.833 (n=6) |
+| accuracy on high inspectability (agg >= 0.2) | 0.667 (n=12) |
+
+**What this does and does not license.** It does NOT license the conclusion that geometric
+inspectability is unrelated to usefulness. The CI on r spans nearly the whole range, and the apparent
+inversion is contaminated in an obvious way: the low-inspectability trials are mostly two-choice
+questions where a forced guess lands 50 % of the time, and inspection of the per-trial log shows
+exactly that — trials 3, 9 and 15 were recorded as guesses and scored correct anyway. Trial 17 is the
+honest counter-example in the other direction: the target was entirely out of frame, the oracle scored
+it 0.000, and the forced guess was wrong.
+
+What it does license is that the question is live and worth powering properly. A +/-0.15 CI on r needs
+roughly **685 trials**, not 18. A properly powered run also needs guess-corrected scoring and questions
+with more than two choices, so chance cannot manufacture the inversion seen here.
+
+Reproduce: `python3 -X utf8 -m services.viewpoint.usefulness.trial_pack --trials 24 --parts 40
+--resolution 384 --out scratch/viewpoint-live-trials`; answers and per-trial log in
+`scratch/viewpoint-live-trials/live_model_results.json`.

@@ -7539,3 +7539,25 @@ user's own flywheel idea, and it is the actual contribution.
 
 Gates: `pytest training/viewpoint services/viewpoint` 30 passed in the training slice, full suite green;
 20 passed / 8 skipped with Torch unimportable.
+
+## 2026-08-08 — Full gate, green
+
+Final verification of the whole effort, run from a clean shell with `TMPDIR` inside the repo (the
+system `/tmp` tmpfs is near quota and breaks large GCC assembly steps):
+
+- `ctest --test-dir core/build-linux -j4` — **97/97 passed**, 448 s. `mesher_advanced` and
+  `kicad_import`, which failed earlier runs purely on `-j` CPU contention, both pass here.
+- `pytest services/manufacturing services/viewpoint services/perception training/perception
+  training/viewpoint services/mcp/test_mfg_tools.py services/agent/test_manufacture_family_default_off.py`
+  — **331 passed, 1 skipped** (the skip is optional `onnx`).
+- `scripts/check.py` — **all 8 gates PASS**, including `advertised_tool_audit`: every advertised tool
+  is reachable.
+- `./build.sh` — links.
+- `scripts/qualify_mfg_e3.py` — **9/9** in 0.61 s; `scripts/qualify_mfg_printer.sh` — **8/8** in 0.89 s.
+  Both tear down their private daemon and temp state.
+- Headless GUI smokes: `CHUDWARE_SHOT=manufacture`, `m1` and `cam` all render.
+
+One item remains open and it is not mine to close: the E4-E6 hardware pilot. Physical `execute` is
+refused by name (`mfg_physical_execute_not_qualified`), the device allowlist denies by default, and
+`mfg_run_resume` has no success path — so nothing can reach a machine until an operator deliberately
+commissions one.

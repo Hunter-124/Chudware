@@ -148,6 +148,12 @@ class Settings:
     terminal_enabled: bool = field(
         default_factory=lambda: _env_bool("CHUDWARE_WEB_TERMINAL_ENABLED", False)
     )
+    # Single-tenant compatibility only: let web RPCs use this host account's
+    # provider profile. Fail closed when unset because a multi-tenant gateway
+    # otherwise spends the operator's keys outside the credit ledger.
+    share_provider_keys: bool = field(
+        default_factory=lambda: _env_bool("CHUDWARE_WEB_SHARE_PROVIDER_KEYS", False)
+    )
     terminal_max_sessions: int = field(
         default_factory=lambda: _env_int("CHUDWARE_WEB_TERMINAL_MAX_SESSIONS", 8)
     )
@@ -180,6 +186,15 @@ class Settings:
     # signed blobs, so rotating this value does not log anybody out.
     session_secret: str = field(
         default_factory=lambda: _env("CHUDWARE_WEB_SESSION_SECRET", "") or ""
+    )
+    # URL-safe base64 encoding of 32 random bytes used only for AES-256-GCM
+    # provider-key envelopes. It is deliberately independent of session_secret
+    # so either secret can rotate without invalidating the other subsystem.
+    provider_key_encryption_key: str = field(
+        default_factory=lambda: _env(
+            "CHUDWARE_WEB_PROVIDER_KEY_ENCRYPTION_KEY", ""
+        )
+        or ""
     )
     session_ttl_days: int = field(
         # Absolute expiry. last_seen_at slides within the window; this does not.

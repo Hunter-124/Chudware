@@ -264,6 +264,20 @@
       border: 1px solid var(--border, #2a2e36); border-radius: 8px;
       padding: 6px 8px; font: inherit; box-sizing: border-box; }
   #trial-domains { width: 100%; min-height: 84px; resize: vertical; }
+  .manifest-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+                   gap: 8px; margin-bottom: 12px; }
+  .manifest-form label { display: grid; gap: 4px; color: var(--muted, #8b93a3);
+                         font-size: .72rem; }
+  .manifest-form .wide { grid-column: 1 / -1; }
+  .manifest-form input, .manifest-form textarea {
+      width: 100%; background: var(--bg, #0e1013); color: var(--fg, #e8eaf0);
+      border: 1px solid var(--border, #2a2e36); border-radius: 8px;
+      padding: 7px 8px; font: inherit; box-sizing: border-box; }
+  .manifest-form textarea { min-height: 58px; resize: vertical; }
+  .manifest-row { border-top: 1px solid var(--border, #2a2e36); padding: 9px 0;
+                  display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
+  .manifest-row strong, .manifest-row span { display: block; word-break: break-word; }
+  .manifest-row span { color: var(--muted, #8b93a3); font-size: .72rem; margin-top: 3px; }
   .ac-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
   .ac-toolbar label { font-size: .82rem; color: var(--muted, #8b93a3); }
   .ac-count { font-size: .8rem; font-weight: 400; color: var(--muted, #8b93a3); margin-left: 6px; }
@@ -416,6 +430,28 @@
       <button type="button" id="trial-domains-save" class="btn ghost" style="margin-top:8px">Save domains</button>
     </div>
     <div class="admin-card">
+      <h2>Release manifests</h2>
+      <p style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 10px">
+        Customer-facing signed release metadata. CI normally publishes these; edits here
+        are for recovery and correction.
+      </p>
+      <form id="manifest-form" class="manifest-form">
+        <label>Channel<select id="manifest-channel"><option value="stable">Stable</option><option value="beta">Beta</option></select></label>
+        <label>Version<input id="manifest-version" required placeholder="1.2.0"></label>
+        <label>Platform<select id="manifest-platform"><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select></label>
+        <label>Architecture<select id="manifest-arch"><option value="x86_64">x86_64</option><option value="arm64">arm64</option></select></label>
+        <label>Minimum supported<input id="manifest-min" required placeholder="1.0.0"></label>
+        <label>Size in bytes<input id="manifest-size" type="number" min="1" required></label>
+        <label class="wide">SHA-256<input id="manifest-sha" required pattern="[0-9a-f]{64}"></label>
+        <label class="wide">Ed25519 signature (base64)<textarea id="manifest-signature" required></textarea></label>
+        <label class="wide">Release notes URL<input id="manifest-notes" type="url" required></label>
+        <label class="wide">R2 artifact key<input id="manifest-artifact" required placeholder="stable/1.2.0/Chudware-…"></label>
+        <button type="submit" class="btn ghost">Save manifest</button>
+      </form>
+      <div id="manifest-status" class="ac-dim" aria-live="polite"></div>
+      <div id="manifest-list">Loading…</div>
+    </div>
+    <div class="admin-card">
       <h2>Host files</h2>
       <p style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 10px">
         Read-only listing of the folders and part files on this machine.
@@ -446,7 +482,7 @@
     </div>
   </div>
 </div>
-<script src="/static/admin.js?v=9"></script>
+<script src="/static/admin.js?v=10"></script>
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/winbox/winbox.bundle.min.js"></script>

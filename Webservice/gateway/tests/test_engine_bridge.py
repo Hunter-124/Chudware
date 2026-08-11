@@ -208,6 +208,12 @@ def _rpc(ws, id_, method, params=None) -> dict:
 
 
 class TestEngineBridge:
+    def test_host_provider_key_sharing_defaults_closed(self, monkeypatch):
+        monkeypatch.delenv("CHUDWARE_WEB_SHARE_PROVIDER_KEYS", raising=False)
+        assert Settings().share_provider_keys is False
+        monkeypatch.setenv("CHUDWARE_WEB_SHARE_PROVIDER_KEYS", "1")
+        assert Settings().share_provider_keys is True
+
     def test_hello_identity_injected(self, daemon, client):
         with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
             resp = _rpc(ws, 1, "hello", {"client": "agent", "pid": 42, "proto": 1})
@@ -377,12 +383,15 @@ class TestEngineBridge:
             assert _rpc(ws, 1, "ping")["result"]["pong"] is True
         assert engine_bridge.active_bridge_count() == 0
 
-    def test_agent_turn_keeps_provider_strips_secrets(self, daemon, client):
-        """Web agent turns may select provider/model; credentials stay server-side.
+    def test_agent_turn_keeps_provider_strips_secrets(
+        self, daemon, client, monkeypatch
+    ):
+        """Legacy single-tenant turns keep selection but strip browser secrets.
 
-        The gateway forwards provider + model so hostd can resolve host config keys
-        by name, but strips api_key / base_url / fallback secrets from the browser.
+        Setting host-key sharing true is deliberate here. With sharing disabled,
+        the gateway refuses this unmetered ambient-host-key path.
         """
+        monkeypatch.setattr(settings, "share_provider_keys", True)
         with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
             _rpc(ws, 1, "hello")
             # Client pins provider/model selection + a browser-side secret; only
@@ -428,13 +437,20 @@ class TestEngineBridge:
         assert not any(call["method"] == "agent_admin_turn" for call in daemon.calls)
 
 
-    def test_pooled_usage_event_is_debited_by_authenticated_bridge(self, daemon, client):
+    def test_studio_pool_reserves_reconciles_and_stops_at_zero(
+        self, daemon, client, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "share_provider_keys", False)
         with db.tx() as cur:
             cur.execute(
-                "UPDATE accounts SET ai_grant = TRUE WHERE email = %s",
+                """
+                UPDATE accounts
+                   SET plan = 'studio', ai_grant = TRUE
+                 WHERE email = %s
+                """,
                 ("demo@example.com",),
             )
-        credits.grant("demo@example.com", 100, note="bridge metering test")
+        credits.grant("demo@example.com", 1, note="bridge metering test")
         credits.refresh_model_rates(
             lambda _url: {
                 "data": [{
@@ -444,21 +460,35 @@ class TestEngineBridge:
             },
             now=1_800_000_000,
         )
+        params = {
+            "question": "cheap turn",
+            "provider": "mock",
+            "model": "vendor/cheap",
+            "max_tokens": 8,
+            "_test_emit_usage": True,
+        }
         with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
-            response = _rpc(ws, 77, "agent_ask_v2", {
-                "question": "cheap turn",
-                "provider": "mock",
-                "model": "vendor/cheap",
-                "max_tokens": 8,
-                "_test_emit_usage": True,
-            })
-            assert response["result"]["ok"] is True
+            assert _rpc(ws, 77, "agent_ask_v2", params)["result"]["ok"] is True
+            refused = _rpc(ws, 78, "agent_ask_v2", params)
+        assert refused["result"] == {
+            "ok": False,
+            "reason": "insufficient_credits",
+        }
+
+        forwarded = [
+            call for call in daemon.calls if call.get("method") == "agent_ask_v2"
+        ]
+        assert len(forwarded) == 1
+        actor = forwarded[0]["params"]["options"]["_chudware_actor"]
+        assert actor["plan"] == "studio"
+        assert actor["key_source"] == "pool"
+        assert actor["_reservation_credits"] == 1
         with db.tx() as cur:
             cur.execute(
                 "SELECT credit_balance FROM accounts WHERE email = %s",
                 ("demo@example.com",),
             )
-            assert cur.fetchone()["credit_balance"] == 99
+            assert cur.fetchone()["credit_balance"] == 0
             cur.execute(
                 """
                 SELECT model, credits_delta, note
@@ -467,12 +497,43 @@ class TestEngineBridge:
                 """,
                 ("demo@example.com",),
             )
-            row = cur.fetchone()
-            assert (row["model"], row["credits_delta"]) == ("vendor/cheap", -1)
-            reservation = json.loads(row["note"])["reservation"]
-            assert reservation["state"] == "reconciled"
-            assert reservation["prompt_tokens"] == 100
-            assert reservation["completion_tokens"] == 100
+            rows = cur.fetchall()
+        assert len(rows) == 1
+        row = rows[0]
+        assert (row["model"], row["credits_delta"]) == ("vendor/cheap", -1)
+        reservation = json.loads(row["note"])["reservation"]
+        assert reservation["state"] == "reconciled"
+        assert reservation["prompt_tokens"] == 100
+        assert reservation["completion_tokens"] == 100
+    @pytest.mark.parametrize("headers", (DEV_HEADERS, ADMIN_HEADERS))
+    def test_unmetered_host_key_fallback_is_refused_for_every_account(
+        self, daemon, client, monkeypatch, headers
+    ):
+        from gateway import engine_bridge
+
+        host_secret = "sk-operator-must-not-fallback"
+        monkeypatch.setattr(settings, "share_provider_keys", False)
+        monkeypatch.setattr(
+            engine_bridge,
+            "_load_host_keys",
+            lambda: {"openrouter": host_secret},
+        )
+        with client.websocket_connect("/engine", headers=headers) as ws:
+            response = _rpc(ws, 79, "agent_ask_v2", {
+                "question": "must not spend the operator key",
+                "provider": "openrouter",
+                "model": "vendor/cheap",
+            })
+        assert response["result"] == {
+            "ok": False,
+            "reason": "provider_credentials_required",
+        }
+        assert not any(
+            call.get("method") == "agent_ask_v2" for call in daemon.calls
+        )
+        assert host_secret not in json.dumps(daemon.calls)
+
+
 
 
     @pytest.mark.parametrize(("method", "params"), PROVIDER_MANAGER_CALLS)
@@ -504,9 +565,12 @@ class TestEngineBridge:
         assert resp["result"]["ok"] is True
         assert any(call.get("method") == method for call in daemon.calls)
 
-    def test_list_models_injects_host_api_key(self, daemon, client, monkeypatch):
-        """agent_list_models gets host keys server-side; browser never sees them back."""
+    def test_list_models_injects_host_api_key_when_sharing_enabled(
+        self, daemon, client, monkeypatch
+    ):
+        """The tested legacy injection now requires the explicit opt-in."""
         from gateway import engine_bridge
+        monkeypatch.setattr(settings, "share_provider_keys", True)
 
         monkeypatch.setattr(
             engine_bridge,
@@ -541,6 +605,41 @@ class TestEngineBridge:
         assert gem_params.get("api_key") == "gem-host-secret", gem_params
         # Response path is pass-through — secrets must not be rewritten into client-bound frames
         # (FakeDaemon returns {"ok": true} without echoing params).
+    def test_list_models_carries_no_host_key_when_sharing_disabled(
+        self, daemon, client, monkeypatch
+    ):
+        from gateway import engine_bridge
+
+        host_secret = "sk-host-must-stay-out"
+        loaded = False
+
+        def load_host_keys():
+            nonlocal loaded
+            loaded = True
+            return {"openrouter": host_secret}
+
+        monkeypatch.setattr(settings, "share_provider_keys", False)
+        monkeypatch.setattr(engine_bridge, "_load_host_keys", load_host_keys)
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            assert _rpc(
+                ws,
+                4,
+                "agent_list_models",
+                {
+                    "provider": "openai",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "",
+                },
+            )["result"]["ok"] is True
+
+        seen = next(
+            call for call in daemon.calls
+            if call.get("method") == "agent_list_models"
+        )
+        assert loaded is False
+        assert seen["params"].get("api_key") in (None, "")
+        assert host_secret not in json.dumps(seen)
+
 
     @pytest.mark.parametrize(
         "base_url",
@@ -562,6 +661,7 @@ class TestEngineBridge:
         self, daemon, client, monkeypatch, caplog, base_url
     ):
         from gateway import engine_bridge
+        monkeypatch.setattr(settings, "share_provider_keys", True)
 
         host_secret = "sk-host-must-never-leave"
         monkeypatch.setattr(
@@ -593,6 +693,7 @@ class TestEngineBridge:
         self, daemon, client, monkeypatch
     ):
         from gateway import engine_bridge
+        monkeypatch.setattr(settings, "share_provider_keys", True)
 
         monkeypatch.setattr(
             engine_bridge,
@@ -623,6 +724,7 @@ class TestEngineBridge:
         self, daemon, client, monkeypatch
     ):
         from gateway import engine_bridge
+        monkeypatch.setattr(settings, "share_provider_keys", True)
 
         host_secret = "sk-cloud-key-not-for-loopback"
         monkeypatch.setattr(

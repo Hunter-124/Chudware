@@ -319,6 +319,10 @@ else()
     ../core/util/secret_store.cpp
     ../core/util/tweetnacl.c
     ../core/agent/http.cpp
+    src/update/updater.cpp
+    src/update/apply_linux.cpp
+    src/update/apply_windows.cpp
+    src/update/apply_macos.cpp
     src/bootstrap.cpp
     ../services/ipc/ipc_transport.cpp
     ../services/ipc/ipc_transport_win.cpp
@@ -515,6 +519,33 @@ target_include_directories(test_entitlement_commands PRIVATE
 set_target_properties(test_entitlement_commands PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_entitlement_commands COMMAND test_entitlement_commands)
+
+# --- Signed desktop auto-update (GL-free security + semver contract) ---
+add_executable(test_updater
+  tests/test_updater.cpp
+  src/update/updater.cpp
+  src/update/apply_linux.cpp
+  src/update/apply_windows.cpp
+  src/update/apply_macos.cpp
+  ../core/util/entitlement.cpp
+  ../core/util/tweetnacl.c
+  ../core/agent/http.cpp)
+target_include_directories(test_updater PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../core)
+target_link_libraries(test_updater PRIVATE nlohmann_json::nlohmann_json)
+if(WIN32)
+  target_link_libraries(test_updater PRIVATE winhttp bcrypt crypt32 ws2_32)
+else()
+  target_link_libraries(test_updater PRIVATE CURL::libcurl)
+  if(APPLE)
+    target_link_libraries(test_updater PRIVATE "-framework Security")
+  endif()
+endif()
+set_target_properties(test_updater PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_updater COMMAND test_updater)
+# --- end signed desktop auto-update ---
 
 # --- RE-07: CameraBackend platform abstraction (V4L2 / MF / stub) ---
 add_executable(test_camera_backend

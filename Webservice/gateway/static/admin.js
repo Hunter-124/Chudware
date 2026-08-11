@@ -721,6 +721,100 @@
     pollOnce().catch(function () {});
   })();
 
+  /* ---- signed customer release manifests ---- */
+  (function initReleaseManifests() {
+    var form = document.getElementById("manifest-form");
+    var list = document.getElementById("manifest-list");
+    var status = document.getElementById("manifest-status");
+    if (!form || !list) return;
+
+    function value(id) { return document.getElementById(id).value.trim(); }
+    function setValue(id, value) { document.getElementById(id).value = value == null ? "" : String(value); }
+    function payload() {
+      return {
+        channel: value("manifest-channel"),
+        version: value("manifest-version"),
+        min_supported: value("manifest-min"),
+        platform: value("manifest-platform"),
+        arch: value("manifest-arch"),
+        sha256: value("manifest-sha"),
+        size: Number(value("manifest-size")),
+        signature: value("manifest-signature"),
+        notes_url: value("manifest-notes"),
+        artifact_key: value("manifest-artifact")
+      };
+    }
+    function fill(row) {
+      setValue("manifest-channel", row.channel);
+      setValue("manifest-version", row.version);
+      setValue("manifest-min", row.min_supported);
+      setValue("manifest-platform", row.platform);
+      setValue("manifest-arch", row.arch);
+      setValue("manifest-sha", row.sha256);
+      setValue("manifest-size", row.size);
+      setValue("manifest-signature", row.signature);
+      setValue("manifest-notes", row.notes_url);
+      setValue("manifest-artifact", row.artifact_key);
+      form.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    async function remove(row) {
+      if (!window.confirm("Delete " + row.channel + " " + row.version + " " +
+                          row.platform + "/" + row.arch + "?")) return;
+      var query = new URLSearchParams({
+        channel: row.channel, version: row.version,
+        platform: row.platform, arch: row.arch
+      });
+      await api("/api/admin/release-manifests?" + query.toString(), { method: "DELETE" });
+      status.textContent = "Manifest deleted.";
+      await loadManifests();
+    }
+    async function loadManifests() {
+      var rows = await api("/api/admin/release-manifests");
+      list.textContent = "";
+      if (!rows.length) {
+        list.appendChild(document.createTextNode("No customer release manifests published."));
+        return;
+      }
+      rows.forEach(function (row) {
+        var host = document.createElement("div");
+        host.className = "manifest-row";
+        var info = document.createElement("div");
+        var name = document.createElement("strong");
+        name.textContent = row.channel + " · " + row.version + " · " +
+                           row.platform + "/" + row.arch;
+        var meta = document.createElement("span");
+        meta.textContent = row.artifact_key + " · " + Number(row.size).toLocaleString() + " bytes";
+        info.appendChild(name);
+        info.appendChild(meta);
+        var actions = document.createElement("div");
+        actions.className = "ac-actions";
+        actions.appendChild(actionBtn("Edit", "btn ghost", function () { fill(row); }));
+        actions.appendChild(actionBtn("Delete", "btn ghost danger", function () {
+          remove(row).catch(function (e) { status.textContent = e.message || String(e); });
+        }));
+        host.appendChild(info);
+        host.appendChild(actions);
+        list.appendChild(host);
+      });
+    }
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      status.textContent = "Saving signed manifest…";
+      try {
+        await api("/api/admin/release-manifests", {
+          method: "POST", body: JSON.stringify(payload())
+        });
+        status.textContent = "Manifest saved.";
+        await loadManifests();
+      } catch (e) {
+        status.textContent = e.message || String(e);
+      }
+    });
+    loadManifests().catch(function (e) {
+      list.textContent = "Failed to load manifests: " + (e.message || e);
+    });
+  })();
+
   /* ---- releases: installer downloads for testing ---- */
   (function initReleases() {
     var side = document.querySelector(".admin-side");

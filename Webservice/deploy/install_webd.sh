@@ -180,6 +180,7 @@ PY
 )"
 HOSTD_UNIT_SHA="$(sha256sum "$STAGE_ROOT/chudware-hostd.service" | cut -d' ' -f1)"
 GATEWAY_UNIT_SHA="$(sha256sum "$ROOT/Webservice/deploy/chudware-gateway.service" | cut -d' ' -f1)"
+STAGING_GATEWAY_UNIT_SHA="$(sha256sum "$ROOT/Webservice/deploy/chudware-gateway-staging.service" | cut -d' ' -f1)"
 PROMPTS_SHA="$("$PYTHON" - "$STAGE_PROMPTS" <<'PY'
 from hashlib import sha256
 from pathlib import Path
@@ -203,8 +204,8 @@ PY
 )"
 CHECKOUT_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')"
 JOINT_SHA="$(printf '%s\n' "$HOSTD_SHA" "$LIB_SHA" "$WASM_SHA" "$JS_SHA" \
-  "$PROVIDER_SHA" "$HOSTD_UNIT_SHA" "$GATEWAY_UNIT_SHA" "$PROMPTS_SHA" \
-  | sha256sum | cut -d' ' -f1)"
+  "$PROVIDER_SHA" "$HOSTD_UNIT_SHA" "$GATEWAY_UNIT_SHA" "$STAGING_GATEWAY_UNIT_SHA" \
+  "$PROMPTS_SHA" | sha256sum | cut -d' ' -f1)"
 cat > "$STAGE_ROOT/deploy-manifest" <<EOF
 schema=1
 joint_sha256=$JOINT_SHA
@@ -215,6 +216,7 @@ javascript_sha256=$JS_SHA
 provider_runtime_sha256=$PROVIDER_SHA
 hostd_unit_sha256=$HOSTD_UNIT_SHA
 gateway_unit_sha256=$GATEWAY_UNIT_SHA
+staging_gateway_unit_sha256=$STAGING_GATEWAY_UNIT_SHA
 prompts_sha256=$PROMPTS_SHA
 wasm_token=$WASM_TOKEN
 checkout_head=$CHECKOUT_HEAD
@@ -235,6 +237,7 @@ install_unit() {
 }
 install_unit "$STAGE_ROOT/chudware-hostd.service" "$UNIT_DIR/chudware-hostd.service"
 install_unit "$ROOT/Webservice/deploy/chudware-gateway.service" "$UNIT_DIR/chudware-gateway.service"
+install_unit "$ROOT/Webservice/deploy/chudware-gateway-staging.service" "$UNIT_DIR/chudware-gateway-staging.service"
 systemctl --user daemon-reload || fatal "systemd user daemon-reload failed"
 systemctl --user enable chudware-hostd.service >/dev/null || fatal "could not enable chudware-hostd.service"
 echo "[webd] systemd units installed"

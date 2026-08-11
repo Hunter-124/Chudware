@@ -1,66 +1,66 @@
-# Windows packaging (T-Q1)
+# Windows packaging
 
-**This document was written on a Linux box that cannot build, run, or verify any of the steps
-below** — no MSVC, no Inno Setup, no Windows `Chudware.exe`. Everything here is derived from
-reading `services/installer/{build_release.py,install.ps1,uninstall.ps1}` (which already exist
-and already work for a manual/dev install) plus `host/src/bootstrap.cpp`'s POSIX branch,
-which the Windows branch mirrors exactly (same `%APPDATA%/Chudware` layout, same
-`services.installer.provision` invocation). A Windows host must run through this once and report back
-before T-Q1's Windows box can be marked more than `[~]`.
+The Windows release is built on the `cc-win-package` self-hosted runner. The public command
+is a single pipeline: `services.installer.build_release` stages the payload, reads the
+generated version header, invokes Inno Setup, and applies the optional Authenticode hook.
+The filename and the binary's `--version` therefore come from the same configured build.
 
-## What already exists (don't rebuild it)
+## Components
 
-- `services/installer/install.ps1` / `uninstall.ps1` — a complete, working installer/uninstaller
-  already: copies the payload, provisions the managed runtime venv, registers the MCP server,
-  sets up file associations, creates a Start Menu shortcut. This has presumably been run and
-  used manually already (it predates T-Q1); it just isn't wrapped in a normal installer `.exe`.
-- `services/installer/build_release.py` — assembles the payload these scripts consume
-  (`Chudware.exe`, `assets/`, `app/`, `wheelhouse/`, `requirements.txt`) into `dist/Chudware/`.
-- `packaging/windows/Chudware.iss` (this task) — a thin Inno Setup wrapper around the above two:
-  stages the payload, runs `install.ps1` as a silent post-install step, registers
-  `uninstall.ps1` as the uninstall action. **Not verified on Windows** — see the checklist below.
+- `services/installer/build_release.py` stages `chudware.exe`, `chudware-hostd.exe`,
+  `assets/`, `app/`, `wheelhouse/`, requirements, and PowerShell install/uninstall scripts
+  into `dist/Chudware/`.
+- `services/installer/provision.py` creates the managed Python venv on first run. Python
+  3.11 must be installed on the destination machine; no incomplete embedded-Python mode is
+  advertised.
+- `packaging/windows/chudware.iss` presents the EULA, installs per-user under
+  `%LOCALAPPDATA%\Programs\Chudware`, runs `install.ps1`, and registers the uninstaller.
+- `services/installer/build_release.py` locates `ISCC.exe`, passes the exact
+  `CHUDWARE_VERSION` from `host/build-win/generated/api/chudware_version.h`, and expects
+  `dist/Chudware-Setup-<version>-x86_64.exe`.
 
 ## Prerequisites on the Windows build host
 
-1. Visual Studio Build Tools (or full VS) with the MSVC toolchain — for `host/build` (the current
-   Windows GUI target — `host/` is the single GUI on both OSes).
-2. Python 3.11 on PATH (or the `py` launcher with a 3.11 install) — `install.ps1` and
-   `services/installer/provision.py` both resolve this the same way `_find_base_python()` does.
-3. [Inno Setup 6](https://jrsoftware.org/isinfo.php) — installs `ISCC.exe` (the command-line
-   compiler); add its install dir to PATH or invoke it by full path below.
+1. Visual Studio Build Tools with the MSVC x64 toolchain.
+2. Python 3.11 on `PATH`.
+3. [Inno Setup 6](https://jrsoftware.org/isinfo.php), with `ISCC.exe` on `PATH` or its full
+   path in `ISCC`.
+4. For signed releases, the Authenticode certificate and Windows SDK `signtool.exe`
+   described in `docs/SIGNING.md`.
 
-## Build steps
+## Build
+
+From an x64 Native Tools PowerShell:
 
 ```powershell
-# 1. Build the host GUI (`host/` is the single GUI target on both OSes).
-cmake --build host\build --config Release
+# Configure/build host and daemon using the repository's Windows presets/build policy.
+cmake --build host\build-win --config Release
 
-# 2. Assemble the release payload (app/ + wheelhouse/ + the exe + assets).
-python -m services.installer.build_release --out dist --zip
-#   -> dist\Chudware\  (payload folder)  and  dist\Chudware-release.zip
-
-# 3. Compile the installer.
-ISCC packaging\windows\Chudware.iss /DPayloadDir=dist\Chudware /DAppVersion=<version>
-#   -> dist\Chudware-Setup-<version>.exe
+# One command stages the payload and compiles the canonical Inno Setup installer.
+python -m services.installer.build_release --out dist
+# -> dist\Chudware-Setup-<CHUDWARE_VERSION>-x86_64.exe
 ```
 
-`<version>` should come from `git describe --tags --always` (matching the Linux AppImage's
-version stamping in `packaging/linux/build_appimage.sh`) — e.g. in PowerShell:
-`$env:AppVersion = (git describe --tags --always).Trim()`.
+Use `--skip-wheels` only for a network-dependent development package. `--zip` additionally
+retains `dist/Chudware-release.zip`; it does not replace the installer. `--payload-only`
+stages the folder without invoking Inno Setup and is intended for developer inspection.
+
+Do not pass `/DAppVersion` manually. The Inno script has no placeholder default and refuses
+to compile unless `build_release.py` supplies the version read from the generated header.
 
 ## Verification checklist (run once on a real Windows box)
 
-- [ ] `dist\Chudware-Setup-<version>.exe` runs without error and completes (watch for the
+- [ ] `dist\Chudware-Setup-<version>-x86_64.exe` runs without error and completes (watch for the
       "Provisioning the Chudware runtime" step — this is a real `pip install` of build123d/OCP/VTK
       and can take several minutes; the installer should not appear to hang without a status
       message during this).
-- [ ] After install, `%LOCALAPPDATA%\Programs\Chudware\Chudware.exe` launches and the worker starts
+- [ ] After install, `%LOCALAPPDATA%\Programs\Chudware\chudware.exe` launches and the worker starts
       (no "Python runtime not installed" banner — the first-run dialog /
       Settings ▸ Advanced ▸ Runtime runs the same check the GUI does).
 - [ ] `%APPDATA%\Chudware\runtime\venv\Scripts\python.exe` exists and
       `%APPDATA%\Chudware\runtime\.ready.json` has a `req_hash` matching the shipped
       `requirements.txt` (`services.installer.provision.is_ready()`'s own check).
-- [ ] The Start Menu has an "Chudware" entry (note: currently duplicated — see the `.iss` file's
+- [ ] The Start Menu has a "Chudware" entry (note: currently duplicated — see the `.iss` file's
       comment; `install.ps1` also makes its own shortcut).
 - [ ] Uninstalling via "Apps & Features" removes the Start Menu entries and `%APPDATA%\Chudware`
       (via `uninstall.ps1`'s `[UninstallRun]` step), leaving no orphaned MCP client registration
@@ -182,11 +182,11 @@ stages `chudware-hostd.exe`/`.pdb`, `install.ps1`/`uninstall.ps1` stop the insta
 first, `register_mcp.py --hostd-bin` pins `CHUDWARE_HOSTD_BIN` in the MCP server env, the
 `.iss` gained `CloseApplications=yes`. See `docs/reference/HOSTD.md` for the daemon reference.
 
-- [ ] `python -m services.installer.build_release --zip` after
-      `cmake --build core\build --config Release --target chudware-hostd`: `dist\Chudware\`
-      contains `chudware-hostd.exe` (and `.pdb`), `manifest.json` says `"hostd": true`.
-      Without the core build it prints the warning and stages the rest (`"hostd": false`).
-- [ ] Fresh install: `dist\Chudware-Setup-<ver>.exe /VERYSILENT` completes;
+- [ ] `python -m services.installer.build_release --out dist` after building
+      `chudware-hostd`: `dist\Chudware\` contains `chudware-hostd.exe` (and `.pdb`),
+      `manifest.json` says `"hostd": true`, and the command produces the installer.
+      Without the daemon build it prints the warning and records `"hostd": false`.
+- [ ] Fresh install: `dist\Chudware-Setup-<ver>-x86_64.exe /VERYSILENT` completes;
       `%LOCALAPPDATA%\Programs\Chudware\chudware-hostd.exe --version` prints the build id.
 - [ ] MCP registration env: `~\.claude.json` (and Claude Desktop config) `chudware`
       entry has `env.CHUDWARE_HOSTD_BIN` = the installed exe path.
@@ -199,20 +199,17 @@ first, `register_mcp.py --hostd-bin` pins `CHUDWARE_HOSTD_BIN` in the MCP server
 - [ ] `/VERYSILENT` install → `--status` OK → silent uninstall
       (`"%LOCALAPPDATA%\Programs\Chudware\unins000.exe" /VERYSILENT`): no
       `chudware-hostd.exe` remains, install dir removed, MCP entry unregistered.
-- [ ] `CloseApplications=yes`: run the installer while Chudware.exe is open — Restart
+- [ ] `CloseApplications=yes`: run the installer while `chudware.exe` is open — Restart
       Manager prompts/handles it instead of failing the file copy.
 
-## Known gaps (not fixed here — flagging so they aren't rediscovered)
+## Known constraints
 
-- **No bundled Python.** `build_release.py --with-python` is a documented `TODO` (drop a
-  `python-build-standalone` CPython into `python-embed/`) — today's installer depends on the
-  target machine already having Python 3.11 on PATH. Not fully "offline-friendly" until that
-  lands.
-- **Duplicate Start Menu shortcut** (`install.ps1` + the `.iss`'s own `[Icons]` entry) — cosmetic,
-  needs an `install.ps1 -NoShortcut` flag to fix cleanly; not changed here since it can't be
-  tested without a Windows box.
-- **No EULA/license page** in the `.iss` — fine for internal dogfooding, needed before any
-  external release (product is commercial closed-source per `CONTRIBUTING.md`).
+- **Python is provisioned on first run.** The target machine needs Python 3.11 on `PATH`;
+  `provision.py` then builds the managed venv. There is no embedded-Python packaging flag.
+- **Duplicate Start Menu shortcut** (`install.ps1` + the `.iss`'s own `[Icons]` entry) is
+  cosmetic and needs an `install.ps1 -NoShortcut` flag to fix cleanly.
+- **The EULA is mandatory.** Inno Setup reads the repository-root `LICENSE-EULA.txt` and
+  presents it before installation.
 - **GPL subprocess tools are never bundled**, per the license guardrails table
   (`CONTRIBUTING.md` ▸ License guardrails): CalculiX/OpenFOAM/esptool/etc. are discovered on
   PATH at runtime (same pattern `services/installer/provision.py:converters_status()` already

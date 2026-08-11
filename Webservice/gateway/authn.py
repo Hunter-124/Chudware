@@ -362,6 +362,13 @@ def revoke_sessions(email: str) -> int:
         return cur.rowcount
 
 
+def delete_sessions(email: str) -> int:
+    """Permanently remove every session for an account."""
+    with tx() as cur:
+        cur.execute("DELETE FROM sessions WHERE email = %s", (email,))
+        return cur.rowcount
+
+
 # ---------------------------------------------------------------------------
 # Email tokens
 # ---------------------------------------------------------------------------
@@ -574,11 +581,11 @@ def _verify_url(token: str) -> str:
 
 
 def _reset_url(token: str) -> str:
-    return f"{_base_url()}/api/auth/reset?token={token}"
+    return f"{_base_url()}/reset?token={token}"
 
 
 def _login_url() -> str:
-    return f"{_base_url()}/"
+    return f"{_base_url()}/signin"
 
 
 def begin_session_response(

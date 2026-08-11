@@ -1,0 +1,607 @@
+# Tagged commercial release pipeline. Installers go directly from each builder to
+# R2; Actions artifact storage is used only for the four tiny parity JSON dumps.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+# A tag identifies one coherent four-platform release. Never cancel a leg and
+# accidentally combine objects from different attempts.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-test-package:
+    name: Build, test, and stage ${{ matrix.label }}
+    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            runner_os: Linux
+            runner_arch: X64
+            runner_label: cc-linux-build
+            preset: linux-core
+            host_build_dir: host/build-linux
+            platform: linux
+            artifact_arch: x86_64
+          - label: Windows x86_64
+            runner_os: Windows
+            runner_arch: X64
+            runner_label: cc-win-package
+            preset: windows-occt
+            host_build_dir: host/build-windows
+            platform: windows
+            artifact_arch: x86_64
+          - label: macOS arm64
+            runner_os: macOS
+            runner_arch: ARM64
+            runner_label: cc-mac-arm
+            preset: macos-arm64
+            host_build_dir: host/build-macos-arm64
+            platform: macos
+            artifact_arch: arm64
+          - label: macOS x86_64
+            runner_os: macOS
+            runner_arch: X64
+            runner_label: cc-mac-intel
+            preset: macos-x86_64
+            host_build_dir: host/build-macos-x86_64
+            platform: macos
+            artifact_arch: x86_64
+    env:
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      CHUDWARE_RELEASE_SIGNING_KEY: ${{ secrets.CHUDWARE_RELEASE_SIGNING_KEY }}
+      CHUDWARE_SIGN_IDENTITY: ${{ secrets.CHUDWARE_SIGN_IDENTITY }}
+      CHUDWARE_NOTARIZE_PROFILE: ${{ secrets.CHUDWARE_NOTARIZE_PROFILE }}
+    steps:
+      - name: Check runner capabilities (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner=${RUNNER_NAME:-unknown} os=$RUNNER_OS arch=$RUNNER_ARCH host=$(hostname -s)"
+          uname -a
+
+          missing=()
+          for tool in cmake ninja ctest git python3; do
+            command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::runner ${RUNNER_NAME:-unknown} is missing required tools: ${missing[*]}"
+            exit 1
+          fi
+
+          cmake_version="$(cmake --version | head -n 1 | awk '{print $3}')"
+          echo "cmake=${cmake_version} ninja=$(ninja --version)"
+          if [ "$(printf '%s\n3.24.0\n' "${cmake_version}" | sort -V | head -n 1)" != "3.24.0" ]; then
+            echo "::error::cmake ${cmake_version} is older than the 3.24 the presets require"
+            exit 1
+          fi
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            sw_vers
+            xcode-select -p
+            echo "sdk=$(xcrun --show-sdk-version) clang=$(xcrun --find clang)"
+            clang --version | head -n 1
+            if ! brew list --versions opencascade >/dev/null 2>&1; then
+              echo "::error::${RUNNER_NAME:-unknown} has no Homebrew opencascade; fix with: brew install opencascade"
+              exit 1
+            fi
+            echo "opencascade=$(brew list --versions opencascade)"
+            echo "brew-prefix=$(brew --prefix)"
+          fi
+          df -h "${RUNNER_TEMP:-/tmp}" "$HOME"
+
+      - name: Check runner capabilities and enter the MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "runner=$env:RUNNER_NAME os=$env:RUNNER_OS arch=$env:RUNNER_ARCH host=$env:COMPUTERNAME"
+          Write-Host "powershell=$($PSVersionTable.PSVersion)"
+
+          $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
+          foreach ($dir in @((Join-Path $tools 'bin'), (Join-Path $tools 'python'), (Join-Path $tools 'python\Scripts'))) {
+            if (Test-Path $dir) {
+              $env:PATH = "$dir;$env:PATH"
+              $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              Write-Host "  path+ $dir"
+            }
+          }
+
+          foreach ($tool in @('cmake', 'ninja', 'ctest', 'git')) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              Write-Host "::error::runner $env:RUNNER_NAME is missing required tool: $tool"
+              exit 1
+            }
+          }
+          $cmakeVersion = [version](((cmake --version) -split "`n")[0] -split ' ')[2]
+          Write-Host "cmake=$cmakeVersion"
+          if ($cmakeVersion -lt [version]'3.24.0') {
+            Write-Host "::error::cmake $cmakeVersion is older than the 3.24 the presets require"
+            exit 1
+          }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) {
+            Write-Host "::error::vswhere.exe not found; Visual Studio Build Tools are not installed on $env:RUNNER_NAME"
+            exit 1
+          }
+          $vsPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vsPath) {
+            Write-Host "::error::no Visual Studio installation with the x64 C++ toolset on $env:RUNNER_NAME"
+            exit 1
+          }
+          Write-Host "visual-studio=$vsPath"
+
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation `
+            -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+
+          Get-ChildItem env: | ForEach-Object {
+            if ($before[$_.Name] -ne $_.Value) {
+              "$($_.Name)=$($_.Value)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+          $compilerOutput = & cmd.exe /d /c 'cl.exe 2>&1'
+          $compilerStatus = $LASTEXITCODE
+          $compilerOutput | Select-Object -First 1
+          if ($compilerStatus -ne 0) { exit $compilerStatus }
+
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve release identity (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not contain a valid release version"
+            exit 1
+          fi
+          channel=stable
+          case "${version}" in *-*) channel=beta ;; esac
+          case "${{ matrix.platform }}-${{ matrix.artifact_arch }}" in
+            linux-x86_64) artifact="Chudware-${version}-linux-x86_64.AppImage" ;;
+            macos-arm64) artifact="Chudware-${version}-macos-arm64.zip" ;;
+            macos-x86_64) artifact="Chudware-${version}-macos-x86_64.zip" ;;
+            *) echo "::error::unsupported release target"; exit 1 ;;
+          esac
+          {
+            echo "CHUDWARE_VERSION=${version}"
+            echo "CHUDWARE_RELEASE_CHANNEL=${channel}"
+            echo "CHUDWARE_ARTIFACT_NAME=${artifact}"
+          } >> "$GITHUB_ENV"
+
+      - name: Resolve release identity (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$') {
+            Write-Host "::error::tag $env:GITHUB_REF_NAME does not contain a valid release version"
+            exit 1
+          }
+          if ($version.Contains('-')) { $channel = 'beta' } else { $channel = 'stable' }
+          $artifact = "Chudware-Setup-$version-x86_64.exe"
+          "CHUDWARE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CHUDWARE_RELEASE_CHANNEL=$channel" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CHUDWARE_ARTIFACT_NAME=$artifact" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Resolve the persistent provisioning cache (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/chudware-ci/netgen/${{ matrix.preset }}"
+          mkdir -p "${root}"
+          echo "NETGEN_ROOT=${root}" >> "$GITHUB_ENV"
+          echo "netgen-root=${root}"
+
+      - name: Resolve the persistent provisioning cache (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:USERPROFILE '.cache\chudware-ci\netgen\${{ matrix.preset }}'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          "NETGEN_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "netgen-root=$root"
+
+      - name: Configure and build core (${{ matrix.preset }}) (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --preset ${{ matrix.preset }} -DNETGEN_ROOT="${{ env.NETGEN_ROOT }}" -DCHUDWARE_WITH_NETGEN=ON
+          cmake --build --preset ${{ matrix.preset }}
+
+      - name: Configure and build core (${{ matrix.preset }}) (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --preset ${{ matrix.preset }} "-DNETGEN_ROOT=$env:NETGEN_ROOT" -DCHUDWARE_WITH_NETGEN=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build --preset ${{ matrix.preset }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: ctest core (${{ matrix.preset }}) (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="build/${{ matrix.preset }}/core"
+          log="${RUNNER_TEMP}/ctest-core.log"
+          status=0
+          ctest --test-dir "${tree}" --output-on-failure 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
+          if grep -qE 'No tests were found' "${log}"; then
+            echo "::error::ctest found no tests in ${tree}; the configure did not register the suite"
+            exit 1
+          fi
+          {
+            echo '## ctest - ${{ matrix.label }} (${{ matrix.preset }})'
+            echo '```text'
+            tail -n 40 "${log}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "${status}"
+
+      - name: ctest core (${{ matrix.preset }}) (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $tree = 'build/${{ matrix.preset }}/core'
+          $log = Join-Path $env:RUNNER_TEMP 'ctest-core.log'
+          ctest --test-dir $tree --output-on-failure 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          if (Select-String -Path $log -Pattern 'No tests were found' -Quiet) {
+            Write-Host "::error::ctest found no tests in $tree; the configure did not register the suite"
+            exit 1
+          }
+          $tail = (Get-Content $log -Tail 40) -join "`n"
+          @(
+            '## ctest - ${{ matrix.label }} (${{ matrix.preset }})'
+            '```text'
+            $tail
+            '```'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          exit $status
+
+      - name: Configure and build host GUI (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build ${{ matrix.host_build_dir }}
+
+      - name: Configure and build host GUI (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build ${{ matrix.host_build_dir }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: ctest host GUI (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="${{ matrix.host_build_dir }}"
+          if [ ! -f "${tree}/CTestTestfile.cmake" ]; then
+            echo "::error::${tree} has no CTest configuration; the host configure did not complete"
+            exit 1
+          fi
+          log="${RUNNER_TEMP}/ctest-host.log"
+          status=0
+          ctest --test-dir "${tree}" --output-on-failure 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
+          {
+            echo '## ctest - host GUI (${{ matrix.label }})'
+            echo '```text'
+            tail -n 40 "${log}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "${status}"
+
+      - name: ctest host GUI (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $tree = '${{ matrix.host_build_dir }}'
+          if (-not (Test-Path (Join-Path $tree 'CTestTestfile.cmake'))) {
+            Write-Host "::error::$tree has no CTest configuration; the host configure did not complete"
+            exit 1
+          }
+          $log = Join-Path $env:RUNNER_TEMP 'ctest-host.log'
+          ctest --test-dir $tree --output-on-failure 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          $tail = (Get-Content $log -Tail 40) -join "`n"
+          @(
+            '## ctest - host GUI (${{ matrix.label }})'
+            '```text'
+            $tail
+            '```'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          exit $status
+
+      - name: Produce parity dump (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="build/${{ matrix.preset }}/bin/test_platform_parity"
+          output="${RUNNER_TEMP}/${{ matrix.platform }}-${{ matrix.artifact_arch }}.json"
+          test -x "${binary}" || { echo "::error::missing parity binary ${binary}"; exit 1; }
+          "${binary}" --parity-dump "${output}"
+          test -s "${output}" || { echo "::error::parity dump is empty"; exit 1; }
+
+      - name: Produce parity dump (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = 'build/${{ matrix.preset }}/bin/test_platform_parity.exe'
+          $output = Join-Path $env:RUNNER_TEMP '${{ matrix.platform }}-${{ matrix.artifact_arch }}.json'
+          if (-not (Test-Path $binary)) { Write-Host "::error::missing parity binary $binary"; exit 1 }
+          & $binary --parity-dump $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path $output) -or (Get-Item $output).Length -eq 0) {
+            Write-Host '::error::parity dump is empty'
+            exit 1
+          }
+
+
+      - name: Package and upload to R2 (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.platform }}" in
+            linux) packaging/linux/build_appimage.sh --out dist ;;
+            macos) packaging/macos/build_app.sh --out dist ;;
+            *) echo "::error::unsupported POSIX packaging target ${{ matrix.platform }}"; exit 1 ;;
+          esac
+          artifact="dist/${CHUDWARE_ARTIFACT_NAME}"
+          test -f "${artifact}" || { echo "::error::packager did not create ${artifact}"; exit 1; }
+          python3 packaging/publish.py upload "${artifact}" \
+            --channel "${CHUDWARE_RELEASE_CHANNEL}" \
+            --manifest-out "${RUNNER_TEMP}/${{ matrix.platform }}-${{ matrix.artifact_arch }}.release-meta"
+
+      - name: Package and upload to R2 (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m services.installer.build_release --out dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $artifact = Join-Path 'dist' $env:CHUDWARE_ARTIFACT_NAME
+          if (-not (Test-Path $artifact)) {
+            Write-Host "::error::packager did not create $artifact"
+            exit 1
+          }
+          $metadata = Join-Path $env:RUNNER_TEMP '${{ matrix.platform }}-${{ matrix.artifact_arch }}.release-meta'
+          python packaging\publish.py upload $artifact --channel $env:CHUDWARE_RELEASE_CHANNEL --manifest-out $metadata
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # This artifact remains a few KB: one parity dump plus the R2 object key
+      # and SHA-256 needed by the publication job. Installer bytes never enter
+      # Actions artifact storage.
+      - name: Upload parity dump and R2 handoff metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: platform-parity-${{ matrix.platform }}-${{ matrix.artifact_arch }}
+          path: |
+            ${{ runner.temp }}/${{ matrix.platform }}-${{ matrix.artifact_arch }}.json
+            ${{ runner.temp }}/${{ matrix.platform }}-${{ matrix.artifact_arch }}.release-meta
+          if-no-files-found: error
+          retention-days: 1
+
+  parity:
+    name: Compare cross-platform parity
+    needs: build-test-package
+    if: ${{ success() }}
+    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download parity dumps
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: platform-parity-*
+          path: ${{ runner.temp }}/platform-parity
+          merge-multiple: true
+
+      - name: Require and compare all four dumps
+        shell: bash
+        run: |
+          set -euo pipefail
+          dumps="${RUNNER_TEMP}/platform-parity"
+          expected=(linux-x86_64 windows-x86_64 macos-x86_64 macos-arm64)
+          for target in "${expected[@]}"; do
+            test -s "${dumps}/${target}.json" || {
+              echo "::error::missing parity dump ${target}.json"
+              exit 1
+            }
+          done
+          count="$(find "${dumps}" -maxdepth 1 -type f -name '*.json' | wc -l)"
+          if [ "${count}" -ne 4 ]; then
+            echo "::error::expected exactly 4 parity dumps, found ${count}"
+            exit 1
+          fi
+          python3 scripts/platform_parity.py "${dumps}"/*.json
+
+  # Keep this job id exactly `publish`: the CI policy's dedicated-runner
+  # exemption is deliberately keyed to (release.yml, publish).
+  publish:
+    name: Publish GitHub release and gateway manifests
+    # `needs` names both the complete four-leg matrix and the comparator. GitHub
+    # skips this job if any matrix leg or parity is red.
+    needs: [build-test-package, parity]
+    if: ${{ success() }}
+    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-artifact-host]
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      CHUDWARE_GATEWAY_URL: ${{ vars.CHUDWARE_GATEWAY_URL }}
+      CHUDWARE_GATEWAY_RELEASE_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
+      CHUDWARE_MIN_SUPPORTED_VERSION: ${{ vars.CHUDWARE_MIN_SUPPORTED_VERSION }}
+    steps:
+      - name: Check publishing capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for tool in git gh python3; do
+            command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::artifact host is missing required tools: ${missing[*]}"
+            exit 1
+          fi
+          for name in R2_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY CHUDWARE_GATEWAY_URL CHUDWARE_GATEWAY_RELEASE_TOKEN CHUDWARE_MIN_SUPPORTED_VERSION; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::required release setting ${name} is unset"
+              exit 1
+            fi
+          done
+
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          channel=stable
+          case "${version}" in *-*) channel=beta ;; esac
+          {
+            echo "CHUDWARE_VERSION=${version}"
+            echo "CHUDWARE_RELEASE_CHANNEL=${channel}"
+            echo "CHUDWARE_NOTES_URL=https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
+          } >> "$GITHUB_ENV"
+      - name: Download R2 handoff metadata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: platform-parity-*
+          path: ${{ runner.temp }}/release-handoff
+          merge-multiple: true
+
+
+      - name: Download staged artifacts from R2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          version="${CHUDWARE_VERSION}"
+          while IFS='|' read -r platform arch artifact; do
+            metadata="${RUNNER_TEMP}/release-handoff/${platform}-${arch}.release-meta"
+            test -s "${metadata}" || { echo "::error::missing R2 handoff metadata for ${platform}-${arch}"; exit 1; }
+            read -r staged_key staged_sha < <(
+              python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); print(d["artifact_key"], d["sha256"])' "${metadata}"
+            )
+            expected_key="${CHUDWARE_RELEASE_CHANNEL}/${version}/${artifact}"
+            if [ "${staged_key}" != "${expected_key}" ]; then
+              echo "::error::staged R2 key ${staged_key} does not match ${expected_key}"
+              exit 1
+            fi
+            if ! [[ "${staged_sha}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid staged SHA-256 for ${artifact}"
+              exit 1
+            fi
+            python3 packaging/publish.py download \
+              --channel "${CHUDWARE_RELEASE_CHANNEL}" \
+              --version "${version}" \
+              --artifact-name "${artifact}" \
+              --out dist
+            test -s "dist/${artifact}" || { echo "::error::R2 download is empty: ${artifact}"; exit 1; }
+            test -s "dist/${artifact}.sha256" || { echo "::error::missing SHA-256 sidecar: ${artifact}"; exit 1; }
+            test -s "dist/${artifact}.sig" || { echo "::error::missing signature sidecar: ${artifact}"; exit 1; }
+            downloaded_sha="$(cut -d ' ' -f 1 "dist/${artifact}.sha256")"
+            if [ "${downloaded_sha}" != "${staged_sha}" ]; then
+              echo "::error::R2 SHA-256 sidecar changed after staging ${artifact}"
+              exit 1
+            fi
+          done <<EOF
+          linux|x86_64|Chudware-${version}-linux-x86_64.AppImage
+          windows|x86_64|Chudware-Setup-${version}-x86_64.exe
+          macos|x86_64|Chudware-${version}-macos-x86_64.zip
+          macos|arm64|Chudware-${version}-macos-arm64.zip
+          EOF
+
+      - name: Create or complete the GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+          if [ "${state}" = missing ]; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --title "Chudware ${CHUDWARE_VERSION}"
+            state=true
+          fi
+          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          if [ "${state}" = true ]; then
+            gh release edit "${GITHUB_REF_NAME}" --draft=false
+          fi
+
+      - name: Notify gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${CHUDWARE_VERSION}"
+          while IFS='|' read -r platform arch artifact; do
+            python3 packaging/publish.py register \
+              --channel "${CHUDWARE_RELEASE_CHANNEL}" \
+              --version "${version}" \
+              --platform "${platform}" \
+              --arch "${arch}" \
+              --artifact-name "${artifact}" \
+              --min-supported "${CHUDWARE_MIN_SUPPORTED_VERSION}" \
+              --notes-url "${CHUDWARE_NOTES_URL}"
+          done <<EOF
+          linux|x86_64|Chudware-${version}-linux-x86_64.AppImage
+          windows|x86_64|Chudware-Setup-${version}-x86_64.exe
+          macos|x86_64|Chudware-${version}-macos-x86_64.zip
+          macos|arm64|Chudware-${version}-macos-arm64.zip
+          EOF

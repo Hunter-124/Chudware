@@ -8,16 +8,14 @@ imports Playwright directly:
   local storage, ...) is saved to disk under the app data dir
   (:mod:`services.browser.profiles`) and is LOCAL ONLY — never synced, never
   uploaded, never read by this module into logs or metadata.
-- :func:`browser_fetch` — loads a URL HEADLESS under the user's saved session
-  in our OWN CEF Chromium (:mod:`.cef_client` → the ``chudware --cef-daemon``
-  host), rate-limited per site (:mod:`services.browser.ratelimit`). Returns
-  rendered HTML. Driving CEF through its native C++ API leaves no CDP
-  ``Runtime.enable`` handshake, so the automation-protocol fingerprint that bot
-  gates key on is absent (the reason we dropped Playwright — see the plan).
+- :func:`browser_fetch` — loads a URL HEADLESS under the user's saved session,
+  rate-limited per site (:mod:`services.browser.ratelimit`). Linux and Windows
+  use our own CEF daemon; Darwin uses the Playwright fallback selected by
+  :mod:`.driver` because its host ships CEF off. Returns rendered HTML through
+  the same backend-independent envelope.
 - :func:`browser_download` (T-X2) — fetches a URL's raw bytes under the same
-  saved session via the daemon's direct ``CefURLRequest`` (no page navigation),
-  the right primitive for CAD/PDF downloads. Same rate-limiting and degradation
-  posture as ``browser_fetch``.
+  saved session through the selected headless backend. It has the same
+  rate-limiting and degradation posture as ``browser_fetch``.
 
 ``browser_login`` still opens a headed Playwright window as a CLI/fallback path;
 the primary login surface is the interactive CEF panel in the GUI, and this
@@ -707,22 +705,21 @@ def browser_fetch(url: str, site: str, *,
                   min_interval: float = ratelimit.DEFAULT_MIN_INTERVAL_S,
                   no_cache: bool = False,
                   _cef: Any | None = None) -> dict:
-    """Fetch ``url`` HEADLESS under ``site``'s saved session, via our own CEF
-    Chromium daemon (:mod:`.cef_client`) — no Playwright, no CDP automation tell.
+    """Fetch ``url`` HEADLESS under ``site``'s saved session.
 
-    Served from the bounded on-disk page cache (:mod:`.page_cache`) when a fresh
-    entry exists: the lookup happens BEFORE the profile lock and the rate limiter,
-    so a repeat search neither contends with a live fetch nor spends its per-site
-    request budget. A hit is the original success payload plus ``cached: True`` and
-    ``age_s``. Only successes are ever cached — failures, challenge pages and
-    HTTP>=400 responses are re-fetched every time. Pass ``no_cache=True`` to skip
-    both the lookup and the store (default off, so existing callers are unchanged);
+    The selected backend is CEF on Linux/Windows and Playwright on Darwin unless
+    ``CHUDWARE_PW_BACKEND`` explicitly overrides it. Served from the bounded
+    on-disk page cache (:mod:`.page_cache`) when a fresh entry exists: the lookup
+    happens BEFORE the profile lock and rate limiter, so a repeat search neither
+    contends with a live fetch nor spends its per-site request budget. A hit is
+    the original success payload plus ``cached: True`` and ``age_s``. Only
+    successes are cached. Pass ``no_cache=True`` to skip lookup and store;
     ``CHUDWARE_PAGE_CACHE=0`` disables the cache process-wide.
 
-    Returns the §6 failure shape (never raises) when the CEF daemon is
-    unavailable or navigation fails. A missing profile is auto-created (anonymous
-    browsing of public catalogs is allowed — login-gated content still degrades to
-    login_required via the adapters).
+    Returns the §6 failure shape (never raises) when the selected backend is
+    unavailable or navigation fails. A missing profile is auto-created
+    (anonymous browsing of public catalogs is allowed; login-gated content
+    still degrades to login_required via adapters).
     """
     started = time.perf_counter() if _TIMING else 0.0
     timing: dict[str, float] | None = {} if _TIMING else None
@@ -771,22 +768,25 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
         timing["rate_ms"] = (time.perf_counter() - t0) * 1000.0
     status: int | None = None
     content = ""
-    t_cef = time.perf_counter() if timing is not None else 0.0
+    t_backend = time.perf_counter() if timing is not None else 0.0
     try:
         try:
-            from . import cef_client  # lazy: keep import cheap for non-browser callers
-            r = (cef or cef_client.client()).fetch(
-                url, settle_ms=int(render_settle * 1000))
-            if not r.get("ok"):
-                return fail("browser_fetch_failed",
-                            f"{site}: CEF fetch of {url} did not complete")
+            from . import driver  # lazy: keep import cheap for non-browser callers
+            backend = cef or driver.headless_client(profile=site)
+            r = backend.fetch(url, settle_ms=int(render_settle * 1000))
             status = r.get("status") or None
+            if not r.get("ok"):
+                if r.get("reason") == "bot_walled":
+                    return fail("bot_walled",
+                                f"{site}: the vendor blocked automated access to {url}")
+                return fail("browser_fetch_failed",
+                            f"{site}: headless fetch of {url} did not complete")
             content = r.get("html", "")
-        except Exception as exc:  # noqa: BLE001 — daemon spawn/connect/protocol
+        except Exception as exc:  # noqa: BLE001 — backend launch/connect/protocol
             return fail("browser_fetch_failed", str(exc))
     finally:
         if timing is not None:
-            timing["cef_ms"] = (time.perf_counter() - t_cef) * 1000.0
+            timing["backend_ms"] = (time.perf_counter() - t_backend) * 1000.0
         # Drives inter-request spacing AND 429/403 exponential backoff off the
         # real status (None on error/challenge → clears any backoff, keeps spacing).
         ratelimit.note_result(site, status)
@@ -887,14 +887,12 @@ def browser_interact(url: str, site: str, script: str, *,
 def browser_download(url: str, site: str, dest: Path, *,
                      min_interval: float = ratelimit.DEFAULT_MIN_INTERVAL_S,
                      _cef: Any | None = None) -> dict:
-    """Download raw bytes from ``url`` under ``site``'s saved session, writing them to ``dest``.
+    """Download raw bytes under ``site``'s saved session into ``dest``.
 
-    Uses the CEF daemon's direct ``CefURLRequest`` (which shares the profile's
-    cookies) rather than a page navigation — the right tool for a CAD/PDF file,
-    which a real page load would hand to the browser's download manager instead of
-    returning as page content. A missing profile is auto-created (public
-    datasheets/models need no login; gated files fail naturally and surface
-    login_required upstream).
+    Linux and Windows use CEF's direct ``CefURLRequest``. Darwin uses
+    Playwright's context request API with the same persistent profile cookies.
+    A missing profile is auto-created; gated files fail naturally and surface
+    login_required upstream.
     """
     profiles.ensure_profile(site)
     lock = profiles.profile_lock(site)
@@ -918,12 +916,17 @@ def _browser_download_locked(url: str, site: str, dest: Path, *,
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         try:
-            from . import cef_client  # lazy import
-            r = (cef or cef_client.client()).download(url, str(dest))
+            from . import driver  # lazy import
+            backend = cef or driver.headless_client(profile=site)
+            r = backend.download(url, str(dest))
+            status = r.get("status") or None
             if not r.get("ok"):
+                if r.get("reason") == "bot_walled":
+                    return fail("bot_walled",
+                                f"{site}: the vendor blocked automated access to {url}")
                 return fail("browser_download_failed",
-                            f"{site}: CEF download of {url} failed or returned no body")
-        except Exception as exc:  # noqa: BLE001 — daemon spawn/connect/protocol
+                            f"{site}: headless download of {url} failed or returned no body")
+        except Exception as exc:  # noqa: BLE001 — backend launch/connect/protocol
             return fail("browser_download_failed", str(exc))
     finally:
         ratelimit.note_result(site, status)

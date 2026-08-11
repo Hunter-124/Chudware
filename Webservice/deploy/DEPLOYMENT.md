@@ -48,6 +48,19 @@ Ingress table (all → local services on `127.0.0.1`):
 | `www.chudware.com` | `http://127.0.0.1:8300` |
 | *(catch-all)* | `http_status:404` |
 
+### Staging ingress
+
+`staging.chudware.com` is a separate tunnel ingress to
+`http://127.0.0.1:8310`. It must never be routed to port 8300. The staging
+gateway uses `~/chudware-web-staging`, PostgreSQL database
+`chudware_staging`, console-only mail, and Stripe test credentials (or no
+Stripe credentials). Its unit refuses to start if an `sk_live_` Stripe secret
+is present.
+
+Production remains on port 8300 with data under `~/chudware-web-data` and
+database `chudware_prod`. Both gateways share application source and the webd
+engine, but never mutable gateway state or database credentials.
+
 ## Cloudflare Access
 
 - ONE self-hosted app "Billet Web", ID `a5c88ac6-8364-4fa1-9610-c2ab5dcf9fa8`
@@ -90,24 +103,57 @@ credential, session and email-token tables created by
 
 ## Safe application updates
 
-Run `Webservice/deploy/update.sh` from the production checkout. The updater and
-`install_webd.sh --restart` now treat the native daemon, OMP/Bun provider
+There is one deployment entry point for both environments:
+
+```
+bash Webservice/deploy/update.sh staging
+bash Webservice/deploy/update.sh prod --tag v1.2.0
+```
+
+Before source or schema changes, it takes a custom-format `pg_dump` under the
+selected data root's `backups/`. It then performs an explicit migration,
+restarts only the selected unit, and requires HTTP 200 plus valid response
+bodies from anonymous `/healthz` and session-authenticated `/api/me`. Any
+backup, migration, restart, or health failure exits nonzero. The updater also
+parses `CHUDWARE_DB_URL` and refuses a staging deploy unless the database name
+is exactly `chudware_staging` (and likewise requires `chudware_prod` for
+production).
+
+The production path continues to treat the native daemon, OMP/Bun provider
 dependencies, and WASM bundle as one immutable release under
 `~/chudware-web/releases/`; `~/chudware-web/current` moves only after every
-artifact is built and validated. The joint manifest and running stamp are
-written after cutover, so a failed native build, provider install, WASM build,
-unit restart, or readiness probe exits nonzero instead of reporting success
-over a mixed/stale deployment.
+artifact is built and validated. Staging's default path is gateway-only so a
+green master deployment cannot bounce the production desktop engine.
 
-Before a shared-daemon restart, the installer reads the authenticated
-`engine_bridges` value from detailed `/healthz`. It resolves an active
-administrator account, mints a short-lived ops session for it
-(`python -m authn ops-session`), and sends that session as the `chudware_sid`
-cookie. A session it cannot mint, missing telemetry, or an unreachable gateway
-fails closed; a nonzero bridge count defers the restart rather than
-disconnecting active browser sessions.
-Anonymous `/healthz` intentionally remains the bare `{"ok": true}` liveness
-contract and must not be used for drain decisions.
+Before a shared-daemon production restart, `install_webd.sh` reads the
+authenticated `engine_bridges` value from detailed `/healthz`. It resolves an
+active account, mints a short-lived ops session, and fails closed when session
+minting or telemetry fails or when active bridges do not drain. Anonymous
+`/healthz` intentionally remains the bare `{"ok": true}` liveness contract and
+must not be used for drain decisions.
+
+### Deployment workflow contract
+
+The workflow owner must implement these requirements without duplicating the
+shell deployment logic:
+
+- **Staging:** react only to a successful completion of `linux-gate.yml` for
+  the canonical repository's `master` branch, select the single
+  `livingroom-pc` self-hosted Linux runner, and invoke
+  `/home/liveuser/Repositories/CAD/Webservice/deploy/update.sh staging`.
+- **Production:** trigger only by `workflow_dispatch`; require a `v*` tag input
+  and invoke `update.sh prod --tag <tag>`. The script independently verifies
+  that deployed HEAD is exactly that release tag.
+- Adapt the existing `pick-windows-runner.yml` selection-job pattern to Linux.
+  Deployment is one side effect, never a matrix: exactly one selected runner
+  may execute it.
+- Serialize prod and staging through the updater's host-wide flock. Propagate
+  its nonzero exit so a failed backup, migration, or either health assertion
+  makes the workflow fail.
+- Every job must be `self-hosted`; do not upload deployment artifacts. The
+  canonical checkout at `/home/liveuser/Repositories/CAD` must be clean before
+  invocation because the updater deliberately uses `git pull --ff-only` and
+  refuses local changes.
 
 Production WASM builds default to CMake `MinSizeRel`; Release's `wasm-opt -O3`
 peaked above 9 GiB RSS and was OOM-killed on the 16 GiB deployment host.

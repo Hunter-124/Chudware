@@ -4,7 +4,7 @@
 //
 // WRITTEN ON LINUX, NEVER COMPILED HERE — every Win32 call below was checked
 // against its documented signature, but this file is UNVERIFIED until the
-// manual Windows checklist in docs/PACKAGING_WINDOWS.md runs on a real box.
+// manual Windows checklist in docs/reference/PACKAGING_WINDOWS.md runs on a real box.
 //
 // Shape of the backend:
 //   * Byte-mode duplex pipes, PIPE_REJECT_REMOTE_CLIENTS, unlimited instances.

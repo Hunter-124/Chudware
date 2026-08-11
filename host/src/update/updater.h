@@ -1,0 +1,95 @@
+#pragma once
+
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <string>
+
+namespace chudware::update {
+
+enum class State {
+    Idle,
+    Checking,
+    Current,
+    Available,
+    Downloading,
+    Staged,
+    ManualDownload,
+    Mandatory,
+    Error,
+};
+
+struct Manifest {
+    std::string version;
+    std::string minSupported;
+    std::string sha256;
+    std::uint64_t size = 0;
+    std::string signature;
+    std::string notesUrl;
+    std::string url;
+};
+
+struct Snapshot {
+    State state = State::Idle;
+    std::string version;
+    std::string message;
+    std::string downloadUrl;
+    bool mandatory = false;
+    std::uint64_t reportSerial = 0;
+};
+
+enum class ApplyResult {
+    NothingStaged,
+    Relaunching,
+    ManualDownload,
+    Rejected,
+    Failed,
+};
+
+// Semantic-version precedence per semver.org. Build metadata is ignored.
+// Invalid inputs compare lower than valid ones; two invalid strings compare equal.
+int compareVersions(const std::string& lhs, const std::string& rhs);
+bool requiresMandatoryUpdate(const std::string& current,
+                             const std::string& minSupported);
+
+class Updater {
+public:
+    Updater();
+    ~Updater();
+    Updater(const Updater&) = delete;
+    Updater& operator=(const Updater&) = delete;
+
+    void configure(std::string currentVersion, std::filesystem::path dataDir,
+                   std::filesystem::path executablePath);
+    ApplyResult applyStagedBeforeWindow();
+    void start();
+    void stop();
+    void setEntitlementToken(std::string token);
+    Snapshot snapshot() const;
+
+    // The download is streamed into the update directory, then size, SHA-256 and
+    // Ed25519 are verified before an atomic stage rename. Exposed so the exact
+    // production path can be exercised by the security regression test.
+    bool downloadAndStage(const Manifest& manifest, std::string* error = nullptr);
+    bool verifyAndStageDownloaded(const Manifest& manifest,
+                                  const std::filesystem::path& downloaded,
+                                  std::string* error = nullptr);
+
+    // Headless UI scenario seam. It never starts a worker or performs I/O.
+    void setTestSnapshot(Snapshot value);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+Updater& globalUpdater();
+
+// Implemented once by the current platform TU. The caller invokes this only for
+// an artifact that has just passed all three verification checks.
+ApplyResult applyPlatformArtifact(const std::filesystem::path& verifiedArtifact,
+                                  const std::filesystem::path& executablePath,
+                                  const std::string& version,
+                                  std::string* error);
+
+}  // namespace chudware::update

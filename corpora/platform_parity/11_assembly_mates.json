@@ -1,0 +1,29 @@
+{
+  "doc": "assembly_three_mates",
+  "schema": "aicad.asm/1",
+  "name": "Parity Assembly Three Mates",
+  "density_kg_mm3": 7.85e-6,
+  "features": [
+    {"id": "base_body", "type": "box", "length": 30.0, "width": 30.0, "height": 5.0, "merge": false},
+    {"id": "moving_body", "type": "cylinder", "radius": 4.0, "height": 20.0, "at": [0, 0, 5], "merge": false}
+  ],
+  "mate_input": {
+    "components": [
+      {"id": "base", "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], "fixed": true},
+      {"id": "moving", "transform": [1, 0, 0, 30, 0, 1, 0, -10, 0, 0, 1, 25, 0, 0, 0, 1], "fixed": false}
+    ],
+    "mates": [
+      {"id": "m1", "type": "concentric", "align": "aligned", "refs": [{"component": "base"}, {"component": "moving"}]},
+      {"id": "m2", "type": "coincident", "align": "aligned", "refs": [{"component": "base"}, {"component": "moving"}]},
+      {"id": "m3", "type": "concentric", "align": "aligned", "refs": [{"component": "base"}, {"component": "moving"}]}
+    ],
+    "resolved_geometry": [
+      {"mate_id": "m1", "ref_index": 0, "geom": {"kind": "axis", "point": [0, 0, 0], "normal": [0, 0, 1], "direction": [0, 0, 1], "radius": 4.0}},
+      {"mate_id": "m1", "ref_index": 1, "geom": {"kind": "axis", "point": [0, 0, 0], "normal": [0, 0, 1], "direction": [0, 0, 1], "radius": 3.9}},
+      {"mate_id": "m2", "ref_index": 0, "geom": {"kind": "plane", "point": [0, 0, 0], "normal": [0, 0, 1], "direction": [0, 0, 1], "radius": 0.0}},
+      {"mate_id": "m2", "ref_index": 1, "geom": {"kind": "plane", "point": [0, 0, 0], "normal": [0, 0, -1], "direction": [0, 0, 1], "radius": 0.0}},
+      {"mate_id": "m3", "ref_index": 0, "geom": {"kind": "axis", "point": [0, 0, 0], "normal": [0, 0, 1], "direction": [0, 0, 1], "radius": 4.0}},
+      {"mate_id": "m3", "ref_index": 1, "geom": {"kind": "axis", "point": [0, 0, 0], "normal": [0, 0, 1], "direction": [0, 0, 1], "radius": 3.9}}
+    ]
+  }
+}

@@ -1,0 +1,130 @@
+"""Authenticated, customer-facing account data for the web portal.
+
+This module composes the account, billing, credit, auth, and entitlement stores;
+it does not own their lifecycle or arithmetic. Every route is behind the normal
+``chudware_sid``/Access authentication middleware.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+
+try:
+    from . import accounts, authn, billing, credits, entitlement
+    from .auth import get_current_user
+    from .limits import api_writes
+    from .plans import limits_for
+except ImportError:  # uvicorn app:app from package dir
+    import accounts  # type: ignore
+    import authn  # type: ignore
+    import billing  # type: ignore
+    import credits  # type: ignore
+    import entitlement  # type: ignore
+    from auth import get_current_user  # type: ignore
+    from limits import api_writes  # type: ignore
+    from plans import limits_for  # type: ignore
+
+router = APIRouter(prefix="/api/portal", tags=["portal"])
+
+
+def _account(request: Request) -> tuple[Any, Any]:
+    user = get_current_user(request)
+    account = accounts.get_account(user.email)
+    if account is None:
+        raise HTTPException(404, "account not found")
+    return user, account
+
+
+@router.get("/account")
+async def portal_account(request: Request) -> dict[str, Any]:
+    user, account = _account(request)
+    try:
+        limits = limits_for(account.plan)
+    except ValueError:
+        limits = limits_for("trial")
+    credential = authn.get_credential(user.email)
+    return {
+        "email": account.email,
+        "display": account.display,
+        "plan": account.plan,
+        "role": account.role,
+        "status": account.status,
+        "created_at": account.created_at,
+        "trial_ends_at": account.trial_ends_at,
+        "paid_through": account.paid_through,
+        "subscription_status": account.subscription_status,
+        "credit_balance": account.credit_balance,
+        "credit_ceiling_monthly": account.credit_ceiling_monthly,
+        "ai_grant": bool(account.ai_grant),
+        "cloud": bool(limits.cloud),
+        "desktop": bool(limits.desktop),
+        "linked_identities": authn.oauth_providers_for(user.email),
+        "has_password": credential is not None,
+        "billing_configured": billing.billing_configured(),
+    }
+
+
+@router.post("/password")
+async def change_password(request: Request, body: dict[str, Any]) -> dict[str, bool]:
+    user, _ = _account(request)
+    current = str(body.get("current_password") or "")
+    replacement = str(body.get("new_password") or "")
+    credential = authn.get_credential(user.email)
+    if credential is None or not authn.verify_password(credential["password_hash"], current):
+        raise HTTPException(401, "current password is incorrect")
+    authn._check_password_policy(replacement)
+    api_writes.enforce(user.email, "portal password changes")
+    authn.set_password(user.email, replacement, verified=True)
+    return {"ok": True}
+
+
+@router.post("/signout-everywhere")
+async def signout_everywhere(request: Request) -> JSONResponse:
+    user, _ = _account(request)
+    api_writes.enforce(user.email, "portal session revocations")
+    deleted = authn.delete_sessions(user.email)
+    response = JSONResponse({"ok": True, "sessions_deleted": deleted})
+    authn.clear_session_cookie(response, request)
+    return response
+
+
+@router.get("/usage")
+async def portal_usage(
+    request: Request, days: int = Query(default=30, ge=1, le=366)
+) -> dict[str, Any]:
+    _, account = _account(request)
+    return {
+        "credit_balance": account.credit_balance,
+        "credit_ceiling_monthly": account.credit_ceiling_monthly,
+        "history": credits.spend_history(account.email, days),
+        "unit": "credits",
+    }
+
+
+@router.get("/invoices")
+async def portal_invoices(
+    request: Request, limit: int = Query(default=12, ge=1, le=100)
+) -> dict[str, Any]:
+    user, _ = _account(request)
+    return {"invoices": billing.invoice_history(user.email, limit)}
+
+
+@router.get("/devices")
+async def portal_devices(request: Request) -> dict[str, Any]:
+    user, _ = _account(request)
+    return {"devices": entitlement.list_devices(user.email)}
+
+
+@router.delete("/devices/{subject}")
+async def portal_revoke_device(subject: str, request: Request) -> dict[str, bool]:
+    user, _ = _account(request)
+    api_writes.enforce(user.email, "portal device revocations")
+    if not entitlement.revoke_device(user.email, subject):
+        raise HTTPException(404, "device not found")
+    return {"ok": True}
+
+
+__all__ = ["router"]

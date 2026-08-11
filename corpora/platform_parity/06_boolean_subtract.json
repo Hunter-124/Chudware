@@ -1,0 +1,11 @@
+{
+  "doc": "boolean_subtract",
+  "schema": "aicad.part/1",
+  "name": "Parity Boolean Subtract",
+  "density_kg_mm3": 7.85e-6,
+  "features": [
+    {"id": "base", "type": "box", "length": 40.0, "width": 30.0, "height": 20.0},
+    {"id": "tool", "type": "cylinder", "radius": 6.0, "height": 24.0, "at": [20, 15, -2], "merge": false},
+    {"id": "subtract", "type": "boolean", "op": "cut", "a": "base", "b": "tool"}
+  ]
+}

@@ -25,12 +25,14 @@ try:
     from .accounts import get_account
     from .credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
     from .config import settings
+    from .provider_keys import resolve_validated_key
     from .limits import user_slug
     from .plans import limits_for
 except ImportError:  # uvicorn app:app from package dir
     from accounts import get_account
     from credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
     from config import settings
+    from provider_keys import resolve_validated_key
     from limits import user_slug
     from plans import limits_for
 
@@ -170,16 +172,20 @@ _STRIP_SECRET_FIELDS = (
 )
 
 # agent_list_models is a C++ probe in libchudware — it does NOT load host config.json.
-# The WASM client has empty/IDBFS keys, so without a server-side inject the probe
-# returns "no api key" / HTTP 401 and the picker looks disconnected from hostd.
-# Fill api_key + base_url from the host config when the client omitted them (or
-# sent a non-secret presence sentinel). Credentials never flow back to the browser.
+# A single-tenant operator may explicitly share the host profile so the WASM
+# model picker works. Multi-tenant deployments must leave sharing disabled:
+# model probes then carry no operator credential, just like inference turns.
 _LIST_MODELS_METHOD = "agent_list_models"
 _PRESENCE_SENTINELS = frozenset({"", "\x01", "host", "shared", "1"})
 
 
 def _load_host_keys() -> dict[str, str]:
-    """Return keys.* string slots from host config (+ ai_providers.env fallback)."""
+    """Load explicitly shared host keys; return empty in multi-tenant mode."""
+    if not settings.share_provider_keys:
+        # Do not even read host credential stores when the security boundary is
+        # closed. The metered pool resolves its key downstream from the
+        # server-authoritative actor path and never enters this compatibility loader.
+        return {}
     out: dict[str, str] = {}
     try:
         try:
@@ -382,7 +388,7 @@ def _key_for_list_models(provider: str, base_url: str, keys: dict[str, str]) -> 
 
 
 def _inject_list_models_creds(line: str) -> tuple[str, str | None]:
-    """Return a credential-filled line, or a generic rejection safe to send to the client."""
+    """Validate a model probe and optionally add single-tenant host credentials."""
     try:
         msg = json.loads(line)
     except ValueError:
@@ -397,9 +403,9 @@ def _inject_list_models_creds(line: str) -> tuple[str, str | None]:
     base_url = str(params.get("base_url") or "")
     api_key = str(params.get("api_key") or "")
     try:
-        # Validation happens even when the caller supplied a non-sentinel key:
-        # arbitrary endpoints are never forwarded through this privileged probe.
-        keys = _load_host_keys()
+        # Validation happens even when sharing is disabled or the caller supplied
+        # a non-sentinel key: arbitrary endpoints never reach this privileged probe.
+        keys = _load_host_keys() if settings.share_provider_keys else {}
         inj_key, inj_url = _key_for_list_models(provider, base_url, keys)
     except ValueError:
         return line, "provider endpoint not allowed"
@@ -449,6 +455,33 @@ def _rpc_result(line: str, result: Mapping[str, Any]) -> str:
     except ValueError:
         pass
     return json.dumps({"id": call_id, "result": dict(result)}, separators=(",", ":"))
+
+
+def _agent_provider(line: str) -> str:
+    """Provider explicitly selected for this turn, never inferred from a model id."""
+    try:
+        message = json.loads(line)
+    except ValueError:
+        return ""
+    params = message.get("params") if isinstance(message, dict) else None
+    if not isinstance(params, dict):
+        return ""
+    options = params.get("options")
+    if not isinstance(options, dict):
+        options = {}
+    return str(params.get("provider") or options.get("provider") or "").strip().lower()
+
+
+def _actor_for_turn(email: str, line: str) -> dict[str, Any]:
+    """Prefer this account's validated key for the selected provider."""
+    actor = actor_for(email)
+    provider = _agent_provider(line)
+    key = resolve_validated_key(email, provider) if provider else None
+    actor["_byok_validated"] = key is not None
+    if key is not None:
+        actor["key_source"] = "byok"
+        actor["_byok_api_key"] = key
+    return actor
 
 
 def _agent_cost_inputs(line: str) -> tuple[str, int, int]:
@@ -524,6 +557,11 @@ def _sanitize_agent_rpc(line: str, actor: Mapping[str, Any]) -> str:
     if method in _AGENT_TURN_PROVIDER_METHODS:
         for key in _STRIP_SECRET_FIELDS:
             params.pop(key, None)
+        # Browser credentials were removed above. Only the credential decrypted
+        # by this gateway for the authenticated account may enter the private
+        # hostd-to-worker run channel.
+        if actor.get("_byok_validated"):
+            params["api_key"] = str(actor["_byok_api_key"])
     options = params.get("options")
     if not isinstance(options, dict):
         options = {}
@@ -663,11 +701,39 @@ async def engine_ws(ws: WebSocket) -> None:
                         continue
 
                 if method.startswith("agent_") or method in _AGENT_TURN_PROVIDER_METHODS:
-                    actor = await asyncio.to_thread(actor_for, user.email)
+                    if method in _AGENT_TURN_PROVIDER_METHODS:
+                        actor = await asyncio.to_thread(
+                            _actor_for_turn, user.email, line
+                        )
+                    else:
+                        actor = await asyncio.to_thread(actor_for, user.email)
+                    if (
+                        method in _AGENT_TURN_PROVIDER_METHODS
+                        and actor.get("key_source") != "pool"
+                        and not actor.get("_byok_validated")
+                        and not settings.share_provider_keys
+                    ):
+                        # A shared hostd's ambient config belongs to the operator.
+                        # Only a server-verified account credential may take the
+                        # unmetered BYOK path when host-key sharing is disabled.
+                        await ws.send_text(_rpc_result(
+                            line,
+                            {"ok": False, "reason": "provider_credentials_required"},
+                        ))
+                        continue
                     if (
                         actor.get("key_source") == "pool"
                         and method in _AGENT_TURN_PROVIDER_METHODS
                     ):
+                        if int(actor.get("credits_remaining") or 0) <= 0:
+                            # Absolute stop: a zero-balance pool actor never
+                            # reaches provider dispatch, even if a missing or
+                            # temporarily zero rate would estimate this turn at 0.
+                            await ws.send_text(_rpc_result(
+                                line,
+                                {"ok": False, "reason": "insufficient_credits"},
+                            ))
+                            continue
                         model, prompt_estimate, max_output = _agent_cost_inputs(line)
                         reservation = await asyncio.to_thread(
                             reserve_turn,

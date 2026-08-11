@@ -40,6 +40,7 @@
 #include "renderer.h"
 #include "worker_client.h"
 #include "util/platform_paths.h"  // executablePath (one spelling per OS)
+#include "update/updater.h"
 
 #ifdef CHUDWARE_ENABLE_CEF
 #include "ui/widgets/cef/cef_app.h"
@@ -638,6 +639,21 @@ int main(int argc, char** argv) {
     // without spinning Chromium up (and then having to tear it down); every headless CLI mode
     // above has already returned, and --ui-screenshot is exempted inside the guard itself.
     if (!claimSingleInstance(argc, argv)) return 0;
+    const bool updateShot =
+        argc >= 2 && std::strcmp(argv[1], "--ui-screenshot") == 0;
+    auto& desktopUpdater = chudware::update::globalUpdater();
+    if (!updateShot) {
+        desktopUpdater.configure(CHUDWARE_VERSION, appdataAppDir(),
+                                 chudware::platform::executablePath());
+        const auto apply = desktopUpdater.applyStagedBeforeWindow();
+        if (apply == chudware::update::ApplyResult::Relaunching) {
+            // Windows/macOS handoff has started. Linux succeeds by execv and
+            // never reaches here. No GUI subsystem has started yet.
+            std::fflush(nullptr);
+            std::_Exit(0);
+        }
+        desktopUpdater.start();
+    }
 #ifdef CHUDWARE_ENABLE_CEF
     // GUI path always boots CEF here — before run_gui / GLFW. Chromium must own
     // display + signal setup first; initializing after GLFW (true "lazy" first-
@@ -683,8 +699,13 @@ int main(int argc, char** argv) {
         std::_Exit(rc);
         return rc;  // unreachable; satisfies the compiler
     };
+    auto runGuiWithUpdater = [&](const char* openPath) {
+        const int rc = run_gui(nullptr, openPath);
+        desktopUpdater.stop();  // joins the poll/download worker before hard_exit
+        return rc;
+    };
     if (argc >= 2 && argv[1] && argv[1][0] != '-')
-        return hard_exit(run_gui(nullptr, documentArg(argc, argv)));
+        return hard_exit(runGuiWithUpdater(documentArg(argc, argv)));
     // GUI opens immediately and provisions the runtime in-app (with progress) if needed.
 #ifdef __EMSCRIPTEN__
     std::fprintf(stderr, "[wasm-boot] calling run_gui\n");
@@ -700,7 +721,7 @@ int main(int argc, char** argv) {
 #ifdef __EMSCRIPTEN__
     return run_gui(nullptr);  // wasm: never hard-exit — the VM owns the lifecycle
 #else
-    return hard_exit(run_gui(nullptr));
+    return hard_exit(runGuiWithUpdater(nullptr));
 #endif
 #endif  // !__EMSCRIPTEN__
 

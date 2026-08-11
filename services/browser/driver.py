@@ -1,30 +1,28 @@
-"""services/browser/driver.py — Playwright-compatible backend factory.
+"""services/browser/driver.py — browser backend factory.
 
-Selects the residual Playwright-compatible driver used by headed login /
-embed / cookie-export surfaces. Headless production fetch stays on the CEF
-daemon (:mod:`.cef_client`) and is **byte-identical** when
-``CHUDWARE_PW_BACKEND`` is unset (default ``cef``).
+Selects both the residual Playwright-compatible driver used by headed login /
+embed / cookie-export surfaces and the headless Parts Library primitive.
 
 Env
 ---
 ``CHUDWARE_PW_BACKEND``:
 
-- ``cef`` (default) — residual paths keep stock ``playwright``; headless
-  ``browser_fetch`` / ``browser_download`` stay on CefDaemon (unchanged).
-- ``patchright`` — drop-in patched Playwright driver (``pip install
-  patchright``). Prefer for residual PW surfaces that need deeper protocol
-  hardening than stock Playwright + :mod:`.stealth`.
-- ``camoufox`` — optional Firefox anti-detect fallback (import-guarded).
-  Not a free Chromium swap; provision explicitly before use.
+- ``cef`` — CEF daemon for headless fetch/download; stock Playwright for
+  residual surfaces.
+- ``playwright`` — stock Playwright for residual and headless paths.
+- ``patchright`` — patched Playwright driver for residual and headless paths
+  (``pip install patchright``).
+- ``camoufox`` — optional Firefox anti-detect fallback (import-guarded) for
+  residual experiments; headless fetch/download remain on CEF.
+
+When the env is unset, Darwin defaults to ``playwright`` because macOS ships
+CEF off. Linux and Windows continue to default to ``cef``. Playwright is an
+intentional platform fallback, not a CEF replacement: challenge detection
+remains detect-never-solve and bot-walled pages fail cleanly.
 
 Never auto-downloads browser binaries at import time. Call
-:func:`provision_browser` (descriptor-driven, explicit ``install=True``)
-to fetch Chromium / Camoufox builds — same posture as the reveng
-provisioning descriptors (no silent network).
-
-Challenge / captcha policy is unchanged and lives in :mod:`.challenge`:
-detect, never solve. This module only chooses which driver binary/API
-backs residual automation surfaces.
+:func:`provision_browser` (descriptor-driven, explicit ``install=True``) to
+fetch Chromium / Camoufox builds.
 """
 from __future__ import annotations
 
@@ -37,12 +35,12 @@ from typing import Any, Callable
 #: Env key that selects the residual PW-compatible backend.
 ENV_PW_BACKEND = "CHUDWARE_PW_BACKEND"
 
-#: Canonical backend ids. Unknown values fall back to DEFAULT_BACKEND.
-BACKENDS: tuple[str, ...] = ("cef", "patchright", "camoufox")
+#: Canonical backend ids. Unknown values fall back to the platform default.
+BACKENDS: tuple[str, ...] = ("cef", "playwright", "patchright", "camoufox")
 
-#: Default when env is unset / empty / unknown — preserves CEF headless path
-#: and stock-playwright residual imports (byte-identical to pre-factory).
+#: Non-Darwin default. Darwin uses ``playwright`` because its host ships CEF off.
 DEFAULT_BACKEND = "cef"
+DARWIN_DEFAULT_BACKEND = "playwright"
 
 # ---------------------------------------------------------------------------
 # Provisioning descriptors (reveng-style; offline-safe until install=True)
@@ -108,12 +106,36 @@ BROWSER_DESCRIPTORS: dict[str, dict[str, Any]] = {
 }
 
 
-def selected_backend() -> str:
-    """Return the active ``CHUDWARE_PW_BACKEND`` (normalised), default ``cef``."""
+def default_backend(platform: str | None = None) -> str:
+    """Return the backend default for ``platform`` (or this interpreter)."""
+    return DARWIN_DEFAULT_BACKEND if (platform or sys.platform) == "darwin" else DEFAULT_BACKEND
+
+
+def selected_backend(platform: str | None = None) -> str:
+    """Return the normalised env selection, or the platform-specific default."""
     raw = (os.environ.get(ENV_PW_BACKEND) or "").strip().lower()
     if raw in BACKENDS:
         return raw
-    return DEFAULT_BACKEND
+    return default_backend(platform)
+
+
+def headless_backend(platform: str | None = None) -> str:
+    """Backend for Parts Library fetch/download.
+
+    Only stock Playwright and Patchright opt the headless seam away from CEF.
+    Camoufox remains an import-guarded residual experiment.
+    """
+    backend = selected_backend(platform)
+    return backend if backend in ("playwright", "patchright") else "cef"
+
+
+def headless_client(*, profile: str = "", platform: str | None = None) -> Any:
+    """Return a client exposing CEF-compatible ``fetch``/``download`` methods."""
+    if headless_backend(platform) in ("playwright", "patchright"):
+        from . import pw_client
+        return pw_client.client(profile)
+    from . import cef_client
+    return cef_client.client()
 
 
 def _not_installed_msg(name: str) -> str:
@@ -407,7 +429,8 @@ def describe_backends() -> dict[str, Any]:
     beyond :func:`backend_available` probes."""
     return {
         "selected": selected_backend(),
-        "default": DEFAULT_BACKEND,
+        "default": default_backend(),
+        "headless": headless_backend(),
         "env_key": ENV_PW_BACKEND,
         "env_value": os.environ.get(ENV_PW_BACKEND),
         "backends": {k: provision_status(k) for k in BROWSER_DESCRIPTORS},

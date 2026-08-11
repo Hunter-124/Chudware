@@ -1,0 +1,24 @@
+{
+  "doc": "revolved_shaft",
+  "schema": "aicad.part/1",
+  "name": "Parity Revolved Shaft",
+  "density_kg_mm3": 7.85e-6,
+  "features": [
+    {
+      "id": "profile",
+      "type": "sketch",
+      "plane": "front",
+      "entities": [
+        {"id": "wall", "type": "line", "construction": false, "p1": [12, 0], "p2": [12, 30]}
+      ],
+      "constraints": []
+    },
+    {
+      "id": "revolve",
+      "type": "revolve",
+      "profile": "profile",
+      "axis": {"kind": "datum", "feature": "axis.z"},
+      "angle": 360.0
+    }
+  ]
+}

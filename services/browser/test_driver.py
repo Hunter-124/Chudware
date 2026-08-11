@@ -35,6 +35,25 @@ def test_default_backend_is_cef_when_env_unset(driver_mod, monkeypatch):
     assert driver_mod.selected_backend() == "cef"
     assert driver_mod.DEFAULT_BACKEND == "cef"
 
+def test_platform_forced_headless_defaults(driver_mod, monkeypatch):
+    monkeypatch.delenv("CHUDWARE_PW_BACKEND", raising=False)
+    assert driver_mod.selected_backend(platform="linux") == "cef"
+    assert driver_mod.headless_backend(platform="linux") == "cef"
+    assert driver_mod.selected_backend(platform="darwin") == "playwright"
+    assert driver_mod.headless_backend(platform="darwin") == "playwright"
+
+
+def test_backend_env_playwright_routes_headless_on_linux(driver_mod, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "playwright")
+    assert driver_mod.selected_backend(platform="linux") == "playwright"
+    assert driver_mod.headless_backend(platform="linux") == "playwright"
+
+
+def test_backend_env_patchright_routes_headless(driver_mod, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "patchright")
+    assert driver_mod.headless_backend(platform="linux") == "patchright"
+
+
 
 def test_backend_env_patchright(driver_mod, monkeypatch):
     monkeypatch.setenv("CHUDWARE_PW_BACKEND", "patchright")

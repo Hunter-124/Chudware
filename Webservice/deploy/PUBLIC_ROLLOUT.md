@@ -231,6 +231,42 @@ The marketing site is live at **https://chudware-site.pages.dev** (Cloudflare
 Pages project `chudware-site`). No DNS was changed — `chudware.com` still goes
 to the gateway behind Access. The apex cutover is §5.
 
+#### Provider-key sharing boundary
+
+`CHUDWARE_WEB_SHARE_PROVIDER_KEYS` is now an enforced financial and credential
+boundary. It defaults to `0`, and public or otherwise multi-tenant deployments
+must leave it there. At `0`, `/engine` does not read or inject credentials from
+the host `config.json` or `~/chudware-web-data/ai_providers.env`; this applies
+equally to customers, administrators, and the operator's own web account.
+For `key_source: "byok"`, the gateway first verifies that this account has a
+validated credential for the selected provider; the worker decrypts that
+account-scoped credential server-side and the turn bypasses the credit ledger.
+Selecting another provider without an attached key does not reuse it: an
+account with `ai_grant` takes the managed pool path, while an account without
+either a matching key or a grant is refused before the shared daemon. It never
+falls back to the operator's ambient profile.
+
+Managed access is separate from host-profile sharing. An account with
+`ai_grant`, an eligible cloud plan, and a positive credit balance is asserted
+server-side as `key_source: "pool"`; the gateway reserves its estimated cost,
+writes the credit-ledger spend row, and only then forwards the turn. Zero
+balance is a hard refusal. Administrators receive no bypass: they need either
+their own validated provider key or the same pooled grant and credits.
+
+Set `CHUDWARE_WEB_SHARE_PROVIDER_KEYS=1` only for a personal or single-tenant
+deployment where the operator genuinely is every web user. That compatibility
+mode restores the old behavior: model probes may receive the host key and
+unmetered turns may resolve the shared daemon's host provider profile.
+
+Historical warning: before the provider-key gate was implemented, this
+environment variable had no consumer and therefore enforced nothing.
+`_load_host_keys()` always read the host provider profile plus
+`ai_providers.env`, `agent_list_models` injected those credentials even when
+the flag was `0`, and unmetered turns could reach the shared daemon's ambient
+profile. A deployment document that merely claimed `=0` prevented host spend
+was false; this section records that failure rather than silently making the
+old claim appear to have always been true.
+
 ### Three regressions this pass caused, and what they teach
 
 All three were invisible to the test suite and to `curl`, and all three only

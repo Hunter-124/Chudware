@@ -1609,10 +1609,10 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
 
 
     cfg = dict(agent_config.load_config() or {})
-    if credit_actor is not None and credit_actor.key_source == "pool":
-        # The descriptor key was resolved by hostd after the gateway stripped
-        # browser credentials. Give it a dedicated slot so config.get_provider
-        # cannot drift back to an ambient desktop config key.
+    if credit_actor is not None and credit_actor.key_source in {"pool", "byok"}:
+        # The credential was resolved on the trusted host side after the gateway
+        # stripped browser credentials. Bind it to the run-scoped slot so neither
+        # metered pool nor account BYOK can fall through to desktop config.json.
         cfg["_chudware_pool_api_key"] = _param_str("api_key")
     try:
         if provider_name:

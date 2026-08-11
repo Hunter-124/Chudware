@@ -38,6 +38,9 @@
 #ifndef __EMSCRIPTEN__
 #include "account_panel.h"
 #endif
+#ifndef __EMSCRIPTEN__
+#include "../update/updater.h"
+#endif
 #include "web_capabilities.h"  // ui::webGapReason (T-RF12: sign-in is desktop-only on web)
 #include "../core/async_rpc.h"  // core::RpcResult for skills/triggers RPCs
 #include "widgets/interwebz.h"  // Skills/Rules two-column editors
@@ -7832,6 +7835,26 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::Text("Version %s (%s)", CHUDWARE_VERSION, CHUDWARE_GIT_SHA);
 #if CHUDWARE_BUILD_DIRTY
         dimText("built from a modified working tree");
+#endif
+#ifndef __EMSCRIPTEN__
+        {
+            const auto update = chudware::update::globalUpdater().snapshot();
+            if (update.state == chudware::update::State::Available ||
+                update.state == chudware::update::State::ManualDownload ||
+                update.state == chudware::update::State::Staged ||
+                update.state == chudware::update::State::Mandatory) {
+                const std::string updateLine =
+                    update.state == chudware::update::State::Staged
+                        ? "Update " + update.version + " is verified; restart to install"
+                        : update.message;
+                ImGui::TextWrapped("%s", updateLine.c_str());
+                if (!update.downloadUrl.empty() &&
+                    ImGui::SmallButton("Open update download"))
+                    ui::openExternalHttpUrl(update.downloadUrl);
+            } else if (update.state == chudware::update::State::Current) {
+                dimText("Chudware is up to date");
+            }
+        }
 #endif
         ImGui::Dummy(ImVec2(0, 4 * sc));
         ImGui::TextUnformatted("build123d + OpenCASCADE kernel");

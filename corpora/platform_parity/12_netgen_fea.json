@@ -1,0 +1,16 @@
+{
+  "doc": "netgen_fea_bracket",
+  "schema": "aicad.part/1",
+  "name": "Parity Netgen FEA Bracket",
+  "density_kg_mm3": 7.85e-6,
+  "features": [
+    {"id": "beam", "type": "box", "length": 60.0, "width": 10.0, "height": 10.0}
+  ],
+  "fea": {
+    "fineness": 0.25,
+    "order": 1,
+    "material": {"E_mpa": 200000.0, "nu": 0.29, "yield_mpa": 250.0, "density_g_cm3": 7.85},
+    "fixtures": [{"points": [[-30, -5, -5], [-30, 5, -5], [-30, -5, 5], [-30, 5, 5]], "tol_mm": 0.5}],
+    "loads": [{"faces": {"points": [[30, -5, -5], [30, 5, -5], [30, -5, 5], [30, 5, 5]], "tol_mm": 0.5}, "type": "force", "vector": [0.0, 0.0, -100.0]}]
+  }
+}

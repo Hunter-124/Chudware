@@ -1,7 +1,11 @@
 # chudware-web RUNBOOK (Hunter)
 
-Host: Fedora 44, gateway `127.0.0.1:8300`, data `~/chudware-web-data/`.
-Public: `https://chudware.com` via Cloudflare Tunnel; sign-in is self-serve in the gateway.
+Host: Fedora 44. Production gateway: `127.0.0.1:8300`, data
+`~/chudware-web-data/`. Staging gateway: `127.0.0.1:8310`, data
+`~/chudware-web-staging/`.
+Public portal: `https://app.chudware.com` through the tunnel. The marketing site
+at `https://chudware.com` and `https://www.chudware.com` is Cloudflare Pages.
+Staging ingress is `https://staging.chudware.com`.
 
 ---
 
@@ -21,8 +25,11 @@ Public: `https://chudware.com` via Cloudflare Tunnel; sign-in is self-serve in t
    - Create a new R2 token if you still need object storage; put keys in the same secrets dir / env — not the repo.
 
 3. **Tunnel token**
-   - Remotely-managed tunnel token lives in `~/chudware-web-data/gateway.env` as `TUNNEL_TOKEN=…`.
-   - If the old API token could mint tunnel credentials, rotate the tunnel token after API token rotation (`cloudflared tunnel token <name>` or re-run provision).
+   - Remotely-managed tunnel token lives only in `~/chudware-web-data/cloudflared.env`
+     as `TUNNEL_TOKEN=…` (mode 600). It must not remain in `gateway.env`.
+   - If the old API token could mint tunnel credentials, rotate the tunnel token after API
+     token rotation (`cloudflared tunnel token <name>` or re-run provision), then run
+     `sudo Webservice/deploy/harden_host.sh --apply tunnel`.
 
 ### Optional history rewrite (explicit approval only)
 
@@ -39,6 +46,74 @@ If you skip rewrite: still rotate everything above; assume attackers who cloned 
 
 ---
 
+## Production host hardening baseline
+
+Run `sudo Webservice/deploy/harden_host.sh --apply launch` on `livingroom-pc`.
+The `launch` profile is intentionally limited to `firewall`, `tunnel`, `updates`,
+`keys`, `backups`, and `gateway`; it cannot apply the two owner-declined controls.
+
+- **Firewall:** the default zone allows the `ssh` service and KDE Connect on
+  `1716/tcp+udp`; the blanket `1025-65535/tcp+udp` LAN opening is gone. The
+  script refuses to reload firewalld unless the active zone already allows TCP
+  22 and sshd is listening. Immediately after applying, open a second SSH
+  connection and scan from another LAN host:
+
+  ```bash
+  ssh livingroom true
+  sudo nmap -sS -Pn -p- --open --min-rate 10000 --max-retries 1 192.168.0.183
+  nmap -Pn -p 5432,8300,8310 192.168.0.183
+  ```
+
+  Expected open ports are `22` (sshd), `1716` (KDE Connect), and the intentional
+  production-mail set: `25/465/993` (`stalwart-mail`), `587` (`mail-edge`), and
+  `8443` (`mail-caddy`, with `roundcube` behind it). Those rootful Podman
+  publishes are owned by CloudCastle's revenue-bearing mail service, not
+  Chudware. Netavark DNAT deliberately bypasses the firewalld zone's port list;
+  do **not** add a pre-netavark drop or close them during Chudware hardening.
+  No other port may be open. In particular, PostgreSQL 5432, production gateway
+  8300, and staging gateway 8310 must scan as filtered from the LAN.
+- **Security updates:** `dnf-automatic.timer` is enabled and
+  `/etc/dnf/automatic.conf` uses `upgrade_type = security` plus
+  `apply_updates = yes`.
+- **Tunnel secret:** `cloudflared.env` is owned by `liveuser`, mode 600.
+  cloudflared reads `TUNNEL_TOKEN` from its environment; `ExecStart` contains no
+  token expansion. Verify with `ps aux | grep '[c]loudflared'`.
+- **LAN pivot:** the outbound `id_ed25519_to_other` key and its `other-pc`
+  config stanza are absent. Preserve the inbound keys used to manage this host.
+- **Gateway attack surfaces:** production and staging set
+  `CHUDWARE_WEB_TERMINAL_ENABLED=0` and
+  `CHUDWARE_WEB_SHARE_PROVIDER_KEYS=0`. The first removes the browser shell;
+  the second prevents a customer context from inheriting host-owned provider
+  credentials and spending the host account.
+- **Backups:** keep the existing timer. It encrypts every artifact with `age`
+  before writing it and contains the environment-gated off-box R2 push. Do not
+  build a parallel plaintext backup path.
+
+### Shared-host capacity
+
+`livingroom-pc` is not a Chudware-only host. It also runs the production mail
+stack above in rootful Podman and a self-hosted CI runner. Treat host-level
+firewall, container, package-update, CPU, memory, and disk changes as shared
+infrastructure changes.
+
+The two gateways each have `MemoryMax=1G`. At the 2026-08-10 hardening baseline
+they used about 58 MB each (peaks 120 MB), the three mail services together used
+about 160 MB at their systemd peaks, 9.4 GiB of 15 GiB RAM remained available,
+and 49 GiB of 117 GiB disk remained free. Those ceilings leave ample memory and
+disk headroom for mail. CPU was saturated by concurrent CI/build work while
+mail containers were below 0.1% CPU combined; schedule production builds with
+the understanding that CI, rather than gateway or mail memory, is the current
+contention risk.
+
+### Accepted residual risk
+
+`liveuser` deliberately remains in `wheel` with `NOPASSWD: ALL`, and sshd
+deliberately keeps password authentication enabled. Therefore a remote-code-
+execution vulnerability in the gateway is still a root compromise of the
+production host. The controls above shrink exposure and remove the highest-value
+LAN pivot, but they do **not** eliminate that root-compromise path. Revisit the
+declined `sudo` and `sshd` items before treating the host as strongly isolated.
+
 ## (b) Cloudflare — what is already provisioned vs manual
 
 ### Pre-provisioned (driver / `Webservice/deploy/cf_provision.py`)
@@ -52,19 +127,49 @@ Do **not** hand-create these if provision already ran:
 | One-Time PIN IdP | already enabled |
 | Zone | `chudware.com` active |
 | Tunnel | `chudware-web` (remotely-managed) |
-| Public hostname | `chudware.com` → `http://127.0.0.1:8300` (WSS over same HTTPS) |
-| Extra hostname | `www.chudware.com` → same tunnel, same service |
-| Access application | self-hosted app for `chudware.com` — gates `/admin` only |
+| Production ingress | `app.chudware.com` → `http://127.0.0.1:8300` |
+| Staging ingress | `staging.chudware.com` → `http://127.0.0.1:8310` |
+| Catch-all ingress | `http_status:404` — no apex, www, `cad.scootware.us`, or `sso.chudware.com` origin route |
+| Pages DNS | `chudware.com`, `www.chudware.com` → `chudware-site.pages.dev` |
+| Access application | the one existing app, narrowed to `app.chudware.com/admin*`; one app means one gateway AUD |
 
-`cf_provision.py` is **driver-owned** and lands beside these deploy files — DeployOps does not implement it. It should write into **`~/chudware-web-data/gateway.env`** (never committed):
+`cf_provision.py` is **driver-owned** and lands beside these deploy files — DeployOps does
+not implement it. It writes the gateway's Cloudflare values into
+`~/chudware-web-data/gateway.env` (never committed). If provisioning places a fresh
+`TUNNEL_TOKEN` there, immediately run the tunnel hardening item; it moves the token to
+the dedicated mode-600 file and removes it from the gateway environment:
 
 ```bash
-TUNNEL_TOKEN=...                 # cloudflared tunnel run --token
-CHUDWARE_CF_TEAM_DOMAIN=https://bruh234324.cloudflareaccess.com
-CHUDWARE_CF_AUD=...                # Access Application Audience (AUD) tag
+CHUDWARE_WEB_CF_TEAM_DOMAIN=https://bruh234324.cloudflareaccess.com
+CHUDWARE_WEB_CF_AUD=...          # the single Access Application AUD
+CHUDWARE_WEB_PUBLIC_BASE_URL=https://app.chudware.com
+sudo Webservice/deploy/harden_host.sh --apply tunnel
 ```
 
-Access is the operator door for `/admin`. When an Access credential is present the gateway verifies `Cf-Access-Jwt-Assertion` against team JWKS (`…/cdn-cgi/access/certs`) with `iss` = team domain and `aud` = `CHUDWARE_CF_AUD`. JWKS rotates ~every 6 weeks (previous key valid ~7 days) — always fetch remotely, match `kid`. Everyone else authenticates to the gateway itself (§c).
+Access is the operator door for `/admin`. When an Access credential is present the gateway verifies `Cf-Access-Jwt-Assertion` against team JWKS (`…/cdn-cgi/access/certs`) with `iss` = team domain and `aud` = `CHUDWARE_WEB_CF_AUD`. JWKS rotates ~every 6 weeks (previous key valid ~7 days) — always fetch remotely, match `kid`. Everyone else authenticates to the gateway itself (§c).
+
+### Required cutover order — do not invert
+
+Narrowing Access first would expose the origin before its replacement login is
+known-good. Perform this cutover in order:
+
+1. Deploy the gateway build while the existing broad Access application still
+   protects the origin.
+2. Through the origin or a temporary hosts override, register, verify, and sign
+   in with the gateway's `chudware_sid` cookie. Confirm `/`, `/api/portal/account`,
+   and `/app/` enforce that session and sign-out makes them inaccessible.
+3. Confirm an account with role `user` receives 403 at `/admin`, while an
+   `admin` account reaches it.
+4. Only after steps 1–3 pass, run
+   `python3 Webservice/deploy/cf_provision.py --emails <operators>`. It changes
+   ingress/DNS and rewrites the **same** Access application to
+   `app.chudware.com/admin*`; it must not create another application/AUD.
+5. From an incognito browser, re-check public marketing pages at the apex,
+   session-cookie login at `app.chudware.com`, Access plus gateway admin-role
+   enforcement at `/admin`, and staging isolation.
+
+This repository change records the cutover but does **not** apply it to live
+Cloudflare.
 
 ### Hunter remaining manual steps
 
@@ -125,25 +230,78 @@ GET  /api/auth/oauth/{google|github}/start | /callback
 
 ---
 
-## (d) Demo-day checklist
+## (d) Staging gateway
 
-- [ ] Secrets rotated; `gateway.env` has `TUNNEL_TOKEN`, `CHUDWARE_CF_TEAM_DOMAIN`, `CHUDWARE_CF_AUD`, `CHUDWARE_WEB_SESSION_SECRET` (mode 600).
+Staging is a second **systemd user** service, not a development mode of
+production:
+
+| | Production | Staging |
+|---|---|---|
+| Unit | `chudware-gateway` | `chudware-gateway-staging` |
+| Loopback | `127.0.0.1:8300` | `127.0.0.1:8310` |
+| Data root | `~/chudware-web-data` | `~/chudware-web-staging` |
+| Database | `chudware_prod` | `chudware_staging` |
+| Mail | configured delivery backend | `console` |
+| Stripe | live when provisioned | test key or disabled |
+
+Install/update the unit atomically, then enable it:
+
+```bash
+install -Dm644 Webservice/deploy/chudware-gateway-staging.service \
+  ~/.config/systemd/user/chudware-gateway-staging.service
+systemctl --user daemon-reload
+systemctl --user enable --now chudware-gateway-staging.service
+```
+
+`~/chudware-web-staging/gateway.env` is mode 600 and must contain
+`CHUDWARE_DB_URL` for the `chudware_staging` role/database, an independent
+`CHUDWARE_WEB_SESSION_SECRET`, and `CHUDWARE_DEPLOY_HEALTH_EMAIL` naming an
+active account in that database. Set `CHUDWARE_MAIL_BACKEND=console`,
+`CHUDWARE_WEB_TERMINAL_ENABLED=0`, and
+`CHUDWARE_WEB_SHARE_PROVIDER_KEYS=0`. Leave Stripe unset until test credentials
+exist; if configured, every Stripe secret and price must be a test-mode object.
+The unit rejects an `sk_live_` secret.
+
+The initial health identity may be an operational account with no password or
+OAuth identity; it exists only so `python -m authn ops-session` can exercise
+the same server-side session path as a customer. Do not copy an account or a
+session row from production.
+
+Deploy and verify:
+
+```bash
+bash Webservice/deploy/update.sh staging
+systemctl --user is-active chudware-gateway-staging
+curl -sS http://127.0.0.1:8310/healthz
+pid=$(systemctl --user show -p MainPID --value chudware-gateway-staging)
+tr '\0' '\n' </proc/$pid/environ | sed -n 's/^CHUDWARE_DB_URL=.*/CHUDWARE_DB_URL=<redacted>/p'
+```
+
+For the database-isolation proof, do not trust `gateway.env`: inspect the
+running process as above, then parse the database name from that process's
+`CHUDWARE_DB_URL`. It must be `chudware_staging`, never `chudware_prod`.
+
+---
+
+## (e) Demo-day checklist
+
+- [ ] Secrets rotated; `gateway.env` has `CHUDWARE_WEB_CF_TEAM_DOMAIN`, `CHUDWARE_WEB_CF_AUD`, `CHUDWARE_WEB_SESSION_SECRET`; `cloudflared.env` has `TUNNEL_TOKEN` (both mode 600).
 - [ ] `bash Webservice/deploy/setup.sh` already run; linger enabled.
 - [ ] `systemctl --user start chudware-gateway chudware-cloudflared chudware-monitor.timer`
 - [ ] `curl -sS http://127.0.0.1:8300/healthz` — free RAM, VRAM, engine bridges look sane.
 - [ ] Every demo attendee has registered and verified (or you approved them at `/admin`).
-- [ ] Browser smoke: `https://chudware.com` → sign in → portal → `/app` loads.
+- [ ] Browser smoke: `https://app.chudware.com` → sign in → portal → `/app` loads.
 - [ ] Know the not-yet-approved path (the gateway's pending/denied status page) and the
       Access deny page for `/admin`.
 - [ ] Confirm `REFUSE_NEW` is absent unless disk is actually critical: `ls ~/chudware-web-data/REFUSE_NEW`.
 
 ---
 
-## (e) Troubleshooting
+## (f) Troubleshooting
 
 ### JWKS / 401 after Access login
 
-- Confirm `CHUDWARE_CF_AUD` matches Access app → Overview / Additional settings → Application Audience.
+- Confirm `CHUDWARE_WEB_CF_AUD` matches Access app → Overview / Additional settings → Application Audience.
 - Team domain must be exactly `https://bruh234324.cloudflareaccess.com` (no trailing slash mismatch vs gateway config).
 - Force JWKS refresh: restart gateway after Access app recreation (AUD changes if app is recreated).
 - CF rotates Access signing keys ~6 weeks; gateway must use live JWKS URL, not a pinned PEM.
@@ -153,12 +311,15 @@ GET  /api/auth/oauth/{google|github}/start | /callback
 ```bash
 systemctl --user status chudware-cloudflared
 journalctl --user -u chudware-cloudflared -n 80 --no-pager
-# token present?
-grep -E '^TUNNEL_TOKEN=' ~/chudware-web-data/gateway.env | sed 's/=.*/=***/'
+# token present, without printing it?
+stat -c '%a %U:%G %n' ~/chudware-web-data/cloudflared.env
+sed -n 's/^TUNNEL_TOKEN=.*/TUNNEL_TOKEN=<redacted>/p' \
+  ~/chudware-web-data/cloudflared.env
+ps aux | grep '[c]loudflared'
 ```
 
-Binary: `/usr/local/bin/cloudflared` (v2026.7.1 on this host). Unit runs:  
-`cloudflared tunnel run --token ${TUNNEL_TOKEN}`.
+Binary: `/usr/local/bin/cloudflared`. The unit runs `cloudflared tunnel run`;
+cloudflared reads `TUNNEL_TOKEN` from the protected environment instead of argv.
 
 ### Gateway / uvicorn
 
@@ -192,6 +353,75 @@ tail -n 5 ~/chudware-web-data/logs/monitor.jsonl
   The flag is advisory: `/healthz` and `/admin` surface it so you know the host
   is under disk pressure. Clear it by hand from `/admin` once space recovers.
 
+### Metrics, dashboards, status publishing, and off-box alerting
+
+The gateway exposes Prometheus text at `GET /metrics`. It contains request
+counts and latency histograms labelled by the **matched route template** (never
+raw user/document ids), current `/engine` bridge and browser-session counts,
+five-minute credit spend rate, mail outbox backlog/failures, Stripe webhook
+outcomes, PostgreSQL pool saturation, entitlement check-ins, and update
+manifest hits. The values include business telemetry and are not public.
+
+Generate independent operator secrets and add them to the mode-600
+`~/chudware-web-data/gateway.env`:
+
+```bash
+printf 'CHUDWARE_METRICS_ADMIN_TOKEN=%s\n' "$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')" >> ~/chudware-web-data/gateway.env
+printf 'CHUDWARE_GRAFANA_ADMIN_PASSWORD=%s\n' "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" >> ~/chudware-web-data/gateway.env
+chmod 600 ~/chudware-web-data/gateway.env
+systemctl --user restart chudware-gateway
+
+# Exact token contract used by Prometheus and an operator smoke:
+set -a; . ~/chudware-web-data/gateway.env; set +a
+curl -fsS -H "Authorization: Bearer $CHUDWARE_METRICS_ADMIN_TOKEN" \
+  http://127.0.0.1:8300/metrics | head -30
+```
+
+`monitor.py --install-observability` is the sole Podman surface in this
+repository. It creates two rootless containers using host networking because
+the gateway is intentionally loopback-only; both services explicitly bind
+loopback too, so neither dashboard becomes a public listener:
+
+- `chudware-prometheus` at `127.0.0.1:9090`, scraping the host gateway every
+  15 seconds with the metrics token and retaining samples for **30 days**;
+- `chudware-grafana` at `127.0.0.1:3000`, signup disabled, with Prometheus
+  provisioned as its default datasource.
+
+```bash
+sudo dnf install -y podman
+python3 Webservice/deploy/monitor.py --install-observability
+podman ps --filter name=chudware-
+# From a workstation: ssh -L 3000:127.0.0.1:3000 livingroom
+```
+
+The two named volumes survive container replacement. Re-running the install
+command is the supported configuration update and preserves those volumes.
+The installer also enables the rootless `podman-restart.service`, so both
+`--restart=unless-stopped` containers return after a reboot.
+The ports bind loopback only; do not add them to the Cloudflare tunnel.
+
+Every normal monitor sample also writes a non-sensitive public status object
+to R2 (`s3://chudware-releases/status.json` by default; override with
+`CHUDWARE_STATUS_BUCKET` / `CHUDWARE_STATUS_KEY`). Configure the monitor unit
+with `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_ENDPOINT`; the object
+must be routed to the Pages `https://chudware.com/status.json` path. Until R2
+is enabled (Cloudflare currently returns error 10042), the sampler still
+appends its local JSONL record but exits 2 and names every missing credential
+on stderr rather than pretending the public snapshot was updated. `--dry-run`
+prints the exact public body without touching R2.
+
+`.github/workflows/prod-external-watch.yml` runs every five minutes on
+`cloudcastle-server` (`cc-artifact-host`), never on the production host. It
+checks both `https://app.chudware.com/healthz` and the operational Pages status
+blob. Failures (including DNS, TLS, timeout, malformed or degraded JSON) are
+persisted on that runner; only the third consecutive failure opens the exact
+`[prod-watch] Chudware production surface unavailable` issue and sends mail.
+Later failures deduplicate against that open issue and send no more mail. The
+first healthy run comments with the recovery time and closes it. Configure
+repository secrets `PROD_WATCH_RESEND_API_KEY`, `PROD_WATCH_EMAIL`, and
+`PROD_WATCH_FROM`; missing mail credentials fail the alert run loudly after
+the GitHub issue has still been opened.
+
 ### Linger / user units vanish on logout
 
 ```bash
@@ -199,11 +429,11 @@ loginctl show-user "$USER" -p Linger
 sudo loginctl enable-linger "$USER"
 ```
 
-## (f) Admin ops dashboard + backups
+## (g) Admin ops dashboard + backups
 
 ### /admin ops
 
-`https://chudware.com/admin` (admin role) shows, above the accounts queue:
+`https://app.chudware.com/admin` (admin role) shows, above the accounts queue:
 
 - **Host bar** — free RAM, VRAM used/total + GPU util (`nvidia-smi`), load,
   plus **service chips** (cloudflared / monitor / backup unit states) and a
@@ -217,31 +447,26 @@ sudo loginctl enable-linger "$USER"
 - **Gateway log** — journal tail in the page (`/api/admin/logs`), optional
   5 s follow. No SSH needed for demo-day triage.
 
-### Shared /admin terminal (tmux-backed)
+### Shared /admin terminal (disabled in production)
 
-The `/admin` browser terminal is now **shared, saved, and concurrent**. Each
-session is a named **tmux** session on the gateway host (socket
-`$CHUDWARE_TMUX_SOCKET`, default `chudware`), so it survives browser disconnects
-*and* a gateway restart, and several admins can attach to the same session at
-once — they see and drive the same `omp` instance, which makes it easy to keep
-track of the actual work in flight.
+`CHUDWARE_WEB_TERMINAL_ENABLED=0` is part of the production and staging
+hardening baseline. With that setting the terminal routes are unavailable. Do
+not enable this merely for convenience: it exposes an interactive shell as the
+gateway account, and that account currently has passwordless sudo.
 
-- **Shared-sessions picker** (top of the terminal pane) lists every session
-  with a live client count; click one to attach, `+ New session` to start one,
-  the `×` on a pill to kill it. A browser **tab** is just this browser's
-  attachment: closing it (or `Ctrl+Alt+W`) only **detaches** — the session
-  keeps running. `Ctrl+Alt+T` starts a new session.
-- REST (admin-only): `GET/POST /api/admin/terminal/sessions`,
-  `DELETE /api/admin/terminal/sessions/{name}`. WS `/admin/terminal?name=<s>`
-  attaches (creating on demand).
-- **Host dependency:** `tmux` must be installed (`dnf install -y tmux`). The
-  first session starts the tmux server inside a `systemd-run --user --scope`
-  unit so heavy `omp` builds live outside the gateway's MemoryMax cgroup; if the
-  user bus is missing the create retries unscoped. Without tmux the terminal
-  falls back to the old private, per-connection shell (not shared or saved).
-- Sessions persist with zero clients (`destroy-unattached off`); they die only
-  on an explicit kill or when the shell/`omp` in them exits. List/inspect from a
-  shell with `tmux -L chudware ls`.
+If an operator deliberately sets the flag to `1` for a bounded maintenance
+window, each session is a named **tmux** session on the gateway host (socket
+`$CHUDWARE_TMUX_SOCKET`, default `chudware`). Sessions survive browser
+disconnects and gateway restarts, and multiple admins can attach concurrently.
+REST endpoints are `GET/POST /api/admin/terminal/sessions` and
+`DELETE /api/admin/terminal/sessions/{name}`; WebSocket
+`/admin/terminal?name=<s>` attaches. `tmux` must be installed. Set the flag back
+to `0`, restart the gateway, and kill leftover sessions when maintenance ends:
+
+```bash
+tmux -L chudware kill-server
+systemctl --user restart chudware-gateway
+```
 
 ### Nightly backups
 
@@ -290,28 +515,39 @@ The age **identity** (private key) must live off this machine. Keeping it in
 attacker who gets the disk.
 
 
-## (g) Pull / rebuild / redeploy (keep this host current)
+## (h) Pull / rebuild / redeploy
 
-One entry point for day-to-day sync from the other machine / `origin/master`:
+The same script deploys both environments:
 
 ```bash
-# Full path: git pull --ff-only + host GUI + engine + install_webd --restart + gateway
-bash Webservice/deploy/update.sh
+# Automatic after green linux-gate.yml on canonical master:
+bash Webservice/deploy/update.sh staging
 
-# Variants
-bash Webservice/deploy/update.sh --pull-only   # git only
-bash Webservice/deploy/update.sh --no-pull     # rebuild current tree
-bash Webservice/deploy/update.sh --host-only   # desktop Chudware binary
-bash Webservice/deploy/update.sh --web-only    # engine + webd + gateway
+# Explicit workflow_dispatch only; the tag is mandatory and re-verified at HEAD:
+bash Webservice/deploy/update.sh prod --tag v1.2.0
+
+# Operational variants retain the same environment guardrails:
+bash Webservice/deploy/update.sh staging --no-pull --gateway-only
+bash Webservice/deploy/update.sh prod --tag v1.2.0 --pull-only
+bash Webservice/deploy/update.sh prod --tag v1.2.0 --web-only
 ```
 
-Logs/lock: `~/chudware-web-data/logs/update.log`, `deploy.lock`, `deploy-status.json`
-(shared with admin `rebuild.sh` / `redeploy.sh`).
+Each gateway deploy takes `backups/pre-deploy-<environment>-<UTC>.dump`,
+migrates that environment's database, restarts its unit, and asserts both
+anonymous `/healthz` and authenticated `/api/me`. Logs and status live under
+the selected data root; the flock is shared under
+`~/chudware-web-data/logs/deploy.lock` so two environments cannot mutate the
+single checkout concurrently. Staging defaults to gateway-only. Production
+keeps the joint native hostd/WASM promotion and refuses any HEAD that is not an
+exact `v*` tag.
+
+To prove the fail-closed assertion without changing code, set
+`CHUDWARE_DEPLOY_HEALTHZ_PATH=/deliberately-broken` and
+`CHUDWARE_DEPLOY_HEALTH_ATTEMPTS=1` for a `--no-pull --gateway-only` staging
+run. It must exit nonzero; immediately rerun without those overrides.
 
 `install_webd.sh` builds the WASM client and promotes the engine in one joint
-release, then restarts `chudware-hostd` only when the joint sha changed. There
-is no auto-promote path unit — run `update.sh` (or `install_webd.sh --restart`)
-when you want the host to pick up a new engine build.
+release, then restarts `chudware-hostd` only when the joint sha changed.
 
 Desktop against the **shared** daemon (same engine the web client uses):
 
@@ -326,34 +562,32 @@ Desktop against the **shared** daemon (same engine the web client uses):
 | Path | Role |
 |------|------|
 | `Webservice/deploy/setup.sh` | Idempotent dirs, venv, unit install, enable |
-| `Webservice/deploy/update.sh` | **Day-to-day:** pull → rebuild host/engine → webd → gateway |
-| `Webservice/deploy/rebuild.sh` / `redeploy.sh` | Admin-locked rebuild targets / gateway restart |
-| `Webservice/deploy/install_webd.sh` | Promote engine build → `~/chudware-web` + hostd unit |
-| `Webservice/deploy/chudware-*.service` / `.timer` | systemd **user** units |
+| `Webservice/deploy/update.sh` | Environment-aware dump → pull → migrate → restart → health assertion |
+| `Webservice/deploy/rebuild.sh` / `redeploy.sh` | Admin-locked rebuild targets / production gateway restart |
+| `Webservice/deploy/install_webd.sh` | Promote engine build and install hostd plus both gateway units |
+| `Webservice/deploy/chudware-gateway{,-staging}.service` | Production 8300 / staging 8310 systemd **user** units |
 | `Webservice/deploy/monitor.py` | Host sample + disk-pressure flag (stdlib) |
 | `Webservice/deploy/cf_provision.py` | Driver: tunnel/DNS/Access via API |
-| `~/chudware-web-data/gateway.env` | Secrets + CF team/AUD/token + `CHUDWARE_WEB_SESSION_SECRET` (never commit) |
+| `~/chudware-web-data/gateway.env` | Production DB/session/Stripe/OAuth settings and hardened gateway flags (never commit) |
+| `~/chudware-web-data/cloudflared.env` | Tunnel token only; mode 600; loaded only by cloudflared |
+| `~/chudware-web-staging/gateway.env` | Staging DB/session secret, disabled attack surfaces, and test-only settings (never commit) |
 | `~/chudware-web-data/{workspace,bucket,plm,logs}` | Runtime file state |
 | PostgreSQL (`CHUDWARE_DB_URL`) | Accounts, chat history, webhook events, credentials, sessions, email tokens, mail outbox |
 
 ## AI modeling agent (remote/subscription models)
 
-The web client runs the in-app AI agent against **remote providers only** — no
-local models on this host. Credentials are resolved SERVER-SIDE and never sent
-to the browser:
+The hosted client uses remote providers, but customer turns must never inherit
+the `liveuser` account's provider credentials. Production and staging therefore
+set `CHUDWARE_WEB_SHARE_PROVIDER_KEYS=0`.
 
-1. **Host config.json** — whatever provider keys the gateway account's Chudware
-   config already carries. `gateway/engine_bridge.py` fills them in for
-   `agent_list_models` and leaves agent turns to the shared daemon.
-2. **Shared keys file (fallback):** create `~/chudware-web-data/ai_providers.env`
-   (`chmod 600`) with `KEY=VALUE` lines (`OPENROUTER_API_KEY=`,
-   `ANTHROPIC_API_KEY=`, `OPENAI_API_KEY=`, `XAI_API_KEY=`, `GEMINI_API_KEY=`, …).
-   Re-read per request; no gateway restart needed.
+With sharing disabled, `gateway/engine_bridge.py` must not inject keys from the
+host `config.json` or `~/chudware-web-data/ai_providers.env` into a customer
+request. A turn uses either that account's own stored provider credential or the
+metered managed-credit path. This is a financial boundary as well as a secrecy
+boundary: falling back to a host key lets any customer spend the host provider
+account outside the credit ledger.
 
-Keys are only ever attached to a **canonical, provider-matching endpoint** —
-a client that names any other base_url gets a generic rejection, never a key.
-Client-supplied `api_key`/`base_url`/`auth_mode` on agent turns are stripped.
-`agent_provider_*` (the administrator's auth store) is admin-only.
-
-All web turns spend the host account's provider quota; per-user billing
-isolation is not implemented.
+Provider credentials are only attached server-side to a canonical,
+provider-matching endpoint. Client-supplied `api_key`, `base_url`, and
+`auth_mode` fields are stripped. `agent_provider_*` remains admin-only. Do not
+set `CHUDWARE_WEB_SHARE_PROVIDER_KEYS=1` in a public environment.

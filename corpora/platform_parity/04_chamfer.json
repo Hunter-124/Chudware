@@ -1,0 +1,18 @@
+{
+  "doc": "chamfered_shaft",
+  "schema": "aicad.part/1",
+  "name": "Parity Chamfered Shaft",
+  "density_kg_mm3": 7.85e-6,
+  "features": [
+    {"id": "shaft", "type": "cylinder", "radius": 10.0, "height": 80.0},
+    {
+      "id": "chamfer",
+      "type": "chamfer",
+      "length": 1.5,
+      "edges": [
+        {"of": "edge", "side": "+z"},
+        {"of": "edge", "side": "-z"}
+      ]
+    }
+  ]
+}

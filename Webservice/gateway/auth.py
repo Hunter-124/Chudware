@@ -23,10 +23,11 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import jwt
 from fastapi import Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 try:
     from . import accounts, authn
@@ -46,7 +47,11 @@ SUPPORT_EMAIL = "support@chudware.com"
 # present a session cookie; each verifies its own signed request before parsing
 # or trusting payload fields. /api/auth is the sign-in surface itself.
 PUBLIC_PATHS = frozenset(
-    {"/healthz", "/api/billing/webhook", "/api/entitlement/refresh", "/api/auth"}
+    {
+        "/healthz", "/api/billing/webhook", "/api/entitlement/refresh",
+        "/api/releases/latest", "/api/auth", "/signin", "/signup",
+        "/forgot", "/reset", "/auth-assets",
+    }
 )
 
 
@@ -261,7 +266,13 @@ class AuthMiddleware:
                     }
                 )
                 return
-            response = self._deny_http(path, headers, exc)
+            response = self._deny_http(
+                path,
+                headers,
+                exc,
+                method=str(scope.get("method") or "GET").upper(),
+                next_path=path + (f"?{raw_qs.decode('latin-1')}" if raw_qs else ""),
+            )
             await response(scope, receive, send)
             return
 
@@ -270,7 +281,11 @@ class AuthMiddleware:
                 await send({"type": "websocket.close", "code": 4401})
                 return
             response = self._deny_http(
-                path, headers, AuthError("not authenticated", status=401)
+                path,
+                headers,
+                AuthError("not authenticated", status=401),
+                method=str(scope.get("method") or "GET").upper(),
+                next_path=path + (f"?{raw_qs.decode('latin-1')}" if raw_qs else ""),
             )
             await response(scope, receive, send)
             return
@@ -453,9 +468,21 @@ class AuthMiddleware:
         user = self._resolve_user(email)
         return user, None
 
-    def _deny_http(self, path: str, headers: dict[str, str], exc: AuthError):
-        accept = headers.get("accept", "")
-        wants_html = "text/html" in accept or path == "/" or path.startswith("/static")
+    def _deny_http(
+        self,
+        path: str,
+        headers: dict[str, str],
+        exc: AuthError,
+        *,
+        method: str,
+        next_path: str,
+    ):
+        wants_html = "text/html" in headers.get("accept", "")
+        if exc.status == 401 and wants_html and method == "GET" and not path.startswith("/api"):
+            return RedirectResponse(
+                "/signin?next=" + quote(next_path, safe=""),
+                status_code=303,
+            )
         if exc.status == 403 and exc.account_status:
             if wants_html or not path.startswith("/api"):
                 return HTMLResponse(

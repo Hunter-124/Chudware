@@ -1,0 +1,22 @@
+{
+  "doc": "linear_pattern",
+  "schema": "aicad.part/1",
+  "name": "Parity Linear Pattern",
+  "density_kg_mm3": 7.85e-6,
+  "features": [
+    {
+      "id": "profile",
+      "type": "sketch",
+      "plane": "top",
+      "entities": [
+        {"id": "e1", "type": "line", "construction": false, "p1": [0, 0], "p2": [10, 0]},
+        {"id": "e2", "type": "line", "construction": false, "p1": [10, 0], "p2": [10, 10]},
+        {"id": "e3", "type": "line", "construction": false, "p1": [10, 10], "p2": [0, 10]},
+        {"id": "e4", "type": "line", "construction": false, "p1": [0, 10], "p2": [0, 0]}
+      ],
+      "constraints": []
+    },
+    {"id": "seed", "type": "extrude", "profile": "profile", "depth": 10.0},
+    {"id": "pattern", "type": "linear_pattern", "seed": "seed", "count1": 3, "spacing1": 20.0, "dir1": [1, 0, 0]}
+  ]
+}

@@ -300,6 +300,49 @@ def test_browser_fetch_surfaces_bot_wall_status(browser_mods):
     assert result["ok"] is False
     assert result["reason"] == "bot_walled"
 
+def test_browser_fetch_preserves_backend_bot_wall_reason(browser_mods):
+    profiles, _ratelimit, session = browser_mods
+    profiles.ensure_profile("8020")
+
+    class _BotWall:
+        def fetch(self, *_args, **_kwargs):
+            return {"ok": False, "reason": "bot_walled", "status": 200}
+
+    result = session.browser_fetch(
+        "https://8020.net/catalogsearch/result/?q=bracket",
+        "8020",
+        _cef=_BotWall(),
+        min_interval=0.0,
+        no_cache=True,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "bot_walled"
+
+
+def test_browser_fetch_uses_driver_headless_client(browser_mods, monkeypatch):
+    profiles, _ratelimit, session = browser_mods
+    profiles.ensure_profile("vendor")
+    selected: list[str] = []
+    backend = _FakeCef(html="<html>selected backend</html>")
+
+    from services.browser import driver
+    monkeypatch.setattr(
+        driver,
+        "headless_client",
+        lambda *, profile: selected.append(profile) or backend,
+    )
+    result = session.browser_fetch(
+        "https://example.com/part",
+        "vendor",
+        min_interval=0.0,
+        no_cache=True,
+    )
+
+    assert result["ok"] is True
+    assert result["content"] == "<html>selected backend</html>"
+    assert selected == ["vendor"]
+
+
 
 def test_browser_fetch_returns_envelope_when_profile_exists(browser_mods):
     profiles, ratelimit, session = browser_mods

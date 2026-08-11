@@ -1,0 +1,21 @@
+{
+  "doc": "extrude_block",
+  "schema": "aicad.part/1",
+  "name": "Parity Extrude Block",
+  "density_kg_mm3": 7.85e-6,
+  "features": [
+    {
+      "id": "profile",
+      "type": "sketch",
+      "plane": "top",
+      "entities": [
+        {"id": "e1", "type": "line", "construction": false, "p1": [0, 0], "p2": [40, 0]},
+        {"id": "e2", "type": "line", "construction": false, "p1": [40, 0], "p2": [40, 30]},
+        {"id": "e3", "type": "line", "construction": false, "p1": [40, 30], "p2": [0, 30]},
+        {"id": "e4", "type": "line", "construction": false, "p1": [0, 30], "p2": [0, 0]}
+      ],
+      "constraints": []
+    },
+    {"id": "extrude", "type": "extrude", "profile": "profile", "depth": 20.0}
+  ]
+}

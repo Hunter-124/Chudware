@@ -1,0 +1,33 @@
+{
+  "doc": "fully_constrained_sketch",
+  "schema": "aicad.part/1",
+  "name": "Parity Fully Constrained Sketch",
+  "density_kg_mm3": 2.70e-6,
+  "features": [
+    {
+      "id": "sketch",
+      "type": "sketch",
+      "plane": "top",
+      "entities": [
+        {"id": "e1", "type": "line", "construction": false, "p1": [0, 0], "p2": [32, 0]},
+        {"id": "e2", "type": "line", "construction": false, "p1": [32, 0], "p2": [32, 18]},
+        {"id": "e3", "type": "line", "construction": false, "p1": [32, 18], "p2": [0, 18]},
+        {"id": "e4", "type": "line", "construction": false, "p1": [0, 18], "p2": [0, 0]}
+      ],
+      "constraints": [
+        {"id": "c1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+        {"id": "c2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
+        {"id": "c3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+        {"id": "c4", "type": "coincident", "refs": ["e4.p2", "e1.p1"]},
+        {"id": "c5", "type": "horizontal", "refs": ["e1"]},
+        {"id": "c6", "type": "horizontal", "refs": ["e3"]},
+        {"id": "c7", "type": "vertical", "refs": ["e2"]},
+        {"id": "c8", "type": "vertical", "refs": ["e4"]},
+        {"id": "c9", "type": "fix", "refs": ["e1.p1"]},
+        {"id": "c10", "type": "distance", "refs": ["e1.p1", "e1.p2"], "value": {"value": 32.0, "expr": null}, "driven": false},
+        {"id": "c11", "type": "distance", "refs": ["e2.p1", "e2.p2"], "value": {"value": 18.0, "expr": null}, "driven": false}
+      ]
+    },
+    {"id": "extrude", "type": "extrude", "profile": "sketch", "depth": 4.0}
+  ]
+}

@@ -494,6 +494,34 @@ def _apply_event(store: AccountStore, event: Any) -> None:
     log.info("unhandled Stripe event type %s — acknowledged, no action", event_type)
 
 
+def invoice_history(email: str, limit: int = 12) -> list[dict[str, Any]]:
+    """Customer-visible Stripe invoices, without exposing provider-cost data."""
+    cfg = load_config()
+    if not cfg.secret_key:
+        return []
+    account = _store().get_account(email)
+    customer_id = getattr(account, "stripe_customer_id", "") if account else ""
+    if not customer_id:
+        return []
+    stripe = _stripe()
+    stripe.api_key = cfg.secret_key
+    page = stripe.Invoice.list(customer=customer_id, limit=max(1, min(int(limit), 100)))
+    rows = _field(page, "data", []) or []
+    return [
+        {
+            "id": str(_field(invoice, "id", "") or ""),
+            "number": str(_field(invoice, "number", "") or ""),
+            "status": str(_field(invoice, "status", "") or ""),
+            "created": int(_field(invoice, "created", 0) or 0),
+            "amount_paid": int(_field(invoice, "amount_paid", 0) or 0),
+            "currency": str(_field(invoice, "currency", "usd") or "usd").lower(),
+            "hosted_invoice_url": str(_field(invoice, "hosted_invoice_url", "") or ""),
+            "invoice_pdf": str(_field(invoice, "invoice_pdf", "") or ""),
+        }
+        for invoice in rows
+    ]
+
+
 router = APIRouter()
 router.include_router(credits.router)
 

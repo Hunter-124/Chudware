@@ -1,0 +1,30 @@
+[Unit]
+Description=chudware-web staging gateway (FastAPI / uvicorn on 127.0.0.1:8310)
+Documentation=file://%h/Repositories/CAD/Webservice/deploy/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Repositories/CAD/Webservice/gateway
+EnvironmentFile=%h/chudware-web-staging/gateway.env
+EnvironmentFile=-%h/chudware-web/webd.env
+Environment=CHUDWARE_WEB_DATA=%h/chudware-web-staging
+Environment=CHUDWARE_WEB_DATA_ROOT=%h/chudware-web-staging
+Environment=CHUDWARE_WEB_PUBLIC_URL=https://staging.chudware.com
+Environment=CHUDWARE_MAIL_BACKEND=console
+Environment=CHUDWARE_DEPLOY_ENV=staging
+Environment=CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES=4194304
+# Staging may use a Stripe test key or run with billing disabled. Every other
+# key form is a configuration error here, including live and restricted-live.
+ExecStartPre=/usr/bin/bash -c 'case "${CHUDWARE_WEB_STRIPE_SECRET_KEY:-}" in ""|sk_test_*|rk_test_*) exit 0;; *) echo "ERROR: staging accepts only Stripe test credentials" >&2; exit 1;; esac'
+ExecStart=%h/Repositories/CAD/Webservice/gateway/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8310 --proxy-headers --forwarded-allow-ips=127.0.0.1 --ws-max-size ${CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES}
+Restart=on-failure
+RestartSec=3
+MemoryMax=1G
+MemoryHigh=900M
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

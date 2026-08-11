@@ -1,15 +1,21 @@
 # services/browser — user-authenticated headless-browser acquisition
 
-Headless production fetch/download uses the host **CEF daemon**
-(`cef_client.py` → `chudware --cef-daemon`). Residual Playwright-compatible
-surfaces (headed CLI login, embed, cookie export) go through
-`services/browser/driver.py`, selected by env:
+Headless production fetch/download uses the backend selected by
+`services/browser/driver.py`. Linux and Windows default to the host **CEF
+daemon** (`cef_client.py` → `chudware --cef-daemon`); macOS defaults to
+`pw_client.py` because it ships CEF off. The same env also selects residual
+Playwright-compatible surfaces (headed CLI login, embed, cookie export):
 
-| `CHUDWARE_PW_BACKEND` | Residual PW driver | Notes |
-|---------------------|--------------------|-------|
-| `cef` (**default**, unset) | stock `playwright` | Byte-identical to pre-factory; headless stays CEF |
-| `patchright` | `patchright` (Apache-2 drop-in) | `pip install patchright` then provision |
-| `camoufox` | import-guarded opt-in | Firefox hard-site fallback; not a login/embed drop-in |
+| `CHUDWARE_PW_BACKEND` | Headless fetch/download | Residual PW driver |
+|---------------------|-------------------------|--------------------|
+| `cef` | CEF daemon | stock `playwright` |
+| `playwright` | stock Playwright | stock `playwright` |
+| `patchright` | Patchright | `patchright` (Apache-2 drop-in) |
+| `camoufox` | CEF daemon | import-guarded opt-in |
+
+Unset defaults to `playwright` on macOS and `cef` on Linux/Windows. See the
+[canonical macOS Parts Library platform note](https://chudware.com/docs/troubleshooting/#macos-parts-library-vendor-access);
+release notes should link there rather than duplicate its wording.
 
 One-time setup (already done in the shared mcp-venv; needed again only for a
 fresh venv). **Never auto-downloads at import** — provision explicitly:
@@ -27,9 +33,9 @@ playwright install chromium
 ```
 
 `driver.resolve_sync()` / `resolve_async()` lazy-import the selected package so
-nothing here crashes an MCP server that hasn't run either step yet — calls just
-degrade to `{ok: false, reason: "playwright_not_installed", ...}`. Challenges
-(captcha/2FA) are **detected never solved** (`challenge.py`).
+nothing here crashes an MCP server that has not run either step. Headless calls
+route through `driver.headless_client()`. Challenges (captcha/2FA) are **detected,
+never solved** (`challenge.py`).
 
 Profiles created by `browser_login(site)` live under the app data dir
 (`~/.local/share/Chudware/browser_profiles/<site>/` or the Windows/legacy

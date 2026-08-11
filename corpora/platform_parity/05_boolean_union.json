@@ -1,0 +1,11 @@
+{
+  "doc": "boolean_union",
+  "schema": "aicad.part/1",
+  "name": "Parity Boolean Union",
+  "density_kg_mm3": 7.85e-6,
+  "features": [
+    {"id": "left", "type": "box", "length": 20.0, "width": 20.0, "height": 10.0},
+    {"id": "right", "type": "box", "length": 20.0, "width": 20.0, "height": 10.0, "at": [10, 0, 0], "merge": false},
+    {"id": "union", "type": "boolean", "op": "fuse", "a": "left", "b": "right"}
+  ]
+}

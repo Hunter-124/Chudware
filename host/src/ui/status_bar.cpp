@@ -13,6 +13,10 @@
 #include "sketch3d_mode.h" // 3D sketch status readout
 #include "plm/plm_quickbar.h"  // embedded per-doc PLM control
 #include "../core/sim_client.h"
+#ifndef __EMSCRIPTEN__
+#include "../update/updater.h"
+#include "web_capabilities.h"
+#endif
 
 namespace ui {
 
@@ -237,6 +241,38 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                 "Chudware will keep retrying (1s, 2s, 5s, then every 10s).\n"
                 "Agent/shared docs reappear automatically on reconnect.");
     }
+#ifndef __EMSCRIPTEN__
+    {
+        const auto update = chudware::update::globalUpdater().snapshot();
+        std::string label;
+        if (update.state == chudware::update::State::Available ||
+            update.state == chudware::update::State::ManualDownload)
+            label = "Update available \xe2\x80\x94 " + update.version;
+        else if (update.state == chudware::update::State::Staged)
+            label = "Restart to update \xe2\x80\x94 " + update.version;
+        else if (update.state == chudware::update::State::Mandatory)
+            label = "Update required \xe2\x80\x94 " + update.version;
+        else if (update.state == chudware::update::State::Downloading)
+            label = "Downloading update \xe2\x80\x94 " + update.version;
+        if (!label.empty()) {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
+                ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 1));
+            const bool clicked =
+                ImGui::SmallButton((label + "##desktop_update").c_str());
+            ImGui::PopStyleColor();
+            if (clicked && !update.downloadUrl.empty())
+                ui::openExternalHttpUrl(update.downloadUrl);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "%s%s",
+                    update.message.c_str(),
+                    update.downloadUrl.empty() ? "" : "\nClick to open the download page.");
+            }
+        }
+    }
+#endif
     if (busy && !st.livePhase.empty()) {
         ImGui::SameLine();
         // Live-phase progress chip on a frosted-glass pill so the running-job readout matches the

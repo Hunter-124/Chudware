@@ -4,19 +4,21 @@
 ; associations. This script's only job is to give that a normal Windows installer experience
 ; (Start Menu entry, Programs-and-Features uninstall entry, a single .exe to hand a user).
 ;
-; Build (on a Windows host with Inno Setup 6 installed — ISCC.exe on PATH):
-;   1. python -m services.installer.build_release --zip          (produces dist\Chudware\...)
-;   2. ISCC packaging\windows\chudware.iss /DPayloadDir=dist\Chudware /DAppVersion=1.0.0
+; Build (on a Windows host with Inno Setup 6 installed):
+;   python -m services.installer.build_release --out dist
+; The Python command stages the payload, reads CHUDWARE_VERSION from the generated header,
+; invokes ISCC with /DAppVersion, and applies the optional signing hook.
 ;
-; See docs/PACKAGING_WINDOWS.md for the full walkthrough (this repo's Linux box cannot run
-; Inno Setup or produce a real Windows chudware.exe, so this script is documented, not verified,
-; here — see that doc for exactly what to check on a Windows host).
+; See docs/reference/PACKAGING_WINDOWS.md for the full walkthrough.
 
 #ifndef PayloadDir
   #define PayloadDir "..\..\dist\Chudware"
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.0.0-dev"
+  #error AppVersion must be supplied by services.installer.build_release from chudware_version.h
+#endif
+#ifndef InstallerOutputDir
+  #define InstallerOutputDir "..\..\dist"
 #endif
 
 [Setup]
@@ -37,13 +39,13 @@ PrivilegesRequired=lowest
 DefaultDirName={localappdata}\Programs\Chudware
 DefaultGroupName=Chudware
 DisableProgramGroupPage=yes
-OutputDir=..\..\dist
-OutputBaseFilename=Chudware-Setup-{#AppVersion}
+OutputDir={#InstallerOutputDir}
+OutputBaseFilename=Chudware-Setup-{#AppVersion}-x86_64
 Compression=lzma2
 SolidCompression=yes
+ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-; No EULA/license file yet (commercial closed-source per CONTRIBUTING.md — add one before a
-; real external release; a bare-bones installer is fine for internal dogfooding builds).
+LicenseFile=..\..\LICENSE-EULA.txt
 WizardStyle=modern
 ; Ask Windows Restart Manager to close apps holding files under {app} (chudware.exe and any
 ; chudware-hostd.exe daemon) before install/uninstall. Belt-and-braces with install.ps1's own
@@ -79,5 +81,4 @@ Name: "{group}\Uninstall Chudware"; Filename: "{uninstallexe}"
 
 ; NOTE: install.ps1 also creates its own Start Menu shortcut (Environment.GetFolderPath
 ; 'Programs') — a known, harmless duplicate with the [Icons] entry above until install.ps1
-; grows a -NoShortcut flag. Not fixed here (can't test the PowerShell change on this box);
-; tracked in docs/PACKAGING_WINDOWS.md.
+; grows a -NoShortcut flag. Tracked in docs/reference/PACKAGING_WINDOWS.md.

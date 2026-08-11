@@ -2230,6 +2230,42 @@ if(TARGET test_nsolve)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mate_corpus COMMAND test_mate_corpus)
 
+  # Release cross-platform parity corpus: compile the same 12 canonical documents on every
+  # native architecture, then emit a JSON dump for scripts/platform_parity.py. The target
+  # remains registered without Netgen and returns CTest's named skip code (77), because the
+  # required FEA fixture must never silently disappear from a supposedly complete dump.
+  if(CHUDWARE_WITH_OCCT)
+    add_executable(test_platform_parity tests/test_platform_parity.cpp)
+    target_compile_features(test_platform_parity PRIVATE cxx_std_20)
+    target_include_directories(test_platform_parity PRIVATE
+      ${doctest_SOURCE_DIR}
+      ${OpenCASCADE_INCLUDE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
+    target_link_libraries(test_platform_parity PRIVATE
+      chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util chudware_mate)
+    target_sources(test_platform_parity PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
+    target_compile_definitions(test_platform_parity PRIVATE
+      CHUDWARE_PLATFORM_PARITY_CORPUS="${CMAKE_CURRENT_SOURCE_DIR}/../corpora/platform_parity")
+    if(CHUDWARE_WITH_NETGEN)
+      target_link_libraries(test_platform_parity PRIVATE chudware_mesh)
+      target_compile_definitions(test_platform_parity PRIVATE CHUDWARE_WITH_NETGEN)
+    endif()
+    set_target_properties(test_platform_parity PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    add_test(NAME platform_parity COMMAND test_platform_parity)
+    if(CHUDWARE_WITH_NETGEN)
+      set_tests_properties(platform_parity PROPERTIES
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
+    else()
+      set_tests_properties(platform_parity PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+    endif()
+  endif()
+
   # Motion inverse dynamics (T-FIN20): OCCT-free analytic V&V — pendulum + slider-crank
   # joint-reaction cross-checks against closed-form mechanics on synthetic trajectories.
   add_executable(test_motion_dynamics

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # packaging/linux/build_appimage.sh — assemble a self-contained AppImage for the Chudware
-# host GUI (binary named Chudware; an Chudware compat symlink ships beside it).
+# host GUI (binary named chudware).
 # Mirrors services/installer/build_release.py's "embed-and-extract" payload shape
 # (app/ Python packages + wheelhouse/ offline wheels) so the SAME bootstrap.cpp
 # findPayload()/provisionRuntime() logic that already runs on Windows also works unmodified
@@ -41,26 +41,33 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-BIN="$REPO/host/build-linux/bin/Chudware"
-# Stale build dirs may only have the old binary name; fall back so packaging still works.
-[ -e "$BIN" ] || BIN="$REPO/host/build-linux/bin/Chudware"
+BIN="$REPO/host/build-linux/bin/chudware"
 if [ ! -x "$BIN" ]; then
     echo "error: $BIN not found — build it first:" >&2
-    echo '  cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release' >&2
-    echo '  ninja -C host/build-linux Chudware' >&2
+    echo '  ./build.sh all' >&2
     exit 1
 fi
 
-VERSION="$(git -C "$REPO" describe --tags --always --dirty 2>/dev/null || echo 0.0.0-dev)"
-echo "==> version: $VERSION"
+# Import the canonical helper rather than implementing another version parser. The helper
+# reads the exact generated header compiled into this binary.
+VERSION_HELPER="$(sed -n '/^chudware_read_version() {/,/^}/p' "$REPO/build.sh")"
+[ -n "$VERSION_HELPER" ] || { echo "error: chudware_read_version missing from build.sh" >&2; exit 1; }
+# shellcheck disable=SC2294
+_eval_version_helper() { eval "$VERSION_HELPER"; }
+_eval_version_helper
+chudware_read_version "$REPO/host/build-linux" || {
+    echo "error: host/build-linux/generated/api/chudware_version.h is missing or invalid; reconfigure the host build" >&2
+    exit 1
+}
+VERSION="$CHUDWARE_VERSION"
+echo "==> version from generated header: $VERSION"
 
 APPDIR="$OUT/AppDir"
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
 
 echo "==> staging binary + resources"
-cp "$BIN" "$APPDIR/usr/bin/Chudware"
-ln -sf Chudware "$APPDIR/usr/bin/Chudware"  # compat symlink for legacy launch paths
+cp "$BIN" "$APPDIR/usr/bin/chudware"
 if [ -d "$REPO/host/build-linux/bin/assets" ]; then
     cp -a "$REPO/host/build-linux/bin/assets" "$APPDIR/usr/bin/assets"
 fi
@@ -211,6 +218,17 @@ for mod in "$REPO"/services/*.py; do
     cp "$mod" "$APP/services/"
 done
 cp "$REPO/requirements.txt" "$APP/requirements.txt"
+cp "$REPO/LICENSE-EULA.txt" "$APPDIR/usr/bin/LICENSE-EULA.txt"
+cat > "$APPDIR/README" <<'EOF'
+Chudware AppImage
+=================
+
+Launching this AppImage is subject to the Chudware End User License Agreement bundled at
+usr/bin/LICENSE-EULA.txt. Read it before launching the application.
+
+This package may be unsigned. When it is, verify the published SHA-256 and Ed25519 signature
+before running it. Unsigned platform builds can trigger operating-system security warnings.
+EOF
 
 if [ "$SKIP_WHEELS" = "1" ]; then
     echo "==> skipping wheelhouse (--skip-wheels)"
@@ -249,16 +267,14 @@ fi
 if [ -z "${CHUDWARE_INSTANCE_KEY:-}" ]; then
     export CHUDWARE_INSTANCE_KEY="$(printf %s "${APPIMAGE:-$HERE}" | sha256sum | cut -c1-12)"
 fi
-exec "$HERE/usr/bin/Chudware" "$@"
+exec "$HERE/usr/bin/chudware" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
-# The staged binary is usr/bin/Chudware (with an Chudware compat symlink), matching the
-# .desktop's Exec=Chudware.
-# Lowercase on disk — a capital-C path here silently failed and left the AppDir with no
-# .desktop, so nothing bound the staged Chudware.png as the AppImage's icon.
-cp "$REPO/packaging/linux/chudware.desktop" "$APPDIR/Chudware.desktop"
-cp "$REPO/assets/logo_icon.png" "$APPDIR/Chudware.png"
-ln -sf Chudware.png "$APPDIR/.DirIcon"
+# The staged binary is usr/bin/chudware, matching the desktop entry's Exec.
+# Lowercase on disk so the desktop entry's Icon=chudware resolves exactly.
+cp "$REPO/packaging/linux/chudware.desktop" "$APPDIR/chudware.desktop"
+cp "$REPO/assets/logo_icon.png" "$APPDIR/chudware.png"
+ln -sf chudware.png "$APPDIR/.DirIcon"
 
 APPIMAGETOOL="$REPO/build/tools/appimagetool"
 if [ ! -x "$APPIMAGETOOL" ]; then
@@ -270,13 +286,40 @@ if [ ! -x "$APPIMAGETOOL" ]; then
 fi
 
 mkdir -p "$OUT"
-OUTFILE="$OUT/Chudware-$VERSION-x86_64.AppImage"
+OUTFILE="$OUT/Chudware-$VERSION-linux-x86_64.AppImage"
+echo "==> checking staged ELF dependencies"
+ldd_targets=()
+while IFS= read -r -d '' candidate; do
+    if file -b "$candidate" | grep -q 'ELF'; then
+        ldd_targets+=("$candidate")
+    fi
+done < <(find "$APPDIR/usr/bin" "$APPDIR/usr/lib" -type f -print0)
+[ "${#ldd_targets[@]}" -gt 0 ] || { echo "error: staged package contains no ELF binaries" >&2; exit 1; }
+unresolved="$(
+    LD_LIBRARY_PATH="$APPDIR/usr/lib:${LD_LIBRARY_PATH:-}" \
+        ldd "${ldd_targets[@]}" 2>/dev/null | awk '/not found/{print}'
+)"
+if [ -n "$unresolved" ]; then
+    echo "error: unresolved staged libraries:" >&2
+    printf '%s\n' "$unresolved" >&2
+    exit 1
+fi
+echo "==> staged ELF dependency check: ${#ldd_targets[@]} files, zero unresolved libraries"
+
+SIGN_IDENTITY="${CHUDWARE_SIGN_IDENTITY:-}"
+NOTARIZE_PROFILE="${CHUDWARE_NOTARIZE_PROFILE:-}"
+if [ -z "$SIGN_IDENTITY" ]; then
+    echo "WARNING: unsigned build — SmartScreen/Gatekeeper will warn users" >&2
+else
+    echo "==> CHUDWARE_SIGN_IDENTITY is set; Linux platform signing is supplied by packaging/publish.py's Ed25519 release signature"
+fi
+[ -z "$NOTARIZE_PROFILE" ] || echo "==> CHUDWARE_NOTARIZE_PROFILE is macOS-only and is not used for this AppImage"
+
 echo "==> building $OUTFILE"
 if ! ARCH=x86_64 VERSION="$VERSION" "$APPIMAGETOOL" "$APPDIR" "$OUTFILE" 2>"$OUT/appimagetool.log"; then
     echo "==> direct run failed, retrying with --appimage-extract-and-run (no-FUSE environments)"
     ARCH=x86_64 VERSION="$VERSION" "$APPIMAGETOOL" --appimage-extract-and-run "$APPDIR" "$OUTFILE"
 fi
-
 if [ "$KEEP_APPDIR" != "1" ]; then
     rm -rf "$APPDIR"
 fi

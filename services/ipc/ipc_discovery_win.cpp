@@ -1,6 +1,6 @@
 // Windows implementation of daemon discovery/lifecycle (POSIX sibling:
 // ipc_discovery.cpp). WRITTEN ON LINUX, NEVER COMPILED HERE — unverified until
-// the manual checklist in docs/PACKAGING_WINDOWS.md runs on a real box.
+// the manual checklist in docs/reference/PACKAGING_WINDOWS.md runs on a real box.
 //
 // The function names stay transport-neutral on purpose:
 //   socketPath(key) -> \\.\pipe\chudware-hostd-<SID>-<key>   (a pipe NAME, not a file)

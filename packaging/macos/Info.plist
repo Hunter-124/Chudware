@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>Chudware</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>step</string>
+        <string>stp</string>
+      </array>
+      <key>CFBundleTypeIconFile</key>
+      <string>Chudware.icns</string>
+      <key>CFBundleTypeName</key>
+      <string>STEP CAD Model</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+    </dict>
+    <dict>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>stepplus</string>
+      </array>
+      <key>CFBundleTypeIconFile</key>
+      <string>Chudware.icns</string>
+      <key>CFBundleTypeName</key>
+      <string>Chudware STEP+ Model</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+    </dict>
+  </array>
+  <key>CFBundleExecutable</key>
+  <string>Chudware</string>
+  <key>CFBundleIconFile</key>
+  <string>Chudware.icns</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.chudware.Chudware</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>Chudware</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@CHUDWARE_VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@CHUDWARE_VERSION@</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+  <key>LSMultipleInstancesProhibited</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright © 2026 Chudware. All rights reserved.</string>
+</dict>
+</plist>

@@ -679,6 +679,29 @@ def record_spend(
     return billed
 
 
+def spend_history(email: str, days: int = 30) -> list[dict[str, Any]]:
+    """Daily net AI spend for the portal, expressed only in Chudware credits."""
+    window = max(1, min(int(days), 366))
+    with tx() as cur:
+        cur.execute(
+            """
+            SELECT to_char(date_trunc('day', ts), 'YYYY-MM-DD') AS day,
+                   GREATEST(-COALESCE(sum(credits_delta), 0), 0) AS credits
+              FROM credit_ledger
+             WHERE email = %s
+               AND kind IN ('spend', 'refund', 'adjust')
+               AND ts >= now() - (%s * interval '1 day')
+             GROUP BY date_trunc('day', ts)
+             ORDER BY date_trunc('day', ts)
+            """,
+            (_email(email), window),
+        )
+        return [
+            {"day": str(row["day"]), "credits": int(row["credits"] or 0)}
+            for row in cur.fetchall()
+        ]
+
+
 def reconcile_balances() -> list[dict[str, Any]]:
     """Return and alert on any account whose materialised balance drifted."""
     with tx() as cur:

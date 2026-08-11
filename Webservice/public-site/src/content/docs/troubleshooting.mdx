@@ -24,4 +24,10 @@ Check system time, internet access, and whether `app.chudware.com` is reachable.
 
 Open AI settings and confirm either managed credits remain or a provider key is configured and passes its connection test. A failed provider request does not consume geometry changes; inspect the feed for the concrete error before retrying.
 
+## macOS Parts Library vendor access
+
+On macOS, the Parts Library fetches vendor pages through Playwright instead of Chudware's CEF daemon. Vendors that fingerprint browser automation can refuse those requests. When that happens, Chudware returns “blocked by the vendor” instead of hanging; the local catalog and vendors that tolerate Playwright continue to work. This is a known platform difference, not a bug. Linux and Windows Parts Library fetching is unaffected.
+
+If a vendor blocks a search on macOS, use the local catalog or run the vendor search from Chudware on a Linux or Windows machine if you have one.
+
 For account help, email [support@chudware.com](mailto:support@chudware.com) without including passwords, provider keys, or private project files.

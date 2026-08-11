@@ -1,0 +1,53 @@
+{
+  "doc": "swept_loft",
+  "schema": "aicad.part/1",
+  "name": "Parity Swept Loft",
+  "density_kg_mm3": 7.85e-6,
+  "features": [
+    {
+      "id": "section_a",
+      "type": "sketch",
+      "plane": "top",
+      "entities": [
+        {"id": "a1", "type": "line", "construction": false, "p1": [-8, -6], "p2": [8, -6]},
+        {"id": "a2", "type": "line", "construction": false, "p1": [8, -6], "p2": [8, 6]},
+        {"id": "a3", "type": "line", "construction": false, "p1": [8, 6], "p2": [-8, 6]},
+        {"id": "a4", "type": "line", "construction": false, "p1": [-8, 6], "p2": [-8, -6]}
+      ],
+      "constraints": []
+    },
+    {"id": "offset_plane", "type": "plane", "method": "offset", "base": "plane.top", "offset": 30.0},
+    {
+      "id": "section_b",
+      "type": "sketch",
+      "plane": "offset_plane",
+      "entities": [
+        {"id": "b1", "type": "line", "construction": false, "p1": [-4, -4], "p2": [4, -4]},
+        {"id": "b2", "type": "line", "construction": false, "p1": [4, -4], "p2": [4, 4]},
+        {"id": "b3", "type": "line", "construction": false, "p1": [4, 4], "p2": [-4, 4]},
+        {"id": "b4", "type": "line", "construction": false, "p1": [-4, 4], "p2": [-4, -4]}
+      ],
+      "constraints": []
+    },
+    {"id": "loft", "type": "loft", "sections": ["section_a", "section_b"]},
+    {
+      "id": "sweep_profile",
+      "type": "sketch",
+      "plane": "top",
+      "entities": [
+        {"id": "circle", "type": "circle", "construction": false, "center": [0, 0], "radius": 2.0}
+      ],
+      "constraints": []
+    },
+    {
+      "id": "sweep_path",
+      "type": "sketch",
+      "plane": "front",
+      "entities": [
+        {"id": "path", "type": "line", "construction": false, "p1": [0, 0], "p2": [0, 30]}
+      ],
+      "constraints": []
+    },
+    {"id": "sweep", "type": "sweep", "profile": "sweep_profile", "path": "sweep_path"}
+  ]
+}

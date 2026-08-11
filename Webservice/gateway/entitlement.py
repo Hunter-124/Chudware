@@ -158,29 +158,77 @@ def grace_days(issued_at: int, subscribed_since: int) -> int:
     return max(7, min(30, 7 + tenure_months))
 
 
-def _subject_for(email: str) -> str:
+def _subject_for(email: str, device_name: str) -> str:
+    """Mint a subject for one named installation, replacing stale authorization.
+
+    Re-authorizing the same machine intentionally rotates its subject and clears
+    a prior revocation. Any token copied from the old installation stops
+    refreshing immediately.
+    """
     subject = str(uuid.uuid4())
     with tx() as cur:
         cur.execute(
             """
-            INSERT INTO desktop_entitlements (email, subject)
-            VALUES (%s, %s)
-            ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+            INSERT INTO desktop_entitlements (email, subject, device_name)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (email, device_name) DO UPDATE
+                    SET subject = EXCLUDED.subject,
+                        created_at = now(),
+                        last_checkin_at = NULL,
+                        revoked_at = NULL
             RETURNING subject::text AS subject
             """,
-            (email, subject),
+            (email, subject, device_name),
         )
         row = cur.fetchone()
     return str(row["subject"])
 
 
 def _subject_matches(email: str, subject: str) -> bool:
+    """Validate an active device and record this authenticated check-in."""
     with tx() as cur:
         cur.execute(
-            "SELECT 1 FROM desktop_entitlements WHERE email = %s AND subject = %s",
+            """
+            UPDATE desktop_entitlements
+               SET last_checkin_at = now()
+             WHERE email = %s AND subject = %s AND revoked_at IS NULL
+         RETURNING 1
+            """,
             (email, subject),
         )
         return cur.fetchone() is not None
+
+
+def list_devices(email: str) -> list[dict[str, Any]]:
+    """Portal-safe device rows for one authenticated account."""
+    with tx() as cur:
+        cur.execute(
+            """
+            SELECT subject::text AS subject, device_name,
+                   EXTRACT(EPOCH FROM created_at) AS created_at,
+                   EXTRACT(EPOCH FROM last_checkin_at) AS last_checkin_at,
+                   EXTRACT(EPOCH FROM revoked_at) AS revoked_at
+              FROM desktop_entitlements
+             WHERE email = %s
+             ORDER BY created_at DESC
+            """,
+            (email,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def revoke_device(email: str, subject: str) -> bool:
+    """Revoke exactly one device belonging to *email*."""
+    with tx() as cur:
+        cur.execute(
+            """
+            UPDATE desktop_entitlements
+               SET revoked_at = COALESCE(revoked_at, now())
+             WHERE email = %s AND subject = %s
+            """,
+            (email, subject),
+        )
+        return cur.rowcount == 1
 
 
 def _entitlement_window(account: Any, now: int) -> tuple[int, int] | None:
@@ -305,7 +353,7 @@ async def desktop_authorize_confirm(request: Request) -> RedirectResponse:
     device = str(form.get("device", ""))
     port = _validate_authorize_params(form.get("port"), state_value, device)
     account = accounts.get_account(user.email)
-    token = _issue(account, _subject_for(user.email))
+    token = _issue(account, _subject_for(user.email, device))
     query = urllib.parse.urlencode({"token": token, "state": state_value})
     return RedirectResponse(f"http://127.0.0.1:{port}/callback?{query}", status_code=303)
 

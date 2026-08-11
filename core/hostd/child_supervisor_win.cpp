@@ -1,6 +1,6 @@
 // Windows backend of ChildSupervisor (POSIX sibling: child_supervisor.cpp).
 // WRITTEN ON LINUX, NEVER COMPILED HERE — unverified until the manual checklist
-// in docs/PACKAGING_WINDOWS.md runs on a real box.
+// in docs/reference/PACKAGING_WINDOWS.md runs on a real box.
 //
 // Containment model (the PDEATHSIG analog):
 //   * each child gets its OWN Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE

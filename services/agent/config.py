@@ -1658,10 +1658,37 @@ _pooled_keys: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
     "chudware_pooled_provider_keys", default={}
 )
 def clear_pooled_credentials() -> None:
-    """Clear run-scoped operator keys before a new worker RPC is accepted."""
+    """Clear every run-scoped web credential before a new worker RPC is accepted."""
     _pooled_keys.set({})
 
 
+
+
+def _byok_provider_config(name: str | None, cfg: dict, actor: Actor) -> dict:
+    """Replace ambient credentials with this run's gateway-supplied BYOK key."""
+    if actor.key_source != "byok":
+        return cfg
+    provider_name = str(name or cfg.get("provider") or "").strip().lower()
+    explicit_key = str(cfg.get("_chudware_pool_api_key") or "").strip()
+    known_keys = dict(_pooled_keys.get())
+    if explicit_key and provider_name:
+        known_keys[provider_name] = explicit_key
+        _pooled_keys.set(known_keys)
+    key = explicit_key or known_keys.get(provider_name, "")
+    if not key:
+        raise ValueError("BYOK provider credential unavailable")
+    resolved = copy.deepcopy(cfg)
+    resolved.pop("_chudware_pool_api_key", None)
+    resolved["provider"] = provider_name
+    resolved["api_key"] = key
+    resolved["openrouter_api_key"] = key if provider_name == "openrouter" else None
+    keys = dict(resolved.get("keys") or {})
+    keys[provider_name] = key
+    resolved["keys"] = keys
+    section = dict(resolved.get(provider_name) or {})
+    section["api_key"] = key
+    resolved[provider_name] = section
+    return resolved
 
 
 def _pooled_provider_config(name: str | None, cfg: dict, actor: Actor) -> dict:
@@ -1735,7 +1762,9 @@ def get_provider(name: str | None = None, cfg: dict | None = None,
     cfg = cfg if cfg is not None else load_config()
     if actor is None or actor.key_source != "pool":
         _pooled_keys.set({})
-    cfg = _pooled_provider_config(name, cfg, actor) if actor is not None else cfg
+    if actor is not None:
+        cfg = _byok_provider_config(name, cfg, actor)
+        cfg = _pooled_provider_config(name, cfg, actor)
     # token_usage's event sink is request-scoped and bound by worker_rpc. Provider
     # construction carries no gateway/database dependency.
     provider = _resolve_provider(name, cfg, role=role)

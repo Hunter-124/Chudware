@@ -1,267 +1,137 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Chudware — Cad Harness Ultimate Design softWare</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2312161E'/%3E%3Cg fill='none' stroke='%2342ECCE' stroke-width='1.7' stroke-linejoin='round' stroke-linecap='round'%3E%3Crect x='5' y='5' width='22' height='22'/%3E%3Crect x='10.5' y='10.5' width='11' height='11'/%3E%3Cpath d='M5 5L10.5 10.5M27 5L21.5 10.5M27 27L21.5 21.5M5 27L10.5 21.5'/%3E%3C/g%3E%3C/svg%3E" />
-  <style>
-    :root {
-      --bg: #0f1418;
-      --bg2: #12181c;
-      --panel: #161d23;
-      --panel-edge: rgba(255,255,255,0.07);
-      --text: #e6edf3;
-      --muted: #8b93a3;
-      --accent: #4f8cff;
-      --accent-hi: #6fa2ff;
-      --teal: #2fd4a7;
-    }
-    * { box-sizing: border-box; }
-    html, body { height: 100%; }
-    body {
-      margin: 0;
-      background:
-        radial-gradient(1200px 700px at 50% -10%, rgba(79,140,255,0.10), transparent 60%),
-        radial-gradient(900px 600px at 90% 110%, rgba(47,212,167,0.07), transparent 55%),
-        linear-gradient(180deg, var(--bg2), var(--bg));
-      color: var(--text);
-      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-      -webkit-font-smoothing: antialiased;
-      min-height: 100%;
-      display: flex;
-      flex-direction: column;
-    }
-    /* Top brand bar */
-    header {
-      display: flex;
-      align-items: center;
-      gap: 11px;
-      padding: 18px 28px;
-    }
-    header .logo { width: 30px; height: 30px; display: block; }
-    header .wordmark {
-      font-size: 20px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-      color: var(--text);
-    }
-    header .tag {
-      font-size: 11px;
-      letter-spacing: 0.18em;
-      text-transform: uppercase;
-      color: var(--muted);
-      border: 1px solid var(--panel-edge);
-      padding: 3px 8px;
-      border-radius: 999px;
-    }
-    /* Centered hero — fills the remaining height, centered both axes */
-    main {
-      flex: 1;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
-    }
-    .hero {
-      width: 100%;
-      max-width: 620px;
-      text-align: center;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 22px;
-    }
-    .hero .bigcube { width: 76px; height: 76px; margin-bottom: 2px; filter: drop-shadow(0 6px 20px rgba(66,236,206,0.35)); }
-    .hero h1 {
-      margin: 0;
-      font-size: clamp(2.1rem, 4.4vw, 3.1rem);
-      font-weight: 700;
-      letter-spacing: -0.02em;
-      line-height: 1.08;
-    }
-    .hero h1 .accent { color: var(--teal); }
-    .hero .expand {
-      margin: 0;
-      font-size: 0.82rem;
-      letter-spacing: 0.13em;
-      text-transform: uppercase;
-      color: var(--muted);
-    }
-    .hero .expand b { color: var(--accent-hi); font-weight: 700; }
-    .hero p.lead {
-      margin: 0;
-      max-width: 480px;
-      font-size: 1.05rem;
-      line-height: 1.55;
-      color: var(--muted);
-    }
-    .cta-row {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: center;
-      gap: 14px;
-    }
-    .cta {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 10px;
-      background: linear-gradient(180deg, var(--accent-hi), var(--accent));
-      color: #fff;
-      text-decoration: none;
-      font-weight: 650;
-      font-size: 1.05rem;
-      padding: 14px 40px;
-      min-height: 48px;
-      border-radius: 12px;
-      box-shadow: 0 8px 24px rgba(79,140,255,0.35), inset 0 1px 0 rgba(255,255,255,0.25);
-      transition: transform .12s ease, box-shadow .12s ease;
-      touch-action: manipulation;
-      -webkit-tap-highlight-color: transparent;
-    }
-    .cta:hover, .cta:focus-visible { transform: translateY(-1px); box-shadow: 0 12px 30px rgba(79,140,255,0.45), inset 0 1px 0 rgba(255,255,255,0.3); }
-    .cta:active { transform: translateY(0); }
-    .cta svg { width: 18px; height: 18px; }
-    .cta.secondary {
-      background: var(--panel);
-      color: var(--text);
-      border: 1px solid var(--panel-edge);
-      box-shadow: none;
-      padding: 13px 32px;
-    }
-    .cta.secondary:hover, .cta.secondary:focus-visible {
-      border-color: var(--accent);
-      box-shadow: 0 8px 20px rgba(0,0,0,0.25);
-    }
-    /* Feature row */
-    .features {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: center;
-      gap: 12px;
-      margin-top: 6px;
-    }
-    .feature {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      background: var(--panel);
-      border: 1px solid var(--panel-edge);
-      border-radius: 10px;
-      padding: 10px 14px;
-      font-size: 0.85rem;
-      color: var(--text);
-    }
-    .feature .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); flex: none; }
-    footer {
-      text-align: center;
-      padding: 18px;
-      font-size: 0.78rem;
-      color: var(--muted);
-    }
-    footer a { color: var(--muted); }
-    @media (max-width: 640px) {
-      header {
-        padding: max(14px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) 12px max(16px, env(safe-area-inset-left));
-      }
-      main {
-        padding: 16px max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
-        align-items: flex-start;
-        padding-top: 8vh;
-      }
-      .hero { gap: 18px; }
-      .hero .bigcube { width: 64px; height: 64px; }
-      .hero h1 { font-size: clamp(1.75rem, 8vw, 2.4rem); }
-      .hero .expand {
-        font-size: 0.72rem;
-        letter-spacing: 0.08em;
-        max-width: 100%;
-        line-height: 1.4;
-      }
-      .hero p.lead {
-        font-size: 0.98rem;
-        max-width: none;
-      }
-      .cta-row {
-        flex-direction: column;
-        width: 100%;
-        align-items: stretch;
-      }
-      .cta {
-        width: 100%;
-        max-width: 360px;
-        padding: 16px 24px;
-        font-size: 1.08rem;
-        margin: 0 auto;
-      }
-      .features {
-        width: 100%;
-        flex-direction: column;
-        align-items: stretch;
-        gap: 10px;
-      }
-      .feature {
-        justify-content: flex-start;
-        min-height: 44px;
-        padding: 12px 14px;
-      }
-    }
-    @media (max-width: 480px) {
-      header .tag { display: none; }
-      .hero .expand { letter-spacing: 0.04em; }
-    }
-  </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Chudware account</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23090d12'/%3E%3Cg fill='none' stroke='%2342ECCE' stroke-width='1.7'%3E%3Crect x='5' y='5' width='22' height='22'/%3E%3Crect x='10.5' y='10.5' width='11' height='11'/%3E%3Cpath d='M5 5L10.5 10.5M27 5L21.5 10.5M27 27L21.5 21.5M5 27L10.5 21.5'/%3E%3C/g%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/portal-assets/portal.ccd14c744436.css">
+  <script src="/portal-assets/portal.8cfb5bf8c58b.js" defer></script>
 </head>
 <body>
-  <header>
-    <svg class="logo" viewBox="0 0 64 64" aria-label="Chudware">
-      <g fill="none" stroke="#42ECCE" stroke-width="3.4" stroke-linejoin="round" stroke-linecap="round">
-        <rect x="10" y="10" width="44" height="44"/>
-        <rect x="21" y="21" width="22" height="22"/>
-        <path d="M10 10L21 21M54 10L43 21M54 54L43 43M10 54L21 43"/>
-      </g>
-    </svg>
-    <span class="wordmark">Chudware</span>
-    <span class="tag">Web</span>
-  </header>
+  <a class="skip-link" href="#page-title">Skip to content</a>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#account" aria-label="Chudware account home">
+        <svg viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="3.2"><rect x="9" y="9" width="46" height="46"/><rect x="21" y="21" width="22" height="22"/><path d="M9 9l12 12M55 9L43 21M55 55L43 43M9 55l12-12"/></g></svg>
+        <span>Chudware</span>
+      </a>
+      <nav aria-label="Account portal">
+        <button class="nav-item active" data-page="account"><span>01</span>Account</button>
+        <button class="nav-item" data-page="billing"><span>02</span>Billing</button>
+        <button class="nav-item" data-page="usage"><span>03</span>Usage</button>
+        <button class="nav-item" data-page="ai"><span>04</span>AI setup</button>
+        <button class="nav-item" data-page="downloads"><span>05</span>Downloads</button>
+        <button class="nav-item" data-page="devices"><span>06</span>Devices</button>
+      </nav>
+      <div class="sidebar-foot">
+        <a id="admin-link" class="admin-link" href="/admin" hidden>Admin console</a>
+        <div class="avatar" id="avatar">C</div>
+        <div><strong id="side-email">Loading…</strong><span id="side-plan">Account</span></div>
+      </div>
+    </aside>
 
-  <main>
-    <section class="hero">
-      <svg class="bigcube" viewBox="0 0 64 64" aria-hidden="true">
-        <!-- Tesseract Schlegel diagram: outer cube + inner cube + 8 connecting edges = 32 edges.
-             Geometry is tuned so no two parallel edges sit closer than ~4.4 user units, which is
-             what keeps every edge distinct at the 64-76px sizes this mark actually renders at. -->
-        <g fill="none" stroke="#42ECCE" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">
-          <rect x="6" y="16" width="42" height="42"/>
-          <rect x="16" y="6" width="42" height="42"/>
-          <rect x="20.6" y="25" width="18.4" height="18.4"/>
-          <rect x="25" y="20.6" width="18.4" height="18.4"/>
-          <path d="M6 16L16 6M48 16L58 6M48 58L58 48M6 58L16 48"/>
-          <path d="M20.6 25L25 20.6M39 25L43.4 20.6M39 43.4L43.4 39M20.6 43.4L25 39"/>
-          <path d="M6 16L20.6 25M48 16L39 25M48 58L39 43.4M6 58L20.6 43.4"/>
-          <path d="M16 6L25 20.6M58 6L43.4 20.6M58 48L43.4 39M16 48L25 39"/>
-        </g>
-      </svg>
-      <h1>Design in the browser,<br><span class="accent">together</span>.</h1>
-      <p class="expand"><b>C</b>ad <b>H</b>arness <b>U</b>ltimate <b>D</b>esign soft<b>W</b>are</p>
-      <p class="lead">
-        The full Chudware CAD suite runs natively in your browser on the shared team
-        workspace — no install. Everyone sees the same models update live.
-      </p>
-      <div class="cta-row">
-        <a class="cta" href="/app/">
-          Open Chudware
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-        </a>
-      </div>
-      <div class="features">
-        <div class="feature"><span class="dot"></span> Live collaborative editing</div>
-        <div class="feature"><span class="dot"></span> AI copilot built in</div>
-        <div class="feature"><span class="dot"></span> Simulation &amp; CAM</div>
-      </div>
-    </section>
-  </main>
+    <main>
+      <header class="topbar">
+        <button id="menu-button" class="icon-button" aria-label="Open navigation" aria-expanded="false">Menu</button>
+        <div><p class="eyebrow">Customer portal</p><h1 id="page-title">Account</h1></div>
+        <a id="open-cloud" class="primary compact" href="/app/">Open Chudware <span aria-hidden="true">↗</span></a>
+      </header>
+      <div id="global-message" class="message" role="status" hidden></div>
+
+      <section class="page active" data-view="account" aria-labelledby="page-title">
+        <div class="hero-grid">
+          <article class="hero-card">
+            <p class="eyebrow">Your workspace</p>
+            <h2 id="welcome">Welcome back</h2>
+            <p id="account-summary" class="lede">Loading your Chudware account…</p>
+            <div class="hero-actions">
+              <a id="hero-cloud" class="primary" href="/app/">Open cloud workspace</a>
+              <button class="secondary" data-go="downloads">Download desktop</button>
+            </div>
+          </article>
+          <article class="metric-card accent-card">
+            <span class="metric-label">Current plan</span>
+            <strong id="account-plan" class="metric-value">—</strong>
+            <span id="renewal-label" class="metric-sub">Loading renewal…</span>
+          </article>
+        </div>
+        <div class="grid two">
+          <article class="card">
+            <div class="card-head"><div><p class="eyebrow">Profile</p><h2>Account details</h2></div><span class="status-dot">Active</span></div>
+            <dl class="details"><div><dt>Email</dt><dd id="account-email">—</dd></div><div><dt>Plan</dt><dd id="account-plan-detail">—</dd></div><div><dt>Renewal</dt><dd id="account-renewal">—</dd></div><div><dt>Trial</dt><dd id="trial-countdown">Not on trial</dd></div></dl>
+          </article>
+          <article class="card">
+            <div class="card-head"><div><p class="eyebrow">Connected accounts</p><h2>Linked identities</h2></div></div>
+            <div id="identity-list" class="identity-list"><p class="empty">Loading linked sign-ins…</p></div>
+            <p class="fine">Sign in with the same verified email to link another identity.</p>
+            <div class="button-row"><a class="secondary small" href="/api/auth/oauth/google/start">Link Google</a><a class="secondary small" href="/api/auth/oauth/github/start">Link GitHub</a></div>
+          </article>
+          <article class="card">
+            <div class="card-head"><div><p class="eyebrow">Security</p><h2>Change password</h2></div></div>
+            <form id="password-form" class="form-stack">
+              <label>Current password<input id="current-password" type="password" autocomplete="current-password" required></label>
+              <label>New password<input id="new-password" type="password" autocomplete="new-password" minlength="12" required></label>
+              <button class="primary small" type="submit">Update password</button>
+              <p id="password-status" class="fine" role="status"></p>
+            </form>
+          </article>
+          <article class="card danger-card">
+            <div class="card-head"><div><p class="eyebrow">Sessions</p><h2>Sign out everywhere</h2></div></div>
+            <p>End every web session for this account, including this browser. Use this after losing a device or sharing a computer.</p>
+            <button id="signout-all" class="danger">Sign out all sessions</button>
+          </article>
+        </div>
+      </section>
+
+      <section class="page" data-view="billing" aria-labelledby="page-title">
+        <div class="section-intro"><div><p class="eyebrow">Subscription</p><h2>Choose how you build</h2><p>Move between Desktop and Studio without losing projects or credits.</p></div><button id="billing-portal" class="secondary">Manage payment details</button></div>
+        <div class="grid two plans">
+          <article class="card plan-card" data-plan-card="desktop"><span class="plan-kicker">Local-first</span><h2>Desktop</h2><p class="price">$49<span>/month</span></p><ul><li>Native desktop CAD</li><li>Offline entitlement grace</li><li>Bring your own AI keys</li></ul><button class="primary plan-action" data-plan="desktop">Choose Desktop</button></article>
+          <article class="card plan-card featured" data-plan-card="studio"><span class="plan-kicker">Cloud + desktop</span><h2>Studio</h2><p class="price">$99<span>/month</span></p><ul><li>Everything in Desktop</li><li>Browser cloud workspace</li><li>Pooled AI credit access</li></ul><button class="primary plan-action" data-plan="studio">Choose Studio</button></article>
+        </div>
+        <div class="section-intro compact-intro"><div><p class="eyebrow">Top up</p><h2>Credit packs</h2><p>Credits never expose upstream provider pricing.</p></div></div>
+        <div class="grid three packs">
+          <article class="card"><h3>Starter</h3><strong>8,000 credits</strong><p>For occasional AI-assisted edits.</p><button class="secondary pack-action" data-pack="starter">Buy pack</button></article>
+          <article class="card"><h3>Standard</h3><strong>20,000 credits</strong><p>For regular modeling sessions.</p><button class="secondary pack-action" data-pack="standard">Buy pack</button></article>
+          <article class="card"><h3>Bulk</h3><strong>80,000 credits</strong><p>For sustained production work.</p><button class="secondary pack-action" data-pack="bulk">Buy pack</button></article>
+        </div>
+        <article class="card table-card"><div class="card-head"><div><p class="eyebrow">Receipts</p><h2>Invoice history</h2></div></div><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Date</th><th>Status</th><th>Total</th><th></th></tr></thead><tbody id="invoice-rows"><tr><td colspan="5" class="empty">Loading invoices…</td></tr></tbody></table></div></article>
+      </section>
+
+      <section class="page" data-view="usage" aria-labelledby="page-title">
+        <div class="metric-strip"><article><span>Available balance</span><strong id="usage-balance">—</strong><small>credits</small></article><article><span>Monthly ceiling</span><strong id="usage-ceiling">—</strong><small>credits</small></article><article><span>Period</span><strong>30</strong><small>days</small></article></div>
+        <article class="card chart-card"><div class="card-head"><div><p class="eyebrow">AI consumption</p><h2>Daily credit spend</h2></div><span class="legend"><i></i>Credits used</span></div><div id="usage-chart" class="chart" role="img" aria-label="Daily credit spend chart"><p class="empty">Loading usage…</p></div><p class="fine"><strong>Using your own provider key consumes no Chudware credits.</strong> Managed usage is shown only in credits; provider cost and internal pricing are never exposed.</p></article>
+      </section>
+
+      <section class="page" data-view="ai" aria-labelledby="page-title">
+        <div class="section-intro"><div><p class="eyebrow">AI onboarding</p><h2>Choose how the copilot is powered</h2><p>The same three choices as desktop onboarding, explained without jargon.</p></div></div>
+        <div class="grid three setup-options">
+          <article id="credits-option" class="card featured"><span class="step">01</span><h2>Chudware credits</h2><p>The simplest option. Models run through the managed pool and draw from your portal balance.</p><strong id="ai-credit-balance">— credits available</strong><button class="primary" data-go="usage">View usage</button></article>
+          <article class="card"><span class="step">02</span><h2>Your AI subscription</h2><p>Use a supported subscription you already pay for. Open desktop Settings → Providers and choose Sign in.</p><span class="setup-note">Claude · ChatGPT · Cursor · xAI · Kimi</span><button class="secondary" data-go="downloads">Get desktop app</button></article>
+          <article class="card"><span class="step">03</span><h2>Your API key</h2><p>Paste a key once. Chudware validates it before encrypted storage and never displays it again.</p><form id="byok-form" class="form-stack"><label>Provider<select id="byok-provider" required><option value="openrouter">OpenRouter</option><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option><option value="xai">xAI</option><option value="moonshot">Moonshot</option></select></label><label>API key<input id="byok-key" type="password" autocomplete="off" required placeholder="Paste key — write only"></label><button class="primary" type="submit">Validate and save</button><p id="byok-status" class="fine" role="status"></p></form></article>
+        </div>
+        <article class="card"><div class="card-head"><div><p class="eyebrow">Your keys</p><h2>Validated providers</h2></div><span class="zero-credit">BYOK turns use 0 credits</span></div><div id="byok-list" class="provider-list"><p class="empty">Checking your providers…</p></div></article>
+      </section>
+
+      <section class="page" data-view="downloads" aria-labelledby="page-title">
+        <div class="section-intro"><div><p class="eyebrow">Native applications</p><h2>Download Chudware</h2><p>Signed release metadata is checked before an entitlement-bound download link is issued.</p></div><label class="channel-select">Channel<select id="release-channel"><option value="stable">Stable</option><option value="beta">Beta</option></select></label></div>
+        <div id="download-grid" class="grid two downloads">
+          <article class="card download-card" data-platform="windows" data-arch="x86_64"><span class="os-mark">WIN</span><div><h2>Windows</h2><p>64-bit installer · Windows 10/11</p><small class="release-meta">Checking latest release…</small></div><button class="primary download-action">Download</button></article>
+          <article class="card download-card" data-platform="macos" data-arch="arm64"><span class="os-mark">MAC</span><div><h2>macOS — Apple silicon</h2><p>M1 and newer · ZIP bundle</p><small class="release-meta">Checking latest release…</small></div><button class="primary download-action">Download</button></article>
+          <article class="card download-card" data-platform="macos" data-arch="x86_64"><span class="os-mark">MAC</span><div><h2>macOS — Intel</h2><p>Intel Macs · ZIP bundle</p><small class="release-meta">Checking latest release…</small></div><button class="primary download-action">Download</button></article>
+          <article class="card download-card" data-platform="linux" data-arch="x86_64"><span class="os-mark">LIN</span><div><h2>Linux</h2><p>x86_64 AppImage</p><small class="release-meta">Checking latest release…</small></div><button class="primary download-action">Download</button></article>
+        </div>
+        <div class="info-band"><strong>Already installed?</strong><span>Chudware checks signed release manifests automatically. Manual downloads remain available for repair and offline installation.</span></div>
+      </section>
+
+      <section class="page" data-view="devices" aria-labelledby="page-title">
+        <div class="section-intro"><div><p class="eyebrow">Desktop access</p><h2>Authorized devices</h2><p>Revoke a computer you no longer use. Its next entitlement refresh will be refused with a signed response.</p></div><button class="secondary" data-go="downloads">Authorize a new device</button></div>
+        <article class="card table-card"><div class="table-wrap"><table><thead><tr><th>Device</th><th>Authorized</th><th>Last check-in</th><th>Status</th><th></th></tr></thead><tbody id="device-rows"><tr><td colspan="5" class="empty">Loading devices…</td></tr></tbody></table></div></article>
+        <div class="info-band"><strong>Lost or stolen computer?</strong><span>Revoke it here. Cached access remains bounded by its signed offline grace period; it cannot obtain a new token.</span></div>
+      </section>
+    </main>
+  </div>
 </body>
 </html>

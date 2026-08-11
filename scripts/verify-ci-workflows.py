@@ -168,7 +168,24 @@ DEDICATED_RUNNER_LABELS = frozenset(
 LINUX_ENDPOINT_LABELS = frozenset(
     {"cc-linux-build", "cc-linux-livingroom", "cc-linux-hunter"}
 )
-DEDICATED_RUNNER_EXCEPTIONS: Dict[Tuple[str, str], frozenset] = {}
+DEDICATED_RUNNER_EXCEPTIONS: Dict[Tuple[str, str], frozenset] = {
+    # Publishing a release IS the single-side-effect operation `cc-artifact-host`
+    # exists for: it uploads the built artifacts to R2 and notifies the gateway,
+    # so it must run on the one endpoint that holds those credentials and must
+    # NOT be spread across the generic pool. The build legs that produce those
+    # artifacts are separate jobs on the build labels and are still policed.
+    ("release.yml", "publish"): frozenset({"cc-artifact-host"}),
+    # External health watch. The whole point is that it runs OFF the box it is
+    # watching: an alerting job on livingroom-pc cannot report that
+    # livingroom-pc is down. cloudcastle-server is the only always-on Linux
+    # endpoint that is not the production host, and this is a control job by
+    # definition, so the dedicated label is the requirement rather than a
+    # convenience. Both of that host's role labels are accepted because the
+    # watcher is equally at home under either.
+    ("prod-external-watch.yml", "watch"): frozenset(
+        {"cc-artifact-host", "cc-prod-control"}
+    ),
+}
 
 # These workflows produce a per-platform artifact set whose commit identity
 # must stay coherent once work has begun -- the cross-platform parity gate
@@ -1153,7 +1170,16 @@ def check_document(
                     )
 
                 generic_linux = {"self-hosted", "linux", "x64", "cloudcastle-ci"}
-                if generic_linux <= lowered and not (lowered & LINUX_ENDPOINT_LABELS):
+                # A job carrying an ALLOWED dedicated label is already pinned to
+                # exactly one endpoint, so "can land on any box in the pool" is
+                # false for it. Only an unexempted dedicated label is a finding,
+                # and that is what dedicated-runner-misuse above reports.
+                pinned_to_allowed_endpoint = bool(dedicated) and not unexpected
+                if (
+                    generic_linux <= lowered
+                    and not (lowered & LINUX_ENDPOINT_LABELS)
+                    and not pinned_to_allowed_endpoint
+                ):
                     add(
                         "unsafe-generic-linux-routing",
                         runs_on_line,

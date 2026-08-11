@@ -51,29 +51,38 @@ try:
     from .appserve import router as appserve_router
     from .perf_client import router as perf_router
     from .providers import router as providers_router
+    from .provider_keys import router as provider_keys_router
     from .terminal import router as terminal_router
     from .deploy_ops import router as deploy_router
     from .releases import router as releases_router
     from .accounts import router as accounts_router
     from .billing import router as billing_router
     from .entitlement import router as entitlement_router
+    from .metrics import MetricsMiddleware, router as metrics_router
+    from .portal_api import router as portal_api_router
+    from .portal_serve import router as portal_serve_router
 except ImportError:
     from engine_bridge import router as engine_router, active_bridge_count
     from workspace import router as workspace_router
     from appserve import router as appserve_router
     from perf_client import router as perf_router
     from providers import router as providers_router
+    from provider_keys import router as provider_keys_router
     from terminal import router as terminal_router
     from deploy_ops import router as deploy_router
     from releases import router as releases_router
     from accounts import router as accounts_router
     from billing import router as billing_router
     from entitlement import router as entitlement_router
+    from metrics import MetricsMiddleware, router as metrics_router
+    from portal_api import router as portal_api_router
+    from portal_serve import router as portal_serve_router
 
 settings.ensure_data_dirs()
 
 app = FastAPI(title="chudware-web", version="1.0.0")
 app.add_middleware(AuthMiddleware)
+app.add_middleware(MetricsMiddleware)
 
 
 # Verified against static/*.html: every <script> is an external /static file
@@ -432,6 +441,7 @@ app.include_router(workspace_router)
 app.include_router(appserve_router)
 app.include_router(perf_router)
 app.include_router(providers_router)
+app.include_router(provider_keys_router)
 app.include_router(terminal_router)
 app.include_router(deploy_router)
 app.include_router(releases_router)
@@ -439,6 +449,9 @@ app.include_router(bucket_router)
 app.include_router(accounts_router)
 app.include_router(billing_router)
 app.include_router(entitlement_router)
+app.include_router(metrics_router)
+app.include_router(portal_api_router)
+app.include_router(portal_serve_router)
 
 
 class _AdminGatedStatic(StaticFiles):
@@ -470,21 +483,6 @@ if STATIC_DIR.is_dir():
     app.mount("/static", _AdminGatedStatic(directory=str(STATIC_DIR)), name="static")
 
 
-@app.get("/", response_model=None)
-async def portal_index():
-    index = STATIC_DIR / "index.html"
-    if index.is_file():
-        return FileResponse(index)
-    return HTMLResponse(
-        """<!DOCTYPE html>
-<html><head><title>Chudware</title></head>
-<body style="font-family:system-ui;background:#0f1419;color:#e7ecf1;padding:2rem">
-  <h1>Chudware</h1>
-  <p>Portal static files not installed yet (waiting for static/index.html).</p>
-  <p>API: <code>/api/me</code> · <code>/healthz</code> · <code>/ws/chat</code></p>
-</body></html>""",
-        status_code=200,
-    )
 
 
 __all__ = ["app"]

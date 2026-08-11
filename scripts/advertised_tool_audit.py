@@ -179,7 +179,15 @@ def scan_files() -> list[str]:
             for fn in filenames:
                 if not fn.endswith(".py") or fn.startswith("test_"):
                     continue
-                out.append(os.path.relpath(os.path.join(dirpath, fn), REPO))
+                # Always forward-slash, on every platform. These strings are
+                # compared against the hand-written paths in NON_TOOL_MENTIONS
+                # and printed in findings, so a backslash here makes every
+                # allowlist entry miss on Windows and the gate reports ten
+                # phantom unreachable tools while Linux and macOS pass on the
+                # identical catalogue. Repo-relative paths are identifiers here,
+                # not filesystem paths.
+                rel = os.path.relpath(os.path.join(dirpath, fn), REPO)
+                out.append(rel.replace(os.sep, "/"))
     return sorted(out)
 
 

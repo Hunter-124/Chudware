@@ -64,6 +64,10 @@ def _load_webd_env() -> dict[str, str]:
 # dev box and the test suite run on; the two real ones are Resend's HTTPS API
 # and any SMTP relay (Amazon SES is the documented fallback above 100 mail/day).
 MAIL_BACKENDS = frozenset({"console", "resend", "smtp"})
+# How the SMTP submission session is encrypted. "starttls" upgrades a plaintext
+# connection (port 587); "implicit" is TLS from the first byte (port 465, which
+# is all Stalwart's submission listener offers). Both verify the peer chain.
+SMTP_TLS_MODES = frozenset({"starttls", "implicit"})
 DEFAULT_MAIL_FROM = "Chudware <noreply@chudware.com>"
 
 # Origin the gateway is reached at. Verification links, password-reset links,
@@ -142,6 +146,15 @@ class Settings:
     smtp_port: int = field(default_factory=lambda: _env_int("CHUDWARE_SMTP_PORT", 587))
     smtp_user: str = field(default_factory=lambda: _env("CHUDWARE_SMTP_USER", "") or "")
     smtp_pass: str = field(default_factory=lambda: _env("CHUDWARE_SMTP_PASS", "") or "")
+    # STARTTLS on 587 is the common case, but a submission listener that only
+    # speaks implicit TLS (Stalwart publishes 465 and refuses 587) needs the
+    # session encrypted from the first byte. There is no plaintext option: a
+    # relay password must never cross even a loopback hop in the clear.
+    smtp_tls: str = field(
+        default_factory=lambda: (
+            _env("CHUDWARE_SMTP_TLS", "starttls") or "starttls"
+        ).strip().lower()
+    )
     # Admin browser-terminal (an interactive shell as the gateway account).
     # Off by default: it must be an explicit operator opt-in, never something a
     # public-facing deployment inherits silently.
@@ -289,6 +302,11 @@ class Settings:
             )
         if self.mail_backend == "smtp" and not self.smtp_host:
             raise ValueError("CHUDWARE_MAIL_BACKEND=smtp requires CHUDWARE_SMTP_HOST")
+        if self.mail_backend == "smtp" and self.smtp_tls not in SMTP_TLS_MODES:
+            raise ValueError(
+                "CHUDWARE_SMTP_TLS must be one of "
+                f"{', '.join(sorted(SMTP_TLS_MODES))} — got {self.smtp_tls!r}"
+            )
         if self.session_ttl_days < 1:
             raise ValueError("CHUDWARE_WEB_SESSION_TTL_DAYS must be at least 1")
         if self.trial_days < 1:

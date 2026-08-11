@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import ssl
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -104,6 +105,94 @@ def test_backend_without_its_credential_refuses_to_boot(monkeypatch):
     monkeypatch.delenv("CHUDWARE_RESEND_API_KEY", raising=False)
     with pytest.raises(ValueError, match="CHUDWARE_RESEND_API_KEY"):
         config.Settings()
+
+
+def test_starttls_is_the_default_tls_mode(monkeypatch):
+    monkeypatch.delenv("CHUDWARE_SMTP_TLS", raising=False)
+    assert config.Settings().smtp_tls == "starttls"
+
+
+def test_unknown_tls_mode_refuses_to_boot(monkeypatch):
+    monkeypatch.setenv("CHUDWARE_MAIL_BACKEND", "smtp")
+    monkeypatch.setenv("CHUDWARE_SMTP_HOST", "mx.example.com")
+    monkeypatch.setenv("CHUDWARE_SMTP_TLS", "plaintext")
+    with pytest.raises(ValueError, match="CHUDWARE_SMTP_TLS"):
+        config.Settings()
+
+
+def test_a_relay_without_starttls_is_refused_rather_than_sent_in_the_clear(
+    mail, monkeypatch
+):
+    """The security property: no silent plaintext fallback.
+
+    A relay that does not advertise STARTTLS used to be used anyway, putting the
+    relay password and every verification link on the wire. It must now fail and
+    say which knob fixes it.
+    """
+    class NoStartTls:
+        def ehlo(self) -> None:
+            return None
+
+        def has_extn(self, name: str) -> bool:
+            return False
+
+        def close(self) -> None:
+            self.closed = True
+
+    stub = NoStartTls()
+    monkeypatch.setattr(mailer.settings, "mail_backend", "smtp")
+    monkeypatch.setattr(mailer.settings, "smtp_host", "mx.example.com")
+    monkeypatch.setattr(mailer.settings, "smtp_tls", "starttls")
+    monkeypatch.setattr(mailer.smtplib, "SMTP", lambda *a, **k: stub)
+
+    with pytest.raises(mailer.MailDeliveryError, match="CHUDWARE_SMTP_TLS=implicit"):
+        mailer._deliver_smtp("ada@example.com", mailer.render("verify_email", VERIFY_CTX))
+    assert stub.closed is True
+
+
+def test_implicit_mode_opens_a_tls_socket_instead_of_upgrading(mail, monkeypatch):
+    """465-only listeners never see a plaintext greeting or a STARTTLS probe."""
+    calls: dict[str, object] = {}
+
+    class Wrapped:
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *exc) -> None:  # noqa: ANN002
+            return None
+
+        def login(self, user: str, password: str) -> None:
+            calls["login"] = user
+
+        def send_message(self, msg) -> None:  # noqa: ANN001
+            calls["sent"] = msg["To"]
+
+    def fake_ssl(host, port, timeout=None, context=None):  # noqa: ANN001, ANN202
+        calls["host"] = host
+        calls["port"] = port
+        calls["verified"] = context.verify_mode
+        return Wrapped()
+
+    def explode(*a, **k):  # noqa: ANN002, ANN003, ANN202
+        raise AssertionError("implicit mode must not open a plaintext SMTP session")
+
+    monkeypatch.setattr(mailer.settings, "mail_backend", "smtp")
+    monkeypatch.setattr(mailer.settings, "smtp_host", "mx.example.com")
+    monkeypatch.setattr(mailer.settings, "smtp_port", 465)
+    monkeypatch.setattr(mailer.settings, "smtp_tls", "implicit")
+    monkeypatch.setattr(mailer.settings, "smtp_user", "noreply@example.com")
+    monkeypatch.setattr(mailer.settings, "smtp_pass", "pw")
+    monkeypatch.setattr(mailer.smtplib, "SMTP_SSL", fake_ssl)
+    monkeypatch.setattr(mailer.smtplib, "SMTP", explode)
+
+    mailer._deliver_smtp("ada@example.com", mailer.render("verify_email", VERIFY_CTX))
+
+    assert calls["host"] == "mx.example.com"
+    assert calls["port"] == 465
+    assert calls["login"] == "noreply@example.com"
+    assert calls["sent"] == "ada@example.com"
+    # A context that skips verification would happily talk to any impostor relay.
+    assert calls["verified"] == ssl.CERT_REQUIRED
 
 
 # ---------------------------------------------------------------------------

@@ -304,6 +304,38 @@ def _deliver_resend(to: str, message: Rendered) -> None:
         )
 
 
+def _smtp_client() -> smtplib.SMTP:
+    """Open an encrypted submission session.
+
+    "implicit" wraps the socket before the greeting, which is the only thing a
+    465-only listener accepts. "starttls" upgrades in-band and REQUIRES the
+    server to advertise the extension: silently continuing in plaintext would
+    put the relay password and every reset link on the wire.
+    """
+    context = ssl.create_default_context()
+    if settings.smtp_tls == "implicit":
+        return smtplib.SMTP_SSL(
+            settings.smtp_host,
+            settings.smtp_port,
+            timeout=SMTP_TIMEOUT_SEC,
+            context=context,
+        )
+    client = smtplib.SMTP(
+        settings.smtp_host, settings.smtp_port, timeout=SMTP_TIMEOUT_SEC
+    )
+    client.ehlo()
+    if not client.has_extn("starttls"):
+        client.close()
+        raise MailDeliveryError(
+            f"{settings.smtp_host}:{settings.smtp_port} does not advertise STARTTLS; "
+            "set CHUDWARE_SMTP_TLS=implicit for a TLS-only submission port such "
+            "as 465"
+        )
+    client.starttls(context=context)
+    client.ehlo()
+    return client
+
+
 def _deliver_smtp(to: str, message: Rendered) -> None:
     msg = EmailMessage()
     msg["Subject"] = message.subject
@@ -312,16 +344,12 @@ def _deliver_smtp(to: str, message: Rendered) -> None:
     msg.set_content(message.text)
     msg.add_alternative(message.html, subtype="html")
     try:
-        with smtplib.SMTP(
-            settings.smtp_host, settings.smtp_port, timeout=SMTP_TIMEOUT_SEC
-        ) as client:
-            client.ehlo()
-            if client.has_extn("starttls"):
-                client.starttls(context=ssl.create_default_context())
-                client.ehlo()
+        with _smtp_client() as client:
             if settings.smtp_user:
                 client.login(settings.smtp_user, settings.smtp_pass)
             client.send_message(msg)
+    except MailDeliveryError:
+        raise
     except (OSError, smtplib.SMTPException) as exc:
         raise MailDeliveryError(f"smtp delivery failed: {exc}") from exc
 

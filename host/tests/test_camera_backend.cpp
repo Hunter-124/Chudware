@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "tests/environment_test_support.h"
 #include "../src/platform/camera.h"
 
 using namespace chudware::platform;
@@ -30,27 +31,12 @@ static int gPass = 0, gFail = 0;
     else { ++gFail; std::fprintf(stderr, "FAIL  %s:%d  %s\n", __FILE__, __LINE__, #cond); } \
 } while(0)
 
-static void setEnvVar(const char* key, const char* value) {
-#if defined(_WIN32)
-    ::_putenv_s(key, value);
-#else
-    ::setenv(key, value, 1);
-#endif
-}
-
-static void unsetEnvVar(const char* key) {
-#if defined(_WIN32)
-    ::_putenv_s(key, "");
-#else
-    ::unsetenv(key);
-#endif
-}
 
 // CameraBackend::create() returns the real platform backend by default; the synthetic stub is
 // selected with CHUDWARE_FORCE_STUB_CAMERA=1 so CI has no hardware dependency.
 static std::unique_ptr<CameraBackend> makeStubBackend() {
-    setEnvVar("CHUDWARE_FORCE_STUB_CAMERA", "1");
-    unsetEnvVar("CHUDWARE_TEST_CAMERA");
+    chudware::test::setEnvironment("CHUDWARE_FORCE_STUB_CAMERA", "1");
+    chudware::test::unsetEnvironment("CHUDWARE_TEST_CAMERA");
     return CameraBackend::create();
 }
 
@@ -258,8 +244,8 @@ static void test_live_optional(bool live_requested) {
         std::fprintf(stdout, "live smoke skipped (CHUDWARE_TEST_CAMERA != 1)\n");
         return;
     }
-    unsetEnvVar("CHUDWARE_FORCE_STUB_CAMERA");  // real V4L2 / MF path
-    setEnvVar("CHUDWARE_TEST_CAMERA", "1");
+    chudware::test::unsetEnvironment("CHUDWARE_FORCE_STUB_CAMERA");  // real V4L2 / MF path
+    chudware::test::setEnvironment("CHUDWARE_TEST_CAMERA", "1");
 
     auto cam = CameraBackend::create();
     if (!cam) {

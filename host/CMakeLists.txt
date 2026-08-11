@@ -575,6 +575,7 @@ elseif(NOT APPLE)
 endif()   # macOS: camera_stub.cpp above is the whole backend set
 target_include_directories(test_camera_backend PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../core
   ${stb_SOURCE_DIR})
 set_target_properties(test_camera_backend PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

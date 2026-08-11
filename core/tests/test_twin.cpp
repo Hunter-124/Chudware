@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
+#include "environment_test_support.h"
 #include "twin/twin.h"
 #include "twin/wide_math.h"
 
@@ -16,18 +17,6 @@
 #include <utility>
 #include <vector>
 
-// MSVC ships these with an underscore prefix rather than the POSIX spelling, and
-// has no setenv/unsetenv at all — _putenv_s with an empty value is the documented
-// way to remove a variable. Confined to this test; the twin library itself is
-// already platform-neutral via twin/wide_math.h.
-#if defined(_MSC_VER)
-#define popen  _popen
-#define pclose _pclose
-static inline int setenv(const char* name, const char* value, int /*overwrite*/) {
-    return _putenv_s(name, value);
-}
-static inline int unsetenv(const char* name) { return _putenv_s(name, ""); }
-#endif
 
 #ifndef CHUDWARE_SOURCE_DIR
 #define CHUDWARE_SOURCE_DIR "."
@@ -108,12 +97,12 @@ std::string shellQuote(std::string_view text) {
 
 std::string subprocessHash() {
     const std::string command = shellQuote(executable_path) + " --emit-twin-hash";
-    FILE* stream = popen(command.c_str(), "r");
+    FILE* stream = chudware::test::openPipe(command.c_str(), "r");
     if (!stream) return {};
     std::string output;
     std::array<char, 128> buffer{};
     while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), stream)) output += buffer.data();
-    if (pclose(stream) != 0) return {};
+    if (chudware::test::closePipe(stream) != 0) return {};
     return output;
 }
 
@@ -240,15 +229,15 @@ TEST_CASE("host clock offset cannot affect tick-domain output") {
     const std::string saved = previous ? previous : "";
     const bool had_previous = previous != nullptr;
 
-    REQUIRE(setenv("TZ", "Pacific/Kiritimati", 1) == 0);
+    REQUIRE(chudware::test::setEnvironment("TZ", "Pacific/Kiritimati") == 0);
     tzset();
     const auto east = scenarioHash();
-    REQUIRE(setenv("TZ", "Etc/GMT+12", 1) == 0);
+    REQUIRE(chudware::test::setEnvironment("TZ", "Etc/GMT+12") == 0);
     tzset();
     const auto west = scenarioHash();
 
-    if (had_previous) setenv("TZ", saved.c_str(), 1);
-    else unsetenv("TZ");
+    if (had_previous) chudware::test::setEnvironment("TZ", saved.c_str());
+    else chudware::test::unsetEnvironment("TZ");
     tzset();
     CHECK(east == west);
 }

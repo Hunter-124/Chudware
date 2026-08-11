@@ -11,17 +11,15 @@
 #include <cstdlib>
 #include <fstream>
 
+#include "environment_test_support.h"
 #include "materials/materials.h"
 
 using namespace chudware::materials;
 using nlohmann::json;
 
 int main(int argc, char** argv) {
-#ifdef _WIN32
-    _putenv_s("CHUDWARE_MATERIALS_REGISTRY", CHUDWARE_TEST_REGISTRY);
-#else
-    setenv("CHUDWARE_MATERIALS_REGISTRY", CHUDWARE_TEST_REGISTRY, 1);
-#endif
+    chudware::test::setEnvironment("CHUDWARE_MATERIALS_REGISTRY",
+                                    CHUDWARE_TEST_REGISTRY);
     doctest::Context ctx(argc, argv);
     return ctx.run();
 }

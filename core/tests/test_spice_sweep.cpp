@@ -21,6 +21,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "environment_test_support.h"
 #include "sim/sim_cache.h"
 #include "sim/spice.h"
 #include "sim/spice_sweep.h"
@@ -82,15 +83,6 @@ bool op_equal(const json& a, const json& b, double eps = 1e-12) {
     return true;
 }
 
-void put_env(const char* k, const char* v) {
-#if defined(_WIN32)
-    if (v) _putenv_s(k, v);
-    else _putenv_s(k, "");
-#else
-    if (v) setenv(k, v, 1);
-    else unsetenv(k);
-#endif
-}
 
 }  // namespace
 
@@ -173,8 +165,8 @@ TEST_CASE("spice_sweep: divider R sweep parity + order vs serial single-runs") {
 
 TEST_CASE("spice_sweep: big sweep parallel not slower than serial + multi-worker") {
     // Force a multi-worker allotment so (b) is testable on any host.
-    put_env("CHUDWARE_GOVERNOR", nullptr);
-    put_env("CHUDWARE_SIM_THREADS", "4");
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_GOVERNOR", nullptr);
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_SIM_THREADS", "4");
     (void)chudware::pool::reconfigure_shared(0, "spice_sweep_test_prep");
     chudware::sim::cache::clear();
 
@@ -215,9 +207,9 @@ TEST_CASE("spice_sweep: big sweep parallel not slower than serial + multi-worker
         parallel_st.plan_report.c_str());
 
     // Restore a modest shared pool for any later tests in-process.
-    put_env("CHUDWARE_SIM_THREADS", "2");
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_SIM_THREADS", "2");
     (void)chudware::pool::reconfigure_shared(0, "spice_sweep_test_restore");
-    put_env("CHUDWARE_SIM_THREADS", nullptr);
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_SIM_THREADS", nullptr);
 }
 
 TEST_CASE("spice_sweep: invalid parameter and non-finite point fail honestly") {

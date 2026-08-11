@@ -13,20 +13,13 @@
 #include <thread>
 #include <vector>
 
+#include "environment_test_support.h"
 #include "util/resource_governor.h"
 #include "util/thread_pool.h"
 
 using chudware::pool::ThreadPool;
 
 namespace {
-void put_env(const char* k, const char* v) {
-#if defined(_WIN32)
-    _putenv_s(k, v ? v : "");
-#else
-    if (v) setenv(k, v, 1);
-    else unsetenv(k);
-#endif
-}
 
 double wall_ms(const std::chrono::steady_clock::time_point& t0) {
     return std::chrono::duration<double, std::milli>(
@@ -105,8 +98,8 @@ TEST_CASE("pool caps workers to governed budget under nested submits") {
 
 TEST_CASE("reconfigure_shared respects governor plan under low / ample memory") {
     const auto t0 = std::chrono::steady_clock::now();
-    put_env("CHUDWARE_GOVERNOR", nullptr);
-    put_env("CHUDWARE_SIM_THREADS", "6");
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_GOVERNOR", nullptr);
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_SIM_THREADS", "6");
 
     // Ample: tiny estimate => full allotment.
     const int ample = chudware::pool::reconfigure_shared(1ull << 20, "pool_ample");
@@ -115,7 +108,7 @@ TEST_CASE("reconfigure_shared respects governor plan under low / ample memory") 
     CHECK(chudware::governor::last_report().find("pool_ample") != std::string::npos);
 
     // Low: estimate far above budget => workers collapse toward 1.
-    put_env("CHUDWARE_MEM_CAP_GB", "1");
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_MEM_CAP_GB", "1");
     const uint64_t budget = chudware::governor::budget_bytes();
     const int tight =
         chudware::pool::reconfigure_shared(budget * 16ull + (1ull << 30), "pool_tight");
@@ -124,10 +117,10 @@ TEST_CASE("reconfigure_shared respects governor plan under low / ample memory") 
     CHECK(chudware::governor::last_report().find("pool_tight") != std::string::npos);
 
     // Restore a sane shared size for any later tests in the same process.
-    put_env("CHUDWARE_MEM_CAP_GB", nullptr);
-    put_env("CHUDWARE_SIM_THREADS", "2");
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_MEM_CAP_GB", nullptr);
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_SIM_THREADS", "2");
     (void)chudware::pool::reconfigure_shared(0, "pool_restore");
-    put_env("CHUDWARE_SIM_THREADS", nullptr);
+    chudware::test::setOrUnsetEnvironment("CHUDWARE_SIM_THREADS", nullptr);
 
     std::printf(
         "[thread_pool] reconfigure ample=%d tight=%d final_max=%d wall=%.3f ms\n",

@@ -11,35 +11,12 @@
 #include <filesystem>
 #include <fstream>
 
+#include "environment_test_support.h"
 #include "sourcing/sourcing.h"
 
 using namespace chudware::sourcing;
 using nlohmann::json;
 
-// Portable env helpers (MSVC has no POSIX setenv/unsetenv; matches the
-// _putenv_s convention used across the other core/tests/*.cpp files).
-static void test_setenv(const char* k, const char* v) {
-#ifdef _WIN32
-    _putenv_s(k, v);
-#else
-    setenv(k, v, 1);
-#endif
-}
-static void test_unsetenv(const char* k) {
-#ifdef _WIN32
-    _putenv_s(k, "");
-#else
-    unsetenv(k);
-#endif
-}
-
-static void test_set_appdata_root(const std::string& path) {
-#ifdef _WIN32
-    test_setenv("APPDATA", path.c_str());
-#else
-    test_setenv("XDG_DATA_HOME", path.c_str());
-#endif
-}
 
 // ---------------------------------------------------------------------------
 // Fixture assembly tree + board (shared by the rollup / pricing suites).
@@ -356,8 +333,8 @@ struct FakeHttp {
 };
 
 TEST_CASE("nexar provider maps a GraphQL supply hit into a priced VendorPart") {
-    test_setenv("NEXAR_CLIENT_ID", "cid");
-    test_setenv("NEXAR_CLIENT_SECRET", "cs");
+    chudware::test::setEnvironment("NEXAR_CLIENT_ID", "cid");
+    chudware::test::setEnvironment("NEXAR_CLIENT_SECRET", "cs");
     auto fake = std::make_shared<FakeHttp>();
     fake->responses.push_back({200, R"({"access_token":"tok123"})", ""});
     fake->responses.push_back({200, R"({"data":{"supSearchMpn":{"results":[{"part":{"mpn":"NE555P","manufacturer":{"name":"Texas Instruments"},"bestDatasheet":{"url":"http://x/ds.pdf"},"sellers":[{"company":{"name":"Digi-Key"},"offers":[{"inventoryLevel":1500,"moq":1,"factoryLeadDays":7,"prices":[{"price":0.55,"quantity":1,"currency":"USD"},{"price":0.42,"quantity":100,"currency":"USD"}]},{"inventoryLevel":0,"prices":[{"price":0.60,"quantity":1}]}]}]}}]}}})", ""});
@@ -384,12 +361,12 @@ TEST_CASE("nexar provider maps a GraphQL supply hit into a priced VendorPart") {
     REQUIRE(fake->urls.size() == 2);
     CHECK(fake->urls[0] == "https://identity.nexar.com/connect/token");
     CHECK(fake->urls[1] == "https://api.nexar.com/graphql");
-    test_unsetenv("NEXAR_CLIENT_ID");
-    test_unsetenv("NEXAR_CLIENT_SECRET");
+    chudware::test::unsetEnvironment("NEXAR_CLIENT_ID");
+    chudware::test::unsetEnvironment("NEXAR_CLIENT_SECRET");
 }
 
 TEST_CASE("mouser provider parses $-prices and stock strings") {
-    test_setenv("MOUSER_API_KEY", "mk");
+    chudware::test::setEnvironment("MOUSER_API_KEY", "mk");
     auto fake = std::make_shared<FakeHttp>();
     fake->responses.push_back({200, R"({"SearchResults":{"Parts":[{
         "Manufacturer":"TI","ManufacturerPartNumber":"LM358","Description":"Op Amp",
@@ -412,12 +389,12 @@ TEST_CASE("mouser provider parses $-prices and stock strings") {
     CHECK(rec["lead_time_days"] == 7);
     REQUIRE(fake->urls.size() == 1);
     CHECK(fake->urls[0].find("apiKey=mk") != std::string::npos);
-    test_unsetenv("MOUSER_API_KEY");
+    chudware::test::unsetEnvironment("MOUSER_API_KEY");
 }
 
 TEST_CASE("digikey provider maps v4 keyword search into a VendorPart") {
-    test_setenv("DIGIKEY_CLIENT_ID", "did");
-    test_setenv("DIGIKEY_CLIENT_SECRET", "ds");
+    chudware::test::setEnvironment("DIGIKEY_CLIENT_ID", "did");
+    chudware::test::setEnvironment("DIGIKEY_CLIENT_SECRET", "ds");
     auto fake = std::make_shared<FakeHttp>();
     fake->responses.push_back({200, R"({"access_token":"dtok"})", ""});
     fake->responses.push_back({200, R"({"Products":[{
@@ -440,8 +417,8 @@ TEST_CASE("digikey provider maps v4 keyword search into a VendorPart") {
     CHECK(rec["stock"] == 5000);
     CHECK(rec["moq"] == 1);
     CHECK(rec["lead_time_days"] == 56);  // 8 weeks * 7
-    test_unsetenv("DIGIKEY_CLIENT_ID");
-    test_unsetenv("DIGIKEY_CLIENT_SECRET");
+    chudware::test::unsetEnvironment("DIGIKEY_CLIENT_ID");
+    chudware::test::unsetEnvironment("DIGIKEY_CLIENT_SECRET");
 }
 
 TEST_CASE("pricing chain fails closed with no credentials (§0)") {
@@ -449,7 +426,7 @@ TEST_CASE("pricing chain fails closed with no credentials (§0)") {
     // empty scratch config: every provider declines -> null (unknown).
     for (const char* v : {"NEXAR_CLIENT_ID", "NEXAR_CLIENT_SECRET", "DIGIKEY_CLIENT_ID",
                           "DIGIKEY_CLIENT_SECRET", "MOUSER_API_KEY"})
-        test_unsetenv(v);
+        chudware::test::unsetEnvironment(v);
     CHECK(fetch_price("NE555P", Seams{}).is_null());
     // Even with a transport, keyless providers decline before any network call.
     auto fake = std::make_shared<FakeHttp>();
@@ -503,7 +480,7 @@ TEST_CASE("request_quote: keyless degrades (§0), never a network call") {
 }
 
 TEST_CASE("request_quote: xometry hit normalizes into a §4 QuoteResult") {
-    test_setenv("XOMETRY_API_KEY", "xk");
+    chudware::test::setEnvironment("XOMETRY_API_KEY", "xk");
     auto fake = std::make_shared<FakeHttp>();
     fake->responses.push_back({200, R"({"unit_price":12.5,"quote_id":"q1","lead_time_days":5})", ""});
     Seams s;
@@ -521,7 +498,7 @@ TEST_CASE("request_quote: xometry hit normalizes into a §4 QuoteResult") {
     CHECK(r["quote_id"] == "q1");
     REQUIRE(fake->urls.size() == 1);
     CHECK(fake->urls[0] == "https://api.xometry.com/v1/quote");
-    test_unsetenv("XOMETRY_API_KEY");
+    chudware::test::unsetEnvironment("XOMETRY_API_KEY");
 }
 
 // ---------------------------------------------------------------------------
@@ -704,13 +681,13 @@ int main(int argc, char** argv) {
     std::error_code ec;
     std::filesystem::remove_all(scratch, ec);
     std::filesystem::create_directories(scratch, ec);
-    test_set_appdata_root(scratch);
+    chudware::test::setEnvironment(chudware::test::appDataEnvironmentVariable(), scratch.c_str());
     // Guard against a developer's live keys leaking into the fail-closed tests.
     for (const char* v :
          {"NEXAR_CLIENT_ID", "NEXAR_CLIENT_SECRET", "DIGIKEY_CLIENT_ID",
           "DIGIKEY_CLIENT_SECRET", "MOUSER_API_KEY", "XOMETRY_API_KEY", "JLCPCB_APP_ID",
           "JLCPCB_ACCESS_KEY", "JLCPCB_SECRET_KEY", "COMMODITIES_API_KEY"})
-        test_unsetenv(v);
+        chudware::test::unsetEnvironment(v);
     doctest::Context ctx(argc, argv);
     return ctx.run();
 }

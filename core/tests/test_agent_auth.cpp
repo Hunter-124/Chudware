@@ -6,6 +6,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "environment_test_support.h"
 #include "agent/auth.h"
 #include "agent/paths.h"
 
@@ -55,18 +56,11 @@ struct ScratchConfig {
                         ) +
                 "-" + std::to_string(seq++));
         fs::create_directories(root);
-#ifdef _WIN32
-        _putenv_s("APPDATA", root.string().c_str());
-#else
-        setenv("XDG_DATA_HOME", root.c_str(), 1);
-#endif
+        chudware::test::setEnvironment(chudware::test::appDataEnvironmentVariable(),
+                                        root.string().c_str());
     }
     ~ScratchConfig() {
-#ifdef _WIN32
-        _putenv_s("APPDATA", "");
-#else
-        unsetenv("XDG_DATA_HOME");
-#endif
+        chudware::test::unsetEnvironment(chudware::test::appDataEnvironmentVariable());
         std::error_code ec;
         fs::remove_all(root, ec);
     }

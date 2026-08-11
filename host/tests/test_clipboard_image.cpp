@@ -23,6 +23,7 @@
 //   ✓ a negative seq is clamped instead of rendering "paste--001.png"
 
 #include "ui/clipboard_image.h"
+#include "tests/environment_test_support.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -193,9 +194,9 @@ int main() {
         std::printf("test_clipboard_image: could not create temp dir %s\n", tmp.string().c_str());
         return 1;
     }
-    ::setenv("XDG_DATA_HOME", tmp.string().c_str(), 1);
-    ::setenv("HOME", tmp.string().c_str(), 1);
-    ::setenv("APPDATA", tmp.string().c_str(), 1);
+    chudware::test::setEnvironment("XDG_DATA_HOME", tmp.string().c_str());
+    chudware::test::setEnvironment("HOME", tmp.string().c_str());
+    chudware::test::setEnvironment("APPDATA", tmp.string().c_str());
 
     test_is_image_attachment();
     test_image_mime_for_path();

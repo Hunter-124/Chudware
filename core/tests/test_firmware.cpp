@@ -8,6 +8,7 @@
 // (graceful toolchain_not_found / tool_not_found degradation, contract §1/§5),
 // and when the tool IS present we skip the live leg instead of faking a pass.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "environment_test_support.h"
 #include "firmware/emulator.h"
 #include "firmware/firmware_rpc.h"
 #include "firmware/pinmap.h"
@@ -37,21 +38,6 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// setenv/unsetenv portability (MSVC has _putenv only).
-void set_env(const char* key, const std::string& value) {
-#ifdef _WIN32
-    _putenv_s(key, value.c_str());
-#else
-    setenv(key, value.c_str(), 1);
-#endif
-}
-void unset_env(const char* key) {
-#ifdef _WIN32
-    _putenv_s(key, "");
-#else
-    unsetenv(key);
-#endif
-}
 
 #ifndef CHUDWARE_TEST_DATA
 #define CHUDWARE_TEST_DATA "tests/data/firmware"
@@ -95,10 +81,10 @@ struct FirmwareRootGuard {
               ("chudware-fwtest-" + std::to_string(static_cast<long long>(
                    std::chrono::system_clock::now().time_since_epoch().count())));
         fs::create_directories(dir);
-        set_env("CHUDWARE_FIRMWARE_DIR", dir.string());
+        chudware::test::setEnvironment("CHUDWARE_FIRMWARE_DIR", dir.string().c_str());
     }
     ~FirmwareRootGuard() {
-        unset_env("CHUDWARE_FIRMWARE_DIR");
+        chudware::test::unsetEnvironment("CHUDWARE_FIRMWARE_DIR");
         std::error_code ec;
         fs::remove_all(dir, ec);
     }
@@ -620,7 +606,7 @@ TEST_CASE("Renode capability-refuses untimestamped GPIO and byte-FIFO register s
     const char* old_raw = std::getenv("PATH");
     const std::optional<std::string> old_path =
         old_raw ? std::optional<std::string>(old_raw) : std::nullopt;
-    set_env("PATH", dir.string());
+    chudware::test::setEnvironment("PATH", dir.string().c_str());
     auto timed = chudware::firmware::run_simulation(
         elf.string(), "stm32f4",
         {"gpio:PA5=1@>10ms", "toggles:PA5>=2", "period:PA5=10ms+-1ms"}, 2.0);
@@ -630,9 +616,9 @@ TEST_CASE("Renode capability-refuses untimestamped GPIO and byte-FIFO register s
     auto sensor = chudware::firmware::run_simulation(
         elf.string(), "stm32f4", {}, 2.0, sensor_scenario);
     if (old_path)
-        set_env("PATH", *old_path);
+        chudware::test::setEnvironment("PATH", old_path->c_str());
     else
-        unset_env("PATH");
+        chudware::test::unsetEnvironment("PATH");
 
     CHECK(timed.passed == false);
     CHECK(timed.uart_log.find("platform_capability:") == 0);
@@ -686,13 +672,13 @@ TEST_CASE("backend process faults cannot become successful simulation") {
     const char* old_raw = std::getenv("PATH");
     const std::optional<std::string> old_path =
         old_raw ? std::optional<std::string>(old_raw) : std::nullopt;
-    set_env("PATH", dir.string());
+    chudware::test::setEnvironment("PATH", dir.string().c_str());
     auto result = chudware::firmware::run_simulation(
         elf.string(), "cortex-m4", {}, 2.0);
     if (old_path)
-        set_env("PATH", *old_path);
+        chudware::test::setEnvironment("PATH", old_path->c_str());
     else
-        unset_env("PATH");
+        chudware::test::unsetEnvironment("PATH");
 
     CHECK(result.passed == false);
     CHECK(result.uart_log.find("emulator_fault: qemu-system-arm exited with code 7") == 0);

@@ -22,6 +22,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "environment_test_support.h"
 #include "doc/stepplus.h"
 #include "sim/fea_run.h"
 #include "sim/flow_run.h"
@@ -124,14 +125,10 @@ struct EnvGuard {
         }
     }
     ~EnvGuard() {
-#if defined(_WIN32)
-        _putenv_s(name.c_str(), had_value ? value.c_str() : "");
-#else
         if (had_value)
-            setenv(name.c_str(), value.c_str(), 1);
+            chudware::test::setEnvironment(name.c_str(), value.c_str());
         else
-            unsetenv(name.c_str());
-#endif
+            chudware::test::unsetEnvironment(name.c_str());
     }
 };
 
@@ -541,20 +538,13 @@ TEST_CASE("numpy_rng: PCG64 and normal streams match NumPy reference vectors") {
 
 TEST_CASE("solver_threads: configured requests remain within the hard host cap") {
     EnvGuard guard("CHUDWARE_FEA_THREADS");
-#if defined(_WIN32)
-    _putenv_s("CHUDWARE_FEA_THREADS", "999999");
-#else
-    setenv("CHUDWARE_FEA_THREADS", "999999", 1);
-#endif
+    chudware::test::setEnvironment("CHUDWARE_FEA_THREADS", "999999");
     const int configured = chudware::sim::governed_solver_threads();
     CHECK(configured >= 1);
     CHECK(configured <= 8);
 
-#if defined(_WIN32)
-    _putenv_s("CHUDWARE_FEA_THREADS", "999999999999999999999999999999");
-#else
-    setenv("CHUDWARE_FEA_THREADS", "999999999999999999999999999999", 1);
-#endif
+    chudware::test::setEnvironment("CHUDWARE_FEA_THREADS",
+                                    "999999999999999999999999999999");
     const int overflowed = chudware::sim::governed_solver_threads();
     CHECK(overflowed >= 1);
     CHECK(overflowed <= 8);

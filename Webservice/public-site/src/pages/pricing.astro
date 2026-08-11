@@ -1,39 +1,60 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
 ---
-<BaseLayout title="Pricing" description="Straightforward Chudware plans: a 14-day trial, Desktop at $30 per month, Studio at $150 per month, and Enterprise for larger deployments.">
-  <header class="page-hero"><div class="wrap"><p class="eyebrow">Pricing</p><h1>Serious engineering tools. Clear monthly plans.</h1><p class="lede">Start with every core capability for 14 days. Choose local desktop work or add the cloud workspace when your projects need it.</p></div></header>
-  <section class="section">
+<BaseLayout title="Pricing" description="Chudware is entering commercial preview. Explore browser, native desktop, and organization access while public pricing is finalized.">
+  <header class="page-hero pricing-hero">
     <div class="wrap">
-      <table class="pricing-table">
-        <thead><tr><th scope="col">Plan</th><th scope="col">Price</th><th scope="col">Desktop</th><th scope="col">Cloud workspace</th><th scope="col">Storage</th><th scope="col">Best for</th></tr></thead>
-        <tbody>
-          <tr><td data-label="Plan"><strong>Trial</strong><small>14 days, no card</small></td><td data-label="Price">$0</td><td data-label="Desktop" class="included">Included</td><td data-label="Cloud workspace" class="included">Included</td><td data-label="Storage">5 GiB</td><td data-label="Best for">Evaluating a real project</td></tr>
-          <tr><td data-label="Plan"><strong>Desktop</strong><small>Local-first</small></td><td data-label="Price">$30 / month</td><td data-label="Desktop" class="included">Included</td><td data-label="Cloud workspace" class="not-included">Not included</td><td data-label="Storage">5 GiB</td><td data-label="Best for">Independent engineers</td></tr>
-          <tr><td data-label="Plan" class="recommended"><strong>Studio</strong><small>Desktop + cloud</small></td><td data-label="Price" class="recommended">$150 / month</td><td data-label="Desktop" class="included recommended">Included</td><td data-label="Cloud workspace" class="included recommended">Included</td><td data-label="Storage" class="recommended">100 GiB</td><td data-label="Best for" class="recommended">Connected product teams</td></tr>
-          <tr><td data-label="Plan"><strong>Enterprise</strong><small>Managed deployment</small></td><td data-label="Price"><a class="tap" href="mailto:sales@chudware.com">Contact sales</a></td><td data-label="Desktop" class="included">Included</td><td data-label="Cloud workspace" class="included">Included</td><td data-label="Storage">1 TiB</td><td data-label="Best for">Organizations with deployment and support requirements</td></tr>
-        </tbody>
-      </table>
+      <p class="eyebrow">Commercial preview</p>
+      <h1>Pricing, without placeholder numbers.</h1>
+      <p class="lede">Public rates and packaging are being finalized for launch. Rather than publish invented figures, this page shows the ways Chudware can be used and sends you to the right next step.</p>
+    </div>
+  </header>
+
+  <section class="section">
+    <div class="wrap access-grid">
+      <article class="access-option access-primary">
+        <p class="eyebrow">Browser workspace</p>
+        <h2>Open Chudware from a tab.</h2>
+        <p>Each browser seat runs in an isolated rootless container and streams the application as video. There is no desktop installation to manage.</p>
+        <ul class="fact-list"><li>Full parametric modeling workspace</li><li>Assemblies, CAM, PLM, simulation, and reverse engineering</li><li>AI copilot inside the product</li></ul>
+        <a class="button" href="https://app.chudware.com/signup">Create an account</a>
+      </article>
+      <article class="access-option">
+        <p class="eyebrow">Native desktop</p>
+        <h2>Run on your workstation.</h2>
+        <p>Native Chudware preview builds exist for Windows and Linux and are currently available on request rather than through a public release channel.</p>
+        <ul class="fact-list"><li>Windows and Linux preview builds</li><li>OCCT 7.9 geometry kernel</li><li>Access coordinated on request</li></ul>
+        <a class="button button-secondary" href="/download/">Native access details</a>
+      </article>
+      <article class="access-option access-contact">
+        <p class="eyebrow">Organizations</p>
+        <h2>Planning for multiple seats?</h2>
+        <p>Talk directly with Chudware about access, deployment, and support requirements while the commercial catalog is being finalized.</p>
+        <a class="text-link" href="mailto:sales@chudware.com">Contact sales <span aria-hidden="true">→</span></a>
+      </article>
     </div>
   </section>
 
-  <section class="section">
-    <div class="wrap">
-      <header class="section-heading"><p class="eyebrow">Copilot credits</p><h2>Add capacity when you need it.</h2><p class="lede">Credits are used only when Chudware's managed AI capacity runs work for you. Bring your own provider key at any time; BYOK usage does not consume Chudware credits.</p></header>
-      <div class="credit-grid">
-        <article class="panel credit-card"><strong>8,000 credits</strong><span>$10 one-time</span></article>
-        <article class="panel credit-card"><strong>20,000 credits</strong><span>$25 one-time</span></article>
-        <article class="panel credit-card"><strong>80,000 credits</strong><span>$100 one-time</span></article>
+  <section class="section pricing-principles">
+    <div class="wrap split">
+      <header class="section-heading">
+        <p class="eyebrow">What is settled</p>
+        <h2>The product modes are real. The public rate card is not ready.</h2>
+        <p class="lede">The browser service, isolated seat architecture, and native desktop application exist today. Exact rates, storage allowances, credit bundles, discounts, and tier boundaries will appear only after they are ratified.</p>
+      </header>
+      <div class="pricing-note">
+        <p class="eyebrow">Why this page changed</p>
+        <p>The previous pricing table used layout filler. Publishing a clean-looking guess would be less useful than being explicit about commercial-preview status.</p>
+        <p>Account creation and sales contact remain available while the final catalog is prepared.</p>
       </div>
     </div>
   </section>
 
-  <section class="section">
-    <div class="wrap split">
-      <header class="section-heading"><p class="eyebrow">Education</p><h2>50% off for verified .edu accounts.</h2><p class="lede">Students, faculty, and academic staff using a verified <code>.edu</code> email receive half-price Desktop or Studio subscriptions through separate education plans.</p><div class="actions"><a class="button button-secondary" href="https://app.chudware.com/">Verify an education account</a></div></header>
-      <div class="panel feature-card"><h3>Trial terms</h3><ul class="terms-list"><li>14 consecutive days from activation.</li><li>No payment card is required.</li><li>Desktop and cloud workspace are included during the trial.</li><li>After the trial, choose a paid plan to continue entitlement check-ins.</li><li>Your project files remain yours if you do not subscribe.</li></ul></div>
+  <section class="section cta-band">
+    <div class="wrap section-heading">
+      <p class="eyebrow">Choose a route</p>
+      <h2>Start in the browser or inspect the native build.</h2>
+      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/download/">View downloads</a></div>
     </div>
   </section>
-
-  <section class="section cta-band"><div class="wrap section-heading"><h2>Start without a purchase decision.</h2><p class="lede">Use the full trial on a real part, assembly, or manufacturing plan.</p><div class="actions"><a class="button" href="/download/">Download for free</a><a class="button button-secondary" href="/legal/terms/">Read the terms</a></div></div></section>
 </BaseLayout>

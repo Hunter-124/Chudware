@@ -1,11 +1,13 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
 ---
-<BaseLayout title="Gallery" description="Real Chudware workspaces rendered by the desktop application's scenario harness.">
-  <header class="page-hero"><div class="wrap"><p class="eyebrow">Gallery</p><h1>Product work, inside the actual product.</h1><p class="lede">These images are captured from Chudware's headless scenario harness, not composited interface mockups.</p></div></header>
-  <section class="section"><div class="wrap gallery-grid">
-    <figure class="panel gallery-card"><img src="/images/modeling.png" width="1340" height="838" alt="A parametric enclosure taking shape in the Chudware modeling workspace" /><figcaption><h2>Parametric enclosure</h2><p>Ordered box, fillet, and shell features remain editable in the feature tree while the copilot works beside the model.</p></figcaption></figure>
-    <figure class="panel gallery-card"><img src="/images/cam.png" width="1340" height="838" alt="Chudware CAM workspace showing stock, operations, and a simulated toolpath" /><figcaption><h2>Manufacturing plan</h2><p>Stock, tools, operations, simulation, and post output share the design document.</p></figcaption></figure>
-    <figure class="panel gallery-card"><img src="/images/onboarding.png" width="1340" height="838" alt="Chudware onboarding workspace setup screen" /><figcaption><h2>Guided setup</h2><p>Account, workstation profile, AI provider, and project location are explained before the first design opens.</p></figcaption></figure>
-  </div></section>
+<BaseLayout title="Gallery" description="See real Chudware modeling, manufacturing, and onboarding workspaces captured from the product.">
+  <header class="page-hero gallery-hero"><div class="wrap"><p class="eyebrow">Product gallery</p><h1>Actual product. No concept renders.</h1><p class="lede">Every image below comes from Chudware itself. They show the current interface and scenario-driven product states rather than composited marketing mockups.</p></div></header>
+  <section class="section">
+    <div class="wrap gallery-grid">
+      <figure class="gallery-card gallery-card-wide"><div class="gallery-media"><img src="/images/modeling.png" width="1340" height="838" alt="Chudware parametric modeling workspace showing an enclosure with Box, Fillet, and Shell features" /></div><figcaption><p class="eyebrow">Model</p><h2>Parametric enclosure</h2><p>A box, fillet, and shell remain visible as ordered features beside the model.</p></figcaption></figure>
+      <figure class="gallery-card"><div class="gallery-media"><img src="/images/cam.png" width="1340" height="838" alt="Chudware manufacturing workspace showing a CAM job, stock, tools, operations, and simulation controls" /></div><figcaption><p class="eyebrow">Manufacture</p><h2>CAM workspace</h2><p>Stock, tools, operations, simulation, and post-processing controls stay with the design.</p></figcaption></figure>
+      <figure class="gallery-card"><div class="gallery-media"><img src="/images/onboarding.png" width="1340" height="838" alt="Chudware onboarding screen for choosing a starting engineering workspace" /></div><figcaption><p class="eyebrow">Start</p><h2>Workspace onboarding</h2><p>Choose modeling, drawing, simulation, electronics, manufacturing, PLM, AI, reverse engineering, or another product workspace.</p></figcaption></figure>
+    </div>
+  </section>
 </BaseLayout>

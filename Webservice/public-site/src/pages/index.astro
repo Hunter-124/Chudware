@@ -1,76 +1,121 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
 ---
-<BaseLayout title="One workspace from sketch to shop floor" description="Chudware unifies parametric CAD, assemblies, CAM, PLM, and an AI copilot in one local-first engineering workspace.">
+<BaseLayout title="Parametric CAD from sketch to shop floor" description="Chudware is an OCCT-powered parametric CAD system for mechanical engineers, available in a browser or as a native Windows and Linux desktop application.">
   <section class="hero">
-    <div class="wrap hero-grid">
-      <div class="hero-copy">
-        <p class="eyebrow">CAD · CAM · PLM · AI</p>
-        <h1>Build the product. Not the toolchain.</h1>
-        <p class="lede">Chudware is a local-first mechanical engineering workspace with parametric modeling, assemblies, manufacturing, product data, and an AI copilot that works inside the model.</p>
-        <div class="actions">
-          <a class="button" href="/download/">Download Chudware</a>
-          <a class="button button-secondary" href="/docs/first-part/">Build your first part</a>
+    <div class="wrap">
+      <div class="hero-grid">
+        <div class="hero-copy">
+          <p class="eyebrow">Parametric CAD · Browser or native</p>
+          <h1>Parametric CAD, from sketch to shop floor.</h1>
+          <p class="lede">Chudware is built for mechanical engineers and product teams who want modeling, assemblies, CAM, PLM, simulation, reverse engineering, and an AI copilot in the same workspace.</p>
+          <p class="hero-note">Browser seats run in isolated rootless containers and stream to a tab. Native Windows and Linux preview builds are available on request.</p>
+          <div class="actions">
+            <a class="button" href="https://app.chudware.com/signup">Create an account</a>
+            <a class="button button-secondary" href="/gallery/">See the actual product</a>
+          </div>
         </div>
-        <p class="hero-note">14-day trial · No card · Windows, macOS, and Linux</p>
+        <figure class="product-frame">
+          <div class="product-viewport">
+            <img src="/images/modeling.png" width="1340" height="838" alt="Chudware modeling workspace showing a shelled parametric enclosure and its feature tree" />
+          </div>
+          <figcaption class="product-caption"><span>Real Chudware workspace</span><span>Feature-based model · OCCT 7.9</span></figcaption>
+        </figure>
       </div>
-      <figure class="product-frame">
-        <img src="/images/modeling.png" width="1340" height="838" alt="Chudware modeling workspace showing a shelled parametric part, feature tree, and AI copilot" />
-        <figcaption class="product-caption"><span>Parametric model · live feature history</span><span>Native desktop workspace</span></figcaption>
-      </figure>
+      <dl class="architecture-strip" aria-label="Chudware architecture at a glance">
+        <div><dt>Geometry</dt><dd>OpenCascade / OCCT 7.9</dd></div>
+        <div><dt>Browser delivery</dt><dd>Video-streamed workspace</dd></div>
+        <div><dt>Isolation</dt><dd>Rootless container per seat</dd></div>
+        <div><dt>Native</dt><dd>Windows + Linux</dd></div>
+      </dl>
     </div>
   </section>
 
-  <div class="signal-grid" aria-label="Product capabilities">
-    <div class="signal"><strong>Parametric CAD</strong><span>Sketch, feature, revise</span></div>
-    <div class="signal"><strong>Assemblies</strong><span>Mate, inspect, explode</span></div>
-    <div class="signal"><strong>CAM</strong><span>Plan, simulate, post</span></div>
-    <div class="signal"><strong>PLM</strong><span>Trace every decision</span></div>
-  </div>
+  <section class="capability-index" aria-labelledby="capabilities-title">
+    <div class="wrap">
+      <p class="eyebrow" id="capabilities-title">The engineering loop</p>
+      <ul>
+        <li>Parametric modeling</li>
+        <li>Constraint sketching</li>
+        <li>Assemblies</li>
+        <li>CAM</li>
+        <li>Simulation</li>
+        <li>Reverse engineering</li>
+        <li>PLM</li>
+      </ul>
+    </div>
+  </section>
 
-  <section class="section">
+  <section class="section" id="architecture">
+    <div class="wrap architecture-layout">
+      <header class="section-heading architecture-copy">
+        <p class="eyebrow">The architecture is the product</p>
+        <h2>Full CAD in a browser tab, without turning CAD into a web toy.</h2>
+        <p class="lede">A browser seat runs server-side in its own isolated rootless container. Chudware streams the workspace as video and sends input back to the application, so the geometry kernel and the full engineering toolchain stay intact.</p>
+        <p class="supporting-copy">Prefer local execution? Native Windows and Linux builds use the same product surface on an engineering workstation.</p>
+      </header>
+      <div class="stack-diagram" aria-label="Browser delivery architecture">
+        <div class="stack-node stack-client"><span>01</span><strong>Browser tab</strong><small>Display + input</small></div>
+        <div class="stack-link"><span>Video</span><span>Input</span></div>
+        <div class="stack-node"><span>02</span><strong>Isolated seat</strong><small>Rootless container</small></div>
+        <div class="stack-link"><span>Model state</span><span>Tool calls</span></div>
+        <div class="stack-node stack-core"><span>03</span><strong>Chudware core</strong><small>C++ · Python · TypeScript · OCCT 7.9</small></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section workbench-section">
     <div class="wrap">
       <header class="section-heading">
-        <p class="eyebrow">One source of truth</p>
-        <h2>Engineering context stays attached to the work.</h2>
-        <p class="lede">The model, manufacturing plan, revisions, artifacts, and conversations share one project. You stop translating intent between disconnected tabs.</p>
+        <p class="eyebrow">One project, not a relay race</p>
+        <h2>Keep design intent attached as the work moves downstream.</h2>
+        <p class="lede">The feature tree, manufacturing plan, product data, artifacts, and copilot activity live in one engineering environment instead of being handed between disconnected tools.</p>
       </header>
-      <div class="card-grid">
-        <article class="panel feature-card"><span class="number">01 / MODEL</span><h3>Design with intent</h3><p>Constrained sketches and ordered features make dimensions, references, and design changes explicit.</p></article>
-        <article class="panel feature-card"><span class="number">02 / MAKE</span><h3>Carry geometry into CAM</h3><p>Define stock, operations, tools, and post output without rebuilding the part in a separate application.</p></article>
-        <article class="panel feature-card"><span class="number">03 / TRACE</span><h3>Keep the why</h3><p>Project history connects revisions and artifacts so a handoff includes the decision trail—not only a final file.</p></article>
+      <div class="workbench">
+        <figure class="workbench-image">
+          <img src="/images/cam.png" width="1340" height="838" loading="lazy" alt="Chudware manufacturing workspace showing a CAM job, stock, tools, operations, and toolpath simulation" />
+          <figcaption>Captured from Chudware's real manufacturing workspace.</figcaption>
+        </figure>
+        <ol class="workflow-list">
+          <li><span>01</span><div><h3>Model with intent</h3><p>Constrained sketches and ordered features keep dimensions, references, and revisions explicit.</p></div></li>
+          <li><span>02</span><div><h3>Carry geometry into production</h3><p>Build CAM operations and inspect simulation alongside the source design.</p></div></li>
+          <li><span>03</span><div><h3>Trace the product</h3><p>PLM connects project history and artifacts to the engineering work that produced them.</p></div></li>
+        </ol>
       </div>
     </div>
   </section>
 
-  <section class="section">
+  <section class="section copilot-section">
     <div class="wrap split">
-      <div class="section-heading">
-        <p class="eyebrow">AI copilot</p>
-        <h2>An engineering copilot with access to the actual model.</h2>
-        <p class="lede">Ask in plain language. Chudware can inspect geometry, make bounded edits, measure the result, and show its work. You remain in control of every change and every machine action.</p>
-        <div class="actions"><a class="button button-secondary" href="/docs/ai-copilot/">How the copilot works</a></div>
-      </div>
-      <div class="panel copilot-flow" aria-label="Example copilot interaction">
-        <div class="copilot-message"><code>YOU</code>Round the enclosure edges to 3 mm and check that the wall remains at least 2 mm.</div>
-        <div class="copilot-message response"><code>CHUDWARE</code>I updated the fillet and measured the resulting shell. Minimum wall thickness is 2.00 mm. The changed feature is highlighted for review.</div>
-        <div class="copilot-message"><code>YOU</code>Save this revision and prepare a manufacturing handoff.</div>
-      </div>
+      <header class="section-heading">
+        <p class="eyebrow">AI that operates the tools</p>
+        <h2>The copilot works inside the model, not in a disconnected chat window.</h2>
+        <p class="lede">Describe the engineering intent in plain language. The copilot drives Chudware's modeling tools, and the result remains a normal, inspectable model with sketches and features.</p>
+        <div class="actions"><a class="button button-secondary" href="/docs/ai-copilot/">Read the copilot guide</a></div>
+      </header>
+      <ol class="tool-loop" aria-label="Copilot modeling loop">
+        <li><span>Intent</span><strong>Describe the part and its constraints</strong></li>
+        <li><span>Context</span><strong>Work against the open model</strong></li>
+        <li><span>Tools</span><strong>Drive the same modeling operations</strong></li>
+        <li><span>Result</span><strong>Inspect sketches, features, and geometry</strong></li>
+      </ol>
     </div>
   </section>
 
-  <section class="section">
-    <div class="wrap">
-      <header class="section-heading"><p class="eyebrow">What it replaces</p><h2>Fewer seams in the engineering loop.</h2><p class="lede">Chudware combines work that is commonly split across a CAD subscription, browser workspace, and product-data stack.</p></header>
-      <div class="replacement-grid">
-        <article class="panel replacement"><h3>Instead of Fusion</h3><ul><li>Local-first parametric modeling</li><li>CAM in the same project</li><li>AI actions visible in feature history</li></ul></article>
-        <article class="panel replacement"><h3>Instead of Onshape</h3><ul><li>Native desktop performance</li><li>Files and projects under your control</li><li>Cloud workspace available on Studio</li></ul></article>
-        <article class="panel replacement"><h3>Instead of SolidWorks</h3><ul><li>One predictable subscription</li><li>Built-in copilot and project history</li><li>Modern cross-platform workflow</li></ul></article>
-      </div>
+  <section class="section source-section">
+    <div class="wrap source-band">
+      <div><p class="eyebrow">Built as a system</p><h2>Deep software for physical products.</h2></div>
+      <p>Chudware is a large C++, Python, and TypeScript codebase built around the OpenCascade geometry kernel, a feature tree, a 2D constraint solver, manufacturing workflows, product data, and isolated streamed sessions.</p>
+      <a class="text-link" href="/changelog/">Read the changelog <span aria-hidden="true">→</span></a>
     </div>
   </section>
 
   <section class="section cta-band">
-    <div class="wrap section-heading"><p class="eyebrow">Start with a real project</p><h2>Fourteen days. No card. Your files stay yours.</h2><p class="lede">Download Chudware and take the first part from sketch to manufacturable geometry.</p><div class="actions"><a class="button" href="/download/">Download Chudware</a><a class="button button-secondary" href="/pricing/">See pricing</a></div></div>
+    <div class="wrap section-heading">
+      <p class="eyebrow">Start in the browser</p>
+      <h2>Open a full engineering workspace from a tab.</h2>
+      <p class="lede">Create an account for browser access, or ask about a native Windows or Linux preview build.</p>
+      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/download/">Native desktop details</a></div>
+    </div>
   </section>
 </BaseLayout>

@@ -10,9 +10,11 @@ if (form && input && results) {
     results.replaceChildren();
     if (!query) return;
 
-    pagefind ??= await import('/pagefind/pagefind.js');
-    await pagefind.options({ bundlePath: '/pagefind/' });
-    await pagefind.init();
+    if (!pagefind) {
+      const module = await import('/pagefind/pagefind.js');
+      pagefind = module.createInstance({ basePath: '/pagefind/', noWorker: true });
+      await pagefind.init();
+    }
     const search = await pagefind.search(query);
     const entries = await Promise.all(search.results.slice(0, 8).map((item) => item.data()));
 

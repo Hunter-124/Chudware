@@ -1,19 +1,15 @@
 ---
-title: Install on macOS
-description: Verify and open Chudware on Apple Silicon or Intel Macs.
+title: Use Chudware on macOS
+description: Open the browser-streamed Chudware workspace from a Mac.
 section: Installation
 order: 20
 ---
-## Choose the correct build
+## Use the browser workspace
 
-In **Apple menu → About This Mac**, check whether the processor is Apple silicon or Intel. Download the matching package from the [download page](/download/).
+Chudware does not currently publish a native macOS package. [Create an account](https://app.chudware.com/signup) and use the browser-streamed workspace instead; there is no desktop installer or checksum to verify.
 
-## Verify the download
+Do not download an unofficial package or bypass macOS quarantine for a file presented as Chudware.
 
-In Terminal, run `shasum -a 256` followed by a space, drag the downloaded file into the Terminal window, and press Return. Compare the result with the release manifest.
+## Native previews
 
-## Open an unsigned build
-
-Because current builds are unsigned and not notarized, macOS may quarantine the app. First try Control-clicking Chudware and choosing **Open**. If macOS still blocks it, open **System Settings → Privacy & Security**, confirm the downloaded filename and checksum, and choose **Open Anyway**.
-
-Never remove quarantine from a file whose checksum does not match the published value.
+Native preview builds currently exist for Windows and Linux and are available on request from the [access page](/download/).

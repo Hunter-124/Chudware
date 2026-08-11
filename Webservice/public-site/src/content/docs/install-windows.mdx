@@ -1,25 +1,15 @@
 ---
-title: Install on Windows
-description: Download, verify, and open the current Chudware Windows build.
+title: Windows desktop preview
+description: Request access to the Chudware Windows desktop preview.
 section: Installation
 order: 10
 ---
-## Before you begin
+## Native access is on request
 
-Use Windows 11 on a 64-bit workstation with current graphics drivers. Download the Windows package from the [download page](/download/) and copy the SHA-256 value shown beside it.
+The Windows desktop build is not yet published through a public release channel. Use the [access page](/download/) to request the Windows preview; there is no public installer or checksum to download today.
 
-## Verify the download
+Do not install a package presented as an official Chudware release from a third-party source.
 
-Open PowerShell in the folder containing the installer and run:
+## Use the browser now
 
-```powershell
-Get-FileHash .\Chudware-Setup.exe -Algorithm SHA256
-```
-
-The value must exactly match the release manifest. Delete the file and download it again if it does not.
-
-## Open an unsigned build
-
-Current builds are unsigned, so Windows may show a publisher warning. Select **More info**, confirm the filename and checksum, then choose **Run anyway**. Do not bypass the warning when the checksum differs.
-
-On first launch, sign in or begin the 14-day trial, choose where projects should be stored, and complete AI setup.
+The browser-streamed workspace requires no desktop installation. [Create an account](https://app.chudware.com/signup) to use Chudware from a Windows browser while native distribution is being prepared.

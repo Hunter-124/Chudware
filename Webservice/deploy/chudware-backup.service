@@ -1,5 +1,5 @@
 [Unit]
-Description=chudware-web data backup (PLM repos, users, chat, homes)
+Description=chudware-web data backup (PLM repos, users, chat)
 
 [Service]
 Type=oneshot

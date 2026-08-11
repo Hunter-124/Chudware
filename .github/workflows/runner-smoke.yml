@@ -1,0 +1,267 @@
+# Daily capability probe over the whole self-hosted fleet.
+#
+# Every other workflow assumes its runner still has a toolchain. When that stops
+# being true — a re-image, an OS upgrade that resets xcode-select, a full disk,
+# a service that never came back after a reboot — nothing notices until a gate
+# or a release fails, hours or weeks later, with an error that names a compile
+# step rather than the machine. This runs once a day and names the machine.
+#
+# It is deliberately side-effect free: identity, disk, and toolchain versions.
+# It builds nothing, publishes nothing, and uploads nothing, so it is safe to
+# run on every endpoint including cloudcastle-server, which is simultaneously
+# the artifact host and the production control box and is therefore the
+# endpoint whose disappearance costs the most.
+#
+# The matrix is resolved at run time from the runners API, mirroring
+# CloudCastle's macOS smoke: an endpoint that is asleep is reported as
+# unscheduled in the summary instead of queueing a row that hangs until its
+# timeout. This repository has no CI_RUNNER_ADMIN_TOKEN secret, so the
+# inventory step degrades to scheduling the full fleet and saying so — a
+# missing PAT must never turn the daily smoke into a failed run.
+#
+# rows are self-hosted by construction: the runs-on array carries literal
+# self-hosted and cloudcastle-ci labels, so no computed row can ever land on a
+# metered GitHub-hosted runner.
+name: runner-smoke
+
+on:
+  schedule:
+    # 09:17 UTC daily. Off the hour so it does not collide with every other
+    # cron on the fleet.
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel a smoke: an operator is usually watching this exact run.
+concurrency:
+  group: runner-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  runner-inventory:
+    name: Resolve online fleet capacity
+    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-livingroom]
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.inventory.outputs.matrix }}
+    steps:
+      - id: inventory
+        name: Schedule only endpoints the runners API reports online
+        shell: bash
+        env:
+          # Absent on this repository today. The step below is written so that
+          # absence is a documented degradation, not a failure.
+          RUNNER_ADMIN_TOKEN: ${{ secrets.CI_RUNNER_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::runner ${RUNNER_NAME:-unknown} has no jq; the inventory cannot be built"
+            exit 1
+          fi
+
+          # The registered fleet, one row per endpoint. Keyed by the
+          # runner-unique label so two endpoints never contend for one row.
+          fleet=$(jq -cn '[
+            {label:"livingroom-pc",      runner_os:"Linux",  runner_arch:"X64",   runner_label:"cc-linux-livingroom"},
+            {label:"hunter-workstation", runner_os:"Linux",  runner_arch:"X64",   runner_label:"cc-linux-hunter"},
+            {label:"cloudcastle-server", runner_os:"Linux",  runner_arch:"X64",   runner_label:"cc-prod-control"},
+            {label:"ryzen-7900x3d",      runner_os:"Windows",runner_arch:"X64",   runner_label:"cc-win-ryzen"},
+            {label:"dell-optiplex-7040", runner_os:"Windows",runner_arch:"X64",   runner_label:"cc-win-dell"},
+            {label:"imac-intel",         runner_os:"macOS",  runner_arch:"X64",   runner_label:"cc-mac-intel"},
+            {label:"macbook-air-m2",     runner_os:"macOS",  runner_arch:"ARM64", runner_label:"cc-mac-arm"}
+          ]')
+
+          schedule_everything() {
+            echo "::warning title=Fleet inventory unavailable::$1; every endpoint will be queued and an offline one will fail on its own timeout"
+            printf '### Fleet inventory\n\n- **all %s endpoints queued** — %s\n' \
+              "$(printf '%s' "$fleet" | jq 'length')" "$1" >> "$GITHUB_STEP_SUMMARY"
+            printf 'matrix=%s\n' "$(jq -cn --argjson f "$fleet" '{include:$f}')" >> "$GITHUB_OUTPUT"
+          }
+
+          if [ -z "${RUNNER_ADMIN_TOKEN:-}" ]; then
+            schedule_everything "CI_RUNNER_ADMIN_TOKEN is not configured on this repository, so online status cannot be confirmed"
+            exit 0
+          fi
+
+          runners=$(curl -sS --fail --max-time 30 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $RUNNER_ADMIN_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runners?per_page=100") || runners=""
+
+          if [ -z "$runners" ] || ! printf '%s' "$runners" | jq -e '.runners' >/dev/null 2>&1; then
+            schedule_everything "the runners API was unavailable or the token lacks Administration:read"
+            exit 0
+          fi
+
+          online=$(printf '%s' "$runners" | jq -c '[.runners[] | select(.status == "online") | .labels[].name] | unique')
+          scheduled=$(printf '%s' "$fleet" | jq -c --argjson online "$online" '[.[] | select(.runner_label as $l | $online | index($l))]')
+          offline=$(printf '%s' "$fleet" | jq -r --argjson online "$online" '.[] | select(.runner_label as $l | $online | index($l) | not) | .label')
+
+          {
+            echo '### Fleet inventory'
+            echo
+            printf '%s' "$scheduled" | jq -r '.[] | "- \(.label) (`\(.runner_label)`): **online, scheduled**"'
+            if [ -n "$offline" ]; then
+              printf '%s\n' "$offline" | while read -r name; do
+                [ -n "$name" ] || continue
+                echo "- ${name}: **not scheduled** — the endpoint is offline or no runner advertises its label"
+                echo "::warning title=Runner offline::${name} is not online; it was reported rather than queued"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # An empty fleet means the runners API answered but nothing matched,
+          # which is a fleet-wide outage, not a clean run.
+          if [ "$(printf '%s' "$scheduled" | jq 'length')" -eq 0 ]; then
+            echo "::error::no registered endpoint is online; the entire self-hosted fleet is unreachable"
+            exit 1
+          fi
+
+          printf 'matrix=%s\n' "$(jq -cn --argjson s "$scheduled" '{include:$s}')" >> "$GITHUB_OUTPUT"
+
+  probe:
+    name: ${{ matrix.label }} (${{ matrix.runner_label }})
+    needs: runner-inventory
+    # Literal self-hosted and cloudcastle-ci: the computed elements only choose
+    # which endpoint inside the free fleet claims the row, never whether the row
+    # lands on metered GitHub-hosted capacity.
+    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
+    timeout-minutes: 15
+    strategy:
+      # One dead endpoint must not cancel the probe of the other six — that
+      # would hide exactly the failure this workflow exists to surface.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.runner-inventory.outputs.matrix) }}
+    steps:
+      - name: Probe identity, disk, and toolchain (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "runner=${RUNNER_NAME:-unknown} host=$(hostname -s) user=$(id -un)"
+          test "$RUNNER_OS" = "${{ matrix.runner_os }}"
+          test "$RUNNER_ARCH" = "${{ matrix.runner_arch }}"
+          uname -a
+          echo "workspace=${GITHUB_WORKSPACE:-unset} temp=${RUNNER_TEMP:-unset}"
+          df -h "${RUNNER_TEMP:-/tmp}" "$HOME"
+
+          # Free space is the failure nobody predicts: a builder with 2 GB left
+          # fails a link step with an error that names the linker.
+          avail_kb="$(df -Pk "$HOME" | awk 'NR==2 {print $4}')"
+          if [ "${avail_kb}" -lt 20971520 ]; then
+            echo "::error::${RUNNER_NAME:-unknown} has $((avail_kb / 1048576)) GiB free on \$HOME; native builds need at least 20 GiB"
+            exit 1
+          fi
+
+          # Tools the build gates take for granted. Reported individually so the
+          # summary names what to reinstall.
+          missing=()
+          for tool in git python3 cmake ninja ctest; do
+            if command -v "${tool}" >/dev/null 2>&1; then
+              printf '  %-8s %s\n' "${tool}" "$(command -v "${tool}")"
+            else
+              missing+=("${tool}")
+            fi
+          done
+
+          python3 --version || true
+          cmake --version | head -n 1 || true
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # Command Line Tools only on both Macs — no full Xcode, so nothing
+            # in CI may depend on xcodebuild. Probed, not assumed.
+            sw_vers
+            xcode-select -p
+            echo "sdk-path=$(xcrun --show-sdk-path)"
+            echo "sdk-version=$(xcrun --show-sdk-version)"
+            clang --version | head -n 1
+            brew_prefix="$(brew --prefix 2>/dev/null || echo unavailable)"
+            echo "homebrew-prefix=${brew_prefix}"
+            if [ "${brew_prefix}" = "unavailable" ]; then
+              missing+=("brew")
+            # The macos-* presets build with CHUDWARE_WITH_OCCT=ON and, off
+            # Windows, ProvisionOCCT.cmake downloads nothing — it requires a
+            # system OCCT that the preset's CMAKE_PREFIX_PATH points at. A
+            # missing formula only surfaces as a find_package failure deep in
+            # native-build; catching it here names the machine a day earlier.
+            elif ! brew list --versions opencascade >/dev/null 2>&1; then
+              missing+=("opencascade (brew install opencascade)")
+            else
+              echo "opencascade=$(brew list --versions opencascade)"
+            fi
+          fi
+
+          {
+            echo '### ${{ matrix.label }}'
+            echo
+            echo "- host: \`$(hostname -s)\`, $(uname -s) $(uname -m)"
+            echo "- free on \$HOME: $((avail_kb / 1048576)) GiB"
+            if [ "${#missing[@]}" -ne 0 ]; then
+              echo "- **missing: ${missing[*]}**"
+            else
+              echo '- toolchain: complete'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::${RUNNER_NAME:-unknown} is missing: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Probe identity, disk, and toolchain (Windows)
+        if: runner.os == 'Windows'
+        # Windows PowerShell 5.1 — these hosts have no pwsh.
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host "runner=$env:RUNNER_NAME host=$env:COMPUTERNAME user=$env:USERNAME"
+          Write-Host "powershell=$($PSVersionTable.PSVersion)"
+          Write-Host (Get-CimInstance Win32_OperatingSystem).Caption
+
+          $drive = Get-PSDrive -Name ($env:USERPROFILE.Substring(0,1))
+          $freeGiB = [math]::Round($drive.Free / 1GB, 1)
+          Write-Host "free-on-$($drive.Name)=$freeGiB GiB"
+
+          $missing = @()
+          foreach ($tool in @('git', 'cmake', 'ninja', 'ctest')) {
+            $found = Get-Command $tool -ErrorAction SilentlyContinue
+            if ($found) { Write-Host ("  {0,-8} {1}" -f $tool, $found.Source) } else { $missing += $tool }
+          }
+          if (-not (Get-Command python3 -ErrorAction SilentlyContinue) -and
+              -not (Get-Command python -ErrorAction SilentlyContinue)) {
+            $missing += 'python'
+          }
+
+          # native-build enters the MSVC dev shell through vswhere; if that is
+          # gone, the Windows build leg fails with a missing-compiler error that
+          # names cl.exe rather than the machine.
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+            if ($vsPath) { Write-Host "visual-studio=$vsPath" } else { $missing += 'msvc-x64-toolset' }
+          } else {
+            $missing += 'vswhere'
+          }
+
+          if ($freeGiB -lt 20) { $missing += "disk-space (only $freeGiB GiB free)" }
+
+          $state = if ($missing.Count -eq 0) { '- toolchain: complete' } else { "- **missing: $($missing -join ', ')**" }
+          @(
+            '### ${{ matrix.label }}'
+            ''
+            "- host: ``$env:COMPUTERNAME``, Windows $env:RUNNER_ARCH"
+            "- free on $($drive.Name): $freeGiB GiB"
+            $state
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          if ($missing.Count -ne 0) {
+            Write-Host "::error::$env:RUNNER_NAME is missing: $($missing -join ', ')"
+            exit 1
+          }

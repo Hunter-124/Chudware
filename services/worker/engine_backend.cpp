@@ -23,6 +23,7 @@
 
 #include "../ipc/ipc_client.h"
 #include "../ipc/ipc_discovery.h"
+#include "util/platform_paths.h"
 
 namespace engine {
 
@@ -87,25 +88,7 @@ chudware_ipc::EngineClient* runClient() {
     return g_runClient = c;
 }
 
-std::string selfExePath() {
-#ifdef __EMSCRIPTEN__
-    return std::string();
-#elif defined(_WIN32)
-    wchar_t buf[MAX_PATH];
-    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return std::string();
-    int len = WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, nullptr, 0, nullptr, nullptr);
-    std::string out(len, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, out.data(), len, nullptr, nullptr);
-    return out;
-#else
-    char buf[4096];
-    ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n <= 0) return std::string();
-    buf[n] = 0;
-    return std::string(buf);
-#endif
-}
+std::string selfExePath() { return chudware::platform::executablePath(); }
 
 }  // namespace
 
@@ -116,9 +99,17 @@ std::string selfExePath() {
 std::string hostdBinHint() {
     namespace fs = std::filesystem;
     std::error_code ec;
-#ifdef _WIN32
+#if defined(_WIN32)
     const char* exeName = "chudware-hostd.exe";
     const char* devBuildDir = "build";  // core\build: the build.bat / MSVC preset dir
+#elif defined(__APPLE__)
+    const char* exeName = "chudware-hostd";
+    // build.sh derives the dev tree name from uname; keep the two spellings in step.
+#  if defined(__aarch64__) || defined(__arm64__)
+    const char* devBuildDir = "build-occt-macos-arm64";
+#  else
+    const char* devBuildDir = "build-occt-macos-x86_64";
+#  endif
 #else
     const char* exeName = "chudware-hostd";
     const char* devBuildDir = "build-occt-linux";

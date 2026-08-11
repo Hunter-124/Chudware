@@ -48,24 +48,47 @@ def test_challenge_is_s256():
 
 # ── Callback server ─────────────────────────────────────────────────────────
 
+def _serve_on_ephemeral_port(server, target):
+    """Start ``target`` in a thread and return ``(thread, base_url)`` for ``server``.
+
+    These tests used to hardcode ports 54999/54998 and sleep 0.3 s hoping the
+    listener had bound. Both are wrong on the CI fleet: several jobs share one
+    runner, so a fixed port collides and the loser dies in ``_make_server`` with
+    EADDRINUSE. Pass ``port=0``, let the kernel assign, then read the assigned
+    address back off the live listener. ``CallbackServer`` binds (and listens) in
+    ``_make_server`` before serving, so once ``_httpd`` is visible a connect is
+    already accepted into the backlog -- no sleep needed either.
+    """
+    t = threading.Thread(target=target)
+    t.start()
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        httpd = server._httpd
+        if httpd is not None:
+            host, port = httpd.server_address[0], httpd.server_address[1]
+            return t, "http://{0}:{1}".format(
+                "[{0}]".format(host) if ":" in host else host, port
+            )
+        time.sleep(0.005)
+    raise AssertionError("callback server never bound a port")
+
+
 def test_callback_server_captures_code():
-    server = sub_auth.CallbackServer(port=54999, path="/callback", timeout=10.0)
+    server = sub_auth.CallbackServer(port=0, path="/callback", timeout=10.0)
     result_holder = {}
 
     def run():
         result_holder["r"] = server.wait_for_callback(expected_state="xyz")
 
-    t = threading.Thread(target=run)
-    t.start()
-    time.sleep(0.3)  # let the listener bind
-    with urlopen("http://127.0.0.1:54999/callback?code=abc123&state=xyz") as resp:
+    t, base = _serve_on_ephemeral_port(server, run)
+    with urlopen(base + "/callback?code=abc123&state=xyz") as resp:
         assert resp.status == 200
     t.join(timeout=10)
     assert result_holder["r"]["code"] == "abc123"
 
 
 def test_callback_server_state_mismatch_raises():
-    server = sub_auth.CallbackServer(port=54998, path="/callback", timeout=10.0)
+    server = sub_auth.CallbackServer(port=0, path="/callback", timeout=10.0)
     err_holder = {}
 
     def run():
@@ -74,10 +97,8 @@ def test_callback_server_state_mismatch_raises():
         except Exception as e:  # noqa: BLE001
             err_holder["e"] = e
 
-    t = threading.Thread(target=run)
-    t.start()
-    time.sleep(0.3)
-    with urlopen("http://127.0.0.1:54998/callback?code=abc&state=WRONG") as resp:
+    t, base = _serve_on_ephemeral_port(server, run)
+    with urlopen(base + "/callback?code=abc&state=WRONG") as resp:
         resp.read()
     t.join(timeout=10)
     assert "state mismatch" in str(err_holder["e"]).lower()

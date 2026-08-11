@@ -9,7 +9,8 @@
 //
 //   chudware-hostd                 run (assumes already detached by the spawner)
 //   chudware-hostd --foreground    same, explicit (dev convenience)
-//   chudware-hostd --status        print daemon_status of the running instance
+//   chudware-hostd --status        product version line (stderr) + daemon_status
+//                               JSON of the running instance (stdout)
 //   chudware-hostd --stop          ask the running instance to drain and exit
 //                               (refused while agent children run; add --force
 //                               to stop them first). If the transport is dead but
@@ -17,7 +18,8 @@
 //                               SIGTERM, wait 3s, then SIGKILL; Windows
 //                               TerminateProcess (no console-ctrl route to a
 //                               DETACHED_PROCESS daemon), same JSON output.
-//   chudware-hostd --version       print build id + engine ABI
+//   chudware-hostd --version       print build id + engine ABI (ONE line; parsed
+//                               by the client staleness checks — see main())
 //
 // Startup order matters: acquire instance lock -> bind socket -> THEN load the
 // engine asynchronously. Racing clients connect immediately and see state:
@@ -42,7 +44,6 @@
 #include <cwctype>  // towlower — pidfile image-name validation in stopViaPidfile
 #include <process.h>  // _getpid
 #else
-#include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
@@ -53,11 +54,13 @@
 #include "../../services/ipc/ipc_discovery.h"
 #include "../../services/ipc/ipc_transport.h"
 #include "../../services/worker/cpp_core.h"
+#include "api/chudware_version.h"  // CHUDWARE_VERSION_LINE (generated, <build>/generated)
 #include "autosave.h"
 #include "hostd_log.h"
 #include "server.h"
 #include "tray_icon.h"
 #include "version_info.h"
+#include "util/platform_paths.h"  // executablePath / processAlive (one spelling per OS)
 #include "worker_bridge.h"
 
 static hostd::Server* g_server = nullptr;
@@ -66,6 +69,10 @@ static void trayQuitThunk(void*) {
     // When systemd supervises us (chudware-hostd.service Restart=always), a bare
     // process exit is respawned in ~2s — the tray "Quit hostd" bounce users hit.
     // systemctl --user stop is a manual stop and stays down.
+    //
+    // Linux-only: systemd, INVOCATION_ID and /proc/self/cgroup are all Linux. On
+    // Darwin and Windows nothing supervises the daemon this way, so Quit is just
+    // the in-process drain below.
     //
     // Two traps this avoids:
     //  1. INVOCATION_ID leaks into ANY process spawned from a systemd-managed
@@ -77,7 +84,7 @@ static void trayQuitThunk(void*) {
     //     blocked inside std::system. systemd SIGKILLs after TimeoutStopSec=30
     //     (observed: "failed (Result: signal) code=killed signal=KILL"). Run it
     //     async ("&") so the GTK thread returns immediately and SIGTERM does the rest.
-#ifndef _WIN32
+#if defined(__linux__)
     bool under_unit = false;
     if (const char* inv = std::getenv("INVOCATION_ID"); inv && inv[0]) {
         if (int fd = ::open("/proc/self/cgroup", O_RDONLY | O_CLOEXEC); fd >= 0) {
@@ -162,16 +169,6 @@ static BOOL WINAPI onConsoleCtrl(DWORD /*ctrlType*/) {
     return TRUE;
 }
 
-static std::string selfPath() {
-    wchar_t buf[MAX_PATH];
-    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return "";
-    int len = WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, nullptr, 0, nullptr, nullptr);
-    std::string out(len, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, out.data(), len, nullptr, nullptr);
-    return out;
-}
-
 static long selfPid() { return (long)_getpid(); }
 
 #else
@@ -180,17 +177,14 @@ static void onSignal(int) {
     if (g_server) g_server->stop();
 }
 
-static std::string selfPath() {
-    char buf[PATH_MAX];
-    ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
-    if (n <= 0) return "";
-    buf[n] = 0;
-    return buf;
-}
-
 static long selfPid() { return (long)::getpid(); }
 
 #endif
+
+// Absolute path of this daemon binary. Every client derives the instance key from
+// it, so it must be the same canonical string on all three platforms —
+// util/platform_paths.cpp owns the one per-OS spelling.
+static std::string selfPath() { return chudware::platform::executablePath(); }
 
 #ifndef _WIN32
 // Read the PID recorded in the instance lock file (diagnostics written by
@@ -209,24 +203,6 @@ static long readLockPid(const std::string& lockFile) {
     // Alive?
     if (::kill((pid_t)pid, 0) != 0) return 0;
     return pid;
-}
-
-// True while `pid` exists and is not a zombie.
-static bool pidAlive(long pid) {
-    if (pid <= 1) return false;
-    if (::kill((pid_t)pid, 0) != 0) return false;
-    char path[64];
-    std::snprintf(path, sizeof path, "/proc/%ld/stat", pid);
-    FILE* f = std::fopen(path, "r");
-    if (!f) return false;
-    char buf[512];
-    const bool ok = std::fgets(buf, sizeof buf, f) != nullptr;
-    std::fclose(f);
-    if (!ok) return true;
-    // Format: pid (comm) state ... — state is first token after the last ')'
-    const char* rp = std::strrchr(buf, ')');
-    if (!rp || !rp[1]) return true;
-    return rp[2] != 'Z';
 }
 
 // Socket-dead fallback for --stop: the accept loop is wedged (or the sock was
@@ -261,7 +237,7 @@ static int stopViaPidfile(const std::string& reason) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (std::chrono::steady_clock::now() < deadline) {
-        if (!pidAlive(pid)) {
+        if (!chudware::platform::processAlive(pid)) {
             std::printf("{\"stopped\":true,\"via\":\"pidfile\",\"pid\":%ld,"
                         "\"signal\":\"SIGTERM\"}\n",
                         pid);
@@ -279,7 +255,7 @@ static int stopViaPidfile(const std::string& reason) {
     }
     // Brief wait so callers see the process gone.
     for (int i = 0; i < 40; ++i) {
-        if (!pidAlive(pid)) break;
+        if (!chudware::platform::processAlive(pid)) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     std::printf("{\"stopped\":true,\"via\":\"pidfile\",\"pid\":%ld,"
@@ -438,10 +414,28 @@ static int controlCommand(const char* method,
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "";
     if (mode == "--version") {
+        // ONE line, "chudware-hostd <build-id>", and it must stay that way: two
+        // independent staleness checks parse this output and disagree about where
+        // to look. services/ipc/ipc_client.cpp diskBuildId() fgets() only the FIRST
+        // line and takes its last token; services/mcp/daemon_bridge.py
+        // _disk_build_id() takes the last token of the WHOLE output. A second line
+        // satisfies neither pair — it makes one of them compare a fragment of the
+        // product version against hello.git_rev and declare every daemon stale.
+        // The product version has its own surfaces: `--status` (below), the GUI's
+        // `chudware --version`, and the About modal.
         std::printf("chudware-hostd %s\n", CHUDWARE_HOSTD_BUILD_ID);
         return 0;
     }
-    if (mode == "--status") return controlCommand("daemon_status");
+    if (mode == "--status") {
+        // Banner on stderr, JSON on stdout: `--status` is documented to emit one
+        // parseable JSON document (docs/reference/PACKAGING_WINDOWS.md), so the
+        // version cannot go in front of it on stdout. In a terminal both stream to
+        // the same place; redirected, the JSON stays clean. This is THIS binary's
+        // version; the running daemon's own identity is `git_rev` in the payload,
+        // and the two differing is exactly the stale-daemon case worth seeing.
+        std::fprintf(stderr, "chudware %s\n", CHUDWARE_VERSION_LINE);
+        return controlCommand("daemon_status");
+    }
     if (mode == "--stop") {
         // Bare --stop is refused while agent children run (mission_active);
         // --stop --force stops the children (TERM -> grace -> KILL) first.

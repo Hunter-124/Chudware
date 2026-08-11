@@ -257,31 +257,21 @@
     setStatus("Failed to load users: " + (e.message || e) + " (admin only)", true);
   });
 
-  /* ---- live ops: sessions, host health, log tail ---- */
-  var opsRows = document.getElementById("ops-rows");
-  var opsEmpty = document.getElementById("ops-empty");
+  /* ---- live ops: host health, log tail ---- */
   var hostBar = document.getElementById("host-bar");
 
-  function fmtDur(sec) {
-    if (sec < 90) return sec + "s";
-    var m = Math.round(sec / 60);
-    if (m < 90) return m + "m";
-    return (sec / 3600).toFixed(1) + "h";
-  }
-
   async function refreshOps() {
-    if (!opsRows) return;
+    if (!hostBar) return;
     var data = await api("/api/admin/ops");
     var h = data.host || {};
     var bits = [];
-    bits.push((data.sessions.length) + "/" + data.limits.max_sessions + " seats");
     if (h.mem_available_gib != null) bits.push(h.mem_available_gib.toFixed(1) + " GiB RAM free");
     if (h.gpu) bits.push("VRAM " + (h.gpu.vram_used_mib / 1024).toFixed(1) + "/" +
                          (h.gpu.vram_total_mib / 1024).toFixed(1) + " GiB · GPU " + h.gpu.util_pct + "%");
     if (h.load1 != null) bits.push("load " + h.load1.toFixed(1));
-    bits.push("idle timeout " + Math.round(data.limits.idle_timeout_sec / 60) + "m");
     hostBar.textContent = "";
     hostBar.appendChild(document.createTextNode(bits.join("  ·  ") + "  ·  "));
+
     // Sibling service chips — a dead tunnel means nobody can reach the site.
     Object.keys(h.units || {}).forEach(function (name) {
       var ok = h.units[name] === "active";
@@ -292,17 +282,17 @@
       chip.textContent = name + (ok ? "" : " " + h.units[name]);
       hostBar.appendChild(chip);
     });
-    // Pause switch — REFUSE_NEW flag (shared with the disk monitor).
+    // REFUSE_NEW flag (shared with the disk monitor's disk-pressure check).
     var pause = document.createElement("button");
     pause.type = "button";
     pause.className = "rm-btn";
     pause.style.marginLeft = "8px";
     if (data.refuse_new) {
-      pause.textContent = "REFUSING new sessions — resume";
-      pause.title = "Removes the REFUSE_NEW flag so people can start seats again";
+      pause.textContent = "REFUSE_NEW set — clear";
+      pause.title = "Removes the REFUSE_NEW flag (the monitor re-creates it while disk is critical)";
     } else {
-      pause.textContent = "pause new sessions";
-      pause.title = "Touches the REFUSE_NEW flag: running seats stay, new starts get a busy message";
+      pause.textContent = "set REFUSE_NEW";
+      pause.title = "Touches the REFUSE_NEW flag the disk monitor uses to signal disk pressure";
     }
     pause.addEventListener("click", async function () {
       try {
@@ -312,51 +302,6 @@
       } catch (e) { setStatus(String(e.message || e), true); }
     });
     hostBar.appendChild(pause);
-
-    opsEmpty.style.display = data.sessions.length ? "none" : "block";
-    var seen = {};
-    data.sessions.forEach(function (s) {
-      seen[s.sid] = true;
-      var row = document.getElementById("ops-" + s.sid);
-      if (!row) {
-        row = document.createElement("div");
-        row.id = "ops-" + s.sid;
-        row.style.cssText = "display:flex;gap:14px;align-items:flex-start;border:1px solid var(--border,#2a2e36);border-radius:10px;padding:10px";
-        row.innerHTML =
-          "<img class='shot' width='224' style='border-radius:6px;background:#000;flex:none;cursor:pointer' alt='' title='Click to watch this seat live (view-only)'>" +
-          "<div style='flex:1;min-width:0'><div class='who' style='font-weight:600'></div>" +
-          "<div class='meta' style='font-size:.82rem;color:var(--muted,#8b93a3);margin-top:4px'></div></div>" +
-          "<button type='button' class='rm-btn stop' style='flex:none'>Stop</button>";
-        row.querySelector(".stop").addEventListener("click", async function () {
-          if (!confirm("Stop " + s.email + "'s session? Unsaved work in their seat is lost.")) return;
-          try { await api("/api/admin/sessions/" + s.sid + "/stop", { method: "POST" }); refreshOps(); }
-          catch (e) { setStatus(String(e.message || e), true); }
-        });
-        row.querySelector(".shot").addEventListener("click", function () {
-          // View-only noVNC spectate through the same authenticated proxy the
-          // owner uses — admins pass the proxy's owner check.
-          var base = "/stream/" + s.sid + "/";
-          window.open(base + "vnc.html?autoconnect=1&resize=scale&view_only=1&path=" +
-                      encodeURIComponent(base.slice(1) + "websockify"),
-                      "_blank", "noopener");
-        });
-        opsRows.appendChild(row);
-      }
-      row.querySelector(".who").textContent =
-        (s.display || s.email) + (s.heavy ? "  ·  GPU seat" : "");
-      row.querySelector(".meta").textContent =
-        s.email + "  ·  " + s.status + "  ·  up " + fmtDur(s.uptime_sec) +
-        "  ·  idle " + fmtDur(s.idle_sec) +
-        (s.cpu ? "  ·  cpu " + s.cpu : "") + (s.mem ? "  ·  mem " + s.mem : "");
-      var img = row.querySelector(".shot");
-      if (s.status === "running" && (!img.dataset.at || Date.now() - img.dataset.at > 10000)) {
-        img.dataset.at = Date.now();
-        img.src = "/api/admin/screenshot/" + s.sid + "?t=" + Date.now();
-      }
-    });
-    Array.prototype.slice.call(opsRows.children).forEach(function (row) {
-      if (!seen[row.id.slice(4)]) row.remove();
-    });
   }
 
   var logPre = document.getElementById("log-pre");
@@ -370,7 +315,7 @@
     refreshLog().catch(function (e) { setStatus(String(e.message || e), true); });
   });
 
-  if (opsRows) {
+  if (hostBar) {
     refreshOps().catch(function () { hostBar.textContent = "ops unavailable"; });
     setInterval(function () {
       refreshOps().catch(function () {});
@@ -392,7 +337,6 @@
         "<span class='deploy-label'>Rebuild targets</span>" +
         "<div class='deploy-targets' id='deploy-targets'>" +
           "<label><input type='checkbox' value='wasm' checked> wasm</label>" +
-          "<label><input type='checkbox' value='image'> image</label>" +
           "<label><input type='checkbox' value='engine'> engine</label>" +
         "</div>" +
         "<div class='deploy-actions'>" +
@@ -406,7 +350,7 @@
       "</div>" +
       "<pre class='deploy-log' id='deploy-log'>(no deploy log yet)</pre>";
 
-    // Insert right after the first ops/host admin-card (Live sessions).
+    // Insert right after the first admin-card (Host health).
     var firstCard = side.querySelector(".admin-card");
     if (firstCard && firstCard.nextSibling) {
       side.insertBefore(card, firstCard.nextSibling);

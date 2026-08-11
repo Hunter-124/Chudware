@@ -14,7 +14,7 @@
 # policy:
 #   python3 Webservice/deploy/cf_provision.py --sync-users
 #
-# role: admin | user;  heavy: true = GPU seat when available (≤ max_heavy).
+# role: admin | user;  heavy: reserved entitlement flag, nothing enforces it today.
 users:
   - email: demo@example.com
     display: Demo User

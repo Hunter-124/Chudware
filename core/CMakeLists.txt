@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
-project(chudware_core LANGUAGES C CXX)  # C enabled for chudware_miniz (miniz.c); the VS generator
+
+# Product version (semver from annotated git tags). Included BEFORE project() so
+# project(VERSION) carries the same numbers the generated header does. Shared
+# verbatim with the root CMakeLists.txt: core/ is also configured standalone
+# (`cmake -S core -B core/build-occt-linux`), where the root file never runs, and
+# two copies of the derive logic would drift.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ChudwareVersion.cmake")
+chudware_version_derive()
+
+project(chudware_core VERSION ${CHUDWARE_VERSION} LANGUAGES C CXX)  # C enabled for chudware_miniz (miniz.c); the VS generator
                                      # tolerates an implicit C, but Ninja/Make + GCC/Clang need it explicit.
 
 # The new pure-C++ engine (libchudware). Wave 1 = the constraint solver core; later
@@ -18,6 +27,14 @@ if(MSVC)
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# <build>/generated/api/chudware_version.h. Generated into the BUILD tree rather
+# than the source tree so `git status` stays clean and two trees configured from
+# the same checkout cannot fight over one file. Adding <build>/generated to a
+# target's include path makes `#include "api/chudware_version.h"` resolve exactly
+# the way `#include "api/libchudware.h"` resolves from ${CMAKE_CURRENT_SOURCE_DIR}.
+chudware_version_header("${CMAKE_BINARY_DIR}/generated")
+set(CHUDWARE_GENERATED_INCLUDE_DIR "${CMAKE_BINARY_DIR}/generated")
 
 # Link-time optimization (IPO/LTO). OFF by default: it's a large link-time + memory hit with
 # the OCCT-linked libchudware, and normal dev/gate builds don't need it. Turn on for release
@@ -174,11 +191,15 @@ target_link_libraries(chudware_geom PUBLIC Eigen3::Eigen)
 # C++ port of engine/doc/equations.py (the `evaluate` entry point) so the sketch
 # solver's resolve_dim() matches the Python oracle for expr:"A*B"-style dims.
 # aicm_handoff: POSIX shm / Win named mapping for tess mesh (T-PERF10).
+# platform_paths / parent_death: the one spelling per OS of "where am I", "is that
+# pid alive", and "bind this child's life to mine" — see util/platform_paths.h.
 add_library(chudware_util STATIC
   util/expr.cpp
   util/aicm_handoff.cpp
   util/resource_governor.cpp
-  util/thread_pool.cpp)
+  util/thread_pool.cpp
+  util/platform_paths.cpp
+  util/parent_death.cpp)
 target_include_directories(chudware_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_util PUBLIC Threads::Threads)
 if(UNIX AND NOT APPLE)
@@ -696,7 +717,9 @@ add_library(chudware_agent STATIC
   agent/iface_plan.cpp
   agent/pm_assist.cpp)
 target_include_directories(chudware_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(chudware_agent PUBLIC nlohmann_json::nlohmann_json)
+# chudware_util: platform_paths (executablePath) + parent_death (fork/exec child
+# hardening) for omp_bridge_client.cpp and run.cpp's worker spawn.
+target_link_libraries(chudware_agent PUBLIC nlohmann_json::nlohmann_json chudware_util)
 if(WIN32)
   target_link_libraries(chudware_agent PUBLIC winhttp bcrypt)
 else()
@@ -1294,7 +1317,13 @@ if(CHUDWARE_WITH_OCCT)
   set_target_properties(test_mesher_advanced PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mesher_advanced COMMAND test_mesher_advanced)
-  set_tests_properties(mesher_advanced PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
+  # RUN_SERIAL: mesher_advanced takes ~56 s standalone and FAILS under `ctest -j6`
+  # contention (REFACTOR_LOG.md:7003-7004) — the Netgen legs are CPU-bound and lose
+  # their budget to the parallel load, exactly like the `firmware` suite above. The
+  # timeout stays at ctest's default; serialization alone is what makes it pass.
+  set_tests_properties(mesher_advanced PROPERTIES
+    RUN_SERIAL TRUE
+    ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
 
   # Durable sim solve-state cache: FEA static HIT/MISS + .step+ studies/*.npz round-trip
   # + SPICE/CFD result cache invalidation. Needs the real mesh path (chudware_mesh) + stepplus
@@ -2070,7 +2099,9 @@ if(CHUDWARE_WITH_OCCT)
   # libchudware, exercises ping + doc_compile_cpp + the unknown-method fallback signal,
   # and asserts a real box compile produced AICM bytes — validating the entire
   # runtime-load + dependency-discovery story before any host code changes.
-  add_executable(chudware_probe api/chudware_probe.cpp)
+  # platform_paths.cpp is compiled in rather than linked from chudware_util so the
+  # probe keeps its "no core static libs" property — it is the loader smoke test.
+  add_executable(chudware_probe api/chudware_probe.cpp util/platform_paths.cpp)
   target_include_directories(chudware_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(chudware_probe PRIVATE nlohmann_json::nlohmann_json)
   set_target_properties(chudware_probe PROPERTIES
@@ -2108,9 +2139,12 @@ if(CHUDWARE_WITH_OCCT)
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_client.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker/cpp_core.cpp)
   target_include_directories(chudware-hostd PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen
+    ${CHUDWARE_GENERATED_INCLUDE_DIR})   # api/chudware_version.h (product semver)
+  # chudware_util: platform_paths (selfPath/pidAlive) + parent_death (the PDEATHSIG /
+  # kqueue-babysitter guard child_supervisor.cpp and worker_bridge.cpp fork through).
   target_link_libraries(chudware-hostd PRIVATE
-    nlohmann_json::nlohmann_json chudware_miniz chudware_manufacturing)
+    nlohmann_json::nlohmann_json chudware_miniz chudware_manufacturing chudware_util)
   if(WIN32)
     # advapi32: pipe DACL (SetEntriesInAclW), token/SID (OpenProcessToken,
     # ConvertSidToStringSidW, CreateWellKnownSid). Everything else (named pipes,

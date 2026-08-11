@@ -111,7 +111,8 @@ set_source_files_properties(
 add_executable(chudware_cef_helper
   src/ui/widgets/cef/cef_helper_main.cpp
   src/ui/widgets/cef/cef_app.cpp
-  src/ui/widgets/cef/cef_stealth.cpp)   # render-process OnContextCreated injects this
+  src/ui/widgets/cef/cef_stealth.cpp   # render-process OnContextCreated injects this
+  ../core/util/platform_paths.cpp)     # executable_dir() in the platform seam
 if(WIN32)
   target_sources(chudware_cef_helper PRIVATE src/ui/widgets/cef/cef_platform_windows.cpp)
 else()
@@ -119,7 +120,8 @@ else()
 endif()
 set_executable_target_properties(chudware_cef_helper)
 target_compile_definitions(chudware_cef_helper PRIVATE CHUDWARE_ENABLE_CEF=1)
-target_include_directories(chudware_cef_helper PRIVATE "${CEF_ROOT}" ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(chudware_cef_helper PRIVATE
+  "${CEF_ROOT}" ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/../core)
 target_link_libraries(chudware_cef_helper libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
 # Helper TUs also include CEF headers (C++20 concepts on CEF 149+).
 set_source_files_properties(

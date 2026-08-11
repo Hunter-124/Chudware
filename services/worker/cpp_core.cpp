@@ -12,7 +12,7 @@
 #  include <windows.h>
 #else
 #  include <dlfcn.h>
-#  include <unistd.h>
+#  include "util/platform_paths.h"
 #endif
 
 namespace core {
@@ -39,14 +39,17 @@ std::wstring exe_dir() {
     return slash == std::wstring::npos ? std::wstring() : p.substr(0, slash);
 }
 #elif !defined(__EMSCRIPTEN__)
-// Directory containing the running host exe (where libchudware.so is staged).
+// The engine's shared-library filename on this OS: Mach-O wants .dylib, ELF .so.
+#  if defined(__APPLE__)
+constexpr const char* kEngineLib = "libchudware.dylib";
+#  else
+constexpr const char* kEngineLib = "libchudware.so";
+#  endif
+
+// Directory containing the running host exe (where the engine is staged).
 std::string exe_dir() {
-    char buf[4096];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n <= 0) return std::string();
-    buf[n] = '\0';
-    std::string p(buf);
-    size_t slash = p.find_last_of('/');
+    const std::string p = chudware::platform::executablePath();
+    const size_t slash = p.find_last_of('/');
     return slash == std::string::npos ? std::string() : p.substr(0, slash);
 }
 #endif
@@ -65,30 +68,26 @@ bool CppCore::ensureLoaded(std::string& err) {
     err = "WASM: in-process libchudware not available (daemon mode only)";
     return false;
 #elif !defined(_WIN32)
-// POSIX: dlopen libchudware.so.
+// POSIX: dlopen the engine (libchudware.so on ELF, libchudware.dylib on Mach-O).
 // Resolve order (first successful load wins — keep this deterministic so a
 // staged dist/exe-dir binary cannot silently lose to a stale LD_LIBRARY_PATH):
-//   1. $CHUDWARE_LIBCHUDWARE (or $CHUDWARE_LIBCHUDWARE) — explicit absolute path
+//   1. $CHUDWARE_LIBCHUDWARE — explicit absolute path
 //   2. CHUDWARE_DEFAULT_LIBCHUDWARE (compile-time build-tree path, if set by CMake)
-//   3. libchudware.so next to the running host/hostd executable (staged install)
-//   4. bare "libchudware.so" via the dynamic loader (rpath / LD_LIBRARY_PATH)
+//   3. the engine next to the running host/hostd executable (staged install)
+//   4. the bare filename via the dynamic loader (rpath / LD_LIBRARY_PATH)
 // Note: when the GUI is in daemon mode (default), hostd is the process that
 // actually dlopens; the GUI only sees hostd's engine_build_id via hello.
 // A long-lived hostd holding a stale .so is the "builds go elsewhere" trap —
 // hostd self-drains on mtime change of selfBinary_ + loadedPath().
 std::vector<std::string> candidates;
-auto push_env = [&](const char* name) {
-    if (const char* env = std::getenv(name); env && env[0])
-        candidates.push_back(env);
-};
-push_env("CHUDWARE_LIBCHUDWARE");
-push_env("CHUDWARE_LIBCHUDWARE");
+if (const char* env = std::getenv("CHUDWARE_LIBCHUDWARE"); env && env[0])
+    candidates.push_back(env);
 #ifdef CHUDWARE_DEFAULT_LIBCHUDWARE
 candidates.push_back(CHUDWARE_DEFAULT_LIBCHUDWARE);  // build-tree fallback (set by CMake)
 #endif
 std::string dir = exe_dir();
-if (!dir.empty()) candidates.push_back(dir + "/libchudware.so");
-candidates.push_back("libchudware.so");  // last resort: loader search
+if (!dir.empty()) candidates.push_back(dir + "/" + kEngineLib);
+candidates.push_back(kEngineLib);  // last resort: loader search
 
 void* h = nullptr;
 std::string loadDiag;
@@ -100,7 +99,7 @@ for (const std::string& path : candidates) {
     loadDiag += "[" + path + " -> " + (de ? de : "?") + "] ";
 }
 if (!h) {
-    err = "could not load libchudware.so: " + loadDiag;
+    err = std::string("could not load ") + kEngineLib + ": " + loadDiag;
     if (const char* lp = std::getenv("CHUDWARE_LOG_FILE"); lp && lp[0]) {
         if (FILE* f = std::fopen(lp, "a")) {
             std::fprintf(f, "[diag] cpp_core load FAILED: %s\n", loadDiag.c_str());
@@ -118,7 +117,7 @@ if (!call_ || !free_ || !abi_fn_) {
     call_ = nullptr;
     free_ = nullptr;
     abi_fn_ = nullptr;
-    err = "libchudware.so missing an expected export";
+    err = std::string(kEngineLib) + " missing an expected export";
     return false;
 }
 dll_ = h;

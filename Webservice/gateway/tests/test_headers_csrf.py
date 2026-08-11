@@ -1,9 +1,8 @@
 """Security headers, auth boundary, healthz disclosure, admin-static gating,
-transfer upload caps, and chat WS identity/rate-limit/sanitization."""
+and chat WS identity/rate-limit/sanitization."""
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import sys
@@ -27,55 +26,21 @@ from gateway import app as app_mod  # noqa: E402
 from gateway import chat as chat_mod  # noqa: E402
 from gateway.config import settings  # noqa: E402
 from gateway.limits import RateLimiter  # noqa: E402
-from gateway.sessions import Session, SessionManager  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    """Per-test data root + clean session/chat state (mirrors test_gateway)."""
+    """Per-test data root + clean chat state (mirrors test_gateway)."""
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setattr(settings, "data_root", data)
     monkeypatch.setattr(settings, "dev_mode", True)
-    mgr = SessionManager(settings)
-    monkeypatch.setattr(app_mod, "manager", mgr)
-    monkeypatch.setattr("gateway.sessions.manager", mgr)
-    monkeypatch.setattr("gateway.proxy.manager", mgr)
     monkeypatch.setattr(settings, "users_file", GATEWAY_DIR / "users.yaml")
-
-    async def _no_podman(args, timeout=120.0):
-        return 0, "", ""
-
-    monkeypatch.setattr(mgr, "run_podman", _no_podman)
-
-    fake_fs = tmp_path / "container-fs"
-    fake_fs.mkdir()
-
-    async def _fake_podman_cp(src, dst, timeout=120.0):
-        import shutil
-
-        def _map(p: str) -> Path:
-            if ":" in p:
-                inner = p.split(":", 1)[1]
-                return fake_fs / inner.lstrip("/")
-            return Path(p)
-
-        s, d = _map(src), _map(dst)
-        if not s.is_file():
-            return 1, "no such file"
-        d.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(s, d)
-        return 0, ""
-
-    monkeypatch.setattr(app_mod, "_podman_cp", _fake_podman_cp)
 
     # Fresh chat store/hub per test (data_root moved).
     monkeypatch.setattr(chat_mod, "_DB_READY", False)
     monkeypatch.setattr(chat_mod, "hub", chat_mod.Hub())
-    yield mgr
-    mgr._sessions.clear()
-    mgr._by_email.clear()
-    mgr._ports_in_use.clear()
+    return data
 
 
 @pytest.fixture
@@ -113,16 +78,6 @@ def _admin_dir(monkeypatch, tmp_path):
 
 def _auth(email: str = "demo@example.com") -> dict[str, str]:
     return {"X-Dev-User": email}
-
-
-def _seed_session(mgr, email="demo@example.com"):
-    sess = Session(
-        sid="livesid", email=email, display="Demo User", slug="demo",
-        container="chudware-sess-demo", host_port=8460, heavy=False, status="ready",
-    )
-    mgr._sessions[sess.sid] = sess
-    mgr._by_email[email] = sess.sid
-    return sess
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +135,7 @@ def test_healthz_anonymous_is_bare(client):
     assert "mem_available_bytes" not in body
     assert "mem_available_gib" not in body
     assert "vram" not in body
-    assert "sessions" not in body
+    assert "engine_bridges" not in body
 
 
 def test_healthz_authenticated_gets_detail(client):
@@ -189,7 +144,7 @@ def test_healthz_authenticated_gets_detail(client):
     body = r.json()
     assert body["dev_mode"] is True
     assert "mem_available_bytes" in body
-    assert "sessions" in body
+    assert "engine_bridges" in body
 
 
 # ---------------------------------------------------------------------------
@@ -213,59 +168,8 @@ def test_admin_static_requires_admin_role(client, _admin_dir):
     assert r.status_code == 200
     assert "/static/admin.js" in r.text
     # Non-admin assets are unaffected.
-    r = client.get("/static/portal.css", headers=_auth("demo@example.com"))
+    r = client.get("/static/base.css", headers=_auth("demo@example.com"))
     assert r.status_code == 200
-
-
-# ---------------------------------------------------------------------------
-# Transfer upload caps
-# ---------------------------------------------------------------------------
-
-
-def test_transfer_oversize_content_length_413(client, monkeypatch):
-    monkeypatch.setattr(settings, "max_upload_bytes", 8)
-    files = {"file": ("big.bin", io.BytesIO(b"x" * 64), "application/octet-stream")}
-    r = client.post("/transfer", headers=_auth("demo@example.com"), files=files)
-    assert r.status_code == 413
-
-
-def test_transfer_streaming_cap_aborts_and_unlinks(client, _isolate, monkeypatch):
-    """Chunked upload (no Content-Length) must still be capped mid-stream."""
-    _seed_session(_isolate)
-    monkeypatch.setattr(settings, "max_upload_bytes", 16)
-    body = (
-        b"--X\r\n"
-        b'Content-Disposition: form-data; name="file"; filename="c.bin"\r\n'
-        b"Content-Type: application/octet-stream\r\n\r\n"
-        + b"y" * 64
-        + b"\r\n--X--\r\n"
-    )
-
-    def gen():
-        yield body  # generator => httpx sends Transfer-Encoding: chunked
-
-    r = client.post(
-        "/transfer?path=c.bin",
-        headers={
-            **_auth("demo@example.com"),
-            "Content-Type": "multipart/form-data; boundary=X",
-        },
-        content=gen(),
-    )
-    assert "content-length" not in r.request.headers
-    assert r.status_code == 413
-    # The partial temp file must be unlinked on abort.
-    tmp_dir = settings.data_root / "tmp"
-    assert not any(tmp_dir.iterdir())
-
-
-def test_transfer_within_cap_still_works(client, _isolate):
-    """Guard the hardened loop: a small upload keeps working end to end."""
-    _seed_session(_isolate)
-    files = {"file": ("ok.step", io.BytesIO(b"small"), "application/octet-stream")}
-    r = client.post("/transfer", headers=_auth("demo@example.com"), files=files)
-    assert r.status_code == 200
-    assert r.json()["bytes"] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +179,7 @@ def test_transfer_within_cap_still_works(client, _isolate):
 
 def test_dev_cookie_samesite_strict_and_secure(client):
     """testserver is plain-http but NOT localhost, so Secure must be set."""
-    r = client.get("/api/sessions", params={"dev_user": "demo@example.com"})
+    r = client.get("/api/me", params={"dev_user": "demo@example.com"})
     assert r.status_code == 200
     set_cookie = r.headers.get("set-cookie", "")
     assert "SameSite=Strict" in set_cookie
@@ -286,7 +190,7 @@ def test_dev_cookie_samesite_strict_and_secure(client):
 def test_dev_cookie_no_secure_on_plain_http_localhost(_isolate):
     """Local dev over http://localhost must keep working (no Secure flag)."""
     with TestClient(app_mod.app, base_url="http://localhost") as c:
-        r = c.get("/api/sessions", params={"dev_user": "demo@example.com"})
+        r = c.get("/api/me", params={"dev_user": "demo@example.com"})
         assert r.status_code == 200
         set_cookie = r.headers.get("set-cookie", "")
         assert "SameSite=Strict" in set_cookie

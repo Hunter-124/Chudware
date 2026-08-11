@@ -21,9 +21,6 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#if defined(__linux__)
-#include <sys/prctl.h>
-#endif
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -46,6 +43,9 @@
 #include "agent/roles.h"
 #include "agent/state.h"
 #include "doc/session.h"
+#if !defined(_WIN32)
+#include "util/parent_death.h"
+#endif
 
 namespace chudware {
 namespace agent {
@@ -639,20 +639,15 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     }
     if (pid == 0) {
         ::setpgid(0, 0);
-#if defined(__linux__)
-        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
-        if (::getppid() != parent_pid) _exit(1);
-#else
-        (void)parent_pid;
-#endif
+        // Parent-death linkage: PDEATHSIG on Linux, a kqueue babysitter on Darwin.
+        // Never returns if the host process already died.
+        platform::guardParentDeath(parent_pid);
         ::dup2(in_pipe[0], STDIN_FILENO);
         ::dup2(out_pipe[1], STDOUT_FILENO);
         ::dup2(err_pipe[1], STDERR_FILENO);
         ::close(in_pipe[0]); ::close(in_pipe[1]); ::close(out_pipe[0]); ::close(out_pipe[1]);
         ::close(err_pipe[0]); ::close(err_pipe[1]);
-#if defined(__linux__)
-        ::close_range(3, ~0U, 0);  // never leak the host process's own fds into the worker
-#endif
+        platform::closeInheritedFds(3);  // never leak the host process's own fds into the worker
         if (!repo.empty()) { if (::chdir(repo.c_str()) != 0) { /* exec from cwd; worker import fails clearly */ } }
         ::execlp(python.c_str(), python.c_str(), "-m", "services.worker_main", (char*)nullptr);
         _exit(127);

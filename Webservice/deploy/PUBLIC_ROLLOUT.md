@@ -3,6 +3,14 @@
 Written 2026-07-28 after a full audit of the gateway, the static front end, and
 the `livingroom-pc` host. Read this before widening access to anyone.
 
+> **Updated 2026-08-10:** the streamed-session product (podman session
+> containers, `/api/sessions`, the `/stream/<sid>/…` proxy, `/transfer`, the
+> session image and the `chudware-webd-sync` auto-promote units) was **removed**.
+> The gateway now serves only the WASM `/app` client and the `/engine` bridge.
+> Table rows below marked _(surface deleted)_ record findings against code that
+> no longer exists; they are kept because the reasoning still applies to the
+> surfaces that remain.
+
 ---
 
 ## 0. The one thing to understand first
@@ -22,23 +30,23 @@ the public internet at — see §4.
 
 | Severity | Issue | Fix |
 |---|---|---|
-| CRITICAL | `/stream/<sid>/<path>` used `urljoin`, so `path` could replace the upstream host — an authenticated user could make the gateway fetch `http://192.168.0.1/` inside the home LAN | `build_upstream_url()` rejects any path with a scheme/netloc/control char; result can only live under the fixed base |
+| CRITICAL | _(surface deleted)_ `/stream/<sid>/<path>` used `urljoin`, so `path` could replace the upstream host — an authenticated user could make the gateway fetch `http://192.168.0.1/` inside the home LAN | `build_upstream_url()` rejected any path with a scheme/netloc/control char. The stream proxy was deleted 2026-08-10. |
 | CRITICAL | `/workspace/*` and `/api/bucket/*` were one shared tree — any user could read, overwrite or `rmtree` any other user's files | Per-account roots via `user_slug(email)`; containment checked on the fully-resolved path; final-component symlinks rejected; `?scope=shared` is admin-only |
-| CRITICAL | `/engine` piped any user into the one shared CAD daemon, which resolves whatever absolute path it is handed | Caller must own a live session; `path_violation()` rejects any RPC naming a path outside the caller's own roots |
-| CRITICAL | Host AI provider keys (Firecrawl/Gemini/Moonshot/OpenRouter) were copied into every session container's environment | Withheld by default; opt in with `CHUDWARE_WEB_SHARE_PROVIDER_KEYS=1` |
+| CRITICAL | `/engine` piped any user into the one shared CAD daemon, which resolves whatever absolute path it is handed | `_inject_identity()` overwrites the client's claimed identity; `path_violation()` rejects any RPC naming a path outside the caller's own roots; `agent_provider_*` is admin-only; per-account bridge cap |
+| CRITICAL | _(surface deleted)_ Host AI provider keys (Firecrawl/Gemini/Moonshot/OpenRouter) were copied into every session container's environment | Session containers were deleted 2026-08-10. Host keys are now resolved server-side per request and only ever attached to a canonical, provider-matching endpoint; client-supplied credentials are stripped |
 | CRITICAL | Admin browser terminal = interactive shell as the gateway account | Off by default (`CHUDWARE_WEB_TERMINAL_ENABLED=0`); per-admin session ownership; opaque ids; session cap; idle timeout; output throttle; `MemoryMax`/`CPUQuota` on the scope |
-| HIGH | Identity headers (`Authorization`, `Cf-Access-Jwt-Assertion`, `X-Forwarded-*`) forwarded to the proxy upstream | Scrubbed before forwarding |
+| HIGH | _(surface deleted)_ Identity headers (`Authorization`, `Cf-Access-Jwt-Assertion`, `X-Forwarded-*`) forwarded to the proxy upstream | Scrubbed before forwarding; the proxy was deleted 2026-08-10 |
 | HIGH | No CSP anywhere | CSP + HSTS + Permissions-Policy + COOP added; verified zero inline scripts in served HTML |
 | HIGH | Uploads had no size cap — one request could fill the host disk | `max_upload_bytes` enforced on `Content-Length` **and** mid-stream; partial files unlinked |
 | HIGH | Unpinned deps allowing known-CVE versions of `PyJWT` / `python-multipart` | Fully `==`-pinned |
 | HIGH | `users.yaml` with real admin emails committed to the repo | Replaced with a template; runtime list lives outside the repo |
-| MEDIUM | Session ids were 48 bits (`uuid4().hex[:12]`) | `secrets.token_urlsafe(24)` |
+| MEDIUM | _(surface deleted)_ Session ids were 48 bits (`uuid4().hex[:12]`) | `secrets.token_urlsafe(24)`; the session manager was deleted 2026-08-10. Admin terminal session ids still use the wide form |
 | MEDIUM | `/healthzFOO` was unauthenticated (prefix match) | Exact-match + `/` boundary |
-| MEDIUM | `/healthz` leaked `dev_mode`, RAM, VRAM, session counts to anonymous callers | Anonymous callers get `{"ok": true}` |
+| MEDIUM | `/healthz` leaked `dev_mode`, RAM, VRAM and live-session counts to anonymous callers | Anonymous callers get `{"ok": true}` |
 | MEDIUM | `/static/admin.*` readable by any authenticated user | Admin-gated |
 | MEDIUM | Chat WebSocket had a `?email=` identity fallback | Deleted |
 | MEDIUM | `_valid_project` / `admin_browse` accepted any absolute host path | Confined to `CHUDWARE_WEB_PROJECT_ROOTS` |
-| MEDIUM | No per-user rate limits or quotas anywhere | `limits.py`: per-account rate limiters, upload caps, disk quota, session caps, hard session lifetime |
+| MEDIUM | No per-user rate limits or quotas anywhere | `limits.py`: per-account rate limiters, upload caps, disk quota; `/engine` bridge cap per account |
 | LOW | `admin_logs` returned raw journal output that can contain tokens | Redaction pass for JWTs, `cfat_`, `Bearer`, `*_KEY=`/`*_SECRET=`/`*_TOKEN=` |
 | LOW | Release filenames could inject into `Content-Disposition` | `[A-Za-z0-9._-]{1,128}` only |
 
@@ -74,19 +82,20 @@ Admin API: `GET /api/admin/accounts`, `.../approve|deny|suspend|plan`,
 These are real and currently unaddressed. Listed in the order they matter.
 
 1. **Plan entitlements are defined but not enforced.** `plans.py` declares
-   session/storage/token limits per tier and `/api/billing/status` reports them,
-   but `sessions.py` never consults a plan. Today a `free` account and a `team`
-   account get identical resources. Monetization is not functional until the
-   plan is wired into `manager.start()` (concurrency + heavy seat) and into the
-   quota check (storage).
+   storage/token limits per tier and `/api/billing/status` reports them, but
+   nothing consults a plan. Today a `free` account and a `team` account get
+   identical resources. Monetization is not functional until the plan is wired
+   into the disk-quota check (storage) and the token budget.
 2. **No LLM token metering.** `monthly_llm_tokens` is a number in a dataclass.
    Nothing counts tokens, nothing stops a user spending your provider balance.
-   With shared host keys now withheld by default this is contained, but the
-   moment you re-enable them or bill for copilot use, you need real metering.
+   Every web turn spends the **host account's** provider balance — there is no
+   per-user credential and no per-user budget. This is the single biggest
+   unpriced cost in the service; it must be metered before you bill for copilot
+   use or open registration.
 3. **The CAD daemon is still one shared process.** The path jail stops user A
    naming user B's files, but a malformed or expensive RPC still degrades the
-   daemon for *everyone*. True isolation needs a daemon per session (or per
-   user), bound to a per-user socket.
+   daemon for *everyone*. True isolation needs a daemon per user, bound to a
+   per-user socket.
 4. **Host blast radius.** The gateway account `liveuser` is in `wheel` with
    `NOPASSWD: ALL` and holds SSH private keys to another LAN machine
    (`192.168.0.123`). Any RCE in the web app is root on the box and a pivot into
@@ -189,10 +198,10 @@ they never un-approve the human.
 2. Apply `harden_host.sh` items — `updates` and `firewall` first, `sudo` and
    `sshd` once you have a second admin account and a verified key login.
 3. Deploy the current gateway (it is several commits behind; the box runs
-   `21e2356c`). Verify `/healthz` and one real session.
+   `21e2356c`). Verify `/healthz` and one real `/app` session end to end.
 4. Publish the Pages site and do the DNS/Access cutover (§5).
-5. Wire plan entitlements into `sessions.py` (§3.1) — this is the gate for
-   taking money.
+5. Wire plan entitlements into the disk-quota and token paths (§3.1) — this is
+   the gate for taking money.
 6. Add token metering (§3.2), then enable Stripe.
 7. Only then set `CHUDWARE_WEB_AUTO_APPROVE_DOMAINS=` and open registration.
 
@@ -223,8 +232,10 @@ showed up by driving the real thing. Worth remembering when hardening further:
    bootstrap script needed a hash. Fixed in `appserve.py`, which now derives
    inline-script hashes from the file on disk so a rebuild refreshes them.
 2. **Requiring a container seat on `/engine` took the web client offline.**
-   `/app` is browser-native and never has a podman seat. Isolation belongs to
-   `_inject_identity` + `path_violation()`, not to seat ownership.
+   `/app` is browser-native and never had a podman seat. Isolation belongs to
+   `_inject_identity` + `path_violation()`, not to seat ownership. (The seat
+   requirement, and the whole container product, were removed 2026-08-10; the
+   lesson is why `/engine` authorizes on identity alone today.)
 3. **The terminal declared dead sessions on every deploy.** `shell_died` only
    meant the `tmux attach` client died, which happens on every gateway restart
    while the tmux server survives.
@@ -241,18 +252,18 @@ cd /home/liveuser/Repositories/CAD && EMSDK=$HOME/.emsdk ./build.sh wasm
 ```
 
 That restages `~/chudware-web/app`. It is a long emscripten build — run it when
-you can watch it. Log lands in `/tmp/chudware-webd-sync-wasm.log`. Note
-`chudware-webd-sync.path` only fires on a rebuilt `chudware-hostd` binary, so a
-source-only pull will never trigger it.
+you can watch it. `install_webd.sh` also builds it as part of a joint release
+(log: `/tmp/chudware-webd-wasm.log`). Nothing promotes a new engine build
+automatically — run `update.sh` or `install_webd.sh --restart` yourself.
 
-**2. Two switches are ON for convenience and must be flipped before public
-registration** (both commented in `~/chudware-web-data/gateway.env`):
-`CHUDWARE_WEB_TERMINAL_ENABLED=1` and `CHUDWARE_WEB_SHARE_PROVIDER_KEYS=1`.
+**2. One switch is ON for convenience and must be flipped before public
+registration** (commented in `~/chudware-web-data/gateway.env`):
+`CHUDWARE_WEB_TERMINAL_ENABLED=1`.
 
 **3. The blockers in §3 are unchanged** — plan entitlements still are not
-enforced (`sessions.py` never reads a plan), there is no token metering, the
-CAD daemon is still one shared process, `liveuser` still has NOPASSWD sudo plus
-LAN SSH keys, and the Cloudflare API token in git history is still live.
+enforced (nothing reads a plan), there is no token metering, the CAD daemon is
+still one shared process, `liveuser` still has NOPASSWD sudo plus LAN SSH keys,
+and the Cloudflare API token in git history is still live.
 
 ### Operating notes
 

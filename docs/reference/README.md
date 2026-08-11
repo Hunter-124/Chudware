@@ -1,7 +1,10 @@
-# docs/reference/ — clean-room CAD format & data-model reference
+# docs/reference/ — build & packaging guides, runbooks, and the clean-room CAD reference
 
-This directory holds general-purpose CAD reference material — **not** Chudware
-design docs. It was folded in from a sibling clean-room project, **Clean Engine**
+This directory holds two distinct kinds of material, and the distinction is
+load-bearing.
+
+The **clean-room CAD format & data-model reference** was folded in from a
+sibling clean-room project, **Clean Engine**
 (`D:\Clean Engine\ODA\`), whose README states explicitly that its contents are
 sourced *only* from public specifications, ISO/ASTM/ASPRS standards, and
 vendor-published developer documentation — never from any proprietary binary or
@@ -9,9 +12,19 @@ decompiled code. That clean-room framing is preserved verbatim in each file belo
 treat it as load-bearing (it's what keeps this material safe to have in the tree
 alongside a product with license obligations — see `contracts/licenses.md`).
 
-Nothing in this directory describes Chudware internals. It describes the public
-CAD format landscape and the classic AutoCAD-lineage data model, then cross-links
-to where this repo's *actual* interop surface sits today.
+The **clean-room CAD-format set** — the three files under **Contents** below —
+describes the public CAD format landscape and the classic AutoCAD-lineage data
+model, then cross-links to where this repo's *actual* interop surface sits
+today. Nothing in that set describes Chudware internals, and the rule in
+**Keeping this clean** governs it.
+
+This directory has since also become the home for Chudware's own build,
+packaging and operations references — `HOSTD.md`, `BUILD_WINDOWS.md`,
+`PACKAGING_WINDOWS.md`, `CI_RUNNERS.md`, `serving_runbook.md`, and the demo and
+degradation notes — which is what `docs/README.md` says this folder is for
+("build/packaging guides, CAD data-model and file-format references, runbooks").
+Those files do describe Chudware internals; the clean-room rule does not apply
+to them, and they are not part of the set listed below.
 
 ## Contents
 

@@ -1,4 +1,4 @@
-"""chudware-web gateway — portal, sessions, stream proxy, chat, transfer."""
+"""chudware-web gateway — portal, chat, engine bridge, workspace, admin."""
 
 from __future__ import annotations
 
@@ -9,30 +9,22 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
+from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.background import BackgroundTask
 
 try:
     from .auth import AuthMiddleware, User, get_current_user
     from .config import settings
-    from .limits import enforce_upload_size, uploads
-    from .proxy import router as proxy_router
-    from .sessions import SessionBusy, PodmanError, manager, mem_available_bytes, mem_available_gib
     from .chat import Presence, presence, router as chat_router  # noqa: F401
     from .bucket import router as bucket_router
 except ImportError:  # uvicorn app:app from package dir
     from auth import AuthMiddleware, User, get_current_user
     from config import settings
-    from limits import enforce_upload_size, uploads
-    from proxy import router as proxy_router
-    from sessions import SessionBusy, PodmanError, manager, mem_available_bytes, mem_available_gib
     from chat import Presence, presence, router as chat_router  # noqa: F401
     from bucket import router as bucket_router
 
@@ -113,7 +105,6 @@ async def _security_headers(request: Request, call_next):
     return resp
 
 
-sessions_router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 admin_router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 
@@ -202,10 +193,10 @@ def _in_project_roots(path: Path) -> bool:
 
 
 def _valid_project(p: str) -> bool:
-    """A PLM project name, or an absolute host directory (bind-mounted into sessions).
+    """A PLM project name, or an absolute host directory.
 
     Absolute paths must sit inside settings.project_roots — otherwise any admin
-    could bind-mount /etc or another user's home into every session.
+    could point the site-wide default project at /etc or another user's home.
     """
     if p.startswith("/"):
         if ".." in p.split("/"):
@@ -312,6 +303,24 @@ async def admin_remove_user(email: str, request: Request) -> dict[str, Any]:
     return {"ok": True, "removed": email, "access_policy": sync}
 
 
+def mem_available_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+
+def mem_available_gib() -> float | None:
+    b = mem_available_bytes()
+    if b is None:
+        return None
+    return b / (1024**3)
+
+
 def _gpu_info() -> dict[str, Any] | None:
     try:
         out = subprocess.run(
@@ -345,26 +354,13 @@ def _unit_health() -> dict[str, str]:
 
 @admin_router.get("/ops")
 async def admin_ops(request: Request) -> dict[str, Any]:
-    """Live sessions + host health for the admin dashboard."""
+    """Host health for the admin dashboard."""
     _require_admin(request)
-    stats = await manager.container_stats()
-    now = time.time()
-    sessions = []
-    for s in manager.list_sessions():
-        st = stats.get(s.container, {})
-        sessions.append({
-            "sid": s.sid, "email": s.email, "display": s.display,
-            "heavy": s.heavy, "status": s.portal_status(),
-            "uptime_sec": int(now - s.created_at),
-            "idle_sec": int(now - s.last_activity),
-            "cpu": st.get("cpu"), "mem": st.get("mem"),
-        })
     try:
         load = os.getloadavg()[0]
     except OSError:
         load = None
     return {
-        "sessions": sessions,
         "host": {
             "mem_available_gib": mem_available_gib(),
             "load1": load,
@@ -372,17 +368,15 @@ async def admin_ops(request: Request) -> dict[str, Any]:
             "units": _unit_health(),
         },
         "refuse_new": settings.refuse_new_flag.exists(),
-        "limits": {"max_sessions": settings.max_sessions, "max_heavy": settings.max_heavy,
-                   "idle_timeout_sec": settings.idle_timeout_sec},
     }
 
 
 @admin_router.put("/refuse-new")
 async def admin_refuse_new(request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    """Pause/resume NEW session starts (running seats unaffected).
+    """Set/clear the REFUSE_NEW disk-pressure flag by hand.
 
-    Same REFUSE_NEW flag file the disk monitor uses — the monitor may
-    re-create it while disk is critical, so a manual clear can be overridden.
+    Same flag file the disk monitor uses — the monitor may re-create it while
+    disk is critical, so a manual clear can be overridden on its next sample.
     """
     _require_admin(request)
     flag = settings.refuse_new_flag
@@ -393,21 +387,12 @@ async def admin_refuse_new(request: Request, body: dict[str, Any]) -> dict[str, 
     return {"ok": True, "refuse_new": flag.exists()}
 
 
-@admin_router.post("/sessions/{sid}/stop")
-async def admin_stop_session(sid: str, request: Request) -> dict[str, Any]:
-    _require_admin(request)
-    sess = await manager.stop(sid)
-    if sess is None:
-        raise HTTPException(status_code=404, detail="no such session")
-    return {"ok": True, "sid": sid, "email": sess.email}
-
-
 @admin_router.patch("/users/{email}")
 async def admin_edit_user(email: str, request: Request, body: dict[str, Any]) -> dict[str, Any]:
     """Edit display/role/heavy/project/doc in place (no remove+re-add dance).
 
     Email itself is immutable — it is the Access identity; add a new entry
-    instead. Live sessions keep their current seat; changes apply next start.
+    instead.
     """
     admin = _require_admin(request)
     email = email.strip().lower()
@@ -439,18 +424,6 @@ async def admin_edit_user(email: str, request: Request, body: dict[str, Any]) ->
     user_directory.upsert(replace(user, **fields))
     return {"ok": True, "user": _user_dict(user_directory.get(email))}
 
-
-@admin_router.get("/screenshot/{sid}")
-async def admin_screenshot(sid: str, request: Request) -> Response:
-    _require_admin(request)
-    sess = manager.get(sid)
-    if sess is None or sess.status not in {"ready", "starting"}:
-        raise HTTPException(status_code=404, detail="no such session")
-    png = await manager.screenshot_png(sess)
-    if png is None:
-        raise HTTPException(status_code=503, detail="screenshot unavailable")
-    return Response(png, media_type="image/png",
-                    headers={"Cache-Control": "no-store"})
 
 
 # Obvious secret shapes that may land in the gateway journal (auth headers,
@@ -516,238 +489,7 @@ async def _startup() -> None:
             "accounts: CHUDWARE_WEB_AUTO_APPROVE_DOMAINS is unset — every new "
             "identity lands in the pending queue and must be approved in /admin"
         )
-    await manager.adopt_running()
-    await manager.start_reaper()
-    log.info(
-        "gateway up data_root=%s max_sessions=%s max_heavy=%s dev=%s",
-        settings.data_root,
-        settings.max_sessions,
-        settings.max_heavy,
-        settings.dev_mode,
-    )
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    await manager.stop_reaper()
-
-
-@sessions_router.get("")
-async def sessions_status(request: Request) -> dict[str, Any]:
-    user = get_current_user(request)
-    sess = manager.get_for_user(user.email)
-    return manager.portal_payload(sess)
-
-
-@sessions_router.post("")
-async def sessions_start(request: Request) -> dict[str, Any]:
-    user = get_current_user(request)
-    # Site-wide default project: users without an explicit project inherit it
-    # (and its auto-open part).
-    if not user.project and user_directory.default_project:
-        user = replace(user, project=user_directory.default_project,
-                       doc=user.doc or user_directory.default_doc)
-    try:
-        sess = await manager.start(user)
-    except HTTPException:
-        # Rate-limit (429) and other deliberate HTTP errors raised inside the
-        # manager must keep their status and Retry-After headers, not be
-        # flattened into a 500 by the broad handler below.
-        raise
-    except SessionBusy as exc:
-        raise HTTPException(status_code=503, detail=exc.message) from exc
-    except PodmanError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        log.exception("start failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return manager.portal_payload(
-        sess, message="started" if sess.status == "ready" else sess.status
-    )
-
-
-@sessions_router.delete("")
-async def sessions_stop(request: Request) -> dict[str, Any]:
-    user = get_current_user(request)
-    sess = await manager.stop_for_user(user.email)
-    if sess is None:
-        return manager.portal_payload(None, message="no session")
-    return {
-        "status": "stopped",
-        "sid": sess.sid,
-        "stream_path": None,
-        "stream_url": None,
-        "heavy": sess.heavy,
-        "error": None,
-        "message": "stopped",
-    }
-
-
-@sessions_router.post("/paste")
-async def sessions_paste(request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    """Type clipboard text into the caller's running session (xdotool).
-
-    The stream iframe can't reach the container's X clipboard from the
-    browser, so this is the paste path for AI keys, dimensions, chat text.
-    """
-    user = get_current_user(request)
-    sess = manager.get_for_user(user.email)
-    if sess is None or sess.status != "ready":
-        raise HTTPException(status_code=409, detail="no running session")
-    text = str(body.get("text") or "")
-    if not text:
-        raise HTTPException(status_code=400, detail="text required")
-    if len(text) > 20000:
-        raise HTTPException(status_code=413, detail="text too large (20k max)")
-    ok, msg = await manager.paste_text(sess, text)
-    if not ok:
-        raise HTTPException(status_code=503, detail=f"paste failed: {msg}")
-    return {"ok": True, "chars": len(text)}
-
-
-@sessions_router.get("/{sid}")
-async def sessions_get(sid: str, request: Request) -> dict[str, Any]:
-    user = get_current_user(request)
-    sess = manager.get(sid)
-    if sess is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    if sess.email != user.email and user.role != "admin":
-        raise HTTPException(status_code=403, detail="forbidden")
-    return manager.portal_payload(sess)
-
-
-async def _podman_cp(src: str, dst: str, *, timeout: float = 120.0) -> tuple[int, str]:
-    """`podman cp` into/out of the user's RUNNING session container.
-
-    HOME volumes are :U-chowned into the subuid range and keep host SELinux
-    labels, so direct host-side writes produce files the container cannot
-    read; `podman cp` handles both the userns mapping and labeling.
-    """
-    proc = await asyncio.create_subprocess_exec(
-        "podman", "cp", src, dst,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise HTTPException(status_code=504, detail="file operation timed out")
-    return proc.returncode or 0, (err or out or b"").decode("utf-8", errors="replace")
-
-
-def _live_session_for(request: Request) -> tuple[User, "object"]:
-    user = get_current_user(request)
-    sess = manager.get_for_user(user.email)
-    if sess is None or sess.status not in {"starting", "ready"}:
-        raise HTTPException(
-            status_code=409,
-            detail="no running session — start your session first, then transfer files",
-        )
-    return user, sess
-
-
-def _safe_rel(rel: str) -> str:
-    """Validate a container-side relative path under /home/user."""
-    rel = (rel or "").lstrip("/")
-    if not rel or rel in {".", "./"}:
-        raise HTTPException(status_code=400, detail="path required")
-    if "\x00" in rel or rel.startswith("~"):
-        raise HTTPException(status_code=400, detail="invalid path")
-    parts = Path(rel).parts
-    if ".." in parts:
-        raise HTTPException(status_code=400, detail="path traversal rejected")
-    return str(Path(*parts))
-
-
-@app.post("/transfer")
-async def transfer_upload(
-    request: Request,
-    file: UploadFile = File(...),
-    path: str = Query(default="", description="relative path under the session home"),
-) -> dict[str, Any]:
-    user = get_current_user(request)
-    uploads.enforce(user.email, "uploads")
-    # Chunked uploads carry no Content-Length, so enforce the byte cap BOTH
-    # up front (fast reject before a byte is buffered) and while streaming
-    # (unlinking the partial temp file on abort) — an unbounded stream to a
-    # host temp file lets any account fill the host disk.
-    cl = request.headers.get("content-length", "").strip()
-    cap = enforce_upload_size(int(cl) if cl.isdigit() else None)
-    user, sess = _live_session_for(request)
-    rel = _safe_rel(path or file.filename or "")
-
-    tmp_dir = settings.data_root / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    size = 0
-    with tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-        try:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > cap:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"upload too large — {cap // (1024 * 1024)} MiB max",
-                    )
-                tmp.write(chunk)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise
-    try:
-        parent = str(Path("/home/user") / Path(rel).parent)
-        if parent not in {"/home/user", "/home/user/."}:
-            # podman cp cannot create intermediate directories
-            await manager.run_podman(
-                ["exec", sess.container, "mkdir", "-p", parent], timeout=30
-            )
-        rc, msg = await _podman_cp(str(tmp_path), f"{sess.container}:/home/user/{rel}")
-        if rc != 0:
-            raise HTTPException(status_code=500, detail=f"upload failed: {msg.strip()}")
-    finally:
-        tmp_path.unlink(missing_ok=True)
-    return {"ok": True, "path": rel, "bytes": size}
-
-
-@app.get("/transfer")
-async def transfer_download(
-    request: Request,
-    path: str = Query(..., description="relative path under the session home"),
-) -> FileResponse:
-    user, sess = _live_session_for(request)
-    rel = _safe_rel(path)
-
-    tmp_dir = settings.data_root / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    tmp = tempfile.NamedTemporaryFile(dir=tmp_dir, delete=False)
-    tmp.close()
-    rc, msg = await _podman_cp(f"{sess.container}:/home/user/{rel}", tmp.name)
-    if rc != 0:
-        Path(tmp.name).unlink(missing_ok=True)
-        raise HTTPException(status_code=404, detail="file not found")
-    return FileResponse(
-        tmp.name,
-        filename=Path(rel).name,
-        background=BackgroundTask(lambda: Path(tmp.name).unlink(missing_ok=True)),
-    )
-
-
-def _image_present() -> bool:
-    try:
-        r = subprocess.run(
-            ["podman", "image", "exists", settings.session_image],
-            capture_output=True,
-            timeout=2,
-            check=False,
-        )
-        return r.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+    log.info("gateway up data_root=%s dev=%s", settings.data_root, settings.dev_mode)
 
 
 # nvidia-smi on a box with a dead driver (e.g. livingroom 1050 Ti, no module)
@@ -793,9 +535,9 @@ def _nvidia_vram() -> dict[str, Any] | None:
 @app.get("/healthz")
 async def healthz(request: Request) -> dict[str, Any]:
     # /healthz is on the public allowlist for uptime probes — anonymous
-    # callers get a bare liveness result ONLY. Host memory/GPU/session
-    # telemetry and dev_mode stay behind auth (AuthMiddleware soft-attaches
-    # the user when valid credentials ride along on a public path).
+    # callers get a bare liveness result ONLY. Host memory/GPU telemetry and
+    # dev_mode stay behind auth (AuthMiddleware soft-attaches the user when
+    # valid credentials ride along on a public path).
     if getattr(request.state, "user", None) is None:
         return {"ok": True}
     mem_b = mem_available_bytes()
@@ -805,24 +547,15 @@ async def healthz(request: Request) -> dict[str, Any]:
         presence_n = len(online) if online is not None else 0
     except Exception:  # noqa: BLE001
         presence_n = None
-    # Shell-outs (podman / nvidia-smi) must not block the asyncio loop —
-    # a wedged nvidia driver previously made every /healthz take ~5s and
-    # stalled concurrent portal traffic on the same worker.
-    image_present, vram = await asyncio.gather(
-        asyncio.to_thread(_image_present),
-        asyncio.to_thread(_nvidia_vram),
-    )
+    # The nvidia-smi shell-out must not block the asyncio loop — a wedged
+    # driver previously made every /healthz take ~5s and stalled concurrent
+    # portal traffic on the same worker.
+    vram = await asyncio.to_thread(_nvidia_vram)
     return {
         "ok": True,
-        "sessions": manager.active_count(),
-        "heavy_sessions": manager.heavy_count(),
-        "max_sessions": settings.max_sessions,
-        "max_heavy": settings.max_heavy,
         "mem_available_bytes": mem_b,
         "mem_available_gib": round(mem_g, 2) if mem_g is not None else None,
         "refuse_new": settings.refuse_new_flag.exists(),
-        "image": settings.session_image,
-        "image_present": image_present,
         "vram": vram,
         "presence": presence_n,
         "dev_mode": settings.dev_mode,
@@ -830,8 +563,6 @@ async def healthz(request: Request) -> dict[str, Any]:
     }
 
 
-app.include_router(sessions_router)
-app.include_router(proxy_router)
 app.include_router(chat_router)
 app.include_router(admin_router)
 app.include_router(engine_router)
@@ -888,7 +619,7 @@ async def portal_index():
 <body style="font-family:system-ui;background:#0f1419;color:#e7ecf1;padding:2rem">
   <h1>Chudware</h1>
   <p>Portal static files not installed yet (waiting for static/index.html).</p>
-  <p>API: <code>/api/sessions</code> · <code>/healthz</code> · <code>/ws/chat</code></p>
+  <p>API: <code>/api/me</code> · <code>/healthz</code> · <code>/ws/chat</code></p>
 </body></html>""",
         status_code=200,
     )

@@ -18,6 +18,8 @@
 
 #include "imgui.h"
 
+#include "api/chudware_version.h"  // CHUDWARE_VERSION / _GIT_SHA in the About modal
+
 #include "settings_modal.h"
 #include "tool_panel_tables.h"  // generated offline fallback tool catalog (tools/gen_tool_panel_tables.py)
 #include "config_panel.h"
@@ -6244,11 +6246,32 @@ void drawSettingsModal(AppState& st, bool busy) {
                     ImGui::BulletText("AI agent (copilot runs): C++ core");
                 } else {
                     ImGui::TextUnformatted("Active engine: UNAVAILABLE (libchudware not loaded)");
-                    helpMarker("The C++ core (libchudware) is NOT loaded, and it is the only engine "
-                               "(the Python oracle was removed). Set the CHUDWARE_LIBCHUDWARE "
-                               "environment variable to the built library "
-                               "(core/build-occt-linux/bin/libchudware.so) or stage it next to the "
-                               "executable, then restart.");
+                    // The path to name here is per-platform: the build tree carries the
+                    // host's suffix (build.sh's PLATFORM_SUFFIX) and the engine takes that
+                    // platform's shared-library extension. Naming the Linux pair on a Mac
+                    // sends the user looking for a file that cannot exist.
+#if defined(_WIN32)
+                    static constexpr const char* kBuiltEngine =
+                        "build/windows-occt/bin/libchudware.dll";
+#elif defined(__APPLE__) && defined(__aarch64__)
+                    static constexpr const char* kBuiltEngine =
+                        "core/build-occt-macos-arm64/bin/libchudware.dylib";
+#elif defined(__APPLE__)
+                    static constexpr const char* kBuiltEngine =
+                        "core/build-occt-macos-x86_64/bin/libchudware.dylib";
+#else
+                    static constexpr const char* kBuiltEngine =
+                        "core/build-occt-linux/bin/libchudware.so";
+#endif
+                    // Composed once, not per frame: this branch redraws every frame the
+                    // engine is missing.
+                    static const std::string kEngineHint =
+                        std::string("The C++ core (libchudware) is NOT loaded, and it is the only "
+                                    "engine (the Python oracle was removed). Set the "
+                                    "CHUDWARE_LIBCHUDWARE environment variable to the built "
+                                    "library (") + kBuiltEngine +
+                        ") or stage it next to the executable, then restart.";
+                    helpMarker(kEngineHint.c_str());
                     dimText("C++ core: not loaded");
                 }
 
@@ -7844,6 +7867,14 @@ void drawSettingsModal(AppState& st, bool busy) {
             sectionHeader(st.fonts.h1, "Chudware");
         }
         dimText("Parametric CAD, driven by AI.");
+        ImGui::Dummy(ImVec2(0, 4 * sc));
+        // Product version + short sha: the first thing a support request needs, and
+        // the only place a GUI-only user can read it. Same string `chudware --version`
+        // prints (api/chudware_version.h, generated at configure time).
+        ImGui::Text("Version %s (%s)", CHUDWARE_VERSION, CHUDWARE_GIT_SHA);
+#if CHUDWARE_BUILD_DIRTY
+        dimText("built from a modified working tree");
+#endif
         ImGui::Dummy(ImVec2(0, 4 * sc));
         ImGui::TextUnformatted("build123d + OpenCASCADE kernel");
         ImGui::TextUnformatted("GLFW / Dear ImGui / OpenGL");

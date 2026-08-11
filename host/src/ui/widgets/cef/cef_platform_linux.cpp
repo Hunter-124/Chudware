@@ -2,11 +2,10 @@
 // SCAFFOLDING (docs/cef_webview.md phase 2); compiled only with CHUDWARE_ENABLE_CEF.
 #include "cef_platform.h"
 
-#include <limits.h>
-#include <unistd.h>
-
 #include <cstdlib>
 #include <string>
+
+#include "util/platform_paths.h"
 
 namespace ui::cef_platform {
 
@@ -15,11 +14,7 @@ CefMainArgs main_args(int argc, char** argv) {
 }
 
 std::string executable_dir() {
-    char buf[PATH_MAX];
-    const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n <= 0) return ".";
-    buf[n] = '\0';
-    std::string p(buf);
+    const std::string p = chudware::platform::executablePath();
     const auto slash = p.find_last_of('/');
     return slash == std::string::npos ? std::string(".") : p.substr(0, slash);
 }

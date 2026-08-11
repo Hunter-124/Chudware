@@ -71,33 +71,6 @@ class Settings:
     )
     host: str = field(default_factory=lambda: _env("CHUDWARE_WEB_HOST", "127.0.0.1") or "127.0.0.1")
     port: int = field(default_factory=lambda: _env_int("CHUDWARE_WEB_PORT", 8300))
-    max_sessions: int = field(default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_SESSIONS", 3))
-    max_heavy: int = field(default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_HEAVY", 2))
-    session_memory: str = field(
-        default_factory=lambda: _env("CHUDWARE_WEB_SESSION_MEMORY", "5g") or "5g"
-    )
-    session_cpus: float = field(default_factory=lambda: _env_float("CHUDWARE_WEB_SESSION_CPUS", 2.0))
-    session_pids_limit: int = field(
-        default_factory=lambda: _env_int("CHUDWARE_WEB_SESSION_PIDS", 2048)
-    )
-    idle_timeout_sec: int = field(
-        default_factory=lambda: _env_int("CHUDWARE_WEB_IDLE_TIMEOUT_SEC", 30 * 60)
-    )
-    min_host_ram_gib: float = field(
-        default_factory=lambda: _env_float("CHUDWARE_WEB_MIN_HOST_RAM_GIB", 8.0)
-    )
-    stream_port_base: int = field(
-        default_factory=lambda: _env_int("CHUDWARE_WEB_STREAM_PORT_BASE", 8400)
-    )
-    session_image: str = field(
-        default_factory=lambda: _env("CHUDWARE_WEB_SESSION_IMAGE", "localhost/chudware-session:latest")
-        or "localhost/chudware-session:latest"
-    )
-    stream_backend: str = field(
-        # novnc is the VERIFIED stream path on the Fedora image; selkies pip is
-        # broken there (evdev/kernel-headers) — opt in explicitly if that changes.
-        default_factory=lambda: _env("CHUDWARE_WEB_STREAM_BACKEND", "novnc") or "novnc"
-    )
     cf_team_domain: str = field(
         # Accept "team.cloudflareaccess.com" or "https://team.cloudflareaccess.com";
         # the Access JWT `iss` claim and the JWKS URL both need the https:// form.
@@ -115,17 +88,8 @@ class Settings:
     )
     dev_mode: bool = field(default_factory=lambda: _env_bool("CHUDWARE_WEB_DEV", False))
     # ---- Multi-tenant abuse controls -------------------------------------
-    # The global seat caps above are host-capacity limits; these are the
-    # per-account limits that keep one user from consuming the whole service.
+    # Per-account limits that keep one user from consuming the whole service.
     # They matter the moment identities stop being hand-approved teammates.
-    max_sessions_per_user: int = field(
-        default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_SESSIONS_PER_USER", 1)
-    )
-    max_session_lifetime_sec: int = field(
-        # Hard ceiling regardless of activity — idle_timeout_sec alone lets a
-        # user hold a seat forever by keeping the stream warm.
-        default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_SESSION_LIFETIME_SEC", 8 * 3600)
-    )
     max_upload_bytes: int = field(
         default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_UPLOAD_BYTES", 100 * 1024 * 1024)
     )
@@ -156,9 +120,6 @@ class Settings:
     rate_chat_per_min: int = field(
         default_factory=lambda: _env_int("CHUDWARE_WEB_RATE_CHAT_PER_MIN", 20)
     )
-    rate_session_starts_per_hour: int = field(
-        default_factory=lambda: _env_int("CHUDWARE_WEB_RATE_SESSION_STARTS_PER_HOUR", 20)
-    )
     # Admin browser-terminal (an interactive shell as the gateway account).
     # Off by default: it must be an explicit operator opt-in, never something a
     # public-facing deployment inherits silently.
@@ -177,12 +138,6 @@ class Settings:
         default_factory=lambda: _env("CHUDWARE_WEB_PROJECT_ROOTS", "") or ""
     )
     users_file: Path = field(default_factory=Path)
-    healthcheck_timeout_sec: float = field(
-        default_factory=lambda: _env_float("CHUDWARE_WEB_HEALTHCHECK_TIMEOUT_SEC", 90.0)
-    )
-    healthcheck_interval_sec: float = field(
-        default_factory=lambda: _env_float("CHUDWARE_WEB_HEALTHCHECK_INTERVAL_SEC", 1.5)
-    )
     # Web-native client: shared engine daemon socket + team workspace root.
     # Env overrides win; else webd.env (install_webd.sh); else deterministic
     # defaults (instance key "chudwareweb" is verbatim => socket name is stable).
@@ -238,10 +193,6 @@ class Settings:
                 )
 
     @property
-    def homes_dir(self) -> Path:
-        return self.data_root / "homes"
-
-    @property
     def plm_dir(self) -> Path:
         return self.data_root / "plm"
 
@@ -259,11 +210,11 @@ class Settings:
 
     @property
     def project_roots(self) -> list[Path]:
-        """Host directories an admin may browse / bind-mount as a project.
+        """Host directories an admin may browse / pick as a project root.
 
         Defaults to the gateway account's home. Anything outside this list is
         rejected, so a mistyped or malicious project path cannot expose /etc
-        or another user's home to every session.
+        or another user's home.
         """
         raw = [p for p in self.project_roots_raw.split(":") if p.strip()]
         roots: list[Path] = []
@@ -289,10 +240,9 @@ class Settings:
 
     @property
     def ai_providers_env(self) -> Path:
-        """Optional host-owned env file (KEY=VALUE) of remote-model provider
-        credentials forwarded into every session container (shared keys).
-        Per-user subscriptions are configured in-app and persist in the
-        user's HOME volume instead."""
+        """Optional host-owned env file (KEY=VALUE) of shared remote-model
+        provider credentials, used as the fallback when host config carries no
+        keys.* slot for a provider."""
         return self.data_root / "ai_providers.env"
 
     def ai_provider_vars(self) -> dict[str, str]:
@@ -321,7 +271,6 @@ class Settings:
 
     def ensure_data_dirs(self) -> None:
         self.data_root.mkdir(parents=True, exist_ok=True)
-        self.homes_dir.mkdir(parents=True, exist_ok=True)
         self.plm_dir.mkdir(parents=True, exist_ok=True)
         # Shared team workspace must exist: /workspace/* 503s otherwise, and a
         # migrated host often has webd.env pointing at a path that was never

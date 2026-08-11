@@ -1,10 +1,8 @@
-"""Gateway tests — dev-mode auth, healthz, sessions (mocked podman), transfer safety."""
+"""Gateway tests — dev-mode auth, healthz, admin allowlist/ops, releases."""
 
 from __future__ import annotations
 
-import io
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -22,65 +20,20 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 from fastapi.testclient import TestClient  # noqa: E402
 
 from gateway import app as app_mod  # noqa: E402
-from gateway.auth import User, UserDirectory  # noqa: E402
 from gateway.config import settings  # noqa: E402
-from gateway.sessions import Session, SessionManager, manager  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    """Per-test data root + clean session manager state."""
+    """Per-test data root in dev mode, resolved against the package allowlist."""
     data = tmp_path / "data"
     data.mkdir()
-    homes = data / "homes"
-    plm = data / "plm"
-    homes.mkdir()
-    plm.mkdir()
+    (data / "plm").mkdir()
     monkeypatch.setattr(settings, "data_root", data)
     monkeypatch.setattr(settings, "dev_mode", True)
-    # fresh manager
-    mgr = SessionManager(settings)
-    monkeypatch.setattr(app_mod, "manager", mgr)
-    monkeypatch.setattr("gateway.sessions.manager", mgr)
-    monkeypatch.setattr("gateway.proxy.manager", mgr)
-    # also patch module-level used by sessions API via app_mod import
-    import gateway.sessions as sessions_mod
-    monkeypatch.setattr(sessions_mod, "manager", mgr)
     # ensure users file points at package users.yaml
     monkeypatch.setattr(settings, "users_file", GATEWAY_DIR / "users.yaml")
-
-    # Hermetic by default: no real podman. Startup adopt_running and /transfer's
-    # podman-cp helper would otherwise touch live containers.
-    async def _no_podman(args, timeout=120.0):
-        return 0, "", ""
-
-    monkeypatch.setattr(mgr, "run_podman", _no_podman)
-
-    fake_fs = tmp_path / "container-fs"  # emulated container /home/user
-    fake_fs.mkdir()
-
-    async def _fake_podman_cp(src, dst, timeout=120.0):
-        import shutil
-
-        def _map(p: str) -> Path:
-            if ":" in p:  # container:path form
-                inner = p.split(":", 1)[1]
-                return fake_fs / inner.lstrip("/")
-            return Path(p)
-
-        s, d = _map(src), _map(dst)
-        if not s.is_file():
-            return 1, "no such file"
-        d.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(s, d)
-        return 0, ""
-
-    monkeypatch.setattr(app_mod, "_podman_cp", _fake_podman_cp)
-    yield mgr
-    # cleanup any leftover
-    mgr._sessions.clear()
-    mgr._by_email.clear()
-    mgr._ports_in_use.clear()
+    return data
 
 
 @pytest.fixture
@@ -107,15 +60,13 @@ def test_healthz_no_auth(client):
 
 
 def test_auth_allow(client):
-    r = client.get("/api/sessions", headers=_auth("demo@example.com"))
+    r = client.get("/api/me", headers=_auth("demo@example.com"))
     assert r.status_code == 200
-    body = r.json()
-    assert body["status"] == "none"
-    assert body["sid"] is None
+    assert r.json()["email"] == "demo@example.com"
 
 
 def test_auth_deny_unknown(client):
-    r = client.get("/api/sessions", headers=_auth("nobody@evil.example"))
+    r = client.get("/api/me", headers=_auth("nobody@evil.example"))
     assert r.status_code == 403
     # JSON for API paths
     body = r.json()
@@ -123,7 +74,7 @@ def test_auth_deny_unknown(client):
 
 
 def test_auth_deny_missing_header(client):
-    r = client.get("/api/sessions")
+    r = client.get("/api/me")
     assert r.status_code == 401
 
 
@@ -136,7 +87,7 @@ def test_not_on_list_html(client):
 def test_auth_allow_ua_domain_as_standard_user(client):
     """Any @ua.edu / @crimson.ua.edu email is auto-approved as a STANDARD user."""
     for email in ("student42@crimson.ua.edu", "Prof.Smith@UA.EDU"):
-        r = client.get("/api/sessions", headers=_auth(email))
+        r = client.get("/api/me", headers=_auth(email))
         assert r.status_code == 200, (email, r.status_code, r.text)
 
 
@@ -153,7 +104,7 @@ def test_ua_domain_user_is_never_admin(client):
 
 def test_dev_user_query_sets_cookie(client):
     """?dev_user= authenticates and Set-Cookies for subsequent subresources."""
-    r = client.get("/api/sessions", params={"dev_user": "demo@example.com"})
+    r = client.get("/api/me", params={"dev_user": "demo@example.com"})
     assert r.status_code == 200
     set_cookie = r.headers.get("set-cookie", "")
     assert "dev_user=demo@example.com" in set_cookie
@@ -166,13 +117,13 @@ def test_dev_user_query_sets_cookie(client):
 
 def test_dev_user_cookie_authenticates(client):
     """Cookie set by ?dev_user= is enough for a follow-up request (no query/header)."""
-    r = client.get("/api/sessions", params={"dev_user": "demo@example.com"})
+    r = client.get("/api/me", params={"dev_user": "demo@example.com"})
     assert r.status_code == 200
     # Follow-up with only the sticky cookie — no X-Dev-User header, no query.
-    r2 = client.get("/api/sessions", cookies={"dev_user": "demo@example.com"})
+    r2 = client.get("/api/me", cookies={"dev_user": "demo@example.com"})
     assert r2.status_code == 200
     body = r2.json()
-    assert body["status"] == "none"
+    assert body["email"] == "demo@example.com"
     # Cookie-only auth must NOT re-emit Set-Cookie (query-param path only).
     assert "dev_user=" not in r2.headers.get("set-cookie", "")
 
@@ -180,155 +131,9 @@ def test_dev_user_cookie_authenticates(client):
 def test_dev_user_query_noop_when_not_dev(client, monkeypatch):
     """Without CHUDWARE_WEB_DEV / dev_mode, ?dev_user= is ignored (prod path)."""
     monkeypatch.setattr(settings, "dev_mode", False)
-    r = client.get("/api/sessions", params={"dev_user": "demo@example.com"})
+    r = client.get("/api/me", params={"dev_user": "demo@example.com"})
     assert r.status_code in {401, 500}
     assert "dev_user=" not in r.headers.get("set-cookie", "")
-
-
-# ---------------------------------------------------------------------------
-# Sessions (podman mocked)
-# ---------------------------------------------------------------------------
-
-
-def test_session_start_stop_mocked(client, _isolate, monkeypatch):
-    mgr: SessionManager = _isolate
-    calls: list[list[str]] = []
-
-    running: set[str] = set()
-
-    async def fake_podman(args, timeout=120.0):
-        calls.append(list(args))
-        if args and args[0] == "run":
-            name = args[args.index("--name") + 1]
-            running.add(name)
-            return 0, "abc123deadbeef\n", ""
-        if args and args[0] == "ps":
-            # Podman treats the name filter as a regular expression.
-            name_pattern = next(
-                (a.split("=", 1)[-1] for a in args if a.startswith("name=")),
-                None,
-            )
-            matches = [
-                n for n in running
-                if not name_pattern or re.fullmatch(name_pattern, n)
-            ]
-            return 0, "\n".join(matches), ""
-        if args and args[0] in {"stop", "rm"}:
-            running.discard(args[-1])
-            return 0, "", ""
-        return 0, "", ""
-
-    async def fake_wait(sess):
-        return True
-
-    monkeypatch.setattr(mgr, "run_podman", fake_podman)
-    monkeypatch.setattr(mgr, "_wait_ready", fake_wait)
-    # lower RAM guard interference — force plenty
-    monkeypatch.setattr("gateway.sessions.mem_available_gib", lambda: 64.0)
-
-    r = client.post("/api/sessions", headers=_auth("demo@example.com"))
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["status"] == "running"
-    assert body["sid"]
-    assert body["stream_path"].startswith("/stream/")
-    sid = body["sid"]
-
-    # reconnect same user → same sid
-    r2 = client.post("/api/sessions", headers=_auth("demo@example.com"))
-    assert r2.status_code == 200
-    assert r2.json()["sid"] == sid
-
-    # GET status
-    r3 = client.get("/api/sessions", headers=_auth("demo@example.com"))
-    assert r3.json()["status"] == "running"
-
-    # stop
-    r4 = client.delete("/api/sessions", headers=_auth("demo@example.com"))
-    assert r4.status_code == 200
-    assert r4.json()["status"] == "stopped"
-
-    r5 = client.get("/api/sessions", headers=_auth("demo@example.com"))
-    assert r5.json()["status"] == "none"
-
-    # podman run was invoked
-    assert any(c and c[0] == "run" for c in calls)
-
-
-def test_session_refuse_new_flag(client, _isolate, monkeypatch, tmp_path):
-    mgr: SessionManager = _isolate
-    flag = settings.refuse_new_flag
-    flag.write_text("1")
-    monkeypatch.setattr("gateway.sessions.mem_available_gib", lambda: 64.0)
-
-    async def boom(*a, **k):
-        raise AssertionError("podman should not run")
-
-    monkeypatch.setattr(mgr, "run_podman", boom)
-    r = client.post("/api/sessions", headers=_auth("demo@example.com"))
-    assert r.status_code == 503
-    flag.unlink(missing_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# Transfer path traversal
-# ---------------------------------------------------------------------------
-
-
-def _seed_session(mgr, email="demo@example.com"):
-    sess = Session(
-        sid="livesid", email=email, display="Demo User", slug="demo",
-        container="chudware-sess-demo", host_port=8460, heavy=False, status="ready",
-    )
-    mgr._sessions[sess.sid] = sess
-    mgr._by_email[email] = sess.sid
-    return sess
-
-
-def test_transfer_requires_running_session(client, _isolate):
-    files = {"file": ("x.step", io.BytesIO(b"x"), "application/octet-stream")}
-    r = client.post("/transfer", headers=_auth("demo@example.com"), files=files)
-    assert r.status_code == 409
-
-
-def test_transfer_upload_download(client, _isolate):
-    _seed_session(_isolate)
-    content = b"hello chudware"
-    files = {"file": ("part.step", io.BytesIO(content), "application/octet-stream")}
-    r = client.post(
-        "/transfer?path=uploads/part.step",
-        headers=_auth("demo@example.com"),
-        files=files,
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["bytes"] == len(content)
-
-    r2 = client.get(
-        "/transfer",
-        headers=_auth("demo@example.com"),
-        params={"path": "uploads/part.step"},
-    )
-    assert r2.status_code == 200
-    assert r2.content == content
-
-
-def test_transfer_path_traversal_rejected(client, _isolate):
-    _seed_session(_isolate)
-    files = {"file": ("x", io.BytesIO(b"x"), "application/octet-stream")}
-    r = client.post(
-        "/transfer?path=../../etc/passwd",
-        headers=_auth("demo@example.com"),
-        files=files,
-    )
-    assert r.status_code == 400
-    assert "traversal" in r.text.lower() or "invalid" in r.text.lower() or "path" in r.text.lower()
-
-    r2 = client.get(
-        "/transfer",
-        headers=_auth("demo@example.com"),
-        params={"path": "../etc/passwd"},
-    )
-    assert r2.status_code == 400
 
 
 def test_portal_index(client):
@@ -339,12 +144,12 @@ def test_portal_index(client):
 
 
 # ---------------------------------------------------------------------------
-# AI provider env passthrough
+# Shared AI provider env file parsing
 # ---------------------------------------------------------------------------
 
 
-def test_ai_provider_vars_parse_and_forward(client, _isolate, monkeypatch, tmp_path):
-    mgr = _isolate
+def test_ai_provider_vars_parse(monkeypatch, tmp_path):
+    """KEY=VALUE lines parse; lowercase and malformed lines are skipped."""
     env_file = tmp_path / "ai_providers.env"
     env_file.write_text(
         "# shared keys\n"
@@ -353,34 +158,11 @@ def test_ai_provider_vars_parse_and_forward(client, _isolate, monkeypatch, tmp_p
         "BROKEN LINE\n"
         "ANTHROPIC_API_KEY=sk-ant-456\n"
     )
-    monkeypatch.setattr(type(mgr.cfg), "ai_providers_env", property(lambda self: env_file))
-    vars_ = mgr.cfg.ai_provider_vars()
-    assert vars_ == {"OPENROUTER_API_KEY": "sk-or-123", "ANTHROPIC_API_KEY": "sk-ant-456"}
-
-    calls: list[list[str]] = []
-
-    async def fake_podman(args, timeout=120.0):
-        calls.append(list(args))
-        if args and args[0] == "run":
-            return 0, "abc123\n", ""
-        return 0, "", ""
-
-    async def fake_wait(sess):
-        return True
-
-    monkeypatch.setattr(mgr, "run_podman", fake_podman)
-    monkeypatch.setattr(mgr, "_wait_ready", fake_wait)
-    monkeypatch.setattr("gateway.sessions.mem_available_gib", lambda: 64.0)
-    # Provider keys are withheld from seats by default; this tests the explicit
-    # operator opt-in forward path.
-    monkeypatch.setattr("gateway.sessions._SHARE_PROVIDER_KEYS", True)
-
-    r = client.post("/api/sessions", headers=_auth("demo@example.com"))
-    assert r.status_code == 200, r.text
-    run_call = next(c for c in calls if c and c[0] == "run")
-    joined = " ".join(run_call)
-    assert "OPENROUTER_API_KEY=sk-or-123" in joined
-    assert "ANTHROPIC_API_KEY=sk-ant-456" in joined
+    monkeypatch.setattr(type(settings), "ai_providers_env", property(lambda self: env_file))
+    assert settings.ai_provider_vars() == {
+        "OPENROUTER_API_KEY": "sk-or-123",
+        "ANTHROPIC_API_KEY": "sk-ant-456",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +256,7 @@ def test_team_domain_normalization(monkeypatch):
     assert _normalize_team_domain("") == ""
 
 
-def test_admin_project_field_and_env(client, _admin_env, _isolate, monkeypatch):
+def test_admin_project_field(client, _admin_env):
     directory, synced, users = _admin_env
     r = client.post(
         "/api/admin/users",
@@ -493,27 +275,8 @@ def test_admin_project_field_and_env(client, _admin_env, _isolate, monkeypatch):
     )
     assert r2.status_code == 400
 
-    # session env carries CHUDWARE_DEFAULT_PROJECT
-    calls = []
 
-    async def fake_podman(args, timeout=120.0):
-        calls.append(list(args))
-        return (0, "cid\n", "") if args and args[0] == "run" else (0, "", "")
-
-    async def fake_wait(sess):
-        return True
-
-    mgr = _isolate
-    monkeypatch.setattr(mgr, "run_podman", fake_podman)
-    monkeypatch.setattr(mgr, "_wait_ready", fake_wait)
-    monkeypatch.setattr("gateway.sessions.mem_available_gib", lambda: 64.0)
-    r3 = client.post("/api/sessions", headers=_auth("pal@ua.edu"))
-    assert r3.status_code == 200, r3.text
-    joined = " ".join(next(c for c in calls if c[0] == "run"))
-    assert "CHUDWARE_DEFAULT_PROJECT=Demo" in joined
-
-
-def test_default_project_inherited(client, _admin_env, _isolate, monkeypatch):
+def test_default_project_setting(client, _admin_env):
     directory, synced, users = _admin_env
     r = client.put("/api/admin/default-project",
                    headers=_auth("boss@example.com"), json={"project": "Demo"})
@@ -526,27 +289,8 @@ def test_default_project_inherited(client, _admin_env, _isolate, monkeypatch):
     assert client.put("/api/admin/default-project",
                       headers=_auth("demo@example.com"), json={"project": "X"}).status_code == 403
 
-    # session start for a user with no explicit project inherits the default
-    calls = []
 
-    async def fake_podman(args, timeout=120.0):
-        calls.append(list(args))
-        return (0, "cid\n", "") if args and args[0] == "run" else (0, "", "")
-
-    async def fake_wait(sess):
-        return True
-
-    mgr = _isolate
-    monkeypatch.setattr(mgr, "run_podman", fake_podman)
-    monkeypatch.setattr(mgr, "_wait_ready", fake_wait)
-    monkeypatch.setattr("gateway.sessions.mem_available_gib", lambda: 64.0)
-    r3 = client.post("/api/sessions", headers=_auth("demo@example.com"))
-    assert r3.status_code == 200, r3.text
-    joined = " ".join(next(c for c in calls if c[0] == "run"))
-    assert "CHUDWARE_DEFAULT_PROJECT=Demo" in joined
-
-
-def test_admin_browse_and_path_default(client, _admin_env, _isolate, monkeypatch, tmp_path):
+def test_admin_browse_and_path_default(client, _admin_env, monkeypatch, tmp_path):
     directory, synced, users = _admin_env
     # Browse/default-project are confined to the allowlisted project roots.
     monkeypatch.setattr(settings, "project_roots_raw", str(tmp_path))
@@ -570,76 +314,20 @@ def test_admin_browse_and_path_default(client, _admin_env, _isolate, monkeypatch
     assert client.put("/api/admin/default-project", headers=_auth("boss@example.com"),
                       json={"project": "/nope/missing"}).status_code == 400
 
-    # session start: ro bind-mount + basename project + open doc env
-    calls = []
-
-    async def fake_podman(args, timeout=120.0):
-        calls.append(list(args))
-        return (0, "cid\n", "") if args and args[0] == "run" else (0, "", "")
-
-    async def fake_wait(sess):
-        return True
-
-    mgr = _isolate
-    monkeypatch.setattr(mgr, "run_podman", fake_podman)
-    monkeypatch.setattr(mgr, "_wait_ready", fake_wait)
-    monkeypatch.setattr("gateway.sessions.mem_available_gib", lambda: 64.0)
-    r3 = client.post("/api/sessions", headers=_auth("demo@example.com"))
-    assert r3.status_code == 200, r3.text
-    run = next(c for c in calls if c[0] == "run")
-    joined = " ".join(run)
-    assert f"{proj}:/home/user/Projects/TeamParts:ro,z" in joined
-    assert "CHUDWARE_DEFAULT_PROJECT=TeamParts" in joined
-    assert "CHUDWARE_OPEN_DOC=Frame.step+" in joined
-
 
 # ---------------------------------------------------------------- admin ops
-def test_admin_ops_and_paste(client, _admin_env, _isolate, monkeypatch):
-    mgr = _isolate
-    # ops: admin-gated, reports host + limits even with no sessions
+def test_admin_ops(client, _admin_env):
+    # ops: admin-gated, reports host health for the dashboard
     assert client.get("/api/admin/ops", headers=_auth("demo@example.com")).status_code == 403
-    async def fake_stats():
-        return {"chudware-sess-demo": {"cpu": "3.0%", "mem": "1GB / 5GB"}}
-    monkeypatch.setattr(mgr, "container_stats", fake_stats)
     r = client.get("/api/admin/ops", headers=_auth("boss@example.com"))
     assert r.status_code == 200
     body = r.json()
-    assert body["sessions"] == []
-    assert body["limits"]["max_sessions"] > 0
     assert "mem_available_gib" in body["host"]
-
-    # paste with no session -> 409
-    r2 = client.post("/api/sessions/paste", headers=_auth("demo@example.com"),
-                     json={"text": "hello"})
-    assert r2.status_code == 409
-
-    # seed a running session, then paste routes through manager.paste_text
-    _seed_session(mgr, "demo@example.com")
-    typed = []
-    async def fake_paste(sess, text):
-        typed.append(text)
-        return True, "ok"
-    monkeypatch.setattr(mgr, "paste_text", fake_paste)
-    r3 = client.post("/api/sessions/paste", headers=_auth("demo@example.com"),
-                     json={"text": "M6x1.0 tap drill 5.0mm"})
-    assert r3.status_code == 200 and typed == ["M6x1.0 tap drill 5.0mm"]
-    assert client.post("/api/sessions/paste", headers=_auth("demo@example.com"),
-                       json={"text": ""}).status_code == 400
-    assert client.post("/api/sessions/paste", headers=_auth("demo@example.com"),
-                       json={"text": "x" * 20001}).status_code == 413
-
-    # admin stop of that session
-    sid = mgr.get_for_user("demo@example.com").sid
-    stopped = []
-    async def fake_stop(s, email=None):
-        stopped.append(s)
-        return mgr.get(s)
-    monkeypatch.setattr(mgr, "stop", fake_stop)
-    r4 = client.post(f"/api/admin/sessions/{sid}/stop", headers=_auth("boss@example.com"))
-    assert r4.status_code == 200 and stopped == [sid]
+    assert "units" in body["host"]
+    assert body["refuse_new"] is False
 
 
-def test_security_headers(client, _isolate):
+def test_security_headers(client):
     r = client.get("/healthz")
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["x-frame-options"] == "SAMEORIGIN"
@@ -670,24 +358,12 @@ def test_admin_patch_user(client, _admin_env):
                         json={"heavy": True}).status_code == 404
 
 
-def test_admin_spectates_stream(client, _admin_env, _isolate):
-    _seed_session(_isolate, "demo@example.com")
-    # owner and admin reach the proxy (502: no upstream in tests); others 403
-    assert client.get("/stream/livesid/", headers=_auth("demo@example.com")).status_code == 502
-    assert client.get("/stream/livesid/", headers=_auth("boss@example.com")).status_code == 502
-    assert client.get("/stream/livesid/", headers=_auth("alice@ua.edu")).status_code == 403
-
-
-def test_admin_refuse_new_toggle(client, _admin_env, _isolate):
-    mgr = _isolate
-    flag = mgr.cfg.refuse_new_flag
+def test_admin_refuse_new_toggle(client, _admin_env):
+    flag = settings.refuse_new_flag
     assert client.put("/api/admin/refuse-new", headers=_auth("demo@example.com"),
                       json={"on": True}).status_code == 403
     r = client.put("/api/admin/refuse-new", headers=_auth("boss@example.com"), json={"on": True})
     assert r.status_code == 200 and r.json()["refuse_new"] is True and flag.exists()
-    # new session start now refused with 503
-    r2 = client.post("/api/sessions", headers=_auth("demo@example.com"))
-    assert r2.status_code == 503
     r3 = client.put("/api/admin/refuse-new", headers=_auth("boss@example.com"), json={"on": False})
     assert r3.status_code == 200 and r3.json()["refuse_new"] is False and not flag.exists()
     ops = client.get("/api/admin/ops", headers=_auth("boss@example.com")).json()

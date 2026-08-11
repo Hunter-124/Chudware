@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Admin rebuild — wasm / image / engine targets. Serialized by deploy.lock.
+# Admin rebuild — wasm / engine targets. Serialized by deploy.lock.
 set -euo pipefail
 
 LOGDIR="${CHUDWARE_WEB_DATA:-$HOME/chudware-web-data}/logs"
@@ -52,15 +52,11 @@ for target in "$@"; do
       fi
       ./build.sh wasm
       ;;
-    image)
-      Webservice/image/stage.sh
-      podman build -t localhost/chudware-session:latest -f Webservice/image/Containerfile Webservice/image
-      ;;
     engine)
       ./build.sh core
       ;;
     *)
-      echo "ERROR: unknown target '$target' (expected wasm|image|engine)" >&2
+      echo "ERROR: unknown target '$target' (expected wasm|engine)" >&2
       exit 2
       ;;
   esac

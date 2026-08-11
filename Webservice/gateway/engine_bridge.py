@@ -23,11 +23,9 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 try:
     from .config import settings
     from .limits import user_slug
-    from .sessions import manager
 except ImportError:  # uvicorn app:app from package dir
     from config import settings
     from limits import user_slug
-    from sessions import manager
 
 log = logging.getLogger("chudware-web.engine")
 
@@ -461,10 +459,8 @@ def _sanitize_agent_provider(line: str) -> str:
 async def engine_ws(ws: WebSocket) -> None:
     user = ws.state.user  # AuthMiddleware closed 4401/4403 already if unauthenticated
     # AUDIT (multi-tenant): this bridge attaches the caller to the ONE shared
-    # webd daemon. It deliberately does NOT require a podman seat — /app is the
-    # browser-native WASM client and is a separate delivery mode from the
-    # streamed desktop, so demanding a container session here takes the whole
-    # web client offline (regression 2026-07-28: "Engine daemon unreachable").
+    # webd daemon. /app is the browser-native WASM client and is now the only
+    # delivery mode, so there is no per-caller sandbox to hang authorization on.
     # Isolation is enforced where it actually belongs: authenticated identity,
     # per-account path roots, provider-manager authorization, canonical provider
     # endpoints, bounded frames, and an atomic per-account connection cap.

@@ -21,8 +21,9 @@
 #  include <windows.h>
 #else
 #  include <dlfcn.h>
-#  include <unistd.h>
 #endif
+
+#include "util/platform_paths.h"
 
 using nlohmann::json;
 
@@ -118,20 +119,19 @@ int main() {
     g_free = reinterpret_cast<chudware_free_fn>(GetProcAddress(dll, "chudware_free"));
     g_abi = reinterpret_cast<chudware_abi_fn>(GetProcAddress(dll, "chudware_abi_version"));
 #else
-    // POSIX: dlopen libchudware.so. Prefer CHUDWARE_LIBCHUDWARE, else the copy next to this exe
+    // POSIX: dlopen the engine. Prefer CHUDWARE_LIBCHUDWARE, else the copy next to this exe
     // (probe + lib are co-located in bin/), else the loader's default search.
-    std::string libpath = "libchudware.so";
+#  if defined(__APPLE__)
+    constexpr const char* kEngineLib = "libchudware.dylib";
+#  else
+    constexpr const char* kEngineLib = "libchudware.so";
+#  endif
+    std::string libpath = kEngineLib;
     if (const char* env = std::getenv("CHUDWARE_LIBCHUDWARE"); env && env[0]) {
         libpath = env;
-    } else {
-        char buf[4096];
-        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-        if (n > 0) {
-            buf[n] = '\0';
-            std::string p(buf);
-            size_t slash = p.find_last_of('/');
-            if (slash != std::string::npos) libpath = p.substr(0, slash) + "/libchudware.so";
-        }
+    } else if (const std::string exe = chudware::platform::executablePath(); !exe.empty()) {
+        const size_t slash = exe.find_last_of('/');
+        if (slash != std::string::npos) libpath = exe.substr(0, slash) + "/" + kEngineLib;
     }
     void* dll = dlopen(libpath.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!dll) {

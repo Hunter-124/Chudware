@@ -1,0 +1,135 @@
+# The cheapest gate in the repository, and the only one that runs everywhere.
+#
+# scripts/check.py is eight deterministic source-level audits — icon atlas
+# coverage, ribbon-command-to-handler routing, SW_PARITY_SPEC drift, the
+# agent event-kind and role-prompt catalogs, the services thin-client ratchet,
+# the Settings tool-panel tables, and advertised-tool reachability. Every one
+# of them parses source and docs with nothing but the standard library, so
+# there is no OCCT, no venv, no toolchain, and nothing to provision: the whole
+# thing is a few seconds of CPU on any Python 3 host.
+#
+# It runs on all three operating systems because these audits walk paths, read
+# files, and compare text. A separator or encoding assumption that only breaks
+# on Windows or macOS is exactly the drift this catches, and catching it here
+# costs seconds instead of a failed native build later.
+#
+# Every push and every pull request, on the self-hosted fleet only. Target is
+# under three minutes wall clock; anything slower belongs in linux-gate.
+name: fast-gate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fast-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: check.py (${{ matrix.label }})
+    # Self-hosted only. Hosted minutes are billed on this private repository
+    # and the whole CI budget is $0; the capacity label keeps a leg off the
+    # production gateway host and off whichever endpoint is already busy.
+    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
+    timeout-minutes: 20
+    strategy:
+      # One platform's failure must not hide the other two: a path bug that
+      # only reproduces on Windows is the entire reason this matrix exists.
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux
+            runner_os: Linux
+            runner_arch: X64
+            runner_label: cc-linux-build
+          - label: Windows
+            runner_os: Windows
+            runner_arch: X64
+            runner_label: cc-win-primary
+          - label: macOS
+            runner_os: macOS
+            runner_arch: ARM64
+            runner_label: cc-mac-arm
+    steps:
+      # Before checkout: a missing or ancient python3 otherwise surfaces as a
+      # confusing traceback from an audit script rather than as the runner
+      # provisioning fault it is.
+      - name: Report runner identity and Python (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner=${RUNNER_NAME:-unknown} os=$RUNNER_OS arch=$RUNNER_ARCH host=$(hostname -s)"
+          uname -a
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "::error::runner ${RUNNER_NAME:-unknown} has no python3 on PATH; scripts/check.py cannot run"
+            exit 1
+          fi
+          python3 --version
+
+      # Windows PowerShell 5.1 only — these hosts have no pwsh, so `shell:
+      # pwsh` would fail to launch before any of this ran.
+      - name: Report runner identity and Python (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "runner=$env:RUNNER_NAME os=$env:RUNNER_OS arch=$env:RUNNER_ARCH host=$env:COMPUTERNAME"
+          Write-Host "powershell=$($PSVersionTable.PSVersion)"
+          $python = Get-Command python3 -ErrorAction SilentlyContinue
+          if (-not $python) { $python = Get-Command python -ErrorAction SilentlyContinue }
+          if (-not $python) {
+            Write-Host "::error::runner $env:RUNNER_NAME has no python3/python on PATH; scripts/check.py cannot run"
+            exit 1
+          }
+          & $python.Source --version
+          "PYTHON=$($python.Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run scripts/check.py (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/check.log"
+          status=0
+          python3 scripts/check.py 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
+
+          # Step summaries and job logs are not metered; artifact storage is.
+          # Diagnostics live here, never in an upload.
+          {
+            echo '## check.py — ${{ matrix.label }}'
+            echo '```text'
+            tail -n 40 "${log}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "${status}"
+
+      - name: Run scripts/check.py (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $log = Join-Path $env:RUNNER_TEMP 'check.log'
+          & $env:PYTHON scripts/check.py 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+
+          $tail = (Get-Content $log -Tail 40) -join "`n"
+          @(
+            '## check.py — ${{ matrix.label }}'
+            '```text'
+            $tail
+            '```'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          exit $status

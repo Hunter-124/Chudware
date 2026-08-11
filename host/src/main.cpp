@@ -4,6 +4,7 @@
 //   Chudware --render  <in.stl> <out.png> [view]   single offscreen view (iso/front/right/top)
 //   Chudware --contact <in.stl> <out.png>          2x2 contact sheet
 //   Chudware [--gui]                               interactive desktop app (ImGui)
+//   Chudware --version                             print the product version and exit
 //
 // The offscreen modes need only a hidden GL context, so they verify the whole render
 // path headlessly. GUI mode is in gui.cpp.
@@ -31,12 +32,14 @@
 #include <unistd.h>  // environ (glibc declares it at global scope)
 #endif
 
+#include "api/chudware_version.h"  // CHUDWARE_VERSION_LINE (generated, <build>/generated)
 #include "bootstrap.h"
 #include "core/app_state.h"  // appstateInitPersist (WASM IDBFS)
 #include "ipc_discovery.h"   // chudware_ipc::SingleInstance/instanceKey/guiLockPath (services/ipc)
 #include "mesh.h"
 #include "renderer.h"
 #include "worker_client.h"
+#include "util/platform_paths.h"  // executablePath (one spelling per OS)
 
 #ifdef CHUDWARE_ENABLE_CEF
 #include "ui/widgets/cef/cef_app.h"
@@ -366,19 +369,7 @@ long readGuiLockPid(const std::string& lockFile) {
 }
 #endif
 
-std::string selfExePath() {
-#ifdef _WIN32
-    char buf[MAX_PATH];
-    const DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    return n ? std::string(buf, n) : std::string();
-#else
-    char buf[4096];
-    const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
-    if (n <= 0) return "";
-    buf[n] = 0;
-    return buf;
-#endif
-}
+std::string selfExePath() { return chudware::platform::executablePath(); }
 
 bool automationLaunch(int argc, char** argv) {
     for (int i = 1; i < argc; ++i)
@@ -547,6 +538,34 @@ int main(int argc, char** argv) {
     }, rc);
     return rc;
 #else
+    // `chudware --version` — first thing checked, before CEF stashes argv and long
+    // before GLFW/X11 or the single-instance lock. Support triage and the installer
+    // must be able to read the version out of a binary that cannot start a GUI.
+    //
+    // OUTPUT FORMAT IS A CONTRACT: exactly ONE line on stdout,
+    // "chudware <semver> (<sha>, <date>)", nothing before or after it. Packaging
+    // and release tooling reads the semver out of a built binary, and a parser
+    // written against `awk '{print $2}'` or a last-token split is broken by any
+    // extra line. chudware-hostd learned this the hard way — its `--version` has
+    // TWO independent parsers (services/ipc/ipc_client.cpp diskBuildId() reads the
+    // last token of the FIRST line, services/mcp/daemon_bridge.py _disk_build_id()
+    // the last token of the WHOLE output) that no two-line form can satisfy. Put
+    // anything new on its own flag, never on this one.
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] && std::strcmp(argv[i], "--version") == 0) {
+            std::printf("chudware %s\n", CHUDWARE_VERSION_LINE);
+            // Same hard-exit tail every other native exit uses (T-RF23, hard_exit()
+            // below), and for the same class of reason: a namespace-scope static in
+            // ui/copilot/composer.cpp (g_agentCtl) spawns a DETACHED worker parked
+            // forever on a condition_variable, so global destruction deadlocks in
+            // pthread_cond_destroy. `return 0` here printed nothing and hung —
+            // eu-stack: main thread in condition_variable::~condition_variable
+            // under __run_exit_handlers, worker in cv.wait. This path has opened no
+            // file, taken no lock and touched no engine: nothing to unwind.
+            std::fflush(nullptr);
+            std::_Exit(0);
+        }
+    }
 #ifdef CHUDWARE_ENABLE_CEF
     // A separate subprocess executable (chudware_cef_helper) is configured via
     // CefSettings.browser_subprocess_path, so this main binary is ALWAYS the

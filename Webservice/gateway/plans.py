@@ -2,11 +2,9 @@
 
 Pure data plus a lookup. This module NEVER imports stripe and performs no I/O,
 so it is trivially unit-testable and safe to import anywhere (including the
-session/workspace hot paths that will eventually enforce these caps).
+workspace/bucket hot paths that will eventually enforce these caps).
 
 The limits map onto settings the gateway already enforces:
-  - max_concurrent_sessions  -> config.settings.max_sessions_per_user
-  - heavy_allowed            -> auth.User.heavy (GPU seat eligibility)
   - storage_quota_bytes      -> config.settings.max_user_disk_bytes
   - monthly_llm_tokens       -> chat/provider budget (enforcement wiring TBD)
 
@@ -32,8 +30,6 @@ class PlanLimits:
 
     plan: str
     display_name: str
-    max_concurrent_sessions: int
-    heavy_allowed: bool
     storage_quota_bytes: int
     monthly_llm_tokens: int
 
@@ -56,8 +52,6 @@ PLANS: dict[str, Plan] = {
         limits=PlanLimits(
             plan="free",
             display_name="Free",
-            max_concurrent_sessions=1,
-            heavy_allowed=False,
             storage_quota_bytes=2 * _GIB,
             monthly_llm_tokens=100_000,
         ),
@@ -69,8 +63,6 @@ PLANS: dict[str, Plan] = {
         limits=PlanLimits(
             plan="pro",
             display_name="Pro",
-            max_concurrent_sessions=2,
-            heavy_allowed=True,
             storage_quota_bytes=20 * _GIB,
             monthly_llm_tokens=2_000_000,
         ),
@@ -82,8 +74,6 @@ PLANS: dict[str, Plan] = {
         limits=PlanLimits(
             plan="team",
             display_name="Team",
-            max_concurrent_sessions=5,
-            heavy_allowed=True,
             storage_quota_bytes=100 * _GIB,
             monthly_llm_tokens=10_000_000,
         ),

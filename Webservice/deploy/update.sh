@@ -10,7 +10,6 @@
 #    bash Webservice/deploy/update.sh --no-pull    # rebuild/redeploy current tree
 #    bash Webservice/deploy/update.sh --host-only  # desktop Chudware binary only
 #    bash Webservice/deploy/update.sh --web-only   # joint hostd/WASM release + gateway
-#    bash Webservice/deploy/update.sh --image      # also rebuild session container
 #
 #  Env:
 #    CHUDWARE_OMP_DIR / repo root detection (this script's ../../)
@@ -37,15 +36,13 @@ DO_HOST=1
 DO_ENGINE=1
 DO_WEBD=1
 DO_GATEWAY=1
-DO_IMAGE=0
 
 for arg in "$@"; do
   case "$arg" in
-    --pull-only) DO_HOST=0; DO_ENGINE=0; DO_WEBD=0; DO_GATEWAY=0; DO_IMAGE=0 ;;
+    --pull-only) DO_HOST=0; DO_ENGINE=0; DO_WEBD=0; DO_GATEWAY=0 ;;
     --no-pull)   DO_PULL=0 ;;
-    --host-only) DO_ENGINE=0; DO_WEBD=0; DO_GATEWAY=0; DO_IMAGE=0 ;;
-    --web-only)  DO_HOST=0; DO_IMAGE=0 ;;
-    --image)     DO_IMAGE=1 ;;
+    --host-only) DO_ENGINE=0; DO_WEBD=0; DO_GATEWAY=0 ;;
+    --web-only)  DO_HOST=0 ;;
     -h|--help)
       sed -n '2,25p' "$0"
       exit 0
@@ -78,7 +75,7 @@ _cleanup() {
 trap _cleanup EXIT
 
 echo "=== chudware update start $(date -Iseconds) repo=$REPO ==="
-echo "    pull=$DO_PULL host=$DO_HOST engine=$DO_ENGINE webd=$DO_WEBD gateway=$DO_GATEWAY image=$DO_IMAGE"
+echo "    pull=$DO_PULL host=$DO_HOST engine=$DO_ENGINE webd=$DO_WEBD gateway=$DO_GATEWAY"
 
 if [[ "$DO_PULL" = 1 ]]; then
   echo
@@ -118,14 +115,6 @@ if [[ "$DO_ENGINE" = 1 ]]; then
     || { echo "ERROR: fresh hostd artifact missing at $ENGINE_ARTIFACT_DIR/chudware-hostd" >&2; exit 1; }
   [[ -f "$ENGINE_ARTIFACT_DIR/libchudware.so" ]] \
     || { echo "ERROR: fresh engine artifact missing at $ENGINE_ARTIFACT_DIR/libchudware.so" >&2; exit 1; }
-fi
-
-
-if [[ "$DO_IMAGE" = 1 ]]; then
-  echo
-  echo "=== [$(date -Iseconds)] session image ==="
-  Webservice/image/stage.sh
-  podman build -t localhost/chudware-session:latest -f Webservice/image/Containerfile Webservice/image
 fi
 
 if [[ "$DO_WEBD" = 1 ]]; then

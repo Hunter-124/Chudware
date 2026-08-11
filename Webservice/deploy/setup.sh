@@ -16,7 +16,6 @@ echo "    data:  ${DATA_ROOT}"
 
 # --- data root tree ----------------------------------------------------------
 mkdir -p \
-  "${DATA_ROOT}/homes" \
   "${DATA_ROOT}/plm" \
   "${DATA_ROOT}/logs" \
   "${DATA_ROOT}/secrets"
@@ -47,7 +46,6 @@ CHUDWARE_CF_AUD=
 
 # Optional overrides
 # CHUDWARE_WEB_DATA=/home/YOU/chudware-web-data
-# CHUDWARE_MAX_SESSIONS=3
 EOF
   chmod 600 "${ENV_FILE}"
   echo "    wrote skeleton ${ENV_FILE} (chmod 600) — fill TUNNEL_TOKEN + CHUDWARE_CF_AUD"
@@ -86,7 +84,7 @@ fi
 
 # --- systemd user units ------------------------------------------------------
 mkdir -p "${UNIT_DIR}"
-for u in chudware-gateway.service chudware-cloudflared.service chudware-monitor.service chudware-monitor.timer chudware-backup.service chudware-backup.timer chudware-webd-sync.path chudware-webd-sync.service chudware-sso.service; do
+for u in chudware-gateway.service chudware-cloudflared.service chudware-monitor.service chudware-monitor.timer chudware-backup.service chudware-backup.timer chudware-sso.service; do
   src="${DEPLOY_DIR}/${u}"
   dst="${UNIT_DIR}/${u}"
   if [[ -f "${src}" ]]; then
@@ -114,31 +112,7 @@ fi
 
 systemctl --user daemon-reload
 systemctl --user enable chudware-gateway.service chudware-cloudflared.service chudware-monitor.timer chudware-backup.timer
-# Path unit: re-promote ~/chudware-web when core/build-occt-linux rebuilds chudware-hostd.
-systemctl --user enable --now chudware-webd-sync.path >/dev/null 2>&1 || true
-echo "    enabled: chudware-gateway, chudware-cloudflared, chudware-monitor.timer, chudware-backup.timer, chudware-webd-sync.path"
-
-# --- image reminder (no build here) ------------------------------------------
-echo
-echo "==> podman image (manual / SessionImage)"
-echo "    expected: localhost/chudware-session:latest"
-if podman image exists localhost/chudware-session:latest 2>/dev/null; then
-  echo "    present: localhost/chudware-session:latest"
-else
-  echo "    MISSING — build when image is ready, e.g.:"
-  echo "      podman build -t localhost/chudware-session:latest -f Webservice/image/Containerfile Webservice/image"
-  echo "    (or pull if published)"
-fi
-
-# GPU CDI quick check
-if command -v nvidia-ctk >/dev/null 2>&1; then
-  if [[ -f /etc/cdi/nvidia.yaml ]] || [[ -f /var/run/cdi/nvidia.yaml ]]; then
-    echo "    CDI nvidia device yaml present"
-  else
-    echo "    CDI yaml not found — after driver updates run:"
-    echo "      sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"
-  fi
-fi
+echo "    enabled: chudware-gateway, chudware-cloudflared, chudware-monitor.timer, chudware-backup.timer"
 
 echo
 echo "==> next steps checklist"
@@ -151,7 +125,6 @@ cat <<EOF
       ${DATA_ROOT}/oauth2-proxy.cfg (see RUNBOOK.md §Entra SSO), then
       systemctl --user enable --now chudware-sso.service
   [ ] Edit Access allowlist emails (dashboard or API)
-  [ ] Pre-pull/build session image; optional warm seat
   [ ] systemctl --user start chudware-gateway chudware-cloudflared chudware-monitor.timer
   [ ] curl -sS http://127.0.0.1:8300/healthz | jq .
   [ ] Full ops: Webservice/deploy/RUNBOOK.md

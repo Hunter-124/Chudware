@@ -1,3 +1,10 @@
+> Superseded 2026-08-10: the streamed-session product described here was
+> removed; the gateway now serves only the WASM `/app` client and the `/engine`
+> bridge. There are no per-user containers — wherever this report says
+> "containerized session" or "per-session container volume", the live system has
+> one shared `chudware-hostd` daemon and per-account workspace roots enforced by
+> `gateway/engine_bridge.py`. The vault/git analysis below is still accurate.
+
 # PLM Multi-User Research Report
 
 **Scope:** Map `services/plm/` + contracts for shared multi-user use across N containerized Chudware sessions. Read-only. Non-goals: GUI panels, doc schema internals.

@@ -19,6 +19,39 @@
 #include <unistd.h>
 
 namespace chudware_ipc {
+// SOCK_CLOEXEC and accept4() are Linux extensions; Darwin has neither. Descriptors
+// must still be close-on-exec — hostd forks agent workers, the python worker and
+// the omp bridge, and a leaked listen fd there keeps the socket bound after the
+// daemon exits, so the next daemon's stale-socket probe finds a live peer and
+// refuses to start. The two-step fallback has a fork window; hostd's own spawn
+// paths close everything from fd 3 up before exec (chudware::platform::
+// closeInheritedFds), which covers it.
+namespace {
+
+int setCloexec(int fd) {
+    if (fd < 0) return fd;
+    const int fl = ::fcntl(fd, F_GETFD);
+    if (fl >= 0) ::fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+    return fd;
+}
+
+int cloexecSocket() {
+#if defined(SOCK_CLOEXEC)
+    return ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#else
+    return setCloexec(::socket(AF_UNIX, SOCK_STREAM, 0));
+#endif
+}
+
+int cloexecAccept(int listenFd) {
+#if defined(__linux__)
+    return ::accept4(listenFd, nullptr, nullptr, SOCK_CLOEXEC);
+#else
+    return setCloexec(::accept(listenFd, nullptr, nullptr));
+#endif
+}
+
+}  // namespace
 
 IpcListener& IpcListener::operator=(IpcListener&& o) noexcept {
     if (this != &o) {
@@ -164,7 +197,7 @@ bool IpcListener::listen(const std::string& path, std::string& err) {
         ::unlink(path.c_str());
     }
 
-    fd_ = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    fd_ = cloexecSocket();
     if (fd_ < 0) {
         err = std::string("socket: ") + std::strerror(errno);
         return false;
@@ -192,7 +225,7 @@ IpcConn IpcListener::accept(int timeoutMs) {
     struct pollfd pfd{fd_, POLLIN, 0};
     int pr = ::poll(&pfd, 1, timeoutMs);
     if (pr <= 0) return IpcConn();
-    int c = ::accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC);
+    int c = cloexecAccept(fd_);
     if (c < 0) return IpcConn();
     // Bound every write to this client. Without it, a client whose recv buffer
     // fills (a busy/wedged GUI under a heavy multi-agent event stream) makes the
@@ -231,7 +264,7 @@ void IpcListener::close(bool unlink_path) {
 }
 
 IpcConn connectTo(const std::string& path, std::string& err) {
-    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int fd = cloexecSocket();
     if (fd < 0) {
         err = std::string("socket: ") + std::strerror(errno);
         return IpcConn();

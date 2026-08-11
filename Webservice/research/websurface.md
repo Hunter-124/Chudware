@@ -1,3 +1,9 @@
+> Superseded 2026-08-10: this survey predates the gateway and its "what is
+> missing" list is no longer the gap list. The streamed-session product it
+> scopes (per-user podman orchestration, GUI pixel streaming) was removed; the
+> gateway now serves only the WASM `/app` client and the `/engine` bridge. The
+> port/transport/secret inventory below is still a useful map of the surfaces.
+
 # Research: Web / Network / Auth Surfaces (Chudware → multi-user web)
 
 Scope: Webservice/, .env (keys only), config.example.json, services/ipc/, services/browser/, services/agent/ (server/event surface only), services/mcp/ (transport/server only), docs/REDACTION_DESIGN.md, docs/AI_HARNESS_ROADMAP.md, opencode.json, .mcp.json, README webservice mentions, git posture of Webservice/Cloudflare-info.txt.

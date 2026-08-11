@@ -168,41 +168,19 @@ def _rpc(ws, id_, method, params=None) -> dict:
 
 class TestEngineBridge:
     @pytest.fixture(autouse=True)
-    def _live_seats(self):
-        """/engine now requires a live seat of the caller's own (ownership audit fix).
+    def _admin_identity(self):
+        """/engine authorizes on identity alone — no per-caller seat exists.
 
         The tracked users.yaml template grants nobody access, so the admin test
         identity is injected into the live directory for the test's duration.
         """
         from gateway.auth import User
-        from gateway.sessions import Session, manager
 
         admin = User(email="haedmonds69@gmail.com", display="Admin", role="admin",
                      heavy=False, project="", doc="")
         prev_entry = app_mod.user_directory._by_email.get(admin.email)
         app_mod.user_directory._by_email[admin.email] = admin
-
-        seeded = []
-        for i, email in enumerate(("demo@example.com", "haedmonds69@gmail.com")):
-            sess = Session(
-                sid=f"ebseat{i}" + "s" * 24,
-                email=email,
-                display=email.split("@")[0],
-                slug=email.split("@")[0],
-                container=f"chudware-sess-eb{i}",
-                host_port=8490 + i,
-                heavy=False,
-                status="ready",
-            )
-            manager._sessions[sess.sid] = sess
-            manager._by_email[email] = sess.sid
-            manager._ports_in_use.add(sess.host_port)
-            seeded.append(sess)
         yield
-        for sess in seeded:
-            manager._sessions.pop(sess.sid, None)
-            manager._by_email.pop(sess.email, None)
-            manager._ports_in_use.discard(sess.host_port)
         if prev_entry is None:
             app_mod.user_directory._by_email.pop(admin.email, None)
         else:

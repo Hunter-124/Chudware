@@ -25,16 +25,18 @@ file(TO_CMAKE_PATH "${NETGEN_ROOT}" NETGEN_ROOT)
 set(_ng_src     "${NETGEN_ROOT}/src")
 set(_ng_build   "${NETGEN_ROOT}/build")
 set(_ng_install "${NETGEN_ROOT}/install")
-# nglib link target: a Windows import lib, or the .so on ELF (lib or lib64 — re-globbed
-# after the build to get the real path). A nonexistent default just triggers the build.
+# nglib link target: a Windows import lib, or the shared library on ELF/Mach-O
+# (lib or lib64, .so or .dylib — re-globbed after the build to get the real path).
+# A nonexistent default just triggers the build.
 if(WIN32)
   set(_ng_implib "${_ng_install}/lib/nglib.lib")
 else()
-  file(GLOB _ng_implib_glob "${_ng_install}/lib/libnglib.so" "${_ng_install}/lib64/libnglib.so")
+  file(GLOB _ng_implib_glob "${_ng_install}/lib/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}"
+                            "${_ng_install}/lib64/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}")
   if(_ng_implib_glob)
     list(GET _ng_implib_glob 0 _ng_implib)
   else()
-    set(_ng_implib "${_ng_install}/lib/libnglib.so")
+    set(_ng_implib "${_ng_install}/lib/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}")
   endif()
 endif()
 
@@ -143,9 +145,10 @@ if(NOT EXISTS "${_ng_implib}")
     message(FATAL_ERROR "[netgen] build failed (${_ng_build_rc})")
   endif()
 endif()
-# Re-resolve the nglib path on ELF now that the install exists (lib vs lib64).
+# Re-resolve the nglib path on ELF/Mach-O now that the install exists (lib vs lib64).
 if(NOT WIN32)
-  file(GLOB _ng_implib_glob "${_ng_install}/lib/libnglib.so" "${_ng_install}/lib64/libnglib.so")
+  file(GLOB _ng_implib_glob "${_ng_install}/lib/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}"
+                            "${_ng_install}/lib64/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}")
   if(_ng_implib_glob)
     list(GET _ng_implib_glob 0 _ng_implib)
   endif()
@@ -159,16 +162,18 @@ set(NETGEN_INCLUDE_DIRS "${_ng_install}/include" CACHE PATH "Netgen include dir"
 set(NETGEN_IMPORT_LIB   "${_ng_implib}"          CACHE FILEPATH "nglib import lib" FORCE)
 
 # Runtime shared libs to stage next to libchudware: nglib + ngcore. On Windows also stage
-# zlib.dll (nglib's dep, which OCCT's DLL staging does NOT copy); on ELF the system zlib
-# resolves via the loader, so NETGEN_ZLIB_DLL stays empty.
+# zlib.dll (nglib's dep, which OCCT's DLL staging does NOT copy); on ELF/Mach-O the system
+# zlib resolves via the loader, so NETGEN_ZLIB_DLL stays empty. The trailing * catches the
+# versioned sonames on both layouts (libngcore.so.6.2 / libngcore.6.2.dylib).
 if(WIN32)
   file(GLOB _ng_dlls "${_ng_install}/bin/*.dll")
   set(NETGEN_DLLS "${_ng_dlls}" CACHE STRING "Netgen runtime DLLs" FORCE)
   set(NETGEN_ZLIB_DLL "${_ng_zlib_dir}/bin/zlib.dll" CACHE FILEPATH "zlib DLL (nglib dep)" FORCE)
 else()
-  file(GLOB _ng_dlls "${_ng_install}/lib/libng*.so*" "${_ng_install}/lib64/libng*.so*")
+  file(GLOB _ng_dlls "${_ng_install}/lib/libng*${CMAKE_SHARED_LIBRARY_SUFFIX}*"
+                     "${_ng_install}/lib64/libng*${CMAKE_SHARED_LIBRARY_SUFFIX}*")
   set(NETGEN_DLLS "${_ng_dlls}" CACHE STRING "Netgen runtime shared libs" FORCE)
-  set(NETGEN_ZLIB_DLL "" CACHE FILEPATH "zlib DLL (nglib dep; unused on ELF)" FORCE)
+  set(NETGEN_ZLIB_DLL "" CACHE FILEPATH "zlib DLL (nglib dep; unused on ELF/Mach-O)" FORCE)
 endif()
 
 message(STATUS "[netgen] ${NETGEN_VERSION}  include=${NETGEN_INCLUDE_DIRS}")

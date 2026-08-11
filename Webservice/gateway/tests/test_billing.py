@@ -214,20 +214,14 @@ def _post_webhook(client, event, sig=VALID_SIG):
 class TestPlans:
     def test_limits_for_each_tier(self):
         free = plans.limits_for("free")
-        assert free.max_concurrent_sessions == 1
-        assert free.heavy_allowed is False
         assert free.storage_quota_bytes == 2 * 1024**3
         assert free.monthly_llm_tokens > 0
 
         pro = plans.limits_for("pro")
-        assert pro.max_concurrent_sessions > free.max_concurrent_sessions
-        assert pro.heavy_allowed is True
         assert pro.storage_quota_bytes > free.storage_quota_bytes
         assert pro.monthly_llm_tokens > free.monthly_llm_tokens
 
         team = plans.limits_for("team")
-        assert team.max_concurrent_sessions > pro.max_concurrent_sessions
-        assert team.heavy_allowed is True
         assert team.storage_quota_bytes > pro.storage_quota_bytes
         assert team.monthly_llm_tokens > pro.monthly_llm_tokens
 
@@ -529,7 +523,7 @@ class TestUnconfigured:
         body = r.json()
         assert body["billing_configured"] is False
         assert body["plan"] == "free"
-        assert body["limits"]["max_concurrent_sessions"] == 1
+        assert body["limits"]["storage_quota_bytes"] == 2 * 1024**3
 
     def test_module_imports_without_stripe_package(self, monkeypatch):
         """billing must import (and re-import) with no stripe package at all."""

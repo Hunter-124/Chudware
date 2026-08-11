@@ -111,7 +111,7 @@ echo "[webd] provider/auth dependencies provisioned"
 # Build WASM into the private release stage, never directly over the live app.
 EMSDK_DIR="${EMSDK:-$HOME/.emsdk}"
 [ -f "$EMSDK_DIR/emsdk_env.sh" ] || fatal "emsdk not found at $EMSDK_DIR; refusing a hostd-only release"
-WASM_LOG="${CHUDWARE_WEBD_WASM_LOG:-/tmp/chudware-webd-sync-wasm.log}"
+WASM_LOG="${CHUDWARE_WEBD_WASM_LOG:-/tmp/chudware-webd-wasm.log}"
 mkdir -p "$(dirname "$WASM_LOG")"
 echo "[webd] building WASM into private stage (log: $WASM_LOG)"
 if ! CHUDWARE_WEB_APP="$STAGE_APP" EMSDK="$EMSDK_DIR" "$ROOT/build.sh" wasm >"$WASM_LOG" 2>&1; then
@@ -235,11 +235,8 @@ install_unit() {
 }
 install_unit "$STAGE_ROOT/chudware-hostd.service" "$UNIT_DIR/chudware-hostd.service"
 install_unit "$ROOT/Webservice/deploy/chudware-gateway.service" "$UNIT_DIR/chudware-gateway.service"
-install_unit "$ROOT/Webservice/deploy/chudware-webd-sync.path" "$UNIT_DIR/chudware-webd-sync.path"
-install_unit "$ROOT/Webservice/deploy/chudware-webd-sync.service" "$UNIT_DIR/chudware-webd-sync.service"
 systemctl --user daemon-reload || fatal "systemd user daemon-reload failed"
 systemctl --user enable chudware-hostd.service >/dev/null || fatal "could not enable chudware-hostd.service"
-systemctl --user enable --now chudware-webd-sync.path >/dev/null || fatal "could not enable/start chudware-webd-sync.path"
 echo "[webd] systemd units installed"
 
 CURRENT_JOINT=""

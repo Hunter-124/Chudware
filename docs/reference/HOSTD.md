@@ -31,12 +31,20 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 - **CLI**:
   - `chudware-hostd --foreground` — run serving in the current terminal (dev).
   - `chudware-hostd --status` — JSON status of the running instance (`state`,
-    `pid`, `children`); exits 1 with "no running instance" if none.
+    `pid`, `children`) on **stdout**, preceded by the product version banner on
+    **stderr**; exits 1 with "no running instance" if none. The two streams are
+    split deliberately so `--status | jq` keeps working.
   - `chudware-hostd --stop` — drain (autosave dirty docs) and exit. **Refused
     while agent children / a mission are active.**
   - `chudware-hostd --stop --force` — stop children (TERM → grace → KILL) first,
     then drain and exit. This is what installers/uninstallers call.
   - `chudware-hostd --version` — prints the git-describe build id.
+    **Exactly one line, and the build id must be the last whitespace-separated
+    token.** Two independent staleness checks parse this and disagree about the
+    shape: `services/ipc/ipc_client.cpp` `diskBuildId()` takes the last token of
+    the FIRST line, while `services/mcp/daemon_bridge.py` `_disk_build_id()`
+    takes the last token of the WHOLE output. Adding a second line makes one of
+    them compare garbage against `hello.git_rev` and declare every daemon stale.
 
 ## Environment variables
 

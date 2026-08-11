@@ -1,0 +1,184 @@
+# The full Linux gate: everything scripts/gate.sh runs, plus the two suites it
+# has never run itself.
+#
+# gate.sh is the repository's real build+test gate — check.py, the OCCT core
+# build, the host GUI build, the WASM smoke, ctest, the hostd daemon smoke, the
+# web-parity probe, the Python service suites, and the headless shot smoke.
+# Locally it is deliberately lenient: a box without OCCT, emsdk, or the service
+# venv reports SKIP and stays green, because a developer should not have to
+# provision the world to run it.
+#
+# That leniency is a false green in CI. A runner that lost its toolchain would
+# report PASS having compiled and tested nothing, and nobody would look again
+# until a release failed. So this job sets CHUDWARE_GATE_STRICT=1, which turns
+# every environment SKIP — no cmake, no OCCT, no emsdk, no venv, no collected
+# tests — into a hard failure. Opt-in stages (the AppImage build, the
+# openEMS/Renode benches) stay opt-in; they are off by choice, not by fault.
+# Consequence: cc-linux-build must stay provisioned with cmake+ninja, system
+# OCCT, emsdk, and the service venv, and a red gate naming a missing capability
+# is a provisioning ticket, not a code defect.
+#
+# Two suites gate.sh has never invoked run here explicitly:
+#   * ctest --test-dir host/build-linux — the host GUI tree's own tests. gate.sh
+#     builds host/build-linux but only ctests the core tree, so these have never
+#     gated anything.
+#   * pytest Webservice/gateway/tests — the FastAPI gateway suite. It lives
+#     outside the paths gate.sh sweeps and needs the gateway's own venv.
+#
+# master only. Pull requests get fast-gate; this one is expensive and holds the
+# Linux builder for the better part of an hour.
+name: linux-gate
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel: this gate is the merge signal for master, and a cancelled run
+# is indistinguishable from an unrun one.
+concurrency:
+  group: linux-gate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Full Linux gate (strict)
+    # Named capacity label, not the bare pool: gate.sh saturates the machine for
+    # tens of minutes and must never land on the production gateway host. Hosted
+    # runners are billed on this private repository; the fleet is free.
+    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
+    timeout-minutes: 120
+    env:
+      # The whole point of this job. See the header block above.
+      CHUDWARE_GATE_STRICT: '1'
+    steps:
+      - name: Check runner capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Named up front. Under CHUDWARE_GATE_STRICT=1 a missing tool fails the
+          # gate anyway, but it fails 20 minutes in with a stage label; here it
+          # fails in two seconds with the tool name.
+          missing=()
+          for tool in python3 cmake ninja ctest git xvfb-run; do
+            command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::runner ${RUNNER_NAME:-unknown} is missing required tools: ${missing[*]}"
+            exit 1
+          fi
+
+          echo "runner=${RUNNER_NAME:-unknown} host=$(hostname -s)"
+          uname -a
+          python3 --version
+          cmake --version | head -n 1
+          ninja --version
+          df -h "${RUNNER_TEMP:-/tmp}" "$HOME"
+
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          # gate.sh generates the version header from `git describe --tags`, so
+          # a shallow clone without tags would silently produce 0.0.0.
+          fetch-depth: 0
+
+      - name: Run scripts/gate.sh (CHUDWARE_GATE_STRICT=1)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          log="${RUNNER_TEMP}/gate.log"
+          status=0
+          bash scripts/gate.sh 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
+
+          # The summary block gate.sh prints is the whole verdict, one line per
+          # stage. Job logs and step summaries are not metered; artifacts are.
+          {
+            echo '## scripts/gate.sh (strict)'
+            echo '```text'
+            sed -n '/Chudware Linux gate — summary/,$p' "${log}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "${status}"
+
+      - name: ctest — host GUI tree
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # gate.sh builds host/build-linux but never ctests it, so these tests
+          # have gated nothing until now. A missing build tree here means the
+          # host build stage silently did not produce one.
+          if [ ! -f host/build-linux/CTestTestfile.cmake ]; then
+            echo "::error::host/build-linux has no CTest configuration; the host build stage did not complete"
+            exit 1
+          fi
+
+          log="${RUNNER_TEMP}/host-ctest.log"
+          status=0
+          ctest --test-dir host/build-linux --output-on-failure 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
+
+          # Zero tests is a harness break, not a pass: this suite exists.
+          if grep -qE 'No tests were found' "${log}"; then
+            echo "::error::ctest found no tests in host/build-linux; the suite did not run"
+            exit 1
+          fi
+
+          {
+            echo '## ctest — host/build-linux'
+            echo '```text'
+            tail -n 30 "${log}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "${status}"
+
+      - name: pytest — Webservice gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The gateway has its own venv with FastAPI and its test deps; the
+          # service venv gate.sh uses does not carry them. The venv is
+          # gitignored, so on a fresh CI checkout it never exists -- it is a
+          # build artifact, not a provisioning capability, and treating its
+          # absence as a provisioning failure would make this gate red on every
+          # clean runner forever. Build it, and be strict about the build
+          # FAILING: a venv that cannot be created is a real defect.
+          venv_py="Webservice/gateway/.venv/bin/python"
+          if [ ! -x "${venv_py}" ]; then
+            echo "creating Webservice/gateway/.venv"
+            python3 -m venv Webservice/gateway/.venv
+          fi
+          "${venv_py}" -m pip install --quiet --upgrade pip
+          "${venv_py}" -m pip install --quiet -r Webservice/gateway/requirements.txt
+          if ! "${venv_py}" -c 'import pytest' 2>/dev/null; then
+            # pytest is a test-only dep and is deliberately absent from the
+            # pinned runtime requirements, which the deployment venv installs.
+            "${venv_py}" -m pip install --quiet pytest
+          fi
+
+          log="${RUNNER_TEMP}/gateway-pytest.log"
+          status=0
+          (cd Webservice/gateway && .venv/bin/python -m pytest tests -q) 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
+
+          # pytest exits 5 on "no tests collected". That is a harness break here.
+          if [ "${status}" -eq 5 ]; then
+            echo "::error::pytest collected zero tests under Webservice/gateway/tests; the suite did not run"
+            exit 1
+          fi
+
+          {
+            echo '## pytest — Webservice/gateway/tests'
+            echo '```text'
+            tail -n 30 "${log}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "${status}"

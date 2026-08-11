@@ -2,17 +2,19 @@
 // plan). The daemon becomes the parent of every agent worker process so:
 //   * GUI/MCP client death does NOT kill a running mission (the child belongs
 //     to the daemon, not to the spawning client);
-//   * daemon death kills ALL children deterministically — each child sets
-//     PR_SET_PDEATHSIG(SIGKILL) (plus its own process group for the graceful
-//     path) so orphaned agent workers are structurally impossible (the
-//     incident class this refactor exists to kill);
+//   * daemon death kills ALL children deterministically — each child binds its
+//     lifetime to the daemon's via chudware::platform::guardParentDeath (plus
+//     its own process group for the graceful path) so orphaned agent workers are
+//     structurally impossible (the incident class this refactor exists to kill);
 //   * the daemon refuses idle-exit and (un-forced) drain while children run.
 //
 // Daemon methods (dispatched via handleMethod):
 //   agent_spawn{argv:[...], env:{...}, mission_id?, doc_id?}
 //       -> {child_id, pid, pgid, log}
-//     fork(); child: setpgid(0,0) + prctl(PDEATHSIG, SIGKILL) + re-check
-//     getppid() (exec-vs-parent-death race guard) + stdio -> per-child log
+//     fork(); child: setpgid(0,0) + guardParentDeath(daemon pid), which is
+//     PR_SET_PDEATHSIG(SIGKILL) plus the getppid() exec-vs-parent-death race
+//     guard on Linux and a kqueue/NOTE_EXIT babysitter on Darwin (see
+//     util/parent_death.h) + stdio -> per-child log
 //     file <logDir>/agent-<child_id>.log + execvpe. A failed exec is reported
 //     synchronously as a clean error via a CLOEXEC pipe (no zombie, no table
 //     entry).

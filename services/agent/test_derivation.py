@@ -22,16 +22,22 @@ from unittest.mock import MagicMock
 _REPO = Path(__file__).resolve().parents[2]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
-# Also probe the main checkout for libchudware: worktrees are siblings of the main checkout.
-# Main checkout is at <parent of worktree parent>/<basename from .git/gitdir>, or we
-# check common sibling locations.  CHUDWARE_LIBCHUDWARE / CHUDWARE_DIST env vars work too.
-for _candidate in [
-    Path(__file__).resolve().parents[2].parent / "CAD",   # sibling worktree → main
-    Path("/home/hunter/Repositories/CAD"),                  # known host path
-]:
-    if _candidate.exists() and str(_candidate) not in sys.path:
-        sys.path.insert(0, str(_candidate))
-        break
+# Also probe the main checkout for libchudware: a git worktree is a sibling of the main
+# checkout and only the main checkout carries a build tree. A worktree's `.git` is a FILE
+# reading `gitdir: <main>/.git/worktrees/<name>`, so the main checkout is derivable from
+# it. Never hardcode an absolute developer path here — that makes the suite pass on
+# exactly one machine and silently degrade everywhere else, CI included.
+# CHUDWARE_LIBCHUDWARE / CHUDWARE_DIST env vars work too.
+_CHECKOUT_ROOTS = [_REPO]
+_git_entry = _REPO / ".git"
+if _git_entry.is_file():
+    _gitdir = Path(_git_entry.read_text(encoding="utf-8").partition("gitdir:")[2].strip())
+    if _gitdir.parent.name == "worktrees" and _gitdir.parent.parent.name == ".git":
+        _main_checkout = _gitdir.parents[2]
+        if _main_checkout.exists():
+            _CHECKOUT_ROOTS.append(_main_checkout)
+            if str(_main_checkout) not in sys.path:
+                sys.path.insert(0, str(_main_checkout))
 
 _TMP_CACHE = tempfile.mkdtemp(prefix="test_derivation_cache_")
 os.environ.setdefault("CHUDWARE_CACHE_ROOT", _TMP_CACHE)
@@ -471,14 +477,17 @@ class TestExprParser(unittest.TestCase):
 # §8  link_dimension round-trip
 # ---------------------------------------------------------------------------
 
-# Detect libchudware availability.
-# The worktree shares the core build tree with the main checkout.
-# Point CHUDWARE_LIBCHUDWARE at the known build artifact if not already set so that
+# Detect libchudware availability. A worktree shares the core build tree with the main
+# checkout, so probe this checkout first and then the main checkout resolved above.
+# Point CHUDWARE_LIBCHUDWARE at the artifact if not already set so that
 # core_bridge._load() can find the .so regardless of which sys.path entry wins.
 _LIBCHUDWARE_AVAILABLE = False
-_KNOWN_SO = Path("/home/hunter/Repositories/CAD/core/build-linux/bin/libchudware.so")
-if _KNOWN_SO.exists() and not os.environ.get("CHUDWARE_LIBCHUDWARE"):
-    os.environ["CHUDWARE_LIBCHUDWARE"] = str(_KNOWN_SO)
+if not os.environ.get("CHUDWARE_LIBCHUDWARE"):
+    for _root in _CHECKOUT_ROOTS:
+        _known_so = _root / "core" / "build-linux" / "bin" / "libchudware.so"
+        if _known_so.exists():
+            os.environ["CHUDWARE_LIBCHUDWARE"] = str(_known_so)
+            break
 try:
     from services.mcp.core_bridge import call as _core_call, CoreError
     # Read-only probe to confirm availability: doc_list mints NOTHING. (The old

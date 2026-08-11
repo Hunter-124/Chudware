@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pricing — Chudware</title>
-<meta name="description" content="Chudware pricing tiers: a free evaluation seat with no persistent session, a paid individual seat, and a team plan. Prices shown are placeholders until launch.">
+<meta name="description" content="Chudware pricing tiers: a free evaluation account, a paid individual plan, and a team plan. Prices shown are placeholders until launch.">
 <meta name="color-scheme" content="dark">
 <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/site.css">
@@ -35,11 +35,11 @@
   <section class="page-head">
     <div class="wrap">
       <p class="eyebrow">Pricing</p>
-      <h1>You are paying for machine time, not for features.</h1>
+      <h1>You are paying for storage and copilot use, not for features.</h1>
       <p class="lede">
-        Every tier is the same application. What changes is how much CPU and GPU session time you
-        get, whether your work survives the end of a session, and how many copilot tokens are
-        included.
+        Every tier is the same application, running in your browser. What changes is how much
+        project storage you keep on our side, how many copilot tokens are included, and whether
+        you get shared PLM projects and the desktop build.
       </p>
 
       <div class="notice" role="note">
@@ -63,9 +63,8 @@
           <p class="ph-tag">Placeholder limits</p>
           <p class="tier-for">For deciding whether the thing works for you at all.</p>
           <ul class="tier-list">
-            <li><b>CPU seat.</b> Software rendering, shared with other evaluation sessions.</li>
-            <li><b>No persistent session.</b> The container and everything in it is discarded when you disconnect — export before you leave.</li>
-            <li>Idle sessions are reclaimed after <b>30 minutes</b> without traffic.</li>
+            <li><b>The full application</b>, in the browser. Same modeller, same ribbon.</li>
+            <li><b>2&nbsp;GiB of project storage</b>, kept between visits.</li>
             <li>Copilot tokens: <span class="tbd">TBD</span> per month.</li>
             <li>No PLM project vaults, no desktop build.</li>
           </ul>
@@ -78,9 +77,7 @@
           <p class="ph-tag">Placeholder price</p>
           <p class="tier-for">For one engineer doing real work.</p>
           <ul class="tier-list">
-            <li><b>Persistent home directory.</b> Your files survive session restarts.</li>
-            <li>One seat. Current session defaults: <b>2 vCPU, 5&nbsp;GiB RAM</b>.</li>
-            <li><b>GPU-accelerated seat</b> when one is free, with hardware video encode.</li>
+            <li><b>20&nbsp;GiB of project storage</b>, with nightly backups.</li>
             <li>PLM project vaults and the parts library.</li>
             <li>Desktop build for Windows and Linux.</li>
             <li>Copilot tokens: <span class="tbd">TBD</span> per month, overage <span class="tbd">TBD</span>.</li>
@@ -94,11 +91,11 @@
           <p class="ph-tag">Placeholder price</p>
           <p class="tier-for">For a group that shares projects and needs someone in charge of it.</p>
           <ul class="tier-list">
-            <li>Everything in Individual, per seat.</li>
+            <li>Everything in Individual, per person.</li>
+            <li><b>100&nbsp;GiB of shared project storage.</b></li>
             <li><b>Shared PLM projects</b> with per-project history across the team.</li>
-            <li><b>Admin console</b> for approving accounts, assigning seats and revoking access.</li>
-            <li>Priority on GPU seats when they are contended.</li>
-            <li>Pooled copilot tokens: <span class="tbd">TBD</span> per seat per month.</li>
+            <li><b>Admin console</b> for approving accounts and revoking access.</li>
+            <li>Pooled copilot tokens: <span class="tbd">TBD</span> per person per month.</li>
             <li>Minimum <span class="tbd">TBD</span> seats.</li>
           </ul>
           <a class="btn btn-ghost" href="signup.html">Request access</a>
@@ -112,36 +109,30 @@
     <div class="wrap">
       <h2 id="drivers-h">What the price is actually made of</h2>
       <p class="lede">
-        Chudware sessions are not cheap to run, and pretending otherwise would just produce a
-        pricing page that has to change later. These are the four things that cost money.
+        Chudware is not cheap to run, and pretending otherwise would just produce a pricing page
+        that has to change later. These are the three things that cost money.
       </p>
       <ul class="drivers">
         <li>
-          <h3>CPU seat time</h3>
-          <p>
-            A default seat renders and encodes in software on shared host CPU. It is the floor cost
-            of having a session open at all, which is why the free tier does not keep one warm.
-          </p>
-        </li>
-        <li>
-          <h3>GPU seat time</h3>
-          <p>
-            Accelerated seats get a slice of a GPU for rendering and hardware video encode. There
-            are only so many at once, so they are metered and prioritised rather than unlimited.
-          </p>
-        </li>
-        <li>
           <h3>Copilot tokens</h3>
           <p>
-            The AI copilot calls a language model, and that is billed per token upstream. Included
-            allowances differ by tier; heavy use is metered instead of throttled silently.
+            The AI copilot calls a language model, and that is billed per token upstream. It is by
+            far the largest variable cost. Included allowances differ by tier; heavy use is metered
+            instead of throttled silently.
           </p>
         </li>
         <li>
           <h3>Persistent storage</h3>
           <p>
-            A home directory that survives disconnects, plus project vault history, is real disk
-            that has to be kept and backed up. The evaluation tier skips it entirely.
+            Your projects and their vault history are real disk on our side that has to be kept,
+            replicated and backed up. Storage is the main thing separating the tiers.
+          </p>
+        </li>
+        <li>
+          <h3>Engine compute</h3>
+          <p>
+            Modelling kernel work — booleans, meshing, simulation — runs on our server, not in your
+            browser. Sustained heavy jobs cost real CPU time and are accounted for per plan.
           </p>
         </li>
       </ul>

@@ -68,8 +68,8 @@ def env(tmp_path, monkeypatch):
 
 
 def _bare_app(auth, directory):
-    """Minimal ASGI app behind the real AuthMiddleware — no session manager,
-    no podman, so this test exercises authorization and nothing else.
+    """Minimal ASGI app behind the real AuthMiddleware — no routers mounted,
+    so this test exercises authorization and nothing else.
 
     NOTE: `Request` must be imported at module scope. This file uses
     `from __future__ import annotations`, so FastAPI resolves the annotation

@@ -1,0 +1,300 @@
+# Per-platform configure + build + ctest. This is the only thing keeping the
+# Windows and macOS trees compiling between releases.
+#
+# Nothing else in CI compiles anything off Linux: fast-gate is stdlib text
+# analysis and linux-gate is Linux by definition. Without this workflow a
+# Windows-only or macOS-only compile break lands on master and is discovered
+# during packaging, when it is expensive and blocking.
+#
+# Each row configures through the CMake preset that platform actually ships
+# with, builds it, and then runs that tree's ctest. The presets are the same
+# ones a developer uses by hand, so a green row here means the documented build
+# command works on a clean checkout — not that some CI-only incantation does.
+#
+# Rows are independent (fail-fast: false): a broken macOS toolchain must not
+# hide a Windows regression.
+#
+# Nothing is uploaded. Build outputs are ~500 MB per platform and Actions
+# artifact storage is metered above the 500 MB shared with Packages, accrued
+# hourly and never refunded. Release artifacts go to R2 (phase 5); diagnostics
+# go to the job log and the step summary, neither of which is metered.
+name: native-build
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel. This is a coherent multi-platform build of one commit; a
+# half-cancelled matrix leaves two platforms reporting on different trees, and
+# the whole value of the workflow is that the four rows describe one commit.
+concurrency:
+  group: native-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    # Self-hosted fleet only — hosted minutes are billed on this private
+    # repository, and a compile matrix is the most expensive thing that could
+    # land on one. Each row names its own capacity label so legs run in
+    # parallel and never contend for a single endpoint.
+    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            runner_os: Linux
+            runner_arch: X64
+            runner_label: cc-linux-build
+            preset: linux-core
+            build_host: true
+            host_build_dir: host/build-linux
+          - label: Windows x86_64
+            runner_os: Windows
+            runner_arch: X64
+            runner_label: cc-win-package
+            # windows-core, not windows-occt: OCCT off is the self-contained
+            # fast build. The OCCT-on Windows tree downloads ~250 MB and builds
+            # Netgen, which belongs in packaging, not in a per-push compile gate.
+            preset: windows-core
+            build_host: true
+            host_build_dir: host/build-windows
+          - label: macOS arm64
+            runner_os: macOS
+            runner_arch: ARM64
+            runner_label: cc-mac-arm
+            preset: macos-arm64
+            # Core only. The macOS host GUI is not a phase-1 target: the macOS
+            # presets build with CHUDWARE_ENABLE_CEF=OFF, and CEF's offscreen
+            # render path has no WKWebView equivalent. Bringing up the core
+            # tree is the whole macOS goal for now, so a host row here would be
+            # a known-red leg that trains everyone to ignore this workflow.
+            build_host: false
+            host_build_dir: ''
+          - label: macOS x86_64
+            runner_os: macOS
+            runner_arch: X64
+            runner_label: cc-mac-intel
+            preset: macos-x86_64
+            build_host: false
+            host_build_dir: ''
+    steps:
+      # Before checkout: a missing compiler or an old CMake otherwise surfaces
+      # as a confusing configure error with no runner-state evidence attached.
+      - name: Check runner capabilities (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner=${RUNNER_NAME:-unknown} os=$RUNNER_OS arch=$RUNNER_ARCH host=$(hostname -s)"
+          uname -a
+
+          missing=()
+          for tool in cmake ninja ctest git python3; do
+            command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::runner ${RUNNER_NAME:-unknown} is missing required tools: ${missing[*]}"
+            exit 1
+          fi
+
+          # CMakePresets.json requires 3.24 — core/CMakeLists.txt uses
+          # $<LINK_GROUP:RESCAN,...>, which older CMake silently mis-generates.
+          cmake_version="$(cmake --version | head -n 1 | awk '{print $3}')"
+          echo "cmake=${cmake_version} ninja=$(ninja --version)"
+          if [ "$(printf '%s\n3.24.0\n' "${cmake_version}" | sort -V | head -n 1)" != "3.24.0" ]; then
+            echo "::error::cmake ${cmake_version} is older than the 3.24 the presets require"
+            exit 1
+          fi
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # These hosts carry Command Line Tools only — no full Xcode — so
+            # nothing here may reach for xcodebuild.
+            sw_vers
+            xcode-select -p
+            echo "sdk=$(xcrun --show-sdk-version) clang=$(xcrun --find clang)"
+            clang --version | head -n 1
+
+            # On everything except Windows, ProvisionOCCT.cmake does not
+            # download anything — it goes straight to
+            # find_package(OpenCASCADE REQUIRED) against a system install, and
+            # the preset's CMAKE_PREFIX_PATH (/opt/homebrew on arm64,
+            # /usr/local on Intel) is what lets it see the keg. Without the
+            # formula the configure dies on "Could not find a package
+            # configuration file provided by OpenCASCADE", which reads like a
+            # code defect and is not one. Named here instead, with the fix.
+            #
+            # Checked, not installed: `brew install opencascade` on a shared
+            # runner is a long, host-mutating operation that two concurrent
+            # jobs would race through brew's lock. A missing formula is a
+            # provisioning ticket, and runner-smoke reports it daily.
+            if ! brew list --versions opencascade >/dev/null 2>&1; then
+              echo "::error::${RUNNER_NAME:-unknown} has no Homebrew opencascade; the ${{ matrix.preset }} preset configures with CHUDWARE_WITH_OCCT=ON and will fail at find_package. Fix with: brew install opencascade"
+              exit 1
+            fi
+            echo "opencascade=$(brew list --versions opencascade)"
+            echo "brew-prefix=$(brew --prefix)"
+          fi
+          df -h "${RUNNER_TEMP:-/tmp}" "$HOME"
+
+      - name: Check runner capabilities and enter the MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        # Windows PowerShell 5.1 — these hosts have no pwsh.
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "runner=$env:RUNNER_NAME os=$env:RUNNER_OS arch=$env:RUNNER_ARCH host=$env:COMPUTERNAME"
+          Write-Host "powershell=$($PSVersionTable.PSVersion)"
+
+          foreach ($tool in @('cmake', 'ninja', 'ctest', 'git')) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              Write-Host "::error::runner $env:RUNNER_NAME is missing required tool: $tool"
+              exit 1
+            }
+          }
+          $cmakeVersion = [version](((cmake --version) -split "`n")[0] -split ' ')[2]
+          Write-Host "cmake=$cmakeVersion"
+          if ($cmakeVersion -lt [version]'3.24.0') {
+            Write-Host "::error::cmake $cmakeVersion is older than the 3.24 the presets require"
+            exit 1
+          }
+
+          # The windows-core preset builds with MSVC + Ninja, which needs cl and
+          # link on PATH. Locating the toolchain with vswhere and exporting the
+          # dev-shell environment into GITHUB_ENV keeps that self-contained: no
+          # third-party action, and no assumption about how the runner service
+          # was launched.
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) {
+            Write-Host "::error::vswhere.exe not found; Visual Studio Build Tools are not installed on $env:RUNNER_NAME"
+            exit 1
+          }
+          $vsPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vsPath) {
+            Write-Host "::error::no Visual Studio installation with the x64 C++ toolset on $env:RUNNER_NAME"
+            exit 1
+          }
+          Write-Host "visual-studio=$vsPath"
+
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation `
+            -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+
+          # Persist only what the dev shell actually changed, so later steps in
+          # this job compile with the same toolchain without re-entering it.
+          Get-ChildItem env: | ForEach-Object {
+            if ($before[$_.Name] -ne $_.Value) {
+              "$($_.Name)=$($_.Value)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+          cl.exe 2>&1 | Select-Object -First 1
+
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          # chudware_version.h is generated at configure time from
+          # `git describe --tags`; a shallow clone without tags yields 0.0.0.
+          fetch-depth: 0
+
+      # third_party/ is gitignored, and actions/checkout's default clean runs
+      # `git clean -ffdx`, which deletes it on every run. Netgen is provisioned
+      # by building it from source (core/cmake/ProvisionNetgen.cmake), so
+      # leaving it in the workspace would mean recompiling a third-party mesher
+      # on every push to master, on every platform. NETGEN_ROOT is a CACHE PATH
+      # precisely so it can live somewhere the clean cannot reach; a
+      # runner-local directory costs $0, unlike actions/cache round-trips.
+      # The first run on a fresh endpoint still pays the full Netgen build.
+      - name: Resolve the persistent provisioning cache (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/chudware-ci/netgen/${{ matrix.preset }}"
+          mkdir -p "${root}"
+          echo "NETGEN_ROOT=${root}" >> "$GITHUB_ENV"
+          echo "netgen-root=${root}"
+
+      - name: Resolve the persistent provisioning cache (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:USERPROFILE '.cache\chudware-ci\netgen\${{ matrix.preset }}'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          "NETGEN_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "netgen-root=$root"
+
+      - name: Configure and build core (${{ matrix.preset }})
+        shell: ${{ runner.os == 'Windows' && 'powershell' || 'bash' }}
+        run: |
+          cmake --preset ${{ matrix.preset }} -DNETGEN_ROOT="${{ env.NETGEN_ROOT }}"
+          cmake --build --preset ${{ matrix.preset }}
+
+      - name: ctest core (${{ matrix.preset }})
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Preset binaryDir is build/<preset> for every platform.
+          tree="build/${{ matrix.preset }}"
+          log="${RUNNER_TEMP}/ctest-core.log"
+          status=0
+          ctest --test-dir "${tree}" --output-on-failure 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
+
+          # A configure that registered no tests would otherwise pass silently.
+          if grep -qE 'No tests were found' "${log}"; then
+            echo "::error::ctest found no tests in ${tree}; the configure did not register the suite"
+            exit 1
+          fi
+
+          {
+            echo '## ctest — ${{ matrix.label }} (${{ matrix.preset }})'
+            echo '```text'
+            tail -n 40 "${log}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "${status}"
+
+      - name: Configure and build host GUI
+        if: matrix.build_host
+        shell: ${{ runner.os == 'Windows' && 'powershell' || 'bash' }}
+        run: |
+          cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build ${{ matrix.host_build_dir }}
+
+      - name: ctest host GUI
+        if: matrix.build_host
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tree="${{ matrix.host_build_dir }}"
+          if [ ! -f "${tree}/CTestTestfile.cmake" ]; then
+            echo "::error::${tree} has no CTest configuration; the host configure did not complete"
+            exit 1
+          fi
+
+          log="${RUNNER_TEMP}/ctest-host.log"
+          status=0
+          ctest --test-dir "${tree}" --output-on-failure 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
+
+          {
+            echo '## ctest — host GUI (${{ matrix.label }})'
+            echo '```text'
+            tail -n 40 "${log}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "${status}"

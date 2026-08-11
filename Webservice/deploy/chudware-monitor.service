@@ -1,5 +1,5 @@
 [Unit]
-Description=chudware-web host monitor (RAM/disk/GPU/session reaper)
+Description=chudware-web host monitor (RAM/disk/GPU, disk-pressure flag)
 Documentation=file://%h/Repositories/CAD/Webservice/deploy/RUNBOOK.md
 After=network.target
 

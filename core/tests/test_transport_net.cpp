@@ -46,11 +46,25 @@ std::span<const std::byte> bytes(std::string_view text) {
 std::string text(std::span<const std::byte> value) {
     return {reinterpret_cast<const char*>(value.data()), value.size()};
 }
+// MSG_NOSIGNAL is Linux; Darwin has no send flag for it and suppresses SIGPIPE
+// per-socket instead. Same degrade-to-0 convention as
+// services/manufacturing/gateway/transport_tcp.cpp, plus the SO_NOSIGPIPE call in
+// send_all below so a peer that closes early yields EPIPE rather than killing the
+// test process.
+#ifdef MSG_NOSIGNAL
+constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+constexpr int kSendFlags = 0;
+#endif
 
 void send_all(int socket, std::span<const std::byte> data) {
     std::size_t offset = 0;
+#if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+    const int on = 1;
+    ::setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);  // idempotent
+#endif
     while (offset < data.size()) {
-        const ssize_t count = ::send(socket, data.data() + offset, data.size() - offset, MSG_NOSIGNAL);
+        const ssize_t count = ::send(socket, data.data() + offset, data.size() - offset, kSendFlags);
         if (count < 0 && errno == EINTR) continue;
         if (count <= 0) throw std::runtime_error("fake server send failed");
         offset += static_cast<std::size_t>(count);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""chudware-web host monitor — sample host health, reaper actions, JSONL log.
+"""chudware-web host monitor — sample host health, disk-pressure flag, JSONL log.
 
 stdlib only. Run by systemd user timer every 2 min, or:
   python3 monitor.py            # sample + act + append JSONL
@@ -24,16 +24,8 @@ DATA_ROOT = Path(os.environ.get("CHUDWARE_WEB_DATA", Path.home() / "chudware-web
 LOG_PATH = DATA_ROOT / "logs" / "monitor.jsonl"
 REFUSE_FLAG = DATA_ROOT / "REFUSE_NEW"
 GATEWAY_HEALTHZ = os.environ.get("CHUDWARE_GATEWAY_HEALTHZ", "http://127.0.0.1:8300/healthz")
-CONTAINER_STORAGE = Path(
-    os.environ.get(
-        "CHUDWARE_CONTAINER_STORAGE",
-        Path.home() / ".local/share/containers/storage",
-    )
-)
-MEM_ACT_BYTES = int(os.environ.get("CHUDWARE_MONITOR_MEM_ACT", str(4 * 1024**3)))  # 4 GiB
 DISK_REFUSE_PCT = float(os.environ.get("CHUDWARE_MONITOR_DISK_REFUSE_PCT", "10"))
 LOG_ROTATE_BYTES = 10 * 1024 * 1024  # 10 MiB
-SESSION_NAME_PREFIX = "chudware-sess-"
 
 
 def _run(cmd: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
@@ -121,37 +113,6 @@ def nvidia_sample() -> dict[str, Any]:
     return {"available": True, "gpus": gpus}
 
 
-def podman_sessions() -> list[dict[str, Any]]:
-    rc, out, err = _run(
-        [
-            "podman",
-            "ps",
-            "--filter",
-            f"name={SESSION_NAME_PREFIX}",
-            "--format",
-            "{{.Names}}\t{{.Status}}\t{{.CreatedAt}}\t{{.ID}}",
-        ]
-    )
-    if rc != 0:
-        return []
-    rows: list[dict[str, Any]] = []
-    for line in out.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        rows.append(
-            {
-                "name": parts[0].strip(),
-                "status": parts[1].strip(),
-                "created": parts[2].strip(),
-                "id": parts[3].strip() if len(parts) > 3 else "",
-            }
-        )
-    return rows
-
-
 def gateway_health() -> dict[str, Any] | None:
     try:
         req = urllib.request.Request(GATEWAY_HEALTHZ, method="GET")
@@ -162,63 +123,6 @@ def gateway_health() -> dict[str, Any] | None:
         return None
 
 
-def pick_oldest_idle(sessions: list[dict[str, Any]], health: dict[str, Any] | None) -> str | None:
-    """Prefer gateway-reported idle sessions; fall back to oldest running container."""
-    if not sessions:
-        return None
-
-    idle_names: list[str] = []
-    if isinstance(health, dict):
-        # Prefer explicit idle list; else sessions[] entries marked idle=true.
-        for key in ("idle_sessions", "sessions"):
-            val = health.get(key)
-            if not isinstance(val, list):
-                continue
-            for item in val:
-                if isinstance(item, str):
-                    if key == "idle_sessions":
-                        idle_names.append(item)
-                elif isinstance(item, dict):
-                    name = item.get("container") or item.get("name") or item.get("id")
-                    if not isinstance(name, str) or not name:
-                        continue
-                    if key == "idle_sessions" or item.get("idle") is True:
-                        idle_names.append(
-                            name
-                            if name.startswith(SESSION_NAME_PREFIX)
-                            else f"{SESSION_NAME_PREFIX}{name}"
-                        )
-            if key == "idle_sessions" and idle_names:
-                break
-
-    by_name = {s["name"]: s for s in sessions}
-    for n in idle_names:
-        if n in by_name:
-            return n
-        # slug-only match
-        for sname in by_name:
-            if sname == n or sname.endswith(n) or n.endswith(sname):
-                return sname
-
-    # Fall back: oldest by CreatedAt string order is unreliable; use podman inspect if few.
-    # Prefer reverse of list order (podman ps default is newest-first) → last is oldest.
-    return sessions[-1]["name"] if sessions else None
-
-
-def stop_session(name: str, dry_run: bool) -> dict[str, Any]:
-    if dry_run:
-        return {"action": "stop", "target": name, "dry_run": True, "ok": True}
-    rc, out, err = _run(["podman", "stop", "-t", "20", name], timeout=60.0)
-    return {
-        "action": "stop",
-        "target": name,
-        "ok": rc == 0,
-        "rc": rc,
-        "stdout": out[:500],
-        "stderr": err[:500],
-    }
-
-
 def set_refuse(want: bool, dry_run: bool) -> dict[str, Any] | None:
     exists = REFUSE_FLAG.exists()
     if want and not exists:
@@ -226,7 +130,7 @@ def set_refuse(want: bool, dry_run: bool) -> dict[str, Any] | None:
             REFUSE_FLAG.parent.mkdir(parents=True, exist_ok=True)
             REFUSE_FLAG.write_text(
                 f"set by chudware-monitor at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                "disk free below threshold; gateway must refuse new sessions\n",
+                "disk free below threshold; the gateway is under disk pressure\n",
                 encoding="utf-8",
             )
         return {"action": "refuse_new", "set": True, "dry_run": dry_run}
@@ -257,37 +161,17 @@ def sample_and_act(*, dry_run: bool) -> dict[str, Any]:
     mem_total = mi.get("MemTotal", 0)
     load1, load5, load15 = os.getloadavg()
     disk_data = disk_sample(DATA_ROOT)
-    disk_ctr = disk_sample(CONTAINER_STORAGE)
     nvidia = nvidia_sample()
-    sessions = podman_sessions()
     health = gateway_health()
 
     actions: list[dict[str, Any]] = []
 
-    # Disk refuse: free_pct on data root OR container storage < threshold
-    free_pcts = [
-        d.get("free_pct")
-        for d in (disk_data, disk_ctr)
-        if isinstance(d.get("free_pct"), (int, float))
-    ]
-    min_free = min(free_pcts) if free_pcts else 100.0
+    # Disk refuse: free_pct on the data root below the threshold.
+    free_pct = disk_data.get("free_pct")
+    min_free = free_pct if isinstance(free_pct, (int, float)) else 100.0
     refuse_act = set_refuse(min_free < DISK_REFUSE_PCT, dry_run)
     if refuse_act:
         actions.append(refuse_act)
-
-    # Low RAM: stop oldest idle session
-    if mem_avail and mem_avail < MEM_ACT_BYTES and sessions:
-        target = pick_oldest_idle(sessions, health)
-        if target:
-            actions.append(stop_session(target, dry_run))
-            actions.append(
-                {
-                    "action": "reason",
-                    "why": "MemAvailable_below_threshold",
-                    "mem_available": mem_avail,
-                    "threshold": MEM_ACT_BYTES,
-                }
-            )
 
     record: dict[str, Any] = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -298,10 +182,8 @@ def sample_and_act(*, dry_run: bool) -> dict[str, Any]:
             "available_gib": round(mem_avail / (1024**3), 3) if mem_avail else 0,
         },
         "load": {"1": load1, "5": load5, "15": load15},
-        "disk": {"data_root": disk_data, "container_storage": disk_ctr},
+        "disk": {"data_root": disk_data},
         "nvidia": nvidia,
-        "sessions": sessions,
-        "session_count": len(sessions),
         "gateway_health": health is not None,
         "refuse_new": REFUSE_FLAG.exists() if not dry_run else (min_free < DISK_REFUSE_PCT or REFUSE_FLAG.exists()),
         "actions": actions,

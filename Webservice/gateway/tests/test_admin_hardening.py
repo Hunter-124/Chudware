@@ -40,7 +40,7 @@ OTHER_ADMIN = "other@example.com"
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    """Seeded admin account + tmp data root; no real tmux / podman."""
+    """Seeded admin account + tmp data root; no real tmux."""
     monkeypatch.setattr(settings, "dev_mode", True)
     monkeypatch.setattr(settings, "data_root", tmp_path / "data")
     users_file = tmp_path / "users.yaml"
@@ -59,11 +59,6 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "users_file", users_file)
     monkeypatch.setattr(app_mod.user_directory, "path", users_file)
     app_mod.user_directory.reload(force=True)
-
-    async def _no_podman(args, timeout=120.0):
-        return 0, "", ""
-
-    monkeypatch.setattr(app_mod.manager, "run_podman", _no_podman)
     return tmp_path
 
 

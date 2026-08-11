@@ -405,8 +405,8 @@ bool ensureRuntime(std::string &log) {
 bool repairRuntime(std::string &log) { return provisionRuntime(true, log); }
 
 #else // ---------------------------------------------------------------------
-      // POSIX (Linux/macOS): XDG data dir, /proc/self/exe, python3.11 +
-      // venv/bin.
+      // POSIX (Linux/macOS): XDG data dir, platform::executablePath(),
+      // python3.11 + venv/bin.
 
 #include <unistd.h>
 
@@ -414,6 +414,8 @@ bool repairRuntime(std::string &log) { return provisionRuntime(true, log); }
 #include <filesystem>
 #include <set>
 #include <string>
+
+#include "util/platform_paths.h"
 
 namespace fs = std::filesystem;
 
@@ -612,13 +614,10 @@ bool provisionRuntime(bool force, std::string &log) {
 } // namespace
 
 std::string exeDir() {
-  char buf[4096];
-  ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-  if (n > 0) {
-    buf[n] = '\0';
-    return fs::path(buf).parent_path().string();
-  }
-  return ".";
+  const std::string exe = chudware::platform::executablePath();
+  if (exe.empty())
+    return ".";
+  return fs::path(exe).parent_path().string();
 }
 
 std::string runtimePython() {

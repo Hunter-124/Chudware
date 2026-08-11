@@ -305,9 +305,15 @@ Lib3MF::PWrapper load_lib3mf() {
         }
     }
 #else
-    // POSIX: prefer the lib3mf shared object staged beside this module (libchudware.so),
-    // located via dladdr; fall back to the loader search by bare soname.
+    // POSIX: prefer the lib3mf shared object staged beside this module (the engine),
+    // located via dladdr; fall back to the loader search by bare soname. The bare
+    // name has to match the platform too — dlopen("lib3mf.so") on Mach-O can only
+    // ever fail.
+#  if defined(__APPLE__)
+    std::string dll_path = "lib3mf.dylib";
+#  else
     std::string dll_path = "lib3mf.so";
+#  endif
     Dl_info info;
     if (dladdr(reinterpret_cast<void*>(&load_lib3mf), &info) && info.dli_fname) {
         std::filesystem::path dir = std::filesystem::path(info.dli_fname).parent_path();

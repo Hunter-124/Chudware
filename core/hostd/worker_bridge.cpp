@@ -44,9 +44,10 @@ bool WorkerBridge::call(const std::string& /*method*/, const nlohmann::json& /*p
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
-#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "util/parent_death.h"
 
 namespace hostd {
 
@@ -208,10 +209,9 @@ bool WorkerBridge::spawn(std::string& err) {
         // Child: async-signal-safe orphan-proofing first (mirrors child_supervisor.cpp:310-315
         // in spirit).
         ::setpgid(0, 0);
-        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
-        // Race guard: if hostd died between fork and prctl, PDEATHSIG never fires — re-check
-        // the parent is still us.
-        if (::getppid() != parentPid) _exit(1);
+        // Parent-death linkage: PDEATHSIG on Linux, a kqueue babysitter on
+        // Darwin. Never returns if hostd already died.
+        chudware::platform::guardParentDeath(parentPid);
         // stdin <- inPipe[0], stdout -> outPipe[1]; stderr stays (hostd log/console).
         dup2(inPipe[0], STDIN_FILENO);
         dup2(outPipe[1], STDOUT_FILENO);
@@ -221,7 +221,7 @@ bool WorkerBridge::spawn(std::string& err) {
         ::close(outPipe[1]);
         // Close every other inherited fd (hostd's listen/client sockets etc.) so they never
         // leak into the python worker child.
-        ::close_range(3, ~0U, 0);
+        chudware::platform::closeInheritedFds(3);
         if (!repo_.empty() && chdir(repo_.c_str()) != 0) {
             // Fall through; exec from current cwd. Worker import may still fail clearly.
         }

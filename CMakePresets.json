@@ -1,6 +1,10 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "linux-core",
@@ -47,6 +51,46 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       }
+    },
+    {
+      "name": "macos-arm64",
+      "displayName": "macOS arm64 core (libchudware, Ninja + AppleClang, OCCT)",
+      "description": "Configure the C++ core with the OCCT geometry kernel on macOS. Needs only the Xcode Command Line Tools (no full Xcode) plus Homebrew ninja/cmake/opencascade. CMAKE_PREFIX_PATH points at the /opt/homebrew Homebrew prefix because Homebrew is not on CMake's default search path, so ProvisionOCCT's find_package(OpenCASCADE REQUIRED) cannot see it otherwise. CEF is off on macOS: no CEF binary distribution is vendored for Darwin, so the embedded-browser widgets are compiled out. Requires CMake >= 3.24 (the file-level cmakeMinimumRequired) — core/CMakeLists.txt's $<LINK_GROUP:RESCAN,...> only emits the correct ld64 flags from 3.24 on.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/macos-arm64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_PREFIX_PATH": "/opt/homebrew",
+        "CHUDWARE_BUILD_CORE": "ON",
+        "CHUDWARE_WITH_OCCT": "ON",
+        "CHUDWARE_ENABLE_CEF": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "macos-x86_64",
+      "displayName": "macOS x86_64 core (libchudware, Ninja + AppleClang, OCCT)",
+      "description": "Configure the C++ core with the OCCT geometry kernel on macOS. Needs only the Xcode Command Line Tools (no full Xcode) plus Homebrew ninja/cmake/opencascade. CMAKE_PREFIX_PATH points at the /usr/local Homebrew prefix because Homebrew is not on CMake's default search path, so ProvisionOCCT's find_package(OpenCASCADE REQUIRED) cannot see it otherwise. CEF is off on macOS: no CEF binary distribution is vendored for Darwin, so the embedded-browser widgets are compiled out. Requires CMake >= 3.24 (the file-level cmakeMinimumRequired) — core/CMakeLists.txt's $<LINK_GROUP:RESCAN,...> only emits the correct ld64 flags from 3.24 on.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/macos-x86_64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_OSX_ARCHITECTURES": "x86_64",
+        "CMAKE_PREFIX_PATH": "/usr/local",
+        "CHUDWARE_BUILD_CORE": "ON",
+        "CHUDWARE_WITH_OCCT": "ON",
+        "CHUDWARE_ENABLE_CEF": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     }
   ],
   "buildPresets": [
@@ -63,6 +107,16 @@
     {
       "name": "windows-occt",
       "configurePreset": "windows-occt",
+      "configuration": "Release"
+    },
+    {
+      "name": "macos-arm64",
+      "configurePreset": "macos-arm64",
+      "configuration": "Release"
+    },
+    {
+      "name": "macos-x86_64",
+      "configurePreset": "macos-x86_64",
       "configuration": "Release"
     }
   ]

@@ -55,9 +55,11 @@ bool OmpBridgeClient::call(const std::string& /*method*/, const nlohmann::json& 
 #include <poll.h>
 #include <signal.h>
 #include <sys/file.h>
-#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "util/parent_death.h"
+#include "util/platform_paths.h"
 
 namespace chudware {
 namespace agent {
@@ -83,7 +85,7 @@ bool fileExists(const std::string& p) {
 
 // Walk upward from `start` looking for the vendor/omp/bridge/src/bridge.ts repo-root marker,
 // so the bridge resolves whether the caller runs from a build dir, the repo root, or an
-// installed AppDir. Mirrors the /proc/self/exe upward-walk convention used by
+// installed AppDir. Mirrors the running-executable upward-walk convention used by
 // host/src/bootstrap.cpp for locating the runtime payload.
 std::string findRepoRootFrom(std::filesystem::path start) {
     std::error_code ec;
@@ -105,11 +107,8 @@ std::string resolveRepoRoot() {
         if (fileExists(root + "/vendor/omp/bridge/src/bridge.ts")) return root;
     }
     // 2) walk up from the running executable — works from any build/install layout.
-    char buf[4096];
-    ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n > 0) {
-        buf[n] = '\0';
-        std::string found = findRepoRootFrom(std::filesystem::path(buf).parent_path());
+    if (const std::string exe = platform::executablePath(); !exe.empty()) {
+        std::string found = findRepoRootFrom(std::filesystem::path(exe).parent_path());
         if (!found.empty()) return found;
     }
     // 3) walk up from the current working directory (dev runs, e.g. `./test_agent` from a
@@ -424,13 +423,12 @@ bool OmpBridgeClient::spawn(std::string& err) {
         return false;
     }
     if (pid == 0) {
-        // Child: async-signal-safe orphan-proofing first (mirrors child_supervisor.cpp:310-315
-        // in spirit).
+        // Child: async-signal-safe orphan-proofing first (same shape as
+        // child_supervisor.cpp's doSpawn).
         ::setpgid(0, 0);
-        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
-        // Race guard: if hostd died between fork and prctl, PDEATHSIG never fires — re-check
-        // the parent is still us.
-        if (::getppid() != parentPid) _exit(1);
+        // Parent-death linkage: PDEATHSIG on Linux, a kqueue babysitter on Darwin.
+        // Never returns if hostd already died.
+        platform::guardParentDeath(parentPid);
         // stdin <- inPipe[0], stdout -> outPipe[1], stderr -> errPipe[1]. bridge.ts logs its
         // own [omp-bridge] lines (and bun's import-time diagnostics) on stderr — never mixed
         // into the response stream. The pump thread tees them straight back out to OUR stderr,
@@ -446,7 +444,7 @@ bool OmpBridgeClient::spawn(std::string& err) {
         ::close(errPipe[1]);
         // Close every other inherited fd (hostd's listen/client sockets etc.) so they never
         // leak into the bun child.
-        ::close_range(3, ~0U, 0);
+        platform::closeInheritedFds(3);
         execlp(bunExe_.c_str(), bunExe_.c_str(), "run", bridgeScript_.c_str(), (char*)nullptr);
         _exit(127);
     }

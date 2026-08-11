@@ -84,7 +84,6 @@ class RateLimiter:
 api_writes = RateLimiter(settings.rate_writes_per_min, 60.0)
 uploads = RateLimiter(settings.rate_uploads_per_min, 60.0)
 chat_messages = RateLimiter(settings.rate_chat_per_min, 60.0)
-session_starts = RateLimiter(settings.rate_session_starts_per_hour, 3600.0)
 
 
 def user_slug(email: str) -> str:
@@ -169,7 +168,6 @@ __all__ = [
     "api_writes",
     "uploads",
     "chat_messages",
-    "session_starts",
     "user_slug",
     "enforce_upload_size",
     "dir_size_bytes",

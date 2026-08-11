@@ -32,7 +32,7 @@ log = logging.getLogger("chudware-web.deploy")
 
 router = APIRouter(prefix="/api/admin", tags=["deploy"])
 
-_VALID_TARGETS = frozenset({"wasm", "image", "engine"})
+_VALID_TARGETS = frozenset({"wasm", "engine"})
 
 
 def _require_admin(request: Request):
@@ -291,7 +291,7 @@ async def deploy_rebuild(request: Request) -> JSONResponse:
         if not isinstance(t, str) or t not in _VALID_TARGETS:
             raise HTTPException(
                 status_code=400,
-                detail=f"invalid target {t!r}; expected one of wasm,image,engine",
+                detail=f"invalid target {t!r}; expected one of wasm,engine",
             )
         if t not in cleaned:
             cleaned.append(t)

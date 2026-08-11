@@ -1,4 +1,4 @@
-// POSIX backend (fork/PDEATHSIG/execvpe). Windows sibling: child_supervisor_win.cpp
+// POSIX backend (fork/parent-death guard/exec). Windows sibling: child_supervisor_win.cpp
 // (Job Objects, KILL_ON_JOB_CLOSE).
 #ifndef _WIN32
 
@@ -10,12 +10,12 @@
 
 #include <fcntl.h>
 #include <signal.h>
-#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "hostd_log.h"
+#include "util/parent_death.h"
 
 extern char** environ;
 
@@ -27,6 +27,29 @@ static long long monoMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// pipe2(O_CLOEXEC) is Linux-only. Darwin has to set the flag after the fact, so
+// there is a window in which a concurrent fork+exec elsewhere in the daemon
+// (worker_bridge, omp bridge) could inherit these ends; a leaked read end would
+// keep the pipe open past exec and turn "exec failed?" into a blocking read. The
+// atomic form is therefore kept wherever the kernel offers it, and the exec-report
+// read below is the only consumer, bounded by the child's own exit either way.
+static bool cloexecPipe(int fds[2]) {
+#if defined(__linux__)
+    return ::pipe2(fds, O_CLOEXEC) == 0;
+#else
+    if (::pipe(fds) != 0) return false;
+    for (int i = 0; i < 2; ++i) {
+        const int fl = ::fcntl(fds[i], F_GETFD);
+        if (fl < 0 || ::fcntl(fds[i], F_SETFD, fl | FD_CLOEXEC) != 0) {
+            ::close(fds[0]);
+            ::close(fds[1]);
+            return false;
+        }
+    }
+    return true;
+#endif
 }
 
 void ChildSupervisor::start() {
@@ -291,9 +314,9 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
     // CLOEXEC pipe: a successful exec closes it silently; a failed exec writes
     // errno so the caller gets a synchronous clean error (and no table entry).
     int ep[2];
-    if (::pipe2(ep, O_CLOEXEC) != 0) {
+    if (!cloexecPipe(ep)) {
         isError = true;
-        result = json{{"code", "spawn_failed"}, {"message", "pipe2 failed"}};
+        result = json{{"code", "spawn_failed"}, {"message", "pipe failed"}};
         return;
     }
 
@@ -309,10 +332,9 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
     if (pid == 0) {
         // Child: async-signal-safe calls only until exec.
         ::setpgid(0, 0);
-        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
-        // Race guard: if the daemon died between fork and prctl, PDEATHSIG
-        // never fires — re-check the parent is still us.
-        if (::getppid() != parentPid) _exit(125);
+        // Parent-death linkage: PDEATHSIG on Linux, a kqueue babysitter on
+        // Darwin. Never returns if the daemon already died.
+        chudware::platform::guardParentDeath(parentPid);
         int devnull = ::open("/dev/null", O_RDONLY);
         if (devnull >= 0) ::dup2(devnull, 0);
         int logfd = logPath.empty() ? -1
@@ -322,7 +344,16 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
             ::dup2(logfd, 1);
             ::dup2(logfd, 2);
         }
+#if defined(__linux__)
         ::execvpe(argv[0], argv.data(), envp.data());
+#else
+        // Darwin has no execvpe. Assigning `environ` then calling execvp() is the
+        // documented equivalent — execvp hands the current `environ` to the new
+        // image. A pointer store is async-signal-safe and this child has one
+        // thread, so no one can observe the intermediate state.
+        environ = envp.data();
+        ::execvp(argv[0], argv.data());
+#endif
         int e = errno;
         ssize_t ignored = ::write(ep[1], &e, sizeof e);
         (void)ignored;

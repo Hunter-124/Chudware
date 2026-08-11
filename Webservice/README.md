@@ -8,16 +8,18 @@ and web users all attach to that daemon and the shared workspace — edits fan o
 undo/redo is per-document and shared, `doc.changed` events carry `user{id,display}`
 attribution.
 
-- Deploy/auto-update: `deploy/install_webd.sh` (atomic cp+mv, never over a live mmap);
-  `chudware-webd-sync.path` watches the master build output and reinstalls+restarts the
-  daemon on every green rebuild. `./build.sh wasm` stages the web bundle into
-  `~/chudware-web/app/` (served at `/app` with COOP/COEP).
+- Deploy: `deploy/install_webd.sh` (atomic cp+mv, never over a live mmap) builds the
+  WASM bundle and promotes the engine as one joint release, restarting the daemon only
+  when the joint sha changed. `./build.sh wasm` stages the web bundle into
+  `~/chudware-web/app/` (served at `/app` with COOP/COEP). Day-to-day entry point is
+  `deploy/update.sh`; nothing auto-promotes on rebuild.
 - Performance ratchet: `gateway/tests/perf_probe.py` (CHUDWARE_LIVE=1) — baseline in
   `perf/baseline.json`, traces per git SHA in `perf/traces/`; p95 regressions
   >15% (and >0.1 ms) fail. Run it before committing engine/gateway changes.
   Browser boot/FPS beacons append to `perf/traces/client.jsonl` via `POST /perf/client`.
-- The old streamed-container portal (`sessions.py`, `proxy.py`, `image/`, `monitor.py`)
-  is DEPRECATED and unlinked from the landing page; do not build on it.
+- The streamed-container portal (`sessions.py`, `proxy.py`, `image/`) was **removed**
+  on 2026-08-10. `/app` is the only client. `deploy/monitor.py` survives as a host
+  RAM/disk/GPU sampler and disk-pressure flag.
 
 ## IP note — before any PUBLIC deployment
 

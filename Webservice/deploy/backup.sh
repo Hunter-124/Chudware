@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # chudware-web nightly backup — tars ~/chudware-web-data (PLM bare repos, users.yaml,
-# chat history, per-user homes) into ~/chudware-web-backups with retention.
+# chat history) into ~/chudware-web-backups with retention.
 # Installed as a systemd user timer (chudware-backup.timer) by setup.sh.
 set -euo pipefail
 
@@ -16,24 +16,12 @@ stamp="$(date +%Y%m%d-%H%M%S)"
 out="$DEST/chudware-web-data-$stamp.tar.gz"
 tmp="$out.partial"
 
-# Caches are junk; everything else (plm/, homes/, users.yaml, chat.db, *.env)
-# is state we cannot recreate. Homes hold WIP that may not be pushed to PLM yet.
-# Session homes are :U-chowned into the subuid range, so the host user cannot
-# read them directly — run tar inside the rootless-podman user namespace
-# (podman unshare), which maps them back. Restore the same way:
-#   podman unshare tar -xzf <backup> -C ~
-TAR=(tar -czf "$tmp"
-    --exclude='homes/*/.cache'
-    --exclude='homes/*/.local/share/Trash'
-    --exclude='homes/*/.local/share/chudware/cef_cache*'
-    --exclude='tmp'
-    --exclude='logs'
-    -C "$(dirname "$DATA_ROOT")" "$(basename "$DATA_ROOT")")
-if command -v podman >/dev/null 2>&1; then
-    podman unshare "${TAR[@]}"
-else
-    "${TAR[@]}"
-fi
+# Caches are junk; everything else (plm/, users.yaml, chat.db, *.env) is state
+# we cannot recreate. Restore with:  tar -xzf <backup> -C ~
+tar -czf "$tmp" \
+    --exclude='tmp' \
+    --exclude='logs' \
+    -C "$(dirname "$DATA_ROOT")" "$(basename "$DATA_ROOT")"
 mv "$tmp" "$out"
 chmod 600 "$out"
 

@@ -8,7 +8,15 @@
 #
 # NOTE: ui/imgui and ui/abstract are retired. host/ is the single GUI.
 cmake_minimum_required(VERSION 3.20)
-project(chudware LANGUAGES C CXX)
+
+# Product version (semver from annotated git tags). Included BEFORE project() so
+# project(VERSION) carries the same numbers the generated header does. The same
+# module is included by core/CMakeLists.txt, which is configured standalone
+# (`cmake -S core`) for core/build-occt-linux — this file never runs for that tree.
+include(core/cmake/ChudwareVersion.cmake)
+chudware_version_derive()
+
+project(chudware VERSION ${CHUDWARE_VERSION} LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

@@ -1,5 +1,19 @@
 cmake_minimum_required(VERSION 3.20)
-project(CHUDWARE_Host LANGUAGES C CXX)
+
+# Product version (semver from annotated git tags). host/ is its own CMake project
+# (`cmake -S host -B host/build-linux`), so it includes core's version module
+# directly rather than inheriting anything — one derive implementation, shared with
+# the root and core builds, so all three report the same string.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../core/cmake/ChudwareVersion.cmake")
+chudware_version_derive()
+
+project(CHUDWARE_Host VERSION ${CHUDWARE_VERSION} LANGUAGES C CXX)
+
+# <build>/generated/api/chudware_version.h — build tree, never the source tree.
+# ${CMAKE_CURRENT_SOURCE_DIR}/../core is already on the include path below, so
+# `#include "api/chudware_version.h"` resolves the same way "api/libchudware.h" does.
+chudware_version_header("${CMAKE_BINARY_DIR}/generated")
+set(CHUDWARE_GENERATED_INCLUDE_DIR "${CMAKE_BINARY_DIR}/generated")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,7 +38,10 @@ option(CHUDWARE_ENABLE_CEF "Build the in-process CEF off-screen browser backend"
 
 # Web/WASM builds never ship CEF. Force the option off so cmake/cef.cmake is
 # never included (the SDK is native-only). Native default stays ON above.
-if(EMSCRIPTEN)
+# macOS is the same story: no CEF binary distribution is vendored for Darwin, and
+# the Mach-O one is a .app bundle with a helper-process layout this build does not
+# produce — so the Mac desktop build gets NullWebView, matching the macos-* presets.
+if(EMSCRIPTEN OR APPLE)
   set(CHUDWARE_ENABLE_CEF OFF CACHE BOOL "Build the in-process CEF off-screen browser backend" FORCE)
 endif()
 
@@ -138,6 +155,7 @@ set(CHUDWARE_CORE_SOURCES
   # --- C16: feature tree + doc mirror ---
   src/core/doc_mirror.cpp
   ../services/worker/cpp_core.cpp
+  ../core/util/platform_paths.cpp # executablePath(): one readlink/_NSGetExecutablePath/GetModuleFileNameW
   ../services/worker/worker_router.cpp
   src/ui/feature_tree.cpp
   src/ui/feature_tree_nested.cpp # recursive cached referenced-part/assembly document tree
@@ -311,10 +329,14 @@ if(NOT EMSCRIPTEN)
   if(WIN32)
     target_sources(Chudware PRIVATE app.rc)
   endif()
-  if(NOT WIN32)
-    target_sources(Chudware PRIVATE src/platform/camera_v4l2.cpp)
-  else()
+  # Native camera backend — one per OS. camera_stub.cpp is always compiled in (it
+  # carries CameraBackend::create() and the synthetic fallback), so macOS, which
+  # has no AVFoundation backend, needs no extra TU: create() falls through to the
+  # stub there. camera_v4l2.cpp is Linux-only and camera_mf.cpp Windows-only.
+  if(WIN32)
     target_sources(Chudware PRIVATE src/platform/camera_mf.cpp)
+  elseif(NOT APPLE)
+    target_sources(Chudware PRIVATE src/platform/camera_v4l2.cpp)
   endif()
 endif()
 
@@ -323,6 +345,7 @@ if(EMSCRIPTEN)
   target_include_directories(Chudware PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../core
+    ${CHUDWARE_GENERATED_INCLUDE_DIR}   # api/chudware_version.h (product semver)
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc
     ${stb_SOURCE_DIR}
@@ -386,6 +409,7 @@ else()
   target_include_directories(Chudware PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../core
+    ${CHUDWARE_GENERATED_INCLUDE_DIR}   # api/chudware_version.h (product semver)
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc
     ${stb_SOURCE_DIR}
@@ -464,11 +488,11 @@ add_executable(test_camera_backend
   src/platform/camera_stub.cpp
   src/stb_impl.cpp          # RE-40: V4L2 MJPEG frames decode via stb_image
   tests/test_camera_backend.cpp)
-if(NOT WIN32)
-  target_sources(test_camera_backend PRIVATE src/platform/camera_v4l2.cpp)
-else()
+if(WIN32)
   target_sources(test_camera_backend PRIVATE src/platform/camera_mf.cpp)
-endif()
+elseif(NOT APPLE)
+  target_sources(test_camera_backend PRIVATE src/platform/camera_v4l2.cpp)
+endif()   # macOS: camera_stub.cpp above is the whole backend set
 target_include_directories(test_camera_backend PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${stb_SOURCE_DIR})

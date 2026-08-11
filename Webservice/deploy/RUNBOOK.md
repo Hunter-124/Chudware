@@ -1,6 +1,6 @@
 # chudware-web RUNBOOK (Hunter)
 
-Host: Fedora 44, rootless podman, gateway `127.0.0.1:8300`, data `~/chudware-web-data/`.
+Host: Fedora 44, gateway `127.0.0.1:8300`, data `~/chudware-web-data/`.
 Public: `https://chudware.com` via Cloudflare Tunnel + Access.
 
 ---
@@ -130,7 +130,7 @@ activation to find out which situation UA is in.
 
 ---
 
-## (c) `users.yaml` + heavy seats
+## (c) `users.yaml`
 
 File: `Webservice/gateway/users.yaml`
 
@@ -139,7 +139,7 @@ users:
   - email: you@example.com
     display: Hunter
     role: admin          # admin | user
-    heavy: true          # GPU seat (≤2 concurrent heavy)
+    heavy: true          # reserved entitlement flag (no runtime consumer today)
   - email: alice@ua.edu
     display: Alice
     role: user
@@ -147,8 +147,9 @@ users:
 ```
 
 - Email must match Access JWT `email` claim (or `X-Dev-User` when `CHUDWARE_WEB_DEV=1`).
-- **heavy: true** → session may get CDI GPU + `nvh264enc`; default seats are CPU `x264enc` / llvmpipe.
-- Cap: demo default **3** sessions; hard **4**; **≤2** concurrent heavy. Edit list before demo; restart gateway if it only loads users at boot.
+- **heavy** is a persisted per-account flag surfaced in `/admin` and `/api/me`.
+  Nothing enforces it since the streamed-session product was removed; it is kept
+  as the hook plan entitlements will use.
 
 ---
 
@@ -157,11 +158,9 @@ users:
 - [ ] Secrets rotated; `gateway.env` has `TUNNEL_TOKEN`, `CHUDWARE_CF_TEAM_DOMAIN`, `CHUDWARE_CF_AUD` (mode 600).
 - [ ] `bash Webservice/deploy/setup.sh` already run; linger enabled.
 - [ ] `systemctl --user start chudware-gateway chudware-cloudflared chudware-monitor.timer`
-- [ ] Session image present: `podman image exists localhost/chudware-session:latest`
-- [ ] Optional warm seat: start one session as admin, leave idle for fast first guest.
-- [ ] `curl -sS http://127.0.0.1:8300/healthz` — sessions, free RAM, VRAM, image bit look sane.
+- [ ] `curl -sS http://127.0.0.1:8300/healthz` — free RAM, VRAM, engine bridges look sane.
 - [ ] Access allowlist + `users.yaml` include every demo attendee email.
-- [ ] Browser smoke: `https://chudware.com` → Access challenge → portal → stream iframe.
+- [ ] Browser smoke: `https://chudware.com` → Access challenge → portal → `/app` loads.
 - [ ] Know the “not on the list” path (Access deny vs portal allowlist page).
 - [ ] Confirm `REFUSE_NEW` is absent unless disk is actually critical: `ls ~/chudware-web-data/REFUSE_NEW`.
 
@@ -198,17 +197,17 @@ curl -sS http://127.0.0.1:8300/healthz
 
 Env file: `~/chudware-web-data/gateway.env`. Unit `MemoryMax=1G`.
 
-### Session container logs
+### Engine daemon (chudware-hostd) logs
 
 ```bash
-podman ps -a --filter name=chudware-sess-
-podman logs --tail 200 chudware-sess-<slug>
-podman inspect chudware-sess-<slug> --format '{{.State.Status}} {{.HostConfig.Memory}}'
+systemctl --user status chudware-hostd.service
+journalctl --user -u chudware-hostd.service -n 200 --no-pager
 ```
 
-Published ports: host `127.0.0.1:8400+n` → container `:8080`.
+One shared daemon serves every web client over a unix socket; `/healthz`
+reports `engine_bridges` (live `/engine` websockets).
 
-### Monitor / reaper
+### Monitor
 
 ```bash
 systemctl --user status chudware-monitor.timer
@@ -216,21 +215,9 @@ python3 Webservice/deploy/monitor.py --dry-run   # one JSONL sample
 tail -n 5 ~/chudware-web-data/logs/monitor.jsonl
 ```
 
-- `MemAvailable < 4 GiB` → `podman stop` oldest idle session (idle from `/healthz` if available).
-- Disk free &lt; 10% on data root or container storage → touches `~/chudware-web-data/REFUSE_NEW`; gateway `sessions.start` returns **503** until free space recovers and monitor clears the flag.
-
-### GPU CDI after driver update
-
-Rootless GPU seats need CDI device nodes. After NVIDIA driver upgrades:
-
-```bash
-sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-# verify
-podman run --rm --device nvidia.com/gpu=all --security-opt label=disable \
-  registry.fedoraproject.org/fedora-minimal:44 nvidia-smi -L
-```
-
-Then recreate heavy session containers so they pick up the new CDI spec.
+- Disk free &lt; 10% on the data root → touches `~/chudware-web-data/REFUSE_NEW`.
+  The flag is advisory: `/healthz` and `/admin` surface it so you know the host
+  is under disk pressure. Clear it by hand from `/admin` once space recovers.
 
 ### Linger / user units vanish on logout
 
@@ -241,28 +228,20 @@ sudo loginctl enable-linger "$USER"
 
 ## (f) Admin ops dashboard + backups
 
-### /admin live ops (added post-v1)
+### /admin ops
 
-`https://chudware.com/admin` (admin role) now shows, above the allowlist:
+`https://chudware.com/admin` (admin role) shows, above the allowlist:
 
-- **Live sessions** — per seat: screenshot thumbnail (refreshes ~10 s), status,
-  uptime, idle, CPU/mem (`podman stats`), and a **Stop** button. **Click a
-  thumbnail to spectate** that seat live (view-only noVNC popout; the stream
-  proxy admits admins alongside the owner).
-- **Host bar** — seats used/max, free RAM, VRAM used/total + GPU util
-  (`nvidia-smi`), load, idle timeout, plus **service chips**
-  (cloudflared / monitor / backup unit states) and a **pause new sessions**
-  switch (touches the same `REFUSE_NEW` flag the disk monitor uses; running
-  seats are unaffected, new starts get a busy message).
+- **Host bar** — free RAM, VRAM used/total + GPU util (`nvidia-smi`), load,
+  plus **service chips** (cloudflared / monitor / backup unit states) and a
+  **REFUSE_NEW** toggle (the same disk-pressure flag the monitor writes; the
+  monitor re-creates it while disk is critical, so a manual clear can be
+  overridden on its next sample).
 - **Allowlist table is editable in place** — click the role pill to toggle
-  admin/user (self-demotion blocked), the GPU pill to toggle the heavy seat,
-  the project cell to reassign; changes apply on their next session start.
+  admin/user (self-demotion blocked), the GPU pill to toggle the `heavy` flag,
+  the project cell to reassign.
 - **Gateway log** — journal tail in the page (`/api/admin/logs`), optional
   5 s follow. No SSH needed for demo-day triage.
-
-Portal users get a **Paste text…** button in the stream bar — types text into
-the focused widget inside their seat via `xdotool` (the browser clipboard can't
-reach the container's X clipboard). 20k char cap, argv-passed (no shell).
 
 ### Shared /admin terminal (tmux-backed)
 
@@ -295,17 +274,16 @@ track of the actual work in flight.
 `chudware-backup.timer` (03:30 + jitter, `Persistent=true`) runs
 `Webservice/deploy/backup.sh`:
 
-- Tars **all of `~/chudware-web-data/`** (PLM bare repos, users.yaml, chat.db,
-  per-user homes incl. unpushed WIP, env files) minus caches/logs/tmp.
-- Homes are subuid-owned → tar runs under **`podman unshare`**.
+- Tars **all of `~/chudware-web-data/`** (PLM bare repos, per-account workspace
+  and bucket trees, users.yaml, chat.db, env files) minus logs/tmp.
 - Destination `~/chudware-web-backups/` (mode 700, tarballs 600), newest
   **14** kept. Override via `CHUDWARE_WEB_BACKUP_DIR` / `CHUDWARE_WEB_BACKUP_KEEP`.
 
 ```bash
 systemctl --user start chudware-backup.service     # manual backup now
 systemctl --user list-timers chudware-backup.timer # next run
-# restore (same subuid mapping):
-podman unshare tar -xzf ~/chudware-web-backups/chudware-web-data-<stamp>.tar.gz -C ~
+# restore:
+tar -xzf ~/chudware-web-backups/chudware-web-data-<stamp>.tar.gz -C ~
 ```
 
 Off-host copies are on you: rsync the backup dir somewhere that isn't this
@@ -325,24 +303,17 @@ bash Webservice/deploy/update.sh --pull-only   # git only
 bash Webservice/deploy/update.sh --no-pull     # rebuild current tree
 bash Webservice/deploy/update.sh --host-only   # desktop Chudware binary
 bash Webservice/deploy/update.sh --web-only    # engine + webd + gateway
-bash Webservice/deploy/update.sh --image       # also rebuild session container
-bash Webservice/deploy/update.sh --wasm        # also wasm
 ```
 
 Logs/lock: `~/chudware-web-data/logs/update.log`, `deploy.lock`, `deploy-status.json`
 (shared with admin `rebuild.sh` / `redeploy.sh`).
 
-**Auto-promote engine → webd:** `chudware-webd-sync.path` watches
-`core/build-occt-linux/bin/chudware-hostd` and re-runs `install_webd.sh --restart`
-(idle-wait when sessions are connected). Enabled by `setup.sh` and
-`install_webd.sh`. Confirm with:
+`install_webd.sh` builds the WASM client and promotes the engine in one joint
+release, then restarts `chudware-hostd` only when the joint sha changed. There
+is no auto-promote path unit — run `update.sh` (or `install_webd.sh --restart`)
+when you want the host to pick up a new engine build.
 
-```bash
-systemctl --user is-enabled chudware-webd-sync.path
-systemctl --user status chudware-webd-sync.path --no-pager
-```
-
-Desktop against the **shared** daemon (same engine as web sessions):
+Desktop against the **shared** daemon (same engine the web client uses):
 
 ```bash
 ~/chudware-web/chudware-shared.sh
@@ -358,29 +329,31 @@ Desktop against the **shared** daemon (same engine as web sessions):
 | `Webservice/deploy/update.sh` | **Day-to-day:** pull → rebuild host/engine → webd → gateway |
 | `Webservice/deploy/rebuild.sh` / `redeploy.sh` | Admin-locked rebuild targets / gateway restart |
 | `Webservice/deploy/install_webd.sh` | Promote engine build → `~/chudware-web` + hostd unit |
-| `Webservice/deploy/chudware-*.service` / `.timer` / `.path` | systemd **user** units (incl. webd-sync) |
-| `Webservice/deploy/monitor.py` | Host sample + reaper (stdlib) |
+| `Webservice/deploy/chudware-*.service` / `.timer` | systemd **user** units |
+| `Webservice/deploy/monitor.py` | Host sample + disk-pressure flag (stdlib) |
 | `Webservice/deploy/cf_provision.py` | Driver: tunnel/DNS/Access via API |
 | `~/chudware-web-data/gateway.env` | Secrets + CF team/AUD/token (gitignored conceptually; never commit) |
-| `~/chudware-web-data/{homes,plm,logs,chat.db}` | Runtime data |
-| `Webservice/gateway/users.yaml` | Allowlist + heavy seats |
+| `~/chudware-web-data/{workspace,bucket,plm,logs,chat.db}` | Runtime data |
+| `Webservice/gateway/users.yaml` | Allowlist |
 
 ## AI modeling agent (remote/subscription models)
 
-Sessions run the in-app AI agent against **remote providers only** — no local
-models on this host. Two ways to give sessions credentials:
+The web client runs the in-app AI agent against **remote providers only** — no
+local models on this host. Credentials are resolved SERVER-SIDE and never sent
+to the browser:
 
-1. **Shared keys (yours):** create `~/chudware-web-data/ai_providers.env`
+1. **Host config.json** — whatever provider keys the gateway account's Chudware
+   config already carries. `gateway/engine_bridge.py` fills them in for
+   `agent_list_models` and leaves agent turns to the shared daemon.
+2. **Shared keys file (fallback):** create `~/chudware-web-data/ai_providers.env`
    (`chmod 600`) with `KEY=VALUE` lines (`OPENROUTER_API_KEY=`,
    `ANTHROPIC_API_KEY=`, `OPENAI_API_KEY=`, `XAI_API_KEY=`, `GEMINI_API_KEY=`, …).
-   The gateway forwards every UPPER_CASE var in that file into each session
-   container at start. Restart is NOT needed — the file is re-read per session
-   start; running seats keep their old env until restarted.
-2. **Bring-your-own:** users open Chudware ▸ Settings ▸ AI provider inside their
-   session and enter their own key / subscription login. It persists in their
-   private HOME volume (`~/chudware-web-data/homes/<slug>`), never on the shared
-   image and never visible to other users.
+   Re-read per request; no gateway restart needed.
 
-The session image bakes the Python worker runtime at `/opt/chudware/runtime/venv`
-(`CHUDWARE_PYTHON`) + app payload at `/opt/chudware/app` (`CHUDWARE_REPO`), so the
-agent works out of the box once a provider credential exists.
+Keys are only ever attached to a **canonical, provider-matching endpoint** —
+a client that names any other base_url gets a generic rejection, never a key.
+Client-supplied `api_key`/`base_url`/`auth_mode` on agent turns are stripped.
+`agent_provider_*` (the administrator's auth store) is admin-only.
+
+All web turns spend the host account's provider quota; per-user billing
+isolation is not implemented.

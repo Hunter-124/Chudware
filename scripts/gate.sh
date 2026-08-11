@@ -28,6 +28,9 @@
 # SKIP semantics: OCCT-absent, emsdk-absent and venv-absent are environment SKIPs, not
 # failures — the gate stays green on a box that simply hasn't provisioned those optional
 # runtimes, while still running the stdlib check + whatever builds are possible.
+# That leniency is wrong in CI, where an unprovisioned runner reporting PASS having built
+# nothing is a false green. Set CHUDWARE_GATE_STRICT=1 (linux-gate.yml does) to turn every
+# environment SKIP into a fatal failure. See skip_stage() below.
 #
 # check.py is FATAL as of T-RF3 (2026-07-22): the feature_surface_audit red was fixed by
 # teaching the audit the sketch3d_mode.cpp handler file + the reveng_ prefix dispatcher.
@@ -52,6 +55,42 @@ declare -a SUMMARY
 fail_fatal=0
 
 record() { SUMMARY+=("$1"); }   # arg: "STAGE  RESULT  detail"
+
+# ---- SKIP policy -------------------------------------------------------------
+# Every SKIP in this gate goes through skip_stage, and the kind argument is
+# load-bearing:
+#
+#   env    a capability is missing — no cmake/ninja/ctest, no system OCCT, no
+#          emsdk, no service venv, no collected tests, no built binary. This is
+#          the false-green hazard: a misprovisioned runner otherwise reports
+#          PASS having compiled and tested nothing.
+#   optin  a heavy stage that is off by default and whose CHUDWARE_RUN_* /
+#          CHUDWARE_GATE_* flag was not set. Nothing is broken and nothing was
+#          asked for, so this stays a SKIP even under strict — failing it would
+#          demand every push build an AppImage and run the openEMS/Renode
+#          benches. To exercise those in CI, set their own flags.
+#
+# CHUDWARE_GATE_STRICT=1 converts every env SKIP into a fatal failure. It is set
+# by .github/workflows/linux-gate.yml and never by default, so a developer box
+# without OCCT keeps its green gate while a CI runner that lost its toolchain
+# goes red instead of green-and-empty.
+#
+# Usage: skip_stage <env|optin> <stage label> <summary detail> [console detail]
+skip_stage() {
+    local kind="$1" label="$2" detail="$3" short="${4:-$3}" padded
+    printf -v padded '%-19s ' "$label"
+    if [ "$kind" = "env" ] && [ "${CHUDWARE_GATE_STRICT:-0}" = "1" ]; then
+        record "${padded}FAIL    $detail [strict: environment SKIP]"
+        echo "  FAIL: $short"
+        echo "        CHUDWARE_GATE_STRICT=1 — this runner is missing a capability the gate needs;"
+        echo "        skipping here would report PASS having verified nothing."
+        fail_fatal=1
+        return 0
+    fi
+    record "${padded}SKIP    $detail"
+    echo "  SKIP: $short"
+    return 0
+}
 
 # ---- Runtime python discovery ------------------------------------------------
 # The provisioned service venv has moved with the product's rebrands (AI-CAD -> Billet ->
@@ -120,8 +159,7 @@ stage_check() {
 stage_manual_gen() {
     echo "=== manual regen clean (advisory) ==="
     if ! command -v python3 >/dev/null 2>&1; then
-        record "manual regen clean  SKIP    python3 not on PATH"
-        echo "  SKIP: python3 not installed"
+        skip_stage env "manual regen clean" "python3 not on PATH" "python3 not installed"
         return 0
     fi
     if python3 -m tools.manual_gen --check > ${GATE_TMP}/manual.out 2>&1; then
@@ -142,8 +180,7 @@ stage_manual_gen() {
 stage_ui_style_check() {
     echo "=== ui_style_check.py (advisory) ==="
     if ! command -v python3 >/dev/null 2>&1; then
-        record "ui_style_check.py   SKIP    python3 not on PATH"
-        echo "  SKIP: python3 not installed"
+        skip_stage env "ui_style_check.py" "python3 not on PATH" "python3 not installed"
         return 0
     fi
     if python3 scripts/ui_style_check.py > ${GATE_TMP}/ui_style.out 2>&1; then
@@ -174,18 +211,15 @@ find_occt_config() {
 stage_core_build() {
     echo "=== [2/6] core CMake/Ninja build (libchudware, CHUDWARE_WITH_OCCT=ON) ==="
     if ! command -v cmake >/dev/null 2>&1; then
-        record "core build          SKIP    cmake not on PATH"
-        echo "  SKIP: cmake not installed"
+        skip_stage env "core build" "cmake not on PATH" "cmake not installed"
         return 0
     fi
     if ! command -v ninja >/dev/null 2>&1; then
-        record "core build          SKIP    ninja not on PATH"
-        echo "  SKIP: ninja not installed"
+        skip_stage env "core build" "ninja not on PATH" "ninja not installed"
         return 0
     fi
     if ! occt_cfg="$(find_occt_config)"; then
-        record "core build          SKIP    OCCT cmake config not found (system OCCT not installed)"
-        echo "  SKIP: system OCCT not installed (no OpenCASCADEConfig.cmake under /usr{/lib,/lib64}/cmake/opencascade)"
+        skip_stage env "core build" "OCCT cmake config not found (system OCCT not installed)" "system OCCT not installed (no OpenCASCADEConfig.cmake under /usr{/lib,/lib64}/cmake/opencascade)"
         return 0
     fi
     echo "  OCCT config: $occt_cfg"
@@ -218,8 +252,7 @@ stage_core_build() {
 stage_ui_abstract() {
     echo "=== [2b/6] host GUI build (ninja Chudware) ==="
     if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
-        record "host build          SKIP    cmake or ninja not on PATH"
-        echo "  SKIP: cmake/ninja missing"
+        skip_stage env "host build" "cmake or ninja not on PATH" "cmake/ninja missing"
         return 0
     fi
     local host_build="$REPO/host/build-linux"
@@ -250,8 +283,7 @@ stage_wasm_smoke() {
     echo "=== [2c/6] WASM web-client build smoke ==="
     local emsdk_dir="${EMSDK:-$HOME/.emsdk}"
     if [ ! -f "$emsdk_dir/emsdk_env.sh" ]; then
-        record "wasm build          SKIP    emsdk not found at $emsdk_dir"
-        echo "  SKIP: emsdk not provisioned ($emsdk_dir)"
+        skip_stage env "wasm build" "emsdk not found at $emsdk_dir" "emsdk not provisioned ($emsdk_dir)"
         return 0
     fi
     if ! CHUDWARE_WEB_APP="${GATE_TMP}/wasm-app" ./build.sh wasm > ${GATE_TMP}/wasm.out 2>&1; then
@@ -268,13 +300,11 @@ stage_wasm_smoke() {
 stage_ctest() {
     echo "=== [3/6] ctest (core) ==="
     if [ "${CORE_BUILD_OK:-0}" -ne 1 ]; then
-        record "ctest               SKIP    core build did not succeed"
-        echo "  SKIP: no core build"
+        skip_stage env "ctest" "core build did not succeed" "no core build"
         return 0
     fi
     if ! command -v ctest >/dev/null 2>&1; then
-        record "ctest               SKIP    ctest not on PATH"
-        echo "  SKIP: ctest not installed"
+        skip_stage env "ctest" "ctest not on PATH" "ctest not installed"
         return 0
     fi
     if ! ctest --test-dir core/build-linux -C Release --output-on-failure > ${GATE_TMP}/ctest.out 2>&1; then
@@ -301,8 +331,7 @@ stage_hostd_smoke() {
         [ -x "$cand" ] && { hostd="$cand"; break; }
     done
     if [ -z "$hostd" ]; then
-        record "hostd smoke         SKIP    chudware-hostd not built"
-        echo "  SKIP: no chudware-hostd binary"
+        skip_stage env "hostd smoke" "chudware-hostd not built" "no chudware-hostd binary"
         return 0
     fi
     if python3 scripts/hostd_smoke.py "$hostd" > ${GATE_TMP}/hostd.out 2>&1; then
@@ -327,8 +356,7 @@ stage_web_parity() {
         [ -x "$cand" ] && { hostd="$cand"; break; }
     done
     if [ -z "$hostd" ]; then
-        record "web parity probe    SKIP    chudware-hostd not built"
-        echo "  SKIP: no chudware-hostd binary"
+        skip_stage env "web parity probe" "chudware-hostd not built" "no chudware-hostd binary"
         return 0
     fi
     if python3 scripts/web_parity_probe.py "$hostd" > ${GATE_TMP}/web_parity.out 2>&1; then
@@ -351,13 +379,11 @@ stage_web_parity() {
 stage_appimage_smoke() {
     echo "=== [3c/6] AppImage smoke (advisory) ==="
     if [ "${CHUDWARE_GATE_APPIMAGE:-0}" != "1" ]; then
-        record "appimage smoke      SKIP    set CHUDWARE_GATE_APPIMAGE=1 to build + boot the AppImage"
-        echo "  SKIP: CHUDWARE_GATE_APPIMAGE not set"
+        skip_stage optin "appimage smoke" "set CHUDWARE_GATE_APPIMAGE=1 to build + boot the AppImage" "CHUDWARE_GATE_APPIMAGE not set"
         return 0
     fi
     if ! command -v xvfb-run >/dev/null 2>&1; then
-        record "appimage smoke      SKIP    xvfb-run not on PATH"
-        echo "  SKIP: xvfb-run not installed"
+        skip_stage env "appimage smoke" "xvfb-run not on PATH" "xvfb-run not installed"
         return 0
     fi
     local out=${GATE_TMP}/appimage
@@ -443,8 +469,7 @@ stage_pytest() {
         venv_py="$GATE_PY"
         echo "  runner: $GATE_PY_LABEL"
     else
-        record "pytest              SKIP    no venv with pytest found; provision ~/.local/share/Chudware/mcp-venv or set CHUDWARE_GATE_PYTHON"
-        echo "  SKIP: no venv with pytest available (service venv not provisioned)"
+        skip_stage env "pytest" "no venv with pytest found; provision ~/.local/share/Chudware/mcp-venv or set CHUDWARE_GATE_PYTHON" "no venv with pytest available (service venv not provisioned)"
         return 0
     fi
 
@@ -573,7 +598,7 @@ stage_pytest() {
         # exit 5 = no tests collected (training has none yet) — not a failure
         if [ "$rc" -eq 5 ]; then
             echo "no tests collected (OK)"
-            record "pytest/$dir         SKIP    no tests collected in $dir"
+            skip_stage env "pytest/$dir" "no tests collected in $dir"
             continue
         fi
 
@@ -642,8 +667,7 @@ stage_ui_imgui() {
             echo "  FAIL: missing $bin"
             fail_fatal=1
         else
-            record "host shot           SKIP    host build did not succeed or was skipped"
-            echo "  SKIP: host binary not available"
+            skip_stage env "host shot" "host build did not succeed or was skipped" "host binary not available"
         fi
         return 0
     fi
@@ -705,13 +729,11 @@ stage_ui_imgui() {
 stage_bench() {
     echo "=== [6/6] model-eval bench smoke (T-H8) ==="
     if [ "${CHUDWARE_RUN_BENCH:-0}" != "1" ]; then
-        record "bench (T-H8)        SKIP    set CHUDWARE_RUN_BENCH=1 to run smoke-size eval benches"
-        echo "  SKIP: CHUDWARE_RUN_BENCH not set"
+        skip_stage optin "bench (T-H8)" "set CHUDWARE_RUN_BENCH=1 to run smoke-size eval benches" "CHUDWARE_RUN_BENCH not set"
         return 0
     fi
     if ! command -v python3 >/dev/null 2>&1; then
-        record "bench (T-H8)        SKIP    python3 not on PATH"
-        echo "  SKIP: python3 not installed"
+        skip_stage env "bench (T-H8)" "python3 not on PATH" "python3 not installed"
         return 0
     fi
     if ! python3 -m tools.flywheel.bench.runner --smoke --all --no-write > ${GATE_TMP}/bench.out 2>&1; then
@@ -734,15 +756,13 @@ stage_bench() {
 stage_perf() {
     echo "=== [7/7] modeling perf-regression ==="
     if [ "${CHUDWARE_RUN_PERF:-0}" != "1" ]; then
-        record "perf-regression     SKIP    set CHUDWARE_RUN_PERF=1 to time the modeling kernel"
-        echo "  SKIP: CHUDWARE_RUN_PERF not set"
+        skip_stage optin "perf-regression" "set CHUDWARE_RUN_PERF=1 to time the modeling kernel" "CHUDWARE_RUN_PERF not set"
         return 0
     fi
     local perf_py=""
     perf_py="$(gate_python_or_system)"
     if [ -z "$perf_py" ]; then
-        record "perf-regression     SKIP    no python for perf harness"
-        echo "  SKIP: no python"; return 0
+        skip_stage env "perf-regression" "no python for perf harness" "no python"; return 0
     fi
     # Prefer the just-built OCCT engine so the contention/per-feature diagnostics are captured.
     if [ -z "${CHUDWARE_LIBCHUDWARE:-}" ] && [ -f "$REPO/core/build-occt-linux/bin/libchudware.so" ]; then
@@ -760,8 +780,7 @@ stage_perf() {
         echo "  REGRESSION detected"
         [ "${CHUDWARE_PERF_FATAL:-0}" = 1 ] && fail_fatal=1
     else
-        record "perf-regression     SKIP    harness could not run (rc=$rc; likely no loadable .so)"
-        echo "  SKIP: harness rc=$rc"
+        skip_stage env "perf-regression" "harness could not run (rc=$rc; likely no loadable .so)" "harness rc=$rc"
     fi
 }
 
@@ -775,13 +794,11 @@ stage_perf() {
 stage_vv() {
     echo "=== [4.5/6] V&V benchmark smoke (T-BL01) ==="
     if [ -z "${CHUDWARE_RUN_VV:-}" ]; then
-        record "vv-bench (T-BL01)   SKIP    set CHUDWARE_RUN_VV=smoke or =full to run V&V harness"
-        echo "  SKIP: CHUDWARE_RUN_VV not set"
+        skip_stage optin "vv-bench (T-BL01)" "set CHUDWARE_RUN_VV=smoke or =full to run V&V harness" "CHUDWARE_RUN_VV not set"
         return 0
     fi
     if ! command -v python3 >/dev/null 2>&1; then
-        record "vv-bench (T-BL01)   SKIP    python3 not on PATH"
-        echo "  SKIP: python3 not installed"
+        skip_stage env "vv-bench (T-BL01)" "python3 not on PATH" "python3 not installed"
         return 0
     fi
 
@@ -813,8 +830,7 @@ stage_vv() {
     else
         local rc=$?
         if [ "$rc" -eq 5 ]; then
-            record "vv-bench (T-BL01)   SKIP    no tests collected (check venv + deps)"
-            echo "  SKIP: no tests collected"
+            skip_stage env "vv-bench (T-BL01)" "no tests collected (check venv + deps)" "no tests collected"
         else
             record "vv-bench (T-BL01)   FAIL    pytest exit $rc (see ${GATE_TMP}/vv.out)"
             echo "  FAIL: V&V suite (see ${GATE_TMP}/vv.out):"
@@ -835,13 +851,11 @@ stage_vv() {
 stage_modeling() {
     echo "=== [4.6/6] Modeling-op combination battery (T-BL19) ==="
     if [ -z "${CHUDWARE_RUN_MODELING:-}" ]; then
-        record "modeling (T-BL19)   SKIP    set CHUDWARE_RUN_MODELING=smoke or =full"
-        echo "  SKIP: CHUDWARE_RUN_MODELING not set"
+        skip_stage optin "modeling (T-BL19)" "set CHUDWARE_RUN_MODELING=smoke or =full" "CHUDWARE_RUN_MODELING not set"
         return 0
     fi
     if ! command -v python3 >/dev/null 2>&1; then
-        record "modeling (T-BL19)   SKIP    python3 not on PATH"
-        echo "  SKIP: python3 not installed"
+        skip_stage env "modeling (T-BL19)" "python3 not on PATH" "python3 not installed"
         return 0
     fi
 
@@ -874,8 +888,7 @@ stage_modeling() {
     else
         local rc=$?
         if [ "$rc" -eq 5 ]; then
-            record "modeling (T-BL19)   SKIP    no tests collected (check venv + deps)"
-            echo "  SKIP: no tests collected"
+            skip_stage env "modeling (T-BL19)" "no tests collected (check venv + deps)" "no tests collected"
         else
             record "modeling (T-BL19)   FAIL    pytest exit $rc (see ${GATE_TMP}/modeling.out)"
             echo "  FAIL: modeling battery (see ${GATE_TMP}/modeling.out):"
@@ -892,21 +905,18 @@ stage_modeling() {
 stage_fin_content() {
     echo "=== [4.7/6] T-FIN25 sensor-node golden demo ==="
     if [ "${CHUDWARE_SKIP_FIN25:-}" = "1" ]; then
-        record "fin25 golden demo   SKIP    CHUDWARE_SKIP_FIN25=1"
-        echo "  SKIP: CHUDWARE_SKIP_FIN25=1"
+        skip_stage optin "fin25 golden demo" "CHUDWARE_SKIP_FIN25=1" "CHUDWARE_SKIP_FIN25=1"
         return 0
     fi
     if [ ! -f "$REPO/scripts/demo_sensor_node.py" ]; then
-        record "fin25 golden demo   SKIP    scripts/demo_sensor_node.py missing"
-        echo "  SKIP: demo script missing"
+        skip_stage env "fin25 golden demo" "scripts/demo_sensor_node.py missing" "demo script missing"
         return 0
     fi
 
     local venv_py=""
     venv_py="$(gate_python_or_system)"
     if [ -z "$venv_py" ]; then
-        record "fin25 golden demo   SKIP    no python3"
-        echo "  SKIP: python3 not installed"
+        skip_stage env "fin25 golden demo" "no python3" "python3 not installed"
         return 0
     fi
 
@@ -961,16 +971,15 @@ stage_fin_content() {
 _run_e2e_bench() {  # $1=label $2=script $3=tmp-subdir $4=gate-flag $5=script-env-prefix
     local label="$1" script="$2" pfx="$3" flag="$4" envpfx="$5"
     if [ "${!flag:-}" != "1" ]; then
-        record "$label   SKIP    set ${flag}=1 to run the E2E benchmark"
-        echo "  SKIP: ${flag} not set"
+        skip_stage optin "$label" "set ${flag}=1 to run the E2E benchmark" "${flag} not set"
         return 0
     fi
     if [ ! -f "$REPO/$script" ]; then
-        record "$label   SKIP    $script missing"; echo "  SKIP: $script missing"; return 0
+        skip_stage env "$label" "$script missing" "$script missing"; return 0
     fi
     local venv_py=""
     venv_py="$(gate_python_or_system)"
-    if [ -z "$venv_py" ]; then record "$label   SKIP    no python3"; echo "  SKIP: no python3"; return 0; fi
+    if [ -z "$venv_py" ]; then skip_stage env "$label" "no python3" "no python3"; return 0; fi
     if [ -z "${CHUDWARE_LIBCHUDWARE:-}" ]; then
         for cand in "$REPO/core/build-occt-linux/bin/libchudware.so" \
                     "$REPO/core/build-linux/bin/libchudware.so"; do
@@ -1041,5 +1050,9 @@ if [ "$fail_fatal" -ne 0 ]; then
     echo "RESULT: FAIL (fatal stage failure)"
     exit 1
 fi
-echo "RESULT: PASS (SKIPs are environment-only; check.py FAIL-RECORDED is pre-existing)"
+if [ "${CHUDWARE_GATE_STRICT:-0}" = "1" ]; then
+    echo "RESULT: PASS (CHUDWARE_GATE_STRICT=1 — no environment SKIP occurred; any SKIP above is an unset opt-in flag)"
+else
+    echo "RESULT: PASS (SKIPs are environment-only; check.py FAIL-RECORDED is pre-existing)"
+fi
 exit 0

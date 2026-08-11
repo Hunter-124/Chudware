@@ -1742,6 +1742,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+  // macOS refuses any core profile >= 3.2 without this: NSGL only exposes 3.2+
+  // through the forward-compatible path. Without it glfwCreateWindow returns
+  // null below and run_gui() exits 1. Same hint as makeContext() in main.cpp.
+  glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
 #endif
   if (!shot)
     glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);

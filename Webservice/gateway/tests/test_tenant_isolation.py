@@ -65,12 +65,6 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "users_file", users_file)
     monkeypatch.setattr(app_mod.user_directory, "path", users_file)
     app_mod.user_directory.reload(force=True)
-
-    # Startup calls manager.adopt_running(); keep it off the real podman.
-    async def _no_podman(args, timeout=120.0):
-        return 0, "", ""
-
-    monkeypatch.setattr(app_mod.manager, "run_podman", _no_podman)
     return tmp_path
 
 

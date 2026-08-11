@@ -31,6 +31,7 @@ import secrets
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from argon2 import PasswordHasher
@@ -514,8 +515,8 @@ def clear_session_cookie(response: Response, request: Request) -> None:
 def page_html(title: str, heading: str, body_html: str) -> str:
     """The one HTML shell every unauthenticated gateway page uses.
 
-    Inline <style> only — the CSP forbids inline <script>, and these pages are
-    served on paths where the static mount may not even be reachable yet.
+    Inline <style>, but never inline <script>. Interactive callers reference a
+    content-hashed file through a public asset route that the CSP permits.
     """
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -535,6 +536,10 @@ def page_html(title: str, heading: str, body_html: str) -> str:
     p {{ line-height: 1.5; color: #b0bcc8; }}
     code {{ background: #0f1419; padding: .1rem .35rem; border-radius: 4px; word-break: break-all; }}
     a {{ color: #6cb6ff; }}
+    button {{ border: 0; border-radius: 7px; padding: .7rem 1rem; background: #2f81f7;
+              color: #fff; font: inherit; font-weight: 650; cursor: pointer; }}
+    button:hover {{ background: #4b91f7; }}
+    button:disabled {{ cursor: wait; opacity: .65; }}
     @media (max-width: 480px) {{
       .card {{ padding: 1.25rem; }}
       h1 {{ font-size: 1.2rem; }}
@@ -726,8 +731,11 @@ async def resend_verification(request: Request, body: dict[str, Any]) -> dict[st
     email = normalize_email(body.get("email"))
     if not valid_email(email):
         return _ACCEPTED
-    credential = get_credential(email)
-    if credential is not None and not credential["email_verified"]:
+    # Access/OAuth can create a pending account without creating password
+    # credentials. The account state, not a credentials row, is the authority
+    # for whether this address still needs a verification link.
+    account = accounts.get_account(email)
+    if account is not None and account.status == "pending":
         token = mint_token(email, PURPOSE_VERIFY, VERIFY_TTL)
         send_mail(
             email,

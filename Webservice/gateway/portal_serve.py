@@ -173,7 +173,7 @@ async def auth_page(request: Request) -> Response:
 @router.get("/auth-assets/{asset_path:path}", response_model=None)
 async def auth_asset(asset_path: str, request: Request) -> Response:
     target = _resolve_under_app(asset_path)
-    if not _HASHED_ASSET_RE.fullmatch(target.name) or not target.name.startswith("login."):
+    if not _HASHED_ASSET_RE.fullmatch(target.name) or not target.name.startswith("login"):
         raise HTTPException(status_code=404, detail="hashed sign-in asset not found")
     return _file_response(target, request, immutable=True)
 

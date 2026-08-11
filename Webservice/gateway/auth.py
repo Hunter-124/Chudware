@@ -112,10 +112,12 @@ class JWKSCache:
 _STATUS_COPY: dict[str, tuple[str, str]] = {
     "pending": (
         "Confirm your email address",
-        "<p>We sent a confirmation link to {who}. Click it and you're in —"
-        " your trial starts the moment you do.</p>"
-        '<p>Nothing in your inbox? Check spam, then <a href="/#resend">send'
-        " it again</a>.</p>",
+        "<p>Use the button below to request a fresh verification link for {who}."
+        " Open the link we email you to continue. Your trial starts when you verify.</p>"
+        '<p><button type="button" data-resend-verification data-email="{email}">'
+        "Send verification email</button></p>"
+        '<p id="resend-verification-status" role="status" aria-live="polite"></p>'
+        '<script src="/auth-assets/login-pending.650a485c0a6c.js" defer></script>',
     ),
     "denied": (
         "This account was declined",
@@ -146,10 +148,13 @@ _STATUS_FALLBACK = (
 
 def status_page_html(email: str | None, status: str | None) -> str:
     """The page a signed-in-but-unauthorized caller sees, keyed on WHY."""
-    who = f"<code>{_html_escape(email)}</code>" if email else "your account"
+    escaped_email = _html_escape(email or "")
+    who = f"<code>{escaped_email}</code>" if email else "your account"
     heading, body = _STATUS_COPY.get(status or "", _STATUS_FALLBACK)
     return authn.page_html(
-        heading, heading, f"    {body.format(who=who, support=SUPPORT_EMAIL)}"
+        heading,
+        heading,
+        f"    {body.format(email=escaped_email, who=who, support=SUPPORT_EMAIL)}",
     )
 
 

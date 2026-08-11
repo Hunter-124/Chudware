@@ -1,8 +1,0 @@
----
-import BaseLayout from '../layouts/BaseLayout.astro';
----
-<BaseLayout title="Status" description="Current availability of Chudware account, copilot, and download services.">
-  <header class="page-hero"><div class="wrap"><p class="eyebrow">System status</p><h1>Chudware service health.</h1><p class="lede">This page and its status snapshot are served independently from the application origin.</p></div></header>
-  <section class="section"><div class="wrap"><div class="panel status-summary" data-status-summary data-state="operational">Checking current status…</div><p class="hero-note" data-status-updated></p><ul class="panel status-list" data-status-services><li><span>Account and billing</span><strong>Checking…</strong></li><li><span>AI copilot gateway</span><strong>Checking…</strong></li><li><span>Downloads</span><strong>Checking…</strong></li></ul></div></section>
-  <script is:inline src="/assets/status.js" defer></script>
-</BaseLayout>

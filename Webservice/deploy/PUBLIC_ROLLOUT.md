@@ -140,42 +140,68 @@ Items, and why each one can bite:
 
 ---
 
-## 5. Cutover to a public homepage
+## 5. Cutover to a public homepage — APPLIED 2026-08-11
 
-Decision taken: the marketing site is **static, on Cloudflare Pages, off the
-home box entirely.** Public and bot traffic must never reach the origin. The app
-moves to `app.chudware.com` behind Access.
+Decision taken and now live: the marketing site is **static, on Cloudflare
+Pages, off the home box entirely**, and the application moved to its own
+hostname. Public and bot traffic no longer reach the origin at all.
 
-Access no longer gates the whole origin — it is scoped to `/admin`, and the
-gateway serves its own public pages (landing, register, login) on
-`chudware.com`, `www.chudware.com` and `cad.scootware.us`, all tunnelled to
-`127.0.0.1:8300`. The split still stands on its own merits: public and bot
-traffic should not reach the home box at all.
+```text
+chudware.com, www.chudware.com  -> Cloudflare Pages (project chudware-site)
+                                   PUBLIC. No Access. No tunnel. 23 pages.
+app.chudware.com                -> cloudflared tunnel -> 127.0.0.1:8300
+                                   gateway's own authn is the front door
+app.chudware.com/admin          -> Cloudflare Access (SAME app, same AUD)
+```
 
-**Nothing below has been applied. These are the steps; you run them.**
+What was applied, in the order it has to happen:
 
-1. **Deploy the site.** From `Webservice/public-site/`:
-   `wrangler pages deploy . --project-name chudware-site`
-   (dashboard alternative in that directory's README).
-2. **Set the real prices.** Every figure in `pricing.html` is a placeholder and
-   is labelled as such on the page. Replace them, then delete the `ph-tag` chips
-   and the `.notice` banner. The tier *shape* (what each tier includes) was
-   invented as layout filler — ratify it before publishing.
-3. **Point the apex at Pages.** `chudware.com` + `www` → the Pages project.
-4. **Add the app hostname.** Create `app.chudware.com` as a proxied CNAME to
-   `<tunnel-id>.cfargotunnel.com` and add it to the tunnel ingress → `127.0.0.1:8300`.
-5. **Update the Access app.** Add `app.chudware.com` to the *existing* self-hosted
-   app's `self_hosted_domains`. Do **not** create a second app — all domains share
-   one AUD and the gateway validates a single `CHUDWARE_WEB_CF_AUD`.
-   Remove `chudware.com`/`www` from it once the apex serves Pages.
-6. **Bypass the Stripe webhook.** `/api/billing/webhook` cannot present an Access
-   JWT. Add an Access *bypass* policy for that exact path, or Stripe events will
-   be rejected at the edge. It is authenticated by HMAC signature in the app.
-7. **Retire or re-point `cad.scootware.us`.**
-8. **Watch the queue.** There is no auto-approval switch left to close — every
-   registration is created `pending`, and only email verification (which starts
-   the trial) or an admin `approve` makes it `active`. Keep an eye on
-   `GET /api/admin/accounts/pending-count` once the apex is public.
+1. `app.chudware.com` created as a proxied CNAME to
+   `<tunnel-id>.cfargotunnel.com` and added to the tunnel ingress → `:8300`.
+2. Gateway deployed (prod was 18 commits behind on `8571334f`). This is what
+   made public signup possible at all: the older commit had no `PUBLIC_PATHS`,
+   so `/signin` and `/signup` answered `401 missing Cf-Access-Jwt-Assertion`
+   and a visitor could not reach a sign-up form by any route.
+3. `CHUDWARE_WEB_PUBLIC_URL` repointed to `https://app.chudware.com`. It builds
+   every verification and reset link, so leaving it on the apex would have
+   mailed people links into the static site.
+4. Access removed from the apex **before** DNS moved. In the other order the
+   marketing site inherits the login wall, because Access is applied per
+   hostname at the edge.
+5. Apex + `www` repointed to the Pages project; both added as Pages custom
+   domains.
+6. Apex, `www` and `sso.chudware.com` removed from the tunnel ingress, and the
+   `sso` DNS record deleted — it pointed at an oauth2-proxy on `:8301` that no
+   longer exists as a unit.
+7. Access scoped to `app.chudware.com/admin` on the *existing* app, so the AUD
+   is unchanged. A second app would mint a different AUD and the gateway
+   validates exactly one `CHUDWARE_WEB_CF_AUD`.
+
+Verified from outside the LAN, anonymously, 28/28 checks: every marketing route
+200 with no Access redirect; `/signin`, `/signup` and `/healthz` 200 on the app
+host; `/`, `/workspace/list`, `/bucket`, `/api/me`, `/api/sessions`,
+`/api/provider-keys`, `/api/admin/*` and `/static/admin.js` all 401 to an
+anonymous caller; `/admin` redirects to the Access login; and a real password
+sign-in returns a `chudware_sid` session that reports `role: admin`.
+
+Use curl, not Python `urllib`, to re-run any of that. Cloudflare's bot
+protection 403s the default `Python-urllib` user agent, which is
+indistinguishable from a genuine authorization failure and will send you
+chasing a security regression that is not there.
+
+### Still open here
+
+- **Prices.** Every figure was placeholder filler, so the pricing page now
+  states commercial-preview status and publishes no numbers. Ratify the tier
+  shape before putting figures back.
+- **Stripe webhook bypass.** Not needed yet: Stripe is unconfigured, and
+  `/api/billing/webhook` is in `PUBLIC_PATHS` so it is not gated by the app.
+  It is also outside the `/admin` Access scope, so no edge bypass is required
+  unless Access is ever widened back to the whole host.
+- **`cad.scootware.us`** is already gone from Access and the tunnel ingress.
+- **Watch the queue.** Every registration is created `pending`; only email
+  verification (which starts the trial) or an admin approval makes it `active`.
+  `GET /api/admin/accounts/pending-count`.
 
 ## 6. Stripe setup
 
@@ -330,3 +356,169 @@ and the Cloudflare API token in git history is still live.
   is the harness, not the server.
 - Rollback commit from before this pass: `~/chudware-web-data/ROLLBACK_COMMIT`.
   Backups: `~/chudware-web-backups/` (local + unencrypted; see §4).
+
+---
+
+## 9. Outbound transactional mail — STILL NOT SENDING (2026-08-11)
+
+`CHUDWARE_MAIL_BACKEND` is absent from `~/chudware-web-data/gateway.env`, so it
+defaults to `console` and the journal confirms `mail: drain started
+backend=console` on every boot. Every verification and reset link ever
+"delivered" was written to the log. This is the one reason a registrant never
+receives anything; the funnel itself is proven working end to end (register →
+202 → `pending` → link → `active` + trial + session).
+
+Do not read the absence of queued mail as a second bug. `mail_outbox` is empty
+because the console backend drains successfully — the message is rendered,
+logged, and marked sent.
+
+### The transport that exists
+
+`livingroom-pc` already runs the CloudCastle mail platform, so no third party is
+needed to *send*. What blocks it is authorization, not capability:
+
+- Stalwart is reachable from the host at **`10.89.0.2:465`** (implicit TLS,
+  banner `220 mx.scootware.us Stalwart ESMTP`). Its cert is a real public-CA
+  cert for `mx.scootware.us` and verifies against the system trust store when
+  SNI is that name.
+- The **published** ports do not work from the host. `127.0.0.1:{25,465,993,8080}`
+  and `:587` all time out, because firewalld's `trusted` zone admits the
+  container subnets (`10.89.0.0/24`, `10.88.0.0/16`) but the loopback DNAT path
+  does not match them. Dial the bridge address, not localhost. Host-native
+  ports (22, 5432, 8300) are fine, which is how to tell a firewall problem from
+  a dead listener.
+- Stalwart has **no 587 listener** — it is refused outright. Submission is 465
+  only, which is why `CHUDWARE_SMTP_TLS=implicit` had to be added to `mailer.py`.
+- Sending as `@chudware.com` is **refused today**: authenticating as
+  `noreply@cloudcastle.ai` and issuing `MAIL FROM:<noreply@chudware.com>`
+  returns `501 5.5.4 You are not allowed to send from this address`
+  (`smtp.session.auth.must_match_sender`). `chudware.com` is not a configured
+  domain on that server.
+
+### What finishing it requires
+
+1. **The Stalwart registry admin credential** (`admin@scootware.us`). It is not
+   in `Website-Credentials/cloudcastle-mail.local.txt`, which carries only the
+   `@cloudcastle.ai` mailboxes — and `admin@cloudcastle.ai` authenticates but
+   answers `forbidden` to `x:Domain/query`. Without it the domain cannot be
+   added. `stalwart-mail/install.sh` documents recreating a temporary admin via
+   `STALWART_RECOVERY_MODE`, which restarts the mail server for both live
+   domains — deliberately not done unattended.
+2. Add `chudware.com` as a domain, create `noreply@chudware.com`, let Stalwart
+   generate an **RSA-2048** DKIM key. Its Ed25519 signature was already retired
+   for returning `neutral (no key)` at Gmail.
+3. Widen `mustMatchSender` for the new domain, then
+   `x:Action/set {"create":{"a":{"@type":"ReloadSettings"}}}` and require
+   `created` — settings are cached at boot and a registry write alone changes
+   nothing.
+4. DNS on `chudware.com`. Note the SPF record Cloudflare Email Routing just
+   created is `v=spf1 include:_spf.mx.cloudflare.net ~all` and authorizes
+   forwarding only; it must also authorize `ip4:174.110.99.16` before Stalwart
+   can send for the domain. Publish the DKIM public key and a DMARC record.
+5. Then, in `gateway.env`:
+   ```
+   CHUDWARE_MAIL_BACKEND=smtp
+   CHUDWARE_SMTP_HOST=mx.scootware.us     # + /etc/hosts: 10.89.0.2 mx.scootware.us
+   CHUDWARE_SMTP_PORT=465
+   CHUDWARE_SMTP_TLS=implicit
+   CHUDWARE_SMTP_USER=noreply@chudware.com
+   CHUDWARE_SMTP_PASS=...
+   ```
+   The `/etc/hosts` pin is what lets normal certificate hostname verification
+   succeed while still dialling the only address that is reachable.
+
+### The deliverability decision nobody can engineer around
+
+The sending IP is residential Spectrum (`174.110.99.16`) with a PTR of
+`syn-174-110-099-016.res.spectrum.com` that does not resolve back. A Gmail
+header audit on 2026-08-08 from this host, with **SPF pass, RSA DKIM pass and
+DMARC `p=reject` pass**, still landed in **Spam**. There is no message-format,
+TLS, or authentication fault left to tune; the remaining classifier input is the
+IP and its missing FCrDNS.
+
+That is survivable for a link the user is actively waiting for — and the pending
+page does say to check spam — but a signup funnel where first-contact mail is
+filed as spam converts badly. If reliable inbox placement becomes a
+requirement, the only fixes are Spectrum-provided FCrDNS, a business-mail
+connection, or a reputable authenticated outbound relay as a smarthost.
+Mailboxes, inbound MX, IMAP, webmail and filtering can stay self-hosted either
+way; only the outbound hop moves.
+
+### Inbound @chudware.com — done
+
+The domain had **no MX at all**, so every address the site advertises
+(`support@`, `sales@`, `billing@`, `legal@`, `privacy@`) was a black hole, as
+was `SUPPORT_EMAIL` on every gateway error page. Cloudflare Email Routing is now
+enabled on the zone (MX + SPF + DKIM records created).
+
+**One manual step remains:** Cloudflare emailed `haedmonds69@gmail.com` a
+verification link for the forwarding destination. Until it is clicked, rule
+creation fails with `2054 Destination address is not verified`. After clicking,
+create the forwards:
+
+```bash
+for l in support sales billing legal privacy postmaster abuse; do
+  curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE/email/routing/rules" \
+    -H "Authorization: Bearer $CF_TOKEN" -H 'Content-Type: application/json' \
+    --data "{\"name\":\"$l\",\"enabled\":true,
+      \"matchers\":[{\"type\":\"literal\",\"field\":\"to\",\"value\":\"$l@chudware.com\"}],
+      \"actions\":[{\"type\":\"forward\",\"value\":[\"haedmonds69@gmail.com\"]}]}"
+done
+```
+
+---
+
+## 10. Defects found while cutting over (2026-08-11)
+
+Fixed in this pass:
+
+- **Pending accounts were told a lie with no way out.** An identity arriving
+  through Access is registered by `ensure_account()` as `pending` with no
+  credentials row, no token and no queued mail — but the status page claimed
+  "We sent a confirmation link" and linked `/#resend`, a fragment no page
+  implements. `resend_verification()` also keyed off a credentials row such an
+  account never has, so it minted nothing. Now keyed off `pending` status, with
+  a working button whose handler is served over the public `/auth-assets` route
+  (a non-active caller cannot read `/static/*`).
+- **Silent plaintext SMTP fallback.** `_deliver_smtp` did
+  `if client.has_extn("starttls")` and, when absent, continued over the
+  plaintext socket with the relay password and every reset link on the wire.
+  Now refuses.
+- **A fabricated public status page.** `public/status.json` was a static file
+  asserting "Systems operational" including "Downloads: Operational" — with
+  zero published releases and `chudware-monitor.service` failed. Page removed
+  rather than shipped as a false claim.
+- **Placeholder pricing, an invented copilot transcript, fabricated system
+  requirements and dead download links** on the public site. See the site commit.
+
+Found, NOT fixed — each is a real gap:
+
+- **No code path can create an admin.** `accounts.py` only ever *reads* `role`;
+  nothing writes it. `users.yaml` — which the runbooks and the
+  `chudware-webservice-multitenant` skill both describe as the allowlist and
+  role source, imported idempotently at startup — is **dead**: no module reads
+  it and `config.py` has no `users_file` setting at all, so
+  `CHUDWARE_WEB_USERS_FILE` in `gateway.env` is dead env. Production had
+  **zero** admins and the owner's `role: admin` line had no effect; it was set
+  with a direct `UPDATE` to unblock the cutover. Either restore an import or
+  give `accounts.py` a `set_role` reachable from the admin API, and delete
+  whichever mechanism loses.
+- **`CHUDWARE_WEB_SSO_SHARED_SECRET` is dead env too.** The HTTP-Basic-on-
+  loopback handoff it belonged to is gone from `auth.py` (no `Basic` handling
+  anywhere), and there is no oauth2-proxy unit. The deploy runbook's
+  "verify the authenticated surface with `curl -u email:$SECRET`" recipe
+  therefore cannot work — it returns `401 missing Cf-Access-Jwt-Assertion` for
+  every path and reads as a catastrophic failure. Use
+  `python -m authn ops-session` (§8) instead, and fix the runbook.
+- **`chudware-monitor.service` is failing every 2 minutes**, exiting 2 with
+  `status publish requires R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT`.
+  That is the RAM/disk/GPU/session reaper. It is not cosmetic: this host shares
+  `/` with a self-hosted Actions runner whose cache filled the disk on
+  2026-08-10 and took Stalwart's RocksDB down with `No space left on device`.
+- **The Cloudflare API token and R2 keys in `Webservice/Cloudflare-info.txt` are
+  compromised** — the file says so itself; they were committed in `84963165`
+  and are still the live credentials. Rotate them.
+- **No Google OAuth in prod.** With Access no longer fronting the host, a user
+  who cannot receive mail has no self-service recovery at all: no OAuth, and
+  password reset needs the transport in §9. Configuring OAuth would give a mail-
+  independent way in.

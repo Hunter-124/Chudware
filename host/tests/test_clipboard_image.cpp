@@ -151,10 +151,15 @@ static void test_pasted_path_sanitises_date_stamp() {
         CHECK(!hasDotDotSegment(p));
         // Exactly one component between the root and the file: <root>/<stamp>/paste-0003.png.
         CHECK_EQ(fs::path(p).filename().string(), "paste-0003.png");
-        const std::string rel = fs::path(p).parent_path().string().substr(root.size());
-        CHECK(rel.find('/') == 0);                      // leading separator only
-        CHECK(rel.find('/', 1) == std::string::npos);   // and no second one
+        const fs::path rel = fs::path(p).parent_path().lexically_relative(fs::path(root));
         CHECK(!rel.empty());
+        CHECK(rel != ".");
+        auto component = rel.begin();
+        CHECK(component != rel.end());
+        if (component != rel.end()) {
+            ++component;
+            CHECK(component == rel.end());  // exactly one bucket below the pasted-image root
+        }
     }
     // A stamp with nothing to keep falls back to a literal bucket rather than the root itself.
     CHECK_EQ(ui::pastedImagePath(3, "a/b"),

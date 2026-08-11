@@ -439,7 +439,9 @@ struct Updater::Impl {
         } else {
             Sha256 sha;
             std::uint64_t size = 0;
-            std::array<unsigned char, 1024 * 1024> buffer{};
+            // Stay well below Windows' default 1 MiB thread stack; the former 1 MiB
+            // buffer overflowed the stack in the function prologue before any read.
+            std::array<unsigned char, 64 * 1024> buffer{};
             while (in) {
                 in.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
                 const std::streamsize count = in.gcount();

@@ -433,33 +433,40 @@ struct Updater::Impl {
 
     bool verifyFile(const Manifest& manifest, const std::filesystem::path& path,
                     std::string& error, bool eraseOnFailure) {
-        std::ifstream in(path, std::ios::binary);
-        if (!in) {
-            error = "downloaded update could not be opened";
-        } else {
-            Sha256 sha;
-            std::uint64_t size = 0;
-            // Stay well below Windows' default 1 MiB thread stack; the former 1 MiB
-            // buffer overflowed the stack in the function prologue before any read.
-            std::array<unsigned char, 64 * 1024> buffer{};
-            while (in) {
-                in.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
-                const std::streamsize count = in.gcount();
-                if (count > 0) {
-                    sha.update(buffer.data(), static_cast<std::size_t>(count));
-                    size += static_cast<std::uint64_t>(count);
+        // The read stream lives in its own scope so it is CLOSED before the
+        // erase below. Windows refuses to delete an open file, so a corrupt
+        // artifact was correctly rejected and then left on disk — verification
+        // worked and cleanup silently did not. POSIX allows unlinking an open
+        // file, which is why Linux never showed it.
+        {
+            std::ifstream in(path, std::ios::binary);
+            if (!in) {
+                error = "downloaded update could not be opened";
+            } else {
+                Sha256 sha;
+                std::uint64_t size = 0;
+                // Stay well below Windows' default 1 MiB thread stack; the former 1 MiB
+                // buffer overflowed the stack in the function prologue before any read.
+                std::array<unsigned char, 64 * 1024> buffer{};
+                while (in) {
+                    in.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
+                    const std::streamsize count = in.gcount();
+                    if (count > 0) {
+                        sha.update(buffer.data(), static_cast<std::size_t>(count));
+                        size += static_cast<std::uint64_t>(count);
+                    }
                 }
-            }
-            if (in.bad()) error = "downloaded update could not be read";
-            else if (size != manifest.size) error = "downloaded update size does not match manifest";
-            else {
-                const std::string digest = hexDigest(sha.finish());
-                if (digest != manifest.sha256)
-                    error = "downloaded update SHA-256 does not match manifest";
-                else if (!signatureValid(digest, manifest.signature))
-                    error = "downloaded update Ed25519 signature is invalid";
-                else
-                    return true;
+                if (in.bad()) error = "downloaded update could not be read";
+                else if (size != manifest.size) error = "downloaded update size does not match manifest";
+                else {
+                    const std::string digest = hexDigest(sha.finish());
+                    if (digest != manifest.sha256)
+                        error = "downloaded update SHA-256 does not match manifest";
+                    else if (!signatureValid(digest, manifest.signature))
+                        error = "downloaded update Ed25519 signature is invalid";
+                    else
+                        return true;
+                }
             }
         }
         if (eraseOnFailure) {

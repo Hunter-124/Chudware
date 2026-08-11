@@ -1,12 +1,12 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "socket_test_support.h"
 #include "device/grbl_adapter.h"
 #include "manufacturing/gateway/device_allowlist.h"
 #include "manufacturing/gateway/transport_tcp.h"
 #include "manufacturing/gateway/transport_ws.h"
 
-#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -14,14 +14,11 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
-#include <netinet/in.h>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <sys/socket.h>
 #include <thread>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -35,6 +32,9 @@ using chudware::mfg::gateway::DeviceAllowlist;
 using chudware::mfg::gateway::EndpointIdentity;
 using chudware::mfg::gateway::TcpTransport;
 using chudware::mfg::gateway::WebSocketTransport;
+
+namespace test_net = chudware::test::net;
+using Socket = test_net::Socket;
 using chudware::mfg::gateway::WebSocketTransportConfig;
 
 namespace {
@@ -46,51 +46,38 @@ std::span<const std::byte> bytes(std::string_view text) {
 std::string text(std::span<const std::byte> value) {
     return {reinterpret_cast<const char*>(value.data()), value.size()};
 }
-// MSG_NOSIGNAL is Linux; Darwin has no send flag for it and suppresses SIGPIPE
-// per-socket instead. Same degrade-to-0 convention as
-// services/manufacturing/gateway/transport_tcp.cpp, plus the SO_NOSIGPIPE call in
-// send_all below so a peer that closes early yields EPIPE rather than killing the
-// test process.
-#ifdef MSG_NOSIGNAL
-constexpr int kSendFlags = MSG_NOSIGNAL;
-#else
-constexpr int kSendFlags = 0;
-#endif
-
-void send_all(int socket, std::span<const std::byte> data) {
+void send_all(Socket socket, std::span<const std::byte> data) {
     std::size_t offset = 0;
-#if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
-    const int on = 1;
-    ::setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);  // idempotent
-#endif
     while (offset < data.size()) {
-        const ssize_t count = ::send(socket, data.data() + offset, data.size() - offset, kSendFlags);
-        if (count < 0 && errno == EINTR) continue;
+        const auto count =
+            test_net::sendSocket(socket, data.data() + offset, data.size() - offset);
+        if (count < 0 && test_net::socketInterrupted(test_net::lastSocketError())) continue;
         if (count <= 0) throw std::runtime_error("fake server send failed");
         offset += static_cast<std::size_t>(count);
     }
 }
 
-void send_all(int socket, std::string_view data) { send_all(socket, bytes(data)); }
+void send_all(Socket socket, std::string_view data) { send_all(socket, bytes(data)); }
 
-std::vector<std::byte> recv_exact(int socket, std::size_t size) {
+std::vector<std::byte> recv_exact(Socket socket, std::size_t size) {
     std::vector<std::byte> result(size);
     std::size_t offset = 0;
     while (offset < size) {
-        const ssize_t count = ::recv(socket, result.data() + offset, size - offset, 0);
-        if (count < 0 && errno == EINTR) continue;
+        const auto count =
+            test_net::receiveSocket(socket, result.data() + offset, size - offset);
+        if (count < 0 && test_net::socketInterrupted(test_net::lastSocketError())) continue;
         if (count <= 0) throw std::runtime_error("fake server receive failed");
         offset += static_cast<std::size_t>(count);
     }
     return result;
 }
 
-std::string recv_until(int socket, std::string_view marker, std::size_t limit = 16384) {
+std::string recv_until(Socket socket, std::string_view marker, std::size_t limit = 16384) {
     std::string result;
     while (result.find(marker) == std::string::npos) {
         char buffer[1024];
-        const ssize_t count = ::recv(socket, buffer, sizeof(buffer), 0);
-        if (count < 0 && errno == EINTR) continue;
+        const auto count = test_net::receiveSocket(socket, buffer, sizeof(buffer));
+        if (count < 0 && test_net::socketInterrupted(test_net::lastSocketError())) continue;
         if (count <= 0) throw std::runtime_error("fake server receive-until failed");
         result.append(buffer, static_cast<std::size_t>(count));
         if (result.size() > limit) throw std::runtime_error("fake server request too large");
@@ -114,7 +101,7 @@ struct ClientFrame {
     std::vector<std::byte> payload;
 };
 
-ClientFrame recv_client_frame(int socket) {
+ClientFrame recv_client_frame(Socket socket) {
     const auto first = recv_exact(socket, 2);
     ClientFrame result;
     const auto a = std::to_integer<std::uint8_t>(first[0]);
@@ -167,41 +154,50 @@ std::vector<std::byte> server_frame(std::uint8_t opcode, std::span<const std::by
 
 class FakeServer {
 public:
-    using Handler = std::function<void(int)>;
+    using Handler = std::function<void(Socket)>;
 
     explicit FakeServer(Handler handler) {
-        listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (listener_ < 0) throw std::runtime_error("socket failed");
-        int enabled = 1;
-        setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+        listener_ = test_net::openTcpSocket();
+        if (!test_net::socketValid(listener_)) throw std::runtime_error("socket failed");
+        if (!test_net::setReuseAddress(listener_)) {
+            test_net::closeSocket(listener_);
+            listener_ = test_net::kInvalidSocket;
+            throw std::runtime_error("setsockopt failed");
+        }
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         address.sin_port = 0;
-        if (::bind(listener_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
-            ::listen(listener_, 1) != 0)
+        if (test_net::bindSocket(listener_, reinterpret_cast<sockaddr*>(&address),
+                                 sizeof(address)) != 0 ||
+            test_net::listenSocket(listener_, 1) != 0) {
+            test_net::closeSocket(listener_);
+            listener_ = test_net::kInvalidSocket;
             throw std::runtime_error("bind/listen failed");
-        socklen_t size = sizeof(address);
-        if (getsockname(listener_, reinterpret_cast<sockaddr*>(&address), &size) != 0)
+        }
+        test_net::AddressLength size = sizeof(address);
+        if (test_net::getSocketName(listener_, reinterpret_cast<sockaddr*>(&address), &size) != 0)
             throw std::runtime_error("getsockname failed");
         port_ = ntohs(address.sin_port);
         thread_ = std::thread([this, handler = std::move(handler)] {
             try {
-                const int peer = ::accept(listener_, nullptr, nullptr);
-                if (peer < 0) throw std::runtime_error("accept failed");
+                const Socket peer = test_net::acceptSocket(listener_);
+                if (!test_net::socketValid(peer)) throw std::runtime_error("accept failed");
+                if (!test_net::suppressBrokenPipe(peer))
+                    throw std::runtime_error("setsockopt failed");
                 handler(peer);
-                ::close(peer);
+                test_net::closeSocket(peer);
             } catch (...) {
                 failure_ = std::current_exception();
             }
-            ::close(listener_);
-            listener_ = -1;
+            test_net::closeSocket(listener_);
+            listener_ = test_net::kInvalidSocket;
         });
     }
 
     ~FakeServer() {
         if (thread_.joinable()) thread_.join();
-        if (listener_ >= 0) ::close(listener_);
+        if (test_net::socketValid(listener_)) test_net::closeSocket(listener_);
     }
 
     std::uint16_t port() const { return port_; }
@@ -212,7 +208,8 @@ public:
     }
 
 private:
-    int listener_ = -1;
+    test_net::SocketRuntime socket_runtime_;
+    Socket listener_ = test_net::kInvalidSocket;
     std::uint16_t port_ = 0;
     std::thread thread_;
     std::exception_ptr failure_;
@@ -228,7 +225,7 @@ public:
                          std::string host = "127.0.0.1",
                          std::string address_class = {})
         : file_(std::filesystem::temp_directory_path() /
-                ("chudware-net-allowlist-" + std::to_string(::getpid()) + "-" +
+                ("chudware-net-allowlist-" + std::to_string(test_net::processId()) + "-" +
                  std::to_string(counter_.fetch_add(1)))),
           allowlist(file_) {
         AllowlistEntry entry;
@@ -251,7 +248,7 @@ public:
 };
 std::atomic<unsigned> CommissionedEndpoint::counter_{0};
 
-std::string ws_upgrade(int peer, std::string_view accept_override = {},
+std::string ws_upgrade(Socket peer, std::string_view accept_override = {},
                        std::string_view extra_header = {}) {
     const std::string request = recv_until(peer, "\r\n\r\n");
     const std::string key = header_value(request, "Sec-WebSocket-Key");
@@ -294,7 +291,7 @@ TEST_CASE("RFC 6455 SHA-1 and Accept vectors are exact") {
 }
 
 TEST_CASE("TCP round trip is non-blocking, commissioned, simulated, and capped at transport") {
-    FakeServer server([](int peer) {
+    FakeServer server([](Socket peer) {
         const auto request = recv_exact(peer, 5);
         send_all(peer, request);
         std::this_thread::sleep_for(50ms);
@@ -324,13 +321,12 @@ TEST_CASE("TCP round trip is non-blocking, commissioned, simulated, and capped a
 }
 
 TEST_CASE("TCP flood is capped per poll, carries no raw copy, and honors an expired deadline") {
-    FakeServer server([](int peer) {
+    FakeServer server([](Socket peer) {
         std::array<std::byte, 16 * 1024> chunk{};
         std::size_t sent = 0;
         while (sent < 2 * 1024 * 1024) {
-            const ssize_t count =
-                ::send(peer, chunk.data(), chunk.size(), MSG_NOSIGNAL);
-            if (count < 0 && errno == EINTR) continue;
+            const auto count = test_net::sendSocket(peer, chunk.data(), chunk.size());
+            if (count < 0 && test_net::socketInterrupted(test_net::lastSocketError())) continue;
             if (count <= 0) break;
             sent += static_cast<std::size_t>(count);
         }
@@ -380,7 +376,7 @@ TEST_CASE("TCP refuses hostile DNS resolution outside the commissioned address c
 
 TEST_CASE("TCP refuses uncommissioned endpoints before any connection attempt") {
     const auto file = std::filesystem::temp_directory_path() /
-                      ("chudware-net-deny-" + std::to_string(::getpid()));
+                      ("chudware-net-deny-" + std::to_string(test_net::processId()));
     std::error_code ignored;
     std::filesystem::remove(file, ignored);
     DeviceAllowlist allowlist(file);
@@ -392,9 +388,9 @@ TEST_CASE("TCP refuses uncommissioned endpoints before any connection attempt") 
 }
 
 TEST_CASE("TCP detects a peer half-close as terminal device_lost") {
-    FakeServer server([](int peer) {
+    FakeServer server([](Socket peer) {
         (void)recv_exact(peer, 1);
-        if (::shutdown(peer, SHUT_WR) != 0) throw std::runtime_error("shutdown failed");
+        if (test_net::shutdownSend(peer) != 0) throw std::runtime_error("shutdown failed");
         std::this_thread::sleep_for(50ms);
     });
     CommissionedEndpoint commissioned(TransportKind::Tcp, server.port());
@@ -410,11 +406,10 @@ TEST_CASE("TCP detects a peer half-close as terminal device_lost") {
 }
 
 TEST_CASE("TCP peer reset is terminal device_lost and never reconnects itself") {
-    FakeServer server([](int peer) {
+    FakeServer server([](Socket peer) {
         const auto request = recv_exact(peer, 1);
         (void)request;
-        linger reset{1, 0};
-        setsockopt(peer, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+        if (!test_net::setAbortiveClose(peer)) throw std::runtime_error("setsockopt failed");
     });
     CommissionedEndpoint commissioned(TransportKind::Tcp, server.port());
     TcpTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill, 1s);
@@ -430,7 +425,7 @@ TEST_CASE("TCP peer reset is terminal device_lost and never reconnects itself") 
 
 TEST_CASE("WebSocket handshake accepts exact Accept and refuses bad Accept or extensions") {
     SUBCASE("accepted") {
-        FakeServer server([](int peer) {
+        FakeServer server([](Socket peer) {
             ws_upgrade(peer);
             (void)recv_client_frame(peer);
         });
@@ -441,7 +436,7 @@ TEST_CASE("WebSocket handshake accepts exact Accept and refuses bad Accept or ex
         server.finish();
     }
     SUBCASE("bad Accept") {
-        FakeServer server([](int peer) {
+        FakeServer server([](Socket peer) {
             ws_upgrade(peer, "AAAAAAAAAAAAAAAAAAAAAAAAAAAA");
             std::this_thread::sleep_for(20ms);
         });
@@ -453,7 +448,7 @@ TEST_CASE("WebSocket handshake accepts exact Accept and refuses bad Accept or ex
         server.finish();
     }
     SUBCASE("unsupported extension") {
-        FakeServer server([](int peer) {
+        FakeServer server([](Socket peer) {
             ws_upgrade(peer, {}, "Sec-WebSocket-Extensions: permessage-deflate\r\n");
             std::this_thread::sleep_for(20ms);
         });
@@ -469,7 +464,7 @@ TEST_CASE("WebSocket handshake accepts exact Accept and refuses bad Accept or ex
 TEST_CASE("WebSocket client text and binary frames are masked") {
     std::atomic<bool> text_masked{false};
     std::atomic<bool> binary_masked{false};
-    FakeServer server([&](int peer) {
+    FakeServer server([&](Socket peer) {
         ws_upgrade(peer);
         const auto first = recv_client_frame(peer);
         const auto second = recv_client_frame(peer);
@@ -492,7 +487,7 @@ TEST_CASE("WebSocket client text and binary frames are masked") {
 TEST_CASE("WebSocket reassembles text, answers ping, and echoes server close status") {
     std::atomic<bool> pong_ok{false};
     std::atomic<bool> close_echo_ok{false};
-    FakeServer server([&](int peer) {
+    FakeServer server([&](Socket peer) {
         ws_upgrade(peer);
         const auto first = server_frame(0x1, bytes("hel"), false);
         const auto ping = server_frame(0x9, bytes("probe"));
@@ -527,7 +522,7 @@ TEST_CASE("WebSocket reassembles text, answers ping, and echoes server close sta
 TEST_CASE("WebSocket refuses oversized and invalid frames with protocol close") {
     SUBCASE("oversized") {
         std::atomic<std::uint16_t> close_code{0};
-        FakeServer server([&](int peer) {
+        FakeServer server([&](Socket peer) {
             ws_upgrade(peer);
             std::this_thread::sleep_for(20ms);
             send_all(peer, server_frame(0x2, bytes("123456789")));
@@ -551,7 +546,7 @@ TEST_CASE("WebSocket refuses oversized and invalid frames with protocol close") 
     }
     SUBCASE("masked server frame") {
         std::atomic<std::uint16_t> close_code{0};
-        FakeServer server([&](int peer) {
+        FakeServer server([&](Socket peer) {
             ws_upgrade(peer);
             std::this_thread::sleep_for(20ms);
             send_all(peer, server_frame(0x1, bytes("bad"), true, true));

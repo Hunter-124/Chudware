@@ -54,7 +54,7 @@ void seedAllowlist(const std::filesystem::path& directory,
 
 json findTransport(const json& listed, std::string_view kind) {
     for (const auto& row : listed.at("devices"))
-        if (row.at("transport").at("kind") == kind) return row;
+        if (row.at("transport").at("kind").get_ref<const std::string&>() == kind) return row;
     FAIL("transport candidate not found: " << kind);
     return nullptr;
 }

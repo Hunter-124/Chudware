@@ -131,11 +131,24 @@ gate_python_or_system() {
     command -v python3 2>/dev/null || true
 }
 
-# ---- Stage 1: stdlib gate ---------------------------------------------------
+# ---- Stage 1: source/audit gate ---------------------------------------------
+# CHECK_PYTHON is deliberately separate from CHUDWARE_GATE_PYTHON: linux-gate
+# provisions the audit's exact four-package import surface in a job-local venv,
+# while the later pytest sweep needs the much larger service runtime venv.
 stage_check() {
-    echo "=== [1/6] scripts/check.py (stdlib gate) ==="
-    if python3 scripts/check.py > ${GATE_TMP}/check.out 2>&1; then
-        record "check.py            PASS    all stdlib gates green"
+    echo "=== [1/6] scripts/check.py (source/audit gate) ==="
+    local check_py="${CHECK_PYTHON:-}"
+    if [ -z "$check_py" ]; then
+        check_py="$(command -v python3 2>/dev/null || true)"
+    fi
+    if [ -z "$check_py" ] || [ ! -x "$check_py" ]; then
+        skip_stage env "check.py" "CHECK_PYTHON is not executable (${check_py:-unset})" \
+            "no usable check.py interpreter"
+        return 0
+    fi
+    echo "  interpreter: $check_py"
+    if "$check_py" scripts/check.py > ${GATE_TMP}/check.out 2>&1; then
+        record "check.py            PASS    all source/audit gates green"
         echo "  PASS"
     else
         local rc=$?
@@ -256,7 +269,14 @@ stage_ui_abstract() {
         return 0
     fi
     local host_build="$REPO/host/build-linux"
-    if ! CCACHE_DISABLE=1 cmake -S "$REPO/host" -B "$host_build" -G Ninja -DCMAKE_BUILD_TYPE=Release > ${GATE_TMP}/host_cfg.out 2>&1; then
+    local cmake_args=(-S "$REPO/host" -B "$host_build" -G Ninja -DCMAKE_BUILD_TYPE=Release)
+    # CI keeps the 1.5 GB SDK outside the checkout so actions/checkout cannot
+    # delete it. linux-gate exports CEF_ROOT; pass it as a CMake cache value
+    # instead of relying on a gitignored symlink inside extern/cef.
+    if [ -n "${CEF_ROOT:-}" ]; then
+        cmake_args+=("-DCEF_ROOT=$CEF_ROOT")
+    fi
+    if ! CCACHE_DISABLE=1 cmake "${cmake_args[@]}" > ${GATE_TMP}/host_cfg.out 2>&1; then
         record "host build          FAIL    cmake configure (see ${GATE_TMP}/host_cfg.out)"
         echo "  FAIL: configure"; tail -n 15 ${GATE_TMP}/host_cfg.out | sed 's/^/    /'
         fail_fatal=1

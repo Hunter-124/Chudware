@@ -305,6 +305,7 @@ if(EMSCRIPTEN)
   set(CHUDWARE_WASM_SOURCES ${CHUDWARE_CORE_SOURCES})
   list(APPEND CHUDWARE_WASM_SOURCES
     src/wasm_stubs.cpp
+    ../core/util/tweetnacl.c   # app_commands mutation-token verification
     ../services/ipc/ipc_transport_wasm.cpp
     src/ui/reveng/webcam_capture.cpp   # RE-19 widget (uses camera_stub under web)
     src/platform/camera_stub.cpp)

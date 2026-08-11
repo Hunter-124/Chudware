@@ -1,10 +1,8 @@
 #include "device/emulator_transport.h"
+#include "device/numeric_parse.h"
 
 #include <algorithm>
-#include <charconv>
-#include <cmath>
 #include <cstdio>
-#include <limits>
 
 #include "device/grbl_protocol.h"
 
@@ -22,11 +20,10 @@ std::vector<std::byte> bytesFor(std::string_view text) {
 bool parseAxis(std::string_view command, char axis, double& value) {
     for (std::size_t at = 0; at < command.size(); ++at) {
         if (command[at] != axis && command[at] != static_cast<char>(axis + ('a' - 'A'))) continue;
-        const char* begin = command.data() + at + 1;
-        const char* end = command.data() + command.size();
+        const std::string_view candidate = command.substr(at + 1);
         double parsed = 0.0;
-        const auto result = std::from_chars(begin, end, parsed);
-        if (result.ec == std::errc{} && std::isfinite(parsed)) {
+        std::size_t consumed = 0;
+        if (parseFiniteDoublePrefix(candidate, parsed, consumed)) {
             value = parsed;
             return true;
         }

@@ -2,11 +2,13 @@
 #include <doctest/doctest.h>
 
 #include "device/grbl_protocol.h"
+#include "device/numeric_parse.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <fstream>
+#include <locale>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -17,6 +19,40 @@
 
 namespace {
 using namespace chudware::device;
+
+class CommaDecimalPoint final : public std::numpunct<char> {
+ protected:
+  char do_decimal_point() const override { return ','; }
+};
+
+class ScopedGlobalLocale final {
+ public:
+  explicit ScopedGlobalLocale(const std::locale& locale)
+      : previous_(std::locale()) {
+    std::locale::global(locale);
+  }
+
+  ~ScopedGlobalLocale() { std::locale::global(previous_); }
+
+  ScopedGlobalLocale(const ScopedGlobalLocale&) = delete;
+  ScopedGlobalLocale& operator=(const ScopedGlobalLocale&) = delete;
+
+ private:
+  std::locale previous_;
+};
+
+TEST_CASE("finite double parsing is exact and independent of the process locale") {
+  const ScopedGlobalLocale comma_locale{
+      std::locale(std::locale::classic(), new CommaDecimalPoint)};
+
+  double value = 0.0;
+  REQUIRE(parseFiniteDouble("12.5", value));
+  CHECK(value == doctest::Approx(12.5));
+  CHECK_FALSE(parseFiniteDouble(" 12.5", value));
+  CHECK_FALSE(parseFiniteDouble("12.5junk", value));
+  CHECK_FALSE(parseFiniteDouble("+12.5", value));
+  CHECK_FALSE(parseFiniteDouble("12,5", value));
+}
 
 std::vector<std::string> readLines(std::string_view relative_path) {
   const std::string path = std::string(CHUDWARE_SOURCE_DIR) + "/" + std::string(relative_path);

@@ -2085,10 +2085,10 @@ if(CHUDWARE_WITH_OCCT)
   if(MSVC)
     target_compile_options(chudware PRIVATE /Zi)
     target_link_options(chudware PRIVATE /DEBUG /OPT:REF /OPT:ICF)
-  elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    # Keep our symbols in the dynamic symbol table so the sampling profiler's dladdr() resolves
-    # OUR frames to real names (OCCT's exported symbols already resolve). GCC/Clang export shared-
-    # library symbols by default, but make it explicit + robust to any future -fvisibility=hidden.
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # On ELF, keep our default-visible symbols in the dynamic symbol table for the sampling
+    # profiler's dladdr() lookup. Mach-O dylibs already export default-visible symbols, so macOS
+    # needs neither GNU ld's --export-dynamic nor ld64's executable-only -export_dynamic.
     target_link_options(chudware PRIVATE -Wl,--export-dynamic)
   endif()
   set_target_properties(chudware PROPERTIES

@@ -1,10 +1,8 @@
 #include "device/grbl_protocol.h"
+#include "device/numeric_parse.h"
 
 #include <charconv>
-#include <cmath>
 #include <limits>
-#include <locale>
-#include <sstream>
 
 namespace chudware::device {
 namespace {
@@ -43,15 +41,7 @@ bool parseInt(std::string_view text, int& value) noexcept {
 }
 
 bool parseDouble(std::string_view text, double& value) noexcept {
-  if (text.empty() || text.front() == '+') return false;
-
-  // Apple libc++ still lacks floating-point from_chars on some toolchains.
-  // The classic locale fixes '.' as the decimal separator, while noskipws and
-  // the EOF check retain from_chars' leading-whitespace and trailing-junk rules.
-  std::istringstream input{std::string(text)};
-  input.imbue(std::locale::classic());
-  input >> std::noskipws >> value;
-  return input && input.peek() == std::char_traits<char>::eof() && std::isfinite(value);
+  return parseFiniteDouble(text, value);
 }
 
 bool split2(std::string_view text, char delimiter, std::string_view& first,

@@ -16,8 +16,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <setupapi.h>
 #include <windows.h>
+#include <setupapi.h>
 #else
 #include <fcntl.h>
 #include <poll.h>

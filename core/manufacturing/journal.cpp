@@ -202,9 +202,13 @@ struct Journal::Impl {
 
         const auto records = read_records(journal_path, 1);
         for (const auto& record : records) current_head = std::max(current_head, record.seq);
-        std::ifstream checkpoint(checkpoint_path);
         device::Seq checkpoint_head = 0;
-        if (checkpoint) checkpoint >> checkpoint_head;
+        {
+            // Windows file streams do not share delete access. End the read handle
+            // before persist_head atomically replaces the checkpoint below.
+            std::ifstream checkpoint(checkpoint_path);
+            if (checkpoint) checkpoint >> checkpoint_head;
+        }
         current_head = std::max(current_head, checkpoint_head);
         epoch_floor = current_head + 1;
         for (const auto& record : records) {

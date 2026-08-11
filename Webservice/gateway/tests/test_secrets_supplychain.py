@@ -1,22 +1,20 @@
 """Secrets & supply-chain regression tests.
 
 Each test fails if the corresponding vulnerability is reintroduced:
-real accounts back in the tracked users.yaml, unpinned requirements, the
-cf_provision.py token file mode check removed, a personal --emails default
+a file-backed allowlist back beside the account store, unpinned requirements,
+the cf_provision.py token file mode check removed, a personal --emails default
 restored, or live secrets pasted into DEPLOYMENT.md.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import os
 import stat
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GATEWAY = REPO_ROOT / "Webservice" / "gateway"
@@ -31,15 +29,13 @@ def _load_cf_provision():
     return mod
 
 
-def test_users_yaml_template_grants_nobody_real_access() -> None:
-    """The tracked allowlist must be a safe template: no real emails, no admin."""
-    data = yaml.safe_load((GATEWAY / "users.yaml").read_text())
-    rows = data.get("users", []) if isinstance(data, dict) else []
-    assert isinstance(rows, list)
-    for row in rows:
-        email = str(row.get("email", "")).lower()
-        assert email.endswith("@example.com"), f"real email in tracked template: {email}"
-        assert row.get("role") != "admin", "tracked template must not grant admin"
+def test_no_users_yaml_allowlist_remains() -> None:
+    """Authorization lives in the account store. A users.yaml anywhere under
+    the gateway would be a second, file-backed source of truth — exactly the
+    thing self-serve auth replaced, and the one that used to ship real emails
+    in the tree."""
+    stragglers = sorted(p.name for p in GATEWAY.rglob("users.yaml"))
+    assert stragglers == [], f"allowlist file(s) back on disk: {stragglers}"
 
 
 def test_requirements_fully_pinned() -> None:
@@ -112,8 +108,6 @@ def test_gitignore_covers_secret_paths() -> None:
     assert not ignored("Webservice/gateway/config.example.env"), (
         "config.example.env must stay tracked"
     )
-    gitignore = (REPO_ROOT / ".gitignore").read_text()
-    assert "Webservice/gateway/users.yaml" in gitignore
 
 
 def test_info_file_is_owner_only_in_worktree() -> None:
@@ -125,25 +119,3 @@ def test_info_file_is_owner_only_in_worktree() -> None:
         "Cloudflare-info.txt is group/world-readable"
     )
     assert "LIVE CREDENTIALS" in info.read_text()[:600], "warning header missing"
-
-
-def test_gateway_config_still_loads_template(tmp_path, monkeypatch) -> None:
-    """config.py seeds a missing runtime users file from the template — the seed
-    must parse and grant nobody access (documented lockout, not a crash)."""
-    monkeypatch.setenv("CHUDWARE_WEB_USERS_FILE", str(tmp_path / "rt" / "users.yaml"))
-    monkeypatch.setenv("CHUDWARE_WEB_DATA_ROOT", str(tmp_path / "data"))
-    sys.path.insert(0, str(GATEWAY))
-    try:
-        import config as gw_config
-
-        settings = gw_config.Settings()
-        settings.ensure_data_dirs()
-        seeded = yaml.safe_load(settings.users_file.read_text())
-        rows = seeded.get("users", [])
-        assert all(
-            str(r.get("email", "")).endswith("@example.com") for r in rows
-        ), "seeded runtime file grants real access"
-    finally:
-        sys.path.remove(str(GATEWAY))
-        for mod in ("config",):
-            sys.modules.pop(mod, None)

@@ -52,20 +52,20 @@ Trust build.sh/gate.sh and this map over AGENTS.md's repo-map rows where they co
 | `engine_oracle/` (symlink `engine/`) | Python parity oracle (build123d on OpenCASCADE) — frozen while `core/` strangles it out; kept in lockstep via parity corpus; deleted last |
 | `host/` | **The production GUI** — C++ GLFW/ImGui desktop app. `host/src/app.cpp` frame loop, `host/src/ui/` panels (52k LOC), `host/src/core/app_state.h` central data model. Details: the gui-* skills |
 | `ui/viewport/` | Shared OpenGL render module (renderer/mesh/camera, id-pass picking, AICM loader) |
-| `services/agent/` (symlink `agent/`) | Built-in AI agent loop (Python): agent_turn, councils, delegation, events |
-| `services/mcp/` (symlink `mcp_server/`) | MCP server exposing the engine to external agents (Claude Code etc.) |
+| `services/agent/` | Built-in AI agent loop (Python): agent_turn, councils, delegation, events |
+| `services/mcp/` | MCP server exposing the engine to external agents (Claude Code etc.) |
 | `services/worker/` | Engine routing seam: WorkerClient / DocMirror / bootstrap |
-| `services/installer/` (symlink `installer/`) | Provisioning, MCP self-registration, packaging |
+| `services/installer/` | Provisioning, MCP self-registration, packaging |
 | `services/manufacturing/**` | Gateway transports + allowlist, printer adapters, slicer, monitor, metrology, notification, PnP, and robot services |
 | `services/perception/**`, `training/perception/**` | Perception model/runtime and reproducible training pipeline |
 | `contracts/` | **Frozen interface contracts — THE seams. Append-only.** `worker_rpc.md`, `doc_ops.md`, `feature_params.md`, `icons.md`, `parts.md`, `ecad/`, … (`contracts/README.md`) |
-| `corpora/` | Consolidated test fixtures (sketch/render/sw_parity); root symlinks keep legacy paths |
+| `corpora/` | Consolidated test fixtures (sketch/render/sw_parity), referenced by canonical paths |
 | `scripts/` | Gates & audits: `gate.sh`, `check.py`, `gui_lint.py`, `icon_pipeline.py` |
 | `docs/` | Design docs, `PLAN.md`, `CPP_MIGRATION.md`, `REFACTOR_LOG.md` (one-paragraph handoffs go here) |
 | `docs/manufacturing/**` | Manufacturing subsystem design corpus |
 | `work/` | Task board (`work/tools/work.py`) + backlog cards `work/backlog/T-*.md` |
 | `assets/` | Icons + generators (`make_icons.py`, `pack_icons.py`), logo |
-| `tools/`, `benchmarks/`, `training/`, `dag/`, `deliverables/` | Dev tools, benches, ML training, DAG missions, deliverable templates |
+| `tools/`, `benchmarks/`, `training/`, `services/dag/`, `services/deliverables/` | Dev tools, benches, ML training, DAG missions, deliverable templates |
 | `Webservice/` | chudware-web: self-hosted multi-user streamed sessions — `gateway/` (FastAPI portal+auth+session mgr+chat), `image/` (Fedora 44 session container), `deploy/` (systemd user units, cf_provision.py, RUNBOOK.md), `DESIGN.md`. T-R7 PLM remote subset lives in `services/plm/remote.py`. Secrets NEVER committed (`Cloudflare-info.txt` gitignored) |
 | `scratch/` | Throwaway output — never commit anything load-bearing here |
 
@@ -86,7 +86,7 @@ python3 work/tools/work.py ready|board            # task board
 
 Gate semantics: OCCT-absent and runtime-venv-absent are **SKIPs, not failures** — the gate
 stays green on an unprovisioned box. Engine+agent pytest runs as
-`<venv>/python -X utf8 -m pytest engine/doc agent -q` when the venv exists.
+`<venv>/python -X utf8 -m pytest engine/doc services/agent -q` when the venv exists.
 Scripted GUI launches use `xvfb-run` automatically; set `CHUDWARE_SHOT_HEADED=1` to see a real
 window. Headless scenario smoke: `CHUDWARE_SHOT=<m1|sketch|asm|fea|flow|drawing|…>
 ./host/build-linux/bin/chudware --ui-screenshot scratch/smoke.png` (crash check, not visual

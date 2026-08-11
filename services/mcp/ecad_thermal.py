@@ -839,7 +839,7 @@ def thermal_handoff_impl(board_doc: dict, *,
         }, envelope)
 
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
         mesh_err = None
     except Exception as exc:  # noqa: BLE001
         cb = None
@@ -989,8 +989,8 @@ def register_ecad_thermal_tools(mcp) -> None:
 
     # Same module identity the rest of the server uses (see piping_tools note on the
     # double-import/_PERIODIC_TIMER hazard).
-    from mcp_server.ecad_tools import _get_pcb, _default_out_dir
-    from mcp_server.ecad_common import OpError
+    from services.mcp.ecad_tools import _get_pcb, _default_out_dir
+    from services.mcp.ecad_common import OpError
 
     def _find_pdn_block(board_name: str, step_path: str) -> Optional[dict]:
         """Locate the aicad.boardphys/1 pdn block written by ecad_run_pdn: sidecar next
@@ -1460,8 +1460,8 @@ def airflow_deviation_table(preset_rows: list, cht_rows: list,
 def register_ecad_airflow_tools(mcp) -> None:
     """Register ecad_airflow_handoff / ecad_verify_airflow on ``mcp`` (FastMCP)."""
 
-    from mcp_server.ecad_tools import _get_pcb, _default_out_dir
-    from mcp_server.ecad_common import OpError
+    from services.mcp.ecad_tools import _get_pcb, _default_out_dir
+    from services.mcp.ecad_common import OpError
 
     def _openfoam_runner():
         try:
@@ -1622,7 +1622,7 @@ def register_ecad_airflow_tools(mcp) -> None:
                           ("enclosure_wall" if s["name"].startswith("encl_")
                            else "component_body"),
                           "stl", path=s["stl_path"],
-                          derived_by="mcp_server.ecad_thermal.build_airflow_solids",
+                          derived_by="services.mcp.ecad_thermal.build_airflow_solids",
                           meta={"region": s["name"], "kappa_w_mk": s["kappa_w_mk"],
                                 "power_w": s["power_w"]})
                       for s in solids],

@@ -22,7 +22,7 @@ def _current_doc_id() -> str:
     cad_tools that was never loaded has no current document anyway.
     """
     for name in (f"{__package__}.cad_tools", "services.mcp.cad_tools",
-                 "mcp_server.cad_tools"):
+                 "services.mcp.cad_tools"):
         mod = sys.modules.get(name)
         if mod is None:
             continue

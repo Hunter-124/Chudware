@@ -9,7 +9,7 @@ rem                         core DLLs + app code + assets into dist\Chudware\.
 rem    build.bat host       Only compile the C++ host (does not touch dist\).
 rem    build.bat core       Only rebuild libchudware + chudware-hostd (windows-occt).
 rem    build.bat app        Only sync Python app code into dist\ (no compile).
-rem    build.bat full       Full clean release via installer.build_release
+rem    build.bat full       Full clean release via services.installer.build_release
 rem                         (re-downloads the wheelhouse; needs network).
 rem    build.bat clean      Wipe host\build-win and dist\, then default build.
 rem    build.bat shortcut   Install/refresh the user Start Menu shortcut only.
@@ -123,12 +123,12 @@ if /i "%MODE%"=="host" goto :done
 rem --- full clean release (re-stages everything, incl. the wheelhouse) -------
 if /i "%MODE%"=="full" (
   if not defined PY (
-    echo [build] ERROR: no Python found for installer.build_release
+    echo [build] ERROR: no Python found for services.installer.build_release
     goto :fail
   )
   echo [build] assembling full release ^(re-downloads the wheelhouse^) ...
   pushd "%ROOT%"
-  "%PY%" -m installer.build_release --out "%ROOT%\dist" || ( popd & goto :fail )
+  "%PY%" -m services.installer.build_release --out "%ROOT%\dist" || ( popd & goto :fail )
   popd
   call :install_shortcut
   goto :done
@@ -199,31 +199,23 @@ if /i not "%MODE%"=="app" (
   )
 )
 
-rem Python app packages (junction names engine/agent/mcp_server/installer when present)
-for %%P in (engine agent mcp_server installer) do (
+rem Python app package that remains top-level.
+for %%P in (engine) do (
   if exist "%ROOT%\%%P\" (
     robocopy "%ROOT%\%%P" "%DIST%\app\%%P" /MIR /XD __pycache__ build samples tests /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
     if errorlevel 8 goto :fail
   )
 )
-rem services.X packages (PLM hub, dag, browser, …) — engine.worker imports these as
-rem `from services.plm.worker_rpc …`. Without them plm_*/git_* never register.
+rem Canonical services.X packages used by the worker and packaged tools.
+rem They are staged under app\services so imports resolve identically to source.
 if not exist "%DIST%\app\services" mkdir "%DIST%\app\services"
 if exist "%ROOT%\services\__init__.py" copy /y "%ROOT%\services\__init__.py" "%DIST%\app\services\__init__.py" >nul
 if not exist "%DIST%\app\services\__init__.py" type nul > "%DIST%\app\services\__init__.py"
-for %%P in (plm dag browser deliverables ipc serving verify) do (
+for %%P in (agent mcp installer plm dag browser deliverables ipc serving verify) do (
   if exist "%ROOT%\services\%%P\" (
     robocopy "%ROOT%\services\%%P" "%DIST%\app\services\%%P" /MIR /XD __pycache__ build tests /XF *.pyc test_*.py /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
     if errorlevel 8 goto :fail
   )
-)
-if exist "%ROOT%\agent\" (
-  robocopy "%ROOT%\agent" "%DIST%\app\services\agent" /MIR /XD __pycache__ build tests /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
-  if errorlevel 8 goto :fail
-)
-if exist "%ROOT%\mcp_server\" (
-  robocopy "%ROOT%\mcp_server" "%DIST%\app\services\mcp" /MIR /XD __pycache__ build tests /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
-  if errorlevel 8 goto :fail
 )
 for %%P in (llamacpp models) do (
   if exist "%ROOT%\%%P\" (

@@ -54,5 +54,5 @@ Deliverables:
 4. services/agent/pipeline/test_coverage_checker.py — 28 new tests (82 total, all green)
 5. Gym C1-DP2: seed1 PASS (5 features, all traced, all 3 reqs covered, DECOMPOSE gate passes); seed2 FAIL-correct (untraced FT-04 surfaces in reasons); seed3 FAIL-correct (orphan R-03 surfaces in reasons)
 
-gate.sh: PASS (exit 0). FAIL-RECORDED items (mcp_server, services, engine_oracle) are all pre-existing, owned by T-V2.
+gate.sh: PASS (exit 0). FAIL-RECORDED items (services.mcp, services, engine_oracle) are all pre-existing, owned by T-V2.
 graphify update: 35144 nodes, 71312 edges, 1618 communities.

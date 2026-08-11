@@ -124,8 +124,8 @@ def test_spec_validates_without_render_engine(data):
     # validate_and_resolve (kind/template/block-shape/slot rules) on its own, independent of
     # whether reportlab/python-docx happen to be installed on the box running the render. Since
     # user_manual declares lb_slots={} (all free prose), zero provenance refs should be consumed.
-    from deliverables.spec import validate_and_resolve
-    from deliverables.templates import get_template
+    from services.deliverables.spec import validate_and_resolve
+    from services.deliverables.templates import get_template
 
     spec = build_report_spec(data)
     template = get_template("user_manual", "report")  # confirms registration under __init__.py

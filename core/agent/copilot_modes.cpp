@@ -48,7 +48,7 @@ fs::path CopilotModes::default_path() {
         return fs::path(env);
     if (const char* dir = std::getenv("CHUDWARE_CONTRACTS_DIR"); dir && dir[0])
         return fs::path(dir) / "copilot_modes.json";
-    // Repo-relative fallback — same CWD convention as roles.cpp's agent/prompts.
+    // Repo-relative fallback — same CWD convention as roles.cpp's services/agent/prompts.
     return fs::path("contracts") / "copilot_modes.json";
 }
 

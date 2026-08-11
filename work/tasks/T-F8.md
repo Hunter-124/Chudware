@@ -41,7 +41,7 @@ ECAD (promote the bespoke `ecad_status` into the GSL layer), and the DAG run its
   MCP tools + their `_describe_*_text` helpers (~270 lines). `_format_fit` extracted out.
 - `services/mcp/fit_narration.py` (NEW): single home for `_format_fit` — import-safe
   (no mcp SDK imports), shared by both `gsl_tools.py` and `services/agent/loop.py`.
-- `services/agent/loop.py`: import updated to `from mcp_server.fit_narration import _format_fit`.
+- `services/agent/loop.py`: import updated to `from services.mcp.fit_narration import _format_fit`.
 - `services/mcp/cad_tools.py`: `cad_guide` updated with `"assembly"`, `"board"`, `"project"`
   topic keys and narration text for the three new tools.
 
@@ -77,7 +77,7 @@ CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so \
 ```
 
 Also verified: `services/agent/loop.py` imports cleanly and `_format_fit` resolves
-to `mcp_server.fit_narration`. The `services/agent/test_loop_mock.py` collection
+to `services.mcp.fit_narration`. The `services/agent/test_loop_mock.py` collection
 error (`FileNotFoundError: services/engine/samples/mounting_plate.py`) is
 baseline-proven pre-existing — the `samples/` path is absent on the base
 `task/T-F7-narration-core` branch too. No legitimately skipping tests remain;

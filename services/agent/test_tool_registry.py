@@ -1,8 +1,7 @@
 """Dispatch allow-list + tagging tests for the MCP tool registry.
 
-Lives under agent/ (the gate runs `pytest engine/doc agent`) but exercises
-`mcp_server.tool_registry` via the top-level `mcp_server` symlink — no FastMCP, no
-libchudware, no network. Contract: contracts/providers.md §6.
+Lives under `services/agent/` but exercises the canonical
+`services.mcp.tool_registry` package — no FastMCP, libchudware, or network.
 """
 from __future__ import annotations
 
@@ -10,7 +9,7 @@ import asyncio
 
 import pytest
 
-from mcp_server import tool_registry as reg
+from services.mcp import tool_registry as reg
 
 
 class _StubMCP:

@@ -32,7 +32,7 @@ from typing import Any, Callable
 from . import sub_auth
 from . import subscription_login as sl
 
-log = logging.getLogger("agent.providers.usage")
+log = logging.getLogger("services.agent.providers.usage")
 
 CACHE_TTL_S = 5 * 60  # contracts/providers.md §4.5: poll <= 5 min
 

@@ -8,7 +8,7 @@ from collections import Counter
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from mcp_server.ecad_common import ecad_session
+from services.mcp.ecad_common import ecad_session
 from services.ecad.library.starter import _make_footprints
 from services.mcp import core_bridge as cb
 

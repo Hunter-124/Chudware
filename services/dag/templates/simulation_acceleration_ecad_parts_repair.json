@@ -206,7 +206,7 @@
       "type": "ecad",
       "name": "Unify ECAD session identity",
       "inputs": {
-        "request": "Guarantee mcp_server.ecad_tools and services.mcp.ecad_tools resolve to one module object/state store. Make warm autosave recovery monotonic: it fills empty defaults but never overwrites a newly-created or explicitly-selected document. Add explicit multi-document isolation tests.",
+        "request": "Guarantee services.mcp.ecad_tools and services.mcp.ecad_tools resolve to one module object/state store. Make warm autosave recovery monotonic: it fills empty defaults but never overwrites a newly-created or explicitly-selected document. Add explicit multi-document isolation tests.",
         "write_set": ["services/mcp/__init__.py", "services/mcp/server.py", "services/mcp/ecad_tools.py", "services/mcp/ecad_thermal.py", "services/mcp/ecad_reliability.py", "services/mcp/heatsink.py", "services/mcp/test_ecad_hardening.py"],
         "acceptance": [
           "Both import paths observe the same _ECAD and _THERMAL objects.",

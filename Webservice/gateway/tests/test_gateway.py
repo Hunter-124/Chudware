@@ -1,4 +1,4 @@
-"""Gateway tests — dev-mode auth, healthz, admin allowlist/ops, releases."""
+"""Gateway tests — dev-mode auth, healthz, admin browse/ops, releases."""
 
 from __future__ import annotations
 
@@ -19,20 +19,36 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import app as app_mod  # noqa: E402
+from gateway import accounts, app as app_mod, db  # noqa: E402
 from gateway.config import settings  # noqa: E402
 
 
+def _seed(email: str, display: str, *, admin: bool = False) -> None:
+    """Register and activate one account, optionally promoting it.
+
+    accounts.py deliberately exposes no role setter — admin is granted through
+    the admin API and never self-assigned — so the promotion is a direct row
+    update here rather than a public call that does not (and should not) exist.
+    """
+    accounts.ensure_account(email, display=display)
+    accounts.set_status(email, "active", decided_by="test")
+    if admin:
+        with db.tx() as cur:
+            cur.execute(
+                "UPDATE accounts SET role = 'admin' WHERE email = %s", (email,)
+            )
+
+
 @pytest.fixture(autouse=True)
-def _isolate(tmp_path, monkeypatch):
-    """Per-test data root in dev mode, resolved against the package allowlist."""
+def _isolate(pg, tmp_path, monkeypatch):
+    """Per-test data root in dev mode, with the two test identities active."""
     data = tmp_path / "data"
     data.mkdir()
     (data / "plm").mkdir()
     monkeypatch.setattr(settings, "data_root", data)
     monkeypatch.setattr(settings, "dev_mode", True)
-    # ensure users file points at package users.yaml
-    monkeypatch.setattr(settings, "users_file", GATEWAY_DIR / "users.yaml")
+    _seed("demo@example.com", "Demo User")
+    _seed("boss@example.com", "Boss", admin=True)
     return data
 
 
@@ -66,11 +82,14 @@ def test_auth_allow(client):
 
 
 def test_auth_deny_unknown(client):
+    """An identity the store has never seen is queued, never admitted."""
     r = client.get("/api/me", headers=_auth("nobody@evil.example"))
     assert r.status_code == 403
-    # JSON for API paths
+    # JSON for API paths, naming the state the caller is actually in.
     body = r.json()
-    assert body.get("error") in {"not_on_list", "not on the list"} or "not" in str(body).lower()
+    assert body["error"] == "not_authorized"
+    assert body["account_status"] == "pending"
+    assert body["email"] == "nobody@evil.example"
 
 
 def test_auth_deny_missing_header(client):
@@ -78,28 +97,13 @@ def test_auth_deny_missing_header(client):
     assert r.status_code == 401
 
 
-def test_not_on_list_html(client):
+def test_unapproved_browser_gets_its_own_status_page(client):
+    """HTML callers get the page for the state they are actually in — a
+    pending account is told to confirm its address, not to email an operator."""
     r = client.get("/", headers={**_auth("ghost@example.com"), "Accept": "text/html"})
     assert r.status_code == 403
-    assert "not on the list" in r.text.lower()
-
-
-def test_auth_allow_ua_domain_as_standard_user(client):
-    """Any @ua.edu / @crimson.ua.edu email is auto-approved as a STANDARD user."""
-    for email in ("student42@crimson.ua.edu", "Prof.Smith@UA.EDU"):
-        r = client.get("/api/me", headers=_auth(email))
-        assert r.status_code == 200, (email, r.status_code, r.text)
-
-
-def test_ua_domain_user_is_never_admin(client):
-    """Domain-auto users must resolve to role='user', never admin."""
-    from gateway.auth import _domain_auto_user, UserDirectory
-    d = UserDirectory(settings.users_file)
-    u = _domain_auto_user("someone@crimson.ua.edu", d)
-    assert u is not None and u.role == "user" and u.heavy is False
-    # A lookalike/spoof domain must NOT be approved.
-    assert _domain_auto_user("evil@ua.edu.attacker.com", d) is None
-    assert _domain_auto_user("rando@gmail.com", d) is None
+    assert "confirm your email address" in r.text.lower()
+    assert "ghost@example.com" in r.text
 
 
 def test_dev_user_query_sets_cookie(client):
@@ -166,87 +170,8 @@ def test_ai_provider_vars_parse(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Admin allowlist API
+# Admin project browsing
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def _admin_env(monkeypatch, tmp_path):
-    """Writable users file + mocked Access sync."""
-    users = tmp_path / "users.yaml"
-    users.write_text(
-        "users:\n"
-        "  - email: boss@example.com\n"
-        "    display: Boss\n"
-        "    role: admin\n"
-        "    heavy: true\n"
-        "  - email: demo@example.com\n"
-        "    display: Demo User\n"
-        "    role: user\n"
-        "    heavy: false\n"
-    )
-    monkeypatch.setattr(settings, "users_file", users)
-    # Middleware and admin endpoints SHARE app_mod.user_directory (passed to
-    directory = app_mod.user_directory
-    orig_path = directory.path
-    monkeypatch.setattr(directory, "path", users)
-    monkeypatch.setattr(directory, "_mtime", None)
-    directory.reload(force=True)
-    synced: list[str] = []
-
-    async def fake_sync():
-        synced.append("x")
-        return {"synced": True, "detail": "mocked"}
-
-    monkeypatch.setattr(app_mod, "_sync_access_policy", fake_sync)
-    yield directory, synced, users
-    directory.path = orig_path
-    directory._mtime = None
-    directory.reload(force=True)
-
-
-def test_admin_requires_admin_role(client, _admin_env, monkeypatch):
-    # demo is role=user in the _admin_env users file, but the MIDDLEWARE still
-    # reads the package users.yaml; use its known non-admin user
-    r = client.get("/api/admin/users", headers=_auth("demo@example.com"))
-    assert r.status_code == 403
-
-
-def test_admin_add_remove_user(client, _admin_env, monkeypatch):
-    directory, synced, users = _admin_env
-    # boss@example.com must ALSO exist in middleware users file to authenticate;
-    # middleware uses package users.yaml. Point middleware directory at ours:
-    import gateway.auth as auth_mod
-    # authenticate via the app's shared directory by swapping settings path used
-    # by the middleware's directory reload
-    mw_dir = app_mod.user_directory
-    r = client.post(
-        "/api/admin/users",
-        headers=_auth("boss@example.com"),
-        json={"email": "friend@ua.edu", "display": "Friend", "role": "user", "heavy": False},
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["ok"] and body["access_policy"]["synced"]
-    assert "friend@ua.edu" in users.read_text()
-    assert synced
-
-    r2 = client.delete("/api/admin/users/friend@ua.edu", headers=_auth("boss@example.com"))
-    assert r2.status_code == 200
-    assert "friend@ua.edu" not in users.read_text()
-
-    # cannot remove yourself
-    r3 = client.delete("/api/admin/users/boss@example.com", headers=_auth("boss@example.com"))
-    assert r3.status_code == 400
-
-
-def test_admin_rejects_bad_email(client, _admin_env):
-    r = client.post(
-        "/api/admin/users",
-        headers=_auth("boss@example.com"),
-        json={"email": "not-an-email"},
-    )
-    assert r.status_code == 400
 
 
 def test_team_domain_normalization(monkeypatch):
@@ -256,43 +181,8 @@ def test_team_domain_normalization(monkeypatch):
     assert _normalize_team_domain("") == ""
 
 
-def test_admin_project_field(client, _admin_env):
-    directory, synced, users = _admin_env
-    r = client.post(
-        "/api/admin/users",
-        headers=_auth("boss@example.com"),
-        json={"email": "pal@ua.edu", "project": "Demo"},
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["user"]["project"] == "Demo"
-    assert "project: Demo" in users.read_text()
-
-    # invalid project name rejected
-    r2 = client.post(
-        "/api/admin/users",
-        headers=_auth("boss@example.com"),
-        json={"email": "pal2@ua.edu", "project": "../evil"},
-    )
-    assert r2.status_code == 400
-
-
-def test_default_project_setting(client, _admin_env):
-    directory, synced, users = _admin_env
-    r = client.put("/api/admin/default-project",
-                   headers=_auth("boss@example.com"), json={"project": "Demo"})
-    assert r.status_code == 200
-    assert "default_project: Demo" in users.read_text()
-    body = client.get("/api/admin/users", headers=_auth("boss@example.com")).json()
-    assert body["default_project"] == "Demo"
-
-    # non-admin blocked
-    assert client.put("/api/admin/default-project",
-                      headers=_auth("demo@example.com"), json={"project": "X"}).status_code == 403
-
-
-def test_admin_browse_and_path_default(client, _admin_env, monkeypatch, tmp_path):
-    directory, synced, users = _admin_env
-    # Browse/default-project are confined to the allowlisted project roots.
+def test_admin_browse_lists_project_roots(client, monkeypatch, tmp_path):
+    # Browse is confined to the allowlisted project roots.
     monkeypatch.setattr(settings, "project_roots_raw", str(tmp_path))
     proj = tmp_path / "TeamParts"
     (proj / "sub").mkdir(parents=True)
@@ -308,15 +198,9 @@ def test_admin_browse_and_path_default(client, _admin_env, monkeypatch, tmp_path
     body = r.json()
     assert body["dirs"] == ["sub"] and body["parts"] == ["Frame.step+"]
 
-    # path default accepted; bogus path rejected
-    assert client.put("/api/admin/default-project", headers=_auth("boss@example.com"),
-                      json={"project": str(proj), "doc": "Frame.step+"}).status_code == 200
-    assert client.put("/api/admin/default-project", headers=_auth("boss@example.com"),
-                      json={"project": "/nope/missing"}).status_code == 400
-
 
 # ---------------------------------------------------------------- admin ops
-def test_admin_ops(client, _admin_env):
+def test_admin_ops(client):
     # ops: admin-gated, reports host health for the dashboard
     assert client.get("/api/admin/ops", headers=_auth("demo@example.com")).status_code == 403
     r = client.get("/api/admin/ops", headers=_auth("boss@example.com"))
@@ -333,32 +217,7 @@ def test_security_headers(client):
     assert r.headers["x-frame-options"] == "SAMEORIGIN"
 
 
-def test_admin_patch_user(client, _admin_env):
-    directory, synced, users = _admin_env
-    # non-admin blocked
-    assert client.patch("/api/admin/users/demo@example.com", headers=_auth("demo@example.com"),
-                        json={"heavy": True}).status_code == 403
-    # toggle heavy + role
-    r = client.patch("/api/admin/users/demo@example.com", headers=_auth("boss@example.com"),
-                     json={"heavy": True, "role": "admin", "display": "Demo Admin"})
-    assert r.status_code == 200, r.text
-    u = r.json()["user"]
-    assert u["heavy"] is True and u["role"] == "admin" and u["display"] == "Demo Admin"
-    # self-demotion blocked
-    assert client.patch("/api/admin/users/boss@example.com", headers=_auth("boss@example.com"),
-                        json={"role": "user"}).status_code == 400
-    # bad role / bogus project / empty body
-    assert client.patch("/api/admin/users/demo@example.com", headers=_auth("boss@example.com"),
-                        json={"role": "supreme"}).status_code == 400
-    assert client.patch("/api/admin/users/demo@example.com", headers=_auth("boss@example.com"),
-                        json={"project": "/nope/missing"}).status_code == 400
-    assert client.patch("/api/admin/users/demo@example.com", headers=_auth("boss@example.com"),
-                        json={}).status_code == 400
-    assert client.patch("/api/admin/users/ghost@example.com", headers=_auth("boss@example.com"),
-                        json={"heavy": True}).status_code == 404
-
-
-def test_admin_refuse_new_toggle(client, _admin_env):
+def test_admin_refuse_new_toggle(client):
     flag = settings.refuse_new_flag
     assert client.put("/api/admin/refuse-new", headers=_auth("demo@example.com"),
                       json={"on": True}).status_code == 403
@@ -395,7 +254,7 @@ def _tmux_env(monkeypatch):
     term._run_tmux("kill-server")
 
 
-def test_terminal_sessions_shared_lifecycle(client, _admin_env, _tmux_env):
+def test_terminal_sessions_shared_lifecycle(client, _tmux_env):
     # admin-gated
     assert client.get("/api/admin/terminal/sessions",
                       headers=_auth("demo@example.com")).status_code == 403
@@ -435,13 +294,11 @@ def test_terminal_sessions_shared_lifecycle(client, _admin_env, _tmux_env):
             headers=_auth("boss@example.com")).json()["sessions"]}
     assert "work-1" not in left and auto in left
 
-# --- Access-policy allowlist sync (cf_provision) ---------------------------
+# --- Access-policy include list (cf_provision) ------------------------------
 #
-# The allowlist -> Cloudflare Access policy path is what decides whether a
-# person ever receives a One-Time PIN: CF silently drops the OTP email for any
-# address not in an Allow policy. A parser that drops or mangles an email =
-# that user never gets a code. These lock the parser against the shapes real
-# users.yaml files take (quoted values, flow style, mixed case, duplicates).
+# The Access policy is what decides whether a person ever receives a One-Time
+# PIN: CF silently drops the OTP email for any address not in an Allow policy.
+# An address mangled on the way into the policy = that user never gets a code.
 
 def _load_cf_provision():
     import importlib.util
@@ -453,54 +310,31 @@ def _load_cf_provision():
     return mod
 
 
-def test_users_yaml_emails_robust_parse(tmp_path, monkeypatch):
+def test_include_list_emits_verbatim_emails_plus_domain_rules():
     cf = _load_cf_provision()
-    users = tmp_path / "users.yaml"
-    users.write_text(
-        "users:\n"
-        '  - email: "Quoted.User@gmail.com"\n'   # quoted + mixed case
-        "  - email: plain@ua.edu\n"
-        "  - email: PLAIN@ua.edu\n"               # duplicate (case-fold)
-        "  - email: demo@example.com\n"           # dev-only, never synced
-        "  - display: no-email-row\n"             # malformed row, ignored
-    )
-    monkeypatch.setenv("CHUDWARE_WEB_USERS_FILE", str(users))
-    assert cf._users_yaml_emails() == ["quoted.user@gmail.com", "plain@ua.edu"]
-
-
-def test_users_yaml_emails_flow_style(tmp_path, monkeypatch):
-    cf = _load_cf_provision()
-    users = tmp_path / "users.yaml"
-    users.write_text("users: [{email: brother@gmail.com, role: user}]\n")
-    monkeypatch.setenv("CHUDWARE_WEB_USERS_FILE", str(users))
-    assert cf._users_yaml_emails() == ["brother@gmail.com"]
-
-
-def test_include_list_never_quotes_email(tmp_path, monkeypatch):
-    cf = _load_cf_provision()
-    users = tmp_path / "users.yaml"
-    users.write_text('users:\n  - email: "brother@gmail.com"\n')
-    monkeypatch.setenv("CHUDWARE_WEB_USERS_FILE", str(users))
-    inc = cf._include_list(cf._users_yaml_emails())
+    inc = cf._include_list(["brother@gmail.com", "plain@ua.edu"])
     emails = [r["email"]["email"] for r in inc if "email" in r]
-    # A stray-quote email can never match in CF Access -> silently no OTP.
-    assert emails == ["brother@gmail.com"]
+    # A stray-quote or otherwise wrapped email can never match in CF Access
+    # -> silently no OTP. Each address goes in exactly as supplied.
+    assert emails == ["brother@gmail.com", "plain@ua.edu"]
     assert all('"' not in e for e in emails)
+    domains = [r["email_domain"]["domain"] for r in inc if "email_domain" in r]
+    assert domains == list(cf.ACCESS_DOMAINS)
 
 
-def test_releases_requires_admin(client, _admin_env):
+def test_releases_requires_admin(client):
     r = client.get("/api/admin/releases", headers=_auth("demo@example.com"))
     assert r.status_code == 403
 
 
-def test_releases_empty_list(client, _admin_env, tmp_path, monkeypatch):
+def test_releases_empty_list(client, tmp_path, monkeypatch):
     monkeypatch.setenv("CHUDWARE_RELEASES_DIR", str(tmp_path / "releases-none"))
     r = client.get("/api/admin/releases", headers=_auth("boss@example.com"))
     assert r.status_code == 200
     assert r.json() == []
 
 
-def test_releases_upload_list_download_delete(client, _admin_env, tmp_path, monkeypatch):
+def test_releases_upload_list_download_delete(client, tmp_path, monkeypatch):
     monkeypatch.setenv("CHUDWARE_RELEASES_DIR", str(tmp_path / "releases"))
     admin = _auth("boss@example.com")
     payload = b"fake installer bytes " * 1000
@@ -539,7 +373,7 @@ def test_releases_upload_list_download_delete(client, _admin_env, tmp_path, monk
     assert r6.status_code == 404
 
 
-def test_releases_upload_requires_admin(client, _admin_env, tmp_path, monkeypatch):
+def test_releases_upload_requires_admin(client, tmp_path, monkeypatch):
     monkeypatch.setenv("CHUDWARE_RELEASES_DIR", str(tmp_path / "releases-forbidden"))
     r = client.post(
         "/api/admin/releases/upload",
@@ -549,7 +383,7 @@ def test_releases_upload_requires_admin(client, _admin_env, tmp_path, monkeypatc
     assert r.status_code == 403
 
 
-def test_releases_download_rejects_path_traversal(client, _admin_env, tmp_path, monkeypatch):
+def test_releases_download_rejects_path_traversal(client, tmp_path, monkeypatch):
     monkeypatch.setenv("CHUDWARE_RELEASES_DIR", str(tmp_path / "releases-safe"))
     admin = _auth("boss@example.com")
     r = client.get("/api/admin/releases/download/..%2F..%2Fetc%2Fpasswd", headers=admin)

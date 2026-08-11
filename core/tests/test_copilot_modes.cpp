@@ -84,7 +84,7 @@ TEST_CASE("mode x tool verdict matrix (no role card)") {
         {"inspect_part",          true, true, true, true, false},
         {"dag_run",               true, false, true, false, false},
         // T-file-floor: agent_default_tools main-agent floor. No role card
-        // here, so agent/swarm are unrestricted (None) regardless.
+        // here, so services/agent/swarm are unrestricted (None) regardless.
         {"fs_write",               true, false, true, false, false},
         {"fs_edit",                true, false, true, false, false},
         {"fs_list",                true, false, true, false, false},
@@ -109,7 +109,7 @@ TEST_CASE("empty tool name is denied even in unrestricted modes") {
     CHECK_FALSE(copilot_tool_allowed(*cm, "   ", "swarm"));
 }
 
-TEST_CASE("agent/swarm unrestricted without a role card; role card applies") {
+TEST_CASE("services/agent/swarm unrestricted without a role card; role card applies") {
     auto cm = CopilotModes::load();
     REQUIRE(cm.has_value());
     CHECK_FALSE(copilot_apply_mode_tools(*cm, "agent").has_value());
@@ -188,7 +188,7 @@ TEST_CASE("ask intersects a role card, strips mutators, keeps the shared floor")
 
 TEST_CASE("ask/plan do not gain the agent-only file-handling floor") {
     // T-file-floor: fs_write/fs_edit/fs_list/run_shell are the main-agent
-    // (agent/swarm-only) floor; ask/plan keep only the read-only shared
+    // (services/agent/swarm-only) floor; ask/plan keep only the read-only shared
     // floor and must never gain them, narrowing role card or not.
     auto cm = CopilotModes::load();
     REQUIRE(cm.has_value());

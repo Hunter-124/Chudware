@@ -56,7 +56,7 @@ def _run_model(params: dict, _emit_event: EmitFn) -> dict:
 
 def _get_prompts(_params: dict, _emit_event: EmitFn) -> dict:
     """The built-in prompts (+ the active override) for the GUI's Settings editor."""
-    from agent import config, loop
+    from services.agent import config, loop
 
     return {"system_prompt": loop.SYSTEM_PROMPT,
             "plan_prompt": loop.PLAN_PROMPT,
@@ -118,7 +118,7 @@ def _register(label: str, import_paths: list[str], attr: str, structured: bool =
 _register("vendor_parts", ["services.parts.vendor_parts"], "WORKER_METHODS", structured=True)
 
 # ---- Deliverables ----
-_register("deliverables", ["deliverables.worker_rpc"], "WORKER_METHODS")
+_register("deliverables", ["services.deliverables.worker_rpc"], "WORKER_METHODS")
 
 # ---- Parts hub FTS + GUI seams ----
 _register("parts", ["services.parts.worker_rpc"], "WORKER_METHODS")

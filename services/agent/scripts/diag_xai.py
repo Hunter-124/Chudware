@@ -35,7 +35,7 @@ CHAT_URL = "https://api.x.ai/v1/chat/completions"
 
 def _config_path() -> Path:
     try:
-        from agent import paths  # type: ignore
+        from services.agent import paths  # type: ignore
 
         return Path(paths.CONFIG)
     except Exception:
@@ -336,7 +336,7 @@ def main() -> int:
         root = Path(__file__).resolve().parents[3]  # repo root
         sys.path.insert(0, str(root / "services"))
         sys.path.insert(0, str(root))
-        from agent.providers import usage as usage_mod  # type: ignore
+        from services.agent.providers import usage as usage_mod  # type: ignore
         import os
 
         print("\n-- usage.fetch_account_usage (api path) --")

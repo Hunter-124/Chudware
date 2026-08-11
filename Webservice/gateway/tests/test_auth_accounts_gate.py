@@ -1,16 +1,15 @@
-"""AuthMiddleware must gate on the account store, not on a bare allowlist.
+"""AuthMiddleware must gate on the account store.
 
 Going public means an unknown-but-authenticated identity has to become a
 *pending* account rather than either (a) being refused outright, which is a
 dead end for a paying stranger, or (b) being let in, which is the bug this
 whole change exists to prevent.
 
-Covers the wiring in auth.AuthMiddleware._resolve_user (2026-07-28 rollout).
+Covers the wiring in auth.AuthMiddleware._resolve_user.
 """
 
 from __future__ import annotations
 
-import importlib
 import sys
 from pathlib import Path
 
@@ -22,52 +21,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 @pytest.fixture()
-def env(tmp_path, monkeypatch):
-    """A gateway wired to a throwaway data root, with a 2-entry users.yaml."""
-    monkeypatch.setenv("CHUDWARE_WEB_DEV", "1")
-    monkeypatch.setenv("CHUDWARE_WEB_DATA_ROOT", str(tmp_path / "data"))
-    # Auto-approval OFF: every new identity must go through the queue.
-    monkeypatch.setenv("CHUDWARE_WEB_AUTO_APPROVE_DOMAINS", "")
-
-    users = tmp_path / "users.yaml"
-    users.write_text(
-        "users:\n"
-        "  - email: boss@example.com\n"
-        "    display: Boss\n"
-        "    role: admin\n"
-        "    heavy: true\n"
-        "  - email: teammate@example.com\n"
-        "    display: Teammate\n"
-        "    role: user\n"
-        "    heavy: false\n"
-    )
-    monkeypatch.setenv("CHUDWARE_WEB_USERS_FILE", str(users))
-
-    # These modules hold process-global state (settings singleton, sqlite
-    # connection), so reloading them under a tmp data root leaks into every
-    # later test in the session unless we reload them back afterwards.
-    import config
+def env(pg, monkeypatch):
+    """The real AuthMiddleware over a virgin account store, in dev auth."""
     import accounts
     import auth
+    from config import settings
 
-    for mod in (config, accounts, auth):
-        importlib.reload(mod)
-
-    directory = auth.UserDirectory(config.settings.users_file)
-    middleware_app = _bare_app(auth, directory)
-    try:
-        yield accounts, TestClient(middleware_app)
-    finally:
-        # monkeypatch's own teardown runs AFTER this finalizer, so the tmp env
-        # is still active here. Undo it first — otherwise the reload below
-        # re-caches settings against the tmp data root and every later test in
-        # the session ends up talking to a throwaway accounts database.
-        monkeypatch.undo()
-        for mod in (config, accounts, auth):
-            importlib.reload(mod)
+    # Dev auth is the identity source here (X-Dev-User); the store is what
+    # decides whether that identity gets a session, which is what we test.
+    monkeypatch.setattr(settings, "dev_mode", True)
+    return accounts, TestClient(_bare_app(auth))
 
 
-def _bare_app(auth, directory):
+def _bare_app(auth):
     """Minimal ASGI app behind the real AuthMiddleware — no routers mounted,
     so this test exercises authorization and nothing else.
 
@@ -83,7 +49,7 @@ def _bare_app(auth, directory):
         user = auth.get_current_user(request)
         return {"email": user.email, "role": user.role, "heavy": user.heavy}
 
-    inner.add_middleware(auth.AuthMiddleware, directory=directory)
+    inner.add_middleware(auth.AuthMiddleware)
     return inner
 
 
@@ -122,47 +88,6 @@ def test_suspending_revokes_access_immediately(env):
 
     accounts.set_status("stranger@gmail.com", "suspended", decided_by="boss@example.com")
     assert client.get("/whoami", headers=hdr("stranger@gmail.com")).status_code == 403
-
-
-def test_legacy_allowlist_user_is_adopted_with_their_role(env):
-    """An existing teammate must not be stranded in the queue by this upgrade."""
-    accounts, client = env
-
-    r = client.get("/whoami", headers=hdr("boss@example.com"))
-    assert r.status_code == 200
-    assert r.json()["role"] == "admin"
-    assert r.json()["heavy"] is True
-
-    acct = accounts.get_account("boss@example.com")
-    assert acct.status == "active" and acct.role == "admin"
-
-    r = client.get("/whoami", headers=hdr("teammate@example.com"))
-    assert r.status_code == 200
-    assert r.json()["role"] == "user"
-
-
-def test_admin_denial_outranks_the_yaml_file(env):
-    """Adoption must never resurrect an account an admin already shut off."""
-    accounts, client = env
-    assert client.get("/whoami", headers=hdr("teammate@example.com")).status_code == 200
-
-    accounts.set_status("teammate@example.com", "denied", decided_by="boss@example.com")
-
-    # Still on the allowlist, but the admin decision wins.
-    assert client.get("/whoami", headers=hdr("teammate@example.com")).status_code == 403
-    assert accounts.get_account("teammate@example.com").status == "denied"
-
-
-def test_auto_approve_domain_activates_without_an_admin(env, monkeypatch):
-    accounts, client = env
-    monkeypatch.setenv("CHUDWARE_WEB_AUTO_APPROVE_DOMAINS", "ua.edu")
-
-    r = client.get("/whoami", headers=hdr("student@crimson.ua.edu"))
-    assert r.status_code == 200
-    assert r.json()["role"] == "user"  # domain users are NEVER admin
-
-    # A domain that is not on the list still queues.
-    assert client.get("/whoami", headers=hdr("nope@elsewhere.edu")).status_code == 403
 
 
 def test_role_cannot_be_escalated_by_the_caller(env):

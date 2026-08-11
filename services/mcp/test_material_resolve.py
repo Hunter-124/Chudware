@@ -30,8 +30,8 @@ if _REPO_ROOT not in sys.path:
 
 import pytest
 
-from mcp_server import core_bridge as cb
-from mcp_server.cad_common import _resolve_material
+from services.mcp import core_bridge as cb
+from services.mcp.cad_common import _resolve_material
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
@@ -202,7 +202,7 @@ def _require_sim() -> None:
 
 
 def _call(name: str, args: dict):
-    from mcp_server import server
+    from services.mcp import server
 
     _content, structured = asyncio.run(server.mcp.call_tool(name, args))
     text = structured.get("result") if isinstance(structured, dict) else None
@@ -270,7 +270,7 @@ if __name__ == "__main__":  # pragma: no cover - manual convenience
 # rendered as the wrong metal and reported success.
 # ==========================================================================
 
-from mcp_server import cad_common as _cc  # noqa: E402
+from services.mcp import cad_common as _cc  # noqa: E402
 
 
 def _appearance_family(name: str) -> str:

@@ -155,7 +155,7 @@ class TestSearchPartsV2:
 
     def test_default_row_projection_is_compact(self, hub_search):
         """Default detail=summary projects rows; full records stay behind detail=full."""
-        from mcp_server import result_serving as rs
+        from services.mcp import result_serving as rs
 
         out = pt.search_parts_v2("bearing")
         assert out["ok"] is True and out["results"]

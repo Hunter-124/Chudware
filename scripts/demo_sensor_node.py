@@ -121,7 +121,7 @@ def build_sensor_node_board(tools: dict, name: str = "sensor_node_stm32") -> str
     # T-RF21: the ecad session lives in the C++ core; the facade mirrors the old
     # engine.ecad.session API, but doc mutations need an explicit swap_doc write-back.
     from services.mcp.ecad_common import ecad_session
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_pcb", name=name)
     doc_id = _ECAD["current_pcb"]
@@ -258,7 +258,7 @@ def build_sensor_node_board(tools: dict, name: str = "sensor_node_stm32") -> str
 
 def build_minimal_schematic(tools: dict, name: str = "sensor_node_sch") -> str:
     """Minimal schematic so ERC has something to check (advisory, not full netlist parity)."""
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_tools import _ECAD
     r = _call(tools, "ecad_new_schematic", name=name)
     if not r.get("ok") and not r.get("doc_id"):
         # some versions return doc_id at top level without ok
@@ -279,11 +279,11 @@ def build_minimal_schematic(tools: dict, name: str = "sensor_node_sch") -> str:
 # ── legs ─────────────────────────────────────────────────────────────────────
 
 def register_all_tools() -> dict:
-    from mcp_server.ecad_tools import register_ecad_tools
-    from mcp_server.ecad_thermal import register_ecad_thermal_tools
-    from mcp_server.heatsink import register_heatsink_tools
-    from mcp_server.power_budget import register_power_budget_tools
-    from mcp_server.firmware_tools import register_firmware_tools
+    from services.mcp.ecad_tools import register_ecad_tools
+    from services.mcp.ecad_thermal import register_ecad_thermal_tools
+    from services.mcp.heatsink import register_heatsink_tools
+    from services.mcp.power_budget import register_power_budget_tools
+    from services.mcp.firmware_tools import register_firmware_tools
 
     stub = _StubMCP()
     register_ecad_tools(stub)
@@ -640,9 +640,9 @@ def main() -> int:
     # ── 12. make_report ───────────────────────────────────────────────────
     def leg_report(leg: Leg) -> None:
         try:
-            import deliverables as d
-            from deliverables import joins as J
-            from deliverables import project as dproj
+            import services.deliverables as d
+            from services.deliverables import joins as J
+            from services.deliverables import project as dproj
         except Exception as exc:  # noqa: BLE001
             leg.skip(f"deliverables unavailable: {exc}")
             return

@@ -14,8 +14,8 @@ from typing import Any
 
 import pytest
 
-from dag import executor
-from dag.graph_loader import GraphValidationError, validate_graph
+from services.dag import executor
+from services.dag.graph_loader import GraphValidationError, validate_graph
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +130,9 @@ class TestExecutorSmoke:
         assert event_types.count("dag.node.started") == 2
         assert event_types.count("dag.node.done") == 2
 
-    def test_importable_as_from_dag_import_executor(self) -> None:
-        """DoD: `from dag import executor` must work (dag -> services/dag repo-root symlink)."""
-        from dag import executor as _exec  # noqa: F401
+    def test_importable_from_canonical_package(self) -> None:
+        """The executor is importable through its canonical package."""
+        from services.dag import executor as _exec  # noqa: F401
         assert callable(_exec.run)
 
 
@@ -191,21 +191,21 @@ class TestGraphValidation:
 
     def test_all_node_types_accepted(self) -> None:
         """Every declared node type in §3 must pass validation."""
-        from dag.graph_loader import VALID_NODE_TYPES
+        from services.dag.graph_loader import VALID_NODE_TYPES
         for ntype in VALID_NODE_TYPES:
             g = _two_node_graph()
             g["nodes"][0]["type"] = ntype
             validate_graph(g)  # must not raise
 
     def test_all_autonomy_levels_accepted(self) -> None:
-        from dag.graph_loader import VALID_AUTONOMY
+        from services.dag.graph_loader import VALID_AUTONOMY
         for level in VALID_AUTONOMY:
             g = _two_node_graph()
             g["nodes"][0]["autonomy"] = level
             validate_graph(g)  # must not raise
 
     def test_all_on_fail_values_accepted(self) -> None:
-        from dag.graph_loader import VALID_ON_FAIL
+        from services.dag.graph_loader import VALID_ON_FAIL
         for val in VALID_ON_FAIL:
             g = _two_node_graph()
             g["nodes"][0]["on_fail"] = val

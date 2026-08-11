@@ -11,14 +11,14 @@ std::string exeDir();
 // else the canonical %APPDATA% path (for messaging).
 std::string runtimePython();
 
-// Resolved working dir that holds the engine/agent/mcp_server packages (cwd for the worker).
+// Resolved working dir that holds the engine/agent/services.mcp packages (cwd for the worker).
 std::string appDir();
 
 bool runtimeReady();                     // python file exists at runtimePython()
 bool ensureRuntime(std::string& log);    // provision if absent; true once ready
 bool repairRuntime(std::string& log);    // force a clean re-provision (broken/partial venv)
 
-// Default CHUDWARE_PROMPTS_DIR (if unset) to the app's bundled agent/prompts so the C++ core
+// Default CHUDWARE_PROMPTS_DIR (if unset) to the app's bundled services/agent/prompts so the C++ core
 // finds its role prompts regardless of the process CWD. MUST be called unconditionally at
 // startup (ensureRuntime is skipped when the runtime is already provisioned).
 void ensurePromptsDir();

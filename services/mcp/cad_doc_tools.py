@@ -7387,7 +7387,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 # Best-effort: never fails the batch if the live sketch load is unavailable.
                 if ok:
                     try:
-                        from mcp_server.ascii2d import (  # noqa: PLC0415
+                        from services.mcp.ascii2d import (  # noqa: PLC0415
                             sketch_ids_from_ops, live_sketch_readback,
                         )
                         sids = sketch_ids_from_ops(ops)

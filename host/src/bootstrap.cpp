@@ -152,7 +152,7 @@ int runWait(const std::string &cmd, const std::string &cwd) {
   return (int)code;
 }
 
-// A provisionable source tree: a dir with installer/provision.py +
+// A provisionable source tree: a dir with services/installer/provision.py +
 // requirements.txt, plus an optional offline wheelhouse beside it.
 struct Payload {
   std::string srcDir;
@@ -286,7 +286,7 @@ bool provisionRuntime(bool force, std::string &log) {
           "the runtime.";
     return false;
   }
-  std::string cmd = "\"" + base + "\" -m installer.provision --base-python \"" +
+  std::string cmd = "\"" + base + "\" -m services.installer.provision --base-python \"" +
                     base + "\" --with-app-code";
   if (force)
     cmd += " --force";
@@ -336,7 +336,7 @@ static bool looksLikeAppDir(const std::string &d) {
 }
 
 std::string appDir() {
-  // Resolve the dir holding engine/agent/mcp_server that the worker runs from.
+  // Resolve the dir holding engine/agent/services.mcp that the worker runs from.
   // Prefer the FRESHEST copy so shipped app-code fixes take effect without
   // re-provisioning: explicit dev override -> payload shipped next to the exe
   // -> a source checkout above the exe -> the installed %APPDATA% copy (last
@@ -378,13 +378,13 @@ bool runtimeReady() {
 
 // Point the C++ core (libchudware) at the app's bundled agent prompts. The core
 // reads CHUDWARE_PROMPTS_DIR for its role prompts + cheatsheets; if it is unset
-// the core falls back to "agent/prompts" RELATIVE TO THE PROCESS CWD. When the
+// the core falls back to "services/agent/prompts" RELATIVE TO THE PROCESS CWD. When the
 // app is launched from its install dir (not the source tree) that relative path
 // does not exist, so agent_run throws "role prompt unreadable/empty:
 // agent\prompts\decomposer.md" and the host silently falls back to the Python
 // worker -> the in-app AI fails with "unknown method: agent_run_v2". appDir()
 // already resolves the dev-repo vs shipped-payload layouts, so its
-// agent/prompts is the right, CWD-independent location. Set it via BOTH
+// services/agent/prompts is the right, CWD-independent location. Set it via BOTH
 // _putenv_s (host CRT) and the process block (so libchudware's own CRT,
 // initialised when the DLL loads later, also sees it).
 void ensurePromptsDir() {
@@ -599,7 +599,7 @@ bool provisionRuntime(bool force, std::string &log) {
         "no base Python 3.11 found - install python3.11 to build the runtime.";
     return false;
   }
-  std::string cmd = shq(base) + " -m installer.provision --base-python " +
+  std::string cmd = shq(base) + " -m services.installer.provision --base-python " +
                     shq(base) + " --with-app-code";
   if (force)
     cmd += " --force";
@@ -679,7 +679,7 @@ bool runtimeReady() {
 void ensurePromptsDir() {
   if (!env_or("CHUDWARE_PROMPTS_DIR", "").empty())
     return; // respect an explicit override
-  std::string p = (fs::path(appDir()) / "agent" / "prompts").string();
+  std::string p = (fs::path(appDir()) / "services" / "agent" / "prompts").string();
   if (!dirExists(p))
     return;
   setenv("CHUDWARE_PROMPTS_DIR", p.c_str(), 1);

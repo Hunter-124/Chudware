@@ -15,7 +15,7 @@ class LlamaCppProvider(OpenAIProvider):
     name = "llamacpp"
 
     def __init__(self, cfg: dict | None = None, model: str = DEFAULT_MODEL):
-        from installer import llamacpp
+        from services.installer import llamacpp
 
         cfg = cfg or {}
         self.runtime = llamacpp.ensure_server_running(cfg)

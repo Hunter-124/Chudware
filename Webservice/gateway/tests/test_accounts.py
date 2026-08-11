@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -17,8 +16,8 @@ if str(GATEWAY_DIR.parent) not in sys.path:
 
 
 @pytest.fixture()
-def accounts_env(tmp_path, monkeypatch):
-    """Fresh accounts module bound to a tmp_path data root (fresh accounts.db)."""
+def accounts_env(pg, tmp_path, monkeypatch):
+    """Fresh accounts module bound to a tmp_path data root and a virgin schema."""
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setenv("CHUDWARE_WEB_DATA_ROOT", str(data))
@@ -39,17 +38,15 @@ def accounts_env(tmp_path, monkeypatch):
     import accounts  # type: ignore
 
     accounts.settings = config.settings
-    accounts._CONN = None
-    accounts._CONN_PATH = None
     return accounts, config, data
 
 
-def _row_count(data: Path) -> int:
-    conn = sqlite3.connect(data / "accounts.db")
-    try:
-        return conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
-    finally:
-        conn.close()
+def _row_count(_data: Path) -> int:
+    import db  # type: ignore
+
+    with db.tx() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM accounts")
+        return int(cur.fetchone()["n"])
 
 
 # ---------------------------------------------------------------------------
@@ -138,28 +135,31 @@ def test_pending_count_and_listing(accounts_env):
 
 
 # ---------------------------------------------------------------------------
-# Auto-approve domains + privilege escalation guards
+# Registration defaults + privilege escalation guards
 # ---------------------------------------------------------------------------
 
 
-def test_auto_approve_domain_creates_active_user(accounts_env, monkeypatch):
+def test_every_new_account_is_pending_regardless_of_domain(accounts_env):
+    """No domain self-activates any more.
+
+    Auto-approval by email domain was deleted with users.yaml: activation is
+    now earned by verifying the address (authn.start_trial promotes only a
+    *pending* row) or granted by an admin. A domain that quietly created
+    `active`/`free` rows would strand every one of its registrants off the
+    trial forever, because there would be no pending row left to promote.
+    """
     accounts, _, _ = accounts_env
-    monkeypatch.setenv("CHUDWARE_WEB_AUTO_APPROVE_DOMAINS", "ua.edu, example.org")
-
-    acct = accounts.ensure_account("student@crimson.ua.edu", "Student")
-    assert acct.status == "active"          # subdomain of ua.edu matches
-    assert acct.role == "user"              # NEVER admin via auto-approve
-    assert accounts.is_authorized(acct)
-    assert acct.decided_by == "auto-domain"
-
-    other = accounts.ensure_account("person@other.net")
-    assert other.status == "pending"
-    assert not accounts.is_authorized(other)
+    for email in ("student@crimson.ua.edu", "staff@ua.edu", "person@other.net"):
+        acct = accounts.ensure_account(email, "Someone")
+        assert acct.status == "pending", email
+        assert acct.plan == "free"
+        assert acct.role == "user"
+        assert acct.decided_by == ""
+        assert not accounts.is_authorized(acct)
 
 
-def test_admin_role_never_self_assigned(accounts_env, monkeypatch):
+def test_admin_role_never_self_assigned(accounts_env):
     accounts, _, _ = accounts_env
-    monkeypatch.setenv("CHUDWARE_WEB_AUTO_APPROVE_DOMAINS", "ua.edu")
 
     # No parameter of ensure_account can influence role.
     for email in ("a@ua.edu", "b@example.com"):
@@ -185,56 +185,6 @@ def test_admin_role_never_self_assigned(accounts_env, monkeypatch):
     # The public router exposes no role-setting endpoint at all.
     paths = {r.path for r in accounts.router.routes}
     assert not any("role" in p for p in paths)
-
-
-# ---------------------------------------------------------------------------
-# users.yaml migration
-# ---------------------------------------------------------------------------
-
-USERS_YAML = """\
-default_project: ""
-default_doc: ""
-users:
-- email: admin@example.com
-  display: Boss
-  role: admin
-  heavy: true
-- email: user@example.com
-  display: Regular
-  role: user
-  heavy: false
-"""
-
-
-def test_users_yaml_import_preserves_admin_and_is_idempotent(accounts_env, tmp_path):
-    accounts, _, _ = accounts_env
-    yaml_path = tmp_path / "users.yaml"
-    yaml_path.write_text(USERS_YAML)
-
-    result = accounts.import_users_yaml(yaml_path)
-    assert sorted(result["imported"]) == ["admin@example.com", "user@example.com"]
-    assert result["skipped"] == []
-
-    admin = accounts.get_account("admin@example.com")
-    assert admin.status == "active"
-    assert admin.role == "admin"
-    assert admin.heavy is True
-    assert accounts.is_authorized(admin)
-    assert accounts.effective_role(admin) == "admin"
-
-    user = accounts.get_account("user@example.com")
-    assert user.status == "active"
-    assert user.role == "user"
-    assert user.heavy is False
-
-    # Second run: no duplication, no clobbering of decisions made since.
-    accounts.set_status("user@example.com", "suspended", decided_by="admin@example.com")
-    accounts.set_plan("admin@example.com", "team")
-    again = accounts.import_users_yaml(yaml_path)
-    assert again["imported"] == []
-    assert sorted(again["skipped"]) == ["admin@example.com", "user@example.com"]
-    assert accounts.get_account("user@example.com").status == "suspended"
-    assert accounts.get_account("admin@example.com").plan == "team"
 
 
 # ---------------------------------------------------------------------------

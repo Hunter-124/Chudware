@@ -1,4 +1,4 @@
-// core/agent/pm_assist.h — C++ port of agent/pm_assist.py (P54b).
+// core/agent/pm_assist.h — C++ port of services/agent/pm_assist.py (P54b).
 //
 // PropertyManager AI assist: ask the active provider for a strict JSON action
 // plan, then validate it against the visible PropertyManager schema. The worker

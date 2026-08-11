@@ -55,12 +55,31 @@ if ($null -ne $HostBin) {
     Write-Warning "chudware.exe not found - staging engine only"
 }
 
-foreach ($pkg in @("engine", "agent", "mcp_server", "installer")) {
-    $src = Join-Path $Root $pkg
+$App = Join-Path $Dist "app"
+New-Item -ItemType Directory -Force -Path $App | Out-Null
+$engineSrc = Join-Path $Root "engine"
+if (Test-Path $engineSrc) {
+    & robocopy $engineSrc (Join-Path $App "engine") /MIR /XD __pycache__ build samples .git /XF *.pyc /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+}
+$servicesSrc = Join-Path $Root "services"
+$servicesDst = Join-Path $App "services"
+New-Item -ItemType Directory -Force -Path $servicesDst | Out-Null
+$servicesInit = Join-Path $servicesSrc "__init__.py"
+if (Test-Path $servicesInit) {
+    Copy-Item -Force $servicesInit (Join-Path $servicesDst "__init__.py")
+} else {
+    New-Item -ItemType File -Force -Path (Join-Path $servicesDst "__init__.py") | Out-Null
+}
+foreach ($pkg in @("agent", "mcp", "installer", "plm", "dag", "browser", "deliverables", "ipc", "serving", "verify", "parts", "reveng", "sim", "vision")) {
+    $src = Join-Path $servicesSrc $pkg
     if (-not (Test-Path $src)) { continue }
-    $dst = Join-Path $Dist ("app\" + $pkg)
-    New-Item -ItemType Directory -Force -Path $dst | Out-Null
-    & robocopy $src $dst /MIR /XD __pycache__ build samples .git /XF *.pyc /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    $dst = Join-Path $servicesDst $pkg
+    & robocopy $src $dst /MIR /XD __pycache__ build samples .git /XF *.pyc test_*.py /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+}
+Get-ChildItem -Path $servicesSrc -Filter "*.py" -File | Where-Object {
+    $_.Name -ne "__init__.py" -and -not $_.Name.StartsWith("test_")
+} | ForEach-Object {
+    Copy-Item -Force $_.FullName (Join-Path $servicesDst $_.Name)
 }
 
 $req = Join-Path $Root "requirements.txt"

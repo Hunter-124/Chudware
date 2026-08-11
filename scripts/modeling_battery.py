@@ -484,7 +484,7 @@ def _engine():
         raise EngineUnavailable(
             "CHUDWARE_LIBCHUDWARE not set to an existing libchudware.so — cannot run live geometry")
     try:
-        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
         cb.call("doc_new", {"kind": "part", "name": "_probe"})
         return cb
     except Exception as e:  # noqa: BLE001

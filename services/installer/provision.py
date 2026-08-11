@@ -1,14 +1,14 @@
 """Provision the Chudware runtime into %APPDATA%/Chudware on first launch.
 
 Ensures an isolated Python venv with build123d/OCCT/pyvista/mcp/etc. exists, plus a copy
-of the app's Python packages (engine, mcp_server, agent, installer) so the MCP server and
-worker can run independent of the source tree. Idempotent and version-stamped: a ready
+of the app's canonical Python packages under ``services`` so the MCP server and worker
+can run independent of the source tree. Idempotent and version-stamped: a ready
 runtime is detected and reused without re-installing.
 
 In the shipped product the C++ launcher extracts an embedded payload (portable Python +
 offline wheelhouse) here; this module is that setup logic and also works from source.
 
-    python -m installer.provision [--check] [--force]
+    python -m services.installer.provision [--check] [--force]
                                   [--base-python <exe>] [--wheelhouse <dir>]
 """
 from __future__ import annotations
@@ -25,32 +25,26 @@ from pathlib import Path
 from services import paths
 
 def _find_repo() -> Path:
-    """Locate the repo root (the dir holding requirements.txt) by walking up from this file.
+    """Locate the repo root (the directory holding requirements.txt).
 
-    Robust to how ``installer`` is laid out: on a normal checkout ``installer`` is a symlink to
-    ``services/installer`` (so ``__file__`` resolves 3 levels below the root), but on Windows —
-    where git symlinks materialize as real top-level directory copies — it sits only 2 levels
-    below. A fixed ``parent.parent.parent`` overshoots by one there and picks the wrong root
-    (the source of the "Could not open requirements file" first-run failure). Anchoring on the
-    requirements.txt marker instead is correct under either layout.
+    Package code always lives at ``services/installer``; walking to the marker keeps
+    source and staged layouts explicit without depending on a compatibility alias.
     """
     here = Path(__file__).resolve()
     for parent in here.parents:
         if (parent / "requirements.txt").is_file():
             return parent
-    return here.parent.parent.parent  # historical fallback (services/installer symlink depth)
+    return here.parents[2]
 
 
 REPO = _find_repo()
 REQUIREMENTS = REPO / "requirements.txt"
-# Top-level packages under the staged app/ dir (import as engine, agent, …).
-APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
-# Nested packages under services/ that the engine worker imports as services.X
-# (e.g. services.plm.worker_rpc for the PLM hub). Without these, plm_*/git_*
-# methods never register and the PLM tab sits on "Loading…". parts/reveng/sim
-# are the worker's own _register() tables; vision backs reveng status probes.
-SERVICE_PACKAGES = ("plm", "dag", "browser", "deliverables", "ipc", "serving", "verify",
-                    "parts", "reveng", "sim", "vision")
+# Top-level packages under the staged app/ directory.
+APP_PACKAGES = ("engine",)
+# Canonical ``services.X`` packages used by the worker and packaged tools.
+SERVICE_PACKAGES = ("agent", "mcp", "installer", "plm", "dag", "browser",
+                    "deliverables", "ipc", "serving", "verify", "parts",
+                    "reveng", "sim", "vision")
 # Top-level modules the worker needs at import time: worker_main itself (the
 # spawned module), paths (hard import), kernel_exec (run_model).
 SERVICE_MODULES = ("worker_main.py", "paths.py", "kernel_exec.py")
@@ -284,15 +278,6 @@ def ensure_app_code(src: Path = REPO) -> Path:
             s = services_src / mod
             if s.exists():
                 shutil.copy2(s, services_dst / mod)
-        # services.agent is also the top-level `agent` package (junction). Mirror it
-        # under services/ so `from services.agent…` works without monorepo layout.
-        agent_src = src / "agent" if (src / "agent").exists() else services_src / "agent"
-        if agent_src.exists():
-            shutil.copytree(agent_src, services_dst / "agent", dirs_exist_ok=True, ignore=ignore)
-        # services.mcp mirrors mcp_server for `from services.mcp…` imports.
-        mcp_src = src / "mcp_server" if (src / "mcp_server").exists() else services_src / "mcp"
-        if mcp_src.exists():
-            shutil.copytree(mcp_src, services_dst / "mcp", dirs_exist_ok=True, ignore=ignore)
     if REQUIREMENTS.exists():
         shutil.copy2(REQUIREMENTS, app / "requirements.txt")
     return app
@@ -339,9 +324,9 @@ def ensure_runtime(base_python: str | None = None, wheelhouse: Path | None = Non
     if not _imports_ok(py):
         return {"status": "error", "reason": "imports failed after install"}
     # Optional local-AI payload. This is a no-op unless the release/source tree includes a
-    # `llamacpp` folder with llama-server.exe; status remains visible via installer.llamacpp.
+    # `llamacpp` folder with llama-server.exe; status remains visible via services.installer.llamacpp.
     try:
-        from installer import llamacpp
+        from services.installer import llamacpp
         llamacpp.install_from_bundle()
     except Exception:  # noqa: BLE001 - runtime provisioning must not fail because optional AI is absent
         pass

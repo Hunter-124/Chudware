@@ -1,11 +1,10 @@
 """Tenant-isolation tests — workspace.py / bucket.py are per-account trees.
 
-Proves that with dev-mode auth standing in for the ~tens of thousands of
-auto-approved *.ua.edu identities, one account can never read, overwrite,
-rename, or delete another account's files or chat history, that jails reject
-escapes and symlinks, that uploads are size-capped with no partials left
-behind, and that the legacy shared tree is reachable only by an explicit
-admin opt-in.
+Proves that with dev-mode auth standing in for the general population of
+self-registered accounts, one account can never read, overwrite, rename, or
+delete another account's files or chat history, that jails reject escapes and
+symlinks, that uploads are size-capped with no partials left behind, and that
+the legacy shared tree is reachable only by an explicit admin opt-in.
 """
 
 from __future__ import annotations
@@ -26,22 +25,37 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import app as app_mod  # noqa: E402
+from gateway import accounts, app as app_mod, db  # noqa: E402
 from gateway.config import settings  # noqa: E402
 from gateway.limits import RateLimiter, user_slug  # noqa: E402
 import gateway.workspace as workspace_mod  # noqa: E402
 
-# Auto-approved domain users (never admin) — the multi-tenant population.
+# Ordinary tenants (never admin) — the multi-tenant population.
 A = {"X-Dev-User": "alice@crimson.ua.edu"}
 B = {"X-Dev-User": "bob@crimson.ua.edu"}
-# Admin seeded into a tmp users file by the fixture (the tracked users.yaml is
-# a template with no admin) — the only identity allowed scope=shared.
+# The only identity allowed scope=shared.
 ADMIN = {"X-Dev-User": "admin@example.com"}
 
 
+def _seed(email: str, display: str, *, admin: bool = False) -> None:
+    """Register and activate one account, optionally promoting it.
+
+    accounts.py deliberately exposes no role setter — admin is granted through
+    the admin API and never self-assigned — so the promotion is a direct row
+    update here rather than a public call that does not (and should not) exist.
+    """
+    accounts.ensure_account(email, display=display)
+    accounts.set_status(email, "active", decided_by="test")
+    if admin:
+        with db.tx() as cur:
+            cur.execute(
+                "UPDATE accounts SET role = 'admin' WHERE email = %s", (email,)
+            )
+
+
 @pytest.fixture(autouse=True)
-def _isolate(tmp_path, monkeypatch):
-    """tmp-backed workspace/bucket roots + seeded admin + hermetic startup."""
+def _isolate(pg, tmp_path, monkeypatch):
+    """tmp-backed workspace/bucket roots + seeded accounts + hermetic startup."""
     monkeypatch.setattr(settings, "dev_mode", True)
     monkeypatch.setattr(settings, "data_root", tmp_path / "data")
     ws = tmp_path / "ws"        # legacy shared workspace root (pre-tenant data)
@@ -51,20 +65,9 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "workspace_root", ws)
     monkeypatch.setattr(settings, "bucket_root", bucket)
 
-    # The middleware's UserDirectory was built from the tracked template; point
-    # it at a tmp file that actually contains an admin account.
-    users_file = tmp_path / "users.yaml"
-    users_file.write_text(
-        "users:\n"
-        "  - email: admin@example.com\n"
-        "    display: Test Admin\n"
-        "    role: admin\n"
-        "    heavy: false\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(settings, "users_file", users_file)
-    monkeypatch.setattr(app_mod.user_directory, "path", users_file)
-    app_mod.user_directory.reload(force=True)
+    _seed("alice@crimson.ua.edu", "Alice")
+    _seed("bob@crimson.ua.edu", "Bob")
+    _seed("admin@example.com", "Test Admin", admin=True)
     return tmp_path
 
 

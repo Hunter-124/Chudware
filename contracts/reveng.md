@@ -323,7 +323,7 @@ Gate nodes use `type: "gate"`, `autonomy: "approve"`, and `inputs.gate_kind` in
 
 ## 10. Agent routing roles
 
-Added to `services/agent/routing.yaml` (and symlink `agent/routing.yaml`):
+Added to `services/agent/routing.yaml`:
 
 | role | purpose | vision |
 |---|---|---|

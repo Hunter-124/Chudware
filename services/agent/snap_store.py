@@ -1,6 +1,6 @@
 """On-disk store for snap-compaction payloads (OG source + PNG frames).
 
-Snap compaction (``services.agent.compaction``) renders archived history to PNG
+Snap compaction (``agent.compaction``) renders archived history to PNG
 frames via the OMP sidecar. The full original ("OG") source text and the decoded
 frames must outlive the in-memory turn: later compaction rounds re-render with
 appended content, and a mid-session provider switch re-renders for the new

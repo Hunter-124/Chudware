@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 
-from mcp_server.ascii2d import (
+from services.mcp.ascii2d import (
     READBACK_MAX_H,
     READBACK_MAX_W,
     apply_ascii_edits,

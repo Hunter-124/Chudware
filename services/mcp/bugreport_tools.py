@@ -10,7 +10,7 @@ explicit override.
 All state and the file writer live in
 ``services.agent.bugreport_context`` — a single import identity, so the ring
 buffer agent_turn feeds is the same one this tool reads no matter which
-module identity (``mcp_server.*`` vs ``services.mcp.*``) loaded this file.
+module identity (``services.mcp.*`` vs ``services.mcp.*``) loaded this file.
 """
 from __future__ import annotations
 

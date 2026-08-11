@@ -20,7 +20,7 @@ if _REPO_ROOT not in sys.path:
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
-from mcp_server.graph_tools import register_graph_tools  # noqa: E402
+from services.mcp.graph_tools import register_graph_tools  # noqa: E402
 
 
 def _mcp() -> FastMCP:

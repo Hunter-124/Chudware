@@ -6,7 +6,7 @@ VENV = os.path.join(os.environ.get("APPDATA", ""), "Chudware", "runtime", "venv"
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 env = dict(os.environ, PYTHONPATH=REPO)
 
-p = subprocess.Popen([VENV, "-m", "mcp_server.server"], cwd=REPO,
+p = subprocess.Popen([VENV, "-m", "services.mcp.server"], cwd=REPO,
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                      stderr=subprocess.DEVNULL, env=env, bufsize=0)
 

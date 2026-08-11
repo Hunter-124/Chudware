@@ -7,7 +7,7 @@ For every `corpora/gsl_dataset` sample (and every `corpora/sw_fixtures/*.step`, 
      the recorded seed from meta.json — the same path gsl_dataset_gen.py used),
   2. export it to STEP,
   3. re-import the STEP (the parametric feature tree is now STRIPPED — one `import` feature),
-  4. run the deterministic recon pipeline (mcp_server/recon_tools.py `reverse_engineer`),
+  4. run the deterministic recon pipeline (services/mcp/recon_tools.py `reverse_engineer`),
   5. score {match_pct, pct_faces_claimed, features_recovered}.
 
 Then render `docs/RECOGNITION_RESIDUAL.md` with a per-family verdict under the binding gate
@@ -23,10 +23,10 @@ If the full set would exceed the ~40-minute budget, run a deterministic stratifi
 (`--per-family N`: the FIRST N samples per family sorted by directory name, seed-free) —
 the report header states exactly which mode produced the numbers.
 
-Usage (from the repo root — the `mcp_server` symlink -> services/mcp must resolve):
+Usage from the repo root (module execution keeps canonical packages importable):
 
-    python3 tools/gsl_eval.py
-    python3 tools/gsl_eval.py --per-family 5 --out docs/RECOGNITION_RESIDUAL.md
+    python3 -m tools.gsl_eval
+    python3 -m tools.gsl_eval --per-family 5 --out docs/RECOGNITION_RESIDUAL.md
 """
 from __future__ import annotations
 
@@ -43,11 +43,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from mcp_server import core_bridge as cb  # noqa: E402
+from services.mcp import core_bridge as cb
 
 # Gate thresholds (binding: tools/gsl_gnn/README.md + HANDOFF_AI_EXPERIENCE.md §TODO-3 — doc pruned 2026-07-23; rule survives in docs/review/RECOGNITION_RESIDUAL.md).
 GATE_MATCH_PCT = 90.0
@@ -66,7 +62,7 @@ def _recon_mcp():
     global _MCP
     if _MCP is None:
         from mcp.server.fastmcp import FastMCP  # noqa: PLC0415
-        from mcp_server.recon_tools import register_recon_tools  # noqa: PLC0415
+        from services.mcp.recon_tools import register_recon_tools  # noqa: PLC0415
         _MCP = FastMCP("gsl-eval")
         register_recon_tools(_MCP)
     return _MCP
@@ -262,7 +258,7 @@ def _render_report(rows_by_family: dict[str, list[dict]], *, dataset_root: Path,
     L.append(f"- Engine: `{lib}`")
     L.append(f"- Dataset: `{dataset_root}` (source parts regenerated from each sample's "
              "recorded family+seed, exported to STEP, re-imported tree-stripped, then run "
-             "through `mcp_server/recon_tools.py:reverse_engineer`)")
+             "through `services/mcp/recon_tools.py:reverse_engineer`)")
     L.append(f"- Sample selection: {mode}")
     L.append(f"- SolidWorks STEP fixtures: {sw_note}")
     L.append(f"- Total runtime: {total_s / 60.0:.1f} min")

@@ -19,10 +19,10 @@ from .common import BUNDLED, envelope, fail
 # --- normaliser seam -------------------------------------------------------------------
 # Prefer the canonical agent normaliser; fall back to a local mirror until T-F3 merges.
 try:  # pragma: no cover - exercised via the skipif test on the F3 branch
-    from agent.interaction import (  # type: ignore
+    from services.agent.interaction import (  # type: ignore
         InteractionError as _InteractionError,
     )
-    from agent.interaction import normalize_dimension as _canonical_normalize
+    from services.agent.interaction import normalize_dimension as _canonical_normalize
 
     _HAVE_CANONICAL = True
 except Exception:  # noqa: BLE001 - agent package not in this tree until T-F3 merges
@@ -30,7 +30,7 @@ except Exception:  # noqa: BLE001 - agent package not in this tree until T-F3 me
     _HAVE_CANONICAL = False
 
     class _InteractionError(Exception):  # type: ignore
-        """Local stand-in mirroring ``agent.interaction.InteractionError``."""
+        """Local stand-in mirroring ``services.agent.interaction.InteractionError``."""
 
 
 # TODO(T-F3 merge): fallback until interaction.py lands. Keep these tables byte-for-byte
@@ -77,9 +77,9 @@ def _fallback_normalize(value: float, unit: str, family: str = "length") -> dict
 
 
 def normalizer_source() -> str:
-    """Which normaliser is live — ``"agent.interaction"`` once F3 merges, else
+    """Which normaliser is live — ``"services.agent.interaction"`` once F3 merges, else
     ``"fallback"``. Surfaced on the envelope so a caller can see the seam."""
-    return "agent.interaction" if _HAVE_CANONICAL else "fallback"
+    return "services.agent.interaction" if _HAVE_CANONICAL else "fallback"
 
 
 def _canonical_direction(value: Any, unit: str, family: str = "length") -> dict:

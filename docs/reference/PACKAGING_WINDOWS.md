@@ -5,7 +5,7 @@ below** — no MSVC, no Inno Setup, no Windows `Chudware.exe`. Everything here i
 reading `services/installer/{build_release.py,install.ps1,uninstall.ps1}` (which already exist
 and already work for a manual/dev install) plus `host/src/bootstrap.cpp`'s POSIX branch,
 which the Windows branch mirrors exactly (same `%APPDATA%/Chudware` layout, same
-`installer.provision` invocation). A Windows host must run through this once and report back
+`services.installer.provision` invocation). A Windows host must run through this once and report back
 before T-Q1's Windows box can be marked more than `[~]`.
 
 ## What already exists (don't rebuild it)
@@ -25,7 +25,7 @@ before T-Q1's Windows box can be marked more than `[~]`.
 1. Visual Studio Build Tools (or full VS) with the MSVC toolchain — for `host/build` (the current
    Windows GUI target — `host/` is the single GUI on both OSes).
 2. Python 3.11 on PATH (or the `py` launcher with a 3.11 install) — `install.ps1` and
-   `installer/provision.py` both resolve this the same way `_find_base_python()` does.
+   `services/installer/provision.py` both resolve this the same way `_find_base_python()` does.
 3. [Inno Setup 6](https://jrsoftware.org/isinfo.php) — installs `ISCC.exe` (the command-line
    compiler); add its install dir to PATH or invoke it by full path below.
 
@@ -36,7 +36,7 @@ before T-Q1's Windows box can be marked more than `[~]`.
 cmake --build host\build --config Release
 
 # 2. Assemble the release payload (app/ + wheelhouse/ + the exe + assets).
-python -m installer.build_release --out dist --zip
+python -m services.installer.build_release --out dist --zip
 #   -> dist\Chudware\  (payload folder)  and  dist\Chudware-release.zip
 
 # 3. Compile the installer.
@@ -59,13 +59,13 @@ version stamping in `packaging/linux/build_appimage.sh`) — e.g. in PowerShell:
       Settings ▸ Advanced ▸ Runtime runs the same check the GUI does).
 - [ ] `%APPDATA%\Chudware\runtime\venv\Scripts\python.exe` exists and
       `%APPDATA%\Chudware\runtime\.ready.json` has a `req_hash` matching the shipped
-      `requirements.txt` (`installer.provision.is_ready()`'s own check).
+      `requirements.txt` (`services.installer.provision.is_ready()`'s own check).
 - [ ] The Start Menu has an "Chudware" entry (note: currently duplicated — see the `.iss` file's
       comment; `install.ps1` also makes its own shortcut).
 - [ ] Uninstalling via "Apps & Features" removes the Start Menu entries and `%APPDATA%\Chudware`
       (via `uninstall.ps1`'s `[UninstallRun]` step), leaving no orphaned MCP client registration
-      (`installer.register_mcp --unregister` runs as part of `uninstall.ps1`).
-- [ ] `python -m installer.provision --check` inside the installed `app\` reports `"ready": true`.
+      (`services.installer.register_mcp --unregister` runs as part of `uninstall.ps1`).
+- [ ] `python -m services.installer.provision --check` inside the installed `app\` reports `"ready": true`.
 
 ## Engine-host daemon (chudware-hostd) — Windows validation checklist (Phase 6)
 
@@ -182,7 +182,7 @@ stages `chudware-hostd.exe`/`.pdb`, `install.ps1`/`uninstall.ps1` stop the insta
 first, `register_mcp.py --hostd-bin` pins `CHUDWARE_HOSTD_BIN` in the MCP server env, the
 `.iss` gained `CloseApplications=yes`. See `docs/reference/HOSTD.md` for the daemon reference.
 
-- [ ] `python -m installer.build_release --zip` after
+- [ ] `python -m services.installer.build_release --zip` after
       `cmake --build core\build --config Release --target chudware-hostd`: `dist\Chudware\`
       contains `chudware-hostd.exe` (and `.pdb`), `manifest.json` says `"hostd": true`.
       Without the core build it prints the warning and stages the rest (`"hostd": false`).

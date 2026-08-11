@@ -761,7 +761,7 @@ def test_fastmcp_path_still_serves_the_canonical_call(live):
     EVERY FastMCP call — including the documented one — fails with "Field required" while
     the built-in agent path (which bypasses FastMCP) keeps working.
     """
-    from mcp_server import server
+    from services.mcp import server
     _add_features, doc = live
     tools = asyncio.run(server.mcp.list_tools())
     schema = next(t for t in tools if t.name == "add_features").inputSchema

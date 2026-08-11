@@ -623,7 +623,7 @@ class TestOrgToolRegistration:
         import importlib
         import glob
 
-        from mcp_server import tool_registry as reg
+        from services.mcp import tool_registry as reg
         reg.clear_catalog()
 
         class _StubMCP:
@@ -648,7 +648,7 @@ class TestOrgToolRegistration:
         """With org_tools registered, validate_suite sees no feature-flagged tools."""
         import glob
         import importlib
-        from mcp_server import tool_registry as reg
+        from services.mcp import tool_registry as reg
         from services.agent import roles
 
         reg.clear_catalog()

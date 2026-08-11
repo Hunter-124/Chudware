@@ -33,7 +33,7 @@ file when the "chudware" (or legacy "ai-cad") entry would actually change.
 Pure standard library on purpose -- it must run under any Python, including one without the
 engine's heavy dependencies installed.
 
-    python installer/setup_mcp_clients.py [--python <exe>] [--repo <dir>]
+    python services/installer/setup_mcp_clients.py [--python <exe>] [--repo <dir>]
                                           [--profile lite|full]
                                           [--unregister] [--dry-run]
                                           [--detect] [--wizard]
@@ -54,12 +54,12 @@ SERVER_NAME_LEGACY = "ai-cad"
 
 
 def _default_repo() -> str:
-    """Resolve repo root whether the script lives under installer/ or services/installer/."""
+    """Resolve the repository root from the canonical services package."""
     here = Path(__file__).resolve()
     for cand in here.parents:
         if (cand / "services" / "mcp").is_dir() and (cand / "requirements.txt").is_file():
             return str(cand)
-    return str(here.parents[1])
+    return str(here.parents[2])
 
 
 def _env(repo: str, profile: str) -> dict:
@@ -97,7 +97,7 @@ def _claude_entry(py: str, repo: str, profile: str) -> dict:
     """Claude Code / Cursor / Antigravity share this shape."""
     return {
         "command": py,
-        "args": ["-m", "mcp_server.server"],
+        "args": ["-m", "services.mcp.server"],
         "cwd": repo,
         "env": _env(repo, profile),
     }
@@ -107,7 +107,7 @@ def _vscode_entry(py: str, repo: str, profile: str) -> dict:
     return {
         "type": "stdio",
         "command": py,
-        "args": ["-m", "mcp_server.server"],
+        "args": ["-m", "services.mcp.server"],
         "cwd": repo,
         "env": _env(repo, profile),
     }
@@ -116,7 +116,7 @@ def _vscode_entry(py: str, repo: str, profile: str) -> dict:
 def _opencode_entry(py: str, repo: str, profile: str) -> dict:
     return {
         "type": "local",
-        "command": [py, "-m", "mcp_server.server"],
+        "command": [py, "-m", "services.mcp.server"],
         "enabled": True,
         "environment": _env(repo, profile),
     }
@@ -168,14 +168,14 @@ def _targets(py: str, repo: str, profile: str = "full") -> list[dict]:
         "client": "Grok (user)",
         "path": home / ".grok" / "config.toml",
         "format": "grok_toml",
-        "entry": {"command": py, "args": ["-m", "mcp_server.server"],
+        "entry": {"command": py, "args": ["-m", "services.mcp.server"],
                   "env": _env(repo, profile)},
     })
     out.append({
         "client": "Grok (project)",
         "path": repo_p / ".grok" / "config.toml",
         "format": "grok_toml",
-        "entry": {"command": py, "args": ["-m", "mcp_server.server"],
+        "entry": {"command": py, "args": ["-m", "services.mcp.server"],
                   "env": _env(repo, profile)},
     })
     return out
@@ -273,7 +273,7 @@ def _toml_upsert_table(text: str, table: str, body: str) -> str:
             # Bare key/value lines that only make sense inside [mcp_servers.chudware]
             if s.startswith("env = {") and "CHUDWARE_MCP_PROFILE" in s:
                 continue
-            if s.startswith("args = [") and "mcp_server.server" in s:
+            if s.startswith("args = [") and "services.mcp.server" in s:
                 continue
             if s.startswith('["-m"') or s.startswith("['-m'"):
                 continue

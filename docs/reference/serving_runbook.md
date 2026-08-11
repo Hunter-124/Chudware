@@ -40,7 +40,7 @@ vllm serve Qwen/Qwen3-4B \
   sends `model="IP-13/v3"`. Base model is requested by its own name.
 - Pull the adapters first: `python -m tools.flywheel.dvc_init --repo training pull adapters/<job_id>`.
 - Verify the SDK provider path locally (no GPU): `pip install openai==2.41.0 &&
-  python -m pytest agent/test_vllm_provider.py -q` → 9 passed (in CI `openai` is absent → the
+  python -m pytest services/agent/test_vllm_provider.py -q` → 9 passed (in CI `openai` is absent → the
   5 SDK cases skip, like the whole openai/anthropic/openrouter family).
 
 ### Local mode (P13 serving posture, no GPU)
@@ -128,7 +128,7 @@ serving_promote(insertion_point="IP-13", adapter_version="IP-13/v4",
 
 CI proves metrics-alone-are-not-sufficient (`test_metrics_alone_are_not_sufficient`),
 no-signoff-refused, report-missing-refused, ineligible-refused, and the happy path
-(`services/serving/test_promotion.py`, `mcp_server/test_serving_tools.py`).
+(`services/serving/test_promotion.py`, `services/mcp/test_serving_tools.py`).
 
 ## 6a. Settings visibility — "which brain answered"
 

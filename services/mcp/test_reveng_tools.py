@@ -55,7 +55,7 @@ _FAKE_MCP_MODULES: dict = _build_fake_mcp_modules()
 
 # Stub keys this module inserted into sys.modules (popped after the import window).
 # Anything installed here MUST be tracked, or it leaks into every later test module in the
-# same process: the untracked `mcp_server.cad_tools` stub used to survive, and because it
+# same process: the untracked `services.mcp.cad_tools` stub used to survive, and because it
 # only carries _dumps/_err any later `from .cad_tools import _CUR` failed with
 # "cannot import name '_CUR' (unknown location)" — which in turn made recon_tools
 # unimportable and the reveng worker bridge answer `reveng_unavailable`.
@@ -76,7 +76,7 @@ def _install_stubs():
     # core_bridge stub (carries CoreError: cad_common does
     # ``from .core_bridge import CoreError`` at module scope since T-RF8, and this
     # stub leaks into later modules' imports by design of setdefault)
-    cb_mod = types.ModuleType("mcp_server.core_bridge")
+    cb_mod = types.ModuleType("services.mcp.core_bridge")
     cb_mod.available = lambda: False
     cb_mod.call = lambda method, params=None: {}
 
@@ -90,7 +90,7 @@ def _install_stubs():
     # Track which keys WE inserted so they can be removed after the import below —
     # a leaked stub with call()->{} silently breaks later modules that drive the
     # real core_bridge (e.g. test_reveng_e2e_datasheet's C++ match_part_number leg).
-    for _k in ("mcp_server.core_bridge", "core_bridge"):
+    for _k in ("services.mcp.core_bridge", "core_bridge"):
         if _k not in sys.modules:
             sys.modules[_k] = cb_mod
             _STUBBED_CORE_BRIDGE_KEYS.append(_k)
@@ -100,8 +100,8 @@ def _install_stubs():
         sys.modules.setdefault(key, mod)
 
     # cad_tools stub — only _dumps/_err needed
-    if "mcp_server.cad_tools" not in sys.modules:
-        ct_mod = types.ModuleType("mcp_server.cad_tools")
+    if "services.mcp.cad_tools" not in sys.modules:
+        ct_mod = types.ModuleType("services.mcp.cad_tools")
 
         def _dumps(obj):
             return json.dumps(obj)
@@ -111,8 +111,8 @@ def _install_stubs():
 
         ct_mod._dumps = _dumps
         ct_mod._err = _err
-        sys.modules["mcp_server.cad_tools"] = ct_mod
-        _STUBBED_MODULE_KEYS.append("mcp_server.cad_tools")
+        sys.modules["services.mcp.cad_tools"] = ct_mod
+        _STUBBED_MODULE_KEYS.append("services.mcp.cad_tools")
 
 
 _install_stubs()

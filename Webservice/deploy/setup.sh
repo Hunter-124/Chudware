@@ -41,6 +41,15 @@ TUNNEL_TOKEN=
 CHUDWARE_CF_TEAM_DOMAIN=https://bruh234324.cloudflareaccess.com
 CHUDWARE_CF_AUD=
 
+# Self-serve auth: signs the chudware_sid session cookie (required in production)
+CHUDWARE_WEB_SESSION_SECRET=
+
+# Optional social sign-in (blank => email + password registration only)
+# CHUDWARE_WEB_GOOGLE_CLIENT_ID=
+# CHUDWARE_WEB_GOOGLE_CLIENT_SECRET=
+# CHUDWARE_WEB_GITHUB_CLIENT_ID=
+# CHUDWARE_WEB_GITHUB_CLIENT_SECRET=
+
 # Local-only bypass (never on a public path)
 # CHUDWARE_WEB_DEV=1
 
@@ -48,7 +57,7 @@ CHUDWARE_CF_AUD=
 # CHUDWARE_WEB_DATA=/home/YOU/chudware-web-data
 EOF
   chmod 600 "${ENV_FILE}"
-  echo "    wrote skeleton ${ENV_FILE} (chmod 600) — fill TUNNEL_TOKEN + CHUDWARE_CF_AUD"
+  echo "    wrote skeleton ${ENV_FILE} (chmod 600) — fill TUNNEL_TOKEN, CHUDWARE_CF_AUD, CHUDWARE_WEB_SESSION_SECRET"
 else
   echo "    keep existing ${ENV_FILE}"
 fi
@@ -63,28 +72,9 @@ echo "==> installing gateway requirements"
 "${VENV}/bin/pip" install -r "${GATEWAY_DIR}/requirements.txt" -q
 echo "    venv ok: ${VENV}"
 
-# --- oauth2-proxy binary (Microsoft Entra multi-tenant SSO front door) -------
-OAUTH2_PROXY_VERSION="7.15.3"
-OAUTH2_PROXY_BIN="${HOME}/.local/bin/oauth2-proxy"
-if [[ ! -x "${OAUTH2_PROXY_BIN}" ]]; then
-  echo "==> installing oauth2-proxy v${OAUTH2_PROXY_VERSION}"
-  mkdir -p "${HOME}/.local/bin"
-  tmp="$(mktemp -d)"
-  curl -fsSL -o "${tmp}/oauth2-proxy.tar.gz" \
-    "https://github.com/oauth2-proxy/oauth2-proxy/releases/download/v${OAUTH2_PROXY_VERSION}/oauth2-proxy-v${OAUTH2_PROXY_VERSION}.linux-amd64.tar.gz"
-  tar -xzf "${tmp}/oauth2-proxy.tar.gz" -C "${tmp}"
-  install -m 755 "${tmp}/oauth2-proxy-v${OAUTH2_PROXY_VERSION}.linux-amd64/oauth2-proxy" "${OAUTH2_PROXY_BIN}"
-  rm -rf "${tmp}"
-  echo "    installed ${OAUTH2_PROXY_BIN}"
-else
-  echo "    oauth2-proxy present: ${OAUTH2_PROXY_BIN}"
-fi
-# Config (client id/secret/shared secret) is hand-provisioned, not written here —
-# see Webservice/deploy/oauth2-proxy.cfg.example + RUNBOOK.md §Entra SSO.
-
 # --- systemd user units ------------------------------------------------------
 mkdir -p "${UNIT_DIR}"
-for u in chudware-gateway.service chudware-cloudflared.service chudware-monitor.service chudware-monitor.timer chudware-backup.service chudware-backup.timer chudware-sso.service; do
+for u in chudware-gateway.service chudware-cloudflared.service chudware-monitor.service chudware-monitor.timer chudware-backup.service chudware-backup.timer; do
   src="${DEPLOY_DIR}/${u}"
   dst="${UNIT_DIR}/${u}"
   if [[ -f "${src}" ]]; then
@@ -119,12 +109,14 @@ echo "==> next steps checklist"
 cat <<EOF
   [ ] SECURITY: rotate Cloudflare API token + R2 keys (leaked in git history) — see RUNBOOK.md §SECURITY
   [ ] Confirm cf_provision.py wrote TUNNEL_TOKEN + CHUDWARE_CF_AUD into ${ENV_FILE}
-  [ ] Edit Webservice/gateway/users.yaml (emails + heavy seats)
-  [ ] Optional: Google IdP in CF Zero Trust (GCP OAuth client) — RUNBOOK.md
-  [ ] Optional: Microsoft Entra SSO for UA accounts — fill client_id/client_secret in
-      ${DATA_ROOT}/oauth2-proxy.cfg (see RUNBOOK.md §Entra SSO), then
-      systemctl --user enable --now chudware-sso.service
-  [ ] Edit Access allowlist emails (dashboard or API)
+  [ ] Set CHUDWARE_WEB_SESSION_SECRET in ${ENV_FILE} — REQUIRED; the gateway refuses to
+      start without it. Generate with:
+      python3 -c 'import secrets;print(secrets.token_urlsafe(48))'
+  [ ] Optional: Google/GitHub sign-in — set CHUDWARE_WEB_GOOGLE_CLIENT_ID/_SECRET and/or
+      CHUDWARE_WEB_GITHUB_CLIENT_ID/_SECRET in ${ENV_FILE} (RUNBOOK.md §(c))
+  [ ] Nothing to seed: users register themselves and verify by email; approve them at /admin
+  [ ] Optional: Google IdP for the CF Access /admin door (CF Zero Trust) — RUNBOOK.md
+  [ ] Edit Access allowlist emails — Access gates /admin only (dashboard or API)
   [ ] systemctl --user start chudware-gateway chudware-cloudflared chudware-monitor.timer
   [ ] curl -sS http://127.0.0.1:8300/healthz | jq .
   [ ] Full ops: Webservice/deploy/RUNBOOK.md

@@ -2,14 +2,14 @@
 
 Produces  <out>/Chudware/  containing:
     chudware.exe              the native host (built separately via CMake)
-    app/                    Python packages (engine, mcp_server, agent, installer) + requirements
+    app/                    Python packages (engine + canonical services packages) + requirements
     wheelhouse/             offline wheels for the runtime (pip download)   [--skip-wheels to omit]
     python-embed/           portable CPython for self-contained installs    [--with-python]
     install.ps1 / uninstall.ps1
 This is the "embed-and-extract" payload: install.ps1 provisions %APPDATA%/Chudware from it and
 registers the MCP server. Optionally zips the folder.
 
-    python -m installer.build_release [--out dist] [--skip-wheels] [--with-python] [--zip]
+    python -m services.installer.build_release [--out dist] [--skip-wheels] [--with-python] [--zip]
 """
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent
-APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
-# Nested packages under services/ that the engine worker imports as services.X
-# (services.plm drives the PLM hub; without it plm_*/git_* never register).
-SERVICE_PACKAGES = ("plm", "dag", "browser", "deliverables", "ipc", "serving", "verify")
+APP_PACKAGES = ("engine",)
+# Canonical ``services.X`` packages used by the worker and packaged tools.
+SERVICE_PACKAGES = ("agent", "mcp", "installer", "plm", "dag", "browser",
+                    "deliverables", "ipc", "serving", "verify")
 HOST_EXE = REPO / "host" / "build-win" / "bin" / "chudware.exe"
 if not HOST_EXE.exists():
     HOST_EXE = REPO / "host" / "build" / "bin" / "Release" / "chudware.exe"
@@ -57,7 +57,7 @@ def stage_app(dst: Path) -> None:
         else:
             (services_dst / "__init__.py").write_text("", encoding="utf-8")
         # Loose top-level services/*.py modules (paths.py, kernel_exec.py, worker_main.py, …) --
-        # SERVICE_PACKAGES below only covers subpackages; installer.provision imports
+        # SERVICE_PACKAGES below only covers subpackages; services.installer.provision imports
         # `services.paths` directly, so these single-file modules must ship too.
         for py in services_src.glob("*.py"):
             if py.name == "__init__.py" or py.name.startswith("test_"):
@@ -67,12 +67,6 @@ def stage_app(dst: Path) -> None:
             s = services_src / name
             if s.exists():
                 shutil.copytree(s, services_dst / name, dirs_exist_ok=True, ignore=_IGNORE)
-        agent_src = REPO / "agent" if (REPO / "agent").exists() else services_src / "agent"
-        if agent_src.exists():
-            shutil.copytree(agent_src, services_dst / "agent", dirs_exist_ok=True, ignore=_IGNORE)
-        mcp_src = REPO / "mcp_server" if (REPO / "mcp_server").exists() else services_src / "mcp"
-        if mcp_src.exists():
-            shutil.copytree(mcp_src, services_dst / "mcp", dirs_exist_ok=True, ignore=_IGNORE)
     # samples are handy to ship even though we ignore them above for other dirs
     sample_src = REPO / "engine" / "samples"
     if sample_src.exists():
@@ -151,8 +145,8 @@ def build(out: Path, skip_wheels: bool, with_python: bool, make_zip: bool) -> di
     manifest["components"]["app"] = True
     manifest["components"].update(stage_optional_payloads(dst))
 
-    shutil.copy2(REPO / "installer" / "install.ps1", dst / "install.ps1")
-    shutil.copy2(REPO / "installer" / "uninstall.ps1", dst / "uninstall.ps1")
+    shutil.copy2(REPO / "services" / "installer" / "install.ps1", dst / "install.ps1")
+    shutil.copy2(REPO / "services" / "installer" / "uninstall.ps1", dst / "uninstall.ps1")
     shutil.copy2(REPO / "requirements.txt", dst / "requirements.txt")
 
     if skip_wheels:

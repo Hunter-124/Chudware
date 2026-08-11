@@ -253,16 +253,18 @@ std::vector<ModelInfo> providerPickerModels(AppState& st, int provider) {
 }
 
 // Free AI (FreeLLMAPI, github.com/tashfeenahmed/freellmapi) provider card — reused from BOTH
-// the classic Settings -> AI provider picker (drawProviderModel, active only) AND the live
-// Settings -> Providers tab (settings_modal.cpp), which is normally driven entirely by the OMP
-// bridge's own catalog and has no row for a provider outside that catalog. Renders differently
-// depending on whether Free AI is the CURRENTLY ACTIVE Settings::provider:
-//   active   — full base_url/model/key editing (s.baseUrl is a SHARED field across every
-//              base_url-keyed provider, so it's only safe to edit while this one owns it).
-//   dormant  — key-only (freellmapiKey is its own dedicated buffer, safe to edit anytime, same
-//              idiom as the "park a Moonshot key without switching" card) + a switch button.
-// Returns true when a field changed (caller saves); the switch button saves immediately, same
-// as every other instant-persist toggle in this modal (theme, units, ...).
+// the classic Settings -> AI provider picker and the live Settings -> Providers tab. Endpoint
+// and model controls remain here; credentials never do. All keys are validated and stored by
+// the OMP AuthStorage flow in Settings -> Providers.
+// Returns true when a non-credential field changed (caller saves).
+static void drawValidatedCredentialHint(AppState& st, const char* detail) {
+    dimText(detail);
+    if (ImGui::SmallButton("Manage validated credentials##provider_credentials")) {
+        st.openSettings = true;
+        st.openSettingsTab = 3;
+    }
+}
+
 bool drawFreeAiProviderCard(AppState& st) {
     Settings& s = st.settings;
     const float S = ui::uiScale;
@@ -290,8 +292,7 @@ bool drawFreeAiProviderCard(AppState& st) {
         }
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
-        ImGui::TextUnformatted("Not the active chat provider \xe2\x80\x94 park a key below, or "
-                                "switch now.");
+        ImGui::TextUnformatted("Not the active chat provider \xe2\x80\x94 switch now if desired.");
         ImGui::PopStyleColor();
         if (ImGui::SmallButton("Use Free AI as provider##fla_activate")) {
             s.provider = ui::PROV_FREELLMAPI;
@@ -307,21 +308,8 @@ bool drawFreeAiProviderCard(AppState& st) {
             refreshModelAvailability(st, true);
         }
     }
-    ImGui::TextUnformatted("Unified API key (from the router's Keys page)");
-    char* key = providerKeyBuf(s, ui::PROV_FREELLMAPI);
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::InputText("##flakey", key, 256, ImGuiInputTextFlags_Password)) {
-        changed = true;
-        if (!active) saveSettings(s);  // dormant slot — persist immediately, like Moonshot's card
-    }
-    bool haveKey = key[0] != '\0';
-    ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? ui::Palette::toU32(ui::palette.statusOk)
-                                                 : ui::Palette::toU32(ui::palette.statusWarn));
-    ImGui::TextUnformatted(haveKey
-        ? (active ? "unified key set \xe2\x80\x94 blocked in Offline mode"
-                  : "key stored \xe2\x80\x94 Free AI is not the active provider")
-        : "no unified key \xe2\x80\x94 install FreeLLMAPI and paste its Keys-page token below");
-    ImGui::PopStyleColor();
+    drawValidatedCredentialHint(
+        st, "Free AI credentials are added under Settings \xe2\x86\x92 Providers, where the router validates them before AuthStorage persists them.");
     if (active) {
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
         const ProviderModels& flapm = st.providerModels[ui::PROV_FREELLMAPI];
@@ -340,8 +328,8 @@ bool drawFreeAiProviderCard(AppState& st) {
     ImGui::TextUnformatted("Don't have FreeLLMAPI installed yet?");
     dimText("One-liner (Docker) sets up ~/freellmapi and starts the router. A native desktop "
             "tray app (macOS/Windows) is also available from Releases. Either way, open the "
-            "dashboard afterward, add your free provider keys under Keys, then copy the "
-            "unified key back up here.");
+            "dashboard afterward, add your free provider keys under Keys, then add the unified "
+            "key through Settings \xe2\x86\x92 Providers so it is validated before storage.");
     static const std::string kInstallCmd = "curl -fsSL https://freellmapi.co/install.sh | bash";
     if (ImGui::SmallButton("Copy install command##fla"))
         ImGui::SetClipboardText(kInstallCmd.c_str());
@@ -606,12 +594,8 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     // ---- credentials / connection ----
     ImGui::Dummy(ImVec2(0, 6 * S));
     if (s.provider == ui::PROV_CLOUDCOMPAT) {
-        // Cloud OpenAI-compatible: needs BOTH an endpoint (set by the preset, editable) and a key.
-        // OpenRouter is first-class — key status names the active service. Moonshot uses its own
-        // keys.moonshot buffer (via providerKeyBuf) so generic cloud_compat keys are preserved.
-        // Bridge-catalog services (Bedrock / Azure / Antigravity / AIMLAPI) ride this slot too,
-        // but their credential lives in the bridge's own auth db and saveSettings deliberately
-        // drops anything typed here for them — show the sign-in path, not a dead field.
+        // Cloud OpenAI-compatible endpoint. Credentials are intentionally absent from this AI
+        // tab: Settings -> Providers validates them before the OMP AuthStorage persists them.
         const char* svc = ui::cloudServiceKey(s.baseUrl);
         const bool isOR = (std::strcmp(svc, "openrouter") == 0);
         const bool isMS = (std::strcmp(svc, "moonshot") == 0);
@@ -622,58 +606,12 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                     : (isMS ? "Moonshot endpoint" : "Endpoint (base URL)")));
         ImGui::SetNextItemWidth(-1);
         if (ImGui::InputText("##cloudbase", s.baseUrl, sizeof(s.baseUrl))) changed = true;
-        if (bridgeAuth) {
-            dimText("Signed in through the OMP bridge — no API key field here. The bridge "
-                    "resolves both the endpoint and the credential from its own auth db "
-                    "(Settings \xe2\x86\x92 Providers).");
-            if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision))
-                changed = true;
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
-            ImGui::TextUnformatted(
-                std::string(ui::categoryLabel(svc)).append(
-                    " \xe2\x80\x94 signed in via the bridge (blocked in Offline mode)").c_str());
-            ImGui::PopStyleColor();
-        } else {
-            ImGui::TextUnformatted(isOR ? "OpenRouter API key"
-                                        : (isMS ? "Moonshot (Kimi) API key" : "API key"));
-            char* key = providerKeyBuf(s, s.provider);
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputText("##provkey", key, 256, ImGuiInputTextFlags_Password))
-                changed = true;
-            if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision))
-                changed = true;
-            bool haveKey = key[0] != '\0';
-            ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? ui::Palette::toU32(ui::palette.statusOk)
-                                                         : ui::Palette::toU32(ui::palette.statusWarn));
-            if (isOR)
-                ImGui::TextUnformatted(haveKey
-                    ? "OpenRouter key set — models available (blocked in Offline mode)"
-                    : "no OpenRouter key — add one at openrouter.ai/keys");
-            else if (isMS)
-                ImGui::TextUnformatted(haveKey
-                    ? "Moonshot key set — Kimi available (blocked in Offline mode)"
-                    : "no Moonshot key — add one at platform.moonshot.ai");
-            else
-                ImGui::TextUnformatted(haveKey
-                    ? "key set — cloud API available (blocked in Offline mode)"
-                    : "no API key — add your OpenRouter / DashScope / DeepSeek key");
-            ImGui::PopStyleColor();
-        }
-        // Always surface the Moonshot key slot even when another cloud service is active, so
-        // credit can be parked without switching the default provider.
-        if (!isMS) {
-            ImGui::Dummy(ImVec2(0, 6 * S));
-            ImGui::TextUnformatted("Moonshot (Kimi) API key (dormant)");
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputText("##moonshotkey", s.moonshotKey, sizeof(s.moonshotKey),
-                                 ImGuiInputTextFlags_Password))
-                changed = true;
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-            ImGui::TextUnformatted(s.moonshotKey[0]
-                ? "key stored \xe2\x80\x94 Moonshot is not the active provider"
-                : "optional \xe2\x80\x94 store a key without switching providers");
-            ImGui::PopStyleColor();
-        }
+        if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision))
+            changed = true;
+        drawValidatedCredentialHint(
+            st, bridgeAuth
+                    ? "This service uses the OMP bridge credential store. Add or replace its credential under Settings \xe2\x86\x92 Providers."
+                    : "API keys are no longer pasted into the AI tab. Add one under Settings \xe2\x86\x92 Providers; it is saved only after the provider validates it.");
     } else if (s.provider == ui::PROV_FREELLMAPI) {
         if (drawFreeAiProviderCard(st)) changed = true;
     } else if (s.provider == ui::PROV_XAI) {
@@ -822,22 +760,8 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             // console.x.ai hint visible (subscription_login already includes it).
         }
 
-        ImGui::Dummy(ImVec2(0, 4 * S));
-        ImGui::TextUnformatted("API key (console.x.ai — optional if signed in)");
-        char* key = providerKeyBuf(s, s.provider);
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::InputText("##xaikey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
-        bool haveKey = key[0] != '\0';
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            (haveKey || s_xaiConnected) ? ui::Palette::toU32(ui::palette.statusOk)
-                                        : ui::Palette::toU32(ui::palette.statusWarn));
-        if (haveKey)
-            ImGui::TextUnformatted("API key set — uses provider 'xai' (blocked in Offline mode)");
-        else if (s_xaiConnected)
-            ImGui::TextUnformatted("OAuth connected — uses provider 'xai-sub' (blocked in Offline mode)");
-        else
-            ImGui::TextUnformatted("Sign in with SuperGrok or paste an API key from console.x.ai");
-        ImGui::PopStyleColor();
+        drawValidatedCredentialHint(
+            st, "Use the system-browser xAI sign-in above, or add an xAI API key under Settings \xe2\x86\x92 Providers. Keys are saved only after xAI validates them.");
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (s.provider == ui::PROV_CURSOR || s.provider == ui::PROV_KIMISUB) {
         // Subscription-only providers: no API key field — the credential is an OAuth grant.
@@ -866,16 +790,8 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         ImGui::PopStyleColor();
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (cloud) {
-        ImGui::TextUnformatted("API key");
-        char* key = providerKeyBuf(s, s.provider);
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::InputText("##provkey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
-        bool haveKey = key[0] != '\0';
-        ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? ui::Palette::toU32(ui::palette.statusOk)
-                                                     : ui::Palette::toU32(ui::palette.statusWarn));
-        ImGui::TextUnformatted(haveKey ? "key set — model available"
-                                       : "no API key — add one to use this provider");
-        ImGui::PopStyleColor();
+        drawValidatedCredentialHint(
+            st, "API keys are managed under Settings \xe2\x86\x92 Providers and persisted only after provider validation.");
     } else {
         ImGui::TextUnformatted("Base URL");
         ImGui::SetNextItemWidth(-1);
@@ -883,12 +799,8 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             changed = true;
             refreshModelAvailability(st, true);  // re-probe the new endpoint
         }
-        if (s.provider == ui::PROV_LOCAL) {
-            ImGui::TextUnformatted("API key (optional)");
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputText("##localkey", s.apiKey, sizeof(s.apiKey),
-                                 ImGuiInputTextFlags_Password)) changed = true;
-        }
+        drawValidatedCredentialHint(
+            st, "If this local endpoint requires authentication, add its supported credential under Settings \xe2\x86\x92 Providers. This AI tab never writes keys.");
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
         // Local availability status.
         const ProviderModels& pm = st.providerModels[s.provider == ui::PROV_LLAMACPP

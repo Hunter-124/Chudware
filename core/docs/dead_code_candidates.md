@@ -8,7 +8,7 @@
 
 ## Summary
 
-~110 000 Python LOC across engine/ (98 373), agent/ (5 286), mcp_server/ (3 719), installer/ (594), scripts/+tools/ (1 652).  The load-bearing entry points are **`engine/worker.py`** (spawned by `host/src/worker_client.cpp` as `engine.worker`) and **`engine/sim/worker.py`** (spawned lazily by `host/src/core/sim_client.cpp` as `engine.sim.worker`); the MCP server path spawns **`mcp_server/server.py`**. Everything else must be reachable from these roots — or from `installer/` build scripts — to be considered live.
+~110 000 Python LOC across engine/ (98 373), agent/ (5 286), services/mcp/ (3 719), installer/ (594), scripts/+tools/ (1 652).  The load-bearing entry points are **`engine/worker.py`** (spawned by `host/src/worker_client.cpp` as `engine.worker`) and **`engine/sim/worker.py`** (spawned lazily by `host/src/core/sim_client.cpp` as `engine.sim.worker`); the MCP server path spawns **`services/mcp/server.py`**. Everything else must be reachable from these roots — or from `installer/` build scripts — to be considered live.
 
 **Immediate safe-to-delete-now:** ~18 items (all pure artifacts/cache already covered by `.gitignore` but not cleaned; plus 3 untracked top-level dirs with no repo relationships). No source files are safe to delete yet.
 
@@ -57,14 +57,14 @@ sldprt reversing/
 
 ## Section 2 — Genuinely Orphaned Python (No Live Import Path)
 
-After tracing all imports from the two entry points (`engine/worker.py` and `engine/sim/worker.py`) plus `mcp_server/server.py` and `installer/build_release.py`, the following are confirmed to have ZERO import hits from non-test code — but all turn out to be intentional standalone runners or demo scripts, not true orphans:
+After tracing all imports from the two entry points (`engine/worker.py` and `engine/sim/worker.py`) plus `services/mcp/server.py` and `services/installer/build_release.py`, the following are confirmed to have ZERO import hits from non-test code — but all turn out to be intentional standalone runners or demo scripts, not true orphans:
 
 | Path | Evidence | Confidence | Recommended action |
 |---|---|---|---|
 | `engine/ecad/demo.py` | Zero imports from any other module. Self-imports `engine.ecad.sync`, `engine.ecad.rpc`, etc. The module docstring says `Run: python -m engine.ecad.demo`. It is a narrative end-to-end walkthrough, not dead. | med | Keep as developer demo. Consider moving to `tools/` or `docs/` for clarity. LOW deletion risk. |
-| `engine/run_model.py` | Imported in tests (`test_worker_stream.py`, `mcp_server/test_roundtrip.py`) and referenced in `mcp_server/server.py` (via `engine.kernel`). The module itself is a `__main__` CLI. LIVE. | — | Keep |
-| `agent/run_agent.py` | CLI entry point (`python -m agent.run_agent ...`). Has `__main__`. Not imported by worker but is a documented developer/test invocation. | — | Keep |
-| `engine/samples/mounting_plate.py` | Referenced by `engine/run_model.py` (bundled samples lookup), `agent/test_loop_mock.py`, and `mcp_server/test_roundtrip.py`. | — | Keep |
+| `engine/run_model.py` | Imported in tests (`test_worker_stream.py`, `services/mcp/test_roundtrip.py`) and referenced in `services/mcp/server.py` (via `engine.kernel`). The module itself is a `__main__` CLI. LIVE. | — | Keep |
+| `services/agent/run_agent.py` | CLI entry point (`python -m services.agent.run_agent ...`). Has `__main__`. Not imported by worker but is a documented developer/test invocation. | — | Keep |
+| `engine/samples/mounting_plate.py` | Referenced by `engine/run_model.py` (bundled samples lookup), `services/agent/test_loop_mock.py`, and `services/mcp/test_roundtrip.py`. | — | Keep |
 | `scripts/check.py` | Standalone aggregation script that calls `gui_lint`, `feature_surface_audit`, `parity_audit` as subprocesses / imports. Self-contained; no other module imports it. Has `__main__`. | — | Keep as dev/CI gate. |
 | `scripts/gui_lint.py`, `scripts/parity_audit.py`, `scripts/feature_surface_audit.py` | Called by `scripts/check.py`. Standalone dev-time linters with `__main__`. | — | Keep |
 | `tools/solver_diff.py` | Differential-test harness for C++ vs Python solver (oracle). Has `__main__`. Critical to the rewrite effort. | — | **KEEP — oracle harness** |
@@ -81,7 +81,7 @@ After tracing all imports from the two entry points (`engine/worker.py` and `eng
 | `host/src/ui/legacy_chat.cpp` / `legacy_chat.h` | Name implies superseded. However, `host/src/app.cpp` actively `#include "ui/legacy_chat.h"` (confirmed in source). The file also hosts shared UI helpers (`primaryButton`, `sectionHeader`, etc.) used by other panels per file comment. It is LIVE C++ code, not dead. The "legacy" name is misleading — it houses the Design panel and shared helpers that were extracted from a prior monolithic `gui_app.cpp`. | low | Do NOT delete. The name is a historical artifact. Consider renaming to `design_panel.cpp` when refactoring. |
 | `engine/doc/features/script.py` | A "script feature" compiler that runs arbitrary Python code as a feature step. Niche and potentially risky. Check whether any test or user workflow actually exercises it. | low | Investigate: grep tests for `"script"` feature kind. If no passing test exists, mark for deprecation. |
 | `engine/doc/features/weldment.py` + `engine/doc/weld_profiles.py` | Both imported by `engine/doc/features/weldment.py` (weld_profiles is a data module) and tested. LIVE. | — | Keep |
-| `AI-gooning/deepseek_bridge/` | Wholly separate project sharing the same repo directory. Has its own `pyproject.toml`, `pyproject.toml`, `.venv/`. No imports into the main codebase. Superseded for provider purposes by `agent/providers/openai_provider.py` (which speaks OpenAI-compatible API). | med | Extract to own repo or keep as a separate sub-project. Add to `.gitignore` as noted in Section 1. |
+| `AI-gooning/deepseek_bridge/` | Wholly separate project sharing the same repo directory. Has its own `pyproject.toml`, `pyproject.toml`, `.venv/`. No imports into the main codebase. Superseded for provider purposes by `services/agent/providers/openai_provider.py` (which speaks OpenAI-compatible API). | med | Extract to own repo or keep as a separate sub-project. Add to `.gitignore` as noted in Section 1. |
 
 ---
 
@@ -176,7 +176,7 @@ These files are **currently LIVE** (imported at runtime by `engine/worker.py` �
 | `engine/sim/bridge.py` | Doc→sim bridge; imported by engine/worker.py |
 | `engine/sim/overlay.py` | Mesh coloring overlays; imported by sim/worker.py |
 | `engine/sim/lbm.py` | Lattice-Boltzmann CFD; imported by sim/worker.py (`sim_run_flow`) |
-| `engine/sim/spice.py` | SPICE netlist generator; imported by engine/ecad/rpc.py and mcp_server |
+| `engine/sim/spice.py` | SPICE netlist generator; imported by engine/ecad/rpc.py and services.mcp |
 | `engine/sim/subckt.py` | SPICE subcircuit library; imported by spice.py |
 | `engine/sim/circuit.py` | Native MNA simulator; imported by sim/worker.py and ecad stack |
 | `engine/sim/devices.py` | Device models for circuit.py |
@@ -184,7 +184,7 @@ These files are **currently LIVE** (imported at runtime by `engine/worker.py` �
 
 ### 4h — ECAD Python stack (keep until C++ ECAD UI built)
 
-All `engine/ecad/*.py` and `mcp_server/ecad_tools.py` are live — they are registered into `engine/worker.py` (via `engine/ecad/rpc.py`) and into the MCP server (`mcp_server/ecad_tools.py`). Nothing in ECAD is dead.
+All `engine/ecad/*.py` and `services/mcp/ecad_tools.py` are live — they are registered into `engine/worker.py` (via `engine/ecad/rpc.py`) and into the MCP server (`services/mcp/ecad_tools.py`). Nothing in ECAD is dead.
 
 ---
 
@@ -198,8 +198,8 @@ This traces the full host dependency graph so other sections don't mis-flag load
 |---|---|---|
 | Main doc worker | `engine/worker.py` | `host/src/worker_client.cpp` → `engine.worker` |
 | Sim worker (lazy) | `engine/sim/worker.py` | `host/src/core/sim_client.cpp` → `engine.sim.worker` |
-| MCP server (registered at install) | `mcp_server/server.py` | via `installer/register_mcp.py` → `python -m mcp_server.server` |
-| Provisioning | `installer/provision.py` | `bootstrap.cpp` → `python -m installer.provision` |
+| MCP server (registered at install) | `services/mcp/server.py` | via `services/installer/register_mcp.py` → `python -m services.mcp.server` |
+| Provisioning | `services/installer/provision.py` | `bootstrap.cpp` → `python -m services.installer.provision` |
 
 ### `engine/worker.py` direct import tree (top-level module-level imports)
 
@@ -229,22 +229,22 @@ This traces the full host dependency graph so other sections don't mis-flag load
 - `agent.ask` — `agent_ask_v2`
 - `agent.pm_assist` — `agent_pm_assist_v1`
 
-### `mcp_server/server.py` imports
+### `services/mcp/server.py` imports
 
 - `engine.paths`, `engine.render`, `engine.kernel` (direct)
-- `mcp_server.ecad_tools` → `engine.ecad.*` (full ECAD stack via `register_ecad_tools`)
+- `services.mcp.ecad_tools` → `engine.ecad.*` (full ECAD stack via `register_ecad_tools`)
 
 ### `installer/` imports (build-time only, not runtime)
 
-- `installer/provision.py` — standalone; reads `requirements.txt`, calls `pip install`
-- `installer/build_release.py` — called by `build.bat full`; calls `provision.py`, stages dist/
-- `installer/register_mcp.py` — registers MCP server in Claude config files
-- `installer/llamacpp.py` — manages optional llama.cpp server binary
+- `services/installer/provision.py` — standalone; reads `requirements.txt`, calls `pip install`
+- `services/installer/build_release.py` — called by `build.bat full`; calls `provision.py`, stages dist/
+- `services/installer/register_mcp.py` — registers MCP server in Claude config files
+- `services/installer/llamacpp.py` — manages optional llama.cpp server binary
 
 ### Developer/test tools (CLI, not imported at runtime)
 
 - `engine/run_model.py` — CLI model runner
-- `agent/run_agent.py` — CLI agent runner
+- `services/agent/run_agent.py` — CLI agent runner
 - `host/assets/make_icons.py` — icon atlas generator (run when icons change)
 - `tools/solver_diff.py` — **oracle differential tester; critical for C++ rewrite validation**
 - `tools/render_sketches.py` — corpus SVG renderer

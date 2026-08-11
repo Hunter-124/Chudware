@@ -59,8 +59,8 @@ def _ensure_import_stubs() -> None:
             sys.modules["mcp.server"] = server_mod
             sys.modules["mcp.server.fastmcp"] = fastmcp_mod
 
-    if "mcp_server.core_bridge" not in sys.modules:
-        cb = types.ModuleType("mcp_server.core_bridge")
+    if "services.mcp.core_bridge" not in sys.modules:
+        cb = types.ModuleType("services.mcp.core_bridge")
         cb.available = lambda: False
         cb.call = lambda method, params=None: {}
 
@@ -68,18 +68,18 @@ def _ensure_import_stubs() -> None:
             pass
 
         cb.CoreError = CoreError
-        sys.modules["mcp_server.core_bridge"] = cb
+        sys.modules["services.mcp.core_bridge"] = cb
         sys.modules.setdefault("core_bridge", cb)
 
-    if "mcp_server.cad_tools" not in sys.modules:
-        ct = types.ModuleType("mcp_server.cad_tools")
+    if "services.mcp.cad_tools" not in sys.modules:
+        ct = types.ModuleType("services.mcp.cad_tools")
         ct._dumps = lambda obj: json.dumps(obj)
         ct._err = lambda e: json.dumps({"ok": False, "error": str(e)})
         ct._CUR = {}
         ct._doc = lambda x: x
         ct._publish_current = lambda *a, **k: None
         ct._read_prompt = lambda *a, **k: ""
-        sys.modules["mcp_server.cad_tools"] = ct
+        sys.modules["services.mcp.cad_tools"] = ct
 
 
 _ensure_import_stubs()

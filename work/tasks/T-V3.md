@@ -103,36 +103,29 @@ FastMCP`) — once `sys.modules["mcp"]` is the genuine SDK, `mcp.test_X` fails w
 `services/__init__.py`, matching every sibling package's own convention.
 
 *Why layer 1 alone wasn't enough:* I verified it against a combined multi-directory
-sweep (`mcp_server services engine_oracle tools training` in one pytest invocation)
+sweep (`services.mcp services engine_oracle tools training` in one pytest invocation)
 and it looked completely fixed — 14 collection errors and a full session abort became
 1711 real passes. But `scripts/gate.sh`'s actual pytest stage runs `services` **alone**
 (one invocation per top-level dir, specifically to dodge cross-suite pollution — see
 its own comment), and running JUST `pytest services` still reproduced the identical
-shadow error. The combined-sweep test had gotten lucky: `mcp_server`'s own files
+shadow error. The combined-sweep test had gotten lucky: `services.mcp`'s own files
 (collected first in that invocation) import the real `mcp` SDK correctly and cache it
 in `sys.modules` before anything can go wrong, masking a second, independent bug that
 `services`-alone exposes.
 
 *Layer 2 — three more places that put `services/` itself back on `sys.path`, undoing
 layer 1's fix locally:*
-1. `services/dag/conftest.py` deliberately did `sys.path.insert(0, services_dir)` (its
-   own docstring: "mirrors the implicit sys.path insertion... services/agent/ gets") so
-   `services/dag/test_node_runner.py`'s `from dag import node_runner` (bare `dag`)
-   would resolve. `services/dag/` had no repo-root symlink, unlike its siblings
-   (`agent`, `deliverables`, `engine`, `installer`, `mcp_server` all do) — a real gap.
+1. `services/dag/conftest.py` deliberately inserted `services/` itself so a bare
+   package import would resolve. That made `services/mcp/` shadow the installed
+   top-level `mcp` SDK.
 2. `services/mcp/test_cad_tools.py` and `services/installer/test_file_assoc.py` both
-   computed their sys.path entry as `os.path.dirname(os.path.dirname(os.path.abspath(
-   __file__)))` — TWO `dirname()` calls. That's correct ONLY when the file is reached
-   via its repo-root symlink (`mcp_server/test_cad_tools.py`, one level deep); pytest
-   collects it via its real path (`services/mcp/test_cad_tools.py`, two levels deep),
-   so the same computation landed on `services/` instead of repo root. A path-depth
-   bug of the exact same shape T-Q1 and T-C5 both hit tonight in unrelated files.
+   computed their path entry with two `dirname()` calls. Pytest collected each file
+   through its canonical `services/...` path, so the computation landed on
+   `services/` instead of the repo root.
 
-**Fix:** added the missing `dag -> services/dag` symlink (matching the established
-convention exactly); removed the `services/dag/conftest.py` sys.path hack entirely (the
-symlink now does its job); rewrote the two miscounted `dirname()` chains to
-`Path(__file__).resolve().parents[2]` (resolves symlinks first, so the answer is
-correct regardless of which alias path loaded the file).
+**Fix:** all callers now import canonical `services.*` packages and no longer need
+compatibility aliases or a `services/` path insertion. Direct module runners use
+`python -m services...`, which gives the same import graph on every platform.
 
 *Layer 3 — an unscoped `sys.modules` stub, the same bug SHAPE as RC#1 but a different
 file/target.* Even with layers 1+2 fixed, `pytest services` alone still failed —
@@ -176,14 +169,14 @@ gate.sh already carries: `test_loop_mock.py`, `test_foam_case.py`, `test_lbm.py`
 
 The AFTER error count (100) looks alarming next to the prior commit's own "44 errors"
 baseline, but that number was measured BEFORE this fix — with the shadow bug active,
-every file under `services/mcp/` (and its `mcp_server/` duplicate) failed to collect
+every file under `services/mcp/` (and its `services/mcp/` duplicate) failed to collect
 at all and was invisible to that count. Fixing collection didn't create new failures;
 it made previously-invisible ones visible. Breakdown of the 100:
 - 10 = `engine_oracle/ecad/{test_fab,test_sync,test_integration}.py` — same
   pre-existing ECAD baseline already flagged in T-C5's gate run tonight (T-V2 cleanup
   scope, unrelated to anything in this task).
 - 68 = `services/mcp/test_ecad_tools.py` + its byte-identical duplicate
-  `mcp_server/test_ecad_tools.py` (confirmed via `diff` — literally the same file in
+  `services/mcp/test_ecad_tools.py` (confirmed via `diff` — literally the same file in
   two places) — both fail with `fixture 'tools' not found` **even standalone**
   (verified in isolation, not a combined-run artifact). A real, pre-existing bug (a
   `tools` fixture that's defined locally in the neighboring `test_req_tools.py` but
@@ -217,11 +210,11 @@ every stage independently and directly:
   before each was killed, so these are solid.
 - **pytest** — ran gate.sh's own `services` invocation directly (same command, same
   `--ignore` flags, matching its per-top-level-directory strategy exactly — see
-  `stage_pytest()`): completes clean, numbers above. Did not re-run `mcp_server`/
+  `stage_pytest()`): completes clean, numbers above. Did not re-run `services.mcp`/
   `engine_oracle`/`tools`/`training` since none of my changes touch those directories'
   content (only `services/*` + the new `dag`/`services/__init__.py`), and their
   results were already unaffected across all 4 gate attempts (identical numbers each
-  time: `mcp_server` 193 passed, `engine_oracle` 987 passed, both pre-existing-baseline
+  time: `services.mcp` 193 passed, `engine_oracle` 987 passed, both pre-existing-baseline
   FAIL-RECORDED, both unrelated to this task).
 - **ui/imgui** — not independently re-verified this pass (T-C5's gate run earlier
   tonight already confirmed build+shot+selftest PASS on a tree with no ui/imgui-
@@ -230,7 +223,7 @@ every stage independently and directly:
 `graphify update .` run.
 
 **Note for whoever reviews this:** gate.sh's own `stage_pytest()` runs `services`
-as ONE of its five per-directory invocations (`dirs=("mcp_server" "services"
+as ONE of its five per-directory invocations (`dirs=("services.mcp" "services"
 "engine_oracle" "tools" "training")`) — the fix here is directly load-bearing for
 that real invocation, not just a nicety for some hypothetical combined-CI run.
 
@@ -249,4 +242,4 @@ before-failures vanished (verify not order-sensitive). Settle this with evidence
 REVIEW note.
 
 ## Progress log
-- 2026-07-03 01:13 UTC [sonnet-reed] REVIEW T-V3 branch=task/T-V3-env-pollution @ d650676 - the mcp namespace shadow (addendum item 6) turned out to have THREE independent root causes, all confirmed live and fixed: (1) services/ missing __init__.py unlike every sibling subpackage - pytest rootdir climb stopped there, imported services/mcp/*.py as top-level mcp, colliding with the real SDK; fixed by adding services/__init__.py. (2) services/dag/conftest.py deliberately re-polluted sys.path with services/ (to make bare from dag import work, since dag was the one sibling missing its repo-root symlink) - fixed by adding the dag -> services/dag symlink matching agent/deliverables/engine/installer/mcp_server, removing the hack, and fixing 2 more instances of tonight's off-by-one path-depth bug (test_cad_tools.py, test_file_assoc.py) that computed services/ instead of repo root when collected via their real path vs symlink alias. (3) services/mcp/test_doc_canonical.py unconditionally stubbed sys.modules mcp.server.fastmcp .FastMCP = object with no restore whenever it was first to touch mcp - RC#1's exact bug shape in a file outside this task's original 3 named root causes; fixed to try the real SDK import first, only stub on genuine ImportError. Verified against gate.sh's actual per-directory invocation (pytest services alone, same --ignore flags): went from Interrupted-after-14-collection-errors/~0 tests run to a complete clean run. Also finalized the branch's inherited RC#1/2/3 fixes + 4 dep declarations (found this branch pre-existed the task file itself, an orphan from the earlier master-lineage-clobber incident - verified sound, discarded a separate staged regression found sitting in the worktree via git stash rather than force-deleting). Honest mcp-venv snapshot: 16 real gaps remain, provisioning deferred to a recommended fresh T-V4 (shared venv, worktree isolation risk - matches the branch's own prior driver's already-sound reasoning). scripts/gate.sh itself hit 4 consecutive external kills from shared-box resource contention tonight (load average 16 at worst) - not a real failure; every other stage (check.py pre-existing-red, manual-regen, ui_style_check, core build, ctest 100%) was independently confirmed PASS identically across all 4 attempts before each was killed. graphify updated.
+- 2026-07-03 01:13 UTC [sonnet-reed] REVIEW T-V3 branch=task/T-V3-env-pollution @ d650676 — fixed the `mcp` namespace shadow by adding `services/__init__.py`, removing `services/` path injection, and canonicalizing package imports under `services.*`.

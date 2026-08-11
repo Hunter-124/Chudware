@@ -117,6 +117,16 @@ private:
     std::string apSavePath, apCapture;
     bool apDirReady = false;
 
+    // ---------- first-run onboarding scenario (CHUDWARE_SHOT=onboarding) ----------
+    // Forces each wizard step open explicitly, independent of ambient completed_version, and
+    // captures all four. Optional CHUDWARE_ONBOARDING_VERIFY_MERGE=1 persists completion through
+    // the production merge writer after the captures (run only with an isolated XDG_DATA_HOME).
+    void runOnboarding(AppState& st);
+    bool obInit = false, obWant = false, obDone = false;
+    int obPhase = 0, obSettle = 0;
+    std::string obSavePath, obCapture;
+    bool obDirReady = false;
+
     // ---------- T-G15 icon pipeline (CHUDWARE_SHOT=iconpipe) ----------
     // Recipe-driven clean-viewport icon generator: read a JSON recipe list (env CHUDWARE_ICON_RECIPES),
     // and for each recipe build a demo part (newPart + applyOps), render it through the renderer's

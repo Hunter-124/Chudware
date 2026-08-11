@@ -1,4 +1,5 @@
-# Daily capability probe over the whole self-hosted fleet.
+# Daily capability probe over the whole self-hosted fleet, plus the unattended
+# provisioning path that repairs what it finds.
 #
 # Every other workflow assumes its runner still has a toolchain. When that stops
 # being true — a re-image, an OS upgrade that resets xcode-select, a full disk,
@@ -6,18 +7,33 @@
 # or a release fails, hours or weeks later, with an error that names a compile
 # step rather than the machine. This runs once a day and names the machine.
 #
-# It is deliberately side-effect free: identity, disk, and toolchain versions.
-# It builds nothing, publishes nothing, and uploads nothing, so it is safe to
-# run on every endpoint including cloudcastle-server, which is simultaneously
-# the artifact host and the production control box and is therefore the
-# endpoint whose disappearance costs the most.
+# The probe is side-effect free: identity, disk, and toolchain versions. It
+# builds nothing, publishes nothing, and uploads nothing, so it is safe to run
+# on every endpoint including cloudcastle-server, which is simultaneously the
+# artifact host and the production control box and is therefore the endpoint
+# whose disappearance costs the most.
+#
+# Expectations are ROLE-AWARE, because a uniform one was permanently red. A
+# builder must have a compiler, cmake, ninja, ctest, a Python new enough for
+# scripts/check.py, and room to link. A control/publish endpoint
+# (cc-prod-control, cc-artifact-host, cc-infra-webservice) needs git and python
+# and nothing else — demanding cmake there does not describe a fault, it
+# describes a machine doing its job.
+#
+# The provisioning job runs on workflow_dispatch only, never on the cron. It
+# installs, unelevated and idempotently, exactly what the probe is allowed to
+# demand, and the probe then runs behind it in the same dispatch — so one
+# manual run repairs the fleet and proves the repair in its own log.
 #
 # The matrix is resolved at run time from the runners API, mirroring
 # CloudCastle's macOS smoke: an endpoint that is asleep is reported as
 # unscheduled in the summary instead of queueing a row that hangs until its
 # timeout. This repository has no CI_RUNNER_ADMIN_TOKEN secret, so the
 # inventory step degrades to scheduling the full fleet and saying so — a
-# missing PAT must never turn the daily smoke into a failed run.
+# missing PAT must never turn the daily smoke into a failed run. That fallback
+# list is the REGISTERED fleet and nothing else: dell-optiplex-7040 was
+# de-registered (docs/reference/CI_RUNNERS.md) and listing it here queued a row
+# that no runner could ever claim, so every fallback run hung until timeout.
 #
 # rows are self-hosted by construction: the runs-on array carries literal
 # self-hosted and cloudcastle-ci labels, so no computed row can ever land on a
@@ -34,12 +50,196 @@ on:
 permissions:
   contents: read
 
-# Never cancel a smoke: an operator is usually watching this exact run.
+# Never cancel a smoke: an operator is usually watching this exact run, and the
+# provisioning job mutates hosts — a half-killed brew or MSI is worse than a
+# slow queue.
 concurrency:
   group: runner-smoke-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  provision:
+    name: Provision ${{ matrix.label }}
+    # Dispatch only. The cron must stay side-effect free: a nightly job that
+    # silently mutates six machines is not a probe, it is an unreviewed
+    # configuration-management system.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
+    timeout-minutes: 90
+    strategy:
+      # One endpoint that cannot be repaired must not stop the others being
+      # repaired.
+      fail-fast: false
+      matrix:
+        include:
+          - label: ryzen-7900x3d
+            runner_os: Windows
+            runner_arch: X64
+            runner_label: cc-win-ryzen
+          - label: imac-intel
+            runner_os: macOS
+            runner_arch: X64
+            runner_label: cc-mac-intel
+          - label: macbook-air-m2
+            runner_os: macOS
+            runner_arch: ARM64
+            runner_label: cc-mac-arm
+    env:
+      # Pinned and checksum-verified, exactly like the actionlint asset in
+      # ci-workflow-policy.yml: a tag can be re-pointed, a digest cannot.
+      #
+      # python-build-standalone rather than the python.org installer. The
+      # installer was tried first and returned 0x80070005 (access denied) even
+      # with InstallAllUsers=0: Windows Installer cannot run a per-user install
+      # for NT AUTHORITY\NETWORK SERVICE. This is a relocatable tarball -- no
+      # msiexec, no registry, no elevation -- and it is the same distribution
+      # actions/setup-python installs. It carries pip as a module, which is all
+      # fast-gate uses (`python -m pip`, `python -m venv`).
+      PYTHON_WINDOWS_VERSION: 3.13.15
+      PYTHON_WINDOWS_RELEASE: '20260807'
+      PYTHON_WINDOWS_SHA256: a9c1da0175c2390df2a5d9b5994cc962780f6eaa59ac6b9a832154b8862abbff
+      NINJA_WINDOWS_VERSION: 1.13.2
+      NINJA_WINDOWS_SHA256: 07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65
+      # Homebrew formulae the macOS builders need. python@3.13 because macOS
+      # ships 3.9.6 and the pinned NumPy/SciPy that scripts/check.py imports
+      # require >= 3.11; opencascade because the macos-* presets configure with
+      # CHUDWARE_WITH_OCCT=ON and find_package it from the brew prefix.
+      MACOS_FORMULAE: cmake ninja python@3.13 opencascade
+    steps:
+      - name: Install missing prerequisites (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v brew >/dev/null 2>&1; then
+            echo "::error::${RUNNER_NAME:-unknown} has no Homebrew; install it by hand before this job can provision anything"
+            exit 1
+          fi
+          prefix="$(brew --prefix)"
+          echo "brew=$(brew --version | head -n 1) prefix=${prefix}"
+
+          # Idempotent by construction: an already-installed formula is left
+          # exactly as it is. This job repairs a gap, it does not upgrade a
+          # working builder underneath a running release.
+          for formula in ${MACOS_FORMULAE}; do
+            if brew list --versions "${formula}" >/dev/null 2>&1; then
+              echo "present: $(brew list --versions "${formula}")"
+            else
+              echo "installing: ${formula}"
+              brew install "${formula}"
+            fi
+          done
+
+          echo '--- resulting toolchain'
+          "${prefix}/bin/cmake" --version | head -n 1
+          "${prefix}/bin/ninja" --version
+          "${prefix}/bin/python3.13" --version
+          brew list --versions opencascade
+
+      - name: Install missing prerequisites (Windows)
+        if: runner.os == 'Windows'
+        # Windows PowerShell 5.1 — these hosts have no pwsh, and `shell: bash`
+        # resolves to an empty WSL shim that exits 0 without running anything.
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          # The runner service here is NT AUTHORITY\NETWORK SERVICE. It cannot
+          # write Program Files, cannot edit the machine PATH, and cannot
+          # restart its own service to pick a new one up -- so an all-users
+          # install is impossible and a PATH edit would not be visible until
+          # someone reboots the box. Everything therefore lands in a
+          # runner-local directory that this account owns, and every Windows
+          # job puts that directory on PATH itself.
+          $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
+          $bin = Join-Path $tools 'bin'
+          $pythonDir = Join-Path $tools 'python'
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          Write-Host "user=$env:USERNAME tools=$tools"
+
+          function Assert-Sha256($path, $expected) {
+            $actual = (Get-FileHash -Path $path -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $expected.ToLower()) {
+              Write-Host "::error::checksum mismatch for $path -- expected $expected, got $actual; refusing to run an unverified installer"
+              exit 1
+            }
+            Write-Host "sha256 verified: $path"
+          }
+
+          $ninjaExe = Join-Path $bin 'ninja.exe'
+          if (Test-Path $ninjaExe) {
+            Write-Host "present: $ninjaExe"
+          } else {
+            $zip = Join-Path $env:RUNNER_TEMP 'ninja-win.zip'
+            Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+              -Uri "https://github.com/ninja-build/ninja/releases/download/v$($env:NINJA_WINDOWS_VERSION)/ninja-win.zip"
+            Assert-Sha256 $zip $env:NINJA_WINDOWS_SHA256
+            Expand-Archive -Path $zip -DestinationPath $bin -Force
+          }
+          & $ninjaExe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $pythonExe = Join-Path $pythonDir 'python.exe'
+          if (Test-Path $pythonExe) {
+            Write-Host "present: $pythonExe"
+          } else {
+            $archive = Join-Path $env:RUNNER_TEMP 'cpython-windows.tar.gz'
+            $asset = "cpython-$($env:PYTHON_WINDOWS_VERSION)%2B$($env:PYTHON_WINDOWS_RELEASE)-x86_64-pc-windows-msvc-install_only.tar.gz"
+            Invoke-WebRequest -UseBasicParsing -OutFile $archive `
+              -Uri "https://github.com/astral-sh/python-build-standalone/releases/download/$($env:PYTHON_WINDOWS_RELEASE)/$asset"
+            Assert-Sha256 $archive $env:PYTHON_WINDOWS_SHA256
+
+            # bsdtar has shipped in System32 since Windows 10 1803, so this
+            # needs no unpacking tool of its own. The archive's single top
+            # directory is literally "python", so extracting into $tools lands
+            # the interpreter exactly at $pythonDir.
+            $tarExe = Join-Path $env:SystemRoot 'System32\tar.exe'
+            if (-not (Test-Path $tarExe)) {
+              Write-Host "::error::$tarExe is missing; this host cannot unpack the Python distribution"
+              exit 1
+            }
+            & $tarExe -xzf $archive -C $tools
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::unpacking the Python $($env:PYTHON_WINDOWS_VERSION) distribution failed with $LASTEXITCODE; nothing was provisioned"
+              exit 1
+            }
+            if (-not (Test-Path $pythonExe)) {
+              Write-Host "::error::the archive unpacked but $pythonExe does not exist; the asset layout changed"
+              exit 1
+            }
+          }
+
+          & $pythonExe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # pip and venv are what fast-gate actually uses, so prove them here
+          # rather than discovering a stripped install during a gate.
+          $probe = Join-Path $env:RUNNER_TEMP 'provision-venv-probe'
+          & $pythonExe -m venv $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $probe 'Scripts\python.exe') -m pip --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item -Recurse -Force $probe
+
+          # Everything in this step is ASCII on purpose. The runner writes the
+          # script as UTF-8 with no BOM and Windows PowerShell 5.1 decodes it
+          # as the ANSI code page, so a UTF-8 em dash arrives as a curly
+          # closing quote -- which PowerShell accepts as a string delimiter.
+          # One em dash in a comment therefore ends a string three lines
+          # earlier and the step dies with "missing closing '}'" before a
+          # single line of it runs. scripts/verify-ci-workflows.py enforces it.
+          $pythonVersion = (& $pythonExe --version 2>&1) -join ' '
+          $ninjaVersion = (& $ninjaExe --version 2>&1) -join ' '
+          @(
+            '### ryzen-7900x3d provisioning'
+            ''
+            "- tools root: ``$tools``"
+            "- python: $pythonVersion"
+            "- ninja: $ninjaVersion"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
   runner-inventory:
     name: Resolve online fleet capacity
     runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-livingroom]
@@ -62,16 +262,19 @@ jobs:
             exit 1
           fi
 
-          # The registered fleet, one row per endpoint. Keyed by the
+          # The registered fleet, one row per endpoint, keyed by the
           # runner-unique label so two endpoints never contend for one row.
+          # `role` decides what the probe is entitled to demand: a builder
+          # compiles, a control endpoint publishes and operates. This list must
+          # stay identical to the table in docs/reference/CI_RUNNERS.md —
+          # de-registered hardware here queues a row nothing can claim.
           fleet=$(jq -cn '[
-            {label:"livingroom-pc",      runner_os:"Linux",  runner_arch:"X64",   runner_label:"cc-linux-livingroom"},
-            {label:"hunter-workstation", runner_os:"Linux",  runner_arch:"X64",   runner_label:"cc-linux-hunter"},
-            {label:"cloudcastle-server", runner_os:"Linux",  runner_arch:"X64",   runner_label:"cc-prod-control"},
-            {label:"ryzen-7900x3d",      runner_os:"Windows",runner_arch:"X64",   runner_label:"cc-win-ryzen"},
-            {label:"dell-optiplex-7040", runner_os:"Windows",runner_arch:"X64",   runner_label:"cc-win-dell"},
-            {label:"imac-intel",         runner_os:"macOS",  runner_arch:"X64",   runner_label:"cc-mac-intel"},
-            {label:"macbook-air-m2",     runner_os:"macOS",  runner_arch:"ARM64", runner_label:"cc-mac-arm"}
+            {label:"livingroom-pc",      runner_os:"Linux",  runner_arch:"X64",   runner_label:"cc-linux-livingroom", role:"builder"},
+            {label:"hunter-workstation", runner_os:"Linux",  runner_arch:"X64",   runner_label:"cc-linux-hunter",     role:"builder"},
+            {label:"cloudcastle-server", runner_os:"Linux",  runner_arch:"X64",   runner_label:"cc-prod-control",     role:"control"},
+            {label:"ryzen-7900x3d",      runner_os:"Windows",runner_arch:"X64",   runner_label:"cc-win-ryzen",        role:"builder"},
+            {label:"imac-intel",         runner_os:"macOS",  runner_arch:"X64",   runner_label:"cc-mac-intel",        role:"builder"},
+            {label:"macbook-air-m2",     runner_os:"macOS",  runner_arch:"ARM64", runner_label:"cc-mac-arm",          role:"builder"}
           ]')
 
           schedule_everything() {
@@ -104,7 +307,7 @@ jobs:
           {
             echo '### Fleet inventory'
             echo
-            printf '%s' "$scheduled" | jq -r '.[] | "- \(.label) (`\(.runner_label)`): **online, scheduled**"'
+            printf '%s' "$scheduled" | jq -r '.[] | "- \(.label) (`\(.runner_label)`, \(.role)): **online, scheduled**"'
             if [ -n "$offline" ]; then
               printf '%s\n' "$offline" | while read -r name; do
                 [ -n "$name" ] || continue
@@ -125,14 +328,19 @@ jobs:
 
   probe:
     name: ${{ matrix.label }} (${{ matrix.runner_label }})
-    needs: runner-inventory
+    # `provision` is skipped on the cron and only covers three of the six
+    # endpoints, so this waits for it when it ran and ignores it when it did
+    # not. The inventory, by contrast, is a hard prerequisite: without a matrix
+    # there is nothing to probe.
+    needs: [runner-inventory, provision]
+    if: always() && needs.runner-inventory.result == 'success'
     # Literal self-hosted and cloudcastle-ci: the computed elements only choose
     # which endpoint inside the free fleet claims the row, never whether the row
     # lands on metered GitHub-hosted capacity.
     runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
     timeout-minutes: 15
     strategy:
-      # One dead endpoint must not cancel the probe of the other six — that
+      # One dead endpoint must not cancel the probe of the other five — that
       # would hide exactly the failure this workflow exists to surface.
       fail-fast: false
       matrix: ${{ fromJSON(needs.runner-inventory.outputs.matrix) }}
@@ -140,28 +348,24 @@ jobs:
       - name: Probe identity, disk, and toolchain (POSIX)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          ROLE: ${{ matrix.role }}
         run: |
           set -euo pipefail
 
-          echo "runner=${RUNNER_NAME:-unknown} host=$(hostname -s) user=$(id -un)"
+          echo "runner=${RUNNER_NAME:-unknown} host=$(hostname -s) user=$(id -un) role=${ROLE}"
           test "$RUNNER_OS" = "${{ matrix.runner_os }}"
           test "$RUNNER_ARCH" = "${{ matrix.runner_arch }}"
           uname -a
           echo "workspace=${GITHUB_WORKSPACE:-unset} temp=${RUNNER_TEMP:-unset}"
           df -h "${RUNNER_TEMP:-/tmp}" "$HOME"
 
-          # Free space is the failure nobody predicts: a builder with 2 GB left
-          # fails a link step with an error that names the linker.
           avail_kb="$(df -Pk "$HOME" | awk 'NR==2 {print $4}')"
-          if [ "${avail_kb}" -lt 20971520 ]; then
-            echo "::error::${RUNNER_NAME:-unknown} has $((avail_kb / 1048576)) GiB free on \$HOME; native builds need at least 20 GiB"
-            exit 1
-          fi
-
-          # Tools the build gates take for granted. Reported individually so the
-          # summary names what to reinstall.
           missing=()
-          for tool in git python3 cmake ninja ctest; do
+
+          # Every endpoint, whatever its role: without these it cannot check out
+          # a repository or run a policy script.
+          for tool in git python3; do
             if command -v "${tool}" >/dev/null 2>&1; then
               printf '  %-8s %s\n' "${tool}" "$(command -v "${tool}")"
             else
@@ -169,8 +373,43 @@ jobs:
             fi
           done
 
-          python3 --version || true
-          cmake --version | head -n 1 || true
+          if [ "${ROLE}" = "builder" ]; then
+            # Free space is the failure nobody predicts: a builder with 2 GB
+            # left fails a link step with an error that names the linker. A
+            # control endpoint stores nothing and is not held to this.
+            if [ "${avail_kb}" -lt 20971520 ]; then
+              echo "::error::${RUNNER_NAME:-unknown} has $((avail_kb / 1048576)) GiB free on \$HOME; native builds need at least 20 GiB"
+              exit 1
+            fi
+
+            for tool in cmake ninja ctest; do
+              if command -v "${tool}" >/dev/null 2>&1; then
+                printf '  %-8s %s\n' "${tool}" "$(command -v "${tool}")"
+              else
+                missing+=("${tool}")
+              fi
+            done
+            command -v cmake >/dev/null 2>&1 && cmake --version | head -n 1
+
+            # fast-gate imports the real MCP tool catalog, which pulls in the
+            # pinned NumPy and SciPy, and both require Python >= 3.11. macOS
+            # ships 3.9.6, so `python3 exists` is not the question.
+            gate_python=''
+            for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+              command -v "${candidate}" >/dev/null 2>&1 || continue
+              if "${candidate}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+                gate_python="$(command -v "${candidate}")"
+                break
+              fi
+            done
+            if [ -n "${gate_python}" ]; then
+              echo "  gate-py  ${gate_python} ($("${gate_python}" --version 2>&1))"
+            else
+              missing+=("python>=3.11 (macOS: brew install python@3.13)")
+            fi
+          else
+            echo "  role=control — compiler, cmake, ninja and the 20 GiB build headroom are deliberately not required here"
+          fi
 
           if [ "$RUNNER_OS" = "macOS" ]; then
             # Command Line Tools only on both Macs — no full Xcode, so nothing
@@ -199,17 +438,17 @@ jobs:
           {
             echo '### ${{ matrix.label }}'
             echo
-            echo "- host: \`$(hostname -s)\`, $(uname -s) $(uname -m)"
+            echo "- host: \`$(hostname -s)\`, $(uname -s) $(uname -m), role \`${ROLE}\`"
             echo "- free on \$HOME: $((avail_kb / 1048576)) GiB"
             if [ "${#missing[@]}" -ne 0 ]; then
               echo "- **missing: ${missing[*]}**"
             else
-              echo '- toolchain: complete'
+              echo '- toolchain: complete for its role'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "${#missing[@]}" -ne 0 ]; then
-            echo "::error::${RUNNER_NAME:-unknown} is missing: ${missing[*]}"
+            echo "::error::${RUNNER_NAME:-unknown} (${ROLE}) is missing: ${missing[*]}"
             exit 1
           fi
 
@@ -217,51 +456,83 @@ jobs:
         if: runner.os == 'Windows'
         # Windows PowerShell 5.1 — these hosts have no pwsh.
         shell: powershell
+        env:
+          ROLE: ${{ matrix.role }}
         run: |
           $ErrorActionPreference = 'Continue'
-          Write-Host "runner=$env:RUNNER_NAME host=$env:COMPUTERNAME user=$env:USERNAME"
+          Write-Host "runner=$env:RUNNER_NAME host=$env:COMPUTERNAME user=$env:USERNAME role=$env:ROLE"
           Write-Host "powershell=$($PSVersionTable.PSVersion)"
           Write-Host (Get-CimInstance Win32_OperatingSystem).Caption
+
+          # The runner service account cannot edit the machine PATH and cannot
+          # restart itself to pick a new one up, so the provisioning job
+          # installs into this runner-local directory and every Windows job
+          # puts it on PATH itself. See docs/reference/CI_RUNNERS.md.
+          $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
+          foreach ($dir in @((Join-Path $tools 'bin'), (Join-Path $tools 'python'), (Join-Path $tools 'python\Scripts'))) {
+            if (Test-Path $dir) {
+              $env:PATH = "$dir;$env:PATH"
+              $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              Write-Host "  path+    $dir"
+            }
+          }
 
           $drive = Get-PSDrive -Name ($env:USERPROFILE.Substring(0,1))
           $freeGiB = [math]::Round($drive.Free / 1GB, 1)
           Write-Host "free-on-$($drive.Name)=$freeGiB GiB"
 
           $missing = @()
-          foreach ($tool in @('git', 'cmake', 'ninja', 'ctest')) {
+          $required = if ($env:ROLE -eq 'builder') { @('git', 'cmake', 'ninja', 'ctest') } else { @('git') }
+          foreach ($tool in $required) {
             $found = Get-Command $tool -ErrorAction SilentlyContinue
             if ($found) { Write-Host ("  {0,-8} {1}" -f $tool, $found.Source) } else { $missing += $tool }
           }
-          if (-not (Get-Command python3 -ErrorAction SilentlyContinue) -and
-              -not (Get-Command python -ErrorAction SilentlyContinue)) {
-            $missing += 'python'
-          }
 
-          # native-build enters the MSVC dev shell through vswhere; if that is
-          # gone, the Windows build leg fails with a missing-compiler error that
-          # names cl.exe rather than the machine.
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          if (Test-Path $vswhere) {
-            $vsPath = & $vswhere -latest -products * `
-              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-              -property installationPath
-            if ($vsPath) { Write-Host "visual-studio=$vsPath" } else { $missing += 'msvc-x64-toolset' }
+          # Python >= 3.11: fast-gate's audits import the pinned NumPy and
+          # SciPy, neither of which exists for anything older.
+          $gatePython = ''
+          foreach ($candidate in @('python3', 'python')) {
+            $found = Get-Command $candidate -ErrorAction SilentlyContinue
+            if (-not $found) { continue }
+            & $found.Source -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'
+            if ($LASTEXITCODE -eq 0) { $gatePython = $found.Source; break }
+          }
+          if ($gatePython) {
+            $gatePythonVersion = (& $gatePython --version 2>&1) -join ' '
+            Write-Host "  gate-py  $gatePython ($gatePythonVersion)"
           } else {
-            $missing += 'vswhere'
+            $missing += 'python>=3.11 (run this workflow with workflow_dispatch to provision it)'
           }
 
-          if ($freeGiB -lt 20) { $missing += "disk-space (only $freeGiB GiB free)" }
+          if ($env:ROLE -eq 'builder') {
+            # native-build enters the MSVC dev shell through vswhere; if that is
+            # gone, the Windows build leg fails with a missing-compiler error
+            # that names cl.exe rather than the machine.
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+            if (Test-Path $vswhere) {
+              $vsPath = & $vswhere -latest -products * `
+                -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                -property installationPath
+              if ($vsPath) { Write-Host "visual-studio=$vsPath" } else { $missing += 'msvc-x64-toolset' }
+            } else {
+              $missing += 'vswhere'
+            }
 
-          $state = if ($missing.Count -eq 0) { '- toolchain: complete' } else { "- **missing: $($missing -join ', ')**" }
+            if ($freeGiB -lt 20) { $missing += "disk-space (only $freeGiB GiB free)" }
+          } else {
+            Write-Host '  role=control -- MSVC, cmake, ninja and the 20 GiB build headroom are deliberately not required here'
+          }
+
+          $state = if ($missing.Count -eq 0) { '- toolchain: complete for its role' } else { "- **missing: $($missing -join ', ')**" }
           @(
             '### ${{ matrix.label }}'
             ''
-            "- host: ``$env:COMPUTERNAME``, Windows $env:RUNNER_ARCH"
+            "- host: ``$env:COMPUTERNAME``, Windows $env:RUNNER_ARCH, role ``$env:ROLE``"
             "- free on $($drive.Name): $freeGiB GiB"
             $state
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
           if ($missing.Count -ne 0) {
-            Write-Host "::error::$env:RUNNER_NAME is missing: $($missing -join ', ')"
+            Write-Host "::error::$env:RUNNER_NAME ($env:ROLE) is missing: $($missing -join ', ')"
             exit 1
           }

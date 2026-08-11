@@ -1,29 +1,20 @@
-"""Tests for installer/setup_file_assoc.py (task 05 — file associations).
+"""Tests for services/installer/setup_file_assoc.py (task 05 — file associations).
 
 House style: a plain main()-runner (no pytest dependency), runnable on any platform with stdlib
 only. The Windows registry PLAN and the Linux .desktop/MIME content are pure functions, so they are
 checked everywhere; the Linux register/unregister side-effects are exercised against a TEMP
 XDG_DATA_HOME so the run never touches the real MIME database.
 
-    python installer/test_file_assoc.py
+    python -m services.installer.test_file_assoc
 """
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
 from pathlib import Path
 
-# T-V3 fix: .resolve() first so this lands on repo root regardless of whether the file was
-# reached via the installer/ symlink or its real services/installer/ path — the old
-# dirname(dirname(...)) on the unresolved path landed on services/ when pytest collects the
-# real path, which makes services/mcp/ resolve as a top-level `mcp` package, shadowing the
-# real installed SDK.
-_REPO_ROOT = str(Path(__file__).resolve().parents[2])
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
-from installer import setup_file_assoc as fa  # noqa: E402
+from services.installer import setup_file_assoc as fa  # noqa: E402
 
 _fail = 0
 

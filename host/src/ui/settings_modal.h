@@ -1,6 +1,8 @@
 // Chudware Settings modal (Appearance / General / AI / Providers) and the About modal.
 // AI absorbs Prompts, Benchmarks, Tools, Roles, and the retired Experimental tab.
 #pragma once
+#include <string>
+
 
 struct AppState;
 
@@ -21,6 +23,23 @@ namespace ui {
 // when state.showAbout is set). `busy` whether a job is running (disables worker-dependent
 // actions like "Load built-in prompt").
 void drawSettingsModal(AppState& state, bool busy);
+
+// Shared external-browser OAuth seam used by Settings -> Providers and first-run onboarding.
+// `beginExternalProviderSignIn` starts the OMP AuthStorage flow; `pollExternalProviderSignIn`
+// advances it and returns the provider's real progress/error. No embedded webview is involved.
+struct ExternalProviderSignInStatus {
+    bool active = false;
+    bool connected = false;
+    bool browserOpened = false;
+    std::string provider;
+    std::string status;
+    std::string progress;
+    std::string instructions;
+    std::string url;
+    std::string error;
+};
+void beginExternalProviderSignIn(AppState& state, const std::string& provider);
+ExternalProviderSignInStatus pollExternalProviderSignIn(AppState& state);
 
 // Settings -> AI -> Harness "Session knobs": the full run-behavior grid (plan/subagent/
 // advisor preferences, role adoption, proactive advisor/company/vision/offline/thoughts/

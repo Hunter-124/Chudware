@@ -6,7 +6,7 @@
     "hallucination_count": 1,
     "live_core": {
       "available": true,
-      "note": "mcp_server.core_bridge importable"
+      "note": "services.mcp.core_bridge importable"
     },
     "per_structure": {
       "bracket": {

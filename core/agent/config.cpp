@@ -1,4 +1,4 @@
-// core/agent/config.cpp — see config.h. Mirrors agent/config.py resolution.
+// core/agent/config.cpp — see config.h. Mirrors services/agent/config.py resolution.
 #include "agent/config.h"
 
 #include <algorithm>
@@ -102,7 +102,7 @@ std::vector<std::string> all_subscription_access_tokens(const json& cfg, const c
 }
 }  // namespace
 
-// load_config — mirror agent/config.py load_config(): read paths_config()
+// load_config — mirror services/agent/config.py load_config(): read paths_config()
 // (%APPDATA%/Chudware/config.json) and parse it. Returns {} on a missing file or any
 // parse error (matching the Python try/except that swallows failures).
 json load_config() {

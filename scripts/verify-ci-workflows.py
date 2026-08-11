@@ -37,6 +37,7 @@ Rules enforced over the policy scope:
   dedicated-runner-misuse   a non-publish/control job targets infrastructure
   unsafe-generic-linux-routing a Linux job can land on the production host
   billable-artifact-retention an upload has no short ``retention-days``
+  powershell-non-ascii      a PowerShell step body carries a non-ASCII byte
   missing-jobs              the document declares no jobs
   missing-job-timeout       a job has no usable ``timeout-minutes:``
   banned-permission         ``permissions.administration`` anywhere
@@ -143,6 +144,18 @@ HOSTED_LABEL_MARKERS = ("-latest", "-largerunner")
 # money; one day is the CloudCastle-proven outage fallback.
 UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact"
 MAX_ARTIFACT_RETENTION_DAYS = 7
+
+# The runner writes a step's script to disk as UTF-8 with no BOM. Windows
+# PowerShell 5.1 -- the only PowerShell on the Chudware Windows endpoints --
+# decodes a BOM-less file as the ANSI code page instead, so a UTF-8 em dash
+# (E2 80 94) arrives as three CP1252 characters ending in U+201D, a curly
+# closing quote. PowerShell accepts curly quotes as string delimiters, so one
+# em dash in a comment terminates a string several lines earlier and the whole
+# step dies at parse time with "missing closing '}'" -- before a single line
+# of it runs, and with an error that points at the wrong line. Observed twice
+# on ryzen-7900x3d while provisioning it. PowerShell step bodies are therefore
+# ASCII-only, and that is a property of the text, so it is checked here.
+POWERSHELL_SHELLS = frozenset({"powershell", "pwsh"})
 
 # Infrastructure labels are not spare build capacity. Exceptions are exact
 # workflow/job pairs whose observable contract requires execution on the
@@ -922,6 +935,30 @@ def check_document(
                     "$GITHUB_STEP_SUMMARY are not metered -- put diagnostics there instead "
                     "of uploading them.".format(MAX_ARTIFACT_RETENTION_DAYS, retention),
                 )
+
+    # -- ASCII-only PowerShell ----------------------------------------------
+    for mapping in _walk_mappings(document):
+        shell = mapping.get("shell")
+        body = mapping.get("run")
+        if not isinstance(shell, str) or not isinstance(body, str):
+            continue
+        words = shell.strip().split()
+        if not words or words[0].lower() not in POWERSHELL_SHELLS:
+            continue
+        offenders = sorted({character for character in body if ord(character) > 127})
+        if offenders:
+            rendered = ", ".join(
+                "{0!r} (U+{1:04X})".format(character, ord(character)) for character in offenders
+            )
+            add(
+                "powershell-non-ascii",
+                mapping.line_of("run"),
+                "a '{0}' step body must be pure ASCII; it contains {1}. Windows PowerShell 5.1 "
+                "decodes the BOM-less UTF-8 script the runner writes as the ANSI code page, "
+                "which turns a UTF-8 em dash into a curly quote that silently terminates a "
+                "string -- the step then fails at parse time, several lines away from the "
+                "character, before any of it runs.".format(words[0], rendered),
+            )
 
     # -- permissions --------------------------------------------------------
     for mapping in _walk_mappings(document):

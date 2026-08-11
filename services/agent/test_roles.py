@@ -42,7 +42,7 @@ _TMP_CACHE = tempfile.mkdtemp(prefix="test_roles_cache_")
 
 from services.agent import roles  # noqa: E402
 from services.agent.ledger import Ledger  # noqa: E402
-from mcp_server import tool_registry as reg  # noqa: E402
+from services.mcp import tool_registry as reg  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -80,11 +80,11 @@ def _build_catalog() -> set[str]:
         mod = os.path.basename(path)[:-3]
         if mod.startswith("test_"):
             continue
-        _regmod(f"mcp_server.{mod}", mod.replace("_tools", ""))
+        _regmod(f"services.mcp.{mod}", mod.replace("_tools", ""))
     _regmod("services.dag.mcp_tools", "dag")
     _regmod("services.agent.buildgraph.mcp_tools", "buildgraph")
     # cam_audit.py is not named *_tools.py (Wave 2); register it under family cam.
-    _regmod("mcp_server.cam_audit", "cam")
+    _regmod("services.mcp.cam_audit", "cam")
     return set(reg.catalog().keys())
 
 

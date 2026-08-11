@@ -361,7 +361,7 @@ class TestRevengResearchSourceTool:
 # Both smokes force a FRESH import to prove the module still loads standalone. Re-importing
 # leaves a SECOND module object in sys.modules, and the original is what every already-imported
 # test module still holds a reference to — services/mcp/__init__.py deliberately unifies
-# `mcp_server.*` and `services.mcp.*` onto ONE object, so replacing it silently splits that
+# `services.mcp.*` and `services.mcp.*` onto ONE object, so replacing it silently splits that
 # identity for the rest of the process. That is why a later suite could see a reveng/cad module
 # that was not the one it had bound to. Restore the original object once the check is done.
 def _fresh_import_restoring(name: str):

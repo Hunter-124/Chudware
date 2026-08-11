@@ -35,7 +35,7 @@ Day 1 for the DAG orchestrator covers two separable deliverables: (AM) freezing 
 ## Definition of done
 
 - [x] `contracts/dag_schema.md` exists, all required fields documented, workstream leads have confirmed no blockers
-- [x] `services/dag/` package importable with `from dag import executor` (services/ on sys.path via conftest, matching agent convention)
+- [x] `services/dag/` package importable with `from services.dag import executor`
 - [x] `executor.run()` can execute a two-node test graph and write a checkpoint SQLite file
 - [x] Smoke-test passes: `python -m pytest services/dag/test_executor.py -q`
 
@@ -48,10 +48,9 @@ Day 1 for the DAG orchestrator covers two separable deliverables: (AM) freezing 
 
 ## Completion notes (sonnet-ash, 2026-07-02)
 
-**Recovery:** sonnet-dane died pre-first-commit; all salvaged work was reviewed and kept
-as-is (quality was sound) with one fix: import paths changed from `from services.dag`
-to `from dag` to match the repo convention (services/agent uses `from agent import ...`).
-Added `services/dag/conftest.py` to add `services/` to sys.path for pytest.
+**Recovery:** sonnet-dane died pre-first-commit; all salvaged work was reviewed and
+kept. Package imports were later standardized on canonical `services.*` names, and
+the temporary `services/` path injection was removed.
 
 **What landed:**
 - `contracts/dag_schema.md` — 13-section frozen contract `aicad.dag/1`; all required

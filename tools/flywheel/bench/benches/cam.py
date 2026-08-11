@@ -24,11 +24,11 @@ Two evaluation paths:
     an HONESTY TRADE-OFF worth stating plainly: offline numbers are RECORDED, not
     recomputed -- they do not verify today's `cam_simulate` still produces them.
   * live mode (core present): the same job (stock/tools/setup/op_plan) is built through
-    `mcp_server.cam_tools` (the same tool surface the MCP server exposes) and RECOMPUTED
+    `services.mcp.cam_tools` (the same tool surface the MCP server exposes) and RECOMPUTED
     by calling `cam_simulate` for real, so the live path is a genuine, non-recorded check.
     Guarded skip-if-no-core, mirroring `regen_fix`'s live path and gate.sh's OCCT-absent
     skip. Never hardcodes a sibling worktree's `.so` path -- resolution is entirely
-    `mcp_server.core_bridge`'s own `$CHUDWARE_LIBCHUDWARE` / `$CHUDWARE_DIST` / platform search.
+    `services.mcp.core_bridge`'s own `$CHUDWARE_LIBCHUDWARE` / `$CHUDWARE_DIST` / platform search.
 
 The deterministic baseline is not a separately-run competing strategy here: the fixtures
 ARE the deterministic candidate's own recorded results (a fixed roughing+finishing op-plan
@@ -137,7 +137,7 @@ def score_example(fixture: dict, *, live_sim: Optional[LiveSim] = None,
     """Score one CAM job fixture.
 
     `live_sim`, when provided (live mode), is a callable(fixture) -> (raw_sim_result,
-    battery_cam_simulate_score) that builds the job through `mcp_server.cam_tools` and
+    battery_cam_simulate_score) that builds the job through `services.mcp.cam_tools` and
     runs the real `cam_simulate`. When None (offline / no core), the fixture's recorded
     `expected_sim` is used directly.
     """
@@ -244,10 +244,10 @@ def make_live_sim() -> Optional[LiveSim]:
     """Build a `live_sim` callable if the C++ core is available; else None (skip).
 
     Never hardcodes a sibling worktree's `.so` path -- resolution goes entirely through
-    `mcp_server.core_bridge`'s own `$CHUDWARE_LIBCHUDWARE` / `$CHUDWARE_DIST` / platform search.
+    `services.mcp.core_bridge`'s own `$CHUDWARE_LIBCHUDWARE` / `$CHUDWARE_DIST` / platform search.
     """
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
     except Exception:
         return None
     if not cb.available():
@@ -255,7 +255,7 @@ def make_live_sim() -> Optional[LiveSim]:
 
     def _live_sim(fixture: dict) -> "tuple[dict, Optional[float]]":
         from mcp.server.fastmcp import FastMCP
-        from mcp_server.cam_tools import register_cam_tools
+        from services.mcp.cam_tools import register_cam_tools
 
         mcp = FastMCP("bench-cam")
         register_cam_tools(mcp)

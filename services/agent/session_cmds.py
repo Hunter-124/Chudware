@@ -198,7 +198,7 @@ def _resolve_provider(provider: Any = None, model: str | None = None):
     if model:
         cfg["model"] = model
     try:
-        from agent import config as agent_config  # type: ignore
+        from services.agent import config as agent_config  # type: ignore
     except Exception:  # noqa: BLE001
         from services.agent import config as agent_config  # type: ignore
     return agent_config.get_provider(name=name, cfg=cfg or None)
@@ -291,14 +291,7 @@ def compact_session(
             "short_summary": "",
         }
 
-    # importlib.import_module (not `from agent import compaction`): the
-    # from-form short-circuits on the package attribute once the real module
-    # was imported anywhere in the process, ignoring sys.modules patches in
-    # tests. import_module consults sys.modules first.
-    try:
-        comp = importlib.import_module("agent.compaction")
-    except Exception:  # noqa: BLE001
-        comp = importlib.import_module("services.agent.compaction")
+    comp = importlib.import_module("services.agent.compaction")
 
     if strat == "shake":
         result = comp.shake_messages(
@@ -361,14 +354,7 @@ def shake_session(
     Returns ``{messages, saved_tokens, notice}`` for the RPC layer.
     """
     msgs = _snapshot_messages(messages)
-    # importlib.import_module (not `from agent import compaction`): the
-    # from-form short-circuits on the package attribute once the real module
-    # was imported anywhere in the process, ignoring sys.modules patches in
-    # tests. import_module consults sys.modules first.
-    try:
-        comp = importlib.import_module("agent.compaction")
-    except Exception:  # noqa: BLE001
-        comp = importlib.import_module("services.agent.compaction")
+    comp = importlib.import_module("services.agent.compaction")
 
     result = comp.shake_messages(
         msgs,

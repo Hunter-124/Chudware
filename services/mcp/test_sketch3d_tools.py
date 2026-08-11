@@ -51,8 +51,8 @@ _unshadow_mcp_sdk()
 
 import pytest  # noqa: E402
 
-from mcp_server import core_bridge as cb  # noqa: E402
-from mcp_server.sketch3d_tools import (  # noqa: E402
+from services.mcp import core_bridge as cb  # noqa: E402
+from services.mcp.sketch3d_tools import (  # noqa: E402
     _arc_polyline,
     _curves_to_entities,
     _free_narration,
@@ -68,7 +68,7 @@ _engine_available = cb.available()
 
 def _call(name: str, args: dict):
     """Invoke a registered MCP tool; return (parsed_json_or_None, raw_content)."""
-    from mcp_server import server
+    from services.mcp import server
     result = asyncio.run(server.mcp.call_tool(name, args))
     if isinstance(result, tuple) and len(result) == 2:
         content, structured = result
@@ -251,7 +251,7 @@ class TestResolvePipeMode:
     def test_alias_table_agrees_with_the_primitive_boolean_table(self):
         """cad_doc_tools maps the same words for primitives. Two tables that disagree on
         what "remove" means is the drift this asserts against."""
-        from mcp_server.cad_doc_tools import _BOOLEAN_MODES, _BOOLEAN_NEW_BODY
+        from services.mcp.cad_doc_tools import _BOOLEAN_MODES, _BOOLEAN_NEW_BODY
         for word, want in _BOOLEAN_MODES.items():
             assert _resolve_pipe_mode(word, True) in (want, "add"), (word, want)
         for word in _BOOLEAN_NEW_BODY:

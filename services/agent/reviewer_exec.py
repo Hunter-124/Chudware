@@ -98,7 +98,7 @@ def _resolve_fn(tool: str) -> Callable[..., Any] | None:
     except Exception:  # noqa: BLE001
         pass
     # 4) research/engineering-calc tools (fit_calc, tap_drill, research_*…) — the
-    # spec_writer role's main toolset; registered in mcp_server.research_tools.
+    # spec_writer role's main toolset; registered in services.mcp.research_tools.
     fn = _resolve_extra("research", tool)
     if fn is not None:
         return fn
@@ -130,44 +130,44 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
             from mcp.server.fastmcp import FastMCP
             mcp = FastMCP(f"reviewer-{module_key}")
             if module_key == "verify":
-                from mcp_server.verify_tools import register_verify_tools
+                from services.mcp.verify_tools import register_verify_tools
                 register_verify_tools(mcp)
             elif module_key == "intake":
-                from mcp_server.intake_tools import register_intake_tools
+                from services.mcp.intake_tools import register_intake_tools
                 register_intake_tools(mcp)
             elif module_key == "cad":
-                from mcp_server.cad_tools import register_cad_tools
+                from services.mcp.cad_tools import register_cad_tools
                 register_cad_tools(mcp)
             elif module_key == "research":
                 # T-W30: the spec_writer/reviewer role cards allow research_* +
                 # fit_calc/recommend_fit — these live in research_tools, not the
                 # battery modules, so agent turns need this branch to dispatch them.
-                from mcp_server.research_tools import register_research_tools
+                from services.mcp.research_tools import register_research_tools
                 register_research_tools(mcp)
             elif module_key == "gsl":
                 # T-W32: describe_part/describe_project/describe_scene… — the GSL
                 # describers every worker card allows; live in gsl_tools.
-                from mcp_server.gsl_tools import register_gsl_tools
+                from services.mcp.gsl_tools import register_gsl_tools
                 register_gsl_tools(mcp)
             elif module_key == "parts":
                 # T-W32: part_get/part_place (part_search also has a mission-scoped
                 # handler) — the standard-parts library surface.
-                from mcp_server.parts_tools import register_parts_tools
+                from services.mcp.parts_tools import register_parts_tools
                 register_parts_tools(mcp)
             elif module_key == "ledger":
                 # T-W32: ledger_get/ledger_note resolve globally with an explicit
                 # run_id; inside a mission the run-scoped dispatcher binds it.
-                from mcp_server.ledger_tools import register_ledger_tools
+                from services.mcp.ledger_tools import register_ledger_tools
                 register_ledger_tools(mcp)
             elif module_key == "preflight":
                 # T-W32: preflight_ops — the feature_modeler card's mandated
                 # pre-mutation check.
-                from mcp_server.preflight_tools import register_preflight_tools
+                from services.mcp.preflight_tools import register_preflight_tools
                 register_preflight_tools(mcp)
             elif module_key == "regen":
                 # T-W32: regen_diagnose/regen_resolve — the fixer/feature_modeler
                 # rebuild-failure toolset.
-                from mcp_server.regen_tools import register_regen_tools
+                from services.mcp.regen_tools import register_regen_tools
                 register_regen_tools(mcp)
             elif module_key == "buildgraph":
                 # T-W32: buildgraph_plan/buildgraph_status — the orchestrator /
@@ -176,54 +176,54 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
                 register_buildgraph_tools(mcp)
             elif module_key == "designreview":
                 # T-W32: design_review — the reviewer card's rubric tool.
-                from mcp_server.design_review_tools import register_design_review_tools
+                from services.mcp.design_review_tools import register_design_review_tools
                 register_design_review_tools(mcp)
             elif module_key == "req":
                 # T-W32: req_create/req_update/req_status — intake_analyst/clarifier.
-                from mcp_server.req_tools import register_req_tools
+                from services.mcp.req_tools import register_req_tools
                 register_req_tools(mcp)
             elif module_key == "cost":
                 # T-W32: cam_cost_estimate — cam_programmer.
-                from mcp_server.cost_tools import register_cost_tools
+                from services.mcp.cost_tools import register_cost_tools
                 register_cost_tools(mcp)
             elif module_key == "structural":
                 # T-W32: struct_analyze — sim_engineer.
-                from mcp_server.structural_tools import register_structural_tools
+                from services.mcp.structural_tools import register_structural_tools
                 register_structural_tools(mcp)
             elif module_key == "dimscheme":
                 # T-W32: suggest_dimension_scheme — sketcher.
-                from mcp_server.dimension_scheme_tools import register_dimension_scheme_tools
+                from services.mcp.dimension_scheme_tools import register_dimension_scheme_tools
                 register_dimension_scheme_tools(mcp)
             elif module_key == "workspace":
                 # T-W32: workspace_status/workspace_doc_events — orchestrator/overseer.
-                from mcp_server.workspace_tools import register_workspace_tools
+                from services.mcp.workspace_tools import register_workspace_tools
                 register_workspace_tools(mcp)
             elif module_key == "firmware":
                 # mega-2: fw_* tools offered on SPECIFY tools_slot (family:fw seed)
                 # must resolve at dispatch — not only appear as unresolved labels.
-                from mcp_server.firmware_tools import register_firmware_tools
+                from services.mcp.firmware_tools import register_firmware_tools
                 register_firmware_tools(mcp)
             elif module_key == "em":
                 # mega-2: em_status / em_eigenmode / em_driven / em_timedomain.
-                from mcp_server.em_tools import register_em_tools
+                from services.mcp.em_tools import register_em_tools
                 register_em_tools(mcp)
             elif module_key == "antenna":
                 # mega-2: ecad_antenna_design / ecad_antenna_analyze (family:em/ecad).
-                from mcp_server.antenna_tools import register_antenna_tools
+                from services.mcp.antenna_tools import register_antenna_tools
                 register_antenna_tools(mcp)
             elif module_key == "files":
                 # Harness overhaul 2026-07-23: fs_read/fs_write/fs_edit/fs_list/
                 # fs_glob/fs_grep — the agent_default/subagent_default floors and
                 # the project_organizer card dispatch through this resolver.
-                from mcp_server.fs_tools import register_fs_tools
+                from services.mcp.fs_tools import register_fs_tools
                 register_fs_tools(mcp)
             elif module_key == "shell":
                 # run_shell — main-agent floor (agent_default_tools).
-                from mcp_server.fs_tools import register_shell_tools
+                from services.mcp.fs_tools import register_shell_tools
                 register_shell_tools(mcp)
             elif module_key == "plm":
                 # plm_* — the project_organizer role card (contract §7 envelope).
-                from mcp_server.plm_tools import register_plm_tools
+                from services.mcp.plm_tools import register_plm_tools
                 register_plm_tools(mcp)
             elif module_key == "mission":
                 # general_agent.yaml advertises mission_start AND its prompt tells
@@ -231,17 +231,17 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
                 # the name resolved nowhere, so the universal entry role's own
                 # escalation path failed 100% of the time with "could not be
                 # resolved" and no rephrasing could recover it.
-                from mcp_server.mission_tools import register_mission_tools
+                from services.mcp.mission_tools import register_mission_tools
                 register_mission_tools(mcp)
             elif module_key == "org":
                 # department_manager.yaml advertises channel_send/request_resolve/
                 # council_convene (aicad.org/1 §18). org_tools implements them but
                 # nothing ever registered the module.
-                from mcp_server.org_tools import register_org_tools
+                from services.mcp.org_tools import register_org_tools
                 register_org_tools(mcp)
             elif module_key == "sourcing":
                 # sourcing_specialist.yaml advertises bom_price/bom_rollup.
-                from mcp_server.sourcing_tools import register_sourcing_tools
+                from services.mcp.sourcing_tools import register_sourcing_tools
                 register_sourcing_tools(mcp)
             elif module_key == "dag":
                 # orchestrator/overseer cards advertise dag_run/dag_status and
@@ -254,26 +254,26 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
                 register_dag_replan_tools(mcp)
             elif module_key == "advisor":
                 # feature_architect advertises advisory_dispute (contract §9.3).
-                from mcp_server.advisor_tools import register_advisor_tools
+                from services.mcp.advisor_tools import register_advisor_tools
                 register_advisor_tools(mcp)
             elif module_key == "camaudit":
                 # cam_programmer's mandated final gate.
-                from mcp_server.cam_audit import register_cam_audit_tools
+                from services.mcp.cam_audit import register_cam_audit_tools
                 register_cam_audit_tools(mcp)
             elif module_key == "spec":
                 # re_datasheet_reader: match_part_number / spec_sheet_match.
-                from mcp_server.spec_tools import register_spec_tools
+                from services.mcp.spec_tools import register_spec_tools
                 register_spec_tools(mcp)
             elif module_key == "sketch3d":
                 # sketch2d advertises render_sketch (its own preview tool).
-                from mcp_server.sketch3d_tools import register_sketch3d_tools
+                from services.mcp.sketch3d_tools import register_sketch3d_tools
                 register_sketch3d_tools(mcp)
             elif module_key == "tasklist":
                 # general_agent.yaml advertises task_list — the ONLY plan_state
                 # producer reachable from the general lane. Unresolved here it
                 # would render as "schema unavailable" and fail at dispatch, so
                 # the copilot Task-list panel would stay empty on every run.
-                from mcp_server.task_list_tools import register_task_list_tools
+                from services.mcp.task_list_tools import register_task_list_tools
                 register_task_list_tools(mcp)
             else:
                 return None

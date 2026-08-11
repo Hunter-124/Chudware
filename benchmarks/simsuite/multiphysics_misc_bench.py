@@ -159,7 +159,7 @@ def _bench_internal_volume() -> dict:
 def _bench_struct() -> dict:
     if not _engine_ok():
         return _skip("struct_cantilever_udl", "libchudware not staged (engine unavailable)")
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
     L, w = 2000.0, 10.0
     doc = {
         "schema": "aicad.structure/1",
@@ -191,7 +191,7 @@ def _bench_struct() -> dict:
 
 def _engine_ok() -> bool:
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
         return cb.available()
     except Exception:  # noqa: BLE001
         return False
@@ -199,14 +199,14 @@ def _engine_ok() -> bool:
 
 def _mcp_call(name: str, args: dict):
     import asyncio
-    from mcp_server import server
+    from services.mcp import server
     content, structured = asyncio.run(server.mcp.call_tool(name, args))
     text = structured.get("result") if isinstance(structured, dict) else None
     return json.loads(text) if isinstance(text, str) else None
 
 
 def _swing_arm(tmp_dir: str):
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
     r = _mcp_call("new_part", {"name": "MPBenchBar"})
     doc = r["doc_id"]
     _mcp_call("add_features", {"doc_id": doc, "ops": [

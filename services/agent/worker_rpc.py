@@ -4,7 +4,7 @@ Single registration point for the worker-RPC tables that were squatting in
 ``engine_oracle/parts_hub/`` although every one is a thin wrapper over
 :mod:`services.agent` modules:
 
-- ``subscription_*`` (§4.4/§4.5 auth, Settings Accounts) — over agent.providers
+- ``subscription_*`` (§4.4/§4.5 auth, Settings Accounts) — over services.agent.providers
 - ``session_compact/shake/handoff/btw`` — over :mod:`services.agent.session_cmds`
 - ``skills_*`` — over :mod:`services.agent.skills`
 - ``triggers_*`` / ``packs_*`` — over :mod:`services.agent.advisor.triggers`
@@ -40,7 +40,7 @@ _login_lock = threading.Lock()
 
 
 def _sl():
-    from agent.providers import subscription_login as sl
+    from services.agent.providers import subscription_login as sl
     return sl
 
 
@@ -227,7 +227,7 @@ def _subscription_usage(params: dict, _emit: Callable) -> dict:
     Returns ``{ok, rows:[{provider, account_id, display_name, plan, usage:[...]}]}``.
     """
     try:
-        from agent.providers import usage as usage_mod
+        from services.agent.providers import usage as usage_mod
 
         raw = (params or {}).get("provider")
         provider = str(raw).strip().lower() if raw else None
@@ -287,7 +287,7 @@ def _cmds():
     try:
         from services.agent import session_cmds as sc
     except Exception:  # noqa: BLE001 — agent package alias
-        from agent import session_cmds as sc  # type: ignore
+        from services.agent import session_cmds as sc  # type: ignore
     return sc
 
 

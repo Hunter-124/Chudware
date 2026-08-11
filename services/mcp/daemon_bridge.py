@@ -132,7 +132,7 @@ class _PipeIO:
 
 def _repo_root() -> Path:
     # .../services/mcp/daemon_bridge.py -> repo root (also correct for the
-    # installed mcp_server/ package layout, where core/ sits beside it).
+    # installed services/mcp/ package layout, where core/ sits beside it).
     return Path(__file__).resolve().parent.parent.parent
 
 

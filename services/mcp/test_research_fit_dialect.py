@@ -72,7 +72,7 @@ def test_canonical_call_still_works_through_fastmcp():
     a bare ``**kwargs`` into a REQUIRED field, which fails every call including this one.
     """
     from mcp.server.fastmcp import FastMCP
-    from mcp_server.research_tools import register_research_tools
+    from services.mcp.research_tools import register_research_tools
 
     mcp = FastMCP("dialect-test")
     register_research_tools(mcp)
@@ -292,7 +292,7 @@ def test_material_query_without_a_property_tail_stays_whole():
 def test_selection_style_call_says_it_is_not_a_selector(monkeypatch):
     """`application=`/`environment=` is a material RECOMMENDATION ask. It is served as a
     composed candidate search AND names the tool that actually does selection."""
-    import mcp_server.research_tools as rt
+    import services.mcp.research_tools as rt
 
     seen = {}
 

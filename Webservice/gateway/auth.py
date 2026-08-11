@@ -1,69 +1,65 @@
-"""Authentication middleware: CF Access JWT (prod), oauth2-proxy shared-secret
-(Entra multi-tenant SSO front door), or X-Dev-User (dev)."""
+"""Authentication middleware.
+
+Three ways a request can arrive with a proven identity, tried in this order:
+
+1. ``X-Dev-User`` — local development only (``CHUDWARE_WEB_DEV=1``).
+2. A **``chudware_sid`` session cookie** minted by ``authn.py`` after a password
+   or OAuth sign-in. This is the self-serve path and the one real users take.
+3. A **Cloudflare Access JWT**, verified against the team's JWKS. Access is
+   scoped to ``/admin``; it is the operator's door, not the front door.
+
+The oauth2-proxy / Microsoft Entra shared-secret front door that used to sit
+between 2 and 3 is gone: the gateway authenticates its own users now, and a
+second edge IdP was one more trusted party for no remaining benefit.
+
+Authentication answers *who is this*. Authorization — pending / active / denied
+/ suspended / trial-expired — is ``accounts.py``'s answer, applied by
+``_resolve_user`` regardless of which branch above proved the email.
+"""
 
 from __future__ import annotations
 
-import base64
 import logging
-import secrets
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import jwt
-import yaml
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 try:
-    from . import accounts
+    from . import accounts, authn
     from .config import Settings, settings
-except ImportError:
-    import accounts
-    from config import Settings, settings
+except ImportError:  # uvicorn app:app from the package dir
+    import accounts  # type: ignore
+    import authn  # type: ignore
+    from config import Settings, settings  # type: ignore
 
 log = logging.getLogger("chudware-web.auth")
 
+# Where a stuck user is told to write. Not derived from a request header: these
+# strings end up in pages served to unauthenticated callers.
+SUPPORT_EMAIL = "support@chudware.com"
+
 # /healthz is liveness. /api/billing/webhook is Stripe calling in — it cannot
-# present a Cloudflare Access JWT, so it is authenticated by HMAC signature
-# inside billing.py instead. Nothing else belongs here.
-PUBLIC_PATHS = frozenset({"/healthz", "/api/billing/webhook"})
+# present a session cookie, so it is authenticated by HMAC signature inside
+# billing.py instead. /api/auth is the sign-in surface itself: register, login,
+# verify, reset and the OAuth handshake are by definition reached without a
+# session. Nothing else belongs here.
+PUBLIC_PATHS = frozenset({"/healthz", "/api/billing/webhook", "/api/auth"})
 
 
 def _is_public_path(path: str) -> bool:
     """Exact match, or a '<public>/' subpath — never a shared string prefix.
 
     A bare startswith("/healthz") also passes /healthzFOO, silently skipping
-    auth on any route that happens to share the prefix.
+    auth on any route that happens to share the prefix. That same '/' boundary
+    is what lets the single "/api/auth" entry cover the whole sign-in subtree
+    while leaving a hypothetical "/api/authorizations" protected.
     """
     return path in PUBLIC_PATHS or any(
         path.startswith(p + "/") for p in PUBLIC_PATHS
-    )
-
-# Any email at these domains (or their subdomains) is auto-approved as a STANDARD user
-# (role="user", never admin) without needing an explicit users.yaml entry. University of
-# Alabama: ua.edu, crimson.ua.edu, and any *.ua.edu subdomain.
-AUTO_APPROVE_DOMAINS = ("ua.edu",)
-
-
-def _domain_auto_user(email: str, directory: "UserDirectory") -> "User | None":
-    """Synthesize a standard (non-admin) User for an allowed email domain, else None."""
-    email = email.strip().lower()
-    at = email.rfind("@")
-    if at < 0:
-        return None
-    domain = email[at + 1:]
-    ok = any(domain == d or domain.endswith("." + d) for d in AUTO_APPROVE_DOMAINS)
-    if not ok:
-        return None
-    return User(
-        email=email,
-        display=email[:at],
-        role="user",       # NEVER admin — domain users are standard only
-        heavy=False,
-        project="",         # inherits site-wide default_project
-        doc="",
     )
 
 
@@ -73,118 +69,14 @@ class User:
     display: str
     role: str
     heavy: bool
-    # Default project opened at session start: a PLM project name (/plm/<name>.git)
-    # or an absolute HOST directory path (bind-mounted read-only into the session).
-    project: str = ""
-    doc: str = ""  # optional part file (relative to project) auto-opened at start
-
-
-class UserDirectory:
-    """Load + reload users.yaml; map email → User."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._mtime: float | None = None
-        self._by_email: dict[str, User] = {}
-        self.default_project: str = ""  # site-wide default; users without a project inherit it
-        self.default_doc: str = ""      # site-wide auto-open part (relative to default_project)
-        self.reload(force=True)
-
-    def reload(self, force: bool = False) -> None:
-        try:
-            st = self.path.stat()
-        except FileNotFoundError:
-            if force:
-                self._by_email = {}
-                self._mtime = None
-                log.warning("users file missing: %s", self.path)
-            return
-        if not force and self._mtime is not None and st.st_mtime == self._mtime:
-            return
-        with self.path.open("r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
-        users = data.get("users") or data if isinstance(data, list) else data.get("users") or []
-        if isinstance(data, dict):
-            self.default_project = str(data.get("default_project") or "").strip()
-            self.default_doc = str(data.get("default_doc") or "").strip()
-        by_email: dict[str, User] = {}
-        for row in users:
-            if not isinstance(row, dict):
-                continue
-            email = str(row.get("email", "")).strip().lower()
-            if not email:
-                continue
-            by_email[email] = User(
-                email=email,
-                display=str(row.get("display") or email.split("@")[0]),
-                role=str(row.get("role") or "user"),
-                heavy=bool(row.get("heavy", False)),
-                project=str(row.get("project") or "").strip(),
-                doc=str(row.get("doc") or "").strip(),
-            )
-        self._by_email = by_email
-        self._mtime = st.st_mtime
-        log.info("loaded %d users from %s", len(by_email), self.path)
-
-    def get(self, email: str) -> User | None:
-        self.reload()
-        return self._by_email.get(email.strip().lower())
-
-    def all(self) -> list[User]:
-        self.reload()
-        return list(self._by_email.values())
-
-    def upsert(self, user: User) -> None:
-        """Add or update a user and persist to users.yaml (atomic write)."""
-        self.reload()
-        self._by_email[user.email.strip().lower()] = user
-        self._write()
-
-    def set_default_project(self, project: str, doc: str = "") -> None:
-        """Site-wide default project + auto-open part (inherited by project-less users)."""
-        self.reload()
-        self.default_project = project.strip()
-        self.default_doc = doc.strip()
-        self._write()
-
-    def effective_project(self, user: User) -> str:
-        return user.project or self.default_project
-
-    def remove(self, email: str) -> bool:
-        self.reload()
-        removed = self._by_email.pop(email.strip().lower(), None) is not None
-        if removed:
-            self._write()
-        return removed
-
-    def _write(self) -> None:
-        payload = {
-            "default_project": self.default_project,
-            "default_doc": self.default_doc,
-            "users": [
-                {
-                    "email": u.email,
-                    "display": u.display,
-                    "role": u.role,
-                    "heavy": u.heavy,
-                    "project": u.project,
-                    "doc": u.doc,
-                }
-                for u in sorted(self._by_email.values(), key=lambda u: u.email)
-            ]
-        }
-        tmp = self.path.with_suffix(".yaml.tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            fh.write("# chudware-web allowlist — managed via /admin; edits here are fine too.\n")
-            fh.write("# After manual edits run: python3 Webservice/deploy/cf_provision.py --sync-users\n")
-            yaml.safe_dump(payload, fh, sort_keys=False)
-        tmp.replace(self.path)
-        self._mtime = self.path.stat().st_mtime
-        log.info("wrote %d users to %s", len(self._by_email), self.path)
 
 
 class JWKSCache:
-    """Cached Cloudflare Access JWKS (15 min TTL)."""
+    """Cached JWKS (15 min TTL).
+
+    Used twice: for Cloudflare Access's team keys below, and for Google's OIDC
+    keys in ``oauth.py``. Same shape, same refresh policy, one implementation.
+    """
 
     def __init__(self, url: str, ttl_sec: int = 15 * 60) -> None:
         self.url = url
@@ -204,43 +96,56 @@ class JWKSCache:
         return client.get_signing_key_from_jwt(token)
 
 
-def not_on_list_html(email: str | None = None) -> str:
+# ---------------------------------------------------------------------------
+# The "you are signed in but cannot use the service" page
+# ---------------------------------------------------------------------------
+
+# One entry per non-active state, each carrying the ONE action that actually
+# unblocks that user. The page this replaces told everybody to email the
+# operator to be added to users.yaml, which stopped being true the moment
+# registration opened — and was never true for a suspended or expired account.
+_STATUS_COPY: dict[str, tuple[str, str]] = {
+    "pending": (
+        "Confirm your email address",
+        "<p>We sent a confirmation link to {who}. Click it and you're in —"
+        " your trial starts the moment you do.</p>"
+        '<p>Nothing in your inbox? Check spam, then <a href="/#resend">send'
+        " it again</a>.</p>",
+    ),
+    "denied": (
+        "This account was declined",
+        "<p>{who} was reviewed and not approved for Chudware.</p>"
+        '<p>If you think that is a mistake, write to <a href="mailto:{support}">'
+        "{support}</a> and we will take another look.</p>",
+    ),
+    "suspended": (
+        "This account is suspended",
+        "<p>Access for {who} is suspended, so nothing here will load.</p>"
+        '<p>Contact <a href="mailto:{support}">{support}</a> to sort it out —'
+        " your files and projects are untouched.</p>",
+    ),
+    "trial_expired": (
+        "Your trial has ended",
+        "<p>The free trial for {who} is over. Your work is safe and stays"
+        " exactly where you left it.</p>"
+        '<p><a href="/#pricing">Pick a plan</a> to pick up where you stopped.</p>',
+    ),
+}
+
+_STATUS_FALLBACK = (
+    "This account cannot sign in",
+    "<p>{who} is not currently authorized for Chudware.</p>"
+    '<p>Contact <a href="mailto:{support}">{support}</a> for help.</p>',
+)
+
+
+def status_page_html(email: str | None, status: str | None) -> str:
+    """The page a signed-in-but-unauthorized caller sees, keyed on WHY."""
     who = f"<code>{_html_escape(email)}</code>" if email else "your account"
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Not on the list — Chudware</title>
-  <style>
-    body {{ font-family: system-ui, sans-serif; background: #0f1419; color: #e7ecf1;
-           display: flex; min-height: 100vh; min-height: 100dvh; align-items: center; justify-content: center;
-           margin: 0; padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
-                    max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
-           box-sizing: border-box; }}
-    .card {{ max-width: 32rem; width: 100%; padding: 2rem; border-radius: 12px; background: #1a2332;
-             border: 1px solid #2a3a4e; box-shadow: 0 8px 32px rgba(0,0,0,.4); box-sizing: border-box; }}
-    h1 {{ margin: 0 0 .75rem; font-size: 1.35rem; }}
-    p {{ line-height: 1.5; color: #b0bcc8; }}
-    code {{ background: #0f1419; padding: .1rem .35rem; border-radius: 4px; word-break: break-all; }}
-    a {{ color: #6cb6ff; }}
-    @media (max-width: 480px) {{
-      .card {{ padding: 1.25rem; }}
-      h1 {{ font-size: 1.2rem; }}
-    }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>You're not on the list</h1>
-    <p>{who} authenticated successfully, but is not authorized for Chudware.</p>
-    <p>Ask the operator (Hunter) to add your email to
-       <code>Webservice/gateway/users.yaml</code> and re-deploy the Access policy if needed.</p>
-    <p>Contact: the host operator for this instance.</p>
-  </div>
-</body>
-</html>
-"""
+    heading, body = _STATUS_COPY.get(status or "", _STATUS_FALLBACK)
+    return authn.page_html(
+        heading, heading, f"    {body.format(who=who, support=SUPPORT_EMAIL)}"
+    )
 
 
 def _html_escape(s: str) -> str:
@@ -265,11 +170,19 @@ def _parse_cookies(header: str) -> dict[str, str]:
 
 
 class AuthError(Exception):
-    def __init__(self, message: str, status: int = 401, email: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status: int = 401,
+        email: str | None = None,
+        account_status: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.status = status
         self.email = email
+        # pending / denied / suspended / trial_expired — selects the page copy.
+        self.account_status = account_status
 
 
 class AuthMiddleware:
@@ -279,26 +192,26 @@ class AuthMiddleware:
         self,
         app,
         cfg: Settings | None = None,
-        directory: UserDirectory | None = None,
         jwks: JWKSCache | None = None,
     ) -> None:
         self.app = app
         self.cfg = cfg or settings
-        # Fail fast on a misconfigured production deploy: with neither CF
-        # Access nor the oauth2-proxy shared secret there is NO strong auth
-        # path at all — refuse to construct rather than run silently broken.
+        # Fail fast on a misconfigured production deploy: with neither a
+        # self-serve session secret nor Cloudflare Access there is NO strong
+        # auth path at all — refuse to construct rather than run silently
+        # broken. session_secret alone is enough: a self-serve deployment
+        # authenticates its own users and needs no edge IdP.
         if (
             not self.cfg.dev_mode
+            and not self.cfg.session_secret
             and not (self.cfg.cf_team_domain and self.cfg.cf_aud)
-            and not self.cfg.sso_shared_secret
         ):
             raise RuntimeError(
-                "no strong auth configured: set CHUDWARE_WEB_CF_TEAM_DOMAIN + "
-                "CHUDWARE_WEB_CF_AUD (Cloudflare Access) or "
-                "CHUDWARE_WEB_SSO_SHARED_SECRET (oauth2-proxy front door); "
+                "no strong auth configured: set CHUDWARE_WEB_SESSION_SECRET "
+                "(self-serve sign-in) or CHUDWARE_WEB_CF_TEAM_DOMAIN + "
+                "CHUDWARE_WEB_CF_AUD (Cloudflare Access); "
                 "CHUDWARE_WEB_DEV=1 is for local development only"
             )
-        self.directory = directory or UserDirectory(self.cfg.users_file)
         self._jwks = jwks
         if not self.cfg.dev_mode and self.cfg.cf_team_domain:
             self._jwks = self._jwks or JWKSCache(self.cfg.cf_jwks_url)
@@ -409,37 +322,38 @@ class AuthMiddleware:
     def _resolve_user(self, email: str) -> User:
         """Map a verified email to an authorized User, or raise 403.
 
-        Authorization lives in the account store (``accounts.py``): an unknown
-        identity is REGISTERED as ``pending`` rather than rejected outright, so
-        a stranger who signs in through Cloudflare Access lands in the approval
-        queue instead of a dead end. Only ``status == "active"`` yields a
-        session. The legacy ``users.yaml`` allowlist is still the source of the
-        project/doc assignment, and is imported into the store at startup so
-        existing teammates keep their role.
+        Authorization lives in the account store (``accounts.py``): an identity
+        the store has never seen is REGISTERED as ``pending`` rather than
+        rejected outright, so someone arriving through Cloudflare Access lands
+        in a state the operator can act on instead of a dead end. Only
+        ``status == "active"`` yields a session, and an active account whose
+        trial window has closed does not get one either.
         """
         email = email.strip().lower()
-        listed = self.directory.get(email)
         account = accounts.ensure_account(email, display=email.split("@")[0])
-        if not accounts.is_authorized(account) and listed is not None:
-            # Adoption path: this identity predates the account store and is
-            # still on the YAML allowlist, so it is already an approved human.
-            # Activate it in place (carrying its role) rather than stranding a
-            # current teammate in the queue. Startup does the same migration in
-            # bulk; this covers a users.yaml edited while the gateway is up.
-            account = accounts.adopt_listed(
-                email, role=listed.role, heavy=listed.heavy, display=listed.display
-            )
         if not accounts.is_authorized(account):
-            raise AuthError("account not approved", status=403, email=email)
+            raise AuthError(
+                "account not approved",
+                status=403,
+                email=email,
+                account_status=account.status,
+            )
+        # The trial is the one entitlement whose expiry the status column does
+        # not encode. Checked here so every entry path enforces it identically.
+        if account.plan == "trial" and authn.trial_expired(email):
+            raise AuthError(
+                "trial expired",
+                status=403,
+                email=email,
+                account_status="trial_expired",
+            )
         return User(
             email=account.email,
-            display=account.display or (listed.display if listed else email.split("@")[0]),
+            display=account.display or email.split("@")[0],
             # Role and heavy come from the store, never from a self-asserted
             # claim — a self-registered account can never be admin.
             role=accounts.effective_role(account),
             heavy=account.heavy,
-            project=listed.project if listed else "",
-            doc=listed.doc if listed else "",
         )
 
     def _authenticate(
@@ -473,31 +387,42 @@ class AuthMiddleware:
             user = self._resolve_user(email)
             return user, (email if from_query else None)
 
-        # Multi-tenant Microsoft Entra front door (sso.chudware.com): oauth2-proxy
-        # verifies the OIDC login itself, then reverse-proxies here over loopback with
-        # HTTP Basic Auth (username=email, password=shared secret) — a real secret
-        # comparison, not a bare trusted header, so a stray local process can't forge
-        # identity by just setting X-Forwarded-Email. Independent of the CF Access path.
-        if self.cfg.sso_shared_secret and "cf-access-jwt-assertion" not in headers and "CF_Authorization" not in cookies:
-            basic = headers.get("authorization", "")
-            if basic[:6].lower() == "basic ":
+        # Self-serve session cookie. Tried before Cloudflare Access, and skipped
+        # entirely when an Access assertion is present so an operator reaching
+        # /admin through Access is never shadowed by a stale user session.
+        cf_present = (
+            "cf-access-jwt-assertion" in headers or "CF_Authorization" in cookies
+        )
+        sid = cookies.get(authn.SESSION_COOKIE, "")
+        if sid and not cf_present:
+            session_email = authn.lookup_session(sid)
+            if session_email:
                 try:
-                    decoded = base64.b64decode(basic[6:].strip()).decode("utf-8", "replace")
-                except Exception:
-                    decoded = ""
-                sso_email, sep, sso_secret = decoded.partition(":")
-                if sep and secrets.compare_digest(sso_secret, self.cfg.sso_shared_secret):
-                    email = sso_email.strip().lower()
-                    if not email or "@" not in email:
-                        raise AuthError("sso token missing email", status=401)
-                    user = self._resolve_user(email)
-                    return user, None
+                    return self._resolve_user(session_email), None
+                except AuthError as exc:
+                    # This is the whole reason sessions are rows rather than
+                    # signed cookies: a denied or suspended decision has to END
+                    # them, not merely be re-checked beside them. Kill every
+                    # session the account owns so the decision sticks.
+                    if exc.account_status in {"denied", "suspended"}:
+                        killed = authn.revoke_sessions(session_email)
+                        if killed:
+                            log.info(
+                                "auth: revoked %d session(s) for %s account %s",
+                                killed,
+                                exc.account_status,
+                                session_email,
+                            )
+                    raise
 
-        token = headers.get("cf-access-jwt-assertion")
+        token = headers.get("cf-access-jwt-assertion") or cookies.get("CF_Authorization")
         if not token:
-            token = cookies.get("CF_Authorization")
-        if not token:
-            raise AuthError("missing Cf-Access-Jwt-Assertion", status=401)
+            # Distinguish "this deployment expects an Access assertion and got
+            # none" from "you are simply not signed in", which is what a
+            # self-serve visitor actually is.
+            if self.cfg.cf_team_domain and self.cfg.cf_aud:
+                raise AuthError("missing Cf-Access-Jwt-Assertion", status=401)
+            raise AuthError("not signed in", status=401)
 
         if not self.cfg.cf_team_domain or not self.cfg.cf_aud:
             raise AuthError("CF Access not configured", status=500)
@@ -531,11 +456,18 @@ class AuthMiddleware:
     def _deny_http(self, path: str, headers: dict[str, str], exc: AuthError):
         accept = headers.get("accept", "")
         wants_html = "text/html" in accept or path == "/" or path.startswith("/static")
-        if exc.status == 403 and (exc.email or "not on the list" in exc.message.lower()):
+        if exc.status == 403 and exc.account_status:
             if wants_html or not path.startswith("/api"):
-                return HTMLResponse(not_on_list_html(exc.email), status_code=403)
+                return HTMLResponse(
+                    status_page_html(exc.email, exc.account_status), status_code=403
+                )
             return JSONResponse(
-                {"error": "not_on_list", "email": exc.email, "detail": exc.message},
+                {
+                    "error": "not_authorized",
+                    "account_status": exc.account_status,
+                    "email": exc.email,
+                    "detail": exc.message,
+                },
                 status_code=403,
             )
         if wants_html and not path.startswith("/api"):

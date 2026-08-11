@@ -3,7 +3,7 @@
 Run as ``python -m services.intake.test_intake`` from the repo root. Prints one line per case
 (PASS/FAIL) and exits nonzero if anything failed — the project's script-style convention
 (cf. ``engine/dfm/test_process_profiles.py`` / ``engine/test_parts_library.py`` /
-``mcp_server.test_ecad_tools``), NOT pytest.
+``services.mcp.test_ecad_tools``), NOT pytest.
 
 Coverage maps to ``docs/INTAKE_MEASUREMENT_DFM_PLAN.md`` and the build spec:
 

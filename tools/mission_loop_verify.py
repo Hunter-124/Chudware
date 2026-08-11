@@ -11,7 +11,7 @@ import ctypes, json, os
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CORE = os.path.join(_REPO_ROOT, "core", "build-occt", "bin", "Release")
-os.environ.setdefault("CHUDWARE_PROMPTS_DIR", os.path.join(_REPO_ROOT, "agent", "prompts"))
+os.environ.setdefault("CHUDWARE_PROMPTS_DIR", os.path.join(_REPO_ROOT, "services", "agent", "prompts"))
 os.add_dll_directory(CORE)
 lib = ctypes.WinDLL(os.path.join(CORE, "libchudware.dll"))
 lib.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]

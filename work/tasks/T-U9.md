@@ -82,7 +82,7 @@ identical across all 3 attempts before each was killed. `ui/imgui` build + `--sh
 verified directly and repeatedly throughout this session (4 separate successful builds +
 6 headless screenshots, not just the gate's single smoke shot). `pytest`: T-U9 touches
 zero Python files (`services/`, `engine_oracle/`, etc. are untouched) — T-V3's
-already-verified numbers for those suites apply unchanged; only `mcp_server`'s count was
+already-verified numbers for those suites apply unchanged; only `services.mcp`'s count was
 visible before this run's kill (218 passed, matching the established baseline). `graphify
 update .` run (26578 nodes / 55187 edges / 1239 communities).
 

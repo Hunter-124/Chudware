@@ -2,7 +2,7 @@
 //
 // P52: role registry + editable-prompt resolution. The BUILTIN prompts dir is
 // product DATA (not under the binary's control at runtime); it is supplied via
-// the CHUDWARE_PROMPTS_DIR env var (default "agent/prompts"), and a per-call
+// the CHUDWARE_PROMPTS_DIR env var (default "services/agent/prompts"), and a per-call
 // override `prompts_dir` lets the parity gate point C++ at the same files Python
 // reads. The user OVERRIDE dir is %APPDATA%/Chudware/prompts/<role>.md.
 #pragma once

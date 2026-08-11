@@ -32,7 +32,7 @@ GUI extras beyond the MCP twins (additive, worker-seam only):
 
 Ease-of-use law (contract §8.1): no git vocabulary in any string a user could
 see. Registered append-only in ``engine/worker.py``, following the
-deliverables.worker_rpc / services.parts.worker_rpc / dag.worker_rpc precedent.
+services.deliverables.worker_rpc / services.parts.worker_rpc / dag.worker_rpc precedent.
 """
 from __future__ import annotations
 

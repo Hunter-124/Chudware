@@ -11,8 +11,8 @@ import math
 import os
 from typing import Any, Optional, Union
 
-from mcp_server import result_serving as _rs
-from mcp_server import core_bridge as cb
+from services.mcp import result_serving as _rs
+from services.mcp import core_bridge as cb
 
 # T-RF20: the ECAD document/session/netlist/ERC/DRC kernel now lives in the C++ core
 # (core/ecad/*, dispatched via the ecad_*/sim_* RPCs — see worker_client.cpp). The direct
@@ -1412,7 +1412,7 @@ def _attach_schematic_ascii_readback(payload: dict, doc_id: str = "",
     if not isinstance(payload, dict) or not payload.get("ok", True):
         return payload
     try:
-        from mcp_server.ascii2d import (  # noqa: PLC0415
+        from services.mcp.ascii2d import (  # noqa: PLC0415
             attach_schematic_readback, _load_schematic,
         )
         did = doc_id or payload.get("doc_id") or ""
@@ -1439,7 +1439,7 @@ def _attach_board_ascii_readback(payload: dict, doc_id: str = "",
     if not isinstance(payload, dict) or not payload.get("ok", True):
         return payload
     try:
-        from mcp_server.ascii2d import (  # noqa: PLC0415
+        from services.mcp.ascii2d import (  # noqa: PLC0415
             attach_board_readback, _load_board,
         )
         did = doc_id or payload.get("doc_id") or payload.get("board_doc_id") or ""

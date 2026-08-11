@@ -31,7 +31,7 @@ from typing import Callable
 from .base import Provider
 from . import sub_auth
 
-log = logging.getLogger("agent.providers.xai_sub")
+log = logging.getLogger("services.agent.providers.xai_sub")
 
 # ── Endpoints / client (source: hermes-agent hermes_cli/auth.py) ─────────────
 # https://github.com/NousResearch/hermes-agent/blob/main/hermes_cli/auth.py

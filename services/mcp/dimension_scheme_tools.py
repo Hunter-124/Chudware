@@ -39,7 +39,7 @@ from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from mcp_server.cad_tools import _dumps, _err, _doc
+from services.mcp.cad_tools import _dumps, _err, _doc
 
 # DfM process data (profiles, resolver, known-process list) now lives in the C++ core
 # (core/dfm/process_profiles.cpp); reached via core_bridge, lazily, so this module still
@@ -53,7 +53,7 @@ def _get_profile(process: str) -> dict:
     ``params.hole_comp_mm`` off it, and a silent blank there becomes a wrong modeled
     diameter (an FDM hole 0.20 mm undersize) or an AttributeError several frames away.
     """
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
     r = cb.call("dfm_get_profile", {"process": process}) or {}
     if not r.get("ok"):
         raise ValueError(r.get("error") or
@@ -68,7 +68,7 @@ def _get_profile(process: str) -> dict:
 
 def _resolve_process(request: str) -> dict:
     """dfm_resolve_process RPC (the FDM-default resolver + ambiguity gate)."""
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
     r = cb.call("dfm_resolve_process", {"request": request})
     if not r.get("ok"):
         raise ValueError(r.get("error") or "dfm_resolve_process failed")
@@ -78,7 +78,7 @@ def _resolve_process(request: str) -> dict:
 def _known_processes() -> list:
     """dfm_known_processes RPC; falls back to the static list when no bridge is up."""
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
         r = cb.call("dfm_known_processes", {})
         if r.get("ok") and isinstance(r.get("result"), list):
             return r["result"]
@@ -99,7 +99,7 @@ def _profile_params(process: str) -> dict | None:
       instead of quietly planning an uncompensated hole.
     """
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
     except Exception:  # noqa: BLE001 — no engine package: offline mode
         return None
     try:
@@ -112,7 +112,7 @@ def _profile_params(process: str) -> dict | None:
     return profile.get("params") or profile
 
 try:
-    from mcp_server.cad_tools import _CB as _cb_module  # noqa: F401 — presence check
+    from services.mcp.cad_tools import _CB as _cb_module  # noqa: F401 — presence check
     import services.mcp.core_bridge as _cb
     _HAS_BRIDGE = True
 except Exception:

@@ -14,7 +14,7 @@ Envelope: ``{ok:true, …}`` | ``{ok:false, reason, hint}`` — never a tracebac
 plm_tools.py's ``_err``/``_ok``). Every tool lazily imports its backing library per call so the
 MCP server boots even when a library is momentarily absent; missing libraries degrade to
 ``reason:"engine_missing"``, a missing ``soffice``/``libreoffice`` binary degrades to
-``reason:"converter_missing"`` (same code deliverables/engines.py uses), and PDF ops that would
+``reason:"converter_missing"`` (same code services/deliverables/engines.py uses), and PDF ops that would
 require real text-content reflow degrade to ``reason:"unsupported_op"``.
 
 FROZEN contract (contracts/office.md) — ``office_extract`` exists BOTH as an MCP tool below
@@ -276,7 +276,7 @@ def _apply_docx_ops(doc, ops: list) -> int | dict:
 
 def _soffice_bin_or_err():
     """(binary, None) or (None, error-dict) — the same soffice/libreoffice discovery
-    deliverables/engines.py uses (subprocess-only, PATH-discovered, never bundled)."""
+    services/deliverables/engines.py uses (subprocess-only, PATH-discovered, never bundled)."""
     try:
         from services.deliverables.engines import soffice_bin  # noqa: PLC0415
     except ImportError:
@@ -291,7 +291,7 @@ def _soffice_bin_or_err():
 
 def _soffice_convert(binary: str, src: Path, outdir: Path, target: str) -> Path | None:
     """Convert *src* to *target* (a bare extension: "docx"/"doc") via LibreOffice headless.
-    Mirrors deliverables/engines.py::office_to_pdf's subprocess shape exactly."""
+    Mirrors services/deliverables/engines.py::office_to_pdf's subprocess shape exactly."""
     outdir.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
         [binary, "--headless", "--convert-to", target, "--outdir", str(outdir), str(src)],

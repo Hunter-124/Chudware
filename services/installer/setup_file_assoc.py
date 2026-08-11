@@ -9,7 +9,7 @@ beside it for legacy scripts, and default_exe() falls back to the old name on st
 also clean up the pre-rename AICAD.* ProgIDs / ai-cad.* XDG files so a machine migrates cleanly.
 
 Idempotent, **per-user (no elevation)**, and reversible (`--unregister`) — modelled on
-installer/setup_mcp_clients.py (stdlib only, `--dry-run`, backups).
+services/installer/setup_mcp_clients.py (stdlib only, `--dry-run`, backups).
 
   Windows: HKCU\\Software\\Classes — a ProgID with an Open command (`"chudware.exe" "%1"`) + a
            DefaultIcon pointing at the exe's SECOND icon group (the branded document icon from
@@ -21,7 +21,7 @@ installer/setup_mcp_clients.py (stdlib only, `--dry-run`, backups).
            routes a double-click to Chudware and shows the branded doc icon. Interchange formats are listed in the launcher's
            MimeType via their standard freedesktop types (Open-with), not redefined.
 
-    python installer/setup_file_assoc.py [--exe <path>] [--unregister] [--dry-run]
+    python services/installer/setup_file_assoc.py [--exe <path>] [--unregister] [--dry-run]
 """
 from __future__ import annotations
 

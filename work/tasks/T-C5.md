@@ -145,7 +145,7 @@ PASS (including the live arm-gcc/Renode-backed tests, not just mocked ones — t
 real toolchain). `check.py`/`pytest`(engine/doc+agent)/`--selftest` reds are the same pre-existing
 gaps every task tonight has logged (ribbon/parity audit drift, issue #6 no-venv-in-gate-script
 gap — unrelated to this task; note the `engine/firmware` suite itself passed real, this is only
-the separate top-level `pytest engine/doc agent` gate stage). `graphify update .` run (25702
+the separate top-level `pytest engine/doc services/agent` gate stage). `graphify update .` run (25702
 nodes / 53607 edges / 1195 communities).
 
 No advisor questions filed — every ambiguity hit (assertion regex vs substring, T-A4 not existing,

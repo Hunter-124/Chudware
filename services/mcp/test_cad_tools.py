@@ -1,11 +1,11 @@
-"""Smoke tests for the C++ feature-engine MCP tools (mcp_server/cad_tools.py).
+"""Smoke tests for the C++ feature-engine MCP tools (services/mcp/cad_tools.py).
 
 These drive the registered MCP tools end-to-end against the STAGED libchudware.dll (the same
 engine the app loads) — build a part, render it, run FEA + CFD. They are skipped cleanly
 when the DLL isn't built/staged, so a checkout without a build still passes.
 
-Run:  python -m pytest mcp_server/test_cad_tools.py -v
-      python mcp_server/test_cad_tools.py        # also works (prints PASS/FAIL)
+Run:  python -m pytest services/mcp/test_cad_tools.py -v
+      python -m services.mcp.test_cad_tools        # also works (prints PASS/FAIL)
 """
 from __future__ import annotations
 
@@ -19,18 +19,10 @@ import time
 import uuid
 from pathlib import Path
 
-# Allow `python mcp_server/test_cad_tools.py` (script dir, not repo root, lands on path).
-# T-V3 fix: .resolve() first so this lands on repo root regardless of whether the file was
-# reached via the mcp_server/ symlink or its real services/mcp/ path — dirname(dirname(...))
-# on the unresolved path landed on services/ when pytest collects the real path, which makes
-# services/mcp/ itself resolve as a top-level `mcp` package, shadowing the real installed SDK.
-_REPO_ROOT = str(Path(__file__).resolve().parents[2])
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 import pytest
 
-from mcp_server import core_bridge as cb
+from services.mcp import core_bridge as cb
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
@@ -40,7 +32,7 @@ pytestmark = pytest.mark.skipif(
 
 def _call(name: str, args: dict):
     """Invoke a registered MCP tool; return (parsed_json_or_None, content_list)."""
-    from mcp_server import server
+    from services.mcp import server
 
     content, structured = asyncio.run(server.mcp.call_tool(name, args))
     text = structured.get("result") if isinstance(structured, dict) else None
@@ -227,7 +219,7 @@ def test_check_sketch_under_defined():
 
 def test_render_part_returns_image():
     doc = _new_plate_with_hole()
-    from mcp_server import server
+    from services.mcp import server
 
     # call_tool's return shape varies for image vs text tools; just hunt for the ImageContent.
     def _find_image(x):
@@ -262,7 +254,7 @@ def test_render_part_custom_angle_returns_image():
     # Task 03: render_part now takes an on-request view (named or {azimuth,elevation}). Each yields
     # a real PNG, and the core echoes the resolved camera, proving the angle actually applied.
     doc = _new_plate_with_hole()
-    from mcp_server import server
+    from services.mcp import server
 
     for view in ("right", {"azimuth": 30, "elevation": 20}):
         result = asyncio.run(
@@ -285,7 +277,7 @@ def test_render_part_custom_angle_returns_image():
 def test_contact_sheet_returns_image():
     # Task 03: contact_sheet tiles several labelled views into one PNG.
     doc = _new_plate_with_hole()
-    from mcp_server import server
+    from services.mcp import server
 
     result = asyncio.run(server.mcp.call_tool("contact_sheet", {"doc_id": doc}))
     item = _find_image(result)
@@ -350,7 +342,7 @@ def test_set_material_print_filaments_use_plastic_appearance(material):
     r, _ = _call("set_material", {"material": material, "doc_id": doc})
 
     assert r["ok"], r
-    from mcp_server import cad_common
+    from services.mcp import cad_common
     assert r["appearance"] == cad_common._resolve_appearance("plastic")
 
 
@@ -1351,7 +1343,7 @@ def test_draft_analysis_sphere_is_moldable():
 def test_new_part_seeds_volume_baseline_for_write_diff():
     """new_part seeds _LAST_VOLUME so the FIRST add_features reports a real volume delta
     (volume 0.0 -> X) instead of degrading to the no-baseline 'volume now X' branch."""
-    from mcp_server import cad_tools
+    from services.mcp import cad_tools
     r, _ = _call("new_part", {"name": "vbase"})
     doc = r["doc_id"]
     # the empty part's volume baseline is seeded (zero) so the write-diff has a before-value
@@ -1379,7 +1371,7 @@ def test_a_resumed_part_carrying_geometry_keeps_a_real_volume_baseline():
     every resume made from a process that had not itself built the part. A resumed
     48000 mm^3 box, then cut by 282.3 mm^3, reported "volume 0.0->47717.7 (+47717.7)" — the
     sign inverted and the magnitude 169x off, on the exact op the model was verifying."""
-    from mcp_server import cad_tools
+    from services.mcp import cad_tools
     r, _ = _call("new_part", {"name": "resumebase", "fresh": True})
     doc = r["doc_id"]
     built, _ = _call("add_features", {"doc_id": doc, "ops": [
@@ -1700,7 +1692,7 @@ def test_new_part_resume_reports_the_feature_count_it_resumed_onto():
     assert built["feature_count"] == 1, built
     assert "ALREADY CARRIES 1 feature(s)" in built["note"], built
     # A resume must never reset the volume baseline of a part that already has geometry.
-    from mcp_server import cad_tools
+    from services.mcp import cad_tools
     assert cad_tools._LAST_VOLUME[doc] == pytest.approx(6000.0, rel=1e-3), \
         cad_tools._LAST_VOLUME[doc]
 
@@ -1768,12 +1760,12 @@ def test_new_part_batch_head_resumes_instead_of_breeding_a_twin():
 # --- pytest import-shadow repair --------------------------------------------------------
 # Under `python3 -m pytest services/mcp/test_cad_tools.py` pytest's default (prepend)
 # import mode names this module `mcp.test_cad_tools` — this directory has an __init__.py,
-# so the PACKAGE `mcp` becomes services/mcp, shadowing the `mcp` SDK that mcp_server's
+# so the PACKAGE `mcp` becomes services/mcp, shadowing the `mcp` SDK that services.mcp's
 # tool modules import (`from mcp.server.fastmcp import FastMCP`). Repair sys.modules:
 # load the real SDK package as `mcp`, keeping this directory on its __path__ so pytest
 # can still import sibling test modules as `mcp.test_*`. (Runs at import time, before
 # any test body executes; a no-op when `mcp` already resolves to the real SDK — e.g.
-# when run by path as `mcp_server/test_cad_tools.py`.)
+# when run as `python -m services.mcp.test_cad_tools`.)
 import importlib.util
 
 
@@ -2089,7 +2081,7 @@ def test_render_part_caption_pairs_image_with_text():
     scene caption (mcp's _convert_to_content flattens the [Image, str] return), so a
     non-vision model reading the transcript still gets signal from the render."""
     doc = _new_plate_with_hole()
-    from mcp_server import server
+    from services.mcp import server
 
     # call_tool returns the bare flattened content list for image tools (no structured
     # result) — same shape test_render_part_returns_image hunts through.
@@ -2378,7 +2370,7 @@ def test_simulate_motion_dynamics_block(tmp_path):
 
 def test_motion_fea_handoff_dry_run(tmp_path):
     """The grounded mate reaction is a boundary reaction, never a duplicate load."""
-    from mcp_server import simhandoff as sh
+    from services.mcp import simhandoff as sh
 
     asm, mate_id, slider = _build_sliding_block_assembly(tmp_path)
     r, _ = _call("motion_fea_handoff", {
@@ -2798,7 +2790,7 @@ def _norm_feature(feature: dict) -> dict:
     sees it (session.cpp::op_add_feature hoists every non-structural key into params, an
     existing params entry winning), so an assertion doesn't care which level a key landed at.
     """
-    from mcp_server.cad_doc_tools import _normalize_feature_ops
+    from services.mcp.cad_doc_tools import _normalize_feature_ops
 
     feat = _normalize_feature_ops([{"op": "add_feature", "feature": feature}])[0]["feature"]
     flat = {k: v for k, v in feat.items() if k != "params"}
@@ -2821,7 +2813,7 @@ def test_normalize_feature_ops_rewrites_the_live_placement_dialect():
 
 def test_normalize_feature_ops_does_not_mutate_the_caller_ops():
     """Pure: the caller's list, op and nested feature/params dicts come back untouched."""
-    from mcp_server.cad_doc_tools import _normalize_feature_ops
+    from services.mcp.cad_doc_tools import _normalize_feature_ops
 
     op = _dialect_spout_op()
     before = json.loads(json.dumps(op))
@@ -2865,7 +2857,7 @@ def test_normalize_feature_ops_rejects_intersect():
 
 def test_normalize_feature_ops_leaves_a_canonical_op_alone():
     """An op already in the documented spelling round-trips byte-for-byte."""
-    from mcp_server.cad_doc_tools import _normalize_feature_ops
+    from services.mcp.cad_doc_tools import _normalize_feature_ops
 
     ops = [{"op": "add_feature", "feature": {
         "type": "cylinder", "name": "Spout",
@@ -2886,7 +2878,7 @@ def test_normalize_feature_ops_leaves_a_canonical_op_alone():
 
 def _norm_dims(feature: dict):
     """Normalize one add_feature op; return (flattened feature, interpreted notes)."""
-    from mcp_server.cad_doc_tools import _normalize_feature_ops
+    from services.mcp.cad_doc_tools import _normalize_feature_ops
 
     notes: list = []
     feat = _normalize_feature_ops([{"op": "add_feature", "feature": feature}], notes)[0]["feature"]
@@ -2897,7 +2889,7 @@ def _norm_dims(feature: dict):
 
 def test_dim_unit_suffix_converts_to_millimetres():
     """<number><unit> becomes the mm number the engine's expression grammar can take."""
-    from mcp_server.cad_doc_tools import _dim_mm
+    from services.mcp.cad_doc_tools import _dim_mm
 
     assert _dim_mm("25mm") == 25
     assert _dim_mm("2.5cm") == 25
@@ -2913,7 +2905,7 @@ def test_dim_unit_suffix_converts_to_millimetres():
 
 def test_dim_unit_suffix_leaves_everything_else_for_the_engine():
     """Only a WHOLE number+unit string converts — an expression must reach the evaluator."""
-    from mcp_server.cad_doc_tools import _dim_mm
+    from services.mcp.cad_doc_tools import _dim_mm
 
     for s in ("width/2", "25", "2*10", "M8", "1e3", "3d", "", "top", "shaft_d"):
         assert _dim_mm(s) is None, s
@@ -2935,7 +2927,7 @@ def test_normalize_dims_converts_units_and_reports_them():
 
 def test_normalize_dims_never_touches_an_expression():
     """`expr` is the engine's job: "width/2" reaches it byte-for-byte, in either spelling."""
-    from mcp_server.cad_doc_tools import _normalize_feature_ops
+    from services.mcp.cad_doc_tools import _normalize_feature_ops
 
     ops = [{"op": "add_feature", "feature": {
         "type": "cylinder", "name": "E",
@@ -3070,7 +3062,7 @@ def test_engine_builds_from_the_dimension_dialect():
 
 def test_as_face_query_parses_a_phrase_into_the_grammar():
     """Free text becomes STRUCTURED query keys — the whole sentence never lands in `side`."""
-    from mcp_server.cad_common import _as_face_query
+    from services.mcp.cad_common import _as_face_query
 
     assert _as_face_query("outer cylindrical wall face at bottom near x=200,y=0") == {
         "of": "face", "surf": "cylinder", "side": "bottom", "pick": "outer"}
@@ -3233,7 +3225,7 @@ def test_inline_profile_sketch_builds_the_same_solid_as_the_two_op_form():
 
 def test_inline_profile_split_emits_a_sketch_op_referenced_by_batch_index():
     """The lifted sketch is a real op BEFORE its consumer, referenced as "$<index>"."""
-    from mcp_server import cad_doc_tools as T
+    from services.mcp import cad_doc_tools as T
 
     notes: list = []
     ops = T._split_inline_profile_sketches([
@@ -3253,7 +3245,7 @@ def test_inline_profile_split_emits_a_sketch_op_referenced_by_batch_index():
 
 def test_inline_profile_split_covers_revolve_and_a_bare_point_loop():
     """Every profile-bearing type is covered, and a bare point loop becomes a polyline."""
-    from mcp_server import cad_doc_tools as T
+    from services.mcp import cad_doc_tools as T
 
     notes: list = []
     ops = T._split_inline_profile_sketches([
@@ -3271,7 +3263,7 @@ def test_inline_profile_split_covers_revolve_and_a_bare_point_loop():
 
 def test_inline_profile_with_no_resolvable_plane_keeps_the_teaching_error():
     """Ambiguity is never guessed away — a plane-less inline profile still teaches."""
-    from mcp_server import cad_doc_tools as T
+    from services.mcp import cad_doc_tools as T
 
     notes: list = []
     ops = [{"op": "add_feature", "feature": {
@@ -3319,7 +3311,7 @@ def test_hole_depth_through_all_drills_all_the_way_through():
 
 def test_hole_depth_nonsense_word_still_fails_with_the_end_condition_vocabulary():
     """An unparseable depth word must never become a silent no-op or a units complaint."""
-    from mcp_server import cad_doc_tools as T
+    from services.mcp import cad_doc_tools as T
 
     with pytest.raises(ValueError) as ei:
         T._normalize_hole_feature(

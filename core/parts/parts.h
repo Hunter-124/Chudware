@@ -8,7 +8,7 @@
 // the module OCCT-free (it only emits JSON); the doc engine compiles the geometry.
 //
 // All dimensions are millimetres (imperial sizes are pre-converted to mm). The
-// numbers mirror agent/prompts/shared/cheatsheets/hardware.md (single source of
+// numbers mirror services/agent/prompts/shared/cheatsheets/hardware.md (single source of
 // truth for the engineer-facing catalog).
 #pragma once
 

@@ -1,4 +1,4 @@
-// core/agent/pm_assist.cpp — see pm_assist.h. Mirrors agent/pm_assist.py.
+// core/agent/pm_assist.cpp — see pm_assist.h. Mirrors services/agent/pm_assist.py.
 #include "agent/pm_assist.h"
 
 #include <cmath>

@@ -13,7 +13,7 @@ import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 from services.ecad_design import orchestrator as orch
-from mcp_server.ecad_common import ecad_session, netlist_mod, _sim_run
+from services.mcp.ecad_common import ecad_session, netlist_mod, _sim_run
 from services.mcp import core_bridge as cb
 
 
@@ -70,7 +70,7 @@ except Exception as e:
     print("autoroute err:", type(e).__name__, e)
 
 # Replicate the MCP make_board step 3.5: auto outline if none
-from mcp_server.ecad_tools import _default_outline_shapes, _outline_bbox
+from services.mcp.ecad_tools import _default_outline_shapes, _outline_bbox
 pcb = ecad_session.get_session(pcb.doc_id)
 print("outline before:", (pcb.doc.get("outline", {}) or {}).get("shapes"))
 if not (pcb.doc.get("outline", {}) or {}).get("shapes"):

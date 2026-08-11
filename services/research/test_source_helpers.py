@@ -55,15 +55,15 @@ def test_unit_convert_cm_to_mm():
     assert out["value"] == 20.0
 
 
-_AGENT_INTERACTION_AVAILABLE = importlib.util.find_spec("agent.interaction") is not None
+_AGENT_INTERACTION_AVAILABLE = importlib.util.find_spec("services.agent.interaction") is not None
 
 
 @pytest.mark.skipif(
     not _AGENT_INTERACTION_AVAILABLE,
-    reason="agent.interaction not present in this tree (pre T-F3 merge)",
+    reason="services.agent.interaction not present in this tree (pre T-F3 merge)",
 )
 def test_unit_convert_uses_canonical_normalizer_when_agent_interaction_lands():
-    assert normalizer_source() == "agent.interaction"
+    assert normalizer_source() == "services.agent.interaction"
     out = research.unit_convert(1, "in", "length")
     assert out["value"] == 25.4
 
@@ -71,7 +71,7 @@ def test_unit_convert_uses_canonical_normalizer_when_agent_interaction_lands():
 def test_unit_convert_normalizer_source_is_a_known_seam():
     # Always-on counterpart to the skipif test above: whichever side of the T-F3 seam
     # we're on, the normalizer must be one of the two known sources.
-    assert normalizer_source() in {"agent.interaction", "fallback"}
+    assert normalizer_source() in {"services.agent.interaction", "fallback"}
 
 
 # --------------------------------------------------------------------------- eng_calc

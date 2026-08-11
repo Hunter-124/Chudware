@@ -2,15 +2,15 @@
 build a part, render it, measure it, run FEA, export. A runnable narrative companion to the
 pytest smoke suite (test_cad_tools.py); prints each step so you can eyeball the engine.
 
-Run:  python -m mcp_server.test_roundtrip
+Run:  python -m services.mcp.test_roundtrip
 """
 from __future__ import annotations
 
 import asyncio
 import json
 
-from mcp_server import core_bridge as cb
-from mcp_server.server import mcp
+from services.mcp import core_bridge as cb
+from services.mcp.server import mcp
 
 
 async def main() -> None:

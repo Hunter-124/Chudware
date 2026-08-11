@@ -1,5 +1,5 @@
 # Clean-room deep-groove ball bearing envelopes (bore x OD x width, mm).
-# Source: agent/prompts/shared/cheatsheets/hardware.md + core/parts/parts_data.h
+# Source: services/agent/prompts/shared/cheatsheets/hardware.md + core/parts/parts_data.h
 # (ISO 15 dimensional standard; NOT copied from BOLTS GPL data). See README.md.
 collection: bearings
 

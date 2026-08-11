@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from mcp_server import result_serving as rs
+from services.mcp import result_serving as rs
 
 
 def test_count_tokens_chars_per_token():

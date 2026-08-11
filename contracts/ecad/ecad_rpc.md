@@ -41,6 +41,6 @@ compiler: keyed on `(revision, op-touched object set)` so a single-symbol edit r
 
 ## 4. MCP bridge
 
-`mcp_server/ecad_tools.py` calls the kernel/engine **directly** (not via the worker socket) — same
-pattern as the existing `mcp_server/server.py` `run_model`. Worker RPC is for the C++ host; MCP is
+`services/mcp/ecad_tools.py` calls the kernel/engine **directly** (not via the worker socket) — same
+pattern as the existing `services/mcp/server.py` `run_model`. Worker RPC is for the C++ host; MCP is
 for external/agent callers. Both share the same `engine/ecad` core, so behavior is identical.

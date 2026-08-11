@@ -22,7 +22,7 @@ from mcp.server.fastmcp import FastMCP
 from . import core_bridge as cb
 from .core_bridge import CoreError
 
-from mcp_server.cad_tools import _dumps, _err
+from services.mcp.cad_tools import _dumps, _err
 
 
 def _struct_rpc(method: str, params: dict) -> str:

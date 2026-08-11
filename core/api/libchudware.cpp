@@ -2518,7 +2518,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             chudware::agent::VerifyResult vr = chudware::agent::verify_step(step, tree, fs, vb, va);
             return emit(json{{"verified", vr.verified}, {"notes", vr.notes}}, out_json, 0);
         }
-        // --- P54b: in-app LLM assists (agent/ask.py + agent/pm_assist.py) ---
+        // --- P54b: in-app LLM assists (services/agent/ask.py + services/agent/pm_assist.py) ---
         // All re-parse params_json as ordered_json so doc/form_schema/current
         // key order survives end-to-end (matching Python dict insertion order).
         if (m == "agent_build_doc_context") {

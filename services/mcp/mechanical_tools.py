@@ -13,8 +13,8 @@ from __future__ import annotations
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
-from mcp_server import core_bridge as cb
-from mcp_server.cad_tools import _dumps, _err
+from services.mcp import core_bridge as cb
+from services.mcp.cad_tools import _dumps, _err
 
 
 def register_mechanical_tools(mcp: FastMCP) -> None:

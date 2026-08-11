@@ -15,7 +15,7 @@ foreman standing ruling for T-B4 requires a question file before bundling any GP
 data — see `work/questions/T-B4.md`.
 
 Instead these values are transcribed from the project's own single source of truth
-for hardware dimensions — `agent/prompts/shared/cheatsheets/hardware.md` and the
+for hardware dimensions — `services/agent/prompts/shared/cheatsheets/hardware.md` and the
 C++ catalog tables in `core/parts/parts_data.h` — which carry published **ISO/DIN
 nominal dimensions**. Dimensional standards are not copyrightable (same posture as
 the IPC-7351 footprint geometry row in `contracts/licenses.md`), so this table is

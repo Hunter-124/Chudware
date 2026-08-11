@@ -30,12 +30,12 @@ from unittest.mock import patch
 
 def _stub_core_bridge():
     """Insert a dummy core_bridge so cad_tools doesn't fail on import."""
-    mod = types.ModuleType("mcp_server.core_bridge")
+    mod = types.ModuleType("services.mcp.core_bridge")
     mod.available = lambda: False
     mod.call = lambda method, params=None: {}
     mod.feat = lambda *a, **kw: {}
     mod.dim = lambda v, unit="mm": {"value": v, "unit": unit}
-    sys.modules.setdefault("mcp_server.core_bridge", mod)
+    sys.modules.setdefault("services.mcp.core_bridge", mod)
     # Also wire the bare-name alias used inside some modules
     sys.modules.setdefault("core_bridge", mod)
 
@@ -45,7 +45,7 @@ def _build_stubs() -> dict:
     stubs: dict[str, object] = {}
 
     # core_bridge stubs (use setdefault so they don't clobber real ones)
-    for key in ("mcp_server.core_bridge", "core_bridge"):
+    for key in ("services.mcp.core_bridge", "core_bridge"):
         if key not in sys.modules:
             mod = types.ModuleType(key)
             mod.available = lambda: False  # type: ignore[attr-defined]
@@ -93,15 +93,15 @@ def _build_stubs() -> dict:
         anyio_mod.wrap_file = lambda f: f  # type: ignore[attr-defined]
         stubs["anyio"] = anyio_mod
 
-    # mcp_server package stub (so sub-imports work)
-    if "mcp_server" not in sys.modules:
-        pkg = types.ModuleType("mcp_server")
+    # services.mcp package stub (so sub-imports work)
+    if "services.mcp" not in sys.modules:
+        pkg = types.ModuleType("services.mcp")
         pkg.__path__ = []  # type: ignore[attr-defined]
-        stubs["mcp_server"] = pkg
+        stubs["services.mcp"] = pkg
 
     # tool_registry stub
-    if "mcp_server.tool_registry" not in sys.modules:
-        reg_mod = types.ModuleType("mcp_server.tool_registry")
+    if "services.mcp.tool_registry" not in sys.modules:
+        reg_mod = types.ModuleType("services.mcp.tool_registry")
 
         class _View:
             def __init__(self, mcp, family):
@@ -115,7 +115,7 @@ def _build_stubs() -> dict:
                 return getattr(self._mcp, name)
 
         reg_mod.view = lambda mcp, family: _View(mcp, family)  # type: ignore[attr-defined]
-        stubs["mcp_server.tool_registry"] = reg_mod
+        stubs["services.mcp.tool_registry"] = reg_mod
 
     return stubs
 

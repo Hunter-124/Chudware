@@ -115,7 +115,7 @@ def test_env_provisioned_flips_available(clean_env, monkeypatch, tmp_path):
 
 def test_installer_wrapper_offline(clean_env):
     """provision.reveng_provisioning_status() returns contract-shaped, no network."""
-    from installer import provision
+    from services.installer import provision
     st = provision.reveng_provisioning_status()
     assert st["ok"] is True
     assert set(st["capabilities"].keys()) == CAPABILITY_KEYS

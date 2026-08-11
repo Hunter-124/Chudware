@@ -58,7 +58,7 @@ def _doc_features(doc_id: Optional[str]) -> list[dict]:
         except Exception:  # noqa: BLE001
             return []
     try:
-        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
         tree = cb.call("doc_tree", {"doc_id": doc_id}) or {}
         feats = ((tree.get("tree") or {}).get("features")) or []
         return [f for f in feats if isinstance(f, dict)]
@@ -105,7 +105,7 @@ def _query_geometry_faces(doc_id: Optional[str]) -> list[dict]:
     faces: list[dict] = []
     # Prefer planar faces via engine query.
     try:
-        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
         for q in (
             {"of": "face", "surf": "plane"},
             {"of": "face"},
@@ -134,7 +134,7 @@ def _bbox_extents(doc_id: Optional[str]) -> Optional[dict]:
     if not doc_id:
         return None
     try:
-        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
         mass = cb.call("eval_mass", {"doc_id": doc_id}) or {}
         bb = (
             mass.get("bbox")
@@ -159,7 +159,7 @@ def _bbox_extents(doc_id: Optional[str]) -> Optional[dict]:
         pass
     # query_geometry fallback for whole body.
     try:
-        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
         raw = cb.call("doc_query", {
             "doc_id": doc_id,
             "query": {"of": "body"},
@@ -285,7 +285,7 @@ def _is_drawing_doc(doc_id: Optional[str]) -> bool:
     if not doc_id:
         return False
     try:
-        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
         full = cb.call("drawing_get", {"doc_id": doc_id}) or {}
         if full.get("_is_error") or full.get("error"):
             return False
@@ -646,19 +646,19 @@ def _get_fn(module_key: str, fn_name: str):
         from mcp.server.fastmcp import FastMCP
         _mcp = FastMCP(f"battery-{module_key}")
         if module_key == "cad":
-            from mcp_server.cad_tools import register_cad_tools
+            from services.mcp.cad_tools import register_cad_tools
             register_cad_tools(_mcp)
         elif module_key == "recon":
-            from mcp_server.recon_tools import register_recon_tools
+            from services.mcp.recon_tools import register_recon_tools
             register_recon_tools(_mcp)
         elif module_key == "ecad":
-            from mcp_server.ecad_tools import register_ecad_tools
+            from services.mcp.ecad_tools import register_ecad_tools
             register_ecad_tools(_mcp)
         elif module_key == "cam":
-            from mcp_server.cam_tools import register_cam_tools
+            from services.mcp.cam_tools import register_cam_tools
             register_cam_tools(_mcp)
         elif module_key == "intake":
-            from mcp_server.intake_tools import register_intake_tools
+            from services.mcp.intake_tools import register_intake_tools
             register_intake_tools(_mcp)
         _PRIVATE_MCP[module_key] = _mcp
     mcp = _PRIVATE_MCP[module_key]
@@ -673,7 +673,7 @@ def _get_fn(module_key: str, fn_name: str):
 # ---------------------------------------------------------------------------
 
 def _cur_doc() -> str:
-    from mcp_server.cad_tools import _CUR
+    from services.mcp.cad_tools import _CUR
     d = _CUR.get("doc_id")
     if not d:
         raise ValueError("No current document")
@@ -693,8 +693,8 @@ def _gap_is_manifold(doc_id: str = None, **_) -> str:
     tiny_edges warnings on curved seams/poles are cosmetic and do NOT fail manifold.
     Falls back to ``free_edges`` scalar if the issues list is absent (forward-compat).
     """
-    from mcp_server import core_bridge as cb
-    from mcp_server.core_bridge import CoreError
+    from services.mcp import core_bridge as cb
+    from services.mcp.core_bridge import CoreError
     d = doc_id or _cur_doc()
     try:
         r = cb.call("eval_check", {"doc_id": d})
@@ -730,8 +730,8 @@ def _gap_eval_check_direct(doc_id: str = None, **_) -> str:
     Not ok = any issue with kind=="free_edges" OR severity=="error".
     Falls back to the scalar fields if the issues list is absent (forward-compat).
     """
-    from mcp_server import core_bridge as cb
-    from mcp_server.core_bridge import CoreError
+    from services.mcp import core_bridge as cb
+    from services.mcp.core_bridge import CoreError
     d = doc_id or _cur_doc()
     try:
         r = cb.call("eval_check", {"doc_id": d})
@@ -751,7 +751,7 @@ def _gap_round_trip(doc_id: str = None, threshold: float = 99.0, **_) -> str:
     """Export STEP → re-import → compare_parts. match_pct >= threshold + eval_check clean."""
     import tempfile
     import os
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
     d = doc_id or _cur_doc()
     step = tempfile.mktemp(suffix=".step")  # noqa: S306 — same pattern as cad_tools._tmp
     try:
@@ -790,7 +790,7 @@ def _gap_groundedness(model_text: str = "", doc_id: str = None, **_) -> str:
     lengths, diameters, counts) merged with the mass properties (volume, mass,
     com). Unmentioned state slots are never penalized, so the breadth is safe.
     """
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
     d = doc_id or _cur_doc()
     state: dict = {}
     try:
@@ -811,7 +811,7 @@ def _gap_groundedness(model_text: str = "", doc_id: str = None, **_) -> str:
 
 def _gap_unit_sanity(doc_id: str = None, **_) -> str:
     """Range-check all numeric quantities in the doc's mass properties."""
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
     from services.verify.unit_ranges import check_unit_ranges
     d = doc_id or _cur_doc()
     try:
@@ -833,7 +833,7 @@ def _gap_dim_coverage(doc_id: str = None, source_doc_id: str = None, **_) -> str
     mega-15: when the mission has no drawing (mechanical doc / airframe), honest
     SKIP — not a zero-score FAIL. A check that CAN run (drawing open) still runs.
     """
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
     d = doc_id or _cur_doc()
     # Honest SKIP when no drawing in mission scope (not a drawing doc).
     if not _is_drawing_doc(d):
@@ -935,7 +935,7 @@ def _gap_interface_check(doc_id: str = None, fastener: str = None, components: l
 def _layout_coverage_cb():
     """Return core_bridge for layout_coverage (lazy import, patchable in tests)."""
     try:
-        from mcp_server import core_bridge as _cb
+        from services.mcp import core_bridge as _cb
         return _cb
     except Exception:  # noqa: BLE001
         return None
@@ -1084,7 +1084,7 @@ def _gap_power_budget(doc_id: str = None, power_source: dict = None,
                       **_) -> str:
     """T-FIN23 system power/energy budget as a verify check.
 
-    Delegates to mcp_server.power_budget.solve_power_budget: rail tree
+    Delegates to services.mcp.power_budget.solve_power_budget: rail tree
     (source → converters → boardphys loads), duty-cycle weighting from an
     aicad.powerprofile/1 artifact, PDN cross-check, battery-life verdict.
     Without a power_source kwarg the check passes with a skip note (the battery's
@@ -1095,7 +1095,7 @@ def _gap_power_budget(doc_id: str = None, power_source: dict = None,
         return json.dumps({"ok": True, "findings": [],
                            "note": "no power_source specified — power budget skipped"})
     try:
-        from mcp_server.power_budget import solve_power_budget, _load_json
+        from services.mcp.power_budget import solve_power_budget, _load_json
         board = power_board
         if board is None and board_path:
             board = _load_json(board_path, "boardphys sidecar")

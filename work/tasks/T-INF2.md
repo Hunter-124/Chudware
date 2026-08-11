@@ -94,7 +94,7 @@ Result: 0 drift rows (was 12), exit 0.
 
 ### Scope note: pytest FAIL-RECORDED lines remain
 
-gate.sh still emits `FAIL-RECORDED` for `pytest/mcp_server`, `pytest/services`,
+gate.sh still emits `FAIL-RECORDED` for `pytest/services.mcp`, `pytest/services`,
 `pytest/engine_oracle` — pre-existing failures explicitly attributed to T-V2 in
 gate.sh's own inline comments. These are not in T-INF2 scope and are NOT caused by
 this change. The check.py line (this task's target) now shows `PASS` in the summary.

@@ -40,7 +40,7 @@ tilted holes — a real shop's bread and butter. Audit: work/audits/CAM_AUDIT.md
       levels each with non-empty regions; `profile` → non-empty [z,x] silhouette. Both asserted.
 - [x] core build + ctest + cam tool tests green; `graphify update .` run (23737 nodes).
       core build PASS; ctest 100% (42/42); cam smoke test 41 checks / 0 failures (15 pre-existing +
-      26 new, run via `CHUDWARE_LIBCHUDWARE=…/libchudware.so python -m mcp_server.test_cam_tools`).
+      26 new, run via `CHUDWARE_LIBCHUDWARE=…/libchudware.so python -m services.mcp.test_cam_tools`).
 
 ## Closeout / verification (opus-flint, 2026-07-03)
 
@@ -48,8 +48,8 @@ Scope: `core/cam/extract.cpp` `holes_json` rewrite (audit D7) + `services/mcp/te
 (new `_check_hole_extraction`). No new deps (gp_Cone.hxx; BRepAdaptor_Surface already imported).
 
 TEST INVOCATION (the cam suite is a plain main() runner needing the engine, NOT collected by the
-gate's `pytest engine/doc agent` stage):
-  `CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so ~/.local/share/Chudware/mcp-venv/bin/python -m mcp_server.test_cam_tools`
+gate's `pytest engine/doc services/agent` stage):
+  `CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so ~/.local/share/Chudware/mcp-venv/bin/python -m services.mcp.test_cam_tools`
   → ALL CAM SMOKE CHECKS PASSED (41 checks, 0 failures; deterministic across reruns).
 
 Fixtures built via the engine (add_features → STEP → cam_extract), asserting RECORDS not counts:

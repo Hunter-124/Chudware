@@ -41,9 +41,9 @@ from typing import Optional, Union
 
 from mcp.server.fastmcp import FastMCP
 
-from mcp_server import core_bridge as cb
-from mcp_server.cad_tools import _CUR, _doc, _dumps, _err, _publish_current, _read_prompt
-from mcp_server.gsl_tools import _axis_order
+from services.mcp import core_bridge as cb
+from services.mcp.cad_tools import _CUR, _doc, _dumps, _err, _publish_current, _read_prompt
+from services.mcp.gsl_tools import _axis_order
 
 # ---------------------------------------------------------------------------
 # T-F13: hypothesis-ranker hook (flag-gated, default OFF)

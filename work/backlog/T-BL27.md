@@ -55,7 +55,7 @@ reads as broken.
   core/CMakeLists.txt as ctest `surfacing`): cut-through (regression guard), coincident-patch,
   and smaller-than-target-footprint cases all heal and assert on the resulting solid's volume.
   Verified: `ctest --test-dir core/build-occt-linux` 43/43 pass; `bash scripts/gate.sh` →
-  RESULT: PASS (pytest/mcp_server, /services, /engine_oracle FAIL-RECORDED are pre-existing,
+  RESULT: PASS (pytest/services.mcp, /services, /engine_oracle FAIL-RECORDED are pre-existing,
   owned by T-V2; unrelated docs/manual/contracts.md regen drift left untouched, out of scope).
   `graphify update .` run. Branch pushed, status -> review.
 - 2026-07-05 [opus-sweep] Merge-integrator: master had independently landed T-BL28's own

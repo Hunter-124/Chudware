@@ -11,6 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +28,7 @@
 #include "evaluate_dialogs.h"
 #include "manufacture/manufacture_panel.h"
 #include "property_manager.h"
+#include "onboarding.h"
 #include "sim_manager.h"
 #include "sketch_mode.h"
 #include "sketch3d_mode.h"
@@ -1028,6 +1030,9 @@ void ScenarioRunner::tick(AppState& st) {
     // ---------- appearance scenario (CHUDWARE_SHOT=appearance) ----------
     runAppearance(st);
 
+    // ---------- first-run onboarding scenario (CHUDWARE_SHOT=onboarding) ----------
+    runOnboarding(st);
+
     // ---------- T-G15 icon pipeline (CHUDWARE_SHOT=iconpipe) ----------
     runIconPipe(st);
 
@@ -1039,6 +1044,63 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- motion scenario (CHUDWARE_SHOT=motion) ----------
     runMotion(st);
+}
+
+// First-run onboarding visual proof. Each step is forced through the public scenario seam, so a
+// developer's existing onboarding.completed_version can never turn this into a false-positive
+// capture of the normal workspace.
+void ScenarioRunner::runOnboarding(AppState& st) {
+    if (!obInit) {
+        obInit = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        obWant = st.shot && mode && std::strcmp(mode, "onboarding") == 0;
+    }
+    if (!obWant || obDone || st.frame < 3) return;
+    if (!obDirReady) {
+        obDirReady = true;
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        const std::string base = repo ? repo : ".";
+        obSavePath = base + "/scratch/onboarding_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(obSavePath, ec);
+    }
+    if (!obCapture.empty()) return;
+    if (obSettle > 0) {
+        // Reassert while settling. The first popup submission can coincide with startup popup
+        // bookkeeping; repeatedly forcing the same step guarantees capture never races that frame.
+        forceOnboardingForScenario(std::clamp((obPhase - 1) / 2, 0, 3));
+        --obSettle;
+        return;
+    }
+
+    static const char* kNames[] = {
+        "onboarding_01_account.png",
+        "onboarding_02_power.png",
+        "onboarding_03_test.png",
+        "onboarding_04_workspace.png",
+    };
+    const int step = obPhase / 2;
+    if (step < 4) {
+        if ((obPhase % 2) == 0) {
+            forceOnboardingForScenario(step);
+            obSettle = 8;
+        } else {
+            obCapture = obSavePath + "/" + kNames[step];
+        }
+        ++obPhase;
+        return;
+    }
+
+    if (const char* verify = std::getenv("CHUDWARE_ONBOARDING_VERIFY_MERGE");
+        verify && verify[0] && verify[0] != '0') {
+        const bool ok = persistOnboardingCompletion();
+        std::printf("onboarding: merge persistence %s via %s\n",
+                    ok ? "PASS" : "FAILED", configPath().c_str());
+        std::fflush(stdout);
+    }
+    obDone = true;
+    std::printf("onboarding: scenario complete\n");
+    std::fflush(stdout);
 }
 
 // T-G15 icon pipeline (CHUDWARE_SHOT=iconpipe). Recipe-driven clean-viewport icon generator: reads a
@@ -2044,6 +2106,25 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         }
         glfwSwapBuffers(st.win);
         return apDone ? FrameAction::Break : FrameAction::Continue;
+    }
+
+    // onboarding scenario: one capture per wizard step. The final workspace step is mirrored to
+    // --ui-screenshot; all four remain in scratch/onboarding_shots for visual inspection.
+    if (obWant) {
+        ++st.frame;
+        if (!obCapture.empty()) {
+            const char* mirror =
+                obCapture.find("onboarding_04_workspace") != std::string::npos
+                    ? screenshotPath
+                    : nullptr;
+            writeBackbufferPng(obCapture.c_str(), dw, dh, mirror);
+            std::printf("onboarding screenshot -> %s (%dx%d)\n",
+                        obCapture.c_str(), dw, dh);
+            std::fflush(stdout);
+            obCapture.clear();
+        }
+        glfwSwapBuffers(st.win);
+        return obDone ? FrameAction::Break : FrameAction::Continue;
     }
 
     // RE-28 reveng_splat scenario: the PNG is rendered + written in tick() (own-FBO drain, like

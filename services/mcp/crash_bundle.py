@@ -96,7 +96,7 @@ _MAX_BUNDLES = 20  # oldest pruned when this is exceeded
 def _log_tail(n: int = _MAX_LOG_TAIL_LINES) -> list[str]:
     """Return the last *n* lines from the stderr log (best-effort)."""
     try:
-        log_path = _crash_dir().parent / "mcp_server.log"
+        log_path = _crash_dir().parent / "services.mcp.log"
         if log_path.exists():
             lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
             return lines[-n:]

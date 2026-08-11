@@ -48,7 +48,7 @@ _MATRIX = [
     ("inspect_part",                    True, True, True, True, False),
     ("dag_run",                         True, False, True, False, False),
     # T-file-floor: agent_default_tools main-agent floor. Absent from ask/
-    # plan mode_tools and shared_default_tools -> unrestricted agent/swarm
+    # plan mode_tools and shared_default_tools -> unrestricted services/agent/swarm
     # only (no role card here, so both are None-unrestricted regardless).
     ("fs_write",                        True, False, True, False, False),
     ("fs_edit",                         True, False, True, False, False),
@@ -153,7 +153,7 @@ class TestRoleCardSemantics:
 
     def test_ask_plan_do_not_gain_agent_default_floor(self):
         # T-file-floor: fs_write/fs_edit/fs_list/run_shell are the main-agent
-        # (agent/swarm-only) floor; ask/plan keep only the read-only shared
+        # (services/agent/swarm-only) floor; ask/plan keep only the read-only shared
         # floor and must never gain them, narrowing role card or not.
         ask_out = cmt.apply_mode_tools("ask", ["describe_part"])
         plan_out = cmt.apply_mode_tools("plan", ["describe_part"])

@@ -16,7 +16,7 @@ from typing import Annotated, Any, Literal, Optional
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
-from mcp_server.cad_tools import _dumps, _err
+from services.mcp.cad_tools import _dumps, _err
 
 # The interaction core (canonical import path: services.agent.*). Question
 # normalization / bad-arguments teaching lives HERE (ONE definition shared

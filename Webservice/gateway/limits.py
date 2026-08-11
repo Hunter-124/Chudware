@@ -85,6 +85,19 @@ api_writes = RateLimiter(settings.rate_writes_per_min, 60.0)
 uploads = RateLimiter(settings.rate_uploads_per_min, 60.0)
 chat_messages = RateLimiter(settings.rate_chat_per_min, 60.0)
 
+# Pre-authentication limiters. Every other limiter above keys on the
+# AUTHENTICATED email, which is exactly what an unauthenticated endpoint does
+# not have — so these two key on the SUBMITTED email and on the client address
+# instead, and are deliberately far tighter as a result.
+#
+# Both are enforced before any password hashing: argon2 at 64 MiB a go is a
+# denial-of-service amplifier if an attacker can spend it for free, and the
+# per-email budget is what actually caps a targeted guess at 5 tries per
+# 15 minutes. The per-address budget is 4x looser so that a shared NAT, an
+# office, or a university does not lock itself out over one forgetful user.
+login_by_email = RateLimiter(5, 900.0)
+login_by_ip = RateLimiter(20, 900.0)
+
 
 def user_slug(email: str) -> str:
     """Filesystem-safe, collision-free per-user directory name.
@@ -168,6 +181,8 @@ __all__ = [
     "api_writes",
     "uploads",
     "chat_messages",
+    "login_by_email",
+    "login_by_ip",
     "user_slug",
     "enforce_upload_size",
     "dir_size_bytes",

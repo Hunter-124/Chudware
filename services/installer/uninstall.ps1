@@ -59,9 +59,9 @@ $app = Join-Path $InstallDir "app"
 if ((Test-Path $venvPy) -and (Test-Path $app)) {
     Write-Host "==> Unregistering MCP server ..."
     Push-Location $app
-    & $venvPy -m installer.register_mcp --unregister
+    & $venvPy -m services.installer.register_mcp --unregister
     Write-Host "==> Unregistering file associations ..."
-    & $venvPy -m installer.setup_file_assoc --unregister
+    & $venvPy -m services.installer.setup_file_assoc --unregister
     Pop-Location
 }
 

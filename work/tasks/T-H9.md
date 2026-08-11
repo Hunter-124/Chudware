@@ -89,10 +89,10 @@ registration append-only.
 
 TEST COUNTS (mcp-venv; run from repo root — NOTE the `mcp` SDK vs local `mcp/` dir collision:
 these are TWO separate invocations, do NOT combine paths in one pytest call):
-- `python -m pytest services/serving/test_routing.py services/serving/test_promotion.py agent/test_vllm_provider.py -q`
+- `python -m pytest services/serving/test_routing.py services/serving/test_promotion.py services/agent/test_vllm_provider.py -q`
   → 38 passed, 5 skipped (SDK; verified 9/9 vllm with `pip install openai==2.41.0` in a scratch venv).
-- `python -m pytest mcp_server/test_serving_tools.py -q` → 5 passed (via the `mcp_server` symlink).
-- Full `python -m pytest agent -q` → 86 passed / 7 skipped / 15 pre-existing fails
+- `python -m pytest services/mcp/test_serving_tools.py -q` → 5 passed.
+- Full `python -m pytest services/agent -q` → 86 passed / 7 skipped / 15 pre-existing fails
   (14 = `test_loop_mock` `import build123d` missing optional engine dep; 1 =
   `test_providers_conformance::test_neutral_part_and_message_helpers`, a stale image_part
   `mime` assertion — BOTH verified failing on clean origin/master, not mine).
@@ -104,7 +104,7 @@ FAIL (known issue #6: gate uses system python3 → 0-collected/107-deselected; m
 implicated — real mcp-venv sweep above is green) · bench SKIP.
 
 BASELINE RED FLAGGED FOR FOREMAN (not mine, not on the known-reds list yet):
-`agent/test_providers_conformance.py::test_neutral_part_and_message_helpers` fails on clean
+`services/agent/test_providers_conformance.py::test_neutral_part_and_message_helpers` fails on clean
 origin/master — `base.py image_part` gained a `mime` key (T-F5) but the conformance assertion
 wasn't updated. One-line test fix; out of T-H9 scope.
 

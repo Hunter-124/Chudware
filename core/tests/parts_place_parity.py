@@ -60,7 +60,7 @@ def _install_stubs(step_path: str) -> None:
         return {}
 
     core_bridge.call = _call  # type: ignore[attr-defined]
-    import services.mcp  # real package (dual-name alias hook)
+    import services.mcp  # canonical package
     services.mcp.core_bridge = core_bridge  # type: ignore[attr-defined]
     sys.modules["services.mcp.core_bridge"] = core_bridge
 

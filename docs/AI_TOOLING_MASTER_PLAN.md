@@ -192,7 +192,7 @@ One provider stack, subscription-friendly, governing every agent surface:
   flagship path. The user's agent client *is* the copilot brain riding their own
   subscription, 100% ToS-clean. Invest in a first-run "Connect to Claude Code / Cursor /
   Codex / Gemini CLI" wizard that writes the client config (extend
-  `installer/setup_mcp_clients.py`), and adopt **MCP elicitation** (stable in the spec,
+  `services/installer/setup_mcp_clients.py`), and adopt **MCP elicitation** (stable in the spec,
   shipped in Claude Code) as a Pillar-9 transport. Do **not** build on MCP *sampling* —
   unimplemented by every major client and deprecated in the MCP draft spec (2026-07-28).
 - **Session auth (researched 2026-07, updated 2026-07-07):**

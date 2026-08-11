@@ -22,7 +22,7 @@ Policies:
   * agent — full (None = unrestricted at mode layer; role card still applies)
   * swarm — full + explicit corporate/delegate tools kept in the set
 
-Subagents (``delegate``) stay available in agent/swarm/edit/plan. Ask also
+Subagents (``delegate``) stay available in services/agent/swarm/edit/plan. Ask also
 gets shared defaults (doc lifecycle + advise + web) so it never dead-ends.
 """
 from __future__ import annotations
@@ -89,7 +89,7 @@ SWARM_EXTRA_TOOLS: frozenset[str] = frozenset(_CONTRACT["swarm_extra_tools"])
 
 # Always-on MAIN-agent loadout (file handling, shell, web fetch) unioned onto
 # the advertised list AND the dispatch policy for unrestricted modes
-# (agent/swarm) even when a role card narrows the tool list. Absent key ->
+# (services/agent/swarm) even when a role card narrows the tool list. Absent key ->
 # empty (older contracts without the floor keep prior behavior).
 AGENT_DEFAULT_TOOLS: frozenset[str] = frozenset(_CONTRACT.get("agent_default_tools", ()))
 
@@ -137,7 +137,7 @@ def apply_mode_tools(
 ) -> Optional[list[str]]:
     """Apply mode policy while preserving open-vs-explicit tool scopes.
 
-    ``role_tools=None`` means unrestricted in agent/swarm. An explicit empty
+    ``role_tools=None`` means unrestricted in services/agent/swarm. An explicit empty
     iterable still receives the applicable always-on floor. Child turns use
     :data:`SUBAGENT_DEFAULT_TOOLS`; main turns use
     :data:`AGENT_DEFAULT_TOOLS`.

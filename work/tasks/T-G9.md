@@ -92,7 +92,7 @@ is the production GUI on Linux; `host/` survives only until T-G11's Windows chec
   normalized domain request slice (engine-minted ids canonicalized; pure catalog reads
   order-free; timings/paths scrubbed — scrub lists are explicit in the code), then for
   gcode/DXF/PDF replay each binary's captured state-building requests through
-  mcp_server.core_bridge (same libchudware) and byte-diff the artifacts host-derived vs
+  services.mcp.core_bridge (same libchudware) and byte-diff the artifacts host-derived vs
   aicad2-derived. Results (fresh captures, both binaries):
     - gcode: requests PASS; all 8 post dialects byte-identical (centroid/fanuc/grbl/haas/
       linuxcnc/mach3/marlin/siemens .nc)

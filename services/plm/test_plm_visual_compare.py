@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from mcp_server import core_bridge
+from services.mcp import core_bridge
 from services.plm import compare as compare_mod
 from services.plm import release as release_mod
 from services.plm import snapshot, worker_rpc

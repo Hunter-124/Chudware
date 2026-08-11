@@ -26,8 +26,8 @@ from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from mcp_server.cad_tools import _dumps, _err
-from mcp_server import core_bridge as cb
+from services.mcp.cad_tools import _dumps, _err
+from services.mcp import core_bridge as cb
 
 
 def _cam_setup_material(tree: Any) -> Optional[str]:

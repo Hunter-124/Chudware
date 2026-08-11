@@ -6,7 +6,7 @@ expert) before treating any DIVERGE as a confirmed bug.
 
 **Date**: 2026-06-15  
 **Python solver**: `engine/doc/sketch_solver.py` (`solve_sketch`)  
-**Runner**: `corpus_sw_parity/_run_fixtures.py`  
+**Runner**: `corpora/sw_parity/_run_fixtures.py`  
 **Total fixtures**: 18 across 6 families  
 **Result**: 9 AGREE · 9 DIVERGE · 0 ERROR
 
@@ -155,7 +155,7 @@ reference to one of the lines.
 fallback unit direction (+x) in BOTH engines (`_add_tangent_circle_circle` in
 `engine/doc/sketch_solver.py` and `add_tangent_circle_circle` in
 `core/sketch/sketch.cpp`). Newton now has a position gradient and separates the
-centers cleanly. Regression guard fixture: `corpus/hardening_tangent_cc_coincident.json`
+centers cleanly. Regression guard fixture: `corpora/sketch/hardening_tangent_cc_coincident.json`
 (passes Python↔C++ parity: dof=0, converged=True, conflicting=[]).
 
 **Resolved geometry to confirm against SolidWorks** (guard fixture: e1 = circle
@@ -257,7 +257,7 @@ length separately and use coincidents to form the rectangle.
 ### Priority 1 — HIGH CONFIDENCE (submit to owner for SW validation)
 
 **BUG-1: Tangent circle-circle Jacobian degeneracy at d=0 (F4e) — RESOLVED 2026-06-15**  
-File: `F4e_coincident_circle_centers_tangent.json` (guard: `corpus/hardening_tangent_cc_coincident.json`)  
+File: `F4e_coincident_circle_centers_tangent.json` (guard: `corpora/sketch/hardening_tangent_cc_coincident.json`)  
 When two circles shared coincident centers and a tangent constraint was applied, the solver returned
 zero position Jacobians and could not separate the centers — it corrupted the radii via least-squares
 instead. **Fixed**: the `if d < 1e-12` guard in the circle-circle tangent Jacobian now uses a

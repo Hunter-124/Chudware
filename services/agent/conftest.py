@@ -1,7 +1,7 @@
 """Suite-wide isolation guards for services/agent.
 
 Only one guard lives here so far: the MCP tool catalog is a PROCESS-GLOBAL
-singleton (``mcp_server.tool_registry``), and several modules in this suite
+singleton (``services.mcp.tool_registry``), and several modules in this suite
 deliberately rebuild it — ``clear_catalog()`` for a controlled clean room, then
 ``register_*_tools`` against a throwaway stub MCP (``test_org.py``,
 ``test_roles.py``, ``test_tool_registry.py``). None of them restore it, so a
@@ -29,7 +29,7 @@ def _catalog_fingerprint() -> tuple:
     tags under a per-role cap — so a retagged catalog silently reshuffles which
     tools win a seat even when every name is still present.
     """
-    from mcp_server import tool_registry as reg
+    from services.mcp import tool_registry as reg
     return tuple(sorted(
         (name, (meta or {}).get("family"), (meta or {}).get("risk"))
         for name, meta in (reg.catalog() or {}).items()
@@ -40,7 +40,7 @@ def _catalog_fingerprint() -> tuple:
 def _warm_catalog_fingerprint() -> tuple:
     """Fingerprint of the fully warmed catalog, measured once per session."""
     try:
-        from mcp_server import tool_registry as reg
+        from services.mcp import tool_registry as reg
         reg.warm_catalog()
         fp = _catalog_fingerprint()
     except Exception:  # pragma: no cover - registry unavailable
@@ -64,7 +64,7 @@ def _restore_warm_tool_catalog(_warm_catalog_fingerprint: tuple):
     if not _warm_catalog_fingerprint:
         return
     try:
-        from mcp_server import tool_registry as reg
+        from services.mcp import tool_registry as reg
         if _catalog_fingerprint() != _warm_catalog_fingerprint:
             reg.clear_catalog()
             reg.warm_catalog()

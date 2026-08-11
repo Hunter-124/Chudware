@@ -64,7 +64,7 @@ def is_offline() -> bool:
     reading ``config.json`` directly if the agent package is unavailable. Fails
     *closed to online* only when nothing is configured (default is online)."""
     try:
-        from agent import config as _cfg  # type: ignore
+        from services.agent import config as _cfg  # type: ignore
 
         return bool(_cfg.offline_enabled())
     except Exception:  # noqa: BLE001 — agent package may not be importable in all contexts

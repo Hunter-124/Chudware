@@ -71,7 +71,7 @@ def _multi_manifest() -> dict:
     return m
 
 
-# mega-8: the multi-domain PLAN/BUILD soft gate (dag/node_runner.py) refuses a
+# mega-8: the multi-domain PLAN/BUILD soft gate (services/dag/node_runner.py) refuses a
 # bare auto-complete on gated nodes (n_plan) — the done-mock agent must carry a
 # schema-valid typed refusal or n_plan escalates to failed and the PLAN phase
 # soft-reconciles (entered, never exited) instead of recording its exit gate.

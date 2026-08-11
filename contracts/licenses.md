@@ -74,7 +74,7 @@
 | LibreOffice headless (T-F14, optional) | MPL-2.0 | office → PDF for `render_document` previews | **subprocess-only**, PATH-discovered, never bundled |
 | pypdf (T-office) | BSD-3 | PDF metadata + page ops (read/rotate/delete/merge, `services/mcp/office_tools.py` office_edit_pdf) | ok. In-process, pure-Python, permissive — same posture as pypdfium2 above. |
 | **BOLTS** (boltsparts) | **GPL-3.0** | standard-part spec reference | **NEVER vendored or linked** (T-B4). Same clean-room posture as KiCad: we learn the `.blt` *format* (documented → interop) and reimplement; no BOLTS data or code enters the tree. A user may point our loader at their own BOLTS checkout (their license, their choice). |
-| clean-room ISO/DIN part tables (`engine_oracle/data/bolts/*.blt.yaml`) | project (dimensional data) | deterministic spec-sheet lookup (T-B4) | ok — published ISO/DIN **nominal dimensions are not copyrightable** (same posture as the IPC-7351 row below); transcribed from our own `agent/prompts/shared/cheatsheets/hardware.md` + `core/parts/parts_data.h`, NOT from BOLTS. GPL-clean. |
+| clean-room ISO/DIN part tables (`engine_oracle/data/bolts/*.blt.yaml`) | project (dimensional data) | deterministic spec-sheet lookup (T-B4) | ok — published ISO/DIN **nominal dimensions are not copyrightable** (same posture as the IPC-7351 row below); transcribed from our own `services/agent/prompts/shared/cheatsheets/hardware.md` + `core/parts/parts_data.h`, NOT from BOLTS. GPL-clean. |
 | **fluids** | **MIT** | piping module: ASME B36.10M/B36.19M pipe schedule tables (`fluids.piping.nearest_pipe`) for `engine/piping/catalog.py` | ok. Pure-Python (numpy/scipy dep already present); optional at runtime — `catalog.nearest_pipe` degrades contract-shaped when absent. Fitting geometry is our own CSV of public manufacturer dims — ASME standard text is **not** bundled (dimensions are facts, not copyrightable). |
 | **probe-rs** (T-C4) | **MIT / Apache-2.0** | hardware flash/debug path: `engine/firmware/hardware.py` `ProbeRsFlasher` + `ProbeRsDebugger` — `probe-rs download` / `probe-rs reset` / `probe-rs read` subcommands | ok. **subprocess-only**, PATH-discovered, never vendored or linked. Dual MIT/Apache-2.0 — both permissive. Absent binary degrades gracefully (`success=False`). |
 | **esptool** | **GPL-2.0+** | ESP32 flash path: `engine/firmware/hardware.py` `EsptoolFlasher` — `esptool.py write_flash` subprocess | ok. **subprocess-only** (GPL-2.0+ isolation — same policy as QEMU/arduino-cli/ngspice). PATH-discovered, never vendored, never imported in-process. Absent binary degrades gracefully (`success=False`). |
@@ -100,7 +100,7 @@
 
 Rules:
 - Adding any dependency requires a row here in the same change.
-- `installer/build_release.py` gains (M10) a license-manifest step that dumps wheel METADATA
+- `services/installer/build_release.py` gains (M10) a license-manifest step that dumps wheel METADATA
   licenses into `dist/Chudware/licenses/` for shipped wheels.
 
 ## ECAD module posture (see `ECAD_PLAN.md §2.1`)

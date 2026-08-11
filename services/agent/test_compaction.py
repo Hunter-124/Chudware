@@ -1,4 +1,4 @@
-"""OMP-port compaction engines (services.agent.compaction) — pure / offline.
+"""OMP-port compaction engines (agent.compaction) — pure / offline.
 
 (The legacy loop.py overflow-helper tests that used to live here were removed in
 T-RF5 with the loop itself.)
@@ -10,7 +10,7 @@ from services.agent import config as agent_config
 
 
 # ---------------------------------------------------------------------------
-# OMP-port engines (services.agent.compaction) — pure / offline
+# OMP-port engines (agent.compaction) — pure / offline
 # ---------------------------------------------------------------------------
 
 

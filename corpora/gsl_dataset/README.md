@@ -16,7 +16,7 @@ python3 tools/gsl_dataset_gen.py --count 5 --render    # + render.png per sample
 
 Run from the repo root; requires the built C++ core (`libchudware.so` under
 `core/build-linux/bin` or `core/build-occt-linux/bin`, resolved by
-`mcp_server/core_bridge.py`).
+`services/mcp/core_bridge.py`).
 
 ## Families (7)
 

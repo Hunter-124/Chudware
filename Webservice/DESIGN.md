@@ -12,8 +12,8 @@ no pixel streaming, and no session manager: every signed-in account shares one
 
 ```mermaid
 flowchart LR
-  B[Browser: WASM /app] -->|HTTPS/WSS| CF[Cloudflare Tunnel + Access\nGoogle IdP allowlist + ua.edu email OTP]
-  CF -->|Cf-Access-Jwt-Assertion| GW[Gateway: FastAPI on 127.0.0.1:8300\nauth + /engine bridge + workspace/bucket + chat WS + admin]
+  B[Browser: WASM /app] -->|HTTPS/WSS| CF[Cloudflare Tunnel\nsole ingress; Access gates /admin only]
+  CF -->|chudware_sid session cookie| GW[Gateway: FastAPI on 127.0.0.1:8300\nself-serve auth + /engine bridge + workspace/bucket + chat WS + admin]
   GW -->|unix socket, NDJSON-RPC| WD[(chudware-hostd\nONE shared daemon)]
   GW --> WS[(~/chudware-web-data/workspace/&lt;slug&gt;\nper-account trees)]
   GW --> PLM[(~/chudware-web-data/plm/*.git\ncentral bare vaults)]
@@ -25,11 +25,16 @@ flowchart LR
    (`Webservice/gateway/engine_bridge.py` ↔ `services/ipc/ipc_transport_wasm.cpp`),
    a byte-for-byte RPC/event pass-through, so engine/AI behavior is identical by
    construction. See `Webservice/README.md`.
-2. **Auth**: Cloudflare Tunnel + Access. IdPs: Google (exact-email allowlist) + One-Time PIN
-   for listed ua.edu addresses. Honest wording: OTP is email-verified school mailbox, NOT
-   Entra OAuth. Phase-2 upgrade paths in RUNBOOK. Gateway MUST verify
-   `Cf-Access-Jwt-Assertion` (iss/aud/exp vs team JWKS, 6-week key rotation) and map
-   `email → user record`. `CHUDWARE_WEB_DEV=1` bypass for local testing only.
+2. **Auth**: self-serve, inside the gateway. `POST /api/auth/register` takes an email and
+   an argon2id-hashed password and mails a verification link; redeeming it activates the
+   account on a 14-day trial (`CHUDWARE_WEB_TRIAL_DAYS`) and signs the visitor in. Optional
+   Google/GitHub OAuth lands on the same account rows. A login writes a server-side session
+   row and sets the `chudware_sid` cookie; the gateway resolves that cookie to an account and
+   reads status/role/plan from the account store on every request — never from the client.
+   Cloudflare Tunnel is still the only ingress, and Cloudflare Access is kept in front of
+   `/admin`: when an Access credential is present the gateway MUST verify
+   `Cf-Access-Jwt-Assertion` (iss/aud/exp vs team JWKS, 6-week key rotation) instead of the
+   cookie. `CHUDWARE_WEB_DEV=1` bypass for local testing only.
 3. **PLM**: NO shared working-tree mount. Central bare folder remotes
    `~/chudware-web-data/plm/<project>.git`; per-account private clone under that
    account's workspace root.
@@ -57,9 +62,12 @@ flowchart LR
 ## Component contract
 - Gateway (port 8300): `/` portal; `/app` WASM client; `/engine` WS bridge to the shared
   daemon; `/workspace/*` and `/bucket/*` per-account file APIs; `/files/aicm` mesh fetch;
-  `/ws/chat`; `/api/admin/*` allowlist + ops + terminal + releases; `/api/billing/*`;
+  `/ws/chat`; `/api/auth/*` register/login/verify/reset + OAuth start/callback;
+  `/api/admin/*` account approvals + ops + terminal + releases; `/api/billing/*`;
   `/healthz` (bare `{ok}` anonymous; RAM/VRAM/presence/engine-bridge detail authenticated).
-- Users file: `Webservice/gateway/users.yaml` — `email, display, role(admin|user), heavy(bool)`.
+- Account store: PostgreSQL `accounts` — `email, display, role(admin|user), plan,
+  status(pending|active|denied|suspended), heavy` — plus credential, session and
+  email-token tables (`Webservice/gateway/migrations/*.sql`). No file-based allowlist.
 - Data root: `~/chudware-web-data/{workspace,bucket,plm,chat.db,logs}`.
 
 ## Monitoring (advisor §C)

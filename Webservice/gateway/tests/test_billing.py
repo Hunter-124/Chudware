@@ -34,9 +34,9 @@ os.environ.setdefault(
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-import gateway.auth as auth_mod  # noqa: E402
-from gateway import billing, plans  # noqa: E402
-from gateway.auth import AuthMiddleware, UserDirectory  # noqa: E402
+from gateway import accounts, billing, plans  # noqa: E402
+from gateway.auth import AuthMiddleware  # noqa: E402
+from gateway.config import settings  # noqa: E402
 
 DEV_HEADERS = {"X-Dev-User": "demo@example.com"}
 VALID_SIG = "t=1,v1=valid"
@@ -155,30 +155,19 @@ def store():
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch, store):
+def client(pg, monkeypatch, store):
     """Full app: real AuthMiddleware (dev mode) + the billing router.
 
-    The webhook path is added to PUBLIC_PATHS here exactly the way the lead
-    must add it in auth.py for production.
+    Two stores are in play on purpose: AuthMiddleware authorizes from the real
+    account store (so the dev identity needs an active row there), while
+    billing's entitlement writes go to the injected FakeAccounts so the
+    webhook assertions stay hermetic.
     """
-    users = tmp_path / "users.yaml"
-    users.write_text(
-        "users:\n"
-        "  - email: demo@example.com\n"
-        "    display: Demo User\n"
-        "    role: user\n"
-        "    heavy: false\n"
-    )
-    monkeypatch.setattr(
-        auth_mod,
-        "PUBLIC_PATHS",
-        auth_mod.PUBLIC_PATHS | {"/api/billing/webhook"},
-    )
-    monkeypatch.setattr(
-        billing, "_events_db_path", lambda: tmp_path / "events.sqlite3"
-    )
+    monkeypatch.setattr(settings, "dev_mode", True)
+    accounts.ensure_account("demo@example.com", display="Demo User")
+    accounts.set_status("demo@example.com", "active", decided_by="test")
     app = FastAPI()
-    app.add_middleware(AuthMiddleware, directory=UserDirectory(users))
+    app.add_middleware(AuthMiddleware)
     app.include_router(billing.router)
     return TestClient(app)
 
@@ -224,6 +213,19 @@ class TestPlans:
         team = plans.limits_for("team")
         assert team.storage_quota_bytes > pro.storage_quota_bytes
         assert team.monthly_llm_tokens > pro.monthly_llm_tokens
+
+        # A trial is the full product for its window, so evaluating it means
+        # evaluating Pro's caps — not Free's.
+        trial = plans.limits_for("trial")
+        assert trial.storage_quota_bytes == pro.storage_quota_bytes
+        assert trial.monthly_llm_tokens == pro.monthly_llm_tokens
+
+    def test_only_paid_tiers_are_purchasable(self):
+        assert plans.is_purchasable("pro")
+        assert plans.is_purchasable("team")
+        assert not plans.is_purchasable("free")
+        # Granted by verifying an address, never sold — Checkout must refuse it.
+        assert not plans.is_purchasable("trial")
 
     def test_unknown_plan_rejected(self):
         with pytest.raises(ValueError):
@@ -415,6 +417,83 @@ class TestWebhookEntitlement:
         acct = store.get_account("demo@example.com")
         assert acct.plan == "pro"
         assert len(store.status_calls) == status_calls_after_first
+
+    def test_replay_against_the_real_store_mutates_exactly_once(
+        self, client, stripe_env, monkeypatch
+    ):
+        """The money bug, against Postgres rather than the in-memory fake.
+
+        The event-id row and the entitlement mutation share one transaction, so
+        a redelivery must leave exactly one processed_events row and exactly one
+        plan change — not two, and not one plus a partially applied second.
+        """
+        import accounts  # type: ignore
+        import db  # type: ignore
+
+        billing.set_account_store(accounts)
+        try:
+            accounts.ensure_account("payer@example.com", display="Payer")
+            _install_fake_stripe(monkeypatch, {})
+            event = _event(
+                "evt_real_1",
+                "checkout.session.completed",
+                {
+                    "client_reference_id": "payer@example.com",
+                    "customer": "cus_real",
+                    "metadata": {"chudware_plan": "pro"},
+                },
+            )
+            assert _post_webhook(client, event).json()["status"] == "processed"
+            assert _post_webhook(client, event).json()["status"] == "duplicate"
+            assert _post_webhook(client, event).json()["status"] == "duplicate"
+
+            with db.tx() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM processed_events WHERE event_id = %s",
+                    ("evt_real_1",),
+                )
+                assert cur.fetchone()["n"] == 1
+            acct = accounts.get_account("payer@example.com")
+            assert (acct.plan, acct.status, acct.stripe_customer_id) == (
+                "pro",
+                "active",
+                "cus_real",
+            )
+            # One decision recorded, not three.
+            assert acct.notes == "checkout.session.completed evt_real_1"
+        finally:
+            billing.set_account_store(None)
+
+    def test_a_failing_entitlement_rolls_back_the_event_id(self, client, stripe_env, monkeypatch):
+        """If the mutation blows up, the event id must NOT be recorded — Stripe's
+        retry has to be able to apply it. Same transaction, both or neither."""
+        import db  # type: ignore
+
+        class Exploding(FakeAccounts):
+            def set_plan(self, email, plan):
+                raise RuntimeError("store is down")
+
+        exploding = Exploding()
+        exploding.ensure_account("boom@example.com", "Boom")
+        billing.set_account_store(exploding)
+        try:
+            _install_fake_stripe(monkeypatch, {})
+            event = _event(
+                "evt_boom",
+                "checkout.session.completed",
+                {
+                    "client_reference_id": "boom@example.com",
+                    "customer": "cus_boom",
+                    "metadata": {"chudware_plan": "pro"},
+                },
+            )
+            with pytest.raises(RuntimeError, match="store is down"):
+                _post_webhook(client, event)
+            with db.tx() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM processed_events")
+                assert cur.fetchone()["n"] == 0
+        finally:
+            billing.set_account_store(None)
 
     def test_checkout_completed_adopts_stranger(
         self, client, store, stripe_env, monkeypatch

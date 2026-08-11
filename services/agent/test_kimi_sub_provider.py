@@ -16,8 +16,8 @@ from urllib.parse import parse_qs
 
 import pytest
 
-from agent.providers import sub_auth
-from agent.providers import usage
+from services.agent.providers import sub_auth
+from services.agent.providers import usage
 
 
 CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
@@ -106,7 +106,7 @@ def _form_fields(req) -> dict[str, str]:
 
 
 def test_provider_identity_and_common_headers(tmp_config):
-    from agent.providers.kimi_sub_provider import (
+    from services.agent.providers.kimi_sub_provider import (
         DEFAULT_MODEL as DM,
         KimiSubProvider,
         PROVIDER_ID as PID,
@@ -137,7 +137,7 @@ def test_provider_identity_and_common_headers(tmp_config):
 
 
 def test_login_device_posts_client_id_and_saves_credential(tmp_config, monkeypatch):
-    from agent.providers import kimi_sub_provider as ksp
+    from services.agent.providers import kimi_sub_provider as ksp
 
     calls: list[dict[str, Any]] = []
     poll_state = {"n": 0}
@@ -232,7 +232,7 @@ def test_login_device_posts_client_id_and_saves_credential(tmp_config, monkeypat
 
 
 def test_poll_authorization_pending_then_slow_down(tmp_config, monkeypatch):
-    from agent.providers import kimi_sub_provider as ksp
+    from services.agent.providers import kimi_sub_provider as ksp
 
     sleeps: list[float] = []
     phase = {"n": 0}
@@ -288,7 +288,7 @@ def test_poll_authorization_pending_then_slow_down(tmp_config, monkeypatch):
 
 
 def test_refresh_keeps_old_refresh_token_when_omitted(tmp_config, monkeypatch):
-    from agent.providers import kimi_sub_provider as ksp
+    from services.agent.providers import kimi_sub_provider as ksp
 
     now_ms = time.time() * 1000
     sub_auth.save_credential(PROVIDER_ID, {
@@ -331,7 +331,7 @@ def test_refresh_keeps_old_refresh_token_when_omitted(tmp_config, monkeypatch):
 
 
 def test_refresh_non_ok_raises(tmp_config, monkeypatch):
-    from agent.providers import kimi_sub_provider as ksp
+    from services.agent.providers import kimi_sub_provider as ksp
 
     now_ms = time.time() * 1000
     sub_auth.save_credential(PROVIDER_ID, {
@@ -363,7 +363,7 @@ def test_refresh_non_ok_raises(tmp_config, monkeypatch):
 
 
 def test_complete_ex_posts_messages_with_bearer_and_max_tokens(tmp_config, monkeypatch):
-    from agent.providers import kimi_sub_provider as ksp
+    from services.agent.providers import kimi_sub_provider as ksp
 
     now_ms = time.time() * 1000
     sub_auth.save_credential(PROVIDER_ID, {
@@ -420,7 +420,7 @@ def test_complete_ex_posts_messages_with_bearer_and_max_tokens(tmp_config, monke
 
 
 def test_fetch_kimi_usage_parses_usage_and_limits(tmp_config, monkeypatch):
-    from agent.providers import usage as usage_mod
+    from services.agent.providers import usage as usage_mod
 
     now_ms = int(time.time() * 1000)
     cred = {

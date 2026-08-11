@@ -2,7 +2,7 @@
 
 Covers work items C3/D/E/F (Python path) + shared-defaults / tool-categories:
   * SHARED_DEFAULT_TOOLS ⊆ every restricted mode allowlist (ask/plan/edit)
-  * agent/swarm unrestricted (None)
+  * services/agent/swarm unrestricted (None)
   * enable_tools / list_tool_categories always allowed
   * resolve_categories expands packs with a cap
   * role_for_copilot_mode mapping

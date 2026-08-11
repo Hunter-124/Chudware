@@ -265,7 +265,7 @@ def test_a_failed_registry_import_is_never_cached(monkeypatch):
     real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __import__
 
     def flaky(name, *a, **k):
-        if name == "mcp_server.server":
+        if name == "services.mcp.server":
             calls["n"] += 1
             if calls["n"] == 1:
                 raise ImportError("transient")

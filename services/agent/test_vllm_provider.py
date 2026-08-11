@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent import config as cfg
+from services.agent import config as cfg
 
 
 # --------------------------------------------------------------------------- offline classification
@@ -51,7 +51,7 @@ def test_offline_mode_refuses_remote_vllm():
 
 def test_construction_defaults():
     pytest.importorskip("openai")
-    from agent.providers.vllm_provider import VLLMProvider
+    from services.agent.providers.vllm_provider import VLLMProvider
     p = VLLMProvider()
     assert p.name == "vllm"
     assert p.adapter is None
@@ -62,7 +62,7 @@ def test_construction_defaults():
 
 def test_adapter_becomes_served_model_name():
     pytest.importorskip("openai")
-    from agent.providers.vllm_provider import VLLMProvider
+    from services.agent.providers.vllm_provider import VLLMProvider
     # vLLM routes a LoRA by the request `model` field == the served adapter name.
     p = VLLMProvider(base_model="qwen3-4b", adapter="IP-13/v3")
     assert p.adapter == "IP-13/v3"
@@ -72,7 +72,7 @@ def test_adapter_becomes_served_model_name():
 
 def test_telemetry_model_carries_adapter():
     pytest.importorskip("openai")
-    from agent.providers.vllm_provider import VLLMProvider
+    from services.agent.providers.vllm_provider import VLLMProvider
     p = VLLMProvider(base_model="qwen3-4b", adapter="IP-13/v3")
     assert p.telemetry_model() == {
         "provider": "vllm", "model": "qwen3-4b", "adapter": "IP-13/v3"}
@@ -80,7 +80,7 @@ def test_telemetry_model_carries_adapter():
 
 def test_get_provider_builds_vllm_with_adapter():
     pytest.importorskip("openai")
-    from agent.providers.vllm_provider import VLLMProvider
+    from services.agent.providers.vllm_provider import VLLMProvider
     conf = {"provider": "vllm",
             "vllm": {"model": "qwen3-4b", "adapter": "IP-13/v3",
                      "base_url": "http://localhost:8000/v1"}}
@@ -92,7 +92,7 @@ def test_get_provider_builds_vllm_with_adapter():
 
 def test_offline_mode_allows_loopback_vllm():
     pytest.importorskip("openai")
-    from agent.providers.vllm_provider import VLLMProvider
+    from services.agent.providers.vllm_provider import VLLMProvider
     conf = {"provider": "vllm", "offline_mode": True,
             "vllm": {"base_url": "http://localhost:8000/v1", "adapter": "IP-13/v3"}}
     p = cfg.get_provider(cfg=conf)        # no raise

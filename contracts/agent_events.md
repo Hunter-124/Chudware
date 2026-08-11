@@ -243,7 +243,7 @@ Config keys under `agent` (Python services/agent/config.py; C++ config.cpp mirro
 - `agent.compaction_strategy` string default "off" — off|snapcompact|shake|summary
 - `agent.compaction.supersede_reads` bool true; `agent.compaction.drop_useless` bool true; `agent.compaction.keep_recent_tokens` int 20000
 - `agent.prewalk` bool false; `agent.prewalk_target` string "@smol"; `agent.handoff_save_to_disk` bool false
-Engines (pure): services.agent.compaction — serialize_transcript, snapcompact_archive (text-phase; frames=[] future), shake_messages ('[shaken ~N tokens — recover: artifact://<id> (region K)]'), reinject_archive.
+Engines (pure): agent.compaction — serialize_transcript, snapcompact_archive (text-phase; frames=[] future), shake_messages ('[shaken ~N tokens — recover: artifact://<id> (region K)]'), reinject_archive.
 Prewalk (C++): planning stages (intake|plan|decompose|review|memory) keep the strong model; implementation stages (model|fix|execute|build) switch once to agent.prewalk_target; run_note on switch; off = byte-identical.
 
 ## Session command RPCs (batch 2b)

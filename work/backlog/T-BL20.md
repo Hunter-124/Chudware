@@ -47,7 +47,7 @@ Scope:
 
 ## Progress log
 - 2026-07-03 22:35 UTC [sonnet-doro] (foreman liveness probe) No branch pushed ~2h after claim. If you are alive: push your worktree branch NOW (even WIP) — work only counts on the remote. If nothing lands by the next foreman sweep the claim gets released per the dead-driver pattern.
-- 2026-07-03 22:38 UTC [sonnet-doro] Landed on task/T-BL20-fea-vv-crossval (pushed). 5 new executed MacNeal-Harder-style FEA/modal cases (all PRECISE, <0.5% err vs live OCCT build) + CalculiX second-opinion stage (ccx absent in this sandbox -> graceful SKIP, .inp generator smoke-tested). Found + filed a real engine bug in the pressure-load path (core/sim/fea_run.cpp) as issue #9, marked xfail not hidden. Also filed issue #10 for pre-existing mcp_server test failures found during gate verification (confirmed unrelated to this branch). Did not re-run gate.sh's cold OCCT core-build stage in this fresh worktree (no C++ touched, no build cache, ccache disabled -- would run past one foreground turn); check.py + full vv_benchmark.py pytest suite verified directly instead. See HANDOFF section for detail.
+- 2026-07-03 22:38 UTC [sonnet-doro] Landed on task/T-BL20-fea-vv-crossval (pushed). 5 new executed MacNeal-Harder-style FEA/modal cases (all PRECISE, <0.5% err vs live OCCT build) + CalculiX second-opinion stage (ccx absent in this sandbox -> graceful SKIP, .inp generator smoke-tested). Found + filed a real engine bug in the pressure-load path (core/sim/fea_run.cpp) as issue #9, marked xfail not hidden. Also filed issue #10 for pre-existing services.mcp test failures found during gate verification (confirmed unrelated to this branch). Did not re-run gate.sh's cold OCCT core-build stage in this fresh worktree (no C++ touched, no build cache, ccache disabled -- would run past one foreground turn); check.py + full vv_benchmark.py pytest suite verified directly instead. See HANDOFF section for detail.
 - 2026-07-03 [fable-foreman] REVIEWED+MERGED: LGTM. Reference values independently verified (Rao modal, Roark static); tolerances standard-appropriate; CalculiX subprocess+GPL-isolated+gated; FEA3 honestly recorded FAIL (issue #9), not back-fitted — strongest possible validation-honesty signal. 25 tests, scope tight (no C++). Merged to master.
 
 ## HANDOFF (sonnet-doro, 2026-07-03)
@@ -55,7 +55,7 @@ Scope:
 Delivered in `scripts/vv_benchmark.py`:
 
 - **MCP wiring**: `_mcp_call()` dispatches through the full in-process FastMCP server
-  (`mcp_server.server.mcp.call_tool`, same pattern as `test_roundtrip.py` /
+  (`services.mcp.server.mcp.call_tool`, same pattern as `test_roundtrip.py` /
   `test_cad_tools.py`), since raw `core_bridge.call("sim_run_static", ...)` can't do
   the face-query -> mesh-point-set resolution `run_fea_static`/`run_fea_modal` do.
 - **5 executed FEA/modal cases** (family `fea-static` + `modal`): FEA1 (cantilever
@@ -104,7 +104,7 @@ Delivered in `scripts/vv_benchmark.py`:
   would run well past what fits in one foreground gate-run turn. The integrator
   merging into a warm main checkout (which already has `core/build-linux` +
   `core/build-occt-linux` built) gets a fast incremental gate run instead.
-- While verifying stage 4 (`pytest mcp_server`), found 8 pre-existing test failures
+- While verifying stage 4 (`pytest services.mcp`), found 8 pre-existing test failures
   + 34 ECAD collection errors that reproduce identically on an unmodified checkout
   against either `.so` build — confirmed unrelated to this branch. Filed as
   **[issue #10](https://github.com/Hunter-124/CAD/issues/10)** for visibility;

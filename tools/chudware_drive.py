@@ -1,7 +1,7 @@
 """chudware_drive.py - ergonomic driver for the Chudware *fixed* engine via core_bridge.
 
 The live MCP server is bypassed (it was deadlocked on the old DLL); this loads the freshly
-staged dist/Chudware/libchudware.dll directly through mcp_server.core_bridge. Run from the repo
+staged dist/Chudware/libchudware.dll directly through services.mcp.core_bridge. Run from the repo
 root (PYTHONPATH=. or run a script that imports `tools.chudware_drive`), ideally with the
 runtime venv python:
   %APPDATA%\\Chudware\\runtime\\venv\\Scripts\\python.exe
@@ -19,7 +19,7 @@ Quick use:
 
 For complex features (sketch/extrude/revolve/loft/sweep/hole/bolt_circle/pattern/mirror/
 fillet/chamfer/shell/draft/transform) use eng.feat(type, name, params, refs) with the op
-JSON shapes from core/tests/test_document.cpp and mcp_server/cad_tools.py / the cheatsheets.
+JSON shapes from core/tests/test_document.cpp and services/mcp/cad_tools.py / the cheatsheets.
 A dimension is eng.dim(value)  ->  {"value": value, "expr": None}.
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from mcp_server import core_bridge as cb  # noqa: E402
+from services.mcp import core_bridge as cb  # noqa: E402
 
 call = cb.call
 CoreError = cb.CoreError

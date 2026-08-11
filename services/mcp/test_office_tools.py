@@ -20,7 +20,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 pypdf = pytest.importorskip("pypdf")
 
-from mcp_server.office_tools import register_office_tools  # noqa: E402
+from services.mcp.office_tools import register_office_tools  # noqa: E402
 
 
 def _mcp() -> FastMCP:

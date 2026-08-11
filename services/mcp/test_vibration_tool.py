@@ -23,8 +23,8 @@ if _REPO_ROOT not in sys.path:
 
 import pytest
 
-from mcp_server import cad_tools
-from mcp_server import cad_sim_tools  # T-RF8: run_fea_* tools live here now
+from services.mcp import cad_tools
+from services.mcp import cad_sim_tools  # T-RF8: run_fea_* tools live here now
 
 
 # ---------------------------------------------------------------------------

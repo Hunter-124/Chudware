@@ -35,7 +35,7 @@ import pytest
 
 # Import the registrar EARLY, before sibling tests pollute sys.modules with stub
 # mcp/anyio packages (same rule as test_fea_advanced.py).
-from mcp_server.cad_tools import register_cad_tools as _register_cad_tools  # noqa: F401
+from services.mcp.cad_tools import register_cad_tools as _register_cad_tools  # noqa: F401
 
 # engine_oracle/hydraulic + engine/piping/{solve,properties} were ported to core
 # (T-RF19) and deleted; these shims drive the same methods over the core bridge.
@@ -66,7 +66,7 @@ class _PipingSolveShim:
 hyd_solve = _HydSolveShim()
 piping_solve_mod = _PipingSolveShim()
 from services.piping import schema as piping_schema  # kept in engine_oracle (threed/cfd_handoff hold-back)
-from mcp_server import simhandoff as sh
+from services.mcp import simhandoff as sh
 
 
 def _have(mod: str) -> bool:
@@ -284,7 +284,7 @@ def test_piping_internal_volume_exact_cylinder(tmp_path):
 # The struct_* MCP tools are dispatched to the C++ core (libchudware struct_* RPCs via
 # core_bridge) — they need a staged engine, not PyNite. Same gate as group 5.
 
-from mcp_server import core_bridge as cb  # noqa: E402
+from services.mcp import core_bridge as cb  # noqa: E402
 
 _STRUCT_ENGINE = pytest.mark.skipif(
     not cb.available(),
@@ -484,7 +484,7 @@ _ENGINE = pytest.mark.skipif(
 
 def _call(name: str, args: dict):
     import asyncio
-    from mcp_server import server
+    from services.mcp import server
     content, structured = asyncio.run(server.mcp.call_tool(name, args))
     text = structured.get("result") if isinstance(structured, dict) else None
     try:

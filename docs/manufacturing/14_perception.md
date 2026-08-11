@@ -870,7 +870,7 @@ automatically and the coverage guard makes an enumeration gap fatal:
 
 **`services/mcp/perception_tools.py`** (new file, exclusively owned) — the module lives beside its
 siblings by convention, not inside the owning package: `services/mcp/server.py` imports each module
-as `from mcp_server.<module> import register_<module>_tools` and calls it with a family view (see
+as `from services.mcp.<module> import register_<module>_tools` and calls it with a family view (see
 `cam_tools` / `cam_audit` at `services/mcp/server.py:362-365`). The family view is the **shared
 `manufacture` family** per Main's ruling in gateway §17 — `register_perception_tools(_reg.view(mcp,
 "manufacture"))` — never a `perception` family. This module is a thin delegation layer over
@@ -899,7 +899,7 @@ Tests: `test_features.py` · `test_windows.py` · `test_freshness.py` · `test_h
 |---|---|---|
 | `tools/flywheel/runner.py` | additive dispatch branch in `_run_training()` for `method: mldp`; dry-run writes a checkpoint stub instead of `adapter_config.json` when `method_family: perception` | ~25 lines, additive |
 | `training/jobs/schema.md` | append "Perception job fields" (`method_family`, `feature_spec_id`, `encoder_ref`, `encoder_license`, `manifest`, `horizons`) | append-only |
-| `services/mcp/server.py` (family registration site, alongside the `cam` block at :362) | `from mcp_server.perception_tools import register_perception_tools` + `register_perception_tools(_reg.view(mcp, "manufacture"))` | 2 lines |
+| `services/mcp/server.py` (family registration site, alongside the `cam` block at :362) | `from services.mcp.perception_tools import register_perception_tools` + `register_perception_tools(_reg.view(mcp, "manufacture"))` | 2 lines |
 | `services/mcp/tool_registry.py` | **nothing authored by this slice.** Gateway owns this file for the risk-class change (review B14) and for the `manufacture`-off-by-default edits (B11); perception submits four `read`-risk rows (`mfg_perception_brief` / `_event_get` / `_evidence_get` / `_health`) as data for that owner to append | 0 lines authored |
 | `contracts/licenses.md` | append the §9 rows | append-only |
 | `contracts/README.md` | index `manufacturing_perception.md` | 1 line |

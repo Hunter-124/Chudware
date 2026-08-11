@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -366,6 +367,24 @@ def default_tools_for_division(division: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # One cell: challenge x tier x seed
 # ---------------------------------------------------------------------------
+# Characters Windows forbids in a path component, plus the separators. Model
+# ids routinely contain ':' and '/', so a cell id is not a legal directory name
+# on NTFS and is a nested path on POSIX. Everything illegal collapses to '-'.
+_UNSAFE_PATH_CHARS = re.compile(r'[:*?"<>|/\\]+')
+
+
+def _path_component(name: str) -> str:
+    """Return *name* reduced to one directory component that is legal everywhere.
+
+    This is deliberately lossy and deliberately not reversible: the authoritative
+    cell identity lives in ``CellResult`` and in the run's JSON, so the directory
+    only has to be unique and portable, not parseable. Two cells whose ids differ
+    solely by an illegal character would collide, which cannot happen here because
+    the illegal characters come from the model id and the model id is echoed in
+    full inside the run's own files.
+    """
+    return _UNSAFE_PATH_CHARS.sub("-", name).strip(". ")
+
 
 @dataclass
 class CellResult:
@@ -428,7 +447,18 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
     base = runs_dir if runs_dir is not None else (REPORTS_DIR / "runs")
     # Keep legacy dir shape when division is default-local for backward paths;
     # include division in the folder so local/open cells do not collide.
-    run_dir = Path(base) / cycle / f"{challenge.id}_{division}_{tier}_s{seed}"
+    #
+    # The cell id keeps its real shape (`C1_open_xai:grok-4-5_s1`) in run_id, in
+    # CellResult, and in every report — that is the logical name and reports
+    # cite it. The DIRECTORY name cannot: tier is a model id like
+    # `xai:grok-4-5`, `ollama:llama3.2:latest` or
+    # `openrouter:deepseek/deepseek-chat-v3.1`, and NTFS rejects ':' outright
+    # while '/' would silently fan the cell out into nested directories. A repo
+    # holding such a path cannot be checked out on Windows at all — `git clone`
+    # aborts with "invalid path" before any file lands, which took the whole
+    # Windows CI leg down until 2026-08-10.
+    run_dir = Path(base) / cycle / _path_component(
+        f"{challenge.id}_{division}_{tier}_s{seed}")
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Fresh ledger for this cell (its own file under the run dir). A cell is

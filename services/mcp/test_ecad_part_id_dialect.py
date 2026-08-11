@@ -92,7 +92,7 @@ class _StubMCP:
 
 
 def _tools() -> dict:
-    from mcp_server.parts_tools import register_parts_tools
+    from services.mcp.parts_tools import register_parts_tools
     stub = _StubMCP()
     register_parts_tools(stub)
     return stub.tools
@@ -455,7 +455,7 @@ def test_every_tool_named_in_a_hint_actually_exists() -> None:
     """
     import re
 
-    from mcp_server.ecad_tools import register_ecad_tools
+    from services.mcp.ecad_tools import register_ecad_tools
     ecad = _StubMCP()
     register_ecad_tools(ecad)
     _pin_starter_only()  # tool registration registers the real user library dir

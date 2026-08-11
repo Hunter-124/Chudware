@@ -26,10 +26,10 @@ core/build*/
 .pytest_cache/
 
 # Generated PNG raster renders (binary).
-# The text SVGs in corpus_render/ are kept for diffable visual reference.
-corpus_render/png/
+# The text SVGs in corpora/render/ are kept for diffable visual reference.
+corpora/render/png/
 
-# Release artifacts (regenerate with installer/build_release.py)
+# Release artifacts (regenerate with services/installer/build_release.py)
 dist/
 
 # Local config / secrets
@@ -39,7 +39,7 @@ config.json
 imgui.ini
 
 # Per-machine MCP client configs (absolute paths) — regenerate with mcp_setup.bat.
-# The portable installer (mcp_setup.bat + installer/setup_mcp_clients.py) IS committed.
+# The portable installer (mcp_setup.bat + services/installer/setup_mcp_clients.py) IS committed.
 /.mcp.json
 /opencode.json
 /.cursor/mcp.json
@@ -118,8 +118,7 @@ Webservice/Cloudflare-info.txt
 Webservice/secrets/
 Webservice/image/stage/
 Webservice/gateway/.venv/
-# per-deployment allowlist and env files hold live emails/secrets — never commit
-Webservice/gateway/users.yaml
+# per-deployment env files hold live secrets — never commit
 Webservice/**/*.env
 !Webservice/gateway/config.example.env
 

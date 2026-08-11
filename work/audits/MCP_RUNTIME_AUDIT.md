@@ -398,7 +398,7 @@ _(none — venv is fully provisioned)_
 
 ## Undeclared-But-Installed Dependencies
 
-Packages imported by `services/`+`engine_oracle/`+`mcp_server/` that are
+Packages imported by `services/`+`engine_oracle/`+`services/mcp/` that are
 installed in the venv but absent from `requirements.txt`:
 
 _(none found)_

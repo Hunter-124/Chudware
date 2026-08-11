@@ -152,6 +152,22 @@ jobs:
           Write-Host "runner=$env:RUNNER_NAME os=$env:RUNNER_OS arch=$env:RUNNER_ARCH host=$env:COMPUTERNAME"
           Write-Host "powershell=$($PSVersionTable.PSVersion)"
 
+          # The Windows runner service runs as NT AUTHORITY\NETWORK SERVICE.
+          # It cannot write Program Files, cannot edit the machine PATH, and
+          # cannot restart itself to pick a new one up, so runner-smoke's
+          # provisioning job installs ninja and Python into a runner-local
+          # directory and every Windows job puts that directory on PATH here.
+          # Done before the vswhere snapshot below so the dev-shell diff
+          # carries it into the build steps. See docs/reference/CI_RUNNERS.md.
+          $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
+          foreach ($dir in @((Join-Path $tools 'bin'), (Join-Path $tools 'python'), (Join-Path $tools 'python\Scripts'))) {
+            if (Test-Path $dir) {
+              $env:PATH = "$dir;$env:PATH"
+              $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              Write-Host "  path+ $dir"
+            }
+          }
+
           foreach ($tool in @('cmake', 'ninja', 'ctest', 'git')) {
             if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
               Write-Host "::error::runner $env:RUNNER_NAME is missing required tool: $tool"
@@ -235,13 +251,37 @@ jobs:
           "NETGEN_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "netgen-root=$root"
 
-      - name: Configure and build core (${{ matrix.preset }})
-        shell: ${{ runner.os == 'Windows' && 'powershell' || 'bash' }}
+      # `shell:` must name a literal interpreter — actionlint rejects an
+      # expression there, and on these Windows hosts `bash` resolves to an
+      # empty WSL shim that exits 0 without running anything. CloudCastle
+      # learned that the expensive way (rmm-agent-packages.yml: "every push
+      # built a release that reached no endpoint"). So every step that runs on
+      # more than one OS is split in two, guarded by `if:`.
+      - name: Configure and build core (${{ matrix.preset }}) (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
+          set -euo pipefail
           cmake --preset ${{ matrix.preset }} -DNETGEN_ROOT="${{ env.NETGEN_ROOT }}"
           cmake --build --preset ${{ matrix.preset }}
 
-      - name: ctest core (${{ matrix.preset }})
+      - name: Configure and build core (${{ matrix.preset }}) (Windows)
+        if: runner.os == 'Windows'
+        # Windows PowerShell 5.1 — these hosts have no pwsh.
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # $ErrorActionPreference does not apply to native exit codes, so each
+          # cmake invocation is checked; otherwise a failed configure would run
+          # the build and report the build's status.
+          cmake --preset ${{ matrix.preset }} "-DNETGEN_ROOT=$env:NETGEN_ROOT"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build --preset ${{ matrix.preset }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: ctest core (${{ matrix.preset }}) (POSIX)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -267,15 +307,52 @@ jobs:
 
           exit "${status}"
 
-      - name: Configure and build host GUI
-        if: matrix.build_host
-        shell: ${{ runner.os == 'Windows' && 'powershell' || 'bash' }}
+      - name: ctest core (${{ matrix.preset }}) (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
         run: |
+          $ErrorActionPreference = 'Continue'
+
+          $tree = 'build/${{ matrix.preset }}'
+          $log = Join-Path $env:RUNNER_TEMP 'ctest-core.log'
+          ctest --test-dir $tree --output-on-failure 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+
+          if (Select-String -Path $log -Pattern 'No tests were found' -Quiet) {
+            Write-Host "::error::ctest found no tests in $tree; the configure did not register the suite"
+            exit 1
+          }
+
+          $tail = (Get-Content $log -Tail 40) -join "`n"
+          @(
+            '## ctest -- ${{ matrix.label }} (${{ matrix.preset }})'
+            '```text'
+            $tail
+            '```'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          exit $status
+
+      - name: Configure and build host GUI (POSIX)
+        if: matrix.build_host && runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
           cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build ${{ matrix.host_build_dir }}
 
-      - name: ctest host GUI
-        if: matrix.build_host
+      - name: Configure and build host GUI (Windows)
+        if: matrix.build_host && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build ${{ matrix.host_build_dir }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: ctest host GUI (POSIX)
+        if: matrix.build_host && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -298,3 +375,29 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           exit "${status}"
+
+      - name: ctest host GUI (Windows)
+        if: matrix.build_host && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $tree = '${{ matrix.host_build_dir }}'
+          if (-not (Test-Path (Join-Path $tree 'CTestTestfile.cmake'))) {
+            Write-Host "::error::$tree has no CTest configuration; the host configure did not complete"
+            exit 1
+          }
+
+          $log = Join-Path $env:RUNNER_TEMP 'ctest-host.log'
+          ctest --test-dir $tree --output-on-failure 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+
+          $tail = (Get-Content $log -Tail 40) -join "`n"
+          @(
+            '## ctest -- host GUI (${{ matrix.label }})'
+            '```text'
+            $tail
+            '```'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          exit $status

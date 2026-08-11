@@ -3336,7 +3336,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                             "available_categories": available,
                         }
                     elif not restricted_tools:
-                        # agent/swarm unrestricted — already full access
+                        # services/agent/swarm unrestricted — already full access
                         meta_result = {
                             "ok": True,
                             "enabled": [],
@@ -4954,7 +4954,7 @@ def resolver_for(mission_dispatch: Any | None = None) -> Callable[[str], Any]:
 #      HAND-MAINTAINED list of MCP module keys, so a tool living in a module
 #      nobody remembered to add was advertised to the model and then unbindable
 #      — and the KeyError said nothing the model could act on.  The fallback
-#      below binds against the REAL server registry (mcp_server.server, the same
+#      below binds against the REAL server registry (services.mcp.server, the same
 #      catalog the tools are advertised from), so the gap cannot reopen when a
 #      new *_tools.py module lands.  When a name still cannot be bound, the
 #      error says whether it is UNKNOWN (model invented it) or KNOWN-BUT-UNBOUND
@@ -5018,7 +5018,7 @@ def _server_tools() -> dict[str, Any]:
     if _SERVER_TOOL_CACHE is None:
         out: dict[str, Any] = {}
         try:
-            from mcp_server.server import mcp as _srv  # noqa: PLC0415
+            from services.mcp.server import mcp as _srv  # noqa: PLC0415
             for name, entry in getattr(_srv._tool_manager, "_tools", {}).items():
                 fn = getattr(entry, "fn", None)
                 out[str(name)] = fn if _directly_callable(fn) else None

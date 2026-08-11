@@ -474,8 +474,8 @@ class TestPartsMCPTools:
         mock_mcp.tool = capture_tool
 
         import importlib
-        # mcp_server is a symlink to services/mcp at repo root.
-        pt = importlib.import_module("mcp_server.parts_tools")
+        # Import the canonical package so the registry under test shares server state.
+        pt = importlib.import_module("services.mcp.parts_tools")
         pt.register_parts_tools(mock_mcp)
 
     def test_tools_registered(self):

@@ -251,7 +251,7 @@ def register_preflight_tools(mcp: FastMCP) -> None:
                you proceed anyway, a ``preflight_overridden`` audit event is logged.
         """
         # Relative imports: resolve to the SAME module identity this package was
-        # loaded under (mcp_server or services.mcp). An absolute services.mcp
+        # loaded under (services.mcp or services.mcp). An absolute services.mcp
         # import here creates a second cad_tools/core_bridge module object with
         # its own _CUR/_PERIODIC_TIMER/fallback state — the 12x-autosave bug class.
         from . import core_bridge as cb

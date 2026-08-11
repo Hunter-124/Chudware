@@ -183,7 +183,7 @@ def freeze_geometry_step(doc: dict[str, Any]) -> bytes | None:
     if kind not in ("part", "asm", "assembly"):
         return None  # only parts/assemblies have a B-rep to freeze
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
     except Exception:
         return None
     try:

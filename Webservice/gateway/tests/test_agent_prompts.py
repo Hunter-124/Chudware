@@ -1,8 +1,8 @@
 """Live regression gate: the shared daemon can resolve its agent role prompts.
 
 Guards the failure class fixed 2026-07-16 (git 0d8fb76f): the chudware-hostd unit had
-no WorkingDirectory, so roles.cpp's relative "agent/prompts" fallback resolved against
-nothing and EVERY agent_run_v2 threw "role prompt unreadable/empty: agent/prompts/
+no WorkingDirectory, so roles.cpp's relative "services/agent/prompts" fallback resolved against
+nothing and EVERY agent_run_v2 threw "role prompt unreadable/empty: services/agent/prompts/
 intake.md" — the web/local/agent part-builder was instant-fail on prod. install_webd.sh
 now deploys the prompt tree and stamps CHUDWARE_PROMPTS_DIR into the unit.
 

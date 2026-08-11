@@ -1932,7 +1932,7 @@ def summarize_sketch(entities: list[dict], constraints: list[dict],
 
     if health is not None:
         try:
-            from mcp_server.gsl_tools import sketch_health_text  # type: ignore
+            from services.mcp.gsl_tools import sketch_health_text  # type: ignore
             lines.append("")
             lines.append(sketch_health_text(health))
         except Exception:
@@ -2732,7 +2732,7 @@ def check_schematic(sch: dict) -> list[dict]:
         })
     # optional netlist-backed unconnected pins
     try:
-        from mcp_server.ecad_common import netlist_mod as _nl_mod  # noqa: PLC0415
+        from services.mcp.ecad_common import netlist_mod as _nl_mod  # noqa: PLC0415
         nl = _nl_mod.build_netlist(sch)
         by_pin = nl.get("by_pin") or {}
         # count pins that never appear in by_pin if components list available
@@ -3671,7 +3671,7 @@ def apply_ascii_edits(kind: str, edits: Sequence[dict], *,
 
     When ``apply_live`` and not ``dry_run``:
       - schematic/pcb → C++ ecad_apply_ops via the ecad_common session facade
-      - sketch → mcp_server.cad_tools add_features path via core bridge
+      - sketch → services.mcp.cad_tools add_features path via core bridge
 
     Offline: pass ``doc`` + ``grid`` + ``index`` from a prior render; with
     ``dry_run=True`` only the op list is returned (no session required).
@@ -3706,11 +3706,11 @@ def apply_ascii_edits(kind: str, edits: Sequence[dict], *,
     if live_doc is None and apply_live and not dry_run:
         try:
             if kind_n in ("schematic", "pcb"):
-                from mcp_server.ecad_common import ecad_session  # noqa: PLC0415
+                from services.mcp.ecad_common import ecad_session  # noqa: PLC0415
                 if doc_id:
                     session = ecad_session.get_session(doc_id)
                 else:
-                    from mcp_server.ecad_tools import _ECAD  # noqa: PLC0415
+                    from services.mcp.ecad_tools import _ECAD  # noqa: PLC0415
                     did = (_ECAD.get("current_sch") if kind_n == "schematic"
                            else _ECAD.get("current_pcb")) or _ECAD.get("current")
                     if not did:
@@ -3755,7 +3755,7 @@ def apply_ascii_edits(kind: str, edits: Sequence[dict], *,
     # Apply
     try:
         if kind_n in ("schematic", "pcb"):
-            from mcp_server.ecad_common import ecad_session  # noqa: PLC0415
+            from services.mcp.ecad_common import ecad_session  # noqa: PLC0415
             if session is None:
                 session = ecad_session.get_session(doc_id)
             resp = ecad_session.apply_ops(session, session.revision, plan["ops"])
@@ -3775,7 +3775,7 @@ def apply_ascii_edits(kind: str, edits: Sequence[dict], *,
             return plan
         if kind_n == "sketch":
             # sketch ops go through add_features
-            from mcp_server.cad_tools import _doc  # noqa: PLC0415
+            from services.mcp.cad_tools import _doc  # noqa: PLC0415
             import services.mcp.core_bridge as cb  # noqa: PLC0415
             d = _doc(doc_id or None)
             # ensure sketch field present
@@ -4118,12 +4118,12 @@ def render_ascii_3d(polylines: Optional[list] = None,
 
 
 def _load_schematic(doc_id: str = "") -> dict:
-    from mcp_server.ecad_common import ecad_session  # noqa: PLC0415
+    from services.mcp.ecad_common import ecad_session  # noqa: PLC0415
     if doc_id:
         session = ecad_session.get_session(doc_id)
     else:
         try:
-            from mcp_server.ecad_tools import _ECAD  # noqa: PLC0415
+            from services.mcp.ecad_tools import _ECAD  # noqa: PLC0415
             did = _ECAD.get("current_sch") or _ECAD.get("current")
             if not did:
                 raise ValueError("no current schematic — pass doc_id or call "
@@ -4137,13 +4137,13 @@ def _load_schematic(doc_id: str = "") -> dict:
 
 
 def _load_board(doc_id: str = "") -> dict:
-    from mcp_server.ecad_common import ecad_session  # noqa: PLC0415
+    from services.mcp.ecad_common import ecad_session  # noqa: PLC0415
     if doc_id:
         session = ecad_session.get_session(doc_id)
     else:
         # current pcb if any
         try:
-            from mcp_server.ecad_tools import _ECAD  # noqa: PLC0415
+            from services.mcp.ecad_tools import _ECAD  # noqa: PLC0415
             did = _ECAD.get("current_pcb") or _ECAD.get("current")
             if not did:
                 raise ValueError("no current PCB — pass doc_id or call ecad_new_pcb first")
@@ -4157,7 +4157,7 @@ def _load_board(doc_id: str = "") -> dict:
 
 def _load_sketch(sketch: str, doc_id: Optional[str]) -> tuple[dict, Optional[dict]]:
     """Return (sketch_dict with entities/constraints, optional health)."""
-    from mcp_server.cad_tools import _doc  # noqa: PLC0415
+    from services.mcp.cad_tools import _doc  # noqa: PLC0415
     import services.mcp.core_bridge as cb  # noqa: PLC0415
     d = _doc(doc_id)
     overview = cb.call("doc_sketch_overview", {"doc_id": d, "sketch": sketch})
@@ -4296,8 +4296,8 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
             if doc_id or (not circuit and not spice_text and not netlist):
                 try:
                     sch = _load_schematic(doc_id)
-                    from mcp_server.ecad_common import _netlist_to_circuit  # noqa: PLC0415
-                    from mcp_server.ecad_common import netlist_mod as _nl_mod  # noqa: PLC0415
+                    from services.mcp.ecad_common import _netlist_to_circuit  # noqa: PLC0415
+                    from services.mcp.ecad_common import netlist_mod as _nl_mod  # noqa: PLC0415
                     netlist = netlist or _nl_mod.build_netlist(sch)
                     try:
                         circuit, _warns = _netlist_to_circuit(netlist)
@@ -4465,7 +4465,7 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
                                               highlight=highlight))
 
             # live path: try HLR drawing views, then measure bbox
-            from mcp_server.cad_tools import _doc  # noqa: PLC0415
+            from services.mcp.cad_tools import _doc  # noqa: PLC0415
             import services.mcp.core_bridge as cb  # noqa: PLC0415
             d = _doc(doc_id)
             source = "experimental"
@@ -4496,7 +4496,7 @@ def register_ascii2d_tools(mcp: FastMCP) -> None:
                 except Exception:
                     try:
                         # describe-style digest sometimes carries bbox
-                        from mcp_server.gsl_tools import _digest  # noqa: PLC0415
+                        from services.mcp.gsl_tools import _digest  # noqa: PLC0415
                         dig = _digest(d)
                         bb = dig.get("bbox")
                     except Exception:

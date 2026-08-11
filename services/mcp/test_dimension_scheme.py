@@ -26,7 +26,7 @@ def _install_stubs():
     here exercises pure offline logic — no bridge call at run time), so the module wraps
     its imports in `try: … finally: restore()` below. That matters for whole-dir pytest
     sweeps: this module used to `setdefault` a fake `services.mcp.core_bridge` / `mcp` SDK
-    and — worse — mutate the REAL `mcp_server` package's attributes, which leaked into
+    and — worse — mutate the REAL `services.mcp` package's attributes, which leaked into
     sibling test modules (test_cad_tools' volume-baseline + render-caption saw a stubbed
     core_bridge and failed). `restore()` removes exactly the keys/attrs this installed and
     leaves any pre-existing real module untouched, so nothing leaks past import.
@@ -47,11 +47,11 @@ def _install_stubs():
 
     # core_bridge stub. Issue #17: cad_tools does `from .core_bridge import CoreError` at
     # import time, so the stub must carry CoreError or a full-dir collection aborts.
-    cb = types.ModuleType("mcp_server.core_bridge")
+    cb = types.ModuleType("services.mcp.core_bridge")
     cb.available = lambda: False
     cb.call = lambda method, params=None: {}
     cb.CoreError = type("CoreError", (Exception,), {})
-    _set("mcp_server.core_bridge", cb)
+    _set("services.mcp.core_bridge", cb)
     _set("core_bridge", cb)
     _set("services.mcp.core_bridge", cb)
 
@@ -72,22 +72,22 @@ def _install_stubs():
     _set("mcp.server", server_mod)
     _set("mcp.server.fastmcp", fastmcp_mod)
 
-    # mcp_server.cad_tools stubs for _dumps / _err / _doc
-    ct = types.ModuleType("mcp_server.cad_tools")
+    # services.mcp.cad_tools stubs for _dumps / _err / _doc
+    ct = types.ModuleType("services.mcp.cad_tools")
     ct._dumps = json.dumps
     ct._err = lambda e: json.dumps({"ok": False, "error": str(e)})
     ct._doc = lambda d: d
-    _set("mcp_server.cad_tools", ct)
-    ms = types.ModuleType("mcp_server")
-    mcp_server_pkg = _set("mcp_server", ms)
+    _set("services.mcp.cad_tools", ct)
+    ms = types.ModuleType("services.mcp")
+    mcp_server_pkg = _set("services.mcp", ms)
 
     # fit_narration stub — gsl_tools imports _format_fit at module level
-    fn_mod = types.ModuleType("mcp_server.fit_narration")
+    fn_mod = types.ModuleType("services.mcp.fit_narration")
     fn_mod._format_fit = lambda fit_result: ""  # no-op for offline tests
-    _set("mcp_server.fit_narration", fn_mod)
-    # Wire submodule attributes ONLY on a mcp_server package WE created — never clobber a
-    # real, already-imported mcp_server (that leak is what broke sibling tests).
-    if "mcp_server" in added:
+    _set("services.mcp.fit_narration", fn_mod)
+    # Wire submodule attributes ONLY on a services.mcp package WE created — never clobber a
+    # real, already-imported services.mcp (that leak is what broke sibling tests).
+    if "services.mcp" in added:
         _setattr(mcp_server_pkg, "fit_narration", fn_mod)
         _setattr(mcp_server_pkg, "cad_tools", ct)
         _setattr(mcp_server_pkg, "core_bridge", cb)
@@ -443,7 +443,7 @@ class TestProcessDifferentiation(unittest.TestCase):
         """With NO engine bridge the planner degrades (comp 0.0) instead of raising —
         that offline path is this module's documented fixture mode and must survive the
         loud-lookup change above."""
-        import mcp_server.core_bridge as cb
+        import services.mcp.core_bridge as cb
         with unittest.mock.patch.object(cb, "available", lambda: False):
             plan = _plan_from_entities(_make_bore_sketch(self.NOMINAL_MM), "fdm",
                                        it_grade=12, nominal_fallback_mm=self.NOMINAL_MM)

@@ -765,7 +765,7 @@ def test_a_geometry_ask_under_a_plural_key_still_routes(part):
 # Dispatch-path SYMMETRY: an unknown argument must be refused on the external
 # MCP path exactly as it already is on the built-in agent path.
 #
-# Measured baseline (2026-07-29, before mcp_server/server.py
+# Measured baseline (2026-07-29, before services/mcp/server.py
 # _open_varkw_arg_model existed):
 #
 #   query_geometry(query="top", doc_id=<plate>, return_sparkles=True)
@@ -805,7 +805,7 @@ def _mcp_text(name: str, args: dict) -> str:
     ``measure`` raises rather than returning ok:False, so a refusal can arrive
     as a ToolError too — both shapes are loud, and both are read here.
     """
-    from mcp_server import server
+    from services.mcp import server
 
     try:
         res = asyncio.run(server.mcp.call_tool(name, args))

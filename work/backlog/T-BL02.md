@@ -44,8 +44,8 @@ Picking up the greenlit no-reversing slice: **DXF import via ezdxf (MIT)**. Stat
   closed → Compound. Import-only for now (2D→DXF export deferred; stated honestly).
 
 **Environment note (this Windows checkout only, local/non-committed):** the top-level
-`engine`, `mcp_server`, `dag`, `deliverables`, `agent`, `installer`, `app`, `corpus*`,
-`test_fixtures_sw` names are git symlinks (mode 120000, e.g. `engine → engine_oracle`)
+`engine`, `services.mcp`, `dag`, `deliverables`, `agent`, `installer`, `app`, `corpus*`,
+`corpora/sw_fixtures` names are git symlinks (mode 120000, e.g. `engine → engine_oracle`)
 that got materialized as real directory copies because core.symlinks=false on Windows.
 Git reported all 11 as "deleted", which tripped `work.py claim`'s dirty-tree guard
 (BUSY on every claim). Remedy applied: `git update-index --skip-worktree` on those 11

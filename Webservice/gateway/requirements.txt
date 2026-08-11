@@ -5,7 +5,7 @@
 # Refresh policy: bump in a dev venv, re-run the gateway test suite, check the
 # new versions against https://osv.dev / GitHub Advisories (or `pip-audit`),
 # then update the pin here. Pinned to the versions verified working in the
-# deployment venv as of 2026-07-28.
+# deployment venv as of 2026-08-10, each checked clean against api.osv.dev.
 
 fastapi==0.139.0
 uvicorn[standard]==0.51.0
@@ -13,5 +13,10 @@ httpx==0.28.1
 websockets==16.1
 PyJWT[crypto]==2.13.0   # >=2.13.0 fixes CVE-2026-48526 (improper auth) and CVE-2026-32597 (crit header bypass, fixed 2.12.0)
 pyyaml==6.0.3
-aiosqlite==0.22.1
+psycopg[binary]==3.3.4   # store; [binary] ships libpq so the host needs no libpq-devel
+psycopg_pool==3.3.1
 python-multipart==0.0.32   # >=0.0.30 fixes CVE-2026-53537/8/9; earlier fixes: 0.0.22 (CVE-2026-24486 path traversal), 0.0.26/0.0.27 (DoS)
+stripe==15.5.0
+argon2-cffi==25.1.0
+boto3==1.43.68           # R2 (S3-compatible) backup upload
+dulwich==1.2.12          # plm_seed.py imports it and it was never declared

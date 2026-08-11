@@ -40,10 +40,8 @@ import math
 from typing import Any, Optional
 
 from services.mcp import simhandoff as sh
-# SAME module identity the server registers (mcp_server.*) — the services.mcp/
-# mcp_server symlink pair would otherwise give a SECOND ecad_thermal module with its
-# own empty _THERMAL state (see the piping_tools double-import note).
-from mcp_server import ecad_thermal as et
+# Import the same canonical module object the server registers so thermal state is shared.
+from services.mcp import ecad_thermal as et
 
 # Aluminum (6063-class extrusion): conductivity + density for fin efficiency + mass.
 ALU_K_W_MK = 200.0
@@ -399,7 +397,7 @@ def heatsink_select_impl(component_ref: str,
     cb = None
     if mesh is not None:
         try:
-            from mcp_server import core_bridge as _cb
+            from services.mcp import core_bridge as _cb
             cb = _cb
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"core bridge unavailable ({exc}) — network estimate.")

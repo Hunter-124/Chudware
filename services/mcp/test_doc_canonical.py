@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 # sys.modules — i.e. whenever this file happened to be the first to touch `mcp` in the
 # process — permanently replacing FastMCP with the bare `object` class in sys.modules for
 # every test collected afterward in the same session (confirmed live:
-# `mcp_server/server.py`'s real `FastMCP(...)` call then raised `TypeError: object() takes no
+# `services/mcp/server.py`'s real `FastMCP(...)` call then raised `TypeError: object() takes no
 # arguments`, and anything importing `Image` from fastmcp got `ImportError`). Try the real SDK
 # first; only stub on a genuine ImportError, so an environment that HAS mcp installed (this
 # one) never gets the fake `object`-as-FastMCP substituted in.

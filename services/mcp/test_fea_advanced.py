@@ -17,7 +17,7 @@ from services.mcp import fea_advanced as fa
 # Import the registrar EARLY, before sibling tests (_ensure_stubs) pollute
 # sys.modules with stub mcp/anyio packages — cad_tools.py imports FastMCP at
 # module level, so it must be imported while the REAL mcp package is accessible.
-# (Same rule as test_mcp_freshness.py; needed for the mcp_server/ mirror suite.)
+# (Same rule as test_mcp_freshness.py; needed for the services/mcp/ mirror suite.)
 from services.mcp.cad_tools import register_cad_tools as _register_cad_tools
 
 

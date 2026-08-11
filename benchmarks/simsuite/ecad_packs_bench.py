@@ -57,7 +57,7 @@ def run(quick: bool = False) -> list[dict]:
         REG_ENG, MCU_ENG, PWR_TRACE_W_MM, J1_X, U1_X, U2_X)
     from engine.ecad import session as ecad_session
     from engine.ecad.pdn import RHO_CU_OHM_M, DEFAULT_COPPER_T_MM
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_tools import _ECAD
 
     try:
         import build123d  # noqa: F401

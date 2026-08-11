@@ -6,8 +6,8 @@ reference planes, extrude/cut/loft) was rebuilt faithfully, not just imported as
 
 Requirements (else the whole module SKIPS): SOLIDWORKS installed + pywin32 (COM extraction) and a
 staged ``dist/Chudware/libchudware.dll`` (the engine). Runnable two ways:
-    python -m mcp_server.test_sw_feature_import      # script style, prints a table
-    pytest mcp_server/test_sw_feature_import.py       # parametrised
+    python -m services.mcp.test_sw_feature_import      # script style, prints a table
+    pytest services/mcp/test_sw_feature_import.py       # parametrised
 The sample parts are the owner's (not in the repo); set CHUDWARE_SW_SAMPLES to the folder holding
 them, or it defaults to the known dev path. Missing files are skipped individually.
 """
@@ -20,7 +20,7 @@ import pytest
 
 from services.sw_import.sw_feature_import import solidworks_available
 from services.sw_import.sw_translate import resolve
-from mcp_server import core_bridge as cb
+from services.mcp import core_bridge as cb
 
 _SAMPLES = os.environ.get(
     "CHUDWARE_SW_SAMPLES", r"C:\Users\dev\Desktop\AI-opencad\sldprt reversing")

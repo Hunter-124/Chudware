@@ -16,7 +16,7 @@ does NOT provide:
   back to ``llama-server`` / ``llama-server.exe`` on PATH.
 
 Design note: this module deliberately does NOT re-implement spawn/health logic.
-It composes with ``installer.llamacpp.ensure_server_running()`` via cfg injection.
+It composes with ``services.installer.llamacpp.ensure_server_running()`` via cfg injection.
 
 GBNF grammar support: verified present in llama.cpp b9860 (the pinned release —
 see ``LLAMA_CPP_PINNED_BUILD``).  ``/v1/chat/completions`` accepts ``grammar``
@@ -217,7 +217,7 @@ def ensure_running(
     Parameters
     ----------
     cfg:
-        Configuration dict forwarded to ``installer.llamacpp.ensure_server_running()``.
+        Configuration dict forwarded to ``services.installer.llamacpp.ensure_server_running()``.
         Recognised keys: ``host``, ``port``, ``base_url``, ``server_path``,
         ``model_path``, ``ctx_size``, ``gpu_layers``, ``auto_start``,
         ``startup_timeout_sec``.
@@ -247,7 +247,7 @@ def ensure_running(
     LocalRuntimeError
         If the server cannot be started (binary missing, model missing, timeout).
     """
-    from installer import llamacpp  # services/installer — always present
+    from services.installer import llamacpp  # services/installer — always present
 
     cfg = dict(cfg or {})
 

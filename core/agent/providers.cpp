@@ -1,4 +1,4 @@
-// core/agent/providers.cpp — C++ port of agent/providers/*.py (see providers.h).
+// core/agent/providers.cpp — C++ port of services/agent/providers/*.py (see providers.h).
 #include "agent/providers.h"
 
 #include <algorithm>

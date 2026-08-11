@@ -14,11 +14,11 @@ face/edge/feature label comes for free from the engine's own feature tree and ow
 no manual annotation, no learned model. This is exactly the "free synthetic labels" the
 review doc names in §3.4.
 
-Usage (from the repo root — the ``mcp_server`` symlink -> services/mcp must resolve):
+Usage from the repo root (module execution keeps canonical packages importable):
 
-    python3 tools/gsl_dataset_gen.py --count 50
-    python3 tools/gsl_dataset_gen.py --count 10 --families plate_bolt_circle,turned_shaft
-    python3 tools/gsl_dataset_gen.py --count 5 --render --out corpora/gsl_dataset --seed 1000
+    python3 -m tools.gsl_dataset_gen --count 50
+    python3 -m tools.gsl_dataset_gen --count 10 --families plate_bolt_circle,turned_shaft
+    python3 -m tools.gsl_dataset_gen --count 5 --render --out corpora/gsl_dataset --seed 1000
 
 Consumers (downstream, not built by this script):
   - tools/gsl_eval.py       — measured-residual reverse-engineering eval harness (WS-D D2).
@@ -37,15 +37,8 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-# `tools/` sits directly under the repo root; the `mcp_server` symlink (-> services/mcp) also
-# lives at the repo root, so it is importable only once the repo root is on sys.path (running
-# `python3 tools/gsl_dataset_gen.py` puts `tools/` on sys.path[0], not the repo root).
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from mcp_server import core_bridge as cb  # noqa: E402
-from mcp_server.core_bridge import CoreError, dim, feat  # noqa: E402
+from services.mcp import core_bridge as cb
+from services.mcp.core_bridge import CoreError, dim, feat
 
 GENERATOR_VERSION = "1.0.0"
 
@@ -540,7 +533,7 @@ def _outline_text_for(doc_id: str) -> str:
     sibling task, so import it lazily and degrade to a placeholder on any failure instead of
     crashing the whole generation run."""
     try:
-        from mcp_server.gsl_tools import _digest, _outline_text  # noqa: PLC0415
+        from services.mcp.gsl_tools import _digest, _outline_text  # noqa: PLC0415
         return _outline_text(_digest(doc_id))
     except Exception as e:  # noqa: BLE001
         return f"(outline unavailable: {e!r})"

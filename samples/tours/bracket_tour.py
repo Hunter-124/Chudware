@@ -348,7 +348,7 @@ Next steps:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
 
     print("=" * 60)
     print("Chudware GUIDED TOUR: Designing a Mounting Bracket")

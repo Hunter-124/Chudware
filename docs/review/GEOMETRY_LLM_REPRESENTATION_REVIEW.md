@@ -34,7 +34,7 @@ The asymmetry across these is the whole story: **input is rich plain-English; ou
 
 ### 1.1 The read-back channel — `query_geometry` → `make_selector`
 
-`query_geometry` (`mcp_server/cad_tools.py:868`) → `doc_query` → `resolve_geom_query` (`core/doc/picks.cpp:598`) → **`make_selector`** (`core/doc/selectors.cpp:307`). Every matched face/edge is serialized as exactly these 7 fields:
+`query_geometry` (`services/mcp/cad_tools.py:868`) → `doc_query` → `resolve_geom_query` (`core/doc/picks.cpp:598`) → **`make_selector`** (`core/doc/selectors.cpp:307`). Every matched face/edge is serialized as exactly these 7 fields:
 
 ```
 kind          "face" | "edge" | "vertex"

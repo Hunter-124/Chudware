@@ -1,6 +1,6 @@
 # ProvisionOCCT.cmake — make the OCCT (Open CASCADE) 3D B-rep kernel available.
 #
-# Windows: mirrors the app's runtime-provisioning philosophy (installer/provision.py
+# Windows: mirrors the app's runtime-provisioning philosophy (services/installer/provision.py
 # for the Python runtime): if the kernel isn't already at the expected location,
 # DOWNLOAD and extract the official prebuilt VC14 binary — no manual install step.
 # Then find_package() it and expose a helper to deploy its DLLs next to an exe.

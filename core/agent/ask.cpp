@@ -1,4 +1,4 @@
-// core/agent/ask.cpp — see ask.h. C++-only (Python agent/ask.py mirror removed).
+// core/agent/ask.cpp — see ask.h. C++-only (Python services/agent/ask.py mirror removed).
 #include "agent/ask.h"
 
 #include <vector>

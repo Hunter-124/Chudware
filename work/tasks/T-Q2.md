@@ -57,7 +57,7 @@ risk. Need autosave/journal recovery and crash diagnostics that respect consent.
 - crash_bundle.install() called once from server._warm_core() after recovery.
 - GUI recovery prompt deferred — depends on unmerged T-U1 (sonnet-reed). The MCP-layer
   recover_parts tool is the primary recovery path; GUI prompt is a UX layer on top.
-- gate.sh: added mcp_server/ to per-dir pytest sweep; ignore
+- gate.sh: added services/mcp/ to per-dir pytest sweep; ignore
   services/mcp/test_autosave_recovery.py from services/ sweep (mcp namespace collision).
 - 20 tests, 25 total (including existing ecad_hardening) — all green.
 - Gate: PASS (pre-existing FAIL-RECORDED entries unchanged; T-V2 owns).
@@ -69,4 +69,4 @@ risk. Need autosave/journal recovery and crash diagnostics that respect consent.
   (offline ⇒ off) — import, don't reimplement.
 
 ## Progress log
-- 2026-07-02 23:12 UTC [sonnet-moss] Implementation complete on branch task/T-Q2-prod (bd6b2aa). Gate PASS. 20 new tests all green. Changes: (1) fixed _autosave_dir() Linux APPDATA bug → now uses engine.paths.appdata_root() (XDG); (2) periodic autosave timer (60s default, configurable, p95 logging); (3) crash_bundle.py module with consent-gated upload (off by default, dispatches only at full); (4) crash handler installed at server startup; (5) gate.sh: added mcp_server/ to pytest sweep, added ignore for services/mcp/test_autosave_recovery.py (mcp namespace collision). GUI recovery prompt deferred — depends on unmerged T-U1. Ready for review/merge.
+- 2026-07-02 23:12 UTC [sonnet-moss] Implementation complete on branch task/T-Q2-prod (bd6b2aa). Gate PASS. 20 new tests all green. Changes: (1) fixed _autosave_dir() Linux APPDATA bug → now uses engine.paths.appdata_root() (XDG); (2) periodic autosave timer (60s default, configurable, p95 logging); (3) crash_bundle.py module with consent-gated upload (off by default, dispatches only at full); (4) crash handler installed at server startup; (5) gate.sh: added services/mcp/ to pytest sweep, added ignore for services/mcp/test_autosave_recovery.py (mcp namespace collision). GUI recovery prompt deferred — depends on unmerged T-U1. Ready for review/merge.

@@ -1,4 +1,4 @@
-// core/agent/ask.h — C++-only Ask mode (Python agent/ask.py mirror removed).
+// core/agent/ask.h — C++-only Ask mode (Python services/agent/ask.py mirror removed).
 //
 // Ask mode: answer QUESTIONS about the open parametric part, mutating nothing.
 // Everything prompt-shaped lives here so it is gateable without the worker:

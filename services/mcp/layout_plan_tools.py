@@ -69,7 +69,7 @@ def _iso_now() -> str:
 
 def _core_bridge():
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
         return cb
     except Exception:
         return None

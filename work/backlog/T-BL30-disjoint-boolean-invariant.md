@@ -103,7 +103,7 @@ Verification:
   of the run.)
 - `ctest --test-dir core/build-linux`: 100% (42/42) passed.
 - `bash scripts/gate.sh`: RESULT: PASS. The three pre-existing `FAIL-RECORDED` pytest
-  buckets (mcp_server/services/engine_oracle) were inspected directly — every failure I
+  buckets (services/mcp/services/engine_oracle) were inspected directly — every failure I
   sampled is either a missing pytest fixture (`test_ecad_tools.py`, unrelated file I
   never touched) or `"unknown method: doc_sketch_solve"`/`"unknown method:
   sim_run_static"`, which `work/audits/SIM_AUDIT.md` (T-V1) already documents as a

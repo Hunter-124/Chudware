@@ -11,9 +11,9 @@ import time
 
 import pytest
 
-from agent.providers import sub_auth
-from agent.providers import subscription_login as sl
-from agent.providers import usage
+from services.agent.providers import sub_auth
+from services.agent.providers import subscription_login as sl
+from services.agent.providers import usage
 
 
 @pytest.fixture

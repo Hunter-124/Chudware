@@ -13,15 +13,15 @@ from unittest.mock import patch
 
 import pytest
 
-from agent import config as cfg
-from agent.providers import base
-from agent.providers.claude_cli_provider import (
+from services.agent import config as cfg
+from services.agent.providers import base
+from services.agent.providers.claude_cli_provider import (
     ClaudeCliProvider,
     MISSING_CLI_MSG as CLAUDE_MISSING,
     parse_cli_output as parse_claude,
     serialize_conversation as serialize_claude,
 )
-from agent.providers.codex_cli_provider import (
+from services.agent.providers.codex_cli_provider import (
     CodexCliProvider,
     MISSING_CLI_MSG as CODEX_MISSING,
     parse_cli_output as parse_codex,
@@ -147,7 +147,7 @@ def test_claude_complete_parses_json(monkeypatch):
         assert "--output-format" in argv
         return _completed(payload)
 
-    with patch("agent.providers.claude_cli_provider.subprocess.run", side_effect=fake_run):
+    with patch("services.agent.providers.claude_cli_provider.subprocess.run", side_effect=fake_run):
         out = p.complete("sys", _msgs(("user", "make a cube")))
     assert out == "cube done"
 
@@ -166,7 +166,7 @@ def test_codex_complete_parses_jsonl(monkeypatch):
         assert "--json" in argv
         return _completed(payload)
 
-    with patch("agent.providers.codex_cli_provider.subprocess.run", side_effect=fake_run):
+    with patch("services.agent.providers.codex_cli_provider.subprocess.run", side_effect=fake_run):
         out = p.complete("sys", _msgs(("user", "fillet")))
     assert out == "filleted"
 
@@ -175,7 +175,7 @@ def test_claude_complete_ex_empty_thinking():
     p = ClaudeCliProvider(check_binary=False)
     p._binary_path = "/usr/bin/claude"
     with patch(
-        "agent.providers.claude_cli_provider.subprocess.run",
+        "services.agent.providers.claude_cli_provider.subprocess.run",
         return_value=_completed(json.dumps({"result": "ok"})),
     ):
         text, thinking = p.complete_ex("s", _msgs(("user", "q")))
@@ -186,7 +186,7 @@ def test_claude_complete_ex_empty_thinking():
 # --------------------------------------------------------------------------- binary-missing error shape
 
 def test_claude_missing_binary_at_construct():
-    with patch("agent.providers.claude_cli_provider.shutil.which", return_value=None):
+    with patch("services.agent.providers.claude_cli_provider.shutil.which", return_value=None):
         with pytest.raises(RuntimeError) as ei:
             ClaudeCliProvider(check_binary=True)
     assert str(ei.value) == CLAUDE_MISSING
@@ -194,7 +194,7 @@ def test_claude_missing_binary_at_construct():
 
 
 def test_codex_missing_binary_at_construct():
-    with patch("agent.providers.codex_cli_provider.shutil.which", return_value=None):
+    with patch("services.agent.providers.codex_cli_provider.shutil.which", return_value=None):
         with pytest.raises(RuntimeError) as ei:
             CodexCliProvider(check_binary=True)
     assert str(ei.value) == CODEX_MISSING
@@ -203,7 +203,7 @@ def test_codex_missing_binary_at_construct():
 
 def test_claude_missing_binary_on_first_call():
     p = ClaudeCliProvider(check_binary=False)
-    with patch("agent.providers.claude_cli_provider.shutil.which", return_value=None):
+    with patch("services.agent.providers.claude_cli_provider.shutil.which", return_value=None):
         with pytest.raises(RuntimeError) as ei:
             p.complete("s", _msgs(("user", "q")))
     assert str(ei.value) == CLAUDE_MISSING
@@ -213,7 +213,7 @@ def test_claude_file_not_found_maps_to_missing():
     p = ClaudeCliProvider(check_binary=False)
     p._binary_path = "/no/such/claude"
     with patch(
-        "agent.providers.claude_cli_provider.subprocess.run",
+        "services.agent.providers.claude_cli_provider.subprocess.run",
         side_effect=FileNotFoundError("gone"),
     ):
         with pytest.raises(RuntimeError) as ei:
@@ -239,7 +239,7 @@ def test_cli_providers_never_offline_safe(name):
 
 def test_get_provider_claude_cli_constructs(monkeypatch):
     monkeypatch.setattr(
-        "agent.providers.claude_cli_provider.shutil.which",
+        "services.agent.providers.claude_cli_provider.shutil.which",
         lambda b: f"/usr/bin/{b}",
     )
     p = cfg.get_provider("claude-cli", {"model": "opus"})
@@ -252,7 +252,7 @@ def test_get_provider_claude_cli_constructs(monkeypatch):
 
 def test_get_provider_codex_cli_constructs(monkeypatch):
     monkeypatch.setattr(
-        "agent.providers.codex_cli_provider.shutil.which",
+        "services.agent.providers.codex_cli_provider.shutil.which",
         lambda b: f"/usr/bin/{b}",
     )
     p = cfg.get_provider("codex-cli", {"model": "gpt-5-codex"})

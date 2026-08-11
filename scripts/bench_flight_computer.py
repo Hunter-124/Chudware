@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 # Heavy ECAD tools (board_from_schematic / autoroute / 3d / dfm) are budget-
-# guarded at import time — set BEFORE importing mcp_server.ecad_tools.
+# guarded at import time — set BEFORE importing services.mcp.ecad_tools.
 os.environ.setdefault("CHUDWARE_ECAD_HEAVY_BUDGET_S", "180")
 os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
@@ -132,12 +132,12 @@ def run_leg(name: str, fn: Callable[[Leg], None]) -> Leg:
 
 
 def register_all_tools() -> dict:
-    from mcp_server.ecad_tools import register_ecad_tools
-    from mcp_server.ecad_thermal import register_ecad_thermal_tools
-    from mcp_server.ecad_reliability import register_ecad_reliability_tools
-    from mcp_server.antenna_tools import register_antenna_tools
-    from mcp_server.power_budget import register_power_budget_tools
-    from mcp_server.firmware_tools import register_firmware_tools
+    from services.mcp.ecad_tools import register_ecad_tools
+    from services.mcp.ecad_thermal import register_ecad_thermal_tools
+    from services.mcp.ecad_reliability import register_ecad_reliability_tools
+    from services.mcp.antenna_tools import register_antenna_tools
+    from services.mcp.power_budget import register_power_budget_tools
+    from services.mcp.firmware_tools import register_firmware_tools
 
     stub = _StubMCP()
     register_ecad_tools(stub)
@@ -526,7 +526,7 @@ def main() -> int:
         from engine.ecad import session as ecad_session
         sess = ecad_session.get_session(bid)
         try:
-            from mcp_server.ecad_tools import _default_outline_shapes
+            from services.mcp.ecad_tools import _default_outline_shapes
             shapes = _default_outline_shapes(sess.doc)
         except Exception:
             shapes = None

@@ -73,8 +73,8 @@ python3 scripts/check.py       # fast stdlib-only gate
 
 ## MCP / agents
 
-The MCP server ([services/mcp/](services/mcp), root `mcp_server` symlink) is a local
-stdio/JSON-RPC harness exposing the full modeling surface; the `cad_guide` tool carries
+The MCP server ([services/mcp/](services/mcp)) is a local stdio/JSON-RPC harness
+exposing the full modeling surface; the `cad_guide` tool carries
 modeling/CAM/ECAD guidance. Register it with your agent clients:
 
 ```bash
@@ -82,8 +82,8 @@ python3 services/installer/setup_mcp_clients.py           # (Windows: mcp_setup.
 python3 services/installer/setup_mcp_clients.py --detect  # verify
 ```
 
-The built-in copilot lives in [services/agent/](services/agent) (root `agent` symlink) with
-its chat UI in `host/src/ui/copilot/`.
+The built-in copilot lives in [services/agent/](services/agent), with its chat UI
+in `host/src/ui/copilot/`.
 
 **If you are an AI agent working on this repo**, read [AGENTS.md](AGENTS.md) first:
 orient with `graphify query "<question>"` (a hook enforces this), pick work from
@@ -100,7 +100,7 @@ verify with `bash scripts/gate.sh` before review.
 | [ui/viewport/](ui/viewport) | AICM mesh-format loader consumed by `core/` |
 | [platform/](platform) | Cross-OS shims (`_linux`/`_win32`) |
 | [contracts/](contracts) | Frozen interface contracts — the seams (append-only) |
-| [corpora/](corpora) | Test fixtures (root `corpus*` symlinks preserved) |
+| [corpora/](corpora) | Test fixtures, referenced through canonical `corpora/...` paths |
 | [work/](work) | Git-tracked solo task board (`tools/work.py`, `WORKFLOW.md`) |
 | [docs/](docs) | Design docs, status notes, handoffs |
 | tools/, scripts/, third_party/, assets/, packaging/, benchmarks/, training/ | Dev tools, repo gates, vendored deps, icons/fonts, packaging, perf benches, ML eval |

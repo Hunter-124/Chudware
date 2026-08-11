@@ -458,7 +458,7 @@ def _intake_dims(session_id: str, session: dict, rows: list):
     if not doc_id:
         return None
     try:
-        from mcp_server import core_bridge as cb  # noqa: PLC0415
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
         measured = cb.call(
             "doc_get_meta", {"doc_id": doc_id, "key": "measured_parts"}
         ).get("value")

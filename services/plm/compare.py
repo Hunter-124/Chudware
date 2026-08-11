@@ -282,7 +282,7 @@ def visual_compare(doc_a: dict[str, Any], doc_b: dict[str, Any],
                 "hint": "visual compare is not available for this document type yet"}
 
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
     except Exception:
         return dict(_DEGRADED_NO_ENGINE)
     try:

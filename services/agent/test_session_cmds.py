@@ -170,13 +170,12 @@ class TestCompactShakeDelegation(unittest.TestCase):
             "kept_messages": [{"role": "user", "content": [{"type": "text", "text": "holes"}]}],
             "cut_index": 2,
         }
-        fake_mod = types.ModuleType("agent.compaction")
+        fake_mod = types.ModuleType("services.agent.compaction")
         fake_mod.snapcompact_archive = lambda *a, **k: fake_result
         fake_mod.shake_messages = lambda *a, **k: {
             "messages": [], "saved_tokens": 0, "regions": [], "placeholders": 0,
         }
         with patch.dict(sys.modules, {
-            "agent.compaction": fake_mod,
             "services.agent.compaction": fake_mod,
         }):
             # Force re-import path: compact_session does lazy import each call
@@ -210,13 +209,12 @@ class TestCompactShakeDelegation(unittest.TestCase):
                 "cut_index": 0,
             }
 
-        fake_mod = types.ModuleType("agent.compaction")
+        fake_mod = types.ModuleType("services.agent.compaction")
         fake_mod.snapcompact_archive = _snap
         fake_mod.shake_messages = lambda *a, **k: {
             "messages": [], "saved_tokens": 0, "regions": [], "placeholders": 0,
         }
         with patch.dict(sys.modules, {
-            "agent.compaction": fake_mod,
             "services.agent.compaction": fake_mod,
         }):
             out = sc.compact_session(_history(), strategy="summary")
@@ -236,7 +234,7 @@ class TestCompactShakeDelegation(unittest.TestCase):
                 }],
             },
         ]
-        fake_mod = types.ModuleType("agent.compaction")
+        fake_mod = types.ModuleType("services.agent.compaction")
         fake_mod.shake_messages = lambda messages, **k: {
             "messages": shaken,
             "saved_tokens": 120,
@@ -248,7 +246,6 @@ class TestCompactShakeDelegation(unittest.TestCase):
             "kept_messages": messages if False else [], "cut_index": 0,
         }
         with patch.dict(sys.modules, {
-            "agent.compaction": fake_mod,
             "services.agent.compaction": fake_mod,
         }):
             out = sc.shake_session(_history(), mode="elide", aggressive=True)

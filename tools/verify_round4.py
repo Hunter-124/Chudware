@@ -13,8 +13,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mcp_server import core_bridge as cb
-from mcp_server.cad_tools import _persist_study
+from services.mcp import core_bridge as cb
+from services.mcp.cad_tools import _persist_study
 
 PASS, FAIL = "PASS", "FAIL"
 results = []

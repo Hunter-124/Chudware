@@ -506,8 +506,8 @@ def run_interface_check(
     plane_gap_tol_mm: float = DEFAULT_PLANE_GAP_TOL_MM,
 ) -> str:
     """Core implementation (importable by tests + the verify battery without going through MCP)."""
-    from mcp_server import core_bridge as cb
-    from mcp_server.cad_tools import _doc, _dumps, _err
+    from services.mcp import core_bridge as cb
+    from services.mcp.cad_tools import _doc, _dumps, _err
     try:
         d = _doc(doc_id)
         wb = cb.call("asm_world_bodies", {"doc_id": d, "explode": False})

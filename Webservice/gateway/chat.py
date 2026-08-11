@@ -1,4 +1,4 @@
-"""Portal shoutbox: WebSocket fan-out + SQLite history + presence.
+"""Portal shoutbox: WebSocket fan-out + Postgres history + presence.
 
 Exports:
   - router: APIRouter with WS /ws/chat and GET /api/chat/history
@@ -12,19 +12,18 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
-import aiosqlite
 from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 try:
-    from .config import settings
+    from .db import tx
     from .limits import chat_messages
 except ImportError:  # allow `python -c 'import chat'` from package dir
-    from config import settings  # type: ignore
+    from db import tx  # type: ignore
     from limits import chat_messages  # type: ignore
 
 log = logging.getLogger("chudware.gateway.chat")
@@ -83,60 +82,57 @@ presence = Presence()
 
 
 # ---------------------------------------------------------------------------
-# SQLite history
+# History (PostgreSQL — schema lives in migrations/0001_init.sql)
 # ---------------------------------------------------------------------------
 
-_DB_READY = False
-_DB_LOCK = asyncio.Lock()
+# These two stay `async def`: they are awaited from the WebSocket hot path and
+# from a request handler, and psycopg's pool is synchronous. Running the query
+# in a worker thread keeps a slow store from stalling every other socket in the
+# process — the same property aiosqlite gave us before the port.
 
 
-def _db_path() -> Path:
-    path = settings.chat_db
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+def _message_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "id": row["id"],
+        "user": row["email"],
+        "display": row["display"],
+        "text": row["text"],
+        "ts": row["ts"],
+    }
 
 
-async def _ensure_db() -> Path:
-    global _DB_READY
-    path = _db_path()
-    if _DB_READY:
-        return path
-    async with _DB_LOCK:
-        if _DB_READY:
-            return path
-        async with aiosqlite.connect(path) as db:
-            await db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts REAL NOT NULL,
-                    email TEXT NOT NULL,
-                    display TEXT NOT NULL,
-                    text TEXT NOT NULL
-                )
-                """
-            )
-            await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts)"
-            )
-            await db.commit()
-        _DB_READY = True
-        return path
+def _insert_message(ts: float, email: str, display: str, text: str) -> int:
+    with tx() as cur:
+        cur.execute(
+            "INSERT INTO messages (ts, email, display, text)"
+            " VALUES (%s, %s, %s, %s) RETURNING id",
+            (ts, email, display, text),
+        )
+        return int(cur.fetchone()["id"])
+
+
+def _select_history(limit: int) -> list[dict[str, Any]]:
+    with tx() as cur:
+        cur.execute(
+            """
+            SELECT id, ts, email, display, text
+            FROM messages
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    return [_message_row(r) for r in reversed(rows)]
 
 
 async def save_message(email: str, display: str, text: str, ts: float | None = None) -> dict[str, Any]:
-    path = await _ensure_db()
     ts = float(ts if ts is not None else time.time())
     email = (email or "").strip().lower()
     display = (display or email or "user").strip() or "user"
     text = (text or "").strip()
-    async with aiosqlite.connect(path) as db:
-        cur = await db.execute(
-            "INSERT INTO messages (ts, email, display, text) VALUES (?, ?, ?, ?)",
-            (ts, email, display, text),
-        )
-        await db.commit()
-        row_id = cur.lastrowid
+    row_id = await asyncio.to_thread(_insert_message, ts, email, display, text)
     return {
         "type": "message",
         "id": row_id,
@@ -148,33 +144,8 @@ async def save_message(email: str, display: str, text: str, ts: float | None = N
 
 
 async def load_history(limit: int = 100) -> list[dict[str, Any]]:
-    path = await _ensure_db()
     limit = max(1, min(int(limit or 100), 500))
-    async with aiosqlite.connect(path) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """
-            SELECT id, ts, email, display, text
-            FROM messages
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-        rows = await cur.fetchall()
-    out: list[dict[str, Any]] = []
-    for r in reversed(rows):
-        out.append(
-            {
-                "type": "message",
-                "id": r["id"],
-                "user": r["email"],
-                "display": r["display"],
-                "text": r["text"],
-                "ts": r["ts"],
-            }
-        )
-    return out
+    return await asyncio.to_thread(_select_history, limit)
 
 
 # ---------------------------------------------------------------------------

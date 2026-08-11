@@ -84,11 +84,10 @@ class CoreError(RuntimeError):
 # ---------------------------------------------------------------- library resolution
 
 def _repo_root() -> Path:
-    """Locate the repo root even when this file is reached via a Windows junction.
+    """Locate the repo root from the canonical ``services/mcp`` package path.
 
-    ``mcp_server`` is a symlink/junction to ``services/mcp``. ``Path.resolve()``
-    follows that, so ``parents[1]`` is ``services/`` — wrong. Walk up looking for
-    the monorepo markers instead.
+    Walking up to repository markers also supports the staged application layout
+    without relying on a compatibility junction.
     """
     here = Path(__file__).resolve()
     for p in [here.parent, *here.parents]:
@@ -96,8 +95,7 @@ def _repo_root() -> Path:
             (p / "services" / "mcp").is_dir() or (p / "core" / "api" / "libchudware.h").is_file()
         ):
             return p
-    # Fallback: pre-junction layout (repo/mcp_server/core_bridge.py)
-    return here.parents[1]
+    return here.parents[2]
 
 
 def _lib_name() -> str:
@@ -180,11 +178,11 @@ def _resolve_lib() -> Path:
 
 def _prompts_default() -> Path:
     """Where the staged/source agent prompts live for $CHUDWARE_PROMPTS_DIR. Prefers the
-    Windows dist stage when present, else the repo source (``agent/prompts``)."""
-    staged = dist_dir() / "app" / "agent" / "prompts"
+    Windows dist stage when present, else the repo source (``services/agent/prompts``)."""
+    staged = dist_dir() / "app" / "services" / "agent" / "prompts"
     if staged.is_dir():
         return staged
-    return _repo_root() / "agent" / "prompts"
+    return _repo_root() / "services" / "agent" / "prompts"
 
 
 # ---------------------------------------------------------------- DLL load (once)

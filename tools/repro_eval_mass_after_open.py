@@ -3,7 +3,7 @@
 Drives the C++ core directly via core_bridge (the same DLL the MCP loads).
 """
 import sys, os, tempfile, json
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "mcp_server"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services.mcp"))
 import core_bridge as cb
 
 

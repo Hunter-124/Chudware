@@ -16,21 +16,34 @@ https://chudware.com/app/
 
 Notes:
 
-- Local fallback (no CF Access):  
+- Local fallback (no sign-in):  
   `http://127.0.0.1:8399/app/?dev_user=haedmonds69@gmail.com`  
   (dev uvicorn with `CHUDWARE_WEB_DEV=1` only — not the public path.)
 
 ---
 
-## Login (Cloudflare Access)
+## Login (self-serve accounts, in the gateway)
 
 1. Open `https://chudware.com/app/` in **Chrome** (preferred) or Firefox.
-2. Cloudflare Access interstitial: **Sign in · Cloudflare Access** for host `chudware.com`.
-3. Authenticate with an allowlisted email (OTP and/or Google IdP if configured).
-   - Hunter admin emails: `haedmonds69@gmail.com`, `haedmonds@crimson.ua.edu`
-   - Allowlist lives in `~/chudware-web-data/users.yaml` and CF Access policy `chudware-users`.
-4. After Access sets the `CF_Authorization` cookie, the gateway validates `Cf-Access-Jwt-Assertion` and serves the WASM shell.
-5. Session duration is Access app default (**24h**). Re-auth only if cookie expired.
+2. Sign-in is the gateway's own now, and in this slice it is **API-only** — the hosted
+   sign-in form and marketing page land later. An unauthenticated HTML request gets a
+   401 page from `auth._deny_http`; an account that is authenticated but not `active`
+   gets a 403 status page whose copy depends on its state (pending / denied /
+   suspended / trial_expired).
+3. So seed every attendee **before** showtime:
+   ```bash
+   curl -sS -X POST https://chudware.com/api/auth/register \
+     -H 'content-type: application/json' \
+     -d '{"email":"guest@crimson.ua.edu","password":"<their password>"}'
+   ```
+   They click the emailed link (`GET /api/auth/verify?token=…`): it activates the account
+   on a 14-day trial and 303-redirects to `/` with the `chudware_sid` cookie already set,
+   so the first visit needs no separate login step.
+   - Hunter admin accounts: `haedmonds69@gmail.com`, `haedmonds@crimson.ua.edu`
+   - Anyone stuck at `pending` (unclicked link) can be approved from `/admin`.
+4. Returning users `POST /api/auth/login`, which sets the same `chudware_sid` cookie —
+   a server-side session row, TTL `CHUDWARE_WEB_SESSION_TTL_DAYS` (30 days).
+5. Cloudflare Access only challenges you on `/admin`; the demo path never sees it.
 
 ---
 
@@ -64,7 +77,7 @@ Cloudflare Tunnel is expected **not** to strip these origin headers on authentic
 
 ## ONE fallback if COOP/COEP is stripped by the tunnel
 
-If after Access login DevTools shows `crossOriginIsolated === false` (headers missing on HTML/JS/WASM):
+If after sign-in DevTools shows `crossOriginIsolated === false` (headers missing on HTML/JS/WASM):
 
 1. Vendor **`coi-serviceworker`** into `~/chudware-web/app/` and register it from `index.html` so the service worker rewrites responses to inject COOP/COEP (standard COI polyfill path).
 2. Hard-reload (or unregister old SW) once.
@@ -93,9 +106,9 @@ curl -sI -X GET 'http://127.0.0.1:8399/app/Chudware.wasm?dev_user=haedmonds69@gm
 #   cross-origin-embedder-policy: require-corp
 #   content-type: application/wasm   (for Chudware.wasm)
 
-# 4) Public path reaches Access (unauthenticated)
+# 4) Public path is served by the gateway, and refuses anonymous callers
 curl -sI https://chudware.com/app/ | head -15
-# Expect 302 → bruh234324.cloudflareaccess.com/.../login/chudware.com
+# Expect 401 from the gateway itself — NOT a redirect to bruh234324.cloudflareaccess.com
 ```
 
 Bundle on disk (served from `CHUDWARE_WEB_APP_DIR` default `~/chudware-web/app/`):
@@ -109,10 +122,10 @@ Bundle on disk (served from `CHUDWARE_WEB_APP_DIR` default `~/chudware-web/app/`
 
 ## Architecture (one line)
 
-Browser → Cloudflare Access → tunnel (`chudware-cloudflared`) → `chudware-gateway` `:8300` → static `/app` + WS `/engine` → shared `chudware-hostd` (`chudware-hostd`).
+Browser → Cloudflare Tunnel (`chudware-cloudflared`) → `chudware-gateway` `:8300` (session-cookie auth) → static `/app` + WS `/engine` → shared `chudware-hostd` (`chudware-hostd`).
 
 ---
 
 ## Talk track (30s)
 
-“This is the real Chudware GUI compiled to WASM, not a VNC stream. After Cloudflare Access, the browser loads the same ribbon and FeatureManager as desktop, talks to Hunter’s shared engine daemon over WebSocket, and stays cross-origin isolated so multi-threaded WASM can use SharedArrayBuffer.”
+“This is the real Chudware GUI compiled to WASM, not a VNC stream. After signing in, the browser loads the same ribbon and FeatureManager as desktop, talks to Hunter’s shared engine daemon over WebSocket, and stays cross-origin isolated so multi-threaded WASM can use SharedArrayBuffer.”

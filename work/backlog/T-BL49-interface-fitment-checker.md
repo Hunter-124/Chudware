@@ -127,7 +127,7 @@ fastener_passthrough}. Field names/`version` are frozen; additive-only changes b
   `"interface_check"` to its `_INTERFACE_VERIFIERS` map so the layout coverage gate consumes
   this tool's output. Gate reads top-level `ok` + any `findings[].severity=="fail"` (advisory
   `warn` does not fail the gate). JSON contract above is version 1, frozen (additive-only bumps
-  `version`). NOTE: the ctypes bridge (`mcp_server/core_bridge.py`) resolves the .so root as
+  `version`). NOTE: the ctypes bridge (`services/mcp/core_bridge.py`) resolves the .so root as
   `parents[1]` = the repo's `services/` dir, so its default search paths point under
   `services/core/build-*` which do not exist in a normal checkout; set
   `CHUDWARE_LIBCHUDWARE=<repo>/core/build-linux/bin/libchudware.so` (or stage the .so) to run the

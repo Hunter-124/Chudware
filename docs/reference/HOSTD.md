@@ -80,7 +80,7 @@ The key is what keeps independent installs from cross-talking:
 - **Installed (Windows)**: key = hash of
   `%LOCALAPPDATA%\Programs\Chudware\chudware-hostd.exe` (pinned via
   `CHUDWARE_HOSTD_BIN` in the registered MCP server env — see
-  `installer/register_mcp.py --hostd-bin`).
+  `services/installer/register_mcp.py --hostd-bin`).
 - **AppImage**: the squashfs mount point is **randomized per launch**, so
   hashing the resolved binary path would mint a new daemon every run. AppRun
   therefore exports `CHUDWARE_INSTANCE_KEY = sha256($APPIMAGE)[0:12]` — the stable

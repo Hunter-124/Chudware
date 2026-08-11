@@ -340,7 +340,7 @@ class RoleCard:
 
         catalog: dict[str, dict] = {}
         try:
-            from mcp_server import tool_registry as _reg  # noqa: PLC0415
+            from services.mcp import tool_registry as _reg  # noqa: PLC0415
             _reg.warm_catalog()
             catalog = dict(_reg.catalog() or {})
         except Exception:  # noqa: BLE001

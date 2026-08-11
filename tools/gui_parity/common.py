@@ -14,7 +14,7 @@ How it works (see work/tasks/T-G9.md scope additions):
      extra panel-init RPCs (gallery/parts/artifact list, etc.) — those are reported as
      informational, never as failures, and never hidden.
   4. Artifact-parity (gcode/DXF/PDF): the state-building requests from EACH binary's
-     captured stream are replayed through mcp_server.core_bridge (the same libchudware the
+     captured stream are replayed through services.mcp.core_bridge (the same libchudware the
      binaries load in-process), then the artifact RPCs (cam_post x8, export_drawing) are
      issued on top of each replayed state. host-derived vs aicad2-derived artifacts are
      byte-diffed. A panel that drove different engine calls => different artifacts.
@@ -178,12 +178,12 @@ def diff_streams(name: str, host_lines: list[str], new_lines: list[str]) -> dict
 # ---- core_bridge replay --------------------------------------------------------------------
 
 def bridge():
-    """Import mcp_server.core_bridge with the repo on sys.path."""
+    """Import services.mcp.core_bridge with the repo on sys.path."""
     if REPO not in sys.path:
         sys.path.insert(0, REPO)
     os.environ.setdefault("CHUDWARE_LIBCHUDWARE",
                           _default_libchudware())
-    from mcp_server import core_bridge  # noqa: PLC0415
+    from services.mcp import core_bridge  # noqa: PLC0415
     return core_bridge
 
 

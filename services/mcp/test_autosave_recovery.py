@@ -1,6 +1,6 @@
 """Tests for T-Q2: autosave, crash recovery & consent-tied diagnostics.
 
-Self-contained: imports go through ``mcp_server.*`` (not ``services.mcp.*``)
+Self-contained: imports go through ``services.mcp.*`` (not ``services.mcp.*``)
 so FastMCP/stdio infrastructure is never triggered in test mode.
 
 Coverage:
@@ -13,7 +13,7 @@ Coverage:
   6. Autosave cadence configurable via env var / start_periodic_autosave().
 
 Run:
-  python -m pytest mcp_server/test_autosave_recovery.py -v
+  python -m pytest services/mcp/test_autosave_recovery.py -v
 """
 from __future__ import annotations
 
@@ -24,8 +24,8 @@ import time
 
 import pytest
 
-import mcp_server.cad_common as cad_tools  # T-RF8: autosave internals moved
-import mcp_server.crash_bundle as crash_bundle
+import services.mcp.cad_common as cad_tools  # T-RF8: autosave internals moved
+import services.mcp.crash_bundle as crash_bundle
 
 
 @pytest.fixture(autouse=True)

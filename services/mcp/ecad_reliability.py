@@ -146,7 +146,7 @@ def detect_mount_holes(board: dict, user_holes: Optional[list] = None) -> list:
                         "ref": f"user{i + 1}", "source": "user"})
         return out
 
-    from mcp_server.ecad_common import _pad_world as pad_world  # pad local frame -> board frame
+    from services.mcp.ecad_common import _pad_world as pad_world  # pad local frame -> board frame
 
     footprints = board.get("footprints", []) or []
     if not isinstance(footprints, list):
@@ -495,8 +495,8 @@ def register_ecad_reliability_tools(mcp) -> None:
 
     # Same module identity as the rest of the server (see piping_tools note on the
     # double-import hazard).
-    from mcp_server.ecad_tools import _get_pcb, _default_out_dir
-    from mcp_server.ecad_common import OpError
+    from services.mcp.ecad_tools import _get_pcb, _default_out_dir
+    from services.mcp.ecad_common import OpError
 
     @mcp.tool()
     def ecad_vibe_check(doc_id: str = "",
@@ -739,7 +739,7 @@ def register_ecad_reliability_tools(mcp) -> None:
 
         # ── modal solve via the core solver ─────────────────────────────────
         try:
-            from mcp_server import core_bridge as cb
+            from services.mcp import core_bridge as cb
         except Exception as e:  # noqa: BLE001
             cb = None
             solve_err: Optional[str] = f"core bridge import failed: {e}"

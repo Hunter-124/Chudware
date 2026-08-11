@@ -13,8 +13,8 @@ import uuid
 
 import pytest
 
-from mcp_server import daemon_bridge
-from mcp_server.daemon_bridge import DaemonClient, DaemonError
+from services.mcp import daemon_bridge
+from services.mcp.daemon_bridge import DaemonClient, DaemonError
 
 HOSTD = daemon_bridge.resolve_hostd_bin()
 
@@ -92,7 +92,7 @@ def test_core_bridge_daemon_mode_raises_coreerror(scratch_daemon, monkeypatch):
     monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
     # Reset the daemon_bridge singleton so it picks up the scratch key.
     monkeypatch.setattr(daemon_bridge, "_client", None)
-    from mcp_server import core_bridge
+    from services.mcp import core_bridge
 
     r = core_bridge.call("doc_new", {"name": "via-core-bridge"})
     assert "doc_id" in r

@@ -215,26 +215,26 @@ def _get_fn(module_key: str, fn_name: str):
         _mcp = FastMCP(f"battery-{module_key}")
         if module_key == "firmware":
             try:
-                from mcp_server.firmware_tools import register_firmware_tools
+                from services.mcp.firmware_tools import register_firmware_tools
                 register_firmware_tools(_mcp)
             except ImportError:
                 pass  # [~] WS-C may not be merged yet
         elif module_key == "structural":
             try:
-                from mcp_server.structural_tools import register_structural_tools
+                from services.mcp.structural_tools import register_structural_tools
                 register_structural_tools(_mcp)
             except ImportError:
                 pass  # [~] WS-D
         elif module_key == "sourcing":
             try:
-                from mcp_server.sourcing_tools import register_sourcing_tools
+                from services.mcp.sourcing_tools import register_sourcing_tools
                 register_sourcing_tools(_mcp)
             except ImportError:
                 pass  # [~] WS-B
         elif module_key == "reveng":
             # RE-17 — get_reveng_deviation for the reveng_deviation verify node.
             try:
-                from mcp_server.reveng_tools import register_reveng_tools
+                from services.mcp.reveng_tools import register_reveng_tools
                 register_reveng_tools(_mcp)
             except ImportError:
                 pass  # [~] RE wave not merged / backend absent

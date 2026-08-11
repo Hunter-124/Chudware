@@ -29,15 +29,15 @@ SECURITY: POST /api/billing/webhook is a NEW unauthenticated route reachable
 from the internet (Stripe calls it). It must be added to auth.PUBLIC_PATHS
 (see the wiring snippet in the rollout report). Its only protection is Stripe
 signature verification — anything unverified is rejected with 400 before any
-parsing or side effect, the body is size-capped, and event ids are persisted
-so Stripe's at-least-once redelivery cannot apply an entitlement twice.
+parsing or side effect, the body is size-capped, and event ids are persisted in
+the same transaction as the entitlement mutation so Stripe's at-least-once
+redelivery cannot apply an entitlement twice.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import sqlite3
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -49,10 +49,12 @@ from pydantic import BaseModel
 try:
     from .auth import get_current_user
     from .config import settings
+    from .db import tx
     from .plans import PLANS, is_purchasable, limits_for
 except ImportError:  # uvicorn app:app from the package dir
     from auth import get_current_user
     from config import settings
+    from db import tx
     from plans import PLANS, is_purchasable, limits_for
 
 log = logging.getLogger("chudware-web.billing")
@@ -163,56 +165,33 @@ def _store() -> AccountStore:
 # ---------------------------------------------------------------------------
 
 
-def _events_db_path() -> Path:
-    return settings.data_root / "billing_webhook_events.sqlite3"
-
-
-_SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS processed_events ("
-    " event_id TEXT PRIMARY KEY,"
-    " event_type TEXT NOT NULL,"
-    " processed_at REAL NOT NULL)"
-)
-
-
 def _process_event_once(event: Any) -> bool:
     """Apply ``event`` exactly once. Returns False for a redelivery.
 
-    The check, the entitlement mutation, and the idempotency record commit in
-    one IMMEDIATE transaction, so a crash mid-handler rolls everything back and
-    Stripe's retry is processed normally.
+    The idempotency record and the entitlement mutation commit in ONE
+    transaction: ``tx()`` is re-entrant, so the ``accounts`` writes performed by
+    ``_apply_event`` join the transaction opened here instead of running in
+    their own. A crash mid-handler therefore rolls BOTH back and Stripe's retry
+    is processed normally, and a half-applied entitlement is not reachable.
+
+    Insert first, ask questions later: ``ON CONFLICT DO NOTHING`` takes the row
+    lock, so two concurrent deliveries of the same event serialize on it and the
+    loser sees zero affected rows. A SELECT-then-INSERT would let both pass the
+    check before either wrote.
     """
     event_id = str(event["id"])
     event_type = str(event["type"])
-    path = _events_db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, isolation_level=None)
-    try:
-        conn.execute(_SCHEMA)
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT 1 FROM processed_events WHERE event_id = ?", (event_id,)
-        ).fetchone()
-        if row is not None:
-            conn.execute("ROLLBACK")
+    with tx() as cur:
+        cur.execute(
+            "INSERT INTO processed_events (event_id, event_type, processed_at)"
+            " VALUES (%s, %s, %s) ON CONFLICT (event_id) DO NOTHING",
+            (event_id, event_type, time.time()),
+        )
+        if cur.rowcount == 0:
             log.info("duplicate Stripe event %s (%s) — ignored", event_id, event_type)
             return False
         _apply_event(_store(), event)
-        conn.execute(
-            "INSERT INTO processed_events (event_id, event_type, processed_at)"
-            " VALUES (?, ?, ?)",
-            (event_id, event_type, time.time()),
-        )
-        conn.execute("COMMIT")
         return True
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------

@@ -17,13 +17,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# `dag` resolves via the repo-root symlink (dag -> services/dag, matching
-# agent/deliverables/engine/installer/mcp_server) — see services/dag/conftest.py for why
-# this no longer does sys.path.insert(0, services_dir) (T-V3: that shadowed the real mcp SDK).
-from dag import context_pack as cp
-from dag import node_runner as nr
-from dag import executor, graph_loader
-from dag.graph_loader import GraphValidationError, build_state_graph, validate_graph
+# Canonical imports keep the repo root on ``sys.path`` and never shadow the
+# installed MCP SDK with ``services/mcp`` as a top-level ``mcp`` package.
+from services.dag import context_pack as cp
+from services.dag import node_runner as nr
+from services.dag import executor, graph_loader
+from services.dag.graph_loader import GraphValidationError, build_state_graph, validate_graph
 
 
 # ---------------------------------------------------------------------------
@@ -585,7 +584,7 @@ class TestRoleCardWiring:
         return _fn, captured
 
     def test_role_node_injects_prompt_and_tools(self):
-        from mcp_server import tool_registry as reg
+        from services.mcp import tool_registry as reg
         reg.reset_policy()
         agent_fn, captured = self._captured_pack()
         node = {"id": "n1", "type": "design", "name": "Sketch",
@@ -923,7 +922,7 @@ class TestMissionNodeRequests:
         }
 
     def test_build_node_request_carries_manifest_content(self):
-        from dag.mission_template import build_mission_graph
+        from services.dag.mission_template import build_mission_graph
         graph = build_mission_graph(self._manifest(), graph_id="t")
         build = next(n for n in graph["nodes"] if n["id"] == "n_build_DL1")
         req = build["inputs"]["request"]
@@ -932,7 +931,7 @@ class TestMissionNodeRequests:
         assert "clearance in [0.007,0.041]" in req      # the pass rule
 
     def test_every_mission_node_has_a_request(self):
-        from dag.mission_template import build_mission_graph
+        from services.dag.mission_template import build_mission_graph
         graph = build_mission_graph(self._manifest(), graph_id="t", org_layer=True)
         for n in graph["nodes"]:
             assert n["inputs"].get("request"), f"{n['id']} has no request"
@@ -941,7 +940,7 @@ def test_role_policy_is_scoped_to_the_turn():
     """T-W30 gate-sweep regression: applying a role card's allowlist must NOT
     leak into the process-global tool_registry after the node turn returns
     (it broke ~78 unrelated cad/gsl tool tests in the combined sweep)."""
-    from mcp_server import tool_registry as reg
+    from services.mcp import tool_registry as reg
     reg.reset_policy()
     assert reg.is_allowed("export_part")  # default: everything allowed
     node = {"id": "n1", "type": "design", "name": "BUILD DL1",

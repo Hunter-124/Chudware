@@ -315,7 +315,7 @@ def _make_doc_id_opener():
     hardcoded sibling-worktree path — resolution is entirely core_bridge's, via
     $CHUDWARE_LIBCHUDWARE / $CHUDWARE_DIST / the build dirs)."""
     try:
-        from mcp_server import core_bridge as cb  # noqa: local import, core-only path
+        from services.mcp import core_bridge as cb  # noqa: local import, core-only path
     except Exception:
         return None
     if not cb.available():
@@ -374,7 +374,7 @@ def score_example(spec: dict, *, doc_id_opener=None) -> ExampleScore:
         try:
             op_feature = _to_op_feature(sketch)
             doc_id = doc_id_opener(op_feature)
-            from mcp_server import core_bridge as cb  # noqa: local import, core-only path
+            from services.mcp import core_bridge as cb  # noqa: local import, core-only path
             from services.verify.battery import verify  # noqa: local import, core-only path
             fid = op_feature["id"]
             battery = verify(doc_id, ["check_sketch"], sketch=fid)

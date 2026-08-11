@@ -36,7 +36,7 @@ struct CopilotModes {
     std::set<std::string> swarm_extras;     // unioned onto swarm role-cards
     // Always-on MAIN-agent loadout (file handling, shell, web fetch) unioned
     // onto the advertised list AND dispatch policy for unrestricted modes
-    // (agent/swarm) even when a role card narrows the tool list. Absent key
+    // (services/agent/swarm) even when a role card narrows the tool list. Absent key
     // in the contract -> stays empty (mirrors Python's dict.get(key, ())).
     std::set<std::string> agent_defaults;
     // File-handling floor unioned onto every DAG-node/subagent role loadout
@@ -56,7 +56,7 @@ struct CopilotModes {
 std::string copilot_normalize_mode(const CopilotModes& cm, const std::string& mode);
 
 // Mirrors services/agent/copilot_mode_tools.apply_mode_tools():
-//   std::nullopt  — unrestricted (agent/swarm with no role card)
+//   std::nullopt  — unrestricted (services/agent/swarm with no role card)
 //   vector        — sorted allowed tool names
 // plan_only forces plan semantics under any mode.
 std::optional<std::vector<std::string>> copilot_apply_mode_tools(

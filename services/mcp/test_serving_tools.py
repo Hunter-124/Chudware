@@ -14,7 +14,7 @@ import json
 import pytest
 
 from mcp.server.fastmcp import FastMCP
-from mcp_server.serving_tools import register_serving_tools
+from services.mcp.serving_tools import register_serving_tools
 
 
 @pytest.fixture()

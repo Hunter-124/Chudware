@@ -27,7 +27,7 @@ default; Chudware Cloud relay is a config seam only, human-gated).
 - `services/agent/providers/` — conform existing adapters; OpenRouter PKCE adapter
 - `services/mcp/server.py` + a new registry module — tool tags (family + risk class:
   read/write/spend/external) enforced at dispatch
-- `installer/setup_mcp_clients.py` — first-run "connect your client" wizard groundwork
+- `services/installer/setup_mcp_clients.py` — first-run "connect your client" wizard groundwork
 
 ## Definition of done
 
@@ -51,11 +51,11 @@ default; Chudware Cloud relay is a config seam only, human-gated).
   never-offline-safe). Prohibited consumer-OAuth grep gate in `test_prohibited_auth.py`.
 - Installer path is `services/installer/setup_mcp_clients.py` (task listed `installer/…`);
   added `--detect` / `--wizard` groundwork.
-- New tests live under `agent/` (the gate runs `pytest engine/doc agent`; `services/mcp`
+- New tests live under `agent/` (the gate runs `pytest engine/doc services/agent`; `services/mcp`
   tests are NOT in the gate path — a pre-existing gap): test_tool_registry,
   test_openrouter_pkce, test_providers_conformance, test_prohibited_auth — all green
   (openai/anthropic-SDK cases importorskip; SDKs absent on this box).
-- Gate caveat: `pytest engine/doc agent` has PRE-EXISTING failures in `test_loop_mock` /
+- Gate caveat: `pytest engine/doc services/agent` has PRE-EXISTING failures in `test_loop_mock` /
   `test_compaction` (`ModuleNotFoundError: build123d`) reproduced on clean master by stash —
   NOT a T-F9 regression; environmental (no runtime venv, build123d unprovisioned). The
   ui/imgui selMulti break is the separately-known pre-existing red.

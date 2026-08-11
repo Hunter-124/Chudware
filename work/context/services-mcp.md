@@ -1,6 +1,6 @@
 # services/mcp — MCP server (Chudware engine exposed to external agents)
 
-Scope: services/mcp/**, root `mcp_server` symlink (the stdio MCP server)
+Scope: services/mcp/** (the stdio MCP server)
 Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.md,
            contracts/feature_params.md, contracts/ecad/ecad_rpc.md,
            contracts/narration.md, contracts/interaction.md, contracts/requirements.md,
@@ -125,7 +125,7 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
   geometry battery narrated via contracts/narration.md: design_review(doc_id, checks?).
 - services/mcp/intake_ledger.py `IntakeLedger(doc_id)` — doc-scoped interaction answer store (contracts/interaction.md §5): persists ask_user Q/A inside the doc's IntakeState meta record (rides the .step+, survives save/reopen — doc_id is per-process, the record travels with the doc); no FastMCP import, get/set injectable for engine-less tests. Used by intake_tools._ask_via_contract and ask_user's scope=doc default ledger (T-BL25)
 - services/mcp/core_bridge.py:20 `call(method, params)` — the one engine funnel (JSON string-in/out). DEFAULT (Phase-8 flip): routes through the shared chudware-hostd daemon via daemon_bridge.py; explicit CHUDWARE_ENGINE_DAEMON=0 = legacy in-process ctypes load (resolves library via $CHUDWARE_LIBCHUDWARE / $CHUDWARE_DIST / build dirs)
-- services/mcp/test_roundtrip.py:5 `python -m mcp_server.test_roundtrip` — integration test: list tools, new_part, add_features, render, measure, run_fea_static, export
+- services/mcp/test_roundtrip.py:5 `python -m services.mcp.test_roundtrip` — integration test: list tools, new_part, add_features, render, measure, run_fea_static, export
 
 ## How it connects
 
@@ -146,7 +146,7 @@ MCP tools, NOT through the worker socket. ECAD is pure Python until 3D (board_to
 
 ## Debugging playbook
 
-- Run: `python -m mcp_server.test_roundtrip` — full MCP roundtrip (new_part, add_features,
+- Run: `python -m services.mcp.test_roundtrip` — full MCP roundtrip (new_part, add_features,
   render, FEA, export); prints each step. Requires libchudware.so.
 - Run: `python -m pytest services/mcp/test_mcp_freshness.py -v` — freshness/consistency
   test: every tool family discoverable from server instructions + cad_guide. No libchudware needed.
@@ -175,7 +175,7 @@ The test runs in the pytest gate stage (no libchudware.so needed).
 
 ## Graphify starters
 
-- graphify query "mcp_server call cad_guide new_part add_features render_part"
+- graphify query "services.mcp call cad_guide new_part add_features render_part"
 - graphify query "register_cad_tools register_gsl_tools register_cam_tools server.py"
 - graphify explain "core_bridge call"
 - graphify path "server.py" "core_bridge.py"

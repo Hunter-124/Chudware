@@ -688,7 +688,7 @@ add_library(chudware_aicm STATIC
 target_include_directories(chudware_aicm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # --- libchudware agent (LLM provider layer; WinHTTP TLS, OCCT-free) -------------
-# P51: C++ port of agent/providers/*.py — the request builders + response parsers
+# P51: C++ port of services/agent/providers/*.py — the request builders + response parsers
 # for Anthropic / OpenAI-compatible / llama.cpp / mock providers, plus a native
 # WinHTTP POST (no libcurl/OpenSSL). Top-level (NOT inside if(CHUDWARE_WITH_OCCT)) so
 # it builds in both configs. Dynamic CRT to match chudware_miniz / the DLL heap.
@@ -736,7 +736,7 @@ target_include_directories(test_agent PRIVATE ${doctest_SOURCE_DIR})
 target_link_libraries(test_agent PRIVATE chudware_agent)
 set_target_properties(test_agent PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-# test_agent loads role prompts from the repo-relative agent/prompts/ — run it from
+# test_agent loads role prompts from the repo-relative services/agent/prompts/ — run it from
 # the repo root (core/..) so the lookup resolves regardless of where ctest is invoked.
 add_test(NAME agent COMMAND test_agent WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
@@ -826,7 +826,7 @@ add_test(NAME aicm COMMAND test_aicm)
 # Generates EDITABLE geometry for off-the-shelf hardware (fasteners/nuts/washers/
 # standoffs/bearings/inserts/dowels) by EMITTING document ops — so it is OCCT-free
 # (only JSON; the doc engine compiles the geometry). The numbers mirror
-# agent/prompts/shared/cheatsheets/hardware.md. Linked into the libchudware DLL below
+# services/agent/prompts/shared/cheatsheets/hardware.md. Linked into the libchudware DLL below
 # (parts_make / parts_catalog_list RPCs) and unit-tested in both configs.
 # parts/place.cpp (T-RF19 place.py port) is the part_place / part_import_file
 # placement router: the symbol_footprint leg drives chudware_ecad's apply_ops and

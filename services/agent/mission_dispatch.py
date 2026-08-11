@@ -1184,7 +1184,7 @@ class MissionDispatch:
                     "node_inputs": {"task_class": self.task_class, "depth": depth},
                 }
                 # Harness role for model resolve:
-                #  - leaf workers stay on "task" (cheap) under agent/swarm
+                #  - leaf workers stay on "task" (cheap) under services/agent/swarm
                 #  - plan mode → planning; edit → task
                 #  - node role overrides for orchestrator/advisor seats
                 # Top-level turns use role_for_copilot_mode at the entry path;
@@ -1402,7 +1402,7 @@ class MissionDispatch:
                 pass
             # Restricted allowlists (mode or role card): ensure meta-tools so the
             # model can expand categories. advise folds into SHARED_DEFAULT_TOOLS
-            # for ask/plan/edit; for agent/swarm role cards inject when advisor on.
+            # for ask/plan/edit; for services/agent/swarm role cards inject when advisor on.
             try:
                 if allowed is not None:
                     for _meta in ("enable_tools", "list_tool_categories"):

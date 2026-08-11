@@ -11,7 +11,7 @@ RPC surface).
 A DETERMINISTIC PYTHON STATE MACHINE drives the whole flow. Code decides every transition; the
 model only makes scoped decisions (the design intent) inside one bounded stage. This mirrors the
 CAD orchestrator philosophy (docs/PLAN.md sec 3.1 / ECAD_PLAN.md sec 2.6) and reuses the agent-loop
-discipline (agent/loop.py): bounded retries, a same-error / fail-streak detector, and rich,
+discipline (services/agent/loop.py): bounded retries, a same-error / fail-streak detector, and rich,
 actionable feedback nudges. The point is that a WEAK local model succeeds because code does the
 bookkeeping + validation, and a recipe fallback guarantees a result no matter what the model emits.
 
@@ -33,7 +33,7 @@ parsed/result):
   4. SIMULATE     -- netlist -> SPICE -> simulate the study; compare the key result to the plan's
                     `expect` within tolerance. Records pass/fail; never loops forever.
   5. REPORT       -- return a DesignRun with the stage events, applied ops, ERC, sim, and a
-                    stop_reason mirroring agent/loop.py (confirmed | stabilized | failed | fallback
+                    stop_reason mirroring services/agent/loop.py (confirmed | stabilized | failed | fallback
                     | max_attempts).
 
 Compaction by construction: each model call gets a FRESH bounded context (request + a catalog
@@ -753,7 +753,7 @@ def run_design(request: str, *, provider=None, doc_id: str | None = None,
                recipe_used: str | None = None) -> DesignRun:
     """Run the full deterministic design pipeline for *request*; return a :class:`DesignRun`.
 
-    ``provider`` is any agent.providers Provider (a MockProvider in tests). When None, the PLAN
+    ``provider`` is any services.agent.providers Provider (a MockProvider in tests). When None, the PLAN
     stage is skipped and the closest recipe is used directly -- the run still produces + verifies a
     real schematic. ``session`` lets a caller pass an existing EcadSession (else one is created).
 

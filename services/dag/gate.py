@@ -31,7 +31,7 @@ from langgraph.types import interrupt
 try:
     from services.agent.interaction import FileLedger, MemoryLedger
 except ImportError:
-    from agent.interaction import FileLedger, MemoryLedger  # type: ignore
+    from services.agent.interaction import FileLedger, MemoryLedger  # type: ignore
 
 # Local type aliases (avoid circular import with graph_loader).
 # DagState and EmitFn are also defined in graph_loader; use the same shapes.

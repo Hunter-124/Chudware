@@ -21,8 +21,8 @@ from __future__ import annotations
 import json
 import math
 
-from mcp_server.ecad_common import ecad_session
-from mcp_server.ecad_tools import _ECAD, register_ecad_tools
+from services.mcp.ecad_common import ecad_session
+from services.mcp.ecad_tools import _ECAD, register_ecad_tools
 from services.ecad import schema
 
 

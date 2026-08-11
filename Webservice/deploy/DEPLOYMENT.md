@@ -46,7 +46,6 @@ Ingress table (all → local services on `127.0.0.1`):
 | `cad.scootware.us` | `http://127.0.0.1:8300` (FastAPI gateway) |
 | `chudware.com` | `http://127.0.0.1:8300` |
 | `www.chudware.com` | `http://127.0.0.1:8300` |
-| `sso.chudware.com` | `http://127.0.0.1:8301` (oauth2-proxy, Microsoft Entra front door — NOT behind the Access app) |
 | *(catch-all)* | `http_status:404` |
 
 ## Cloudflare Access
@@ -59,26 +58,35 @@ Ingress table (all → local services on `127.0.0.1`):
   single `CHUDWARE_WEB_CF_AUD` (`Webservice/gateway/auth.py`). A per-domain app
   would mint a different AUD and JWT validation would fail. Add new domains to
   THIS app's `self_hosted_domains`, never as a new app.
-- Policy "billet-users": explicit user allowlist + `email_domain` rules
+- Policy "billet-users": explicit operator allowlist + `email_domain` rules
   (`ua.edu`, `crimson.ua.edu`). CF `email_domain` is an EXACT match (no
   subdomain wildcard), so each domain must be listed explicitly.
+- Access is the **operator door only** — it gates `/admin`. Ordinary visitors
+  authenticate to the gateway itself with a `chudware_sid` session, and the
+  gateway assigns roles from the account store, never from this policy.
 
-## Allowlist / users file (production)
+## Accounts (production)
 
-The tracked `Webservice/gateway/users.yaml` is a **template that grants nobody
-access**. Production MUST load the real allowlist from a file OUTSIDE the repo:
+There is no allowlist file. Accounts live in PostgreSQL (`accounts`, plus the
+credential, session and email-token tables created by
+`Webservice/gateway/migrations/*.sql`) and people create their own:
 
-- Set `CHUDWARE_WEB_USERS_FILE=/path/to/users.yaml` (e.g.
-  `~/chudware-web-data/users.yaml`, `chmod 600`) in the gateway env.
-- On startup `config.py`'s `ensure_data_dirs()` seeds that path from the repo
-  template if it does not exist — the seeded file grants nobody access, so a
-  fresh boot serves health checks but logs NOBODY in. This is safe but silent.
-- **Recovery if locked out:** edit the runtime file pointed to by
-  `CHUDWARE_WEB_USERS_FILE` (add your email with `role: admin`), or unset the
-  override so the repo template is used, then restart the gateway. Admin role
-  changes also require a matching entry in the CF Access policy — run
-  `python3 Webservice/deploy/cf_provision.py --sync-users` to push the runtime
-  users file into the Access allow policy.
+- `POST /api/auth/register` stores an argon2id password hash and mails a
+  verification link; redeeming the link activates the account on a 14-day trial
+  (`CHUDWARE_WEB_TRIAL_DAYS`) and opens a server-side session carried by the
+  `chudware_sid` cookie.
+- Optional Google/GitHub sign-in resolves to the same rows — set
+  `CHUDWARE_WEB_GOOGLE_CLIENT_ID`/`_SECRET` and/or
+  `CHUDWARE_WEB_GITHUB_CLIENT_ID`/`_SECRET` in the gateway env.
+- `CHUDWARE_WEB_SESSION_SECRET` is required: outside dev mode the gateway
+  refuses to start without it unless CF Access is fully configured. Generate one
+  with `python3 -c 'import secrets;print(secrets.token_urlsafe(48))'`.
+- Admins approve, deny and suspend from `/admin`
+  (`POST /api/admin/accounts/{email}/{approve,deny,suspend}`).
+- **Recovery if locked out:** promote yourself in the database —
+  `UPDATE accounts SET role='admin', status='active' WHERE email='you@example.com';`
+  — then sign in normally. `/admin` also sits behind Cloudflare Access, so that
+  address must be in the Access allow policy too.
 
 ## Safe application updates
 
@@ -92,10 +100,12 @@ unit restart, or readiness probe exits nonzero instead of reporting success
 over a mixed/stale deployment.
 
 Before a shared-daemon restart, the installer reads the authenticated
-`engine_bridges` value from detailed `/healthz` using the loopback SSO secret
-and an active administrator account. Missing authentication, missing
-telemetry, or an unreachable gateway fails closed; a nonzero bridge count
-defers the restart rather than disconnecting active browser sessions.
+`engine_bridges` value from detailed `/healthz`. It resolves an active
+administrator account, mints a short-lived ops session for it
+(`python -m authn ops-session`), and sends that session as the `chudware_sid`
+cookie. A session it cannot mint, missing telemetry, or an unreachable gateway
+fails closed; a nonzero bridge count defers the restart rather than
+disconnecting active browser sessions.
 Anonymous `/healthz` intentionally remains the bare `{"ok": true}` liveness
 contract and must not be used for drain decisions.
 

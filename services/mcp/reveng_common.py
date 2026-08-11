@@ -19,7 +19,7 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 
 # ── helpers from cad_tools (already loaded) ────────────────────────────────
-from mcp_server.cad_tools import _dumps, _err  # type: ignore[attr-defined]
+from services.mcp.cad_tools import _dumps, _err  # type: ignore[attr-defined]
 
 # ── RE-29: research ingest orchestrator ────────────────────────────────────
 try:
@@ -385,7 +385,7 @@ def _call_reverse_engineer(
     """
     try:
         from mcp.server.fastmcp import FastMCP  # noqa: PLC0415
-        from mcp_server.recon_tools import register_recon_tools  # noqa: PLC0415
+        from services.mcp.recon_tools import register_recon_tools  # noqa: PLC0415
 
         mcp = FastMCP("_reveng_internal")
         register_recon_tools(mcp)

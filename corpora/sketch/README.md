@@ -1,4 +1,4 @@
-# `corpus/` — differential-test fixtures (Python oracle ↔ C++ port)
+# `corpora/sketch/` — differential-test fixtures (Python oracle ↔ C++ port)
 
 Each `*.json` file here is one sketch-solver fixture. The differential runner
 `tools/solver_diff.py` feeds every fixture to **both** engines and diffs the

@@ -238,7 +238,7 @@ def _verify_envelope(result: dict) -> dict:
 def register_piping_tools(mcp) -> None:
     """Register the AI-Piping tools on the given FastMCP instance.
 
-    Called from ``mcp_server/server.py`` after ``mcp`` is created. A function (not import-time
+    Called from ``services/mcp/server.py`` after ``mcp`` is created. A function (not import-time
     side effects) so the tools can be driven against a stub ``mcp`` in tests without importing the
     whole stdio server — mirrors :func:`register_ecad_tools`.
     """
@@ -618,7 +618,7 @@ def register_piping_tools(mcp) -> None:
         try:
             # Call via core_bridge sim_run_flow (what run_cfd_flow uses internally).
             # NB: never `from services.mcp import cad_tools` here — every other tool
-            # module imports it as `mcp_server.cad_tools`, and a second module identity
+            # module imports it as `services.mcp.cad_tools`, and a second module identity
             # would mean a second _PERIODIC_TIMER (the autosave thread-leak class).
             prog_path = os.path.join(tmp_dir, "progress.json")
             cfd_raw = cb.call("sim_run_flow", {

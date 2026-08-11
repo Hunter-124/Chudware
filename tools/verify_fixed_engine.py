@@ -1,6 +1,6 @@
 """
 Verification script for the freshly-staged libchudware.dll.
-Drives the engine directly through mcp_server.core_bridge (no live MCP server).
+Drives the engine directly through services.mcp.core_bridge (no live MCP server).
 
 Tests:
   1. PLUMBING       – box 20^3 -> eval_mass -> volume ≈ 8000 mm³
@@ -33,7 +33,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 os.environ.setdefault("PYTHONPATH", str(REPO))
 
-from mcp_server import core_bridge as cb  # noqa: E402
+from services.mcp import core_bridge as cb  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers

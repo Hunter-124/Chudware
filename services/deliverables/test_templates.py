@@ -21,16 +21,10 @@ Run:  python3 -m pytest services/deliverables/test_templates.py -q
 """
 from __future__ import annotations
 
-import os
-import sys
 from pathlib import Path
 
 import pytest
 
-# `deliverables` is importable as a top-level package via the repo-root symlink.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 # The in-process engines are required deps; skip the whole module cleanly if a runtime lacks them.
 pytest.importorskip("pptx")
@@ -41,8 +35,8 @@ pytest.importorskip("reportlab")
 pytest.importorskip("pypdfium2")
 pytest.importorskip("PIL")
 
-import deliverables as d  # noqa: E402
-from deliverables import joins as J, project  # noqa: E402
+import services.deliverables as d  # noqa: E402
+from services.deliverables import joins as J, project  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

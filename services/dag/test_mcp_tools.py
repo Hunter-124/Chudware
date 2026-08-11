@@ -47,7 +47,7 @@ def _make_mcp():
 
 def _build_clients():
     mcp, tools = _make_mcp()
-    from dag.mcp_tools import register_dag_tools
+    from services.dag.mcp_tools import register_dag_tools
     register_dag_tools(mcp)
     return tools
 

@@ -39,7 +39,7 @@ the public internet at — see §4.
 | HIGH | No CSP anywhere | CSP + HSTS + Permissions-Policy + COOP added; verified zero inline scripts in served HTML |
 | HIGH | Uploads had no size cap — one request could fill the host disk | `max_upload_bytes` enforced on `Content-Length` **and** mid-stream; partial files unlinked |
 | HIGH | Unpinned deps allowing known-CVE versions of `PyJWT` / `python-multipart` | Fully `==`-pinned |
-| HIGH | `users.yaml` with real admin emails committed to the repo | Replaced with a template; runtime list lives outside the repo |
+| HIGH | The committed YAML allowlist carried real admin emails in the repo | That file was deleted 2026-08-10; accounts live in PostgreSQL, roles are assigned there, and nothing in the repo grants anyone access |
 | MEDIUM | _(surface deleted)_ Session ids were 48 bits (`uuid4().hex[:12]`) | `secrets.token_urlsafe(24)`; the session manager was deleted 2026-08-10. Admin terminal session ids still use the wide form |
 | MEDIUM | `/healthzFOO` was unauthenticated (prefix match) | Exact-match + `/` boundary |
 | MEDIUM | `/healthz` leaked `dev_mode`, RAM, VRAM and live-session counts to anonymous callers | Anonymous callers get `{"ok": true}` |
@@ -59,18 +59,24 @@ reintroduced (mutation-checked, not just written).
 ## 2. What changed about accounts
 
 Authorization moved from a hand-edited YAML allowlist to an account store
-(`gateway/accounts.py`, SQLite at `<data_root>/accounts.db`).
+(`gateway/accounts.py`, PostgreSQL via `CHUDWARE_DB_URL`), and sign-in moved off
+the Cloudflare Access edge into the gateway itself (`gateway/authn.py`,
+`gateway/oauth.py`).
 
-- An unknown identity that authenticates is **registered as `pending`**, not
-  refused — a stranger lands in an approval queue instead of a dead end.
-- Only `status == "active"` yields a session. Role comes from the database; a
+- Anyone can register: email + argon2id password, or Google/GitHub OAuth. Every
+  new row is created **`pending`** — a stranger lands in an approval queue
+  instead of a dead end.
+- Redeeming the emailed verification link promotes that pending row to `active`
+  on a 14-day trial (`CHUDWARE_WEB_TRIAL_DAYS`). The promoting `UPDATE` is
+  guarded on `status = 'pending'`, so a stale link can never resurrect an
+  account an admin denied or suspended.
+- Only `status == "active"` yields any rights. Role comes from the database; a
   self-registered account can never be `admin`.
-- Existing `users.yaml` entries are imported at startup **and** adopted lazily on
-  first request, so current teammates keep their role. An admin `denied` or
-  `suspended` decision always outranks the YAML file.
-- `CHUDWARE_WEB_AUTO_APPROVE_DOMAINS` defaults to `ua.edu` (matching the old
-  hard-coded behaviour). **Set it to an empty string to close that door** and
-  route every new identity through the queue.
+- A login writes a **server-side session row** and sets the opaque
+  `chudware_sid` cookie, so revoking the row logs that browser out at once.
+- Cloudflare Access is no longer the front door. It is kept in front of `/admin`
+  as the operator door, and there is no domain auto-approval knob anywhere —
+  the only paths to `active` are email verification and an admin approval.
 
 Admin API: `GET /api/admin/accounts`, `.../approve|deny|suspend|plan`,
 `GET /api/admin/accounts/pending-count`. Self-service: `GET /api/me/account`.
@@ -140,10 +146,11 @@ Decision taken: the marketing site is **static, on Cloudflare Pages, off the
 home box entirely.** Public and bot traffic must never reach the origin. The app
 moves to `app.chudware.com` behind Access.
 
-Today all three hostnames (`chudware.com`, `www.chudware.com`,
-`cad.scootware.us`) tunnel to `127.0.0.1:8300` and Cloudflare Access gates the
-whole origin — so there is currently no way to serve an unauthenticated page
-without punching a hole in that gate. Hence the split.
+Access no longer gates the whole origin — it is scoped to `/admin`, and the
+gateway serves its own public pages (landing, register, login) on
+`chudware.com`, `www.chudware.com` and `cad.scootware.us`, all tunnelled to
+`127.0.0.1:8300`. The split still stands on its own merits: public and bot
+traffic should not reach the home box at all.
 
 **Nothing below has been applied. These are the steps; you run them.**
 
@@ -165,8 +172,10 @@ without punching a hole in that gate. Hence the split.
    JWT. Add an Access *bypass* policy for that exact path, or Stripe events will
    be rejected at the edge. It is authenticated by HMAC signature in the app.
 7. **Retire or re-point `cad.scootware.us`.**
-8. **Decide on auto-approval.** Set `CHUDWARE_WEB_AUTO_APPROVE_DOMAINS=` (empty)
-   when you want every new identity to queue.
+8. **Watch the queue.** There is no auto-approval switch left to close — every
+   registration is created `pending`, and only email verification (which starts
+   the trial) or an admin `approve` makes it `active`. Keep an eye on
+   `GET /api/admin/accounts/pending-count` once the apex is public.
 
 ## 6. Stripe setup
 
@@ -203,7 +212,8 @@ they never un-approve the human.
 5. Wire plan entitlements into the disk-quota and token paths (§3.1) — this is
    the gate for taking money.
 6. Add token metering (§3.2), then enable Stripe.
-7. Only then set `CHUDWARE_WEB_AUTO_APPROVE_DOMAINS=` and open registration.
+7. Only then publish the apex. Registration is already self-serve and every new
+   account starts `pending`, so going live is a DNS decision, not an auth one.
 
 ---
 
@@ -272,10 +282,15 @@ and the Cloudflare API token in git history is still live.
   XDG_RUNTIME_DIR=/run/user/1000
   DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus systemctl --user ...`
 - **Warn before restarting** — it drops every live terminal and engine socket.
-- To exercise authenticated endpoints without a browser, use the SSO shared
-  secret over loopback: `curl -u "you@crimson.ua.edu:$CHUDWARE_WEB_SSO_SHARED_SECRET"`.
-  Browsers will NOT attach that header to a WebSocket handshake, so a WS 403 in
-  a headless-browser test is usually the harness, not the server — confirm with
-  a real WS client before chasing it.
+- To exercise authenticated endpoints without a browser, mint a short-lived
+  session over loopback and send it as the cookie:
+  ```bash
+  SID="$(cd Webservice/gateway && .venv/bin/python -m authn ops-session --email you@crimson.ua.edu)"
+  curl -b "chudware_sid=$SID" http://127.0.0.1:8300/healthz
+  ```
+  It reads `CHUDWARE_DB_URL` from the environment, exits 1 if that address has
+  no active account, and expires on its own (900 s default). A WS client must
+  carry the same cookie — a 403 on a handshake from a harness with no cookie jar
+  is the harness, not the server.
 - Rollback commit from before this pass: `~/chudware-web-data/ROLLBACK_COMMIT`.
   Backups: `~/chudware-web-backups/` (local + unencrypted; see §4).

@@ -1,4 +1,4 @@
-"""Crash-recovery autosave for ECAD sessions (the ECAD twin of mcp_server.cad_tools autosave).
+"""Crash-recovery autosave for ECAD sessions (the ECAD twin of services.mcp.cad_tools autosave).
 
 ECAD documents live ONLY in memory — the :mod:`engine.ecad.session` registry has no on-disk
 backing. A heavy MCP tool (ecad_simulate / ecad_make_board / ecad_design / autoroute / fill / dfm)

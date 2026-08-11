@@ -73,7 +73,7 @@ echo(
 
 REM ---- 2. verify the server can start --------------------------------------
 echo Verifying the MCP server imports ...
-"!PYEXE!" -c "import mcp_server.server" 2>nul
+"!PYEXE!" -c "import services.mcp.server" 2>nul
 if errorlevel 1 (
     echo  ERROR: the MCP server failed to import under this Python.
     echo         Try deleting .venv and re-running, or check requirements.txt.

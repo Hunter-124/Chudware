@@ -18,7 +18,7 @@ Persistence:  buildgraph_plan writes a <run_id>.buildgraph.json sidecar into
 the runs directory (mirrors the dag executor sidecar pattern).
 buildgraph_status reads it back.
 
-Returns {ok, ...} following the project _dumps/_err convention from dag/mcp_tools.py.
+Returns {ok, ...} following the project _dumps/_err convention from services/dag/mcp_tools.py.
 """
 from __future__ import annotations
 
@@ -410,7 +410,7 @@ def register_buildgraph_tools(mcp, runs_dir: Optional[Path] = None) -> None:
     Appended to services/mcp/server.py by T-W15 (append-only block).
 
     Args:
-        mcp:       FastMCP / mcp_server instance.
+        mcp:       FastMCP / services.mcp instance.
         runs_dir:  Override for tests; defaults to platform default.
     """
     _base_runs_dir = runs_dir  # captured in closures

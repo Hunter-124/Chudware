@@ -119,8 +119,8 @@ def _open(cb, path: Path) -> str | None:
 
 def part_facts(dirs: list[Path]) -> list[dict]:
     """Reopen every part container and record ONLY engine-computed facts."""
-    from mcp_server import core_bridge as cb  # noqa: PLC0415 — engine, lazily
-    from mcp_server import server  # noqa: PLC0415
+    from services.mcp import core_bridge as cb  # noqa: PLC0415 — engine, lazily
+    from services.mcp import server  # noqa: PLC0415
 
     tools = server.mcp._tool_manager._tools
     candidates: list[Path] = []

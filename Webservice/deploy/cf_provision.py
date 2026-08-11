@@ -22,8 +22,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import yaml
-
 API = "https://api.cloudflare.com/client/v4"
 ACCOUNT_ID = "9a800a5f674233fe127cdb44b395ebfa"
 TUNNEL_NAME = "chudware-web"
@@ -72,10 +70,10 @@ def find(items: list[dict], key: str, value: str) -> dict | None:
     return next((i for i in items if i.get(key) == value), None)
 
 
-# Whole-domain auto-approval: anyone with an email at these domains is allowed through
-# CF Access (as a standard user; the gateway assigns role="user", never admin). Keep in
-# sync with AUTO_APPROVE_DOMAINS in Webservice/gateway/auth.py. CF email_domain is an
-# EXACT match (no subdomain wildcard), so each domain must be listed explicitly.
+# Cloudflare Access is the operator door: it gates /admin only. Anyone with an email at
+# one of these domains may pass Access; the gateway itself decides who is a real user
+# and assigns roles from its own account store, never from this list. CF email_domain is
+# an EXACT match (no subdomain wildcard), so each domain must be listed explicitly.
 ACCESS_DOMAINS = ["ua.edu", "crimson.ua.edu"]
 
 # Additional hostnames served by the SAME tunnel and gated by the SAME Access app.
@@ -83,12 +81,6 @@ ACCESS_DOMAINS = ["ua.edu", "crimson.ua.edu"]
 # separate per-domain app would mint a different AUD and break JWT validation. So new
 # public domains go HERE (added to the app's self_hosted_domains), never as a new app.
 EXTRA_HOSTS = ["www.chudware.com"]
-
-# Multi-tenant Microsoft Entra (UA school accounts) front door: NOT behind the
-# chudware-web Access app (oauth2-proxy does its own auth), so it's wired
-# straight into tunnel ingress + DNS below rather than EXTRA_HOSTS/self_hosted_domains.
-SSO_HOSTNAME = "sso.chudware.com"
-SSO_SERVICE = "http://127.0.0.1:8301"
 
 
 def _include_list(emails: list[str]) -> list[dict]:
@@ -111,86 +103,14 @@ def upsert_env(updates: dict[str, str]) -> None:
     ENV_FILE.chmod(0o600)
 
 
-def _users_yaml_emails() -> list[str]:
-    """Read the gateway allowlist (single source of truth for people).
-
-    Prefers the runtime file ($CHUDWARE_WEB_USERS_FILE, or the data-root copy the
-    /admin page edits) over the repo template. Parsed as real YAML (not line
-    scraping): a quoted, flow-style, or mixed-case entry must never silently
-    drop someone from the Access policy, because a missing or malformed email
-    means Cloudflare simply never sends that person a One-Time PIN. Emails are
-    lowercased and de-duplicated; example.com rows are dev-only and skipped.
-    """
-    candidates = [
-        os.environ.get("CHUDWARE_WEB_USERS_FILE"),
-        str(Path.home() / "chudware-web-data" / "users.yaml"),
-        str(Path(__file__).resolve().parents[1] / "gateway" / "users.yaml"),
-    ]
-    users_file = next(Path(c) for c in candidates if c and Path(c).is_file())
-    data = yaml.safe_load(users_file.read_text()) or {}
-    rows = data.get("users") if isinstance(data, dict) else data
-    if not isinstance(rows, list):
-        rows = []
-    emails: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        email = str(row.get("email", "")).strip().lower()
-        if "@" not in email or email.endswith("example.com") or email in seen:
-            continue
-        seen.add(email)
-        emails.append(email)
-    return emails
-
-
-def sync_users(host: str) -> None:
-    """Push users.yaml emails into the Access allow policy (operator one-liner).
-
-    Advisor T-WEB2 Q1: invite keys rejected; the dual-edit friction is solved
-    here instead — edit users.yaml, run `cf_provision.py --sync-users`.
-    """
-    emails = _users_yaml_emails()
-    if not emails:
-        sys.exit("users.yaml has no real emails (example.com entries are skipped)")
-    apps = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps")
-    app = find(apps, "domain", host)
-    if app is None:
-        sys.exit(f"no Access app for {host} — run full provisioning first")
-    pols = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies")
-    allow_pols = [p for p in pols if p.get("decision") == "allow"]
-    # Reuse whatever allow policy already governs this app instead of creating a second
-    # one at precedence 1 — older deployments may carry a legacy policy name (e.g.
-    # "billet-users"/"aicad-users") and a name-only lookup used to miss the existing policy, then
-    # collide on precedence with a hard "policy precedences must be unique" 400.
-    pol = find(pols, "name", "chudware-users") or (allow_pols[0] if len(allow_pols) == 1 else None)
-    name = pol["name"] if pol else "chudware-users"
-    pol_body = {
-        "name": name, "decision": "allow", "precedence": pol["precedence"] if pol else 1,
-        "include": _include_list(emails),
-    }
-    if pol:
-        api("PUT", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies/{pol['id']}", pol_body)
-    else:
-        api("POST", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies", pol_body)
-    print(f"Access policy {name!r} synced from users.yaml: {len(emails)} email(s)")
-    for e in emails:
-        print(f"  - {e}")
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hostname", default="chudware.com")
     ap.add_argument("--emails", default=None,
                     help="comma-separated allowlist for the Access policy (required; no default)")
-    ap.add_argument("--sync-users", action="store_true",
-                    help="only sync gateway/users.yaml emails into the Access policy")
     args = ap.parse_args()
     host = args.hostname
     zone_name = ".".join(host.split(".")[-2:])
-    if args.sync_users:
-        sync_users(host)
-        return
     if not args.emails:
         # No personal default: provisioning with an omitted allowlist would
         # silently lock everyone out of the Access policy.
@@ -211,9 +131,8 @@ def main() -> None:
     api("PUT", f"/accounts/{ACCOUNT_ID}/cfd_tunnel/{tid}/configurations", {
         "config": {"ingress":
             [{"hostname": h, "service": GATEWAY_SERVICE} for h in [host] + EXTRA_HOSTS]
-            + [{"hostname": SSO_HOSTNAME, "service": SSO_SERVICE}]
             + [{"service": "http_status:404"}]}})
-    print(f"ingress: {[host] + EXTRA_HOSTS} -> {GATEWAY_SERVICE}; {SSO_HOSTNAME} -> {SSO_SERVICE}")
+    print(f"ingress: {[host] + EXTRA_HOSTS} -> {GATEWAY_SERVICE}")
 
     # 3. DNS CNAME (proxied)
     zone = find(api("GET", "/zones"), "name", zone_name)
@@ -227,14 +146,6 @@ def main() -> None:
     else:
         api("POST", f"/zones/{zone['id']}/dns_records", rec_body)
     print(f"dns: {host} CNAME {tid}.cfargotunnel.com (proxied)")
-    sso_recs = api("GET", f"/zones/{zone['id']}/dns_records?name={SSO_HOSTNAME}")
-    sso_body = {"type": "CNAME", "name": SSO_HOSTNAME,
-                "content": f"{tid}.cfargotunnel.com", "proxied": True}
-    if sso_recs:
-        api("PUT", f"/zones/{zone['id']}/dns_records/{sso_recs[0]['id']}", sso_body)
-    else:
-        api("POST", f"/zones/{zone['id']}/dns_records", sso_body)
-    print(f"dns: {SSO_HOSTNAME} CNAME {tid}.cfargotunnel.com (proxied)")
     # Extra hosts live in their own zones — resolve each and upsert a proxied CNAME.
     for eh in EXTRA_HOSTS:
         ez = find(api("GET", "/zones"), "name", ".".join(eh.split(".")[-2:]))

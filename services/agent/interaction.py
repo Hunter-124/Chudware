@@ -400,8 +400,8 @@ def _default_doc_ledger(doc_id: str) -> "Ledger":
         try:
             from services.mcp.intake_ledger import IntakeLedger
         except ImportError:
-            from mcp_server.intake_ledger import IntakeLedger  # type: ignore
-        from mcp_server import core_bridge as cb  # type: ignore
+            from services.mcp.intake_ledger import IntakeLedger  # type: ignore
+        from services.mcp import core_bridge as cb  # type: ignore
         if cb.available():
             return IntakeLedger(doc_id)
     except Exception:  # pragma: no cover - engine-less environments

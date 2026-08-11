@@ -12,7 +12,7 @@ twins share executor.resume()).
 
 Each method degrades gracefully (returns an ``ok: false`` envelope, never
 raises).  Registered append-only in ``engine/worker.py``, following the
-deliverables.worker_rpc / parts_hub.worker_rpc precedent.
+services.deliverables.worker_rpc / parts_hub.worker_rpc precedent.
 """
 from __future__ import annotations
 

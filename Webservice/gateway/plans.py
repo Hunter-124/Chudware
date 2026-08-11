@@ -56,6 +56,22 @@ PLANS: dict[str, Plan] = {
             monthly_llm_tokens=100_000,
         ),
     ),
+    "trial": Plan(
+        name="trial",
+        display_name="Trial",
+        # Not purchasable: a trial is granted by verifying an email address,
+        # never bought. is_purchasable("trial") must stay False or Checkout
+        # would happily sell a 14-day window that expires anyway.
+        stripe_price_env=None,
+        limits=PlanLimits(
+            plan="trial",
+            display_name="Trial",
+            # A trial is the full product for 14 days — Pro's caps, not Free's.
+            # Evaluating against a crippled tier tells nobody anything.
+            storage_quota_bytes=20 * _GIB,
+            monthly_llm_tokens=2_000_000,
+        ),
+    ),
     "pro": Plan(
         name="pro",
         display_name="Pro",

@@ -50,7 +50,7 @@ plug into **`core/agent/providers.cpp`** (C++, libcurl), not `services/agent/con
   `skills_*`, `triggers_*`, `ai_roles_*`, `bench_*`) — it does **not** carry chat completions.
   Confirmed by reading the full method list registered there (`services/agent/worker_rpc.py:1-300`)
   and its own docstring (`:1-19`): "Single registration point for the worker-RPC tables ... over
-  agent.providers" for **auth**, not completion.
+  services.agent.providers" for **auth**, not completion.
 
 ## 3. In-process C++ vs Python worker — confirmed, with one real exception
 

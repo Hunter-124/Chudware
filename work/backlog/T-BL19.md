@@ -63,7 +63,7 @@ Battery shape:
 ## Implementation notes (opus-marrow)
 
 - **Harness:** `scripts/modeling_battery.py` — drives the real C++ feature engine via
-  `mcp_server.core_bridge` (`doc_new` + `doc_apply_ops`), two-phase per case (seed then
+  `services.mcp.core_bridge` (`doc_new` + `doc_apply_ops`), two-phase per case (seed then
   test) so volume deltas are measurable. 50 cases: 32 single-op, 11 sequence, 3 recipe,
   4 negative controls. Reuses `services/verify/battery.py::check_feature_overlap`; rolls
   its own manifold predicate (see below).

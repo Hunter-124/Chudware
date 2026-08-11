@@ -170,6 +170,31 @@ jobs:
                     path: out/
           FIXTURE
 
+          # Fixture 3: a PowerShell step whose body carries a UTF-8 em dash.
+          # Windows PowerShell 5.1 reads the BOM-less script the runner writes
+          # as the ANSI code page, turning that em dash into a curly quote that
+          # terminates the string above it, so the step dies at parse time
+          # before running. actionlint has no opinion on step-body encoding.
+          cat > "${control}/.github/workflows/powershell-mojibake.yml" <<'FIXTURE'
+          name: negative-control-powershell-mojibake
+          on: workflow_dispatch
+          permissions:
+            contents: read
+          concurrency:
+            group: negative-control-powershell-mojibake
+            cancel-in-progress: false
+          jobs:
+            probe:
+              runs-on: [self-hosted, Windows, X64, cloudcastle-ci, cc-win-primary]
+              timeout-minutes: 5
+              steps:
+                - name: Report
+                  shell: powershell
+                  run: |
+                    # this em dash — is three CP1252 characters on the runner
+                    Write-Host "hello"
+          FIXTURE
+
           echo "--- control 1: actionlint must reject the unparseable workflow"
           status=0
           "$ACTIONLINT" -no-color "${control}/.github/workflows/parse-invalid.yml" \
@@ -190,14 +215,15 @@ jobs:
             > "${control}/policy.log" 2>&1 || status=$?
           cat "${control}/policy.log"
           if [ "${status}" -eq 0 ]; then
-            echo "::error::the workflow policy checker accepted a hosted runner, a mutable action ref and an unbounded artifact"
+            echo "::error::the workflow policy checker accepted a hosted runner, a mutable action ref, an unbounded artifact and a non-ASCII PowerShell body"
             exit 1
           fi
           # Named individually: a checker that fails for one reason while a
           # money rule has quietly stopped firing is the failure mode this list
           # exists to catch.
           for rule in workflow-parse-error unpinned-action-ref hosted-runner \
-                      string-form-runs-on billable-artifact-retention; do
+                      string-form-runs-on billable-artifact-retention \
+                      powershell-non-ascii; do
             if ! grep -q "${rule}" "${control}/policy.log"; then
               echo "::error::the policy checker failed, but never reported ${rule}; the rule is not wired up"
               exit 1

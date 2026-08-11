@@ -6,7 +6,7 @@ would be lost. The fixes are (1) a bounded worker-thread lifecycle whose timeout
 durably retrievable in-process job, and (2) autosave/recovery so a kill never loses open work.
 
 Self-contained: tools are registered against a stub mcp (no FastMCP / stdio server needed).
-Run:  python -m pytest mcp_server/test_ecad_hardening.py -q
+Run:  python -m pytest services/mcp/test_ecad_hardening.py -q
 """
 from __future__ import annotations
 
@@ -16,10 +16,10 @@ import pathlib
 import tempfile
 import time
 
-import mcp_server.ecad_common as et  # T-RF8: budget/session internals moved
+import services.mcp.ecad_common as et  # T-RF8: budget/session internals moved
 from services.ecad import autosave as eauto
-from mcp_server.ecad_common import ecad_session as esess
-from mcp_server.ecad_tools import register_ecad_tools
+from services.mcp.ecad_common import ecad_session as esess
+from services.mcp.ecad_tools import register_ecad_tools
 
 
 class _StubMCP:
@@ -46,7 +46,7 @@ def _get_job(job_id: str) -> dict:
     """Poll through the same existing MCP get_job surface used by production."""
     global _GET_JOB_TOOL
     if _GET_JOB_TOOL is None:
-        from mcp_server.cad_doc_tools import register_cad_doc_tools
+        from services.mcp.cad_doc_tools import register_cad_doc_tools
 
         mcp = _StubMCP()
         register_cad_doc_tools(mcp)
@@ -268,7 +268,7 @@ def test_terminal_job_retention_has_a_hard_count_bound() -> None:
 
 def test_autoroute_overrun_returns_clean_message() -> None:
     """A router overrun returns a job and the test drains that worker before teardown."""
-    import mcp_server.ecad_pcb_tools as _pcb_tools  # T-RF20: tool RPCs via ecad_common._rpc
+    import services.mcp.ecad_pcb_tools as _pcb_tools  # T-RF20: tool RPCs via ecad_common._rpc
 
     tools = _tools()
     _call(tools, "ecad_new_pcb", name="HeavyBoard")
@@ -312,7 +312,7 @@ def test_autoroute_overrun_returns_clean_message() -> None:
 
 def test_simulate_overrun_returns_clean_message() -> None:
     """ecad_simulate hands off safely and its test worker is drained before teardown."""
-    import mcp_server.ecad_sim_tools as _sim_tools  # T-RF20: tool runs C++ sim via _sim_run
+    import services.mcp.ecad_sim_tools as _sim_tools  # T-RF20: tool runs C++ sim via _sim_run
 
     tools = _tools()
     # minimal sim-able schematic: a source + resistor to ground (recipe via ecad_design is heavy;
@@ -360,7 +360,7 @@ def test_simulate_overrun_returns_clean_message() -> None:
 
 def test_nonconvergence_is_not_reported_as_success() -> None:
     """A completed backend call with convergence=false is an analysis failure."""
-    import mcp_server.ecad_sim_tools as _sim_tools
+    import services.mcp.ecad_sim_tools as _sim_tools
 
     tools = _tools()
     _call(tools, "ecad_new_schematic", name="Nonconverged")
@@ -444,13 +444,13 @@ def test_mcp_autosave_and_recover() -> None:
 
 
 def test_ecad_module_identity_dual_import() -> None:
-    """mcp_server.ecad_tools and services.mcp.ecad_tools must be ONE module object so
+    """services.mcp.ecad_tools and services.mcp.ecad_tools must be ONE module object so
     _ECAD / _THERMAL session state is never split across two import paths."""
-    import mcp_server.ecad_tools as a
+    import services.mcp.ecad_tools as a
     import services.mcp.ecad_tools as b
     assert a is b, f"dual import produced two modules: {a} vs {b}"
     assert a._ECAD is b._ECAD
-    import mcp_server.ecad_thermal as t1
+    import services.mcp.ecad_thermal as t1
     import services.mcp.ecad_thermal as t2
     assert t1 is t2
     assert t1._THERMAL is t2._THERMAL
@@ -560,7 +560,7 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
     import services.agent.config as _cfg  # T-RF8: canonical path (ecad_design uses it)
     orig_get = getattr(_cfg, "get_provider", None)
     _cfg.get_provider = lambda *a, **k: slow  # type: ignore[attr-defined]
-    import mcp_server.ecad_sim_tools as et_sim  # T-RF8: ecad_design looks it up here
+    import services.mcp.ecad_sim_tools as et_sim  # T-RF8: ecad_design looks it up here
     orig_reach = et_sim._provider_reachable
     et_sim._provider_reachable = lambda p, timeout_s=0.6: True  # type: ignore[assignment]
 

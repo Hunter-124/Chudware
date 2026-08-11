@@ -38,7 +38,7 @@ _K_REQUIREMENTS = "requirements"
 def _core_bridge():
     """Lazy import core_bridge so req_tools works even when the C++ engine is absent."""
     try:
-        from mcp_server import core_bridge as cb  # type: ignore
+        from services.mcp import core_bridge as cb  # type: ignore
         return cb
     except Exception:  # noqa: BLE001
         return None

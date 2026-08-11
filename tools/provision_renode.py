@@ -269,7 +269,7 @@ def _ensure_path_symlink(binary: Path) -> None:
     """Symlink/copy renode onto a user PATH location (posix: ~/.local/bin)."""
     if os.name == "nt":
         # On Windows the install dir itself should be added to user PATH by the
-        # installer.ps1 path; we still copy renode.exe next to itself (noop).
+        # services.installer.ps1 path; we still copy renode.exe next to itself (noop).
         return
     bin_dir = Path.home() / ".local" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)

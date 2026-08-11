@@ -142,8 +142,8 @@ def test_machine_profile_unknown_lists_ids():
 
 # --------------------------------------------------------------------------- cam_audit wrapper
 def test_cam_audit_wrapper_passes_params(monkeypatch):
-    from mcp_server import cam_audit as ca
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_audit as ca
+    from services.mcp import cam_tools as ct
 
     calls: list[tuple[str, dict]] = []
     envelope = {
@@ -212,8 +212,8 @@ def test_cam_audit_wrapper_passes_params(monkeypatch):
 
 # --------------------------------------------------------------------------- cam_job_diff
 def test_cam_job_diff_added_removed_changed(monkeypatch, tmp_path):
-    from mcp_server import cam_audit as ca
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_audit as ca
+    from services.mcp import cam_tools as ct
 
     saved = _sample_job()
     cam_path = str(tmp_path / "job.cam+")
@@ -292,7 +292,7 @@ def test_cam_job_diff_added_removed_changed(monkeypatch, tmp_path):
 
 def test_diff_cam_job_pure():
     """Unit-level diff without MCP registration."""
-    from mcp_server.cam_audit import diff_cam_job
+    from services.mcp.cam_audit import diff_cam_job
 
     saved = _sample_job()
     live = {
@@ -321,7 +321,7 @@ def test_diff_cam_job_pure():
 
 # --------------------------------------------------------------------------- cam_add_setup machine_profile
 def test_cam_add_setup_machine_profile_haas(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
     import asyncio
 
@@ -383,7 +383,7 @@ def test_cam_add_setup_machine_profile_haas(monkeypatch):
 
 
 def test_cam_add_setup_machine_profile_bridge_error(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
     import asyncio
 
@@ -413,7 +413,7 @@ def test_cam_add_setup_machine_profile_bridge_error(monkeypatch):
 
 # --------------------------------------------------------------------------- MCP feeds_speeds wrapper
 def test_mcp_feeds_speeds_thread_and_machine(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
     import asyncio
 

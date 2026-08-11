@@ -3,7 +3,7 @@
 Test strategy (offline-ML-track discipline, no all-skip):
 
   fixture mode (default, no real server):
-    * Mock the installer.llamacpp.ensure_server_running() to avoid needing a real binary.
+    * Mock the services.installer.llamacpp.ensure_server_running() to avoid needing a real binary.
     * Mock /props HTTP endpoint to verify n_ctx capture + tier detection.
     * Verify routing.yaml idempotent append.
     * Verify port allocation uses a free port when auto_port=True.
@@ -193,7 +193,7 @@ class TestEnsureRunning(unittest.TestCase):
                 "model": "/fake/model.gguf",
             }
 
-        with patch("installer.llamacpp.ensure_server_running", side_effect=fake_ensure):
+        with patch("services.installer.llamacpp.ensure_server_running", side_effect=fake_ensure):
             with patch("services.agent.local_runtime.get_served_n_ctx", return_value=32768):
                 info = ensure_running({}, auto_port=True, register_routing=False)
 
@@ -212,7 +212,7 @@ class TestEnsureRunning(unittest.TestCase):
                 "model": "",
             }
 
-        with patch("installer.llamacpp.ensure_server_running", side_effect=fake_ensure):
+        with patch("services.installer.llamacpp.ensure_server_running", side_effect=fake_ensure):
             with patch("services.agent.local_runtime.get_served_n_ctx", return_value=24000):
                 info = ensure_running({}, auto_port=False, register_routing=False)
 
@@ -224,7 +224,7 @@ class TestEnsureRunning(unittest.TestCase):
         from services.agent.local_runtime import LocalRuntimeError, ensure_running
 
         with patch(
-            "installer.llamacpp.ensure_server_running",
+            "services.installer.llamacpp.ensure_server_running",
             side_effect=RuntimeError("binary not found"),
         ):
             with pytest.raises(LocalRuntimeError, match="binary not found"):
@@ -240,7 +240,7 @@ class TestEnsureRunning(unittest.TestCase):
                 "launched": True,
             }
 
-        with patch("installer.llamacpp.ensure_server_running", side_effect=fake_ensure):
+        with patch("services.installer.llamacpp.ensure_server_running", side_effect=fake_ensure):
             with patch("services.agent.local_runtime.get_served_n_ctx", return_value=None):
                 info = ensure_running({}, auto_port=False, register_routing=False)
 
@@ -414,7 +414,7 @@ class TestCudaVariantSelection(unittest.TestCase):
         assert local_runtime.LLAMA_CPP_PINNED_COMMIT == "fdb1db8"
 
     def test_find_server_prefers_cuda_when_gpu_present(self) -> None:
-        from installer import llamacpp
+        from services.installer import llamacpp
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -424,7 +424,7 @@ class TestCudaVariantSelection(unittest.TestCase):
             assert llamacpp.server_variant(p) == "cuda"
 
     def test_find_server_cpu_fallback_without_gpu(self) -> None:
-        from installer import llamacpp
+        from services.installer import llamacpp
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -434,7 +434,7 @@ class TestCudaVariantSelection(unittest.TestCase):
             assert llamacpp.server_variant(p) == "cpu"
 
     def test_find_server_cuda_preference_falls_back_to_cpu_build(self) -> None:
-        from installer import llamacpp
+        from services.installer import llamacpp
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -444,7 +444,7 @@ class TestCudaVariantSelection(unittest.TestCase):
             assert llamacpp.server_variant(p) == "cpu"
 
     def test_find_server_flat_legacy_layout(self) -> None:
-        from installer import llamacpp
+        from services.installer import llamacpp
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -454,7 +454,7 @@ class TestCudaVariantSelection(unittest.TestCase):
             assert llamacpp.server_variant(p) == "unknown"
 
     def test_cuda_available_env_override(self) -> None:
-        from installer import llamacpp
+        from services.installer import llamacpp
 
         with patch.dict(os.environ, {"CHUDWARE_LLAMA_VARIANT": "cuda"}):
             assert llamacpp.cuda_available() is True
@@ -462,16 +462,16 @@ class TestCudaVariantSelection(unittest.TestCase):
             assert llamacpp.cuda_available() is False
 
     def test_cuda_available_no_tool_is_false(self) -> None:
-        from installer import llamacpp
+        from services.installer import llamacpp
 
         with patch.dict(os.environ, {"CHUDWARE_LLAMA_VARIANT": ""}), \
-             patch("installer.llamacpp.subprocess.run",
+             patch("services.installer.llamacpp.subprocess.run",
                    side_effect=FileNotFoundError("nvidia-smi")):
             assert llamacpp.cuda_available() is False
 
     def _run_ensure(self, root: Path, cfg: dict) -> tuple[dict, list[str]]:
         """Drive ensure_server_running with spawn/health/paths mocked (gate-safe)."""
-        from installer import llamacpp
+        from services.installer import llamacpp
 
         captured: list[str] = []
 
@@ -484,11 +484,11 @@ class TestCudaVariantSelection(unittest.TestCase):
         fake_paths = MagicMock()
         fake_paths.ROOT = root
         fake_paths.MODELS = root
-        with patch("installer.llamacpp._http_models_ready",
+        with patch("services.installer.llamacpp._http_models_ready",
                    side_effect=[False, True]), \
-             patch("installer.llamacpp.subprocess.Popen", side_effect=fake_popen), \
-             patch("installer.llamacpp.paths", fake_paths), \
-             patch("installer.llamacpp.find_default_model", return_value=gguf):
+             patch("services.installer.llamacpp.subprocess.Popen", side_effect=fake_popen), \
+             patch("services.installer.llamacpp.paths", fake_paths), \
+             patch("services.installer.llamacpp.find_default_model", return_value=gguf):
             res = llamacpp.ensure_server_running(cfg)
         return res, captured
 

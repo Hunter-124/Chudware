@@ -16,8 +16,8 @@ import uuid
 
 import pytest
 
-from mcp_server import daemon_bridge
-from mcp_server.daemon_bridge import DaemonClient
+from services.mcp import daemon_bridge
+from services.mcp.daemon_bridge import DaemonClient
 
 HOSTD = daemon_bridge.resolve_hostd_bin()
 
@@ -667,7 +667,7 @@ def test_foreign_edits_surface_in_tool_note(scratch_daemon, monkeypatch):
     the human-readable note."""
     monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
     monkeypatch.setattr(daemon_bridge, "_client", None)
-    from mcp_server import cad_tools, core_bridge
+    from services.mcp import cad_tools, core_bridge
 
     a = DaemonClient()
     a.connect()
@@ -743,7 +743,7 @@ def test_recover_autosaved_uses_daemon_remap(scratch_daemon, monkeypatch):
     handle to the freshly-minted id."""
     monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
     monkeypatch.setattr(daemon_bridge, "_client", None)
-    from mcp_server import cad_tools, core_bridge
+    from services.mcp import cad_tools, core_bridge
 
     doc = core_bridge.call("doc_new", {"name": "alias-me"})["doc_id"]
     pid = daemon_bridge.client().call("daemon_status")["pid"]
@@ -989,7 +989,7 @@ def test_agent_origin_survives_base_gc_grace(scratch_daemon, monkeypatch):
 
 def test_no_python_autosave_timer_in_daemon_mode(scratch_daemon, monkeypatch):
     monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
-    from mcp_server import cad_tools
+    from services.mcp import cad_tools
 
     cad_tools.start_periodic_autosave()
     time.sleep(0.1)

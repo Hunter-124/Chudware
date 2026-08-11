@@ -24,9 +24,15 @@ Gates (all stdlib-only — they parse source/docs, so they need NO engine/OCCT d
                             floor or a role loadout) and actually exists. Closes the
                             run-42508173312214 class: the harness told the model to "execute
                             with dag_run(...)" while dag_run was in no pack at all.
+  - portable_paths_audit  : every tracked path can actually be checked out on Windows and
+                            macOS — no NTFS-reserved characters, no trailing dot/space, no
+                            reserved device names, no case-only collisions. Closes the class
+                            where a ':' in a generated directory name made `git clone` fail
+                            with "invalid path" and took the entire Windows CI leg down
+                            before a single step ran.
 
 The engine + agent pytest suites are NOT run here (they need the runtime venv); run them separately:
-    <venv>/python -X utf8 -m pytest engine/doc agent -q
+    <venv>/python -X utf8 -m pytest engine/doc services/agent -q
 See docs/GUI_TOOLING.md for the full standards workflow + how to install this as a git pre-commit hook.
 """
 from __future__ import annotations
@@ -46,6 +52,7 @@ GATES = [
     ("oracle_import_audit (services thin-client ratchet)", ["scripts/oracle_import_audit.py"]),
     ("tool_panel_sync (Settings → AI → Tools fallback tables)", ["tools/gen_tool_panel_tables.py", "--check"]),
     ("advertised_tool_audit (named tools are reachable)", ["scripts/advertised_tool_audit.py"]),
+    ("portable_paths_audit (tracked paths check out on Windows/macOS)", ["scripts/portable_paths_audit.py"]),
 ]
 
 

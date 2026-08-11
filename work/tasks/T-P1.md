@@ -64,7 +64,7 @@ sections (T-D3 AISC/lumber JSON), piping fittings (T-E1), hydraulic components (
 - contracts/parts.md — aicad.parts/1 frozen contract
 - engine_oracle/data/bolts/bearings.blt.yaml — extended with 6200/6300 series
 - engine_oracle/parts_hub/ — ProviderRegistry + PartsIndex (FTS5) + PartsHub + adapters
-- services/mcp/parts_tools.py (= mcp_server/parts_tools.py via symlink) — part_search, part_get
+- services/mcp/parts_tools.py — part_search, part_get
 - services/mcp/server.py — append-only registration
 - 44 tests in engine_oracle/parts_hub/test_parts_hub.py
 

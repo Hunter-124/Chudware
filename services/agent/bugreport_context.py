@@ -14,7 +14,7 @@ triage; nothing leaves the machine.
 This module lives under ``services.agent`` ONLY and is imported by both
 ``agent_turn`` (recorder) and ``services.mcp.bugreport_tools`` (tool wrapper)
 under this exact dotted path, so there is exactly ONE ring buffer per
-process — the dual-identity trap (``mcp_server.*`` vs ``services.mcp.*``)
+process — the dual-identity trap (``services.mcp.*`` vs ``services.mcp.*``)
 that bit ``cad_tools._CUR`` cannot split the state.
 """
 from __future__ import annotations

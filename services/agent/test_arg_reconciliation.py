@@ -33,10 +33,10 @@ from services.agent import agent_turn as at
 from services.agent import arg_reconciliation as recon
 
 
-import services.mcp.server as mcp_server
+from services.mcp import server as imported_server
 
 
-def _mcp_server():
+def _server_module():
     """The imported server module.
 
     This used to be a deliberately DEFERRED import: server.py registers ~400 tools
@@ -49,7 +49,7 @@ def _mcp_server():
     import is safe at module scope again (see tool_registry.warm_catalog docstring and
     test_tool_registry's clear/warm regression tests).
     """
-    return mcp_server
+    return imported_server
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SHARED_MODULE = pathlib.Path(__file__).resolve().parent / "arg_reconciliation.py"
@@ -64,7 +64,7 @@ def _agent_reconcile(tool: str, **kwargs):
 
 def _server_call(tool: str, arguments: dict) -> dict:
     """Exactly what an external MCP client does: ToolManager.call_tool."""
-    tm = _mcp_server().mcp._tool_manager
+    tm = _server_module().mcp._tool_manager
     blocks, _structured = asyncio.run(
         tm.call_tool(tool, arguments, convert_result=True))
     text = blocks[0].text if isinstance(blocks, list) else blocks
@@ -222,9 +222,9 @@ def test_query_geometry_var_kw_bypasses_reconciliation_on_agent_path():
 
 
 def test_query_geometry_var_kw_bypasses_reconciliation_on_mcp_path():
-    mcp_server = _mcp_server()
-    tm = mcp_server.mcp._tool_manager
-    meta = mcp_server._arg_meta(tm.get_tool("query_geometry"))
+    server = _server_module()
+    tm = server.mcp._tool_manager
+    meta = server._arg_meta(tm.get_tool("query_geometry"))
     assert meta["varkw"] is True
 
 
@@ -819,10 +819,10 @@ def test_the_drawing_tools_are_not_varkw_so_this_layer_actually_runs():
     the first time they were requested: while these tools declared **kwargs, BOTH
     dispatch paths skipped reconciliation (agent_turn.py:4380, server.py:852) and any
     table entry would have been dead code."""
-    mcp_server = _mcp_server()
+    server = _server_module()
     for tool in ("make_drawing", "export_drawing"):
         assert at._signature_spec(at._bind_tool(tool))["var_kw"] is False, tool
-        meta = mcp_server._arg_meta(mcp_server.mcp._tool_manager.get_tool(tool))
+        meta = server._arg_meta(server.mcp._tool_manager.get_tool(tool))
         assert meta["varkw"] is False, tool
 
 

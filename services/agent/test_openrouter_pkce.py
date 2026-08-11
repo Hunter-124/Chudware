@@ -1,7 +1,7 @@
 """OpenRouter PKCE login — end-to-end behind the feature flag, no network.
 
 Contract: contracts/providers.md §4.1. Drives the full flow with a fake transport so CI
-needs no network and no secrets. Lives under agent/ (gate runs `pytest engine/doc agent`).
+needs no network and no secrets. Lives under agent/ (gate runs `pytest engine/doc services/agent`).
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from agent.providers import oauth_pkce as pk
+from services.agent.providers import oauth_pkce as pk
 
 
 def test_flag_default_off():
@@ -86,6 +86,6 @@ def test_complete_login_no_key_in_response(monkeypatch):
 
 def test_openrouter_refused_offline():
     """Offline mode refuses the OpenRouter cloud provider before construction."""
-    from agent import config
+    from services.agent import config
     with pytest.raises(config.OfflineModeError):
         config.get_provider("openrouter", {"offline_mode": True})

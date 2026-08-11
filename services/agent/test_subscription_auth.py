@@ -17,8 +17,8 @@ from urllib.request import urlopen
 
 import pytest
 
-from agent.providers import sub_auth
-from agent.providers import subscription_login as sl
+from services.agent.providers import sub_auth
+from services.agent.providers import subscription_login as sl
 
 
 # ── config.json isolation ───────────────────────────────────────────────────
@@ -154,7 +154,7 @@ def test_decode_jwt_garbage_returns_empty():
 # ── Anthropic CCH + billing suffix ──────────────────────────────────────────
 
 def test_anthropic_cch_is_deterministic_5hex(tmp_config):
-    from agent.providers.anthropic_sub_provider import AnthropicSubProvider
+    from services.agent.providers.anthropic_sub_provider import AnthropicSubProvider
     p = AnthropicSubProvider()
     h1 = p._compute_cch(b"some-body-bytes")
     h2 = p._compute_cch(b"some-body-bytes")
@@ -164,7 +164,7 @@ def test_anthropic_cch_is_deterministic_5hex(tmp_config):
 
 
 def test_anthropic_billing_suffix_3hex(tmp_config):
-    from agent.providers.anthropic_sub_provider import AnthropicSubProvider
+    from services.agent.providers.anthropic_sub_provider import AnthropicSubProvider
     p = AnthropicSubProvider()
     s = p._billing_suffix("hello world this is a long enough message")
     assert len(s) == 3 and all(c in "0123456789abcdef" for c in s)
@@ -175,8 +175,8 @@ def test_anthropic_billing_suffix_3hex(tmp_config):
 # ── Anthropic request body shape (Opus-4.8 safe, CCH patched) ───────────────
 
 def test_anthropic_body_is_opus48_safe_and_cch_patched(tmp_config, monkeypatch):
-    from agent.providers.anthropic_sub_provider import AnthropicSubProvider
-    from agent.providers import base
+    from services.agent.providers.anthropic_sub_provider import AnthropicSubProvider
+    from services.agent.providers import base
 
     p = AnthropicSubProvider()
     p._cred = {"access_token": "t", "refresh_token": "r",
@@ -208,13 +208,13 @@ def test_anthropic_body_is_opus48_safe_and_cch_patched(tmp_config, monkeypatch):
 # ── Codex is honest about vision + drops images ─────────────────────────────
 
 def test_codex_reports_no_vision(tmp_config):
-    from agent.providers.codex_sub_provider import CodexSubProvider
+    from services.agent.providers.codex_sub_provider import CodexSubProvider
     assert CodexSubProvider().supports_vision is False
 
 
 def test_codex_build_input_drops_images(tmp_config):
-    from agent.providers.codex_sub_provider import CodexSubProvider
-    from agent.providers import base
+    from services.agent.providers.codex_sub_provider import CodexSubProvider
+    from services.agent.providers import base
 
     p = CodexSubProvider()
     msgs = [base.user([base.text_part("look"), base.image_part("/tmp/x.png")])]
@@ -258,7 +258,7 @@ def test_dispatcher_logout(tmp_config):
 
 def test_dispatcher_login_failure_is_contract_shaped(tmp_config, monkeypatch):
     # Force the provider's login() to blow up; the dispatcher must catch and shape it.
-    from agent.providers import cursor_sub_provider as csp
+    from services.agent.providers import cursor_sub_provider as csp
 
     def boom(self):
         raise RuntimeError("no browser")
@@ -273,14 +273,14 @@ def test_dispatcher_login_failure_is_contract_shaped(tmp_config, monkeypatch):
 
 @pytest.mark.parametrize("name", ["anthropic-sub", "codex-sub", "cursor-sub", "xai-sub"])
 def test_subscription_providers_refused_offline(name):
-    from agent import config
+    from services.agent import config
     with pytest.raises(config.OfflineModeError):
         config.get_provider(name, {"offline_mode": True})
 
 
 @pytest.mark.parametrize("name", ["anthropic-sub", "codex-sub", "cursor-sub", "xai-sub"])
 def test_subscription_providers_never_offline_safe(name):
-    from agent import config
+    from services.agent import config
 
     class _Stub:
         pass
@@ -318,7 +318,7 @@ def test_xai_credential_roundtrip_and_status(tmp_config):
 
 
 def test_xai_sub_provider_loads_cached_token(tmp_config):
-    from agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
+    from services.agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
 
     sub_auth.save_credential(PROVIDER_ID, {
         "access_token": "tok",
@@ -333,8 +333,8 @@ def test_xai_sub_provider_loads_cached_token(tmp_config):
 
 
 def test_xai_api_key_provider_resolves(tmp_config):
-    from agent import config
-    from agent.providers.xai_provider import XAIProvider, BASE_URL
+    from services.agent import config
+    from services.agent.providers.xai_provider import XAIProvider, BASE_URL
 
     p = config.get_provider("xai", {"api_key": "xai-test-key", "model": "grok-4"})
     assert isinstance(p, XAIProvider)
@@ -344,13 +344,13 @@ def test_xai_api_key_provider_resolves(tmp_config):
 
 
 def test_xai_offline_refuses_api_key_path():
-    from agent import config
+    from services.agent import config
     with pytest.raises(config.OfflineModeError):
         config.get_provider("xai", {"offline_mode": True, "api_key": "k"})
 
 
 def test_xai_tier_denied_error_is_contract_shaped():
-    from agent.providers.xai_sub_provider import (
+    from services.agent.providers.xai_sub_provider import (
         XaiTierDeniedError, TIER_DENIED_REASON, TIER_DENIED_HINT,
     )
     err = XaiTierDeniedError("permission denied")
@@ -362,7 +362,7 @@ def test_xai_tier_denied_error_is_contract_shaped():
 
 def test_xai_login_403_is_contract_shaped(tmp_config, monkeypatch):
     """Device-code HTTP 403 surfaces the Heavy-gating reason, never a traceback."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     def boom(self, open_browser=True, progress=None):
         raise xsp.XaiTierDeniedError("caller does not have permission")
@@ -376,8 +376,8 @@ def test_xai_login_403_is_contract_shaped(tmp_config, monkeypatch):
 
 
 def test_xai_store_tokens_roundtrip(tmp_config, monkeypatch):
-    from agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
-    from agent.providers import usage as usage_mod
+    from services.agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
+    from services.agent.providers import usage as usage_mod
 
     # Offline unit test: no live userinfo.
     monkeypatch.setattr(usage_mod, "_http_get", lambda *a, **k: (404, None, {}))
@@ -402,8 +402,8 @@ def test_xai_store_tokens_roundtrip(tmp_config, monkeypatch):
 
 def test_xai_store_tokens_uuid_only_gets_friendly_name(tmp_config, monkeypatch):
     """JWT with sub UUID and no email still sets a non-UUID display_name."""
-    from agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
-    from agent.providers import usage as usage_mod
+    from services.agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
+    from services.agent.providers import usage as usage_mod
 
     monkeypatch.setattr(usage_mod, "_http_get", lambda *a, **k: (404, None, {}))
 
@@ -428,7 +428,7 @@ def test_xai_store_tokens_uuid_only_gets_friendly_name(tmp_config, monkeypatch):
 
 def test_xai_login_device_true_still_opens_browser(tmp_config, monkeypatch):
     """GUI passes device=True; that must NOT suppress the browser open (regression)."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     seen = {}
 
@@ -455,7 +455,7 @@ def test_xai_login_device_true_still_opens_browser(tmp_config, monkeypatch):
 
 
 def test_xai_login_open_browser_false_for_headless(tmp_config, monkeypatch):
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     seen = {}
 
@@ -470,7 +470,7 @@ def test_xai_login_open_browser_false_for_headless(tmp_config, monkeypatch):
 
 
 def test_xai_login_progress_callback_surfaces_code(tmp_config, monkeypatch):
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     events = []
 
@@ -491,7 +491,7 @@ def test_xai_login_progress_callback_surfaces_code(tmp_config, monkeypatch):
 
 
 def test_open_verification_url_fallback_does_not_raise(monkeypatch):
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     monkeypatch.setattr(xsp.webbrowser, "open", lambda url: (_ for _ in ()).throw(RuntimeError("no display")))
     monkeypatch.setattr(xsp.shutil, "which", lambda name: None)
@@ -504,7 +504,7 @@ def test_xai_device_url_always_embeds_user_code(tmp_config, monkeypatch):
     Without this, accounts.x.ai/oauth2/device bounces signed-out browsers to the
     generic X "Sign in to X to generate tweets with Grok" page.
     """
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     opened = {}
 
@@ -549,8 +549,8 @@ def test_xai_device_url_always_embeds_user_code(tmp_config, monkeypatch):
 
 
 def test_xai_default_model_is_grok_45():
-    from agent.providers.xai_sub_provider import DEFAULT_MODEL as sub_default
-    from agent.providers.xai_provider import DEFAULT_MODEL as key_default
+    from services.agent.providers.xai_sub_provider import DEFAULT_MODEL as sub_default
+    from services.agent.providers.xai_provider import DEFAULT_MODEL as key_default
     assert sub_default == "grok-4.5"
     assert key_default == "grok-4.5"
 
@@ -680,7 +680,7 @@ def test_two_accounts_same_provider_and_switch(tmp_config):
 
 def test_active_token_resolution_via_sub_providers(tmp_config):
     """*_sub_provider constructors resolve the ACTIVE account through load_credential."""
-    from agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
+    from services.agent.providers.xai_sub_provider import XAISubProvider, PROVIDER_ID
 
     sub_auth.save_credential(PROVIDER_ID, {
         "access_token": "first", "refresh_token": "r1",
@@ -710,7 +710,7 @@ def test_active_token_resolution_via_sub_providers(tmp_config):
 
 def test_login_derives_account_id_and_sets_active(tmp_config, monkeypatch):
     """login() derives account_id from cred metadata and marks it active."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     def fake_login_device(self, open_browser=True, progress=None):
         cred = {
@@ -868,7 +868,7 @@ def test_ensure_fresh_stale_token_refreshes_and_persists(tmp_config, monkeypatch
 
 def test_ensure_fresh_fresh_token_skips_refresh(tmp_config, monkeypatch):
     """Token valid beyond 5 min skew → no network refresh."""
-    from agent.providers.xai_sub_provider import XAISubProvider
+    from services.agent.providers.xai_sub_provider import XAISubProvider
 
     now = time.time() * 1000
     sub_auth.save_credential("xai-sub", {
@@ -895,7 +895,7 @@ def test_ensure_fresh_fresh_token_skips_refresh(tmp_config, monkeypatch):
 
 def test_ensure_fresh_refresh_failure_clean_error(tmp_config, monkeypatch):
     """Refresh exception → clean error dict, no traceback, nothing half-written."""
-    from agent.providers.anthropic_sub_provider import AnthropicSubProvider
+    from services.agent.providers.anthropic_sub_provider import AnthropicSubProvider
 
     now = time.time() * 1000
     sub_auth.save_credential("anthropic-sub", {
@@ -1111,7 +1111,7 @@ def test_cpp_settings_allowlist_merge_preserves_subscription_store(tmp_config):
 
 def test_xai_provider_usable_with_stored_credentials(tmp_config):
     """Signed-in xAI credentials make the provider usable (cold restore)."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     xsp.clear_blocked_accounts_for_tests()
     assert xsp.provider_is_usable() is False
@@ -1135,7 +1135,7 @@ def test_xai_provider_usable_with_stored_credentials(tmp_config):
 
 
 def test_xai_pick_skips_blocked_account(tmp_config):
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     xsp.clear_blocked_accounts_for_tests()
     now = int(time.time() * 1000) + 10 ** 9
@@ -1162,7 +1162,7 @@ def test_xai_pick_skips_blocked_account(tmp_config):
 
 def test_xai_complete_ex_rotates_on_tier_denied(tmp_config, monkeypatch):
     """HTTP 403 on account A falls through to account B before failing."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     xsp.clear_blocked_accounts_for_tests()
     now = int(time.time() * 1000) + 10 ** 9
@@ -1211,7 +1211,7 @@ def test_xai_complete_ex_rotates_on_tier_denied(tmp_config, monkeypatch):
 
 
 def test_xai_complete_ex_all_accounts_403_clear_error(tmp_config, monkeypatch):
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     xsp.clear_blocked_accounts_for_tests()
     now = int(time.time() * 1000) + 10 ** 9
@@ -1242,7 +1242,7 @@ def test_xai_complete_ex_all_accounts_403_clear_error(tmp_config, monkeypatch):
 
 def test_xai_model_hyphen_normalized_in_request_body(tmp_config, monkeypatch):
     """grok-4-5 (gym/hyphen form) is rewritten to dotted API id grok-4.5."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     xsp.clear_blocked_accounts_for_tests()
     sub_auth.save_credential(xsp.PROVIDER_ID, {
@@ -1273,7 +1273,7 @@ def test_xai_model_hyphen_normalized_in_request_body(tmp_config, monkeypatch):
 
 def test_xai_complete_ex_rotates_on_timeout(tmp_config, monkeypatch):
     """Read timeout on account A falls through to account B (pool hang)."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     xsp.clear_blocked_accounts_for_tests()
     now = int(time.time() * 1000) + 10 ** 9
@@ -1320,7 +1320,7 @@ def test_xai_complete_ex_rotates_on_timeout(tmp_config, monkeypatch):
 
 
 def test_account_usage_exhausted_filters_full_credits():
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     assert xsp.account_usage_exhausted({
         "last_usage": [
@@ -1337,7 +1337,7 @@ def test_account_usage_exhausted_filters_full_credits():
 
 
 def test_list_candidates_skips_100pct_usage_and_orders_by_remaining(tmp_config):
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     xsp.clear_blocked_accounts_for_tests()
     now = int(time.time() * 1000) + 10 ** 9
@@ -1380,7 +1380,7 @@ def test_list_candidates_skips_100pct_usage_and_orders_by_remaining(tmp_config):
 
 def test_complete_ex_pulls_usage_before_try_and_skips_spent(tmp_config, monkeypatch):
     """Before each hop, live usage is pulled; 100% accounts are not POSTed."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     xsp.clear_blocked_accounts_for_tests()
     now = int(time.time() * 1000) + 10 ** 9
@@ -1540,7 +1540,7 @@ def test_parallel_account_writes_do_not_drop_sibling_tokens(tmp_config):
 def test_xai_refresh_serializes_and_reuses_rotated_token(tmp_config, monkeypatch):
     """Two concurrent refresh() calls share one network exchange; both get new RT."""
     import threading
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     now = time.time() * 1000
     sub_auth.save_credential(xsp.PROVIDER_ID, {
@@ -1595,7 +1595,7 @@ def test_xai_refresh_serializes_and_reuses_rotated_token(tmp_config, monkeypatch
 
 def test_xai_refresh_invalid_grant_marks_revoked(tmp_config, monkeypatch):
     import urllib.error
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     now = time.time() * 1000
     sub_auth.save_credential(xsp.PROVIDER_ID, {
@@ -1629,7 +1629,7 @@ def test_xai_refresh_invalid_grant_marks_revoked(tmp_config, monkeypatch):
 
 def test_ensure_fresh_xai_rotates_past_revoked_active(tmp_config, monkeypatch):
     """Pre-run gate must not fail closed on a dead active account when siblings live."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     now = time.time() * 1000
     sub_auth.save_credential(xsp.PROVIDER_ID, {
@@ -1686,7 +1686,7 @@ def test_ensure_fresh_skips_revoked_prefix_beyond_old_cap(tmp_config, monkeypatc
     Regression: _ENSURE_FRESH_MAX_ACCOUNTS sliced candidates BEFORE skipping
     refresh_revoked, so pools with many dead actives always failed closed.
     """
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     now = time.time() * 1000
     # 7 revoked/expired leaders, then one live account.
@@ -1742,7 +1742,7 @@ def test_ensure_fresh_skips_revoked_prefix_beyond_old_cap(tmp_config, monkeypatc
 def test_xai_tier_denied_spending_limit_reason_distinct():
     """403 body personal-team-blocked:spending-limit must surface as
     out-of-credits / needs-subscription, not the Heavy-only tier gate."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     exc = xsp.XaiTierDeniedError('{"code":"personal-team-blocked:spending-limit"}')
     msg = str(exc)
@@ -1762,7 +1762,7 @@ def test_xai_tier_denied_spending_limit_reason_distinct():
 def test_xai_ensure_auth_all_revoked_pool_says_relogin(tmp_config, monkeypatch):
     """When every stored account is refresh_revoked, _ensure_auth must say
     plainly that re-login is required — not a generic all-accounts-failed."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     xsp.clear_blocked_accounts_for_tests()
     past = time.time() * 1000 - 1000  # expired access JWTs
@@ -1791,7 +1791,7 @@ def test_xai_ensure_auth_all_revoked_pool_says_relogin(tmp_config, monkeypatch):
 
 def test_xai_ensure_auth_mixed_pool_not_flagged_all_revoked(tmp_config, monkeypatch):
     """One viable account among revoked ones must NOT trip the re-login error."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     xsp.clear_blocked_accounts_for_tests()
     past = time.time() * 1000 - 1000
@@ -1824,7 +1824,7 @@ def test_xai_ensure_auth_mixed_pool_not_flagged_all_revoked(tmp_config, monkeypa
 
 def test_xai_all_revoked_predicate_empty_store(tmp_config):
     """No stored accounts → predicate is False (plain 'not logged in' path)."""
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     xsp.clear_blocked_accounts_for_tests()
     assert xsp._stored_accounts_all_refresh_revoked() is False
@@ -1898,7 +1898,7 @@ def test_xai_refresh_invalid_grant_retries_once_when_peer_rotated(tmp_config, mo
     rotated it) — retry once with the newer token instead."""
     import io
     import urllib.error
-    from agent.providers import xai_sub_provider as xsp
+    from services.agent.providers import xai_sub_provider as xsp
 
     now = time.time() * 1000
     sub_auth.save_credential(xsp.PROVIDER_ID, {

@@ -8,7 +8,7 @@ in place on register — existing tooling references it — and removed on --unr
 Idempotent and non-destructive: backs up each file before writing and only writes when the
 entry actually changes. Use --dry-run to preview, --unregister to remove.
 
-    python -m installer.register_mcp [--dry-run] [--unregister]
+    python -m services.installer.register_mcp [--dry-run] [--unregister]
                                      [--python <exe>] [--cwd <dir>] [--target desktop|code]
 """
 from __future__ import annotations
@@ -48,7 +48,7 @@ def server_entry(python_exe: Path, cwd: Path, hostd_bin: Path | None = None) -> 
         env["CHUDWARE_HOSTD_BIN"] = str(hostd_bin)
     return {
         "command": str(python_exe),
-        "args": ["-m", "mcp_server.server"],
+        "args": ["-m", "services.mcp.server"],
         "cwd": str(cwd),
         "env": env,
     }

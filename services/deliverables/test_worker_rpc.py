@@ -1,4 +1,4 @@
-"""Tests for the T-F16 worker-RPC preview bridge (``deliverables.worker_rpc``).
+"""Tests for the T-F16 worker-RPC preview bridge (``services.deliverables.worker_rpc``).
 
 The bridge exposes ``render_document`` + ``list_artifacts`` as engine-worker methods so the ImGui
 GUI reaches them over the standard worker seam. These tests prove:
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from deliverables import worker_rpc
+from services.deliverables import worker_rpc
 
 
 @pytest.fixture()
@@ -54,7 +54,7 @@ def test_list_artifacts_roundtrip_with_project_dir(project):
 
 def test_list_artifacts_sees_appended_record(project):
     # A record written by a make_* tool must surface for the GUI's artifact cards.
-    from deliverables import registry
+    from services.deliverables import registry
 
     rec = registry.build_record(
         "art_report_TESTULID", "report",

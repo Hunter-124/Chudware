@@ -1,5 +1,5 @@
 # Clean-room ISO/DIN metric fastener nominal dimensions (mm).
-# Source: agent/prompts/shared/cheatsheets/hardware.md + core/parts/parts_data.h
+# Source: services/agent/prompts/shared/cheatsheets/hardware.md + core/parts/parts_data.h
 # (published dimensional standards; NOT copied from BOLTS GPL data). See README.md.
 collection: iso_metric_fasteners
 

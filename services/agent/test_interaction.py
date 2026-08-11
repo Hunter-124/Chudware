@@ -12,8 +12,8 @@ import math
 
 import pytest
 
-from agent import interaction
-from agent.interaction import (
+from services.agent import interaction
+from services.agent.interaction import (
     InAppTransport,
     InteractionError,
     MCPElicitationTransport,

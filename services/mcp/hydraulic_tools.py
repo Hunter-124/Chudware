@@ -528,7 +528,7 @@ def _verify_fea_envelope(handoff: dict, tolerance_pct: float,
 def register_hydraulic_tools(mcp) -> None:
     """Register the AI-Hydraulic tools on the given FastMCP instance.
 
-    Called from ``mcp_server/server.py`` after ``mcp`` is created. A function (not import-time
+    Called from ``services/mcp/server.py`` after ``mcp`` is created. A function (not import-time
     side effects) so the tools can be driven against a stub ``mcp`` in tests — mirrors
     :func:`register_piping_tools`.
     """

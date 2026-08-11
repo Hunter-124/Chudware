@@ -281,7 +281,7 @@ def test_each_alias_resolves_to_the_canonical_tool(box, alias):
 @pytest.mark.parametrize("alias", ALIASES + ("check_geometry_health",))
 def test_every_spelling_is_registered_on_the_mcp_surface(alias):
     """External MCP clients resolve by NAME, so an alias must be a real registered tool."""
-    from mcp_server import server
+    from services.mcp import server
     assert alias in server.mcp._tool_manager._tools
 
 

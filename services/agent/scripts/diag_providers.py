@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Import path: services/ on sys.path so `agent.providers.*` resolves.
+# Import path: services/ on sys.path so `services.agent.providers.*` resolves.
 # ---------------------------------------------------------------------------
 _HERE = Path(__file__).resolve()
 _REPO = _HERE.parents[3]  # …/CAD
@@ -30,9 +30,9 @@ for p in (str(_SERVICES), str(_REPO)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from agent.providers import sub_auth  # noqa: E402
-from agent.providers import subscription_login as sl  # noqa: E402
-from agent.providers import usage as usage_mod  # noqa: E402
+from services.agent.providers import sub_auth  # noqa: E402
+from services.agent.providers import subscription_login as sl  # noqa: E402
+from services.agent.providers import usage as usage_mod  # noqa: E402
 
 # Friendly id -> (provider_name for instantiate, cred store id)
 # Mirrors subscription_login._PROVIDERS.
@@ -329,7 +329,7 @@ def diag_one(friendly: str) -> dict:
 def main() -> int:
     print(f"repo={_REPO}")
     try:
-        from agent import paths as agent_paths  # type: ignore
+        from services.agent import paths as agent_paths  # type: ignore
 
         cfg = Path(getattr(agent_paths, "CONFIG", ""))
     except Exception:

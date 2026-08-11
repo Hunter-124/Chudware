@@ -8,7 +8,7 @@ Contracts: none (build-test is purely infrastructure; test contracts are implici
 - scripts/gate.sh:39 `stage_check()` — runs scripts/check.py (gui_lint icons/theme, feature_surface_audit ribbon→handlers, parity_audit spec drift)
 - scripts/gate.sh:72 `stage_core_build()` — cmake configure/build core/ as libchudware.so with -DCHUDWARE_WITH_OCCT=ON; detects OCCT via find_occt_config() (L58)
 - scripts/gate.sh:129 `stage_ctest()` — runs `ctest --test-dir core/build-linux` (constraint solver, geometry, sim tests; see core/CMakeLists.txt:224–294)
-- scripts/gate.sh:154 `stage_pytest()` — runs `pytest engine/doc agent -q` if venv/pytest is available; SKIP if not provisioned
+- scripts/gate.sh:154 `stage_pytest()` — runs `pytest engine/doc services/agent -q` if venv/pytest is available; SKIP if not provisioned
 - scripts/gate.sh:183 `stage_ui_imgui()` — cmake preset linux-app, build, smoke test via `--shot` (headless render) + optional `--selftest`
 - CMakePresets.json:6,18 — linux-core preset (OCCT ON, Ninja) and linux-app preset (ImGui GUI, ui/abstract ON)
 - corpora/README.md:1–14 — test fixtures layout: sketch/ (solver JSON), render/ (SVG outputs), sw_parity/ (SolidWorks parity JSON), sw_fixtures/ (.SLDPRT imports)
@@ -21,7 +21,7 @@ gate.sh orchestrates Linux CI across the entire stack: `stage_check` (stdlib-onl
 - Just check.py: `python3 scripts/check.py` (runs gui_lint + feature_surface_audit + parity_audit)
 - Just core build: `cmake -S core -B core/build-linux -DCHUDWARE_WITH_OCCT=ON && cmake --build core/build-linux --config Release`
 - Just ctest: `ctest --test-dir core/build-linux -C Release --output-on-failure` (requires successful core build)
-- Just pytest: `python3 -X utf8 -m pytest engine/doc agent -q` (requires venv at runtime/venv/bin/python or .venv/bin/python)
+- Just pytest: `python3 -X utf8 -m pytest engine/doc services/agent -q` (requires venv at runtime/venv/bin/python or .venv/bin/python)
 - Just ui/imgui: `cmake --preset linux-app && cmake --build build/linux-app --config Release`
 - Gotcha: check.py is non-fatal (CHECK_PY_FATAL=0, L31) because feature_surface_audit is missing dwg_*/cam_* handlers and parity_audit has SW_PARITY_SPEC drift (docs/REFACTOR_LOG.md); flip to 1 once gaps close to make check.py hard-gating
 - Gotcha: OCCT detection is optional; gate stays green on boxes with no system OCCT (L84–88)

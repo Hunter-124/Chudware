@@ -1,5 +1,5 @@
 [Unit]
-Description=chudware-web data backup (PLM repos, users, chat)
+Description=chudware-web backup (pg_dump both databases + data tar, age-encrypted, R2)
 
 [Service]
 Type=oneshot

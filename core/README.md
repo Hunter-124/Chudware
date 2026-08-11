@@ -54,7 +54,7 @@ if it ever gets in).
   with the radius as a solver variable on either ref), radius, diameter (incl.
   slot/arc_slot width mapping w=2r / w=d); SVD-nullspace status coloring. Polar
   (r, θ) placement is expressed by `angle` + `distance`-to-origin (proven by
-  `corpus/ported_polar_point.json` landing a point at (r·cosθ, r·sinθ)).
+  `corpora/sketch/ported_polar_point.json` landing a point at (r·cosθ, r·sinθ)).
 
 **Not yet ported** (next increments, driven to parity by the differential harness):
 - Conic/spline *constraints* that need numeric closest-point projection:

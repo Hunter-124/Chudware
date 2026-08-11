@@ -17,16 +17,16 @@ Contracts: contracts/ecad/ (ecad_ops.md, ecad_rpc.md, fab_outputs.md, library.md
 - engine/ecad/threed.py — `board_to_step` — 3D bridge (PCB → STEP part doc)
 - engine/ecad/library/{kicad_mod.py,kicad_sym.py,native.py,sexpr.py,starter.py} — KiCad-compatible + native symbol/footprint libraries
 - engine/ecad/formats.py — .ecad+/.kicad_sch/.kicad_pcb import-export
-- mcp_server/ecad_tools.py — MCP-facing wrappers (the `ecad_*` tools in this session's tool list)
+- services/mcp/ecad_tools.py — MCP-facing wrappers (the `ecad_*` tools in this session's tool list)
 - core/ecad/*.cpp — C++ port already exists for autoroute, drc, erc, netlist, session, zonefill, dfm, impedance, library, recipes, sync, fabformats (in-flight cutover; verify current parity before assuming Python is authoritative)
 
 ## How it connects
-`mcp_server/ecad_tools.py` calls the engine **directly in-process** (not via the worker JSON-RPC socket) per contracts/ecad/ecad_rpc.md:43 — different from the CAD (part) MCP path, which does go through the worker/libchudware routing. `ecad_apply_ops` runs sch→netlist+ERC or pcb→DRC+ratsnest **synchronously** unless it would block too long, in which case `stats.partial=true` and the GUI issues an async `ecad_rebuild`. `_ecad_to_3d` bridges a PCB board into a normal CAD part doc for STEP export (fab_outputs.md §5). README states "Still Python-only: ECAD" but `core/ecad/*.cpp` already mirrors most Python modules 1:1 (autoroute.cpp, drc.cpp, erc.cpp, netlist.cpp, session.cpp, zonefill.cpp) — treat that claim as possibly stale and check `core/tests/` / parity corpus before relying on it.
+`services/mcp/ecad_tools.py` calls the engine **directly in-process** (not via the worker JSON-RPC socket) per contracts/ecad/ecad_rpc.md:43 — different from the CAD (part) MCP path, which does go through the worker/libchudware routing. `ecad_apply_ops` runs sch→netlist+ERC or pcb→DRC+ratsnest **synchronously** unless it would block too long, in which case `stats.partial=true` and the GUI issues an async `ecad_rebuild`. `_ecad_to_3d` bridges a PCB board into a normal CAD part doc for STEP export (fab_outputs.md §5). README states "Still Python-only: ECAD" but `core/ecad/*.cpp` already mirrors most Python modules 1:1 (autoroute.cpp, drc.cpp, erc.cpp, netlist.cpp, session.cpp, zonefill.cpp) — treat that claim as possibly stale and check `core/tests/` / parity corpus before relying on it.
 
 ## Debugging playbook
 - Run one Python test module: `<venv>/python -X utf8 -m engine.ecad.test_drc` (house style: plain `main()` + asserts, `if __name__ == "__main__":` at file end — see every `engine/ecad/test_*.py`)
 - Other module tests: `test_autoroute.py`, `test_autoroute2.py` (diff-pair/meander cases), `test_erc.py`(not confirmed — check `ls engine/ecad/test_*.py`), `test_dfm.py`, `test_fab.py`, `test_formats.py`, `test_hierarchy.py`, `test_impedance.py`, `test_integration.py`, `test_library.py`, `test_netlist.py`, `test_ops.py`, `test_orchestrator.py`, `test_rpc.py`, `test_sync.py`, `test_threed.py`, `test_zonefill.py`, `test_autosave.py`
-- MCP-layer tests: `services/mcp/test_ecad_hardening.py` (timeout/slow-autoroute handling), `mcp_server/test_ecad_tools.py`
+- MCP-layer tests: `services/mcp/test_ecad_hardening.py` (timeout/slow-autoroute handling), `services/mcp/test_ecad_tools.py`
 - If touching `core/ecad/*.cpp`, build/run the core ctest suite (see build-test.md) and check for a matching parity test before assuming Python-only.
 
 ## Graphify starters

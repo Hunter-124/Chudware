@@ -21,12 +21,12 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from mcp_server import core_bridge as cb
-from mcp_server.cad_tools import _doc, _dumps, _err
+from services.mcp import core_bridge as cb
+from services.mcp.cad_tools import _doc, _dumps, _err
 # fit_report's ad-hoc pair is the SAME engine as fit_calc — one dialect, one maths.
 # _Extra is the var-keyword annotation FastMCP needs (a bare **kwargs becomes a
 # required "kwargs" field there and breaks every call); see research_tools.
-from mcp_server.research_tools import (
+from services.mcp.research_tools import (
     _Extra,
     fit_from_kwargs as _fit_from_kwargs,
     has_fit_inputs as _has_fit_inputs,
@@ -96,7 +96,7 @@ def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
     """
     from services.agent.interaction import (
         FileLedger, MemoryLedger, ask_user, make_batch)
-    from mcp_server.intake_ledger import IntakeLedger
+    from services.mcp.intake_ledger import IntakeLedger
 
     if ledger is None:
         if run_id:

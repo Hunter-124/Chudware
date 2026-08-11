@@ -208,7 +208,7 @@ def _make_live_verifier():
         compare_fn(a, b) -> match_pct float|None   (100 == identical; None == degraded)
     """
     try:
-        from mcp_server import core_bridge as cb  # noqa: local import, core-only path
+        from services.mcp import core_bridge as cb  # noqa: local import, core-only path
     except Exception:
         return None, None
     if not cb.available():

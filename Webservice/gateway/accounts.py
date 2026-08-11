@@ -1,42 +1,39 @@
 """Account store: registration, approval queue, and entitlement decisions.
 
-Replaces the hand-edited users.yaml allowlist as the authorization source of
-truth for public sign-up. An unknown-but-authenticated identity (Cloudflare
-Access OIDC already proved the email) becomes a *pending* account with NO
-session rights until an admin approves it, an auto-approve domain matches, or
-a billing entitlement activates it.
+The authorization half of identity. ``authn.py`` proves *who* a caller is; this
+module decides *whether they may use the service* — pending / active / denied /
+suspended, on which plan, in which role. A newly seen identity is registered as
+``pending`` with NO session rights and becomes active either by verifying its
+email address (self-serve, onto a trial) or by an admin decision.
 
-Storage is a single SQLite database at ``settings.data_root / "accounts.db"``
-using stdlib ``sqlite3`` with ``check_same_thread=False`` and one module-level
-lock — the same store pattern as chat.py, but synchronous so it is callable
-from both the ASGI middleware and request handlers without an event loop.
+Storage is PostgreSQL via ``db.tx()`` — one pooled connection per call inside a
+real transaction, so read-modify-write sequences are serialized by the database
+instead of by a process-local lock. Synchronous, so it stays callable from both
+the ASGI middleware and request handlers without an event loop.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import sqlite3
-import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 try:
-    from .config import settings
+    from .db import tx
     from .limits import api_writes
 except ImportError:  # allow `uvicorn app:app` from the package dir
-    from config import settings  # type: ignore
+    from db import tx  # type: ignore
     from limits import api_writes  # type: ignore
 
 log = logging.getLogger("chudware.gateway.accounts")
 
 STATUSES = frozenset({"pending", "active", "denied", "suspended"})
-PLANS = frozenset({"free", "pro", "team"})
+# "trial" is set by the self-serve signup flow (authn.py), never purchasable.
+PLANS = frozenset({"free", "trial", "pro", "team"})
 ROLES = frozenset({"user", "admin"})
 
 router = APIRouter(tags=["accounts"])
@@ -59,7 +56,7 @@ class Account:
     decided_by: str
     stripe_customer_id: str
     notes: str
-    heavy: bool = False  # imported from users.yaml; new accounts never heavy
+    heavy: bool = False  # admin-granted; self-registered accounts are never heavy
 
 
 def is_authorized(account: Account | None) -> bool:
@@ -83,76 +80,11 @@ def effective_plan(account: Account | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# SQLite store (single connection, module-level lock)
+# Store (PostgreSQL — schema lives in migrations/0001_init.sql)
 # ---------------------------------------------------------------------------
 
-# RLock: public functions hold it across read-modify-write while _db() also
-# acquires it internally; a plain Lock would self-deadlock.
-_DB_LOCK = threading.RLock()
-_CONN: sqlite3.Connection | None = None
-_CONN_PATH: Path | None = None
 
-
-def _db_path() -> Path:
-    path = settings.data_root / "accounts.db"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _connect(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, check_same_thread=False)
-    # Account rows carry every user's email, role and Stripe customer id, so
-    # the file must not be world-readable. sqlite creates it 0644 by default.
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        log.warning("accounts: could not restrict permissions on %s", path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS accounts (
-            email TEXT PRIMARY KEY,
-            display TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'pending',
-            plan TEXT NOT NULL DEFAULT 'free',
-            role TEXT NOT NULL DEFAULT 'user',
-            created_at REAL NOT NULL,
-            decided_at REAL,
-            decided_by TEXT NOT NULL DEFAULT '',
-            stripe_customer_id TEXT NOT NULL DEFAULT '',
-            notes TEXT NOT NULL DEFAULT '',
-            heavy INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
-    # status: admin queue listing + pending-count badge filter by status.
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)")
-    # stripe_customer_id: billing webhook resolves customer → account.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_accounts_stripe ON accounts(stripe_customer_id)"
-    )
-    conn.commit()
-    return conn
-
-
-def _db() -> sqlite3.Connection:
-    """Process-wide connection, re-opened if data_root moves (tests)."""
-    global _CONN, _CONN_PATH
-    path = _db_path()
-    with _DB_LOCK:
-        if _CONN is None or _CONN_PATH != path:
-            if _CONN is not None:
-                try:
-                    _CONN.close()
-                except Exception:
-                    pass
-            _CONN = _connect(path)
-            _CONN_PATH = path
-        return _CONN
-
-
-def _row_to_account(row: sqlite3.Row | None) -> Account | None:
+def _row_to_account(row: Mapping[str, Any] | None) -> Account | None:
     if row is None:
         return None
     return Account(
@@ -179,84 +111,47 @@ def _normalize_email(email: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-# Legacy parity: auth.py hard-coded AUTO_APPROVE_DOMAINS = ("ua.edu",) before
-# this store existed, and the Cloudflare Access policy gates the same domains
-# at the edge. Defaulting to it keeps the existing user base working across the
-# change; set the env var to an EMPTY string to close it and route every new
-# identity through the approval queue instead.
-_LEGACY_AUTO_APPROVE = "ua.edu"
-
-
-def auto_approve_domains() -> tuple[str, ...]:
-    """Domains whose identities self-activate as standard users.
-
-    Read from the environment (CHUDWARE_WEB_AUTO_APPROVE_DOMAINS, comma-
-    separated) rather than config.py so this module ships without touching the
-    settings dataclass — wire it into Settings later. An explicitly empty value
-    disables auto-approval; an UNSET value keeps the legacy behaviour.
-    """
-    raw = os.environ.get("CHUDWARE_WEB_AUTO_APPROVE_DOMAINS")
-    if raw is None:
-        raw = _LEGACY_AUTO_APPROVE
-    return tuple(d.strip().lower() for d in raw.split(",") if d.strip())
-
-
-def _domain_auto_approved(email: str) -> bool:
-    at = email.rfind("@")
-    if at < 0:
-        return False
-    domain = email[at + 1:]
-    return any(domain == d or domain.endswith("." + d) for d in auto_approve_domains())
-
-
 def ensure_account(email: str, display: str = "") -> Account:
     """Return the account for ``email``, registering it on first sight.
 
     Idempotent and cheap: no write when the row already exists. New rows are
-    ``pending`` (or ``active`` when the domain is auto-approved) and are ALWAYS
-    role ``user`` — admin is only ever granted through the admin API or the
-    users.yaml migration, never self-assigned. Never resurrects or overwrites
-    an existing (e.g. denied) account.
+    ALWAYS ``pending`` and ALWAYS role ``user`` — admin is only ever granted
+    through the admin API, never self-assigned, and activation is earned by
+    verifying the address (``authn.start_trial``) or granted by an admin.
+    Never resurrects or overwrites an existing (e.g. denied) account.
     """
     email = _normalize_email(email)
     display = (display or "").strip() or email.split("@")[0] or "user"
-    with _DB_LOCK:
-        conn = _db()
-        row = conn.execute(
-            "SELECT * FROM accounts WHERE email = ?", (email,)
-        ).fetchone()
+    with tx() as cur:
+        cur.execute("SELECT * FROM accounts WHERE email = %s", (email,))
+        row = cur.fetchone()
         if row is None:
-            auto = _domain_auto_approved(email)
-            now = time.time()
-            conn.execute(
+            # Two callers racing a first sighting both reach here; the loser's
+            # INSERT blocks on the primary key, then no-ops, and the re-SELECT
+            # (READ COMMITTED takes a fresh snapshot per statement) returns the
+            # winner's row. One row, one created_at, no lock held in Python.
+            cur.execute(
                 """
-                INSERT OR IGNORE INTO accounts
+                INSERT INTO accounts
                     (email, display, status, plan, role, created_at, decided_at, decided_by)
-                VALUES (?, ?, ?, 'free', 'user', ?, ?, ?)
+                VALUES (%s, %s, 'pending', 'free', 'user', %s, NULL, '')
+                ON CONFLICT (email) DO NOTHING
                 """,
-                (
-                    email,
-                    display,
-                    "active" if auto else "pending",
-                    now,
-                    now if auto else None,
-                    "auto-domain" if auto else "",
-                ),
+                (email, display, time.time()),
             )
-            conn.commit()
-            row = conn.execute(
-                "SELECT * FROM accounts WHERE email = ?", (email,)
-            ).fetchone()
+            cur.execute("SELECT * FROM accounts WHERE email = %s", (email,))
+            row = cur.fetchone()
     account = _row_to_account(row)
     assert account is not None  # row exists: we just wrote it or it pre-existed
     return account
 
 
 def get_account(email: str) -> Account | None:
-    with _DB_LOCK:
-        row = _db().execute(
-            "SELECT * FROM accounts WHERE email = ?", (_normalize_email(email),)
-        ).fetchone()
+    with tx() as cur:
+        cur.execute(
+            "SELECT * FROM accounts WHERE email = %s", (_normalize_email(email),)
+        )
+        row = cur.fetchone()
     return _row_to_account(row)
 
 
@@ -264,56 +159,17 @@ def get_account_by_stripe_customer(customer_id: str) -> Account | None:
     customer_id = (customer_id or "").strip()
     if not customer_id:
         return None
-    with _DB_LOCK:
-        row = _db().execute(
-            "SELECT * FROM accounts WHERE stripe_customer_id = ?", (customer_id,)
-        ).fetchone()
+    with tx() as cur:
+        cur.execute(
+            "SELECT * FROM accounts WHERE stripe_customer_id = %s", (customer_id,)
+        )
+        row = cur.fetchone()
     return _row_to_account(row)
 
 
 # ---------------------------------------------------------------------------
 # Mutations (admin / billing)
 # ---------------------------------------------------------------------------
-
-
-def adopt_listed(
-    email: str,
-    *,
-    role: str = "user",
-    heavy: bool = False,
-    display: str = "",
-) -> Account | None:
-    """Activate a legacy ``users.yaml`` identity that predates this store.
-
-    Used by the auth middleware when an allowlisted teammate shows up before
-    (or after) the bulk startup migration ran — they are already an approved
-    human, so stranding them in the pending queue would be a regression.
-
-    Deliberately narrow: it only ever moves a ``pending`` row to ``active``. A
-    ``denied`` or ``suspended`` account is NOT resurrected, so an admin
-    decision always outranks the YAML file.
-    """
-    email = _normalize_email(email)
-    role = role if role in ROLES else "user"
-    with _DB_LOCK:
-        conn = _db()
-        cur = conn.execute(
-            """
-            UPDATE accounts
-               SET status = 'active', role = ?, heavy = ?,
-                   display = COALESCE(NULLIF(?, ''), display),
-                   decided_at = ?, decided_by = 'users.yaml'
-             WHERE email = ? AND status = 'pending'
-            """,
-            (role, 1 if heavy else 0, display.strip(), time.time(), email),
-        )
-        conn.commit()
-        if cur.rowcount:
-            log.info("accounts: adopted %s from users.yaml as %s", email, role)
-        row = conn.execute(
-            "SELECT * FROM accounts WHERE email = ?", (email,)
-        ).fetchone()
-    return _row_to_account(row) if row else None
 
 
 def set_status(
@@ -329,23 +185,18 @@ def set_status(
     email = _normalize_email(email)
     if status not in STATUSES:
         raise ValueError(f"unknown status: {status}")
-    with _DB_LOCK:
-        conn = _db()
-        cur = conn.execute(
+    with tx() as cur:
+        cur.execute(
             """
             UPDATE accounts
-               SET status = ?, decided_at = ?, decided_by = ?,
-                   notes = COALESCE(?, notes)
-             WHERE email = ?
+               SET status = %s, decided_at = %s, decided_by = %s,
+                   notes = COALESCE(%s, notes)
+             WHERE email = %s
+         RETURNING *
             """,
             (status, time.time(), decided_by.strip(), notes, email),
         )
-        conn.commit()
-        if cur.rowcount == 0:
-            return None
-        row = conn.execute(
-            "SELECT * FROM accounts WHERE email = ?", (email,)
-        ).fetchone()
+        row = cur.fetchone()
     return _row_to_account(row)
 
 
@@ -353,35 +204,23 @@ def set_plan(email: str, plan: str) -> Account | None:
     email = _normalize_email(email)
     if plan not in PLANS:
         raise ValueError(f"unknown plan: {plan}")
-    with _DB_LOCK:
-        conn = _db()
-        cur = conn.execute(
-            "UPDATE accounts SET plan = ? WHERE email = ?", (plan, email)
+    with tx() as cur:
+        cur.execute(
+            "UPDATE accounts SET plan = %s WHERE email = %s RETURNING *", (plan, email)
         )
-        conn.commit()
-        if cur.rowcount == 0:
-            return None
-        row = conn.execute(
-            "SELECT * FROM accounts WHERE email = ?", (email,)
-        ).fetchone()
+        row = cur.fetchone()
     return _row_to_account(row)
 
 
 def set_stripe_customer(email: str, customer_id: str) -> Account | None:
     email = _normalize_email(email)
     customer_id = (customer_id or "").strip()
-    with _DB_LOCK:
-        conn = _db()
-        cur = conn.execute(
-            "UPDATE accounts SET stripe_customer_id = ? WHERE email = ?",
+    with tx() as cur:
+        cur.execute(
+            "UPDATE accounts SET stripe_customer_id = %s WHERE email = %s RETURNING *",
             (customer_id, email),
         )
-        conn.commit()
-        if cur.rowcount == 0:
-            return None
-        row = conn.execute(
-            "SELECT * FROM accounts WHERE email = ?", (email,)
-        ).fetchone()
+        row = cur.fetchone()
     return _row_to_account(row)
 
 
@@ -396,99 +235,35 @@ def list_accounts(
         raise ValueError(f"unknown status: {status}")
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
-    with _DB_LOCK:
-        conn = _db()
+    with tx() as cur:
         if status is None:
-            total = conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"]
-            rows = conn.execute(
-                "SELECT * FROM accounts ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            cur.execute("SELECT COUNT(*) AS n FROM accounts")
+            total = cur.fetchone()["n"]
+            cur.execute(
+                "SELECT * FROM accounts ORDER BY created_at DESC LIMIT %s OFFSET %s",
                 (limit, offset),
-            ).fetchall()
+            )
         else:
-            total = conn.execute(
-                "SELECT COUNT(*) AS n FROM accounts WHERE status = ?", (status,)
-            ).fetchone()["n"]
-            rows = conn.execute(
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM accounts WHERE status = %s", (status,)
+            )
+            total = cur.fetchone()["n"]
+            cur.execute(
                 """
-                SELECT * FROM accounts WHERE status = ?
-                ORDER BY created_at DESC LIMIT ? OFFSET ?
+                SELECT * FROM accounts WHERE status = %s
+                ORDER BY created_at DESC LIMIT %s OFFSET %s
                 """,
                 (status, limit, offset),
-            ).fetchall()
+            )
+        rows = cur.fetchall()
     return [a for a in (_row_to_account(r) for r in rows) if a is not None], int(total)
 
 
 def pending_count() -> int:
-    with _DB_LOCK:
-        row = _db().execute(
-            "SELECT COUNT(*) AS n FROM accounts WHERE status = 'pending'"
-        ).fetchone()
+    with tx() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM accounts WHERE status = 'pending'")
+        row = cur.fetchone()
     return int(row["n"])
-
-
-# ---------------------------------------------------------------------------
-# users.yaml migration / adoption
-# ---------------------------------------------------------------------------
-
-
-def import_users_yaml(
-    path: Path | None = None,
-    *,
-    decided_by: str = "migration",
-) -> dict[str, Any]:
-    """Adopt the existing users.yaml allowlist as ACTIVE accounts.
-
-    Preserves role (so current admins keep admin) and heavy. Idempotent:
-    existing rows are never touched, so re-running after go-live cannot
-    clobber approvals, denials, plans, or stripe ids recorded since.
-    """
-    path = path or settings.users_file
-    with Path(path).open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
-    users = data.get("users") if isinstance(data, dict) else data
-    if not isinstance(users, list):
-        users = []
-    imported: list[str] = []
-    skipped: list[str] = []
-    now = time.time()
-    with _DB_LOCK:
-        conn = _db()
-        for row in users:
-            if not isinstance(row, dict):
-                continue
-            email = _normalize_email(str(row.get("email", "")))
-            if not email:
-                continue
-            display = str(row.get("display") or email.split("@")[0]).strip()
-            role = str(row.get("role") or "user").strip().lower()
-            if role not in ROLES:
-                role = "user"
-            cur = conn.execute(
-                """
-                INSERT OR IGNORE INTO accounts
-                    (email, display, status, plan, role, created_at,
-                     decided_at, decided_by, notes, heavy)
-                VALUES (?, ?, 'active', 'free', ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    email,
-                    display,
-                    role,
-                    now,
-                    now,
-                    decided_by,
-                    str(row.get("notes") or "").strip(),
-                    1 if row.get("heavy") else 0,
-                ),
-            )
-            (imported if cur.rowcount else skipped).append(email)
-        conn.commit()
-    log.info(
-        "users.yaml import: %d imported as active, %d already present",
-        len(imported),
-        len(skipped),
-    )
-    return {"imported": imported, "skipped": skipped}
 
 
 # ---------------------------------------------------------------------------
@@ -635,8 +410,8 @@ async def my_account(request: Request) -> dict[str, Any]:
     user = _current_user(request)
     account = get_account(user.email)
     if account is None:
-        # Authenticated but never registered (pre-migration users.yaml identity):
-        # report a truthful, non-authorized shape without writing anything.
+        # Authenticated but never registered — report a truthful,
+        # non-authorized shape without writing anything.
         return {"email": user.email, "registered": False, "status": None, "plan": None}
     return {
         "email": account.email,

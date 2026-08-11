@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import asyncio
 import logging
 import os
 import re
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -18,11 +16,13 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 try:
+    from . import db
     from .auth import AuthMiddleware, User, get_current_user
     from .config import settings
     from .chat import Presence, presence, router as chat_router  # noqa: F401
     from .bucket import router as bucket_router
 except ImportError:  # uvicorn app:app from package dir
+    import db  # type: ignore
     from auth import AuthMiddleware, User, get_current_user
     from config import settings
     from chat import Presence, presence, router as chat_router  # noqa: F401
@@ -37,9 +37,13 @@ logging.basicConfig(
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 try:
-    from .auth import UserDirectory
+    from . import mailer
+    from .authn import router as authn_router
+    from .oauth import router as oauth_router
 except ImportError:
-    from auth import UserDirectory
+    import mailer  # type: ignore
+    from authn import router as authn_router  # type: ignore
+    from oauth import router as oauth_router  # type: ignore
 
 try:
     from .engine_bridge import router as engine_router, active_bridge_count
@@ -50,7 +54,6 @@ try:
     from .terminal import router as terminal_router
     from .deploy_ops import router as deploy_router
     from .releases import router as releases_router
-    from . import accounts
     from .accounts import router as accounts_router
     from .billing import router as billing_router
 except ImportError:
@@ -62,15 +65,13 @@ except ImportError:
     from terminal import router as terminal_router
     from deploy_ops import router as deploy_router
     from releases import router as releases_router
-    import accounts
     from accounts import router as accounts_router
     from billing import router as billing_router
 
-settings.ensure_data_dirs()  # users_file must exist before the directory loads
-user_directory = UserDirectory(settings.users_file)
+settings.ensure_data_dirs()
 
 app = FastAPI(title="chudware-web", version="1.0.0")
-app.add_middleware(AuthMiddleware, directory=user_directory)
+app.add_middleware(AuthMiddleware)
 
 
 # Verified against static/*.html: every <script> is an external /static file
@@ -122,57 +123,9 @@ async def whoami(request: Request) -> dict[str, Any]:
             "role": user.role, "heavy": user.heavy}
 
 
-async def _sync_access_policy() -> dict[str, Any]:
-    """Push the current users file into the Cloudflare Access policy.
-
-    Reuses deploy/cf_provision.py --sync-users (single tested code path).
-    Best-effort: a CF failure must not lose the local allowlist edit.
-    """
-    script = Path(__file__).resolve().parents[1] / "deploy" / "cf_provision.py"
-    env = dict(os.environ, CHUDWARE_WEB_USERS_FILE=str(settings.users_file))
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, str(script), "--sync-users",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
-    )
-    try:
-        out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        return {"synced": False, "detail": "cloudflare sync timed out"}
-    out = (out_b or b"").decode("utf-8", errors="replace").strip()
-    ok = proc.returncode == 0
-    if not ok:
-        log.warning("Access policy sync failed: %s", out)
-    return {"synced": ok, "detail": out[-500:]}
-
-
-def _user_dict(u: User) -> dict[str, Any]:
-    return {"email": u.email, "display": u.display, "role": u.role,
-            "heavy": u.heavy, "project": u.project, "doc": u.doc}
-
-
-def _available_projects() -> list[str]:
-    try:
-        return sorted(p.name[:-4] for p in settings.plm_dir.glob("*.git"))
-    except OSError:
-        return []
-
-
-@admin_router.get("/users")
-async def admin_list_users(request: Request) -> dict[str, Any]:
-    _require_admin(request)
-    return {
-        "users": [_user_dict(u) for u in sorted(user_directory.all(), key=lambda u: u.email)],
-        "projects": _available_projects(),
-        "default_project": user_directory.default_project,
-        "default_doc": user_directory.default_doc,
-    }
-
-
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
 
-# Part files the admin browser lists / the auto-open picker accepts.
+# Part files the admin browser lists.
 _CAD_EXTS = {".step+", ".step", ".stp", ".stl", ".3mf", ".iges", ".igs", ".brep", ".aicm"}
 
 
@@ -195,8 +148,8 @@ def _in_project_roots(path: Path) -> bool:
 def _valid_project(p: str) -> bool:
     """A PLM project name, or an absolute host directory.
 
-    Absolute paths must sit inside settings.project_roots — otherwise any admin
-    could point the site-wide default project at /etc or another user's home.
+    Absolute paths must sit inside settings.project_roots — otherwise an admin
+    could point a project at /etc or another user's home.
     """
     if p.startswith("/"):
         if ".." in p.split("/"):
@@ -209,13 +162,9 @@ def _valid_project(p: str) -> bool:
     return bool(_PROJECT_RE.match(p))
 
 
-def _valid_doc(d: str) -> bool:
-    return bool(d) and not d.startswith("/") and ".." not in d.split("/")
-
-
 @admin_router.get("/browse")
 async def admin_browse(request: Request, path: str = "") -> dict[str, Any]:
-    """Host-machine folder listing for the admin project picker (admin-only).
+    """Host-machine folder listing (admin-only).
 
     Confined to settings.project_roots: an absolute path outside every
     allowlisted root is rejected rather than listed.
@@ -249,58 +198,6 @@ async def admin_browse(request: Request, path: str = "") -> dict[str, Any]:
     return {"path": str(base),
             "parent": parent,
             "dirs": dirs[:500], "parts": parts[:500]}
-
-
-@admin_router.put("/default-project")
-async def admin_set_default_project(request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    """Site-wide default project — every user without an explicit project inherits it."""
-    _require_admin(request)
-    project = str(body.get("project") or "").strip()
-    doc = str(body.get("doc") or "").strip()
-    if project and not _valid_project(project):
-        raise HTTPException(status_code=400,
-                            detail="project must be a PLM project name or an existing host folder path")
-    if doc and not _valid_doc(doc):
-        raise HTTPException(status_code=400, detail="invalid part path")
-    user_directory.set_default_project(project, doc)
-    return {"ok": True, "default_project": project, "default_doc": doc}
-
-
-@admin_router.post("/users")
-async def admin_add_user(request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    _require_admin(request)
-    email = str(body.get("email", "")).strip().lower()
-    if "@" not in email or " " in email or len(email) > 254:
-        raise HTTPException(status_code=400, detail="invalid email")
-    role = str(body.get("role", "user"))
-    if role not in {"admin", "user"}:
-        raise HTTPException(status_code=400, detail="role must be admin or user")
-    project = str(body.get("project") or "").strip()
-    if project and not _valid_project(project):
-        raise HTTPException(status_code=400,
-                            detail="project must be a PLM project name or an existing host folder path")
-    user = User(
-        email=email,
-        display=str(body.get("display") or email.split("@")[0]),
-        role=role,
-        heavy=bool(body.get("heavy", False)),
-        project=project,
-    )
-    user_directory.upsert(user)
-    sync = await _sync_access_policy()
-    return {"ok": True, "user": _user_dict(user), "access_policy": sync}
-
-
-@admin_router.delete("/users/{email}")
-async def admin_remove_user(email: str, request: Request) -> dict[str, Any]:
-    admin = _require_admin(request)
-    email = email.strip().lower()
-    if email == admin.email:
-        raise HTTPException(status_code=400, detail="cannot remove yourself")
-    if not user_directory.remove(email):
-        raise HTTPException(status_code=404, detail="no such user")
-    sync = await _sync_access_policy()
-    return {"ok": True, "removed": email, "access_policy": sync}
 
 
 def mem_available_bytes() -> int | None:
@@ -387,45 +284,6 @@ async def admin_refuse_new(request: Request, body: dict[str, Any]) -> dict[str, 
     return {"ok": True, "refuse_new": flag.exists()}
 
 
-@admin_router.patch("/users/{email}")
-async def admin_edit_user(email: str, request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    """Edit display/role/heavy/project/doc in place (no remove+re-add dance).
-
-    Email itself is immutable — it is the Access identity; add a new entry
-    instead.
-    """
-    admin = _require_admin(request)
-    email = email.strip().lower()
-    user = user_directory.get(email)
-    if user is None:
-        raise HTTPException(status_code=404, detail="no such user")
-    fields: dict[str, Any] = {}
-    if "display" in body:
-        fields["display"] = str(body.get("display") or "").strip() or user.display
-    if "role" in body:
-        role = str(body.get("role") or "").strip()
-        if role not in {"admin", "user"}:
-            raise HTTPException(status_code=400, detail="role must be admin or user")
-        if email == admin.email and role != "admin":
-            raise HTTPException(status_code=400, detail="cannot demote yourself")
-        fields["role"] = role
-    if "heavy" in body:
-        fields["heavy"] = bool(body.get("heavy"))
-    if "project" in body:
-        project = str(body.get("project") or "").strip()
-        if project and not _valid_project(project):
-            raise HTTPException(status_code=400,
-                detail="project must be a PLM project name or an existing host folder path")
-        fields["project"] = project
-    if "doc" in body:
-        fields["doc"] = str(body.get("doc") or "").strip()
-    if not fields:
-        raise HTTPException(status_code=400, detail="nothing to change")
-    user_directory.upsert(replace(user, **fields))
-    return {"ok": True, "user": _user_dict(user_directory.get(email))}
-
-
-
 # Obvious secret shapes that may land in the gateway journal (auth headers,
 # CF Access tokens, env dumps). admin_logs redacts them before serving.
 _REDACT_JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\b")
@@ -472,24 +330,24 @@ async def admin_page(request: Request) -> HTMLResponse:
 @app.on_event("startup")
 async def _startup() -> None:
     settings.ensure_data_dirs()
-    # Adopt the legacy YAML allowlist into the account store so existing
-    # teammates (and their admin role) survive the switch to the approval
-    # queue. Idempotent — later admin decisions are never clobbered.
-    try:
-        migrated = accounts.import_users_yaml(settings.users_file)
-        # import_users_yaml returns the email LISTS, not counts.
-        imported = migrated.get("imported") or []
-        if imported:
-            log.info("accounts: imported %d user(s) from %s",
-                     len(imported), settings.users_file)
-    except Exception:  # noqa: BLE001 — never block boot on a migration hiccup
-        log.exception("accounts: users.yaml import failed")
-    if not accounts.auto_approve_domains():
-        log.warning(
-            "accounts: CHUDWARE_WEB_AUTO_APPROVE_DOMAINS is unset — every new "
-            "identity lands in the pending queue and must be approved in /admin"
-        )
+    # Store first: open the pool and bring the schema up to date. This raises
+    # if PostgreSQL is unreachable or a migration fails, and that is the point
+    # — a gateway serving requests against a missing or half-migrated schema
+    # looks healthy and answers wrongly.
+    db.init()
+    # Outbound mail is queued into mail_outbox by mailer.send() and delivered
+    # only by this task. Without it every verification and reset link ever
+    # generated sits in the table unsent, and registration silently dead-ends.
+    mailer.start_drain()
     log.info("gateway up data_root=%s dev=%s", settings.data_root, settings.dev_mode)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    # Before anything else: the drain marks rows sent through db.tx(), so
+    # tearing the pool down first would only produce spurious failures.
+    await mailer.stop_drain()
+    db.close_pool()
 
 
 # nvidia-smi on a box with a dead driver (e.g. livingroom 1050 Ti, no module)
@@ -564,6 +422,8 @@ async def healthz(request: Request) -> dict[str, Any]:
 
 
 app.include_router(chat_router)
+app.include_router(authn_router)
+app.include_router(oauth_router)
 app.include_router(admin_router)
 app.include_router(engine_router)
 app.include_router(workspace_router)
@@ -580,10 +440,9 @@ app.include_router(billing_router)
 
 class _AdminGatedStatic(StaticFiles):
     """admin.* portal assets are the privileged UI — never serve them to
-    standard users (any *.ua.edu account is auto-approved as role='user').
-    The mutations were already gated server-side; this keeps the admin UI
-    itself unreadable. /admin reads admin.html from disk and the admin's own
-    browser fetches admin.js here — both pass for role='admin'."""
+    standard users. The mutations were already gated server-side; this keeps
+    the admin UI itself unreadable. /admin reads admin.html from disk and the
+    admin's own browser fetches admin.js here — both pass for role='admin'."""
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http":

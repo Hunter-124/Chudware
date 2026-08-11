@@ -417,7 +417,7 @@ def test_gap_is_manifold_issues_free_edges_fails(monkeypatch):
         return {"issues": [{"kind": "free_edges", "severity": "error", "count": 4}],
                 "tiny_edges": 0}
 
-    import mcp_server.core_bridge as cb
+    import services.mcp.core_bridge as cb
     monkeypatch.setattr(cb, "call", fake_cb_call)
 
     r = json.loads(bat._gap_is_manifold(doc_id="fake"))
@@ -434,7 +434,7 @@ def test_gap_is_manifold_tiny_edges_only_is_manifold(monkeypatch):
         return {"issues": [{"kind": "tiny_edges", "severity": "warning", "count": 2}],
                 "tiny_edges": 2}
 
-    import mcp_server.core_bridge as cb
+    import services.mcp.core_bridge as cb
     monkeypatch.setattr(cb, "call", fake_cb_call)
 
     r = json.loads(bat._gap_is_manifold(doc_id="fake"))
@@ -450,7 +450,7 @@ def test_gap_is_manifold_no_issues_scalar_fallback_manifold(monkeypatch):
     def fake_cb_call(op, args):
         return {"issues": [], "free_edges": 0, "tiny_edges": 0}
 
-    import mcp_server.core_bridge as cb
+    import services.mcp.core_bridge as cb
     monkeypatch.setattr(cb, "call", fake_cb_call)
 
     r = json.loads(bat._gap_is_manifold(doc_id="fake"))
@@ -464,7 +464,7 @@ def test_gap_is_manifold_no_issues_scalar_fallback_non_manifold(monkeypatch):
     def fake_cb_call(op, args):
         return {"issues": [], "free_edges": 4, "tiny_edges": 0}
 
-    import mcp_server.core_bridge as cb
+    import services.mcp.core_bridge as cb
     monkeypatch.setattr(cb, "call", fake_cb_call)
 
     r = json.loads(bat._gap_is_manifold(doc_id="fake"))
@@ -480,7 +480,7 @@ def test_gap_is_manifold_error_severity_fails(monkeypatch):
         return {"issues": [{"kind": "invalid_face", "severity": "error"}],
                 "tiny_edges": 0}
 
-    import mcp_server.core_bridge as cb
+    import services.mcp.core_bridge as cb
     monkeypatch.setattr(cb, "call", fake_cb_call)
 
     r = json.loads(bat._gap_is_manifold(doc_id="fake"))
@@ -500,7 +500,7 @@ def test_gap_eval_check_direct_issues_free_edges_fails(monkeypatch):
         return {"issues": [{"kind": "free_edges", "severity": "error", "count": 4}],
                 "tiny_edges": 0}
 
-    import mcp_server.core_bridge as cb
+    import services.mcp.core_bridge as cb
     monkeypatch.setattr(cb, "call", fake_cb_call)
 
     r = json.loads(bat._gap_eval_check_direct(doc_id="fake"))
@@ -515,7 +515,7 @@ def test_gap_eval_check_direct_tiny_edges_only_is_ok(monkeypatch):
         return {"issues": [{"kind": "tiny_edges", "severity": "warning", "count": 2}],
                 "tiny_edges": 2}
 
-    import mcp_server.core_bridge as cb
+    import services.mcp.core_bridge as cb
     monkeypatch.setattr(cb, "call", fake_cb_call)
 
     r = json.loads(bat._gap_eval_check_direct(doc_id="fake"))
@@ -530,7 +530,7 @@ def test_gap_eval_check_direct_error_severity_fails(monkeypatch):
         return {"issues": [{"kind": "invalid_face", "severity": "error"}],
                 "tiny_edges": 0}
 
-    import mcp_server.core_bridge as cb
+    import services.mcp.core_bridge as cb
     monkeypatch.setattr(cb, "call", fake_cb_call)
 
     r = json.loads(bat._gap_eval_check_direct(doc_id="fake"))
@@ -544,7 +544,7 @@ def test_gap_eval_check_direct_no_issues_scalar_fallback_ok(monkeypatch):
     def fake_cb_call(op, args):
         return {"issues": [], "free_edges": 0, "invalid_faces": 0, "tiny_edges": 0}
 
-    import mcp_server.core_bridge as cb
+    import services.mcp.core_bridge as cb
     monkeypatch.setattr(cb, "call", fake_cb_call)
 
     r = json.loads(bat._gap_eval_check_direct(doc_id="fake"))
@@ -558,7 +558,7 @@ def test_gap_eval_check_direct_no_issues_scalar_fallback_not_ok(monkeypatch):
     def fake_cb_call(op, args):
         return {"issues": [], "free_edges": 0, "invalid_faces": 2, "tiny_edges": 0}
 
-    import mcp_server.core_bridge as cb
+    import services.mcp.core_bridge as cb
     monkeypatch.setattr(cb, "call", fake_cb_call)
 
     r = json.loads(bat._gap_eval_check_direct(doc_id="fake"))
@@ -674,14 +674,14 @@ def test_adapt_dim_coverage_runs_on_drawing(monkeypatch):
             raise AssertionError(method)
 
     import sys
-    monkeypatch.setitem(sys.modules, "mcp_server.core_bridge", _CB)
+    monkeypatch.setitem(sys.modules, "services.mcp.core_bridge", _CB)
     # also patch import path used inside gap fn
     monkeypatch.setattr(
-        "mcp_server.core_bridge.call", _CB.call, raising=False
+        "services.mcp.core_bridge.call", _CB.call, raising=False
     )
 
     # Re-bind via battery's import site: inject into the module used by gap.
-    import mcp_server.core_bridge as cb_mod
+    import services.mcp.core_bridge as cb_mod
     monkeypatch.setattr(cb_mod, "call", _CB.call)
 
     r = bat.verify("drw-1", ["dim_coverage"])

@@ -13,14 +13,14 @@ Every assertion checks BOTH the result AND the rich-context contract: payloads m
 and ``next_actions``, status must name unconnected pins, and the sim numbers must be physically
 sane (divider midpoint = Vsrc * R2/(R1+R2)).
 
-Run:  & ".../venv/Scripts/python.exe" -m mcp_server.test_ecad_tools
+Run:  & ".../venv/Scripts/python.exe" -m services.mcp.test_ecad_tools
 """
 from __future__ import annotations
 
 import json
 import math
 
-from mcp_server.ecad_tools import register_ecad_tools
+from services.mcp.ecad_tools import register_ecad_tools
 
 
 # --------------------------------------------------------------------------- stub mcp
@@ -320,8 +320,8 @@ def test_sweep_guard(tools: dict) -> None:
 
 def _build_footprinted_divider(tools: dict) -> None:
     """Build a divider whose resistors carry a real footprint, so sync places them on the board."""
-    from mcp_server.ecad_common import ecad_session
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_schematic", name="sync_div")
     v1 = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
@@ -347,8 +347,8 @@ def _build_footprinted_divider(tools: dict) -> None:
 def test_sync_autoroute_zone_flow(tools: dict) -> None:
     """The full PCB capability chain via the AI tools: update_from_sch -> autoroute -> add_zone ->
     fill_zones, asserting the rich-context contract at each step."""
-    from mcp_server.ecad_common import ecad_session
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_tools import _ECAD
 
     _build_footprinted_divider(tools)
     _call(tools, "ecad_new_pcb", name="sync_board")
@@ -561,8 +561,8 @@ def test_simulate_four(tools: dict) -> None:
     _call(tools, "ecad_wire", from_ref="C1", from_pin="2", to_ref="V1", to_pin="-")
     _call(tools, "ecad_add_power", net="GND", x=0, y=3)
     # Sine source: set waveform to SIN so the tran has something to analyze.
-    from mcp_server.ecad_common import ecad_session
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_tools import _ECAD
     s = ecad_session.get_session(_ECAD["current_sch"])
     v_sym = next(sym for sym in s.doc.get("symbols", []) if sym.get("ref") == "V1")
     ecad_session.apply_ops(s, s.revision, [
@@ -644,8 +644,8 @@ def test_check_impedance_no_tracks(tools: dict) -> None:
 
 def test_check_impedance_routed(tools: dict) -> None:
     """ecad_check_impedance on a board with a routed trace must return a Z0 reading."""
-    from mcp_server.ecad_common import ecad_session
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_tools import _ECAD
 
     # Build a footprinted divider + route it.
     _build_footprinted_divider(tools)
@@ -708,7 +708,7 @@ def test_make_board(tools: dict) -> None:
     assert "new_pcb" in step_names, f"new_pcb step missing: {step_names}"
     assert "update_from_sch" in step_names, f"update_from_sch step missing: {step_names}"
     # The tool must set a current_pcb so ecad_status works immediately after.
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_tools import _ECAD
     assert _ECAD["current_pcb"] is not None, "ecad_make_board must set current_pcb"
     st = _call(tools, "ecad_status")
     assert st["ok"] and st["kind"] == "pcb", "ecad_status after make_board should see a board"
@@ -737,8 +737,8 @@ def test_run_dfm_clean(tools: dict) -> None:
 
 def test_run_dfm_seeded(tools: dict) -> None:
     """ecad_run_dfm on a board with a seeded DFM violation must report it with a reading."""
-    from mcp_server.ecad_common import ecad_session
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_pcb", name="dfm_seeded")
     pcb = ecad_session.get_session(_ECAD["current_pcb"])
@@ -787,8 +787,8 @@ def test_run_dfm_seeded(tools: dict) -> None:
 def test_autoroute_with_diff_pairs(tools: dict) -> None:
     """ecad_autoroute with diff_pairs=[['CLK_P','CLK_N']] must attempt coupled routing and
     return diff_pair_stats in the payload."""
-    from mcp_server.ecad_common import ecad_session
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_tools import _ECAD
 
     _build_footprinted_divider(tools)  # sets up a schematic with footprints
     _call(tools, "ecad_new_pcb", name="dp_board")
@@ -856,8 +856,8 @@ def test_autoroute_with_diff_pairs(tools: dict) -> None:
 
 def test_check_diff_impedance(tools: dict) -> None:
     """ecad_check_diff_impedance on a board with routed CLK_P/CLK_N tracks must return Z_diff."""
-    from mcp_server.ecad_common import ecad_session
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_tools import _ECAD
 
     # Start with a clean board.
     _call(tools, "ecad_new_pcb", name="diff_z_board")
@@ -963,8 +963,8 @@ def test_e2_led_driver_recipe(tools: dict) -> None:
 
 def test_e3_opamp_noninverting_gain(tools: dict) -> None:
     """E3: a non-inverting op-amp (Rf=10k,Rin=1k,Vin=1V) must simulate to V(OUT)~=11V, not 0."""
-    from mcp_server.ecad_common import schema as ecad_schema
-    from mcp_server.ecad_common import ecad_session
+    from services.mcp.ecad_common import schema as ecad_schema
+    from services.mcp.ecad_common import ecad_session
 
     s = _call(tools, "ecad_new_schematic", name="E3_noninv")
     sid = s["doc_id"]
@@ -1016,7 +1016,7 @@ def test_e3_opamp_noninverting_gain(tools: dict) -> None:
 
 def test_e5_make_board_honors_doc_id(tools: dict) -> None:
     """E5: ecad_make_board(doc_id=A) must build from schematic A even when B is the active one."""
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_tools import _ECAD
     a = _call(tools, "ecad_design", request="5V voltage divider with 2.5V output")
     aid = a["doc_id"]
     b = _call(tools, "ecad_new_schematic", name="E5_empty_B")  # active becomes B (empty)
@@ -1142,7 +1142,7 @@ def test_e9_noise_top_level_nonzero(tools: dict) -> None:
 def test_fin9_hostcheck_tool(tools: dict) -> None:
     """T-FIN9: ecad_run_hostcheck runs on the active board, reports the metadata-driven
     sequencing finding with a fix hint, and is clean on an empty board."""
-    from mcp_server.ecad_common import ecad_session
+    from services.mcp.ecad_common import ecad_session
 
     # clean empty board -> no findings, teaching payload intact
     b = _call(tools, "ecad_new_pcb", name="FIN9_clean")
@@ -1301,8 +1301,8 @@ def test_fin13_run_pdn(tools: dict) -> None:
     """T-FIN13: ecad_run_pdn flags an undersized 3 A trace (drop + current density) and
     exports the I2R map as the boardphys `pdn` sidecar extension."""
     import os
-    from mcp_server.ecad_common import ecad_session
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_pcb", name="fin13_pdn")
     pcb = ecad_session.get_session(_ECAD["current_pcb"])
@@ -1442,7 +1442,7 @@ def _disable_live_provider():
     is absent.
     """
     try:
-        from agent import config as _cfg  # type: ignore
+        from services.agent import config as _cfg  # type: ignore
     except Exception:  # noqa: BLE001 -- agent package not importable in this env
         return lambda: None
     _orig = getattr(_cfg, "get_provider", None)
@@ -1488,7 +1488,7 @@ if pytest is not None:
 def _fin16_tools() -> dict:
     """Register the ECAD + thermal-handoff tools onto ONE stub (the handoff needs
     ecad session state)."""
-    from mcp_server.ecad_thermal import register_ecad_thermal_tools
+    from services.mcp.ecad_thermal import register_ecad_thermal_tools
     stub = _StubMCP()
     register_ecad_tools(stub)
     register_ecad_thermal_tools(stub)
@@ -1498,8 +1498,8 @@ def _fin16_tools() -> dict:
 def _fin16_demo_board(tools: dict, name: str = "fin16_demo") -> str:
     """Regulator (~2 W) + MCU (0.3 W) + passives demo board with a closed outline and
     a skinny +5V trace (for the PDN/trace-heating leg). Returns the pcb doc_id."""
-    from mcp_server.ecad_common import ecad_session
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_pcb", name=name)
     doc_id = _ECAD["current_pcb"]
@@ -1671,7 +1671,7 @@ def test_fin16_verify_thermal() -> None:
 
 
 def test_fin16_conservation_and_incomplete_guards() -> None:
-    from mcp_server.ecad_thermal import (
+    from services.mcp.ecad_thermal import (
         airflow_deviation_table, build_component_table, build_heat_loads,
         build_i2r_loads, map_component_temps, quasi_steady_transient,
         theta_ja_checks)
@@ -1745,7 +1745,7 @@ def test_fin16_live_solve() -> None:
         print("  FIN16: build123d not installed — skipping live solve")
         return
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
         cb.call("ping", {})
     except Exception as e:  # noqa: BLE001
         print(f"  FIN16: libchudware not loadable ({type(e).__name__}) — live solve SKIPPED "
@@ -1781,8 +1781,8 @@ def test_fin16_live_solve() -> None:
 
 def _fin17_tools() -> dict:
     """ECAD + thermal-handoff + heatsink tools on ONE stub (shared session state)."""
-    from mcp_server.ecad_thermal import register_ecad_thermal_tools
-    from mcp_server.heatsink import register_heatsink_tools
+    from services.mcp.ecad_thermal import register_ecad_thermal_tools
+    from services.mcp.heatsink import register_heatsink_tools
     stub = _StubMCP()
     register_ecad_tools(stub)
     register_ecad_thermal_tools(stub)
@@ -1792,7 +1792,7 @@ def _fin17_tools() -> dict:
 
 def test_fin17_tim_physics_guards() -> None:
     """Invalid TIM physics must fail before ranking, never score as a cold winner."""
-    from mcp_server.heatsink import (heatsink_select_from_params,
+    from services.mcp.heatsink import (heatsink_select_from_params,
                                      tim_resistance_c_per_w)
 
     invalid_helper_inputs = [
@@ -1830,8 +1830,8 @@ def test_fin17_tim_physics_guards() -> None:
 
 
 def test_fin17_invalid_contact_area_fails_before_candidate_scoring() -> None:
-    from mcp_server import ecad_thermal
-    from mcp_server.heatsink import heatsink_select_from_params
+    from services.mcp import ecad_thermal
+    from services.mcp.heatsink import heatsink_select_from_params
 
     missing = object()
     prior = ecad_thermal._THERMAL.get("last_ctx", missing)
@@ -1863,7 +1863,7 @@ def test_fin17_parametric_generator() -> None:
     geometry across its parameter range — every emitted spec passes structural
     validation, has physical mass/theta, and yields a well-formed engine op list;
     unbuildable specs are rejected."""
-    from mcp_server.heatsink import (parametric_candidates, validate_sink_spec,
+    from services.mcp.heatsink import (parametric_candidates, validate_sink_spec,
                                      sink_theta_sa, sink_mass_g, sink_ops)
     n_specs = 0
     for fp in (2.0, 6.0, 12.0, 25.0, 60.0):          # footprint span sweep (mm)
@@ -1902,7 +1902,7 @@ def test_fin17_parametric_generator() -> None:
 def test_fin17_library_candidates() -> None:
     """T-FIN17: the parts library serves heatsink candidates WITH thermal metadata
     (domain 'thermal'), and undersized sinks are filtered for a big component."""
-    from mcp_server.heatsink import library_candidates
+    from services.mcp.heatsink import library_candidates
     cands, notice = library_candidates("still_air", 10.0, 6.0, 6.0)
     assert notice is None, notice
     assert len(cands) >= 5, f"expected curated heatsinks, got {len(cands)}"
@@ -1927,7 +1927,7 @@ def test_fin17_library_candidates() -> None:
 def _fin17_board(tools: dict, name: str) -> str:
     """FIN16 demo board with the regulator turned up to a ~3 W part."""
     doc_id = _fin16_demo_board(tools, name=name)
-    from mcp_server.ecad_common import ecad_session
+    from services.mcp.ecad_common import ecad_session
     doc = ecad_session.get_session(doc_id).doc
     for fp in doc["footprints"]:
         if fp["ref"] == "U1":
@@ -1954,7 +1954,7 @@ def test_fin17_heatsink_select() -> None:
 
     tools = _fin17_tools()
     # No context yet -> honest error.
-    from mcp_server import ecad_thermal as _et
+    from services.mcp import ecad_thermal as _et
     _et._THERMAL["last_ctx"] = None
     r0 = _call(tools, "heatsink_select", component_ref="U1", tj_target_c=85.0)
     assert not r0["ok"] and "ecad_thermal_handoff" in r0["error"]
@@ -1962,7 +1962,7 @@ def test_fin17_heatsink_select() -> None:
     doc_id = _fin17_board(tools, "fin17_demo")
     live = True
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
         cb.call("ping", {})
     except Exception:  # noqa: BLE001
         live = False
@@ -1995,7 +1995,7 @@ def test_fin17_heatsink_select() -> None:
     if live:
         assert w["solve"] == "fea" and w.get("board_max_temp_c") is not None
         # Winner's solved study is KEPT.
-        from mcp_server.heatsink import _HEATSINK
+        from services.mcp.heatsink import _HEATSINK
         kept = _HEATSINK["winner_study"]
         assert kept and kept["candidate"] == w["candidate"]
         assert kept["study"]["t_case_c"] is not None
@@ -2051,7 +2051,7 @@ def _build_large_schematic(tools: dict, n_pairs: int = 16) -> str:
 def test_status_summary_token_budget(tools: dict) -> None:
     """Default ecad_status(detail=summary) stays <=800 tokens on a >=30-comp board
     while retaining ok/summary/counts/erc counts/unconnected/next_actions."""
-    from mcp_server import result_serving as rs
+    from services.mcp import result_serving as rs
 
     doc_id = _build_large_schematic(tools, n_pairs=16)  # 1 V + 32 R = 33 comps
     raw = tools["ecad_status"](doc_id=doc_id)  # default summary
@@ -2245,7 +2245,7 @@ if __name__ == "__main__":
 
 
 def _fin19_tools() -> dict:
-    from mcp_server.ecad_thermal import (register_ecad_thermal_tools,
+    from services.mcp.ecad_thermal import (register_ecad_thermal_tools,
                                          register_ecad_airflow_tools)
     stub = _StubMCP()
     register_ecad_tools(stub)
@@ -2276,7 +2276,7 @@ def _fin19_board_geo() -> tuple:
 
 def test_fin19_box_stl_watertight(tmp_path) -> None:
     """write_box_stl emits a closed 12-facet ASCII STL in world mm."""
-    from mcp_server.ecad_thermal import write_box_stl
+    from services.mcp.ecad_thermal import write_box_stl
     p = write_box_stl(str(tmp_path / "b.stl"), 0, 0, 0, 4, 3, 2)
     txt = open(p, encoding="ascii").read()
     assert txt.count("facet normal") == 12 and txt.count("endfacet") == 12
@@ -2295,7 +2295,7 @@ def test_fin19_case_generation(tmp_path) -> None:
     """Engine-less: build_airflow_solids produces the exact T-SIM5 solids seam shape —
     board (passive, homogenized k) + one region per POWERED component, unpowered
     components skipped honestly; enclosure adds 4 passive duct walls."""
-    from mcp_server.ecad_thermal import build_airflow_solids, build_enclosure_walls
+    from services.mcp.ecad_thermal import build_airflow_solids, build_enclosure_walls
     import os as _os
     board, material, components = _fin19_board_geo()
     case = build_airflow_solids(board, material, components, str(tmp_path))
@@ -2322,7 +2322,7 @@ def test_fin19_case_generation(tmp_path) -> None:
 
 
 def test_fin19_region_parse() -> None:
-    from mcp_server.ecad_thermal import parse_region_temps
+    from services.mcp.ecad_thermal import parse_region_temps
     notes = ["chtMultiRegionFoam coupled solid+fluid; solid temperature 25-61 C.",
              "per-region: board: 41 C mean, 44 C peak; c_U1: 58 C mean, 61 C peak."]
     t = parse_region_temps(notes)
@@ -2334,7 +2334,7 @@ def test_fin19_region_parse() -> None:
 def test_fin19_deviation_table() -> None:
     """Engine-less: the verify math — sane / optimistic / conservative verdicts, rise-
     based deviation, and effective-h guidance when the preset was optimistic."""
-    from mcp_server.ecad_thermal import airflow_deviation_table
+    from services.mcp.ecad_thermal import airflow_deviation_table
     preset = [{"ref": "U1", "t_case_c": 65.0},   # rise 40
               {"ref": "U2", "t_case_c": 45.0},   # rise 20
               {"ref": "U3", "t_case_c": 35.0}]   # rise 10
@@ -2427,7 +2427,7 @@ def test_fin19_live_cht_smoke(tmp_path) -> None:
     if not _fin19_openfoam_available():
         print("  FIN19: OpenFOAM not available — live CHT smoke SKIPPED")
         return
-    from mcp_server.ecad_thermal import build_airflow_solids, parse_region_temps
+    from services.mcp.ecad_thermal import build_airflow_solids, parse_region_temps
     from services.sim.openfoam import run_openfoam_tunnel
     board = {"bbox_mm": [0.0, 0.0, 20.0, 20.0], "z_top_mm": 1.6, "z_bot_mm": 0.0,
              "thickness_mm": 1.6, "outline_area_mm2": 400.0}
@@ -2887,7 +2887,7 @@ def test_dialect_wire_ab_endpoint_names(tools: dict) -> None:
 
     # Independent STATE read: rebuild the netlist from the stored document itself rather
     # than trusting the wire reply's own summary.
-    from mcp_server.ecad_common import _get_sch, netlist_mod
+    from services.mcp.ecad_common import _get_sch, netlist_mod
     nl = netlist_mod.build_netlist(_get_sch(None).doc)
     members = {f"{m['ref']}.{m['pin']}" for m in nl["nets"][w["net"]]}
     assert members == {"U1.3", "C1.1"}, \
@@ -3283,7 +3283,7 @@ def test_make_part_survives_a_process_restart(tools: dict) -> None:
 
     probe = (
         "import sys, json; sys.path.insert(0, '.');\n"
-        "from mcp_server.ecad_tools import register_ecad_tools\n"
+        "from services.mcp.ecad_tools import register_ecad_tools\n"
         "class S:\n"
         "    def __init__(s): s.tools = {}\n"
         "    def tool(s, *a, **k):\n"

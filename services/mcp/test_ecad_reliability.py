@@ -9,17 +9,17 @@ Coverage:
     verdict present, deflection screen carries the Steinberg citation; a seeded
     HEAVY component lowers f1 vs the bare board (sanity regression).
 
-Run:  <venv>/python -m mcp_server.test_ecad_reliability
+Run:  <venv>/python -m services.mcp.test_ecad_reliability
 """
 from __future__ import annotations
 
 import json
 import math
 
-from mcp_server.ecad_reliability import (
+from services.mcp.ecad_reliability import (
     STEINBERG_CITATION, band_split, deflection_3sigma_mm, detect_mount_holes,
     position_factor, register_ecad_reliability_tools, steinberg_c, steinberg_screen)
-from mcp_server.ecad_tools import register_ecad_tools
+from services.mcp.ecad_tools import register_ecad_tools
 
 
 class _StubMCP:
@@ -53,8 +53,8 @@ def _demo_board(tools: dict, name: str = "fin21_demo", heavy: bool = False,
                 with_mounts: bool = True) -> str:
     """40x30 board, 4 corner NPTH mounting holes, an MCU + regulator; ``heavy=True``
     adds a large transformer-class body at the board center."""
-    from mcp_server.ecad_common import ecad_session
-    from mcp_server.ecad_tools import _ECAD
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_tools import _ECAD
 
     _call(tools, "ecad_new_pcb", name=name)
     doc_id = _ECAD["current_pcb"]
@@ -307,7 +307,7 @@ def test_live_solve_and_heavy_regression() -> None:
         print("  FIN21: build123d not installed — skipping live solve")
         return
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
         cb.call("ping", {})
     except Exception as e:  # noqa: BLE001
         print(f"  FIN21: libchudware not loadable ({type(e).__name__}) — live solve "

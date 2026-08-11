@@ -18,9 +18,9 @@ sys.path.insert(0, str(REPO))
 @pytest.fixture(scope="session")
 def cb():
     try:
-        from mcp_server import core_bridge as _cb
+        from services.mcp import core_bridge as _cb
     except ImportError:
-        pytest.skip("mcp_server not importable")
+        pytest.skip("services.mcp not importable")
     if not _cb.available():
         pytest.skip("libchudware not available — set CHUDWARE_LIBCHUDWARE=<path>")
     return _cb

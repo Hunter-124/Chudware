@@ -518,7 +518,7 @@ stage_pytest() {
     # The unit list is DERIVED at runtime (glob), never hardcoded, so a new services
     # subpackage is picked up automatically and cannot silently go unrun. The
     # coverage guard below turns any enumeration gap into a hard failure.
-    local dirs=("mcp_server")
+    local dirs=("services.mcp")
     if [ -d "services" ]; then
         local sd f
         for sd in services/*/; do
@@ -586,8 +586,8 @@ stage_pytest() {
         # engine_oracle/doc/test_aicm.py was removed (T-V3): OCP now installed, collects cleanly.
         # T-V4: foam_case and lbm ignores removed — trimesh now installed, both collect cleanly.
         # (test_loop_mock.py ignore removed in T-RF5 — the file was deleted with the legacy loop.)
-        # T-Q2: test_autosave_recovery must be collected via mcp_server/ (not services/)
-        # because it imports mcp_server.cad_tools; from services/ the 'mcp' name resolves
+        # T-Q2: test_autosave_recovery must be collected via services/mcp/ (not services/)
+        # because it imports services.mcp.cad_tools; from services/ the 'mcp' name resolves
         # to the services/mcp/ package and shadows mcp.server.fastmcp (collection crash).
         [ -f "services/mcp/test_autosave_recovery.py" ] && ignore_args+=(--ignore=services/mcp/test_autosave_recovery.py)
 

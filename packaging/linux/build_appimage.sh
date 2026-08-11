@@ -184,16 +184,31 @@ if [ "$WITH_LIBCHUDWARE" = "1" ]; then
 fi
 
 # Python payload (mirrors services/installer/build_release.py:stage_app, minus host/-only
-# assets): bootstrap.cpp's findPayload() looks for <exedir>/app/{installer/provision.py,
+# assets): bootstrap.cpp's findPayload() looks for <exedir>/app/{services/installer/provision.py,
 # requirements.txt} — same convention that already ships in the Windows installer.
 echo "==> staging Python app payload"
 APP="$APPDIR/usr/bin/app"
 mkdir -p "$APP"
-for pkg in engine mcp_server agent installer; do
-    if [ -d "$REPO/$pkg" ]; then
+if [ -d "$REPO/engine" ]; then
+    rsync -a --exclude='__pycache__' --exclude='*.pyc' --exclude='build' \
+          --exclude='test_*' --exclude='.ready.json' "$REPO/engine/" "$APP/engine/"
+fi
+mkdir -p "$APP/services"
+if [ -f "$REPO/services/__init__.py" ]; then
+    cp "$REPO/services/__init__.py" "$APP/services/__init__.py"
+else
+    : > "$APP/services/__init__.py"
+fi
+for pkg in agent mcp installer plm dag browser deliverables ipc serving verify parts reveng sim vision; do
+    if [ -d "$REPO/services/$pkg" ]; then
         rsync -a --exclude='__pycache__' --exclude='*.pyc' --exclude='build' \
-              --exclude='test_*' --exclude='.ready.json' "$REPO/$pkg/" "$APP/$pkg/"
+              --exclude='test_*' --exclude='.ready.json' "$REPO/services/$pkg/" "$APP/services/$pkg/"
     fi
+done
+for mod in "$REPO"/services/*.py; do
+    [ "$(basename "$mod")" = "__init__.py" ] && continue
+    case "$(basename "$mod")" in test_*) continue ;; esac
+    cp "$mod" "$APP/services/"
 done
 cp "$REPO/requirements.txt" "$APP/requirements.txt"
 

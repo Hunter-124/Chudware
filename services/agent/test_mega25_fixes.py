@@ -613,7 +613,6 @@ def test_end_of_turn_ecad_force_from_orphan_power_seed():
 def test_no_dead_mistral_in_frontier_fallback_source():
     """Leaf oneshot miss must not hardcode mistralai/mistral-small:free."""
     from pathlib import Path
-    src = Path(__file__).resolve().parents[1] / "dag" / "node_runner.py"
     # services/agent/test → parents[1]=services; node_runner is services/dag
     src = Path(__file__).resolve().parents[2] / "services" / "dag" / "node_runner.py"
     body = src.read_text(encoding="utf-8")

@@ -41,8 +41,8 @@ from pydantic import Field
 # and this module already imports the cad_tools facade that loads it — so importing it
 # here adds no dependency edge and no import cost.  A second copy (or a new shared
 # module) would be a second thing to keep correct.
-from mcp_server.cad_doc_tools import _dim_mm, _interpreted_notes
-from mcp_server.cad_tools import _dumps, _err
+from services.mcp.cad_doc_tools import _dim_mm, _interpreted_notes
+from services.mcp.cad_tools import _dumps, _err
 from services import research
 import services.research.calcs as _calcs  # registers all T-W4 calculators
 from services.research import fits as _fits

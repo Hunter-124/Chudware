@@ -1,4 +1,4 @@
-// core/agent/providers.h — C++ port of agent/providers/*.py (the LLM provider layer).
+// core/agent/providers.h — C++ port of services/agent/providers/*.py (the LLM provider layer).
 //
 // This is the first increment (P51) of the agent/LLM port toward zero-Python. It
 // mirrors, byte-for-byte, the wire-format construction + response parsing of the

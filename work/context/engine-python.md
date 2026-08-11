@@ -24,8 +24,8 @@ Contracts: contracts/doc_schema.md, contracts/doc_ops.md, contracts/worker_rpc.m
 - `$py = "$env:APPDATA\Chudware\runtime\venv\Scripts\python.exe"` (Windows) — the managed runtime; on Linux check for an equivalent local venv (see linux-build-port memory / build-test.md)
 - `& $py -m engine.run_model mounting_plate` — build + render a sample to `%APPDATA%\Chudware\cache`
 - `& $py -m engine.doc.test_sketch_solver` — run one engine test suite (house style: every `test_*.py` is a plain-`main()` runner, invoke as `-m engine.<pkg>.test_<name>`)
-- `& $py -m mcp_server.test_roundtrip` — MCP roundtrip self-test that exercises this layer end-to-end
-- `<venv>/python -X utf8 -m pytest engine/doc agent -q` — the pytest-style suites AGENTS.md's gate runs (SKIP, not fail, if the runtime venv is absent on Linux)
+- `& $py -m services.mcp.test_roundtrip` — MCP roundtrip self-test that exercises this layer end-to-end
+- `<venv>/python -X utf8 -m pytest engine/doc services/agent -q` — the pytest-style suites AGENTS.md's gate runs (SKIP, not fail, if the runtime venv is absent on Linux)
 - engine_oracle root also has its own test modules: `test_kernel_aliases.py`, `test_parts_library.py`, `test_parts_providers.py`, `test_vendor_parts.py`, `test_worker_stream.py`
 
 ## Graphify starters

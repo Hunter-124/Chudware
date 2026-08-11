@@ -41,7 +41,7 @@ internal cross-refs, and root config (`README.md`, `ARCHITECTURE.md`,
 integrator-sign-off policy.
 
 **Deferred (per P0 hard constraint — no source edits under
-`core/`/`host/`/`app/`/`engine/`/`agent/`/`mcp_server/`):** the `docs/contracts`
+`core/`/`host/`/`app/`/`engine/`/`agent/`/`services/mcp/`):** the `docs/contracts`
 path references that remain in code comments / one string literal inside those
 trees (e.g. `host/src/ui/viewport_panel.cpp`, `host/src/render/test_aicm_cpp/test_aicm.cpp`
 default `"docs/contracts/fixtures/box.aicm"`, `core/CMakeLists.txt`,
@@ -275,7 +275,7 @@ labelled with the owning feature's TYPE, resolved by joining `doc_tree`'s `owner
 `(body_id, face_id)` pairs against each match's `hint_index + 1` — `doc_query`'s own
 `owner_feature` field is always null since that RPC never threads the owner map through, a gap
 discovered and worked around here rather than filed), `adjacency.json` (`doc_adjacency`),
-`outline.txt` (best-effort `mcp_server.gsl_tools._outline_text(_digest(doc_id))`, imported
+`outline.txt` (best-effort `services.mcp.gsl_tools._outline_text(_digest(doc_id))`, imported
 lazily per-sample and caught so a concurrent edit to `gsl_tools.py` degrades to a placeholder
 string instead of crashing the run), and `meta.json` (bbox, `eval_mass` volume, ops count,
 generator version). `doc_close` is called after every sample (confirmed live as a real RPC,
@@ -390,12 +390,12 @@ entirely when the batch added no features. `check_interference` gained `include_
 `min_clearance_mm` params threaded straight through to `eval_interference`, documented alongside
 the new `contacts` array and the "below min clearance" warning. `render_part`/`contact_sheet`
 now return `-> list`: a new `_captioned_render(png, doc_id, views)` helper lazy-imports
-`mcp_server.gsl_tools._scene_caption` inside a try/except and returns `[Image(path=png),
+`services.mcp.gsl_tools._scene_caption` inside a try/except and returns `[Image(path=png),
 caption]`, degrading to the bare `Image` on any failure (missing gsl_tools, bad doc_id); every
 existing return point in both tools was routed through it. Guide discoverability: `_GSL_GUIDE`
 now documents `describe_sketch`/`describe_scene` alongside `describe_part`/`hover`/
 `query_adjacency`; `cad_guide_text` gained a `("reverse","re","recognize","recon")` branch that
-lazy-imports `mcp_server.recon_tools._RE_GUIDE` and falls back to a one-line pointer via
+lazy-imports `services.mcp.recon_tools._RE_GUIDE` and falls back to a one-line pointer via
 `except ImportError` (recon_tools.py doesn't exist yet — this future-proofs the wave-3 node
 with zero coupling); the no-match fallback string and the `cad_guide` tool docstring both now
 list gsl/reverse alongside overview/simulation/review/intake/cam. `server.py`'s FastMCP
@@ -1235,9 +1235,9 @@ float32 reduction parity kept, backend+fallback surfaced in `LbmResult`. CPU-onl
 green; ctest `sim|tet10|modal|thermal|studies|prof_phases|governor|overlay` 9/9; CUDA build
 `test_sim` 13/13. **ECAD MCP** (`services/mcp/*ecad*`, `engine_oracle/ecad/orchestrator.py`):
 split provider PLAN from BUILD (`orchestrator.plan_design`) so a slow/timed-out provider is budgeted
-and can never race the recipe fallback or overwrite `current_sch` (generation-token guard); unified
-`mcp_server.*` vs `services.mcp.*` to one module object via a `services/mcp/__init__.py` meta-path
-finder (shared `_ECAD`/`_THERMAL`); monotonic warm recovery; `power_budget` under `family:ecad`;
+and can never race the recipe fallback or overwrite `current_sch` (generation-token guard);
+canonicalized the MCP imports under `services.mcp.*` so `_ECAD`/`_THERMAL` state is shared;
+monotonic warm recovery; `power_budget` under `family:ecad`;
 added a pytest `tools` fixture that fixed 40 collection errors (→0). ECAD suite 91 passed; main
 harness ALL PASS. **Parts** (`engine_oracle/parts_hub/*`, `services/mcp/parts_tools.py`,
 `services/browser/health.py`): bounded the deadline-less synchronous live-vendor fan-out in
@@ -1295,7 +1295,7 @@ ribbon-handler flags in `host/src/ui/ribbon_def.cpp`.
 
 ## Master mission — ECAD board-design + simulation-suite expansion (2026-07-14)
 
-Planned as a monolithic `aicad.dag/1` (`dag/templates/flight_computer_charger_ecad_sim_master.json`,
+Planned as a monolithic `aicad.dag/1` (`services/dag/templates/flight_computer_charger_ecad_sim_master.json`,
 20 nodes, schema-valid) with the advisor (MCP `cad_guide`/`em_status`/`fw_status`/`check_metadata`)
 and the user (decisions D1–D4). Executed off master in subagent waves, commit+push per verified unit.
 
@@ -1985,7 +1985,7 @@ detached agent-job threads in `host/src/core/jobs.cpp` with a catch-all that
 lands the job in an error state (an escaped nlohmann type_error was a loaded
 std::terminate→SIGABRT gun). Host rebuild + 5/5 ctest green.
 **Python harness (27 → 0 failures):** real loop regressions fixed in
-`agent/loop.py` — `_loop_done_guardrail` demanded `verify_battery` evidence the
+`services/agent/loop.py` — `_loop_done_guardrail` demanded `verify_battery` evidence the
 quick loop can never produce (every run burned its full iteration budget;
 battery floor now skipped only where no battery tool exists, assembly fit
 reports feed the interference check), and `run_turn` re-raises context overflow
@@ -1995,11 +1995,11 @@ Everything else was drift, fixed at the drifted layer: role-card data
 vocabulary + new `playbooks/drawing_package.yaml`, `routing.yaml` rows for 7
 newer roles), stale test mocks (battery_payload kwarg, mega-8 typed_refusal,
 mime/source evidence fields, GBNF `+` acceptor, role-prompt skills injection,
-mega-13 zero-tool-done, mode-unioned default tools). Systemic: `conftest.py`
-gained a meta_path alias finder so `agent`/`engine`/… symlink imports resolve
-to the SAME module object as `services.*` (was: two live copies, monkeypatches
-landed on the wrong one); `session_cmds.py` imports compaction via
-`importlib.import_module` so sys.modules patches hold; delegate tests made
+mega-13 zero-tool-done, mode-unioned default tools). Systemic: package imports
+were canonicalized under `services.*` so each submodule has exactly one live
+module object (two copies had sent monkeypatches to the wrong state);
+`session_cmds.py` imports `agent.compaction` dynamically so
+`sys.modules` patches hold; delegate tests made
 hermetic against ambient config.json ai_roles (load_config/resolve stubs);
 `test_mega4` stubs the ambient-state terminal mech/ecad gates;
 `engine_oracle/sim/em/antenna_bridge.py` restores process CWD after openEMS
@@ -2013,7 +2013,7 @@ refresh-revoked and labels spending-limit 403s distinctly (the user's pool IS
 12/13 revoked + 1 spend-blocked — re-login is a user action, endpoints are
 fine). `pyvista` was missing from system python (render-dependent tests
 silently degraded) — installed.
-**Verify:** `pytest agent engine/doc` 2300+ green; host ninja + ctest green.
+**Verify:** `pytest services/agent engine/doc` 2300+ green; host ninja + ctest green.
 **Deferred/gotchas:** `scripts/check.py` feature_surface_audit is still RED
 (pre-existing since N0b: missing ribbon handlers for Sketch3D/ReverseEng —
 untouched by this wave); in-proc mode (CHUDWARE_ENGINE_DAEMON=0) still serializes
@@ -2401,11 +2401,10 @@ test stubs import private helpers straight from them (`_dumps`, `_err`, `_doc`,
 family modules directly, one `register_*(_reg.view(mcp, "<family>"))` call per
 module, registry family names unchanged ("cad"/"ecad"/"reveng"; the sim retag in
 _FAMILY_REASSIGN is untouched). Tool surface proven identical by registration
-smoke: 68/68, 33/33, 21/21 same names before/after. Dual-import shims removed
-(`interaction_tools`, `ledger_tools` ×3, `workspace_tools` ×2, `intake_tools` ×2
-→ canonical `services.agent.*`; the intake_ledger shim → `mcp_server.*`, the
-majority path inside services/mcp; one stray `from agent import config` in the
-ecad_design tool → `services.agent.config`). Deferred: registration ORDER of the
+smoke: 68/68, 33/33, 21/21 same names before/after. Dual-import shims removed;
+all agent and MCP consumers now use canonical `services.agent.*` and
+`services.mcp.*` imports, including the ecad_design config consumer. Deferred:
+registration ORDER of the
 cad tools is now family-grouped rather than the historical interleave (tool
 names/count identical; MCP listing order differs — no client contract on order).
 Gotchas: (1) monkeypatch-based tests must patch the module where the looked-up
@@ -2414,9 +2413,9 @@ name now lives — import-path-only fixes applied to test_vibration_tool
 + test_autosave_recovery (→cad_common), test_mega8_op_vocab (→cad_doc_tools for
 inspect.getsource), test_ecad_hardening (→ecad_common for budget/session, +
 ecad_sim_tools for _provider_reachable, + services.agent.config), the three
-reveng suites (→reveng_common / reveng_build_tools); (2) `mcp_server.` vs
-`services.mcp.` remain two sys.modules aliases of one tree (pre-existing) —
-facades preserve whichever path a consumer uses; (3) test_mcp_freshness's
+reveng suites (→reveng_common / reveng_build_tools); (2) all consumers now use
+the canonical `services.mcp.*` module tree, so stateful facades have one identity;
+(3) test_mcp_freshness's
 "read cad_tools.py as text" fallback now sees the facade, but its primary path
 (cad_guide_text import) is unaffected; (4) pre-existing failures in this
 environment proven NOT from the split by A/B against the pre-split backups:
@@ -2633,7 +2632,7 @@ prose contracts/copilot_modes.md are the canonical source BOTH runtimes load at 
 Python reads it at import (CHUDWARE_COPILOT_MODES_JSON → <repo>/contracts via parents[2]);
 new core/agent/copilot_modes.{h,cpp} loads it (CHUDWARE_COPILOT_MODES_JSON →
 CHUDWARE_CONTRACTS_DIR → repo-relative contracts/, same CWD convention as roles.cpp's
-agent/prompts) and implements the exact apply_mode_tools/is_tool_allowed semantics.
+services/agent/prompts) and implements the exact apply_mode_tools/is_tool_allowed semantics.
 run.cpp's delegate mode gate now consults the contract (legacy inline gate kept only as
 the contract-unreadable packaged fallback). BEHAVIOR CHANGE (parity fix, intended):
 top-level swarm / eng_firm runs no longer refuse delegate — the contract (and Python)
@@ -2747,7 +2746,7 @@ loop.py was REDUCED 3,732→320 lines to exactly those symbols (+ _format_contex
 — everything else (run/run_turn/Session/AgentRun, compaction, ETA, plan mode, run_mission
 + the whole mission-phase machinery, all with zero production callers) deleted. Tests:
 deleted test_loop_mock.py, test_live_seam_wiring.py, test_autosave_close.py; trimmed the
-loop section of test_compaction.py (kept the services.agent.compaction OMP-engine tests),
+loop section of test_compaction.py (kept the agent.compaction OMP-engine tests),
 3 agent_design tests out of engine_oracle/test_worker_stream.py, and 44 deleted-surface
 tests across test_pipeline.py, test_eta_estimator.py, test_roles.py, advisor/test_engine.py
 and test_mega{1_top5,3_fixes,4_fixes,5_fixes,7_fixes,8_rolesurface,9_fixes,10_fixes,
@@ -3353,7 +3352,7 @@ the two struct tests were gated on HAVE_PYNITE; re-gated on a new
 `_STRUCT_ENGINE` skipif (`cb.available()`, same pattern as group 5), removed
 the now-unused HAVE_PYNITE, hoisted the shared `core_bridge` import (group 5's
 duplicate removed). Verify: both modules import clean as `services.mcp.*` and
-`mcp_server.*`; stub-FastMCP smoke of all four tools green (payload keys,
+`services.mcp.*`; stub-FastMCP smoke of all four tools green (payload keys,
 line_item shape, bad-path envelope, code_check deflection+post+fastener legs,
 missing-doc leg). pytest `services/mcp -q -k 'struct or compliance'`
 (mcp-venv): BEFORE 11 passed / 5 skipped / 978 deselected → AFTER identical
@@ -3389,7 +3388,7 @@ stay until the host flow path flips to `core/sim/lbm.cpp` (already ported, stl-s
 `circuit/spice/devices/subckt/analysis_ext` — the MNA solver — is PORTED
 (`core/sim/spice.cpp`, `spice_sweep.cpp`, `netlist.cpp`; `ecad_simulate` libchudware-dispatched)
 but still directly imported by services/mcp (ecad_sim_tools, ecad_common, ascii2d,
-server.py warmup) + `services/ecad_design/orchestrator.py` + installer/provision.py
+server.py warmup) + `services/ecad_design/orchestrator.py` + services/installer/provision.py
 (`ngspice_status`) → delete after T-RF20 flip. `vibration.py` (NOT ported — no C++
 Miles/PSD) lives via ecad_reliability/cad_sim_tools/multiphysics_rpc → port-to-core
 (core/sim vibration) or re-home with ecad_reliability. `fea_thermal_transient.py` ported
@@ -3446,7 +3445,7 @@ exception), engine_oracle/ecad/rpc.py:780 (ecad_design registration, integrator
 exception), engine_oracle/run_model.py, engine_oracle/test_kernel_aliases.py,
 engine_oracle/ecad/{demo,test_library,test_orchestrator}.py (consumers of moved
 modules), services/mcp/ecad_sim_tools.py + test_ecad_sim_e2e.py (MCP ecad_design refs),
-tools/ecad_round5_repro.py. agent_turn.py + its 6 consumers (dag/node_runner,
+tools/ecad_round5_repro.py. agent_turn.py + its 6 consumers (services/dag/node_runner,
 plm/{assist,ai_vc}, subagent_rpc, mission_dispatch, reviewer_exec) needed NO flips —
 audit proves zero engine_oracle imports there except mission_dispatch's
 engine_oracle.parts_hub (other leaf's scope, allowlisted); services/dag likewise clean
@@ -3525,7 +3524,7 @@ GOTCHAS: (1) a parallel leaf was mid-rewrite of services/mcp/cad_tools +
 cad_common during this run (`_materials_registry`/`register_cad_tools`/
 `_publish_current` ImportErrors, cad_common mtime 19:14) — it broke 6
 unrelated services/mcp collection modules + order-dependent TestCadGuideParts
-(mcp_server.cad_tools importer) in combined runs; those pass in isolation and
+(services.mcp.cad_tools importer) in combined runs; those pass in isolation and
 failed/passed identically before and after my edits. Integrator: re-run the
 full gate once that leaf lands. (2) dist/AppDir + Webservice/image/stage hold
 stale packaged copies of engine worker.py — regenerated on next packaging, not
@@ -3865,13 +3864,13 @@ entry dropped, gate.sh pytest dirs list updated, worker spawn targets all
 `services.worker_main` (hostd worker_bridge, worker_client default, test_worker_stream).
 `scripts/oracle_import_allowlist.txt` is EMPTY — the audit ratchet now keeps it that way.
 **Straggler retargets (agent-43 + integrator):** ~170 files — all remaining
-`from engine…`/`engine_oracle…` live imports across services/, mcp_server, tools/
+`from engine…`/`engine_oracle…` live imports across services/, services.mcp, tools/
 pointed at their services.* homes or the facades; test_ngspice_backend retargeted to
 `_sim_run` + services.installer.ngspice_backend + services.sim.spice (vendor-.subckt
 enrichment leg stays Python — C++ sim_netlist_to_circuit doesn't carry xdevices/includes,
 tracked gap); list_formats restored as a doc_formats RPC wrapper (services/formats).
 **Gate state at closeout:** check.py 6/6 PASS (oracle_import_audit clean, 0 allowlist
-entries); mcp_server collects 994 clean; services collects 5246 clean, full run
+entries); services.mcp collects 994 clean; services collects 5246 clean, full run
 5110 passed / 11 failed — ALL 11 triaged as non-regressions: em×3 (openEMS env,
 T-SIM11 parked), lbm test_sphere_basic (cd units bug predating this wave; the test
 didn't even collect at ae4d0c3f), verify_battery×3 (agent_turn chain logic — the
@@ -4296,7 +4295,7 @@ zero-volume). Files: `services/mcp/cad_common.py`, `services/mcp/cad_doc_tools.p
 revolve.md`, new `services/mcp/test_current_part.py`.
 
 ### Agent bug reports (2026-07-27)
-Settings → AI → Tools gains a "Send bug reports" toggle (config `agent.bug_reports`, default ON; `config.bug_reports_enabled()` / `bugreport_floor()`). When on, the agent gets a `submit_bug_report` MCP tool (`services/mcp/bugreport_tools.py`, family `workspace`, risk overridden to WRITE — the `submit_` prefix auto-classified EXTERNAL) advertised on every turn (union sites: `run_linear_role_turn`, two DAG floors in `mission_dispatch.py`, `run_turn` post-mode-gate, `roles.apply_tool_policy`). Failed tool calls are captured at the `agent_turn` choke point into a per-process ring (`services/agent/bugreport_context.py` — single import identity to dodge the mcp_server/services.mcp dual-module trap) and auto-embedded in the markdown report written to `~/Documents/Chudware/Bug-Reports/` (override `CHUDWARE_BUG_REPORTS_DIR`). Gotcha: the floor tool had to be excluded from `_force_first_tool` candidates or zero-tool turns force-fired it and flipped the no_code invariant. GUI section lives between Tool families and Maintenance in `settings_modal.cpp`; tests in `services/mcp/test_bugreport_tools.py`.
+Settings → AI → Tools gains a "Send bug reports" toggle (config `agent.bug_reports`, default ON; `config.bug_reports_enabled()` / `bugreport_floor()`). When on, the agent gets a `submit_bug_report` MCP tool (`services/mcp/bugreport_tools.py`, family `workspace`, risk overridden to WRITE — the `submit_` prefix auto-classified EXTERNAL) advertised on every turn (union sites: `run_linear_role_turn`, two DAG floors in `mission_dispatch.py`, `run_turn` post-mode-gate, `roles.apply_tool_policy`). Failed tool calls are captured at the `agent_turn` choke point into a per-process ring (`services/agent/bugreport_context.py` — single import identity to dodge the services/mcp/services.mcp dual-module trap) and auto-embedded in the markdown report written to `~/Documents/Chudware/Bug-Reports/` (override `CHUDWARE_BUG_REPORTS_DIR`). Gotcha: the floor tool had to be excluded from `_force_first_tool` candidates or zero-tool turns force-fired it and flipped the no_code invariant. GUI section lives between Tool families and Maintenance in `settings_modal.cpp`; tests in `services/mcp/test_bugreport_tools.py`.
 
 ### Routing card only on real role changes + Delegation card (2026-07-27)
 The copilot Routing card (rowKind 10) no longer appears on every first turn: the
@@ -4454,7 +4453,7 @@ reported the whole graph as added). File-node mtimes share the `file:<rel>`
 cache-key namespace with containers (disjoint by suffix) so cache validation
 needed no schema change. Worker RPC surface +11 methods (keyword/search/
 neighbors/watch/changes/config; `cad_graph_get` gains `linked`), MCP
-`mcp_server/graph_tools.py` +9 tools (plm_graph_keyword/search/neighbors/
+`services/mcp/graph_tools.py` +9 tools (plm_graph_keyword/search/neighbors/
 links/watch/changes/configure/suggest/brief). GUI `host/src/ui/plm/
 graph_tab.cpp` (+531/−36): file/keyword rendering + TAGGED chips, drill-to-open
 / drill-to-filter, keyword chips side panel, text_preview, cluster seed modes

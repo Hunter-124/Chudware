@@ -344,7 +344,7 @@ def test_fetch_grok_usage_empty_parse_raises(tmp_path, monkeypatch):
 
 
 def test_usage_py_browser_scrape_success(monkeypatch):
-    from agent.providers import usage
+    from services.agent.providers import usage
 
     scraped = {
         "ok": True,
@@ -384,7 +384,7 @@ def test_usage_py_browser_scrape_success(monkeypatch):
 
 
 def test_usage_py_browser_scrape_fallback_on_error(monkeypatch):
-    from agent.providers import usage
+    from services.agent.providers import usage
 
     def boom(*_a, **_k):
         raise us.UsageScrapeError("daemon missing")
@@ -408,7 +408,7 @@ def test_usage_py_browser_scrape_fallback_on_error(monkeypatch):
 
 
 def test_usage_py_browser_scrape_needs_login_keeps_source(monkeypatch):
-    from agent.providers import usage
+    from services.agent.providers import usage
 
     scraped = us._needs_login_result("u1", {"email": "g@x.ai", "plan": "SuperGrok"})
     import services.browser.usage_scrape as scrape_mod
@@ -423,7 +423,7 @@ def test_usage_py_browser_scrape_needs_login_keeps_source(monkeypatch):
 
 
 def test_usage_py_browser_scrape_blocked_keeps_source(monkeypatch):
-    from agent.providers import usage
+    from services.agent.providers import usage
 
     scraped = us._blocked_result("u1", {"email": "g@x.ai"})
     import services.browser.usage_scrape as scrape_mod

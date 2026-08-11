@@ -197,7 +197,7 @@ def make_thumbnail() -> bool:
 
 def regen_and_verify() -> dict:
     """Entry point called by samples/test_regen.py."""
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
 
     if not cb.available():
         return {"ok": False, "error": "libchudware not available"}
@@ -225,7 +225,7 @@ def regen_and_verify() -> dict:
 
 
 if __name__ == "__main__":
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
 
     if not cb.available():
         print("FATAL: libchudware not available. Set CHUDWARE_LIBCHUDWARE=<path>.")

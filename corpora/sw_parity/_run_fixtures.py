@@ -1,8 +1,8 @@
-"""Runner: load every corpus_sw_parity/*.json fixture, call solve_sketch,
+"""Runner: load every corpora/sw_parity/*.json fixture, call solve_sketch,
 compare against expect block and geometric checks, print a NOTES-style report.
 
 Run from repo root:
-    & "$env:APPDATA\\Chudware\\runtime\\venv\\Scripts\\python.exe" corpus_sw_parity/_run_fixtures.py
+    & "$env:APPDATA\\Chudware\\runtime\\venv\\Scripts\\python.exe" corpora/sw_parity/_run_fixtures.py
 """
 from __future__ import annotations
 import json

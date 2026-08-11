@@ -28,7 +28,7 @@ if _REPO_ROOT not in sys.path:
 
 import pytest
 
-from mcp_server import core_bridge as cb
+from services.mcp import core_bridge as cb
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
@@ -40,7 +40,7 @@ HOLE_D_MM = 8.0  # the bore drilled by _plate_with_hole below
 
 def _call(name: str, args: dict):
     """Invoke a registered MCP tool; return the parsed JSON reply."""
-    from mcp_server import server
+    from services.mcp import server
 
     _content, structured = asyncio.run(server.mcp.call_tool(name, args))
     text = structured.get("result") if isinstance(structured, dict) else None

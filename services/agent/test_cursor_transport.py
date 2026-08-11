@@ -6,7 +6,7 @@ import struct
 
 import pytest
 
-from agent.providers import cursor_sub_provider as csp
+from services.agent.providers import cursor_sub_provider as csp
 
 
 # ── Framing ──────────────────────────────────────────────────────────────────

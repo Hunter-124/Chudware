@@ -50,30 +50,30 @@ os.environ.setdefault("CHUDWARE_QUIET", "1")
 # ---------------------------------------------------------------------------
 # Families and their registration functions (mirrors server.py exactly)
 FAMILY_REGISTRY = [
-    ("cad",             "mcp_server.cad_tools",             "register_cad_tools",             True),
-    ("gsl",             "mcp_server.gsl_tools",             "register_gsl_tools",             True),
-    ("recon",           "mcp_server.recon_tools",           "register_recon_tools",           True),
-    ("intake",          "mcp_server.intake_tools",          "register_intake_tools",          True),
-    ("interaction",     "mcp_server.interaction_tools",     "register_interaction_tools",     False),
-    ("ecad",            "mcp_server.ecad_tools",            "register_ecad_tools",            True),
-    ("cam",             "mcp_server.cam_tools",             "register_cam_tools",             True),
-    ("doc_diff",        "mcp_server.doc_diff_tools",        "register_doc_diff_tools",        False),
-    ("req",             "mcp_server.req_tools",             "register_req_tools",             False),
-    ("verify",          "mcp_server.verify_tools",          "register_verify_tools",          False),
-    ("research",        "mcp_server.research_tools",        "register_research_tools",        False),
+    ("cad",             "services.mcp.cad_tools",             "register_cad_tools",             True),
+    ("gsl",             "services.mcp.gsl_tools",             "register_gsl_tools",             True),
+    ("recon",           "services.mcp.recon_tools",           "register_recon_tools",           True),
+    ("intake",          "services.mcp.intake_tools",          "register_intake_tools",          True),
+    ("interaction",     "services.mcp.interaction_tools",     "register_interaction_tools",     False),
+    ("ecad",            "services.mcp.ecad_tools",            "register_ecad_tools",            True),
+    ("cam",             "services.mcp.cam_tools",             "register_cam_tools",             True),
+    ("doc_diff",        "services.mcp.doc_diff_tools",        "register_doc_diff_tools",        False),
+    ("req",             "services.mcp.req_tools",             "register_req_tools",             False),
+    ("verify",          "services.mcp.verify_tools",          "register_verify_tools",          False),
+    ("research",        "services.mcp.research_tools",        "register_research_tools",        False),
     ("deliverables",    "deliverables",                     "register_deliverables_tools",    False),
-    ("sourcing",        "mcp_server.sourcing_tools",        "register_sourcing_tools",        True),
-    ("cost",            "mcp_server.cost_tools",            "register_cost_tools",            True),
-    ("spec",            "mcp_server.spec_tools",            "register_spec_tools",            True),
-    ("piping",          "mcp_server.piping_tools",          "register_piping_tools",          True),
-    ("hydraulic",       "mcp_server.hydraulic_tools",       "register_hydraulic_tools",       True),
-    ("photo_recon",     "mcp_server.recon_tools",           "register_photo_recon_tools",     False),
-    ("firmware",        "mcp_server.firmware_tools",        "register_firmware_tools",        True),
-    ("structural",      "mcp_server.structural_tools",      "register_structural_tools",      True),
-    ("parts",           "mcp_server.parts_tools",           "register_parts_tools",           True),
-    ("serving",         "mcp_server.serving_tools",         "register_serving_tools",         False),
-    ("regen",           "mcp_server.regen_tools",           "register_regen_tools",           False),
-    ("code_compliance", "mcp_server.code_compliance_tools", "register_code_compliance_tools", False),
+    ("sourcing",        "services.mcp.sourcing_tools",        "register_sourcing_tools",        True),
+    ("cost",            "services.mcp.cost_tools",            "register_cost_tools",            True),
+    ("spec",            "services.mcp.spec_tools",            "register_spec_tools",            True),
+    ("piping",          "services.mcp.piping_tools",          "register_piping_tools",          True),
+    ("hydraulic",       "services.mcp.hydraulic_tools",       "register_hydraulic_tools",       True),
+    ("photo_recon",     "services.mcp.recon_tools",           "register_photo_recon_tools",     False),
+    ("firmware",        "services.mcp.firmware_tools",        "register_firmware_tools",        True),
+    ("structural",      "services.mcp.structural_tools",      "register_structural_tools",      True),
+    ("parts",           "services.mcp.parts_tools",           "register_parts_tools",           True),
+    ("serving",         "services.mcp.serving_tools",         "register_serving_tools",         False),
+    ("regen",           "services.mcp.regen_tools",           "register_regen_tools",           False),
+    ("code_compliance", "services.mcp.code_compliance_tools", "register_code_compliance_tools", False),
 ]
 
 # ---------------------------------------------------------------------------
@@ -418,7 +418,7 @@ def call_tool(mcp, name: str, args: dict) -> tuple[Any, Exception | None]:
 
 def run_audit(out_path: Path | None = None) -> dict:
     from mcp.server.fastmcp import FastMCP
-    import mcp_server.tool_registry as _reg
+    import services.mcp.tool_registry as _reg
 
     mcp = FastMCP("Chudware-audit")
 
@@ -549,7 +549,7 @@ def run_audit(out_path: Path | None = None) -> dict:
             if pkg and pkg not in installed_pkgs:
                 declared_missing.append({"pkg": pkg, "req_line": line})
 
-    # Undeclared deps: imports in services/+engine_oracle/+mcp_server/ NOT in requirements.txt
+    # Undeclared deps: imports in services/+engine_oracle/+services/mcp/ NOT in requirements.txt
     req_pkgs: set[str] = set()
     if req_file.exists():
         for line in req_file.read_text().splitlines():
@@ -571,7 +571,7 @@ def run_audit(out_path: Path | None = None) -> dict:
         "threading", "time", "traceback", "types", "typing", "unicodedata",
         "unittest", "urllib", "uuid", "warnings", "weakref", "xml", "zipfile",
         # internal
-        "engine", "engine_oracle", "mcp_server", "services", "agent", "deliverables",
+        "engine", "engine_oracle", "services.mcp", "services", "agent", "deliverables",
         "tools", "training", "installer", "dag", "provider",
         # test-only
         "pytest", "conftest",
@@ -580,7 +580,7 @@ def run_audit(out_path: Path | None = None) -> dict:
         "cycle",      # itertools.cycle? — not a package
     }
 
-    import_dirs = ["mcp_server", "services", "engine_oracle"]
+    import_dirs = ["services.mcp", "services", "engine_oracle"]
     raw_imports: set[str] = set()
     for d in import_dirs:
         dir_path = _REPO / d
@@ -703,7 +703,7 @@ def make_markdown(data: dict) -> str:
     # Undeclared deps
     lines.append("## Undeclared-But-Installed Dependencies")
     lines.append("")
-    lines.append("Packages imported by `services/`+`engine_oracle/`+`mcp_server/` that are")
+    lines.append("Packages imported by `services/`+`engine_oracle/`+`services/mcp/` that are")
     lines.append("installed in the venv but absent from `requirements.txt`:")
     lines.append("")
     ud = data.get("undeclared_deps", [])

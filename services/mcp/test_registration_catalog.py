@@ -174,7 +174,7 @@ class TestWarmClearCatalogSemantics(unittest.TestCase):
     in the SAME process, in either order, however many times.
 
     Regression: warm_catalog() used to warm purely as a side effect of the FIRST
-    ``import mcp_server.server``. Once anything imported server.py (this very module
+    ``import services.mcp.server``. Once anything imported server.py (this very module
     does, at collection time) the memo latched, so after a clear_catalog() the
     families only server.py registers — ascii2d, office, power_budget, heatsink,
     ecad_thermal — could never be restored, and every later caller in the process

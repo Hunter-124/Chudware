@@ -76,11 +76,11 @@ Canonical references:
 |-----|---------|
 | `core/` | Pure C++/CUDA kernel → `libchudware`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. **The engine** (zero-Python since T-RF21). |
 | `host/` | **The single GUI target.** Production C++ desktop host (~110k LOC under `host/src/ui/`), cross-platform (Linux GCC/Clang + Windows MSVC); the same tree compiles to WASM for the web app. Binary: `host/build-linux/bin/Chudware` (`Chudware` compat symlink). Own GL pipeline under `host/src/render/`. |
-| `services/` | Python services: `agent/` (built-in agent loop; root `agent` symlink), `mcp/` (MCP server for external agents; root `mcp_server` symlink), `worker/` (C++ engine routing seam, four modules: worker_client / engine_backend / cpp_core / worker_router), `worker_main.py` (the stdio worker hostd spawns), `installer/` (provisioning, MCP registration, packaging), `ecad/`+`sim/`+`structural/`+`piping/`+`formats/` (pure-helper re-homes from the deleted Python engine), plus `dag/`, `deliverables/`, `plm/`, `browser/`, `ipc/`, `serving/` (LoRA adapter routing — not the webservice; the webservice is top-level `Webservice/`), `verify/`, `dist/`. |
+| `services/` | Python services: `agent/` (built-in agent loop), `mcp/` (MCP server for external agents), `worker/` (C++ engine routing seam, four modules: worker_client / engine_backend / cpp_core / worker_router), `worker_main.py` (the stdio worker hostd spawns), `installer/` (provisioning, MCP registration, packaging), `ecad/`+`sim/`+`structural/`+`piping/`+`formats/` (pure-helper re-homes from the deleted Python engine), plus `dag/`, `deliverables/`, `plm/`, `browser/`, `ipc/`, `serving/` (LoRA adapter routing — not the webservice; the webservice is top-level `Webservice/`), `verify/`, `dist/`. All Python imports use canonical `services.*` names. |
 | `ui/viewport/` | AICM mesh-format loader (`render/aicm_loader.*`) consumed by `core/` (libchudware tests/tools). The rest of the former "shared renderer" extraction was orphaned (host builds its own pipeline in `host/src/render/`) and was purged in T-RF2. `ui/imgui`/`ui/abstract` (the AI-CAD2 shell) are retired and gone. |
 | `platform/` | Cross-OS shims (dialogs, DPI, paths, resources, window) with `_linux`/`_win32` implementations. |
 | `contracts/` | Frozen interface contracts — THE seams. Append-only, integrator-owned. |
-| `corpora/` | Consolidated test fixtures (`sketch/`, `render/`, `sw_parity/`, `sw_fixtures/`). Root `corpus*` symlinks preserve legacy paths. |
+| `corpora/` | Consolidated test fixtures (`sketch/`, `render/`, `sw_parity/`, `sw_fixtures/`), referenced directly by their canonical paths. |
 | `work/` | Git-tracked solo task board (`tasks/`, `backlog/`, `tools/work.py`, `WORKFLOW.md` policy). |
 | `docs/` | Design docs, status notes, parity specs, handoffs, perf audits. |
 | `tools/`, `scripts/`, `third_party/`, `assets/`, `packaging/`, `benchmarks/`, `training/` | Dev tools; repo gates + audits (`check.py`, `gate.sh`); vendored deps; icons/fonts; packaging; perf benches; ML eval/telemetry (training itself is a deferred plan). |
@@ -124,7 +124,7 @@ green. It runs, in order:
    **web parity probe** (`scripts/web_parity_probe.py` enforcing
    `contracts/web_parity.md` over a scratch hostd with the Python worker bridge
    disabled — what the WASM client faces).
-5. Engine + agent pytest suites: `<venv>/python -X utf8 -m pytest engine/doc agent -q`.
+5. Engine + agent pytest suites: `<venv>/python -X utf8 -m pytest engine/doc services/agent -q`.
    SKIPPED if the runtime venv/pytest is not provisioned on the box — again a
    SKIP, not a failure.
 6. `CHUDWARE_SHOT=m1` headless screenshot smoke via `xvfb-run`, plus the
@@ -205,15 +205,15 @@ Other entry points:
 - Full gate: `bash scripts/gate.sh` (see stage list above). Environment SKIPs
   (no OCCT, no venv, no xvfb) are honest SKIPs, not failures.
 - Fast stdlib gate only: `python3 scripts/check.py`.
-- Python suites: `<venv>/python -X utf8 -m pytest engine/doc agent -q`
+- Python suites: `<venv>/python -X utf8 -m pytest services/agent -q`
   (`-X utf8` matters on Windows). A root `conftest.py` exists.
 - C++ core: `ctest --test-dir core/build-linux` (or the preset's build dir);
   GUI-adjacent unit tests build into `host/build-linux/bin/` (`test_aicm`,
   `test_camera_backend`, `test_splat_renderer`, …).
 - GUI verification: headless screenshot harness `CHUDWARE_SHOT=<scenario>`; use
   `xvfb-run` unless `CHUDWARE_SHOT_HEADED=1`.
-- Test fixtures: `corpora/` (canonical) with root `corpus*` symlinks;
-  SW-parity fixtures under `corpus_sw_parity/`.
+- Test fixtures: `corpora/` (canonical); SW-parity fixtures are under
+  `corpora/sw_parity/`.
 
 ## Security considerations
 

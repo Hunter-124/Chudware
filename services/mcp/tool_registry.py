@@ -115,7 +115,7 @@ def catalog() -> dict[str, dict]:
 
 
 # --- warm/clear semantics -------------------------------------------------
-# ``_WARM_BASELINE`` is the set of catalog entries a FULL ``mcp_server.server``
+# ``_WARM_BASELINE`` is the set of catalog entries a FULL ``services.mcp.server``
 # import contributes, captured by :func:`mark_warm_baseline` from server.py's module
 # body. It is a *memory of content*, never an "already warmed" latch: it survives
 # :func:`clear_catalog` precisely so a later :func:`warm_catalog` can rebuild the
@@ -185,7 +185,7 @@ def warm_catalog() -> None:
         _WARM_IMPORT_TRIED = True
         try:
             # side-effect: registers every family AND calls mark_warm_baseline().
-            import mcp_server.server  # noqa: F401
+            import services.mcp.server  # noqa: F401
         except Exception:  # noqa: BLE001 — best-effort; a heavy/failed import must never break role loading
             pass
     if _WARM_BASELINE:

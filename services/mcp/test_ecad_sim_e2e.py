@@ -38,7 +38,7 @@ import pytest
 
 # Import the registrar EARLY (before sibling tests stub sys.modules) — same rule as
 # test_fea_advanced.py / test_mcp_freshness.py.
-from mcp_server.ecad_tools import register_ecad_tools
+from services.mcp.ecad_tools import register_ecad_tools
 
 
 # --------------------------------------------------------------------------- harness
@@ -88,7 +88,7 @@ def _wire(doc: str, a: str, ap: str, b: str, bp: str) -> None:
 
 def _set_sin(doc: str, ref: str, amplitude: float, freq: float) -> None:
     """Give a placed V source a SIN transient waveform via sim_params (the GUI shape)."""
-    from mcp_server.ecad_common import ecad_session
+    from services.mcp.ecad_common import ecad_session
     s = ecad_session.get_session(doc)
     sym = next(sym for sym in s.doc.get("symbols", []) if sym.get("ref") == ref)
     ecad_session.apply_ops(s, s.revision, [
@@ -99,7 +99,7 @@ def _set_sin(doc: str, ref: str, amplitude: float, freq: float) -> None:
 
 def _circuit_of(doc: str) -> dict:
     """The exact Circuit the tools simulate (netlist -> spice translation)."""
-    from mcp_server.ecad_common import ecad_session, netlist_mod
+    from services.mcp.ecad_common import ecad_session, netlist_mod
     from services.sim.spice import netlist_to_spice_circuit
     ses = ecad_session.get_session(doc)
     circuit, _warns = netlist_to_spice_circuit(netlist_mod.build_netlist(ses.doc))
@@ -151,7 +151,7 @@ def _oracle_sim_run(circuit, study, **kw):
     """The MNA leg — C++ sim_spice RPC now (engine.sim.circuit was deleted in the
     zero-Python cutover); ecad_common._sim_run keeps the Python-side sanitize shims
     and the ngspice-backend dispatch."""
-    from mcp_server.ecad_common import _sim_run
+    from services.mcp.ecad_common import _sim_run
     return _sim_run(circuit, study, **kw)
 
 
@@ -486,7 +486,7 @@ def test_orchestrator_simulate_design_deterministic():
     """simulate_design on a hand-built design dict (no planner, no LLM): the divider
     op probe must hit the closed-form midpoint and pass its own expect gate."""
     from services.ecad_design import orchestrator as orch
-    from mcp_server.ecad_common import ecad_session
+    from services.mcp.ecad_common import ecad_session
 
     doc = _new_sch("e2e_simdesign")
     _build_divider(doc)

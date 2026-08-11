@@ -1,10 +1,16 @@
-/* chudware-web /admin — allowlist management */
+/* chudware-web /admin — account administration */
 (function () {
   "use strict";
 
-  var rows = document.getElementById("user-rows");
-  var form = document.getElementById("add-form");
   var statusEl = document.getElementById("admin-status");
+  var rows = document.getElementById("account-rows");
+  var cardsEl = document.getElementById("account-cards");
+  var filterEl = document.getElementById("account-filter");
+  var totalEl = document.getElementById("account-total");
+  var pendingEl = document.getElementById("account-pending");
+  var rangeEl = document.getElementById("account-range");
+  var prevBtn = document.getElementById("account-prev");
+  var nextBtn = document.getElementById("account-next");
 
   function setStatus(msg, isErr) {
     statusEl.textContent = msg || "";
@@ -27,53 +33,257 @@
     return d.innerHTML;
   }
 
-  var state = { defaultProject: "", defaultDoc: "" };
+  /* ---- accounts: the approval queue and everyone already through it ---- */
 
-  function baseName(p) { var i = p.lastIndexOf("/"); return i < 0 ? p : p.slice(i + 1); }
+  var PAGE_SIZE = 50;
+  var PLANS = ["free", "trial", "pro", "team"];
+  var STATUS_CLASS = {
+    pending: "st-pending",
+    active: "st-active",
+    denied: "st-denied",
+    suspended: "st-suspended"
+  };
+  var page = { status: "", offset: 0, total: 0 };
 
-  function renderDocRow() {
-    var row = document.getElementById("default-doc-row");
-    if (!row) return;
-    row.textContent = state.defaultDoc
-      ? "Auto-opens for everyone: " + state.defaultDoc
-      : "Auto-opens the most recently modified part in the folder. Use Browse host… to pick a specific one.";
+  function toDate(secs) {
+    var n = Number(secs);
+    if (!secs || isNaN(n)) return null;
+    var d = new Date(n * 1000);
+    return isNaN(d.getTime()) ? null : d;
   }
 
-  var defForm = document.getElementById("default-form");
-  if (defForm) {
-    defForm.addEventListener("submit", async function (ev) {
-      ev.preventDefault();
-      var p = document.getElementById("f-default-project").value.trim();
-      setStatus(p ? "Setting default project to " + p + "…" : "Clearing default project…");
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+  function fmtDate(secs) {
+    var d = toDate(secs);
+    return d ? d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) : "\u2014";
+  }
+
+  function fmtWhen(secs) {
+    var d = toDate(secs);
+    return d ? d.toLocaleString() : "";
+  }
+
+  function statusPill(status) {
+    return "<span class='pill " + (STATUS_CLASS[status] || "st-unknown") + "'>" +
+           esc(status || "unknown") + "</span>";
+  }
+
+  function roleHtml(role) {
+    return "<span class='" + (role === "admin" ? "ac-admin" : "ac-dim") + "'>" +
+           esc(role || "user") + "</span>";
+  }
+
+  // One literal per endpoint the card drives, so the API surface greps cleanly.
+  var ACTION_PATH = {
+    approve: "/api/admin/accounts/{email}/approve",
+    deny: "/api/admin/accounts/{email}/deny",
+    suspend: "/api/admin/accounts/{email}/suspend",
+    plan: "/api/admin/accounts/{email}/plan"
+  };
+
+  function accountUrl(email, action) {
+    return ACTION_PATH[action].replace("{email}", encodeURIComponent(email));
+  }
+
+  function applyPending(n) {
+    var v = Number(n) || 0;
+    pendingEl.textContent = v ? v + " pending" : "";
+    pendingEl.hidden = !v;
+  }
+
+  async function act(email, action, verb) {
+    setStatus(verb + " " + email + "\u2026");
+    try {
+      var r = await api(accountUrl(email, action), { method: "POST", body: "{}" });
+      applyPending(r.pending);
+      setStatus(email + " is now " + r.account.status + ".");
+      await load();
+    } catch (e) { setStatus(String(e.message || e), true); }
+  }
+
+  function actionBtn(label, cls, onClick) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = cls;
+    b.textContent = label;
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  function planSelect(a) {
+    var sel = document.createElement("select");
+    sel.title = "Plan for " + a.email;
+    PLANS.forEach(function (p) {
+      var o = document.createElement("option");
+      o.value = p;
+      o.textContent = p;
+      if (p === a.plan) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.addEventListener("change", async function () {
+      var to = sel.value;
+      setStatus("Moving " + a.email + " to the " + to + " plan\u2026");
       try {
-        await api("/api/admin/default-project",
-                  { method: "PUT", body: JSON.stringify({ project: p, doc: p ? state.defaultDoc : "" }) });
-        setStatus(p ? "Default project set: everyone without an explicit project now opens " +
-                      (state.defaultDoc ? state.defaultDoc + " from " : "") + baseName(p) +
-                      " on their next session start." : "Default project cleared.");
-        refresh();
-      } catch (e) { setStatus(String(e.message || e), true); }
+        var r = await api(accountUrl(a.email, "plan"),
+                          { method: "POST", body: JSON.stringify({ plan: to }) });
+        applyPending(r.pending);
+        setStatus(a.email + " is on the " + r.account.plan + " plan.");
+        await load();
+      } catch (e) {
+        sel.value = a.plan;
+        setStatus(String(e.message || e), true);
+      }
+    });
+    return sel;
+  }
+
+  function fillPlan(host, a, prefix) {
+    if (prefix) host.appendChild(document.createTextNode(prefix));
+    if (a.status === "active") host.appendChild(planSelect(a));
+    else host.appendChild(document.createTextNode(a.plan || "free"));
+  }
+
+  function fillActions(host, a) {
+    if (a.status === "pending") {
+      host.appendChild(actionBtn("Approve", "btn primary", function () {
+        act(a.email, "approve", "Approving");
+      }));
+      host.appendChild(actionBtn("Deny", "rm-btn", function () {
+        if (confirm("Deny " + a.email + "? They stay registered but get no access."))
+          act(a.email, "deny", "Denying");
+      }));
+    } else if (a.status === "active") {
+      host.appendChild(actionBtn("Suspend", "rm-btn", function () {
+        if (confirm("Suspend " + a.email + "? Their access stops immediately."))
+          act(a.email, "suspend", "Suspending");
+      }));
+    } else {
+      host.appendChild(actionBtn("Reinstate", "btn ghost", function () {
+        act(a.email, "approve", "Reinstating");
+      }));
+    }
+  }
+
+  function placeholder(msg) {
+    rows.innerHTML = "<tr><td colspan='7' class='ac-dim'>" + esc(msg) + "</td></tr>";
+    cardsEl.innerHTML = "<div class='ac-dim'>" + esc(msg) + "</div>";
+  }
+
+  function render(list) {
+    rows.innerHTML = "";
+    cardsEl.innerHTML = "";
+    list.forEach(function (a) {
+      var tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td class='ac-email'>" + esc(a.email) + "</td>" +
+        "<td>" + (a.display ? esc(a.display) : "<span class='ac-dim'>\u2014</span>") + "</td>" +
+        "<td>" + statusPill(a.status) + "</td>" +
+        "<td class='ac-plan'></td>" +
+        "<td class='ac-role'>" + roleHtml(a.role) + "</td>" +
+        "<td class='ac-when' title='" + esc(fmtWhen(a.created_at)) + "'>" +
+          esc(fmtDate(a.created_at)) + "</td>" +
+        "<td class='ac-act'><div class='ac-actions'></div></td>";
+      fillPlan(tr.querySelector(".ac-plan"), a, "");
+      fillActions(tr.querySelector(".ac-actions"), a);
+      rows.appendChild(tr);
+
+      var card = document.createElement("div");
+      card.className = "account-card";
+      card.innerHTML =
+        "<div class='ac-email'>" + esc(a.email) + "</div>" +
+        "<div class='ac-meta'>" + (a.display ? esc(a.display) : "No display name") + "</div>" +
+        "<div class='ac-row'>" + statusPill(a.status) + roleHtml(a.role) + "</div>" +
+        "<div class='ac-meta'>Created " + esc(fmtDate(a.created_at)) + "</div>" +
+        "<div class='ac-plan'></div>" +
+        "<div class='ac-actions'></div>";
+      fillPlan(card.querySelector(".ac-plan"), a, "Plan ");
+      fillActions(card.querySelector(".ac-actions"), a);
+      cardsEl.appendChild(card);
     });
   }
 
-  /* ---- host folder browser (admin-only) ---- */
+  function fetchPage() {
+    var q = "/api/admin/accounts?limit=" + PAGE_SIZE + "&offset=" + page.offset;
+    if (page.status) q += "&status=" + encodeURIComponent(page.status);
+    return api(q);
+  }
+
+  async function load() {
+    var data = await fetchPage();
+    var list = data.accounts || [];
+    if (!list.length && page.offset > 0) {
+      // The page we were sitting on emptied out (last pending approved, filter
+      // flipped under us) — fall back to the last page that still has rows.
+      var lastOffset = Math.max(0, (Math.ceil((data.total || 0) / PAGE_SIZE) - 1) * PAGE_SIZE);
+      if (lastOffset !== page.offset) {
+        page.offset = lastOffset;
+        data = await fetchPage();
+        list = data.accounts || [];
+      }
+    }
+    page.total = data.total || 0;
+    page.offset = data.offset || 0;
+    applyPending(data.pending);
+    totalEl.textContent = page.total === 1 ? "1 account" : page.total + " accounts";
+    rangeEl.textContent = list.length
+      ? (page.offset + 1) + "\u2013" + (page.offset + list.length)
+      : "";
+    prevBtn.disabled = page.offset <= 0;
+    nextBtn.disabled = page.offset + list.length >= page.total;
+    if (!list.length) {
+      placeholder(page.status
+        ? "No " + page.status + " accounts."
+        : "No accounts yet \u2014 people show up here as they register.");
+      return;
+    }
+    render(list);
+  }
+
+  function reload() {
+    load().catch(function (e) {
+      placeholder("Couldn't load accounts.");
+      setStatus("Failed to load accounts: " + (e.message || e) + " (admin only)", true);
+    });
+  }
+
+  filterEl.addEventListener("change", function () {
+    page.status = filterEl.value;
+    page.offset = 0;
+    reload();
+  });
+  prevBtn.addEventListener("click", function () {
+    page.offset = Math.max(0, page.offset - PAGE_SIZE);
+    reload();
+  });
+  nextBtn.addEventListener("click", function () {
+    if (page.offset + PAGE_SIZE >= page.total) return;
+    page.offset += PAGE_SIZE;
+    reload();
+  });
+
+  placeholder("Loading accounts\u2026");
+  reload();
+
+  /* ---- host folder browser (admin-only, read-only) ---- */
   var modal = document.getElementById("browse-modal");
-  var browse = { path: "" };
 
   async function browseTo(path) {
     var data = await api("/api/admin/browse?path=" + encodeURIComponent(path || ""));
-    browse.path = data.path;
     document.getElementById("browse-path").textContent = data.path;
     var list = document.getElementById("browse-list");
     list.innerHTML = "";
     function row(label, cls, onClick) {
       var d = document.createElement("div");
       d.textContent = label;
-      d.style.cssText = "padding:5px 14px;cursor:pointer;font-size:.88rem" +
+      d.style.cssText = "padding:5px 14px;font-size:.88rem" +
+                        (onClick ? ";cursor:pointer" : "") +
                         (cls === "part" ? ";color:#55d98a" : "");
-      d.addEventListener("mouseenter", function () { d.style.background = "rgba(255,255,255,.06)"; });
-      d.addEventListener("mouseleave", function () { d.style.background = ""; });
-      d.addEventListener("click", onClick);
+      if (onClick) {
+        d.addEventListener("mouseenter", function () { d.style.background = "rgba(255,255,255,.06)"; });
+        d.addEventListener("mouseleave", function () { d.style.background = ""; });
+        d.addEventListener("click", onClick);
+      }
       list.appendChild(d);
     }
     if (data.parent) row("\u2B06 ..", "dir", function () { browseTo(data.parent).catch(showBrowseErr); });
@@ -83,10 +293,7 @@
       });
     });
     data.parts.forEach(function (n) {
-      row("\u2699 " + n + " — click to auto-open this part", "part", function () {
-        state.defaultDoc = n;
-        pickFolder(data.path);
-      });
+      row("\u2699 " + n, "part", null);
     });
     if (!data.dirs.length && !data.parts.length) {
       var empty = document.createElement("div");
@@ -98,164 +305,19 @@
 
   function showBrowseErr(e) { setStatus(String(e.message || e), true); }
 
-  function pickFolder(path) {
-    document.getElementById("f-default-project").value = path;
-    modal.style.display = "none";
-    renderDocRow();
-    setStatus("Folder picked — hit \u201CSet for all\u201D to apply.");
-  }
-
   var btnBrowse = document.getElementById("btn-browse");
   if (btnBrowse && modal) {
     btnBrowse.addEventListener("click", function () {
-      state.defaultDoc = "";
       modal.style.display = "block";
-      var cur = document.getElementById("f-default-project").value.trim();
-      browseTo(cur.indexOf("/") === 0 ? cur : "").catch(showBrowseErr);
+      browseTo("").catch(showBrowseErr);
     });
-    document.getElementById("browse-cancel").addEventListener("click", function () {
+    document.getElementById("browse-close").addEventListener("click", function () {
       modal.style.display = "none";
-    });
-    document.getElementById("browse-use").addEventListener("click", function () {
-      state.defaultDoc = "";
-      pickFolder(browse.path);
     });
     modal.addEventListener("click", function (ev) {
       if (ev.target === modal) modal.style.display = "none";
     });
   }
-  async function refresh() {
-    var data = await api("/api/admin/users");
-    var dl = document.getElementById("project-list");
-    if (dl && data.projects) {
-      dl.innerHTML = "";
-      data.projects.forEach(function (p) {
-        var o = document.createElement("option");
-        o.value = p;
-        dl.appendChild(o);
-      });
-    }
-    var defInput = document.getElementById("f-default-project");
-    if (defInput && document.activeElement !== defInput) defInput.value = data.default_project || "";
-    state.defaultProject = data.default_project || "";
-    state.defaultDoc = data.default_doc || "";
-    renderDocRow();
-    rows.innerHTML = "";
-    var cards = document.getElementById("user-cards");
-    if (cards) cards.innerHTML = "";
-    data.users.forEach(function (u) {
-      var tr = document.createElement("tr");
-      tr.innerHTML =
-        "<td>" + esc(u.email) + "</td>" +
-        "<td>" + esc(u.display) + "</td>" +
-        "<td><span class='pill " + (u.role === "admin" ? "admin" : "user") + " edit-role' style='cursor:pointer' title='Click to toggle admin/user'>" + esc(u.role) + "</span>" +
-        "<span class='pill heavy edit-heavy' style='cursor:pointer" + (u.heavy ? "" : ";opacity:.35") + "' title='Click to toggle the GPU seat'>GPU</span></td>" +
-        "<td class='edit-project' style='cursor:pointer' title='Click to change their project'>" +
-        (u.project ? esc(baseName(u.project))
-                 : state.defaultProject ? "<span style='opacity:.6'>" + esc(baseName(state.defaultProject)) + " (default)</span>"
-                 : "—") + "</td>" +
-        "<td></td>";
-      async function patch(fields, label) {
-        setStatus("Updating " + u.email + "…");
-        try {
-          await api("/api/admin/users/" + encodeURIComponent(u.email),
-                    { method: "PATCH", body: JSON.stringify(fields) });
-          setStatus(label + " Applies on their next session start.");
-          refresh();
-        } catch (e) { setStatus(String(e.message || e), true); }
-      }
-      function bindRole(el) {
-        el.addEventListener("click", function () {
-          var to = u.role === "admin" ? "user" : "admin";
-          if (confirm("Make " + u.email + " " + (to === "admin" ? "an ADMIN (full ops + allowlist control)?" : "a regular user?")))
-            patch({ role: to }, u.email + " is now " + to + ".");
-        });
-      }
-      function bindHeavy(el) {
-        el.addEventListener("click", function () {
-          patch({ heavy: !u.heavy }, u.email + (u.heavy ? " lost" : " got") + " the GPU seat.");
-        });
-      }
-      function bindProject(el) {
-        el.addEventListener("click", function () {
-          var v = prompt("Project for " + u.email + " (PLM name or host folder path; empty = inherit site default):",
-                         u.project || "");
-          if (v !== null) patch({ project: v.trim() }, "Project updated.");
-        });
-      }
-      function makeRemoveBtn() {
-        var btn = document.createElement("button");
-        btn.className = "rm-btn";
-        btn.textContent = "remove";
-        btn.addEventListener("click", async function () {
-          if (!confirm("Remove " + u.email + " from the allowlist?")) return;
-          setStatus("Removing " + u.email + "…");
-          try {
-            var r = await api("/api/admin/users/" + encodeURIComponent(u.email), { method: "DELETE" });
-            setStatus("Removed. Access policy: " + (r.access_policy.synced ? "synced" : "SYNC FAILED — " + r.access_policy.detail),
-                      !r.access_policy.synced);
-            refresh();
-          } catch (e) { setStatus(String(e.message || e), true); }
-        });
-        return btn;
-      }
-      bindRole(tr.querySelector(".edit-role"));
-      bindHeavy(tr.querySelector(".edit-heavy"));
-      bindProject(tr.querySelector(".edit-project"));
-      tr.lastElementChild.appendChild(makeRemoveBtn());
-      rows.appendChild(tr);
-
-      if (cards) {
-        var card = document.createElement("div");
-        card.className = "user-card";
-        var projectLabel = u.project ? esc(baseName(u.project))
-          : state.defaultProject ? esc(baseName(state.defaultProject)) + " (default)"
-          : "—";
-        card.innerHTML =
-          "<div class='uc-email'>" + esc(u.email) + "</div>" +
-          "<div class='uc-meta'>" + (u.display ? esc(u.display) : "No display name") + "</div>" +
-          "<div class='uc-row'>" +
-            "<span class='pill " + (u.role === "admin" ? "admin" : "user") + " edit-role' style='cursor:pointer'>" + esc(u.role) + "</span>" +
-            "<span class='pill heavy edit-heavy' style='cursor:pointer" + (u.heavy ? "" : ";opacity:.35") + "'>GPU</span>" +
-          "</div>" +
-          "<div class='uc-meta edit-project' style='cursor:pointer'>Project: " + projectLabel + "</div>" +
-          "<div class='uc-actions'></div>";
-        bindRole(card.querySelector(".edit-role"));
-        bindHeavy(card.querySelector(".edit-heavy"));
-        bindProject(card.querySelector(".edit-project"));
-        card.querySelector(".uc-actions").appendChild(makeRemoveBtn());
-        cards.appendChild(card);
-      }
-    });
-  }
-
-  form.addEventListener("submit", async function (ev) {
-    ev.preventDefault();
-    var email = document.getElementById("f-email").value.trim();
-    if (!email) return;
-    setStatus("Adding " + email + "…");
-    try {
-      var r = await api("/api/admin/users", {
-        method: "POST",
-        body: JSON.stringify({
-          email: email,
-          display: document.getElementById("f-display").value.trim(),
-          role: document.getElementById("f-admin").checked ? "admin" : "user",
-          heavy: document.getElementById("f-heavy").checked,
-          project: document.getElementById("f-project").value.trim(),
-        }),
-      });
-      setStatus("Added " + r.user.email + ". Access policy: " +
-                (r.access_policy.synced ? "synced — they can log in now." : "SYNC FAILED — " + r.access_policy.detail),
-                !r.access_policy.synced);
-      form.reset();
-      refresh();
-    } catch (e) { setStatus(String(e.message || e), true); }
-  });
-
-  refresh().catch(function (e) {
-    setStatus("Failed to load users: " + (e.message || e) + " (admin only)", true);
-  });
 
   /* ---- live ops: host health, log tail ---- */
   var hostBar = document.getElementById("host-bar");

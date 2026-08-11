@@ -71,9 +71,9 @@ class TestRoutingYamlDrivesGetProvider(unittest.TestCase):
                 p.start()
             try:
                 # get_provider() must not spawn a real llama.cpp server: LlamaCppProvider
-                # wraps installer.llamacpp.ensure_server_running() in its constructor.
+                # wraps services.installer.llamacpp.ensure_server_running() in its constructor.
                 with patch(
-                    "installer.llamacpp.ensure_server_running",
+                    "services.installer.llamacpp.ensure_server_running",
                     return_value={"base_url": "http://127.0.0.1:8765/v1"},
                 ) as mock_ensure:
                     provider = agent_config.get_provider(cfg={}, role="default")

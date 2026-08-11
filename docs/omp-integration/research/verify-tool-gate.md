@@ -89,7 +89,7 @@ source reads.**
 
 ## 4. New firmware tools — CONFIRMED pattern already exists
 
-`mcp_server.firmware_tools.register_firmware_tools` is ALREADY registered twice: once directly on
+`services.mcp.firmware_tools.register_firmware_tools` is ALREADY registered twice: once directly on
 the live `mcp` tagged family `"ecad"` (`server.py:428`: `register_firmware_tools(_reg.view(mcp,
 "ecad"))`), and once as a `verify.py`-local extension for AC/DAG-verify dispatch on a private
 `battery-firmware` FastMCP instance (`verify.py:216-219`). **New firmware capability tools slot
@@ -106,7 +106,7 @@ Grep across the whole repo for MCP-client-style code (`ClientSession`, `stdio_cl
 `sse_client`, `MCPManager`, `.connectToServer`) found **zero hits**. All "MCP client" mentions in
 the codebase refer to *external* clients (Claude Code/Cursor/VS Code/opencode) connecting **into**
 CAD's own FastMCP server (`services/mcp/server.py`, stdio transport) — confirmed via:
-- `installer/setup_mcp_clients.py` + `mcp_setup.bat` — writes THIRD-PARTY client configs
+- `services/installer/setup_mcp_clients.py` + `mcp_setup.bat` — writes THIRD-PARTY client configs
   (`.mcp.json`, `.vscode/mcp.json`, Grok `.grok/`) so external tools can talk to CAD's server;
   never the reverse.
 - `contracts/interaction.md:138`, `contracts/deliverables.md:292`, `contracts/providers.md:5-6` —

@@ -52,7 +52,7 @@ def _rel(metric: float, ref: float) -> float:
 def _bench_rc_step_tau() -> dict:
     t0 = time.perf_counter()
     try:
-        from mcp_server.ecad_tools import register_ecad_tools
+        from services.mcp.ecad_tools import register_ecad_tools
         from engine.ecad import netlist as netlist_mod
         from engine.ecad import session as ecad_session
         from engine.sim.spice import netlist_to_spice_circuit

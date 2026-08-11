@@ -63,7 +63,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 
-from mcp_server import result_serving as _rs
+from services.mcp import result_serving as _rs
 from .cad_common import coerce_json_or_repr
 
 def _ok(payload) -> str:
@@ -903,10 +903,10 @@ def cam_tool_import_impl(part_id: str, number: int = 0, material: str = "", *,
         tool_material = "carbide"
 
     if _add_tool_fn is None or _existing_numbers_fn is None:
-        # Prefer an ALREADY-LOADED cam_tools module (mcp_server.* or
+        # Prefer an ALREADY-LOADED cam_tools module (services.mcp.* or
         # services.mcp.*) so we share its _CAM current-job state; fall back to a
         # same-package import.
-        _ct = sys.modules.get("mcp_server.cam_tools") or \
+        _ct = sys.modules.get("services.mcp.cam_tools") or \
             sys.modules.get("services.mcp.cam_tools")
         if _ct is None:
             try:

@@ -31,13 +31,13 @@ import math
 
 import pytest
 
-from mcp_server.ecad_tools import register_ecad_tools, _ECAD
-from mcp_server.ecad_thermal import (register_ecad_thermal_tools,
+from services.mcp.ecad_tools import register_ecad_tools, _ECAD
+from services.mcp.ecad_thermal import (register_ecad_thermal_tools,
                                      register_ecad_airflow_tools)
-from mcp_server.ecad_reliability import register_ecad_reliability_tools
-from mcp_server.heatsink import register_heatsink_tools
-from mcp_server.power_budget import register_power_budget_tools
-from mcp_server.ecad_common import ecad_session
+from services.mcp.ecad_reliability import register_ecad_reliability_tools
+from services.mcp.heatsink import register_heatsink_tools
+from services.mcp.power_budget import register_power_budget_tools
+from services.mcp.ecad_common import ecad_session
 
 
 def _has_3d() -> bool:
@@ -507,7 +507,7 @@ def test_thermal_live_solve_verify_and_heatsink(tools, board):
 def test_verify_thermal_without_solve_teaches(tools):
     """With no cached solve, verify must return a teaching error (the cache lives in
     the module-global _THERMAL, so save/clear/restore it around the check)."""
-    from mcp_server import ecad_thermal as et  # same module identity as the tools (double-import hazard)
+    from services.mcp import ecad_thermal as et  # same module identity as the tools (double-import hazard)
     saved = et._THERMAL.get("last_handoff")
     et._THERMAL["last_handoff"] = None
     try:
@@ -531,7 +531,7 @@ def test_airflow_handoff_dry_run_and_verify_guard(tools, board):
     assert names == {"board", "c_U1", "c_U2"}, names
     powers = {s["name"]: s["power_w"] for s in r["solids"]}
     assert powers["c_U1"] == 2.0 and powers["c_U2"] == 0.3, powers
-    from mcp_server import ecad_thermal as et  # same module identity as the tools (double-import hazard)
+    from services.mcp import ecad_thermal as et  # same module identity as the tools (double-import hazard)
     saved = et._AIRFLOW.get("last")
     et._AIRFLOW["last"] = None
     try:

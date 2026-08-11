@@ -26,39 +26,39 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import app as app_mod  # noqa: E402
+from gateway import accounts, app as app_mod, db  # noqa: E402
 from gateway.app import _redact_secrets, _valid_project  # noqa: E402
 from gateway.config import settings  # noqa: E402
 from gateway.releases import _safe_name  # noqa: E402
 import gateway.terminal as terminal_mod  # noqa: E402
 
-# The tracked users.yaml is a template with no admin; the fixture seeds one.
+# Identities the fixture seeds into the account store; the middleware maps the
+# X-Dev-User header to a row there and authorizes from it.
 ADMIN = {"X-Dev-User": "admin@example.com"}
 ADMIN_EMAIL = "admin@example.com"
 OTHER_ADMIN = "other@example.com"
 
 
+def _seed_admin(email: str, display: str) -> None:
+    """Register, activate, and promote one account.
+
+    accounts.py deliberately exposes no role setter — admin is granted through
+    the admin API and never self-assigned — so the promotion is a direct row
+    update here rather than a public call that does not (and should not) exist.
+    """
+    accounts.ensure_account(email, display=display)
+    accounts.set_status(email, "active", decided_by="test")
+    with db.tx() as cur:
+        cur.execute("UPDATE accounts SET role = 'admin' WHERE email = %s", (email,))
+
+
 @pytest.fixture(autouse=True)
-def _isolate(tmp_path, monkeypatch):
-    """Seeded admin account + tmp data root; no real tmux."""
+def _isolate(pg, tmp_path, monkeypatch):
+    """Seeded admin accounts + tmp data root; no real tmux."""
     monkeypatch.setattr(settings, "dev_mode", True)
     monkeypatch.setattr(settings, "data_root", tmp_path / "data")
-    users_file = tmp_path / "users.yaml"
-    users_file.write_text(
-        "users:\n"
-        "  - email: admin@example.com\n"
-        "    display: Test Admin\n"
-        "    role: admin\n"
-        "    heavy: false\n"
-        "  - email: other@example.com\n"
-        "    display: Other Admin\n"
-        "    role: admin\n"
-        "    heavy: false\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(settings, "users_file", users_file)
-    monkeypatch.setattr(app_mod.user_directory, "path", users_file)
-    app_mod.user_directory.reload(force=True)
+    _seed_admin(ADMIN_EMAIL, "Test Admin")
+    _seed_admin(OTHER_ADMIN, "Other Admin")
     return tmp_path
 
 

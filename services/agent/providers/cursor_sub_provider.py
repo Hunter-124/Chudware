@@ -29,7 +29,7 @@ import urllib.error
 from .base import Provider
 from . import sub_auth
 
-log = logging.getLogger("agent.providers.cursor_sub")
+log = logging.getLogger("services.agent.providers.cursor_sub")
 
 LOGIN_URL = "https://cursor.com/loginDeepControl"
 POLL_URL = "https://api2.cursor.sh/auth/poll"

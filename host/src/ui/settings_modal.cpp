@@ -34,7 +34,7 @@
 #include "ai/ai_prefs.h"  // ui::aiUiVerbosity/aiFollowActiveSession/aiActiveWorkPreviews
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 #include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > Benchmarks)
-#include "oauth_capture.h"  // in-app xAI multi-account CEF OAuth (Settings → Accounts)
+#include "onboarding.h"  // first-run guided account/provider/test/workspace flow
 #include "web_capabilities.h"  // ui::webGapReason (T-RF12: sign-in is desktop-only on web)
 #include "../core/async_rpc.h"  // core::RpcResult for skills/triggers RPCs
 #include "widgets/interwebz.h"  // Skills/Rules two-column editors
@@ -430,9 +430,8 @@ static std::string s_pendingActiveProv;   // provider whose selection is mid-swi
 static std::string s_pendingActiveId;     // account_id the user picked
 static std::string s_pendingSignOutKey;   // "<provider>\n<account_id>" being removed
 
-// CEF add-account disabled — device/browser Python flow (xai_sub_provider)
-// handles multi-account storage+rotation. Leave oauth_capture compiled but dormant.
-static constexpr bool kXaiUseCef = false;
+// All subscription account sign-ins use the system browser. The former optional CEF path was
+// deliberately removed: device-code and loopback OAuth flows are lossless externally.
 
 static const char* kSubProviders[] = {"xai", "claude", "codex", "cursor", "kimi"};
 static const char* kSubProviderLabels[] = {
@@ -629,10 +628,6 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
         if (!activeSeen) { s_pendingActiveProv.clear(); s_pendingActiveId.clear(); }
         if (!signOutSeen) s_pendingSignOutKey.clear();
     }
-
-    // In-app xAI OAuth modal (CEF). Draw every frame so the approve page keeps
-    // receiving frames/input even if Accounts scrolls out of view.
-    ui::oauthCapture().draw(st, sc);
 
     if (!ui::providerUsageError().empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
@@ -844,20 +839,9 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
             ImGui::PopStyleColor();
         }
 
-        // Live login progress for this provider (device-code UX).
-        // When the in-app CEF modal owns the xAI flow, suppress the inline
-        // external-browser progress (modal shows code + page instead).
+        // Live login progress for this provider (device-code / loopback system-browser UX).
         ui::UsageLoginProgress& prog = ui::providerUsageLogin()[prov];
-        const bool cefOwnsXai = (std::string(prov) == "xai") && kXaiUseCef && ui::oauthCapture().active();
-        if (cefOwnsXai) {
-            // Modal owns the flow; Python status still drives prog via the normal
-            // poll above. Do not force-poll every frame (TTL + in-flight guard
-            // would still thrash accounts RPCs). Closing mid-flow leaves the
-            // Python device-code poll running — same as the external-browser path.
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-            ImGui::TextUnformatted("Sign-in open in embedded browser\xe2\x80\xa6");
-            ImGui::PopStyleColor();
-        } else if (prog.inProgress) {
+        if (prog.inProgress) {
             if (prog.userCode.empty() && prog.verifyUrl.empty()) {
                 ImGui::TextUnformatted("Opening browser\xe2\x80\xa6");
             } else {
@@ -913,46 +897,32 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                           any ? "Add another account##%s" : "Sign in##%s", prov);
             if (webWhy) ImGui::BeginDisabled();
             if (ImGui::SmallButton(addId)) {
-                const bool isXai = std::string(prov) == "xai";
-                // xAI: CEF path is gated by kXaiUseCef (currently off — Python
-                // device/browser token store+rotation handles multi-account).
-                // When enabled, prefer in-app CEF; fallback is external browser.
-                if (isXai && kXaiUseCef && ui::OauthCapture::cefAvailable()) {
-                    prog.inProgress = true;
-                    prog.lastError.clear();
-                    prog.userCode.clear();
-                    prog.verifyUrl.clear();
-                    prog.browserOpened = false;
-                    prog.stage = "start";
-                    ui::oauthCapture().beginXai(st);
-                } else {
-                    prog.inProgress = true;
-                    prog.lastError.clear();
-                    prog.userCode.clear();
-                    prog.verifyUrl.clear();
-                    prog.browserOpened = false;
-                    prog.stage = "start";
-                    nlohmann::json p;
-                    p["provider"] = prov;
-                    // xAI is device-code only. Codex uses its browser callback flow here;
-                    // its headless device flow cannot surface a code through this UI.
-                    if (isXai)
-                        p["device"] = true;
-                    st.rpc.call("subscription_login", p, [prov](const core::RpcResult& r) {
-                        ui::UsageLoginProgress& pr = ui::providerUsageLogin()[prov];
-                        if (!r.ok) {
-                            pr.inProgress = false;
-                            pr.lastError = r.err.empty() ? "login failed" : r.err;
-                        } else if (r.result.is_object() && r.result.value("ok", true) == false) {
-                            pr.inProgress = false;
-                            auto reason = optionalJsonString(r.result, "reason");
-                            auto hint = optionalJsonString(r.result, "hint");
-                            pr.lastError = reason.empty() ? "login failed" : reason;
-                            if (!hint.empty()) pr.lastError += " \xe2\x80\x94 " + hint;
-                        }
-                        ui::providerUsageInvalidate();
-                    });
-                }
+                prog.inProgress = true;
+                prog.lastError.clear();
+                prog.userCode.clear();
+                prog.verifyUrl.clear();
+                prog.browserOpened = false;
+                prog.stage = "start";
+                nlohmann::json p;
+                p["provider"] = prov;
+                // xAI and Kimi are device-code; Claude and Codex use loopback callbacks, and
+                // Cursor uses vendor-hosted polling. Every path opens the system browser.
+                if (std::string(prov) == "xai" || std::string(prov) == "kimi")
+                    p["device"] = true;
+                st.rpc.call("subscription_login", p, [prov](const core::RpcResult& r) {
+                    ui::UsageLoginProgress& pr = ui::providerUsageLogin()[prov];
+                    if (!r.ok) {
+                        pr.inProgress = false;
+                        pr.lastError = r.err.empty() ? "login failed" : r.err;
+                    } else if (r.result.is_object() && r.result.value("ok", true) == false) {
+                        pr.inProgress = false;
+                        auto reason = optionalJsonString(r.result, "reason");
+                        auto hint = optionalJsonString(r.result, "hint");
+                        pr.lastError = reason.empty() ? "login failed" : reason;
+                        if (!hint.empty()) pr.lastError += " \xe2\x80\x94 " + hint;
+                    }
+                    ui::providerUsageInvalidate();
+                });
             }
             if (webWhy) ImGui::EndDisabled();
             // Disabled items need AllowWhenDisabled to still show the explaining tooltip.
@@ -961,18 +931,11 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
                     : ImGui::IsItemHovered()) {
                 if (webWhy)
                     ImGui::SetTooltip("%s", webWhy);
-                else if (std::string(prov) == "xai" && kXaiUseCef && ui::OauthCapture::cefAvailable())
-                    ImGui::SetTooltip(
-                        any
-                            ? "Add another %s account in the embedded browser "
-                              "(session isolated for multi-account)."
-                            : "Sign in to %s in the embedded browser.",
-                        plabel);
                 else
                     ImGui::SetTooltip(
                         any
-                            ? "Add another %s subscription account (browser OAuth)."
-                            : "Sign in to %s (browser OAuth). Existing accounts stay listed above.",
+                            ? "Add another %s subscription account in your system browser."
+                            : "Sign in to %s in your system browser. Existing accounts stay listed above.",
                         plabel);
             }
         }
@@ -1027,6 +990,9 @@ struct OmpOAuthFlow {
     bool manualInFlight = false;
     bool canSubmitManual = false;
     bool credentialSaved = false;
+    bool externalOwner = false;    // onboarding/system-browser flow; independent of Settings modal
+    bool browserOpenAttempted = false;
+    bool browserOpened = false;
     uint64_t generation = 0;
     uint64_t beginRequest = 0;
     uint64_t pollRequest = 0;
@@ -1360,8 +1326,10 @@ static bool ompOAuthCallbackCurrent(uint64_t modalGeneration, uint64_t generatio
                                     const std::string& provider,
                                     const std::string& handle) {
     const OmpOAuthFlow& f = s_omp.oauth;
-    return s_omp.modalOpen && s_omp.modalGeneration == modalGeneration &&
-           f.generation == generation && f.provider == provider &&
+    const bool ownerCurrent =
+        f.externalOwner ||
+        (s_omp.modalOpen && s_omp.modalGeneration == modalGeneration);
+    return ownerCurrent && f.generation == generation && f.provider == provider &&
            (handle.empty() || f.handle == handle);
 }
 
@@ -1374,6 +1342,18 @@ static void cancelLateOmpOAuthHandle(AppState& st, const std::string& provider,
         (void)handle;
         (void)generation;
     });
+}
+
+static bool openOmpOAuthUrl(const OmpOAuthFlow& f);
+
+static void openOmpOAuthInSystemBrowser(OmpOAuthFlow& f) {
+    if (f.status != "awaiting_auth" || f.browserOpenAttempted ||
+        (f.url.empty() && f.launchUrl.empty()))
+        return;
+    f.browserOpenAttempted = true;
+    f.browserOpened = openOmpOAuthUrl(f);
+    if (!f.browserOpened)
+        f.manualError = "The system browser could not be opened. Use the link below.";
 }
 
 // Snapshots are replaceable, not deltas: clearing a field is meaningful (in particular,
@@ -1411,11 +1391,13 @@ static void failOmpOAuth(OmpOAuthFlow& f, std::string error) {
     f.error = error.empty() ? "Sign-in failed" : std::move(error);
 }
 
-static void beginOmpOAuth(AppState& st, const std::string& provider) {
+static void beginOmpOAuth(AppState& st, const std::string& provider,
+                          bool externalOwner = false) {
     OmpOAuthFlow& f = s_omp.oauth;
     if (f.active || provider.empty()) return;
     f = OmpOAuthFlow{};
     f.active = true;
+    f.externalOwner = externalOwner;
     f.provider = provider;
     f.status = "starting";
     f.generation = ++s_omp.oauthGeneration;
@@ -1450,6 +1432,7 @@ static void beginOmpOAuth(AppState& st, const std::string& provider) {
         }
         f.handle = returnedHandle;
         ompOAuthApplySnapshot(f, r.result);
+        openOmpOAuthInSystemBrowser(f);
         if (f.status.empty()) {
             failOmpOAuth(f, "sign-in returned an incomplete flow snapshot");
             return;
@@ -1497,6 +1480,7 @@ static void pollOmpOAuth(AppState& st) {
             return;
         }
         ompOAuthApplySnapshot(f, r.result);
+        openOmpOAuthInSystemBrowser(f);
         if (f.status.empty()) {
             failOmpOAuth(f, "sign-in status was incomplete");
             return;
@@ -1896,8 +1880,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         }
     }
 
-    // API-key block (inline; validate → set, with an explicit unvalidated save for providers
-    // whose wire API has no cheap validation endpoint).
+    // API-key block: validation is mandatory and persistence happens only after success.
     if (prov.hasApiKey) {
         ImGui::Dummy(ImVec2(0, 4.0f * sc));
         if (s_omp.keyFor != prov.id) {
@@ -1971,42 +1954,6 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                     refreshOmpProvider(st);
                 });
             }, 20000);
-        }
-        ImGui::SameLine(0, 6.0f * sc);
-        if (ImGui::SmallButton("Add unvalidated") && haveInput && !s_omp.keyBusy) {
-            s_omp.keyBusy = true;
-            s_omp.keyStatus.clear();
-            const std::string provider = prov.id;
-            const std::string key = s_omp.keyBuf;
-            const uint64_t modalGeneration = s_omp.modalGeneration;
-            const uint64_t viewGeneration = s_omp.viewGeneration;
-            const uint64_t selectionGeneration = s_omp.selectionGeneration;
-            const uint64_t requestGeneration = nextOmpRequestGeneration();
-            s_omp.keyRequestGeneration = requestGeneration;
-            st.rpc.call("agent_provider_set_key",
-                        nlohmann::json{{"provider", provider}, {"apiKey", key}},
-                        [&st, provider, modalGeneration, viewGeneration,
-                         selectionGeneration, requestGeneration](const core::RpcResult& sr) {
-                if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
-                                                 selectionGeneration, provider) ||
-                    s_omp.keyRequestGeneration != requestGeneration ||
-                    s_omp.keyFor != provider)
-                    return;
-                s_omp.keyBusy = false;
-                if (!sr.ok || !sr.result.is_object() ||
-                    !optionalJsonBool(sr.result, "ok", true)) {
-                    s_omp.keyStatusErr = true;
-                    s_omp.keyStatus = !sr.ok ? sr.err
-                                             : optionalJsonString(sr.result, "error");
-                    if (s_omp.keyStatus.empty() && sr.result.is_object())
-                        s_omp.keyStatus = optionalJsonString(sr.result, "detail");
-                    return;
-                }
-                s_omp.keyStatusErr = false;
-                s_omp.keyStatus = "key saved (not validated)";
-                s_omp.keyBuf[0] = 0;
-                refreshOmpProvider(st);
-            });
         }
         if (s_omp.keyBusy) ImGui::EndDisabled();
         if (!prov.consoleUrl.empty()) {
@@ -4160,7 +4107,8 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
         std::memset(settings.expVisionKey, 0, sizeof(settings.expVisionKey));
         std::strncpy(settings.expVisionKey, src, sizeof(settings.expVisionKey) - 1);
     }
-    // Model id + endpoint side by side (inline labels); API key inline on its own row.
+    // Model id + endpoint side by side. Credential entry is intentionally absent: this AI tab
+    // never persists provider keys; Settings -> Providers owns validated AuthStorage writes.
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * sc, 1.5f * sc));
     if (ImGui::BeginTable("##expvis_fields", 2,
                           ImGuiTableFlags_SizingStretchSame |
@@ -4181,20 +4129,13 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
     }
     ImGui::PopStyleVar();  // CellPadding
     ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted("API key (blank for a local endpoint)");
-    ImGui::SameLine();
-    helpMarker("Local: LM Studio / Ollama / vLLM (loopback, no key needed). Cloud: a vision "
-               "model endpoint + its API key (refused under Offline mode).");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputText("##expviskey", settings.expVisionKey, sizeof(settings.expVisionKey),
-                     ImGuiInputTextFlags_Password);
-    // A remote endpoint with no key can only 401, and the core then SKIPS the split silently
-    // (review falls back to the command model). Say so here instead of letting it look enabled.
-    if (!settings.expVisionKey[0] && !ui::baseUrlIsLoopback(settings.expVisionBaseUrl)) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
-        ImGui::TextWrapped("No API key for this cloud vision endpoint — the split is skipped "
-                           "and the command model handles vision.");
+    if (ui::baseUrlIsLoopback(settings.expVisionBaseUrl)) {
+        dimText("Local loopback endpoint — no API key required.");
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped("Cloud credentials are managed under Settings \xe2\x86\x92 Providers "
+                           "and saved only after validation. This override no longer accepts an "
+                           "unvalidated key.");
         ImGui::PopStyleColor();
     }
 }
@@ -5735,6 +5676,26 @@ namespace ui {
 // Forward to it. (:: is required: unqualified here would resolve to this wrapper.)
 bool drawHarnessSessionKnobs(AppState& st, float sc) {
     return ::drawHarnessSessionKnobs(st, sc);
+}
+
+void beginExternalProviderSignIn(AppState& st, const std::string& provider) {
+    ::beginOmpOAuth(st, provider, /*externalOwner=*/true);
+}
+
+ExternalProviderSignInStatus pollExternalProviderSignIn(AppState& st) {
+    ::pollOmpOAuth(st);
+    const OmpOAuthFlow& f = s_omp.oauth;
+    ExternalProviderSignInStatus out;
+    out.active = f.active;
+    out.connected = f.status == "connected" || f.credentialSaved;
+    out.browserOpened = f.browserOpened;
+    out.provider = f.provider;
+    out.status = f.status;
+    out.progress = f.progress;
+    out.instructions = f.instructions;
+    out.url = !f.url.empty() ? f.url : f.launchUrl;
+    out.error = !f.manualError.empty() ? f.manualError : f.error;
+    return out;
 }
 
 void drawSettingsModal(AppState& st, bool busy) {
@@ -7801,25 +7762,15 @@ void drawSettingsModal(AppState& st, bool busy) {
                     settingsGlassSectionEnd();
 
                     settingsGlassSectionBegin("##prov_moonshot", "Moonshot (Kimi)");
-                    dimText("Configured but not the active provider. Store a key to park credit; "
-                            "pick a Kimi model later when you want to use it.");
-                    ImGui::TextUnformatted("API key (platform.moonshot.ai)");
-                    ImGui::SetNextItemWidth(-1);
-                    if (ImGui::InputText("##settings_moonshot_key", st.settings.moonshotKey,
-                                         sizeof(st.settings.moonshotKey),
-                                         ImGuiInputTextFlags_Password)) {
-                        saveSettings(st.settings);
-                    }
-                    {
-                        const bool have = st.settings.moonshotKey[0] != '\0';
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                            have ? ui::Palette::toU32(ui::palette.statusOk)
-                                 : ui::Palette::toU32(ui::palette.statusWarn));
-                        ImGui::TextUnformatted(have
-                            ? "key set \xe2\x80\x94 Kimi models appear in the picker when enabled"
-                            : "no key \xe2\x80\x94 paste a Moonshot API key when you have credit");
-                        ImGui::PopStyleColor();
-                    }
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          ui::Palette::toU32(ui::palette.statusWarn));
+                    ImGui::TextWrapped("The validated provider service is temporarily unavailable. "
+                                       "Reconnect the engine before adding a Moonshot key; "
+                                       "Chudware will not save an unvalidated credential.");
+                    ImGui::PopStyleColor();
+                    if (ImGui::SmallButton("Where do I get a Moonshot key?"))
+                        ui::openExternalHttpUrl(
+                            "https://platform.moonshot.ai/console/api-keys");
                     settingsGlassSectionEnd();
 
                     settingsGlassSectionBegin("##prov_accounts", "Accounts");
@@ -7882,6 +7833,9 @@ void drawSettingsModal(AppState& st, bool busy) {
         if (primaryButton("Close", ImVec2(110.0f * sc, 32.0f * sc))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
+
+    // Submitted last so the first-run flow stays topmost over Settings/About.
+    ui::drawOnboarding(st, busy);
 }
 
 }  // namespace ui

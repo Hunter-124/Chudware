@@ -41,7 +41,7 @@ Day 4 adds the hardware path: probe-rs (MIT/Apache-2.0) for DAP flash and debug,
 - check.py: pre-existing FAIL (feature_surface_audit, parity_audit) — not from T-C4
 - core CMake/Ninja: PASS
 - ctest: PASS
-- pytest engine/doc agent: pre-existing FAIL (OCP module not installed in venv — `ModuleNotFoundError: No module named 'OCP'`) — not from T-C4; present on master before this branch
+- pytest engine/doc services/agent: pre-existing FAIL (OCP module not installed in venv — `ModuleNotFoundError: No module named 'OCP'`) — not from T-C4; present on master before this branch
 - ui/imgui: PASS
 - firmware test suite: 118/118 passed (87 baseline C1-C3 + 31 new T-C4)
 

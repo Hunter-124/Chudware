@@ -28,9 +28,9 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))                      # for flamegraph
-sys.path.insert(0, str(_HERE.parent))               # for mcp_server.core_bridge
+sys.path.insert(0, str(_HERE.parent))               # for services.mcp.core_bridge
 
-from mcp_server import core_bridge as cb  # noqa: E402
+from services.mcp import core_bridge as cb  # noqa: E402
 import flamegraph  # noqa: E402
 
 

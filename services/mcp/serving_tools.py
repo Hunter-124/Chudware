@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from mcp_server.cad_tools import _dumps, _err
+from services.mcp.cad_tools import _dumps, _err
 
 
 def register_serving_tools(mcp: FastMCP) -> None:

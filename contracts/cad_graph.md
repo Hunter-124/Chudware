@@ -147,7 +147,7 @@ Graphify/Sourcegraph analogue over CAD projects: how parts/features/mates/BOM/do
     `cad_graph_config_set {office_content?|office_max_chars?|office_kinds?|
     linked_projects?|project_key?} -> {ok, config}` (`invalid_field` /
     `invalid_project`).
-- MCP (family `cad`, `mcp_server/graph_tools.py`): `plm_graph_keyword`,
+- MCP (family `cad`, `services/mcp/graph_tools.py`): `plm_graph_keyword`,
   `plm_graph_search`, `plm_graph_neighbors`, `plm_graph_links` (list/remove),
   `plm_graph_watch`, `plm_graph_changes`, `plm_graph_configure`, `plm_graph_suggest`
   (heuristic link suggestions: same_folder / name_match / shared_keyword /

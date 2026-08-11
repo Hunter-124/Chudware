@@ -15,19 +15,11 @@ Run:  CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so \
 """
 from __future__ import annotations
 
-import sys
 import uuid
-from pathlib import Path
-
-# Same T-V3-hardened path bootstrap as test_cad_tools.py (resolve() first so the
-# mcp_server/ symlink and the real services/mcp/ path both land on repo root).
-_REPO_ROOT = str(Path(__file__).resolve().parents[2])
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 import pytest
 
-from mcp_server import core_bridge as cb
+from services.mcp import core_bridge as cb
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),

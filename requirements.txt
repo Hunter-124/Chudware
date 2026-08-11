@@ -84,6 +84,14 @@ langgraph-checkpoint-sqlite>=3.1.0  # MIT — sqlite checkpointer imported by se
 pydantic>=2.0.0       # MIT — FastMCP tool arg schemas (indirect, via mcp package)
 qrcode>=7.0           # MIT — QR code generation used by engine_oracle/
 lib3mf>=2.5.0         # BSD — 3MF mesh file I/O (T-V4 audit: installed but undeclared)
+# pyyaml is a DIRECT import of product code, not a transitive or test-only dep: 17 files under
+# services/ import it, including services/agent/{routing,local_runtime,role_models,design_recipe,
+# roles,councils,effort,tiers}.py, services/agent/skills/__init__.py,
+# services/agent/advisor/triggers.py and services/parts/bolts_loader.py. It went undeclared until
+# the first CI run, where scripts/advertised_tool_audit.py importing services.mcp.tool_registry
+# raised ModuleNotFoundError("No module named 'yaml'") on every runner. Pinned to the same version
+# Webservice/gateway/requirements.txt uses so the two environments cannot drift.
+pyyaml==6.0.3         # MIT — YAML config/catalog loader
 
 # user-authenticated headless-browser acquisition (T-X1, Hunter directive 2026-07-04).
 # Apache-2.0. Chosen over Selenium/Puppeteer-node: first-party async+sync Python API and

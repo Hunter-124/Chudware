@@ -2,7 +2,7 @@
 
 Scope: `scratch/omp-src/packages/{coding-agent,agent,ai}` (pinned 6ae7cdbf) +
 `omp-inspection/oh-my-pi/packages/mnemopi` (MCP server authoring example — no
-standalone `mcp_server` top-level dir exists in the inspection clone; the
+standalone `services.mcp` top-level dir exists in the inspection clone; the
 canonical example server lives at `packages/mnemopi/src/mcp-server.ts`).
 
 ## 1. DAP / Debugger integration — **PORT** (S-M effort, highest-value reuse)

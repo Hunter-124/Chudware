@@ -35,7 +35,7 @@ from services import paths
 from .base import Provider
 from . import sub_auth
 
-log = logging.getLogger("agent.providers.kimi_sub")
+log = logging.getLogger("services.agent.providers.kimi_sub")
 
 PROVIDER_ID = "kimi-sub"
 # The Kimi Code endpoint now takes real per-model wire ids: k3 (1M ctx), k3-256k,

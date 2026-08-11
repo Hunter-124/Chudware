@@ -17,10 +17,10 @@ def _prompts_dir() -> Path:
     if d and Path(d).is_dir():
         return Path(d)
     # Fall backs: the staged dist prompts, then the repo source prompts.
-    staged = cb.dist_dir() / "app" / "agent" / "prompts"
+    staged = cb.dist_dir() / "app" / "services" / "agent" / "prompts"
     if staged.is_dir():
         return staged
-    return cb._repo_root() / "agent" / "prompts"
+    return cb._repo_root() / "services" / "agent" / "prompts"
 
 
 def _read_prompt(rel: str) -> str:
@@ -710,7 +710,7 @@ def cad_guide_text(topic: str = "overview") -> str:
         # read-only w.r.t. that node's write-set; lazy-import so the guide degrades to a pointer
         # if that package isn't present and picks up the real text the moment it lands.
         try:
-            from deliverables import DELIVERABLES_GUIDE  # noqa: PLC0415
+            from services.deliverables import DELIVERABLES_GUIDE  # noqa: PLC0415
             return DELIVERABLES_GUIDE
         except ImportError:
             return ("Deliverables (spec-driven .pptx/.docx/.pdf/.xlsx with a provenance rule) ship "
@@ -807,7 +807,7 @@ def cad_guide_text(topic: str = "overview") -> str:
         # file stays read-only w.r.t. that node's write-set; lazy-import so cad_guide("reverse")
         # works TODAY (degrades to a pointer) and picks up the real guide the moment it lands.
         try:
-            from mcp_server.recon_tools import _RE_GUIDE  # noqa: PLC0415
+            from services.mcp.recon_tools import _RE_GUIDE  # noqa: PLC0415
             return _RE_GUIDE
         except ImportError:
             return ("Reverse-engineering guide ships with the recon tools (wave 3); use "

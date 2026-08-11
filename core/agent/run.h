@@ -72,7 +72,7 @@ std::string sanitize_part_name(std::string name);
 //                is_sub_run?,      // true inside nested units (disables further delegate)
 //                firm_role_seed?   // specialist prompt prefix for eng_firm sub-runs
 //               }. run_id overrides the generated uuid hex[:12]; prompts_dir overrides
-//               CHUDWARE_PROMPTS_DIR (the gate points both engines at the same agent/prompts).
+//               CHUDWARE_PROMPTS_DIR (the gate points both engines at the same services/agent/prompts).
 //
 // Returns {run_id, status, stop_reason, revision, doc_id, execution_style?} — or on plan_only
 // success {status:"plan_ready", plan, stop_reason:"plan_only"|"awaiting_plan_approval", ...}.

@@ -1,6 +1,6 @@
 # services/agent — built-in agent loop & provider adapters
 
-Scope: services/agent/** (Python service root `agent` symlink — agent support services: provider adapters, agent_turn, roles/playbooks; the autonomous design loop itself is C++ in core/agent/)
+Scope: services/agent/** (agent support services: provider adapters, agent_turn, roles/playbooks; the autonomous design loop itself is C++ in core/agent/)
 Contracts: contracts/worker_rpc.md (protocol 2), contracts/events.md
 
 ## Entry points
@@ -24,7 +24,7 @@ Autonomous part design runs in the C++ core (`core/agent/run.cpp`, `agent_run_v2
 - Gotcha: offline mode is enforced twice: at provider resolution (config.py:132) AND at loop start (config.py:847); disable via config.json `"offline_mode": false` or `CHUDWARE_PROVIDER` env var override
 - Gotcha: `MockProvider` replies use fixed scripts; for real design, configure ANTHROPIC_API_KEY env var or %APPDATA%/Chudware/config.json
 - `pytest services/agent/test_roles.py -q` — role cards + playbooks + handoff/GBNF machinery (T-W7), fully headless (no engine, no LLM); includes a self-contained GBNF acceptor
-- Gotcha (T-W7): role allowlist enforcement is bound via `mcp_server.tool_registry.set_policy(allow=...)` — the ONE dispatch chokepoint; the loader flags `delegate`/`workspace_status` as not-yet-registered (they land with sibling W tasks), not as errors
+- Gotcha (T-W7): role allowlist enforcement is bound via `services.mcp.tool_registry.set_policy(allow=...)` — the ONE dispatch chokepoint; the loader flags `delegate`/`workspace_status` as not-yet-registered (they land with sibling W tasks), not as errors
 
 ## Graphify starters
 - graphify explain "built-in agent loop"

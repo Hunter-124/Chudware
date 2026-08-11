@@ -2,7 +2,7 @@
 
 No network: SDK-backed adapters (openai/anthropic/openrouter) are importorskip'd; the
 dependency-free gemini adapter and the neutral helpers/classification always run.
-Lives under agent/ (gate runs `pytest engine/doc agent`).
+Lives under agent/ (gate runs `pytest engine/doc services/agent`).
 """
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ import types
 
 import pytest
 
-from agent import config
-from agent.providers import base
+from services.agent import config
+from services.agent.providers import base
 
 
 def _png(tmp_path):
@@ -65,7 +65,7 @@ def test_assert_offline_safe_refuses_openrouter_when_offline():
 
 # ------------------------------------------------------------------ gemini wire shape (§1)
 def test_gemini_parts_text_and_image(tmp_path):
-    from agent.providers.gemini_provider import GeminiProvider
+    from services.agent.providers.gemini_provider import GeminiProvider
 
     g = GeminiProvider(api_key="k")
     assert g.name == "gemini"
@@ -78,7 +78,7 @@ def test_gemini_parts_text_and_image(tmp_path):
 # ------------------------------------------------------------------ openai-family (§1, needs SDK)
 def test_openai_wire_shape(tmp_path):
     pytest.importorskip("openai")
-    from agent.providers.openai_provider import OpenAIProvider
+    from services.agent.providers.openai_provider import OpenAIProvider
 
     o = OpenAIProvider(api_key="k", base_url="http://127.0.0.1:1234/v1")
     assert o._content(base.text_part("hi")) == {"type": "text", "text": "hi"}
@@ -91,7 +91,7 @@ def test_openai_wire_shape(tmp_path):
 
 def test_openrouter_pins_openrouter_base_url():
     pytest.importorskip("openai")
-    from agent.providers.openrouter_provider import OpenRouterProvider, BASE_URL
+    from services.agent.providers.openrouter_provider import OpenRouterProvider, BASE_URL
 
     r = OpenRouterProvider(api_key="sk-or-x")
     assert r.name == "openrouter"

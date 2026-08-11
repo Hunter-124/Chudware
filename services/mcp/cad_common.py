@@ -843,7 +843,7 @@ def _captioned_render(png: str, doc_id: str, views: list,
     if extra:
         tail = (tail + " " + extra).strip() if tail else extra.strip()
     try:
-        from mcp_server.gsl_tools import _scene_caption
+        from services.mcp.gsl_tools import _scene_caption
         caption = _scene_caption(doc_id, views)
         return [Image(path=png), (caption + " " + tail).strip() if tail else caption]
     except Exception:  # noqa: BLE001

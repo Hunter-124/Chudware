@@ -59,7 +59,7 @@ Two evaluation paths, mirroring regen_fix's fixture/live split:
   * fixture mode (offline, default): pure data — claims vs known_geometry from committed
     JSON fixtures under training/benches/vlm/scenes/. No C++ core, no model call.
   * live mode (core present): GUARDED. `_core_available()` probes whether
-    `mcp_server.core_bridge` importable (never a hardcoded sibling .so path) and records
+    `services.mcp.core_bridge` importable (never a hardcoded sibling .so path) and records
     an honest skip-with-reason when it is not. `score_example(..., live_check=...)` is the
     extension point for cross-checking a fixture's known_geometry against a real
     `describe_scene()` call once a fixture carries a live `doc_id` — none do today (the
@@ -180,8 +180,8 @@ def deterministic_claims(known_geometry: list[dict]) -> list[dict]:
 
 def _core_available() -> tuple[bool, str]:
     try:
-        from mcp_server import core_bridge as cb  # noqa: F401  (availability probe only)
-        return True, "mcp_server.core_bridge importable"
+        from services.mcp import core_bridge as cb  # noqa: F401  (availability probe only)
+        return True, "services.mcp.core_bridge importable"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"[:160]
 

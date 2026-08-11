@@ -65,7 +65,7 @@ second machine gets the same hash from the same bytes (DoD).
 the extension points for cross-checking a fixture's known geometry against a real
 `describe_scene()` call once a fixture carries a live `doc_id` — none do today (rendered
 PNGs are optional; this bench scores claims-vs-facts, not pixels). `_core_available()`
-probes `mcp_server.core_bridge` import only (never a hardcoded sibling `.so` path) and
+probes `services.mcp.core_bridge` import only (never a hardcoded sibling `.so` path) and
 records skip-with-reason in `aggregate.live_core` without gating the offline score.
 
 **Run:**

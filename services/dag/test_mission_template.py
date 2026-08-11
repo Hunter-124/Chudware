@@ -11,7 +11,7 @@ Run: pytest services/dag/test_mission_template.py -q
 """
 from __future__ import annotations
 
-from dag.mission_template import build_mission_graph
+from services.dag.mission_template import build_mission_graph
 
 
 def _minimal_manifest() -> dict:

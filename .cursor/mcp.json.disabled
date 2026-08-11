@@ -4,7 +4,7 @@
       "command": "/home/hunter/Repositories/CAD/.venv-mcp/bin/python",
       "args": [
         "-m",
-        "mcp_server.server"
+        "services.mcp.server"
       ],
       "cwd": "/home/hunter/Repositories/CAD",
       "env": {

@@ -25,16 +25,16 @@ import threading
 import pytest
 
 # Self-heal against sweep pollution: test_dimension_scheme.py (and friends) install a
-# STUB mcp_server.core_bridge (call -> {}) into sys.modules at import time, which in a
+# STUB services.mcp.core_bridge (call -> {}) into sys.modules at import time, which in a
 # whole-directory pytest sweep would make every engine call here return {}. A stub
 # ModuleType has no __file__; evict it and import the real bridge.
-_cb_mod = sys.modules.get("mcp_server.core_bridge")
+_cb_mod = sys.modules.get("services.mcp.core_bridge")
 if _cb_mod is not None and not getattr(_cb_mod, "__file__", None):
-    for _name in ("mcp_server.core_bridge", "services.mcp.core_bridge", "core_bridge"):
+    for _name in ("services.mcp.core_bridge", "services.mcp.core_bridge", "core_bridge"):
         _stub = sys.modules.get(_name)
         if _stub is not None and not getattr(_stub, "__file__", None):
             del sys.modules[_name]
-cb = importlib.import_module("mcp_server.core_bridge")
+cb = importlib.import_module("services.mcp.core_bridge")
 
 
 def _apply(doc_id, ops):

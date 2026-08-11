@@ -1233,7 +1233,7 @@ def _apply_role_tool_policy(role_card: Any) -> None:
     dispatch enforcement point). Best-effort — a missing registry never breaks the
     run."""
     try:
-        from mcp_server import tool_registry as reg  # noqa: PLC0415
+        from services.mcp import tool_registry as reg  # noqa: PLC0415
         role_card.apply_tool_policy(reg)
     except Exception:  # noqa: BLE001
         pass
@@ -1248,7 +1248,7 @@ def _snapshot_tool_policy() -> "Optional[Callable[[], None]]":
     private fields deliberately — there is no public getter — with the same
     best-effort discipline as ``_apply_role_tool_policy``."""
     try:
-        from mcp_server import tool_registry as reg  # noqa: PLC0415
+        from services.mcp import tool_registry as reg  # noqa: PLC0415
         prev_allow = set(reg._ACTIVE_ALLOW) if reg._ACTIVE_ALLOW is not None else None
         prev_deny = set(reg._ACTIVE_DENY_RISK) if reg._ACTIVE_DENY_RISK is not None else None
         prev_set = bool(reg._POLICY_SET)

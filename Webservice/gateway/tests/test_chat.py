@@ -25,7 +25,7 @@ class _User:
 
 
 @pytest.fixture()
-def chat_env(tmp_path, monkeypatch):
+def chat_env(pg, tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setenv("CHUDWARE_WEB_DATA_ROOT", str(data))
@@ -38,8 +38,6 @@ def chat_env(tmp_path, monkeypatch):
     import chat  # type: ignore
 
     config.settings = config.load_settings()
-    chat.settings = config.settings
-    chat._DB_READY = False
     chat.presence = chat.Presence()
     chat.hub = chat.Hub()
     return chat, config, data
@@ -97,7 +95,12 @@ def test_history_roundtrip(chat_env):
         assert msgs[0]["display"] == "Alice"
         assert msgs[1]["text"] == "second"
         assert msgs[1]["user"] == "bob@example.com"
-        assert (data / "chat.db").exists()
+        # Persisted, not merely fanned out in memory.
+        import db  # type: ignore
+
+        with db.tx() as cur:
+            cur.execute("SELECT text FROM messages ORDER BY id")
+            assert [r["text"] for r in cur.fetchall()] == ["hello history", "second"]
 
 
 def test_ws_broadcast_and_presence(chat_env):

@@ -37,9 +37,9 @@ INDEX_FILE = SAMPLES_DIR / "index.json"
 def cb():
     """core_bridge handle — skip entire session if libchudware is not available."""
     try:
-        from mcp_server import core_bridge as _cb
+        from services.mcp import core_bridge as _cb
     except ImportError:
-        pytest.skip("mcp_server not importable (PYTHONPATH not set?)")
+        pytest.skip("services.mcp not importable (PYTHONPATH not set?)")
     if not _cb.available():
         pytest.skip("libchudware not available — set CHUDWARE_LIBCHUDWARE=<path>")
     return _cb

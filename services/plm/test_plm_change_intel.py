@@ -514,7 +514,7 @@ def test_visual_compare_degrades_without_engine(tmp_path, monkeypatch):
         def available():
             return False
 
-    monkeypatch.setitem(__import__("sys").modules, "mcp_server", None)
+    monkeypatch.setitem(__import__("sys").modules, "services.mcp", None)
     out = cmp_mod.visual_compare(_part(3.0), _part(5.0), tmp_path / "viz")
     assert out["degraded"] is True
     assert out["reason"] == "engine_unavailable"

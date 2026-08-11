@@ -16,7 +16,7 @@ Pipeline (seeded / deterministic)::
     6. ``optimize_traces`` (E2)  — arc corners / teardrops / impedance (optional)
     7. DRC                       — residual violations returned honestly (never hidden)
 
-The MCP wrappers in :mod:`mcp_server.ecad_tools` call this module and wrap the
+The MCP wrappers in :mod:`services.mcp.ecad_tools` call this module and wrap the
 result in the standard compact ``ok/hint/next_actions`` envelope.
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ from typing import Any, Optional, Union
 from services.ecad import place as place_mod  # STAYS (T-RF20): no C++ counterpart
 from services.ecad import trace_opt as trace_opt_mod  # STAYS (T-RF20): no C++ counterpart
 
-from mcp_server.ecad_common import (
+from services.mcp.ecad_common import (
     OpError,
     _compile_of,
     _rpc,
@@ -658,7 +658,7 @@ def board_from_schematic(
 def autoplace_board(pcb_session_or_doc: Any, opts: Optional[dict] = None) -> dict:
     """Connectivity-aware placement on an active board (standalone tool helper).
 
-    Accepts a PCB session (:class:`mcp_server.ecad_common.EcadSession`) or ``doc_id``.
+    Accepts a PCB session (:class:`services.mcp.ecad_common.EcadSession`) or ``doc_id``.
     Pure :func:`engine.ecad.place.place_board` + ``swap_doc`` write-back (T-RF20: the
     write-back goes through the C++-backed session facade).
     """

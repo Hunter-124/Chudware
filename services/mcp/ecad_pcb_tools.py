@@ -1680,7 +1680,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
 
     # ---------------------------------------------------------------- board flow (Wave 2b)
     # Deterministic schematic->preliminary-PCB + standalone place/optimize tools.
-    # Engine lives in mcp_server.board_flow (reuses E1 place_board + E2 optimize_traces).
+    # Engine lives in services.mcp.board_flow (reuses E1 place_board + E2 optimize_traces).
 
     @mcp.tool()
     def board_from_schematic(sch_doc_id: str = "", optimize: bool = True,
@@ -1716,7 +1716,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         AUTO-READBACK: compact board ASCII + net_delta + findings. READ it before further
         place/route. Call render_board_ascii before declaring the board done.
         """
-        from mcp_server import board_flow as _bf
+        from services.mcp import board_flow as _bf
 
         sch_id = sch_doc_id or doc_id or _ECAD.get("current_sch")
         if not sch_id:
@@ -1907,7 +1907,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         AUTO-READBACK: compact layer ASCII + courtyard/net findings. READ before routing.
         Call render_board_ascii before declaring the board done.
         """
-        from mcp_server import board_flow as _bf
+        from services.mcp import board_flow as _bf
 
         try:
             session = _get_pcb(doc_id or None)
@@ -1977,7 +1977,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         AUTO-READBACK: compact layer ASCII + net_delta after polish. READ before fill/DRC.
         Call render_board_ascii before declaring the board done.
         """
-        from mcp_server import board_flow as _bf
+        from services.mcp import board_flow as _bf
 
         try:
             session = _get_pcb(doc_id or None)

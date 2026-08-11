@@ -4,7 +4,7 @@
 House style: a plain main() runner. Skips gracefully if libchudware can't be located/
 loaded (e.g. the C++ core hasn't been built) so it never blocks a Python-only run.
 
-    & $py -m mcp_server.test_cam_tools
+    & $py -m services.mcp.test_cam_tools
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import tempfile
 
 import pytest
 
-from mcp_server import core_bridge as cb
+from services.mcp import core_bridge as cb
 
 _HERE = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
 
@@ -88,7 +88,7 @@ def _check_registry_foldin(check) -> None:
     env = dict(os.environ, CHUDWARE_MATERIALS_REGISTRY=p)
     code = (
         "import sys; sys.path[:0]=['services/mcp','.']\n"
-        "from mcp_server import core_bridge as cb\n"
+        "from services.mcp import core_bridge as cb\n"
         "m={x['id']:x for x in cb.call('cam_materials',{})['materials']}\n"
         "print(m['aluminum']['sfm_mill'])\n"
     )
@@ -112,7 +112,7 @@ def _check_registry_foldin(check) -> None:
 def _check_add_setup_material_resolution(check) -> None:
     """DoD (T-M4): cam_add_setup accepts any registry material ID (translated to a cutting group)."""
     try:
-        from mcp_server.cam_tools import _resolve_cam_material
+        from services.mcp.cam_tools import _resolve_cam_material
     except Exception as e:  # noqa: BLE001
         print(f"  skip: cam_add_setup material resolution ({e})")
         return
@@ -334,7 +334,7 @@ def main() -> int:
 
     # cad_guide('cam') text is wired (needs the `mcp` package; skipped if absent).
     try:
-        from mcp_server.cad_tools import cad_guide_text
+        from services.mcp.cad_tools import cad_guide_text
         g = cad_guide_text("cam")
         check("CAM / MACHINING GUIDE" in g, "cad_guide('cam') returns the CAM guide")
         cond = ("cam_post" in g) and ("cam_extract" in g)
@@ -436,7 +436,7 @@ def _call_tool(mcp, name, args):
 
 
 def test_cam_add_tool_changes_field(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     def fake_call(method, params=None):
@@ -472,7 +472,7 @@ def test_cam_add_tool_changes_field(monkeypatch):
 # --------------------------------------------------------------------------------------- #
 def test_resolve_tool_type_vocabulary_and_aliases():
     """Pure-Python: the accepted set, the mapped short forms, and the rejections."""
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
 
     # Every id in the kTool mirror is accepted and returned unchanged.
     for tid in ct._TOOL_TYPES_KTOOL:
@@ -496,7 +496,7 @@ def test_resolve_tool_type_vocabulary_and_aliases():
 
 
 def test_resolve_tool_type_error_names_the_valid_set():
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
 
     with pytest.raises(ValueError) as ei:
         ct._resolve_tool_type("wobble_mill")
@@ -512,7 +512,7 @@ def test_resolve_tool_type_folds_in_the_live_engine_enum(monkeypatch):
     """The vocabulary is the ENGINE's cam_tool_types unioned with the mirror, so a type
     the engine gains is never rejected by a stale Python list — and an unreachable
     engine must not pin the mirror-only floor for the rest of the process."""
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
 
     monkeypatch.setitem(ct._TOOL_TYPES_CACHE, "ids", None)
     monkeypatch.setattr(ct.cb, "call", lambda m, p=None: {
@@ -531,7 +531,7 @@ def test_resolve_tool_type_folds_in_the_live_engine_enum(monkeypatch):
 
 def test_cam_add_tool_rejects_unknown_type_without_touching_the_library(monkeypatch):
     """The negative case: no add_tool op reaches the engine, and the response names the set."""
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     applied: list = []
@@ -560,7 +560,7 @@ def test_cam_add_tool_rejects_unknown_type_without_touching_the_library(monkeypa
 def test_cam_add_tool_stores_the_canonical_type_and_matching_name(monkeypatch):
     """A valid type still lands, and an alias lands as the tool it means — record AND
     label. Before the fix, type="ball" stored endmill_flat under the name "T3 ball"."""
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     stored: list = []
@@ -594,7 +594,7 @@ def test_cam_add_tool_stores_the_canonical_type_and_matching_name(monkeypatch):
 
 
 def test_resolve_extract_kind_vocabulary_and_aliases():
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
 
     for kind in ct._EXTRACT_KINDS:
         assert ct._resolve_extract_kind(kind) == kind, kind
@@ -612,7 +612,7 @@ def test_resolve_extract_kind_vocabulary_and_aliases():
 
 def test_cam_extract_rejects_unknown_kind_before_exporting_anything(monkeypatch):
     """A bad kind must cost nothing: no STEP export, no cam_extract RPC."""
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     seen: list = []
@@ -641,7 +641,7 @@ def test_cam_extract_rejects_unknown_kind_before_exporting_anything(monkeypatch)
 
 
 def test_cam_add_setup_changes_field(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     def fake_call(method, params=None):
@@ -670,7 +670,7 @@ def test_cam_add_setup_changes_field(monkeypatch):
 
 
 def test_cam_set_stock_changes_field(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     def fake_call(method, params=None):
@@ -694,7 +694,7 @@ def test_cam_set_stock_changes_field(monkeypatch):
 
 
 def test_cam_add_operation_changes_field(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     def fake_call(method, params=None):
@@ -721,7 +721,7 @@ def test_cam_add_operation_changes_field(monkeypatch):
 
 
 def test_cam_update_operation_changes_field(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     def fake_call(method, params=None):
@@ -741,7 +741,7 @@ def test_cam_update_operation_changes_field(monkeypatch):
 
 
 def test_cam_remove_operation_changes_field(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     def fake_call(method, params=None):
@@ -762,7 +762,7 @@ def test_cam_remove_operation_changes_field(monkeypatch):
 
 
 def test_cam_undo_redo_changes_field(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     state = {"undo_calls": 0}
@@ -798,7 +798,7 @@ def test_cam_save_resolves_path_and_confirms_write(tmp_path, monkeypatch):
     _sanitize_output_path — same convention as cad_exchange_tools/cad_drawing_tools),
     not whatever cwd the engine daemon happens to run under, and the response must
     prove the file actually landed there (exists + size), not just echo the input."""
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     def fake_call(method, params=None):
@@ -826,7 +826,7 @@ def test_cam_save_resolves_path_and_confirms_write(tmp_path, monkeypatch):
 
 
 def test_cam_open_changes_field(monkeypatch, tmp_path):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     def fake_call(method, params=None):
@@ -856,7 +856,7 @@ def test_cam_post_refuses_a_program_with_no_motion(monkeypatch):
     produced no regions generated 0 toolpaths (cam_generate warned "pocket: no regions"),
     and cam_post still answered ok:true / line_count:9 / warnings:[] with
     "G21 G90 G17 G40 M5 M9 M30" — a syntactically valid NC file that machines nothing."""
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     header_only = "( J - S1)\n( post: GRBL )\nG21\nG90\nG17\nG40\nM5\nM9\nM30\n"
@@ -881,7 +881,7 @@ def test_cam_post_refuses_a_program_with_no_motion(monkeypatch):
 def test_cam_post_reports_motion_on_a_real_program(monkeypatch):
     """The gate must not fire on a program that DOES cut: modal continuation lines
     (`X2.659 Y-25.781 Z9.994`) carry most of the motion in every dialect here."""
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     gcode = ("( J - S1)\nG21\nG90\n( T1 6mm )\nS14553 M3\n"
@@ -909,7 +909,7 @@ def test_cam_add_operation_rejects_empty_geometry(monkeypatch):
     """cam_extract returns `{"regions": []}` whenever the section Z misses the part, and
     the operation used to be accepted with a cheerful "pocket2d operation added" — the
     failure only surfaced two calls later as a header-only posted program."""
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     def fake_call(method, params=None):
@@ -931,7 +931,7 @@ def test_cam_generate_digests_the_moves_and_names_an_empty_result(monkeypatch):
     """Measured live 2026-07-30: ONE pocket2d on a 100x60x20 block returned 894,116 chars
     of per-move JSON from cam_generate — bigger than most context windows, and nothing a
     caller can act on that the digest does not carry."""
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     moves = ([{"kind": "rapid", "to": [0, 0, 15]}]
@@ -957,7 +957,7 @@ def test_cam_generate_digests_the_moves_and_names_an_empty_result(monkeypatch):
 
 
 def test_cam_generate_says_so_when_nothing_was_generated(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     def fake_call(method, params=None):
@@ -981,7 +981,7 @@ def test_cam_add_setup_resolves_the_default_offset_stock_against_the_part(monkey
     CAM job never has. Measured live 2026-07-30: a setup built with this tool's OWN default
     stock simulated as {ok:false, error:"stock has zero extent", stock_volume_mm3:0}, while
     the same job with an explicit box gave stock 120000.0 / removed 41936.0."""
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     seen: dict = {}
@@ -1016,7 +1016,7 @@ def test_cam_add_setup_resolves_the_default_offset_stock_against_the_part(monkey
 
 
 def test_cam_add_setup_keeps_an_explicit_box_stock_untouched(monkeypatch):
-    from mcp_server import cam_tools as ct
+    from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
     seen: dict = {}

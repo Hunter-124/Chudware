@@ -28,11 +28,11 @@ probes a scratch hostd with the Python worker bridge disabled — what the WASM 
 
 ### `services/` — the remaining Python
 No engine code; Python lives here only where there is no C++ counterpart:
-- `services/mcp/` (root `mcp_server` symlink) — MCP server, stdio/JSON-RPC, so external
-  agents (Claude Code, Cursor, …) drive the same document as the GUI. Server id `chudware`
-  (`ai-cad` preserved). The `cad_guide` tool carries modeling/CAM/ECAD guidance.
-- `services/agent/` (root `agent` symlink) — the built-in copilot loop, with provider
-  adapters (Anthropic/OpenAI/local).
+- `services/mcp/` — MCP server, stdio/JSON-RPC, so external agents (Claude Code,
+  Cursor, …) drive the same document as the GUI. Server id `chudware` (`ai-cad`
+  preserved). The `cad_guide` tool carries modeling/CAM/ECAD guidance.
+- `services/agent/` — the built-in copilot loop, with provider adapters
+  (Anthropic/OpenAI/local).
 - `services/worker/` + `services/worker_main.py` — the stdio worker hostd spawns for
   services-side methods (worker_client / engine_backend / cpp_core / worker_router).
 - `services/installer/` — provisioning, MCP registration, packaging.

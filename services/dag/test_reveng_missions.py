@@ -46,13 +46,13 @@ def _install_stubs() -> None:
     # below and shadows _doc/_get_part for every sibling test in this pytest
     # session. Only fall back to a stub in an env with no core_bridge at all.
     try:
-        import mcp_server.core_bridge  # noqa: F401
+        import services.mcp.core_bridge  # noqa: F401
         _cb_real = True
     except Exception:  # noqa: BLE001
         _cb_real = False
 
     if not _cb_real:
-        cb_mod = types.ModuleType("mcp_server.core_bridge")
+        cb_mod = types.ModuleType("services.mcp.core_bridge")
         cb_mod.available = lambda: False
         cb_mod.call = lambda method, params=None: {}
 
@@ -60,7 +60,7 @@ def _install_stubs() -> None:
             pass
 
         cb_mod.CoreError = CoreError
-        sys.modules.setdefault("mcp_server.core_bridge", cb_mod)
+        sys.modules.setdefault("services.mcp.core_bridge", cb_mod)
         sys.modules.setdefault("core_bridge", cb_mod)
 
     # Prefer the real ``mcp`` package when it is importable — installing a fake
@@ -96,16 +96,16 @@ def _install_stubs() -> None:
     # Same real-first rule for cad_tools: a bare _dumps/_err stub would shadow the
     # real module and break sibling tests that import _doc/_get_part/etc. from it.
     try:
-        import mcp_server.cad_tools  # noqa: F401
+        import services.mcp.cad_tools  # noqa: F401
         _cad_real = True
     except Exception:  # noqa: BLE001
         _cad_real = False
 
-    if not _cad_real and "mcp_server.cad_tools" not in sys.modules:
-        ct_mod = types.ModuleType("mcp_server.cad_tools")
+    if not _cad_real and "services.mcp.cad_tools" not in sys.modules:
+        ct_mod = types.ModuleType("services.mcp.cad_tools")
         ct_mod._dumps = lambda obj: json.dumps(obj)
         ct_mod._err = lambda e: json.dumps({"ok": False, "error": str(e)})
-        sys.modules["mcp_server.cad_tools"] = ct_mod
+        sys.modules["services.mcp.cad_tools"] = ct_mod
 
 
 _install_stubs()

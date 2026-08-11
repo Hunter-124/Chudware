@@ -5,8 +5,8 @@
 stdio MCP server exposing CAD tools to external agents (Claude Code, Cursor, etc.).
 
 ## Entry points
-- `python -m mcp_server.server`
-- `python -m mcp_server.test_roundtrip`
+- `python -m services.mcp.server`
+- `python -m services.mcp.test_roundtrip`
 
 ## Layout (T-RF8)
 - `cad_tools.py` / `ecad_tools.py` / `reveng_tools.py` are compat facades; the tools live

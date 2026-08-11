@@ -712,7 +712,7 @@ def bench_structural() -> None:
 # resolution (_resolve_face_points, doc_export_step, ...) that lives in the registered
 # MCP tools (run_fea_static / run_fea_modal) — raw core_bridge.call("sim_run_static", ...)
 # cannot do this itself. So we call the FULL FastMCP server in-process, exactly like
-# services/mcp/test_roundtrip.py and services/mcp/test_cad_tools.py do (mcp_server.server.mcp
+# services/mcp/test_roundtrip.py and services/mcp/test_cad_tools.py do (services.mcp.server.mcp
 # .call_tool), never a bare core_bridge FFI call and never a real subprocess (the "full MCP
 # server" distinction is tool-registration-vs-raw-FFI, not process boundary).
 # ===========================================================================
@@ -720,7 +720,7 @@ def bench_structural() -> None:
 def _mcp_call(name: str, args: dict) -> dict:
     """Call a registered MCP tool in-process through the full FastMCP server."""
     import asyncio
-    from mcp_server import server
+    from services.mcp import server
     _content, structured = asyncio.run(server.mcp.call_tool(name, args))
     text = structured.get("result") if isinstance(structured, dict) else None
     if isinstance(text, str):
@@ -732,15 +732,15 @@ def _mcp_call(name: str, args: dict) -> dict:
 
 
 def _fea_ready() -> tuple[bool, str]:
-    """Whether the C++ engine is staged and reachable through mcp_server.core_bridge."""
+    """Whether the C++ engine is staged and reachable through services.mcp.core_bridge."""
     lib_path = os.environ.get("CHUDWARE_LIBCHUDWARE", "")
     if not lib_path or not os.path.exists(lib_path):
         return False, ("CHUDWARE_LIBCHUDWARE not set — C++ FEA is only reachable through the "
                         "full MCP server (run_fea_static/run_fea_modal)")
     try:
-        from mcp_server import core_bridge as cb
+        from services.mcp import core_bridge as cb
     except ImportError as exc:
-        return False, f"mcp_server import failed: {exc}"
+        return False, f"services.mcp import failed: {exc}"
     if not cb.available():
         return False, "core_bridge reports libchudware not loadable"
     return True, ""
@@ -764,7 +764,7 @@ _VV_STEEL = {"name": "vv-steel", "E_mpa": 200000.0, "nu": 0.3,
 def _build_box_part(name: str, length: float, width: float, height: float) -> str:
     """Build a single-box part via the full MCP server (X=length, Y=width, Z=height —
     core/doc/document.cpp:6717); returns doc_id."""
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
     r = _mcp_call("new_part", {"name": name})
     if "doc_id" not in r:
         raise RuntimeError(f"new_part failed: {r}")

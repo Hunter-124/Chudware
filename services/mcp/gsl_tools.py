@@ -25,11 +25,11 @@ from typing import Annotated, Any, Optional, Union
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from mcp_server import core_bridge as cb
-from mcp_server.cad_common import (_NON_BODY_FEATURE_TYPES, _face_attribution,
+from services.mcp import core_bridge as cb
+from services.mcp.cad_common import (_NON_BODY_FEATURE_TYPES, _face_attribution,
                                    _solid_feature_order, coerce_json_or_repr, require_list)
-from mcp_server.cad_tools import _doc, _dumps, _err
-from mcp_server.fit_narration import _format_fit  # single home (T-F8); loop.py shares it
+from services.mcp.cad_tools import _doc, _dumps, _err
+from services.mcp.fit_narration import _format_fit  # single home (T-F8); loop.py shares it
 
 
 def _axis_order(faces: list) -> Optional[dict]:
@@ -771,7 +771,7 @@ def _study_bc_faces(doc_id: str, study: dict) -> dict:
 
 def _describe_toolpaths_text(job_id: Optional[str] = None, audit: bool = True) -> str:
     """Narrate a CAM job's toolpaths — data from cam_tree, cam_simulate, cam_post, cam_audit."""
-    from mcp_server.cam_tools import _CAM  # shared job state  # noqa: PLC0415
+    from services.mcp.cam_tools import _CAM  # shared job state  # noqa: PLC0415
 
     jid = job_id or _CAM.get("doc_id")
     if not jid:
@@ -1202,7 +1202,7 @@ def _describe_board_text(doc_id: str) -> str:
     3. engine.ecad.erc.run_erc → ERC/DRC violation summary
     """
     # T-RF20: the session/netlist facades route to the C++ core via core_bridge RPCs.
-    from mcp_server.ecad_common import _compile_of, ecad_session, netlist_mod  # noqa: PLC0415
+    from services.mcp.ecad_common import _compile_of, ecad_session, netlist_mod  # noqa: PLC0415
 
     did = doc_id or ""
     try:

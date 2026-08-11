@@ -13,7 +13,7 @@ from __future__ import annotations
 # --- pytest import-shadow repair --------------------------------------------------------
 # Under `python3 -m pytest services/mcp/test_gsl_tools.py` pytest's default (prepend)
 # import mode names this module `mcp.test_gsl_tools` — this directory has an __init__.py,
-# so the PACKAGE `mcp` becomes services/mcp, shadowing the `mcp` SDK that mcp_server's
+# so the PACKAGE `mcp` becomes services/mcp, shadowing the `mcp` SDK that services.mcp's
 # tool modules import (`from mcp.server.fastmcp import FastMCP`). Repair sys.modules:
 # load the real SDK package as `mcp`, keeping this directory on its __path__ so pytest
 # can still import sibling test modules as `mcp.test_*`.
@@ -24,7 +24,7 @@ import sys
 _HERE = os.path.dirname(os.path.realpath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)  # `mcp_server` (repo-root name of services/mcp)
+    sys.path.insert(0, _REPO_ROOT)  # `services.mcp` (repo-root name of services/mcp)
 
 
 def _unshadow_mcp_sdk() -> None:
@@ -52,7 +52,7 @@ import re  # noqa: E402
 
 import pytest  # noqa: E402
 
-from mcp_server import core_bridge as cb  # noqa: E402
+from services.mcp import core_bridge as cb  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
@@ -62,7 +62,7 @@ pytestmark = pytest.mark.skipif(
 
 def _call(name: str, args: dict):
     """Invoke a registered MCP tool; return (parsed_json_or_None, content_list)."""
-    from mcp_server import server
+    from services.mcp import server
 
     content, structured = asyncio.run(server.mcp.call_tool(name, args))
     text = structured.get("result") if isinstance(structured, dict) else None
@@ -300,7 +300,7 @@ def test_describe_scene_default_views():
 
 def test_describe_toolpaths_no_job_graceful():
     """describe_toolpaths with no active CAM job returns a graceful error, not a crash."""
-    from mcp_server.cam_tools import _CAM
+    from services.mcp.cam_tools import _CAM
     old = _CAM.get("doc_id")
     _CAM["doc_id"] = None
     try:

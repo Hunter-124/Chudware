@@ -5,7 +5,7 @@
 ; (Start Menu entry, Programs-and-Features uninstall entry, a single .exe to hand a user).
 ;
 ; Build (on a Windows host with Inno Setup 6 installed — ISCC.exe on PATH):
-;   1. python -m installer.build_release --zip          (produces dist\Chudware\...)
+;   1. python -m services.installer.build_release --zip          (produces dist\Chudware\...)
 ;   2. ISCC packaging\windows\chudware.iss /DPayloadDir=dist\Chudware /DAppVersion=1.0.0
 ;
 ; See docs/PACKAGING_WINDOWS.md for the full walkthrough (this repo's Linux box cannot run

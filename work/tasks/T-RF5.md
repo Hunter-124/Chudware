@@ -29,6 +29,6 @@ path: agent_run_v2. MCP freshness rule applies.
 ## Definition of done
 
 - [x] agent_design gone or fully aliased to agent_run_v2; no jobs.cpp Python launcher.
-- [x] loop.py deleted; pytest engine/doc agent green.
+- [x] loop.py deleted; pytest engine/doc services/agent green.
 - [x] Copilot chat e2e verified headless (CHUDWARE_SHOT scenario).
 - [x] gate.sh green; REFACTOR_LOG handoff; MCP instructions/cad_guide refreshed.

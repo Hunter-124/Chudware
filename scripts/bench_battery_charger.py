@@ -34,7 +34,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-# Heavy ECAD tools budget-guarded at import time — set BEFORE mcp_server imports.
+# Heavy ECAD tools budget-guarded at import time — set BEFORE services.mcp imports.
 os.environ.setdefault("CHUDWARE_ECAD_HEAVY_BUDGET_S", "180")
 os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
@@ -146,10 +146,10 @@ def run_leg(name: str, fn: Callable[[Leg], None]) -> Leg:
 
 
 def register_all_tools() -> dict:
-    from mcp_server.ecad_tools import register_ecad_tools
-    from mcp_server.ecad_thermal import register_ecad_thermal_tools
-    from mcp_server.power_budget import register_power_budget_tools
-    from mcp_server.firmware_tools import register_firmware_tools
+    from services.mcp.ecad_tools import register_ecad_tools
+    from services.mcp.ecad_thermal import register_ecad_thermal_tools
+    from services.mcp.power_budget import register_power_budget_tools
+    from services.mcp.firmware_tools import register_firmware_tools
 
     stub = _StubMCP()
     register_ecad_tools(stub)

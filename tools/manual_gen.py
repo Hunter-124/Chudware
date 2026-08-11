@@ -7,7 +7,7 @@ prose:
 
 - ``scripts/feature_surface_audit.ribbon_rows`` — every ribbon command (id/label/tab/group),
   so the "Commands Reference" section covers 100% of the UI surface.
-- ``mcp_server.cad_tools.cad_guide_text`` — the agent's own modeling-guide prose (overview,
+- ``services.mcp.cad_tools.cad_guide_text`` — the agent's own modeling-guide prose (overview,
   simulation, intake, gsl, cam, narration, deliverables, reverse-engineering) and, per-command,
   its per-feature cheatsheets (``fillet``, ``chamfer``, ``shell``, ...) when one exists for a
   ribbon command's id.
@@ -47,7 +47,7 @@ def _ensure_sys_path(repo: Path) -> None:
 
 # --------------------------------------------------------------------------- guide topics
 
-# Fixed, documented order (matches the topic list in mcp_server.cad_tools.cad_guide_text's own
+# Fixed, documented order (matches the topic list in services.mcp.cad_tools.cad_guide_text's own
 # "No guide for ..." fallback message) — deterministic regardless of dict/set iteration.
 GUIDE_TOPICS = [
     "overview", "review", "simulation", "intake", "gsl", "cam", "narration",
@@ -79,7 +79,7 @@ def collect(repo: Path) -> dict:
         ribbon = []
 
     try:
-        from mcp_server.cad_tools import cad_guide_text  # noqa: PLC0415
+        from services.mcp.cad_tools import cad_guide_text  # noqa: PLC0415
     except Exception:  # noqa: BLE001 - guide is best-effort; the inventory is the real spine
         cad_guide_text = None
 
@@ -313,7 +313,7 @@ def build_report_spec(data: dict, fmt: str = "pdf") -> dict:
 def render_pdf(repo: Path, spec: dict) -> dict:
     """Best-effort render via deliverables.make_report; never raises."""
     try:
-        from deliverables import make_report  # noqa: PLC0415
+        from services.deliverables import make_report  # noqa: PLC0415
     except ImportError as e:
         return {"ok": False, "reason": "import_error", "hint": str(e)}
     try:

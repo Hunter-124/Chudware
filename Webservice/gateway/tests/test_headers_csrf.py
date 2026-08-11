@@ -22,23 +22,45 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 from fastapi.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
+from gateway import accounts  # noqa: E402
 from gateway import app as app_mod  # noqa: E402
 from gateway import chat as chat_mod  # noqa: E402
+from gateway import db  # noqa: E402
 from gateway.config import settings  # noqa: E402
 from gateway.limits import RateLimiter  # noqa: E402
 
 
+def _seed(email: str, display: str, *, admin: bool = False) -> None:
+    """Register and activate one account, optionally promoting it.
+
+    accounts.py deliberately exposes no role setter — admin is granted through
+    the admin API and never self-assigned — so the promotion is a direct row
+    update here rather than a public call that does not (and should not) exist.
+    """
+    accounts.ensure_account(email, display=display)
+    accounts.set_status(email, "active", decided_by="test")
+    if admin:
+        with db.tx() as cur:
+            cur.execute(
+                "UPDATE accounts SET role = 'admin' WHERE email = %s", (email,)
+            )
+
+
 @pytest.fixture(autouse=True)
-def _isolate(tmp_path, monkeypatch):
-    """Per-test data root + clean chat state (mirrors test_gateway)."""
+def _isolate(pg, tmp_path, monkeypatch):
+    """Per-test data root + seeded accounts + clean chat state."""
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setattr(settings, "data_root", data)
     monkeypatch.setattr(settings, "dev_mode", True)
-    monkeypatch.setattr(settings, "users_file", GATEWAY_DIR / "users.yaml")
 
-    # Fresh chat store/hub per test (data_root moved).
-    monkeypatch.setattr(chat_mod, "_DB_READY", False)
+    # One standard user and one admin — the middleware authorizes from these
+    # rows, so every identity these tests present has to exist in the store.
+    _seed("demo@example.com", "Demo User")
+    _seed("boss@example.com", "Boss", admin=True)
+
+    # Fresh fan-out hub per test; history lives in the schema the pg fixture
+    # rebuilt, so there is no store-level flag left to reset.
     monkeypatch.setattr(chat_mod, "hub", chat_mod.Hub())
     return data
 
@@ -47,33 +69,6 @@ def _isolate(tmp_path, monkeypatch):
 def client(_isolate):
     with TestClient(app_mod.app) as c:
         yield c
-
-
-@pytest.fixture
-def _admin_dir(monkeypatch, tmp_path):
-    """Users file with one admin (boss) + one standard user (demo)."""
-    users = tmp_path / "users.yaml"
-    users.write_text(
-        "users:\n"
-        "  - email: boss@example.com\n"
-        "    display: Boss\n"
-        "    role: admin\n"
-        "    heavy: true\n"
-        "  - email: demo@example.com\n"
-        "    display: Demo User\n"
-        "    role: user\n"
-        "    heavy: false\n"
-    )
-    monkeypatch.setattr(settings, "users_file", users)
-    directory = app_mod.user_directory
-    orig_path = directory.path
-    monkeypatch.setattr(directory, "path", users)
-    monkeypatch.setattr(directory, "_mtime", None)
-    directory.reload(force=True)
-    yield directory
-    directory.path = orig_path
-    directory._mtime = None
-    directory.reload(force=True)
 
 
 def _auth(email: str = "demo@example.com") -> dict[str, str]:
@@ -152,13 +147,11 @@ def test_healthz_authenticated_gets_detail(client):
 # ---------------------------------------------------------------------------
 
 
-def test_admin_static_requires_admin_role(client, _admin_dir):
-    # Standard (incl. auto-approved *.ua.edu) users cannot read the admin UI.
+def test_admin_static_requires_admin_role(client):
+    # Standard users cannot read the admin UI.
     for asset in ("admin.js", "admin.html", "admin_terminal.js", "admin_ops.css"):
         r = client.get(f"/static/{asset}", headers=_auth("demo@example.com"))
         assert r.status_code == 403, (asset, r.status_code)
-    r = client.get("/static/admin.js", headers=_auth("student@crimson.ua.edu"))
-    assert r.status_code == 403
     # Admin CAN read admin.js (the /admin page loads it from /static).
     r = client.get("/static/admin.js", headers=_auth("boss@example.com"))
     assert r.status_code == 200
@@ -198,28 +191,34 @@ def test_dev_cookie_no_secure_on_plain_http_localhost(_isolate):
 
 
 def test_auth_middleware_fails_fast_without_strong_auth():
-    """Non-dev with neither CF Access nor the SSO secret must raise at
+    """Non-dev with neither a session secret nor CF Access must raise at
     construction instead of silently running with no working auth path."""
     from gateway.auth import AuthMiddleware
     from gateway.config import Settings
 
     bare = Settings(
-        dev_mode=False, cf_team_domain="", cf_aud="", sso_shared_secret=""
+        dev_mode=False, session_secret="", cf_team_domain="", cf_aud=""
     )
     with pytest.raises(RuntimeError, match="no strong auth"):
-        AuthMiddleware(app_mod.app, cfg=bare, directory=app_mod.user_directory)
+        AuthMiddleware(app_mod.app, cfg=bare)
+
     # Any ONE strong path configured is enough to boot.
+    dev = Settings(
+        dev_mode=True, session_secret="", cf_team_domain="", cf_aud=""
+    )
+    AuthMiddleware(app_mod.app, cfg=dev)
+    # A self-serve deployment signs its own users in and needs no edge IdP.
+    self_serve = Settings(
+        dev_mode=False, session_secret="s3cret", cf_team_domain="", cf_aud=""
+    )
+    AuthMiddleware(app_mod.app, cfg=self_serve)
     cf = Settings(
         dev_mode=False,
+        session_secret="",
         cf_team_domain="https://team.cloudflareaccess.com",
         cf_aud="aud",
-        sso_shared_secret="",
     )
-    AuthMiddleware(app_mod.app, cfg=cf, directory=app_mod.user_directory)
-    sso = Settings(
-        dev_mode=False, cf_team_domain="", cf_aud="", sso_shared_secret="s3cret"
-    )
-    AuthMiddleware(app_mod.app, cfg=sso, directory=app_mod.user_directory)
+    AuthMiddleware(app_mod.app, cfg=cf)
 
 
 # ---------------------------------------------------------------------------

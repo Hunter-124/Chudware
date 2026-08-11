@@ -280,7 +280,7 @@ PY
 
 probe_engine_bridges() {
   local body
-  if ! body="$(curl -fsS --max-time 3 --user "$HEALTH_EMAIL:$HEALTH_SECRET" "$HEALTH_URL/healthz")"; then
+  if ! body="$(curl -fsS --max-time 3 -b "chudware_sid=$HEALTH_SID" "$HEALTH_URL/healthz")"; then
     return 1
   fi
   HEALTH_JSON="$body" "$PYTHON" -c '
@@ -298,7 +298,7 @@ except Exception:
 
 # A caller can require an idle proof even when hostd itself is unchanged (update.sh
 # does this before bouncing the gateway). Ordinary sync only drains for a real
-# hostd/WASM change. Missing secret/account/telemetry is fail-closed.
+# hostd/WASM change. Missing session/account/telemetry is fail-closed.
 REQUIRE_IDLE="${CHUDWARE_WEBD_REQUIRE_IDLE:-0}"
 case "$REQUIRE_IDLE" in 0|1) ;; *) fatal "CHUDWARE_WEBD_REQUIRE_IDLE must be 0 or 1" ;; esac
 if [ "$RUNNING" = 1 ] && { [ "$NEEDS_RESTART" = 1 ] || [ "$REQUIRE_IDLE" = 1 ]; }; then
@@ -308,24 +308,14 @@ if [ "$RUNNING" = 1 ] && { [ "$NEEDS_RESTART" = 1 ] || [ "$REQUIRE_IDLE" = 1 ]; 
   FILE_DATA_ROOT="$(read_env_value "$GATEWAY_ENV" CHUDWARE_WEB_DATA)"
   [ -z "$FILE_DATA_ROOT" ] || DATA_ROOT="$FILE_DATA_ROOT"
   DATA_ROOT="${DATA_ROOT/#\~/$HOME}"
-  HEALTH_SECRET="$(read_env_value "$GATEWAY_ENV" CHUDWARE_WEB_SSO_SHARED_SECRET)"
-  [ -n "$HEALTH_SECRET" ] || fatal "CHUDWARE_WEB_SSO_SHARED_SECRET missing; refusing unauthenticated drain"
   HEALTH_EMAIL="${CHUDWARE_WEBD_HEALTH_EMAIL:-$(read_env_value "$GATEWAY_ENV" CHUDWARE_WEBD_HEALTH_EMAIL)}"
   if [ -z "$HEALTH_EMAIL" ]; then
-    ACCOUNTS_DB="$DATA_ROOT/accounts.db"
-    [ -r "$ACCOUNTS_DB" ] || fatal "accounts database unreadable at $ACCOUNTS_DB; cannot select a loopback identity"
-    if ! HEALTH_EMAIL="$("$PYTHON" - "$ACCOUNTS_DB" <<'PY'
-import sqlite3
-import sys
-con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-row = con.execute(
-    "SELECT email FROM accounts WHERE status='active' "
-    "ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, email LIMIT 1"
-).fetchone()
-print(row[0] if row else "", end="")
-PY
-)"; then
-      fatal "could not read an active loopback identity from $ACCOUNTS_DB"
+    HEALTH_DB_URL="$(read_env_value "$GATEWAY_ENV" CHUDWARE_DB_URL)"
+    [ -n "$HEALTH_DB_URL" ] || fatal "CHUDWARE_DB_URL missing from $GATEWAY_ENV; cannot select a loopback identity"
+    command -v psql >/dev/null 2>&1 || fatal "psql not found; install postgresql to read the account store"
+    if ! HEALTH_EMAIL="$(psql "$HEALTH_DB_URL" -tAXq -v ON_ERROR_STOP=1 -c \
+      "SELECT email FROM accounts WHERE status='active' ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, email LIMIT 1")"; then
+      fatal "could not read an active loopback identity from the account store"
     fi
   fi
   [ -n "$HEALTH_EMAIL" ] || fatal "no active account available for authenticated drain health"
@@ -335,6 +325,18 @@ PY
   HEALTH_URL="http://127.0.0.1:$HEALTH_PORT"
   MAXW="${CHUDWARE_WEBD_RESTART_MAX_WAIT:-600}"
   [[ "$MAXW" =~ ^[0-9]+$ ]] || fatal "CHUDWARE_WEBD_RESTART_MAX_WAIT must be a non-negative integer"
+  HEALTH_DB_URL="${HEALTH_DB_URL:-$(read_env_value "$GATEWAY_ENV" CHUDWARE_DB_URL)}"
+  [ -n "$HEALTH_DB_URL" ] || fatal "CHUDWARE_DB_URL missing from $GATEWAY_ENV; cannot mint a drain health session"
+  GATEWAY_DIR="$ROOT/Webservice/gateway"
+  GATEWAY_PY="$GATEWAY_DIR/.venv/bin/python"
+  [ -x "$GATEWAY_PY" ] || fatal "gateway venv python missing at $GATEWAY_PY; cannot mint a drain health session"
+  # The session must outlive the whole drain wait, or a long poll would start
+  # failing on an expired cookie and look like an unreachable gateway.
+  if ! HEALTH_SID="$(cd "$GATEWAY_DIR" && CHUDWARE_DB_URL="$HEALTH_DB_URL" \
+    "$GATEWAY_PY" -m authn ops-session --email "$HEALTH_EMAIL" --ttl-seconds "$((MAXW + 60))")"; then
+    fatal "could not mint an ops session for $HEALTH_EMAIL; refusing unauthenticated drain"
+  fi
+  [ -n "$HEALTH_SID" ] || fatal "ops session for $HEALTH_EMAIL was empty; refusing unauthenticated drain"
   waited=0
   while :; do
     if ! active="$(probe_engine_bridges)"; then

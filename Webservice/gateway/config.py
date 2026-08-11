@@ -60,6 +60,18 @@ def _load_webd_env() -> dict[str, str]:
     return out
 
 
+# Outbound mail backends. "console" logs the rendered message and is what a
+# dev box and the test suite run on; the two real ones are Resend's HTTPS API
+# and any SMTP relay (Amazon SES is the documented fallback above 100 mail/day).
+MAIL_BACKENDS = frozenset({"console", "resend", "smtp"})
+DEFAULT_MAIL_FROM = "Chudware <noreply@chudware.com>"
+
+# Origin the gateway is reached at. Verification links, password-reset links,
+# and OAuth redirect_uri values are all built from it, so it is configuration
+# rather than something derived from a request header.
+DEFAULT_PUBLIC_BASE_URL = "https://chudware.com"
+
+
 @dataclass
 class Settings:
     """Runtime settings loaded once from the process environment."""
@@ -79,13 +91,6 @@ class Settings:
         )
     )
     cf_aud: str = field(default_factory=lambda: _env("CHUDWARE_WEB_CF_AUD", "") or "")
-    # Multi-tenant Microsoft Entra (UA school accounts) front door: oauth2-proxy on
-    # sso.chudware.com verifies the OIDC login itself, then reverse-proxies here over
-    # loopback with this value as its HTTP Basic Auth password (see auth.py). Equivalent
-    # defense-in-depth to the CF Access JWT signature check — empty disables the path.
-    sso_shared_secret: str = field(
-        default_factory=lambda: _env("CHUDWARE_WEB_SSO_SHARED_SECRET", "") or ""
-    )
     dev_mode: bool = field(default_factory=lambda: _env_bool("CHUDWARE_WEB_DEV", False))
     # ---- Multi-tenant abuse controls -------------------------------------
     # Per-account limits that keep one user from consuming the whole service.
@@ -120,6 +125,27 @@ class Settings:
     rate_chat_per_min: int = field(
         default_factory=lambda: _env_int("CHUDWARE_WEB_RATE_CHAT_PER_MIN", 20)
     )
+    # ---- Transactional mail ----------------------------------------------
+    # Every send is queued in mail_outbox and drained by a single asyncio
+    # task (mailer.py), so a dead SMTP host or a rate-limited Resend account
+    # can never turn a signup into a 500. "console" is the default because a
+    # dev box and the test suite must work with no credentials at all.
+    mail_backend: str = field(
+        default_factory=lambda: (
+            _env("CHUDWARE_MAIL_BACKEND", "console") or "console"
+        ).strip().lower()
+    )
+    mail_from: str = field(
+        default_factory=lambda: _env("CHUDWARE_MAIL_FROM", DEFAULT_MAIL_FROM)
+        or DEFAULT_MAIL_FROM
+    )
+    resend_api_key: str = field(
+        default_factory=lambda: _env("CHUDWARE_RESEND_API_KEY", "") or ""
+    )
+    smtp_host: str = field(default_factory=lambda: _env("CHUDWARE_SMTP_HOST", "") or "")
+    smtp_port: int = field(default_factory=lambda: _env_int("CHUDWARE_SMTP_PORT", 587))
+    smtp_user: str = field(default_factory=lambda: _env("CHUDWARE_SMTP_USER", "") or "")
+    smtp_pass: str = field(default_factory=lambda: _env("CHUDWARE_SMTP_PASS", "") or "")
     # Admin browser-terminal (an interactive shell as the gateway account).
     # Off by default: it must be an explicit operator opt-in, never something a
     # public-facing deployment inherits silently.
@@ -137,7 +163,6 @@ class Settings:
     project_roots_raw: str = field(
         default_factory=lambda: _env("CHUDWARE_WEB_PROJECT_ROOTS", "") or ""
     )
-    users_file: Path = field(default_factory=Path)
     # Web-native client: shared engine daemon socket + team workspace root.
     # Env overrides win; else webd.env (install_webd.sh); else deterministic
     # defaults (instance key "chudwareweb" is verbatim => socket name is stable).
@@ -150,18 +175,78 @@ class Settings:
     # WASM web client static root (served at /app) + client perf traces.
     app_dir: Path = field(default_factory=Path)
     perf_traces_dir: Path = field(default_factory=Path)
+    # ---- Self-serve authentication ---------------------------------------
+    # session_secret is the fourth accepted answer to "is strong auth
+    # configured?" in AuthMiddleware: a deployment that authenticates its own
+    # users with passwords and OAuth needs neither Cloudflare Access nor an
+    # edge IdP, and must not be refused a boot for lacking them. It signs the
+    # OAuth state parameter; session ids themselves are random rows, not
+    # signed blobs, so rotating this value does not log anybody out.
+    session_secret: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_SESSION_SECRET", "") or ""
+    )
+    session_ttl_days: int = field(
+        # Absolute expiry. last_seen_at slides within the window; this does not.
+        default_factory=lambda: _env_int("CHUDWARE_WEB_SESSION_TTL_DAYS", 30)
+    )
+    trial_days: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_WEB_TRIAL_DAYS", 14)
+    )
+    # Absolute origin used to build verification, reset, and OAuth redirect
+    # URLs. It has to be configuration, not a Host header: a link built from
+    # attacker-supplied Host is a credential-delivery vulnerability.
+    public_base_url: str = field(
+        default_factory=lambda: (
+            _env("CHUDWARE_WEB_PUBLIC_BASE_URL", DEFAULT_PUBLIC_BASE_URL)
+            or DEFAULT_PUBLIC_BASE_URL
+        ).rstrip("/")
+    )
+    google_client_id: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_GOOGLE_CLIENT_ID", "") or ""
+    )
+    google_client_secret: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_GOOGLE_CLIENT_SECRET", "") or ""
+    )
+    github_client_id: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_GITHUB_CLIENT_ID", "") or ""
+    )
+    github_client_secret: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_GITHUB_CLIENT_SECRET", "") or ""
+    )
 
     def __post_init__(self) -> None:
         if self.max_engine_bridges_per_user < 1:
             raise ValueError(
                 "CHUDWARE_WEB_MAX_ENGINE_BRIDGES_PER_USER must be at least 1"
             )
-        if not self.users_file or str(self.users_file) in {".", ""}:
-            override = _env("CHUDWARE_WEB_USERS_FILE")
-            if override:
-                self.users_file = _expand_path(override)
-            else:
-                self.users_file = Path(__file__).resolve().parent / "users.yaml"
+        if self.mail_backend not in MAIL_BACKENDS:
+            raise ValueError(
+                "CHUDWARE_MAIL_BACKEND must be one of "
+                f"{', '.join(sorted(MAIL_BACKENDS))} — got {self.mail_backend!r}"
+            )
+        # Fail at boot, not on the first password-reset request: a backend
+        # selected without its credential can never deliver anything.
+        if self.mail_backend == "resend" and not self.resend_api_key:
+            raise ValueError(
+                "CHUDWARE_MAIL_BACKEND=resend requires CHUDWARE_RESEND_API_KEY"
+            )
+        if self.mail_backend == "smtp" and not self.smtp_host:
+            raise ValueError("CHUDWARE_MAIL_BACKEND=smtp requires CHUDWARE_SMTP_HOST")
+        if self.session_ttl_days < 1:
+            raise ValueError("CHUDWARE_WEB_SESSION_TTL_DAYS must be at least 1")
+        if self.trial_days < 1:
+            raise ValueError("CHUDWARE_WEB_TRIAL_DAYS must be at least 1")
+        # The OAuth state parameter is HMAC-signed with the session secret, so
+        # a provider configured without one has no CSRF protection on its
+        # callback at all. Refuse the combination at boot.
+        if not self.session_secret and (
+            (self.google_client_id and self.google_client_secret)
+            or (self.github_client_id and self.github_client_secret)
+        ):
+            raise ValueError(
+                "OAuth sign-in requires CHUDWARE_WEB_SESSION_SECRET "
+                "(it signs the single-use OAuth state parameter)"
+            )
         webd_env = _load_webd_env()
         if not self.webd_socket or str(self.webd_socket) in {".", ""}:
             raw = _env("CHUDWARE_WEBD_SOCKET") or webd_env.get("CHUDWARE_WEBD_SOCKET")
@@ -199,10 +284,6 @@ class Settings:
     @property
     def logs_dir(self) -> Path:
         return self.data_root / "logs"
-
-    @property
-    def chat_db(self) -> Path:
-        return self.data_root / "chat.db"
 
     @property
     def refuse_new_flag(self) -> Path:
@@ -277,7 +358,7 @@ class Settings:
         # created here. Creating the configured root is safe (empty tree).
         try:
             self.workspace_root.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
+        except OSError:
             # Don't crash gateway boot if the path is unwritable; list endpoints
             # will still 503 with a clear detail.
             pass
@@ -285,13 +366,6 @@ class Settings:
             self.bucket_root.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-        # Seed a runtime users file from the repo template when the configured
-        # path lives outside the package and doesn't exist yet (/admin edits it).
-        template = Path(__file__).resolve().parent / "users.yaml"
-        if self.users_file != template and not self.users_file.exists():
-            self.users_file.parent.mkdir(parents=True, exist_ok=True)
-            if template.exists():
-                self.users_file.write_text(template.read_text())
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
 

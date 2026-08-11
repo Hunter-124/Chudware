@@ -28,7 +28,7 @@ K_INTAKE = "intake"
 
 def _bridge():
     try:
-        from mcp_server import core_bridge as cb  # type: ignore
+        from services.mcp import core_bridge as cb  # type: ignore
     except ImportError:
         from services.mcp import core_bridge as cb  # type: ignore
     return cb

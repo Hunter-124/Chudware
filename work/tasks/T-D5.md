@@ -45,7 +45,7 @@ Day 5 delivers cost takeoff from the structure doc: board-feet for lumber, steel
 
 ## Implementation notes
 
-- `struct_estimate` registered in `mcp_server/structural_tools.py` (not server.py) — all
+- `struct_estimate` registered in `services/mcp/structural_tools.py` (not server.py) — all
   `struct_*` tools are co-located in that module per the append-only pattern; server.py is
   unmodified. This is a deliberate deviation from the task's literal "Files touched: server.py".
 - Labor model: per-element install hours seeded from RS Means Division 05/06 field values,
@@ -74,7 +74,7 @@ Files added:
 - engine_oracle/structural/estimate.py — board_feet(), steel_weight_lbs(), fastener_count(), takeoff(), estimate()
 - engine_oracle/structural/bom_bridge.py — structural_bom_lines()/structural_bom_dicts() → BomLine output for bom_rollup
 - engine_oracle/structural/test_estimate.py — 26 tests, all pass offline (no DLL/network)
-- mcp_server/structural_tools.py — struct_estimate MCP tool added inside register_structural_tools()
+- services/mcp/structural_tools.py — struct_estimate MCP tool added inside register_structural_tools()
 
 DoD gates:
 ✓ board_feet(4x4×8ft) = 10.67 BF

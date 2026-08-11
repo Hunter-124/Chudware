@@ -282,7 +282,7 @@ C++ read-side (`core/agent/run.cpp` provider selection + the `adapter` telemetry
 
 - Python adapters conform today: `anthropic`, `openai`, `gemini`, `llamacpp` (inherits
   `openai`), `openrouter` (inherits `openai` + PKCE auth), `mock`/`mock-roles`. Conformance is
-  tested in `agent/test_providers_conformance.py` (neutral schema round-trip + offline-safety,
+  tested in `services/agent/test_providers_conformance.py` (neutral schema round-trip + offline-safety,
   incl. `provider_offline_safe`).
 - C++ mirrors the same neutral layer; it is developed against the Python engine as the
   differential oracle (CONTRIBUTING.md). New neutral-layer changes land in Python first, then

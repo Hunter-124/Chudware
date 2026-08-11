@@ -1,6 +1,6 @@
 // core/parts/parts_data.h — internal catalog data tables (not part of the public API).
 // Dimensions in millimetres; imperial sizes pre-converted. Mirrors
-// agent/prompts/shared/cheatsheets/hardware.md.
+// services/agent/prompts/shared/cheatsheets/hardware.md.
 #pragma once
 
 #include <string>

@@ -898,7 +898,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         provider = None
         provider_setup_err: Exception | None = None
         try:
-            from agent import config as _cfg  # type: ignore
+            from services.agent import config as _cfg  # type: ignore
             provider = _cfg.get_provider()
         except Exception as exc:  # noqa: BLE001 -- offline / unconfigured / module absent
             provider_setup_err = exc

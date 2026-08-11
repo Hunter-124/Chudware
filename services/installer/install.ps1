@@ -124,7 +124,7 @@ try {
     $whArgs = @()
     if (Test-Path $wh) { $whArgs = @("--wheelhouse", $wh) }
     Write-Host "==> Provisioning runtime into %APPDATA%\Chudware ..."
-    $provisionOut = & $basePy -m installer.provision @whArgs --base-python $basePy --with-app-code
+    $provisionOut = & $basePy -m services.installer.provision @whArgs --base-python $basePy --with-app-code
     if ($LASTEXITCODE -ne 0) { $provisionOut | ForEach-Object { Write-Host $_ }; throw "provisioning failed" }
     $provisionOut | ForEach-Object { Write-Host $_ }
     # provision.py may legitimately reuse a pre-Chudware-rename venv (services/paths.py's
@@ -142,11 +142,11 @@ try {
         # resolve the SAME installed engine daemon (shared instance key = shared daemon).
         $regArgs = @("--python", $venvPy, "--cwd", $app)
         if (Test-Path $hostdExe) { $regArgs += @("--hostd-bin", $hostdExe) }
-        & $venvPy -m installer.register_mcp @regArgs
+        & $venvPy -m services.installer.register_mcp @regArgs
         # File associations (.step+ default + Open-with for the formats Chudware loads). Per-user
         # (HKCU), idempotent, reversed on uninstall. Stdlib-only, so the base python is fine too.
         Write-Host "==> Registering Chudware file associations ..."
-        & $venvPy -m installer.setup_file_assoc --exe (Join-Path $InstallDir "chudware.exe")
+        & $venvPy -m services.installer.setup_file_assoc --exe (Join-Path $InstallDir "chudware.exe")
     }
 
     # Optional sim/firmware backends (Renode portable zip, openEMS MSVC note).
@@ -157,7 +157,7 @@ try {
         & $venvPy -c @"
 import sys
 try:
-    from installer.provision import ensure_optional_sim_tools
+    from services.installer.provision import ensure_optional_sim_tools
     st = ensure_optional_sim_tools(install=True)
     for k, v in st.items():
         print(f'  {k}: installed={v.get(\"installed\")} path={v.get(\"path\") or v.get(\"python\")}')

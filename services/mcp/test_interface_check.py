@@ -23,7 +23,7 @@ if _REPO_ROOT not in sys.path:
 
 import pytest
 
-from mcp_server import core_bridge as cb
+from services.mcp import core_bridge as cb
 
 pytestmark = pytest.mark.skipif(
     not cb.available(),
@@ -32,7 +32,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _call(name: str, args: dict):
-    from mcp_server import server
+    from services.mcp import server
     content, structured = asyncio.run(server.mcp.call_tool(name, args))
     text = structured.get("result") if isinstance(structured, dict) else None
     parsed = None

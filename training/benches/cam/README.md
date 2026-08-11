@@ -47,7 +47,7 @@ path for `cam_simulate` checks.
 | `contoured_part` | 2 | clean pass, a **gouge** case (ball-endmill radius exceeds a fillet radius) |
 
 Each fixture is a plain-dict CAM job spec: `stock` + `tools` + `setup` + a candidate
-`op_plan` (built against `mcp_server.cam_tools.cam_add_operation`'s real kwargs: `type,
+`op_plan` (built against `services.mcp.cam_tools.cam_add_operation`'s real kwargs: `type,
 tool_number, geometry, heights, params`) + a recorded `expected_sim` (a `cam_simulate`
 -shaped result for that exact job). `spec.json` freezes the content hash
 (`tools/flywheel/bench/dataset.py`); a second machine gets the same hash from the same
@@ -69,12 +69,12 @@ run.
   still produces those exact numbers for that job. This mirrors the same honesty posture as
   `regen_fix`'s fixture-mode scoring and the T-H8 Q2 answer for spec→sketch/CAM/VLM.
 - **Live (C++ core present):** the same job (stock/tools/setup/op_plan) is built through
-  `mcp_server.cam_tools` (`cam_new_job` → `cam_add_tool` → `cam_add_setup` →
+  `services.mcp.cam_tools` (`cam_new_job` → `cam_add_tool` → `cam_add_setup` →
   `cam_add_operation` → `cam_generate` → `cam_simulate`) and `cam_simulate` is genuinely
   recomputed. The battery's own `cam_simulate` check is also run (`services.verify.battery
   .verify(None, ["cam_simulate"])`) against the same in-process current job and its score
   recorded alongside as the through-battery signal. Guarded skip-if-no-core: resolution of
-  the core library goes entirely through `mcp_server.core_bridge`'s own
+  the core library goes entirely through `services.mcp.core_bridge`'s own
   `$CHUDWARE_LIBCHUDWARE` / `$CHUDWARE_DIST` / platform search — no sibling worktree `.so` path is
   ever hardcoded.
 

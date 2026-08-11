@@ -21,12 +21,12 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import app as app_mod  # noqa: E402
+from gateway import accounts, app as app_mod, db  # noqa: E402
 from gateway.config import Settings, settings  # noqa: E402
 from gateway.limits import user_slug  # noqa: E402
 
 DEV_HEADERS = {"X-Dev-User": "demo@example.com"}
-ADMIN_HEADERS = {"X-Dev-User": "haedmonds69@gmail.com"}
+ADMIN_HEADERS = {"X-Dev-User": "admin@example.com"}
 
 PROVIDER_MANAGER_CALLS = (
     ("agent_provider_list", {}),
@@ -153,6 +153,30 @@ def workspace(tmp_path, monkeypatch):
     return user_root
 
 
+def _seed(email: str, display: str, *, admin: bool = False) -> None:
+    """Register and activate one account, optionally promoting it.
+
+    accounts.py deliberately exposes no role setter — admin is granted through
+    the admin API and never self-assigned — so the promotion is a direct row
+    update here rather than a public call that does not (and should not) exist.
+    """
+    accounts.ensure_account(email, display=display)
+    accounts.set_status(email, "active", decided_by="test")
+    if admin:
+        with db.tx() as cur:
+            cur.execute(
+                "UPDATE accounts SET role = 'admin' WHERE email = %s", (email,)
+            )
+
+
+@pytest.fixture(autouse=True)
+def _identities(pg):
+    """/engine authorizes on identity alone — no per-caller seat exists — so
+    both test callers need an active row in the store the middleware reads."""
+    _seed("demo@example.com", "Demo User")
+    _seed("admin@example.com", "Admin", admin=True)
+
+
 @pytest.fixture()
 def client():
     return TestClient(app_mod.app)
@@ -167,25 +191,6 @@ def _rpc(ws, id_, method, params=None) -> dict:
 
 
 class TestEngineBridge:
-    @pytest.fixture(autouse=True)
-    def _admin_identity(self):
-        """/engine authorizes on identity alone — no per-caller seat exists.
-
-        The tracked users.yaml template grants nobody access, so the admin test
-        identity is injected into the live directory for the test's duration.
-        """
-        from gateway.auth import User
-
-        admin = User(email="haedmonds69@gmail.com", display="Admin", role="admin",
-                     heavy=False, project="", doc="")
-        prev_entry = app_mod.user_directory._by_email.get(admin.email)
-        app_mod.user_directory._by_email[admin.email] = admin
-        yield
-        if prev_entry is None:
-            app_mod.user_directory._by_email.pop(admin.email, None)
-        else:
-            app_mod.user_directory._by_email[admin.email] = prev_entry
-
     def test_hello_identity_injected(self, daemon, client):
         with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
             resp = _rpc(ws, 1, "hello", {"client": "agent", "pid": 42, "proto": 1})

@@ -17,7 +17,7 @@ Checks (each prints PASS/FAIL with the observed value):
 import os, sys
 os.environ.setdefault("CHUDWARE_DIST", os.path.abspath("core/build-occt/bin/Release"))
 import tools.chudware_drive as d
-from mcp_server import core_bridge as cb
+from services.mcp import core_bridge as cb
 
 PI = 3.141592653589793
 results = []

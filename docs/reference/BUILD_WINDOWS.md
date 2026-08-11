@@ -6,22 +6,12 @@ Python 3.12). The GUI on both Linux and Windows is the **`host/` tree** (binary 
 `Chudware` compat symlink) — the interim `ui/imgui` shell is retired and deleted. Re-verifying the
 restored `host/` build under MSVC is an open item (see `docs/plans/GUI_OVERHAUL_SPEC.md`).
 
-## 0. One-time checkout fix — symlinks
+## 0. Checkout portability
 
-This repo uses git symlinks for short top-level names (`agent`→`services/agent`,
-`mcp_server`→`services/mcp`, `corpus`→`corpora/sketch`, …). A default Windows checkout has
-`core.symlinks=false`, so these land as **13-byte text files**, which breaks Python imports
-and data-file access under `corpus/` etc.
-
-Fix (pick one):
-
-```powershell
-# Recommended: convert them to directory junctions (no admin needed). Idempotent.
-powershell -File scripts\setup_windows_links.ps1
-```
-
-or enable real symlinks before cloning: `git config --global core.symlinks true` **and** turn on
-Windows **Developer Mode**, then re-clone.
+All Python packages and fixture corpora are referenced by their canonical
+`services/...` and `corpora/...` paths. The repository has no committed symlinks,
+so a default unelevated Windows checkout needs no Developer Mode, junction setup,
+or `core.symlinks` override.
 
 ## 1. Toolchain
 
@@ -83,7 +73,7 @@ Every dependency ships a prebuilt `cp312` wheel — **no compiler needed** for t
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt pytest pytest-timeout
 # services-side Python suites (the C++ engine is exercised via ctest on the core build):
-.\.venv\Scripts\python -X utf8 -m pytest agent -q --timeout=90
+.\.venv\Scripts\python -X utf8 -m pytest services/agent -q --timeout=90
 ```
 
 The legacy `engine_oracle` Python suite is gone (zero-Python cutover, T-RF21) — engine
@@ -91,13 +81,6 @@ correctness proof on Windows is `ctest` on the `windows-core` / `windows-occt` c
 
 ## Troubleshooting / gotchas
 
-- **NEVER `git stash` in this repo on Windows.** The step-0 compat symlinks get materialized as
-  absolute symlinks; a `git stash push`/`pop` cycle follows them and **deletes the real
-  target-directory contents** (hundreds of files across `services/`, `corpora/`).
-  Recovery is `git reset --hard HEAD` (history is never affected). To land a commit despite the
-  symlink "changes", `git add` only your edited file(s), then `git pull --rebase` / `git push` —
-  don't stash. Running `scripts/setup_windows_links.ps1` (junctions + skip-worktree) avoids the
-  dirty-symlink state entirely.
 - **`cl` / `cmake` "is not recognized"** — MSVC isn't on `PATH` in a normal shell. Build from the
   **x64 Native Tools Command Prompt for VS 2022** (Start menu) or run `vcvars64.bat` first.
 - **Known ctest failure** `freecad_parity` (both `windows-core` 19/20 and `windows-occt` 48/49) is a

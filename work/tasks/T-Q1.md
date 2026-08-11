@@ -49,19 +49,18 @@ bundled — today only developers can run it.
 turned out to depend on real, load-bearing bugs in existing provisioning code (below) — not
 speculative refactoring.
 
-**The "staged services/dist layout" the driver note pointed at doesn't exist** (no
-`services/dist/`, no top-level `installer/` beyond the `installer -> services/installer`
-symlink) — but `services/installer/{provision.py,build_release.py,install.ps1,uninstall.ps1}`
-is exactly that proto-package, already fully working *on Windows*, just never exercised on
+The staged `services/dist` layout the driver note pointed at did not exist, but
+`services/installer/{provision.py,build_release.py,install.ps1,uninstall.ps1}`
+was exactly that proto-package, already fully working *on Windows*, just never exercised on
 Linux. Formalized it rather than reinventing: the Linux AppImage and the Windows Inno wrapper
 both consume the same `app/`+`wheelhouse/` payload shape `bootstrap.cpp`'s
 `findPayload()`/`provisionRuntime()` already expects.
 
 **Three real, live-reproduced cross-platform bugs found and fixed** while making that
 provisioning path actually work on Linux (each verified before/after, each its own commit):
-1. `provision.py`/`build_release.py` computed `REPO` as `Path(__file__).resolve().parent.parent`
-   — `.resolve()` follows the `installer -> services/installer` symlink, landing on `services/`
-   instead of the repo root (`--check` looked for `services/requirements.txt`).
+1. `provision.py`/`build_release.py` computed `REPO` from a path depth that differed
+   between the compatibility alias and the canonical `services/installer` location,
+   so `--check` looked for `services/requirements.txt`.
 2. `provision.py:_venv_python()` was hardcoded to `venv/Scripts/python.exe` (Windows) even on
    POSIX, disagreeing with `bootstrap.cpp`'s own POSIX `bin/python` path.
 3. `requirements.txt`'s `pywin32==312` had no platform marker, so `pip install -r
@@ -72,7 +71,7 @@ provisioning path actually work on Linux (each verified before/after, each its o
    pinned wheels (build123d==0.10.0) actually support.
 
 **Full end-to-end proof, not just unit-level:** with all four fixed, ran a REAL (not mocked)
-`python -m installer.provision --with-app-code` under an isolated `XDG_DATA_HOME` — completed
+`python -m services.installer.provision --with-app-code` under an isolated `XDG_DATA_HOME` — completed
 successfully (build123d/cadquery-ocp/vtk/pyvista/mcp/anthropic/openai/... all installed,
 ~1.5GB venv) — then launched AI-CAD2 against that provisioned root: the "Python runtime not
 installed" banner is gone and the worker actually starts and answers RPC (progressed to an
@@ -131,12 +130,12 @@ walking any of it back: I independently re-read every commit diff and the full
   requirement exactly.
 - Ran `scripts/gate.sh` fresh (see Gate section above) and `graphify update .`.
 
-**Not independently re-run this pass:** the full real `installer.provision` venv bootstrap
+**Not independently re-run this pass:** the full real `services.installer.provision` venv bootstrap
 (~1.5GB, network+several minutes) — accepting the fork's live-verification claim (documented in
 the `d15c7ba`/`9da2bb1`/`d88b135` commit messages, each describing a real repro-then-fix cycle)
 rather than re-running it myself. Flagging as fork-verified-not-independently-reproduced in this
 pass; a merge reviewer who wants belt-and-suspenders on that specific claim should re-run
-`python -m installer.provision --with-app-code` under an isolated `XDG_DATA_HOME` before
+`python -m services.installer.provision --with-app-code` under an isolated `XDG_DATA_HOME` before
 trusting it fully offline.
 
 **Board status:** the main checkout was mid-rebase (Fable's own overnight merge session) when

@@ -24,8 +24,8 @@ from pathlib import Path
 
 import pytest
 
-from mcp_server import daemon_bridge
-from mcp_server.daemon_bridge import DaemonClient
+from services.mcp import daemon_bridge
+from services.mcp.daemon_bridge import DaemonClient
 
 HOSTD = daemon_bridge.resolve_hostd_bin()
 

@@ -1,7 +1,7 @@
 # chudware-web RUNBOOK (Hunter)
 
 Host: Fedora 44, gateway `127.0.0.1:8300`, data `~/chudware-web-data/`.
-Public: `https://chudware.com` via Cloudflare Tunnel + Access.
+Public: `https://chudware.com` via Cloudflare Tunnel; sign-in is self-serve in the gateway.
 
 ---
 
@@ -53,7 +53,8 @@ Do **not** hand-create these if provision already ran:
 | Zone | `chudware.com` active |
 | Tunnel | `chudware-web` (remotely-managed) |
 | Public hostname | `chudware.com` → `http://127.0.0.1:8300` (WSS over same HTTPS) |
-| Access application | self-hosted app for `chudware.com` |
+| Extra hostname | `www.chudware.com` → same tunnel, same service |
+| Access application | self-hosted app for `chudware.com` — gates `/admin` only |
 
 `cf_provision.py` is **driver-owned** and lands beside these deploy files — DeployOps does not implement it. It should write into **`~/chudware-web-data/gateway.env`** (never committed):
 
@@ -63,105 +64,77 @@ CHUDWARE_CF_TEAM_DOMAIN=https://bruh234324.cloudflareaccess.com
 CHUDWARE_CF_AUD=...                # Access Application Audience (AUD) tag
 ```
 
-Gateway verifies `Cf-Access-Jwt-Assertion` against team JWKS (`…/cdn-cgi/access/certs`) with `iss` = team domain and `aud` = `CHUDWARE_CF_AUD`. JWKS rotates ~every 6 weeks (previous key valid ~7 days) — always fetch remotely, match `kid`.
+Access is the operator door for `/admin`. When an Access credential is present the gateway verifies `Cf-Access-Jwt-Assertion` against team JWKS (`…/cdn-cgi/access/certs`) with `iss` = team domain and `aud` = `CHUDWARE_CF_AUD`. JWKS rotates ~every 6 weeks (previous key valid ~7 days) — always fetch remotely, match `kid`. Everyone else authenticates to the gateway itself (§c).
 
 ### Hunter remaining manual steps
 
 1. **Rotate leaked API token + R2 keys** (§a) — do this before relying on any old token in scripts.
-2. **Optional Google IdP** (nice for Gmail allowlist users):
+2. **Optional Google IdP for the `/admin` door** (Access-side, not the site login):
    - [Google Cloud Console](https://console.cloud.google.com/) → project → OAuth consent **External**.
    - OAuth client type **Web**:
      - Authorized JS origin: `https://bruh234324.cloudflareaccess.com`
      - Redirect URI: `https://bruh234324.cloudflareaccess.com/cdn-cgi/access/callback`
    - Zero Trust → Integrations → Identity providers → **Google** → paste Client ID/Secret → Test.
-3. **Edit allowed emails** (Access policy Include → Emails), via Zero Trust dashboard **or** API after the new token exists. Prefer **exact emails**, not whole domains, for personal Google accounts. List each `@ua.edu` address that should use One-Time PIN.
+3. **Edit the Access allowlist** (Access policy Include → Emails), via Zero Trust dashboard **or** API after the new token exists. This list is operators only — it decides who may reach `/admin`, not who may use the site. Prefer **exact emails** over whole domains.
 
-### Auth honesty (do not market as Entra)
+### Auth honesty (what a login actually proves)
 
-Phase-1 login is:
+Site login is the gateway's own: an email plus an argon2id-hashed password, or Google/GitHub
+OAuth if those client credentials are configured. Both prove control of an **email mailbox**
+or of a Google/GitHub account. Neither is Microsoft Entra / "sign in with your school
+Microsoft account", and nothing here is an institutional SSO — do not market it as one.
 
-- **Google OAuth** (if IdP configured) for listed Google emails, and/or
-- **Cloudflare Access One-Time PIN** to listed addresses (including `@ua.edu`).
-
-OTP proves control of the **email mailbox**. It is **not** Microsoft Entra / “sign in with school Microsoft account.”
-
-### Entra SSO (implemented — 2b: self-hosted oauth2-proxy, path 2a still needs UA IT)
-
-Path **2a** (Cloudflare Access's own Entra IdP) needs an app registered *inside*
-the ua.edu Entra tenant with admin consent — not something a student can self-serve.
-Path **2b** is what's actually live: a second, independent front door at
-`https://sso.chudware.com`, parallel to the Cloudflare Access app on `chudware.com`
-(OTP + Google unaffected). Full rationale in `research/auth.md`.
-
-```
-browser -> Cloudflare Tunnel -> sso.chudware.com -> oauth2-proxy (127.0.0.1:8301,
-  entra-id provider, oidc_issuer_url=.../common/v2.0, multi-tenant) -> verified login
-  -> reverse-proxy to gateway (127.0.0.1:8300) with HTTP Basic Auth
-  (username=email, password=shared secret) -> gateway/auth.py SSO branch
-```
-
-Already provisioned: DNS CNAME + tunnel ingress for `sso.chudware.com`, the
-`chudware-sso.service` unit (installed, **not started**), `oauth2-proxy` binary at
-`~/.local/bin/oauth2-proxy`, config skeleton at `~/chudware-web-data/oauth2-proxy.cfg`
-(template: `Webservice/deploy/oauth2-proxy.cfg.example`), and
-`CHUDWARE_WEB_SSO_SHARED_SECRET` in `gateway.env` matching the config's
-`basic_auth_password`.
-
-**Hunter's one remaining manual step** — register the Azure app (needs your Microsoft
-account, not scriptable):
-
-1. [portal.azure.com](https://portal.azure.com) → Microsoft Entra ID → App registrations → New registration.
-2. Supported account types: **Accounts in any organizational directory (Any Microsoft Entra ID tenant - Multitenant)**.
-3. Redirect URI (Web): `https://sso.chudware.com/oauth2/callback`.
-4. Certificates & secrets → New client secret → copy the **Value** immediately (shown once).
-5. API permissions → Microsoft Graph → Delegated → `openid`, `profile`, `email`, `offline_access`, `User.Read`. **Do not add** `Directory.Read.All`/`GroupMember.Read.All` — those force per-tenant admin consent and will wall out UA students whose IT hasn't approved this app.
-6. Copy the **Application (client) ID** + client secret **Value** into `~/chudware-web-data/oauth2-proxy.cfg` (`client_id` / `client_secret`), then:
-   ```bash
-   systemctl --user enable --now chudware-sso.service
-   journalctl --user -u chudware-sso.service -n 40 --no-pager   # confirm clean start
-   ```
-
-**Known limitation (not guaranteed to clear on its own):** UA's tenant may still show
-**"Need admin approval"** on first `@ua.edu` login if UA locks down user consent for
-third-party multi-tenant apps — common at universities. If that happens, the only
-fixes are a formal request to UA IT/security to approve this specific app, or falling
-back to path 2a. Test with one real `@ua.edu`/`@crimson.ua.edu` account after
-activation to find out which situation UA is in.
+Cloudflare Access One-Time PIN still guards `/admin`, and it proves the same thing: mailbox
+control for an address listed in the Access policy.
 
 ---
 
-## (c) `users.yaml`
+## (c) Accounts and sign-in
 
-File: `Webservice/gateway/users.yaml`
+There is no users file. Accounts live in PostgreSQL and people create their own:
 
-```yaml
-users:
-  - email: you@example.com
-    display: Hunter
-    role: admin          # admin | user
-    heavy: true          # reserved entitlement flag (no runtime consumer today)
-  - email: alice@ua.edu
-    display: Alice
-    role: user
-    heavy: false
+```
+POST /api/auth/register        email + password -> pending account, verification mail
+GET  /api/auth/verify?token=…  activates the account on a 14-day trial, signs in
+POST /api/auth/login           argon2id check -> new session row + chudware_sid cookie
+POST /api/auth/logout          revokes that session row
+POST /api/auth/forgot | reset  emailed password reset
+GET  /api/auth/oauth/{google|github}/start | /callback
 ```
 
-- Email must match Access JWT `email` claim (or `X-Dev-User` when `CHUDWARE_WEB_DEV=1`).
+- Sessions are **server-side rows**, not signed blobs: the `chudware_sid` cookie is an
+  opaque id, so revoking a row logs that browser out immediately. TTL
+  `CHUDWARE_WEB_SESSION_TTL_DAYS` (30), trial window `CHUDWARE_WEB_TRIAL_DAYS` (14).
+- `CHUDWARE_WEB_SESSION_SECRET` must be set in `gateway.env`; outside `CHUDWARE_WEB_DEV=1`
+  the gateway refuses to start without it unless CF Access is fully configured. Generate
+  one with `python3 -c 'import secrets;print(secrets.token_urlsafe(48))'`. Optional
+  `CHUDWARE_WEB_GOOGLE_CLIENT_ID`/`_SECRET` and `CHUDWARE_WEB_GITHUB_CLIENT_ID`/`_SECRET`
+  enable the OAuth buttons.
+- These endpoints are **API-only today** — the hosted sign-in form and marketing page are
+  a later slice. An unauthenticated HTML request gets a 401 page; an authenticated but
+  non-`active` account gets a 403 status page whose copy depends on the state
+  (pending / denied / suspended / trial_expired).
+- Status is `pending` → `active` (self-serve on verification) and an admin may set
+  `denied`/`suspended`. Only `active` accounts get any rights; role and plan are read from
+  the row, never from the client.
 - **heavy** is a persisted per-account flag surfaced in `/admin` and `/api/me`.
   Nothing enforces it since the streamed-session product was removed; it is kept
   as the hook plan entitlements will use.
+- **Locked out?** `UPDATE accounts SET role='admin', status='active' WHERE email='you@…';`
+  against `CHUDWARE_DB_URL`, then sign in normally.
 
 ---
 
 ## (d) Demo-day checklist
 
-- [ ] Secrets rotated; `gateway.env` has `TUNNEL_TOKEN`, `CHUDWARE_CF_TEAM_DOMAIN`, `CHUDWARE_CF_AUD` (mode 600).
+- [ ] Secrets rotated; `gateway.env` has `TUNNEL_TOKEN`, `CHUDWARE_CF_TEAM_DOMAIN`, `CHUDWARE_CF_AUD`, `CHUDWARE_WEB_SESSION_SECRET` (mode 600).
 - [ ] `bash Webservice/deploy/setup.sh` already run; linger enabled.
 - [ ] `systemctl --user start chudware-gateway chudware-cloudflared chudware-monitor.timer`
 - [ ] `curl -sS http://127.0.0.1:8300/healthz` — free RAM, VRAM, engine bridges look sane.
-- [ ] Access allowlist + `users.yaml` include every demo attendee email.
-- [ ] Browser smoke: `https://chudware.com` → Access challenge → portal → `/app` loads.
-- [ ] Know the “not on the list” path (Access deny vs portal allowlist page).
+- [ ] Every demo attendee has registered and verified (or you approved them at `/admin`).
+- [ ] Browser smoke: `https://chudware.com` → sign in → portal → `/app` loads.
+- [ ] Know the not-yet-approved path (the gateway's pending/denied status page) and the
+      Access deny page for `/admin`.
 - [ ] Confirm `REFUSE_NEW` is absent unless disk is actually critical: `ls ~/chudware-web-data/REFUSE_NEW`.
 
 ---
@@ -230,16 +203,17 @@ sudo loginctl enable-linger "$USER"
 
 ### /admin ops
 
-`https://chudware.com/admin` (admin role) shows, above the allowlist:
+`https://chudware.com/admin` (admin role) shows, above the accounts queue:
 
 - **Host bar** — free RAM, VRAM used/total + GPU util (`nvidia-smi`), load,
   plus **service chips** (cloudflared / monitor / backup unit states) and a
   **REFUSE_NEW** toggle (the same disk-pressure flag the monitor writes; the
   monitor re-creates it while disk is critical, so a manual clear can be
   overridden on its next sample).
-- **Allowlist table is editable in place** — click the role pill to toggle
-  admin/user (self-demotion blocked), the GPU pill to toggle the `heavy` flag,
-  the project cell to reassign.
+- **Accounts queue** (`GET /api/admin/accounts`, filterable by status, with a
+  pending badge from `/api/admin/accounts/pending-count`) — approve, deny or
+  suspend a registration and set its plan in place
+  (`POST /api/admin/accounts/{email}/{approve,deny,suspend,plan}`).
 - **Gateway log** — journal tail in the page (`/api/admin/logs`), optional
   5 s follow. No SSH needed for demo-day triage.
 
@@ -274,20 +248,46 @@ track of the actual work in flight.
 `chudware-backup.timer` (03:30 + jitter, `Persistent=true`) runs
 `Webservice/deploy/backup.sh`:
 
-- Tars **all of `~/chudware-web-data/`** (PLM bare repos, per-account workspace
-  and bucket trees, users.yaml, chat.db, env files) minus logs/tmp.
-- Destination `~/chudware-web-backups/` (mode 700, tarballs 600), newest
-  **14** kept. Override via `CHUDWARE_WEB_BACKUP_DIR` / `CHUDWARE_WEB_BACKUP_KEEP`.
+- `pg_dump -Fc` of **both** databases (`chudware_prod`, `chudware_staging`), plus
+  a tar of the non-database state in `~/chudware-web-data/` (PLM bare repos,
+  per-account workspace and bucket trees) minus `logs/` and `tmp/`.
+- Every artifact is piped through `age -r <recipient>` before it touches disk.
+  The recipient is `CHUDWARE_BACKUP_AGE_RECIPIENT` or
+  `~/chudware-web-data/secrets/backup_age_recipient`; with neither, the script
+  refuses to run rather than write plaintext.
+- **`secrets/` and every `*.env` are deliberately excluded.** They hold the
+  PostgreSQL role passwords, the session secret and the Stripe/OAuth keys — the
+  credentials that protect the dump they would otherwise sit beside. One leaked
+  archive must not be both the lock and the key. Back those up through your own
+  password store. Do not "fix" the excludes.
+- `homes/` spans several uids (hostd writes under a subuid), so the tar
+  elevates through `sudo -n` when it finds an unreadable file. Without that it
+  exits 2 and the night's backup is silently lost — which is exactly what was
+  happening before 2026-08-10.
+- Destination `~/chudware-web-backups/` (mode 700, artifacts 600), newest
+  **7** of each family kept. Override via `CHUDWARE_WEB_BACKUP_DIR` /
+  `CHUDWARE_WEB_BACKUP_KEEP`.
+- Uploaded to the R2 bucket `chudware-backups` (30-day lifecycle rule, applied
+  idempotently on every run) when `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`
+  and `R2_ENDPOINT` are set. Without them the run says so loudly and keeps the
+  local copy.
 
 ```bash
 systemctl --user start chudware-backup.service     # manual backup now
 systemctl --user list-timers chudware-backup.timer # next run
-# restore:
-tar -xzf ~/chudware-web-backups/chudware-web-data-<stamp>.tar.gz -C ~
+
+# restore a database:
+age -d -i <identity> < ~/chudware-web-backups/chudware_prod-<stamp>.dump.age > /tmp/prod.dump
+pg_restore -h 127.0.0.1 -U chudware_prod -d chudware_prod --clean --if-exists /tmp/prod.dump
+
+# restore the file state:
+age -d -i <identity> < ~/chudware-web-backups/chudware-web-data-<stamp>.tar.age \
+  | tar -x -C ~/chudware-web-data
 ```
 
-Off-host copies are on you: rsync the backup dir somewhere that isn't this
-machine when the project data starts mattering.
+The age **identity** (private key) must live off this machine. Keeping it in
+`secrets/` next to the archives it decrypts defeats the encryption for any
+attacker who gets the disk.
 
 
 ## (g) Pull / rebuild / redeploy (keep this host current)
@@ -332,9 +332,9 @@ Desktop against the **shared** daemon (same engine the web client uses):
 | `Webservice/deploy/chudware-*.service` / `.timer` | systemd **user** units |
 | `Webservice/deploy/monitor.py` | Host sample + disk-pressure flag (stdlib) |
 | `Webservice/deploy/cf_provision.py` | Driver: tunnel/DNS/Access via API |
-| `~/chudware-web-data/gateway.env` | Secrets + CF team/AUD/token (gitignored conceptually; never commit) |
-| `~/chudware-web-data/{workspace,bucket,plm,logs,chat.db}` | Runtime data |
-| `Webservice/gateway/users.yaml` | Allowlist |
+| `~/chudware-web-data/gateway.env` | Secrets + CF team/AUD/token + `CHUDWARE_WEB_SESSION_SECRET` (never commit) |
+| `~/chudware-web-data/{workspace,bucket,plm,logs}` | Runtime file state |
+| PostgreSQL (`CHUDWARE_DB_URL`) | Accounts, chat history, webhook events, credentials, sessions, email tokens, mail outbox |
 
 ## AI modeling agent (remote/subscription models)
 

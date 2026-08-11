@@ -168,7 +168,7 @@ def make_thumbnail() -> bool:
 
 
 def regen_and_verify() -> dict:
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
     if not cb.available():
         return {"ok": False, "error": "libchudware not available"}
     result = build_frame(cb)
@@ -182,7 +182,7 @@ def regen_and_verify() -> dict:
 
 
 if __name__ == "__main__":
-    from mcp_server import core_bridge as cb
+    from services.mcp import core_bridge as cb
     if not cb.available():
         print("FATAL: libchudware not available.")
         sys.exit(1)

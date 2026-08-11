@@ -18,7 +18,7 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import app as app_mod  # noqa: E402
+from gateway import accounts, app as app_mod  # noqa: E402
 from gateway.config import settings  # noqa: E402
 
 DEV_HEADERS = {"X-Dev-User": "demo@example.com"}
@@ -27,6 +27,20 @@ DEV_HEADERS = {"X-Dev-User": "demo@example.com"}
 @pytest.fixture()
 def client():
     return TestClient(app_mod.app)
+
+
+@pytest.fixture()
+def dev_account(pg, monkeypatch):
+    """DEV_HEADERS' identity, active in the account store.
+
+    AuthMiddleware authorizes from the store, so an unseeded dev identity 403s
+    before any route below is reached. Requested only by tests whose subject is
+    the served response — the two anonymous tests must stay unseeded, or a
+    regression that stopped requiring auth at all would still look green.
+    """
+    monkeypatch.setattr(settings, "dev_mode", True)
+    accounts.ensure_account("demo@example.com", display="Demo User")
+    accounts.set_status("demo@example.com", "active", decided_by="test")
 
 
 @pytest.fixture()
@@ -58,7 +72,7 @@ class TestAppServe:
         r = client.get("/app/")
         assert r.status_code in (401, 403)
 
-    def test_app_index_coop_coep_and_cache(self, client, app_tree):
+    def test_app_index_coop_coep_and_cache(self, client, app_tree, dev_account):
         r = client.get("/app/", headers=DEV_HEADERS)
         assert r.status_code == 200
         assert r.headers["cross-origin-opener-policy"] == "same-origin"
@@ -67,7 +81,7 @@ class TestAppServe:
         assert "text/html" in (r.headers.get("content-type") or "")
         assert "chudware" in r.text
 
-    def test_app_csp_permits_wasm_and_blob_workers(self, client, app_tree):
+    def test_app_csp_permits_wasm_and_blob_workers(self, client, app_tree, dev_account):
         """The site-wide CSP in app.py is fatal for the Emscripten client.
 
         `script-src 'self'` alone makes Chrome refuse WebAssembly.instantiate,
@@ -88,7 +102,7 @@ class TestAppServe:
             assert "'unsafe-eval'" not in csp.replace("'wasm-unsafe-eval'", "")
 
     def test_app_bare_path_redirects_to_slash_and_relative_bundle_resolves(
-        self, client, app_tree
+        self, client, app_tree, dev_account
     ):
         redirect = client.get("/app", headers=DEV_HEADERS, follow_redirects=False)
         assert redirect.status_code == 307
@@ -108,7 +122,7 @@ class TestAppServe:
         assert asset.headers["cross-origin-opener-policy"] == "same-origin"
         assert asset.text == "/* wasm glue */\n"
 
-    def test_app_wasm_and_data_mime(self, client, app_tree):
+    def test_app_wasm_and_data_mime(self, client, app_tree, dev_account):
         rw = client.get("/app/chudware.wasm", headers=DEV_HEADERS)
         assert rw.status_code == 200
         assert rw.headers["content-type"].startswith("application/wasm")
@@ -123,7 +137,7 @@ class TestAppServe:
         assert rd.headers["cross-origin-embedder-policy"] == "require-corp"
         assert rd.content == b"PACK"
 
-    def test_app_traversal_rejected(self, client, app_tree):
+    def test_app_traversal_rejected(self, client, app_tree, dev_account):
         r = client.get("/app/../config.py", headers=DEV_HEADERS)
         # Starlette may normalize before route match → 404; our clamp → 400.
         assert r.status_code in (400, 404)
@@ -137,7 +151,7 @@ class TestPerfClient:
         )
         assert r.status_code in (401, 403)
 
-    def test_perf_appends_line(self, client, traces_dir):
+    def test_perf_appends_line(self, client, traces_dir, dev_account):
         body = {"boot_ms": 1234.5, "fps": 58.0, "rpc_ms": 12.0, "ua": "TestUA/1.0"}
         r = client.post("/perf/client", headers=DEV_HEADERS, json=body)
         assert r.status_code == 200
@@ -155,7 +169,7 @@ class TestPerfClient:
         assert rec["ua"] == "TestUA/1.0"
         assert isinstance(rec["ts"], (int, float))
 
-    def test_perf_oversized_rejected(self, client, traces_dir):
+    def test_perf_oversized_rejected(self, client, traces_dir, dev_account):
         # >4 KiB payload — Content-Length / body both over the hard cap.
         fat = {"boot_ms": 1, "fps": 1, "rpc_ms": 1, "ua": "x" * 5000}
         r = client.post("/perf/client", headers=DEV_HEADERS, json=fat)
@@ -223,7 +237,7 @@ class TestContentEncoding:
         assert enc is None
         assert served == target
 
-    def test_http_serves_gzip_with_headers(self, client, app_tree):
+    def test_http_serves_gzip_with_headers(self, client, app_tree, dev_account):
         # End-to-end: stdlib-gzip variant, fresh mtime → server sets Content-Encoding
         # + Vary and httpx transparently decodes back to the original bytes.
         import gzip as _gz

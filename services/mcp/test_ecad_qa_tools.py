@@ -29,9 +29,9 @@ import sys
 from pathlib import Path
 
 from services.ecad import sch_qa
-from mcp_server.ecad_common import _ECAD, ecad_session
-from mcp_server.ecad_qa_tools import register_ecad_qa_tools
-from mcp_server.ecad_sch_tools import register_ecad_sch_tools
+from services.mcp.ecad_common import _ECAD, ecad_session
+from services.mcp.ecad_qa_tools import register_ecad_qa_tools
+from services.mcp.ecad_sch_tools import register_ecad_sch_tools
 
 _REPO = Path(__file__).resolve().parents[2]
 
@@ -106,7 +106,7 @@ def _server_names() -> set:
     if not _SERVER_NAMES:
         _SERVER_NAMES.update(_run_probe(
             "import sys, json; sys.path.insert(0, '.');"
-            "from mcp_server import server;"
+            "from services.mcp import server;"
             "print(json.dumps({'names': sorted(server.mcp._tool_manager._tools)}))"
         )["names"])
     return _SERVER_NAMES
@@ -207,16 +207,16 @@ def test_registered_under_family_ecad_and_count_went_up() -> None:
     """
     probe = (
         "import sys, types, json; sys.path.insert(0, '.');"
-        "from mcp_server import server;"
+        "from services.mcp import server;"
         "from services.mcp import tool_registry as reg;"
         "print(json.dumps({'names': sorted(server.mcp._tool_manager._tools),"
         " 'tag': reg.catalog().get('ecad_lint_schematic')}))"
     )
     neuter = (
         "import sys, types; sys.path.insert(0, '.');"
-        "m = types.ModuleType('mcp_server.ecad_qa_tools');"
+        "m = types.ModuleType('services.mcp.ecad_qa_tools');"
         "m.register_ecad_qa_tools = lambda mcp: None;"
-        "sys.modules['mcp_server.ecad_qa_tools'] = m;"
+        "sys.modules['services.mcp.ecad_qa_tools'] = m;"
     ) + probe
 
     live = _run_probe(probe)

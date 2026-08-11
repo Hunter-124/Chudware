@@ -16,6 +16,19 @@
 #include <utility>
 #include <vector>
 
+// MSVC ships these with an underscore prefix rather than the POSIX spelling, and
+// has no setenv/unsetenv at all — _putenv_s with an empty value is the documented
+// way to remove a variable. Confined to this test; the twin library itself is
+// already platform-neutral via twin/wide_math.h.
+#if defined(_MSC_VER)
+#define popen  _popen
+#define pclose _pclose
+static inline int setenv(const char* name, const char* value, int /*overwrite*/) {
+    return _putenv_s(name, value);
+}
+static inline int unsetenv(const char* name) { return _putenv_s(name, ""); }
+#endif
+
 #ifndef CHUDWARE_SOURCE_DIR
 #define CHUDWARE_SOURCE_DIR "."
 #endif
@@ -70,7 +83,19 @@ std::uint64_t scenarioHash() {
     return trace.determinismHash();
 }
 
+// Quote a path for the shell _popen actually spawns. These are genuinely
+// different languages, not a spelling difference: POSIX sh takes single quotes
+// and has no escape inside them (hence the close-escape-reopen dance), while
+// cmd.exe only understands double quotes and does not process backslash escapes
+// at all. Emitting POSIX quoting on Windows compiles fine and then fails at
+// runtime, which is worse than failing to build.
 std::string shellQuote(std::string_view text) {
+#if defined(_MSC_VER)
+    std::string result = "\"";
+    result.append(text);
+    result.push_back('"');
+    return result;
+#else
     std::string result = "'";
     for (const char c : text) {
         if (c == '\'') result += "'\\''";
@@ -78,6 +103,7 @@ std::string shellQuote(std::string_view text) {
     }
     result.push_back('\'');
     return result;
+#endif
 }
 
 std::string subprocessHash() {

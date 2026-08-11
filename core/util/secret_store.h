@@ -6,8 +6,10 @@
 
 namespace chudware::secret_store {
 
-// Three-function platform seam. `dataDir` is used only for DPAPI ciphertext and
-// for the explicit 0600 fallback when no OS keychain is available.
+// Three-function platform seam. On Windows, `dataDir` stores only user-bound
+// DPAPI ciphertext; POSIX mode bits are not its protection. On macOS and Linux,
+// `dataDir` is used only for the explicit, verified-0600 fallback when the OS
+// keychain is unavailable.
 bool store(std::string_view service, std::string_view account,
            const std::vector<unsigned char>& value, std::string_view dataDir);
 bool load(std::string_view service, std::string_view account,

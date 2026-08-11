@@ -344,12 +344,17 @@ jobs:
 
           exit $status
 
+      # This compile-and-test gate deliberately disables the 1.5 GB gitignored
+      # CEF SDK on every host configure; makeWebView then uses NullWebView.
+      # Consequence: native-build does not compile the CEF backend, so a
+      # CEF-only break surfaces at release time. release.yml intentionally
+      # remains CEF-enabled and must build against a provisioned SDK.
       - name: Configure and build host GUI (POSIX)
         if: matrix.build_host && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF
           cmake --build ${{ matrix.host_build_dir }}
 
       - name: Configure and build host GUI (Windows)
@@ -357,7 +362,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build ${{ matrix.host_build_dir }}
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

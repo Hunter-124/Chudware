@@ -100,6 +100,12 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
 - `CMakePresets.json` requires **CMake >= 3.24** on any runner that runs
   `cmake --preset`; `native-build.yml` checks this explicitly and fails with
   that message rather than a confusing generator error.
+- **`native-build.yml` deliberately configures every host GUI build with
+  `CHUDWARE_ENABLE_CEF=OFF`.** The per-push compile-and-test gate therefore uses
+  `NullWebView` and does not compile the CEF backend; a CEF-only break surfaces
+  at release time. Tagged releases remain CEF-enabled, so `cc-linux-build` and
+  `cc-win-package` need the platform CEF SDK provisioned before the first tagged
+  release.
 
 ### Provisioning: `runner-smoke.yml`'s dispatch-only `provision` job
 

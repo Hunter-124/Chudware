@@ -15,14 +15,16 @@
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #  include <dpapi.h>
-#elif defined(__APPLE__)
-#  include <Security/Security.h>
 #else
 #  include <fcntl.h>
 #  include <sys/stat.h>
 #  include <sys/types.h>
-#  include <sys/wait.h>
 #  include <unistd.h>
+#  if defined(__APPLE__)
+#    include <Security/Security.h>
+#  else
+#    include <sys/wait.h>
+#  endif
 #endif
 
 namespace chudware::secret_store {
@@ -54,32 +56,45 @@ void warnOnce(const fs::path& path) {
     }
 }
 
-bool atomicWrite0600(const fs::path& path, const std::vector<unsigned char>& value) {
+bool atomicWriteProtectedFile(const fs::path& path,
+                              const std::vector<unsigned char>& value) {
     std::error_code ec;
     fs::create_directories(path.parent_path(), ec);
     if (ec) return false;
     const fs::path tmp = path.string() + ".tmp";
 #if !defined(_WIN32)
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    constexpr mode_t secretMode = S_IRUSR | S_IWUSR;
+    const int fd =
+        ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, secretMode);
     if (fd < 0) return false;
+    const auto rejectTemporaryFile = [&] {
+        ::close(fd);
+        ::unlink(tmp.c_str());
+        return false;
+    };
+
+    // open(2)'s mode only applies when it creates the file. Repair a stale
+    // temporary file before writing, then verify the descriptor rather than
+    // trusting umask or a path-based check.
+    struct stat metadata {};
+    if (::fchmod(fd, secretMode) != 0 || ::fstat(fd, &metadata) != 0 ||
+        !S_ISREG(metadata.st_mode) || (metadata.st_mode & 0777) != secretMode)
+        return rejectTemporaryFile();
+
     std::size_t done = 0;
     while (done < value.size()) {
         const ssize_t n = ::write(fd, value.data() + done, value.size() - done);
         if (n > 0) done += static_cast<std::size_t>(n);
         else if (n < 0 && errno == EINTR) continue;
-        else {
-            ::close(fd);
-            ::unlink(tmp.c_str());
-            return false;
-        }
+        else return rejectTemporaryFile();
     }
-    const bool synced = ::fsync(fd) == 0;
+    if (::fsync(fd) != 0) return rejectTemporaryFile();
     ::close(fd);
-    if (!synced) {
-        ::unlink(tmp.c_str());
-        return false;
-    }
 #else
+    // Only user-bound DPAPI ciphertext reaches this branch. The file inherits
+    // the per-user profile ACL, but confidentiality does not depend on POSIX
+    // mode bits or that ACL: CryptProtectData protects the bytes for the
+    // current Windows user on this machine.
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     if (!out) return false;
     out.write(reinterpret_cast<const char*>(value.data()), static_cast<std::streamsize>(value.size()));
@@ -92,10 +107,23 @@ bool atomicWrite0600(const fs::path& path, const std::vector<unsigned char>& val
         ec.clear();
         fs::rename(tmp, path, ec);
     }
+    if (ec) {
+        std::error_code cleanupError;
+        fs::remove(tmp, cleanupError);
+        return false;
+    }
 #if !defined(_WIN32)
-    if (!ec) ::chmod(path.c_str(), 0600);
+    // The descriptor check above prevents an exposure window. Apply and check
+    // the final pathname too; never report success with an unexpectedly
+    // readable entitlement file.
+    if (::chmod(path.c_str(), secretMode) != 0 || ::stat(path.c_str(), &metadata) != 0 ||
+        !S_ISREG(metadata.st_mode) || (metadata.st_mode & 0777) != secretMode) {
+        std::error_code cleanupError;
+        fs::remove(path, cleanupError);
+        return false;
+    }
 #endif
-    return !ec;
+    return true;
 }
 
 bool readFile(const fs::path& path, std::vector<unsigned char>& value) {
@@ -217,7 +245,7 @@ bool store(std::string_view service, std::string_view account,
         return false;
     std::vector<unsigned char> bytes(encrypted.pbData, encrypted.pbData + encrypted.cbData);
     LocalFree(encrypted.pbData);
-    return atomicWrite0600(fallbackPath(service, account, dataDir, ".dpapi"), bytes);
+    return atomicWriteProtectedFile(fallbackPath(service, account, dataDir, ".dpapi"), bytes);
 #elif defined(__APPLE__)
     UInt32 oldLength = 0;
     void* oldData = nullptr;
@@ -249,7 +277,7 @@ bool store(std::string_view service, std::string_view account,
 #endif
     const fs::path path = fallbackPath(service, account, dataDir);
     warnOnce(path);
-    return atomicWrite0600(path, value);
+    return atomicWriteProtectedFile(path, value);
 }
 
 bool load(std::string_view service, std::string_view account,
@@ -295,7 +323,8 @@ bool erase(std::string_view service, std::string_view account, std::string_view 
     std::error_code ec;
     fs::remove(fallbackPath(service, account, dataDir, ".dpapi"), ec);
     return !ec;
-#elif defined(__APPLE__)
+#else
+#  if defined(__APPLE__)
     UInt32 length = 0;
     void* data = nullptr;
     SecKeychainItemRef item = nullptr;
@@ -307,14 +336,15 @@ bool erase(std::string_view service, std::string_view account, std::string_view 
     const OSStatus status = found == errSecSuccess ? SecKeychainItemDelete(item) : found;
     if (item) CFRelease(item);
     if (status == errSecSuccess) return true;
-#else
+#  else
     if (runSecretTool({"clear", "service", std::string(service), "account",
                        std::string(account)}, {}, nullptr) == 0)
         return true;
-#endif
+#  endif
     std::error_code ec;
     fs::remove(fallbackPath(service, account, dataDir), ec);
     return !ec;
+#endif
 }
 
 }  // namespace chudware::secret_store

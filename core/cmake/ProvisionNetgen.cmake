@@ -32,9 +32,12 @@ if(WIN32)
   set(_ng_implib "${_ng_install}/lib/nglib.lib")
 else()
   file(GLOB _ng_implib_glob "${_ng_install}/lib/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}"
-                            "${_ng_install}/lib64/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}")
+                            "${_ng_install}/lib64/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}"
+                            "${_ng_install}/Contents/MacOS/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}")
   if(_ng_implib_glob)
     list(GET _ng_implib_glob 0 _ng_implib)
+  elseif(APPLE)
+    set(_ng_implib "${_ng_install}/Contents/MacOS/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}")
   else()
     set(_ng_implib "${_ng_install}/lib/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}")
   endif()
@@ -148,7 +151,8 @@ endif()
 # Re-resolve the nglib path on ELF/Mach-O now that the install exists (lib vs lib64).
 if(NOT WIN32)
   file(GLOB _ng_implib_glob "${_ng_install}/lib/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}"
-                            "${_ng_install}/lib64/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}")
+                            "${_ng_install}/lib64/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}"
+                            "${_ng_install}/Contents/MacOS/libnglib${CMAKE_SHARED_LIBRARY_SUFFIX}")
   if(_ng_implib_glob)
     list(GET _ng_implib_glob 0 _ng_implib)
   endif()
@@ -158,7 +162,12 @@ if(NOT EXISTS "${_ng_implib}")
 endif()
 
 # --- expose locations --------------------------------------------------------
-set(NETGEN_INCLUDE_DIRS "${_ng_install}/include" CACHE PATH "Netgen include dir" FORCE)
+if(APPLE)
+  set(_ng_include "${_ng_install}/Contents/Resources/include")
+else()
+  set(_ng_include "${_ng_install}/include")
+endif()
+set(NETGEN_INCLUDE_DIRS "${_ng_include}" CACHE PATH "Netgen include dir" FORCE)
 set(NETGEN_IMPORT_LIB   "${_ng_implib}"          CACHE FILEPATH "nglib import lib" FORCE)
 
 # Runtime shared libs to stage next to libchudware: nglib + ngcore. On Windows also stage
@@ -171,7 +180,8 @@ if(WIN32)
   set(NETGEN_ZLIB_DLL "${_ng_zlib_dir}/bin/zlib.dll" CACHE FILEPATH "zlib DLL (nglib dep)" FORCE)
 else()
   file(GLOB _ng_dlls "${_ng_install}/lib/libng*${CMAKE_SHARED_LIBRARY_SUFFIX}*"
-                     "${_ng_install}/lib64/libng*${CMAKE_SHARED_LIBRARY_SUFFIX}*")
+                     "${_ng_install}/lib64/libng*${CMAKE_SHARED_LIBRARY_SUFFIX}*"
+                     "${_ng_install}/Contents/MacOS/libng*${CMAKE_SHARED_LIBRARY_SUFFIX}*")
   set(NETGEN_DLLS "${_ng_dlls}" CACHE STRING "Netgen runtime shared libs" FORCE)
   set(NETGEN_ZLIB_DLL "" CACHE FILEPATH "zlib DLL (nglib dep; unused on ELF/Mach-O)" FORCE)
 endif()

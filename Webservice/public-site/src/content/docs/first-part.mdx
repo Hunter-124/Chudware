@@ -1,0 +1,23 @@
+---
+title: Your first part
+description: Create a constrained sketch, extrude it, round its edges, and save an editable Chudware part.
+section: Model
+order: 40
+---
+## Start a part
+
+Choose **File → New Part**. Give the document a descriptive name such as `mounting-bracket`; revision numbers belong in project history, not in the filename.
+
+## Sketch the base
+
+Select the Top plane, choose **Sketch**, and draw a center rectangle. Add horizontal and vertical relations, then use **Smart Dimension** to set its width and depth. A fully defined sketch cannot drift when upstream dimensions change.
+
+## Make it solid
+
+Exit the sketch and choose **Extrude**. Set the height, preview the result, and confirm. The feature appears beneath the sketch in the Feature Manager.
+
+Select the outside vertical edges and add a **Fillet**. If the preview fails, reduce the radius or check whether the selected edges meet a very short face.
+
+## Save the editable design
+
+Save as `.step+`. This native file keeps the feature tree, dimensions, materials, studies, and drawings. Export STEP or STL only when another tool needs a flattened handoff.

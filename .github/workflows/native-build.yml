@@ -213,7 +213,14 @@ jobs:
               "$($_.Name)=$($_.Value)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             }
           }
-          cl.exe 2>&1 | Select-Object -First 1
+          # PowerShell 5.1 promotes native stderr merged into its pipeline to a
+          # NativeCommandError under Stop. cl writes its healthy banner to
+          # stderr, so let cmd merge it before PowerShell sees it, then judge
+          # the probe by cl's exit status rather than by which stream it used.
+          $compilerOutput = & cmd.exe /d /c 'cl.exe 2>&1'
+          $compilerStatus = $LASTEXITCODE
+          $compilerOutput | Select-Object -First 1
+          if ($compilerStatus -ne 0) { exit $compilerStatus }
 
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -286,8 +293,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Preset binaryDir is build/<preset> for every platform.
-          tree="build/${{ matrix.preset }}"
+          # The root dispatcher adds core/ as a subdirectory. enable_testing()
+          # lives there, so its CTestTestfile.cmake and registered suite are in
+          # build/<preset>/core rather than the dispatcher build directory.
+          tree="build/${{ matrix.preset }}/core"
           log="${RUNNER_TEMP}/ctest-core.log"
           status=0
           ctest --test-dir "${tree}" --output-on-failure 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
@@ -313,7 +322,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
 
-          $tree = 'build/${{ matrix.preset }}'
+          # The root dispatcher adds core/ as a subdirectory; its registered
+          # CTest suite is therefore rooted at build/<preset>/core.
+          $tree = 'build/${{ matrix.preset }}/core'
           $log = Join-Path $env:RUNNER_TEMP 'ctest-core.log'
           ctest --test-dir $tree --output-on-failure 2>&1 | Tee-Object -FilePath $log
           $status = $LASTEXITCODE

@@ -35,6 +35,7 @@ from fastapi.responses import FileResponse
 
 try:
     from .auth import User, get_current_user
+    from .accounts import get_account
     from .config import settings
     from .limits import (
         api_writes,
@@ -45,6 +46,7 @@ try:
     )
 except ImportError:  # uvicorn app:app from package dir
     from auth import User, get_current_user
+    from accounts import get_account
     from config import settings
     from limits import (
         api_writes,
@@ -200,7 +202,14 @@ async def workspace_upload(
     uploads.enforce(user.email, "uploads")
     declared = _content_length(request)
     cap = enforce_upload_size(declared)
-    enforce_disk_quota(root, declared or 0)
+    account = get_account(user.email)
+    plan = getattr(account, "plan", "trial")
+    enforce_disk_quota(
+        user.email,
+        plan,
+        root,
+        incoming_bytes=declared or 0,
+    )
     base = _resolve(root, dir)
     if not base.is_dir():
         raise HTTPException(status_code=400, detail="not a directory")
@@ -223,6 +232,9 @@ async def workspace_upload(
                         detail=f"upload too large — {cap // (1024 * 1024)} MiB max",
                     )
                 out.write(chunk)
+        # Content-Length can be absent or dishonest. The completed file is
+        # inside root now, so this final check binds the quota to actual bytes.
+        enforce_disk_quota(user.email, plan, root)
     except BaseException:
         target.unlink(missing_ok=True)
         raise

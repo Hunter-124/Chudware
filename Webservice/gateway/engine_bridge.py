@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import threading
+from collections.abc import Mapping
 from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
@@ -21,11 +22,17 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 try:
+    from .accounts import get_account
+    from .credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
     from .config import settings
     from .limits import user_slug
+    from .plans import limits_for
 except ImportError:  # uvicorn app:app from package dir
+    from accounts import get_account
+    from credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
     from config import settings
     from limits import user_slug
+    from plans import limits_for
 
 log = logging.getLogger("chudware-web.engine")
 
@@ -149,21 +156,18 @@ def path_violation(line: str, allowed_roots: list[PurePosixPath]) -> str | None:
     return None
 
 
-# Agent-turn RPCs may pin provider/model (and sometimes credentials) from the web
-# client's local settings. Credentials MUST stay server-side: the shared hostd already
-# resolves keys/tokens from the host user's config.json by provider name, so we drop
-# secret-bearing fields only. provider + model SELECTION is allowed through so a web
-# user can use the host's administrator-managed shared providers.
-#
-# Multi-tenant caveat: all web turns still spend the host user's accounts; per-user
-# billing isolation is out of scope. If no provider is selected, hostd keeps using its
-# default/active account (same as before).
+# Agent RPCs may pin provider/model (and sometimes credentials) from the web
+# client's local settings. Credentials MUST stay server-side. The gateway also
+# owns the billing actor: a browser-supplied copy is removed before the current
+# account state is injected under options, the object run.cpp actually receives.
 _AGENT_TURN_PROVIDER_METHODS = frozenset({
     "agent_run_v2", "agent_ask_v2", "agent_clarify_v1", "agent_mission_v1",
     "session_btw", "session_handoff",
 })
 # Secrets / server-owned endpoint config — never accept from the browser.
-_STRIP_SECRET_FIELDS = ("api_key", "base_url", "fallback_api_keys", "auth_mode")
+_STRIP_SECRET_FIELDS = (
+    "api_key", "base_url", "fallback_api_keys", "auth_mode",
+)
 
 # agent_list_models is a C++ probe in libchudware — it does NOT load host config.json.
 # The WASM client has empty/IDBFS keys, so without a server-side inject the probe
@@ -436,28 +440,133 @@ def _rpc_error(line: str, code: int, message: str) -> str:
         separators=(",", ":"),
     )
 
+def _rpc_result(line: str, result: Mapping[str, Any]) -> str:
+    call_id: Any = None
+    try:
+        msg = json.loads(line)
+        if isinstance(msg, dict):
+            call_id = msg.get("id")
+    except ValueError:
+        pass
+    return json.dumps({"id": call_id, "result": dict(result)}, separators=(",", ":"))
 
-def _sanitize_agent_provider(line: str) -> str:
-    """Drop client-supplied secrets from agent-turn RPCs; keep provider/model selection."""
+
+def _agent_cost_inputs(line: str) -> tuple[str, int, int]:
+    """Return model, prompt estimate, requested output cap from an agent RPC."""
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return "", 1, 8192
+    params = msg.get("params") if isinstance(msg, dict) else {}
+    if not isinstance(params, dict):
+        params = {}
+    options = params.get("options")
+    if not isinstance(options, dict):
+        options = {}
+    model = str(params.get("model") or options.get("model") or "")
+    text = "".join(
+        str(params.get(key) or "") for key in ("request", "question", "prompt")
+    )
+    history = options.get("history") or params.get("history")
+    if isinstance(history, list):
+        text += "".join(
+            str(item.get("text") or item.get("content") or "")
+            for item in history if isinstance(item, dict)
+        )
+    prompt_estimate = max(1, (len(text.encode("utf-8")) + 3) // 4)
+    raw_max = (
+        options.get("max_output_tokens")
+        or options.get("max_tokens")
+        or params.get("max_output_tokens")
+        or params.get("max_tokens")
+        or 8192
+    )
+    try:
+        max_output = max(0, int(raw_max))
+    except (TypeError, ValueError):
+        max_output = 8192
+    return model, prompt_estimate, max_output
+
+
+def _provider_usage_payload(line: str) -> dict[str, Any] | None:
+    try:
+        message = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(message, dict) or message.get("event") != "agent.event":
+        return None
+    data = message.get("data")
+    if not isinstance(data, dict) or data.get("kind") != "agent.provider_usage":
+        return None
+    return data
+
+
+
+def _sanitize_agent_rpc(line: str, actor: Mapping[str, Any]) -> str:
+    """Drop forged server fields and inject the authenticated account actor."""
     try:
         msg = json.loads(line)
     except ValueError:
         return line
-    if not isinstance(msg, dict) or msg.get("method") not in _AGENT_TURN_PROVIDER_METHODS:
+    if not isinstance(msg, dict):
+        return line
+    method = str(msg.get("method") or "")
+    if not (method.startswith("agent_") or method in _AGENT_TURN_PROVIDER_METHODS):
         return line
     params = msg.get("params")
     if not isinstance(params, dict):
-        return line
-    if not any(k in params for k in _STRIP_SECRET_FIELDS):
-        return line
-    for k in _STRIP_SECRET_FIELDS:
-        params.pop(k, None)
+        params = {}
+        msg["params"] = params
+    # Only inference turns accept provider selection from the browser. Other
+    # agent RPCs (notably list_models) may already carry gateway-injected
+    # credentials and must retain them.
+    params.pop("_chudware_actor", None)
+    if method in _AGENT_TURN_PROVIDER_METHODS:
+        for key in _STRIP_SECRET_FIELDS:
+            params.pop(key, None)
+    options = params.get("options")
+    if not isinstance(options, dict):
+        options = {}
+        params["options"] = options
+    injected = {
+        "email": str(actor["email"]),
+        "plan": str(actor["plan"]),
+        "credits_remaining": max(0, int(actor["credits_remaining"])),
+        "key_source": str(actor["key_source"]),
+    }
+    rate = actor.get("_rate")
+    if isinstance(rate, Mapping):
+        injected["_rate"] = {
+            "model": str(rate.get("model") or ""),
+            "prompt_usd_per_mtok": str(rate.get("prompt_usd_per_mtok") or "0"),
+            "completion_usd_per_mtok": str(
+                rate.get("completion_usd_per_mtok") or "0"
+            ),
+        }
+    if actor.get("_reservation_credits") is not None:
+        injected["_reservation_credits"] = max(
+            0, int(actor.get("_reservation_credits") or 0)
+        )
+    options["_chudware_actor"] = injected
     return json.dumps(msg, separators=(",", ":"))
 
 
 @router.websocket("/engine")
 async def engine_ws(ws: WebSocket) -> None:
     user = ws.state.user  # AuthMiddleware closed 4401/4403 already if unauthenticated
+    account = get_account(user.email)
+    try:
+        cloud_allowed = bool(account and limits_for(account.plan).cloud)
+    except ValueError:
+        cloud_allowed = False
+    if not cloud_allowed:
+        log.info(
+            "engine bridge refused for %s: plan %s has no cloud access",
+            user.email,
+            getattr(account, "plan", ""),
+        )
+        await ws.close(code=4403, reason="plan_no_cloud")
+        return
     # AUDIT (multi-tenant): this bridge attaches the caller to the ONE shared
     # webd daemon. /app is the browser-native WASM client and is now the only
     # delivery mode, so there is no per-caller sandbox to hang authorization on.
@@ -497,13 +606,15 @@ async def engine_ws(ws: WebSocket) -> None:
             PurePosixPath("/dev/shm"),
             PurePosixPath("/tmp"),
         ]
+        active_actor: dict[str, Any] | None = None
+        active_reservation: dict[str, Any] | None = None
 
         async def ws_to_daemon() -> None:
+            nonlocal active_actor, active_reservation
             max_frame = settings.ws_max_message_bytes
             while True:
                 line = await ws.receive_text()
                 if len(line.encode("utf-8")) > max_frame:
-                    # One oversized frame can OOM the gateway; never forward it.
                     log.warning(
                         "engine bridge %s: frame exceeds %d bytes; closing",
                         user.email,
@@ -513,33 +624,29 @@ async def engine_ws(ws: WebSocket) -> None:
                     return
 
                 method = _rpc_method(line)
+                if method == "agent_admin_turn":
+                    await ws.send_text(_rpc_error(
+                        line, -32601, "method unavailable on web bridge"
+                    ))
+                    continue
                 if method.startswith("agent_provider_") and user.role != "admin":
-                    # Provider login/state mutates or reveals the administrator's
-                    # shared-host auth store. Role comes only from AuthMiddleware.
                     log.warning(
                         "engine bridge %s: rejected administrator provider RPC",
                         user.email,
                     )
                     await ws.send_text(_rpc_error(
-                        line,
-                        -32003,
-                        "administrator authorization required",
+                        line, -32003, "administrator authorization required"
                     ))
                     continue
-
                 offender = path_violation(line, allowed_roots)
                 if offender is not None:
-                    # Do NOT tear the socket down: one bad path is a client bug or a
-                    # probe, and killing the bridge would lose the user's live document.
                     log.warning(
                         "engine bridge %s: rejected out-of-jail path %r",
                         user.email,
                         offender,
                     )
                     await ws.send_text(_rpc_error(
-                        line,
-                        -32001,
-                        "path outside your workspace",
+                        line, -32001, "path outside your workspace"
                     ))
                     continue
 
@@ -548,24 +655,129 @@ async def engine_ws(ws: WebSocket) -> None:
                 elif method == _LIST_MODELS_METHOD:
                     line, error = _inject_list_models_creds(line)
                     if error is not None:
-                        # Never log the caller URL or any loaded host credential.
                         log.warning(
                             "engine bridge %s: rejected non-canonical model endpoint",
                             user.email,
                         )
                         await ws.send_text(_rpc_error(line, -32002, error))
                         continue
-                elif method in _AGENT_TURN_PROVIDER_METHODS:
-                    line = _sanitize_agent_provider(line)
+
+                if method.startswith("agent_") or method in _AGENT_TURN_PROVIDER_METHODS:
+                    actor = await asyncio.to_thread(actor_for, user.email)
+                    if (
+                        actor.get("key_source") == "pool"
+                        and method in _AGENT_TURN_PROVIDER_METHODS
+                    ):
+                        model, prompt_estimate, max_output = _agent_cost_inputs(line)
+                        reservation = await asyncio.to_thread(
+                            reserve_turn,
+                            actor,
+                            model=model,
+                            prompt_tokens_estimate=prompt_estimate,
+                            max_output_tokens=max_output,
+                        )
+                        if not reservation.get("ok"):
+                            await ws.send_text(_rpc_result(
+                                line,
+                                {"ok": False, "reason": "insufficient_credits"},
+                            ))
+                            continue
+                        actor["credits_remaining"] = int(
+                            reservation["credits_remaining"]
+                        )
+                        actor["_reservation_credits"] = int(
+                            reservation["estimated_credits"]
+                        )
+                        actor["_rate"] = {
+                            "model": model,
+                            "prompt_usd_per_mtok": str(
+                                reservation["prompt_usd_per_mtok"]
+                            ),
+                            "completion_usd_per_mtok": str(
+                                reservation["completion_usd_per_mtok"]
+                            ),
+                        }
+                        try:
+                            request_id = json.loads(line).get("id")
+                        except (ValueError, AttributeError):
+                            request_id = None
+                        active_reservation = {
+                            "id": reservation["reservation_id"],
+                            "request_id": request_id,
+                            "actual_credits": 0,
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "reported": False,
+                        }
+                    if method in _AGENT_TURN_PROVIDER_METHODS:
+                        active_actor = actor
+                    line = _sanitize_agent_rpc(line, actor)
                 writer.write(line.encode("utf-8") + b"\n")
                 await writer.drain()
 
         async def daemon_to_ws() -> None:
+            nonlocal active_actor, active_reservation
             while True:
                 raw = await reader.readline()
-                if not raw:  # daemon EOF (drain/restart)
+                if not raw:
                     break
-                await ws.send_text(raw.decode("utf-8", errors="replace").rstrip("\n"))
+                line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                usage = _provider_usage_payload(line)
+                if (
+                    usage is not None
+                    and active_actor is not None
+                    and active_actor.get("key_source") == "pool"
+                    and active_reservation is not None
+                ):
+                    source = str(usage.get("source") or "")
+                    if "unreported" not in source:
+                        try:
+                            actual = await asyncio.to_thread(
+                                usage_cost,
+                                str(usage.get("model") or ""),
+                                int(usage.get("prompt_tokens") or 0),
+                                int(usage.get("completion_tokens") or 0),
+                            )
+                            active_reservation["actual_credits"] += actual
+                            active_reservation["prompt_tokens"] += int(
+                                usage.get("prompt_tokens") or 0
+                            )
+                            active_reservation["completion_tokens"] += int(
+                                usage.get("completion_tokens") or 0
+                            )
+                            active_reservation["reported"] = True
+                        except Exception:
+                            log.exception(
+                                "usage pricing failed; reservation stands for %s",
+                                user.email,
+                            )
+                try:
+                    terminal = json.loads(line)
+                except ValueError:
+                    terminal = None
+                if (
+                    isinstance(terminal, dict)
+                    and active_reservation is not None
+                    and terminal.get("id") == active_reservation["request_id"]
+                    and ("result" in terminal or "error" in terminal)
+                ):
+                    if active_reservation["reported"]:
+                        try:
+                            await asyncio.to_thread(
+                                reconcile_reservation,
+                                active_reservation["id"],
+                                actual_credits=active_reservation["actual_credits"],
+                                prompt_tokens=active_reservation["prompt_tokens"],
+                                completion_tokens=active_reservation["completion_tokens"],
+                            )
+                        except Exception:
+                            log.exception(
+                                "reservation reconciliation failed for %s",
+                                user.email,
+                            )
+                    active_reservation = None
+                    active_actor = None
+                await ws.send_text(line)
 
         tasks = (
             asyncio.create_task(ws_to_daemon(), name="engine-ws2d"),

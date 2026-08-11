@@ -1,0 +1,25 @@
+---
+title: Install on Windows
+description: Download, verify, and open the current Chudware Windows build.
+section: Installation
+order: 10
+---
+## Before you begin
+
+Use Windows 11 on a 64-bit workstation with current graphics drivers. Download the Windows package from the [download page](/download/) and copy the SHA-256 value shown beside it.
+
+## Verify the download
+
+Open PowerShell in the folder containing the installer and run:
+
+```powershell
+Get-FileHash .\Chudware-Setup.exe -Algorithm SHA256
+```
+
+The value must exactly match the release manifest. Delete the file and download it again if it does not.
+
+## Open an unsigned build
+
+Current builds are unsigned, so Windows may show a publisher warning. Select **More info**, confirm the filename and checksum, then choose **Run anyway**. Do not bypass the warning when the checksum differs.
+
+On first launch, sign in or begin the 14-day trial, choose where projects should be stored, and complete AI setup.

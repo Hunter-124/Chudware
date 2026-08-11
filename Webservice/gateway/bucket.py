@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 try:
     from .config import settings
     from .auth import User, get_current_user
+    from .accounts import get_account
     from .limits import (
         api_writes,
         enforce_disk_quota,
@@ -34,6 +35,7 @@ try:
 except ImportError:  # uvicorn app:app from package dir
     from config import settings
     from auth import User, get_current_user
+    from accounts import get_account
     from limits import (
         api_writes,
         enforce_disk_quota,
@@ -171,7 +173,14 @@ async def bucket_upload(
     uploads.enforce(user.email, "uploads")
     declared = _content_length(request)
     cap = enforce_upload_size(declared)
-    enforce_disk_quota(root, declared or 0)
+    account = get_account(user.email)
+    plan = getattr(account, "plan", "trial")
+    enforce_disk_quota(
+        user.email,
+        plan,
+        root,
+        incoming_bytes=declared or 0,
+    )
     base = _resolve(root, dir, must_exist=False)
     base.mkdir(parents=True, exist_ok=True)
     uploaded: list[dict[str, Any]] = []
@@ -206,6 +215,7 @@ async def bucket_upload(
                             detail=f"upload too large — {cap // (1024 * 1024)} MiB max",
                         )
                     out.write(chunk)
+            enforce_disk_quota(user.email, plan, root)
         except BaseException:
             target.unlink(missing_ok=True)
             raise

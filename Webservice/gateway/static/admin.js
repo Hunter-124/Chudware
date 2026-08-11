@@ -36,7 +36,7 @@
   /* ---- accounts: the approval queue and everyone already through it ---- */
 
   var PAGE_SIZE = 50;
-  var PLANS = ["free", "trial", "pro", "team"];
+  var planCatalog = [];
   var STATUS_CLASS = {
     pending: "st-pending",
     active: "st-active",
@@ -114,13 +114,21 @@
   function planSelect(a) {
     var sel = document.createElement("select");
     sel.title = "Plan for " + a.email;
-    PLANS.forEach(function (p) {
+    planCatalog.forEach(function (plan) {
       var o = document.createElement("option");
-      o.value = p;
-      o.textContent = p;
-      if (p === a.plan) o.selected = true;
+      o.value = plan.id;
+      o.textContent = plan.display_name;
+      if (plan.id === a.plan) o.selected = true;
       sel.appendChild(o);
     });
+    if (!planCatalog.some(function (plan) { return plan.id === a.plan; })) {
+      var unknown = document.createElement("option");
+      unknown.value = a.plan || "";
+      unknown.textContent = "Unknown: " + (a.plan || "(blank)");
+      unknown.selected = true;
+      unknown.disabled = true;
+      sel.appendChild(unknown);
+    }
     sel.addEventListener("change", async function () {
       var to = sel.value;
       setStatus("Moving " + a.email + " to the " + to + " plan\u2026");
@@ -141,8 +149,84 @@
   function fillPlan(host, a, prefix) {
     if (prefix) host.appendChild(document.createTextNode(prefix));
     if (a.status === "active") host.appendChild(planSelect(a));
-    else host.appendChild(document.createTextNode(a.plan || "free"));
+    else host.appendChild(document.createTextNode(a.plan || "trial"));
   }
+  function creditsUrl(email, action) {
+    return "/api/admin/credits/" + encodeURIComponent(email) + "/" + action;
+  }
+
+  function creditControls(a) {
+    var host = document.createElement("div");
+    host.className = "credit-controls";
+    var balance = document.createElement("span");
+    balance.className = "credit-balance";
+    balance.textContent = String(Number(a.credit_balance) || 0) + " credits";
+    host.appendChild(balance);
+
+    var grantLabel = document.createElement("label");
+    var grantCheck = document.createElement("input");
+    grantCheck.type = "checkbox";
+    grantCheck.checked = Boolean(a.ai_grant);
+    grantLabel.appendChild(grantCheck);
+    grantLabel.appendChild(document.createTextNode(" pooled AI"));
+    host.appendChild(grantLabel);
+
+    var unlimitedLabel = document.createElement("label");
+    var unlimited = document.createElement("input");
+    unlimited.type = "checkbox";
+    unlimited.checked = Number(a.credit_ceiling_monthly) === 0;
+    unlimitedLabel.appendChild(unlimited);
+    unlimitedLabel.appendChild(document.createTextNode(" Unlimited"));
+    host.appendChild(unlimitedLabel);
+
+    var ceiling = document.createElement("input");
+    ceiling.type = "number";
+    ceiling.min = "1";
+    ceiling.step = "1";
+    ceiling.placeholder = "monthly cap";
+    ceiling.title = "Monthly pooled-AI credit ceiling";
+    ceiling.disabled = unlimited.checked;
+    if (!unlimited.checked) ceiling.value = String(a.credit_ceiling_monthly);
+    unlimited.addEventListener("change", function () {
+      ceiling.disabled = unlimited.checked;
+      if (!unlimited.checked && !ceiling.value) ceiling.value = "1";
+    });
+    host.appendChild(ceiling);
+
+    host.appendChild(actionBtn("Save", "btn ghost", async function () {
+      setStatus("Saving credit controls for " + a.email + "\u2026");
+      try {
+        await api(creditsUrl(a.email, "controls"), {
+          method: "POST",
+          body: JSON.stringify({
+            ai_grant: grantCheck.checked,
+            credit_ceiling_monthly: unlimited.checked ? 0 : Number(ceiling.value)
+          })
+        });
+        setStatus("Credit controls saved for " + a.email + ".");
+        await load();
+      } catch (e) { setStatus(String(e.message || e), true); }
+    }));
+    host.appendChild(actionBtn("Grant\u2026", "btn ghost", async function () {
+      var raw = prompt("Credits to grant to " + a.email + ":", "1000");
+      if (raw == null) return;
+      var amount = Number(raw);
+      if (!Number.isInteger(amount) || amount <= 0) {
+        setStatus("Grant must be a positive whole number of credits.", true);
+        return;
+      }
+      setStatus("Granting " + amount + " credits to " + a.email + "\u2026");
+      try {
+        await api(creditsUrl(a.email, "grant"), {
+          method: "POST", body: JSON.stringify({ credits: amount })
+        });
+        setStatus("Granted " + amount + " credits to " + a.email + ".");
+        await load();
+      } catch (e) { setStatus(String(e.message || e), true); }
+    }));
+    return host;
+  }
+
 
   function fillActions(host, a) {
     if (a.status === "pending") {
@@ -166,7 +250,7 @@
   }
 
   function placeholder(msg) {
-    rows.innerHTML = "<tr><td colspan='7' class='ac-dim'>" + esc(msg) + "</td></tr>";
+    rows.innerHTML = "<tr><td colspan='8' class='ac-dim'>" + esc(msg) + "</td></tr>";
     cardsEl.innerHTML = "<div class='ac-dim'>" + esc(msg) + "</div>";
   }
 
@@ -180,11 +264,13 @@
         "<td>" + (a.display ? esc(a.display) : "<span class='ac-dim'>\u2014</span>") + "</td>" +
         "<td>" + statusPill(a.status) + "</td>" +
         "<td class='ac-plan'></td>" +
+        "<td class='ac-credit'></td>" +
         "<td class='ac-role'>" + roleHtml(a.role) + "</td>" +
         "<td class='ac-when' title='" + esc(fmtWhen(a.created_at)) + "'>" +
           esc(fmtDate(a.created_at)) + "</td>" +
         "<td class='ac-act'><div class='ac-actions'></div></td>";
       fillPlan(tr.querySelector(".ac-plan"), a, "");
+      tr.querySelector(".ac-credit").appendChild(creditControls(a));
       fillActions(tr.querySelector(".ac-actions"), a);
       rows.appendChild(tr);
 
@@ -196,8 +282,10 @@
         "<div class='ac-row'>" + statusPill(a.status) + roleHtml(a.role) + "</div>" +
         "<div class='ac-meta'>Created " + esc(fmtDate(a.created_at)) + "</div>" +
         "<div class='ac-plan'></div>" +
+        "<div class='ac-credit'></div>" +
         "<div class='ac-actions'></div>";
       fillPlan(card.querySelector(".ac-plan"), a, "Plan ");
+      card.querySelector(".ac-credit").appendChild(creditControls(a));
       fillActions(card.querySelector(".ac-actions"), a);
       cardsEl.appendChild(card);
     });
@@ -262,8 +350,51 @@
     reload();
   });
 
+  async function loadPlanCatalog() {
+    var data = await api("/api/plans");
+    var catalog = data && data.plans;
+    if (!Array.isArray(catalog) || !catalog.length) {
+      throw new Error("server returned an empty plan catalog");
+    }
+    planCatalog = catalog.map(function (plan) {
+      return {
+        id: String(plan.id),
+        display_name: String(plan.display_name || plan.id),
+        purchasable: Boolean(plan.purchasable)
+      };
+    });
+  }
+
   placeholder("Loading accounts\u2026");
-  reload();
+  loadPlanCatalog().then(reload).catch(function (e) {
+    placeholder("Couldn't load plan catalog.");
+    setStatus("Failed to load plans: " + (e.message || e), true);
+  });
+
+  var trialDomains = document.getElementById("trial-domains");
+  var trialDomainsSave = document.getElementById("trial-domains-save");
+  async function loadTrialDomains() {
+    if (!trialDomains) return;
+    var data = await api("/api/admin/credits/trial-domains");
+    trialDomains.value = (data.trial_domains || []).join("\n");
+  }
+  if (trialDomainsSave) {
+    trialDomainsSave.addEventListener("click", async function () {
+      var domains = trialDomains.value.split(/[\n,]+/).map(function (v) {
+        return v.trim();
+      }).filter(Boolean);
+      try {
+        var data = await api("/api/admin/credits/trial-domains", {
+          method: "PUT", body: JSON.stringify({ trial_domains: domains })
+        });
+        trialDomains.value = (data.trial_domains || []).join("\n");
+        setStatus("Trial domains saved.");
+      } catch (e) { setStatus(String(e.message || e), true); }
+    });
+  }
+  loadTrialDomains().catch(function (e) {
+    setStatus("Failed to load trial domains: " + (e.message || e), true);
+  });
 
   /* ---- host folder browser (admin-only, read-only) ---- */
   var modal = document.getElementById("browse-modal");

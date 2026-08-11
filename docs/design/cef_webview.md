@@ -1,52 +1,51 @@
 # In-Panel Browser: CEF Off-Screen Backend
 
-Status: **design + seam landed; CEF backend is next-increment scaffolding (needs the CEF SDK + a real build/verify loop).**
+Status: **shipping and load-bearing on Linux and Windows.** CEF backs both the
+in-app browser and, through a separate headless daemon, the fetch primitive used
+by the 100+ Parts Library source adapters. macOS and Web/WASM build with
+`CHUDWARE_ENABLE_CEF=OFF` and use `NullWebView`.
 
 ## Why
 
 The vendor sign-in panel embeds a browser so users can log into McMaster,
-GrabCAD, TraceParts, SnapEDA, etc. and the [Playwright scraper](../services/browser/)
-can then download models/datasheets under that saved session.
+GrabCAD, TraceParts, SnapEDA, and other sources. The same session is handed to
+the headless CEF daemon (`chudware --cef-daemon`) so source adapters can fetch
+models and datasheets.
 
-The shipping backend (`ScreencastWebView`) streams JPEG frames from a *headless*
-Chromium in the worker and forwards synthetic input. That approach cannot render
-OS-native UI: **native `<select>` popups don't appear, and the desktop clipboard
-is isolated** (no copy/paste, no password-manager autofill). Those are exactly
-the interactions logins need.
+CEF off-screen rendering (OSR) paints into a pixel buffer uploaded as a GL
+texture. It composites `<select>` and popup layers and bridges the OS clipboard
+while remaining inside the ImGui panel. On Wayland this also avoids trying to
+reparent a native browser window into the app.
 
-On Wayland (Fedora default here) you also can't reparent a real browser window
-into the app. So the fix is **CEF off-screen rendering (OSR)**: an in-process
-Chromium Embedded Framework that paints into a pixel buffer we upload as a GL
-texture. CEF composites its own `<select>`/popup layer and bridges the OS
-clipboard, so those work — while staying inside the ImGui panel.
+## The shipping seam
 
-## The seam (landed, build-green with CEF OFF)
-
-All UI talks to the browser through one interface; the engine underneath is a
-swappable implementation. This is the durable abstraction — CEF is just the
-second backend behind it.
+All UI talks to the browser through one interface:
 
 ```
 host/src/ui/widgets/
   web_view_backend.h    IWebViewBackend (open/attach/close/update/draw/url/loginState/…)
                         + makeWebView() factory  ← single backend-selection point
-  web_view.{h,cpp}      ScreencastWebView : IWebViewBackend   (default, ships today)
-  web_view_backend.cpp  makeWebView(): CEF when CHUDWARE_ENABLE_CEF + CHUDWARE_WEBVIEW=cef, else screencast
-  cef/                  CefWebView : IWebViewBackend          (this doc; opt-in)
+  web_view_backend.cpp  CefWebView when CHUDWARE_ENABLE_CEF, otherwise NullWebView
+  cef/                  CefWebView : IWebViewBackend
 ```
 
+`ScreencastWebView`, the former worker-side JPEG-streaming backend, was deleted
+when CEF landed on 2026-07-07. There is no runtime backend selector.
+
+`CHUDWARE_ENABLE_CEF` defaults ON for native Linux and Windows builds and
+requires the SDK under `extern/cef/`. macOS forces the option OFF because the
+vendored distribution/build does not implement CEF's Darwin app-bundle and
+helper-process layout; it ships the existing `NullWebView`. Web/WASM also forces
+CEF OFF because the SDK is native-only.
+
 `parts_browser_panel.cpp` holds a `std::unique_ptr<IWebViewBackend>` from
-`makeWebView()` and never mentions a concrete backend. Selecting CEF changes one
-factory line, not the UI.
+`makeWebView()` and never mentions a concrete backend. Backend selection is a
+compile-time build decision, not an environment-variable toggle.
 
-Build: `option(CHUDWARE_ENABLE_CEF OFF)` in `host/CMakeLists.txt`. OFF (default)
-compiles only the screencast backend — CI and contributors never need the ~1 GB
-CEF SDK. ON includes `host/cmake/cef.cmake`.
+## Cross-platform strategy
 
-## Cross-platform strategy — CEF *is* the platform layer
-
-CEF already gives Linux/Windows parity. Keep the OS-specific surface tiny and
-isolated in `cef/cef_platform_{linux,windows}.cpp`. It is only three things:
+CEF supplies the shared Linux/Windows implementation. Keep their OS-specific
+surface tiny and isolated in `cef/cef_platform_{linux,windows}.cpp`:
 
 | Concern | Linux | Windows |
 | --- | --- | --- |
@@ -82,68 +81,22 @@ abstraction; the valuable abstraction is `IWebViewBackend`, not re-homed OS code
   `SendKeyEvent`) with correct `EVENTFLAG_*` modifiers. Coordinates are the same
   page-pixel mapping `collectInput()` already computes.
 
-## Cookie interop — the make-or-break risk
+## Session interop with headless fetch
 
-Sign-in only matters if the **Playwright scraper** (`services/browser/session.py`)
-can reuse the session CEF created. Same profile dir is necessary but **not
-sufficient**:
+The interactive CefWebView and the headless CEF daemon are separate processes
+with separate responsibilities:
 
-- **Linux**: Chromium encrypts cookie values with `OSCrypt` using a key from the
-  Secret Service (gnome-keyring/kwallet), or a fixed key under
-  `--password-store=basic`. If CEF uses the keyring and Playwright doesn't (or
-  vice-versa), cookies written by one are **undecryptable** by the other even in
-  the same dir.
-- **Windows**: same trap via DPAPI (per-user key) — generally fine if both run
-  as the same user, but pin it.
+- **CefWebView** renders the in-app page, forwards input, and exposes the live
+  URL and login state.
+- **`services/browser/cef_client.py`** drives `chudware --cef-daemon`, the
+  production fetch/download implementation used by source adapters.
+- **`exportSession()`** exports the interactive cookie jar and stages it through
+  `browser_session_import`, allowing subsequent headless fetches to reuse the
+  user's authenticated session.
+- **`services/browser/embed.py`** retains login-wizard orchestration and login
+  state classification.
 
-Plan, in order:
-1. **Force both engines to the same cookie crypto.** Launch CEF and Playwright
-   with `--password-store=basic` (Playwright: add to
-   `stealth.launch_args`; CEF: `CefSettings`/command-line). Removes the keyring
-   variable entirely.
-2. **Version-match** CEF's Chromium to Playwright's bundled Chromium (currently
-   **149** — see `stealth.chromium_version_*`) so the cookie DB schema matches.
-3. **Fallback**: if shared-dir still misbehaves, use CEF's cookie API to export
-   and import into the Playwright profile after sign-in.
-4. **Shared profile dir**: CEF cache path = `profiles.profile_dir(site)` (the
-   same per-vendor dir), serialized by the existing `profile_lock` so the two
-   engines never open it concurrently.
-
-**Verify first, build second.** The earliest possible check once CEF renders:
-sign in via CEF → run an existing `browser_fetch(site)` → confirm it comes back
-authenticated (no `login_required`). That one test validates the whole feature's
-reason to exist; do it before finishing the OSR/input polish.
-
-## C++/Python boundary — reuse the verified detection
-
-Keep the browser state split clean (avoid the RPC-sync shape that caused past GL
-freezes):
-
-- **C++ (CefWebView)**: renders, forwards input, writes cookies to the profile
-  dir, and reports `current_url` + page `login_state`.
-- **Python (`services/browser/embed.py`)**: keeps wizard orchestration —
-  `classify_login_state`, `login_verified_ts` stamping, walk-all site list,
-  auto-advance. These are already implemented and tested; don't reimplement them
-  in C++.
-- CEF reports URL/HTML to the wizard over the existing `login_wizard_*` RPC
-  surface so `classify_login_state` runs unchanged. (For a fully C++-side flow
-  later, `classify_login_state`'s auth-URL + login-wall logic can be mirrored,
-  but the first increment reuses Python.)
-
-## Phasing
-
-1. ✅ **Seam**: `IWebViewBackend`, `ScreencastWebView` refactor, factory,
-   `CHUDWARE_ENABLE_CEF` option — build-green with CEF OFF. *(done)*
-2. **CEF hello-world**: SDK via `cmake/cef.cmake`, subprocess helper,
-   `CefExecuteProcess` in `main()`, OSR paints example.com into the panel.
-   *(needs SDK + build loop)*
-3. **Cookie interop check**: sign in on one site, confirm `browser_fetch` is
-   authenticated. Gate everything else on this.
-4. **Input + popups + clipboard**: full mouse/key, `<select>` popup compositing,
-   OS clipboard.
-5. **Cross-platform**: Windows helper/bundle parity; verify OSR + cookies there.
-6. **Flip default** once proven; keep screencast as fallback.
-
-Until phase 6, `ScreencastWebView` remains the default and Hunter can sign in
-today via the headed `browser_login` fallback (native dropdowns/clipboard work
-there already) to unblock download testing.
+The production proof is end to end: sign in through CefWebView, export the
+session, then call `browser_fetch(site)` and observe authenticated content rather
+than `login_required`. This boundary must remain asynchronous; neither CEF
+callbacks nor browser RPC may block the GL thread.

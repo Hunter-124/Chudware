@@ -251,7 +251,8 @@ class MissionDispatch:
                  mode: str | None = None,
                  corporate_force: bool | None = None,
                  plan_only: bool | None = None,
-                 advisor: bool | None = None) -> None:
+                 advisor: bool | None = None,
+                 chudware_actor: Any | None = None) -> None:
         self.run_id = run_id
         self.ledger = ledger
         self.autonomy = autonomy
@@ -266,6 +267,7 @@ class MissionDispatch:
         # from inside the sub-agent turn through the same drain).
         self.provider = provider
         self.on_event = on_event
+        self.chudware_actor = chudware_actor
         # Capability dials (WI-2/4/…): optional profile or tier for scaffolds.
         self.capability = capability
         self.tier = tier
@@ -1311,7 +1313,9 @@ class MissionDispatch:
                                 prov_name = "openai"
                                 cfg_pick.setdefault("api_key", "ollama")
                             provider = agent_config.get_provider(
-                                name=prov_name, cfg=cfg_pick)
+                                name=prov_name, cfg=cfg_pick,
+                                **({"actor": self.chudware_actor}
+                                   if self.chudware_actor is not None else {}))
                     except Exception:  # noqa: BLE001 — keep mission provider
                         provider = self.provider
                     if isinstance(node, dict):
@@ -1432,6 +1436,7 @@ class MissionDispatch:
             try:
                 result = _at.run_turn(
                     brief, provider, name=role, actor=role,
+                    credit_actor=self.chudware_actor,
                     system_prompt=system_prompt,
                     allowed_tools=allowed,
                     tools_text=tools_text,
@@ -2395,6 +2400,7 @@ def run_linear_role_turn(
     options: dict | None = None,
     history: list[dict] | None = None,
     attachments: list[dict] | None = None,
+    chudware_actor: Any | None = None,
 ) -> dict[str, Any]:
     """Run ONE bounded ``agent_turn.run_turn`` against *role*'s card.
 
@@ -2439,7 +2445,7 @@ def run_linear_role_turn(
                 tree = None
             mission_dispatch = MissionDispatch(
                 run_id=_rid, ledger=ledger, provider=provider, on_event=on_event,
-                delegation_tree=tree)
+                delegation_tree=tree, chudware_actor=chudware_actor)
         except Exception:  # noqa: BLE001 — dispatcher is best-effort
             mission_dispatch = None
 
@@ -2481,10 +2487,12 @@ def run_linear_role_turn(
 
     result = _at.run_turn(
         request, provider, name=role, actor=role,
+        credit_actor=chudware_actor,
         system_prompt=system_prompt,
         allowed_tools=allowed,
         tools_text=tools_text,
-        max_tokens=max_tokens or LINEAR_ROLE_MAX_OUTPUT_TOKENS,
+        max_tokens=(max_tokens if max_tokens is not None
+                    else LINEAR_ROLE_MAX_OUTPUT_TOKENS),
         ledger=ledger,
         mission_dispatch=mission_dispatch,
         tool_dispatch=tool_dispatch,

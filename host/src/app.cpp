@@ -124,6 +124,9 @@ inline void wasmBootDom(const char *msg) {
 #include "ui/file_dialog.h" // Wave Y: native Save As / Open dialogs for .ecad+
 #include "ui/file_dialog.h" // W14: native Save-As for 2D export (flat-pattern DXF)
 #include "ui/file_explorer.h" // Wave 3: File Explorer + workspace/recent helpers
+#ifndef __EMSCRIPTEN__
+#include "ui/account_panel.h"
+#endif
 #include "ui/firmware/fw_workspace.h" // T-FIN5 Firmware workspace (drawFirmwareWorkspace + shot fixture)
 #include "ui/manufacture/manufacture_panel.h" // P4 manufacturing operator surface + RPC dispatch
 #include "ui/manufacture/mfg_mirror.h" // complete read-only manufacturing mirror type
@@ -2067,6 +2070,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   //     registration order reproduces the original if-chain exactly, including
   //     its fall-through cases.
   auto dispatchCmd = [&st](const char *cmd_id) {
+    static const CommandRouter router = buildRibbonCommandRouter(
+        {cmdEditCopy, cmdEditCut, cmdEditPaste, cmdEditDelete, cmdEditSelectAll,
+         cmdMakeDrawing, cmdDisplayStyle, cmdAppearance, cmdFlatPattern,
+         cmdFlatDxf, ecadDispatch});
+    if (!router.authorize(st, cmd_id)) return;
     // Multi-document: handlers resolve the PropertyManager / SketchMode /
     // EvaluateDialogs of the ACTIVE document through the AppState& they are
     // handed (st.* are re-seated on every tab switch), so no per-call shadowing
@@ -2119,10 +2127,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // subsystem through the AppState& at call time. The app-level family
     // handlers (cmdEdit*/cmdDisplayStyle/cmdAppearance/...) stay in this file
     // and are handed over via RibbonCommandHooks.
-    static const CommandRouter router = buildRibbonCommandRouter(
-        {cmdEditCopy, cmdEditCut, cmdEditPaste, cmdEditDelete, cmdEditSelectAll,
-         cmdMakeDrawing, cmdDisplayStyle, cmdAppearance, cmdFlatPattern,
-         cmdFlatDxf, ecadDispatch});
+    // Family routing uses the same router that authorized this command above.
     if (router.dispatch(st, cmd_id))
       return;
     // Commands without a handler log a stub line so they stay observable until
@@ -2140,6 +2145,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   st.orthographic =
       st.settings
           .orthographic; // live projection mode mirrors the persisted setting
+#ifndef __EMSCRIPTEN__
+  ui::initializeAccountPanel(st);
+#endif
   // Liquid glass v2.1: install + resolve the persisted appearance config before
   // the first frame (idempotent; re-pushed every frame in the loop below so
   // runtime mutations self-heal).
@@ -2861,6 +2869,30 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   st.wantPlan = shot && shotMode && std::strcmp(shotMode, "plan") == 0;
   st.wantPick = shot && shotMode && std::strcmp(shotMode, "pick") == 0;
   st.wantRibbon = shot && shotMode && std::strcmp(shotMode, "ribbon") == 0;
+  const bool wantEntitlementReadonly =
+      shot && shotMode && std::strcmp(shotMode, "entitlement_readonly") == 0;
+  if (wantEntitlementReadonly) {
+    st.showRibbon = true;
+    st.entitlementReadOnly = true;
+    st.entitlementSignedIn = true;
+    st.entitlementStatus = "Desktop entitlement refused";
+    const bool pmWasActive = st.propertyManager && st.propertyManager->active();
+    st.ribbonDispatch("extrude_boss");
+    const bool editBlocked =
+        !st.propertyManager || st.propertyManager->active() == pmWasActive;
+    st.displayStyle = 0;
+    st.ribbonDispatch("display_wireframe");
+    const bool viewAllowed = st.displayStyle == 4;
+    st.entitlementMutationVerified = false;
+    st.ribbonDispatch("eval_measure");
+    const bool measureAllowed = !st.entitlementMutationVerified;
+    st.ribbonDispatch("sm_export_flat_dxf");
+    const bool exportAllowed = !st.entitlementMutationVerified;
+    std::printf("[entitlement-shot] edit_blocked=%d view_allowed=%d "
+                "measure_allowed=%d export_allowed=%d\n",
+                editBlocked, viewAllowed, measureAllowed, exportAllowed);
+    std::fflush(stdout);
+  }
   st.wantTree = shot && shotMode && std::strcmp(shotMode, "tree") == 0;
   // Wave 3: explorer shot — force the tabbed left pane to the Explorer (File
   // Explorer) tab so the headless screenshot captures the workspace file tree
@@ -5547,7 +5579,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // Ctrl+N creates a new part directly. The old "+" chooser lived in the
       // removed document strip; full document-type creation is still available
       // from File > New.
-      if (appShortcutsOk && (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
+      if (appShortcutsOk && !st.entitlementReadOnly &&
+          (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
           ImGui::IsKeyPressed(ImGuiKey_N, false))
         ui::createNewDoc(st, 0);
 
@@ -5601,9 +5634,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       if (appShortcutsOk && !ecadFocused && (io.KeyCtrl || io.KeySuper)) {
         if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_O, false))
           st.requestOpenDialog = true;
-        else if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false))
+        else if (!st.entitlementReadOnly && io.KeyShift &&
+                 ImGui::IsKeyPressed(ImGuiKey_S, false))
           st.requestSaveAs = true;
-        else if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false))
+        else if (!st.entitlementReadOnly && !io.KeyShift &&
+                 ImGui::IsKeyPressed(ImGuiKey_S, false))
           st.requestSave = true;
       }
 
@@ -5988,6 +6023,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
     // ---------- status bar ----------
     ui::drawStatusBar(st, vp, statusH, busy, hostFlags);
+#ifndef __EMSCRIPTEN__
+    ui::tickAccountPanel(st);
+    ui::drawEntitlementBanner(st);
+#endif
 
     // ---------- panels (pinned glass columns + floating dialogs over the
     // full-width 3D) ---- The SolidWorks-faithful tabbed LEFT column (Explorer

@@ -38,6 +38,12 @@
 #include <emscripten.h>
 #include "fs_backend.h"
 #endif
+#ifndef __EMSCRIPTEN__
+#include "util/entitlement.h"
+extern "C" {
+#include "util/tweetnacl.h"
+}
+#endif
 
 #include "../bootstrap.h"
 #include "cpp_core.h"  // in-process C++ core (libchudware) — the backend when no Python runtime
@@ -2849,6 +2855,76 @@ std::string AppState::pickLabel(const render::PickHit& h) const {
     }
     return std::string(kind) + " " + std::to_string(h.topo_id) + " of Body" +
            std::to_string(h.body_id);
+}
+
+bool AppState::verifyEntitlementForAi() {
+#ifdef __EMSCRIPTEN__
+    return true;
+#else
+    if (entitlementReadOnly) {
+        toast(ui::ToastLevel::Warn,
+              "Read-only mode — sign in or manage your subscription to use AI");
+        return false;
+    }
+    if (entitlementAiVerified) return true;
+
+    auto decode = [](std::string_view value) {
+        auto cv = [](unsigned char c) -> int {
+            if (c >= 'A' && c <= 'Z') return c - 'A';
+            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+            if (c >= '0' && c <= '9') return c - '0' + 52;
+            if (c == '-') return 62;
+            if (c == '_') return 63;
+            return -1;
+        };
+        std::vector<unsigned char> out;
+        if (value.empty() || value.find('=') != std::string_view::npos ||
+            value.size() % 4 == 1)
+            return out;
+        unsigned int acc = 0;
+        int bits = 0;
+        for (unsigned char c : value) {
+            const int v = cv(c);
+            if (v < 0) return std::vector<unsigned char>{};
+            acc = (acc << 6) | static_cast<unsigned int>(v);
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                out.push_back(static_cast<unsigned char>((acc >> bits) & 255));
+            }
+        }
+        return out;
+    };
+
+    const std::size_t dot = entitlementToken.find('.');
+    bool valid = false;
+    if (dot != std::string::npos && entitlementToken.find('.', dot + 1) == std::string::npos) {
+        const std::string_view encoded(entitlementToken.data(), dot);
+        const auto signature = decode(std::string_view(entitlementToken).substr(dot + 1));
+        if (signature.size() == crypto_sign_BYTES) {
+            std::vector<unsigned char> signedMessage(signature.size() + encoded.size());
+            std::copy(signature.begin(), signature.end(), signedMessage.begin());
+            std::copy(encoded.begin(), encoded.end(),
+                      signedMessage.begin() + signature.size());
+            std::vector<unsigned char> opened(signedMessage.size());
+            unsigned long long openedLength = 0;
+            valid = crypto_sign_open(
+                        opened.data(), &openedLength, signedMessage.data(),
+                        static_cast<unsigned long long>(signedMessage.size()),
+                        chudware::entitlement::kEmbeddedPublicKey.data()) == 0 &&
+                    openedLength == encoded.size();
+        }
+    }
+    if (!valid) {
+        entitlementReadOnly = true;
+        entitlementSignedIn = false;
+        entitlementStatus = "Entitlement verification failed; sign in again";
+        toast(ui::ToastLevel::Warn, entitlementStatus);
+        return false;
+    }
+    entitlementAiVerified = true;
+    return true;
+#endif
 }
 
 void setActiveProjectDir(AppState& st, const std::string& absDir) {

@@ -1,0 +1,23 @@
+---
+title: CAM and manufacturing
+description: Set up stock, create operations, simulate toolpaths, and review output before it reaches a machine.
+section: Manufacture
+order: 90
+---
+## Define the job
+
+Open the Manufacture workspace and create a job from the active part. Select the machine or post target, define stock, and set a work coordinate system that the operator can reproduce.
+
+## Build operations in process order
+
+Choose tools from the project library, then add facing, pocketing, contouring, drilling, or 3D operations as needed. Name setups and operations for the actual manufacturing intent, not generic sequence numbers.
+
+## Simulate before posting
+
+Generate the toolpath and run simulation with tool, holder, stock, and rapid moves visible. Investigate collisions, unexpected remaining stock, gouges, and rapids through fixtures. A generated path is not automatically a safe path.
+
+## Review machine output
+
+Post G-code only for the machine and controller profile you intend to use. Compare units, work offsets, tool numbers, spindle limits, and the first moves. Use dry-run and single-block procedures at the machine according to your shop's safety process.
+
+Chudware helps prepare and inspect work; the operator remains responsible for machine setup and execution.

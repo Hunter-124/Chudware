@@ -81,6 +81,20 @@ class TestAppServe:
         assert "text/html" in (r.headers.get("content-type") or "")
         assert "chudware" in r.text
 
+    def test_desktop_plan_gets_upgrade_page_while_studio_opens_app(
+        self, client, app_tree, dev_account
+    ):
+        accounts.set_plan("demo@example.com", "desktop")
+        denied = client.get("/app/", headers=DEV_HEADERS)
+        assert denied.status_code == 403
+        assert "does not include the cloud workspace" in denied.text
+        assert denied.headers["cache-control"] == "no-store"
+
+        accounts.set_plan("demo@example.com", "studio")
+        allowed = client.get("/app/", headers=DEV_HEADERS)
+        assert allowed.status_code == 200
+        assert "chudware" in allowed.text
+
     def test_app_csp_permits_wasm_and_blob_workers(self, client, app_tree, dev_account):
         """The site-wide CSP in app.py is fatal for the Emscripten client.
 

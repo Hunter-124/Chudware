@@ -98,10 +98,6 @@ class Settings:
     max_upload_bytes: int = field(
         default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_UPLOAD_BYTES", 100 * 1024 * 1024)
     )
-    max_user_disk_bytes: int = field(
-        # Per-account storage across workspace + bucket. 0 disables the check.
-        default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_USER_DISK_BYTES", 2 * 1024 * 1024 * 1024)
-    )
     ws_max_message_bytes: int = field(
         # Per-frame cap on the /engine bridge. The daemon line limit is 256 MiB;
         # forwarding anything near that OOM-kills a 1 GiB gateway.
@@ -213,6 +209,52 @@ class Settings:
     github_client_secret: str = field(
         default_factory=lambda: _env("CHUDWARE_WEB_GITHUB_CLIENT_SECRET", "") or ""
     )
+    # ---- Stripe billing -------------------------------------------------
+    # Unset is a supported deployment state. Once any subscription billing
+    # credential is present, __post_init__ requires the complete set so the
+    # gateway cannot take payment without being able to resolve its webhook.
+    stripe_secret_key: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_STRIPE_SECRET_KEY", "") or ""
+    )
+    stripe_webhook_secret: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET", "") or ""
+    )
+    stripe_success_url: str = field(
+        default_factory=lambda: _env(
+            "CHUDWARE_WEB_STRIPE_SUCCESS_URL",
+            "https://app.chudware.com/?billing=success",
+        )
+        or "https://app.chudware.com/?billing=success"
+    )
+    stripe_cancel_url: str = field(
+        default_factory=lambda: _env(
+            "CHUDWARE_WEB_STRIPE_CANCEL_URL",
+            "https://app.chudware.com/?billing=cancel",
+        )
+        or "https://app.chudware.com/?billing=cancel"
+    )
+    stripe_price_desktop: str = field(
+        default_factory=lambda: _env("CHUDWARE_STRIPE_PRICE_DESKTOP", "") or ""
+    )
+    stripe_price_desktop_edu: str = field(
+        default_factory=lambda: _env("CHUDWARE_STRIPE_PRICE_DESKTOP_EDU", "") or ""
+    )
+    stripe_price_studio: str = field(
+        default_factory=lambda: _env("CHUDWARE_STRIPE_PRICE_STUDIO", "") or ""
+    )
+    stripe_price_studio_edu: str = field(
+        default_factory=lambda: _env("CHUDWARE_STRIPE_PRICE_STUDIO_EDU", "") or ""
+    )
+    stripe_price_credits_starter: str = field(
+        default_factory=lambda: _env("CHUDWARE_STRIPE_PRICE_CREDITS_STARTER", "") or ""
+    )
+    stripe_price_credits_standard: str = field(
+        default_factory=lambda: _env("CHUDWARE_STRIPE_PRICE_CREDITS_STANDARD", "") or ""
+    )
+    stripe_price_credits_bulk: str = field(
+        default_factory=lambda: _env("CHUDWARE_STRIPE_PRICE_CREDITS_BULK", "") or ""
+    )
+
 
     def __post_init__(self) -> None:
         if self.max_engine_bridges_per_user < 1:
@@ -246,6 +288,21 @@ class Settings:
             raise ValueError(
                 "OAuth sign-in requires CHUDWARE_WEB_SESSION_SECRET "
                 "(it signs the single-use OAuth state parameter)"
+            )
+        stripe_required = {
+            "CHUDWARE_WEB_STRIPE_SECRET_KEY": self.stripe_secret_key,
+            "CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET": self.stripe_webhook_secret,
+            "CHUDWARE_STRIPE_PRICE_DESKTOP": self.stripe_price_desktop,
+            "CHUDWARE_STRIPE_PRICE_DESKTOP_EDU": self.stripe_price_desktop_edu,
+            "CHUDWARE_STRIPE_PRICE_STUDIO": self.stripe_price_studio,
+            "CHUDWARE_STRIPE_PRICE_STUDIO_EDU": self.stripe_price_studio_edu,
+        }
+        if any(stripe_required.values()) and not all(stripe_required.values()):
+            missing = ", ".join(
+                name for name, value in stripe_required.items() if not value
+            )
+            raise ValueError(
+                "Stripe billing is partially configured; missing " + missing
             )
         webd_env = _load_webd_env()
         if not self.webd_socket or str(self.webd_socket) in {".", ""}:

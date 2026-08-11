@@ -18,8 +18,10 @@ from fastapi import HTTPException
 
 try:
     from .config import settings
+    from .plans import limits_for
 except ImportError:  # uvicorn app:app from the package dir
     from config import settings
+    from plans import limits_for
 
 
 class RateLimiter:
@@ -160,17 +162,21 @@ def dir_size_bytes(root: Path, *, cap: int | None = None) -> int:
     return total
 
 
-def enforce_disk_quota(user_root: Path, incoming_bytes: int = 0) -> None:
-    """Raise 507 when a user's own tree would exceed their storage quota."""
-    quota = settings.max_user_disk_bytes
-    if quota <= 0:
-        return
-    used = dir_size_bytes(user_root, cap=quota)
-    if used + incoming_bytes > quota:
+def enforce_disk_quota(
+    email: str,
+    plan: str,
+    root: Path,
+    incoming_bytes: int = 0,
+) -> None:
+    """Raise 507 when an account's tree would exceed its plan storage limit."""
+    quota = limits_for(plan).storage_quota_bytes
+    used = dir_size_bytes(root, cap=quota)
+    if used + max(0, incoming_bytes) > quota:
         raise HTTPException(
             status_code=507,
             detail=(
-                f"storage quota exceeded — {quota // (1024 * 1024)} MiB per account "
+                f"storage quota exceeded for {email} — "
+                f"{quota // (1024 * 1024)} MiB on {plan} "
                 f"({used // (1024 * 1024)} MiB used)"
             ),
         )

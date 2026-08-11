@@ -24,16 +24,19 @@ endif()
 include(FetchContent)
 
 # --- Embedded browser backend selection -------------------------------------
-# OFF (default): the app ships only the ScreencastWebView (worker-side headless
-# Chromium streamed over browser_embed_* RPCs) — no extra deps, always builds.
-# ON: additionally compile the in-process CEF off-screen backend (native
-# <select>/clipboard/autofill). Requires a CEF binary distribution; point
-# CEF_ROOT at it. See docs/cef_webview.md and cmake/cef.cmake. The build stays
-# green with this OFF so CI and contributors never need the ~1 GB CEF SDK.
-# CEF is THE embedded-browser backend since the screencast removal (2026-07-07).
-# Default ON: a normal build carries the vendor sign-in browser. Requires the CEF
-# SDK under extern/cef/ (see cmake/cef.cmake / docs/cef_webview.md). Turn OFF only
-# for an SDK-less build — makeWebView then returns a NullWebView (no browser).
+# CEF is THE embedded-browser backend since the ScreencastWebView removal
+# (2026-07-07); the screencast backend no longer exists and this option no
+# longer selects between two implementations.
+#
+# Default ON: a normal Linux or Windows build carries the vendor sign-in
+# browser, and CEF is load-bearing beyond the visible browser tab — a separate
+# headless CEF daemon is the fetch primitive behind 100+ Parts Library adapters
+# (services/browser/cef_client.py). Requires the CEF SDK under extern/cef/; see
+# cmake/cef.cmake and docs/design/cef_webview.md.
+#
+# Turn OFF only for an SDK-less build. makeWebView then returns NullWebView,
+# which paints an explanatory message and reports available() == false; every
+# call site already branches on that.
 option(CHUDWARE_ENABLE_CEF "Build the in-process CEF off-screen browser backend" ON)
 
 # Web/WASM builds never ship CEF. Force the option off so cmake/cef.cmake is
@@ -311,6 +314,11 @@ if(EMSCRIPTEN)
 else()
   set(CHUDWARE_NATIVE_SOURCES ${CHUDWARE_CORE_SOURCES})
   list(APPEND CHUDWARE_NATIVE_SOURCES
+    src/ui/account_panel.cpp
+    ../core/util/entitlement.cpp
+    ../core/util/secret_store.cpp
+    ../core/util/tweetnacl.c
+    ../core/agent/http.cpp
     src/bootstrap.cpp
     ../services/ipc/ipc_transport.cpp
     ../services/ipc/ipc_transport_win.cpp
@@ -422,8 +430,16 @@ else()
   # target name stays "Chudware" — build.sh and scripts/gate.sh invoke it by that
   # target name (`ninja ... Chudware`), so only the on-disk filename changes here.
   set_target_properties(Chudware PROPERTIES OUTPUT_NAME "chudware")
-  if(UNIX AND NOT APPLE)
-    target_link_libraries(Chudware PRIVATE rt)  # shm_open (older glibc)
+  if(WIN32)
+    target_link_libraries(Chudware PRIVATE winhttp bcrypt crypt32 ws2_32)
+  else()
+    find_package(CURL REQUIRED)
+    target_link_libraries(Chudware PRIVATE CURL::libcurl)
+    if(APPLE)
+      target_link_libraries(Chudware PRIVATE "-framework Security")
+    else()
+      target_link_libraries(Chudware PRIVATE rt)  # shm_open (older glibc)
+    endif()
   endif()
 endif()
 
@@ -434,15 +450,22 @@ endif()
 if(CHUDWARE_ENABLE_CEF AND NOT EMSCRIPTEN)
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/cef.cmake)
 endif()
+if(MSVC)
+  target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:/DEBUG:NONE>)
+elseif(APPLE)
+  target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:-Wl,-x>)
+else()
+  target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
+endif()
 if(WIN32)
   target_link_libraries(Chudware PRIVATE dwmapi comdlg32 dbghelp)  # comdlg32: C41 file dialogs; dbghelp: crash stack/minidump
   # windows.h min/max macros break CEF headers (std::numeric_limits<>::max()) and
   # any other code that uses std::min/std::max — always define NOMINMAX on the host.
   target_compile_definitions(Chudware PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-  # Emit debug info even in Release so crash stacks symbolize (PDB next to the exe).
+  # Commercial release binaries carry no PDB/debug directory. This is only a
+  # speed bump against casual patching, not an anti-tamper claim.
   if(MSVC)
-    target_compile_options(Chudware PRIVATE $<$<CONFIG:Release>:/Zi>)
-    target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+    target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:/OPT:REF /OPT:ICF>)
     # MSVC 14.51 (VS 2026): UCRT <cmath> is missing C99 float math declarations in the
     # global namespace; force-include the shim on C++ TUs only (see extern/fix_math.h).
     # Do NOT quote the path inside /FI — under Ninja+MSVC the quotes become part of the
@@ -483,6 +506,15 @@ add_test(NAME test_img_tex
   COMMAND test_img_tex "${CMAKE_BINARY_DIR}/test_img_tex_tmp"
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end RE-08 ---
+
+add_executable(test_entitlement_commands
+  tests/test_entitlement_commands.cpp
+  src/ui/ribbon_def.cpp)
+target_include_directories(test_entitlement_commands PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_entitlement_commands PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_entitlement_commands COMMAND test_entitlement_commands)
 
 # --- RE-07: CameraBackend platform abstraction (V4L2 / MF / stub) ---
 add_executable(test_camera_backend

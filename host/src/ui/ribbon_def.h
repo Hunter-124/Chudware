@@ -5,6 +5,12 @@
 
 namespace ui {
 
+enum class CommandCapability {
+    Mutate,   // default and fail-closed for every unclassified/new command
+    Inspect,  // view/display/measure only
+    Export,   // writes a copy; never mutates the open document
+};
+
 struct RibbonCmd {
     const char* cmd_id;   // snake_case unique command identifier
     const char* label;    // display label (short, ≤12 chars fits big button)
@@ -14,9 +20,13 @@ struct RibbonCmd {
     bool        big;      // true = 32px icon over label; false = 20px + label on right
     const char* sub_of;   // nullptr for top-level; parent cmd_id for dropdown sub-commands
     bool        stretch;  // true = schema-reserved but not wired in v1 (rendered disabled)
+    CommandCapability capability = CommandCapability::Mutate;
 };
 
 // Returns pointer to the static command table and sets count.
 const RibbonCmd* getRibbonCmds(int& count);
+// Unknown ids are Mutate. Adding a command without classifying it can only
+// over-block read-only mode, never silently unlock editing.
+CommandCapability ribbonCommandCapability(const char* cmdId);
 
 }  // namespace ui

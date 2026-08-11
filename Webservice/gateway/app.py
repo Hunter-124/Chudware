@@ -56,6 +56,7 @@ try:
     from .releases import router as releases_router
     from .accounts import router as accounts_router
     from .billing import router as billing_router
+    from .entitlement import router as entitlement_router
 except ImportError:
     from engine_bridge import router as engine_router, active_bridge_count
     from workspace import router as workspace_router
@@ -67,6 +68,7 @@ except ImportError:
     from releases import router as releases_router
     from accounts import router as accounts_router
     from billing import router as billing_router
+    from entitlement import router as entitlement_router
 
 settings.ensure_data_dirs()
 
@@ -436,6 +438,7 @@ app.include_router(releases_router)
 app.include_router(bucket_router)
 app.include_router(accounts_router)
 app.include_router(billing_router)
+app.include_router(entitlement_router)
 
 
 class _AdminGatedStatic(StaticFiles):

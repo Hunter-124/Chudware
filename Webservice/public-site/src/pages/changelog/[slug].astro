@@ -1,0 +1,14 @@
+---
+import { getCollection, render } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+export async function getStaticPaths() {
+  const releases = await getCollection('changelog');
+  return releases.map((entry) => ({ params: { slug: entry.id }, props: { entry } }));
+}
+const { entry } = Astro.props;
+const { Content } = await render(entry);
+const date = new Intl.DateTimeFormat('en', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
+---
+<BaseLayout title={entry.data.title} description={entry.data.description}>
+  <div class="wrap legal-shell"><header><p class="eyebrow">Changelog / {entry.data.version}</p><h1>{entry.data.title}</h1><p class="effective">Published {date.format(entry.data.published)}</p></header><div class="prose"><Content /></div></div>
+</BaseLayout>

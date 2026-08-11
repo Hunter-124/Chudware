@@ -179,7 +179,7 @@ def test_registration_pends_then_verification_activates_a_trial(client):
 
     account = accounts.get_account("new@example.com")
     assert account.status == "pending"
-    assert account.plan == "free"
+    assert account.plan == "trial"
     credential = authn.get_credential("new@example.com")
     assert credential is not None and credential["email_verified"] is False
 

@@ -35,6 +35,9 @@
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 #include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > Benchmarks)
 #include "onboarding.h"  // first-run guided account/provider/test/workspace flow
+#ifndef __EMSCRIPTEN__
+#include "account_panel.h"
+#endif
 #include "web_capabilities.h"  // ui::webGapReason (T-RF12: sign-in is desktop-only on web)
 #include "../core/async_rpc.h"  // core::RpcResult for skills/triggers RPCs
 #include "widgets/interwebz.h"  // Skills/Rules two-column editors
@@ -6081,6 +6084,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     (jumpToTab == 1) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_general");
+#ifndef __EMSCRIPTEN__
+                settingsSectionHeader("Chudware account", /*first=*/true);
+                ui::drawAccountSettings(st);
+#endif
                 settingsSectionHeader("Document", /*first=*/true);
                 ImGui::TextUnformatted("Units");
                 helpMarker("The unit system for dimension display and input. The model is always "

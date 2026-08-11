@@ -1,0 +1,16 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+<BaseLayout title="Download" description="Download Chudware for Windows, macOS, or Linux. Review checksums, system requirements, and current unsigned-build guidance.">
+  <header class="page-hero"><div class="wrap"><p class="eyebrow">Download</p><h1>Put the full workspace on your machine.</h1><p class="lede" data-detected-platform>Choose your platform. The installer and its SHA-256 checksum are published together in the public release manifest.</p></div></header>
+  <section class="section">
+    <div class="wrap platform-grid">
+      <article class="panel platform-card" data-platform="windows"><h2>Windows</h2><p>Windows 11, x64. Installer package for a per-user desktop installation.</p><a class="button" href="https://app.chudware.com/api/releases/manifest">Get Windows build</a></article>
+      <article class="panel platform-card" data-platform="macos"><h2>macOS</h2><p>macOS 14 or newer. Native builds are published for Apple Silicon and Intel.</p><a class="button" href="https://app.chudware.com/api/releases/manifest">Get macOS build</a></article>
+      <article class="panel platform-card" data-platform="linux"><h2>Linux</h2><p>64-bit Linux with a current glibc and GPU driver. Portable archive distribution.</p><a class="button" href="https://app.chudware.com/api/releases/manifest">Get Linux build</a></article>
+    </div>
+  </section>
+  <section class="section"><div class="wrap"><header class="section-heading"><p class="eyebrow">Integrity</p><h2>Release checksums</h2><p class="lede">Compare the SHA-256 value below with the downloaded file before opening it. A matching checksum proves the file arrived unchanged.</p></header><div class="manifest-list" data-release-list><a class="tap" href="https://app.chudware.com/api/releases/manifest">Open the public release manifest</a></div></div></section>
+  <section class="section"><div class="wrap split"><div><header class="section-heading"><p class="eyebrow">System requirements</p><h2>Designed for engineering workstations.</h2></header><ul class="terms-list"><li>64-bit processor with 4 or more cores.</li><li>16 GiB RAM minimum; 32 GiB recommended for large assemblies and simulation.</li><li>GPU with current OpenGL 4.1-capable drivers.</li><li>10 GiB free storage, plus room for project data.</li><li>Internet access for sign-in, entitlement check-ins, cloud features, and managed AI. Local modeling remains on your machine.</li></ul></div><aside class="unsigned-note"><h3><strong>Builds are currently unsigned.</strong></h3><p>Your operating system may warn that the publisher is unknown, quarantine the app, or require an explicit “Open anyway” step. Until code signing is in place, verify the published SHA-256 checksum before running a build. Never bypass the warning for a file whose checksum does not match.</p></aside></div></section>
+  <script is:inline src="/assets/download.js" defer></script>
+</BaseLayout>

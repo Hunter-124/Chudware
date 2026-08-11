@@ -189,8 +189,8 @@ def test_concurrent_async_tasks_get_independent_transactions(pg):
 
     async def run() -> None:
         results = await asyncio.gather(
-            deliver("evt_a", "a@x", "pro", blow_up=True),
-            deliver("evt_b", "b@x", "team", blow_up=False),
+            deliver("evt_a", "a@x", "desktop", blow_up=True),
+            deliver("evt_b", "b@x", "studio", blow_up=False),
             return_exceptions=True,
         )
         assert isinstance(results[0], RuntimeError)
@@ -203,4 +203,4 @@ def test_concurrent_async_tasks_get_independent_transactions(pg):
         assert {r["event_id"] for r in cur.fetchall()} == {"evt_b"}
         cur.execute("SELECT email, plan FROM accounts")
         # B's entitlement survived A's rollback, and A's did not leak through.
-        assert [(r["email"], r["plan"]) for r in cur.fetchall()] == [("b@x", "team")]
+        assert [(r["email"], r["plan"]) for r in cur.fetchall()] == [("b@x", "studio")]

@@ -1,0 +1,76 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+<BaseLayout title="One workspace from sketch to shop floor" description="Chudware unifies parametric CAD, assemblies, CAM, PLM, and an AI copilot in one local-first engineering workspace.">
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <p class="eyebrow">CAD · CAM · PLM · AI</p>
+        <h1>Build the product. Not the toolchain.</h1>
+        <p class="lede">Chudware is a local-first mechanical engineering workspace with parametric modeling, assemblies, manufacturing, product data, and an AI copilot that works inside the model.</p>
+        <div class="actions">
+          <a class="button" href="/download/">Download Chudware</a>
+          <a class="button button-secondary" href="/docs/first-part/">Build your first part</a>
+        </div>
+        <p class="hero-note">14-day trial · No card · Windows, macOS, and Linux</p>
+      </div>
+      <figure class="product-frame">
+        <img src="/images/modeling.png" width="1340" height="838" alt="Chudware modeling workspace showing a shelled parametric part, feature tree, and AI copilot" />
+        <figcaption class="product-caption"><span>Parametric model · live feature history</span><span>Native desktop workspace</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <div class="signal-grid" aria-label="Product capabilities">
+    <div class="signal"><strong>Parametric CAD</strong><span>Sketch, feature, revise</span></div>
+    <div class="signal"><strong>Assemblies</strong><span>Mate, inspect, explode</span></div>
+    <div class="signal"><strong>CAM</strong><span>Plan, simulate, post</span></div>
+    <div class="signal"><strong>PLM</strong><span>Trace every decision</span></div>
+  </div>
+
+  <section class="section">
+    <div class="wrap">
+      <header class="section-heading">
+        <p class="eyebrow">One source of truth</p>
+        <h2>Engineering context stays attached to the work.</h2>
+        <p class="lede">The model, manufacturing plan, revisions, artifacts, and conversations share one project. You stop translating intent between disconnected tabs.</p>
+      </header>
+      <div class="card-grid">
+        <article class="panel feature-card"><span class="number">01 / MODEL</span><h3>Design with intent</h3><p>Constrained sketches and ordered features make dimensions, references, and design changes explicit.</p></article>
+        <article class="panel feature-card"><span class="number">02 / MAKE</span><h3>Carry geometry into CAM</h3><p>Define stock, operations, tools, and post output without rebuilding the part in a separate application.</p></article>
+        <article class="panel feature-card"><span class="number">03 / TRACE</span><h3>Keep the why</h3><p>Project history connects revisions and artifacts so a handoff includes the decision trail—not only a final file.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap split">
+      <div class="section-heading">
+        <p class="eyebrow">AI copilot</p>
+        <h2>An engineering copilot with access to the actual model.</h2>
+        <p class="lede">Ask in plain language. Chudware can inspect geometry, make bounded edits, measure the result, and show its work. You remain in control of every change and every machine action.</p>
+        <div class="actions"><a class="button button-secondary" href="/docs/ai-copilot/">How the copilot works</a></div>
+      </div>
+      <div class="panel copilot-flow" aria-label="Example copilot interaction">
+        <div class="copilot-message"><code>YOU</code>Round the enclosure edges to 3 mm and check that the wall remains at least 2 mm.</div>
+        <div class="copilot-message response"><code>CHUDWARE</code>I updated the fillet and measured the resulting shell. Minimum wall thickness is 2.00 mm. The changed feature is highlighted for review.</div>
+        <div class="copilot-message"><code>YOU</code>Save this revision and prepare a manufacturing handoff.</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <header class="section-heading"><p class="eyebrow">What it replaces</p><h2>Fewer seams in the engineering loop.</h2><p class="lede">Chudware combines work that is commonly split across a CAD subscription, browser workspace, and product-data stack.</p></header>
+      <div class="replacement-grid">
+        <article class="panel replacement"><h3>Instead of Fusion</h3><ul><li>Local-first parametric modeling</li><li>CAM in the same project</li><li>AI actions visible in feature history</li></ul></article>
+        <article class="panel replacement"><h3>Instead of Onshape</h3><ul><li>Native desktop performance</li><li>Files and projects under your control</li><li>Cloud workspace available on Studio</li></ul></article>
+        <article class="panel replacement"><h3>Instead of SolidWorks</h3><ul><li>One predictable subscription</li><li>Built-in copilot and project history</li><li>Modern cross-platform workflow</li></ul></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section cta-band">
+    <div class="wrap section-heading"><p class="eyebrow">Start with a real project</p><h2>Fourteen days. No card. Your files stay yours.</h2><p class="lede">Download Chudware and take the first part from sketch to manufacturable geometry.</p><div class="actions"><a class="button" href="/download/">Download Chudware</a><a class="button button-secondary" href="/pricing/">See pricing</a></div></div>
+  </section>
+</BaseLayout>

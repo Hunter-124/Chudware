@@ -5,6 +5,7 @@
 //
 // APPEND-ONLY: later cards add rows here; never reorder or delete existing rows.
 #include "ribbon_def.h"
+#include <cstring>
 
 namespace ui {
 
@@ -154,21 +155,21 @@ static const RibbonCmd kCmds[] = {
     // =========================================================================
 
     // --- Group: Measure ---
-    { "eval_measure",      "Measure",        "measure",         "Evaluate", "Measure",         true,  nullptr,          false },
-    { "eval_mass_props",   "Mass Props.",    "mass_props",      "Evaluate", "Measure",         true,  nullptr,          false },
-    { "eval_section_props","Section Props.", "section_props",   "Evaluate", "Measure",         true,  nullptr,          false },
+    { "eval_measure",      "Measure",        "measure",         "Evaluate", "Measure",         true,  nullptr,          false, CommandCapability::Inspect },
+    { "eval_mass_props",   "Mass Props.",    "mass_props",      "Evaluate", "Measure",         true,  nullptr,          false, CommandCapability::Inspect },
+    { "eval_section_props","Section Props.", "section_props",   "Evaluate", "Measure",         true,  nullptr,          false, CommandCapability::Inspect },
 
     // --- Group: Geometry Analysis ---
-    { "eval_draft",        "Draft Anlys.",   "draft_analysis",  "Evaluate", "Geometry",        true,  nullptr,          false },
-    { "eval_thickness",    "Thickness",      "thickness",       "Evaluate", "Geometry",        true,  nullptr,          false },
-    { "eval_curvature",    "Curvature",      "curvature",       "Evaluate", "Geometry",        true,  nullptr,          false },
-    { "eval_zebra",        "Zebra",          "zebra",           "Evaluate", "Geometry",        false, nullptr,          false },
-    { "eval_symmetry",     "Symmetry",       "symmetry_check",  "Evaluate", "Geometry",        false, nullptr,          false },
+    { "eval_draft",        "Draft Anlys.",   "draft_analysis",  "Evaluate", "Geometry",        true,  nullptr,          false, CommandCapability::Inspect },
+    { "eval_thickness",    "Thickness",      "thickness",       "Evaluate", "Geometry",        true,  nullptr,          false, CommandCapability::Inspect },
+    { "eval_curvature",    "Curvature",      "curvature",       "Evaluate", "Geometry",        true,  nullptr,          false, CommandCapability::Inspect },
+    { "eval_zebra",        "Zebra",          "zebra",           "Evaluate", "Geometry",        false, nullptr,          false, CommandCapability::Inspect },
+    { "eval_symmetry",     "Symmetry",       "symmetry_check",  "Evaluate", "Geometry",        false, nullptr,          false, CommandCapability::Inspect },
 
     // --- Group: Check ---
-    { "eval_check",        "Check",          "check",           "Evaluate", "Geometry Check",  true,  nullptr,          false },
-    { "eval_interference", "Interference",   "interference_eval","Evaluate","Geometry Check",  true,  nullptr,          false },
-    { "eval_geometry",     "Geometry Anlys.","geometry_analysis","Evaluate","Geometry Check",  false, nullptr,          false },
+    { "eval_check",        "Check",          "check",           "Evaluate", "Geometry Check",  true,  nullptr,          false, CommandCapability::Inspect },
+    { "eval_interference", "Interference",   "interference_eval","Evaluate","Geometry Check",  true,  nullptr,          false, CommandCapability::Inspect },
+    { "eval_geometry",     "Geometry Anlys.","geometry_analysis","Evaluate","Geometry Check",  false, nullptr,          false, CommandCapability::Inspect },
 
     // =========================================================================
     // Tab: Simulation
@@ -280,7 +281,7 @@ static const RibbonCmd kCmds[] = {
     { "sm_flat_pattern",     "Flatten",         "sm_flat_pattern",   "Sheet Metal", "Flat Pattern",true,  nullptr,          false },
     // W14: export the flat pattern (outline on layer OUTLINE + bend lines on layer BEND) to DXF.
     // One-click command (no PM form) — handled in app.cpp like Flatten, via export_flat_dxf.
-    { "sm_export_flat_dxf",  "Export Flat DXF", "sm_flat_pattern",  "Sheet Metal", "Flat Pattern",true,  nullptr,          false },
+    { "sm_export_flat_dxf",  "Export Flat DXF", "sm_flat_pattern",  "Sheet Metal", "Flat Pattern",true,  nullptr,          false, CommandCapability::Export },
 
     // =========================================================================
     // Tab: Weldments — sweeps a library profile along a path sketch's segments.
@@ -321,9 +322,9 @@ static const RibbonCmd kCmds[] = {
 
     // --- Group: Outputs ---
     { "ecad_to_3d",         "Board to 3D",    "extrude_boss",    "PCB Design", "Outputs",    true,  nullptr, false },
-    { "ecad_export_gerber", "Gerbers",        "ref_plane",       "PCB Design", "Outputs",    false, nullptr, false },
-    { "ecad_export_drill",  "Drill",          "hole_wizard",     "PCB Design", "Outputs",    false, nullptr, false },
-    { "ecad_export_bom",    "BOM",            "bom",             "PCB Design", "Outputs",    false, nullptr, false },
+    { "ecad_export_gerber", "Gerbers",        "ref_plane",       "PCB Design", "Outputs",    false, nullptr, false, CommandCapability::Export },
+    { "ecad_export_drill",  "Drill",          "hole_wizard",     "PCB Design", "Outputs",    false, nullptr, false, CommandCapability::Export },
+    { "ecad_export_bom",    "BOM",            "bom",             "PCB Design", "Outputs",    false, nullptr, false, CommandCapability::Export },
 
     // --- Group: Checks --- (Run DRC promoted to a big primary button to the right of Outputs,
     // sized like Board to 3D / PCB Layout; the old small Board-group entry + the manager toolbar
@@ -395,9 +396,9 @@ static const RibbonCmd kCmds[] = {
     // --- Group: Sheet --- sheet-level + output actions (were inline buttons).
     { "dwg_sheet_props",  "Sheet Props",   "settings",      "View Layout", "Sheet", true,  nullptr, false },
     { "dwg_rebuild",      "Rebuild",       "refresh",       "View Layout", "Sheet", false, nullptr, false },
-    { "dwg_fit",          "Fit",           "zoom_fit",      "View Layout", "Sheet", false, nullptr, false },
-    { "dwg_export_dxf",   "Export DXF",    "section_props", "View Layout", "Sheet", false, nullptr, false },
-    { "dwg_export_pdf",   "Export PDF",    "save",          "View Layout", "Sheet", false, nullptr, false },
+    { "dwg_fit",          "Fit",           "zoom_fit",      "View Layout", "Sheet", false, nullptr, false, CommandCapability::Inspect },
+    { "dwg_export_dxf",   "Export DXF",    "section_props", "View Layout", "Sheet", false, nullptr, false, CommandCapability::Export },
+    { "dwg_export_pdf",   "Export PDF",    "save",          "View Layout", "Sheet", false, nullptr, false, CommandCapability::Export },
     // --- Group: Section --- custom-section controls applied by the Section tool.
     { "dwg_section_half",   "Half Section",  "section_view",  "View Layout", "Section", false, nullptr, false },
     { "dwg_section_reverse","Flip Side",     "orientation",   "View Layout", "Section", false, nullptr, false },
@@ -429,7 +430,7 @@ static const RibbonCmd kCmds[] = {
     // --- Tab: Evaluate, Group: Performance --- sampling profiler for modeling perf.
     // Toggles the in-process stack sampler in libchudware (prof_start/prof_stop). See
     // docs/PROFILER.md. Click to start; model; click again to stop + save a report.
-    { "prof_toggle",      "Profiler",      "results",       "Evaluate", "Performance",   true,  nullptr, false },
+    { "prof_toggle",      "Profiler",      "results",       "Evaluate", "Performance",   true,  nullptr, false, CommandCapability::Inspect },
 
     // =========================================================================
     // Tab: Appearance — per-body color, RealView material + display style.
@@ -449,11 +450,11 @@ static const RibbonCmd kCmds[] = {
     { "appr_clear",          "Clear",           "refresh",          "Appearance", "Material", false, nullptr, false },
 
     // --- Group: Display --- (sets st.displayStyle; the viewport applies it each frame) ---
-    { "display_shaded",       "Shaded",          "display_shaded",       "Appearance", "Display", true,  nullptr, false },
-    { "display_shaded_edges", "Shaded Edges",    "display_shaded_edges", "Appearance", "Display", true,  nullptr, false },
-    { "display_hlr",          "Hidden Removed",  "display_hlr",          "Appearance", "Display", true,  nullptr, false },
-    { "display_hlv",          "Hidden Visible",  "display_hlv",          "Appearance", "Display", false, nullptr, false },
-    { "display_wireframe",    "Wireframe",       "display_wireframe",    "Appearance", "Display", true,  nullptr, false },
+    { "display_shaded",       "Shaded",          "display_shaded",       "Appearance", "Display", true,  nullptr, false, CommandCapability::Inspect },
+    { "display_shaded_edges", "Shaded Edges",    "display_shaded_edges", "Appearance", "Display", true,  nullptr, false, CommandCapability::Inspect },
+    { "display_hlr",          "Hidden Removed",  "display_hlr",          "Appearance", "Display", true,  nullptr, false, CommandCapability::Inspect },
+    { "display_hlv",          "Hidden Visible",  "display_hlv",          "Appearance", "Display", false, nullptr, false, CommandCapability::Inspect },
+    { "display_wireframe",    "Wireframe",       "display_wireframe",    "Appearance", "Display", true,  nullptr, false, CommandCapability::Inspect },
 
     // =========================================================================
     // Polygon flyout variants (parent: sk_polygon, big=false). Each arms the
@@ -675,7 +676,7 @@ static const RibbonCmd kCmds[] = {
     { "reveng_ai_model",     "AI Model",       "new_part",        "Reverse Eng", "Model",       false, nullptr, false },
     { "reveng_mesh_body",    "Mesh Body",      "sim_mesh",        "Reverse Eng", "Model",       false, nullptr, false },
     // Deliver group — export bundle / add to Parts Hub / print scale mat.
-    { "reveng_export",       "Export",         "dwg_export_pdf",  "Reverse Eng", "Deliver",     true,  nullptr, false },
+    { "reveng_export",       "Export",         "dwg_export_pdf",  "Reverse Eng", "Deliver",     true,  nullptr, false, CommandCapability::Export },
     { "reveng_to_parts",     "Add to Parts",   "insert_component","Reverse Eng", "Deliver",     false, nullptr, false },
     { "reveng_print_mat",    "Print Scale Mat","make_drawing",    "Reverse Eng", "Deliver",     false, nullptr, false },
 };
@@ -684,6 +685,13 @@ static const RibbonCmd kCmds[] = {
 const RibbonCmd* getRibbonCmds(int& count) {
     count = (int)(sizeof(kCmds) / sizeof(kCmds[0]));
     return kCmds;
+}
+
+CommandCapability ribbonCommandCapability(const char* cmdId) {
+    if (!cmdId || !*cmdId) return CommandCapability::Mutate;
+    for (const RibbonCmd& command : kCmds)
+        if (std::strcmp(command.cmd_id, cmdId) == 0) return command.capability;
+    return CommandCapability::Mutate;
 }
 
 }  // namespace ui

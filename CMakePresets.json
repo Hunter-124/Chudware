@@ -8,14 +8,15 @@
   "configurePresets": [
     {
       "name": "linux-core",
-      "displayName": "Linux core (libchudware, Ninja, OCCT)",
-      "description": "Configure the pure-C++ core libchudware with the OCCT geometry kernel (core/).",
+      "displayName": "Linux core (libchudware, Ninja, OCCT + Netgen)",
+      "description": "Configure the pure-C++ core libchudware with the OCCT geometry kernel and Netgen mesher (core/).",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-core",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CHUDWARE_BUILD_CORE": "ON",
-        "CHUDWARE_WITH_OCCT": "ON"
+        "CHUDWARE_WITH_OCCT": "ON",
+        "CHUDWARE_WITH_NETGEN": "ON"
       }
     },
     {

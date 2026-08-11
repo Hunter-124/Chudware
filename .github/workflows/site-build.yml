@@ -1,0 +1,54 @@
+# Build the zero-runtime marketing/docs site and publish the exact static output
+# to the existing Cloudflare Pages project. This private repository has a $0 CI
+# budget, so every job stays on the named self-hosted Linux builder.
+name: site-build
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'Webservice/public-site/**'
+      - '.github/workflows/site-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: site-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy Cloudflare Pages site
+    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify CI workflow policy
+        shell: bash
+        run: python3 scripts/verify-ci-workflows.py
+
+      - name: Build static site
+        shell: bash
+        working-directory: Webservice/public-site
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          npm ci
+          npm run build
+
+      - name: Deploy to Cloudflare Pages
+        shell: bash
+        working-directory: Webservice/public-site
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/wrangler pages deploy dist --project-name chudware-site --branch master

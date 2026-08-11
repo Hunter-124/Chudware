@@ -1,0 +1,21 @@
+---
+title: Assemblies
+description: Insert components, define mates, inspect interference, and create a useful bill of materials.
+section: Assemble
+order: 60
+---
+## Begin with one fixed component
+
+Create an assembly and insert the component that defines the product's frame or base. Fix that first component at the assembly origin. Every other component should be located through mates rather than arbitrary coordinates.
+
+## Add only the mates you need
+
+Use concentric mates for aligned shafts and holes, coincident mates for touching planar faces, and distance or angle mates where motion must remain. Stop when the intended degrees of freedom are controlled; extra mates make revisions brittle.
+
+## Inspect before release
+
+Use **Interference** to find overlapping solids and inspect clearances at moving or manufactured interfaces. An exploded view is useful for assembly sequence and communication, but it does not change mate definitions.
+
+## Keep component identity stable
+
+Replace or revise a component through project history instead of inserting renamed copies. Stable component identity keeps mates, bill-of-material rows, and downstream references connected.

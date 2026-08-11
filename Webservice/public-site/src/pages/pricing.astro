@@ -1,0 +1,39 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+<BaseLayout title="Pricing" description="Straightforward Chudware plans: a 14-day trial, Desktop at $30 per month, Studio at $150 per month, and Enterprise for larger deployments.">
+  <header class="page-hero"><div class="wrap"><p class="eyebrow">Pricing</p><h1>Serious engineering tools. Clear monthly plans.</h1><p class="lede">Start with every core capability for 14 days. Choose local desktop work or add the cloud workspace when your projects need it.</p></div></header>
+  <section class="section">
+    <div class="wrap">
+      <table class="pricing-table">
+        <thead><tr><th scope="col">Plan</th><th scope="col">Price</th><th scope="col">Desktop</th><th scope="col">Cloud workspace</th><th scope="col">Storage</th><th scope="col">Best for</th></tr></thead>
+        <tbody>
+          <tr><td data-label="Plan"><strong>Trial</strong><small>14 days, no card</small></td><td data-label="Price">$0</td><td data-label="Desktop" class="included">Included</td><td data-label="Cloud workspace" class="included">Included</td><td data-label="Storage">5 GiB</td><td data-label="Best for">Evaluating a real project</td></tr>
+          <tr><td data-label="Plan"><strong>Desktop</strong><small>Local-first</small></td><td data-label="Price">$30 / month</td><td data-label="Desktop" class="included">Included</td><td data-label="Cloud workspace" class="not-included">Not included</td><td data-label="Storage">5 GiB</td><td data-label="Best for">Independent engineers</td></tr>
+          <tr><td data-label="Plan" class="recommended"><strong>Studio</strong><small>Desktop + cloud</small></td><td data-label="Price" class="recommended">$150 / month</td><td data-label="Desktop" class="included recommended">Included</td><td data-label="Cloud workspace" class="included recommended">Included</td><td data-label="Storage" class="recommended">100 GiB</td><td data-label="Best for" class="recommended">Connected product teams</td></tr>
+          <tr><td data-label="Plan"><strong>Enterprise</strong><small>Managed deployment</small></td><td data-label="Price"><a class="tap" href="mailto:sales@chudware.com">Contact sales</a></td><td data-label="Desktop" class="included">Included</td><td data-label="Cloud workspace" class="included">Included</td><td data-label="Storage">1 TiB</td><td data-label="Best for">Organizations with deployment and support requirements</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <header class="section-heading"><p class="eyebrow">Copilot credits</p><h2>Add capacity when you need it.</h2><p class="lede">Credits are used only when Chudware's managed AI capacity runs work for you. Bring your own provider key at any time; BYOK usage does not consume Chudware credits.</p></header>
+      <div class="credit-grid">
+        <article class="panel credit-card"><strong>8,000 credits</strong><span>$10 one-time</span></article>
+        <article class="panel credit-card"><strong>20,000 credits</strong><span>$25 one-time</span></article>
+        <article class="panel credit-card"><strong>80,000 credits</strong><span>$100 one-time</span></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap split">
+      <header class="section-heading"><p class="eyebrow">Education</p><h2>50% off for verified .edu accounts.</h2><p class="lede">Students, faculty, and academic staff using a verified <code>.edu</code> email receive half-price Desktop or Studio subscriptions through separate education plans.</p><div class="actions"><a class="button button-secondary" href="https://app.chudware.com/">Verify an education account</a></div></header>
+      <div class="panel feature-card"><h3>Trial terms</h3><ul class="terms-list"><li>14 consecutive days from activation.</li><li>No payment card is required.</li><li>Desktop and cloud workspace are included during the trial.</li><li>After the trial, choose a paid plan to continue entitlement check-ins.</li><li>Your project files remain yours if you do not subscribe.</li></ul></div>
+    </div>
+  </section>
+
+  <section class="section cta-band"><div class="wrap section-heading"><h2>Start without a purchase decision.</h2><p class="lede">Use the full trial on a real part, assembly, or manufacturing plan.</p><div class="actions"><a class="button" href="/download/">Download for free</a><a class="button button-secondary" href="/legal/terms/">Read the terms</a></div></div></section>
+</BaseLayout>

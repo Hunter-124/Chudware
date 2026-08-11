@@ -1,0 +1,40 @@
+---
+title: The AI copilot
+description: Ask for model-aware help, review changes, manage provider keys, and know when the copilot needs your judgment.
+section: Collaborate
+order: 70
+---
+## Describe the outcome
+
+Write the way you would brief another engineer: name the part, critical dimensions, material or process constraints, and what must not change. “Add four M4 clearance holes on a 60 mm bolt circle, centered on the top face” is more useful than a list of button clicks.
+
+You do not need to describe internal tool names or JSON. Chudware translates the request into normal sketches and features, works in the open document, and reports what changed.
+
+## Watch the work
+
+The copilot can inspect geometry, create or edit features, render alternate views, and measure results. Its activity appears in the copilot feed and its geometry appears in the same feature tree you use manually.
+
+After a change:
+
+1. Rotate the model and inspect the highlighted feature.
+2. Check critical dimensions with **Evaluate**.
+3. Open the edited feature and confirm its references.
+4. Save a revision only when the result matches your intent.
+
+## Ask for evidence
+
+A useful follow-up is concrete: “Measure the minimum wall thickness,” “Show the right view,” or “Check interference with the housing.” Measurements and renders reduce ambiguity, but they do not certify a design. Safety, tolerance, material, and manufacturing decisions remain yours.
+
+## Choose how AI is provided
+
+During onboarding you can use Chudware-managed capacity or add your own provider key. Managed work consumes Chudware credits. Bring-your-own-key work is sent directly through the provider you configured and does not consume Chudware credits.
+
+Provider keys are secrets. Paste them only into Chudware's AI setup screen, never into a chat message or project note.
+
+## Keep machine actions deliberate
+
+The copilot may prepare CAM operations and output, but actions that affect a physical machine require explicit operator review and control. Inspect stock, tool, setup, simulation, and posted code before execution.
+
+## Recover from a wrong direction
+
+Stop the run, explain the mismatch in plain language, and point to the last good feature or revision. Avoid stacking corrective edits on geometry you no longer trust. Project history is there to return to a known state and continue cleanly.

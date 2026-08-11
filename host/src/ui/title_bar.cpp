@@ -678,7 +678,7 @@ struct FilMenuDrawer {
     bool hasDoc;
     GLFWwindow* win;
     void draw() const {
-        if (ImGui::BeginMenu("New")) {
+        if (ImGui::BeginMenu("New", !st.entitlementReadOnly)) {
             if (ImGui::MenuItem("Part", "Ctrl+N")) ui::createNewDoc(st, 0);
             if (ImGui::MenuItem("Assembly"))       ui::createNewDoc(st, 1);
             const bool canDraw = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
@@ -696,9 +696,9 @@ struct FilMenuDrawer {
             openProjectFolderAction(st);
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Save", "Ctrl+S", false, hasDoc)) st.requestSave = true;
-        if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, hasDoc)) st.requestSaveAs = true;
-        if (ImGui::MenuItem("Save All", nullptr, false, hasDoc)) st.requestSaveAll = true;
+        if (ImGui::MenuItem("Save", "Ctrl+S", false, hasDoc && !st.entitlementReadOnly)) st.requestSave = true;
+        if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, hasDoc && !st.entitlementReadOnly)) st.requestSaveAs = true;
+        if (ImGui::MenuItem("Save All", nullptr, false, hasDoc && !st.entitlementReadOnly)) st.requestSaveAll = true;
         ImGui::Separator();
         const bool canExport3d = hasDoc && !st.activeTabIsDrawing() && !st.activeTabIsEcad();
         auto openMeshExport = [&](const char* fmt) {

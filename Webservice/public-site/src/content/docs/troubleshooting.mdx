@@ -1,0 +1,27 @@
+---
+title: Troubleshooting
+description: Resolve common launch, graphics, modeling, sign-in, and copilot problems.
+section: Reference
+order: 100
+---
+## The app does not open
+
+Confirm the download checksum and review the unsigned-build instructions for your platform. On Linux, launch from a terminal once so missing-library or graphics-driver messages remain visible.
+
+## The viewport is blank or slow
+
+Update the GPU driver, then restart Chudware. Avoid remote-desktop sessions that do not expose hardware OpenGL. If the interface appears but geometry does not, switch display style and fit the view before assuming the model is empty.
+
+## A feature fails
+
+Return to the first failed feature in the tree. Check its sketch state and references before editing later features. Fillets commonly fail when the radius is larger than a neighboring face; cuts fail when they no longer intersect a body.
+
+## Sign-in or entitlement check-in fails
+
+Check system time, internet access, and whether `app.chudware.com` is reachable. A paid desktop entitlement has an offline grace period, but initial activation requires sign-in.
+
+## The copilot cannot run
+
+Open AI settings and confirm either managed credits remain or a provider key is configured and passes its connection test. A failed provider request does not consume geometry changes; inspect the feed for the concrete error before retrying.
+
+For account help, email [support@chudware.com](mailto:support@chudware.com) without including passwords, provider keys, or private project files.

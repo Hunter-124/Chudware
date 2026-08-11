@@ -1,0 +1,22 @@
+{
+  "name": "chudware-public-site",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build && pagefind --site dist",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@astrojs/mdx": "7.0.5",
+    "astro": "7.2.0"
+  },
+  "devDependencies": {
+    "pagefind": "1.5.2",
+    "wrangler": "4.120.1"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

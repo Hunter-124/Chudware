@@ -61,10 +61,10 @@ def test_unknown_email_becomes_pending_unauthorized_not_admin(accounts_env):
     assert acct.email == "stranger@example.com"  # lowercased
     assert acct.status == "pending"
     assert acct.role == "user"
-    assert acct.plan == "free"
+    assert acct.plan == "trial"
     assert not accounts.is_authorized(acct)
     assert accounts.effective_role(acct) == "user"
-    assert accounts.effective_plan(acct) == "free"
+    assert accounts.effective_plan(acct) == "trial"
 
 
 def test_ensure_account_idempotent_and_never_resurrects_denied(accounts_env):
@@ -145,14 +145,14 @@ def test_every_new_account_is_pending_regardless_of_domain(accounts_env):
     Auto-approval by email domain was deleted with users.yaml: activation is
     now earned by verifying the address (authn.start_trial promotes only a
     *pending* row) or granted by an admin. A domain that quietly created
-    `active`/`free` rows would strand every one of its registrants off the
-    trial forever, because there would be no pending row left to promote.
+    `active`/`trial` rows would strand every one of its registrants off the
+    verified trial window, because there would be no pending row left to promote.
     """
     accounts, _, _ = accounts_env
     for email in ("student@crimson.ua.edu", "staff@ua.edu", "person@other.net"):
         acct = accounts.ensure_account(email, "Someone")
         assert acct.status == "pending", email
-        assert acct.plan == "free"
+        assert acct.plan == "trial"
         assert acct.role == "user"
         assert acct.decided_by == ""
         assert not accounts.is_authorized(acct)
@@ -220,9 +220,9 @@ def test_stripe_customer_lookup_roundtrip(accounts_env):
     assert found is not None and found.email == "pay@example.com"
 
     assert accounts.set_stripe_customer("ghost@example.com", "cus_x") is None
-    assert accounts.set_plan("ghost@example.com", "pro") is None
+    assert accounts.set_plan("ghost@example.com", "desktop") is None
     with pytest.raises(ValueError):
-        accounts.set_plan("pay@example.com", "enterprise")
+        accounts.set_plan("pay@example.com", "team")
 
 
 def test_pending_page_data(accounts_env):
@@ -285,7 +285,7 @@ def test_admin_api_gating_and_self_service(accounts_env):
     me = member.get("/api/me/account")
     assert me.status_code == 200
     assert me.json()["status"] == "pending"
-    assert me.json()["plan"] == "free"
+    assert me.json()["plan"] == "trial"
 
     # Admin: full queue access.
     admin = TestClient(_make_app(accounts, _User("boss@example.com", role="admin")))

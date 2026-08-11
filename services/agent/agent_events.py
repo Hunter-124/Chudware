@@ -702,6 +702,28 @@ def thought_event(
     return ("agent.thought.delta" if delta else "agent.thought"), payload
 
 
+def provider_usage_event(
+    *,
+    provider: str = "",
+    model: str = "",
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    context_tokens: int = 0,
+    source: str = "api",
+) -> tuple[str, dict]:
+    """Commercial usage report. Attribution is gateway-owned, never payload data."""
+    return "agent.provider_usage", {
+        "provider": str(provider or ""),
+        "model": str(model or ""),
+        "prompt_tokens": max(0, int(prompt_tokens or 0)),
+        "completion_tokens": max(0, int(completion_tokens or 0)),
+        "total_tokens": max(0, int(total_tokens or 0)),
+        "context_tokens": max(0, int(context_tokens or 0)),
+        "source": str(source or "api"),
+    }
+
+
 def context_injected_event(
     node_id: str, source: str, label: str, *, token_est: int = 0,
     span_id: str | None = None, parent_id: str | None = None,

@@ -37,7 +37,17 @@ int open_file(const std::filesystem::path& path, int flags = kOpenFlags) {
     return ::open(path.c_str(), flags, 0600);
 }
 int close_file(int fd) { return ::close(fd); }
+#ifdef __APPLE__
+int sync_file(int fd) {
+    // Journal ordering must survive power loss. Darwin's fsync may leave data in the
+    // drive cache, so prefer F_FULLFSYNC; unsupported filesystems fall back to fsync's
+    // weaker best-effort durability rather than rejecting an otherwise valid write.
+    if (::fcntl(fd, F_FULLFSYNC) == 0) return 0;
+    return ::fsync(fd);
+}
+#else
 int sync_file(int fd) { return ::fdatasync(fd); }
+#endif
 off_t seek_file(int fd, off_t offset, int origin) { return ::lseek(fd, offset, origin); }
 int truncate_file(int fd, uint64_t size) { return ::ftruncate(fd, static_cast<off_t>(size)); }
 ssize_t write_file(int fd, const char* bytes, size_t count) { return ::write(fd, bytes, count); }

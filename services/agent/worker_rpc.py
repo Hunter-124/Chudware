@@ -20,6 +20,7 @@ when an RPC reports ``unknown_method``.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -1500,7 +1501,7 @@ _ATTACH_MAX = 32
 def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     """``agent_admin_turn {request, run_id?, role?, provider?, model?, api_key?,
     base_url?, reasoning_effort?, workspace_dir?, history?, attachments?,
-    session_id?, sessions_dir?} ->
+    session_id?, sessions_dir?, _chudware_actor?} ->
     {ok, turn:{success, stop_reason, result, role, allowed_tools}}
     | {ok:false, reason}``.
 
@@ -1592,8 +1593,27 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         from services.agent.mission_dispatch import run_linear_role_turn  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"agent_admin_turn: import failed: {exc}"}
+    agent_config.clear_pooled_credentials()
+    raw_actor = (params or {}).get("_chudware_actor")
+    if raw_actor is None:
+        # Named, legitimate actor-free path: the desktop/CLI invokes its own
+        # local hostd with a user-owned credential (BYOK). A web request can
+        # never land here actor-free because engine_bridge injects on every
+        # agent RPC and run.cpp forwards it verbatim.
+        credit_actor = None
+    else:
+        try:
+            credit_actor = agent_config.Actor.from_mapping(raw_actor)
+        except ValueError:
+            return {"ok": False, "reason": "invalid_chudware_actor"}
+
 
     cfg = dict(agent_config.load_config() or {})
+    if credit_actor is not None and credit_actor.key_source == "pool":
+        # The descriptor key was resolved by hostd after the gateway stripped
+        # browser credentials. Give it a dedicated slot so config.get_provider
+        # cannot drift back to an ambient desktop config key.
+        cfg["_chudware_pool_api_key"] = _param_str("api_key")
     try:
         if provider_name:
             # Shallow overlay — load_config() hands back a process-cached dict, so
@@ -1614,9 +1634,13 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 sub = dict(sub) if isinstance(sub, dict) else {}
                 sub["base_url"] = base_url
                 cfg[provider_name] = sub
-            provider = agent_config.get_provider(name=provider_name, cfg=cfg, role=role)
+            provider = agent_config.get_provider(
+                name=provider_name, cfg=cfg, role=role,
+                **({"actor": credit_actor} if credit_actor is not None else {}))
         else:
-            provider = agent_config.get_provider(role=role, cfg=cfg)
+            provider = agent_config.get_provider(
+                role=role, cfg=cfg,
+                **({"actor": credit_actor} if credit_actor is not None else {}))
     except agent_config.OfflineModeError as exc:
         return {"ok": False, "reason": f"offline: {exc}"}
     except Exception as exc:  # noqa: BLE001
@@ -1660,6 +1684,35 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         except Exception:  # noqa: BLE001 — attachments must never break a turn
             return None
 
+    history = _history()
+    turn_max_tokens = configured_max_tokens or 8192
+    if credit_actor is not None and credit_actor.key_source == "pool":
+        prompt_text = request + "".join(
+            str(item.get("text") or "") for item in (history or [])
+            if isinstance(item, dict)
+        )
+        prompt_estimate = max(1, math.ceil(len(prompt_text.encode("utf-8")) / 4))
+        actual_model = str(getattr(provider, "model", None) or cfg.get("model") or "")
+        if credit_actor.rated_model and credit_actor.rated_model != actual_model:
+            return {"ok": False, "reason": "insufficient_credits"}
+        check = agent_config.pooled_credit_preflight(
+            credit_actor,
+            prompt_tokens_estimate=prompt_estimate,
+            max_output_tokens=turn_max_tokens,
+        )
+        if not check.get("ok"):
+            return {"ok": False, "reason": "insufficient_credits"}
+        turn_max_tokens = max(0, int(check.get("max_output_tokens") or 0))
+
+    from services.agent import agent_events as _agent_events  # noqa: PLC0415
+    from services.agent.providers import token_usage as _token_usage  # noqa: PLC0415
+
+    def _usage_event(payload: dict) -> None:
+        kind, data = _agent_events.provider_usage_event(**payload)
+        _on_event(kind, data)
+
+    usage_sink_token = _token_usage.bind_usage_sink(_usage_event)
+
     try:
         turn = run_linear_role_turn(
             request, role, provider,
@@ -1668,14 +1721,16 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             # reads options project_dir/project_path/workspace_dir for its
             # project-memory lookup).
             options={"project_dir": project_root} if project_root else None,
-            max_tokens=configured_max_tokens or None,
-            history=_history(),
+            max_tokens=turn_max_tokens,
+            history=history,
             attachments=_attachments(),
+            chudware_actor=credit_actor,
         )
         return {"ok": True, "turn": turn}
     except Exception as exc:  # noqa: BLE001 — never raise across the worker seam
         return {"ok": False, "reason": f"agent_admin_turn failed: {type(exc).__name__}: {exc}"}
     finally:
+        _token_usage.reset_usage_sink(usage_sink_token)
         # A turn that CRASHED still built geometry, and the same "part potentially lost"
         # recovery row is waiting for it. run_linear_role_turn sweeps on every normal
         # outcome (it has no try/except of its own), so this covers exactly the escaping

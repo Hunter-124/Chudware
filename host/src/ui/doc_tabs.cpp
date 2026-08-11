@@ -939,6 +939,11 @@ float drawDocTabs(AppState& st, float availW) {
 // API. `kind` is a NewDocKind ordinal (0=Part,1=Assembly,2=Drawing,3=Schematic,4=PCB). Kept as a free
 // function (not a static) so app.cpp's Ctrl+N hook can request it via openNewDocChooser() instead.
 void createNewDoc(AppState& st, int kindOrd) {
+    if (st.entitlementReadOnly) {
+        st.toast(ui::ToastLevel::Warn,
+                 "Read-only mode — sign in or manage your subscription to create a document");
+        return;
+    }
     const NewDocKind kind = (NewDocKind)kindOrd;
     if (kind == NewDocKind::Part || kind == NewDocKind::Assembly) {
         const bool asm_ = (kind == NewDocKind::Assembly);

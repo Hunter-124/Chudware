@@ -59,6 +59,16 @@ vendor/omp/**/node_modules/
 vendor/omp/.chudware-bridge-deps
 vendor/omp/.chudware-bridge-install.lock
 
+# Marketing site (Astro). SOURCE under Webservice/public-site/src, public/ and the
+# pinned package.json + package-lock.json ARE tracked — the lockfile is what makes
+# `npm ci` reproducible in CI. Installed deps and build output are not: node_modules
+# is ~7,000 files of third-party code that would bloat every clone, drown every diff,
+# and quietly import a pile of unaudited licenses into a repository that keeps a
+# license ledger.
+Webservice/public-site/node_modules/
+Webservice/public-site/dist/
+Webservice/public-site/.astro/
+
 # Claude Code project state — CLAUDE.md, settings.json (shared graphify hook),
 # commands/, skills/ ARE tracked (team-shared config); only per-machine state is ignored.
 .claude/settings.local.json

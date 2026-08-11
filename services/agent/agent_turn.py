@@ -1491,6 +1491,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              max_tokens: int | None = None,
              ledger=None,
              actor: str | None = None,
+             credit_actor: Any | None = None,
              tool_dispatch: Callable[[str, dict], Any] | None = None,
              mission_dispatch: Any | None = None,
              tools_text: str | None = None,
@@ -1530,6 +1531,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             request, provider, name=name, allowed_tools=allowed_tools,
             system_prompt=system_prompt, max_tool_calls=max_tool_calls,
             max_tokens=max_tokens, ledger=ledger, actor=actor,
+            credit_actor=credit_actor,
             tool_dispatch=tool_dispatch, mission_dispatch=mission_dispatch,
             tools_text=tools_text, on_event=on_event, run_id=run_id,
             node_id=node_id, parent_id=parent_id, subagent_id=subagent_id,
@@ -1572,6 +1574,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 request, provider, name=name, allowed_tools=allowed_tools,
                 system_prompt=system_prompt, max_tool_calls=max_tool_calls,
                 max_tokens=max_tokens, ledger=ledger, actor=actor,
+                credit_actor=credit_actor,
                 tool_dispatch=tool_dispatch, mission_dispatch=mission_dispatch,
                 tools_text=tools_text, on_event=_ordered_event, run_id=run_id,
                 node_id=node_id, parent_id=parent_id, subagent_id=subagent_id,
@@ -1595,6 +1598,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
              max_tokens: int | None = None,
              ledger=None,
              actor: str | None = None,
+             credit_actor: Any | None = None,
              tool_dispatch: Callable[[str, dict], Any] | None = None,
              mission_dispatch: Any | None = None,
              tools_text: str | None = None,
@@ -1693,7 +1697,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         if subagent_id
         else MAIN_CHAT_RUNAWAY_TOOL_CALL_BACKSTOP
     )
-    completion_cap = int(max_tokens) if max_tokens else 2048
+    completion_cap = int(max_tokens) if max_tokens is not None else 2048
     _tool_call_counts: dict[str, int] = {}
     # WI-10 refine cap. A "refine round" is geometry re-worked AFTER the model itself
     # declared the build finished — it verified it (verify_battery) or delivered it
@@ -2483,7 +2487,8 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         cfg2 = dict(cfg)
                         cfg2["model"] = model_override
                         alt = agent_config.get_provider(
-                            name=provider_override or None, cfg=cfg2)
+                            name=provider_override or None, cfg=cfg2,
+                            **({"actor": credit_actor} if credit_actor is not None else {}))
                         old_model = current_model
                         provider = alt
                         _log(ledger, actor, {
@@ -2542,8 +2547,28 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             if queued is not None:
                 reply = ""          # drained directive: nothing was billed
             else:
-                reply = provider.complete(
-                    system, messages, max_tokens=completion_cap)
+                _usage_before = _tu.usage_event_count() if _tu is not None else 0
+                _provider_failed = False
+                try:
+                    reply = provider.complete(
+                        system, messages, max_tokens=completion_cap)
+                except BaseException:
+                    _provider_failed = True
+                    raise
+                finally:
+                    if (_tu is not None
+                            and _tu.usage_event_count() == _usage_before):
+                        _tu.record_usage(
+                            provider=str(getattr(provider, "name", "") or ""),
+                            model=str(getattr(provider, "model", "") or ""),
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            total_tokens=0,
+                            context_tokens=0,
+                            source=("provider_error_unreported"
+                                    if _provider_failed
+                                    else "provider_unreported"),
+                        )
             # mega-6: drain last-call usage into ledger so spend is auditable.
             # `queued` skipped: get_last_usage would re-report the completion
             # that produced the batch, billing one reply several times over.
@@ -2669,7 +2694,8 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                                     **or_cfg, "api_key": or_key,
                                 }
                                 alt = agent_config.get_provider(
-                                    name="openrouter", cfg=cfg_or)
+                                    name="openrouter", cfg=cfg_or,
+                                    **({"actor": credit_actor} if credit_actor is not None else {}))
                                 setattr(alt, "_mega6_degraded", True)
                                 _log(ledger, actor, {
                                     "event": "provider_degrade",
@@ -2677,10 +2703,35 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                                     "model": mid,
                                     "error": str(exc)[:200],
                                 })
-                                reply = alt.complete(
-                                    system, messages,
-                                    max_tokens=completion_cap,
-                                )
+                                _usage_before = (
+                                    _tu.usage_event_count() if _tu is not None else 0)
+                                _provider_failed = False
+                                try:
+                                    reply = alt.complete(
+                                        system, messages,
+                                        max_tokens=completion_cap,
+                                    )
+                                except BaseException:
+                                    _provider_failed = True
+                                    raise
+                                finally:
+                                    if (_tu is not None
+                                            and _tu.usage_event_count()
+                                            == _usage_before):
+                                        _tu.record_usage(
+                                            provider=str(
+                                                getattr(alt, "name", "") or ""),
+                                            model=str(
+                                                getattr(alt, "model", "") or ""),
+                                            prompt_tokens=0,
+                                            completion_tokens=0,
+                                            total_tokens=0,
+                                            context_tokens=0,
+                                            source=(
+                                                "provider_error_unreported"
+                                                if _provider_failed
+                                                else "provider_unreported"),
+                                        )
                                 provider = alt
                                 if _tu is not None and ledger is not None:
                                     try:

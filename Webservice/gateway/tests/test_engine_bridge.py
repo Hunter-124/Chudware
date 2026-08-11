@@ -21,7 +21,7 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import accounts, app as app_mod, db  # noqa: E402
+from gateway import accounts, app as app_mod, credits, db  # noqa: E402
 from gateway.config import Settings, settings  # noqa: E402
 from gateway.limits import user_slug  # noqa: E402
 
@@ -106,6 +106,23 @@ class FakeDaemon:
                     await self._broadcast(
                         {"event": "doc.changed", "doc_id": "d1", "revision": 1}
                     )
+                elif method == "agent_ask_v2" and params.get("_test_emit_usage"):
+                    event = {
+                        "event": "agent.event",
+                        "data": {
+                            "kind": "agent.provider_usage",
+                            "provider": "mock",
+                            "model": params.get("model", ""),
+                            "prompt_tokens": 100,
+                            "completion_tokens": 100,
+                            "total_tokens": 200,
+                            "context_tokens": 100,
+                            "source": "api",
+                        },
+                    }
+                    writer.write((json.dumps(event) + "\n").encode())
+                    await writer.drain()
+                    result = {"ok": True}
                 else:
                     result = {"ok": True}
                 writer.write((json.dumps({"id": mid, "result": result}) + "\n").encode())
@@ -223,6 +240,20 @@ class TestEngineBridge:
             with client.websocket_connect("/engine"):
                 pass
         assert exc.value.code == 4401
+
+    def test_cloud_access_binds_to_account_plan(self, daemon, client):
+        from starlette.websockets import WebSocketDisconnect
+
+        accounts.set_plan("demo@example.com", "desktop")
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect("/engine", headers=DEV_HEADERS):
+                pass
+        assert exc.value.code == 4403
+        assert exc.value.reason == "plan_no_cloud"
+
+        accounts.set_plan("demo@example.com", "studio")
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            assert _rpc(ws, 1, "ping")["result"]["pong"] is True
 
     def test_daemon_down_closes_cleanly(self, tmp_path, monkeypatch, client):
         monkeypatch.setattr(settings, "webd_socket", tmp_path / "absent.sock")
@@ -356,19 +387,93 @@ class TestEngineBridge:
             _rpc(ws, 1, "hello")
             # Client pins provider/model selection + a browser-side secret; only
             # the secret must be dropped before hostd sees the turn.
-            _rpc(ws, 2, "agent_ask_v2", {"question": "hi", "provider": "gemini",
-                                         "model": "gemini-2.5-flash", "api_key": "sk-web",
-                                         "base_url": "https://evil.example",
-                                         "fallback_api_keys": ["sk-other"]})
+            _rpc(ws, 2, "agent_ask_v2", {
+                "question": "hi", "provider": "gemini",
+                "model": "gemini-2.5-flash", "api_key": "sk-web",
+                "base_url": "https://evil.example",
+                "fallback_api_keys": ["sk-other"],
+                "_chudware_actor": {
+                    "email": "attacker@example.com", "plan": "enterprise",
+                    "credits_remaining": 999999, "key_source": "pool",
+                },
+                "options": {"_chudware_actor": {
+                    "email": "nested-attacker@example.com", "key_source": "pool",
+                }},
+            })
         seen = next(c for c in daemon.calls if c.get("method") == "agent_ask_v2")
         p = seen["params"]
         assert p.get("provider") == "gemini", p
         assert p.get("model") == "gemini-2.5-flash", p
         assert "api_key" not in p and "base_url" not in p and "fallback_api_keys" not in p, p
         assert p["question"] == "hi"  # non-provider params pass through untouched
+        actor = p["options"]["_chudware_actor"]
+        assert actor == {
+            "email": "demo@example.com",
+            "plan": "trial",
+
+            "credits_remaining": 0,
+            "key_source": "byok",
+        }
+        assert "_chudware_actor" not in p
         # A non-agent method keeps its params verbatim (no over-broad stripping).
         doc_calls = [c for c in daemon.calls if c.get("method") == "doc_new"]
         assert all("name" in c["params"] for c in doc_calls) or not doc_calls
+
+    def test_browser_cannot_invoke_internal_admin_worker_directly(self, daemon, client):
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            response = _rpc(ws, 76, "agent_admin_turn", {
+                "request": "bypass metering", "provider": "mock",
+            })
+        assert response["error"]["code"] == -32601
+        assert not any(call["method"] == "agent_admin_turn" for call in daemon.calls)
+
+
+    def test_pooled_usage_event_is_debited_by_authenticated_bridge(self, daemon, client):
+        with db.tx() as cur:
+            cur.execute(
+                "UPDATE accounts SET ai_grant = TRUE WHERE email = %s",
+                ("demo@example.com",),
+            )
+        credits.grant("demo@example.com", 100, note="bridge metering test")
+        credits.refresh_model_rates(
+            lambda _url: {
+                "data": [{
+                    "id": "vendor/cheap",
+                    "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                }]
+            },
+            now=1_800_000_000,
+        )
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            response = _rpc(ws, 77, "agent_ask_v2", {
+                "question": "cheap turn",
+                "provider": "mock",
+                "model": "vendor/cheap",
+                "max_tokens": 8,
+                "_test_emit_usage": True,
+            })
+            assert response["result"]["ok"] is True
+        with db.tx() as cur:
+            cur.execute(
+                "SELECT credit_balance FROM accounts WHERE email = %s",
+                ("demo@example.com",),
+            )
+            assert cur.fetchone()["credit_balance"] == 99
+            cur.execute(
+                """
+                SELECT model, credits_delta, note
+                  FROM credit_ledger
+                 WHERE email = %s AND kind = 'spend'
+                """,
+                ("demo@example.com",),
+            )
+            row = cur.fetchone()
+            assert (row["model"], row["credits_delta"]) == ("vendor/cheap", -1)
+            reservation = json.loads(row["note"])["reservation"]
+            assert reservation["state"] == "reconciled"
+            assert reservation["prompt_tokens"] == 100
+            assert reservation["completion_tokens"] == 100
+
 
     @pytest.mark.parametrize(("method", "params"), PROVIDER_MANAGER_CALLS)
     def test_standard_user_cannot_forward_provider_manager_rpc(

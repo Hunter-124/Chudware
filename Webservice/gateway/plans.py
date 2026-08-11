@@ -1,104 +1,76 @@
-"""Subscription tiers and the concrete limits each one grants.
+"""Commercial subscription tiers and the hard limits each tier grants.
 
-Pure data plus a lookup. This module NEVER imports stripe and performs no I/O,
-so it is trivially unit-testable and safe to import anywhere (including the
-workspace/bucket hot paths that will eventually enforce these caps).
-
-The limits map onto settings the gateway already enforces:
-  - storage_quota_bytes      -> config.settings.max_user_disk_bytes
-  - monthly_llm_tokens       -> chat/provider budget (enforcement wiring TBD)
-
-The numeric values below are PROVISIONAL product decisions — the owner should
-confirm them before launch. Stripe price ids are NOT stored here; only the NAME
-of the env var that carries each price id, resolved by gateway/billing.py.
+This module is pure data: Stripe price ids stay in deployment configuration,
+while the env-var names live beside the plans so provisioning and billing share
+one vocabulary.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Env var names (values live in the process environment, resolved by billing.py).
-STRIPE_PRICE_PRO_ENV = "CHUDWARE_WEB_STRIPE_PRICE_PRO"
-STRIPE_PRICE_TEAM_ENV = "CHUDWARE_WEB_STRIPE_PRICE_TEAM"
+STRIPE_PRICE_DESKTOP_ENV = "CHUDWARE_STRIPE_PRICE_DESKTOP"
+STRIPE_PRICE_DESKTOP_EDU_ENV = "CHUDWARE_STRIPE_PRICE_DESKTOP_EDU"
+STRIPE_PRICE_STUDIO_ENV = "CHUDWARE_STRIPE_PRICE_STUDIO"
+STRIPE_PRICE_STUDIO_EDU_ENV = "CHUDWARE_STRIPE_PRICE_STUDIO_EDU"
 
 _GIB = 1024**3
+_TIB = 1024**4
 
 
 @dataclass(frozen=True)
 class PlanLimits:
-    """What one account on this tier may consume. All fields are hard caps."""
-
     plan: str
     display_name: str
+    desktop: bool
+    cloud: bool
     storage_quota_bytes: int
-    monthly_llm_tokens: int
+    included_credits_monthly: int
 
 
 @dataclass(frozen=True)
 class Plan:
-    """A subscription tier. ``stripe_price_env`` is None for non-purchasable tiers."""
-
     name: str
     display_name: str
     stripe_price_env: str | None
+    stripe_price_env_edu: str | None
     limits: PlanLimits
 
 
 PLANS: dict[str, Plan] = {
-    "free": Plan(
-        name="free",
-        display_name="Free",
-        stripe_price_env=None,  # not purchasable — the default/landing tier
-        limits=PlanLimits(
-            plan="free",
-            display_name="Free",
-            storage_quota_bytes=2 * _GIB,
-            monthly_llm_tokens=100_000,
-        ),
-    ),
     "trial": Plan(
         name="trial",
         display_name="Trial",
-        # Not purchasable: a trial is granted by verifying an email address,
-        # never bought. is_purchasable("trial") must stay False or Checkout
-        # would happily sell a 14-day window that expires anyway.
         stripe_price_env=None,
-        limits=PlanLimits(
-            plan="trial",
-            display_name="Trial",
-            # A trial is the full product for 14 days — Pro's caps, not Free's.
-            # Evaluating against a crippled tier tells nobody anything.
-            storage_quota_bytes=20 * _GIB,
-            monthly_llm_tokens=2_000_000,
-        ),
+        stripe_price_env_edu=None,
+        limits=PlanLimits("trial", "Trial", True, True, 5 * _GIB, 0),
     ),
-    "pro": Plan(
-        name="pro",
-        display_name="Pro",
-        stripe_price_env=STRIPE_PRICE_PRO_ENV,
-        limits=PlanLimits(
-            plan="pro",
-            display_name="Pro",
-            storage_quota_bytes=20 * _GIB,
-            monthly_llm_tokens=2_000_000,
-        ),
+    "desktop": Plan(
+        name="desktop",
+        display_name="Desktop",
+        stripe_price_env=STRIPE_PRICE_DESKTOP_ENV,
+        stripe_price_env_edu=STRIPE_PRICE_DESKTOP_EDU_ENV,
+        limits=PlanLimits("desktop", "Desktop", True, False, 5 * _GIB, 0),
     ),
-    "team": Plan(
-        name="team",
-        display_name="Team",
-        stripe_price_env=STRIPE_PRICE_TEAM_ENV,
-        limits=PlanLimits(
-            plan="team",
-            display_name="Team",
-            storage_quota_bytes=100 * _GIB,
-            monthly_llm_tokens=10_000_000,
-        ),
+    "studio": Plan(
+        name="studio",
+        display_name="Studio",
+        stripe_price_env=STRIPE_PRICE_STUDIO_ENV,
+        stripe_price_env_edu=STRIPE_PRICE_STUDIO_EDU_ENV,
+        limits=PlanLimits("studio", "Studio", True, True, 100 * _GIB, 0),
+    ),
+    "enterprise": Plan(
+        name="enterprise",
+        display_name="Enterprise",
+        stripe_price_env=None,
+        stripe_price_env_edu=None,
+        limits=PlanLimits("enterprise", "Enterprise", True, True, _TIB, 0),
     ),
 }
 
 
 def limits_for(plan: str) -> PlanLimits:
-    """Return the hard caps for ``plan``. Raises ValueError for unknown names."""
+    """Return the hard limits for ``plan``; reject unknown tier names."""
     entry = PLANS.get((plan or "").strip().lower())
     if entry is None:
         raise ValueError(f"unknown plan: {plan!r}")
@@ -106,17 +78,23 @@ def limits_for(plan: str) -> PlanLimits:
 
 
 def is_purchasable(plan: str) -> bool:
-    """True when ``plan`` is a real tier that can be bought through Checkout."""
+    """Whether the tier can be bought through self-service Checkout."""
     entry = PLANS.get((plan or "").strip().lower())
-    return entry is not None and entry.stripe_price_env is not None
+    return bool(
+        entry
+        and entry.stripe_price_env is not None
+        and entry.stripe_price_env_edu is not None
+    )
 
 
 __all__ = [
     "PLANS",
     "Plan",
     "PlanLimits",
-    "STRIPE_PRICE_PRO_ENV",
-    "STRIPE_PRICE_TEAM_ENV",
+    "STRIPE_PRICE_DESKTOP_EDU_ENV",
+    "STRIPE_PRICE_DESKTOP_ENV",
+    "STRIPE_PRICE_STUDIO_EDU_ENV",
+    "STRIPE_PRICE_STUDIO_ENV",
     "is_purchasable",
     "limits_for",
 ]

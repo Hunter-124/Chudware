@@ -1,0 +1,76 @@
+---
+import '../styles/global.css';
+
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+const path = Astro.url.pathname;
+const nav = [
+  { href: '/', label: 'Product' },
+  { href: '/pricing/', label: 'Pricing' },
+  { href: '/docs/', label: 'Docs' },
+  { href: '/gallery/', label: 'Gallery' },
+  { href: '/changelog/', label: 'Changelog' },
+];
+const active = (href: string) => href === '/' ? path === '/' : path.startsWith(href);
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#0f1418" />
+    <link rel="icon" href="/assets/logo.svg" type="image/svg+xml" />
+    <link rel="canonical" href={new URL(path, Astro.site)} />
+    <title>{title} · Chudware</title>
+    <slot name="head" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <div class="wrap header-inner">
+        <a class="brand tap" href="/" aria-label="Chudware home">
+          <img src="/assets/logo.svg" width="32" height="32" alt="" />
+          <span>CHUDWARE</span>
+        </a>
+        <nav class="desktop-nav" aria-label="Primary">
+          {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
+        </nav>
+        <div class="header-actions">
+          <a class="sign-in tap" href="https://app.chudware.com/">Sign in</a>
+          <a class="button button-small" href="/download/">Download</a>
+        </div>
+        <details class="mobile-nav">
+          <summary class="tap">Menu</summary>
+          <nav aria-label="Mobile primary">
+            {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
+            <a class="tap" href="https://app.chudware.com/">Sign in</a>
+            <a class="tap mobile-download" href="/download/">Download</a>
+          </nav>
+        </details>
+      </div>
+    </header>
+    <main id="main"><slot /></main>
+    <footer class="site-footer">
+      <div class="wrap footer-grid">
+        <div>
+          <a class="brand tap" href="/"><img src="/assets/logo.svg" width="28" height="28" alt="" /><span>CHUDWARE</span></a>
+          <p>Mechanical design, manufacturing, and product data—one local-first workspace.</p>
+        </div>
+        <nav aria-label="Product links">
+          <strong>Product</strong>
+          <a class="tap" href="/pricing/">Pricing</a><a class="tap" href="/download/">Download</a><a class="tap" href="/docs/">Docs</a><a class="tap" href="/status/">Status</a>
+        </nav>
+        <nav aria-label="Legal links">
+          <strong>Legal</strong>
+          <a class="tap" href="/legal/terms/">Terms</a><a class="tap" href="/legal/privacy/">Privacy</a><a class="tap" href="/legal/eula/">EULA</a><a class="tap" href="/legal/refunds/">Refunds</a>
+        </nav>
+      </div>
+      <div class="wrap footer-bottom"><span>© 2026 Chudware</span><span>Built for engineers who ship.</span></div>
+    </footer>
+  </body>
+</html>

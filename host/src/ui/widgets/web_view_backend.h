@@ -1,27 +1,20 @@
 // ui::IWebViewBackend — the embedded-browser seam (Parts Library vendor sign-in).
 //
 // The vendor sign-in panel (parts_browser_panel.cpp) talks to the browser ONLY
-// through this interface, so the rendering engine underneath can be swapped
-// without touching any UI code. Two implementations:
+// through this interface. CefWebView (cef/cef_web_view.h) is the sole shipping
+// browser backend; ScreencastWebView was deleted when CEF landed on 2026-07-07.
+// CHUDWARE_ENABLE_CEF defaults ON for Linux and Windows. macOS and Web/WASM
+// force it OFF and use NullWebView, which honestly reports that no embedded
+// browser is available.
 //
-//   * ScreencastWebView (web_view.h) — the shipping default. A worker-side
-//     headless Chromium (Playwright, services/browser) streamed as JPEG frames
-//     over the browser_embed_* RPCs into a GL texture, with synthetic input
-//     forwarded back. Zero extra build deps; works today. Limitation: native
-//     OS UI (native <select> popups, the desktop clipboard, password-manager
-//     autofill) never renders into the frame stream.
+// CEF is load-bearing beyond the in-app browser: a separate headless CEF daemon
+// provides the fetch primitive used by the 100+ Parts Library source adapters.
+// See docs/design/cef_webview.md for the architecture and session interop.
 //
-//   * CefWebView (cef/cef_web_view.h, built only with CHUDWARE_ENABLE_CEF) — an
-//     in-process Chromium Embedded Framework off-screen render straight to a GL
-//     texture. CEF composites its own <select>/popup layer and bridges the OS
-//     clipboard, so those interactions work. See docs/cef_webview.md for the
-//     architecture, the cookie-store interop contract with the Playwright
-//     scraper, and the C++/Python boundary.
-//
-// Threading contract is identical for every backend: GL-thread-only; all RPC is
-// async via st.rpc; texture create/update happens only on the GL thread (see
-// MEMORY gl-thread-rpc-freeze). CEF's OnPaint hands buffers off a CEF thread —
-// its backend copies them and uploads on the GL thread like the screencast one.
+// Threading contract: GL-thread-only; all RPC is async via st.rpc; texture
+// create/update happens only on the GL thread (see MEMORY gl-thread-rpc-freeze).
+// CEF's OnPaint hands buffers off a CEF thread; the backend copies them and
+// uploads them on the GL thread.
 #pragma once
 
 #include <functional>
@@ -58,12 +51,11 @@ public:
     virtual bool starting() const = 0;
     virtual const std::string& lastError() const = 0;
 
-    // Hand the live session over to the worker so headless scraping/downloads
+    // Hand the live CEF session over to the headless fetch daemon so downloads
     // reuse it: export the backend's cookie jar for `site` and stage it via the
     // browser_session_import RPC (which also stamps the login as verified).
-    // `done(ok)` fires on the GL thread. Backends whose cookies already live in
-    // the worker-side Playwright profile have nothing to hand over — the default
-    // reports success without doing anything.
+    // `done(ok)` fires on the GL thread. NullWebView has nothing to export, so
+    // the default reports success without doing anything.
     virtual void exportSession(AppState& st, const std::string& site,
                                std::function<void(bool)> done) {
         (void)st; (void)site;
@@ -71,9 +63,8 @@ public:
     }
 
     // Browser-chrome navigation (URL bar / refresh / back / forward). The panel
-    // shows these controls only when the backend supports them; the default is an
-    // inert stub so the screencast backend (worker-driven) is unaffected. CEF
-    // overrides them to drive the in-process browser. navigate() takes a full URL.
+    // shows these controls only when the backend supports them; NullWebView uses
+    // the inert defaults. navigate() takes a full URL.
     virtual void navigate(AppState& st, const std::string& url) { open(st, url, /*isUrl=*/true); }
     virtual void reload(AppState& st) { (void)st; }
     virtual void goBack(AppState& st) { (void)st; }
@@ -83,10 +74,8 @@ public:
     // True when this backend exposes the URL-bar / back-forward chrome above.
     virtual bool hasNavChrome() const { return false; }
 
-    // True when the backend adopts the login wizard's worker-side embed via
-    // attach(embed_id) (the ScreencastWebView default). CEF renders in-process and
-    // has no worker embed, so it returns false and the panel drives it with
-    // open(site) instead. Keeps the wizard flow backend-agnostic.
+    // Legacy capability query retained by the wizard interface. CefWebView
+    // overrides this to false; unavailable NullWebView never starts a session.
     virtual bool usesWorkerEmbed() const { return true; }
 
     // False when the backend cannot host a browser (e.g. CEF cold-init failed).
@@ -103,11 +92,10 @@ public:
     }
 };
 
-// Backend selection, single source of truth. Returns the in-process CefWebView —
-// the one and only embedded-browser backend — whenever built with
-// CHUDWARE_ENABLE_CEF (the default on every OS; no runtime toggle). Only an
-// SDK-less build (CHUDWARE_ENABLE_CEF=OFF, e.g. CI without the CEF binary dist)
-// falls back to the inert NullWebView. Call sites stay backend-agnostic:
+// Backend selection, single source of truth. Returns CefWebView when
+// CHUDWARE_ENABLE_CEF is enabled (the Linux/Windows default), otherwise the
+// inert NullWebView (macOS, Web/WASM, or an explicit SDK-less native build).
+// There is no runtime toggle. Call sites stay backend-agnostic:
 // `auto web = ui::makeWebView();  web->open(...);`.
 std::unique_ptr<IWebViewBackend> makeWebView();
 

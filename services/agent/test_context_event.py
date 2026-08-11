@@ -92,6 +92,25 @@ def _run(provider, **kw):
     return res, events
 
 
+def test_silent_provider_emits_visible_unreported_usage_in_finally():
+    usage_events: list[dict] = []
+    token = token_usage.bind_usage_sink(usage_events.append)
+    try:
+        result, _ = _run(_SilentProvider())
+    finally:
+        token_usage.reset_usage_sink(token)
+    assert result.success is True
+    assert usage_events == [{
+        "provider": "silent",
+        "model": "silent-1",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "context_tokens": 0,
+        "source": "provider_unreported",
+    }]
+
+
 def test_emits_used_and_window_from_provider():
     provider = _UsageProvider(prompts=(4321,), context_window=131072)
     res, events = _run(provider)

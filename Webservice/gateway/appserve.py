@@ -17,12 +17,18 @@ import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 try:
+    from .accounts import get_account
+    from .auth import get_current_user
     from .config import settings
+    from .plans import limits_for
 except ImportError:  # uvicorn app:app from package dir
+    from accounts import get_account
+    from auth import get_current_user
     from config import settings
+    from plans import limits_for
 
 log = logging.getLogger("chudware-web.appserve")
 
@@ -213,9 +219,35 @@ def _file_response(target: Path, request: Request) -> FileResponse:
     )
 
 
+def _upgrade_response(request: Request) -> HTMLResponse | None:
+    """Return the cloud-plan upgrade page, or None when /app is entitled."""
+    user = get_current_user(request)
+    account = get_account(user.email)
+    try:
+        if account is not None and limits_for(account.plan).cloud:
+            return None
+    except ValueError:
+        pass
+    return HTMLResponse(
+        status_code=403,
+        headers={"Cache-Control": "no-store"},
+        content="""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cloud workspace upgrade required · Chudware</title></head>
+<body><main><h1>Your plan does not include the cloud workspace</h1>
+<p>The Desktop plan keeps the native app enabled. Upgrade to Studio to use
+Chudware in this browser.</p>
+<p><a href="/#pricing">Compare plans</a></p></main></body></html>""",
+    )
+
+
 @router.get("/app", response_model=None)
-async def app_redirect() -> Response:
-    """Redirect to the canonical slash form so relative bundle URLs stay under /app/."""
+async def app_redirect(request: Request) -> Response:
+    """Redirect entitled callers to the canonical slash form."""
+    upgrade = _upgrade_response(request)
+    if upgrade is not None:
+        return upgrade
     index = _resolve_under_app("")
     return RedirectResponse(
         url="/app/",
@@ -227,12 +259,18 @@ async def app_redirect() -> Response:
 @router.get("/app/", response_model=None)
 async def app_index(request: Request) -> Response:
     """Serve the WASM client entry (index.html)."""
+    upgrade = _upgrade_response(request)
+    if upgrade is not None:
+        return upgrade
     return _file_response(_resolve_under_app(""), request)
 
 
 @router.get("/app/{asset_path:path}", response_model=None)
 async def app_asset(asset_path: str, request: Request) -> Response:
     """Serve a file from the WASM client tree."""
+    upgrade = _upgrade_response(request)
+    if upgrade is not None:
+        return upgrade
     return _file_response(_resolve_under_app(asset_path), request)
 
 

@@ -1,7 +1,9 @@
 # corpora — consolidated test fixtures
 
-Parity, sketch, render, and SolidWorks fixture corpora for differential testing
-(Python oracle ↔ C++ core ↔ host GUI).
+Sketch, render, and SolidWorks fixtures for testing the C++ core and the sole
+host GUI. The former Python `engine_oracle/` differential leg was deleted in
+T-RF21 (2026-07-23); these are regression and interoperability corpora, not a
+three-engine oracle comparison.
 
 | Subdir | Purpose |
 |--------|---------|

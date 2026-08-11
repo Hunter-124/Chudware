@@ -238,6 +238,10 @@ C++ agent_run path now emits agent-level kinds previously Python-only:
 - `agent.role` (new kind): emitted ONLY when the agent actually adopts a different role via `adopt_role` — never for the default first-turn `general_agent` entry. Fields: `node_id`, `role`, `goal` (<=280), `from_role`, `reason` (<=280). Producer: `services.agent.mission_dispatch.MissionDispatch.adopt_role` via `agent_events.role_event`. GUI: reveals the copilot Routing card (rowKind 10) with the new role; the per-request `agent.classification`/`complexity`/`task_route` telemetry alone now keeps the card hidden (stage `class:pending`) since every request enters via the universal `general_agent` role.
 - `agent.spawn` (existing kind) additionally drives a GUI "Delegating" card (rowKind 19) in the copilot activity timeline — one card per turn, upserted as spawns land, listing `role`/`spawn_kind`/`brief` per subagent. No payload change.
 
+## Provider usage metering (2026-08-10, additive)
+- `agent.provider_usage`: emitted immediately by the Python provider usage sink with `{provider, model, prompt_tokens, completion_tokens, total_tokens, context_tokens, source}`. The payload deliberately carries no email, account id, balance, or other attribution: the authenticated gateway attributes the event to the WebSocket that delivered it. With no bound sink (desktop/local BYOK), usage keeps its existing in-process accumulator behavior and emits nothing.
+
+
 ## agent compaction / session settings (batch 2b)
 Config keys under `agent` (Python services/agent/config.py; C++ config.cpp mirrors agent.prewalk*):
 - `agent.compaction_strategy` string default "off" — off|snapcompact|shake|summary

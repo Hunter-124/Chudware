@@ -851,6 +851,22 @@ struct AppState {
     Renderer* renderer = nullptr;     // owned by run_gui; AppState only borrows it
     chrome::HitLayout* hitLayout = nullptr;
 
+    // ---- signed desktop entitlement (commercial launch 4.1) ----
+    // One fail-closed flag is consulted by every command surface. It never
+    // prevents opening, viewing, orbiting, measuring, or exporting existing work.
+    bool entitlementReadOnly = true;
+    bool entitlementSignedIn = false;
+    bool entitlementGraceExpiring = false;
+    std::string entitlementPlan;
+    std::string entitlementEmail;
+    std::string entitlementStatus;
+    std::string entitlementToken;  // verified compact token, memory-only
+    // Independent first-AI-dispatch verification; implemented in app_state.cpp
+    // with its own crypto_sign_open call rather than the launch/router helper.
+    bool entitlementMutationVerified = false;
+    bool entitlementAiVerified = false;
+    bool verifyEntitlementForAi();
+
     // ---- document mirror (C16) — worker-backed document state ----
     core::DocMirror docMirror;
     bool wantTree = false;   // CHUDWARE_SHOT=tree: scripted doc-smoke flow + screenshot

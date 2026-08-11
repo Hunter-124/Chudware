@@ -1447,6 +1447,9 @@ void submitTurn(AppState& st, const std::string& text) {
     // Slash commands: /compact /shake /handoff /btw /prewalk /skills /help — pure host+RPC,
     // no agent turn. Skills themselves (/skill:<name>) ride a normal turn and activate in-agent.
     if (tryHandleSlashCommand(st, text)) return;
+#ifndef __EMSCRIPTEN__
+    if (!st.verifyEntitlementForAi()) return;
+#endif
     // Persist the active provider/model to config.json BEFORE launching any run. The C++ core
     // resolves the provider from config.json (not in-memory st.settings), so this guarantees the
     // run uses exactly what the picker shows — closing the window where a freshly-picked local

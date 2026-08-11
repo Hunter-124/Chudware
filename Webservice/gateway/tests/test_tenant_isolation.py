@@ -9,6 +9,7 @@ the legacy shared tree is reachable only by an explicit admin opt-in.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 import sys
 from pathlib import Path
@@ -25,7 +26,7 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import accounts, app as app_mod, db  # noqa: E402
+from gateway import accounts, app as app_mod, db, plans  # noqa: E402
 from gateway.config import settings  # noqa: E402
 from gateway.limits import RateLimiter, user_slug  # noqa: E402
 import gateway.workspace as workspace_mod  # noqa: E402
@@ -310,9 +311,17 @@ def test_workspace_write_rate_limit_enforced(client, monkeypatch):
 
 
 def test_workspace_disk_quota_enforced(client, monkeypatch):
-    monkeypatch.setattr(settings, "max_user_disk_bytes", 10)
+    trial = plans.PLANS["trial"]
+    monkeypatch.setitem(
+        plans.PLANS,
+        "trial",
+        replace(trial, limits=replace(trial.limits, storage_quota_bytes=10)),
+    )
     r = _upload_ws(client, A, name="q.bin", data=b"y" * 50)
     assert r.status_code == 507
+    accounts.set_plan("alice@crimson.ua.edu", "studio")
+    r = _upload_ws(client, A, name="q.bin", data=b"y" * 50)
+    assert r.status_code == 200
 
 
 def test_workspace_paths_stay_inside_the_callers_own_root(client):

@@ -1,0 +1,24 @@
+---
+title: Sketching
+description: Build stable profiles with relations, driving dimensions, and clear design intent.
+section: Model
+order: 50
+---
+## Constrain intent, not the picture
+
+A sketch should explain how geometry may move. Start with relations—coincident, horizontal, vertical, parallel, tangent, equal—then add only the dimensions needed to set size and position.
+
+Use the origin and reference geometry whenever the part is naturally symmetric. Mirroring half a profile is usually more stable than dimensioning two nearly identical sides.
+
+## Read sketch state
+
+The sketch status reports remaining degrees of freedom and conflicting constraints. Drag under-defined geometry gently to reveal what can still move. If the sketch is over-defined, remove the newest redundant relation rather than suppressing the warning.
+
+## Choose the feature that follows
+
+- Closed planar profile → **Extrude** or **Revolve**
+- Cross-sections on several planes → **Loft**
+- Profile following a path → **Sweep**
+- Repeated geometry → build one instance, then **Pattern**
+
+Keep sketches simple. Several focused sketches are easier to revise than one drawing that controls the entire part.

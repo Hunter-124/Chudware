@@ -199,13 +199,26 @@ add_library(chudware_util STATIC
   util/resource_governor.cpp
   util/thread_pool.cpp
   util/platform_paths.cpp
-  util/parent_death.cpp)
+  util/parent_death.cpp
+  util/entitlement.cpp
+  util/secret_store.cpp
+  util/tweetnacl.c)
 target_include_directories(chudware_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(chudware_util PUBLIC Threads::Threads)
-if(UNIX AND NOT APPLE)
+target_link_libraries(chudware_util PUBLIC Threads::Threads nlohmann_json::nlohmann_json)
+if(WIN32)
+  target_link_libraries(chudware_util PUBLIC bcrypt crypt32)
+elseif(APPLE)
+  target_link_libraries(chudware_util PUBLIC "-framework Security")
+elseif(UNIX)
   # shm_open/shm_unlink live in librt on older glibc; harmless empty on new glibc.
   target_link_libraries(chudware_util PUBLIC rt)
 endif()
+
+add_executable(test_entitlement tests/test_entitlement.cpp)
+target_link_libraries(test_entitlement PRIVATE chudware_util)
+add_test(NAME entitlement COMMAND test_entitlement)
+set_target_properties(test_entitlement PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # --- libchudware sim (simulation solvers) ---------------------------------------
 # C++ port of engine/sim. FEA static linear elasticity first (tet4 + Eigen::SparseLU,

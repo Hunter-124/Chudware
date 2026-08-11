@@ -1,57 +1,35 @@
-"""Stripe billing: Checkout, Customer Portal, and webhook-driven entitlement.
+"""Stripe Checkout, Customer Portal, and idempotent billing webhooks.
 
-Architecture
-------------
-- plans.py is the source of truth for what a plan grants. Stripe only carries
-  the price id, resolved from the process environment via the env-var NAMES in
-  plans.py. A client can request a plan NAME; it can never supply a price id
-  or amount — those come from the server-side environment only.
-- The entitlement lives in the accounts store (gateway/accounts.py, owned by a
-  sibling module). This module never touches the accounts SQLite file directly;
-  it calls the narrow AccountStore interface below, which is bound either to
-  the real ``accounts`` module at import time or injected via
-  ``set_account_store()`` (tests / wiring).
-- Everything degrades to a clear 503 when Stripe is not configured, and this
-  module imports cleanly with neither the ``stripe`` package nor any keys
-  present — the gateway keeps booting on a box with no Stripe setup.
-- ``stripe`` is imported lazily inside the functions that need it.
-
-Environment (read directly here; the lead should later fold these into
-gateway/config.py Settings as ``stripe_*`` fields):
-  CHUDWARE_WEB_STRIPE_SECRET_KEY      — sk_live_... / sk_test_...
-  CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET  — whsec_... for the signing endpoint
-  CHUDWARE_WEB_STRIPE_PRICE_PRO       — price_... for the Pro tier
-  CHUDWARE_WEB_STRIPE_PRICE_TEAM      — price_... for the Team tier
-  CHUDWARE_WEB_STRIPE_SUCCESS_URL     — Checkout return URL (optional)
-  CHUDWARE_WEB_STRIPE_CANCEL_URL      — Checkout abort URL (optional)
-
-SECURITY: POST /api/billing/webhook is a NEW unauthenticated route reachable
-from the internet (Stripe calls it). It must be added to auth.PUBLIC_PATHS
-(see the wiring snippet in the rollout report). Its only protection is Stripe
-signature verification — anything unverified is rejected with 400 before any
-parsing or side effect, the body is size-capped, and event ids are persisted in
-the same transaction as the entitlement mutation so Stripe's at-least-once
-redelivery cannot apply an entitlement twice.
+The browser may select only a plan or named credit pack. Price ids, amounts,
+education eligibility, and entitlement dates are server-authoritative. Stripe
+webhook event ids are inserted in the same re-entrant PostgreSQL transaction as
+every resulting account or credit-ledger mutation.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 try:
+    from . import accounts as _accounts_mod
+    from . import credits
+    from . import mailer
     from .auth import get_current_user
     from .config import settings
     from .db import tx
     from .plans import PLANS, is_purchasable, limits_for
 except ImportError:  # uvicorn app:app from the package dir
+    import accounts as _accounts_mod
+    import credits
+    import mailer
     from auth import get_current_user
     from config import settings
     from db import tx
@@ -59,21 +37,8 @@ except ImportError:  # uvicorn app:app from the package dir
 
 log = logging.getLogger("chudware-web.billing")
 
-# Stripe webhook payloads for subscription/checkout events are a few KiB;
-# 64 KiB is generous headroom and keeps a junk POST from being buffered.
 MAX_WEBHOOK_BYTES = 64 * 1024
-
-DEFAULT_SUCCESS_URL = "https://app.chudware.com/?billing=success"
-DEFAULT_CANCEL_URL = "https://app.chudware.com/?billing=cancel"
-
-# Subscription states that mean the customer is NOT currently entitled.
 _DOWNGRADE_STATUSES = {"past_due", "unpaid", "canceled", "incomplete_expired"}
-
-
-# ---------------------------------------------------------------------------
-# Configuration (env-driven; read per call so tests and ops can rotate keys
-# without a module reload)
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -82,17 +47,30 @@ class BillingConfig:
     webhook_secret: str
     success_url: str
     cancel_url: str
+    desktop_price: str
+    desktop_edu_price: str
+    studio_price: str
+    studio_edu_price: str
+    credits_starter_price: str
+    credits_standard_price: str
+    credits_bulk_price: str
 
 
-def load_config(env: Any = None) -> BillingConfig:
-    env = os.environ if env is None else env
+def load_config(source: Any = None) -> BillingConfig:
+    """Snapshot the validated process settings for one billing operation."""
+    source = settings if source is None else source
     return BillingConfig(
-        secret_key=(env.get("CHUDWARE_WEB_STRIPE_SECRET_KEY") or "").strip(),
-        webhook_secret=(env.get("CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET") or "").strip(),
-        success_url=(env.get("CHUDWARE_WEB_STRIPE_SUCCESS_URL") or "").strip()
-        or DEFAULT_SUCCESS_URL,
-        cancel_url=(env.get("CHUDWARE_WEB_STRIPE_CANCEL_URL") or "").strip()
-        or DEFAULT_CANCEL_URL,
+        secret_key=source.stripe_secret_key.strip(),
+        webhook_secret=source.stripe_webhook_secret.strip(),
+        success_url=source.stripe_success_url.strip(),
+        cancel_url=source.stripe_cancel_url.strip(),
+        desktop_price=source.stripe_price_desktop.strip(),
+        desktop_edu_price=source.stripe_price_desktop_edu.strip(),
+        studio_price=source.stripe_price_studio.strip(),
+        studio_edu_price=source.stripe_price_studio_edu.strip(),
+        credits_starter_price=source.stripe_price_credits_starter.strip(),
+        credits_standard_price=source.stripe_price_credits_standard.strip(),
+        credits_bulk_price=source.stripe_price_credits_bulk.strip(),
     )
 
 
@@ -106,7 +84,6 @@ def _require_configured(cfg: BillingConfig) -> None:
 
 
 def _stripe():
-    """Import stripe lazily — the module must load without the package installed."""
     try:
         import stripe
     except ImportError as exc:
@@ -116,15 +93,8 @@ def _stripe():
     return stripe
 
 
-# ---------------------------------------------------------------------------
-# Account store adapter (gateway/accounts.py — interface agreed with its owner)
-# ---------------------------------------------------------------------------
-
-
 @runtime_checkable
 class AccountStore(Protocol):
-    """The exact helpers billing needs from gateway/accounts.py."""
-
     def get_account(self, email: str) -> Any: ...
     def get_account_by_stripe_customer(self, customer_id: str) -> Any: ...
     def ensure_account(self, email: str, display: str) -> Any: ...
@@ -133,52 +103,132 @@ class AccountStore(Protocol):
     def set_status(
         self, email: str, status: str, decided_by: str = "", notes: str = ""
     ) -> Any: ...
+    def set_subscription(
+        self,
+        email: str,
+        *,
+        subscription_id: str = "",
+        subscription_status: str = "",
+        price_id: str = "",
+        subscribed_since: float | None = None,
+        paid_through: float | None = None,
+        is_edu: bool,
+    ) -> Any: ...
 
-
-try:  # real store, when the sibling module is present
-    from . import accounts as _accounts_mod  # type: ignore[import-not-found]
-except ImportError:
-    try:
-        import accounts as _accounts_mod  # type: ignore[no-redef]
-    except ImportError:
-        _accounts_mod = None
 
 _injected_store: AccountStore | None = None
 
 
 def set_account_store(store: AccountStore | None) -> None:
-    """Bind the account store explicitly (tests, or wiring before accounts.py lands)."""
     global _injected_store
     _injected_store = store
 
 
 def _store() -> AccountStore:
-    store = _injected_store if _injected_store is not None else _accounts_mod
-    if store is None:
-        raise HTTPException(503, "account store unavailable")
-    return store  # type: ignore[return-value]
+    return _injected_store if _injected_store is not None else _accounts_mod
 
 
-# ---------------------------------------------------------------------------
-# Webhook idempotency: persist processed Stripe event ids (at-least-once
-# redelivery must not re-apply an entitlement)
-# ---------------------------------------------------------------------------
+def _subscription_prices(cfg: BillingConfig) -> dict[tuple[str, bool], str]:
+    """The only four recurring prices Checkout and webhooks recognize."""
+    return {
+        ("desktop", False): cfg.desktop_price,
+        ("desktop", True): cfg.desktop_edu_price,
+        ("studio", False): cfg.studio_price,
+        ("studio", True): cfg.studio_edu_price,
+    }
+
+
+def _credit_pack_prices(cfg: BillingConfig) -> dict[str, str]:
+    return {
+        "starter": cfg.credits_starter_price,
+        "standard": cfg.credits_standard_price,
+        "bulk": cfg.credits_bulk_price,
+    }
+
+
+def _is_edu(email: str) -> bool:
+    local, separator, domain = (email or "").strip().lower().rpartition("@")
+    return bool(local and separator and domain.endswith(".edu"))
+
+
+def _price_for_plan(cfg: BillingConfig, plan: str, is_edu: bool) -> str:
+    return _subscription_prices(cfg).get((plan, is_edu), "")
+
+
+def _plan_name_for_price(cfg: BillingConfig, price_id: str | None) -> str | None:
+    if not price_id:
+        return None
+    for (plan, _is_education), configured in _subscription_prices(cfg).items():
+        if configured and configured == price_id:
+            return plan
+    return None
+
+
+def _field(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, Mapping):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _line_data(obj: Any) -> list[Any]:
+    container = (
+        _field(obj, "line_items")
+        or _field(obj, "lines")
+        or _field(obj, "items")
+        or {}
+    )
+    data = _field(container, "data", [])
+    return list(data or [])
+
+
+def _price_id(line: Any) -> str:
+    price = _field(line, "price") or {}
+    if isinstance(price, str):
+        return price
+    return str(_field(price, "id", "") or "")
+
+
+def _subscription_id(obj: Any) -> str:
+    direct = _field(obj, "subscription")
+    if isinstance(direct, str):
+        return direct
+    if direct:
+        return str(_field(direct, "id", "") or "")
+    parent = _field(obj, "parent") or {}
+    details = _field(parent, "subscription_details") or {}
+    value = _field(details, "subscription")
+    if isinstance(value, str):
+        return value
+    return str(_field(value, "id", "") or "") if value else ""
+
+
+def _subscription_line(obj: Any, cfg: BillingConfig) -> Any | None:
+    lines = _line_data(obj)
+    for line in lines:
+        if _plan_name_for_price(cfg, _price_id(line)):
+            return line
+    return lines[0] if lines else None
+
+
+def _plan_from_subscription(obj: Any, cfg: BillingConfig) -> str | None:
+    metadata = _field(obj, "metadata") or {}
+    name = str(_field(metadata, "chudware_plan", "") or "").strip().lower()
+    if is_purchasable(name):
+        return name
+    line = _subscription_line(obj, cfg)
+    return _plan_name_for_price(cfg, _price_id(line)) if line is not None else None
+
+
+def _downgrade(account: Any, reason: str) -> None:
+    """End a paid plan without changing the human account's approval status."""
+    if account is None:
+        return
+    if getattr(account, "plan", "trial") != "trial":
+        log.info("downgrading %s to trial (%s)", account.email, reason)
+        _store().set_plan(account.email, "trial")
 
 
 def _process_event_once(event: Any) -> bool:
-    """Apply ``event`` exactly once. Returns False for a redelivery.
-
-    The idempotency record and the entitlement mutation commit in ONE
-    transaction: ``tx()`` is re-entrant, so the ``accounts`` writes performed by
-    ``_apply_event`` join the transaction opened here instead of running in
-    their own. A crash mid-handler therefore rolls BOTH back and Stripe's retry
-    is processed normally, and a half-applied entitlement is not reachable.
-
-    Insert first, ask questions later: ``ON CONFLICT DO NOTHING`` takes the row
-    lock, so two concurrent deliveries of the same event serialize on it and the
-    loser sees zero affected rows. A SELECT-then-INSERT would let both pass the
-    check before either wrote.
-    """
     event_id = str(event["id"])
     event_type = str(event["type"])
     with tx() as cur:
@@ -194,132 +244,282 @@ def _process_event_once(event: Any) -> bool:
         return True
 
 
-# ---------------------------------------------------------------------------
-# Entitlement transitions
-# ---------------------------------------------------------------------------
+def _checkout_email(obj: Any) -> str:
+    metadata = _field(obj, "metadata") or {}
+    details = _field(obj, "customer_details") or {}
+    return str(
+        _field(obj, "client_reference_id", "")
+        or _field(metadata, "chudware_email", "")
+        or _field(obj, "customer_email", "")
+        or _field(details, "email", "")
+        or ""
+    ).strip().lower()
 
 
-def _plan_name_for_price(price_id: str | None) -> str | None:
-    if not price_id:
-        return None
-    for name, plan in PLANS.items():
-        if plan.stripe_price_env and os.environ.get(plan.stripe_price_env) == price_id:
-            return name
-    return None
+def _checkout_lines(obj: Any, stripe: Any) -> list[Any]:
+    lines = _line_data(obj)
+    if lines:
+        return lines
+    session_id = str(_field(obj, "id", "") or "")
+    if not session_id:
+        raise HTTPException(400, "credit checkout session has no id")
+    result = stripe.checkout.Session.list_line_items(
+        session_id, limit=2, expand=["data.price"]
+    )
+    return list(_field(result, "data", []) or [])
 
 
-def _plan_from_subscription(obj: Any) -> str | None:
-    meta = obj.get("metadata") or {}
-    name = (meta.get("chudware_plan") or "").strip().lower()
-    if name in PLANS:
-        return name
-    items = (obj.get("items") or {}).get("data") or []
-    if items:
-        return _plan_name_for_price((items[0].get("price") or {}).get("id"))
-    return None
+def _credit_price_metadata(price: Any, stripe: Any) -> tuple[str, Mapping[str, Any]]:
+    if isinstance(price, str):
+        price_id = price
+        price = {}
+    else:
+        price_id = str(_field(price, "id", "") or "")
+    metadata = _field(price, "metadata") or {}
+    if not metadata and price_id:
+        price = stripe.Price.retrieve(price_id)
+        metadata = _field(price, "metadata") or {}
+    return price_id, metadata
 
 
-def _downgrade(account: Any, reason: str) -> None:
-    """Revoke paid entitlement (cancellation / payment failure) -> free tier.
+def _grant_credit_checkout(obj: Any, event: Any, cfg: BillingConfig, stripe: Any) -> None:
+    email = _checkout_email(obj)
+    lines = _checkout_lines(obj, stripe)
+    if not email or len(lines) != 1:
+        raise HTTPException(400, "invalid credit checkout identity or line items")
+    price = _field(lines[0], "price") or {}
+    price_id, metadata = _credit_price_metadata(price, stripe)
+    if price_id not in set(_credit_pack_prices(cfg).values()):
+        raise HTTPException(400, "unrecognized credit pack price")
+    raw = str(_field(metadata, "chud_credits", "") or "").strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        raise HTTPException(400, "credit pack price missing valid chud_credits metadata")
+    session_meta = _field(obj, "metadata") or {}
+    credits.grant_purchased(
+        email,
+        int(raw),
+        str(event["id"]),
+        {
+            "checkout_session_id": str(_field(obj, "id", "") or ""),
+            "pack": str(_field(session_meta, "chudware_pack", "") or ""),
+            "price_id": price_id,
+        },
+    )
 
-    The account's approval STATUS is left alone: an expired card does not
-    un-approve the human, it only ends what they are paying for.
-    """
-    if account is None:
-        return
-    if getattr(account, "plan", "free") != "free":
-        log.info("downgrading %s to free (%s)", account.email, reason)
-        _store().set_plan(account.email, "free")
+
+def _period_bounds(
+    obj: Any, cfg: BillingConfig
+) -> tuple[float | None, float | None]:
+    """Paid service period from the recurring plan line, never a one-off item."""
+    line = _subscription_line(obj, cfg)
+    period = _field(line, "period") or {} if line is not None else {}
+    start = _field(period, "start")
+    end = _field(period, "end")
+    return (
+        float(start) if isinstance(start, (int, float)) else None,
+        float(end) if isinstance(end, (int, float)) else None,
+    )
+
+
+def _sync_renewal_price(
+    account: Any, obj: Any, cfg: BillingConfig, stripe: Any
+) -> tuple[str, str, bool]:
+    line = _subscription_line(obj, cfg)
+    actual_price = _price_id(line) if line is not None else ""
+    plan = _plan_name_for_price(cfg, actual_price) or getattr(account, "plan", "trial")
+    education = _is_edu(account.email)
+    expected_price = _price_for_plan(cfg, plan, education)
+    subscription_id = _subscription_id(obj) or getattr(account, "subscription_id", "")
+    if expected_price and actual_price and expected_price != actual_price and subscription_id:
+        parent = _field(line, "parent") or {}
+        item_details = _field(parent, "subscription_item_details") or {}
+        item_id = str(
+            _field(line, "subscription_item", "")
+            or _field(item_details, "subscription_item", "")
+            or ""
+        )
+        if not item_id:
+            raise HTTPException(400, "renewal line missing subscription item id")
+        stripe.Subscription.modify(
+            subscription_id,
+            items=[{"id": item_id, "price": expected_price}],
+            proration_behavior="none",
+        )
+        log.info(
+            "renewal price corrected for %s: %s -> %s",
+            account.email,
+            actual_price,
+            expected_price,
+        )
+        actual_price = expected_price
+    return plan, actual_price, education
+
+
+def _payment_failed_mail(account: Any, invoice: Any, cfg: BillingConfig) -> None:
+    amount_minor = int(_field(invoice, "amount_due", 0) or 0)
+    currency = str(_field(invoice, "currency", "usd") or "usd").upper()
+    amount = f"{currency} {amount_minor / 100:.2f}"
+    retry_at = _field(invoice, "next_payment_attempt")
+    if isinstance(retry_at, (int, float)):
+        retry_on = datetime.fromtimestamp(float(retry_at), timezone.utc).strftime(
+            "%B %d"
+        ).replace(" 0", " ")
+    else:
+        retry_on = "the date shown in your billing portal"
+    update_url = str(
+        _field(invoice, "hosted_invoice_url", "")
+        or f"{settings.public_base_url}/account"
+    )
+    mailer.send(
+        account.email,
+        "payment_failed",
+        {
+            "amount": amount,
+            "email": account.email,
+            "retry_on": retry_on,
+            "update_payment_url": update_url,
+        },
+    )
 
 
 def _apply_event(store: AccountStore, event: Any) -> None:
-    """Mutate the entitlement for one verified, not-yet-processed event."""
     event_type = str(event["type"])
     obj = event["data"]["object"]
+    cfg = load_config()
+    stripe = _stripe()
+    stripe.api_key = cfg.secret_key
 
     if event_type == "checkout.session.completed":
-        meta = obj.get("metadata") or {}
-        email = (
-            (obj.get("client_reference_id") or "").strip().lower()
-            or (meta.get("chudware_email") or "").strip().lower()
-            or (obj.get("customer_email") or "").strip().lower()
-            or ((obj.get("customer_details") or {}).get("email") or "").strip().lower()
-        )
-        plan = (meta.get("chudware_plan") or "").strip().lower()
+        if str(_field(obj, "mode", "") or "") == "payment":
+            _grant_credit_checkout(obj, event, cfg, stripe)
+            return
+        metadata = _field(obj, "metadata") or {}
+        email = _checkout_email(obj)
+        plan = str(_field(metadata, "chudware_plan", "") or "").strip().lower()
         if not email or not is_purchasable(plan):
-            # Poison event (our own metadata was wrong). Log loud, mark
-            # processed — retrying it forever would change nothing.
             log.error(
-                "checkout.session.completed %s with unusable email/plan "
-                "(email=%r plan=%r) — entitlement NOT applied",
+                "checkout.session.completed %s has unusable email/plan (%r, %r)",
                 event["id"],
                 email,
                 plan,
             )
             return
         account = store.ensure_account(email, display=email)
-        customer_id = obj.get("customer") or ""
+        customer_id = str(_field(obj, "customer", "") or "")
         if customer_id:
             store.set_stripe_customer(email, customer_id)
+        education = _is_edu(email)
         store.set_plan(email, plan)
+        store.set_subscription(
+            email,
+            subscription_id=_subscription_id(obj),
+            subscription_status="active",
+            price_id=_price_for_plan(cfg, plan, education),
+            is_edu=education,
+        )
         store.set_status(
             email,
             "active",
             decided_by="stripe",
             notes=f"checkout.session.completed {event['id']}",
         )
-        log.info(
-            "entitlement upgraded: %s -> %s (customer %s)",
-            account.email,
-            plan,
-            customer_id,
-        )
+        log.info("entitlement upgraded: %s -> %s", account.email, plan)
         return
 
     if event_type == "customer.subscription.updated":
-        account = store.get_account_by_stripe_customer(obj.get("customer") or "")
+        account = store.get_account_by_stripe_customer(_field(obj, "customer", "") or "")
         if account is None:
-            log.warning(
-                "subscription.updated for unknown customer %s — ignored",
-                obj.get("customer"),
-            )
+            log.warning("subscription.updated for unknown customer — ignored")
             return
-        sub_status = str(obj.get("status") or "")
-        if sub_status in _DOWNGRADE_STATUSES:
-            _downgrade(account, f"subscription status {sub_status}")
+        status = str(_field(obj, "status", "") or "")
+        price_id = _price_id(_subscription_line(obj, cfg) or {})
+        store.set_subscription(
+            account.email,
+            subscription_id=str(_field(obj, "id", "") or ""),
+            subscription_status=status,
+            price_id=price_id,
+            is_edu=_is_edu(account.email),
+        )
+        if status in _DOWNGRADE_STATUSES:
+            _downgrade(account, f"subscription status {status}")
             return
-        if sub_status in {"active", "trialing"}:
-            plan = _plan_from_subscription(obj)
-            if plan and plan != getattr(account, "plan", "free"):
+        if status in {"active", "trialing"}:
+            plan = _plan_from_subscription(obj, cfg)
+            if plan and plan != getattr(account, "plan", "trial"):
                 store.set_plan(account.email, plan)
-                log.info("plan synced from subscription: %s -> %s", account.email, plan)
         return
 
     if event_type == "customer.subscription.deleted":
-        account = store.get_account_by_stripe_customer(obj.get("customer") or "")
+        account = store.get_account_by_stripe_customer(_field(obj, "customer", "") or "")
         if account is None:
-            log.warning(
-                "subscription.deleted for unknown customer %s — ignored",
-                obj.get("customer"),
-            )
+            log.warning("subscription.deleted for unknown customer — ignored")
             return
+        store.set_subscription(
+            account.email,
+            subscription_id=str(_field(obj, "id", "") or ""),
+            subscription_status="canceled",
+            is_edu=_is_edu(account.email),
+        )
         _downgrade(account, "subscription deleted")
+        return
+
+    if event_type == "invoice.paid":
+        account = store.get_account_by_stripe_customer(_field(obj, "customer", "") or "")
+        if account is None:
+            log.warning("invoice.paid for unknown customer — ignored")
+            return
+        plan, price_id, education = _sync_renewal_price(account, obj, cfg, stripe)
+        if is_purchasable(plan) and plan != getattr(account, "plan", "trial"):
+            store.set_plan(account.email, plan)
+        period_start, period_end = _period_bounds(obj, cfg)
+        store.set_subscription(
+            account.email,
+            subscription_id=_subscription_id(obj),
+            subscription_status="active",
+            price_id=price_id,
+            subscribed_since=period_start or float(_field(event, "created", time.time())),
+            paid_through=period_end,
+            is_edu=education,
+        )
+        return
+
+    if event_type == "invoice.payment_failed":
+        account = store.get_account_by_stripe_customer(_field(obj, "customer", "") or "")
+        if account is None:
+            log.warning("invoice.payment_failed for unknown customer — ignored")
+            return
+        _payment_failed_mail(account, obj, cfg)
         return
 
     log.info("unhandled Stripe event type %s — acknowledged, no action", event_type)
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
 router = APIRouter()
+router.include_router(credits.router)
+
+
+@router.get("/api/plans")
+async def plan_catalog(request: Request) -> dict[str, list[dict[str, Any]]]:
+    """Authenticated commercial plan catalog for every plan-selecting UI."""
+    get_current_user(request)
+    return {
+        "plans": [
+            {
+                "id": name,
+                "display_name": entry.display_name,
+                "purchasable": is_purchasable(name),
+            }
+            for name, entry in PLANS.items()
+        ]
+    }
 
 
 class CheckoutRequest(BaseModel):
-    # The ONLY client input is the plan name. There is deliberately no price
-    # id / amount field — extra keys a client sends are ignored by pydantic.
     plan: str
+
+
+class CreditCheckoutRequest(BaseModel):
+    pack: str
 
 
 @router.post("/api/billing/checkout")
@@ -327,37 +527,71 @@ async def create_checkout(body: CheckoutRequest, request: Request) -> dict[str, 
     cfg = load_config()
     _require_configured(cfg)
     user = get_current_user(request)
-
-    name = (body.plan or "").strip().lower()
-    if not is_purchasable(name):
+    plan = (body.plan or "").strip().lower()
+    if not is_purchasable(plan):
         raise HTTPException(400, f"unknown or non-purchasable plan: {body.plan!r}")
-    plan = PLANS[name]
-    price_id = os.environ.get(plan.stripe_price_env or "", "").strip()
+    education = _is_edu(user.email)
+    price_id = _price_for_plan(cfg, plan, education)
     if not price_id:
-        raise HTTPException(503, f"billing not configured: no price for plan {name!r}")
-
-    store = _store()
-    account = store.get_account(user.email)
+        raise HTTPException(503, f"billing not configured: no price for plan {plan!r}")
+    account = _store().get_account(user.email)
     stripe = _stripe()
     stripe.api_key = cfg.secret_key
-
+    metadata = {
+        "chudware_email": user.email,
+        "chudware_plan": plan,
+        "chudware_is_edu": "true" if education else "false",
+    }
     kwargs: dict[str, Any] = {
         "mode": "subscription",
         "line_items": [{"price": price_id, "quantity": 1}],
         "success_url": cfg.success_url,
         "cancel_url": cfg.cancel_url,
         "client_reference_id": user.email,
-        "metadata": {"chudware_email": user.email, "chudware_plan": name},
-        "subscription_data": {
-            "metadata": {"chudware_email": user.email, "chudware_plan": name}
-        },
+        "metadata": metadata,
+        "subscription_data": {"metadata": metadata},
     }
-    existing_customer = getattr(account, "stripe_customer_id", None) if account else None
-    if existing_customer:
-        kwargs["customer"] = existing_customer
+    customer_id = getattr(account, "stripe_customer_id", "") if account else ""
+    if customer_id:
+        kwargs["customer"] = customer_id
     else:
         kwargs["customer_email"] = user.email
+    session = stripe.checkout.Session.create(**kwargs)
+    return {"url": session.url}
 
+
+@router.post("/api/billing/credits/checkout")
+async def create_credit_checkout(
+    body: CreditCheckoutRequest, request: Request
+) -> dict[str, str]:
+    cfg = load_config()
+    _require_configured(cfg)
+    user = get_current_user(request)
+    pack = (body.pack or "").strip().lower()
+    prices = _credit_pack_prices(cfg)
+    if pack not in prices:
+        raise HTTPException(400, f"unknown credit pack: {body.pack!r}")
+    price_id = prices[pack]
+    if not price_id:
+        raise HTTPException(503, f"billing not configured: no price for credit pack {pack!r}")
+    account = _store().get_account(user.email)
+    stripe = _stripe()
+    stripe.api_key = cfg.secret_key
+    metadata = {"chudware_email": user.email, "chudware_pack": pack}
+    kwargs: dict[str, Any] = {
+        "mode": "payment",
+        "line_items": [{"price": price_id, "quantity": 1}],
+        "success_url": cfg.success_url,
+        "cancel_url": cfg.cancel_url,
+        "client_reference_id": user.email,
+        "metadata": metadata,
+        "payment_intent_data": {"metadata": metadata},
+    }
+    customer_id = getattr(account, "stripe_customer_id", "") if account else ""
+    if customer_id:
+        kwargs["customer"] = customer_id
+    else:
+        kwargs["customer_email"] = user.email
     session = stripe.checkout.Session.create(**kwargs)
     return {"url": session.url}
 
@@ -367,12 +601,10 @@ async def create_portal(request: Request) -> dict[str, str]:
     cfg = load_config()
     _require_configured(cfg)
     user = get_current_user(request)
-
     account = _store().get_account(user.email)
-    customer_id = getattr(account, "stripe_customer_id", None) if account else None
+    customer_id = getattr(account, "stripe_customer_id", "") if account else ""
     if not customer_id:
         raise HTTPException(404, "no billing customer for this account")
-
     stripe = _stripe()
     stripe.api_key = cfg.secret_key
     session = stripe.billing_portal.Session.create(
@@ -383,57 +615,47 @@ async def create_portal(request: Request) -> dict[str, str]:
 
 @router.post("/api/billing/webhook")
 async def stripe_webhook(request: Request) -> dict[str, str]:
-    """Stripe -> entitlement. UNAUTHENTICATED (must be in auth.PUBLIC_PATHS).
-
-    Trust model: the Stripe-Signature header over the RAW body, verified
-    against the endpoint secret. Anything else is rejected before parsing.
-    """
     cfg = load_config()
     _require_configured(cfg)
     if not cfg.webhook_secret:
         raise HTTPException(503, "billing not configured: webhook secret missing")
-
-    # Body size cap — check the declared length before buffering, then the real
-    # one after (a liar content-length must not slip an oversized body through).
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > MAX_WEBHOOK_BYTES:
         raise HTTPException(413, "webhook payload too large")
     body = await request.body()
     if len(body) > MAX_WEBHOOK_BYTES:
         raise HTTPException(413, "webhook payload too large")
-
-    sig = request.headers.get("stripe-signature") or ""
-    if not sig:
+    signature = request.headers.get("stripe-signature") or ""
+    if not signature:
         raise HTTPException(400, "missing Stripe-Signature header")
-
     stripe = _stripe()
     try:
-        event = stripe.Webhook.construct_event(body, sig, cfg.webhook_secret)
+        event = stripe.Webhook.construct_event(body, signature, cfg.webhook_secret)
     except stripe.error.SignatureVerificationError:
         log.warning("rejected Stripe webhook: bad signature")
         raise HTTPException(400, "invalid signature") from None
-
     processed = _process_event_once(event)
     return {"status": "processed" if processed else "duplicate"}
 
 
 @router.get("/api/billing/status")
 async def billing_status(request: Request) -> dict[str, Any]:
-    """The caller's own plan and subscription state. Works without Stripe keys."""
     user = get_current_user(request)
     account = _store().get_account(user.email)
-    plan = getattr(account, "plan", None) or "free"
+    plan = getattr(account, "plan", None) or "trial"
     try:
         limits = asdict(limits_for(plan))
     except ValueError:
-        plan, limits = "free", asdict(limits_for("free"))
+        plan, limits = "trial", asdict(limits_for("trial"))
     return {
         "email": user.email,
         "plan": plan,
         "account_status": getattr(account, "status", None) if account else None,
-        "stripe_customer_id": (
-            getattr(account, "stripe_customer_id", None) if account else None
-        ),
+        "stripe_customer_id": getattr(account, "stripe_customer_id", "") if account else "",
+        "subscription_status": getattr(account, "subscription_status", "") if account else "",
+        "paid_through": getattr(account, "paid_through", None) if account else None,
+        "is_edu": getattr(account, "is_edu", False) if account else False,
+        "credit_balance": getattr(account, "credit_balance", 0) if account else 0,
         "limits": limits,
         "billing_configured": billing_configured(),
     }

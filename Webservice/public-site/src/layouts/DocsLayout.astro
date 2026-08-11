@@ -1,0 +1,36 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from './BaseLayout.astro';
+
+interface Props {
+  title: string;
+  description: string;
+  section: string;
+}
+const { title, description, section } = Astro.props;
+const entries = (await getCollection('docs')).sort((a, b) => a.data.order - b.data.order);
+const groups = [...new Set(entries.map((entry) => entry.data.section))];
+const path = Astro.url.pathname;
+---
+<BaseLayout title={title} description={description}>
+  <div class="wrap docs-shell">
+    <aside class="docs-sidebar" aria-label="Documentation sidebar">
+      <div class="docs-sidebar-inner">
+        <form class="doc-search" data-doc-search role="search"><input name="q" type="search" aria-label="Search documentation" placeholder="Search docs" /><button type="submit" aria-label="Submit search">⌕</button></form>
+        <details open>
+          <summary>Documentation menu</summary>
+          <nav class="docs-nav" aria-label="Documentation">
+            <a href="/docs/" aria-current={path === '/docs/' ? 'page' : undefined}>Overview</a>
+            {groups.map((group) => <><strong>{group}</strong>{entries.filter((entry) => entry.data.section === group).map((entry) => <a href={`/docs/${entry.id}/`} aria-current={path === `/docs/${entry.id}/` ? 'page' : undefined}>{entry.data.title}</a>)}</>)}
+          </nav>
+        </details>
+      </div>
+    </aside>
+    <article class="docs-article" data-pagefind-body>
+      <header><p class="docs-kicker">Docs / {section}</p><h1 data-pagefind-meta="title">{title}</h1><p class="docs-description">{description}</p></header>
+      <div class="search-results" data-search-results aria-live="polite"></div>
+      <div class="prose"><slot /></div>
+    </article>
+  </div>
+  <script is:inline src="/assets/docs-search.js" defer></script>
+</BaseLayout>

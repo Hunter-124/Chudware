@@ -28,12 +28,13 @@ Architecture in one paragraph: the pure C++/CUDA kernel `libchudware` (under
 `engine` symlink) was fully strangled out and deleted in T-RF21 (zero-Python
 cutover, 2026-07-23); what Python remains lives under `services/` (MCP tools,
 agent, worker seam, pure-helper modules with no C++ counterpart). The C++ host
-under `host/` is the **sole GUI target** (~110k LOC under `host/src/ui/`); it
-talks to the shared `chudware-hostd` daemon (which dlopens `libchudware`) over a unix
-socket, with `python -m services.worker_main` as the stdio worker for the
-services-side methods. The same `host/src/ui` tree compiles to WASM for the
-web app (`Webservice/README.md`), so desktop and web stay at parity by
-construction. The host builds its own OpenGL pipeline under `host/src/render/`.
+under `host/` owns the **sole GUI source tree** (~110k LOC under `host/src/ui/`).
+Native builds ship from that tree on Linux, Windows, and macOS; the same source
+tree also compiles to WASM for the web app (`Webservice/README.md`). The host
+talks to the shared `chudware-hostd` daemon (which dlopens `libchudware`) over a
+Unix socket, with `python -m services.worker_main` as the stdio worker for
+services-side methods. Desktop and web therefore stay at parity by construction.
+The host builds its own OpenGL pipeline under `host/src/render/`.
 
 Canonical references:
 - `ARCHITECTURE.md` — system architecture and locked decisions.
@@ -75,7 +76,7 @@ Canonical references:
 | Dir | Purpose |
 |-----|---------|
 | `core/` | Pure C++/CUDA kernel → `libchudware`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. **The engine** (zero-Python since T-RF21). |
-| `host/` | **The single GUI target.** Production C++ desktop host (~110k LOC under `host/src/ui/`), cross-platform (Linux GCC/Clang + Windows MSVC); the same tree compiles to WASM for the web app. Binary: `host/build-linux/bin/Chudware` (`Chudware` compat symlink). Own GL pipeline under `host/src/render/`. |
+| `host/` | **The sole GUI source tree.** Production C++ host (~110k LOC under `host/src/ui/`), compiled natively on Linux (GCC/Clang), Windows (MSVC), and macOS (AppleClang), and to WASM/Emscripten for the web app. Binary: `host/build-linux/bin/chudware`. Own GL pipeline under `host/src/render/`. |
 | `services/` | Python services: `agent/` (built-in agent loop), `mcp/` (MCP server for external agents), `worker/` (C++ engine routing seam, four modules: worker_client / engine_backend / cpp_core / worker_router), `worker_main.py` (the stdio worker hostd spawns), `installer/` (provisioning, MCP registration, packaging), `ecad/`+`sim/`+`structural/`+`piping/`+`formats/` (pure-helper re-homes from the deleted Python engine), plus `dag/`, `deliverables/`, `plm/`, `browser/`, `ipc/`, `serving/` (LoRA adapter routing — not the webservice; the webservice is top-level `Webservice/`), `verify/`, `dist/`. All Python imports use canonical `services.*` names. |
 | `ui/viewport/` | AICM mesh-format loader (`render/aicm_loader.*`) consumed by `core/` (libchudware tests/tools). The rest of the former "shared renderer" extraction was orphaned (host builds its own pipeline in `host/src/render/`) and was purged in T-RF2. `ui/imgui`/`ui/abstract` (the AI-CAD2 shell) are retired and gone. |
 | `platform/` | Cross-OS shims (dialogs, DPI, paths, resources, window) with `_linux`/`_win32` implementations. |
@@ -88,15 +89,16 @@ Canonical references:
 
 ## GUI ownership policy
 
-- **`host/` is the SINGLE GUI target.** There is no second GUI tree; the
+- **`host/` is the sole GUI source tree.** There is no second GUI tree; the
   `ui/imgui` + `ui/abstract` (AI-CAD2) shell is retired. (Historical: T-G11
-  briefly deleted `host/`; that was reversed.)
+  briefly deleted `host/`; that was reversed.) Native Linux, Windows, and macOS
+  builds and the web app's WASM build all compile this tree.
 - **Form/PropertyManager schema lives with the host GUI** (`host/src/ui/`) —
-  the single source the app reads. A form/PM fix (selector kinds, wells,
+  the single source every build reads. A form/PM fix (selector kinds, wells,
   gating) belongs there.
-- **OS-specifics belong in build files / the `platform/` seam**, not duplicated
-  source. Per-OS bits (subprocess launch, file dialogs, GL loader) live behind
-  CMake conditionals and the `platform/*_{linux,win32}.cpp` split.
+- **OS-specifics belong behind build conditionals and platform seams**, not in a
+  second GUI. Shared native shims live under top-level `platform/`; host-only
+  devices such as cameras live under `host/src/platform/`.
 - Scripted GUI launches (gate.sh, tools/gui_parity/run_all.py) always use
   `xvfb-run` when available unless `CHUDWARE_SHOT_HEADED=1` is set. Set that env
   var for interactive/walkthrough runs to see a real window.

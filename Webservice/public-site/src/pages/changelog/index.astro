@@ -1,0 +1,10 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+const releases = (await getCollection('changelog')).sort((a, b) => b.data.published.valueOf() - a.data.published.valueOf());
+const date = new Intl.DateTimeFormat('en', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
+---
+<BaseLayout title="Changelog" description="What changed in each Chudware release, with installation and compatibility notes.">
+  <header class="page-hero"><div class="wrap"><p class="eyebrow">Changelog</p><h1>What changed, and why it matters.</h1><p class="lede">Release notes for the desktop app, cloud workspace, and connected services.</p></div></header>
+  <section class="section"><div class="wrap release-list">{releases.map((release) => <article class="panel release-card"><p class="release-meta">{release.data.version} · {date.format(release.data.published)}</p><h2>{release.data.title}</h2><p class="lede">{release.data.description}</p><a href={`/changelog/${release.id}/`}>Read release notes →</a></article>)}</div></section>
+</BaseLayout>

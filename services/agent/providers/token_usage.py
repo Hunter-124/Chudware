@@ -17,6 +17,30 @@ from typing import Any
 _last_usage: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "provider_last_token_usage", default=None
 )
+# A worker RPC may bind a live usage sink. Desktop/local calls leave it unset,
+# preserving the existing dependency-free stash behavior exactly.
+_usage_sink: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+    "provider_usage_sink", default=None
+)
+_usage_event_count: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "provider_usage_event_count", default=0
+)
+
+
+def bind_usage_sink(sink: Any):
+    _usage_event_count.set(0)
+    return _usage_sink.set(sink)
+
+
+def reset_usage_sink(token: Any) -> None:
+    _usage_sink.reset(token)
+    _usage_event_count.set(0)
+
+
+def usage_event_count() -> int:
+    return _usage_event_count.get()
+
+
 
 # Process-wide accumulator for a single agent turn (multi complete calls).
 _turn_lock = threading.Lock()
@@ -44,6 +68,7 @@ def record_usage(
     context_tokens: int | None = None,
     raw: dict | None = None,
     source: str = "api",
+    actor: Any | None = None,
 ) -> dict[str, Any]:
     """Normalize + stash one completion's usage; accumulate into the turn total.
 
@@ -101,6 +126,9 @@ def record_usage(
         # Keep a tiny raw slice for debug; never large bodies.
         row["raw_keys"] = sorted(str(k) for k in list(raw.keys())[:12])
 
+    # Identity is intentionally absent: the authenticated gateway attributes
+    # this event to its WebSocket. A worker-supplied email would cross the trust
+    # boundary in the wrong direction.
     _last_usage.set(dict(row))
     with _turn_lock:
         _turn_usage["prompt_tokens"] += row["prompt_tokens"]
@@ -117,6 +145,18 @@ def record_usage(
                 "total_tokens": row["total_tokens"],
                 "context_tokens": row["context_tokens"],
             })
+    sink = _usage_sink.get()
+    if sink is not None:
+        sink({
+            "provider": row["provider"],
+            "model": row["model"],
+            "prompt_tokens": row["prompt_tokens"],
+            "completion_tokens": row["completion_tokens"],
+            "total_tokens": row["total_tokens"],
+            "context_tokens": row["context_tokens"],
+            "source": row["source"],
+        })
+        _usage_event_count.set(_usage_event_count.get() + 1)
     return row
 
 

@@ -253,6 +253,17 @@
       border: 1px solid var(--border, #2a2e36);
       border-radius: 8px; padding: 6px 8px; min-height: 32px;
       font-size: .82rem; box-sizing: border-box; }
+  .credit-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+                     min-width: 190px; }
+  .credit-balance { color: var(--teal-hi, #42ecce); font-weight: 600; white-space: nowrap; }
+  .credit-controls label { display: inline-flex; align-items: center; gap: 4px;
+                           color: var(--muted, #8b93a3); font-size: .76rem; }
+  .credit-controls input[type="number"] { width: 88px; }
+  .admin-wrap input[type="number"], .admin-wrap textarea {
+      background: var(--bg, #0e1013); color: var(--fg, #e8eaf0);
+      border: 1px solid var(--border, #2a2e36); border-radius: 8px;
+      padding: 6px 8px; font: inherit; box-sizing: border-box; }
+  #trial-domains { width: 100%; min-height: 84px; resize: vertical; }
   .ac-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
   .ac-toolbar label { font-size: .82rem; color: var(--muted, #8b93a3); }
   .ac-count { font-size: .8rem; font-weight: 400; color: var(--muted, #8b93a3); margin-left: 6px; }
@@ -383,7 +394,7 @@
       </div>
       <div class="accounts-scroll">
         <table class="accounts">
-          <thead><tr><th class="ac-email">Email</th><th>Name</th><th>Status</th><th>Plan</th><th>Role</th><th>Created</th><th class="ac-act">Actions</th></tr></thead>
+          <thead><tr><th class="ac-email">Email</th><th>Name</th><th>Status</th><th>Plan</th><th>Credits</th><th>Role</th><th>Created</th><th class="ac-act">Actions</th></tr></thead>
           <tbody id="account-rows"></tbody>
         </table>
       </div>
@@ -394,6 +405,15 @@
         <button type="button" class="btn ghost" id="account-next">Next</button>
       </div>
       <div id="admin-status" aria-live="polite"></div>
+    </div>
+    <div class="admin-card">
+      <h2>Trial domains</h2>
+      <p style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 10px">
+        One verified email domain per line. These domains are eligible for trial access.
+      </p>
+      <label for="trial-domains" class="ac-dim">Domains</label>
+      <textarea id="trial-domains" spellcheck="false" placeholder="example.edu"></textarea>
+      <button type="button" id="trial-domains-save" class="btn ghost" style="margin-top:8px">Save domains</button>
     </div>
     <div class="admin-card">
       <h2>Host files</h2>
@@ -426,7 +446,7 @@
     </div>
   </div>
 </div>
-<script src="/static/admin.js?v=8"></script>
+<script src="/static/admin.js?v=9"></script>
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/winbox/winbox.bundle.min.js"></script>

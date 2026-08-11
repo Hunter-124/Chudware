@@ -103,7 +103,11 @@ fs::path builtin_dir(const std::string& prompts_dir) {
     if (!prompts_dir.empty()) return fs::path(prompts_dir);
     const char* env = std::getenv("CHUDWARE_PROMPTS_DIR");
     if (env && env[0]) return fs::path(env);
-    return fs::path("agent") / "prompts";
+    // Repo-relative. This was "agent/prompts" while a root `agent` symlink
+    // pointed at services/agent; that symlink was removed on 2026-08-11
+    // because a committed symlink checks out on Windows as a text file
+    // containing its target path, which silently breaks every consumer.
+    return fs::path("services") / "agent" / "prompts";
 }
 
 fs::path override_dir() { return paths_root() / "prompts"; }

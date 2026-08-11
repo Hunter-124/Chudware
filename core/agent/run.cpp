@@ -615,8 +615,8 @@ std::string admin_worker_repo_root() {
 bool call_admin_worker_turn(const std::string& request, const std::string& run_id,
                             const json& provider_cfg, const std::string& workspace_dir,
                             const std::string& session_id, const std::string& sessions_dir,
-                            const json& history, const json& attachments, RunEvents& events,
-                            json& turn_out,
+                            const json& history, const json& attachments,
+                            const json& chudware_actor, RunEvents& events, json& turn_out,
                             std::string& err, bool& crashed, bool& timed_out) {
     const std::string python = admin_worker_python_bin();
     if (python.find('/') != std::string::npos && !admin_worker_file_exists(python)) {
@@ -757,6 +757,9 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     // only place that can build them. Absent/empty array == previous behaviour
     // (no key sent at all).
     if (attachments.is_array() && !attachments.empty()) params["attachments"] = attachments;
+    // Commercial web identity is injected by the authenticated gateway under
+    // options. Desktop/local invocations omit it deliberately and remain BYOK.
+    if (chudware_actor.is_object()) params["_chudware_actor"] = chudware_actor;
     if (provider_cfg.is_object()) {
         auto put = [&](const char* cfg_key, const char* param_key) {
             const auto it = provider_cfg.find(cfg_key);
@@ -1177,9 +1180,12 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         const std::string sessions_dir = options.value("sessions_dir", std::string());
         const json history = options.value("history", json::array());
         const json attachments = options.value("attachments", json::array());
+        const json chudware_actor =
+            options.value("_chudware_actor", json::object());
         if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, session_id,
-                                    sessions_dir, history, attachments, events, turn,
-                                    worker_err, worker_crashed, worker_timed_out)) {
+                                    sessions_dir, history, attachments, chudware_actor,
+                                    events, turn, worker_err, worker_crashed,
+                                    worker_timed_out)) {
             if (worker_err == "cancelled" || run_ctl.cancelled()) {
                 events.emit("run_finished", json{{"status", "cancelled"},
                                                  {"stop_reason", "cancelled"}});

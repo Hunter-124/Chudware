@@ -1,0 +1,24 @@
+---
+title: Install on Linux
+description: Verify and run the portable Chudware Linux distribution.
+section: Installation
+order: 30
+---
+## Requirements
+
+Use a current 64-bit Linux distribution with a modern glibc, OpenGL 4.1-capable driver, and working desktop session. Wayland and X11 are supported through the host window system.
+
+## Verify and unpack
+
+Download the Linux archive and its checksum from the [download page](/download/), then run:
+
+```bash
+sha256sum Chudware-linux-x64.tar.gz
+tar -xzf Chudware-linux-x64.tar.gz
+```
+
+The checksum must match before you unpack or run the application.
+
+## Launch
+
+Open the extracted folder and run `./chudware`. If your file manager removed executable permission, run `chmod u+x chudware` once. Keep the application files together; move the whole extracted directory when you want it elsewhere.

@@ -32,8 +32,8 @@ except ImportError:  # allow `uvicorn app:app` from the package dir
 log = logging.getLogger("chudware.gateway.accounts")
 
 STATUSES = frozenset({"pending", "active", "denied", "suspended"})
-# "trial" is set by the self-serve signup flow (authn.py), never purchasable.
-PLANS = frozenset({"free", "trial", "pro", "team"})
+# "trial" is set by self-serve signup; only desktop/studio are self-purchased.
+PLANS = frozenset({"trial", "desktop", "studio", "enterprise"})
 ROLES = frozenset({"user", "admin"})
 
 router = APIRouter(tags=["accounts"])
@@ -49,7 +49,7 @@ class Account:
     email: str           # PK, lowercased
     display: str
     status: str          # pending | active | denied | suspended
-    plan: str            # free | pro | team
+    plan: str            # trial | desktop | studio | enterprise
     role: str            # user | admin — ONLY meaningful when status == active
     created_at: float    # epoch seconds
     decided_at: float | None
@@ -57,6 +57,16 @@ class Account:
     stripe_customer_id: str
     notes: str
     heavy: bool = False  # admin-granted; self-registered accounts are never heavy
+    trial_ends_at: float | None = None
+    subscribed_since: float | None = None
+    paid_through: float | None = None
+    subscription_id: str = ""
+    subscription_status: str = ""
+    price_id: str = ""
+    credit_balance: int = 0
+    credit_ceiling_monthly: int = 0
+    ai_grant: bool = False
+    is_edu: bool = False
 
 
 def is_authorized(account: Account | None) -> bool:
@@ -75,8 +85,8 @@ def effective_role(account: Account | None) -> str:
 
 def effective_plan(account: Account | None) -> str:
     if account is None or account.status != "active":
-        return "free"
-    return account.plan if account.plan in PLANS else "free"
+        return "trial"
+    return account.plan if account.plan in PLANS else "trial"
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +109,22 @@ def _row_to_account(row: Mapping[str, Any] | None) -> Account | None:
         stripe_customer_id=row["stripe_customer_id"],
         notes=row["notes"],
         heavy=bool(row["heavy"]),
+        trial_ends_at=(
+            None if row["trial_ends_at"] is None else float(row["trial_ends_at"])
+        ),
+        subscribed_since=(
+            None if row["subscribed_since"] is None else float(row["subscribed_since"])
+        ),
+        paid_through=(
+            None if row["paid_through"] is None else float(row["paid_through"])
+        ),
+        subscription_id=row["subscription_id"],
+        subscription_status=row["subscription_status"],
+        price_id=row["price_id"],
+        credit_balance=int(row["credit_balance"]),
+        credit_ceiling_monthly=int(row["credit_ceiling_monthly"]),
+        ai_grant=bool(row["ai_grant"]),
+        is_edu=bool(row["is_edu"]),
     )
 
 
@@ -134,7 +160,7 @@ def ensure_account(email: str, display: str = "") -> Account:
                 """
                 INSERT INTO accounts
                     (email, display, status, plan, role, created_at, decided_at, decided_by)
-                VALUES (%s, %s, 'pending', 'free', 'user', %s, NULL, '')
+                VALUES (%s, %s, 'pending', 'trial', 'user', %s, NULL, '')
                 ON CONFLICT (email) DO NOTHING
                 """,
                 (email, display, time.time()),
@@ -219,6 +245,59 @@ def set_stripe_customer(email: str, customer_id: str) -> Account | None:
         cur.execute(
             "UPDATE accounts SET stripe_customer_id = %s WHERE email = %s RETURNING *",
             (customer_id, email),
+        )
+        row = cur.fetchone()
+    return _row_to_account(row)
+
+
+def set_subscription(
+    email: str,
+    *,
+    subscription_id: str = "",
+    subscription_status: str = "",
+    price_id: str = "",
+    subscribed_since: float | None = None,
+    paid_through: float | None = None,
+    is_edu: bool,
+) -> Account | None:
+    """Persist Stripe lifecycle state without changing approval status or plan.
+
+    Empty identifiers leave their current value intact. ``subscribed_since`` is
+    first-write-wins; ``paid_through`` only advances, so an older replay or an
+    out-of-order invoice cannot shorten an entitlement.
+    """
+    email = _normalize_email(email)
+    with tx() as cur:
+        cur.execute(
+            """
+            UPDATE accounts
+               SET subscription_id = CASE WHEN %s = '' THEN subscription_id ELSE %s END,
+                   subscription_status = CASE WHEN %s = '' THEN subscription_status ELSE %s END,
+                   price_id = CASE WHEN %s = '' THEN price_id ELSE %s END,
+                   subscribed_since = COALESCE(subscribed_since, %s),
+                   paid_through = CASE
+                       WHEN CAST(%s AS DOUBLE PRECISION) IS NULL THEN paid_through
+                       WHEN paid_through IS NULL OR paid_through < %s THEN %s
+                       ELSE paid_through
+                   END,
+                   is_edu = %s
+             WHERE email = %s
+         RETURNING *
+            """,
+            (
+                subscription_id,
+                subscription_id,
+                subscription_status,
+                subscription_status,
+                price_id,
+                price_id,
+                subscribed_since,
+                paid_through,
+                paid_through,
+                paid_through,
+                is_edu,
+                email,
+            ),
         )
         row = cur.fetchone()
     return _row_to_account(row)
@@ -338,6 +417,16 @@ def _account_dict(a: Account) -> dict[str, Any]:
         "decided_at": a.decided_at,
         "decided_by": a.decided_by,
         "stripe_customer_id": a.stripe_customer_id,
+        "trial_ends_at": a.trial_ends_at,
+        "subscribed_since": a.subscribed_since,
+        "paid_through": a.paid_through,
+        "subscription_id": a.subscription_id,
+        "subscription_status": a.subscription_status,
+        "price_id": a.price_id,
+        "credit_balance": a.credit_balance,
+        "credit_ceiling_monthly": a.credit_ceiling_monthly,
+        "ai_grant": a.ai_grant,
+        "is_edu": a.is_edu,
         "notes": a.notes,
     }
 

@@ -35,6 +35,7 @@
     {"kind": "agent.classification", "required_fields": ["task_class", "scaffold_level", "tier", "reason", "request_snippet"], "optional": false, "emitter_note": "python (2026-07-17 additive)"},
     {"kind": "agent.role", "required_fields": ["node_id", "role", "goal", "from_role", "reason"], "optional": false, "emitter_note": "python (2026-07-27 additive; real adopt_role changes only)"},
     {"kind": "agent.model_assignment", "required_fields": ["depth", "task_class", "picked_model"], "optional": false, "emitter_note": "python (spawn model-assignment audit, watch-list additive)"},
+    {"kind": "agent.provider_usage", "required_fields": ["provider", "model", "prompt_tokens", "completion_tokens", "total_tokens", "context_tokens", "source"], "optional": false, "emitter_note": "python provider usage sink; gateway-owned attribution"},
 
     {"kind": "mission.brief.proposed", "required_fields": ["batch_id", "brief_ref"], "optional": true, "emitter_note": "design-brief flow (telemetry.md §5.4)"},
     {"kind": "mission.brief.signed", "required_fields": ["batch_id", "brief_ref", "signed_ref"], "optional": true, "emitter_note": "design-brief flow"},

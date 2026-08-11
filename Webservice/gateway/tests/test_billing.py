@@ -1,18 +1,7 @@
-"""Billing slice tests (dev-auth hermetic; stripe stubbed — no network).
-
-Covers:
-- plans.limits_for caps per tier + unknown-plan rejection
-- checkout rejects unknown plans and ignores client-supplied price ids/amounts
-- webhook: bad/missing signature -> 400 with zero entitlement side effects
-- webhook: checkout.session.completed upgrades; replayed event id is a no-op
-- webhook: customer.subscription.deleted downgrades to free
-- no Stripe key -> 503 on checkout/portal/webhook, and the module still
-  imports cleanly with the stripe package absent
-"""
+"""Commercial plans and Stripe billing contracts (fake transport, real webhook DB)."""
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import sys
@@ -36,15 +25,10 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from gateway import accounts, billing, plans  # noqa: E402
 from gateway.auth import AuthMiddleware  # noqa: E402
-from gateway.config import settings  # noqa: E402
+from gateway.config import Settings, settings  # noqa: E402
 
 DEV_HEADERS = {"X-Dev-User": "demo@example.com"}
 VALID_SIG = "t=1,v1=valid"
-
-
-# ---------------------------------------------------------------------------
-# Fakes
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -52,54 +36,76 @@ class FakeAccount:
     email: str
     display: str = ""
     status: str = "active"
-    plan: str = "free"
+    plan: str = "trial"
     stripe_customer_id: str = ""
+    subscription_id: str = ""
+    subscription_status: str = ""
+    price_id: str = ""
+    subscribed_since: float | None = None
+    paid_through: float | None = None
+    is_edu: bool = False
+    credit_balance: int = 0
 
 
 class FakeAccounts:
-    """In-memory stand-in for gateway/accounts.py (interface agreed with its owner)."""
-
     def __init__(self) -> None:
         self.by_email: dict[str, FakeAccount] = {}
         self.status_calls: list[tuple] = []
+        self.subscription_calls: list[dict] = []
 
     def get_account(self, email):
         return self.by_email.get(email)
 
     def get_account_by_stripe_customer(self, customer_id):
-        for acct in self.by_email.values():
-            if acct.stripe_customer_id and acct.stripe_customer_id == customer_id:
-                return acct
-        return None
+        return next(
+            (
+                account
+                for account in self.by_email.values()
+                if account.stripe_customer_id == customer_id and customer_id
+            ),
+            None,
+        )
 
     def ensure_account(self, email, display):
-        acct = self.by_email.get(email)
-        if acct is None:
-            acct = FakeAccount(email=email, display=display)
-            self.by_email[email] = acct
-        return acct
+        return self.by_email.setdefault(email, FakeAccount(email=email, display=display))
 
     def set_plan(self, email, plan):
-        acct = self.by_email.get(email)
-        if acct is None:
-            return None
-        acct.plan = plan
-        return acct
+        account = self.by_email.get(email)
+        if account:
+            account.plan = plan
+        return account
 
     def set_stripe_customer(self, email, customer_id):
-        acct = self.by_email.get(email)
-        if acct is None:
-            return None
-        acct.stripe_customer_id = customer_id
-        return acct
+        account = self.by_email.get(email)
+        if account:
+            account.stripe_customer_id = customer_id
+        return account
 
     def set_status(self, email, status, decided_by="", notes=""):
-        acct = self.by_email.get(email)
-        if acct is None:
+        account = self.by_email.get(email)
+        if account:
+            account.status = status
+            self.status_calls.append((email, status, decided_by, notes))
+        return account
+
+    def set_subscription(self, email, **values):
+        account = self.by_email.get(email)
+        if account is None:
             return None
-        acct.status = status
-        self.status_calls.append((email, status, decided_by, notes))
-        return acct
+        self.subscription_calls.append(dict(values))
+        for name in ("subscription_id", "subscription_status", "price_id", "is_edu"):
+            value = values.get(name)
+            if value not in (None, ""):
+                setattr(account, name, value)
+        start = values.get("subscribed_since")
+        if account.subscribed_since is None and start is not None:
+            account.subscribed_since = start
+        through = values.get("paid_through")
+        if through is not None and (
+            account.paid_through is None or through > account.paid_through
+        ):
+            account.paid_through = through
+        return account
 
 
 class SignatureVerificationError(Exception):
@@ -107,65 +113,78 @@ class SignatureVerificationError(Exception):
 
 
 def _install_fake_stripe(monkeypatch, captured: dict, *, valid_sig: str = VALID_SIG):
-    """Put a stub `stripe` module into sys.modules — zero network."""
     fake = types.ModuleType("stripe")
+    fake.api_key = None
     fake.error = types.SimpleNamespace(
         SignatureVerificationError=SignatureVerificationError
     )
-    fake.api_key = None
 
     class CheckoutSession:
         @staticmethod
         def create(**kwargs):
-            captured["checkout"] = kwargs
-            return types.SimpleNamespace(url="https://checkout.stripe.test/pay_123")
+            captured.setdefault("checkouts", []).append(kwargs)
+            return types.SimpleNamespace(url="https://checkout.stripe.test/session")
+
+        @staticmethod
+        def list_line_items(session_id, **kwargs):
+            captured["listed_session"] = session_id
+            return {"data": captured.get("line_items", [])}
 
     class PortalSession:
         @staticmethod
         def create(**kwargs):
             captured["portal"] = kwargs
-            return types.SimpleNamespace(url="https://billing.stripe.test/portal_123")
+            return types.SimpleNamespace(url="https://billing.stripe.test/portal")
 
     class Webhook:
         @staticmethod
-        def construct_event(body, sig, secret):
-            if sig != valid_sig:
+        def construct_event(body, signature, secret):
+            if signature != valid_sig:
                 raise SignatureVerificationError("bad signature")
             return json.loads(body)
+
+    class Price:
+        @staticmethod
+        def retrieve(price_id):
+            captured["retrieved_price"] = price_id
+            return {
+                "id": price_id,
+                "metadata": captured.get("price_metadata", {}),
+            }
+
+    class Subscription:
+        @staticmethod
+        def modify(subscription_id, **kwargs):
+            captured.setdefault("subscription_modifications", []).append(
+                (subscription_id, kwargs)
+            )
+            return {"id": subscription_id}
 
     fake.checkout = types.SimpleNamespace(Session=CheckoutSession)
     fake.billing_portal = types.SimpleNamespace(Session=PortalSession)
     fake.Webhook = Webhook
+    fake.Price = Price
+    fake.Subscription = Subscription
     monkeypatch.setitem(sys.modules, "stripe", fake)
     return fake
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture()
 def store():
-    s = FakeAccounts()
-    s.ensure_account("demo@example.com", "Demo User")
-    billing.set_account_store(s)
-    yield s
+    value = FakeAccounts()
+    value.ensure_account("demo@example.com", "Demo")
+    billing.set_account_store(value)
+    yield value
     billing.set_account_store(None)
 
 
 @pytest.fixture()
 def client(pg, monkeypatch, store):
-    """Full app: real AuthMiddleware (dev mode) + the billing router.
-
-    Two stores are in play on purpose: AuthMiddleware authorizes from the real
-    account store (so the dev identity needs an active row there), while
-    billing's entitlement writes go to the injected FakeAccounts so the
-    webhook assertions stay hermetic.
-    """
     monkeypatch.setattr(settings, "dev_mode", True)
-    accounts.ensure_account("demo@example.com", display="Demo User")
-    accounts.set_status("demo@example.com", "active", decided_by="test")
+    for email in ("demo@example.com", "a@school.edu", "a@gmail.com"):
+        accounts.ensure_account(email, display=email)
+        accounts.set_status(email, "active", decided_by="test")
+        store.ensure_account(email, email)
     app = FastAPI()
     app.add_middleware(AuthMiddleware)
     app.include_router(billing.router)
@@ -173,439 +192,375 @@ def client(pg, monkeypatch, store):
 
 
 @pytest.fixture()
-def stripe_env(monkeypatch):
-    monkeypatch.setenv("CHUDWARE_WEB_STRIPE_SECRET_KEY", "sk_test_123")
-    monkeypatch.setenv("CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET", "whsec_123")
-    monkeypatch.setenv(plans.STRIPE_PRICE_PRO_ENV, "price_pro_123")
-    monkeypatch.setenv(plans.STRIPE_PRICE_TEAM_ENV, "price_team_123")
+def stripe_config(monkeypatch):
+    values = {
+        "stripe_secret_key": "sk_test_123",
+        "stripe_webhook_secret": "whsec_123",
+        "stripe_success_url": "https://app.test/success",
+        "stripe_cancel_url": "https://app.test/cancel",
+        "stripe_price_desktop": "price_desktop",
+        "stripe_price_desktop_edu": "price_desktop_edu",
+        "stripe_price_studio": "price_studio",
+        "stripe_price_studio_edu": "price_studio_edu",
+        "stripe_price_credits_starter": "price_credits_starter",
+        "stripe_price_credits_standard": "price_credits_standard",
+        "stripe_price_credits_bulk": "price_credits_bulk",
+    }
+    for name, value in values.items():
+        monkeypatch.setattr(settings, name, value)
+    return values
 
 
-def _event(event_id, event_type, obj):
+def _event(event_id, event_type, obj, *, created=1_700_000_000):
     return {
         "id": event_id,
         "type": event_type,
+        "created": created,
         "data": {"object": obj},
     }
 
 
-def _post_webhook(client, event, sig=VALID_SIG):
+def _post_webhook(client, event, signature=VALID_SIG):
     headers = {"Content-Type": "application/json"}
-    if sig is not None:
-        headers["Stripe-Signature"] = sig
-    return client.post("/api/billing/webhook", content=json.dumps(event), headers=headers)
-
-
-# ---------------------------------------------------------------------------
-# plans.py
-# ---------------------------------------------------------------------------
+    if signature is not None:
+        headers["Stripe-Signature"] = signature
+    return client.post(
+        "/api/billing/webhook", content=json.dumps(event), headers=headers
+    )
 
 
 class TestPlans:
-    def test_limits_for_each_tier(self):
-        free = plans.limits_for("free")
-        assert free.storage_quota_bytes == 2 * 1024**3
-        assert free.monthly_llm_tokens > 0
-
-        pro = plans.limits_for("pro")
-        assert pro.storage_quota_bytes > free.storage_quota_bytes
-        assert pro.monthly_llm_tokens > free.monthly_llm_tokens
-
-        team = plans.limits_for("team")
-        assert team.storage_quota_bytes > pro.storage_quota_bytes
-        assert team.monthly_llm_tokens > pro.monthly_llm_tokens
-
-        # A trial is the full product for its window, so evaluating it means
-        # evaluating Pro's caps — not Free's.
+    def test_locked_plan_limits(self):
+        assert set(plans.PLANS) == {"trial", "desktop", "studio", "enterprise"}
         trial = plans.limits_for("trial")
-        assert trial.storage_quota_bytes == pro.storage_quota_bytes
-        assert trial.monthly_llm_tokens == pro.monthly_llm_tokens
-
-    def test_only_paid_tiers_are_purchasable(self):
-        assert plans.is_purchasable("pro")
-        assert plans.is_purchasable("team")
-        assert not plans.is_purchasable("free")
-        # Granted by verifying an address, never sold — Checkout must refuse it.
+        desktop = plans.limits_for("desktop")
+        studio = plans.limits_for("studio")
+        enterprise = plans.limits_for("enterprise")
+        assert (trial.desktop, trial.cloud, trial.storage_quota_bytes) == (
+            True,
+            True,
+            5 * 1024**3,
+        )
+        assert (desktop.desktop, desktop.cloud, desktop.storage_quota_bytes) == (
+            True,
+            False,
+            5 * 1024**3,
+        )
+        assert studio.cloud and studio.storage_quota_bytes == 100 * 1024**3
+        assert enterprise.cloud and enterprise.storage_quota_bytes == 1024**4
+        assert all(p.limits.included_credits_monthly == 0 for p in plans.PLANS.values())
+        assert plans.is_purchasable("desktop")
+        assert plans.is_purchasable("studio")
         assert not plans.is_purchasable("trial")
-
-    def test_unknown_plan_rejected(self):
+        assert not plans.is_purchasable("enterprise")
         with pytest.raises(ValueError):
-            plans.limits_for("enterprise-ultra")
-        with pytest.raises(ValueError):
-            plans.limits_for("")
+            plans.limits_for("free")
 
-    def test_no_stripe_import(self):
-        assert "stripe" not in sys.modules or sys.modules["stripe"] is None
-        assert not hasattr(plans, "stripe")
-        src = (GATEWAY_DIR / "plans.py").read_text()
-        assert "import stripe" not in src
+    def test_plans_module_never_imports_stripe(self):
+        assert "import stripe" not in (GATEWAY_DIR / "plans.py").read_text()
 
-
-# ---------------------------------------------------------------------------
-# Checkout / portal
-# ---------------------------------------------------------------------------
+    def test_authenticated_plan_catalog_is_ordered_from_server_table(self, client):
+        response = client.get("/api/plans", headers=DEV_HEADERS)
+        assert response.status_code == 200
+        assert response.json()["plans"] == [
+            {"id": "trial", "display_name": "Trial", "purchasable": False},
+            {"id": "desktop", "display_name": "Desktop", "purchasable": True},
+            {"id": "studio", "display_name": "Studio", "purchasable": True},
+            {"id": "enterprise", "display_name": "Enterprise", "purchasable": False},
+        ]
 
 
 class TestCheckout:
-    def test_unknown_plan_rejected(self, client, stripe_env, monkeypatch):
-        captured = {}
-        _install_fake_stripe(monkeypatch, captured)
-        r = client.post(
-            "/api/billing/checkout", json={"plan": "platinum"}, headers=DEV_HEADERS
-        )
-        assert r.status_code == 400
-        assert "checkout" not in captured  # no Stripe call happened
-
-    def test_free_plan_not_purchasable(self, client, stripe_env, monkeypatch):
-        _install_fake_stripe(monkeypatch, {})
-        r = client.post(
-            "/api/billing/checkout", json={"plan": "free"}, headers=DEV_HEADERS
-        )
-        assert r.status_code == 400
-
-    def test_client_price_id_and_amount_ignored(
-        self, client, stripe_env, monkeypatch
+    def test_server_selects_different_edu_price_for_same_plan(
+        self, client, stripe_config, monkeypatch
     ):
         captured = {}
         _install_fake_stripe(monkeypatch, captured)
-        r = client.post(
-            "/api/billing/checkout",
-            json={
-                "plan": "pro",
-                "price_id": "price_evil_free",
-                "amount": 1,
-                "price": "price_evil_free",
-            },
+        for email in ("a@school.edu", "a@gmail.com"):
+            response = client.post(
+                "/api/billing/checkout",
+                json={"plan": "studio", "price_id": "price_evil", "amount": 1},
+                headers={"X-Dev-User": email},
+            )
+            assert response.status_code == 200, response.text
+        edu, regular = captured["checkouts"]
+        assert edu["line_items"] == [{"price": "price_studio_edu", "quantity": 1}]
+        assert regular["line_items"] == [{"price": "price_studio", "quantity": 1}]
+        assert edu["metadata"]["chudware_is_edu"] == "true"
+        assert regular["metadata"]["chudware_is_edu"] == "false"
+
+    def test_unknown_and_nonpurchasable_plans_never_call_stripe(
+        self, client, stripe_config, monkeypatch
+    ):
+        captured = {}
+        _install_fake_stripe(monkeypatch, captured)
+        for plan in ("trial", "enterprise", "free", "platinum"):
+            response = client.post(
+                "/api/billing/checkout", json={"plan": plan}, headers=DEV_HEADERS
+            )
+            assert response.status_code == 400
+        assert "checkouts" not in captured
+
+    def test_credit_pack_checkout_is_one_time_and_server_priced(
+        self, client, stripe_config, monkeypatch
+    ):
+        captured = {}
+        _install_fake_stripe(monkeypatch, captured)
+        response = client.post(
+            "/api/billing/credits/checkout",
+            json={"pack": "starter", "amount": 1, "price": "price_evil"},
             headers=DEV_HEADERS,
         )
-        assert r.status_code == 200, r.text
-        sent = captured["checkout"]
-        # The price came from the server-side env, never from the request body.
-        assert sent["line_items"] == [{"price": "price_pro_123", "quantity": 1}]
-        assert "amount" not in sent
-        assert sent["client_reference_id"] == "demo@example.com"
-        assert sent["metadata"]["chudware_plan"] == "pro"
-        assert r.json()["url"].startswith("https://checkout.stripe.test/")
+        assert response.status_code == 200
+        sent = captured["checkouts"][0]
+        assert sent["mode"] == "payment"
+        assert sent["line_items"] == [{"price": "price_credits_starter", "quantity": 1}]
+        assert sent["metadata"]["chudware_pack"] == "starter"
 
-    def test_existing_customer_reused(self, client, store, stripe_env, monkeypatch):
+    def test_existing_customer_reused(self, client, store, stripe_config, monkeypatch):
         captured = {}
         _install_fake_stripe(monkeypatch, captured)
         store.set_stripe_customer("demo@example.com", "cus_existing")
-        r = client.post(
-            "/api/billing/checkout", json={"plan": "team"}, headers=DEV_HEADERS
-        )
-        assert r.status_code == 200
-        assert captured["checkout"]["customer"] == "cus_existing"
-        assert "customer_email" not in captured["checkout"]
-        assert captured["checkout"]["line_items"][0]["price"] == "price_team_123"
+        assert client.post(
+            "/api/billing/checkout", json={"plan": "desktop"}, headers=DEV_HEADERS
+        ).status_code == 200
+        sent = captured["checkouts"][0]
+        assert sent["customer"] == "cus_existing"
+        assert "customer_email" not in sent
 
 
-class TestPortal:
-    def test_portal_returns_url_for_own_customer(
-        self, client, store, stripe_env, monkeypatch
-    ):
-        captured = {}
-        _install_fake_stripe(monkeypatch, captured)
-        store.set_stripe_customer("demo@example.com", "cus_123")
-        r = client.post("/api/billing/portal", headers=DEV_HEADERS)
-        assert r.status_code == 200
-        assert captured["portal"]["customer"] == "cus_123"
-        assert r.json()["url"].startswith("https://billing.stripe.test/")
-
-    def test_portal_without_customer_404(self, client, stripe_env, monkeypatch):
-        _install_fake_stripe(monkeypatch, {})
-        r = client.post("/api/billing/portal", headers=DEV_HEADERS)
-        assert r.status_code == 404
-
-
-# ---------------------------------------------------------------------------
-# Webhook
-# ---------------------------------------------------------------------------
-
-
-class TestWebhookSecurity:
-    def test_missing_signature_400_no_side_effect(
-        self, client, store, stripe_env, monkeypatch
+class TestWebhook:
+    def test_signature_and_size_checks_precede_mutation(
+        self, client, store, stripe_config, monkeypatch
     ):
         _install_fake_stripe(monkeypatch, {})
         event = _event(
-            "evt_nosig",
+            "evt_bad",
             "checkout.session.completed",
-            {
-                "client_reference_id": "demo@example.com",
-                "customer": "cus_x",
-                "metadata": {"chudware_plan": "pro"},
-            },
+            {"client_reference_id": "demo@example.com", "metadata": {"chudware_plan": "studio"}},
         )
-        r = _post_webhook(client, event, sig=None)
-        assert r.status_code == 400
-        acct = store.get_account("demo@example.com")
-        assert acct.plan == "free"
-        assert acct.stripe_customer_id == ""
-
-    def test_bad_signature_400_no_side_effect(
-        self, client, store, stripe_env, monkeypatch
-    ):
-        _install_fake_stripe(monkeypatch, {})
-        event = _event(
-            "evt_badsig",
-            "checkout.session.completed",
-            {
-                "client_reference_id": "demo@example.com",
-                "customer": "cus_x",
-                "metadata": {"chudware_plan": "team"},
-            },
-        )
-        r = _post_webhook(client, event, sig="t=1,v1=forged")
-        assert r.status_code == 400
-        acct = store.get_account("demo@example.com")
-        assert acct.plan == "free"
-        assert acct.stripe_customer_id == ""
-
-    def test_oversized_body_413(self, client, stripe_env, monkeypatch):
-        _install_fake_stripe(monkeypatch, {})
-        big = b" " * (billing.MAX_WEBHOOK_BYTES + 1)
-        r = client.post(
+        assert _post_webhook(client, event, None).status_code == 400
+        assert _post_webhook(client, event, "forged").status_code == 400
+        assert store.get_account("demo@example.com").plan == "trial"
+        oversized = b" " * (billing.MAX_WEBHOOK_BYTES + 1)
+        assert client.post(
             "/api/billing/webhook",
-            content=big,
+            content=oversized,
             headers={"Stripe-Signature": VALID_SIG},
-        )
-        assert r.status_code == 413
+        ).status_code == 413
 
-    def test_webhook_needs_no_auth(self, client, store, stripe_env, monkeypatch):
-        """The public path: no X-Dev-User, no cookies — signature is the auth."""
-        _install_fake_stripe(monkeypatch, {})
-        event = _event(
-            "evt_anon",
-            "customer.subscription.deleted",
-            {"customer": "cus_unknown"},
-        )
-        r = client.post(
-            "/api/billing/webhook",
-            content=json.dumps(event),
-            headers={"Stripe-Signature": VALID_SIG},
-        )
-        assert r.status_code == 200
-
-
-class TestWebhookEntitlement:
-    def test_checkout_completed_upgrades_and_replay_is_noop(
-        self, client, store, stripe_env, monkeypatch
+    def test_checkout_replay_mutates_real_store_exactly_once(
+        self, client, stripe_config, monkeypatch
     ):
-        _install_fake_stripe(monkeypatch, {})
-        event = _event(
-            "evt_upgrade_1",
-            "checkout.session.completed",
-            {
-                "client_reference_id": "demo@example.com",
-                "customer": "cus_new",
-                "metadata": {"chudware_plan": "pro"},
-            },
-        )
-        r1 = _post_webhook(client, event)
-        assert r1.status_code == 200
-        assert r1.json()["status"] == "processed"
-        acct = store.get_account("demo@example.com")
-        assert acct.plan == "pro"
-        assert acct.stripe_customer_id == "cus_new"
-        assert acct.status == "active"
-        status_calls_after_first = len(store.status_calls)
-
-        # Stripe redelivers the identical event id: nothing changes.
-        r2 = _post_webhook(client, event)
-        assert r2.status_code == 200
-        assert r2.json()["status"] == "duplicate"
-        acct = store.get_account("demo@example.com")
-        assert acct.plan == "pro"
-        assert len(store.status_calls) == status_calls_after_first
-
-    def test_replay_against_the_real_store_mutates_exactly_once(
-        self, client, stripe_env, monkeypatch
-    ):
-        """The money bug, against Postgres rather than the in-memory fake.
-
-        The event-id row and the entitlement mutation share one transaction, so
-        a redelivery must leave exactly one processed_events row and exactly one
-        plan change — not two, and not one plus a partially applied second.
-        """
-        import accounts  # type: ignore
-        import db  # type: ignore
+        from gateway import db
 
         billing.set_account_store(accounts)
         try:
-            accounts.ensure_account("payer@example.com", display="Payer")
+            accounts.ensure_account("payer@example.com", "Payer")
             _install_fake_stripe(monkeypatch, {})
             event = _event(
-                "evt_real_1",
+                "evt_replay",
                 "checkout.session.completed",
                 {
+                    "id": "cs_subscription",
+                    "mode": "subscription",
                     "client_reference_id": "payer@example.com",
                     "customer": "cus_real",
-                    "metadata": {"chudware_plan": "pro"},
+                    "subscription": "sub_real",
+                    "metadata": {"chudware_plan": "studio"},
                 },
             )
             assert _post_webhook(client, event).json()["status"] == "processed"
             assert _post_webhook(client, event).json()["status"] == "duplicate"
             assert _post_webhook(client, event).json()["status"] == "duplicate"
-
             with db.tx() as cur:
                 cur.execute(
                     "SELECT COUNT(*) AS n FROM processed_events WHERE event_id = %s",
-                    ("evt_real_1",),
+                    ("evt_replay",),
                 )
                 assert cur.fetchone()["n"] == 1
-            acct = accounts.get_account("payer@example.com")
-            assert (acct.plan, acct.status, acct.stripe_customer_id) == (
-                "pro",
-                "active",
-                "cus_real",
-            )
-            # One decision recorded, not three.
-            assert acct.notes == "checkout.session.completed evt_real_1"
+            account = accounts.get_account("payer@example.com")
+            assert (
+                account.plan,
+                account.status,
+                account.stripe_customer_id,
+                account.subscription_id,
+            ) == ("studio", "active", "cus_real", "sub_real")
+            assert account.notes == "checkout.session.completed evt_replay"
         finally:
             billing.set_account_store(None)
 
-    def test_a_failing_entitlement_rolls_back_the_event_id(self, client, stripe_env, monkeypatch):
-        """If the mutation blows up, the event id must NOT be recorded — Stripe's
-        retry has to be able to apply it. Same transaction, both or neither."""
-        import db  # type: ignore
-
-        class Exploding(FakeAccounts):
-            def set_plan(self, email, plan):
-                raise RuntimeError("store is down")
-
-        exploding = Exploding()
-        exploding.ensure_account("boom@example.com", "Boom")
-        billing.set_account_store(exploding)
-        try:
-            _install_fake_stripe(monkeypatch, {})
-            event = _event(
-                "evt_boom",
-                "checkout.session.completed",
-                {
-                    "client_reference_id": "boom@example.com",
-                    "customer": "cus_boom",
-                    "metadata": {"chudware_plan": "pro"},
-                },
-            )
-            with pytest.raises(RuntimeError, match="store is down"):
-                _post_webhook(client, event)
-            with db.tx() as cur:
-                cur.execute("SELECT COUNT(*) AS n FROM processed_events")
-                assert cur.fetchone()["n"] == 0
-        finally:
-            billing.set_account_store(None)
-
-    def test_checkout_completed_adopts_stranger(
-        self, client, store, stripe_env, monkeypatch
+    def test_credit_grant_uses_price_metadata_and_replay_is_noop(
+        self, client, stripe_config, monkeypatch
     ):
-        _install_fake_stripe(monkeypatch, {})
+        from gateway import db
+
+        captured = {"price_metadata": {"chud_credits": "8000"}}
+        _install_fake_stripe(monkeypatch, captured)
         event = _event(
-            "evt_stranger",
+            "evt_credits",
             "checkout.session.completed",
             {
-                "customer": "cus_stranger",
-                "customer_email": "newbie@example.com",
-                "metadata": {
-                    "chudware_email": "newbie@example.com",
-                    "chudware_plan": "team",
+                "id": "cs_credits",
+                "mode": "payment",
+                "client_reference_id": "demo@example.com",
+                "metadata": {"chudware_pack": "starter"},
+                "line_items": {"data": [{"price": {"id": "price_credits_starter"}}]},
+            },
+        )
+        assert _post_webhook(client, event).json()["status"] == "processed"
+        assert _post_webhook(client, event).json()["status"] == "duplicate"
+        assert _post_webhook(client, event).json()["status"] == "duplicate"
+        with db.tx() as cur:
+            cur.execute(
+                "SELECT credit_balance FROM accounts WHERE email = %s",
+                ("demo@example.com",),
+            )
+            assert cur.fetchone()["credit_balance"] == 8000
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n, max(credits_delta) AS delta
+                  FROM credit_ledger
+                 WHERE email = %s AND kind = 'purchase'
+                """,
+                ("demo@example.com",),
+            )
+            row = cur.fetchone()
+            assert (row["n"], row["delta"]) == (1, 8000)
+        assert captured["retrieved_price"] == "price_credits_starter"
+
+    def test_credit_price_without_metadata_is_rejected_and_not_recorded(
+        self, client, stripe_config, monkeypatch
+    ):
+        from gateway import db
+
+        _install_fake_stripe(monkeypatch, {"price_metadata": {}})
+        event = _event(
+            "evt_bad_pack",
+            "checkout.session.completed",
+            {
+                "id": "cs_bad_pack",
+                "mode": "payment",
+                "client_reference_id": "demo@example.com",
+                "line_items": {"data": [{"price": {"id": "price_credits_starter"}}]},
+            },
+        )
+        assert _post_webhook(client, event).status_code == 400
+        with db.tx() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM processed_events WHERE event_id = %s",
+                ("evt_bad_pack",),
+            )
+            assert cur.fetchone()["n"] == 0
+
+    def test_invoice_paid_advances_dates_and_removes_stale_edu_price(
+        self, client, store, stripe_config, monkeypatch
+    ):
+        captured = {}
+        _install_fake_stripe(monkeypatch, captured)
+        store.set_stripe_customer("demo@example.com", "cus_demo")
+        store.set_plan("demo@example.com", "studio")
+        event = _event(
+            "evt_invoice",
+            "invoice.paid",
+            {
+                "customer": "cus_demo",
+                "subscription": "sub_demo",
+                "lines": {
+                    "data": [
+                        {
+                            "id": "si_demo",
+                            "subscription_item": "si_demo",
+                            "price": {"id": "price_studio_edu"},
+                            "period": {"start": 1_700_000_000, "end": 1_702_592_000},
+                        }
+                    ]
                 },
             },
         )
-        r = _post_webhook(client, event)
-        assert r.status_code == 200
-        acct = store.get_account("newbie@example.com")
-        assert acct is not None
-        assert acct.plan == "team"
-        assert acct.status == "active"
+        assert _post_webhook(client, event).status_code == 200
+        account = store.get_account("demo@example.com")
+        assert account.subscribed_since == 1_700_000_000
+        assert account.paid_through == 1_702_592_000
+        assert account.is_edu is False
+        assert account.price_id == "price_studio"
+        assert captured["subscription_modifications"] == [
+            (
+                "sub_demo",
+                {
+                    "items": [{"id": "si_demo", "price": "price_studio"}],
+                    "proration_behavior": "none",
+                },
+            )
+        ]
 
-    def test_subscription_deleted_downgrades_to_free(
-        self, client, store, stripe_env, monkeypatch
+    def test_payment_failed_sends_mail_without_downgrade(
+        self, client, store, stripe_config, monkeypatch
     ):
         _install_fake_stripe(monkeypatch, {})
-        store.set_stripe_customer("demo@example.com", "cus_123")
-        store.set_plan("demo@example.com", "pro")
+        store.set_stripe_customer("demo@example.com", "cus_demo")
+        store.set_plan("demo@example.com", "studio")
+        sent = []
+        monkeypatch.setattr(billing.mailer, "send", lambda *args: sent.append(args))
         event = _event(
-            "evt_cancel",
-            "customer.subscription.deleted",
-            {"customer": "cus_123", "status": "canceled"},
-        )
-        r = _post_webhook(client, event)
-        assert r.status_code == 200
-        assert store.get_account("demo@example.com").plan == "free"
-
-    def test_subscription_updated_past_due_downgrades(
-        self, client, store, stripe_env, monkeypatch
-    ):
-        _install_fake_stripe(monkeypatch, {})
-        store.set_stripe_customer("demo@example.com", "cus_123")
-        store.set_plan("demo@example.com", "team")
-        event = _event(
-            "evt_pastdue",
-            "customer.subscription.updated",
-            {"customer": "cus_123", "status": "past_due"},
-        )
-        r = _post_webhook(client, event)
-        assert r.status_code == 200
-        assert store.get_account("demo@example.com").plan == "free"
-
-    def test_subscription_updated_active_syncs_plan_from_price(
-        self, client, store, stripe_env, monkeypatch
-    ):
-        _install_fake_stripe(monkeypatch, {})
-        store.set_stripe_customer("demo@example.com", "cus_123")
-        event = _event(
-            "evt_sync",
-            "customer.subscription.updated",
+            "evt_failed",
+            "invoice.payment_failed",
             {
-                "customer": "cus_123",
-                "status": "active",
-                "items": {"data": [{"price": {"id": "price_pro_123"}}]},
+                "customer": "cus_demo",
+                "amount_due": 15000,
+                "currency": "usd",
+                "next_payment_attempt": 1_700_086_400,
+                "hosted_invoice_url": "https://invoice.test/update",
             },
         )
-        r = _post_webhook(client, event)
-        assert r.status_code == 200
-        assert store.get_account("demo@example.com").plan == "pro"
+        assert _post_webhook(client, event).status_code == 200
+        assert store.get_account("demo@example.com").plan == "studio"
+        assert sent[0][0:2] == ("demo@example.com", "payment_failed")
+
+    def test_subscription_deletion_changes_plan_only(
+        self, client, store, stripe_config, monkeypatch
+    ):
+        _install_fake_stripe(monkeypatch, {})
+        account = store.get_account("demo@example.com")
+        store.set_stripe_customer(account.email, "cus_demo")
+        store.set_plan(account.email, "desktop")
+        event = _event(
+            "evt_deleted",
+            "customer.subscription.deleted",
+            {"id": "sub_demo", "customer": "cus_demo"},
+        )
+        assert _post_webhook(client, event).status_code == 200
+        account = store.get_account("demo@example.com")
+        assert account.plan == "trial"
+        assert account.status == "active"
 
 
-# ---------------------------------------------------------------------------
-# Degraded mode: no Stripe configured
-# ---------------------------------------------------------------------------
+class TestDegradedMode:
+    def test_unconfigured_gateway_boots_and_billing_returns_503(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "stripe_secret_key", "")
+        monkeypatch.setattr(settings, "stripe_webhook_secret", "")
+        assert client.post(
+            "/api/billing/checkout", json={"plan": "studio"}, headers=DEV_HEADERS
+        ).status_code == 503
+        assert client.post("/api/billing/portal", headers=DEV_HEADERS).status_code == 503
+        assert client.post("/api/billing/webhook", content=b"{}").status_code == 503
+        status = client.get("/api/billing/status", headers=DEV_HEADERS)
+        assert status.status_code == 200
+        assert status.json()["billing_configured"] is False
 
-
-class TestUnconfigured:
-    @pytest.fixture(autouse=True)
-    def _no_keys(self, monkeypatch):
-        for var in (
+    def test_partial_stripe_configuration_fails_at_startup(self, monkeypatch):
+        names = (
             "CHUDWARE_WEB_STRIPE_SECRET_KEY",
             "CHUDWARE_WEB_STRIPE_WEBHOOK_SECRET",
-        ):
-            monkeypatch.delenv(var, raising=False)
-
-    def test_checkout_503(self, client):
-        r = client.post(
-            "/api/billing/checkout", json={"plan": "pro"}, headers=DEV_HEADERS
+            "CHUDWARE_STRIPE_PRICE_DESKTOP",
+            "CHUDWARE_STRIPE_PRICE_DESKTOP_EDU",
+            "CHUDWARE_STRIPE_PRICE_STUDIO",
+            "CHUDWARE_STRIPE_PRICE_STUDIO_EDU",
         )
-        assert r.status_code == 503
-        assert "billing not configured" in r.json()["detail"]
-
-    def test_portal_503(self, client):
-        r = client.post("/api/billing/portal", headers=DEV_HEADERS)
-        assert r.status_code == 503
-
-    def test_webhook_503(self, client):
-        r = client.post("/api/billing/webhook", content=b"{}")
-        assert r.status_code == 503
-
-    def test_status_still_works_and_reports_unconfigured(self, client):
-        r = client.get("/api/billing/status", headers=DEV_HEADERS)
-        assert r.status_code == 200
-        body = r.json()
-        assert body["billing_configured"] is False
-        assert body["plan"] == "free"
-        assert body["limits"]["storage_quota_bytes"] == 2 * 1024**3
-
-    def test_module_imports_without_stripe_package(self, monkeypatch):
-        """billing must import (and re-import) with no stripe package at all."""
-        monkeypatch.delitem(sys.modules, "stripe", raising=False)
-        importlib.reload(billing)
-        assert "stripe" not in sys.modules
+        for name in names:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("CHUDWARE_WEB_STRIPE_SECRET_KEY", "sk_test_partial")
+        with pytest.raises(ValueError, match="Stripe billing is partially configured"):
+            Settings()

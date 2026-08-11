@@ -17,11 +17,14 @@ state. config.json shape:
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import copy
 import json
 import os
 import threading
 from collections.abc import Iterable
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from urllib.parse import urlparse
 
 from services import paths
@@ -1555,6 +1558,144 @@ def _attach_catalog_meta(provider: Provider, caps: dict) -> Provider:
     return provider
 
 
+@dataclass(frozen=True)
+class Actor:
+    """Server-authoritative billing identity carried across the web/hostd seam."""
+
+    email: str
+    plan: str
+    credits_remaining: int
+    key_source: str
+    rated_model: str = ""
+    prompt_usd_per_mtok: Decimal | None = None
+    completion_usd_per_mtok: Decimal | None = None
+    reservation_credits: int = 0
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "Actor":
+        if not isinstance(value, dict):
+            raise ValueError("_chudware_actor must be an object")
+        email = str(value.get("email") or "").strip().lower()
+        plan = str(value.get("plan") or "").strip().lower()
+        source = str(value.get("key_source") or "").strip().lower()
+        try:
+            remaining = max(0, int(value.get("credits_remaining") or 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("_chudware_actor credits_remaining must be an integer") from exc
+        if not email or source not in {"byok", "pool"}:
+            raise ValueError("_chudware_actor requires email and key_source=byok|pool")
+        raw_rate = value.get("_rate")
+        rated_model = ""
+        prompt_rate = completion_rate = None
+        if isinstance(raw_rate, dict):
+            rated_model = str(raw_rate.get("model") or "")
+            try:
+                prompt_rate = Decimal(str(raw_rate["prompt_usd_per_mtok"]))
+                completion_rate = Decimal(str(raw_rate["completion_usd_per_mtok"]))
+            except (KeyError, InvalidOperation, TypeError, ValueError):
+                prompt_rate = completion_rate = None
+        try:
+            reservation_credits = max(
+                0, int(value.get("_reservation_credits") or 0)
+            )
+        except (TypeError, ValueError):
+            reservation_credits = 0
+        return cls(
+            email=email,
+            plan=plan,
+            credits_remaining=remaining,
+            key_source=source,
+            rated_model=rated_model,
+            prompt_usd_per_mtok=prompt_rate,
+            completion_usd_per_mtok=completion_rate,
+            reservation_credits=reservation_credits,
+        )
+
+
+def pooled_credit_preflight(
+    actor: Actor,
+    *,
+    prompt_tokens_estimate: int,
+    max_output_tokens: int,
+) -> dict[str, Any]:
+    """Pure worker-side guard; all money/rate authority arrived from gateway."""
+    requested = max(0, int(max_output_tokens or 0))
+    if actor.key_source != "pool":
+        return {"ok": True, "max_output_tokens": requested, "estimated_credits": 0}
+    if actor.prompt_usd_per_mtok is None or actor.completion_usd_per_mtok is None:
+        return {"ok": False, "reason": "insufficient_credits"}
+    prompt = max(0, int(prompt_tokens_estimate or 0))
+    estimate_value = (
+        Decimal(prompt) * actor.prompt_usd_per_mtok
+        + Decimal(requested) * actor.completion_usd_per_mtok
+    ) / Decimal(1000)
+    estimate = int(estimate_value.to_integral_value(rounding=ROUND_CEILING))
+    available = (
+        actor.reservation_credits
+        if actor.reservation_credits > 0
+        else max(0, int(actor.credits_remaining))
+    )
+    if estimate > available and actor.reservation_credits <= 0:
+        return {"ok": False, "reason": "insufficient_credits"}
+    prompt_cost = Decimal(prompt) * actor.prompt_usd_per_mtok / Decimal(1000)
+    if prompt_cost > Decimal(available):
+        return {"ok": False, "reason": "insufficient_credits"}
+    output_budget = max(Decimal(0), Decimal(available) - prompt_cost)
+    if actor.completion_usd_per_mtok > 0:
+        affordable = int(
+            (output_budget * Decimal(1000) / actor.completion_usd_per_mtok)
+            .to_integral_value(rounding=ROUND_FLOOR)
+        )
+        requested = min(requested, max(0, affordable))
+    return {
+        "ok": True,
+        "max_output_tokens": requested,
+        "estimated_credits": min(estimate, available),
+    }
+
+
+_pooled_keys: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
+    "chudware_pooled_provider_keys", default={}
+)
+def clear_pooled_credentials() -> None:
+    """Clear run-scoped operator keys before a new worker RPC is accepted."""
+    _pooled_keys.set({})
+
+
+
+
+def _pooled_provider_config(name: str | None, cfg: dict, actor: Actor) -> dict:
+    """Replace ambient user credentials with the operator-owned pooled key.
+
+    worker_rpc sets ``_chudware_pool_api_key`` only from the provider descriptor
+    resolved by hostd after the gateway stripped browser credentials. This named
+    slot makes the trust boundary explicit: a pooled turn never falls through to
+    a desktop user's config.json key.
+    """
+    if actor.key_source != "pool":
+        return cfg
+    provider_name = str(name or cfg.get("provider") or "").strip().lower()
+    explicit_key = str(cfg.get("_chudware_pool_api_key") or "").strip()
+    known_keys = dict(_pooled_keys.get())
+    if explicit_key and provider_name:
+        known_keys[provider_name] = explicit_key
+        _pooled_keys.set(known_keys)
+    key = explicit_key or known_keys.get(provider_name, "")
+    if not key and provider_name != "mock":
+        raise ValueError("pooled provider credential unavailable")
+    pooled = copy.deepcopy(cfg)
+    pooled["provider"] = provider_name
+    pooled["api_key"] = key
+    pooled["openrouter_api_key"] = key if provider_name == "openrouter" else None
+    keys = dict(pooled.get("keys") or {})
+    if provider_name:
+        keys[provider_name] = key
+        section = dict(pooled.get(provider_name) or {})
+        section["api_key"] = key
+        pooled[provider_name] = section
+    pooled["keys"] = keys
+    return pooled
+
 
 def assert_offline_safe(provider: Provider, cfg: dict | None = None) -> None:
     """Defense-in-depth guard the agent loop calls before every run when offline mode is set.
@@ -1575,7 +1716,7 @@ def assert_offline_safe(provider: Provider, cfg: dict | None = None) -> None:
 
 
 def get_provider(name: str | None = None, cfg: dict | None = None,
-                 role: str | None = None) -> Provider:
+                 role: str | None = None, *, actor: Actor | None = None) -> Provider:
     """Resolve the configured provider, enforcing offline/local-only at two points: cloud
     providers are refused by name BEFORE construction, and the resolved provider is re-checked
     against ``provider_offline_safe`` AFTER (catches the empty-name local default + edge cases).
@@ -1592,9 +1733,13 @@ def get_provider(name: str | None = None, cfg: dict | None = None,
     non-loopback provider before the wrap.
     """
     cfg = cfg if cfg is not None else load_config()
-    # local_only / offline: refuse non-loopback via the existing offline assert path.
-    # For local_only without offline_mode, temporarily treat as offline for the assert.
+    if actor is None or actor.key_source != "pool":
+        _pooled_keys.set({})
+    cfg = _pooled_provider_config(name, cfg, actor) if actor is not None else cfg
+    # token_usage's event sink is request-scoped and bound by worker_rpc. Provider
+    # construction carries no gateway/database dependency.
     provider = _resolve_provider(name, cfg, role=role)
+    # For local_only without offline_mode, temporarily treat as offline for the assert.
     if local_only_enabled(cfg):
         # Reuse offline assert machinery; synthesize a cfg that trips offline_enabled.
         if offline_enabled(cfg):

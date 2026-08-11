@@ -42,12 +42,12 @@ log = logging.getLogger("chudware-web.auth")
 # strings end up in pages served to unauthenticated callers.
 SUPPORT_EMAIL = "support@chudware.com"
 
-# /healthz is liveness. /api/billing/webhook is Stripe calling in — it cannot
-# present a session cookie, so it is authenticated by HMAC signature inside
-# billing.py instead. /api/auth is the sign-in surface itself: register, login,
-# verify, reset and the OAuth handshake are by definition reached without a
-# session. Nothing else belongs here.
-PUBLIC_PATHS = frozenset({"/healthz", "/api/billing/webhook", "/api/auth"})
+# /healthz is liveness. The Stripe webhook and desktop entitlement refresh cannot
+# present a session cookie; each verifies its own signed request before parsing
+# or trusting payload fields. /api/auth is the sign-in surface itself.
+PUBLIC_PATHS = frozenset(
+    {"/healthz", "/api/billing/webhook", "/api/entitlement/refresh", "/api/auth"}
+)
 
 
 def _is_public_path(path: str) -> bool:

@@ -10,6 +10,9 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#include <share.h>
+#include <sys/stat.h>
+#include <windows.h>
 #else
 #include <fcntl.h>
 #include <sys/file.h>
@@ -25,6 +28,23 @@ constexpr int kOpenFlags = _O_CREAT | _O_RDWR | _O_APPEND | _O_BINARY;
 int open_file(const std::filesystem::path& path, int flags = kOpenFlags) {
     return _open(path.string().c_str(), flags, _S_IREAD | _S_IWRITE);
 }
+int open_lock_file(const std::filesystem::path& path) {
+    int fd = -1;
+    const errno_t error = _wsopen_s(
+        &fd, path.c_str(), _O_CREAT | _O_RDWR | _O_BINARY, _SH_DENYRW,
+        _S_IREAD | _S_IWRITE);
+    if (error != 0) errno = error;
+    return fd;
+}
+void replace_file(const std::filesystem::path& source,
+                  const std::filesystem::path& destination) {
+    if (!::MoveFileExW(source.c_str(), destination.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        throw std::system_error(
+            static_cast<int>(::GetLastError()), std::system_category(),
+            "replace journal checkpoint");
+    }
+}
 int close_file(int fd) { return _close(fd); }
 int sync_file(int fd) { return _commit(fd); }
 int64_t seek_file(int fd, int64_t offset, int origin) { return _lseeki64(fd, offset, origin); }
@@ -35,6 +55,19 @@ int read_file(int fd, char* bytes, unsigned count) { return _read(fd, bytes, cou
 constexpr int kOpenFlags = O_CREAT | O_RDWR | O_APPEND | O_CLOEXEC;
 int open_file(const std::filesystem::path& path, int flags = kOpenFlags) {
     return ::open(path.c_str(), flags, 0600);
+}
+int open_lock_file(const std::filesystem::path& path) {
+    const int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) return fd;
+    if (::flock(fd, LOCK_EX | LOCK_NB) == 0) return fd;
+    const int lock_errno = errno;
+    ::close(fd);
+    errno = lock_errno;
+    return -1;
+}
+void replace_file(const std::filesystem::path& source,
+                  const std::filesystem::path& destination) {
+    std::filesystem::rename(source, destination);
 }
 int close_file(int fd) { return ::close(fd); }
 #ifdef __APPLE__
@@ -161,21 +194,8 @@ struct Journal::Impl {
           checkpoint_path(directory / "seq.head"), lock_path(directory / "writer.lock"),
           epoch(std::move(current_epoch)) {
         std::filesystem::create_directories(directory);
-        lock_fd = open_file(lock_path,
-#ifdef _WIN32
-                            _O_CREAT | _O_RDWR | _O_BINARY
-#else
-                            O_CREAT | O_RDWR | O_CLOEXEC
-#endif
-        );
-        if (lock_fd < 0) throw_io("journal lock open");
-#ifndef _WIN32
-        if (::flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
-            close_file(lock_fd);
-            lock_fd = -1;
-            throw std::runtime_error("journal already has a writer");
-        }
-#endif
+        lock_fd = open_lock_file(lock_path);
+        if (lock_fd < 0) throw std::runtime_error("journal already has a writer");
         journal_fd = open_file(journal_path);
         if (journal_fd < 0) throw_io("journal open");
         repair_torn_tail(journal_fd);
@@ -205,7 +225,7 @@ struct Journal::Impl {
 
     void persist_head(device::Seq value) {
         const auto temporary = checkpoint_path.string() + ".tmp." + epoch.process_start_id;
-        const int fd = open_file(temporary,
+        int fd = open_file(temporary,
 #ifdef _WIN32
                                  _O_CREAT | _O_TRUNC | _O_WRONLY | _O_BINARY
 #else
@@ -217,8 +237,10 @@ struct Journal::Impl {
             const std::string bytes = std::to_string(value) + "\n";
             write_all(fd, bytes);
             if (sync_file(fd) != 0) throw_io("seq checkpoint sync");
-            close_file(fd);
-            std::filesystem::rename(temporary, checkpoint_path);
+            const int close_result = close_file(fd);
+            fd = -1;
+            if (close_result != 0) throw_io("seq checkpoint close");
+            replace_file(temporary, checkpoint_path);
 #ifndef _WIN32
             const int directory_fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (directory_fd >= 0) {
@@ -227,7 +249,7 @@ struct Journal::Impl {
             }
 #endif
         } catch (...) {
-            close_file(fd);
+            if (fd >= 0) close_file(fd);
             std::error_code ignored;
             std::filesystem::remove(temporary, ignored);
             throw;

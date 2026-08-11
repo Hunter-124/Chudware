@@ -263,10 +263,11 @@ TEST_CASE("parity: point_on a plain ellipse satisfies the ellipse equation") {
     json s;
     s["entities"] = json::array({ellipse("e1", 0, 0, 8, 5, 30), point("p", 12, 3)});
     s["constraints"] = json::array({
-        rel("c1", "fix", {"e1.center"}),  // pin centre; rx/ry/rot stay free
+        rel("c1", "fix", {"e1"}),  // pin the ellipse; point_on must move the point
         rel("c2", "point_on", {"p", "e1"}),
     });
     auto sol = solve_sketch(s, json::object());
+    INFO("solved entities: " << sol.entities.dump());
     REQUIRE(sol.converged);
     // The solved point must lie on the solved ellipse: rad == 1 in the rotated frame.
     const json& e = sol.entities["e1"];

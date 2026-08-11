@@ -508,6 +508,7 @@ double ellipse_implicit(const VectorXd& xs, const Vector2d& P) {
     return (rad - 1.0) * r_mean;
 }
 
+
 // Exact line<->ellipse tangency residual via the support function. Port of
 // _ellipse_line_support. line = [ax,ay,bx,by]; ell = [cx,cy,rx,ry,rot].
 double ellipse_line_support(const VectorXd& line, const VectorXd& ell) {
@@ -1387,7 +1388,12 @@ void add_fix(System& sys, const std::string& cid, const std::string& handle,
             pin(pick(var_map.at(eid), {0, 1}), tgt);
         }
     } else if (t == "ellipse") {
-        if (sub.empty() || sub == "center") {
+        if (sub.empty()) {
+            VectorXd tgt(5);
+            tgt << num(ent["center"][0]), num(ent["center"][1]), num(ent["rx"]),
+                num(ent["ry"]), num(ent["rot"]);
+            pin(pick(var_map.at(eid), {0, 1, 2, 3, 4}), tgt);
+        } else if (sub == "center") {
             VectorXd tgt(2);
             tgt << num(ent["center"][0]), num(ent["center"][1]);
             pin(pick(var_map.at(eid), {0, 1}), tgt);
@@ -2645,7 +2651,7 @@ SketchSolution solve_sketch_monolithic(const json& sketch, const json& env,
     }
 
     SketchSolution sol;
-    auto res = sys.solve(x0, 1e-10, 50, time_budget_ms);
+    auto res = sys.solve(x0, 1e-10, 100, time_budget_ms);
     sol.x = res.x;
     sol.converged = res.converged;
     sol.var_map = var_map;

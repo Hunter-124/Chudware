@@ -33,6 +33,14 @@ static void test_unsetenv(const char* k) {
 #endif
 }
 
+static void test_set_appdata_root(const std::string& path) {
+#ifdef _WIN32
+    test_setenv("APPDATA", path.c_str());
+#else
+    test_setenv("XDG_DATA_HOME", path.c_str());
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // Fixture assembly tree + board (shared by the rollup / pricing suites).
 // ---------------------------------------------------------------------------
@@ -689,14 +697,14 @@ TEST_CASE("vendor registry rejects malformed price breaks at the offending entry
 }
 
 int main(int argc, char** argv) {
-    // Isolate ALL config/vendor-registry reads to a scratch XDG dir: the providers and
-    // the cost model must see an empty user config (no live machine state in tests).
+    // Isolate ALL config/vendor-registry reads to a scratch app-data directory: the
+    // providers and cost model must see empty user config (no live machine state in tests).
     const std::string scratch =
         (std::filesystem::temp_directory_path() / "chudware_sourcing_test_xdg").string();
     std::error_code ec;
     std::filesystem::remove_all(scratch, ec);
     std::filesystem::create_directories(scratch, ec);
-    test_setenv("XDG_DATA_HOME", scratch.c_str());
+    test_set_appdata_root(scratch);
     // Guard against a developer's live keys leaking into the fail-closed tests.
     for (const char* v :
          {"NEXAR_CLIENT_ID", "NEXAR_CLIENT_SECRET", "DIGIKEY_CLIENT_ID",

@@ -1,4 +1,5 @@
 #include "twin/twin.h"
+#include "twin/wide_math.h"
 
 #include <nlohmann/json.hpp>
 
@@ -82,44 +83,9 @@ struct Reader {
     }
 };
 
-std::int64_t ceilDivPositive(__int128 numerator, __int128 denominator) {
-    if (denominator <= 0 || numerator < 0) throw std::invalid_argument("invalid positive division");
-    return static_cast<std::int64_t>((numerator + denominator - 1) / denominator);
-}
 
 std::optional<std::int64_t> parseScaled(std::string_view text, std::int64_t scale) {
-    if (text.empty() || scale <= 0) return std::nullopt;
-    bool negative = false;
-    std::size_t pos = 0;
-    if (text[pos] == '+' || text[pos] == '-') {
-        negative = text[pos] == '-';
-        if (++pos == text.size()) return std::nullopt;
-    }
-    __int128 whole = 0;
-    bool any = false;
-    while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos]))) {
-        any = true;
-        whole = whole * 10 + (text[pos++] - '0');
-    }
-    __int128 fraction = 0;
-    __int128 divisor = 1;
-    if (pos < text.size() && text[pos] == '.') {
-        ++pos;
-        while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos]))) {
-            any = true;
-            if (divisor < 1'000'000'000'000'000'000ll) {
-                fraction = fraction * 10 + (text[pos] - '0');
-                divisor *= 10;
-            }
-            ++pos;
-        }
-    }
-    if (!any || pos != text.size()) return std::nullopt;
-    __int128 scaled = whole * scale;
-    scaled += (fraction * scale + divisor / 2) / divisor;
-    if (negative) scaled = -scaled;
-    if (scaled < std::numeric_limits<std::int64_t>::min() || scaled > std::numeric_limits<std::int64_t>::max()) return std::nullopt;
-    return static_cast<std::int64_t>(scaled);
+    return wide_math::parseScaledDecimal(text, scale);
 }
 
 std::string formatMm(Nm value) {
@@ -347,14 +313,13 @@ struct DeterministicTwin::Impl {
         const auto min_iy = std::max<std::int64_t>(0, (state.position.y - radius - config.stock.origin_nm.y) / res);
         const auto max_iy = std::min<std::int64_t>(config.stock.cells_y - 1, (state.position.y + radius - config.stock.origin_nm.y) / res);
         if (min_ix > max_ix || min_iy > max_iy) return;
-        const __int128 radius_sq = static_cast<__int128>(radius) * radius;
         for (std::int64_t iy = min_iy; iy <= max_iy; ++iy) {
             for (std::int64_t ix = min_ix; ix <= max_ix; ++ix) {
                 const Nm cx = config.stock.origin_nm.x + ix * res + res / 2;
                 const Nm cy = config.stock.origin_nm.y + iy * res + res / 2;
-                const __int128 dx = static_cast<__int128>(cx) - state.position.x;
-                const __int128 dy = static_cast<__int128>(cy) - state.position.y;
-                if (dx * dx + dy * dy > radius_sq) continue;
+                if (!wide_math::withinSquaredRadius(
+                        cx, cy, state.position.x, state.position.y, radius))
+                    continue;
                 auto& height = state.stock_heights[static_cast<std::size_t>(iy * config.stock.cells_x + ix)];
                 const Nm cut_height = std::max(config.stock.bottom_nm, state.position.z);
                 if (cut_height < height) height = cut_height;
@@ -399,9 +364,9 @@ struct DeterministicTwin::Impl {
         for (const auto& fixture : config.fixtures) {
             const Nm closest_x = std::clamp(state.position.x, fixture.min_nm.x, fixture.max_nm.x);
             const Nm closest_y = std::clamp(state.position.y, fixture.min_nm.y, fixture.max_nm.y);
-            const __int128 dx = static_cast<__int128>(state.position.x) - closest_x;
-            const __int128 dy = static_cast<__int128>(state.position.y) - closest_y;
-            const bool radial = dx * dx + dy * dy <= static_cast<__int128>(config.tool.holder_radius_nm) * config.tool.holder_radius_nm;
+            const bool radial = wide_math::withinSquaredRadius(
+                state.position.x, state.position.y, closest_x, closest_y,
+                config.tool.holder_radius_nm);
             const bool vertical = holder_min_z < fixture.max_nm.z && holder_max_z > fixture.min_nm.z;
             if (radial && vertical) {
                 holder_fixture = true;
@@ -502,7 +467,9 @@ struct DeterministicTwin::Impl {
             return true;
         }
         if (!movement_word && !has_axis) return true;
-        const std::array<Nm, 3> delta{target.x - state.position.x, target.y - state.position.y, target.z - state.position.z};
+        const std::array<Nm, 3> starts{
+            state.position.x, state.position.y, state.position.z};
+        const std::array<Nm, 3> destinations{target.x, target.y, target.z};
         const std::array<NmPerS, 3> caps{
             config.machine.axes[0].max_feed_nm_s,
             config.machine.axes[1].max_feed_nm_s,
@@ -510,16 +477,32 @@ struct DeterministicTwin::Impl {
         };
         std::int64_t travel_ticks = 1;
         for (std::size_t axis = 0; axis < 3; ++axis) {
-            const auto distance = static_cast<std::uint64_t>(delta[axis] < 0 ? -(delta[axis] + 1) + 1 : delta[axis]);
+            const auto distance =
+                wide_math::absoluteDistance(destinations[axis], starts[axis]);
             const NmPerS speed = state.modal_rapid ? caps[axis] : std::min(caps[axis], state.feed_nm_s);
-            if (distance > 0) travel_ticks = std::max(travel_ticks, ceilDivPositive(static_cast<__int128>(distance) * 1'000'000'000, static_cast<__int128>(speed) * config.dt_ns));
+            if (distance > 0)
+                travel_ticks = std::max(
+                    travel_ticks,
+                    wide_math::ceilDivProductsPositive(
+                        distance, 1'000'000'000,
+                        static_cast<std::uint64_t>(speed),
+                        static_cast<std::uint64_t>(config.dt_ns)));
         }
         std::int64_t ramp_ticks = 0;
         for (std::size_t axis = 0; axis < 3; ++axis) {
-            const auto distance = static_cast<std::uint64_t>(delta[axis] < 0 ? -(delta[axis] + 1) + 1 : delta[axis]);
+            const auto distance =
+                wide_math::absoluteDistance(destinations[axis], starts[axis]);
             if (distance == 0) continue;
-            const auto velocity = ceilDivPositive(static_cast<__int128>(distance) * 1'000'000'000, static_cast<__int128>(travel_ticks) * config.dt_ns);
-            ramp_ticks = std::max(ramp_ticks, ceilDivPositive(static_cast<__int128>(velocity) * 1'000'000'000, static_cast<__int128>(config.machine.axes[axis].accel_nm_s2) * config.dt_ns));
+            const auto velocity = wide_math::ceilDivProductsPositive(
+                distance, 1'000'000'000,
+                static_cast<std::uint64_t>(travel_ticks),
+                static_cast<std::uint64_t>(config.dt_ns));
+            ramp_ticks = std::max(
+                ramp_ticks,
+                wide_math::ceilDivProductsPositive(
+                    static_cast<std::uint64_t>(velocity), 1'000'000'000,
+                    static_cast<std::uint64_t>(config.machine.axes[axis].accel_nm_s2),
+                    static_cast<std::uint64_t>(config.dt_ns)));
         }
         state.motion = {state.position, target, travel_ticks + ramp_ticks, 0, state.modal_rapid, true};
         return true;
@@ -618,8 +601,8 @@ struct DeterministicTwin::Impl {
             const Vec3Nm previous = state.position;
             ++state.motion.elapsed_ticks;
             const auto interpolate = [&](Nm start, Nm end) {
-                const __int128 delta = static_cast<__int128>(end) - start;
-                return static_cast<Nm>(static_cast<__int128>(start) + delta * state.motion.elapsed_ticks / state.motion.total_ticks);
+                return wide_math::interpolate(
+                    start, end, state.motion.elapsed_ticks, state.motion.total_ticks);
             };
             state.position = {
                 interpolate(state.motion.start.x, state.motion.target.x),
@@ -627,9 +610,12 @@ struct DeterministicTwin::Impl {
                 interpolate(state.motion.start.z, state.motion.target.z),
             };
             state.velocity = {
-                static_cast<Nm>((static_cast<__int128>(state.position.x - previous.x) * 1'000'000'000) / config.dt_ns),
-                static_cast<Nm>((static_cast<__int128>(state.position.y - previous.y) * 1'000'000'000) / config.dt_ns),
-                static_cast<Nm>((static_cast<__int128>(state.position.z - previous.z) * 1'000'000'000) / config.dt_ns),
+                wide_math::scaleDifference(
+                    state.position.x, previous.x, 1'000'000'000, config.dt_ns),
+                wide_math::scaleDifference(
+                    state.position.y, previous.y, 1'000'000'000, config.dt_ns),
+                wide_math::scaleDifference(
+                    state.position.z, previous.z, 1'000'000'000, config.dt_ns),
             };
             collisions(output);
             if (!state.halted) applyRemoval();
@@ -822,10 +808,8 @@ std::uint64_t DeterministicTwin::stateHash() const { return impl_->configured ? 
 Tick DeterministicTwin::tick() const { return impl_->state.tick; }
 Vec3Nm DeterministicTwin::toolTip() const { return impl_->state.position; }
 std::int64_t DeterministicTwin::stockHeightSumNm() const {
-    __int128 sum = 0;
-    for (const auto value : impl_->state.stock_heights) sum += value - impl_->config.stock.bottom_nm;
-    if (sum > std::numeric_limits<std::int64_t>::max()) return std::numeric_limits<std::int64_t>::max();
-    return static_cast<std::int64_t>(sum);
+    return wide_math::saturatingDifferenceSum(
+        impl_->state.stock_heights, impl_->config.stock.bottom_nm);
 }
 const FidelityDeclaration& DeterministicTwin::fidelity() const { return impl_->fidelity; }
 ProceduralFact DeterministicTwin::proceduralFact(std::string check_name) const {

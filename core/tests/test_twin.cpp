@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "twin/twin.h"
+#include "twin/wide_math.h"
 
 #include <algorithm>
 #include <array>
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -111,6 +113,45 @@ bool hasCollision(const std::vector<CollisionEvent>& events, CollisionClass type
 std::string lower(std::string text) {
     std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return text;
+}
+
+TEST_CASE("portable wide arithmetic preserves exact overflow headroom") {
+    namespace wide = chudware::twin::wide_math;
+    constexpr auto i64_min = std::numeric_limits<std::int64_t>::min();
+    constexpr auto i64_max = std::numeric_limits<std::int64_t>::max();
+    constexpr auto u64_max = std::numeric_limits<std::uint64_t>::max();
+
+    CHECK(wide::absoluteDistance(i64_min, i64_max) == u64_max);
+    // Both products exceed uint64; the second case also forces a full-width
+    // denominator rather than MSVC's single-word `_udiv128` fast path.
+    CHECK(wide::ceilDivProductsPositive(4'000'000'000ull, 4'000'000'000ull,
+                                        3'000'000'000ull, 2ull) ==
+          2'666'666'667ll);
+    CHECK(wide::ceilDivProductsPositive(u64_max, 100, u64_max, 3) == 34);
+
+    REQUIRE(wide::parseScaledDecimal("9223372036.854775807", 1'000'000'000)
+                .has_value());
+    CHECK(*wide::parseScaledDecimal("9223372036.854775807", 1'000'000'000) ==
+          i64_max);
+    CHECK(*wide::parseScaledDecimal("-9223372036.854775808", 1'000'000'000) ==
+          i64_min);
+    CHECK_FALSE(
+        wide::parseScaledDecimal("9223372036.854775808", 1'000'000'000)
+            .has_value());
+    CHECK_FALSE(
+        wide::parseScaledDecimal("184467440737095516160", 1).has_value());
+
+    CHECK(wide::withinSquaredRadius(4'000'000'000ll, 3'000'000'000ll,
+                                    0, 0, 5'000'000'000ll));
+    CHECK_FALSE(wide::withinSquaredRadius(i64_min, i64_min, i64_max, i64_max,
+                                          i64_max));
+
+    CHECK(wide::interpolate(i64_min, i64_max, 1, 2) == -1);
+    CHECK(wide::interpolate(i64_max, i64_min, 1, 2) == 0);
+    CHECK(wide::scaleDifference(i64_max, i64_min, 1, 2) == i64_max);
+    CHECK(wide::scaleDifference(i64_min, i64_max, 1, 2) == -i64_max);
+    CHECK(wide::saturatingDifferenceSum({i64_max, i64_max}, i64_min) ==
+          i64_max);
 }
 
 TEST_CASE("snapshot restore reproduces every tick hash and the final snapshot bytes") {

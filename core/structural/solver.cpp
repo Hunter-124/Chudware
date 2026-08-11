@@ -815,10 +815,24 @@ AnalysisRow member_extract(const Member& m, const SegmentedMember& sm, const std
     }
     const double defl_y = max_mag({dmax_y, dmin_y});
     const double defl_z = max_mag({dmax_z, dmin_z});
-    const double defl = max_mag({defl_y, defl_z});
 
-    return {m.name, combo, axial, shear, moment, defl,
-            shear_y, shear_z, moment_y, moment_z, defl_y, defl_z};
+    AnalysisRow row;
+    row.element_id = m.name;
+    row.combo = combo;
+    row.axial_n = axial;
+    row.shear_n = shear;
+    row.moment_nmm = moment;
+    row.shear_y_n = shear_y;
+    row.shear_z_n = shear_z;
+    row.moment_y_nmm = moment_y;
+    row.moment_z_nmm = moment_z;
+    row.deflection_y_mm = defl_y;
+    row.deflection_z_mm = defl_z;
+    row.deflection_mm =
+        std::abs(row.deflection_y_mm) >= std::abs(row.deflection_z_mm)
+            ? row.deflection_y_mm
+            : row.deflection_z_mm;
+    return row;
 }
 
 }  // namespace

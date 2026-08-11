@@ -42,6 +42,16 @@ json rpc(const std::string& method, const json& params) {
     std::string err;
     const bool handled = chudware::structural::call(method, params, result, err);
     REQUIRE(handled);
+    if (method == "struct_analyze" && result.contains("results")) {
+        for (const json& row : result["results"]) {
+            const double deflection_y = row["deflection_y_mm"].get<double>();
+            const double deflection_z = row["deflection_z_mm"].get<double>();
+            const double expected =
+                std::abs(deflection_y) >= std::abs(deflection_z) ? deflection_y : deflection_z;
+            INFO("structural result=" << row.dump());
+            CHECK(row["deflection_mm"].get<double>() == expected);
+        }
+    }
     return result;
 }
 

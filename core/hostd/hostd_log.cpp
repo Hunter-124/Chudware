@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <system_error>
 
+#include "util/time_local.h"
+
 namespace hostd {
 
 static constexpr long kMaxBytes = 5 * 1024 * 1024;
@@ -59,11 +61,7 @@ void Log::line(const char* fmt, ...) {
     char ts[32];
     std::time_t now = std::time(nullptr);
     std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &now);  // MSVC's re-entrant variant (args swapped vs POSIX)
-#else
-    localtime_r(&now, &tm);
-#endif
+    (void)chudware::util::localTime(now, tm);
     // Spelled out (not %F %T): pre-UCRT Windows CRTs lack the C99 specifiers.
     std::strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tm);
     std::fprintf(f_, "[%s] ", ts);

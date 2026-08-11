@@ -25,6 +25,8 @@
 #include <string>
 #include <system_error>
 
+#include "util/time_local.h"
+
 // appdataDir() is a free function at namespace scope (host/src/core/app_state.h:221). We
 // declare it here instead of including that header: app_state.h drags in GLFW, ImGui and the
 // whole AppState graph, none of which the standalone test TU can compile or link against. The
@@ -147,11 +149,7 @@ namespace {
 std::string todayStamp() {
     const std::time_t t = std::time(nullptr);
     std::tm tmv {};
-#if defined(_WIN32)
-    ::localtime_s(&tmv, &t);
-#else
-    ::localtime_r(&t, &tmv);
-#endif
+    if (!chudware::util::localTime(t, tmv)) return {};
     char buf[16];
     std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tmv);
     return std::string(buf);

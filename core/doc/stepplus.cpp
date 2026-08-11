@@ -35,6 +35,7 @@
 #include "doc/session.h"  // OpError
 
 #include "sim/sim_cache.h"
+#include "util/time_local.h"
 
 namespace chudware::doc {
 
@@ -113,11 +114,7 @@ std::string placeholder_png(int size = 256, unsigned char grey = 200) {
 std::string iso_utc_now() {
     std::time_t t = std::time(nullptr);
     std::tm tmv{};
-#if defined(_WIN32)
-    gmtime_s(&tmv, &t);
-#else
-    gmtime_r(&t, &tmv);
-#endif
+    (void)chudware::util::gmTime(t, tmv);
     char buf[40];
     std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d+00:00",
                   tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,

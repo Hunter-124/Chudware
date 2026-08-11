@@ -705,7 +705,8 @@ add_executable(test_clipboard_image
   tests/test_clipboard_image.cpp)
 target_compile_definitions(test_clipboard_image PRIVATE CHUDWARE_CLIPBOARD_IMAGE_TEST=1)
 target_include_directories(test_clipboard_image PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../core)
 set_target_properties(test_clipboard_image PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_clipboard_image

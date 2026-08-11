@@ -7,6 +7,7 @@
 // timeline that hosts them lives in activity_timeline.cpp.
 
 #include "copilot_internal.h"
+#include "util/time_local.h"
 
 // ============================ Plan / Objectives section ============================
 // Multi-shape plan display (build_plan | checklist | phased_todo | objectives | dag).
@@ -2428,7 +2429,7 @@ static std::string aiVcFmtMtime(double epoch) {
     if (epoch <= 0.0) return {};
     std::time_t t = (std::time_t)epoch;
     std::tm tmv;
-    if (!localtime_r(&t, &tmv)) return {};
+    if (!chudware::util::localTime(t, tmv)) return {};
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d",
                   tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,

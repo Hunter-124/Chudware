@@ -25,6 +25,7 @@
 #include "ui/file_dialog.h"
 #include "ui/icons.h"
 #include "ui_theme.h"
+#include "util/time_local.h"
 
 namespace ui {
 namespace {
@@ -1265,14 +1266,15 @@ bool plmDatePicker(const char* id, char* buf, size_t n) {
     int y = 0, mo = 0, d = 0;
     bool haveVal = (std::sscanf(buf, "%d-%d-%d", &y, &mo, &d) == 3 &&
                     mo >= 1 && mo <= 12 && d >= 1 && d <= 31);
-    std::time_t tt = std::time(nullptr);
+    const std::time_t tt = std::time(nullptr);
     std::tm now{};
-#if defined(_WIN32)
-    localtime_s(&now, &tt);
-#else
-    localtime_r(&tt, &now);
-#endif
-    if (!haveVal) { y = now.tm_year + 1900; mo = now.tm_mon + 1; d = 0; }
+    const bool haveNow = chudware::util::localTime(tt, now);
+    if (!haveVal) {
+        if (!haveNow) return false;
+        y = now.tm_year + 1900;
+        mo = now.tm_mon + 1;
+        d = 0;
+    }
 
     ImGui::PushID(id);
     // view state (month being browsed) lives in ImGui storage, keyed per widget
@@ -1362,8 +1364,8 @@ bool plmDatePicker(const char* id, char* buf, size_t n) {
             if (cell % 7) ImGui::SameLine();
             ImGui::PushID(day);
             bool isSel = (haveVal && vy == y && vm == mo && day == d);
-            bool isToday = (vy == now.tm_year + 1900 && vm == now.tm_mon + 1 &&
-                            day == now.tm_mday);
+            bool isToday = haveNow && vy == now.tm_year + 1900 && vm == now.tm_mon + 1 &&
+                           day == now.tm_mday;
             ImVec2 rmin = ImGui::GetCursorScreenPos();
             bool click = ImGui::InvisibleButton("##d", ImVec2(kCell, kCellH));
             ImVec2 rmax(rmin.x + kCell, rmin.y + kCellH);

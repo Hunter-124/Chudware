@@ -10,6 +10,7 @@
 #include "ui/copilot/tool_phrase.h"   // human phrasing + grouping for raw MCP tool symbols
 #include "ui/ai/ai_prefs.h"           // cached chat-display prefs (Settings -> AI -> Harness)
 #include "gl_compat.h"                // glDeleteTextures — bounded artifact texture cache
+#include "util/time_local.h"
 
 namespace ui {
 
@@ -1125,11 +1126,7 @@ static std::string chatRowClock(double ts) {
     if (ts <= 0.0) return std::string();
     const std::time_t t = (std::time_t)ts;
     std::tm tmv;
-#ifdef _WIN32
-    if (localtime_s(&tmv, &t) != 0) return std::string();
-#else
-    if (localtime_r(&t, &tmv) == nullptr) return std::string();
-#endif
+    if (!chudware::util::localTime(t, tmv)) return std::string();
     int h = tmv.tm_hour % 12; if (h == 0) h = 12;
     char buf[24];
     std::snprintf(buf, sizeof(buf), "%d:%02d %s", h, tmv.tm_min,

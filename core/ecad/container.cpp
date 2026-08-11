@@ -18,6 +18,7 @@
 #include "ecad/netlist.h"
 #include "ecad/ops.h"  // OpError
 #include "ecad/schema.h"
+#include "util/time_local.h"
 
 namespace chudware::ecad {
 
@@ -84,11 +85,7 @@ std::string placeholder_png(int size = 128, unsigned char grey = 210) {
 std::string iso_utc_now() {
     std::time_t t = std::time(nullptr);
     std::tm tmv{};
-#if defined(_WIN32)
-    gmtime_s(&tmv, &t);
-#else
-    gmtime_r(&t, &tmv);
-#endif
+    (void)chudware::util::gmTime(t, tmv);
     char buf[40];
     std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d+00:00", tmv.tm_year + 1900,
                   tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);

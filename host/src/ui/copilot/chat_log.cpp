@@ -7,6 +7,7 @@
 #include "agent_text.h"
 #include "ui/clipboard_image.h"   // isImageAttachment / pastedImagePath — resolve sent attachments
 #include "image_lightbox.h"       // attachmentThumbnail / openImageLightbox
+#include "util/time_local.h"
 
 namespace ui {
 
@@ -17,11 +18,7 @@ namespace ui {
 static bool chatLocalTime(double ts, std::tm& out) {
     if (ts <= 0.0) return false;
     const std::time_t t = (std::time_t)ts;
-#ifdef _WIN32
-    return localtime_s(&out, &t) == 0;
-#else
-    return localtime_r(&t, &out) != nullptr;
-#endif
+    return chudware::util::localTime(t, out);
 }
 
 static std::string chatAgeLabel(double ts) {

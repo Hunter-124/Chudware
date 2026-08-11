@@ -34,6 +34,12 @@ namespace {
 bool virtualSerialAddress(std::string_view address) {
     if (address.starts_with("/dev/pts/") || address.starts_with("pty:") ||
         address.starts_with("loopback:") || address.starts_with("replay:")) return true;
+#ifdef __APPLE__
+    // Darwin PTY slaves are /dev/ttysNNN (real serial devices use /dev/tty.* or
+    // /dev/cu.*). Treating a test/emulator PTY as probed physical evidence
+    // would let a caller's endpoint_is_physical flag overstate its provenance.
+    if (address.starts_with("/dev/ttys")) return true;
+#endif
     std::string lowered(address);
     std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
         return static_cast<char>(std::tolower(ch));
@@ -717,6 +723,24 @@ std::vector<SerialCandidate> SerialTransport::enumerate(std::string* why) {
                 })) candidates.push_back({identity, port, true});
         }
     }
+#elif defined(__APPLE__)
+    // Darwin has no Linux-style /dev/serial/by-id tree. IOKit publishes serial
+    // callout and dial-in character devices as /dev/cu.* and /dev/tty.*.
+    const std::filesystem::path root("/dev");
+    std::error_code error;
+    std::filesystem::directory_iterator iterator(root, error);
+    const std::filesystem::directory_iterator end;
+    while (!error && iterator != end) {
+        const auto path = iterator->path();
+        const std::string name = path.filename().string();
+        std::error_code status_error;
+        if ((name.starts_with("cu.") || name.starts_with("tty.")) &&
+            iterator->is_character_file(status_error) && !status_error) {
+            candidates.push_back({EndpointIdentity::serial(path.string()), name, true});
+        }
+        iterator.increment(error);
+    }
+    if (error && why) *why = "serial enumeration failed: " + error.message();
 #else
     const std::filesystem::path root("/dev/serial/by-id");
     std::error_code error;

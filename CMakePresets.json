@@ -55,8 +55,8 @@
     },
     {
       "name": "macos-arm64",
-      "displayName": "macOS arm64 core (libchudware, Ninja + AppleClang, OCCT)",
-      "description": "Configure the C++ core with the OCCT geometry kernel on macOS. Needs only the Xcode Command Line Tools (no full Xcode) plus Homebrew ninja/cmake/opencascade. CMAKE_PREFIX_PATH points at the /opt/homebrew Homebrew prefix because Homebrew is not on CMake's default search path, so ProvisionOCCT's find_package(OpenCASCADE REQUIRED) cannot see it otherwise. CEF is off on macOS: no CEF binary distribution is vendored for Darwin, so the embedded-browser widgets are compiled out. Requires CMake >= 3.24 (the file-level cmakeMinimumRequired) — core/CMakeLists.txt's $<LINK_GROUP:RESCAN,...> only emits the correct ld64 flags from 3.24 on.",
+      "displayName": "macOS arm64 core (libchudware, Ninja + AppleClang, OCCT + Netgen)",
+      "description": "Configure the C++ core with the OCCT geometry kernel and Netgen mesher on macOS. Needs only the Xcode Command Line Tools (no full Xcode) plus Homebrew ninja/cmake/opencascade. Netgen is built once from the pinned LGPL source into NETGEN_ROOT so it receives the required safety patch and remains ABI-matched to Homebrew OCCT. CMAKE_PREFIX_PATH points at the /opt/homebrew Homebrew prefix because Homebrew is not on CMake's default search path, so ProvisionOCCT's find_package(OpenCASCADE REQUIRED) cannot see it otherwise. CEF is off on macOS: no CEF binary distribution is vendored for Darwin, so the embedded-browser widgets are compiled out. Requires CMake >= 3.24 (the file-level cmakeMinimumRequired) — core/CMakeLists.txt's $<LINK_GROUP:RESCAN,...> only emits the correct ld64 flags from 3.24 on.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/macos-arm64",
       "cacheVariables": {
@@ -65,6 +65,7 @@
         "CMAKE_PREFIX_PATH": "/opt/homebrew",
         "CHUDWARE_BUILD_CORE": "ON",
         "CHUDWARE_WITH_OCCT": "ON",
+        "CHUDWARE_WITH_NETGEN": "ON",
         "CHUDWARE_ENABLE_CEF": "OFF"
       },
       "condition": {
@@ -75,8 +76,8 @@
     },
     {
       "name": "macos-x86_64",
-      "displayName": "macOS x86_64 core (libchudware, Ninja + AppleClang, OCCT)",
-      "description": "Configure the C++ core with the OCCT geometry kernel on macOS. Needs only the Xcode Command Line Tools (no full Xcode) plus Homebrew ninja/cmake/opencascade. CMAKE_PREFIX_PATH points at the /usr/local Homebrew prefix because Homebrew is not on CMake's default search path, so ProvisionOCCT's find_package(OpenCASCADE REQUIRED) cannot see it otherwise. CEF is off on macOS: no CEF binary distribution is vendored for Darwin, so the embedded-browser widgets are compiled out. Requires CMake >= 3.24 (the file-level cmakeMinimumRequired) — core/CMakeLists.txt's $<LINK_GROUP:RESCAN,...> only emits the correct ld64 flags from 3.24 on.",
+      "displayName": "macOS x86_64 core (libchudware, Ninja + AppleClang, OCCT + Netgen)",
+      "description": "Configure the C++ core with the OCCT geometry kernel and Netgen mesher on macOS. Needs only the Xcode Command Line Tools (no full Xcode) plus Homebrew ninja/cmake/opencascade. Netgen is built once from the pinned LGPL source into NETGEN_ROOT so it receives the required safety patch and remains ABI-matched to Homebrew OCCT. CMAKE_PREFIX_PATH points at the /usr/local Homebrew prefix because Homebrew is not on CMake's default search path, so ProvisionOCCT's find_package(OpenCASCADE REQUIRED) cannot see it otherwise. CEF is off on macOS: no CEF binary distribution is vendored for Darwin, so the embedded-browser widgets are compiled out. Requires CMake >= 3.24 (the file-level cmakeMinimumRequired) — core/CMakeLists.txt's $<LINK_GROUP:RESCAN,...> only emits the correct ld64 flags from 3.24 on.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/macos-x86_64",
       "cacheVariables": {
@@ -85,6 +86,7 @@
         "CMAKE_PREFIX_PATH": "/usr/local",
         "CHUDWARE_BUILD_CORE": "ON",
         "CHUDWARE_WITH_OCCT": "ON",
+        "CHUDWARE_WITH_NETGEN": "ON",
         "CHUDWARE_ENABLE_CEF": "OFF"
       },
       "condition": {

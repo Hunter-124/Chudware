@@ -182,29 +182,59 @@ jobs:
           }
 
           # The windows-core preset builds with MSVC + Ninja, which needs cl and
-          # link on PATH. Locating the toolchain with vswhere and exporting the
-          # dev-shell environment into GITHUB_ENV keeps that self-contained: no
-          # third-party action, and no assumption about how the runner service
-          # was launched.
+          # link on PATH. Prefer vswhere when the Visual Studio Installer payload
+          # is present. Some Build Tools-only hosts retain a complete VC tree
+          # after the Installer directory is removed, so fall back to the
+          # authoritative vcvars64.bat location under the VS root.
+          $vsPath = $null
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          if (-not (Test-Path $vswhere)) {
-            Write-Host "::error::vswhere.exe not found; Visual Studio Build Tools are not installed on $env:RUNNER_NAME"
-            exit 1
+          if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
           }
-          $vsPath = & $vswhere -latest -products * `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath
           if (-not $vsPath) {
-            Write-Host "::error::no Visual Studio installation with the x64 C++ toolset on $env:RUNNER_NAME"
+            $searchRoots = @(
+              (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio'),
+              (Join-Path $env:ProgramFiles 'Microsoft Visual Studio')
+            ) | Where-Object { Test-Path $_ }
+            $vcvars = $searchRoots |
+              ForEach-Object {
+                Get-ChildItem -Path $_ -Filter vcvars64.bat -File -Recurse `
+                  -ErrorAction SilentlyContinue
+              } |
+              Select-Object -First 1
+            if ($vcvars) {
+              $vsPath = $vcvars.Directory.Parent.Parent.Parent.FullName
+              Write-Host "::notice::vswhere unavailable or returned no x64 toolset; found vcvars64.bat at $($vcvars.FullName)"
+            }
+          }
+          if (-not $vsPath) {
+            Write-Host "::error::no Visual Studio installation with vcvars64.bat and the x64 C++ toolset on $env:RUNNER_NAME"
             exit 1
           }
           Write-Host "visual-studio=$vsPath"
 
           $before = @{}
           Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
-          Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
-          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation `
-            -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+          $devShellModule = Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+          if (Test-Path $devShellModule) {
+            Import-Module $devShellModule
+            Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation `
+              -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+          } else {
+            $vcvarsPath = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+            if (-not (Test-Path $vcvarsPath)) {
+              Write-Host "::error::Visual Studio root $vsPath has neither DevShell nor vcvars64.bat"
+              exit 1
+            }
+            & cmd.exe /d /s /c "`"$vcvarsPath`" >nul && set" |
+              ForEach-Object {
+                if ($_ -match '^([^=]+)=(.*)$') {
+                  [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+                }
+              }
+          }
 
           # Persist only what the dev shell actually changed, so later steps in
           # this job compile with the same toolchain without re-entering it.

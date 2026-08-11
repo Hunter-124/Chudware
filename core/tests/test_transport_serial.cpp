@@ -372,6 +372,14 @@ TEST_CASE("POSIX serial reports device_lost and capability remains transport-onl
     CHECK(SerialTransport::evidenceSourceForEndpoint(
               {"untrusted-flag", "/dev/serial/by-id/usb-Controller_42", false}) ==
           FreshSource::Simulated);
+#ifdef __APPLE__
+    CHECK(SerialTransport::evidenceSourceForEndpoint(
+              {"darwin-pty", "/dev/ttys001", true}) ==
+          FreshSource::Simulated);
+    CHECK(SerialTransport::evidenceSourceForEndpoint(
+              {"darwin-controller", "/dev/cu.usbserial-Controller_42", true}) ==
+          FreshSource::Probed);
+#endif
     const auto report = transport.capabilityReport("dev:emulated:test", "res:device_identity:test");
     REQUIRE(report.complete());
     CHECK(report.max_advertised == CapabilityLevel::Transport);

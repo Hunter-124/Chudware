@@ -934,8 +934,8 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
 #else   // _WIN32
 bool call_admin_worker_turn(const std::string&, const std::string&, const json&,
                             const std::string&, const std::string&, const std::string&,
-                            const json&, const json&, RunEvents&, json&, std::string& err,
-                            bool&, bool&) {
+                            const json&, const json&, const json&, RunEvents&, json&,
+                            std::string& err, bool&, bool&) {
     err = "admin worker bridge unavailable on this platform";
     return false;
 }

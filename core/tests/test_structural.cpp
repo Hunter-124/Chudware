@@ -152,6 +152,7 @@ TEST_CASE("cantilever tip deflection hand-calc") {
     const json out = rpc("struct_analyze", {{"doc", doc}, {"load_combo", "DEAD_LIVE"}});
     const json* r = row_for(out["results"], "beam1");
     REQUIRE(r != nullptr);
+    INFO("beam1 result=" << r->dump());
     // Factored tip load P = 500 × 1.2 = 600 N; δ_tip = PL³/(3EI), M_fix = PL.
     const SectionProps p = section_properties("150x150", "cedar");
     const double P = 600.0, L = 3000.0;

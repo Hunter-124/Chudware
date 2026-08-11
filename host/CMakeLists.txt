@@ -9,6 +9,21 @@ chudware_version_derive()
 
 project(CHUDWARE_Host VERSION ${CHUDWARE_VERSION} LANGUAGES C CXX)
 
+# MSVC: <windows.h> defines min()/max() macros that clobber std::min, std::max and
+# std::numeric_limits<>::max. core/CMakeLists.txt:71 already suppresses this
+# project-wide, but host/ is a SEPARATE CMake project that compiles several core
+# sources directly (core/util/entitlement.cpp, platform_paths.cpp, tweetnacl.c),
+# so it does not inherit that definition — which is exactly how the Windows host
+# build broke on entitlement.cpp's std::numeric_limits<std::size_t>::max() long
+# after core itself was green. Mirror it here.
+#
+# NOMINMAX only. Deliberately NOT WIN32_LEAN_AND_MEAN: core/doc/formats.cpp
+# documents that it needs <windows.h> pulled in FULL and that a lean include
+# would poison a later one.
+if(MSVC)
+  add_compile_definitions(NOMINMAX)
+endif()
+
 # <build>/generated/api/chudware_version.h — build tree, never the source tree.
 # ${CMAKE_CURRENT_SOURCE_DIR}/../core is already on the include path below, so
 # `#include "api/chudware_version.h"` resolves the same way "api/libchudware.h" does.

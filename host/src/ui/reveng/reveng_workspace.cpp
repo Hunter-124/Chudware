@@ -1439,7 +1439,8 @@ void drawPropsProvenance(RevEngState& s) {
             ImGui::PushID(i);
             kit::KeyValueRow(p.step.c_str(), p.ts.empty() ? "" : p.ts.c_str());
             if (!p.detail.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                const float* d = ui::palette.textDisabled;
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(d[0], d[1], d[2], d[3]));
                 ImGui::TextWrapped("%s", p.detail.c_str());
                 ImGui::PopStyleColor();
             }

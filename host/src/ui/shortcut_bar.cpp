@@ -134,7 +134,8 @@ void ShortcutBar::draw(AppState& st, bool inSketch) {
                               ImGui::ColorConvertFloat4ToU32(surf.textPrimary),
                               ui::glassIconHalo(surf));
         else
-            ui::drawIconGlass(dl, cmds[i].icon, ic, iz, IM_COL32(255, 255, 255, 230), 0);
+            ui::drawIconGlass(dl, cmds[i].icon, ic, iz,
+                              IM_COL32(255, 255, 255, 230), 0);  // gui-lint: allow identity tint at 90% — raster glyph keeps its own pixels
         if (clicked) {
             if (st.ribbonDispatch) st.ribbonDispatch(cmds[i].id);
             dismiss();

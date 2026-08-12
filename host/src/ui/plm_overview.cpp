@@ -648,8 +648,11 @@ static void drawProjectHeader(AppState& st) {
 
 static void drawStatusDot(ImDrawList* dl, ImVec2 center, ImU32 col, float r) {
     dl->AddCircleFilled(center, r, col);
-    // soft ring so the dot reads on frosted glass
-    dl->AddCircle(center, r + 0.5f, IM_COL32(0, 0, 0, 40), 0, 1.0f);
+    // soft ring so the dot reads on frosted glass — the app's drop-shadow role at a light alpha
+    const float* sh = ui::palette.glassShadow;
+    dl->AddCircle(center, r + 0.5f,
+                  ImGui::ColorConvertFloat4ToU32(ImVec4(sh[0], sh[1], sh[2], 40.0f / 255.0f)), 0,
+                  1.0f);
 }
 
 static void drawAssetRow(AppState& st, const AssetRow& a) {

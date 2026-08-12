@@ -289,6 +289,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/plm/plm_quickbar.cpp # embedded per-doc PLM control (status-bar chip + popover)
   src/ui/plm/graph_tab.cpp     # PLM Graph tab (cad_graph_get/blast draw-list)
   src/ui/plm/graph_force.cpp    # PLM Graph force-directed layout engine (headless)
+  src/ui/plm/graph_changes.cpp  # PLM Graph "what changed since I last looked" (cad_graph_changes + watch overlay)
   src/ui/plm/graph_thumbs.cpp   # PLM Graph grid-view iso thumbnails (.plm/thumbs cache)
   src/ui/plm_overview.cpp        # compact PLM overview (left manager tab, left of Explorer)
   src/ui/ai/ai_workspace.cpp

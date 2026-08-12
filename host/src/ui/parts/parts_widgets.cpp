@@ -198,7 +198,7 @@ void partIconDraw(ImDrawList* dl, ImVec2 center, float sizePx, const std::string
             const float* role = selected ? palette.accent : palette.text;
             col = Palette::toU32(role);
         } else {
-            col = IM_COL32(255, 255, 255, 255);
+            col = IM_COL32(255, 255, 255, 255);  // gui-lint: allow identity tint, not a color — the raster atlas glyph keeps its own pixels
         }
         ui::drawIconGlass(dl, name, center, sizePx, col, 0);
     } else {
@@ -253,7 +253,7 @@ bool borderRow(const char* strId, const char* label, const char* icon, bool sele
             const float* role = selected ? palette.accent : palette.text;
             icol = Palette::toU32(role);
         } else {
-            icol = IM_COL32(255, 255, 255, 255);   // raster glyphs keep atlas pixels
+            icol = IM_COL32(255, 255, 255, 255);  // gui-lint: allow identity tint, not a color — raster glyphs keep atlas pixels
         }
         ui::drawIconGlass(dl, icon, ImVec2(x + iconSz * 0.5f, p0.y + size.y * 0.5f),
                           iconSz, icol, 0);
@@ -423,7 +423,7 @@ bool glassRow(const char* strId, const char* label, const char* icon, bool selec
     if (haveIcon) {
         // The glyph carries the hue, the label stays high-contrast text: tinting BOTH turned
         // a low-emphasis child row into unreadable coloured-on-dark text.
-        ImU32 icol = IM_COL32(255, 255, 255, 255);
+        ImU32 icol = IM_COL32(255, 255, 255, 255);  // gui-lint: allow identity tint, not a color — raster fallback keeps atlas pixels
         if (ui::hasIconSdf(icon)) {
             float ic[4] = {tint[0], tint[1], tint[2], selected ? 1.0f : 0.92f};
             icol = Palette::toU32(ic);

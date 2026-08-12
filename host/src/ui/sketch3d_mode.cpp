@@ -419,13 +419,14 @@ void Sketch3DMode::drawPlaneGrid(ImDrawList* dl, AppState& st, const ImVec2& img
             worldToScreen(cam, imgMin, vw, vh, q1.x, q1.y, q1.z, d))
             dl->AddLine(c, d, gc, 1.0f);
     }
-    // origin triad glyph (world axes at the world origin) — X red-ish, Y green-ish, Z blue-ish.
+    // origin triad glyph (world axes at the world origin) — the same X/Y/Z roles the orientation
+    // triad and the manipulators use, so every axis cue in the app is one colour.
     ImVec2 o, axp;
     if (worldToScreen(cam, imgMin, vw, vh, 0, 0, 0, o)) {
         const float axLen = 12.0f;
         const Vec3 axes[3] = {{axLen, 0, 0}, {0, axLen, 0}, {0, 0, axLen}};
-        const ImU32 axc[3] = {IM_COL32(214, 84, 84, 255), IM_COL32(90, 176, 96, 255),
-                              IM_COL32(84, 120, 214, 255)};
+        const ImU32 axc[3] = {col(ui::palette.axisX), col(ui::palette.axisY),
+                              col(ui::palette.axisZ)};
         for (int i = 0; i < 3; ++i)
             if (worldToScreen(cam, imgMin, vw, vh, axes[i].x, axes[i].y, axes[i].z, axp))
                 dl->AddLine(o, axp, axc[i], 1.6f);

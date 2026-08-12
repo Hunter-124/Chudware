@@ -716,7 +716,11 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         const float swR = 5.5f * s, swPad = 8.0f * s;
         ImVec2 swC(r.mn.x + swPad + swR, (r.mn.y + r.mx.y) * 0.5f);
         dl->AddCircleFilled(swC, swR, dye(1.0f), 16);
-        dl->AddCircle(swC, swR, ImGui::ColorConvertFloat4ToU32(ImVec4(0, 0, 0, 0.55f)), 16,
+        // Ring that separates the swatch from the row: whatever contrasts with the layer's own
+        // color, so a near-black copper layer stops getting an invisible black outline.
+        ImVec4 swRing = ui::maxContrastTextOn(ImVec4(c.x, c.y, c.z, 1.0f));
+        swRing.w = 0.55f;
+        dl->AddCircle(swC, swR, ImGui::ColorConvertFloat4ToU32(swRing), 16,
                       std::max(1.0f, 1.0f * s));
         const float swRightX = swC.x + swR;
         ImGui::AlignTextToFramePadding();

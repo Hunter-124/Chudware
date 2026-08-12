@@ -3473,8 +3473,10 @@ static bool fmFeaturesHeader(bool* open, bool addEn, bool* addFolder) {
         const bool hov = enabled && ImGui::IsItemHovered();
         if (hov) ui::glassRowBackground(dl, bMin, bMax, 3.0f, false, false, 0.40f);
         const ImVec2 bc((bMin.x + bMax.x) * 0.5f, (bMin.y + bMax.y) * 0.5f);
+        const float* dis = ui::palette.textDisabled;
         const ImU32 col = enabled ? ImGui::ColorConvertFloat4ToU32(fmSurf().textPrimary)
-                                  : ImGui::ColorConvertFloat4ToU32(ImVec4(0.55f, 0.55f, 0.55f, 0.5f));
+                                  : ImGui::ColorConvertFloat4ToU32(
+                                        ImVec4(dis[0], dis[1], dis[2], 0.5f));
         ui::drawIconGlass(dl, iconName, bc, btn * 0.42f, col, fmHalo(fmSurf()));
         if (hov && tip) ImGui::SetTooltip("%s", tip);
         return clicked;

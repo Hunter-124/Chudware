@@ -211,7 +211,8 @@ void drawFlame(float rowH) {
     const float bottom = origin.y + canvasH;
     const ImVec2 mouse = ImGui::GetMousePos();
     const ImU32 border = ui::Palette::toU32(ui::palette.glassBorder);
-    const ImU32 ink = IM_COL32(24, 24, 28, 255);  // dark label ink on the warm fills
+    // Label ink is picked per box against that box's own fill, so a cool-toned module (the
+    // #4E79A7 chudware fill) stops carrying near-black text at ~2:1 contrast.
     const FlameRect* hover = nullptr;
 
     for (const auto& r : s_rects) {
@@ -221,9 +222,12 @@ void drawFlame(float rowH) {
         float y = bottom - (r.depth + 1) * rowH;
         ImVec2 mn(x, y);
         ImVec2 mx(x + (w > 1.0f ? w - 1.0f : w), y + rowH - 1.0f);
-        dl->AddRectFilled(mn, mx, flameColor(r.name), M::rounding(2));
+        const ImU32 fill = flameColor(r.name);
+        dl->AddRectFilled(mn, mx, fill, M::rounding(2));
         dl->AddRect(mn, mx, border, M::rounding(2));
         if (w > M::px(34)) {
+            const ImU32 ink = ImGui::ColorConvertFloat4ToU32(
+                ui::maxContrastTextOn(ImGui::ColorConvertU32ToFloat4(fill)));
             dl->PushClipRect(mn, mx, true);
             dl->AddText(ImVec2(x + M::px(3), y + M::px(1)), ink, r.name.c_str());
             dl->PopClipRect();

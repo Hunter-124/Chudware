@@ -387,8 +387,10 @@ void drawVendorStrip(AppState& st, float paneW) {
         const ImVec2 ts       = ImGui::CalcTextSize(label);
         float x = c0.x + (w - (ts.x + (haveIcon ? iconSz + iconGap : 0.0f))) * 0.5f;
         if (haveIcon) {
-            const ImU32 icol = ui::hasIconSdf(icon) ? Palette::toU32(palette.text)
-                                                    : IM_COL32(255, 255, 255, 255);
+            const ImU32 icol =
+                ui::hasIconSdf(icon)
+                    ? Palette::toU32(palette.text)
+                    : IM_COL32(255, 255, 255, 255);  // gui-lint: allow identity tint, not a color — raster atlas glyphs keep their own pixels
             ui::drawIconGlass(dl, icon, ImVec2(x + iconSz * 0.5f, c0.y + h * 0.5f), iconSz,
                               icol, 0);
             x += iconSz + iconGap;

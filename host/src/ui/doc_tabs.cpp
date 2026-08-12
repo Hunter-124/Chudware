@@ -34,6 +34,10 @@
 
 namespace ui {
 
+// Same platform close-red the window caption uses (#E81123). An OS-standard destructive affordance
+// rather than a theme role, so it must not track dark/light like the rest of the strip.
+static const ImVec4 kTabCloseRed(232.0f / 255.0f, 17.0f / 255.0f, 35.0f / 255.0f, 200.0f / 255.0f);
+
 // Deferred actions, applied after the strip finishes drawing (see header note).
 static int  s_switchTo   = -1;   // tab index to activate, or -1
 static int  s_closeIdx   = -1;   // tab index to close, or -1
@@ -272,7 +276,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     bool xHover = ImGui::IsItemHovered();
     ImVec2 xc(cx + closeW * 0.5f, p0.y + tabH * 0.5f);
     if (xHover)
-        dl->AddCircleFilled(xc, closeW * 0.42f, IM_COL32(232, 17, 35, 200));  // semantic red — kept literal
+        dl->AddCircleFilled(xc, closeW * 0.42f, ImGui::ColorConvertFloat4ToU32(kTabCloseRed));
     // Crisp × : slightly longer arms + thicker stroke so it doesn't read as a broken fleck
     // next to the doc-type icon at HiDPI.
     float g = closeW * 0.26f;

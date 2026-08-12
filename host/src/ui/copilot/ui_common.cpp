@@ -297,53 +297,38 @@ ImVec4 semanticOnGlass(const float role[4], const ui::AdaptiveSurface& surf) {
     return semanticOnTone(role, surf.darkText);
 }
 
-// Per-message mode accent for chat borders (CopilotMode 0..5). mode < 0 → 0 (no border).
-// Agent=blue/accent, Plan=amber, Swarm=teal/cyan, Edit=green, Ask=neutral-gray, Eng.Firm=violet.
-ImU32 modeBorderColor(int mode) {
-    if (mode < 0 || mode > 5) return 0;
+// Per-message mode accent (CopilotMode 0..5). ONE source for both the border and the wash, so the
+// two can never drift: Agent=accent, Plan=amber, Swarm=info blue, Edit=green, Ask=neutral,
+// Eng.Firm=violet. Swarm and Eng.Firm have no chrome-domain role of their own; iterBuilt (the app's
+// secondary-emphasis blue) and sketchExternal (its only violet) are the closest existing ones.
+static const float* modeRole(int mode) {
     const auto& pal = ui::palette;
-    auto withA = [](const float c[4], float a) -> ImU32 {
-        return ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], a));
-    };
     switch (mode) {
-        case 0: return withA(pal.accent, 0.70f);                              // Agent — accent/blue
-        case 1: return withA(pal.statusWarn, 0.75f);                          // Plan — amber
-        case 2: return IM_COL32(40, 190, 200, 180);                           // Swarm — teal/cyan
-        case 3: return withA(pal.statusOk, 0.70f);                            // Edit — green
-        case 4: return IM_COL32(150, 155, 165, 160);                          // Ask — neutral gray
-        case 5: return IM_COL32(150, 90, 220, 180);                           // Eng.Firm — violet
-        default: return 0;
+        case 1:  return pal.statusWarn;
+        case 2:  return pal.iterBuilt;
+        case 3:  return pal.statusOk;
+        case 4:  return pal.textDim;
+        case 5:  return pal.sketchExternal;
+        case 0:
+        default: return pal.accent;
     }
 }
 
-// RGB (0..1) counterpart of modeBorderColor — same palette sources for Agent/Plan/Edit,
-// same fixed hues for Swarm/Ask/Eng.Firm. Used by the mode-selector popup + trigger chip
-// for coloredRowWash gradients (every row gets its mode tint, not only the active one).
+// mode < 0 or > 5 → 0 (no border).
+ImU32 modeBorderColor(int mode) {
+    if (mode < 0 || mode > 5) return 0;
+    static const float kAlpha[6] = {0.70f, 0.75f, 0.71f, 0.70f, 0.63f, 0.71f};
+    const float* r = modeRole(mode);
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(r[0], r[1], r[2], kAlpha[mode]));
+}
+
+// RGB (0..1) counterpart of modeBorderColor. Used by the mode-selector popup + trigger chip for
+// coloredRowWash gradients (every row gets its mode tint, not only the active one).
 void modeAccentRgb(int mode, float out[3]) {
-    const auto& pal = ui::palette;
-    switch (mode) {
-        case 0: // Agent — accent/blue
-            out[0] = pal.accent[0]; out[1] = pal.accent[1]; out[2] = pal.accent[2];
-            break;
-        case 1: // Plan — amber (statusWarn)
-            out[0] = pal.statusWarn[0]; out[1] = pal.statusWarn[1]; out[2] = pal.statusWarn[2];
-            break;
-        case 2: // Swarm — teal/cyan  (matches IM_COL32(40, 190, 200, …))
-            out[0] = 40.f / 255.f; out[1] = 190.f / 255.f; out[2] = 200.f / 255.f;
-            break;
-        case 3: // Edit — green (statusOk)
-            out[0] = pal.statusOk[0]; out[1] = pal.statusOk[1]; out[2] = pal.statusOk[2];
-            break;
-        case 4: // Ask — neutral gray  (matches IM_COL32(150, 155, 165, …))
-            out[0] = 150.f / 255.f; out[1] = 155.f / 255.f; out[2] = 165.f / 255.f;
-            break;
-        case 5: // Eng.Firm — violet  (matches IM_COL32(150, 90, 220, …))
-            out[0] = 150.f / 255.f; out[1] = 90.f / 255.f; out[2] = 220.f / 255.f;
-            break;
-        default:
-            out[0] = pal.accent[0]; out[1] = pal.accent[1]; out[2] = pal.accent[2];
-            break;
-    }
+    const float* r = modeRole(mode);
+    out[0] = r[0];
+    out[1] = r[1];
+    out[2] = r[2];
 }
 
 

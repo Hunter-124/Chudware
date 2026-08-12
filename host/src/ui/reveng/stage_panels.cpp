@@ -65,10 +65,17 @@ const char* const kStrategyLabels[2]  = { "Auto (fits + AI)", "Mesh-body fallbac
 
 // ---- small text helpers ------------------------------------------------------------------------
 
-// Dim explanatory prose. Uses the style's disabled-text role, so no colour literal is involved.
+// The palette's disabled-text role. ImGui's own style copy is a separate mutable slot that any
+// PushStyleColor can shift out from under us; the role is the single source.
+ImVec4 disabledInk() {
+    const float* d = ui::palette.textDisabled;
+    return ImVec4(d[0], d[1], d[2], d[3]);
+}
+
+// Dim explanatory prose.
 void dimWrapped(const char* text) {
     if (!text || !text[0]) return;
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::PushStyleColor(ImGuiCol_Text, disabledInk());
     ImGui::TextWrapped("%s", text);
     ImGui::PopStyleColor();
 }
@@ -846,7 +853,7 @@ void drawScalePanel(AppState& st) {
                     rowX = 0.0f;
                 }
             }
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::PushStyleColor(ImGuiCol_Text, disabledInk());
             ImGui::TextUnformatted(kScaleMethodLabels[i]);
             ImGui::PopStyleColor();
             ImGui::SameLine(0, M::reLabelGap());

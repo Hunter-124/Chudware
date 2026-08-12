@@ -385,6 +385,13 @@ static ImVec4 ribbon_chromeTint(const float base[4]) {
     c.z += (tb - c.z) * m;
     return c;
 }
+// Press feedback scrim: the palette's drop-shadow role at a light alpha, so "click-down" darkening
+// is the same wash on every ribbon button size.
+static ImU32 ribbon_pressScrim() {
+    const float* sh = ui::palette.glassShadow;
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(sh[0], sh[1], sh[2], 40.0f / 255.0f));
+}
+
 
 // Crisp icon draw, centered at (cx, cy), sizePx square. Line-art glyphs render via the SDF
 // re-raster path (sharp at ANY pixel size — the raw atlas blit upscaled 32->36px big-button
@@ -400,8 +407,12 @@ static void ribbon_icon(ImDrawList* dl, const char* name, float cx, float cy, fl
                           : active   ? ui::palette.accent
                                      : ui::palette.text;
         col = ui::Palette::toU32(role);
+    } else if (enabled) {
+        col = IM_COL32(255, 255, 255, 255);  // gui-lint: allow identity tint, not a color — raster glyph keeps its atlas pixels
     } else {
-        col = enabled ? IM_COL32(255, 255, 255, 255) : IM_COL32(128, 128, 128, 160);
+        // Greyed raster glyph: the palette's disabled ink so it desaturates with the theme.
+        const float* dis = ui::palette.textDisabled;
+        col = ImGui::ColorConvertFloat4ToU32(ImVec4(dis[0], dis[1], dis[2], 160.0f / 255.0f));
     }
     ui::drawIconGlass(dl, name, ImVec2(cx, cy), sizePx, col, 0);
 }
@@ -1152,7 +1163,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     // Press feedback: darken the button slightly while the mouse button is held down.
     // Draws over hover/active layers — gives physical "click-down" feel.
     if (mainPress && enabled) {
-        ImU32 pressOverlay = IM_COL32(0, 0, 0, 40);
+        ImU32 pressOverlay = ribbon_pressScrim();
         dl->AddRectFilled(p0, p1, pressOverlay, rnd);
     }
 
@@ -1325,7 +1336,7 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
                                  ImVec2(ax,      ay + hs * 0.5f), aCol);
     }
     if (mainPress && enabled) {
-        dl_sm->AddRectFilled(p0, p1_sm, IM_COL32(0, 0, 0, 40), rnd_sm);
+        dl_sm->AddRectFilled(p0, p1_sm, ribbon_pressScrim(), rnd_sm);
     }
 
     ImGui::PopStyleColor(3);
@@ -1532,7 +1543,7 @@ static void ribbon_sketchFinishBadge(ImDrawList* dl, float cx, float cy, float s
     const float* role = isCheck ? ui::palette.statusOk : ui::palette.statusErr;
     ImVec4 disc(role[0], role[1], role[2], 1.0f);
     dl->AddCircleFilled(ImVec2(bx, by), br, ImGui::ColorConvertFloat4ToU32(disc));
-    const ImU32 gl = IM_COL32(255, 255, 255, 255);
+    const ImU32 gl = ImGui::ColorConvertFloat4ToU32(ui::maxContrastTextOn(disc));
     float lw = ImMax(1.6f * s, br * 0.28f);
     if (isCheck) {
         dl->AddLine(ImVec2(bx - br * 0.45f, by + br * 0.02f),
@@ -1654,7 +1665,7 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
             ribbon_btnActive(dl_s, p0, p1_s, rnd_s);
         }
         if (press && enabled) {
-            dl_s->AddRectFilled(p0, p1_s, IM_COL32(0, 0, 0, 40), rnd_s);
+            dl_s->AddRectFilled(p0, p1_s, ribbon_pressScrim(), rnd_s);
         }
     }
 

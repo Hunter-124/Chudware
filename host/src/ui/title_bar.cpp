@@ -40,6 +40,10 @@
 #include <cstdio>          // snprintf
 #include <cstring>        // std::strcmp (workspace raster-tile gate)
 
+// The Windows caption convention: the close button's hover fill is the platform red #E81123. It is
+// an OS affordance, not a theme role — it must read as "close" identically in dark and light.
+static const ImVec4 kCaptionCloseRed(232.0f / 255.0f, 17.0f / 255.0f, 35.0f / 255.0f, 1.0f);
+
 // ---------------- caption buttons (shared small ui helper) ----------------
 bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
     // C25-W3G: button width tracks uiScale so buttons stay clickable at 1.5x/2.0x.
@@ -50,17 +54,18 @@ bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
     bool hovered = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (hovered) {
-        // Close keeps the Windows-standard caption red (intentional literal); min/max hover
-        // uses the palette role so the wash reads on the light theme too (a white wash on the
-        // near-white light headerBg was invisible).
-        ImU32 bg = kind == BTN_CLOSE ? IM_COL32(232, 17, 35, 255)
+        // min/max hover uses the palette role so the wash reads on the light theme too (a white
+        // wash on the near-white light headerBg was invisible).
+        ImU32 bg = kind == BTN_CLOSE ? ImGui::ColorConvertFloat4ToU32(kCaptionCloseRed)
                                      : ui::Palette::toU32(ui::palette.buttonHovered);
         dl->AddRectFilled(p0, ImVec2(p0.x + size.x, p0.y + size.y), bg);
     }
-    // Caption glyph color from palette so it adapts to light/dark themes.
+    // Caption glyph color from palette so it adapts to light/dark themes; over the close red the
+    // ink is whatever contrasts with that fixed fill.
     const unsigned char fgv = (unsigned char)(ui::palette.captionFg * 255.0f + 0.5f);
-    const ImU32 fg = (hovered && kind == BTN_CLOSE) ? IM_COL32(255, 255, 255, 255)
-                                                    : IM_COL32(fgv, fgv, fgv, 235);
+    const ImU32 fg = (hovered && kind == BTN_CLOSE)
+                         ? ImGui::ColorConvertFloat4ToU32(ui::maxContrastTextOn(kCaptionCloseRed))
+                         : IM_COL32(fgv, fgv, fgv, 235);
     const ImVec2 c(p0.x + size.x * 0.5f, p0.y + size.y * 0.5f);
     const float s = h * 0.16f;  // glyph half-size
     const float th = ui::metrics::stroke(1.4f);  // hairline at 2x DPI

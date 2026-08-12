@@ -49,6 +49,7 @@
 #include "metrics.h"  // ui::metrics::px/stroke — DPI-scaled Settings gutter + usage rings
 #include "tesseract.h"  // ui::drawTesseract + TesseractAnim — Appearance > Brand mark picker
 #include "../ui_theme.h"  // ui::busyLabel — the one inline "working" indicator
+#include "widgets/kit.h"  // ui::kit::sectionHeader — the one accent-caption treatment
 #include "ai/rules_authoring.h"  // ui::drawRulesAuthoringPopup (Settings → AI → Rules → New…)
 #include "copilot/agent_text.h"  // ui::foldToAtlasGlyphs — Rules tab renders Python-authored text
 
@@ -312,16 +313,19 @@ static bool settingsPopupRowCombo(const char* id, int* current,
 
 
 
-// Shared Settings section chrome: accent title + even vertical rhythm across every tab.
-// Prefer this over raw ImGui::SeparatorText so Appearance/General/AI/… share one look.
+// Inline save/validation error ink.
+static ImVec4 settingsErrInk() {
+    const float* e = ui::palette.statusErr;
+    return ImVec4(e[0], e[1], e[2], 1.0f);
+}
+
+// Shared Settings section chrome. A thin wrapper over the app-wide header so Settings shares the
+// one accent-caption treatment (and its vertical rhythm) with every other pane; `first` suppresses
+// the leading gap at the top of a tab.
 static void settingsSectionHeader(const char* title, bool first = false) {
-    const float sc = ui::uiScale;
-    ImGui::Dummy(ImVec2(0, first ? 0.0f : 6.0f * sc));
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 1.0f));
-    ImGui::TextUnformatted(title);
-    ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 1.0f * sc));
+    ui::kit::pushDensity(ui::kit::Density::Cozy);
+    ui::kit::sectionHeader(title, /*icon=*/nullptr, /*trailing=*/nullptr, /*count=*/-1, first);
+    ui::kit::popDensity();
 }
 
 // Frosted glass card around a group of related fields. Auto-height; id must be unique per tab.
@@ -2316,9 +2320,10 @@ static void drawOmpProviderManager(AppState& st) {
             const bool hov = ImGui::IsItemHovered();
             const bool act = ImGui::IsItemActive();
             if (sel || hov || act) {
-                const ImVec4 hc = ImGui::GetStyleColorVec4(
-                    (act && hov) ? ImGuiCol_HeaderActive
-                                 : (hov ? ImGuiCol_HeaderHovered : ImGuiCol_Header));
+                // The roles applyTheme installs into ImGuiCol_Header{,Hovered,Active} — read
+                // directly so a caller's PushStyleColor cannot shift the wash out from under us.
+                const float* hr = (hov || act) ? ui::palette.accentMid : ui::palette.accentSoft;
+                const ImVec4 hc(hr[0], hr[1], hr[2], hr[3]);
                 dl->AddRectFilled(mn, mx, ImGui::ColorConvertFloat4ToU32(hc),
                                   ui::metrics::rounding(6.0f));
             }
@@ -2495,8 +2500,12 @@ static void drawRoleBadge(int roleIdx, float sc) {
     dl->AddCircle(ImVec2(p.x + sz * 0.5f, p.y + sz * 0.5f), sz * 0.48f, border, 16, 1.2f * sc);
     const char* glyph = kRoleIcons[roleIdx];
     const ImVec2 ts = ImGui::CalcTextSize(glyph);
+    // Letter ink picked against the badge's own hue: every kRoleColors entry is a pastel above the
+    // 0.5 luminance split, so white was the low-contrast choice on all fifteen.
+    ImVec4 ink = ui::maxContrastTextOn(col);
+    ink.w = 240.0f / 255.0f;
     dl->AddText(ImVec2(p.x + (sz - ts.x) * 0.5f, p.y + (sz - ts.y) * 0.5f),
-                IM_COL32(255, 255, 255, 240), glyph);
+                ImGui::ColorConvertFloat4ToU32(ink), glyph);
     ImGui::Dummy(ImVec2(sz + 4.0f * sc, sz));
 }
 
@@ -3725,7 +3734,8 @@ static void drawHarnessOrganizationSection(AppState& st, float sc) {
                 ImGui::TextUnformatted(line);
                 ImGui::PopStyleColor();
             } else {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                const float* d = ui::palette.textDisabled;
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(d[0], d[1], d[2], d[3]));
                 ImGui::TextUnformatted(line);
                 ImGui::PopStyleColor();
             }
@@ -6702,8 +6712,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         if (s_globalDirty) {
                             ImGui::Dummy(ImVec2(0, 4.0f * sc));
                             if (!s_globalErr.empty())
-                                ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "%s",
-                                                   s_globalErr.c_str());
+                                ImGui::TextColored(settingsErrInk(), "%s", s_globalErr.c_str());
                             if (ImGui::Button("Save global limits", ImVec2(180.0f * sc, 0))) {
                                 if (updateConfigJson([&](nlohmann::json& j) {
                                         if (!j.contains("agent") || !j["agent"].is_object())
@@ -7474,8 +7483,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         if (s_roleToolsDirty || s_toolOptDirty) {
                             ImGui::Dummy(ImVec2(0, 6.0f * sc));
                             if (!s_toolOptErr.empty()) {
-                                ImGui::TextColored(ImVec4(1,0.4f,0.3f,1), "%s",
-                                                   s_toolOptErr.c_str());
+                                ImGui::TextColored(settingsErrInk(), "%s", s_toolOptErr.c_str());
                             }
                             if (ImGui::Button("Save role tools & options",
                                               ImVec2(240.0f * sc, 0))) {

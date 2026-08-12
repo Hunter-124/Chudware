@@ -5719,12 +5719,14 @@ bool SketchMode::drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin
             if (!worldToScreen(cam, imgMin, vw, vh, c.wx, c.wy, c.wz, s)) continue;
             // DIAG (CHUDWARE_ORIGIN_PICK_DEBUG): mark exactly where the code thinks each datum point is,
             // plus the grab ring, so we can see alignment vs. the click. Remove once verified.
+            // Deliberately a non-palette magenta: diagnostic ink must be impossible to mistake for
+            // real sketch ink in a screenshot, so it must NOT track the theme.
             static const bool kDbg = std::getenv("CHUDWARE_ORIGIN_PICK_DEBUG") != nullptr;
             if (kDbg) {
                 wdl->PushClipRect(imgMin, imgMax, true);
-                wdl->AddCircle(s, grabRadius, IM_COL32(255, 0, 255, 200), 24, 1.5f * ui::uiScale);
-                wdl->AddLine(ImVec2(s.x - 6, s.y), ImVec2(s.x + 6, s.y), IM_COL32(255, 0, 255, 255), 1.5f);
-                wdl->AddLine(ImVec2(s.x, s.y - 6), ImVec2(s.x, s.y + 6), IM_COL32(255, 0, 255, 255), 1.5f);
+                wdl->AddCircle(s, grabRadius, IM_COL32(255, 0, 255, 200), 24, 1.5f * ui::uiScale);  // gui-lint: allow debug-only diagnostic ink
+                wdl->AddLine(ImVec2(s.x - 6, s.y), ImVec2(s.x + 6, s.y), IM_COL32(255, 0, 255, 255), 1.5f);  // gui-lint: allow debug-only diagnostic ink
+                wdl->AddLine(ImVec2(s.x, s.y - 6), ImVec2(s.x, s.y + 6), IM_COL32(255, 0, 255, 255), 1.5f);  // gui-lint: allow debug-only diagnostic ink
                 wdl->PopClipRect();
             }
             float dx = mouse.x - s.x, dy = mouse.y - s.y;
@@ -7780,8 +7782,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             const ImU32 ac = col(pal.accent, 0.95f);
             const ImU32 hc = col(pal.hoverHighlight, 0.9f);
             const ImU32 gc = col(pal.sketchUnder, 0.85f);
-            const ImU32 uCol = IM_COL32(228, 86, 86, 255);    // u / first in-plane axis (red)
-            const ImU32 vCol = IM_COL32(96, 200, 112, 255);   // v / second in-plane axis (green)
+            const ImU32 uCol = col(pal.axisX, 1.0f);   // u / first in-plane axis (red)
+            const ImU32 vCol = col(pal.axisY, 1.0f);   // v / second in-plane axis (green)
             const float uis = ui::uiScale;
             auto inSel = [&](const std::string& id) {
                 return std::find(mpSel_.begin(), mpSel_.end(), id) != mpSel_.end();

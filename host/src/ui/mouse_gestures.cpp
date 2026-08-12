@@ -146,9 +146,9 @@ void MouseGestures::draw(ImDrawList* dl) {
     ImU32 accentFill  = ui::Palette::toU32(pal.accentSoft);
     ImU32 accentLine  = ui::Palette::toU32(pal.accent);
 
-    // Draw the donut background.
+    // Radial background disc, then the inner/outer rings that read it as a donut. (There is no
+    // literal punch-out: a fully transparent AddCircleFilled is a no-op in ImGui.)
     dl->AddCircleFilled(m_center, outer, bgColor, segs * 2);
-    dl->AddCircleFilled(m_center, inner, IM_COL32(0, 0, 0, 0), segs);  // punch-out (transparent)
     dl->AddCircle(m_center, outer, borderColor, segs * 2, 1.5f);
     dl->AddCircle(m_center, inner, borderColor, segs, 1.0f);
 

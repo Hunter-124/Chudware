@@ -12,6 +12,7 @@
 
 #include "graph_force.h"
 #include "graph_thumbs.h"
+#include "graph_changes.h" // cad_graph_changes / watch overlay (the "what changed" rail)
 #include "plm_hub.h"
 
 #include <algorithm>
@@ -122,6 +123,18 @@ struct DescCounts {
   int total() const { return features + sketches + other; }
 };
 
+// One label the canvas would like to paint this frame. Collected before the
+// node paint so the whole set can be ranked and collision-culled: labels used
+// to be drawn unconditionally, and any tight cluster overprinted into mush.
+struct LabelCand {
+  int vi = -1;      // nodes[] index
+  ImVec2 c{};       // disc centre, screen space
+  float r = 0.0f;   // drawn disc radius (includes the selection/blast bump)
+  float persp = 1.0f;
+  int deg = 0;      // whole-graph out+in degree (primary priority)
+  bool forced = false; // selection / hover / search match — never dropped
+};
+
 struct GraphTabState {
   bool available = true; // false after permanent unknown_method
   bool loading = false;
@@ -136,7 +149,7 @@ struct GraphTabState {
   std::vector<GNode> nodes;
   std::vector<GEdge> edges;
   std::unordered_set<std::string> blast; // highlighted node ids (impact set)
-  std::string blastEpicenter;            // node id rings expand from
+  std::string blastEpicenter;            // node id the wave leaves from
   double blastT0 = 0.0;                  // ImGui::GetTime() when blast landed
   // Hop distance from blastEpicenter over visibleEdges, so the shockwave can
   // leave the epicentre ALONG the edges instead of as concentric rings drawn
@@ -144,6 +157,10 @@ struct GraphTabState {
   // does not exist yet when the impact RPC lands.
   std::unordered_map<std::string, int> blastHop;
   bool blastHopDirty = true;
+  // False when the impact set has more internal edges than kBlastEdgeAnimMax:
+  // past that the travelling heads are visual noise AND a per-frame cost, so
+  // the wave animates the nodes only. Set by rebuildBlastHops.
+  bool blastEdgeAnim = false;
   std::string selectedId;
   std::string hoverId;
   char search[128] = {};
@@ -285,8 +302,19 @@ struct GraphTabState {
   // the sort does not allocate every frame at ME489 scale.
   std::vector<int> drawOrder;
   std::vector<float> perspOf; // indexed by nodes[] index
+  // Label occupancy scratch (per frame). labelShown is indexed by nodes[]
+  // index and gates the paint; labelTaken holds the rects already reserved.
+  // Members so the pass does not allocate every frame at ME489 scale.
+  std::vector<LabelCand> labelCand;
+  std::vector<ImRect> labelTaken;
+  std::vector<char> labelShown;
   // Search match cache (rebuilt when the query or visible set changes).
   std::unordered_set<std::string> matchIds;
+  // Query the cache was last built for, and when that query changed. The search
+  // spotlight's breathing ring decays from matchT0, so a data poll (which also
+  // dirties the cache) must not restart it.
+  std::string matchQuery;
+  double matchT0 = 0.0;
   int visMatches = 0;
   int allMatches = 0;
   bool matchDirty = true;
@@ -2857,8 +2885,13 @@ bool graphGlassButton(const char *id, const char *label, bool accent = false,
                                   palette.text[2], held ? 0.10f : 0.06f)),
         9.0f * S);
   }
-  ImU32 tcol =
-      accent ? IM_COL32(255, 255, 255, 255) : Palette::toU32(palette.text);
+  // Ink over the accent fill is DERIVED from that fill, not assumed white: the
+  // accent teal sits at luminance 0.686, where white is the low-contrast choice.
+  ImU32 tcol = accent
+                   ? ImGui::ColorConvertFloat4ToU32(ui::maxContrastTextOn(
+                         ImVec4(palette.accent[0], palette.accent[1],
+                                palette.accent[2], 1.0f)))
+                   : Palette::toU32(palette.text);
   float x = p0.x + (w - content) * 0.5f;
   if (iconSz > 0.0f) {
     ui::drawIconGlass(dl, icon, ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f),
@@ -2896,6 +2929,27 @@ const GNode *instanceTarget(const GraphTabState &G, const GNode &n) {
   // that quadratic.
   auto it = G.instTargetIdx.find(n.id);
   return it == G.instTargetIdx.end() ? nullptr : &G.nodes[it->second];
+}
+
+// Kinds that have an iso render worth billboarding onto the node disc.
+bool renderableKind(const std::string &k) {
+  return k == "part" || k == "assembly" || k == "doc" || k == "drawing";
+}
+
+// Screen radius past which the kind letter dissolves into the real iso render.
+constexpr float kBillboardR = 26.0f;
+// New thumbnail keys admitted per frame. graphThumbEnsure is O(1) for a key it
+// has already seen, but a FIRST touch stats the disk, decodes a PNG and uploads
+// a texture — a zoom sweep across 200 nodes would otherwise do all of that in
+// one frame. Four keeps the sweep's worst frame under a millisecond of I/O and
+// still fills a screenful of billboards within half a second.
+constexpr int kBillboardNewPerFrame = 4;
+
+// Keys already handed to graphThumbEnsure at least once, so only genuinely
+// cold touches are rate-limited. Cleared with the thumbnail cache itself.
+std::unordered_set<std::string> &billboardSeen() {
+  static std::unordered_set<std::string> s;
+  return s;
 }
 
 // ---- hover thumbnails (.step+ package thumbnail.png via miniz)
@@ -3379,9 +3433,27 @@ void buildDrawOrder(GraphTabState &G, const Proj3 &P, float &perspMin,
   });
 }
 
+// Straight U32 lerp in linear-ish sRGB — good enough for tinting one colour
+// toward another over an animation, and it keeps the alpha channel honest.
+ImU32 mixCol(ImU32 a, ImU32 b, float t) {
+  t = std::clamp(t, 0.0f, 1.0f);
+  const ImVec4 x = ImGui::ColorConvertU32ToFloat4(a);
+  const ImVec4 y = ImGui::ColorConvertU32ToFloat4(b);
+  return ImGui::ColorConvertFloat4ToU32(
+      ImVec4(x.x + (y.x - x.x) * t, x.y + (y.y - x.y) * t,
+             x.z + (y.z - x.z) * t, x.w + (y.w - x.w) * t));
+}
+
 ImVec2 lerpPt(ImVec2 a, ImVec2 b, float t) {
   return ImVec2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
 }
+
+// Hops are one kStagger apart by default (20 ms) — far too quick to read as
+// propagation across a dependency chain, so each hop is widened to ~8 of them.
+constexpr int kBlastHopStride = 8;
+// Above this many impact-internal edges the travelling heads stop reading as a
+// wave and start reading as flicker, so the wave animates the nodes only.
+constexpr int kBlastEdgeAnimMax = 400;
 
 // Hop distance from the blast epicentre along the VISIBLE edges. The impact
 // wave travels this, one hop at a time, so the animation shows the dependency
@@ -3390,14 +3462,24 @@ ImVec2 lerpPt(ImVec2 a, ImVec2 b, float t) {
 void rebuildBlastHops(GraphTabState &G) {
   G.blastHopDirty = false;
   G.blastHop.clear();
+  G.blastEdgeAnim = false;
   if (G.blastEpicenter.empty() || G.visibleEdges.empty())
     return;
+  // Adjacency over IMPACT-INTERNAL edges only. The wave must trace the
+  // dependency path the change propagates down, so an edge leaving the impact
+  // set is not part of it — and restricting the walk here yields the animatable
+  // edge count for free.
   std::unordered_map<std::string, std::vector<const std::string *>> adj;
-  adj.reserve(G.visibleEdges.size() * 2);
+  adj.reserve(G.blast.size() * 2);
+  int impactEdges = 0;
   for (const auto &e : G.visibleEdges) {
+    if (!G.blast.count(e.src) || !G.blast.count(e.dst))
+      continue;
     adj[e.src].push_back(&e.dst);
     adj[e.dst].push_back(&e.src);
+    ++impactEdges;
   }
+  G.blastEdgeAnim = impactEdges > 0 && impactEdges <= kBlastEdgeAnimMax;
   std::vector<const std::string *> q;
   q.reserve(G.blast.size() + 1);
   G.blastHop[G.blastEpicenter] = 0;
@@ -3415,10 +3497,6 @@ void rebuildBlastHops(GraphTabState &G) {
     }
   }
 }
-
-// Hops are one kStagger apart by default (20 ms) — far too quick to read as
-// propagation across a dependency chain, so each hop is widened to ~8 of them.
-constexpr int kBlastHopStride = 8;
 
 int blastHopOf(const GraphTabState &G, const std::string &id) {
   auto it = G.blastHop.find(id);
@@ -3485,6 +3563,10 @@ void rebuildMatchCache(GraphTabState &G) {
     }
   }
   G.matchDirty = false;
+  if (G.matchQuery != G.search) {
+    G.matchQuery = G.search;
+    G.matchT0 = ImGui::GetTime();
+  }
 }
 
 // ---- legend -----------------------------------------------------------------
@@ -4220,6 +4302,40 @@ void drawSidePanel(AppState &st, float panelW) {
   ImGui::PopStyleVar();
 }
 
+// RAII guard around an ImDrawListSplitter, used by the search spotlight to lift
+// matches above one even scrim. Merging is the whole point: an unmerged splitter
+// does not assert, it silently corrupts every later primitive in the window, so
+// the destructor merges if the caller has not and no early return can leak one.
+// A null draw list makes the whole guard inert, which is how the not-filtering
+// path pays nothing.
+class ChannelSplit {
+public:
+  ChannelSplit(ImDrawList *dl, int channels) : dl_(dl) {
+    if (!dl_)
+      return;
+    split_.Split(dl_, channels);
+    active_ = true;
+  }
+  ChannelSplit(const ChannelSplit &) = delete;
+  ChannelSplit &operator=(const ChannelSplit &) = delete;
+  ~ChannelSplit() { merge(); }
+  void setChannel(int c) {
+    if (active_)
+      split_.SetCurrentChannel(dl_, c);
+  }
+  void merge() {
+    if (!active_)
+      return;
+    active_ = false;
+    split_.Merge(dl_);
+  }
+
+private:
+  ImDrawList *dl_ = nullptr;
+  ImDrawListSplitter split_;
+  bool active_ = false;
+};
+
 void drawCanvas(AppState &st, ImVec2 canvasSz) {
   auto &G = S();
   const float S = ui::uiScale;
@@ -4485,6 +4601,45 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     return e.src == focusId || e.dst == focusId;
   };
 
+  // ---- Impact shockwave timing ---------------------------------------------
+  // Light leaves the epicentre ALONG the edges, one hop at a time, so the
+  // animation traces the dependency path the change actually propagates down.
+  // The BFS runs once per blast (or per visible-set change), never per frame —
+  // it needs visibleEdges, which does not exist when the impact RPC lands.
+  const bool blastLive =
+      !G.blast.empty() && G.blastT0 > 0.0 && !G.blastEpicenter.empty();
+  if (blastLive && G.blastHopDirty)
+    rebuildBlastHops(G);
+  // 0 before the wave reaches this node, 1 once it has passed. stagger() pumps
+  // frames while any hop is still moving and stops the moment all have landed.
+  auto blastWave = [&](const std::string &id) -> float {
+    return ui::anim::stagger(G.blastT0, blastHopOf(G, id) * kBlastHopStride,
+                             ui::anim::kBase);
+  };
+
+  // ---- Search spotlight ----------------------------------------------------
+  // Two channels: 0 is the world, 1 is one even scrim plus the matches that sit
+  // above it. That replaces per-element alpha dimming — which was correct but
+  // flat, and cost a branch on every edge and node — with a single rect, and it
+  // means a match keeps its true colour instead of everything else losing its.
+  ChannelSplit spot(filtering ? dl : nullptr, 2);
+  if (filtering) {
+    spot.setChannel(1);
+    dl->AddRectFilled(
+        origin, ImVec2(origin.x + canvasSz.x, origin.y + canvasSz.y),
+        ImGui::GetColorU32(ImVec4(palette.panelBg[0], palette.panelBg[1],
+                                  palette.panelBg[2], 0.55f)));
+    spot.setChannel(0);
+  }
+  // Breathing amplitude for the match rings: full for ~4 s after the query
+  // changes, then zero. A ring that pulses forever is a distraction AND it pins
+  // the frame pump at 60 fps for as long as a query sits in the box.
+  const float spotAmp =
+      filtering ? 1.0f - std::clamp((float)((ImGui::GetTime() - G.matchT0) /
+                                            4.0),
+                                    0.0f, 1.0f)
+                : 0.0f;
+
   // ---- Containment bubble outlines (under edges) --------------------------
   // Nested packing makes every parent a bubble of its contents; outline it
   // so assembly/part nesting reads at a glance. LOD-culled when tiny.
@@ -4551,15 +4706,21 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     ImVec2 p0 = nodeScreen(a, perspA);
     ImVec2 p1 = nodeScreen(b, perspB);
 
-    bool dimf = filtering && !G.matchIds.count(a.id) && !G.matchIds.count(b.id);
+    // Spotlight: an edge is lit only when BOTH endpoints match, so a half-lit
+    // line never runs out of the spotlight and into the scrim. Lit edges go to
+    // the channel above the scrim; everything else keeps its normal colour and
+    // is dimmed uniformly by the scrim instead of per-element alpha.
+    const bool edgeLit =
+        !filtering ||
+        (G.matchIds.count(a.id) != 0 && G.matchIds.count(b.id) != 0);
+    if (filtering)
+      spot.setChannel(edgeLit ? 1 : 0);
     bool incident = edgeIncident(e);
     bool selEdge = (ei == G.selectedEdge);
     bool authored = (e.origin == "manual" || e.origin == "ai");
 
     float alpha;
-    if (dimf)
-      alpha = 0.08f;
-    else if (selEdge)
+    if (selEdge)
       alpha = 1.0f;
     else if (!G.blast.empty() && !incident)
       alpha = 0.07f;
@@ -4574,17 +4735,17 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       alpha *= std::clamp(0.5f * (perspA + perspB), 0.55f, 1.0f);
 
     ImU32 col = edgeColor(e.kind, alpha);
-    if (authored && !dimf && (incident || selEdge || !incidenceDim))
+    if (authored && (incident || selEdge || !incidenceDim))
       col =
           ImGui::GetColorU32(ImVec4(palette.accent[0], palette.accent[1],
                                     palette.accent[2], selEdge ? 1.0f : 0.85f));
-    else if (incident && !G.blast.empty() && !dimf)
+    else if (incident && !G.blast.empty())
       col = ImGui::GetColorU32(ImVec4(palette.statusWarn[0],
                                       palette.statusWarn[1],
                                       palette.statusWarn[2], 0.90f));
     // A stale external reference outranks every other edge colour: it is the
     // one that silently produces wrong geometry downstream.
-    if (e.stale && !dimf)
+    if (e.stale)
       col = ui::kit::toneU32(ui::kit::Tone::Err, std::max(alpha, 0.80f));
     // Atmospheric perspective, from the midpoint depth of the two endpoints.
     col = hazeCol(col, hazeK(0.5f * (perspA + perspB)));
@@ -4593,7 +4754,7 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       continue; // viewport cull
     float thick = (edgeLod   ? 1.0f
                    : selEdge ? 3.0f
-                             : (incident && !dimf ? 2.2f : 1.3f)) *
+                             : (incident ? 2.2f : 1.3f)) *
                   S;
     // Dashed = "this link is not a solid fact": inferred/AI-authored, an edge
     // leaving a suppressed feature, or a stale external ref. Stale dashes even
@@ -4606,8 +4767,28 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     else
       dl->AddLine(p0, p1, col, thick);
 
-    // Dimensional / aggregation label at midpoint when zoomed in.
-    if (!edgeLod && !dimf && alpha > 0.2f && G.zoom >= 0.8f) {
+    // Shockwave head: a bright segment running this edge during the hop that
+    // reaches its FAR endpoint, so the light visibly leaves the epicentre and
+    // travels outward instead of appearing everywhere at once.
+    if (blastLive && G.blastEdgeAnim && G.blast.count(e.src) &&
+        G.blast.count(e.dst)) {
+      const int ha = blastHopOf(G, e.src), hb = blastHopOf(G, e.dst);
+      if (ha != hb) {
+        const float wv = ui::anim::stagger(
+            G.blastT0, std::max(ha, hb) * kBlastHopStride, ui::anim::kBase);
+        if (wv > 0.0f && wv < 1.0f) {
+          const ImVec2 pn = (ha < hb) ? p0 : p1;
+          const ImVec2 pf = (ha < hb) ? p1 : p0;
+          const float tail = std::max(0.0f, wv - 0.35f);
+          dl->AddLine(lerpPt(pn, pf, tail), lerpPt(pn, pf, wv),
+                      ui::kit::toneU32(ui::kit::Tone::Warn, 0.95f), 3.0f * S);
+        }
+      }
+    }
+
+    // Dimensional / aggregation label at midpoint when zoomed in. Suppressed on
+    // unlit edges: under the scrim it is unreadable noise.
+    if (!edgeLod && edgeLit && alpha > 0.2f && G.zoom >= 0.8f) {
       std::string lab = e.dimLabel;
       if (e.aggCount > 1) {
         char buf[48];
@@ -4625,6 +4806,8 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       }
     }
   }
+  if (filtering)
+    spot.setChannel(0); // back to the world for the hit-test and blast flash
 
   // ---- Hit-test VISIBLE nodes ---------------------------------------------
   G.hoverId.clear();
@@ -4821,39 +5004,119 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   }
 
   // ---- Nodes (visibleIdx only) --------------------------------------------
-  // ---- Blast ripple rings (expanding from epicenter) ----------------------
-  if (!G.blast.empty() && G.blastT0 > 0.0 && !G.blastEpicenter.empty()) {
+  // ---- Blast: epicentre flash ---------------------------------------------
+  // ONE ring, during hop 0 only. Three concentric rings expanding over
+  // unrelated geometry claimed a blast radius the dependency graph does not
+  // have; the wave itself now travels the edges, so this is just "it started
+  // here".
+  if (blastLive) {
     auto eit = G.idIndex.find(G.blastEpicenter);
     if (eit != G.idIndex.end()) {
-      const GNode &en = G.nodes[eit->second];
-      ImVec2 ec = toScreen(en.lx, en.ly, en.lz);
-      const float t = (float)(ImGui::GetTime() - G.blastT0);
-      if (t >= 0.0f && t < 1.25f) {
-        const float u = std::clamp(t / 1.2f, 0.0f, 1.0f);
-        // Ease-out: fast start, slow end.
-        const float ease = 1.0f - (1.0f - u) * (1.0f - u);
-        for (int i = 0; i < 3; ++i) {
-          const float rr = ease * 200.0f * S * (float)(i + 1) / 3.0f * G.zoom;
-          const float fade = (1.0f - u) * (1.0f - 0.2f * (float)i);
-          ImU32 rc = ImGui::GetColorU32(
-              ImVec4(palette.statusWarn[0], palette.statusWarn[1],
-                     palette.statusWarn[2], 0.55f * fade));
-          dl->AddCircle(ec, rr, rc, 48, (2.0f - 0.4f * (float)i) * S);
-        }
+      const float w0 = ui::anim::stagger(G.blastT0, 0, ui::anim::kSlow);
+      if (w0 < 1.0f) {
+        const GNode &en = G.nodes[eit->second];
+        const ImVec2 ec = toScreen(en.lx, en.ly, en.lz);
+        const float ease = ui::anim::easeOut(w0);
+        dl->AddCircle(ec, (en.radius + ease * 60.0f) * G.zoom,
+                      ui::kit::toneU32(ui::kit::Tone::Warn,
+                                       0.60f * (1.0f - w0)),
+                      48, 2.0f * S);
       }
     }
   }
 
   const bool projectScope = G.scopeDocId.empty();
-  // Label LOD: with few nodes on screen, label everything; otherwise only
-  // hovered/selected/search-matched nodes (text is the draw bottleneck).
+  // Label geometry — ONE definition, shared by the occupancy pass below and
+  // the paint, so a reserved rect can never disagree with the pixels drawn.
+  auto labelGeom = [&](ImVec2 c, float r, const char *lab, ImVec2 &ts,
+                       float &drawW, ImVec2 &tp) {
+    ts = ImGui::CalcTextSize(lab);
+    const float maxW = 140.0f * S * std::max(0.8f, G.zoom);
+    drawW = std::min(ts.x, maxW);
+    tp = ImVec2(c.x - drawW * 0.5f, c.y + r + 3 * S);
+  };
+  const float labelPadX = 3.0f * S, labelPadY = 1.0f * S;
+  auto labelRect = [&](ImVec2 tp, float drawW, ImVec2 ts) {
+    // The halo rect the paint lays down, plus a 2 px breathing gap so two
+    // accepted labels never end up flush against each other.
+    return ImRect(tp.x - labelPadX - 2.0f * S, tp.y - labelPadY,
+                  tp.x + drawW + labelPadX + 2.0f * S,
+                  tp.y + ts.y + labelPadY);
+  };
+
+  // ---- Label occupancy pass ------------------------------------------------
+  // Labels were painted unconditionally, so any tight cluster overprinted into
+  // an unreadable stack. Rank the candidates and drop any whose backing rect
+  // already overlaps a reserved one. Nothing becomes unreachable: the hover
+  // tooltip still names every node.
   int onScreenNodes = 0;
-  for (int vi : G.visibleIdx) {
+  G.labelCand.clear();
+  for (int vi : G.drawOrder) {
     const GNode &n = G.nodes[vi];
-    if (onScreen(toScreen(n.lx, n.ly, n.lz)))
-      ++onScreenNodes;
+    float persp = 1.0f;
+    const ImVec2 c = nodeScreen(n, persp);
+    if (!onScreen(c))
+      continue;
+    ++onScreenNodes;
+    if (n.label.empty())
+      continue;
+    const bool isMatch = filtering && G.matchIds.count(n.id) > 0;
+    if (filtering && !isMatch)
+      continue; // under the spotlight scrim — its label is noise
+    LabelCand lc;
+    lc.vi = vi;
+    lc.c = c;
+    lc.persp = persp;
+    const bool sel = (n.id == G.selectedId);
+    lc.r = n.radius * persp * G.zoom +
+           ((sel || G.blast.count(n.id)) ? 2.0f * S : 0.0f);
+    auto dg = G.degree.find(n.id);
+    lc.deg = dg == G.degree.end() ? 0 : dg->second.first + dg->second.second;
+    lc.forced = sel || n.id == G.hoverId || isMatch;
+    G.labelCand.push_back(lc);
   }
   const bool labelAll = onScreenNodes <= 150;
+  // Descending priority: forced first (they reserve their space, so a
+  // lower-priority neighbour is the one that drops), then whole-graph degree —
+  // the hub of a cluster is the label worth keeping — then screen radius, then
+  // nearest-first in 3D. vi last so ties resolve identically every frame and
+  // labels cannot flicker between two indistinguishable nodes.
+  std::sort(G.labelCand.begin(), G.labelCand.end(),
+            [](const LabelCand &a, const LabelCand &b) {
+              if (a.forced != b.forced)
+                return a.forced;
+              if (a.deg != b.deg)
+                return a.deg > b.deg;
+              if (a.r != b.r)
+                return a.r > b.r;
+              if (a.persp != b.persp)
+                return a.persp > b.persp;
+              return a.vi < b.vi;
+            });
+  G.labelShown.assign(G.nodes.size(), 0);
+  G.labelTaken.clear();
+  for (const LabelCand &lc : G.labelCand) {
+    if (!lc.forced && !((labelAll && G.zoom >= 0.35f) || G.zoom >= 0.9f))
+      continue; // LOD: text is the draw bottleneck on a wide web
+    ImVec2 ts, tp;
+    float drawW = 0.0f;
+    labelGeom(lc.c, lc.r, G.nodes[lc.vi].label.c_str(), ts, drawW, tp);
+    const ImRect rc = labelRect(tp, drawW, ts);
+    if (!lc.forced) {
+      bool clash = false;
+      for (const ImRect &t : G.labelTaken)
+        if (t.Overlaps(rc)) {
+          clash = true;
+          break;
+        }
+      if (clash)
+        continue;
+    }
+    G.labelTaken.push_back(rc);
+    G.labelShown[static_cast<size_t>(lc.vi)] = 1;
+  }
+  // Cold-thumbnail admissions left this frame (see kBillboardNewPerFrame).
+  int billboardBudget = kBillboardNewPerFrame;
   for (int vi : G.drawOrder) {
     const GNode &n = G.nodes[vi];
     float persp = 1.0f;
@@ -4865,25 +5128,35 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     bool sel = (n.id == G.selectedId);
     bool hov = (n.id == G.hoverId);
     bool inBlast = G.blast.count(n.id) > 0;
+    // Spotlight: a match is painted above the scrim at its true brightness, so
+    // its own alpha is no longer collapsed to 0.18 — the scrim does the dimming
+    // for the whole world in one rect. Selection and hover ride up with it,
+    // because the occupancy pass forces THEIR labels and a label above the
+    // scrim over a disc below it would read as a floating orphan.
+    if (filtering)
+      spot.setChannel((dim && !sel && !hov) ? 0 : 1);
     // Soft-dim non-incident nodes when something is focused; blast dims harder.
     bool nonIncident =
         incidenceDim && !sel && !hov && !inBlast && n.id != focusId;
     float a;
-    if (dim)
-      a = 0.18f;
-    else if (!G.blast.empty() && nonIncident)
+    if (!G.blast.empty() && nonIncident)
       a = 0.07f;
     else if (nonIncident)
       a = 0.45f;
     else
       a = 1.0f;
     ImU32 fill = kindColor(n.kind, 0.85f * a);
-    if (inBlast && !dim) {
+    // How far the shockwave has got at THIS node. The warm tint and halo below
+    // fade in with it, so a five-hop impact set arrives as five waves rather
+    // than as one instantaneous flash.
+    const float blastW = (inBlast && blastLive) ? blastWave(n.id) : 0.0f;
+    if (inBlast && !dim && blastW > 0.0f) {
       // Warm tint on blast members so impact reads differently from selection.
-      fill = ImGui::GetColorU32(
+      const ImU32 warm = ImGui::GetColorU32(
           ImVec4(palette.statusWarn[0] * 0.55f + palette.accent[0] * 0.15f,
                  palette.statusWarn[1] * 0.45f + 0.15f,
                  palette.statusWarn[2] * 0.20f, 0.88f * a));
+      fill = mixCol(fill, warm, blastW);
     }
     ImU32 ring = Palette::toU32(palette.border);
     // Rim slot precedence: selection / blast / hover while active, then vault
@@ -4938,6 +5211,68 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     } else {
       dl->AddCircleFilled(c, r, fill, 24);
     }
+    // Iso billboard: past kBillboardR the kind letter stops being the most
+    // useful thing in the disc — the part itself is. The kind ring and any
+    // lifecycle rim stay on top, so identity is never traded for the picture.
+    // Instance nodes MUST resolve INSTANCE_OF first: their own path is the
+    // CONTAINING assembly, so the raw path renders the parent every time.
+    float billT = 0.0f;
+    // !dim: under the search scrim a billboard is invisible detail, and the
+    // cold-thumbnail budget belongs to whatever the user is actually hunting.
+    if (!n.metaSuppressed && !dim) {
+      const GNode *bt = instanceTarget(G, n);
+      const GNode &bn = bt ? *bt : n;
+      if (renderableKind(bn.kind) && !bn.path.empty()) {
+        const ImGuiID bid = ImGui::GetID(n.id.c_str());
+        const bool want = r >= kBillboardR;
+        // peek() so a disc nowhere near the threshold never even allocates a
+        // tween slot: at ME489 scale that would be a table entry per node.
+        if (want || ui::anim::peek(bid) > 0.004f)
+          billT = ui::anim::toward(bid, want ? 1.0f : 0.0f, ui::anim::kFast);
+        GraphGridThumb th;
+        if (billT > 0.01f) {
+          const std::string abs = resolveNodeAbsPath(st, bn);
+          if (!abs.empty()) {
+            const std::string tkey = graphThumbKey(bn.metaDh, bn.metaMt, abs);
+            auto &seen = billboardSeen();
+            if (seen.count(tkey)) {
+              th = graphThumbEnsure(st, G.projectDir, tkey, abs);
+            } else if (billboardBudget > 0) {
+              --billboardBudget;
+              seen.insert(tkey);
+              th = graphThumbEnsure(st, G.projectDir, tkey, abs);
+            }
+          }
+        }
+        // r >= 1: AddImageRounded degrades to a SQUARE AddImage below a 0.5 px
+        // corner radius, which would flash a rectangle mid-dissolve.
+        if (th.tex && th.w > 0 && th.h > 0 && r >= 1.0f) {
+          // Centre-crop to a square: the mask is circular, so a non-square
+          // render stretched to fit would distort the part.
+          float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+          if (th.w > th.h) {
+            const float f = 0.5f * (1.0f - (float)th.h / (float)th.w);
+            u0 = f;
+            u1 = 1.0f - f;
+          } else if (th.h > th.w) {
+            const float f = 0.5f * (1.0f - (float)th.w / (float)th.h);
+            v0 = f;
+            v1 = 1.0f - f;
+          }
+          // rounding == r turns the rounded-rect path into the circular mask,
+          // and hazing the identity tint keeps a far billboard behind the haze
+          // instead of punching through it.
+          dl->AddImageRounded(
+              (ImTextureID)(intptr_t)th.tex, ImVec2(c.x - r, c.y - r),
+              ImVec2(c.x + r, c.y + r), ImVec2(u0, v0), ImVec2(u1, v1),
+              hazeCol(ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, billT * a)),
+                      k),
+              r);
+        } else {
+          billT = 0.0f; // nothing to dissolve into — keep the kind glyph
+        }
+      }
+    }
     dl->AddCircle(c, r, ring, 24, (sel || inBlast ? 2.6f : 1.4f) * S);
     // Project tint displaced by the lifecycle rim — kept as a thinner outer
     // ring so a cross-project Released part still reads as foreign.
@@ -4951,14 +5286,31 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       dl->AddCircle(c, r + 4.5f * S,
                     hazeCol(ui::kit::toneU32(ui::kit::Tone::Err, 0.85f * a), k),
                     24, 1.6f * S);
+    // Spotlight ring on a search match: breathes while spotAmp is alive, then
+    // holds steady. pulse() is only called while it is still breathing, so a
+    // settled query lets the app fall back to its 20 Hz idle.
+    if (filtering && !dim) {
+      float sp = 0.5f;
+      if (spotAmp > 0.002f)
+        sp = 0.5f + 0.5f * spotAmp *
+                        (2.0f * ui::anim::pulse(ui::anim::kBreathe) - 1.0f);
+      // Each literal scaled individually rather than the group: (5 + 3*sp) * S is correct but
+      // the scale lint can only see a scale token adjacent to a literal, and a suppression here
+      // would be hiding a true positive's warning for a false one.
+      dl->AddCircle(c, r + 5.0f * S + 3.0f * S * sp,
+                    ui::kit::toneU32(ui::kit::Tone::Accent,
+                                     0.55f + 0.35f * sp),
+                    32, 1.8f * S);
+    }
     // Pulsing outer halo on blast nodes (distinct from selection accent).
-    if (inBlast && !dim) {
-      const float pulse =
-          0.55f + 0.45f * std::sin((float)ImGui::GetTime() * 4.0f);
-      ImU32 halo = ImGui::GetColorU32(
-          ImVec4(palette.statusWarn[0], palette.statusWarn[1],
-                 palette.statusWarn[2], 0.35f * pulse * a));
-      dl->AddCircle(c, r + (4.0f + 3.0f * pulse) * S, halo, 28, 2.0f * S);
+    // ui::anim::pulse, NOT std::sin(GetTime()*k): a raw sine paints whatever
+    // phase the next frame happens to land on, and the app idles at 20 Hz the
+    // instant the pointer stops — so the "pulse" stepped instead of breathing.
+    if (inBlast && !dim && blastW > 0.01f) {
+      const float pl = 0.55f + 0.45f * ui::anim::pulse(ui::anim::kBreathe);
+      const ImU32 halo =
+          ui::kit::toneU32(ui::kit::Tone::Warn, 0.35f * pl * a * blastW);
+      dl->AddCircle(c, r + (4.0f + 3.0f * pl) * S, halo, 28, 2.0f * S);
     }
     if (hov && !dim)
       dl->AddCircleFilled(
@@ -4967,8 +5319,10 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
               ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.55f)),
           12);
 
-    // Kind glyph inside the disc once it's big enough on screen.
-    if (r >= 9.0f) {
+    // Kind glyph inside the disc once it's big enough on screen — dissolved out
+    // by whatever the billboard has faded in, so the two never fight.
+    const float glyphA = (dim ? 0.5f : 0.95f) * (1.0f - billT);
+    if (r >= 9.0f && glyphA > 0.02f) {
       const char *glyph = kindShort(n.kind);
       ImVec2 gs = ImGui::CalcTextSize(glyph);
       if (gs.x <= r * 1.6f) {
@@ -4976,36 +5330,33 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
         // is no fill to knock out of, so it inverts to the kind colour.
         const ImU32 gc =
             n.metaSuppressed
-                ? hazeCol(kindColor(n.kind, dim ? 0.5f : 0.95f), k)
+                ? hazeCol(kindColor(n.kind, glyphA), k)
                 : ImGui::GetColorU32(ImVec4(palette.panelBg[0],
                                             palette.panelBg[1],
-                                            palette.panelBg[2],
-                                            dim ? 0.5f : 0.95f));
+                                            palette.panelBg[2], glyphA));
         dl->AddText(ImVec2(c.x - gs.x * 0.5f, c.y - gs.y * 0.5f), gc, glyph);
       }
     }
 
-    // Labels: LOD-gated (few on screen, or zoomed, or focused/matched).
-    const bool showLabel =
-        !dim && ((labelAll && G.zoom >= 0.35f) || sel || hov ||
-                 (filtering && G.matchIds.count(n.id)) || G.zoom >= 0.9f);
+    // Labels: the occupancy pass above already applied the LOD gate and culled
+    // every colliding rect, so the paint just honours its verdict.
+    const bool showLabel = G.labelShown[static_cast<size_t>(vi)] != 0;
     if (showLabel) {
       const char *lab = n.label.c_str();
-      ImVec2 ts = ImGui::CalcTextSize(lab);
-      float maxW = 140.0f * S * std::max(0.8f, G.zoom);
-      float drawW = std::min(ts.x, maxW);
+      ImVec2 ts, tp;
+      float drawW = 0.0f;
+      labelGeom(c, r, lab, ts, drawW, tp);
+      const float maxW = 140.0f * S * std::max(0.8f, G.zoom);
       ImU32 tc = ImGui::GetColorU32(ImVec4(palette.text[0], palette.text[1],
                                            palette.text[2],
                                            sel || hov ? 1.0f : 0.90f));
-      ImVec2 tp(c.x - drawW * 0.5f, c.y + r + 3 * S);
 
       // Subtle dark halo/backing rect for legibility over edges.
-      const float padX = 3.0f * S, padY = 1.0f * S;
       ImU32 halo = ImGui::GetColorU32(ImVec4(
           palette.panelBg[0], palette.panelBg[1], palette.panelBg[2], 0.72f));
-      dl->AddRectFilled(ImVec2(tp.x - padX, tp.y - padY),
-                        ImVec2(tp.x + drawW + padX, tp.y + ts.y + padY), halo,
-                        3.0f * S);
+      dl->AddRectFilled(ImVec2(tp.x - labelPadX, tp.y - labelPadY),
+                        ImVec2(tp.x + drawW + labelPadX, tp.y + ts.y + labelPadY),
+                        halo, 3.0f * S);
 
       if (ts.x > maxW) {
         dl->PushClipRect(tp, ImVec2(tp.x + maxW, tp.y + ts.y), true);
@@ -5042,6 +5393,10 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       }
     }
   }
+  // World paint done: fold the scrim + matches back down before anything else
+  // touches this draw list. The guard would do it, but doing it HERE keeps the
+  // tooltip and the empty/loading overlays out of the split entirely.
+  spot.merge();
 
   // Tooltip (optional package thumbnail for part/asm/doc).
   if (!G.hoverId.empty() && hovered) {
@@ -5786,6 +6141,7 @@ void plmGraphOnProjectChanged() {
   G.listViewUserOverride = false;
   G.gridView = false;
   graphThumbsReset();
+  billboardSeen().clear(); // stale keys would bypass the per-frame cold budget
   G.asmView = false;
   G.projPosStash.clear();
   G.asmPosStash.clear();
@@ -6101,6 +6457,24 @@ void plmDrawGraphPage(AppState &st) {
                               : "Re-fetch the project graph from the backend.",
                           !G.loading))
     requestGraph(st, /*force=*/true);
+  // "What changed since I last looked?" — the one question this tab could not answer at all.
+  // cad_graph_changes has been registered, contracted and tested on the worker the whole time and
+  // the GUI simply never called it (6 of 18 cad_graph_* RPCs were reachable). It is a TOGGLE, and
+  // fetching is a SEPARATE explicit gesture inside the rail, because the worker's diff runs a full
+  // forced rebuild — wiring it into the poll path or the focus-regain refresh would turn a 20 Hz
+  // idle app into a rebuild treadmill.
+  if (ui::plmgraph::changesAvailable() && !G.projectDir.empty()) {
+    ImGui::SameLine();
+    const int nch = ui::plmgraph::changesCount();
+    std::string lbl = "Changes";
+    if (nch > 0) lbl += " " + ui::kit::fmtCount(nch);
+    bool on = ui::plmgraph::changesActive();
+    if (ui::kit::toggleChip(lbl.c_str(), &on, ui::kit::Tone::Accent,
+                            on ? "Hide the changes rail."
+                               : "Show what was added or removed since the last cached build "
+                                 "of this project."))
+      ui::plmgraph::toggleChanges(st, G.projectDir, G.linkedProjects);
+  }
   if (!G.listView && !G.gridView) {
     ImGui::SameLine();
     if (ui::kit::iconButton("##graph_fit", "zoom_fit",
@@ -6417,7 +6791,25 @@ void plmDrawGraphPage(AppState &st) {
   ImGui::EndChild();
 
   ImGui::SameLine(0, gap);
-  drawSidePanel(st, sideW);
+  // The changes rail takes the inspector's column while the overlay is on: the two answer
+  // different questions and there is no room for both. A clicked row returns a node id, and we
+  // centre the camera on it rather than only selecting it, so "what changed" and "where is it"
+  // are one gesture.
+  if (ui::plmgraph::changesActive()) {
+    ImGui::BeginChild("##graph_changes_rail", ImVec2(sideW, 0), false,
+                      ImGuiWindowFlags_NoSavedSettings);
+    const std::string jump = ui::plmgraph::drawChangesRail(st);
+    ImGui::EndChild();
+    if (!jump.empty()) {
+      const auto it = G.idIndex.find(jump);
+      if (it != G.idIndex.end()) {
+        G.selectedId = jump;
+        centerOnNode(G, G.nodes[it->second], csz);
+      }
+    }
+  } else {
+    drawSidePanel(st, sideW);
+  }
 
   ImGui::EndChild();
 
@@ -6432,8 +6824,6 @@ void plmDrawGraphPage(AppState &st) {
     ImGui::Combo("kind##lk", &G.linkKindIdx, kEdgeKinds,
                  IM_ARRAYSIZE(kEdgeKinds));
     ImGui::SetNextItemWidth(220 * S);
-    ImGui::InputTextWithHint("##lknote", "note (optional)", G.linkNote,
-                             sizeof(G.linkNote));
     if (ImGui::Button("Create")) {
       int ki = std::clamp(G.linkKindIdx, 0, (int)IM_ARRAYSIZE(kEdgeKinds) - 1);
       requestLinkAdd(st, G.linkArmSrc, G.linkPopupDst, kEdgeKinds[ki],

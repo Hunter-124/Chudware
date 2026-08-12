@@ -255,7 +255,11 @@ void drawImageLightbox(AppState& st) {
     if (begun) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 sEnd(wpos.x + wsz.x, wpos.y + wsz.y);
-        dl->AddRectFilled(wpos, sEnd, IM_COL32(0, 0, 0, 140));   // ~55% dim
+        // ~55% dim: the app's drop-shadow role, so the scrim is the same black everywhere.
+        const float* sh = ui::palette.glassShadow;
+        dl->AddRectFilled(wpos, sEnd,
+                          ImGui::ColorConvertFloat4ToU32(
+                              ImVec4(sh[0], sh[1], sh[2], 140.0f / 255.0f)));
 
         // Same cache the tile filled: opening a thumbnailed chip is a map hit, not an upload.
         const ::Tex& tex   = texFor(g_lbPath);

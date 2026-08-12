@@ -25,6 +25,7 @@
 #include "section_tool.h"    // C25 W3-J: section-view tool (another agent owns impl)
 #include "cam/cam_panel.h"   // CAM: viewport toolpath backplot overlay
 #include "cam/cam_mirror.h"  // CAM: CamBackplot type
+#include "widgets/kit.h"     // ui::kit::primaryButton/dangerButton — the one commit/cancel pair
 
 #include "../core/app_state.h"
 
@@ -191,9 +192,11 @@ static void drawNewDocPreview(ImDrawList* dl, ImVec2 p0, ImVec2 p1, int kind) {
                     ImVec2(s1.x - 9.0f * S, s1.y - 14.0f * S), textDim, 1.0f * S);
     } else if (kind == 3 || kind == 5) { // simulation/stress
         ImVec2 beam0(c.x - w * 0.34f, c.y - h * 0.02f), beam1(c.x + w * 0.34f, c.y + h * 0.15f);
-        const ImU32 hot = IM_COL32(242, 99, 78, 180);
-        const ImU32 mid = IM_COL32(245, 190, 66, 170);
-        const ImU32 cold = IM_COL32(45, 212, 191, 150);
+        // Stress colormap: the app's err/warn/ok triple, so the tile's legend matches every other
+        // hot->cold readout in the product.
+        const ImU32 hot = withAlpha(pal.statusErr, 180.0f / 255.0f);
+        const ImU32 mid = withAlpha(pal.statusWarn, 170.0f / 255.0f);
+        const ImU32 cold = withAlpha(pal.statusOk, 150.0f / 255.0f);
         dl->AddRectFilledMultiColor(beam0, beam1, hot, mid, cold, cold);
         dl->AddRect(beam0, beam1, border, 2.0f * S, 0, 1.1f * S);
         for (int i = 0; i < 3; ++i) {
@@ -205,13 +208,14 @@ static void drawNewDocPreview(ImDrawList* dl, ImVec2 p0, ImVec2 p1, int kind) {
         }
     } else if (kind == 4) { // pcb
         ImVec2 b0(c.x - w * 0.34f, c.y - h * 0.23f), b1(c.x + w * 0.34f, c.y + h * 0.24f);
-        dl->AddRectFilled(b0, b1, IM_COL32(22, 116, 95, 170), 5.0f * S);
+        dl->AddRectFilled(b0, b1, withAlpha(pal.accentDim, 170.0f / 255.0f), 5.0f * S);
         dl->AddRect(b0, b1, accent, 5.0f * S, 0, 1.2f * S);
         for (int i = 0; i < 4; ++i) {
             float x = b0.x + (i + 1) * (b1.x - b0.x) / 5.0f;
-            dl->AddCircleFilled(ImVec2(x, c.y - h * 0.08f), 4.0f * S, IM_COL32(230, 205, 112, 210));
+            dl->AddCircleFilled(ImVec2(x, c.y - h * 0.08f), 4.0f * S,
+                                withAlpha(pal.statusWarn, 210.0f / 255.0f));
             dl->AddLine(ImVec2(x, c.y - h * 0.08f), ImVec2(c.x, c.y + h * 0.14f),
-                        IM_COL32(230, 205, 112, 190), 1.3f * S);
+                        withAlpha(pal.statusWarn, 190.0f / 255.0f), 1.3f * S);
         }
     } else if (kind == 6) { // fluids
         ImVec2 ch0(c.x - w * 0.34f, c.y - h * 0.18f), ch1(c.x + w * 0.34f, c.y + h * 0.18f);
@@ -236,7 +240,7 @@ static void drawNewDocPreview(ImDrawList* dl, ImVec2 p0, ImVec2 p1, int kind) {
                             ImVec2(c.x + 5.0f * S, c.y - 4.0f * S),
                             ImVec2(c.x - 2.0f * S, c.y - 4.0f * S),
                             ImVec2(c.x + 8.0f * S, c.y + h * 0.22f)};
-        dl->AddPolyline(boltPts, 4, IM_COL32(245, 190, 66, 230), 0, 2.0f * S);
+        dl->AddPolyline(boltPts, 4, withAlpha(pal.statusWarn, 230.0f / 255.0f), 0, 2.0f * S);
     } else if (kind == 8) { // open existing — an open folder with a file lifting out
         ImVec2 f0(c.x - w * 0.32f, c.y - h * 0.10f), f1(c.x + w * 0.32f, c.y + h * 0.26f);
         dl->AddRectFilled(ImVec2(f0.x, f0.y - h * 0.10f), ImVec2(f0.x + w * 0.26f, f0.y + 2.0f * S),
@@ -2068,15 +2072,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         sketch->setHudAngle(ang);
                 }
                 ImGui::Spacing();
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.55f, 0.24f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.66f, 0.30f, 1.0f));
-                if (ImGui::Button("\xE2\x9C\x93 Finish", ImVec2(96 * s, 0))) sketch->commitTransform(st);
-                ImGui::PopStyleColor(2);
+                // The app's primary/danger buttons. The old hand-rolled green/red pushes also
+                // carried U+2713/U+2717 in the label, which the app font has no codepoint for.
+                if (ui::kit::primaryButton("Finish", true, nullptr, ImVec2(96 * s, 0)))
+                    sketch->commitTransform(st);
                 ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.62f, 0.18f, 0.18f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.74f, 0.22f, 0.22f, 1.0f));
-                if (ImGui::Button("\xE2\x9C\x97 Cancel", ImVec2(96 * s, 0))) sketch->cancelTransform();
-                ImGui::PopStyleColor(2);
+                if (ui::kit::dangerButton("Cancel", true, nullptr, ImVec2(96 * s, 0)))
+                    sketch->cancelTransform();
                 ImGui::EndChild();
             }
         }

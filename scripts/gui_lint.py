@@ -286,7 +286,33 @@ KIT_PRIMITIVE_DEF_RE = re.compile(
     r"[Ss]econdaryButton|[Dd]angerButton|[Cc]ardBegin|[Ss]tatusGlyph|[Pp]rogressBar|"
     r"[Ss]egmentedControl|[Ii]nlineStatus|[Vv]alueChip|[Tt]oggleChip))\s*\(")
 KIT_FORWARD_WINDOW = 14   # lines of body inspected for a ui::kit:: call
-KIT_OWN_FILES = {"host/src/ui/widgets/kit.cpp", "host/src/ui/widgets/kit.h"}
+KIT_OWN_FILES = {
+    "host/src/ui/widgets/kit.cpp",
+    "host/src/ui/widgets/kit.h",
+    # The brand mark is the PRIMITIVE ui::kit::spinner and statusGlyph(Status::Running) are built
+    # ON, not a duplicate of them. Forwarding it to the kit would be circular.
+    "host/src/ui/tesseract.cpp",
+    "host/src/ui/tesseract.h",
+}
+
+
+def is_kit_declaration(lines: list[str], idx: int) -> bool:
+    """True when the construct starting at lines[idx] is a PROTOTYPE, not a definition.
+
+    A declaration's statement terminates in ';'; a definition opens a body with '{'. Testing only
+    whether the FIRST line ends in ';' was wrong: a prototype whose parameter list wraps (every
+    multi-line signature in reveng_widgets.h / parts_widgets.h) has no ';' on line one, so seven
+    headers were reported as second implementations of themselves. Scan forward instead and take
+    whichever terminator appears first.
+    """
+    for raw in lines[idx:idx + 8]:
+        code = raw.split("//", 1)[0]
+        for ch in code:
+            if ch == ";":
+                return True
+            if ch == "{":
+                return False
+    return False
 
 def lint_file(path: str, atlas: set[str], rules: set[str], findings: list):
     rel = os.path.relpath(path, REPO).replace(os.sep, "/")
@@ -371,9 +397,7 @@ def lint_file(path: str, atlas: set[str], rules: set[str], findings: list):
 
         if "dupe" in rules and not suppressed and rel not in KIT_OWN_FILES:
             dm = KIT_PRIMITIVE_DEF_RE.match(code)
-            # A prototype is not an implementation. Header declarations end in ';' on the same
-            # line; a definition opens a body, so its line ends in '{' (or continues).
-            if dm and not code.rstrip().endswith(";"):
+            if dm and not is_kit_declaration(lines, n - 1):
                 body = "".join(lines[n - 1:n - 1 + KIT_FORWARD_WINDOW])
                 if "ui::kit::" not in body and "kit::" not in body.split("(", 1)[-1]:
                     findings.append((rel, n, "dupe",

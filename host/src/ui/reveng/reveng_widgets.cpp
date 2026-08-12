@@ -1,14 +1,24 @@
 // reveng_widgets.cpp — the RE-40 shared visual kit for the Reverse Engineering workspace.
 // See reveng_widgets.h for the contract each widget owes its callers.
 //
-// House rules this TU obeys (and exists to make cheap for the RE panels):
-//   • Every colour comes from levelColor()/levelColorVec() or a ui::palette role. No literals.
+// WHY MOST OF THIS FILE IS NOW FORWARDERS
+// This TU used to be the best-behaved widget kit in the app, which is exactly why
+// ui/widgets/kit.h was modelled on it: kit.cpp absorbed this file's card chrome, section
+// header, chips, buttons, segmented control, progress bar and empty/blocked states. Keeping
+// both would leave the product with two implementations of every one of them — the precise
+// failure kit.h exists to end. The shared widgets therefore FORWARD to ui::kit wrapped in
+// Density::Roomy, whose padding/gap/corner tokens ARE the re* family, so the RE tab keeps its
+// own rhythm while the pixels come from one painter.
+//
+// What is still implemented here is only what the app-wide kit has no business owning: the
+// honesty tag, the image / 3D previews and their slot publication, the capability row, the
+// stage StepTrack, the two-column field label and the mm / % formatters.
+//
+// House rules this TU obeys:
+//   • Every colour comes from levelColor()/levelColorVec(), a ui::kit tone or a ui::palette
+//     role. No literals.
 //   • Every dimension comes from ui::metrics::* (the re* tokens where one exists). No literals.
-//   • Cards reuse the shared liquid-glass card look (ui::glassCardWash on a deferred draw
-//     channel) — the exact idiom plmCardBegin/plmCardEnd use in ui/plm/plm_pages.cpp — so an
-//     RE card and a PLM card read as the same product.
-//   • Icons are only ever drawn from a caller-supplied name, and only when the atlas actually
-//     has that cell. The kit never invents an icon name (that logs "[icons] unknown icon").
+//   • Every busy indicator is the ui::kit Running mark. This file no longer owns a spinner.
 //
 // GL-thread only, like the rest of ui/reveng.
 #include "reveng_widgets.h"
@@ -24,9 +34,10 @@
 #include "imgui_internal.h"
 
 #include "ui_theme.h"
-#include "../icons.h"
 #include "../metrics.h"
-#include "ui/tesseract.h"   // ui::drawTesseractSpinner — the brand mark IS the busy indicator
+#include "ui/anim.h"          // requestFrames — the stepper's active-node halo is ambient motion
+#include "ui/tesseract.h"     // kTesseractSpinnerMinPx — the brand mark's legibility floor
+#include "ui/widgets/kit.h"   // the app-wide vocabulary every shared widget below forwards to
 
 namespace ui {
 namespace reveng {
@@ -34,10 +45,10 @@ namespace kit {
 namespace {
 
 // ---- dp vs. scaled-pixel radii ------------------------------------------------------------------
-// ui::glassBackground / glassCardWash / glassSelectionGlow take a LOGICAL dp radius (they multiply
-// by ui::uiScale themselves) while ui::metrics::re*Round() already returns scaled pixels. Convert
-// back exactly once so the corner never double-scales at HiDPI. ImDrawList::Add*() rounding, by
-// contrast, is raw pixels — pass the metrics token straight through there.
+// ui::glassBackground / glassSelectionGlow take a LOGICAL dp radius (they multiply by ui::uiScale
+// themselves) while ui::metrics::re*Round() already returns scaled pixels. Convert back exactly
+// once so the corner never double-scales at HiDPI. ImDrawList::Add*() rounding, by contrast, is
+// raw pixels — pass the metrics token straight through there.
 inline float dpOf(float scaledPx) {
     const float s = ui::metrics::scale();
     return s > 0.0f ? scaledPx / s : scaledPx;
@@ -45,44 +56,10 @@ inline float dpOf(float scaledPx) {
 inline float cardRoundDp() { return dpOf(ui::metrics::reCardRound()); }
 inline float chipRoundDp() { return dpOf(ui::metrics::reChipRound()); }
 
-// ---- text fitting -------------------------------------------------------------------------------
-// Shorten `text` so it fits `maxW`, appending a horizontal ellipsis. Returns the ORIGINAL string
-// when it already fits, so the common case allocates nothing.
-//
-// Why this exists: centring a too-long label and clipping the segment eats BOTH ends, which turned
-// the stepper's "Reconstruct" into "econstru". Clipping is not ellipsizing.
-//
-// U+2026 is inside the atlas' 0x2010-0x2027 range (ui_theme.cpp uiGlyphRanges), so it renders.
-// Arrows and box-drawing are NOT in the atlas — never put them in a rendered string.
-inline std::string ellipsize(const char* text, float maxW) {
-    if (!text || !*text) return std::string();
-    if (maxW <= 0.0f || ImGui::CalcTextSize(text).x <= maxW) return std::string(text);
-
-    static const char* kEll = "\xe2\x80\xa6";  // U+2026 HORIZONTAL ELLIPSIS
-    const float ellW = ImGui::CalcTextSize(kEll).x;
-    if (ellW >= maxW) return std::string();
-
-    const std::string s(text);
-    std::size_t n = s.size();
-    while (n > 0) {
-        // Never split a UTF-8 continuation byte.
-        while (n > 0 && (static_cast<unsigned char>(s[n - 1]) & 0xC0) == 0x80) --n;
-        if (n == 0) break;
-        --n;
-        while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) --n;
-        const std::string cut = s.substr(0, n);
-        if (ImGui::CalcTextSize(cut.c_str()).x + ellW <= maxW) return cut + kEll;
-    }
-    return std::string(kEll);
-}
-
 // ---- opacity / ratio constants ------------------------------------------------------------------
 // These scale a palette role's alpha or are pure ratios; the COLOUR itself is always a palette role.
-constexpr float kCardWashA     = 0.060f;  // card liquid-glass tint at the top edge
 constexpr float kChipFillA     = 0.16f;
 constexpr float kChipBorderA   = 0.55f;
-constexpr float kRuleA         = 0.55f;
-constexpr float kTrackA        = 0.85f;   // progress / segmented-control track
 constexpr float kMatteA        = 0.85f;   // plate behind a letterboxed image
 constexpr float kPlaceholderA  = 0.35f;
 constexpr float kCaptionA      = 0.80f;
@@ -91,26 +68,19 @@ constexpr float kTileBaseA     = 0.45f;
 constexpr float kTileHoverA    = 0.70f;
 constexpr float kNodeIdleA     = 0.45f;
 constexpr float kNodeHaloA     = 0.28f;
-constexpr float kPrimaryFillA  = 0.90f;
-constexpr float kDangerFillA   = 0.85f;
-constexpr float kDangerActA    = 0.70f;
-constexpr float kSegSelA       = 0.85f;
-constexpr float kSegHoverA     = 0.16f;
-constexpr float kArrowDimA     = 0.80f;
 constexpr float kStripA        = 0.72f;
 
 constexpr float kTooltipWrapEm  = 26.0f;      // tooltip wrap width, in em
 constexpr float kHeroAspect     = 9.0f / 16.0f;
-constexpr float kEmptyIconScale = 2.0f;       // empty/blocked glyph = 2x the header icon tier
-constexpr float kMarqueeFrac    = 0.28f;      // indeterminate bar segment, fraction of the track
-constexpr float kMarqueeSpeed   = 0.55f;      // marquee cycles per second
-constexpr float kSpinnerSpeed   = 4.2f;       // radians per second
-constexpr float kSpinnerSweep   = 1.35f;      // arc length, multiples of PI
-constexpr int   kSpinnerSegs    = 16;
 constexpr float kPulseBase      = 1.55f;      // active step-node halo radius, x node radius
 constexpr float kPulseAmp       = 0.18f;
 constexpr float kPulseSpeed     = 3.0f;
 constexpr int   kMaxDecimals    = 6;
+
+// ui::kit::statusGlyph takes the VECTOR-MARK radius and derives the brand mark's ink box as
+// r / 0.30 (kit.h, "status" section). Callers that own a box and want the mark to fill it convert
+// through this ratio — it is part of that documented contract, not a fresh magic number.
+constexpr float kKitGlyphRadiusFrac = 0.30f;
 
 // ---- palette plumbing ---------------------------------------------------------------------------
 inline ImU32 roleU32(const float c[4], float alphaMul = 1.0f) {
@@ -132,69 +102,57 @@ inline const float* levelRole(Level l) {
     }
 }
 
+// ---- Level -> ui::kit::Tone ---------------------------------------------------------------------
+// The two enums are the same five meanings; this is the ONLY place the mapping lives, so a
+// Level::Warn chip and a copilot Tone::Warn chip can never drift apart. Busy maps to Accent and
+// gains the kit's Running mark on top (see overlayBusyMark) — the kit tone alone cannot say
+// "still in flight", and an RE panel that showed a motionless busy chip would be lying.
+inline ui::kit::Tone toneOf(Level l) {
+    switch (l) {
+        case Level::Ok:    return ui::kit::Tone::Ok;
+        case Level::Warn:  return ui::kit::Tone::Warn;
+        case Level::Error: return ui::kit::Tone::Err;
+        case Level::Busy:  return ui::kit::Tone::Accent;
+        case Level::Neutral:
+        default:           return ui::kit::Tone::Neutral;
+    }
+}
+
+// ui::kit::statusGlyph resolves its ink through the surface's darkText bit only (via toneOn), so
+// deriving that one bit from the CURRENT text colour is exactly as correct here as a full
+// adaptivePanel() sample — and does not add a hysteretic luminance sampler per chip.
+ui::AdaptiveSurface glyphSurface() {
+    ui::AdaptiveSurface s;
+    const ImVec4 ink = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    s.darkText       = (0.2126f * ink.x + 0.7152f * ink.y + 0.0722f * ink.z) < 0.5f;
+    s.textPrimary    = ink;
+    s.textSecondary  = ink;
+    s.textTertiary   = ink;
+    return s;
+}
+
+// The app-wide Running mark drawn over the tone dot ui::kit just painted. `center` is that dot's
+// centre and `dotR` its radius; the mark rides just OUTSIDE the disc (the same trick StepTrack
+// uses for a busy step node) so nothing has to be erased and the accent dot still reads.
+void overlayBusyMark(ImVec2 center, float dotR) {
+    ui::kit::statusGlyph(ImGui::GetWindowDrawList(), center, dotR + ui::metrics::stroke(1.5f),
+                         ui::kit::Status::Running, glyphSurface());
+}
+
+// Centre of the tone dot inside a chip whose top-left is `p0`. Mirrors ui::kit's chip geometry
+// (horizontal pad U(1.5), vertical pad U(0.5), dot radius U(0.75)) so the busy mark lands on the
+// dot it decorates. Derived from the tokens rather than read back off the item rect: ui::kit::chip
+// may open a tooltip as its last act, which leaves ImGui's "last item" pointing inside that popup.
+constexpr float kKitChipPadXU = 1.5f;
+constexpr float kKitChipPadYU = 0.5f;
+constexpr float kKitChipDotRU = 0.75f;
+inline float chipDotR() { return ui::metrics::U(kKitChipDotRU); }
+inline ImVec2 chipDotCenter(const ImVec2& p0) {
+    const float h = ImGui::GetTextLineHeight() + ui::metrics::U(kKitChipPadYU) * 2.0f;
+    return ImVec2(p0.x + ui::metrics::U(kKitChipPadXU) + chipDotR(), p0.y + h * 0.5f);
+}
+
 // ---- small painters -----------------------------------------------------------------------------
-// The kit's one busy primitive, in two regimes. `r` is a RADIUS, so the ink box is `2r`.
-//
-// At or above ui::kTesseractSpinnerMinPx the indicator IS the brand mark, a turning tesseract, so a
-// working RE stage says "working" in the same visual language as the rest of the product. Below it
-// a 16-vertex wireframe collapses into a smudge, so the original 243-degree arc stays. The ~6 dp
-// Level::Busy dots in StatusChip / InlineStatus land in that lower regime at ordinary DPI by
-// design: growing them past the gate would reflow every chip and inline row in the workspace.
-void drawSpinner(ImDrawList* dl, ImVec2 c, float r, float thickness, ImU32 col) {
-    const float box = r * 2.0f;
-    if (box >= ui::kTesseractSpinnerMinPx) {
-        // `thickness` is deliberately dropped here: it was tuned to make a single-stroke ARC
-        // visible, and at that weight 32 edges in a ~20 px box fuse into a solid patch. The mark
-        // derives a stroke from its own size, which is what its legibility ladder was measured at.
-        ui::drawTesseractSpinner(dl, c, box, ImGui::GetTime(), col);
-        return;
-    }
-    const float a0 = (float)ImGui::GetTime() * kSpinnerSpeed;
-    dl->PathClear();
-    dl->PathArcTo(c, r, a0, a0 + IM_PI * kSpinnerSweep, kSpinnerSegs);
-    dl->PathStroke(col, ImDrawFlags_None, thickness);
-}
-
-// The status dot every chip / inline row shares. Busy spins instead of sitting still, so a
-// pending job can never look like a finished one.
-void drawLevelDot(ImDrawList* dl, ImVec2 c, float r, Level l) {
-    const ImU32 col = levelColor(l);
-    if (l == Level::Busy) {
-        drawSpinner(dl, c, r, ui::metrics::stroke(1.5f), col);
-        return;
-    }
-    dl->AddCircleFilled(c, r, col);
-}
-
-// Draw a caller-named atlas icon centred at `center`. Unknown names draw NOTHING (rather than the
-// magenta placeholder tile) — the kit never substitutes a guessed name.
-void drawIconAt(ImDrawList* dl, const char* name, ImVec2 center, float sz, ImU32 col) {
-    if (!name || !name[0] || sz <= 0.0f) return;
-    if (ui::hasIconSdf(name)) {
-        ui::drawIconGlass(dl, name, center, sz, col, 0);
-        return;
-    }
-    const int cell = (sz >= ui::metrics::px(24.0f)) ? 32 : 20;
-    const ui::IconUV ic = ui::getIcon(name, cell);
-    if (!ic.valid) return;
-    const float r = sz * 0.5f;
-    dl->AddImage(ic.texId, ImVec2(center.x - r, center.y - r), ImVec2(center.x + r, center.y + r),
-                 ic.uv0, ic.uv1, col);
-}
-
-// Hand-drawn warning triangle for BlockedState — hand-drawn precisely so the kit does not have to
-// hardcode (and possibly miss) an atlas icon name.
-void drawWarnGlyph(ImDrawList* dl, ImVec2 c, float sz, ImU32 col) {
-    const float r = sz * 0.5f;
-    const float t = ui::metrics::stroke(1.6f);
-    const ImVec2 apex(c.x, c.y - r);
-    const ImVec2 bl(c.x - r, c.y + r * 0.72f);
-    const ImVec2 br(c.x + r, c.y + r * 0.72f);
-    dl->AddTriangle(apex, bl, br, col, t);
-    dl->AddLine(ImVec2(c.x, c.y - r * 0.20f), ImVec2(c.x, c.y + r * 0.22f), col, t);
-    dl->AddCircleFilled(ImVec2(c.x, c.y + r * 0.50f), ui::metrics::stroke(1.4f), col);
-}
-
 // Wrapped hover tooltip. No-op on an empty string so callers can pass an optional reason straight
 // through. ImGuiCol_PopupBg is already the glass role (applyTheme), so no extra glass push here.
 void kitTooltip(const char* text) {
@@ -245,7 +203,7 @@ void drawPlaceholder(ImDrawList* dl, ImVec2 a, ImVec2 b, const char* label) {
     dl->AddText(ImVec2(m.x - ts.x * 0.5f, m.y - ts.y * 0.5f), roleU32(palette.textDim), label);
 }
 
-// ---- chip geometry (shared by StatusChip / ValueChip / HonestyTag / badges) ----------------------
+// ---- chip geometry (HonestyTag, the thumbnail quality badge, CapabilityRow's right-align) -------
 struct ChipGeom {
     float  w = 0.0f, h = 0.0f;
     float  padX = 0.0f, padY = 0.0f, gap = 0.0f, dotR = 0.0f;
@@ -254,32 +212,15 @@ struct ChipGeom {
 
 ChipGeom chipGeom(const char* label, bool withDot) {
     ChipGeom g;
-    g.padX = ui::metrics::U(1.5f);
-    g.padY = ui::metrics::U(0.5f);
+    g.padX = ui::metrics::U(kKitChipPadXU);
+    g.padY = ui::metrics::U(kKitChipPadYU);
     g.gap  = ui::metrics::reLabelGap();
-    g.dotR = withDot ? ui::metrics::U(0.75f) : 0.0f;
+    g.dotR = withDot ? chipDotR() : 0.0f;
     g.textSize = ImGui::CalcTextSize(label ? label : "");
     g.h = g.textSize.y + g.padY * 2.0f;
     g.w = g.padX * 2.0f + g.textSize.x + (withDot ? (g.dotR * 2.0f + g.gap) : 0.0f);
     return g;
 }
-
-// ---- card nesting -------------------------------------------------------------------------------
-// One entry per live CardBegin(). CardEnd() is a hard no-op on an empty stack, so an unmatched End
-// (or an End after a CardBegin that returned false) can never pop ImGui state it did not push.
-struct CardFrame {
-    int   styleVars    = 0;
-    int   styleColors  = 0;
-    float contentLeft  = 0.0f;   // screen x of the card's content column
-    float contentRight = 0.0f;
-    bool  hasHeader    = false;
-    bool  open         = true;
-    // Screen x just past the header's chevron/icon/title. CardHeaderRight() right-aligns against
-    // contentRight but must never rewind PAST this, or a wide status chip lands on top of the
-    // title (which is exactly what "Dimensions" + a "fit-critical" chip did).
-    float headerEndX   = 0.0f;
-};
-std::vector<CardFrame> g_cards;
 
 // ---- 3D preview slots ---------------------------------------------------------------------------
 constexpr int kSlotCount = 6;   // None, SparseCloud, Splat, Mesh, Deviation, Parametric
@@ -294,49 +235,7 @@ inline int slotIndex(PreviewSlot s) {
     return (i >= 0 && i < kSlotCount) ? i : 0;
 }
 
-// ---- buttons ------------------------------------------------------------------------------------
-// Shared body for Primary/Secondary/Danger. A disabled button still renders (greyed) and still
-// answers the user's "why can't I click this?" via `disabledReason` on hover — the kit never hides
-// an action the user is looking for.
-bool kitButton(const char* label, bool enabled, const char* disabledReason, const ImVec2& size,
-               const ImVec4& base, const ImVec4& hovered, const ImVec4& active,
-               const ImVec4& text) {
-    ImVec2 sz = size;
-    if (sz.y <= 0.0f) sz.y = ui::metrics::reBtnH();
-
-    ImGui::PushStyleColor(ImGuiCol_Button,        base);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hovered);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  active);
-    ImGui::PushStyleColor(ImGuiCol_Text,          text);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::reChipRound());
-
-    if (!enabled) ImGui::BeginDisabled();
-    bool pressed = ImGui::Button(label ? label : "", sz);
-    if (!enabled) {
-        ImGui::EndDisabled();
-        pressed = false;
-        // Disabled items do not report hover normally; AllowWhenDisabled is what makes the
-        // explanation reachable at all.
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) kitTooltip(disabledReason);
-    }
-
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(4);
-    return pressed;
-}
-
-// ---- centred text helpers (EmptyState / BlockedState) -------------------------------------------
-void centeredText(const char* s, float rowLeft, float availW, const ImVec4& col) {
-    if (!s || !s[0]) return;
-    const ImVec2 ts = ImGui::CalcTextSize(s);
-    const ImVec2 c  = ImGui::GetCursorScreenPos();
-    const float dx  = (availW - ts.x) * 0.5f;
-    ImGui::SetCursorScreenPos(ImVec2(rowLeft + (dx > 0.0f ? dx : 0.0f), c.y));
-    ImGui::PushStyleColor(ImGuiCol_Text, col);
-    ImGui::TextUnformatted(s);
-    ImGui::PopStyleColor();
-}
-
+// ---- wrapped paragraph (CapabilityRow's always-visible fix-it hint) -----------------------------
 void wrappedBlock(const char* s, float leftScreenX, float w, const ImVec4& col) {
     if (!s || !s[0]) return;
     const ImVec2 c = ImGui::GetCursorScreenPos();
@@ -366,215 +265,80 @@ const char* badgeShort(const char* badge) {
     return badge;
 }
 
+// The RE tab's ambient density. Every forwarder below opens it so ui::kit resolves padX/padY/
+// rowGap/rowRound/chipRound/sectionGap/headGap from the re* tokens this workspace was tuned on.
+struct Roomy {
+    Roomy()  { ui::kit::pushDensity(ui::kit::Density::Roomy); }
+    ~Roomy() { ui::kit::popDensity(); }
+    Roomy(const Roomy&)            = delete;
+    Roomy& operator=(const Roomy&) = delete;
+};
+
 }  // namespace
 
 // =================================================================================================
-// semantic status
+// semantic status — thin wrappers over the ui::kit tone table
 // =================================================================================================
-ImU32 levelColor(Level l) { return roleU32(levelRole(l)); }
+ImU32 levelColor(Level l) { return ui::kit::toneU32(toneOf(l)); }
 
-ImVec4 levelColorVec(Level l) { return roleVec(levelRole(l)); }
+ImVec4 levelColorVec(Level l) { return ui::kit::toneVec(toneOf(l)); }
 
 // =================================================================================================
-// cards
+// cards -> ui::kit::cardBegin / cardEnd / cardHeaderRight
 // =================================================================================================
 bool CardBegin(const char* id, const char* title, const char* icon, bool collapsible, bool* open) {
-    ImGui::PushID(id ? id : "re_card");
-
     // Supplying `open` implies the card can collapse, even if the caller left `collapsible` false.
     const bool canCollapse = collapsible || open != nullptr;
 
-    // Resolve the open state BEFORE BeginChild so the fallback storage (and its key) belong to the
-    // PARENT window and survive the child's own id-stack reset.
-    bool          isOpen   = true;
-    ImGuiStorage* store    = nullptr;
-    ImGuiID       stateKey = 0;
-    if (canCollapse) {
-        if (open) {
-            isOpen = *open;
-        } else {
-            store    = ImGui::GetStateStorage();
-            stateKey = ImGui::GetID("re_card_open");
-            isOpen   = store->GetBool(stateKey, true);
-        }
+    // ui::kit::cardBegin collapses through a caller-owned bool. This kit's older contract also
+    // allowed `collapsible` with no bool at all, so that case still needs somewhere to live: the
+    // PARENT window's storage, resolved BEFORE the kit opens its child (whose id stack is fresh).
+    ImGuiStorage* store = nullptr;
+    ImGuiID       key   = 0;
+    bool          local = true;
+    if (canCollapse && !open) {
+        store = ImGui::GetStateStorage();
+        ImGui::PushID(id ? id : "re_card");
+        key = ImGui::GetID("re_card_open");
+        ImGui::PopID();
+        local = store->GetBool(key, true);
     }
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, roleVec(palette.glassBg, 0.0f));  // we paint our own
-    ImGui::PushStyleColor(ImGuiCol_Border,  roleVec(palette.glassBorder));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,   ui::metrics::reCardRound());
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, ui::metrics::stroke(1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::reCardPadX(), ui::metrics::reCardPadY()));
-    ImGui::BeginChild("re_card_body", ImVec2(0.0f, 0.0f),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
-    // Content draws on channel 1; CardEnd paints the liquid-glass wash behind it on channel 0 once
-    // the auto-resized height is final. Split + merge are unconditional and paired.
-    ImGui::GetWindowDrawList()->ChannelsSplit(2);
-    ImGui::GetWindowDrawList()->ChannelsSetCurrent(1);
-
-    CardFrame f;
-    f.styleVars    = 3;
-    f.styleColors  = 2;
-    f.contentLeft  = ImGui::GetCursorScreenPos().x;
-    f.contentRight = f.contentLeft + ImGui::GetContentRegionAvail().x;
-    f.open         = isOpen;
-    g_cards.push_back(f);
-
-    const bool wantHeader = (title && title[0]) || (icon && icon[0]) || canCollapse;
-    if (!wantHeader) return isOpen;
-
-    ImDrawList*  dl     = ImGui::GetWindowDrawList();
-    const float  txtH   = ImGui::GetTextLineHeight();
-    const float  iconSz = ui::metrics::iconHeader();
-    const float  rowH   = (icon && icon[0]) ? ImMax(txtH, iconSz) : txtH;
-    const float  gapH   = isOpen ? ui::metrics::reHeadGap() : 0.0f;
-    const float  rowW   = ImMax(f.contentRight - f.contentLeft, ui::metrics::stroke(1.0f));
-    const ImVec2 rowMin = ImGui::GetCursorScreenPos();
-
-    // The header row is ONE item (its height already carries the head gap) so CardHeaderRight's
-    // SameLine rewind lands on the title row rather than on a spacer.
-    bool toggled = false;
-    if (canCollapse) {
-        toggled = ImGui::InvisibleButton("re_card_head", ImVec2(rowW, rowH + gapH));
-    } else {
-        ImGui::Dummy(ImVec2(rowW, rowH + gapH));
-    }
-    const bool headHovered = ImGui::IsItemHovered();
-
-    float       x  = rowMin.x;
-    const float cy = rowMin.y + rowH * 0.5f;
-    if (canCollapse) {
-        ImGui::RenderArrow(dl, ImVec2(x, rowMin.y + (rowH - txtH) * 0.5f),
-                           roleU32(palette.textDim, headHovered ? 1.0f : kArrowDimA),
-                           isOpen ? ImGuiDir_Down : ImGuiDir_Right, 1.0f);
-        x += txtH + ui::metrics::reLabelGap();
-    }
-    if (icon && icon[0]) {
-        drawIconAt(dl, icon, ImVec2(x + iconSz * 0.5f, cy), iconSz, roleU32(palette.accent));
-        x += iconSz + ui::metrics::reLabelGap();
-    }
-    if (title && title[0]) {
-        dl->AddText(ImVec2(x, rowMin.y + (rowH - txtH) * 0.5f), roleU32(palette.text), title);
-        x += ImGui::CalcTextSize(title).x;
-    }
-    g_cards.back().headerEndX = x + ui::metrics::reLabelGap() * 2.0f;
-
-    if (toggled) {
-        isOpen = !isOpen;
-        if (open)       *open = isOpen;
-        else if (store) store->SetBool(stateKey, isOpen);
-        g_cards.back().open = isOpen;
-    }
-    g_cards.back().hasHeader = true;
-    return isOpen;
+    ui::kit::pushDensity(ui::kit::Density::Roomy);   // paired in CardEnd()
+    const bool visible =
+        ui::kit::cardBegin(id, title, icon, canCollapse ? (open ? open : &local) : nullptr);
+    if (store) store->SetBool(key, local);
+    return visible;
 }
 
 void CardEnd() {
-    if (g_cards.empty()) return;   // unmatched End: refuse rather than corrupt the ImGui stacks
-    const CardFrame f = g_cards.back();
-    g_cards.pop_back();
-
-    ImDrawList*  dl = ImGui::GetWindowDrawList();
-    const ImVec2 mn = ImGui::GetWindowPos();
-    const ImVec2 sz = ImGui::GetWindowSize();
-    const ImVec2 mx(mn.x + sz.x, mn.y + sz.y);
-    dl->ChannelsSetCurrent(0);
-    const float tint[3] = { palette.accent[0], palette.accent[1], palette.accent[2] };
-    ui::glassCardWash(dl, mn, mx, cardRoundDp(), tint, kCardWashA);
-    dl->ChannelsMerge();
-
-    ImGui::EndChild();
-    ImGui::PopStyleVar(f.styleVars);
-    ImGui::PopStyleColor(f.styleColors);
-    ImGui::PopID();
-    // No trailing gap here on purpose — GapCards() is the explicit between-cards rhythm token.
+    ui::kit::cardEnd();
+    ui::kit::popDensity();
 }
 
-void CardHeaderRight(float widgetsWidth) {
-    if (g_cards.empty()) return;
-    const CardFrame& f = g_cards.back();
-    float x = f.contentRight - widgetsWidth;
-    // Floor at the end of the title, NOT at the content edge: clamping to contentLeft when the
-    // widget is wider than the free space parked the chip directly on top of the title text.
-    // Overflowing to the right (and being clipped by the card) is strictly better than overlap.
-    const float floorX = f.headerEndX > 0.0f ? f.headerEndX : f.contentLeft;
-    if (x < floorX) x = floorX;
-    // SameLine rewinds Y onto the header row; the absolute X avoids any scroll/indent arithmetic.
-    if (f.hasHeader) ImGui::SameLine(0.0f, 0.0f);
-    ImGui::SetCursorScreenPos(ImVec2(x, ImGui::GetCursorScreenPos().y));
-}
+void CardHeaderRight(float widgetsWidth) { ui::kit::cardHeaderRight(widgetsWidth); }
 
 void SectionHeader(const char* label, const char* icon) {
-    ImDrawList* dl   = ImGui::GetWindowDrawList();
-    const float txtH = ImGui::GetTextLineHeight();
-    const float rowX = ImGui::GetCursorScreenPos().x;
-
-    if (icon && icon[0]) {
-        const ImVec2 p = ImGui::GetCursorScreenPos();
-        drawIconAt(dl, icon, ImVec2(p.x + txtH * 0.5f, p.y + txtH * 0.5f), txtH,
-                   roleU32(palette.accent));
-        ImGui::Dummy(ImVec2(txtH, txtH));
-        ImGui::SameLine(0.0f, ui::metrics::reLabelGap());
-    }
-    ImGui::PushStyleColor(ImGuiCol_Text, roleVec(palette.accent));
-    ImGui::TextUnformatted(label ? label : "");
-    ImGui::PopStyleColor();
-
-    const float rowBottom = ImGui::GetItemRectMax().y;
-    const float rule      = ui::metrics::stroke(1.0f);
-    const float rightX    = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
-    dl->AddLine(ImVec2(rowX, rowBottom + rule), ImVec2(rightX, rowBottom + rule),
-                roleU32(palette.accent, kRuleA), rule);
-    ImGui::Dummy(ImVec2(0.0f, ui::metrics::reHeadGap()));
+    const Roomy density;
+    // `first` suppresses ui::kit's leading sectionGap: RE panels already place their own gap above
+    // a header (GapSection, or the card's own top padding), so letting the kit add one doubles it.
+    ui::kit::sectionHeader(label, icon, nullptr, /*count=*/-1, /*first=*/true);
 }
 
 // =================================================================================================
 // chips / badges
 // =================================================================================================
 void StatusChip(const char* label, Level l, const char* tooltip) {
-    const ChipGeom g  = chipGeom(label, /*withDot=*/true);
-    const ImVec2   p0 = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(g.w, g.h));
-    const bool hovered = ImGui::IsItemHovered();
-
-    ImDrawList*  dl = ImGui::GetWindowDrawList();
-    const ImVec2 p1(p0.x + g.w, p0.y + g.h);
-    const float* role = levelRole(l);
-    const float  rnd  = ui::metrics::reChipRound();
-    dl->AddRectFilled(p0, p1, roleU32(role, kChipFillA), rnd);
-    dl->AddRect(p0, p1, roleU32(role, hovered ? 1.0f : kChipBorderA), rnd, 0,
-                ui::metrics::stroke(1.0f));
-    drawLevelDot(dl, ImVec2(p0.x + g.padX + g.dotR, p0.y + g.h * 0.5f), g.dotR, l);
-    dl->AddText(ImVec2(p0.x + g.padX + g.dotR * 2.0f + g.gap, p0.y + g.padY), roleU32(role),
-                label ? label : "");
-    if (hovered) kitTooltip(tooltip);
+    const Roomy  density;
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ui::kit::chip(label, toneOf(l), /*dot=*/true, tooltip);
+    if (l == Level::Busy)
+        overlayBusyMark(chipDotCenter(p0), chipDotR());
 }
 
 void ValueChip(const char* label, const char* value, Level l, const char* tooltip) {
-    const char*  lab  = label ? label : "";
-    const char*  val  = value ? value : "";
-    const float  padX = ui::metrics::U(1.5f);
-    const float  padY = ui::metrics::U(0.5f);
-    const float  gap  = ui::metrics::U(1.0f);
-    const ImVec2 ls   = ImGui::CalcTextSize(lab);
-    const ImVec2 vs   = ImGui::CalcTextSize(val);
-    const float  h    = ImMax(ls.y, vs.y) + padY * 2.0f;
-    const float  w    = padX * 2.0f + ls.x + gap + vs.x;
-
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(w, h));
-    const bool hovered = ImGui::IsItemHovered();
-
-    ImDrawList*  dl = ImGui::GetWindowDrawList();
-    const ImVec2 p1(p0.x + w, p0.y + h);
-    const float* role = levelRole(l);
-    const float  rnd  = ui::metrics::reChipRound();
-    dl->AddRectFilled(p0, p1, roleU32(role, kChipFillA), rnd);
-    dl->AddRect(p0, p1, roleU32(role, hovered ? 1.0f : kChipBorderA), rnd, 0,
-                ui::metrics::stroke(1.0f));
-    dl->AddText(ImVec2(p0.x + padX, p0.y + (h - ls.y) * 0.5f), roleU32(palette.textDim), lab);
-    dl->AddText(ImVec2(p0.x + padX + ls.x + gap, p0.y + (h - vs.y) * 0.5f), roleU32(role), val);
-    if (hovered) kitTooltip(tooltip);
+    const Roomy density;
+    ui::kit::valueChip(label, value, toneOf(l), tooltip);
 }
 
 void HonestyTag(const char* tier, const char* detail) {
@@ -614,6 +378,8 @@ void HonestyTag(const char* tier, const char* detail) {
     const float* role = levelRole(l);
     const float  rnd  = ui::metrics::reChipRound();
     // Solid-bordered pill (no dot) so an honesty tier never reads as a transient status chip.
+    // Deliberately NOT ui::kit::chip: the full-strength border is the whole signal, and a tier is
+    // a permanent property of the value, not a status that will change on the next poll.
     dl->AddRectFilled(p0, p1, roleU32(role, kChipFillA), rnd);
     dl->AddRect(p0, p1, roleU32(role, 1.0f), rnd, 0, ui::metrics::stroke(1.0f));
     dl->AddText(ImVec2(p0.x + g.padX, p0.y + g.padY), roleU32(role), t);
@@ -634,17 +400,12 @@ void HonestyTag(const char* tier, const char* detail) {
 void InlineStatus(const char* msg, Level l) {
     if (!msg || !msg[0]) return;   // sticky-error callers pass an empty string unconditionally
 
-    ImDrawList*  dl   = ImGui::GetWindowDrawList();
-    const float  dotR = ui::metrics::U(0.75f);
-    const float  txtH = ImGui::GetTextLineHeight();
+    const Roomy  density;
+    const float  dotR = chipDotR();
     const ImVec2 p    = ImGui::GetCursorScreenPos();
-    drawLevelDot(dl, ImVec2(p.x + dotR, p.y + txtH * 0.5f), dotR, l);
-    ImGui::Dummy(ImVec2(dotR * 2.0f, txtH));
-    ImGui::SameLine(0.0f, ui::metrics::reLabelGap());
-
-    ImGui::PushStyleColor(ImGuiCol_Text, levelColorVec(l));
-    ImGui::TextWrapped("%s", msg);
-    ImGui::PopStyleColor();
+    ui::kit::inlineStatus(msg, toneOf(l));
+    if (l == Level::Busy)
+        overlayBusyMark(ImVec2(p.x + dotR, p.y + ImGui::GetTextLineHeight() * 0.5f), dotR);
 }
 
 void HelpMarker(const char* text) {
@@ -657,6 +418,9 @@ void HelpMarker(const char* text) {
 // =================================================================================================
 // form rows
 // =================================================================================================
+// FieldLabel stays a real implementation: ui::kit has no two-column FORM row (keyValueRow is
+// read-only and sets no item width), and inventing one for a single workspace is how the app grew
+// four kits in the first place. It is 12 lines of cursor arithmetic, not a painter.
 void FieldLabel(const char* label, const char* help) {
     const float rowLeft = ImGui::GetCursorScreenPos().x;
 
@@ -677,117 +441,50 @@ void FieldLabel(const char* label, const char* help) {
 }
 
 void KeyValueRow(const char* key, const char* value, Level valueLevel) {
-    const float rowLeft = ImGui::GetCursorScreenPos().x;
-
-    ImGui::PushStyleColor(ImGuiCol_Text, roleVec(palette.textDim));
-    ImGui::TextUnformatted(key ? key : "");
-    ImGui::PopStyleColor();
-
-    float       x    = rowLeft + ui::metrics::pmLabelCol();
-    const float minX = ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x;
-    if (x < minX) x = minX;
-    ImGui::SameLine(0.0f, 0.0f);
-    ImGui::SetCursorScreenPos(ImVec2(x, ImGui::GetCursorScreenPos().y));
-
-    // Neutral reads as PRIMARY text here: the key is already dim, so dimming the value too would
-    // make a perfectly good readout look disabled.
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          valueLevel == Level::Neutral ? roleVec(palette.text)
-                                                       : levelColorVec(valueLevel));
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextUnformatted(value ? value : "");
-    ImGui::PopTextWrapPos();
-    ImGui::PopStyleColor();
+    const Roomy density;
+    ui::kit::keyValueRow(key, value, toneOf(valueLevel), /*copyable=*/false);
 }
 
 // =================================================================================================
 // buttons
 // =================================================================================================
+// reBtnH() (30 dp) is a hair shorter than ImGui's frame height at the shipping body font
+// (17.5 dp + 2x7 dp padding = 31.5 dp), which is what ui::kit defaults to. Pass the RE height
+// explicitly so no RE button changes size.
 bool PrimaryButton(const char* label, bool enabled, const char* disabledReason,
                    const ImVec2& size) {
-    const ImVec4 base = roleVec(palette.accent, kPrimaryFillA);
-    return kitButton(label, enabled, disabledReason, size, base, roleVec(palette.accent),
-                     roleVec(palette.accentDim), ui::maxContrastTextOn(base));
+    const Roomy density;
+    return ui::kit::primaryButton(label, enabled, disabledReason,
+                                  ImVec2(size.x, size.y > 0.0f ? size.y : ui::metrics::reBtnH()));
 }
 
 bool SecondaryButton(const char* label, bool enabled, const char* disabledReason,
                      const ImVec2& size) {
-    return kitButton(label, enabled, disabledReason, size, roleVec(palette.button),
-                     roleVec(palette.buttonHovered), roleVec(palette.buttonActive),
-                     roleVec(palette.text));
+    const Roomy density;
+    return ui::kit::secondaryButton(label, enabled, disabledReason,
+                                    ImVec2(size.x, size.y > 0.0f ? size.y : ui::metrics::reBtnH()));
 }
 
 bool DangerButton(const char* label, bool enabled, const char* disabledReason) {
-    const ImVec4 base = roleVec(palette.statusErr, kDangerFillA);
-    return kitButton(label, enabled, disabledReason, ImVec2(0.0f, ui::metrics::reBtnH()), base,
-                     roleVec(palette.statusErr), roleVec(palette.statusErr, kDangerActA),
-                     ui::maxContrastTextOn(base));
+    const Roomy density;
+    return ui::kit::dangerButton(label, enabled, disabledReason,
+                                 ImVec2(0.0f, ui::metrics::reBtnH()));
 }
 
 bool SegmentedControl(const char* id, const char* const* labels, int count, int* selected,
                       float width) {
-    if (!labels || count <= 0 || !selected) return false;
-
-    ImGui::PushID(id ? id : "re_seg");
-    const float  h    = ui::metrics::reBtnH();
-    float        w    = width > 0.0f ? width : ImGui::GetContentRegionAvail().x;
-    const float  minW = ui::metrics::stroke(1.0f) * (float)count;
-    if (w < minW) w = minW;
-    const float  segW = w / (float)count;
-    const ImVec2 p0   = ImGui::GetCursorScreenPos();
-    const ImVec2 p1(p0.x + w, p0.y + h);
-
-    ImDrawList* dl  = ImGui::GetWindowDrawList();
-    const float rnd = ui::metrics::reChipRound();
-    dl->AddRectFilled(p0, p1, roleU32(palette.frameBg, kTrackA), rnd);
-    dl->AddRect(p0, p1, roleU32(palette.border), rnd, 0, ui::metrics::stroke(1.0f));
-
-    const float inset   = ui::metrics::stroke(2.0f);
-    bool        changed = false;
-    for (int i = 0; i < count; ++i) {
-        const ImVec2 sMin(p0.x + segW * (float)i, p0.y);
-        const ImVec2 sMax(sMin.x + segW, p1.y);
-
-        ImGui::PushID(i);
-        ImGui::SetCursorScreenPos(sMin);
-        if (ImGui::InvisibleButton("seg", ImVec2(segW, h)) && *selected != i) {
-            *selected = i;
-            changed   = true;
-        }
-        const bool hovered = ImGui::IsItemHovered();
-        ImGui::PopID();
-
-        const bool sel = (*selected == i);
-        if (sel) {
-            dl->AddRectFilled(ImVec2(sMin.x + inset, sMin.y + inset),
-                              ImVec2(sMax.x - inset, sMax.y - inset),
-                              roleU32(palette.accent, kSegSelA), rnd);
-        } else if (hovered) {
-            dl->AddRectFilled(ImVec2(sMin.x + inset, sMin.y + inset),
-                              ImVec2(sMax.x - inset, sMax.y - inset),
-                              roleU32(palette.accent, kSegHoverA), rnd);
-        } else if (i > 0) {
-            dl->AddLine(ImVec2(sMin.x, sMin.y + inset * 2.0f),
-                        ImVec2(sMin.x, sMax.y - inset * 2.0f), roleU32(palette.border),
-                        ui::metrics::stroke(1.0f));
-        }
-
-        // Same fit-before-centre rule as StepTrack: clipping a centred label eats both ends.
-        const std::string lab = ellipsize(labels[i] ? labels[i] : "", segW - inset * 2.0f);
-        const ImVec2      ts  = ImGui::CalcTextSize(lab.c_str());
-        const ImU32       tc  = sel ? ImGui::ColorConvertFloat4ToU32(
-                                          ui::maxContrastTextOn(roleVec(palette.accent, kSegSelA)))
-                                    : roleU32(hovered ? palette.text : palette.textDim);
-        dl->PushClipRect(ImVec2(sMin.x + inset, sMin.y), ImVec2(sMax.x - inset, sMax.y), true);
-        dl->AddText(ImVec2(sMin.x + (segW - ts.x) * 0.5f, sMin.y + (h - ts.y) * 0.5f), tc,
-                    lab.c_str());
-        dl->PopClipRect();
-        if (hovered && labels[i] && lab != labels[i]) ImGui::SetTooltip("%s", labels[i]);
-    }
-
-    ImGui::SetCursorScreenPos(p0);
-    ImGui::Dummy(ImVec2(w, h));
-    ImGui::PopID();
+    const Roomy density;
+    // ui::kit::segmented sizes its height from ImGui's frame height and, with no explicit width,
+    // to its own content. Both defaults differ from this control's contract (reBtnH, full pane
+    // width), and only the height is unreachable through its arguments — so set FramePadding.y to
+    // land GetFrameHeight() exactly on reBtnH() for the duration of the call.
+    const float padY = ImMax(0.0f, (ui::metrics::reBtnH() - ImGui::GetFontSize()) * 0.5f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(ImGui::GetStyle().FramePadding.x, padY));
+    const bool changed =
+        ui::kit::segmented(id, labels, count, selected,
+                           width > 0.0f ? width : ImGui::GetContentRegionAvail().x);
+    ImGui::PopStyleVar();
     return changed;
 }
 
@@ -795,51 +492,11 @@ bool SegmentedControl(const char* id, const char* const* labels, int count, int*
 // progress
 // =================================================================================================
 void ProgressBar(float pct, const char* caption, Level l) {
-    const float availW = ImGui::GetContentRegionAvail().x;
-    const float barH   = ui::metrics::reProgressH();
-    const bool  hasCap = caption && caption[0];
-
-    ImVec2 capSz(0.0f, 0.0f);
-    float  capGap = 0.0f;
-    if (hasCap) {
-        capSz  = ImGui::CalcTextSize(caption);
-        capGap = ui::metrics::reCtlGap();
-    }
-    const float rowH = ImMax(barH, capSz.y);
-    float       barW = availW - capSz.x - capGap;
-    const float minW = ui::metrics::stroke(1.0f);
-    if (barW < minW) barW = minW;
-
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(availW, rowH));
-
-    ImDrawList* dl  = ImGui::GetWindowDrawList();
-    const float by  = p0.y + (rowH - barH) * 0.5f;
-    const float rnd = barH * 0.5f;
-    dl->AddRectFilled(ImVec2(p0.x, by), ImVec2(p0.x + barW, by + barH),
-                      roleU32(palette.frameBg, kTrackA), rnd);
-
-    const ImU32 fill = (l == Level::Neutral) ? roleU32(palette.accent) : levelColor(l);
-    if (pct < 0.0f) {
-        // Indeterminate: a marquee segment sweeping the track. A started job with no reported
-        // progress still LOOKS like it is running.
-        const float segW = barW * kMarqueeFrac;
-        const float span = barW + segW;
-        const float t    = (float)ImGui::GetTime() * kMarqueeSpeed;
-        const float head = (t - std::floor(t)) * span - segW;
-        const float a    = p0.x + ImMax(0.0f, head);
-        const float b    = p0.x + ImMin(barW, head + segW);
-        if (b > a) dl->AddRectFilled(ImVec2(a, by), ImVec2(b, by + barH), fill, rnd);
-    } else {
-        const float f = pct > 1.0f ? 1.0f : pct;
-        const float w = barW * f;
-        if (w > 0.0f) dl->AddRectFilled(ImVec2(p0.x, by), ImVec2(p0.x + w, by + barH), fill, rnd);
-    }
-
-    if (hasCap) {
-        dl->AddText(ImVec2(p0.x + availW - capSz.x, p0.y + (rowH - capSz.y) * 0.5f),
-                    (l == Level::Neutral) ? roleU32(palette.textDim) : levelColor(l), caption);
-    }
+    const Roomy density;
+    // Level::Neutral means "no judgement about the OUTCOME", not "grey bar": an RE progress bar has
+    // always been accent-filled unless a level overrides it, so Neutral maps to Tone::Accent here
+    // rather than to Tone::Neutral (which the kit renders in textDim).
+    ui::kit::progressBar(pct, caption, l == Level::Neutral ? ui::kit::Tone::Accent : toneOf(l));
 }
 
 int StepTrack(const char* id, const char* const* labels, const Level* states, int count,
@@ -893,35 +550,39 @@ int StepTrack(const char* id, const char* const* labels, const Level* states, in
         const ImVec2 c(sMin.x + segW * 0.5f, nodeY);
 
         if (i == active) {
+            // Ambient motion: without the frame request this breathes at whatever cadence stray
+            // mouse events produce, i.e. a 20 Hz stutter the moment the cursor stops.
+            ui::anim::requestFrames();
             const float pulse =
                 kPulseBase + kPulseAmp * (float)std::sin(ImGui::GetTime() * kPulseSpeed);
             dl->AddCircleFilled(c, nodeR * pulse, roleU32(palette.accent, kNodeHaloA));
         }
-        // The arc this replaced was a ring drawn OUTSIDE the filled node disc. The brand mark
-        // instead fills its whole box, so painting it over the disc in the same colour just
-        // merges into a blob — a busy node therefore BECOMES the mark rather than wearing one.
-        // Below the legibility gate drawSpinner still paints the old ring, so the disc stays.
-        const float busyR    = nodeR + ui::metrics::stroke(2.5f);
-        const bool  busyMark = lv == Level::Busy && busyR * 2.0f >= ui::kTesseractSpinnerMinPx;
+        // A busy node BECOMES the app's Running mark rather than wearing one: the mark fills its
+        // whole box, so painting it over a filled disc in the same colour just merges into a blob.
+        // Below the mark's legibility floor ui::kit falls back to a comet arc, so the disc stays.
+        const float busyBox  = (nodeR + ui::metrics::stroke(2.5f)) * 2.0f;
+        const bool  busyMark = lv == Level::Busy && busyBox >= ui::kTesseractSpinnerMinPx;
         if (!busyMark) {
             dl->AddCircleFilled(c, nodeR, roleU32(rl, lv == Level::Neutral ? kNodeIdleA : 1.0f));
             dl->AddCircle(c, nodeR, roleU32(rl, hovered ? 1.0f : kChipBorderA), 0,
                           ui::metrics::stroke(1.0f));
         }
-        if (lv == Level::Busy)
-            drawSpinner(dl, c, busyR, ui::metrics::stroke(1.5f), levelColor(Level::Busy));
+        if (lv == Level::Busy) {
+            ui::kit::statusGlyph(dl, c, busyBox * kKitGlyphRadiusFrac, ui::kit::Status::Running,
+                                 glyphSurface());
+        }
 
         // Fit the label to its own segment (minus a hair of breathing room) BEFORE centring.
         // Centre-then-clip would trim both ends and leave an unreadable middle fragment.
-        const std::string lab = ellipsize(labels[i] ? labels[i] : "",
-                                          segW - ui::metrics::U(1.0f));
+        const std::string lab = ui::kit::elide(labels[i] ? labels[i] : "",
+                                              segW - ui::metrics::U(1.0f));
         const ImVec2      ts  = ImGui::CalcTextSize(lab.c_str());
         dl->PushClipRect(ImVec2(sMin.x, p0.y), ImVec2(sMin.x + segW, p0.y + h), true);
         dl->AddText(ImVec2(c.x - ts.x * 0.5f, labY),
                     roleU32((i == active || hovered) ? palette.text : palette.textDim),
                     lab.c_str());
         dl->PopClipRect();
-        // Full text on hover, so an ellipsized step is never ambiguous.
+        // Full text on hover, so an elided step is never ambiguous.
         if (hovered && labels[i] && lab != labels[i]) ImGui::SetTooltip("%s", labels[i]);
     }
 
@@ -932,7 +593,7 @@ int StepTrack(const char* id, const char* const* labels, const Level* states, in
 }
 
 // =================================================================================================
-// previews
+// previews — the RE tab's own art; ui::kit has no image/3D surface and should not grow one
 // =================================================================================================
 bool HeroPreview(const char* id, unsigned int texId, int texW, int texH, const ImVec2& box,
                  const char* caption, const char* emptyLabel) {
@@ -1119,92 +780,18 @@ void resetPreviewSlots() {
 }
 
 // =================================================================================================
-// empty / error states
+// empty / error states -> ui::kit::emptyState / blockedState
 // =================================================================================================
 bool EmptyState(const char* icon, const char* title, const char* body, const char* actionLabel,
                 bool actionEnabled) {
-    ImGui::PushID(title && title[0] ? title : "re_empty");
-
-    const float rowLeft = ImGui::GetCursorScreenPos().x;
-    const float availW  = ImGui::GetContentRegionAvail().x;
-    const float colW    = ImMin(availW, ui::metrics::rePreviewMinW());
-    const float colLeft = rowLeft + ImMax(0.0f, (availW - colW) * 0.5f);
-
-    ImGui::Dummy(ImVec2(0.0f, ui::metrics::reSectionGap()));
-    if (icon && icon[0]) {
-        const float  sz = ui::metrics::iconHeader() * kEmptyIconScale;
-        const ImVec2 p  = ImGui::GetCursorScreenPos();
-        drawIconAt(ImGui::GetWindowDrawList(), icon, ImVec2(rowLeft + availW * 0.5f, p.y + sz * 0.5f),
-                   sz, roleU32(palette.textDim));
-        ImGui::Dummy(ImVec2(availW, sz));
-        ImGui::Dummy(ImVec2(0.0f, ui::metrics::reCtlGap()));
-    }
-
-    centeredText(title, rowLeft, availW, roleVec(palette.text));
-    if (body && body[0]) {
-        ImGui::Dummy(ImVec2(0.0f, ui::metrics::reLabelGap()));
-        wrappedBlock(body, colLeft, colW, roleVec(palette.textDim));
-    }
-
-    bool clicked = false;
-    if (actionLabel && actionLabel[0]) {
-        ImGui::Dummy(ImVec2(0.0f, ui::metrics::reCtlGap()));
-        const float bw = ImMax(ui::metrics::reBtnW(),
-                               ImGui::CalcTextSize(actionLabel).x + ui::metrics::reCardPadX() * 2.0f);
-        const ImVec2 c = ImGui::GetCursorScreenPos();
-        ImGui::SetCursorScreenPos(ImVec2(rowLeft + ImMax(0.0f, (availW - bw) * 0.5f), c.y));
-        clicked = PrimaryButton(actionLabel, actionEnabled, nullptr,
-                                ImVec2(bw, ui::metrics::reBtnH()));
-    }
-
-    ImGui::Dummy(ImVec2(0.0f, ui::metrics::reSectionGap()));
-    ImGui::PopID();
-    return clicked;
+    const Roomy density;
+    return ui::kit::emptyState(icon, title, body, actionLabel, actionEnabled);
 }
 
 bool BlockedState(const char* title, const char* reason, const char* hint,
                   const char* actionLabel) {
-    ImGui::PushID(title && title[0] ? title : "re_blocked");
-
-    const float rowLeft = ImGui::GetCursorScreenPos().x;
-    const float availW  = ImGui::GetContentRegionAvail().x;
-    const float colW    = ImMin(availW, ui::metrics::rePreviewMinW());
-    const float colLeft = rowLeft + ImMax(0.0f, (availW - colW) * 0.5f);
-
-    ImGui::Dummy(ImVec2(0.0f, ui::metrics::reSectionGap()));
-    {
-        const float  sz = ui::metrics::iconHeader() * kEmptyIconScale;
-        const ImVec2 p  = ImGui::GetCursorScreenPos();
-        drawWarnGlyph(ImGui::GetWindowDrawList(),
-                      ImVec2(rowLeft + availW * 0.5f, p.y + sz * 0.5f), sz,
-                      levelColor(Level::Error));
-        ImGui::Dummy(ImVec2(availW, sz));
-        ImGui::Dummy(ImVec2(0.0f, ui::metrics::reCtlGap()));
-    }
-
-    centeredText(title, rowLeft, availW, levelColorVec(Level::Error));
-    if (reason && reason[0]) {
-        ImGui::Dummy(ImVec2(0.0f, ui::metrics::reLabelGap()));
-        wrappedBlock(reason, colLeft, colW, roleVec(palette.text));
-    }
-    if (hint && hint[0]) {
-        ImGui::Dummy(ImVec2(0.0f, ui::metrics::reLabelGap()));
-        wrappedBlock(hint, colLeft, colW, roleVec(palette.textDim));
-    }
-
-    bool clicked = false;
-    if (actionLabel && actionLabel[0]) {
-        ImGui::Dummy(ImVec2(0.0f, ui::metrics::reCtlGap()));
-        const float bw = ImMax(ui::metrics::reBtnW(),
-                               ImGui::CalcTextSize(actionLabel).x + ui::metrics::reCardPadX() * 2.0f);
-        const ImVec2 c = ImGui::GetCursorScreenPos();
-        ImGui::SetCursorScreenPos(ImVec2(rowLeft + ImMax(0.0f, (availW - bw) * 0.5f), c.y));
-        clicked = PrimaryButton(actionLabel, true, nullptr, ImVec2(bw, ui::metrics::reBtnH()));
-    }
-
-    ImGui::Dummy(ImVec2(0.0f, ui::metrics::reSectionGap()));
-    ImGui::PopID();
-    return clicked;
+    const Roomy density;
+    return ui::kit::blockedState(title, reason, hint, actionLabel);
 }
 
 // =================================================================================================
@@ -1244,17 +831,14 @@ void CapabilityRow(const char* name, bool available, const char* hint) {
 // misc
 // =================================================================================================
 void Rule() {
-    ImDrawList*  dl = ImGui::GetWindowDrawList();
-    const ImVec2 p  = ImGui::GetCursorScreenPos();
-    const float  w  = ImGui::GetContentRegionAvail().x;
-    const float  t  = ui::metrics::stroke(1.0f);
-    dl->AddLine(ImVec2(p.x, p.y + t * 0.5f), ImVec2(p.x + w, p.y + t * 0.5f),
-                roleU32(palette.border), t);
-    ImGui::Dummy(ImVec2(w, t));
+    const Roomy density;
+    ui::kit::rule();
 }
 
-void GapCards()   { ImGui::Dummy(ImVec2(0.0f, ui::metrics::reCardGap())); }
-void GapSection() { ImGui::Dummy(ImVec2(0.0f, ui::metrics::reSectionGap())); }
+void GapCards()   { const Roomy density; ui::kit::gapRow(); }
+void GapSection() { const Roomy density; ui::kit::gapSection(); }
+// No kit equivalent: reCtlGap (control -> next label) sits between reHeadGap and reCardGap, and a
+// fourth rhythm token in the kit would only ever have this one caller.
 void GapControl() { ImGui::Dummy(ImVec2(0.0f, ui::metrics::reCtlGap())); }
 
 std::string fmtMm(double mm, int decimals) {
@@ -1273,21 +857,8 @@ std::string fmtPct(double pct01, int decimals) {
     return std::string(buf);
 }
 
-std::string fmtDuration(double seconds) {
-    char buf[64];
-    if (!(seconds > 0.0)) {   // also catches NaN
-        return std::string("0.0 s");
-    }
-    const long total = (long)(seconds + 0.5);
-    if (total < 60) {
-        std::snprintf(buf, sizeof(buf), "%.1f s", seconds);
-    } else if (total < 3600) {
-        std::snprintf(buf, sizeof(buf), "%ld m %02ld s", total / 60, total % 60);
-    } else {
-        std::snprintf(buf, sizeof(buf), "%ld h %02ld m", total / 3600, (total % 3600) / 60);
-    }
-    return std::string(buf);
-}
+// Byte-identical formats, so this is a pure alias.
+std::string fmtDuration(double seconds) { return ui::kit::fmtDuration(seconds); }
 
 }  // namespace kit
 }  // namespace reveng

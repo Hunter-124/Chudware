@@ -769,7 +769,7 @@ void insertItem(AppState& st, const PartsItem& item) {
         if (ok) {
             std::string doc = r.result.value("doc_id", "");
             st.toast(ui::ToastLevel::Success,
-                     "Inserted " + name + (doc.empty() ? "" : (" → " + doc)));
+                     "Inserted " + name + (doc.empty() ? "" : (" into " + doc)));
         } else {
             std::string why = r.ok
                 ? r.result.value("reason", std::string("insert failed"))

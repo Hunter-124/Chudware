@@ -239,7 +239,7 @@ void applyWizardStatus(AppState& st, const nlohmann::json& j) {
         // Toast every newly signed-in site (the worker auto-advances on logged_in).
         for (const auto& s : nd)
             if (std::find(w.done.begin(), w.done.end(), s) == w.done.end())
-                st.toast(ui::ToastLevel::Success, "✓ " + vendorLabel(s) + " signed in");
+                st.toast(ui::ToastLevel::Success, vendorLabel(s) + " signed in");
         w.done = std::move(nd);
     }
     if (j.contains("skipped") && j["skipped"].is_array()) {
@@ -442,7 +442,7 @@ void startLoginWizard(AppState& st, const std::string& site) {
                                    ? "Embedded browser unavailable — Playwright/Chromium not installed"
                                    : "Sign-in wizard is busy — close it and try again";
                 w.setupHint  = hint.empty()
-                                   ? "Run Settings → Repair runtime, or: pip install playwright && "
+                                   ? "Run Settings > Repair runtime, or: pip install playwright && "
                                      "playwright install chromium"
                                    : hint;
                 st.toast(ui::ToastLevel::Error, w.setupError);

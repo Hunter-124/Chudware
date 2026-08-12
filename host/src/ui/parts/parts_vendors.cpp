@@ -677,7 +677,7 @@ void drawDownloadQueue(AppState& st) {
                                       r.result.value("ok", false);
                             if (ok) {
                                 st.toast(ui::ToastLevel::Success,
-                                    "Imported → " + jstr(r.result, "doc_id", "doc"));
+                                    "Imported as " + jstr(r.result, "doc_id", "doc"));
                             } else {
                                 std::string why = r.ok
                                     ? jstr(r.result, "reason", "import failed")

@@ -179,6 +179,115 @@ RIBBON_ROW_RE = re.compile(r'^\s*\{\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*"([^"]*)"\s*,'
 APPLY_THEME_RE = re.compile(r'applyTheme\s*\([^,]+,\s*1(?:\.0*)?f?\s*\)')
 FONT_GLOBAL_RE = re.compile(r'FontGlobalScale\s*=')
 
+# ---- rule "color": literal colors that bypass ui::palette / ui::kit::tone* -------------------------
+# The theme rule only ever caught applyTheme(...,1.0f) and FontGlobalScale, so the actual house rule
+# ("all panels read ONLY role fields — never hardcode ImVec4/ImU32 colors in panel code",
+# ui_theme.h:1-3) was unenforced. These three patterns are the ways it actually gets broken.
+#   IM_COL32(r,g,b,a) with NUMERIC channels — a literal color. IM_COL32 over a variable is fine.
+#   ImVec4(r,g,b,a) with >=3 numeric channels inside a color context (PushStyleColor/TextColored/
+#     ColorConvert/AddRect*/Add*Filled) — same thing spelled as floats.
+#   GetStyleColorVec4(<not ImGuiCol_Text>) — substitutes ImGui's own style for the palette role.
+COLOR_LITERAL_MACRO_RE = re.compile(
+    r"\bIM_COL32\s*\(\s*\d[\d.f]*\s*,\s*\d[\d.f]*\s*,\s*\d[\d.f]*\s*(?:,\s*[\d.f]+\s*)?\)")
+COLOR_LITERAL_VEC_RE = re.compile(
+    r"\bImVec4\s*\(\s*[\d.f]+\s*,\s*[\d.f]+\s*,\s*[\d.f]+\s*,\s*[\d.f]+\s*\)")
+COLOR_CONTEXT_RE = re.compile(
+    r"\b(?:PushStyleColor|TextColored|ColorConvertFloat4ToU32|AddRectFilled|AddRect|AddCircleFilled|"
+    r"AddCircle|AddLine|AddText|AddTriangleFilled|AddConvexPolyFilled)\s*\(")
+# GetStyleColorVec4(ImGuiCol_Text) is the DOCUMENTED adaptive idiom, not a bypass: it reads the ink
+# the caller pushed so a widget stays legible inside a glass bubble, a docked panel or a popup,
+# where a fixed palette.textDim washes out (see ui::kit::inkSurface / dimText). Every OTHER
+# ImGuiCol_* read IS a bypass — ImGuiCol_TextDisabled in particular substitutes ImGui's own style
+# for the palette role and drifts from the theme.
+GET_STYLE_COLOR_RE = re.compile(r"\bGetStyleColorVec4\s*\(\s*(?!ImGuiCol_Text\s*\))")
+# An IM_COL32 on an AddImage* line is a TINT, and (255,255,255,255) there means "identity, draw the
+# texture as authored" — not a color choice at all.
+COLOR_IMAGE_TINT_RE = re.compile(r"\bAddImage(?:Rounded|Quad)?\s*\(")
+# Fully-transparent and fully-opaque white/black are structural sentinels, not theme colors: a
+# transparent ChildBg/WindowBg is "draw nothing", and 1,1,1,1 as a TINT is identity for AddImage.
+COLOR_SENTINELS = ("ImVec4(0, 0, 0, 0)", "ImVec4(0,0,0,0)", "ImVec4(0.0f, 0.0f, 0.0f, 0.0f)",
+                   "ImVec4(1, 1, 1, 1)", "ImVec4(1,1,1,1)", "ImVec4(1.0f, 1.0f, 1.0f, 1.0f)")
+# Files that AUTHOR colors rather than consume roles. ui_theme.cpp defines the palettes; icons*.cpp
+# bakes atlas tints; provider_logos.cpp and tesseract.cpp draw BRAND marks, whose colors are owned
+# by the vendor / the logo spec and must NOT track the user's theme.
+COLOR_AUTHORING_FILES = {
+    "host/src/ui_theme.cpp",
+    "host/src/ui/icons.cpp",
+    "host/src/ui/icons_sdf.cpp",
+    "host/src/ui/provider_logos.cpp",
+    "host/src/ui/tesseract.cpp",
+}
+
+# ---- rule "glyph": codepoints the UI font does not carry ------------------------------------------
+# This is an ALLOWLIST transcribed from the source of truth, ui_theme.cpp uiGlyphRanges() (line 662)
+# and cadSymbolRanges() (675) — not a guessed blocklist. Anything outside these ranges was never
+# requested from the TTF, so ImGui has no cell for it and draws the notdef: a literal '?' in the
+# shipping UI. ui_theme.cpp:659-661 states the omission is deliberate ("Rubik does not ship them, so
+# leaving them out keeps the atlas small"), so the fix is always at the call site, never the font.
+#
+# Consequence worth knowing, because it is counter-intuitive and has caused over-correction: the
+# font DOES carry '…' U+2026, '—' U+2014, '·' U+00B7, '×' U+00D7 and '•' U+2022 — those are in
+# range and render correctly, and the app ships them. What it does NOT carry is every arrow,
+# checkmark, cross, filled/hollow circle, box-drawing rule and dingbat. Status marks belong in
+# ui::kit::statusGlyph (vector) or the icon atlas, never in a string. Shipped as a '?' at least
+# twice already: the 3D toggle's U+25CF and the PLM breadcrumb's U+25A3 + U+203A.
+GLYPH_ALLOWED_RANGES = (
+    (0x0000, 0x00FF),  # uiGlyphRanges: ASCII + Latin-1
+    (0x2010, 0x2027),  # uiGlyphRanges: general punctuation (dashes, quotes, bullet, ellipsis)
+    (0x2070, 0x209F),  # uiGlyphRanges: super/subscripts
+    (0x2205, 0x2205),  # CADSymbols: empty set / diameter
+    (0x2225, 0x2225),  # CADSymbols: parallel
+    (0x2261, 0x2261),  # CADSymbols: identical to
+    (0x2295, 0x2295),  # CADSymbols: circled plus
+    (0x2299, 0x2299),  # CADSymbols: circled dot
+    (0x22A5, 0x22A5),  # CADSymbols: perpendicular
+    (0x2300, 0x2300),  # CADSymbols: diameter sign
+    (0x25C6, 0x25C7),  # CADSymbols: filled/hollow diamond
+)
+UNICODE_ESCAPE_RE = re.compile(r"\\u[0-9a-fA-F]{4}")
+STRING_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def glyph_supported(cp: int) -> bool:
+    return any(lo <= cp <= hi for lo, hi in GLYPH_ALLOWED_RANGES)
+
+
+def glyph_offenders(code: str):
+    """Yield (kind, detail) for font-unsupported codepoints inside string literals on this line."""
+    for lit in STRING_LITERAL_RE.finditer(code):
+        text = lit.group(0)
+        for esc in UNICODE_ESCAPE_RE.finditer(text):
+            cp = int(esc.group(0)[2:], 16)
+            if not glyph_supported(cp):
+                yield ("escape", f"{esc.group(0)} (U+{cp:04X})")
+        for ch in text:
+            cp = ord(ch)
+            if cp > 0x7F and not glyph_supported(cp):
+                yield ("literal", f"U+{cp:04X} {ch!r}")
+
+
+# Strings that never reach the font: log/trace sinks and model-facing prompt text. A '→' in a
+# CEF_TRACE line or in a tool DESCRIPTION sent to the model is correct usage, not a render bug.
+GLYPH_NONUI_RE = re.compile(
+    r"\b(?:CEF_TRACE|addLog|std::printf|std::fprintf|printf|fprintf|snprintf_log|LOG_[A-Z]+|"
+    r"TRACE|logLine|appendLog)\s*\(")
+# tool_panel_tables.h is the MCP tool catalogue: every string in it is prompt text handed to the
+# model, not an ImGui label. Ranges/arrows there are meaningful to the model and must stay.
+GLYPH_NONUI_FILES = {"host/src/ui/tool_panel_tables.h"}
+# ---- rule "dupe": a second implementation of a ui::kit primitive ----------------------------------
+# The unification's whole point: ONE painter per composite widget. Per-domain entry points are
+# welcome (hundreds of call sites spell them plmEmptyState / kit::EmptyState / awEmptyState), but
+# their BODY must forward to ui::kit. A definition whose body never mentions ui::kit is a second
+# implementation, and second implementations are how the app drifted into eight empty-state
+# painters, six section headers and six spinner idioms in the first place.
+KIT_PRIMITIVE_DEF_RE = re.compile(
+    r"^\s*(?:static\s+|inline\s+)*(?:bool|void|float|int|ImU32|ImVec4|std::string)\s+"
+    r"(\w*(?:[Ss]ectionHeader|[Ee]mptyState|[Bb]lockedState|[Ss]pinner|[Pp]rimaryButton|"
+    r"[Ss]econdaryButton|[Dd]angerButton|[Cc]ardBegin|[Ss]tatusGlyph|[Pp]rogressBar|"
+    r"[Ss]egmentedControl|[Ii]nlineStatus|[Vv]alueChip|[Tt]oggleChip))\s*\(")
+KIT_FORWARD_WINDOW = 14   # lines of body inspected for a ui::kit:: call
+KIT_OWN_FILES = {"host/src/ui/widgets/kit.cpp", "host/src/ui/widgets/kit.h"}
+
 def lint_file(path: str, atlas: set[str], rules: set[str], findings: list):
     rel = os.path.relpath(path, REPO).replace(os.sep, "/")
     is_ribbon_def = rel.endswith("ribbon_def.cpp")
@@ -236,6 +345,42 @@ def lint_file(path: str, atlas: set[str], rules: set[str], findings: list):
                                          f'raw px literal {nm.group(1)} in {func}(...) not *uiScale',
                                          line.strip()))
 
+        if "color" in rules and not suppressed and rel not in COLOR_AUTHORING_FILES:
+            if COLOR_LITERAL_MACRO_RE.search(code) and not COLOR_IMAGE_TINT_RE.search(code):
+                findings.append((rel, n, "color",
+                                 "IM_COL32 with literal channels — use ui::palette role / "
+                                 "ui::kit::toneU32 / maxContrastTextOn", line.strip()))
+            if COLOR_CONTEXT_RE.search(code):
+                for m in COLOR_LITERAL_VEC_RE.finditer(code):
+                    if m.group(0).replace(" ", "") in [s.replace(" ", "") for s in COLOR_SENTINELS]:
+                        continue
+                    findings.append((rel, n, "color",
+                                     f"literal {m.group(0)} in a color call — use a palette role "
+                                     "or the AdaptiveSurface ink", line.strip()))
+            if GET_STYLE_COLOR_RE.search(code):
+                findings.append((rel, n, "color",
+                                 "GetStyleColorVec4 — reads ImGui state, not the palette role; "
+                                 "ignores the adaptive-surface ink", line.strip()))
+
+        if ("glyph" in rules and not suppressed and rel not in GLYPH_NONUI_FILES
+                and not GLYPH_NONUI_RE.search(code)):
+            for kind, detail in glyph_offenders(code):
+                findings.append((rel, n, "glyph",
+                                 f"font has no glyph for {detail} ({kind}) — renders as '?'; "
+                                 "use ui::kit::statusGlyph or an atlas icon", line.strip()))
+
+        if "dupe" in rules and not suppressed and rel not in KIT_OWN_FILES:
+            dm = KIT_PRIMITIVE_DEF_RE.match(code)
+            # A prototype is not an implementation. Header declarations end in ';' on the same
+            # line; a definition opens a body, so its line ends in '{' (or continues).
+            if dm and not code.rstrip().endswith(";"):
+                body = "".join(lines[n - 1:n - 1 + KIT_FORWARD_WINDOW])
+                if "ui::kit::" not in body and "kit::" not in body.split("(", 1)[-1]:
+                    findings.append((rel, n, "dupe",
+                                     f"{dm.group(1)}() paints its own {dm.group(1)} instead of "
+                                     "forwarding to ui::kit — second implementations are how the "
+                                     "app drifted into 8 empty-state painters", line.strip()))
+
 
 # ---- baseline -------------------------------------------------------------------------------------
 
@@ -256,7 +401,8 @@ def load_baseline(path):
 def main(argv) -> int:
     ap = argparse.ArgumentParser(description="Chudware GUI sizing/icon/theme linter")
     ap.add_argument("roots", nargs="*", default=None)
-    ap.add_argument("--rule", default="all", choices=["all", "icons", "theme", "scale"])
+    ap.add_argument("--rule", default="all",
+                    choices=["all", "icons", "theme", "scale", "color", "glyph", "dupe"])
     ap.add_argument("--report", default="text", choices=["text", "md"])
     ap.add_argument("--baseline", default=DEFAULT_BASELINE,
                     help="JSON baseline to ignore known findings (default: %(default)s)")
@@ -269,7 +415,8 @@ def main(argv) -> int:
         print(f"gui_lint: atlas not found at {ATLAS}", file=sys.stderr)
         return 2
     atlas = load_atlas_names(ATLAS)
-    rules = {"icons", "theme", "scale"} if args.rule == "all" else {args.rule}
+    rules = ({"icons", "theme", "scale", "color", "glyph", "dupe"}
+             if args.rule == "all" else {args.rule})
 
     explicit_roots = bool(args.roots)
     roots = args.roots if explicit_roots else list(DEFAULT_ROOTS)

@@ -2549,7 +2549,10 @@ float Renderer::averageLuminance(float x0, float y0, float x1, float y1) const {
         const float* row = &lumaGrid_[(size_t)gy * (size_t)lumaW_];
         for (int gx = gx0; gx < gx1; ++gx) { sum += row[gx]; ++count; }
     }
-    return count > 0 ? (float)(sum / count) : 0.5f;
+    // Same reasoning as the no-grid early-out above: a degenerate rect that sampled zero cells is
+    // UNKNOWN, not neutral. Returning 0.5f here reintroduced the exact tie adaptiveSurfaceStyled()
+    // loses, for the narrow case of a rect that clamped to nothing.
+    return count > 0 ? (float)(sum / count) : -1.0f;
 }
 
 // Dynamic-color stats (Liquid Glass v2.1): mean RGB + mean luminance + luminance variance under

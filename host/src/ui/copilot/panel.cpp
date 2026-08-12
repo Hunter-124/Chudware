@@ -63,10 +63,6 @@ static CpTab cpTabAfterClick(CpTab current, CpTab clicked) {
 // Compact AI-settings popover body (provider + model + effort + run toggles + "All settings...");
 // defined below with the picker helpers, hosted by the header Settings button.
 
-// Clip a label to a pixel width with a real ellipsis, UTF-8 safe (defined with the Artifacts
-// presentation helpers below; declared here because the Sessions rows above need it too —
-// draw-list text is not clipped by its card, so every user-supplied string gets measured).
-static std::string artiEllipsize(const std::string& s, float maxW);
 
 // True when the plan has real checklist content — at least one non-subagent item
 // (step/task/part/objective/node) or an explicit fromEvent plan with a non-empty summary.
@@ -238,7 +234,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         auto cy1 = [&](float h) { ImGui::SetCursorPosY(rowTop1 + (rowH1 - h) * 0.5f); };
 
         const float tlW = measureBtn(tlLabel, "plan_board", /*withLabel=*/true);
-        const float artW = measureBtn("Artifacts", "team", tabLabels);
+        const float artW = measureBtn("Artifacts", "artifacts", tabLabels);
 
         // Shed the wordmark, then the mark, rather than letting the brand collide with the
         // chips. `pillGap` is the clearance each side of the logo cluster must keep.
@@ -345,7 +341,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     // you just picked lights up on the very frame you release the mouse. ----
     if (tabOut != tabIn) cpSetTab(st, tabOut);
     headerTextButtonPaint(hTasks, tlLabel,     tabOut == CpTab::Tasks,     "plan_board", true);
-    headerTextButtonPaint(hArts,  "Artifacts", tabOut == CpTab::Artifacts, "team",      tabLabels);
+    headerTextButtonPaint(hArts,  "Artifacts", tabOut == CpTab::Artifacts, "artifacts", tabLabels);
     headerTextButtonPaint(hChat,  "Chat",      tabOut == CpTab::Chat,      "ai_panel",  tabLabels);
     headerTextButtonPaint(hSess,  "Sessions",  tabOut == CpTab::Sessions,  "history",   tabLabels);
     headerTextButtonPaint(hGear,  "Settings",  tabOut == CpTab::Settings,  "settings",  tabLabels);
@@ -579,7 +575,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
                                         : 0.0f;
         const float textMaxW = std::max(ui::metrics::px(24.0f),
                                         rowW - padX * 2.0f - actionsReserve - chipW - runIndent);
-        const std::string titleShown = artiEllipsize(title, textMaxW);
+        const std::string titleShown = ui::kit::elide(title.c_str(), textMaxW);
         ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
         dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, titleShown.c_str());
 
@@ -613,7 +609,8 @@ void drawSessionsPanel(AppState& st, bool busy) {
         float badgeX0 = 0.0f, badgeX1 = 0.0f;
         if (!badge.empty()) {
             // Never let a long filename eat the whole sub line — cap at half the row.
-            badge = artiEllipsize(badge, std::max(ui::metrics::px(24.0f), rowW * 0.5f - padX));
+            badge = ui::kit::elide(badge.c_str(),
+                                   std::max(ui::metrics::px(24.0f), rowW * 0.5f - padX));
             badgeW = ImGui::CalcTextSize(badge.c_str()).x + 8.0f * sc;
             // Right-aligned at the row's true right edge — hover/active rows never reach
             // here (showBadge above), so this never collides with the action buttons.
@@ -627,7 +624,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
                                        subRight - (rowMin.x + padX + runIndent));
         dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY + titleH + 2.0f * sc),
                     ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
-                    artiEllipsize(sub, subMaxW).c_str());
+                    ui::kit::elide(sub, subMaxW).c_str());
 
         if (!badge.empty()) {
             const ImVec2 bsz = ImGui::CalcTextSize(badge.c_str());
@@ -772,34 +769,17 @@ static void drawTaskListPanel(AppState& st, bool busy) {
         return;
     }
 
-    const float S = ui::uiScale;
-    const float padX = ui::metrics::cpMenuRowPadX();
-    const float padY = ui::metrics::cpMenuRowPadY();
-    const float rowGap = ui::metrics::cpMenuRowGap();
-    const float rowH = ImGui::GetTextLineHeight() + padY * 2.0f;
-    const float dotR = ui::metrics::px(2.2f);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
+    // Subagent rows go through ui::kit::row like every other list row in the app: the hand-rolled
+    // version here painted its own glass background, its own hover wash and a generic 2.2px dot
+    // that carried no information — the same placeholder the artifact rows used, which is exactly
+    // the duplication the kit exists to end. The leading slot now says what the row IS.
     ImGui::PushID("task_subagents");
     for (size_t i = 0; i < subs.size(); ++i) {
-        ImGui::PushID((int)i);
-        const ImVec2 p0 = ImGui::GetCursorScreenPos();
-        const float rowW = ImGui::GetContentRegionAvail().x;
-        const ImVec2 p1(p0.x + rowW, p0.y + rowH);
-        ImGui::InvisibleButton("##subagent", ImVec2(rowW, rowH));
-        const bool hot = ImGui::IsItemHovered();
-        ui::glassRowBackground(dl, p0, p1, ui::metrics::cpMenuRowRound() / S,
-                               (i % 2) == 1, false, hot ? 0.42f : 0.30f);
-        const ImVec2 dotC(p0.x + padX + dotR, p0.y + rowH * 0.5f);
-        dl->AddCircleFilled(dotC, dotR,
-                            ImGui::ColorConvertFloat4ToU32(surf.textTertiary));
-        const float textX = dotC.x + dotR + ui::metrics::cpMenuLabelGap();
-        const float textW = std::max(ui::metrics::px(24.0f), p1.x - padX - textX);
-        dl->AddText(ImVec2(textX, p0.y + padY),
-                    ImGui::ColorConvertFloat4ToU32(surf.textPrimary),
-                    artiEllipsize(subs[i], textW).c_str());
-        if (hot) ImGui::SetTooltip("%s", subs[i].c_str());
-        ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + rowGap));
-        ImGui::PopID();
+        ui::kit::RowStyle rs;
+        rs.icon     = "ai_panel";
+        rs.iconTone = ui::kit::Tone::Accent;
+        rs.tooltip  = subs[i].c_str();
+        ui::kit::row(std::to_string(i).c_str(), subs[i].c_str(), rs);
     }
     ImGui::PopID();
 }

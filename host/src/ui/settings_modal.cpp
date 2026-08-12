@@ -3838,8 +3838,8 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::TableNextColumn();
         if (ImGui::Checkbox("Auto-route missions", &settings.autoMissionRouting))
             changed = true;
-        helpMarker("When on, Agent mode may auto-launch a mission (intake → "
-                   "breakdown → specialists) for build+analyze phrasing. "
+        helpMarker("When on, Agent mode may auto-launch a mission (intake, "
+                   "breakdown, specialists) for build+analyze phrasing. "
                    "Default off — the main chat stays on one direct agent "
                    "turn with tools.");
         ImGui::TableNextColumn();
@@ -7660,7 +7660,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 auto meta = r.result.value("meta", nlohmann::json::object());
                                 char buf[256];
                                 std::snprintf(buf, sizeof(buf),
-                                    "role=%s  tools≈%d  chars=%d  tokens≈%d  autolearn=%s",
+                                    "role=%s  tools~%d  chars=%d  tokens~%d  autolearn=%s",
                                     meta.value("role", "general_agent").c_str(),
                                     meta.value("allowed_tool_count", 0),
                                     meta.value("system_chars", 0),

@@ -218,7 +218,7 @@ void ConfigPanel::drawBody(AppState& st) {
 
         // Row: a selectable that also drives the override expansion below. The active config is
         // marked with a leading accent dot and bold-ish accent text (SolidWorks bolds the active).
-        std::string label = (isActive ? std::string(u8"●  ") : std::string("    ")) + name;
+        std::string label = (isActive ? std::string("*  ") : std::string("   ")) + name;
         if (isActive) ImGui::PushStyleColor(ImGuiCol_Text, accentCol);
         const bool clicked = ImGui::Selectable(label.c_str(), selected_ == i,
                                                ImGuiSelectableFlags_AllowDoubleClick);

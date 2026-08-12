@@ -26,6 +26,8 @@
 #include "core/async_rpc.h"
 #include "ui/file_dialog.h"
 #include "ui/icons.h"
+#include "ui/metrics.h"
+#include "ui/widgets/kit.h"
 #include "ui_theme.h"
 
 namespace ui {
@@ -33,129 +35,116 @@ namespace ui {
 PlmHubState g_plmHub;  // shared across the hub page TUs (plm_hub.h)
 
 // ---- shared widgets (used by every page) --------------------------------------
+//
+// The hub keeps these NAMES — hundreds of call sites across the PLM TUs (and
+// feature_tree.cpp) spell their headers, empty states and spinners this way — but
+// the painting belongs to ui::kit now, so the Project Hub, the Copilot, Parts and
+// Reverse Engineering all draw one header, one empty state and one spinner. What
+// survives in each wrapper is only the PLM default the kit deliberately does not
+// carry.
+
+// The kit's resting row wash (kit.cpp kRowBaseA). plmRowPill cannot call the kit's
+// row painter at all (see below), so it mirrors the one number that sets the look.
+constexpr float kPlmRowWashA = 0.16f;
+// Hub empty states own a whole page, so they sit a third of the way down the pane
+// instead of hugging its top edge.
+constexpr float kPlmEmptyDropFrac = 0.30f;
+// A superseded revision is the neutral tone held back — present, no longer current.
+constexpr float kSupersededDimA = 0.62f;
+
+// The kit's chip height (kit.cpp chipGeom: one text line plus U(0.5) top and bottom).
+// Needed to centre a pill inside a frame-height row; the kit exposes the corner
+// radius but not the height.
+inline float kPlmChipH() {
+    return ImGui::GetTextLineHeight() + ui::metrics::U(1.0f);
+}
 
 void plmRowPill(bool sel, float rows) {
-    float rowH = ImGui::GetFrameHeight() * rows;
-    ImVec2 p0  = ImGui::GetCursorScreenPos();
-    float  w   = ImGui::GetContentRegionAvail().x;
-    ImVec2 p1(p0.x + w, p0.y + rowH);
-    ui::glassRowBackground(ImGui::GetWindowDrawList(), p0, p1, 4.0f,
-                           false, sel, sel ? 0.42f : 0.20f);
+    // Background ONLY: the caller draws the row's content from this same cursor and
+    // owns its hit test, so this cannot forward to kit::rowBegin — that reserves the
+    // row with its own InvisibleButton and would swallow the caller's clicks. It does
+    // take the kit's row geometry and wash, so the hub's pills cannot drift from it.
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 p1(p0.x + ImGui::GetContentRegionAvail().x,
+                    p0.y + ImGui::GetFrameHeight() * rows);
+    ui::glassRowBackground(ImGui::GetWindowDrawList(), p0, p1,
+                           kit::rowRound() / ui::metrics::scale(), false, sel,
+                           kPlmRowWashA);
 }
 
 void plmSectionHeader(const char* label, const char* icon) {
-    const float S = ui::uiScale;
-    const float h = ImGui::GetFrameHeight();
-    if (icon && icon[0]) {
-        ImVec2 c = ImGui::GetCursorScreenPos();
-        const float isz = 17 * S;
-        ui::drawIconGlass(ImGui::GetWindowDrawList(), icon,
-                          ImVec2(c.x + isz * 0.5f, c.y + h * 0.5f), isz,
-                          Palette::toU32(palette.accent), 0);
-        ImGui::Dummy(ImVec2(isz + 9 * S, h));
-        ImGui::SameLine();
-    }
-    // Accent title, no underline — the old "underscore" rule read as clutter and
-    // clashed with the boxed glass panels. Icon (if any) is centred on the title.
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-    ImGui::PopStyleColor();
-    // No trailing Spacing() here — callers add exactly the gap they want (or none),
-    // instead of every title carrying an extra baked-in ItemSpacing underneath it.
+    // `first` suppresses the kit's leading section gap: hub headers open glass panels
+    // that already carry their own padding, and every caller places the gap above
+    // deliberately. Still no underline rule — that decision started here and the kit
+    // now carries it app-wide. The kit's headGap under the label replaces the frame
+    // padding the old header spent on AlignTextToFramePadding, so the rhythm holds
+    // and callers keep adding exactly the gap they want beneath.
+    kit::sectionHeader(label, icon, nullptr, -1, /*first=*/true);
+}
+
+// Legacy ASCII stand-in art ("[ ]", "(#)", "[ + ]") predates the icon atlas and was
+// typed straight into the call sites. The kit draws a real atlas glyph from a NAME,
+// so a bracket placeholder resolves to no icon rather than an unknown-name miss.
+static const char* plmEmptyIcon(const char* icon) {
+    if (!icon || !icon[0]) return nullptr;
+    return (icon[0] == '[' || icon[0] == '(') ? nullptr : icon;
 }
 
 void plmEmptyState(const char* icon, const char* msg, const char* sub) {
-    const float S = ui::uiScale;
-    ImGui::Dummy(ImVec2(0, ImGui::GetContentRegionAvail().y * 0.30f));
-    // A line that FITS is centred. A line that does not must WRAP: the old code
-    // centred unconditionally, and (avail - tw) * 0.5 goes negative once the text
-    // is wider than the pane — pushing it off the left edge and clipping it at
-    // both ends. Long hint sentences read as a paragraph instead.
-    auto centered = [](const char* t, ImVec4 col) {
-        const float avail = ImGui::GetContentRegionAvail().x;
-        const float tw    = ImGui::CalcTextSize(t).x;
-        ImGui::PushStyleColor(ImGuiCol_Text, col);
-        if (tw <= avail) {
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - tw) * 0.5f);
-            ImGui::TextUnformatted(t);
-        } else {
-            const float inset = avail * 0.08f;
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + inset);
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + avail - inset * 2.0f);
-            ImGui::TextUnformatted(t);
-            ImGui::PopTextWrapPos();
-        }
-        ImGui::PopStyleColor();
-    };
-    centered(icon, ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                          palette.textDisabled[2], 0.5f));
-    ImGui::Spacing();
-    centered(msg, ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-    if (sub)
-        centered(sub, ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                             palette.textDisabled[2], 0.8f));
-    ImGui::Dummy(ImVec2(0, 8.0f * S));
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetContentRegionAvail().y * kPlmEmptyDropFrac));
+    kit::emptyState(plmEmptyIcon(icon), msg, sub);
 }
 
-// Every "working" indicator in the product is the brand mark in motion, so this
-// hub-wide helper is now a thin alias over the shared one; it survives only
-// because seven call sites spell their busy state as plmSpinner("Loading…").
 void plmSpinner(const char* prefix) {
-    ui::busyLabel(prefix);
+    kit::spinner(prefix);
 }
 
 void plmError(const std::string& msg) {
-    if (msg.empty()) return;
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 1.0f));
-    ImGui::TextWrapped("%s", msg.c_str());
-    ImGui::PopStyleColor();
+    kit::inlineStatus(msg.c_str(), kit::Tone::Err);
 }
 
 void plmLifecycleBadge(const std::string& lifecycle, const std::string& rev) {
-    ImVec4 col;
-    const char* label = lifecycle.c_str();
-    if (lifecycle == "Released")
-        col = ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f);
-    else if (lifecycle == "Superseded")
-        col = ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                     palette.textDisabled[2], 1.0f);
-    else
-        col = ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    // Meaning -> colour goes through the kit's tone table, so a released revision
+    // reads the same green here, in the feature tree and in the Copilot. Superseded
+    // is the neutral tone held back, i.e. "was true, is not any more".
+    const bool released   = (lifecycle == "Released");
+    const bool superseded = (lifecycle == "Superseded");
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        kit::toneVec(released ? kit::Tone::Ok : kit::Tone::Neutral,
+                     superseded ? kSupersededDimA : 1.0f));
     if (!rev.empty())
-        ImGui::Text("%s \xc2\xb7 %s", rev.c_str(), label);
+        ImGui::Text("%s \xc2\xb7 %s", rev.c_str(), lifecycle.c_str());
     else
-        ImGui::Text("%s", label);
+        ImGui::Text("%s", lifecycle.c_str());
     ImGui::PopStyleColor();
 }
 
-// A short, coloured tag for a doc_type / kind — no atlas icons (avoids the
-// dual-source atlas staging trap); plain bracket tags read clearly.
+// A short tag for a doc_type / kind, drawn as the app-wide kit pill. The old form
+// was bracket text ("[PART]") because the hub had no chip of its own; the kit's pill
+// carries the same information with the boundary drawn instead of typed.
 void plmDocTypeTag(const std::string& docType, const std::string& kind) {
-    struct T { const char* tag; float r, g, b; };
-    std::string k = !docType.empty() ? docType : kind;
-    T t{"DOC", palette.textDim[0], palette.textDim[1], palette.textDim[2]};
-    if (k == "part")            t = {"PART", palette.accent[0], palette.accent[1], palette.accent[2]};
-    else if (k == "assembly")   t = {"ASM",  palette.accent[0], palette.accent[1], palette.accent[2]};
-    else if (k == "drawing")    t = {"DWG",  palette.accent[0], palette.accent[1], palette.accent[2]};
-    else if (k == "ecad")       t = {"PCB",  palette.accent[0], palette.accent[1], palette.accent[2]};
-    else if (k == "cam")        t = {"CAM",  palette.accent[0], palette.accent[1], palette.accent[2]};
-    else if (k == "spec")       t = {"SPEC", palette.statusWarn[0], palette.statusWarn[1], palette.statusWarn[2]};
-    else if (k == "report")     t = {"RPT",  palette.textDim[0], palette.textDim[1], palette.textDim[2]};
-    else if (k == "datasheet")  t = {"DATA", palette.textDim[0], palette.textDim[1], palette.textDim[2]};
-    else if (k == "spreadsheet")t = {"XLS",  palette.textDim[0], palette.textDim[1], palette.textDim[2]};
-    else if (k == "dataset")    t = {"CSV",  palette.textDim[0], palette.textDim[1], palette.textDim[2]};
-    else if (k == "image")      t = {"IMG",  palette.textDim[0], palette.textDim[1], palette.textDim[2]};
-    else if (k == "sim_study")  t = {"SIM",  palette.textDim[0], palette.textDim[1], palette.textDim[2]};
-    else if (k == "software")   t = {"CODE", palette.accent[0], palette.accent[1], palette.accent[2]};
-    else if (k == "linked_repo")t = {"LINK", palette.accent[0], palette.accent[1], palette.accent[2]};
-    ImGui::AlignTextToFramePadding();  // sit level with the path text / controls beside it
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(t.r, t.g, t.b, 1.0f));
-    ImGui::Text("[%s]", t.tag);
-    ImGui::PopStyleColor();
+    struct T { const char* tag; kit::Tone tone; };
+    const std::string k = !docType.empty() ? docType : kind;
+    T t{"DOC", kit::Tone::Neutral};
+    if (k == "part")             t = {"PART", kit::Tone::Accent};
+    else if (k == "assembly")    t = {"ASM",  kit::Tone::Accent};
+    else if (k == "drawing")     t = {"DWG",  kit::Tone::Accent};
+    else if (k == "ecad")        t = {"PCB",  kit::Tone::Accent};
+    else if (k == "cam")         t = {"CAM",  kit::Tone::Accent};
+    else if (k == "spec")        t = {"SPEC", kit::Tone::Warn};
+    else if (k == "report")      t = {"RPT",  kit::Tone::Neutral};
+    else if (k == "datasheet")   t = {"DATA", kit::Tone::Neutral};
+    else if (k == "spreadsheet") t = {"XLS",  kit::Tone::Neutral};
+    else if (k == "dataset")     t = {"CSV",  kit::Tone::Neutral};
+    else if (k == "image")       t = {"IMG",  kit::Tone::Neutral};
+    else if (k == "sim_study")   t = {"SIM",  kit::Tone::Neutral};
+    else if (k == "software")    t = {"CODE", kit::Tone::Accent};
+    else if (k == "linked_repo") t = {"LINK", kit::Tone::Accent};
+    // Centre the pill in a frame-height row so it sits level with the path text and
+    // controls beside it (the pill is shorter than a framed widget).
+    const float drop = (ImGui::GetFrameHeight() - kPlmChipH()) * 0.5f;
+    if (drop > 0.0f) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + drop);
+    kit::chip(t.tag, t.tone);
 }
 
 // ---- rail ---------------------------------------------------------------------
@@ -250,9 +239,13 @@ static void drawNavButton(const RailItem& r, int badge) {
         ImVec2 bp1(p1.x - badgeInset, p0.y + (h - bs.y) * 0.5f - 3 * S);
         ImVec2 bp0(bp1.x - badgePillW, bp1.y);
         bp1.y = bp0.y + bs.y + 6 * S;
-        dl->AddRectFilled(bp0, bp1, ImGui::GetColorU32(ImVec4(palette.statusWarn[0],
-            palette.statusWarn[1], palette.statusWarn[2], 0.90f)), (bs.y + 6 * S) * 0.5f);
-        dl->AddText(ImVec2(bp0.x + badgePadX, bp0.y + 3 * S), IM_COL32(20, 22, 26, 255), bbuf);
+        // The count sits ON the warn fill, so its ink is derived from that fill rather
+        // than assumed dark — the light theme's warn is bright enough to swallow it.
+        const ImVec4 fill(palette.statusWarn[0], palette.statusWarn[1],
+                          palette.statusWarn[2], 0.90f);
+        dl->AddRectFilled(bp0, bp1, ImGui::GetColorU32(fill), (bs.y + 6 * S) * 0.5f);
+        dl->AddText(ImVec2(bp0.x + badgePadX, bp0.y + 3 * S),
+                    ImGui::GetColorU32(ui::maxContrastTextOn(fill)), bbuf);
     }
     ImGui::PopID();
 }
@@ -280,24 +273,18 @@ static void drawTopNav(AppState& st) {
 // ---- onboarding (no project resolvable) ---------------------------------------
 
 static void drawOnboarding(AppState& st) {
-    plmEmptyState(
-        "[ + ]",
-        "Open a project folder",
-        "Use the folder button (top-right) to pick an existing project folder. "
-        "If the folder already has a .aicadvault, it is reused — history is never "
-        "reinitialized. Opening the same folder again is safe and idempotent. "
-        "You can also open or save a document under a folder to start history there.");
-    const float S = ui::uiScale;
-    float bw = 220 * S;
-    ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - bw) * 0.5f);
-    if (!st.workspaceDir.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
-        if (ImGui::Button("Use my workspace folder", ImVec2(bw, 0))) {
-            setActiveProjectDir(st, st.workspaceDir);
-        }
-        ImGui::PopStyleColor();
-    }
+    // The "use my workspace" offer IS the empty state's action, so it rides the kit's
+    // centred action slot instead of a hand-tinted ImGui::Button under it.
+    const bool haveWorkspace = !st.workspaceDir.empty();
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetContentRegionAvail().y * kPlmEmptyDropFrac));
+    if (kit::emptyState(
+            "open", "Open a project folder",
+            "Use the folder button (top-right) to pick an existing project folder. "
+            "If the folder already has a .aicadvault, it is reused — history is never "
+            "reinitialized. Opening the same folder again is safe and idempotent. "
+            "You can also open or save a document under a folder to start history there.",
+            haveWorkspace ? "Use my workspace folder" : nullptr))
+        setActiveProjectDir(st, st.workspaceDir);
 }
 
 } // anonymous namespace
@@ -330,7 +317,7 @@ void drawPlmWorkspace(AppState& st) {
     const float S = ui::uiScale;
 
     if (!st.workerStarted) {
-        plmEmptyState("[V]", "Project history unavailable",
+        plmEmptyState("warning_badge", "Project history unavailable",
                       "The Chudware service is not running.");
         return;
     }

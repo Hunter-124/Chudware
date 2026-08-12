@@ -414,86 +414,50 @@ void drawFitReadout(const FitReport& fit, bool detailed) {
     }
 }
 
+// The status-mark radius as a fraction of its glyph CELL. ui::kit::statusGlyph takes the radius
+// and reconstructs the cell from this same ratio (kit.cpp kGlyphRadiusFrac), so a caller that
+// reserves `box` gets art identical to every other status mark in the app.
+static constexpr float kStatusGlyphRadiusFrac = 0.30f;
+
+ui::kit::Status chatRowStatus(const std::string& status) {
+    if (status == "running")                    return ui::kit::Status::Running;
+    if (status == "pass" || status == "done")   return ui::kit::Status::Done;
+    if (status == "retry")                      return ui::kit::Status::Retry;
+    if (status == "fail" || status == "error")  return ui::kit::Status::Failed;
+    // "skipped" = the step deliberately did NOT run (harness intervention, e.g. the tool-loop
+    // guard refusing a repeated call). Informational, never alarming.
+    if (status == "skipped")                    return ui::kit::Status::Skipped;
+    return ui::kit::Status::Pending;
+}
+
 // Draw a run-status glyph (the turning brand mark while running / check / cross / retry ring /
 // "skipped" dash / pending hollow dot) centered in a `box`-wide cell at the cursor, then advance
-// past it. Shared by the plan checklist and the action cards so every surface shows the same
-// animated status art.
+// past it. Shared by the plan checklist, the action cards and the timeline spine.
+//
+// This WAS the canonical implementation; ui::kit::statusGlyph is the port of it, and the app now
+// has exactly one status painter. The wrapper survives because ~seven call sites spell the status
+// as the harness's raw string and pass a cell size — translating that at every site would buy
+// nothing. chatSurf() is the ink source: the copilot's cached adaptive surface, which the kit's
+// own ink-derived surface cannot see from inside a PushStyleColor'd card.
 void drawStatusGlyph(const std::string& status, float box) {
-    const auto& pal = ui::palette;
-    const ui::AdaptiveSurface& surf = chatSurf();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    const ImVec2 c(p0.x + box * 0.5f, p0.y + box * 0.5f);
-    const float r = box * 0.30f;
-    const bool running = status == "running";
-    const bool pass    = status == "pass" || status == "done";
-    const bool retry   = status == "retry";
-    const bool fail    = status == "fail";
-    // "skipped" = the step deliberately did NOT run (harness intervention, e.g. the tool-loop
-    // guard refusing a repeated call). Informational, never alarming: iterBuilt blue — the same
-    // palette role the "built" step badge and the AI-VC tool chip use.
-    const bool skipped = status == "skipped";
-    ImU32 col = ImGui::ColorConvertFloat4ToU32(
-        running || pass ? semanticOnGlass(pal.accent, surf)
-        : retry         ? semanticOnGlass(pal.statusWarn, surf)
-        : fail          ? semanticOnGlass(pal.statusErr, surf)
-        : skipped       ? semanticOnGlass(pal.iterBuilt, surf)
-                        : surf.textTertiary);
-    const float th = ui::metrics::stroke(1.6f);
-    if (running) {
-        // Busy state is the brand mark in motion, so a running step, the composer and the copilot
-        // header are all visibly the same object.
-        if (box >= ui::kTesseractSpinnerMinPx) {
-            ui::drawTesseractSpinner(dl, c, box, ImGui::GetTime(), col);
-        } else {
-            // Below the mark's legibility floor a 16-vertex wireframe is a smudge, so the original
-            // comet arc stays.
-            float t = (float)ImGui::GetTime();
-            const int seg = 14;
-            for (int s = 0; s < seg; ++s) {
-                float f = (float)s / seg, aa = t * 6.0f + f * 6.2831853f;
-                float al = 0.12f + 0.88f * f;
-                ImU32 cc = (col & 0x00FFFFFFu) | ((ImU32)(al * 255) << 24);
-                dl->AddCircleFilled(ImVec2(c.x + std::cos(aa) * r, c.y + std::sin(aa) * r), th,
-                                    cc);
-            }
-        }
-    } else if (pass) {                          // check mark
-        dl->AddLine(ImVec2(c.x - r * 0.55f, c.y + r * 0.05f),
-                    ImVec2(c.x - r * 0.10f, c.y + r * 0.50f), col, th);
-        dl->AddLine(ImVec2(c.x - r * 0.10f, c.y + r * 0.50f),
-                    ImVec2(c.x + r * 0.60f, c.y - r * 0.50f), col, th);
-    } else if (fail) {                          // cross
-        dl->AddLine(ImVec2(c.x - r * 0.5f, c.y - r * 0.5f),
-                    ImVec2(c.x + r * 0.5f, c.y + r * 0.5f), col, th);
-        dl->AddLine(ImVec2(c.x - r * 0.5f, c.y + r * 0.5f),
-                    ImVec2(c.x + r * 0.5f, c.y - r * 0.5f), col, th);
-    } else if (retry) {
-        dl->AddCircle(c, r, col, 12, th);
-    } else if (skipped) {                       // dash: nothing ran, nothing broke
-        dl->AddLine(ImVec2(c.x - r * 0.6f, c.y), ImVec2(c.x + r * 0.6f, c.y), col, th);
-    } else {
-        dl->AddCircle(c, r * 0.8f, col, 12, th);  // pending hollow dot
-    }
+    ui::kit::statusGlyph(ImGui::GetWindowDrawList(),
+                         ImVec2(p0.x + box * 0.5f, p0.y + box * 0.5f),
+                         box * kStatusGlyphRadiusFrac, chatRowStatus(status), chatSurf());
     ImGui::Dummy(ImVec2(box, box));
 }
 
 // The "AI is working" busy affordance for the chat column: the brand mark turning in place, so
 // the composer and the copilot header show the same object moving the same way while a run is
-// live. ImDrawList-only, driven by GetTime(); colors via palette / chatSurf (theme lint).
-// Sized to `box` (logical height of the glyph cell). Caller places it with Dummy/SetCursor.
+// live. Sized to `box` (logical height of the glyph cell); the caller places it with
+// Dummy/SetCursor. Busy IS the running status mark — same art, same legibility ladder, same
+// frame pump (kit::statusGlyph declares itself busy through ui::anim, which is what keeps the
+// mark turning at 60 fps instead of the idle loop's 20 Hz).
 void drawBusyMark(float box) {
-    const auto& pal = ui::palette;
-    const ui::AdaptiveSurface& surf = chatSurf();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    const ImVec2 c(p0.x + box * 0.5f, p0.y + box * 0.5f);
-    // The forge's brightest element (its strike face) was plain accent — keep that tone.
-    const ImU32 col = ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.accent, surf));
-    if (box >= ui::kTesseractSpinnerMinPx)
-        ui::drawTesseractSpinner(dl, c, box, ImGui::GetTime(), col);
-    else
-        dl->AddCircleFilled(c, box * 0.25f, col);  // legibility floor: a dot still reads as busy
+    ui::kit::statusGlyph(ImGui::GetWindowDrawList(),
+                         ImVec2(p0.x + box * 0.5f, p0.y + box * 0.5f),
+                         box * kStatusGlyphRadiusFrac, ui::kit::Status::Running, chatSurf());
     ImGui::Dummy(ImVec2(box, box));
 }
 

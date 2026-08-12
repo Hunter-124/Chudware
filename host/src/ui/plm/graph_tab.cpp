@@ -32,14 +32,17 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h" // ShadeVertsLinearColorGradientKeepAlpha (edge gradients)
 
 #include "core/app_state.h"
 #include "core/async_rpc.h"
 #include "gl_compat.h"
 #include "miniz.h"
 #include "stb_image.h"
+#include "ui/anim.h"
 #include "ui/icons.h"
 #include "ui/tesseract.h"
+#include "ui/widgets/kit.h"
 #include "ui_theme.h"
 
 namespace ui {
@@ -59,6 +62,21 @@ struct GNode {
   std::string metaPreview;    // file text_preview (<=300 chars, file nodes)
   std::string metaProject;    // owning project root (cross-project merges)
   std::string metaFolder;     // folder bucket for file nodes (By-folder layout)
+  // Vault identity stamped by cad_graph._merge_items (meta.item_id /
+  // part_number / lifecycle). lifecycle is the actionable one: it drives the
+  // node rim, so an assembly of Released parts with one In-work child reads
+  // without a click.
+  std::string metaItemId;
+  std::string metaPartNumber;
+  std::string metaLifecycle; // "In work" / "Released" / "Superseded" / ...
+  // Features and mates carry meta.suppressed. A suppressed feature that still
+  // has downstream DEPENDS_ON edges is exactly what makes a rebuild behave
+  // inexplicably, so it gets a hollow disc and dashed outgoing edges.
+  bool metaSuppressed = false;
+  // Equation nodes: expr / value / unit (meta.expr, meta.value, meta.unit).
+  std::string metaExpr;
+  std::string metaEqValue; // pre-formatted; the payload value may be any JSON
+  std::string metaEqUnit;
   float lx = 0.0f, ly = 0.0f; // layout coords (graph space)
   float lz = 0.0f;            // depth coord (3D projection mode only)
   float radius = 14.0f;
@@ -81,6 +99,9 @@ struct GEdge {
   nlohmann::json meta;     // full meta for the side panel
   int aggCount = 1;        // >1 when project-view edge is an aggregation
   int srcEdgeIdx = -1;     // original edges[] index (representative for panel)
+  // REFERENCES edges with meta.via == "external_ref" carry meta.stale. Promoted
+  // out of the json so the draw path branches on a bool, not a per-frame parse.
+  bool stale = false;
 };
 
 // Drawn edge after scope filtering / project-view aggregation.
@@ -89,6 +110,7 @@ struct VEdge {
   std::string dimLabel;
   int aggCount = 1;
   int srcEdgeIdx = -1; // index into GraphTabState::edges
+  bool stale = false;
 };
 
 // Per structural node: hidden descendant tallies (features / sketches / other).
@@ -115,6 +137,12 @@ struct GraphTabState {
   std::unordered_set<std::string> blast; // highlighted node ids (impact set)
   std::string blastEpicenter;            // node id rings expand from
   double blastT0 = 0.0;                  // ImGui::GetTime() when blast landed
+  // Hop distance from blastEpicenter over visibleEdges, so the shockwave can
+  // leave the epicentre ALONG the edges instead of as concentric rings drawn
+  // over unrelated geometry. Rebuilt lazily; the BFS needs visibleEdges, which
+  // does not exist yet when the impact RPC lands.
+  std::unordered_map<std::string, int> blastHop;
+  bool blastHopDirty = true;
   std::string selectedId;
   std::string hoverId;
   char search[128] = {};
@@ -175,6 +203,27 @@ struct GraphTabState {
   bool view3d = false;
   float orbitYaw = 0.55f;
   float orbitPitch = -0.30f;
+  // Camera TARGETS. Every input site writes these; the live orbit/pan/zoom
+  // above chase them through ui::anim::toward once per frame, which is what
+  // makes fly-to, inertia and idle drift a camera concern only — no layout
+  // position is ever touched (the hierarchy pack must stay frozen).
+  float orbitYawT = 0.55f;
+  float orbitPitchT = -0.30f;
+  float panXT = 0.0f, panYT = 0.0f, zoomT = 1.0f;
+  // Orbit throw: angular velocity captured on the last drag frame, decayed to
+  // rest after release (~0.6 s).
+  float orbitVelYaw = 0.0f, orbitVelPitch = 0.0f;
+  bool orbitDragging = false;
+  // Cursor parallax (3D): the projection leans a few degrees toward the
+  // cursor's offset from canvas centre. Live values; eased at kFast.
+  float parYaw = 0.0f, parPitch = 0.0f;
+  // Fly-to in flight until this timestamp — the camera eases at kSlow instead
+  // of kBase while a framing move is running.
+  double flyUntil = -1.0;
+  // Idle auto-orbit ("cinematic drift"): on by default, defeatable from the
+  // canvas mode badge. lastInputT is stamped by ANY pointer motion.
+  bool autoOrbit = true;
+  double lastInputT = 0.0;
   // Depth normalization for 3D: raw seed z (containment depth) is scaled so
   // the deepest node sits at a bounded fraction of the focal distance. Keeps
   // perspective sane (no clamp/blow-up) and depth readable for ANY tree size.
@@ -211,6 +260,16 @@ struct GraphTabState {
   // CONTAINS parent: child id → parent id (first parent wins; rebuilt with
   // data).
   std::unordered_map<std::string, std::string> containsParent;
+  // Whole-graph out/in degree per node id, hoisted out of the inspector's
+  // per-frame O(edges) rescan. Rebuilt with the data, not with the frame.
+  std::unordered_map<std::string, std::pair<int, int>> degree;
+  // instance:… node id → nodes[] index of the doc it instances (INSTANCE_OF
+  // target). Thumbnails MUST resolve through this: an instance's own path is
+  // the CONTAINING assembly, so the raw path renders the parent every time.
+  std::unordered_map<std::string, int> instTargetIdx;
+  bool edgeIndexDirty = true;
+  // Endpoints of a stale external reference, for the warning rim.
+  std::unordered_set<std::string> staleNodes;
 
   // Force-directed layout (graph_force.h). forceSlot maps nodes[] index →
   // sim node index (-1 when not in the sim); GNode::lx/ly stay the render
@@ -220,6 +279,11 @@ struct GraphTabState {
   int dragNode = -1;        // nodes[] index currently physics-dragged
   int dragCandidate = -1;   // nodes[] index pressed, awaiting drag threshold
   bool fitOnSettle = false; // fit once when a fresh layout first settles
+  // Per-frame scratch: visibleIdx re-sorted back-to-front by projected depth
+  // (3D only) plus the perspective each visible node projected to. Members so
+  // the sort does not allocate every frame at ME489 scale.
+  std::vector<int> drawOrder;
+  std::vector<float> perspOf; // indexed by nodes[] index
   // Search match cache (rebuilt when the query or visible set changes).
   std::unordered_set<std::string> matchIds;
   int visMatches = 0;
@@ -624,6 +688,34 @@ void rebuildIdIndex(GraphTabState &G) {
     G.idIndex[G.nodes[i].id] = i;
 }
 
+// Whole-graph derived edge facts that the DRAW and INSPECT paths used to
+// recompute by scanning G.edges every frame: out/in degree per node, and the
+// INSTANCE_OF target of every instance node. Both are O(edges) once per data
+// load instead of O(edges) per node per frame — at ME489 scale the old
+// inspector rescan alone was ~60k string compares a frame, and resolving an
+// instance thumbnail was the same scan again per instance.
+void rebuildEdgeIndex(GraphTabState &G) {
+  G.edgeIndexDirty = false;
+  G.degree.clear();
+  G.instTargetIdx.clear();
+  G.degree.reserve(G.nodes.size() * 2);
+  for (const auto &e : G.edges) {
+    ++G.degree[e.src].first;
+    ++G.degree[e.dst].second;
+    if (e.kind == "INSTANCE_OF" && e.src.rfind("instance:", 0) == 0 &&
+        !G.instTargetIdx.count(e.src)) {
+      auto it = G.idIndex.find(e.dst);
+      if (it != G.idIndex.end())
+        G.instTargetIdx[e.src] = it->second;
+    }
+  }
+}
+
+void ensureEdgeIndex(GraphTabState &G) {
+  if (G.edgeIndexDirty)
+    rebuildEdgeIndex(G);
+}
+
 // Transitive CONTAINS descendants → per-structural-node feature/sketch badges.
 void rebuildDescCounts(GraphTabState &G) {
   G.descCounts.clear();
@@ -717,6 +809,7 @@ void rebuildVisible(GraphTabState &G) {
       std::string src, dst, kind, origin, dimLabel;
       int count = 0;
       int srcEdgeIdx = -1;
+      bool stale = false; // any aggregated member stale → the bundle is stale
     };
     std::unordered_map<std::string, Agg> aggs;
     aggs.reserve(G.edges.size());
@@ -753,6 +846,7 @@ void rebuildVisible(GraphTabState &G) {
         a.origin = e.origin;
         a.dimLabel = e.dimLabel;
         a.srcEdgeIdx = ei;
+        a.stale = e.stale;
       } else {
         // Prefer extracted origin as representative when mixed.
         if (a.origin != "extracted" && e.origin == "extracted") {
@@ -760,6 +854,7 @@ void rebuildVisible(GraphTabState &G) {
           a.dimLabel = e.dimLabel;
           a.srcEdgeIdx = ei;
         }
+        a.stale = a.stale || e.stale;
       }
       ++a.count;
     }
@@ -781,6 +876,7 @@ void rebuildVisible(GraphTabState &G) {
       ve.dimLabel = a.dimLabel;
       ve.aggCount = a.count;
       ve.srcEdgeIdx = a.srcEdgeIdx;
+      ve.stale = a.stale;
       G.visibleEdges.push_back(std::move(ve));
     }
 
@@ -937,6 +1033,7 @@ void rebuildVisible(GraphTabState &G) {
       ve.dimLabel = e.dimLabel;
       ve.aggCount = 1;
       ve.srcEdgeIdx = ei;
+      ve.stale = e.stale;
       G.visibleEdges.push_back(std::move(ve));
     }
   } else {
@@ -1028,12 +1125,24 @@ void rebuildVisible(GraphTabState &G) {
       ve.dimLabel = e.dimLabel;
       ve.aggCount = 1;
       ve.srcEdgeIdx = ei;
+      ve.stale = e.stale;
       G.visibleEdges.push_back(std::move(ve));
     }
   }
 
+  // Endpoints of a stale external reference get a warning rim; recomputed
+  // here so the paint loop never re-scans.
+  G.staleNodes.clear();
+  for (const auto &ve : G.visibleEdges) {
+    if (!ve.stale)
+      continue;
+    G.staleNodes.insert(ve.src);
+    G.staleNodes.insert(ve.dst);
+  }
+
   G.layoutDirty = true;
   G.matchDirty = true;
+  G.blastHopDirty = true;
 }
 
 // True when the node has bom_item children — i.e. it can be viewed as an
@@ -2137,45 +2246,33 @@ void rebuildForce(GraphTabState &G) {
   }
 }
 
+// `phase` in [0,1) slides the dash pattern along the line by that fraction of
+// one dash+gap period — "marching ants". Callers that pass a live phase MUST
+// come from ui::anim::phase(), which requests frames; a raw GetTime() march
+// steps at the 20 Hz idle floor whenever the mouse is still.
 void drawDashedLine(ImDrawList *dl, ImVec2 a, ImVec2 b, ImU32 col, float thick,
-                    float dash = 6.0f, float gap = 4.0f) {
+                    float dash = 6.0f, float gap = 4.0f, float phase = 0.0f) {
   float dx = b.x - a.x, dy = b.y - a.y;
   float len = std::sqrt(dx * dx + dy * dy);
   if (len < 0.5f)
     return;
   float ux = dx / len, uy = dy / len;
-  float t = 0.0f;
+  const float period = dash + gap;
+  // Start one full period behind so the marched-in dash enters from the source
+  // end instead of popping into existence mid-line.
+  float t = -period + std::fmod(std::max(0.0f, phase), 1.0f) * period;
   bool on = true;
   while (t < len) {
     float seg = on ? dash : gap;
     float t1 = std::min(t + seg, len);
-    if (on) {
-      ImVec2 p0(a.x + ux * t, a.y + uy * t);
+    if (on && t1 > 0.0f) {
+      const float ts = std::max(t, 0.0f);
+      ImVec2 p0(a.x + ux * ts, a.y + uy * ts);
       ImVec2 p1(a.x + ux * t1, a.y + uy * t1);
       dl->AddLine(p0, p1, col, thick);
     }
     t = t1;
     on = !on;
-  }
-}
-
-// Busy indicator for the graph canvas overlay and the pending thumbnails.
-// Draw-list only (no widgets), driven by GetTime() so it stays alive while
-// G.loading keeps the frame loop busy via st.rpc.busy(). Takes a radius, not a
-// box, because its three call sites are all circle-shaped slots.
-void drawArcSpinner(ImDrawList *dl, ImVec2 c, float radius, ImU32 col) {
-  const float box = radius * 2.0f;
-  if (box >= ui::kTesseractSpinnerMinPx) {
-    ui::drawTesseractSpinner(dl, c, box, ImGui::GetTime(), col);
-  } else {
-    // Below the mark's legibility floor a 16-vertex wireframe is a smudge, so
-    // the original accent arc stays: ~2 rev/s, 270°.
-    const float t = (float)ImGui::GetTime();
-    const float a0 = t * (4.0f * 3.14159265f);
-    const float sweep = 3.14159265f * 1.5f;
-    const float th = std::max(1.5f, radius * 0.18f);
-    dl->PathArcTo(c, radius, a0, a0 + sweep, 24);
-    dl->PathStroke(col, 0, th);
   }
 }
 
@@ -2309,6 +2406,7 @@ void requestGraph(AppState &st, bool force) {
       G.available = false;
       G.nodes.clear();
       G.edges.clear();
+      G.edgeIndexDirty = true;
       G.err.clear();
       return;
     }
@@ -2390,6 +2488,24 @@ void requestGraph(AppState &st, bool force) {
           n.metaPreview = jstr(*m, "text_preview");
           n.metaProject = jstr(*m, "project");
           n.metaFolder = jstr(*m, "folder");
+          // Vault identity (_merge_items) — _sanitize_meta keeps these.
+          n.metaItemId = jstr(*m, "item_id");
+          n.metaPartNumber = jstr(*m, "part_number");
+          n.metaLifecycle = jstr(*m, "lifecycle");
+          if (auto sup = m->find("suppressed");
+              sup != m->end() && sup->is_boolean())
+            n.metaSuppressed = sup->get<bool>();
+          n.metaExpr = jstr(*m, "expr");
+          n.metaEqUnit = jstr(*m, "unit");
+          if (auto val = m->find("value"); val != m->end()) {
+            if (val->is_number()) {
+              char vb[32];
+              std::snprintf(vb, sizeof(vb), "%g", val->get<double>());
+              n.metaEqValue = vb;
+            } else if (val->is_string()) {
+              n.metaEqValue = val->get<std::string>();
+            }
+          }
         }
         if (n.id.empty())
           continue;
@@ -2417,6 +2533,8 @@ void requestGraph(AppState &st, bool force) {
           if (e.kind == "DERIVES_FROM" || e.kind == "REFERENCES" ||
               e.kind == "MATES")
             e.dimLabel = edgeDimLabel(*m);
+          if (auto stl = m->find("stale"); stl != m->end() && stl->is_boolean())
+            e.stale = stl->get<bool>();
         }
         if (e.src.empty() || e.dst.empty())
           continue;
@@ -2464,6 +2582,7 @@ void requestGraph(AppState &st, bool force) {
 
     // Indexes + descendant badges + scoped visible set (once per load).
     rebuildIdIndex(G);
+    rebuildEdgeIndex(G);
     rebuildContainsParent(G);
     rebuildDescCounts(G);
     // Drop stale drill target if the node vanished.
@@ -2530,6 +2649,7 @@ void requestBlast(AppState &st, const std::string &nodeId) {
     }
     G.blastEpicenter = nodeId;
     G.blastT0 = ImGui::GetTime();
+    G.blastHopDirty = true;
   });
 }
 
@@ -2764,13 +2884,11 @@ std::string resolveNodeAbsPath(AppState &st, const GNode &n) {
 const GNode *instanceTarget(const GraphTabState &G, const GNode &n) {
   if (n.id.rfind("instance:", 0) != 0)
     return nullptr;
-  for (const auto &e : G.edges)
-    if (e.kind == "INSTANCE_OF" && e.src == n.id) {
-      auto it = G.idIndex.find(e.dst);
-      if (it != G.idIndex.end())
-        return &G.nodes[it->second];
-    }
-  return nullptr;
+  // O(1) through the hoisted index: the node paint loop resolves one of these
+  // per instance per frame for billboards, and the old full-edge scan made
+  // that quadratic.
+  auto it = G.instTargetIdx.find(n.id);
+  return it == G.instTargetIdx.end() ? nullptr : &G.nodes[it->second];
 }
 
 // ---- hover thumbnails (.step+ package thumbnail.png via miniz)
@@ -2979,14 +3097,27 @@ struct Proj3 {
   float focal = 2400.0f;
 };
 
-Proj3 makeProj(const GraphTabState &G) {
+// Two spellings on purpose. makeProj() is the PAINT projection: it folds in
+// the cursor parallax lean, so hit-testing and drawing agree on exactly what
+// the user sees. makeProjTarget() is the FRAMING projection at the camera's
+// resting target, used by fitView/centerOnNode/flyTo so a fit computed while
+// the camera is still easing (or leaning) arrives correctly framed.
+Proj3 makeProjAt(float yaw, float pitch) {
   Proj3 P;
-  P.cy = std::cos(G.orbitYaw);
-  P.sy = std::sin(G.orbitYaw);
-  P.cp = std::cos(G.orbitPitch);
-  P.sp = std::sin(G.orbitPitch);
+  P.cy = std::cos(yaw);
+  P.sy = std::sin(yaw);
+  P.cp = std::cos(pitch);
+  P.sp = std::sin(pitch);
   P.focal = 2400.0f * ui::uiScale;
   return P;
+}
+
+Proj3 makeProj(const GraphTabState &G) {
+  return makeProjAt(G.orbitYaw + G.parYaw, G.orbitPitch + G.parPitch);
+}
+
+Proj3 makeProjTarget(const GraphTabState &G) {
+  return makeProjAt(G.orbitYawT, G.orbitPitchT);
 }
 
 // Returns perspective scale in perspOut (1 = at focal plane).
@@ -3023,12 +3154,17 @@ void updateZScale(GraphTabState &G) {
   G.zScale = maxAbsZ > 1.0f ? target / maxAbsZ : 1.0f;
 }
 
-void fitView(GraphTabState &G, ImVec2 canvasSz) {
-  if (G.visibleIdx.empty() || canvasSz.x < 1.0f || canvasSz.y < 1.0f)
+// Frame a set of visible nodes. Writes camera TARGETS only — the tween in
+// drawCanvas eases the live camera there, which is why Fit and fly-to read as
+// a dolly instead of a jump cut. `subset` empty = the whole visible set.
+void fitViewTo(GraphTabState &G, ImVec2 canvasSz,
+               const std::vector<int> &subset, float maxZoom) {
+  const std::vector<int> &set = subset.empty() ? G.visibleIdx : subset;
+  if (set.empty() || canvasSz.x < 1.0f || canvasSz.y < 1.0f)
     return;
-  const Proj3 P = makeProj(G);
+  const Proj3 P = makeProjTarget(G);
   float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
-  for (int vi : G.visibleIdx) {
+  for (int vi : set) {
     const GNode &n = G.nodes[vi];
     float px, py, persp;
     projectPoint(G, P, n.lx, n.ly, n.lz, px, py, persp);
@@ -3043,19 +3179,138 @@ void fitView(GraphTabState &G, ImVec2 canvasSz) {
   float pad = 40.0f * ui::uiScale;
   float zx = (canvasSz.x - pad * 2) / gw;
   float zy = (canvasSz.y - pad * 2) / gh;
-  G.zoom = std::clamp(std::min(zx, zy), 0.15f, 4.0f);
+  G.zoomT = std::clamp(std::min(zx, zy), 0.15f, maxZoom);
   float cx = (minX + maxX) * 0.5f;
   float cy = (minY + maxY) * 0.5f;
-  G.panX = canvasSz.x * 0.5f - cx * G.zoom;
-  G.panY = canvasSz.y * 0.5f - cy * G.zoom;
+  G.panXT = canvasSz.x * 0.5f - cx * G.zoomT;
+  G.panYT = canvasSz.y * 0.5f - cy * G.zoomT;
+}
+
+void fitView(GraphTabState &G, ImVec2 canvasSz) {
+  fitViewTo(G, canvasSz, {}, 4.0f);
 }
 
 void centerOnNode(GraphTabState &G, const GNode &n, ImVec2 canvasSz) {
-  const Proj3 P = makeProj(G);
+  const Proj3 P = makeProjTarget(G);
   float px, py, persp;
   projectPoint(G, P, n.lx, n.ly, n.lz, px, py, persp);
-  G.panX = canvasSz.x * 0.5f - px * G.zoom;
-  G.panY = canvasSz.y * 0.5f - py * G.zoom;
+  G.panXT = canvasSz.x * 0.5f - px * G.zoomT;
+  G.panYT = canvasSz.y * 0.5f - py * G.zoomT;
+}
+
+// Cinematic framing of one node plus its visible neighbourhood. Pan, zoom and
+// (in 3D) orbit all retarget together and the tween runs at kSlow, so the
+// camera swings around to the node instead of teleporting. Purely camera-side:
+// no layout position is touched, so the frozen hierarchy pack is untouched.
+void flyToNode(GraphTabState &G, const std::string &id, ImVec2 canvasSz) {
+  auto self = G.idIndex.find(id);
+  if (self == G.idIndex.end())
+    return;
+  std::vector<int> set;
+  set.push_back(self->second);
+  std::unordered_set<std::string> seen{id};
+  for (const auto &e : G.visibleEdges) {
+    if (G.hiddenKinds.count(e.kind))
+      continue;
+    const std::string *other = nullptr;
+    if (e.src == id)
+      other = &e.dst;
+    else if (e.dst == id)
+      other = &e.src;
+    if (!other || !seen.insert(*other).second)
+      continue;
+    auto it = G.idIndex.find(*other);
+    if (it != G.idIndex.end())
+      set.push_back(it->second);
+  }
+  if (G.view3d) {
+    // Swing a little so the move reads as a camera orbit, and settle the pitch
+    // at a three-quarter view where depth separation is legible.
+    G.orbitYawT += 0.35f;
+    G.orbitPitchT = -0.28f;
+    G.orbitVelYaw = 0.0f;
+    G.orbitVelPitch = 0.0f;
+  }
+  // A lone node would otherwise frame at the 4x clamp and fill the canvas.
+  fitViewTo(G, canvasSz, set, 1.8f);
+  G.flyUntil = ImGui::GetTime() + (double)ui::anim::kSlow * 2.0;
+  G.userNavigated = true;
+}
+
+// Atmospheric perspective: lerp a color toward the canvas bed by `k` (0 =
+// untouched, 1 = fully dissolved into the background), keeping its alpha. This
+// is what makes a 3D web read as depth rather than as a flat tangle.
+ImU32 hazeCol(ImU32 c, float k) {
+  if (k <= 0.001f)
+    return c;
+  k = std::clamp(k, 0.0f, 1.0f);
+  ImVec4 v = ImGui::ColorConvertU32ToFloat4(c);
+  v.x += (palette.panelBg[0] - v.x) * k;
+  v.y += (palette.panelBg[1] - v.y) * k;
+  v.z += (palette.panelBg[2] - v.z) * k;
+  return ImGui::ColorConvertFloat4ToU32(v);
+}
+
+ImVec2 lerpPt(ImVec2 a, ImVec2 b, float t) {
+  return ImVec2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+}
+
+// Hop distance from the blast epicentre along the VISIBLE edges. The impact
+// wave travels this, one hop at a time, so the animation shows the dependency
+// path the change actually propagates down rather than a circle expanding over
+// unrelated geometry. Rebuilt only when the blast or the visible set changes.
+void rebuildBlastHops(GraphTabState &G) {
+  G.blastHopDirty = false;
+  G.blastHop.clear();
+  if (G.blastEpicenter.empty() || G.visibleEdges.empty())
+    return;
+  std::unordered_map<std::string, std::vector<const std::string *>> adj;
+  adj.reserve(G.visibleEdges.size() * 2);
+  for (const auto &e : G.visibleEdges) {
+    adj[e.src].push_back(&e.dst);
+    adj[e.dst].push_back(&e.src);
+  }
+  std::vector<const std::string *> q;
+  q.reserve(G.blast.size() + 1);
+  G.blastHop[G.blastEpicenter] = 0;
+  q.push_back(&G.blastEpicenter);
+  for (size_t qi = 0; qi < q.size(); ++qi) {
+    const std::string &u = *q[qi];
+    const int d = G.blastHop[u];
+    auto ait = adj.find(u);
+    if (ait == adj.end())
+      continue;
+    for (const std::string *v : ait->second) {
+      auto ins = G.blastHop.emplace(*v, d + 1);
+      if (ins.second)
+        q.push_back(&ins.first->first);
+    }
+  }
+}
+
+// Hops are one kStagger apart by default (20 ms) — far too quick to read as
+// propagation across a dependency chain, so each hop is widened to ~8 of them.
+constexpr int kBlastHopStride = 8;
+
+int blastHopOf(const GraphTabState &G, const std::string &id) {
+  auto it = G.blastHop.find(id);
+  return it == G.blastHop.end() ? 0 : it->second;
+}
+
+// Vault lifecycle → rim tone. Released reads healthy, In work reads "this is
+// moving under you", anything terminal (Superseded / Obsolete) recedes.
+bool lifecycleRim(const std::string &lifecycle, float alpha, ImU32 &out) {
+  if (lifecycle.empty())
+    return false;
+  if (lifecycle == "Released")
+    out = ui::kit::toneU32(ui::kit::Tone::Ok, alpha);
+  else if (lifecycle == "In work")
+    out = ui::kit::toneU32(ui::kit::Tone::Warn, alpha);
+  else
+    out = ImGui::GetColorU32(ImVec4(palette.textDisabled[0],
+                                    palette.textDisabled[1],
+                                    palette.textDisabled[2], 0.55f * alpha));
+  return true;
 }
 
 bool matchesSearch(const GNode &n, const char *q) {
@@ -3406,10 +3661,15 @@ void drawSidePanel(AppState &st, float panelW) {
           ImVec2(p0.x + previewW * 0.5f, p0.y + previewH * 0.38f), r,
           kindColor(sel->kind, 0.35f), 28);
       if (gth.pending) {
-        // A render is queued/in flight — spinner above the hint.
-        drawArcSpinner(dl, ImVec2(p0.x + previewW * 0.5f,
-                                  p0.y + previewH * 0.20f),
-                       8.0f * S, kindColor(sel->kind, 0.9f));
+        // A render is queued/in flight — the brand mark above the hint. Placed
+        // by cursor because ui::kit::spinner is the app-wide busy indicator.
+        const ImVec2 keep = ImGui::GetCursorScreenPos();
+        const float box = ImGui::GetTextLineHeight();
+        ImGui::SetCursorScreenPos(
+            ImVec2(p0.x + previewW * 0.5f - box * 0.5f,
+                   p0.y + previewH * 0.20f - box * 0.5f));
+        ui::kit::spinner("");
+        ImGui::SetCursorScreenPos(keep);
       }
     }
     ImGui::Dummy(ImVec2(previewW, previewH));
@@ -3421,13 +3681,12 @@ void drawSidePanel(AppState &st, float panelW) {
 
   // ---- compact facts (no raw id dump; path is the locator) ---------------
   {
-    int outE = 0, inE = 0;
-    for (const auto &e : G.edges) {
-      if (e.src == sel->id)
-        ++outE;
-      if (e.dst == sel->id)
-        ++inE;
-    }
+    // Degree comes from the index rebuilt with the data, not from an O(edges)
+    // rescan on every frame the inspector is open.
+    ensureEdgeIndex(G);
+    const auto dit = G.degree.find(sel->id);
+    const int outE = dit == G.degree.end() ? 0 : dit->second.first;
+    const int inE = dit == G.degree.end() ? 0 : dit->second.second;
     char linksBuf[48];
     std::snprintf(linksBuf, sizeof(linksBuf), "%d out · %d in", outE, inE);
 
@@ -3737,8 +3996,30 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
                          ImGuiButtonFlags_MouseButtonLeft |
                              ImGuiButtonFlags_MouseButtonMiddle |
                              ImGuiButtonFlags_MouseButtonRight);
-  const bool hovered = ImGui::IsItemHovered();
+  const bool canvasHovered = ImGui::IsItemHovered();
   const ImVec2 origin = ImGui::GetItemRectMin();
+
+  // Mode badge geometry, hoisted to the top of the frame. The badge now hosts
+  // a real widget (the auto-orbit toggle) which is emitted AFTER the canvas
+  // InvisibleButton, so its hit box has to be subtracted from the canvas's own
+  // hover here — otherwise clicking the toggle would also deselect on canvas.
+  const char *modeTxt = G.view3d ? "3D" : "2D";
+  const char *modeBindings =
+      G.view3d ? "  |  left-drag orbit  |  right-drag pan  |  Shift+drag depth"
+               : "";
+  const ImVec2 modeSz = ImGui::CalcTextSize(modeTxt);
+  const ImVec2 bindSz = ImGui::CalcTextSize(modeBindings);
+  const float badgePadX = 8.0f * S, badgePadY = 4.0f * S;
+  const float badgeBtn = G.view3d ? ImGui::GetFrameHeight() : 0.0f;
+  const ImVec2 badge0(origin.x + 10.0f * S, origin.y + 10.0f * S);
+  const ImVec2 badge1(badge0.x + badgePadX * 2.0f + modeSz.x + bindSz.x +
+                          (badgeBtn > 0.0f ? badgeBtn + badgePadX : 0.0f),
+                      badge0.y + badgePadY * 2.0f +
+                          std::max(modeSz.y, badgeBtn));
+  const ImVec2 mpNow = ImGui::GetIO().MousePos;
+  const bool overBadge = mpNow.x >= badge0.x && mpNow.x <= badge1.x &&
+                         mpNow.y >= badge0.y && mpNow.y <= badge1.y;
+  const bool hovered = canvasHovered && !overBadge;
   ImDrawList *dl = ImGui::GetWindowDrawList();
   dl->PushClipRect(origin, ImVec2(origin.x + canvasSz.x, origin.y + canvasSz.y),
                    true);
@@ -4465,7 +4746,13 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     const float blockH = r * 2.0f + gap + ts.y;
     const ImVec2 spinC(origin.x + canvasSz.x * 0.5f,
                        origin.y + (canvasSz.y - blockH) * 0.5f + r);
-    drawArcSpinner(dl, spinC, r, Palette::toU32(palette.accent));
+    // The brand mark, not a bespoke arc: this file used to carry its own drawArcSpinner, one of
+    // six independent spinner idioms across the app. requestFrames() is required because a
+    // draw-list paint declares no motion of its own — without it this turns at the 20 Hz idle
+    // floor whenever the pointer is still, which is precisely the stutter ui/anim.h exists to fix.
+    ui::anim::requestFrames();
+    ui::drawTesseractSpinner(dl, spinC, r * 2.0f, ImGui::GetTime(),
+                             Palette::toU32(palette.accent));
     dl->AddText(
         ImVec2(origin.x + (canvasSz.x - ts.x) * 0.5f, spinC.y + r + gap),
         Palette::toU32(palette.accent), msg);
@@ -4875,8 +5162,13 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
           ui::drawIconGlass(dl, icon, ic, 26.0f * Sc, kindColor(n.kind, 0.9f),
                             0);
           if (th.pending) {
-            drawArcSpinner(dl, ImVec2(t0.x + tile * 0.5f, t0.y + tile * 0.78f),
-                           7.0f * Sc, kindColor(n.kind, 0.9f));
+            const ImVec2 keep = ImGui::GetCursorScreenPos();
+            const float box = ImGui::GetTextLineHeight();
+            ImGui::SetCursorScreenPos(
+                ImVec2(t0.x + tile * 0.5f - box * 0.5f,
+                       t0.y + tile * 0.78f - box * 0.5f));
+            ui::kit::spinner("");
+            ImGui::SetCursorScreenPos(keep);
           }
         }
 
@@ -4943,6 +5235,7 @@ void plmGraphOnProjectChanged() {
   freeAllGraphThumbs();
   G.nodes.clear();
   G.edges.clear();
+  G.edgeIndexDirty = true;
   clearBlast(G);
   G.selectedId.clear();
   G.hoverId.clear();

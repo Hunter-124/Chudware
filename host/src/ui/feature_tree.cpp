@@ -3655,7 +3655,7 @@ static void drawRollbackBarLine(AppState& st, bool enabled, const std::string& b
     // meaning obvious — clearly not a plain separator. Skipped when the bar is at the end.
     if (!barAfterFid.empty()) {
         ImGui::Dummy(ImVec2(0, 3.0f * rsc));
-        const char* rbLbl = "↓ rolled back";
+        const char* rbLbl = "rolled back";
         float rbW = ImGui::CalcTextSize(rbLbl).x;
         float rbX0 = ImGui::GetCursorPosX();
         ImGui::SetCursorPosX(rbX0 + std::max(0.0f, (w - rbW) * 0.5f));

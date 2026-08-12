@@ -503,7 +503,7 @@ private:
     mutable unsigned int lumaWebCounter_ = 0;        // web: sync-read throttle cadence (decoupled from fallback)
 #endif
     mutable int lumaW_ = 0, lumaH_ = 0;
-    mutable bool lumaEverRead_ = false;  // averageLuminance() returns 0.5f until this is true
+    mutable bool lumaEverRead_ = false;  // averageLuminance() returns -1 (unknown) until this is true
     bool backdropEnabled_ = true;
 
     // ---- T-RF13 adaptive quality ladder state ----

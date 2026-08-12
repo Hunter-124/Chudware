@@ -520,8 +520,12 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
 // label + duration/ops meta, the verdict folded in as a result line, an expandable drawer (a
 // legacy AgentStep's thinking/code/diff/thumbnail when attached, else the raw detail), and a red
 // border when the stage failed. `step` is non-null only for v1 runs that carry an AgentStep.
+//
+// `onSpine` = the run spine is drawing this row's status mark out in the left gutter, so the card
+// must NOT draw its own leading glyph — two marks for one step reads as two steps. The card keeps
+// drawing its own when it is rendered outside a timeline (drawToolCallRow's single-row entry).
 void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, float logW,
-                           bool liveFrontier) {
+                           bool liveFrontier, bool onSpine) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const bool running = a.status == "running";
@@ -548,7 +552,10 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);   // base ink (dimText derives from it)
 
     // ---- header row: status glyph + tool icon + label + meta ----
-    drawStatusGlyph(a.status, ImGui::GetTextLineHeight());
+    // The spine already carries this step's mark in the gutter; drawing a second one here would
+    // read as two steps. Still reserve the cell so the label column lines up either way.
+    if (onSpine) ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
+    else         drawStatusGlyph(a.status, ImGui::GetTextLineHeight());
     ImGui::SameLine(0, 6 * sc);
     ui::IconUV iv = ui::getIcon(stageIconName(a.stage, a.missionHeader), 20);
     if (iv.valid) {
@@ -1199,7 +1206,8 @@ static void drawToolDetailBox(const char* id, const std::string& text, ImFont* f
 // successful calls into one card (drawAgentTimeline computes both runs).
 static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& fonts,
                                 int failCount, bool liveFrontier, int callI = -1,
-                                const std::vector<ActivityItem*>* group = nullptr) {
+                                const std::vector<ActivityItem*>* group = nullptr,
+                                bool onSpine = false) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     // Chat-display prefs (cached in ai_prefs — safe to read per row per frame).
@@ -1293,8 +1301,12 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         }
     };
 
-    drawStatusGlyph(hardFail ? "retry" : guard ? "skipped" : a.status,
-                    ImGui::GetTextLineHeight());
+    // Same rule as drawActionCard: when the run spine owns this row's mark out in the gutter, the
+    // row must not paint a second one. The spine's own status resolution (spineStatusOf) applies
+    // the identical retry/skipped remap, so the gutter mark says exactly what this glyph would.
+    if (onSpine) ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
+    else         drawStatusGlyph(hardFail ? "retry" : guard ? "skipped" : a.status,
+                                 ImGui::GetTextLineHeight());
     ImGui::SameLine(0, 6 * sc);
     ui::IconUV iv = ui::getIcon("wrench", 20);
     if (iv.valid) {
@@ -1527,13 +1539,162 @@ void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
     drawToolCallRowImpl(st, a, fonts, /*failCount=*/1, /*liveFrontier=*/false);
 }
 
+// ---- transcript scroll anchors -----------------------------------------------------------------
+// The ONE anchor mechanism the run receipt's failure list and the cost-attribution strip share.
+// The scroll is DEFERRED rather than applied at click time because of the render-windowing cache
+// (ChatMsg::uiCachedH): when the footer is clicked, the target row may not be submitted this frame
+// at all — the message above it can still be collapsed to a spacer. So a request survives until
+// the row actually draws and consumes it, which also makes it correct across a scroll-height
+// change. Exactly one request is pending at a time; a second click simply retargets.
+namespace {
+ImGuiID g_pendingAnchor = 0;
+
+// Consumed by the timeline as it submits each row. Scrolls only the row that matches, and only
+// once — clearing the request here is what keeps the view from fighting the user afterwards.
+void consumeAnchorScroll(ImGuiID rowAnchor) {
+    if (!g_pendingAnchor || g_pendingAnchor != rowAnchor) return;
+    g_pendingAnchor = 0;
+    // Bias toward the top of the viewport rather than dead centre: the interesting content of a
+    // card is its header, and a tall card centred by its middle would put that header offscreen.
+    ImGui::SetScrollFromPosY(ImGui::GetCursorPosY(), 0.15f);
+}
+}  // namespace
+
+ImGuiID activityAnchorId(int activityIdx) {
+    // Keyed the way the timeline keys its rows: chat_log has already pushed the message index, and
+    // the timeline pushes the activity index per row, so deriving the id from the SAME scope makes
+    // a request raised in the turn footer resolve to the row the timeline will draw.
+    return ImGui::GetID((void*)(intptr_t)(activityIdx + 1));
+}
+
+void timelineScrollTo(ImGuiID anchor) { g_pendingAnchor = anchor; }
+
+bool activityIsGuardRefusal(const ActivityItem& a) { return toolRowIsGuardRefusal(a); }
+
+// ---- the run spine -----------------------------------------------------------------------------
+namespace {
+// One status mark on the rail. Collected during the row loop and painted afterwards, because the
+// rail's extent is only known once every row has landed.
+struct SpineMark {
+    float           y;
+    ui::kit::Status st;
+};
+
+// RAII guard around an ImDrawListSplitter. Merging is the whole point: an unmerged splitter does
+// not fail loudly, it silently corrupts every subsequent primitive in the window, which is a
+// spectacularly confusing failure mode to debug. The destructor merges if the caller has not, so
+// no early return — or an exception out of a card painter — can leak one.
+class ChannelSplit {
+public:
+    ChannelSplit(ImDrawList* dl, int channels) : dl_(dl) {
+        if (!dl_) return;
+        split_.Split(dl_, channels);
+        active_ = true;
+    }
+    ChannelSplit(const ChannelSplit&) = delete;
+    ChannelSplit& operator=(const ChannelSplit&) = delete;
+    ~ChannelSplit() { merge(); }
+    void setChannel(int c) {
+        if (active_) split_.SetCurrentChannel(dl_, c);
+    }
+    void merge() {
+        if (!active_) return;
+        active_ = false;
+        split_.Merge(dl_);
+    }
+
+private:
+    ImDrawList*        dl_ = nullptr;
+    ImDrawListSplitter split_;
+    bool               active_ = false;
+};
+
+// What this row's mark says. Deliberately the SAME remap the row's own glyph applies (a hard
+// repeated failure reads as retry, a loop-guard refusal as skipped rather than failed) so the
+// gutter can never disagree with the card beside it. `frontier` is the live row of a running turn:
+// its mark spins even when the event stream has not stamped a status yet, because something IS
+// happening — a hollow pending dot there would be a lie.
+ui::kit::Status spineStatusOf(const ActivityItem& a, bool turnRunning, bool frontier) {
+    if (a.status == "fail")
+        return toolRowIsGuardRefusal(a) ? ui::kit::Status::Skipped : ui::kit::Status::Failed;
+    if (a.status == "running" || (turnRunning && frontier)) return ui::kit::Status::Running;
+    if (a.status == "done" || a.status == "ok" || a.status == "pass") return ui::kit::Status::Done;
+    if (a.status == "skipped") return ui::kit::Status::Skipped;
+    if (a.status == "retry") return ui::kit::Status::Retry;
+    return ui::kit::Status::Pending;
+}
+
+// Paint the rail and its marks. Called with the splitter on the BACK channel so the hairline sits
+// under the cards no matter what order they were submitted in.
+//
+// The rail spans mark-to-mark, never the whole turn height: that is what makes it survive the
+// grouped-tool fold, the collapse animations and the synthesized "Session files" presentation row.
+// A row that drew nothing contributed no mark, so the rail simply does not reach it — it can never
+// draw a segment to a step that is not on screen.
+void paintRunSpine(ImDrawList* dl, float railX, float cell,
+                   const std::vector<SpineMark>& marks, bool running) {
+    if (!dl || marks.size() < 1) return;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const float r      = cell * 0.5f;
+    const float thick  = ui::metrics::stroke(1.0f);
+    const float top    = marks.front().y;
+    const float bottom = marks.back().y;
+
+    if (bottom > top) {
+        // The track: a hairline in the tertiary ink, so it reads as structure rather than content.
+        ImVec4 track = surf.textTertiary;
+        // 0.75, not 0.55: pixel-measured against the light glass surface, 0.55 put only ~30/255
+        // between the rail and the panel — below the point where a hairline reads as a deliberate
+        // connector rather than a compression artifact.
+        track.w *= 0.75f;
+        dl->AddLine(ImVec2(railX, top), ImVec2(railX, bottom),
+                    ImGui::ColorConvertFloat4ToU32(track), thick);
+
+        // The LIVE segment: from the last completed mark down to the running one, marching
+        // downward. This is the whole point of the spine — "how far into the turn is the agent"
+        // answerable at a glance. Only drawn while a turn is actually running, so a finished
+        // transcript is completely static and requests no frames.
+        if (running) {
+            size_t runIdx = marks.size();
+            for (size_t i = 0; i < marks.size(); ++i)
+                if (marks[i].st == ui::kit::Status::Running) { runIdx = i; break; }
+            if (runIdx < marks.size()) {
+                const float segTop = runIdx == 0 ? top : marks[runIdx - 1].y;
+                const float segBot = marks[runIdx].y;
+                if (segBot > segTop) {
+                    // A short bright head sliding down the segment, rather than pulsing the whole
+                    // length: motion with a direction reads as progress, motion without one reads
+                    // as an error state.
+                    const float span = segBot - segTop;
+                    const float head = ImMin(span, cell * 1.6f);
+                    const float p    = ui::anim::phase(ui::anim::kMarch);
+                    const float hy   = segTop + p * span;
+                    const ImU32 hot  = ui::kit::toneU32(ui::kit::Tone::Accent, 0.85f);
+                    const ImU32 cold = ui::kit::toneU32(ui::kit::Tone::Accent, 0.0f);
+                    const int   v0   = dl->VtxBuffer.Size;
+                    dl->AddLine(ImVec2(railX, ImMax(segTop, hy - head)), ImVec2(railX, hy), hot,
+                                ui::metrics::stroke(2.0f));
+                    ImGui::ShadeVertsLinearColorGradientKeepAlpha(
+                        dl, v0, dl->VtxBuffer.Size, ImVec2(railX, ImMax(segTop, hy - head)),
+                        ImVec2(railX, hy), cold, hot);
+                }
+            }
+        }
+    }
+    for (const SpineMark& mk : marks)
+        ui::kit::statusGlyph(dl, ImVec2(railX, mk.y), r, mk.st, surf);
+}
+}  // namespace
+
 
 void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
                               bool showThinking, bool isLastTurn) {
     if (m.activity.empty()) return;
-    // The default ImGui vertical item gap is menu-sized. Keep the entire activity run — including
-    // the unboxed context lines and cards delegated to cards.cpp — on the shared chat rhythm.
-    // Card renderers may push the same value locally so their standalone entry points match.
+    // ONE rhythm for the whole run (metrics.h:93): a streaming conversation is denser than a
+    // docked menu, and every kit widget any row draws — here, or in the corp/firm/swarm family
+    // cards.cpp draws for us — must resolve its padding from the SAME density or the stack
+    // alternates rhythms row to row, which is the uneven spacing a live session called trash.
+    ui::kit::pushDensity(ui::kit::Density::Compact);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
     const bool turnRunning = m.running;
@@ -1564,6 +1725,28 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         if (isProseOutputRow(a) && !ui::streamTextVisible(a.detail)) continue;
         lastVisible = i;
     }
+
+    // ---- the run spine -------------------------------------------------------------------
+    // A continuous hairline down the left gutter of the turn with each step's status mark ON it,
+    // so "how far into this run is the agent" is answerable across the room. The rail is derived
+    // ENTIRELY from where rows actually landed this frame, which is what makes it survive the
+    // grouped-tool fold, the collapse animations and the synthesized "Session files" row: a row
+    // that did not draw contributes no mark, and the rail spans mark-to-mark, so it can never
+    // run to a step that is not on screen.
+    //
+    // It paints into a BACK channel of the window draw list so it sits under every card
+    // regardless of submission order. ChannelSplit merges in its destructor, so every exit from
+    // this function — the normal path, and a throw out of any card painter — leaves the draw
+    // list intact; an unmerged splitter silently corrupts the whole window.
+    const float spineCell = ImGui::GetTextLineHeight();          // the status-mark glyph cell
+    const float spineW    = spineCell + ui::kit::padX();         // gutter the rows indent past
+    const float railX     = ImGui::GetCursorScreenPos().x + spineCell * 0.5f;
+    std::vector<SpineMark> spineMarks;
+    spineMarks.reserve(m.activity.size());
+    ImDrawList* const spineDl = ImGui::GetWindowDrawList();
+    ChannelSplit spine(spineDl, 2);
+    spine.setChannel(1);
+    ImGui::Indent(spineW);
     // Tool-call ordinal within the turn — the `i` of an AI-VC "call:<turn>:<i>" target.
     // Counted over rowKind-3 rows only (the timeline also carries thinking, context and
     // card rows), and NOT over the synthesized "Session files" artifact row, which is a
@@ -1578,7 +1761,19 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
         if (a.rowKind == 10 && a.stage == "class:pending") continue;
         const bool liveFrontier = turnRunning && (i == lastVisible);
+        // Deferred scroll-to-anchor: the receipt / cost strip requested this row LAST frame, when
+        // the render-windowing cache may still have had the message collapsed to a spacer.
+        // Resolved BEFORE PushID((int)i) so the id matches activityAnchorId's — that helper is
+        // documented to be called from the turn footer, i.e. the message scope, not the row scope.
+        // The cursor is at the row's top edge here, which is the position we want to bring into
+        // view; a tall card centred on its own middle would push its header offscreen.
+        consumeAnchorScroll(activityAnchorId((int)i));
         ImGui::PushID((int)i);
+        // Where this row's status mark sits on the rail, and what it says. Captured around the
+        // dispatch so a row that draws nothing (an empty prose segment) leaves no orphan mark.
+        const float rowTopY = ImGui::GetCursorScreenPos().y;
+        const ui::kit::Status rowStatus = spineStatusOf(a, turnRunning, i == lastVisible);
+        const bool onSpine = !isProseOutputRow(a) && a.rowKind != 1;
         if (isProseOutputRow(a)) {
             // The model's own words, in the column at the point it said them.
             drawProseBubble(a, fonts);
@@ -1654,7 +1849,7 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
             const int rewindIdx = (group.size() > 1 || chatFrontier) ? -1 : callIdx;
             drawToolCallRowImpl(st, m.activity[drawIdx], fonts, failCount,
                                 turnRunning && (frontIdx == lastVisible), rewindIdx,
-                                group.size() > 1 ? &group : nullptr);
+                                group.size() > 1 ? &group : nullptr, onSpine);
         } else if (a.rowKind == 10) {
             drawClassificationCard(a, fonts, turnRunning);
         } else if (a.rowKind == 19) {
@@ -1688,11 +1883,29 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         } else if (isThinkingItem(a)) {
             drawThinkingBlock(a, fonts, showThinking, liveFrontier);
         } else {
-            drawActionCard(a, nullptr, fonts, logW, liveFrontier);
+            drawActionCard(a, nullptr, fonts, logW, liveFrontier, onSpine);
+        }
+        // The mark's y: the row's own header line, not its centre — a card with a long open
+        // drawer would otherwise float its mark halfway down the rail, away from the title it
+        // belongs to. Clamped inside the row so a one-line row can never push it outside.
+        if (onSpine) {
+            const float rowBotY = ImGui::GetCursorScreenPos().y;
+            if (rowBotY > rowTopY) {
+                const float half = spineCell * 0.5f;
+                float my = rowTopY + ui::metrics::cpChatRowGap() + ui::kit::padY() + half;
+                const float lo = rowTopY + half;
+                const float hi = ImMax(lo, rowBotY - half);
+                spineMarks.push_back(SpineMark{ImClamp(my, lo, hi), rowStatus});
+            }
         }
         ImGui::PopID();
     }
+    ImGui::Unindent(spineW);
+    spine.setChannel(0);
+    paintRunSpine(spineDl, railX, spineCell, spineMarks, turnRunning);
+    spine.merge();   // explicit, ahead of the guard, so the rail is in the list before PopStyleVar
     ImGui::PopStyleVar();   // timeline-wide compact ItemSpacing
+    ui::kit::popDensity();
 }
 
 // Forward: user bubble + rewind/edit actions (defined after AI-VC helpers).

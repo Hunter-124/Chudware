@@ -59,6 +59,8 @@
 #include "ui/doc_tabs.h"        // ui::docTabStripHeight — top inset so the column clears the tab band
 #include "ui/model_registry.h"  // ui::ModelInfo / capability flags / provider mapping
 #include "ui/metrics.h"         // ui::metrics::px/U/asmHeaderIconGap
+#include "ui/widgets/kit.h"     // ui::kit — the app-wide widget vocabulary (status, rows, cards)
+#include "ui/anim.h"            // ui::anim — duration tokens, easing, the frame pump
 #include "ui/console_panel.h"   // drawConsoleBody (shared console helper)
 #include "ui/file_dialog.h"     // openFileDialog — composer paperclip attachments (M23)
 #include "ui/icons.h"           // getIcon / IconUV — composer settings glyph
@@ -93,6 +95,10 @@ const ui::AdaptiveSurface& chatSurf();
 ImVec4 semanticOnGlass(const float role[4], const ui::AdaptiveSurface& surf);
 ImU32  modeBorderColor(int mode);
 void   modeAccentRgb(int mode, float out[3]);
+// Map a raw ActivityItem/AgentStep status string ("running"/"pass"/"done"/"retry"/"fail"/
+// "skipped"/"") onto the kit's status vocabulary. ONE spelling of that mapping for the whole
+// copilot: the timeline spine, the action cards and the plan checklist all read it.
+ui::kit::Status chatRowStatus(const std::string& status);
 void   drawStatusGlyph(const std::string& status, float box);
 void   drawBusyMark(float box);
 GlassBubble beginGlassBubble(float width, ui::GlassLevel level, float rounding);
@@ -188,6 +194,23 @@ void        chatArtifactActions(AppState& st, const std::string& path);
 void        drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts);
 void        drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
                               bool showThinking, bool isLastTurn = false);
+// ---- transcript scroll anchors (activity_timeline) ----
+// The ONE anchor mechanism shared by the run receipt's failure list and the cost-attribution
+// strip: both need "take me to that action card". Keyed the way the timeline keys its rows —
+// activityAnchorId() must be called inside the SAME ImGui id scope drawAgentTimeline runs in
+// (chat_log pushes the message index; the id below adds the activity index), so a request made
+// from the turn footer resolves to the row the timeline will draw.
+//
+// The scroll is DEFERRED, not applied at click time: the render-windowing cache
+// (ChatMsg::uiCachedH) means the target row may not have been submitted yet this frame. The
+// request survives until the row draws, which is also what makes it correct for a message that
+// is currently collapsed to a spacer.
+ImGuiID     activityAnchorId(int activityIdx);
+void        timelineScrollTo(ImGuiID anchor);
+// True when a FAILED tool row is the harness's own loop-guard refusing a repeated call rather
+// than a tool that ran and broke. The run receipt counts those separately — a turn that burned
+// six calls on refusals must not read like a turn that did six units of work.
+bool        activityIsGuardRefusal(const ActivityItem& a);
 // Doc-id + atlas-glyph fold for agent-authored text, gated on ui::chatHumanizeDocIds().
 // `jsonBody` additionally strips the resolved-id parenthetical (tool-row args blobs).
 // Idempotent, with a no-allocation fast path.
@@ -369,6 +392,10 @@ std::string aiVcCallCheckpointId(int callI, const std::string& toolName);
 void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                    float panelW, int msgIdx);
 void drawChatLogWindowed(AppState& st);
+// Drop stick-to-bottom on EVERY chat surface. A deferred scroll-to-anchor lands one frame after
+// the click; chatLogStickToBottom runs after the log every frame and would snap straight back to
+// the tail, so the jump has to un-stick first.
+void chatLogBreakStick();
 
 // ---- conversations + persistence (conversations) ----
 // Sessions are first-class + document-independent (v2 flat store); Conversation::docLink is

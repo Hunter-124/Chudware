@@ -2606,7 +2606,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               AppState::AutoAxisCache ent;
               ent.id = "axis.auto:" + idA + "|" + idB;
               // Name uses original a/b display names (not id-sorted).
-              ent.name = "Axis " + a.name + " \u2229 " + b.name;
+              ent.name = "Axis " + a.name + " x " + b.name;
               ent.origin[0] = pt.x;
               ent.origin[1] = pt.y;
               ent.origin[2] = pt.z;

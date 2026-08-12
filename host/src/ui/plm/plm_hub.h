@@ -162,17 +162,33 @@ struct PlmHubState {
 
 extern PlmHubState g_plmHub;
 
-// ---- shared widgets (defined in plm_workspace.cpp) ----------------------------
+// ---- shared widgets ------------------------------------------------------------
+//
+// The hub's spelling of the app-wide vocabulary in ui/widgets/kit.h. The names and
+// signatures are load-bearing (hundreds of call sites, plus feature_tree.cpp), but
+// each one now forwards to ui::kit — the Project Hub paints no header, empty state,
+// chip or spinner of its own. Defined in plm_workspace.cpp.
 
+// A background-only row pill. Unlike ui::kit::row it does NOT reserve or hit-test the
+// row: the caller draws the content from the same cursor and owns the interaction.
 void plmRowPill(bool sel = false, float rows = 1.0f);
-// Accent title with an optional atlas icon lined up to its left. No underline —
-// matches the icon+title header used by the glass sub-panels (plmPanelBegin).
+// Accent title with an optional atlas icon lined up to its left. No underline and no
+// baked trailing gap — callers place the gap beneath deliberately.
 void plmSectionHeader(const char* label, const char* icon = nullptr);
+// `icon` is a contracts/icons.md name; the legacy ASCII stand-ins ("[ ]", "(#)") that
+// predate the atlas resolve to no icon.
 void plmEmptyState(const char* icon, const char* msg, const char* sub = nullptr);
 void plmSpinner(const char* prefix);
 void plmError(const std::string& msg);
 void plmLifecycleBadge(const std::string& lifecycle, const std::string& rev = "");
 void plmDocTypeTag(const std::string& docType, const std::string& kind);
+
+// The ONE liquid-glass action button (defined in plm_pages.cpp): frosted base +
+// vertical shine + border, an accent wash when `accent`, and an optional atlas icon
+// beside the label. Published here because the Graph tab needs the identical button —
+// it used to carry a near-byte copy that was 1 px narrower per side. Returns clicked.
+bool plmGlassButton(const char* id, const char* label, const char* icon,
+                    bool accent = false, float widthOverride = 0.0f);
 
 // ---- state helpers (defined in plm_state.cpp) ---------------------------------
 

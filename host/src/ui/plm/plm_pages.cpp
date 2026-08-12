@@ -24,6 +24,8 @@
 #include "core/async_rpc.h"
 #include "ui/file_dialog.h"
 #include "ui/icons.h"
+#include "ui/metrics.h"
+#include "ui/widgets/kit.h"
 #include "ui_theme.h"
 #include "util/time_local.h"
 
@@ -267,52 +269,9 @@ void plmPanelEnd() {
 
 void priorityDot(const std::string& pr);  // defined below; used by Overview too
 
-// A liquid-glass action button: the shared frosted-glass panel (translucent base +
-// vertical shine + specular + border), an accent-tinted wash when `accent`, and an
-// optional atlas icon + label centered inside. Matches the glass language used in
-// the ribbon / parts hub instead of a flat ImGui::Button. Returns clicked.
-bool plmGlassButton(const char* id, const char* label, const char* icon,
-                    bool accent = false, float widthOverride = 0.0f) {
-    const float S = ui::uiScale;
-    const float iconSz  = (icon && icon[0]) ? 16 * S : 0.0f;
-    const float iconGap = iconSz > 0 ? 6 * S : 0.0f;
-    const float padX    = 13 * S;
-    const float textW   = (label && label[0]) ? ImGui::CalcTextSize(label).x : 0.0f;
-    const float content = iconSz + iconGap + textW;
-    const float w = widthOverride > 0 ? widthOverride : (padX * 2 + content);
-    const float h = ImGui::GetFrameHeight();   // aligns with adjacent input rows
-
-    ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ImVec2 p1(p0.x + w, p0.y + h);
-    bool clicked = ImGui::InvisibleButton(id, ImVec2(w, h));
-    bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-
-    ui::glassBackground(dl, p0, p1, 9.0f);
-    if (accent) {
-        float a = held ? 0.92f : hov ? 0.80f : 0.66f;
-        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
-            palette.accent[0], palette.accent[1], palette.accent[2], a)), 9.0f * S);
-    } else if (hov) {
-        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
-            palette.text[0], palette.text[1], palette.text[2], held ? 0.10f : 0.06f)), 9.0f * S);
-    }
-
-    ImU32 tcol = accent ? IM_COL32(255, 255, 255, 255) : Palette::toU32(palette.text);
-    float x = p0.x + (w - content) * 0.5f;
-    if (iconSz > 0) {
-        ui::drawIconGlass(dl, icon, ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f),
-                          iconSz, tcol, 0);
-        x += iconSz + iconGap;
-    }
-    if (textW > 0)
-        dl->AddText(ImVec2(x, p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f), tcol, label);
-    return clicked;
-}
-
 void plmComingSoon(const char* title, const char* note) {
     plmSectionHeader(title);
-    plmEmptyState("[ \xc2\xb7 ]", note,
+    plmEmptyState(nullptr, note,
                   "This page is being built out in the Project Hub.");
 }
 
@@ -351,6 +310,71 @@ void doRecordOutside(AppState& st) {
 }
 
 }  // namespace
+
+// ---- the one glass action button (declared in plm_hub.h) ----------------------
+//
+// Deliberately NOT a forward to ui::kit::secondaryButton: that is a themed
+// ImGui::Button — flat fill, no atlas icon slot, no frosted base. This is the glass
+// language the ribbon and the Parts hub use, and the hub's action rows are built on
+// it. What it no longer owns is its own geometry: padding, corner radius and the icon
+// tier all come from the kit / metrics, so it tracks the app rhythm.
+//
+// The Graph tab used to carry a byte-copy of this with padX 12dp instead of 13dp,
+// which is why its buttons were a pixel narrower per side than every other page's.
+// One definition, published, ends that.
+namespace {
+constexpr float kGlassAccentIdleA  = 0.66f;
+constexpr float kGlassAccentHovA   = 0.80f;
+constexpr float kGlassAccentHeldA  = 0.92f;
+constexpr float kGlassGhostHovA    = 0.06f;
+constexpr float kGlassGhostHeldA   = 0.10f;
+}  // namespace
+
+bool plmGlassButton(const char* id, const char* label, const char* icon, bool accent,
+                    float widthOverride) {
+    const float iconSz  = (icon && icon[0]) ? ui::metrics::U(4.0f) : 0.0f;
+    const float iconGap = iconSz > 0.0f ? ui::metrics::U(1.5f) : 0.0f;
+    const float padX    = kit::padX();
+    const float textW   = (label && label[0]) ? ImGui::CalcTextSize(label).x : 0.0f;
+    const float content = iconSz + iconGap + textW;
+    const float w = widthOverride > 0.0f ? widthOverride : (padX * 2.0f + content);
+    const float h = ImGui::GetFrameHeight();   // aligns with adjacent input rows
+
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 p1(p0.x + w, p0.y + h);
+    const bool clicked = ImGui::InvisibleButton(id, ImVec2(w, h));
+    const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // glassBackground takes a LOGICAL dp radius; rowRound() is already scaled.
+    const float rndPx = kit::rowRound();
+    const float rndDp = rndPx / ui::metrics::scale();
+    ui::glassBackground(dl, p0, p1, rndDp);
+
+    ImVec4 fill(palette.accent[0], palette.accent[1], palette.accent[2],
+                held ? kGlassAccentHeldA : hov ? kGlassAccentHovA : kGlassAccentIdleA);
+    if (accent) {
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(fill), rndPx);
+    } else if (hov) {
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
+            palette.text[0], palette.text[1], palette.text[2],
+            held ? kGlassGhostHeldA : kGlassGhostHovA)), rndPx);
+    }
+
+    // On the accent wash the ink is derived from that fill, not assumed white — the
+    // light theme's accent is bright enough that white text vanishes on it.
+    const ImU32 tcol = accent ? ImGui::GetColorU32(ui::maxContrastTextOn(fill))
+                              : Palette::toU32(palette.text);
+    float x = p0.x + (w - content) * 0.5f;
+    if (iconSz > 0.0f) {
+        ui::drawIconGlass(dl, icon, ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f), iconSz,
+                          tcol, 0);
+        x += iconSz + iconGap;
+    }
+    if (textW > 0.0f)
+        dl->AddText(ImVec2(x, p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f), tcol, label);
+    return clicked;
+}
 
 void plmDrawOverviewPage(AppState& st) {
     auto& H = g_plmHub;

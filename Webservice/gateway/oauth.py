@@ -1,15 +1,19 @@
-"""Google and GitHub sign-in, hand-rolled on httpx + PyJWT.
+"""Google, GitHub, and Microsoft sign-in, hand-rolled on httpx + PyJWT.
 
-Two providers, one shared shape, ~200 lines. Authlib would add a dependency to
-the login path — the single riskiest path in the gateway — to save the code
+Three providers, one shared shape, ~300 lines. Authlib would add a dependency
+to the login path — the single riskiest path in the gateway — to save the code
 below, and would still need its own JWKS cache when ``auth.JWKSCache`` already
-exists and is already exercised by the Cloudflare Access branch.
+exists and is already exercised by the Cloudflare Access branch. MSAL would add
+a second, much larger one for a single provider.
 
-Google is OIDC: the ``id_token`` it returns is an RS256 JWT verified against
-Google's published JWKS, so the email arrives signed. GitHub is plain OAuth2
-with no identity token at all, so the email comes from a second authenticated
-call to ``GET /user/emails``, filtered to the address GitHub itself marks
-primary *and* verified — an unverified GitHub email is a claim, not a proof.
+Google and Microsoft are OIDC: the ``id_token`` they return is an RS256 JWT
+verified against published JWKS, so the email arrives signed. GitHub is plain
+OAuth2 with no identity token at all, so the email comes from a second
+authenticated call to ``GET /user/emails``, filtered to the address GitHub
+itself marks primary *and* verified — an unverified GitHub email is a claim,
+not a proof. Microsoft needs a further check of its own (see ``nOAuth`` at
+``_verify_microsoft_id_token``): in a multi-tenant app the ``email`` claim is
+only trustworthy when the tenant has proven it owns the domain.
 
 CSRF on the callback is the ``state`` parameter: a random nonce, HMAC-signed
 with the session secret and bound to the provider, stored as a SHA-256 in
@@ -54,6 +58,16 @@ GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 # acceptable; PyJWT takes a container for exactly this case.
 GOOGLE_ISSUERS = ("https://accounts.google.com", "accounts.google.com")
 
+# Entra endpoints are tenant-parameterised. Templates, not URLs: the tenant is
+# configuration and must be read at request time, never frozen at import.
+MICROSOFT_AUTHORITY = "https://login.microsoftonline.com"
+MICROSOFT_JWKS_URL_TEMPLATE = f"{MICROSOFT_AUTHORITY}/{{tenant}}/discovery/v2.0/keys"
+MICROSOFT_ISSUER_TEMPLATE = f"{MICROSOFT_AUTHORITY}/{{tid}}/v2.0"
+# Tenant selectors that are routing aliases rather than a directory: with any
+# of these the token's own ``tid`` is the only tenant we learn, so it cannot be
+# compared against configuration.
+MICROSOFT_MULTI_TENANT = frozenset({"common", "organizations", "consumers"})
+
 _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 
 
@@ -61,6 +75,9 @@ _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 class _Provider:
     name: str
     label: str
+    # URL *templates*. Entra's endpoints carry ``{tenant}``; Google's and
+    # GitHub's carry no placeholder, so ``_endpoint`` serves all three and the
+    # frozen table never holds a tenant that configuration has since changed.
     authorize_url: str
     token_url: str
     scope: str
@@ -81,9 +98,17 @@ PROVIDERS: dict[str, _Provider] = {
         token_url="https://github.com/login/oauth/access_token",
         scope="read:user user:email",
     ),
+    "microsoft": _Provider(
+        name="microsoft",
+        label="Microsoft",
+        authorize_url=f"{MICROSOFT_AUTHORITY}/{{tenant}}/oauth2/v2.0/authorize",
+        token_url=f"{MICROSOFT_AUTHORITY}/{{tenant}}/oauth2/v2.0/token",
+        scope="openid email profile",
+    ),
 }
 
 _google_jwks: JWKSCache | None = None
+_microsoft_jwks: dict[str, JWKSCache] = {}
 
 
 class OAuthError(Exception):
@@ -103,7 +128,19 @@ class OAuthError(Exception):
 def _credentials(provider: str) -> tuple[str, str]:
     if provider == "google":
         return settings.google_client_id, settings.google_client_secret
+    if provider == "microsoft":
+        return settings.microsoft_client_id, settings.microsoft_client_secret
     return settings.github_client_id, settings.github_client_secret
+
+
+def _tenant() -> str:
+    """The Entra tenant selector, read fresh on every call."""
+    return (settings.microsoft_tenant or "common").strip() or "common"
+
+
+def _endpoint(template: str) -> str:
+    """Resolve a provider URL template against the tenant configured *now*."""
+    return template.format(tenant=_tenant())
 
 
 def configured_providers() -> list[str]:
@@ -173,7 +210,9 @@ async def _exchange_code(provider: _Provider, code: str) -> dict[str, Any]:
     }
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
         response = await client.post(
-            provider.token_url, data=form, headers={"Accept": "application/json"}
+            _endpoint(provider.token_url),
+            data=form,
+            headers={"Accept": "application/json"},
         )
     if response.status_code != 200:
         log.warning(
@@ -212,6 +251,95 @@ def _verify_google_id_token(id_token: str) -> tuple[str, str]:
     if not claims.get("email_verified") or not authn.valid_email(email):
         raise OAuthError("Google did not supply a verified email address")
     return str(claims["sub"]), email
+
+
+def _microsoft_jwks_for(tenant: str) -> JWKSCache:
+    cache = _microsoft_jwks.get(tenant)
+    if cache is None:
+        cache = JWKSCache(MICROSOFT_JWKS_URL_TEMPLATE.format(tenant=tenant))
+        _microsoft_jwks[tenant] = cache
+    return cache
+
+
+def _edov_is_true(raw: Any) -> bool:
+    """``xms_edov`` reaches us as a JSON boolean from some tenants and as the
+    string "1" or "true" from others. Everything else, absence included, is
+    false."""
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true"}
+    return False
+
+
+def _verify_microsoft_id_token(id_token: str) -> tuple[str, str]:
+    tenant = _tenant()
+    client_id, _ = _credentials("microsoft")
+    try:
+        key = _microsoft_jwks_for(tenant).get_signing_key(id_token)
+        claims = jwt.decode(
+            id_token,
+            key.key,
+            algorithms=["RS256"],
+            audience=client_id,
+            # verify_iss is off ON PURPOSE, and the issuer is not going
+            # unchecked. With tenant "common" the issuer is per-directory —
+            # https://login.microsoftonline.com/<tid>/v2.0 — so there is no
+            # single string PyJWT could be handed up front. PyJWT's check is
+            # therefore compensated below by an exact comparison against the
+            # issuer the token's own ``tid`` implies, plus a tid bound. Both
+            # are required, so this is stricter than a static issuer, not
+            # looser.
+            options={
+                "require": ["exp", "iss", "aud", "sub", "tid"],
+                "verify_iss": False,
+            },
+        )
+    except jwt.PyJWTError as exc:
+        log.warning("oauth: microsoft id_token verification failed: %s", exc)
+        raise OAuthError("could not verify the response from Microsoft") from exc
+
+    tid = str(claims.get("tid") or "")
+    issuer = str(claims.get("iss") or "")
+    if not tid or not hmac.compare_digest(
+        issuer, MICROSOFT_ISSUER_TEMPLATE.format(tid=tid)
+    ):
+        raise OAuthError("that Microsoft token came from an unexpected issuer")
+    # A deployment pinned to one directory gets that pin enforced: a token from
+    # any other tenant is the wrong directory even when it is internally
+    # consistent.
+    if tenant not in MICROSOFT_MULTI_TENANT and not hmac.compare_digest(tid, tenant):
+        raise OAuthError("that Microsoft account is not in this deployment's directory")
+
+    # nOAuth. link_account() links a provider identity to an existing account
+    # BY EMAIL, and in a multi-tenant Entra app any tenant administrator can
+    # set an arbitrary, unverified ``email`` on a user in their own directory —
+    # including an address at a domain they do not own. Trusting the bare claim
+    # hands them the matching Chudware account; that is the published nOAuth
+    # account-takeover vector. ``xms_edov`` is Microsoft asserting the domain
+    # is verified as owned by the issuing tenant, so it is the only condition
+    # under which the claim is proof rather than tenant-controlled input.
+    if not _edov_is_true(claims.get("xms_edov")):
+        raise OAuthError(
+            "that Microsoft tenant has not proven it owns that email address, so "
+            "we cannot sign you in with it — use another sign-in method, or ask "
+            "your administrator to emit the xms_edov optional claim"
+        )
+    email = authn.normalize_email(claims.get("email"))
+    # No preferred_username fallback on purpose: it is a display hint the
+    # tenant also controls, so falling back to it would reopen nOAuth by
+    # another door.
+    if not authn.valid_email(email):
+        raise OAuthError("Microsoft did not supply a usable email address")
+
+    # oid + tid rather than sub: ``sub`` is a pairwise pseudonym scoped to this
+    # application as well as the user, so recreating the app registration
+    # rotates it and every linked account would orphan. ``oid`` is the
+    # immutable directory object id, unique only within its tenant, so the
+    # tenant-qualified pair is the durable global identity.
+    oid = str(claims.get("oid") or "").strip()
+    subject = f"{tid}.{oid}" if oid else str(claims["sub"])
+    return subject, email
 
 
 async def _github_identity(access_token: str) -> tuple[str, str]:
@@ -253,10 +381,12 @@ async def _github_identity(access_token: str) -> tuple[str, str]:
 async def resolve_identity(provider: _Provider, code: str) -> tuple[str, str]:
     """(subject, email) proven by ``provider`` for this authorization code."""
     token_payload = await _exchange_code(provider, code)
-    if provider.name == "google":
+    if provider.name in ("google", "microsoft"):
         id_token = str(token_payload.get("id_token") or "")
         if not id_token:
-            raise OAuthError("Google did not return an identity token")
+            raise OAuthError(f"{provider.label} did not return an identity token")
+        if provider.name == "microsoft":
+            return _verify_microsoft_id_token(id_token)
         return _verify_google_id_token(id_token)
     access_token = str(token_payload.get("access_token") or "")
     if not access_token:
@@ -320,12 +450,19 @@ async def oauth_start(provider: str, request: Request) -> Response:
             "response_type": "code",
             "scope": entry.scope,
             "state": mint_state(entry.name),
-            # Google only returns a refresh token with consent, which we do not
-            # want or store; select_account makes account switching possible.
-            **({"prompt": "select_account"} if entry.name == "google" else {}),
+            # Neither Google nor Microsoft returns a refresh token without a
+            # consent prompt, which we do not want or store; select_account is
+            # what makes account switching possible on both.
+            **(
+                {"prompt": "select_account"}
+                if entry.name in ("google", "microsoft")
+                else {}
+            ),
         }
     )
-    return RedirectResponse(f"{entry.authorize_url}?{query}", status_code=302)
+    return RedirectResponse(
+        f"{_endpoint(entry.authorize_url)}?{query}", status_code=302
+    )
 
 
 @router.get("/api/auth/oauth/{provider}/callback", response_model=None)
@@ -359,6 +496,10 @@ async def oauth_callback(
 __all__ = [
     "GOOGLE_ISSUERS",
     "GOOGLE_JWKS_URL",
+    "MICROSOFT_AUTHORITY",
+    "MICROSOFT_ISSUER_TEMPLATE",
+    "MICROSOFT_JWKS_URL_TEMPLATE",
+    "MICROSOFT_MULTI_TENANT",
     "OAuthError",
     "PROVIDERS",
     "check_state",

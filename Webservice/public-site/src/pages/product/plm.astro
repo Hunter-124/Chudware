@@ -1,0 +1,139 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import '../../styles/product.css';
+---
+<BaseLayout title="Product data and revisions" description="Projects, revision history with notes, supporting artifacts, and a node-and-edge project graph that shows how documents are connected.">
+  <header class="page-hero">
+    <div class="wrap">
+      <p class="eyebrow">Product / Collaborate</p>
+      <h1>One design identity, and the history that explains it.</h1>
+      <p class="lede">A project is the boundary for designs, assemblies, manufacturing artifacts, and revision history. Chudware keeps the sequence of decisions attached to the geometry, so a handoff carries the deliverable and the reasoning behind it.</p>
+      <ul class="product-hero-meta">
+        <li>Revisions with notes, not <code>_final_v7</code> filenames</li>
+        <li>Specifications, photos, reports, and supplier files as project items</li>
+        <li>Project graph, history timeline, and revision compare</li>
+      </ul>
+    </div>
+  </header>
+
+  <section class="section" aria-labelledby="history-title">
+    <div class="wrap">
+      <header class="section-heading">
+        <p class="eyebrow" id="history-title">Revision history</p>
+        <h2>History is a line you can walk back.</h2>
+        <p class="lede">Save a checkpoint when a design decision is ready to preserve, and use the note to explain why the design changed and what evidence you checked. The design keeps one identity; history carries the sequence.</p>
+      </header>
+      <figure class="product-diagram" data-lift>
+        <svg class="product-svg" viewBox="0 0 640 300" role="img" aria-labelledby="plm-diagram-title">
+          <title id="plm-diagram-title">A project timeline: four checkpoints on one design identity, each carrying a note, with supporting artifacts attached to the checkpoints they belong to.</title>
+          <defs>
+            <marker id="plm-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path class="product-svg-arrow-accent" d="M0,0 L10,5 L0,10 Z" />
+            </marker>
+          </defs>
+
+          <text class="product-svg-label-faint" x="40" y="30">PROJECT &middot; ONE DESIGN IDENTITY</text>
+
+          <line class="product-svg-hidden" x1="60" y1="120" x2="590" y2="120" />
+
+          <line class="product-svg-flow" x1="130" y1="120" x2="240" y2="120" marker-end="url(#plm-arrow)" />
+          <line class="product-svg-flow" x1="280" y1="120" x2="390" y2="120" marker-end="url(#plm-arrow)" />
+          <line class="product-svg-flow" x1="430" y1="120" x2="530" y2="120" marker-end="url(#plm-arrow)" />
+
+          <circle class="product-svg-node" cx="110" cy="120" r="17" />
+          <circle class="product-svg-node" cx="260" cy="120" r="17" />
+          <circle class="product-svg-node" cx="410" cy="120" r="17" />
+          <circle class="product-svg-node-accent" cx="550" cy="120" r="17" />
+          <text class="product-svg-title" x="110" y="125" text-anchor="middle">A</text>
+          <text class="product-svg-title" x="260" y="125" text-anchor="middle">B</text>
+          <text class="product-svg-title" x="410" y="125" text-anchor="middle">C</text>
+          <text class="product-svg-title" x="550" y="125" text-anchor="middle">D</text>
+
+          <text class="product-svg-label" x="110" y="84" text-anchor="middle">first layout</text>
+          <text class="product-svg-label" x="260" y="84" text-anchor="middle">wall thickened</text>
+          <text class="product-svg-label" x="410" y="84" text-anchor="middle">bolt circle set</text>
+          <text class="product-svg-label-dim" x="550" y="84" text-anchor="middle">current</text>
+
+          <line class="product-svg-con" x1="110" y1="137" x2="110" y2="190" />
+          <line class="product-svg-con" x1="260" y1="137" x2="260" y2="190" />
+          <line class="product-svg-con" x1="410" y1="137" x2="410" y2="190" />
+          <line class="product-svg-con" x1="550" y1="137" x2="550" y2="190" />
+
+          <rect class="product-svg-node" x="58" y="190" width="104" height="40" rx="3" />
+          <rect class="product-svg-node" x="208" y="190" width="104" height="40" rx="3" />
+          <rect class="product-svg-node" x="358" y="190" width="104" height="40" rx="3" />
+          <rect class="product-svg-node" x="498" y="190" width="104" height="40" rx="3" />
+          <text class="product-svg-label" x="110" y="215" text-anchor="middle">SPEC</text>
+          <text class="product-svg-label" x="260" y="215" text-anchor="middle">DRAWING</text>
+          <text class="product-svg-label" x="410" y="215" text-anchor="middle">CAM OUTPUT</text>
+          <text class="product-svg-label" x="550" y="215" text-anchor="middle">SUPPLIER PDF</text>
+
+          <text class="product-svg-label-faint" x="40" y="268">EACH CHECKPOINT CARRIES A NOTE: WHAT CHANGED, AND WHAT WAS CHECKED</text>
+        </svg>
+        <figcaption>Checkpoints on one identity, with supporting artifacts attached where they were produced.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="project-title">
+    <div class="wrap product-columns">
+      <div>
+        <header class="section-heading product-subhead">
+          <p class="eyebrow" id="project-title">Inside a project</p>
+          <h2>Keep related work under one root.</h2>
+        </header>
+        <p class="product-body">Native <code>.step+</code> files belong under the project root so Chudware can connect them without relying on absolute paths. Design files register through their save and checkpoint flow; supporting non-design files are added as project items.</p>
+        <p class="product-body">That distinction matters at handoff. A supplier PDF and a photo of a failed print are evidence, and they should sit beside the revision they justify rather than in someone's mailbox.</p>
+      </div>
+      <div class="product-spec-wrap">
+        <table class="product-spec">
+          <caption>What a project holds</caption>
+          <tbody>
+            <tr><th scope="row">Designs</th><td>Native <code>.step+</code> parts and assemblies under the project root</td></tr>
+            <tr><th scope="row">History</th><td>Checkpoints with revision notes, newest first</td></tr>
+            <tr><th scope="row">Artifacts</th><td>Specifications, photos, reports, supplier files as project items</td></tr>
+            <tr><th scope="row">Manufacturing</th><td>Job output produced from the designs in the same project</td></tr>
+            <tr><th scope="row">Compare</th><td>An item at two history points, including a rendered geometry diff</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="graph-title">
+    <div class="wrap split">
+      <header class="section-heading">
+        <p class="eyebrow" id="graph-title">Project graph</p>
+        <h2>See how the documents are actually connected.</h2>
+        <p class="lede">The PLM workspace renders the project as a node-and-edge graph: documents and related items as nodes, their relationships as edges. You can search it, scope into a single node and its neighbors, or switch to a grid view with rendered document previews.</p>
+        <p class="supporting-copy">Jumping from a part in the Feature Manager to that part's links in the graph is one action. The graph view depends on the project graph service, and Chudware hides the tab on builds that do not expose it rather than showing an empty page.</p>
+      </header>
+      <div class="product-note" data-lift>
+        <p class="eyebrow">Before a handoff</p>
+        <ul class="fact-list">
+          <li>Checkpoint the design so the recipient starts from a known state</li>
+          <li>Confirm every referenced part is available in the project</li>
+          <li>Include the relevant drawing, neutral export, or manufacturing output</li>
+          <li>Leave the decision trail intact &mdash; the notes are the handoff</li>
+        </ul>
+        <p><a class="text-link" href="/docs/plm/">Product data guide <span aria-hidden="true">&rarr;</span></a></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section cta-band">
+    <div class="wrap section-heading">
+      <p class="eyebrow">Next</p>
+      <h2>Give the work a project before it needs one.</h2>
+      <p class="lede">Open a browser workspace, or read how the copilot operates inside the same documents and history.</p>
+      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/product/copilot/">The AI copilot</a></div>
+      <ul class="product-jump">
+        <li><a href="/product/">All capabilities</a></li>
+        <li><a href="/product/modeling/">Modeling</a></li>
+        <li><a href="/product/assemblies/">Assemblies</a></li>
+        <li><a href="/product/cam/">CAM</a></li>
+        <li><a href="/docs/plm/">Docs</a></li>
+      </ul>
+    </div>
+  </section>
+</BaseLayout>

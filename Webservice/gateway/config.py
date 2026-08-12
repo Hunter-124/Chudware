@@ -237,6 +237,20 @@ class Settings:
     github_client_secret: str = field(
         default_factory=lambda: _env("CHUDWARE_WEB_GITHUB_CLIENT_SECRET", "") or ""
     )
+    # Microsoft (Entra ID). The tenant is part of every endpoint URL:
+    # "common" accepts both work/school and personal accounts, "organizations"
+    # only work/school, or a concrete tenant id/domain locks sign-in to one
+    # directory.
+    microsoft_client_id: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_MICROSOFT_CLIENT_ID", "") or ""
+    )
+    microsoft_client_secret: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_MICROSOFT_CLIENT_SECRET", "") or ""
+    )
+    microsoft_tenant: str = field(
+        default_factory=lambda: _env("CHUDWARE_WEB_MICROSOFT_TENANT", "common")
+        or "common"
+    )
     # ---- Stripe billing -------------------------------------------------
     # Unset is a supported deployment state. Once any subscription billing
     # credential is present, __post_init__ requires the complete set so the
@@ -317,6 +331,7 @@ class Settings:
         if not self.session_secret and (
             (self.google_client_id and self.google_client_secret)
             or (self.github_client_id and self.github_client_secret)
+            or (self.microsoft_client_id and self.microsoft_client_secret)
         ):
             raise ValueError(
                 "OAuth sign-in requires CHUDWARE_WEB_SESSION_SECRET "

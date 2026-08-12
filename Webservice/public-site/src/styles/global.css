@@ -128,7 +128,7 @@
   .split { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: clamp(2rem, 7vw, 6rem); align-items: center; }
   .split > .section-heading { margin-bottom: 0; }
   .site-footer { padding-block: var(--s8) var(--s5); border-top: var(--border) solid var(--line); background: var(--bg-deep); }
-  .footer-grid { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: var(--s7); }
+  .footer-grid { display: grid; grid-template-columns: 1.8fr repeat(3, minmax(0, 1fr)); gap: var(--s6) var(--s7); }
   .footer-grid > div p { max-width: 42ch; margin-top: var(--s4); color: var(--muted); font-size: var(--step--1); }
   .footer-grid nav { display: flex; flex-direction: column; }
   .footer-grid nav strong { margin-bottom: var(--s2); font-size: var(--step--1); }
@@ -145,10 +145,6 @@
   .hero-copy h1 { max-width: 11ch; }
   .hero-copy .lede { max-width: 38ch; }
   .hero-note { max-width: 58ch; padding-left: var(--s4); border-left: var(--border-strong) solid var(--technical); color: var(--faint); font: var(--step--1)/1.55 var(--mono); }
-  .product-frame { min-width: 0; padding: var(--s2); border: var(--border) solid var(--line-hi); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
-  .product-viewport { overflow: hidden; border-radius: var(--radius-sm); background: var(--bg-deep); }
-  .product-frame img { width: 124%; max-width: none; aspect-ratio: 1.55; object-fit: cover; object-position: left center; }
-  .product-caption { display: flex; justify-content: space-between; gap: var(--s3); padding: var(--s3) var(--s2) var(--s1); color: var(--faint); font: .7rem/1.4 var(--mono); }
   .architecture-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: var(--s7); border-block: var(--border) solid var(--line); }
   .architecture-strip div { min-width: 0; padding: var(--s4); border-right: var(--border) solid var(--line); }
   .architecture-strip div:last-child { border-right: 0; }
@@ -303,7 +299,7 @@
     .brand span { font-size: .72rem; }
     .hero { padding-block: var(--s7) var(--s6); }
     .hero-grid { gap: var(--s7); }
-    .product-caption { display: grid; }
+    .hero-visual { max-width: none; }
     .capability-index .wrap { grid-template-columns: 1fr; gap: var(--s4); }
     .stack-diagram { padding-left: 0; }
     .stack-diagram::before { display: none; }
@@ -335,11 +331,53 @@
   }
 }
 
+/* Interpolatable pointer position. Registering the properties is what lets the
+   spotlight ease back to centre instead of snapping when a card is released. */
+@property --mx { syntax: "<percentage>"; inherits: false; initial-value: 50%; }
+@property --my { syntax: "<percentage>"; inherits: false; initial-value: 50%; }
+@property --tilt-x { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+@property --tilt-y { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+
 @layer motion {
+  /* Pointer spotlight and tilt. The custom properties come from
+     scripts/effects.ts; with no script the initial values leave every surface
+     centred, unlit, and untilted, so this degrades to the plain card. */
+  .panel, .access-option, .gallery-card, .stack-node, [data-lift] {
+    position: relative;
+    transform: perspective(52rem) rotateX(var(--tilt-x)) rotateY(var(--tilt-y));
+    transition: transform .4s var(--ease), box-shadow .4s var(--ease), border-color .4s var(--ease);
+  }
+  .panel::after, .access-option::after, .gallery-card::after, .stack-node::after, [data-lift]::after {
+    content: ""; position: absolute; inset: 0; z-index: 0; opacity: 0; pointer-events: none;
+    background: radial-gradient(18rem 18rem at var(--mx) var(--my), var(--accent-wash), transparent 70%);
+    /* Screen so the wash can only lighten; it sits above the card's own text. */
+    mix-blend-mode: screen;
+    transition: opacity .4s var(--ease);
+  }
+  [data-live]::after { opacity: 1; }
+  [data-live] { border-color: var(--line-hi); box-shadow: 0 var(--s5) var(--s8) var(--shadow-color); }
+
   @media (prefers-reduced-motion: no-preference) {
     @supports (animation-timeline: view()) {
+      /* `translate`, not `transform`: the reveal has to compose with the
+         pointer tilt rather than overwrite it once the animation fills. */
       .section-heading, .stack-diagram, .workbench, .tool-loop, .gallery-card, .access-option { animation: enter linear both; animation-timeline: view(); animation-range: entry 0% entry 28%; }
-      @keyframes enter { from { opacity: .35; transform: translateY(var(--s4)); } to { opacity: 1; transform: none; } }
+      @keyframes enter { from { opacity: .35; translate: 0 var(--s4); } to { opacity: 1; translate: none; } }
+    }
+
+    @supports (animation-timeline: scroll()) {
+      /* Read-progress rail welded to the underside of the sticky header. */
+      .site-header::after {
+        content: ""; position: absolute; left: 0; bottom: calc(var(--border) * -1);
+        width: 100%; height: var(--border-strong); transform-origin: 0 50%;
+        background: linear-gradient(90deg, var(--accent), var(--technical));
+        animation: rail linear both; animation-timeline: scroll(root block);
+      }
+      @keyframes rail { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+
+      /* The header tightens once the hero is behind you. */
+      .header-inner { animation: condense linear both; animation-timeline: scroll(root block); animation-range: 0 12rem; }
+      @keyframes condense { to { min-height: 3.5rem; } }
     }
   }
   @media (prefers-reduced-motion: reduce) {

@@ -1,0 +1,184 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import '../../styles/product.css';
+---
+<BaseLayout title="Parametric modeling" description="Constraint sketching, driving dimensions, ordered features, and the Feature Manager, running on the OpenCascade 7.9 geometry kernel.">
+  <header class="page-hero">
+    <div class="wrap">
+      <p class="eyebrow">Product / Model</p>
+      <h1>Sketches that explain how the part may move.</h1>
+      <p class="lede">Chudware modeling is feature-based and history-driven. A constrained 2D sketch defines intent, a feature turns it into solid geometry, and the Feature Manager keeps that sequence editable for as long as the design lives.</p>
+      <ul class="product-hero-meta">
+        <li>OpenCascade / OCCT 7.9 kernel</li>
+        <li>2D constraint solver with degrees-of-freedom reporting</li>
+        <li>Native <code>.step+</code> documents</li>
+      </ul>
+    </div>
+  </header>
+
+  <section class="section" aria-labelledby="workspace-title">
+    <div class="wrap split">
+      <header class="section-heading">
+        <p class="eyebrow" id="workspace-title">The workspace</p>
+        <h2>Geometry on the left, construction history on the right.</h2>
+        <p class="lede">Features are not baked away when they are created. A box, a fillet, and a shell stay listed in order beside the model, and each one can be reopened, re-dimensioned, or reordered.</p>
+        <p class="supporting-copy">Saving as <code>.step+</code> keeps the feature tree, dimensions, materials, studies, and drawings in one editable document. STEP and STL exports exist for handing a flattened result to another tool, not for storing your design.</p>
+        <div class="actions"><a class="button button-secondary" href="/docs/first-part/">Read the first-part guide</a></div>
+      </header>
+      <figure class="product-figure" data-lift>
+        <img src="/images/modeling.png" width="1340" height="838" loading="lazy" alt="Chudware parametric modeling workspace showing a shelled enclosure in the 3D view with its Box, Fillet, and Shell features listed in the Feature Manager" />
+        <figcaption><span>Chudware modeling workspace</span><span>Ordered features &middot; OCCT 7.9</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="sketch-title">
+    <div class="wrap split product-split-diagram">
+      <figure class="product-diagram" data-lift>
+        <svg class="product-svg" viewBox="0 0 640 320" role="img" aria-labelledby="sketch-diagram-title">
+          <title id="sketch-diagram-title">A constrained sketch profile: relations hold the shape, driving dimensions set its size, and construction geometry carries symmetry.</title>
+          <defs>
+            <marker id="sketch-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path class="product-svg-arrow" d="M0,0 L10,5 L0,10 Z" />
+            </marker>
+          </defs>
+
+          <line class="product-svg-edge" x1="120" y1="40" x2="150" y2="40" />
+          <text class="product-svg-label-faint" x="158" y="44">PROFILE</text>
+          <line class="product-svg-dim" x1="250" y1="40" x2="280" y2="40" />
+          <text class="product-svg-label-faint" x="288" y="44">DRIVING DIMENSION</text>
+          <line class="product-svg-con" x1="450" y1="40" x2="480" y2="40" />
+          <text class="product-svg-label-faint" x="488" y="44">CONSTRUCTION</text>
+
+          <path class="product-svg-part" d="M120,220 L120,90 L430,90 A30,30 0 0 1 460,120 L460,220 Z" />
+          <circle class="product-svg-edge" cx="300" cy="170" r="26" />
+          <line class="product-svg-con" x1="300" y1="66" x2="300" y2="250" />
+
+          <line class="product-svg-dim" x1="104" y1="220" x2="136" y2="220" />
+          <line class="product-svg-dim" x1="120" y1="204" x2="120" y2="236" />
+          <text class="product-svg-label" x="100" y="246" text-anchor="end">ORIGIN</text>
+
+          <line class="product-svg-tick" x1="120" y1="228" x2="120" y2="284" />
+          <line class="product-svg-tick" x1="460" y1="228" x2="460" y2="284" />
+          <line class="product-svg-dim" x1="120" y1="276" x2="460" y2="276" marker-start="url(#sketch-arrow)" marker-end="url(#sketch-arrow)" />
+          <text class="product-svg-label-dim" x="290" y="268" text-anchor="middle">128.00</text>
+
+          <line class="product-svg-tick" x1="468" y1="90" x2="536" y2="90" />
+          <line class="product-svg-tick" x1="468" y1="220" x2="536" y2="220" />
+          <line class="product-svg-dim" x1="528" y1="90" x2="528" y2="220" marker-start="url(#sketch-arrow)" marker-end="url(#sketch-arrow)" />
+          <text class="product-svg-label-dim" x="540" y="158">62.00</text>
+
+          <path class="product-svg-dim" d="M452,98 L500,62 L534,62" marker-start="url(#sketch-arrow)" />
+          <text class="product-svg-label-dim" x="540" y="66">R30</text>
+
+          <path class="product-svg-dim" d="M282,152 L228,66 L196,66" marker-start="url(#sketch-arrow)" />
+          <text class="product-svg-label-dim" x="190" y="70" text-anchor="end">&#216;18</text>
+
+          <text class="product-svg-label" x="150" y="116">PERPENDICULAR</text>
+          <text class="product-svg-label" x="446" y="140" text-anchor="end">TANGENT</text>
+          <text class="product-svg-label-faint" x="300" y="304" text-anchor="middle">SKETCH STATUS: FULLY DEFINED &middot; 0 DOF</text>
+        </svg>
+        <figcaption>Relations first, then only the dimensions needed to set size and position.</figcaption>
+      </figure>
+      <header class="section-heading">
+        <p class="eyebrow" id="sketch-title">Constraint sketching</p>
+        <h2>Constrain intent, not the picture.</h2>
+        <p class="lede">Start with relations &mdash; coincident, horizontal, vertical, parallel, tangent, equal &mdash; then add only the dimensions that set size and position. The sketch status reports remaining degrees of freedom and flags conflicting constraints, so an under-defined profile is visible rather than surprising.</p>
+        <p class="supporting-copy">Where a part is naturally symmetric, reference the origin and construction geometry and mirror half the profile. That is more stable than dimensioning two nearly identical sides. If a sketch becomes over-defined, remove the newest redundant relation instead of suppressing the warning.</p>
+        <div class="actions"><a class="button button-secondary" href="/docs/sketching/">Sketching guide</a></div>
+      </header>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="loop-title">
+    <div class="wrap">
+      <header class="section-heading">
+        <p class="eyebrow" id="loop-title">The modeling loop</p>
+        <h2>How a part actually gets built.</h2>
+        <p class="lede">The same six steps cover the first bracket and the hundredth revision of it.</p>
+      </header>
+      <ol class="product-steps">
+        <li>
+          <div>
+            <h3>Start a document with a real name</h3>
+            <p>Create a part and name it for what it is, such as <code>mounting-bracket</code>. Revision numbers belong in project history, not in the filename.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Sketch on a plane</h3>
+            <p>Pick a reference plane, draw the profile, and keep each sketch focused. Several small sketches are easier to revise than one drawing that controls the entire part.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Add relations, then dimensions</h3>
+            <p>Apply horizontal, vertical, and coincident relations, then use Smart Dimension for the values that matter. A fully defined sketch cannot drift when an upstream dimension changes.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Choose the feature the profile implies</h3>
+            <p>A closed planar profile extrudes or revolves. Cross-sections on several planes loft. A profile following a path sweeps. Repeated geometry is built once and patterned.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Refine on the solid</h3>
+            <p>Select edges and apply Fillet or Shell. If a preview fails, reduce the radius or check whether the selected edges meet a very short face.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Save an editable design</h3>
+            <p>Save as <code>.step+</code> so the tree, dimensions, materials, studies, and drawings travel with the geometry. Export STEP or STL only for a downstream handoff.</p>
+          </div>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="spec-title">
+    <div class="wrap product-columns">
+      <div>
+        <header class="section-heading product-subhead">
+          <p class="eyebrow" id="spec-title">Specifics</p>
+          <h2>What the modeling workspace gives you.</h2>
+        </header>
+        <p class="product-body">Chudware is a large C++, Python, and TypeScript system built around the OpenCascade geometry kernel, a 2D constraint solver, and a feature tree. The browser workspace and the native Windows and Linux builds present the same modeling surface.</p>
+        <p class="product-body">View control stays out of the way: <code>F</code> fits the model, <code>0</code> returns to isometric, and the numbered keys jump to standard views while a command is running.</p>
+      </div>
+      <div class="product-spec-wrap">
+        <table class="product-spec">
+          <caption>Modeling reference</caption>
+          <tbody>
+            <tr><th scope="row">Geometry kernel</th><td>OpenCascade / OCCT 7.9</td></tr>
+            <tr><th scope="row">Sketch relations</th><td>Coincident, horizontal, vertical, parallel, tangent, equal</td></tr>
+            <tr><th scope="row">Sketch feedback</th><td>Remaining degrees of freedom and conflicting-constraint reporting</td></tr>
+            <tr><th scope="row">Profile features</th><td>Extrude, Revolve, Loft, Sweep, Pattern</td></tr>
+            <tr><th scope="row">Solid features</th><td>Fillet, Shell</td></tr>
+            <tr><th scope="row">History</th><td>Ordered Feature Manager tree, editable after the fact</td></tr>
+            <tr><th scope="row">Native format</th><td><code>.step+</code> &mdash; tree, dimensions, materials, studies, drawings</td></tr>
+            <tr><th scope="row">Neutral export</th><td>STEP, STL for downstream handoff</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section cta-band">
+    <div class="wrap section-heading">
+      <p class="eyebrow">Next</p>
+      <h2>Model it, then take it downstream.</h2>
+      <p class="lede">Open a workspace in the browser, or see how the same document carries into assemblies and manufacturing.</p>
+      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/product/assemblies/">Assemblies</a></div>
+      <ul class="product-jump">
+        <li><a href="/product/">All capabilities</a></li>
+        <li><a href="/product/cam/">CAM</a></li>
+        <li><a href="/product/plm/">Product data</a></li>
+        <li><a href="/product/copilot/">AI copilot</a></li>
+        <li><a href="/gallery/">Gallery</a></li>
+      </ul>
+    </div>
+  </section>
+</BaseLayout>

@@ -1,0 +1,178 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import '../../styles/product.css';
+---
+<BaseLayout title="AI copilot" description="An AI copilot that works inside the open Chudware document: it drives real modeling tools, its geometry lands in the same feature tree, and provider keys stay with your own account.">
+  <header class="page-hero">
+    <div class="wrap">
+      <p class="eyebrow">Product / Collaborate</p>
+      <h1>An assistant that operates the tools, not a chat window beside them.</h1>
+      <p class="lede">Describe the engineering outcome the way you would brief another engineer. Chudware translates the request into normal sketches and features, works in the open document, and reports what changed. The result is an ordinary model you can inspect, edit, and revise.</p>
+      <ul class="product-hero-meta">
+        <li>Works in the open document</li>
+        <li>Geometry lands in the same feature tree</li>
+        <li>Chudware-managed capacity or your own provider key</li>
+      </ul>
+    </div>
+  </header>
+
+  <section class="section" aria-labelledby="brief-title">
+    <div class="wrap split">
+      <header class="section-heading">
+        <p class="eyebrow" id="brief-title">Describe the outcome</p>
+        <h2>Name the part, the critical dimensions, and what must not change.</h2>
+        <p class="lede">You do not need to know internal tool names or write JSON. A brief that states intent and constraints produces better work than a list of button clicks, for exactly the same reason it does with a colleague.</p>
+        <p class="supporting-copy">Follow-ups work best when they ask for something concrete: measure the minimum wall thickness, show the right view, check interference with the housing. Measurements and renders reduce ambiguity &mdash; they do not certify a design.</p>
+        <div class="actions"><a class="button button-secondary" href="/docs/ai-copilot/">Copilot guide</a></div>
+      </header>
+      <div class="product-compare">
+        <div class="product-compare-good" data-lift>
+          <p class="eyebrow">Useful brief</p>
+          <p>&ldquo;Add four M4 clearance holes on a 60 mm bolt circle, centered on the top face. Do not change the outer profile.&rdquo;</p>
+        </div>
+        <div data-lift>
+          <p class="eyebrow">Weak brief</p>
+          <p>&ldquo;Open the sketch tool, click the circle button, then pattern it around a bit.&rdquo;</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="loop-title">
+    <div class="wrap">
+      <header class="section-heading">
+        <p class="eyebrow" id="loop-title">The loop</p>
+        <h2>Intent in, inspectable geometry out.</h2>
+        <p class="lede">The copilot's activity appears in the copilot feed, and its geometry appears in the same feature tree you use manually. Nothing lands in a parallel, opaque model.</p>
+      </header>
+      <figure class="product-diagram" data-lift>
+        <svg class="product-svg" viewBox="0 0 640 300" role="img" aria-labelledby="copilot-diagram-title">
+          <title id="copilot-diagram-title">The copilot loop: a plain-language brief drives real modeling tools, the geometry lands in the open document's feature tree, and you review it before saving a revision.</title>
+          <defs>
+            <marker id="copilot-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path class="product-svg-arrow-accent" d="M0,0 L10,5 L0,10 Z" />
+            </marker>
+          </defs>
+
+          <rect class="product-svg-node-accent" x="60" y="40" width="180" height="70" rx="4" />
+          <text class="product-svg-title" x="80" y="70">INTENT</text>
+          <text class="product-svg-label" x="80" y="92">plain-language brief</text>
+
+          <rect class="product-svg-node" x="400" y="40" width="180" height="70" rx="4" />
+          <text class="product-svg-title" x="420" y="70">TOOLS</text>
+          <text class="product-svg-label" x="420" y="92">sketches + features</text>
+
+          <rect class="product-svg-node" x="400" y="190" width="180" height="70" rx="4" />
+          <text class="product-svg-title" x="420" y="220">MODEL</text>
+          <text class="product-svg-label" x="420" y="242">same feature tree</text>
+
+          <rect class="product-svg-node" x="60" y="190" width="180" height="70" rx="4" />
+          <text class="product-svg-title" x="80" y="220">REVIEW</text>
+          <text class="product-svg-label" x="80" y="242">measure, then save</text>
+
+          <line class="product-svg-flow" x1="250" y1="75" x2="392" y2="75" marker-end="url(#copilot-arrow)" />
+          <line class="product-svg-flow" x1="490" y1="120" x2="490" y2="182" marker-end="url(#copilot-arrow)" />
+          <line class="product-svg-flow" x1="390" y1="225" x2="250" y2="225" marker-end="url(#copilot-arrow)" />
+          <line class="product-svg-flow" x1="150" y1="180" x2="150" y2="118" marker-end="url(#copilot-arrow)" />
+
+          <rect class="product-svg-con" x="255" y="128" width="130" height="44" rx="4" />
+          <text class="product-svg-label-dim" x="320" y="155" text-anchor="middle">OPEN DOCUMENT</text>
+
+          <text class="product-svg-label-faint" x="320" y="62" text-anchor="middle">REQUEST</text>
+          <text class="product-svg-label-faint" x="320" y="246" text-anchor="middle">EVIDENCE</text>
+        </svg>
+        <figcaption>Every pass ends with your judgment, not with the copilot's confidence.</figcaption>
+      </figure>
+      <ul class="product-tiles product-stack">
+        <li class="product-tile" data-lift><strong>Inspect geometry</strong><span>Read the open model rather than guessing at it.</span></li>
+        <li class="product-tile" data-lift><strong>Create and edit features</strong><span>Ordinary sketches and features in the feature tree.</span></li>
+        <li class="product-tile" data-lift><strong>Render views</strong><span>Alternate views to show what actually changed.</span></li>
+        <li class="product-tile" data-lift><strong>Measure results</strong><span>Concrete numbers you can check against intent.</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="review-title">
+    <div class="wrap">
+      <header class="section-heading">
+        <p class="eyebrow" id="review-title">After a change</p>
+        <h2>Four checks before a revision is worth saving.</h2>
+      </header>
+      <ol class="product-steps">
+        <li>
+          <div>
+            <h3>Rotate and look</h3>
+            <p>Inspect the highlighted feature in the 3D view. Geometry that reads correctly from one angle can be wrong from another.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Measure the critical dimensions</h3>
+            <p>Use <strong>Evaluate</strong> on the dimensions that actually matter for fit, strength, or process.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Open the edited feature</h3>
+            <p>Confirm its references. A feature attached to the wrong face is a problem that surfaces two revisions later.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Save a revision when it matches your intent</h3>
+            <p>Not before. If the run went the wrong direction, stop it, explain the mismatch in plain language, and point at the last good feature or revision instead of stacking corrective edits on geometry you no longer trust.</p>
+          </div>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="providers-title">
+    <div class="wrap product-columns">
+      <div>
+        <header class="section-heading product-subhead">
+          <p class="eyebrow" id="providers-title">How AI is provided</p>
+          <h2>Managed capacity, or your own key.</h2>
+        </header>
+        <p class="product-body">During onboarding you choose how AI work is paid for and where it is sent. Managed work consumes Chudware credits. Bring-your-own-key work is sent directly through the provider you configured and does not consume Chudware credits.</p>
+        <p class="product-body">A provider key you add belongs to your account and is entered in Chudware's AI setup screen. It is a secret: never paste it into a chat message or a project note.</p>
+        <p class="product-body"><a class="text-link" href="/pricing/">Access and commercial status <span aria-hidden="true">&rarr;</span></a></p>
+      </div>
+      <div class="product-spec-wrap">
+        <table class="product-spec">
+          <caption>Provider modes</caption>
+          <thead>
+            <tr><th scope="col"><span class="product-visually-hidden">Aspect</span></th><th scope="col">Managed</th><th scope="col">Your key</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">Chosen</th><td>During onboarding</td><td>During onboarding</td></tr>
+            <tr><th scope="row">Requests go</th><td>Through Chudware-managed capacity</td><td>Directly to the provider you configured</td></tr>
+            <tr><th scope="row">Chudware credits</th><td>Consumed</td><td>Not consumed</td></tr>
+            <tr><th scope="row">Key location</th><td>Not applicable</td><td>Chudware's AI setup screen, on your own account</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="product-note product-note-warning product-stack product-span-all" data-lift>
+        <p class="eyebrow">Machine actions stay deliberate</p>
+        <p>The copilot may prepare CAM operations and output, but anything that affects a physical machine requires explicit operator review and control. Safety, tolerance, material, and manufacturing decisions remain yours.</p>
+        <p><a class="text-link" href="/product/cam/">Manufacturing hand-off <span aria-hidden="true">&rarr;</span></a></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section cta-band">
+    <div class="wrap section-heading">
+      <p class="eyebrow">Next</p>
+      <h2>Try it against a model you can check.</h2>
+      <p class="lede">Create a browser account, or build the first part by hand and then ask the copilot to revise it.</p>
+      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/docs/first-part/">Build your first part</a></div>
+      <ul class="product-jump">
+        <li><a href="/product/">All capabilities</a></li>
+        <li><a href="/product/modeling/">Modeling</a></li>
+        <li><a href="/product/assemblies/">Assemblies</a></li>
+        <li><a href="/product/plm/">Product data</a></li>
+        <li><a href="/download/">Native access</a></li>
+      </ul>
+    </div>
+  </section>
+</BaseLayout>

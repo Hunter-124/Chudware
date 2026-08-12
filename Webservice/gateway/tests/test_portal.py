@@ -9,7 +9,7 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import accounts, app as app_mod, authn, billing, db, entitlement  # noqa: E402
+from gateway import accounts, app as app_mod, authn, billing, db, entitlement, oauth  # noqa: E402
 from gateway.config import settings  # noqa: E402
 
 
@@ -73,6 +73,28 @@ def test_portal_has_ordinary_csp_and_hashed_assets_are_immutable(pg, monkeypatch
     assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
     assert asset.headers["content-type"].startswith("application/javascript")
     assert hashlib.sha256(asset.content).hexdigest().startswith("8cfb5bf8c58b")
+
+
+def test_every_oauth_provider_has_a_button_on_the_signin_page(pg, monkeypatch):
+    """A provider the gateway can complete but never offers is unreachable.
+
+    ``oauth.PROVIDERS`` is the set of flows the callback route will honour, and
+    the sign-in page is hand-written HTML, so adding a provider without adding
+    its button is a silent dead end for every user who is not typing the start
+    URL by hand.
+    """
+    monkeypatch.setattr(settings, "dev_mode", False)
+    monkeypatch.setattr(settings, "session_secret", "signin-buttons-secret")
+    monkeypatch.setattr(settings, "cf_team_domain", "")
+    monkeypatch.setattr(settings, "cf_aud", "")
+    page = TestClient(app_mod.app).get("/signin")
+    assert page.status_code == 200
+    missing = [
+        name
+        for name in oauth.PROVIDERS
+        if f"/api/auth/oauth/{name}/start" not in page.text
+    ]
+    assert not missing, f"sign-in page offers no button for: {missing}"
 
 
 def test_portal_account_reports_plan_security_and_linked_identities(pg, monkeypatch):

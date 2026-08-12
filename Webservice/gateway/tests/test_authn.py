@@ -25,7 +25,9 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
@@ -682,6 +684,146 @@ def test_a_configured_provider_redirects_with_a_state_parameter(client, monkeypa
     assert query["response_type"] == ["code"]
     # The state we just minted must be live and redeemable exactly once.
     assert oauth.check_state("google", query["state"][0]) is True
+
+
+# ---------------------------------------------------------------------------
+# Microsoft (Entra ID)
+# ---------------------------------------------------------------------------
+
+MS_TENANT = "11111111-2222-3333-4444-555555555555"
+MS_OTHER_TENANT = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+MS_OID = "99999999-8888-7777-6666-555555555555"
+MS_CLIENT_ID = "ms-client-id"
+# Sentinel for "this claim is not in the token at all", which is distinct from
+# a claim present and false.
+ABSENT = object()
+
+
+@pytest.fixture(scope="module")
+def ms_key():
+    """One RSA key for the module — keygen is the expensive part, not signing."""
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def ms_claims(**overrides):
+    tid = overrides.get("tid", MS_TENANT)
+    claims = {
+        "iss": f"https://login.microsoftonline.com/{tid}/v2.0",
+        "aud": MS_CLIENT_ID,
+        "sub": "pairwise-subject-for-this-app",
+        "tid": tid,
+        "oid": MS_OID,
+        "email": "engineer@contoso.com",
+        "preferred_username": "attacker@chudware.com",
+        "xms_edov": True,
+        "iat": int(time.time()) - 5,
+        "exp": int(time.time()) + 300,
+    }
+    claims.update(overrides)
+    return {name: value for name, value in claims.items() if value is not ABSENT}
+
+
+def ms_signed(monkeypatch, ms_key, claims, tenant=MS_TENANT):
+    """A real RS256 token plus a JWKS cache holding the matching public key.
+
+    The JWKS *lookup* is stubbed, never ``jwt.decode``: signature, audience,
+    expiry and required-claim checks all run for real, which is the whole
+    point of the tests below.
+    """
+    monkeypatch.setattr(settings, "microsoft_client_id", MS_CLIENT_ID)
+    monkeypatch.setattr(settings, "microsoft_client_secret", "ms-secret")
+    monkeypatch.setattr(settings, "microsoft_tenant", tenant)
+
+    public_key = ms_key.public_key()
+
+    class _Cache:
+        def get_signing_key(self, token):
+            return type("_Key", (), {"key": public_key})()
+
+    monkeypatch.setitem(oauth._microsoft_jwks, tenant, _Cache())
+    return jwt.encode(claims, ms_key, algorithm="RS256")
+
+
+def test_a_microsoft_state_is_bound_to_microsoft(client):
+    state = oauth.mint_state("microsoft")
+    assert oauth.check_state("google", state) is False, "state crossed providers"
+    assert oauth.check_state("microsoft", state) is True
+    assert oauth.check_state("microsoft", state) is False, "state was replayable"
+
+
+def test_an_unconfigured_microsoft_provider_is_not_startable(client):
+    assert "microsoft" not in oauth.configured_providers()
+    response = client.get("/api/auth/oauth/microsoft/start", follow_redirects=False)
+    assert response.status_code == 400
+    assert "not enabled" in response.text
+
+
+def test_configured_microsoft_redirects_to_its_tenant_with_a_state(client, monkeypatch):
+    monkeypatch.setattr(settings, "microsoft_client_id", MS_CLIENT_ID)
+    monkeypatch.setattr(settings, "microsoft_client_secret", "ms-secret")
+    monkeypatch.setattr(settings, "microsoft_tenant", MS_TENANT)
+    assert oauth.configured_providers() == ["microsoft"]
+
+    response = client.get("/api/auth/oauth/microsoft/start", follow_redirects=False)
+    assert response.status_code == 302
+    target = urlparse(response.headers["location"])
+    assert target.netloc == "login.microsoftonline.com"
+    # The tenant is resolved from configuration at request time, so it appears
+    # in the path even though PROVIDERS was built at import.
+    assert target.path == f"/{MS_TENANT}/oauth2/v2.0/authorize"
+    query = parse_qs(target.query)
+    assert query["client_id"] == [MS_CLIENT_ID]
+    assert query["redirect_uri"] == [
+        "https://chudware.test/api/auth/oauth/microsoft/callback"
+    ]
+    assert query["response_type"] == ["code"]
+    assert query["prompt"] == ["select_account"]
+    assert oauth.check_state("microsoft", query["state"][0]) is True
+
+
+@pytest.mark.parametrize("edov", [True, "true", "1"])
+def test_a_domain_verified_microsoft_token_yields_tid_dot_oid(monkeypatch, ms_key, edov):
+    """Entra emits xms_edov as a boolean or as a string; both mean verified."""
+    token = ms_signed(monkeypatch, ms_key, ms_claims(xms_edov=edov))
+    subject, email = oauth._verify_microsoft_id_token(token)
+    # oid+tid, not the app-scoped pairwise sub.
+    assert subject == f"{MS_TENANT}.{MS_OID}"
+    assert email == "engineer@contoso.com"
+
+
+@pytest.mark.parametrize("edov", [ABSENT, False, "false", "0"])
+def test_a_microsoft_token_without_a_verified_domain_is_refused(
+    monkeypatch, ms_key, edov
+):
+    """nOAuth: without xms_edov the email is tenant-controlled input, and
+    link_account() links by email, so trusting it is account takeover."""
+    token = ms_signed(monkeypatch, ms_key, ms_claims(xms_edov=edov))
+    with pytest.raises(oauth.OAuthError) as caught:
+        oauth._verify_microsoft_id_token(token)
+    assert "owns that email address" in caught.value.message
+
+
+def test_a_microsoft_token_whose_issuer_disagrees_with_its_tid_is_refused(
+    monkeypatch, ms_key
+):
+    """PyJWT's issuer check is off (the issuer is per-tenant), so this is the
+    replacement check doing its job."""
+    claims = ms_claims()
+    claims["iss"] = f"https://login.microsoftonline.com/{MS_OTHER_TENANT}/v2.0"
+    token = ms_signed(monkeypatch, ms_key, claims)
+    with pytest.raises(oauth.OAuthError) as caught:
+        oauth._verify_microsoft_id_token(token)
+    assert "unexpected issuer" in caught.value.message
+
+
+def test_a_single_tenant_deployment_refuses_another_tenants_token(monkeypatch, ms_key):
+    """Internally consistent, correctly signed — and from the wrong directory."""
+    token = ms_signed(
+        monkeypatch, ms_key, ms_claims(tid=MS_OTHER_TENANT), tenant=MS_TENANT
+    )
+    with pytest.raises(oauth.OAuthError) as caught:
+        oauth._verify_microsoft_id_token(token)
+    assert "not in this deployment's directory" in caught.value.message
 
 
 # ---------------------------------------------------------------------------

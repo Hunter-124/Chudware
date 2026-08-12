@@ -1,35 +1,24 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
+import HeroCanvas from '../components/HeroCanvas.astro';
 ---
 <BaseLayout title="Parametric CAD from sketch to shop floor" description="Chudware is an OCCT-powered parametric CAD system for mechanical engineers, available in a browser or as a native Windows and Linux desktop application.">
-  <section class="hero">
-    <div class="wrap">
-      <div class="hero-grid">
-        <div class="hero-copy">
-          <p class="eyebrow">Parametric CAD · Browser or native</p>
-          <h1>Parametric CAD, from sketch to shop floor.</h1>
-          <p class="lede">Chudware is built for mechanical engineers and product teams who want modeling, assemblies, CAM, PLM, simulation, reverse engineering, and an AI copilot in the same workspace.</p>
-          <p class="hero-note">Browser seats run in isolated rootless containers and stream to a tab. Native Windows and Linux preview builds are available on request.</p>
-          <div class="actions">
-            <a class="button" href="https://app.chudware.com/signup">Create an account</a>
-            <a class="button button-secondary" href="/gallery/">See the actual product</a>
-          </div>
-        </div>
-        <figure class="product-frame">
-          <div class="product-viewport">
-            <img src="/images/modeling.png" width="1340" height="838" alt="Chudware modeling workspace showing a shelled parametric enclosure and its feature tree" />
-          </div>
-          <figcaption class="product-caption"><span>Real Chudware workspace</span><span>Feature-based model · OCCT 7.9</span></figcaption>
-        </figure>
-      </div>
-      <dl class="architecture-strip" aria-label="Chudware architecture at a glance">
-        <div><dt>Geometry</dt><dd>OpenCascade / OCCT 7.9</dd></div>
-        <div><dt>Browser delivery</dt><dd>Video-streamed workspace</dd></div>
-        <div><dt>Isolation</dt><dd>Rootless container per seat</dd></div>
-        <div><dt>Native</dt><dd>Windows + Linux</dd></div>
-      </dl>
+  <HeroCanvas>
+    <p class="eyebrow">Parametric CAD · Browser or native</p>
+    <h1>Parametric CAD, from sketch to shop floor.</h1>
+    <p class="lede">Chudware is built for mechanical engineers and product teams who want modeling, assemblies, CAM, PLM, simulation, reverse engineering, and an AI copilot in the same workspace.</p>
+    <p class="hero-note">Browser seats run in isolated rootless containers and stream to a tab. Native Windows and Linux preview builds are available on request.</p>
+    <div class="actions">
+      <a class="button" href="https://app.chudware.com/signup">Create an account</a>
+      <a class="button button-secondary" href="/product/">Tour the product</a>
     </div>
-  </section>
+    <dl class="architecture-strip" slot="strip" aria-label="Chudware architecture at a glance">
+      <div><dt>Geometry</dt><dd>OpenCascade / OCCT 7.9</dd></div>
+      <div><dt>Browser delivery</dt><dd>Video-streamed workspace</dd></div>
+      <div><dt>Isolation</dt><dd>Rootless container per seat</dd></div>
+      <div><dt>Native</dt><dd>Windows + Linux</dd></div>
+    </dl>
+  </HeroCanvas>
 
   <section class="capability-index" aria-labelledby="capabilities-title">
     <div class="wrap">

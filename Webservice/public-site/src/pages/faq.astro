@@ -1,0 +1,199 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import '../styles/company.css';
+---
+<BaseLayout title="FAQ" description="Straight answers about Chudware: browser versus native access, supported platforms, file formats, where files live, how the AI copilot works, and commercial-preview status.">
+  <header class="page-hero">
+    <div class="wrap">
+      <p class="eyebrow">Frequently asked</p>
+      <h1>Questions people actually ask first.</h1>
+      <p class="lede">Answered from the product and the documentation. Where the honest answer is that something is not finalized, that is the answer given.</p>
+      <ul class="co-faq-jump">
+        <li><a href="#co-product">The product</a></li>
+        <li><a href="#co-access">Access and platforms</a></li>
+        <li><a href="#co-files">Files and data</a></li>
+        <li><a href="#co-ai">AI copilot</a></li>
+        <li><a href="#co-commercial">Commercial and support</a></li>
+      </ul>
+    </div>
+  </header>
+
+  <section class="section" aria-labelledby="co-product">
+    <div class="co-faq-group wrap">
+      <h2 id="co-product" class="co-anchor">The product</h2>
+      <p>What Chudware is, and what it is not.</p>
+      <div class="co-faq-list">
+        <details class="co-faq">
+          <summary>What is Chudware?</summary>
+          <div class="co-faq-answer">
+            <p>A parametric CAD system for mechanical engineers, built on the OpenCascade (OCCT 7.9) geometry kernel. One workspace covers constraint sketching, feature-based modeling, assemblies, CAM, simulation, reverse engineering, PLM, and an AI copilot.</p>
+            <p>It is a modeling system, not a viewer. Features stay ordered and editable, sketches can be fully defined, and the geometry is real B-rep rather than a mesh approximation.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>Is this a web viewer with a CAD skin?</summary>
+          <div class="co-faq-answer">
+            <p>No. The browser is a display surface. The full application, including the geometry kernel, runs server-side in an isolated rootless container and streams the workspace to your tab while your input drives it. Nothing about the toolchain is reduced to fit a web page.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>How mature is it?</summary>
+          <div class="co-faq-answer">
+            <p>Chudware is in commercial preview. The product modes are real and used daily; distribution, packaging, and the public rate card are not finished. Shipped changes are listed in the <a href="/changelog/">changelog</a>, and the <a href="/gallery/">gallery</a> shows captures from the running product rather than concept renders.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="co-access">
+    <div class="co-faq-group wrap">
+      <h2 id="co-access" class="co-anchor">Access and platforms</h2>
+      <p>Browser versus native, and how to get in.</p>
+      <div class="co-faq-list">
+        <details class="co-faq">
+          <summary>Browser or native desktop — which should I use?</summary>
+          <div class="co-faq-answer">
+            <p>Start in the browser. It is the route that is available now, requires no installation, and gives the full product surface. Choose native if you specifically want the application running on your own workstation; native preview builds exist for Windows and Linux and are available on request rather than through a public release channel.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>What does a browser seat actually run on?</summary>
+          <div class="co-faq-answer">
+            <p>A server-side seat in an isolated rootless container. The application renders there and is streamed to your tab as video; your keyboard and pointer input travel back to it. Your machine only needs a current browser and a usable network connection — no GPU driver work, no installer, no licence dongle.</p>
+            <p>Identity, authorization, and per-account file isolation are enforced by the gateway in front of that seat. See <a href="/security/">security</a> for what that means concretely.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>Which platforms are supported?</summary>
+          <div class="co-faq-answer">
+            <ul>
+              <li><strong>Any modern desktop browser</strong>, including on macOS — this is the supported route today.</li>
+              <li><strong>Windows and Linux</strong> native preview builds, on request.</li>
+              <li><strong>No native macOS package</strong> is published, and no installer or checksum exists to verify. Use the browser workspace on a Mac.</li>
+            </ul>
+            <p>Do not install anything presented as an official Chudware release from a third-party source; there is no public download channel yet.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>How do I get access?</summary>
+          <div class="co-faq-answer">
+            <p><a href="https://app.chudware.com/signup">Create an account</a> and verify your email address. Verification activates the account on a 14-day trial and signs you in; no payment card is required to start. Some registrations wait on operator approval before they become active, in which case the account page tells you so and no action is needed from you.</p>
+            <p>Native preview access is arranged from the <a href="/download/">access page</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="co-files">
+    <div class="co-faq-group wrap">
+      <h2 id="co-files" class="co-anchor">Files and data</h2>
+      <p>Formats, interoperability, and where your work lives.</p>
+      <div class="co-faq-list">
+        <details class="co-faq">
+          <summary>What file format does Chudware use?</summary>
+          <div class="co-faq-answer">
+            <p><code>.step+</code> is the native format. It keeps the feature tree, dimensions, materials, studies, and drawings — the editable design, not a flattened result.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>Can I get my geometry into other tools?</summary>
+          <div class="co-faq-answer">
+            <p>Yes. Export STEP or STL when another tool needs a handoff. A neutral export loses the feature history by definition, so keep the <code>.step+</code> document as the source of truth and treat the export as a deliverable.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>Where are my files stored?</summary>
+          <div class="co-faq-answer">
+            <p>In a per-account file tree on the server, with a separate per-account upload bucket. Path resolution is clamped to your own roots on every request, including on the engine connection itself, so another signed-in account cannot address your documents by guessing a path.</p>
+            <p>Storage is quota-checked per account. You can export your files at any time, and you should: Chudware publishes no recovery-time or data-loss objectives, so it should not be the only copy of a design you care about.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>Who can see my designs?</summary>
+          <div class="co-faq-answer">
+            <p>Project content enters Chudware systems only through the hosted workspace, synchronization, or managed AI features you use. Chudware does not sell personal information and does not use project content to train a public model. The full statement is in the <a href="/legal/privacy/">privacy policy</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="co-ai">
+    <div class="co-faq-group wrap">
+      <h2 id="co-ai" class="co-anchor">AI copilot</h2>
+      <p>What it does inside the model, and whose API keys pay for it.</p>
+      <div class="co-faq-list">
+        <details class="co-faq">
+          <summary>What does the copilot actually do?</summary>
+          <div class="co-faq-answer">
+            <p>It operates the same modeling tools you do. Describe the engineering intent — the part, the critical dimensions, what must not change — and the copilot inspects geometry, creates or edits features, renders views, and measures results in the open document. The output is a normal model: ordinary sketches and features in the same feature tree, which you can inspect, edit, or delete.</p>
+            <p>Details are in the <a href="/docs/ai-copilot/">copilot guide</a>.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>Whose API keys does it use?</summary>
+          <div class="co-faq-answer">
+            <p>Your choice, made during onboarding. Chudware-managed capacity consumes Chudware credits. If you add your own provider key instead, that work is sent through the provider you configured, is governed by that provider's terms and charges, and consumes no Chudware credits.</p>
+            <p>Provider keys are secrets: paste them only into Chudware's AI setup screen, never into a chat message or a project note.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>Can I rely on what the copilot produces?</summary>
+          <div class="co-faq-answer">
+            <p>Review it. AI output can be incomplete or wrong, and neither the copilot nor Chudware certifies a design, analysis, toolpath, or machine setup. Anything that drives physical equipment requires explicit operator review of stock, tool, setup, simulation, and posted code before it runs.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="co-commercial">
+    <div class="co-faq-group wrap">
+      <h2 id="co-commercial" class="co-anchor">Commercial and support</h2>
+      <p>Pricing status, trials, and how to reach a person.</p>
+      <div class="co-faq-list">
+        <details class="co-faq">
+          <summary>What does it cost?</summary>
+          <div class="co-faq-answer">
+            <p>Public rates are not published yet. Chudware is in commercial preview and the <a href="/pricing/">pricing page</a> deliberately shows the ways the product can be used instead of invented figures. Rates, storage allowances, credit bundles, and tier boundaries appear once they are ratified.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>Is there a trial?</summary>
+          <div class="co-faq-answer">
+            <p>Yes — 14 consecutive days, with no payment card required. Education pricing may be offered to eligible <code>.edu</code> accounts where it is available; exact terms are shown before any purchase.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>Are AI credits refundable?</summary>
+          <div class="co-faq-answer">
+            <p>No. Credit packs are non-refundable and non-transferable, are not cash or stored value, and may be used only with the purchasing account. See the <a href="/legal/terms/">terms of service</a>.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>How do I report a security issue?</summary>
+          <div class="co-faq-answer">
+            <p>Email <a href="mailto:security@chudware.com?subject=Security%20report">security@chudware.com</a> with the affected surface, the impact, and reproduction steps, and test only against your own account. There is no bug bounty and no formal response-time commitment; reports reach the team that writes the code. The <a href="/security/">security page</a> sets out what is enforced and what is not claimed.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>Something is broken. Who do I talk to?</summary>
+          <div class="co-faq-answer">
+            <p>Start with <a href="/docs/troubleshooting/">troubleshooting</a>, then mail <a href="mailto:support@chudware.com">support@chudware.com</a>. Every other route — sales, privacy, legal — is listed on the <a href="/contact/">contact page</a>.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section class="section cta-band">
+    <div class="wrap section-heading">
+      <p class="eyebrow">Still unanswered</p>
+      <h2>Ask the question this page missed.</h2>
+      <p class="lede">The documentation covers day-to-day use; anything else can go to a person who will answer it directly.</p>
+      <div class="actions"><a class="button" href="/docs/">Read the docs</a><a class="button button-secondary" href="/contact/">Contact Chudware</a></div>
+    </div>
+  </section>
+</BaseLayout>

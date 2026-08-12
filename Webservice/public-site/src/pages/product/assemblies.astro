@@ -1,0 +1,138 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import '../../styles/product.css';
+---
+<BaseLayout title="Assemblies" description="Locate components with concentric, coincident, distance, and angle mates, inspect interference before release, and keep component identity stable across revisions.">
+  <header class="page-hero">
+    <div class="wrap">
+      <p class="eyebrow">Product / Assemble</p>
+      <h1>Components located by intent, not by typed coordinates.</h1>
+      <p class="lede">An assembly starts from one fixed component and grows through mates. Every other part is positioned by a relationship you can read and revise, so the structure survives the change that arrives after release.</p>
+      <ul class="product-hero-meta">
+        <li>Concentric, coincident, distance, angle mates</li>
+        <li>Interference and clearance inspection</li>
+        <li>Stable component identity across revisions</li>
+      </ul>
+    </div>
+  </header>
+
+  <section class="section" aria-labelledby="structure-title">
+    <div class="wrap split product-split-diagram">
+      <figure class="product-diagram" data-lift>
+        <svg class="product-svg" viewBox="0 0 640 340" role="img" aria-labelledby="mate-diagram-title">
+          <title id="mate-diagram-title">An assembly graph: a frame component fixed at the assembly origin, with a bearing, shaft, and cover each located by a named mate.</title>
+          <defs>
+            <marker id="mate-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path class="product-svg-arrow-accent" d="M0,0 L10,5 L0,10 Z" />
+            </marker>
+          </defs>
+
+          <text class="product-svg-label-faint" x="40" y="30">ASSEMBLY STRUCTURE</text>
+
+          <rect class="product-svg-node-accent" x="40" y="132" width="180" height="76" rx="4" />
+          <text class="product-svg-title" x="60" y="164">FRAME</text>
+          <text class="product-svg-label" x="60" y="186">fixed at origin</text>
+          <line class="product-svg-dim" x1="86" y1="222" x2="174" y2="222" />
+          <path class="product-svg-tick" d="M92,222 L84,234 M112,222 L104,234 M132,222 L124,234 M152,222 L144,234 M172,222 L164,234" />
+          <text class="product-svg-label-faint" x="130" y="252" text-anchor="middle">GROUNDED</text>
+
+          <path class="product-svg-flow" d="M220,170 L300,170 L300,74 L392,74" marker-end="url(#mate-arrow)" />
+          <path class="product-svg-flow" d="M220,171 L392,171" marker-end="url(#mate-arrow)" />
+          <path class="product-svg-flow" d="M220,170 L300,170 L300,270 L392,270" marker-end="url(#mate-arrow)" />
+
+          <text class="product-svg-label-dim" x="390" y="64" text-anchor="end">CONCENTRIC</text>
+          <text class="product-svg-label-dim" x="390" y="161" text-anchor="end">COINCIDENT</text>
+          <text class="product-svg-label-dim" x="390" y="260" text-anchor="end">DISTANCE</text>
+
+          <rect class="product-svg-node" x="400" y="40" width="200" height="68" rx="4" />
+          <text class="product-svg-title" x="420" y="70">BEARING</text>
+          <text class="product-svg-label" x="420" y="90">bore axis aligned</text>
+
+          <rect class="product-svg-node" x="400" y="138" width="200" height="68" rx="4" />
+          <text class="product-svg-title" x="420" y="168">SHAFT</text>
+          <text class="product-svg-label" x="420" y="188">seating face touching</text>
+
+          <rect class="product-svg-node" x="400" y="236" width="200" height="68" rx="4" />
+          <text class="product-svg-title" x="420" y="266">COVER</text>
+          <text class="product-svg-label" x="420" y="286">standoff 12.00</text>
+        </svg>
+        <figcaption>One grounded component, then relationships. Nothing downstream is placed by absolute coordinates.</figcaption>
+      </figure>
+      <header class="section-heading">
+        <p class="eyebrow" id="structure-title">Structure</p>
+        <h2>Begin with one fixed component.</h2>
+        <p class="lede">Insert the component that defines the product's frame or base and fix it at the assembly origin. Everything else is located through mates, which is what makes a later dimension change propagate instead of scattering parts.</p>
+        <p class="supporting-copy">Add only the mates you need. Stop once the intended degrees of freedom are controlled: extra mates do not make an assembly more correct, they make revisions brittle and conflicts harder to read.</p>
+        <div class="actions"><a class="button button-secondary" href="/docs/assemblies/">Assemblies guide</a></div>
+      </header>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="mates-title">
+    <div class="wrap">
+      <header class="section-heading">
+        <p class="eyebrow" id="mates-title">Mate selection</p>
+        <h2>Pick the mate that matches the joint.</h2>
+        <p class="lede">The mate type is a statement about the physical interface. Choosing it deliberately is the difference between an assembly that updates and one that has to be rebuilt.</p>
+      </header>
+      <div class="product-spec-wrap">
+        <table class="product-spec">
+          <caption>Mate types and where they belong</caption>
+          <thead>
+            <tr><th scope="col">Mate</th><th scope="col">Use it for</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">Concentric</th><td>Aligned shafts and holes, bearing bores, fastener stacks</td></tr>
+            <tr><th scope="row">Coincident</th><td>Touching planar faces, seating surfaces, mounting flanges</td></tr>
+            <tr><th scope="row">Distance</th><td>Interfaces where a controlled gap or travel must remain</td></tr>
+            <tr><th scope="row">Angle</th><td>Interfaces where a controlled orientation must remain</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="release-title">
+    <div class="wrap">
+      <header class="section-heading">
+        <p class="eyebrow" id="release-title">Before release</p>
+        <h2>Inspect the assembly, then keep its identity stable.</h2>
+        <p class="lede">Two habits do most of the work: check what actually collides, and never solve a revision by inserting a renamed copy.</p>
+      </header>
+      <div class="product-compare">
+        <div class="product-compare-good" data-lift>
+          <p class="eyebrow">Do this</p>
+          <h3>Revise through project history</h3>
+          <p>Replace or revise a component in place. Stable component identity keeps mates, bill-of-material rows, and downstream references connected to the same part.</p>
+          <p>Run <strong>Interference</strong> to find overlapping solids, then inspect clearances at moving and manufactured interfaces before anything is released.</p>
+        </div>
+        <div data-lift>
+          <p class="eyebrow">Not this</p>
+          <h3>Insert a renamed copy</h3>
+          <p>A duplicate named <code>housing_rev_b</code> is a new component as far as the assembly is concerned. Mates point at the old one, the bill of materials splits, and references quietly go stale.</p>
+          <p>An exploded view is useful for assembly sequence and communication, but it is a presentation state. It does not change any mate definition.</p>
+        </div>
+      </div>
+      <div class="product-stack product-note" data-lift>
+        <p class="eyebrow">Interference is a check, not a verdict</p>
+        <p>Interference detection reports overlapping solids and lets you measure clearances. Fit, tolerance stack, and whether a clearance is adequate for the process remain engineering decisions you make.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section cta-band">
+    <div class="wrap section-heading">
+      <p class="eyebrow">Next</p>
+      <h2>Take the assembly to the shop floor.</h2>
+      <p class="lede">Manufacturing jobs are built from the same documents, so the plan stays attached to the design.</p>
+      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/product/cam/">CAM and manufacturing</a></div>
+      <ul class="product-jump">
+        <li><a href="/product/">All capabilities</a></li>
+        <li><a href="/product/modeling/">Modeling</a></li>
+        <li><a href="/product/plm/">Product data</a></li>
+        <li><a href="/product/copilot/">AI copilot</a></li>
+        <li><a href="/docs/assemblies/">Docs</a></li>
+      </ul>
+    </div>
+  </section>
+</BaseLayout>

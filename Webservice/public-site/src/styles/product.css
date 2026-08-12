@@ -1,0 +1,105 @@
+@layer pages {
+  .product-hero-meta { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s5); list-style: none; color: var(--faint); font: var(--step--1)/1.5 var(--mono); }
+  .product-hero-meta li { position: relative; padding-left: var(--s4); }
+  .product-hero-meta li::before { content: "/"; position: absolute; left: 0; color: var(--accent); }
+
+  .product-hub-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s5); }
+  .product-card { position: relative; display: flex; min-width: 0; flex-direction: column; gap: var(--s4); padding: var(--s6); border-top: var(--border-strong) solid var(--line-hi); background: var(--surface); transition: border-color .18s var(--ease), background .18s var(--ease); }
+  .product-card:hover { border-color: var(--accent); background: var(--surface-hi); }
+  .product-card-lead { grid-column: 1 / -1; border-color: var(--accent); }
+  .product-card-index { color: var(--technical); font: var(--step--1)/1 var(--mono); letter-spacing: .12em; }
+  .product-card h2 { font-size: var(--step-2); }
+  .product-card h2 a { color: var(--text); text-decoration: none; }
+  .product-card h2 a::after { content: ""; position: absolute; inset: 0; }
+  .product-card > p { max-width: 56ch; color: var(--muted); }
+  .product-card .fact-list { margin-top: auto; font-size: var(--step--1); }
+
+  .product-crosslinks { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s4); list-style: none; }
+  .product-crosslink { display: grid; min-width: 0; gap: var(--s2); padding: var(--s5); border: var(--border) solid var(--line); background: var(--bg-deep); }
+  .product-crosslink h3 { font-size: var(--step-1); }
+  .product-crosslink p { color: var(--muted); font-size: var(--step--1); }
+
+  .product-figure { min-width: 0; margin: 0; padding: var(--s2); border: var(--border) solid var(--line-hi); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+  .product-figure img { width: 100%; border-radius: var(--radius-sm); background: var(--bg-deep); }
+  .product-figure figcaption { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--s2) var(--s4); padding: var(--s3) var(--s2) var(--s1); color: var(--faint); font: .7rem/1.4 var(--mono); }
+
+  .product-diagram { min-width: 0; margin: 0; padding: var(--s5); border: var(--border) solid var(--line); background: var(--bg-deep); }
+  .product-diagram figcaption { margin-top: var(--s4); padding-top: var(--s3); border-top: var(--border) solid var(--line); color: var(--faint); font: var(--step--1)/1.5 var(--mono); }
+  .product-stack { margin-top: var(--s6); }
+  .product-visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+  .product-svg { width: 100%; max-width: 46rem; height: auto; margin-inline: auto; color: var(--technical); }
+  .product-split-diagram { grid-template-columns: minmax(0, 1.1fr) minmax(0, .9fr); gap: clamp(2rem, 5vw, 4rem); }
+  .product-svg-arrow { fill: currentColor; stroke: none; }
+  .product-svg-arrow-accent { fill: var(--accent); stroke: none; }
+  .product-svg-edge { fill: none; stroke: var(--text); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+  .product-svg-part { fill: var(--surface-hi); stroke: var(--text); stroke-width: 1.5; stroke-linejoin: round; }
+  .product-svg-node { fill: var(--surface); stroke: var(--line-hi); stroke-width: 1; }
+  .product-svg-node-accent { fill: var(--accent-wash); stroke: var(--accent); stroke-width: 1.2; }
+  .product-svg-dim { fill: none; stroke: var(--technical); stroke-width: 1; }
+  .product-svg-tick { fill: none; stroke: var(--technical); stroke-width: 1; opacity: .55; }
+  .product-svg-con { fill: none; stroke: var(--technical); stroke-width: 1; stroke-dasharray: 6 5; opacity: .75; }
+  .product-svg-hidden { fill: none; stroke: var(--line-hi); stroke-width: 1; stroke-dasharray: 3 4; }
+  .product-svg-flow { fill: none; stroke: var(--accent); stroke-width: 1.4; }
+  .product-svg-label { fill: var(--muted); font: 400 12px/1 var(--mono); letter-spacing: .06em; }
+  .product-svg-label-dim { fill: var(--technical); font: 400 12px/1 var(--mono); letter-spacing: .06em; }
+  .product-svg-label-faint { fill: var(--faint); font: 400 11px/1 var(--mono); letter-spacing: .09em; }
+  .product-svg-title { fill: var(--text); font: 620 14px/1 var(--sans); letter-spacing: -.01em; }
+
+  .product-steps { display: grid; list-style: none; counter-reset: product-step; border-bottom: var(--border) solid var(--line); }
+  .product-steps li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--s4); padding-block: var(--s5); border-top: var(--border) solid var(--line); counter-increment: product-step; }
+  .product-steps li::before { content: counter(product-step, decimal-leading-zero); color: var(--technical); font: var(--step--1)/1.5 var(--mono); }
+  .product-steps h3 { font-size: var(--step-1); }
+  .product-steps p { margin-top: var(--s2); max-width: var(--measure); color: var(--muted); font-size: var(--step--1); }
+
+  .product-spec-wrap { overflow-x: auto; border-top: var(--border-strong) solid var(--line-hi); }
+  .product-spec { width: 100%; border-collapse: collapse; text-align: left; }
+  .product-spec caption { padding-block: var(--s3); color: var(--faint); font: var(--step--1)/1.5 var(--mono); text-align: left; }
+  .product-spec th, .product-spec td { padding: var(--s4) var(--s4) var(--s4) 0; border-bottom: var(--border) solid var(--line); vertical-align: top; }
+  .product-spec thead th { color: var(--faint); font: 400 .7rem/1.4 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+  .product-spec tbody th { width: 30%; color: var(--text); font-weight: 620; }
+  .product-spec td { color: var(--muted); font-size: var(--step--1); }
+
+  .product-note { display: grid; gap: var(--s3); padding: var(--s6); border-left: var(--border-strong) solid var(--technical); background: var(--surface); }
+  .product-note-warning { border-left-color: var(--warning); }
+  .product-note p:not(.eyebrow) { max-width: var(--measure); color: var(--muted); }
+
+  .product-compare { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s5); }
+  .product-compare > div { display: grid; min-width: 0; gap: var(--s3); align-content: start; padding: var(--s6); border: var(--border) solid var(--line); }
+  .product-compare h3 { font-size: var(--step-1); }
+  .product-compare p { color: var(--muted); font-size: var(--step--1); }
+  .product-compare code { display: inline-block; }
+  .product-compare-good { border-color: var(--technical); background: var(--technical-wash); }
+
+  .product-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--s3); list-style: none; }
+  .product-tile { display: grid; min-width: 0; gap: var(--s2); align-content: start; padding: var(--s5); border-top: var(--border) solid var(--line-hi); background: var(--surface); }
+  .product-tile strong { font-size: var(--step-0); font-weight: 640; }
+  .product-tile span { color: var(--muted); font-size: var(--step--1); }
+
+  .product-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: clamp(2rem, 6vw, 4rem); align-items: start; }
+  .product-columns > * { min-width: 0; }
+  .product-columns > .product-span-all { grid-column: 1 / -1; }
+  .product-subhead { margin-bottom: var(--s4); }
+  .product-body { max-width: var(--measure); color: var(--muted); }
+  .product-body + .product-body { margin-top: var(--s4); }
+
+  .product-jump { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--s2) var(--s5); margin-top: var(--s7); padding-top: var(--s5); border-top: var(--border) solid var(--line); list-style: none; }
+  .product-jump a { display: inline-flex; min-height: var(--touch); align-items: center; color: var(--muted); font: var(--step--1)/1 var(--mono); text-decoration: none; }
+  .product-jump a:hover { color: var(--text); }
+}
+
+@layer responsive {
+  @media (max-width: 60rem) {
+    .product-hub-grid, .product-compare, .product-columns { grid-template-columns: 1fr; }
+    .product-crosslinks, .product-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .product-spec tbody th { width: 40%; }
+  }
+
+  @media (max-width: 45rem) {
+    .product-crosslinks, .product-tiles { grid-template-columns: 1fr; }
+    .product-card, .product-compare > div, .product-note { padding: var(--s5); }
+    .product-diagram { padding: var(--s4); overflow-x: auto; }
+    .product-svg { min-width: 30rem; }
+    .product-spec tbody th { width: auto; }
+  }
+}

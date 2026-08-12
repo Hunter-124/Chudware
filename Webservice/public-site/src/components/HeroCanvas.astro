@@ -1,0 +1,373 @@
+---
+/**
+ * The hero shell: a full-bleed WebGL stage behind the copy, and the feature
+ * tree the render drives.
+ *
+ * It owns the section rather than sitting inside it because the canvas has to
+ * be a direct child of the positioned `.hero` to go full-bleed, while the
+ * panel has to sit in the grid's second column. Copy arrives through the
+ * default slot and the architecture strip through a named one, so the page
+ * still owns its words.
+ *
+ * Progressive enhancement is the design: the server renders the real product
+ * screenshot. Only once WebGL2 hands back a live context does the script swap
+ * it for the canvas, so no JS, no WebGL, or a blocked bundle still shows the
+ * product rather than an empty rectangle.
+ */
+import { HERO_STAGES } from '../scripts/hero-timeline';
+---
+
+<section class="hero">
+  <div class="wrap">
+    <div class="hero-grid">
+      <div class="hero-copy"><slot /></div>
+      <div class="hero-visual">
+        <div class="hero-stage" data-hero>
+          <canvas class="hero-canvas" data-hero-canvas aria-hidden="true" hidden></canvas>
+          <div class="hero-veil" aria-hidden="true"></div>
+        </div>
+
+        <figure class="hero-shot" data-hero-shot>
+          <div class="hero-shot-viewport">
+            <img
+              src="/images/modeling.png"
+              width="1340"
+              height="838"
+              alt="The Chudware modeling workspace showing a shelled parametric enclosure beside its feature tree"
+            />
+          </div>
+          <figcaption class="hero-shot-caption">
+            <span>Real Chudware workspace</span><span>Feature-based model · OCCT 7.9</span>
+          </figcaption>
+        </figure>
+
+        <figure class="hero-panel" data-hero-panel data-lift hidden>
+          <figcaption class="hero-panel-head">
+            <span class="hero-panel-title">FeatureManager</span>
+            <span class="hero-panel-doc">bracket_v4.chud</span>
+          </figcaption>
+          <ol class="hero-tree">
+            {HERO_STAGES.map((stage, index) => (
+              <li class="hero-feature" data-hero-feature={index} data-state="done">
+                <span class="hero-feature-mark" aria-hidden="true"></span>
+                <span class="hero-feature-body">
+                  <span class="hero-feature-label">{stage.label}</span>
+                  <span class="hero-feature-detail">{stage.detail}</span>
+                </span>
+              </li>
+            ))}
+          </ol>
+          <div class="hero-panel-foot">
+            <span class="hero-kernel">OCCT 7.9</span>
+            <span class="hero-regen" data-hero-status>Rebuild complete</span>
+          </div>
+        </figure>
+      </div>
+    </div>
+    <div class="hero-strip"><slot name="strip" /></div>
+  </div>
+</section>
+
+<style>
+  @layer pages {
+    /* Full-bleed from inside the centred `.wrap`: the offset parent is
+       `.hero > .wrap`, so a viewport-wide box centred on it spans the section,
+       and `.hero`'s own `overflow: hidden` clips it. Living in the visual
+       column instead of beside it is what lets the portrait breakpoint drop
+       the same element back into the flow, under the copy. */
+    .hero-stage {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 50%;
+      z-index: 0;
+      width: 100vw;
+      overflow: hidden;
+      transform: translateX(-50%);
+      pointer-events: none;
+      contain: strict;
+    }
+
+    /* The stage now shares a stacking context with the copy instead of sitting
+       behind the whole `.wrap`, so every sibling that must read over it says
+       so explicitly rather than relying on source order. */
+    .hero-copy,
+    .hero-strip,
+    .hero-shot {
+      position: relative;
+      z-index: 1;
+    }
+
+    .hero-canvas {
+      width: 100%;
+      height: 100%;
+      /* The renderer owns the backing-store size; CSS only stretches it. */
+      display: block;
+      opacity: 0;
+      transition: opacity 1.1s var(--ease);
+    }
+
+    .hero-canvas[data-ready] {
+      opacity: 1;
+    }
+
+    /* Keeps the copy legible over whatever the render puts behind it. The
+       stops end before the right column so the part is never veiled. */
+    .hero-veil {
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(
+        95deg,
+        var(--bg) 20%,
+        color-mix(in srgb, var(--bg) 74%, transparent) 34%,
+        transparent 48%
+      );
+    }
+
+    /* Top-aligned so the panel reads as a HUD docked in the corner and leaves
+       the middle of the right column to the render. */
+    .hero-visual {
+      align-self: start;
+      min-width: 0;
+    }
+
+    /* The panel is a HUD over the render, not a column filler: it sits at the
+       outer edge of the grid cell so the part stays visible beside it. */
+    .hero-panel {
+      position: relative;
+      z-index: 1;
+      max-width: 21rem;
+      margin: 0 0 0 auto;
+      border: var(--border) solid var(--line);
+      border-radius: var(--radius);
+      background: color-mix(in srgb, var(--surface) 78%, transparent);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px) saturate(1.3);
+      font-family: var(--mono);
+    }
+
+    .hero-panel-head {
+      display: flex;
+      justify-content: space-between;
+      gap: var(--s4);
+      padding: var(--s3) var(--s4);
+      border-bottom: var(--border) solid var(--line);
+      font-size: var(--step--1);
+    }
+
+    .hero-panel-title {
+      color: var(--technical);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .hero-panel-doc {
+      color: var(--faint);
+    }
+
+    .hero-tree {
+      display: grid;
+      margin: 0;
+      padding: var(--s2) 0;
+      list-style: none;
+    }
+
+    .hero-feature {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: var(--s3);
+      align-items: center;
+      padding: var(--s2) var(--s4);
+      border-left: var(--border-strong) solid transparent;
+      transition: background 0.3s var(--ease), border-color 0.3s var(--ease);
+    }
+
+    .hero-feature-mark {
+      width: 0.7rem;
+      height: 0.7rem;
+      border: var(--border) solid var(--line-hi);
+      border-radius: 2px;
+      transition: background 0.3s var(--ease), border-color 0.3s var(--ease),
+        transform 0.3s var(--ease);
+    }
+
+    .hero-feature-body {
+      display: grid;
+      min-width: 0;
+    }
+
+    .hero-feature-label {
+      color: var(--muted);
+      font-size: var(--step--1);
+      transition: color 0.3s var(--ease);
+    }
+
+    .hero-feature-detail {
+      overflow: hidden;
+      color: var(--faint);
+      font-size: 0.72rem;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .hero-feature[data-state="done"] .hero-feature-mark {
+      border-color: var(--technical);
+      background: color-mix(in srgb, var(--technical) 45%, transparent);
+    }
+
+    .hero-feature[data-state="done"] .hero-feature-label {
+      color: var(--text);
+    }
+
+    .hero-feature[data-state="building"] {
+      border-left-color: var(--accent);
+      background: var(--accent-wash);
+    }
+
+    .hero-feature[data-state="building"] .hero-feature-mark {
+      border-color: var(--accent);
+      background: var(--accent);
+      transform: scale(1.15);
+    }
+
+    .hero-feature[data-state="building"] .hero-feature-label {
+      color: var(--text);
+    }
+
+    .hero-feature[data-state="building"] .hero-feature-detail {
+      color: var(--accent-hi);
+    }
+
+    .hero-feature[data-state="pending"] {
+      opacity: 0.4;
+    }
+
+    .hero-panel-foot {
+      display: flex;
+      justify-content: space-between;
+      gap: var(--s4);
+      padding: var(--s3) var(--s4);
+      border-top: var(--border) solid var(--line);
+      color: var(--faint);
+      font-size: 0.72rem;
+    }
+
+    .hero-regen {
+      color: var(--technical-hi);
+    }
+
+    .hero-shot {
+      margin: 0;
+      border: var(--border) solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .hero-shot-viewport {
+      overflow: hidden;
+      border-radius: var(--radius) var(--radius) 0 0;
+    }
+
+    .hero-shot-viewport img {
+      width: 100%;
+      height: auto;
+    }
+
+    .hero-shot-caption {
+      display: flex;
+      justify-content: space-between;
+      gap: var(--s4);
+      padding: var(--s3) var(--s4);
+      border-top: var(--border) solid var(--line);
+      color: var(--faint);
+      font: var(--step--1) / 1.4 var(--mono);
+    }
+  }
+
+  @layer responsive {
+    /* Portrait: nothing needs bleeding past a single column, and a full-bleed
+       stage would only sit behind the copy where the veil hides it. Drop the
+       same element back into the flow as a framed band between the copy and
+       the feature tree, and retire the veil with it. */
+    @media (max-width: 60rem) {
+      .hero-stage {
+        position: relative;
+        top: auto;
+        bottom: auto;
+        left: auto;
+        width: auto;
+        height: min(46svh, 22rem);
+        margin-bottom: var(--s5);
+        border: var(--border) solid var(--line);
+        border-radius: var(--radius);
+        transform: none;
+      }
+
+      .hero-veil {
+        display: none;
+      }
+
+      .hero-panel {
+        max-width: none;
+      }
+    }
+  }
+
+  @layer motion {
+    @media (prefers-reduced-motion: reduce) {
+      .hero-canvas,
+      .hero-feature,
+      .hero-feature-mark,
+      .hero-feature-label {
+        transition: none;
+      }
+    }
+  }
+</style>
+
+<script>
+  import { createHero } from '../scripts/hero';
+  import { HERO_STAGES } from '../scripts/hero-timeline';
+
+  const stage = document.querySelector<HTMLElement>('[data-hero]');
+  const canvas = document.querySelector<HTMLCanvasElement>('[data-hero-canvas]');
+  const panel = document.querySelector<HTMLElement>('[data-hero-panel]');
+  const shot = document.querySelector<HTMLElement>('[data-hero-shot]');
+  const status = document.querySelector<HTMLElement>('[data-hero-status]');
+  const features = Array.from(
+    document.querySelectorAll<HTMLElement>('[data-hero-feature]'),
+  );
+
+  if (stage && canvas && panel) {
+    canvas.hidden = false;
+    const hero = createHero(canvas, {
+      still: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+      onStage(index, building) {
+        for (let i = 0; i < features.length; i++) {
+          features[i].dataset.state = !building || i < index
+            ? 'done'
+            : i === index
+              ? 'building'
+              : 'pending';
+        }
+        if (status) {
+          status.textContent = building
+            ? `Rebuilding ${HERO_STAGES[index]?.label ?? ''}`
+            : 'Rebuild complete';
+        }
+      },
+    });
+
+    if (hero) {
+      // The screenshot is the fallback. It only steps aside once the canvas
+      // has actually produced a context and a first frame.
+      canvas.dataset.ready = '';
+      panel.hidden = false;
+      shot?.setAttribute('hidden', '');
+    } else {
+      canvas.hidden = true;
+      stage.hidden = true;
+    }
+  }
+</script>

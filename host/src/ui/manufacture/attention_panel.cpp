@@ -1,6 +1,7 @@
 #include "attention_panel.h"
 
 #include <algorithm>
+#include <cstdarg>
 #include <vector>
 
 #include "imgui.h"
@@ -15,6 +16,18 @@ const float* severityColor(const std::string& severity) {
     if (severity == "critical") return palette.statusErr;
     if (severity == "warning") return palette.statusWarn;
     return palette.textDim;
+}
+
+// Dim secondary line that wraps. The panel now lives in the ~360 px pinned rail, where every
+// unwrapped line (ids, delivery failures, hints) ran straight off the edge.
+void dimWrapped(const char* fmt, ...) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
+                                                palette.textDim[2], palette.textDim[3]));
+    va_list args;
+    va_start(args, fmt);
+    ImGui::TextWrappedV(fmt, args);
+    va_end(args);
+    ImGui::PopStyleColor();
 }
 
 bool deliveryStillFailed(const MfgAttentionRow& item, std::size_t index) {
@@ -36,19 +49,17 @@ bool drawAttentionItem(const MfgAttentionRow& item, const MfgAttentionPanelInput
                           ImVec4(severity[0], severity[1], severity[2], severity[3]));
     ImGui::TextUnformatted(item.severity.empty() ? "unknown" : item.severity.c_str());
     ImGui::PopStyleColor();
-    ImGui::SameLine(0, metrics::U(2));
-    ImGui::TextUnformatted(item.reason.empty() ? "Machine attention" : item.reason.c_str());
     if (item.occurrenceCount > 1) {
         ImGui::SameLine(0, metrics::U(2));
         ImGui::TextDisabled("%u occurrences", item.occurrenceCount);
     }
+    ImGui::TextWrapped("%s", item.reason.empty() ? "Machine attention" : item.reason.c_str());
 
     ImGui::TextWrapped("%s", item.why.empty() ? "No reason was supplied." : item.why.c_str());
-    ImGui::TextDisabled("Device: %s", item.device.empty() ? "—" : item.device.c_str());
-    ImGui::SameLine(0, metrics::U(3));
-    ImGui::TextDisabled("Run: %s", item.run.empty() ? "—" : item.run.c_str());
-    ImGui::TextDisabled("Raised at journal seq %llu",
-                        static_cast<unsigned long long>(item.raisedSeq));
+    dimWrapped("Device: %s", item.device.empty() ? "—" : item.device.c_str());
+    dimWrapped("Run: %s", item.run.empty() ? "—" : item.run.c_str());
+    dimWrapped("Raised at journal seq %llu",
+               static_cast<unsigned long long>(item.raisedSeq));
 
     for (std::size_t i = 0; i < item.deliveries.size(); ++i) {
         if (!deliveryStillFailed(item, i)) continue;
@@ -71,18 +82,14 @@ bool drawAttentionItem(const MfgAttentionRow& item, const MfgAttentionPanelInput
     ImGui::EndDisabled();
 
     if (actorMissing) {
-        ImGui::SameLine(0, metrics::U(2));
-        ImGui::TextDisabled("Actor identity is required to acknowledge.");
+        dimWrapped("Actor identity is required to acknowledge.");
     } else if (sinkMissing) {
-        ImGui::SameLine(0, metrics::U(2));
-        ImGui::TextDisabled("Acknowledgement service is unavailable.");
+        dimWrapped("Acknowledgement service is unavailable.");
     } else if (input.requestInFlight) {
-        ImGui::SameLine(0, metrics::U(2));
-        ImGui::TextDisabled("Acknowledgement request in flight.");
+        dimWrapped("Acknowledgement request in flight.");
     } else {
-        ImGui::SameLine(0, metrics::U(2));
-        ImGui::TextDisabled("Records acknowledgement by %.*s; it does not resolve the cause.",
-                            static_cast<int>(input.actor.size()), input.actor.data());
+        dimWrapped("Records acknowledgement by %.*s; it does not resolve the cause.",
+                   static_cast<int>(input.actor.size()), input.actor.data());
     }
 
     if (clicked && !disabled) {
@@ -98,7 +105,7 @@ bool drawAttentionItem(const MfgAttentionRow& item, const MfgAttentionPanelInput
 
 void drawManufactureAttentionPanel(const MfgAttentionPanelInput& input) {
     ImGui::TextUnformatted("Machine attention");
-    ImGui::TextDisabled("Items remain here until the journal records acknowledgement or resolution.");
+    dimWrapped("Items remain here until the journal records acknowledgement or resolution.");
     if (!input.requestError.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text,
                               ImVec4(palette.statusErr[0], palette.statusErr[1],

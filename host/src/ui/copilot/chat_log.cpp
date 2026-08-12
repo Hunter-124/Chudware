@@ -109,22 +109,32 @@ static std::string chatAgeCacheTip(double ts, int cacheTok, int totTok = 0, int 
 // the turn's peak prompt-cache read to the age ("3m ago · 21.4k cached"); totTok/calls
 // carry the cumulative figure, which only ever appears in the hover tooltip.
 static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec4& nameCol,
-                           double ts, int cacheTok = 0, int totTok = 0, int calls = 0) {
+                           double ts, int cacheTok = 0, int totTok = 0, int calls = 0,
+                           const char* fullName = nullptr) {
     const ui::AdaptiveSurface& surf = chatSurf();
     const std::string age = chatAgeCacheLabel(ts, cacheTok);
     if ((!name || !name[0]) && age.empty()) return;   // legacy turn, no model — no blank row
+    // Right inset clears the hover "copy" glyph that owns the bubble's top-right corner
+    // (14px glyph + 4px pad, chatHoverCopyGlyph) plus a small breathing gap.
+    const float rightInset = (14.0f + 4.0f + 6.0f) * ui::uiScale;
+    const float ageW = age.empty() ? 0.0f : ImGui::CalcTextSize(age.c_str()).x;
     if (name && name[0]) {
         ImGui::PushFont(fonts.medium);
-        ImGui::TextColored(nameCol, "%s", name);
+        // The name shares this row with the right-anchored age, so it gets only what is
+        // left over: an unbounded draw let a long id ("Kimi K3-256k (custom)") run past
+        // the card's right edge. Truncated names keep the full id on hover.
+        float nameMax = ImGui::GetWindowContentRegionMax().x - ImGui::GetCursorPosX()
+                      - rightInset - ageW;
+        if (!age.empty()) nameMax -= ImGui::GetStyle().ItemSpacing.x;
+        const std::string fit = chatEllipsize(name, std::max(nameMax, 24.0f * ui::uiScale));
+        ImGui::TextColored(nameCol, "%s", fit.c_str());
         ImGui::PopFont();
+        if (fit != name && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", (fullName && fullName[0]) ? fullName : name);
     } else {
         ImGui::Dummy(ImVec2(1.0f, ImGui::GetTextLineHeight()));
     }
     if (!age.empty()) {
-        const float ageW = ImGui::CalcTextSize(age.c_str()).x;
-        // Right inset clears the hover "copy" glyph that owns the bubble's top-right corner
-        // (14px glyph + 4px pad, chatHoverCopyGlyph) plus a small breathing gap.
-        const float rightInset = (14.0f + 4.0f + 6.0f) * ui::uiScale;
         const float rx = ImGui::GetWindowContentRegionMax().x - ageW - rightInset;
         ImGui::SameLine();
         ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), rx));
@@ -608,12 +618,19 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                             ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
         if (haveModel && !metaInCard) {
-            ImGui::PushFont(fonts.medium);
-            ImGui::TextColored(turnSurf.textSecondary, "%s", modelLabel.c_str());
-            ImGui::PopFont();
-            // Inline age (+ prompt-cache total) next to the above-card label
-            // (in-card rows right-align it via drawMsgMetaRow).
+            // Inline age (+ prompt-cache total) trails the label on this same line
+            // (in-card rows right-align it via drawMsgMetaRow), so the name only gets the
+            // rest of the row: unbounded, a long model id ran off the column's right edge.
             const std::string age = chatAgeCacheLabel(m.ts, m.cacheReadTok);
+            const float ageW = age.empty() ? 0.0f
+                                           : ImGui::CalcTextSize(age.c_str()).x + 6 * sc;
+            ImGui::PushFont(fonts.medium);
+            const std::string fit = chatEllipsize(
+                modelLabel, std::max(ImGui::GetContentRegionAvail().x - ageW, 24.0f * sc));
+            ImGui::TextColored(turnSurf.textSecondary, "%s", fit.c_str());
+            ImGui::PopFont();
+            if (fit != modelLabel && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", mid);
             if (!age.empty()) {
                 ImGui::SameLine(0, 6 * sc);
                 ImGui::PushStyleColor(ImGuiCol_Text, turnSurf.textTertiary);
@@ -689,7 +706,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         if (metaInCard && !metaDrawn) {
             drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
                            turnSurf.textSecondary, m.ts, m.cacheReadTok,
-                           m.cacheReadTotTok, m.cacheReadCalls);
+                           m.cacheReadTotTok, m.cacheReadCalls, mid);
             metaDrawn = true;
             ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         }
@@ -791,7 +808,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         if (metaInCard && !metaDrawn) {
             drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
                            turnSurf.textSecondary, m.ts, m.cacheReadTok,
-                           m.cacheReadTotTok, m.cacheReadCalls);
+                           m.cacheReadTotTok, m.cacheReadCalls, mid);
             metaDrawn = true;
             ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         }
@@ -909,7 +926,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             const ImVec4 errCol = semanticOnGlass(ec, chatSurf());
             if (metaInCard && !metaDrawn) {
                 drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
-                               turnSurf.textSecondary, m.ts);
+                               turnSurf.textSecondary, m.ts, 0, 0, 0, mid);
                 metaDrawn = true;
                 ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
             }
@@ -958,10 +975,17 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // (8b) Fallback: an error/partial turn whose card ended up with no body renders
     // no card at all — don't lose the model label; draw it here (above-style, inline age).
     if (metaInCard && !metaDrawn && haveModel) {
-        ImGui::PushFont(fonts.medium);
-        ImGui::TextColored(turnSurf.textSecondary, "%s", modelLabel.c_str());
-        ImGui::PopFont();
+        // Same bound as the above-card label: the inline age owns the row's tail, the
+        // name gets the rest, and the full id stays on hover when it is clipped.
         const std::string age = chatAgeLabel(m.ts);
+        const float ageW = age.empty() ? 0.0f : ImGui::CalcTextSize(age.c_str()).x + 6 * sc;
+        ImGui::PushFont(fonts.medium);
+        const std::string fit = chatEllipsize(
+            modelLabel, std::max(ImGui::GetContentRegionAvail().x - ageW, 24.0f * sc));
+        ImGui::TextColored(turnSurf.textSecondary, "%s", fit.c_str());
+        ImGui::PopFont();
+        if (fit != modelLabel && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", mid);
         if (!age.empty()) {
             ImGui::SameLine(0, 6 * sc);
             ImGui::PushStyleColor(ImGuiCol_Text, turnSurf.textTertiary);

@@ -390,7 +390,8 @@ static bool isThinkingItem(const ActivityItem& a) {
 }
 
 // Truncate `s` to fit `maxW` in the current font, appending "…" when truncated (UTF-8-safe).
-static std::string chatEllipsize(const std::string& s, float maxW) {
+// Declared in copilot_internal.h: chat_log.cpp bounds its model-name labels with it too.
+std::string chatEllipsize(const std::string& s, float maxW) {
     if (maxW <= 0.0f) return s;
     if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
     static const char* kEll = "\xe2\x80\xa6";

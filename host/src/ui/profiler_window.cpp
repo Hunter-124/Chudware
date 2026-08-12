@@ -21,6 +21,7 @@
 #include "imgui_internal.h"  // ImRect (adaptivePanel / glassPanel rect)
 
 #include "icons.h"
+#include "layout.h"
 #include "metrics.h"
 
 #include "../core/app_state.h"
@@ -558,12 +559,19 @@ void drawProfilerWindow(AppState& st) {
     // window is open so drag/rebuild interactivity is visible without hunting
     // the window header (H-B1). Glass-styled chip to match the rest of the HUD.
     if (st.showProfilerWindow) {
-        const ImGuiViewport* mvp = ImGui::GetMainViewport();
         const float fps = ImGui::GetIO().Framerate;
         const ImVec2 pad(M::px(12), M::px(12));
-        ImGui::SetNextWindowPos(
-            ImVec2(mvp->WorkPos.x + mvp->WorkSize.x - pad.x, mvp->WorkPos.y + pad.y),
-            ImGuiCond_Always, ImVec2(1.f, 0.f));
+        // Anchor the chip inside the frame-authoritative overlay band (ribbon bottom ->
+        // status-bar top), NOT the raw viewport: mvp->WorkPos.y is the title-bar bottom, so the
+        // chip used to sit on top of the ribbon's right-hand groups, and no fixed ribbon-height
+        // guess survives DPI / tab / Manufacture-mode-strip changes. Same pattern as
+        // ui/toast.cpp; the raw work area is only the pre-publish first-frame fallback.
+        const OverlayBand& band = overlayBand();
+        const ImGuiViewport* mvp = ImGui::GetMainViewport();
+        const float anchorX = band.valid ? band.maxX : mvp->WorkPos.x + mvp->WorkSize.x;
+        const float anchorY = band.valid ? band.minY : mvp->WorkPos.y;
+        ImGui::SetNextWindowPos(ImVec2(anchorX - pad.x, anchorY + pad.y),
+                                ImGuiCond_Always, ImVec2(1.f, 0.f));
         ImGui::SetNextWindowBgAlpha(0.0f);  // glassPanel paints the fill
         const ImGuiWindowFlags flags =
             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |

@@ -2521,8 +2521,13 @@ ViewportBackdrop Renderer::backdrop() const {
 // F1: pure CPU box-average of the cached async luminance grid (see reduceLumaPbo()). ZERO GL
 // calls — (x0,y0,x1,y1) is viewport-local top-left px coords, matching the grid's row convention.
 float Renderer::averageLuminance(float x0, float y0, float x1, float y1) const {
+    // No grid yet (first frames after launch, or the readback is disabled): report UNKNOWN, not a
+    // neutral 0.5. ui_theme's adaptiveSurfaceStyled() branches on `l > 0.50f` to pick the ink
+    // tone, so a 0.5 sentinel lost the tie and handed every glass panel LIGHT text — white-on-
+    // white until the first async readback landed. -1 routes it to the theme-correct palette
+    // fallback instead (`avgLuminance < 0` in ui_theme.cpp), which is what "unknown" means there.
     if (!lumaEverRead_ || lumaGrid_.empty() || lumaW_ <= 0 || lumaH_ <= 0 || w_ <= 0 || h_ <= 0)
-        return 0.5f;
+        return -1.0f;
 
     if (x1 < x0) std::swap(x0, x1);
     if (y1 < y0) std::swap(y0, y1);

@@ -18,6 +18,8 @@
 
 #include "../core/app_state.h"
 #include "../ui_theme.h"
+#include "layout.h"
+#include "doc_tabs.h"   // docTabStripHeight — the banner must clear the document tab strip
 #include "onboarding.h"
 #include "web_capabilities.h"
 #include "agent/http.h"
@@ -611,12 +613,34 @@ void drawAccountSettings(AppState& state) {
     }
 }
 
+// Frame-authoritative anchor rect for the decoration-less entitlement overlays.
+//
+// The raw main viewport is the WRONG reference: WorkPos.y is the bottom of the OS/title bar, so
+// anything pinned there draws on top of the ribbon (the read-only banner was covering half the
+// Manufacture ribbon's buttons), and WorkPos.y + WorkSize.y is the literal window bottom, under
+// the status bar. Subtracting a hardcoded ribbon-height guess is equally wrong — the real ribbon
+// height moves with DPI, the active tab and the Manufacture mode strip. ui::overlayBand() is the
+// same ribbon-bottom / status-bar-top band app.cpp publishes once per frame before any panel
+// draws, and is what the pinned columns and toasts already anchor to (see ui/toast.cpp).
+namespace {
+struct BandRect { float minX, minY, maxX, maxY; };
+
+BandRect entitlementBandRect() {
+    const OverlayBand& band = overlayBand();
+    if (band.valid) return {band.minX, band.minY, band.maxX, band.maxY};
+    // Pre-publish first frame only — fall back to the raw viewport work area.
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    return {vp->WorkPos.x, vp->WorkPos.y,
+            vp->WorkPos.x + vp->WorkSize.x, vp->WorkPos.y + vp->WorkSize.y};
+}
+}  // namespace
+
 void drawEntitlementBanner(AppState& state) {
     if (!state.entitlementReadOnly && !state.entitlementGraceExpiring) return;
-    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const BandRect band = entitlementBandRect();
     if (state.entitlementGraceExpiring && !state.entitlementReadOnly) {
-        ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - 12.0f * uiScale,
-                                      viewport->WorkPos.y + viewport->WorkSize.y - 12.0f * uiScale),
+        ImGui::SetNextWindowPos(ImVec2(band.maxX - 12.0f * uiScale,
+                                       band.maxY - 12.0f * uiScale),
                                 ImGuiCond_Always, ImVec2(1.0f, 1.0f));
         ImGui::SetNextWindowBgAlpha(0.88f);
         if (ImGui::Begin("##entitlement_grace_chip", nullptr,
@@ -628,18 +652,30 @@ void drawEntitlementBanner(AppState& state) {
         return;
     }
 
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
-                                  viewport->WorkPos.y + 8.0f * uiScale),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    // Slot the banner into the free viewport space: BELOW the doc-tab strip (which owns the very
+    // top of the band) and BETWEEN the pinned columns, so it can't cover the document tabs, the
+    // left rail's header chip or the Copilot column. overlayColumnEdge() returns a negative value
+    // for a column that didn't draw this frame — then the banner uses the full band width.
+    const float leftEdge = overlayColumnEdge(0) > band.minX ? overlayColumnEdge(0) : band.minX;
+    const float rightEdge = overlayColumnEdge(1) > leftEdge ? overlayColumnEdge(1) : band.maxX;
+    // Auto-resize would happily grow the card wider than the gap between the columns; clamp it and
+    // wrap the copy instead of letting it spill back over the chrome we just dodged. Left-aligned
+    // in that gap on purpose: the viewport HUD toolbar is anchored to the gap's RIGHT edge, so a
+    // centred card grew into it as soon as the window narrowed.
+    const float gapW = std::max(160.0f * uiScale, rightEdge - leftEdge - 24.0f * uiScale);
+    ImGui::SetNextWindowPos(ImVec2(leftEdge + 12.0f * uiScale,
+                                   band.minY + docTabStripHeight(state) + 8.0f * uiScale),
+                            ImGuiCond_Always, ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(gapW, FLT_MAX));
     ImGui::SetNextWindowBgAlpha(0.94f);
     if (ImGui::Begin("##entitlement_readonly_banner", nullptr,
                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav)) {
-        ImGui::TextUnformatted("Read-only — your files remain openable and exportable");
-        if (!state.entitlementStatus.empty()) {
-            ImGui::SameLine();
+        ImGui::PushTextWrapPos(gapW - 2.0f * ImGui::GetStyle().WindowPadding.x);
+        ImGui::TextWrapped("Read-only — your files remain openable and exportable");
+        if (!state.entitlementStatus.empty())
             ImGui::TextDisabled("%s", state.entitlementStatus.c_str());
-        }
+        ImGui::PopTextWrapPos();
         if (ImGui::Button("Sign in")) beginDesktopAccountLogin(state);
         ImGui::SameLine();
         if (ImGui::Button("Manage subscription"))

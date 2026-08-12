@@ -1,6 +1,7 @@
 #include "device_panel.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <string>
 
 #include "imgui.h"
@@ -56,6 +57,27 @@ void disabledReason(bool disabled, const std::string& reason) {
     ImGui::PopStyleColor();
 }
 
+// Narrow-rail label/value row: value stays on the label's line when it fits, otherwise it
+// drops to a wrapped line so long ids and hashes never run off the pinned column.
+void kvRow(const char* label, const std::string& value) {
+    const char* text = value.empty() ? "—" : value.c_str();
+    const float gap = metrics::U(1);
+    const float inlineBudget = ImGui::GetContentRegionAvail().x -
+                               ImGui::CalcTextSize(label).x - gap;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
+                                                palette.textDim[2], palette.textDim[3]));
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    if (ImGui::CalcTextSize(text).x <= inlineBudget) {
+        ImGui::SameLine(0, gap);
+        ImGui::TextUnformatted(text);
+        return;
+    }
+    ImGui::Indent(metrics::U(2));
+    ImGui::TextWrapped("%s", text);
+    ImGui::Unindent(metrics::U(2));
+}
+
 void enqueueSelectedQueries(AppState& st, const std::string& deviceId) {
     queueManufactureRequest(st, "mfg_device_describe", {{"device_id", deviceId}});
     queueManufactureRequest(st, "mfg_device_capability", {{"device_id", deviceId}});
@@ -89,19 +111,26 @@ void drawManufactureDevicePanel(AppState& st) {
     for (const MfgDevice& row : mirror.devices()) {
         ImGui::PushID(row.deviceId.c_str());
         const bool selected = st.mfg.selectedDeviceId == row.deviceId;
-        const std::string title = row.machineClass.empty()
-                                      ? row.deviceId : row.machineClass + "  ·  " + row.deviceId;
+        // The rail is narrow: the row header carries the machine class only, with the
+        // device id and freshness wrapped underneath instead of clipped beside it.
+        const std::string title = row.machineClass.empty() ? row.deviceId : row.machineClass;
         if (ImGui::Selectable(title.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick)) {
             st.mfg.selectedDeviceId = row.deviceId;
             enqueueSelectedQueries(st, row.deviceId);
         }
+        ImGui::Indent(metrics::U(2));
+        if (!row.machineClass.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
+                                                        palette.textDim[2], palette.textDim[3]));
+            ImGui::TextWrapped("%s", row.deviceId.c_str());
+            ImGui::PopStyleColor();
+        }
         const MfgFreshPresentation state = presentMfgFresh(row.state);
-        ImGui::SameLine();
         const float* stateColor = state.ok ? palette.statusOk
                                 : state.stale ? palette.statusWarn : palette.textDim;
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(stateColor[0], stateColor[1],
                                                     stateColor[2], stateColor[3]));
-        ImGui::TextUnformatted(state.current.c_str());
+        ImGui::TextWrapped("%s", state.current.c_str());
         ImGui::PopStyleColor();
         if (!state.detail.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
@@ -109,6 +138,7 @@ void drawManufactureDevicePanel(AppState& st) {
             ImGui::TextWrapped("%s", state.detail.c_str());
             ImGui::PopStyleColor();
         }
+        ImGui::Unindent(metrics::U(2));
         ImGui::PopID();
     }
 
@@ -122,30 +152,39 @@ void drawManufactureDevicePanel(AppState& st) {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    ImGui::Text("Controller: %s", selected->controller.empty() ? "—" : selected->controller.c_str());
-    ImGui::Text("Command owner: %s", selected->commandOwner.empty()
-                                      ? "unclaimed" : selected->commandOwner.c_str());
-    ImGui::Text("Commissioning ceiling: %s", selected->maxExercisableBy.c_str());
+    kvRow("Controller", selected->controller);
+    kvRow("Command owner", selected->commandOwner.empty() ? std::string("unclaimed")
+                                                          : selected->commandOwner);
+    kvRow("Commissioning ceiling", selected->maxExercisableBy);
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Capability truth");
-    if (ImGui::BeginTable("##mfg_capabilities", 3,
-                          ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH)) {
-        ImGui::TableSetupColumn("Level");
-        ImGui::TableSetupColumn("Truth");
-        ImGui::TableSetupColumn("Reason");
-        ImGui::TableHeadersRow();
-        for (const MfgCapabilityLevel& capability : selected->capabilities) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(capability.level.c_str());
-            ImGui::TableSetColumnIndex(1);
-            drawCapabilityChip(capability);
-            ImGui::TableSetColumnIndex(2);
-            if (!capability.why.empty()) ImGui::TextWrapped("%s", capability.why.c_str());
-            else ImGui::TextDisabled("—");
+    if (selected->capabilities.empty()) {
+        ImGui::TextDisabled("No capability rows were returned.");
+    }
+    // Stacked cards, not a 3-column table: at ~360 logical px the reason column was unreadable.
+    for (std::size_t i = 0; i < selected->capabilities.size(); ++i) {
+        const MfgCapabilityLevel& capability = selected->capabilities[i];
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::TextUnformatted(capability.level.empty() ? "unnamed level"
+                                                        : capability.level.c_str());
+        ImGui::SameLine(0, metrics::U(1));
+        drawCapabilityChip(capability);
+        ImGui::Indent(metrics::U(2));
+        if (!capability.why.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
+                                                        palette.textDim[2], palette.textDim[3]));
+            ImGui::TextWrapped("%s", capability.why.c_str());
+            ImGui::PopStyleColor();
         }
-        ImGui::EndTable();
+        if (!capability.missingLevel.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusWarn[0], palette.statusWarn[1],
+                                                        palette.statusWarn[2], palette.statusWarn[3]));
+            ImGui::TextWrapped("missing_level: %s", capability.missingLevel.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::Unindent(metrics::U(2));
+        ImGui::PopID();
     }
 
     ImGui::Spacing();

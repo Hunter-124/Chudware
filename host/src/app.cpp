@@ -5962,6 +5962,18 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ribbonH > 0.0f)
       ui::drawEcadRibbonStatus(st, vp->Pos.y + barH, ribbonH);
 
+    // ---------- Manufacture Offline/Live mode strip ----------
+    // Safety-critical mode indication is CHROME, not an overlay: it draws in its
+    // own full-width strip directly under the ribbon and its height is folded
+    // into dockTopY below, so the dockspace, the doc-tab strip and the pinned
+    // columns all start beneath it. It used to float over the 3D viewport (and
+    // collided with the doc tabs, which anchor to the same band top).
+    // manufactureModeBarHeight() returns 0 outside the Manufacture workspace.
+    const float mfgBarH = ui::manufactureModeBarHeight(st);
+    if (mfgBarH > 0.0f)
+      ui::drawManufactureModeBar(st, vp->Pos.x, vp->Pos.y + barH + ribbonH,
+                                 vp->Size.x, mfgBarH);
+
     // ---------- default starter document ----------
     // Open straight into a fresh part on launch (non-shot) so the app is
     // immediately usable.
@@ -5976,7 +5988,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // ---------- dockspace host (between the title bar+ribbon and the status
     // bar) ----------
     const float statusH = ImGui::GetTextLineHeight() + 8.0f * scale;
-    const float dockTopY = barH + ribbonH;
+    const float dockTopY = barH + ribbonH + mfgBarH;
     // Publish the full viewport overlay band BEFORE any panel draws —
     // drawLeftPane (layout.cpp) and the Copilot column read it via
     // ui::overlayBand(). Manufacture no longer owns a separate bottom CAM dock,
@@ -6255,9 +6267,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ui::drawViewportPanel(st, io, busy);
       }
     }
-    // Manufacture's operator drawer overlays the existing native viewport. It
-    // owns no geometry canvas and draws after the viewport so its controls and
-    // explicit Offline/Live banner remain reachable.
+    // Manufacture owns no floating operator surface any more: Devices / Run /
+    // Attention live in the pinned left column (layout.cpp) and the Offline/Live
+    // mode strip is chrome under the ribbon (above). This call only bootstraps
+    // the mirror's list RPCs and hosts the approval dialog.
     if (!webActive && ws == WS::Manufacture)
       ui::drawManufacturePanel(st);
 

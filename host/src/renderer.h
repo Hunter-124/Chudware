@@ -372,6 +372,8 @@ public:
     // Kawase-blurred copy of the resolved color buffer (updated when resolveColorTexture runs).
     ViewportBackdrop backdrop() const;
     // Mean relative luminance (Rec.709) under the rect, top-left viewport-local px coords.
+    // Returns -1 ("unknown") until the first async readback has published a grid, so contrast
+    // consumers take their theme fallback instead of guessing a tone.
     float averageLuminance(float x0, float y0, float x1, float y1) const;
     // Mean backdrop color stats under the rect (same coord convention): mean RGB, mean Rec.709
     // luminance, and the luminance VARIANCE across the sampled grid cells (the dynamic-color
@@ -385,7 +387,7 @@ public:
     GlassTimings glassTimings() const;
     // Master switch: when false, updateBackdropBlur() and the async luminance readback are
     // skipped entirely each frame (averageLuminance() keeps returning the last-known grid
-    // value, or 0.5f if none was ever read back). Default true.
+    // value, or -1 "unknown" if none was ever read back). Default true.
     void setBackdropEnabled(bool on);
 
     // ---- T-RF13 (R3a): adaptive quality ladder ----

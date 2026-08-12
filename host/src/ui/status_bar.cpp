@@ -1,6 +1,9 @@
 // Chudware status bar — state + live agent phase (left), provider/model summary (right).
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <string>
+#include <vector>
 
 #include "imgui.h"
 
@@ -33,6 +36,28 @@ static std::string prettySimStage(const std::string& s) {
     if (s == "stream")   return "Streaming results";
     if (s == "post")     return "Post-processing";
     return s.empty() ? "Solving" : s;
+}
+
+// Clip a label to `maxW` with a real ellipsis, respecting UTF-8 boundaries. The right cluster
+// measures its own tokens (they are laid out at an absolute X), so anything it has to shrink
+// instead of drop goes through this rather than relying on a clip rect that does not exist.
+static std::string sbEllipsize(const std::string& s, float maxW) {
+    static const char* kEll = "\xe2\x80\xa6";
+    if (s.empty() || maxW <= 0.0f) return s;
+    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+    const float ew = ImGui::CalcTextSize(kEll).x;
+    std::string out;
+    for (std::size_t i = 0; i < s.size();) {
+        std::size_t n = 1;
+        const unsigned char c = (unsigned char)s[i];
+        if (c >= 0xF0) n = 4; else if (c >= 0xE0) n = 3; else if (c >= 0xC0) n = 2;
+        if (i + n > s.size()) n = s.size() - i;
+        std::string cand = out + s.substr(i, n);
+        if (ImGui::CalcTextSize(cand.c_str()).x + ew > maxW) break;
+        out.swap(cand);
+        i += n;
+    }
+    return out.empty() ? std::string(kEll) : out + kEll;
 }
 
 // Title-bar workspace names, indexed by AppState::Workspace.
@@ -340,6 +365,12 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         ImGui::TextColored(ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1),
                            "|  %s", st.pickStatus.c_str());
     }
+    // The left chip flow above and the right cluster below are two independent layout passes:
+    // the cluster is placed at an absolute X, so it has to be told where the chips actually
+    // ended or it overprints them. SameLine() parks the cursor on the flow's real end (ImGui
+    // tracks it per-window, so hover tooltips cannot corrupt the reading).
+    ImGui::SameLine();
+    const float leftEndX = ImGui::GetCursorPosX();
     // ---- right cluster (SolidWorks order): view-style | units | editing-mode | provider/model ----
     // C24: SW shows the unit system ("MMGS"/"IPS") and "Editing Part"/"Editing Assembly" near the
     // right edge of the status bar; we mirror that, with the provider/model summary furthest right
@@ -373,7 +404,6 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                         ? std::string(isAsm ? "Editing Assembly" : "Editing Part") +
                               (docDirty ? " *" : "")
                         : std::string();
-    const char* editTxt = editStr.c_str();
     // [workspace-tabs seam] Per-workspace live token, leftmost in the right cluster. Kept small
     // and quiet; degrades gracefully when idle (Simulate shows "Solver idle", Parts Library shows
     // the download-queue count via the partsDownloadQueueCount hook). Workspaces with no cheap
@@ -404,63 +434,124 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                                         "Hidden Visible", "Wireframe"};
     const char* vsTxt = st.docMirror.hasDoc()
         ? kViewStyle[(st.displayStyle >= 0 && st.displayStyle < 5) ? st.displayStyle : 1] : "";
-    std::string sep = "    |    ";
-    float ptw   = ImGui::CalcTextSize(ptxt.c_str()).x;
-    float uniw  = ImGui::CalcTextSize(unitsTxt).x;
-    float editw = editTxt[0] ? ImGui::CalcTextSize(editTxt).x : 0.0f;
-    float vsw   = vsTxt[0] ? ImGui::CalcTextSize(vsTxt).x : 0.0f;
-    float sepw  = ImGui::CalcTextSize(sep.c_str()).x;
-    float wstw  = wsTok.empty() ? 0.0f : ImGui::CalcTextSize(wsTok.c_str()).x;
-    float total = (wstw > 0 ? wstw + sepw : 0.0f) + (vsw > 0 ? vsw + sepw : 0.0f) + uniw + sepw +
-                  (editw > 0 ? editw + sepw : 0.0f) + ptw;
-    ImGui::SameLine(ImGui::GetWindowWidth() - total - 16.0f * dpiS);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
-    // --- per-workspace live token (leftmost; statusOk tint while something runs).
-    if (!wsTok.empty()) {
-        if (wsTokLive)
-            ImGui::TextColored(ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1),
-                               "%s", wsTok.c_str());
-        else
-            ImGui::TextUnformatted(wsTok.c_str());
-        ImGui::SameLine(0, 0); ImGui::TextUnformatted(sep.c_str());
-        ImGui::SameLine(0, 0);
+    const std::string sep = "    |    ";
+    const float sepw = ImGui::CalcTextSize(sep.c_str()).x;
+    // ---- collision-safe placement -------------------------------------------------------
+    // The cluster's preferred X is flush right, but it is only honoured while it clears the
+    // left flow. When it does not, the cluster sheds its lowest-value tokens first — model id,
+    // then the whole provider link, the workspace token and the units — so that "Editing Part"
+    // and the display style are the last things standing, and elides those two only as a final
+    // resort. Nothing is ever drawn on top of the chips.
+    enum class RTokKind { Ws, Vs, Units, Edit, Prov };
+    struct RTok { RTokKind kind; std::string text; std::string full; };
+    const float padR   = 16.0f * dpiS;
+    const float gapL   = 12.0f * dpiS;   // minimum breathing room between the two flows
+    const float winW   = ImGui::GetWindowWidth();
+    const float budget = std::max(0.0f, winW - padR - (leftEndX + gapL));
+
+    std::vector<RTok> toks;
+    auto clusterW = [&]() {
+        float w = 0.0f;
+        for (std::size_t i = 0; i < toks.size(); ++i) {
+            if (i) w += sepw;
+            w += ImGui::CalcTextSize(toks[i].text.c_str()).x;
+        }
+        return w;
+    };
+    bool showWs = !wsTok.empty(), showVs = vsTxt[0] != 0, showUnits = true,
+         showEdit = !editStr.empty(), showProv = true, showModel = true;
+    // Provider without the model id: the shortest form that still names where completions go.
+    const std::string provShort =
+        std::string(provName) + (st.settings.planMode ? "   [plan mode]" : "");
+    auto rebuild = [&]() {
+        toks.clear();
+        if (showWs)    toks.push_back({RTokKind::Ws,    wsTok,    wsTok});
+        if (showVs)    toks.push_back({RTokKind::Vs,    vsTxt,    vsTxt});
+        if (showUnits) toks.push_back({RTokKind::Units, unitsTxt, unitsTxt});
+        if (showEdit)  toks.push_back({RTokKind::Edit,  editStr,  editStr});
+        if (showProv)  toks.push_back({RTokKind::Prov,  showModel ? ptxt : provShort, ptxt});
+    };
+    rebuild();
+    if (clusterW() > budget) { showModel = false; rebuild(); }
+    if (clusterW() > budget) { showProv  = false; rebuild(); }
+    if (clusterW() > budget) { showWs    = false; rebuild(); }
+    if (clusterW() > budget) { showUnits = false; rebuild(); }
+    if (clusterW() > budget && showVs) {
+        const float editW = showEdit ? ImGui::CalcTextSize(editStr.c_str()).x + sepw : 0.0f;
+        if (budget - editW <= 0.0f) { showVs = false; rebuild(); }
+        else {
+            const std::string cut = sbEllipsize(vsTxt, budget - editW);
+            for (auto& t : toks) if (t.kind == RTokKind::Vs) t.text = cut;
+        }
     }
-    // --- view-style token (read-only label; the viewport HUD / context menu changes it).
-    if (vsTxt[0]) {
-        ImGui::TextUnformatted(vsTxt);
-        ImGui::SameLine(0, 0); ImGui::TextUnformatted(sep.c_str());
-        ImGui::SameLine(0, 0);
+    if (clusterW() > budget && showEdit) {
+        if (budget <= 0.0f) { showEdit = false; rebuild(); }
+        else {
+            const std::string cut = sbEllipsize(editStr, budget);
+            for (auto& t : toks) if (t.kind == RTokKind::Edit) t.text = cut;
+        }
     }
-    // --- units token: its own clickable item so it can toggle independently of the provider link.
-    ImGui::TextUnformatted(unitsTxt);
-    bool unitsHovered = ImGui::IsItemHovered();
-    if (unitsHovered) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        ImGui::SetTooltip("Document units: %s — click to switch to %s\n"
-                          "(lengths reformat everywhere; angles stay in degrees)",
-                          st.ips() ? "IPS (inch)" : "MMGS (millimeter)",
-                          st.ips() ? "MMGS" : "IPS");
+
+    if (!toks.empty()) {
+        const float rightX = std::max(leftEndX + gapL, winW - clusterW() - padR);
+        ImGui::SameLine(rightX);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
+        for (std::size_t i = 0; i < toks.size(); ++i) {
+            const RTok& t = toks[i];
+            if (i) {
+                ImGui::SameLine(0, 0); ImGui::TextUnformatted(sep.c_str());
+                ImGui::SameLine(0, 0);
+            }
+            switch (t.kind) {
+            case RTokKind::Ws:
+                // per-workspace live token (leftmost; statusOk tint while something runs)
+                if (wsTokLive)
+                    ImGui::TextColored(
+                        ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1),
+                        "%s", t.text.c_str());
+                else
+                    ImGui::TextUnformatted(t.text.c_str());
+                break;
+            case RTokKind::Units:
+                // its own clickable item so it toggles independently of the provider link
+                ImGui::TextUnformatted(t.text.c_str());
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    ImGui::SetTooltip("Document units: %s — click to switch to %s\n"
+                                      "(lengths reformat everywhere; angles stay in degrees)",
+                                      st.ips() ? "IPS (inch)" : "MMGS (millimeter)",
+                                      st.ips() ? "MMGS" : "IPS");
+                }
+                if (ImGui::IsItemClicked()) {
+                    st.toggleUnits();
+                    saveSettings(st.settings);  // persist the choice immediately
+                    st.addLog(std::string("[units] switched to ") +
+                              (st.ips() ? "IPS" : "MMGS"));
+                }
+                break;
+            case RTokKind::Prov:
+                // provider/model token: clicking opens Settings (unchanged behavior)
+                ImGui::TextUnformatted(t.text.c_str());
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    if (t.text != t.full)
+                        ImGui::SetTooltip("%s\nAI provider & agent settings", t.full.c_str());
+                    else
+                        ImGui::SetTooltip("AI provider & agent settings");
+                }
+                if (ImGui::IsItemClicked()) st.openSettings = true;
+                break;
+            default:
+                // view-style / editing-mode: read-only labels, tooltipped when shortened
+                ImGui::TextUnformatted(t.text.c_str());
+                if (t.text != t.full && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", t.full.c_str());
+                break;
+            }
+        }
+        ImGui::PopStyleColor();
     }
-    if (ImGui::IsItemClicked()) {
-        st.toggleUnits();
-        saveSettings(st.settings);   // persist the choice immediately (survives restart)
-        st.addLog(std::string("[units] switched to ") + (st.ips() ? "IPS" : "MMGS"));
-    }
-    if (editTxt[0]) {
-        ImGui::SameLine(0, 0); ImGui::TextUnformatted(sep.c_str());
-        ImGui::SameLine(0, 0); ImGui::TextUnformatted(editTxt);
-    }
-    ImGui::SameLine(0, 0); ImGui::TextUnformatted(sep.c_str());
-    // --- provider/model token: clicking opens Settings (unchanged behavior).
-    ImGui::SameLine(0, 0);
-    ImGui::TextUnformatted(ptxt.c_str());
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        ImGui::SetTooltip("AI provider & agent settings");
-    }
-    if (ImGui::IsItemClicked()) st.openSettings = true;
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(3);

@@ -1,5 +1,6 @@
 #include "run_panel.h"
 
+#include <cstddef>
 #include <string>
 
 #include "imgui.h"
@@ -14,20 +15,46 @@
 namespace ui {
 namespace {
 
+// Narrow-rail label/value row: the value stays on the label's line when it fits, otherwise it
+// drops to a wrapped line so long ids and hashes never run off the pinned column.
+void kvRow(const char* label, const std::string& value) {
+    const char* text = value.empty() ? "—" : value.c_str();
+    const float gap = metrics::U(1);
+    const float inlineBudget = ImGui::GetContentRegionAvail().x -
+                               ImGui::CalcTextSize(label).x - gap;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
+                                                palette.textDim[2], palette.textDim[3]));
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    if (ImGui::CalcTextSize(text).x <= inlineBudget) {
+        ImGui::SameLine(0, gap);
+        ImGui::TextUnformatted(text);
+        return;
+    }
+    ImGui::Indent(metrics::U(2));
+    ImGui::TextWrapped("%s", text);
+    ImGui::Unindent(metrics::U(2));
+}
+
 void drawFreshRow(const char* label, const MfgFreshValue& value, const std::string& unit = {}) {
     const MfgFreshPresentation display = presentMfgFresh(value, unit);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
+                                                palette.textDim[2], palette.textDim[3]));
     ImGui::TextUnformatted(label);
-    ImGui::SameLine(0, metrics::U(2));
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, metrics::U(1));
     const float* color = display.ok ? palette.statusOk
                        : display.stale ? palette.statusWarn : palette.textDim;
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(color[0], color[1], color[2], color[3]));
-    ImGui::TextUnformatted(display.current.c_str());
+    ImGui::TextWrapped("%s", display.current.c_str());
     ImGui::PopStyleColor();
     if (!display.detail.empty()) {
+        ImGui::Indent(metrics::U(2));
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
                                                     palette.textDim[2], palette.textDim[3]));
         ImGui::TextWrapped("%s", display.detail.c_str());
         ImGui::PopStyleColor();
+        ImGui::Unindent(metrics::U(2));
     }
 }
 
@@ -46,13 +73,24 @@ void drawGateReport(const MfgGateReport& report) {
     }
     ImGui::Text("seq %llu", static_cast<unsigned long long>(report.seq));
     if (!report.reportRef.empty()) {
-        ImGui::SameLine(0, metrics::U(2));
-        ImGui::TextDisabled("%s", report.reportRef.c_str());
+        ImGui::Indent(metrics::U(2));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
+                                                    palette.textDim[2], palette.textDim[3]));
+        ImGui::TextWrapped("%s", report.reportRef.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Unindent(metrics::U(2));
     }
 
     ImGui::Spacing();
-    ImGui::Text("Stage 1 admission: %s", report.stage1.empty() ? "unknown" : report.stage1.c_str());
-    if (!report.stage1Why.empty()) ImGui::TextDisabled("%s", report.stage1Why.c_str());
+    kvRow("Stage 1 admission", report.stage1.empty() ? std::string("unknown") : report.stage1);
+    if (!report.stage1Why.empty()) {
+        ImGui::Indent(metrics::U(2));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
+                                                    palette.textDim[2], palette.textDim[3]));
+        ImGui::TextWrapped("%s", report.stage1Why.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Unindent(metrics::U(2));
+    }
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Stage 2 guards");
@@ -60,38 +98,39 @@ void drawGateReport(const MfgGateReport& report) {
         ImGui::TextDisabled("No Stage-2 guard rows were returned.");
         return;
     }
-    if (ImGui::BeginTable("##mfg_guards", 3,
-                          ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH)) {
-        ImGui::TableSetupColumn("Guard");
-        ImGui::TableSetupColumn("Verdict");
-        ImGui::TableSetupColumn("Reason / waiver");
-        ImGui::TableHeadersRow();
-        for (const MfgGateGuard& guard : report.guards) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(guard.name.empty() ? "unnamed guard" : guard.name.c_str());
-            ImGui::TableSetColumnIndex(1);
-            const std::string verdict = guard.verdict.empty() ? "unknown" : guard.verdict;
-            const float* color = verdictColor(verdict);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(color[0], color[1], color[2], color[3]));
-            ImGui::TextUnformatted(verdict.c_str());
+    // Stacked guard cards, not a 3-column table: at ~360 logical px the reason column
+    // collapsed to a few characters and the waiver line was unreadable.
+    for (std::size_t i = 0; i < report.guards.size(); ++i) {
+        const MfgGateGuard& guard = report.guards[i];
+        ImGui::PushID(static_cast<int>(i));
+        const std::string verdict = guard.verdict.empty() ? "unknown" : guard.verdict;
+        const float* color = verdictColor(verdict);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(color[0], color[1], color[2], color[3]));
+        ImGui::TextUnformatted(verdict.c_str());
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0, metrics::U(1));
+        ImGui::TextWrapped("%s", guard.name.empty() ? "unnamed guard" : guard.name.c_str());
+        ImGui::Indent(metrics::U(2));
+        if (!guard.why.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
+                                                        palette.textDim[2], palette.textDim[3]));
+            ImGui::TextWrapped("%s", guard.why.c_str());
             ImGui::PopStyleColor();
-            ImGui::TableSetColumnIndex(2);
-            if (!guard.why.empty()) ImGui::TextWrapped("%s", guard.why.c_str());
-            if (guard.waiver) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusWarn[0], palette.statusWarn[1],
-                                                            palette.statusWarn[2], palette.statusWarn[3]));
-                ImGui::TextWrapped("Waiver by %s at seq %llu — %s",
-                                   guard.waiver->by.empty() ? "unnamed actor" : guard.waiver->by.c_str(),
-                                   static_cast<unsigned long long>(guard.waiver->atSeq),
-                                   guard.waiver->reason.empty() ? "no reason supplied"
-                                                                : guard.waiver->reason.c_str());
-                ImGui::PopStyleColor();
-            } else if (guard.why.empty()) {
-                ImGui::TextDisabled("—");
-            }
         }
-        ImGui::EndTable();
+        if (guard.waiver) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusWarn[0], palette.statusWarn[1],
+                                                        palette.statusWarn[2], palette.statusWarn[3]));
+            ImGui::TextWrapped("Waiver by %s at seq %llu — %s",
+                               guard.waiver->by.empty() ? "unnamed actor" : guard.waiver->by.c_str(),
+                               static_cast<unsigned long long>(guard.waiver->atSeq),
+                               guard.waiver->reason.empty() ? "no reason supplied"
+                                                            : guard.waiver->reason.c_str());
+            ImGui::PopStyleColor();
+        } else if (guard.why.empty()) {
+            ImGui::TextDisabled("—");
+        }
+        ImGui::Unindent(metrics::U(2));
+        ImGui::PopID();
     }
 }
 
@@ -132,13 +171,19 @@ void drawManufactureRunPanel(AppState& st) {
         ImGui::PushID(row.runId.c_str());
         const MfgFreshPresentation freshState = presentMfgFresh(row.state);
         const std::string state = row.stateLabel.empty() ? freshState.current : row.stateLabel;
-        const std::string label = row.runId + "  ·  " + state;
-        if (ImGui::Selectable(label.c_str(), st.mfg.selectedRunId == row.runId)) {
+        // Rail-width row: the id is the selectable, the state wraps underneath it.
+        if (ImGui::Selectable(row.runId.c_str(), st.mfg.selectedRunId == row.runId)) {
             st.mfg.selectedRunId = row.runId;
             queueManufactureRequest(st, "mfg_run_describe", {{"run_id", row.runId}});
             if (!row.gates.reportRef.empty())
                 queueManufactureRequest(st, "mfg_gate_report", {{"ref", row.gates.reportRef}});
         }
+        ImGui::Indent(metrics::U(2));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
+                                                    palette.textDim[2], palette.textDim[3]));
+        ImGui::TextWrapped("%s", state.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Unindent(metrics::U(2));
         ImGui::PopID();
     }
 
@@ -152,11 +197,11 @@ void drawManufactureRunPanel(AppState& st) {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    ImGui::Text("Run: %s", run->runId.c_str());
-    ImGui::Text("Device: %s", run->deviceId.empty() ? "—" : run->deviceId.c_str());
-    ImGui::Text("Artifact: %s", run->artifactHash.empty() ? "—" : run->artifactHash.c_str());
-    if (!run->initiatedBy.empty()) ImGui::Text("initiated_by: %s", run->initiatedBy.c_str());
-    ImGui::Text("Run state: %s", run->stateLabel.empty() ? "unknown" : run->stateLabel.c_str());
+    kvRow("Run", run->runId);
+    kvRow("Device", run->deviceId);
+    kvRow("Artifact", run->artifactHash);
+    if (!run->initiatedBy.empty()) kvRow("initiated_by", run->initiatedBy);
+    kvRow("Run state", run->stateLabel.empty() ? std::string("unknown") : run->stateLabel);
     drawFreshRow("Progress", run->progress);
     drawFreshRow("Controller snapshot", run->snapshot);
 
@@ -202,7 +247,7 @@ void drawManufactureRunPanel(AppState& st) {
                                 {{"run_id", run->runId}, {"device_id", run->deviceId}},
                                 "preflight_run");
     }
-    ImGui::SameLine(0, metrics::U(2));
+    ImGui::Spacing();
     if (ImGui::Button("Review approval binding")) {
         st.mfg.openApprovalDialog = true;
         st.mfg.exercisableBy = 0;

@@ -173,6 +173,10 @@ void cpMenuHint(const char* text);
 // ---- activity timeline (activity_timeline) ----
 void        drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW);
 std::string stripMdMarks(const std::string& in);
+// Truncate to fit `maxW` in the CURRENT font, appending "…" when it does not (UTF-8-safe).
+// The one truncation primitive for chat chrome — call it inside the PushFont whose metrics
+// the label will be drawn with. Returns the input unchanged when it already fits.
+std::string chatEllipsize(const std::string& s, float maxW);
 // Fence-aware assistant prose: ``` spans render via drawCodeBox, everything else through
 // stripMdMarks + chatDrawSelectableText. Returns the last prose segment's InputText id.
 ImGuiID     drawMdProse(const char* id, const std::string& in, const ImVec4& col, ImFont* mono);

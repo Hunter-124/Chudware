@@ -1,7 +1,13 @@
+// Manufacture operator surface plumbing. Nothing here floats over the viewport any more:
+// the Offline/Live mode strip is real chrome drawn by app.cpp directly under the ribbon
+// (drawManufactureModeBar, whose height app.cpp reserves before the dockspace), and the
+// Devices / Run / Attention views are bodies hosted by the pinned left column
+// (ui/layout.cpp). This file owns the mode strip, those bodies, and the RPC queue.
 #include "manufacture_panel.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -10,14 +16,12 @@
 #include <utility>
 
 #include "imgui.h"
-#include "imgui_internal.h"
 
 #include "attention_panel.h"
 #include "approval_dialog.h"
 #include "device_panel.h"
 #include "mfg_mirror.h"
 #include "run_panel.h"
-#include "../layout.h"
 #include "../metrics.h"
 #include "../../core/app_state.h"
 #include "../../ui_theme.h"
@@ -77,133 +81,35 @@ void drawInlineWarning(const std::string& text) {
     ImGui::PopStyleColor();
 }
 
-struct ManufactureRegion {
-    ImVec2 min;
-    ImVec2 max;
-    bool valid = false;
-};
-
-ManufactureRegion operatorRegion() {
-    const OverlayBand& band = overlayBand();
-    if (!band.valid) return {};
-    const float inset = metrics::U(2);
-    float left = overlayColumnEdge(0);
-    if (left <= band.minX || left >= band.maxX) left = band.minX;
-    float right = overlayColumnEdge(1);
-    if (right <= left + inset || right > band.maxX) right = band.maxX;
-    ManufactureRegion out;
-    out.min = ImVec2(left + inset, band.minY + inset);
-    out.max = ImVec2(right - inset, band.maxY - inset);
-    out.valid = out.max.x > out.min.x + metrics::U(60) &&
-                out.max.y > out.min.y + metrics::U(40);
-    return out;
-}
-
-void drawModeBanner(AppState& st, const ManufactureRegion& region) {
-    const float height = metrics::U(19);
-    ImGui::SetNextWindowPos(region.min, ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(region.max.x - region.min.x, height), ImGuiCond_Always);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,
-                          st.mfg.mode == MfgUi::Mode::OfflineSimulation
-                              ? ImVec4(palette.setupWarnBg[0], palette.setupWarnBg[1],
-                                       palette.setupWarnBg[2], palette.setupWarnBg[3])
-                              : ImVec4(palette.proseBg[0], palette.proseBg[1],
-                                       palette.proseBg[2], palette.proseBg[3]));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(metrics::cpMenuGutter(), metrics::cpMenuRowPadY()));
-    ImGui::Begin("##ManufactureModeBanner", nullptr,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor();
-
-    const bool offline = st.mfg.mode == MfgUi::Mode::OfflineSimulation;
-    const float* semantic = offline ? palette.statusWarn : palette.statusErr;
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(semantic[0], semantic[1], semantic[2], semantic[3]));
-    if (st.fonts.h2) ImGui::PushFont(st.fonts.h2);
-
-    // The viewport keeps a compact affordance at this band's leading edge. Reserve its frame and
-    // the standard control gap so the safety-critical mode word can never be painted underneath it.
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + metrics::camBtnH() + metrics::camBtnGap());
-    const float availableTextWidth = ImGui::GetContentRegionAvail().x;
-    auto fits = [availableTextWidth](const char* text) {
-        return ImGui::CalcTextSize(text).x <= availableTextWidth;
-    };
-
-    if (offline) {
-        constexpr const char* mode = "OFFLINE SIMULATION";
-        constexpr const char* compact = "OFFLINE SIMULATION — no machine output";
-        constexpr const char* full = "OFFLINE SIMULATION — nothing is sent to a machine";
-        ImGui::TextUnformatted(fits(full) ? full : (fits(compact) ? compact : mode));
-    } else if (st.mfg.liveDeviceId.empty()) {
-        constexpr const char* mode = "LIVE MACHINE";
-        constexpr const char* compact = "LIVE MACHINE — identity unknown";
-        constexpr const char* full = "LIVE MACHINE — device identity unknown";
-        ImGui::TextUnformatted(fits(full) ? full : (fits(compact) ? compact : mode));
-    } else {
-        const std::string full = "LIVE MACHINE — " + st.mfg.liveDeviceId;
-        ImGui::TextUnformatted(fits(full.c_str()) ? full.c_str() : "LIVE MACHINE");
+// Single-line trailing note for the mode strip. Renders the full text when it fits on the
+// current row, otherwise a hoverable marker — a safety statement is never half-painted.
+void drawTrailingNote(const char* text, const float* color) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(color[0], color[1], color[2], color[3]));
+    if (ImGui::CalcTextSize(text).x <= ImGui::GetContentRegionAvail().x) {
+        ImGui::TextUnformatted(text);
+        ImGui::PopStyleColor();
+        return;
     }
-    if (st.fonts.h2) ImGui::PopFont();
+    ImGui::TextUnformatted("(?)");
     ImGui::PopStyleColor();
-
-    if (offline) {
-        const bool disabled = st.mfg.selectedDeviceId.empty() || st.mfg.requestInFlight;
-        ImGui::BeginDisabled(disabled);
-        if (ImGui::Button("Claim command ownership & enter Live Machine")) {
-            queueManufactureRequest(st, "mfg_device_claim",
-                                    {{"device_id", st.mfg.selectedDeviceId},
-                                     {"role", "commander"}}, "enter_live");
-        }
-        ImGui::EndDisabled();
-        if (disabled) {
-            drawInlineWarning(st.mfg.selectedDeviceId.empty()
-                ? "Live Machine unavailable — select a device, then explicitly claim command ownership."
-                : "Live Machine unavailable — another manufacturing request is in flight.");
-        }
-    } else {
-        if (ImGui::Button("Return to Offline Simulation")) {
-            const std::string deviceId = st.mfg.liveDeviceId;
-            json release{{"device_id", deviceId}};
-            if (const MfgDevice* device = st.mfgMirror->device(deviceId);
-                device && !device->leaseId.empty())
-                release["lease_id"] = device->leaseId;
-            else if (leaseHeartbeat.deviceId == deviceId &&
-                     !leaseHeartbeat.leaseId.empty())
-                release["lease_id"] = leaseHeartbeat.leaseId;
-            st.mfg.mode = MfgUi::Mode::OfflineSimulation;
-            st.mfg.liveDeviceId.clear();
-            leaseHeartbeat.clear();
-            if (!deviceId.empty())
-                queueManufactureRequest(st, "mfg_device_release", std::move(release),
-                                        "leave_live");
-        }
-        ImGui::SameLine(0, metrics::U(2));
-        ImGui::TextUnformatted("Opening a panel or observing a run never changes this mode.");
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(text);
+        ImGui::EndTooltip();
     }
-    ImGui::End();
 }
 
-void beginOperatorChild(const char* id, const ImVec2& size) {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(palette.panelBg[0], palette.panelBg[1],
-                                                   palette.panelBg[2], palette.panelBg[3]));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(metrics::cpMenuGutter(), metrics::cpMenuGutter()));
-    ImGui::BeginChild(id, size,
-                      ImGuiChildFlags_Border | ImGuiChildFlags_AlwaysUseWindowPadding,
-                      ImGuiWindowFlags_NoScrollbar);
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor();
-}
-
-void endOperatorChild(const char* stableId) {
-    const ImVec2 childPos = ImGui::GetWindowPos();
-    const ImVec2 childSize = ImGui::GetWindowSize();
-    const ImRect rect(childPos, ImVec2(childPos.x + childSize.x, childPos.y + childSize.y));
-    const AdaptiveSurface& surf = adaptivePanel(panelId(stableId), rect);
-    drawWindowPillScrollbarV(surf);
-    ImGui::EndChild();
+// Global operator notices. Every rail body repeats them: the rail shows one tab at a time, so
+// a notice parked on a sibling tab would be invisible exactly when the operator needs it.
+void drawOperatorNotices(AppState& st) {
+    if (!st.mfg.lastError.empty()) drawInlineWarning(st.mfg.lastError);
+    if (st.daemonUnreachable || !st.mfgMirror || !st.mfgMirror->gatewayReachable()) {
+        const std::string why = st.daemonUnreachable
+            ? "Manufacturing gateway unreachable — live values are unknown and cached rows are not shown as current."
+            : (st.mfgMirror ? st.mfgMirror->gatewayWhy()
+                            : "Manufacturing mirror unavailable.");
+        drawInlineWarning(why);
+    }
 }
 
 const std::string& signedInActor() {
@@ -246,93 +152,151 @@ void drawAttentionBody(AppState& st) {
     drawManufactureAttentionPanel(input);
 }
 
-void drawOperatorDrawer(AppState& st, const ManufactureRegion& region) {
-    const float bannerHeight = metrics::U(19);
-    const float gap = metrics::U(2);
-    const float available = region.max.y - region.min.y - bannerHeight - gap;
-    const float height = std::min(metrics::U(108), available);
-    if (height < metrics::U(36)) return;
-    const ImVec2 pos(region.min.x, region.max.y - height);
-    const ImVec2 size(region.max.x - region.min.x, height);
+}  // namespace
 
-    ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
-    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+float manufactureModeBarHeight(const AppState& st) {
+    if (st.activeWorkspace != AppState::Workspace::Manufacture || st.showWeb) return 0.0f;
+    // One row: the mode word (h2 font) beside the mode button, so size from the taller of the
+    // two. Called before drawManufacturePanel, so it must never read st.mfgMirror (null on
+    // the first frame) or anything else produced later in the frame.
+    float row = std::max(ImGui::GetFrameHeight(), ImGui::GetTextLineHeight());
+    if (st.fonts.h2) row = std::max(row, st.fonts.h2->FontSize);
+    return 2.0f * metrics::cpMenuRowPadY() + row;
+}
+
+void drawManufactureModeBar(AppState& st, float x, float y, float w, float h) {
+    if (w <= 0.0f || h <= 0.0f) return;
+    const bool offline = st.mfg.mode == MfgUi::Mode::OfflineSimulation;
+
+    ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
     ImGui::PushStyleColor(ImGuiCol_WindowBg,
-                          ImVec4(palette.windowBg[0], palette.windowBg[1],
-                                 palette.windowBg[2], 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::Begin("##ManufactureOperatorDrawer", nullptr,
+                          offline ? ImVec4(palette.setupWarnBg[0], palette.setupWarnBg[1],
+                                           palette.setupWarnBg[2], palette.setupWarnBg[3])
+                                  : ImVec4(palette.proseBg[0], palette.proseBg[1],
+                                           palette.proseBg[2], palette.proseBg[3]));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(metrics::cpMenuGutter(), metrics::cpMenuRowPadY()));
+    ImGui::Begin("##ManufactureModeBar", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBringToFrontOnFocus);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
 
-    if (!st.mfg.lastError.empty()) drawInlineWarning(st.mfg.lastError);
-    if (st.daemonUnreachable || !st.mfgMirror || !st.mfgMirror->gatewayReachable()) {
-        const std::string why = st.daemonUnreachable
-            ? "Manufacturing gateway unreachable — live values are unknown and cached rows are not shown as current."
-            : (st.mfgMirror ? st.mfgMirror->gatewayWhy()
-                            : "Manufacturing mirror unavailable.");
-        drawInlineWarning(why);
+    // The whole strip is one row: mode word, mode button, then the reason/no-op note.
+    const char* button = offline ? "Claim command ownership & enter Live Machine"
+                                 : "Return to Offline Simulation";
+    const float gap = metrics::U(2);
+    const float buttonWidth = ImGui::CalcTextSize(button).x +
+                              ImGui::GetStyle().FramePadding.x * 2.0f;
+    const float textBudget =
+        std::max(0.0f, ImGui::GetContentRegionAvail().x - buttonWidth - gap);
+
+    ImGui::AlignTextToFramePadding();
+    const float* semantic = offline ? palette.statusWarn : palette.statusErr;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(semantic[0], semantic[1], semantic[2], semantic[3]));
+    if (st.fonts.h2) ImGui::PushFont(st.fonts.h2);
+    auto fits = [textBudget](const char* text) {
+        return ImGui::CalcTextSize(text).x <= textBudget;
+    };
+
+    if (offline) {
+        constexpr const char* mode = "OFFLINE SIMULATION";
+        constexpr const char* compact = "OFFLINE SIMULATION — no machine output";
+        constexpr const char* full = "OFFLINE SIMULATION — nothing is sent to a machine";
+        ImGui::TextUnformatted(fits(full) ? full : (fits(compact) ? compact : mode));
+    } else if (st.mfg.liveDeviceId.empty()) {
+        constexpr const char* mode = "LIVE MACHINE";
+        constexpr const char* compact = "LIVE MACHINE — identity unknown";
+        constexpr const char* full = "LIVE MACHINE — device identity unknown";
+        ImGui::TextUnformatted(fits(full) ? full : (fits(compact) ? compact : mode));
+    } else {
+        const std::string full = "LIVE MACHINE — " + st.mfg.liveDeviceId;
+        ImGui::TextUnformatted(fits(full.c_str()) ? full.c_str() : "LIVE MACHINE");
     }
+    if (st.fonts.h2) ImGui::PopFont();
+    ImGui::PopStyleColor();
 
-    const std::size_t criticalCount = st.mfgMirror
-                                          ? unacknowledgedCriticalCount(*st.mfgMirror)
-                                          : 0;
-    if (criticalCount > 0) {
-        ImGui::PushStyleColor(
-            ImGuiCol_Text,
-            ImVec4(palette.statusErr[0], palette.statusErr[1],
-                   palette.statusErr[2], palette.statusErr[3]));
-        ImGui::Text("%zu unacknowledged critical attention item%s",
-                    criticalCount, criticalCount == 1 ? "" : "s");
-        ImGui::PopStyleColor();
-        ImGui::SameLine(0, metrics::U(2));
-        ImGui::TextDisabled("Open Attention before operating the machine.");
-    }
-
-    if (ImGui::BeginTabBar("##mfg_operator_tabs")) {
-        if (ImGui::BeginTabItem("Devices")) {
-            beginOperatorChild("##mfg_devices", ImVec2(0, 0));
-            drawManufactureDevicePanel(st);
-            endOperatorChild("mfg_devices_scroll");
-            ImGui::EndTabItem();
+    ImGui::SameLine(0, gap);
+    if (offline) {
+        const bool disabled = st.mfg.selectedDeviceId.empty() || st.mfg.requestInFlight;
+        ImGui::BeginDisabled(disabled);
+        if (ImGui::Button(button)) {
+            queueManufactureRequest(st, "mfg_device_claim",
+                                    {{"device_id", st.mfg.selectedDeviceId},
+                                     {"role", "commander"}}, "enter_live");
         }
-        if (ImGui::BeginTabItem("Run")) {
-            beginOperatorChild("##mfg_runs", ImVec2(0, 0));
-            drawManufactureRunPanel(st);
-            endOperatorChild("mfg_runs_scroll");
-            ImGui::EndTabItem();
+        ImGui::EndDisabled();
+        if (disabled) {
+            ImGui::SameLine(0, gap);
+            drawTrailingNote(st.mfg.selectedDeviceId.empty()
+                ? "Live Machine unavailable — select a device, then explicitly claim command ownership."
+                : "Live Machine unavailable — another manufacturing request is in flight.",
+                palette.statusWarn);
         }
-
-        const std::string attentionLabel = criticalCount > 0
-            ? "Attention (" + std::to_string(criticalCount) + " critical)###mfg_attention"
-            : "Attention###mfg_attention";
-        ImGui::PushStyleColor(
-            ImGuiCol_Text,
-            criticalCount > 0
-                ? ImVec4(palette.statusErr[0], palette.statusErr[1],
-                         palette.statusErr[2], palette.statusErr[3])
-                : ImVec4(palette.text[0], palette.text[1],
-                         palette.text[2], palette.text[3]));
-        const ImGuiTabItemFlags attentionFlags =
-            st.shot ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
-        const bool attentionOpen =
-            ImGui::BeginTabItem(attentionLabel.c_str(), nullptr, attentionFlags);
-        ImGui::PopStyleColor();
-        if (attentionOpen) {
-            beginOperatorChild("##mfg_attention", ImVec2(0, 0));
-            drawAttentionBody(st);
-            endOperatorChild("mfg_attention_scroll");
-            ImGui::EndTabItem();
+    } else {
+        if (ImGui::Button(button)) {
+            const std::string deviceId = st.mfg.liveDeviceId;
+            json release{{"device_id", deviceId}};
+            const MfgDevice* device =
+                st.mfgMirror ? st.mfgMirror->device(deviceId) : nullptr;
+            if (device && !device->leaseId.empty())
+                release["lease_id"] = device->leaseId;
+            else if (leaseHeartbeat.deviceId == deviceId &&
+                     !leaseHeartbeat.leaseId.empty())
+                release["lease_id"] = leaseHeartbeat.leaseId;
+            st.mfg.mode = MfgUi::Mode::OfflineSimulation;
+            st.mfg.liveDeviceId.clear();
+            leaseHeartbeat.clear();
+            if (!deviceId.empty())
+                queueManufactureRequest(st, "mfg_device_release", std::move(release),
+                                        "leave_live");
         }
-        ImGui::EndTabBar();
+        ImGui::SameLine(0, gap);
+        drawTrailingNote("Opening a panel or observing a run never changes this mode.",
+                         palette.textDim);
     }
     ImGui::End();
 }
 
-}  // namespace
+std::size_t manufactureCriticalCount(const AppState& st) {
+    return st.mfgMirror ? unacknowledgedCriticalCount(*st.mfgMirror) : 0;
+}
+
+void drawManufactureDevicesBody(AppState& st) {
+    drawOperatorNotices(st);
+    drawManufactureDevicePanel(st);
+}
+
+void drawManufactureRunBody(AppState& st) {
+    drawOperatorNotices(st);
+    drawManufactureRunPanel(st);
+}
+
+void drawManufactureAttentionBody(AppState& st) {
+    drawOperatorNotices(st);
+    const std::size_t criticalCount = manufactureCriticalCount(st);
+    if (criticalCount > 0) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              ImVec4(palette.statusErr[0], palette.statusErr[1],
+                                     palette.statusErr[2], palette.statusErr[3]));
+        ImGui::TextWrapped("%zu unacknowledged critical attention item%s",
+                           criticalCount, criticalCount == 1 ? "" : "s");
+        ImGui::PopStyleColor();
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              ImVec4(palette.textDim[0], palette.textDim[1],
+                                     palette.textDim[2], palette.textDim[3]));
+        ImGui::TextWrapped("Acknowledge them before operating the machine.");
+        ImGui::PopStyleColor();
+    }
+    if (!st.mfgMirror) {
+        ImGui::TextDisabled("Manufacturing mirror unavailable.");
+        return;
+    }
+    drawAttentionBody(st);
+}
 
 void queueManufactureRequest(AppState& st, std::string method, json params,
                              std::string context) {
@@ -456,10 +420,8 @@ void drawManufacturePanel(AppState& st) {
                                 "bootstrap_attention");
     }
 
-    const ManufactureRegion region = operatorRegion();
-    if (!region.valid) return;
-    drawModeBanner(st, region);
-    drawOperatorDrawer(st, region);
+    // The mode strip is chrome drawn by app.cpp; Devices/Run/Attention are rail bodies.
+    // Nothing left to float here — only the modal approval dialog.
     drawManufactureApprovalDialog(st);
 }
 

@@ -165,12 +165,31 @@ void drawPlmQuickChip(AppState& st) {
     resolve(st);
 
     const auto& pal = ui::palette;
-    // chip label: revision + lifecycle when the active doc is a tracked item
+    // Chip label + hover copy. A naked "PLM" reads as a stray button, so the label always
+    // carries context — the tracked item's revision/lifecycle when we have one, otherwise the
+    // open project's name — and the tooltip says what clicking it does.
+    std::string projPath = st.plmProjectPath();
+    while (!projPath.empty() && (projPath.back() == '/' || projPath.back() == '\\'))
+        projPath.pop_back();
+    const std::string projName = baseName(projPath);
     std::string label = "PLM";
+    std::string tip;
     if (q.haveItem) {
         std::string r = !q.rev.empty() ? q.rev : q.workingRev;
         label = "PLM " + (r.empty() ? "" : r + " \xc2\xb7 ") + q.lifecycle;
         if (q.dirty) label += " *";
+        tip = "PLM \xe2\x80\x94 revision & lifecycle for this document.\n";
+        if (!q.partNumber.empty()) tip += q.partNumber + "   ";
+        tip += (r.empty() ? std::string("(no revision)") : r) + " \xc2\xb7 " + q.lifecycle + "\n";
+        if (q.dirty) tip += "* uncommitted changes since the last checkpoint\n";
+        if (!projName.empty()) tip += "Project: " + projName + "\n";
+        tip += "Click for checkpoint / release actions.";
+    } else {
+        label = projName.empty() ? "PLM project" : "PLM \xc2\xb7 " + projName;
+        if (q.loading) label += " \xe2\x80\xa6";
+        tip = "PLM project open \xe2\x80\x94 this document is not tracked yet.\n";
+        if (!projPath.empty()) tip += "Project: " + projPath + "\n";
+        tip += "Click for project actions (checkpoint, open the Project Hub).";
     }
 
     ImGui::SameLine();
@@ -188,6 +207,11 @@ void drawPlmQuickChip(AppState& st) {
     if (ImGui::SmallButton(label.c_str()))
         ImGui::OpenPopup("##plm_quick");
     ImGui::PopStyleColor(3);
+    // Tooltip after the pops so the hover copy uses normal text color, not the chip's accent.
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
 
     if (ImGui::BeginPopup("##plm_quick")) {
         const float S = ui::uiScale;

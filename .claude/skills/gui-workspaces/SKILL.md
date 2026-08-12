@@ -27,7 +27,7 @@ the frame loop in `host/src/app.cpp`.
 | **Drawing** | `host/src/ui/drawing_panel.cpp` | Sheet layout, views, DXF export |
 | **Simulation** | `host/src/ui/sim_manager.cpp`, `host/src/ui/evaluate_dialogs.cpp` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …) |
 | **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | T-FIN5: project rail + sources, build console (parsed warnings), emulation + UART console, GPIO trace viewer (`contracts/firmware_rpc.md` §7/§8); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `CHUDWARE_SHOT=firmware` |
-| **Manufacture** | `host/src/ui/manufacture/{manufacture_panel,device_panel,run_panel,approval_dialog,attention_panel,mfg_mirror}.cpp/.h` | Offline/Live banner, capability-truth chips, gate-report rendering, attention tab; shot: `CHUDWARE_SHOT=manufacture` |
+| **Manufacture** | `host/src/ui/manufacture/{manufacture_panel,device_panel,run_panel,approval_dialog,attention_panel,mfg_mirror}.cpp/.h` | Capability-truth chips, gate-report rendering. **No floating operator surface**: Devices / Run / Attention are rail tabs 3–5 of the pinned left column (`layout.cpp`), and the Offline/Live mode strip is chrome under the ribbon. Shot: `CHUDWARE_SHOT=manufacture` |
 
 ### CAM / Manufacture internals (native viewport cutover)
 
@@ -35,6 +35,18 @@ the frame loop in `host/src/app.cpp`.
   uninterrupted Viewport/ECAD central node. Manufacture's pinned left rail hosts Explorer,
   `drawCamTreeBody()` (job/setup/tool tree, serialized-value operation inspector, simulation
   controls) and `drawCamOutputBody()` (post flavor, G-code, audit).
+- **No floating operator drawer, no floating mode banner.** The Manufacture rail in
+  `drawLeftPane` has SIX tabs: Explorer, Job Manager, NC Output, Devices, Run, Attention.
+  The last three are `ui::drawManufacture{Devices,Run,Attention}Body(st)` — they draw straight
+  into the rail's body child (no `Begin`/`BeginChild` of their own, same contract as
+  `drawCamTreeBody`), and are written for the ~360dp column, not a wide drawer. The Attention
+  tab shows its attention dot from `ui::manufactureCriticalCount(st) > 0`. The column's `minW`
+  is raised to 360dp on this workspace so six rail buttons always fit.
+- **The Offline/Live mode strip is real chrome, not an overlay.** `app.cpp` calls
+  `ui::manufactureModeBarHeight(st)` right after the ribbon, folds it into `dockTopY` BEFORE
+  `setOverlayBand()`, and draws it with `ui::drawManufactureModeBar(st, x, y, w, h)`. So the
+  dockspace, the doc-tab strip and both pinned columns start beneath it and it can never cover
+  geometry. `drawManufacturePanel(st)` is now only bootstrap RPCs + the approval dialog.
 - `CamMirror` owns the typed job mirror plus render-ready world-space batches. Every path class
   carries global segment start/end times and cached direction triangles; stock-box edges are
   cached too. Tree revision changes invalidate generated paths so stale geometry cannot remain

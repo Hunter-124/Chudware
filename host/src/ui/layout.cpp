@@ -2,9 +2,10 @@
 //
 // Overlay redesign: buildDefaultLayout() keeps one uninterrupted central Viewport / ECAD node so
 // the 3D surface spans the full dockspace. Manufacture previews render natively in that viewport,
-// while drawLeftPane() hosts Explorer, Job Manager, and NC Output as integrated views in the pinned
-// full-height glass column over its left edge. The invisible right-edge resize and
-// collapse-to-pill affordance remain; command dialogs float above the central node.
+// while drawLeftPane() hosts Explorer, Job Manager, NC Output, Devices, Run and Attention as
+// integrated views in the pinned full-height glass column over its left edge. The invisible
+// right-edge resize and collapse-to-pill affordance remain; command dialogs float above the
+// central node.
 #include "layout.h"
 
 #include "imgui.h"
@@ -21,6 +22,7 @@
 #include "plm/plm_hub.h"         // g_plmHub, PlmPage
 #include "sim_manager.h"        // SimManager::drawTreeBody (live Simulation tab)
 #include "cam/cam_panel.h"      // drawCamTreeBody (the Manufacture workspace's left tree)
+#include "manufacture/manufacture_panel.h"  // Manufacture Devices/Run/Attention rail bodies + critical count
 #include "ecad/ecad_panel.h"    // drawEcadManagerBody (the Electronics workspace's left tree)
 #include "plm_overview.h"       // compact PLM overview tab (left of Explorer on Model)
 #include "doc_tabs.h"           // docTabStripHeight (the column never overlaps the doc-tab band)
@@ -350,14 +352,20 @@ void drawLeftPane(AppState& st,
     // shrinking to a pill; see ui::PanelCollapseAnim). Default/min widths reuse the HiDPI-damped
     // targets of the old dock split.
     const float panelSc = 1.0f + (S - 1.0f) * 0.55f;
-    const float minW = 250.0f * panelSc;
+    // Manufacture hosts a SIX-tab icon rail (Explorer / Job Manager / NC Output / Devices / Run /
+    // Attention) across the column top — 6 * 30dp + 5 * 6dp = 210dp of rail before the header chip.
+    // It gets a wider default AND a hard minimum so the rail can never be squeezed narrower than its
+    // own buttons; unlike Electronics the size is NOT forced (FirstUseEver below), so the user keeps
+    // the ability to widen it and the min-width constraint is what guarantees the fit.
+    const bool mfgWs  = (st.activeWorkspace == AppState::Workspace::Manufacture);
+    const float minW = (mfgWs ? 360.0f : 250.0f) * panelSc;
     // Electronics (PCB/Schematic Manager) runs a little wider than the Model FeatureManager — its
     // layer/net rows carry a swatch + label + eye toggle, so the extra width keeps them uncramped
     // (Hunter red-pen). Forced (Always) on that workspace so it reliably applies to the shared,
     // otherwise user-resized column; the doc-tab strip re-anchors to this edge each frame, so a wider
     // Electronics column just pushes its own tabs right — Model stays at its own persisted width.
     const bool ecadWs = (st.activeWorkspace == AppState::Workspace::Electronics);
-    const float defW = (ecadWs ? 360.0f : 320.0f) * panelSc;
+    const float defW = (ecadWs ? 360.0f : mfgWs ? 380.0f : 320.0f) * panelSc;
     const float maxW = std::max(minW + 40.0f * S,
                                 std::min(560.0f * panelSc, (band.maxX - band.minX) * 0.42f));
     const float winH = s_anim.tick(s_collapsed, colH);
@@ -484,18 +492,26 @@ void drawLeftPane(AppState& st,
     }
 
     // [workspace-tabs seam] Manufacture keeps the native 3D viewport uninterrupted and integrates
-    // its three supporting views here: Explorer, the CAM Job Manager tree (Job / Setups /
-    // Operations / Tools / Models), and NC Output. No separate CAM window or detail dock is used.
+    // its six supporting views here: Explorer, the CAM Job Manager tree (Job / Setups / Operations /
+    // Tools / Models), NC Output, and the three operator views that used to float over the viewport
+    // as a drawer — Devices, Run and Attention. No separate CAM window, detail dock or floating
+    // drawer is used; the only Manufacture chrome outside this column is the Offline/Live mode strip
+    // app.cpp reserves under the ribbon.
     if (st.activeWorkspace == AppState::Workspace::Manufacture) {
         const float S = ui::uiScale;
-        // Explorer + Job Manager + NC Output rail — same chrome as the Electronics/Simulate rails.
-        static int s_camTab = 1;   // 0 = Explorer, 1 = Job Manager, 2 = NC Output
+        // Explorer + Job Manager + NC Output + Devices + Run + Attention rail — same chrome as the
+        // Electronics/Simulate rails.
+        static int s_camTab = 1;   // 0=Explorer 1=Job Manager 2=NC Output 3=Devices 4=Run 5=Attention
+        // Headless-shot parity: the retired floating drawer opened on Attention under CHUDWARE_SHOT
+        // so `manufacture` captured the safety-critical view. The rail keeps that behaviour.
+        if (st.shot) s_camTab = 5;
         const float ebtn = 30.0f * S, eglyph = 18.0f * S, egap = 6.0f * S, erowPad = 6.0f * S;
         const float erailRowH = erowPad + ebtn + erowPad;
+        const float erailW = 6.0f * ebtn + 5.0f * egap;
         const ImVec2 ePaneOrigin  = ImGui::GetCursorScreenPos();
         const float  ePaneInnerW  = ImGui::GetContentRegionAvail().x;
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-        ImGui::BeginChild("##cam_tabstrip", ImVec2(3.0f * ebtn + 2.0f * egap, erailRowH),
+        ImGui::BeginChild("##cam_tabstrip", ImVec2(erailW, erailRowH),
                           ImGuiChildFlags_None,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
         ImGui::PopStyleVar();
@@ -512,15 +528,35 @@ void drawLeftPane(AppState& st,
         if (drawManagerTabButton("camO", "save", "N", "NC Output", s_camTab == 2, false,
                                  surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/false))
             s_camTab = 2;
+        ImGui::SameLine(0, egap);
+        if (drawManagerTabButton("camD", "ws_manufacture", "D", "Devices", s_camTab == 3, false,
+                                 surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/false))
+            s_camTab = 3;
+        ImGui::SameLine(0, egap);
+        if (drawManagerTabButton("camR", "run_study", "R", "Run", s_camTab == 4, false,
+                                 surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/false))
+            s_camTab = 4;
+        ImGui::SameLine(0, egap);
+        // Attention is the one rail tab that carries the attention dot: an unacknowledged critical
+        // item must be visible even while the operator is on another tab.
+        if (drawManagerTabButton("camA", "warning_badge", "A", "Attention", s_camTab == 5,
+                                 ui::manufactureCriticalCount(st) > 0,
+                                 surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/false))
+            s_camTab = 5;
         ImGui::EndChild();
         {
-            const float railW = 3.0f * ebtn + 2.0f * egap;
-            const float hdrX = ePaneOrigin.x + railW + egap;
-            const float hdrW = ePaneInnerW - railW - egap;
+            const float hdrX = ePaneOrigin.x + erailW + egap;
+            const float hdrW = ePaneInnerW - erailW - egap;
             const char* hdrTitle = s_camTab == 0 ? "Explorer"
-                                  : s_camTab == 1 ? "Job Manager" : "NC Output";
+                                  : s_camTab == 1 ? "Job Manager"
+                                  : s_camTab == 2 ? "NC Output"
+                                  : s_camTab == 3 ? "Devices"
+                                  : s_camTab == 4 ? "Run" : "Attention";
             const char* hdrIcon  = s_camTab == 0 ? "body_folder"
-                                  : s_camTab == 1 ? "ai_panel" : "save";
+                                  : s_camTab == 1 ? "ai_panel"
+                                  : s_camTab == 2 ? "save"
+                                  : s_camTab == 3 ? "ws_manufacture"
+                                  : s_camTab == 4 ? "run_study" : "warning_badge";
             const ImVec2 saveLocal = ImGui::GetCursorPos();
             ImGui::SetCursorScreenPos(ImVec2(hdrX, ePaneOrigin.y + erowPad + 2.0f * S));
             ui::fmPaneHeaderChip(st, hdrTitle, hdrIcon, hdrX + hdrW * 0.5f);
@@ -541,11 +577,17 @@ void drawLeftPane(AppState& st,
         if (s_camTab == 0) {
             drawFileExplorerBody(st);
         } else if (s_camTab == 1) {
-            // Both integrated CAM bodies share the Explorer tab's child inset and add no extra
-            // WindowPadding of their own.
+            // Every integrated CAM / Manufacture body shares the Explorer tab's child inset and adds
+            // no extra WindowPadding or child of its own.
             ui::drawCamTreeBody(st);
-        } else {
+        } else if (s_camTab == 2) {
             ui::drawCamOutputBody(st);
+        } else if (s_camTab == 3) {
+            ui::drawManufactureDevicesBody(st);
+        } else if (s_camTab == 4) {
+            ui::drawManufactureRunBody(st);
+        } else {
+            ui::drawManufactureAttentionBody(st);
         }
         const float eBodyContentH = ImGui::GetCursorPosY();
         ImGui::EndChild();

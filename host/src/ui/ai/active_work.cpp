@@ -20,6 +20,7 @@
 #include "ui/metrics.h"    // cpMenu* rhythm tokens (gutter / row pad / gap / corner)
 #include "ai_prefs.h"
 #include "ui/plm/graph_thumbs.h"
+#include "ui/widgets/kit.h"   // ui::kit::emptyState — the one empty-state painter
 
 namespace ui {
 namespace {
@@ -98,25 +99,13 @@ const char* kindTag(const AppState::DocTab& t) {
     return "DOC";
 }
 
+// Domain wrapper over the shared painter: the only Active-Work-specific part left is the
+// vertical push, so the state sits inside the grid area rather than at the pane's top edge.
 void awEmptyState(const char* msg, const char* sub) {
-    const float S = ui::uiScale;
+    ui::kit::pushDensity(ui::kit::Density::Cozy);
     ImGui::Dummy(ImVec2(0, ImGui::GetContentRegionAvail().y * 0.30f));
-    const float tw = ImGui::CalcTextSize(msg).x;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - tw) * 0.5f);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.textDisabled[0], palette.textDisabled[1], palette.textDisabled[2], 0.55f));
-    ImGui::TextUnformatted(msg);
-    ImGui::PopStyleColor();
-    if (sub) {
-        const float sw = ImGui::CalcTextSize(sub).x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             std::max(0.0f, (ImGui::GetContentRegionAvail().x - sw) * 0.5f));
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 0.75f));
-        ImGui::TextWrapped("%s", sub);
-        ImGui::PopStyleColor();
-    }
-    (void)S;
+    ui::kit::emptyState(nullptr, msg, sub);
+    ui::kit::popDensity();
 }
 
 }  // namespace
@@ -257,7 +246,8 @@ void drawActiveWorkView(AppState& st) {
             const AwOp& op = s_aw.ops[i];
             if (!line.empty()) line += "   ";
             line += op.tool;
-            if (!op.target.empty()) { line += " → "; line += op.target; }
+            // "→" (U+2192) is outside the UI font's requested ranges and drew a literal '?'.
+            if (!op.target.empty()) { line += " into "; line += op.target; }
         }
         if (line.size() > 220) line = "… " + line.substr(line.size() - 218);
         ImGui::TextWrapped("%s", line.c_str());

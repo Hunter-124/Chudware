@@ -3325,6 +3325,53 @@ ImU32 hazeCol(ImU32 c, float k) {
   return ImGui::ColorConvertFloat4ToU32(v);
 }
 
+// Depth ramp bounds for the 3D atmospheric pass. 0.75 is a ceiling, not taste:
+// at 1.0 the farthest nodes dissolve fully into the bed and the graph reads as
+// though it lost data.
+constexpr float kHazeMax = 0.75f;
+// Bloom is reserved for the front slice of the depth range — applied to the
+// whole frame it stops meaning "nearest" and becomes a uniform glow.
+constexpr float kBloomFront = 0.20f;
+// Screen radius at which a containment bubble earns the five-shell volumetric
+// treatment instead of the flat fill + outline.
+constexpr float kBubbleVolumeR = 40.0f;
+
+// Painter's-algorithm draw order. visibleIdx is sorted by node id, so in 3D a
+// node hundreds of units BEHIND another painted over it purely because its id
+// sorted later. persp is a monotone depth proxy (bigger = nearer), so
+// back-to-front is ascending persp and the sort key costs nothing.
+//
+// 2D skips the sort deliberately: every persp is exactly 1.0 there, and
+// std::sort would scramble the deterministic id order that label-overlap
+// behaviour depends on.
+void buildDrawOrder(GraphTabState &G, const Proj3 &P, float &perspMin,
+                    float &perspMax) {
+  perspMin = 1.0f;
+  perspMax = 1.0f;
+  G.drawOrder.assign(G.visibleIdx.begin(), G.visibleIdx.end());
+  if (!G.view3d)
+    return;
+  if (G.perspOf.size() != G.nodes.size())
+    G.perspOf.assign(G.nodes.size(), 1.0f);
+  bool first = true;
+  for (int vi : G.visibleIdx) {
+    const GNode &n = G.nodes[vi];
+    float px, py, persp;
+    projectPoint(G, P, n.lx, n.ly, n.lz, px, py, persp);
+    G.perspOf[static_cast<size_t>(vi)] = persp;
+    if (first) {
+      perspMin = perspMax = persp;
+      first = false;
+    } else {
+      perspMin = std::min(perspMin, persp);
+      perspMax = std::max(perspMax, persp);
+    }
+  }
+  std::sort(G.drawOrder.begin(), G.drawOrder.end(), [&G](int a, int b) {
+    return G.perspOf[static_cast<size_t>(a)] < G.perspOf[static_cast<size_t>(b)];
+  });
+}
+
 ImVec2 lerpPt(ImVec2 a, ImVec2 b, float t) {
   return ImVec2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
 }
@@ -4303,6 +4350,19 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
                   origin.y + G.panY + py * G.zoom);
   };
 
+  // Back-to-front paint order + this frame's depth range. Reuses two member
+  // vectors, so the sort does not allocate at ME489 scale.
+  float perspMin = 1.0f, perspMax = 1.0f;
+  buildDrawOrder(G, P, perspMin, perspMax);
+  const float perspSpan = std::max(perspMax - perspMin, 1e-4f);
+  // 0 at the nearest node in frame, 1 at the farthest. Flat in 2D.
+  auto depthT = [&](float persp) -> float {
+    if (!G.view3d)
+      return 0.0f;
+    return std::clamp((perspMax - persp) / perspSpan, 0.0f, 1.0f);
+  };
+  auto hazeK = [&](float persp) { return depthT(persp) * kHazeMax; };
+
   // Viewport culling helpers (screen space, padded past the clip rect).
   const ImVec2 scrMin(origin.x - 40.0f, origin.y - 40.0f);
   const ImVec2 scrMax(origin.x + canvasSz.x + 40.0f,
@@ -4333,7 +4393,7 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   // ---- Containment bubble outlines (under edges) --------------------------
   // Nested packing makes every parent a bubble of its contents; outline it
   // so assembly/part nesting reads at a glance. LOD-culled when tiny.
-  for (int vi : G.visibleIdx) {
+  for (int vi : G.drawOrder) {
     const GNode &n = G.nodes[vi];
     if (n.bubbleR <= n.radius + 1.0f)
       continue;
@@ -4342,8 +4402,37 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     const float rb = n.bubbleR * perspB * G.zoom;
     if (rb < 10.0f)
       continue;
-    dl->AddCircleFilled(c, rb, kindColor(n.kind, 0.045f), 48);
-    dl->AddCircle(c, rb, kindColor(n.kind, 0.30f), 48, 1.5f);
+    const float k = hazeK(perspB);
+    const ImU32 rim = hazeCol(kindColor(n.kind, 0.30f), k);
+    if (rb < kBubbleVolumeR * S) {
+      // Below this the shells land sub-pixel apart: a packed hierarchy of
+      // hundreds of tiny bubbles would pay for the volume and show none of it.
+      dl->AddCircleFilled(c, rb, hazeCol(kindColor(n.kind, 0.045f), k), 48);
+      dl->AddCircle(c, rb, rim, 48, 1.5f);
+      continue;
+    }
+    // Rim-weighted radial falloff. Nested fills accumulate toward the centre,
+    // so brightening the rim means fading each inner shell further into the
+    // bed instead of raising its alpha. Nested assemblies then stack as glass
+    // shells rather than as overlapping outlines.
+    static constexpr float kShellR[5] = {1.0f, 0.90f, 0.78f, 0.62f, 0.42f};
+    static constexpr float kShellA[5] = {0.10f, 0.075f, 0.055f, 0.04f, 0.03f};
+    static constexpr float kShellFade[5] = {0.0f, 0.45f, 0.70f, 0.86f, 0.96f};
+    for (int s = 0; s < 5; ++s)
+      dl->AddCircleFilled(
+          c, rb * kShellR[s],
+          hazeCol(kindColor(n.kind, kShellA[s]),
+                  std::min(1.0f, k + kShellFade[s] * (1.0f - k))),
+          48);
+    dl->AddCircle(c, rb, rim, 48, 1.5f);
+    // One upper-left specular arc — the cue that says "curved glass".
+    dl->PathArcTo(c, rb * 0.94f, IM_PI * 1.06f, IM_PI * 1.52f, 20);
+    dl->PathStroke(hazeCol(ImGui::GetColorU32(ImVec4(palette.glassHighlight[0],
+                                                     palette.glassHighlight[1],
+                                                     palette.glassHighlight[2],
+                                                     0.32f)),
+                           k),
+                   ImDrawFlags_None, 1.6f * S);
   }
 
   // ---- Edges (visibleEdges only) ------------------------------------------
@@ -4398,6 +4487,12 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       col = ImGui::GetColorU32(ImVec4(palette.statusWarn[0],
                                       palette.statusWarn[1],
                                       palette.statusWarn[2], 0.90f));
+    // A stale external reference outranks every other edge colour: it is the
+    // one that silently produces wrong geometry downstream.
+    if (e.stale && !dimf)
+      col = ui::kit::toneU32(ui::kit::Tone::Err, std::max(alpha, 0.80f));
+    // Atmospheric perspective, from the midpoint depth of the two endpoints.
+    col = hazeCol(col, hazeK(0.5f * (perspA + perspB)));
 
     if (!onScreen(p0) && !onScreen(p1))
       continue; // viewport cull
@@ -4405,7 +4500,13 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
                    : selEdge ? 3.0f
                              : (incident && !dimf ? 2.2f : 1.3f)) *
                   S;
-    if (!edgeLod && (e.origin == "inferred" || e.origin == "ai"))
+    // Dashed = "this link is not a solid fact": inferred/AI-authored, an edge
+    // leaving a suppressed feature, or a stale external ref. Stale dashes even
+    // under edge LOD — it is rare and it is the diagnostic.
+    const bool dashed =
+        e.stale || (!edgeLod && (e.origin == "inferred" || e.origin == "ai" ||
+                                 a.metaSuppressed));
+    if (dashed)
       drawDashedLine(dl, p0, p1, col, thick, 7 * S, 4 * S);
     else
       dl->AddLine(p0, p1, col, thick);
@@ -4435,14 +4536,28 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   ImVec2 mp = ImGui::GetIO().MousePos;
   float bestD = 1e9f;
   if (hovered) {
-    for (int vi : G.visibleIdx) {
-      const GNode &n = G.nodes[vi];
+    // The paint walks back-to-front, so picking walks the opposite way: in 3D
+    // the first disc the cursor lands in is the one closest to the camera, and
+    // it wins even if a node far behind has its centre nearer in screen space.
+    // 2D keeps the original forward id-order min-distance scan verbatim, so
+    // which node a click selects there is byte-for-byte unchanged.
+    const std::vector<int> &hitSet = G.view3d ? G.drawOrder : G.visibleIdx;
+    const int hitN = (int)hitSet.size();
+    for (int k = 0; k < hitN; ++k) {
+      const GNode &n = G.nodes[hitSet[static_cast<size_t>(
+          G.view3d ? (hitN - 1 - k) : k)]];
       float persp = 1.0f;
       ImVec2 c = nodeScreen(n, persp);
       float r = n.radius * persp * G.zoom;
       float dx = mp.x - c.x, dy = mp.y - c.y;
       float d = dx * dx + dy * dy;
-      if (d <= r * r && d < bestD) {
+      if (d > r * r)
+        continue;
+      if (G.view3d) {
+        G.hoverId = n.id;
+        break;
+      }
+      if (d < bestD) {
         bestD = d;
         G.hoverId = n.id;
       }
@@ -4644,7 +4759,7 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       ++onScreenNodes;
   }
   const bool labelAll = onScreenNodes <= 150;
-  for (int vi : G.visibleIdx) {
+  for (int vi : G.drawOrder) {
     const GNode &n = G.nodes[vi];
     float persp = 1.0f;
     ImVec2 c = nodeScreen(n, persp);
@@ -4676,9 +4791,17 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
                  palette.statusWarn[2] * 0.20f, 0.88f * a));
     }
     ImU32 ring = Palette::toU32(palette.border);
-    // Cross-project merged graph (>1 owning root): rim tint per project so
-    // foreign nodes read at a glance. Selection/blast/hover still override.
-    if (G.projects.size() > 1 && !n.metaProject.empty())
+    // Rim slot precedence: selection / blast / hover while active, then vault
+    // lifecycle, then the cross-project tint. Lifecycle outranks the project
+    // tint because it is the actionable one — an assembly of Released parts
+    // with one In-work child has to read without a click — but the tint is not
+    // dropped: it moves to a thinner outer ring below.
+    const bool projTint = G.projects.size() > 1 && !n.metaProject.empty();
+    ImU32 lcRim = 0;
+    const bool hasLc = lifecycleRim(n.metaLifecycle, a, lcRim);
+    if (hasLc)
+      ring = lcRim;
+    else if (projTint)
       ring = projectColor(n.metaProject, 0.85f * a);
     if (sel) {
       ring = Palette::toU32(palette.accent);
@@ -4689,8 +4812,50 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     } else if (hov) {
       ring = Palette::toU32(palette.accentDim);
     }
-    dl->AddCircleFilled(c, r, fill, 24);
+    const float k = hazeK(persp);
+    fill = hazeCol(fill, k);
+    ring = hazeCol(ring, k);
+    // Nearest slice of the depth range gets a soft bloom, so "in front" is
+    // legible without moving the camera. 3D only; flat frames have no front.
+    if (G.view3d && !dim) {
+      const float dt = depthT(persp);
+      if (dt <= kBloomFront) {
+        const float b = 1.0f - dt / kBloomFront;
+        dl->AddCircleFilled(c, r * 1.5f, kindColor(n.kind, 0.06f * b * a), 24);
+        dl->AddCircleFilled(c, r * 2.2f, kindColor(n.kind, 0.03f * b * a), 24);
+      }
+    }
+    if (n.metaSuppressed) {
+      // Hollow instead of solid. A suppressed feature that still has
+      // downstream DEPENDS_ON edges is what makes a rebuild behave
+      // inexplicably, and a solid disc makes it identical to a live one.
+      dl->AddCircleFilled(c, r, hazeCol(kindColor(n.kind, 0.16f * a), k), 24);
+      if (r < 9.0f) {
+        // Too small for the kind glyph, so hatch it — otherwise a suppressed
+        // node at this zoom is just a faint disc.
+        const float h = r * 0.62f;
+        const ImU32 hc = hazeCol(kindColor(n.kind, 0.60f * a), k);
+        dl->AddLine(ImVec2(c.x - h, c.y - h), ImVec2(c.x + h, c.y + h), hc,
+                    1.2f * S);
+        dl->AddLine(ImVec2(c.x - h, c.y + h), ImVec2(c.x + h, c.y - h), hc,
+                    1.2f * S);
+      }
+    } else {
+      dl->AddCircleFilled(c, r, fill, 24);
+    }
     dl->AddCircle(c, r, ring, 24, (sel || inBlast ? 2.6f : 1.4f) * S);
+    // Project tint displaced by the lifecycle rim — kept as a thinner outer
+    // ring so a cross-project Released part still reads as foreign.
+    if (projTint && hasLc)
+      dl->AddCircle(c, r + 2.5f * S,
+                    hazeCol(projectColor(n.metaProject, 0.65f * a), k), 24,
+                    1.0f * S);
+    // Endpoint of a stale external reference: the geometry downstream of this
+    // node may already be wrong.
+    if (G.staleNodes.count(n.id))
+      dl->AddCircle(c, r + 4.5f * S,
+                    hazeCol(ui::kit::toneU32(ui::kit::Tone::Err, 0.85f * a), k),
+                    24, 1.6f * S);
     // Pulsing outer halo on blast nodes (distinct from selection accent).
     if (inBlast && !dim) {
       const float pulse =
@@ -4712,11 +4877,16 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
       const char *glyph = kindShort(n.kind);
       ImVec2 gs = ImGui::CalcTextSize(glyph);
       if (gs.x <= r * 1.6f) {
-        dl->AddText(
-            ImVec2(c.x - gs.x * 0.5f, c.y - gs.y * 0.5f),
-            ImGui::GetColorU32(ImVec4(palette.panelBg[0], palette.panelBg[1],
-                                      palette.panelBg[2], dim ? 0.5f : 0.95f)),
-            glyph);
+        // Knocked out of the fill normally; on a hollow suppressed disc there
+        // is no fill to knock out of, so it inverts to the kind colour.
+        const ImU32 gc =
+            n.metaSuppressed
+                ? hazeCol(kindColor(n.kind, dim ? 0.5f : 0.95f), k)
+                : ImGui::GetColorU32(ImVec4(palette.panelBg[0],
+                                            palette.panelBg[1],
+                                            palette.panelBg[2],
+                                            dim ? 0.5f : 0.95f));
+        dl->AddText(ImVec2(c.x - gs.x * 0.5f, c.y - gs.y * 0.5f), gc, glyph);
       }
     }
 

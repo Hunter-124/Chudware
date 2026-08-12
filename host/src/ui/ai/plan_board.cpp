@@ -20,6 +20,7 @@
 #include "ui_theme.h"
 #include "ui/metrics.h"       // cpMenu* rhythm tokens (gutter / row pad / gap / corner)
 #include "ui/ai/ai_prefs.h"
+#include "ui/widgets/kit.h"   // ui::kit — the shared section header / empty state / tone table
 
 namespace ui {
 namespace {
@@ -144,25 +145,20 @@ std::string pbStatusNext(const std::string& s) {
 }
 
 ImVec4 pbStatusColor(const std::string& s, const AdaptiveSurface& surf) {
-    const auto& pal = palette;
-    if (s == "running" || s == "active")
-        return ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f);
-    if (s == "done" || s == "pass")
-        return ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1.0f);
-    if (s == "abandoned" || s == "dropped" || s == "fail")
-        return surf.textTertiary;
+    // The two SEMANTIC states go through the kit tone table, so "active" and "done" read the
+    // same here as in the Copilot task list. Pending and Dropped are not statuses but weights
+    // (not-yet vs. no-longer) and there is no kit Tone that separates them — they stay on the
+    // surface's own ink ladder, which is what keeps them distinguishable from each other.
+    if (s == "running" || s == "active") return ui::kit::toneOn(ui::kit::Tone::Accent, surf);
+    if (s == "done" || s == "pass")      return ui::kit::toneOn(ui::kit::Tone::Ok, surf);
+    if (s == "abandoned" || s == "dropped" || s == "fail") return surf.textTertiary;
     return surf.textSecondary;
 }
 
 // ---- small text helpers -------------------------------------------------------------
 
 std::string pbElide(const std::string& s, float maxW) {
-    if (maxW <= 0.0f) return std::string();
-    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
-    std::string out = s;
-    while (out.size() > 4 && ImGui::CalcTextSize((out + "...").c_str()).x > maxW)
-        out.pop_back();
-    return out + "...";
+    return ui::kit::elide(s.c_str(), maxW);   // cuts on a UTF-8 boundary, unlike a byte pop_back
 }
 
 // "2026-07-23T14:02:11Z" -> "14:02:11" (keep the raw string when it isn't ISO-ish).
@@ -173,15 +169,13 @@ std::string pbShortTime(const std::string& iso) {
     return iso.substr(t + 1, 8);
 }
 
+// Domain wrapper over the shared painter. `surf` is now unused: ui::kit::emptyState resolves
+// its own ink from the palette. The parameter stays so the four call sites are untouched.
 void pbEmptyState(const char* msg, const char* sub, const AdaptiveSurface& surf) {
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextWrapped("%s", msg);
-    ImGui::PopStyleColor();
-    if (sub && sub[0]) {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        ImGui::TextWrapped("%s", sub);
-        ImGui::PopStyleColor();
-    }
+    (void)surf;
+    ui::kit::pushDensity(ui::kit::Density::Cozy);
+    ui::kit::emptyState(nullptr, msg, sub);
+    ui::kit::popDensity();
 }
 
 // ---- ai_vc timeline ----------------------------------------------------------------
@@ -325,18 +319,15 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
         glassPanel(dl, ImRect(c0, c1), GlassLevel::Thin, rowRoundDp(), surf);
     }
 
-    ImGui::PushFont(st.fonts.medium);
-    ImGui::TextColored(semanticOnGlass(pal.accent, surf), "Checkpoints");
-    ImGui::PopFont();
-    if (s_tl.loading) {
-        ImGui::SameLine(0, 8.0f * S);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        ImGui::TextUnformatted("(refreshing...)");
-        ImGui::PopStyleColor();
-    }
+    // Section header through the shared painter: the refresh state right-aligns on the header's
+    // own line instead of trailing the title, so the label position never shifts while polling.
+    ui::kit::pushDensity(ui::kit::Density::Cozy);
+    ui::kit::sectionHeader("Checkpoints", nullptr, s_tl.loading ? "refreshing..." : nullptr,
+                           /*count=*/-1, /*first=*/true);
+    ui::kit::popDensity();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-    ImGui::TextUnformatted("Silent agent version control — restore the document (and "
-                           "chat) to before a turn or tool call.");
+    ImGui::TextWrapped("Silent agent version control — restore the document (and "
+                       "chat) to before a turn or tool call.");
     ImGui::PopStyleColor();
     ImGui::Spacing();
 
@@ -487,36 +478,43 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
     PlanState* plan = msg ? &msg->planState : nullptr;
 
     // ---- header ----------------------------------------------------------------
-    ImGui::PushFont(st.fonts.medium);
-    ImGui::TextColored(semanticOnGlass(pal.accent, surf), "%s",
-                       plan && !plan->title.empty() ? plan->title.c_str() : "Session Plan");
-    ImGui::PopFont();
+    // Section header through the shared painter. The completion count moves INTO the trailing
+    // text (it used to live only in the ring's tooltip, invisible until hovered), and the ring
+    // is placed on the header's own row immediately left of it — still the app's one shared
+    // circular gauge, never a bespoke bar.
+    int done = 0;
+    if (plan)
+        for (const auto& it : plan->items)
+            if (it.status == "done" || it.status == "pass") ++done;
+    std::string meta;
     if (plan) {
-        ImGui::SameLine(0, ui::metrics::cpMenuRowPadX());
-        // Plan completion as the app's shared circular gauge — the same ring every compact
-        // "how full is this" readout uses, never a bespoke rectangular bar.
-        if (!plan->items.empty()) {
-            int done = 0;
-            for (const auto& it : plan->items)
-                if (it.status == "done" || it.status == "pass") ++done;
-            const float frac = (float)done / (float)plan->items.size();
-            const float r  = ImGui::GetFrameHeight() * 0.34f;
-            const float lh = ImGui::GetTextLineHeight();
-            const ImVec2 rp = ImGui::GetCursorScreenPos();
-            ImVec4 track = surf.textTertiary;
-            track.w = 0.35f;
-            drawFractionRing(dl, ImVec2(rp.x + r, rp.y + lh * 0.5f), r,
-                             ui::metrics::stroke(2.0f), frac,
-                             ImGui::ColorConvertFloat4ToU32(track), fracArcCol(1.0f - frac));
-            ImGui::Dummy(ImVec2(r * 2.0f, lh));
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%d of %d plan items done", done, (int)plan->items.size());
-            ImGui::SameLine(0, ui::metrics::cpMenuLabelGap());
-        }
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        ImGui::Text("%d item%s - rev %d", (int)plan->items.size(),
-                    plan->items.size() == 1 ? "" : "s", plan->revision);
-        ImGui::PopStyleColor();
+        char buf[64];
+        if (plan->items.empty())
+            std::snprintf(buf, sizeof(buf), "no items · rev %d", plan->revision);
+        else
+            std::snprintf(buf, sizeof(buf), "%d/%d done · rev %d", done,
+                          (int)plan->items.size(), plan->revision);
+        meta = buf;
+    }
+    const ImVec2 headPos = ImGui::GetCursorScreenPos();
+    const float  headW   = ImGui::GetContentRegionAvail().x;
+    const float  headLh  = ImGui::GetTextLineHeight();
+    ui::kit::pushDensity(ui::kit::Density::Cozy);
+    ui::kit::sectionHeader(plan && !plan->title.empty() ? plan->title.c_str() : "Session Plan",
+                           nullptr, meta.empty() ? nullptr : meta.c_str(),
+                           /*count=*/-1, /*first=*/true);
+    ui::kit::popDensity();
+    if (plan && !plan->items.empty()) {
+        const float frac  = (float)done / (float)plan->items.size();
+        const float r     = headLh * 0.40f;
+        const float metaW = ImGui::CalcTextSize(meta.c_str()).x;
+        ImVec4 track = surf.textTertiary;
+        track.w = 0.35f;
+        drawFractionRing(dl,
+                         ImVec2(headPos.x + headW - metaW - ui::metrics::cpMenuLabelGap() - r,
+                                headPos.y + headLh * 0.5f),
+                         r, ui::metrics::stroke(2.0f), frac,
+                         ImGui::ColorConvertFloat4ToU32(track), fracArcCol(1.0f - frac));
     }
     // Live progress line (the same one-liner the Copilot plan card shows).
     if (plan && !plan->items.empty()) {

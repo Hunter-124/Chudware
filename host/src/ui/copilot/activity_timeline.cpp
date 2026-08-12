@@ -109,8 +109,13 @@ static float collapseEase(ImGuiID key, bool open) {
     if (c.t < 0.0f) {
         c.t = target;
     } else if (c.t != target) {
-        const float step = ImGui::GetIO().DeltaTime / kCollapseSecs;
+        // ui::anim::dt() rather than raw DeltaTime: a debugger stall or a blocking RPC would
+        // otherwise teleport the drawer to its end state on the resume frame. requestFrames() is
+        // what keeps the ease smooth instead of stepping at the 20 Hz idle floor — and it is
+        // asked for ONLY while moving, so a settled transcript still idles.
+        const float step = ui::anim::dt() / kCollapseSecs;
         c.t = (c.t < target) ? ImMin(target, c.t + step) : ImMax(target, c.t - step);
+        ui::anim::requestFrames();
     }
     return c.t * c.t * (3.0f - 2.0f * c.t);
 }
@@ -148,6 +153,96 @@ static void endCollapseBody(CollapseBody& b) {
         if (h > 0.0f) s_collapseT[b.key].h = h;
     }
 }
+
+// ---- row silhouettes -------------------------------------------------------------------------
+// A turn used to render as eight identical grey rounded rectangles: thinking, plan, stage card,
+// tool call, raw payload, error and the answer all shared ONE fill, ONE border and ONE weight, so
+// nothing in the column said what mattered. Weight now tracks importance, and the shell is what
+// encodes it:
+//
+//   the reply                a full glass bubble (drawProseBubble) — the ONLY one in a turn
+//   orchestrator stage card  faint wash + a status-toned left rail
+//   thinking / thought box   no wash, a muted left rail — the agent muttering
+//   tool call                no wash, no rail: one dense log line
+//   raw ops payload          no shell at all: one dim mono line + a disclosure
+//   anything that failed     the rail turns Tone::Err (a refusal: Tone::Info)
+//
+// Measure-then-fill exactly like beginGlassBubble: the body draws on a front channel and the shell
+// is painted behind it once the child's true height is known, so an auto-height row needs no
+// second frame. beginRowShell owns the child AND the style stack it pushed; endRowShell must run
+// on every path out.
+struct RowShell {
+    ImDrawList*   dl = nullptr;
+    ImVec2        origin{};
+    float         width = 0.0f;
+    ui::kit::Tone tone  = ui::kit::Tone::Neutral;
+    float         wash  = 0.0f;   // background alpha; 0 = no fill
+    float         rail  = 0.0f;   // left-rail alpha; 0 = no rail
+};
+
+// 2 dp: a 1 px hairline vanishes against the frosted bed at 100% scale, and 3 dp reads as a border
+// — which is the thing this replaces.
+static float rowRailW() { return ui::metrics::px(2.0f); }
+
+static RowShell beginRowShell(const char* id, ui::kit::Tone tone, float wash, float rail) {
+    RowShell sh;
+    sh.dl     = ImGui::GetWindowDrawList();
+    sh.origin = ImGui::GetCursorScreenPos();
+    sh.width  = ImGui::GetContentRegionAvail().x;
+    sh.tone   = tone;
+    sh.wash   = wash;
+    sh.rail   = rail;
+    sh.dl->ChannelsSplit(2);
+    sh.dl->ChannelsSetCurrent(1);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    // The rail lives in the content inset, so the text column lands in the same place whether or
+    // not this row has one.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(rowRailW() + ui::kit::padX(), ui::kit::padY()));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::kit::rowGap()));
+    ImGui::BeginChild(id, ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    return sh;
+}
+
+static ImRect endRowShell(const RowShell& sh) {
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+    ImVec2 p1 = ImGui::GetItemRectMax();
+    if (p1.x < sh.origin.x + sh.width) p1.x = sh.origin.x + sh.width;
+    sh.dl->ChannelsSetCurrent(0);
+    if (sh.wash > 0.0f)
+        sh.dl->AddRectFilled(sh.origin, p1, ui::kit::toneU32(sh.tone, sh.wash),
+                             ui::kit::rowRound());
+    if (sh.rail > 0.0f) {
+        const float w = rowRailW();
+        sh.dl->AddRectFilled(sh.origin, ImVec2(sh.origin.x + w, p1.y),
+                             ui::kit::toneU32(sh.tone, sh.rail), w * 0.5f);
+    }
+    sh.dl->ChannelsMerge();
+    return ImRect(sh.origin, p1);
+}
+
+// The rail/ink tone for a row, from the same status vocabulary the gutter spine mark uses — so a
+// red mark in the gutter can never sit beside an amber rail. A plain COMPLETED step gets Neutral
+// rather than Tone::Ok on purpose: the gutter already carries its check, and eight green rails
+// down a finished turn is a wall of chroma that says nothing.
+static ui::kit::Tone rowToneOf(const std::string& status, bool guardRefusal) {
+    if (status == "fail" || status == "error")
+        return guardRefusal ? ui::kit::Tone::Info : ui::kit::Tone::Err;
+    if (status == "running")  return ui::kit::Tone::Accent;
+    if (status == "retry")    return ui::kit::Tone::Warn;
+    if (status == "skipped")  return ui::kit::Tone::Info;
+    return ui::kit::Tone::Neutral;
+}
+
+// Shell alphas, named once so the hierarchy is legible in one place rather than as six magic
+// numbers scattered through the painters.
+static constexpr float kStageWash  = 0.055f;  // stage-card fill — present, but well under glass
+static constexpr float kRailStrong = 0.85f;   // a status rail that IS the row's identity
+static constexpr float kRailMuted  = 0.40f;   // a thought's rail: visible, never competing
 
 // ---- inline artifact thumbnails: bounded texture cache --------------------------------------
 // Renders are now written once per render_part call, so the old unbounded path-keyed map leaked
@@ -260,6 +355,22 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
         if (toggleChip("Diff", s.showDiff)) s.showDiff = !s.showDiff;
         first = false;
     }
+    // Console output the model's own generated code printed. Captured by the drain and written to
+    // the conversation file for months, rendered nowhere: when a build "succeeds" but the geometry
+    // is wrong, these are the print statements the model added to debug itself. The open flag lives
+    // in ImGui's per-window storage rather than on AgentStep — app_state.h is integrator-owned —
+    // and the ##stepcard child makes that id unique per iteration.
+    ImGuiStorage* const outStore = ImGui::GetStateStorage();
+    const ImGuiID       outKey   = ImGui::GetID("##step_stdout_open");
+    bool                showOut  = outStore->GetBool(outKey, false);
+    if (!s.stdoutText.empty()) {
+        if (!first) ImGui::SameLine();
+        if (toggleChip("Console", showOut)) {
+            showOut = !showOut;
+            outStore->SetBool(outKey, showOut);
+        }
+        first = false;
+    }
     if (!s.ok && !s.error.empty()) {
         if (!first) ImGui::SameLine();
         if (toggleChip("Error details", s.showError)) s.showError = !s.showError;
@@ -273,6 +384,8 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
         drawDiffBox("##diff_v", s.diff, fonts.mono, ui::metrics::copilotDiffMaxH());
     if (s.showError && !s.error.empty())
         drawCodeBox("##err_v", s.error, fonts.mono, ui::metrics::px(200.0f));
+    if (showOut && !s.stdoutText.empty())
+        drawCodeBox("##stdout_v", s.stdoutText, fonts.mono, ui::metrics::px(200.0f));
     ImGui::PopStyleColor();
     ImGui::EndChild();
     ImGui::PopStyleVar(2);   // ##stepcard compact ItemSpacing + WindowPadding
@@ -413,11 +526,13 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
 
     if (!showThinking) {
+        ImGui::Indent(rowRailW() + ui::kit::padX());   // one left edge for the whole timeline
         ImGui::PushFont(fonts.body);
         ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
         ImGui::TextUnformatted(a.title.empty() ? "Thinking" : a.title.c_str());
         ImGui::PopStyleColor();
         ImGui::PopFont();
+        ImGui::Unindent(rowRailW() + ui::kit::padX());
         return;
     }
 
@@ -445,13 +560,9 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     const bool    wantOpen = open && hasDetail;
     const float   openE = ui::chatCollapseAnim() ? collapseEase(animKey, wantOpen)
                                                  : (wantOpen ? 1.0f : 0.0f);
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
-    ImGui::BeginChild("##thinkblk", ImVec2(0, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    // The agent muttering: no glass, no border, just a muted rail. It must not compete with the
+    // answer, and eight of these in a row must not read as eight decisions.
+    RowShell sh = beginRowShell("##thinkblk", ui::kit::Tone::Neutral, 0.0f, kRailMuted);
 
     const ui::AdaptiveSurface& surf = chatSurf();
     if (openE <= 0.0f && hasDetail) {
@@ -500,26 +611,31 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
         endCollapseBody(cb);
     } else if (hasDetail && !replyBody.empty()) {
         // Collapsed: dim one-line preview of the first reply line, ellipsized to the card's
-        // content width (same pattern as drawThoughtBox).
-        std::string prev = stripMdMarks(replyBody.substr(0, replyBody.find('\n')));
-        prev = chatEllipsize(prev, ImGui::GetContentRegionAvail().x);
+        // content width (same pattern as drawThoughtBox). The tooltip carries the untruncated
+        // line — an ellipsis with no way to read what it ate is a dead end.
+        const std::string prevFull = stripMdMarks(replyBody.substr(0, replyBody.find('\n')));
+        const std::string prev = chatEllipsize(prevFull, ImGui::GetContentRegionAvail().x);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         ImGui::TextUnformatted(prev.c_str());
         ImGui::PopStyleColor();
+        if (prev != prevFull && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", prevFull.c_str());
     }
 
-    ImGui::EndChild();
-    ImGui::PopStyleVar(2);   // ##thinkblk compact ItemSpacing + WindowPadding
-    ImRect thinkRect = endGlassBubble(gb);
+    ImRect thinkRect = endRowShell(sh);
     const std::string thinkCopy = chatActivityCopyText(a);
     chatCopyContext(thinkRect, "##think_copy", thinkCopy);
 
 }
 
-// A glass action card for a tool call / orchestrator build stage: status glyph + tool icon + human
-// label + duration/ops meta, the verdict folded in as a result line, an expandable drawer (a
-// legacy AgentStep's thinking/code/diff/thumbnail when attached, else the raw detail), and a red
-// border when the stage failed. `step` is non-null only for v1 runs that carry an AgentStep.
+// An orchestrator build stage: status glyph + stage icon + human label + duration/ops meta, the
+// verdict folded in as a result line, and an expandable drawer (a legacy AgentStep's
+// thinking/code/console/diff/thumbnail when attached, else the raw detail). `step` is non-null
+// only for v1 runs that carry an AgentStep.
+//
+// Silhouette: a faint wash behind a status-toned LEFT RAIL — never a full border. The card is one
+// beat in the run's story, not a document; a boxed border per stage is what made eight of them
+// read as eight equal-weight objects.
 //
 // `onSpine` = the run spine is drawing this row's status mark out in the left gutter, so the card
 // must NOT draw its own leading glyph — two marks for one step reads as two steps. The card keeps
@@ -541,13 +657,8 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
                           hasWord(a.title, "planner");
 
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
-    ImGui::BeginChild("##actcard", ImVec2(0, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    RowShell sh = beginRowShell("##actcard", rowToneOf(a.status, /*guardRefusal=*/false),
+                                kStageWash, kRailStrong);
     const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);   // base ink (dimText derives from it)
 
@@ -614,8 +725,12 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
     // ends — UNLESS the user explicitly toggled it (userToggled always wins, both directions).
     // No mutation of a.expanded here: pinning state belongs to the click handlers only.
     const bool open = a.userToggled ? a.expanded : (a.expanded || running || liveFrontier);
+    // The console output the model's own code printed. It is captured, drained and persisted; the
+    // ONLY reason it never appeared is that this predicate did not test it, so the drawer it
+    // belongs in was never offered on a step whose sole extra payload was stdout.
     const bool hasDrawer = (step && (!step->thinking.empty() || !step->code.empty() ||
-                                     !step->diff.empty() || !step->contactSheet.empty())) ||
+                                     !step->diff.empty() || !step->contactSheet.empty() ||
+                                     !step->stdoutText.empty())) ||
                            !replyBody.empty() || !sentBody.empty() || !altLines.empty();
     if (hasDrawer) {
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -666,6 +781,16 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
                 drawCodeBox("##actcode", step->code, fonts.mono, ui::metrics::px(260.0f));
             if (!step->diff.empty())
                 drawDiffBox("##actdiff", step->diff, fonts.mono, ui::metrics::copilotDiffMaxH());
+            if (!step->stdoutText.empty()) {
+                // Collapsed by default: when a build "succeeds" but the geometry is wrong, these
+                // are the print statements the model wrote to debug its own code.
+                if (ImGui::TreeNodeEx("Console output##actstdout",
+                                      ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                    drawCodeBox("##actstdout_box", step->stdoutText, fonts.mono,
+                                ui::metrics::px(200.0f));
+                    ImGui::TreePop();
+                }
+            }
             if (!step->contactSheet.empty()) {
                 if (!step->triedThumb) { step->thumb = loadTexture(step->contactSheet); step->triedThumb = true; }
                 if (step->thumb.id) {
@@ -695,15 +820,7 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
     }
 
     ImGui::PopStyleColor();   // base ink
-    ImGui::EndChild();
-    ImGui::PopStyleVar(2);   // ##actcard compact ItemSpacing + WindowPadding
-    ImRect cardRect = endGlassBubble(gb);
-
-    // ---- error frame: a red border around the whole card ----
-    if (fail) {
-        ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
-                                            ui::metrics::rounding(8.0f), 0, ui::metrics::stroke(1.5f));
-    }
+    ImRect cardRect = endRowShell(sh);
     {
         const std::string copyTxt = chatActivityCopyText(a);
         chatCopyContext(cardRect, "##act_copy", copyTxt);
@@ -721,6 +838,10 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
+    // Shell-less, like the raw-payload line: borrow the shell's content inset so the whole timeline
+    // shares one left edge instead of the lightest rows hanging out into the gutter.
+    const float shellInset = rowRailW() + ui::kit::padX();
+    ImGui::Indent(shellInset);
     ui::IconUV iv = ui::getIcon("bookmark", 20);
     if (iv.valid) {
         float gz = ImGui::GetTextLineHeight() * 0.85f;
@@ -742,6 +863,7 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
     if (clipped != line && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", line.c_str());
     ImGui::PopStyleColor();
     ImGui::PopFont();
+    ImGui::Unindent(shellInset);
     {
         const ImRect chipRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
         chatCopyContext(chipRect, "##ctx_copy", line);
@@ -789,16 +911,17 @@ std::string timelineProseTail(const ChatMsg& m) {
     return m.text.substr(shown.size());
 }
 
-// The model's prose, as a Thin glass bubble (Liquid Glass v2 §6, host contract H5) drawn at the
-// position in the column where the segment actually arrived. Selectable for click-drag +
-// Ctrl+C; right-click copies the selection or the whole segment — the same affordances the
-// single trailing reply card used to carry, which chat_log.cpp now only draws for a reply the
-// timeline never saw.
+// The model's prose — the answer — as the HEAVIEST thing in the column: the only full glass
+// bubble a turn draws, at Regular rather than Thin, so it reads as the deliverable and every
+// stage/thought/tool row beside it reads as supporting material. Selectable for click-drag +
+// Ctrl+C; right-click copies the selection or the whole segment — the same affordances the single
+// trailing reply card used to carry, which chat_log.cpp now only draws for a reply the timeline
+// never saw.
 static void drawProseBubble(ActivityItem& a, const ui::Fonts& fonts) {
     if (!ui::streamTextVisible(a.detail)) return;   // an empty segment is not a card
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     const std::string prose = stripMdMarks(a.detail);
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Regular,
                                       10.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
@@ -838,9 +961,11 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     const bool isOpsJson = (a.stage == "stream:out" && a.opsCount > 0) ||
                            (a.title.find("Building ops") != std::string::npos);
     if (!showThinking && !isOpsJson) {
+        ImGui::Indent(rowRailW() + ui::kit::padX());   // one left edge for the whole timeline
         ImGui::PushFont(fonts.body);
         ImGui::TextColored(surf.textSecondary, "Thinking");
         ImGui::PopFont();
+        ImGui::Unindent(rowRailW() + ui::kit::padX());
         return;
     }
     // Ops JSON: only open when the user expanded it (never auto-opens, even mid-stream).
@@ -853,17 +978,61 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     const ImGuiID animKey = ImGui::GetID("##thoughtbox_anim");
     const float   openE = ui::chatCollapseAnim() ? collapseEase(animKey, open)
                                                  : (open ? 1.0f : 0.0f);
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
-    ImGui::BeginChild("##thoughtbox", ImVec2(0, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    // ---- a raw wire payload is NOT a card. "Building ops… (raw) 1747 bytes" used to claim the
+    // same silhouette, fill and border as a decision the agent made. It gets one dim MONO line
+    // and a disclosure: mono says "this is a dump", and the weight says "audit me if you like".
+    if (isOpsJson) {
+        std::string sum = a.reason;
+        if (sum.empty()) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%zu bytes", a.detail.size());
+            sum = buf;
+        }
+        const std::string line =
+            (a.title.empty() ? std::string("Building ops") : a.title) + "  \xc2\xb7  " + sum;
+        // This row has no shell, so it has to borrow the shell's content inset by hand or its text
+        // starts a rail-width left of every other row and the column reads as ragged.
+        const float shellInset = rowRailW() + ui::kit::padX();
+        ImGui::Indent(shellInset);
+        const ImVec2 lineP0 = ImGui::GetCursorScreenPos();
+        const float  lineW  = ImGui::GetContentRegionAvail().x;
+        if (fonts.mono) ImGui::PushFont(fonts.mono);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        const char* disc  = open ? "(hide)" : "(raw)";
+        const float discW = ImGui::CalcTextSize(disc).x + 8 * sc;
+        const std::string fit = chatEllipsize(line, ImMax(lineW - discW, 24.0f * sc));
+        ImGui::TextUnformatted(fit.c_str());
+        bool hit = ImGui::IsItemClicked();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (fit != line) ImGui::SetTooltip("%s", line.c_str());
+        }
+        ImGui::SameLine(0, 8 * sc);
+        ImGui::TextUnformatted(disc);
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) hit = true;
+        const float lineBot = ImGui::GetItemRectMax().y;
+        ImGui::PopStyleColor();
+        if (fonts.mono) ImGui::PopFont();
+        if (hit) { a.expanded = !open; a.userToggled = true; }
+        if (openE > 0.0f && !a.detail.empty()) {
+            CollapseBody cb = beginCollapseBody(animKey, openE, "##thoughtanim");
+            drawProseBox("##opsraw", a.detail, ui::metrics::copilotProseMaxH());
+            endCollapseBody(cb);
+        }
+        ImGui::Unindent(shellInset);
+        chatCopyContext(ImRect(lineP0, ImVec2(lineP0.x + lineW, lineBot)),
+                        "##thought_copy", chatActivityCopyText(a));
+        return;
+    }
+
+    // ---- the agent muttering: borderless, muted, a rail and nothing else.
+    RowShell sh = beginRowShell("##thoughtbox", ui::kit::Tone::Neutral, 0.0f, kRailMuted);
     ImGui::PushFont(fonts.body);
     const char* boxLabel = a.title.empty() ? "Thinking" : a.title.c_str();
     ImGui::TextColored(surf.textSecondary, "%s%s", boxLabel,
-                       (!isOpsJson && a.streaming) ? "\xe2\x80\xa6" : "");
+                       a.streaming ? "\xe2\x80\xa6" : "");
     ImGui::PopFont();
     if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     if (ImGui::IsItemClicked()) {
@@ -872,7 +1041,7 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     }
     ImGui::SameLine(0, 6 * sc);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-    ImGui::TextUnformatted(open ? "(hide)" : (isOpsJson ? "(raw)" : "(show)"));
+    ImGui::TextUnformatted(open ? "(hide)" : "(show)");
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     if (ImGui::IsItemClicked()) {
@@ -880,54 +1049,31 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
         a.userToggled = true;
     }
 
-    // Ops JSON collapsed (default): one-line summary from reason (op count / byte count).
-    if (isOpsJson && openE <= 0.0f) {
-        std::string sum = a.reason;
-        if (sum.empty()) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%zu bytes", a.detail.size());
-            sum = buf;
-        }
-        ImGui::SameLine(0, 8 * sc);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        // Ellipsize to what the row ACTUALLY has left — an unbounded summary
-        // ("1747 bytes · mission_st…") ran straight off the card's right edge.
-        const std::string sumFit = chatEllipsize(sum, ImGui::GetContentRegionAvail().x);
-        ImGui::TextUnformatted(sumFit.c_str());
-        ImGui::PopStyleColor();
-    }
-
     if (openE > 0.0f) {
         if (!a.detail.empty()) {
             CollapseBody cb = beginCollapseBody(animKey, openE, "##thoughtanim");
-            if (isOpsJson) {
-                // Raw JSON only inside the expander.
-                drawProseBox("##opsraw", a.detail, ui::metrics::copilotProseMaxH());
-            } else {
-                // Grow to fit while the text is still arriving (or this box is the live
-                // frontier just after streaming stopped) instead of scrolling inside a small
-                // fixed box — the box fills out as the model reasons, only falling back to the
-                // scrolling presentation past the generous cap. Finished/historical boxes keep
-                // the tight static scroll cap.
-                const bool grow = a.streaming || liveFrontier;
-                drawProseBox("##thoughttxt", stripMdMarks(a.detail),
-                             grow ? ui::metrics::copilotProseStreamCapH()
-                                  : ui::metrics::copilotProseMaxH(), grow);
-            }
+            // Grow to fit while the text is still arriving (or this box is the live frontier just
+            // after streaming stopped) instead of scrolling inside a small fixed box — the box
+            // fills out as the model reasons, only falling back to the scrolling presentation past
+            // the generous cap. Finished/historical boxes keep the tight static scroll cap.
+            const bool grow = a.streaming || liveFrontier;
+            drawProseBox("##thoughttxt", stripMdMarks(a.detail),
+                         grow ? ui::metrics::copilotProseStreamCapH()
+                              : ui::metrics::copilotProseMaxH(), grow);
             endCollapseBody(cb);
         }
-    } else if (!isOpsJson && !a.detail.empty()) {
-        // Collapsed thinking/prose: dim one-line preview (first line), ellipsized to the card's
-        // content width — a raw first line + TextUnformatted ran past the card's right edge.
-        std::string prev = stripMdMarks(a.detail.substr(0, a.detail.find('\n')));
-        prev = chatEllipsize(prev, ImGui::GetContentRegionAvail().x);
+    } else if (!a.detail.empty()) {
+        // Collapsed: dim one-line preview (first line), ellipsized to the row's content width, and
+        // the tooltip carries the untruncated line so the ellipsis is never a dead end.
+        const std::string prevFull = stripMdMarks(a.detail.substr(0, a.detail.find('\n')));
+        const std::string prev = chatEllipsize(prevFull, ImGui::GetContentRegionAvail().x);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         ImGui::TextUnformatted(prev.c_str());
         ImGui::PopStyleColor();
+        if (prev != prevFull && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", prevFull.c_str());
     }
-    ImGui::EndChild();
-    ImGui::PopStyleVar(2);   // ##thoughtbox compact ItemSpacing + WindowPadding
-    ImRect thoughtRect = endGlassBubble(gb);
+    ImRect thoughtRect = endRowShell(sh);
     const std::string thoughtCopy = chatActivityCopyText(a);
     chatCopyContext(thoughtRect, "##thought_copy", thoughtCopy);
 }
@@ -1100,6 +1246,44 @@ ToolRowDetail splitToolRowDetail(const std::string& detail) {
     return d;
 }
 
+// ONE parse of a line inside the packed "\x1eART\x1e" blob. Both producers — feed.cpp's tool-call
+// packer and conversations.cpp's session-restore synthesizer — write "<kind>\t<path>", one artifact
+// per line, so a line that does not have that shape is not an artifact.
+//
+// The path sanity check is not pedantry. Real persisted transcripts on this machine carry ART blobs
+// whose "path" was a multi-LINE tool payload (a cad_guide dump): the embedded newlines shatter the
+// one-artifact-per-line contract, and 450 of the 634 artifact lines in the local store are guide
+// prose wearing a "file\t" prefix. Unfiltered, that renders 32 fake "file: WORKFLOW" rows — each
+// with a live (open)/(folder) button — on a single tool row, and would have the run receipt claim
+// the turn wrote 93 files.
+//
+// A real artifact path therefore has to look like one: no leading/trailing space, a directory
+// separator, and a basename ending in a 1-8 character extension of alphanumerics plus '+' (the
+// native ".step+"/".ecad+" containers). Deliberately NOT "no spaces in the basename" — a part named
+// "rev 2 plate" exports to "rev 2 plate.step" and that file is real. Measured against all 634
+// artifact lines in the local session stores: 0 prose lines survive, every well-formed path does.
+static bool artifactLine(const std::string& line, std::string* kindOut, std::string* pathOut) {
+    const size_t tab = line.find('\t');
+    if (tab == std::string::npos) return false;
+    const std::string kind = line.substr(0, tab);
+    if (kind != "image" && kind != "mesh" && kind != "file") return false;
+    const std::string path = line.substr(tab + 1);
+    if (path.empty() || std::isspace((unsigned char)path.front()) ||
+        std::isspace((unsigned char)path.back()))
+        return false;
+    const size_t slash = path.find_last_of("/\\");
+    if (slash == std::string::npos) return false;
+    const size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos || dot <= slash + 1) return false;   // no basename, or dotfile
+    const std::string ext = path.substr(dot + 1);
+    if (ext.empty() || ext.size() > 8) return false;
+    for (unsigned char c : ext)
+        if (!std::isalnum(c) && c != '+') return false;
+    if (kindOut) *kindOut = kind;
+    if (pathOut) *pathOut = path;
+    return true;
+}
+
 // True when a tool-call failure payload is the harness REFUSING a repeated (tool, args) pair
 // (services/agent/tool_loop_guard.py — ToolCallLoopGuard.message()) rather than a tool that ran
 // and broke. agent_events.tool_call_event ships no structured flag for it (the payload carries
@@ -1193,22 +1377,23 @@ static void drawToolDetailBox(const char* id, const std::string& text, ImFont* f
     if (font) ImGui::PopFont();
 }
 
-// M14 — one inline row per tool call: ok/fail glyph + tool icon + a HUMAN title (tool_phrase.h
-// turns `add_features` into "Building geometry"; the raw MCP symbol survives as the title's
-// tooltip, and as a dim suffix at chatToolDetail() >= 2) + latency, with the cleaned target as a
-// dim wrapped line. Args preview + failure text + image artifacts expand on click, and the
-// drawer eases shut (chatCollapseAnim) instead of snapping when the next call starts.
-// Mid-loop CAD tool failures use statusWarn (amber), matching drawAgentStep build issues — the
-// error is fed back for repair, not a catastrophic turn failure. A loop-guard refusal is not a
-// failure at all (the tool never ran), so it drops the amber chrome entirely for the neutral
-// "skipped" glyph + iterBuilt blue chip. `failCount` > 1 collapses consecutive identical
-// tool+target fails into one row; a non-null `group` of >1 is a fold of consecutive SIMILAR
-// successful calls into one card (drawAgentTimeline computes both runs).
+// M14 — one tool call as ONE dense LOG LINE, not a card: [status mark in the gutter] wrench, the
+// HUMAN title (tool_phrase.h turns `add_features` into "Building geometry"), the target it acts on,
+// and a right-aligned latency/cache chip. It used to be a bordered glass card spending three lines
+// on the same facts, which is how twelve calls came to look exactly as important as the answer.
+// Nothing was dropped to get there: the raw MCP symbol, the wall clock and the full target live on
+// the title's tooltip, and args/failure/artifacts still expand on click (chatCollapseAnim eases the
+// drawer shut instead of snapping when the next call starts).
+//
+// A call that FAILED gets a Tone::Err rail and prints its reason in full, wrapped, collapsed or
+// not. A loop-guard refusal is not a failure at all (the tool never ran), so it takes the
+// informational Tone::Info rail and says so in words. `failCount` > 1 collapses consecutive
+// identical tool+target fails into one row; a non-null `group` of >1 is a fold of consecutive
+// SIMILAR successful calls into one row (drawAgentTimeline computes both runs).
 static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& fonts,
                                 int failCount, bool liveFrontier, int callI = -1,
                                 const std::vector<ActivityItem*>* group = nullptr,
                                 bool onSpine = false) {
-    const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     // Chat-display prefs (cached in ai_prefs — safe to read per row per frame).
     const int  detailLvl = ui::chatToolDetail();
@@ -1225,16 +1410,24 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     const bool fail     = a.status == "fail";
     const bool guard    = fail && isLoopGuardRefusal(errBody);
     const bool hardFail = fail && !guard;   // a tool actually ran and broke
-    // Amber chrome for repairable mid-loop fails (glyph via "retry" status → statusWarn).
-    const ImVec4 failTone = semanticOnGlass(pal.statusWarn, chatSurf());
-    // Refusals get the palette's informational role instead (iterBuilt — the "in progress,
-    // nothing broke" blue of the "built" step badge and the AI-VC tool chip), never amber.
-    const ImVec4 guardTone = semanticOnGlass(pal.iterBuilt, chatSurf());
+    // One hue per meaning, and the same one the gutter mark uses: a genuine failure is Tone::Err
+    // (spineStatusOf maps it to Status::Failed, which resolves to exactly this), a refusal is the
+    // informational Tone::Info. The old amber-on-red split had the rail disagreeing with the mark
+    // beside it; "not catastrophic" is now carried by WEIGHT — a 2 dp rail, not a boxed border.
+    const ImVec4 failTone  = ui::kit::toneOn(ui::kit::Tone::Err, chatSurf());
+    const ImVec4 guardTone = ui::kit::toneOn(ui::kit::Tone::Info, chatSurf());
+    // The one-line cause, hoisted: the row prints it (never truncated) and the drawer only exists
+    // when the raw text says MORE than it does.
+    const std::string errShort = (hardFail && !errBody.empty()) ? errSummary(errBody)
+                                                                : std::string();
 
     // Drawer state is settled BEFORE anything is drawn: the header's click targets and the
     // animated body both need it, and a grouped card's drawer is its members' drawers stacked.
     const bool open = a.userToggled ? a.expanded : (a.expanded || liveFrontier);
-    bool hasDrawer = !argsBody.empty() || !errBody.empty() || !artsBlob.empty();
+    // A hard failure whose raw text IS its summary has nothing extra to reveal, so it must not
+    // advertise "(details)" onto an empty drawer.
+    bool hasDrawer = !argsBody.empty() || !artsBlob.empty() ||
+                     (guard && !errBody.empty()) || (hardFail && errShort != errBody);
     if (groupN > 1) {
         hasDrawer = false;
         for (const ActivityItem* mi : *group) {
@@ -1251,13 +1444,9 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
                                                  : (wantOpen ? 1.0f : 0.0f);
 
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
-    ImGui::BeginChild("##toolrow", ImVec2(0, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    // A completed call gets NO shell: it is a log line. Only an exceptional one earns a rail.
+    RowShell sh = beginRowShell("##toolrow", rowToneOf(a.status, guard), 0.0f,
+                                (hardFail || guard) ? kRailStrong : 0.0f);
     const ui::AdaptiveSurface& surf = chatSurf();
 
     // One artifact blob -> inline images (or, with renders off, dim path lines) + file actions.
@@ -1269,11 +1458,10 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         std::string line;
         int imgI = 0;
         while (std::getline(iss, line)) {
-            if (line.empty()) continue;
-            size_t tab = line.find('\t');
-            std::string kindA = (tab == std::string::npos) ? "file" : line.substr(0, tab);
-            std::string path  = (tab == std::string::npos) ? line : line.substr(tab + 1);
-            if (path.empty()) continue;
+            std::string kindA, path;
+            // artifactLine drops continuation lines from a corrupted multi-line "path": offering an
+            // (open) button on "WORKFLOW" is worse than showing nothing.
+            if (!artifactLine(line, &kindA, &path)) continue;
             ++imgI;
             if (kindA == "image" && showRenders) {
                 const Tex& tx = artTexFor(path);
@@ -1301,54 +1489,9 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         }
     };
 
-    // Same rule as drawActionCard: when the run spine owns this row's mark out in the gutter, the
-    // row must not paint a second one. The spine's own status resolution (spineStatusOf) applies
-    // the identical retry/skipped remap, so the gutter mark says exactly what this glyph would.
-    if (onSpine) ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
-    else         drawStatusGlyph(hardFail ? "retry" : guard ? "skipped" : a.status,
-                                 ImGui::GetTextLineHeight());
-    ImGui::SameLine(0, 6 * sc);
-    ui::IconUV iv = ui::getIcon("wrench", 20);
-    if (iv.valid) {
-        float gz = ImGui::GetTextLineHeight();
-        ImVec4 tint(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.85f);
-        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
-        ImGui::SameLine(0, 6 * sc);
-    }
-    // ---- the human title. `add_features` is an MCP symbol, not a sentence: the card says what
-    // the call DOES, and the raw symbol stays reachable as the title's tooltip (always) and as a
-    // dim suffix in diagnostic mode.
-    const std::string humanTitle = groupN > 1
-        ? ui::toolGroupTitle(a.title, groupN)
-        : ui::toolPhrase(a.title, a.reason, !fail).title;
-    ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(hardFail ? failTone : surf.textPrimary, "%s", humanTitle.c_str());
-    ImGui::PopFont();
-    // Click state is sampled BEFORE SetTooltip: that opens a window of its own and the
-    // IsItem* queries afterwards would no longer refer to the title.
-    const bool titleHovered = ImGui::IsItemHovered();
-    bool toggleHit = hasDrawer && ImGui::IsItemClicked();
-    if (titleHovered) {
-        if (hasDrawer) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        ImGui::SetTooltip("%s", a.title.c_str());
-    }
-    if (diag) {
-        ImGui::SameLine(0, 6 * sc);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        ImGui::Text("\xc2\xb7 %s", a.title.c_str());
-        ImGui::PopStyleColor();
-    }
-    if (hasDrawer) {
-        ImGui::SameLine(0, 6 * sc);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextUnformatted(open ? "(hide)" : "(details)");
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        if (ImGui::IsItemClicked()) toggleHit = true;
-    }
-    if (toggleHit) { a.expanded = !open; a.userToggled = true; }
-
-    // ---- meta chip: latency / failure count / refusal note. Simplified mode shows none of it.
+    // ---- the right-hand chip is composed FIRST, because the title/target elision budget has to
+    // reserve it. A second meta LINE was the old way around that, at the cost of a whole extra
+    // line on every call in the transcript.
     double groupMs = a.durationMs;
     if (groupN > 1) {
         groupMs = 0;
@@ -1365,10 +1508,10 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
                 metaS = meta;
             }
         } else if (guard && failCount > 1) {
-            std::snprintf(meta, sizeof(meta), "skipped \xc2\xb7 repeated call \xc3\x97%d", failCount);
+            std::snprintf(meta, sizeof(meta), "skipped \xc3\x97%d", failCount);
             metaS = meta;
         } else if (guard) {
-            metaS = "skipped \xc2\xb7 repeated call";
+            metaS = "skipped";
         } else if (hardFail && failCount > 1 && a.durationMs > 0) {
             std::snprintf(meta, sizeof(meta), "failed \xc3\x97%d \xc2\xb7 %.1fs",
                           failCount, a.durationMs / 1000.0);
@@ -1386,22 +1529,156 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
             metaS = meta;
         }
     }
+    // META trailer: when the call ran + what its completion read from the prompt cache. A grouped
+    // row shows its LAST member's stamp (the most recent call in the fold).
+    double metaTs = parts.ts;
+    int    metaCache = parts.cacheRead;
+    if (groupN > 1) {
+        const ToolRowDetail tailParts = splitToolRowDetail(group->back()->detail);
+        metaTs = tailParts.ts;
+        metaCache = tailParts.cacheRead;
+    }
+    if (!simple && metaCache > 0) {
+        if (!metaS.empty()) metaS += " \xc2\xb7 ";
+        metaS += "cache " + chatTokCount(metaCache);
+    }
+    const std::string clockS = (!simple && metaTs > 0.0) ? chatRowClock(metaTs) : std::string();
+    // Reserve the chip's slot INCLUDING the right inset the painter below insets by, or the
+    // title's elision budget is optimistic by exactly that much and the chip clips off the panel.
+    const float metaW = metaS.empty()
+                            ? 0.0f
+                            : ImGui::CalcTextSize(metaS.c_str()).x + 8 * sc + ui::kit::padX();
+    // The per-call rewind glyph SameLines itself in and is self-gating, so its slot has to be
+    // reserved up front or a long title pushes it under the meta chip. Resolved ONCE here and used
+    // to skip the painter entirely when there is no checkpoint, so the row does not pay for the
+    // same checkpoint scan twice.
+    const bool hasRewind = groupN == 1 && ui::s_aiVc.available && !ui::s_aiVc.busy &&
+                           !ui::aiVcCallCheckpointId(callI, a.title).empty();
+    const float rewindW = hasRewind ? ImGui::GetTextLineHeight() * 1.15f + 8 * sc : 0.0f;
+
+    // Same rule as drawActionCard: when the run spine owns this row's mark out in the gutter, the
+    // row must not paint a second one. The spine's own status resolution (spineStatusOf) applies
+    // the identical retry/skipped remap, so the gutter mark says exactly what this glyph would.
+    if (onSpine) ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
+    else         drawStatusGlyph(hardFail ? "fail" : guard ? "skipped" : a.status,
+                                 ImGui::GetTextLineHeight());
+    ImGui::SameLine(0, 6 * sc);
+    ui::IconUV iv = ui::getIcon("wrench", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight();
+        ImVec4 tint(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.85f);
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
+        ImGui::SameLine(0, 6 * sc);
+    }
+    // What is left on THIS line once the right-hand cluster is reserved.
+    auto lineRoom = [&]() {
+        return ImGui::GetContentRegionMax().x - ImGui::GetCursorPosX() - metaW - rewindW;
+    };
+    const std::string humanTitle = groupN > 1
+        ? ui::toolGroupTitle(a.title, groupN)
+        : ui::toolPhrase(a.title, a.reason, !fail).title;
+    const char* disc  = hasDrawer ? (open ? "(hide)" : "(details)") : nullptr;
+    const float discW = disc ? ImGui::CalcTextSize(disc).x + 6 * sc : 0.0f;
+    ImGui::PushFont(fonts.medium);
+    const std::string titleFit =
+        chatEllipsize(humanTitle, ImMax(lineRoom() - discW, 24.0f * sc));
+    ImGui::TextColored(hardFail ? failTone : guard ? guardTone : surf.textPrimary,
+                       "%s", titleFit.c_str());
+    ImGui::PopFont();
+    // Click state is sampled BEFORE SetTooltip: that opens a window of its own and the
+    // IsItem* queries afterwards would no longer refer to the title.
+    const bool titleHovered = ImGui::IsItemHovered();
+    bool toggleHit = hasDrawer && ImGui::IsItemClicked();
+    if (titleHovered) {
+        if (hasDrawer) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        // Everything the single line could not afford, in one place: the untruncated phrasing, the
+        // raw MCP symbol, and when the call ran.
+        std::string tip;
+        if (titleFit != humanTitle) tip = humanTitle + "\n";
+        tip += a.title;
+        if (!clockS.empty()) tip += "\n" + clockS;
+        if (metaCache > 0)
+            tip += "\n" + chatTokCount(metaCache) + " tokens read from the prompt cache by the "
+                   "completion that made this call.";
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
+    if (diag) {
+        // Same ordering rule as the target below: SameLine, then measure.
+        const ImVec2 wrapped = ImGui::GetCursorPos();
+        ImGui::SameLine(0, 6 * sc);
+        if (lineRoom() > 40.0f * sc) {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::TextUnformatted(chatEllipsize("\xc2\xb7 " + a.title, lineRoom()).c_str());
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::SetCursorPos(wrapped);
+        }
+    }
+    if (disc) {
+        ImGui::SameLine(0, 6 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted(disc);
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) toggleHit = true;
+    }
+    if (toggleHit) { a.expanded = !open; a.userToggled = true; }
+
+    // ---- the target — "what it acts on" — on the SAME line. It used to own a wrapped line of its
+    // own; at chat widths that doubled every row's height to carry a part name.
+    if (groupN == 1) {
+        const std::string tgt = ui::humanTarget(a.reason);
+        if (!tgt.empty()) {
+            // SameLine FIRST, THEN measure. lineRoom() reads GetCursorPosX(), and after the title's
+            // text item the cursor has already wrapped to the line start — so measuring before the
+            // SameLine computed the room as if the title occupied nothing, the target was elided
+            // against a budget ~a title too wide, and it overprinted the right-hand chip
+            // ("standoff" over "cache 41.3k"). Save/restore so an insufficient-room verdict can
+            // still fall through to the wrapped line below.
+            const ImVec2 wrapped = ImGui::GetCursorPos();
+            ImGui::SameLine(0, 8 * sc);
+            const float room = lineRoom() - 8 * sc;
+            if (room > 48.0f * sc) {
+                const std::string fit = chatEllipsize(tgt, room);
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+                ImGui::TextUnformatted(fit.c_str());
+                ImGui::PopStyleColor();
+                if (fit != tgt && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tgt.c_str());
+            } else {
+                ImGui::SetCursorPos(wrapped);
+                dimText(tgt.c_str());   // genuinely no room on the line: keep it, wrapped, below
+            }
+        }
+    }
+    if (hasRewind) drawAiVcCallRewind(st, callI, a.title);
+
+    // ---- the right-aligned latency/token chip, on the header line, in the slot reserved above.
+    // Two things this has to get right, both of which it got wrong at narrow column widths:
+    //  * SameLine(0, 0) followed by an ineffective SetCursorPosX pasted the chip directly onto the
+    //    preceding text with no separator at all ("standoffcache", "top edgesfailed"). If the slot
+    //    did not survive the title/target elision, the chip belongs on its own right-aligned line,
+    //    not jammed against whatever ran long.
+    //  * the right edge must inset by the shell's own padding, or the chip clips off the panel
+    //    ("failed · cac").
     if (!metaS.empty()) {
-        ImGui::SameLine(0, 8 * sc);
+        const float inset = ui::kit::padX();
+        const float chipW = ImGui::CalcTextSize(metaS.c_str()).x;
+        const float rx = ImGui::GetContentRegionMax().x - inset - chipW;
+        const float minGap = 8.0f * sc;
         ImGui::PushStyleColor(ImGuiCol_Text, guard ? guardTone
                                            : hardFail ? failTone : surf.textSecondary);
+        if (rx > ImGui::GetCursorPosX() + minGap) {
+            ImGui::SameLine(0, 0);
+            ImGui::SetCursorPosX(rx);
+        } else {
+            ImGui::SetCursorPosX(ImMax(inset, rx));   // own line, still right-aligned
+        }
         ImGui::TextUnformatted(metaS.c_str());
         ImGui::PopStyleColor();
     }
-    // Per-call rewind: restore the part to the state BEFORE this individual tool call.
-    // Self-gating — it draws nothing unless exactly one checkpoint matches this call
-    // ordinal AND tool name, so read-only calls and pre-checkpoint history get no glyph.
-    // A grouped card covers several calls, so it never offers one (callI arrives as -1).
-    if (groupN == 1) drawAiVcCallRewind(st, callI, a.title);
 
-    // ---- the human target(s) — "what it acts on".
+    // A fold of N similar calls is N facts: each member's own target, below the header.
     if (groupN > 1) {
-        // Each folded member's own target, so a run of three never hides which three.
         std::vector<std::string> tgts;
         tgts.reserve(group->size());
         for (const ActivityItem* mi : *group) {
@@ -1412,42 +1689,15 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         for (size_t k = 0; k < tgts.size() && k < kMaxTargetLines; ++k) dimText(tgts[k].c_str());
         if (tgts.size() > kMaxTargetLines)
             dimText(("+" + std::to_string(tgts.size() - kMaxTargetLines) + " more").c_str());
-    } else {
-        const std::string tgt = ui::humanTarget(a.reason);
-        if (!tgt.empty()) dimText(tgt.c_str());
     }
 
-    // ---- bottom meta line: call timestamp + prompt-cache read (META trailer),
-    // right-aligned like the user bubble's own meta bar. Kept OFF the header row:
-    // the title/(details)/meta/rewind chain already fills it, and a right-aligned
-    // jump there either collided or clipped under the log's scrollbar. A grouped
-    // row shows its LAST member's stamp (the most recent call in the fold).
-    double metaTs = parts.ts;
-    int metaCache = parts.cacheRead;
-    if (groupN > 1) {
-        const ToolRowDetail tailParts = splitToolRowDetail(group->back()->detail);
-        metaTs = tailParts.ts;
-        metaCache = tailParts.cacheRead;
-    }
-    if (!simple && (metaTs > 0.0 || metaCache > 0)) {
-        std::string tail;
-        if (metaTs > 0.0) tail = chatRowClock(metaTs);
-        if (metaCache > 0) {
-            if (!tail.empty()) tail += " \xc2\xb7 ";
-            tail += "cache " + chatTokCount(metaCache);
-        }
-        if (!tail.empty()) {
-            const float tailW = ImGui::CalcTextSize(tail.c_str()).x;
-            const float rx = ImGui::GetWindowContentRegionMax().x - tailW;
-            if (rx > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rx);
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-            ImGui::TextUnformatted(tail.c_str());
-            ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered() && metaCache > 0)
-                ImGui::SetTooltip("%d tokens read from the prompt cache by the completion\n"
-                                  "that made this call (billed at the cached-input rate).",
-                                  metaCache);
-        }
+    // ---- WHY it failed, wrapped and never ellipsized, collapsed or not. Behind the drawer it was
+    // reachable only by clicking a row that gave no hint it had anything to say; a truncated error
+    // with no way to read the rest is the single worst thing this surface can do.
+    if (!errShort.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, failTone);
+        ImGui::TextWrapped("%s", errShort.c_str());
+        ImGui::PopStyleColor();
     }
 
     if (guard) {
@@ -1492,11 +1742,10 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
                 ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
                 ImGui::TextWrapped("%s", errBody.c_str());
                 ImGui::PopStyleColor();
-            } else if (hardFail && !errBody.empty()) {
-                // Why it failed, first: amber summary + full text in a warn-outlined code box.
-                ImGui::PushStyleColor(ImGuiCol_Text, failTone);
-                ImGui::TextWrapped("%s", errSummary(errBody).c_str());
-                ImGui::PopStyleColor();
+            } else if (hardFail && errShort != errBody) {
+                // The summary is already on the row, wrapped and untruncated; the drawer only earns
+                // its space when there is MORE than the summary — a traceback behind a one-line
+                // cause. When the two are the same string, a box repeating it is pure noise.
                 drawToolDetailBox("##toolerr", errBody, fonts.mono,
                                   ui::metrics::px(200.0f), /*failure=*/true);
             }
@@ -1512,19 +1761,7 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         }
         endCollapseBody(cb);
     }
-    ImGui::EndChild();
-    ImGui::PopStyleVar(2);   // ##toolrow compact ItemSpacing + WindowPadding
-    ImRect rowRect = endGlassBubble(gb);
-    if (hardFail)
-        ImGui::GetWindowDrawList()->AddRect(rowRect.Min, rowRect.Max,
-                                            ui::Palette::toU32(pal.statusWarn),
-                                            ui::metrics::rounding(8.0f), 0, ui::metrics::stroke(1.5f));
-    else if (guard)
-        // Hairline informational outline: enough to set the row apart from a plain completed
-        // call, deliberately lighter than the amber failure frame.
-        ImGui::GetWindowDrawList()->AddRect(rowRect.Min, rowRect.Max,
-                                            ui::Palette::toU32(pal.iterBuilt),
-                                            ui::metrics::rounding(8.0f), 0, ui::metrics::stroke(1.0f));
+    ImRect rowRect = endRowShell(sh);
     {
         const std::string toolCopy = chatActivityCopyText(a);
         chatCopyContext(rowRect, "##tool_copy", toolCopy);
@@ -1570,6 +1807,252 @@ ImGuiID activityAnchorId(int activityIdx) {
 void timelineScrollTo(ImGuiID anchor) { g_pendingAnchor = anchor; }
 
 bool activityIsGuardRefusal(const ActivityItem& a) { return toolRowIsGuardRefusal(a); }
+
+// ---- the run receipt + cost attribution --------------------------------------------------------
+// A finished turn tells its story chronologically but cannot answer the three questions people
+// actually ask afterwards: what changed on disk, what went wrong along the way, and where the time
+// went. Every input is already on ChatMsg::activity — per-row status, the packed \x1e ART \x1e
+// artifact blobs, per-stage tokens and durations — so the receipt adds no state and no second
+// bookkeeping path. It REPLACES the old "N tokens in / M out" footer line, whose numbers are now
+// the last clause of its headline.
+namespace {
+
+// One stage's slice of the turn's cost. `anchor` is resolved in the MESSAGE id scope (see
+// activityAnchorId), which is what makes a click here land on the row the timeline will draw.
+struct StageCost {
+    ImGuiID     anchor = 0;
+    std::string label;
+    int         tokens = 0;         // in + out — the segment's weight
+    int         in = 0, out = 0, ms = 0;
+};
+
+// A failure worth naming. `guard` separates the harness refusing a repeated call from a tool that
+// ran and broke: a turn that burned six calls on refusals must not read like six units of work.
+struct ReceiptFail {
+    ImGuiID     anchor = 0;
+    std::string title;
+    std::string why;
+    bool        guard = false;
+};
+
+struct TurnReceipt {
+    int toolCalls = 0;
+    int retried   = 0;   // hard tool failures — the error went back to the model for repair
+    int skipped   = 0;   // loop-guard refusals — nothing was ever dispatched
+    int ms        = 0;
+    int tokensIn = 0, tokensOut = 0;
+    std::vector<StageCost>   stages;
+    std::vector<ReceiptFail> fails;
+    std::vector<std::string> files;   // artifact paths, de-duplicated, in arrival order
+};
+
+// MUST run in the MESSAGE id scope, before any PushID: activityAnchorId is only meaningful there.
+TurnReceipt buildReceipt(const ChatMsg& m) {
+    TurnReceipt r;
+    for (size_t i = 0; i < m.activity.size(); ++i) {
+        const ActivityItem& a = m.activity[i];
+        if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
+        if (a.rowKind == 0) {
+            // Orchestrator stages ARE the turn's model I/O and wall clock; tool and context rows
+            // are neither (the usage footer has always summed exactly this set).
+            r.tokensIn  += a.tokensIn;
+            r.tokensOut += a.tokensOut;
+            r.ms        += a.durationMs;
+            const int tok = a.tokensIn + a.tokensOut;
+            if (tok > 0) {
+                StageCost s;
+                s.anchor = activityAnchorId((int)i);
+                s.label  = a.title.empty() ? a.stage : a.title;
+                s.tokens = tok;
+                s.in = a.tokensIn;
+                s.out = a.tokensOut;
+                s.ms = a.durationMs;
+                r.stages.push_back(std::move(s));
+            }
+        } else if (a.rowKind == 3) {
+            // The synthesized "Session files" row is presentation, not a call the engine made.
+            if (a.stage != "artifacts") ++r.toolCalls;
+            const ToolRowDetail parts = splitToolRowDetail(a.detail);
+            if (a.status == "fail") {
+                const bool g = isLoopGuardRefusal(parts.err);
+                if (g) ++r.skipped;
+                else   ++r.retried;
+                ReceiptFail f;
+                f.anchor = activityAnchorId((int)i);
+                f.title  = ui::toolPhrase(a.title, a.reason, /*ok=*/false).title;
+                f.guard  = g;
+                f.why    = g ? "Identical call repeated — the harness skipped it; the tool never ran."
+                             : errSummary(parts.err);
+                if (f.why.empty()) f.why = a.reason.empty() ? a.title : a.reason;
+                r.fails.push_back(std::move(f));
+            }
+            if (!parts.arts.empty()) {
+                std::istringstream iss(parts.arts);
+                std::string line;
+                while (std::getline(iss, line)) {
+                    std::string path;
+                    // Same parse the transcript rows use: "3 files written" must never count a
+                    // continuation line of a corrupted multi-line artifact path as a file.
+                    if (!artifactLine(line, nullptr, &path)) continue;
+                    if (std::find(r.files.begin(), r.files.end(), path) == r.files.end())
+                        r.files.push_back(std::move(path));
+                }
+            }
+        }
+    }
+    // A pure tool-loop turn stamps no stage durations; fall back to the calls' own latency rather
+    // than claim "0 s" for a turn that plainly took time.
+    if (r.ms == 0)
+        for (const auto& a : m.activity)
+            if (a.rowKind == 3) r.ms += a.durationMs;
+    return r;
+}
+
+// The cost-attribution strip: one segment per stage, weighted by that stage's tokens, so an intake
+// that quietly re-read a 40k context stops being indistinguishable from one that cost nothing.
+// Hover names the stage and its in/out/duration; a click jumps to its card.
+//
+// HONEST LIMIT: ActivityItem carries NO per-stage cache-read figure. This attributes tokens and
+// time by stage and claims nothing about prompt-cache reads — the cache total is a turn-level fact
+// and stays on the assistant bubble's meta row, where it is actually known.
+void drawCostStrip(const std::vector<StageCost>& stages, int totalTokens) {
+    if (stages.empty() || totalTokens <= 0) return;
+    const float  h  = ui::metrics::px(9.0f);
+    const float  w  = ImMax(ImGui::GetContentRegionAvail().x, ui::metrics::px(24.0f));
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton("##cost_strip", ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+    const float mouseX = ImGui::GetIO().MousePos.x;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float r   = h * 0.5f;
+    const float gap = ui::metrics::stroke(1.0f);
+    dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h),
+                      ui::kit::toneU32(ui::kit::Tone::Neutral, 0.20f), r);
+    // ONE tone at alternating alpha, never a rainbow: the kit owns meaning->color and "stage 3" is
+    // not a meaning. Proportion is the message; the name arrives on hover.
+    float x      = p0.x;
+    int   hoverI = -1;
+    for (size_t i = 0; i < stages.size(); ++i) {
+        float segW = w * (float)stages[i].tokens / (float)totalTokens;
+        if (i + 1 == stages.size()) segW = p0.x + w - x;   // absorb rounding into the last segment
+        if (segW <= 0.0f) continue;
+        const bool hit = hovered && mouseX >= x && mouseX < x + segW;
+        if (hit) hoverI = (int)i;
+        ImDrawFlags fl = 0;
+        if (i == 0)                  fl |= ImDrawFlags_RoundCornersLeft;
+        if (i + 1 == stages.size())  fl |= ImDrawFlags_RoundCornersRight;
+        if (!fl)                     fl  = ImDrawFlags_RoundCornersNone;
+        dl->AddRectFilled(ImVec2(x, p0.y), ImVec2(ImMax(x, x + segW - gap), p0.y + h),
+                          ui::kit::toneU32(ui::kit::Tone::Accent,
+                                           hit ? 1.0f : ((i % 2) ? 0.55f : 0.85f)),
+                          r, fl);
+        x += segW;
+    }
+    if (hoverI >= 0) {
+        const StageCost& s = stages[(size_t)hoverI];
+        ImGui::SetTooltip("%s\n%s in / %s out \xc2\xb7 %s\nClick to jump to this step.",
+                          s.label.c_str(), ui::fmtTokens(s.in).c_str(),
+                          ui::fmtTokens(s.out).c_str(),
+                          ui::kit::fmtDuration(s.ms / 1000.0).c_str());
+        if (clicked) {
+            timelineScrollTo(s.anchor);
+            chatLogBreakStick();   // stick-to-bottom would snap the deferred jump straight back
+        }
+    }
+}
+
+// Receipt disclosure state. NOT a ChatMsg field — app_state.h is integrator-owned — so it keys off
+// the message id scope, which is stable per turn and per conversation.
+std::unordered_map<ImGuiID, bool> g_receiptOpen;
+
+const char* receiptFileIcon(const std::string& path) {
+    const std::string e = chatLowerExt(path);
+    if (e == ".png" || e == ".jpg" || e == ".jpeg" || e == ".bmp" || e == ".webp")
+        return "file_image";
+    if (e == ".stl" || e == ".3mf" || e == ".obj" || e == ".ply")   return "file_mesh";
+    if (e == ".step" || e == ".step+" || e == ".stp" || e == ".iges" || e == ".igs")
+        return "file_step";
+    if (e == ".json" || e == ".csv" || e == ".yaml" || e == ".yml") return "file_data";
+    if (e == ".py" || e == ".cpp" || e == ".h" || e == ".js" || e == ".ts") return "file_code";
+    if (e == ".zip" || e == ".tar" || e == ".gz" || e == ".7z")     return "file_archive";
+    if (e == ".md" || e == ".txt" || e == ".pdf")                   return "file_doc";
+    return "file_generic";
+}
+
+}  // namespace
+
+void drawTurnReceipt(AppState& st, ChatMsg& m) {
+    if (m.activity.empty()) return;
+    // Built HERE, in the message id scope, before cardBegin pushes an id of its own: every anchor
+    // in the receipt has to resolve to the same id the timeline's row loop will compute.
+    const TurnReceipt r = buildReceipt(m);
+    const int totalTok = r.tokensIn + r.tokensOut;
+    if (r.toolCalls == 0 && totalTok == 0 && r.files.empty() && r.fails.empty()) return;
+
+    std::string head;
+    auto add = [&head](const std::string& s) {
+        if (!head.empty()) head += " \xc2\xb7 ";
+        head += s;
+    };
+    if (r.toolCalls > 0)
+        add(std::to_string(r.toolCalls) + (r.toolCalls == 1 ? " tool call" : " tool calls"));
+    if (r.retried > 0) add(std::to_string(r.retried) + " retried");
+    if (r.skipped > 0) add(std::to_string(r.skipped) + " skipped");
+    if (!r.files.empty())
+        add(std::to_string(r.files.size()) +
+            (r.files.size() == 1 ? " file written" : " files written"));
+    if (r.ms > 0)      add(ui::kit::fmtDuration(r.ms / 1000.0));
+    if (totalTok > 0)
+        add(ui::fmtTokens(r.tokensIn) + " in / " + ui::fmtTokens(r.tokensOut) + " out");
+
+    ui::kit::pushDensity(ui::kit::Density::Compact);
+    if (g_receiptOpen.size() > 4096) g_receiptOpen.clear();
+    bool&      openState = g_receiptOpen[ImGui::GetID("##turn_receipt")];
+    const bool wasOpen   = openState;
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
+    if (ui::kit::cardBegin("##turn_receipt", head.c_str(), "activity", &openState)) {
+        if (!r.fails.empty()) {
+            ui::kit::sectionHeader("What went wrong", nullptr, nullptr, (int)r.fails.size(),
+                                   /*first=*/true);
+            for (size_t i = 0; i < r.fails.size(); ++i) {
+                const ReceiptFail& f = r.fails[i];
+                ui::kit::RowStyle rs;
+                rs.secondary = f.why.c_str();
+                rs.meta      = f.guard ? "skipped" : "retried";
+                rs.tooltip   = "Jump to this step in the transcript.";
+                ImGui::PushID((int)i);
+                const bool hit = ui::kit::row("##fail", f.title.c_str(), rs);
+                ImGui::PopID();
+                if (hit) { timelineScrollTo(f.anchor); chatLogBreakStick(); }
+            }
+        }
+        if (!r.files.empty()) {
+            ui::kit::sectionHeader("Written to disk", "artifacts", nullptr, (int)r.files.size(),
+                                   /*first=*/r.fails.empty());
+            for (size_t i = 0; i < r.files.size(); ++i) {
+                const std::string& p = r.files[i];
+                const size_t slash = p.find_last_of("/\\");
+                const std::string base = (slash == std::string::npos) ? p : p.substr(slash + 1);
+                ui::kit::RowStyle rs;
+                rs.icon    = receiptFileIcon(p);
+                rs.tooltip = p.c_str();
+                ImGui::PushID((int)i);
+                const bool hit = ui::kit::row("##file", base.c_str(), rs);
+                ImGui::PopID();
+                if (hit) chatArtifactOpenSmart(st, p);
+            }
+        }
+        if (!r.stages.empty() && totalTok > 0) {
+            ui::kit::sectionHeader("Where the tokens went", nullptr, nullptr, -1,
+                                   /*first=*/r.fails.empty() && r.files.empty());
+            drawCostStrip(r.stages, totalTok);
+        }
+    }
+    ui::kit::cardEnd();
+    ui::kit::popDensity();
+    // The turn's rendered height just changed; the render-windowing cache has to re-measure it.
+    if (openState != wasOpen) m.uiCachedH = -1.0f;
+}
 
 // ---- the run spine -----------------------------------------------------------------------------
 namespace {

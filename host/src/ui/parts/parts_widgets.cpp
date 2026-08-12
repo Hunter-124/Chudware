@@ -20,6 +20,7 @@
 #include "ui/icons.h"
 #include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
 #include "ui_theme.h"
+#include "ui/widgets/kit.h"   // the app-wide vocabulary the header/empty/spinner wrappers forward to
 
 #include "parts_internal.h"
 
@@ -53,104 +54,45 @@ std::vector<unsigned char> b64decode(const std::string& in) {
     return out;
 }
 
-// ---- headers / states ----------------------------------------------------------------
+// ---- headers / states -> ui::kit -------------------------------------------------------
+// These three were three of the app's duplicated painters (kit.h's opening comment counts
+// them). They survive as domain wrappers only because hundreds of Parts call sites spell
+// them this way and they carry this workspace's two defaults: the partsPadX content line,
+// and an empty state that sits a third of the way down a tall pane instead of at its top.
+
+// The Parts pane rhythm is the app default; Density::Cozy IS the cpMenu*/cam* token family.
+struct CozyDensity {
+    CozyDensity()  { ui::kit::pushDensity(ui::kit::Density::Cozy); }
+    ~CozyDensity() { ui::kit::popDensity(); }
+    CozyDensity(const CozyDensity&)            = delete;
+    CozyDensity& operator=(const CozyDensity&) = delete;
+};
 
 void sectionHeader(const char* label, bool firstInPane, const char* icon,
                    const char* trailing) {
-    const float sc  = ui::uiScale;
-    const float pad = ui::metrics::partsPadX();
-    if (!firstInPane) ImGui::Dummy(ImVec2(0, 8.0f * sc));
+    const CozyDensity density;
     // The label sits on the pane's TEXT line (pane gutter + partsPadX) — the same line
     // borderRow paints its icon/label on, a grid card starts its title on, and ImGui puts
-    // the text of a framed widget on (partsPadX == style.FramePadding.x). A header and the
-    // body under it therefore share one left edge instead of stepping by the row padding.
+    // the text of a framed widget on (partsPadX == style.FramePadding.x).
+    const float pad = ui::metrics::partsPadX();
     ImGui::Indent(pad);
-    const ImVec2 rowMin = ImGui::GetCursorScreenPos();
-    const float  rowW   = ImGui::GetContentRegionAvail().x;
-    ImDrawList*  dl     = ImGui::GetWindowDrawList();
-
-    ImFont* h2 = S().fonts ? S().fonts->h2 : nullptr;
-    if (h2) ImGui::PushFont(h2);
-    const float lh = ImGui::GetTextLineHeight();
-
-    // Optional accent glyph ahead of the label: a header reads as a section marker rather
-    // than a bare underlined word, and the pane picks up the same iconography as its rows.
-    const float iconSz = 15.0f * sc;
-    if (icon && icon[0] && (ui::hasIconSdf(icon) || ui::getIcon(icon).valid)) {
-        ui::drawIconGlass(dl, icon,
-                          ImVec2(rowMin.x + iconSz * 0.5f, rowMin.y + lh * 0.5f), iconSz,
-                          Palette::toU32(palette.accent), 0);
-        ImGui::Dummy(ImVec2(iconSz, lh));
-        ImGui::SameLine(0.0f, 6.0f * sc);
-    }
-    ImGui::TextUnformatted(label);
-    if (h2) ImGui::PopFont();
-
-    // Right-aligned secondary text (counts, state) on the header's own line — the pane no
-    // longer has to spend a whole dim line under the header on a number.
-    const float rowBot = ImGui::GetItemRectMax().y;
-    if (trailing && trailing[0]) {
-        const ImVec2 ts = ImGui::CalcTextSize(trailing);
-        const float  tx = rowMin.x + rowW - ts.x;
-        if (tx > ImGui::GetItemRectMax().x + 6.0f * sc)
-            dl->AddText(ImVec2(tx, rowMin.y + (lh - ts.y) * 0.5f),
-                        Palette::toU32(palette.textDim), trailing);
-    }
-
-    // Rule: accent fading to nothing across the pane, not a flat full-strength underline
-    // clipped to the label — it reads as a section edge instead of a hyperlink.
-    float a0[4], a1[4];
-    Palette::withAlpha(palette.accent, a0, 0.55f);
-    Palette::withAlpha(palette.accent, a1, 0.00f);
-    const float ry = rowBot + 3.0f * sc;
-    dl->AddRectFilledMultiColor(ImVec2(rowMin.x, ry),
-                                ImVec2(rowMin.x + rowW, ry + 1.5f * sc),
-                                Palette::toU32(a0), Palette::toU32(a1),
-                                Palette::toU32(a1), Palette::toU32(a0));
+    ui::kit::sectionHeader(label, icon, trailing, /*count=*/-1, /*first=*/firstInPane);
     ImGui::Unindent(pad);
-    ImGui::Dummy(ImVec2(0, 5.0f * sc));
 }
 
 ContentInset::ContentInset()  { ImGui::Indent(ui::metrics::partsPadX()); }
 ContentInset::~ContentInset() { ImGui::Unindent(ui::metrics::partsPadX()); }
 
 void emptyState(const char* iconName, const char* msg, const char* sub) {
-    const float sc = ui::uiScale;
-    float avail = ImGui::GetContentRegionAvail().y;
-    ImGui::Dummy(ImVec2(0, avail * 0.35f));
-
-    const float iconSz = 40.0f * sc;
-    if (iconName && iconName[0]) {
-        ImVec2 cur = ImGui::GetCursorScreenPos();
-        float cx = cur.x + ImGui::GetContentRegionAvail().x * 0.5f;
-        float dis[4];
-        Palette::withAlpha(palette.textDisabled, dis, 0.6f);
-        ui::drawIconGlass(ImGui::GetWindowDrawList(), iconName,
-                          ImVec2(cx, cur.y + iconSz * 0.5f), iconSz,
-                          Palette::toU32(dis), 0);
-        ImGui::Dummy(ImVec2(0, iconSz + 4.0f * sc));
-    }
-
-    // Centered, not inset: an empty state owns the whole pane, so it deliberately ignores
-    // the content line. One helper so the two lines can never drift apart.
-    auto centeredLine = [](const char* text, const float role[4], float alpha) {
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             (ImGui::GetContentRegionAvail().x -
-                              ImGui::CalcTextSize(text).x) * 0.5f);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(role[0], role[1], role[2], alpha));
-        ImGui::TextUnformatted(text);
-        ImGui::PopStyleColor();
-    };
-    centeredLine(msg, palette.textDim, 1.0f);
-    if (sub) centeredLine(sub, palette.textDisabled, 0.8f);
-    ImGui::Dummy(ImVec2(0, 8.0f * sc));
+    const CozyDensity density;
+    // Parts panes are full-height columns; sitting the state at the top of one reads as a
+    // stray label rather than the pane's answer. The vertical push is this workspace's
+    // default, everything below it is the shared painter.
+    ImGui::Dummy(ImVec2(0, ImGui::GetContentRegionAvail().y * 0.35f));
+    ui::kit::emptyState(iconName, msg, sub);
 }
 
-void spinner(const char* prefix) {
-    // Every "working" indicator in the app is the brand mark in motion; busyLabel owns the
-    // reserved square, the legibility floor and the accent tint the ASCII frames used to carry.
-    ui::busyLabel(prefix);
-}
+void spinner(const char* prefix) { ui::kit::spinner(prefix); }
 
 // ---- domain glyph / part icons ---------------------------------------------------------
 

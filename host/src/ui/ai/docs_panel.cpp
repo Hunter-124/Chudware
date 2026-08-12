@@ -29,6 +29,7 @@
 #include "ui/metrics.h"       // cpMenu* rhythm tokens (gutter / row pad / corner)
 #include "gl_compat.h"        // glDeleteTextures for the bounded preview-texture cache
 #include "ui/ai/ai_prefs.h"   // ui::chatShowRenders (chat display prefs)
+#include "ui/widgets/kit.h"   // ui::kit::emptyState / elide — the shared painters
 
 namespace ui {
 namespace {
@@ -163,31 +164,19 @@ bool dialogsDisabled() {
     return disabled;
 }
 
+// Domain wrapper over the shared painter: only the vertical push is this pane's own, so the
+// state lands inside the list/preview body rather than at its top edge.
 void emptyState(const char* msg, const char* sub) {
+    ui::kit::pushDensity(ui::kit::Density::Cozy);
     ImGui::Dummy(ImVec2(0, ImGui::GetContentRegionAvail().y * 0.28f));
-    const float tw = ImGui::CalcTextSize(msg).x;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                         std::max(0.0f, (ImGui::GetContentRegionAvail().x - tw) * 0.5f));
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.textDisabled[0], palette.textDisabled[1], palette.textDisabled[2], 0.55f));
-    ImGui::TextUnformatted(msg);
-    ImGui::PopStyleColor();
-    if (sub) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 0.75f));
-        ImGui::TextWrapped("%s", sub);
-        ImGui::PopStyleColor();
-    }
+    ui::kit::emptyState(nullptr, msg, sub);
+    ui::kit::popDensity();
 }
 
-// Clip a label to fit `maxW`, appending "..." when it must be shortened.
+// Clip a label to fit `maxW`. Forwards to ui::kit::elide, which cuts on a UTF-8 boundary —
+// the local byte-wise pop_back could split a multi-byte codepoint into mojibake.
 std::string ellipsize(const std::string& s, float maxW) {
-    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
-    std::string out = s;
-    while (out.size() > 4 &&
-           ImGui::CalcTextSize((out + "...").c_str()).x > maxW)
-        out.pop_back();
-    return out + "...";
+    return ui::kit::elide(s.c_str(), maxW);
 }
 
 // A render, either because the agent tagged the artifact "image" or because the path says so.

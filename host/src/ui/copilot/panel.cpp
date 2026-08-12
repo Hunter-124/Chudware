@@ -696,11 +696,76 @@ void drawSessionsPanel(AppState& st, bool busy) {
 
 }
 
+// PlanItem::status -> the app's one status vocabulary.
+static ui::kit::Status planItemStatus(const std::string& s) {
+    if (s == "done" || s == "pass") return ui::kit::Status::Done;
+    if (s == "running")             return ui::kit::Status::Running;
+    if (s == "fail")                return ui::kit::Status::Failed;
+    if (s == "abandoned")           return ui::kit::Status::Skipped;
+    return ui::kit::Status::Pending;
+}
+
+// Nesting depth along the parent_id chain. Bounded: a malformed plan event could describe a cycle.
+static int planDepth(const PlanState& ps, const PlanItem& item) {
+    int depth = 0;
+    std::string parent = item.parent_id;
+    for (int guard = 0; guard < 8 && !parent.empty(); ++guard) {
+        const PlanItem* p = nullptr;
+        for (const auto& c : ps.items)
+            if (c.id == parent) { p = &c; break; }
+        if (!p) break;
+        ++depth;
+        parent = p->parent_id;
+    }
+    return depth;
+}
+
+// One plan item. `parent_id` (indent) and `desc` (second line) were both parsed and persisted and
+// neither reached this panel before, so a one-word subtask sat at the same level as its parent
+// with no elaboration anywhere in the surface.
+static void planTaskRow(const PlanState& ps, const PlanItem& pi, int index) {
+    const ui::kit::Status s = planItemStatus(pi.status);
+    const float ind = (float)planDepth(ps, pi) * ui::metrics::U(3.0f);
+    if (ind > 0.0f) ImGui::Indent(ind);
+
+    const bool  hasDesc = !pi.desc.empty();
+    const float lineH   = ImGui::GetTextLineHeight();
+    // The second line is a separate ImGui item, so the gap the group WILL emit is ItemSpacing.y —
+    // reserve exactly that or the desc spills past the row background.
+    const float lineGap = ImGui::GetStyle().ItemSpacing.y;
+    const float h       = lineH + (hasDesc ? lineGap + lineH : 0.0f) + ui::kit::padY() * 2.0f;
+
+    ImGui::PushID(index);
+    ui::kit::rowBegin("task", h);
+    const bool hovered = ImGui::IsItemHovered();
+
+    // Running IS the brand mark in motion, so the spinner REPLACES the static glyph on the live
+    // item rather than sitting next to a second copy of it.
+    if (s == ui::kit::Status::Running) ui::kit::spinner("");
+    else                               ui::kit::statusGlyphInline(s);
+    ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
+
+    // BeginGroup pins the line start to the text column, so the desc lines up under the title
+    // instead of wrapping back under the status mark.
+    ImGui::BeginGroup();
+    const float textW = ImMax(ImGui::GetContentRegionAvail().x - ui::kit::padX(),
+                              ui::metrics::stroke(1.0f));
+    const std::string title = pi.title.empty() ? std::string("(task)") : pi.title;
+    ImGui::TextUnformatted(ui::kit::elide(title.c_str(), textW).c_str());
+    if (hasDesc) ui::kit::dimText(ui::kit::elide(pi.desc.c_str(), textW).c_str());
+    ImGui::EndGroup();
+    ui::kit::rowEnd();
+    ImGui::PopID();
+
+    if (hovered)
+        ImGui::SetTooltip("%s%s%s", title.c_str(), hasDesc ? "\n" : "", pi.desc.c_str());
+    if (ind > 0.0f) ImGui::Unindent(ind);
+}
+
 // Task-list panel — replaces the chat log; the deterministic plan/checklist for the
 // active conversation's most recent turn (statuses from engine events, not the model).
 static void drawTaskListPanel(AppState& st, bool busy) {
     (void)busy;
-    const ui::AdaptiveSurface& surf = chatSurf();
     const PlanState* ps = nullptr;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
         if (!it->fromUser && planIsReal(it->planState)) {
@@ -724,48 +789,69 @@ static void drawTaskListPanel(AppState& st, bool busy) {
 
     int done = 0, total = 0;
     copilotTaskProgress(st, done, total);
-    char progress[48];
-    std::snprintf(progress, sizeof(progress), "%d of %d complete", done, total);
+
+    const int revision = ps ? ps->revision : 0;
     ui::cpMenuHeader(st.fonts,
-                     ps && !ps->title.empty() ? ps->title.c_str() : "Task list",
-                     ps ? progress : "");
+                     ps && !ps->title.empty() ? ps->title.c_str() : "Task list", nullptr,
+                     revision > 0 ? std::function<void()>([revision]() {
+                         char rev[32];
+                         std::snprintf(rev, sizeof(rev), "revised x %d", revision);
+                         ui::kit::chip(rev, ui::kit::Tone::Info);
+                     })
+                                  : std::function<void()>());
     if (ps && !ps->summary.empty()) {
         ui::cpMenuHint(ps->summary.c_str());
         ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
     }
+    // A bare "3 of 7 complete" shows no trend; the bar does, and it sweeps when a step lands.
+    if (ps && total > 0) {
+        char caption[48];
+        std::snprintf(caption, sizeof(caption), "%d of %d complete", done, total);
+        ui::kit::progressBar((float)done / (float)total, caption,
+                             done >= total ? ui::kit::Tone::Ok : ui::kit::Tone::Accent);
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
+    }
+
     if (!ps) {
-        ui::cpMenuHint("No task list yet \xe2\x80\x94 start a build and the agent's plan appears here.");
+        ui::kit::emptyState("plan_board", "No task list yet",
+                            "Start a build and the agent's plan appears here.");
     } else {
-        // Fixed glyph column: TextWrapped after a SameLine wraps back to the LINE start, which
-        // pushed continuation lines under the [x] marker. Indent the title past a MEASURED glyph
-        // column instead, so a multi-line task title stays one aligned text block.
-        const float glyphW = ImGui::CalcTextSize("[~]").x + ui::metrics::px(6.0f);
+        // A shape=phased_todo plan carries a phase per item and used to lose it entirely.
+        std::vector<std::string> phases;
+        bool anyPhase = false;
         for (const auto& pi : ps->items) {
             if (pi.kind == "subagent") continue;
-            const bool ok = (pi.status == "done" || pi.status == "pass");
-            const bool run = (pi.status == "running");
-            const bool fail = (pi.status == "fail");
-            const char* glyph = ok ? "[x]" : run ? "[~]" : fail ? "[!]" : "[ ]";
-            ImVec4 gc = surf.textSecondary;
-            if (ok) { gc = semanticOnGlass(ui::palette.accent, surf); gc.w = 1.0f; }
-            else if (fail) { gc = semanticOnGlass(ui::palette.statusErr, surf); gc.w = 1.0f; }
-            const float rowY = ImGui::GetCursorPosY();
-            ImGui::PushStyleColor(ImGuiCol_Text, gc);
-            ImGui::TextUnformatted(glyph);
-            ImGui::PopStyleColor();
-            ImGui::SetCursorPosY(rowY);
-            ImGui::Indent(glyphW);
-            ImGui::PushStyleColor(ImGuiCol_Text, ok ? surf.textSecondary : surf.textPrimary);
-            ImGui::TextWrapped("%s", pi.title.empty() ? "(task)" : pi.title.c_str());
-            ImGui::PopStyleColor();
-            ImGui::Unindent(glyphW);
-            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+            if (!pi.phase.empty()) anyPhase = true;
+            if (std::find(phases.begin(), phases.end(), pi.phase) == phases.end())
+                phases.push_back(pi.phase);
+        }
+        if (!anyPhase) phases.assign(1, std::string());
+
+        int  index       = 0;
+        bool firstHeader = true;
+        for (const std::string& ph : phases) {
+            int count = 0;
+            for (const auto& pi : ps->items)
+                if (pi.kind != "subagent" && (!anyPhase || pi.phase == ph)) ++count;
+            if (count == 0) continue;
+            if (anyPhase) {
+                ui::kit::sectionHeader(ph.empty() ? "Unphased" : ph.c_str(), nullptr, nullptr,
+                                       count, firstHeader);
+                firstHeader = false;
+            }
+            for (const auto& pi : ps->items) {
+                if (pi.kind == "subagent") continue;
+                if (anyPhase && pi.phase != ph) continue;
+                planTaskRow(*ps, pi, index++);
+            }
         }
     }
 
-    ui::cpMenuSection("Subagents", (int)subs.size());
+    ui::kit::sectionHeader("Subagents", "ai_panel", nullptr, (int)subs.size());
     if (subs.empty()) {
-        ui::cpMenuHint("Spawned helpers and their current status appear here while a run is working.");
+        ui::kit::emptyState(nullptr, "No subagents running",
+                            "Spawned helpers and their current status appear here while a run "
+                            "is working.");
         return;
     }
 
@@ -785,143 +871,163 @@ static void drawTaskListPanel(AppState& st, bool busy) {
 }
 
 // ============================ Session Artifacts presentation ============================
-// Presentation-only helpers for the Artifacts tab (no artifact data/model changes). Every
-// size goes through ui::metrics::px so the tab scales with DPI like the rest of the app, and
-// every tone comes from the adaptive glass surface (chatSurf) — no hardcoded colors.
+// The Artifacts tab is an asset BROWSER: every row says what KIND of thing it is, how big it is
+// and when it landed, and carries persistent actions. All chrome comes from ui::kit, so an
+// artifact row and a PLM row are the same object.
 
-// Group header: delegates to the shared copilot-menu section chrome so every artifact section
-// carries the same label/count treatment, including an explicit zero count.
-static void artiSectionHeader(const ui::AdaptiveSurface& surf, const char* label, int count) {
-    (void)surf;
-    ui::cpMenuSection(label, count);
+// One listed artifact. `open` is the row's activation; `image` marks an ART-stream image.
+struct ArtiDocRow {
+    std::string label, tooltip, path;
+    std::function<void()> open;
+    bool image = false;
+};
+
+enum ArtiBucket { ArtiModels = 0, ArtiDrawings, ArtiData, ArtiOther };
+
+// What an artifact IS — resolved once from its extension, then reused for the leading icon, the
+// secondary line and the section bucket. The old panel put the PARENT FOLDER on the second line,
+// which for a session whose output all lands in one directory is the same string on every row.
+struct ArtiClass {
+    const char* icon   = "file_generic";
+    const char* what   = "File";
+    bool        image  = false;
+    ArtiBucket  bucket = ArtiOther;
+};
+
+static std::string artiLower(std::string s) {
+    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
 }
 
-// Styled empty state: the SHARED menu hint tone (cpMenuHint), indented to the section body, and
-// INFORMATIVE (says what will appear here) instead of a bare "(none)".
-static void artiEmptyState(const ui::AdaptiveSurface& surf, const char* msg) {
-    (void)surf;   // tone now comes from cpMenuHint
-    const float ind = ui::metrics::cpMenuRowPadX();
-    ImGui::Indent(ind);
-    ui::cpMenuHint(msg);
-    ImGui::Unindent(ind);
-}
-
-// Clip a label to maxW with a real ellipsis, respecting UTF-8 boundaries.
-static std::string artiEllipsize(const std::string& s, float maxW) {
-    static const char* kEll = "\xe2\x80\xa6";
-    if (s.empty() || maxW <= 0.0f) return s;
-    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
-    const float ew = ImGui::CalcTextSize(kEll).x;
-    std::string out;
-    for (size_t i = 0; i < s.size();) {
-        size_t n = 1;
-        const unsigned char c = (unsigned char)s[i];
-        if (c >= 0xF0) n = 4; else if (c >= 0xE0) n = 3; else if (c >= 0xC0) n = 2;
-        if (i + n > s.size()) n = s.size() - i;
-        std::string cand = out + s.substr(i, n);
-        if (ImGui::CalcTextSize(cand.c_str()).x + ew > maxW) break;
-        out.swap(cand);
-        i += n;
-    }
-    return out.empty() ? std::string(kEll) : out + kEll;
-}
-
-// One tight artifact card: the full row opens the item, while compact actions appear at the right
-// only on hover. Both user-supplied lines are draw-list text, so both are ellipsized to the card's
-// measured width instead of relying on an ImGui clip rect that does not exist here.
-static void artiRow(AppState& st, const std::string& label, const std::string& tooltip,
-                    const std::string& path, const std::function<void()>& onOpen) {
-    const ui::AdaptiveSurface& surf = chatSurf();
-    const float S = ui::uiScale;
-    const bool canReveal = !path.empty();
-    const float padX = ui::metrics::cpMenuRowPadX();
-    const float padY = ui::metrics::cpMenuRowPadY();
-    const float lineGap = ui::metrics::cpMenuLabelGap();
-    const float rowGap = ui::metrics::cpMenuRowGap();
-    const float rowW = ImGui::GetContentRegionAvail().x;
-    const float lineH = ImGui::GetTextLineHeight();
-    const float cardH = padY * 2.0f + lineH * 2.0f + lineGap;
-    const float dotR = ui::metrics::px(2.2f);
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    const ImVec2 p1(p0.x + rowW, p0.y + cardH);
-    const bool rowHot = ImGui::IsMouseHoveringRect(p0, p1);
-
-    std::string secondary;
+static ArtiClass artiClassify(const std::string& path, const std::string& label) {
+    ArtiClass c;
     if (path.empty()) {
-        secondary = "Live document";
-    } else {
-        const size_t slash = path.find_last_of("/\\");
-        const std::string parent = slash == std::string::npos ? std::string() : path.substr(0, slash);
-        const size_t parentSlash = parent.find_last_of("/\\");
-        secondary = parent.empty() ? std::string()
-                                   : parent.substr(parentSlash == std::string::npos
-                                                       ? 0 : parentSlash + 1);
-        if (secondary.empty()) {
-            const size_t dot = path.find_last_of('.');
-            if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
-                secondary = path.substr(dot);
-        }
-        if (secondary.empty()) secondary = "File";
+        c.icon = "part";
+        c.what = "Live document";
+        return c;
     }
+    const size_t slash = path.find_last_of("/\\");
+    const size_t dot   = path.find_last_of('.');
+    std::string ext;
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        ext = artiLower(path.substr(dot + 1));
 
-    const ImGuiStyle& style = ImGui::GetStyle();
-    const float actionGap = ui::metrics::cpMenuLabelGap();
-    const float openW = ImGui::CalcTextSize("Open").x + style.FramePadding.x * 2.0f;
-    const float revealW = canReveal
-        ? ImGui::CalcTextSize("Folder").x + style.FramePadding.x * 2.0f : 0.0f;
-    const float actionsW = rowHot ? openW + (canReveal ? actionGap + revealW : 0.0f) : 0.0f;
-
-    ImGui::Selectable("##artifact_row", false, ImGuiSelectableFlags_AllowItemOverlap,
-                      ImVec2(rowW, cardH));
-    // The hover actions sit INSIDE the selectable and are submitted after it, so overlap
-    // normally hands them the click. Exclude their strip explicitly anyway: the first frame a
-    // row becomes hot the buttons were not hovered last frame, and "Folder" would then both
-    // reveal the file AND open the artifact.
-    const bool overActions =
-        actionsW > 0.0f &&
-        ImGui::IsMouseHoveringRect(ImVec2(p1.x - padX - actionsW, p0.y),
-                                   ImVec2(p1.x - padX, p1.y), /*clip=*/false);
-    if (ImGui::IsItemClicked() && !overActions && onOpen) onOpen();
-
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ui::glassRowBackground(dl, p0, p1, ui::metrics::cpMenuRowRound() / S,
-                           false, false, rowHot ? 0.42f : 0.30f);
-    const ImVec2 dotC(p0.x + padX + dotR, p0.y + cardH * 0.5f);
-    dl->AddCircleFilled(dotC, dotR, ImGui::ColorConvertFloat4ToU32(surf.textTertiary));
-    const float textX = dotC.x + dotR + ui::metrics::cpMenuLabelGap();
-    const float textW = std::max(ui::metrics::px(24.0f),
-                                 p1.x - padX - actionsW - textX -
-                                     (rowHot ? actionGap : 0.0f));
-    dl->AddText(ImVec2(textX, p0.y + padY),
-                ImGui::ColorConvertFloat4ToU32(surf.textPrimary),
-                artiEllipsize(label, textW).c_str());
-    dl->AddText(ImVec2(textX, p0.y + padY + lineH + lineGap),
-                ImGui::ColorConvertFloat4ToU32(surf.textTertiary),
-                artiEllipsize(secondary, textW).c_str());
-
-    if (rowHot) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        ImGui::SetTooltip("%s", tooltip.empty() ? (path.empty() ? label.c_str() : path.c_str())
-                                               : tooltip.c_str());
-        const float buttonY = p0.y + (cardH - ImGui::GetFrameHeight()) * 0.5f;
-        float buttonX = p1.x - padX - actionsW;
-        ImGui::SetCursorScreenPos(ImVec2(buttonX, buttonY));
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        if (ImGui::SmallButton("Open") && onOpen) onOpen();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open this artifact");
-        if (canReveal) {
-            buttonX += openW + actionGap;
-            ImGui::SetCursorScreenPos(ImVec2(buttonX, buttonY));
-            if (ImGui::SmallButton("Folder")) chatArtifactReveal(st, path);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Show in file manager\n%s", path.c_str());
-        }
-        ImGui::PopStyleColor();
-        ImGui::PopStyleVar();
+    static const struct {
+        const char* ext; const char* icon; const char* what; bool image; ArtiBucket bucket;
+    } kMap[] = {
+        {"step",   "file_step",    "STEP export",        false, ArtiModels},
+        {"stp",    "file_step",    "STEP export",        false, ArtiModels},
+        {"iges",   "file_step",    "IGES export",        false, ArtiModels},
+        {"igs",    "file_step",    "IGES export",        false, ArtiModels},
+        {"sldprt", "file_step",    "SolidWorks part",    false, ArtiModels},
+        {"x_t",    "file_step",    "Parasolid export",   false, ArtiModels},
+        {"stl",    "file_mesh",    "STL mesh",           false, ArtiModels},
+        {"obj",    "file_mesh",    "OBJ mesh",           false, ArtiModels},
+        {"ply",    "file_mesh",    "PLY mesh",           false, ArtiModels},
+        {"3mf",    "file_mesh",    "3MF print file",     false, ArtiModels},
+        {"png",    "file_image",   "Render",             true,  ArtiOther},
+        {"jpg",    "file_image",   "Render",             true,  ArtiOther},
+        {"jpeg",   "file_image",   "Render",             true,  ArtiOther},
+        {"webp",   "file_image",   "Render",             true,  ArtiOther},
+        {"pdf",    "file_doc",     "PDF document",       false, ArtiDrawings},
+        {"dxf",    "file_doc",     "DXF drawing",        false, ArtiDrawings},
+        {"svg",    "file_doc",     "SVG drawing",        false, ArtiDrawings},
+        {"md",     "file_doc",     "Notes",              false, ArtiData},
+        {"txt",    "file_doc",     "Text file",          false, ArtiData},
+        {"docx",   "file_doc",     "Word document",      false, ArtiData},
+        {"json",   "file_data",    "JSON data",          false, ArtiData},
+        {"csv",    "file_data",    "CSV table",          false, ArtiData},
+        {"xml",    "file_data",    "XML data",           false, ArtiData},
+        {"yaml",   "file_data",    "YAML data",          false, ArtiData},
+        {"yml",    "file_data",    "YAML data",          false, ArtiData},
+        {"py",     "file_code",    "Python script",      false, ArtiData},
+        {"cpp",    "file_code",    "C++ source",         false, ArtiData},
+        {"js",     "file_code",    "JavaScript source",  false, ArtiData},
+        {"ts",     "file_code",    "TypeScript source",  false, ArtiData},
+        {"zip",    "file_archive", "Archive",            false, ArtiOther},
+        {"tar",    "file_archive", "Archive",            false, ArtiOther},
+        {"7z",     "file_archive", "Archive",            false, ArtiOther},
+        {"gz",     "file_archive", "Archive",            false, ArtiOther},
+    };
+    for (const auto& m : kMap) {
+        if (ext != m.ext) continue;
+        c.icon = m.icon; c.what = m.what; c.image = m.image; c.bucket = m.bucket;
+        break;
     }
+    // A CSV the agent produced is almost always the BOM; say so rather than "CSV table".
+    if (ext == "csv" && artiLower(label).find("bom") != std::string::npos)
+        c.what = "Bill of materials";
+    return c;
+}
 
-    ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + rowGap));
+// Size + age for the row's meta column, from ONE cached stat.
+struct ArtiStat {
+    unsigned long long size  = 0;
+    double             mtime = 0.0;   // unix seconds; 0 = unknown
+    bool               ok    = false;
+};
+
+// BOUNDED stat cache: the panel repaints every frame and stat()ing 50 artifact paths per frame is
+// real syscall cost for numbers that move at most once a second. 128 resident paths,
+// least-recently-used evicted; each entry re-stat'ed after kStatTtl so a file the agent is still
+// writing settles to its final size instead of freezing at its first sample.
+static ArtiStat artiStatOf(const std::string& path) {
+    struct Slot { ArtiStat st; double lastUse = 0.0; double taken = -1.0e9; };
+    static std::unordered_map<std::string, Slot> s_cache;
+    static constexpr size_t kMaxResident = 128;
+    static constexpr double kStatTtl     = 2.0;
+    const double now = ImGui::GetTime();
+
+    auto it = s_cache.find(path);
+    if (it == s_cache.end()) {
+        if (s_cache.size() >= kMaxResident) {
+            auto oldest = s_cache.begin();
+            for (auto i = s_cache.begin(); i != s_cache.end(); ++i)
+                if (i->second.lastUse < oldest->second.lastUse) oldest = i;
+            s_cache.erase(oldest);
+        }
+        it = s_cache.emplace(path, Slot{}).first;
+    }
+    Slot& s = it->second;
+    if (now - s.taken >= kStatTtl) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const auto sz = fs::file_size(path, ec);
+        s.st.ok = !ec;
+        if (!ec) {
+            s.st.size = (unsigned long long)sz;
+            std::error_code tec;
+            const auto ft = fs::last_write_time(path, tec);
+            if (!tec) {
+                // file_clock has no portable epoch; rebase it through both clocks' "now".
+                const auto sysT = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                    ft - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+                s.st.mtime = std::chrono::duration<double>(sysT.time_since_epoch()).count();
+            }
+        }
+        s.taken = now;
+    }
+    s.lastUse = now;
+    return s.st;   // by value: the next call may evict/rehash this slot
+}
+
+// Fade everything a widget just painted. The kit resolves its colors from ui::palette directly,
+// so ImGuiStyleVar_Alpha cannot reach it — scale the alpha of the vertices it emitted instead.
+static void artiFadeVerts(ImDrawList* dl, int firstVtx, float a) {
+    const float f = ImClamp(a, 0.0f, 1.0f);
+    for (int i = firstVtx; i < dl->VtxBuffer.Size; ++i) {
+        ImU32& c        = dl->VtxBuffer.Data[i].col;
+        const ImU32 al  = (c >> IM_COL32_A_SHIFT) & 0xFFu;
+        c = (c & ~IM_COL32_A_MASK) | ((ImU32)((float)al * f) << IM_COL32_A_SHIFT);
+    }
+}
+
+// Entrance stagger: rows land as a wave. The index is CAPPED so a 200-row list does not spend
+// four seconds arriving — past the cap every remaining row shares the last slot's timing.
+static constexpr int kArtiStaggerCap = 12;
+static float artiEnterAlpha(double t0, int index) {
+    return ui::anim::stagger(t0, index < kArtiStaggerCap ? index : kArtiStaggerCap,
+                             ui::anim::kSlow);
 }
 
 // Render-thumbnail cache for the Artifacts tab's "Renders" grid. The panel is redrawn every
@@ -954,19 +1060,197 @@ static Tex artiRenderThumb(const std::string& path) {
     return it->second.tex;   // by value: the next call may evict/rehash this slot
 }
 
+// Filter / disclosure / view-mode state for the Artifacts tab. These lived in file statics, so a
+// filter typed in one session was still applied — invisibly, because the field only appears past
+// eight rows — after switching to another. Keyed to the viewed conversation and reset with it.
+struct ArtiUiState {
+    std::string convId;
+    char        filter[192]     = "";
+    bool        showOtherDocs   = false;
+    bool        showAllRenders  = false;
+    int         viewMode        = 0;    // 0 = List, 1 = Grid
+    double      enterT0         = 0.0;  // stagger origin for the row entrance
+    int         lastFrame       = -2;
+};
+static ArtiUiState& artiUi(const AppState& st) {
+    static ArtiUiState s;
+    const std::string id    = st.activeConvId();
+    const int         frame = ImGui::GetFrameCount();
+    // A gap in the frame numbers means the tab was closed and reopened — replay the entrance.
+    if (id != s.convId || frame != s.lastFrame + 1) {
+        if (id != s.convId) {
+            s = ArtiUiState{};
+            s.convId = id;
+        }
+        s.enterT0 = ImGui::GetTime();
+    }
+    s.lastFrame = frame;
+    return s;
+}
+
+// One artifact row: kit chrome, a kind icon (or the render thumbnail), "2.4 MB . 3 min ago" in the
+// meta column, and a PERSISTENT action lane. Hover-gated actions are unreachable by keyboard and
+// touch and invisible in a screenshot, which is why they are always drawn now.
+static void artiRow(AppState& st, const ArtiDocRow& r, int index, double t0, bool thumbsOn) {
+    const ArtiClass cls = artiClassify(r.path, r.label);
+
+    std::string meta;
+    if (!r.path.empty()) {
+        const ArtiStat s = artiStatOf(r.path);
+        if (s.ok) {
+            meta = ui::kit::fmtBytes(s.size);
+            const std::string ago = ui::kit::fmtAgo(s.mtime);
+            if (!ago.empty()) meta += " \xc2\xb7 " + ago;
+        }
+    }
+    std::string tip = r.tooltip.empty() ? (r.path.empty() ? r.label : r.path) : r.tooltip;
+    if (!meta.empty()) tip += "\n" + meta;
+
+    ui::kit::RowStyle rs;
+    rs.icon      = cls.icon;
+    rs.iconTone  = ui::kit::Tone::Accent;
+    rs.secondary = cls.what;              // never empty — the row height below relies on it
+    rs.meta      = meta.empty() ? nullptr : meta.c_str();
+    rs.tooltip   = tip.c_str();
+    if (cls.image && thumbsOn) {
+        const Tex t = artiRenderThumb(r.path);
+        if (t.id) rs.thumb = (ImTextureID)(intptr_t)t.id;
+    }
+
+    const float btn    = ImGui::GetFrameHeight();
+    const float btnGap = ui::metrics::U(0.5f);
+    const int   nAct   = r.path.empty() ? 1 : 3;
+    rs.actionsW = btn * (float)nAct + btnGap * (float)(nAct - 1);
+
+    const float  lineH = ImGui::GetTextLineHeight();
+    const float  rowH  = lineH * 2.0f + ui::metrics::U(0.5f) + ui::kit::padY() * 2.0f;
+    const float  rowW  = ImGui::GetContentRegionAvail().x;
+    const float  a     = artiEnterAlpha(t0, index);
+    const float  off   = (1.0f - a) * ui::metrics::px(8.0f);
+    ImDrawList*  dl    = ImGui::GetWindowDrawList();
+    const int    vtx0  = dl->VtxBuffer.Size;
+
+    const ImVec2 base = ImGui::GetCursorScreenPos();
+    if (off > 0.0f) ImGui::SetCursorScreenPos(ImVec2(base.x, base.y - off));
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+
+    ImGui::PushID(index);
+    ImGui::SetNextItemAllowOverlap();   // the action lane is submitted ON TOP of the row's hit box
+    const bool   activated = ui::kit::row("arti", r.label.c_str(), rs);
+    const ImVec2 after     = ImGui::GetCursorScreenPos();
+
+    // The action lane lives inside the row's hit box and is submitted after it. AllowOverlap hands
+    // the click to the buttons, but exclude their strip from the row activation explicitly anyway:
+    // on the first hot frame the buttons were not hovered last frame, and "Folder" would then both
+    // reveal the file AND open the artifact.
+    const float bx0 = p0.x + rowW - ui::kit::padX() - rs.actionsW;
+    const bool  overLane = ImGui::IsMouseHoveringRect(ImVec2(bx0, p0.y),
+                                                      ImVec2(bx0 + rs.actionsW, p0.y + rowH),
+                                                      /*clip=*/false);
+    if (activated && !overLane && r.open) r.open();
+
+    float bx = bx0;
+    const float by = p0.y + (rowH - btn) * 0.5f;
+    ImGui::SetCursorScreenPos(ImVec2(bx, by));
+    if (ui::kit::iconButton("open", "open",
+                            r.path.empty() ? "Reopen the live view of this part"
+                                           : "Open this artifact",
+                            true, ui::kit::Tone::Neutral, btn) && r.open)
+        r.open();
+    if (!r.path.empty()) {
+        bx += btn + btnGap;
+        ImGui::SetCursorScreenPos(ImVec2(bx, by));
+        if (ui::kit::iconButton("copy", "copy", "Copy the full path to the clipboard", true,
+                                ui::kit::Tone::Neutral, btn))
+            ImGui::SetClipboardText(r.path.c_str());
+        bx += btn + btnGap;
+        ImGui::SetCursorScreenPos(ImVec2(bx, by));
+        // body_folder is the atlas's plain folder mark; there is no separate "reveal" glyph.
+        if (ui::kit::iconButton("reveal", "body_folder", "Show in the file manager", true,
+                                ui::kit::Tone::Neutral, btn))
+            chatArtifactReveal(st, r.path);
+    }
+    ImGui::PopID();
+
+    if (a < 1.0f) artiFadeVerts(dl, vtx0, a);
+    ImGui::SetCursorScreenPos(ImVec2(after.x, after.y + off));
+}
+
+// Square image tiles. The Copilot dock is narrow, so the grid reflows down to two columns and
+// gives up entirely below the minimum content width rather than clipping tiles to slivers.
+// `enterBase` continues the panel-wide entrance wave instead of restarting it at zero.
+static constexpr float kArtiGridHoverLift = 0.03f;   // 1.00 -> 1.03 on hover
+static bool artiDrawGrid(AppState& st, const std::vector<const ArtiDocRow*>& rows, double t0,
+                         int enterBase, std::vector<const ArtiDocRow*>& fallbackOut) {
+    const float availW = ImGui::GetContentRegionAvail().x;
+    if (availW < ui::metrics::px(180.0f)) return false;   // caller falls back to the list
+
+    const float gap  = ui::kit::rowGap();
+    int         cols = (int)((availW + gap) / (ui::metrics::px(120.0f) + gap));
+    cols = ImClamp(cols, 2, 4);
+    const float cell = (availW - gap * (float)(cols - 1)) / (float)cols;
+    const float rnd  = ui::metrics::cpMenuRowRound();
+    const float rndDp = rnd / ui::metrics::scale();
+
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList*  dl     = ImGui::GetWindowDrawList();
+    int          shown  = 0;
+
+    ImGui::PushID("arti_grid");
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const ArtiDocRow& r = *rows[i];
+        const Tex tex = artiRenderThumb(r.path);
+        if (!tex.id || tex.w <= 0 || tex.h <= 0) {
+            fallbackOut.push_back(&r);   // missing / corrupt / half-written stays visible as a row
+            continue;
+        }
+        const float  a   = artiEnterAlpha(t0, enterBase + (int)i);
+        const float  off = (1.0f - a) * ui::metrics::px(8.0f);
+        const ImVec2 p0(origin.x + (float)(shown % cols) * (cell + gap),
+                        origin.y + (float)(shown / cols) * (cell + gap) - off);
+        const int vtx0 = dl->VtxBuffer.Size;
+
+        ImGui::PushID((int)i);
+        ImGui::SetCursorScreenPos(p0);
+        ImGui::InvisibleButton("##tile", ImVec2(cell, cell));
+        const bool hot = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked()) chatArtifactOpenSmart(st, r.path);
+
+        const float k = 1.0f + kArtiGridHoverLift *
+                                   ui::anim::toward(ImGui::GetID("##lift"), hot ? 1.0f : 0.0f,
+                                                    ui::anim::kFast);
+        const ImVec2 c(p0.x + cell * 0.5f, p0.y + cell * 0.5f);
+        const ImVec2 q0(c.x - cell * 0.5f * k, c.y - cell * 0.5f * k);
+        const ImVec2 q1(c.x + cell * 0.5f * k, c.y + cell * 0.5f * k);
+        if (k > 1.0f) ui::glassSelectionGlow(dl, q0, q1, rndDp, ui::palette.accent);
+        dl->AddImageRounded((ImTextureID)(intptr_t)tex.id, q0, q1, ImVec2(0, 0), ImVec2(1, 1),
+                            IM_COL32_WHITE, rnd);
+        if (hot) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            ImGui::SetTooltip("%s\n%s", r.label.c_str(), r.path.c_str());
+        }
+        ImGui::PopID();
+
+        if (a < 1.0f) artiFadeVerts(dl, vtx0, a);
+        ++shown;
+    }
+    ImGui::PopID();
+
+    const int gridRows = (shown + cols - 1) / cols;
+    ImGui::SetCursorScreenPos(origin);
+    if (gridRows > 0)
+        ImGui::Dummy(ImVec2(availW, (float)gridRows * cell + (float)(gridRows - 1) * gap));
+    return true;
+}
+
 // Session Artifacts is a browser for session output: agent-touched documents, render images and
 // produced files. Run telemetry stays in the Tasks panel.
 static void drawArtifactsPanel(AppState& st, bool busy) {
     (void)busy;
-    const ui::AdaptiveSurface& surf = chatSurf();
+    ArtiUiState& ui_ = artiUi(st);
     ui::cpMenuHeader(st.fonts, "Session Artifacts",
                      "Documents, renders and files produced or touched by this session.");
 
-    struct ArtiDocRow {
-        std::string label, tooltip, path;
-        std::function<void()> open;
-        bool image = false;
-    };
     // The question this panel answers is "what did the AGENT touch", not "what is open" — the old
     // single list showed every doc tab, so a session that built one part looked like it built
     // four. A tab counts as agent-touched when it was handed off by an agent OR carries an agent
@@ -1060,61 +1344,43 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
     // directory directly; render visibility uses the existing cached chat display preference.
     const std::string projectPath = st.plmProjectPath();
     bool rendersOn = ui::chatShowRenders();
-    const float actionGap = ui::metrics::cpMenuCtlGap();
-    const float actionAvail = ImGui::GetContentRegionAvail().x;
-    const float actionW = std::max(ui::metrics::px(24.0f),
-                                   (actionAvail - actionGap) * 0.5f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    ImGui::BeginDisabled(projectPath.empty());
-    if (ImGui::Button("Open project folder", ImVec2(actionW, 0)))
+    if (ui::kit::secondaryButton("Open project folder", !projectPath.empty(),
+                                 "Open or choose a project before revealing its folder.",
+                                 ImVec2(-FLT_MIN, 0)))
         chatArtifactReveal(st, projectPath);
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("%s", projectPath.empty()
-            ? "Open or choose a project before revealing its folder."
-            : projectPath.c_str());
-    ImGui::SameLine(0, actionGap);
-    const char* renderToggle = rendersOn ? "Renders: on" : "Renders: off";
-    if (ImGui::Button(renderToggle, ImVec2(actionW, 0))) {
-        rendersOn = !rendersOn;
+
+    if (ui::kit::toggleChip("Renders", &rendersOn, ui::kit::Tone::Accent,
+                            "Show or hide image previews here and in the chat transcript."))
         ui::setChatShowRenders(rendersOn);
+    {
+        // List / Grid sits on the same control line, right-aligned.
+        static const char* kViewLabels[]   = {"List", "Grid"};
+        static const char* kViewTooltips[] = {"One row per artifact, with size and age",
+                                              "Renders as square preview tiles"};
+        const float segW = ui::metrics::px(104.0f);
+        ImGui::SameLine();
+        const float slack = ImGui::GetContentRegionAvail().x - segW;
+        if (slack > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + slack);
+        ui::kit::segmented("arti_view", kViewLabels, 2, &ui_.viewMode, segW, kViewTooltips);
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Show or hide image previews here and in the chat transcript.");
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
 
-    auto lowerCopy = [](std::string s) {
-        for (char& c : s) c = (char)std::tolower((unsigned char)c);
-        return s;
-    };
-    static char s_artifactFilter[192] = "";
     const size_t totalRows = agentRows.size() + otherRows.size() + fileRows.size();
     const bool showFilter = totalRows > 8;
     if (showFilter) {
-        const ImVec4 fieldBg(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.08f);
-        const ImVec4 fieldHov(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.14f);
-        const ImVec4 fieldAct(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.18f);
         ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, fieldBg);
-        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, fieldHov);
-        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, fieldAct);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
         ImGui::InputTextWithHint("##artifact_filter", "Filter artifacts\xe2\x80\xa6",
-                                 s_artifactFilter, sizeof(s_artifactFilter));
+                                 ui_.filter, sizeof(ui_.filter));
         ImGui::PopStyleVar();
-        ImGui::PopStyleColor(4);
         ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
     }
-    const bool filterActive = showFilter && s_artifactFilter[0] != '\0';
-    const std::string filterNeedle = filterActive ? lowerCopy(s_artifactFilter) : std::string();
+    const bool filterActive = showFilter && ui_.filter[0] != '\0';
+    const std::string filterNeedle = filterActive ? artiLower(ui_.filter) : std::string();
     auto matches = [&](const ArtiDocRow& r) {
         if (!filterActive) return true;
-        return lowerCopy(r.label).find(filterNeedle) != std::string::npos ||
-               lowerCopy(r.path).find(filterNeedle) != std::string::npos;
+        return artiLower(r.label).find(filterNeedle) != std::string::npos ||
+               artiLower(r.path).find(filterNeedle) != std::string::npos;
     };
 
     std::vector<const ArtiDocRow*> documents;
@@ -1127,213 +1393,121 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
     for (auto it = fileRows.rbegin(); it != fileRows.rend(); ++it)
         if (it->image && matches(*it)) renders.push_back(&*it);
 
-    std::vector<const ArtiDocRow*> models;
-    std::vector<const ArtiDocRow*> drawings;
-    std::vector<const ArtiDocRow*> data;
-    std::vector<const ArtiDocRow*> otherFiles;
-    auto lowerExt = [&](const std::string& path) {
-        const size_t dot = path.find_last_of('.');
-        const size_t slash = path.find_last_of("/\\");
-        if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
-            return std::string();
-        return lowerCopy(path.substr(dot));
-    };
+    // One classifier drives the leading icon, the "what it IS" line AND this bucketing, so a row's
+    // section can never disagree with the kind its icon claims.
+    std::vector<const ArtiDocRow*> buckets[4];
     for (auto it = fileRows.rbegin(); it != fileRows.rend(); ++it) {
         if (it->image || !matches(*it)) continue;
-        const std::string ext = lowerExt(it->path);
-        if (ext == ".step" || ext == ".stp" || ext == ".stl" || ext == ".3mf" ||
-            ext == ".obj" || ext == ".step+")
-            models.push_back(&*it);
-        else if (ext == ".pdf" || ext == ".dxf" || ext == ".svg")
-            drawings.push_back(&*it);
-        else if (ext == ".csv" || ext == ".json" || ext == ".txt" || ext == ".md")
-            data.push_back(&*it);
-        else
-            otherFiles.push_back(&*it);
+        buckets[artiClassify(it->path, it->label).bucket].push_back(&*it);
     }
 
-    const size_t fileCount = models.size() + drawings.size() + data.size() + otherFiles.size();
+    const size_t fileCount = buckets[ArtiModels].size() + buckets[ArtiDrawings].size() +
+                             buckets[ArtiData].size() + buckets[ArtiOther].size();
     const size_t matchCount = documents.size() + renders.size() + fileCount + otherDocs.size();
     if (filterActive && matchCount == 0)
-        artiEmptyState(surf, "No matches \xe2\x80\x94 try a document name, file name or folder.");
+        ui::kit::emptyState("artifacts", "No matches",
+                            "Try a document name, a file name or a folder.");
 
-    // Section-scoped ImGui ids: every loop below indexes from 0, so without a per-section scope
-    // the first file row would collide with the first document row and one row would go dead.
+    // One entrance wave across the whole panel: the running index makes section 2 continue
+    // section 1's stagger instead of restarting it.
+    int enterIdx = 0;
+
     // ---- Documents ----
-    artiSectionHeader(surf, "Documents", (int)documents.size());
+    ui::kit::sectionHeader("Documents", "part", nullptr, (int)documents.size(), /*first=*/true);
     if (documents.empty()) {
-        artiEmptyState(surf, filterActive
-            ? "No matching documents \xe2\x80\x94 parts the agent opens, imports or edits appear here."
-            : "Parts the agent opens, imports or edits appear here.");
+        ui::kit::emptyState(nullptr, filterActive ? "No matching documents" : "No documents yet",
+                            "Parts the agent opens, imports or edits appear here.");
     } else {
         ImGui::PushID("arti_docs");
-        for (size_t i = 0; i < documents.size(); ++i) {
-            ImGui::PushID((int)i);
-            artiRow(st, documents[i]->label, documents[i]->tooltip, documents[i]->path,
-                    documents[i]->open);
-            ImGui::PopID();
-        }
+        for (const ArtiDocRow* r : documents)
+            artiRow(st, *r, enterIdx++, ui_.enterT0, rendersOn);
         ImGui::PopID();
     }
 
     // ---- Renders ----
-    artiSectionHeader(surf, "Renders", (int)renders.size());
+    ui::kit::sectionHeader("Renders", "file_image", nullptr, (int)renders.size());
     if (renders.empty()) {
-        artiEmptyState(surf, filterActive
-            ? "No matching renders \xe2\x80\x94 images produced for agent vision appear here."
-            : "Images produced for agent vision appear here as preview tiles.");
+        ui::kit::emptyState(nullptr, filterActive ? "No matching renders" : "No renders yet",
+                            "Images produced for agent vision appear here as preview tiles.");
     } else if (!rendersOn) {
-        artiEmptyState(surf, "Render previews are hidden \xe2\x80\x94 use the Renders control above to show them.");
+        ui::kit::emptyState(nullptr, "Render previews are hidden",
+                            "Use the Renders control above to show them.");
     } else {
-        const float S = ui::uiScale;
-        const float availW = ImGui::GetContentRegionAvail().x;
-        const float targetW = ui::metrics::copilotThumbW();
-        const float cellGap = ui::metrics::cpMenuRowGap();
-        const int columns = std::max(1, (int)((availW + cellGap) / (targetW + cellGap)));
-        const float cellW = (availW - cellGap * (float)(columns - 1)) / (float)columns;
-        const float padX = ui::metrics::cpMenuRowPadX();
-        const float padY = ui::metrics::cpMenuRowPadY();
-        const float imageW = std::max(ui::metrics::px(24.0f), cellW - padX * 2.0f);
-        const float imageH = imageW * 0.72f;
-        const float captionH = ImGui::GetTextLineHeight();
-        const float cellH = padY * 2.0f + imageH + ui::metrics::cpMenuLabelGap() + captionH;
-        const ImVec2 gridStart = ImGui::GetCursorScreenPos();
-        const int kCap = 24;
-        const size_t drawCount = std::min(renders.size(), (size_t)kCap);
+        // The overflow used to be a dead-end "+N more" line. It is a real control now.
+        const size_t kCap = 24;
+        const size_t drawCount = ui_.showAllRenders ? renders.size()
+                                                    : std::min(renders.size(), kCap);
+        std::vector<const ArtiDocRow*> shown(renders.begin(), renders.begin() + (long)drawCount);
         std::vector<const ArtiDocRow*> fallbackRows;
-        size_t gridCount = 0;
-        ImDrawList* dl = ImGui::GetWindowDrawList();
+
         ImGui::PushID("arti_renders");
-        for (size_t i = 0; i < drawCount; ++i) {
-            const ArtiDocRow& r = *renders[i];
-            ImGui::PushID((int)i);
-            const Tex tex = artiRenderThumb(r.path);
-            if (!tex.id || tex.w <= 0 || tex.h <= 0) {
-                // Missing, corrupt or half-written images remain visible as dim fallback rows.
-                fallbackRows.push_back(&r);
-                ImGui::PopID();
-                continue;
-            }
-            const size_t row = gridCount / (size_t)columns;
-            const size_t col = gridCount % (size_t)columns;
-            const ImVec2 p0(gridStart.x + (float)col * (cellW + cellGap),
-                            gridStart.y + (float)row * (cellH + cellGap));
-            const ImVec2 p1(p0.x + cellW, p0.y + cellH);
-            ImGui::SetCursorScreenPos(p0);
-            ImGui::InvisibleButton("##render_cell", ImVec2(cellW, cellH));
-            const bool hot = ImGui::IsItemHovered();
-            if (ImGui::IsItemClicked()) chatArtifactOpenSmart(st, r.path);
-            ui::glassRowBackground(dl, p0, p1, ui::metrics::cpMenuRowRound() / S,
-                                   (gridCount % 2) == 1, false, hot ? 0.48f : 0.28f);
-            const float scale = std::min(imageW / (float)tex.w, imageH / (float)tex.h);
-            const ImVec2 drawSize((float)tex.w * scale, (float)tex.h * scale);
-            const ImVec2 imageMin(p0.x + padX + (imageW - drawSize.x) * 0.5f,
-                                  p0.y + padY + (imageH - drawSize.y) * 0.5f);
-            dl->AddImage((ImTextureID)(intptr_t)tex.id, imageMin,
-                         ImVec2(imageMin.x + drawSize.x, imageMin.y + drawSize.y));
-            dl->AddText(ImVec2(p0.x + padX,
-                               p0.y + padY + imageH + ui::metrics::cpMenuLabelGap()),
-                        ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
-                        artiEllipsize(r.label, imageW).c_str());
-            if (hot) {
-                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                ImGui::SetTooltip("%s", r.path.c_str());
-            }
-            ++gridCount;
-            ImGui::PopID();
+        const bool gridded =
+            ui_.viewMode == 1 && artiDrawGrid(st, shown, ui_.enterT0, enterIdx, fallbackRows);
+        if (gridded) enterIdx += (int)shown.size();
+        if (!gridded) {
+            for (const ArtiDocRow* r : shown)
+                artiRow(st, *r, enterIdx++, ui_.enterT0, rendersOn);
         }
-        if (gridCount > 0) {
-            const size_t gridRows = (gridCount + (size_t)columns - 1) / (size_t)columns;
-            ImGui::SetCursorScreenPos(
-                ImVec2(gridStart.x, gridStart.y + (float)gridRows * cellH +
-                                        (float)(gridRows - 1) * cellGap + cellGap));
-        } else {
-            ImGui::SetCursorScreenPos(gridStart);
-        }
-        ImGui::PushID("fallback");
-        for (size_t i = 0; i < fallbackRows.size(); ++i) {
-            ImGui::PushID((int)i);
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-            ImGui::TextWrapped("Preview unavailable \xc2\xb7 %s", fallbackRows[i]->label.c_str());
-            ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", fallbackRows[i]->path.c_str());
-            chatArtifactActions(st, fallbackRows[i]->path);
-            ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
-            ImGui::PopID();
-        }
+        // Missing, corrupt or half-written images stay visible as ordinary rows.
+        for (const ArtiDocRow* r : fallbackRows)
+            artiRow(st, *r, enterIdx++, ui_.enterT0, /*thumbsOn=*/false);
         ImGui::PopID();
-        ImGui::PopID();
+
         const size_t more = renders.size() - drawCount;
         if (more > 0) {
             char mline[64];
-            std::snprintf(mline, sizeof(mline), "+%d more render%s",
-                          (int)more, more == 1 ? "" : "s");
-            artiEmptyState(surf, mline);
+            std::snprintf(mline, sizeof(mline), "Show all %d renders##arti_showall",
+                          (int)renders.size());
+            if (ui::kit::secondaryButton(mline)) ui_.showAllRenders = true;
         }
     }
 
     // ---- Files ----
-    artiSectionHeader(surf, "Files", (int)fileCount);
+    ui::kit::sectionHeader("Files", "file_generic", nullptr, (int)fileCount);
     if (fileCount == 0) {
-        artiEmptyState(surf, filterActive
-            ? "No matching files \xe2\x80\x94 exported models, drawings and data appear here."
-            : "Exported models, drawings, data and other files appear here.");
+        ui::kit::emptyState(nullptr, filterActive ? "No matching files" : "No files yet",
+                            "Exported models, drawings, data and other files appear here.");
     } else {
-        auto drawFileGroup = [&](const char* label, const char* id,
-                                 const std::vector<const ArtiDocRow*>& rows) {
-            if (rows.empty()) return;
+        auto drawFileGroup = [&](const char* label, const char* id, ArtiBucket b) {
+            if (buckets[b].empty()) return;
             ui::cpMenuLabel(label);
             ImGui::PushID(id);
-            for (size_t i = 0; i < rows.size(); ++i) {
-                ImGui::PushID((int)i);
-                artiRow(st, rows[i]->label, rows[i]->tooltip, rows[i]->path, rows[i]->open);
-                ImGui::PopID();
-            }
+            for (const ArtiDocRow* r : buckets[b])
+                artiRow(st, *r, enterIdx++, ui_.enterT0, rendersOn);
             ImGui::PopID();
         };
         ImGui::PushID("arti_files");
-        drawFileGroup("Models", "models", models);
-        drawFileGroup("Drawings / exports", "drawings", drawings);
-        drawFileGroup("Data", "data", data);
-        drawFileGroup("Other", "other", otherFiles);
+        drawFileGroup("Models", "models", ArtiModels);
+        drawFileGroup("Drawings / exports", "drawings", ArtiDrawings);
+        drawFileGroup("Data", "data", ArtiData);
+        drawFileGroup("Other", "other", ArtiOther);
         ImGui::PopID();
     }
 
     // ---- Other open documents ----
     // The user's own tabs must not dominate this panel, but dropping them outright would lose the
     // only way to reach a part the agent worked on BEFORE the handoff / edit-stamp flags were set
-    // — so they stay, collapsed behind a dim click-to-expand line.
-    artiSectionHeader(surf, "Other open documents", (int)otherDocs.size());
-    {
-        static bool s_showOtherDocs = false;
-        const float ind = ui::metrics::cpMenuRowPadX();
-        ImGui::Indent(ind);
-        if (otherDocs.empty()) {
-            ui::cpMenuHint(filterActive
-                ? "No matching open documents \xe2\x80\x94 user-opened tabs are kept here, collapsed."
-                : "User-opened tabs appear here, collapsed away from session output.");
-        } else {
-            char line[96];
-            std::snprintf(line, sizeof(line), "%d other open document%s \xc2\xb7 %s",
-                          (int)otherDocs.size(), otherDocs.size() == 1 ? "" : "s",
-                          s_showOtherDocs ? "hide" : "show");
-            ui::cpMenuHint(line);
-            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-            if (ImGui::IsItemClicked()) s_showOtherDocs = !s_showOtherDocs;
-        }
-        ImGui::Unindent(ind);
-        if (s_showOtherDocs && !otherDocs.empty()) {
+    // — so they stay, collapsed behind a click-to-expand line.
+    ui::kit::sectionHeader("Other open documents", "open", nullptr, (int)otherDocs.size());
+    if (otherDocs.empty()) {
+        ui::kit::emptyState(nullptr,
+                            filterActive ? "No matching open documents" : "Nothing else open",
+                            "User-opened tabs appear here, collapsed away from session output.");
+    } else {
+        // The ## suffix keeps ONE ImGui id across the Show/Hide label flip.
+        char line[96];
+        std::snprintf(line, sizeof(line), "%s %d other open document%s##arti_otherdocs",
+                      ui_.showOtherDocs ? "Hide" : "Show", (int)otherDocs.size(),
+                      otherDocs.size() == 1 ? "" : "s");
+        if (ui::kit::secondaryButton(line)) ui_.showOtherDocs = !ui_.showOtherDocs;
+        if (ui_.showOtherDocs) {
             ImGui::PushID("arti_other_docs");
-            for (size_t i = 0; i < otherDocs.size(); ++i) {
-                ImGui::PushID((int)i);
-                artiRow(st, otherDocs[i]->label, otherDocs[i]->tooltip, otherDocs[i]->path,
-                        otherDocs[i]->open);
-                ImGui::PopID();
-            }
+            for (const ArtiDocRow* r : otherDocs)
+                artiRow(st, *r, enterIdx++, ui_.enterT0, rendersOn);
             ImGui::PopID();
         }
     }
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, ui::kit::rowGap()));
 }
 
 
@@ -1578,12 +1752,13 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         if (padR > padL) ImGui::Indent(padL - padR);   // negative: pull the LEFT edge back to padL
         if (st.showAISettingsOverlay) {
             drawAISettingsBody(st, busy);
-        } else if (st.showTaskList) {
-            drawTaskListPanel(st, busy);
-        } else if (st.showArtifacts) {
-            drawArtifactsPanel(st, busy);
-        } else if (st.showSessionsPicker) {
-            drawSessionsPanel(st, busy);
+        } else if (st.showTaskList || st.showArtifacts || st.showSessionsPicker) {
+            // The menu views run at the docked-pane rhythm whatever the host pushed around us.
+            ui::kit::pushDensity(ui::kit::Density::Cozy);
+            if (st.showTaskList)            drawTaskListPanel(st, busy);
+            else if (st.showArtifacts)      drawArtifactsPanel(st, busy);
+            else                            drawSessionsPanel(st, busy);
+            ui::kit::popDensity();
         } else {
             drawChatLogWindowed(st);   // M19: render-windowed endless scroll-back
             chatLogStickToBottom("copilot.panel");

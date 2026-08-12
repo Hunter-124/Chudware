@@ -17,10 +17,11 @@ struct PartsItem;
 // Minimal base64 decode for parts_thumbnail image_b64 payloads.
 std::vector<unsigned char> b64decode(const std::string& in);
 
-// Section header: optional accent glyph + h2 label + optional right-aligned dim `trailing`
-// text (counts/state), closed by an accent-to-transparent rule spanning the pane.
-// firstInPane=true sits flush at the pane top (no leading gap); subsequent headers add
-// breathing room above.
+// Section header: optional accent icon + accent label + optional right-aligned dim `trailing`
+// text (counts/state). Forwards to ui::kit::sectionHeader under Density::Cozy — there is no
+// underline rule any more (the app-wide header dropped it; it read as clutter beside the glass
+// panels). firstInPane=true sits flush at the pane top (no leading gap); subsequent headers add
+// the shared section gap above.
 void sectionHeader(const char* label, bool firstInPane = false, const char* icon = nullptr,
                    const char* trailing = nullptr);
 
@@ -37,9 +38,12 @@ struct ContentInset {
     ContentInset& operator=(const ContentInset&) = delete;
 };
 
-// Centered empty-state: 40px atlas icon (drawIconGlass, textDisabled) + message + optional sub.
+// Centered empty-state: ui::kit::emptyState under Density::Cozy (atlas icon + message +
+// optional sub-line, each line centred if it fits and WRAPPED if it does not), pushed a third
+// of the way down the pane so it lands in the body rather than at the top edge.
 void emptyState(const char* iconName, const char* msg, const char* sub = nullptr);
 
+// The brand mark in motion + `prefix`. Forwards to ui::kit::spinner.
 void spinner(const char* prefix);
 
 // Flat vector glyph per part domain — the offline preview fallback.

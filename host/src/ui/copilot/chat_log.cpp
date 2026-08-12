@@ -690,13 +690,15 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // m.text, or a streamed reply prints twice.
     const std::string bodyText = proseInline ? ui::timelineProseTail(m) : m.text;
 
-    // (3) The reply as a Thin glass "prose" card (Liquid Glass v2 §6, host contract H5) —
-    // body copy stays legible over the live viewport blur. Selectable for click-drag +
-    // Ctrl+C; right-click copies selection or full text.
+    // (3) The reply as a REGULAR glass "prose" card (Liquid Glass v2 §6, host contract H5) — the
+    // heaviest silhouette in the column, matching the timeline's inline prose bubble. Every other
+    // row kind (stage cards, thoughts, tool lines) is now a rail or a bare line, so the answer is
+    // unmistakably the deliverable. Selectable for click-drag + Ctrl+C; right-click copies
+    // selection or full text.
     if (proseCard || (proseInline && !bodyText.empty() && m.errKind == ERR_NONE)) {
         const std::string prose = stripMdMarks(bodyText);
-        GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                          10.0f);
+        GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x,
+                                          ui::GlassLevel::Regular, 10.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                             ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
         ImGui::BeginChild("##prose", ImVec2(0, 0),
@@ -778,17 +780,11 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             ImGui::PopStyleColor();
         }
     } else {
-        // (7) Usage footer — tokens + wall-time for the finished turn, dim (DESIGN §5).
-        int tin = 0, tout = 0, tms = 0;
-        for (const auto& a : m.activity) {
-            if (a.rowKind != 0) continue;   // tool / ctx / provider rows aren't stage wall-time
-            tin += a.tokensIn; tout += a.tokensOut; tms += a.durationMs;
-        }
-        if (tin > 0) {
-            ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textTertiary);
-            ImGui::Text("%d tokens in / %d out \xc2\xb7 %.1f s", tin, tout, tms / 1000.0);
-            ImGui::PopStyleColor();
-        }
+        // (7) The run receipt — the finished turn's footer. It carries the usage numbers this slot
+        // used to print as bare text, and expands to what went wrong, what was written to disk and
+        // where the tokens went. Anchors inside it resolve against the message id scope the
+        // per-message PushID has already established.
+        drawTurnReceipt(st, m);
     }
 
     // (8) Result / error block.
@@ -1196,6 +1192,19 @@ void chatDrawJumpToLatest(const char* regionId, const ImVec2& viewMin, const ImV
 // the carried-over offset down would otherwise look exactly like a user scroll-up and unstick
 // the very first frame of the new conversation.
 void chatLogResetStick() { s_stickByRegion.clear(); }
+
+// The inverse, for a deferred scroll-to-anchor (run receipt / cost strip). The jump lands one
+// frame AFTER the click, and chatLogStickToBottom runs after the log every frame — so without
+// un-sticking first, the snap-to-tail would immediately undo the jump and the click would look
+// like it did nothing. Every region is broken, not just the active one: the docked column and
+// the AI tab render the same conversation, and the jump has to survive on whichever is visible.
+// atBottom is cleared too so the "jump to latest" affordance appears, which is now accurate.
+void chatLogBreakStick() {
+    for (auto& kv : s_stickByRegion) {
+        kv.second.stick = false;
+        kv.second.atBottom = false;
+    }
+}
 
 
 // ---- unified AI Copilot pane: header -> conversation -> bottom composer ----

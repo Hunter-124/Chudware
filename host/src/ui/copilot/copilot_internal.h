@@ -211,6 +211,12 @@ void        timelineScrollTo(ImGuiID anchor);
 // than a tool that ran and broke. The run receipt counts those separately — a turn that burned
 // six calls on refusals must not read like a turn that did six units of work.
 bool        activityIsGuardRefusal(const ActivityItem& a);
+// The FINISHED turn's footer: a one-line receipt ("14 tool calls · 2 retried · 1 skipped · 3 files
+// written · 41 s · 12.4k in / 3.1k out") that expands to the failures, the files the turn wrote,
+// and a per-stage cost-attribution strip. It REPLACES the old plain "N tokens in / M out" line —
+// those numbers are the receipt headline's last clause. Must be called from the message id scope
+// (chat_log's per-message PushID) so its scroll anchors resolve to the timeline's own rows.
+void        drawTurnReceipt(AppState& st, ChatMsg& m);
 // Doc-id + atlas-glyph fold for agent-authored text, gated on ui::chatHumanizeDocIds().
 // `jsonBody` additionally strips the resolved-id parenthetical (tool-row args blobs).
 // Idempotent, with a no-allocation fast path.

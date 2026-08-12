@@ -354,7 +354,10 @@ static void planDrawTodosTree(const PlanState& plan,
                        plan.shape == "phased_todo" ||
                        (phases.size() == 1 && phases[0] != "Tasks");
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
+    // ui::kit::sectionGap(), not the raw cpMenu token: these three sub-sections render BOTH inside
+    // the turn timeline (Compact) and in the docked Tasks view (Cozy), and a 14 px menu gap inside
+    // a 2 px conversation rhythm is exactly the row-to-row unevenness metrics.h:93 forbids.
+    ImGui::Dummy(ImVec2(0, ui::kit::sectionGap()));
     ImGui::PushFont(fonts.medium);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextUnformatted("Todos");
@@ -441,7 +444,7 @@ static void planDrawObjectives(const PlanState& plan,
         if (it.kind == "objective" || plan.shape == "objectives") ++n;
     if (n == 0) return;
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
+    ImGui::Dummy(ImVec2(0, ui::kit::sectionGap()));   // density-aware — see planDrawTodosTree
     ImGui::PushFont(fonts.medium);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextUnformatted("Objectives");
@@ -505,7 +508,7 @@ static void planDrawSubagents(const PlanState& plan,
 
     const ui::AdaptiveSurface& surf = chatSurf();
     const float sc = ui::uiScale;
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
+    ImGui::Dummy(ImVec2(0, ui::kit::sectionGap()));   // density-aware — see planDrawTodosTree
     ImGui::PushFont(fonts.medium);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextUnformatted("Subagents");

@@ -25,6 +25,7 @@
 #include "property_manager.h"   // pmParseDim (Smart Dimension value parsing)
 #include "airfoil.h"            // NACA 4-/5-digit + .dat profile generator (SketchTool::Airfoil)
 #include "file_dialog.h"        // openFileDialog (.dat import)
+#include "widgets/kit.h"        // ui::kit::primaryButton (the one accent-button treatment)
 
 namespace ui {
 
@@ -4366,15 +4367,12 @@ void SketchMode::drawOverDefinePrompt(AppState& st) {
         auto finish = [&]() { overDefOpen_ = false; overDefPendingCon_ = nullptr;
                               dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
                               dimAxis_.clear(); dimPopupDriven_ = false; };
-        // Default action (Make this dimension driven) — commits a reference dimension. Highlight it
-        // in the accent color so it reads as the recommended choice.
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.85f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.70f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.windowBg[0], pal.windowBg[1], pal.windowBg[2], 1));
-        bool mkDriven = ImGui::Button("Make this dimension driven");
-        ImGui::PopStyleColor(4);
-        if (mkDriven) { overDefCommit(st, /*driven=*/true); overDefOpen_ = false; }
+        // Default action (Make this dimension driven) — commits a reference dimension. The
+        // recommended choice wears the app's ONE primary-button treatment.
+        if (ui::kit::primaryButton("Make this dimension driven")) {
+            overDefCommit(st, /*driven=*/true);
+            overDefOpen_ = false;
+        }
         ImGui::SameLine();
         if (ImGui::Button("Leave this dimension driving")) {
             // Commit as a driving dim; the sketch becomes over defined (reads red, frozen geometry).
@@ -4412,13 +4410,7 @@ void SketchMode::drawEditOverDefinePrompt(AppState& st) {
                               dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
                               dimAxis_.clear(); dimPopupDriven_ = false; };
         // Default action (Cancel) — keep the old value, send nothing. Highlighted as recommended.
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.85f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.70f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.windowBg[0], pal.windowBg[1], pal.windowBg[2], 1));
-        bool cancel = ImGui::Button("Cancel");
-        ImGui::PopStyleColor(4);
-        if (cancel) finish();
+        if (ui::kit::primaryButton("Cancel")) finish();
         ImGui::SameLine();
         if (ImGui::Button("Apply anyway")) {
             nlohmann::json op = editOverDefOp_;
@@ -9758,12 +9750,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             const float okW = 64 * sc, cancelW = 64 * sc;
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                 std::max(0.0f, ImGui::GetContentRegionAvail().x - okW - cancelW - 7 * sc));
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.85f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.70f));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.windowBg[0], pal.windowBg[1], pal.windowBg[2], 1));
-            bool ok = ImGui::Button("OK", ImVec2(okW, 0)) || enter;
-            ImGui::PopStyleColor(4);
+            bool ok = ui::kit::primaryButton("OK", true, nullptr, ImVec2(okW, 0)) || enter;
             ImGui::SameLine();
             bool cancel = ImGui::Button("Cancel", ImVec2(cancelW, 0));
             if (ok) dimCommit(st);

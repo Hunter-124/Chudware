@@ -16,8 +16,8 @@
 
 #include "core/app_state.h"
 #include "ui_theme.h"
-#include "ui/icons.h"      // ui::drawIconGlass — the wrapped dead-zone hint at the pane foot
 #include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
+#include "ui/widgets/kit.h"   // ui::kit::emptyState — the shared no-facets hint
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -353,11 +353,12 @@ void drawFiltersBlock(AppState& st, float paneW) {
     // back while the taxonomy is still in flight (the region is about to be filled) and while
     // a stale facet value is still narrowing the search, since claiming "no extra filters"
     // while one is active would be a lie.
-    // The hint is drawn locally rather than through emptyState(): that helper centres each
-    // line on the raw available width with NO wrapping, so at this pane width the sub-line was
-    // clipped at both ends ("ck a category to filter by its own spec"). Here both lines wrap
-    // inside the lane-reserved content width. The height guard stays: below one hint's worth
-    // of room there is no dead zone to fill and the leading Dummy would go negative.
+    // Drawn through the shared empty-state painter: ui::kit::emptyState centres a line that
+    // FITS and wraps one that does not, which is the defect that forced a local copy here
+    // (the sub-line used to be clipped at both ends at this pane width). The lane-width child
+    // is the one thing the kit cannot know — it reserves the pill scrollbar's gutter so the
+    // wrapped paragraph stops short of the bar. The height guard stays: below one hint's
+    // worth of room there is no dead zone to fill and the leading Dummy would go negative.
     if (!drewFacets && !S().taxonomyLoading &&
         ImGui::GetContentRegionAvail().y > 96.0f * sc) {
         bool anyFacetValue = false;
@@ -366,26 +367,17 @@ void drawFiltersBlock(AppState& st, float paneW) {
         if (!anyFacetValue) {
             const float hintW = ImGui::GetContentRegionAvail().x - laneW;
             ImGui::Dummy(ImVec2(0, ImGui::GetContentRegionAvail().y * 0.25f));
-            const float  iconSz = 32.0f * sc;
-            const ImVec2 cur    = ImGui::GetCursorScreenPos();
-            float dis[4];
-            Palette::withAlpha(palette.textDisabled, dis, 0.6f);
-            ui::drawIconGlass(ImGui::GetWindowDrawList(), "filter_funnel",
-                              ImVec2(cur.x + hintW * 0.5f, cur.y + iconSz * 0.5f), iconSz,
-                              Palette::toU32(dis), 0);
-            ImGui::Dummy(ImVec2(0, iconSz + 6.0f * sc));
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + hintW);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(palette.textDim[0], palette.textDim[1],
-                                         palette.textDim[2], 1.0f));
-            ImGui::TextWrapped("No extra filters here");
+            // A plain child would paint ImGuiCol_ChildBg (panelBg) as a slab behind the hint.
+            float clear[4];
+            Palette::withAlpha(palette.panelBg, clear, 0.0f);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                                  ImVec4(clear[0], clear[1], clear[2], clear[3]));
+            ImGui::BeginChild("##nofacets", ImVec2(hintW, 0), ImGuiChildFlags_AutoResizeY,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ui::kit::emptyState("filter_funnel", "No extra filters here",
+                                "Pick a category to filter by its own specs.");
+            ImGui::EndChild();
             ImGui::PopStyleColor();
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                                         palette.textDisabled[2], 0.85f));
-            ImGui::TextWrapped("Pick a category to filter by its own specs.");
-            ImGui::PopStyleColor();
-            ImGui::PopTextWrapPos();
         }
     }
 

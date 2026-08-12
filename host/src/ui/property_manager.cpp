@@ -2804,7 +2804,13 @@ static bool pmGroupDefaultOpen(const char* label) {
     return true;
 }
 
-static bool pmSectionHeader(const char* label, const Palette& pal) {
+// NOT a ui::kit::sectionHeader in disguise: this is the PM group's DISCLOSURE control — an
+// ImGui::CollapsingHeader whose open state it returns, with the app's shared glass row pill behind
+// it and the adaptive-surface ink T-G14 requires over the live viewport. The kit's sectionHeader is
+// a static caption and its collapsible primitive (cardBegin/cardEnd) is a paired container, which
+// this call site cannot be: the group card that follows is opened here and closed by the NEXT
+// group's header. Nothing below duplicates a kit painter.
+static bool pmSectionHeader(const char* label, const Palette& pal) {  // gui-lint: allow (disclosure control, not a caption painter)
     if (!label || !label[0]) return true;
     const float S = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(9.0f * S, 4.0f * S));

@@ -17,6 +17,7 @@
 #include "ui_theme.h"
 #include "ui/icons.h"      // ui::drawIconGlass — atlas glyphs on the card preview band
 #include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
+#include "ui/widgets/kit.h"    // ui::kit — the app-wide progress painter
 #include "ui/tesseract.h"  // ui::drawTesseractSpinner — the brand mark IS the busy indicator
 
 #include "parts_internal.h"
@@ -286,35 +287,27 @@ static void itemTooltip(const PartsItem& item) {
     itemTooltipAt(item, ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal));
 }
 
-// Indeterminate progress bar for the "more results are still landing" state: 2dp of accent
-// riding at the top of the results region. There is no completion fraction to report (each
-// vendor answers independently), so the bar reports MOTION — the point is that the rows
-// already on screen are live and more are coming, not a percentage.
+// Indeterminate progress bar for the "more results are still landing" state: 2dp of accent riding
+// at the top of the results region. There is no completion fraction to report (each vendor answers
+// independently), so the bar reports MOTION — an out-of-range fraction is exactly how ui::kit
+// spells that, and its marquee drives the frame pump instead of stuttering at the 20 Hz idle rate.
 static void resultsProgressBar() {
-    const float  sc = ui::uiScale;
-    const float  h  = std::max(2.0f * sc, 2.0f);
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    // The results pane's scroll child carries the copilot pill scrollbar on its right edge,
-    // so the bar stops a lane short of the content region instead of running under it.
-    const float  w  = std::max(ImGui::GetContentRegionAvail().x -
-                                   ui::metrics::px(ui::kChatScrollbarLane), 1.0f);
-    const ImVec2 p1(p0.x + w, p0.y + h);
-    ImDrawList*  dl = ImGui::GetWindowDrawList();
-    const float  r  = h * 0.5f;
-
-    float track[4], head[4];
-    Palette::withAlpha(palette.accent, track, 0.16f);
-    Palette::withAlpha(palette.accent, head,  0.92f);
-    dl->AddRectFilled(p0, p1, Palette::toU32(track), r);
-
-    const float seg  = std::max(56.0f * sc, w * 0.30f);
-    const float span = w + seg;   // the head enters off the left and exits off the right
-    const float x0   = p0.x - seg + std::fmod((float)ImGui::GetTime() * 0.9f, 1.0f) * span;
-    dl->PushClipRect(p0, p1, true);
-    dl->AddRectFilled(ImVec2(x0, p0.y), ImVec2(x0 + seg, p1.y), Palette::toU32(head), r);
-    dl->PopClipRect();
-
-    ImGui::Dummy(ImVec2(w, h + 2.0f * sc));   // reserve the strip: results start below it
+    const float h = std::max(2.0f * ui::uiScale, 2.0f);
+    // The results pane's scroll child carries the copilot pill scrollbar on its right edge, so the
+    // bar stops a lane short of the content region instead of running under it. A zero-padding,
+    // transparent child is how that inset is handed to a shared painter that sizes itself from the
+    // content region.
+    const float w = std::max(ImGui::GetContentRegionAvail().x -
+                                 ui::metrics::px(ui::kChatScrollbarLane), 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    ImGui::BeginChild("##parts_results_progress", ImVec2(w, h), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ui::kit::progressBar(/*frac=*/-1.0f, /*caption=*/nullptr, ui::kit::Tone::Accent, h);
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+    ImGui::Dummy(ImVec2(w, 2.0f * ui::uiScale));   // results start below the strip
 }
 
 // Searching / error / empty preamble, shared by both renderers so a backend failure can

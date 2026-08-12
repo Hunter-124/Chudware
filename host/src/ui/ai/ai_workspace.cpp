@@ -43,6 +43,7 @@
 #include "ui/copilot/copilot.h"
 #include "ui_theme.h"
 #include "ui/metrics.h"            // cpMenu* rhythm tokens (gutter / row pad / gap / corner)
+#include "ui/widgets/kit.h"        // ui::kit — the app-wide section header / empty state
 #include "ui/leaderboard_ui.h"
 #include "ui/ai/active_work.h"
 #include "ui/ai/plan_board.h"
@@ -363,62 +364,33 @@ namespace {
 // of truth for the corner without double-scaling it.
 inline float rowRoundDp() { return ui::metrics::cpMenuRowRound() / ui::uiScale; }
 
-// ---- shared little helpers (same visual grammar as parts/plm workspaces) --------
+// ---- shared little helpers -> ui::kit --------------------------------------------
+// Two of the app's duplicated painters lived here. They survive as file-local wrappers because
+// this workspace's views spell them this way and they carry its two decisions: sections spaced by
+// the caller, and an empty state that sits a third of the way down a full-height column.
+
+// This workspace draws on the cpMenu* rhythm, and Density::Cozy IS that token family.
+struct CozyDensity {
+    CozyDensity()  { ui::kit::pushDensity(ui::kit::Density::Cozy); }
+    ~CozyDensity() { ui::kit::popDensity(); }
+    CozyDensity(const CozyDensity&)            = delete;
+    CozyDensity& operator=(const CozyDensity&) = delete;
+};
 
 static void sectionHeader(const char* label) {
-    ImGui::TextUnformatted(label);
-    ImVec2 p0 = ImGui::GetItemRectMin();
-    ImVec2 p1 = ImGui::GetItemRectMax();
-    const float rule = ui::metrics::stroke(1.0f);
-    ImGui::GetWindowDrawList()->AddLine(
-        ImVec2(p0.x, p1.y + rule), ImVec2(p1.x, p1.y + rule),
-        ImGui::ColorConvertFloat4ToU32(
-            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.60f)),
-        rule);
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
+    const CozyDensity density;
+    // `first`: the views space their own sections (an explicit cpMenuSectionGap between them), so
+    // the shared painter must not add a second leading gap.
+    ui::kit::sectionHeader(label, /*icon=*/nullptr, /*trailing=*/nullptr, /*count=*/-1,
+                           /*first=*/true);
 }
 
 static void emptyState(const char* icon, const char* msg, const char* sub = nullptr) {
-    const float S = ui::uiScale;
-    float avail = ImGui::GetContentRegionAvail().y;
-    ImGui::Dummy(ImVec2(0, avail * 0.35f));
-
-    float tw = ImGui::CalcTextSize(icon).x;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                         (ImGui::GetContentRegionAvail().x - tw) * 0.5f);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-               palette.textDisabled[2], 0.5f));
-    ImGui::TextUnformatted(icon);
-    ImGui::PopStyleColor();
-    ImGui::Spacing();
-
-    {
-        float mw = ImGui::CalcTextSize(msg).x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             (ImGui::GetContentRegionAvail().x - mw) * 0.5f);
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::TextUnformatted(msg);
-        ImGui::PopStyleColor();
-    }
-    if (sub) {
-        // Wrap-aware centering: long sub lines wrap inside the pane instead of clipping off the
-        // left edge (M21 — the DAG pane is narrower now that the chat column sits beside it).
-        float avail2 = ImGui::GetContentRegionAvail().x;
-        float wrapW  = std::min(avail2 - 16.0f * S, 460.0f * S);
-        float sw     = ImGui::CalcTextSize(sub, nullptr, false, wrapW).x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             std::max(0.0f, (avail2 - sw) * 0.5f));
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                   palette.textDisabled[2], 0.8f));
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
-        ImGui::TextWrapped("%s", sub);
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
-    }
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
+    const CozyDensity density;
+    // These views are full-height columns; a state at the top of one reads as a stray label
+    // rather than the pane's answer. The vertical push is this workspace's own decision.
+    ImGui::Dummy(ImVec2(0, ImGui::GetContentRegionAvail().y * 0.35f));
+    ui::kit::emptyState(icon, msg, sub);
 }
 
 static const float* statusColor(const std::string& s) {
@@ -898,7 +870,7 @@ static bool drawSubagentChatWindow(AppState& st, SubChatState& cs, int cascadeId
             ImGui::PopStyleColor();
         }
         if (cs.msgs.empty() && cs.viewErr.empty()) {
-            emptyState("[sa]", cs.trPending ? "Loading transcript\xE2\x80\xA6" : "No transcript yet",
+            emptyState("file_doc", cs.trPending ? "Loading transcript\xE2\x80\xA6" : "No transcript yet",
                        "This sub-agent has not produced any messages yet. Its replies and your "
                        "steering messages appear here.");
         }
@@ -1517,10 +1489,10 @@ static void drawAgentHubView(AppState& st) {
 
     if (!haveDag && !haveSubs) {
         if (busy)
-            emptyState("[>]", "Agent is starting\xE2\x80\xA6",
+            emptyState("ai_panel", "Agent is starting\xE2\x80\xA6",
                        "Tool calls, thoughts and context injections will appear here as the run streams.");
         else
-            emptyState("[/]", "No agent activity yet",
+            emptyState("activity", "No agent activity yet",
                        "Send a message in the chat — delegated sub-agents list here live, each with a "
                        "popup chat of its own, and the execution trace builds below.");
         return;
@@ -1542,7 +1514,7 @@ static void drawAgentHubView(AppState& st) {
         drawAgentDagCanvas(st, dag, verbosity);
     } else if (!haveSubs) {
         // Registry has agents but the event stream hasn't produced spans yet — honest, not blank.
-        emptyState("[>]", busy ? "Agent is starting\xE2\x80\xA6" : "No agent events yet",
+        emptyState("ai_panel", busy ? "Agent is starting\xE2\x80\xA6" : "No agent events yet",
                    "Tool calls, thoughts and context injections appear here as the run streams.");
     }
 }
@@ -1682,7 +1654,7 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
                            lw0.y + ImGui::GetWindowSize().y)),
         GlassGroup::Global);
     if (st.chat.empty()) {
-        emptyState("[AI]", "Start a conversation",
+        emptyState("ai_panel", "Start a conversation",
                    "Describe what to build — the copilot plans, models and verifies it.");
     } else {
         chatDrawLog(st);
@@ -1842,7 +1814,7 @@ static void drawViewPane(AppState& st, bool busy) {
             break;
         case 1:  // Session Plan: the plan board over persisted buildgraph runs.
             if (!st.workerStarted)
-                emptyState("[#]", "Worker not running",
+                emptyState("health_check", "Worker not running",
                            "The Chudware worker service is required to load and steer plans.");
             else
                 drawPlanBoardView(st);

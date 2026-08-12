@@ -31,6 +31,7 @@
 #include "metrics.h"
 #include "property_manager.h" // PropertyManager::active() — mutual-exclusion pick guard
 #include "util/aicm_handoff.h" // is_shm_uri — overlay paths are aicm-shm:// handoff URIs, not files
+#include "widgets/kit.h" // kit::dimText — the app-wide dim/secondary prose renderer
 #include "widgets/ribbon.h" // setRibbonDisabledPrefix — EM tab gating
 
 namespace ui {
@@ -136,7 +137,9 @@ static void popCardText() { ImGui::PopStyleColor(2); }
 // Dim/secondary text for the CURRENT scope: derives from whatever Text color is
 // active (adaptive pane ink outside the cards, card ink inside), instead of
 // palette.textDim — which only pairs with theme surfaces and washes out on the
-// frosted adaptive pane.
+// frosted adaptive pane. Wrapped prose goes through kit::dimText (identical
+// 0.62 ink); this pair stays only for single-line row labels, which must not
+// wrap inside a fixed-height row pill.
 static void pushDimText() {
   ImVec4 t = ImGui::GetStyleColorVec4(ImGuiCol_Text);
   t.w *= 0.62f;
@@ -146,6 +149,10 @@ static void popDimText() { ImGui::PopStyleColor(1); }
 // Semantic status colors as ImVec4 (palette roles carry float[4]).
 static ImVec4 simRole(const float c[4]) {
   return ImVec4(c[0], c[1], c[2], c[3]);
+}
+static ImU32 simRoleU32(const float c[4], float a = 1.0f) {
+  float t[4] = {c[0], c[1], c[2], c[3] * a};
+  return Palette::toU32(t);
 }
 
 // Compose the incoming-flow unit vector from a study's base axis + AoA +
@@ -1980,8 +1987,11 @@ void SimManager::drawEmLinePlot(const char *id, const std::vector<float> &x,
         ImVec4(inkV.x, inkV.y, inkV.z, inkV.w * a));
   };
   const ImU32 axisCol = ink(0.62f), txtCol = ink(1.0f), gridCol = ink(0.20f);
-  const ImU32 c1 = IM_COL32(90, 170, 250, 255),
-              c2 = IM_COL32(240, 140, 60, 255);
+  // Two-series categorical hues: the orientation-triad blue + the amber status
+  // role (the palette's only theme-aware categorical hues) — see the ramp note
+  // in drawFatigueGraphs.
+  const ImU32 c1 = simRoleU32(ui::palette.axisZ),
+              c2 = simRoleU32(ui::palette.statusWarn);
 
   const auto xRange = std::minmax_element(x.begin(), x.end());
   float xLo = *xRange.first, xHi = *xRange.second;
@@ -2325,7 +2335,7 @@ void SimManager::drawEmPanel(AppState &st) {
           // whole row.
           if (row == 0)
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
-                                   IM_COL32(90, 170, 250, 40));
+                                   simRoleU32(ui::palette.accent, 0.157f));
           ImGui::TableNextColumn();
           std::string nm = m.value("name", std::string("?"));
           if (row == 0)
@@ -5320,9 +5330,7 @@ void SimManager::drawTreeBody(AppState &st) {
 
     // Title.
     ImGui::PushFont(st.fonts.medium);
-    pushDimText();
-    ImGui::TextUnformatted("New study");
-    popDimText();
+    kit::dimText("New study");
     ImGui::PopFont();
     ImGui::Dummy(ImVec2(0, 2.0f * S2));
 
@@ -5334,11 +5342,8 @@ void SimManager::drawTreeBody(AppState &st) {
     for (const auto &e : kEntries)
       maxNameW = std::max(maxNameW, ImGui::CalcTextSize(e.name).x);
     if (kEntries.empty()) {
-      pushDimText();
-      ImGui::TextWrapped(
-          "Open a part, assembly, schematic, PCB or firmware project to "
-          "see the study kinds it unlocks.");
-      popDimText();
+      kit::dimText("Open a part, assembly, schematic, PCB or firmware project "
+                   "to see the study kinds it unlocks.");
     }
     ImGui::PopFont();
     const float descOffset = iconSz + 8.0f * S2 + maxNameW + 14.0f * S2;
@@ -5437,22 +5442,17 @@ void SimManager::drawTreeBody(AppState &st) {
   }
 
   if (!st.docMirror.hasDoc()) {
-    pushDimText();
-    ImGui::TextWrapped(
+    kit::dimText(
         "Open a part or assembly to set up mechanical studies. Electronics "
         "docs unlock circuit simulation and emulation in the picker above.");
-    popDimText();
     return;
   }
   if (studies_.empty()) {
     // FM chrome convention: Spacing alone separates — no orphaned hairline under the button.
     ImGui::Spacing();
-    pushDimText(); // pane surface — dim the ADAPTIVE ink, not the theme textDim
-                   // role
-    ImGui::TextWrapped("No studies yet. Create a study above to add fixtures, "
-                       "loads, and run an "
-                       "analysis. Studies are saved inside this part file.");
-    popDimText();
+    kit::dimText("No studies yet. Create a study above to add fixtures, "
+                 "loads, and run an "
+                 "analysis. Studies are saved inside this part file.");
     return;
   }
 
@@ -5867,17 +5867,18 @@ void SimManager::drawMaterialCombo(AppState &st, Study &s) {
   // Transparency: show the resolved properties of the selected material inline.
   if (mi >= 0) {
     const auto &m = mats[mi];
-    pushDimText();
-    ImGui::TextWrapped(
-        "E %.0f MPa  -  nu %.2f  -  yield %.0f MPa  -  rho %.2f g/cm3", m.E_mpa,
-        m.nu, m.yield_mpa, m.density_g_cm3);
-    popDimText();
+    char buf[192];
+    std::snprintf(buf, sizeof(buf),
+                  "E %.0f MPa  -  nu %.2f  -  yield %.0f MPa  -  rho %.2f g/cm3",
+                  m.E_mpa, m.nu, m.yield_mpa, m.density_g_cm3);
+    kit::dimText(buf);
   } else if (!s.materialKey.empty()) {
-    pushDimText();
-    ImGui::TextWrapped(
+    char buf[256];
+    std::snprintf(
+        buf, sizeof(buf),
         "Part material '%s' is not in the library — pick a library material.",
         s.materialKey.c_str());
-    popDimText();
+    kit::dimText(buf);
   }
 }
 
@@ -5887,12 +5888,13 @@ void SimManager::drawWellRow(AppState &st, const char *label, SimWell &well,
   const bool armed = (armedWell_ == armId);
   ImGui::TextUnformatted(label);
   simTip(tip);
-  // Active selection box: armed = accent border + "Selecting…" hint.
-  ImGui::PushStyleColor(ImGuiCol_Button,
-                        armed ? ImVec4(ui::palette.accent[0],
-                                       ui::palette.accent[1],
-                                       ui::palette.accent[2], 0.85f)
-                              : ImGui::GetStyleColorVec4(ImGuiCol_Button));
+  // Active selection box: armed = accent border + "Selecting…" hint. Only the
+  // armed state overrides the button role; unarmed leaves the style untouched.
+  if (armed) {
+    float a[4];
+    Palette::withAlpha(ui::palette.accent, a, 0.85f);
+    ImGui::PushStyleColor(ImGuiCol_Button, simRole(a));
+  }
   if (ImGui::Button(armed ? "Selecting faces… (click viewport)" : "Add faces",
                     ImVec2(-FLT_MIN, 0))) {
     const bool nowArmed = !armed;
@@ -5901,7 +5903,8 @@ void SimManager::drawWellRow(AppState &st, const char *label, SimWell &well,
       st.selection
           .clear(); // fresh well — no carryover from a previously-picked face
   }
-  ImGui::PopStyleColor();
+  if (armed)
+    ImGui::PopStyleColor();
   simTip(
       armed
           ? "Click faces in the viewport to add them. Click here again to stop."
@@ -6487,9 +6490,10 @@ void SimManager::drawFatigueForm(AppState &st, Study &s) {
                  kd = marin_kd(s.fatigueTempC);
     const double SeC = ka * kb * kc * kd * Seb;
     ImGui::Spacing();
-    pushDimText();
-    ImGui::TextWrapped("ka %.2f  kb %.2f  kc %.2f  kd %.2f", ka, kb, kc, kd);
-    popDimText();
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "ka %.2f  kb %.2f  kc %.2f  kd %.2f", ka,
+                  kb, kc, kd);
+    kit::dimText(buf);
     ImGui::Text("Corrected Se = %.0f %s", SeC * u.stressFromMpa, u.stress);
     simTip("Se = ka.kb.kc.kd . Se'. This is the endurance limit used for life "
            "+ factor of safety "
@@ -6613,15 +6617,18 @@ void SimManager::drawFatigueGraphs(AppState &st, Study &s) {
   Palette::withAlpha(ui::palette.statusWarn, warnA, 0.8f);
   const ImU32 ptCol = Palette::toU32(ui::palette.statusErr);
   const ImU32 yieldCol = Palette::toU32(warnA),
-              bandCol = IM_COL32(90, 170, 250, 55);
-  const ImU32 tcol[5] = {
-      IM_COL32(90, 170, 250, 255), IM_COL32(120, 210, 120, 255),
-      IM_COL32(240, 140, 60, 255), IM_COL32(200, 120, 230, 255),
-      IM_COL32(230, 90, 90, 255)};
-  const ImU32 tdim[5] = {
-      IM_COL32(90, 170, 250, 120), IM_COL32(120, 210, 120, 120),
-      IM_COL32(240, 140, 60, 120), IM_COL32(200, 120, 230, 120),
-      IM_COL32(230, 90, 90, 120)};
+              bandCol = simRoleU32(ui::palette.axisZ, 0.216f);
+  // 5-hue categorical ramp for the theory traces. Borrowed from the
+  // orientation-triad + CAM roles — the palette's only theme-aware categorical
+  // hues — until it gains a dedicated chart-series ramp.
+  const float *const tramp[5] = {ui::palette.axisZ, ui::palette.axisY,
+                                 ui::palette.statusWarn, ui::palette.camArc,
+                                 ui::palette.axisX};
+  ImU32 tcol[5], tdim[5];
+  for (int i = 0; i < 5; ++i) {
+    tcol[i] = simRoleU32(tramp[i]);
+    tdim[i] = simRoleU32(tramp[i], 0.47f);
+  }
 
   // ---- life-estimate band per theory (low / median / high cycles) ----
   ImGui::SeparatorText("Life estimate (low / median / high)");
@@ -7169,8 +7176,10 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
   flowIncomingDir(s, dir);
   float density, visc;
   flowFluidProps(s, density, visc);
-  pushDimText();
-  ImGui::Text("Incoming flow: (%.2f, %.2f, %.2f)", dir[0], dir[1], dir[2]);
+  char buf[128];
+  std::snprintf(buf, sizeof(buf), "Incoming flow: (%.2f, %.2f, %.2f)", dir[0],
+                dir[1], dir[2]);
+  kit::dimText(buf);
   // Reynolds estimate off the model's bounding diagonal (a stand-in for the
   // characteristic length).
   float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
@@ -7186,9 +7195,10 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
     float Lc = std::max({hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]}) *
                1e-3f; // mm -> m
     double Re = (double)s.flowSpeed * Lc / visc;
-    ImGui::Text("Re ~ %.0f  |  rho %.3g kg/m3", Re, density);
+    std::snprintf(buf, sizeof(buf), "Re ~ %.0f  |  rho %.3g kg/m3", Re,
+                  density);
+    kit::dimText(buf);
   }
-  popDimText();
   (void)S;
 }
 
@@ -7935,12 +7945,10 @@ void SimManager::drawForm(AppState &st, Study &s) {
           "strut-like parts.");
       if (capsStatus_ == 1 && caps_.contains("ccx") &&
           !caps_["ccx"].value("found", false)) {
-        pushDimText();
-        ImGui::TextWrapped(
-            "%s", caps_["ccx"]
-                      .value("hint", std::string("CalculiX (ccx) not found."))
-                      .c_str());
-        popDimText();
+        kit::dimText(
+            caps_["ccx"]
+                .value("hint", std::string("CalculiX (ccx) not found."))
+                .c_str());
       }
       ImGui::SeparatorText("Compressive load");
       ImGui::SetNextItemWidth(-FLT_MIN);
@@ -7966,12 +7974,10 @@ void SimManager::drawForm(AppState &st, Study &s) {
           "transmits the applied load into the support (reaction = applied).");
       if (capsStatus_ == 1 && caps_.contains("ccx") &&
           !caps_["ccx"].value("found", false)) {
-        pushDimText();
-        ImGui::TextWrapped(
-            "%s", caps_["ccx"]
-                      .value("hint", std::string("CalculiX (ccx) not found."))
-                      .c_str());
-        popDimText();
+        kit::dimText(
+            caps_["ccx"]
+                .value("hint", std::string("CalculiX (ccx) not found."))
+                .c_str());
       }
       ImGui::SeparatorText("Contact pressure");
       ImGui::SetNextItemWidth(-FLT_MIN);
@@ -9167,7 +9173,7 @@ void SimManager::drawMotionResults(AppState &st, Study &s) {
                                    static_cast<float>(nFrames - 1));
         ImGui::GetWindowDrawList()->AddLine(
             ImVec2(xCur, rMin.y), ImVec2(xCur, rMax.y),
-            IM_COL32(255, 200, 80, 200), 1.5f * S);
+            simRoleU32(ui::palette.statusWarn, 0.784f), 1.5f * S);
       }
     }
   }
@@ -9334,11 +9340,12 @@ void SimManager::drawProvenance(const nlohmann::json &result) {
   if (env.contains("source") && env["source"].is_object())
     src = env["source"].value("domain", std::string("?")) + "/" +
           env["source"].value("tool", std::string("?"));
-  pushDimText();
-  ImGui::TextWrapped(
+  char buf[256];
+  std::snprintf(
+      buf, sizeof(buf),
       "Provenance: %s \xe2\x80\x94 from %s (aicad.simhandoff/1, id %s)",
       coupling.c_str(), src.c_str(), env.value("id", std::string("?")).c_str());
-  popDimText();
+  kit::dimText(buf);
 }
 
 // ---------------------------------------------------------------- thermal FEA
@@ -9866,9 +9873,7 @@ void SimManager::drawAdvancedResults(AppState &st, Study &s) {
       }
       ImGui::EndTable();
     }
-    pushDimText();
-    ImGui::TextWrapped("%s", res.value("note", std::string()).c_str());
-    popDimText();
+    kit::dimText(res.value("note", std::string()).c_str());
   } else if (s.type == StudyType::Contact && res.is_object()) {
     ImGui::SeparatorText("Contact conservation check");
     double applied = 0.0, reaction = 0.0;
@@ -9881,9 +9886,7 @@ void SimManager::drawAdvancedResults(AppState &st, Study &s) {
       ImGui::Text("Base reaction: %.4g N", reaction);
     if (!haveApplied || !haveReaction)
       ImGui::TextDisabled("Reaction audit unavailable in this saved result.");
-    pushDimText();
-    ImGui::TextWrapped("%s", res.value("note", std::string()).c_str());
-    popDimText();
+    kit::dimText(res.value("note", std::string()).c_str());
   } else if (s.type == StudyType::FreqResponse && res.is_object()) {
     ImGui::SeparatorText("Harmonic response");
     if (!s.frSweep.empty() && s.frSweep.size() == s.frAccel.size())
@@ -9896,17 +9899,12 @@ void SimManager::drawAdvancedResults(AppState &st, Study &s) {
         std::snprintf(b, sizeof(b), " %.1f", v);
         f += b;
       }
-      pushDimText();
-      ImGui::TextWrapped("%s", f.c_str());
-      popDimText();
+      kit::dimText(f.c_str());
     }
-    pushDimText();
-    ImGui::TextWrapped("%s",
-                       res.value("damping_assumption", std::string()).c_str());
-    ImGui::TextWrapped(
+    kit::dimText(res.value("damping_assumption", std::string()).c_str());
+    kit::dimText(
         "Random (PSD) response needs a qualification-spec PSD — run "
         "run_fea_frequency_response via the copilot with psd_breakpoints.");
-    popDimText();
   } else if (s.type == StudyType::ThermalFea && res.is_object()) {
     ImGui::SeparatorText(s.thermTransient ? "Transient conduction"
                                           : "Steady conduction");
@@ -9918,16 +9916,12 @@ void SimManager::drawAdvancedResults(AppState &st, Study &s) {
     if (res.contains("n_steps"))
       ImGui::Text("Time steps: %d", res.value("n_steps", 0));
     ImGui::Text("Nodes %d | elements %d", s.nNodes, s.nElems);
-    pushDimText();
-    ImGui::TextWrapped(
+    kit::dimText(
         "The temperature field colormap overlay is not packaged by the "
         "conduction solver yet — numeric summary + flux audit only.");
-    popDimText();
   }
   for (const auto &n : s.solverNotes) {
-    pushDimText();
-    ImGui::TextWrapped("%s", n.c_str());
-    popDimText();
+    kit::dimText(n.c_str());
   }
   drawProvenance(res);
 }
@@ -10177,12 +10171,10 @@ void SimManager::drawElectronicsPanel(AppState &st) {
         !st.docTabs[i].ecadDocId.empty())
       schTabs.push_back(i);
   if (schTabs.empty()) {
-    pushDimText();
-    ImGui::TextWrapped(
+    kit::dimText(
         "No schematic open. SPICE simulation runs on a Schematic document's "
         "netlist \xe2\x80\x94 open the board's schematic tab (a PCB alone has "
         "no simulatable devices).");
-    popDimText();
     return;
   }
   if (el_.docTab < 0 ||
@@ -10473,13 +10465,10 @@ void SimManager::drawEmulationPanel(AppState &st) {
   if (fwStatus_ < 0 || !fwCanEmulate_) {
     // Honest doctor state: the run leg is missing — show the guidance, no dead
     // buttons.
-    pushDimText();
-    ImGui::TextWrapped("%s", fwHint_.empty()
-                                 ? "Emulation backend unavailable \xe2\x80\x94 "
+    kit::dimText(fwHint_.empty() ? "Emulation backend unavailable \xe2\x80\x94 "
                                    "install Renode (preferred) or "
                                    "qemu-system-arm, then Recheck."
                                  : fwHint_.c_str());
-    popDimText();
     if (ImGui::SmallButton("Recheck")) {
       fwStatus_ = 0;
       probeFwStatus(st);
@@ -10491,11 +10480,8 @@ void SimManager::drawEmulationPanel(AppState &st) {
     return;
   }
   if (fwsim_.projectIds.empty()) {
-    pushDimText();
-    ImGui::TextWrapped(
-        "No firmware projects yet \xe2\x80\x94 create one in the Firmware "
-        "workspace (its New Project rail), then come back.");
-    popDimText();
+    kit::dimText("No firmware projects yet \xe2\x80\x94 create one in the "
+                 "Firmware workspace (its New Project rail), then come back.");
     return;
   }
   if (fwsim_.projIdx >= (int)fwsim_.projectIds.size())
@@ -10803,11 +10789,9 @@ void SimManager::drawHandoffPanel(AppState &st) {
         !ho_.ecadDocTitle.empty() ? ho_.ecadDocTitle : ho_.ecadDocId;
     ImGui::Text("Board: %s (not open)",
                 label.empty() ? "(source unavailable)" : label.c_str());
-    pushDimText();
-    ImGui::TextWrapped(
+    kit::dimText(
         "The source board was closed or replaced. Reopen it and start a new "
         "handoff; another tab will never be substituted.");
-    popDimText();
   }
   static const char *kEnvLabels[3] = {"Still air (h=10)", "Forced air (h=50)",
                                       "Cold plate (bottom held)"};
@@ -10832,15 +10816,15 @@ void SimManager::drawHandoffPanel(AppState &st) {
   if (capsStatus_ == 0) {
     ImGui::TextDisabled("Checking the handoff seam\xe2\x80\xa6");
   } else if (!seamUp) {
-    pushDimText();
-    ImGui::TextWrapped(
-        "ECAD \xe2\x86\x92 thermal handoff unavailable: %s",
-        capsStatus_ == 1
-            ? caps_["handoffs"]["ecad_thermal"]
-                  .value("hint", std::string("worker seam missing"))
-                  .c_str()
-            : "worker unreachable (sim_caps probe failed)");
-    popDimText();
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "ECAD \xe2\x86\x92 thermal handoff unavailable: %s",
+                  capsStatus_ == 1
+                      ? caps_["handoffs"]["ecad_thermal"]
+                            .value("hint", std::string("worker seam missing"))
+                            .c_str()
+                      : "worker unreachable (sim_caps probe failed)");
+    kit::dimText(buf);
   } else {
     const bool disabled = ho_.running || !sourceOpen;
     if (disabled)
@@ -10941,9 +10925,7 @@ void SimManager::drawHandoffPanel(AppState &st) {
     ImGui::EndDisabled();
   simTip(hsReason.c_str());
   if (!hsReason.empty()) {
-    pushDimText();
-    ImGui::TextWrapped("%s", hsReason.c_str());
-    popDimText();
+    kit::dimText(hsReason.c_str());
   }
 
   ImGui::Spacing();
@@ -10954,12 +10936,12 @@ void SimManager::drawHandoffPanel(AppState &st) {
     const std::string resultDocId =
         ho_.result.value("doc_id", std::string());
     if (!resultDocId.empty() && resultDocId != ho_.ecadDocId) {
-      pushDimText();
-      ImGui::TextWrapped(
-          "The retained thermal result belongs to ECAD document %s, not the "
-          "currently selected source.",
-          resultDocId.c_str());
-      popDimText();
+      char buf[192];
+      std::snprintf(buf, sizeof(buf),
+                    "The retained thermal result belongs to ECAD document %s, "
+                    "not the currently selected source.",
+                    resultDocId.c_str());
+      kit::dimText(buf);
     }
   }
   if (ho_.result.is_object() && ho_.result.value("ok", false)) {
@@ -11003,9 +10985,7 @@ void SimManager::drawHandoffPanel(AppState &st) {
     if (ho_.result.contains("warnings") && ho_.result["warnings"].is_array()) {
       for (const auto &w : ho_.result["warnings"])
         if (w.is_string()) {
-          pushDimText();
-          ImGui::TextWrapped("%s", w.get<std::string>().c_str());
-          popDimText();
+          kit::dimText(w.get<std::string>().c_str());
         }
     }
     drawProvenance(ho_.result);

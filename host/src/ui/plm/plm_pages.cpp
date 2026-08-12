@@ -73,64 +73,49 @@ int plmSeverityRank(const std::string& sev) {
     if (sev == "med") return 2; return 3;
 }
 
-// A self-bounding "card": an auto-height bordered child whose background is a
-// priority-coloured liquid-glass gradient (frosted base + a vertical colour wash,
-// brighter at the top). Because AutoResizeY means the height isn't known until the
-// content is laid out, the gradient is painted in plmCardEnd on a *background*
-// draw-channel (channel 0, under the content on channel 1) once the size is final.
-// `tint` (a palette float[4]) selects the wash colour; nullptr = neutral.
-struct PlmCardStyle { float r, g, b, a; };
-static std::vector<PlmCardStyle> s_cardStyleStack;
+// A self-bounding "card": ui::kit::cardBegin IS this idiom — the wave-0 kit absorbed the
+// AutoResizeY child, the deferred background draw-channel and the glassCardWash + tint gradient
+// from right here. What stays local is what the kit has no parameter for: the SELECTED ring
+// (ui::glassSelectionGlow, the app's one selected look) and the click-anywhere-in-the-card hit
+// test plmCardEnd reports back for row selection.
+static std::vector<bool> s_cardSel;
 
 void plmCardBegin(const char* id, bool sel, float padX = 8.0f, float padY = 6.0f,
                   const float* tint = nullptr, float tintA = 0.20f) {
-    const float S = ui::uiScale;
-    const float* tc = sel ? palette.accent : (tint ? tint : palette.text);
-    // Transparent native body (we paint our own gradient); border echoes the tint.
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_Border,
-        sel ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.60f)
-            : ImVec4(tc[0], tc[1], tc[2], tint ? 0.40f : 0.14f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f * S);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX * S, padY * S));
-    ImGui::BeginChild(id, ImVec2(0, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
-    // Content draws on the foreground channel; the gradient goes behind it in End.
-    // Split + merge are unconditional and paired (End always merges).
-    ImGui::GetWindowDrawList()->ChannelsSplit(2);
-    ImGui::GetWindowDrawList()->ChannelsSetCurrent(1);
-    const float baseA = sel ? 0.28f : (tint ? tintA : 0.055f);
-    s_cardStyleStack.push_back({tc[0], tc[1], tc[2], baseA});
+    // The pads the call sites pass are a density HINT, not free geometry: 3-5dp is the dense
+    // activity/commit rhythm (Compact), 6dp the task/issue/release card rhythm (Cozy). From there
+    // the padding, corner and wash are the kit's. tintA has no kit equivalent — the shared card
+    // wash is one strength app-wide, and the tint HUE is what carries the priority/severity.
+    ui::kit::pushDensity(padY <= 5.0f ? ui::kit::Density::Compact : ui::kit::Density::Cozy);
+    (void)padX;
+    (void)tintA;
+    ui::kit::cardBegin(id, /*title=*/nullptr, /*icon=*/nullptr, /*open=*/nullptr,
+                       sel ? palette.accent : tint);
+    s_cardSel.push_back(sel);
 }
 
-// Close a card opened with plmCardBegin. Paints the deferred liquid-glass gradient
-// on the background channel, merges, then returns true if the card body was clicked
-// outside any inner widget (for row/card selection).
+// Close a card opened with plmCardBegin. Returns true if the card body was clicked outside any
+// inner widget (for row/card selection).
 bool plmCardEnd(float gap = 3.0f) {
-    const float S = ui::uiScale;
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    PlmCardStyle cs = s_cardStyleStack.empty()
-        ? PlmCardStyle{palette.text[0], palette.text[1], palette.text[2], 0.055f}
-        : s_cardStyleStack.back();
-    if (!s_cardStyleStack.empty()) s_cardStyleStack.pop_back();
+    const bool sel = !s_cardSel.empty() && s_cardSel.back();
+    if (!s_cardSel.empty()) s_cardSel.pop_back();
 
-    ImVec2 mn = ImGui::GetWindowPos();
-    ImVec2 sz = ImGui::GetWindowSize();
-    ImVec2 mx(mn.x + sz.x, mn.y + sz.y);
-    (void)S;
-    dl->ChannelsSetCurrent(0);                 // background, under the content
-    const float tint[3] = {cs.r, cs.g, cs.b};
-    ui::glassCardWash(dl, mn, mx, 6.0f, tint, cs.a);   // shared liquid-glass card style
-    dl->ChannelsMerge();
-
-    bool clicked = ImGui::IsWindowHovered() &&
-                   ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-                   !ImGui::IsAnyItemHovered();
-    ImGui::EndChild();
-    ImGui::PopStyleVar(3);
-    ImGui::PopStyleColor(2);
-    ImGui::Dummy(ImVec2(0, gap * S));
+    // Hit test and rect must both be read while the card's child window is still current.
+    const bool clicked = ImGui::IsWindowHovered() &&
+                         ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                         !ImGui::IsAnyItemHovered();
+    if (sel) {
+        // Drawn on the CONTENT channel so it lands above the wash cardEnd paints behind it; the
+        // rings step inward from the edge, well outside the card's content padding.
+        const ImVec2 mn = ImGui::GetWindowPos();
+        const ImVec2 sz = ImGui::GetWindowSize();
+        ui::glassSelectionGlow(ImGui::GetWindowDrawList(), mn,
+                               ImVec2(mn.x + sz.x, mn.y + sz.y),
+                               ui::kit::rowRound() / ui::uiScale, palette.accent);
+    }
+    ui::kit::cardEnd();
+    ui::kit::popDensity();
+    ImGui::Dummy(ImVec2(0, gap * ui::uiScale));
     return clicked;
 }
 

@@ -879,14 +879,21 @@ bool segmented(const char* id, const char* const* labels, int count, int* select
 
     const float h   = ImGui::GetFrameHeight();
     const float pX  = padX();
-    float       w   = width > 0.0f ? width : 0.0f;
-    if (width <= 0.0f) {
+    // Segments are equal width, so the width that matters is the WIDEST label's — not the
+    // average. Summing every label and then dividing by count (what this did) gives each segment
+    // the mean width, so any set with one long and two short labels elides the long one:
+    // {"Links","All","Assembly"} rendered as "Asse...". An explicit `width` still wins, and is
+    // still divided evenly, because a caller passing one is fitting a known column.
+    float segW = 0.0f;
+    if (width > 0.0f) {
+        segW = width / (float)count;
+    } else {
         for (int i = 0; i < count; ++i)
-            w += ImGui::CalcTextSize(labels[i] ? labels[i] : "").x + pX * 2.0f;
+            segW = ImMax(segW, ImGui::CalcTextSize(labels[i] ? labels[i] : "").x);
+        segW += pX * 2.0f;
     }
-    const float minW = ui::metrics::stroke(1.0f) * (float)count;
-    if (w < minW) w = minW;
-    const float segW = w / (float)count;
+    segW = ImMax(segW, ui::metrics::stroke(1.0f));
+    const float w = segW * (float)count;
 
     const int   sel = ImClamp(*selected, 0, count - 1);
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -965,7 +972,14 @@ bool popoverBegin(const char* id, const char* label, const char* icon, int activ
     const float  gap    = ui::metrics::U(1.0f);
     const float  glyph  = (icon && icon[0]) ? ui::metrics::iconHeader() : 0.0f;
     const ImVec2 ts     = ImGui::CalcTextSize(lab);
-    const float  w      = pX * 2.0f + ts.x + (glyph > 0.0f ? glyph + gap : 0.0f);
+    // The count badge lives INSIDE the button's top-right corner, so its width has to be
+    // reserved here or it sits on top of the label. It used to be drawn hanging off the
+    // button's outer edge, which put it above the row's clip rect and clipped its top half off.
+    const std::string bnum   = activeCount > 0 ? fmtCount((long long)activeCount) : std::string();
+    const float       badgeW =
+        bnum.empty() ? 0.0f : ImGui::CalcTextSize(bnum.c_str()).x + ui::metrics::U(1.5f);
+    const float  w      = pX * 2.0f + ts.x + (glyph > 0.0f ? glyph + gap : 0.0f) +
+                          (badgeW > 0.0f ? badgeW + gap : 0.0f);
 
     const ImVec2 p0      = ImGui::GetCursorScreenPos();
     const bool   pressed = ImGui::InvisibleButton("##kit_poptrigger", ImVec2(w, h));
@@ -989,16 +1003,18 @@ bool popoverBegin(const char* id, const char* label, const char* icon, int activ
     }
     dl->AddText(ImVec2(x, p0.y + (h - ts.y) * 0.5f), roleU32(palette.text), lab);
 
-    // A collapsed popover must never hide the fact that its filters are ON.
-    if (activeCount > 0) {
-        const std::string   n  = fmtCount((long long)activeCount);
-        const ImVec2        bs = ImGui::CalcTextSize(n.c_str());
-        const float         bp = ui::metrics::U(0.5f);
-        const ImVec2        b1(p1.x + bp, p0.y + bs.y * 0.5f + bp * 2.0f);
-        const ImVec2        b0(b1.x - (bs.x + bp * 2.0f), b1.y - (bs.y + bp));
-        dl->AddRectFilled(b0, b1, roleU32(palette.accent), (b1.y - b0.y) * 0.5f);
-        dl->AddText(ImVec2(b0.x + bp, b0.y + bp * 0.5f),
-                    u32(ui::maxContrastTextOn(roleVec(palette.accent))), n.c_str());
+    // A collapsed popover must never hide the fact that its filters are ON. Vertically CENTRED and
+    // fully inside the button, in the width reserved above: a corner badge that overhangs the
+    // frame gets clipped by whatever row the button sits in, which is what happened on the PLM
+    // graph toolbar (the count's top half was sliced off by the toolbar's own clip rect).
+    if (!bnum.empty()) {
+        const ImVec2 bs = ImGui::CalcTextSize(bnum.c_str());
+        const float  bh = bs.y + ui::metrics::U(0.5f);
+        const ImVec2 b1(p1.x - pX, p0.y + (h + bh) * 0.5f);
+        const ImVec2 b0(b1.x - badgeW, b1.y - bh);
+        dl->AddRectFilled(b0, b1, roleU32(palette.accent), bh * 0.5f);
+        dl->AddText(ImVec2(b0.x + (badgeW - bs.x) * 0.5f, b0.y + (bh - bs.y) * 0.5f),
+                    u32(ui::maxContrastTextOn(roleVec(palette.accent))), bnum.c_str());
     }
 
     if (pressed) ImGui::OpenPopup("##kit_popover_body");

@@ -41,6 +41,7 @@
 #include "stb_image.h"
 #include "ui/anim.h"
 #include "ui/icons.h"
+#include "ui/metrics.h"
 #include "ui/tesseract.h"
 #include "ui/widgets/kit.h"
 #include "ui_theme.h"
@@ -304,6 +305,15 @@ struct GraphTabState {
   bool wasSettled = true;
   // Once the user pans/zooms, never auto-fit again until scope/project change.
   bool userNavigated = false;
+  // Legend card: a bottom-left canvas overlay, collapsed to an icon chip by
+  // default so it stops covering the graph it explains.
+  bool legendOpen = false;
+  // '/' focuses the search field — SetKeyboardFocusHere has to run in the
+  // frame that submits the widget, so the key handler defers through this.
+  bool focusSearchPending = false;
+  // Delete on a selected authored link raises the SAME confirmation the
+  // inspector's popover trigger opens.
+  bool linkRemoveConfirm = false;
 };
 
 // List view auto-threshold (user can still force Graph view).
@@ -2736,6 +2746,82 @@ void requestKeywordRemove(AppState &st, const std::string &target,
   });
 }
 
+// ---- filter bookkeeping -----------------------------------------------------
+// Every display filter now lives inside one toolbar popover, so the popover
+// badge and the blocked-canvas message are the only things left telling the
+// user a filter is on. Both read from here.
+int activeFilterCount(const GraphTabState &G, bool graphMode) {
+  int n = 0;
+  if (G.hideArchive)
+    ++n;
+  if (graphMode && G.hideUnconnected)
+    ++n;
+  n += (int)G.hiddenKinds.size();
+  n += (int)G.kindFilter.size();
+  if (G.search[0])
+    ++n;
+  return n;
+}
+
+std::string activeFilterSummary(const GraphTabState &G) {
+  std::string s;
+  auto add = [&](const std::string &t) {
+    if (!s.empty())
+      s += " \xc2\xb7 ";
+    s += t;
+  };
+  if (G.hideArchive)
+    add("hiding archive/stale");
+  if (G.hideUnconnected)
+    add("hiding unconnected nodes");
+  if (!G.hiddenKinds.empty())
+    add(std::to_string(G.hiddenKinds.size()) + " relation kinds hidden");
+  if (!G.kindFilter.empty())
+    add(std::to_string(G.kindFilter.size()) + " node kinds selected");
+  if (G.search[0])
+    add(std::string("search \"") + G.search + "\"");
+  if (G.asmView)
+    add("assembly structure only");
+  if (s.empty())
+    return "No filters are active.";
+  return "Active: " + s + ".";
+}
+
+void clearAllFilters(AppState &st, GraphTabState &G) {
+  // include_archive is a BACKEND walk policy, so dropping it needs a refetch;
+  // everything else is a local visibility rebuild.
+  const bool refetch = G.hideArchive;
+  G.hideArchive = false;
+  G.hideUnconnected = false;
+  G.hiddenKinds.clear();
+  G.kindFilter.clear();
+  G.search[0] = 0;
+  G.matchDirty = true;
+  if (refetch) {
+    G.lastFetch = -1e9;
+    requestGraph(st, /*force=*/true);
+  } else {
+    rebuildVisible(G);
+  }
+  G.layoutDirty = true;
+}
+
+// link_id of the selected edge when it is a hand-authored overlay link (the
+// only kind that can be removed at all); empty otherwise.
+std::string selectedAuthoredLinkId(const GraphTabState &G) {
+  if (G.selectedEdge < 0 || G.selectedEdge >= (int)G.visibleEdges.size())
+    return {};
+  const VEdge &ve = G.visibleEdges[G.selectedEdge];
+  if (ve.aggCount > 1 || ve.srcEdgeIdx < 0 ||
+      ve.srcEdgeIdx >= (int)G.edges.size())
+    return {};
+  const GEdge &e = G.edges[ve.srcEdgeIdx];
+  if (e.origin != "manual" && e.origin != "ai")
+    return {};
+  return e.meta.is_object() ? e.meta.value("link_id", std::string())
+                            : std::string();
+}
+
 // Local glass action button — supports optional atlas icon (matches
 // plmGlassButton).
 bool graphGlassButton(const char *id, const char *label, bool accent = false,
@@ -2782,85 +2868,6 @@ bool graphGlassButton(const char *id, const char *label, bool accent = false,
   if (textW > 0)
     dl->AddText(ImVec2(x, p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f), tcol,
                 label);
-  return clicked;
-}
-
-// Segmented 2D|3D mode switch: two segments under one shared glass frame;
-// the active segment uses the same accent fill as an accent graphGlassButton
-// (the active view-chip style). Returns 0 when 2D was clicked, 1 for 3D,
-// -1 otherwise.
-int graphModeSegment(const char *id, bool view3d) {
-  const float S = ui::uiScale;
-  ImDrawList *dl = ImGui::GetWindowDrawList();
-  const float h = ImGui::GetFrameHeight();
-  const float iconSz = 14.0f * S;
-  const float iconGap = 5.0f * S;
-  const float padX = 10.0f * S;
-  const char *labels[2] = {"2D", "3D"};
-  const char *icons[2] = {"plane", "view_cube"};
-  const char *tips[2] = {
-      "2D force layout (flat x/y). Drag nodes to rearrange.",
-      "3D force layout: physics runs on x/y/z. Left-drag orbits,\n"
-      "right-drag pans, Shift+drag moves a node in depth."};
-  float segW[2], w = 0.0f;
-  for (int i = 0; i < 2; ++i) {
-    segW[i] = padX * 2.0f + iconSz + iconGap + ImGui::CalcTextSize(labels[i]).x;
-    w += segW[i];
-  }
-  const ImVec2 p0 = ImGui::GetCursorScreenPos();
-  const ImVec2 p1(p0.x + w, p0.y + h);
-  ui::glassBackground(dl, p0, p1, 9.0f); // one shared frame
-  const float rnd = 9.0f * S;
-  int clicked = -1;
-  float x = p0.x;
-  ImGui::PushID(id);
-  for (int i = 0; i < 2; ++i) {
-    const bool active = (i == 1) == view3d;
-    const ImVec2 s0(x, p0.y), s1(x + segW[i], p0.y + h);
-    ImGui::SetCursorScreenPos(s0);
-    ImGui::PushID(i);
-    if (ImGui::InvisibleButton("##seg", ImVec2(segW[i], h)))
-      clicked = i;
-    ImGui::PopID();
-    const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-      ImGui::SetTooltip("%s", tips[i]);
-    const ImDrawFlags corners =
-        i == 0 ? ImDrawFlags_RoundCornersLeft : ImDrawFlags_RoundCornersRight;
-    if (active) {
-      const float a = held ? 0.92f : hov ? 0.80f : 0.66f;
-      dl->AddRectFilled(
-          s0, s1,
-          ImGui::GetColorU32(ImVec4(palette.accent[0], palette.accent[1],
-                                    palette.accent[2], a)),
-          rnd, corners);
-    } else if (hov) {
-      dl->AddRectFilled(
-          s0, s1,
-          ImGui::GetColorU32(ImVec4(palette.text[0], palette.text[1],
-                                    palette.text[2], held ? 0.10f : 0.06f)),
-          rnd, corners);
-    }
-    const ImU32 tcol =
-        active ? IM_COL32(255, 255, 255, 255) : Palette::toU32(palette.text);
-    const float content = iconSz + iconGap + ImGui::CalcTextSize(labels[i]).x;
-    float cx = x + (segW[i] - content) * 0.5f;
-    ui::drawIconGlass(dl, icons[i], ImVec2(cx + iconSz * 0.5f, p0.y + h * 0.5f),
-                      iconSz, tcol, 0);
-    cx += iconSz + iconGap;
-    dl->AddText(ImVec2(cx, p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f),
-                tcol, labels[i]);
-    x += segW[i];
-  }
-  ImGui::PopID();
-  // Segment divider.
-  dl->AddLine(ImVec2(p0.x + segW[0], p0.y + 5.0f * S),
-              ImVec2(p0.x + segW[0], p1.y - 5.0f * S),
-              ImGui::GetColorU32(ImVec4(palette.textDisabled[0],
-                                        palette.textDisabled[1],
-                                        palette.textDisabled[2], 0.35f)));
-  ImGui::SetCursorScreenPos(p0);
-  ImGui::Dummy(ImVec2(w, h)); // reserve the rect the buttons were drawn over
   return clicked;
 }
 
@@ -3480,17 +3487,21 @@ void rebuildMatchCache(GraphTabState &G) {
   G.matchDirty = false;
 }
 
-void drawLegend(ImDrawList *dl, ImVec2 origin, bool projectScope) {
-  const float S = ui::uiScale;
-  // Scope note + edge styles + kinds actually shown in this view.
-  struct Row {
-    const char *label;
-    ImU32 col;
-    bool dashed;
-    bool isNode;
-    bool header;
-  };
-  std::vector<Row> rows;
+// ---- legend -----------------------------------------------------------------
+// Row model shared by the builder and the painter, so the card's height is
+// DERIVED from the rows it will actually paint. The previous canvas painter
+// offset itself by a hardcoded 232 px that clipped or left dead space the
+// moment a row was added or removed.
+struct LegendRow {
+  const char *label;
+  ImU32 col;
+  bool dashed;
+  bool isNode;
+  bool header;
+};
+
+std::vector<LegendRow> legendRows(bool projectScope) {
+  std::vector<LegendRow> rows;
   rows.push_back({projectScope ? "Project view" : "Document view",
                   Palette::toU32(palette.textDim), false, false, true});
   rows.push_back(
@@ -3507,7 +3518,8 @@ void drawLegend(ImDrawList *dl, ImVec2 origin, bool projectScope) {
     rows.push_back({"file", kindColor("file"), false, true, false});
     rows.push_back({"keyword", kindColor("keyword"), false, true, false});
     rows.push_back(
-        {"(agg ×N)", edgeColor("REFERENCES", 0.85f), false, false, false});
+        {"(agg \xc3\x97N)", edgeColor("REFERENCES", 0.85f), false, false,
+         false});
   } else {
     rows.push_back({"feature", kindColor("feature"), false, true, false});
     rows.push_back({"sketch", kindColor("sketch"), false, true, false});
@@ -3515,33 +3527,93 @@ void drawLegend(ImDrawList *dl, ImVec2 origin, bool projectScope) {
     rows.push_back({"mate", kindColor("mate"), false, true, false});
     rows.push_back({"body", kindColor("body"), false, true, false});
   }
-  float y = origin.y;
-  float x = origin.x;
-  ImU32 tdim = Palette::toU32(palette.textDim);
-  ImU32 tdis = Palette::toU32(palette.textDisabled);
-  for (const auto &r : rows) {
-    if (r.header) {
-      dl->AddText(ImVec2(x, y), tdis, r.label);
-      y += 16 * S;
-      continue;
-    }
-    if (r.isNode) {
-      dl->AddCircleFilled(ImVec2(x + 6 * S, y + 6 * S), 5 * S, r.col);
-      dl->AddCircle(
-          ImVec2(x + 6 * S, y + 6 * S), 5 * S,
-          ImGui::GetColorU32(ImVec4(palette.border[0], palette.border[1],
-                                    palette.border[2], 0.9f)),
-          0, 1.0f);
-    } else if (r.dashed) {
-      drawDashedLine(dl, ImVec2(x, y + 6 * S), ImVec2(x + 18 * S, y + 6 * S),
-                     r.col, 1.5f * S, 4 * S, 3 * S);
-    } else {
-      dl->AddLine(ImVec2(x, y + 6 * S), ImVec2(x + 18 * S, y + 6 * S), r.col,
-                  1.5f * S);
-    }
-    dl->AddText(ImVec2(x + 24 * S, y), tdim, r.label);
-    y += 16 * S;
+  return rows;
+}
+
+// Collapsible legend pinned bottom-left INSIDE the canvas. Hosted in its own
+// child window so its widgets win the hit test over the canvas InvisibleButton
+// underneath (an overlapping item in the SAME window would never be hoverable).
+void drawLegendCard(GraphTabState &G, ImVec2 canvasOrigin, ImVec2 canvasSz,
+                    bool projectScope) {
+  const float inset = ui::metrics::U(3.0f);
+  const float lineH = ImGui::GetTextLineHeight();
+  const float iconH = ui::metrics::iconHeader();
+
+  if (!G.legendOpen) {
+    const float chip = ImGui::GetFrameHeight();
+    ImGui::SetCursorScreenPos(
+        ImVec2(canvasOrigin.x + inset,
+               canvasOrigin.y + canvasSz.y - inset - chip));
+    ImGui::BeginChild("##legend_chip", ImVec2(chip, chip), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar |
+                          ImGuiWindowFlags_NoScrollWithMouse |
+                          ImGuiWindowFlags_NoBackground);
+    if (ui::kit::iconButton("##legend_show", "legend",
+                            "Colour key for node kinds and link origins"))
+      G.legendOpen = true;
+    ImGui::EndChild();
+    return;
   }
+
+  const std::vector<LegendRow> rows = legendRows(projectScope);
+  const float swatchW = ui::metrics::U(5.0f);
+  const float gap = ui::metrics::U(1.5f);
+  const float rowH = lineH + ui::metrics::U(0.5f);
+  const float step = rowH + ImGui::GetStyle().ItemSpacing.y;
+
+  float contentW = lineH + gap + iconH + gap + ImGui::CalcTextSize("Legend").x;
+  for (const auto &r : rows)
+    contentW = std::max(contentW,
+                        swatchW + gap + ImGui::CalcTextSize(r.label).x);
+  const float cardW = contentW + ui::kit::padX() * 2.0f +
+                      ui::metrics::stroke(1.0f) * 2.0f + ui::metrics::U(1.0f);
+  const float cardH = ui::kit::padY() * 2.0f + std::max(lineH, iconH) +
+                      ui::kit::headGap() + step * (float)rows.size() +
+                      ui::metrics::stroke(1.0f) * 2.0f;
+
+  ImGui::SetCursorScreenPos(ImVec2(canvasOrigin.x + inset,
+                                   canvasOrigin.y + canvasSz.y - inset - cardH));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+  ImGui::BeginChild("##legend_host", ImVec2(cardW, cardH), ImGuiChildFlags_None,
+                    ImGuiWindowFlags_NoScrollbar |
+                        ImGuiWindowFlags_NoScrollWithMouse |
+                        ImGuiWindowFlags_NoBackground);
+  ImGui::PopStyleVar();
+  if (ui::kit::cardBegin("##legend", "Legend", "legend", &G.legendOpen)) {
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImU32 tdim = Palette::toU32(palette.textDim);
+    const ImU32 tdis = Palette::toU32(palette.textDisabled);
+    for (const auto &r : rows) {
+      const ImVec2 p = ImGui::GetCursorScreenPos();
+      const float cy = p.y + rowH * 0.5f;
+      float tx = p.x;
+      if (!r.header) {
+        tx += swatchW + gap;
+        if (r.isNode) {
+          dl->AddCircleFilled(ImVec2(p.x + swatchW * 0.5f, cy),
+                              ui::metrics::U(1.25f), r.col);
+          dl->AddCircle(ImVec2(p.x + swatchW * 0.5f, cy),
+                        ui::metrics::U(1.25f),
+                        ImGui::GetColorU32(ImVec4(palette.border[0],
+                                                  palette.border[1],
+                                                  palette.border[2], 0.9f)),
+                        0, ui::metrics::stroke(1.0f));
+        } else if (r.dashed) {
+          drawDashedLine(dl, ImVec2(p.x, cy), ImVec2(p.x + swatchW, cy), r.col,
+                         ui::metrics::stroke(1.5f), ui::metrics::U(1.0f),
+                         ui::metrics::U(0.75f));
+        } else {
+          dl->AddLine(ImVec2(p.x, cy), ImVec2(p.x + swatchW, cy), r.col,
+                      ui::metrics::stroke(1.5f));
+        }
+      }
+      dl->AddText(ImVec2(tx, p.y + (rowH - lineH) * 0.5f),
+                  r.header ? tdis : tdim, r.label);
+      ImGui::Dummy(ImVec2(tx - p.x + ImGui::CalcTextSize(r.label).x, rowH));
+    }
+  }
+  ui::kit::cardEnd();
+  ImGui::EndChild();
 }
 
 void drawSidePanel(AppState &st, float panelW) {
@@ -3555,13 +3627,9 @@ void drawSidePanel(AppState &st, float panelW) {
   auto row = [](const char *k, const std::string &v) {
     if (v.empty())
       return;
-    panelFieldLabel(k);
-    ImGui::SameLine(0, 8 * ui::uiScale);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImVec4(palette.textDim[0], palette.textDim[1],
-                                 palette.textDim[2], 1.0f));
-    ImGui::TextWrapped("%s", v.c_str());
-    ImGui::PopStyleColor();
+    // Elide + tooltip, never TextWrapped: link ids and paths carry no
+    // whitespace and break mid-token inside a stretch column.
+    ui::kit::keyValueRow(k, v.c_str());
   };
   auto nodeLabel = [&](const std::string &id) -> std::string {
     auto it = G.idIndex.find(id);
@@ -3634,12 +3702,38 @@ void drawSidePanel(AppState &st, float panelW) {
     const std::string &origin = srcE ? srcE->origin : ve.origin;
     bool authored = (origin == "manual" || origin == "ai");
     if (authored && ve.aggCount <= 1 && srcE) {
-      std::string linkId = srcE->meta.is_object()
-                               ? srcE->meta.value("link_id", std::string())
-                               : "";
-      if (graphGlassButton("##rmlink", "Remove link", true, -1.0f) &&
-          !linkId.empty())
-        requestLinkRemove(st, linkId);
+      const std::string linkId =
+          srcE->meta.is_object() ? srcE->meta.value("link_id", std::string())
+                                 : std::string();
+      // Irreversible (it rewrites .plm/graph_links.json) and it used to sit
+      // one row below "Copy path" in identical styling. The confirmation names
+      // BOTH endpoints. The Delete key arms the same popup: kit::popoverBegin
+      // opens "##kit_popover_body" under PushID(id), so this matches it.
+      ImGui::PushID("##rmlink");
+      if (G.linkRemoveConfirm) {
+        ImGui::OpenPopup("##kit_popover_body");
+        G.linkRemoveConfirm = false;
+      }
+      ImGui::PopID();
+      if (ui::kit::popoverBegin("##rmlink", "Remove link\xe2\x80\xa6",
+                                "delete")) {
+        const std::string ask = "Delete the authored " + ve.kind +
+                                " link \"" + nodeLabel(ve.src) + "\" \xe2\x80\x94 \"" +
+                                nodeLabel(ve.dst) +
+                                "\"? This rewrites .plm/graph_links.json and "
+                                "cannot be undone.";
+        ui::kit::dimText(ask.c_str());
+        ui::kit::gapRow();
+        if (ui::kit::dangerButton("Remove link", !linkId.empty(),
+                                  "This link carries no link_id to remove.")) {
+          requestLinkRemove(st, linkId);
+          ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine(0, ui::metrics::U(1.0f));
+        if (ui::kit::secondaryButton("Cancel"))
+          ImGui::CloseCurrentPopup();
+        ui::kit::popoverEnd();
+      }
     } else if (!authored) {
       ImGui::PushStyleColor(ImGuiCol_Text,
                             ImVec4(palette.textDim[0], palette.textDim[1],
@@ -3653,9 +3747,6 @@ void drawSidePanel(AppState &st, float panelW) {
     return;
   }
 
-  plmSectionHeader("Node", "mesh");
-  ImGui::Dummy(ImVec2(0, 6 * S));
-
   const GNode *sel = nullptr;
   if (!G.selectedId.empty()) {
     auto it = G.idIndex.find(G.selectedId);
@@ -3664,23 +3755,26 @@ void drawSidePanel(AppState &st, float panelW) {
   }
 
   if (!sel) {
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImVec4(palette.textDim[0], palette.textDim[1],
-                                 palette.textDim[2], 1.0f));
+    // A bare accent "Node" title over two lines of hint read as a broken pane.
     if (!G.linkArmSrc.empty())
-      ImGui::TextWrapped(
-          "Click the target node to link it — or Esc to cancel.");
+      ui::kit::emptyState("isolate", "Pick a link target",
+                          "Click the node to link to \xe2\x80\x94 or press Esc "
+                          "to cancel.");
     else if (G.scopeDocId.empty())
-      ImGui::TextWrapped("Click a node to inspect it. Double-click a part or "
-                         "document to isolate its references.");
+      ui::kit::emptyState("isolate", "Nothing selected",
+                          "Click a node to inspect it. Double-click a part or "
+                          "document to isolate its references.");
     else
-      ImGui::TextWrapped("Click a node to inspect it, or a link to see its "
-                         "properties. Double-click empty space to go back.");
-    ImGui::PopStyleColor();
+      ui::kit::emptyState("isolate", "Nothing selected",
+                          "Click a node to inspect it, or a link to see its "
+                          "properties. Backspace goes back a scope.");
     ImGui::EndChild();
     ImGui::PopStyleVar();
     return;
   }
+
+  plmSectionHeader("Node", "mesh");
+  ImGui::Dummy(ImVec2(0, 6 * S));
 
   // ---- header: kind pill + title -----------------------------------------
   {
@@ -3690,10 +3784,12 @@ void drawSidePanel(AppState &st, float panelW) {
     const ImVec2 ksSz = ImGui::CalcTextSize(ks);
     const float pillH = ImGui::GetTextLineHeight() + 4 * S;
     const float pillW = ksSz.x + 12 * S;
-    const ImU32 fill = kindColor(sel->kind, 0.85f);
-    dl->AddRectFilled(p0, ImVec2(p0.x + pillW, p0.y + pillH), fill, 6.0f * S);
+    const ImVec4 fill = ImGui::ColorConvertU32ToFloat4(
+        kindColor(sel->kind, 0.85f));
+    dl->AddRectFilled(p0, ImVec2(p0.x + pillW, p0.y + pillH),
+                      ImGui::GetColorU32(fill), 6.0f * S);
     dl->AddText(ImVec2(p0.x + 6 * S, p0.y + 2 * S),
-                IM_COL32(255, 255, 255, 240), ks);
+                ImGui::GetColorU32(ui::maxContrastTextOn(fill)), ks);
     ImGui::Dummy(ImVec2(pillW + 8 * S, pillH));
     ImGui::SameLine(0, 0);
     ImGui::PushStyleColor(
@@ -3702,6 +3798,43 @@ void drawSidePanel(AppState &st, float panelW) {
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2 * S);
     ImGui::TextWrapped("%s", sel->label.c_str());
     ImGui::PopStyleColor();
+  }
+
+  // ---- vault identity: part number, lifecycle, suppression ----------------
+  // A Released, part-numbered component and a scratch experiment were
+  // textually identical everywhere in this tab.
+  if (!sel->metaPartNumber.empty() || !sel->metaLifecycle.empty() ||
+      sel->metaSuppressed) {
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    bool first = true;
+    if (!sel->metaPartNumber.empty()) {
+      ui::kit::valueChip("PN", sel->metaPartNumber.c_str(),
+                         ui::kit::Tone::Info,
+                         sel->metaItemId.empty()
+                             ? nullptr
+                             : ("vault item " + sel->metaItemId).c_str());
+      first = false;
+    }
+    if (!sel->metaLifecycle.empty()) {
+      if (!first)
+        ImGui::SameLine(0, ui::metrics::U(1.0f));
+      const ui::kit::Tone lct = sel->metaLifecycle == "Released"
+                                    ? ui::kit::Tone::Ok
+                                    : (sel->metaLifecycle == "In work"
+                                           ? ui::kit::Tone::Warn
+                                           : ui::kit::Tone::Neutral);
+      ui::kit::chip(sel->metaLifecycle.c_str(), lct, /*dot=*/true,
+                    "Vault lifecycle state (meta.lifecycle).");
+      first = false;
+    }
+    if (sel->metaSuppressed) {
+      if (!first)
+        ImGui::SameLine(0, ui::metrics::U(1.0f));
+      ui::kit::chip("Suppressed", ui::kit::Tone::Warn, /*dot=*/true,
+                    "Suppressed in the model. Downstream DEPENDS_ON edges "
+                    "still exist, which is what makes a rebuild behave "
+                    "inexplicably.");
+    }
   }
 
   ImGui::Dummy(ImVec2(0, 8 * S));
@@ -3800,7 +3933,7 @@ void drawSidePanel(AppState &st, float panelW) {
 
   ImGui::Dummy(ImVec2(0, 10 * S));
 
-  // ---- compact facts (no raw id dump; path is the locator) ---------------
+  // ---- metric strip (degree + hidden descendants + instance count) --------
   {
     // Degree comes from the index rebuilt with the data, not from an O(edges)
     // rescan on every frame the inspector is open.
@@ -3808,40 +3941,29 @@ void drawSidePanel(AppState &st, float panelW) {
     const auto dit = G.degree.find(sel->id);
     const int outE = dit == G.degree.end() ? 0 : dit->second.first;
     const int inE = dit == G.degree.end() ? 0 : dit->second.second;
-    char linksBuf[48];
-    std::snprintf(linksBuf, sizeof(linksBuf), "%d out · %d in", outE, inE);
-
-    // One-line summary chips instead of a wall of key/value.
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImVec4(palette.textDim[0], palette.textDim[1],
-                                 palette.textDim[2], 1.0f));
-    ImGui::Text("%s", sel->kind.c_str());
-    ImGui::SameLine(0, 10 * S);
-    ImGui::TextUnformatted("·");
-    ImGui::SameLine(0, 10 * S);
-    ImGui::TextUnformatted(linksBuf);
+    ui::kit::valueChip("out", ui::kit::fmtCount(outE).c_str(),
+                       ui::kit::Tone::Accent, "Outgoing links.");
+    ImGui::SameLine(0, ui::metrics::U(1.0f));
+    ui::kit::valueChip("in", ui::kit::fmtCount(inE).c_str(),
+                       ui::kit::Tone::Accent, "Incoming links.");
     if (G.scopeDocId.empty()) {
-      auto dit = G.descCounts.find(sel->id);
-      if (dit != G.descCounts.end() && dit->second.total() > 0) {
-        ImGui::SameLine(0, 10 * S);
-        ImGui::TextUnformatted("·");
-        ImGui::SameLine(0, 10 * S);
-        {
-          const std::string badge = formatDescBadge(dit->second);
-          ImGui::TextUnformatted(badge.c_str());
-        }
+      auto cit = G.descCounts.find(sel->id);
+      if (cit != G.descCounts.end() && cit->second.total() > 0) {
+        ImGui::SameLine(0, ui::metrics::U(1.0f));
+        ui::kit::valueChip("inside",
+                           ui::kit::fmtCount(cit->second.total()).c_str(),
+                           ui::kit::Tone::Info,
+                           formatDescBadge(cit->second).c_str());
       }
     }
     if (G.scopeDecomp) {
       auto qit = G.instCount.find(sel->id);
       if (qit != G.instCount.end() && qit->second > 0) {
-        ImGui::SameLine(0, 10 * S);
-        ImGui::TextUnformatted("·");
-        ImGui::SameLine(0, 10 * S);
-        ImGui::Text("×%d", qit->second);
+        ImGui::SameLine(0, ui::metrics::U(1.0f));
+        ui::kit::valueChip("qty", ui::kit::fmtCount(qit->second).c_str(),
+                           ui::kit::Tone::Neutral, "Instances in this scope.");
       }
     }
-    ImGui::PopStyleColor();
   }
 
   // Path row — a Feature-Manager-style row (icon vertically centered with the
@@ -3910,39 +4032,29 @@ void drawSidePanel(AppState &st, float panelW) {
     if (sel->metaMat.size() > 6)
       mats += " +" + std::to_string(sel->metaMat.size() - 6);
 
-    auto trow = [&](const char *k, const std::string &v) {
+    // One row painter for the whole table: keyValueRow elides its value and
+    // tooltips the full string, which is exactly what an unbroken id or docId
+    // needs inside a 260 px column.
+    auto trow = [&](const char *k, const std::string &v, bool copyable) {
       if (v.empty())
         return;
-      ImGui::TableNextRow();
-      ImGui::TableSetColumnIndex(0);
-      panelFieldLabel(k);
-      ImGui::TableSetColumnIndex(1);
-      ImGui::PushStyleColor(ImGuiCol_Text,
-                            ImVec4(palette.textDim[0], palette.textDim[1],
-                                   palette.textDim[2], 1.0f));
-      ImGui::TextWrapped("%s", v.c_str());
-      ImGui::PopStyleColor();
+      ui::kit::keyValueRow(k, v.c_str(), ui::kit::Tone::Neutral, copyable);
     };
-    if (ImGui::BeginTable("##node_details", 2,
-                          ImGuiTableFlags_SizingFixedFit |
-                              ImGuiTableFlags_PadOuterX)) {
-      ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed,
-                              66.0f * S);
-      ImGui::TableSetupColumn("v", ImGuiTableColumnFlags_WidthStretch);
-      trow("units", units);
-      trow("material", mats);
-      trow("origin", sel->origin);
-      if (!sel->metaProject.empty() && G.projects.size() > 1) {
-        std::string projBase = sel->metaProject;
-        if (auto sl = projBase.find_last_of("/\\"); sl != std::string::npos)
-          projBase = projBase.substr(sl + 1);
-        trow("project", projBase);
-      }
-      if (!sel->docId.empty() && sel->docId != sel->id)
-        trow("document", sel->docId);
-      trow("id", sel->id);
-      ImGui::EndTable();
+    trow("units", units, false);
+    trow("material", mats, false);
+    trow("origin", sel->origin, false);
+    trow("lifecycle", sel->metaLifecycle, false);
+    trow("part number", sel->metaPartNumber, true);
+    trow("item id", sel->metaItemId, true);
+    if (!sel->metaProject.empty() && G.projects.size() > 1) {
+      std::string projBase = sel->metaProject;
+      if (auto sl = projBase.find_last_of("/\\"); sl != std::string::npos)
+        projBase = projBase.substr(sl + 1);
+      trow("project", projBase, false);
     }
+    if (!sel->docId.empty() && sel->docId != sel->id)
+      trow("document", sel->docId, true);
+    trow("id", sel->id, true);
   }
 
   // ---- file text preview (meta.text_preview, <=300 chars) ------------------
@@ -4120,27 +4232,10 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   const bool canvasHovered = ImGui::IsItemHovered();
   const ImVec2 origin = ImGui::GetItemRectMin();
 
-  // Mode badge geometry, hoisted to the top of the frame. The badge now hosts
-  // a real widget (the auto-orbit toggle) which is emitted AFTER the canvas
-  // InvisibleButton, so its hit box has to be subtracted from the canvas's own
-  // hover here — otherwise clicking the toggle would also deselect on canvas.
-  const char *modeTxt = G.view3d ? "3D" : "2D";
-  const char *modeBindings =
-      G.view3d ? "  |  left-drag orbit  |  right-drag pan  |  Shift+drag depth"
-               : "";
-  const ImVec2 modeSz = ImGui::CalcTextSize(modeTxt);
-  const ImVec2 bindSz = ImGui::CalcTextSize(modeBindings);
-  const float badgePadX = 8.0f * S, badgePadY = 4.0f * S;
-  const float badgeBtn = G.view3d ? ImGui::GetFrameHeight() : 0.0f;
-  const ImVec2 badge0(origin.x + 10.0f * S, origin.y + 10.0f * S);
-  const ImVec2 badge1(badge0.x + badgePadX * 2.0f + modeSz.x + bindSz.x +
-                          (badgeBtn > 0.0f ? badgeBtn + badgePadX : 0.0f),
-                      badge0.y + badgePadY * 2.0f +
-                          std::max(modeSz.y, badgeBtn));
-  const ImVec2 mpNow = ImGui::GetIO().MousePos;
-  const bool overBadge = mpNow.x >= badge0.x && mpNow.x <= badge1.x &&
-                         mpNow.y >= badge0.y && mpNow.y <= badge1.y;
-  const bool hovered = canvasHovered && !overBadge;
+  // The 2D|3D state and its gesture bindings now live in the toolbar (the
+  // segmented control and the persistent hint line), so no widget floats over
+  // the canvas and nothing has to be subtracted from the canvas hover.
+  const bool hovered = canvasHovered;
   ImDrawList *dl = ImGui::GetWindowDrawList();
   dl->PushClipRect(origin, ImVec2(origin.x + canvasSz.x, origin.y + canvasSz.y),
                    true);
@@ -5062,36 +5157,6 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
         Palette::toU32(palette.accent), msg);
   }
 
-  // Legend bottom-left of canvas.
-  drawLegend(dl, ImVec2(origin.x + 12 * S, origin.y + canvasSz.y - 232 * S),
-             projectScope);
-
-  // Mode badge top-left: at-a-glance 2D/3D state; in 3D it also lists the
-  // actual bindings (right-drag orbits, Shift+drag moves a node in depth).
-  {
-    const char *mode = G.view3d ? "3D" : "2D";
-    const char *bindings =
-        G.view3d
-            ? "  |  left-drag orbit  |  right-drag pan  |  Shift+drag depth"
-            : "";
-    const ImVec2 ms = ImGui::CalcTextSize(mode);
-    const ImVec2 bs = ImGui::CalcTextSize(bindings);
-    const float padX = 8.0f * S, padY = 4.0f * S;
-    const ImVec2 b0(origin.x + 10.0f * S, origin.y + 10.0f * S);
-    const ImVec2 b1(b0.x + ms.x + bs.x + padX * 2.0f,
-                    b0.y + ms.y + padY * 2.0f);
-    dl->AddRectFilled(b0, b1, Palette::toU32(palette.overlayBg), 7.0f * S);
-    dl->AddRect(b0, b1, Palette::toU32(palette.overlayBorder), 7.0f * S);
-    const float ty = b0.y + padY;
-    dl->AddText(ImVec2(b0.x + padX, ty),
-                G.view3d ? Palette::toU32(palette.accent)
-                         : Palette::toU32(palette.overlayText),
-                mode);
-    if (bindings[0])
-      dl->AddText(ImVec2(b0.x + padX + ms.x, ty),
-                  Palette::toU32(palette.overlayText), bindings);
-  }
-
   dl->PopClipRect();
 
   // Search-driven center: when the user types a filter, center on first VISIBLE
@@ -5173,6 +5238,27 @@ void drawListView(AppState &st, ImVec2 canvasSz) {
     if (!G.kindFilter.empty() && !G.kindFilter.count(G.nodes[i].kind))
       continue;
     visible.push_back(i);
+  }
+  // Same hole the canvas had: rows exist but every one is filtered away, and
+  // the view degenerates to a blank scroll region under a "0 visible" count.
+  if (visible.empty()) {
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(6.0f)));
+    if (activeFilterCount(G, /*graphMode=*/false) > 0) {
+      char reason[128];
+      std::snprintf(reason, sizeof(reason),
+                    "All %d loaded nodes are hidden by the active filters.",
+                    (int)G.nodes.size());
+      if (ui::kit::blockedState("Nothing to show", reason,
+                                activeFilterSummary(G).c_str(),
+                                "Clear filters"))
+        clearAllFilters(st, G);
+    } else {
+      ui::kit::emptyState("isolate", "Nothing to list",
+                          "This project graph has no nodes in the current "
+                          "scope.");
+    }
+    ImGui::EndChild();
+    return;
   }
   clipper.Begin((int)visible.size());
   while (clipper.Step()) {
@@ -5349,12 +5435,21 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
   });
 
   if (items.empty()) {
-    ImGui::Dummy(ImVec2(0, 24 * Sc));
-    ImGui::TextColored(ImVec4(palette.textDim[0], palette.textDim[1],
-                              palette.textDim[2], 1.0f),
-                       "%s",
-                       filtering ? "No parts or assemblies match the search"
-                                 : "No parts or assemblies in this view");
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(6.0f)));
+    if (activeFilterCount(G, /*graphMode=*/false) > 0) {
+      char reason[128];
+      std::snprintf(reason, sizeof(reason),
+                    "All %d loaded nodes are hidden by the active filters.",
+                    (int)G.nodes.size());
+      if (ui::kit::blockedState("Nothing to show", reason,
+                                activeFilterSummary(G).c_str(),
+                                "Clear filters"))
+        clearAllFilters(st, G);
+    } else {
+      ui::kit::emptyState("isolate", "No parts or assemblies here",
+                          "This scope carries no assembly, part or document "
+                          "nodes to tile.");
+    }
     ImGui::EndChild();
     return;
   }
@@ -5520,6 +5615,130 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
   }
   clipper.End();
 
+  ImGui::EndChild();
+}
+
+// One popover for every display filter. Data-source toggles, node/edge
+// visibility and the eleven relation pills used to be ~15 flat controls
+// wrapped across three toolbar rows with nothing grouping them; the popover's
+// active-count badge is what keeps a collapsed filter honest.
+void drawFilterPopover(AppState &st, GraphTabState &G, bool graphMode) {
+  if (!ui::kit::popoverBegin("##graph_filters", "Filters", "filter_funnel",
+                             activeFilterCount(G, graphMode)))
+    return;
+
+  ui::kit::sectionHeader("Source", nullptr, nullptr, -1, /*first=*/true);
+  {
+    bool hide = G.hideArchive;
+    if (ui::kit::toggleChip("Hide archive/stale", &hide, ui::kit::Tone::Accent,
+                            "Exclude _archive_stale / _archive / archive / "
+                            ".trash\ndirectories from the graph (default "
+                            "ON).")) {
+      // include_archive is a backend walk policy: flipping it must refetch.
+      G.hideArchive = hide;
+      G.lastFetch = -1e9;
+      requestGraph(st, /*force=*/true);
+    }
+    ImGui::SameLine(0, ui::metrics::U(1.0f));
+    bool linked = G.linkedProjects;
+    if (ui::kit::toggleChip("Linked projects", &linked, ui::kit::Tone::Info,
+                            "Merge graphs of projects linked to this one.\n"
+                            "Node rims tint per owning project.")) {
+      G.linkedProjects = linked;
+      G.lastFetch = -1e9;
+      requestGraph(st, /*force=*/true);
+    }
+  }
+
+  if (graphMode) {
+    bool hu = G.hideUnconnected;
+    if (ui::kit::toggleChip("Hide unconnected", &hu, ui::kit::Tone::Accent,
+                            "Hide nodes with no visible links (default ON).\n"
+                            "They remain available in List view.")) {
+      G.hideUnconnected = hu;
+      rebuildVisible(G);
+    }
+
+    const int kindTotal = (int)IM_ARRAYSIZE(kEdgeKinds);
+    ui::kit::sectionHeader("Relations", nullptr, nullptr,
+                           kindTotal - (int)G.hiddenKinds.size());
+    const float swatchW = ui::metrics::U(5.0f);
+    ImDrawList *pdl = ImGui::GetWindowDrawList();
+    for (int ki = 0; ki < kindTotal; ++ki) {
+      const char *k = kEdgeKinds[ki];
+      const ImVec2 p = ImGui::GetCursorScreenPos();
+      const float h = ImGui::GetFrameHeight();
+      // kit::Tone is six SEMANTIC roles, so it cannot carry an arbitrary edge
+      // hue: the swatch holds the exact legend colour, the chip holds state.
+      pdl->AddLine(ImVec2(p.x, p.y + h * 0.5f),
+                   ImVec2(p.x + swatchW, p.y + h * 0.5f), edgeColor(k, 1.0f),
+                   ui::metrics::stroke(2.0f));
+      ImGui::Dummy(ImVec2(swatchW, h));
+      ImGui::SameLine(0, ui::metrics::U(1.5f));
+      bool vis = !G.hiddenKinds.count(k);
+      if (ui::kit::toggleChip(edgeKindLabel(k).c_str(), &vis)) {
+        if (vis)
+          G.hiddenKinds.erase(k);
+        else
+          G.hiddenKinds.insert(k);
+        G.layoutDirty = true; // hidden kinds exert no spring force
+      }
+    }
+  } else {
+    ui::kit::sectionHeader("Node kinds", nullptr, nullptr,
+                           (int)G.kindFilter.size());
+    if (ui::kit::secondaryButton("All kinds", !G.kindFilter.empty(),
+                                 "Every kind is already shown."))
+      G.kindFilter.clear();
+    std::set<std::string> present;
+    for (const auto &n : G.nodes)
+      present.insert(n.kind);
+    for (const auto &k : present) {
+      bool on = G.kindFilter.count(k) > 0;
+      if (ui::kit::toggleChip(k.c_str(), &on)) {
+        if (on)
+          G.kindFilter.insert(k);
+        else
+          G.kindFilter.erase(k);
+      }
+    }
+
+    ui::kit::sectionHeader("Sort");
+    static const char *kSorts[3] = {"Name", "Kind", "Newest"};
+    ui::kit::segmented("##graph_sort", kSorts, 3, &G.gridSort);
+  }
+
+  ui::kit::popoverEnd();
+}
+
+// Canvas overlay for "every node is filtered out". drawCanvas guards an empty
+// NODE list but not an empty VISIBLE list, which ordinary filter combinations
+// reach (hide-archive + hide-unconnected + a drill into a fully-filtered
+// scope, or Links-only on a project with no cross-doc links) — the canvas then
+// paints a blank glass rectangle while the status line reports "0 of N nodes
+// visible". Hosted in its own child so the action button wins the hit test
+// over the canvas InvisibleButton underneath.
+void drawCanvasBlocked(AppState &st, GraphTabState &G, ImVec2 canvasOrigin,
+                       ImVec2 canvasSz) {
+  const float w = std::min(canvasSz.x - ui::metrics::U(6.0f),
+                           ui::metrics::px(400.0f));
+  const float h = std::min(canvasSz.y - ui::metrics::U(6.0f),
+                           ui::metrics::px(240.0f));
+  if (w <= 0.0f || h <= 0.0f)
+    return;
+  ImGui::SetCursorScreenPos(ImVec2(canvasOrigin.x + (canvasSz.x - w) * 0.5f,
+                                   canvasOrigin.y + (canvasSz.y - h) * 0.5f));
+  ImGui::BeginChild("##graph_blocked", ImVec2(w, h), ImGuiChildFlags_None,
+                    ImGuiWindowFlags_NoScrollbar |
+                        ImGuiWindowFlags_NoScrollWithMouse |
+                        ImGuiWindowFlags_NoBackground);
+  char reason[128];
+  std::snprintf(reason, sizeof(reason),
+                "All %d loaded nodes are hidden by the active filters.",
+                (int)G.nodes.size());
+  if (ui::kit::blockedState("Nothing to show", reason,
+                            activeFilterSummary(G).c_str(), "Clear filters"))
+    clearAllFilters(st, G);
   ImGui::EndChild();
 }
 
@@ -5707,8 +5926,13 @@ void plmDrawGraphPage(AppState &st) {
   }
 
   // ---- toolbar -------------------------------------------------------------
-  ImGui::SetNextItemWidth(220 * S);
-  if (ImGui::InputTextWithHint("##graph_search", "Search nodes…", G.search,
+  if (G.focusSearchPending) { // '/' binding
+    ImGui::SetKeyboardFocusHere();
+    G.focusSearchPending = false;
+  }
+  ImGui::SetNextItemWidth(ui::metrics::px(220.0f));
+  if (ImGui::InputTextWithHint("##graph_search", "Search nodes\xe2\x80\xa6  (/)",
+                               G.search,
                                sizeof(G.search))) {
     G.centerPending = G.search[0] != 0;
     G.matchDirty = true;
@@ -5716,109 +5940,39 @@ void plmDrawGraphPage(AppState &st) {
                        ? 0.0f
                        : 0.12f); // matched nodes draw the eye as they settle
   }
+  // View mode: Graph | List | Grid.
   ImGui::SameLine();
-  if (graphGlassButton("##graph_refresh", G.loading ? "Refreshing…" : "Refresh",
-                       false, 110 * S) &&
-      !G.loading) {
-    requestGraph(st, /*force=*/true);
-  }
-  if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-    ImGui::SetTooltip("Re-fetch the project graph from the backend.");
-  if (!G.listView && !G.gridView) {
-    ImGui::SameLine();
-    if (graphGlassButton("##graph_fit", "Fit", false, 70 * S)) {
-      G.fitRequested = true; // the ONLY auto-fit path left
-      G.userNavigated = false;
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-      ImGui::SetTooltip("Frame all visible nodes in the canvas.");
-  }
-  ImGui::SameLine();
-  // Hide archive/stale — ON by default; toggling re-fetches with
-  // include_archive flipped so the backend walk policy matches the UI.
   {
-    bool hide = G.hideArchive;
-    if (ImGui::Checkbox("Hide archive/stale", &hide) && hide != G.hideArchive) {
-      G.hideArchive = hide;
-      G.lastFetch = -1e9;
-      requestGraph(st, /*force=*/true);
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-      ImGui::SetTooltip("Exclude _archive_stale / _archive / archive / .trash\n"
-                        "directories from the graph (default ON).");
-    }
-  }
-  ImGui::SameLine();
-  // Hide unconnected — ON by default; project view only, no refetch needed.
-  {
-    bool hu = G.hideUnconnected;
-    if (ImGui::Checkbox("Hide unconnected", &hu) && hu != G.hideUnconnected) {
-      G.hideUnconnected = hu;
-      rebuildVisible(G);
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-      ImGui::SetTooltip("Hide nodes with no visible links (default ON).\n"
-                        "They remain available in List view.");
-    }
-  }
-  ImGui::SameLine();
-  // Linked projects — OFF by default; toggling refetches with linked=true so
-  // the worker merges linked projects' graphs (nodes then carry meta.project).
-  if (graphGlassButton("##linked_proj", "Linked projects", G.linkedProjects,
-                       0.0f)) {
-    G.linkedProjects = !G.linkedProjects;
-    G.lastFetch = -1e9;
-    requestGraph(st, /*force=*/true);
-  }
-  if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-    ImGui::SetTooltip("Merge graphs of projects linked to this one.\n"
-                      "Node rims tint per owning project; a legend lists\n"
-                      "each merged project root.");
-  }
-  ImGui::SameLine();
-  // View mode chips: Graph / List / Grid. The active chip carries the accent
-  // fill (same active-chip style as the 2D|3D segment).
-  {
-    const bool graphActive = !G.listView && !G.gridView;
-    if (graphGlassButton("##view_graph", "Graph view", graphActive, 0.0f)) {
-      if (G.listView || G.gridView) {
-        G.listView = false;
-        G.gridView = false;
+    static const char *kViewLabels[3] = {"Graph", "List", "Grid"};
+    static const char *kViewTips[3] = {
+        "Graph view animates the current scope as a live force-directed\n"
+        "layout (drag nodes to rearrange).",
+        "List view shows every loaded node (including features) as\n"
+        "filterable rows.",
+        "Grid view tiles the parts and assemblies of the current scope as\n"
+        "square cells with iso previews, rendered on demand and cached."};
+    int vm = G.gridView ? 2 : (G.listView ? 1 : 0);
+    if (ui::kit::segmented("##graph_view", kViewLabels, 3, &vm, 0.0f,
+                           kViewTips)) {
+      if (vm == 0 && (G.listView || G.gridView))
         G.layoutDirty = true;
-      }
+      G.listView = (vm == 1);
+      G.gridView = (vm == 2);
       G.listViewUserOverride = true;
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-      ImGui::SetTooltip("Graph view animates the current scope as a live\n"
-                        "force-directed layout (drag nodes to rearrange).");
-    }
-    ImGui::SameLine(0, 4 * S);
-    if (graphGlassButton("##view_list", "List view", G.listView, 0.0f)) {
-      G.listView = true;
-      G.gridView = false;
-      G.listViewUserOverride = true;
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-      ImGui::SetTooltip("List view shows every loaded node (including\n"
-                        "features) as filterable rows.");
-    }
-    ImGui::SameLine(0, 4 * S);
-    if (graphGlassButton("##view_grid", "Grid view", G.gridView, 0.0f)) {
-      G.gridView = true;
-      G.listView = false;
-      G.listViewUserOverride = true;
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-      ImGui::SetTooltip("Grid view shows the parts and assemblies of the\n"
-                        "current scope as square cells with iso previews.\n"
-                        "Previews render on demand and cache on disk.");
     }
   }
-  // Dimension mode: segmented 2D|3D switch — graph view only.
+  // Dimension: 2D | 3D — graph view only.
   if (!G.listView && !G.gridView) {
     ImGui::SameLine();
-    const int seg = graphModeSegment("##graph_dim", G.view3d);
-    if (seg >= 0 && (seg == 1) != G.view3d) {
+    static const char *kDimLabels[2] = {"2D", "3D"};
+    static const char *kDimTips[2] = {
+        "2D force layout (flat x/y). Drag nodes to rearrange.",
+        "3D force layout: physics runs on x/y/z. Left-drag orbits,\n"
+        "right-drag pans, Shift+drag moves a node in depth."};
+    int dim = G.view3d ? 1 : 0;
+    if (ui::kit::segmented("##graph_dim", kDimLabels, 2, &dim, 0.0f,
+                           kDimTips) &&
+        (dim == 1) != G.view3d) {
       G.view3d = !G.view3d;
       // Transition: capture pre-toggle positions for the lerp animation.
       G.trans3dFrom.clear();
@@ -5934,9 +6088,95 @@ void plmDrawGraphPage(AppState &st) {
       G.userNavigated = false;
     }
   }
+
+  // Filters: source policy, node/link visibility and the relation checklist,
+  // collapsed into ONE popover that badges its active count.
+  ImGui::SameLine();
+  drawFilterPopover(st, G, !G.listView && !G.gridView);
+
+  ImGui::SameLine();
+  if (ui::kit::iconButton("##graph_refresh", "refresh",
+                          G.loading
+                              ? "Refreshing\xe2\x80\xa6"
+                              : "Re-fetch the project graph from the backend.",
+                          !G.loading))
+    requestGraph(st, /*force=*/true);
+  if (!G.listView && !G.gridView) {
+    ImGui::SameLine();
+    if (ui::kit::iconButton("##graph_fit", "zoom_fit",
+                            "Frame all visible nodes in the canvas.  (F)")) {
+      G.fitRequested = true; // the ONLY auto-fit path left
+      G.userNavigated = false;
+    }
+    // Relation scope: the link web, everything, or assembly structure.
+    ImGui::SameLine();
+    // One word per segment. "Links only" was eliding to "Links o..." in the segment's own
+    // measured width, and three parallel one-word choices read better anyway; the tooltip
+    // below carries the full meaning.
+    static const char *kScopeLabels[3] = {"Links", "All", "Assembly"};
+    static const char *kScopeTips[3] = {
+        "Hide containment and show only the cross-document link web.",
+        "Show every relation kind.",
+        "Assembly structure: assemblies + parts with containment, instance\n"
+        "and mate relations, laid out as a deterministic layered tree.\n"
+        "Arrangement is kept per-session."};
+    const bool linksOnly =
+        G.hiddenKinds.size() == 1 && G.hiddenKinds.count("CONTAINS") > 0;
+    int scope = G.asmView ? 2 : (linksOnly ? 0 : 1);
+    const int wasScope = scope;
+    if (ui::kit::segmented("##graph_scope", kScopeLabels, 3, &scope, 0.0f,
+                           kScopeTips) &&
+        scope != wasScope) {
+      if ((scope == 2) != G.asmView)
+        toggleAsmView(G);
+      if (scope == 0) {
+        G.hiddenKinds.clear();
+        G.hiddenKinds.insert("CONTAINS"); // hide containment → the link web
+        G.layoutDirty = true;             // hidden kinds exert no spring force
+      } else if (scope == 1) {
+        G.hiddenKinds.clear();
+        G.layoutDirty = true;
+      }
+    }
+  }
   if (!G.err.empty() && !G.nodes.empty()) {
     ImGui::SameLine();
     plmError(G.err);
+  }
+  // Layout seeding is a force-layout concern: graph view only (as before).
+  if (!G.listView && !G.gridView) {
+  ImGui::SameLine(0, 12 * S);
+  {
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                                 palette.textDisabled[2], 1.0f));
+    ImGui::TextUnformatted("Layout:");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 4 * S);
+    static const char *kClusterModes[] = {"Default", "By project", "By keyword",
+                                          "By folder"};
+    ImGui::SetNextItemWidth(ui::metrics::asmInputW());
+    if (ImGui::Combo("##cluster_mode", &G.clusterMode, kClusterModes,
+                     (int)IM_ARRAYSIZE(kClusterModes))) {
+      for (auto &n : G.nodes)
+        n.lx = n.ly = n.lz = 0.0f;
+      G.projPosStash.clear();
+      G.asmPosStash.clear();
+      G.layoutCache.clear(); // disk file is overwritten on the next settle
+      G.hierarchyLayout = false;
+      G.userNavigated = false;
+      G.layoutDirty = true;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+      ImGui::SetTooltip(
+          "Initial-position seeding for the force layout (project web):\n"
+          "Default — balloon hierarchy / current behavior.\n"
+          "By project — cluster per owning project root (merged graphs).\n"
+          "By keyword — cluster around each keyword's tagged targets.\n"
+          "By folder — cluster per folder (file assets / doc paths).");
+    }
+  }
   }
 
   // ---- breadcrumb: Project › asm › subasm › … ----------------------------
@@ -6023,36 +6263,17 @@ void plmDrawGraphPage(AppState &st) {
       if (hasBomChildren(G, G.scopeDocId) ||
           (it != G.idIndex.end() && G.nodes[it->second].kind == "assembly")) {
         ImGui::SameLine(0, 12 * S);
-        // Active chip reads by accent text (the app font lacks dot glyphs).
-        if (G.scopeDecomp)
-          ImGui::PushStyleColor(ImGuiCol_Text,
-                                ImVec4(palette.accent[0], palette.accent[1],
-                                       palette.accent[2], 1.0f));
-        if (ImGui::SmallButton("Parts##sc_parts")) {
-          if (!G.scopeDecomp) {
-            G.scopeDecomp = true;
-            rebuildVisible(G);
-          }
+        // Was two raw SmallButtons whose active state was a text-colour hack.
+        static const char *kDecompLabels[2] = {"Internals", "Parts"};
+        static const char *kDecompTips[2] = {
+            "Internals: raw features / sketches / mates of this document.",
+            "Parts: subassembly/part decomposition with instance counts."};
+        int decomp = G.scopeDecomp ? 1 : 0;
+        if (ui::kit::segmented("##scope_decomp", kDecompLabels, 2, &decomp,
+                               0.0f, kDecompTips)) {
+          G.scopeDecomp = (decomp == 1);
+          rebuildVisible(G);
         }
-        if (G.scopeDecomp)
-          ImGui::PopStyleColor();
-        ImGui::SameLine(0, 2 * S);
-        if (!G.scopeDecomp)
-          ImGui::PushStyleColor(ImGuiCol_Text,
-                                ImVec4(palette.accent[0], palette.accent[1],
-                                       palette.accent[2], 1.0f));
-        if (ImGui::SmallButton("Internals##sc_int")) {
-          if (G.scopeDecomp) {
-            G.scopeDecomp = false;
-            rebuildVisible(G);
-          }
-        }
-        if (!G.scopeDecomp)
-          ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-          ImGui::SetTooltip(
-              "Parts: subassembly/part decomposition with instance counts.\n"
-              "Internals: raw features / sketches / mates of this document.");
       }
     }
   }
@@ -6143,140 +6364,26 @@ void plmDrawGraphPage(AppState &st) {
     }
   }
 
-  // ---- edge-kind filter row (graph view only) ----------------------------
-  if (!G.listView && !G.gridView) {
-  if (graphGlassButton("##links_only", "Links only", false, 0.0f)) {
-    G.hiddenKinds.clear();
-    G.hiddenKinds.insert("CONTAINS"); // hide containment → the link web
-    G.layoutDirty = true;             // hidden kinds exert no spring force
-  }
-  ImGui::SameLine();
-  if (graphGlassButton("##all_kinds", "All", false, 0.0f)) {
-    G.hiddenKinds.clear();
-    G.layoutDirty = true;
-  }
-  ImGui::SameLine();
-  // Assembly structure view: containment/instance tree + mates, layered.
-  // Accent fill while active (same active-chip style as the 2D|3D segment).
-  if (graphGlassButton("##asm_view", "Assembly", G.asmView, 0.0f)) {
-    toggleAsmView(G);
-  }
-  if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-    ImGui::SetTooltip(
-        "Assembly structure: assemblies + parts with containment, instance\n"
-        "and mate relations, laid out as a deterministic layered tree.\n"
-        "Arrangement is kept per-session (the layered layout is re-derived\n"
-        "deterministically on entry).");
-  }
-  // Layout seed mode: Default is the current behavior (balloon hierarchy /
-  // warm append); the cluster modes seed group centroids and let the live
-  // sim relax around them. Switching reseeds from scratch (positions zeroed,
-  // stashes dropped) so the whole web re-groups.
-  ImGui::SameLine(0, 12 * S);
-  {
-    ImGui::AlignTextToFramePadding();
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                                 palette.textDisabled[2], 1.0f));
-    ImGui::TextUnformatted("Layout:");
-    ImGui::PopStyleColor();
-    ImGui::SameLine(0, 4 * S);
-    static const char *kClusterModes[] = {"Default", "By project", "By keyword",
-                                          "By folder"};
-    ImGui::SetNextItemWidth(124 * S);
-    if (ImGui::Combo("##cluster_mode", &G.clusterMode, kClusterModes,
-                     (int)IM_ARRAYSIZE(kClusterModes))) {
-      for (auto &n : G.nodes)
-        n.lx = n.ly = n.lz = 0.0f;
-      G.projPosStash.clear();
-      G.asmPosStash.clear();
-      G.layoutCache.clear(); // disk file is overwritten on the next settle
-      G.hierarchyLayout = false;
-      G.userNavigated = false;
-      G.layoutDirty = true;
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-      ImGui::SetTooltip(
-          "Initial-position seeding for the force layout (project web):\n"
-          "Default — balloon hierarchy / current behavior.\n"
-          "By project — cluster per owning project root (merged graphs).\n"
-          "By keyword — cluster around each keyword's tagged targets.\n"
-          "By folder — cluster per folder (file assets / doc paths).");
-    }
-  }
-  // Edge-kind toggle grid: structural relations (containment, deps, mates,
-  // instances, references) on top, documentation/derivation relations
-  // (derives-from, documents, simulates, manufactures, tagged) stacked
-  // directly beneath — a compact 2-row grid of on/off switches instead of
-  // one long strip that ran off past the window edge.
-  ImGui::SameLine(0, 12 * S);
-  {
-    const float gridX = ImGui::GetCursorPosX();
-    auto drawKindChip = [&](const char *k) {
-      const bool vis = !G.hiddenKinds.count(k);
-      const ImU32 tc =
-          vis ? edgeColor(k, 1.0f) : Palette::toU32(palette.textDisabled);
-      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tc));
-      const std::string lab = edgeKindLabel(k) + "##ek_" + std::string(k);
-      if (ImGui::SmallButton(lab.c_str())) {
-        if (vis)
-          G.hiddenKinds.insert(k);
-        else
-          G.hiddenKinds.erase(k);
-        G.layoutDirty = true;
-      }
-      ImGui::PopStyleColor();
-    };
-    constexpr int kStructN = 5; // CONTAINS..REFERENCES
-    constexpr int kTotal = (int)(sizeof(kEdgeKinds) / sizeof(kEdgeKinds[0]));
-    for (int ki = 0; ki < kStructN; ++ki) {
-      if (ki > 0)
-        ImGui::SameLine(0, 4 * S);
-      drawKindChip(kEdgeKinds[ki]);
-    }
-    ImGui::NewLine();
-    ImGui::SetCursorPosX(gridX);
-    for (int ki = kStructN; ki < kTotal; ++ki) {
-      if (ki > kStructN)
-        ImGui::SameLine(0, 4 * S);
-      drawKindChip(kEdgeKinds[ki]);
-    }
-  }
-  } else {
-    // Grid/List controls: kind filter chips + sort (graph controls hidden).
-    if (graphGlassButton("##kf_all", "All kinds", G.kindFilter.empty(), 0.0f))
-      G.kindFilter.clear();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-      ImGui::SetTooltip("Show every kind (clear the kind filter).");
-    std::set<std::string> present;
-    for (const auto &n : G.nodes)
-      present.insert(n.kind);
-    for (const auto &k : present) {
-      ImGui::SameLine(0, 4 * S);
-      const bool on = G.kindFilter.count(k) > 0;
-      if (graphGlassButton(("##kf_" + k).c_str(), k.c_str(), on, 0.0f)) {
-        if (on)
-          G.kindFilter.erase(k);
-        else
-          G.kindFilter.insert(k);
-      }
-    }
-    ImGui::SameLine(0, 14 * S);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                                 palette.textDisabled[2], 1.0f));
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted("Sort:");
-    ImGui::PopStyleColor();
-    static const char *kSorts[3] = {"Name", "Kind", "Newest"};
-    for (int si = 0; si < 3; ++si) {
-      ImGui::SameLine(0, 4 * S);
-      if (graphGlassButton(("##sort_" + std::to_string(si)).c_str(), kSorts[si],
-                           G.gridSort == si, 0.0f))
-        G.gridSort = si;
-    }
-  }
 
+  // Persistent gesture/key hints. These used to be documented ONLY in the
+  // inspector's placeholder text, which disappears the moment anything is
+  // selected — i.e. exactly when the user starts needing them.
+  {
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(palette.textDisabled[0],
+                                 palette.textDisabled[1],
+                                 palette.textDisabled[2], 1.0f));
+    if (!G.listView && !G.gridView && G.view3d)
+      ImGui::TextUnformatted("double-click a node to drill in \xc2\xb7 "
+                             "Backspace goes back \xc2\xb7 / search \xc2\xb7 "
+                             "F fit \xc2\xb7 left-drag orbits \xc2\xb7 "
+                             "Shift+drag moves depth");
+    else
+      ImGui::TextUnformatted("double-click a node to drill in \xc2\xb7 "
+                             "Backspace goes back \xc2\xb7 / search \xc2\xb7 "
+                             "F fit");
+    ImGui::PopStyleColor();
+  }
   ImGui::Dummy(ImVec2(0, 4 * S));
 
   // ---- body: canvas/list + side panel -------------------------------------
@@ -6293,13 +6400,20 @@ void plmDrawGraphPage(AppState &st) {
   ImGui::BeginChild(
       "##graph_canvas_host", ImVec2(canvasW, 0), ImGuiChildFlags_None,
       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+  const ImVec2 corigin = ImGui::GetCursorScreenPos();
   ImVec2 csz = ImGui::GetContentRegionAvail();
   if (G.gridView)
     drawGridView(st, csz);
   else if (G.listView)
     drawListView(st, csz);
-  else
+  else {
     drawCanvas(st, csz);
+    // Canvas overlays: both live in their own child windows so they can be
+    // clicked through the canvas's full-bleed InvisibleButton.
+    if (G.visibleIdx.empty() && !G.nodes.empty() && !G.loading)
+      drawCanvasBlocked(st, G, corigin, csz);
+    drawLegendCard(G, corigin, csz, G.scopeDocId.empty());
+  }
   ImGui::EndChild();
 
   ImGui::SameLine(0, gap);
@@ -6337,13 +6451,37 @@ void plmDrawGraphPage(AppState &st) {
     }
     ImGui::EndPopup();
   }
-  // Esc clears blast, else cancels an armed link when no popup is open.
-  if (!ImGui::IsPopupOpen("Add link##graph_link") &&
-      ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+  // ---- keyboard ------------------------------------------------------------
+  // Every one of these already existed as a function and was reachable only by
+  // mouse. Text fields keep their keys (WantTextInput), and a live popup owns
+  // Escape.
+  const bool addLinkOpen = ImGui::IsPopupOpen("Add link##graph_link");
+  if (!addLinkOpen && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
     if (!G.blast.empty())
       clearBlast(G);
     else if (!G.linkArmSrc.empty())
       G.linkArmSrc.clear();
+  }
+  if (!addLinkOpen && !ImGui::GetIO().WantTextInput &&
+      ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+    if (ImGui::IsKeyPressed(ImGuiKey_Slash))
+      G.focusSearchPending = true;
+    if (ImGui::IsKeyPressed(ImGuiKey_F) && !G.listView && !G.gridView) {
+      G.fitRequested = true;
+      G.userNavigated = false;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter) ||
+        ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
+      auto it = G.idIndex.find(G.selectedId);
+      if (it != G.idIndex.end() && G.nodes[it->second].id != G.scopeDocId &&
+          isDrillableKind(G.nodes[it->second].kind))
+        drillInto(G, G.nodes[it->second].id);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Backspace) && !G.scopeDocId.empty())
+      scopeBack(G);
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete) &&
+        !selectedAuthoredLinkId(G).empty())
+      G.linkRemoveConfirm = true; // raises the inspector's confirmation
   }
 }
 

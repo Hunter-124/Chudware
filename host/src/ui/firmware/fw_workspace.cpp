@@ -47,6 +47,7 @@
 #include "ui/copilot/copilot.h"
 #include "ui/icons.h"
 #include "ui/metrics.h"
+#include "ui/widgets/kit.h"   // ui::kit — the app-wide section header
 #include "ui/panel_collapse.h"
 #include "ui_theme.h"
 
@@ -150,31 +151,17 @@ static const char* kMcuFamilies[] = {"cortex-m4", "cortex-m0", "cortex-m3", "cor
 // Small local widgets built on the shared ui_theme primitives (the same recipes the
 // PLM hub and title bar use). Kept local so the firmware workspace stays self-contained.
 
-// Section title: accent atlas icon + accent label + a short accent->transparent gradient
-// underline (the title-bar divider trick). Replaces the old plain text + Separator().
+// Section title: accent atlas icon + accent label, from the app-wide painter. The short
+// accent->transparent underline this used to draw is deliberately gone — the kit carries no
+// section rule (the PLM hub retired it as clutter and that is now the app-wide decision).
 static void fwSectionHeader(const char* icon, const char* label) {
-    const float sc = ui::uiScale;
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    const float h = ImGui::GetFrameHeight();
-    float x = p0.x;
-    if (icon && icon[0]) {
-        const float isz = 16.0f * sc;
-        ui::drawIconGlass(dl, icon, ImVec2(x + isz * 0.5f, p0.y + h * 0.5f), isz,
-                          palette.toU32(palette.accent), 0);
-        x += isz + 7.0f * sc;
-    }
-    dl->AddText(ImVec2(x, p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f),
-                palette.toU32(palette.accent), label);
-    ImGui::Dummy(ImVec2(0.0f, h));
-    const float w = std::min(ImGui::GetContentRegionAvail().x, 140.0f * sc);
-    const float uy = p0.y + h + 1.0f * sc;
-    const ImU32 ca = ImGui::GetColorU32(
-        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.55f));
-    const ImU32 cb = ImGui::GetColorU32(
-        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.0f));
-    dl->AddRectFilledMultiColor(ImVec2(p0.x, uy), ImVec2(p0.x + w, uy + sc), ca, cb, cb, ca);
-    ImGui::Dummy(ImVec2(0.0f, 4.0f * sc));
+    // A firmware panel is a docked column, i.e. the app's default rhythm.
+    ui::kit::pushDensity(ui::kit::Density::Cozy);
+    // `first`: fwHeaderAction parks a SmallButton on THIS header's row by rewinding the cursor
+    // immediately before the call, so the header must start exactly at the cursor — a leading gap
+    // would drop the label below that button. The callers space their own sections.
+    ui::kit::sectionHeader(label, icon, /*trailing=*/nullptr, /*count=*/-1, /*first=*/true);
+    ui::kit::popDensity();
 }
 
 // Status pill: soft tinted fill + tinted text + hairline border (the graph-tab kind-pill

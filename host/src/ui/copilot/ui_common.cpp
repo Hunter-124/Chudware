@@ -9,64 +9,30 @@
 #include "ui/tesseract.h"  // ui::drawTesseractSpinner — the brand mark doubles as the busy art
 
 // ============================ shared small-UI helpers ============================
+// These three are declared in core/app_state.h and called from the copilot module, the settings
+// modal and the workspaces, so they are app-wide API with a copilot-local home. The BODIES now
+// forward to ui::kit (same style as drawStatusGlyph below) — one accent-button, one section
+// caption and one filter chip for the whole product. Deliberately NO pushDensity here: an
+// app-wide entry point must inherit the density its host pushed, not impose one.
 bool primaryButton(const char* label, const ImVec2& size) {
-    const auto& p = ui::palette;
-    // Primary button always uses the accent color regardless of theme.
-    ImGui::PushStyleColor(ImGuiCol_Button,
-        ImVec4(p.accent[0], p.accent[1], p.accent[2], 1));
-    // Hovered: lighten for dark theme, darken for light (just brighten accent channel).
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        ImVec4(p.accent[0]*1.15f > 1.f ? 1.f : p.accent[0]*1.15f,
-               p.accent[1]*1.08f > 1.f ? 1.f : p.accent[1]*1.08f,
-               p.accent[2]*1.08f > 1.f ? 1.f : p.accent[2]*1.08f, 1));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-        ImVec4(p.accentDim[0], p.accentDim[1], p.accentDim[2], 1));
-    // Text on the accent button: max-contrast ink for the accent fill (dark ink on the teal
-    // accent, light ink on the light theme's deeper blue) — no hardcoded tone.
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ui::maxContrastTextOn(ImVec4(p.accent[0], p.accent[1], p.accent[2], 1)));
-    bool r = ImGui::Button(label, size);
-    ImGui::PopStyleColor(4);
-    return r;
+    return ui::kit::primaryButton(label, /*enabled=*/true, /*disabledReason=*/nullptr, size);
 }
 void sectionHeader(ImFont* f, const char* text) {
+    // The font stays a caller decision (the About popup hands its h1); the kit sizes the row from
+    // whatever font is current. `first`: this header never carried a leading gap, callers space it.
     if (f) ImGui::PushFont(f);
-    ImGui::TextUnformatted(text);
+    ui::kit::sectionHeader(text, /*icon=*/nullptr, /*trailing=*/nullptr, /*count=*/-1,
+                           /*first=*/true);
     if (f) ImGui::PopFont();
-    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
 }
-void dimText(const char* t) {
-    // Dim = the CURRENT text tone at reduced alpha, so the helper stays readable on ANY surface:
-    // theme text on opaque panels, adaptive glass ink when a bubble pushed surf.textPrimary
-    // (the old fixed palette.textDim was light grey over the light frost — washed out).
-    ImVec4 c = ImGui::GetStyleColorVec4(ImGuiCol_Text);
-    c.w *= 0.62f;
-    ImGui::PushStyleColor(ImGuiCol_Text, c);
-    ImGui::TextWrapped("%s", t);
-    ImGui::PopStyleColor();
-}
+void dimText(const char* t) { ui::kit::dimText(t); }
 
-// A small pill button that highlights when its section is expanded. All tones derive from the
-// CURRENT text color (+ the translucent chip accent when active) so the chip reads on opaque
-// panels AND on adaptive glass bubbles alike — the old theme-button fill under adaptive
-// near-black ink was black-on-black over the glass cards.
+// A small pill button that highlights when its section is expanded.
 bool toggleChip(const char* label, bool active) {
-    const auto& p = ui::palette;
-    const ImVec4 txt = ImGui::GetStyleColorVec4(ImGuiCol_Text);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
-    ImGui::PushStyleColor(ImGuiCol_Button, active
-        ? ImVec4(p.chipBg[0], p.chipBg[1], p.chipBg[2], p.chipBg[3])
-        : ImVec4(txt.x, txt.y, txt.z, 0.06f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt.x, txt.y, txt.z, 0.14f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(txt.x, txt.y, txt.z, 0.22f));
-    bool clicked = ImGui::SmallButton(label);
-    ImGui::GetWindowDrawList()->AddRect(
-        ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-        ImGui::ColorConvertFloat4ToU32(ImVec4(txt.x, txt.y, txt.z, active ? 0.45f : 0.25f)),
-        ui::metrics::rounding(6.0f), 0, ui::metrics::stroke(1.0f));
-    ImGui::PopStyleColor(3);
-    ImGui::PopStyleVar();
-    return clicked;
+    // The callers own the flag and flip it themselves on a true return (several write through a
+    // settings store rather than a bool), so the kit gets a scratch copy of the current state.
+    bool on = active;
+    return ui::kit::toggleChip(label, &on);
 }
 
 

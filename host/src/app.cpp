@@ -6226,6 +6226,44 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       ecadPrevWsForInit = ws;
     }
 
+    // ---- workspace crossfade -------------------------------------------------
+    // Switching workspaces was a channel flip: the outgoing body simply stopped
+    // being drawn and the incoming one appeared fully formed on the next frame.
+    // Fading the central body in over kBase costs a fifth of a second and is
+    // most of the difference between "an app" and "a program". Only the BODY
+    // transitions — the title bar, ribbon and status bar stay put, so the chrome
+    // reads as a fixed frame around content that changed.
+    //
+    // Alpha only, deliberately no vertical lift: every full-body block below
+    // positions its own window from the overlay band, so a lift would have to be
+    // threaded through five separate SetNextWindowPos calls for a fraction of the
+    // effect.
+    //
+    // The push is popped unconditionally after the body section; there is no
+    // early return anywhere between the two (verified), and a headless capture
+    // snaps straight to 1 so a shot can never photograph a half-faded panel.
+    float wsFadeAlpha = 1.0f;
+    {
+      static WS wsFadeFrom = ws;
+      static double wsFadeT0 = -1.0;
+      if (wsFadeFrom != ws) {
+        wsFadeFrom = ws;
+        wsFadeT0 = ImGui::GetTime();
+      }
+      if (!shot && wsFadeT0 > 0.0) {
+        const float t =
+            (float)((ImGui::GetTime() - wsFadeT0) / (double)ui::anim::kBase);
+        if (t >= 1.0f) {
+          wsFadeT0 = -1.0;
+        } else {
+          wsFadeAlpha = ui::anim::easeOut(t);
+          ui::anim::requestFrames();
+        }
+      }
+    }
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha,
+                        ImGui::GetStyle().Alpha * wsFadeAlpha);
+
     if (!wsFullBody) {
       // ---- normal viewport workspaces (Model, Drawing, Simulate, Electronics,
       // Manufacture) ---- Electronics used to suppress this column (the ECAD
@@ -6440,6 +6478,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ImGui::End();
       }
     }
+    // End of the central body: pop the crossfade alpha pushed above. The Web
+    // overlay below is NOT part of the transition — it composes over whatever
+    // workspace is underneath and must never inherit a fade.
+    ImGui::PopStyleVar();
 
     // ---- "Web" chip overlay: full-window in-app browser over the central band
     // ---- Drawn LAST in the central-body section and only when active, so it's

@@ -138,3 +138,64 @@ Neither belongs in `atlas.json` `raster_only` — that list is for photographic
 tiles that must never derive an SDF. `icon_pipeline.py` had listed both names
 there years before either had a cell; `make_icons.py` now prunes carried-forward
 `raster_only` entries whose cell it draws itself.
+
+## 2026-08-12 append (Copilot Artifacts + PLM Graph, Wave 0)
+
+Thirteen new procedural glyphs, appended LAST in `make_icons.py`
+`CONTRACT_NAMES` so every pre-existing cell keeps its UVs (verified: 478/478
+prior cells byte-identical rects; atlas grew 56x8126 -> 56x8568). Same idiom as
+the rest of the inventory: 2 px-equivalent stroke, flat fills, 8x supersample
+downsampled LANCZOS, dark `#E5EAF1`/`#2DD4BF` and light `#3A4350`/`#1A8C7F`, no
+baked plate. None belongs in `atlas.json` `raster_only`.
+
+**File-kind glyphs.** The Copilot Artifacts panel drew one 2 px grey dot per
+row whatever the artifact was; these give it a type read at 20 px. All eight
+share the `_artifact_page()` silhouette (portrait sheet, folded top-right
+corner) so a mixed list scans as one family, and differ only in the motif inked
+into the lower two thirds — the page interior is ~10 px wide at 20 px, so each
+motif is one bold shape, never fine detail.
+
+- `file_image` — sun over a two-peak ridge (PNG/JPG/render).
+- `file_mesh` — subdivided wireframe triangle, edges only (STL/OBJ/PLY).
+- `file_step` — opaque three-face cube (STEP/IGES/SLDPRT). Hand-rolled rather
+  than `shaded_prism`: that helper's face alphas (36/54/72) read as a wireframe
+  box at any size, i.e. as `file_mesh`. Solid-vs-wireframe is the entire
+  distinction between the two, so the faces here are near-opaque and stepped in
+  value (235/150/100).
+- `file_doc` — accent title rule + two text rules (PDF/MD/TXT).
+- `file_data` — table grid with a filled header band (JSON/CSV/XML/YAML). A
+  grid, not braces: braces collapse into two blobs on the 20 px downsample.
+- `file_code` — bold angle brackets.
+- `file_archive` — two stacked crates under one strap. A zipper's teeth mush
+  into a grey bar below ~24 px, so the archive motif is one size class coarser.
+- `file_generic` — plain folded page, oversized fold, deliberately empty: the
+  fallback must not imply a kind it does not know.
+
+**Panel chrome.**
+
+- `artifacts` — stacked sheets with a corner fold, for the Copilot Artifacts
+  tab header. **Supersedes that panel's misuse of `team`**, the multi-person
+  glyph from the corporate/org iconography, which said "people" on a documents
+  panel. `team` keeps its cell and its PLM Project Hub meaning. Only two sheets
+  are drawn: at 20 px a third layer lands inside its neighbour's stroke and the
+  stack downsamples into a grey block.
+- `copy` — already in the inventory since v1 (two offset sheets, the standard
+  copy-to-clipboard mark) and reused as-is; no new cell, no redraw.
+
+**PLM Graph toolbar.**
+
+- `orbit_auto` — auto-rotate toggle: a body inside a tilted orbit with a motion
+  arrowhead. The orbit is deliberately flatter than the body is wide
+  (`ry < r_sphere`) so its near half crosses in FRONT of the body and its far
+  half is clipped behind it. A ring merely tangent to the sphere reads as an
+  eye, which is already `hide_show_eye`.
+- `depth_3d` — depth-cue toggle: three planes receding with perspective, near
+  plane wide/accent/opaque. Far-plane alpha bottoms out around 110; below that
+  the slate light-theme stroke vanishes on a light panel at 20 px and only two
+  planes read.
+- `legend` — three colour key dots (accent / warn / stroke), each labelled by a
+  short rule of decreasing length.
+- `isolate` — "show only this subtree": the kept node filled inside an accent
+  focus ring, three neighbours dimmed to outlines on dim links. Neighbour alpha
+  is 170, not the ~100 that reads as "dim" at 32 px — below ~150 they downsample
+  to nothing at 20 px and the glyph collapses into a plain target mark.

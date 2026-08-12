@@ -255,6 +255,12 @@ set(CHUDWARE_CORE_SOURCES
   src/core/engine_events.cpp
   # --- end Phase 4 ---
   src/ui_theme.cpp
+  # --- app-wide visual vocabulary + motion language ---
+  # kit.cpp is the ONE implementation of card / section header / row / chip / button / progress /
+  # status glyph / empty state; the per-workspace helpers forward here. anim.cpp owns the shared
+  # easing curves and the continuous-redraw frame request the idle throttle in app.cpp consumes.
+  src/ui/anim.cpp
+  src/ui/widgets/kit.cpp
   src/ui/tesseract.cpp  # brand mark: live 4D tesseract projection (copilot logo + Appearance preview)
   src/win_chrome.cpp
   src/stb_impl.cpp

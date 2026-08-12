@@ -19,7 +19,6 @@
 #include "../core/app_state.h"
 #include "../ui_theme.h"
 #include "layout.h"
-#include "doc_tabs.h"   // docTabStripHeight — the banner must clear the document tab strip
 #include "onboarding.h"
 #include "web_capabilities.h"
 #include "agent/http.h"
@@ -613,73 +612,100 @@ void drawAccountSettings(AppState& state) {
     }
 }
 
-// Frame-authoritative anchor rect for the decoration-less entitlement overlays.
-//
-// The raw main viewport is the WRONG reference: WorkPos.y is the bottom of the OS/title bar, so
-// anything pinned there draws on top of the ribbon (the read-only banner was covering half the
-// Manufacture ribbon's buttons), and WorkPos.y + WorkSize.y is the literal window bottom, under
-// the status bar. Subtracting a hardcoded ribbon-height guess is equally wrong — the real ribbon
-// height moves with DPI, the active tab and the Manufacture mode strip. ui::overlayBand() is the
-// same ribbon-bottom / status-bar-top band app.cpp publishes once per frame before any panel
-// draws, and is what the pinned columns and toasts already anchor to (see ui/toast.cpp).
-namespace {
-struct BandRect { float minX, minY, maxX, maxY; };
+// The read-only entitlement notice is RESERVED CHROME (see account_panel.h). It used to be a
+// decoration-less floating window pinned inside ui::overlayBand(); every refinement of WHERE to
+// pin it just moved which panel it covered next — the Manufacture ribbon, then the document tab
+// strip, then the PLM hub's breadcrumb/Refresh/search row. An overlay cannot be positioned
+// correctly for all nine workspaces because they do not agree on what lives at the top-left.
+// Reserving a strip between the ribbon and the dockspace is the fix that generalizes: the
+// dockspace, the doc-tab strip and both pinned columns all start beneath it, so it can never
+// cover anything, and the safety-relevant message can never be scrolled or collapsed away.
 
-BandRect entitlementBandRect() {
-    const OverlayBand& band = overlayBand();
-    if (band.valid) return {band.minX, band.minY, band.maxX, band.maxY};
-    // Pre-publish first frame only — fall back to the raw viewport work area.
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    return {vp->WorkPos.x, vp->WorkPos.y,
-            vp->WorkPos.x + vp->WorkSize.x, vp->WorkPos.y + vp->WorkSize.y};
+float entitlementBannerHeight(const AppState& state) {
+    if (!state.entitlementReadOnly) return 0.0f;
+    // One text line for the headline, one dim line for the status detail (when present), the
+    // action buttons, and the strip's own vertical padding. Derived from live font/frame metrics
+    // so it tracks DPI and font-size changes instead of drifting against them.
+    const float padY = 7.0f * uiScale;
+    const float lines = ImGui::GetTextLineHeight() +
+                        (state.entitlementStatus.empty() ? 0.0f
+                                                         : ImGui::GetTextLineHeightWithSpacing());
+    return padY * 2.0f + std::max(lines, ImGui::GetFrameHeight());
 }
-}  // namespace
 
-void drawEntitlementBanner(AppState& state) {
-    if (!state.entitlementReadOnly && !state.entitlementGraceExpiring) return;
-    const BandRect band = entitlementBandRect();
-    if (state.entitlementGraceExpiring && !state.entitlementReadOnly) {
-        ImGui::SetNextWindowPos(ImVec2(band.maxX - 12.0f * uiScale,
-                                       band.maxY - 12.0f * uiScale),
-                                ImGuiCond_Always, ImVec2(1.0f, 1.0f));
-        ImGui::SetNextWindowBgAlpha(0.88f);
-        if (ImGui::Begin("##entitlement_grace_chip", nullptr,
-                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
-                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav)) {
-            ImGui::TextUnformatted("Subscription check unavailable — reconnect within 3 days");
-        }
-        ImGui::End();
-        return;
-    }
+void drawEntitlementBanner(AppState& state, float x, float y, float w, float h) {
+    if (h <= 0.0f || !state.entitlementReadOnly) return;
 
-    // Slot the banner into the free viewport space: BELOW the doc-tab strip (which owns the very
-    // top of the band) and BETWEEN the pinned columns, so it can't cover the document tabs, the
-    // left rail's header chip or the Copilot column. overlayColumnEdge() returns a negative value
-    // for a column that didn't draw this frame — then the banner uses the full band width.
-    const float leftEdge = overlayColumnEdge(0) > band.minX ? overlayColumnEdge(0) : band.minX;
-    const float rightEdge = overlayColumnEdge(1) > leftEdge ? overlayColumnEdge(1) : band.maxX;
-    // Auto-resize would happily grow the card wider than the gap between the columns; clamp it and
-    // wrap the copy instead of letting it spill back over the chrome we just dodged. Left-aligned
-    // in that gap on purpose: the viewport HUD toolbar is anchored to the gap's RIGHT edge, so a
-    // centred card grew into it as soon as the window narrowed.
-    const float gapW = std::max(160.0f * uiScale, rightEdge - leftEdge - 24.0f * uiScale);
-    ImGui::SetNextWindowPos(ImVec2(leftEdge + 12.0f * uiScale,
-                                   band.minY + docTabStripHeight(state) + 8.0f * uiScale),
-                            ImGuiCond_Always, ImVec2(0.0f, 0.0f));
-    ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(gapW, FLT_MAX));
-    ImGui::SetNextWindowBgAlpha(0.94f);
-    if (ImGui::Begin("##entitlement_readonly_banner", nullptr,
-                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
-                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav)) {
-        ImGui::PushTextWrapPos(gapW - 2.0f * ImGui::GetStyle().WindowPadding.x);
-        ImGui::TextWrapped("Read-only — your files remain openable and exportable");
+    const float padX = 12.0f * uiScale;
+    const float padY = 7.0f * uiScale;
+    ImDrawList* fg = ImGui::GetBackgroundDrawList();
+    const ImVec2 p0(x, y), p1(x + w, y + h);
+
+    // Warning-toned wash rather than plain chrome: this is an account state the user needs to
+    // notice, but it is not an error and must not read as one. Alpha kept low so the strip reads
+    // as chrome tint, not as a modal band.
+    float bg[4];
+    Palette::withAlpha(palette.statusWarn, bg, 0.14f);
+    fg->AddRectFilled(p0, p1, Palette::toU32(bg));
+    float rule[4];
+    Palette::withAlpha(palette.statusWarn, rule, 0.55f);
+    fg->AddLine(ImVec2(p0.x, p1.y - 1.0f), ImVec2(p1.x, p1.y - 1.0f), Palette::toU32(rule),
+                std::max(1.0f, uiScale));
+
+    ImGui::SetNextWindowPos(p0, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX, padY));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    if (ImGui::Begin("##entitlement_readonly_strip", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                     ImGuiWindowFlags_NoScrollWithMouse)) {
+        // Actions are laid out from the RIGHT edge first so the headline gets whatever width is
+        // left and elides into it, instead of the buttons being pushed off a narrow window.
+        const float gap = 8.0f * uiScale;
+        const float signW = ImGui::CalcTextSize("Sign in").x + ImGui::GetStyle().FramePadding.x * 2;
+        const float mgmtW =
+            ImGui::CalcTextSize("Manage subscription").x + ImGui::GetStyle().FramePadding.x * 2;
+        const float actionsW = signW + mgmtW + gap;
+        const float textW = std::max(80.0f * uiScale, w - padX * 2.0f - actionsW - gap * 2.0f);
+
+        ImGui::BeginGroup();
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + textW);
+        ImGui::TextUnformatted("Read-only — your files remain openable and exportable");
         if (!state.entitlementStatus.empty())
             ImGui::TextDisabled("%s", state.entitlementStatus.c_str());
         ImGui::PopTextWrapPos();
-        if (ImGui::Button("Sign in")) beginDesktopAccountLogin(state);
+        ImGui::EndGroup();
+
         ImGui::SameLine();
+        ImGui::SetCursorPosX(w - padX - actionsW);
+        ImGui::SetCursorPosY((h - ImGui::GetFrameHeight()) * 0.5f);
+        if (ImGui::Button("Sign in")) beginDesktopAccountLogin(state);
+        ImGui::SameLine(0.0f, gap);
         if (ImGui::Button("Manage subscription"))
             openExternalHttpUrl("https://app.chudware.com/account/billing");
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+}
+
+void drawEntitlementGraceChip(AppState& state) {
+    if (!state.entitlementGraceExpiring || state.entitlementReadOnly) return;
+    // Transient, corner-anchored, and small enough that the band's bottom-right is genuinely
+    // free — the one entitlement surface an overlay is still the right shape for.
+    const OverlayBand& band = overlayBand();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float maxX = band.valid ? band.maxX : vp->WorkPos.x + vp->WorkSize.x;
+    const float maxY = band.valid ? band.maxY : vp->WorkPos.y + vp->WorkSize.y;
+    ImGui::SetNextWindowPos(ImVec2(maxX - 12.0f * uiScale, maxY - 12.0f * uiScale),
+                            ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.88f);
+    if (ImGui::Begin("##entitlement_grace_chip", nullptr,
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav)) {
+        ImGui::TextUnformatted("Subscription check unavailable — reconnect within 3 days");
     }
     ImGui::End();
 }

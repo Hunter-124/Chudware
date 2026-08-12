@@ -113,6 +113,14 @@ CONTRACT_NAMES: list[str] = [
     # row keeps its packed UVs). The app logged "unknown icon: 'ws_parts' /
     # 'ws_manufacture'" every run and fell through to procedural glyphs. ----
     "ws_parts", "ws_manufacture",
+    # ---- Copilot Artifacts + PLM Graph (Wave 0 overhaul, append-only; appended
+    # LAST so every pre-existing row keeps its packed UVs). The Artifacts panel
+    # drew one 2 px grey dot per row regardless of kind and borrowed `team` for
+    # its tab header; the PLM Graph toolbar had no glyphs at all. ----
+    "file_image", "file_mesh", "file_step", "file_doc", "file_data",
+    "file_code", "file_archive", "file_generic",
+    "artifacts",
+    "orbit_auto", "depth_3d", "legend", "isolate",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -3913,6 +3921,292 @@ def draw_context_cube(d, cell, p):
                      (q["lt"], q["lb"]), (q["rt"], q["rb"]), (q["lb"], q["bot"]),
                      (q["rb"], q["bot"]), (q["lt"], q["top"]), (q["rt"], q["top"])]:
             d.line([a, b], fill=_rgba(p.stroke, 180), width=nlw)
+
+# ---------------------------------------------------------------------------
+# Copilot Artifacts + PLM Graph (Wave 0 overhaul)
+# ---------------------------------------------------------------------------
+# Every file_* glyph shares one page silhouette so a mixed artifact list scans
+# as a single family; only the motif inked into the lower two thirds differs.
+# The 20 px cell is the binding constraint (a page interior is ~10 px wide
+# there), so each motif is one bold shape rather than fine detail.
+
+def _artifact_page(d, s, p, lw, fold=0.24):
+    """Portrait sheet with a folded top-right corner — the shared file_* body.
+
+    Returns the interior box (x0, y0, x1, y1) below the fold that callers ink
+    their kind motif into."""
+    x0, x1 = s * 0.15, s * 0.85
+    y0, y1 = s * 0.06, s * 0.94
+    f = s * fold
+    body = [(x0, y0), (x1 - f, y0), (x1, y0 + f), (x1, y1), (x0, y1)]
+    d.polygon(body, fill=_rgba(p.stroke, 18))
+    d.line(body + [body[0]], fill=p.stroke, width=lw)
+    d.polygon([(x1 - f, y0), (x1 - f, y0 + f), (x1, y0 + f)], fill=_rgba(p.accent, 60))
+    d.line([(x1 - f, y0), (x1 - f, y0 + f), (x1, y0 + f)], fill=p.stroke, width=lw)
+    return x0, y0 + f, x1, y1
+
+
+@icon("file_image")
+def draw_file_image(d, cell, p):
+    """Page + raster motif: a sun over a two-peak ridge (PNG/JPG/render)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _artifact_page(d, s, p, lw)
+    filled_circle(d, s * 0.35, s * 0.55, s * 0.065, p.warn)
+    ridge = [(s * 0.23, s * 0.85), (s * 0.42, s * 0.60), (s * 0.54, s * 0.73),
+             (s * 0.64, s * 0.60), (s * 0.77, s * 0.85)]
+    d.polygon(ridge, fill=_rgba(p.accent, 165))
+    polyline(d, ridge, p.accent, max(1, int(lw * 0.8)))
+
+
+@icon("file_mesh")
+def draw_file_mesh(d, cell, p):
+    """Page + a subdivided wireframe triangle (STL/OBJ/PLY).
+
+    Edges only, no face fill — that open read is the whole distinction from
+    file_step's opaque solid once both shrink to 20 px."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    mlw = max(1, int(lw * 0.8))
+    _artifact_page(d, s, p, lw)
+    a, b, c = (s * 0.24, s * 0.85), (s * 0.50, s * 0.42), (s * 0.76, s * 0.85)
+    mid = lambda u, v: ((u[0] + v[0]) * 0.5, (u[1] + v[1]) * 0.5)
+    ab, bc, ca = mid(a, b), mid(b, c), mid(c, a)
+    for u, v in ((a, b), (b, c), (c, a), (ab, bc), (bc, ca), (ca, ab)):
+        d.line([u, v], fill=p.accent, width=mlw)
+    for pt in (a, b, c):
+        filled_circle(d, pt[0], pt[1], mlw * 0.75, p.stroke)
+
+
+@icon("file_step")
+def draw_file_step(d, cell, p):
+    """Page + an opaque shaded cube (STEP/IGES/SLDPRT) — B-rep solid.
+
+    Hand-rolled rather than shaded_prism: that helper's face alphas (36/54/72)
+    are transparent enough that the cube reads as a wireframe box, which is
+    exactly file_mesh. Here the three faces are near-opaque and stepped in
+    value, so solid-vs-wireframe survives the 20 px downsample."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    clw = max(1, int(lw * 0.8))
+    _artifact_page(d, s, p, lw)
+    x, y, w, h = s * 0.28, s * 0.62, s * 0.32, s * 0.22
+    dx, dy = s * 0.14, s * 0.11
+    top = [(x, y), (x + dx, y - dy), (x + w + dx, y - dy), (x + w, y)]
+    side = [(x + w, y), (x + w + dx, y - dy), (x + w + dx, y + h - dy), (x + w, y + h)]
+    front = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+    d.polygon(front, fill=_rgba(p.accent, 235))
+    d.polygon(side, fill=_rgba(p.accent, 150))
+    d.polygon(top, fill=_rgba(p.accent, 100))
+    for pts in (front, side, top):
+        d.line(pts + [pts[0]], fill=p.accent, width=clw)
+
+
+@icon("file_doc")
+def draw_file_doc(d, cell, p):
+    """Page + text rules with a short accent title line (PDF/MD/TXT)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    rlw = max(1, int(lw * 0.8))
+    _artifact_page(d, s, p, lw)
+    d.line([(s * 0.26, s * 0.47), (s * 0.56, s * 0.47)], fill=p.accent, width=lw)
+    for y, x1 in ((0.65, 0.75), (0.82, 0.64)):
+        d.line([(s * 0.26, s * y), (s * x1, s * y)], fill=_rgba(p.stroke, 195), width=rlw)
+
+
+@icon("file_data")
+def draw_file_data(d, cell, p):
+    """Page + a table grid with a filled header band (JSON/CSV/XML/YAML).
+
+    A grid survives the downsample where braces collapse into two blobs."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    glw = max(1, int(lw * 0.8))
+    _artifact_page(d, s, p, lw)
+    x0, x1, y0, y1 = s * 0.26, s * 0.74, s * 0.46, s * 0.85
+    hdr = y0 + (y1 - y0) * 0.34
+    d.rectangle([x0, y0, x1, hdr], fill=_rgba(p.accent, 165))
+    d.rectangle([x0, y0, x1, y1], outline=p.accent, width=glw)
+    d.line([(x0, hdr), (x1, hdr)], fill=p.accent, width=glw)
+    d.line([((x0 + x1) * 0.5, hdr), ((x0 + x1) * 0.5, y1)], fill=p.accent, width=glw)
+
+
+@icon("file_code")
+def draw_file_code(d, cell, p):
+    """Page + bold angle brackets — source / script artifacts."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    clw = max(2, int(lw * 1.05))
+    _artifact_page(d, s, p, lw)
+    polyline(d, [(s * 0.43, s * 0.48), (s * 0.27, s * 0.66), (s * 0.43, s * 0.84)],
+             p.accent, clw)
+    polyline(d, [(s * 0.57, s * 0.48), (s * 0.73, s * 0.66), (s * 0.57, s * 0.84)],
+             p.accent, clw)
+
+
+@icon("file_archive")
+def draw_file_archive(d, cell, p):
+    """Page + two stacked crates with a strap.
+
+    A zipper's teeth mush into a grey bar below ~24 px, so the archive reads as
+    boxed contents instead — same idea, one size class coarser."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    blw = max(1, int(lw * 0.8))
+    _artifact_page(d, s, p, lw)
+    d.rectangle([s * 0.22, s * 0.63, s * 0.78, s * 0.87],
+                fill=_rgba(p.stroke, 60), outline=p.stroke, width=blw)
+    d.rectangle([s * 0.32, s * 0.41, s * 0.68, s * 0.63],
+                fill=_rgba(p.accent, 160), outline=p.accent, width=blw)
+    # One strap running down both crates ties them into a single packed stack.
+    d.line([(s * 0.50, s * 0.41), (s * 0.50, s * 0.87)], fill=_rgba(p.stroke, 225),
+           width=blw)
+
+
+@icon("file_generic")
+def draw_file_generic(d, cell, p):
+    """Plain folded page — the fallback for an unrecognised extension.
+
+    Deliberately empty: an unknown kind must not imply one. The fold is
+    oversized so the blank body still reads as a sheet, not a rectangle."""
+    s = cell * SS
+    _artifact_page(d, s, p, stroke_width(cell), fold=0.31)
+
+
+@icon("artifacts")
+def draw_artifacts(d, cell, p):
+    """Stacked sheets with a folded corner — the Copilot Artifacts tab header.
+
+    Supersedes that panel's misuse of `team` (a multi-person org glyph). Only
+    two sheets: at 20 px a third layer lands inside its neighbour's stroke and
+    the stack turns into a grey block."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    blw = max(1, int(lw * 0.85))
+    back = [(s * 0.13, s * 0.08), (s * 0.61, s * 0.08), (s * 0.61, s * 0.70),
+            (s * 0.13, s * 0.70)]
+    d.line(back + [back[0]], fill=_rgba(p.stroke, 150), width=blw)
+    f = s * 0.20
+    fx0, fy0, fx1, fy1 = s * 0.31, s * 0.28, s * 0.87, s * 0.92
+    front = [(fx0, fy0), (fx1 - f, fy0), (fx1, fy0 + f), (fx1, fy1), (fx0, fy1)]
+    d.polygon(front, fill=_rgba(p.stroke, 30))
+    d.line(front + [front[0]], fill=p.stroke, width=lw)
+    d.polygon([(fx1 - f, fy0), (fx1 - f, fy0 + f), (fx1, fy0 + f)],
+              fill=_rgba(p.accent, 90))
+    d.line([(fx1 - f, fy0), (fx1 - f, fy0 + f), (fx1, fy0 + f)], fill=p.stroke, width=lw)
+    d.line([(s * 0.40, s * 0.72), (s * 0.70, s * 0.72)], fill=p.accent, width=blw)
+
+
+@icon("orbit_auto")
+def draw_orbit_auto(d, cell, p):
+    """Auto-rotate: a body inside a tilted orbit carrying a motion arrowhead.
+
+    The orbit is deliberately FLATTER than the body is wide (ry < r_sphere), so
+    the near half crosses in FRONT of the body and the far half is clipped
+    behind it. A ring tangent to the sphere instead reads as an eye — which is
+    already hide_show_eye."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    olw = max(1, int(lw * 0.85))
+    cx, cy = s * 0.50, s * 0.52
+    rx, ry = s * 0.44, s * 0.115
+    rs = s * 0.205
+    rot = math.radians(-16.0)
+    ca, sa = math.cos(rot), math.sin(rot)
+
+    def ep(t):
+        x, y = rx * math.cos(t), ry * math.sin(t)
+        return (cx + x * ca - y * sa, cy + x * sa + y * ca)
+
+    n = 96
+    near, far = [], []
+    for i in range(n):
+        t0, t1 = math.tau * i / n, math.tau * (i + 1) / n
+        seg = (ep(t0), ep(t1))
+        mx = ((seg[0][0] + seg[1][0]) * 0.5, (seg[0][1] + seg[1][1]) * 0.5)
+        if math.sin((t0 + t1) * 0.5) < 0.0:          # upper = far side
+            if math.hypot(mx[0] - cx, mx[1] - cy) > rs * 1.04:
+                far.append(seg)
+        else:
+            near.append(seg)
+    for a, b in far:
+        d.line([a, b], fill=_rgba(p.accent, 150), width=olw)
+    filled_circle(d, cx, cy, rs, _rgba(p.stroke, 85))
+    circle(d, cx, cy, rs, outline=p.stroke, lw=olw)
+    for a, b in near:
+        d.line([a, b], fill=p.accent, width=olw)
+    # Motion arrowhead riding the near half, pointing along travel.
+    ta = math.pi * 0.80
+    tip = ep(ta)
+    tan = (ep(ta + 0.06)[0] - ep(ta - 0.06)[0], ep(ta + 0.06)[1] - ep(ta - 0.06)[1])
+    tl = math.hypot(*tan) or 1.0
+    ux, uy = tan[0] / tl, tan[1] / tl
+    hl, hw = s * 0.16, s * 0.095
+    d.polygon([tip,
+               (tip[0] - ux * hl - uy * hw, tip[1] - uy * hl + ux * hw),
+               (tip[0] - ux * hl + uy * hw, tip[1] - uy * hl - ux * hw)],
+              fill=p.accent)
+
+
+@icon("depth_3d")
+def draw_depth_3d(d, cell, p):
+    """Depth cue: three planes receding with perspective — the near plane wide,
+    accent and opaque, the far ones narrower and dimmer."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    plw = max(1, int(lw * 0.7))
+    cx = s * 0.50
+    h = s * 0.055
+    # Far-plane alphas bottom out around 110: below that the slate light-theme
+    # stroke on a light panel disappears at 20 px and only two planes read.
+    for yc, hw, alpha, col in ((0.26, 0.19, 115, p.stroke),
+                               (0.51, 0.28, 165, p.stroke),
+                               (0.78, 0.37, 210, p.accent)):
+        y = s * yc
+        w = s * hw
+        sk = w * 0.34
+        pts = [(cx - w + sk, y - h), (cx + w + sk, y - h),
+               (cx + w - sk, y + h), (cx - w - sk, y + h)]
+        d.polygon(pts, fill=_rgba(col, alpha))
+        d.line(pts + [pts[0]], fill=_rgba(col, min(255, alpha + 65)), width=plw)
+
+
+@icon("legend")
+def draw_legend(d, cell, p):
+    """Legend key: three colour dots, each labelled by a short rule."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    r = s * 0.078
+    for y, x1, col in ((0.26, 0.86, p.accent), (0.50, 0.80, p.warn),
+                       (0.74, 0.72, p.stroke)):
+        filled_circle(d, s * 0.20, s * y, r, col)
+        d.line([(s * 0.38, s * y), (s * x1, s * y)], fill=_rgba(p.stroke, 195), width=lw)
+
+
+@icon("isolate")
+def draw_isolate(d, cell, p):
+    """Isolate subtree: the kept node sits filled inside a focus ring while its
+    neighbours drop to dim outlines on dim links."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    dlw = max(1, int(lw * 0.75))
+    cx, cy = s * 0.44, s * 0.53
+    ring = s * 0.245
+    nr = s * 0.095
+    # Dim, not invisible: at 20 px an alpha below ~150 downsamples to nothing and
+    # the glyph collapses into a plain target mark.
+    dim = _rgba(p.stroke, 170)
+    for nx, ny in ((0.84, 0.15), (0.85, 0.86), (0.13, 0.87)):
+        px, py = s * nx, s * ny
+        vx, vy = px - cx, py - cy
+        vl = math.hypot(vx, vy) or 1.0
+        d.line([(cx + vx / vl * ring, cy + vy / vl * ring),
+                (px - vx / vl * nr, py - vy / vl * nr)],
+               fill=_rgba(p.stroke, 110), width=dlw)
+        circle(d, px, py, nr, outline=dim, lw=dlw)
+    circle(d, cx, cy, ring, outline=p.accent, lw=max(1, int(lw * 0.9)))
+    filled_circle(d, cx, cy, s * 0.12, p.accent)
+
 
 
 # ---------------------------------------------------------------------------

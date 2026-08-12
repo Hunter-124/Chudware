@@ -130,6 +130,7 @@ inline void wasmBootDom(const char *msg) {
 #include "ui/firmware/fw_workspace.h" // T-FIN5 Firmware workspace (drawFirmwareWorkspace + shot fixture)
 #include "ui/manufacture/manufacture_panel.h" // P4 manufacturing operator surface + RPC dispatch
 #include "ui/manufacture/mfg_mirror.h" // complete read-only manufacturing mirror type
+#include "ui/anim.h" // shared motion language + the continuous-redraw frame request
 #include "ui/icons.h"
 #include "ui/layout.h" // Wave 1C/1D: buildDefaultLayout + tabbed left pane (drawLeftPane)
 #include "ui/property_manager.h"
@@ -3770,8 +3771,17 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // Input still wakes immediately. CEF's pump_if_due below still runs every
     // frame after wait; when browsers are live the 20 Hz floor is enough for
     // its deadline path, and note_browser_* still forces work.
+    //
+    // ui::anim::consumeFrameRequest() is the GENERAL hook: any painter that is
+    // mid-motion calls ui::anim::requestFrames() while it draws, and this reads
+    // and clears the flag once per frame. It must be consumed unconditionally
+    // (not short-circuited behind the other terms) or a busy frame would leave a
+    // stale request behind and pin the loop awake after the motion stopped.
+    // st.animActive stays separate: it is the 3D CAD camera tween's own flag and
+    // doc_tabs.cpp clears it on tab switches, so it is not a general-purpose pump.
     {
-      const bool busy = st.animActive || st.rebuildsInFlight > 0 ||
+      const bool wantFrames = ui::anim::consumeFrameRequest();
+      const bool busy = wantFrames || st.animActive || st.rebuildsInFlight > 0 ||
                         st.rpc.busy() || (st.simClient && st.simClient->busy());
       if (busy || shot) {
         glfwPollEvents();
@@ -5974,6 +5984,22 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       ui::drawManufactureModeBar(st, vp->Pos.x, vp->Pos.y + barH + ribbonH,
                                  vp->Size.x, mfgBarH);
 
+    // ---------- read-only entitlement strip ----------
+    // Same treatment, same reason: as a floating overlay it covered whichever
+    // workspace element happened to sit at the top-left (the PLM hub's
+    // breadcrumb / Refresh / search row was the last casualty). Reserved height
+    // is the only placement that is correct for every workspace.
+    // entitlementBannerHeight() returns 0 when the account is in good standing.
+#ifndef __EMSCRIPTEN__
+    const float entBarH = ui::entitlementBannerHeight(st);
+    if (entBarH > 0.0f)
+      ui::drawEntitlementBanner(st, vp->Pos.x,
+                                vp->Pos.y + barH + ribbonH + mfgBarH, vp->Size.x,
+                                entBarH);
+#else
+    const float entBarH = 0.0f;
+#endif
+
     // ---------- default starter document ----------
     // Open straight into a fresh part on launch (non-shot) so the app is
     // immediately usable.
@@ -5988,7 +6014,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // ---------- dockspace host (between the title bar+ribbon and the status
     // bar) ----------
     const float statusH = ImGui::GetTextLineHeight() + 8.0f * scale;
-    const float dockTopY = barH + ribbonH + mfgBarH;
+    const float dockTopY = barH + ribbonH + mfgBarH + entBarH;
     // Publish the full viewport overlay band BEFORE any panel draws —
     // drawLeftPane (layout.cpp) and the Copilot column read it via
     // ui::overlayBand(). Manufacture no longer owns a separate bottom CAM dock,
@@ -6063,7 +6089,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 #ifndef __EMSCRIPTEN__
     ui::tickAccountPanel(st);
     chudware::update::globalUpdater().setEntitlementToken(st.entitlementToken);
-    ui::drawEntitlementBanner(st);
+    // The read-only strip is chrome now (drawn above, before the dockspace);
+    // only the transient grace chip is still a corner overlay.
+    ui::drawEntitlementGraceChip(st);
 #endif
 
     // ---------- panels (pinned glass columns + floating dialogs over the

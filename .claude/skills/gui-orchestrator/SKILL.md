@@ -51,23 +51,30 @@ so workers load only their own subsystem's knowledge.
 | 3D viewport, rendering, picking, camera, overlays/HUD | `host/src/ui/viewport_panel.cpp`, `host/src/renderer.cpp`, `host/src/render/` | `.claude/skills/gui-viewport/SKILL.md` |
 | Ribbon tabs/buttons, feature tree, PropertyManager forms, command routing | `host/src/ui/ribbon_def.cpp`, `ui/widgets/ribbon.cpp`, `ui/feature_tree.cpp`, `ui/property_manager.cpp`, `ui/pm_forms.cpp` | `.claude/skills/gui-ribbon-commands/SKILL.md` |
 | 2D sketcher, 3D sketcher, constraints UI, dimensions | `host/src/ui/sketch_mode.cpp` (8.9k LOC), `ui/sketch3d_mode.cpp` | `.claude/skills/gui-sketch/SKILL.md` |
-| Workspace tabs: Parts Library, Assembly, CAM, ECAD, PLM, RevEng, AI/Activity, Drawing, Simulation | `host/src/ui/parts/`, `ui/asm_panels.cpp`, `ui/cam/`, `ui/ecad/`, `ui/plm/`, `ui/reveng/` (RevEng also reaches `host/src/platform/camera*.cpp` for capture work; its shared kit `ui/reveng/reveng_widgets.h` is frozen — see below), `ui/ai/`, `ui/drawing_panel.cpp`, `ui/sim_manager.cpp` | `.claude/skills/gui-workspaces/SKILL.md` |
+| Workspace tabs: Parts Library, Assembly, CAM, ECAD, PLM, RevEng, AI/Activity, Drawing, Simulation | `host/src/ui/parts/`, `ui/asm_panels.cpp`, `ui/cam/`, `ui/ecad/`, `ui/plm/`, `ui/reveng/` (RevEng also reaches `host/src/platform/camera*.cpp` for capture work; the per-workspace kits `ui/reveng/reveng_widgets.h`, `ui/plm/plm_hub.h`, `ui/parts/parts_widgets.h` are consume-only wrappers over `ui::kit` — see below), `ui/ai/`, `ui/drawing_panel.cpp`, `ui/sim_manager.cpp` | `.claude/skills/gui-workspaces/SKILL.md` |
 | Theme/colors/glass styling, dock layout, DPI/metrics, dialogs/modals, status bar, title bar, toasts | `host/src/ui_theme.cpp`, `ui/layout.cpp`, `ui/metrics.h`, `ui/settings_modal.cpp` | `.claude/skills/gui-theme-layout/SKILL.md` |
+| Shared widget/motion vocabulary — a new kit primitive, a new density token, a new easing | `host/src/ui/widgets/kit.h/.cpp`, `host/src/ui/anim.h/.cpp` | `.claude/skills/gui-theme-layout/SKILL.md` |
 
 **Shared/hot files — integrator-owned.** `host/src/app.cpp` (frame loop / panel dispatch),
 `host/src/core/app_state.h` (central data model), `host/src/ui/ribbon_def.cpp` (append-only
 command table), `host/src/ui/metrics.h` (append-only sizing tokens — now carries the `re*()`
 block the Reverse Engineering workspace sizes itself from; RE panel agents CALL `metrics::re*()`
-and never write pixel literals, but adding a token is an integrator edit), `ui_theme.cpp/.h`, and
-anything in `contracts/`. At most ONE agent per wave may touch a given shared file; if several
+and never write pixel literals, but adding a token is an integrator edit), `ui_theme.cpp/.h`,
+`host/src/ui/widgets/kit.h/.cpp` and `host/src/ui/anim.h/.cpp` (the app-wide widget and motion
+vocabularies — panel agents CONSUME them, and a new primitive is a dedicated earlier-wave agent),
+and anything in `contracts/`. At most ONE agent per wave may touch a given shared file; if several
 changes need the same one, either merge them into one agent or apply the shared-file edit
 yourself between waves. `contracts/` is append-only.
 
-**Frozen shared contract — `host/src/ui/reveng/reveng_widgets.h`** (`ui::reveng::kit`). Every
-Reverse Engineering panel draws with this kit; its header is the vocabulary all RE agents code
-against. Panel agents CONSUME it and MUST NOT edit it — if a wave genuinely needs a new kit
-widget, that is one dedicated agent owning `reveng_widgets.h/.cpp` in an earlier wave, exactly
-like the icon-before-ribbon-button ordering.
+**Every workspace's own kit is a THIN WRAPPER over `ui::kit`.** `ui/reveng/reveng_widgets.h`
+(`ui::reveng::kit`), `ui/plm/plm_hub.h`, `ui/parts/parts_widgets.h` and `ui/copilot/ui_common.cpp`
+keep their names and signatures — hundreds of call sites spell them that way — but their BODIES
+forward to `ui::kit`. Panel agents CONSUME those headers and MUST NOT edit them; if a wave
+genuinely needs a new widget, that is one dedicated agent owning `kit.h/.cpp` in an earlier wave,
+exactly like the icon-before-ribbon-button ordering. A helper whose body paints its own card,
+header, chip, empty state, progress bar or status glyph fails `gui_lint.py --rule dupe` — that
+duplication (eight empty-state painters, six section headers, five chip painters) is the whole
+reason the kit exists.
 
 ## Waves
 
@@ -80,9 +87,17 @@ Each subagent prompt must contain, so the worker never searches or guesses:
 - Read `<repo>/.claude/skills/<specialist>/SKILL.md` FIRST — it has the subsystem map.
 - The exact change, in the user's words plus your clarifications.
 - The exact files to edit (from the table + specialist skill).
-- Match surrounding style; colors only via `ui_theme` (lint enforces this); icons only from
-  `contracts/icons.md` inventory.
-- Verify with a compile: `./build.sh` from repo root (2–3 min, Ninja). Fix until green.
+- Match surrounding style; widgets from `ui::kit` and motion from `ui::anim` (never a hand-rolled
+  card/chip/empty state or a bare duration literal); colors only via `ui_theme`; icons only from
+  the `contracts/icons.md` inventory. Lint enforces all three.
+- Verify each item with a per-TU compile before starting the next one — **concurrent agents must
+  NOT run `./build.sh`**, it races on the Ninja lock:
+  `cd host/build-linux && ninja -t commands CMakeFiles/Chudware.dir/src/ui/<path>.o | tail -1 > /tmp/c.sh && sh /tmp/c.sh`
+  You gate the whole wave with `./build.sh` once, centrally.
+- **"Implement, do not narrate."** Put those words in the prompt. This cost a wave: agents given a
+  large multi-item brief spent their budget writing long design commentary and ran out mid-refactor,
+  leaving call sites without definitions and a non-compiling tree. Scope ONE feature cluster per
+  agent, and require a compile after EACH item so an interrupted run still leaves a green tree.
 - **Never run git** (leaf agents don't commit — you do).
 - Return: files changed, one-line summary per change, and one manual verification step
   ("open X panel, do Y, expect Z").
@@ -93,8 +108,12 @@ After a wave's agents return:
 
 ```bash
 ./build.sh                                   # must compile clean
-python3 scripts/gui_lint.py --rule theme     # if any wave touched colors/styling
+python3 scripts/gui_lint.py --rule theme     # applyTheme literal scale / FontGlobalScale
+python3 scripts/gui_lint.py --rule color     # IM_COL32/ImVec4 literals, GetStyleColorVec4 bypass
+python3 scripts/gui_lint.py --rule glyph     # codepoints the font has no cell for (render as '?')
+python3 scripts/gui_lint.py --rule dupe      # a second implementation of a ui::kit primitive
 python3 scripts/gui_lint.py --rule icons     # if any wave touched icons/ribbon
+python3 scripts/gui_lint.py --rule scale     # unscaled pixel literals in ImGui geometry
 git add -A && git commit -m "gui: <wave summary>"   # one commit per wave
 git push origin master                       # push as you go, every wave
 ```

@@ -3120,6 +3120,80 @@ Proj3 makeProjTarget(const GraphTabState &G) {
   return makeProjAt(G.orbitYawT, G.orbitPitchT);
 }
 
+// Ease the LIVE camera toward its target, once per frame, before makeProj. This is the
+// single place the camera actually moves; every input site writes only targets.
+//
+// Camera-side only, by construction: it writes orbitYaw/orbitPitch/pan/zoom, which feed
+// nothing but Proj3 at paint time. It never touches G.force or GNode::lx/ly/lz, so the
+// frozen hierarchy pack cannot be disturbed by any of it — that invariant is what makes
+// this whole feature safe (see the skill: force polish of ANY strength homogenizes the
+// tree into a blob).
+//
+// Frames: anim::toward requests them while it is moving and stops when it settles, so a
+// camera at rest lets the app fall back to its 20 Hz idle. Drift, when it engages,
+// deliberately holds 60 fps — hence the gates on it.
+void tickCamera(GraphTabState &G, ImVec2 origin, ImVec2 canvasSz, bool hovered) {
+  (void)origin;
+  (void)canvasSz;
+  const double now = ImGui::GetTime();
+  const float dt = ui::anim::dt();
+
+  // ---- orbit throw: release a drag and the graph keeps turning, decaying to rest.
+  // Velocity feeds the TARGET so the tween below stays the only thing that moves the
+  // live camera. tau 0.20s => visually at rest in ~0.6s.
+  if (!G.orbitDragging && G.view3d &&
+      (std::fabs(G.orbitVelYaw) > 1e-4f || std::fabs(G.orbitVelPitch) > 1e-4f)) {
+    G.orbitYawT += G.orbitVelYaw * dt;
+    G.orbitPitchT =
+        std::clamp(G.orbitPitchT + G.orbitVelPitch * dt, -1.35f, 1.35f);
+    const float decay = std::exp(-dt / 0.20f);
+    G.orbitVelYaw *= decay;
+    G.orbitVelPitch *= decay;
+    if (std::fabs(G.orbitVelYaw) < 1e-4f) G.orbitVelYaw = 0.0f;
+    if (std::fabs(G.orbitVelPitch) < 1e-4f) G.orbitVelPitch = 0.0f;
+    ui::anim::requestFrames();
+  }
+
+  // ---- idle drift ("cinematic"): a slow yaw the user did not ask for, so it must be
+  // easy to defeat and must never fight a reading task. Three gates, all deliberate:
+  // nothing selected (reading a node), no search query (hunting a match), and ~6s since
+  // the last pointer input. It also does NOT set userNavigated — doing so would silently
+  // disable the Fit-on-settle behaviour for the rest of the session.
+  const bool driftAllowed = G.autoOrbit && G.view3d && !G.orbitDragging &&
+                            G.selectedId.empty() && G.search[0] == '\0' &&
+                            G.orbitVelYaw == 0.0f &&
+                            (now - G.lastInputT) > 6.0;
+  if (driftAllowed) {
+    G.orbitYawT += 0.02f * dt;
+    ui::anim::requestFrames();
+  }
+
+  // ---- cursor parallax: the projection leans a few degrees toward the pointer's offset
+  // from canvas centre. Bounded hard at ~0.06 rad — this is depth cueing, not a second
+  // orbit control, and anything larger reads as the graph sliding around under the mouse.
+  float parYawT = 0.0f, parPitchT = 0.0f;
+  if (G.view3d && hovered && canvasSz.x > 1.0f && canvasSz.y > 1.0f) {
+    const ImVec2 mp = ImGui::GetIO().MousePos;
+    const float nx =
+        std::clamp((mp.x - (origin.x + canvasSz.x * 0.5f)) / (canvasSz.x * 0.5f), -1.0f, 1.0f);
+    const float ny =
+        std::clamp((mp.y - (origin.y + canvasSz.y * 0.5f)) / (canvasSz.y * 0.5f), -1.0f, 1.0f);
+    parYawT = nx * 0.06f;
+    parPitchT = ny * 0.04f;
+  }
+  G.parYaw = ui::anim::toward(ImGui::GetID("##plmg_par_yaw"), parYawT, ui::anim::kFast);
+  G.parPitch = ui::anim::toward(ImGui::GetID("##plmg_par_pitch"), parPitchT, ui::anim::kFast);
+
+  // ---- the tween. kSlow while a framing move (Fit / fly-to) is in flight so it reads as
+  // a dolly; kBase otherwise so ordinary navigation still feels immediate.
+  const float dur = now < G.flyUntil ? ui::anim::kSlow : ui::anim::kBase;
+  G.orbitYaw = ui::anim::toward(ImGui::GetID("##plmg_yaw"), G.orbitYawT, dur);
+  G.orbitPitch = ui::anim::toward(ImGui::GetID("##plmg_pitch"), G.orbitPitchT, dur);
+  G.zoom = ui::anim::toward(ImGui::GetID("##plmg_zoom"), G.zoomT, dur);
+  G.panX = ui::anim::toward(ImGui::GetID("##plmg_panx"), G.panXT, dur);
+  G.panY = ui::anim::toward(ImGui::GetID("##plmg_pany"), G.panYT, dur);
+}
+
 // Returns perspective scale in perspOut (1 = at focal plane).
 void projectPoint(const GraphTabState &G, const Proj3 &P, float lx, float ly,
                   float lz, float &px, float &py, float &perspOut) {
@@ -4115,18 +4189,52 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     G.wasSettled = nowSettled;
   }
 
-  // Zoom (wheel) around cursor.
+  // Fit is NOT only a settle-transition concern, and treating it as one was a real bug: a WARM
+  // layout cache restores node positions with the sim already settled, so the block above never
+  // runs, the pending fit is never consumed, and the tab opens at pan=0 / zoom=1 with the layout
+  // wherever the cache happened to leave it — i.e. clipped into the top-left corner, which is
+  // exactly how the Graph tab has been presenting itself. Consume the request here instead, as
+  // soon as there is something to frame and a canvas to frame it in. Writes camera targets only.
+  if (G.fitOnSettle && !G.userNavigated && !G.visibleIdx.empty() &&
+      canvasSz.x > 1.0f && canvasSz.y > 1.0f) {
+    fitView(G, canvasSz);
+    G.fitOnSettle = false;
+    // Land the framing immediately on the first paint rather than easing in from the default
+    // camera: an opening dolly from a wrong position reads as a glitch, not as polish.
+    G.orbitYaw = G.orbitYawT;
+    G.orbitPitch = G.orbitPitchT;
+    G.zoom = G.zoomT;
+    G.panX = G.panXT;
+    G.panY = G.panYT;
+    ui::anim::forget(ImGui::GetID("##plmg_zoom"));
+    ui::anim::forget(ImGui::GetID("##plmg_panx"));
+    ui::anim::forget(ImGui::GetID("##plmg_pany"));
+    ui::anim::forget(ImGui::GetID("##plmg_yaw"));
+    ui::anim::forget(ImGui::GetID("##plmg_pitch"));
+  }
+
+  // ---- camera: ONE authority ------------------------------------------------
+  // Every input below writes the camera TARGET, and the tick at the end eases the
+  // live camera there. That single rule is what makes Fit, fly-to, orbit throw and
+  // idle drift read as a dolly instead of a jump cut — and it is why the inputs
+  // must not touch the live values: two writers would fight every frame.
+  // Nothing here goes anywhere near G.force or GNode::lx/ly/lz, so the frozen
+  // hierarchy pack is untouched by all of it.
+
+  // Zoom (wheel) around cursor. Solved against the LIVE camera so the point under
+  // the pointer stays put during a fast scroll, then expressed as a target.
   if (hovered) {
     float wheel = ImGui::GetIO().MouseWheel;
     if (wheel != 0.0f) {
       G.userNavigated = true;
+      G.lastInputT = ImGui::GetTime();
       ImVec2 mp = ImGui::GetIO().MousePos;
       float lx = (mp.x - origin.x - G.panX) / G.zoom;
       float ly = (mp.y - origin.y - G.panY) / G.zoom;
-      G.zoom =
+      G.zoomT =
           std::clamp(G.zoom * (wheel > 0 ? 1.12f : 1.0f / 1.12f), 0.12f, 6.0f);
-      G.panX = (mp.x - origin.x) - lx * G.zoom;
-      G.panY = (mp.y - origin.y) - ly * G.zoom;
+      G.panXT = (mp.x - origin.x) - lx * G.zoomT;
+      G.panYT = (mp.y - origin.y) - ly * G.zoomT;
     }
   }
 
@@ -4138,21 +4246,47 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
        (!G.view3d && ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
         G.hoverId.empty() && !ImGui::GetIO().KeyCtrl))) {
     G.userNavigated = true;
+    G.lastInputT = ImGui::GetTime();
     ImVec2 d = ImGui::GetIO().MouseDelta;
+    // A drag must track the pointer 1:1, so it advances BOTH the target and the
+    // live value: easing a pan would feel like dragging through treacle.
+    G.panXT += d.x;
+    G.panYT += d.y;
     G.panX += d.x;
     G.panY += d.y;
   }
 
   // Orbit: left-drag on empty background rotates the 3D projection
   // (view3d only; swapped with pan per CAD convention).
-  if (G.view3d && hovered && G.dragNode < 0 && G.dragCandidate < 0 &&
+  const bool orbitDragNow =
+      G.view3d && hovered && G.dragNode < 0 && G.dragCandidate < 0 &&
       G.hoverId.empty() && !ImGui::GetIO().KeyCtrl &&
-      ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+      ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+  if (orbitDragNow) {
     G.userNavigated = true;
+    G.lastInputT = ImGui::GetTime();
     ImVec2 d = ImGui::GetIO().MouseDelta;
-    G.orbitYaw += d.x * 0.008f;
-    G.orbitPitch = std::clamp(G.orbitPitch + d.y * 0.008f, -1.35f, 1.35f);
+    G.orbitYawT += d.x * 0.008f;
+    G.orbitPitchT = std::clamp(G.orbitPitchT + d.y * 0.008f, -1.35f, 1.35f);
+    G.orbitYaw = G.orbitYawT;      // 1:1 while held, same reason as pan
+    G.orbitPitch = G.orbitPitchT;
+    // Capture angular velocity for the throw. dt() is clamped, so a stall cannot
+    // record an absurd fling.
+    const float dt = ui::anim::dt();
+    if (dt > 0.0f) {
+      G.orbitVelYaw = d.x * 0.008f / dt;
+      G.orbitVelPitch = d.y * 0.008f / dt;
+    }
   }
+  if (G.orbitDragging && !orbitDragNow && !G.view3d) {
+    G.orbitVelYaw = G.orbitVelPitch = 0.0f;   // never throw a 2D view
+  }
+  G.orbitDragging = orbitDragNow;
+  if (hovered && (ImGui::GetIO().MouseDelta.x != 0.0f ||
+                  ImGui::GetIO().MouseDelta.y != 0.0f))
+    G.lastInputT = ImGui::GetTime();
+
+  tickCamera(G, origin, canvasSz, hovered);
 
   // 3D projection state: trig precomputed once per frame, O(1) per point.
   const Proj3 P = makeProj(G);

@@ -268,6 +268,15 @@ def test_redact_secrets_strips_credentials():
     assert "TUNNEL_TOKEN=[REDACTED]" in out
 
 
+def test_redact_secrets_strips_auth_query_values():
+    raw = "GET /api/auth/callback?code=provider-code&state=csrf-state&token=bearer-token HTTP/1.1"
+    out = _redact_secrets(raw)
+    assert "provider-code" not in out
+    assert "csrf-state" not in out
+    assert "bearer-token" not in out
+    assert out.count("[REDACTED]") == 3
+
+
 def test_redact_secrets_leaves_ordinary_lines_intact():
     line = (
         "2026-07-28T10:00:00 INFO chudware-web: gateway up "

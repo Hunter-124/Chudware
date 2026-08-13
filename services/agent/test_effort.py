@@ -10,6 +10,8 @@ explicit ``config=`` dict; persistence tests monkeypatch services.paths.CONFIG.
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -283,6 +285,19 @@ def test_save_effort_settings_roundtrip(tmp_path, monkeypatch):
     on_disk = json.loads((tmp_path / "config.json").read_text())
     assert on_disk["ai_effort"]["level"] == "deliberate"
     assert on_disk["provider"] == "mock"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission contract")
+def test_save_config_uses_owner_only_directory_and_file_modes(tmp_path, monkeypatch):
+    from services import paths as engine_paths
+    from services.agent.config import save_config
+
+    config_dir = tmp_path / "nested"
+    monkeypatch.setattr(engine_paths, "CONFIG", config_dir / "config.json")
+    save_config({"keys": {"provider": "secret"}})
+    assert stat.S_IMODE(config_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((config_dir / "config.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((config_dir / "config.json.lock").stat().st_mode) == 0o600
 
 
 def test_save_rejects_structural_garbage_but_not_absurd_values(tmp_path, monkeypatch):

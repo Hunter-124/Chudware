@@ -20,6 +20,11 @@ from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 try:
+    from .auth import AuthError, revalidate_websocket_user
+except ImportError:
+    from auth import AuthError, revalidate_websocket_user  # type: ignore
+
+try:
     from .db import tx
     from .limits import chat_messages
 except ImportError:  # allow `python -c 'import chat'` from package dir
@@ -255,6 +260,11 @@ async def ws_chat(websocket: WebSocket) -> None:
 
         while True:
             raw = await websocket.receive_text()
+            try:
+                revalidate_websocket_user(websocket.scope)
+            except AuthError as exc:
+                await websocket.close(code=4401 if exc.status == 401 else 4403)
+                return
             text = ""
             try:
                 body = json.loads(raw)

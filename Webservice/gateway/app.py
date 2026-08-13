@@ -305,6 +305,9 @@ _REDACT_CFAT = re.compile(r"\bcfat_[A-Za-z0-9_-]+\b")
 _REDACT_ASSIGN = re.compile(
     r"\b([A-Z_][A-Z0-9_]*(?:_KEY|_SECRET|_TOKEN|KEY|SECRET|TOKEN))=([^\s]+)"
 )
+_REDACT_QUERY_SECRET = re.compile(
+    r"([?&](?:token|code|state)=)([^&#\s]+)", re.IGNORECASE
+)
 
 
 def _redact_secrets(text: str) -> str:
@@ -313,6 +316,7 @@ def _redact_secrets(text: str) -> str:
     text = _REDACT_BEARER.sub(r"\1[REDACTED]", text)
     text = _REDACT_CFAT.sub("[REDACTED-CFAT]", text)
     text = _REDACT_ASSIGN.sub(r"\1=[REDACTED]", text)
+    text = _REDACT_QUERY_SECRET.sub(r"\1[REDACTED]", text)
     return text
 
 

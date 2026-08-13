@@ -79,6 +79,16 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <random>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <unordered_map>
 
 #include <BRepBuilderAPI_MakeEdge.hxx>
@@ -837,35 +847,72 @@ TopoDS_Shape read_dxf_shape(const std::string& path) {
 // --------------------------------------------------------------------------- DWG import
 //
 // DWG is a proprietary binary format; we do NOT parse it in-process (license/complexity
-// isolation, same spirit as the SolidWorks COM lane). Instead we shell out to LibreDWG's
-// `dwg2dxf` CLI (GPL, kept fully out-of-process so this TU never links/embeds GPL code) to
-// convert to a temp .dxf, then reuse read_dxf_shape above — the C++ analogue of a Python
-// oracle that would call an external dwg->dxf converter before handing ezdxf the result.
+// isolation, same spirit as the SolidWorks COM lane). LibreDWG's GPL `dwg2dxf` remains
+// fully out-of-process. Arguments are passed as an argv vector, never through a shell.
+bool run_dwg2dxf(const std::string& output, const std::string& input) {
+#ifdef _WIN32
+    const char* argv[] = {"dwg2dxf", "-o", output.c_str(), input.c_str(), nullptr};
+    return ::_spawnvp(_P_WAIT, argv[0], argv) == 0;
+#else
+    const pid_t pid = ::fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        const int null_fd = ::open("/dev/null", O_WRONLY);
+        if (null_fd >= 0) {
+            (void)::dup2(null_fd, STDOUT_FILENO);
+            (void)::dup2(null_fd, STDERR_FILENO);
+            ::close(null_fd);
+        }
+        const char* argv[] = {"dwg2dxf", "-o", output.c_str(), input.c_str(), nullptr};
+        ::execvp(argv[0], const_cast<char* const*>(argv));
+        ::_exit(127);
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
+}
+
+}  // namespace
+
 std::string dwg_to_temp_dxf(const std::string& path) {
-    const std::string stem = std::filesystem::path(path).stem().string();
     std::error_code ec;
     std::filesystem::path tmp_dir = std::filesystem::temp_directory_path(ec);
     if (ec) tmp_dir = std::filesystem::path(".");
-    std::filesystem::path out_dxf = tmp_dir / (stem + "_aicad_dwg2dxf.dxf");
-
-    std::error_code rm_ec;
-    std::filesystem::remove(out_dxf, rm_ec);  // start clean so a stale file can't fool us
-
-    std::ostringstream cmd;
-    cmd << "dwg2dxf -o \"" << out_dxf.string() << "\" \"" << path << "\"";
-#ifndef _WIN32
-    cmd << " >/dev/null 2>&1";
+    std::random_device random;
+    std::filesystem::path out_dxf;
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        const auto nonce = (static_cast<std::uint64_t>(random()) << 32) ^ random();
+        out_dxf = tmp_dir / ("chudware-dwg2dxf-" + std::to_string(nonce) + ".dxf");
+#ifdef _WIN32
+        HANDLE reservation = CreateFileW(out_dxf.wstring().c_str(), GENERIC_WRITE, 0, nullptr,
+                                         CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (reservation != INVALID_HANDLE_VALUE) { CloseHandle(reservation); break; }
+#else
+        const int reservation = ::open(out_dxf.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (reservation >= 0) { ::close(reservation); break; }
 #endif
-    std::system(cmd.str().c_str());  // NOLINT — deliberate subprocess call, output discarded
+        out_dxf.clear();
+    }
+    if (out_dxf.empty())
+        throw OpError("import_failed", "DWG import could not reserve a private temporary output.",
+                      {{"path", path}, {"format", "dwg"}});
 
-    if (std::filesystem::exists(out_dxf) && std::filesystem::file_size(out_dxf, ec) > 0 && !ec)
+    const bool converted = run_dwg2dxf(out_dxf.string(), path);
+    if (converted && std::filesystem::exists(out_dxf, ec) &&
+        std::filesystem::file_size(out_dxf, ec) > 0 && !ec)
         return out_dxf.string();
 
+    std::filesystem::remove(out_dxf, ec);
     throw OpError("import_failed",
                   "DWG import needs a DWG->DXF converter (LibreDWG dwg2dxf) on PATH; none "
                   "found or conversion failed. Or convert to DXF/STEP first.",
                   {{"path", path}, {"format", "dwg"}});
 }
+
+namespace {
 
 #ifdef CHUDWARE_WITH_OPENNURBS
 // A named mesh pulled out of a .3dm object — the C++ analogue of the oracle's
@@ -2113,8 +2160,8 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
             return {{stem.empty() ? std::string("dxf") : stem, shape}};
         }
         if (fmt == "dwg") {
-            // DWG has no in-process reader here (proprietary binary) — shell out to
-            // LibreDWG's dwg2dxf, then reuse the DXF lane above on the converted file.
+            // DWG has no in-process reader here (proprietary binary) — run LibreDWG's
+            // dwg2dxf with literal argv, then reuse the DXF lane above.
             std::string tmp_dxf = dwg_to_temp_dxf(path);
             TopoDS_Shape shape = read_dxf_shape(tmp_dxf);
             std::error_code ec;

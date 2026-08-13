@@ -57,10 +57,10 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from starlette.websockets import WebSocketState
 
 try:
-    from .auth import get_current_user
+    from .auth import AuthError, get_current_user, revalidate_websocket_user
     from .config import settings
 except ImportError:  # uvicorn app:app from package dir
-    from auth import get_current_user
+    from auth import AuthError, get_current_user, revalidate_websocket_user
     from config import settings
 
 log = logging.getLogger("chudware-web.terminal")
@@ -941,6 +941,11 @@ async def admin_terminal(ws: WebSocket) -> None:
             except Exception:  # noqa: BLE001
                 break
             if msg.get("type") == "websocket.disconnect":
+                break
+            try:
+                revalidate_websocket_user(ws.scope, required_role="admin")
+            except AuthError as exc:
+                await ws.close(code=4401 if exc.status == 401 else 4403)
                 break
             last_activity = loop.time()
             if "bytes" in msg and msg["bytes"] is not None:

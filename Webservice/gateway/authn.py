@@ -299,11 +299,11 @@ def trial_expired(email: str) -> bool:
 def create_session(
     email: str, *, user_agent: str = "", ip: str = "", ttl: timedelta | None = None
 ) -> str:
-    """Mint a session row and return its id.
+    """Mint a bearer session id, persist only its SHA-256 digest, and return the raw id.
 
-    256 bits from ``secrets`` — the id is the entire bearer credential, so it
-    gets the full width rather than a truncated uuid. ``ttl`` overrides the
-    configured absolute expiry; only the ops CLI below passes it.
+    The raw 256-bit value exists only in the cookie. A database dump therefore
+    cannot authenticate as a user, while deterministic SHA-256 still permits
+    indexed lookup and revocation without a schema change.
     """
     sid = secrets.token_urlsafe(32)
     expires = _now() + (ttl or timedelta(days=max(1, int(settings.session_ttl_days))))
@@ -311,7 +311,7 @@ def create_session(
         cur.execute(
             "INSERT INTO sessions (sid, email, expires_at, user_agent, ip)"
             " VALUES (%s, %s, %s, %s, %s)",
-            (sid, email, expires, user_agent[:512], _inet_or_none(ip)),
+            (token_hash(sid), email, expires, user_agent[:512], _inet_or_none(ip)),
         )
     return sid
 
@@ -329,14 +329,15 @@ def lookup_session(sid: str) -> str | None:
         cur.execute(
             "SELECT email, last_seen_at FROM sessions"
             " WHERE sid = %s AND revoked_at IS NULL AND expires_at > now()",
-            (sid,),
+            (token_hash(sid),),
         )
         row = cur.fetchone()
         if row is None:
             return None
         if row["last_seen_at"] <= _now() - _TOUCH_INTERVAL:
             cur.execute(
-                "UPDATE sessions SET last_seen_at = now() WHERE sid = %s", (sid,)
+                "UPDATE sessions SET last_seen_at = now() WHERE sid = %s",
+                (token_hash(sid),),
             )
     return row["email"]
 
@@ -348,7 +349,7 @@ def revoke_session(sid: str) -> None:
         cur.execute(
             "UPDATE sessions SET revoked_at = now()"
             " WHERE sid = %s AND revoked_at IS NULL",
-            (sid,),
+            (token_hash(sid),),
         )
 
 

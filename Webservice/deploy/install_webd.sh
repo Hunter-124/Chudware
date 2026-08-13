@@ -280,6 +280,30 @@ for raw in path.read_text(encoding="utf-8").splitlines():
 print(value, end="")
 PY
 }
+with_pgpass() {
+  local dsn="$1"; shift
+  local pgpass rc safe_dsn
+  pgpass="$(mktemp)"
+  chmod 600 "$pgpass"
+  safe_dsn="$(DB_DSN="$dsn" "$PYTHON" - "$pgpass" <<'PY'
+import os, sys
+from pathlib import Path
+from urllib.parse import quote, unquote, urlparse
+d = urlparse(os.environ["DB_DSN"])
+if d.scheme not in {"postgres", "postgresql"}:
+    raise SystemExit("database URL must use PostgreSQL")
+host, port = d.hostname or "localhost", d.port or 5432
+database, user = unquote(d.path.lstrip("/")), unquote(d.username or "")
+password = unquote(d.password or "")
+esc = lambda value: str(value).replace("\\", "\\\\").replace(":", "\\:")
+Path(sys.argv[1]).write_text(":".join(map(esc, (host, port, database, user, password))) + "\n")
+print(f"postgresql://{quote(user, safe='') + '@' if user else ''}{host}:{port}/{quote(database, safe='')}")
+PY
+)" || { rm -f "$pgpass"; return 1; }
+  if PGPASSFILE="$pgpass" "$@" "$safe_dsn"; then rc=0; else rc=$?; fi
+  rm -f "$pgpass"
+  return "$rc"
+}
 
 probe_engine_bridges() {
   local body
@@ -316,7 +340,7 @@ if [ "$RUNNING" = 1 ] && { [ "$NEEDS_RESTART" = 1 ] || [ "$REQUIRE_IDLE" = 1 ]; 
     HEALTH_DB_URL="$(read_env_value "$GATEWAY_ENV" CHUDWARE_DB_URL)"
     [ -n "$HEALTH_DB_URL" ] || fatal "CHUDWARE_DB_URL missing from $GATEWAY_ENV; cannot select a loopback identity"
     command -v psql >/dev/null 2>&1 || fatal "psql not found; install postgresql to read the account store"
-    if ! HEALTH_EMAIL="$(psql "$HEALTH_DB_URL" -tAXq -v ON_ERROR_STOP=1 -c \
+    if ! HEALTH_EMAIL="$(with_pgpass "$HEALTH_DB_URL" psql --no-password -tAXq -v ON_ERROR_STOP=1 -c \
       "SELECT email FROM accounts WHERE status='active' ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, email LIMIT 1")"; then
       fatal "could not read an active loopback identity from the account store"
     fi

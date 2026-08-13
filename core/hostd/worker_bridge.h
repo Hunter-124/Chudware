@@ -1,10 +1,10 @@
-// Lazily-spawned Python worker bridge for chudware-hostd.
+// Lazily-spawned services worker bridge for chudware-hostd.
 //
 // On web the browser talks only to hostd (via the gateway websocket). Methods the
 // C++ engine does not implement (plm_*, git_*, ai_roles_*, provider accounts, …)
-// live in `python -m services.worker_main`. This bridge owns ONE long-lived worker
-// subprocess and forwards those engine-unknown RPCs over stdio JSON-RPC — the
-// same protocol services/worker/worker_client.cpp uses on desktop.
+// live in the services worker. This bridge owns ONE long-lived subprocess and
+// forwards those engine-unknown RPCs over stdio JSON-RPC — the same protocol
+// services/worker/worker_client.cpp uses on desktop.
 //
 // Desktop GUI behaviour is unchanged: it still owns its own WorkerClient. This
 // path is the hostd fallback only.
@@ -31,7 +31,7 @@ class WorkerBridge {
 public:
     static WorkerBridge& instance();
 
-    // Send {method, params} to the Python worker; block until the matching
+    // Send {method, params} to the services worker; block until the matching
     // response (default 120 s — plm_overview on a large project is 10–30 s).
     //
     // Returns true on ok:true (result filled). Returns false on transport
@@ -70,9 +70,11 @@ private:
     std::string readBuf_;
     int nextId_ = 1;
     bool running_ = false;
-    // Resolved once on first spawn.
-    std::string python_;
+    // Resolved once on first spawn. Packaged builds use only the canonical adjacent worker;
+    // developer builds retain CHUDWARE_WORKER_BIN / CHUDWARE_PYTHON source execution.
+    std::string workerBin_;
     std::string repo_;
+    bool compiledWorker_ = false;
     bool pathsResolved_ = false;
 #endif
 

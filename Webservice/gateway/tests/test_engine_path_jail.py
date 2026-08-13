@@ -49,6 +49,10 @@ def rpc(method: str, params: object, call_id: int = 1) -> str:
         rpc("agent_run_v2", {"ctx": {"project_dir": "/home/liveuser"}}),
         # A path-bearing key nested two levels deep.
         rpc("thing", {"a": {"b": {"target": "/var/log/messages"}}}),
+        # Relative paths would be resolved against the shared daemon's cwd and
+        # must not bypass containment, including values nested in arrays/maps.
+        rpc("doc_open", {"path": "relative/part.step+"}),
+        rpc("batch", {"ops": [{"options": {"output_path": "out/result.step+"}}]}),
     ],
 )
 def test_cross_tenant_paths_are_rejected(line: str) -> None:
@@ -64,9 +68,7 @@ def test_cross_tenant_paths_are_rejected(line: str) -> None:
         rpc("doc_save", {"path": "/srv/bucket/users/alice~40ua.edu/out.step+"}),
         # Scratch space used for mesh/tess payloads.
         rpc("doc_render", {"aicm_path": "/tmp/mesh-1234.aicm"}),
-        # Relative paths are resolved by the daemon against its own cwd, never
-        # against another account's tree, so they are not a cross-tenant vector.
-        rpc("doc_open", {"path": "relative/part.step+"}),
+        # Canonical absolute paths are required for every path-bearing field.
         # Non-path payloads must pass through untouched.
         rpc("hello", {"client": "gui"}),
         rpc("doc_rebuild", {"doc_id": "abc123"}),

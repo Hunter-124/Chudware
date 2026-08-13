@@ -7,8 +7,8 @@
 #   sudo ./harden_host.sh --apply firewall
 #   sudo ./harden_host.sh --apply launch
 #
-# "launch" deliberately excludes sudo and sshd. Those two controls remain
-# owner-declined because they affect the management path.
+# "launch" includes removing general sudo from the service identity. Operators
+# must provision and verify a separate administrator before applying it.
 set -euo pipefail
 
 APPLY=0
@@ -25,7 +25,7 @@ SVC_USER="${CHUDWARE_SERVICE_USER:-liveuser}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SVC_HOME="$(getent passwd "$SVC_USER" | cut -d: -f6)"
 SVC_UID="$(id -u "$SVC_USER")"
-SAFE_ITEMS=" firewall tunnel updates keys backups gateway "
+SAFE_ITEMS=" sudo firewall tunnel updates keys backups gateway "
 
 note() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 would() { printf '   \033[33mwould:\033[0m %s\n' "$*"; }
@@ -75,14 +75,14 @@ if (( APPLY )) && (( EUID != 0 )); then
 fi
 
 # ---------------------------------------------------------------------------
-# 1. sudo — deliberately declined for launch. Residual risk is documented in
-# RUNBOOK.md: a gateway RCE remains a root compromise while this stays enabled.
+# 1. sudo — least privilege is part of the launch default. Preflight output
+# explicitly warns that a separate administrator must exist before applying.
 # ---------------------------------------------------------------------------
 if show sudo; then
   note "sudo: remove passwordless root for the service account"
   if id -nG "$SVC_USER" 2>/dev/null | tr ' ' '\n' | grep -qx wheel; then
     echo "   $SVC_USER is currently in wheel with NOPASSWD:ALL."
-    echo "   NOTE: ensure another admin account exists before applying."
+    echo "   REQUIRED: verify another administrator before applying the launch profile."
     run sudo "remove $SVC_USER from wheel" gpasswd -d "$SVC_USER" wheel
     run sudo "require a password for wheel sudo" \
       bash -c 'printf "%%wheel ALL=(ALL:ALL) ALL\n" > /etc/sudoers.d/wheel-nopasswd && visudo -cf /etc/sudoers.d/wheel-nopasswd'
@@ -189,16 +189,18 @@ if show tunnel; then
     [[ "$token_line" == TUNNEL_TOKEN=?* ]] ||
       die "no non-empty TUNNEL_TOKEN found in $gateway_env or $tunnel_env"
 
-    tmp="$(mktemp)"
+    tmp="$(mktemp "${tunnel_env}.tmp.XXXXXX")"
     printf '%s\n' "$token_line" > "$tmp"
-    install -o "$SVC_USER" -g "$SVC_USER" -m 600 "$tmp" "$tunnel_env"
-    rm -f "$tmp"
+    chown "$SVC_USER:$SVC_USER" "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$tunnel_env"
 
     if [[ -f "$gateway_env" ]]; then
-      tmp="$(mktemp)"
+      tmp="$(mktemp "${gateway_env}.tmp.XXXXXX")"
       awk '$0 !~ /^TUNNEL_TOKEN=/' "$gateway_env" > "$tmp"
-      install -o "$SVC_USER" -g "$SVC_USER" -m 600 "$tmp" "$gateway_env"
-      rm -f "$tmp"
+      chown "$SVC_USER:$SVC_USER" "$tmp"
+      chmod 600 "$tmp"
+      mv -f "$tmp" "$gateway_env"
     fi
 
     install -o "$SVC_USER" -g "$SVC_USER" -m 644 "$unit_source" "$unit"

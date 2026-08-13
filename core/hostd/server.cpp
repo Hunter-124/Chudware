@@ -540,10 +540,10 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     }
     if (method == "ping") return json{{"ok", true}};
     const std::string authenticatedSeat = authenticatedPeerIdentity(c);
+    // hello.client is display/routing metadata only. It cannot attest a human at
+    // the keyboard, so manufacturing sees every raw socket as non-human.
     const chudware::mfg::LeaseOwner mfgCaller{
-        c.kind.empty() ? "unknown" : c.kind,
-        authenticatedSeat,
-        "hostd-client:" + std::to_string(c.id)};
+        "raw", authenticatedSeat, "hostd-client:" + std::to_string(c.id)};
     if (auto result = chudware::mfg::lane().handle(method, params, mfgCaller)) {
         isError = result->is_error;
         return std::move(result->body);

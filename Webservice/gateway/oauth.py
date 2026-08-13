@@ -17,8 +17,9 @@ only trustworthy when the tenant has proven it owns the domain.
 
 CSRF on the callback is the ``state`` parameter: a random nonce, HMAC-signed
 with the session secret and bound to the provider, stored as a SHA-256 in
-``email_tokens`` so redeeming it is atomically single-use, and expiring after
-ten minutes.
+``email_tokens`` so redeeming it is atomically single-use, and paired with a
+short-lived browser cookie so a stolen state cannot swap another browser's
+session.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from __future__ import annotations
 import hmac
 import logging
 import secrets
+from html import escape
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
@@ -69,6 +71,8 @@ MICROSOFT_ISSUER_TEMPLATE = f"{MICROSOFT_AUTHORITY}/{{tid}}/v2.0"
 MICROSOFT_MULTI_TENANT = frozenset({"common", "organizations", "consumers"})
 
 _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+OAUTH_TRANSACTION_COOKIE = "chudware_oauth_transaction"
+OAUTH_TRANSACTION_MAX_AGE = 10 * 60
 
 
 @dataclass(frozen=True)
@@ -164,34 +168,58 @@ def _redirect_uri(provider: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _sign_state(provider: str, nonce: str) -> str:
-    """HMAC over provider *and* nonce, so a state minted for Google's callback
-    cannot be replayed at GitHub's."""
+def _sign_state(provider: str, nonce: str, verifier: str) -> str:
+    """Bind the provider state to the verifier held only by its browser."""
     return hmac.new(
         settings.session_secret.encode("utf-8"),
-        f"{provider}:{nonce}".encode("utf-8"),
+        f"{provider}:{nonce}:{verifier}".encode("utf-8"),
         sha256,
     ).hexdigest()
 
 
-def mint_state(provider: str) -> str:
+def mint_state(provider: str) -> tuple[str, str]:
     nonce = secrets.token_urlsafe(24)
-    state = f"{nonce}.{_sign_state(provider, nonce)}"
+    verifier = secrets.token_urlsafe(32)
+    state = f"{nonce}.{_sign_state(provider, nonce, verifier)}"
     # store_token, not mint_token: the value is ours, signature and all.
     authn.store_token(state, "", authn.PURPOSE_OAUTH_STATE, authn.OAUTH_STATE_TTL)
-    return state
+    return state, verifier
 
 
-def check_state(provider: str, state: str) -> bool:
-    """Signature first (free), then the single-use database redemption."""
-    nonce, _, signature = (state or "").partition(".")
-    if not nonce or not signature:
+def check_state(provider: str, state: str, verifier: str) -> bool:
+    """Require its browser verifier, then atomically redeem the signed state."""
+    nonce, separator, signature = (state or "").partition(".")
+    if not nonce or not separator or not signature or not verifier:
         return False
-    if not hmac.compare_digest(signature, _sign_state(provider, nonce)):
+    if not hmac.compare_digest(signature, _sign_state(provider, nonce, verifier)):
         return False
     # consume_token returns the (empty) email it was minted against, so success
     # is "not None" rather than truthiness.
     return authn.consume_token(state, authn.PURPOSE_OAUTH_STATE) is not None
+
+
+def _attach_transaction_cookie(response: Response, request: Request, verifier: str) -> None:
+    response.headers.append(
+        "set-cookie",
+        authn._cookie(
+            OAUTH_TRANSACTION_COOKIE,
+            verifier,
+            max_age=OAUTH_TRANSACTION_MAX_AGE,
+            secure=authn._cookie_secure(request),
+        ),
+    )
+
+
+def _clear_transaction_cookie(response: Response, request: Request) -> None:
+    response.headers.append(
+        "set-cookie",
+        authn._cookie(
+            OAUTH_TRANSACTION_COOKIE,
+            "",
+            max_age=0,
+            secure=authn._cookie_secure(request),
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +457,7 @@ def _error_page(message: str) -> Response:
         authn.page_html(
             "Sign-in failed",
             "That sign-in could not be completed",
-            f"    <p>{message}.</p>\n"
+            f"    <p>{escape(message)}.</p>\n"
             '    <p><a href="/">Back to Chudware</a> and try again.</p>',
         ),
         status_code=400,
@@ -443,13 +471,14 @@ async def oauth_start(provider: str, request: Request) -> Response:
         entry = _provider_or_error(provider)
     except OAuthError as exc:
         return _error_page(exc.message)
+    state, verifier = mint_state(entry.name)
     query = urlencode(
         {
             "client_id": _credentials(entry.name)[0],
             "redirect_uri": _redirect_uri(entry.name),
             "response_type": "code",
             "scope": entry.scope,
-            "state": mint_state(entry.name),
+            "state": state,
             # Neither Google nor Microsoft returns a refresh token without a
             # consent prompt, which we do not want or store; select_account is
             # what makes account switching possible on both.
@@ -460,9 +489,11 @@ async def oauth_start(provider: str, request: Request) -> Response:
             ),
         }
     )
-    return RedirectResponse(
+    response = RedirectResponse(
         f"{_endpoint(entry.authorize_url)}?{query}", status_code=302
     )
+    _attach_transaction_cookie(response, request, verifier)
+    return response
 
 
 @router.get("/api/auth/oauth/{provider}/callback", response_model=None)
@@ -470,17 +501,20 @@ async def oauth_callback(
     provider: str, request: Request, code: str = "", state: str = "", error: str = ""
 ) -> Response:
     login_by_ip.enforce(authn.client_ip(request), "authentication attempts")
+    verifier = request.cookies.get(OAUTH_TRANSACTION_COOKIE, "")
     try:
         entry = _provider_or_error(provider)
         if error:
             raise OAuthError(f"{entry.label} reported: {error}")
         if not code:
             raise OAuthError("that sign-in response carried no authorization code")
-        if not check_state(entry.name, state):
+        if not check_state(entry.name, state, verifier):
             raise OAuthError("that sign-in link expired or was already used")
         subject, email = await resolve_identity(entry, code)
     except OAuthError as exc:
-        return _error_page(exc.message)
+        response = _error_page(exc.message)
+        _clear_transaction_cookie(response, request)
+        return response
 
     account_email = link_account(entry.name, subject, email)
     # The provider just proved control of the address, so this is a full
@@ -490,6 +524,7 @@ async def oauth_callback(
     log.info("oauth: %s sign-in for %s", entry.name, account_email)
     response = RedirectResponse("/", status_code=303)
     authn.attach_session_cookie(response, request, sid)
+    _clear_transaction_cookie(response, request)
     return response
 
 
@@ -501,6 +536,7 @@ __all__ = [
     "MICROSOFT_JWKS_URL_TEMPLATE",
     "MICROSOFT_MULTI_TENANT",
     "OAuthError",
+    "OAUTH_TRANSACTION_COOKIE",
     "PROVIDERS",
     "check_state",
     "configured_providers",

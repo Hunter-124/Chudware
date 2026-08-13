@@ -9,8 +9,9 @@ AUD; this script never creates a second Access application.
 IMPORTANT: deploy and verify gateway session-cookie auth before running this
 script to narrow Access. See deploy/RUNBOOK.md for the required ordering.
 
-Secrets: reads $CF_API_TOKEN or the gitignored Cloudflare-info.txt and writes
-only ~/chudware-web-data/gateway.env (0600).
+Secrets: reads $CF_API_TOKEN or the gitignored Cloudflare-info.txt. Gateway
+settings are written to ~/chudware-web-data/gateway.env; the tunnel credential
+is written only to owner-readable cloudflared.env.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ STAGING_SERVICE = "http://127.0.0.1:8310"
 PAGES_PROJECT = "chudware-site"
 PAGES_HOSTS = ("chudware.com", "www.chudware.com")
 ENV_FILE = Path.home() / "chudware-web-data" / "gateway.env"
+TUNNEL_ENV_FILE = Path.home() / "chudware-web-data" / "cloudflared.env"
 
 
 def token() -> str:
@@ -82,17 +84,31 @@ def _include_list(emails: list[str]) -> list[dict]:
     return result
 
 
+def _atomic_write_env(path: Path, values: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text("\n".join(f"{key}={value}" for key, value in values.items()) + "\n")
+        tmp.chmod(0o600)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def upsert_env(updates: dict[str, str]) -> None:
-    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
     lines: dict[str, str] = {}
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text().splitlines():
             if "=" in line and not line.lstrip().startswith("#"):
                 key, value = line.split("=", 1)
-                lines[key] = value
+                if key != "TUNNEL_TOKEN":
+                    lines[key] = value
     lines.update(updates)
-    ENV_FILE.write_text("\n".join(f"{key}={value}" for key, value in lines.items()) + "\n")
-    ENV_FILE.chmod(0o600)
+    _atomic_write_env(ENV_FILE, lines)
+
+
+def write_tunnel_env(tunnel_token: str) -> None:
+    _atomic_write_env(TUNNEL_ENV_FILE, {"TUNNEL_TOKEN": tunnel_token})
 
 
 def _zone(zones: list[dict], hostname: str) -> dict:
@@ -206,13 +222,14 @@ def main() -> None:
     assert isinstance(organizations, dict)
     tunnel_token = api("GET", f"/accounts/{ACCOUNT_ID}/cfd_tunnel/{tunnel_id}/token")
     assert isinstance(tunnel_token, str)
+    write_tunnel_env(tunnel_token)
     upsert_env({
-        "TUNNEL_TOKEN": tunnel_token,
         "CHUDWARE_WEB_CF_TEAM_DOMAIN": organizations["auth_domain"],
         "CHUDWARE_WEB_CF_AUD": app["aud"],
         "CHUDWARE_WEB_PUBLIC_BASE_URL": f"https://{PORTAL_HOST}",
     })
-    print(f"env written: {ENV_FILE} (team={organizations['auth_domain']})")
+    print(f"gateway env written: {ENV_FILE} (team={organizations['auth_domain']})")
+    print(f"tunnel env written: {TUNNEL_ENV_FILE}")
     print("Access is narrowed only after session-cookie auth verification; see RUNBOOK.md.")
 
 

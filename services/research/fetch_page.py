@@ -8,10 +8,57 @@ under the per-user knowledge cache (§4); offline mode serves cache only (§5).
 """
 from __future__ import annotations
 
+import ipaddress
 import re
+import socket
 from html.parser import HTMLParser
 from typing import Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+_MAX_REDIRECTS = 10
+
+
+class OutboundPolicyError(ValueError):
+    """The requested URL is not an eligible public research destination."""
+
+
+def _public_address(value: str) -> bool:
+    """Return true only for globally routable IPv4/IPv6, including mapped forms."""
+    try:
+        address = ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_global
+
+
+def _validate_public_url(url: str) -> None:
+    """Reject malformed, credential-bearing, non-HTTPS, or non-public destinations."""
+    try:
+        parsed = urlparse(str(url))
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise OutboundPolicyError("invalid URL") from exc
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise OutboundPolicyError("research fetch requires a public HTTPS URL")
+    port = port or 443
+    try:
+        literal = ipaddress.ip_address(parsed.hostname.split("%", 1)[0])
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if not _public_address(str(literal)):
+            raise OutboundPolicyError("destination address is not public")
+        return
+    try:
+        answers = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM,
+                                     proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise OutboundPolicyError("destination DNS resolution failed") from exc
+    addresses = [str(sockaddr[0]) for family, _type, _proto, _canon, sockaddr in answers
+                 if family in (socket.AF_INET, socket.AF_INET6)]
+    if not addresses or any(not _public_address(address) for address in addresses):
+        raise OutboundPolicyError("destination DNS includes a non-public address")
 
 from .cache import Cache, DEFAULT_TIER
 from .common import HIGH, MEDIUM, OFFLINE, envelope, fail, is_offline, now_ts
@@ -80,44 +127,51 @@ class _Readability(HTMLParser):
 def html_to_markdown(html_text: str) -> tuple[str, str]:
     """Return ``(markdown, title)`` from raw HTML using the stdlib readability parser."""
     parser = _Readability()
-    try:
-        parser.feed(html_text)
-    except Exception:  # noqa: BLE001 — malformed HTML: keep whatever parsed
-        pass
+    parser.feed(html_text)
     md = parser.markdown()
     if len(md) > _MAX_CONTENT:
         md = md[:_MAX_CONTENT] + "\n\n… [truncated]"
     return md, parser.title.strip()
 
 
+def _valid_url_syntax(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url))
+        parsed.port
+    except (TypeError, ValueError):
+        return False
+    return parsed.scheme == "https" and bool(parsed.hostname) and not parsed.username
+
+
 def _valid_url(url: str) -> bool:
     try:
-        p = urlparse(str(url))
-    except Exception:  # noqa: BLE001
+        _validate_public_url(url)
+    except OutboundPolicyError:
         return False
-    return p.scheme in ("http", "https") and bool(p.netloc)
+    return True
 
 
 def _http_get(url: str) -> tuple[str, str, str]:
-    """Live fetch. Returns ``(markdown, final_url, title)``. Uses the Firecrawl key
-    pool when any keys are configured (rotates on rate limits; returns markdown
-    directly), else httpx + the stdlib extractor."""
-    from . import firecrawl_pool
-
+    """Fetch a public HTTPS page, revalidating DNS and every redirect target."""
     import httpx
 
-    if firecrawl_pool.load_keys():
-        try:
-            md, meta = firecrawl_pool.scrape(url)
-            if md:
-                return md[:_MAX_CONTENT], url, str(meta.get("title") or "")
-        except Exception:  # noqa: BLE001 — degrade to the built-in fetch, never error out
-            pass
-
-    resp = httpx.get(url, headers={"User-Agent": _UA}, timeout=30.0, follow_redirects=True)
-    resp.raise_for_status()
-    md, title = html_to_markdown(resp.text)
-    return md, str(resp.url), title
+    current = url
+    with httpx.Client(headers={"User-Agent": _UA}, timeout=30.0,
+                      follow_redirects=False) as client:
+        for _ in range(_MAX_REDIRECTS + 1):
+            _validate_public_url(current)
+            resp = client.get(current)
+            if resp.is_redirect:
+                location = resp.headers.get("location")
+                if not location:
+                    raise OutboundPolicyError("redirect omitted Location")
+                current = urljoin(current, location)
+                _validate_public_url(current)
+                continue
+            resp.raise_for_status()
+            md, title = html_to_markdown(resp.text)
+            return md, current, title
+    raise OutboundPolicyError("too many redirects")
 
 
 def _from_cache(rec: dict, *, offline: bool) -> dict:
@@ -148,8 +202,13 @@ def fetch_page(
 ) -> dict:
     """Fetch ``url`` -> markdown with provenance, using the local cache and honoring
     offline mode. ``_fetcher`` is a test seam (defaults to :func:`_http_get`)."""
-    if not _valid_url(url):
-        return fail("bad_url", "Provide an absolute http(s) URL, e.g. https://example.org/page.")
+    if _fetcher is None:
+        try:
+            _validate_public_url(url)
+        except OutboundPolicyError as exc:
+            return fail("bad_url", f"Provide a public HTTPS URL ({exc}).")
+    elif not _valid_url_syntax(url):
+        return fail("bad_url", "Provide an absolute HTTPS URL.")
 
     store = cache if cache is not None else Cache()
     offline = is_offline()

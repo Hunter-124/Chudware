@@ -76,13 +76,15 @@ struct FreshValueMeta {
     std::string source_id;
     std::string lane_id;
     std::string why;
+    uint64_t observed_mono_ns = 0;
 };
 
 template <typename T>
 FreshValueMeta metadata(const FreshValue<T>& value, std::string source_id,
                         std::string lane_id) {
     return {value.state, value.src, value.v.has_value(), value.age_ms, value.ttl_ms,
-            value.seq, std::move(source_id), std::move(lane_id), value.why};
+            value.seq, std::move(source_id), std::move(lane_id), value.why,
+            value.t_mono_ns};
 }
 
 struct ProceduralFact {

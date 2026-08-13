@@ -23,6 +23,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 try:
     from .accounts import get_account
+    from .auth import AuthError, revalidate_websocket_user
     from .credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
     from .config import settings
     from .provider_keys import resolve_validated_key
@@ -30,6 +31,7 @@ try:
     from .plans import limits_for
 except ImportError:  # uvicorn app:app from package dir
     from accounts import get_account
+    from auth import AuthError, revalidate_websocket_user
     from credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
     from config import settings
     from provider_keys import resolve_validated_key
@@ -134,11 +136,12 @@ def _collect_paths(node: Any, found: list[str]) -> None:
 
 
 def path_violation(line: str, allowed_roots: list[PurePosixPath]) -> str | None:
-    """Return the offending path when an RPC addresses a file outside the caller's roots.
+    """Return a path value that is relative or outside the caller's roots.
 
-    Only ABSOLUTE paths are checked: a relative path is resolved by the daemon
-    against its own working directory, never against another account's tree, so
-    it is not a cross-tenant vector. A non-JSON or path-free line is fine.
+    Daemon path-bearing RPC fields must always carry canonical absolute paths:
+    allowing relative values delegates resolution to the shared daemon's working
+    directory and bypasses the caller-root containment check. A non-JSON or
+    path-free line is fine.
     """
     try:
         msg = json.loads(line)
@@ -148,7 +151,7 @@ def path_violation(line: str, allowed_roots: list[PurePosixPath]) -> str | None:
     _collect_paths(msg, found)
     for raw in found:
         if not raw or not raw.startswith("/"):
-            continue
+            return raw
         # normpath, not resolve() — the path names a file on the daemon's host,
         # may legitimately not exist yet (doc_save), and resolving would do
         # filesystem I/O plus symlink following on the event loop.
@@ -456,6 +459,91 @@ def _rpc_result(line: str, result: Mapping[str, Any]) -> str:
         pass
     return json.dumps({"id": call_id, "result": dict(result)}, separators=(",", ":"))
 
+# The native daemon owns one process-wide document registry. A web socket may
+# address only documents it minted/opened itself, or documents whose canonical
+# saved path proves they belong to the authenticated account.
+_DOC_ID_KEYS = frozenset({"doc_id", "document_id", "source_doc_id", "target_doc_id"})
+_DOC_MINT_METHODS = frozenset({"doc_new", "doc_open", "doc_import", "doc_import_file"})
+
+
+def _collect_doc_ids(node: Any, found: list[str]) -> None:
+    """Gather document identifiers at any depth, including batch requests."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _DOC_ID_KEYS and isinstance(value, str) and value:
+                found.append(value)
+            _collect_doc_ids(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_doc_ids(item, found)
+
+
+def _request_doc_ids(line: str) -> set[str]:
+    try:
+        message = json.loads(line)
+    except ValueError:
+        return set()
+    found: list[str] = []
+    if isinstance(message, dict):
+        _collect_doc_ids(message.get("params"), found)
+    return set(found)
+
+
+def _owned_doc_entry(entry: Any, allowed_roots: list[PurePosixPath]) -> bool:
+    """Prove a doc_list entry belongs to this caller from its canonical path."""
+    if not isinstance(entry, dict):
+        return False
+    raw = entry.get("path")
+    if not isinstance(raw, str) or not raw or not os.path.isabs(raw):
+        return False
+    candidate = PurePosixPath(os.path.normpath(raw))
+    return any(candidate == root or candidate.is_relative_to(root) for root in allowed_roots[:2])
+
+
+def _authorize_daemon_response(
+    line: str,
+    pending: dict[Any, tuple[str, set[str]]],
+    capabilities: set[str],
+    allowed_roots: list[PurePosixPath],
+) -> str | None:
+    """Update capabilities and filter registry output; None drops an unsafe reply."""
+    try:
+        message = json.loads(line)
+    except ValueError:
+        return line
+    if not isinstance(message, dict) or "id" not in message:
+        return line
+    request = pending.pop(message.get("id"), None)
+    if request is None:
+        return None
+    method, request_ids = request
+    if "error" in message:
+        return line
+    result = message.get("result")
+    if method == "doc_list":
+        if not isinstance(result, dict) or not isinstance(result.get("docs"), list):
+            return None
+        kept: list[dict[str, Any]] = []
+        for entry in result["docs"]:
+            doc_id = entry.get("doc_id") if isinstance(entry, dict) else None
+            if not isinstance(doc_id, str) or not doc_id:
+                continue
+            if doc_id in capabilities or _owned_doc_entry(entry, allowed_roots):
+                capabilities.add(doc_id)
+                kept.append(entry)
+        result["docs"] = kept
+        return json.dumps(message, separators=(",", ":"))
+    if method in _DOC_MINT_METHODS:
+        if not isinstance(result, dict):
+            return None
+        doc_id = result.get("doc_id")
+        if not isinstance(doc_id, str) or not doc_id:
+            return None
+        capabilities.add(doc_id)
+    elif method == "doc_close":
+        capabilities.difference_update(request_ids)
+    return line
+
 
 def _agent_provider(line: str) -> str:
     """Provider explicitly selected for this turn, never inferred from a model id."""
@@ -646,12 +734,19 @@ async def engine_ws(ws: WebSocket) -> None:
         ]
         active_actor: dict[str, Any] | None = None
         active_reservation: dict[str, Any] | None = None
+        document_capabilities: set[str] = set()
+        pending_requests: dict[Any, tuple[str, set[str]]] = {}
 
         async def ws_to_daemon() -> None:
             nonlocal active_actor, active_reservation
             max_frame = settings.ws_max_message_bytes
             while True:
                 line = await ws.receive_text()
+                try:
+                    current_user = revalidate_websocket_user(ws.scope, require_cloud=True)
+                except AuthError as exc:
+                    await ws.close(code=4401 if exc.status == 401 else 4403)
+                    return
                 if len(line.encode("utf-8")) > max_frame:
                     log.warning(
                         "engine bridge %s: frame exceeds %d bytes; closing",
@@ -662,12 +757,23 @@ async def engine_ws(ws: WebSocket) -> None:
                     return
 
                 method = _rpc_method(line)
+                request_doc_ids = _request_doc_ids(line)
+                forbidden = request_doc_ids - document_capabilities
+                if forbidden:
+                    log.warning(
+                        "engine bridge %s: rejected unauthorized document IDs",
+                        user.email,
+                    )
+                    await ws.send_text(_rpc_error(
+                        line, -32004, "document not authorized for this connection"
+                    ))
+                    continue
                 if method == "agent_admin_turn":
                     await ws.send_text(_rpc_error(
                         line, -32601, "method unavailable on web bridge"
                     ))
                     continue
-                if method.startswith("agent_provider_") and user.role != "admin":
+                if method.startswith("agent_provider_") and current_user.role != "admin":
                     log.warning(
                         "engine bridge %s: rejected administrator provider RPC",
                         user.email,
@@ -778,6 +884,13 @@ async def engine_ws(ws: WebSocket) -> None:
                     if method in _AGENT_TURN_PROVIDER_METHODS:
                         active_actor = actor
                     line = _sanitize_agent_rpc(line, actor)
+                try:
+                    request_message = json.loads(line)
+                    request_id = request_message.get("id") if isinstance(request_message, dict) else None
+                except ValueError:
+                    request_id = None
+                if request_id is not None:
+                    pending_requests[request_id] = (method, request_doc_ids)
                 writer.write(line.encode("utf-8") + b"\n")
                 await writer.drain()
 
@@ -788,6 +901,16 @@ async def engine_ws(ws: WebSocket) -> None:
                 if not raw:
                     break
                 line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                authorized = _authorize_daemon_response(
+                    line, pending_requests, document_capabilities, allowed_roots
+                )
+                if authorized is None:
+                    log.warning(
+                        "engine bridge %s: dropped response with unprovable document ownership",
+                        user.email,
+                    )
+                    continue
+                line = authorized
                 usage = _provider_usage_payload(line)
                 if (
                     usage is not None

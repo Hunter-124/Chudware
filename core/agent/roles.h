@@ -1,10 +1,9 @@
-// core/agent/roles.h — C++ port of agent/orchestrator/roles.py.
+// core/agent/roles.h — native role-prompt registry.
 //
-// P52: role registry + editable-prompt resolution. The BUILTIN prompts dir is
-// product DATA (not under the binary's control at runtime); it is supplied via
-// the CHUDWARE_PROMPTS_DIR env var (default "services/agent/prompts"), and a per-call
-// override `prompts_dir` lets the parity gate point C++ at the same files Python
-// reads. The user OVERRIDE dir is %APPDATA%/Chudware/prompts/<role>.md.
+// Developer builds read authored prompts from CHUDWARE_PROMPTS_DIR (or the
+// per-call prompts_dir). Packaged builds ignore those built-in paths and read the
+// generated protected-assets string table. Both modes preserve user overrides at
+// %APPDATA%/Chudware/prompts/<role>.md.
 #pragma once
 
 #include <set>
@@ -18,15 +17,13 @@ namespace agent {
 
 using nlohmann::json;
 
-extern const std::vector<std::string> kRoles;  // canonical order; extras via dir scan.
+extern const std::vector<std::string> kRoles;  // canonical order; generated/dev extras follow.
 
-// (text, source). source is the absolute path the text came from. Ops roles get
-// the ops cheatsheet appended. `prompts_dir` overrides CHUDWARE_PROMPTS_DIR.
-// When `solo` is true, modeler/fixer get the slim ops_cheatsheet_solo.md instead
-// of the full ~28KB sheet (Standard/Complex keep the full sheet). When
-// `tool_scope_full` is true the full sheet is forced even on Solo. Each entry in
-// `tool_scope_classes` appends shared/cheatsheets/<class>.md when the file exists
-// (sheetmetal.md / weldment.md / surfacing.md — weldments maps to weldment.md).
+// (text, source). Ops roles get the ops cheatsheet appended. In developer builds
+// `prompts_dir` overrides CHUDWARE_PROMPTS_DIR; packaged builds ignore it. When
+// `solo` is true, modeler/fixer get the slim ops_cheatsheet_solo.md instead of the
+// full sheet. `tool_scope_full` forces the full sheet. Entries in
+// `tool_scope_classes` append the matching generated/developer cheatsheet.
 std::pair<std::string, std::string> load_prompt(const std::string& role,
                                                 const std::string& prompts_dir = "",
                                                 bool solo = false,

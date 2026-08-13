@@ -197,14 +197,15 @@ class TestModeToolAllowlists:
         # file-handling floor (AGENT_DEFAULT_TOOLS only — NOT
         # SHARED_DEFAULT_TOOLS, which is for ask/plan/edit/swarm) on top of
         # the role card's own tools — a narrowing role card must not lose
-        # fs_write/fs_edit/fs_list/run_shell/research_fetch_page, but CAD
+        # fs_write/fs_edit/fs_list/research_fetch_page, while shell and CAD
         # document-lifecycle tools stay behind enable_tools instead.
         out = cmt.apply_mode_tools("agent", ["add_features", "new_part", "delegate"])
         assert out == sorted(
             {"add_features", "new_part", "delegate"} | cmt.AGENT_DEFAULT_TOOLS
         )
-        for tool in ("fs_write", "fs_edit", "fs_list", "run_shell", "research_fetch_page"):
+        for tool in ("fs_write", "fs_edit", "fs_list", "research_fetch_page"):
             assert tool in out, (tool, out)
+        assert "run_shell" not in out
         for tool in ("close_part", "save_part", "measure_part", "cad_guide", "advise",
                      "import_part", "export_part"):
             assert tool not in out, (tool, out)
@@ -216,7 +217,7 @@ class TestModeToolAllowlists:
 
         assert main == sorted(cmt.AGENT_DEFAULT_TOOLS)
         assert child == sorted(cmt.SUBAGENT_DEFAULT_TOOLS)
-        assert "run_shell" in main
+        assert "run_shell" not in main
         assert "run_shell" not in child
         for name in ("fs_read", "fs_glob", "fs_grep"):
             assert name in child
@@ -227,8 +228,9 @@ class TestModeToolAllowlists:
         assert "add_features" in out
         assert "delegate" in out
         assert "corporate_activate" in out
-        for tool in ("fs_write", "fs_edit", "fs_list", "run_shell", "research_fetch_page"):
+        for tool in ("fs_write", "fs_edit", "fs_list", "research_fetch_page"):
             assert tool in out, (tool, out)
+        assert "run_shell" not in out
 
     def test_apply_intersects_role_with_ask_plus_shared(self):
         role = ["describe_part", "add_features", "new_part", "measure_part"]

@@ -37,10 +37,26 @@ def chat_env(pg, tmp_path, monkeypatch):
     import config  # type: ignore
     import chat  # type: ignore
 
+    import auth  # type: ignore
+
     config.settings = config.load_settings()
     chat.presence = chat.Presence()
     chat.hub = chat.Hub()
+    import accounts  # type: ignore
+    accounts.ensure_account("alice@example.com", display="Alice")
+    accounts.set_status("alice@example.com", "active", decided_by="test")
+    accounts.ensure_account("bob@example.com", display="Bob")
+    accounts.set_status("bob@example.com", "active", decided_by="test")
+    monkeypatch.setattr(
+        chat,
+        "revalidate_websocket_user",
+        lambda scope: auth.AuthMiddleware(lambda *_: None)._resolve_user(
+            scope["state"]["user"].email
+        ),
+    )
     return chat, config, data
+
+
 
 
 def _make_app(chat, user: _User | None = None):
@@ -162,6 +178,26 @@ def test_ws_broadcast_and_presence(chat_env):
         assert r.status_code == 200
         texts = [m["text"] for m in r.json()["messages"]]
         assert "hello lab" in texts
+
+
+def test_ws_suspension_closes_before_next_message_is_saved(chat_env):
+    chat, _config, _data = chat_env
+    import accounts  # type: ignore
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    app = _make_app(chat, _User("alice@example.com", "Alice"))
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws/chat", headers={"X-Dev-User": "alice@example.com"}
+        ) as ws:
+            assert ws.receive_json()["type"] == "presence"
+            accounts.set_status("alice@example.com", "suspended", decided_by="test")
+            ws.send_json({"text": "must not persist"})
+            with pytest.raises(WebSocketDisconnect) as exc:
+                ws.receive_json()
+            assert exc.value.code == 4403
+    assert asyncio.run(chat.load_history()) == []
 
 
 def test_presence_refcount(chat_env):

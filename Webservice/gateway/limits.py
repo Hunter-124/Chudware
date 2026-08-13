@@ -8,6 +8,7 @@ across workers to keep coherent.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from collections import deque
@@ -102,24 +103,26 @@ login_by_ip = RateLimiter(20, 900.0)
 
 
 def user_slug(email: str) -> str:
-    """Filesystem-safe, collision-free per-user directory name.
+    """Return a filesystem-safe, human-diagnosable account slug.
 
-    Lowercased and restricted to ``[a-z0-9._-]``; every other byte becomes an
-    underscore. Emails are already unique and the substitution is injective
-    enough in practice only because the full address is preserved verbatim
-    apart from separators — ``a+b@x.com`` and ``a_b@x.com`` would otherwise
-    collide, so the raw address is percent-style escaped instead of dropped.
+    Existing escaped slugs up to 120 characters remain unchanged. Longer
+    identities retain a readable prefix plus a full digest of the complete
+    normalized address, so truncation cannot merge colliding prefixes.
     """
+    normalized = email.strip().lower()
     out = []
-    for ch in email.strip().lower():
+    for ch in normalized:
         if ch.isalnum() or ch in "._-":
             out.append(ch)
         else:
             out.append(f"~{ord(ch):02x}")
-    slug = "".join(out)
-    if not slug or slug in {".", ".."}:
+    readable = "".join(out)
+    if not readable or readable in {".", ".."}:
         raise HTTPException(status_code=400, detail="invalid account identity")
-    return slug[:120]
+    if len(readable) <= 120:
+        return readable
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"{readable[:54]}~z{digest}"
 
 
 def enforce_upload_size(content_length: int | None) -> int:

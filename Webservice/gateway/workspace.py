@@ -40,6 +40,7 @@ try:
     from .limits import (
         api_writes,
         enforce_disk_quota,
+        dir_size_bytes,
         enforce_upload_size,
         uploads,
         user_slug,
@@ -51,6 +52,7 @@ except ImportError:  # uvicorn app:app from package dir
     from limits import (
         api_writes,
         enforce_disk_quota,
+        dir_size_bytes,
         enforce_upload_size,
         uploads,
         user_slug,
@@ -283,7 +285,7 @@ async def workspace_delete(request: Request, body: dict[str, Any], scope: str = 
 
 @router.post("/workspace/copy")
 async def workspace_copy(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
-    """Copy a file or (when recursive) a directory tree within the caller's workspace."""
+    """Copy a file or directory within the caller's workspace under quota."""
     user, root = _caller_root(request, scope)
     api_writes.enforce(user.email, "writes")
     src = _resolve(root, str(body.get("src", "")))
@@ -298,18 +300,34 @@ async def workspace_copy(request: Request, body: dict[str, Any], scope: str = ""
             raise HTTPException(status_code=400, detail="directory copy requires recursive=true")
         if dst.exists():
             raise HTTPException(status_code=409, detail="destination exists")
-        # Ensure parent of dst exists; copytree creates dst itself.
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dst)
+        incoming = dir_size_bytes(src)
     else:
         if not src.is_file():
             raise HTTPException(status_code=400, detail="not a file")
         if dst.exists() and dst.is_dir():
-            dst = dst / src.name
-            if root not in dst.resolve().parents and dst.resolve() != root:
-                raise HTTPException(status_code=400, detail="path escapes workspace")
+            dst = _resolve(root, str((dst / src.name).relative_to(root)), must_exist=False)
+        if dst.exists():
+            raise HTTPException(status_code=409, detail="destination exists")
+        incoming = src.stat().st_size
+
+    account = get_account(user.email)
+    plan = getattr(account, "plan", "trial")
+    enforce_disk_quota(user.email, plan, root, incoming_bytes=incoming)
+    try:
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        if src.is_dir():
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+        # Bind enforcement to actual copied bytes if the source changed during
+        # the copy. Rejection removes the whole destination before returning.
+        enforce_disk_quota(user.email, plan, root)
+    except BaseException:
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.rmtree(dst, ignore_errors=True)
+        else:
+            dst.unlink(missing_ok=True)
+        raise
     log.info("workspace copy: %s -> %s by %s", src, dst, user.email)
     return {"ok": True, "path": str(dst.relative_to(root))}
 

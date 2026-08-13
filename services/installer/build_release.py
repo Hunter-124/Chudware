@@ -1,22 +1,19 @@
-"""Assemble a distributable Chudware release (payload + installer scripts).
+"""Assemble a source-free, signed Chudware Windows customer payload.
 
-The default command performs the complete Windows packaging pipeline: it stages
-``<out>/Chudware/`` and invokes Inno Setup to produce the canonical installer.
+Release construction is deliberately two-phase. ``--prepare-signing`` stages compiled
+workers and runtime assets, writes canonical ``payload-manifest.v1.json``, and emits the
+exact domain-separated preimage outside the payload. After offline Ed25519 signing,
+``--finalize-signing <sig>`` re-verifies every byte, writes the canonical signature
+sidecar, and may create the installer/archive. An unverified customer payload is never
+archived or passed to Inno Setup.
 
-The payload contains:
-    chudware.exe            the native host (built separately via CMake)
-    app/                    Python packages and requirements
-    wheelhouse/             offline wheels [--skip-wheels to omit]
-    install.ps1 / uninstall.ps1
-
-``provision.py`` creates the managed venv on first run. No non-functional embedded-Python
-option is advertised. ``--payload-only`` is available for inspecting the staged payload.
-
-    python -m services.installer.build_release [--out dist] [--skip-wheels] [--zip]
+Developer provisioning remains available through ``services.installer.provision`` and
+is not copied into customer releases.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -26,16 +23,51 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from services.installer.payload_manifest import (
+    MANIFEST_NAME,
+    SIGNATURE_NAME,
+    PayloadManifestError,
+    build_manifest,
+    create_verified_zip,
+    finalize_signature,
+    payload_signature_preimage,
+    read_manifest,
+    verify_manifest_payload,
+    verify_signature,
+    verify_snapshot,
+    write_manifest,
+    write_signing_preimage,
+)
+
 REPO = Path(__file__).resolve().parent.parent.parent
-APP_PACKAGES = ("engine",)
-# Canonical ``services.X`` packages used by the worker and packaged tools.
-SERVICE_PACKAGES = ("agent", "mcp", "installer", "plm", "dag", "browser",
-                    "deliverables", "ipc", "serving", "verify")
+# Only files consumed by the installed runtime belong in customer payloads.  Source
+# generators, icon prompts, and atlas recipes intentionally stay in the checkout.
+RUNTIME_ASSETS = (
+    "logo_icon.png",
+    "logo_wordmark.png",
+    "appicon/16.png",
+    "appicon/32.png",
+    "appicon/48.png",
+    "appicon/64.png",
+    "appicon/128.png",
+    "appicon/256.png",
+    "logo_wordmark_dark.png",
+    "fonts/Rubik-Regular.ttf",
+    "fonts/Rubik-Medium.ttf",
+    "fonts/Rubik-SemiBold.ttf",
+    "fonts/Rubik-Bold.ttf",
+    "fonts/JetBrainsMono-Regular.ttf",
+    "fonts/CADSymbols.ttf",
+    "icons/atlas.json",
+    "icons/atlas_dark.png",
+    "icons/atlas_light.png",
+)
 HOST_EXE = REPO / "host" / "build-win" / "bin" / "chudware.exe"
 if not HOST_EXE.exists():
     HOST_EXE = REPO / "host" / "build" / "bin" / "Release" / "chudware.exe"
-# Engine host daemon (core/hostd). MSVC builds of chudware-hostd are new — absence is a
-# warning + skip, not a failure (the app falls back to legacy in-process engine mode).
+UNINSTALL_HELPER_EXE = HOST_EXE.parent / "chudware-uninstall-helper.exe"
+# The engine daemon is mandatory in customer payloads; candidate discovery is only a
+# convenience for local release work and never permits a packaged fallback.
 HOSTD_EXE_CANDIDATES = (
     REPO / "build" / "windows-occt" / "bin" / "chudware-hostd.exe",
     REPO / "build" / "windows-core" / "bin" / "chudware-hostd.exe",
@@ -49,136 +81,190 @@ VERSION_HEADER_CANDIDATES = (
 )
 ISS_SCRIPT = REPO / "packaging" / "windows" / "chudware.iss"
 VERSION_RE = re.compile(r'^#define CHUDWARE_VERSION\s+"([^"]+)"$', re.MULTILINE)
-_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "build", "samples", "test_*", ".ready.json")
+
+def _copy_required(source: Path | None, destination: Path, label: str) -> None:
+    if source is None or not source.is_file() or source.is_symlink():
+        raise RuntimeError(f"required compiled {label} not found or unsafe: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
 
 
-def stage_app(dst: Path) -> None:
-    app = dst / "app"
-    app.mkdir(parents=True, exist_ok=True)
-    for pkg in APP_PACKAGES:
-        s = REPO / pkg
-        if s.exists():
-            shutil.copytree(s, app / pkg, dirs_exist_ok=True, ignore=_IGNORE)
-    # services.X packages for the engine worker (PLM hub, dag, browser, …)
-    services_src = REPO / "services"
-    if services_src.is_dir():
-        services_dst = app / "services"
-        services_dst.mkdir(parents=True, exist_ok=True)
-        init_py = services_src / "__init__.py"
-        if init_py.exists():
-            shutil.copy2(init_py, services_dst / "__init__.py")
-        else:
-            (services_dst / "__init__.py").write_text("", encoding="utf-8")
-        # Loose top-level services/*.py modules (paths.py, kernel_exec.py, worker_main.py, …) --
-        # SERVICE_PACKAGES below only covers subpackages; services.installer.provision imports
-        # `services.paths` directly, so these single-file modules must ship too.
-        for py in services_src.glob("*.py"):
-            if py.name == "__init__.py" or py.name.startswith("test_"):
-                continue
-            shutil.copy2(py, services_dst / py.name)
-        for name in SERVICE_PACKAGES:
-            s = services_src / name
-            if s.exists():
-                shutil.copytree(s, services_dst / name, dirs_exist_ok=True, ignore=_IGNORE)
-    # samples are handy to ship even though we ignore them above for other dirs
-    sample_src = REPO / "engine" / "samples"
-    if sample_src.exists():
-        shutil.copytree(sample_src, app / "engine" / "samples", dirs_exist_ok=True, ignore=_IGNORE)
-    shutil.copy2(REPO / "requirements.txt", app / "requirements.txt")
+def stage_compiled_payload(
+    dst: Path,
+    *,
+    host_bin: Path,
+    hostd_bin: Path,
+    worker_bin: Path,
+    mcp_bin: Path,
+    omp_bridge_bin: Path,
+    uninstall_helper_bin: Path,
+) -> None:
+    """Stage customer binaries only; developer Python sources remain in the checkout."""
+    _copy_required(host_bin, dst / "chudware.exe", "host")
+    _copy_required(hostd_bin, dst / "chudware-hostd.exe", "host daemon")
+    _copy_required(worker_bin, dst / "chudware-worker.exe", "worker")
+    _copy_required(mcp_bin, dst / "chudware-mcp.exe", "MCP server")
+    _copy_required(omp_bridge_bin, dst / "chudware-omp-bridge.exe", "OMP bridge")
+    _copy_required(uninstall_helper_bin, dst / "chudware-uninstall-helper.exe", "uninstall helper")
 
 
-def stage_optional_payloads(dst: Path) -> dict:
-    staged: dict[str, bool] = {}
-    for name in ("llamacpp", "models"):
-        src = REPO / name
-        if src.exists():
-            shutil.copytree(src, dst / name, dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-            staged[name] = True
-        else:
-            staged[name] = False
-    return staged
+def stage_runtime_assets(dst: Path) -> None:
+    assets_src = REPO / "assets"
+    for relative in RUNTIME_ASSETS:
+        source = assets_src / relative
+        if not source.is_file() or source.is_symlink():
+            raise RuntimeError(f"required runtime asset not found or unsafe: {source}")
+        target = dst / "assets" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
 
-def stage_wheels(dst: Path) -> dict:
-    wh = dst / "wheelhouse"
-    wh.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "-m", "pip", "download", "-r", str(REPO / "requirements.txt"),
-           "-d", str(wh)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    n = len(list(wh.glob("*.whl"))) + len(list(wh.glob("*.tar.gz")))
-    return {"ok": r.returncode == 0, "files": n,
-            "tail": (r.stdout + r.stderr).splitlines()[-3:] if r.returncode else []}
+def build(
+    out: Path,
+    *,
+    version: str,
+    key_id: str,
+    created_at: str | None,
+    make_zip: bool,
+    prepare_signing: bool,
+    payload_signature: Path | None,
+    release_public_key: str | None,
+    host_bin: Path | None,
+    hostd_bin: Path | None,
+    worker_bin: Path | None,
+    mcp_bin: Path | None,
+    omp_bridge_bin: Path | None,
+    uninstall_helper_bin: Path | None,
+    platform: str = "windows",
+    arch: str = "x86_64",
+) -> dict[str, Any]:
+    """Stage and authenticate a source-free customer payload.
 
-
-def build(out: Path, skip_wheels: bool, make_zip: bool) -> dict[str, Any]:
+    ``prepare_signing`` emits the exact signing preimage outside the payload and
+    intentionally cannot archive or compile an installer.  Finalization restages the
+    same deterministic payload, verifies the supplied detached signature, and writes
+    its canonical base64 sidecar adjacent to the manifest.
+    """
+    if prepare_signing:
+        if payload_signature is not None or make_zip:
+            raise RuntimeError("--prepare-signing cannot be combined with a signature or --zip")
+        preimage_path = out / "payload-manifest.v1.preimage"
+        if preimage_path.exists():
+            raise RuntimeError(f"refusing to replace existing signing preimage: {preimage_path}")
+    elif payload_signature is None or release_public_key is None:
+        raise RuntimeError(
+            "customer payload finalization requires --payload-signature and --release-public-key"
+        )
     dst = out / "Chudware"
     if dst.exists():
-        shutil.rmtree(dst)
-    dst.mkdir(parents=True)
+        raise RuntimeError(f"refusing to replace existing payload directory: {dst}")
+    out.mkdir(parents=True, exist_ok=True)
+    dst.mkdir()
 
-    manifest: dict = {"components": {}}
-
-    if HOST_EXE.exists():
-        shutil.copy2(HOST_EXE, dst / "chudware.exe")
-        manifest["components"]["exe"] = True
-    else:
-        manifest["components"]["exe"] = False  # build it with: cmake --build host/build --config Release
-
-    # chudware-hostd.exe (+ .pdb when present) — staged next to chudware.exe/libchudware.dll so
-    # install.ps1 can stop/replace it and register_mcp can pin CHUDWARE_HOSTD_BIN at it.
-    hostd = next((p for p in HOSTD_EXE_CANDIDATES if p.exists()), None)
-    if hostd is not None:
-        shutil.copy2(hostd, dst / "chudware-hostd.exe")
-        pdb = hostd.with_suffix(".pdb")
-        if pdb.exists():
-            shutil.copy2(pdb, dst / "chudware-hostd.pdb")
-        manifest["components"]["hostd"] = True
-    else:
-        print("warning: chudware-hostd.exe not found (cmake --build core\\build --config Release "
-              "--target chudware-hostd) — payload ships without the engine daemon", file=sys.stderr)
-        manifest["components"]["hostd"] = False
-
-    # Brand + font assets, loaded by the GUI from <exedir>/assets — including logo_icon.png,
-    # which IS the runtime GLFW window/taskbar icon. This read `REPO/"host"/"assets"` for its
-    # whole life; that path has never existed (the assets live at the repo root), so the guard
-    # below was always false and every Windows payload shipped with no assets/ at all — the
-    # installed app fell back to a blank window icon and no wordmark.
-    assets_src = REPO / "assets"
-    if assets_src.exists():
-        shutil.copytree(assets_src, dst / "assets", dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns("Rubik-VF.ttf", "make_logo.py", "__pycache__"))
-        manifest["components"]["assets"] = True
-    else:
-        print(f"warning: {assets_src} not found — payload ships without brand/font assets",
-              file=sys.stderr)
-        manifest["components"]["assets"] = False
-
-    stage_app(dst)
-    manifest["components"]["app"] = True
-    manifest["components"].update(stage_optional_payloads(dst))
-
+    stage_compiled_payload(
+        dst,
+        host_bin=host_bin,
+        hostd_bin=hostd_bin,
+        worker_bin=worker_bin,
+        uninstall_helper_bin=uninstall_helper_bin,
+        mcp_bin=mcp_bin,
+        omp_bridge_bin=omp_bridge_bin,
+    )
     shutil.copy2(REPO / "services" / "installer" / "install.ps1", dst / "install.ps1")
-    shutil.copy2(REPO / "services" / "installer" / "uninstall.ps1", dst / "uninstall.ps1")
-    shutil.copy2(REPO / "requirements.txt", dst / "requirements.txt")
 
-    if skip_wheels:
-        manifest["components"]["wheelhouse"] = "skipped"
-    else:
-        manifest["components"]["wheelhouse"] = stage_wheels(dst)
+    manifest, canonical_json, snapshots = build_manifest(
+        dst,
+        version=version,
+        platform=platform,
+        arch=arch,
+        key_id=key_id,
+        created_at=created_at,
+    )
+    manifest_path = write_manifest(dst, canonical_json)
+    verify_snapshot(dst, snapshots)
 
-    # provision.py creates the managed venv on first run. The manifest therefore has no
-    # embedded-Python component state.
+    result: dict[str, Any] = {
+        "dist": str(dst),
+        "payload_manifest": str(manifest_path),
+        "files": len(manifest["files"]),
+        "key_id": key_id,
+    }
+    if prepare_signing:
+        write_signing_preimage(preimage_path, key_id, canonical_json)
+        result["signing_preimage"] = str(preimage_path)
+        result["signing_preimage_sha256"] = hashlib.sha256(
+            payload_signature_preimage(key_id, canonical_json)
+        ).hexdigest()
+        return result
 
-    (dst / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    signature_path = finalize_signature(
+        dst,
+        key_id=key_id,
+        canonical_json=canonical_json,
+        signature_path=payload_signature,
+        public_key=release_public_key,
+    )
+    on_disk_manifest, on_disk_json = read_manifest(dst)
+    if on_disk_json != canonical_json or on_disk_manifest["key_id"] != key_id:
+        raise PayloadManifestError("payload manifest changed during signature finalization")
+    verify_signature(
+        key_id=key_id,
+        canonical_json=canonical_json,
+        signature_path=signature_path,
+        public_key=release_public_key,
+    )
+    verify_snapshot(dst, snapshots)
+    result["payload_signature"] = str(signature_path)
 
     if make_zip:
-        archive = shutil.make_archive(str(out / "Chudware-release"), "zip", root_dir=dst.parent,
-                                      base_dir="Chudware")
-        manifest["zip"] = archive
+        archive = create_verified_zip(dst, out / "Chudware-release.zip")
+        result["zip"] = str(archive)
+    return result
 
-    manifest["dist"] = str(dst)
-    return manifest
+
+def finalize_prepared_payload(
+    out: Path,
+    *,
+    signature_source: Path,
+    release_public_key: str,
+    make_zip: bool,
+) -> dict[str, Any]:
+    """Verify and finalize a payload previously emitted by ``--prepare-signing``."""
+    dst = out / "Chudware"
+    manifest_path = dst / MANIFEST_NAME
+    if (dst / SIGNATURE_NAME).exists():
+        raise RuntimeError(f"prepared payload is already finalized: {dst / SIGNATURE_NAME}")
+    manifest, canonical_json = read_manifest(dst)
+    manifest, snapshots = verify_manifest_payload(dst, canonical_json)
+    key_id = str(manifest["key_id"])
+    signature_path = finalize_signature(
+        dst,
+        key_id=key_id,
+        canonical_json=canonical_json,
+        signature_path=signature_source,
+        public_key=release_public_key,
+    )
+    on_disk_manifest, on_disk_json = read_manifest(dst)
+    if on_disk_json != canonical_json or on_disk_manifest["key_id"] != key_id:
+        raise PayloadManifestError("payload manifest changed during signature finalization")
+    verify_signature(
+        key_id=key_id,
+        canonical_json=canonical_json,
+        signature_path=signature_path,
+        public_key=release_public_key,
+    )
+    verify_snapshot(dst, snapshots)
+    result: dict[str, Any] = {
+        "dist": str(dst),
+        "version": str(manifest["version"]),
+        "payload_manifest": str(manifest_path),
+        "payload_signature": str(signature_path),
+        "files": len(manifest["files"]),
+        "key_id": key_id,
+    }
+    if make_zip:
+        result["zip"] = str(create_verified_zip(dst, out / "Chudware-release.zip"))
+    return result
 
 def read_built_version() -> str:
     """Read the exact CHUDWARE_VERSION compiled into the staged Windows binary."""
@@ -235,8 +321,8 @@ def sign_installer(installer: Path) -> None:
     )
     subprocess.run([signtool, "verify", "/pa", "/v", str(installer)], check=True)
 
-
-def compile_installer(out: Path, payload: Path, version: str) -> Path:
+def compile_installer(out: Path, payload: Path, version: str,
+                      release_public_key: str) -> Path:
     program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\\Program Files (x86)"))
     iscc = find_tool(
         "ISCC",
@@ -249,6 +335,27 @@ def compile_installer(out: Path, payload: Path, version: str) -> Path:
         )
     if not (payload / "chudware.exe").is_file():
         raise RuntimeError("staged payload has no chudware.exe; build the Windows host first")
+    manifest_path = payload / MANIFEST_NAME
+    signature_path = payload / SIGNATURE_NAME
+    manifest, canonical_json = read_manifest(payload)
+    verify_signature(
+        key_id=str(manifest["key_id"]),
+        canonical_json=canonical_json,
+        signature_path=signature_path,
+        public_key=release_public_key,
+    )
+    manifest, payload_snapshot = verify_manifest_payload(payload, canonical_json)
+    helper_rows = [row for row in manifest["files"]
+                   if row["path"] == "chudware-uninstall-helper.exe"]
+    if len(helper_rows) != 1 or helper_rows[0]["kind"] != "executable":
+        raise RuntimeError(
+            "signed payload manifest must own exactly one executable "
+            "chudware-uninstall-helper.exe"
+        )
+    uninstall_helper_sha256 = str(helper_rows[0]["sha256"])
+    installer = out / f"Chudware-Setup-{version}-x86_64.exe"
+    if installer.exists():
+        raise RuntimeError(f"refusing to replace existing installer: {installer}")
     subprocess.run(
         [
             iscc,
@@ -256,33 +363,96 @@ def compile_installer(out: Path, payload: Path, version: str) -> Path:
             f"/DPayloadDir={payload.resolve()}",
             f"/DAppVersion={version}",
             f"/DInstallerOutputDir={out.resolve()}",
+            f"/DUninstallHelperSha256={uninstall_helper_sha256}",
         ],
         cwd=REPO,
         check=True,
     )
-    installer = out / f"Chudware-Setup-{version}-x86_64.exe"
     if not installer.is_file():
         raise RuntimeError(f"Inno Setup succeeded but did not produce {installer}")
+    try:
+        verify_snapshot(payload, payload_snapshot)
+    except PayloadManifestError:
+        installer.unlink(missing_ok=True)
+        raise
     sign_installer(installer)
     return installer
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description="Assemble the Chudware Windows installer.")
+    ap = argparse.ArgumentParser(description="Assemble the signed Chudware Windows installer.")
     ap.add_argument("--out", type=Path, default=REPO / "dist")
-    ap.add_argument("--skip-wheels", action="store_true")
     ap.add_argument("--zip", action="store_true",
-                    help="also retain a zip of the raw installation payload")
+                    help="also retain a deterministic zip of the authenticated payload")
     ap.add_argument("--payload-only", action="store_true",
-                    help="stage the payload without invoking Inno Setup (developer inspection)")
+                    help="stage/finalize the payload without invoking Inno Setup")
+    phase = ap.add_mutually_exclusive_group()
+    phase.add_argument("--prepare-signing", action="store_true",
+                       help="stage payload and emit its exact signing preimage")
+    phase.add_argument("--finalize-signing", type=Path, metavar="SIG",
+                       help="finalize an existing prepared payload with an offline signature")
+    ap.add_argument("--payload-signature", type=Path, metavar="SIG",
+                    help="one-pass finalization with a signature for this deterministic payload")
+    ap.add_argument("--release-public-key", default=os.environ.get("CHUDWARE_RELEASE_PUBLIC_KEY"),
+                    help="Ed25519 public key PEM path or canonical base64")
+    ap.add_argument("--key-id", default=os.environ.get("CHUDWARE_RELEASE_KEY_ID", "release-v1"))
+    ap.add_argument("--created-at", help="canonical UTC timestamp; defaults reproducibly from inputs")
+    ap.add_argument("--version", help="override version-header discovery")
+    ap.add_argument("--host-bin", type=Path, default=HOST_EXE)
+    ap.add_argument("--uninstall-helper-bin", type=Path, default=UNINSTALL_HELPER_EXE)
+    ap.add_argument("--hostd-bin", type=Path,
+                    default=next((path for path in HOSTD_EXE_CANDIDATES if path.is_file()), None))
+    ap.add_argument("--worker-bin", type=Path,
+                    default=Path(os.environ["CHUDWARE_WORKER_BIN"])
+                    if os.environ.get("CHUDWARE_WORKER_BIN") else None)
+    ap.add_argument("--mcp-bin", type=Path,
+                    default=Path(os.environ["CHUDWARE_MCP_BIN"])
+                    if os.environ.get("CHUDWARE_MCP_BIN") else None)
+    ap.add_argument("--omp-bridge-bin", type=Path,
+                    default=Path(os.environ["CHUDWARE_OMP_BRIDGE_BIN"])
+                    if os.environ.get("CHUDWARE_OMP_BRIDGE_BIN") else None)
     args = ap.parse_args(argv)
     try:
-        version = read_built_version()
-        res = build(args.out, args.skip_wheels, args.zip)
-        res["version"] = version
+        if args.finalize_signing is not None:
+            if args.payload_signature is not None:
+                raise RuntimeError("--finalize-signing and --payload-signature are mutually exclusive")
+            if not args.release_public_key:
+                raise RuntimeError("--finalize-signing requires --release-public-key")
+            res = finalize_prepared_payload(
+                args.out,
+                signature_source=args.finalize_signing,
+                release_public_key=args.release_public_key,
+                make_zip=args.zip,
+            )
+            version = str(res["version"])
+        else:
+            if not args.key_id:
+                raise RuntimeError("staging requires --key-id (or CHUDWARE_RELEASE_KEY_ID)")
+            if args.prepare_signing and not args.payload_only:
+                raise RuntimeError("--prepare-signing requires --payload-only")
+            version = args.version or read_built_version()
+            res = build(
+                args.out,
+                version=version,
+                key_id=args.key_id,
+                created_at=args.created_at,
+                make_zip=args.zip,
+                prepare_signing=args.prepare_signing,
+                payload_signature=args.payload_signature,
+                release_public_key=args.release_public_key,
+                host_bin=args.host_bin,
+                hostd_bin=args.hostd_bin,
+                worker_bin=args.worker_bin,
+                mcp_bin=args.mcp_bin,
+                omp_bridge_bin=args.omp_bridge_bin,
+                uninstall_helper_bin=args.uninstall_helper_bin,
+            )
+            res["version"] = version
         if not args.payload_only:
-            res["installer"] = str(compile_installer(args.out, Path(res["dist"]), version))
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+            res["installer"] = str(compile_installer(
+                args.out, Path(res["dist"]), version, args.release_public_key
+            ))
+    except (OSError, RuntimeError, PayloadManifestError, subprocess.CalledProcessError) as exc:
         print(f"build_release: error: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(res, indent=2))

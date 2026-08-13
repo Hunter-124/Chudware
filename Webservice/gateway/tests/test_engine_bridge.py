@@ -58,6 +58,8 @@ class FakeDaemon:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._started = threading.Event()
+        self.docs: dict[str, dict] = {}
+        self._next_doc = 1
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -98,13 +100,26 @@ class FakeDaemon:
                     result = {"proto": 1, "state": "ready"}
                 elif method == "ping":
                     result = {"pong": True}
-                elif method == "doc_new":
-                    result = {"doc_id": "d1", "revision": 0}
-                    await self._broadcast({"event": "doc.opened", "doc_id": "d1"})
+                elif method in {"doc_new", "doc_open", "doc_import", "doc_import_file"}:
+                    doc_id = f"d{self._next_doc}"
+                    self._next_doc += 1
+                    path = params.get("path")
+                    self.docs[doc_id] = {
+                        "doc_id": doc_id,
+                        "name": params.get("name", doc_id),
+                        "path": path,
+                        "revision": 0,
+                    }
+                    result = {"doc_id": doc_id, "revision": 0}
+                    await self._broadcast({"event": "doc.opened", "doc_id": doc_id})
+                elif method == "doc_list":
+                    result = {"docs": list(self.docs.values())}
+                elif method == "doc_close":
+                    result = {"closed": self.docs.pop(params.get("doc_id", ""), None) is not None}
                 elif method == "doc_apply_ops":
                     result = {"ok": True, "revision": 1}
                     await self._broadcast(
-                        {"event": "doc.changed", "doc_id": "d1", "revision": 1}
+                        {"event": "doc.changed", "doc_id": params.get("doc_id"), "revision": 1}
                     )
                 elif method == "agent_ask_v2" and params.get("_test_emit_usage"):
                     event = {
@@ -238,6 +253,53 @@ class TestEngineBridge:
                 # ws2 sees the daemon's fanout events (id-less lines).
                 events = [json.loads(ws2.receive_text())["event"] for _ in range(2)]
                 assert events == ["doc.opened", "doc.changed"]
+
+    def test_document_capabilities_isolate_accounts_and_reconnect(
+        self, daemon, tmp_path, monkeypatch
+    ):
+        workspace_root = tmp_path / "workspace"
+        bucket_root = tmp_path / "bucket"
+        monkeypatch.setattr(settings, "workspace_root", workspace_root)
+        monkeypatch.setattr(settings, "bucket_root", bucket_root)
+        alice_root = settings.user_workspace_root(user_slug("demo@example.com"))
+        bob_root = settings.user_workspace_root(user_slug("admin@example.com"))
+        alice_root.mkdir(parents=True)
+        bob_root.mkdir(parents=True)
+
+        alice_client = TestClient(app_mod.app)
+        bob_client = TestClient(app_mod.app)
+        with alice_client.websocket_connect("/engine", headers=DEV_HEADERS) as alice:
+            alice_id = _rpc(alice, 1, "doc_open", {"path": str(alice_root / "a.step+")})["result"]["doc_id"]
+            assert _rpc(alice, 2, "doc_tree", {"doc_id": alice_id})["result"]["ok"]
+            assert _rpc(alice, 3, "doc_apply_ops", {"doc_id": alice_id, "ops": []})["result"]["ok"]
+            assert _rpc(alice, 4, "doc_save", {"doc_id": alice_id, "path": str(alice_root / "a.step+")})["result"]["ok"]
+            with bob_client.websocket_connect("/engine", headers=ADMIN_HEADERS) as bob:
+                assert _rpc(bob, 10, "doc_list")["result"]["docs"] == []
+                for call_id, method, params in (
+                    (11, "doc_tree", {"doc_id": alice_id}),
+                    (12, "doc_apply_ops", {"doc_id": alice_id, "ops": []}),
+                    (13, "doc_save", {"doc_id": alice_id, "path": str(bob_root / "stolen.step+")}),
+                    (14, "doc_close", {"doc_id": alice_id}),
+                    (15, "batch", {"ops": [{"params": {"doc_id": alice_id}}]}),
+                ):
+                    assert _rpc(bob, call_id, method, params)["error"]["code"] == -32004
+            assert _rpc(alice, 5, "doc_tree", {"doc_id": alice_id})["result"]["ok"]
+
+        # Reconnect starts empty, then path-owned listing grants the capability.
+        reconnect_client = TestClient(app_mod.app)
+        with reconnect_client.websocket_connect("/engine", headers=DEV_HEADERS) as alice:
+            listed = _rpc(alice, 20, "doc_list")["result"]["docs"]
+            assert [entry["doc_id"] for entry in listed] == [alice_id]
+            assert _rpc(alice, 21, "doc_tree", {"doc_id": alice_id})["result"]["ok"]
+            assert _rpc(alice, 22, "doc_close", {"doc_id": alice_id})["result"]["closed"]
+            assert _rpc(alice, 23, "doc_tree", {"doc_id": alice_id})["error"]["code"] == -32004
+
+    def test_doc_list_fails_closed_for_pathless_foreign_docs(self, daemon, client):
+        daemon.docs["foreign"] = {
+            "doc_id": "foreign", "name": "Unknown", "path": None, "revision": 0
+        }
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            assert _rpc(ws, 1, "doc_list")["result"]["docs"] == []
 
     def test_unauthenticated_socket_rejected(self, daemon, client):
         from starlette.websockets import WebSocketDisconnect

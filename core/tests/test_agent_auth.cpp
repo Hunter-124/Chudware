@@ -154,6 +154,23 @@ json xai_store(const json& accounts, const std::string& active) {
 
 }  // namespace
 
+#ifndef _WIN32
+TEST_CASE("credential config and directory are owner-only") {
+    ScratchConfig scratch;
+    scratch.write_cfg(xai_store({{"default", xai_account("old", "refresh", 0)}}, "default"));
+    chudware::agent::auth::set_http_post_for_testing([](const std::string&,
+            const std::vector<std::pair<std::string, std::string>>&, const std::string&, int) {
+        return json_response(200, {{"access_token", "new"}, {"refresh_token", "rotated"},
+                                   {"expires_in", 3600}});
+    });
+    CHECK(chudware::agent::auth::ensure_fresh("xai").ok);
+    CHECK((fs::status(scratch.cfg_dir()).permissions() & fs::perms::all) == fs::perms::owner_all);
+    CHECK((fs::status(scratch.cfg_path()).permissions() & fs::perms::all) ==
+          (fs::perms::owner_read | fs::perms::owner_write));
+    chudware::agent::auth::set_http_post_for_testing(nullptr);
+}
+#endif
+
 TEST_CASE("fresh token skips the network entirely") {
     ScratchConfig scratch;
     FakeHttp fake;

@@ -1,10 +1,10 @@
-// core/agent/omp_bridge_client.h — long-lived bun bridge sidecar client
-// (vendor/omp/bridge/src/bridge.ts).
+// core/agent/omp_bridge_client.h — long-lived OMP bridge sidecar client.
 //
 // core/agent/providers.cpp::complete() forwards OMP-backed providers (see
 // is_omp_bridge_provider() in providers.h) here instead of building a native libcurl/WinHTTP
-// request. This owns ONE `bun run <repo>/vendor/omp/bridge/src/bridge.ts` child process and
-// speaks the newline-delimited JSON-RPC protocol documented at the top of bridge.ts:
+// request. Packaged builds launch only the canonical adjacent chudware-omp-bridge binary;
+// developer builds retain CHUDWARE_OMP_BRIDGE_BIN or the Bun source bridge.
+// The client speaks the newline-delimited JSON-RPC protocol documented at the top of bridge.ts:
 //   -> {"id": <int>, "method": <string>, "params": <object>}
 //   <- {"id": <int>, "ok": true,  "result": <object>}
 //   <- {"id": <int>, "ok": false, "error": {"message": <string>, "status"?: <number>}}
@@ -12,8 +12,8 @@
 // Notification frames are opt-in per request (today: `complete` with params.stream=true, which
 // emits {"event":"delta","data":{"text"|"thinking":<chunk>}} per fragment) and always precede
 // that id's response line. They are handed to the call's OnEvent sink and NEVER complete or
-// retire the request. stdout carries ONLY those frames; the child's own stderr logging is left
-// connected to this process's stderr (nothing redirected/discarded).
+// retire the request. stdout carries ONLY those frames; the child's stderr is pumped back to
+// this process's stderr while retaining a bounded diagnostic tail.
 //
 // Concurrency: the stdio channel is multiplexed, not serialized. A background reader thread
 // owns all reads off the child's stdout and dispatches each response to its id-matched caller;
@@ -22,12 +22,10 @@
 // bridge-backed provider) make independent progress — neither blocks behind the other's full
 // round-trip.
 //
-// Mirrors core/hostd/worker_bridge.{h,cpp} (the C++ core's existing Python-worker stdio
-// bridge) in transport shape: a fork+pipe POSIX child, id-correlated call(), reap-and-respawn
-// on a dead child. Unlike worker_bridge, request/response correlation is NOT serialized behind
-// one lock — see the reader-thread design above. Windows is currently an "unavailable" stub,
-// matching worker_bridge's own Windows branch — the bun bridge does not yet have a
-// CreateProcess-based child transport.
+// Mirrors core/hostd/worker_bridge.{h,cpp} in transport shape: a pipe-backed child,
+// id-correlated call(), and reap-and-respawn on a dead child. Unlike worker_bridge,
+// request/response correlation is not serialized behind one lock. POSIX uses fork/exec;
+// Windows uses CreateProcessW with inherited stdio pipes.
 #pragma once
 
 #include <atomic>
@@ -37,13 +35,14 @@
 
 #include <nlohmann/json.hpp>
 
-#ifndef _WIN32
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
-#include <sys/types.h>
 #include <thread>
 #include <unordered_map>
+
+#ifndef _WIN32
+#include <sys/types.h>
 #endif
 
 namespace chudware {
@@ -90,7 +89,6 @@ private:
     OmpBridgeClient(const OmpBridgeClient&) = delete;
     OmpBridgeClient& operator=(const OmpBridgeClient&) = delete;
 
-#ifndef _WIN32
     // One caller's outstanding request: the reader thread fills {ok,result,err} and flips
     // `done` under `mtx`, notifying `cv`. The waiting call() thread owns `mtx` for the whole
     // wait (condition_variable::wait_for releases/reacquires it around each sleep), so reads
@@ -112,8 +110,8 @@ private:
         bool detached = false;
     };
 
-    // Resolve bunExe_/bridgeScript_/vendorOmpDir_ once (env overrides, else repo-root
-    // discovery). Caller holds mtx_.
+    // Resolve the packaged bridge binary or developer Bun/script paths once. Caller holds
+    // mtx_.
     bool resolvePaths(std::string& err);
     // Bring <vendorOmp>/node_modules in line with the committed bun.lock before spawning. Runs
     // per spawn (not once per process) so a checkout pulled forward under a live daemon heals
@@ -122,10 +120,9 @@ private:
     // mtx_.
     void provisionDeps();
     bool spawn(std::string& err);  // caller holds mtx_
-    // Caller holds mtx_. Tears down process_/fds (fast WNOHANG check, SIGTERM+blocking-wait
-    // fallback if still alive) and fails every outstanding Pending with a transport error —
-    // whichever thread notices the child is dead (a caller's failed write, or the reader
-    // thread's EOF), this is the single place that guarantees no one is left hanging.
+    // Caller holds mtx_. Tears down the process and pipes, then fails every outstanding
+    // Pending with a transport error. Whichever thread notices death is the single place
+    // that guarantees no caller is left hanging.
     void reap();
     bool writeLine(const std::string& line);
     // Ensures the current generation's child + its background reader thread are running,
@@ -141,33 +138,39 @@ private:
     // cancellation, or an ok:false method-level RPC error is final.
     bool callOnce(const std::string& method, const nlohmann::json& params, nlohmann::json& result,
                   std::string& err, int timeoutMs, const OnEvent& onEvent, bool& childDead);
-    // Background reader thread body for one generation: pumps response lines off `fd` until
-    // EOF/error, dispatching each to its id-matched Pending, then reaps this generation (if it
-    // wasn't already reaped by a concurrent caller) and fails whatever is left outstanding so
-    // no caller hangs. `fd`/`pid` are captured at spawn time rather than re-read from
-    // childStdoutRd_/process_, which may already name a newer generation by the time this
-    // thread notices its own child died.
+    // Background reader thread body for one generation: pumps response lines until EOF/error,
+    // dispatches each to its id-matched Pending, then reaps this generation and fails whatever
+    // remains outstanding. The process identity is captured at spawn time rather than re-read
+    // from fields that may already name a newer generation.
+#ifdef _WIN32
+    void readerLoop(void* fd, void* process);
+    void stderrLoop(void* fd);
+#else
     void readerLoop(int fd, pid_t pid);
-    // Background stderr pump for one generation: tees the child's stderr to this process's
-    // stderr (unchanged journal behaviour) while keeping the tail for stderrSummary(). Owns
-    // and closes `fd`. Joined by reap() before it fails outstanding callers, so the tail is
-    // complete by the time a transport error is decorated with it.
     void stderrLoop(int fd);
+#endif
     // Last few non-empty stderr lines of the most recent child, condensed onto one line.
     std::string stderrSummary();
     void dispatchResponse(const std::string& line);  // caller holds no lock
     void failAllPending(const std::string& reason);   // caller holds no lock
 
+#ifdef _WIN32
+    void* childStdinWr_ = nullptr;   // HANDLE: write -> child stdin
+    void* childStdoutRd_ = nullptr;  // HANDLE: read <- child stdout
+    void* job_ = nullptr;            // HANDLE: kill-on-close containment job
+    void* process_ = nullptr;        // HANDLE
+#else
     int childStdinWr_ = -1;   // write -> child stdin
-    int childStdoutRd_ = -1;  // read  <- child stdout (owned by the reader thread once spawned)
+    int childStdoutRd_ = -1;  // read  <- child stdout
     pid_t process_ = -1;
-    bool running_ = false;
-    // Resolved once on first spawn. Defaults to a PATH-searched "bun" (or a common
-    // curl-installer location) and <repo root>/vendor/omp/bridge/src/bridge.ts; both are
-    // overridable (CHUDWARE_BUN, CHUDWARE_OMP_BRIDGE) for checkouts/installs that don't sit under
-    // $HOME/Repositories/CAD or don't have bun on PATH.
+#endif
+    // Resolved once on first spawn. Packaged builds derive the canonical adjacent bridge
+    // from the current executable and reject non-adjacent inherited overrides. Developer
+    // builds retain CHUDWARE_OMP_BRIDGE_BIN, CHUDWARE_BUN, and the source-script override.
     std::string bunExe_;
     std::string bridgeScript_;
+    std::string bridgeCwd_;
+    bool compiledBridge_ = false;
     // <...>/vendor/omp — the vendored bun workspace provisionDeps() keeps current.
     std::string vendorOmpDir_;
     // Lockfile fingerprint provisionDeps() last acted on in this process (see provisionDeps).
@@ -191,7 +194,6 @@ private:
     std::mutex pendingMtx_;
     std::unordered_map<int64_t, std::shared_ptr<Pending>> pending_;
     std::atomic<int64_t> nextId_{1};
-#endif
 
     // Guards process_/childStdinWr_/childStdoutRd_/running_/pathsResolved_ and serializes
     // writing one request line to the child's stdin. Held only for spawn/reap/write — never

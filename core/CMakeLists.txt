@@ -18,6 +18,29 @@ project(chudware_core VERSION ${CHUDWARE_VERSION} LANGUAGES C CXX)  # C enabled 
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Developer checkouts may execute source-backed sidecars and built-in prompt files.
+# Release builders set this OFF; production code has no runtime bypass.
+option(CHUDWARE_DEVELOPER_BUILD "Enable source-backed developer execution paths" ON)
+if(CHUDWARE_DEVELOPER_BUILD)
+  add_compile_definitions(CHUDWARE_DEVELOPER_BUILD=1)
+endif()
+
+set(CHUDWARE_PROTECTED_ASSETS_DIR "" CACHE PATH
+  "Generated protected-assets root required when CHUDWARE_DEVELOPER_BUILD=OFF")
+if(NOT CHUDWARE_DEVELOPER_BUILD)
+  if(NOT CHUDWARE_PROTECTED_ASSETS_DIR)
+    set(CHUDWARE_PROTECTED_ASSETS_DIR
+      "${CMAKE_BINARY_DIR}/generated/protected-assets")
+  endif()
+  if(NOT EXISTS "${CHUDWARE_PROTECTED_ASSETS_DIR}/include/chudware/protected_assets.generated.h")
+    message(FATAL_ERROR
+      "Production builds require packaging/embed_protected_assets.py output at "
+      "${CHUDWARE_PROTECTED_ASSETS_DIR}")
+  endif()
+endif()
+
+
 # Build all static libs position-independent so they can be linked into the libchudware
 # SHARED library on ELF platforms (Linux/macOS): GCC/Clang reject non-PIC .o in a .so
 # ("recompile with -fPIC"). No-op on MSVC (DLLs are inherently relocatable).
@@ -730,6 +753,11 @@ add_library(chudware_agent STATIC
   agent/iface_plan.cpp
   agent/pm_assist.cpp)
 target_include_directories(chudware_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(NOT CHUDWARE_DEVELOPER_BUILD)
+  target_include_directories(chudware_agent PRIVATE
+    "${CHUDWARE_PROTECTED_ASSETS_DIR}/include")
+endif()
+
 # chudware_util: platform_paths (executablePath) + parent_death (fork/exec child
 # hardening) for omp_bridge_client.cpp and run.cpp's worker spawn.
 target_link_libraries(chudware_agent PUBLIC nlohmann_json::nlohmann_json chudware_util)

@@ -48,6 +48,8 @@ from config import settings  # noqa: E402
 # is not shared with any other test module.
 CLIENT = ("203.0.113.9", 44_321)
 
+_DELIVERED_MESSAGES: list[dict] = []
+
 GOOD_PASSWORD = "correct horse battery staple"
 WRONG_PASSWORD = "incorrect horse battery staple"
 
@@ -85,33 +87,13 @@ def _protected_app() -> FastAPI:
 @pytest.fixture()
 def client(pg, monkeypatch):
     """A gateway in production auth mode, with virgin rate limiters."""
-    # Not dev mode: the X-Dev-User short-circuit would skip the session branch
-    # entirely, which is the branch under test.
+    limits.login_by_email._hits.clear()
+    limits.login_by_ip._hits.clear()
     monkeypatch.setattr(settings, "dev_mode", False)
     monkeypatch.setattr(settings, "session_secret", "test-session-secret")
-    monkeypatch.setattr(settings, "cf_team_domain", "")
-    monkeypatch.setattr(settings, "cf_aud", "")
     monkeypatch.setattr(settings, "public_base_url", "https://chudware.test")
-    monkeypatch.setattr(settings, "mail_backend", "console")
-
-    # Fresh limiter instances with the SHIPPED limits, so these tests assert
-    # the configured policy rather than a number retyped here, while staying
-    # isolated from whatever ran before them in the session.
-    for name in ("login_by_email", "login_by_ip"):
-        shipped = getattr(limits, name)
-        fresh = limits.RateLimiter(shipped.limit, shipped.window)
-        monkeypatch.setattr(limits, name, fresh)
-        monkeypatch.setattr(authn, name, fresh, raising=False)
-        if hasattr(oauth, name):
-            monkeypatch.setattr(oauth, name, fresh)
-    monkeypatch.setattr(mailer, "outbound", limits.RateLimiter(1000, 3600.0))
-
-    # https, because the session cookie is Secure and an http client drops a
-    # Secure cookie set over plain http — exactly as a browser would, and
-    # exactly how production runs behind the Cloudflare tunnel.
-    with TestClient(
-        _protected_app(), client=CLIENT, base_url="https://testserver"
-    ) as c:
+    app = _protected_app()
+    with TestClient(app, client=CLIENT, base_url="https://testserver") as c:
         yield c
 
 
@@ -214,6 +196,22 @@ def test_verified_user_reaches_a_protected_route(client):
     register_and_verify(client, "member@example.com")
     body = client.get("/api/whoami").json()
     assert body == {"email": "member@example.com", "role": "user", "status": "ok"}
+
+
+def test_websocket_revalidation_tracks_actual_session_and_revocation(client):
+    from auth import AuthError, revalidate_websocket_user
+    register_and_verify(client, "member@example.com")
+    sid = authn.create_session("member@example.com")
+    assert sid
+    scope = {
+        "state": {"user": auth.User("member@example.com", "Member", "user", False)},
+        "headers": [(b"cookie", f"{authn.SESSION_COOKIE}={sid}".encode())],
+    }
+    assert revalidate_websocket_user(scope).email == "member@example.com"
+    authn.revoke_session(sid)
+    with pytest.raises(AuthError) as exc:
+        revalidate_websocket_user(scope)
+    assert exc.value.status == 401
 
 
 def test_unverified_account_cannot_log_in_even_with_the_right_password(client):
@@ -383,6 +381,21 @@ def test_login_sets_a_hardened_session_cookie(client):
     assert authn.lookup_session(sid) == "cookie@example.com"
 
 
+def test_session_bearer_is_never_stored_in_plaintext(client):
+    register_and_verify(client, "digest@example.com")
+    response = login(client, "digest@example.com", GOOD_PASSWORD)
+    sid = response.headers["set-cookie"].split(";", 1)[0].split("=", 1)[1]
+    with db.tx() as cur:
+        cur.execute(
+            "SELECT sid FROM sessions WHERE email = %s AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1",
+            ("digest@example.com",),
+        )
+        stored = cur.fetchone()["sid"]
+    assert stored == authn.token_hash(sid)
+    assert sid != stored
+    assert authn.lookup_session(sid) == "digest@example.com"
+
+
 def test_suspending_an_account_kills_its_live_session_on_the_next_request(client):
     register_and_verify(client, "doomed@example.com")
     assert client.get("/api/whoami").status_code == 200
@@ -399,7 +412,7 @@ def test_suspending_an_account_kills_its_live_session_on_the_next_request(client
     # And the row itself is revoked, so reinstating the account later does not
     # silently resurrect a session an operator believed they had ended.
     with db.tx() as cur:
-        cur.execute("SELECT revoked_at FROM sessions WHERE sid = %s", (sid,))
+        cur.execute("SELECT revoked_at FROM sessions WHERE sid = %s", (authn.token_hash(sid),))
         assert cur.fetchone()["revoked_at"] is not None
     assert authn.lookup_session(sid) is None
     # The cookie is now inert: subsequent requests are plain unauthenticated,
@@ -428,7 +441,7 @@ def test_an_expired_session_does_not_authenticate(client):
         cur.execute(
             "UPDATE sessions SET expires_at = now() - interval '1 second'"
             " WHERE sid = %s",
-            (sid,),
+            (authn.token_hash(sid),),
         )
     assert authn.lookup_session(sid) is None
     assert client.get("/api/whoami").status_code == 401
@@ -599,29 +612,95 @@ def test_a_short_password_is_refused_at_registration(client):
 # ---------------------------------------------------------------------------
 
 
-def test_oauth_state_is_single_use_and_bound_to_its_provider(client):
-    state = oauth.mint_state("google")
-    assert oauth.check_state("github", state) is False, "state crossed providers"
-    assert oauth.check_state("google", state) is True
-    assert oauth.check_state("google", state) is False, "state was replayable"
+def test_oauth_state_is_single_use_and_bound_to_its_provider_and_browser(client):
+    state, verifier = oauth.mint_state("google")
+    assert oauth.check_state("github", state, verifier) is False, "state crossed providers"
+    assert oauth.check_state("google", state, "") is False, "state worked without its browser"
+    assert oauth.check_state("google", state, "stolen-browser") is False
+    assert oauth.check_state("google", state, verifier) is True
+    assert oauth.check_state("google", state, verifier) is False, "state was replayable"
 
 
 def test_oauth_state_with_a_forged_signature_is_rejected(client):
-    nonce, _, _signature = oauth.mint_state("google").partition(".")
-    assert oauth.check_state("google", f"{nonce}.{'0' * 64}") is False
-    assert oauth.check_state("google", nonce) is False
-    assert oauth.check_state("google", "") is False
+    state, verifier = oauth.mint_state("google")
+    nonce, _, _signature = state.partition(".")
+    assert oauth.check_state("google", f"{nonce}.{'0' * 64}", verifier) is False
+    assert oauth.check_state("google", nonce, verifier) is False
+    assert oauth.check_state("google", "", verifier) is False
 
 
 def test_an_expired_oauth_state_is_rejected(client):
-    state = oauth.mint_state("google")
+    state, verifier = oauth.mint_state("google")
     with db.tx() as cur:
         cur.execute(
             "UPDATE email_tokens SET expires_at = now() - interval '1 second'"
             " WHERE token_hash = %s",
             (authn.token_hash(state),),
         )
-    assert oauth.check_state("google", state) is False
+    assert oauth.check_state("google", state, verifier) is False
+
+def test_stolen_oauth_state_without_initiating_cookie_is_rejected_and_cleared(
+    client, monkeypatch
+):
+    monkeypatch.setattr(settings, "google_client_id", "client-id")
+    monkeypatch.setattr(settings, "google_client_secret", "client-secret")
+    state, _verifier = oauth.mint_state("google")
+
+    response = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    assert "expired or was already used" in response.text
+    cookie = response.headers["set-cookie"]
+    assert cookie.startswith(f"{oauth.OAUTH_TRANSACTION_COOKIE}=;")
+    assert "Max-Age=0" in cookie
+
+
+def test_matching_oauth_cookie_succeeds_once_and_is_cleared(client, monkeypatch):
+    monkeypatch.setattr(settings, "google_client_id", "client-id")
+    monkeypatch.setattr(settings, "google_client_secret", "client-secret")
+    monkeypatch.setattr(oauth, "resolve_identity", _identity)
+    state, verifier = oauth.mint_state("google")
+    client.cookies.set(oauth.OAUTH_TRANSACTION_COOKIE, verifier)
+
+    response = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    cookies = response.headers.get_list("set-cookie")
+    assert any(cookie.startswith(f"{authn.SESSION_COOKIE}=") for cookie in cookies)
+    assert any(
+        cookie.startswith(f"{oauth.OAUTH_TRANSACTION_COOKIE}=;") and "Max-Age=0" in cookie
+        for cookie in cookies
+    )
+
+    client.cookies.set(oauth.OAUTH_TRANSACTION_COOKIE, verifier)
+    replay = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    assert replay.status_code == 400
+
+
+async def _identity(_provider, _code):
+    return "provider-subject", "social@example.com"
+
+
+def test_hostile_provider_error_is_html_escaped_and_cookie_cleared(client, monkeypatch):
+    monkeypatch.setattr(settings, "google_client_id", "client-id")
+    monkeypatch.setattr(settings, "google_client_secret", "client-secret")
+    hostile = "%3Cscript%3Ealert%281%29%3C%2Fscript%3E%26%22%27"
+    response = client.get(
+        f"/api/auth/oauth/google/callback?error={hostile}", follow_redirects=False
+    )
+    assert response.status_code == 400
+    assert "<script>" not in response.text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;&amp;&quot;&#x27;" in response.text
+    assert response.headers["set-cookie"].startswith(
+        f"{oauth.OAUTH_TRANSACTION_COOKIE}=;"
+    )
 
 
 def test_an_oauth_callback_without_valid_state_is_refused(client):
@@ -632,7 +711,9 @@ def test_an_oauth_callback_without_valid_state_is_refused(client):
     # network call — which is itself the right answer for an unconfigured
     # provider, and must never be a redirect that sets a cookie.
     assert monkey.status_code == 400
-    assert "set-cookie" not in monkey.headers
+    assert monkey.headers["set-cookie"].startswith(
+        f"{oauth.OAUTH_TRANSACTION_COOKIE}=;"
+    )
 
 
 def test_an_oauth_identity_links_to_an_existing_password_account(client):
@@ -665,7 +746,7 @@ def test_an_unconfigured_provider_is_not_startable(client):
     assert "not enabled" in response.text
 
 
-def test_a_configured_provider_redirects_with_a_state_parameter(client, monkeypatch):
+def test_a_configured_provider_binds_state_to_a_short_lived_browser_cookie(client, monkeypatch):
     monkeypatch.setattr(settings, "google_client_id", "client-id-123")
     monkeypatch.setattr(settings, "google_client_secret", "client-secret-456")
     assert oauth.configured_providers() == ["google"]
@@ -682,8 +763,15 @@ def test_a_configured_provider_redirects_with_a_state_parameter(client, monkeypa
         "https://chudware.test/api/auth/oauth/google/callback"
     ]
     assert query["response_type"] == ["code"]
-    # The state we just minted must be live and redeemable exactly once.
-    assert oauth.check_state("google", query["state"][0]) is True
+    cookie = response.headers["set-cookie"]
+    assert cookie.startswith(f"{oauth.OAUTH_TRANSACTION_COOKIE}=")
+    assert "; HttpOnly" in cookie and "; Secure" in cookie and "; SameSite=Lax" in cookie
+    assert f"Max-Age={oauth.OAUTH_TRANSACTION_MAX_AGE}" in cookie
+
+    state = query["state"][0]
+    verifier = client.cookies.get(oauth.OAUTH_TRANSACTION_COOKIE)
+    assert oauth.check_state("google", state, verifier) is True
+    assert oauth.check_state("google", state, verifier) is False
 
 
 # ---------------------------------------------------------------------------
@@ -745,10 +833,10 @@ def ms_signed(monkeypatch, ms_key, claims, tenant=MS_TENANT):
 
 
 def test_a_microsoft_state_is_bound_to_microsoft(client):
-    state = oauth.mint_state("microsoft")
-    assert oauth.check_state("google", state) is False, "state crossed providers"
-    assert oauth.check_state("microsoft", state) is True
-    assert oauth.check_state("microsoft", state) is False, "state was replayable"
+    state, verifier = oauth.mint_state("microsoft")
+    assert oauth.check_state("google", state, verifier) is False, "state crossed providers"
+    assert oauth.check_state("microsoft", state, verifier) is True
+    assert oauth.check_state("microsoft", state, verifier) is False, "state was replayable"
 
 
 def test_an_unconfigured_microsoft_provider_is_not_startable(client):
@@ -778,7 +866,8 @@ def test_configured_microsoft_redirects_to_its_tenant_with_a_state(client, monke
     ]
     assert query["response_type"] == ["code"]
     assert query["prompt"] == ["select_account"]
-    assert oauth.check_state("microsoft", query["state"][0]) is True
+    verifier = client.cookies.get(oauth.OAUTH_TRANSACTION_COOKIE)
+    assert oauth.check_state("microsoft", query["state"][0], verifier) is True
 
 
 @pytest.mark.parametrize("edov", [True, "true", "1"])

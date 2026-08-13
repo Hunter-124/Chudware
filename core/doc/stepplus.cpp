@@ -45,6 +45,17 @@ namespace {
 
 constexpr const char* kContainer = "aicad.step+/1";
 constexpr const char* kAppVersion = "Chudware/M1";
+// Conservative pre-allocation limits for remotely supplied archives. Metadata is checked
+// for every entry before any payload buffer is allocated.
+constexpr mz_uint kMaxArchiveEntries = 4096;
+constexpr mz_uint64 kMaxEntryExpandedBytes = 64ull * 1024ull * 1024ull;
+constexpr mz_uint64 kMaxArchiveExpandedBytes = 256ull * 1024ull * 1024ull;
+constexpr mz_uint64 kMaxCompressionRatio = 200;
+
+[[noreturn]] void archive_limit_error(const char* limit) {
+    throw OpError("io_error", std::string("doc_open: .step+ archive exceeds ") + limit,
+                  {{"limit", limit}});
+}
 
 // Entries this module owns + rewrites on every save; everything else is preserved.
 bool is_known_entry(const std::string& name) {
@@ -262,15 +273,45 @@ StepPlusDoc stepplus_open(const std::string& path) {
     if (!mz_zip_reader_init_file(&zip, path.c_str(), 0))
         io_error("doc_open: not a valid .step+ (zip) container: " + path);
 
+    const mz_uint count = mz_zip_reader_get_num_files(&zip);
+    if (count > kMaxArchiveEntries) {
+        mz_zip_reader_end(&zip);
+        archive_limit_error("entry count limit");
+    }
+    mz_uint64 aggregate_expanded = 0;
+    for (mz_uint i = 0; i < count; ++i) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&zip, i, &st)) {
+            mz_zip_reader_end(&zip);
+            io_error("doc_open: invalid .step+ archive metadata");
+        }
+        if (st.m_is_directory) continue;
+        if (st.m_uncomp_size > kMaxEntryExpandedBytes) {
+            mz_zip_reader_end(&zip);
+            archive_limit_error("per-entry expanded byte limit");
+        }
+        if (st.m_uncomp_size > kMaxArchiveExpandedBytes ||
+            aggregate_expanded > kMaxArchiveExpandedBytes - st.m_uncomp_size) {
+            mz_zip_reader_end(&zip);
+            archive_limit_error("aggregate expanded byte limit");
+        }
+        aggregate_expanded += st.m_uncomp_size;
+        if (st.m_uncomp_size != 0 &&
+            (st.m_comp_size == 0 || st.m_uncomp_size / st.m_comp_size > kMaxCompressionRatio)) {
+            mz_zip_reader_end(&zip);
+            archive_limit_error("compression ratio limit");
+        }
+    }
+
     auto read_entry = [&](const std::string& name, std::string& out) -> bool {
-        int idx = mz_zip_reader_locate_file(&zip, name.c_str(), nullptr, 0);
+        const int idx = mz_zip_reader_locate_file(&zip, name.c_str(), nullptr, 0);
         if (idx < 0) return false;
-        std::size_t n = 0;
-        void* p = mz_zip_reader_extract_to_heap(&zip, (mz_uint)idx, &n, 0);
-        if (!p) return false;
-        out.assign(static_cast<char*>(p), n);
-        mz_free(p);
-        return true;
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&zip, static_cast<mz_uint>(idx), &st)) return false;
+        out.resize(static_cast<std::size_t>(st.m_uncomp_size));
+        if (out.empty()) return true;
+        return mz_zip_reader_extract_to_mem(&zip, static_cast<mz_uint>(idx), out.data(), out.size(),
+                                            0) != 0;
     };
 
     StepPlusDoc result;
@@ -312,23 +353,19 @@ StepPlusDoc stepplus_open(const std::string& path) {
     }
 
     // Carry every entry we don't own back onto the session for forward-compat resave.
-    mz_uint count = mz_zip_reader_get_num_files(&zip);
     for (mz_uint i = 0; i < count; ++i) {
         mz_zip_archive_file_stat st;
         if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
         const std::string name = st.m_filename;
-        if (is_known_entry(name)) continue;
+        if (is_known_entry(name) || st.m_is_directory) continue;
         // STORED entries (method 0 — e.g. cache.aicm) carry the persisted-geometry mesh. Extract
-        // them raw with MZ_ZIP_FLAG_COMPRESSED_DATA so miniz skips BOTH the DEFLATE inflate and
-        // the byte-wise mz_crc32 verify (for a STORED entry the "compressed" bytes ARE the data).
-        // This is the doc_open / agent->GUI handoff fast path — it was the dominant open cost.
-        // DEFLATE entries take the normal extract (they must be inflated).
-        std::size_t n = 0;
-        mz_uint flags = (st.m_method == 0) ? MZ_ZIP_FLAG_COMPRESSED_DATA : 0;
-        void* p = mz_zip_reader_extract_to_heap(&zip, i, &n, flags);
-        if (!p) continue;
-        result.extra[name].assign(static_cast<char*>(p), n);
-        mz_free(p);
+        // them raw with MZ_ZIP_FLAG_COMPRESSED_DATA so miniz skips BOTH inflate and CRC; for a
+        // STORED entry the compressed bytes are the data. Allocate the destination exactly once.
+        const mz_uint flags = (st.m_method == 0) ? MZ_ZIP_FLAG_COMPRESSED_DATA : 0;
+        std::string data(static_cast<std::size_t>(st.m_uncomp_size), '\0');
+        if (!data.empty() &&
+            !mz_zip_reader_extract_to_mem(&zip, i, data.data(), data.size(), flags)) continue;
+        result.extra.emplace(name, std::move(data));
     }
 
     mz_zip_reader_end(&zip);

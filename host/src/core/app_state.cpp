@@ -28,6 +28,7 @@
 #elif !defined(__EMSCRIPTEN__)
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #else
 #include <unistd.h>  // ::getpid() — the config-write tmp name below uses it on all non-Windows
@@ -726,7 +727,8 @@ public:
             h_ = nullptr;
         }
 #elif !defined(__EMSCRIPTEN__)
-        fd_ = ::open(p.c_str(), O_CREAT | O_RDWR, 0644);
+        fd_ = ::open(p.c_str(), O_CREAT | O_RDWR, 0600);
+        if (fd_ >= 0) (void)::fchmod(fd_, 0600);
         if (fd_ < 0) return;
         if (::flock(fd_, LOCK_EX) != 0) { ::close(fd_); fd_ = -1; }
 #else
@@ -766,6 +768,9 @@ bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch) {
     std::lock_guard<std::mutex> guard(configWriteMutex());
     std::error_code ec;
     std::filesystem::create_directories(appdataAppDir(), ec);
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    (void)::chmod(appdataAppDir().c_str(), 0700);
+#endif
     ConfigFileLock lock(path + ".lock");
     // Re-read INSIDE the lock: anything we parsed earlier may be stale by now.
     nlohmann::json j = nlohmann::json::object();
@@ -797,17 +802,36 @@ bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch) {
             (long long)::getpid()
 #endif
         );
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+        const int tmpFd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (tmpFd < 0) return false;
+        const std::string data = j.dump(2);
+        size_t written = 0;
+        while (written < data.size()) {
+            const ssize_t n = ::write(tmpFd, data.data() + written, data.size() - written);
+            if (n <= 0) { ::close(tmpFd); std::filesystem::remove(tmp, ec); return false; }
+            written += static_cast<size_t>(n);
+        }
+        if (::fsync(tmpFd) != 0 || ::close(tmpFd) != 0) {
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+#else
         {
             std::ofstream out(tmp, std::ios::trunc);
             if (!out) return false;
             out << j.dump(2);
             if (!out) return false;
         }
+#endif
         std::filesystem::rename(tmp, path, ec);
         if (ec) {
             std::filesystem::remove(tmp, ec);  // don't leave a stray tmp behind
             return false;
         }
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+        (void)::chmod(path.c_str(), 0600);
+#endif
         appstatePersistSync();  // WASM: flush IDBFS; no-op on desktop
     } catch (...) {
         return false;

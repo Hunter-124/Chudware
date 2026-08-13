@@ -410,6 +410,8 @@ bool DeviceAllowlist::upsert(const AllowlistEntry& entry, std::string* why) {
     std::string invalid;
     if (!entry.endpoint.valid(&invalid)) return fail(why, invalid);
     if (entry.operator_note.empty()) return fail(why, "allowlist operator note is required");
+    if (entry.connection.contains("origin"))
+        return fail(why, "connection parameter origin is forbidden; transport physicality is server-attested");
     for (const auto& [key, value] : entry.connection) {
         if (!validConnectionKey(key)) return fail(why, "invalid connection parameter key: " + key);
         if (value.empty()) return fail(why, "connection parameter value is empty: " + key);
@@ -515,6 +517,11 @@ std::optional<AllowlistEntry> DeviceAllowlist::parseLine(std::string_view line, 
     if (const auto value = fields.find("usb_serial"); value != fields.end())
         entry.endpoint.usb_serial = value->second;
 
+
+    if (fields.contains("origin")) {
+        fail(why, "connection parameter origin is forbidden; transport physicality is server-attested");
+        return std::nullopt;
+    }
     static constexpr std::array reserved = {"address", "port", "usb_vid", "usb_pid",
                                              "usb_serial", "machine_class", "note"};
     for (const auto& [key, value] : fields) {

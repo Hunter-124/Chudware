@@ -32,6 +32,14 @@ set(CHUDWARE_GENERATED_INCLUDE_DIR "${CMAKE_BINARY_DIR}/generated")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Developer checkouts may execute source-backed sidecars and built-in prompt files.
+# Release builders set this OFF; production code has no runtime bypass.
+option(CHUDWARE_DEVELOPER_BUILD "Enable source-backed developer execution paths" ON)
+if(CHUDWARE_DEVELOPER_BUILD)
+  add_compile_definitions(CHUDWARE_DEVELOPER_BUILD=1)
+endif()
+
 if(MSVC)
   add_compile_options(/utf-8 /MP)
 endif()
@@ -341,8 +349,10 @@ else()
     ../core/util/entitlement.cpp
     ../core/util/secret_store.cpp
     ../core/util/tweetnacl.c
+    ../core/security/integrity.cpp
     ../core/agent/http.cpp
     src/update/updater.cpp
+    ../core/security/integrity.cpp
     src/update/apply_linux.cpp
     src/update/apply_windows.cpp
     src/update/apply_macos.cpp
@@ -365,6 +375,23 @@ if(NOT EMSCRIPTEN)
   if(WIN32)
     target_sources(Chudware PRIVATE app.rc)
   endif()
+  if(WIN32)
+    add_executable(chudware-update-helper WIN32
+      src/update/windows_update_helper_main.cpp
+      src/update/windows_update_helper.cpp
+      ../core/security/integrity.cpp
+      ../core/util/tweetnacl.c)
+    target_include_directories(chudware-update-helper PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/../core)
+    target_compile_definitions(chudware-update-helper PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(chudware-update-helper PRIVATE
+      nlohmann_json::nlohmann_json shell32 ole32 bcrypt crypt32)
+    set_target_properties(chudware-update-helper PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    add_dependencies(Chudware chudware-update-helper)
+  endif()
+
   # Native camera backend — one per OS. camera_stub.cpp is always compiled in (it
   # carries CameraBackend::create() and the synthetic fallback), so macOS, which
   # has no AVFoundation backend, needs no extra TU: create() falls through to the
@@ -502,6 +529,20 @@ if(WIN32)
   endif()
 endif()
 
+if(WIN32)
+  add_executable(chudware-uninstall-helper
+    src/update/windows_uninstall_helper.cpp
+    ../core/security/integrity.cpp
+    ../core/util/tweetnacl.c)
+  target_include_directories(chudware-uninstall-helper PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core)
+  target_compile_definitions(chudware-uninstall-helper PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(chudware-uninstall-helper PRIVATE
+    nlohmann_json::nlohmann_json bcrypt crypt32)
+  set_target_properties(chudware-uninstall-helper PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
+
 set_target_properties(Chudware PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
@@ -547,8 +588,10 @@ add_test(NAME test_entitlement_commands COMMAND test_entitlement_commands)
 add_executable(test_updater
   tests/test_updater.cpp
   src/update/updater.cpp
+  ../core/security/integrity.cpp
   src/update/apply_linux.cpp
   src/update/apply_windows.cpp
+  src/update/windows_update_helper.cpp
   src/update/apply_macos.cpp
   ../core/util/entitlement.cpp
   ../core/util/tweetnacl.c
@@ -558,7 +601,7 @@ target_include_directories(test_updater PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../core)
 target_link_libraries(test_updater PRIVATE nlohmann_json::nlohmann_json)
 if(WIN32)
-  target_link_libraries(test_updater PRIVATE winhttp bcrypt crypt32 ws2_32)
+  target_link_libraries(test_updater PRIVATE winhttp bcrypt crypt32 ws2_32 shell32 ole32)
 else()
   target_link_libraries(test_updater PRIVATE CURL::libcurl)
   if(APPLE)
@@ -568,6 +611,12 @@ endif()
 set_target_properties(test_updater PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_updater COMMAND test_updater)
+if(CHUDWARE_DEVELOPER_BUILD AND NOT WIN32)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME test_updater_https
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_updater_https.py
+            $<TARGET_FILE:test_updater>)
+endif()
 # --- end signed desktop auto-update ---
 
 # --- RE-07: CameraBackend platform abstraction (V4L2 / MF / stub) ---

@@ -62,6 +62,10 @@ bool solidworks_available();
 // "Save As STEP" message when SolidWorks/COM is unavailable or the automation fails.
 std::string sw_export_step(const std::string& src_path);
 
+// Convert a DWG through the external LibreDWG converter. Public only so the focused native
+// boundary test can verify literal argv handling; callers normally use import_bodies.
+std::string dwg_to_temp_dxf(const std::string& path);
+
 // A raw triangle-soup mesh (the C++ analogue of engine/doc/mesh_body.py::MeshBody used
 // only internally by the mesh readers/writers — the public body model stays TopoDS).
 // `verts` is N*3 doubles (x,y,z row-major); `tris` is M*3 0-based vertex indices.

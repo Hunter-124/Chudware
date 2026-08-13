@@ -21,13 +21,15 @@ struct LeaseOwner {
 };
 
 struct CommandLease {
+    static constexpr uint64_t default_ttl_ms = 15000;
+    static constexpr uint64_t max_ttl_ms = 60000;
     std::string lease_id;
     std::string device_id;
     LeaseOwner owner;
     std::string role = "commander";
     device::Seq granted_at_seq = 0;
     uint64_t granted_at_mono_ns = 0;
-    uint64_t ttl_ms = 15000;
+    uint64_t ttl_ms = default_ttl_ms;
     uint64_t heartbeat_ms = 3000;
     uint64_t expires_at_mono_ns = 0;
     std::string transport_kind;
@@ -47,7 +49,7 @@ public:
     explicit LeaseRegistry(Journal& journal) : journal_(journal) {}
 
     LeaseOutcome claim(std::string device_id, LeaseOwner owner, uint64_t now_mono_ns,
-                       uint64_t ttl_ms = 15000, uint64_t heartbeat_ms = 3000,
+                       uint64_t ttl_ms = CommandLease::default_ttl_ms, uint64_t heartbeat_ms = 3000,
                        std::string transport_kind = {}, std::string exclusive_endpoint = {});
     LeaseOutcome renew(std::string_view lease_id, const LeaseOwner& owner,
                        uint64_t now_mono_ns, uint64_t ttl_ms);

@@ -22,6 +22,7 @@ enum class State {
 struct Manifest {
     std::string version;
     std::string minSupported;
+    std::string keyId;
     std::string sha256;
     std::uint64_t size = 0;
     std::string signature;

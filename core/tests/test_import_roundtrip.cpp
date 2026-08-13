@@ -10,6 +10,11 @@
 
 #include <filesystem>
 #include <string>
+#include <fstream>
+#include <cstdlib>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 #include <vector>
 
 #include <BRepGProp.hxx>
@@ -41,6 +46,17 @@ fs::path tmp(const std::string& name) {
 }
 }  // namespace
 
+#ifndef _WIN32
+struct PathGuard {
+    std::string old = std::getenv("PATH") ? std::getenv("PATH") : "";
+    explicit PathGuard(const fs::path& prepend) {
+        const std::string value = prepend.string() + ":" + old;
+        ::setenv("PATH", value.c_str(), 1);
+    }
+    ~PathGuard() { ::setenv("PATH", old.c_str(), 1); }
+};
+#endif
+
 // --- N-8 mechanism: the BREP base64 round-trip is lossless (volume preserved). --------
 TEST_CASE("shape <-> brep base64 round-trips exactly") {
     TopoDS_Shape box = BRepPrimAPI_MakeBox(10.0, 20.0, 30.0).Shape();
@@ -50,6 +66,38 @@ TEST_CASE("shape <-> brep base64 round-trips exactly") {
     REQUIRE_FALSE(back.IsNull());
     CHECK(vol(back) == doctest::Approx(vol(box)).epsilon(1e-9));
 }
+
+#ifndef _WIN32
+TEST_CASE("DWG converter receives hostile path literally without shell execution") {
+    const fs::path dir = tmp("dwg_argv_test");
+    fs::create_directories(dir);
+    const fs::path converter = dir / "dwg2dxf";
+    {
+        std::ofstream script(converter);
+        script << "#!/bin/sh\n"
+                  "test \"$1\" = -o || exit 2\n"
+                  "printf '0\\nSECTION\\n2\\nENTITIES\\n0\\nLINE\\n8\\n0\\n10\\n0\\n20\\n0\\n11\\n1\\n21\\n1\\n0\\nENDSEC\\n0\\nEOF\\n' > \"$2\"\n"
+                  "printf '%s' \"$3\" > \"$2.argv\"\n";
+    }
+    REQUIRE(::chmod(converter.c_str(), 0700) == 0);
+    PathGuard path_guard(dir);
+    const fs::path marker = dir / "INJECTION_MARKER";
+    const fs::path hostile = dir / "drawing;touch INJECTION_MARKER.dwg";
+    std::ofstream(hostile).put('\0');
+
+    const fs::path converted = chudware::doc::dwg_to_temp_dxf(hostile.string());
+    CHECK_FALSE(fs::exists(marker));
+    std::ifstream argv_file(converted.string() + ".argv");
+    const std::string received((std::istreambuf_iterator<char>(argv_file)),
+                               std::istreambuf_iterator<char>());
+    CHECK(received == hostile.string());
+
+    std::error_code ec;
+    fs::remove(converted, ec);
+    fs::remove(converted.string() + ".argv", ec);
+    fs::remove_all(dir, ec);
+}
+#endif
 
 // --- N-5: a two-solid STEP imports as TWO separate bodies. -----------------------------
 TEST_CASE("multi-solid STEP imports as separate bodies") {

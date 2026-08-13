@@ -173,6 +173,47 @@ for raw in path.read_text(encoding="utf-8").splitlines():
         break
 PY
 }
+with_pgpass() {
+  local dsn="$1"; shift
+  local pgpass rc
+  pgpass="$(mktemp)"
+  chmod 600 "$pgpass"
+  if ! DB_DSN="$dsn" python3 - "$pgpass" <<'PY'
+import os
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+dsn = urlparse(os.environ["DB_DSN"])
+if dsn.scheme not in {"postgres", "postgresql"}:
+    raise SystemExit("CHUDWARE_DB_URL must be a PostgreSQL URL")
+host = dsn.hostname or "localhost"
+port = dsn.port or 5432
+database = unquote(dsn.path.lstrip("/"))
+user = unquote(dsn.username or "")
+password = unquote(dsn.password or "")
+def field(value: object) -> str:
+    return str(value).replace("\\", "\\\\").replace(":", "\\:")
+Path(sys.argv[1]).write_text(":".join(map(field, (host, port, database, user, password))) + "\n")
+PY
+  then
+    rm -f "$pgpass"
+    return 1
+  fi
+  if PGPASSFILE="$pgpass" "$@" "postgresql://$(DB_DSN="$dsn" python3 - <<'PY'
+import os
+from urllib.parse import quote, unquote, urlparse
+d = urlparse(os.environ["DB_DSN"])
+user = quote(unquote(d.username or ""), safe="")
+host = d.hostname or "localhost"
+port = d.port or 5432
+database = quote(unquote(d.path.lstrip("/")), safe="")
+print(f"{user + '@' if user else ''}{host}:{port}/{database}")
+PY
+)"; then rc=0; else rc=$?; fi
+  rm -f "$pgpass"
+  return "$rc"
+}
 
 assert_database_target() {
   local actual
@@ -203,7 +244,7 @@ backup_database() {
   tmp="$final.tmp.$$"
   umask 077
   echo "=== [$(date -Iseconds)] pg_dump rollback point ($EXPECTED_DB) ==="
-  if ! pg_dump --format=custom --file="$tmp" "$DB_URL"; then
+  if ! with_pgpass "$DB_URL" pg_dump --no-password --format=custom --file="$tmp"; then
     rm -f "$tmp"
     echo "ERROR: pg_dump failed; deployment has not changed the database or service" >&2
     exit 1
@@ -254,7 +295,7 @@ post_deploy_health_assert() {
 
   health_email="$(env_value CHUDWARE_DEPLOY_HEALTH_EMAIL)"
   if [[ -z "$health_email" ]]; then
-    health_email="$(psql "$DB_URL" -tAXq -v ON_ERROR_STOP=1 -c \
+    health_email="$(with_pgpass "$DB_URL" psql --no-password -tAXq -v ON_ERROR_STOP=1 -c \
       "SELECT email FROM accounts WHERE status='active' ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, email LIMIT 1")"
   fi
   [[ -n "$health_email" ]] \
@@ -312,6 +353,11 @@ if [[ "$DO_GATEWAY" = 1 ]]; then
   DB_URL="$(env_value CHUDWARE_DB_URL)"
   [[ -n "$DB_URL" ]] \
     || { echo "ERROR: CHUDWARE_DB_URL is missing from $GATEWAY_ENV" >&2; exit 1; }
+  DEV_MODE="$(env_value CHUDWARE_WEB_DEV)"
+  case "$DEV_MODE" in
+    ""|0|false|False|FALSE|no|No|NO|off|Off|OFF) ;;
+    *) echo "ERROR: CHUDWARE_WEB_DEV must be disabled for $ENVIRONMENT deployments" >&2; exit 1 ;;
+  esac
   assert_database_target
   backup_database
 fi

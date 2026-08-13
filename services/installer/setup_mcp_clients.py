@@ -63,7 +63,9 @@ def _default_repo() -> str:
 
 
 def _env(repo: str, profile: str) -> dict:
-    env = {"PYTHONPATH": repo}
+    name = "chudware-mcp.exe" if os.name == "nt" else "chudware-mcp"
+    compiled = os.environ.get("CHUDWARE_MCP_BIN") or (Path(repo).resolve() / name).is_file()
+    env = {} if compiled else {"PYTHONPATH": repo}
     # Always pin the profile explicitly so clients don't inherit a stale shell default.
     env["CHUDWARE_MCP_PROFILE"] = profile
     # Prefer the staged full engine (OCCT + Netgen) when present so MCP and GUI share one.
@@ -91,32 +93,47 @@ def _env(repo: str, profile: str) -> dict:
     return env
 
 
+def _server_command(py: str, repo: str) -> tuple[str, list[str]]:
+    name = "chudware-mcp.exe" if os.name == "nt" else "chudware-mcp"
+    adjacent = (Path(repo).expanduser().resolve() / name).resolve()
+    if compiled := os.environ.get("CHUDWARE_MCP_BIN"):
+        if Path(compiled).expanduser().resolve() != adjacent:
+            raise ValueError("CHUDWARE_MCP_BIN must name the adjacent packaged MCP binary")
+        return str(adjacent), ["--module", "mcp"]
+    if adjacent.is_file():
+        return str(adjacent), ["--module", "mcp"]
+    return py, ["-m", "services.mcp.server"]
+
+
 # --------------------------------------------------------------------------- entry shapes
 
 def _claude_entry(py: str, repo: str, profile: str) -> dict:
     """Claude Code / Cursor / Antigravity share this shape."""
+    command, args = _server_command(py, repo)
     return {
-        "command": py,
-        "args": ["-m", "services.mcp.server"],
+        "command": command,
+        "args": args,
         "cwd": repo,
         "env": _env(repo, profile),
     }
 
 
 def _vscode_entry(py: str, repo: str, profile: str) -> dict:
+    command, args = _server_command(py, repo)
     return {
         "type": "stdio",
-        "command": py,
-        "args": ["-m", "services.mcp.server"],
+        "command": command,
+        "args": args,
         "cwd": repo,
         "env": _env(repo, profile),
     }
 
 
 def _opencode_entry(py: str, repo: str, profile: str) -> dict:
+    command, args = _server_command(py, repo)
     return {
         "type": "local",
-        "command": [py, "-m", "services.mcp.server"],
+        "command": [command, *args],
         "enabled": True,
         "environment": _env(repo, profile),
     }
@@ -164,19 +181,18 @@ def _targets(py: str, repo: str, profile: str = "full") -> list[dict]:
         out.append({"client": f"Antigravity ({Path(p).parent.name})", "path": Path(p),
                     "key": "mcpServers", "entry": _claude_entry(py, repo, profile)})
     # Grok: TOML configs (user + project). Handled separately in _apply_grok.
+    command, args = _server_command(py, repo)
     out.append({
         "client": "Grok (user)",
         "path": home / ".grok" / "config.toml",
         "format": "grok_toml",
-        "entry": {"command": py, "args": ["-m", "services.mcp.server"],
-                  "env": _env(repo, profile)},
+        "entry": {"command": command, "args": args, "env": _env(repo, profile)},
     })
     out.append({
         "client": "Grok (project)",
         "path": repo_p / ".grok" / "config.toml",
         "format": "grok_toml",
-        "entry": {"command": py, "args": ["-m", "services.mcp.server"],
-                  "env": _env(repo, profile)},
+        "entry": {"command": command, "args": args, "env": _env(repo, profile)},
     })
     return out
 
@@ -273,7 +289,7 @@ def _toml_upsert_table(text: str, table: str, body: str) -> str:
             # Bare key/value lines that only make sense inside [mcp_servers.chudware]
             if s.startswith("env = {") and "CHUDWARE_MCP_PROFILE" in s:
                 continue
-            if s.startswith("args = [") and "services.mcp.server" in s:
+            if s.startswith("args = [") and ("services.mcp.server" in s or '"--module"' in s):
                 continue
             if s.startswith('["-m"') or s.startswith("['-m'"):
                 continue
@@ -426,6 +442,10 @@ def main(argv: list[str]) -> int:
                     help="Connect only the clients detected on this machine (first-run flow)")
     args = ap.parse_args(argv)
 
+    compiled_mcp = os.environ.get("CHUDWARE_MCP_BIN")
+    if compiled_mcp and not Path(compiled_mcp).is_file() and not args.unregister:
+        ap.error(f"compiled MCP executable not found: {compiled_mcp}")
+
     py = str(Path(args.python).resolve())
     repo = str(Path(args.repo).resolve())
     profile = args.profile
@@ -443,7 +463,8 @@ def main(argv: list[str]) -> int:
     if args.wizard:
         action = "Connecting detected"
     print(f"{action} '{SERVER_NAME}' MCP server (legacy: '{SERVER_NAME_LEGACY}')")
-    print(f"  python  : {py}")
+    command, command_args = _server_command(py, repo)
+    print(f"  command : {command} {' '.join(command_args)}")
     print(f"  repo    : {repo}")
     print(f"  profile : {profile}")
     print()

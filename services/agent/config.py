@@ -110,14 +110,18 @@ def config_lock():
             import fcntl  # noqa: PLC0415 — POSIX only
         except ImportError:
             fcntl = None  # type: ignore[assignment]
-        paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        paths.CONFIG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(paths.CONFIG.parent, 0o700)
         lock_p = paths.CONFIG.with_name(paths.CONFIG.name + _CFG_LOCK_SUFFIX)
         _cfg_lock_depth += 1
         try:
             if fcntl is None:
                 yield
                 return
-            with open(lock_p, "a+", encoding="utf-8") as lf:
+            with open(lock_p, "a+", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600)) as lf:
+                with contextlib.suppress(OSError):
+                    os.chmod(lock_p, 0o600)
                 fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
                 try:
                     yield
@@ -178,14 +182,24 @@ def save_config(cfg: dict, *, replace: Iterable[str] = ()) -> None:
         for key in replace:
             current.pop(key, None)
         _deep_merge(current, cfg)
-        paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        paths.CONFIG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(paths.CONFIG.parent, 0o700)
         # Per-process tmp name: the lock already serializes well-behaved writers, but a
         # shared ".tmp" means any writer that skips the lock races us into a rename of a
         # file we already moved (FileNotFoundError) or, worse, publishes our half-file.
         tmp = paths.CONFIG.with_name("%s.tmp.%d" % (paths.CONFIG.name, os.getpid()))
         try:
-            tmp.write_text(json.dumps(current, indent=2), encoding="utf-8")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(current, indent=2))
+                fh.flush()
+                os.fsync(fh.fileno())
+            with contextlib.suppress(OSError):
+                os.chmod(tmp, 0o600)
             os.replace(tmp, paths.CONFIG)
+            with contextlib.suppress(OSError):
+                os.chmod(paths.CONFIG, 0o600)
         finally:
             with contextlib.suppress(OSError):
                 tmp.unlink()  # no-op after a successful replace; cleans up a failed write

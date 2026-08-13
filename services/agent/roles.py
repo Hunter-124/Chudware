@@ -5,10 +5,10 @@ Contract: contracts/advisor.md §4 (role card `aicad.role/1`), §6 (playbook
 `aicad.playbook/1`), §9 (injection & precedence), §1 (stage vocabulary).
 Pipeline composition: docs/COPILOT_MISSION_PIPELINE.md.
 
-Roles are DATA. The 13 role cards in ``services/agent/roles/*.yaml`` are AUTHORED
-by the lead and canonical — this module LOADS them verbatim (their ``system_prompt``
-block scalars are never rewritten here) and validates the mechanical fields around
-them. Playbooks in ``services/agent/playbooks/*.yaml`` are the multi-step thinking
+Roles are authored data. Developer runs load ``services/agent/roles/*.yaml``;
+packaged workers load their deterministic build-generated representation. Their
+``system_prompt`` values are preserved and the loader validates the surrounding
+mechanical fields. Playbooks in ``services/agent/playbooks/*.yaml`` are the
 scaffolds referenced by ``playbook_default``.
 
 What this module gives the hosts (services/dag node runner, services/agent loop):
@@ -45,6 +45,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 import yaml
+
+from services.agent import protected_assets
 
 # --------------------------------------------------------------------------- constants
 
@@ -130,21 +132,23 @@ def _mission_prompt_override_path(role_id: str) -> Path:
 
 
 def _prompt_builtin_md_path(role_id: str) -> Path:
-    """Shipped C++-style prompts under services/agent/prompts/."""
+    """Developer-source path for a native/core prompt."""
     return Path(__file__).resolve().parent / "prompts" / f"{role_id}.md"
 
 
+def _builtin_prompt_text(role_id: str) -> str:
+    if protected_assets.packaged():
+        return (protected_assets.prompt(f"{role_id}.md") or "").strip()
+    path = _prompt_builtin_md_path(role_id)
+    return path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+
+
 def resolve_role_system_prompt(role_id: str, yaml_prompt: str) -> str:
-    """Resolution order for the *Python* live path (delegate / load_role):
+    """Resolve mission override, authored role text, then the built-in prompt.
 
-    1. Mission override
-       (~/.local/share/Chudware/prompts/<id>.mission.md) — Settings → Prompts
-    2. YAML card system_prompt field (canonical for mission roles)
-    3. Shipped .md (services/agent/prompts/<id>.md) — fallback without YAML text
-
-    Mission overrides are intentionally namespaced: native C++ roles may share an id
-    while requiring a different output contract. C++ ``load_prompt`` continues to
-    consume only ``<id>.md``.
+    Production reads the built-in fallback from the compiled asset module. Mission
+    overrides remain user-authored appdata files and are intentionally namespaced
+    from native/core ``<id>.md`` overrides.
     """
     ov = _mission_prompt_override_path(role_id)
     if ov.is_file():
@@ -154,63 +158,65 @@ def resolve_role_system_prompt(role_id: str, yaml_prompt: str) -> str:
     yaml_text = (yaml_prompt or "").strip()
     if yaml_text:
         return yaml_text
-    md = _prompt_builtin_md_path(role_id)
-    if md.is_file():
-        text = md.read_text(encoding="utf-8").strip()
-        lines = text.splitlines()
-        while lines and lines[0].strip().startswith("<!--"):
-            lines.pop(0)
-        while lines and not lines[0].strip():
-            lines.pop(0)
-        text = '\n'.join(lines).strip()
-        if text:
-            return text
-    return ""
-
+    text = _builtin_prompt_text(role_id)
+    lines = text.splitlines()
+    while lines and lines[0].strip().startswith("<!--"):
+        lines.pop(0)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return "\n".join(lines).strip()
 
 
 def list_editable_prompts() -> list[dict]:
-    """Catalog distinct mission/YAML and native/core prompt override surfaces.
-
-    Each row matches get_prompts_v2 shape so the GUI can merge sources:
-      role, path, override_path, text, overridden, source
-
-    Display ids are namespaced because several mission and core prompts share the
-    same base id but require incompatible output contracts.
-    """
+    """Catalog distinct mission/YAML and native/core override surfaces."""
     out: list[dict] = []
 
     for rid, card in load_all_roles().items():
         ov = _mission_prompt_override_path(rid)
         overridden = ov.is_file() and bool(ov.read_text(encoding="utf-8").strip())
+        role_source = (
+            f"compiled://services/agent/roles/{rid}.yaml"
+            if protected_assets.packaged()
+            else str(_ROLES_DIR / f"{rid}.yaml")
+        )
         out.append({
             "role": f"mission:{rid}",
-            "path": str(_ROLES_DIR / f"{rid}.yaml"),
+            "path": role_source,
             "override_path": str(ov),
             "text": resolve_role_system_prompt(rid, card.system_prompt),
             "overridden": overridden,
             "source": "yaml",
         })
 
-    prompts_dir = Path(__file__).resolve().parent / "prompts"
-    if prompts_dir.is_dir():
-        for md in sorted(prompts_dir.glob("*.md")):
-            rid = md.stem
-            ov = _prompt_override_path(rid)
-            overridden = ov.is_file() and bool(ov.read_text(encoding="utf-8").strip())
-            text = (
-                ov.read_text(encoding="utf-8").strip()
-                if overridden
-                else md.read_text(encoding="utf-8").strip()
-            )
-            out.append({
-                "role": f"core:{rid}",
-                "path": str(md),
-                "override_path": str(ov),
-                "text": text,
-                "overridden": overridden,
-                "source": "md",
-            })
+    if protected_assets.packaged():
+        prompt_ids = tuple(
+            Path(name).stem for name in protected_assets.prompt_names()
+            if "/" not in name and name.endswith(".md")
+        )
+    else:
+        prompts_dir = Path(__file__).resolve().parent / "prompts"
+        prompt_ids = tuple(path.stem for path in sorted(prompts_dir.glob("*.md")))
+    for rid in prompt_ids:
+        ov = _prompt_override_path(rid)
+        overridden = ov.is_file() and bool(ov.read_text(encoding="utf-8").strip())
+        text = (
+            ov.read_text(encoding="utf-8").strip()
+            if overridden
+            else _builtin_prompt_text(rid)
+        )
+        builtin_source = (
+            f"compiled://services/agent/prompts/{rid}.md"
+            if protected_assets.packaged()
+            else str(_prompt_builtin_md_path(rid))
+        )
+        out.append({
+            "role": f"core:{rid}",
+            "path": builtin_source,
+            "override_path": str(ov),
+            "text": text,
+            "overridden": overridden,
+            "source": "md",
+        })
 
     out.sort(key=lambda row: row["role"])
     return out
@@ -565,12 +571,25 @@ def _playbook_from_dict(data: dict[str, Any], *, source: str) -> Playbook:
 
 # --------------------------------------------------------------------------- loading
 
-def load_role(role_id: str, *, roles_dir: Path | None = None) -> RoleCard:
-    path = (roles_dir or _ROLES_DIR) / f"{role_id}.yaml"
+def _load_role_document(role_name: str, roles_dir: Path | None) -> tuple[Any, str]:
+    filename = f"{role_name}.yaml"
+    if protected_assets.packaged():
+        if roles_dir is not None:
+            raise RoleError("filesystem role directories are disabled in packaged builds")
+        raw = protected_assets.role_yaml(filename)
+        source = f"compiled://services/agent/roles/{filename}"
+        if raw is None:
+            raise RoleError(f"role card not found: {source}")
+        return json.loads(raw), source
+    path = (roles_dir or _ROLES_DIR) / filename
     if not path.exists():
         raise RoleError(f"role card not found: {path}")
-    data = yaml.safe_load(path.read_text())
-    card = _role_from_dict(data, source=str(path))
+    return yaml.safe_load(path.read_text()), str(path)
+
+
+def load_role(role_id: str, *, roles_dir: Path | None = None) -> RoleCard:
+    data, source = _load_role_document(role_id, roles_dir)
+    card = _role_from_dict(data, source=source)
     # Mission prompt overrides use appdata prompts/<id>.mission.md so a GUI edit
     # cannot overwrite a native/core role with the same id and output contract.
     resolved = resolve_role_system_prompt(role_id, card.system_prompt)
@@ -591,15 +610,20 @@ def load_role(role_id: str, *, roles_dir: Path | None = None) -> RoleCard:
 
 
 def load_all_roles(*, roles_dir: Path | None = None) -> dict[str, RoleCard]:
-    d = roles_dir or _ROLES_DIR
+    if protected_assets.packaged():
+        if roles_dir is not None:
+            raise RoleError("filesystem role directories are disabled in packaged builds")
+        names = protected_assets.role_names()
+    else:
+        d = roles_dir or _ROLES_DIR
+        names = tuple(path.name for path in sorted(d.glob("*.yaml")))
     out: dict[str, RoleCard] = {}
-    for path in sorted(d.glob("*.yaml")):
-        data = yaml.safe_load(path.read_text())
-        # roles/ also holds non-card data files (e.g. council_seats.yaml,
-        # schema aicad.council_seats/1) - only aicad.role/1 documents are cards.
+    for filename in names:
+        data, source = _load_role_document(Path(filename).stem, roles_dir)
+        # roles/ also holds non-card data files (e.g. council_seats.yaml).
         if not isinstance(data, dict) or data.get("schema") != ROLE_SCHEMA:
             continue
-        card = _role_from_dict(data, source=str(path))
+        card = _role_from_dict(data, source=source)
         out[card.id] = card
     return out
 

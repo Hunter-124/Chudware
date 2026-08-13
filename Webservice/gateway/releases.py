@@ -19,6 +19,8 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import boto3
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import APIRouter, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -48,6 +50,15 @@ _SEMVER_RE = re.compile(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_ARTIFACT_SIGNATURE_DOMAIN = b"chudware-artifact-v1"
+_RELEASE_PUBLIC_KEYS = {
+    "release-v1": bytes.fromhex(
+        "bdb8869038e8274a32a6f14b86f0fbdbe599c6c78e49dc495cfa1275b01490f3"
+    ),
+}
+_PAYLOAD_SIGNATURE_DOMAIN = b"chudware-payload-v1\0"
+_PAYLOAD_SCHEMA = "chudware-payload-v1"
+_PAYLOAD_PRODUCT = "Chudware"
 _SAFE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 _manifest_by_ip = RateLimiter(120, 60.0)
 _publish_by_ip = RateLimiter(20, 60.0)
@@ -55,6 +66,7 @@ _publish_by_ip = RateLimiter(20, 60.0)
 
 class PublishRelease(BaseModel):
     channel: Channel
+    key_id: str
     version: str
     min_supported: str
     platform: Platform
@@ -64,6 +76,10 @@ class PublishRelease(BaseModel):
     signature: str
     notes_url: str
     artifact_key: str
+    payload_manifest_key: str
+    payload_manifest_sha256: str
+    payload_signature_key: str
+    payload_signature_sha256: str
 
 
 def _require_admin(request: Request):
@@ -97,6 +113,39 @@ def _canonical_artifact(version: str, platform: str, arch: str) -> str:
     raise HTTPException(422, "unsupported platform and architecture combination")
 
 
+
+def _artifact_signature_preimage(key_id: str, sha256: str) -> bytes:
+    return (
+        _ARTIFACT_SIGNATURE_DOMAIN
+        + b"\0"
+        + key_id.encode("ascii")
+        + b"\0"
+        + sha256.encode("ascii")
+    )
+
+
+def _verify_artifact_signature(key_id: str, sha256: str, signature: bytes) -> None:
+    public_key = _RELEASE_PUBLIC_KEYS.get(key_id)
+    if public_key is None:
+        raise HTTPException(422, "unknown release key_id")
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            signature, _artifact_signature_preimage(key_id, sha256)
+        )
+    except InvalidSignature as exc:
+        raise HTTPException(422, "signature does not match key_id and sha256") from exc
+
+def _validate_payload_metadata(value: PublishRelease) -> None:
+    for field in ("payload_manifest_sha256", "payload_signature_sha256"):
+        if not _SHA256_RE.fullmatch(getattr(value, field)):
+            raise HTTPException(422, f"{field} must be 64 lowercase hexadecimal characters")
+    expected_manifest_key = value.artifact_key + ".payload-manifest.v1.json"
+    expected_signature_key = value.artifact_key + ".payload-manifest.v1.sig"
+    if value.payload_manifest_key != expected_manifest_key:
+        raise HTTPException(422, f"payload_manifest_key must be {expected_manifest_key}")
+    if value.payload_signature_key != expected_signature_key:
+        raise HTTPException(422, f"payload_signature_key must be {expected_signature_key}")
+
 def _validate_publish(value: PublishRelease) -> None:
     if not _SEMVER_RE.fullmatch(value.version):
         raise HTTPException(422, "version must be canonical semantic version")
@@ -104,6 +153,8 @@ def _validate_publish(value: PublishRelease) -> None:
         raise HTTPException(422, "min_supported must be canonical semantic version")
     if not _SHA256_RE.fullmatch(value.sha256):
         raise HTTPException(422, "sha256 must be 64 lowercase hexadecimal characters")
+    if value.key_id not in _RELEASE_PUBLIC_KEYS:
+        raise HTTPException(422, "unknown release key_id")
     if value.size <= 0:
         raise HTTPException(422, "size must be positive")
     try:
@@ -112,6 +163,7 @@ def _validate_publish(value: PublishRelease) -> None:
         raise HTTPException(422, "signature must be canonical base64") from exc
     if len(signature) != 64 or base64.b64encode(signature).decode("ascii") != value.signature:
         raise HTTPException(422, "signature must encode one Ed25519 signature")
+    _verify_artifact_signature(value.key_id, value.sha256, signature)
     parsed_notes = urlparse(value.notes_url)
     if parsed_notes.scheme not in {"http", "https"} or not parsed_notes.netloc:
         raise HTTPException(422, "notes_url must be an absolute HTTP(S) URL")
@@ -120,6 +172,7 @@ def _validate_publish(value: PublishRelease) -> None:
     path = PurePosixPath(value.artifact_key)
     if path.is_absolute() or ".." in path.parts or value.artifact_key != expected_key:
         raise HTTPException(422, f"artifact_key must be {expected_key}")
+    _validate_payload_metadata(value)
 
 
 def _require_publish_token(request: Request) -> None:
@@ -139,7 +192,9 @@ def _fetch_latest(channel: str, platform: str, arch: str) -> dict[str, Any] | No
     with tx() as cur:
         cur.execute(
             """
-            SELECT version, min_supported, sha256, size, signature, notes_url, artifact_key
+            SELECT version, min_supported, key_id, sha256, size, signature, notes_url,
+                   artifact_key, payload_manifest_key, payload_manifest_sha256,
+                   payload_signature_key, payload_signature_sha256
               FROM releases
              WHERE channel = %s AND platform = %s AND arch = %s
              ORDER BY published_at DESC, version DESC
@@ -221,10 +276,15 @@ async def latest_release(
     manifest = {
         "version": str(row["version"]),
         "min_supported": str(row["min_supported"]),
+        "key_id": str(row["key_id"]),
         "sha256": str(row["sha256"]),
         "size": int(row["size"]),
         "signature": str(row["signature"]),
         "notes_url": str(row["notes_url"]),
+        "payload_manifest_key": str(row["payload_manifest_key"]),
+        "payload_manifest_sha256": str(row["payload_manifest_sha256"]),
+        "payload_signature_key": str(row["payload_signature_key"]),
+        "payload_signature_sha256": str(row["payload_signature_sha256"]),
     }
     if _may_download(request):
         manifest["url"] = _presigned_url(artifact_key)
@@ -240,16 +300,23 @@ def _upsert_release(value: PublishRelease) -> None:
         cur.execute(
             """
             INSERT INTO releases
-                (channel, version, min_supported, platform, arch, sha256, size,
-                 signature, notes_url, artifact_key, published_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                (channel, version, min_supported, platform, arch, key_id, sha256,
+                 size, signature, notes_url, artifact_key, payload_manifest_key,
+                 payload_manifest_sha256, payload_signature_key, payload_signature_sha256,
+                 published_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (channel, version, platform, arch) DO UPDATE SET
                 min_supported = EXCLUDED.min_supported,
+                key_id = EXCLUDED.key_id,
                 sha256 = EXCLUDED.sha256,
                 size = EXCLUDED.size,
                 signature = EXCLUDED.signature,
                 notes_url = EXCLUDED.notes_url,
                 artifact_key = EXCLUDED.artifact_key,
+                payload_manifest_key = EXCLUDED.payload_manifest_key,
+                payload_manifest_sha256 = EXCLUDED.payload_manifest_sha256,
+                payload_signature_key = EXCLUDED.payload_signature_key,
+                payload_signature_sha256 = EXCLUDED.payload_signature_sha256,
                 published_at = now()
             """,
             (
@@ -258,11 +325,16 @@ def _upsert_release(value: PublishRelease) -> None:
                 value.min_supported,
                 value.platform,
                 value.arch,
+                value.key_id,
                 value.sha256,
                 value.size,
                 value.signature,
                 value.notes_url,
                 value.artifact_key,
+                value.payload_manifest_key,
+                value.payload_manifest_sha256,
+                value.payload_signature_key,
+                value.payload_signature_sha256,
             ),
         )
 
@@ -282,8 +354,10 @@ async def list_release_manifests(request: Request) -> list[dict[str, Any]]:
     with tx() as cur:
         cur.execute(
             """
-            SELECT channel, version, min_supported, platform, arch, sha256, size,
-                   signature, notes_url, artifact_key, published_at
+            SELECT channel, version, min_supported, platform, arch, key_id, sha256,
+                   size, signature, notes_url, artifact_key, payload_manifest_key,
+                   payload_manifest_sha256, payload_signature_key, payload_signature_sha256,
+                   published_at
               FROM releases
              ORDER BY published_at DESC, channel, platform, arch
             """

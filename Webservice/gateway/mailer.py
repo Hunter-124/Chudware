@@ -230,6 +230,16 @@ def _record_sent(row_id: int) -> None:
         )
 
 
+def scrub_expired_context() -> int:
+    """Erase bearer-bearing context once queued links can no longer be valid."""
+    with tx() as cur:
+        cur.execute(
+            "UPDATE mail_outbox SET ctx_json = '{}'"
+            " WHERE ctx_json <> '{}' AND created_at < now() - interval '24 hours'"
+        )
+        return cur.rowcount
+
+
 def _record_failure(row_id: int, attempts: int, exc: BaseException) -> None:
     detail = f"{type(exc).__name__}: {exc}"[:500]
     with tx() as cur:
@@ -264,12 +274,13 @@ def _deliver(to: str, message: Rendered) -> None:
 
 
 def _deliver_console(to: str, message: Rendered) -> None:
+    # Console is a development transport, not a safe place for bearer links.
+    # Log only routing metadata; never the rendered body.
     log.info(
-        "mail[console] from=%s to=%s subject=%s\n%s",
+        "mail[console] from=%s to=%s subject=%s body=[SUPPRESSED]",
         settings.mail_from,
         to,
         message.subject,
-        message.text,
     )
 
 
@@ -358,9 +369,9 @@ async def drain_once() -> int:
     """Attempt every message that is due. Returns how many were delivered.
 
     Blocking work — psycopg calls and the transports themselves — runs in a
-    worker thread so the drain never stalls the event loop the gateway serves
-    requests on.
+    worker thread so the drain never stalls the event loop the gateway serves.
     """
+    await asyncio.to_thread(scrub_expired_context)
     claimed = await asyncio.to_thread(_claim, DRAIN_BATCH)
     delivered = 0
     for row in claimed:

@@ -143,7 +143,7 @@ mfg::RunAuthorization make_run(const mfg::ApprovalBinding& approval) {
                           approval.machine.device_id, device::MachineClass::Emulated};
     controller.candidate.offered_as = mfg::gates::Admission::ProbedEvidence;
     controller.candidate.fresh = {mfg::FreshState::Ok, mfg::FreshSource::Simulated, true,
-                                  0, 1000, 2, "emulator", "command", {}};
+                                  0, 1000, 2, "emulator", "command", {}, 1000000};
     controller.candidate.execute_truth = device::CapabilityTruthValue::Verified;
     controller.candidate.approval_device_id = approval.machine.device_id;
     controller.accepts = {{"dev"}, {mfg::gates::Admission::ProbedEvidence}};
@@ -225,7 +225,7 @@ TEST_CASE("Stage-1 admission fails closed and procedural facts stay bounded") {
     candidate.execute_truth = device::CapabilityTruthValue::Verified;
     candidate.approval_device_id = physical.device_id;
     candidate.fresh = {mfg::FreshState::Ok, mfg::FreshSource::Probed, true,
-                       1, 10, 1, "probe", "device", {}};
+                       1, 10, 1, "probe", "device", {}, 0};
     CHECK(mfg::gates::admit(candidate, physical, probed).admit == mfg::gates::Admit::Admitted);
 
     for (const auto state : {mfg::FreshState::Stale, mfg::FreshState::Unknown}) {
@@ -345,6 +345,41 @@ TEST_CASE("commander lease is exclusive, renewable, expiring, and takeover-safe"
     CHECK(leases.held_by("dev:x", first, 400));
     CHECK_FALSE(leases.claim("dev:x", second, 1000000301ULL, 1000, 100).ok);
     CHECK(leases.claim("dev:x", second, 2000000000400ULL, 1000, 100).ok);
+}
+
+TEST_CASE("lease TTL is bounded and cannot saturate monotonic expiry") {
+    TempDirectory temp;
+    chudware::mfg::Journal journal(temp.path, chudware::device::LaneEpoch::mint("lease-bound"));
+    chudware::mfg::LeaseRegistry leases(journal);
+    const chudware::mfg::LeaseOwner owner{"raw", "seat", "one"};
+    CHECK_FALSE(leases.claim("dev:x", owner, 100, UINT64_MAX, 100).ok);
+    const auto bounded = leases.claim("dev:x", owner, 100,
+                                      chudware::mfg::CommandLease::max_ttl_ms, 100);
+    REQUIRE(bounded.ok);
+    CHECK(bounded.lease->expires_at_mono_ns ==
+          100 + chudware::mfg::CommandLease::max_ttl_ms * 1000000ULL);
+}
+
+TEST_CASE("start-time stale telemetry rejects before nonce burn") {
+    using namespace chudware;
+    ArbiterRig rig;
+    const auto run_id = device::RunId::mint().str();
+    const auto approval_id = device::ApprovalId::mint().str();
+    auto approval = make_approval(run_id, approval_id, mfg::ExercisableBy::HumanOrAgent,
+                                  10'000'000'000ULL);
+    auto run = make_run(approval);
+    run.gate_input.stage1.front().candidate.fresh.ttl_ms = 1;
+    run.gate_input.stage1.front().candidate.fresh.observed_mono_ns = rig.clock.now;
+    REQUIRE(rig.arbiter.register_approval(approval));
+    REQUIRE(rig.arbiter.register_run(std::move(run)));
+    rig.clock.now += 2'000'000ULL;
+    const auto outcome = rig.arbiter.start(
+        run_id, approval_id,
+        {mfg::gates::InitiatorKind::Agent, "raw", "seat", "session"});
+    CHECK_FALSE(outcome.ok);
+    CHECK_FALSE(outcome.nonce_burned_at_seq.has_value());
+    REQUIRE(rig.nonces.describe(approval_id).has_value());
+    CHECK(rig.nonces.describe(approval_id)->state == mfg::NonceState::Unburned);
 }
 
 TEST_CASE("arbiter refuses human-only agent, expiry, and fingerprint changes by name") {

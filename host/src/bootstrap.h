@@ -18,7 +18,6 @@ bool runtimeReady();                     // python file exists at runtimePython(
 bool ensureRuntime(std::string& log);    // provision if absent; true once ready
 bool repairRuntime(std::string& log);    // force a clean re-provision (broken/partial venv)
 
-// Default CHUDWARE_PROMPTS_DIR (if unset) to the app's bundled services/agent/prompts so the C++ core
-// finds its role prompts regardless of the process CWD. MUST be called unconditionally at
-// startup (ensureRuntime is skipped when the runtime is already provisioned).
+// Developer builds default CHUDWARE_PROMPTS_DIR to the authored prompt tree.
+// Packaged builds use compiled assets, so this is intentionally a no-op there.
 void ensurePromptsDir();

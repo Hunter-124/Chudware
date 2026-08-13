@@ -294,6 +294,24 @@ def test_terminal_sessions_shared_lifecycle(client, _tmux_env):
             headers=_auth("boss@example.com")).json()["sessions"]}
     assert "work-1" not in left and auto in left
 
+
+def test_terminal_demotion_closes_before_next_input(client, _tmux_env):
+    from starlette.websockets import WebSocketDisconnect
+
+    with client.websocket_connect(
+        "/admin/terminal", headers=_auth("boss@example.com")
+    ) as ws:
+        ws.receive_json()
+        with db.tx() as cur:
+            cur.execute(
+                "UPDATE accounts SET role = 'user' WHERE email = %s",
+                ("boss@example.com",),
+            )
+        ws.send_bytes(b"printf should-not-run\\n")
+        with pytest.raises(WebSocketDisconnect) as exc:
+            ws.receive_bytes()
+        assert exc.value.code == 4403
+
 # --- Access-policy include list (cf_provision) ------------------------------
 #
 # The Access policy is what decides whether a person ever receives a One-Time

@@ -16,11 +16,16 @@ def manifest_row() -> dict[str, Any]:
     return {
         "version": "1.2.0",
         "min_supported": "1.0.0",
+        "key_id": "release-v1",
         "sha256": "a" * 64,
         "size": 123456789,
         "signature": base64.b64encode(b"s" * 64).decode("ascii"),
         "notes_url": "https://chudware.com/releases/1.2.0",
         "artifact_key": "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage",
+        "payload_manifest_key": "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage.payload-manifest.v1.json",
+        "payload_manifest_sha256": "b" * 64,
+        "payload_signature_key": "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage.payload-manifest.v1.sig",
+        "payload_signature_sha256": "c" * 64,
     }
 
 
@@ -52,7 +57,9 @@ def test_anonymous_and_bad_entitlement_receive_byte_identical_metadata(
     assert anonymous.content == invalid.content
     assert "url" not in anonymous.json()
     assert set(anonymous.json()) == {
-        "version", "min_supported", "sha256", "size", "signature", "notes_url"
+        "version", "min_supported", "key_id", "sha256", "size", "signature", "notes_url",
+        "payload_manifest_key", "payload_manifest_sha256", "payload_signature_key",
+        "payload_signature_sha256",
     }
 
 
@@ -100,6 +107,7 @@ def test_publish_is_bearer_gated_and_idempotent(
         yield Cursor()
 
     monkeypatch.setattr(releases, "tx", fake_tx)
+    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
     monkeypatch.setenv("CHUDWARE_GATEWAY_RELEASE_TOKEN", "publish-secret")
     app = FastAPI()
     app.include_router(releases.router)
@@ -123,11 +131,20 @@ def test_publish_is_bearer_gated_and_idempotent(
     assert response.json() == {"ok": True}
     assert len(statements) == 1
     assert "ON CONFLICT (channel, version, platform, arch) DO UPDATE" in statements[0][0]
+    assert "key_id" in statements[0][0]
+    assert statements[0][1][5] == "release-v1"
+    assert statements[0][1][11:] == (
+        manifest_row["payload_manifest_key"],
+        manifest_row["payload_manifest_sha256"],
+        manifest_row["payload_signature_key"],
+        manifest_row["payload_signature_sha256"],
+    )
 
 
 def test_publish_rejects_noncanonical_artifact_key(
     monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
 ) -> None:
+    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
     monkeypatch.setenv("CHUDWARE_GATEWAY_RELEASE_TOKEN", "publish-secret")
     app = FastAPI()
     app.include_router(releases.router)
@@ -145,6 +162,94 @@ def test_publish_rejects_noncanonical_artifact_key(
     )
     assert response.status_code == 422
     assert "artifact_key" in response.json()["detail"]
+
+
+def test_publish_rejects_signature_outside_artifact_domain(
+    monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
+) -> None:
+    monkeypatch.setenv("CHUDWARE_GATEWAY_RELEASE_TOKEN", "publish-secret")
+    payload = {
+        "channel": "stable",
+        "platform": "linux",
+        "arch": "x86_64",
+        **manifest_row,
+    }
+    app = FastAPI()
+    app.include_router(releases.router)
+    response = TestClient(app).post(
+        "/api/releases/latest/publish",
+        json=payload,
+        headers={"Authorization": "Bearer publish-secret"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "signature does not match key_id and sha256"
+
+
+def test_publish_rejects_unknown_release_key_id(
+    monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
+) -> None:
+    monkeypatch.setenv("CHUDWARE_GATEWAY_RELEASE_TOKEN", "publish-secret")
+    payload = {
+        "channel": "stable",
+        "platform": "linux",
+        "arch": "x86_64",
+        **manifest_row,
+        "key_id": "attacker-key",
+    }
+    app = FastAPI()
+    app.include_router(releases.router)
+    response = TestClient(app).post(
+        "/api/releases/latest/publish",
+        json=payload,
+        headers={"Authorization": "Bearer publish-secret"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "unknown release key_id"
+
+
+
+@pytest.mark.parametrize("channel", ["stable", "beta"])
+def test_publish_rejects_missing_payload_metadata(
+    monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any], channel: str
+) -> None:
+    monkeypatch.setenv("CHUDWARE_GATEWAY_RELEASE_TOKEN", "publish-secret")
+    payload = {"channel": channel, "platform": "linux", "arch": "x86_64", **manifest_row}
+    payload["artifact_key"] = payload["artifact_key"].replace("stable/", channel + "/", 1)
+    for field in (
+        "payload_manifest_key", "payload_manifest_sha256",
+        "payload_signature_key", "payload_signature_sha256",
+    ):
+        payload.pop(field)
+    app = FastAPI()
+    app.include_router(releases.router)
+    response = TestClient(app).post(
+        "/api/releases/latest/publish", json=payload,
+        headers={"Authorization": "Bearer publish-secret"},
+    )
+    assert response.status_code == 422
+
+
+def test_publish_rejects_identity_mismatched_payload_key(
+    monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
+) -> None:
+    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
+    monkeypatch.setenv("CHUDWARE_GATEWAY_RELEASE_TOKEN", "publish-secret")
+    payload = {"channel": "stable", "platform": "linux", "arch": "x86_64", **manifest_row}
+    payload["payload_manifest_key"] = "stable/9.9.9/other.payload-manifest.v1.json"
+    app = FastAPI()
+    app.include_router(releases.router)
+    response = TestClient(app).post(
+        "/api/releases/latest/publish", json=payload,
+        headers={"Authorization": "Bearer publish-secret"},
+    )
+    assert response.status_code == 422
+    assert "payload_manifest_key" in response.json()["detail"]
+
+def test_artifact_signature_preimage_is_domain_separated() -> None:
+    digest = "a" * 64
+    assert releases._artifact_signature_preimage("release-v1", digest) == (
+        b"chudware-artifact-v1\0release-v1\0" + digest.encode("ascii")
+    )
 
 
 def test_release_manifest_is_exactly_soft_auth_public() -> None:

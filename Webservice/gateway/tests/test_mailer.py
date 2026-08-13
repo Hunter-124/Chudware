@@ -266,6 +266,8 @@ def test_send_queues_instead_of_delivering(mail):
     assert row["last_error"] is None
 
 
+
+
 def test_send_accepts_a_display_name_and_stores_the_bare_address(mail):
     mailer.send("Ada Lovelace <ada@example.com>", "verify_email", VERIFY_CTX)
     assert _rows()[0]["to_addr"] == "ada@example.com"
@@ -282,6 +284,15 @@ def test_drain_delivers_and_marks_sent(mail):
     # A delivered row is never claimed again.
     assert asyncio.run(mailer.drain_once()) == 0
     assert _rows()[0]["attempts"] == 1
+
+
+def test_console_delivery_never_logs_bearer_context(mail, caplog):
+    secret = "single-use-token-very-secret"
+    ctx = dict(VERIFY_CTX, verify_url=f"https://example.test/verify?token={secret}")
+    with caplog.at_level("INFO"):
+        mailer.send("ada@example.com", "verify_email", ctx)
+        assert asyncio.run(mailer.drain_once()) == 1
+    assert secret not in caplog.text
 
 
 def test_unrenderable_mail_is_dropped_without_burning_budget(mail):

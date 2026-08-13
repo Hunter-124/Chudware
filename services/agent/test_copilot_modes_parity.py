@@ -117,16 +117,18 @@ class TestRoleCardSemantics:
 
     def test_agent_narrowed_role_card_gains_file_handling_floor(self):
         out = cmt.apply_mode_tools("agent", ["add_features"])
-        for tool in ("fs_write", "fs_edit", "fs_list", "run_shell", "research_fetch_page"):
+        for tool in ("fs_write", "fs_edit", "fs_list", "research_fetch_page"):
             assert tool in out, (tool, out)
+        assert "run_shell" not in out
 
     def test_swarm_unions_extras(self):
         out = cmt.apply_mode_tools("swarm", ["add_features"])
         assert "add_features" in out
         assert "delegate" in out
         assert "corporate_activate" in out
-        for tool in ("fs_write", "fs_edit", "fs_list", "run_shell", "research_fetch_page"):
+        for tool in ("fs_write", "fs_edit", "fs_list", "research_fetch_page"):
             assert tool in out, (tool, out)
+        assert "run_shell" not in out
 
     def test_plan_strips_mutators_keeps_shared_floor(self):
         out = cmt.apply_mode_tools(

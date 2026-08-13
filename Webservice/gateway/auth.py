@@ -376,6 +376,7 @@ class AuthMiddleware:
             heavy=account.heavy,
         )
 
+
     def _authenticate(
         self,
         headers: dict[str, str],
@@ -511,6 +512,68 @@ class AuthMiddleware:
         return JSONResponse(
             {"error": exc.message, "email": exc.email}, status_code=exc.status
         )
+def revalidate_websocket_user(
+    scope: dict[str, Any], *, required_role: str | None = None, require_cloud: bool = False
+) -> User:
+    """Re-read the credential and account behind a live WebSocket frame.
+
+    Middleware authentication is only a handshake snapshot.  This helper binds
+    every later decision to the original credential and current account row so
+    revocation, suspension, role changes, and entitlement expiry take effect on
+    the next inbound frame.
+    """
+    state = scope.get("state") or {}
+    user = state.get("user") if isinstance(state, dict) else getattr(state, "user", None)
+    if user is None:
+        raise AuthError("not authenticated", status=401)
+
+    headers = {
+        k.decode("latin-1").lower(): v.decode("latin-1")
+        for k, v in scope.get("headers") or []
+    }
+    cookies = _parse_cookies(headers.get("cookie", ""))
+    if settings.dev_mode:
+        principal = (headers.get("x-dev-user") or cookies.get("dev_user") or "").strip().lower()
+        if not principal or principal != user.email:
+            raise AuthError("invalid session", status=401)
+    else:
+        sid = cookies.get(authn.SESSION_COOKIE, "")
+        if sid:
+            principal = authn.lookup_session(sid)
+            if principal is None or principal.strip().lower() != user.email:
+                raise AuthError("invalid session", status=401)
+        else:
+            # Access JWTs are authoritative credentials too; re-run signature,
+            # expiry, and principal checks rather than trusting handshake state.
+            principal_user, _ = AuthMiddleware(lambda *_: None)._authenticate(headers, cookies)
+            if principal_user is None or principal_user.email != user.email:
+                raise AuthError("invalid session", status=401)
+
+    account = accounts.get_account(user.email)
+    if not accounts.is_authorized(account):
+        raise AuthError("account not approved", status=403, email=user.email)
+    if account.plan == "trial" and authn.trial_expired(user.email):
+        raise AuthError("trial expired", status=403, email=user.email)
+    current = User(
+        email=account.email,
+        display=account.display or account.email.split("@")[0],
+        role=accounts.effective_role(account),
+        heavy=account.heavy,
+    )
+    if required_role is not None and current.role != required_role:
+        raise AuthError("role no longer authorized", status=403, email=current.email)
+    if require_cloud:
+        try:
+            from .plans import limits_for
+        except ImportError:
+            from plans import limits_for  # type: ignore
+        try:
+            cloud = bool(limits_for(account.plan).cloud)
+        except ValueError:
+            cloud = False
+        if not cloud:
+            raise AuthError("plan no longer authorized", status=403, email=current.email)
+    return current
 
 
 def get_current_user(request: Request) -> User:

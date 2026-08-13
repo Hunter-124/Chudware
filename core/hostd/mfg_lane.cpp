@@ -74,6 +74,15 @@ bool printerClass(device::MachineClass machine_class) {
     return machine_class == device::MachineClass::FdmPrinterOpen ||
            machine_class == device::MachineClass::FdmPrinterEnclosed;
 }
+bool workerVirtualPrinter(const json& capability) {
+    if (!capability.is_object() || !capability.contains("levels") ||
+        !capability["levels"].is_array()) return false;
+    for (const auto& level : capability["levels"]) {
+        if (level.is_object() && level.value("level", std::string{}) == "execute" &&
+            level.value("truth", std::string{}) == "verified") return true;
+    }
+    return false;
+}
 
 std::string base64Encode(std::string_view input) {
     static constexpr char alphabet[] =
@@ -134,10 +143,6 @@ json policyJson(const MachinePolicy& policy) {
             {"spindle_guard_required", policy.spindle_guard_required},
             {"feedback_relay_commissioned", policy.feedback_relay_commissioned},
             {"emulator_stage_passed", "E3"}, {"revision", policy.revision}};
-}
-bool virtualQualificationEndpoint(const gateway::AllowlistEntry& entry) {
-    const auto origin = entry.connection.find("origin");
-    return origin != entry.connection.end() && origin->second == "virtual";
 }
 
 
@@ -285,8 +290,7 @@ std::vector<ManufacturingLane::DeviceCandidate> ManufacturingLane::deviceCandida
         candidate.device_id = candidateId(entry.machine_class, entry.endpoint);
         candidate.machine_class = entry.machine_class;
         candidate.transport_kind = entry.endpoint.transport;
-        candidate.endpoint = {candidate.device_id, endpointAddress(entry),
-                              !virtualQualificationEndpoint(entry)};
+        candidate.endpoint = {candidate.device_id, endpointAddress(entry), true};
         candidate.allowlisted = true;
         candidate.allowlist_entry = entry;
         candidates.push_back(std::move(candidate));
@@ -502,9 +506,10 @@ MachinePolicy ManufacturingLane::lanePolicy() const {
 
 Initiator ManufacturingLane::authenticatedInitiator(const LeaseOwner& caller) const {
     Initiator out;
-    out.kind = caller.client_kind == "agent" || caller.client_kind == "mcp"
-        ? gates::InitiatorKind::Agent
-        : gates::InitiatorKind::Human;
+    // hostd classifies all raw IPC peers as `raw`; direct in-process callers may
+    // supply an already-attested `human` owner in focused tests or future trusted UI glue.
+    out.kind = caller.client_kind == "human"
+        ? gates::InitiatorKind::Human : gates::InitiatorKind::Agent;
     out.identity = caller.seat;
     out.seat = caller.seat;
     if (out.kind == gates::InitiatorKind::Agent) out.agent_run_id = caller.session;
@@ -1046,6 +1051,7 @@ gates::GateReport ManufacturingLane::computePreflight(RunRecord& run,
 RunAuthorization ManufacturingLane::authorizationFor(const RunRecord& run,
                                                        const ArtifactRecord& artifact,
                                                        const ApprovalBinding& approval) const {
+    const bool virtual_printer = isPrinter() && workerVirtualPrinter(printer_capability_);
     RunAuthorization auth;
     auth.run_id = run.run_id;
     auth.approval_id = approval.approval_id;
@@ -1059,33 +1065,35 @@ RunAuthorization ManufacturingLane::authorizationFor(const RunRecord& run,
     auto& context = auth.tier0_context;
     context.action = tier0::Action::RunStart;
     context.artifact_kind = artifact.kind;
-    context.machine_class = endpoint_.endpoint_is_physical
+    context.machine_class = endpoint_.endpoint_is_physical && !virtual_printer
         ? machine_class_ : device::MachineClass::Emulated;
     context.policy = lanePolicy();
     context.policy.revision = approval.policy_revision;
     context.execute_capability = {
         device::CapabilityLevel::Execute,
-        endpoint_.endpoint_is_physical ? device::CapabilityTruthValue::Assumed
-                                       : device::CapabilityTruthValue::Verified,
-        endpoint_.endpoint_is_physical
+        endpoint_.endpoint_is_physical && !virtual_printer
+            ? device::CapabilityTruthValue::Assumed
+            : device::CapabilityTruthValue::Verified,
+        endpoint_.endpoint_is_physical && !virtual_printer
             ? std::vector<std::string>{}
-            : std::vector<std::string>{
-                  transport_kind_ == device::TransportKind::Emulator
+            : std::vector<std::string>{virtual_printer
+                  ? "res:virtual_printer_worker"
+                  : transport_kind_ == device::TransportKind::Emulator
                       ? "res:emulator_e3:built_in"
                       : "res:virtual_qualification"},
         device::EmulatorStage::E3,
-        endpoint_.endpoint_is_physical
+        endpoint_.endpoint_is_physical && !virtual_printer
             ? std::optional<device::CapabilityLevel>(device::CapabilityLevel::Execute)
             : std::nullopt,
-        endpoint_.endpoint_is_physical
+        endpoint_.endpoint_is_physical && !virtual_printer
             ? "physical execute requires an attended hardware pilot" : ""};
     context.emulator_stage_passed = device::EmulatorStage::E3;
     context.commander_lease_held_by_caller = true;
-    context.wcs_established_this_setup = !endpoint_.endpoint_is_physical;
-    context.bed_origin_declared_by_firmware = !endpoint_.endpoint_is_physical;
+    context.wcs_established_this_setup = !endpoint_.endpoint_is_physical || virtual_printer;
+    context.bed_origin_declared_by_firmware = !endpoint_.endpoint_is_physical || virtual_printer;
 
     auto& input = auth.gate_input;
-    const auto authorization_machine_class = endpoint_.endpoint_is_physical
+    const auto authorization_machine_class = endpoint_.endpoint_is_physical && !virtual_printer
         ? machine_class_ : device::MachineClass::Emulated;
     input.machine_class = authorization_machine_class;
     input.artifact_kind = artifact.kind;
@@ -1106,7 +1114,7 @@ RunAuthorization ManufacturingLane::authorizationFor(const RunRecord& run,
         snapshot.state = FreshState::Ok;
         snapshot.normalize();
     }
-    const auto execute_truth = endpoint_.endpoint_is_physical
+    const auto execute_truth = endpoint_.endpoint_is_physical && !virtual_printer
         ? device::CapabilityTruthValue::Assumed
         : device::CapabilityTruthValue::Verified;
     gates::Stage1Check controller;
@@ -1121,7 +1129,7 @@ RunAuthorization ManufacturingLane::authorizationFor(const RunRecord& run,
     controller.accepts = {{"dev"}, {gates::Admission::ProbedEvidence}};
     input.stage1.push_back(std::move(controller));
     auto& facts = input.facts;
-    const bool simulated_qualification = !endpoint_.endpoint_is_physical;
+    const bool simulated_qualification = !endpoint_.endpoint_is_physical || virtual_printer;
     facts.artifact_hash = artifact.hash_sha256;
     facts.approved_artifact_hash = approval.artifact.hash_sha256;
     facts.machine_fingerprint =
@@ -1262,7 +1270,11 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
                           "observer clients read without owning the command lease");
         if (!current) selectTransport(*candidate);
         const LeaseOwner& owner = caller;
-        const uint64_t ttl = params.value("ttl_ms", 15000ULL);
+        const uint64_t ttl = params.value("ttl_ms", CommandLease::default_ttl_ms);
+        if (ttl == 0 || ttl > CommandLease::max_ttl_ms)
+            return refuse("lease.invalid_ttl",
+                          "ttl_ms must be within the server-owned lease limit",
+                          {{"max_ttl_ms", CommandLease::max_ttl_ms}});
         const uint64_t heartbeat = std::min<uint64_t>(3000, std::max<uint64_t>(1, ttl / 3));
         const auto claimed = leases_.claim(device_id_.str(), owner, clock_.mono_ns(), ttl,
                                            heartbeat,
@@ -1680,9 +1692,9 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         if (params.contains("approver_auth"))
             return refuse("mfg_approval_identity_assertion_forbidden",
                           "approver identity is derived from the authenticated connection, not request parameters");
-        if (caller.seat.empty() || caller.session.empty())
+        if (authenticatedInitiator(caller).kind != gates::InitiatorKind::Human)
             return refuse("mfg_approval_human_auth_required",
-                          "approval creation requires a server-authenticated connection identity");
+                          "approval creation requires an unforgeable human-presence attestation");
         const auto run_it = runs_.find(proposal->second.run_id);
         if (run_it == runs_.end() || run_it->second.device_id != device_id_.str())
             return refuse("mfg_run_device_mismatch",
@@ -1777,7 +1789,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
     }
     if (method == "mfg_run_start") {
         if (!requireLease(params, caller, failure)) return failure;
-        if (endpoint_.endpoint_is_physical)
+        if (endpoint_.endpoint_is_physical && !connected_)
             return refuse("mfg_physical_execute_not_qualified",
                           "physical execute is not advertised or enabled");
         if (!connected_) return refuse("mfg_transport_not_connected", "run start requires a connected device");
@@ -1789,6 +1801,10 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
             return refuse("mfg_run_device_mismatch",
                           "run is bound to a different selected device");
         const auto artifact = artifacts_.find(run->second.artifact_id);
+        if (endpoint_.endpoint_is_physical &&
+            !(isPrinter() && workerVirtualPrinter(printer_capability_)))
+            return refuse("mfg_physical_execute_not_qualified",
+                          "physical execute is not advertised or enabled");
         if (artifact == artifacts_.end() ||
             artifact->second.device_id != device_id_.str() ||
             artifact->second.device_id != run->second.device_id)
@@ -1817,6 +1833,14 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
                           "mfg_printer_adapter_start worker callback is not configured",
                           {{"method", "mfg_printer_adapter_start"}});
         serviceDevice();
+        // Rebuild the authorization from a current transport snapshot immediately
+        // before arbitration. This refresh and the gate evaluation both precede
+        // the one-shot nonce burn.
+        std::string refresh_why;
+        if (!arbiter_.replace_authorization(
+                run_id, authorizationFor(run->second, artifact->second, approval->second),
+                &refresh_why))
+            return refuse("mfg_run_authorization_refresh_refused", refresh_why);
         const auto initiator = authenticatedInitiator(caller);
         const auto before = journal_.head();
         const auto outcome = arbiter_.start(run_id, approval_id, initiator);

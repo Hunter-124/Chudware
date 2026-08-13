@@ -68,6 +68,8 @@ public:
     bool register_run(RunAuthorization run, std::string* why = nullptr);
     bool replace_current_inputs(std::string_view run_id, ApprovalInputs current,
                                 std::string* why = nullptr);
+    bool replace_authorization(std::string_view run_id, RunAuthorization current,
+                               std::string* why = nullptr);
 
     StartOutcome start(std::string_view run_id, std::string_view approval_id,
                        const Initiator& initiator);

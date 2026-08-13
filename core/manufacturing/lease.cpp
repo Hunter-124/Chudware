@@ -7,8 +7,6 @@ namespace {
 
 uint64_t expiry_ns(uint64_t now_mono_ns, uint64_t ttl_ms) {
     constexpr uint64_t per_ms = 1000000;
-    if (ttl_ms > (std::numeric_limits<uint64_t>::max() - now_mono_ns) / per_ms)
-        return std::numeric_limits<uint64_t>::max();
     return now_mono_ns + ttl_ms * per_ms;
 }
 
@@ -39,9 +37,10 @@ LeaseOutcome LeaseRegistry::claim(std::string device_id, LeaseOwner owner,
     std::lock_guard lock(mutex_);
     expire_locked(now_mono_ns);
     if (device_id.empty() || owner.client_kind.empty() || owner.seat.empty() ||
-        owner.session.empty() || ttl_ms == 0 || heartbeat_ms == 0 || heartbeat_ms >= ttl_ms) {
+        owner.session.empty() || ttl_ms == 0 || ttl_ms > CommandLease::max_ttl_ms ||
+        heartbeat_ms == 0 || heartbeat_ms >= ttl_ms) {
         return {false, "lease.invalid_request",
-                "device, complete owner identity, and heartbeat_ms < ttl_ms are required",
+                "device, complete owner identity, bounded ttl_ms, and heartbeat_ms < ttl_ms are required",
                 std::nullopt, std::nullopt};
     }
     const auto occupied = by_device_.find(device_id);
@@ -82,8 +81,9 @@ LeaseOutcome LeaseRegistry::renew(std::string_view lease_id, const LeaseOwner& o
     if (!(lease.owner == owner))
         return {false, "lease.owner_mismatch", "only the current owner may renew the lease",
                 std::nullopt, lease.owner};
-    if (ttl_ms == 0)
-        return {false, "lease.invalid_ttl", "renewal ttl_ms must be nonzero", std::nullopt, lease.owner};
+    if (ttl_ms == 0 || ttl_ms > CommandLease::max_ttl_ms)
+        return {false, "lease.invalid_ttl", "renewal ttl_ms exceeds the server-owned limit",
+                std::nullopt, lease.owner};
     lease.ttl_ms = ttl_ms;
     lease.expires_at_mono_ns = expiry_ns(now_mono_ns, ttl_ms);
     journal_.append("mfg.device.lease", lease.device_id,

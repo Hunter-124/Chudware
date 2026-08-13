@@ -6,6 +6,7 @@
 #include <bcrypt.h>
 #endif
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -13,27 +14,30 @@
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #include "agent/paths.h"
+#ifndef CHUDWARE_DEVELOPER_BUILD
+#include "chudware/protected_assets.generated.h"
+#endif
 
 namespace fs = std::filesystem;
 
 namespace chudware {
 namespace agent {
 
-// Ordered catalog for Settings → AI → Prompts and load_prompt().
-// Keep in sync with services/agent/prompts/*.md — scripts/agent_events_audit.py (in
-// scripts/check.py) fails on a stale entry. At runtime validate_roles_against_disk()
-// warns on stderr and get_prompts_v2 drops an entry whose file is gone.
-// get_prompts_v2 also appends any extra *.md found on disk (so new files show up
-// without a code change).
+// Ordered catalog for Settings → AI → Prompts and load_prompt(). The build-time
+// audit keeps it in sync with authored prompt markdown. Runtime catalog extras
+// come from the generated table in packaged builds and the prompt directory in
+// developer builds.
 const std::vector<std::string> kRoles = {
     "intake", "planner", "modeler", "reviewer", "fixer", "memory",
     "decomposer", "executor", "mission_planner", "reporter", "advisor",
     // 2D/3D specialist pair (Settings model roles + YAML cards)
     "sketch2d", "model3d",
-    // On-disk prompts that were missing from the hardcoded list
+    // Additional authored prompts retained in the canonical order
     "firmware", "dag_planner"};
 
 namespace {
@@ -99,33 +103,66 @@ std::string read_text(const fs::path& path) {
     return ss.str();
 }
 
+#ifdef CHUDWARE_DEVELOPER_BUILD
 fs::path builtin_dir(const std::string& prompts_dir) {
     if (!prompts_dir.empty()) return fs::path(prompts_dir);
     const char* env = std::getenv("CHUDWARE_PROMPTS_DIR");
     if (env && env[0]) return fs::path(env);
-    // Repo-relative. This was "agent/prompts" while a root `agent` symlink
-    // pointed at services/agent; that symlink was removed on 2026-08-11
-    // because a committed symlink checks out on Windows as a text file
-    // containing its target path, which silently breaks every consumer.
     return fs::path("services") / "agent" / "prompts";
 }
+#endif
 
 fs::path override_dir() { return paths_root() / "prompts"; }
 
-fs::path builtin_path(const std::string& role, const std::string& prompts_dir) {
-    return builtin_dir(prompts_dir) / (role + ".md");
-}
 fs::path override_path(const std::string& role) {
     return override_dir() / (role + ".md");
 }
 
-std::string read_cheatsheet_shared(const std::string& prompts_dir, bool solo) {
-    const char* name = solo ? "ops_cheatsheet_solo.md" : "ops_cheatsheet.md";
-    return read_text(builtin_dir(prompts_dir) / "shared" / name);
+std::string builtin_source(const std::string& relative,
+                           const std::string& prompts_dir) {
+#ifdef CHUDWARE_DEVELOPER_BUILD
+    return (builtin_dir(prompts_dir) / relative).string();
+#else
+    (void)prompts_dir;
+    return "compiled://services/agent/prompts/" + relative;
+#endif
 }
 
-// Map a granted tool-scope class to the on-disk cheatsheet stem (no .md).
-// weldments (model-facing plural) -> weldment.md on disk.
+std::string read_builtin(const std::string& relative,
+                         const std::string& prompts_dir) {
+#ifdef CHUDWARE_DEVELOPER_BUILD
+    return read_text(builtin_dir(prompts_dir) / relative);
+#else
+    (void)prompts_dir;
+    std::string_view text;
+    if (relative.rfind("shared/", 0) == 0)
+        text = protected_assets::findCheatsheet(relative);
+    else
+        text = protected_assets::findPrompt(relative);
+    return std::string(text);
+#endif
+}
+
+bool builtin_exists(const std::string& relative,
+                    const std::string& prompts_dir) {
+#ifdef CHUDWARE_DEVELOPER_BUILD
+    std::error_code ec;
+    return fs::is_regular_file(builtin_dir(prompts_dir) / relative, ec);
+#else
+    (void)prompts_dir;
+    if (relative.rfind("shared/", 0) == 0)
+        return !protected_assets::findCheatsheet(relative).empty();
+    return !protected_assets::findPrompt(relative).empty();
+#endif
+}
+
+std::string read_cheatsheet_shared(const std::string& prompts_dir, bool solo) {
+    const char* name = solo ? "ops_cheatsheet_solo.md" : "ops_cheatsheet.md";
+    return read_builtin(std::string("shared/") + name, prompts_dir);
+}
+
+// Map a granted tool-scope class to the built-in cheatsheet stem (no .md).
+// weldments (model-facing plural) -> weldment.md.
 const char* domain_sheet_stem(const std::string& cls) {
     if (cls == "sheetmetal") return "sheetmetal";
     if (cls == "weldments" || cls == "weldment") return "weldment";
@@ -136,12 +173,12 @@ const char* domain_sheet_stem(const std::string& cls) {
 std::string read_domain_cheatsheet(const std::string& prompts_dir, const std::string& cls) {
     const char* stem = domain_sheet_stem(cls);
     if (!stem) return "";
-    return py_strip(read_text(builtin_dir(prompts_dir) / "shared" / "cheatsheets" /
-                              (std::string(stem) + ".md")));
+    return py_strip(read_builtin("shared/cheatsheets/" + std::string(stem) + ".md",
+                                 prompts_dir));
 }
 
 std::string read_hardware_catalog(const std::string& prompts_dir) {
-    return py_strip(read_text(builtin_dir(prompts_dir) / "shared" / "cheatsheets" / "hardware.md"));
+    return py_strip(read_builtin("shared/cheatsheets/hardware.md", prompts_dir));
 }
 
 bool is_ops_role(const std::string& role) {
@@ -159,29 +196,25 @@ bool is_catalog_role(const std::string& role) {
 bool is_role(const std::string& role) {
     for (const auto& r : kRoles)
         if (r == role) return true;
-    // Accept drop-in prompts (*.md) that are not yet listed in kRoles.
-    if (role.empty()) return false;
-    std::error_code ec;
-    return fs::exists(builtin_path(role, /*prompts_dir=*/""), ec);
+    // Developer builds accept drop-ins; packaged builds accept only signed,
+    // build-generated prompt entries.
+    return !role.empty() && builtin_exists(role + ".md", /*prompts_dir=*/"");
 }
 
-// Validate the curated kRoles catalog against the on-disk prompts dir: an entry whose
-// *.md was renamed/deleted is a stale order entry — warn loudly on stderr instead of
-// silently surfacing nothing (get_prompts_v2 drops it; load_prompt throws on use).
-// Once per process; the first caller's prompts_dir wins (all production paths share it).
-void validate_roles_against_disk(const std::string& prompts_dir) {
+// Validate the curated catalog against its active built-in source once per process.
+void validate_role_catalog(const std::string& prompts_dir) {
     static bool done = false;
     if (done) return;
     done = true;
     for (const auto& role : kRoles) {
         std::error_code ec;
-        if (!fs::exists(builtin_path(role, prompts_dir), ec) &&
+        if (!builtin_exists(role + ".md", prompts_dir) &&
             !fs::exists(override_path(role), ec)) {
+            const std::string source = builtin_source(role + ".md", prompts_dir);
             std::fprintf(stderr,
-                         "agent roles: kRoles entry '%s' has no prompt file "
+                         "agent roles: kRoles entry '%s' has no built-in prompt "
                          "(%s missing) — dropping stale catalog entry\n",
-                         role.c_str(),
-                         builtin_path(role, prompts_dir).string().c_str());
+                         role.c_str(), source.c_str());
         }
     }
 }
@@ -193,7 +226,7 @@ std::pair<std::string, std::string> load_prompt(const std::string& role,
                                                 bool solo,
                                                 bool tool_scope_full,
                                                 const std::set<std::string>& tool_scope_classes) {
-    validate_roles_against_disk(prompts_dir);
+    validate_role_catalog(prompts_dir);
     if (!is_role(role)) throw std::runtime_error("unknown role " + role);
     fs::path ov = override_path(role);
     std::string ov_text;
@@ -204,9 +237,9 @@ std::pair<std::string, std::string> load_prompt(const std::string& role,
         text = ov_text;
         source = ov.string();
     } else {
-        fs::path bp = builtin_path(role, prompts_dir);
-        text = read_text(bp);
-        source = bp.string();
+        const std::string relative = role + ".md";
+        text = read_builtin(relative, prompts_dir);
+        source = builtin_source(relative, prompts_dir);
         if (py_strip(text).empty())
             throw std::runtime_error("role prompt unreadable/empty: " + source);
     }
@@ -323,61 +356,63 @@ std::string prompt_hash(const std::string& text) {
 }
 
 json get_prompts_v2(const std::string& prompts_dir) {
-    validate_roles_against_disk(prompts_dir);
+    validate_role_catalog(prompts_dir);
     json out = json::array();
     std::error_code ec;
     std::set<std::string> seen;
 
     auto push_role = [&](const std::string& role) {
         if (role.empty() || !seen.insert(role).second) return;
-        fs::path bpath = builtin_path(role, prompts_dir);
+        const std::string relative = role + ".md";
         fs::path opath = override_path(role);
         std::string ov_text;
         if (fs::exists(opath, ec)) ov_text = py_strip(read_text(opath));
-        bool overridden = !ov_text.empty();
-        // Prefer override; else builtin file if present. A kRoles entry with no file is
-        // a stale catalog entry: drop it here (validate_roles_against_disk already
-        // warned on stderr) so the Settings UI never shows a ghost row.
+        const bool overridden = !ov_text.empty();
         std::string text;
-        if (overridden) {
+        if (overridden)
             text = ov_text;
-        } else if (fs::exists(bpath, ec)) {
-            text = read_text(bpath);
-        } else {
-            return;  // nothing to edit
-        }
+        else if (builtin_exists(relative, prompts_dir))
+            text = read_builtin(relative, prompts_dir);
+        else
+            return;
         out.push_back(json{
             {"role", role},
-            {"path", bpath.string()},
+            {"path", builtin_source(relative, prompts_dir)},
             {"override_path", opath.string()},
             {"text", text},
             {"overridden", overridden},
         });
     };
 
-    // 1) Canonical order from kRoles
     for (const std::string& role : kRoles) push_role(role);
 
-    // 2) Any extra *.md in the prompts dir (dev drop-in without editing kRoles)
+    std::vector<std::string> extras;
+#ifdef CHUDWARE_DEVELOPER_BUILD
     fs::path dir = builtin_dir(prompts_dir);
     if (fs::is_directory(dir, ec)) {
-        std::vector<std::string> extras;
         for (fs::directory_iterator it(dir, ec), end; it != end && !ec; it.increment(ec)) {
             if (!it->is_regular_file(ec)) continue;
-            auto p = it->path();
-            if (p.extension() != ".md") continue;
-            extras.push_back(p.stem().string());
+            const auto path = it->path();
+            if (path.extension() == ".md") extras.push_back(path.stem().string());
         }
-        std::sort(extras.begin(), extras.end());
-        for (const auto& role : extras) push_role(role);
     }
+#else
+    for (const auto& asset : protected_assets::kPrompts) {
+        if (asset.path.find('/') != std::string_view::npos ||
+            asset.path.size() < 3 || asset.path.substr(asset.path.size() - 3) != ".md")
+            continue;
+        extras.emplace_back(asset.path.substr(0, asset.path.size() - 3));
+    }
+#endif
+    std::sort(extras.begin(), extras.end());
+    for (const auto& role : extras) push_role(role);
     return out;
 }
 
 std::string load_cheatsheet(const std::string& feature_type, const std::string& prompts_dir) {
     std::string name = cheatsheet_name(feature_type);
     if (name.empty()) return "";
-    return py_strip(read_text(builtin_dir(prompts_dir) / "shared" / "cheatsheets" / (name + ".md")));
+    return py_strip(read_builtin("shared/cheatsheets/" + name + ".md", prompts_dir));
 }
 
 }  // namespace agent

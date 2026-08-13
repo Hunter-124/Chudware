@@ -1,4 +1,4 @@
-// hostd → python -m services.worker_main stdio bridge (POSIX). Windows: unavailable stub.
+// hostd → services worker stdio bridge. Windows hostd remains unavailable.
 #include "worker_bridge.h"
 
 #include <cstdlib>
@@ -48,6 +48,7 @@ bool WorkerBridge::call(const std::string& /*method*/, const nlohmann::json& /*p
 #include <unistd.h>
 
 #include "util/parent_death.h"
+#include "util/platform_paths.h"
 
 namespace hostd {
 
@@ -70,6 +71,34 @@ bool fileExists(const std::string& p) {
     return std::filesystem::is_regular_file(p, ec);
 }
 
+
+std::string adjacentWorkerBinary(std::string& err) {
+    const std::string executable = chudware::platform::executablePath();
+    if (executable.empty()) {
+        err = "could not resolve the current executable path";
+        return {};
+    }
+#ifdef _WIN32
+    constexpr const char* name = "chudware-worker.exe";
+#else
+    constexpr const char* name = "chudware-worker";
+#endif
+    std::error_code ec;
+    const auto candidate = std::filesystem::weakly_canonical(
+        std::filesystem::path(executable).parent_path() / name, ec);
+    if (ec) {
+        err = "could not canonicalize adjacent worker path";
+        return {};
+    }
+    return candidate.string();
+}
+
+bool sameCanonicalPath(const std::string& left, const std::string& right) {
+    std::error_code leftEc, rightEc;
+    const auto canonicalLeft = std::filesystem::weakly_canonical(left, leftEc);
+    const auto canonicalRight = std::filesystem::weakly_canonical(right, rightEc);
+    return !leftEc && !rightEc && canonicalLeft == canonicalRight;
+}
 }  // namespace
 
 std::atomic<bool> WorkerBridge::created_{false};
@@ -153,38 +182,61 @@ void WorkerBridge::reap() {
 bool WorkerBridge::spawn(std::string& err) {
     // Caller holds mtx_. running_ must be false / fds closed.
     if (!pathsResolved_) {
+#ifdef CHUDWARE_DEVELOPER_BUILD
         const std::string home = homeDir();
-        // Preferred backend is the provisioned Chudware runtime venv (carries every Python dep).
-        // When it is absent (dev checkout / unprovisioned install) fall back to a system python3
-        // so the lightweight worker RPCs the GUI needs (ai_roles / subscription_status / skills /
-        // triggers / prompts / bench catalog) still work instead of hard-failing with "Python
-        // runtime not installed". CHUDWARE_PYTHON overrides all of this. Heavy deps (build123d
-        // etc.) only matter for run_model-class RPCs, which route to the C++ core anyway.
-        python_ = envOr("CHUDWARE_PYTHON", std::string());
-        if (python_.empty()) {
-            const std::string venv =
-                home.empty() ? std::string()
-                             : home + "/.local/share/Chudware/runtime/venv/bin/python";
-            if (!venv.empty() && fileExists(venv)) {
-                python_ = venv;
-            } else {
-                for (const char* cand :
-                     {"/usr/bin/python3", "/usr/local/bin/python3", "/usr/bin/python"}) {
-                    if (fileExists(cand)) { python_ = cand; break; }
+        if (const char* env = std::getenv("CHUDWARE_WORKER_BIN"); env && *env) {
+            std::error_code ec;
+            workerBin_ = std::filesystem::weakly_canonical(env, ec).string();
+            if (ec) workerBin_ = env;
+            compiledWorker_ = true;
+        } else {
+            workerBin_ = envOr("CHUDWARE_PYTHON", std::string());
+            if (workerBin_.empty()) {
+                const std::string venv =
+                    home.empty() ? std::string()
+                                 : home + "/.local/share/Chudware/runtime/venv/bin/python";
+                if (!venv.empty() && fileExists(venv)) {
+                    workerBin_ = venv;
+                } else {
+                    for (const char* cand :
+                         {"/usr/bin/python3", "/usr/local/bin/python3", "/usr/bin/python"}) {
+                        if (fileExists(cand)) { workerBin_ = cand; break; }
+                    }
+                    if (workerBin_.empty()) workerBin_ = "python3";
                 }
-                if (python_.empty()) python_ = "python3";  // execlp PATH search in the child
             }
         }
-        repo_ = envOr("CHUDWARE_REPO",
-                      home.empty() ? std::string(".") : home + "/Repositories/CAD");
+        repo_ = compiledWorker_
+                    ? std::filesystem::path(workerBin_).parent_path().string()
+                    : envOr("CHUDWARE_REPO",
+                            home.empty() ? std::string(".") : home + "/Repositories/CAD");
+#else
+        workerBin_ = adjacentWorkerBinary(err);
+        if (workerBin_.empty()) return false;
+        if (const char* env = std::getenv("CHUDWARE_WORKER_BIN"); env && *env &&
+            !sameCanonicalPath(env, workerBin_)) {
+            err = "CHUDWARE_WORKER_BIN must name the adjacent packaged worker";
+            log().line("worker_bridge: spawn failed: %s", err.c_str());
+            return false;
+        }
+        compiledWorker_ = true;
+        repo_ = std::filesystem::path(workerBin_).parent_path().string();
+#endif
         pathsResolved_ = true;
     }
 
-    // Only a fully-qualified path is validated here; a bare "python3" defers to execlp's PATH
-    // search in the forked child (fileExists on a bare name is always false).
-    if (python_.find('/') != std::string::npos && !fileExists(python_)) {
-        err = "Python runtime not found at " + python_ +
-              " (set CHUDWARE_PYTHON or provision the Chudware runtime venv)";
+    if (workerBin_.empty()) {
+        err = "CHUDWARE_WORKER_BIN is required in packaged builds";
+        log().line("worker_bridge: spawn failed: %s", err.c_str());
+        return false;
+    }
+
+    // Packaged binaries must resolve to a real manifest-owned file. Developer-mode bare
+    // interpreter names may still defer to execlp's PATH search.
+    if ((compiledWorker_ || workerBin_.find('/') != std::string::npos) &&
+        !fileExists(workerBin_)) {
+        err = (compiledWorker_ ? "Compiled worker not found at " : "Python runtime not found at ") +
+              workerBin_;
         log().line("worker_bridge: spawn failed: %s", err.c_str());
         return false;
     }
@@ -220,13 +272,16 @@ bool WorkerBridge::spawn(std::string& err) {
         ::close(outPipe[0]);
         ::close(outPipe[1]);
         // Close every other inherited fd (hostd's listen/client sockets etc.) so they never
-        // leak into the python worker child.
+        // leak into the worker child.
         chudware::platform::closeInheritedFds(3);
         if (!repo_.empty() && chdir(repo_.c_str()) != 0) {
-            // Fall through; exec from current cwd. Worker import may still fail clearly.
+            // Fall through; imports or resource lookup will fail clearly.
         }
-        // Mirror worker_client.cpp: execlp(python, python, "-m", "services.worker_main", nullptr)
-        execlp(python_.c_str(), python_.c_str(), "-m", "services.worker_main", (char*)nullptr);
+        if (compiledWorker_)
+            execlp(workerBin_.c_str(), workerBin_.c_str(), "--module", "worker", (char*)nullptr);
+        else
+            execlp(workerBin_.c_str(), workerBin_.c_str(), "-m", "services.worker_main",
+                   (char*)nullptr);
         _exit(127);
     }
 
@@ -241,8 +296,8 @@ bool WorkerBridge::spawn(std::string& err) {
     childStdinWr_ = inPipe[1];
     readBuf_.clear();
     running_ = true;
-    log().line("worker_bridge: spawned services.worker_main pid=%d python=%s repo=%s", (int)pid,
-               python_.c_str(), repo_.c_str());
+    log().line("worker_bridge: spawned services.worker_main pid=%d launcher=%s repo=%s", (int)pid,
+               workerBin_.c_str(), repo_.c_str());
     return true;
 }
 

@@ -100,6 +100,26 @@ bool Arbiter::replace_current_inputs(std::string_view run_id, ApprovalInputs cur
     it->second.current_inputs = std::move(current);
     return true;
 }
+bool Arbiter::replace_authorization(std::string_view run_id, RunAuthorization current,
+                                    std::string* why) {
+    std::lock_guard lock(mutex_);
+    const auto it = runs_.find(run_id);
+    if (it == runs_.end()) {
+        if (why) *why = "run not found";
+        return false;
+    }
+    if (current.run_id != it->second.run_id ||
+        current.approval_id != it->second.approval_id ||
+        current.state != it->second.state) {
+        if (why) *why = "refreshed authorization changed the frozen run binding";
+        return false;
+    }
+    current.discontinuity_since_hold = it->second.discontinuity_since_hold;
+    current.initiator = it->second.initiator;
+    current.gate_report_ref = it->second.gate_report_ref;
+    it->second = std::move(current);
+    return true;
+}
 
 tier0::Context Arbiter::materialize_tier0(const RunAuthorization& run,
                                           const ApprovalBinding& approval) const {
@@ -141,6 +161,22 @@ gates::GateInput Arbiter::materialize_gate_input(const RunAuthorization& run,
     facts.exercisable_by = approval.exercisable_by;
     facts.initiator_kind = initiator.kind;
     facts.now_mono_ns = clock_.mono_ns();
+    for (auto& check : input.stage1) {
+        auto& fresh = check.candidate.fresh;
+        if (fresh.observed_mono_ns == 0) continue;
+        if (fresh.observed_mono_ns > facts.now_mono_ns) {
+            fresh.state = FreshState::Unknown;
+            fresh.has_value = false;
+            fresh.why = "observation timestamp is in the future";
+            continue;
+        }
+        fresh.age_ms = (facts.now_mono_ns - fresh.observed_mono_ns) / 1000000ULL;
+        if (fresh.ttl_ms && fresh.age_ms > *fresh.ttl_ms) {
+            fresh.state = FreshState::Stale;
+            fresh.has_value = false;
+            fresh.why = "freshness ttl exceeded at start";
+        }
+    }
     facts.approval_expiry_mono_ns = approval.expiry.t_mono_ns;
     facts.nonce_unburned = nonces_.describe(approval.approval_id).has_value() &&
         nonces_.describe(approval.approval_id)->state == NonceState::Unburned;

@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/utsname.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -148,10 +149,25 @@ json load_cfg() {
 void write_cfg(const json& cfg) {
     std::error_code ec;
     fs::create_directories(config_path().parent_path(), ec);
+#ifndef _WIN32
+    (void)::chmod(config_path().parent_path().c_str(), 0700);
+    const int fd = ::open(tmp_path().c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+    const std::string data = cfg.dump(2);
+    size_t written = 0;
+    while (written < data.size()) {
+        const ssize_t n = ::write(fd, data.data() + written, data.size() - written);
+        if (n <= 0) { ::close(fd); fs::remove(tmp_path(), ec); return; }
+        written += static_cast<size_t>(n);
+    }
+    if (::fsync(fd) != 0 || ::close(fd) != 0) { fs::remove(tmp_path(), ec); return; }
+#else
     {
         std::ofstream fh(tmp_path(), std::ios::binary | std::ios::trunc);
         fh << cfg.dump(2);
+        if (!fh) return;
     }
+#endif
     fs::rename(tmp_path(), config_path(), ec);
     if (ec) {
         // Windows rename refuses an existing target; os.replace semantics instead.
@@ -159,6 +175,9 @@ void write_cfg(const json& cfg) {
         fs::remove(config_path(), ec2);
         fs::rename(tmp_path(), config_path(), ec);
     }
+#ifndef _WIN32
+    if (!ec) (void)::chmod(config_path().c_str(), 0600);
+#endif
 }
 
 // Advisory exclusive lock on <config.json>.lock — the SAME file sub_auth._lock_path
@@ -169,6 +188,9 @@ public:
     explicit FileLock(const fs::path& p) {
         std::error_code ec;
         fs::create_directories(p.parent_path(), ec);
+#ifndef _WIN32
+        (void)::chmod(p.parent_path().c_str(), 0700);
+#endif
 #ifdef _WIN32
         h_ = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE,
                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,

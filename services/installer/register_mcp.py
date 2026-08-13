@@ -9,7 +9,7 @@ Idempotent and non-destructive: backs up each file before writing and only write
 entry actually changes. Use --dry-run to preview, --unregister to remove.
 
     python -m services.installer.register_mcp [--dry-run] [--unregister]
-                                     [--python <exe>] [--cwd <dir>] [--target desktop|code]
+        [--python <exe>] [--mcp-bin <exe>] [--cwd <dir>] [--target desktop|code]
 """
 from __future__ import annotations
 
@@ -30,6 +30,15 @@ def default_python() -> Path:
     return paths.RUNTIME / "venv" / "Scripts" / "python.exe"
 
 
+def default_mcp_bin() -> Path | None:
+    value = os.environ.get("CHUDWARE_MCP_BIN")
+    return Path(value).expanduser().resolve() if value else None
+
+def adjacent_mcp_bin(cwd: Path) -> Path:
+    name = "chudware-mcp.exe" if os.name == "nt" else "chudware-mcp"
+    return (cwd.expanduser().resolve() / name).resolve()
+
+
 def config_paths() -> dict[str, Path]:
     home = Path.home()
     appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
@@ -39,16 +48,30 @@ def config_paths() -> dict[str, Path]:
     }
 
 
-def server_entry(python_exe: Path, cwd: Path, hostd_bin: Path | None = None) -> dict:
+def server_entry(python_exe: Path, cwd: Path, hostd_bin: Path | None = None,
+                 mcp_bin: Path | None = None) -> dict:
+    cwd = cwd.expanduser().resolve()
+    adjacent = adjacent_mcp_bin(cwd)
+    supplied = mcp_bin if mcp_bin is not None else default_mcp_bin()
+    if supplied is not None and supplied.expanduser().resolve() != adjacent:
+        raise ValueError("CHUDWARE_MCP_BIN/--mcp-bin must name the adjacent packaged MCP binary")
+    use_compiled = supplied is not None or adjacent.is_file()
     env: dict[str, str] = {}
     if hostd_bin is not None:
         # Pin the installed engine-host daemon so MCP sessions and the GUI share ONE
-        # daemon (same binary path -> same instance key -> same socket/pipe). Without
-        # this the MCP venv would resolve a dev-tree hostd and mint a separate daemon.
+        # daemon (same binary path -> same instance key -> same socket/pipe).
         env["CHUDWARE_HOSTD_BIN"] = str(hostd_bin)
+    if use_compiled:
+        command = str(adjacent)
+        command_args = ["--module", "mcp"]
+    else:
+        # Developer-source registration only. A packaged install carries the adjacent binary
+        # and therefore never emits a Python fallback.
+        command = str(python_exe)
+        command_args = ["-m", "services.mcp.server"]
     return {
-        "command": str(python_exe),
-        "args": ["-m", "services.mcp.server"],
+        "command": command,
+        "args": command_args,
         "cwd": str(cwd),
         "env": env,
     }
@@ -64,8 +87,9 @@ def _load(path: Path) -> dict:
 
 
 def apply(python_exe: Path, cwd: Path, targets: list[str], dry_run: bool,
-          unregister: bool, hostd_bin: Path | None = None) -> dict:
-    entry = server_entry(python_exe, cwd, hostd_bin)
+          unregister: bool, hostd_bin: Path | None = None,
+          mcp_bin: Path | None = None) -> dict:
+    entry = server_entry(python_exe, cwd, hostd_bin, mcp_bin)
     out: dict = {}
     for name, path in config_paths().items():
         if name not in targets:
@@ -99,6 +123,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--unregister", action="store_true")
     ap.add_argument("--python", type=Path, default=default_python())
+    ap.add_argument("--mcp-bin", type=Path, default=default_mcp_bin(),
+                    help="compiled MCP executable (must be adjacent to --cwd)")
     ap.add_argument("--cwd", type=Path, default=Path(__file__).resolve().parent.parent)
     ap.add_argument("--target", choices=["desktop", "code", "both"], default="both")
     ap.add_argument("--hostd-bin", type=Path, default=None,
@@ -106,14 +132,24 @@ def main(argv: list[str]) -> int:
                          "CHUDWARE_HOSTD_BIN so MCP sessions attach to the installed daemon")
     args = ap.parse_args(argv)
 
+    if args.mcp_bin is not None:
+        args.mcp_bin = args.mcp_bin.expanduser().resolve()
+    try:
+        entry = server_entry(args.python, args.cwd, args.hostd_bin, args.mcp_bin)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if not args.unregister and entry["args"] == ["--module", "mcp"] and not Path(
+            entry["command"]).is_file():
+        ap.error(f"compiled MCP executable not found: {entry['command']}")
+
     targets = ["desktop", "code"] if args.target == "both" else [args.target]
     res = apply(args.python, args.cwd, targets, args.dry_run, args.unregister,
-                hostd_bin=args.hostd_bin)
+                hostd_bin=args.hostd_bin, mcp_bin=args.mcp_bin)
     print(json.dumps({
         "action": "unregister" if args.unregister else "register",
         "dry_run": args.dry_run,
         "server": SERVER_NAME,
-        "entry": server_entry(args.python, args.cwd, args.hostd_bin),
+        "entry": entry,
         "targets": res,
     }, indent=2))
     return 0

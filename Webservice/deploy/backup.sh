@@ -62,9 +62,17 @@ for dbname in "${DATABASES[@]}"; do
   [ -r "$pwfile" ] || die "missing password file $pwfile"
   out="$DEST/$dbname-$stamp.dump.age"
   # -Fc is the custom format: compressed, and pg_restore can select out of it.
-  PGPASSWORD="$(cat "$pwfile")" pg_dump -Fc --no-password \
+  pgpass="$(mktemp)"
+  chmod 600 "$pgpass"
+  printf '127.0.0.1:5432:%s:%s:%s\n' "$dbname" "$dbname" \
+    "$(sed 's/\\/\\\\/g; s/:/\\:/g' "$pwfile")" > "$pgpass"
+  if ! PGPASSFILE="$pgpass" pg_dump -Fc --no-password \
       -h 127.0.0.1 -U "$dbname" -d "$dbname" \
-    | age -r "$RECIPIENT" > "$out.partial"
+      | age -r "$RECIPIENT" > "$out.partial"; then
+    rm -f "$pgpass" "$out.partial"
+    die "database backup failed for $dbname"
+  fi
+  rm -f "$pgpass"
   mv "$out.partial" "$out"
   chmod 600 "$out"
   artifacts+=("$out")

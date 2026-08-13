@@ -62,7 +62,7 @@ json findTransport(const json& listed, std::string_view kind) {
 json call(ManufacturingLane& lane, std::string_view method, json params = json::object(),
           bool expect_error = false,
           chudware::mfg::LeaseOwner caller =
-              {"test", "test-seat", "test-session"}) {
+              {"human", "test-seat", "test-session"}) {
     const auto handled = lane.handle(method, params, caller);
     REQUIRE(handled.has_value());
     INFO("method=" << method << " body=" << handled->body.dump());
@@ -84,7 +84,7 @@ struct LaneRig {
     void claim(std::string session = "one") {
         const auto claimed = call(lane, "mfg_device_claim",
             {{"device_id", device_id},
-             {"owner", {{"client_kind", "test"}, {"seat", "test-seat"},
+             {"owner", {{"client_kind", "human"}, {"seat", "test-seat"},
                         {"session", std::move(session)}}}});
         lease_id = claimed.at("lease").at("lease_id").get<std::string>();
     }
@@ -213,6 +213,45 @@ TEST_CASE("commander claim is exclusive and every write requires the lease") {
     CHECK(takeover.at("lease").at("owner").at("session") == "second");
 }
 
+
+TEST_CASE("client-supplied GUI label cannot create human-only approval") {
+    LaneRig rig;
+    const chudware::mfg::LeaseOwner spoofed_gui{"gui", "uid:1000", "raw-socket"};
+    const auto claimed = call(rig.lane, "mfg_device_claim",
+                              {{"device_id", rig.device_id}}, false, spoofed_gui);
+    rig.lease_id = claimed.at("lease").at("lease_id");
+    call(rig.lane, "mfg_device_connect",
+         {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}}, false, spoofed_gui);
+    const auto artifact = call(
+        rig.lane, "mfg_artifact_register",
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"artifact", {{"kind", "nc"}, {"content", "G0 X0\n"}}}}, false, spoofed_gui);
+    const auto preflight = call(
+        rig.lane, "mfg_preflight_run",
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"artifact_id", artifact.at("artifact").at("artifact_id")}}, false, spoofed_gui);
+    const auto proposed = call(
+        rig.lane, "mfg_approval_propose",
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"run_id", preflight.at("run_id")}, {"exercisable_by", "human_only"}},
+        false, spoofed_gui);
+    const auto refused = call(
+        rig.lane, "mfg_approval_create",
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"proposal_id", proposed.at("proposal").at("proposal_id")}}, true, spoofed_gui);
+    CHECK(refused.at("code") == "mfg_approval_human_auth_required");
+}
+
+TEST_CASE("lane rejects unbounded lease TTL before granting ownership") {
+    LaneRig rig;
+    const auto refused = call(rig.lane, "mfg_device_claim",
+                              {{"device_id", rig.device_id}, {"ttl_ms", UINT64_MAX}}, true);
+    CHECK(refused.at("code") == "lease.invalid_ttl");
+    const auto bounded = call(rig.lane, "mfg_device_claim",
+                              {{"device_id", rig.device_id},
+                               {"ttl_ms", chudware::mfg::CommandLease::max_ttl_ms}});
+    CHECK(bounded.at("lease").at("ttl_ms") == chudware::mfg::CommandLease::max_ttl_ms);
+}
 TEST_CASE("lease bearer value is caller-bound and redacted from observers") {
     TempDirectory temp;
     ManufacturingLane lane(temp.path);
@@ -342,8 +381,7 @@ TEST_CASE("request-asserted initiator is refused and authenticated nonce is sing
     REQUIRE(listed.at("runs").size() == 1);
     CHECK(listed.at("runs").at(0).at("run_id") == run_id);
     const auto replay = rig.start(run_id, approval_id, "human", true);
-    CHECK(replay.at("code").get<std::string>().find("approval.present_unexpired_unburned") !=
-          std::string::npos);
+    CHECK(replay.at("code") == "mfg_run_authorization_refresh_refused");
 }
 
 TEST_CASE("hold and abort are accepted but alarm permanently forbids resume") {
@@ -482,6 +520,19 @@ TEST_CASE("emulator fault injection is structurally barred from physical endpoin
          {"run_id", "run:physical"}, {"approval_id", "approval:physical"}},
         true);
     CHECK(start_refused.at("code") == "mfg_physical_execute_not_qualified");
+}
+
+TEST_CASE("allowlist rejects metadata that claims a physical transport is virtual") {
+    TempDirectory temp;
+    auto entry = commissioned(chudware::device::TransportKind::Serial,
+                              chudware::device::MachineClass::OpenFrameMill,
+                              "origin-virtual");
+    entry.connection["origin"] = "virtual";
+    chudware::mfg::gateway::DeviceAllowlist allowlist(
+        temp.path / "device_allowlist.tsv");
+    std::string why;
+    CHECK_FALSE(allowlist.upsert(entry, &why));
+    CHECK(why.find("physicality is server-attested") != std::string::npos);
 }
 
 TEST_CASE("approval identity assertions are refused and host identity is stamped") {
@@ -665,7 +716,6 @@ TEST_CASE("observed controller fingerprint change falsifies its approval") {
                               chudware::device::MachineClass::FdmPrinterEnclosed,
                               "fingerprint");
     entry.connection["adapter_kind"] = "moonraker";
-    entry.connection["origin"] = "virtual";
     seedAllowlist(temp.path, entry);
     ManufacturingLane lane(temp.path);
     std::string subject = "printer:controller-a";
@@ -731,7 +781,6 @@ TEST_CASE("run artifact and approval cannot cross the selected device boundary")
                               chudware::device::MachineClass::FdmPrinterEnclosed,
                               "cross-device");
     entry.connection["adapter_kind"] = "moonraker";
-    entry.connection["origin"] = "virtual";
     seedAllowlist(temp.path, entry);
     ManufacturingLane lane(temp.path);
     lane.setWorkerCall([](const std::string& method, const json&) {
@@ -820,7 +869,6 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
                               "printer");
     entry.connection["adapter_kind"] = "moonraker";
     entry.connection["auth_mode"] = "trusted_host";
-    entry.connection["origin"] = "virtual";
     seedAllowlist(temp.path, entry);
     ManufacturingLane lane(temp.path);
     std::vector<std::string> methods;
@@ -867,10 +915,10 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
           "http://127.0.0.1:39007");
     const auto capability = call(lane, "mfg_device_capability",
                                  {{"device_id", device_id}});
-    CHECK_FALSE(candidate.at("transport").at("endpoint_is_physical"));
-    CHECK(capability.at("capability").at("max_advertised") == "execute");
+    CHECK(candidate.at("transport").at("endpoint_is_physical"));
+    CHECK(capability.at("capability").at("max_advertised") == "transport");
     CHECK(capability.at("capability").at("levels").at("execute").at("truth") ==
-          "verified");
+          "assumed");
 
     const auto telemetry = call(lane, "mfg_telemetry_snapshot",
                                 {{"device_id", device_id}});
@@ -950,7 +998,6 @@ TEST_CASE("printer terminal telemetry faults the run and raises attention") {
                               "terminal-printer");
     entry.connection["adapter_kind"] = "moonraker";
     entry.connection["auth_mode"] = "trusted_host";
-    entry.connection["origin"] = "virtual";
     seedAllowlist(temp.path, entry);
     ManufacturingLane lane(temp.path);
     bool terminal_snapshot = false;

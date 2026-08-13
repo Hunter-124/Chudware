@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -20,7 +21,8 @@
 #include <nlohmann/json.hpp>
 
 #include "agent/http.h"
-#include "util/entitlement.h"
+#include "security/release_keys.h"
+#include "security/integrity.h"
 extern "C" {
 #include "util/tweetnacl.h"
 }
@@ -34,6 +36,10 @@ extern "C" {
 #else
 #include <curl/curl.h>
 #include <unistd.h>
+#include <cerrno>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #endif
 
 namespace chudware::update {
@@ -269,20 +275,32 @@ std::vector<unsigned char> decodeBase64(std::string_view value) {
     return out;
 }
 
-bool signatureValid(const std::string& sha256, const std::string& encoded) {
+bool signatureValid(const std::string& sha256, const std::string& keyId,
+                    const std::string& encoded) {
+    const auto* key = security::release::findKey(keyId);
     const std::vector<unsigned char> signature = decodeBase64(encoded);
-    if (signature.size() != crypto_sign_BYTES || sha256.size() != 64) return false;
-    std::vector<unsigned char> signedMessage(signature.size() + sha256.size());
+    if (!key || signature.size() != crypto_sign_BYTES || sha256.size() != 64) return false;
+
+    constexpr std::string_view domain = "chudware-artifact-v1";
+    std::string preimage;
+    preimage.reserve(domain.size() + 1 + keyId.size() + 1 + sha256.size());
+    preimage.append(domain.data(), domain.size());
+    preimage.push_back('\0');
+    preimage.append(keyId.data(), keyId.size());
+    preimage.push_back('\0');
+    preimage.append(sha256);
+
+    std::vector<unsigned char> signedMessage(signature.size() + preimage.size());
     std::copy(signature.begin(), signature.end(), signedMessage.begin());
-    std::copy(sha256.begin(), sha256.end(), signedMessage.begin() + signature.size());
+    std::copy(preimage.begin(), preimage.end(), signedMessage.begin() + signature.size());
     std::vector<unsigned char> opened(signedMessage.size());
     unsigned long long openedLength = 0;
     return crypto_sign_open(opened.data(), &openedLength, signedMessage.data(),
                             static_cast<unsigned long long>(signedMessage.size()),
-                            entitlement::kEmbeddedPublicKey.data()) == 0 &&
-           openedLength == sha256.size() &&
+                            key->publicKey.data()) == 0 &&
+           openedLength == preimage.size() &&
            std::equal(opened.begin(), opened.begin() + static_cast<std::ptrdiff_t>(openedLength),
-                      sha256.begin());
+                      preimage.begin());
 }
 
 std::string platformName() {
@@ -318,17 +336,21 @@ bool manifestFromJson(const std::string& body, Manifest& out, std::string& error
         const json value = json::parse(body);
         out.version = value.at("version").get<std::string>();
         out.minSupported = value.at("min_supported").get<std::string>();
+        out.keyId = value.at("key_id").get<std::string>();
         out.sha256 = value.at("sha256").get<std::string>();
         out.size = value.at("size").get<std::uint64_t>();
         out.signature = value.at("signature").get<std::string>();
         out.notesUrl = value.at("notes_url").get<std::string>();
         out.url = value.value("url", std::string());
         if (!parseVersion(out.version) || !parseVersion(out.minSupported) ||
-            out.sha256.size() != 64 || out.size == 0 || out.signature.empty())
+            out.keyId.empty() || out.sha256.size() != 64 || out.size == 0 ||
+            out.signature.empty())
             throw std::runtime_error("invalid manifest fields");
         if (!std::all_of(out.sha256.begin(), out.sha256.end(), [](char c) {
                 return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
             })) throw std::runtime_error("invalid manifest digest");
+        if (!security::release::findKey(out.keyId))
+            throw std::runtime_error("unknown release key id");
         return true;
     } catch (const std::exception& exc) {
         error = std::string("invalid release manifest: ") + exc.what();
@@ -359,6 +381,80 @@ bool canReplaceInstall(const std::filesystem::path& executable) {
     return ok;
 #endif
 }
+
+#if !defined(_WIN32)
+bool runExtractor(const std::filesystem::path& artifact,
+                  const std::filesystem::path& destination,
+                  std::string& error) {
+    const pid_t child = ::fork();
+    if (child < 0) {
+        error = "could not start update payload inspector: " + std::string(std::strerror(errno));
+        return false;
+    }
+    if (child == 0) {
+#if defined(__APPLE__)
+        ::execl("/usr/bin/ditto", "ditto", "-x", "-k", artifact.c_str(),
+                destination.c_str(), static_cast<char*>(nullptr));
+#else
+        if (::chdir(destination.c_str()) == 0) {
+            ::execl(artifact.c_str(), artifact.c_str(), "--appimage-extract",
+                    static_cast<char*>(nullptr));
+        }
+#endif
+        ::_exit(127);
+    }
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        error = "waiting for update payload inspector failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        error = "update artifact could not be safely inspected";
+        return false;
+    }
+    return true;
+}
+
+bool verifyInnerPayload(const std::filesystem::path& artifact, std::string& error) {
+    const auto base = std::filesystem::temp_directory_path() /
+        ("chudware-update-inspect-" + std::to_string(static_cast<long long>(::getpid())) +
+         "-" + std::to_string(Clock::now().time_since_epoch().count()));
+    std::error_code ec;
+    if (!std::filesystem::create_directory(base, ec)) {
+        error = "could not create private update inspection directory: " + ec.message();
+        return false;
+    }
+    (void)::chmod(base.c_str(), 0700);
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
+    } cleanup{base};
+
+    if (!runExtractor(artifact, base, error)) return false;
+#if defined(__APPLE__)
+    const auto root = base / "Chudware.app";
+#else
+    const auto root = base / "squashfs-root";
+#endif
+    const auto manifest = root / "payload-manifest.v1.json";
+    const auto signature = root / "payload-manifest.v1.sig";
+    if (!std::filesystem::is_directory(root) ||
+        !std::filesystem::is_regular_file(manifest) ||
+        !std::filesystem::is_regular_file(signature)) {
+        error = "update artifact does not contain a signed payload manifest";
+        return false;
+    }
+    const security::IntegrityResult result = security::verifyPayloadManifest(
+        root, manifest, signature, security::VerifyMode::Full);
+    if (!result.ok) {
+        error = "inner payload integrity failed (" +
+            std::string(security::integrityReasonName(result.reason)) + "): " + result.detail;
+        return false;
+    }
+    return true;
+}
+#endif
 
 }  // namespace
 
@@ -418,7 +514,7 @@ struct Updater::Impl {
     }
 
     bool reportOnce(const Manifest& manifest, const std::string& message) {
-        const std::string fingerprint = manifest.sha256 + ":" + manifest.signature;
+        const std::string fingerprint = manifest.keyId + ":" + manifest.sha256 + ":" + manifest.signature;
         std::lock_guard<std::mutex> lock(mutex);
         if (!reported.insert(fingerprint).second) return false;
         std::filesystem::create_directories(updateDir());
@@ -462,7 +558,9 @@ struct Updater::Impl {
                     const std::string digest = hexDigest(sha.finish());
                     if (digest != manifest.sha256)
                         error = "downloaded update SHA-256 does not match manifest";
-                    else if (!signatureValid(digest, manifest.signature))
+                    else if (!security::release::findKey(manifest.keyId))
+                        error = "downloaded update release key id is unknown";
+                    else if (!signatureValid(digest, manifest.keyId, manifest.signature))
                         error = "downloaded update Ed25519 signature is invalid";
                     else
                         return true;
@@ -480,7 +578,7 @@ struct Updater::Impl {
     bool writeStagedMetadata(const Manifest& manifest, const std::filesystem::path& artifact,
                              std::string& error) {
         const json value = {{"version", manifest.version}, {"min_supported", manifest.minSupported},
-            {"sha256", manifest.sha256}, {"size", manifest.size},
+            {"key_id", manifest.keyId}, {"sha256", manifest.sha256}, {"size", manifest.size},
             {"signature", manifest.signature}, {"notes_url", manifest.notesUrl},
             {"url", manifest.url}, {"artifact", artifact.filename().string()}};
         const auto temporary = stagedMetadata().string() + ".tmp";
@@ -506,6 +604,21 @@ struct Updater::Impl {
     bool verifyAndStage(const Manifest& manifest, const std::filesystem::path& downloaded,
                         std::string& error) {
         if (!verifyFile(manifest, downloaded, error, true)) return false;
+#if !defined(_WIN32)
+        // Developer unit fixtures intentionally exercise only the outer artifact
+        // signature. Network downloads and every production build must carry a
+        // complete, inspectable signed payload.
+#ifdef CHUDWARE_DEVELOPER_BUILD
+        const bool requireInnerPayload = !manifest.url.empty();
+#else
+        constexpr bool requireInnerPayload = true;
+#endif
+        if (requireInnerPayload && !verifyInnerPayload(downloaded, error)) {
+            std::filesystem::remove(downloaded);
+            reportOnce(manifest, error);
+            return false;
+        }
+#endif
         std::filesystem::create_directories(updateDir());
         const auto staged = updateDir() / artifactName(manifest.version);
         std::error_code ec;
@@ -580,6 +693,10 @@ struct Updater::Impl {
         if (!WinHttpCrackUrl(url.c_str(), static_cast<DWORD>(url.size()), 0, &uc)) {
             error = "WinHttpCrackUrl failed"; return false;
         }
+        if (uc.nScheme != INTERNET_SCHEME_HTTPS) {
+            error = "update artifact URL must use HTTPS";
+            return false;
+        }
         std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
         std::wstring path(uc.lpszUrlPath, uc.dwUrlPathLength);
         if (uc.dwExtraInfoLength) path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
@@ -587,8 +704,7 @@ struct Updater::Impl {
                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
         Handle connection{session ? WinHttpConnect(session, host.c_str(), uc.nPort, 0) : nullptr};
         Handle request{connection ? WinHttpOpenRequest(connection, L"GET", path.c_str(), nullptr,
-            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-            uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : nullptr};
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr};
         if (!session || !connection || !request ||
             !WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
@@ -632,7 +748,12 @@ struct Updater::Impl {
         curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, &curlProgress);
         curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &sink);
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-        curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https,http");
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#ifdef CHUDWARE_DEVELOPER_BUILD
+        if (const char* caFile = std::getenv("CHUDWARE_UPDATE_CA_FILE"); caFile && *caFile)
+            curl_easy_setopt(curl, CURLOPT_CAINFO, caFile);
+#endif
         const CURLcode rc = curl_easy_perform(curl);
         long status = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
@@ -788,6 +909,7 @@ ApplyResult Updater::applyStagedBeforeWindow() {
             const json value = json::parse(std::ifstream(impl_->stagedMetadata()));
             manifest.version = value.at("version").get<std::string>();
             manifest.minSupported = value.at("min_supported").get<std::string>();
+            manifest.keyId = value.at("key_id").get<std::string>();
             manifest.sha256 = value.at("sha256").get<std::string>();
             manifest.size = value.at("size").get<std::uint64_t>();
             manifest.signature = value.at("signature").get<std::string>();

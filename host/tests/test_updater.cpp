@@ -1,4 +1,5 @@
 #include "update/updater.h"
+#include "update/windows_update_helper.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -9,6 +10,8 @@
 namespace fs = std::filesystem;
 using chudware::update::Manifest;
 using chudware::update::Updater;
+using chudware::update::ApplyResult;
+using chudware::update::applyPlatformArtifact;
 
 namespace {
 
@@ -34,6 +37,7 @@ Manifest corruptManifest() {
     Manifest value;
     value.version = "1.2.0";
     value.minSupported = "1.0.0";
+    value.keyId = "release-v1";
     value.sha256 = std::string(64, '0');
     value.size = 22;
     value.signature = std::string(88, 'A');
@@ -46,12 +50,34 @@ Manifest wrongKeyManifest() {
     Manifest value;
     value.version = "1.2.1";
     value.minSupported = "1.0.0";
+    value.keyId = "release-v1";
     value.sha256 = "45ac4000573891c15d2f881d944f9c98234332693bae7c1410aa2c14ed8a209f";
     value.size = 22;
-    // A real Ed25519 signature over the 64 lowercase digest bytes, produced by
-    // private seed 000102...1f. Its public key is intentionally NOT Chudware's.
+    // A real Ed25519 signature over the legacy bare digest, produced by
+    // private seed 000102...1f. It must not verify under the artifact-v1 domain.
     value.signature = "UHkVz77DialONbSu3wW4Mk0gV2xyyEnAYDbqJpdNe0eLrGwUXBw8HI2AlL8qZ/8eGd/bgvgXVRXsAGTiVFDJCg==";
     value.notesUrl = "https://chudware.com/releases/1.2.1";
+    return value;
+}
+
+#ifdef CHUDWARE_DEVELOPER_BUILD
+Manifest validDomainManifest() {
+    Manifest value;
+    value.version = "1.2.2";
+    value.minSupported = "1.0.0";
+    value.keyId = "dev-test-v1";
+    value.sha256 = "45ac4000573891c15d2f881d944f9c98234332693bae7c1410aa2c14ed8a209f";
+    value.size = 22;
+    value.signature = "87lx6JNOomUKj2m3U0IlXc8zj4Msxq1hyC23kFkb0f/veyakI4BU+uBwWa6iUaj+Ve0oNkuXqdAPpCuwJxcvCQ==";
+    value.notesUrl = "https://chudware.com/releases/1.2.2";
+    return value;
+}
+#endif
+
+Manifest unknownKeyManifest() {
+    Manifest value = wrongKeyManifest();
+    value.version = "1.2.3";
+    value.keyId = "unknown-release-key";
     return value;
 }
 
@@ -80,6 +106,16 @@ void localSecurityTests(const fs::path& root) {
     updater.configure("1.0.0", root / "data", running);
     std::string error;
 
+#ifdef CHUDWARE_DEVELOPER_BUILD
+    const fs::path valid = root / "valid.download";
+    writeFile(valid, "signed artifact bytes\n");
+    require(updater.verifyAndStageDownloaded(validDomainManifest(), valid, &error),
+            "artifact-v1 domain signature with known key id must verify");
+    require(readFile(root / "data/updates/staged.json").find("\"key_id\":\"dev-test-v1\"") != std::string::npos,
+            "staged metadata must retain the verified release key id");
+    fs::remove_all(root / "data/updates");
+#endif
+
     const fs::path corrupt = root / "corrupt.download";
     writeFile(corrupt, "signed artifact bytes\n");
     require(!updater.verifyAndStageDownloaded(corruptManifest(), corrupt, &error),
@@ -107,11 +143,86 @@ void localSecurityTests(const fs::path& root) {
     require(updater.snapshot().reportSerial == 2,
             "same wrong-key artifact must not be reported every retry loop");
 
+    const fs::path unknown = root / "unknown-key.download";
+    writeFile(unknown, "signed artifact bytes\n");
+    require(!updater.verifyAndStageDownloaded(unknownKeyManifest(), unknown, &error),
+            "unknown release key id must be rejected");
+    require(error.find("key id") != std::string::npos,
+            "unknown-key rejection must name the release key id");
+    require(!fs::exists(unknown), "unknown-key artifact must be deleted");
+    require(updater.snapshot().reportSerial == 3,
+            "unknown release key id must be reported once");
+
     require(readFile(running) == original, "running application was modified before verification");
     require(!fs::exists(root / "data/updates/staged.json"),
             "rejected artifact must never create staged metadata");
     std::cout << "security: corrupt=rejected+deleted+reported-once wrong-key=rejected+deleted+reported-once running-app=untouched\n";
 }
+#if defined(__linux__)
+void linuxInnerManifestFailureTest(const fs::path& root) {
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path running = root / "installed.AppImage";
+    const std::string original = "RUNNING APP MUST STAY UNTOUCHED\n";
+    writeFile(running, original);
+
+    const fs::path staged = root / "staged.AppImage";
+    const std::string manifest =
+        "{\"arch\":\"x86_64\",\"created_at\":\"2026-08-12T00:00:00Z\","
+        "\"files\":[],\"key_id\":\"dev-test-v1\",\"platform\":\"linux\","
+        "\"product\":\"Chudware\",\"schema\":\"chudware-payload-v1\","
+        "\"version\":\"1.2.3\"}";
+    writeFile(staged,
+              "#!/bin/sh\n"
+              "[ \"$1\" = --appimage-extract ] || exit 2\n"
+              "mkdir -p squashfs-root/usr/bin\n"
+              "cat > squashfs-root/payload-manifest.v1.json <<'EOF'\n" + manifest +
+              "\nEOF\n"
+              "printf '%s' 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==' > squashfs-root/payload-manifest.v1.sig\n"
+              "exit 0\n");
+    fs::permissions(staged, fs::perms::owner_exec | fs::perms::owner_read |
+                            fs::perms::owner_write);
+
+    std::string error;
+    require(applyPlatformArtifact(staged, running, "1.2.3", &error) ==
+                ApplyResult::Rejected,
+            "invalid inner AppImage signature must be rejected before replacement");
+    require(error.find("payload verification failed") != std::string::npos,
+            "inner AppImage rejection must identify payload verification");
+    require(readFile(running) == original,
+            "invalid inner AppImage manifest touched installed application");
+    require(!fs::exists(running.string() + ".update"),
+            "invalid inner AppImage manifest created a replacement file");
+    std::cout << "linux-inner-security: invalid-signature=rejected running-app=untouched\n";
+}
+#endif
+
+
+#if defined(_WIN32)
+void windowsRollbackTests(const fs::path& root) {
+    const fs::path install = root / "rollback-install";
+    const fs::path rollback = root / "rollback-copy";
+    fs::create_directories(install);
+    fs::create_directories(rollback);
+    writeFile(install / "owned.exe", "changed");
+    writeFile(install / "unowned.txt", "leave me");
+    writeFile(install / "new-owned.dll", "new file");
+    writeFile(rollback / "owned.exe", "original");
+    const fs::path state = root / "rollback-state.json";
+    writeFile(state,
+              R"({"files":[{"path":"owned.exe","existed":true},{"path":"new-owned.dll","existed":false}]})");
+    std::string error;
+    require(chudware::update::testing::restoreWindowsSnapshotForTest(
+                install, rollback, state, &error),
+            "Windows rollback must restore a valid snapshot");
+    require(readFile(install / "owned.exe") == "original",
+            "Windows rollback must restore exact owned bytes");
+    require(!fs::exists(install / "new-owned.dll"),
+            "Windows rollback must remove newly installed owned files");
+    require(readFile(install / "unowned.txt") == "leave me",
+            "Windows rollback must never alter unowned files");
+}
+#endif
 
 void servedSecurityTest(const std::string& kind, const std::string& url,
                         const fs::path& root) {
@@ -142,14 +253,18 @@ void servedSecurityTest(const std::string& kind, const std::string& url,
 
 int main(int argc, char** argv) {
     versionTests();
-    if (argc == 4 && std::string(argv[1]) == "--served") {
-        const std::string url = argv[2];
-        const std::string kind = url.find("wrong-key") != std::string::npos
-            ? "wrong-key" : "corrupt";
-        servedSecurityTest(kind, url, argv[3]);
+    if (argc == 5 && std::string(argv[1]) == "--served") {
+        servedSecurityTest(argv[2], argv[3], argv[4]);
     } else {
         localSecurityTests(fs::temp_directory_path() / "chudware-updater-test");
     }
+#if defined(__linux__)
+        linuxInnerManifestFailureTest(fs::temp_directory_path() /
+                                      "chudware-updater-inner-test");
+#endif
+#if defined(_WIN32)
+        windowsRollbackTests(fs::temp_directory_path() / "chudware-updater-test");
+#endif
     std::cout << "versions: semver+prerelease+0.0.0+min-supported=ok\n";
     return 0;
 }

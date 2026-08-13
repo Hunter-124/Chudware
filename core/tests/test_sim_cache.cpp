@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -21,6 +22,7 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <miniz.h>
 
 #include "environment_test_support.h"
 #include "doc/stepplus.h"
@@ -112,6 +114,28 @@ fs::path tmp_path(const std::string& name) {
 }
 
 }  // namespace
+void write_zip(const fs::path& path,
+               const std::vector<std::pair<std::string, std::string>>& entries) {
+    mz_zip_archive zip{};
+    REQUIRE(mz_zip_writer_init_file(&zip, path.string().c_str(), 0));
+    for (const auto& [name, data] : entries) {
+        REQUIRE(mz_zip_writer_add_mem(&zip, name.c_str(), data.data(), data.size(),
+                                      MZ_DEFAULT_COMPRESSION));
+    }
+    REQUIRE(mz_zip_writer_finalize_archive(&zip));
+    REQUIRE(mz_zip_writer_end(&zip));
+}
+
+void check_stepplus_limit(const fs::path& path, const std::string& expected) {
+    try {
+        (void)chudware::doc::stepplus_open(path.string());
+        FAIL("malicious archive was accepted");
+    } catch (const std::exception& e) {
+        CHECK(std::string(e.what()).find(expected) != std::string::npos);
+    }
+    std::error_code ec;
+    fs::remove(path, ec);
+}
 
 struct EnvGuard {
     std::string name;
@@ -393,6 +417,40 @@ TEST_CASE("sim_cache: .step+ save->reopen restores study result") {
     fs::remove(path, ec);
     std::printf("[sim_cache] .step+ study result round-trip OK (input_hash=%s)\n",
                 input_hash.c_str());
+}
+
+TEST_CASE("stepplus rejects excessive compression before extraction") {
+    const fs::path path = tmp_path("compression_bomb.step+");
+    write_zip(path, {{"meta.json", R"({"container":"aicad.step+/1"})"},
+                     {"document.json", R"({"schema":"aicad.part/1"})"},
+                     {"bomb.bin", std::string(8 * 1024 * 1024, 'A')}});
+    check_stepplus_limit(path, "compression ratio limit");
+}
+
+TEST_CASE("stepplus rejects excessive archive entry count before extraction") {
+    const fs::path path = tmp_path("entry_count_bomb.step+");
+    std::vector<std::pair<std::string, std::string>> entries;
+    entries.reserve(4097);
+    for (int i = 0; i < 4097; ++i) entries.emplace_back("e/" + std::to_string(i), "x");
+    write_zip(path, entries);
+    check_stepplus_limit(path, "entry count limit");
+}
+
+TEST_CASE("stepplus rejects excessive aggregate expansion before extraction") {
+    const fs::path path = tmp_path("aggregate_bomb.step+");
+    std::vector<std::pair<std::string, std::string>> entries;
+    const std::string incompressible_chunk(1024 * 1024, '\0');
+    for (int i = 0; i < 257; ++i) {
+        std::string data = incompressible_chunk;
+        std::uint32_t state = 0x9e3779b9u ^ static_cast<std::uint32_t>(i);
+        for (char& byte : data) {
+            state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+            byte = static_cast<char>(state & 0xffu);
+        }
+        entries.emplace_back("payload/" + std::to_string(i), std::move(data));
+    }
+    write_zip(path, entries);
+    check_stepplus_limit(path, "aggregate expanded byte limit");
 }
 
 TEST_CASE("sim_cache: hash is stable and kind-scoped") {

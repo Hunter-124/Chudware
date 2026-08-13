@@ -46,6 +46,7 @@
 #if !defined(_WIN32)
 #include "util/parent_death.h"
 #endif
+#include "util/platform_paths.h"
 
 namespace chudware {
 namespace agent {
@@ -548,29 +549,31 @@ struct ProviderDeltaGuard {
     }
 };
 
-// ---- Admin turn seam: python worker "agent_admin_turn" RPC --------------------
-// core/hostd/worker_bridge.cpp already owns a persistent "spawn python -m
-// services.worker_main, stdio JSON-RPC" bridge — but it lives in the hostd
-// EXECUTABLE, which dlopens this agent code as a shared library (never the
-// other way around), so nothing in core/agent can reach that singleton across
-// the link boundary. This is a minimal, single-shot client for the ONE method
-// the admin branch needs (services/agent/worker_rpc.py:_agent_admin_turn),
-// mirroring the fork/pipe/PDEATHSIG idiom already used in this same static
-// library by OmpBridgeClient (agent/omp_bridge_client.cpp) and by hostd's
-// WorkerBridge. POSIX only; Windows always reports unavailable so the caller
-// falls back to the existing blocked response (never a build break, never a
-// crash — see call sites below).
+// ---- Admin turn seam: services worker "agent_admin_turn" RPC ----------------
+// core/hostd/worker_bridge.cpp already owns a persistent worker bridge, but it lives in the
+// hostd executable, which dlopens this agent code as a shared library (never the other way
+// around), so nothing in core/agent can reach that singleton across the link boundary. This
+// is a minimal, single-shot client for the one method the admin branch needs, mirroring the
+// fork/pipe/PDEATHSIG idiom used by OmpBridgeClient and hostd's WorkerBridge. Packaged builds
+// require CHUDWARE_WORKER_BIN; developer builds retain Python source execution. POSIX only;
+// Windows reports unavailable so the caller falls back to the existing blocked response.
 #if !defined(_WIN32)
 bool admin_worker_file_exists(const std::string& p) {
     std::error_code ec;
     return std::filesystem::is_regular_file(p, ec);
 }
 
-// Resolves the same way hostd's WorkerBridge does (CHUDWARE_PYTHON override ->
-// provisioned runtime venv -> system python3 -> bare "python3" for execlp's PATH
-// search) so behaviour is identical whether the worker is reached from hostd or
-// from here.
-std::string admin_worker_python_bin() {
+// Packaged builds derive the canonical adjacent worker from the current executable and reject
+// non-adjacent inherited overrides. Developer builds retain compiled overrides and Python.
+std::string admin_worker_bin(bool& compiled, std::string& err) {
+#ifdef CHUDWARE_DEVELOPER_BUILD
+    if (const char* env = std::getenv("CHUDWARE_WORKER_BIN"); env && *env) {
+        compiled = true;
+        std::error_code ec;
+        const std::string path = std::filesystem::weakly_canonical(env, ec).string();
+        return ec ? std::string(env) : path;
+    }
+    compiled = false;
     if (const char* env = std::getenv("CHUDWARE_PYTHON"); env && *env) return std::string(env);
     const char* home_c = std::getenv("HOME");
     const std::string home = home_c ? home_c : "";
@@ -580,7 +583,37 @@ std::string admin_worker_python_bin() {
     }
     for (const char* cand : {"/usr/bin/python3", "/usr/local/bin/python3", "/usr/bin/python"})
         if (admin_worker_file_exists(cand)) return cand;
-    return "python3";  // execlp PATH search in the forked child
+    return "python3";
+#else
+    compiled = true;
+    const std::string executable = platform::executablePath();
+    if (executable.empty()) {
+        err = "could not resolve the current executable path";
+        return {};
+    }
+#ifdef _WIN32
+    constexpr const char* name = "chudware-worker.exe";
+#else
+    constexpr const char* name = "chudware-worker";
+#endif
+    std::error_code ec;
+    const std::string adjacent = std::filesystem::weakly_canonical(
+                                     std::filesystem::path(executable).parent_path() / name, ec)
+                                     .string();
+    if (ec) {
+        err = "could not canonicalize adjacent worker path";
+        return {};
+    }
+    if (const char* env = std::getenv("CHUDWARE_WORKER_BIN"); env && *env) {
+        std::error_code envEc;
+        const auto supplied = std::filesystem::weakly_canonical(env, envEc);
+        if (envEc || supplied != std::filesystem::path(adjacent)) {
+            err = "CHUDWARE_WORKER_BIN must name the adjacent packaged worker";
+            return {};
+        }
+    }
+    return adjacent;
+#endif
 }
 
 std::string admin_worker_repo_root() {
@@ -589,7 +622,7 @@ std::string admin_worker_repo_root() {
     return home_c ? std::string(home_c) + "/Repositories/CAD" : std::string(".");
 }
 
-// Spawns `python -m services.worker_main`, sends ONE
+// Spawns the services worker, sends ONE
 // {"id":1,"method":"agent_admin_turn",...} line carrying the request text, run_id,
 // resolved provider descriptor, workspace_dir, session identity, the prior-turn
 // `history`, and the turn's `attachments` array (pasted images / attached files, as
@@ -618,12 +651,21 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
                             const json& history, const json& attachments,
                             const json& chudware_actor, RunEvents& events, json& turn_out,
                             std::string& err, bool& crashed, bool& timed_out) {
-    const std::string python = admin_worker_python_bin();
-    if (python.find('/') != std::string::npos && !admin_worker_file_exists(python)) {
-        err = "python runtime not found at " + python;
+    bool compiled_worker = false;
+    const std::string worker_bin = admin_worker_bin(compiled_worker, err);
+    if (worker_bin.empty()) {
+        if (err.empty()) err = "worker launcher unavailable";
         return false;
     }
-    const std::string repo = admin_worker_repo_root();
+    if ((compiled_worker || worker_bin.find('/') != std::string::npos) &&
+        !admin_worker_file_exists(worker_bin)) {
+        err = (compiled_worker ? "compiled worker not found at " : "python runtime not found at ") +
+              worker_bin;
+        return false;
+    }
+    const std::string repo = compiled_worker
+                                 ? std::filesystem::path(worker_bin).parent_path().string()
+                                 : admin_worker_repo_root();
 
     int out_pipe[2], in_pipe[2], err_pipe[2];
     if (::pipe(out_pipe) != 0 || ::pipe(in_pipe) != 0 || ::pipe(err_pipe) != 0) {
@@ -649,7 +691,11 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
         ::close(err_pipe[0]); ::close(err_pipe[1]);
         platform::closeInheritedFds(3);  // never leak the host process's own fds into the worker
         if (!repo.empty()) { if (::chdir(repo.c_str()) != 0) { /* exec from cwd; worker import fails clearly */ } }
-        ::execlp(python.c_str(), python.c_str(), "-m", "services.worker_main", (char*)nullptr);
+        if (compiled_worker)
+            ::execlp(worker_bin.c_str(), worker_bin.c_str(), "--module", "worker", (char*)nullptr);
+        else
+            ::execlp(worker_bin.c_str(), worker_bin.c_str(), "-m", "services.worker_main",
+                     (char*)nullptr);
         _exit(127);
     }
     ::setpgid(pid, pid);
@@ -740,11 +786,11 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     // omitted rather than sent as "" so the worker's "caller supplied nothing" branch
     // stays distinguishable from "caller supplied a blank".
     json params{{"request", request}, {"run_id", run_id}, {"role", "general_agent"}};
-    // The user's project/workspace dir (agent_workspace_dir(options)): the python
-    // worker jails fs_* on CHUDWARE_FS_ROOT and chdirs here so file work lands in
-    // the user's folder instead of the CAD source repo checkout.
+    // The user's project/workspace dir (agent_workspace_dir(options)): the services worker
+    // jails fs_* on CHUDWARE_FS_ROOT and chdirs here so file work lands in the user's folder
+    // instead of the application install or developer checkout.
     if (!workspace_dir.empty()) params["workspace_dir"] = workspace_dir;
-    // Bind the python worker's lossless sub-agent raw transcripts to the owning GUI
+    // Bind the services worker's lossless sub-agent raw transcripts to the owning GUI
     // conversation. Empty identity is omitted, matching workspace/history semantics.
     if (!session_id.empty()) params["session_id"] = session_id;
     if (!sessions_dir.empty()) params["sessions_dir"] = sessions_dir;
@@ -814,7 +860,7 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     bool ok_final = false;
     // Stop button: run_design registered this run's RunControl and pointed the
     // provider cancel flag at it before entering the pre-flight branch, but the
-    // python worker cannot observe that flag across the process boundary — THIS
+    // worker sidecar cannot observe that flag across the process boundary — THIS
     // loop is the cancellation point. Poll it every iteration (200ms poll tick);
     // on cancel, hard-kill the worker's process group so the output stream dies
     // immediately instead of streaming on for up to 5 minutes.
@@ -1093,7 +1139,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // (which turned each admin step into an extruded plate). is_general_work_request
     // survives only as an ADVISORY label for the Routing card, never a gate.
     //
-    // OFFLINE is the one exception: the python worker turn needs a provider, so an
+    // OFFLINE is the one exception: the services worker turn needs a provider, so an
     // offline top-level run keeps the old deterministic split — general work is
     // blocked (nothing can run it), and an offline-safe local modeling run falls
     // through to the C++ pipeline below. Sub-runs are exempt everywhere: their
@@ -1161,7 +1207,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
         // Execute instead of refuse: hand the request to a bounded general_agent
         // role turn (fs/plm/shell + on-demand modeling/sketch/sim/... tool packs
-        // via enable_tools) over the python worker's agent_admin_turn RPC
+        // via enable_tools) over the services worker's agent_admin_turn RPC
         // (services/agent/worker_rpc.py), threading the caller's resolved provider
         // descriptor through so the worker runs the provider the user picked. Any
         // failure to reach/complete it (worker unavailable, spawn failure, timeout,

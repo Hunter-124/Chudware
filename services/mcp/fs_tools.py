@@ -62,53 +62,34 @@ from typing import Any, Optional
 
 # --------------------------------------------------------------------------- scoping
 
-# Directories that are NEVER readable/writable/listable through these tools, no matter
-# what allow-list or CHUDWARE_FS_ROOT policy is active — credentials/keys an AI role has
-# no legitimate reason to touch. Matched as "resolved path is this dir or lives under it".
+# Directories/files that are NEVER reachable through these tools.  The check is
+# applied to the fully resolved target and to every descendant discovered by a
+# recursive operation, so a symlink or an innocuous parent cannot hide a secret.
 _SENSITIVE_DIR_NAMES = (
     ".ssh", ".aws", ".gnupg", ".gcloud", ".azure", ".kube", ".docker",
+    "keyrings", "credentials",
 )
 _SENSITIVE_FILE_NAMES = (
     ".netrc", ".git-credentials", ".npmrc", ".pypirc", "id_rsa", "id_ed25519",
 )
 
 
-def _sensitive_block(raw_path: str) -> Optional[dict]:
-    """Refuse if *raw_path* resolves into a credential store. Applies to every fs_*
-    tool (read included) regardless of allow-list/root policy — see module docstring."""
-    try:
-        resolved = Path(raw_path).expanduser().resolve(strict=False)
-    except Exception:  # noqa: BLE001
-        return None  # unresolvable path — let the normal not_found path report it
-    parts = resolved.parts
-    if resolved.name in _SENSITIVE_FILE_NAMES or any(p in _SENSITIVE_DIR_NAMES for p in parts):
-        return _err("blocked_sensitive_path",
-                    f"{raw_path} resolves into a credential/key location and is never "
-                    "readable or writable through these tools")
-    return None
-
-
 def _workspace_root() -> Optional[Path]:
-    """The active jail root for write-class tools, or None (no jail — default)."""
+    """Return the canonical mandatory filesystem jail, or ``None`` to fail closed."""
     raw = os.environ.get("CHUDWARE_FS_ROOT", "").strip()
     if not raw:
         return None
-    return Path(raw).expanduser().resolve(strict=False)
+    try:
+        root = Path(raw).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    return root if root.is_dir() else None
 
 
 def _firmware_project_redirect(raw_path: str) -> Optional[str]:
-    """Hint text when *raw_path* lands inside a firmware project root this process knows
-    about, else None.
-
-    A firmware project (fw_new_project) is scaffolded under firmware_root(), which is
-    outside any CHUDWARE_FS_ROOT workspace — so authoring its sources through fs_write is
-    refused. That refusal used to be a DEAD END: the agent was told "outside the active
-    project root" and nothing more, so it wrote the .c files into the workspace instead,
-    where the firmware build never sees them. The jail stays exactly as tight; the message
-    now names the tool that does work.
-    """
+    """Hint text when *raw_path* belongs to the separate firmware project store."""
     try:
-        from services.mcp.firmware_tools import project_for_path  # noqa: PLC0415 — avoid import cycle
+        from services.mcp.firmware_tools import project_for_path  # noqa: PLC0415
     except Exception:  # noqa: BLE001
         return None
     hit = project_for_path(raw_path)
@@ -121,26 +102,45 @@ def _firmware_project_redirect(raw_path: str) -> Optional[str]:
             "writes it AND registers it so the next fw_build compiles it")
 
 
-def _root_block(raw_path: str) -> Optional[dict]:
-    """Refuse if *raw_path* falls outside the active CHUDWARE_FS_ROOT jail. Only called
-    from write-class tools (fs_write/fs_edit/run_shell's cwd) — see module docstring."""
-    if os.environ.get("CHUDWARE_FS_ALLOW_OUTSIDE_ROOT", "").strip().lower() in ("1", "true", "yes"):
-        return None
+def _canonical_target(raw_path: str, *, allow_missing: bool = False) -> tuple[Optional[Path], Optional[dict]]:
+    """Resolve *raw_path* once and enforce the mandatory root and secret denylist."""
     root = _workspace_root()
     if root is None:
-        return None
+        return None, _err("workspace_root_unavailable",
+                          "CHUDWARE_FS_ROOT must name an existing directory")
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
     try:
-        resolved = Path(raw_path).expanduser().resolve(strict=False)
-    except Exception:  # noqa: BLE001
-        return None
-    if resolved == root or root in resolved.parents:
-        return None
-    firmware = _firmware_project_redirect(raw_path)
-    if firmware:
-        return _err("use_fw_sources", firmware)
-    return _err("outside_workspace_root",
-                f"{raw_path} resolves outside the active project root ({root}); set "
-                "CHUDWARE_FS_ALLOW_OUTSIDE_ROOT=1 if this write is deliberately cross-root")
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        return None, _err("invalid_path", str(exc))
+    if not allow_missing and not resolved.exists():
+        return None, _err_not_found(str(candidate))
+    if resolved != root and root not in resolved.parents:
+        firmware = _firmware_project_redirect(raw_path)
+        if firmware:
+            return None, _err("use_fw_sources", firmware)
+        return None, _err("outside_workspace_root",
+                          f"{raw_path} resolves outside the active project root ({root})")
+    if resolved.name in _SENSITIVE_FILE_NAMES or any(
+        part in _SENSITIVE_DIR_NAMES for part in resolved.parts
+    ):
+        return None, _err("blocked_sensitive_path",
+                          f"{raw_path} resolves into a credential/key location")
+    return resolved, None
+
+
+def _sensitive_block(raw_path: str) -> Optional[dict]:
+    """Compatibility wrapper for callers that only need the policy result."""
+    _target, blocked = _canonical_target(raw_path, allow_missing=True)
+    return blocked
+
+
+def _root_block(raw_path: str) -> Optional[dict]:
+    """Compatibility wrapper for write and shell callers."""
+    _target, blocked = _canonical_target(raw_path, allow_missing=True)
+    return blocked
 
 # --------------------------------------------------------------------------- envelope
 
@@ -604,38 +604,21 @@ def register_fs_tools(mcp) -> None:
         Returns {ok, path, kind, text, total_lines, shown_lines, truncated, next_offset?}.
         """
         clean, sel = _split_path_selector(path)
-        blocked = _sensitive_block(clean)
+        p, blocked = _canonical_target(clean)
         if blocked:
             return blocked
+        assert p is not None
         ranges = _parse_ranges(sel) if sel else None
         if sel and sel.lower().find("raw") >= 0:
             raw = True
-        p = Path(clean)
-        # Path.exists() is NOT exception-free on every supported interpreter:
-        # CPython 3.12 changed it to swallow OSError, but on 3.11 (the version the
-        # repo-local .venv-mcp runs) a path whose PARENT is chmod 000 raises
-        # PermissionError straight out of pathlib. That escaped fs_read as a raw
-        # traceback instead of a tool envelope, so the same call was clean on one
-        # box and a crash on another. Treat any stat failure as "cannot be seen":
-        # with an unreadable parent we genuinely cannot distinguish absent from
-        # present, and not_found (with no did-you-mean suggestions, since the dir
-        # cannot be listed either) is the honest answer — and matches 3.12+.
-        try:
-            _exists = p.exists()
-        except OSError:
-            _exists = False
-        if not _exists:
-            return _err_not_found(clean)
         if p.is_dir():
-            return _list_dir(clean, show_hidden=raw)
-        kind = _kind_for(clean)
+            return _list_dir(str(p), show_hidden=raw)
+        kind = _kind_for(str(p))
         if kind in CAD_EXTS and (kind in CAD_BINARY_EXTS or not raw):
-            # CAD geometry is read through import_part + describe/measure/inspect, never
-            # dumped as text — redirect BEFORE the binary sniff so the answer teaches.
-            return _cad_redirect(clean, kind)
+            return _cad_redirect(str(p), kind)
         if kind in DOC_EXTS:
-            return _read_document(clean, ranges, offset, limit, raw)
-        return _read_text(clean, ranges, offset, limit, raw)
+            return _read_document(str(p), ranges, offset, limit, raw)
+        return _read_text(str(p), ranges, offset, limit, raw)
 
     @mcp.tool()
     def fs_list(path: str = ".", show_hidden: bool = False) -> dict:
@@ -646,15 +629,13 @@ def register_fs_tools(mcp) -> None:
         call import_part(path=...) for a doc_id and read the model with describe_part /
         measure_part / inspect_part. Risk: read.
         """
-        blocked = _sensitive_block(path)
+        p, blocked = _canonical_target(path)
         if blocked:
             return blocked
-        p = Path(path)
-        if not p.exists():
-            return _err_not_found(path)
+        assert p is not None
         if not p.is_dir():
             return _err("not_a_directory", f"{path} is not a directory")
-        return _list_dir(path, show_hidden)
+        return _list_dir(str(p), show_hidden)
 
     @mcp.tool()
     def fs_glob(pattern: str, path: str = ".", limit: int = 0) -> dict:
@@ -664,15 +645,18 @@ def register_fs_tools(mcp) -> None:
         Any CAD/geometry match is also listed under ``open_with_import_part`` — read those
         with import_part(path=...), never fs_read. Risk: read.
         """
-        blocked = _sensitive_block(path)
+        base, blocked = _canonical_target(path)
         if blocked:
             return blocked
-        base = Path(path)
-        if not base.exists():
-            return _err_not_found(path)
+        assert base is not None
         cap = min(limit if limit > 0 else MAX_GLOB_RESULTS, MAX_GLOB_RESULTS)
+        hits: list[str] = []
         try:
-            hits = [str(m) for m in base.glob(pattern)]
+            for match in base.glob(pattern):
+                resolved, descendant_block = _canonical_target(str(match))
+                if descendant_block or resolved is None:
+                    continue
+                hits.append(str(resolved))
         except Exception as exc:  # noqa: BLE001
             return _err("glob_failed", str(exc))
         try:
@@ -695,19 +679,21 @@ def register_fs_tools(mcp) -> None:
                 max_matches: int = 0) -> dict:
         """Regex-search files under *path* (optionally filtered by *glob*, e.g. '*.py').
         Returns {file, line, text} matches, capped at 500. Risk: read."""
-        blocked = _sensitive_block(path)
+        base, blocked = _canonical_target(path)
         if blocked:
             return blocked
+        assert base is not None
         try:
             rx = re.compile(pattern, re.I if ignore_case else 0)
         except re.error as exc:
             return _err("bad_pattern", str(exc))
-        base = Path(path)
-        if not base.exists():
-            return _err_not_found(path)
         cap = min(max_matches if max_matches > 0 else MAX_GREP_MATCHES, MAX_GREP_MATCHES)
-        files: list[Path] = [base] if base.is_file() else \
-            [p for p in base.rglob(glob or "*") if p.is_file()]
+        files: list[Path] = [base] if base.is_file() else []
+        if base.is_dir():
+            for candidate in base.rglob(glob or "*"):
+                resolved, descendant_block = _canonical_target(str(candidate))
+                if not descendant_block and resolved is not None and resolved.is_file():
+                    files.append(resolved)
         matches: list[dict] = []
         scanned = 0
         truncated = False
@@ -738,13 +724,17 @@ def register_fs_tools(mcp) -> None:
     def fs_write(path: str, content: str, make_dirs: bool = True) -> dict:
         """Create or OVERWRITE a text file with *content*. Parent dirs are created by
         default. Returns {ok, path, bytes}. Risk: write."""
-        blocked = _sensitive_block(path) or _root_block(path)
+        p, blocked = _canonical_target(path, allow_missing=True)
         if blocked:
             return blocked
-        p = Path(path)
+        assert p is not None
         try:
             if make_dirs and p.parent and not p.parent.exists():
                 p.parent.mkdir(parents=True, exist_ok=True)
+            p, blocked = _canonical_target(str(p), allow_missing=True)
+            if blocked:
+                return blocked
+            assert p is not None
             data = content.encode("utf-8")
             p.write_bytes(data)
         except Exception as exc:  # noqa: BLE001
@@ -756,10 +746,10 @@ def register_fs_tools(mcp) -> None:
         """Replace text in an existing file. By default *old* MUST occur exactly once
         (a safe, unambiguous edit); set replace_all=True to replace every occurrence.
         Returns {ok, path, replacements}. Risk: write."""
-        blocked = _sensitive_block(path) or _root_block(path)
+        p, blocked = _canonical_target(path)
         if blocked:
             return blocked
-        p = Path(path)
+        assert p is not None
         if p.is_dir():
             return _err("not_found",
                         f"{path} is a directory, not a file — fs_edit edits files; "

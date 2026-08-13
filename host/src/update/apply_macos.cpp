@@ -1,4 +1,5 @@
 #include "updater.h"
+#include "security/integrity.h"
 
 #if defined(__APPLE__)
 
@@ -71,6 +72,15 @@ ApplyResult applyPlatformArtifact(const std::filesystem::path& verifiedArtifact,
         if (error) *error = "verified update zip does not contain Chudware.app";
         std::filesystem::remove_all(expanded);
         return ApplyResult::Failed;
+    }
+    const auto integrity = security::verifyPayloadManifest(
+        source, source / "payload-manifest.v1.json", source / "payload-manifest.v1.sig",
+        security::VerifyMode::Full, source / "Contents/MacOS/Chudware-bin");
+    if (!integrity.ok) {
+        if (error) *error = "expanded Chudware.app payload verification failed: " +
+                            integrity.detail;
+        std::filesystem::remove_all(expanded);
+        return ApplyResult::Rejected;
     }
 
     const std::filesystem::path script = expanded / "apply-update.sh";

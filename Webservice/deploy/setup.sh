@@ -31,11 +31,8 @@ echo "    workspace: ${WORKSPACE_ROOT}"
 ENV_FILE="${DATA_ROOT}/gateway.env"
 if [[ ! -f "${ENV_FILE}" ]]; then
   cat >"${ENV_FILE}" <<'EOF'
-# chudware-web gateway + cloudflared env — NEVER commit this file.
+# chudware-web gateway env — NEVER commit this file.
 # Filled by Webservice/deploy/cf_provision.py (driver) and/or hand edits.
-
-# Cloudflare tunnel (remotely-managed); from cf_provision / dashboard
-TUNNEL_TOKEN=
 
 # Access JWT verification (team domain + Application Audience AUD tag)
 CHUDWARE_CF_TEAM_DOMAIN=https://bruh234324.cloudflareaccess.com
@@ -57,9 +54,18 @@ CHUDWARE_WEB_SESSION_SECRET=
 # CHUDWARE_WEB_DATA=/home/YOU/chudware-web-data
 EOF
   chmod 600 "${ENV_FILE}"
-  echo "    wrote skeleton ${ENV_FILE} (chmod 600) — fill TUNNEL_TOKEN, CHUDWARE_CF_AUD, CHUDWARE_WEB_SESSION_SECRET"
+  echo "    wrote skeleton ${ENV_FILE} (chmod 600) — fill CHUDWARE_CF_AUD and CHUDWARE_WEB_SESSION_SECRET"
 else
   echo "    keep existing ${ENV_FILE}"
+fi
+
+# cloudflared gets its own least-privilege environment so the tunnel credential
+# is never inherited by uvicorn.
+TUNNEL_ENV_FILE="${DATA_ROOT}/cloudflared.env"
+if [[ ! -f "${TUNNEL_ENV_FILE}" ]]; then
+  printf '# cloudflared only — NEVER commit this file.\nTUNNEL_TOKEN=\n' >"${TUNNEL_ENV_FILE}"
+  chmod 600 "${TUNNEL_ENV_FILE}"
+  echo "    wrote skeleton ${TUNNEL_ENV_FILE} (chmod 600)"
 fi
 
 # --- python venv for gateway -------------------------------------------------
@@ -108,7 +114,7 @@ echo
 echo "==> next steps checklist"
 cat <<EOF
   [ ] SECURITY: rotate Cloudflare API token + R2 keys (leaked in git history) — see RUNBOOK.md §SECURITY
-  [ ] Confirm cf_provision.py wrote TUNNEL_TOKEN + CHUDWARE_CF_AUD into ${ENV_FILE}
+  [ ] Confirm cf_provision.py wrote TUNNEL_TOKEN into ${TUNNEL_ENV_FILE} and CHUDWARE_CF_AUD into ${ENV_FILE}
   [ ] Set CHUDWARE_WEB_SESSION_SECRET in ${ENV_FILE} — REQUIRED; the gateway refuses to
       start without it. Generate with:
       python3 -c 'import secrets;print(secrets.token_urlsafe(48))'

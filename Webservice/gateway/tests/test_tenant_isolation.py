@@ -324,6 +324,48 @@ def test_workspace_disk_quota_enforced(client, monkeypatch):
     assert r.status_code == 200
 
 
+@pytest.mark.parametrize("kind", ["file", "tree"])
+def test_workspace_copy_enforces_quota_without_partial_destination(
+    client, monkeypatch, kind
+):
+    root = _ws_user_root("alice@crimson.ua.edu")
+    root.mkdir(parents=True, exist_ok=True)
+    if kind == "file":
+        (root / "source.bin").write_bytes(b"123456")
+        src, dst = "source.bin", "copied.bin"
+    else:
+        (root / "source" / "nested").mkdir(parents=True)
+        (root / "source" / "nested" / "payload.bin").write_bytes(b"123456")
+        src, dst = "source", "copied"
+
+    trial = plans.PLANS["trial"]
+    monkeypatch.setitem(
+        plans.PLANS,
+        "trial",
+        replace(trial, limits=replace(trial.limits, storage_quota_bytes=10)),
+    )
+    r = client.post(
+        "/workspace/copy", headers=A, json={"src": src, "dst": dst, "recursive": True}
+    )
+    assert r.status_code == 507, r.text
+    assert not (root / dst).exists()
+    assert (root / src).exists()
+
+
+def test_user_slug_distinguishes_max_length_colliding_prefix_emails():
+    prefix = "a" * 118
+    first = f"{prefix}x@example.com"
+    second = f"{prefix}y@example.com"
+    first_slug = user_slug(first)
+    second_slug = user_slug(second)
+    assert first_slug != second_slug
+    assert len(first_slug) <= 120
+    assert len(second_slug) <= 120
+    assert first_slug.startswith("a" * 54 + "~z")
+    assert second_slug.startswith("a" * 54 + "~z")
+    assert user_slug("alice@crimson.ua.edu") == "alice~40crimson.ua.edu"
+
+
 def test_workspace_paths_stay_inside_the_callers_own_root(client):
     """Absolute paths ARE returned — the WASM client needs them to drive
     doc_open (host/src/core/fs_backend.h) — but they may only ever name the

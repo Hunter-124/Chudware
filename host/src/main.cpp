@@ -41,6 +41,8 @@
 #include "worker_client.h"
 #include "util/platform_paths.h"  // executablePath (one spelling per OS)
 #include "update/updater.h"
+#include "security/integrity.h"
+#include "update/windows_update_helper.h"
 
 #ifdef CHUDWARE_ENABLE_CEF
 #include "ui/widgets/cef/cef_app.h"
@@ -539,6 +541,38 @@ int main(int argc, char** argv) {
     }, rc);
     return rc;
 #else
+    const std::filesystem::path executable = chudware::platform::executablePath();
+#ifdef _WIN32
+    {
+        std::string recoveryError;
+        if (!chudware::update::recoverPendingWindowsUpdate(executable, &recoveryError)) {
+            std::fprintf(stderr, "chudware: update recovery failed: %s\n", recoveryError.c_str());
+            return 79;
+        }
+    }
+#endif
+    if (argc == 4 && std::strcmp(argv[1], "--verify-payload-manifest") == 0) {
+        const auto root = chudware::security::installedPayloadRoot(executable);
+        const auto verified = chudware::security::verifyPayloadManifest(
+            root, argv[2], argv[3], chudware::security::VerifyMode::Full, executable);
+        if (!verified.ok) {
+            std::fprintf(stderr, "chudware: payload integrity failed (%s): %s\n",
+                         chudware::security::integrityReasonName(verified.reason),
+                         verified.detail.c_str());
+            return chudware::security::kIntegrityFailureExitCode;
+        }
+        return 0;
+    }
+    {
+        const auto verified = chudware::security::verifyInstalledPayload(
+            executable, chudware::security::VerifyMode::Startup);
+        if (!verified.ok) {
+            std::fprintf(stderr, "chudware: installed payload integrity failed (%s): %s\n",
+                         chudware::security::integrityReasonName(verified.reason),
+                         verified.detail.c_str());
+            return chudware::security::kIntegrityFailureExitCode;
+        }
+    }
     // `chudware --version` — first thing checked, before CEF stashes argv and long
     // before GLFW/X11 or the single-instance lock. Support triage and the installer
     // must be able to read the version out of a binary that cannot start a GUI.

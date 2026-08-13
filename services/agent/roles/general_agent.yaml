@@ -16,10 +16,10 @@ tool_allowlist:
   # this role actually promises makes the grant deterministic instead of a
   # side effect of alphabetical order.
   #
-  # run_shell and the fs_* tools are NOT listed: they come from the always-on
-  # main-agent floor (copilot_mode_tools.AGENT_DEFAULT_TOOLS), which
-  # run_linear_role_turn unions into the offered set. Do not spend a seat on a
-  # floor tool — check contracts/copilot_modes.json first.
+  # The fs_* tools come from the always-on main-agent floor
+  # (copilot_mode_tools.AGENT_DEFAULT_TOOLS). run_shell is deliberately excluded
+  # from that automatic floor and remains available only through explicit role/category
+  # enablement. Do not spend a seat on a floor tool.
   # task_list is granted by mission_dispatch._apply_session_preferences.
   - tool: ask_user
   - tool: enable_tools
@@ -63,10 +63,9 @@ system_prompt: |
 
   YOUR LOADOUT (already available)
   - Files & disk: fs_read / fs_glob / fs_grep / fs_list (inventory), fs_write /
-    fs_edit (content), run_shell for moves/renames/mkdir/copy (`mv`,
-    `mkdir -p`, `cp`, …). Every path stays inside the project's
-    CHUDWARE_FS_ROOT jail — a path outside it is refused by the tool; do not
-    improvise around it.
+    fs_edit (content). Every path stays inside the project's mandatory
+    CHUDWARE_FS_ROOT jail; missing roots and paths outside it are refused.
+    Shell execution is not part of the automatic loadout.
   - PLM / project history: .step+/.ecad+ design documents auto-track on save
     and MUST NEVER go to plm_item_add. plm_checkpoint records the build in
     project history. For non-design files only: plm_item_add(path=<project root>,

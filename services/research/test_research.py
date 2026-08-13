@@ -177,6 +177,56 @@ def test_fetch_page_network_error_degrades():
     assert out["ok"] is False and out["reason"] == "network"
 
 
+def test_fetch_page_rejects_private_targets_before_fetch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fp_mod.socket, "getaddrinfo", lambda *a, **k: calls.append(a) or [])
+    for url in ("https://127.0.0.1/x", "https://[::1]/x",
+                "https://[::ffff:127.0.0.1]/x", "http://example.com/x"):
+        out = research.fetch_page(url)
+        assert out["reason"] == "bad_url", (url, out)
+    assert calls == []
+
+
+def test_public_https_policy_accepts_public_dns(monkeypatch):
+    monkeypatch.setattr(fp_mod.socket, "getaddrinfo", lambda *a, **k: [
+        (fp_mod.socket.AF_INET, fp_mod.socket.SOCK_STREAM, fp_mod.socket.IPPROTO_TCP,
+         "", ("93.184.216.34", 443))
+    ])
+    fp_mod._validate_public_url("https://example.com/path")
+
+
+def test_http_get_revalidates_private_redirect_before_next_connection(monkeypatch):
+    requested = []
+
+    class _Response:
+        is_redirect = True
+        headers = {"location": "https://127.0.0.1/metadata"}
+
+    class _Client:
+        def __init__(self, **kwargs):
+            assert kwargs["follow_redirects"] is False
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return None
+        def get(self, url):
+            requested.append(url)
+            return _Response()
+
+    monkeypatch.setattr(fp_mod.socket, "getaddrinfo", lambda *a, **k: [
+        (fp_mod.socket.AF_INET, fp_mod.socket.SOCK_STREAM, fp_mod.socket.IPPROTO_TCP,
+         "", ("93.184.216.34", 443))
+    ])
+    import httpx
+    monkeypatch.setattr(httpx, "Client", _Client)
+    try:
+        fp_mod._http_get("https://example.com/start")
+        assert False, "private redirect should be refused"
+    except fp_mod.OutboundPolicyError:
+        pass
+    assert requested == ["https://example.com/start"]
+
+
 # --------------------------------------------------------------------------- extraction
 
 

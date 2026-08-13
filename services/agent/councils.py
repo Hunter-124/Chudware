@@ -52,6 +52,8 @@ from typing import Any, Optional
 
 import yaml
 
+from services.agent import protected_assets
+
 # ---------------------------------------------------------------------------
 # T-DP8: Council policy engine imports
 # ---------------------------------------------------------------------------
@@ -81,7 +83,7 @@ _BUILDGRAPH_SEAM_ENABLED = os.environ.get("CHUDWARE_COUNCIL_BUILDGRAPH", "1") !=
 # Read from T-W10 tiers.yaml when merged; else default full per 2026-07-04 amendment.
 _DELIBERATION_DEFAULT = os.environ.get("CHUDWARE_COUNCIL_DELIBERATION", "full")
 
-# Seat personas YAML (authored, canonical — loaded verbatim, never rewritten here).
+# Seat personas: authored YAML in developer runs, canonical compiled data in packages.
 _SEATS_YAML = (
     __import__("pathlib").Path(__file__).resolve().parent
     / "roles" / "council_seats.yaml"
@@ -256,22 +258,27 @@ def resolve_policy(
 
 
 # ---------------------------------------------------------------------------
-# Seats loader — verbatim YAML, never mutated
+# Seats loader — canonical authored data, cached and never mutated
 # ---------------------------------------------------------------------------
 
 def _load_seats() -> dict:
-    """Load council_seats.yaml verbatim (cached after first call)."""
+    """Load the canonical council seats from compiled or developer assets."""
     global _SEATS_CACHE
     if _SEATS_CACHE is not None:
         return _SEATS_CACHE
-    try:
-        raw = _SEATS_YAML.read_text(encoding="utf-8")
-        data = yaml.safe_load(raw)
-    except FileNotFoundError:
-        raise RuntimeError(
-            f"council_seats.yaml not found at {_SEATS_YAML}. "
-            "It is a canonical authored file; check your checkout."
-        )
+    if protected_assets.packaged():
+        raw = protected_assets.role_yaml("council_seats.yaml")
+        if raw is None:
+            raise RuntimeError("compiled council_seats.yaml asset is unavailable")
+        data = json.loads(raw)
+    else:
+        try:
+            data = yaml.safe_load(_SEATS_YAML.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"council_seats.yaml not found at {_SEATS_YAML}. "
+                "It is a canonical authored file; check your checkout."
+            )
     assert data.get("schema") == "aicad.council_seats/1", (
         "council_seats.yaml schema mismatch — expected aicad.council_seats/1"
     )

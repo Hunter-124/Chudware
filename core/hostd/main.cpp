@@ -61,6 +61,7 @@
 #include "tray_icon.h"
 #include "version_info.h"
 #include "util/platform_paths.h"  // executablePath / processAlive (one spelling per OS)
+#include "security/integrity.h"
 #include "worker_bridge.h"
 
 static hostd::Server* g_server = nullptr;
@@ -412,6 +413,15 @@ static int controlCommand(const char* method,
 }
 
 int main(int argc, char** argv) {
+    const std::filesystem::path executable = selfPath();
+    const auto integrity = chudware::security::verifyInstalledPayload(
+        executable, chudware::security::VerifyMode::Startup);
+    if (!integrity.ok) {
+        std::fprintf(stderr, "chudware-hostd: installed payload integrity failed (%s): %s\n",
+                     chudware::security::integrityReasonName(integrity.reason),
+                     integrity.detail.c_str());
+        return chudware::security::kIntegrityFailureExitCode;
+    }
     std::string mode = argc > 1 ? argv[1] : "";
     if (mode == "--version") {
         // ONE line, "chudware-hostd <build-id>", and it must stay that way: two

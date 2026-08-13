@@ -16,20 +16,49 @@ from services.mcp.fs_tools import register_fs_tools, register_shell_tools
 
 
 @pytest.fixture(autouse=True)
-def _no_ambient_jail(monkeypatch):
-    """fs_tools reads its jail policy from the environment, so these tests MUST pin
-    it rather than inherit it.
-
-    Without this, any earlier test that exercised the real
-    worker_rpc._agent_admin_turn (which sets CHUDWARE_FS_ROOT via os.environ, not
-    monkeypatch) left a jail root behind and the write-safety cases failed only
-    when run after it — a pollution that hid until fs and agent tests first shared
-    a session.
-    """
-    for key in ("CHUDWARE_FS_ROOT", "CHUDWARE_FS_ALLOW_OUTSIDE_ROOT",
-                "CHUDWARE_PROJECT_DIR", "CHUDWARE_PROJECT_SAVE_DIR"):
+def _isolated_jail(monkeypatch):
+    """Each test may choose a jail; default to the system temp root for legacy fixtures."""
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", tempfile.gettempdir())
+    for key in ("CHUDWARE_FS_ALLOW_OUTSIDE_ROOT", "CHUDWARE_PROJECT_DIR",
+                "CHUDWARE_PROJECT_SAVE_DIR"):
         monkeypatch.delenv(key, raising=False)
     yield
+def test_fs_tools_block_escape_symlink_and_recursive_secrets(tmp_path, monkeypatch):
+    t = _tools()
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("token")
+    (tmp_path / "escape").symlink_to(outside, target_is_directory=True)
+    assert t["fs_read"](str(outside / "secret.txt"))["reason"] == "outside_workspace_root"
+    assert t["fs_read"]("../outside.txt")["reason"] == "not_found"
+    assert t["fs_read"]("escape/secret.txt")["reason"] == "outside_workspace_root"
+
+    sensitive = tmp_path / ".ssh"
+    sensitive.mkdir()
+    (sensitive / "id_rsa").write_text("private")
+    assert t["fs_read"](".ssh/id_rsa")["reason"] == "blocked_sensitive_path"
+    assert all(".ssh" not in hit for hit in t["fs_glob"]("**/*")["matches"])
+    assert t["fs_grep"]("private")["count"] == 0
+
+
+def test_fs_tools_allow_ordinary_relative_in_root_work(tmp_path, monkeypatch):
+    t = _tools()
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    assert t["fs_write"]("nested/file.txt", "hello")["ok"]
+    assert t["fs_read"]("nested/file.txt")["ok"]
+    assert t["fs_grep"]("hello", path="nested")["count"] == 1
+
+
+def test_fs_tools_fail_closed_without_root(monkeypatch):
+    t = _tools()
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    for name, args in (("fs_read", ("x",)), ("fs_list", (".",)),
+                       ("fs_glob", ("*",)), ("fs_grep", ("x",)),
+                       ("fs_write", ("x", "y")), ("fs_edit", ("x", "a", "b"))):
+        assert t[name](*args)["reason"] == "workspace_root_unavailable"
+
+
 
 
 class _FakeMCP:

@@ -220,6 +220,22 @@ def migration_files(directory: Path | None = None) -> list[Path]:
     return files
 
 
+def _apply_python_migration(cur, version: str) -> bool:
+    """Apply data rewrites that cannot be expressed portably in PostgreSQL SQL."""
+    if version != "0011_session_hashes.sql":
+        return False
+    import hashlib
+
+    cur.execute("SELECT sid FROM sessions")
+    for row in cur.fetchall():
+        sid = row["sid"]
+        if len(sid) == 64 and all(ch in "0123456789abcdef" for ch in sid):
+            continue
+        digest = hashlib.sha256(sid.encode("utf-8")).hexdigest()
+        cur.execute("UPDATE sessions SET sid = %s WHERE sid = %s", (digest, sid))
+    return True
+
+
 def migrate(directory: Path | None = None) -> list[str]:
     """Apply every unapplied migration, in order, under an advisory lock.
 
@@ -254,7 +270,8 @@ def migrate(directory: Path | None = None) -> list[str]:
                 sql = path.read_text(encoding="utf-8")
                 try:
                     with conn.cursor() as cur:
-                        cur.execute(sql)
+                        if not _apply_python_migration(cur, path.name):
+                            cur.execute(sql)
                         cur.execute(
                             "INSERT INTO schema_migrations (version) VALUES (%s)",
                             (path.name,),

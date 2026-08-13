@@ -1,19 +1,122 @@
-// core/agent/omp_bridge_client.cpp — see omp_bridge_client.h. POSIX fork+pipe child talking
-// newline-delimited JSON-RPC to `bun run vendor/omp/bridge/src/bridge.ts`, structurally mirrored
-// on core/hostd/worker_bridge.cpp (the existing Python-worker stdio bridge pattern), but with a
-// background reader thread multiplexing responses instead of serializing request/response pairs
-// behind one lock — see the design note at the top of omp_bridge_client.h.
+// core/agent/omp_bridge_client.cpp — see omp_bridge_client.h. Long-lived newline-delimited
+// JSON-RPC sidecar transport. Packaged builds execute the canonical adjacent bridge directly;
+// developer builds retain explicit overrides and the Bun source bridge. POSIX uses fork/pipe and
+// CreateProcessW with inherited stdio pipes.
 #include "agent/omp_bridge_client.h"
 #include "agent/providers.h"  // provider_cancel_flag() — abort in-flight bridge complete() on Stop
 
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <thread>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "util/platform_paths.h"
 
 #ifdef _WIN32
 
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 namespace chudware {
 namespace agent {
+
+using nlohmann::json;
+
+namespace {
+
+std::wstring widen(const std::string& value) {
+    if (value.empty()) return std::wstring();
+    const int count = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                                          nullptr, 0);
+    if (count <= 0) return std::wstring();
+    std::wstring out(static_cast<size_t>(count), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), out.data(), count);
+    return out;
+}
+
+bool fileExistsWin(const std::string& path) {
+    const DWORD attrs = GetFileAttributesW(widen(path).c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+std::string winError(DWORD code) {
+    char* msg = nullptr;
+    const DWORD count = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                                           FORMAT_MESSAGE_FROM_SYSTEM |
+                                           FORMAT_MESSAGE_IGNORE_INSERTS,
+                                       nullptr, code, 0, reinterpret_cast<char*>(&msg), 0, nullptr);
+    std::string out = count && msg ? std::string(msg, count) : "error " + std::to_string(code);
+    if (msg) LocalFree(msg);
+    while (!out.empty() && (out.back() == '\r' || out.back() == '\n' || out.back() == '.'))
+        out.pop_back();
+    return out;
+}
+
+#ifdef CHUDWARE_DEVELOPER_BUILD
+std::string findRepoRootWin(std::filesystem::path start) {
+    std::error_code ec;
+    for (int i = 0; i < 8 && !start.empty(); ++i) {
+        if (std::filesystem::is_regular_file(
+                start / "vendor" / "omp" / "bridge" / "src" / "bridge.ts", ec))
+            return start.string();
+        const std::filesystem::path parent = start.parent_path();
+        if (parent == start) break;
+        start = parent;
+    }
+    return std::string();
+}
+
+std::string resolveRepoRootWin() {
+    if (const char* env = std::getenv("CHUDWARE_REPO"); env && *env) {
+        if (fileExistsWin(std::string(env) + "/vendor/omp/bridge/src/bridge.ts")) return env;
+    }
+    std::vector<wchar_t> exe(32768);
+    const DWORD count = GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+    if (count > 0 && count < exe.size()) {
+        const std::string found = findRepoRootWin(std::filesystem::path(exe.data()).parent_path());
+        if (!found.empty()) return found;
+    }
+    std::error_code ec;
+    const std::string found = findRepoRootWin(std::filesystem::current_path(ec));
+    if (!found.empty()) return found;
+    if (const char* home = std::getenv("USERPROFILE"); home && *home)
+        return std::string(home) + "/Repositories/CAD";
+    return ".";
+}
+
+std::string resolveBunExeWin() {
+    if (const char* env = std::getenv("CHUDWARE_BUN"); env && *env) return env;
+    if (const char* home = std::getenv("USERPROFILE"); home && *home) {
+        const std::string candidate = std::string(home) + "/.bun/bin/bun.exe";
+        if (fileExistsWin(candidate)) return candidate;
+    }
+    return "bun.exe";
+}
+#endif
+
+bool readerReadLineWin(HANDLE pipe, std::string& buffer, std::string& line) {
+    for (;;) {
+        const size_t newline = buffer.find('\n');
+        if (newline != std::string::npos) {
+            line = buffer.substr(0, newline);
+            buffer.erase(0, newline + 1);
+            return true;
+        }
+        char chunk[4096];
+        DWORD got = 0;
+        if (!ReadFile(pipe, chunk, sizeof(chunk), &got, nullptr) || got == 0) return false;
+        buffer.append(chunk, static_cast<size_t>(got));
+    }
+}
+
+}  // namespace
 
 std::atomic<bool> OmpBridgeClient::created_{false};
 
@@ -23,23 +126,316 @@ OmpBridgeClient& OmpBridgeClient::instance() {
     return inst;
 }
 
-OmpBridgeClient::~OmpBridgeClient() = default;
-
-void OmpBridgeClient::stop() {}
-
 void OmpBridgeClient::shutdownIfCreated() {
     if (created_.load(std::memory_order_relaxed)) instance().stop();
 }
 
-bool OmpBridgeClient::call(const std::string& /*method*/, const nlohmann::json& /*params*/,
-                           nlohmann::json& /*result*/, std::string& err, int /*timeoutMs*/,
-                           OnEvent /*onEvent*/) {
-    err = "omp bridge unavailable on Windows";
-    return false;
+OmpBridgeClient::~OmpBridgeClient() { stop(); }
+
+void OmpBridgeClient::stop() {
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!running_ && !process_ && !job_ && !childStdinWr_ && !childStdoutRd_ &&
+            !reader_.joinable())
+            return;
+        if (childStdinWr_) {
+            CloseHandle(static_cast<HANDLE>(childStdinWr_));
+            childStdinWr_ = nullptr;
+        }
+        if (process_ && WaitForSingleObject(static_cast<HANDLE>(process_), 2000) == WAIT_TIMEOUT) {
+            TerminateProcess(static_cast<HANDLE>(process_), 1);
+        }
+    }
+    if (reader_.joinable()) reader_.join();
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (running_) reap();
 }
 
+void OmpBridgeClient::reap() {
+    if (childStdinWr_) {
+        CloseHandle(static_cast<HANDLE>(childStdinWr_));
+        childStdinWr_ = nullptr;
+    }
+    if (childStdoutRd_) {
+        CloseHandle(static_cast<HANDLE>(childStdoutRd_));
+        childStdoutRd_ = nullptr;
+    }
+    if (process_) {
+        HANDLE process = static_cast<HANDLE>(process_);
+        if (WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
+            TerminateProcess(process, 1);
+            WaitForSingleObject(process, 2000);
+        }
+        CloseHandle(process);
+        process_ = nullptr;
+    }
+    if (job_) {
+        CloseHandle(static_cast<HANDLE>(job_));
+        job_ = nullptr;
+    }
+    running_ = false;
+    if (stderrPump_.joinable()) stderrPump_.join();
+    failAllPending("omp bridge subprocess exited");
+}
+bool OmpBridgeClient::resolvePaths(std::string& err) {
+    if (pathsResolved_) return true;
+#ifdef CHUDWARE_DEVELOPER_BUILD
+    if (const char* env = std::getenv("CHUDWARE_OMP_BRIDGE_BIN"); env && *env) {
+        std::error_code ec;
+        bridgeScript_ = std::filesystem::weakly_canonical(env, ec).string();
+        if (ec) bridgeScript_ = env;
+        compiledBridge_ = true;
+    }
+    if (bridgeScript_.empty()) {
+        bunExe_ = resolveBunExeWin();
+        if (const char* env = std::getenv("CHUDWARE_OMP_BRIDGE"); env && *env)
+            bridgeScript_ = env;
+        else
+            bridgeScript_ = resolveRepoRootWin() + "/vendor/omp/bridge/src/bridge.ts";
+    }
+#else
+    const std::string executable = platform::executablePath();
+    if (executable.empty()) {
+        err = "could not resolve the current executable path";
+        return false;
+    }
+    std::error_code ec;
+    bridgeScript_ = std::filesystem::weakly_canonical(
+                        std::filesystem::path(executable).parent_path() /
+                            "chudware-omp-bridge.exe",
+                        ec)
+                        .string();
+    if (ec) {
+        err = "could not canonicalize adjacent OMP bridge path";
+        return false;
+    }
+    if (const char* env = std::getenv("CHUDWARE_OMP_BRIDGE_BIN"); env && *env) {
+        std::error_code envEc;
+        const auto supplied = std::filesystem::weakly_canonical(env, envEc);
+        if (envEc || supplied != std::filesystem::path(bridgeScript_)) {
+            err = "CHUDWARE_OMP_BRIDGE_BIN must name the adjacent packaged bridge";
+            return false;
+        }
+    }
+    compiledBridge_ = true;
+#endif
+    if (!fileExistsWin(bridgeScript_)) {
+        err = std::string(compiledBridge_ ? "OMP bridge binary not found: "
+                                          : "OMP bridge script not found: ") +
+              bridgeScript_;
+        return false;
+    }
+    if (compiledBridge_)
+        bridgeCwd_ = std::filesystem::path(bridgeScript_).parent_path().string();
+    else
+        vendorOmpDir_ = std::filesystem::path(bridgeScript_)
+                            .parent_path().parent_path().parent_path().string();
+    pathsResolved_ = true;
+    return true;
+}
+
+void OmpBridgeClient::provisionDeps() {
+    // Release bridges are self-contained. Developer workspaces retain their existing Bun
+    // install workflow; platform builders run the locked install before compiling releases.
+}
+
+bool OmpBridgeClient::spawn(std::string& err) {
+    if (!resolvePaths(err)) return false;
+    provisionDeps();
+
+    SECURITY_ATTRIBUTES attrs{};
+    attrs.nLength = sizeof(attrs);
+    attrs.bInheritHandle = TRUE;
+    HANDLE outRead = nullptr, outWrite = nullptr;
+    HANDLE inRead = nullptr, inWrite = nullptr;
+    HANDLE errRead = nullptr, errWrite = nullptr;
+    auto closeIf = [](HANDLE& handle) {
+        if (handle) CloseHandle(handle);
+        handle = nullptr;
+    };
+    if (!CreatePipe(&outRead, &outWrite, &attrs, 0) ||
+        !CreatePipe(&inRead, &inWrite, &attrs, 0) ||
+        !CreatePipe(&errRead, &errWrite, &attrs, 0)) {
+        const DWORD code = GetLastError();
+        closeIf(outRead); closeIf(outWrite); closeIf(inRead); closeIf(inWrite);
+        closeIf(errRead); closeIf(errWrite);
+        err = "CreatePipe failed: " + winError(code);
+        return false;
+    }
+    SetHandleInformation(outRead, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(inWrite, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(errRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = inRead;
+    startup.hStdOutput = outWrite;
+    startup.hStdError = errWrite;
+
+    const std::string launcher = compiledBridge_ ? bridgeScript_ : bunExe_;
+    std::wstring command = L"\"" + widen(launcher) + L"\"";
+    if (!compiledBridge_) command += L" run \"" + widen(bridgeScript_) + L"\"";
+    std::vector<wchar_t> commandBuffer(command.begin(), command.end());
+    commandBuffer.push_back(L'\0');
+    const std::wstring cwd = std::filesystem::path(compiledBridge_ ? bridgeCwd_ : vendorOmpDir_)
+                                 .wstring();
+    const std::wstring application = widen(launcher);
+
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (!job) {
+        const DWORD code = GetLastError();
+        closeIf(outRead); closeIf(outWrite); closeIf(inRead); closeIf(inWrite);
+        closeIf(errRead); closeIf(errWrite);
+        err = "CreateJobObjectW failed: " + winError(code);
+        return false;
+    }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
+                                 sizeof(limits))) {
+        const DWORD code = GetLastError();
+        CloseHandle(job);
+        closeIf(outRead); closeIf(outWrite); closeIf(inRead); closeIf(inWrite);
+        closeIf(errRead); closeIf(errWrite);
+        err = "SetInformationJobObject failed: " + winError(code);
+        return false;
+    }
+
+    PROCESS_INFORMATION process{};
+    const BOOL created = CreateProcessW(
+        application.empty() ? nullptr : application.c_str(), commandBuffer.data(), nullptr, nullptr,
+        TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
+        cwd.empty() ? nullptr : cwd.c_str(), &startup, &process);
+    const DWORD code = GetLastError();
+    closeIf(outWrite);
+    closeIf(inRead);
+    closeIf(errWrite);
+    if (!created) {
+        CloseHandle(job);
+        closeIf(outRead); closeIf(inWrite); closeIf(errRead);
+        err = "Could not launch OMP bridge: " + winError(code);
+        return false;
+    }
+    if (!AssignProcessToJobObject(job, process.hProcess)) {
+        const DWORD assignCode = GetLastError();
+        TerminateProcess(process.hProcess, 1);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        CloseHandle(job);
+        closeIf(outRead); closeIf(inWrite); closeIf(errRead);
+        err = "AssignProcessToJobObject failed: " + winError(assignCode);
+        return false;
+    }
+    if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+        const DWORD resumeCode = GetLastError();
+        TerminateProcess(process.hProcess, 1);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        CloseHandle(job);
+        closeIf(outRead); closeIf(inWrite); closeIf(errRead);
+        err = "ResumeThread failed: " + winError(resumeCode);
+        return false;
+    }
+    CloseHandle(process.hThread);
+    job_ = job;
+    process_ = process.hProcess;
+    childStdoutRd_ = outRead;
+    childStdinWr_ = inWrite;
+    {
+        std::lock_guard<std::mutex> lock(stderrMtx_);
+        stderrTail_.clear();
+    }
+    stderrPump_ = std::thread(&OmpBridgeClient::stderrLoop, this, errRead);
+    running_ = true;
+    return true;
+}
+
+void OmpBridgeClient::stderrLoop(void* raw) {
+    HANDLE pipe = static_cast<HANDLE>(raw);
+    char chunk[4096];
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(pipe, chunk, sizeof(chunk), &got, nullptr) || got == 0) break;
+        HANDLE stderrHandle = GetStdHandle(STD_ERROR_HANDLE);
+        if (stderrHandle && stderrHandle != INVALID_HANDLE_VALUE) {
+            DWORD wrote = 0;
+            WriteFile(stderrHandle, chunk, got, &wrote, nullptr);
+        }
+        std::lock_guard<std::mutex> lock(stderrMtx_);
+        stderrTail_.append(chunk, static_cast<size_t>(got));
+        if (stderrTail_.size() > kMaxStderrTail)
+            stderrTail_.erase(0, stderrTail_.size() - kMaxStderrTail);
+    }
+    CloseHandle(pipe);
+}
+
+std::string OmpBridgeClient::stderrSummary() {
+    std::string tail;
+    {
+        std::lock_guard<std::mutex> lock(stderrMtx_);
+        tail = stderrTail_;
+    }
+    std::vector<std::string> lines;
+    size_t pos = 0;
+    while (pos <= tail.size()) {
+        const size_t newline = tail.find('\n', pos);
+        std::string line = tail.substr(
+            pos, newline == std::string::npos ? std::string::npos : newline - pos);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (!line.empty()) lines.push_back(std::move(line));
+        if (newline == std::string::npos) break;
+        pos = newline + 1;
+    }
+    if (lines.empty()) return std::string();
+    const size_t take = std::min<size_t>(3, lines.size());
+    std::string out;
+    for (size_t i = lines.size() - take; i < lines.size(); ++i) {
+        if (!out.empty()) out += " | ";
+        out += lines[i];
+    }
+    if (out.size() > kMaxStderrTail) out.resize(kMaxStderrTail);
+    return out;
+}
+
+bool OmpBridgeClient::writeLine(const std::string& line) {
+    if (!childStdinWr_) return false;
+    const char* cursor = line.data();
+    size_t remaining = line.size();
+    while (remaining > 0) {
+        DWORD wrote = 0;
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(remaining, 0xffffffffu));
+        if (!WriteFile(static_cast<HANDLE>(childStdinWr_), cursor, chunk, &wrote, nullptr) ||
+            wrote == 0)
+            return false;
+        cursor += wrote;
+        remaining -= wrote;
+    }
+    return true;
+}
+
+bool OmpBridgeClient::ensureRunning(std::string& err) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (running_) return true;
+    if (reader_.joinable()) reader_.join();
+    if (!spawn(err)) return false;
+    reader_ = std::thread(&OmpBridgeClient::readerLoop, this, childStdoutRd_, process_);
+    return true;
+}
+
+void OmpBridgeClient::readerLoop(void* rawPipe, void* rawProcess) {
+    HANDLE pipe = static_cast<HANDLE>(rawPipe);
+    std::string buffer;
+    std::string line;
+    while (readerReadLineWin(pipe, buffer, line)) {
+        if (!line.empty()) dispatchResponse(line);
+    }
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (running_ && process_ == rawProcess) reap();
+}
 }  // namespace agent
 }  // namespace chudware
+
 
 #else  // !_WIN32
 
@@ -59,7 +455,6 @@ bool OmpBridgeClient::call(const std::string& /*method*/, const nlohmann::json& 
 #include <unistd.h>
 
 #include "util/parent_death.h"
-#include "util/platform_paths.h"
 
 namespace chudware {
 namespace agent {
@@ -73,16 +468,19 @@ std::string envOr(const char* key, const std::string& def) {
     return def;
 }
 
+#ifdef CHUDWARE_DEVELOPER_BUILD
 std::string homeDir() {
     if (const char* h = std::getenv("HOME"); h && *h) return std::string(h);
     return std::string();
 }
+#endif
 
 bool fileExists(const std::string& p) {
     std::error_code ec;
     return std::filesystem::is_regular_file(p, ec);
 }
 
+#ifdef CHUDWARE_DEVELOPER_BUILD
 // Walk upward from `start` looking for the vendor/omp/bridge/src/bridge.ts repo-root marker,
 // so the bridge resolves whether the caller runs from a build dir, the repo root, or an
 // installed AppDir. Mirrors the running-executable upward-walk convention used by
@@ -245,6 +643,7 @@ void ensureBridgeDeps(const std::string& vendorOmpDir, const std::string& bunExe
         ::close(lockFd);
     }
 }
+#endif
 
 // Blocking single-line reader used only by the background reader thread: pumps `fd` (this
 // generation's child stdout, non-blocking) into `buf` until a full line is available, `fd`
@@ -370,17 +769,55 @@ void OmpBridgeClient::reap() {
 
 bool OmpBridgeClient::resolvePaths(std::string& err) {
     if (pathsResolved_) return true;
-    bunExe_ = resolveBunExe();
-    bridgeScript_ = envOr("CHUDWARE_OMP_BRIDGE", resolveRepoRoot() + "/vendor/omp/bridge/src/bridge.ts");
-    if (!fileExists(bridgeScript_)) {
-        err = "OMP bridge script not found: " + bridgeScript_ +
-              " (set CHUDWARE_OMP_BRIDGE to the script path, or CHUDWARE_REPO to a checkout "
-              "containing vendor/omp/)";
+#ifdef CHUDWARE_DEVELOPER_BUILD
+    if (const char* env = std::getenv("CHUDWARE_OMP_BRIDGE_BIN"); env && *env) {
+        std::error_code ec;
+        bridgeScript_ = std::filesystem::weakly_canonical(env, ec).string();
+        if (ec) bridgeScript_ = env;
+        compiledBridge_ = true;
+    }
+    if (bridgeScript_.empty()) {
+        bunExe_ = resolveBunExe();
+        bridgeScript_ = envOr("CHUDWARE_OMP_BRIDGE",
+                              resolveRepoRoot() + "/vendor/omp/bridge/src/bridge.ts");
+    }
+#else
+    const std::string executable = platform::executablePath();
+    if (executable.empty()) {
+        err = "could not resolve the current executable path";
         return false;
     }
-    // <...>/vendor/omp/bridge/src/bridge.ts -> <...>/vendor/omp.
-    vendorOmpDir_ =
-        std::filesystem::path(bridgeScript_).parent_path().parent_path().parent_path().string();
+    std::error_code ec;
+    bridgeScript_ = std::filesystem::weakly_canonical(
+                        std::filesystem::path(executable).parent_path() /
+                            "chudware-omp-bridge",
+                        ec)
+                        .string();
+    if (ec) {
+        err = "could not canonicalize adjacent OMP bridge path";
+        return false;
+    }
+    if (const char* env = std::getenv("CHUDWARE_OMP_BRIDGE_BIN"); env && *env) {
+        std::error_code envEc;
+        const auto supplied = std::filesystem::weakly_canonical(env, envEc);
+        if (envEc || supplied != std::filesystem::path(bridgeScript_)) {
+            err = "CHUDWARE_OMP_BRIDGE_BIN must name the adjacent packaged bridge";
+            return false;
+        }
+    }
+    compiledBridge_ = true;
+#endif
+    if (!fileExists(bridgeScript_)) {
+        err = std::string(compiledBridge_ ? "OMP bridge binary not found: "
+                                          : "OMP bridge script not found: ") +
+              bridgeScript_;
+        return false;
+    }
+    if (compiledBridge_)
+        bridgeCwd_ = std::filesystem::path(bridgeScript_).parent_path().string();
+    else
+        vendorOmpDir_ =
+            std::filesystem::path(bridgeScript_).parent_path().parent_path().parent_path().string();
     pathsResolved_ = true;
     return true;
 }
@@ -392,11 +829,13 @@ bool OmpBridgeClient::resolvePaths(std::string& err) {
 // stops a hopeless install from re-running on every 3-second provider poll: one attempt per
 // distinct lockfile fingerprint per process. Caller holds mtx_.
 void OmpBridgeClient::provisionDeps() {
-    if (vendorOmpDir_.empty()) return;
+#ifdef CHUDWARE_DEVELOPER_BUILD
+    if (compiledBridge_ || vendorOmpDir_.empty()) return;
     const std::string want = bridgeDepsStamp(vendorOmpDir_);
     if (!want.empty() && want == depsStamp_) return;  // this lockfile already handled here
     ensureBridgeDeps(vendorOmpDir_, bunExe_, want);
     depsStamp_ = want;
+#endif
 }
 
 bool OmpBridgeClient::spawn(std::string& err) {
@@ -443,9 +882,15 @@ bool OmpBridgeClient::spawn(std::string& err) {
         ::close(errPipe[0]);
         ::close(errPipe[1]);
         // Close every other inherited fd (hostd's listen/client sockets etc.) so they never
-        // leak into the bun child.
+        // leak into the bridge child.
         platform::closeInheritedFds(3);
-        execlp(bunExe_.c_str(), bunExe_.c_str(), "run", bridgeScript_.c_str(), (char*)nullptr);
+        if (compiledBridge_ && !bridgeCwd_.empty() && ::chdir(bridgeCwd_.c_str()) != 0)
+            _exit(127);
+        if (compiledBridge_)
+            execlp(bridgeScript_.c_str(), bridgeScript_.c_str(), (char*)nullptr);
+        else
+            execlp(bunExe_.c_str(), bunExe_.c_str(), "run", bridgeScript_.c_str(),
+                   (char*)nullptr);
         _exit(127);
     }
 
@@ -575,6 +1020,14 @@ void OmpBridgeClient::readerLoop(int fd, pid_t pid) {
         dispatchResponse(line);
     }
 }
+
+}  // namespace agent
+}  // namespace chudware
+
+#endif  // _WIN32
+
+namespace chudware {
+namespace agent {
 
 void OmpBridgeClient::dispatchResponse(const std::string& line) {
     json j;
@@ -809,4 +1262,3 @@ bool OmpBridgeClient::call(const std::string& method, const json& params, json& 
 }  // namespace agent
 }  // namespace chudware
 
-#endif  // !_WIN32

@@ -24,6 +24,10 @@
 #include <cwchar> // _wcsnicmp for the Win32 child env block
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#include <filesystem>
+#endif
+#include "util/platform_paths.h"
 
 #include "bootstrap.h"
 #include "cpp_core.h" // P16: legacy in-process libchudware (InProcCore backend)
@@ -569,7 +573,35 @@ bool fileExists(const std::string &p) {
   std::error_code ec;
   return std::filesystem::is_regular_file(p, ec);
 }
+
 #endif
+std::string adjacentWorkerBinary(std::string &err) {
+  const std::string executable = chudware::platform::executablePath();
+  if (executable.empty()) {
+    err = "Could not resolve the current executable path";
+    return {};
+  }
+#ifdef _WIN32
+  constexpr const char *name = "chudware-worker.exe";
+#else
+  constexpr const char *name = "chudware-worker";
+#endif
+  std::error_code ec;
+  const std::filesystem::path candidate =
+      std::filesystem::weakly_canonical(std::filesystem::path(executable).parent_path() / name, ec);
+  if (ec) {
+    err = "Could not canonicalize adjacent worker path";
+    return {};
+  }
+  return candidate.string();
+}
+
+bool sameCanonicalPath(const std::string &left, const std::string &right) {
+  std::error_code leftEc, rightEc;
+  const auto canonicalLeft = std::filesystem::weakly_canonical(left, leftEc);
+  const auto canonicalRight = std::filesystem::weakly_canonical(right, rightEc);
+  return !leftEc && !rightEc && canonicalLeft == canonicalRight;
+}
 } // namespace
 
 WorkerClient::~WorkerClient() { stop(); }
@@ -580,18 +612,45 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
   err = "WASM: Python worker not available (daemon mode only)";
   return false;
 #else
-  // Resolve via the shared bootstrap logic so the worker, runtimeReady(), and
-  // the GUI all agree on which python + app dir to use.
-  std::string python = runtimePython();
-  std::string repo = appDir();
+  std::string repo;
+  std::string launcher;
+  bool compiledWorker = false;
+#ifdef CHUDWARE_DEVELOPER_BUILD
+  if (const char *env = std::getenv("CHUDWARE_WORKER_BIN"); env && *env) {
+    if (module != "services.worker_main") {
+      err = "Compiled worker does not provide module: " + module;
+      return false;
+    }
+    std::error_code ec;
+    launcher = std::filesystem::weakly_canonical(env, ec).string();
+    if (ec) launcher = env;
+    compiledWorker = true;
+  } else {
+    launcher = runtimePython();
+  }
+  repo = appDir();
+#else
+  if (module != "services.worker_main") {
+    err = "Packaged worker does not provide module: " + module;
+    return false;
+  }
+  launcher = adjacentWorkerBinary(err);
+  if (launcher.empty()) return false;
+  if (const char *env = std::getenv("CHUDWARE_WORKER_BIN"); env && *env &&
+      !sameCanonicalPath(env, launcher)) {
+    err = "CHUDWARE_WORKER_BIN must name the adjacent packaged worker";
+    return false;
+  }
+  repo = std::filesystem::path(launcher).parent_path().string();
+  compiledWorker = true;
+#endif
   readBuf_.clear(); // fresh process => fresh stream (matters when restarting
                     // after a repair)
 
-  // Fail with a clear, actionable message *before* CreateProcess so a missing
-  // runtime never surfaces as a cryptic "CreateProcess failed".
-  if (!fileExists(python)) {
-    err = "Python runtime not installed.\nExpected: " + python +
-          "\nUse Chudware \xe2\x96\xb8 Repair runtime to install it.";
+  if (!fileExists(launcher)) {
+    err = compiledWorker ? "Compiled worker not found: " + launcher
+                         : "Python runtime not installed.\nExpected: " + launcher +
+                               "\nUse Chudware \xe2\x96\xb8 Repair runtime to install it.";
     return false;
   }
 
@@ -629,7 +688,11 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
   si.hStdError =
       GetStdHandle(STD_ERROR_HANDLE); // worker diagnostics -> host console
 
-  std::wstring cmd = L"\"" + widen(python) + L"\" -m " + widen(module);
+  std::wstring cmd = L"\"" + widen(launcher) + L"\"";
+  if (compiledWorker)
+    cmd += L" --module worker";
+  else
+    cmd += L" -m " + widen(module);
   std::wstring cwd = widen(repo);
   std::vector<wchar_t> cmdbuf(cmd.begin(), cmd.end());
   cmdbuf.push_back(0);
@@ -649,8 +712,7 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
   CloseHandle(outWr);
   CloseHandle(inRd);
   if (!ok) {
-    err = "Could not launch the Python runtime (" + win32Error(gle) + ").\n" +
-          python + "\nUse Chudware \xe2\x96\xb8 Repair runtime to reinstall it.";
+    err = "Could not launch worker (" + win32Error(gle) + ").\n" + launcher;
     CloseHandle(outRd);
     CloseHandle(inWr);
     return false;
@@ -693,8 +755,10 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
     // and doing it here (rather than in the parent) keeps the override out of
     // the parent's own later getenv() decisions.
     setenv("CHUDWARE_ENGINE_DAEMON", enginePin, 1);
-    execlp(python.c_str(), python.c_str(), "-m", module.c_str(),
-           (char *)nullptr);
+    if (compiledWorker)
+      execlp(launcher.c_str(), launcher.c_str(), "--module", "worker", (char *)nullptr);
+    else
+      execlp(launcher.c_str(), launcher.c_str(), "-m", module.c_str(), (char *)nullptr);
     _exit(127); // exec failed
   }
   // parent: keep our ends, close the child's.
@@ -1456,12 +1520,12 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     // engine.
   }
   // Fall-through methods (plm_*, git_*, ai_roles_*, subscription_status, bench_*,
-  // triggers_*, skills_*, list_editable_prompts, provider accounts, and Python-only provider
-  // completions like Cursor) are served by the Python worker, NOT the C++ core. On the web
-  // there is no local pipe; on desktop in DAEMON mode the GUI likewise has no local Python
+  // triggers_*, skills_*, list_editable_prompts, provider accounts, and service-side provider
+  // completions like Cursor) are served by the worker sidecar, NOT the C++ core. On the web
+  // there is no local pipe; on desktop in DAEMON mode the GUI likewise has no local worker
   // child (tryStartWorker fell back to the in-process C++ core, running_==false), so in BOTH
   // cases route them over the engine channel — engine::call -> hostd, which bridges
-  // engine-unknown methods to its lazily-spawned `python -m services.worker_main`. Without
+  // engine-unknown methods to its lazily-spawned services worker. Without
   // this, desktop daemon mode hit the dead local pipe below and every such method failed with
   // "worker not started" even though hostd was up. Only a desktop build on the LEGACY
   // in-process backend (CHUDWARE_ENGINE_DAEMON=0) with a real local worker child takes the

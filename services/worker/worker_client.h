@@ -1,5 +1,5 @@
-// Spawns the Python kernel worker (services.worker_main) and talks to it over stdio with
-// newline-delimited JSON-RPC. Windows pipes; one synchronous request/response per call.
+// Spawns the services worker sidecar and talks to it over stdio with newline-delimited
+// JSON-RPC. Windows pipes; one synchronous request/response per call.
 #pragma once
 #include <atomic>
 #include <functional>
@@ -23,9 +23,10 @@ public:
     using ErrorSink = std::function<void(const std::string& method, const std::string& err)>;
     void setErrorSink(ErrorSink sink) { errorSink_ = std::move(sink); }
 
-    // Resolve python exe + repo/cwd from env (CHUDWARE_PYTHON, CHUDWARE_REPO) or the
-    // %APPDATA%/Chudware defaults, then spawn `python -m <module>`. The default module is the
-    // doc worker; C19 spawns a second instance with module="engine.sim.worker".
+    // Packaged builds map only services.worker_main to the canonical adjacent
+    // chudware-worker binary and launch it with `--module worker`; missing binaries,
+    // non-adjacent inherited overrides, and unknown modules fail closed. Developer builds
+    // retain CHUDWARE_WORKER_BIN / CHUDWARE_PYTHON source execution.
     bool start(std::string& err, const std::string& module = "services.worker_main");
     bool started() const { return running_; }
     // Synthetic ready flag for daemon/WASM (and in-process libchudware FEA): no child process,

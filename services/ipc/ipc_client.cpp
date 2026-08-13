@@ -170,11 +170,22 @@ bool EngineClient::connectOrSpawn(const Options& opts, std::string& err) {
 }
 
 bool EngineClient::connectInner(const Options& opts, std::string& err) {
-    const std::string key = instanceKey(opts.hostdBin);
+#ifdef CHUDWARE_DEVELOPER_BUILD
+    const std::string keyBin = opts.hostdBin;
+#else
+    // Installed clients and hostd must derive the rendezvous key from the same
+    // verified executable, even when the caller supplied no hint.
+    const std::string keyBin = resolveHostdBin(opts.hostdBin);
+    if (keyBin.empty()) {
+        err = "canonical manifest-owned hostd binary unavailable";
+        return false;
+    }
+#endif
+    const std::string key = instanceKey(keyBin);
+    sockPath_ = socketPath(key);
     clientKind_ = opts.clientKind;
     userId_ = opts.userId;
     userDisplay_ = opts.userDisplay;
-    sockPath_ = socketPath(key);
     if (sockPath_.empty()) {
         err = "no runtime dir for hostd socket";
         return false;
@@ -188,9 +199,22 @@ bool EngineClient::connectInner(const Options& opts, std::string& err) {
     }
     const std::string bin = resolveHostdBin(opts.hostdBin);
     if (bin.empty()) {
+#ifdef CHUDWARE_DEVELOPER_BUILD
         err = "hostd binary not found (set CHUDWARE_HOSTD_BIN); connect failed: " + firstErr;
+#else
+        err = "canonical manifest-owned hostd binary unavailable; connect failed: " + firstErr;
+#endif
         return false;
     }
+#ifndef CHUDWARE_DEVELOPER_BUILD
+    // Re-verify immediately before CreateProcess/exec. resolveHostdBin also verifies,
+    // but this closes the discovery-to-spawn swap window for ordinary replacements.
+    const std::string rechecked = resolveHostdBin(opts.hostdBin);
+    if (rechecked.empty() || rechecked != bin) {
+        err = "hostd binary changed after integrity verification";
+        return false;
+    }
+#endif
     if (!spawnDetached(bin, "", err)) return false;
 
     // Retry-connect: 50 ms doubling capped at 500 ms, until the budget runs out.

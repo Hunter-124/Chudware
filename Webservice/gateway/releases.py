@@ -43,22 +43,21 @@ Channel = Literal["stable", "beta"]
 Platform = Literal["linux", "windows", "macos"]
 Architecture = Literal["x86_64", "arm64"]
 
-_SEMVER_RE = re.compile(
-    r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
-    r"(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
-    r"(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
-)
+_SEMVER_RE = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
+
+
+def _parse_release_version(value: str, field: str) -> tuple[int, int, int]:
+    match = _SEMVER_RE.fullmatch(value)
+    if match is None:
+        raise HTTPException(422, f"{field} must be canonical major.minor.patch")
+    return tuple(int(component) for component in match.groups())
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ARTIFACT_SIGNATURE_DOMAIN = b"chudware-artifact-v1"
 _RELEASE_PUBLIC_KEYS = {
     "release-v1": bytes.fromhex(
-        "bdb8869038e8274a32a6f14b86f0fbdbe599c6c78e49dc495cfa1275b01490f3"
+        "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7"
     ),
 }
-_PAYLOAD_SIGNATURE_DOMAIN = b"chudware-payload-v1\0"
-_PAYLOAD_SCHEMA = "chudware-payload-v1"
-_PAYLOAD_PRODUCT = "Chudware"
 _SAFE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 _manifest_by_ip = RateLimiter(120, 60.0)
 _publish_by_ip = RateLimiter(20, 60.0)
@@ -80,6 +79,19 @@ class PublishRelease(BaseModel):
     payload_manifest_sha256: str
     payload_signature_key: str
     payload_signature_sha256: str
+    commit_sha: str
+    sbom_key: str
+    sbom_sha256: str
+    sbom_signature_key: str
+    sbom_signature_sha256: str
+    provenance_key: str
+    provenance_sha256: str
+    provenance_signature_key: str
+    provenance_signature_sha256: str
+    platform_test_key: str
+    platform_test_sha256: str
+    platform_test_signature_key: str
+    platform_test_signature_sha256: str
 
 
 def _require_admin(request: Request):
@@ -114,26 +126,29 @@ def _canonical_artifact(version: str, platform: str, arch: str) -> str:
 
 
 
-def _artifact_signature_preimage(key_id: str, sha256: str) -> bytes:
-    return (
-        _ARTIFACT_SIGNATURE_DOMAIN
-        + b"\0"
-        + key_id.encode("ascii")
-        + b"\0"
-        + sha256.encode("ascii")
-    )
+def _artifact_signature_preimage(
+    key_id: str, version: str, platform: str, arch: str, sha256: str
+) -> bytes:
+    return b"\0".join((
+        _ARTIFACT_SIGNATURE_DOMAIN, key_id.encode("ascii"), version.encode("ascii"),
+        platform.encode("ascii"), arch.encode("ascii"), sha256.encode("ascii"),
+    ))
 
 
-def _verify_artifact_signature(key_id: str, sha256: str, signature: bytes) -> None:
+def _verify_artifact_signature(
+    key_id: str, version: str, platform: str, arch: str, sha256: str, signature: bytes
+) -> None:
     public_key = _RELEASE_PUBLIC_KEYS.get(key_id)
     if public_key is None:
         raise HTTPException(422, "unknown release key_id")
     try:
         Ed25519PublicKey.from_public_bytes(public_key).verify(
-            signature, _artifact_signature_preimage(key_id, sha256)
+            signature, _artifact_signature_preimage(
+                key_id, version, platform, arch, sha256
+            )
         )
     except InvalidSignature as exc:
-        raise HTTPException(422, "signature does not match key_id and sha256") from exc
+        raise HTTPException(422, "signature does not match release identity and sha256") from exc
 
 def _validate_payload_metadata(value: PublishRelease) -> None:
     for field in ("payload_manifest_sha256", "payload_signature_sha256"):
@@ -146,11 +161,31 @@ def _validate_payload_metadata(value: PublishRelease) -> None:
     if value.payload_signature_key != expected_signature_key:
         raise HTTPException(422, f"payload_signature_key must be {expected_signature_key}")
 
+def _validate_evidence_metadata(value: PublishRelease) -> None:
+    if not re.fullmatch(r"[0-9a-f]{40,64}", value.commit_sha):
+        raise HTTPException(422, "commit_sha must be a full lowercase commit id")
+    evidence = (
+        ("sbom", "sbom.cdx.json"),
+        ("provenance", "provenance.slsa.json"),
+        ("platform_test", "platform-test.v1.json"),
+    )
+    for prefix, filename in evidence:
+        digest_field = f"{prefix}_sha256"
+        signature_digest_field = f"{prefix}_signature_sha256"
+        for field in (digest_field, signature_digest_field):
+            if not _SHA256_RE.fullmatch(getattr(value, field)):
+                raise HTTPException(422, f"{field} must be 64 lowercase hexadecimal characters")
+        expected_key = value.artifact_key + "." + filename
+        expected_signature_key = expected_key + ".sig"
+        if getattr(value, f"{prefix}_key") != expected_key:
+            raise HTTPException(422, f"{prefix}_key must be {expected_key}")
+        if getattr(value, f"{prefix}_signature_key") != expected_signature_key:
+            raise HTTPException(422, f"{prefix}_signature_key must be {expected_signature_key}")
+
+
 def _validate_publish(value: PublishRelease) -> None:
-    if not _SEMVER_RE.fullmatch(value.version):
-        raise HTTPException(422, "version must be canonical semantic version")
-    if not _SEMVER_RE.fullmatch(value.min_supported):
-        raise HTTPException(422, "min_supported must be canonical semantic version")
+    _parse_release_version(value.version, "version")
+    _parse_release_version(value.min_supported, "min_supported")
     if not _SHA256_RE.fullmatch(value.sha256):
         raise HTTPException(422, "sha256 must be 64 lowercase hexadecimal characters")
     if value.key_id not in _RELEASE_PUBLIC_KEYS:
@@ -163,7 +198,9 @@ def _validate_publish(value: PublishRelease) -> None:
         raise HTTPException(422, "signature must be canonical base64") from exc
     if len(signature) != 64 or base64.b64encode(signature).decode("ascii") != value.signature:
         raise HTTPException(422, "signature must encode one Ed25519 signature")
-    _verify_artifact_signature(value.key_id, value.sha256, signature)
+    _verify_artifact_signature(
+        value.key_id, value.version, value.platform, value.arch, value.sha256, signature
+    )
     parsed_notes = urlparse(value.notes_url)
     if parsed_notes.scheme not in {"http", "https"} or not parsed_notes.netloc:
         raise HTTPException(422, "notes_url must be an absolute HTTP(S) URL")
@@ -173,6 +210,7 @@ def _validate_publish(value: PublishRelease) -> None:
     if path.is_absolute() or ".." in path.parts or value.artifact_key != expected_key:
         raise HTTPException(422, f"artifact_key must be {expected_key}")
     _validate_payload_metadata(value)
+    _validate_evidence_metadata(value)
 
 
 def _require_publish_token(request: Request) -> None:
@@ -296,46 +334,46 @@ async def latest_release(
 
 def _upsert_release(value: PublishRelease) -> None:
     _validate_publish(value)
+    columns = (
+        "channel", "version", "min_supported", "platform", "arch", "key_id", "sha256",
+        "size", "signature", "notes_url", "artifact_key", "payload_manifest_key",
+        "payload_manifest_sha256", "payload_signature_key", "payload_signature_sha256",
+        "commit_sha", "sbom_key", "sbom_sha256", "sbom_signature_key",
+        "sbom_signature_sha256", "provenance_key", "provenance_sha256",
+        "provenance_signature_key", "provenance_signature_sha256", "platform_test_key",
+        "platform_test_sha256", "platform_test_signature_key", "platform_test_signature_sha256",
+    )
+    values = tuple(getattr(value, column) for column in columns)
+    requested_floor = _parse_release_version(value.min_supported, "min_supported")
     with tx() as cur:
         cur.execute(
-            """
-            INSERT INTO releases
-                (channel, version, min_supported, platform, arch, key_id, sha256,
-                 size, signature, notes_url, artifact_key, payload_manifest_key,
-                 payload_manifest_sha256, payload_signature_key, payload_signature_sha256,
-                 published_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-            ON CONFLICT (channel, version, platform, arch) DO UPDATE SET
-                min_supported = EXCLUDED.min_supported,
-                key_id = EXCLUDED.key_id,
-                sha256 = EXCLUDED.sha256,
-                size = EXCLUDED.size,
-                signature = EXCLUDED.signature,
-                notes_url = EXCLUDED.notes_url,
-                artifact_key = EXCLUDED.artifact_key,
-                payload_manifest_key = EXCLUDED.payload_manifest_key,
-                payload_manifest_sha256 = EXCLUDED.payload_manifest_sha256,
-                payload_signature_key = EXCLUDED.payload_signature_key,
-                payload_signature_sha256 = EXCLUDED.payload_signature_sha256,
-                published_at = now()
+            "SELECT min_supported FROM release_channels WHERE channel = %s FOR UPDATE",
+            (value.channel,),
+        )
+        channel_row = cur.fetchone()
+        if channel_row is None:
+            raise HTTPException(503, "release channel schema is not initialized")
+        current_floor = channel_row["min_supported"]
+        if current_floor is not None:
+            try:
+                parsed_current_floor = _parse_release_version(str(current_floor), "stored min_supported")
+            except HTTPException as exc:
+                raise HTTPException(503, "stored release floor is invalid") from exc
+            if requested_floor < parsed_current_floor:
+                raise HTTPException(409, "min_supported cannot move backward")
+        cur.execute(
+            f"""
+            INSERT INTO releases ({', '.join(columns)}, published_at)
+            VALUES ({', '.join(['%s'] * len(columns))}, now())
+            ON CONFLICT (channel, version, platform, arch) DO NOTHING
             """,
-            (
-                value.channel,
-                value.version,
-                value.min_supported,
-                value.platform,
-                value.arch,
-                value.key_id,
-                value.sha256,
-                value.size,
-                value.signature,
-                value.notes_url,
-                value.artifact_key,
-                value.payload_manifest_key,
-                value.payload_manifest_sha256,
-                value.payload_signature_key,
-                value.payload_signature_sha256,
-            ),
+            values,
+        )
+        if getattr(cur, "rowcount", 1) == 0:
+            raise HTTPException(409, "release identity is immutable and already registered")
+        cur.execute(
+            "UPDATE release_channels SET min_supported = %s, updated_at = now() WHERE channel = %s",
+            (value.min_supported, value.channel),
         )
 
 
@@ -345,23 +383,25 @@ async def publish_release(value: PublishRelease, request: Request) -> dict[str, 
     _publish_by_ip.enforce(client, "release publications")
     _require_publish_token(request)
     _upsert_release(value)
-    return {"ok": True}
+    return {
+        "ok": True,
+        "artifact_key": value.artifact_key,
+        "payload_manifest_key": value.payload_manifest_key,
+        "payload_signature_key": value.payload_signature_key,
+        "sbom_key": value.sbom_key,
+        "sbom_signature_key": value.sbom_signature_key,
+        "provenance_key": value.provenance_key,
+        "provenance_signature_key": value.provenance_signature_key,
+        "platform_test_key": value.platform_test_key,
+        "platform_test_signature_key": value.platform_test_signature_key,
+    }
 
 
 @router.get("/api/admin/release-manifests")
 async def list_release_manifests(request: Request) -> list[dict[str, Any]]:
     _require_admin(request)
     with tx() as cur:
-        cur.execute(
-            """
-            SELECT channel, version, min_supported, platform, arch, key_id, sha256,
-                   size, signature, notes_url, artifact_key, payload_manifest_key,
-                   payload_manifest_sha256, payload_signature_key, payload_signature_sha256,
-                   published_at
-              FROM releases
-             ORDER BY published_at DESC, channel, platform, arch
-            """
-        )
+        cur.execute("SELECT * FROM releases ORDER BY published_at DESC, channel, platform, arch")
         rows = cur.fetchall()
     return [dict(row) for row in rows]
 

@@ -1,18 +1,12 @@
 // Daemon discovery + lifecycle primitives shared by chudware-hostd and every client
 // (GUI DaemonConn, Python daemon_bridge reimplements the same contract).
 //
-// Instance identity: every socket/lock name embeds an "instance key" so a dev
-// tree and an installed app (or two installed versions) never share a daemon:
-//   1. $CHUDWARE_INSTANCE_KEY (explicit override — tests, AppImage AppRun which
-//      derives it from $APPIMAGE because squashfs mounts are randomized), else
-//   2. hash of the canonical (realpath) hostd binary path.
-// The key is 16 hex chars of FNV-1a 64 (stable across builds/platforms; this is
-// a namespacing key, not a security boundary — the 0700 runtime dir is that).
+// Developer builds may override instance/socket/binary discovery for tests and
+// source-tree workflows. Production derives identity from the canonical adjacent
+// hostd and ignores those overrides.
 //
-// Endpoints (Linux): $XDG_RUNTIME_DIR/chudware/hostd-<key>.sock, falling back to
-// /tmp/chudware-<uid>/hostd-<key>.sock (dir created 0700, ownership verified).
-// $CHUDWARE_HOSTD_SOCKET overrides the full path.
-#pragma once
+// The key is 16 hex chars of FNV-1a 64. It is namespacing, not authentication;
+// the per-user runtime directory or Windows SID namespace supplies isolation.
 
 #include <string>
 
@@ -42,8 +36,9 @@ std::string runtimeDir();
 // State dir for logs/autosaves: ~/.local/share/Chudware (or $XDG_DATA_HOME/Chudware).
 std::string stateDir();
 
-// Resolve the hostd binary to spawn: $CHUDWARE_HOSTD_BIN, else `hint` (a path the
-// caller knows, e.g. next to its own binary), else "" (caller reports failure).
+// Resolve the hostd binary. Developer builds honor $CHUDWARE_HOSTD_BIN then `hint`.
+// Production ignores both and returns only the canonical adjacent hostd after its exact
+// signed payload-manifest row is authenticated; otherwise returns "".
 std::string resolveHostdBin(const std::string& hint);
 
 // Single-instance guard: flock on POSIX, named mutex on Windows (lockPath()

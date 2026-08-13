@@ -270,7 +270,11 @@ bool store(std::string_view service, std::string_view account,
     if (status == errSecSuccess) return true;
 #else
     const std::string encoded = base64(value);
-    if (runSecretTool({"store", "--label=Chudware entitlement", "service",
+    // Explicit data directories are used by isolated tests and recovery tools;
+    // bind those secrets to the directory-backed 0600 store instead of the
+    // process-global desktop keychain, where parallel fixtures would collide.
+    if (dataDir.empty() &&
+        runSecretTool({"store", "--label=Chudware entitlement", "service",
                        std::string(service), "account", std::string(account)},
                       encoded, nullptr) == 0)
         return true;
@@ -306,11 +310,13 @@ bool load(std::string_view service, std::string_view account,
     if (item) CFRelease(item);
     if (status == errSecSuccess) return true;
 #else
-    std::string encoded;
-    if (runSecretTool({"lookup", "service", std::string(service), "account",
-                       std::string(account)}, {}, &encoded) == 0 &&
-        unbase64(encoded, value))
-        return true;
+    if (dataDir.empty()) {
+        std::string encoded;
+        if (runSecretTool({"lookup", "service", std::string(service), "account",
+                           std::string(account)}, {}, &encoded) == 0 &&
+            unbase64(encoded, value))
+            return true;
+    }
 #endif
     const fs::path path = fallbackPath(service, account, dataDir);
     if (!fs::exists(path)) return false;
@@ -337,7 +343,8 @@ bool erase(std::string_view service, std::string_view account, std::string_view 
     if (item) CFRelease(item);
     if (status == errSecSuccess) return true;
 #  else
-    if (runSecretTool({"clear", "service", std::string(service), "account",
+    if (dataDir.empty() &&
+        runSecretTool({"clear", "service", std::string(service), "account",
                        std::string(account)}, {}, nullptr) == 0)
         return true;
 #  endif

@@ -26,6 +26,19 @@ def manifest_row() -> dict[str, Any]:
         "payload_manifest_sha256": "b" * 64,
         "payload_signature_key": "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage.payload-manifest.v1.sig",
         "payload_signature_sha256": "c" * 64,
+        "commit_sha": "d" * 40,
+        "sbom_key": "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage.sbom.cdx.json",
+        "sbom_sha256": "d" * 64,
+        "sbom_signature_key": "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage.sbom.cdx.json.sig",
+        "sbom_signature_sha256": "e" * 64,
+        "provenance_key": "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage.provenance.slsa.json",
+        "provenance_sha256": "f" * 64,
+        "provenance_signature_key": "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage.provenance.slsa.json.sig",
+        "provenance_signature_sha256": "1" * 64,
+        "platform_test_key": "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage.platform-test.v1.json",
+        "platform_test_sha256": "2" * 64,
+        "platform_test_signature_key": "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage.platform-test.v1.json.sig",
+        "platform_test_signature_sha256": "3" * 64,
     }
 
 
@@ -99,8 +112,13 @@ def test_publish_is_bearer_gated_and_idempotent(
     statements: list[tuple[str, tuple[Any, ...]]] = []
 
     class Cursor:
+        rowcount = 1
+
         def execute(self, statement: str, values: tuple[Any, ...]) -> None:
             statements.append((statement, values))
+
+        def fetchone(self) -> dict[str, str | None]:
+            return {"min_supported": None}
 
     @contextmanager
     def fake_tx():
@@ -118,27 +136,96 @@ def test_publish_is_bearer_gated_and_idempotent(
         "arch": "x86_64",
         **manifest_row,
     }
-    payload.pop("artifact_key")
-    payload["artifact_key"] = "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage"
-
     assert publish_client.post("/api/releases/latest/publish", json=payload).status_code == 401
     response = publish_client.post(
-        "/api/releases/latest/publish",
-        json=payload,
+        "/api/releases/latest/publish", json=payload,
         headers={"Authorization": "Bearer publish-secret"},
     )
     assert response.status_code == 200
-    assert response.json() == {"ok": True}
+    assert response.json()["ok"] is True
+    assert response.json()["sbom_key"] == manifest_row["sbom_key"]
+    assert len(statements) == 3
+    assert "FOR UPDATE" in statements[0][0]
+    assert "ON CONFLICT (channel, version, platform, arch) DO NOTHING" in statements[1][0]
+    assert "release_channels" in statements[2][0]
+    assert statements[1][1][5] == "release-v1"
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        ("2.0.0", "1.99.99", True),
+        ("2.10.0", "2.9.99", True),
+        ("2.10.4", "2.10.3", True),
+        ("2.9.0", "2.10.0", False),
+    ],
+)
+def test_release_version_order_is_numeric(left: str, right: str, expected: bool) -> None:
+    assert (releases._parse_release_version(left, "version") > releases._parse_release_version(right, "version")) is expected
+
+
+@pytest.mark.parametrize("version", ["01.2.3", "1.02.3", "1.2.03", "1.2", "1.2.3-rc.1", "1.2.3+build", "v1.2.3"])
+def test_release_version_rejects_noncanonical_and_prerelease(version: str) -> None:
+    with pytest.raises(Exception) as error:
+        releases._parse_release_version(version, "version")
+    assert getattr(error.value, "status_code", None) == 422
+
+
+def test_floor_update_locks_before_insert_and_rejects_numeric_rollback(
+    monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
+) -> None:
+    statements: list[str] = []
+
+    class Cursor:
+        rowcount = 1
+
+        def execute(self, statement: str, _values: tuple[Any, ...]) -> None:
+            statements.append(statement)
+
+        def fetchone(self) -> dict[str, str]:
+            return {"min_supported": "2.10.0"}
+
+    @contextmanager
+    def fake_tx():
+        yield Cursor()
+
+    monkeypatch.setattr(releases, "tx", fake_tx)
+    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
+    payload = {"channel": "stable", "platform": "linux", "arch": "x86_64", **manifest_row, "min_supported": "2.9.0"}
+    value = releases.PublishRelease(**payload)
+    with pytest.raises(Exception) as error:
+        releases._upsert_release(value)
+    assert getattr(error.value, "status_code", None) == 409
     assert len(statements) == 1
-    assert "ON CONFLICT (channel, version, platform, arch) DO UPDATE" in statements[0][0]
-    assert "key_id" in statements[0][0]
-    assert statements[0][1][5] == "release-v1"
-    assert statements[0][1][11:] == (
-        manifest_row["payload_manifest_key"],
-        manifest_row["payload_manifest_sha256"],
-        manifest_row["payload_signature_key"],
-        manifest_row["payload_signature_sha256"],
-    )
+    assert "FOR UPDATE" in statements[0]
+
+
+def test_floor_update_accepts_2_10_after_2_9_under_same_lock(
+    monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
+) -> None:
+    statements: list[str] = []
+
+    class Cursor:
+        rowcount = 1
+
+        def execute(self, statement: str, _values: tuple[Any, ...]) -> None:
+            statements.append(statement)
+
+        def fetchone(self) -> dict[str, str]:
+            return {"min_supported": "2.9.0"}
+
+    @contextmanager
+    def fake_tx():
+        yield Cursor()
+
+    monkeypatch.setattr(releases, "tx", fake_tx)
+    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
+    payload = {"channel": "stable", "platform": "linux", "arch": "x86_64", **manifest_row, "min_supported": "2.10.0"}
+    releases._upsert_release(releases.PublishRelease(**payload))
+    assert "FOR UPDATE" in statements[0]
+    assert "INSERT INTO releases" in statements[1]
+    assert "UPDATE release_channels" in statements[2]
+
 
 
 def test_publish_rejects_noncanonical_artifact_key(
@@ -182,7 +269,7 @@ def test_publish_rejects_signature_outside_artifact_domain(
         headers={"Authorization": "Bearer publish-secret"},
     )
     assert response.status_code == 422
-    assert response.json()["detail"] == "signature does not match key_id and sha256"
+    assert response.json()["detail"] == "signature does not match release identity and sha256"
 
 
 def test_publish_rejects_unknown_release_key_id(
@@ -245,11 +332,70 @@ def test_publish_rejects_identity_mismatched_payload_key(
     assert response.status_code == 422
     assert "payload_manifest_key" in response.json()["detail"]
 
+
+def test_publish_rejects_noncanonical_payload_digest(
+    monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
+) -> None:
+    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
+    monkeypatch.setenv("CHUDWARE_GATEWAY_RELEASE_TOKEN", "publish-secret")
+    payload = {"channel": "stable", "platform": "linux", "arch": "x86_64", **manifest_row}
+    payload["payload_signature_sha256"] = "A" * 64
+    app = FastAPI()
+    app.include_router(releases.router)
+    response = TestClient(app).post(
+        "/api/releases/latest/publish", json=payload,
+        headers={"Authorization": "Bearer publish-secret"},
+    )
+    assert response.status_code == 422
+    assert "payload_signature_sha256" in response.json()["detail"]
+
+@pytest.mark.parametrize("field", [
+    "sbom_key", "sbom_sha256", "sbom_signature_key", "sbom_signature_sha256",
+    "provenance_key", "provenance_sha256", "provenance_signature_key", "provenance_signature_sha256",
+    "platform_test_key", "platform_test_sha256", "platform_test_signature_key", "platform_test_signature_sha256",
+])
+def test_publish_rejects_missing_or_mismatched_evidence(monkeypatch, manifest_row, field):
+    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
+    monkeypatch.setenv("CHUDWARE_GATEWAY_RELEASE_TOKEN", "publish-secret")
+    payload = {"channel": "stable", "platform": "linux", "arch": "x86_64", **manifest_row}
+    if field.endswith("_key"):
+        payload[field] = "stable/stale/hostile"
+    else:
+        payload.pop(field)
+    app = FastAPI()
+    app.include_router(releases.router)
+    response = TestClient(app).post("/api/releases/latest/publish", json=payload, headers={"Authorization": "Bearer publish-secret"})
+    assert response.status_code == 422
+
+
+def test_only_publish_gate_updates_min_supported(monkeypatch, manifest_row):
+    statements = []
+    class Cursor:
+        rowcount = 1
+
+        def execute(self, statement, values):
+            statements.append((statement, values))
+
+        def fetchone(self):
+            return {"min_supported": None}
+    @contextmanager
+    def fake_tx():
+        yield Cursor()
+    monkeypatch.setattr(releases, "tx", fake_tx)
+    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
+    releases._upsert_release(releases.PublishRelease(channel="stable", platform="linux", arch="x86_64", **manifest_row))
+    updates = [(sql, values) for sql, values in statements if sql.startswith("UPDATE release_channels")]
+    assert len(updates) == 1
+    assert updates[0][1] == (manifest_row["min_supported"], "stable")
+
 def test_artifact_signature_preimage_is_domain_separated() -> None:
     digest = "a" * 64
-    assert releases._artifact_signature_preimage("release-v1", digest) == (
-        b"chudware-artifact-v1\0release-v1\0" + digest.encode("ascii")
-    )
+    assert releases._artifact_signature_preimage(
+        "release-v1", "1.2.3", "linux", "x86_64", digest
+    ) == b"\0".join((
+        b"chudware-artifact-v1", b"release-v1", b"1.2.3", b"linux",
+        b"x86_64", digest.encode("ascii"),
+    ))
 
 
 def test_release_manifest_is_exactly_soft_auth_public() -> None:

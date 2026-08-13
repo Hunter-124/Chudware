@@ -29,6 +29,10 @@
 #include <cstdlib>
 #include <cwctype>
 #include <vector>
+#include <filesystem>
+
+#include "security/integrity.h"
+#include "util/platform_paths.h"
 
 namespace chudware_ipc {
 
@@ -94,7 +98,9 @@ std::string fnv1aHex(const std::string& s) {
 }
 
 std::string instanceKey(const std::string& hostdBin) {
+#ifdef CHUDWARE_DEVELOPER_BUILD
     if (const char* k = std::getenv("CHUDWARE_INSTANCE_KEY"); k && *k) return k;
+#endif
     std::string id = hostdBin;
     if (!id.empty()) {
         // Canonicalize: GetFullPathNameW (the realpath analog for identity —
@@ -125,9 +131,10 @@ std::string stateDir() {
 }
 
 std::string socketPath(const std::string& key) {
-    // Full-name overrides, checked in the same order daemon_bridge.py uses.
+#ifdef CHUDWARE_DEVELOPER_BUILD
     if (const char* p = std::getenv("CHUDWARE_HOSTD_PIPE"); p && *p) return p;
     if (const char* p = std::getenv("CHUDWARE_HOSTD_SOCKET"); p && *p) return p;
+#endif
     return "\\\\.\\pipe\\chudware-hostd-" + currentUserSid() + "-" + key;
 }
 
@@ -152,13 +159,29 @@ std::string guiLockPath(const std::string& key) {
 }
 
 std::string resolveHostdBin(const std::string& hint) {
+#ifdef CHUDWARE_DEVELOPER_BUILD
     if (const char* b = std::getenv("CHUDWARE_HOSTD_BIN"); b && *b) return b;
     if (!hint.empty()) {
         DWORD attrs = GetFileAttributesW(widen(hint).c_str());
-        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY))
+        if (attrs != INVALID_FILE_ATTRIBUTES &&
+            !(attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)))
             return hint;
     }
     return "";
+#else
+    (void)hint;
+    namespace fs = std::filesystem;
+    const fs::path self = chudware::platform::executablePath();
+    if (self.empty()) return "";
+    const fs::path root = chudware::security::installedPayloadRoot(self);
+    const fs::path candidate = self.parent_path() / "chudware-hostd.exe";
+    std::error_code ec;
+    const std::string relative = fs::relative(candidate, root, ec).generic_string();
+    if (ec || relative.empty() || relative.starts_with("../")) return "";
+    const auto verified =
+        chudware::security::verifyInstalledManifestEntry(self, relative, "worker");
+    return verified.ok ? candidate.string() : std::string();
+#endif
 }
 
 // Named-mutex single instance. Like the POSIX flock, the claim evaporates on
@@ -196,57 +219,89 @@ void SingleInstance::release() {
 }
 
 bool spawnDetached(const std::string& exe, const std::string& arg, std::string& err) {
-    // Detach analog of the POSIX double-fork: no console, own process group, and
-    // — critically — try to BREAK OUT of any Job Object the spawner sits in.
-    // MCP clients under Claude Code often live in a KILL_ON_JOB_CLOSE job; a
-    // daemon left inside it would die when that agent session ends, which is
-    // exactly what a shared daemon must not do (plan Top-risk 1).
     std::wstring wexe = widen(exe);
     std::wstring cmd = L"\"" + wexe + L"\"";
     if (!arg.empty()) cmd += L" " + widen(arg);
+#ifndef CHUDWARE_DEVELOPER_BUILD
+    namespace fs = std::filesystem;
+    const fs::path self = chudware::platform::executablePath();
+    const fs::path root = chudware::security::installedPayloadRoot(self);
+    std::error_code ec;
+    const std::string relative = fs::relative(fs::path(exe), root, ec).generic_string();
+    if (ec || relative.empty() || relative.starts_with("../")) {
+        err = "hostd path is outside the installed payload";
+        return false;
+    }
+    HANDLE pinned = CreateFileW(wexe.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (pinned == INVALID_HANDLE_VALUE) {
+        err = lastErr("open verified hostd");
+        return false;
+    }
+    const auto verified = chudware::security::verifyInstalledManifestHandle(
+        self, relative, "worker", pinned);
+    if (!verified.ok) {
+        CloseHandle(pinned);
+        err = "hostd integrity verification failed: " + verified.detail;
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION pinnedInfo{};
+    if (!GetFileInformationByHandle(pinned, &pinnedInfo)) {
+        CloseHandle(pinned); err = lastErr("inspect verified hostd"); return false;
+    }
+#endif
 
     auto tryCreate = [&](DWORD flags) -> DWORD {
-        STARTUPINFOW si{};
-        si.cb = sizeof si;
+        STARTUPINFOW si{}; si.cb = sizeof si;
         PROCESS_INFORMATION pi{};
-        std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
-        cmdline.push_back(L'\0');  // CreateProcessW may modify lpCommandLine
-        if (!CreateProcessW(wexe.c_str(), cmdline.data(), nullptr, nullptr,
-                            /*inherit handles*/ FALSE, flags, nullptr, nullptr, &si,
-                            &pi))
+        std::vector<wchar_t> cmdline(cmd.begin(), cmd.end()); cmdline.push_back(L'\0');
+        if (!CreateProcessW(wexe.c_str(), cmdline.data(), nullptr, nullptr, FALSE,
+                            flags | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi))
             return GetLastError();
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
+#ifndef CHUDWARE_DEVELOPER_BUILD
+        wchar_t image[MAX_PATH]; DWORD imageLen = MAX_PATH;
+        bool same = QueryFullProcessImageNameW(pi.hProcess, 0, image, &imageLen) != FALSE;
+        HANDLE childImage = INVALID_HANDLE_VALUE;
+        if (same) childImage = CreateFileW(image, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                           OPEN_EXISTING,
+                                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                                           nullptr);
+        BY_HANDLE_FILE_INFORMATION childInfo{};
+        same = same && childImage != INVALID_HANDLE_VALUE &&
+               GetFileInformationByHandle(childImage, &childInfo) &&
+               childInfo.dwVolumeSerialNumber == pinnedInfo.dwVolumeSerialNumber &&
+               childInfo.nFileIndexHigh == pinnedInfo.nFileIndexHigh &&
+               childInfo.nFileIndexLow == pinnedInfo.nFileIndexLow;
+        if (childImage != INVALID_HANDLE_VALUE) CloseHandle(childImage);
+        if (!same) {
+            TerminateProcess(pi.hProcess, ERROR_BAD_EXE_FORMAT);
+            CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+            return ERROR_BAD_EXE_FORMAT;
+        }
+#endif
+        if (ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
+            DWORD e = GetLastError(); TerminateProcess(pi.hProcess, e);
+            CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return e;
+        }
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
         return ERROR_SUCCESS;
     };
 
     const DWORD base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
     DWORD e = tryCreate(base | CREATE_BREAKAWAY_FROM_JOB);
-    if (e == ERROR_SUCCESS) return true;
-
     if (e == ERROR_ACCESS_DENIED) {
-        // Likely breakaway denied by the enclosing job. Confirm, then retry
-        // WITHOUT the flag — a contained daemon beats no daemon (autosave bounds
-        // the loss; the next client respawns when the job dies).
-        BOOL inJob = FALSE;
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
+        BOOL inJob = FALSE; JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
         if (IsProcessInJob(GetCurrentProcess(), nullptr, &inJob) && inJob &&
             QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation,
-                                      &info, sizeof info, nullptr)) {
-            const DWORD lf = info.BasicLimitInformation.LimitFlags;
-            if (!(lf & JOB_OBJECT_LIMIT_BREAKAWAY_OK)) {
-                if (lf & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
-                    std::fprintf(
-                        stderr,
-                        "[chudware-hostd] WARNING: spawner is inside a KILL_ON_JOB_CLOSE "
-                        "job that denies breakaway — the daemon will DIE with this "
-                        "job (e.g. when the agent session ends). Start the Chudware "
-                        "GUI first for a durable daemon.\n");
-                e = tryCreate(base);
-                if (e == ERROR_SUCCESS) return true;
-            }
-        }
+                                      &info, sizeof info, nullptr) &&
+            !(info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK))
+            e = tryCreate(base);
     }
+#ifndef CHUDWARE_DEVELOPER_BUILD
+    CloseHandle(pinned);
+#endif
+    if (e == ERROR_SUCCESS) return true;
     err = "CreateProcessW " + exe + " failed (" + std::to_string(e) + ")";
     return false;
 }

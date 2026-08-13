@@ -336,6 +336,7 @@ if(EMSCRIPTEN)
   list(APPEND CHUDWARE_WASM_SOURCES
     src/wasm_stubs.cpp
     ../core/util/tweetnacl.c   # app_commands mutation-token verification
+    ../core/util/randombytes.cpp
     ../services/ipc/ipc_transport_wasm.cpp
     src/ui/reveng/webcam_capture.cpp   # RE-19 widget (uses camera_stub under web)
     src/platform/camera_stub.cpp)
@@ -348,11 +349,16 @@ else()
     src/ui/account_panel.cpp
     ../core/util/entitlement.cpp
     ../core/util/secret_store.cpp
+    ../core/util/device_identity.cpp
+    ../core/util/randombytes.cpp
     ../core/util/tweetnacl.c
     ../core/security/integrity.cpp
+    ../core/security/containment.cpp
+    ../core/security/runtime_guard.cpp
+    ../core/security/event_queue.cpp
     ../core/agent/http.cpp
     src/update/updater.cpp
-    ../core/security/integrity.cpp
+    src/update/windows_update_helper.cpp
     src/update/apply_linux.cpp
     src/update/apply_windows.cpp
     src/update/apply_macos.cpp
@@ -380,6 +386,7 @@ if(NOT EMSCRIPTEN)
       src/update/windows_update_helper_main.cpp
       src/update/windows_update_helper.cpp
       ../core/security/integrity.cpp
+      ../core/util/randombytes.cpp
       ../core/util/tweetnacl.c)
     target_include_directories(chudware-update-helper PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -533,6 +540,7 @@ if(WIN32)
   add_executable(chudware-uninstall-helper
     src/update/windows_uninstall_helper.cpp
     ../core/security/integrity.cpp
+    ../core/util/randombytes.cpp
     ../core/util/tweetnacl.c)
   target_include_directories(chudware-uninstall-helper PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../core)
@@ -594,6 +602,7 @@ add_executable(test_updater
   src/update/windows_update_helper.cpp
   src/update/apply_macos.cpp
   ../core/util/entitlement.cpp
+  ../core/util/randombytes.cpp
   ../core/util/tweetnacl.c
   ../core/agent/http.cpp)
 target_include_directories(test_updater PRIVATE
@@ -610,6 +619,27 @@ else()
 endif()
 set_target_properties(test_updater PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+add_executable(test_security
+  tests/test_security.cpp
+  ../core/security/integrity.cpp
+  ../core/security/containment.cpp
+  ../core/security/runtime_guard.cpp
+  ../core/security/event_queue.cpp
+  ../core/util/entitlement.cpp
+  ../core/util/randombytes.cpp
+  ../core/util/tweetnacl.c
+  ../core/util/device_identity.cpp
+  ../core/util/secret_store.cpp)
+target_include_directories(test_security PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../core ${miniz_SOURCE_DIR})
+target_link_libraries(test_security PRIVATE nlohmann_json::nlohmann_json chudware_host_miniz)
+if(WIN32)
+  target_link_libraries(test_security PRIVATE bcrypt crypt32)
+elseif(APPLE)
+  target_link_libraries(test_security PRIVATE "-framework Security")
+endif()
+set_target_properties(test_security PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_security COMMAND test_security)
 add_test(NAME test_updater COMMAND test_updater)
 if(CHUDWARE_DEVELOPER_BUILD AND NOT WIN32)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)

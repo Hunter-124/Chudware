@@ -176,6 +176,7 @@ private:
     // Lockfile fingerprint provisionDeps() last acted on in this process (see provisionDeps).
     std::string depsStamp_;
     bool pathsResolved_ = false;
+    bool running_ = false;
 
     // Background reader for the current generation's child. Joined (never detached) before a
     // respawn (ensureRunning) and on shutdown (stop()) so no thread outlives its stdio fds.

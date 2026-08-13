@@ -25,7 +25,7 @@ SVC_USER="${CHUDWARE_SERVICE_USER:-liveuser}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SVC_HOME="$(getent passwd "$SVC_USER" | cut -d: -f6)"
 SVC_UID="$(id -u "$SVC_USER")"
-SAFE_ITEMS=" sudo firewall tunnel updates keys backups gateway "
+SAFE_ITEMS=" sudo firewall tunnel updates keys backups gateway entitlement "
 
 note() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 would() { printf '   \033[33mwould:\033[0m %s\n' "$*"; }
@@ -304,6 +304,33 @@ if show backups; then
   fi
   (( age_count > 0 )) || die "no age-encrypted backup artifacts found"
   did "confirmed encrypted backups; no duplicate backup path added"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. entitlement credential — the online signing key is available only through
+# systemd's private credential directory. Provisioning is owner-interactive;
+# hardening verifies custody and refuses legacy raw-secret environment wiring.
+# ---------------------------------------------------------------------------
+if show entitlement; then
+  note "entitlement: verify encrypted systemd credential custody"
+  cred="$SVC_HOME/.config/credstore.encrypted/chudware-entitlement.cred"
+  env_file="$SVC_HOME/chudware-web-data/gateway.env"
+  unit_source="$SCRIPT_DIR/chudware-gateway.service"
+  [[ -f "$cred" ]] || die "missing $cred; run provision_entitlement_credential.sh prod as $SVC_USER"
+  [[ "$(stat -c '%a' "$cred")" = 600 ]] || die "$cred must have mode 600"
+  if grep -q '^CHUDWARE_ENTITLEMENT_KEY_PATH=' "$env_file" 2>/dev/null; then
+    die "remove CHUDWARE_ENTITLEMENT_KEY_PATH from gateway.env; only the systemd unit may supply it"
+  fi
+  grep -q '^LoadCredentialEncrypted=entitlement.key:' "$unit_source" \
+    || die "canonical gateway unit does not load the encrypted entitlement credential"
+  grep -q '^Environment=CHUDWARE_ENTITLEMENT_KEY_PATH=%d/entitlement.key$' "$unit_source" \
+    || die "canonical gateway unit does not point at the private credential directory"
+  if want entitlement; then
+    install -o "$SVC_USER" -g "$SVC_USER" -m 600 "$cred" "$cred"
+    did "verified machine-bound encrypted entitlement credential and systemd-only path"
+  else
+    would "verify credential mode, reject env-file wiring, and require LoadCredentialEncrypted"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -542,15 +542,6 @@ int main(int argc, char** argv) {
     return rc;
 #else
     const std::filesystem::path executable = chudware::platform::executablePath();
-#ifdef _WIN32
-    {
-        std::string recoveryError;
-        if (!chudware::update::recoverPendingWindowsUpdate(executable, &recoveryError)) {
-            std::fprintf(stderr, "chudware: update recovery failed: %s\n", recoveryError.c_str());
-            return 79;
-        }
-    }
-#endif
     if (argc == 4 && std::strcmp(argv[1], "--verify-payload-manifest") == 0) {
         const auto root = chudware::security::installedPayloadRoot(executable);
         const auto verified = chudware::security::verifyPayloadManifest(
@@ -563,6 +554,15 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+#ifdef _WIN32
+    {
+        std::string recoveryError;
+        if (!chudware::update::recoverPendingWindowsUpdate(executable, &recoveryError)) {
+            std::fprintf(stderr, "chudware: update recovery failed: %s\n", recoveryError.c_str());
+            return 79;
+        }
+    }
+#endif
     {
         const auto verified = chudware::security::verifyInstalledPayload(
             executable, chudware::security::VerifyMode::Startup);

@@ -275,20 +275,24 @@ std::vector<unsigned char> decodeBase64(std::string_view value) {
     return out;
 }
 
-bool signatureValid(const std::string& sha256, const std::string& keyId,
-                    const std::string& encoded) {
-    const auto* key = security::release::findKey(keyId);
-    const std::vector<unsigned char> signature = decodeBase64(encoded);
-    if (!key || signature.size() != crypto_sign_BYTES || sha256.size() != 64) return false;
+bool signatureValid(const Manifest& manifest) {
+    const auto* key = security::release::findKey(manifest.keyId);
+    const std::vector<unsigned char> signature = decodeBase64(manifest.signature);
+    if (!key || signature.size() != crypto_sign_BYTES || manifest.sha256.size() != 64)
+        return false;
 
     constexpr std::string_view domain = "chudware-artifact-v1";
     std::string preimage;
-    preimage.reserve(domain.size() + 1 + keyId.size() + 1 + sha256.size());
-    preimage.append(domain.data(), domain.size());
-    preimage.push_back('\0');
-    preimage.append(keyId.data(), keyId.size());
-    preimage.push_back('\0');
-    preimage.append(sha256);
+    preimage.reserve(domain.size() + manifest.keyId.size() + manifest.version.size() +
+                     manifest.platform.size() + manifest.arch.size() + manifest.sha256.size() + 5);
+    const std::array<std::string_view, 6> fields{
+        domain, std::string_view(manifest.keyId), std::string_view(manifest.version),
+        std::string_view(manifest.platform), std::string_view(manifest.arch),
+        std::string_view(manifest.sha256)};
+    for (const std::string_view field : fields) {
+        if (!preimage.empty()) preimage.push_back('\0');
+        preimage.append(field.data(), field.size());
+    }
 
     std::vector<unsigned char> signedMessage(signature.size() + preimage.size());
     std::copy(signature.begin(), signature.end(), signedMessage.begin());
@@ -336,6 +340,8 @@ bool manifestFromJson(const std::string& body, Manifest& out, std::string& error
         const json value = json::parse(body);
         out.version = value.at("version").get<std::string>();
         out.minSupported = value.at("min_supported").get<std::string>();
+        out.platform = value.at("platform").get<std::string>();
+        out.arch = value.at("arch").get<std::string>();
         out.keyId = value.at("key_id").get<std::string>();
         out.sha256 = value.at("sha256").get<std::string>();
         out.size = value.at("size").get<std::uint64_t>();
@@ -343,9 +349,10 @@ bool manifestFromJson(const std::string& body, Manifest& out, std::string& error
         out.notesUrl = value.at("notes_url").get<std::string>();
         out.url = value.value("url", std::string());
         if (!parseVersion(out.version) || !parseVersion(out.minSupported) ||
+            out.platform != platformName() || out.arch != architectureName() ||
             out.keyId.empty() || out.sha256.size() != 64 || out.size == 0 ||
             out.signature.empty())
-            throw std::runtime_error("invalid manifest fields");
+            throw std::runtime_error("invalid manifest fields or target identity");
         if (!std::all_of(out.sha256.begin(), out.sha256.end(), [](char c) {
                 return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
             })) throw std::runtime_error("invalid manifest digest");
@@ -416,7 +423,8 @@ bool runExtractor(const std::filesystem::path& artifact,
     return true;
 }
 
-bool verifyInnerPayload(const std::filesystem::path& artifact, std::string& error) {
+bool verifyInnerPayload(const std::filesystem::path& artifact, const Manifest& outer,
+                        std::string& error) {
     const auto base = std::filesystem::temp_directory_path() /
         ("chudware-update-inspect-" + std::to_string(static_cast<long long>(::getpid())) +
          "-" + std::to_string(Clock::now().time_since_epoch().count()));
@@ -450,6 +458,19 @@ bool verifyInnerPayload(const std::filesystem::path& artifact, std::string& erro
     if (!result.ok) {
         error = "inner payload integrity failed (" +
             std::string(security::integrityReasonName(result.reason)) + "): " + result.detail;
+        return false;
+    }
+    try {
+        const json inner = json::parse(std::ifstream(manifest));
+        if (inner.at("version").get<std::string>() != outer.version ||
+            inner.at("platform").get<std::string>() != outer.platform ||
+            inner.at("arch").get<std::string>() != outer.arch ||
+            inner.at("key_id").get<std::string>() != outer.keyId) {
+            error = "inner payload identity does not match outer release metadata";
+            return false;
+        }
+    } catch (const std::exception&) {
+        error = "inner payload identity is malformed";
         return false;
     }
     return true;
@@ -560,8 +581,8 @@ struct Updater::Impl {
                         error = "downloaded update SHA-256 does not match manifest";
                     else if (!security::release::findKey(manifest.keyId))
                         error = "downloaded update release key id is unknown";
-                    else if (!signatureValid(digest, manifest.keyId, manifest.signature))
-                        error = "downloaded update Ed25519 signature is invalid";
+                    else if (!signatureValid(manifest))
+                        error = "downloaded update Ed25519 identity signature is invalid";
                     else
                         return true;
                 }
@@ -575,12 +596,7 @@ struct Updater::Impl {
         return false;
     }
 
-    bool writeStagedMetadata(const Manifest& manifest, const std::filesystem::path& artifact,
-                             std::string& error) {
-        const json value = {{"version", manifest.version}, {"min_supported", manifest.minSupported},
-            {"key_id", manifest.keyId}, {"sha256", manifest.sha256}, {"size", manifest.size},
-            {"signature", manifest.signature}, {"notes_url", manifest.notesUrl},
-            {"url", manifest.url}, {"artifact", artifact.filename().string()}};
+    bool writeMetadataAtomic(json value, std::string& error) {
         const auto temporary = stagedMetadata().string() + ".tmp";
         {
             std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
@@ -592,17 +608,43 @@ struct Updater::Impl {
             }
         }
         std::error_code ec;
+#if defined(_WIN32)
+        if (!MoveFileExW(std::filesystem::path(temporary).c_str(), stagedMetadata().c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            ec = std::error_code(static_cast<int>(GetLastError()), std::system_category());
+        }
+#else
         std::filesystem::rename(temporary, stagedMetadata(), ec);
+#endif
         if (ec) {
             std::filesystem::remove(temporary);
-            error = "could not atomically stage update metadata: " + ec.message();
+            error = "could not atomically persist update metadata: " + ec.message();
             return false;
         }
         return true;
     }
 
+    bool writeStagedMetadata(const Manifest& manifest, const std::filesystem::path& artifact,
+                             std::string& error) {
+        const json value = {{"state", "staged"}, {"version", manifest.version},
+            {"min_supported", manifest.minSupported}, {"platform", manifest.platform},
+            {"arch", manifest.arch}, {"key_id", manifest.keyId}, {"sha256", manifest.sha256},
+            {"size", manifest.size}, {"signature", manifest.signature},
+            {"notes_url", manifest.notesUrl}, {"url", manifest.url},
+            {"artifact", artifact.filename().string()}};
+        return writeMetadataAtomic(value, error);
+    }
+
     bool verifyAndStage(const Manifest& manifest, const std::filesystem::path& downloaded,
                         std::string& error) {
+        const auto current = parseVersion(currentVersion);
+        const auto target = parseVersion(manifest.version);
+        if (!current || !target || compareParsed(*target, *current) <= 0) {
+            error = "update target must be a strict semantic-version upgrade";
+            std::filesystem::remove(downloaded);
+            reportOnce(manifest, error);
+            return false;
+        }
         if (!verifyFile(manifest, downloaded, error, true)) return false;
 #if !defined(_WIN32)
         // Developer unit fixtures intentionally exercise only the outer artifact
@@ -613,7 +655,7 @@ struct Updater::Impl {
 #else
         constexpr bool requireInnerPayload = true;
 #endif
-        if (requireInnerPayload && !verifyInnerPayload(downloaded, error)) {
+        if (requireInnerPayload && !verifyInnerPayload(downloaded, manifest, error)) {
             std::filesystem::remove(downloaded);
             reportOnce(manifest, error);
             return false;
@@ -896,26 +938,63 @@ void Updater::configure(std::string currentVersion, std::filesystem::path dataDi
     impl_->stopping = false;
     impl_->mandatoryActive = false;
     impl_->status = {};
+    // A verified replacement launch finalizes the transaction left by the old
+    // process. Cleanup happens only after the new executable has started.
+    if (std::filesystem::is_regular_file(impl_->stagedMetadata())) {
+        try {
+            auto value = json::parse(std::ifstream(impl_->stagedMetadata()));
+            if (value.value("state", "staged") == "applying" &&
+                compareVersions(impl_->currentVersion,
+                                value.at("version").get<std::string>()) >= 0) {
+                value["state"] = "committed";
+                std::string error;
+                if (impl_->writeMetadataAtomic(value, error)) {
+                    std::error_code ec;
+                    std::filesystem::remove(impl_->updateDir() /
+                        value.at("artifact").get<std::string>(), ec);
+                    std::filesystem::remove(impl_->stagedMetadata(), ec);
+                }
+            }
+        } catch (const std::exception&) {
+            // applyStagedBeforeWindow owns malformed metadata rejection.
+        }
+    }
 }
 
 ApplyResult Updater::applyStagedBeforeWindow() {
     Manifest manifest;
     std::filesystem::path artifact;
+    json metadata;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         if (!impl_->configured || !std::filesystem::is_regular_file(impl_->stagedMetadata()))
             return ApplyResult::NothingStaged;
         try {
-            const json value = json::parse(std::ifstream(impl_->stagedMetadata()));
-            manifest.version = value.at("version").get<std::string>();
-            manifest.minSupported = value.at("min_supported").get<std::string>();
-            manifest.keyId = value.at("key_id").get<std::string>();
-            manifest.sha256 = value.at("sha256").get<std::string>();
-            manifest.size = value.at("size").get<std::uint64_t>();
-            manifest.signature = value.at("signature").get<std::string>();
-            manifest.notesUrl = value.at("notes_url").get<std::string>();
-            manifest.url = value.value("url", std::string());
-            artifact = impl_->updateDir() / value.at("artifact").get<std::string>();
+            metadata = json::parse(std::ifstream(impl_->stagedMetadata()));
+            const std::string state = metadata.value("state", "staged");
+            if (state == "committed") {
+                std::error_code ec;
+                const auto committedArtifact = impl_->updateDir() /
+                    metadata.at("artifact").get<std::string>();
+                std::filesystem::remove(committedArtifact, ec);
+                std::filesystem::remove(impl_->stagedMetadata(), ec);
+                return ApplyResult::NothingStaged;
+            }
+            // An applying marker means handoff already succeeded. The replacement
+            // launch owns final cleanup; this process must never apply it again.
+            if (state == "applying") return ApplyResult::NothingStaged;
+            if (state != "staged") throw std::runtime_error("invalid staged state");
+            manifest.version = metadata.at("version").get<std::string>();
+            manifest.minSupported = metadata.at("min_supported").get<std::string>();
+            manifest.platform = metadata.at("platform").get<std::string>();
+            manifest.arch = metadata.at("arch").get<std::string>();
+            manifest.keyId = metadata.at("key_id").get<std::string>();
+            manifest.sha256 = metadata.at("sha256").get<std::string>();
+            manifest.size = metadata.at("size").get<std::uint64_t>();
+            manifest.signature = metadata.at("signature").get<std::string>();
+            manifest.notesUrl = metadata.at("notes_url").get<std::string>();
+            manifest.url = metadata.value("url", std::string());
+            artifact = impl_->updateDir() / metadata.at("artifact").get<std::string>();
         } catch (const std::exception&) {
             std::filesystem::remove(impl_->stagedMetadata());
             return ApplyResult::Rejected;
@@ -924,15 +1003,29 @@ ApplyResult Updater::applyStagedBeforeWindow() {
             requiresMandatoryUpdate(impl_->currentVersion, manifest.minSupported);
     }
     std::string error;
-    if (!impl_->verifyFile(manifest, artifact, error, true)) {
+    const auto current = parseVersion(impl_->currentVersion);
+    const auto target = parseVersion(manifest.version);
+    if (!current || !target || compareParsed(*target, *current) <= 0 ||
+        manifest.platform != platformName() || manifest.arch != architectureName() ||
+        !impl_->verifyFile(manifest, artifact, error, true)) {
         std::filesystem::remove(impl_->stagedMetadata());
         return ApplyResult::Rejected;
     }
+    metadata["state"] = "applying";
+    if (!impl_->writeMetadataAtomic(metadata, error)) {
+        impl_->setStatus(State::Error, &manifest, error, manifest.notesUrl);
+        return ApplyResult::Failed;
+    }
     const ApplyResult result = applyPlatformArtifact(
         artifact, impl_->executablePath, manifest.version, &error);
+    if (result != ApplyResult::Relaunching) {
+        metadata["state"] = "staged";
+        std::string restoreError;
+        if (!impl_->writeMetadataAtomic(metadata, restoreError) && error.empty())
+            error = std::move(restoreError);
+    }
     if (result == ApplyResult::ManualDownload) {
-        impl_->setStatus(State::ManualDownload, &manifest, error,
-                         manifest.notesUrl);
+        impl_->setStatus(State::ManualDownload, &manifest, error, manifest.notesUrl);
     } else if (result == ApplyResult::Failed) {
         impl_->setStatus(State::Error, &manifest, error, manifest.notesUrl);
     }
@@ -998,3 +1091,46 @@ Updater& globalUpdater() {
 }
 
 }  // namespace chudware::update
+
+namespace chudware::update::testing {
+
+StagedTransactionState stagedTransactionState(const std::filesystem::path& metadata) {
+    if (!std::filesystem::is_regular_file(metadata)) return StagedTransactionState::Missing;
+    try {
+        const std::string state = nlohmann::json::parse(std::ifstream(metadata)).value("state", "staged");
+        if (state == "staged") return StagedTransactionState::Staged;
+        if (state == "applying") return StagedTransactionState::Applying;
+        if (state == "committed") return StagedTransactionState::Committed;
+    } catch (const std::exception&) {}
+    return StagedTransactionState::Invalid;
+}
+
+bool transitionStagedTransaction(const std::filesystem::path& metadata,
+                                 StagedTransactionState expected,
+                                 StagedTransactionState desired,
+                                 std::string* error) {
+    if (stagedTransactionState(metadata) != expected) {
+        if (error) *error = "unexpected staged transaction state";
+        return false;
+    }
+    try {
+        auto value = nlohmann::json::parse(std::ifstream(metadata));
+        const char* name = desired == StagedTransactionState::Staged ? "staged" :
+            desired == StagedTransactionState::Applying ? "applying" :
+            desired == StagedTransactionState::Committed ? "committed" : nullptr;
+        if (!name) throw std::runtime_error("invalid desired staged transaction state");
+        value["state"] = name;
+        const auto temporary = metadata.string() + ".tmp";
+        { std::ofstream out(temporary, std::ios::binary | std::ios::trunc); out << value.dump();
+          if (!out) throw std::runtime_error("could not write staged transaction"); }
+        std::error_code ec;
+        std::filesystem::rename(temporary, metadata, ec);
+        if (ec) throw std::runtime_error(ec.message());
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+}  // namespace chudware::update::testing

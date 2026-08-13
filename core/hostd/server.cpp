@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <thread>
@@ -15,6 +16,10 @@
 #endif
 
 #include "../../services/worker/cpp_core.h"
+#include "../util/entitlement.h"
+#include "../util/secret_store.h"
+#include "../security/containment.h"
+#include "../../services/ipc/ipc_discovery.h"
 #include "hostd_log.h"
 #include "mfg_lane.h"
 #include "worker_bridge.h"
@@ -29,6 +34,14 @@ static long selfPid() {
 #else
     return (long)::getpid();
 #endif
+}
+
+static std::string entitlementSubject() {
+    std::vector<unsigned char> bytes;
+    if (!chudware::secret_store::load("com.chudware.desktop", "entitlement-subject-v1", bytes,
+                                      chudware_ipc::stateDir()))
+        return {};
+    return std::string(bytes.begin(), bytes.end());
 }
 static std::string authenticatedPeerIdentity(const ClientConn& c) {
 #if defined(__linux__)
@@ -539,6 +552,19 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0}};
     }
     if (method == "ping") return json{{"ok", true}};
+    // Containment is checked before every handler that can mutate daemon state,
+    // supervise a child, enter the engine, or lazily spawn/forward to a worker.
+    // Unknown methods fail closed here rather than reaching either passthrough.
+    const bool lifecycleReadOnly = method == "daemon_status" || method == "attach_doc" ||
+                                   method == "detach_doc" || method == "subscribe";
+    const bool containedAllowed = lifecycleReadOnly || DocRegistry::isReadOnlyMethod(method);
+    const auto containment = chudware::security::loadEmbeddedEnforcementState(
+        chudware_ipc::stateDir(), entitlementSubject(), std::time(nullptr));
+    if (!containment.active() && !containedAllowed) {
+        isError = true;
+        return json{{"code", "entitlement_read_only"},
+                    {"message", "protected operation disabled"}};
+    }
     const std::string authenticatedSeat = authenticatedPeerIdentity(c);
     // hello.client is display/routing metadata only. It cannot attest a human at
     // the keyboard, so manufacturing sees every raw socket as non-human.

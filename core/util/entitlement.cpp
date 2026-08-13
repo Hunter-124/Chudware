@@ -13,19 +13,9 @@
 extern "C" {
 #include "util/tweetnacl.h"
 }
+extern "C" void randombytes(unsigned char*, unsigned long long);
 
-#if defined(_WIN32)
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
-#  include <bcrypt.h>
-#elif defined(__APPLE__)
-#  include <Security/Security.h>
-#else
-#  include <cerrno>
-#  include <fcntl.h>
-#  include <sys/random.h>
-#  include <unistd.h>
-#endif
+
 
 namespace {
 
@@ -117,40 +107,6 @@ bool exactString(const json& value, const char* name, std::string& out) {
 
 }  // namespace
 
-extern "C" void randombytes(unsigned char* out, unsigned long long length) {
-#if defined(_WIN32)
-    if (BCryptGenRandom(nullptr, out, static_cast<ULONG>(length),
-                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0)
-        return;
-#elif defined(__APPLE__)
-    if (SecRandomCopyBytes(kSecRandomDefault, static_cast<size_t>(length), out) == errSecSuccess)
-        return;
-#else
-    unsigned long long done = 0;
-    while (done < length) {
-        const ssize_t n = ::getrandom(out + done, static_cast<size_t>(length - done), 0);
-        if (n > 0) {
-            done += static_cast<unsigned long long>(n);
-            continue;
-        }
-        if (n < 0 && errno == EINTR) continue;
-        break;
-    }
-    if (done == length) return;
-    const int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) {
-        while (done < length) {
-            const ssize_t n = ::read(fd, out + done, static_cast<size_t>(length - done));
-            if (n > 0) done += static_cast<unsigned long long>(n);
-            else if (n < 0 && errno == EINTR) continue;
-            else break;
-        }
-        ::close(fd);
-        if (done == length) return;
-    }
-#endif
-    std::terminate();  // never produce predictable crypto material
-}
 
 namespace chudware::entitlement {
 
@@ -268,31 +224,112 @@ bool verifyRefusal(std::string_view payloadJson,
     }
 }
 
-int graceDaysFor(std::int64_t issuedAt, std::int64_t subscribedSince) {
-    if (issuedAt <= subscribedSince) return 7;
-    const std::int64_t months = (issuedAt - subscribedSince) / 2592000;
-    return static_cast<int>(std::clamp<std::int64_t>(7 + months, 7, 30));
+bool verifySecurityPolicy(std::string_view policyJson,
+                          const std::array<unsigned char, kPublicKeyBytes>& publicKey,
+                          std::string_view expectedSubject, SecurityPolicy& policy,
+                          std::string* error) {
+    try {
+        json value = json::parse(policyJson);
+        if (!value.is_object() || !value.contains("signature") ||
+            !value["signature"].is_string()) {
+            setError(error, "security policy shape is invalid");
+            return false;
+        }
+        const std::string signature = value["signature"].get<std::string>();
+        const bool customer = value.value("telemetry_mode", std::string()) == "customer_endpoint";
+        const std::size_t expectedSize = customer ? 10u : 9u;
+        if (value.size() != expectedSize || value.value("id", std::string()) !=
+                value.value("telemetry_mode", std::string()) ||
+            value.value("subject", std::string()) != expectedSubject ||
+            !value["issued_at"].is_number_integer() || !value["expires_at"].is_number_integer()) {
+            setError(error, "security policy values are invalid");
+            return false;
+        }
+        static const std::set<std::string> common = {
+            "id", "subject", "email", "entitlement_nonce", "request_nonce",
+            "issued_at", "expires_at", "telemetry_mode", "signature"};
+        for (auto it = value.begin(); it != value.end(); ++it)
+            if (!common.count(it.key()) && it.key() != "customer_endpoint") {
+                setError(error, "security policy contains an unknown field");
+                return false;
+            }
+        const std::string endpoint = customer ? value.value("customer_endpoint", std::string()) : std::string();
+        if ((customer && (endpoint.rfind("https://", 0) != 0 || endpoint.size() <= 8 ||
+                          endpoint.find('@', 8) != std::string::npos)) ||
+            (!customer && value.contains("customer_endpoint"))) {
+            setError(error, "customer security endpoint is invalid");
+            return false;
+        }
+        value.erase("signature");
+        std::vector<unsigned char> sig;
+        if (!decodeBase64Url(signature, sig) || sig.size() != crypto_sign_BYTES) {
+            setError(error, "security policy signature is invalid");
+            return false;
+        }
+        const std::string canonical = value.dump();
+        std::vector<unsigned char> signedMessage(sig);
+        signedMessage.insert(signedMessage.end(), canonical.begin(), canonical.end());
+        std::vector<unsigned char> opened(signedMessage.size());
+        unsigned long long openedLength = 0;
+        if (crypto_sign_open(opened.data(), &openedLength, signedMessage.data(),
+                             signedMessage.size(), publicKey.data()) != 0 ||
+            openedLength != canonical.size()) {
+            setError(error, "security policy signature is invalid");
+            return false;
+        }
+        SecurityPolicy parsed;
+        parsed.id = value["id"].get<std::string>();
+        if (parsed.id != "standard" && parsed.id != "minimized" && parsed.id != "customer_endpoint") {
+            setError(error, "security policy mode is invalid");
+            return false;
+        }
+        parsed.subject = value["subject"].get<std::string>();
+        parsed.customerEndpoint = endpoint;
+        parsed.issuedAt = value["issued_at"].get<std::int64_t>();
+        parsed.expiresAt = value["expires_at"].get<std::int64_t>();
+        if (parsed.issuedAt <= 0 || parsed.expiresAt <= parsed.issuedAt) {
+            setError(error, "security policy lifetime is invalid");
+            return false;
+        }
+        policy = std::move(parsed);
+        if (error) error->clear();
+        return true;
+    } catch (const std::exception&) {
+        setError(error, "security policy is not valid JSON");
+        return false;
+    }
 }
+
+bool verifyEmbeddedSecurityPolicy(std::string_view policyJson,
+                                  std::string_view expectedSubject, SecurityPolicy& policy,
+                                  std::string* error) {
+    return verifySecurityPolicy(policyJson, kEmbeddedPublicKey, expectedSubject, policy, error);
+}
+
 
 std::int64_t graceDeadline(const TokenPayload& payload,
                            std::int64_t lastSuccessfulCheckinWall) {
     const std::int64_t byCheckin = lastSuccessfulCheckinWall +
                                    static_cast<std::int64_t>(payload.graceDays) * 86400;
-    const std::int64_t byPayment = payload.paidThrough + 3 * 86400;
+    const std::int64_t byPayment = payload.paidThrough;
     return std::min(byCheckin, byPayment);
 }
 
 OfflineDecision offlineAccess(const TokenPayload& payload,
                               const CheckinStamp& lastSuccessfulCheckin,
-                              std::int64_t nowWall, double nowMonotonic) {
+                              std::int64_t nowWall, double nowMonotonic,
+                              std::string_view currentBootId) {
     OfflineDecision out;
     out.deadline = graceDeadline(payload, lastSuccessfulCheckin.wallSeconds);
 
-    // A persisted steady-clock value is comparable only while it has not reset
-    // (same boot). During that interval it is the authoritative elapsed clock.
-    const bool sameMonotonicEpoch = lastSuccessfulCheckin.monotonicSeconds >= 0.0 &&
-                                    nowMonotonic >= lastSuccessfulCheckin.monotonicSeconds;
-    if (sameMonotonicEpoch) {
+    // Steady-clock values are meaningful only within the exact boot that produced
+    // them. A non-empty boot identifier prevents low post-reboot uptime from being
+    // mistaken for a clock reset within the same monotonic epoch.
+    const bool sameBoot = !lastSuccessfulCheckin.bootId.empty() &&
+                          lastSuccessfulCheckin.bootId == currentBootId;
+    const bool validSteady = sameBoot && lastSuccessfulCheckin.monotonicSeconds >= 0.0 &&
+                             nowMonotonic >= lastSuccessfulCheckin.monotonicSeconds;
+    if (validSteady) {
         const double elapsed = nowMonotonic - lastSuccessfulCheckin.monotonicSeconds;
         const double expectedWall = static_cast<double>(lastSuccessfulCheckin.wallSeconds) + elapsed;
         if (static_cast<double>(nowWall) < expectedWall - 3600.0) {
@@ -302,9 +339,16 @@ OfflineDecision offlineAccess(const TokenPayload& payload,
         }
         const auto graceRemaining = static_cast<std::int64_t>(
             static_cast<double>(payload.graceDays * 86400) - elapsed);
-        const auto paymentRemaining = payload.paidThrough + 3 * 86400 - nowWall;
+        // A rolled-back wall clock must not add paid time. The monotonic projection
+        // is the minimum credible current wall time on the same boot.
+        const auto effectiveWall = std::max(
+            static_cast<double>(nowWall), expectedWall);
+        const auto paymentRemaining = static_cast<std::int64_t>(
+            static_cast<double>(payload.paidThrough) - effectiveWall);
         out.secondsRemaining = std::min(graceRemaining, paymentRemaining);
     } else {
+        // Across reboots there is no comparable steady epoch: use wall time only.
+        // In particular, never treat low uptime as extra paid or grace time.
         out.secondsRemaining = out.deadline - nowWall;
     }
 

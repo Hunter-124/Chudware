@@ -27,6 +27,8 @@
 #if defined(_WIN32)
 #include <filesystem>
 #endif
+#include "security/integrity.h"
+#include "security/runtime_guard.h"
 #include "util/platform_paths.h"
 
 #include "bootstrap.h"
@@ -575,6 +577,7 @@ bool fileExists(const std::string &p) {
 }
 
 #endif
+#ifndef __EMSCRIPTEN__
 std::string adjacentWorkerBinary(std::string &err) {
   const std::string executable = chudware::platform::executablePath();
   if (executable.empty()) {
@@ -602,16 +605,35 @@ bool sameCanonicalPath(const std::string &left, const std::string &right) {
   const auto canonicalRight = std::filesystem::weakly_canonical(right, rightEc);
   return !leftEc && !rightEc && canonicalLeft == canonicalRight;
 }
+#endif
 } // namespace
 
 WorkerClient::~WorkerClient() { stop(); }
 
+namespace {
+bool allowWorkerSpawn(std::string& err) {
+  const auto executable = chudware::platform::executablePath();
+  const auto integrity = chudware::security::verifyInstalledPayload(
+      executable, chudware::security::VerifyMode::ProtectedOperation);
+  if (!integrity.ok) {
+    err = "worker spawn blocked: protected_file_hash_mismatch";
+    return false;
+  }
+  const auto decision = chudware::security::inspectAndPersistRuntime(
+      chudware::security::SecurityCheckpoint::BeforeWorkerSpawn,
+      integrity.root, integrity.files, chudware::security::runtimeGuardStateDir().string());
+  if (decision.allowed()) return true;
+  err = "worker spawn blocked: " + decision.denialReason;
+  return false;
+}
+}  // namespace
 bool WorkerClient::start(std::string &err, const std::string &module) {
 #ifdef __EMSCRIPTEN__
   (void)module;
   err = "WASM: Python worker not available (daemon mode only)";
   return false;
 #else
+  if (!allowWorkerSpawn(err)) return false;
   std::string repo;
   std::string launcher;
   bool compiledWorker = false;

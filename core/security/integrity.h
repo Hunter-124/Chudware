@@ -56,11 +56,37 @@ FileVerdict verifyManifestEntry(const std::filesystem::path& root,
                                 std::string_view expectedSha256,
                                 std::uint32_t expectedMode = 0);
 
+// Verifies exactly one named manifest row after authenticating the canonical manifest.
+// Fails closed when the path is absent, duplicated, or has a different kind.
+FileVerdict verifyInstalledManifestEntry(const std::filesystem::path& executable,
+                                         std::string_view relativePath,
+                                         std::string_view expectedKind);
+
+#if defined(_WIN32)
+FileVerdict verifyInstalledManifestHandle(const std::filesystem::path& executable,
+                                          std::string_view relativePath,
+                                          std::string_view expectedKind,
+                                          void* fileHandle);
+#else
+FileVerdict verifyInstalledManifestFd(const std::filesystem::path& executable,
+                                      std::string_view relativePath,
+                                      std::string_view expectedKind,
+                                      int fd);
+#endif
+
 IntegrityResult verifyPayloadManifest(const std::filesystem::path& root,
                                       const std::filesystem::path& manifest,
                                       const std::filesystem::path& signature,
                                       VerifyMode mode = VerifyMode::Full,
                                       const std::filesystem::path& executable = {});
+
+// Verifies the exact caller-held manifest/signature bytes. Callers that pin file handles
+// use this overload so the authenticated bytes are the same bytes they subsequently parse.
+IntegrityResult verifyPayloadManifestBytes(const std::filesystem::path& root,
+                                           std::string_view manifestBytes,
+                                           std::string_view signatureBytes,
+                                           VerifyMode mode = VerifyMode::Full,
+                                           const std::filesystem::path& executable = {});
 
 IntegrityResult verifyInstalledPayload(const std::filesystem::path& executable,
                                        VerifyMode mode);

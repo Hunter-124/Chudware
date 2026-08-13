@@ -37,6 +37,9 @@
 #include "agent/firm_team.h"
 #include "agent/logging_provider.h"
 #include "agent/machine.h"
+#include "security/integrity.h"
+#include "security/runtime_guard.h"
+#include "util/platform_paths.h"
 #include "agent/mission.h"
 #include "agent/ops_emit.h"
 #include "agent/providers.h"
@@ -651,6 +654,20 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
                             const json& history, const json& attachments,
                             const json& chudware_actor, RunEvents& events, json& turn_out,
                             std::string& err, bool& crashed, bool& timed_out) {
+    const auto executable = chudware::platform::executablePath();
+    const auto integrity = chudware::security::verifyInstalledPayload(
+        executable, chudware::security::VerifyMode::ProtectedOperation);
+    if (!integrity.ok) {
+        err = "worker spawn blocked: protected_file_hash_mismatch";
+        return false;
+    }
+    const auto security = chudware::security::inspectAndPersistRuntime(
+        chudware::security::SecurityCheckpoint::BeforeWorkerSpawn,
+        integrity.root, integrity.files, chudware::security::runtimeGuardStateDir().string());
+    if (!security.allowed()) {
+        err = "worker spawn blocked: " + security.denialReason;
+        return false;
+    }
     bool compiled_worker = false;
     const std::string worker_bin = admin_worker_bin(compiled_worker, err);
     if (worker_bin.empty()) {

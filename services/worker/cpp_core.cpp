@@ -1,6 +1,10 @@
 // CppCore implementation — see cpp_core.h.
 #include <cstdio>
 #include "cpp_core.h"
+#include "security/integrity.h"
+#include "util/platform_paths.h"
+
+#include <filesystem>
 
 #include <cstdlib>
 #include <vector>
@@ -12,7 +16,8 @@
 #  include <windows.h>
 #else
 #  include <dlfcn.h>
-#  include "util/platform_paths.h"
+#  include <fcntl.h>
+#  include <unistd.h>
 #endif
 
 namespace core {
@@ -68,26 +73,52 @@ bool CppCore::ensureLoaded(std::string& err) {
     err = "WASM: in-process libchudware not available (daemon mode only)";
     return false;
 #elif !defined(_WIN32)
-// POSIX: dlopen the engine (libchudware.so on ELF, libchudware.dylib on Mach-O).
-// Resolve order (first successful load wins — keep this deterministic so a
-// staged dist/exe-dir binary cannot silently lose to a stale LD_LIBRARY_PATH):
-//   1. $CHUDWARE_LIBCHUDWARE — explicit absolute path
-//   2. CHUDWARE_DEFAULT_LIBCHUDWARE (compile-time build-tree path, if set by CMake)
-//   3. the engine next to the running host/hostd executable (staged install)
-//   4. the bare filename via the dynamic loader (rpath / LD_LIBRARY_PATH)
-// Note: when the GUI is in daemon mode (default), hostd is the process that
-// actually dlopens; the GUI only sees hostd's engine_build_id via hello.
-// A long-lived hostd holding a stale .so is the "builds go elsewhere" trap —
-// hostd self-drains on mtime change of selfBinary_ + loadedPath().
+// POSIX developer builds retain explicit/build-tree/loader candidates. Production
+// accepts only the canonical library owned by the adjacent signed payload manifest.
 std::vector<std::string> candidates;
+#ifdef CHUDWARE_DEVELOPER_BUILD
 if (const char* env = std::getenv("CHUDWARE_LIBCHUDWARE"); env && env[0])
     candidates.push_back(env);
-#ifdef CHUDWARE_DEFAULT_LIBCHUDWARE
-candidates.push_back(CHUDWARE_DEFAULT_LIBCHUDWARE);  // build-tree fallback (set by CMake)
-#endif
+#  ifdef CHUDWARE_DEFAULT_LIBCHUDWARE
+candidates.push_back(CHUDWARE_DEFAULT_LIBCHUDWARE);
+#  endif
 std::string dir = exe_dir();
 if (!dir.empty()) candidates.push_back(dir + "/" + kEngineLib);
-candidates.push_back(kEngineLib);  // last resort: loader search
+candidates.push_back(kEngineLib);
+#else
+const std::filesystem::path self = chudware::platform::executablePath();
+const std::filesystem::path root = chudware::security::installedPayloadRoot(self);
+#if defined(__APPLE__)
+const std::filesystem::path candidate = root / "Contents" / "Frameworks" / kEngineLib;
+#elif defined(__linux__)
+const std::filesystem::path candidate = root / "usr" / "lib" / kEngineLib;
+#else
+const std::filesystem::path candidate = self.parent_path() / kEngineLib;
+#endif
+std::error_code ec;
+const std::string relative = std::filesystem::relative(candidate, root, ec).generic_string();
+if (self.empty() || ec || relative.empty() || relative.starts_with("../")) {
+    err = "canonical libchudware path is outside the installed payload";
+    return false;
+}
+int pinnedFd = ::open(candidate.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+if (pinnedFd < 0) {
+    err = "canonical libchudware could not be opened without following links";
+    return false;
+}
+const auto verified =
+    chudware::security::verifyInstalledManifestFd(self, relative, "library", pinnedFd);
+if (!verified.ok) {
+    ::close(pinnedFd);
+    err = "libchudware integrity verification failed: " + verified.detail;
+    return false;
+}
+#if defined(__linux__)
+candidates.push_back("/proc/self/fd/" + std::to_string(pinnedFd));
+#else
+candidates.push_back(candidate.string());
+#endif
+#endif
 
 void* h = nullptr;
 std::string loadDiag;
@@ -98,6 +129,9 @@ for (const std::string& path : candidates) {
     const char* de = dlerror();
     loadDiag += "[" + path + " -> " + (de ? de : "?") + "] ";
 }
+#ifndef CHUDWARE_DEVELOPER_BUILD
+::close(pinnedFd);
+#endif
 if (!h) {
     err = std::string("could not load ") + kEngineLib + ": " + loadDiag;
     if (const char* lp = std::getenv("CHUDWARE_LOG_FILE"); lp && lp[0]) {
@@ -146,21 +180,15 @@ std::fprintf(stderr,
 std::fflush(stderr);
 return true;
 #else
-    // Candidate paths in priority order (mirrors MCP core_bridge + Linux build-tree fallbacks).
     std::vector<std::wstring> candidates;
+#ifdef CHUDWARE_DEVELOPER_BUILD
     auto push_env = [&](const char* name) {
-        if (const char* env = std::getenv(name); env && env[0])
-            candidates.push_back(widen(env));
+        if (const char* env = std::getenv(name); env && env[0]) candidates.push_back(widen(env));
     };
-    push_env("CHUDWARE_LIBCHUDWARE");
     push_env("CHUDWARE_LIBCHUDWARE");
     std::wstring dir = exe_dir();
     if (!dir.empty()) candidates.push_back(dir + L"\\libchudware.dll");
-    // Dev-tree fallbacks: Ninja windows-occt preset, then VS multi-config OCCT build.
-    // Walk up from the exe (…/host/build-win/bin → repo root) when present.
     if (!dir.empty()) {
-        // host/build-win/bin → ../../../build/windows-occt/bin
-        // host/build/bin/Release → ../../../../build/windows-occt/bin (rare)
         const wchar_t* rels[] = {
             L"\\..\\..\\..\\build\\windows-occt\\bin\\libchudware.dll",
             L"\\..\\..\\..\\..\\build\\windows-occt\\bin\\libchudware.dll",
@@ -168,33 +196,61 @@ return true;
             L"\\..\\..\\..\\dist\\Chudware\\libchudware.dll",
             L"\\..\\..\\..\\..\\dist\\Chudware\\libchudware.dll",
         };
-        for (const wchar_t* rel : rels)
-            candidates.push_back(dir + rel);
+        for (const wchar_t* rel : rels) candidates.push_back(dir + rel);
     }
-    candidates.push_back(L"libchudware.dll");  // last resort: default search order
-
-    HMODULE h = nullptr;
+    candidates.push_back(L"libchudware.dll");
+#else
+    const std::filesystem::path self = chudware::platform::executablePath();
+    const std::filesystem::path root = chudware::security::installedPayloadRoot(self);
+    const std::filesystem::path candidate = self.parent_path() / "libchudware.dll";
+    std::error_code ec;
+    const std::string relative = std::filesystem::relative(candidate, root, ec).generic_string();
+    if (self.empty() || ec || relative.empty() || relative.starts_with("../")) {
+        err = "canonical libchudware path is outside the installed payload";
+        return false;
+    }
+    HANDLE pinnedFile = INVALID_HANDLE_VALUE;
+    const auto verified = [&] {
+        pinnedFile = CreateFileW(candidate.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                 nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (pinnedFile == INVALID_HANDLE_VALUE) {
+            chudware::security::FileVerdict failed;
+            failed.detail = "canonical libchudware could not be opened exclusively";
+            return failed;
+        }
+        return chudware::security::verifyInstalledManifestHandle(
+            self, relative, "library", pinnedFile);
+    }();
+    if (!verified.ok) {
+        if (pinnedFile != INVALID_HANDLE_VALUE) CloseHandle(pinnedFile);
+        err = "libchudware integrity verification failed: " + verified.detail;
+        return false;
+    }
+    candidates.push_back(candidate.wstring());
+#endif
     std::string loadDiag;
     std::wstring winnerW;
     for (const std::wstring& path : candidates) {
-        // Resolve the DLL's directory and add it to the PROCESS search path. This is the
-        // crucial bit: LOAD_WITH_ALTERED_SEARCH_PATH adds that directory only for
-        // libchudware's DIRECT imports — it does NOT cover TRANSITIVE deps (a dep loaded by
-        // an OCCT TK*.dll or gmsh-4.15.dll). Those transitive loads use the normal process
-        // search, so an OCCT-internal sibling that lives only in the build dir came back
-        // ERROR_MOD_NOT_FOUND (126) inside the host, even though libchudware itself was found.
-        // SetDllDirectoryW puts the build dir on the process search path, which DOES apply
-        // to the whole dependency chain.
+#ifdef CHUDWARE_DEVELOPER_BUILD
         size_t slash = path.find_last_of(L"\\/");
         if (slash != std::wstring::npos) SetDllDirectoryW(path.substr(0, slash).c_str());
         h = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+#else
+        h = LoadLibraryExW(path.c_str(), nullptr,
+                           LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+#endif
         if (h) { winnerW = path; break; }
         DWORD gle = GetLastError();
-        // narrow the wide path for the diagnostic
         std::string p(path.begin(), path.end());
         loadDiag += "[" + p + " -> Win32 " + std::to_string(gle) + "] ";
     }
-    SetDllDirectoryW(nullptr);  // restore the default search path
+#ifndef CHUDWARE_DEVELOPER_BUILD
+    CloseHandle(pinnedFile);
+#endif
+#ifdef CHUDWARE_DEVELOPER_BUILD
+    SetDllDirectoryW(nullptr);
+#endif
     if (!h) {
         err = "could not load libchudware.dll: " + loadDiag;
         if (const char* lp = std::getenv("CHUDWARE_LOG_FILE"); lp && lp[0]) {

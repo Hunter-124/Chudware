@@ -15,6 +15,8 @@ Environment=CHUDWARE_WEB_PUBLIC_URL=https://staging.chudware.com
 Environment=CHUDWARE_MAIL_BACKEND=console
 Environment=CHUDWARE_DEPLOY_ENV=staging
 Environment=CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES=4194304
+LoadCredentialEncrypted=entitlement.key:%h/.config/credstore.encrypted/chudware-entitlement-staging.cred
+Environment=CHUDWARE_ENTITLEMENT_KEY_PATH=%d/entitlement.key
 # Staging may use a Stripe test key or run with billing disabled. Every other
 # key form is a configuration error here, including live and restricted-live.
 ExecStartPre=/usr/bin/bash -c 'case "${CHUDWARE_WEB_STRIPE_SECRET_KEY:-}" in ""|sk_test_*|rk_test_*) exit 0;; *) echo "ERROR: staging accepts only Stripe test credentials" >&2; exit 1;; esac'

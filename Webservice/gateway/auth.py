@@ -49,8 +49,8 @@ SUPPORT_EMAIL = "support@chudware.com"
 PUBLIC_PATHS = frozenset(
     {
         "/healthz", "/api/billing/webhook", "/api/entitlement/refresh",
-        "/api/releases/latest", "/api/auth", "/signin", "/signup",
-        "/forgot", "/reset", "/auth-assets",
+        "/api/security/events", "/api/releases/latest", "/api/auth",
+        "/signin", "/signup", "/forgot", "/reset", "/auth-assets",
     }
 )
 

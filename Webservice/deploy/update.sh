@@ -42,7 +42,8 @@ case "$ENVIRONMENT" in
     DATA_ROOT="${CHUDWARE_WEB_DATA:-$HOME/chudware-web-data}"
     GATEWAY_ENV="${CHUDWARE_WEB_GATEWAY_ENV:-$DATA_ROOT/gateway.env}"
     GATEWAY_UNIT="chudware-gateway.service"
-    GATEWAY_PORT=8300
+    RETENTION_UNIT="chudware-security-retention.service"
+    RETENTION_TIMER="chudware-security-retention.timer"
     EXPECTED_DB="chudware_prod"
     DO_HOST=1
     DO_ENGINE=1
@@ -53,7 +54,8 @@ case "$ENVIRONMENT" in
     GATEWAY_ENV="${CHUDWARE_WEB_GATEWAY_ENV:-$DATA_ROOT/gateway.env}"
     GATEWAY_UNIT="chudware-gateway-staging.service"
     GATEWAY_PORT=8310
-    EXPECTED_DB="chudware_staging"
+    RETENTION_UNIT="chudware-security-retention-staging.service"
+    RETENTION_TIMER="chudware-security-retention-staging.timer"
     DO_HOST=0
     DO_ENGINE=0
     DO_WEBD=0
@@ -280,6 +282,42 @@ finally:
 PY
   )
 }
+install_current_units() {
+  local unit_dir="$HOME/.config/systemd/user"
+  mkdir -p "$unit_dir"
+  install -m 644 "$REPO/Webservice/deploy/$GATEWAY_UNIT" "$unit_dir/$GATEWAY_UNIT"
+  install -m 644 "$REPO/Webservice/deploy/$RETENTION_UNIT" "$unit_dir/$RETENTION_UNIT"
+  install -m 644 "$REPO/Webservice/deploy/$RETENTION_TIMER" "$unit_dir/$RETENTION_TIMER"
+  systemctl --user daemon-reload \
+    || { echo "ERROR: systemd user daemon-reload failed" >&2; exit 1; }
+}
+enable_security_retention() {
+  # Retention is operational hygiene, not a gateway availability dependency.
+  # Surface failures in this deploy's journal/log but continue the gateway rollout.
+  systemctl --user disable --now chudware-security-retention.timer chudware-security-retention-staging.timer >/dev/null 2>&1 || true
+  if ! systemctl --user enable --now "$RETENTION_UNIT" "$RETENTION_TIMER"; then
+    echo "WARN: failed to enable retention for $ENVIRONMENT; expired security batches will not be purged" >&2
+  fi
+}
+assert_entitlement_credential() {
+  local encrypted
+  case "$ENVIRONMENT" in
+    prod) encrypted="$HOME/.config/credstore.encrypted/chudware-entitlement.cred" ;;
+    staging) encrypted="$HOME/.config/credstore.encrypted/chudware-entitlement-staging.cred" ;;
+  esac
+  [[ -f "$encrypted" && -r "$encrypted" ]] \
+    || { echo "ERROR: encrypted entitlement credential is missing: $encrypted" >&2; exit 1; }
+  local mode
+  mode="$(stat -c '%a' "$encrypted")"
+  [[ "$mode" = 600 ]] \
+    || { echo "ERROR: encrypted entitlement credential must have mode 600: $encrypted ($mode)" >&2; exit 1; }
+  if env_value CHUDWARE_ENTITLEMENT_KEY_PATH | grep -q .; then
+    echo "ERROR: remove CHUDWARE_ENTITLEMENT_KEY_PATH from $GATEWAY_ENV; the systemd unit owns it" >&2
+    exit 1
+  fi
+  echo "    entitlement credential: encrypted, mode 600"
+}
+
 
 post_deploy_health_assert() {
   local base health_path me_path attempts health_email health_sid
@@ -358,6 +396,7 @@ if [[ "$DO_GATEWAY" = 1 ]]; then
     ""|0|false|False|FALSE|no|No|NO|off|Off|OFF) ;;
     *) echo "ERROR: CHUDWARE_WEB_DEV must be disabled for $ENVIRONMENT deployments" >&2; exit 1 ;;
   esac
+  assert_entitlement_credential
   assert_database_target
   backup_database
 fi
@@ -415,6 +454,8 @@ fi
 if [[ "$DO_GATEWAY" = 1 ]]; then
   install_gateway_requirements
   run_migrations
+  install_current_units
+  enable_security_retention
   echo "=== [$(date -Iseconds)] restart $GATEWAY_UNIT ==="
   systemctl --user cat "$GATEWAY_UNIT" >/dev/null 2>&1 \
     || { echo "ERROR: $GATEWAY_UNIT is not installed" >&2; exit 1; }

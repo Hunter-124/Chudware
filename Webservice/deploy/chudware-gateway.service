@@ -10,6 +10,10 @@ WorkingDirectory=%h/Repositories/CAD/Webservice/gateway
 EnvironmentFile=-%h/chudware-web-data/gateway.env
 EnvironmentFile=-%h/chudware-web/webd.env
 Environment=CHUDWARE_WEB_DATA=%h/chudware-web-data
+# systemd decrypts this into a private runtime credential directory. The key
+# never enters gateway.env, the database, the repository, or /proc environ.
+LoadCredentialEncrypted=entitlement.key:%h/.config/credstore.encrypted/chudware-entitlement.cred
+Environment=CHUDWARE_ENTITLEMENT_KEY_PATH=%d/entitlement.key
 # Keep uvicorn's WebSocket frame ceiling identical to the gateway forwarding
 # budget. EnvironmentFile overrides this default when the operator tunes it.
 Environment=CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES=4194304

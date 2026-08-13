@@ -19,11 +19,9 @@ namespace core {
 
 class CppCore {
 public:
-    // Lazily load libchudware.{so,dll}. Resolve order (first hit wins):
-    //   1. $CHUDWARE_LIBCHUDWARE / $CHUDWARE_LIBCHUDWARE (explicit absolute path)
-    //   2. CHUDWARE_DEFAULT_LIBCHUDWARE (compile-time build-tree path, if set)
-    //   3. libchudware next to the running host/hostd executable (staged install)
-    //   4. bare name via the dynamic loader (rpath / LD_DIRECTORY / PATH)
+    // Lazily load libchudware.{so,dylib,dll}. Developer builds retain explicit,
+    // build-tree and loader-search candidates. Production loads only the canonical
+    // installed payload location after authenticating its exact signed manifest row.
     // Logs the winner once to stderr: "[cpp_core] loaded libchudware ... path=...".
     // Safe to call repeatedly; only loads once.
     bool ensureLoaded(std::string& err);

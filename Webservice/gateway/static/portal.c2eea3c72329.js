@@ -14,13 +14,15 @@
   function number(value) { return new Intl.NumberFormat().format(Number(value || 0)); }
   function date(value) {
     if (!value) return "—";
+    var parsed = typeof value === "number" ? new Date(value * 1000) : new Date(value);
     return new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" })
-      .format(new Date(Number(value) * 1000));
+      .format(parsed);
   }
   function dateTime(value) {
     if (!value) return "Never";
+    var parsed = typeof value === "number" ? new Date(value * 1000) : new Date(value);
     return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
-      .format(new Date(Number(value) * 1000));
+      .format(parsed);
   }
   function relativeDays(value) {
     if (!value) return null;
@@ -43,6 +45,26 @@
     box.classList.toggle("error", Boolean(isError));
     box.hidden = false;
     window.setTimeout(function () { box.hidden = true; }, 7000);
+  }
+  var SAFE_REASON_LABELS = {
+    integrity_violation: "App integrity issue",
+    identity_mismatch: "Device identity changed",
+    credential_compromise: "Credential security issue",
+    replay_detected: "Repeated security receipt",
+    policy_violation: "Security policy issue",
+    anomalous_activity: "Unusual device activity"
+  };
+  function reasonLabels(codes) {
+    var labels = (Array.isArray(codes) ? codes : []).map(function (code) {
+      return SAFE_REASON_LABELS[String(code)] || "Security policy issue";
+    });
+    return labels.filter(function (label, index) { return labels.indexOf(label) === index; }).join(", ") || "No action recorded";
+  }
+  function securityState(device) {
+    return String(device.security_status || (device.revoked_at ? "revoked" : "active"));
+  }
+  function securityStateLabel(value) {
+    return ({ active: "Active", pending: "Review pending", revoked: "Revoked", restored: "Restored", upheld: "Upheld" })[value] || "Under review";
   }
 
   async function api(path, options) {
@@ -289,18 +311,41 @@
 
   async function loadDevices(force) {
     if (state.loaded.devices && !force) return;
-    var payload = await api("/api/portal/devices");
+    var results = await Promise.all([api("/api/portal/devices"), api("/api/portal/security-appeals")]);
+    var devices = results[0].devices || [];
+    var appeals = results[1].appeals || [];
     var table = el("device-rows"); clear(table);
-    var devices = payload.devices || [];
-    if (!devices.length) { var row = document.createElement("tr"); var cell = text("td", "No desktop devices are authorized.", "empty"); cell.colSpan = 5; row.appendChild(cell); table.appendChild(row); }
+    var select = el("appeal-subject");
+    while (select.options.length > 1) select.remove(1);
+    if (!devices.length) { var row = document.createElement("tr"); var cell = text("td", "No desktop devices are authorized.", "empty"); cell.colSpan = 7; row.appendChild(cell); table.appendChild(row); }
     devices.forEach(function (device) {
+      var status = securityState(device);
       var row = document.createElement("tr");
-      row.append(text("td", device.device_name), text("td", dateTime(device.created_at)), text("td", dateTime(device.last_checkin_at)), text("td", device.revoked_at ? "Revoked" : "Active", device.revoked_at ? "status-revoked" : "status-active"));
+      row.append(text("td", device.device_name), text("td", dateTime(device.created_at)), text("td", dateTime(device.last_checkin_at)), text("td", securityStateLabel(status), "status-" + status), text("td", reasonLabels(device.reason_codes)), text("td", dateTime(device.action_at || device.revoked_at)));
       var action = document.createElement("td");
       if (!device.revoked_at) { var button = text("button", "Revoke", "danger small"); button.dataset.subject = device.subject; action.appendChild(button); }
+      if (device.revoked_at && !appeals.some(function (appeal) { return appeal.subject === device.subject && appeal.state === "pending"; })) {
+        var option = document.createElement("option"); option.value = device.subject; option.textContent = device.device_name; select.appendChild(option);
+      }
       row.appendChild(action); table.appendChild(row);
     });
+    renderAppeals(appeals);
+    el("appeal-submit").disabled = select.options.length === 1;
     state.loaded.devices = true;
+  }
+
+  function renderAppeals(appeals) {
+    var host = el("appeal-list"); clear(host);
+    if (!appeals.length) { host.appendChild(text("p", "No appeals submitted. Revoked devices eligible for review appear in the form.", "empty")); return; }
+    appeals.forEach(function (appeal) {
+      var item = text("article", "", "appeal-item");
+      var head = text("div", "", "appeal-item-head");
+      head.append(text("strong", appeal.device_name || "Previous device"), text("span", securityStateLabel(appeal.state), "status-" + appeal.state));
+      item.append(head, text("p", reasonLabels(appeal.reason_codes)), text("small", "Action " + dateTime(appeal.action_at) + " · Submitted " + dateTime(appeal.created_at)));
+      if (appeal.resolved_at) item.appendChild(text("small", "Decision recorded " + dateTime(appeal.resolved_at)));
+      if (appeal.decision_note) item.appendChild(text("p", appeal.decision_note, "appeal-note"));
+      host.appendChild(item);
+    });
   }
 
   async function loadPage(name) {
@@ -358,6 +403,17 @@
   el("release-channel").addEventListener("change", function () { loadDownloads(true).catch(function (error) { showMessage(error.message, true); }); });
   qa(".download-action").forEach(function (button) { button.addEventListener("click", function () { var card = button.closest(".download-card"); var release = state.releases.get(card.dataset.platform + ":" + card.dataset.arch); if (release && release.url) window.location.assign(release.url); }); });
   el("device-rows").addEventListener("click", async function (event) { var button = event.target.closest("button[data-subject]"); if (!button || !window.confirm("Revoke this desktop device?")) return; button.disabled = true; try { await api("/api/portal/devices/" + encodeURIComponent(button.dataset.subject), { method: "DELETE" }); await loadDevices(true); showMessage("Device revoked. Its next refresh will be refused.", false); } catch (error) { button.disabled = false; showMessage(error.message, true); } });
+  el("appeal-message").addEventListener("input", function () { el("appeal-count").textContent = this.value.length + " / 4096"; });
+  el("appeal-form").addEventListener("submit", async function (event) {
+    event.preventDefault();
+    var status = el("appeal-status"); var submit = el("appeal-submit");
+    submit.disabled = true; status.textContent = "Submitting appeal…";
+    try {
+      await api("/api/portal/security-appeals", { method: "POST", body: JSON.stringify({ subject: el("appeal-subject").value, message: el("appeal-message").value }) });
+      this.reset(); el("appeal-count").textContent = "0 / 4096"; state.loaded.devices = false; await loadDevices(true);
+      status.textContent = "Appeal submitted. You can continue to open, view, and export documents while it is reviewed.";
+    } catch (error) { status.textContent = error.message; submit.disabled = false; }
+  });
   window.addEventListener("hashchange", function () { setPage(window.location.hash.slice(1), false); });
 
   setPage(window.location.hash.slice(1) || "account", false);

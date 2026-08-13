@@ -5,6 +5,9 @@
 #include <cstring>
 
 #include "hostd_log.h"
+#include "security/integrity.h"
+#include "security/runtime_guard.h"
+#include "util/platform_paths.h"
 
 #ifdef _WIN32
 
@@ -179,8 +182,26 @@ void WorkerBridge::reap() {
     running_ = false;
 }
 
+namespace {
+bool allowWorkerSpawn(std::string& err) {
+    const auto executable = chudware::platform::executablePath();
+    const auto integrity = chudware::security::verifyInstalledPayload(
+        executable, chudware::security::VerifyMode::ProtectedOperation);
+    if (!integrity.ok) {
+        err = "worker spawn blocked: protected_file_hash_mismatch";
+        return false;
+    }
+    const auto decision = chudware::security::inspectAndPersistRuntime(
+        chudware::security::SecurityCheckpoint::BeforeWorkerSpawn,
+        integrity.root, integrity.files, chudware::security::runtimeGuardStateDir().string());
+    if (decision.allowed()) return true;
+    err = "worker spawn blocked: " + decision.denialReason;
+    return false;
+}
+}  // namespace
 bool WorkerBridge::spawn(std::string& err) {
     // Caller holds mtx_. running_ must be false / fds closed.
+    if (!allowWorkerSpawn(err)) return false;
     if (!pathsResolved_) {
 #ifdef CHUDWARE_DEVELOPER_BUILD
         const std::string home = homeDir();

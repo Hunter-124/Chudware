@@ -310,6 +310,15 @@
                            color: var(--muted, #8b93a3); font-size: .85rem; }
   .account-card .ac-actions { gap: 8px; }
   .account-card .ac-actions .btn, .account-card .ac-actions .rm-btn { flex: 1 1 auto; min-height: 40px; }
+  .appeal-admin-list { display: grid; gap: 10px; }
+  .appeal-admin-item { border: 1px solid var(--border, #2a2e36); border-radius: 10px; padding: 12px; background: var(--bg, #0e1013); }
+  .appeal-admin-head { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
+  .appeal-admin-head strong { word-break: break-all; }
+  .appeal-admin-meta, .appeal-admin-reason { color: var(--muted, #8b93a3); font-size: .78rem; line-height: 1.5; margin: 6px 0 0; }
+  .appeal-resolve { display: grid; gap: 8px; margin-top: 10px; }
+  .appeal-resolve label { display: grid; gap: 4px; color: var(--muted, #8b93a3); font-size: .76rem; }
+  .appeal-resolve textarea { width: 100%; min-height: 64px; resize: vertical; }
+  .appeal-actions { display: flex; flex-wrap: wrap; gap: 8px; }
   #browse-modal > div {
     max-width: 640px;
     margin: 8vh auto;
@@ -419,6 +428,12 @@
         <button type="button" class="btn ghost" id="account-next">Next</button>
       </div>
       <div id="admin-status" aria-live="polite"></div>
+    </div>
+    <div class="admin-card">
+      <h2>Security appeals <span class="pill st-pending" id="appeal-pending" hidden></span></h2>
+      <p style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 10px">Review customer-provided context and bounded reason categories. Internal evidence and score thresholds are not shown. Restoring requires the customer to sign in again and never reactivates a compromised device key.</p>
+      <div id="admin-appeal-list" class="appeal-admin-list" aria-live="polite"><p class="ac-dim">Loading appeals…</p></div>
+      <div id="admin-appeal-status" class="ac-dim" role="status" aria-live="polite"></div>
     </div>
     <div class="admin-card">
       <h2>Trial domains</h2>

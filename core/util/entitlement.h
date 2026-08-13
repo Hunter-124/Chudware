@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include <vector>
+#include <nlohmann/json_fwd.hpp>
 
 namespace chudware::entitlement {
 
@@ -31,6 +31,7 @@ struct TokenPayload {
 struct CheckinStamp {
     std::int64_t wallSeconds = 0;
     double monotonicSeconds = 0.0;
+    std::string bootId;
 };
 
 enum class OfflineAccess {
@@ -69,13 +70,31 @@ bool verifyRefusal(std::string_view payloadJson,
                    std::string* reason = nullptr,
                    std::string* error = nullptr);
 
-int graceDaysFor(std::int64_t issuedAt, std::int64_t subscribedSince);
+// Strict signed server-policy verification. The endpoint is accepted only from
+// the authenticated policy object and only for customer_endpoint mode.
+struct SecurityPolicy {
+    std::string id;
+    std::string subject;
+    std::string customerEndpoint;
+    std::int64_t issuedAt = 0;
+    std::int64_t expiresAt = 0;
+};
+bool verifySecurityPolicy(std::string_view policyJson,
+                          const std::array<unsigned char, kPublicKeyBytes>& publicKey,
+                          std::string_view expectedSubject,
+                          SecurityPolicy& policy,
+                          std::string* error = nullptr);
+bool verifyEmbeddedSecurityPolicy(std::string_view policyJson,
+                                  std::string_view expectedSubject,
+                                  SecurityPolicy& policy,
+                                  std::string* error = nullptr);
 std::int64_t graceDeadline(const TokenPayload& payload,
                            std::int64_t lastSuccessfulCheckinWall);
 OfflineDecision offlineAccess(const TokenPayload& payload,
                               const CheckinStamp& lastSuccessfulCheckin,
                               std::int64_t nowWall,
-                              double nowMonotonic);
+                              double nowMonotonic,
+                              std::string_view currentBootId);
 
 // XSalsa20-Poly1305 (TweetNaCl secretbox). The key must be a stable,
 // device-derived 32-byte digest. This is a speed bump against casual copying,

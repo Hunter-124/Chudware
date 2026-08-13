@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
-# Assemble the AppleClang host build into a redistributable Chudware.app and zip.
+# Assemble the AppleClang host build into a redistributable, source-free Chudware.app and zip.
+# Two phase: --prepare-signing --key-id ID retains the immutable .app and emits a preimage;
+# --finalize-signing SIG --release-public-key KEY seals and archives that exact retained bundle.
+# Release configure: generate into host/build-macos-<arch>/generated/protected-assets, then
+# configure host and core/hostd with -DCHUDWARE_DEVELOPER_BUILD=OFF.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$REPO/dist"
 KEEP_APP=0
+MODE=""
+KEY_ID="${CHUDWARE_RELEASE_KEY_ID:-}"
+FINALIZE_SIGNATURE=""
+RELEASE_PUBLIC_KEY="${CHUDWARE_RELEASE_PUBLIC_KEY:-}"
+RELEASE_PYTHON="${CHUDWARE_RELEASE_PYTHON:-python3}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -14,9 +23,202 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         --keep-app) KEEP_APP=1; shift ;;
+        --prepare-signing)
+            [ -z "$MODE" ] || { echo "error: choose exactly one signing mode" >&2; exit 2; }
+            MODE=prepare; shift ;;
+        --key-id)
+            [ "$#" -ge 2 ] || { echo "error: --key-id requires an id" >&2; exit 2; }
+            KEY_ID="$2"; shift 2 ;;
+        --finalize-signing)
+            [ -z "$MODE" ] || { echo "error: choose exactly one signing mode" >&2; exit 2; }
+            [ "$#" -ge 2 ] || { echo "error: --finalize-signing requires a signature" >&2; exit 2; }
+            MODE=finalize; FINALIZE_SIGNATURE="$2"; shift 2 ;;
+        --release-public-key)
+            [ "$#" -ge 2 ] || { echo "error: --release-public-key requires a PEM path or canonical base64 key" >&2; exit 2; }
+            RELEASE_PUBLIC_KEY="$2"; shift 2 ;;
         *) echo "error: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+[ -n "$MODE" ] || { echo "error: --prepare-signing or --finalize-signing is required" >&2; exit 2; }
+if [ "$MODE" = prepare ]; then
+    [ -n "$KEY_ID" ] || { echo "error: --key-id is required with --prepare-signing" >&2; exit 2; }
+else
+    [ -f "$FINALIZE_SIGNATURE" ] && [ -s "$FINALIZE_SIGNATURE" ] || {
+        echo "error: --finalize-signing must name a detached signature" >&2; exit 2;
+    }
+    [ -n "$RELEASE_PUBLIC_KEY" ] || {
+        echo "error: --release-public-key is required with --finalize-signing" >&2; exit 2;
+    }
+fi
+
+require_production_cache() {
+    local build_dir="$1" label="$2" cache="$1/CMakeCache.txt"
+    [ -f "$cache" ] || { echo "error: $label has no CMakeCache.txt: $cache" >&2; exit 1; }
+    grep -Fxq 'CHUDWARE_DEVELOPER_BUILD:BOOL=OFF' "$cache" || {
+        echo "error: $label was not explicitly configured with CHUDWARE_DEVELOPER_BUILD=OFF" >&2
+        exit 1
+    }
+}
+
+build_omp_bridge() {
+    local destination="$1"
+    command -v bun >/dev/null 2>&1 || { echo "error: Bun is required to compile chudware-omp-bridge" >&2; exit 1; }
+    echo "==> installing locked vendored OMP workspace"
+    (cd "$REPO/vendor/omp" && bun install --frozen-lockfile)
+    echo "==> compiling chudware-omp-bridge"
+    (cd "$REPO/vendor/omp" && bun build --compile --sourcemap=none --packages=bundle \
+        --reject-unresolved --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
+        --no-compile-autoload-package-json bridge/src/bridge.ts --outfile "$destination")
+    [ -x "$destination" ] || { echo "error: Bun did not produce $destination" >&2; exit 1; }
+}
+
+generate_protected_assets() {
+    echo "==> generating protected prompt and role tables"
+    "$RELEASE_PYTHON" "$REPO/packaging/embed_protected_assets.py" \
+        --source-root "$REPO" --output-dir "$PROTECTED_ASSETS_OUT"
+    [ -f "$PROTECTED_ASSETS_OUT/python/chudware_protected_assets.py" ] || {
+        echo "error: protected Python asset table was not generated" >&2
+        exit 1
+    }
+    [ -f "$PROTECTED_ASSETS_OUT/include/chudware/protected_assets.generated.h" ] || {
+        echo "error: protected C++ asset table was not generated" >&2
+        exit 1
+    }
+}
+prepare_signing_metadata() {
+    local root="$1" request="$2"
+    PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
+import sys
+from pathlib import Path
+from services.installer.payload_manifest import build_manifest, verify_manifest_payload, write_manifest, write_signing_preimage
+root = Path(sys.argv[1])
+manifest, canonical, _ = build_manifest(root, version=sys.argv[2], platform="macos",
+                                        arch=sys.argv[3], key_id=sys.argv[4])
+write_manifest(root, canonical)
+verify_manifest_payload(root, canonical)
+write_signing_preimage(Path(sys.argv[5]), manifest["key_id"], canonical)
+' "$root" "$VERSION" "$ARCH" "$KEY_ID" "$request"
+}
+
+finalize_signing_metadata() {
+    local root="$1"
+    PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
+import json, sys
+from pathlib import Path
+from services.installer.payload_manifest import canonical_manifest_bytes, finalize_signature
+root = Path(sys.argv[1])
+canonical = (root / "payload-manifest.v1.json").read_bytes()
+manifest = json.loads(canonical.decode("utf-8"))
+if canonical_manifest_bytes(manifest) != canonical:
+    raise SystemExit("retained payload manifest is not exact canonical JSON")
+finalize_signature(root, key_id=manifest["key_id"], canonical_json=canonical,
+                   signature_path=Path(sys.argv[2]), public_key=sys.argv[3])
+' "$root" "$FINALIZE_SIGNATURE" "$RELEASE_PUBLIC_KEY"
+    chmod 0644 "$MANIFEST_PATH" "$SIGNATURE_PATH"
+}
+
+verify_staged_manifest() {
+    local root="$1"
+    PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
+import sys
+from pathlib import Path
+from services.installer.payload_manifest import verify_manifest_payload
+root = Path(sys.argv[1])
+verify_manifest_payload(root, (root / "payload-manifest.v1.json").read_bytes())
+' "$root"
+}
+
+verify_manifest_rows_unchanged() {
+    local root="$1"
+    PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
+import json, sys
+from pathlib import Path
+from services.installer.payload_manifest import canonical_manifest_bytes, snapshot_payload
+root, manifest_path = map(Path, sys.argv[1:])
+canonical = manifest_path.read_bytes()
+manifest = json.loads(canonical.decode("utf-8"))
+if canonical_manifest_bytes(manifest) != canonical or manifest["platform"] != "macos":
+    raise SystemExit("external macOS payload manifest is invalid")
+rows = manifest["files"]
+kinds = {row["path"]: row["kind"] for row in rows}
+actual = [item.manifest_row() for item in snapshot_payload(
+    root, [row["path"] for row in rows], kind_for_path=lambda path: kinds[path])]
+if actual != rows:
+    raise SystemExit("manifest-owned macOS payload bytes changed after outer signing")
+' "$root" "$MANIFEST_PATH"
+}
+
+archive_signed_bundle() {
+    local zip_path="$1"
+    rm -f "$zip_path"
+    ditto -c -k --sequesterRsrc --keepParent "$APP" "$zip_path"
+}
+
+emit_artifact_signing_request() {
+    local artifact="$1" request="$artifact.artifact-signing-request.bin"
+    PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
+import hashlib, sys
+from pathlib import Path
+artifact, request, key_id, version, arch = (Path(sys.argv[1]), Path(sys.argv[2]),
+    sys.argv[3], sys.argv[4], sys.argv[5])
+digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+request.write_bytes(b"\0".join((b"chudware-artifact-v1", key_id.encode("ascii"),
+    version.encode("ascii"), b"macos", arch.encode("ascii"), digest.encode("ascii"))))
+' "$artifact" "$request" "$KEY_ID" "$VERSION" "$ARCH"
+    echo "==> artifact signing request: $request"
+}
+
+
+build_python_sidecar() {
+    local module="$1" destination="$2" name work
+    name="$(basename "$destination")"
+    work="$OUT/.nuitka-$name"
+    rm -rf "$work"
+    mkdir -p "$work"
+    "$RELEASE_PYTHON" -c 'import nuitka' >/dev/null 2>&1 || {
+        echo "error: Nuitka is missing; install packaging/requirements-release.txt into the release Python" >&2
+        exit 1
+    }
+    echo "==> compiling $name"
+    local -a includes=("--include-module=chudware_protected_assets" "--include-module=services.$module")
+    if [ "$module" = "worker_main" ]; then
+        includes+=(
+            --include-module=services.parts.vendor_parts
+            --include-module=services.deliverables.worker_rpc
+            --include-module=services.parts.worker_rpc
+            --include-module=services.agent.worker_rpc
+            --include-module=services.reveng.worker_rpc
+            --include-module=services.dag.worker_rpc
+            --include-module=services.agent.subagent_rpc
+            --include-module=services.plm.worker_rpc
+            --include-module=services.sim.em.worker_rpc
+            --include-module=services.sim.multiphysics_rpc
+            --include-module=services.manufacturing.printers.worker_rpc
+        )
+    fi
+    (cd "$REPO" && PYTHONPATH="$PROTECTED_ASSETS_OUT/python${PYTHONPATH:+:$PYTHONPATH}" \
+        "$RELEASE_PYTHON" -m nuitka \
+        --mode=onefile --remove-output \
+        --output-dir="$work" --output-filename="$name" \
+        --nofollow-import-to='*.tests' --nofollow-import-to='*.test_*' \
+        "${includes[@]}" services/compiled_entry.py)
+    [ -x "$work/$name" ] || { echo "error: Nuitka did not produce $work/$name" >&2; exit 1; }
+    cp "$work/$name" "$destination"
+    chmod 0755 "$destination"
+    rm -rf "$work"
+}
+
+audit_production_payload() {
+    local root="$1" bad
+    bad="$(find "$root" \( -type l -o -type f \( \
+        -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o -name '*.ts' -o -name '*.tsx' \
+        -o -name '*.js' -o -name '*.jsx' -o -name '*.map' -o -name '*.pdb' \
+        -o -name 'test_*' -o -name '*_test.*' \) -o -type d \( \
+        -name '__pycache__' -o -name 'node_modules' -o -name '.git' -o -name '.github' \
+        -o -name '.svn' -o -name '*.dSYM' \) \) -print -quit)"
+    [ -z "$bad" ] || { echo "error: forbidden source/debug/repository artifact survived staging: $bad" >&2; exit 1; }
+}
 
 [ "$(uname -s)" = "Darwin" ] || {
     echo "error: packaging/macos/build_app.sh must run on macOS" >&2
@@ -29,37 +231,46 @@ case "$ARCH" in
     x86_64) PLATFORM_SUFFIX="macos-x86_64"; BREW_PREFIX="/usr/local" ;;
     *) echo "error: unsupported macOS architecture: $ARCH" >&2; exit 1 ;;
 esac
-BUILD="$REPO/host/build-$PLATFORM_SUFFIX"
-BIN="$BUILD/bin/chudware"
-[ -x "$BIN" ] || {
-    echo "error: $BIN not found; run ./build.sh all on this Mac first" >&2
-    exit 1
-}
-
-# Import the canonical helper rather than implementing another version parser. The helper
-# reads the exact generated header compiled into this binary.
-VERSION_HELPER="$(sed -n '/^chudware_read_version() {/,/^}/p' "$REPO/build.sh")"
-[ -n "$VERSION_HELPER" ] || { echo "error: chudware_read_version missing from build.sh" >&2; exit 1; }
-# shellcheck disable=SC2294
-_eval_version_helper() { eval "$VERSION_HELPER"; }
-_eval_version_helper
-chudware_read_version "$BUILD" || {
-    echo "error: $BUILD/generated/api/chudware_version.h is missing or invalid; reconfigure the host build" >&2
-    exit 1
-}
-VERSION="$CHUDWARE_VERSION"
-
-for tool in otool install_name_tool ditto plutil; do
-    command -v "$tool" >/dev/null 2>&1 || { echo "error: required tool not found: $tool" >&2; exit 1; }
-done
-
 APP="$OUT/Chudware.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
+MANIFEST_PATH="$APP/payload-manifest.v1.json"
+SIGNATURE_PATH="$APP/payload-manifest.v1.sig"
 FRAMEWORKS="$CONTENTS/Frameworks"
-rm -rf "$APP"
-mkdir -p "$MACOS" "$RESOURCES" "$FRAMEWORKS"
+SIGN_IDENTITY="${CHUDWARE_SIGN_IDENTITY:-}"
+NOTARIZE_PROFILE="${CHUDWARE_NOTARIZE_PROFILE:-}"
+
+if [ "$MODE" = prepare ]; then
+    BUILD="$REPO/host/build-$PLATFORM_SUFFIX"
+    PROTECTED_ASSETS_OUT="$BUILD/generated/protected-assets"
+    BIN="$BUILD/bin/chudware"
+    [ -x "$BIN" ] || { echo "error: $BIN not found; run ./build.sh all on this Mac first" >&2; exit 1; }
+    require_production_cache "$BUILD" "host GUI"
+    VERSION_HELPER="$(sed -n '/^chudware_read_version() {/,/^}/p' "$REPO/build.sh")"
+    [ -n "$VERSION_HELPER" ] || { echo "error: chudware_read_version missing from build.sh" >&2; exit 1; }
+    # shellcheck disable=SC2294
+    _eval_version_helper() { eval "$VERSION_HELPER"; }
+    _eval_version_helper
+    chudware_read_version "$BUILD" || {
+        echo "error: $BUILD/generated/api/chudware_version.h is missing or invalid; reconfigure the host build" >&2
+        exit 1
+    }
+    VERSION="$CHUDWARE_VERSION"
+    for tool in otool install_name_tool ditto plutil; do
+        command -v "$tool" >/dev/null 2>&1 || { echo "error: required tool not found: $tool" >&2; exit 1; }
+    done
+    rm -rf "$APP"
+    mkdir -p "$MACOS" "$RESOURCES" "$FRAMEWORKS"
+else
+    [ -d "$APP" ] && [ -f "$MANIFEST_PATH" ] || {
+        echo "error: retained prepared Chudware.app or in-bundle manifest is missing under $OUT" >&2; exit 1;
+    }
+    VERSION="$(PYTHONPATH="$REPO" "$RELEASE_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "$MANIFEST_PATH")"
+    command -v ditto >/dev/null 2>&1 || { echo "error: required tool not found: ditto" >&2; exit 1; }
+fi
+
+if [ "$MODE" = prepare ]; then
 
 sed "s/@CHUDWARE_VERSION@/$VERSION/g" "$REPO/packaging/macos/Info.plist" > "$CONTENTS/Info.plist"
 plutil -lint "$CONTENTS/Info.plist" >/dev/null
@@ -70,9 +281,11 @@ cp "$BIN" "$MACOS/Chudware-bin"
 chmod +x "$MACOS/Chudware-bin"
 
 if [ -d "$BUILD/bin/assets" ]; then
-    cp -R "$BUILD/bin/assets" "$MACOS/assets"
+    rsync -a --exclude='*.py' --exclude='*.pyc' --exclude='test_*' --exclude='.git*' \
+        "$BUILD/bin/assets/" "$MACOS/assets/"
 elif [ -d "$REPO/assets" ]; then
-    cp -R "$REPO/assets" "$MACOS/assets"
+    rsync -a --exclude='*.py' --exclude='*.pyc' --exclude='test_*' --exclude='.git*' \
+        "$REPO/assets/" "$MACOS/assets/"
 fi
 
 ENGINE=""
@@ -104,37 +317,26 @@ for candidate in \
     "$REPO/build/$PLATFORM_SUFFIX/bin/chudware-hostd"; do
     if [ -x "$candidate" ]; then HOSTD="$candidate"; break; fi
 done
-if [ -n "$HOSTD" ]; then
-    cp "$HOSTD" "$MACOS/chudware-hostd"
-    chmod +x "$MACOS/chudware-hostd"
-else
-    echo "WARNING: chudware-hostd was not found; the app will use its in-process fallback" >&2
-fi
+[ -n "$HOSTD" ] || {
+    echo "error: production macOS app requires chudware-hostd for $ARCH" >&2
+    exit 1
+}
+HOSTD_BUILD="$(dirname "$(dirname "$HOSTD")")"
+require_production_cache "$HOSTD_BUILD" "chudware-hostd"
+cp "$HOSTD" "$MACOS/chudware-hostd"
+chmod +x "$MACOS/chudware-hostd"
 
-# Bootstrap looks beside the executable for app/requirements.txt and service packages.
-APP_PAYLOAD="$MACOS/app"
-mkdir -p "$APP_PAYLOAD/services"
-if [ -d "$REPO/engine" ]; then
-    rsync -a --exclude='__pycache__' --exclude='*.pyc' --exclude='build' --exclude='test_*' \
-        "$REPO/engine/" "$APP_PAYLOAD/engine/"
-fi
-if [ -f "$REPO/services/__init__.py" ]; then
-    cp "$REPO/services/__init__.py" "$APP_PAYLOAD/services/__init__.py"
-else
-    : > "$APP_PAYLOAD/services/__init__.py"
-fi
-for package in agent mcp installer plm dag browser deliverables ipc serving verify parts reveng sim vision; do
-    if [ -d "$REPO/services/$package" ]; then
-        rsync -a --exclude='__pycache__' --exclude='*.pyc' --exclude='build' --exclude='test_*' \
-            "$REPO/services/$package/" "$APP_PAYLOAD/services/$package/"
-    fi
-done
-for module in "$REPO"/services/*.py; do
-    [ -f "$module" ] || continue
-    case "$(basename "$module")" in __init__.py|test_*) continue ;; esac
-    cp "$module" "$APP_PAYLOAD/services/"
-done
-cp "$REPO/requirements.txt" "$APP_PAYLOAD/requirements.txt"
+# Protected services and the OMP bridge are compiled sidecars. No repository Python,
+# TypeScript, generated compiler source, source maps, or provisioning wheelhouse enters the app.
+[ -f "$REPO/services/compiled_entry.py" ] || {
+    echo "error: services/compiled_entry.py is required for release sidecars" >&2
+    exit 1
+}
+generate_protected_assets
+build_python_sidecar worker_main "$MACOS/chudware-worker"
+build_python_sidecar mcp.server "$MACOS/chudware-mcp"
+build_omp_bridge "$MACOS/chudware-omp-bridge"
+
 
 # Resolve @rpath/@loader_path entries when deciding whether a dependency belongs in the
 # bundle. Homebrew's OCCT bottles normally use absolute Cellar names, but formula revisions
@@ -178,6 +380,9 @@ for bundled_dylib in "$FRAMEWORKS"/*.dylib; do
     [ -f "$bundled_dylib" ] && printf '%s\n' "$bundled_dylib" >> "$QUEUE"
 done
 [ -n "$HOSTD" ] && printf '%s\n' "$MACOS/chudware-hostd" >> "$QUEUE"
+for sidecar in "$MACOS/chudware-worker" "$MACOS/chudware-mcp" "$MACOS/chudware-omp-bridge"; do
+    printf '%s\n' "$sidecar" >> "$QUEUE"
+done
 
 index=1
 while :; do
@@ -251,8 +456,12 @@ LAUNCHER
 sed -i '' "s/@CHUDWARE_VERSION@/$VERSION/g" "$MACOS/Chudware"
 chmod +x "$MACOS/Chudware"
 
+
+
 # Fail before signing if any non-system dependency still resolves outside the bundle.
-for executable in "$MACOS/Chudware-bin" "$MACOS/chudware-hostd" "$FRAMEWORKS"/*.dylib; do
+for executable in "$MACOS/Chudware-bin" "$MACOS/chudware-hostd" \
+    "$MACOS/chudware-worker" "$MACOS/chudware-mcp" "$MACOS/chudware-omp-bridge" \
+    "$FRAMEWORKS"/*.dylib; do
     [ -f "$executable" ] || continue
     while IFS= read -r dependency; do
         dependency_target=""
@@ -269,20 +478,40 @@ for executable in "$MACOS/Chudware-bin" "$MACOS/chudware-hostd" "$FRAMEWORKS"/*.
     done < <(otool -L "$executable" | sed -n '2,$p' | awk '{print $1}')
 done
 
-SIGN_IDENTITY="${CHUDWARE_SIGN_IDENTITY:-}"
-NOTARIZE_PROFILE="${CHUDWARE_NOTARIZE_PROFILE:-}"
 if [ -n "$SIGN_IDENTITY" ]; then
-    echo "==> signing Chudware.app with identity: $SIGN_IDENTITY"
-    codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
-    codesign --verify --deep --strict --verbose=2 "$APP"
+    echo "==> signing nested Mach-O payloads with identity: $SIGN_IDENTITY"
+    while IFS= read -r -d '' nested; do
+        file -b "$nested" | grep -q 'Mach-O' || continue
+        codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$nested"
+        codesign --verify --strict --verbose=2 "$nested"
+    done < <(find "$MACOS" "$FRAMEWORKS" -type f -print0)
 else
-    echo "WARNING: unsigned build — SmartScreen/Gatekeeper will warn users" >&2
+    echo "WARNING: preview build has no Apple platform identity; payload signing remains mandatory" >&2
+fi
+
+audit_production_payload "$APP"
+REQUEST="$OUT/Chudware-$VERSION-macos-$ARCH.payload-signing-request.bin"
+prepare_signing_metadata "$APP" "$REQUEST"
+echo "==> prepared immutable app: $APP"
+echo "==> signing request: $REQUEST"
+exit 0
+fi
+
+finalize_signing_metadata "$APP"
+audit_production_payload "$APP"
+verify_staged_manifest "$APP"
+
+if [ -n "$SIGN_IDENTITY" ]; then
+    echo "==> signing outer bundle seal without re-signing nested payloads"
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+    codesign --verify --deep --strict --verbose=2 "$APP"
+    verify_manifest_rows_unchanged "$APP"
 fi
 
 mkdir -p "$OUT"
+command -v zip >/dev/null 2>&1 || { echo "error: required tool not found: zip" >&2; exit 1; }
 ZIP="$OUT/Chudware-$VERSION-macos-$ARCH.zip"
-rm -f "$ZIP"
-ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+archive_signed_bundle "$ZIP"
 
 if [ -n "$NOTARIZE_PROFILE" ]; then
     [ -n "$SIGN_IDENTITY" ] || {
@@ -292,9 +521,13 @@ if [ -n "$NOTARIZE_PROFILE" ]; then
     echo "==> notarizing with keychain profile: $NOTARIZE_PROFILE"
     xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARIZE_PROFILE" --wait
     xcrun stapler staple "$APP"
-    rm -f "$ZIP"
-    ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+    xcrun stapler validate "$APP"
+    codesign --verify --deep --strict --verbose=2 "$APP"
+    spctl --assess --type execute --verbose=2 "$APP"
+    verify_manifest_rows_unchanged "$APP"
+    archive_signed_bundle "$ZIP"
 fi
+emit_artifact_signing_request "$ZIP"
 
 if [ "$KEEP_APP" != "1" ]; then rm -rf "$APP"; fi
 size="$(stat -f %z "$ZIP")"

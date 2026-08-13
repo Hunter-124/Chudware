@@ -17,18 +17,17 @@ int main() {
         }
     };
 
-    check(graceDaysFor(now, now) == 7, "zero-day grace floor");
-    check(graceDaysFor(now, now - 400 * day) == 20, "400-day linear grace");
-    check(graceDaysFor(now, now - 689 * day) == 29, "day before grace ceiling");
-    // 690 days is the first day the 30-day ceiling binds.
-    check(graceDaysFor(now, now - 690 * day) == 30, "grace ceiling boundary");
-    check(graceDaysFor(now, now - 5000 * day) == 30, "grace ceiling holds");
-
     TokenPayload payload;
     payload.graceDays = 30;
     payload.paidThrough = now + day;
-    check(graceDeadline(payload, now) == payload.paidThrough + 3 * day,
-          "paid-through clamp dominates tenure");
+    check(graceDeadline(payload, now) == payload.paidThrough,
+          "paid-through exactly clamps check-in grace");
+
+    CheckinStamp stamp{now, 10'000.0, "boot-a"};
+    auto paidThroughBoundary = offlineAccess(payload, stamp, payload.paidThrough + 1,
+                                             10'000.0 + day + 1, "boot-a");
+    check(paidThroughBoundary.access == OfflineAccess::Expired,
+          "monotonic path denies one second after paid-through");
 
     check(classifyRefresh(401, false, false) == RefreshOutcome::Unreachable,
           "unsigned 401 applies grace");
@@ -39,18 +38,40 @@ int main() {
     check(classifyRefresh(0, false, false) == RefreshOutcome::Unreachable,
           "blackholed transport applies grace");
     payload.paidThrough = now + 100 * day;
-    CheckinStamp stamp{now, 10'000.0};
-    auto beforeChip = offlineAccess(payload, stamp, now + 26 * day,
-                                    10'000.0 + 26 * day);
-    check(beforeChip.access == OfflineAccess::Allowed,
-          "unreachable check has no chip before final three days");
-    auto finalThreeDays = offlineAccess(payload, stamp, now + 28 * day,
-                                        10'000.0 + 28 * day);
-    check(finalThreeDays.access == OfflineAccess::Expiring,
-          "unreachable check shows chip only in final three days");
+    auto day29 = offlineAccess(payload, stamp, now + 29 * day,
+                               10'000.0 + 29 * day, "boot-a");
+    check(day29.access == OfflineAccess::Expiring,
+          "29 days offline remains allowed in final warning window");
+    auto day30PlusOne = offlineAccess(payload, stamp, now + 30 * day + 1,
+                                      10'000.0 + 30 * day + 1, "boot-a");
+    check(day30PlusOne.access == OfflineAccess::Expired,
+          "30 days plus one second offline is denied");
 
-    auto rollback = offlineAccess(payload, stamp, now - 3700, 10'100.0);
-    check(rollback.access == OfflineAccess::ClockRollback, "clock rollback expires grace");
+    CheckinStamp rebootStamp{now, 10'000.0, "boot-a"};
+    auto rebootLowUptime = offlineAccess(payload, rebootStamp, now + 30 * day + 1,
+                                         15.0, "boot-b");
+    check(rebootLowUptime.access == OfflineAccess::Expired,
+          "reboot with low uptime cannot extend grace");
+    payload.paidThrough = now + day;
+    auto rebootPaidBoundary = offlineAccess(payload, rebootStamp, payload.paidThrough + 1,
+                                            15.0, "boot-b");
+    check(rebootPaidBoundary.access == OfflineAccess::Expired,
+          "reboot cannot grant an extra paid cutoff hour");
+
+    payload.paidThrough = now + 100 * day;
+    auto rebootRollback = offlineAccess(payload, rebootStamp, now - 3700, 15.0, "boot-b");
+    check(rebootRollback.access == OfflineAccess::Allowed,
+          "reboot wall rollback uses wall fallback rather than incomparable steady uptime");
+
+    auto rollback = offlineAccess(payload, stamp, now - 3700, 10'100.0, "boot-a");
+    check(rollback.access == OfflineAccess::ClockRollback,
+          "same-boot wall rollback expires grace");
+
+    payload.paidThrough = now + day;
+    auto smallRollbackPastPaid = offlineAccess(payload, stamp, now + day - 1800,
+                                                10'000.0 + day + 1, "boot-a");
+    check(smallRollbackPastPaid.access == OfflineAccess::Expired,
+          "same-boot expected wall prevents paid cutoff extension");
 
     const std::array<unsigned char, 32> vectorPublic = {
         0x03, 0xa1, 0x07, 0xbf, 0xf3, 0xce, 0x10, 0xbe,

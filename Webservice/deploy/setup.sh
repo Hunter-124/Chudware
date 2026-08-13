@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # chudware-web host setup — idempotent. NO secrets written here.
-# Usage: bash Webservice/deploy/setup.sh
+# Usage: bash Webservice/deploy/setup.sh [prod|staging]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -9,6 +9,23 @@ DEPLOY_DIR="${REPO_ROOT}/Webservice/deploy"
 DATA_ROOT="${CHUDWARE_WEB_DATA:-${HOME}/chudware-web-data}"
 UNIT_DIR="${HOME}/.config/systemd/user"
 VENV="${GATEWAY_DIR}/.venv"
+ENVIRONMENT="${1:-prod}"
+case "$ENVIRONMENT" in
+  prod)
+    GATEWAY_UNIT="chudware-gateway.service"
+    RETENTION_UNIT="chudware-security-retention.service"
+    RETENTION_TIMER="chudware-security-retention.timer"
+    ENTITLEMENT_CREDENTIAL="${HOME}/.config/credstore.encrypted/chudware-entitlement.cred"
+    ;;
+  staging)
+    GATEWAY_UNIT="chudware-gateway-staging.service"
+    RETENTION_UNIT="chudware-security-retention-staging.service"
+    RETENTION_TIMER="chudware-security-retention-staging.timer"
+    DATA_ROOT="${CHUDWARE_WEB_DATA:-${HOME}/chudware-web-staging}"
+    ENTITLEMENT_CREDENTIAL="${HOME}/.config/credstore.encrypted/chudware-entitlement-staging.cred"
+    ;;
+  *) echo "ERROR: environment must be prod or staging" >&2; exit 2 ;;
+esac
 
 echo "==> chudware-web setup"
 echo "    repo:  ${REPO_ROOT}"
@@ -77,10 +94,21 @@ echo "==> installing gateway requirements"
 "${VENV}/bin/pip" install --upgrade pip -q
 "${VENV}/bin/pip" install -r "${GATEWAY_DIR}/requirements.txt" -q
 echo "    venv ok: ${VENV}"
+# --- entitlement signing credential ----------------------------------------
+# The helper consumes 32 raw bytes on stdin and stores only a TPM2/host-bound
+# encrypted systemd credential. It is intentionally interactive and never
+# copies signing material into gateway.env, the database, or this repository.
+# Environment-specific encrypted credential must exist before service enablement.
+if [[ ! -f "${ENTITLEMENT_CREDENTIAL}" || ! -r "${ENTITLEMENT_CREDENTIAL}" ]]; then
+  echo "ERROR: encrypted entitlement credential is missing: ${ENTITLEMENT_CREDENTIAL}" >&2
+  exit 1
+fi
+chmod 600 "${ENTITLEMENT_CREDENTIAL}"
+echo "    entitlement credential present: ${ENTITLEMENT_CREDENTIAL}"
 
 # --- systemd user units ------------------------------------------------------
 mkdir -p "${UNIT_DIR}"
-for u in chudware-gateway.service chudware-cloudflared.service chudware-monitor.service chudware-monitor.timer chudware-backup.service chudware-backup.timer; do
+for u in "${GATEWAY_UNIT}" chudware-cloudflared.service chudware-monitor.service chudware-monitor.timer chudware-backup.service chudware-backup.timer "${RETENTION_UNIT}" "${RETENTION_TIMER}"; do
   src="${DEPLOY_DIR}/${u}"
   dst="${UNIT_DIR}/${u}"
   if [[ -f "${src}" ]]; then
@@ -107,8 +135,9 @@ if command -v loginctl >/dev/null 2>&1; then
 fi
 
 systemctl --user daemon-reload
-systemctl --user enable chudware-gateway.service chudware-cloudflared.service chudware-monitor.timer chudware-backup.timer
-echo "    enabled: chudware-gateway, chudware-cloudflared, chudware-monitor.timer, chudware-backup.timer"
+systemctl --user disable --now chudware-security-retention.timer chudware-security-retention-staging.timer >/dev/null 2>&1 || true
+systemctl --user enable "${GATEWAY_UNIT}" chudware-cloudflared.service chudware-monitor.timer chudware-backup.timer "${RETENTION_UNIT}" "${RETENTION_TIMER}"
+echo "    enabled: ${GATEWAY_UNIT}, chudware-cloudflared, chudware-monitor.timer, chudware-backup.timer, ${RETENTION_UNIT}, ${RETENTION_TIMER}"
 
 echo
 echo "==> next steps checklist"
@@ -120,10 +149,13 @@ cat <<EOF
       python3 -c 'import secrets;print(secrets.token_urlsafe(48))'
   [ ] Optional: Google/GitHub sign-in — set CHUDWARE_WEB_GOOGLE_CLIENT_ID/_SECRET and/or
       CHUDWARE_WEB_GITHUB_CLIENT_ID/_SECRET in ${ENV_FILE} (RUNBOOK.md §(c))
+  [ ] Provision the online entitlement credential (exactly 32 raw key bytes on stdin):
+      cat /secure/owner-source/entitlement.key | Webservice/deploy/provision_entitlement_credential.sh prod
+      TPM2 is preferred; otherwise systemd-creds uses the host key and owner unlock at boot.
   [ ] Nothing to seed: users register themselves and verify by email; approve them at /admin
   [ ] Optional: Google IdP for the CF Access /admin door (CF Zero Trust) — RUNBOOK.md
   [ ] Edit Access allowlist emails — Access gates /admin only (dashboard or API)
-  [ ] systemctl --user start chudware-gateway chudware-cloudflared chudware-monitor.timer
+  [ ] systemctl --user start ${GATEWAY_UNIT} chudware-cloudflared chudware-monitor.timer ${RETENTION_TIMER}
   [ ] curl -sS http://127.0.0.1:8300/healthz | jq .
   [ ] Full ops: Webservice/deploy/RUNBOOK.md
 EOF

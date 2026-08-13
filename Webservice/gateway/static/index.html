@@ -7,7 +7,7 @@
   <title>Chudware account</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23090d12'/%3E%3Cg fill='none' stroke='%2342ECCE' stroke-width='1.7'%3E%3Crect x='5' y='5' width='22' height='22'/%3E%3Crect x='10.5' y='10.5' width='11' height='11'/%3E%3Cpath d='M5 5L10.5 10.5M27 5L21.5 10.5M27 27L21.5 21.5M5 27L10.5 21.5'/%3E%3C/g%3E%3C/svg%3E">
   <link rel="stylesheet" href="/portal-assets/portal.ccd14c744436.css">
-  <script src="/portal-assets/portal.8cfb5bf8c58b.js" defer></script>
+  <script src="/portal-assets/portal.c2eea3c72329.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#page-title">Skip to content</a>
@@ -127,10 +127,14 @@
       </section>
 
       <section class="page" data-view="devices" aria-labelledby="page-title">
-        <div class="section-intro"><div><p class="eyebrow">Desktop access</p><h2>Authorized devices</h2><p>Revoke a computer you no longer use. Its next entitlement refresh will be refused with a signed response.</p></div><button class="secondary" data-go="downloads">Authorize a new device</button></div>
-        <article class="card table-card"><div class="table-wrap"><table><thead><tr><th>Device</th><th>Authorized</th><th>Last check-in</th><th>Status</th><th></th></tr></thead><tbody id="device-rows"><tr><td colspan="5" class="empty">Loading devices…</td></tr></tbody></table></div></article>
+        <div class="section-intro"><div><p class="eyebrow">Desktop access</p><h2>Authorized devices</h2><p>Review each device's bounded security status. Internal evidence and decision thresholds are never exposed.</p></div><button class="secondary" data-go="downloads">Authorize a new device</button></div>
+        <article class="card table-card"><div class="table-wrap"><table><thead><tr><th>Device</th><th>Authorized</th><th>Last check-in</th><th>Security status</th><th>Reason</th><th>Action time</th><th></th></tr></thead><tbody id="device-rows"><tr><td colspan="7" class="empty">Loading devices…</td></tr></tbody></table></div></article>
+        <div class="info-band security-access-note"><strong>When review is pending or access is revoked</strong><span>Your documents remain available to open, view, and export. Protected mutations, AI, workers, and update downloads remain unavailable until review is complete and you sign in again.</span></div>
+        <div class="grid two appeal-grid">
+          <article class="card"><div class="card-head"><div><p class="eyebrow">Security review</p><h2>Appeal a device action</h2></div></div><form id="appeal-form" class="form-stack"><label for="appeal-subject">Device<select id="appeal-subject" required><option value="">Select a revoked device</option></select></label><label for="appeal-message">Why should this device be restored?<textarea id="appeal-message" maxlength="4096" required aria-describedby="appeal-message-help appeal-count"></textarea></label><div class="field-help"><span id="appeal-message-help">Do not include passwords, private keys, or other secrets.</span><span id="appeal-count">0 / 4096</span></div><button id="appeal-submit" class="primary small" type="submit">Submit appeal</button><p id="appeal-status" class="fine" role="status" aria-live="polite"></p></form></article>
+          <article class="card"><div class="card-head"><div><p class="eyebrow">Review history</p><h2>Your appeals</h2></div></div><div id="appeal-list" class="appeal-list" aria-live="polite"><p class="empty">Loading appeals…</p></div></article>
+        </div>
         <div class="info-band"><strong>Lost or stolen computer?</strong><span>Revoke it here. Cached access remains bounded by its signed offline grace period; it cannot obtain a new token.</span></div>
-      </section>
     </main>
   </div>
 </body>

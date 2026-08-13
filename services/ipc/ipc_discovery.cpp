@@ -16,6 +16,11 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+extern char** environ;
+#include <filesystem>
+
+#include "security/integrity.h"
+#include "util/platform_paths.h"
 
 namespace chudware_ipc {
 
@@ -36,7 +41,9 @@ std::string fnv1aHex(const std::string& s) {
 }
 
 std::string instanceKey(const std::string& hostdBin) {
+#ifdef CHUDWARE_DEVELOPER_BUILD
     if (const char* k = std::getenv("CHUDWARE_INSTANCE_KEY"); k && *k) return k;
+#endif
     std::string id = hostdBin;
     char real[PATH_MAX];
     if (!id.empty() && ::realpath(id.c_str(), real)) id = real;
@@ -83,7 +90,9 @@ std::string stateDir() {
 }
 
 std::string socketPath(const std::string& key) {
+#ifdef CHUDWARE_DEVELOPER_BUILD
     if (const char* p = std::getenv("CHUDWARE_HOSTD_SOCKET"); p && *p) return p;
+#endif
     std::string dir = runtimeDir();
     return dir.empty() ? "" : dir + "/hostd-" + key + ".sock";
 }
@@ -102,9 +111,24 @@ std::string guiLockPath(const std::string& key) {
 }
 
 std::string resolveHostdBin(const std::string& hint) {
+#ifdef CHUDWARE_DEVELOPER_BUILD
     if (const char* b = std::getenv("CHUDWARE_HOSTD_BIN"); b && *b) return b;
     if (!hint.empty() && ::access(hint.c_str(), X_OK) == 0) return hint;
     return "";
+#else
+    (void)hint;
+    namespace fs = std::filesystem;
+    const fs::path self = chudware::platform::executablePath();
+    if (self.empty()) return "";
+    const fs::path root = chudware::security::installedPayloadRoot(self);
+    const fs::path candidate = self.parent_path() / "chudware-hostd";
+    std::error_code ec;
+    const std::string relative = fs::relative(candidate, root, ec).generic_string();
+    if (ec || relative.empty() || relative.starts_with("../")) return "";
+    const auto verified =
+        chudware::security::verifyInstalledManifestEntry(self, relative, "worker");
+    return verified.ok ? candidate.string() : std::string();
+#endif
 }
 
 bool SingleInstance::acquire(const std::string& lockFile, std::string& err) {
@@ -147,31 +171,59 @@ void SingleInstance::release() {
 }
 
 bool spawnDetached(const std::string& exe, const std::string& arg, std::string& err) {
+#ifndef CHUDWARE_DEVELOPER_BUILD
+    namespace fs = std::filesystem;
+    const fs::path self = chudware::platform::executablePath();
+    const fs::path root = chudware::security::installedPayloadRoot(self);
+    std::error_code ec;
+    const std::string relative = fs::relative(fs::path(exe), root, ec).generic_string();
+    if (ec || relative.empty() || relative.starts_with("../")) {
+        err = "hostd path is outside the installed payload";
+        return false;
+    }
+    const int pinnedFd = ::open(exe.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (pinnedFd < 0) {
+        err = std::string("open verified hostd: ") + std::strerror(errno);
+        return false;
+    }
+    const auto verified =
+        chudware::security::verifyInstalledManifestFd(self, relative, "worker", pinnedFd);
+    if (!verified.ok) {
+        ::close(pinnedFd);
+        err = "hostd integrity verification failed: " + verified.detail;
+        return false;
+    }
+#endif
     pid_t pid = ::fork();
     if (pid < 0) {
+#ifndef CHUDWARE_DEVELOPER_BUILD
+        ::close(pinnedFd);
+#endif
         err = std::string("fork: ") + std::strerror(errno);
         return false;
     }
     if (pid == 0) {
-        // Child: new session, second fork so the daemon reparents to init and can
-        // never reacquire a controlling terminal.
         ::setsid();
         pid_t pid2 = ::fork();
         if (pid2 != 0) ::_exit(0);
         int devnull = ::open("/dev/null", O_RDWR);
         if (devnull >= 0) {
-            ::dup2(devnull, 0);
-            ::dup2(devnull, 1);
-            ::dup2(devnull, 2);
+            ::dup2(devnull, 0); ::dup2(devnull, 1); ::dup2(devnull, 2);
             if (devnull > 2) ::close(devnull);
         }
-        if (arg.empty())
-            ::execl(exe.c_str(), exe.c_str(), (char*)nullptr);
-        else
-            ::execl(exe.c_str(), exe.c_str(), arg.c_str(), (char*)nullptr);
+#ifdef CHUDWARE_DEVELOPER_BUILD
+        if (arg.empty()) ::execl(exe.c_str(), exe.c_str(), (char*)nullptr);
+        else ::execl(exe.c_str(), exe.c_str(), arg.c_str(), (char*)nullptr);
+#else
+        char* const argvNoArg[] = {const_cast<char*>(exe.c_str()), nullptr};
+        char* const argvArg[] = {const_cast<char*>(exe.c_str()), const_cast<char*>(arg.c_str()), nullptr};
+        ::fexecve(pinnedFd, arg.empty() ? argvNoArg : argvArg, environ);
+#endif
         ::_exit(127);
     }
-    // Parent: reap the intermediate child immediately (grandchild is init's).
+#ifndef CHUDWARE_DEVELOPER_BUILD
+    ::close(pinnedFd);
+#endif
     int status = 0;
     ::waitpid(pid, &status, 0);
     return true;

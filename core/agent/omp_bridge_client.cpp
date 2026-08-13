@@ -1,7 +1,7 @@
 // core/agent/omp_bridge_client.cpp — see omp_bridge_client.h. Long-lived newline-delimited
 // JSON-RPC sidecar transport. Packaged builds execute the canonical adjacent bridge directly;
-// developer builds retain explicit overrides and the Bun source bridge. POSIX uses fork/pipe and
-// CreateProcessW with inherited stdio pipes.
+// developer builds retain explicit overrides and the Bun source bridge. POSIX uses fork/pipe;
+// Windows uses CreateProcessW with inherited stdio pipes.
 #include "agent/omp_bridge_client.h"
 #include "agent/providers.h"  // provider_cancel_flag() — abort in-flight bridge complete() on Stop
 
@@ -15,6 +15,8 @@
 #include <cstdlib>
 #include <cstring>
 #include "util/platform_paths.h"
+#include "security/integrity.h"
+#include "security/runtime_guard.h"
 
 #ifdef _WIN32
 
@@ -238,8 +240,26 @@ void OmpBridgeClient::provisionDeps() {
     // Release bridges are self-contained. Developer workspaces retain their existing Bun
     // install workflow; platform builders run the locked install before compiling releases.
 }
+namespace {
+bool allowBridgeSpawn(std::string& err) {
+    const auto executable = chudware::platform::executablePath();
+    const auto integrity = chudware::security::verifyInstalledPayload(
+        executable, chudware::security::VerifyMode::ProtectedOperation);
+    if (!integrity.ok) {
+        err = "worker spawn blocked: protected_file_hash_mismatch";
+        return false;
+    }
+    const auto decision = chudware::security::inspectAndPersistRuntime(
+        chudware::security::SecurityCheckpoint::BeforeWorkerSpawn,
+        integrity.root, integrity.files, chudware::security::runtimeGuardStateDir().string());
+    if (decision.allowed()) return true;
+    err = "worker spawn blocked: " + decision.denialReason;
+    return false;
+}
+}  // namespace
 
 bool OmpBridgeClient::spawn(std::string& err) {
+    if (!allowBridgeSpawn(err)) return false;
     if (!resolvePaths(err)) return false;
     provisionDeps();
 
@@ -462,6 +482,22 @@ namespace agent {
 using nlohmann::json;
 
 namespace {
+bool allowBridgeSpawn(std::string& err) {
+    const auto executable = chudware::platform::executablePath();
+    const auto integrity = chudware::security::verifyInstalledPayload(
+        executable, chudware::security::VerifyMode::ProtectedOperation);
+    if (!integrity.ok) {
+        err = "worker spawn blocked: protected_file_hash_mismatch";
+        return false;
+    }
+    const auto decision = chudware::security::inspectAndPersistRuntime(
+        chudware::security::SecurityCheckpoint::BeforeWorkerSpawn,
+        integrity.root, integrity.files, chudware::security::runtimeGuardStateDir().string());
+    if (decision.allowed()) return true;
+    err = "worker spawn blocked: " + decision.denialReason;
+    return false;
+}
+
 
 std::string envOr(const char* key, const std::string& def) {
     if (const char* v = std::getenv(key); v && *v) return std::string(v);
@@ -592,6 +628,8 @@ bool bridgeDepsCurrent(const std::string& vendorOmpDir, const std::string& stamp
 
 // Run `bun install --frozen-lockfile` in vendorOmpDir; true only on a clean exit.
 bool runBridgeInstall(const std::string& vendorOmpDir, const std::string& bunExe) {
+    std::string securityError;
+    if (!allowBridgeSpawn(securityError)) return false;
     pid_t pid = fork();
     if (pid < 0) return false;
     if (pid == 0) {
@@ -839,6 +877,7 @@ void OmpBridgeClient::provisionDeps() {
 }
 
 bool OmpBridgeClient::spawn(std::string& err) {
+    if (!allowBridgeSpawn(err)) return false;
     // Caller holds mtx_. running_ must be false / fds closed.
     if (!resolvePaths(err)) return false;
     provisionDeps();

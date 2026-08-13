@@ -10,8 +10,6 @@
 namespace fs = std::filesystem;
 using chudware::update::Manifest;
 using chudware::update::Updater;
-using chudware::update::ApplyResult;
-using chudware::update::applyPlatformArtifact;
 
 namespace {
 
@@ -37,6 +35,8 @@ Manifest corruptManifest() {
     Manifest value;
     value.version = "1.2.0";
     value.minSupported = "1.0.0";
+    value.platform = "linux";
+    value.arch = "x86_64";
     value.keyId = "release-v1";
     value.sha256 = std::string(64, '0');
     value.size = 22;
@@ -50,6 +50,8 @@ Manifest wrongKeyManifest() {
     Manifest value;
     value.version = "1.2.1";
     value.minSupported = "1.0.0";
+    value.platform = "linux";
+    value.arch = "x86_64";
     value.keyId = "release-v1";
     value.sha256 = "45ac4000573891c15d2f881d944f9c98234332693bae7c1410aa2c14ed8a209f";
     value.size = 22;
@@ -65,10 +67,12 @@ Manifest validDomainManifest() {
     Manifest value;
     value.version = "1.2.2";
     value.minSupported = "1.0.0";
+    value.platform = "linux";
+    value.arch = "x86_64";
     value.keyId = "dev-test-v1";
     value.sha256 = "45ac4000573891c15d2f881d944f9c98234332693bae7c1410aa2c14ed8a209f";
     value.size = 22;
-    value.signature = "87lx6JNOomUKj2m3U0IlXc8zj4Msxq1hyC23kFkb0f/veyakI4BU+uBwWa6iUaj+Ve0oNkuXqdAPpCuwJxcvCQ==";
+    value.signature = "v/JjOpXwWicDr8iiQL5t5H2/sLs/omo31Cej2GnWa1vpGNx8t8t9KywDJKNJjaXSArbl3xHGjq6pRFiOUbCUDg==";
     value.notesUrl = "https://chudware.com/releases/1.2.2";
     return value;
 }
@@ -95,6 +99,37 @@ void versionTests() {
     require(!requiresMandatoryUpdate("1.2.0", "1.0.0"), "supported release is not killed");
 }
 
+void stagedLifecycleTests(const fs::path& root) {
+    using chudware::update::testing::StagedTransactionState;
+    using chudware::update::testing::stagedTransactionState;
+    using chudware::update::testing::transitionStagedTransaction;
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path metadata = root / "staged.json";
+    writeFile(metadata, R"({"state":"staged","artifact":"update.bin","version":"2.0.0"})");
+    std::string error;
+    require(stagedTransactionState(metadata) == StagedTransactionState::Staged,
+            "new transaction must begin staged");
+    require(transitionStagedTransaction(metadata, StagedTransactionState::Staged,
+                                        StagedTransactionState::Applying, &error),
+            "handoff must atomically consume staged transaction");
+    require(!transitionStagedTransaction(metadata, StagedTransactionState::Staged,
+                                         StagedTransactionState::Applying, &error),
+            "restart must not consume an applying transaction twice");
+    require(transitionStagedTransaction(metadata, StagedTransactionState::Applying,
+                                        StagedTransactionState::Staged, &error),
+            "immediate handoff failure must restore retryable state");
+    require(transitionStagedTransaction(metadata, StagedTransactionState::Staged,
+                                        StagedTransactionState::Applying, &error),
+            "restored transaction must be retryable");
+    require(transitionStagedTransaction(metadata, StagedTransactionState::Applying,
+                                        StagedTransactionState::Committed, &error),
+            "verified replacement must commit transaction");
+    require(!transitionStagedTransaction(metadata, StagedTransactionState::Staged,
+                                         StagedTransactionState::Applying, &error),
+            "committed transaction must never reapply");
+}
+
 void localSecurityTests(const fs::path& root) {
     fs::remove_all(root);
     fs::create_directories(root);
@@ -108,6 +143,32 @@ void localSecurityTests(const fs::path& root) {
 
 #ifdef CHUDWARE_DEVELOPER_BUILD
     const fs::path valid = root / "valid.download";
+    Manifest relabeled = validDomainManifest();
+    relabeled.version = "1.2.3";
+    const fs::path relabeledPath = root / "relabeled.download";
+    writeFile(relabeledPath, "signed artifact bytes\n");
+    require(!updater.verifyAndStageDownloaded(relabeled, relabeledPath, &error),
+            "artifact signature relabeled to a newer version must be rejected");
+    Manifest wrongPlatform = validDomainManifest();
+    wrongPlatform.platform = "windows";
+    writeFile(relabeledPath, "signed artifact bytes\n");
+    require(!updater.verifyAndStageDownloaded(wrongPlatform, relabeledPath, &error),
+            "artifact signature relabeled to another platform must be rejected");
+
+    Updater equalUpdater;
+    equalUpdater.configure("1.2.2", root / "equal-data", running);
+    writeFile(relabeledPath, "signed artifact bytes\n");
+    require(!equalUpdater.verifyAndStageDownloaded(validDomainManifest(), relabeledPath, &error),
+            "equal semantic version must not stage");
+    require(error.find("strict semantic-version upgrade") != std::string::npos,
+            "equal version rejection must identify upgrade requirement");
+    Updater downgradeUpdater;
+    downgradeUpdater.configure("2.0.0", root / "downgrade-data", running);
+    writeFile(relabeledPath, "signed artifact bytes\n");
+    require(!downgradeUpdater.verifyAndStageDownloaded(validDomainManifest(), relabeledPath, &error),
+            "downgrade must not stage");
+    fs::remove_all(root / "data/updates");
+    updater.configure("1.0.0", root / "data", running);
     writeFile(valid, "signed artifact bytes\n");
     require(updater.verifyAndStageDownloaded(validDomainManifest(), valid, &error),
             "artifact-v1 domain signature with known key id must verify");
@@ -158,48 +219,59 @@ void localSecurityTests(const fs::path& root) {
             "rejected artifact must never create staged metadata");
     std::cout << "security: corrupt=rejected+deleted+reported-once wrong-key=rejected+deleted+reported-once running-app=untouched\n";
 }
-#if defined(__linux__)
-void linuxInnerManifestFailureTest(const fs::path& root) {
+
+
+#if defined(__linux__) && defined(CHUDWARE_DEVELOPER_BUILD)
+void innerPayloadMismatchTest(const fs::path& root) {
     fs::remove_all(root);
     fs::create_directories(root);
-    const fs::path running = root / "installed.AppImage";
+    const fs::path running = root / "running.AppImage";
     const std::string original = "RUNNING APP MUST STAY UNTOUCHED\n";
     writeFile(running, original);
-
-    const fs::path staged = root / "staged.AppImage";
-    const std::string manifest =
+    const fs::path artifact = root / "hostile.AppImage";
+    const std::string inner =
         "{\"arch\":\"x86_64\",\"created_at\":\"2026-08-12T00:00:00Z\","
         "\"files\":[],\"key_id\":\"dev-test-v1\",\"platform\":\"linux\","
         "\"product\":\"Chudware\",\"schema\":\"chudware-payload-v1\","
         "\"version\":\"1.2.3\"}";
-    writeFile(staged,
-              "#!/bin/sh\n"
-              "[ \"$1\" = --appimage-extract ] || exit 2\n"
-              "mkdir -p squashfs-root/usr/bin\n"
-              "cat > squashfs-root/payload-manifest.v1.json <<'EOF'\n" + manifest +
-              "\nEOF\n"
-              "printf '%s' 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==' > squashfs-root/payload-manifest.v1.sig\n"
-              "exit 0\n");
-    fs::permissions(staged, fs::perms::owner_exec | fs::perms::owner_read |
-                            fs::perms::owner_write);
+    writeFile(artifact,
+        "#!/bin/sh\n[ \"$1\" = --appimage-extract ] || exit 2\n"
+        "mkdir -p squashfs-root/usr/bin\n"
+        "cat > squashfs-root/payload-manifest.v1.json <<'EOF'\n" + inner +
+        "\nEOF\nprintf '%s' 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==' > squashfs-root/payload-manifest.v1.sig\n"
+        "exit 0\n");
+    fs::permissions(artifact, fs::perms::owner_read | fs::perms::owner_write |
+                              fs::perms::owner_exec);
 
+    Manifest outer;
+    outer.version = "1.2.4";
+    outer.minSupported = "1.0.0";
+    outer.platform = "linux";
+    outer.arch = "x86_64";
+    outer.keyId = "dev-test-v1";
+    outer.sha256 = "ff7996098767e61f9636a82732d9df71498a7e3e4158502c2afc3f5a0934326e";
+    outer.size = 465;
+    outer.signature = "p10PNvDDkd9HSRzCZIfElWxtBlgvMSSxHiNQ0sG8fgii6BvLHzURsp4tqZsgzkIF0T6tMk19zvVKa+kBs74oBQ==";
+    outer.url = "fixture://signed-outer";
+    Updater updater;
+    updater.configure("1.0.0", root / "data", running);
     std::string error;
-    require(applyPlatformArtifact(staged, running, "1.2.3", &error) ==
-                ApplyResult::Rejected,
-            "invalid inner AppImage signature must be rejected before replacement");
-    require(error.find("payload verification failed") != std::string::npos,
-            "inner AppImage rejection must identify payload verification");
+    require(!updater.verifyAndStageDownloaded(outer, artifact, &error),
+            "valid outer artifact with invalid inner payload must be rejected");
+    require(error.find("inner payload integrity failed") != std::string::npos ||
+                error.find("Ed25519 identity signature") != std::string::npos,
+            "payload rejection must identify the failing signed trust layer");
+    require(!fs::exists(artifact), "inner-invalid artifact must be deleted");
+    require(!fs::exists(root / "data/updates/staged.json"),
+            "inner-invalid artifact must not create staged metadata");
     require(readFile(running) == original,
-            "invalid inner AppImage manifest touched installed application");
-    require(!fs::exists(running.string() + ".update"),
-            "invalid inner AppImage manifest created a replacement file");
-    std::cout << "linux-inner-security: invalid-signature=rejected running-app=untouched\n";
+            "inner-invalid artifact must not touch the running fixture");
 }
 #endif
 
-
 #if defined(_WIN32)
 void windowsRollbackTests(const fs::path& root) {
+    fs::remove_all(root);
     const fs::path install = root / "rollback-install";
     const fs::path rollback = root / "rollback-copy";
     fs::create_directories(install);
@@ -253,14 +325,15 @@ void servedSecurityTest(const std::string& kind, const std::string& url,
 
 int main(int argc, char** argv) {
     versionTests();
+    stagedLifecycleTests(fs::temp_directory_path() / "chudware-updater-state-test");
     if (argc == 5 && std::string(argv[1]) == "--served") {
         servedSecurityTest(argv[2], argv[3], argv[4]);
     } else {
         localSecurityTests(fs::temp_directory_path() / "chudware-updater-test");
     }
-#if defined(__linux__)
-        linuxInnerManifestFailureTest(fs::temp_directory_path() /
-                                      "chudware-updater-inner-test");
+#if defined(__linux__) && defined(CHUDWARE_DEVELOPER_BUILD)
+        if (argc == 1)
+            innerPayloadMismatchTest(fs::temp_directory_path() / "chudware-updater-inner-test");
 #endif
 #if defined(_WIN32)
         windowsRollbackTests(fs::temp_directory_path() / "chudware-updater-test");

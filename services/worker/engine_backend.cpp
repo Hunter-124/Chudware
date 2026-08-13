@@ -92,10 +92,8 @@ std::string selfExePath() { return chudware::platform::executablePath(); }
 
 }  // namespace
 
-// hostd binary hint, mirroring services/mcp/daemon_bridge.py resolve_hostd_bin:
-// $CHUDWARE_HOSTD_BIN is honored inside resolveHostdBin(); the hint covers
-// exe-adjacent (installed layout: dist/Chudware stages both binaries together)
-// then the repo dev-tree build.
+// Production accepts only the adjacent daemon selected and verified by resolveHostdBin().
+// Developer builds additionally search the familiar repository build tree.
 std::string hostdBinHint() {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -119,6 +117,7 @@ std::string hostdBinHint() {
         // exe-adjacent
         fs::path cand = fs::path(self).parent_path() / exeName;
         if (fs::is_regular_file(cand, ec)) return cand.string();
+#ifdef CHUDWARE_DEVELOPER_BUILD
         // repo dev tree: walk up from the exe looking for core/<build dir>.
         fs::path dir = fs::path(self).parent_path();
         for (int i = 0; i < 6 && !dir.empty(); ++i, dir = dir.parent_path()) {
@@ -126,6 +125,7 @@ std::string hostdBinHint() {
             if (fs::is_regular_file(c, ec)) return c.string();
             if (dir == dir.parent_path()) break;
         }
+#endif
     }
     return std::string();
 }

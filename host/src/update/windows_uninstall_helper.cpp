@@ -6,7 +6,6 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <winreg.h>
-#include <winternl.h>
 
 #include "security/integrity.h"
 
@@ -44,25 +43,16 @@ UniqueHandle openPath(HANDLE parent, const std::wstring& component, DWORD access
     if (component.empty() || component == L"." || component == L".." ||
         component.find_first_of(L"\\/:") != std::wstring::npos)
         return {};
-    const std::wstring path = component;
-    UNICODE_STRING name{};
-    name.Buffer = const_cast<PWSTR>(path.c_str());
-    name.Length = static_cast<USHORT>(path.size() * sizeof(wchar_t));
-    name.MaximumLength = name.Length;
-    OBJECT_ATTRIBUTES attributes{};
-    InitializeObjectAttributes(&attributes, &name, OBJ_CASE_INSENSITIVE, parent, nullptr);
-    IO_STATUS_BLOCK status{};
-    HANDLE result = nullptr;
-    using NtCreateFileFn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
-        PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
-    static const auto ntCreateFile = reinterpret_cast<NtCreateFileFn>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
-    if (!ntCreateFile) return {};
-    const ULONG options = FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT |
-        (flags & FILE_FLAG_BACKUP_SEMANTICS ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE);
-    const NTSTATUS rc = ntCreateFile(&result, access | SYNCHRONIZE, &attributes, &status,
-        nullptr, FILE_ATTRIBUTE_NORMAL, share, FILE_OPEN, options, nullptr, 0);
-    return rc >= 0 ? UniqueHandle(result) : UniqueHandle{};
+    wchar_t parentPath[32768];
+    const DWORD length = GetFinalPathNameByHandleW(parent, parentPath, 32768,
+                                                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!length || length >= 32768) return {};
+    std::wstring path(parentPath, length);
+    if (!path.empty() && path.back() != L'\\') path += L'\\';
+    path += component;
+    HANDLE result = CreateFileW(path.c_str(), access, share, nullptr, OPEN_EXISTING,
+                                flags | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    return result != INVALID_HANDLE_VALUE ? UniqueHandle(result) : UniqueHandle{};
 }
 
 bool isPlain(HANDLE handle, bool directory) {
@@ -100,7 +90,7 @@ UniqueHandle openCanonicalRoot(const std::wstring& requested) {
     const std::wstring registered = registeredRoot();
     if (registered.empty() || _wcsicmp(registered.c_str(), requested.c_str()) != 0) return {};
     HANDLE raw = CreateFileW(registered.c_str(), FILE_LIST_DIRECTORY | FILE_TRAVERSE | DELETE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     UniqueHandle root(raw);
     if (!root || !isPlain(root.get(), true)) return {};
@@ -109,7 +99,7 @@ UniqueHandle openCanonicalRoot(const std::wstring& requested) {
                                                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     if (!n || n >= 32768) return {};
     HANDLE checkRaw = CreateFileW(finalPath, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     UniqueHandle check(checkRaw);
     return check && isPlain(check.get(), true) && sameIdentity(root.get(), check.get())
@@ -140,16 +130,16 @@ bool splitPath(const std::string& value, std::vector<std::wstring>& parts) {
 }
 
 bool hashAndDelete(HANDLE root, const std::vector<std::wstring>& parts,
-                   std::uint64_t expectedSize, const std::string& expectedHash) {
+                   std::uint64_t expectedSize, const std::string& expectedHash,
+                   std::vector<UniqueHandle>& pinnedDirectories) {
     HANDLE parent = root;
-    std::vector<UniqueHandle> parents;
     for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
         auto next = openPath(parent, parts[i], FILE_LIST_DIRECTORY | FILE_TRAVERSE,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE,
                              FILE_FLAG_BACKUP_SEMANTICS);
         if (!next || !isPlain(next.get(), true)) return false;
         parent = next.get();
-        parents.push_back(std::move(next));
+        pinnedDirectories.push_back(std::move(next));
     }
     auto file = openPath(parent, parts.back(), FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE,
                          FILE_SHARE_READ, 0);
@@ -192,14 +182,36 @@ bool hashAndDelete(HANDLE root, const std::vector<std::wstring>& parts,
 int uninstall(const std::wstring& requestedRoot) {
     auto root = openCanonicalRoot(requestedRoot);
     if (!root) return 10;
+    auto manifestHandle = openPath(root.get(), kManifestName, FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+                                   FILE_SHARE_READ, 0);
+    auto signatureHandle = openPath(root.get(), kSignatureName, FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+                                    FILE_SHARE_READ, 0);
+    if (!manifestHandle || !signatureHandle || !isPlain(manifestHandle.get(), false) ||
+        !isPlain(signatureHandle.get(), false)) return 11;
+    auto readHeld = [](HANDLE handle, std::size_t cap, std::string& bytes) {
+        LARGE_INTEGER zero{};
+        if (!SetFilePointerEx(handle, zero, nullptr, FILE_BEGIN)) return false;
+        std::array<char, 64 * 1024> buffer{};
+        for (;;) {
+            DWORD count = 0;
+            if (!ReadFile(handle, buffer.data(), static_cast<DWORD>(buffer.size()), &count, nullptr))
+                return false;
+            if (!count) return true;
+            if (bytes.size() + count > cap) return false;
+            bytes.append(buffer.data(), count);
+        }
+    };
+    std::string manifestBytes, signatureBytes;
+    if (!readHeld(manifestHandle.get(), 16 * 1024 * 1024, manifestBytes) ||
+        !readHeld(signatureHandle.get(), 256, signatureBytes)) return 11;
     const fs::path rootPath(requestedRoot);
-    const auto verified = chudware::security::verifyPayloadManifest(
-        rootPath, rootPath / kManifestName, rootPath / kSignatureName,
-        chudware::security::VerifyMode::Full, rootPath / L"chudware.exe");
+    const auto verified = chudware::security::verifyPayloadManifestBytes(
+        rootPath, manifestBytes, signatureBytes, chudware::security::VerifyMode::Full,
+        rootPath / L"chudware.exe");
     if (!verified.ok) return 11;
 
     json manifest;
-    try { manifest = json::parse(std::ifstream(rootPath / kManifestName, std::ios::binary)); }
+    try { manifest = json::parse(manifestBytes); }
     catch (...) { return 12; }
     if (!manifest.is_object() || manifest.value("schema", "") != "chudware-payload-v1" ||
         manifest.value("product", "") != "Chudware" || manifest.value("platform", "") != "windows" ||
@@ -225,11 +237,20 @@ int uninstall(const std::wstring& requestedRoot) {
         if (item.hash.size() != 64) return 14;
         owned.push_back(std::move(item));
     }
-    std::sort(owned.begin(), owned.end(), [](const Owned& a, const Owned& b) {
+    auto isTrustAnchor = [](const Owned& item) {
+        return item.parts.size() == 1 &&
+               (_wcsicmp(item.parts[0].c_str(), L"chudware.exe") == 0 ||
+                _wcsicmp(item.parts[0].c_str(), L"chudware-uninstall-helper.exe") == 0);
+    };
+    std::stable_sort(owned.begin(), owned.end(), [&](const Owned& a, const Owned& b) {
+        const bool anchorA = isTrustAnchor(a), anchorB = isTrustAnchor(b);
+        if (anchorA != anchorB) return !anchorA;
         return a.parts.size() > b.parts.size();
     });
+    std::vector<UniqueHandle> pinnedDirectories;
     for (const auto& item : owned)
-        if (!hashAndDelete(root.get(), item.parts, item.size, item.hash)) return 15;
+        if (!hashAndDelete(root.get(), item.parts, item.size, item.hash,
+                           pinnedDirectories)) return 15;
     return 0;
 }
 

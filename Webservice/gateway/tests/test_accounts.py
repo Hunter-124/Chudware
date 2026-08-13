@@ -305,6 +305,29 @@ def test_admin_api_gating_and_self_service(accounts_env):
     ).status_code == 400
     assert admin.get("/api/admin/accounts?status=bogus").status_code == 400
 
+    assert member.put(
+        "/api/admin/accounts/newbie@example.com/security-policy",
+        json={"policy": "minimized", "endpoint": None},
+    ).status_code == 403
+    assert admin.put(
+        "/api/admin/accounts/newbie@example.com/security-policy",
+        json={"policy": "minimized", "endpoint": None},
+    ).status_code == 404
+    accounts.set_plan("newbie@example.com", "enterprise")
+    assigned = admin.put(
+        "/api/admin/accounts/newbie@example.com/security-policy",
+        json={"policy": "customer_endpoint", "endpoint": "https://security.example/receipt"},
+    )
+    assert assigned.status_code == 200
+    assert admin.get("/api/admin/accounts/newbie@example.com/security-policy").json() == {
+        "email": "newbie@example.com", "policy": "customer_endpoint",
+        "endpoint": "https://security.example/receipt",
+    }
+    assert admin.put(
+        "/api/admin/accounts/newbie@example.com/security-policy",
+        json={"policy": "customer_endpoint", "endpoint": "http://insecure.example/receipt"},
+    ).status_code == 400
+
     # Self-service reflects the approval.
     me = member.get("/api/me/account")
     assert me.json()["status"] == "active"

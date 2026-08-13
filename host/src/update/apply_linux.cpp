@@ -1,5 +1,4 @@
 #include "updater.h"
-#include "security/integrity.h"
 
 #if defined(__linux__)
 
@@ -11,79 +10,10 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <sys/wait.h>
-#include <vector>
 
 namespace chudware::update {
 namespace {
 
-class TemporaryDirectory {
-public:
-    TemporaryDirectory() {
-        std::string pattern = (std::filesystem::temp_directory_path() /
-                               "chudware-appimage-XXXXXX").string();
-        storage_.assign(pattern.begin(), pattern.end());
-        storage_.push_back('\0');
-        if (char* made = ::mkdtemp(storage_.data())) path_ = made;
-    }
-    ~TemporaryDirectory() {
-        std::error_code ignored;
-        if (!path_.empty()) std::filesystem::remove_all(path_, ignored);
-    }
-    const std::filesystem::path& path() const { return path_; }
-
-private:
-    std::vector<char> storage_;
-    std::filesystem::path path_;
-};
-
-bool runAppImageExtract(const std::filesystem::path& artifact,
-                        const std::filesystem::path& destination,
-                        std::string* error) {
-    const pid_t child = ::fork();
-    if (child < 0) {
-        if (error) *error = "could not fork AppImage extractor: " +
-                            std::string(std::strerror(errno));
-        return false;
-    }
-    if (child == 0) {
-        if (::chdir(destination.c_str()) != 0) ::_exit(126);
-        ::execl(artifact.c_str(), artifact.c_str(), "--appimage-extract",
-                static_cast<char*>(nullptr));
-        ::_exit(127);
-    }
-    int status = 0;
-    pid_t waited;
-    do {
-        waited = ::waitpid(child, &status, 0);
-    } while (waited < 0 && errno == EINTR);
-    if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        if (error) *error = "could not unpack staged AppImage for payload verification";
-        return false;
-    }
-    return true;
-}
-
-bool verifyStagedAppImage(const std::filesystem::path& artifact, std::string* error) {
-    TemporaryDirectory temporary;
-    if (temporary.path().empty()) {
-        if (error) *error = "could not create AppImage verification directory: " +
-                            std::string(std::strerror(errno));
-        return false;
-    }
-    if (!runAppImageExtract(std::filesystem::absolute(artifact), temporary.path(), error))
-        return false;
-
-    const std::filesystem::path root = temporary.path() / "squashfs-root";
-    const auto result = security::verifyPayloadManifest(
-        root, root / "payload-manifest.v1.json", root / "payload-manifest.v1.sig",
-        security::VerifyMode::Full, root / "usr/bin/chudware");
-    if (!result.ok) {
-        if (error) *error = "staged AppImage payload verification failed: " + result.detail;
-        return false;
-    }
-    return true;
-}
 
 bool copyDurable(const std::filesystem::path& source,
                  const std::filesystem::path& destination,
@@ -151,8 +81,6 @@ ApplyResult applyPlatformArtifact(const std::filesystem::path& verifiedArtifact,
         if (error) *error = "cannot determine the installed AppImage path";
         return ApplyResult::ManualDownload;
     }
-    if (!verifyStagedAppImage(verifiedArtifact, error))
-        return ApplyResult::Rejected;
     const std::filesystem::path replacement = installed.string() + ".update";
     if (!copyDurable(verifiedArtifact, replacement, error))
         return ApplyResult::ManualDownload;

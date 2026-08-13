@@ -57,8 +57,10 @@ try:
     from .releases import router as releases_router
     from .accounts import router as accounts_router
     from .billing import router as billing_router
-    from .entitlement import router as entitlement_router
+    from .entitlement import _load_private_key as load_entitlement_private_key, router as entitlement_router
     from .metrics import MetricsMiddleware, router as metrics_router
+    from .security import router as security_router
+    from .appeals import router as appeals_router
     from .portal_api import router as portal_api_router
     from .portal_serve import router as portal_serve_router
 except ImportError:
@@ -73,8 +75,10 @@ except ImportError:
     from releases import router as releases_router
     from accounts import router as accounts_router
     from billing import router as billing_router
-    from entitlement import router as entitlement_router
+    from entitlement import _load_private_key as load_entitlement_private_key, router as entitlement_router
     from metrics import MetricsMiddleware, router as metrics_router
+    from security import router as security_router
+    from appeals import router as appeals_router
     from portal_api import router as portal_api_router
     from portal_serve import router as portal_serve_router
 
@@ -345,6 +349,9 @@ async def admin_page(request: Request) -> HTMLResponse:
 @app.on_event("startup")
 async def _startup() -> None:
     settings.ensure_data_dirs()
+    # The online signing key is a systemd credential, never generated or read
+    # from an EnvironmentFile. Validate it before opening any serving resource.
+    load_entitlement_private_key()
     # Store first: open the pool and bring the schema up to date. This raises
     # if PostgreSQL is unreachable or a migration fails, and that is the point
     # — a gateway serving requests against a missing or half-migrated schema
@@ -453,6 +460,8 @@ app.include_router(bucket_router)
 app.include_router(accounts_router)
 app.include_router(billing_router)
 app.include_router(entitlement_router)
+app.include_router(security_router)
+app.include_router(appeals_router)
 app.include_router(metrics_router)
 app.include_router(portal_api_router)
 app.include_router(portal_serve_router)

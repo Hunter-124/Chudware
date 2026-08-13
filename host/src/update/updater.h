@@ -22,6 +22,8 @@ enum class State {
 struct Manifest {
     std::string version;
     std::string minSupported;
+    std::string platform;
+    std::string arch;
     std::string keyId;
     std::string sha256;
     std::uint64_t size = 0;
@@ -92,5 +94,14 @@ ApplyResult applyPlatformArtifact(const std::filesystem::path& verifiedArtifact,
                                   const std::filesystem::path& executablePath,
                                   const std::string& version,
                                   std::string* error);
+
+namespace testing {
+enum class StagedTransactionState { Missing, Staged, Applying, Committed, Invalid };
+StagedTransactionState stagedTransactionState(const std::filesystem::path& metadata);
+bool transitionStagedTransaction(const std::filesystem::path& metadata,
+                                 StagedTransactionState expected,
+                                 StagedTransactionState desired,
+                                 std::string* error = nullptr);
+}
 
 }  // namespace chudware::update

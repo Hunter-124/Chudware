@@ -25,9 +25,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 try:
     from .db import tx
     from .limits import api_writes
+    from urllib.parse import urlparse
 except ImportError:  # allow `uvicorn app:app` from the package dir
     from db import tx  # type: ignore
     from limits import api_writes  # type: ignore
+    from urllib.parse import urlparse
 
 log = logging.getLogger("chudware.gateway.accounts")
 
@@ -491,6 +493,56 @@ async def admin_set_plan(
     if plan not in PLANS:
         raise HTTPException(status_code=400, detail=f"plan must be one of {sorted(PLANS)}")
     return _mutate(request, email, set_plan, plan)
+
+
+@router.get("/api/admin/accounts/{email}/security-policy")
+async def admin_get_security_policy(email: str, request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    account = get_account(email)
+    if account is None or account.plan != "enterprise":
+        raise HTTPException(status_code=404, detail="enterprise account not found")
+    with tx() as cur:
+        cur.execute(
+            "SELECT a.policy_id, p.endpoint FROM account_security_policies a "
+            "JOIN security_policies p ON p.id = a.policy_id WHERE a.email = %s", (account.email,),
+        )
+        row = cur.fetchone()
+    return {"email": account.email, "policy": "standard" if row is None else row["policy_id"],
+            "endpoint": None if row is None else row["endpoint"]}
+
+
+@router.put("/api/admin/accounts/{email}/security-policy")
+async def admin_set_security_policy(email: str, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    admin = _require_admin(request)
+    api_writes.enforce(admin.email, "admin security policy writes")
+    account = get_account(email)
+    if account is None or account.plan != "enterprise":
+        raise HTTPException(status_code=404, detail="enterprise account not found")
+    if not isinstance(body, dict) or set(body) != {"policy", "endpoint"}:
+        raise HTTPException(status_code=400, detail="invalid security policy assignment")
+    policy = body.get("policy")
+    endpoint = body.get("endpoint")
+    if policy not in {"standard", "minimized", "customer_endpoint"}:
+        raise HTTPException(status_code=400, detail="invalid security policy")
+    if policy == "customer_endpoint":
+        parsed = urlparse(endpoint) if isinstance(endpoint, str) else None
+        if parsed is None or parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+            raise HTTPException(status_code=400, detail="customer endpoint must be HTTPS")
+    elif endpoint is not None:
+        raise HTTPException(status_code=400, detail="endpoint is only valid for customer_endpoint")
+    with tx() as cur:
+        cur.execute(
+            "INSERT INTO security_policies (id,telemetry_mode,endpoint,config) VALUES (%s,%s,%s,'{}'::jsonb) "
+            "ON CONFLICT (id) DO UPDATE SET endpoint=EXCLUDED.endpoint",
+            (policy, policy, endpoint),
+        )
+        cur.execute(
+            "INSERT INTO account_security_policies (email,policy_id,assigned_at,assigned_by) "
+            "VALUES (%s,%s,now(),%s) ON CONFLICT (email) DO UPDATE SET "
+            "policy_id=EXCLUDED.policy_id,assigned_at=EXCLUDED.assigned_at,assigned_by=EXCLUDED.assigned_by",
+            (account.email, policy, admin.email),
+        )
+    return {"ok": True, "email": account.email, "policy": policy, "endpoint": endpoint}
 
 
 @router.get("/api/me/account")

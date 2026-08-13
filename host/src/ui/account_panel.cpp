@@ -6,11 +6,14 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+#include <sstream>
 
 #include <nlohmann/json.hpp>
 
@@ -22,6 +25,12 @@
 #include "onboarding.h"
 #include "web_capabilities.h"
 #include "agent/http.h"
+#include "api/chudware_version.h"
+#include "security/containment.h"
+#include "security/integrity.h"
+#include "security/event_queue.h"
+#include "util/device_identity.h"
+#include "util/platform_paths.h"
 #include "util/entitlement.h"
 #include "util/secret_store.h"
 extern "C" {
@@ -51,13 +60,16 @@ namespace {
 using json = nlohmann::json;
 using namespace std::chrono;
 constexpr const char* kService = "com.chudware.desktop";
+constexpr const char* kSecurityAccount = "security-policy-v1";
 constexpr const char* kAccount = "entitlement";
+constexpr const char* kSubjectAccount = "entitlement-subject-v1";
 constexpr double kRefreshIntervalSeconds = 12.0 * 60.0 * 60.0;
-
 struct PendingResult {
     enum class Kind { None, Fresh, Refused, Unreachable, Invalid } kind = Kind::None;
     std::string token;
     std::string detail;
+    std::string securityPolicy;
+    std::string enforcementState;
 };
 
 struct Controller {
@@ -71,6 +83,7 @@ struct Controller {
     bool initialized = false;
     bool refreshRunning = false;
     bool loginRunning = false;
+    std::string securityPolicyId;
     bool authoritativeRefused = false;
 
     ~Controller() {
@@ -88,8 +101,25 @@ double monotonicNow() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
+std::string platformName();
 std::int64_t wallNow() {
     return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+}
+
+std::string bootIdentifier() {
+#if defined(_WIN32)
+    // The boot wall instant remains stable for the boot and changes across reboots.
+    const auto bootWall = wallNow() - static_cast<std::int64_t>(GetTickCount64() / 1000ULL);
+    return "windows:" + std::to_string(bootWall);
+#elif defined(__linux__)
+    std::ifstream input("/proc/sys/kernel/random/boot_id");
+    std::string id;
+    std::getline(input, id);
+    return id.empty() ? std::string{} : "linux:" + id;
+#else
+    // No reliable platform boot identity: leave empty and force wall-clock mode.
+    return {};
+#endif
 }
 
 void closeSocket(Socket socket) {
@@ -230,11 +260,19 @@ bool persist(const std::string& token, const chudware::entitlement::CheckinStamp
         {"token", token},
         {"last_successful_checkin_wall", stamp.wallSeconds},
         {"last_successful_checkin_monotonic", stamp.monotonicSeconds},
+        {"last_successful_checkin_boot_id", stamp.bootId},
     };
     const auto key = chudware::entitlement::deviceKey(stableDeviceMaterial());
     const auto sealed = chudware::entitlement::sealForDevice(stored.dump(), key);
     return !sealed.empty() && chudware::secret_store::store(
         kService, kAccount, sealed, appdataAppDir());
+}
+
+bool persistSubject(std::string_view subject) {
+    if (subject.empty()) return false;
+    return chudware::secret_store::store(
+        kService, kSubjectAccount,
+        std::vector<unsigned char>(subject.begin(), subject.end()), appdataAppDir());
 }
 
 bool loadStored(std::string& token, chudware::entitlement::CheckinStamp& stamp) {
@@ -249,10 +287,93 @@ bool loadStored(std::string& token, chudware::entitlement::CheckinStamp& stamp) 
         token = stored.at("token").get<std::string>();
         stamp.wallSeconds = stored.at("last_successful_checkin_wall").get<std::int64_t>();
         stamp.monotonicSeconds = stored.at("last_successful_checkin_monotonic").get<double>();
+        stamp.bootId = stored.at("last_successful_checkin_boot_id").get<std::string>();
         return !token.empty() && stamp.wallSeconds > 0;
     } catch (const std::exception&) {
         return false;
     }
+}
+
+bool persistSecurityPolicy(std::string_view subject, const json& policy) {
+    chudware::entitlement::SecurityPolicy verified;
+    std::string error;
+    if (!chudware::entitlement::verifyEmbeddedSecurityPolicy(
+            policy.dump(), subject, verified, &error)) return false;
+    const std::string value = json{{"subject",subject},{"policy",policy}}.dump();
+    return chudware::secret_store::store(kService,kSecurityAccount,
+        std::vector<unsigned char>(value.begin(),value.end()),appdataAppDir());
+}
+
+bool loadSecurityPolicy(std::string& subject, json& policy,
+                        chudware::entitlement::SecurityPolicy& verified) {
+    std::vector<unsigned char> bytes;
+    if(!chudware::secret_store::load(kService,kSecurityAccount,bytes,appdataAppDir()))return false;
+    try {
+        const json value=json::parse(bytes.begin(),bytes.end());
+        subject=value.at("subject").get<std::string>(); policy=value.at("policy");
+        std::string error;
+        return !subject.empty() && chudware::entitlement::verifyEmbeddedSecurityPolicy(
+            policy.dump(), subject, verified, &error);
+    } catch(...){return false;}
+}
+
+std::string securityEventsUrl() {
+    if(const char* value=std::getenv("CHUDWARE_SECURITY_EVENTS_URL");value&&*value)return value;
+    return "https://app.chudware.com/api/security/events";
+}
+
+struct SecurityBatchResult {
+    bool accepted = false;
+    json customerReceipt = nullptr;
+};
+
+SecurityBatchResult sendSecurityBatch(std::string_view subject,
+                                      const chudware::entitlement::SecurityPolicy& policy,
+                                      std::uint64_t refreshSequence,
+                                      std::string_view requestNonce) {
+    SecurityBatchResult result;
+    chudware::security::EventQueue queue(appdataAppDir()); std::string error;
+    auto batch=queue.prepareBatch(subject,policy.id,CHUDWARE_VERSION,platformName(),wallNow(),&error);
+    if(!batch)return result;
+    std::string compressed;
+    if(!chudware::security::gzipSecurityPayload(batch.body,compressed))return result;
+    const std::string endpoint = policy.id == "customer_endpoint"
+        ? policy.customerEndpoint : securityEventsUrl();
+    if (policy.id == "customer_endpoint" && endpoint.rfind("https://", 0) != 0) return result;
+    const auto response=chudware::agent::http_post(endpoint,
+        {{"Content-Type","application/json"},{"Content-Encoding","gzip"}},compressed,8000);
+    if (policy.id == "customer_endpoint") {
+        if (response.status != 200) return result;
+        try {
+            const json acceptance = json::parse(response.body);
+            if (acceptance != json{{"accepted", true}}) return result;
+            json receipt = {
+                {"subject", subject},
+                {"sequence", refreshSequence},
+                {"request_nonce", requestNonce},
+                {"verdict", "allow"},
+                {"reason", "heartbeat"},
+                {"issued_at", wallNow()},
+            };
+            // The customer service authenticates acceptance through HTTPS; the
+            // device then attests that exact refresh-bound acceptance to central.
+            if (!chudware::device_identity::signCustomerReceipt(
+                    receipt, appdataAppDir(), &error)) return result;
+            result.customerReceipt = std::move(receipt);
+            result.accepted = true;
+            return result;
+        } catch (...) { return result; }
+    }
+    std::string enforcement;
+    if(response.status!=200||!chudware::security::verifySecurityAcknowledgement(
+            response.body,batch.batchId,subject,policy.id,batch.sequence,&enforcement))return result;
+    const auto decision=chudware::security::verifyEmbeddedEnforcementState(enforcement,subject,wallNow());
+    if(decision.status==chudware::security::EnforcementStatus::Malformed||
+       decision.status==chudware::security::EnforcementStatus::InvalidSignature||
+       decision.status==chudware::security::EnforcementStatus::SubjectMismatch||
+       !chudware::security::persistEnforcementState(enforcement,appdataAppDir()))return result;
+    result.accepted = queue.accept(batch.batchId,batch.sequence,&error);
+    return result;
 }
 
 void fillState(AppState& state, const chudware::entitlement::TokenPayload& payload) {
@@ -264,7 +385,7 @@ void fillState(AppState& state, const chudware::entitlement::TokenPayload& paylo
 void evaluateOffline(AppState& state) {
     Controller& c = controller();
     const auto decision = chudware::entitlement::offlineAccess(
-        c.payload, c.stamp, wallNow(), monotonicNow());
+        c.payload, c.stamp, wallNow(), monotonicNow(), bootIdentifier());
     state.entitlementGraceExpiring =
         decision.access == chudware::entitlement::OfflineAccess::Expiring;
     state.entitlementReadOnly =
@@ -297,16 +418,89 @@ void setPending(PendingResult result) {
 
 std::string randomState();
 
+std::string platformName() {
+#if defined(_WIN32)
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#else
+    return "linux";
+#endif
+}
+
+std::string integrityDigest() {
+    const auto verified = chudware::security::verifyInstalledPayload(
+        chudware::platform::executablePath(), chudware::security::VerifyMode::Startup);
+    if (!verified.ok) return "invalid:" + std::string(chudware::security::integrityReasonName(verified.reason));
+    // Startup verification is authoritative for the installed signed payload.
+    // The digest is a stable signed-manifest identifier rather than a claim
+    // that the device itself is trustworthy.
+    const auto manifest = verified.root / "payload-manifest.v1.json";
+    std::ifstream input(manifest, std::ios::binary);
+    if (!input) return chudware::security::integrityReasonName(verified.reason);
+    std::string bytes((std::istreambuf_iterator<char>(input)), {});
+    std::array<unsigned char, crypto_hash_BYTES> hash{};
+    crypto_hash(hash.data(), reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size());
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(hash.size() * 2);
+    for (unsigned char byte : hash) { out.push_back(hex[byte >> 4]); out.push_back(hex[byte & 15]); }
+    return out;
+}
+
 void startRefresh(const std::string& token) {
     Controller& c = controller();
     if (c.refreshRunning || c.loginRunning || c.worker.joinable()) return;
+    const auto identity = chudware::device_identity::load(appdataAppDir());
+    if (identity.status != chudware::device_identity::KeyStatus::Ready) {
+        setPending({PendingResult::Kind::Invalid, {},
+                    "Device identity is missing or damaged; sign in again to reauthorize this device"});
+        return;
+    }
     c.refreshRunning = true;
     c.lastAttemptMonotonic = monotonicNow();
+    std::string securitySubject;
+    json signedPolicy;
+    chudware::entitlement::SecurityPolicy securityPolicy;
+    const bool havePolicy = loadSecurityPolicy(securitySubject, signedPolicy, securityPolicy);
+    chudware::security::EventQueue securityQueue(appdataAppDir());
     const std::string challenge = randomState();
-    c.worker = std::thread([token, challenge]() {
+    const std::uint64_t sequence = chudware::device_identity::nextRefreshSequence(appdataAppDir());
+    json envelope = {
+        {"token", token},
+        {"request_nonce", challenge},
+        {"sequence", sequence},
+        {"app_version", CHUDWARE_VERSION},
+        {"platform", platformName()},
+        {"integrity_digest", integrityDigest()},
+        {"last_acked_event_sequence", securityQueue.acceptedThrough()},
+        {"customer_receipt", nullptr},
+    };
+    if (havePolicy) {
+        const SecurityBatchResult batch = sendSecurityBatch(
+            securitySubject, securityPolicy, sequence, challenge);
+        if (securityPolicy.id == "customer_endpoint") {
+            if (!batch.accepted || batch.customerReceipt.is_null()) {
+                c.refreshRunning = false;
+                setPending({PendingResult::Kind::Unreachable, {},
+                            "Customer security endpoint did not return a valid signed receipt"});
+                return;
+            }
+            envelope["customer_receipt"] = batch.customerReceipt;
+        }
+    }
+    std::string signingError;
+    if (sequence == 0 ||
+        !chudware::device_identity::signRefreshEnvelope(envelope, appdataAppDir(), &signingError)) {
+        c.refreshRunning = false;
+        setPending({PendingResult::Kind::Invalid, {},
+                    "Device identity could not sign the refresh; sign in again to reauthorize this device"});
+        return;
+    }
+    c.worker = std::thread([envelope = std::move(envelope), challenge]() {
         const auto response = chudware::agent::http_post(
-            refreshUrl(), {{"Content-Type", "application/chudware-entitlement"},
-                           {"X-Chudware-Refresh-Nonce", challenge}}, token, 8000);
+            refreshUrl(), {{"Content-Type", "application/json"},
+                           {"X-Chudware-Refresh-Nonce", challenge}}, envelope.dump(), 8000);
         if (response.status == 200) {
             try {
                 const json body = json::parse(response.body);
@@ -315,6 +509,29 @@ void startRefresh(const std::string& token) {
                     std::string error;
                     const std::string freshToken = body["token"].get<std::string>();
                     if (chudware::entitlement::verifyEmbeddedToken(freshToken, fresh, &error)) {
+                        if (!body.contains("security_policy") || !body["security_policy"].is_object() ||
+                            !persistSecurityPolicy(fresh.subject, body["security_policy"])) {
+                            setPending({PendingResult::Kind::Invalid, {}, "Gateway security policy failed verification"});
+                            return;
+                        }
+                        if (!persistSubject(fresh.subject)) {
+                            setPending({PendingResult::Kind::Invalid, {}, "Gateway subject could not be stored securely"});
+                            return;
+                        }
+                        if (!body.contains("enforcement_state") || !body["enforcement_state"].is_object()) {
+                            setPending({PendingResult::Kind::Invalid, {}, "Gateway omitted signed enforcement state"});
+                            return;
+                        }
+                        const std::string enforcement = body["enforcement_state"].dump();
+                        const auto decision = chudware::security::verifyEmbeddedEnforcementState(
+                            enforcement, fresh.subject, wallNow());
+                        if (decision.status == chudware::security::EnforcementStatus::InvalidSignature ||
+                            decision.status == chudware::security::EnforcementStatus::SubjectMismatch ||
+                            decision.status == chudware::security::EnforcementStatus::Malformed ||
+                            !chudware::security::persistEnforcementState(enforcement, appdataAppDir())) {
+                            setPending({PendingResult::Kind::Invalid, {}, "Gateway enforcement state failed verification"});
+                            return;
+                        }
                         setPending({PendingResult::Kind::Fresh, freshToken, {}});
                         return;
                     }
@@ -339,8 +556,6 @@ void startRefresh(const std::string& token) {
             setPending({PendingResult::Kind::Unreachable, {}, response.error});
             return;
         }
-        // Unsigned 4xx responses are not authoritative refusals. Treat them like
-        // an unreachable gateway so a hostile network cannot force read-only.
         setPending({PendingResult::Kind::Unreachable, {}, "Subscription check could not be authenticated"});
     });
 }
@@ -459,15 +674,23 @@ bool beginDesktopAccountLogin(AppState& state) {
         state.entitlementStatus = "Could not start the secure loopback sign-in listener";
         return false;
     }
+    const auto identity = chudware::device_identity::prepareAuthorizationKey(appdataAppDir());
+    if (identity.status != chudware::device_identity::KeyStatus::Ready) {
+        closeSocket(listener);
+        state.entitlementStatus = "Could not create or securely store the pending device identity";
+        return false;
+    }
     const std::string stateValue = randomState();
     const std::string device = deviceName();
     const char* baseEnv = std::getenv("CHUDWARE_ENTITLEMENT_AUTHORIZE_URL");
     const std::string base = baseEnv && *baseEnv
         ? baseEnv : "https://app.chudware.com/desktop/authorize";
     const std::string url = base + "?port=" + std::to_string(port) +
-        "&state=" + urlEncode(stateValue) + "&device=" + urlEncode(device);
+        "&state=" + urlEncode(stateValue) + "&device=" + urlEncode(device) +
+        "&device_public_key=" + urlEncode(identity.publicKey);
     if (!openExternalHttpUrl(url)) {
         closeSocket(listener);
+        chudware::device_identity::discardAuthorizationKey(appdataAppDir());
         state.entitlementStatus = "Could not open the system browser";
         return false;
     }
@@ -496,17 +719,29 @@ bool beginDesktopAccountLogin(AppState& state) {
                     std::string error;
                     ok = target.rfind("/callback?", 0) == 0 && returnedState == stateValue &&
                          chudware::entitlement::verifyEmbeddedToken(token, payload, &error);
-                    if (ok) setPending({PendingResult::Kind::Fresh, token, {}});
+                    if (ok) {
+                        try {
+                            const json policy = json::parse(queryValue(target, "security_policy"));
+                            const json enforcement = json::parse(queryValue(target, "enforcement_state"));
+                            const auto decision = chudware::security::verifyEmbeddedEnforcementState(
+                                enforcement.dump(), payload.subject, wallNow());
+                            ok = policy.is_object() && policy.value("subject", "") == payload.subject &&
+                                 policy.value("request_nonce", "") == stateValue && decision.active();
+                            if (ok) {
+                                ok = chudware::device_identity::finalizeAuthorizationKey(appdataAppDir());
+                                if (ok) setPending({PendingResult::Kind::Fresh, token, {},
+                                                    policy.dump(), enforcement.dump()});
+                            }
+                        } catch (...) { ok = false; }
+                    }
                 }
             }
             sendBrowserResponse(client, ok);
             closeSocket(client);
-            if (ok) {
-                closeSocket(listener);
-                return;
-            }
+            if (ok) { closeSocket(listener); return; }
         }
         closeSocket(listener);
+        chudware::device_identity::discardAuthorizationKey(appdataAppDir());
         setPending({PendingResult::Kind::Unreachable, {}, "Browser authorization timed out"});
     });
     return true;
@@ -521,7 +756,7 @@ void tickAccountPanel(AppState& state) {
             if (c.pending.kind == PendingResult::Kind::None) {
                 if (state.entitlementSignedIn) {
                     const auto decision = chudware::entitlement::offlineAccess(
-                        c.payload, c.stamp, wallNow(), monotonicNow());
+                        c.payload, c.stamp, wallNow(), monotonicNow(), bootIdentifier());
                     if (decision.access == chudware::entitlement::OfflineAccess::ClockRollback)
                         state.entitlementReadOnly = true;
                 }
@@ -539,12 +774,41 @@ void tickAccountPanel(AppState& state) {
                 state.entitlementStatus = "Received entitlement failed verification";
                 return;
             }
+            if (!result.securityPolicy.empty()) {
+                try {
+                    const json policy = json::parse(result.securityPolicy);
+                    chudware::entitlement::SecurityPolicy verifiedPolicy;
+                    std::string policyError;
+                    if (!chudware::entitlement::verifyEmbeddedSecurityPolicy(
+                            policy.dump(), fresh.subject, verifiedPolicy, &policyError) ||
+                        !persistSecurityPolicy(fresh.subject, policy)) {
+                        state.entitlementReadOnly = true;
+                        state.entitlementStatus = "Security policy could not be stored securely";
+                        return;
+                    }
+                } catch (...) {
+                    state.entitlementReadOnly = true;
+                    state.entitlementStatus = "Security policy was malformed";
+                    return;
+                }
+            }
+            if (!result.enforcementState.empty() &&
+                !chudware::security::persistEnforcementState(result.enforcementState, appdataAppDir())) {
+                state.entitlementReadOnly = true;
+                state.entitlementStatus = "Enforcement state could not be stored securely";
+                return;
+            }
             c.payload = std::move(fresh);
-            c.stamp = {wallNow(), monotonicNow()};
+            c.stamp = {wallNow(), monotonicNow(), bootIdentifier()};
             state.entitlementToken = result.token;
             state.entitlementMutationVerified = false;
             state.entitlementAiVerified = false;
             fillState(state, c.payload);
+            if (!persistSubject(c.payload.subject)) {
+                state.entitlementReadOnly = true;
+                state.entitlementStatus = "Entitlement subject could not be stored securely";
+                return;
+            }
             c.authoritativeRefused = false;
             state.entitlementReadOnly = false;
             state.entitlementGraceExpiring = false;
@@ -577,7 +841,7 @@ void tickAccountPanel(AppState& state) {
     bool forceClockCheck = false;
     if (state.entitlementSignedIn && !c.authoritativeRefused) {
         const auto decision = chudware::entitlement::offlineAccess(
-            c.payload, c.stamp, wallNow(), monotonicNow());
+            c.payload, c.stamp, wallNow(), monotonicNow(), bootIdentifier());
         evaluateOffline(state);
         forceClockCheck =
             decision.access == chudware::entitlement::OfflineAccess::ClockRollback;

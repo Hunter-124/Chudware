@@ -19,6 +19,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from gateway import accounts, app as app_mod, db, metrics  # noqa: E402
 from gateway.config import settings  # noqa: E402
+from gateway import entitlement  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
 _LABEL = r'[a-zA-Z_][a-zA-Z0-9_]*="(?:[^"\\]|\\.)*"'
 _SAMPLE = re.compile(
@@ -40,6 +43,15 @@ def _isolate(pg, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_root", tmp_path / "data")
     monkeypatch.setattr(settings, "dev_mode", True)
     monkeypatch.setattr(metrics, "registry", metrics.Registry())
+    key = Ed25519PrivateKey.generate()
+    key_path = tmp_path / "entitlement.key"
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+        serialization.NoEncryption()))
+    key_path.chmod(0o600)
+    monkeypatch.setenv("CHUDWARE_ENTITLEMENT_KEY_PATH", str(key_path))
+    monkeypatch.setattr(entitlement, "EMBEDDED_PUBLIC_KEY", key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw))
     _seed("user@example.com")
     _seed("admin@example.com", admin=True)
 
@@ -112,3 +124,24 @@ def test_instrumentation_exception_cannot_break_response(client, monkeypatch):
     response = client.get("/healthz")
     assert response.status_code == 200
     assert response.json() == {"ok": True}
+
+def test_security_counters_have_fixed_outcome_labels():
+    registry = metrics.Registry()
+    registry.security_batch("accepted")
+    registry.security_batch("attacker-controlled-label")
+    registry.security_action("revoked")
+    registry.security_appeal("submitted")
+
+    body = "\n".join(registry.render_process_metrics())
+    assert 'chudware_security_batches_total{outcome="accepted"} 1' in body
+    assert 'chudware_security_batches_total{outcome="other"} 1' in body
+    assert 'chudware_security_actions_total{outcome="revoked"} 1' in body
+    assert 'chudware_security_appeals_total{outcome="submitted"} 1' in body
+    assert "attacker-controlled-label" not in body
+
+
+def test_security_counter_families_render_zeroes_before_first_event():
+    body = "\n".join(metrics.Registry().render_process_metrics())
+    assert 'chudware_security_batches_total{outcome="duplicate"} 0' in body
+    assert 'chudware_security_actions_total{outcome="reversed"} 0' in body
+    assert 'chudware_security_appeals_total{outcome="upheld"} 0' in body

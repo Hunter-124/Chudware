@@ -15,7 +15,9 @@ import re
 import secrets
 import stat
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
@@ -45,7 +47,7 @@ except ImportError:  # uvicorn app:app from package dir
 router = APIRouter(tags=["entitlement"])
 
 MAX_REFRESH_BYTES = 64 * 1024
-KEY_PATH = Path("~/chudware-web-data/entitlement_ed25519.key").expanduser()
+ENTITLEMENT_KEY_ENV = "CHUDWARE_ENTITLEMENT_KEY_PATH"
 EMBEDDED_PUBLIC_KEY = bytes.fromhex(
     "bdb8869038e8274a32a6f14b86f0fbdbe599c6c78e49dc495cfa1275b01490f3"
 )
@@ -55,6 +57,124 @@ _VALID_PLANS = frozenset({"trial", "desktop", "studio", "enterprise"})
 _PAID_STATUSES = frozenset({"active", "trialing"})
 _refresh_by_subject = RateLimiter(20, 60.0)
 _refresh_by_ip = RateLimiter(30, 60.0)
+_REFRESH_FIELDS = frozenset({
+    "token", "request_nonce", "sequence", "app_version", "platform",
+    "integrity_digest", "last_acked_event_sequence", "customer_receipt", "signature",
+})
+_POLICY_MODES = frozenset({"standard", "minimized", "customer_endpoint"})
+_CUSTOMER_RECEIPT_FIELDS = frozenset({"subject", "sequence", "request_nonce", "verdict", "reason", "issued_at", "signature"})
+
+def _device_public_key(value: str) -> bytes:
+    try:
+        raw = _unb64(value)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, "invalid device public key") from exc
+    if len(raw) != 32 or _b64(raw) != value:
+        raise HTTPException(400, "invalid device public key")
+    return raw
+
+def _sign_object(payload: dict[str, Any]) -> dict[str, Any]:
+    signed = dict(payload)
+    signed["signature"] = _b64(_load_private_key().sign(_canonical(payload)))
+    return signed
+
+def _verify_device_object(payload: dict[str, Any], public_key: bytes) -> None:
+    signature = payload.get("signature")
+    try:
+        if not isinstance(signature, str):
+            raise ValueError("missing signature")
+        unsigned = dict(payload)
+        unsigned.pop("signature")
+        Ed25519PublicKey.from_public_bytes(public_key).verify(_unb64(signature), _canonical(unsigned))
+    except (ValueError, InvalidSignature) as exc:
+        raise HTTPException(401, "invalid device signature") from exc
+
+def _policy_assignment(account: Any) -> dict[str, Any]:
+    if str(getattr(account, "plan", "")) != "enterprise":
+        return {"policy_id": "standard", "endpoint": None, "config": {}}
+    with tx() as cur:
+        cur.execute(
+            "SELECT a.policy_id, p.endpoint, p.config "
+            "FROM account_security_policies a JOIN security_policies p ON p.id = a.policy_id "
+            "WHERE a.email = %s", (account.email,),
+        )
+        row = cur.fetchone()
+    if row is None or str(row["policy_id"]) not in _POLICY_MODES:
+        return {"policy_id": "standard", "endpoint": None, "config": {}}
+    return {"policy_id": str(row["policy_id"]), "endpoint": row["endpoint"], "config": dict(row["config"] or {})}
+
+
+def _security_policy(account: Any, entitlement_payload: dict[str, Any], request_nonce: str,
+                     policy_id: str, now: int | None = None) -> dict[str, Any]:
+    issued_at = int(time.time()) if now is None else int(now)
+    assignment = _policy_assignment(account)
+    mode = assignment["policy_id"]
+    if policy_id != mode:
+        policy_id = mode
+    expires_at = min(
+        int(entitlement_payload["paid_through"]),
+        int(entitlement_payload["issued_at"]) + int(entitlement_payload["grace_days"]) * 86400,
+    )
+    payload = {
+        "id": policy_id, "subject": entitlement_payload["sub"],
+        "email": entitlement_payload["email"], "entitlement_nonce": entitlement_payload["nonce"],
+        "request_nonce": request_nonce, "issued_at": issued_at, "expires_at": expires_at,
+        "telemetry_mode": mode,
+    }
+    if mode == "customer_endpoint":
+        payload["customer_endpoint"] = assignment["endpoint"]
+    return _sign_object(payload)
+
+def _enforcement_state(subject: str, state: str, expires_at: int, *,
+                       reason_codes: list[str] | None = None,
+                       action_id: str | None = None, now: int | None = None) -> dict[str, Any]:
+    issued_at = int(time.time()) if now is None else int(now)
+    payload = {
+        "subject": subject,
+        "state": state,
+        "issued_at": issued_at,
+        "expires_at": int(expires_at),
+        "reason_codes": list(reason_codes or []),
+        "action_id": action_id or str(uuid.uuid4()),
+        "nonce": _b64(secrets.token_bytes(16)),
+    }
+    return _sign_object(payload)
+
+
+def _verify_customer_receipt(receipt: Any, public_key: bytes, *, subject: str,
+                             sequence: int, request_nonce: str) -> None:
+    if not isinstance(receipt, dict) or set(receipt) != _CUSTOMER_RECEIPT_FIELDS:
+        raise HTTPException(409, "valid customer security receipt required")
+    _verify_device_object(receipt, public_key)
+    if (receipt.get("subject") != subject or receipt.get("sequence") != sequence
+            or receipt.get("request_nonce") != request_nonce
+            or receipt.get("verdict") != "allow" or receipt.get("reason") != "heartbeat"):
+        raise HTTPException(409, "valid customer security receipt required")
+    issued_at = receipt.get("issued_at")
+    if type(issued_at) is not int or abs(int(time.time()) - issued_at) > 900:
+        raise HTTPException(409, "valid customer security receipt required")
+
+
+def _forward_customer_receipt(endpoint: str, receipt: dict[str, Any]) -> None:
+    parsed = urllib.parse.urlparse(endpoint)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise HTTPException(409, "customer security endpoint is not configured")
+    request = urllib.request.Request(
+        endpoint, data=_canonical(receipt), method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "Chudware-Security/1"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            body = response.read(4097)
+            if response.status != 200 or len(body) > 4096:
+                raise HTTPException(409, "customer security receipt was not accepted")
+            answer = json.loads(body)
+    except HTTPException:
+        raise
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise HTTPException(409, "customer security receipt was not accepted") from exc
+    if answer != {"accepted": True}:
+        raise HTTPException(409, "customer security receipt was not accepted")
 
 
 def _b64(data: bytes) -> str:
@@ -72,43 +192,41 @@ def _canonical(payload: dict[str, Any]) -> bytes:
 
 
 def _key_file() -> Path:
-    override = os.environ.get("CHUDWARE_ENTITLEMENT_KEY_PATH", "").strip()
-    return Path(override).expanduser() if override else KEY_PATH
+    value = os.environ.get(ENTITLEMENT_KEY_ENV, "").strip()
+    if not value:
+        raise RuntimeError(
+            f"{ENTITLEMENT_KEY_ENV} must name the systemd entitlement credential"
+        )
+    path = Path(value)
+    if not path.is_absolute():
+        raise RuntimeError(f"{ENTITLEMENT_KEY_ENV} must be an absolute path")
+    return path
 
 
 def _load_private_key(path: Path | None = None) -> Ed25519PrivateKey:
     key_path = path or _key_file()
-    key_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        metadata = key_path.stat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"entitlement signing credential is missing: {key_path}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"entitlement signing credential is not a regular file: {key_path}")
+    if metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise RuntimeError(
+            f"entitlement signing credential must not be accessible by group or others: {key_path}"
+        )
     try:
         raw = key_path.read_bytes()
-    except FileNotFoundError:
-        generated = Ed25519PrivateKey.generate()
-        raw = generated.private_bytes(
-            serialization.Encoding.Raw,
-            serialization.PrivateFormat.Raw,
-            serialization.NoEncryption(),
-        )
-        try:
-            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:  # another gateway worker won first-start generation
-            raw = key_path.read_bytes()
-        else:
-            with os.fdopen(fd, "wb") as out:
-                out.write(raw)
-                out.flush()
-                os.fsync(out.fileno())
+    except OSError as exc:
+        raise RuntimeError(f"entitlement signing credential is unreadable: {key_path}") from exc
     if len(raw) != 32:
         raise RuntimeError(f"entitlement signing key must be 32 raw bytes: {key_path}")
-    os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
     key = Ed25519PrivateKey.from_private_bytes(raw)
-    # An override is a test/rotation seam. The production default must match the
-    # public key compiled into the desktop or every valid customer is locked out.
-    if path is None and not os.environ.get("CHUDWARE_ENTITLEMENT_KEY_PATH"):
-        public = key.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw
-        )
-        if public != EMBEDDED_PUBLIC_KEY:
-            raise RuntimeError("entitlement private key does not match the shipped public key")
+    public = key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    if public != EMBEDDED_PUBLIC_KEY:
+        raise RuntimeError("entitlement private key does not match the shipped public key")
     return key
 
 
@@ -153,32 +271,39 @@ def verify_compact(token: str, public_key: bytes | None = None) -> dict[str, Any
     return payload
 
 
-def grace_days(issued_at: int, subscribed_since: int) -> int:
-    tenure_months = max(0, (issued_at - subscribed_since) // 2_592_000)
-    return max(7, min(30, 7 + tenure_months))
 
 
-def _subject_for(email: str, device_name: str) -> str:
-    """Mint a subject for one named installation, replacing stale authorization.
-
-    Re-authorizing the same machine intentionally rotates its subject and clears
-    a prior revocation. Any token copied from the old installation stops
-    refreshing immediately.
-    """
+def _subject_for(email: str, device_name: str, device_public_key: str) -> str:
+    """Rotate one named installation onto a new normalized Ed25519 identity."""
+    public_key = _device_public_key(device_public_key)
     subject = str(uuid.uuid4())
     with tx() as cur:
         cur.execute(
+            "SELECT device_public_key, revoked_at FROM desktop_entitlements "
+            "WHERE email = %s AND device_name = %s FOR UPDATE", (email, device_name),
+        )
+        existing = cur.fetchone()
+        if (existing is not None and existing["revoked_at"] is not None
+                and bytes(existing["device_public_key"] or b"") == public_key):
+            raise HTTPException(409, "revoked device key cannot be reactivated")
+        cur.execute(
             """
-            INSERT INTO desktop_entitlements (email, subject, device_name)
-            VALUES (%s, %s, %s)
+            INSERT INTO desktop_entitlements
+                (email, subject, device_name, device_public_key)
+            VALUES (%s, %s, %s, %s)
             ON CONFLICT (email, device_name) DO UPDATE
                     SET subject = EXCLUDED.subject,
+                        device_public_key = EXCLUDED.device_public_key,
                         created_at = now(),
                         last_checkin_at = NULL,
+                        last_security_checkin_at = NULL,
+                        last_refresh_sequence = 0,
+                        last_event_sequence = 0,
+                        policy_id = 'standard',
                         revoked_at = NULL
             RETURNING subject::text AS subject
             """,
-            (email, subject, device_name),
+            (email, subject, device_name, public_key),
         )
         row = cur.fetchone()
     return str(row["subject"])
@@ -264,7 +389,7 @@ def _issue(account: Any, subject: str, now: int | None = None) -> str:
         "issued_at": issued_at,
         "paid_through": paid_through,
         "subscribed_since": subscribed_since,
-        "grace_days": grace_days(issued_at, subscribed_since),
+        "grace_days": 30,
         "nonce": _b64(secrets.token_bytes(16)),
     }
     return _compact(payload)
@@ -321,10 +446,11 @@ def _validate_authorize_params(port: Any, state_value: str, device: str) -> int:
 
 @router.get("/desktop/authorize", response_class=HTMLResponse)
 async def desktop_authorize_page(
-    request: Request, port: int, state: str, device: str
+    request: Request, port: int, state: str, device: str, device_public_key: str
 ) -> HTMLResponse:
     user = get_current_user(request)
     _validate_authorize_params(port, state, device)
+    _device_public_key(device_public_key)
     account = accounts.get_account(user.email)
     if _entitlement_window(account, int(time.time())) is None:
         return HTMLResponse(
@@ -341,6 +467,7 @@ async def desktop_authorize_page(
         f'<input type="hidden" name="port" value="{port}">'
         f'<input type="hidden" name="state" value="{html.escape(state)}">'
         f'<input type="hidden" name="device" value="{escaped_device}">'
+        f'<input type="hidden" name="device_public_key" value="{html.escape(device_public_key)}">'
         '<button type="submit">Authorize Chudware</button></form></main></body></html>'
     )
 
@@ -351,10 +478,20 @@ async def desktop_authorize_confirm(request: Request) -> RedirectResponse:
     form = await request.form()
     state_value = str(form.get("state", ""))
     device = str(form.get("device", ""))
+    device_public_key = str(form.get("device_public_key", ""))
     port = _validate_authorize_params(form.get("port"), state_value, device)
     account = accounts.get_account(user.email)
-    token = _issue(account, _subject_for(user.email, device))
-    query = urllib.parse.urlencode({"token": token, "state": state_value})
+    subject = _subject_for(user.email, device, device_public_key)
+    token = _issue(account, subject)
+    payload = verify_compact(token)
+    policy = _security_policy(account, payload, state_value, "standard")
+    enforcement = _enforcement_state(subject, "active", min(
+        int(payload["paid_through"]), int(payload["issued_at"]) + int(payload["grace_days"]) * 86400))
+    query = urllib.parse.urlencode({
+        "token": token, "state": state_value,
+        "security_policy": json.dumps(policy, separators=(",", ":"), sort_keys=True),
+        "enforcement_state": json.dumps(enforcement, separators=(",", ":"), sort_keys=True),
+    })
     return RedirectResponse(f"http://127.0.0.1:{port}/callback?{query}", status_code=303)
 
 
@@ -370,29 +507,89 @@ async def refresh_entitlement(request: Request) -> JSONResponse:
     body = await request.body()
     if len(body) > MAX_REFRESH_BYTES:
         raise HTTPException(413, "refresh request too large")
-    try:
-        token = body.decode("ascii")
-    except UnicodeDecodeError as exc:
-        key = request.client.host if request.client else "unknown"
-        _refresh_by_ip.enforce(key, "entitlement refreshes")
-        raise HTTPException(401, "invalid entitlement token") from exc
-
-    try:
-        payload = verify_compact(token)
-    except HTTPException:
-        key = request.client.host if request.client else "unknown"
-        _refresh_by_ip.enforce(key, "entitlement refreshes")
-        raise
-    _refresh_by_subject.enforce(payload["sub"], "entitlement refreshes")
     refresh_nonce = request.headers.get("x-chudware-refresh-nonce", "")
     if not _STATE_RE.fullmatch(refresh_nonce):
         raise HTTPException(400, "invalid refresh nonce")
 
-    account = accounts.get_account(payload["email"])
-    identity_matches = _subject_matches(payload["email"], payload["sub"])
-    if account is None or not identity_matches:
-        return JSONResponse(_signed_refusal("account identity is no longer valid", refresh_nonce))
-    if _entitlement_window(account, int(time.time())) is None:
-        return JSONResponse(_signed_refusal("desktop entitlement is inactive", refresh_nonce))
-    fresh = _issue(account, payload["sub"])
-    return JSONResponse({"entitled": True, "token": fresh})
+    # One-release migration path: old clients sent only the compact token. It
+    # is authenticated before receiving a signed, nonce-bound reauthorization.
+    try:
+        envelope = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        try:
+            legacy = verify_compact(body.decode("ascii"))
+        except (HTTPException, UnicodeDecodeError):
+            key = request.client.host if request.client else "unknown"
+            _refresh_by_ip.enforce(key, "entitlement refreshes")
+            raise HTTPException(401, "invalid entitlement token")
+        _refresh_by_subject.enforce(legacy["sub"], "entitlement refreshes")
+        return JSONResponse(_signed_refusal("device reauthorization required", refresh_nonce))
+
+    if not isinstance(envelope, dict) or set(envelope) != _REFRESH_FIELDS:
+        raise HTTPException(400, "invalid refresh envelope")
+    if envelope.get("request_nonce") != refresh_nonce:
+        raise HTTPException(401, "refresh nonce mismatch")
+    sequence = envelope.get("sequence")
+    ack = envelope.get("last_acked_event_sequence")
+    if type(sequence) is not int or sequence <= 0 or type(ack) is not int or ack < 0:
+        raise HTTPException(400, "invalid refresh sequence")
+    if not all(isinstance(envelope.get(k), str) for k in (
+        "token", "app_version", "platform", "integrity_digest", "signature"
+    )):
+        raise HTTPException(400, "invalid refresh envelope")
+    if envelope["customer_receipt"] is not None and not isinstance(envelope["customer_receipt"], dict):
+        raise HTTPException(400, "invalid refresh envelope")
+    token_payload = verify_compact(envelope["token"])
+    _refresh_by_subject.enforce(token_payload["sub"], "entitlement refreshes")
+
+    account = accounts.get_account(token_payload["email"])
+    with tx() as cur:
+        cur.execute(
+            """
+            SELECT device_public_key, last_refresh_sequence, last_event_sequence,
+                   last_security_checkin_at, policy_id, revoked_at
+              FROM desktop_entitlements
+             WHERE email = %s AND subject = %s
+             FOR UPDATE
+            """,
+            (token_payload["email"], token_payload["sub"]),
+        )
+        device = cur.fetchone()
+        if device is None or device["revoked_at"] is not None or device["device_public_key"] is None:
+            return JSONResponse(_signed_refusal("account identity is no longer valid", refresh_nonce))
+        _verify_device_object(envelope, bytes(device["device_public_key"]))
+        if sequence <= int(device["last_refresh_sequence"]):
+            return JSONResponse(_signed_refusal("device reauthorization required", refresh_nonce))
+        if ack != int(device["last_event_sequence"]):
+            raise HTTPException(409, "security event acknowledgement mismatch")
+        assignment = _policy_assignment(account) if account is not None else {"policy_id": "standard", "endpoint": None}
+        if assignment["policy_id"] == "customer_endpoint":
+            receipt = envelope["customer_receipt"]
+            _verify_customer_receipt(
+                receipt, bytes(device["device_public_key"]), subject=token_payload["sub"],
+                sequence=sequence, request_nonce=refresh_nonce,
+            )
+            _forward_customer_receipt(str(assignment["endpoint"] or ""), receipt)
+        elif (device["last_security_checkin_at"] is None
+                or device["last_security_checkin_at"].timestamp() < time.time() - 900):
+            raise HTTPException(409, "recent security check-in required")
+        if account is None or _entitlement_window(account, int(time.time())) is None:
+            return JSONResponse(_signed_refusal("desktop entitlement is inactive", refresh_nonce))
+        fresh = _issue(account, token_payload["sub"])
+        fresh_payload = verify_compact(fresh)
+        policy_id = str(assignment["policy_id"])
+        policy = _security_policy(account, fresh_payload, refresh_nonce, policy_id)
+        cur.execute(
+            """
+            UPDATE desktop_entitlements
+               SET last_refresh_sequence = %s, last_checkin_at = now(), policy_id = %s
+             WHERE email = %s AND subject = %s
+            """,
+            (sequence, policy["id"], token_payload["email"], token_payload["sub"]),
+        )
+    enforcement = _enforcement_state(token_payload["sub"], "active", min(
+        int(fresh_payload["paid_through"]),
+        int(fresh_payload["issued_at"]) + int(fresh_payload["grace_days"]) * 86400,
+    ))
+    return JSONResponse({"entitled": True, "token": fresh, "security_policy": policy,
+                         "enforcement_state": enforcement})

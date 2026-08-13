@@ -43,6 +43,9 @@
 #include <vector>
 
 #include "hostd_log.h"
+#include "security/integrity.h"
+#include "security/runtime_guard.h"
+#include "util/platform_paths.h"
 
 namespace hostd {
 
@@ -324,6 +327,24 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
     const json& params = req.params;
     json& result = req.result;
     bool& isError = req.isError;
+    const auto executable = chudware::platform::executablePath();
+    const auto integrity = chudware::security::verifyInstalledPayload(
+        executable, chudware::security::VerifyMode::ProtectedOperation);
+    if (!integrity.ok) {
+        isError = true;
+        result = json{{"code", "contained"},
+                      {"message", "worker spawn blocked: protected_file_hash_mismatch"}};
+        return;
+    }
+    const auto security = chudware::security::inspectAndPersistRuntime(
+        chudware::security::SecurityCheckpoint::BeforeWorkerSpawn,
+        integrity.root, integrity.files, chudware::security::runtimeGuardStateDir().string());
+    if (!security.allowed()) {
+        isError = true;
+        result = json{{"code", "contained"},
+                      {"message", "worker spawn blocked: " + security.denialReason}};
+        return;
+    }
 
     if (!params.contains("argv") || !params["argv"].is_array() || params["argv"].empty()) {
         isError = true;

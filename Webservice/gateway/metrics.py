@@ -36,6 +36,9 @@ router = APIRouter(tags=["operations"])
 _BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
 _UNMATCHED_ROUTE = "__unmatched__"
 
+_SECURITY_BATCH_OUTCOMES = ("accepted", "duplicate", "reauthorize", "rejected", "other")
+_SECURITY_ACTION_OUTCOMES = ("revoked", "reversed", "other")
+_SECURITY_APPEAL_OUTCOMES = ("submitted", "restored", "upheld", "other")
 
 def _escape_label(value: str) -> str:
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
@@ -66,6 +69,9 @@ class Registry:
         self._entitlements: dict[str, int] = defaultdict(int)
         self._manifests: dict[str, int] = defaultdict(int)
         self._collection_errors = 0
+        self._security_batches: dict[str, int] = defaultdict(int)
+        self._security_actions: dict[str, int] = defaultdict(int)
+        self._security_appeals: dict[str, int] = defaultdict(int)
 
     def observe(self, method: str, route: str, status_code: int, elapsed: float) -> None:
         status_class = f"{status_code // 100}xx" if 100 <= status_code <= 599 else "unknown"
@@ -89,6 +95,24 @@ class Registry:
         with self._lock:
             self._collection_errors += 1
 
+    def security_batch(self, outcome: str) -> None:
+        self._increment_bounded(self._security_batches, outcome, _SECURITY_BATCH_OUTCOMES)
+
+    def security_action(self, outcome: str) -> None:
+        self._increment_bounded(self._security_actions, outcome, _SECURITY_ACTION_OUTCOMES)
+
+    def security_appeal(self, outcome: str) -> None:
+        self._increment_bounded(self._security_appeals, outcome, _SECURITY_APPEAL_OUTCOMES)
+
+    def _increment_bounded(
+        self,
+        family: dict[str, int],
+        outcome: str,
+        allowed: tuple[str, ...],
+    ) -> None:
+        label = outcome if outcome in allowed else "other"
+        with self._lock:
+            family[label] += 1
     def render_process_metrics(self) -> list[str]:
         with self._lock:
             requests = dict(self._requests)
@@ -99,6 +123,9 @@ class Registry:
             entitlements = dict(self._entitlements)
             manifests = dict(self._manifests)
             collection_errors = self._collection_errors
+            security_batches = dict(self._security_batches)
+            security_actions = dict(self._security_actions)
+            security_appeals = dict(self._security_appeals)
 
         lines = [
             "# HELP chudware_http_requests_total Gateway HTTP responses by matched route template.",
@@ -155,6 +182,24 @@ class Registry:
             "Desktop update-manifest request outcomes.",
             manifests,
         ))
+        lines.extend(_counter_family(
+            "chudware_security_batches_total",
+            "Signed security batch ingestion outcomes.",
+            security_batches,
+            _SECURITY_BATCH_OUTCOMES,
+        ))
+        lines.extend(_counter_family(
+            "chudware_security_actions_total",
+            "Reversible device security action outcomes.",
+            security_actions,
+            _SECURITY_ACTION_OUTCOMES,
+        ))
+        lines.extend(_counter_family(
+            "chudware_security_appeals_total",
+            "Security appeal lifecycle outcomes.",
+            security_appeals,
+            _SECURITY_APPEAL_OUTCOMES,
+        ))
         lines.extend(
             [
                 "# HELP chudware_metrics_collection_errors_total Failed PostgreSQL metric collections.",
@@ -168,9 +213,14 @@ class Registry:
 registry = Registry()
 
 
-def _counter_family(name: str, help_text: str, values: dict[str, int]) -> list[str]:
+def _counter_family(
+    name: str,
+    help_text: str,
+    values: dict[str, int],
+    outcomes: tuple[str, ...] = ("success", "client_error", "server_error", "other"),
+) -> list[str]:
     lines = [f"# HELP {name} {help_text}", f"# TYPE {name} counter"]
-    for outcome in ("success", "client_error", "server_error", "other"):
+    for outcome in outcomes:
         lines.append(f"{name}" + _labels((("outcome", outcome),)) + f" {values.get(outcome, 0)}")
     return lines
 

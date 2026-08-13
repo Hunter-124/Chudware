@@ -40,34 +40,30 @@ from services.installer.payload_manifest import (
 )
 
 REPO = Path(__file__).resolve().parent.parent.parent
-# Only files consumed by the installed runtime belong in customer payloads.  Source
-# generators, icon prompts, and atlas recipes intentionally stay in the checkout.
-RUNTIME_ASSETS = (
-    "logo_icon.png",
-    "logo_wordmark.png",
-    "appicon/16.png",
-    "appicon/32.png",
-    "appicon/48.png",
-    "appicon/64.png",
-    "appicon/128.png",
-    "appicon/256.png",
-    "logo_wordmark_dark.png",
-    "fonts/Rubik-Regular.ttf",
-    "fonts/Rubik-Medium.ttf",
-    "fonts/Rubik-SemiBold.ttf",
-    "fonts/Rubik-Bold.ttf",
-    "fonts/JetBrainsMono-Regular.ttf",
-    "fonts/CADSymbols.ttf",
-    "icons/atlas.json",
-    "icons/atlas_dark.png",
-    "icons/atlas_light.png",
-)
 HOST_EXE = REPO / "host" / "build-win" / "bin" / "chudware.exe"
 if not HOST_EXE.exists():
     HOST_EXE = REPO / "host" / "build" / "bin" / "Release" / "chudware.exe"
 UNINSTALL_HELPER_EXE = HOST_EXE.parent / "chudware-uninstall-helper.exe"
-# The engine daemon is mandatory in customer payloads; candidate discovery is only a
-# convenience for local release work and never permits a packaged fallback.
+# CMake stages the complete GUI runtime next to chudware.exe. Release packaging copies
+# that verified tree rather than maintaining a brittle executable/resource allowlist.
+FORBIDDEN_RUNTIME_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".inl",
+    ".py", ".pyc", ".pyo", ".ts", ".tsx", ".js", ".jsx", ".map", ".pdb",
+}
+FORBIDDEN_RUNTIME_DIRS = {
+    ".git", ".github", ".svn", "__pycache__", "node_modules", "CMakeFiles",
+}
+REQUIRED_WINDOWS_RUNTIME = (
+    "chudware.exe",
+    "chudware_cef_helper.exe",
+    "libcef.dll",
+    "chrome_elf.dll",
+    "icudtl.dat",
+    "v8_context_snapshot.bin",
+    "resources.pak",
+    "chrome_100_percent.pak",
+    "chrome_200_percent.pak",
+)
 HOSTD_EXE_CANDIDATES = (
     REPO / "build" / "windows-occt" / "bin" / "chudware-hostd.exe",
     REPO / "build" / "windows-core" / "bin" / "chudware-hostd.exe",
@@ -89,6 +85,17 @@ def _copy_required(source: Path | None, destination: Path, label: str) -> None:
     shutil.copy2(source, destination)
 
 
+def _runtime_file_allowed(relative: Path) -> bool:
+    if any(part in FORBIDDEN_RUNTIME_DIRS or part.endswith(".dSYM") for part in relative.parts):
+        return False
+    name = relative.name.lower()
+    return (
+        relative.suffix.lower() not in FORBIDDEN_RUNTIME_SUFFIXES
+        and not name.startswith("test_")
+        and not re.search(r"_test\.[^.]+$", name)
+    )
+
+
 def stage_compiled_payload(
     dst: Path,
     *,
@@ -99,25 +106,30 @@ def stage_compiled_payload(
     omp_bridge_bin: Path,
     uninstall_helper_bin: Path,
 ) -> None:
-    """Stage customer binaries only; developer Python sources remain in the checkout."""
-    _copy_required(host_bin, dst / "chudware.exe", "host")
+    """Stage the complete CMake-produced GUI runtime plus protected sidecars."""
+    runtime_root = host_bin.parent
+    missing = [name for name in REQUIRED_WINDOWS_RUNTIME if not (runtime_root / name).is_file()]
+    locales = runtime_root / "locales"
+    assets = runtime_root / "assets"
+    if missing or not assets.is_dir() or not locales.is_dir() or not any(locales.glob("*.pak")):
+        details = ", ".join(missing) or "assets/locales closure"
+        raise RuntimeError(f"incomplete Windows GUI runtime beside {host_bin}: {details}")
+    for source in sorted(runtime_root.rglob("*")):
+        relative = source.relative_to(runtime_root)
+        if source.is_symlink():
+            raise RuntimeError(f"unsafe runtime symlink: {source}")
+        if source.is_dir():
+            continue
+        if not _runtime_file_allowed(relative):
+            continue
+        target = dst / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
     _copy_required(hostd_bin, dst / "chudware-hostd.exe", "host daemon")
     _copy_required(worker_bin, dst / "chudware-worker.exe", "worker")
     _copy_required(mcp_bin, dst / "chudware-mcp.exe", "MCP server")
     _copy_required(omp_bridge_bin, dst / "chudware-omp-bridge.exe", "OMP bridge")
     _copy_required(uninstall_helper_bin, dst / "chudware-uninstall-helper.exe", "uninstall helper")
-
-
-def stage_runtime_assets(dst: Path) -> None:
-    assets_src = REPO / "assets"
-    for relative in RUNTIME_ASSETS:
-        source = assets_src / relative
-        if not source.is_file() or source.is_symlink():
-            raise RuntimeError(f"required runtime asset not found or unsafe: {source}")
-        target = dst / "assets" / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-
 
 def build(
     out: Path,
@@ -265,6 +277,19 @@ def finalize_prepared_payload(
     if make_zip:
         result["zip"] = str(create_verified_zip(dst, out / "Chudware-release.zip"))
     return result
+
+
+def write_artifact_signing_request(
+    artifact: Path, key_id: str, version: str, platform: str, arch: str
+) -> Path:
+    """Emit the identity-bound offline artifact-signing request after creation."""
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    request = artifact.with_name(artifact.name + ".artifact-signing-request.bin")
+    request.write_bytes(b"\0".join((
+        b"chudware-artifact-v1", key_id.encode("ascii"), version.encode("ascii"),
+        platform.encode("ascii"), arch.encode("ascii"), digest.encode("ascii"),
+    )))
+    return request
 
 def read_built_version() -> str:
     """Read the exact CHUDWARE_VERSION compiled into the staged Windows binary."""
@@ -449,9 +474,15 @@ def main(argv: list[str]) -> int:
             )
             res["version"] = version
         if not args.payload_only:
-            res["installer"] = str(compile_installer(
+            installer = compile_installer(
                 args.out, Path(res["dist"]), version, args.release_public_key
-            ))
+            )
+            res["installer"] = str(installer)
+            res["artifact_signing_request"] = str(
+                write_artifact_signing_request(
+                    installer, str(res["key_id"]), args.version, "windows", "x86_64"
+                )
+            )
     except (OSError, RuntimeError, PayloadManifestError, subprocess.CalledProcessError) as exc:
         print(f"build_release: error: {exc}", file=sys.stderr)
         return 1

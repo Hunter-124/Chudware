@@ -1,4 +1,5 @@
 #include "windows_update_helper.h"
+#include "security/integrity.h"
 
 #if defined(_WIN32)
 
@@ -7,10 +8,14 @@
 #endif
 #include <windows.h>
 #include <shlobj.h>
+#include <bcrypt.h>
+#include <shellapi.h>
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <memory>
 #include <cctype>
 #include <fstream>
 #include <set>
@@ -22,6 +27,97 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 constexpr wchar_t kManifest[] = L"payload-manifest.v1.json";
 constexpr wchar_t kSignature[] = L"payload-manifest.v1.sig";
+constexpr wchar_t kHeldManifest[] = L"installed-manifest.v1.json";
+constexpr wchar_t kHeldSignature[] = L"installed-manifest.v1.sig";
+
+struct HandleCloser {
+    void operator()(void* value) const noexcept {
+        if (value && value != INVALID_HANDLE_VALUE) CloseHandle(value);
+    }
+};
+using UniqueHandle = std::unique_ptr<void, HandleCloser>;
+
+UniqueHandle openPlain(const fs::path& path, DWORD access, DWORD share, bool directory,
+                       DWORD creation = OPEN_EXISTING) {
+    const DWORD flags = FILE_FLAG_OPEN_REPARSE_POINT |
+                        (directory ? FILE_FLAG_BACKUP_SEMANTICS : 0);
+    UniqueHandle handle(CreateFileW(path.c_str(), access, share, nullptr, creation, flags, nullptr));
+    if (!handle) return {};
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    if (!GetFileInformationByHandleEx(handle.get(), FileAttributeTagInfo, &info, sizeof(info)) ||
+        (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+        (!!(info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != directory)) return {};
+    return handle;
+}
+
+bool sameIdentity(HANDLE left, HANDLE right) {
+    FILE_ID_INFO a{}, b{};
+    return GetFileInformationByHandleEx(left, FileIdInfo, &a, sizeof(a)) &&
+           GetFileInformationByHandleEx(right, FileIdInfo, &b, sizeof(b)) &&
+           a.VolumeSerialNumber == b.VolumeSerialNumber &&
+           std::equal(std::begin(a.FileId.Identifier), std::end(a.FileId.Identifier),
+                      std::begin(b.FileId.Identifier));
+}
+
+bool readHeld(HANDLE handle, std::size_t cap, std::string& bytes) {
+    LARGE_INTEGER zero{};
+    if (!SetFilePointerEx(handle, zero, nullptr, FILE_BEGIN)) return false;
+    std::array<char, 64 * 1024> buffer{};
+    for (;;) {
+        DWORD count = 0;
+        if (!ReadFile(handle, buffer.data(), static_cast<DWORD>(buffer.size()), &count, nullptr)) return false;
+        if (!count) return true;
+        if (bytes.size() + count > cap) return false;
+        bytes.append(buffer.data(), count);
+    }
+}
+
+std::string hexDigest(const unsigned char* bytes, std::size_t count) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string result; result.reserve(count * 2);
+    for (std::size_t i = 0; i < count; ++i) { result += hex[bytes[i] >> 4]; result += hex[bytes[i] & 15]; }
+    return result;
+}
+
+bool hmacSha256(std::string_view key, std::string_view message, std::string& digest) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    std::array<unsigned char, 32> output{};
+    bool ok = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                          BCRYPT_ALG_HANDLE_HMAC_FLAG) == 0 &&
+              BCryptCreateHash(algorithm, &hash, nullptr, 0,
+                  reinterpret_cast<PUCHAR>(const_cast<char*>(key.data())),
+                  static_cast<ULONG>(key.size()), 0) == 0 &&
+              BCryptHashData(hash,
+                  reinterpret_cast<PUCHAR>(const_cast<char*>(message.data())),
+                  static_cast<ULONG>(message.size()), 0) == 0 &&
+              BCryptFinishHash(hash, output.data(), static_cast<ULONG>(output.size()), 0) == 0;
+    if (hash) BCryptDestroyHash(hash);
+    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (ok) digest = hexDigest(output.data(), output.size());
+    return ok;
+}
+
+std::string pendingMacKey(std::string_view manifestBytes, std::string_view signatureBytes) {
+    std::string material("chudware-windows-recovery-key-v1\0", 33);
+    material.append(manifestBytes); material.push_back('\0'); material.append(signatureBytes);
+    BCRYPT_ALG_HANDLE algorithm = nullptr; BCRYPT_HASH_HANDLE hash = nullptr;
+    std::array<unsigned char, 32> output{};
+    bool ok = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 &&
+              BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) == 0 &&
+              BCryptHashData(hash, reinterpret_cast<PUCHAR>(material.data()),
+                             static_cast<ULONG>(material.size()), 0) == 0 &&
+              BCryptFinishHash(hash, output.data(), static_cast<ULONG>(output.size()), 0) == 0;
+    if (hash) BCryptDestroyHash(hash); if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+    return ok ? std::string(reinterpret_cast<char*>(output.data()), output.size()) : std::string{};
+}
+
+bool constantEqual(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    unsigned char mismatch = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) mismatch |= static_cast<unsigned char>(a[i] ^ b[i]);
+    return mismatch == 0;
+}
 
 std::wstring quote(const fs::path& p) {
     std::wstring s = p.wstring();
@@ -98,24 +194,70 @@ bool writeJsonAtomic(const fs::path& path, const json& value) {
     return MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 
-bool loadOwned(const fs::path& root, std::vector<fs::path>& owned, std::string* error) {
+bool parseOwned(std::string_view manifestBytes, std::vector<fs::path>& owned, std::string* error) {
     try {
-        if (!realFile(root / kManifest) || !realFile(root / kSignature)) throw std::runtime_error("installed payload metadata is missing or reparse-backed");
-        const json manifest = json::parse(std::ifstream(root / kManifest));
-        if (!manifest.contains("files") || !manifest["files"].is_array()) throw std::runtime_error("payload manifest has no files array");
+        const json manifest = json::parse(manifestBytes);
+        if (!manifest.contains("files") || !manifest["files"].is_array())
+            throw std::runtime_error("payload manifest has no files array");
         std::set<std::wstring> unique;
         for (const auto& row : manifest["files"]) {
             fs::path relative;
-            if (!row.is_object() || !row.contains("path") || !safeRelative(row.at("path").get<std::string>(), relative))
+            if (!row.is_object() || !row.contains("path") ||
+                !safeRelative(row.at("path").get<std::string>(), relative))
                 throw std::runtime_error("payload manifest contains an unsafe path");
             std::wstring folded = relative.generic_wstring();
             std::transform(folded.begin(), folded.end(), folded.begin(), ::towlower);
-            if (!unique.insert(folded).second) throw std::runtime_error("payload manifest contains a duplicate path");
+            if (!unique.insert(folded).second)
+                throw std::runtime_error("payload manifest contains a duplicate path");
             owned.push_back(relative);
         }
         owned.emplace_back(kManifest); owned.emplace_back(kSignature);
         return true;
     } catch (const std::exception& e) { if (error) *error = e.what(); return false; }
+}
+
+bool loadInstalledTrust(const fs::path& root, std::string& manifestBytes,
+                        std::string& signatureBytes, std::vector<fs::path>& owned,
+                        std::string* error) {
+    auto manifest = openPlain(root / kManifest, GENERIC_READ, FILE_SHARE_READ, false);
+    auto signature = openPlain(root / kSignature, GENERIC_READ, FILE_SHARE_READ, false);
+    if (!manifest || !signature || !readHeld(manifest.get(), 16 * 1024 * 1024, manifestBytes) ||
+        !readHeld(signature.get(), 256, signatureBytes)) {
+        if (error) *error = "installed payload metadata is missing or reparse-backed";
+        return false;
+    }
+    const auto verified = chudware::security::verifyPayloadManifestBytes(
+        root, manifestBytes, signatureBytes, chudware::security::VerifyMode::Full,
+        root / L"chudware.exe");
+    if (!verified.ok) { if (error) *error = "installed payload metadata is not trusted"; return false; }
+    return parseOwned(manifestBytes, owned, error);
+}
+
+bool loadHeldTrust(const fs::path& session, std::string& manifestBytes,
+                   std::string& signatureBytes, std::vector<fs::path>& owned,
+                   std::string* error) {
+    auto manifest = openPlain(session / kHeldManifest, GENERIC_READ, FILE_SHARE_READ, false);
+    auto signature = openPlain(session / kHeldSignature, GENERIC_READ, FILE_SHARE_READ, false);
+    if (!manifest || !signature || !readHeld(manifest.get(), 16 * 1024 * 1024, manifestBytes) ||
+        !readHeld(signature.get(), 256, signatureBytes)) {
+        if (error) *error = "held recovery manifest is missing or unsafe";
+        return false;
+    }
+    return parseOwned(manifestBytes, owned, error);
+}
+
+json existenceRows(const std::vector<fs::path>& owned, const json& snapshotRows) {
+    if (!snapshotRows.is_array() || snapshotRows.size() != owned.size())
+        throw std::runtime_error("pending recovery row count does not match held manifest");
+    json rows = json::array();
+    for (std::size_t i = 0; i < owned.size(); ++i) {
+        if (!snapshotRows.at(i).is_object() || !snapshotRows.at(i).contains("existed") ||
+            !snapshotRows.at(i).at("existed").is_boolean())
+            throw std::runtime_error("pending recovery row is malformed");
+        rows.push_back({{"path", owned[i].generic_u8string()},
+                        {"existed", snapshotRows.at(i).at("existed").get<bool>()}});
+    }
+    return rows;
 }
 
 bool snapshot(const fs::path& install, const fs::path& rollback,
@@ -136,18 +278,52 @@ bool snapshot(const fs::path& install, const fs::path& rollback,
 
 bool restore(const fs::path& install, const fs::path& rollback, const json& files,
              std::string* error) {
+    auto rootHandle = openPlain(install, FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, true);
+    auto rollbackHandle = openPlain(rollback, FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+                                    FILE_SHARE_READ, true);
+    if (!rootHandle || !rollbackHandle) { if (error) *error = "restore roots are unsafe"; return false; }
     for (const auto& row : files) {
         fs::path relative;
         if (!safeRelative(row.at("path").get<std::string>(), relative)) { if (error) *error = "unsafe rollback record"; return false; }
         fs::path target;
         if (!checkedParent(install, relative, true, target)) { if (error) *error = "reparse point in restore path"; return false; }
+        auto rootCheck = openPlain(install, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, true);
+        if (!rootCheck || !sameIdentity(rootHandle.get(), rootCheck.get())) { if (error) *error = "install root identity changed"; return false; }
         if (!row.at("existed").get<bool>()) {
-            if (fs::exists(target) && !realFile(target)) { if (error) *error = "refusing to remove non-file during rollback"; return false; }
-            std::error_code ec; fs::remove(target, ec); if (ec) { if (error) *error = "could not remove newly installed owned file"; return false; }
+            if (fs::exists(target)) {
+                auto held = openPlain(target, DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, false);
+                if (!held) { if (error) *error = "refusing to remove unsafe owned path"; return false; }
+                FILE_DISPOSITION_INFO_EX disposition{};
+                disposition.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+                if (!SetFileInformationByHandle(held.get(), FileDispositionInfoEx,
+                                                &disposition, sizeof(disposition))) {
+                    if (error) *error = "could not remove newly installed owned file";
+                    return false;
+                }
+            }
         } else {
             fs::path source;
-            if (!checkedParent(rollback, relative, false, source) || !realFile(source)) { if (error) *error = "rollback snapshot is incomplete"; return false; }
-            if (!CopyFileW(source.c_str(), target.c_str(), FALSE)) { if (error) *error = "could not restore installed payload"; return false; }
+            if (!checkedParent(rollback, relative, false, source)) { if (error) *error = "rollback snapshot is incomplete"; return false; }
+            auto sourceHandle = openPlain(source, GENERIC_READ, FILE_SHARE_READ, false);
+            auto rollbackCheck = openPlain(rollback, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, true);
+            if (!sourceHandle || !rollbackCheck || !sameIdentity(rollbackHandle.get(), rollbackCheck.get())) { if (error) *error = "rollback source identity changed"; return false; }
+            auto targetHandle = openPlain(target, GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+                                          FILE_SHARE_READ, false, OPEN_ALWAYS);
+            if (!targetHandle) { if (error) *error = "restore target is unsafe"; return false; }
+            LARGE_INTEGER zero{};
+            if (!SetFilePointerEx(sourceHandle.get(), zero, nullptr, FILE_BEGIN) ||
+                !SetFilePointerEx(targetHandle.get(), zero, nullptr, FILE_BEGIN) ||
+                !SetEndOfFile(targetHandle.get())) { if (error) *error = "could not prepare restore target"; return false; }
+            std::array<unsigned char, 64 * 1024> buffer{};
+            for (;;) {
+                DWORD read = 0;
+                if (!ReadFile(sourceHandle.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr)) { if (error) *error = "could not read rollback snapshot"; return false; }
+                if (!read) break;
+                DWORD written = 0;
+                if (!WriteFile(targetHandle.get(), buffer.data(), read, &written, nullptr) || written != read) { if (error) *error = "could not restore installed payload"; return false; }
+            }
+            if (!FlushFileBuffers(targetHandle.get())) { if (error) *error = "could not flush restored payload"; return false; }
         }
     }
     return true;
@@ -168,18 +344,36 @@ bool canonicalRoot(const fs::path& executable, const fs::path& claimed, fs::path
 }
 }  // namespace
 
-bool recoverPendingWindowsUpdate(const fs::path&, std::string* error) {
+bool recoverPendingWindowsUpdate(const fs::path& executable, std::string* error) {
+    fs::path install;
+    if (!canonicalRoot(executable, executable.parent_path(), install)) {
+        if (error) *error = "running executable parent is not a canonical install root";
+        return false;
+    }
     const fs::path sessions = updatesRoot() / L"sessions";
     if (!fs::exists(sessions)) return true;
     if (!realDirectory(sessions)) { if (error) *error = "update sessions root is a reparse point"; return false; }
     for (const auto& entry : fs::directory_iterator(sessions)) {
-        if (!entry.is_directory() || entry.is_symlink()) continue;
+        if (!entry.is_directory() || entry.is_symlink() || !realDirectory(entry.path())) continue;
         const fs::path pending = entry.path() / L"pending.json";
         const fs::path committed = entry.path() / L"committed.json";
         if (!fs::exists(pending) || fs::exists(committed)) continue;
         try {
-            const json state = json::parse(std::ifstream(pending));
-            if (!restore(fs::u8path(state.at("install_root").get<std::string>()), entry.path() / L"rollback", state.at("files"), error)) return false;
+            if (!realFile(pending)) throw std::runtime_error("pending recovery state is unsafe");
+            const json envelope = json::parse(std::ifstream(pending));
+            const json state = envelope.at("state");
+            if (!state.is_object() || !envelope.at("mac").is_string() ||
+                fs::u8path(state.at("install_root").get<std::string>()) != install)
+                throw std::runtime_error("pending recovery root does not match running executable");
+            std::string manifestBytes, signatureBytes; std::vector<fs::path> owned;
+            if (!loadHeldTrust(entry.path(), manifestBytes, signatureBytes, owned, error)) return false;
+            std::string expected;
+            const std::string key = pendingMacKey(manifestBytes, signatureBytes);
+            if (key.empty() || !hmacSha256(key, state.dump(), expected) ||
+                !constantEqual(expected, envelope.at("mac").get<std::string>()))
+                throw std::runtime_error("pending recovery authentication failed");
+            const json rows = existenceRows(owned, state.at("files"));
+            if (!restore(install, entry.path() / L"rollback", rows, error)) return false;
             fs::remove(pending);
         } catch (const std::exception& e) { if (error) *error = e.what(); return false; }
     }
@@ -194,10 +388,18 @@ int runWindowsUpdateHelper(int argc, wchar_t** argv) {
     fs::path install; if (!canonicalRoot(executable, claimedRoot, install)) return 2;
     const fs::path session = updatesRoot() / L"sessions" / sessionId;
     if (fs::exists(session) || !fs::create_directories(session / L"rollback") || !realDirectory(session)) return 3;
-    std::vector<fs::path> owned; std::string error; if (!loadOwned(install, owned, &error)) return 4;
+    std::string manifestBytes, signatureBytes;
+    std::vector<fs::path> owned; std::string error;
+    if (!loadInstalledTrust(install, manifestBytes, signatureBytes, owned, &error)) return 4;
+    if (!CopyFileW((install / kManifest).c_str(), (session / kHeldManifest).c_str(), TRUE) ||
+        !CopyFileW((install / kSignature).c_str(), (session / kHeldSignature).c_str(), TRUE)) return 5;
     json files = json::array(); if (!snapshot(install, session / L"rollback", owned, files, &error)) return 5;
-    json pending{{"session_id", std::string(sessionId.begin(), sessionId.end())}, {"install_root", install.generic_u8string()}, {"executable", executable.generic_u8string()}, {"files", files}};
-    if (!writeJsonAtomic(session / L"pending.json", pending)) return 6;
+    json state{{"session_id", std::string(sessionId.begin(), sessionId.end())},
+               {"install_root", install.generic_u8string()}, {"files", files}};
+    std::string mac;
+    const std::string key = pendingMacKey(manifestBytes, signatureBytes);
+    if (key.empty() || !hmacSha256(key, state.dump(), mac) ||
+        !writeJsonAtomic(session / L"pending.json", {{"state", state}, {"mac", mac}})) return 6;
     const DWORD installCode = run(installer, L"/SILENT /NORESTART /DIR=" + quote(install), true, &error);
     const DWORD verifyCode = installCode == 0 ? run(executable, L"--verify-payload-manifest " + quote(install / kManifest) + L" " + quote(install / kSignature), false, &error) : installCode;
     if (installCode != 0 || verifyCode != 0) { restore(install, session / L"rollback", files, &error); return 7; }

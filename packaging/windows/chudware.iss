@@ -1,8 +1,6 @@
-; packaging/windows/chudware.iss — Inno Setup wrapper around the existing PowerShell installer
-; (services/installer/install.ps1 / uninstall.ps1), which already does the real work: copy the
-; payload, provision the managed runtime venv, register the MCP server, set up file
-; associations. This script's only job is to give that a normal Windows installer experience
-; (Start Menu entry, Programs-and-Features uninstall entry, a single .exe to hand a user).
+; packaging/windows/chudware.iss — Inno Setup installs the finalized source-free payload
+; byte-for-byte and invokes the signed native manifest-owned uninstaller before Inno removes
+; bookkeeping. The helper binds to the registered root and deletes verified handles only.
 ;
 ; Build (on a Windows host with Inno Setup 6 installed):
 ;   python -m services.installer.build_release --out dist
@@ -20,21 +18,18 @@
 #ifndef InstallerOutputDir
   #define InstallerOutputDir "..\..\dist"
 #endif
+#ifndef UninstallHelperSha256
+  #error UninstallHelperSha256 must come from the finalized signed payload manifest
+#endif
 
 [Setup]
 AppId={{6B9E2E6B-6B7B-4B7B-9B7B-AICADSETUP01}
 AppName=Chudware
 AppVersion={#AppVersion}
 AppPublisher=Chudware
-; MUST stay byte-identical to install.ps1's -InstallDir default. Instance identity hashes
-; the realpath of chudware-hostd.exe (services/ipc/ipc_discovery.cpp instanceKey), so two
-; installs at two different directories are two independent daemons with two tray icons —
-; the disagreement between this script and install.ps1 reproduced that bug by construction.
-; Per-user wins over {autopf}: the whole product is already per-user (install.ps1 provisions
-; the runtime venv into %APPDATA%\Chudware, the daemon is spawn-on-demand per logon, the MCP
-; registration and file associations are HKCU), so Program Files bought nothing but a UAC
-; prompt. PrivilegesRequired=lowest is REQUIRED here: without it Inno elevates and
-; {localappdata} would expand to the ADMIN's profile, not the installing user's.
+; The per-user location is deliberate: it avoids elevation/profile substitution and is the
+; canonical root recorded in HKCU Programs-and-Features. The native uninstall helper requires
+; this exact registered identity before it opens any manifest-owned child.
 PrivilegesRequired=lowest
 DefaultDirName={localappdata}\Programs\Chudware
 DefaultGroupName=Chudware
@@ -47,38 +42,71 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 LicenseFile=..\..\LICENSE-EULA.txt
 WizardStyle=modern
-; Ask Windows Restart Manager to close apps holding files under {app} (chudware.exe and any
-; chudware-hostd.exe daemon) before install/uninstall. Belt-and-braces with install.ps1's own
-; targeted daemon --stop step; the daemon is also staged/replaced by the payload copy below
-; (the [Files] {#PayloadDir}\* glob picks up chudware-hostd.exe/.pdb automatically once
-; build_release.py stages them — no extra [Files] entry needed).
+; Ask Windows Restart Manager to close apps holding files under {app} before uninstall.
+; Release staging rejects PDBs/source, and the protected sidecars below are explicit so ISCC
+; fails closed if any compiled output is missing.
 CloseApplications=yes
 RestartApplications=no
 
 [Files]
-; Staged to {tmp} (Inno auto-cleans after setup exits) — install.ps1 reads from $PSScriptRoot
-; and copies into -InstallDir itself, so the real payload must NOT also be staged into {app}
-; directly (that would make install.ps1 copy {app} onto itself).
-Source: "{#PayloadDir}\*"; DestDir: "{tmp}\Chudware-payload"; Flags: recursesubdirs createallsubdirs
-; uninstall.ps1 is NOT in install.ps1's own copy list (see services/installer/install.ps1) —
-; stage it into {app} directly so [UninstallRun] below can always find it.
-Source: "{#PayloadDir}\uninstall.ps1"; DestDir: "{app}"; Flags: ignoreversion
+; Production installation is a byte-for-byte copy of the already verified, source-free payload.
+; Developer Python provisioning remains available through services/installer/install.ps1 but is
+; never executed by the packaged installer. Explicit protected rows make ISCC fail closed when a
+; compiled sidecar or signed manifest is absent.
+Source: "{#PayloadDir}\*"; DestDir: "{app}"; \
+    Excludes: "chudware-worker.exe,chudware-mcp.exe,chudware-omp-bridge.exe,chudware-uninstall-helper.exe,payload-manifest.v1.json,payload-manifest.v1.sig,install.ps1"; \
+    Flags: recursesubdirs createallsubdirs ignoreversion
+; packaging/windows/build_sidecars.ps1 creates these before the manifest is hashed.
+Source: "{#PayloadDir}\chudware-worker.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\chudware-mcp.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\chudware-omp-bridge.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\chudware-uninstall-helper.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\payload-manifest.v1.json"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\payload-manifest.v1.sig"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
-[Run]
-Filename: "powershell.exe"; \
-    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\Chudware-payload\install.ps1"" -InstallDir ""{app}"""; \
-    StatusMsg: "Provisioning the Chudware runtime (this can take a few minutes)..."; \
-    Flags: runhidden waituntilterminated
 
-[UninstallRun]
-Filename: "powershell.exe"; \
-    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\uninstall.ps1"" -InstallDir ""{app}"""; \
-    Flags: runhidden waituntilterminated
+[Code]
+function InitializeUninstall(): Boolean;
+var
+  ResultCode: Integer;
+  Started: Boolean;
+  HelperPath: String;
+  HelperCopy: String;
+begin
+  Result := False;
+  HelperPath := ExpandConstant('{app}\chudware-uninstall-helper.exe');
+  if not FileExists(HelperPath) then
+  begin
+    MsgBox('The signed Chudware uninstall helper is missing. Nothing was removed.', mbError, MB_OK);
+    Exit;
+  end;
+  HelperCopy := ExpandConstant('{tmp}\chudware-uninstall-helper.exe');
+  if not FileCopy(HelperPath, HelperCopy, False) then
+  begin
+    MsgBox('The signed Chudware uninstall helper could not be staged. Nothing was removed.', mbError, MB_OK);
+    Exit;
+  end;
+  try
+    if CompareText(GetSHA256OfFile(HelperCopy), '{#UninstallHelperSha256}') <> 0 then
+    begin
+      MsgBox('The signed Chudware uninstall helper was modified. Nothing was removed.', mbError, MB_OK);
+      Exit;
+    end;
+  except
+    MsgBox('The signed Chudware uninstall helper could not be verified. Nothing was removed.', mbError, MB_OK);
+    Exit;
+  end;
+  Started := Exec(HelperCopy,
+    '--uninstall ' + AddQuotes(ExpandConstant('{app}')),
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := Started and (ResultCode = 0);
+  if not Result then
+    MsgBox(
+      'Chudware could not verify or safely remove the signed payload. No unverified path was removed.',
+      mbError, MB_OK);
+end;
 
 [Icons]
 Name: "{group}\Chudware"; Filename: "{app}\chudware.exe"
 Name: "{group}\Uninstall Chudware"; Filename: "{uninstallexe}"
-
-; NOTE: install.ps1 also creates its own Start Menu shortcut (Environment.GetFolderPath
-; 'Programs') — a known, harmless duplicate with the [Icons] entry above until install.ps1
-; grows a -NoShortcut flag. Tracked in docs/reference/PACKAGING_WINDOWS.md.

@@ -33,6 +33,58 @@
     return d.innerHTML;
   }
 
+  var SAFE_REASON_LABELS = {
+    integrity_violation: "App integrity issue",
+    identity_mismatch: "Device identity changed",
+    credential_compromise: "Credential security issue",
+    replay_detected: "Repeated security receipt",
+    policy_violation: "Security policy issue",
+    anomalous_activity: "Unusual device activity"
+  };
+  function appealReasons(codes) {
+    var values = Array.isArray(codes) ? codes : [];
+    var labels = values.map(function (code) { return SAFE_REASON_LABELS[String(code)] || "Security policy issue"; });
+    return labels.filter(function (label, index) { return labels.indexOf(label) === index; }).join(", ") || "Security policy issue";
+  }
+  function appealState(value) { return ({ pending: "Pending", restored: "Restored", upheld: "Upheld" })[value] || "Under review"; }
+  function appealStateClass(value) { return value === "pending" ? "st-pending" : value === "restored" ? "st-active" : "st-denied"; }
+  function fmtAppealDate(value) { var d = value ? new Date(value) : null; return d && !isNaN(d.getTime()) ? d.toLocaleString() : "—"; }
+
+  async function loadAppeals() {
+    var host = document.getElementById("admin-appeal-list");
+    var status = document.getElementById("admin-appeal-status");
+    var payload = await api("/api/admin/security/appeals");
+    var appeals = payload.appeals || [];
+    var pending = appeals.filter(function (appeal) { return appeal.state === "pending"; }).length;
+    var badge = document.getElementById("appeal-pending"); badge.textContent = pending ? pending + " pending" : ""; badge.hidden = !pending;
+    host.innerHTML = "";
+    if (!appeals.length) { host.innerHTML = "<p class='ac-dim'>No security appeals.</p>"; return; }
+    appeals.forEach(function (appeal) {
+      var item = document.createElement("article"); item.className = "appeal-admin-item";
+      item.innerHTML = "<div class='appeal-admin-head'><strong>" + esc(appeal.email) + "</strong><span class='pill " + appealStateClass(appeal.state) + "'>" + esc(appealState(appeal.state)) + "</span></div>" +
+        "<p class='appeal-admin-meta'>" + esc(appeal.device_name || appeal.subject) + " · Action " + esc(fmtAppealDate(appeal.action_at)) + " · Submitted " + esc(fmtAppealDate(appeal.created_at)) + "</p>" +
+        "<p class='appeal-admin-reason'><strong>Reason:</strong> " + esc(appealReasons(appeal.reason_codes)) + "</p>" +
+        "<p class='appeal-admin-reason'><strong>Customer message:</strong> " + esc(appeal.message || "No message provided") + "</p>";
+      if (appeal.state === "pending") {
+        var form = document.createElement("form"); form.className = "appeal-resolve";
+        form.innerHTML = "<label>Decision note<textarea maxlength='4096' required aria-label='Decision note for " + esc(appeal.email) + "'></textarea></label><div class='appeal-actions'><button type='submit' class='btn primary' data-decision='restore_device'>Restore device</button><button type='submit' class='rm-btn' data-decision='uphold'>Uphold action</button></div>";
+        form.addEventListener("submit", async function (event) {
+          event.preventDefault(); var decision = event.submitter && event.submitter.dataset.decision; if (!decision) return;
+          Array.prototype.forEach.call(form.querySelectorAll("button"), function (button) { button.disabled = true; });
+          status.textContent = "Recording decision…";
+          try {
+            await api("/api/admin/security/appeals/" + encodeURIComponent(appeal.id) + "/resolve", { method: "POST", body: JSON.stringify({ decision: decision, note: form.querySelector("textarea").value }) });
+            status.textContent = decision === "restore_device" ? "Device restored. The customer must sign in again with a newly rotated identity." : "Security action upheld.";
+            await loadAppeals();
+          } catch (e) { status.textContent = e.message || String(e); status.className = "err"; Array.prototype.forEach.call(form.querySelectorAll("button"), function (button) { button.disabled = false; }); }
+        });
+        item.appendChild(form);
+      } else {
+        item.insertAdjacentHTML("beforeend", "<p class='appeal-admin-meta'>Decided " + esc(fmtAppealDate(appeal.resolved_at)) + " by " + esc(appeal.decided_by || "administrator") + (appeal.decision_note ? " · " + esc(appeal.decision_note) : "") + "</p>");
+      }
+      host.appendChild(item);
+    });
+  }
   /* ---- accounts: the approval queue and everyone already through it ---- */
 
   var PAGE_SIZE = 50;
@@ -369,6 +421,10 @@
   loadPlanCatalog().then(reload).catch(function (e) {
     placeholder("Couldn't load plan catalog.");
     setStatus("Failed to load plans: " + (e.message || e), true);
+  });
+  loadAppeals().catch(function (e) {
+    document.getElementById("admin-appeal-list").innerHTML = "<p class='ac-dim'>Couldn't load security appeals.</p>";
+    document.getElementById("admin-appeal-status").textContent = e.message || String(e);
   });
 
   var trialDomains = document.getElementById("trial-domains");

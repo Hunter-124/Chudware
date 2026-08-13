@@ -41,6 +41,10 @@
 #endif
 #ifndef __EMSCRIPTEN__
 #include "util/entitlement.h"
+#include "security/containment.h"
+#include "security/integrity.h"
+#include "security/runtime_guard.h"
+#include "util/platform_paths.h"
 extern "C" {
 #include "util/tweetnacl.h"
 }
@@ -2890,59 +2894,40 @@ bool AppState::verifyEntitlementForAi() {
               "Read-only mode — sign in or manage your subscription to use AI");
         return false;
     }
-    if (entitlementAiVerified) return true;
-
-    auto decode = [](std::string_view value) {
-        auto cv = [](unsigned char c) -> int {
-            if (c >= 'A' && c <= 'Z') return c - 'A';
-            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-            if (c >= '0' && c <= '9') return c - '0' + 52;
-            if (c == '-') return 62;
-            if (c == '_') return 63;
-            return -1;
-        };
-        std::vector<unsigned char> out;
-        if (value.empty() || value.find('=') != std::string_view::npos ||
-            value.size() % 4 == 1)
-            return out;
-        unsigned int acc = 0;
-        int bits = 0;
-        for (unsigned char c : value) {
-            const int v = cv(c);
-            if (v < 0) return std::vector<unsigned char>{};
-            acc = (acc << 6) | static_cast<unsigned int>(v);
-            bits += 6;
-            if (bits >= 8) {
-                bits -= 8;
-                out.push_back(static_cast<unsigned char>((acc >> bits) & 255));
-            }
-        }
-        return out;
-    };
-
-    const std::size_t dot = entitlementToken.find('.');
-    bool valid = false;
-    if (dot != std::string::npos && entitlementToken.find('.', dot + 1) == std::string::npos) {
-        const std::string_view encoded(entitlementToken.data(), dot);
-        const auto signature = decode(std::string_view(entitlementToken).substr(dot + 1));
-        if (signature.size() == crypto_sign_BYTES) {
-            std::vector<unsigned char> signedMessage(signature.size() + encoded.size());
-            std::copy(signature.begin(), signature.end(), signedMessage.begin());
-            std::copy(encoded.begin(), encoded.end(),
-                      signedMessage.begin() + signature.size());
-            std::vector<unsigned char> opened(signedMessage.size());
-            unsigned long long openedLength = 0;
-            valid = crypto_sign_open(
-                        opened.data(), &openedLength, signedMessage.data(),
-                        static_cast<unsigned long long>(signedMessage.size()),
-                        chudware::entitlement::kEmbeddedPublicKey.data()) == 0 &&
-                    openedLength == encoded.size();
-        }
-    }
-    if (!valid) {
+    chudware::entitlement::TokenPayload tokenPayload;
+    std::string tokenError;
+    if (!chudware::entitlement::verifyEmbeddedToken(entitlementToken, tokenPayload, &tokenError)) {
         entitlementReadOnly = true;
         entitlementSignedIn = false;
         entitlementStatus = "Entitlement verification failed; sign in again";
+        toast(ui::ToastLevel::Warn, entitlementStatus);
+        return false;
+    }
+    const auto enforcement = chudware::security::loadEmbeddedEnforcementState(
+        appdataAppDir(), tokenPayload.subject,
+        static_cast<std::int64_t>(std::chrono::system_clock::to_time_t(
+            std::chrono::system_clock::now())));
+    if (!enforcement.active()) {
+        entitlementReadOnly = true;
+        entitlementStatus = "Protected operation blocked: entitlement_signature_invalid";
+        toast(ui::ToastLevel::Warn, entitlementStatus);
+        return false;
+    }
+    const auto executable = chudware::platform::executablePath();
+    const auto integrity = chudware::security::verifyInstalledPayload(
+        executable, chudware::security::VerifyMode::ProtectedOperation);
+    if (!integrity.ok) {
+        entitlementReadOnly = true;
+        entitlementStatus = "Protected operation blocked: protected_file_hash_mismatch";
+        toast(ui::ToastLevel::Warn, entitlementStatus);
+        return false;
+    }
+    const auto decision = chudware::security::inspectAndPersistRuntime(
+        chudware::security::SecurityCheckpoint::BeforeAi,
+        integrity.root, integrity.files, appdataAppDir());
+    if (!decision.allowed()) {
+        entitlementReadOnly = true;
+        entitlementStatus = "Protected operation blocked: " + decision.denialReason;
         toast(ui::ToastLevel::Warn, entitlementStatus);
         return false;
     }

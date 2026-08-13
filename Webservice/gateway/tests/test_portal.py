@@ -68,11 +68,11 @@ def test_portal_has_ordinary_csp_and_hashed_assets_are_immutable(pg, monkeypatch
     assert "cross-origin-embedder-policy" not in page.headers
     assert page.headers["cache-control"] == "no-cache"
 
-    asset = client.get("/portal-assets/portal.8cfb5bf8c58b.js")
+    asset = client.get("/portal-assets/portal.c2eea3c72329.js")
     assert asset.status_code == 200
     assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
     assert asset.headers["content-type"].startswith("application/javascript")
-    assert hashlib.sha256(asset.content).hexdigest().startswith("8cfb5bf8c58b")
+    assert hashlib.sha256(asset.content).hexdigest().startswith("c2eea3c72329")
 
 
 def test_every_oauth_provider_has_a_button_on_the_signin_page(pg, monkeypatch):
@@ -193,8 +193,12 @@ def test_portal_device_list_and_revoke_are_account_scoped(pg, monkeypatch):
     other = "other-devices@example.com"
     _seed(email)
     _seed(other)
-    own = entitlement._subject_for(email, "Design workstation")
-    foreign = entitlement._subject_for(other, "Other workstation")
+    own = entitlement._subject_for(
+        email, "Design workstation", entitlement._b64(bytes(range(32)))
+    )
+    foreign = entitlement._subject_for(
+        other, "Other workstation", entitlement._b64(bytes(range(1, 33)))
+    )
     client = _client(monkeypatch, email)
 
     listed = client.get("/api/portal/devices")

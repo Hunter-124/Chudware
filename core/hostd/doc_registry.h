@@ -161,6 +161,10 @@ public:
     // deliberately excluded: tick() retires + closes those, and a retire that keeps failing
     // must never pin the daemon forever.
     int pendingGcCount();
+    // Shared fail-closed classification used by daemon containment. Methods not
+    // listed here are treated as protected even when the engine does not know them.
+    static bool isReadOnlyMethod(const std::string& method);
+
 
 private:
     struct Attach {
@@ -221,7 +225,6 @@ private:
         std::string line;
     };
 
-    static bool isReadOnlyMethod(const std::string& method);
     static long sniffRevision(const nlohmann::json& result);
     // Display name of the doc a minting call just created, read out of the SAME
     // place doc_list reports it from: the document's own "name" field. doc_new /

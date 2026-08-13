@@ -79,8 +79,10 @@ REQUIRED_WORKFLOWS: Tuple[str, ...] = (
     # keeps the Windows and macOS trees compiling between releases.
     "native-build.yml",
     # Daily capability probes. Without them a runner that lost its toolchain
-    # is discovered by a failed release, not by a smoke.
     "runner-smoke.yml",
+    # Commercial payload preparation must remain self-hosted, bounded, and stop at
+    # the authenticated offline-owner signing boundary.
+    "release.yml",
 )
 
 # This gate polices itself too.

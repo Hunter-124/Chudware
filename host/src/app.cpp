@@ -5647,7 +5647,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         if (wantHideFront)
           ui::ecadEditorMirror().setLayerVisible("F.Cu", false);
         if (wantNetSelect)
-          ui::ecadEditorMirror().setNetVisible("SIG", false);
+          ui::ecadEditorHighlightNet("SIG");
         std::printf(
             "[ecad-shot] showing %s rev=%d footprints=%d tracks=%d vias=%d "
             "nets=%d drc=%d front_visible=%d sig_visible=%d\n",

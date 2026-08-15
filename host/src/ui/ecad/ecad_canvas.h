@@ -60,6 +60,7 @@ public:
     // Selection: the panel sets a "<kind>:<id>" token (e.g. "s:s1","fp:fp1","w:w1","t:t1")
     // before draw(); the canvas halos/outlines that entity. Empty = nothing selected.
     void setSelection(const std::string& sel) { selected_ = sel; }
+    void setHighlightedNet(const std::string& net) { highlightedNet_ = net; }
 
     // Transient drag-move offset (world mm) applied to the selected symbol/footprint while a
     // left-drag is in progress, for live visual feedback. The panel sets it each frame; (0,0)
@@ -85,6 +86,7 @@ private:
     bool   wantFit_ = true;        // fit on first draw
     bool   inited_ = false;
     std::string selected_;         // "<kind>:<id>" of the highlighted entity ("" = none)
+    std::string highlightedNet_;
     float  dragDx_ = 0.0f, dragDy_ = 0.0f;  // live drag-move offset (world mm) for selected sym/fp
     EcadPt focusLoc_{0, 0};        // "zoom to violation" marker location (world mm)
     int    focusFrames_ = 0;       // frames the marker remains (counts down each draw; 0 = hidden)

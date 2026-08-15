@@ -82,6 +82,7 @@ void ecadEditorLoadResponse(const nlohmann::json& resp);
 // Lets a headless scenario drive selection without a mouse so a shot can show the highlight; the
 // canvas haloes the matching symbol/footprint/wire/track on the next draw. (Select tool only.)
 void ecadEditorSelect(const std::string& sel);
+void ecadEditorHighlightNet(const std::string& net);
 
 // Pan + zoom the canvas to the first ERC/DRC violation that has a location and flash a marker there
 // (what clicking a located violation row does). Returns false if no located violation exists. Lets a

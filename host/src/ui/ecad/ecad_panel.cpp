@@ -784,7 +784,8 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) m.setNetVisible(n.name, !nvis);
         } else if (ImGui::IsMouseHoveringRect(r.mn, r.mx) &&
                    ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            es.mgrSel = sel ? std::string() : selId;   // toggle row selection
+            es.mgrSel = sel ? std::string() : selId;
+            es.canvas.setHighlightedNet(sel ? std::string() : n.name);
         }
         ImGui::PopID();
     };
@@ -1166,6 +1167,11 @@ void drawResultsStrip(AppState& st, EcadEditorState& es) {
 EcadMirror& ecadEditorMirror() { return state().mirror; }
 
 void ecadEditorSelect(const std::string& sel) { state().selected = sel; }
+void ecadEditorHighlightNet(const std::string& net) {
+    EcadEditorState& es = state();
+    es.mgrSel = net.empty() ? std::string() : "net:" + net;
+    es.canvas.setHighlightedNet(net);
+}
 
 bool ecadEditorFocusFirstViolation() {
     EcadEditorState& es = state();
@@ -1343,6 +1349,10 @@ void drawEcadEditor(AppState& st) {
     // Push the current selection + live drag offset into the canvas so it haloes the picked entity
     // (and shows drag feedback). Only the Select tool shows a selection.
     es.canvas.setSelection(st.ecadTool == 0 ? es.selected : std::string());
+    const std::string netPrefix = "net:";
+    es.canvas.setHighlightedNet(
+        es.mgrSel.rfind(netPrefix, 0) == 0 ? es.mgrSel.substr(netPrefix.size())
+                                          : std::string());
     es.canvas.setDragOffset(es.dragDx, es.dragDy);
     EcadCanvasIO io = es.canvas.draw(es.mirror, canvasAvail);
     handleCanvasEdit(st, es, io);  // Wave Q: select/place/route + delete/drag on the canvas

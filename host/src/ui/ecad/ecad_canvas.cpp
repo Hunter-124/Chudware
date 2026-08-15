@@ -167,7 +167,7 @@ void EcadCanvas::handleNavigation(const EcadCanvasIO& io, const ImVec2& avail) {
 void EcadCanvas::drawGrid(const ImVec2& avail) {
     const ui::Palette& p = ui::palette;
     const ImU32 gridCol = col(p.sketchGrid);
-    const ImU32 axisCol = col(p.sketchGrid, 2.2f);
+    const ImU32 axisCol = col(p.sketchGrid, 0.55f);
 
     // Choose a grid spacing (mm) that stays readable at the current zoom (~14..60 px between lines).
     float stepMm = 1.0f;
@@ -190,7 +190,10 @@ void EcadCanvas::drawGrid(const ImVec2& avail) {
     for (float y = y0; y <= y1; y += stepMm) {
         ImVec2 a = toScreen({wTL.x, y}), b = toScreen({wBR.x, y});
         const bool isAxis = std::fabs(y) < stepMm * 0.5f;
-        dl_->AddLine(a, b, isAxis ? axisCol : gridCol, isAxis ? 1.4f : 1.0f);
+        if (isAxis)
+            drawDashedLine(dl_, a, b, axisCol, 1.0f, 5.0f, 5.0f);
+        else
+            dl_->AddLine(a, b, gridCol, 1.0f);
     }
 }
 
@@ -376,7 +379,9 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
               [](const EcadLayer& a, const EcadLayer& b) { return a.copperIndex > b.copperIndex; });
     for (const auto& ly : layersCopy) {
         if (!doc.layerVisible(ly.id)) continue;
-        const ImU32 c = copperColorFor(doc, ly.id, ly.copperIndex, 0.92f);
+        const bool dimLayer = !highlightedNet_.empty();
+        const ImU32 c = copperColorFor(doc, ly.id, ly.copperIndex,
+                                       dimLayer ? 0.24f : 0.92f);
         for (const EcadTrack* t : doc.tracksOnLayer(ly.id)) {
             if (!doc.netVisible(t->net)) continue;
             const float wpx = std::max(1.0f, t->width * pxPerMm_);
@@ -421,7 +426,13 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
                 if (found) break;
             }
             if (!found && !pad.layers.empty() && !doc.layerVisible(pad.layers.front())) continue;
-            const ImU32 padCol = copperColorFor(doc, cLid, ci, 0.95f);
+            const bool padHighlighted =
+                !highlightedNet_.empty() && pad.net == highlightedNet_;
+            const float padAlpha =
+                highlightedNet_.empty() ? 0.95f : (padHighlighted ? 1.0f : 0.22f);
+            const ImU32 padCol =
+                padHighlighted ? col(p.selectionHighlight)
+                               : copperColorFor(doc, cLid, ci, padAlpha);
             const ImVec2 sp = toScreen(pad.pos);
             const float hw = std::max(2.0f, pad.w * 0.5f * pxPerMm_);
             const float hh = std::max(2.0f, pad.h * 0.5f * pxPerMm_);
@@ -440,10 +451,15 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
             dl_->AddText(ImVec2(fps.x + 4, fps.y - 16), refCol, fp.ref.c_str());
     }
 
-    // Vias: annular ring + drill plug.
+    // Vias: annular ring + drill plug. Net selection uses the same selection
+    // tone as entity selection and dims unrelated copper.
     for (const auto& v : doc.vias()) {
         const ImVec2 sp = toScreen(v.at);
-        dl_->AddCircleFilled(sp, std::max(2.0f, v.diameter * 0.5f * pxPerMm_), viaRing, 20);
+        const bool hi = !highlightedNet_.empty() && v.net == highlightedNet_;
+        const ImU32 ring = hi ? col(p.selectionHighlight)
+                              : (highlightedNet_.empty() ? viaRing
+                                                        : col(p.text, 0.22f));
+        dl_->AddCircleFilled(sp, std::max(2.0f, v.diameter * 0.5f * pxPerMm_), ring, 20);
         dl_->AddCircleFilled(sp, std::max(1.0f, v.drill * 0.5f * pxPerMm_), drillCol, 16);
     }
 
@@ -451,6 +467,17 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
     for (const auto& aw : doc.ratsnest()) {
         if (!doc.netVisible(aw.net)) continue;
         drawDashedLine(dl_, toScreen(aw.p1), toScreen(aw.p2), ratsCol, 1.2f, 5, 4);
+    }
+
+    if (!highlightedNet_.empty()) {
+        const ImU32 hi = col(p.selectionHighlight);
+        for (const auto& t : doc.tracks()) {
+            if (t.net != highlightedNet_ || !doc.layerVisible(t.layer) ||
+                !doc.netVisible(t.net))
+                continue;
+            const float wpx = std::max(3.0f, t.width * pxPerMm_ + 2.0f);
+            dl_->AddLine(toScreen(t.p1), toScreen(t.p2), hi, wpx);
+        }
     }
 
     // Selection highlight (drawn last, on top). A footprint gets a translucent halo over its

@@ -1525,7 +1525,6 @@ void drawClassificationCard(ActivityItem& a, const ui::Fonts& fonts,
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
     ui::IconUV iv = ui::getIcon("milestone_flag", 20);
-    if (!iv.valid) iv = ui::getIcon("bookmark", 20);
     if (iv.valid) {
         float gz = ImGui::GetTextLineHeight() * 0.95f;
         ImVec4 tint = semanticOnGlass(pal.accent, surf);
@@ -1806,8 +1805,7 @@ void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts) {
     ImGui::BeginChild("##firmbids", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
-    ui::IconUV iv = ui::getIcon("bookmark", 20);
-    if (!iv.valid) iv = ui::getIcon("team", 20);
+    ui::IconUV iv = ui::getIcon("team", 20);
     if (iv.valid) {
         float gz = ImGui::GetTextLineHeight();
         ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, semanticOnGlass(pal.accent, surf));
@@ -2089,7 +2087,7 @@ void drawAdvisorCard(ActivityItem& a, const ui::Fonts& fonts) {
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
     ui::IconUV iv = ui::getIcon("poly_star", 20);
-    if (!iv.valid) iv = ui::getIcon("bookmark", 20);
+    if (!iv.valid) iv = ui::getIcon("milestone_flag", 20);
     if (iv.valid) {
         float gz = ImGui::GetTextLineHeight() * 0.95f;
         ImVec4 tint = planApproval ? semanticOnGlass(pal.statusOk, surf)
@@ -2684,16 +2682,29 @@ static void aiVcFetchTimeline(AppState& st, bool force = false) {
                     catch (...) { cp.turn = -1; }
                 }
             }
-            // Accept both field names from Main vs WorkingPheasant payloads.
-            cp.when = c.value("when", c.value("time", std::string()));
-            cp.label = c.value("label", std::string());
+            // A nullable key MUST NOT go through nlohmann's value(): it throws type_error.302
+            // when the key exists and holds null, and the default argument is evaluated eagerly
+            // besides. plm_timeline emits null session_id (39 of 846 rows on this machine),
+            // null msg_idx and null parent, and that throw escaped into the rpc callback:
+            //   [async_rpc] callback for 'plm_timeline' threw: type must be string, but is null
+            // which abandoned the whole checkpoint list mid-parse, so the rollback popover
+            // silently showed a truncated history. The turn/msg_idx guards below already knew
+            // this; session_id, when, label and kind did not.
+            auto js = [](const nlohmann::json& o, const char* k) -> std::string {
+                auto it = o.find(k);
+                if (it == o.end() || !it->is_string()) return std::string();
+                return it->get<std::string>();
+            };
+            cp.when = js(c, "when");
+            if (cp.when.empty()) cp.when = js(c, "time");
+            cp.label = js(c, "label");
             if (c.contains("features") && c["features"].is_number())
                 cp.features = c["features"].get<int>();
             else if (c.contains("features_count") && c["features_count"].is_number())
                 cp.features = c["features_count"].get<int>();
             // v2: kind / msg_idx / call:{turn,i}
-            cp.kind = c.value("kind", std::string());
-            cp.sessionId = c.value("session_id", std::string());
+            cp.kind = js(c, "kind");
+            cp.sessionId = js(c, "session_id");
             if (c.contains("msg_idx") && !c["msg_idx"].is_null()) {
                 if (c["msg_idx"].is_number_integer()) cp.msgIdx = c["msg_idx"].get<int>();
                 else if (c["msg_idx"].is_number()) cp.msgIdx = (int)c["msg_idx"].get<double>();

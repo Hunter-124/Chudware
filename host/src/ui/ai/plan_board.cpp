@@ -282,17 +282,26 @@ void pbPollTimeline(AppState& st) {
         for (const auto& c : *it) {
             if (!c.is_object()) continue;
             PbCheckpoint cp;
-            cp.id = c.value("id", std::string());
+            // Null-safe reads: plm_timeline emits null for session_id / msg_idx / parent, and
+            // nlohmann's value() throws type_error.302 on an existing-but-null key, which kills
+            // the whole parse inside the rpc callback (see cards.cpp's aiVc parse).
+            auto js = [](const nlohmann::json& o, const char* k) -> std::string {
+                auto it = o.find(k);
+                if (it == o.end() || !it->is_string()) return std::string();
+                return it->get<std::string>();
+            };
+            cp.id = js(c, "id");
             if (c.contains("turn") && c["turn"].is_number())
                 cp.turn = c["turn"].is_number_integer() ? c["turn"].get<int>()
                                                         : (int)c["turn"].get<double>();
-            cp.when  = c.value("when", c.value("time", std::string()));
-            cp.label = c.value("label", std::string());
+            cp.when = js(c, "when");
+            if (cp.when.empty()) cp.when = js(c, "time");
+            cp.label = js(c, "label");
             if (c.contains("features") && c["features"].is_number())
                 cp.features = c["features"].get<int>();
             else if (c.contains("features_count") && c["features_count"].is_number())
                 cp.features = c["features_count"].get<int>();
-            cp.kind = c.value("kind", std::string());
+            cp.kind = js(c, "kind");
             if (c.contains("msg_idx") && c["msg_idx"].is_number())
                 cp.msgIdx = c["msg_idx"].is_number_integer() ? c["msg_idx"].get<int>()
                                                              : (int)c["msg_idx"].get<double>();

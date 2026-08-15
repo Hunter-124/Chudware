@@ -399,7 +399,11 @@ static void fetchAiTimeline(AppState& st, bool force) {
             if (!c.is_object()) continue;
             FeedRow fr;
             fr.id     = jstr(c, "id");
-            fr.when   = c.value("when", c.value("time", std::string()));
+            // NOT c.value("when", c.value("time", ...)): value() throws type_error.302 on a key
+            // that exists and holds null, and the default argument is evaluated eagerly, so a
+            // null `time` threw even when `when` was a perfectly good string. jstr is null-safe.
+            fr.when   = jstr(c, "when");
+            if (fr.when.empty()) fr.when = jstr(c, "time");
             fr.source = "ai";
             fr.pathHint = jstr(c, "path");
             int turn = -1;

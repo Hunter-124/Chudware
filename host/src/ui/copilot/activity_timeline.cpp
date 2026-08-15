@@ -842,7 +842,7 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
     // shares one left edge instead of the lightest rows hanging out into the gutter.
     const float shellInset = rowRailW() + ui::kit::padX();
     ImGui::Indent(shellInset);
-    ui::IconUV iv = ui::getIcon("bookmark", 20);
+    ui::IconUV iv = ui::getIcon("paperclip", 20);
     if (iv.valid) {
         float gz = ImGui::GetTextLineHeight() * 0.85f;
         ImVec4 tint(surf.textTertiary.x, surf.textTertiary.y, surf.textTertiary.z, 0.9f);
@@ -1563,7 +1563,7 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     else         drawStatusGlyph(hardFail ? "fail" : guard ? "skipped" : a.status,
                                  ImGui::GetTextLineHeight());
     ImGui::SameLine(0, 6 * sc);
-    ui::IconUV iv = ui::getIcon("wrench", 20);
+    ui::IconUV iv = ui::getIcon("cat_tools", 20);
     if (iv.valid) {
         float gz = ImGui::GetTextLineHeight();
         ImVec4 tint(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.85f);

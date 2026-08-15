@@ -3426,18 +3426,10 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
             else if (errored) inkV = ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1.0f);
             else if (listening) inkV = ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f);
             const ImU32 ink = ImGui::ColorConvertFloat4ToU32(inkV);
-            IconUV mic = ui::getIcon("mic", 20);
             const float pulse = listening
                 ? 0.5f + 0.5f * std::sin(v.animT * 4.0f)
                 : (processing ? 0.5f + 0.5f * std::sin(v.animT * 6.0f) : 0.0f);
-            if (mic.valid && !listening) {
-                mdl->AddImage(mic.texId,
-                              ImVec2(mc.x - isz * 0.5f, mc.y - isz * 0.5f),
-                              ImVec2(mc.x + isz * 0.5f, mc.y + isz * 0.5f),
-                              mic.uv0, mic.uv1, ink);
-            } else {
-                drawMicGlyph(mdl, mc, isz, ink, pulse, v.level, listening || processing);
-            }
+            drawMicGlyph(mdl, mc, isz, ink, pulse, v.level, listening || processing);
             if (listening) {
                 mdl->AddRect(mmn, mmx,
                              ImGui::ColorConvertFloat4ToU32(

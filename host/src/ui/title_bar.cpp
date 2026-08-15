@@ -391,38 +391,11 @@ static ChipResult drawChipAt(const char* btnId,
     const float contentW = hasLabel ? (iconSz + iconGap + textW) : iconSz;
     const float gx = p0.x + (chipW - contentW) * 0.5f;  // group left edge
     const ImVec2 iconCenter(gx + iconSz * 0.5f, p0.y + chipH * 0.5f);
-    // Prefer a crisp procedural TbIcon for the small (~13–15 px) workspace chips.
-    // Photographic / multi-color atlas tiles (ws_model, etc.) collapse to a muddy
-    // "broken box" at this size under linear filtering; only blit a raster cell when
-    // it is a monochrome-safe glyph that still reads at chip size. Missing/invalid
-    // cells fall through to the procedural path.
-    ui::IconUV riv;
-    bool useRaster = false;
-    if (rasterCell && rasterCell[0]) {
-        riv = ui::getIcon(rasterCell, 20);  // match chip size; @20 is the near size
-        // Skip sparse / photographic tiles: opaque coverage under ~35% of a 20px cell
-        // (≈140 px) reads as a broken fleck next to the label. Procedural wins.
-        if (riv.valid) {
-            // Always allow monochrome line-art style tiles via SDF when available;
-            // otherwise keep the raster only when the name is not a known photo tile.
-            // ws_model / ws_simulate / ws_electronics are engine renders (raster_only)
-            // that look wrong at chip size — force procedural for those. ws_manufacture
-            // USED to be one; it is now a generated line-art glyph in the atlas
-            // (assets/make_icons.py) and reads fine at 20 px, so it takes the raster path.
-            const bool photoTile =
-                std::strcmp(rasterCell, "ws_model") == 0 ||
-                std::strcmp(rasterCell, "ws_simulate") == 0 ||
-                std::strcmp(rasterCell, "ws_electronics") == 0;
-            useRaster = !photoTile;
-        }
-    }
-    if (useRaster) {
-        const ImVec2 tl(iconCenter.x - iconSz * 0.5f, iconCenter.y - iconSz * 0.5f);
-        const ImVec2 br(iconCenter.x + iconSz * 0.5f, iconCenter.y + iconSz * 0.5f);
-        dl->AddImage(riv.texId, tl, br, riv.uv0, riv.uv1);
-    } else {
-        drawTbIcon(dl, icon, iconCenter, iconSz, textU32);
-    }
+    // Workspace chips are always drawn by the crisp procedural TbIcon path below. The atlas
+    // workspace tiles are richer 32 px imagery and are intentionally not sampled at this size.
+    // Do not probe the atlas here: a missing optional raster tile must not emit a runtime warning.
+    (void)rasterCell;
+    drawTbIcon(dl, icon, iconCenter, iconSz, textU32);
     if (hasLabel) {
         const float tx = gx + iconSz + iconGap;
         const float ty = p0.y + (chipH - drawFont->FontSize) * 0.5f;

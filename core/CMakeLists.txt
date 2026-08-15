@@ -1216,7 +1216,8 @@ if(CHUDWARE_WITH_OCCT)
   # Gated on CHUDWARE_WITH_NETGEN: the mesher (mesher.cpp) is the only nglib consumer.
   if(CHUDWARE_WITH_NETGEN)
     add_library(chudware_mesh STATIC sim/mesher.cpp sim/hex_mesher.cpp sim/fea_run.cpp
-                                     sim/fea_fatigue.cpp sim/polymesh_backend.cpp)
+                                     sim/fea_fatigue.cpp sim/polymesh_backend.cpp
+                                     sim/fea_adaptive.cpp)
     target_include_directories(chudware_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_include_directories(chudware_mesh PRIVATE ${NETGEN_INCLUDE_DIRS})
     # nglib's import lib is PUBLIC so it propagates onto the final link line of the

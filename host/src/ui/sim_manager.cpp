@@ -351,8 +351,11 @@ static void addMeshParams(nlohmann::json &j, const Study &s, int meshOrder,
     j["target_size_mm"] = s.meshTargetMm;
   if (s.meshMinMm > 0.0f)
     j["min_size_mm"] = s.meshMinMm;
-  j["algorithm3d"] = s.meshAlgo;
+  j["mesher_backend"] = s.meshBackend;
   j["optimize"] = s.meshOptimize;
+  if (s.adaptEnabled)
+    j["adapt"] = {{"max_passes", std::clamp(s.adaptMaxPasses, 1, 6)},
+                  {"eta_target", s.adaptEtaTarget}};
 }
 
 static void clearTransientResult(Study &s) {
@@ -373,6 +376,10 @@ static void clearTransientResult(Study &s) {
   s.flowFields.clear();
   s.solverNotes.clear();
   s.nNodes = s.nElems = s.nDof = 0;
+  s.adaptPasses.clear();
+  s.adaptGlobalEta = 0.0;
+  s.adaptEtaTargetMet = false;
+  s.adaptStopReason.clear();
   // Motion study transient results.
   s.motionHasResult = false;
   s.motionPlaying = false;
@@ -1056,8 +1063,11 @@ nlohmann::json SimManager::studyToJson(const Study &s) {
       {"mesh_order", s.meshOrder},
       {"mesh_target_mm", s.meshTargetMm},
       {"mesh_min_mm", s.meshMinMm},
-      {"mesh_algo", s.meshAlgo},
+      {"mesher_backend", s.meshBackend},
       {"mesh_optimize", s.meshOptimize},
+      {"adapt_enabled", s.adaptEnabled},
+      {"adapt_max_passes", std::clamp(s.adaptMaxPasses, 1, 6)},
+      {"adapt_eta_target", s.adaptEtaTarget},
       {"n_modes", s.nModes},
       {"criterion", (int)s.criterion},
       {"flow",
@@ -1153,8 +1163,13 @@ Study SimManager::studyFromJson(const nlohmann::json &j) {
   s.meshOrder = j.value("mesh_order", 2);
   s.meshTargetMm = j.value("mesh_target_mm", 0.0f);
   s.meshMinMm = j.value("mesh_min_mm", 0.0f);
-  s.meshAlgo = j.value("mesh_algo", 1);
+  s.meshBackend = j.value("mesher_backend", std::string("netgen"));
   s.meshOptimize = j.value("mesh_optimize", true);
+  s.adaptEnabled = j.value("adapt_enabled", false);
+  s.adaptMaxPasses =
+      std::clamp(j.value("adapt_max_passes", 3), 1, 6);
+  s.adaptEtaTarget =
+      std::max(0.0f, j.value("adapt_eta_target", 0.05f));
   s.nModes = j.value("n_modes", 6);
   s.criterion = (FailureCriterion)j.value("criterion", 0);
   if (j.contains("flow") && j["flow"].is_object()) {
@@ -2729,6 +2744,11 @@ void SimManager::previewMesh(AppState &st, Study &s) {
                 for (const auto &b : res["aspect_hist"])
                   s->meshAspectHist.push_back((float)b.get<int>());
               s->meshHasQuality = s->nElems > 0;
+              s->meshTypeUsed =
+                  res.value("mesh_type_used", std::string());
+              s->meshBackendUsed =
+                  res.value("mesher_backend", std::string());
+              s->meshNote = res.value("note", std::string());
               clearMeshPreview();
               meshPreviewStudyId_ = s->id;
               if (!res.contains("points") || !res.contains("tets") ||
@@ -3952,7 +3972,7 @@ void SimManager::runStaticOrModal(AppState &st, Study &s) {
   prep->meshOptions.meshCurvPerCircle = s.meshCurvPerCircle;
   prep->meshOptions.meshTargetMm = s.meshTargetMm;
   prep->meshOptions.meshMinMm = s.meshMinMm;
-  prep->meshOptions.meshAlgo = s.meshAlgo;
+  prep->meshOptions.meshBackend = s.meshBackend;
   prep->meshOptions.meshOptimize = s.meshOptimize;
   prep->meshOptions.meshOrder = s.meshOrder;
 
@@ -4171,8 +4191,10 @@ void SimManager::finishStaticModalPrep(
       loads.push_back(std::move(item));
     }
     study["loads"] = std::move(loads);
-    launched = prep->sim->launch("sim_run_static", {{"study", study}}, note,
-                                 prep->docId, token);
+    const char *method =
+        prep->meshOptions.adaptEnabled ? "sim_run_adaptive" : "sim_run_static";
+    launched = prep->sim->launch(method, {{"study", study}}, note, prep->docId,
+                                 token);
   } else {
     launched = prep->sim->launch(
         "sim_run_modal", {{"study", study}, {"n_modes", prep->nModes}}, note,
@@ -4703,6 +4725,30 @@ void SimManager::drainSimClientJob(AppState &st) {
       postFreqResponse(st, s, res, ownerDocId);
       return;
     } else {
+      if (s.type == StudyType::Static && res.contains("adapt") &&
+          res["adapt"].is_object()) {
+        const auto &adapt = res["adapt"];
+        s.adaptGlobalEta = adapt.value("global_eta", 0.0);
+        s.adaptEtaTargetMet = adapt.value("eta_target_met", false);
+        s.adaptStopReason = adapt.value("stop_reason", std::string());
+        s.adaptPasses.clear();
+        if (adapt.contains("passes") && adapt["passes"].is_array()) {
+          for (const auto &p : adapt["passes"]) {
+            if (!p.is_object())
+              continue;
+            Study::AdaptPass row;
+            row.pass = p.value("pass", 0);
+            row.nNodes = p.value("n_nodes", 0);
+            row.nElems = p.value("n_elems", 0);
+            row.nDof = p.value("n_dof", 0);
+            row.elementSizeMm = p.value("element_size_mm", 0.0);
+            row.globalEta = p.value("global_eta", 0.0);
+            row.maxVonMisesMpa = p.value("max_von_mises_mpa", 0.0);
+            row.maxDispMm = p.value("max_disp_mm", 0.0);
+            s.adaptPasses.push_back(row);
+          }
+        }
+      }
       // Mesh / system size for the Results metric table + solver transparency.
       s.nNodes = res.value("n_nodes", 0);
       s.nElems = res.value("n_elems", 0);
@@ -6220,6 +6266,7 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
       ImGui::TextUnformatted("Element size override (mm, 0 = auto)");
       float target = s.meshTargetMm, minSize = s.meshMinMm;
       ImGui::SetNextItemWidth(-FLT_MIN);
+
       if (ImGui::InputFloat("##target_size", &target, 0.0f, 0.0f, "%.4g")) {
       }
       edited = edited || ImGui::IsItemDeactivatedAfterEdit();
@@ -6238,27 +6285,63 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
         clearMeshPreview();
       }
       ImGui::Spacing();
-      ImGui::TextUnformatted("3D algorithm");
-      static const char *kAlgo[2] = {"Delaunay (robust)",
-                                     "HXT (fast, parallel)"};
-      int ai = (s.meshAlgo == 10) ? 1 : 0;
+      ImGui::TextUnformatted("Mesher backend");
+      static const char *kBackend[2] = {"Netgen (default)",
+                                        "Polymesh (robust fill)"};
+      int backendIndex = s.meshBackend == "polymesh" ? 1 : 0;
       ImGui::SetNextItemWidth(-FLT_MIN);
-      if (ImGui::BeginCombo("##meshalgo", kAlgo[ai])) {
+      if (ImGui::BeginCombo("##mesherbackend", kBackend[backendIndex])) {
         for (int i = 0; i < 2; ++i)
-          if (ImGui::Selectable(kAlgo[i], ai == i)) {
-            s.meshAlgo = i ? 10 : 1;
+          if (ImGui::Selectable(kBackend[i], backendIndex == i)) {
+            s.meshBackend = i ? "polymesh" : "netgen";
             persist(st, s);
             clearMeshPreview();
           }
         ImGui::EndCombo();
       }
-      simTip("Tetrahedral meshing algorithm. Delaunay is the robust default; "
-             "HXT is faster "
-             "and multi-threaded for large parts.");
+      simTip("Netgen is the default and the only backend with curvature "
+             "refinement, structured hex and quad surfaces. Polymesh is a "
+             "graded Cartesian tet fill (BSD-licensed) that succeeds on "
+             "geometry Netgen rejects and serves as an independent second "
+             "opinion, at the cost of a stair-cased boundary.");
       ImGui::Unindent();
     }
     ImGui::Spacing();
   } // end !hexMesh tet-only controls
+  if (s.type == StudyType::Static) {
+    if (ImGui::Checkbox("Adaptive refinement", &s.adaptEnabled)) {
+      persist(st, s);
+      clearMeshPreview();
+    }
+    simTip("Re-meshes and re-solves up to the pass limit, each pass finer and "
+           "graded toward where the discretization error is largest, stopping "
+           "when the error indicator reaches the target. The indicator is a "
+           "dimensionless relative measure; smaller is better. It is not a "
+           "percentage stress error.");
+    if (s.adaptEnabled) {
+      ImGui::Indent();
+      ImGui::TextUnformatted("Maximum passes");
+      ImGui::SetNextItemWidth(-FLT_MIN);
+      if (ImGui::SliderInt("##adaptpasses", &s.adaptMaxPasses, 1, 6)) {
+        s.adaptMaxPasses = std::clamp(s.adaptMaxPasses, 1, 6);
+        persist(st, s);
+        clearMeshPreview();
+      }
+      ImGui::TextUnformatted("Error indicator target");
+      ImGui::SetNextItemWidth(-FLT_MIN);
+      float etaTarget = s.adaptEtaTarget;
+      if (ImGui::InputFloat("##adaptetatarget", &etaTarget, 0.005f, 0.01f,
+                            "%.4g")) {
+      }
+      if (ImGui::IsItemDeactivatedAfterEdit()) {
+        s.adaptEtaTarget = std::max(0.0f, etaTarget);
+        persist(st, s);
+        clearMeshPreview();
+      }
+      ImGui::Unindent();
+    }
+    ImGui::Spacing();
+  }
 
   bool busy = st.simClient && st.simClient->busy();
   if (busy)
@@ -6275,6 +6358,12 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
     ImGui::Spacing();
     ImGui::Text("Nodes: %d", s.nNodes);
     ImGui::Text("Elements: %d", s.nElems);
+    if (!s.meshTypeUsed.empty())
+      ImGui::Text("Mesh type: %s", s.meshTypeUsed.c_str());
+    if (!s.meshBackendUsed.empty())
+      ImGui::TextDisabled("Backend: %s", s.meshBackendUsed.c_str());
+    if (!s.meshNote.empty())
+      ImGui::TextWrapped("%s", s.meshNote.c_str());
     if (!meshPreviewSegs_.empty() && meshPreviewStudyId_ == s.id)
       ImGui::TextDisabled("Wireframe shown in the viewport.");
   }
@@ -7392,6 +7481,7 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
       row("Max von Mises", stressV("max_von_mises_mpa"));
       if (sm.contains("max_tresca_mpa"))
         row("Max shear stress (Tresca)", stressV("max_tresca_mpa"));
+
       else if (sm.contains("max_shear_mpa"))
         row("Max shear", stressV("max_shear_mpa"));
       if (sm.contains("max_principal_mpa"))
@@ -7418,6 +7508,44 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
           fos > 0.0 && fos < 1.0);
     }
     ImGui::EndTable();
+  }
+  if (s.type == StudyType::Static && !s.adaptPasses.empty()) {
+    ImGui::Spacing();
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted("Adaptive convergence");
+    ImGui::PopFont();
+    if (!s.adaptEtaTargetMet)
+      ImGui::PushStyleColor(ImGuiCol_Text,
+                            simRole(ui::palette.statusWarn));
+    ImGui::Text("Achieved error indicator: %.4g", s.adaptGlobalEta);
+    ImGui::Text("Target met: %s", s.adaptEtaTargetMet ? "Yes" : "No");
+    ImGui::Text("Passes run: %d", (int)s.adaptPasses.size());
+    if (!s.adaptEtaTargetMet) {
+      ImGui::TextWrapped(
+          "Attention: target not met; treat the stress result as "
+          "under-resolved.");
+      ImGui::PopStyleColor();
+    }
+    if (!s.adaptStopReason.empty())
+      ImGui::TextDisabled("Stopped: %s", s.adaptStopReason.c_str());
+    if (ImGui::BeginTable("##adaptpasses", 3,
+                          ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_BordersInnerH)) {
+      ImGui::TableSetupColumn("Pass");
+      ImGui::TableSetupColumn("Elements");
+      ImGui::TableSetupColumn("Indicator");
+      ImGui::TableHeadersRow();
+      for (const auto &pass : s.adaptPasses) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("%d", pass.pass);
+        ImGui::TableNextColumn();
+        ImGui::Text("%d", pass.nElems);
+        ImGui::TableNextColumn();
+        ImGui::Text("%.4g", pass.globalEta);
+      }
+      ImGui::EndTable();
+    }
   }
   // Yield warning for static/modal (fatigue shows per-theory FoS in its own
   // table).

@@ -91,6 +91,7 @@ _TOOL_STAGE: dict[str, str] = {
     "describe_assembly": "assembly",
     # sim
     "run_fea_static": "sim",
+    "run_fea_adaptive": "sim",
     "run_fea_modal": "sim",
     "run_cfd_flow": "sim",
     "describe_results": "sim",
@@ -236,7 +237,8 @@ _STAGE_SPEC: dict[str, dict] = {
             CHECK_SIM_MESH,
             CHECK_SIM_ANCHOR,
         ],
-        "helper_tools": ["describe_results", "run_fea_static", "run_fea_modal", "run_cfd_flow"],
+        "helper_tools": ["describe_results", "run_fea_static", "run_fea_adaptive",
+                         "run_fea_modal", "run_cfd_flow"],
         # Exit gate: BC lint + margin must PASS before advancing.
         # Divergence is action-level (not a blocker) so the model may acknowledge and
         # proceed; it is NOT in the exit gate per §9.3.

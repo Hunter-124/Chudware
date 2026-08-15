@@ -449,16 +449,28 @@ Env: `CHUDWARE_STT_MODEL` overrides the default model key (`fast`).
 
 ## 3. Sim worker (`core/api/libchudware.cpp`, separate process, spawned on demand)
 
-Same wire protocol. One job in flight; `job_id` correlates events.
+Same wire protocol. One job in flight; `job_id` correlates events. This table was re-verified
+against the native and Python implementations on 2026-08-15.
 
 | method | params → result |
 |---|---|
 | `ping` | → `{pong: true, protocol: 2, sim: true}` |
-| `sim_mesh` | `{step_path, density: 0..1}` → `{mesh_path, nodes, elems, char_len_mm}` |
-| `sim_run_static` | `{study}` (study JSON: material key + E/ν/ρ/yield, fixtures:[Selector→node sets prepared by doc worker as face point clouds], loads:[{faces, type: force\|pressure, vector\|magnitude}], mesh_path) → `{results_npz, overlay_aicm, summary:{max_von_mises_mpa, max_disp_mm, min_fos}}` |
-| `sim_run_modal` | `{study, n_modes: 6}` → `{freqs_hz:[…], results_npz, overlay_aicm}` |
-| `sim_run_flow` | `{stl_path, direction:[3], speed_mps, preset: "coarse"\|"medium"\|"fine"\|"xfine"}` → `{drag_n, lift_n, cd, frontal_area_mm2, reynolds_note, slices_aicm, lines_aicm, trace:[{step, drag}]}` |
-| `sim_cancel` | `{job_id}` → `{cancelled: bool}` |
+| `sim_mesh` | `{step_path, fineness?: 0..1, density?: 0..1 (legacy alias), order?\|mesh_order?, curvature?, curv_elems_per_circle?, target_size_mm?, min_size_mm?, max_size_mm?, optimize?, mesher_backend?: "netgen"\|"polymesh" (default "netgen"), structured?\|mesh_type?: "hex", auto_type?, quad_surface?, fallback_to_tet?, thin_wall_layers?}` → `{ok, points:[…], tets:[…], char_len_mm, n_nodes, n_elems, nodes_per_elem, min_tet_volume_mm3, max_tet_edge_ratio, aspect_min, aspect_avg, aspect_max, jacobian_min, pct_poor, aspect_hist:[…], mesh_type_used, note, mesher_backend}`. There is no `mesh_path`. Requesting `"polymesh"` when the build lacks `CHUDWARE_WITH_POLYMESH` returns `{ok:false,error}`. |
+| `sim_run_static` | `{study}` where `study` carries `step_path` or inline `points`/`tets`, material, fixtures, loads, mesh options, and optional `mesher_backend: "netgen"\|"polymesh"` → `{ok, displacement:[…], disp_magnitude:[…], von_mises:[…], principal1:[…], principal3:[…], max_shear:[…], stress_xx:[…], stress_yy:[…], stress_zz:[…], n_dof, n_nodes, n_elems, mesh_type_used, summary:{max_von_mises_mpa,max_disp_mm,min_fos,max_principal_mpa,min_principal_mpa,max_shear_mpa,min_fos_tresca,min_fos_rankine,max_tresca_mpa,max_abs_principal_mpa}, solver_notes:[…], cache_hit, cache_reason, input_hash, overlay_aicm?}`. `overlay_aicm` is best-effort for STEP-backed solves; there is no `results_npz`. |
+| `sim_run_modal` | `{study, n_modes?: 6}`; `study.mesher_backend` accepts `"netgen"` (default) or `"polymesh"` → `{ok, freqs_hz:[…], mode_shapes:[…], n_modes, n_nodes, n_dof, mesh_type_used, solver_notes:[…], cache_hit, cache_reason, input_hash, overlay_aicm?}`. |
+| `sim_run_thermal` | `{study}` (steady heat conduction; `study.mesher_backend` accepts `"netgen"` default or `"polymesh"`) → `{ok, temperature:[…], n_nodes, n_dof, n_elems, mesh_type_used, summary:{max_temp_c,min_temp_c}, flux_summary:[…], solver_notes:[…], cache_hit, cache_reason, input_hash}`. |
+| `sim_run_fatigue` | `{study}` (high-cycle fatigue over a static solve; `study.mesher_backend` accepts `"netgen"` default or `"polymesh"`) → `{ok, n_nodes, n_elems, n_dof, summary:{se_corrected_mpa,se_base_mpa,sut_mpa,sy_mpa,lmin,lmax,crit_sigma_a,crit_sigma_m,theories:{goodman,gerber,soderberg,asme,morrow}}, solver_notes:[…], overlay_aicm?}`. |
+| `sim_run_buckling` | `{L_mm?, b_mm?, h_mm?, E_mpa?, nu?, load_n?, n_modes?: 4}` → `{ok, backend, solver, applied_load_n, load_factors:[…], critical_loads_n:[…], euler_reference_pcr_n, note}`; returns an honest skipped/error payload when CalculiX is unavailable or the setup/solve fails. |
+| `sim_run_contact` | `{L_mm?, b_mm?, h_mm?, E_mpa?, nu?, pressure_mpa?}` → `{ok, backend, solver, applied_load_n, base_reaction_n, reaction_balance_error_pct, note}`; fails if CalculiX is unavailable or force balance exceeds 5%. |
+| `sim_freq_response` | `{freqs_hz, mode_shapes, n_nodes, total_mass_kg, excitation_dir?:[3], zeta?:0.02, base_accel_g?:1, sweep_hz?:[…], psd_breakpoints?:[[f_hz,g2_per_hz],…], vibration_spec?:{…}}` → `{ok, freqs_hz, harmonic, random, verdict, damping_assumption}`. |
+| `sim_caps` | `{}` → `{ok, ccx:{found,path,hint}, freq_response:{available,hint}, handoffs:{ecad_thermal,heatsink_select,motion_fea,piping_verify_cfd}}`. |
+| `sim_lbm` | `{mask:{nx,ny,nz,solid:[…]}, params:{u_lat?,tau0?,voxel_mm?,dx_m?,dt_s?,rho_air?,backend?}, n_steps, backend?}` → `{ok, nx, ny, nz, ux:[…], uy:[…], uz:[…], rho:[…], cd, drag_n, lift_n, frontal_area_mm2, steps_run, diverged, backend, backend_fallback}`. |
+| `sim_run_flow` | STL form `{stl_path, direction?:[3], speed_mps?, preset?: "coarse"\|"medium"\|"fine"\|"xfine", solver?:"lbm", aoa_deg?, sideslip_deg?, roughness_um?, ref_area_mm2?, fluid?, cells?, n_steps?, progress_path?, job_id?}` → `{ok, drag_n, lift_n, side_n, cd, cl, ld, reynolds, frontal_area_mm2, ref_area_mm2, reynolds_note, diverged, trace:[], cp_min, cp_max, vmax_mps, solver_notes, scalar_fields:[], overlay_pending:true, steps_run, converged, residual, mass_imbalance, voxel_mm, min_feature_mm, min_feature_voxels, grid, warning?}`. Document form `{doc_id, velocity?, aoa?, fluid?, cells?, n_steps?, progress_path?, job_id?}` returns the corresponding force/convergence subset. |
+| `sim_cancel` | `{job_id}` → `{cancelled: bool}` (idempotent; unknown id is `false`). |
+| `sim_study_list` | `{doc_id}` → `{studies:[…], revision}`. |
+| `sim_study_add` | `{doc_id, study}` → `{studies:[…], revision, study_id}`; the core assigns an id when absent. |
+| `sim_study_edit` | `{doc_id, study_id, study}` → `{studies:[…], revision}`; the addressed id is preserved. |
+| `sim_study_delete` | `{doc_id, study_id}` → `{studies:[…], revision}`. |
 | `shutdown` | |
 
 All `sim_run_*`/`sim_mesh` stream `sim_progress` events (events.md). The sim worker receives

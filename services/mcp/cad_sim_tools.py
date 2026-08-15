@@ -375,6 +375,15 @@ def _norm_fineness(value, arg_name: str = "mesh_fineness") -> float:
         raise ValueError(f"{arg_name} must be in 0..1, got {value!r}.")
     return out
 
+def _norm_mesher_backend(value) -> str:
+    """Validate the public mesher selector without silently changing attribution."""
+    backend = str(value).strip().lower()
+    if backend not in ("netgen", "polymesh"):
+        raise ValueError(
+            "mesher_backend must be 'netgen' or 'polymesh'; "
+            f"got {value!r}. Refusing to choose a different mesher silently.")
+    return backend
+
 
 def _norm_direction(d, where: str) -> list:
     """A `direction` value -> a UNIT 3-vector. Normalizing first is the whole point: a
@@ -901,7 +910,8 @@ def _reject_fully_constrained_loads(fixture_sets: list, load_specs: list,
                 "fixture to match the real support.")})
 
 
-def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes: list) -> dict:
+def _build_static_study(fixtures, loads, material, mesh_fineness, mesher_backend,
+                        doc_id, notes: list) -> dict:
     """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
     d = _doc(doc_id)
     _require_sim_geometry(d)
@@ -914,6 +924,7 @@ def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes:
     fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=notes)
     loads = _norm_bc_list(loads, "loads", notes=notes)
     mesh_fineness = _norm_fineness(mesh_fineness)
+    mesher_backend = _norm_mesher_backend(mesher_backend)
     mat = _resolve_study_material(material, "static")
     # fixtures=[] and "fixtures that resolved to nothing" are DIFFERENT mistakes, and the
     # single old message diagnosed the wrong one — it told a caller who supplied no queries
@@ -948,13 +959,66 @@ def _build_static_study(fixtures, loads, material, mesh_fineness, doc_id, notes:
         "loads": load_specs,
         "mesh_order": 2,        # tet10 captures bending
         "fineness": mesh_fineness,
+        "mesher_backend": mesher_backend,
     }
     return {"analysis": "fea_static", "doc": d, "study": study, "material": mat,
             "material_arg": material, "fixtures": fixtures, "loads": loads,
-            "mesh_fineness": mesh_fineness, "step_path": step}
+            "mesh_fineness": mesh_fineness, "mesher_backend": mesher_backend,
+            "step_path": step}
 
 
-def _build_modal_study(fixtures, material, mesh_fineness, doc_id, notes: list) -> dict:
+def _build_adaptive_study(fixtures, loads, material, mesh_fineness,
+                          max_passes, eta_target, doc_id, notes: list) -> dict:
+    """SETUP stage for run_fea_adaptive / sim_run_adaptive."""
+    if isinstance(max_passes, bool) or not isinstance(max_passes, int):
+        raise ValueError("max_passes must be an integer from 1 through 6")
+    if not 1 <= max_passes <= 6:
+        raise ValueError("max_passes must be from 1 through 6")
+    eta_target = _finite_float(eta_target, "eta_target")
+    if eta_target <= 0.0:
+        raise ValueError("eta_target must be finite and greater than 0")
+    ctx = _build_static_study(fixtures, loads, material, mesh_fineness,
+                              "polymesh", doc_id, notes)
+    ctx["study"].pop("mesher_backend", None)
+    ctx["study"]["adapt"] = {"max_passes": max_passes, "eta_target": eta_target}
+    ctx["max_passes"] = max_passes
+    ctx["eta_target"] = eta_target
+    return ctx
+
+
+def _collect_adaptive(ctx: dict, res: dict, notes: list) -> dict:
+    """Shape an adaptive solve like static FEA while surfacing convergence."""
+    out = _collect_static(ctx, res, notes)
+    if not out.get("ok"):
+        return out
+    adapt = res.get("adapt")
+    if not isinstance(adapt, dict):
+        return {"ok": False, "doc_id": ctx["doc"],
+                "error": "adaptive solver reported success without convergence metadata."}
+    try:
+        global_eta = _finite_float(adapt.get("global_eta"), "adapt.global_eta")
+        passes_run = _positive_int(adapt.get("passes_run"), "adapt.passes_run")
+    except ValueError as exc:
+        return {"ok": False, "doc_id": ctx["doc"],
+                "error": f"adaptive solver returned incomplete convergence metadata: {exc}"}
+    eta_target_met = adapt.get("eta_target_met")
+    stop_reason = adapt.get("stop_reason")
+    if not isinstance(eta_target_met, bool) or not isinstance(stop_reason, str) or not stop_reason:
+        return {"ok": False, "doc_id": ctx["doc"],
+                "error": "adaptive solver returned invalid eta_target_met or stop_reason."}
+    out.update({"global_eta": global_eta, "eta_target_met": eta_target_met,
+                "passes_run": passes_run, "stop_reason": stop_reason,
+                "adapt": adapt})
+    if not eta_target_met:
+        out["resolution_note"] = (
+            "The adaptive error target was not met; this result may be under-resolved.")
+    return out
+
+
+
+
+def _build_modal_study(fixtures, material, mesh_fineness, mesher_backend,
+                       doc_id, notes: list) -> dict:
     """SETUP stage for run_fea_modal / sim_run(analysis="fea_modal")."""
     d = _doc(doc_id)
     _require_sim_geometry(d)
@@ -962,6 +1026,7 @@ def _build_modal_study(fixtures, material, mesh_fineness, doc_id, notes: list) -
                             'a list of face queries held fixed, e.g. ["bottom"]')
     fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=notes)
     mesh_fineness = _norm_fineness(mesh_fineness)
+    mesher_backend = _norm_mesher_backend(mesher_backend)
     mat = _resolve_study_material(material, "modal")
     fixture_sets: list = []
     for q in fixtures:
@@ -982,11 +1047,12 @@ def _build_modal_study(fixtures, material, mesh_fineness, doc_id, notes: list) -
     # 2nd-order (tet10) elements: quadratic bending accuracy — no spurious split on
     # a square section and no low-frequency bias the way tet4 had (Bug N-1).
     study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
-             "mesh_order": 2, "fineness": mesh_fineness}
+             "mesh_order": 2, "fineness": mesh_fineness,
+             "mesher_backend": mesher_backend}
     return {"analysis": "fea_modal", "doc": d, "study": study, "material": mat,
             "material_arg": material, "fixtures": fixtures, "fixture_sets": fixture_sets,
             "free_free": not fixture_sets, "mesh_fineness": mesh_fineness,
-            "step_path": step}
+            "mesher_backend": mesher_backend, "step_path": step}
 
 
 # core/sim/fea_static.cpp clamps yield/stress into [0, 15]; 15 therefore means "saturated",
@@ -1035,6 +1101,7 @@ def _collect_static(ctx: dict, res: dict, notes: list) -> dict:
         "fixtures": ctx.get("fixtures"),
         "loads": ctx.get("loads"),
         "mesh_fineness": ctx.get("mesh_fineness"),
+        "mesher_backend": ctx.get("mesher_backend"),
         "results": summary,
         "n_dof": counts["n_dof"], "n_elems": counts["n_elems"],
         "n_nodes": counts["n_nodes"], "mesh": res.get("mesh_type_used"),
@@ -1116,6 +1183,7 @@ def _collect_modal(ctx: dict, freqs: list, n_modes: int, notes: list,
         "fixtures": ctx.get("fixtures"),
         "n_modes": n_modes,
         "mesh_fineness": ctx.get("mesh_fineness"),
+        "mesher_backend": ctx.get("mesher_backend"),
         "results": {"freqs_hz": freqs, "n_modes": len(freqs)},
         **modal_meta,
     })
@@ -1204,7 +1272,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def run_fea_static(fixtures: Union[list, str], loads: Union[list, str],
                        material: Union[str, dict] = "steel",
-                       mesh_fineness: Union[float, str] = 0.5, doc_id: Optional[str] = None,
+                       mesh_fineness: Union[float, str] = 0.5,
+                       mesher_backend: str = "netgen", doc_id: Optional[str] = None,
                        background: bool = False) -> str:
         """Linear-static stress FEA on the current part. Returns max stress, displacement, and FoS.
 
@@ -1223,6 +1292,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         mesh_fineness : 0..1 (default 0.5), or a preset word
                    ("coarse"=0.25, "medium"=0.5, "fine"=0.75, "finest"=1.0).
                    Second-order (tet10) elements are used for accuracy.
+        mesher_backend : "netgen" (default) or "polymesh"; no other value is accepted.
         background : if True, return a job_id immediately and solve on a worker thread — poll
                      get_job(job_id). Use it for fine meshes that may exceed the call timeout.
 
@@ -1237,7 +1307,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         try:
             bc_notes: list = []
             ctx = _build_static_study(fixtures, loads, material, mesh_fineness,
-                                      doc_id, bc_notes)
+                                      mesher_backend, doc_id, bc_notes)
             d = ctx["doc"]
 
             def _solve() -> dict:
@@ -1259,9 +1329,56 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
+    def run_fea_adaptive(fixtures: Union[list, str], loads: Union[list, str],
+                         material: Union[str, dict] = "steel",
+                         mesh_fineness: Union[float, str] = 0.5,
+                         max_passes: int = 3, eta_target: float = 0.05,
+                         doc_id: Optional[str] = None,
+                         background: bool = False) -> str:
+        """Adaptive linear-static stress FEA for decision-driving peak stresses.
+
+        It re-meshes and re-solves up to max_passes times, so it is several times slower
+        than run_fea_static. Prefer it when a peak stress drives a decision, or when a
+        coarse result looks mesher-sensitive. Its dimensionless relative error indicator
+        is smaller when the discretization is better; it does not bound stress error.
+
+        fixtures : list of face queries held fixed, in the run_fea_static dialect.
+        loads : list of face queries plus force (N) or pressure (MPa), as for run_fea_static.
+        material : a registry name or explicit material property dict.
+        mesh_fineness : starting fineness from 0..1 or coarse/medium/fine/finest.
+        max_passes : maximum remesh-and-solve passes, from 1 through 6.
+        eta_target : finite positive target for the dimensionless relative error indicator.
+        background : if True, return a job_id immediately; poll get_job(job_id).
+        """
+        try:
+            bc_notes: list = []
+            ctx = _build_adaptive_study(fixtures, loads, material, mesh_fineness,
+                                        max_passes, eta_target, doc_id, bc_notes)
+            d = ctx["doc"]
+
+            def _solve() -> dict:
+                res = cb.call("sim_run_adaptive", {"study": ctx["study"]})
+                return _collect_adaptive(ctx, res, bc_notes)
+
+            _autosave_all_open()
+            if background:
+                jid = _start_job("fea_adaptive", _solve)
+                return _dumps({"ok": True, "job_id": jid, "status": "running",
+                               "doc_id": d,
+                               "note": "solving on a worker thread — poll get_job(job_id)",
+                               "next_actions": [f"get_job('{jid}')"]})
+            return _dumps(_solve_sync_or_handoff("fea_adaptive", _solve))
+        except _StudyRefusal as r:
+            return _dumps(r.payload)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+
+    @mcp.tool()
     def run_fea_modal(fixtures: Union[list, str], material: Union[str, dict] = "steel",
                       n_modes: int = 6,
-                      mesh_fineness: Union[float, str] = 0.5, doc_id: Optional[str] = None,
+                      mesh_fineness: Union[float, str] = 0.5,
+                      mesher_backend: str = "netgen", doc_id: Optional[str] = None,
                       background: bool = False) -> str:
         """Modal FEA — the natural frequencies (Hz) of the held part. Returns the first n_modes.
 
@@ -1271,12 +1388,14 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    wrapper {"face": q} / {"faces": [q1, q2]}.
         material : name or explicit dict (density drives the mode frequencies).
         mesh_fineness : 0..1, or a preset word ("coarse"/"medium"/"fine"/"finest").
+        mesher_backend : "netgen" (default) or "polymesh"; no other value is accepted.
         background : if True, return a job_id and solve on a worker thread — poll get_job(job_id).
         """
         try:
             n_modes = _positive_int(n_modes, "n_modes")
             bc_notes: list = []
-            ctx = _build_modal_study(fixtures, material, mesh_fineness, doc_id, bc_notes)
+            ctx = _build_modal_study(fixtures, material, mesh_fineness, mesher_backend,
+                                     doc_id, bc_notes)
             d = ctx["doc"]
             fixture_sets = ctx["fixture_sets"]
             study = ctx["study"]
@@ -1335,6 +1454,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 loads: Optional[Union[list, str]] = None,
                 material: Union[str, dict] = "steel",
                 mesh_fineness: Union[float, str] = 0.5,
+                mesher_backend: str = "netgen",
                 n_modes: int = 6,
                 doc_id: Optional[str] = None,
                 study: Optional[str] = None,
@@ -1351,6 +1471,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         Every other argument means exactly what it means on run_fea_static / run_fea_modal,
         and the study is built by the SAME setup code, so the answer is identical to the
         synchronous one.
+        mesher_backend : "netgen" (default) or "polymesh"; invalid values are refused.
 
         Then: sim_status(job_id) -> queued|running|done|failed|cancelled (+ progress, elapsed)
               sim_results(job_id) -> the full result once done (partial=True while running)
@@ -1376,12 +1497,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             notes: list = []
             if kind == "fea_static":
                 ctx = _build_static_study(fixtures, loads, material, mesh_fineness,
-                                          doc_id, notes)
+                                          mesher_backend, doc_id, notes)
                 method = "sim_run_static"
                 params = {"study": ctx["study"]}
             else:
                 n_modes = _positive_int(n_modes, "n_modes")
-                ctx = _build_modal_study(fixtures, material, mesh_fineness, doc_id, notes)
+                ctx = _build_modal_study(fixtures, material, mesh_fineness,
+                                         mesher_backend, doc_id, notes)
                 ctx["n_modes"] = n_modes
                 method = "sim_run_modal"
                 params = {"study": ctx["study"],
@@ -2026,7 +2148,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         load_type: str = "reversed", load_ratio: float = -1.0,
                         surface: str = "machined", reliability_pct: float = 50.0,
                         temperature_c: float = 20.0, theory: str = "goodman",
-                        mesh_fineness: Union[float, str] = 0.5, doc_id: Optional[str] = None,
+                        mesh_fineness: Union[float, str] = 0.5,
+                        mesher_backend: str = "netgen", doc_id: Optional[str] = None,
                         background: bool = False, load_case: str = "bending") -> str:
         """High-cycle fatigue life (S-N) on the current part — reuses the linear-static
         stress field, then applies mean-stress theory + Marin correction + Basquin life.
@@ -2051,6 +2174,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         load_case      : "bending" (default), "axial", or "torsion" for Marin kb/kc.
                          Rectangular bending/torsion uses d_e=0.808*sqrt(b*h) from the
                          two smaller bounding-box spans; axial uses kb=1.
+        mesher_backend : "netgen" (default) or "polymesh"; no other value is accepted.
 
         Returns {ok, regime: infinite|finite|static_overload, cycles, fos_endurance,
         se_corrected_mpa, theories{...}}. regime="infinite" ⇒ >1e6 cycles (runout).
@@ -2067,6 +2191,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=bc_notes)
             loads = _norm_bc_list(loads, "loads", notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
+            mesher_backend = _norm_mesher_backend(mesher_backend)
             mat = _resolve_study_material(material, "fatigue")
             Sut = _finite_float(mat["ultimate_mpa"], "material.ultimate_mpa")
             Se_base = _finite_float(mat["endurance_mpa"], "material.endurance_mpa")
@@ -2131,7 +2256,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             cb.call("doc_export_step", {"doc_id": d, "path": step})
             study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
                      "loads": load_specs, "mesh_order": 2, "fineness": mesh_fineness,
-                     "fatigue": fat}
+                     "mesher_backend": mesher_backend, "fatigue": fat}
 
             def _solve() -> dict:
                 try:
@@ -2203,6 +2328,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         loads: Optional[Union[list, str]] = None,
                         specific_heat_j_kgk: Optional[float] = None,
                         mesh_fineness: Union[float, str] = 0.5,
+                        mesher_backend: str = "netgen",
                         doc_id: Optional[str] = None) -> str:
         """Thermal (heat-conduction) FEA — steady-state via CalculiX, TRANSIENT via the
         C++ core solver on the real part mesh.
@@ -2243,6 +2369,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
         conductivity_w_mk : thermal conductivity override (W/m·K); else from material
                             (falls back to a typical value for the named material).
+        mesher_backend : "netgen" (default) or "polymesh"; it applies to the transient
+                         real-mesh path and invalid values are always refused.
         """
         try:
             bc_notes: list = []
@@ -2257,6 +2385,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             hot_faces = _norm_bc_list(hot_faces, "hot_faces", notes=bc_notes)
             cold_faces = _norm_bc_list(cold_faces, "cold_faces", notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
+            mesher_backend = _norm_mesher_backend(mesher_backend)
             material = coerce_json_or_repr(material)
             if conductivity_w_mk is not None:
                 conductivity_w_mk = _finite_float(
@@ -2381,6 +2510,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                          "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
                          "fixtures": fixtures, "loads": load_specs,
                          "mesh_order": 2, "fineness": mesh_fineness,
+                         "mesher_backend": mesher_backend,
                          "transient": {"t_end_s": t_end, "dt_s": dt,
                                        "t_init_c": t_init,
                                        "frame_times_s": frame_times,

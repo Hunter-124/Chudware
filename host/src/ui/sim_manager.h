@@ -93,13 +93,19 @@ struct Study {
                                     // 2nd order captures bending accurately (linear tets shear-lock).
     float meshTargetMm = 0.0f;      // advanced: explicit element size override (0 = auto)
     float meshMinMm = 0.0f;         // advanced: min element size override (0 = auto)
-    int   meshAlgo = 1;             // advanced 3D algorithm knob (legacy; Netgen uses Delaunay)
+    std::string meshBackend = "netgen"; // "netgen" | "polymesh"
     bool meshOptimize = true;       // Netgen surface + volume optimization pass
+    bool adaptEnabled = false;      // static only: error-driven re-mesh/re-solve
+    int adaptMaxPasses = 3;         // adaptive pass budget, clamped to [1, 6]
+    float adaptEtaTarget = 0.05f;   // dimensionless relative error indicator target
     // Mesh quality readout from the last Preview (transient; not persisted).
     bool  meshHasQuality = false;
     float meshAspectMin = 0, meshAspectAvg = 0, meshAspectMax = 0;
     float meshJacobianMin = 0, meshPctPoor = 0;
     std::vector<float> meshAspectHist;  // 10 buckets
+    std::string meshTypeUsed;       // backend element type reported by sim_mesh
+    std::string meshBackendUsed;    // backend actually used by sim_mesh
+    std::string meshNote;           // backend option/capability note from sim_mesh
     int nModes = 6;                 // modal
 
     // Static: which failure theory drives the headline FoS + the FoS plot field.
@@ -218,6 +224,16 @@ struct Study {
     double cpMin = 0, cpMax = 0, vmaxMps = 0;  // legend ranges for the Cp / velocity plots
     std::vector<std::string> flowFields;       // scalar_fields available to plot (pressure_cp, velocity)
     std::vector<std::string> solverNotes;      // solver_notes echoed verbatim (pressure area, fallbacks…)
+    // Adaptive static convergence history (transient; never persisted).
+    struct AdaptPass {
+        int pass = 0, nNodes = 0, nElems = 0, nDof = 0;
+        double elementSizeMm = 0.0, globalEta = 0.0;
+        double maxVonMisesMpa = 0.0, maxDispMm = 0.0;
+    };
+    std::vector<AdaptPass> adaptPasses;
+    double adaptGlobalEta = 0.0;
+    bool adaptEtaTargetMet = false;
+    std::string adaptStopReason;
 };
 
 // Which sub-node of a study the tree has selected (drives the form + previews).

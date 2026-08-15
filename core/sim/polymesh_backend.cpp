@@ -56,6 +56,10 @@ MeshOut mesh_step_polymesh(const std::string&, const MeshOptions&) {
 #include "sim/solver_threads.h"
 
 #include <fea/backend.hpp>
+#include <adapt/graded_sizing.hpp>
+#include <adapt/loop.hpp>
+#include <fea/material.hpp>
+#include <fea/zz.hpp>
 #include <fea/nodal_mesh.hpp>
 #include <fea/p_elevate.hpp>
 #include <pipeline/scene.hpp>
@@ -104,6 +108,135 @@ std::string inapplicable_options_note(const MeshOptions& options) {
            " (Netgen-only; mesh is a graded Cartesian fill)";
 }
 
+// A loaded model plus the resolved element-size band. Shared by the one-shot mesh and the
+// adaptive driver, which must not re-parse the STEP on every pass.
+struct LoadedModel {
+    pm::pipeline::Model model;
+    SizeBand band;
+};
+
+bool load_model(const std::string& step_path, const MeshOptions& options, LoadedModel& loaded,
+                std::string& error) {
+    loaded.model = pm::pipeline::Model::load(step_path);
+    if (loaded.model.surface.vertices.empty() || loaded.model.surface.triangles.empty()) {
+        error = "polymesh: STEP produced no tessellated surface to fill";
+        return false;
+    }
+    // Size the mesh with Chudware's shared brain, not polymesh's resolve_mesh_size, so one
+    // fineness setting means one element size across backends AND the host-memory governor
+    // still applies. resolve_size_band needs the OCC shape; polymesh already holds it
+    // behind CadModel::shape_handle().
+    if (loaded.model.cad && loaded.model.cad->shape_handle() != nullptr) {
+        const TopoDS_Shape& shape =
+            *static_cast<const TopoDS_Shape*>(loaded.model.cad->shape_handle());
+        loaded.band = resolve_size_band(shape, options);
+    }
+    if (!loaded.band.ok) {
+        error = loaded.band.error.empty()
+                    ? "polymesh: could not resolve element sizing from the STEP"
+                    : loaded.band.error;
+        return false;
+    }
+    return true;
+}
+
+// Fill at coarse element size `h`, optionally under a spatial size field h(x), promote to
+// tet10 when asked, and normalize into MeshOut. `nodal` keeps the polymesh-side mesh, which
+// the adaptive driver needs for error recovery (the MeshOut node ORDER is identical, so a
+// displacement vector indexed against one is valid against the other).
+bool build_mesh(const LoadedModel& loaded, const MeshOptions& options, double h,
+                const pm::mesh::SizeFieldFn& size_field, pm::fea::NodalMesh& nodal,
+                MeshOut& out) {
+    const pm::pipeline::ResolvedMeshSize resolved =
+        pm::pipeline::resolve_mesh_size(loaded.model, h);
+
+    // kGradedTet: pure tets (the fixed-stride contract every Chudware solver assumes) with
+    // a refined boundary skin, which is the closest polymesh family to what the Netgen path
+    // delivers. The hybrid/VEM families emit hex/prism/pyramid/polyhedral cells that
+    // MeshOut cannot express, so they are deliberately not selectable here. It is also one
+    // of the two families that honor a size field, which is what makes adaptive refinement
+    // possible at all.
+    const pm::pipeline::VolumeMeshOutput volume = pm::pipeline::volume_mesh(
+        loaded.model, h, pm::pipeline::VolumeMesher::kGradedTet,
+        /*skin_layers=*/2, /*feature_refine=*/true, /*refine_seeds=*/{}, /*seed_band=*/0.0,
+        /*element_tendency=*/0.0, resolved.element_ceiling, resolved.dof_ceiling,
+        /*auto_retry_budget=*/0, /*cancel_check=*/{}, size_field);
+
+    nodal = volume.mesh;
+    if (options.order == 2) {
+        nodal = pm::fea::promote_to_quadratic(nodal);
+        // Straight-edge mids are a poor approximation on a fillet or a bore. Project the
+        // free-surface mids onto the exact BRep, exactly as the Netgen second-order path
+        // does with Ng_OCC_Generate_SecondOrder.
+        if (loaded.model.cad) {
+            std::vector<pm::mesh::BoundarySupport> provenance;
+            pm::mesh::BoundaryProjectionContext projection;
+            if (pm::pipeline::make_boundary_projection(*loaded.model.cad, h, &projection,
+                                                       &provenance)) {
+                pm::pipeline::project_quadratic_boundary_mids(nodal, *loaded.model.cad,
+                                                              &projection, h);
+            }
+        }
+    }
+    nodal.compact_unused_nodes();
+
+    const int stride = options.order == 2 ? 10 : 4;
+    const pm::fea::ElementType want =
+        options.order == 2 ? pm::fea::ElementType::kTet10 : pm::fea::ElementType::kTet4;
+    // A mixed cell here would be silently misread as a tet by every downstream reader
+    // (they index a flat array by a constant stride), so refuse instead of truncating.
+    for (const pm::fea::NodalElement& element : nodal.elements) {
+        if (element.type != want) {
+            out.ok = false;
+            out.error = std::string("polymesh: mesh contains a ") +
+                        pm::fea::element_type_name(element.type) +
+                        " element, but Chudware's mesh contract carries a single element "
+                        "type (tet4/tet10) — this geometry needs the Netgen backend";
+            return false;
+        }
+    }
+    if (nodal.nodes.empty() || nodal.elements.empty()) {
+        out.ok = false;
+        out.error = "polymesh: fill produced an empty mesh (geometry not watertight?)";
+        return false;
+    }
+
+    out.points.resize(nodal.nodes.size() * 3);
+    for (size_t i = 0; i < nodal.nodes.size(); ++i) {
+        out.points[3 * i + 0] = nodal.nodes[i].x();
+        out.points[3 * i + 1] = nodal.nodes[i].y();
+        out.points[3 * i + 2] = nodal.nodes[i].z();
+    }
+    out.tets.resize(nodal.elements.size() * static_cast<size_t>(stride));
+    for (size_t e = 0; e < nodal.elements.size(); ++e) {
+        const std::vector<uint32_t>& nodes = nodal.elements[e].nodes;
+        if (nodes.size() != static_cast<size_t>(stride)) {
+            out.ok = false;
+            out.error = "polymesh: element node count does not match its element type";
+            return false;
+        }
+        int* dst = out.tets.data() + e * static_cast<size_t>(stride);
+        for (int c = 0; c < 4; ++c) dst[c] = static_cast<int>(nodes[static_cast<size_t>(c)]);
+        for (int m = 0; m < stride - 4; ++m)
+            dst[kTet10PolymeshToChudware[m]] =
+                static_cast<int>(nodes[static_cast<size_t>(4 + m)]);
+    }
+
+    out.char_len_mm = h;
+    out.n_nodes = static_cast<int>(nodal.nodes.size());
+    out.n_elems = static_cast<int>(nodal.elements.size());
+    out.nodes_per_elem = stride;
+    out.mesh_type_used = stride == 10 ? "tet10-polymesh" : "tet4-polymesh";
+    append_note(out.note, volume.mesher_note);
+    if (!detail::fill_quality(out)) {
+        out.ok = false;  // fill_quality set the diagnostic
+        return false;
+    }
+    mesh_cache_note_generation();
+    out.ok = true;
+    return true;
+}
+
 }  // namespace
 
 MeshOut mesh_step_polymesh(const std::string& step_path, const MeshOptions& options) {
@@ -115,121 +248,15 @@ MeshOut mesh_step_polymesh(const std::string& step_path, const MeshOptions& opti
     init_polymesh_runtime();
 
     try {
-        pm::pipeline::Model model = pm::pipeline::Model::load(step_path);
-        if (model.surface.vertices.empty() || model.surface.triangles.empty()) {
+        LoadedModel loaded;
+        if (!load_model(step_path, options, loaded, out.error)) {
             out.ok = false;
-            out.error = "polymesh: STEP produced no tessellated surface to fill";
             return out;
         }
-
-        // Size the mesh with Chudware's shared brain, not polymesh's resolve_mesh_size, so
-        // one fineness setting means one element size across backends AND the host-memory
-        // governor still applies. resolve_size_band needs the OCC shape; polymesh already
-        // holds it behind CadModel::shape_handle().
-        SizeBand band;
-        if (model.cad && model.cad->shape_handle() != nullptr) {
-            const TopoDS_Shape& shape =
-                *static_cast<const TopoDS_Shape*>(model.cad->shape_handle());
-            band = resolve_size_band(shape, options);
-        }
-        if (!band.ok) {
-            out.ok = false;
-            out.error = band.error.empty()
-                            ? "polymesh: could not resolve element sizing from the STEP"
-                            : band.error;
-            return out;
-        }
-        append_note(out.note, band.note);
+        append_note(out.note, loaded.band.note);
         append_note(out.note, inapplicable_options_note(options));
-
-        // Ceilings: polymesh refuses rather than thrashing when a fill would exceed them.
-        // resolve_size_band has already applied the governor to `base`, so pass polymesh's
-        // own defaults as a backstop only.
-        const pm::pipeline::ResolvedMeshSize resolved =
-            pm::pipeline::resolve_mesh_size(model, band.base);
-
-        // kGradedTet: pure tets (the fixed-stride contract every Chudware solver assumes)
-        // with a refined boundary skin, which is the closest polymesh family to what the
-        // Netgen path delivers. The hybrid/VEM families emit hex/prism/pyramid/polyhedral
-        // cells that MeshOut cannot express, so they are deliberately not selectable here.
-        const pm::pipeline::VolumeMeshOutput volume = pm::pipeline::volume_mesh(
-            model, band.base, pm::pipeline::VolumeMesher::kGradedTet,
-            /*skin_layers=*/2, /*feature_refine=*/true, /*refine_seeds=*/{},
-            /*seed_band=*/0.0, /*element_tendency=*/0.0, resolved.element_ceiling,
-            resolved.dof_ceiling);
-
-        pm::fea::NodalMesh mesh = volume.mesh;
-        if (options.order == 2) {
-            mesh = pm::fea::promote_to_quadratic(mesh);
-            // Straight-edge mids are a poor approximation on a fillet or a bore. Project
-            // the free-surface mids onto the exact BRep, exactly as the Netgen second-order
-            // path does with Ng_OCC_Generate_SecondOrder.
-            if (model.cad) {
-                std::vector<pm::mesh::BoundarySupport> provenance;
-                pm::mesh::BoundaryProjectionContext projection;
-                if (pm::pipeline::make_boundary_projection(*model.cad, band.base, &projection,
-                                                           &provenance)) {
-                    pm::pipeline::project_quadratic_boundary_mids(mesh, *model.cad, &projection,
-                                                                  band.base);
-                }
-            }
-        }
-        mesh.compact_unused_nodes();
-
-        const int stride = options.order == 2 ? 10 : 4;
-        const pm::fea::ElementType want =
-            options.order == 2 ? pm::fea::ElementType::kTet10 : pm::fea::ElementType::kTet4;
-        // A mixed cell here would be silently misread as a tet by every downstream reader
-        // (they index a flat array by a constant stride), so refuse instead of truncating.
-        for (const pm::fea::NodalElement& element : mesh.elements) {
-            if (element.type != want) {
-                out.ok = false;
-                out.error = std::string("polymesh: mesh contains a ") +
-                            pm::fea::element_type_name(element.type) +
-                            " element, but Chudware's mesh contract carries a single "
-                            "element type (tet4/tet10) — this geometry needs the Netgen "
-                            "backend";
-                return out;
-            }
-        }
-        if (mesh.nodes.empty() || mesh.elements.empty()) {
-            out.ok = false;
-            out.error = "polymesh: fill produced an empty mesh (geometry not watertight?)";
-            return out;
-        }
-
-        out.points.resize(mesh.nodes.size() * 3);
-        for (size_t i = 0; i < mesh.nodes.size(); ++i) {
-            out.points[3 * i + 0] = mesh.nodes[i].x();
-            out.points[3 * i + 1] = mesh.nodes[i].y();
-            out.points[3 * i + 2] = mesh.nodes[i].z();
-        }
-        out.tets.resize(mesh.elements.size() * static_cast<size_t>(stride));
-        for (size_t e = 0; e < mesh.elements.size(); ++e) {
-            const std::vector<uint32_t>& nodes = mesh.elements[e].nodes;
-            if (nodes.size() != static_cast<size_t>(stride)) {
-                out.ok = false;
-                out.error = "polymesh: element node count does not match its element type";
-                return out;
-            }
-            int* dst = out.tets.data() + e * static_cast<size_t>(stride);
-            for (int c = 0; c < 4; ++c) dst[c] = static_cast<int>(nodes[static_cast<size_t>(c)]);
-            for (int m = 0; m < stride - 4; ++m)
-                dst[kTet10PolymeshToChudware[m]] = static_cast<int>(nodes[static_cast<size_t>(4 + m)]);
-        }
-
-        out.char_len_mm = band.base;
-        out.n_nodes = static_cast<int>(mesh.nodes.size());
-        out.n_elems = static_cast<int>(mesh.elements.size());
-        out.nodes_per_elem = stride;
-        out.mesh_type_used = stride == 10 ? "tet10-polymesh" : "tet4-polymesh";
-        append_note(out.note, volume.mesher_note);
-        if (!detail::fill_quality(out)) {
-            out.ok = false;  // fill_quality set the diagnostic
-            return out;
-        }
-        mesh_cache_note_generation();
-        out.ok = true;
+        pm::fea::NodalMesh nodal;
+        build_mesh(loaded, options, loaded.band.base, {}, nodal, out);
         return out;
     } catch (const std::exception& e) {
         out.ok = false;
@@ -239,6 +266,157 @@ MeshOut mesh_step_polymesh(const std::string& step_path, const MeshOptions& opti
         out.ok = false;
         out.error = "polymesh mesher failed with an unknown exception";
         return out;
+    }
+}
+
+// ── Adaptive driver ─────────────────────────────────────────────────────────────────
+
+struct PolymeshAdaptiveMesher::Impl {
+    LoadedModel loaded;
+    MeshOptions options;
+    double h = 0.0;        // coarse background element size, mm (never rises)
+    double h_fine = 0.0;   // target size inside the marked region, mm (shrinks per pass)
+    pm::mesh::SizeFieldFn size_field;  // empty on the first pass = uniform h
+    pm::fea::NodalMesh nodal;          // the mesh the last mesh() returned
+};
+
+PolymeshAdaptiveMesher::PolymeshAdaptiveMesher(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+PolymeshAdaptiveMesher::~PolymeshAdaptiveMesher() = default;
+
+std::unique_ptr<PolymeshAdaptiveMesher> PolymeshAdaptiveMesher::open(
+    const std::string& step_path, const MeshOptions& options, std::string& error) {
+    if (!validate_mesh_options(options, error)) return nullptr;
+    init_polymesh_runtime();
+    try {
+        auto impl = std::make_unique<Impl>();
+        impl->options = options;
+        if (!load_model(step_path, options, impl->loaded, error)) return nullptr;
+        impl->h = impl->loaded.band.base;
+        impl->h_fine = impl->loaded.band.base;
+        return std::unique_ptr<PolymeshAdaptiveMesher>(
+            new PolymeshAdaptiveMesher(std::move(impl)));
+    } catch (const std::exception& e) {
+        error = std::string("polymesh adaptive open failed: ") + e.what();
+        return nullptr;
+    } catch (...) {
+        error = "polymesh adaptive open failed with an unknown exception";
+        return nullptr;
+    }
+}
+
+// The background element size, mm — the number that actually moves as the loop adapts
+// (see refine() for why the background size, and not a purely local field, is the lever).
+double PolymeshAdaptiveMesher::element_size_mm() const { return impl_->h; }
+
+bool PolymeshAdaptiveMesher::mesh(MeshOut& out, std::string& error) {
+    try {
+        out = MeshOut();
+        append_note(out.note, impl_->loaded.band.note);
+        if (!build_mesh(impl_->loaded, impl_->options, impl_->h, impl_->size_field,
+                        impl_->nodal, out)) {
+            error = out.error;
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        error = std::string("polymesh adaptive mesh failed: ") + e.what();
+        return false;
+    } catch (...) {
+        error = "polymesh adaptive mesh failed with an unknown exception";
+        return false;
+    }
+}
+
+bool PolymeshAdaptiveMesher::estimate_error(const std::vector<double>& disp_mm, double e_mpa,
+                                            double nu, std::vector<double>& element_eta,
+                                            double& global_eta, std::string& error) {
+    if (impl_->nodal.nodes.empty()) {
+        error = "polymesh adaptive: estimate_error called before mesh()";
+        return false;
+    }
+    if (disp_mm.size() != impl_->nodal.nodes.size() * 3) {
+        error = "polymesh adaptive: displacement length does not match the current mesh";
+        return false;
+    }
+    try {
+        // Unit consistency: coordinates mm, displacement mm, E in MPa (= N/mm^2). The
+        // recovered stresses are then MPa, and global_eta is a dimensionless relative
+        // indicator, so no scaling is needed anywhere in this call.
+        const pm::fea::Material material{e_mpa, nu};
+        Eigen::VectorXd u(static_cast<Eigen::Index>(disp_mm.size()));
+        for (size_t i = 0; i < disp_mm.size(); ++i) u[static_cast<Eigen::Index>(i)] = disp_mm[i];
+        const pm::fea::ZzRecovery zz = pm::fea::recover_zz(impl_->nodal, material, u);
+        element_eta = zz.element_eta;
+        global_eta = zz.global_eta;
+        return true;
+    } catch (const std::exception& e) {
+        error = std::string("polymesh error recovery failed: ") + e.what();
+        return false;
+    } catch (...) {
+        error = "polymesh error recovery failed with an unknown exception";
+        return false;
+    }
+}
+
+bool PolymeshAdaptiveMesher::refine(const std::vector<double>& element_eta, std::string& note,
+                                    std::string& error) {
+    if (element_eta.size() != impl_->nodal.elements.size()) {
+        error = "polymesh adaptive: error field length does not match the current mesh";
+        return false;
+    }
+    try {
+        std::vector<Eigen::Vector3d> centroids;
+        centroids.reserve(impl_->nodal.elements.size());
+        for (const pm::fea::NodalElement& element : impl_->nodal.elements) {
+            Eigen::Vector3d c = Eigen::Vector3d::Zero();
+            for (uint32_t n : element.nodes) c += impl_->nodal.nodes[n];
+            centroids.push_back(c / static_cast<double>(element.nodes.size()));
+        }
+        // Dorfler marking at theta=0.3: the smallest set of elements carrying 30% of the
+        // total error — on a stress concentration, a few percent of the mesh.
+        const std::vector<Eigen::Vector3d> marks =
+            pm::adapt::marked_centroids(centroids, element_eta, /*theta=*/0.3);
+        if (marks.empty()) {
+            note = "no elements marked for refinement";
+            return false;
+        }
+
+        // WHAT ACTUALLY REFINES, and why it is not pure local refinement.
+        //
+        // polymesh's graded tet fill is a three-level lattice: a background cell at h, and
+        // local children at h/2 (L1) and h/4 (L2). A size field only decides WHERE those
+        // children go — it cannot ask for anything below h/4, and on a part that is mostly
+        // boundary skin (any plate, bracket or shell) the fill is already at L2 everywhere,
+        // so a field alone changes nothing at all. Measured on a 120x60x8 plate: identical
+        // 41,515 elements whether the field asked for 4.87 mm or 1.96 mm.
+        //
+        // So the background size is the lever that guarantees progress, and the size field
+        // rides along to bias the child cells toward the marked region. Each pass is
+        // therefore "a finer mesh, graded toward the error", not "more elements only at the
+        // error" — the honest description of what this mesher can deliver.
+        const double h_floor = impl_->loaded.band.base * 0.35;
+        const double next_h = std::max(impl_->h * 0.7, h_floor);
+        if (next_h >= impl_->h * 0.98) {
+            note = "element-size floor reached (" + std::to_string(h_floor) + " mm)";
+            return false;
+        }
+        impl_->h = next_h;
+        impl_->h_fine = next_h / 4.0;  // the finest the lattice can place (L2)
+        const std::vector<pm::adapt::SizeSource> sources =
+            pm::adapt::point_size_sources(marks, impl_->h_fine);
+        // beta = 1.0: the requested size may grow at most 1 mm per mm away from a mark,
+        // the standard gradient limit, which keeps the fine/coarse transition free of
+        // slivers without a separate smoothing pass.
+        impl_->size_field = pm::adapt::size_field_from_sources(sources, impl_->h_fine,
+                                                               impl_->h, /*beta=*/1.0);
+        return true;
+    } catch (const std::exception& e) {
+        error = std::string("polymesh refinement failed: ") + e.what();
+        return false;
+    } catch (...) {
+        error = "polymesh refinement failed with an unknown exception";
+        return false;
     }
 }
 

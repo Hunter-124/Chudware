@@ -47,6 +47,27 @@ _N_MODES_SPELLINGS: dict[str, str] = {
     "numofmodes": "nmodes",
 }
 
+
+# Model-facing spellings of the FEA mesher selector. Like `_N_MODES_SPELLINGS`, this
+# table maps only names denoting the SAME semantic slot; unlike `mesh_size_mm`, none
+# carries a quantity or unit that would be lost by reconciliation.
+_MESHER_BACKEND_SPELLINGS: dict[str, str] = {
+    "mesher": "mesherbackend",
+    "meshbackend": "mesherbackend",
+    "meshingbackend": "mesherbackend",
+    "backend": "mesherbackend",
+}
+
+_MESHER_BACKEND_VALUES: dict[str, str] = {
+    "netgen": "netgen",
+    "nglib": "netgen",
+    "polymesh": "polymesh",
+    "poly": "polymesh",
+    "polyhedral": "polymesh",
+    "polyhedralfea": "polymesh",
+}
+
+
 # Synonyms that are only unambiguous for ONE tool. "type" is far too generic
 # to map globally, but export_part(fmt, path, doc_id) has no other parameter
 # a str `type=` could mean. Every entry below was added only after READING the
@@ -151,6 +172,11 @@ TOOL_ARG_SYNONYMS: dict[str, dict[str, str]] = {
     "run_fea_frequency_response": _N_MODES_SPELLINGS,
     # run_fea_buckling(fixtures, load, material, n_modes=4, doc_id) — cad_sim_tools.py:1327.
     "run_fea_buckling": _N_MODES_SPELLINGS,
+    "run_fea_static": _MESHER_BACKEND_SPELLINGS,
+    "run_fea_fatigue": _MESHER_BACKEND_SPELLINGS,
+    "run_fea_thermal": _MESHER_BACKEND_SPELLINGS,
+    "sim_run": _MESHER_BACKEND_SPELLINGS,
+
     # make_drawing(doc_id, views, sections, sheet, hole_callouts, model_items, title,
     # source_doc, template) — cad_drawing_tools.py:407, signature read 2026-07-29 AFTER
     # DrawingArgAliases removed the **kwargs that had made this tool varkw (a varkw tool
@@ -197,6 +223,10 @@ TOOL_ARG_SYNONYMS: dict[str, dict[str, str]] = {
         "type": "fmt",
     },
 }
+
+# The mode-count table remains identity-shared by the three solvers. Mesher spellings
+# are added only when resolving the modal tool, because its siblings have no such slot.
+
 
 # Argument names that are PURELY a human-readable label: they name the call for
 # a reader and can never change what the tool computes. When a model adds one
@@ -279,8 +309,9 @@ def synonyms_for(tool: str) -> dict[str, str]:
     """The global synonym table plus *tool*'s own overrides, merged."""
     merged = dict(ARG_SYNONYMS)
     merged.update(TOOL_ARG_SYNONYMS.get(tool) or {})
+    if tool == "run_fea_modal":
+        merged.update(_MESHER_BACKEND_SPELLINGS)
     return merged
-
 
 def norm_arg(name: str) -> str:
     """Fold an argument name for matching: case/underscore/dash/space are noise."""
@@ -335,19 +366,16 @@ def annotation_admits(ann: str, value: Any) -> bool:
 
 
 def bind_value(target: str, ann: str, value: Any) -> Any:
-    """The value that should actually be bound to *target*.
+    """Return the value that should actually be bound to *target*.
 
-    One case only: a ``*_json`` parameter annotated ``str`` is a JSON DOCUMENT
-    slot, and a model that already has the document in structured form sends
-    the list/dict itself (live 2026-07-29: ``apply_ascii_edits(edits=[{...}])``).
-    Renaming alone is not enough — the agent path would hand a list to a str
-    parameter and the MCP path's pydantic model would reject it outright
-    ("edits_json: Input should be a valid string"). Serialising here gives both
-    paths exactly what the signature declares.
-
-    Everything else is returned untouched: this is a spelling/encoding fix, not
-    a type coercion layer.
+    JSON-document parameters accept decoded model output. The mesher selector also
+    canonicalizes a closed set of names for the same two backends; an unknown value
+    remains untouched so the tool's own validator refuses it with the legal vocabulary.
     """
+    if norm_arg(target) == "mesherbackend" and isinstance(value, str):
+        canonical = _MESHER_BACKEND_VALUES.get(norm_arg(value))
+        if canonical is not None:
+            return canonical
     if isinstance(value, (list, dict)) and str(target).endswith("_json"):
         a = str(ann or "").lower()
         if ("str" in a or "string" in a) and "dict" not in a and "list" not in a:

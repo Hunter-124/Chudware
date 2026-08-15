@@ -10181,10 +10181,10 @@ _ARTIFACT_PRODUCT_GATES: tuple[tuple[frozenset, str], ...] = (
      "no toolpath exists — cam_generate/cam_post never ran. A CAM role cannot "
      "declare done off ledger/read calls alone: cam_generate, then cam_simulate "
      "and cam_post."),
-    (frozenset({"run_fea_static", "run_fea_modal", "run_cfd_flow"}),
-     "no study was run — run_fea_static/run_fea_modal/run_cfd_flow never ran. A "
-     "simulation role cannot declare done off ledger/read calls alone: run the "
-     "study, then describe_results."),
+    (frozenset({"run_fea_static", "run_fea_adaptive", "run_fea_modal", "run_cfd_flow"}),
+     "no study was run — run_fea_static/run_fea_adaptive/run_fea_modal/run_cfd_flow "
+     "never ran. A simulation role cannot declare done off ledger/read calls alone: "
+     "run the study, then describe_results."),
     (frozenset({"make_drawing", "export_drawing"}),
      "no drawing sheet exists — make_drawing/export_drawing never ran. A drawing "
      "role cannot declare done off ledger/read calls alone: make_drawing, place "
@@ -10199,7 +10199,7 @@ _DELIVERED_PRODUCT_TOOLS: frozenset[str] = frozenset({
     "add_features", "edit_feature", "export_part",
     "board_from_schematic", "ecad_run_drc", "ecad_make_board", "fw_build",
     "cam_generate", "cam_post", "make_drawing", "export_drawing",
-    "run_fea_static", "run_fea_modal", "run_cfd_flow",
+    "run_fea_static", "run_fea_adaptive", "run_fea_modal", "run_cfd_flow",
 })
 
 

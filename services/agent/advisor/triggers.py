@@ -381,7 +381,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 r"flow simulation", r"motion study", r"\b(?:simulation )?mesh quality\b",
             ],
             "tools": [
-                "run_fea_static", "run_fea_modal", "run_fea_fatigue",
+                "run_fea_static", "run_fea_adaptive", "run_fea_modal", "run_fea_fatigue",
                 "run_fea_thermal", "run_fea_buckling", "run_fea_contact",
                 "run_cfd_flow", "run_cfd_accurate", "simulate_motion",
                 "describe_results",

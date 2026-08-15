@@ -381,6 +381,7 @@ triggers:
         - "\\b(?:simulation )?mesh quality\\b"
       tools:
         - run_fea_static
+        - run_fea_adaptive
         - run_fea_modal
         - run_fea_fatigue
         - run_fea_thermal

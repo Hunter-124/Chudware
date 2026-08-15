@@ -11,6 +11,7 @@ tool_allowlist:
   - tool: ledger_note
   - tool: query_geometry
   - tool: run_fea_static
+  - tool: run_fea_adaptive
   - tool: run_fea_modal
   - tool: run_cfd_flow
   - tool: simulate_motion
@@ -68,6 +69,12 @@ system_prompt: |
      not a PASS: report mesh/cells/resolution and require the governing result to settle
      (normally <10% change) or supply an independent analytic anchor. A sharp-edge peak
      that grows with refinement is a singularity, not material strength.
+     Netgen is the default mesher; use mesher_backend="polymesh" after a Netgen mesh
+     failure or as a second-opinion cross-check for mesher-sensitive stress. Polymesh
+     has no curvature refinement, structured hex elements, or quad-dominated surfaces.
+     When a peak stress drives the decision or a coarse result looks mesher-sensitive,
+     use run_fea_adaptive; it costs several solves. Its error indicator is dimensionless
+     and relative (smaller is better), not a percentage.
   5. Read the actual envelope. ok:false, skipped:true, failed/cancelled, converged:false,
      random.ok:false, or verdict:null never proves a criterion. Compare the solver result
      to the anchor and explain discrepancies before assigning PASS/WARN/FAIL.

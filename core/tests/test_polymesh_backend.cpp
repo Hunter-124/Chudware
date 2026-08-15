@@ -19,9 +19,14 @@
 #include <nlohmann/json.hpp>
 
 #include "sim/fea_run.h"
+#include "sim/fea_adaptive.h"
 #include "sim/mesher.h"
 
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <gp_Ax2.hxx>
+#include <gp_Dir.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <STEPControl_Writer.hxx>
 #include <TopoDS_Shape.hxx>
@@ -136,4 +141,107 @@ TEST_CASE("a cantilever reads the same deflection on either mesher") {
     // And the two meshers must agree with EACH OTHER more closely than either agrees
     // with beam theory would allow by luck.
     CHECK(std::abs(d_poly - d_netgen) / delta_eb < 0.30);
+}
+
+namespace {
+// Kirsch plate (mm): a plate in uniaxial tension with a central through-hole. The classic
+// stress concentration, and the classic thing a coarse mesh misses — the peak lives in a
+// band a fraction of the hole radius wide, so a uniform mesh that resolves the plate does
+// not resolve the answer. Exactly the case adaptive refinement exists for.
+constexpr double PL = 120.0, PW = 60.0, PT = 8.0, HOLE_R = 8.0;
+
+std::string write_holed_plate_step() {
+    TopoDS_Shape plate = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), PL, PW, PT).Shape();
+    TopoDS_Shape hole =
+        BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(PL / 2, PW / 2, -1.0), gp_Dir(0, 0, 1)), HOLE_R,
+                                 PT + 2.0)
+            .Shape();
+    TopoDS_Shape cut = BRepAlgoAPI_Cut(plate, hole).Shape();
+    auto p = std::filesystem::temp_directory_path() / "chudware_polymesh_plate.step";
+    STEPControl_Writer wr;
+    REQUIRE(wr.Transfer(cut, STEPControl_AsIs) == IFSelect_RetDone);
+    REQUIRE(wr.Write(p.string().c_str()) == IFSelect_RetDone);
+    return p.string();
+}
+
+json plate_face_samples(double x0) {
+    json pts = json::array();
+    for (int i = 0; i <= 4; ++i)
+        for (int j = 0; j <= 2; ++j) pts.push_back({x0, PW * i / 4.0, PT * j / 2.0});
+    return pts;
+}
+}  // namespace
+
+TEST_CASE("adaptive refinement drives the error down and finds the stress concentration") {
+    if (!mesher_backend_available(MesherBackend::Polymesh)) return;
+    const std::string step = write_holed_plate_step();
+    const double F = 20000.0;  // N, tension along +X
+
+    json study;
+    study["step_path"] = step;
+    study["fineness"] = 0.35;  // deliberately coarse: the adapt loop must earn the answer
+    study["mesh_order"] = 1;
+    study["material"] = {{"E_mpa", 200000.0}, {"nu", 0.3}, {"yield_mpa", 250.0},
+                         {"density_g_cm3", 7.85}};
+    study["fixtures"] =
+        json::array({json{{"points", plate_face_samples(0.0)}, {"tol_mm", 3.0}}});
+    study["loads"] = json::array({json{{"faces", {{"points", plate_face_samples(PL)},
+                                                  {"tol_mm", 3.0}}},
+                                       {"type", "force"},
+                                       {"vector", {F, 0.0, 0.0}}}});
+    study["adapt"] = {{"max_passes", 3}, {"eta_target", 0.02}};
+
+    const json res = fea_run_adaptive(study);
+    REQUIRE_MESSAGE(res.value("ok", false), res.dump().substr(0, 900));
+    REQUIRE(res.contains("adapt"));
+    const json& adapt = res["adapt"];
+    const json& passes = adapt["passes"];
+    REQUIRE(passes.is_array());
+    REQUIRE(passes.size() >= 2);
+
+    // Every pass must be recorded with a real error number and a real mesh behind it.
+    for (const json& p : passes) {
+        CHECK(p["n_elems"].get<int>() > 0);
+        CHECK(p["global_eta"].get<double>() > 0.0);
+        CHECK(std::isfinite(p["global_eta"].get<double>()));
+    }
+
+    const double eta_first = passes.front()["global_eta"].get<double>();
+    const double eta_last = passes.back()["global_eta"].get<double>();
+    const int elems_first = passes.front()["n_elems"].get<int>();
+    const int elems_last = passes.back()["n_elems"].get<int>();
+    const double vm_first = passes.front()["max_von_mises_mpa"].get<double>();
+    const double vm_last = passes.back()["max_von_mises_mpa"].get<double>();
+    MESSAGE("eta " << eta_first << " -> " << eta_last << ", elems " << elems_first << " -> "
+                   << elems_last << ", peak vm " << vm_first << " -> " << vm_last);
+
+    // The point of the loop: error goes DOWN, and it does so by spending elements.
+    CHECK(eta_last < eta_first);
+    CHECK(elems_last > elems_first);
+    // And the refined mesh resolves MORE peak stress than the coarse one did. A coarse
+    // mesh under-reports the concentration, which reads as a safer part than it is.
+    CHECK(vm_last > vm_first);
+
+    // Net-section nominal stress and the Kirsch concentration factor (~3 for a hole small
+    // against the plate; higher here because the hole eats a quarter of the width). The
+    // band is wide because this is a coarse-budget adaptive run, not a converged study —
+    // the assertion is "in the physical ballpark", not "converged to theory".
+    const double nominal = F / ((PW - 2.0 * HOLE_R) * PT);  // MPa
+    MESSAGE("net-section nominal=" << nominal << " MPa, peak=" << vm_last << " MPa");
+    CHECK(vm_last > nominal);           // a concentration exists at all
+    CHECK(vm_last < nominal * 6.0);     // and it is not a singular-corner artifact
+
+    CHECK(adapt["passes_run"].get<int>() == static_cast<int>(passes.size()));
+    CHECK(adapt.contains("stop_reason"));
+    CHECK(adapt["mesher_backend"].get<std::string>() == "polymesh");
+    // An unconverged run must confess in solver_notes, not only in the adapt block.
+    if (!adapt["eta_target_met"].get<bool>()) {
+        const json notes = res.value("solver_notes", json::array());
+        bool warned = false;
+        for (const json& n : notes)
+            if (n.is_string() && n.get<std::string>().find("adaptive refinement stopped") !=
+                                     std::string::npos)
+                warned = true;
+        CHECK(warned);
+    }
 }

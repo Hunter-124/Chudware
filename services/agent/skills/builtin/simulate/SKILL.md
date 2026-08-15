@@ -4,7 +4,7 @@ description: Run FEA, thermal, vibration, CFD, motion, and EM studies with actua
 inject: auto
 triggers:
   keywords: [fea, cfd, simulate, simulation, stress, modal, thermal, vibration, wind tunnel, drag, motion, eigenmode, s-parameter, antenna, contact, load case, strong enough, will this hold, can this hold, factor of safety, deflection, buckling, von mises]
-  tools: [run_fea_static, run_fea_modal, run_fea_fatigue, run_fea_frequency_response, run_fea_thermal, run_fea_buckling, run_fea_contact, run_cfd_flow, run_cfd_accurate, simulate_motion, em_eigenmode, em_driven, em_timedomain, ecad_antenna_design, ecad_antenna_analyze]
+  tools: [run_fea_static, run_fea_adaptive, run_fea_modal, run_fea_fatigue, run_fea_frequency_response, run_fea_thermal, run_fea_buckling, run_fea_contact, run_cfd_flow, run_cfd_accurate, simulate_motion, em_eigenmode, em_driven, em_timedomain, ecad_antenna_design, ecad_antenna_analyze]
   phases: [sim]
 ---
 
@@ -28,6 +28,12 @@ triggers:
 3. Run a cheap discretization, then a finer one with identical setup. Report both
    discretizations and require the governing value to settle (normally <10% change)
    or remain consistent with the independent anchor. One favorable mesh is not PASS.
+   Netgen is the default mesher. Use `mesher_backend="polymesh"` when Netgen fails
+   to mesh, or as a second-opinion cross-check for mesher-sensitive stress; polymesh
+   has no curvature refinement, structured hex elements, or quad-dominated surfaces.
+   When a peak stress drives the decision or a coarse result looks mesher-sensitive,
+   use `run_fea_adaptive`; it costs several solves. Its error indicator is dimensionless
+   and relative (smaller is better), not a percentage.
 4. Read the envelope literally: `ok:false`, `skipped:true`, failed/cancelled,
    `converged:false`, `random.ok:false`, or `verdict:null` proves nothing.
 

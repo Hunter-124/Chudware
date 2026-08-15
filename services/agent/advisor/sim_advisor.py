@@ -1456,6 +1456,47 @@ def postcheck(
         and (mesh_stable or anchor_consistent)
     )
 
+    # Postcheck is the existing post-failure advisory seam. Recommend the robust fallback
+    # only when Netgen failed during meshing; a successful mesh or a solve-stage failure
+    # must not turn into an accuracy claim for another mesher.
+    requested_mesher = str(
+        study.get("mesher_backend") or results.get("mesher_backend") or "netgen"
+    ).strip().lower()
+    failure_stage = str(
+        study.get("failure_stage") or results.get("failure_stage")
+        or study.get("stage") or results.get("stage") or ""
+    ).strip().lower()
+    mesh_failed = (
+        not solver_completed
+        and requested_mesher == "netgen"
+        and failure_stage in ("mesh", "meshing")
+    )
+    if mesh_failed:
+        items.append({
+            "schema": "aicad.advisory/1",
+            "check": "sim_mesh",
+            "severity": "action",
+            "finding": (
+                "Netgen failed during the mesh stage. Retry with "
+                'mesher_backend="polymesh": its graded Cartesian fill often succeeds '
+                "on topology an advancing-front mesh rejects; this is a robustness "
+                "fallback, not an accuracy upgrade."
+            ),
+            "refs": {},
+            "numbers": {},
+            "candidate_fixes": [{
+                "action": "retry_with_polymesh",
+                "params": {"mesher_backend": "polymesh"},
+                "basis": "The Netgen mesh stage failed before a solved result existed.",
+                "predicted_effect": "A robust second meshing attempt on difficult topology.",
+                "confidence": "heuristic",
+            }],
+            "helper_tools": ["run_fea_static", "run_fea_modal", "run_fea_fatigue",
+                             "run_fea_thermal"],
+            "source": {"kind": "heuristic",
+                       "detail": "sim_advisor.postcheck mesh-stage failure"},
+        })
+
     # --- Unit-correct static margin verdict ---
     if vm is not None and yield_mpa is not None:
         allowable_mpa = yield_mpa / sf

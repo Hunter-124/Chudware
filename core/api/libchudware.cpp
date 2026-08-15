@@ -88,6 +88,7 @@
 #include "geom/aicm.h"
 #include "geom/ecad_3d.h"
 #ifdef CHUDWARE_WITH_NETGEN
+#include "sim/fea_adaptive.h"
 #include "sim/fea_fatigue.h"
 #endif
 #include "sim/fea_modal.h"
@@ -2978,6 +2979,17 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 }
             }
             return emit(std::move(res), out_json, 0);
+        }
+        if (m == "sim_run_adaptive") {
+            // Error-driven static solve: mesh, solve, score the discretization error,
+            // refine where the error is, repeat. Params: {"study": {...}} — an ordinary
+            // sim_run_static study (step_path REQUIRED; an inline mesh cannot be refined)
+            // plus an optional "adapt":{max_passes, eta_target}. Returns the final pass's
+            // sim_run_static payload plus "adapt":{passes[], global_eta, eta_target,
+            // eta_target_met, passes_run, stop_reason} and, unlike sim_run_static, an
+            // "overlay_aicm" already built on the FINAL refined mesh.
+            const json& study = params.contains("study") ? params["study"] : json::object();
+            return emit(chudware::sim::fea_run_adaptive(study), out_json, 0);
         }
         if (m == "sim_run_fatigue") {
             // High-cycle fatigue study (Goodman/Gerber/Soderberg + S-N life). Reuses

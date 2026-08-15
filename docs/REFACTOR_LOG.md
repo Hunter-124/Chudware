@@ -7687,3 +7687,22 @@ in what you can actually see. And the agent DAG's "drag to pan" hint was painted
 with no backing, overprinting whatever node card sat in the corner; it gets a washed plate.
 Re-verified after all three: 25/25 scenarios exit 0 with zero icon misses, gui_lint clean,
 check.py 9/9, test_ops 3702 assertions green.
+
+## 2026-08-15 — Polyhedral-FEA second mesher backend
+
+Polyhedral-FEA (`polymesh`, BSD-3) landed as a second FEA mesher behind the existing
+`chudware::sim::MeshOut` contract, with shared sizing in `sim/mesh_size_band.h`, shared quality
+accounting through `detail::fill_quality`, and a clean `algorithm3d` → `mesher_backend`
+cutover. Touched: `core/cmake/ProvisionPolymesh.cmake`,
+`core/sim/polymesh_backend.{h,cpp}`, `core/sim/mesh_size_band.h`,
+`core/sim/mesher.{h,cpp}`, `core/sim/fea_run.cpp`, `core/sim/fea_fatigue.cpp`,
+`core/api/libchudware.cpp`, `core/tests/test_polymesh_backend.cpp`, and
+`core/CMakeLists.txt`. Gotchas for the next contributor: the dependency is pinned by SHA in
+`ProvisionPolymesh.cmake` and is `add_subdirectory`-only with no install/export; its concrete
+libraries are `polymesh_*` with `polymesh::` aliases; it MUST share the host Eigen target
+because Eigen types cross its API and linking two Eigen versions is an ODR violation. The
+tet10 mid-edge slot permutation between the two node orderings is a silent-wrong-answer trap
+guarded only by the cross-backend solve test. Polymesh emits tet4/tet10 only; its hybrid/VEM
+element families cannot fit `MeshOut`'s fixed-stride connectivity. Verification: core ctest
+101/101; cantilever analytic tip deflection 0.2000 mm, Netgen 0.19270 mm, polymesh
+0.19068 mm.

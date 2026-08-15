@@ -7560,3 +7560,60 @@ One item remains open and it is not mine to close: the E4-E6 hardware pilot. Phy
 refused by name (`mfg_physical_execute_not_qualified`), the device allowlist denies by default, and
 `mfg_run_resume` has no success path — so nothing can reach a machine until an operator deliberately
 commissions one.
+
+## 2026-08-14 — the version graph, and an OCCT crash that took the daemon with it
+
+Two efforts. **(1) A real version graph.** The vault has always been a git DAG that
+`gitbind.log()` read as a line (`parents[0]` only), so every commit reachable only through
+a merge's second parent was invisible in `plm_history`, `plm_overview` and `plm_compare` —
+merged-in work looked merged away. Added `gitbind.log_dag()` (Kahn walk over child→parent
+edges from every branch tip, HEAD and version ref; newest-first AND topologically
+consistent, so a renderer assigns lanes in one forward pass), a `refs/aicad/versions/<name>`
+namespace with `services/plm/versions.py` for named versions (the Onshape V1/V2 noun), a
+real `merge` entry kind (merges were stamped `checkpoint` and thus indistinguishable),
+compare-and-swap on merge commits, branch ahead/behind topology, and `Vault.version_graph()`
+decorating nodes with `parents`/`refs`/`release`/`pin`. Three additive RPCs
+(`plm_version_graph`, `plm_version_tag`, `plm_version_list`) and `contracts/plm.md`
+Appendix C record the surface, since §1 said "linear in v1" and §7 said "do not implement
+plm_branch/plm_merge" while `branches.py` and the overview panel had already shipped both.
+`plm_history` deliberately keeps its first-parent walk — Appendix B.6's per-item semantics
+depend on it. GUI: a new `host/src/ui/plm/versions_tab.cpp` Versions page replacing History
+on the rail (`plmDrawHistoryPage` stays for the Files page), deterministic git-graph lanes on
+the force-graph's ImDrawList/camera/label-culling patterns, per-kind glyphs, branch and V*n*
+chips, and an inspector with tag/restore/checkpoint/branch/merge, "Show changes" and
+agent micro-history. Two things beat Onshape: any-two-commit compare (ctrl-click), and AI-VC
+agent checkpoints with provenance.
+
+Verifying against a REAL vault rather than the code found seven defects the compiling page
+hid: the two-commit release pair drew twice (the pin is now folded into its release,
+inheriting its decorations and re-parenting its children); "Show changes" reported "that item
+is not present at one of those points" on a good commit because `plm_compare` is per-ITEM
+(now unioned over the project's items, not-present treated as untouched); "AI activity" was
+permanently empty because it sent `plm_timeline` a `commit` it does not accept and read keys
+it never returns; a tip chipped "main main"; the legend advertised a Release-candidate state
+this tree can never produce; left-drag panned AND selected; and 400 nodes drew every frame.
+Two were NOT in the new code at all: `summarize.py` emitted a Unicode arrow the UI font
+renders as `?`, and the rebrand from `aicad-plm-*` to `chudware-plm-*` renamed the trailer
+READERS, so on any pre-rebrand vault kind/scope silently fell back to defaults (a release
+read as `auto`, a planning commit polluted the design timeline) and every message leaked its
+raw trailers — 6 of 6 messages on the dogfood vault, and 1 of 6 mis-scoped. Readers now take
+both spellings. Also: the first-run onboarding wizard opened over every `CHUDWARE_SHOT`
+capture, so headless shots were verifying the sign-in step instead of the surface under test.
+
+**(2) T-BL61 — a fillet SIGSEGV killed hostd.** OCCT's corner resolver does not throw; it
+dereferences into `Geom2dAdaptor_Curve::D0` and segfaults, so `blend_drop_failing`'s
+`catch (Standard_Failure&)` was structurally unable to contain it. Blend builds now run in a
+bounded forked child (`core/util/process_isolation.*`) that serializes its result with
+`BinTools`; a signal, non-zero exit, unreadable payload or timeout becomes the same
+"unbuildable edge set" the bisect already handled, so `n_dropped` and "round what you can"
+are unchanged. A timeout is a failure, not a retry, because `fork()` in a multithreaded
+daemon can deadlock the child on a malloc lock. Both the explicit-edge and the whole-body
+overloads are isolated. Cost: +0.6 ms on a successful 12-edge fillet (3.88 → 4.47 ms median),
++0.4 ms on the 113 ms partial-drop path; one child per build attempt, never per edge.
+**Deferred, honestly:** a 94-case convergent-blend sweep (`scratch/fillet_fuzz.cpp`) produced
+ZERO signals, so the card's first DoD box stays unchecked and T-BL61 is `review`, not `done` —
+containment is proved by fault injection (`CHUDWARE_TEST_BLEND_SIGSEGV`), which the card
+permits. Closing it needs the real captured document, i.e. agent bracket builds re-run with
+the run journal on. Also noticed and NOT touched: this repo's own tracked `.aicadvault/`
+(2463 files, committed at e4a1a607) accumulates local object churn from any run that treats
+the repo root as a project — that is a repo-hygiene decision for Hunter, not a code fix.

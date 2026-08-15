@@ -3,7 +3,7 @@ id: T-BL61
 title: Fillet on a compiled document SIGSEGVs hostd — OCCT PerformFilletOnVertex kills the daemon
 workstream: backlog
 owner: unassigned
-status: todo
+status: review
 branch: task/T-BL61-fillet-segv
 depends_on: []
 lane: modeling-core
@@ -81,9 +81,36 @@ crash itself is not in doubt; its trigger geometry is.
 ## Definition of done
 
 - [ ] A deterministic reproducer exists (test or script) that killed hostd before the fix.
-- [ ] The same input no longer terminates the daemon; it returns a failed-feature envelope.
-- [ ] Other documents open in the same engine survive the event.
-- [ ] `cd core/build-occt-linux && ninja && ctest -j4` green.
+- [x] The same input no longer terminates the daemon; it returns a failed-feature envelope.
+- [x] Other documents open in the same engine survive the event.
+- [x] `cd core/build-occt-linux && ninja && ctest -j4` green.
+
+## Outcome (2026-08-14) — contained, reproducer still unfound
+
+Step 2's **fault isolation** option is implemented (`core/util/process_isolation.*`,
+wired into `core/geom/dress.cpp`). Every blend build attempt — the explicit-edge
+drop-failing path AND the two whole-body overloads — runs in a bounded forked
+child that serializes its result with `BinTools`; the parent maps a signal, a
+non-zero exit, an unreadable payload or a timeout onto the same "this edge set is
+unbuildable" answer the bisect already handled, so `n_dropped` and "round what you
+can" are unchanged. A timeout is a failure rather than a retry because `fork()` in
+a multithreaded daemon can deadlock the child on a malloc lock held at fork time.
+`CHUDWARE_BLEND_ISOLATION=0` restores the in-process path; non-POSIX compiles to
+in-process. Measured overhead on a successful 12-edge box fillet: 3.88 → 4.47 ms
+median (+0.6 ms); +0.4 ms on the 113 ms partial-drop path. This covers the NEXT
+unknown OCCT crash too, which pre-flight rejection would not have.
+
+**Step 1 (capture the trigger) is still open.** A 94-case sweep
+(`scratch/fillet_fuzz.cpp`, matrix in `scratch/fillet_fuzz_matrix.txt`) over
+fillet-into-bore, fillet-into-fillet, chamfer/fillet on a shared vertex, 3- and
+4-way corners, pre-blended corners, wedges, boss fillets, tangent-continuous
+pairs, variable-radius fillets, two-distance chamfers, 0.2 mm walls, near-tangent
+faces and sub-0.05 mm edges produced **zero** signalled cases with isolation off.
+So the first DoD box stays unchecked: containment is proved by fault injection
+(`CHUDWARE_TEST_BLEND_SIGSEGV`, regression case in `core/tests/test_ops.cpp`),
+which is what this card explicitly permits, not by the original geometry. Closing
+it needs the real captured document — re-run agent bracket builds with the run
+journal on so `add_features` args survive the daemon.
 
 ## AI hints
 
@@ -94,3 +121,5 @@ crash itself is not in doubt; its trigger geometry is.
   fault is inside OCCT's fillet builder, not in our indexing.
 - Do not "fix" this by widening the `catch` in `blend_drop_failing` — a signal is
   not an exception, and a wider catch will look like a fix while changing nothing.
+- The isolation utility is the containment seam: put any NEW crash-prone OCCT
+  builder behind `chudware::util::isolate_shape_build` rather than a `catch`.

@@ -145,3 +145,7 @@ repomix-output.*
 # Cloudflare wrangler local state (tmp/ + cache/) for the public site — regenerated
 # on every build, never source.
 Webservice/public-site/.wrangler/
+
+# Convenience symlink for the Kimi CLI harness: it points at .claude/skills, and a
+# committed symlink does not survive a Windows checkout (portable_paths_audit).
+.kimi-code/

@@ -874,6 +874,14 @@ struct AppState {
     bool wantEquations = false;   // CHUDWARE_SHOT=equations: open the Equations editor + seed two globals
     bool equationsShotDone = false; // guard so the equations seed runs exactly once
     bool wantPartsShot = false;   // CHUDWARE_SHOT=parts: Parts Library with a seeded no-model result (RE-32)
+    // CHUDWARE_SHOT=*: the workspace the scenario selected, re-asserted every frame while
+    // the capture runs. Startup doc restore calls activateTab, which pulls any workspace
+    // that cannot host a 3D part back to Model (core/doc_tabs.cpp) — so a full-body
+    // workspace scenario captured the modelling tab and "passed" while verifying nothing.
+    // That race was hand-patched three times (parts, reveng, PLM) and still bit ECAD, the
+    // AI workspace and Drawing; this pin replaces the special cases. -1 = unpinned (the
+    // `workspaces` cycle scenario, which changes workspace deliberately).
+    int shotWorkspacePin = -1;
 
     // ---- Wave N: AI-ECAD document (worker ecad_* RPCs; the editor mirror lives in ecad_panel.cpp) ----
     std::string ecadDocId;          // open ECAD doc id ("" = none)

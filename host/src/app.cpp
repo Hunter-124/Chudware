@@ -2984,6 +2984,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.showPcbTools = true;
     st.showRibbon = true;
     st.ribbonTab = AppState::RT_PCB;
+    // The scenario used to set only the ribbon tab, so the capture stayed on the Model
+    // workspace and the ECAD shot verified the modelling tab with a PCB ribbon.
+    st.activeWorkspace = AppState::Workspace::Electronics;
   } // PCB tab forward
   st.wantSketch = shot && shotMode &&
                   std::strcmp(shotMode, "sketch") == 0; // C18 sketch flow
@@ -3025,6 +3028,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   if (st.wantDrawing) {
     st.showRibbon = true;
     st.showFeatureTree = true;
+    // Same omission as the ECAD scenario: without this the sheet renders inside the Model
+    // workspace, so the Drawing workspace's own chrome was never in the capture.
+    st.activeWorkspace = AppState::Workspace::Drawing;
   }
   st.wantEvalMass = shot && shotMode &&
                     std::strcmp(shotMode, "evalmass") == 0; // C19 mass props
@@ -3153,18 +3159,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     seedRevengCanned("re_canned_done", "Bracket scan (canned)", "done", 12);
     ui::reveng::S().stage = ui::reveng::Stage::Deliver;
   }
-  // RE-40: pin the RE workspace for the whole reveng_* shot family.
-  //
-  // Setting st.activeWorkspace above is NOT enough: startup doc restore runs
-  // activateTab afterwards, and that pulls any workspace which cannot host a 3D
-  // part back to Model (core/doc_tabs.cpp). The parts shot already worked around
-  // this with st.wantPartsShot (see the re-assert near the top of the frame
-  // loop); every reveng_* shot silently lost the same race and captured the
-  // Model workspace instead of the tab under test — so these scenarios were
-  // reporting exit 0 while verifying nothing. Re-assert until the RE body has
-  // actually drawn a frame.
-  const bool wantRevengShot =
-      shot && shotMode && std::strncmp(shotMode, "reveng", 6) == 0;
+  // RE-40 note: the reveng_* family used to need its own workspace re-assert here. The
+  // generic shot pin below (AppState::shotWorkspacePin) now covers every scenario.
   // CHUDWARE_SHOT=parts: open the Parts Library workspace with a synthetic
   // no-model result row so the "Generate 3D model" action (RE-32) is visible in
   // the shot.
@@ -3209,6 +3205,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       st.plmProjectDir = ec ? std::string(".") : cwd.string();
     }
   }
+  // Pin whatever workspace the scenario just selected (see AppState::shotWorkspacePin).
+  // The `workspaces` scenario cycles all of them on purpose, so it stays unpinned.
+  if (shot && !st.wantWorkspace)
+    st.shotWorkspacePin = (int)st.activeWorkspace;
   // C20b: assembly shot — author base/peg parts, new assembly, insert + mate +
   // interference.
   st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
@@ -6116,22 +6116,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // pane and viewport in favour of their own full-screen layout; the docked
     // Copilot column is always drawn so it stays available in non-AI workspaces
     // exactly as today.
-    // CHUDWARE_SHOT=parts: the scenario selects the Parts Library workspace before the
-    // frame loop, but startup doc restore runs activateTab, which pulls any workspace
-    // that can't host a 3D part back to Model (core/doc_tabs.cpp) — so the scenario
-    // never reached its own workspace and the capture silently showed Model instead.
-    // Re-assert it until the parts body actually draws (it clears wantPartsShot on its
-    // first frame, so this self-terminates).
-    if (st.wantPartsShot) st.activeWorkspace = AppState::Workspace::PartsLibrary;
-    // RE-40: same race, same fix, for the reveng_* shot family. Unconditional
-    // for the whole run: the RE workspace is full-body and hosts no 3D part, so
-    // any later activateTab would yank it back to Model mid-capture too.
-    if (wantRevengShot) st.activeWorkspace = AppState::Workspace::ReverseEng;
-    // Same race, same fix, for the CHUDWARE_SHOT=git PLM shot family. A project
-    // folder with documents restores them at startup, and that activateTab pulls
-    // the full-body PLM workspace back to Model — so the capture silently showed
-    // the modelling tab and the scenario "passed" while verifying nothing.
-    if (wantPlmShot) st.activeWorkspace = AppState::Workspace::PLM;
+    // Every CHUDWARE_SHOT scenario re-asserts its own workspace here: startup doc restore
+    // runs activateTab, which pulls any workspace that cannot host a 3D part back to Model
+    // (core/doc_tabs.cpp), so a full-body scenario captured the modelling tab and "passed"
+    // while verifying nothing. This was hand-patched for parts, then reveng, then PLM, and
+    // still bit ECAD, the AI workspace and Drawing — three scenarios exiting 0 having
+    // photographed the wrong surface. One pin covers the class (AppState::shotWorkspacePin).
+    if (st.shotWorkspacePin >= 0)
+      st.activeWorkspace = (AppState::Workspace)st.shotWorkspacePin;
 
     using WS = AppState::Workspace;
     const WS ws = st.activeWorkspace;

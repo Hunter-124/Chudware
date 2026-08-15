@@ -645,3 +645,58 @@ commit that actually made the change) and emitted pre-creation entries, so a
 consumer diffing adjacent entries could hit `invalid_item` / "that item is not
 present at one of those points". Project-wide history (no `item_id`) is
 unaffected: it still returns one entry per scope-matching commit.
+
+## Appendix C — the version graph (additive, 2026-08)
+
+§1 called the vault history "the git commit DAG (**linear in v1**)" and §7 reserved
+`plm_branch`/`plm_merge` as *do not implement*. Reality diverged: `services/plm/branches.py`
+writes genuine two-parent merge commits into `refs/aicad/branches/<name>`, and the GUI has
+exposed branch create/switch/merge from the PLM overview panel since T-R7. This appendix
+records the surface that already exists and the additive reader/decoration layer built on
+top of it. It changes no existing signature and no existing response key.
+
+**C.1 The store was a DAG that was READ as a line.** `gitbind.log()` follows `parents[0]`
+only, so every commit reachable only through a merge's SECOND parent was absent from
+`plm_history`, `plm_overview` and `plm_compare` — merged-in work was invisible, not merged
+away. `plm_history` keeps its first-parent walk (its per-item creation-anchored semantics in
+B.6 depend on it); the full topology is exposed by the new reader below.
+
+**C.2 Named versions — `refs/aicad/versions/<name>`.** A new ref namespace, plus the side
+table `.aicadvault/versions/meta.json` `{versions:{<name>:{name,commit,created_at,author,message}}}`.
+A named version is an immutable label on a commit — the Onshape "V1/V2" noun. It is NOT a
+lifecycle state: item lifecycle remains exactly `In work → Released → Superseded` (§5), and
+releases are still discovered from `manifest.items[].released_revs[].commit`.
+
+**C.3 New history entry kind `merge`.** `ENTRY_KINDS` gains `merge`; merge commits are
+stamped `chudware-plm-kind: merge` instead of masquerading as checkpoints. Consumers that
+switch on entry kind MUST treat an unknown kind as `auto` rather than failing.
+
+**C.4 Release pin trailer `chudware-plm-pin: 1`.** A release is two commits (the release
+itself, then the `manifest.json` back-fill that pins the rev to its commit, §5). The
+back-fill now carries this trailer so a renderer can collapse the pair into one node. Legacy
+vaults with no trailer are recognised structurally (a commit whose tree differs from its
+parent only in `manifest.json`).
+
+**C.5 Additive tools.**
+
+| tool | request | success response |
+|---|---|---|
+| `plm_version_graph` | `{path, limit?=400, scope?="all"}` | `{ok, head, active_branch, truncated, nodes:[…], branches:[…], versions:[…]}` |
+| `plm_version_tag` | `{path, commit?, name?, message?}` | `{ok, name, commit, created_at}` |
+| `plm_version_list` | `{path}` | `{ok, versions:[…]}` |
+
+A graph node is `{commit, parents:[…], kind, scope, authored_at, author, ai, message, summary,
+thumbnail_ref, refs:[{type:"branch"|"version"|"release"|"head", name}], release:{item_id,rev}|null, pin}`.
+`nodes` is newest-first AND topologically consistent: a node always precedes every one of its
+parents, so a consumer can assign lanes in one forward pass. The walk starts from ALL branch
+tips + `HEAD` + every version ref, so nothing reachable is hidden. `branches` rows carry
+`ahead`/`behind`/`merge_base` relative to the active branch tip.
+
+`plm_version_tag` auto-allocates the next `V<n>` when `name` is omitted; a duplicate name is
+`{ok:false, reason:"not_found"}`-style refusal, never an overwrite — labels are immutable, in
+keeping with the history-is-never-rewritten MUST (§8).
+
+**C.6 What is still deliberately absent.** No release-candidate or approval lifecycle state
+(§5's three states are frozen). No conflict-resolution state: `plm_branch_merge` still commits
+a dst-favoured tree and returns the conflict list for the caller to act on. Team sync remains
+linear-with-forward-replay (§6) — a merge node is a LOCAL construct and is never pushed as one.

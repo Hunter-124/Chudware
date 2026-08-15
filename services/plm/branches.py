@@ -169,10 +169,13 @@ def _commit_with_parents(
         trailer += f"chudware-plm-scope: {meta.scope}\n"
     commit.message = (f"{body}\n\n{trailer}").encode("utf-8")
     obj_store.add_object(commit)
-    cid = commit.id.decode("ascii")
-    # Move HEAD to the new merge/commit tip (absolute).
-    bind._repo.refs[b"HEAD"] = commit.id
-    return cid
+    expected = bind.head_commit()
+    swapped = bind._repo.refs.set_if_equals(
+        b"HEAD", expected.encode("ascii") if expected else None, commit.id)
+    if not swapped:
+        raise gitbind.ConcurrentUpdate(
+            "HEAD moved under a concurrent write; rebuild the merge and retry")
+    return commit.id.decode("ascii")
 
 
 def _ancestor_set(bind: gitbind.GitBinding, commit_hex: str) -> set[str]:
@@ -328,6 +331,26 @@ def list_branches(vault: Vault) -> dict[str, Any]:
             "current": name == active,
         })
     return {"ok": True, "active": active, "branches": out}
+
+def branch_topology(vault: Vault) -> list[dict[str, Any]]:
+    """Return branch tips and divergence relative to the active branch."""
+    listed = list_branches(vault)
+    active = listed["active"]
+    active_tip = next(
+        (b["head"] for b in listed["branches"] if b["name"] == active), None)
+    active_anc = _ancestor_set(vault._bind, active_tip) if active_tip else set()
+    out: list[dict[str, Any]] = []
+    for branch in listed["branches"]:
+        tip = branch["head"]
+        tip_anc = _ancestor_set(vault._bind, tip) if tip else set()
+        base = _merge_base(vault._bind, tip, active_tip) if tip and active_tip else None
+        out.append({
+            **branch,
+            "ahead": len(tip_anc - active_anc),
+            "behind": len(active_anc - tip_anc),
+            "merge_base": base,
+        })
+    return out
 
 
 def create_branch(
@@ -902,7 +925,7 @@ def merge_branches(
     if conflicts:
         msg = f"{msg} ({len(conflicts)} conflict{'s' if len(conflicts) != 1 else ''})"
     emeta = gitbind.EntryMeta(
-        kind=hist.KIND_CHECKPOINT,
+        kind=hist.KIND_MERGE,
         message=msg,
         author_name=author["display"],
         author_email=f'{author["id"]}@aicad.local',

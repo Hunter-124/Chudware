@@ -14,10 +14,12 @@ KIND_AUTO = "auto"
 KIND_CHECKPOINT = "checkpoint"
 KIND_RELEASE = "release"
 KIND_RESTORE = "restore"
-ENTRY_KINDS = {KIND_AUTO, KIND_CHECKPOINT, KIND_RELEASE, KIND_RESTORE}
+KIND_MERGE = "merge"
+ENTRY_KINDS = {KIND_AUTO, KIND_CHECKPOINT, KIND_RELEASE, KIND_RESTORE, KIND_MERGE}
 
 _KIND_TRAILER = "chudware-plm-kind:"
 _SCOPE_TRAILER = "chudware-plm-scope:"
+PIN_TRAILER = "chudware-plm-pin:"
 
 # entry scope: design history (the timeline users watch) vs planning-store
 # mutations (tasks/issues/milestones), so the default timeline stays curated.
@@ -99,10 +101,19 @@ def scope_from_commit_message(message: str) -> str:
                 return s
     return SCOPE_DESIGN
 
+def pin_from_commit_message(message: str) -> bool:
+    """Return whether the commit is a release manifest back-fill pin."""
+    for line in message.splitlines():
+        line = line.strip()
+        if line.startswith(PIN_TRAILER):
+            return line[len(PIN_TRAILER):].strip() == "1"
+    return False
+
 
 def user_message_from_commit(message: str) -> str:
     """Return the user-facing message (commit body with the trailers stripped)."""
     lines = [ln for ln in message.splitlines()
              if not ln.strip().startswith(_KIND_TRAILER)
-             and not ln.strip().startswith(_SCOPE_TRAILER)]
+             and not ln.strip().startswith(_SCOPE_TRAILER)
+             and not ln.strip().startswith(PIN_TRAILER)]
     return "\n".join(lines).strip()

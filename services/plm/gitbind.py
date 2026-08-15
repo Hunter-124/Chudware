@@ -28,6 +28,7 @@ Design notes
 """
 from __future__ import annotations
 
+import heapq
 import os
 import shutil
 import subprocess
@@ -227,6 +228,65 @@ class GitBinding:
             parents = self._repo[head.encode("ascii")].parents
             head = parents[0].decode("ascii") if parents else None
         return out
+
+    def log_dag(self, start_shas: list[str], limit: int) -> list[str]:
+        """Return a newest-first topological walk of all reachable parents."""
+        reachable: set[str] = set()
+        stack = [sha for sha in start_shas if sha]
+        while stack:
+            sha = stack.pop()
+            if sha in reachable:
+                continue
+            try:
+                parents = self.commit_meta(sha)["parents"]
+            except KeyError:
+                continue
+            reachable.add(sha)
+            stack.extend(p for p in parents if p not in reachable)
+
+        # Kahn over child -> parent edges guarantees every child is emitted
+        # before its parents. Timestamp chooses among currently-ready commits.
+        child_count = {sha: 0 for sha in reachable}
+        parents_by_sha: dict[str, list[str]] = {}
+        times: dict[str, int] = {}
+        for sha in reachable:
+            meta = self.commit_meta(sha)
+            parents = [p for p in meta["parents"] if p in reachable]
+            parents_by_sha[sha] = parents
+            times[sha] = int(meta["authored_at"])
+            for parent in parents:
+                child_count[parent] += 1
+        ready = [(-times[sha], sha) for sha, count in child_count.items() if count == 0]
+        heapq.heapify(ready)
+        out: list[str] = []
+        while ready and len(out) < max(0, int(limit)):
+            _neg_time, sha = heapq.heappop(ready)
+            out.append(sha)
+            for parent in parents_by_sha[sha]:
+                child_count[parent] -= 1
+                if child_count[parent] == 0:
+                    heapq.heappush(ready, (-times[parent], parent))
+        return out
+
+    def list_refs(self, prefix: str) -> dict[str, str]:
+        """Return refs beneath *prefix* as ``{full_name: target_sha}``."""
+        raw_prefix = prefix.encode("utf-8")
+        out: dict[str, str] = {}
+        for key in self._repo.refs.keys():
+            if key.startswith(raw_prefix):
+                target = self._repo.refs[key]
+                out[key.decode("utf-8")] = target.decode("ascii")
+        return out
+
+    def set_ref(self, name: str, sha: str) -> None:
+        self._repo.refs[name.encode("utf-8")] = sha.encode("ascii")
+
+    def ref_target(self, name: str) -> str | None:
+        try:
+            target = self._repo.refs[name.encode("utf-8")]
+        except KeyError:
+            return None
+        return target.decode("ascii")
 
     # -- writing -----------------------------------------------------------
 

@@ -853,7 +853,8 @@ class Vault:
             freeze["commit"] = commit
         files["manifest.json"] = manifest.dumps(m)
         pin_meta = gitbind.EntryMeta(
-            kind=hist.KIND_RELEASE, message=message,
+            kind=hist.KIND_RELEASE,
+            message=f"{message}\n\n{hist.PIN_TRAILER} 1",
             author_name=author["display"], author_email=f'{author["id"]}@aicad.local',
         )
         pinned_commit = self._bind.commit_tree(files, pin_meta)
@@ -887,6 +888,97 @@ class Vault:
     def active_branch(self) -> str:
         from services.plm import branches as branches_mod
         return branches_mod.active_branch(self)
+
+    def tag_version(self, commit: str | None = None, name: str | None = None,
+                    message: str = "") -> dict[str, Any]:
+        from services.plm import versions
+        return versions.tag_version(self, commit=commit, name=name, message=message)
+
+    def list_versions(self) -> list[dict[str, Any]]:
+        from services.plm import versions
+        return versions.list_versions(self)
+
+    def version_graph(self, limit: int = 400, scope: str = "all") -> dict[str, Any]:
+        """Return the decorated multi-parent commit DAG."""
+        from services.plm import branches as branches_mod
+
+        head = self._bind.head_commit()
+        branch_rows = branches_mod.branch_topology(self)
+        version_rows = self.list_versions()
+        starts = [b["head"] for b in branch_rows if b.get("head")]
+        starts.extend(v["commit"] for v in version_rows if v.get("commit"))
+        if head:
+            starts.append(head)
+        commits = self._bind.log_dag(starts, max(0, int(limit)))
+        if scope != "all":
+            commits = [c for c in commits if hist.scope_from_commit_message(
+                self._bind.commit_meta(c)["message"]) == scope]
+
+        decorations: dict[str, list[dict[str, str]]] = {}
+        for branch in branch_rows:
+            if branch.get("head"):
+                decorations.setdefault(branch["head"], []).append(
+                    {"type": "branch", "name": branch["name"]})
+        for version in version_rows:
+            decorations.setdefault(version["commit"], []).append(
+                {"type": "version", "name": version["name"]})
+        if head:
+            decorations.setdefault(head, []).append(
+                {"type": "head", "name": branches_mod.active_branch(self)})
+
+        release_by_commit: dict[str, dict[str, str]] = {}
+        manifest_raw = self._bind.read_blob_at(head, "manifest.json") if head else None
+        if manifest_raw:
+            current_manifest = manifest.loads(manifest_raw)
+            for item in current_manifest.get("items", []):
+                for released in item.get("released_revs", []) or []:
+                    commit = released.get("commit")
+                    if commit:
+                        release_by_commit[commit] = {
+                            "item_id": item.get("item_id", ""),
+                            "rev": released.get("rev", ""),
+                        }
+                        decorations.setdefault(commit, []).append(
+                            {"type": "release", "name": released.get("rev", "")})
+
+        def legacy_pin(commit: str, parents: list[str]) -> bool:
+            if len(parents) != 1:
+                return False
+            tree = self._bind.read_tree(commit)
+            parent_tree = self._bind.read_tree(parents[0])
+            changed = {p for p in set(tree) | set(parent_tree)
+                       if tree.get(p) != parent_tree.get(p)}
+            return changed == {"manifest.json"}
+
+        nodes: list[dict[str, Any]] = []
+        for commit in commits:
+            cmeta = self._bind.commit_meta(commit)
+            entry = self._entry_view_light(commit)
+            parents = cmeta["parents"]
+            pin = hist.pin_from_commit_message(cmeta["message"])
+            if not pin and entry["kind"] == hist.KIND_RELEASE:
+                pin = legacy_pin(commit, parents)
+            ai = entry.get("ai") or {}
+            nodes.append({
+                **entry,
+                "ai": {
+                    "provider": str(ai.get("provider") or ""),
+                    "model": str(ai.get("model") or ""),
+                    "run_id": str(ai.get("run_id") or ""),
+                },
+                "parents": parents,
+                "refs": decorations.get(commit, []),
+                "release": release_by_commit.get(commit),
+                "pin": pin,
+            })
+        return {
+            "head": head or "",
+            "active_branch": branches_mod.active_branch(self),
+            "truncated": len(commits) >= max(0, int(limit)),
+            "nodes": nodes,
+            "branches": branch_rows,
+            "versions": version_rows,
+        }
 
 
     def repack(self) -> str:

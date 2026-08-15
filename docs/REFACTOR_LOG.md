@@ -7617,3 +7617,64 @@ permits. Closing it needs the real captured document, i.e. agent bracket builds 
 the run journal on. Also noticed and NOT touched: this repo's own tracked `.aicadvault/`
 (2463 files, committed at e4a1a607) accumulates local object churn from any run that treats
 the repo root as a project — that is a repo-hygiene decision for Hunter, not a code fix.
+
+## 2026-08-15 — a pixel audit of the workspaces nobody had looked at
+
+Drove all 25 `CHUDWARE_SHOT` scenarios headless and read the captures instead of trusting exit
+codes. The exit codes were lying: **`ecad`, `parts` and `aiws` all exited 0 while photographing
+the Model workspace.** Startup doc restore calls `activateTab`, which pulls any workspace that
+cannot host a 3D part back to Model, and that race had been hand-patched three separate times
+(parts, then reveng, then PLM) without anyone generalising it. One per-frame pin
+(`AppState::shotWorkspacePin`) replaces the special cases; it ADOPTS any non-Model workspace the
+run selects and only restores it when something yanks back to Model, because `fea`/`flow`/
+`simdisc_*` reach their workspace mid-run — a blunter pin broke them the other way and a
+subagent correctly refused to verify against the wrong surface. On top of that the `ecad` and
+`drawing` scenarios only ever set their ribbon tab, never their workspace.
+
+With honest captures, the surfaces confessed. **ECAD** had never been seen with a board on it:
+its scenario drove `ecad_design`, a provider-backed AI tool, as its first call, got an error
+envelope and aborted, leaving an empty grid crossed by what looked like stray geometry. The
+default scenario now mints a provider-free `.ecad+` fixture and applies deterministic ops (48x32
+outline, three footprints, GND/SIG, three routes over both layers, a via, one deliberate 0.1 mm
+width breach), which exposed two more defects: **net row selection was a dead control** (set
+`mgrSel`, changed no pixels — now highlights the net's copper and dims the rest, 20,294 pixels
+different) and the "stray line" was the **y=0 grid axis** drawn solid and in front, landing
+exactly where an Edge.Cuts line would be. Also worth recording: the first fixture's 6 DRC errors
+and 3 warnings were HONEST (routes terminating on opposite-net pads); the fixture was fixed, not
+the rules. And the native ECAD op vocabulary cannot create a net — an agent-facing API gap.
+
+**Drawing** had an unreadable title block: row heights scale with sheet zoom while text does
+not, and the guard was a `std::min` of the two — exactly backwards, so at 149 % zoom every label
+collapsed onto its value. Now a `max` that grows the block upward, verified at 149 % and 211 %.
+View labels also fell under the title block and under their own dimensions (dims paint later
+into the same band), and the sheet hint read as two fragments because it ellipsised to the full
+content width while the floating doc-tab strip covered the middle.
+
+**Simulation Manager** was clipping its own text through three `PushTextWrapPos` calls handed
+SCREEN-space X (the call takes window-local), and its body sliced a row in half under the pinned
+Run button. **Seven icons** rendered as magenta placeholders in every scenario, and the icons
+lint could not see them because its regex missed namespace-qualified `ui::getIcon` — fixed and
+proved by reintroducing one bad name. **Mass Properties** mixed unit systems (IPS volume and
+mass beside a hard-coded g/cm3 density) and printed `X: 4.449e-17in` for a symmetric body. The
+**orientation triad** drew on top of the Simulation Manager during its dodge ease. The **RevEng**
+busy mark cleared the tesseract's legibility floor by inflating the radius it passed, rendering
+as a broken glyph box.
+
+Two crashes, both latent, both mine to own in different senses. `nlohmann::json::value()` throws
+on an existing-but-null key and evaluates its default eagerly, so `value("when", value("time",
+""))` threw on plm_timeline's null fields and abandoned the checkpoint list mid-parse in three
+separate panels — the copilot rollback popover had been silently truncating history. And the
+T-BL61 fork isolation **hung the GUI**: fork gives the child a snapshot of every lock, and the
+desktop app links libchudware beside its worker and RPC threads, so children wedged and each
+blend burned its 30 s budget (`CHUDWARE_SHOT=fea`: 90 s scenario → hard hang). A timeout now
+means "fork is unusable in this process", not "this geometry is bad": retry in-process, disable
+isolation for the process, keep signal containment intact. Budget 30 s → 5 s. A new test runs an
+isolated fillet against four allocator-hammering threads (7.4 ms, no drop) so the daemon's
+containment is measured rather than assumed, and fails the build if it drifts toward the budget.
+
+Verification: all 25 scenarios exit 0 with zero `unknown icon` lines at 1280x800;
+`scripts/gui_lint.py` clean; `python3 scripts/check.py` **all 9 gates PASS** — it had been red
+before this session on a committed `.kimi-code/skills` symlink that a Windows checkout turns
+into a text file, now untracked. Deferred: the "New study" popup covers the manager panel it was
+opened from; ECAD zoom-to-fit does not frame the whole board inside the visible canvas; the AI
+workspace's trace hint line collides with its last card.

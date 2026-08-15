@@ -1885,7 +1885,8 @@ void ScenarioRunner::runDrawing(AppState& st) {
             st.worker.call("drawing_set_titleblock",
                            {{"doc_id", tab.drawingDocId}, {"sheet_id", "s1"},
                             {"fields", {{"title", "PLATE"}, {"drawn_by", "Chudware"},
-                                        {"material", "AL 6061"}, {"scale", "1:1"}, {"rev", "A"}}}},
+                                        {"date", "2026-08-15"}, {"material", "AL 6061"},
+                                        {"scale", "1:1"}, {"rev", "A"}, {"sheet", "1/1"}}}},
                            r3, err);
             st.refreshDrawingTab(st.activeTab);
             // Make the first linear dim a critical +/-0.1 tolerance.

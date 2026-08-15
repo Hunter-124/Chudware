@@ -24,6 +24,8 @@
 #include "../ui_theme.h"
 #include "file_dialog.h"
 #include "property_manager.h"   // pmFormatDim — dimension text follows MMGS/IPS like the rest of the UI
+#include "layout.h"             // ui::overlayColumnEdge — the sheet hint dodges the doc-tab strip
+#include "metrics.h"            // ui::metrics::U — 4 px grid
 
 namespace ui {
 
@@ -686,8 +688,8 @@ bool drawingHandleCommand(AppState& st, const std::string& cmd) {
 // Render one stored dimension annotation: extension lines from a & b, a dimension line through the
 // text position, simple arrowheads, and the value text. `toScreen` maps sheet-mm to screen px.
 static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
-                            const std::function<ImVec2(double, double)>& toScreen, float s,
-                            bool selected) {
+                            const std::function<ImVec2(double, double)>& toScreen, float z,
+                            float s, bool selected) {
     auto rdvec = [&](const char* k, double& x, double& y) -> bool {
         auto it = ann.find(k);
         if (it == ann.end() || !it->is_array() || it->size() != 2 ||
@@ -706,13 +708,16 @@ static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
                                    : sheetCol(palette.sketchUnder);
     const float thick = std::max(1.0f, (critical ? 1.6f : 1.0f) * s);
 
+    const float fontPx = std::max(ImGui::GetFontSize(), 3.5f * z);
+    ImFont* font = ImGui::GetFont();
     std::string txt = djstr(ann, "text");
     auto drawLabel = [&](ImVec2 tp, const std::string& t) {
         if (t.empty()) return;
-        ImVec2 ts = ImGui::CalcTextSize(t.c_str());
-        dl->AddRectFilled(ImVec2(tp.x - 2, tp.y - 1), ImVec2(tp.x + ts.x + 2, tp.y + ts.y + 1),
-                          sheetCol(palette.viewportTop, 0.86f), 2.0f);
-        dl->AddText(tp, dimCol, t.c_str());
+        ImVec2 ts = font->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, t.c_str());
+        dl->AddRectFilled(ImVec2(tp.x - 2 * s, tp.y - s),
+                          ImVec2(tp.x + ts.x + 2 * s, tp.y + ts.y + s),
+                          sheetCol(palette.viewportTop, 0.86f), 2.0f * s);
+        dl->AddText(font, fontPx, tp, dimCol, t.c_str());
     };
     auto criticalFlag = [&](ImVec2 at) {
         if (critical)
@@ -762,8 +767,9 @@ static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
                 if (it > 0) txt = std::to_string(it);
             }
             if (!txt.empty()) {
-                ImVec2 ts = ImGui::CalcTextSize(txt.c_str());
-                dl->AddText(ImVec2(P.x - ts.x * 0.5f, P.y - ts.y * 0.5f), dimCol, txt.c_str());
+                ImVec2 ts = font->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, txt.c_str());
+                dl->AddText(font, fontPx,
+                            ImVec2(P.x - ts.x * 0.5f, P.y - ts.y * 0.5f), dimCol, txt.c_str());
             }
         }
         return;
@@ -846,18 +852,19 @@ static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
     arrow(A2, B2);
     arrow(B2, A2);
 
-    // Value text at P (centered above the dimension line). `txt` is the engine-composed display
-    // string (prefix / tolerance baked in); fall back to formatting the canonical mm value.
+    // Value text at the dimension line midpoint. Paper-space dimensions scale with sheet zoom,
+    // but never fall below the UI font size at fit-to-window zoom.
     if (txt.empty()) {
         double val = djnum(ann, "value", 0.0);
         txt = pmFormatDim(val, ips);   // engine value is canonical mm; pmFormatDim handles IPS
     }
-    ImVec2 ts = ImGui::CalcTextSize(txt.c_str());
+    ImVec2 ts = font->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, txt.c_str());
     ImVec2 mid((A2.x + B2.x) * 0.5f, (A2.y + B2.y) * 0.5f);
     ImVec2 tp(mid.x - ts.x * 0.5f, mid.y - ts.y - 2 * s);
-    dl->AddRectFilled(ImVec2(tp.x - 2, tp.y - 1), ImVec2(tp.x + ts.x + 2, tp.y + ts.y + 1),
-                      sheetCol(palette.viewportTop, 0.86f), 2.0f);
-    dl->AddText(tp, dimCol, txt.c_str());
+    dl->AddRectFilled(ImVec2(tp.x - 2 * s, tp.y - s),
+                      ImVec2(tp.x + ts.x + 2 * s, tp.y + ts.y + s),
+                      sheetCol(palette.viewportTop, 0.86f), 2.0f * s);
+    dl->AddText(font, fontPx, tp, dimCol, txt.c_str());
     criticalFlag(ImVec2(tp.x, tp.y));
 }
 
@@ -926,7 +933,7 @@ static void renderDrawPrimitives(ImDrawList* dl, const nlohmann::json& ann,
             std::string txt = djstr(t, "text");
             if (txt.empty()) continue;
             double h = djnum(t, "h", 3.5);
-            float fpx = std::max(8.0f, (float)h * z);
+            float fpx = std::max(ImGui::GetFontSize(), (float)h * z);
             ImVec2 anchor = toScreen(t["pos"][0].get<double>(), t["pos"][1].get<double>());
             ImVec2 ts = ImGui::CalcTextSize(txt.c_str());
             float scaleF = fpx / baseSz;
@@ -983,33 +990,54 @@ static void renderTitleBlock(ImDrawList* dl, const nlohmann::json& sheet,
         }
         return fb;
     };
-    const double margin = 8.0, bw = 176.0, bh = 48.0;
+    const double margin = 8.0, bw = 176.0, bh = 56.0;
     const double rx = paperW - margin, by = margin;     // bottom-right corner, inside the trim
     const double lx = rx - bw, ty = by + bh;
     ImVec2 tl = toScreen(lx, ty), br = toScreen(rx, by);
     const ImU32 ink = sheetCol(palette.sketchInk), line = sheetCol(palette.sketchDimLine);
+    // The title owns one row; metadata owns two equal-height rows. Row height is in SHEET units
+    // (it scales with the sheet zoom) while the text is drawn at a fixed font size, so the rows
+    // must be at LEAST tall enough for a label plus a value or the two collapse onto each other.
+    // This was a std::min, which is the opposite: at 149% sheet zoom (a 1280x800 window) the
+    // rows shrank under the text and the block read "DRAWN" over "Chudware" and "MATL" over
+    // "AL 6061" again. Take the max, and grow the block UPWARD when the fixed text needs more
+    // room than the scaled box has, so it stays anchored in the bottom-right corner.
+    float h = br.y - tl.y, w = br.x - tl.x;
+    const float fontH = ImGui::GetTextLineHeight();
+    const float pad = 2.0f * s;
+    const float metadataRowH = std::max(h * 0.34f, 2.0f * fontH + 3.0f * pad);
+    const float titleRowH = std::max(h * 0.32f, fontH + 2.0f * pad);
+    const float needed = 2.0f * metadataRowH + titleRowH;
+    if (needed > h) {
+        tl.y = br.y - needed;
+        h = needed;
+    }
     dl->AddRectFilled(tl, br, sheetCol(palette.viewportTop, 0.92f));
     dl->AddRect(tl, br, line, 0.0f, 0, 1.4f * s);
-    // Two horizontal dividers -> 3 rows: title, drawn/date, scale/rev/sheet + material.
-    float h = br.y - tl.y, w = br.x - tl.x;
-    float r1 = tl.y + h * 0.42f, r2 = tl.y + h * 0.72f;
+    const float r2 = br.y - metadataRowH;
+    const float r1 = r2 - metadataRowH;
     dl->AddLine(ImVec2(tl.x, r1), ImVec2(br.x, r1), line, 1.0f * s);
     dl->AddLine(ImVec2(tl.x, r2), ImVec2(br.x, r2), line, 1.0f * s);
-    auto label = [&](float x, float y, const char* k, const std::string& val) {
-        dl->AddText(ImVec2(x + 3 * s, y + 1 * s), sheetCol(palette.sketchInk, 0.55f), k);
-        dl->AddText(ImVec2(x + 3 * s, y + ImGui::GetTextLineHeight() * 0.6f + 2 * s), ink,
-                    val.c_str());
+    auto label = [&](float x, float y, float cellW, const char* k, const std::string& val) {
+        const float cellH = metadataRowH;
+        const float labelY = y + pad;
+        const float valueY = std::min(y + cellH - fontH - pad, labelY + fontH + pad);
+        dl->PushClipRect(ImVec2(x + pad, y), ImVec2(x + cellW - pad, y + cellH), true);
+        dl->AddText(ImVec2(x + pad, labelY), sheetCol(palette.sketchInk, 0.55f), k);
+        dl->AddText(ImVec2(x + pad, valueY), ink, val.c_str());
+        dl->PopClipRect();
     };
     std::string title = field("title", "TITLE");
     ImVec2 tts = ImGui::CalcTextSize(title.c_str());
     dl->AddText(ImVec2(tl.x + (w - tts.x) * 0.5f, tl.y + (r1 - tl.y - tts.y) * 0.5f), ink,
                 title.c_str());
-    label(tl.x, r1, "DRAWN", field("drawn_by", ""));
-    label(tl.x + w * 0.5f, r1, "DATE", field("date", ""));
-    label(tl.x, r2, "MATL", field("material", ""));
-    label(tl.x + w * 0.34f, r2, "SCALE", field("scale", "1:1"));
-    label(tl.x + w * 0.62f, r2, "REV", field("rev", "A"));
-    label(tl.x + w * 0.80f, r2, "SHEET", field("sheet", "1/1"));
+    label(tl.x, r1, w * 0.5f, "DRAWN", field("drawn_by", ""));
+    std::string date = field("date", "");
+    if (!date.empty()) label(tl.x + w * 0.5f, r1, w * 0.5f, "DATE", date);
+    label(tl.x, r2, w * 0.34f, "MATL", field("material", ""));
+    label(tl.x + w * 0.34f, r2, w * 0.28f, "SCALE", field("scale", "1:1"));
+    label(tl.x + w * 0.62f, r2, w * 0.18f, "REV", field("rev", "A"));
+    label(tl.x + w * 0.80f, r2, w * 0.20f, "SHEET", field("sheet", "1/1"));
 }
 
 // The dimension/annotation editor popup: double-click a dim to open it. Edits tolerance, prefix/
@@ -1430,8 +1458,23 @@ void drawDrawingSheet(AppState& st) {
         } else {
             ImGui::PushStyleColor(ImGuiCol_Text,
                                   ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
-            ImGui::TextUnformatted("double-click a dim to edit  |  drag to reposition  |  "
-                                   "wheel zoom  |  MMB / Space+drag pan  |  Del removes");
+            const char* hint = "double-click dim to edit | drag to reposition | wheel zoom | "
+                               "MMB / Space+drag pan | Del removes";
+            // The hint shares its ROW with the floating doc-tab strip, which is drawn later and
+            // over it. Ellipsising to the full content width therefore clipped nothing useful:
+            // the strip covered the middle and the tail ("Del removes") reappeared on the far
+            // side, so the line read as two fragments. The strip starts at the FeatureManager
+            // column's right edge plus its margin (doc_tabs.cpp), so that is the real budget.
+            const ImVec2 hp = ImGui::GetCursorScreenPos();
+            float hintW = ImGui::GetContentRegionAvail().x;
+            const float stripLeft = ui::overlayColumnEdge(0);
+            if (stripLeft > hp.x) hintW = std::min(hintW, stripLeft - hp.x - ui::metrics::U(3.0f));
+            if (hintW > ui::metrics::U(12.0f)) {
+                ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(), hp,
+                                          ImVec2(hp.x + hintW, hp.y + ImGui::GetTextLineHeight()),
+                                          hp.x + hintW, hp.x, hint, nullptr, nullptr);
+            }
+            ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetTextLineHeight()));
             ImGui::PopStyleColor();
         }
     }
@@ -1558,6 +1601,9 @@ void drawDrawingSheet(AppState& st) {
     const float hidThick = std::max(1.0f, 1.0f * s);
 
     // ---- views ----
+    const ImVec2 titleBlockTL = toScreen(paperW - 8.0 - 176.0, 8.0 + 56.0);
+    const ImVec2 titleBlockBR = toScreen(paperW - 8.0, 8.0);
+    const float labelBandH = ImGui::GetTextLineHeight() + 8.0f * s;
     int viewIdx = 0;
     if (sheet->contains("views") && (*sheet)["views"].is_array()) {
         for (const auto& v : (*sheet)["views"]) {
@@ -1712,8 +1758,9 @@ void drawDrawingSheet(AppState& st) {
                 }
             }
 
-            // Per-view label: SolidWorks-style title. Section/detail get "SECTION A-A" / "DETAIL B"
-            // (with the scale); ortho/iso show the orientation + scale.
+            // Per-view label: reserve a dedicated band below the view frame. If that band intersects
+            // the title block, place it immediately above the frame instead; labels therefore never
+            // sit under title-block ink, and annotations remain visually separate from the label band.
             if (haveBox) {
                 char lbl[80];
                 std::string vtype = djstr(v, "type");
@@ -1726,11 +1773,22 @@ void drawDrawingSheet(AppState& st) {
                 else
                     std::snprintf(lbl, sizeof(lbl), "%s  (%.2g:1)",
                                   orient.empty() ? "view" : orient.c_str(), scale);
-                ImVec2 lp(boxTL.x, boxBR.y + 4 * s);
                 ImVec2 ts = ImGui::CalcTextSize(lbl);
-                dl->AddRectFilled(ImVec2(lp.x - 2, lp.y - 1),
-                                  ImVec2(lp.x + ts.x + 4, lp.y + ts.y + 2),
-                                  sheetCol(pal.viewportTop, 0.82f), 2.0f);
+                // Dimensions are painted AFTER the labels (below), in the same band under the
+                // view, so a view that carries annotations had its label overprinted by a dim
+                // string - "top (1:1)" sitting under "80.00 +/-0.10" at 149% sheet zoom. Drop
+                // the label clear of that band when the view actually has annotations.
+                const bool hasDims = v.contains("annotations") && v["annotations"].is_array() &&
+                                     !v["annotations"].empty();
+                const float dimBand = hasDims ? ImGui::GetTextLineHeight() + 6.0f * s : 0.0f;
+                ImVec2 lp(boxTL.x, boxBR.y + 4 * s + dimBand);
+                ImVec2 labelBR(lp.x + ts.x + 4 * s, lp.y + labelBandH);
+                const bool hitsTitle = lp.x < titleBlockBR.x && labelBR.x > titleBlockTL.x &&
+                                       lp.y < titleBlockBR.y && labelBR.y > titleBlockTL.y;
+                if (hitsTitle) lp.y = boxTL.y - labelBandH;
+                dl->AddRectFilled(ImVec2(lp.x - 2 * s, lp.y - s),
+                                  ImVec2(lp.x + ts.x + 4 * s, lp.y + ts.y + 2 * s),
+                                  sheetCol(pal.viewportTop, 0.92f), 2.0f * s);
                 dl->AddText(lp, sheetCol(pal.sketchInk, 0.80f), lbl);
             }
         }
@@ -1754,7 +1812,7 @@ void drawDrawingSheet(AppState& st) {
                 if (ann.contains("draw") && ann["draw"].is_object())
                     renderDrawPrimitives(dl, ann, toScreen, z, s, sel);
                 else
-                    renderDimension(dl, ann, st.ips(), toScreen, s, sel);
+                    renderDimension(dl, ann, st.ips(), toScreen, z, s, sel);
             }
         }
     }

@@ -30,6 +30,8 @@
 
 #include "prof/phases.h"     // per-phase timers (StudyScope "mesh_tet")
 #include "sim/hex_mesher.h"  // mesh_box_hex (structured hex path)
+#include "sim/mesh_size_band.h"  // SizeBand + resolve_size_band (shared with polymesh)
+#include "sim/polymesh_backend.h"    // mesh_step_polymesh (second mesher backend)
 #include "geom/booleans.h"   // geom::unify_same_domain (mesh-time geometry healing)
 #include "util/resource_governor.h"  // host-memory element ceiling (graceful degrade)
 
@@ -149,7 +151,7 @@ uint64_t component_opts_key(const MeshOptions& o, uint64_t h) {
     h = component_fnv1a(&o.min_size_mm, sizeof o.min_size_mm, h);
     h = component_fnv1a(&o.max_size_mm, sizeof o.max_size_mm, h);
     h = component_fnv1a(&o.optimize, sizeof o.optimize, h);
-    h = component_fnv1a(&o.algorithm3d, sizeof o.algorithm3d, h);
+    h = component_fnv1a(&o.backend, sizeof o.backend, h);
     h = component_fnv1a(&o.structured, sizeof o.structured, h);
     h = component_fnv1a(&o.auto_type, sizeof o.auto_type, h);
     h = component_fnv1a(&o.quad_surface, sizeof o.quad_surface, h);
@@ -358,6 +360,12 @@ bool tet10_jacobians_valid(const MeshOut& out, const int* t,
     return true;
 }
 
+}  // namespace
+
+// Shared by every mesher backend (Netgen here, polymesh in polymesh_backend.cpp) so a
+// quality number means the SAME thing whichever backend produced the mesh — the GUI
+// compares them side by side.
+namespace detail {
 bool fill_quality(MeshOut& out) {
     const int stride = out.nodes_per_elem == 10 ? 10 : 4;
     if (out.points.empty() || out.points.size() % 3 != 0 ||
@@ -454,8 +462,10 @@ bool fill_quality(MeshOut& out) {
     out.pct_poor = counted ? 100.0 * static_cast<double>(poor) / static_cast<double>(counted) : 0.0;
     return counted == n;
 }
+}  // namespace detail
 
-}  // namespace
+using detail::fill_quality;
+
 bool validate_mesh_options(const MeshOptions& options, std::string& error) {
     if (!std::isfinite(options.fineness) || options.fineness < 0.0 ||
         options.fineness > 1.0) {
@@ -565,19 +575,7 @@ MeshOut mesh_stl_netgen(const TopoDS_Shape& shape, const MeshOptions& options,
                         bool force_direct = false);
 
 // Sizing resolution shared by every meshing route (defined below, next to
-// mesh_step_netgen): fineness -> base element size off the bbox diagonal, volume-aware
-// interactivity budget + host-memory governor coarsening, tight 2:1 min/max band.
-struct SizeBand {
-    bool ok = false;
-    std::string error;
-    std::string note;
-    double fineness = 0.5;
-    double base = 0.0;
-    double min_len = 0.0;
-    double max_len = 0.0;
-    double diag = 0.0;
-};
-SizeBand resolve_size_band(const TopoDS_Shape& shape, const MeshOptions& options);
+// mesh_step_netgen) and by the polymesh backend — see sim/mesh_size_band.h.
 
 namespace {
 
@@ -780,6 +778,11 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
         invalid.error = "mesh: STEP path must not be empty";
         return invalid;
     }
+    // Backend selection happens before any Netgen-specific work below. The polymesh
+    // backend owns its whole pipeline (load -> fill -> optional p-elevation), so it is a
+    // dispatch, not a stage: everything from here down is Netgen's route.
+    if (options.backend == MesherBackend::Polymesh)
+        return mesh_step_polymesh(step_path, options);
     // P4: parse the STEP ONCE and thread the shape through classify/pick/hex/netgen.
     TopoDS_Shape shape = read_step_shape(step_path);
 

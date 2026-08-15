@@ -1091,6 +1091,8 @@ if(CHUDWARE_WITH_OCCT)
        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lib3mf/*/lib/lib3mf.lib")
   file(GLOB _have_opennurbs
        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/opennurbs/*/lib/*opennurbs*")
+  file(GLOB _have_polymesh
+       "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/polymesh/src/CMakeLists.txt")
 
   # --- One-time migration of pre-rebrand caches (605645b7) --------------------
   # The Billet / AI-CAD -> Chudware rename renamed AICAD_WITH_* to CHUDWARE_WITH_*.
@@ -1131,6 +1133,7 @@ if(CHUDWARE_WITH_OCCT)
   set(_def_netgen    ${_aicad_subdep_default})
   set(_def_lib3mf    ${_aicad_subdep_default})
   set(_def_opennurbs ${_aicad_subdep_default})
+  set(_def_polymesh  ${_aicad_subdep_default})
   if(_have_netgen)
     set(_def_netgen ON)
   endif()
@@ -1140,9 +1143,13 @@ if(CHUDWARE_WITH_OCCT)
   if(_have_opennurbs)
     set(_def_opennurbs ON)
   endif()
+  if(_have_polymesh)
+    set(_def_polymesh ON)
+  endif()
   option(CHUDWARE_WITH_NETGEN    "Netgen/nglib FEA tet mesher (sim/mesher.cpp, fea_run)" ${_def_netgen})
   option(CHUDWARE_WITH_LIB3MF    "lib3mf 3MF reader/writer (doc/formats.cpp)"            ${_def_lib3mf})
   option(CHUDWARE_WITH_OPENNURBS "openNURBS Rhino .3dm reader/writer (doc/formats.cpp)"  ${_def_opennurbs})
+  option(CHUDWARE_WITH_POLYMESH  "Polyhedral-FEA graded-tet mesher backend (sim/polymesh_backend.cpp)" ${_def_polymesh})
 
   # --- P50: Netgen / nglib tet mesher (LGPL-2.1 — commercial-safe) -----------
   # BUILD Netgen from source against OUR OCCT (no prebuilt SDK exists); see
@@ -1183,13 +1190,33 @@ if(CHUDWARE_WITH_OCCT)
     include(ProvisionOpenNURBS)
   endif()
 
+  # --- Polyhedral-FEA (`polymesh`) second mesher backend — BSD-3, static ------
+  # A graded Cartesian tet fill that succeeds on STEP topology Netgen's advancing
+  # front rejects, and an independent second opinion on any stress result. It plugs in
+  # behind the SAME chudware::sim::MeshOut contract (sim/polymesh_backend.cpp), so no
+  # solver, overlay, RPC or viewport path knows which mesher ran.
+  #
+  # It lives in the chudware_mesh target, which exists only under CHUDWARE_WITH_NETGEN:
+  # mesh_step's multi-solid/auto-pick dispatch is still Netgen's. Say so rather than
+  # compiling a backend nothing can reach.
+  if(CHUDWARE_WITH_POLYMESH AND NOT CHUDWARE_WITH_NETGEN)
+    message(WARNING
+      "[polymesh] CHUDWARE_WITH_POLYMESH needs CHUDWARE_WITH_NETGEN (the mesher target "
+      "and its mesh_step dispatch live there) — disabling the polymesh backend.")
+    set(CHUDWARE_WITH_POLYMESH OFF CACHE BOOL "" FORCE)
+  endif()
+  if(CHUDWARE_WITH_POLYMESH)
+    include(ProvisionPolymesh)
+  endif()
+
   # P50b: sim/fea_run.cpp (the combined mesh+resolve+solve glue) joins the mesher
   # target — it is the only sim source that needs the mesher, and adding it here
   # keeps the mesher-backend confinement intact (fea_run.h itself is nglib-free).
   # chudware_mesh gains a PUBLIC dep on chudware_sim so fea_run.cpp can call the FEA solvers.
   # Gated on CHUDWARE_WITH_NETGEN: the mesher (mesher.cpp) is the only nglib consumer.
   if(CHUDWARE_WITH_NETGEN)
-    add_library(chudware_mesh STATIC sim/mesher.cpp sim/hex_mesher.cpp sim/fea_run.cpp sim/fea_fatigue.cpp)
+    add_library(chudware_mesh STATIC sim/mesher.cpp sim/hex_mesher.cpp sim/fea_run.cpp
+                                     sim/fea_fatigue.cpp sim/polymesh_backend.cpp)
     target_include_directories(chudware_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_include_directories(chudware_mesh PRIVATE ${NETGEN_INCLUDE_DIRS})
     # nglib's import lib is PUBLIC so it propagates onto the final link line of the
@@ -1198,6 +1225,15 @@ if(CHUDWARE_WITH_OCCT)
     target_link_libraries(chudware_mesh PUBLIC ${NETGEN_IMPORT_LIB} chudware_sim nlohmann_json::nlohmann_json)
     set_property(TARGET chudware_mesh PROPERTY
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    if(CHUDWARE_WITH_POLYMESH)
+      # polymesh headers (pipeline/scene.hpp, fea/*.hpp) are PRIVATE: only
+      # polymesh_backend.cpp includes them, and sim/polymesh_backend.h stays
+      # backend-free exactly like sim/mesher.h.
+      target_link_libraries(chudware_mesh PRIVATE polymesh::pipeline)
+      target_compile_definitions(chudware_mesh PRIVATE CHUDWARE_WITH_POLYMESH)
+      # polymesh is C++20 (std::format, concepts, std::span); core/ is C++17.
+      target_compile_features(chudware_mesh PRIVATE cxx_std_20)
+    endif()
   endif()
   # Smoke test: box -> volume (BRepGProp) -> tessellation (BRepMesh). Proves the
   # auto-provisioned kernel is found, linked, and runnable end to end.
@@ -1327,6 +1363,21 @@ if(CHUDWARE_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME netgen_mesh COMMAND test_netgen_mesh)
   set_tests_properties(netgen_mesh PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
+
+  # Cross-backend interchangeability: the same cantilever meshed by BOTH backends must
+  # honor one MeshOut contract and solve to the same tip deflection. Also the only guard
+  # on the tet10 mid-edge slot permutation between the two node orderings, which is a
+  # silent-wrong-answer bug, not a crash. Runs (and passes trivially) in a build without
+  # polymesh — the cases self-skip via mesher_backend_available.
+  add_executable(test_polymesh_backend tests/test_polymesh_backend.cpp)
+  target_include_directories(test_polymesh_backend PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_polymesh_backend PRIVATE chudware_mesh chudware_geom_occt)
+  set_target_properties(test_polymesh_backend PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME polymesh_backend COMMAND test_polymesh_backend)
+  set_tests_properties(polymesh_backend PROPERTIES RUN_SERIAL TRUE
+    ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
 
   # fea_profile: standalone profiling harness for the static-stress solve (NOT a ctest — a
   # manual perf tool). Meshes a beam -> fea_run_static under the in-process sampling profiler

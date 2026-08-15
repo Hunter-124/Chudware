@@ -107,7 +107,8 @@ ResolvedMesh resolve_mesh_for_overlay(const json& study) {
         opts.min_size_mm = study.value("min_size_mm", 0.0);
         opts.max_size_mm = study.value("max_size_mm", 0.0);
         opts.optimize = study.value("optimize", true);
-        opts.algorithm3d = study.value("algorithm3d", 1);
+        opts.backend =
+            mesher_backend_from_string(study.value("mesher_backend", std::string("netgen")));
         opts.structured =
             study.value("structured",
                         study.value("mesh_type", std::string()) == "hex");

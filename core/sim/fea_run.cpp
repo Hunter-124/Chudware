@@ -318,7 +318,8 @@ bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<in
         opts.min_size_mm = study.value("min_size_mm", 0.0);
         opts.max_size_mm = study.value("max_size_mm", 0.0);
         opts.optimize = study.value("optimize", true);
-        opts.algorithm3d = study.value("algorithm3d", 1);
+        opts.backend =
+            mesher_backend_from_string(study.value("mesher_backend", std::string("netgen")));
         opts.structured = study.value("structured", study.value("mesh_type", std::string()) == "hex");
         // Exotic-type + auto-pick controls (Simple/Advanced mode). Defaults preserve existing
         // behavior: auto_type off; structured-hex falls back to tet on a non-box part.
@@ -2367,7 +2368,7 @@ inline uint64_t mesh_opts_key(const MeshOptions& o, uint64_t h) {
     h = fnv1a(&o.min_size_mm, sizeof o.min_size_mm, h);
     h = fnv1a(&o.max_size_mm, sizeof o.max_size_mm, h);
     h = fnv1a(&o.optimize, sizeof o.optimize, h);
-    h = fnv1a(&o.algorithm3d, sizeof o.algorithm3d, h);
+    h = fnv1a(&o.backend, sizeof o.backend, h);
     h = fnv1a(&o.structured, sizeof o.structured, h);
     h = fnv1a(&o.auto_type, sizeof o.auto_type, h);
     h = fnv1a(&o.quad_surface, sizeof o.quad_surface, h);

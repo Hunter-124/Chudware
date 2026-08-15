@@ -62,6 +62,19 @@ struct MeshOut {
     std::string error;  // non-empty when ok==false
 };
 
+// Which mesh generator to drive. Both backends emit the same normalized tet4 / tet10
+// contract above, so every solver, overlay and viewport path is backend-agnostic.
+enum class MesherBackend {
+    Netgen = 0,   // nglib OCC pipeline: curvature-adaptive, structured hex, quad surfaces
+    Polymesh = 1  // Polyhedral-FEA graded Cartesian fill (BSD-3); independent second opinion
+};
+
+// Stable wire/persistence spelling. Unknown text resolves to Netgen.
+MesherBackend mesher_backend_from_string(const std::string& name);
+const char* mesher_backend_name(MesherBackend backend);
+// False when the build was configured without CHUDWARE_WITH_POLYMESH.
+bool mesher_backend_available(MesherBackend backend);
+
 struct MeshOptions {
     // Primary control: 0 = coarse, 1 = fine. Base element size is derived from the
     // bounding-box DIAGONAL (not the smallest side) so plates/brackets/shafts all get a
@@ -86,8 +99,14 @@ struct MeshOptions {
     double min_size_mm = 0.0;      // >0 overrides base*0.5 (the auto 2:1 size band floor)
     double max_size_mm = 0.0;      // >0 overrides base
     bool optimize = true;          // run Netgen's surface + volume quality optimizers
-    int algorithm3d = 1;           // legacy gmsh Mesh.Algorithm3D knob; accepted but not
-                                   // mapped (Netgen uses Delaunay + advancing front)
+    // --- Mesher backend -------------------------------------------------------
+    // Which mesh generator produces the volume mesh. Netgen (nglib, LGPL) is the
+    // default and the only backend that supports curvature-adaptive sizing and
+    // structured hex. Polymesh (Polyhedral-FEA, BSD-3) is a second, independent
+    // generator: a Cartesian grid fill with a graded boundary skin, useful both as a
+    // fallback when Netgen rejects a STEP and as a cross-check that a result is not
+    // an artifact of one mesher. Both emit the same tet4 / tet10 contract.
+    MesherBackend backend = MesherBackend::Netgen;
 
     // Structured hexahedral meshing: when true, mesh_step delegates to mesh_box_hex,
     // which produces a regular nx*ny*nz grid of 8-node hexes for a box/rectangular-prism
@@ -177,5 +196,13 @@ void mesh_cache_note_generation();
 // Per-solid component cache observability (mesher multi-solid path).
 void mesh_cache_note_component_hit();
 void mesh_cache_note_component_miss();
+
+namespace detail {
+// Fill MeshOut's quality block (aspect min/avg/max + histogram, scaled-Jacobian floor,
+// min volume, poor-element percentage) from its points/tets. Shared by every mesher
+// backend so the numbers are directly comparable; returns false (and sets MeshOut::error)
+// on malformed or non-finite connectivity.
+bool fill_quality(MeshOut& out);
+}  // namespace detail
 
 }  // namespace chudware::sim

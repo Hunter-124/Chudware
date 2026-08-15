@@ -2854,10 +2854,11 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             // Curvature-adaptive tet mesher (wraps Netgen / nglib). Params:
             //   {"step_path", "fineness"(0..1)|"density"(legacy), "order"|"mesh_order",
             //    "curvature"(bool), "curv_elems_per_circle", "target_size_mm",
-            //    "min_size_mm", "max_size_mm", "optimize"(bool), "algorithm3d",
-            //    "structured"|"mesh_type"=="hex", "auto_type"(bool, Simple-mode geometry
-            //    pick), "quad_surface"(bool, quad-dominated surface), "fallback_to_tet"(bool,
-            //    default true), "thin_wall_layers"(double)}.
+            //    "min_size_mm", "max_size_mm", "optimize"(bool),
+            //    "mesher_backend"("netgen"|"polymesh"), "structured"|"mesh_type"=="hex",
+            //    "auto_type"(bool, Simple-mode geometry pick), "quad_surface"(bool,
+            //    quad-dominated surface), "fallback_to_tet"(bool, default true),
+            //    "thin_wall_layers"(double)}.
             // Returns points[n*3], tets[m*K] (0-based), counts, quality metrics (aspect
             // min/avg/max, jacobian_min, pct_poor, aspect_hist), plus mesh_type_used + note
             // (the element type actually produced and any auto-pick/fallback decision) for the GUI.
@@ -2876,7 +2877,13 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             opts.min_size_mm = params.value("min_size_mm", 0.0);
             opts.max_size_mm = params.value("max_size_mm", 0.0);
             opts.optimize = params.value("optimize", true);
-            opts.algorithm3d = params.value("algorithm3d", 1);
+            opts.backend = chudware::sim::mesher_backend_from_string(
+                params.value("mesher_backend", std::string("netgen")));
+            if (!chudware::sim::mesher_backend_available(opts.backend))
+                return emit(json{{"ok", false},
+                                 {"error", "sim_mesh: mesher_backend 'polymesh' is not "
+                                           "available in this build"}},
+                            out_json, 0);
             opts.structured = params.value(
                 "structured", params.value("mesh_type", std::string()) == "hex");
             opts.auto_type = params.value("auto_type", false);
@@ -2904,7 +2911,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                              {"pct_poor", r.pct_poor},
                              {"aspect_hist", r.aspect_hist},
                              {"mesh_type_used", r.mesh_type_used},
-                             {"note", r.note}},
+                             {"note", r.note},
+                             {"mesher_backend", chudware::sim::mesher_backend_name(opts.backend)}},
                         out_json, 0);
         }
         if (m == "sim_run_static") {
@@ -2939,7 +2947,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     opts.min_size_mm = study.value("min_size_mm", 0.0);
                     opts.max_size_mm = study.value("max_size_mm", 0.0);
                     opts.optimize = study.value("optimize", true);
-                    opts.algorithm3d = study.value("algorithm3d", 1);
+                    opts.backend = chudware::sim::mesher_backend_from_string(
+                        study.value("mesher_backend", std::string("netgen")));
                     opts.structured = study.value(
                         "structured", study.value("mesh_type", std::string()) == "hex");
                     opts.auto_type = study.value("auto_type", false);
@@ -3022,7 +3031,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     opts.min_size_mm = study.value("min_size_mm", 0.0);
                     opts.max_size_mm = study.value("max_size_mm", 0.0);
                     opts.optimize = study.value("optimize", true);
-                    opts.algorithm3d = study.value("algorithm3d", 1);
+                    opts.backend = chudware::sim::mesher_backend_from_string(
+                        study.value("mesher_backend", std::string("netgen")));
                     opts.structured = study.value(
                         "structured", study.value("mesh_type", std::string()) == "hex");
                     opts.auto_type = study.value("auto_type", false);

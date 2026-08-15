@@ -1,7 +1,7 @@
 # Contract: Part Sourcing Fan-out — `aicad.part_source/1`
 
 > Version 1 (Parts Library V2, workstream 5). The result envelope of the deterministic
-> sourcing fan-out (`engine_oracle/parts_hub/source.py`, exposed as the `part_source`
+> sourcing fan-out (`services/parts/source.py`, exposed as the `part_source`
 > MCP tool and the copilot's mission-scoped `part_source` wrapper). Append-only per
 > `contracts/README.md`: new OPTIONAL fields may be added additively without a bump.
 >
@@ -127,7 +127,7 @@ the bar is deliberately high):
 
 When the user accepts the `reverse_engineer` fallback, the RE suite must start
 already loaded with everything scrapable about the product. A **media-harvest** step
-(`engine_oracle/parts_hub/product_media.py :: harvest_product_media(url|part_id)`)
+(`services/parts/product_media.py :: harvest_product_media(url|part_id)`)
 fetches the product page under the user's own browser session and collects EVERY
 candidate image (product photos, gallery `<img>`/`srcset`, og:image) and document
 (datasheet/manual/spec `.pdf` and doc links), returning
@@ -136,7 +136,7 @@ redistributed. The harvest feeds one call that stands up the session:
 
 `reveng_start_from_product(part_id|url)` → `reveng_start_session(seed)` +
 `reveng_add_images(images)` + `reveng_ingest_datasheet(documents)` (the existing
-`engine_oracle/reveng_rpc.py` worker methods), returning the new `session_id` +
+`services/reveng/worker_rpc.py` worker methods), returning the new `session_id` +
 `activeWorkspace = ReverseEng` so the GUI opens the RE tab pre-populated. The harvest
 is best-effort: zero images/documents still starts a session (the user adds their own
 photos), never a traceback.

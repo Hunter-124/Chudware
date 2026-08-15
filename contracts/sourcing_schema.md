@@ -5,12 +5,12 @@
 > changes to an existing field's meaning require integrator sign-off + a version bump. New
 > OPTIONAL fields may be added additively without a bump.
 >
-> Producers: `engine_oracle/parts_providers.py` (providers), the BOM roll-up, quote adapters
+> Producers: `core/sourcing/providers.cpp` (providers), the BOM roll-up, quote adapters
 > (Xometry / JLCPCB). Consumers: cost-model, sourcing UI, the local sourcing model.
 >
 > **Compliance is normative.** No website scraping. Providers use a supplier's *approved* API
 > with the customer's own credentials, or user-registered downloads. Provider API keys are
-> configuration (`%APPDATA%/Chudware/config.json`), never committed. See `docs/PARTS_LIBRARY.md`
+> configuration (`%APPDATA%/Chudware/config.json`), never committed.
 > and `CONTRIBUTING.md`.
 
 ## 0. Conventions
@@ -28,7 +28,7 @@
 
 ## 1. VendorPart (extended)
 
-`VendorPart` (`engine_oracle/vendor_parts.py`) is the cached supplier-part record. The sourcing
+`VendorPart` (`services/parts/vendor_parts.py`) is the cached supplier-part record. The sourcing
 fields below are **additive and OPTIONAL** — every pre-sourcing record and any code constructing
 a `VendorPart` without price data stays valid, so the registry `index.json` needs **no
 schema-version bump**. Fields default to `None`/empty so "no price feed" is byte-compatible with
@@ -74,7 +74,7 @@ tier whose `qty <= q`, falling back to `unit_price`.
 
 ## 2. PartProvider interface
 
-`PartProvider` (`engine_oracle/parts_providers.py`) is the pluggable supplier seam. A provider
+`PartProvider` (`core/sourcing/providers.cpp`) is the pluggable supplier seam. A provider
 resolves a supplier part number to a registered `VendorPart` record, optionally with pricing.
 
 ```python

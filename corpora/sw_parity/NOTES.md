@@ -5,7 +5,7 @@ are derived from geometric first principles and should be validated by the human
 expert) before treating any DIVERGE as a confirmed bug.
 
 **Date**: 2026-06-15  
-**Python solver**: `engine/doc/sketch_solver.py` (`solve_sketch`)  
+**Solver**: `core/sketch/sketch.cpp`
 **Runner**: `corpora/sw_parity/_run_fixtures.py`  
 **Total fixtures**: 18 across 6 families  
 **Result**: 9 AGREE · 9 DIVERGE · 0 ERROR
@@ -152,11 +152,10 @@ reference to one of the lines.
 ### F4e — Coincident circle centers with tangent (BUG-1 — RESOLVED 2026-06-15)
 
 **Status**: FIXED. The degenerate-Jacobian guard at d=0 now uses a deterministic
-fallback unit direction (+x) in BOTH engines (`_add_tangent_circle_circle` in
-`engine/doc/sketch_solver.py` and `add_tangent_circle_circle` in
-`core/sketch/sketch.cpp`). Newton now has a position gradient and separates the
-centers cleanly. Regression guard fixture: `corpora/sketch/hardening_tangent_cc_coincident.json`
-(passes Python↔C++ parity: dof=0, converged=True, conflicting=[]).
+fallback unit direction (+x) in `add_tangent_circle_circle` in
+`core/sketch/sketch.cpp`. Newton now has a position gradient and separates the
+centers cleanly. Regression guard fixture:
+`corpora/sketch/hardening_tangent_cc_coincident.json`.
 
 **Resolved geometry to confirm against SolidWorks** (guard fixture: e1 = circle
 r=10 fixed at origin; e2 = circle r=5 starting at the SAME center (0,0); centers

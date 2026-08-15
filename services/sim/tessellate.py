@@ -9,7 +9,7 @@ Exports:
   disp_chunk(body_id, scale_hint, vectors) -> bytes
   lines_chunk(name, polylines, scalars=None) -> bytes
 
-OCP call paths (verified on OCP 7.8.1 — docs/PLAN.md §3):
+OCP call paths (verified on OCP 7.8.1):
   BRepMesh_IncrementalMesh(shape, lin_defl, False, ang_defl, True).Perform()
   TopExp.MapShapes_s for FACE/EDGE/VERTEX index maps
   BRep_Tool.Triangulation_s(face, loc) + loc.Transformation() to world-space nodes

@@ -81,7 +81,7 @@ copies it onto the component (`eng_overrides`), and `update_board_from_sch` carr
 the board footprint as `footprint.eng_overrides` (a direct `footprint.fields.eng` dict is
 also honored). Board footprints also gain a `libid` back-link to the placing symbol.
 
-### Merge precedence (resolver: `engine/ecad/metadata.py`)
+### Merge precedence (resolver: `services/ecad/metadata.py`)
 
 ```
 footprint eng  <  symbol eng  <  per-instance override      (later wins)

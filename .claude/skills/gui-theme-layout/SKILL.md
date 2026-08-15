@@ -15,7 +15,7 @@ modals. What individual panels *contain* belongs to their own specialist skills.
 | `host/src/ui_theme.cpp/.h` (~1.6k LOC) | Liquid Glass v2: palette (dark default + light), glass helpers, elevation. **The ONLY place colors are defined** |
 | `host/src/ui/widgets/kit.h/.cpp` (~1.4k LOC, 49 entry points) | `ui::kit` — the app-wide **widget** vocabulary. ONE implementation of every composite widget. Read its header comment before adding any painter |
 | `host/src/ui/anim.h/.cpp` | `ui::anim` — the app-wide **motion** vocabulary: duration tokens, easings, the per-id tween, and the frame pump |
-| `contracts/GLASS_DESIGN_SPEC.md` | Frozen visual-system spec — read before changing any glass behavior |
+| `docs/design/GLASS_DESIGN_SPEC.md` | Frozen visual-system spec — read before changing any glass behavior |
 | `host/src/ui/layout.cpp/.h` | ImGui dockspace, pinned glass columns, overlay band, `resetOverlayColumns()` |
 | `host/src/ui/metrics.h` | DPI-aware fonts/spacing — all sizes scale through this |
 | `host/src/ui/settings_modal.cpp` | Settings dialog (theme toggle, AI provider, units, glass knobs) |

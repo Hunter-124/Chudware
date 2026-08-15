@@ -156,7 +156,7 @@ outliving its binaries:
   on glibc 2.43 requires host glibc ≥ 2.43 — build on an older base for wider
   distro coverage. freetype/fontconfig/libX11 are likewise host-provided (they
   interoperate with the host's fonts/X server; present on any GUI machine).
-- **Windows** (`services/installer/` + `packaging/windows/Chudware.iss`):
+- **Windows** (`services/installer/` + `packaging/windows/chudware.iss`):
   `build_release.py` stages `chudware-hostd.exe` (+ `.pdb`) into the payload;
   `install.ps1`/`uninstall.ps1` first run `<InstallDir>\chudware-hostd.exe --stop`
   and then a taskkill scoped to processes whose image path is under the install

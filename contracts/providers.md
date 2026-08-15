@@ -204,7 +204,7 @@ edits — `services/mcp/tool_registry.py` + the wiring in `services/mcp/server.p
 
 ## 7. `routing` — per-insertion-point adapter routing (T-H9, additive)
 
-Per-task LoRA serving (Pillar 16, `docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §5.7-5.8). A
+Per-task LoRA serving (Pillar 16, `docs/review/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §5.7-5.8). A
 served model enters the app as *just another provider* under §2 — the `vllm` adapter
 (`services/agent/providers/vllm_provider.py`) is an OpenAI-compatible client pinned to a vLLM
 instance launched with `--enable-lora`; the LoRA is selected by the request `model` field (the

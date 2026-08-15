@@ -3,7 +3,7 @@
 Status: **design** (2026-07-16). Grounded on first-cut commit `f538b36c` and live code in
 `services/agent/corporate.py`, `coordination.py`, `delegation.py`, `mission_dispatch.py`,
 `role_models.py`, `config.py`, `test_corporate.py`, `contracts/agent_events.md`, and the
-Corporate Roles settings box in `host/src/ui/legacy_chat.cpp` (`drawOvCorporateRolesBox`).
+Corporate Roles setting in `host/src/ui/settings_modal.cpp`.
 
 This document is the design of record for Corporate Roles **org mode** — how Chudware's copilot
 runs complex multi-domain missions as a company instead of a flat spawn tree. The first cut
@@ -510,8 +510,8 @@ head-pool allocation.
 
 ### 8.1 What the user should see
 
-1. **Settings → Agents → Corporate Roles** (exists: `drawOvCorporateRolesBox` in
-   `legacy_chat.cpp`): toggle + max departments, team leads, meeting cadence, director review.
+1. **Settings → AI → Behavior** (exists in `host/src/ui/settings_modal.cpp`):
+   toggle company-structure auto-routing.
 2. **During a run (design):**
    - Org chart panel or Activity-tree section: director → depts → heads → workers (status chips).
    - Meeting digests as chat/Activity cards (done/blocked counts, trigger).
@@ -701,7 +701,7 @@ otherwise the feature remains a library without a runtime.
 | Deliverable org (other system) | `services/agent/org.py` |
 | Tests | `services/agent/test_corporate.py` |
 | Contract | `contracts/agent_events.md` § aicad.corporate/1 |
-| Settings GUI | `host/src/ui/legacy_chat.cpp` (`drawOvCorporateRolesBox`, `OvCorporateCfg`) |
+| Settings GUI | `host/src/ui/settings_modal.cpp` (`settings.corporateMode`) |
 
 ---
 

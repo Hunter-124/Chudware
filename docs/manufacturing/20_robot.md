@@ -201,7 +201,7 @@ unreachable from our code.
 | `services/manufacturing/robot/evidence.py` | `mfg.robot.*` event construction, `FreshValue` wrapping, falsified/superseded notices |
 | `services/manufacturing/robot/determinism.py` | canonical ordering, output quantisation, state hashing, fixed-seed LCG |
 | `services/manufacturing/robot/store.py` | content-addressed analysis/plan/reach artifact store under the app cache |
-| `services/manufacturing/robot/worker_methods.py` | `WORKER_METHODS` dict registering every `mfg_robot_*` method (same registration idiom as `engine/doc/drawing.py`'s `drawing.WORKER_METHODS`, `contracts/worker_rpc.md:251`) |
+| `services/manufacturing/robot/worker_methods.py` | `WORKER_METHODS` dict registering every `mfg_robot_*` method (same registration idiom as `services/worker_main.py`'s `drawing.WORKER_METHODS`, `contracts/worker_rpc.md:251`) |
 | `services/manufacturing/robot/smoke_offline.py` | end-to-end smoke: import → reach → plan → analyse → export ×3 → print capability + gate + evidence tables |
 
 ### 3.2 New — MCP tool surface
@@ -253,7 +253,7 @@ struct RobotBackplot {
 | `services/mcp/tool_registry.py` | **not edited by robot** — the two `_RISK_OVERRIDES` rows (`:64-70`) are handed to Gateway, sole owner of this file's risk-class edit for the batch (`GW-RISK-TABLE-OWNER`) | See §5.2 — two tools persist artifacts and must be tightened to `RISK_WRITE` despite read-shaped names; five concurrent appenders would each break the others' unchanged-`classify_risk` assertion. |
 | `services/agent/config.py` | **not edited by robot.** The edit is exactly as analysed in §3.7 — **+1 entry** in `DEFAULT_TOOL_FAMILIES` (`:589-593`) and **+1 new** `DEFAULT_OFF_TOOL_FAMILIES = ("manufacture",)` consulted in the `else` branch of `get_tool_families` (`:1004-1005`) — but it is **Gateway-owned in W1.1** and lands before any MCP wave (`GW-FAMILY-MANUFACTURE`) | **Required, not cosmetic** — see the trap in §3.7. Robot's wave is not first, so robot cannot own the file that decides whether *every* domain's surface ships enabled. |
 | `host/CMakeLists.txt` | **+2 source entries** (`robot_panel.cpp`, `robot_mirror.cpp`) | No new target, no new dependency, no new link, no C ABI symbol. Top-level/root CMake is untouched. |
-| `engine/worker.py` (or the doc-worker method registry that consumes `WORKER_METHODS`) | **+1 registration line** for `services.manufacturing.robot.worker_methods.WORKER_METHODS` | Same idiom `contracts/worker_rpc.md:251` documents for `drawing.WORKER_METHODS`. `[TO CONFIRM]` the exact registration call site in `engine/worker.py`; the pattern is contract-documented, the line number is not in my read scope. |
+| `services/worker_main.py` (or the doc-worker method registry that consumes `WORKER_METHODS`) | **+1 registration line** for `services.manufacturing.robot.worker_methods.WORKER_METHODS` | Same idiom `contracts/worker_rpc.md:251` documents for `drawing.WORKER_METHODS`. `[TO CONFIRM]` the exact registration call site in `services/worker_main.py`; the pattern is contract-documented, the line number is not in my read scope. |
 
 ### 3.6 New — fixtures (synthetic, project-owned)
 
@@ -1315,7 +1315,7 @@ content is specified so the integrator appends rather than designs.
 
 Marked so nobody mistakes them for verified facts.
 
-- `[TO CONFIRM]` the `engine/worker.py` registration call site for a `WORKER_METHODS` module. The
+- `[TO CONFIRM]` the `services/worker_main.py` registration call site for a `WORKER_METHODS` module. The
   idiom is contract-documented (`contracts/worker_rpc.md:251`); the exact line is not in my read set.
 - `[TO CONFIRM]` the Manufacture ribbon group registration file, and whether a robot-specific
   `ui::Palette` role set is preferred over reusing the CAM roles I observed at

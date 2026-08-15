@@ -3,9 +3,9 @@
 > **Frozen seam.** Append-only; changes require integrator sign-off + a version bump
 > (see `contracts/README.md`). This is the executable-backed schema for the piping
 > discipline module, a sibling of `engine.doc` / `engine.ecad`. The executable form is
-> `engine/piping/schema.py` (structural validation only — geometry realizability and
-> catalog resolution are separate passes in `engine/piping/catalog.py` +
-> `engine/piping/threed.py`, exactly as ECAD keeps DRC/3D out of its schema validator).
+> `services/piping/schema.py` (structural validation only — geometry realizability and
+> catalog resolution are separate passes in `services/piping/catalog.py` +
+> `services/piping/threed.py`, exactly as ECAD keeps DRC/3D out of its schema validator).
 
 ## 1. Scope & conventions
 
@@ -139,7 +139,7 @@ type,nps,nps2,center_to_end,length,flange_class,od,thickness,bolt_circle,bolt_ho
 
 ## 7. Realization pipeline (informative)
 
-`engine/piping/threed.py` turns an `aicad.piping/1` doc into geometry:
+`services/piping/threed.py` turns an `aicad.piping/1` doc into geometry:
 
 1. `piping_to_step(doc, out_path)` → OCCT sweep of each run's annular section along its
    filleted centreline + parametric fitting solids → one `Compound` → STEP on disk. Returns

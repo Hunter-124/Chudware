@@ -1,7 +1,7 @@
-# Clean-room standard-part specification tables (`engine_oracle/data/bolts/`)
+# Clean-room standard-part specification tables (`services/parts/data/bolts/`)
 
-These YAML tables are the deterministic spec-sheet lookup source for
-`engine_oracle/spec_sheet_matcher.py` (task T-B4). They map a standard designation
+These YAML tables are the deterministic spec-sheet lookup source for the
+standard-part matcher in `core/parts/` (task T-B4). They map a standard designation
 (ISO 4762 M3, deep-groove bearing 608, …) to nominal dimensions and to a
 `core/parts` catalog **family + size**, so a normalized manufacturer part number can
 resolve to real, editable geometry via the `parts_make` RPC.
@@ -25,7 +25,7 @@ clean-room original data, GPL-clean.
 
 The schema is a small, documented subset chosen to interoperate with BOLTS `.blt`
 concepts (a *collection* of *standards*, each a *table* of size → parameters). The
-loader (`engine_oracle/bolts_loader.py`) parses this format; a user who points it at
+loader (`services/parts/bolts_loader.py`) parses this format; a user who points it at
 their own installed BOLTS checkout (their license, their choice) can be supported by
 the same parser without us redistributing GPL data.
 

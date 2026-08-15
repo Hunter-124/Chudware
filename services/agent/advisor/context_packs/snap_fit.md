@@ -1,6 +1,6 @@
 # Snap-fit context pack
 # Source: services/research/calcs/snap_fit.py;
-#         engine_oracle/sim/materials.json (E_mpa, yield_mpa per material_id)
+#         services/sim/materials.json (E_mpa, yield_mpa per material_id)
 #         Reference: Bayer Design Guide "Snap-Fit Joints for Plastics" (1998);
 #                    Shigley's §4-1 cantilever deflection
 

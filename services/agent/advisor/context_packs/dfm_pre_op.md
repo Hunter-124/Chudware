@@ -10,7 +10,7 @@
   check, the measured value, the process minimum, and the delta to fix.
 - Apply only checks relevant to the selected process. If the process is unknown and changes
   the design decision, resolve it or ask; do not invent a process or block on irrelevant rules.
-- Process minimums (from ProcessProfile table — source: engine_oracle/dfm/):
+- Process minimums (from the ProcessProfile table in `core/dfm/process_profiles.cpp`):
   - FDM: min wall ~1.2 mm, no draft required
   - Injection molding: min wall ~1.0 mm, ≥1° draft required on vertical faces
   - SLA: min wall ~0.6 mm, no draft required

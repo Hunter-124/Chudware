@@ -1,6 +1,6 @@
 # Thin wall context pack
 # Source: services/research/calcs/wall_thickness.py;
-#         engine_oracle/sim/materials.json
+#         services/sim/materials.json
 #         Reference: Machinery's Handbook 31st ed. §Plastics Mold Design;
 #                    manufacturer DFM guides (Xometry, Protolabs)
 

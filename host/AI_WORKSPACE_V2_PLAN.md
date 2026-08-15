@@ -6,9 +6,9 @@
 >
 > **Ownership / collision rule:**
 > - `host/src/ui/ai/ai_workspace.cpp` — the main AI-workspace surface (M1–M11, M15–M17 layout/DAG).
-> - `host/src/ui/legacy_chat.cpp` — the **shared** chat renderer, ALSO the docked Copilot. Edit surgically (M12–M14, M18–M19 touch it).
+> - `host/src/ui/copilot/` — the shared chat renderer and docked Copilot.
 > - `host/src/ui/activity_panel.cpp/.h` — existing `events.jsonl` consumer (`parseEvents`/`drawAttempt`); reuse/extend for the DAG store.
-> - Backend event emission lives in `services/agent/` (loop.py, agent_turn.py, delegation.py, ladder.py, ledger.py), `services/dag/` (executor.py, node_runner.py, event_journal.py), and the `engine_oracle` worker transport (`services/worker/worker_client.cpp`).
+> - Backend event emission lives in `services/agent/`, `services/dag/`, and the worker transport in `services/worker/`.
 
 ---
 
@@ -137,19 +137,19 @@ The current `drawDagView` renders `*.buildgraph.json` — the **mission plan gra
 
 ### Phase 3 — Chat transparency (M12, M13, M14) — **gated on Phase 0**
 - **Goal:** show context-injection events, streamed thoughts, and tool calls (tool + target) inline in the chat.
-- **Files:** `host/src/core/app_state.h` (extend `ActivityItem`/add a tool-call/context row type); `host/src/ui/legacy_chat.cpp` (`feedTurnActivity` `:527–605` to fold the new `agent.tool_call`/`agent.context_injected`/`agent.thought` kinds; `drawActionCard` `:991`/`drawAgentTimeline` `:1089` to render tool+target and injection rows). **Edit `legacy_chat.cpp` surgically — it is the shared docked Copilot renderer.**
+- **Files:** `host/src/core/app_state.h` (extend `ActivityItem`/add a tool-call/context row type) and `host/src/ui/copilot/` (fold the new `agent.tool_call`/`agent.context_injected`/`agent.thought` kinds into the shared docked Copilot renderer).
 - **Deps:** Phase 0.
 - **Closes:** M12, M14; **M13 partial** (falls back to completed-block thoughts if streaming unavailable — see Q4).
 
 ### Phase 4 — Subagent open/steer + recolor/lock/read-only (M11, M15, M16, M17) — **gated on Phase 0 + Phase 2**
 - **Goal:** click a subagent node (incl. active) → open/steer its chat in the main conversation window; recolor + lock while viewing a subagent.
-- **Files:** `host/src/ui/ai/ai_workspace.cpp` (subagent-node click → set a "viewing subagent" mode bound to a subagent_id/run_id; route its conversation into the main chat window); `host/src/ui/legacy_chat.cpp` (recolor the conversation, disable "end chat", make model/effort/starting-prompt read-only when in subagent-view mode); `host/src/core/app_state.h` (subagent-view state + subagent chat registry). Requires a **subagent session registry** (from `agent.spawn` events, Phase 0).
+- **Files:** `host/src/ui/ai/ai_workspace.cpp` (subagent-node click → set a "viewing subagent" mode bound to a subagent_id/run_id; route its conversation into the main chat window); `host/src/ui/copilot/` (recolor the conversation, disable "end chat", make model/effort/starting-prompt read-only when in subagent-view mode); `host/src/core/app_state.h` (subagent-view state + subagent chat registry). Requires a **subagent session registry** (from `agent.spawn` events, Phase 0).
 - **Deps:** Phase 0 (spawn events + registry), Phase 2 (subagent nodes to click).
 - **Closes:** M11, M15, M16, M17.
 
 ### Phase 5 — Chat UX (M18, M19) — **parallel, independent**
 - **Goal:** composer auto-grows upward (capped); endless lazy scrollback.
-- **Files:** `host/src/ui/legacy_chat.cpp` (`drawComposer` `:3160`/`drawChatInput` `:161` — replace fixed height reserve with dynamic upward growth + cap; `chatDrawLog` `:3513` — virtualize: render only visible range + buffer, lazy-load older `ChatMsg`s). **Shared renderer — surgical edits.**
+- **Files:** `host/src/ui/copilot/` — make the composer grow upward with a cap and virtualize the chat log to render only the visible range plus a buffer.
 - **Deps:** none.
 - **Closes:** M18, M19.
 

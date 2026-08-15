@@ -1014,9 +1014,9 @@ std::optional<Eigen::Vector3d> parse_signed_axis(const json& j) {
     return std::nullopt;
 }
 
-// SCHEMA CONVERGENCE (docs/CPP_MIGRATION.md): accept BOTH the host's canonical
-// feature shape — {id, type, params:{...}, refs:{slot:<sel|datum>}} per
-// engine/doc/schema.py — and the simplified flat shape the early C++ tests use.
+// SCHEMA CONVERGENCE (docs/REFACTOR_LOG.md, T-RF20/T-RF21): accept BOTH the host's
+// canonical feature shape — {id, type, params:{...}, refs:{slot:<sel|datum>}} per
+// contracts/doc_schema.md — and the simplified flat shape the early C++ tests use.
 // We normalize to the flat shape the per-feature compilers already read: params
 // and refs are merged to top level, and the two structural divergences are
 // translated (plane datum "plane.top" -> "top"; region-selector profile list ->
@@ -2102,7 +2102,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         const json& raw = features[_fi];
         // Accept the host's canonical {params,refs} shape OR the simplified flat
         // shape, normalizing to flat so the compilers below read either (see
-        // normalize_feature / docs/CPP_MIGRATION.md schema convergence).
+        // normalize_feature above / contracts/doc_schema.md schema convergence).
         const json feat = normalize_feature(raw);
         const std::string id = feat.value("id", std::string("?"));
         const std::string type = feat.value("type", std::string(""));

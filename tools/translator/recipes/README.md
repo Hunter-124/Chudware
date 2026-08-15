@@ -27,7 +27,7 @@ QLoRA SFT (2 candidates, winner picked by harness)  →  TRL GRPO (deterministic
 | unsupported-claim rate | < 0.1% on held-out **structures** | same |
 | slot coverage | ≥ 98% | same |
 | round-trip re-extraction | exact | `gsl_ser.roundtrip_diff == []` |
-| **kill-switch** | **beat raw GSL templates on downstream task success, never lose on fidelity** | downstream-task harness (see `docs/RECOGNITION_RESIDUAL.md`) |
+| **kill-switch** | **beat raw GSL templates on downstream task success, never lose on fidelity** | downstream-task harness (see `docs/review/RECOGNITION_RESIDUAL.md`) |
 
 **Inversion caveat:** `render_caption` scores ~1.0 fidelity BY CONSTRUCTION — it is the
 ceiling. A learned model can at best TIE on fidelity; its reason to ship is the kill-switch

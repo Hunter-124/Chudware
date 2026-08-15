@@ -53,7 +53,7 @@ flowchart LR
    upload size, disk quota across workspace + bucket, WS frame size, and per-account
    rate limits; `/engine` additionally caps concurrent bridges per account. The disk
    monitor touches `~/chudware-web-data/REFUSE_NEW` under disk pressure.
-6. **Chat**: portal-level collapsible sidebar, gateway WS fan-out, SQLite persistence.
+6. **Chat**: portal-level collapsible sidebar, gateway WS fan-out, PostgreSQL persistence.
    Not inside the Chudware binary.
 7. **Layout**: everything under `Webservice/` except the T-R7 subset (services/plm + MCP/worker
    wiring). Secrets only in gitignored files (`Webservice/Cloudflare-info.txt`,

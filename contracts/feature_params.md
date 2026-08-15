@@ -14,7 +14,7 @@
   `angle: dim` (45, method=angle) · `flip: bool` (false)
 - refs: `base: sel(face[plane], datum)` (offset/angle/midplane #1) · `second: sel(face, datum,
   edge)` (angle hinge edge; midplane #2) · `points: [sel(vertex)]×3` (three_point)
-- compiler: `features/datum.py::compile_plane` → build123d `Plane`
+- compiler: `core/doc/document.cpp::compile_plane` → build123d `Plane`
 - errors: non-planar base; colinear points.
 
 ### `axis`
@@ -37,7 +37,7 @@
   written by the `sketch_convert` op, re-projected on every rebuild, `stale:true` on a
   non-resolving source with last-good geometry kept + a feature-status warning)
 - refs: `plane: sel(face[plane], datum)`
-- compiler: `features/sketch.py` — solve → wire graph → closed-loop region detection →
+- compiler: `core/doc/document.cpp` — solve → wire graph → closed-loop region detection →
   pickable region faces (AICM pseudo-body `sketch:<id>`).
 
 ### `sketch3d` (3D free-space sketch)
@@ -64,7 +64,7 @@
 ### `sphere` — `radius: dim` (10); refs `at?`
 ### `cone` — `r1: dim` (10) · `r2: dim` (0) · `height: dim` (20); refs `at?`
 ### `torus` — `major_r: dim` (15) · `minor_r: dim` (3); refs `at?`
-- compiler: `features/primitives.py`; first solid-producing feature creates Body1, later ones
+- compiler: `core/doc/document.cpp`; first solid-producing feature creates Body1, later ones
   default `merge:true` (fuse) — params include `merge: bool` (true) · `mode: "boss"|"cut"` ("boss").
 
 ## Sketched features
@@ -74,7 +74,7 @@
   `depth: dim` (10, blind) · `flip: bool` (false) · `draft: dim` (0) · `draft_outward: bool`
   (false) · `merge: bool` (true)
 - refs: `profile: [sel(region, face[plane])]` (≥1)
-- compiler: `features/extrude.py` → `extrude(...)`; draft via `BRepOffsetAPI_DraftAngle` post-op;
+- compiler: `core/doc/document.cpp` → `extrude(...)`; draft via `BRepOffsetAPI_DraftAngle` post-op;
   cut = boolean subtract; through_all = 1.05× bbox extent both ways as needed.
 - errors: open profile (region detection failed); cut removes nothing (warn).
 
@@ -116,7 +116,7 @@
 - params: `mode: "boss"|"cut"` · `angle: dim` (360) · `flip: bool` (false) · `merge: bool` (true)
 - refs: `profile: [sel(region)]` · `axis: sel(edge[line], datum, region-line)` — axis must not
   cross profile interior (error).
-- compiler: `features/revolve.py` → `revolve(...)`
+- compiler: `core/doc/document.cpp` → `revolve(...)`
 
 ### `sweep`
 - params: `mode: "boss"|"cut"` · `orientation: "follow_path"|"frenet"|"keep_normal"`
@@ -127,7 +127,7 @@
   single guide curve; a 2D sketch, curve feature, or `sketch3d` chain. The guide overrides the
   orientation law and drives profile orientation + SCALING along the path; must differ from the
   path; >1 guide rejected loudly).
-- compiler: C++ `doc/document.cpp` sweep branch → `geom::sweep_profile`
+- compiler: C++ `core/doc/document.cpp` sweep branch → `geom::sweep_profile`
   (`BRepOffsetAPI_MakePipeShell`; guided mode uses `SetMode(guide, CurvilinearEquivalence,
   BRepFill_ContactOnBorder)` so the profile scales to follow the guide).
 - errors: self-intersecting sweep; zero-volume sweep (profile not at path start — gap distance
@@ -136,20 +136,20 @@
 ### `loft`
 - params: `mode: "boss"|"cut"` · `ruled: bool` (false) · `merge: bool`
 - refs: `sections: [sel(region, face)]` (≥2, ordered; PM well preserves pick order)
-- compiler: `features/loft.py` → `loft()` / `ThruSections`
+- compiler: `core/doc/document.cpp` → `loft()` / `ThruSections`
 
 ### `helix` (curve feature; consumed by sweep)
 - params: `pitch: dim` (5) · `height: dim` (20) · `turns: dim?` (null → height/pitch) ·
   `taper: dim` (0) · `start_angle: dim` (0) · `ccw: bool` (true)
 - refs: `base: sel(edge[circle], face[cylinder])`
-- compiler: `features/curves.py` → `Helix(...)`; produces an edge body (pickable as sweep path).
+- compiler: `core/doc/document.cpp` → `Helix(...)`; produces an edge body (pickable as sweep path).
 
 ## Dress-up
 
 ### `fillet`
 - params: `radius: dim` (2)
 - refs: `edges: [sel(edge)]` (≥1)
-- compiler: `features/dress.py::compile_fillet`; **auto-clamp retry** (halve ×3, floor 0.2 mm,
+- compiler: `core/doc/document.cpp::compile_fillet`; **auto-clamp retry** (halve ×3, floor 0.2 mm,
   warning surfaced) — generalizes the proven `kernel._wrap_edge_op` behavior.
 
 #### `fillet` — C30-A additions (implemented; variable size)
@@ -193,7 +193,7 @@
   the face plane (world **+Y** when the plane is ⟂X); `v` = `n×u`, right-handed around the
   **outward** normal. Top face: u=+X, v=+Y; front (−Y) face: u=+X, v=+Z. `bolt_circle` uses
   the same frame (`start_angle` measured from `u`).
-- compiler: `features/hole.py` → `Hole/CounterBoreHole/CounterSinkHole` at each point.
+- compiler: `core/doc/document.cpp` → `Hole/CounterBoreHole/CounterSinkHole` at each point.
 
 ## Patterns & mirror — tool-body semantics (normative)
 
@@ -246,7 +246,7 @@ at `K·T` into the thickness), and bend interior angle `θ`:
 - params: `thickness: dim` (2) · `k_factor: dim` (0.45, 0..1) · `default_bend_radius: dim`
   (= thickness)
 - refs: `profile: [sel(region)]` (≥1 closed sketch region)
-- compiler: `features/sheetmetal.py::compile_sm_base_flange` → extrude the region(s) by
+- compiler: `core/doc/document.cpp::compile_sm_base_flange` → extrude the region(s) by
   `thickness`. Stores part-level `{thickness, k_factor, default_bend_radius}` on the body so edge
   flanges inherit them. `resolved`: `{thickness, k_factor, default_bend_radius, volume}`.
 - errors: missing/open profile (no closed region); `thickness ≤ 0`; `k_factor` outside 0..1.
@@ -258,7 +258,7 @@ at `K·T` into the thickness), and bend interior angle `θ`:
   "bend_outside"` ("material_inside") · `flip: bool` (false)
 - refs: `edge: sel(edge[line])` — a STRAIGHT edge on the sheet's thickness (side) face: the bend
   line.
-- compiler: `features/sheetmetal.py::compile_sm_edge_flange` → builds a bend arc (inner radius `R`,
+- compiler: `core/doc/document.cpp::compile_sm_edge_flange` → builds a bend arc (inner radius `R`,
   sweep `angle`) tangent to the parent face + a flat wall of `length` tangent to the bend, at sheet
   thickness, as a cross-section prismed along the bend edge, then FUSED to the sheet body.
 - `position` (mirrors SolidWorks "Flange Position", measured against the picked thickness-face
@@ -284,7 +284,7 @@ at `K·T` into the thickness), and bend interior angle `θ`:
   toward).
 - refs: `edge: sel(edge[line])` — a STRAIGHT thickness-face edge (the fold line), resolved exactly
   like the edge flange's bend edge.
-- compiler: `features/sheetmetal.py::compile_sm_hem` → walks a CONSTANT-THICKNESS strip centerline
+- compiler: `core/doc/document.cpp::compile_sm_hem` → walks a CONSTANT-THICKNESS strip centerline
   (a lead-in run, one bend, a return wall) in the bend-edge frame and prisms it along the edge, then
   FUSES it to the sheet. Hem types differ only in the bend sweep + radius: `closed` = 180° fold at a
   tiny radius (≈ T/2) so the return wall folds flat back against the sheet (gap ≈ thickness);
@@ -304,7 +304,7 @@ at `K·T` into the thickness), and bend interior angle `θ`:
   `position: "material_inside"|"material_outside"|"bend_outside"` ("material_inside") · `flip: bool`
   (false).
 - refs: `edge: sel(edge[line])` — the STRAIGHT thickness-face bend line (as the edge flange).
-- compiler: `features/sheetmetal.py::compile_sm_jog` → TWO opposing bends: bend UP by `angle`, a
+- compiler: `core/doc/document.cpp::compile_sm_jog` → TWO opposing bends: bend UP by `angle`, a
   short inclined connector that climbs the `offset`, then bend BACK by `angle` so the end flange is
   PARALLEL to the original face but offset from it by `offset`, then a flat run of `length`. Built as
   a constant-thickness strip centerline and fused to the sheet. The connector length is solved so
@@ -321,7 +321,7 @@ at `K·T` into the thickness), and bend interior angle `θ`:
 ### `sm_flat_pattern`
 - params: `{}` (none). refs: none. Operates on the RUNNING sheet-metal body plus the per-bend
   records the edge flanges stored (`ctx.datums["_sheet_metal_bends"]`).
-- compiler: `features/sheetmetal_flat.py::compile_sm_flat_pattern` → UNFOLDS the folded part into
+- compiler: `core/doc/document.cpp::compile_sm_flat_pattern` → UNFOLDS the folded part into
   its flat blank. The base flange is the fixed face; each flange is developed flat in the base
   plane. The bend records are SUFFICIENT — they carry `bend_allowance` (BA), the `bend_line`
   endpoints, and the `e_dir`/`length_dir`/`fold_dir` frame — so no re-derivation from the solid is
@@ -357,7 +357,7 @@ sketch, producing weldment members (one solid per segment) with mitre corner tri
 per-member length for the future cut list. Gusset / end-cap / weld-bead and the cut-list TABLE are
 later waves. Canonical units mm/deg.
 
-### Profile library (`engine/doc/weld_profiles.py`)
+### Profile library (`core/geom/weldment.cpp`)
 Each profile is a 2-D cross-section (outer boundary minus any inner void — hollow tubes are
 genuinely hollow), drawn centred on its local origin and swept along +Z by the member compiler.
 Dimension keys (mm) with their defaults:
@@ -381,7 +381,7 @@ depends on this).
   `trim_corners: bool` (true).
 - refs: `sketch: feature-id` (the source sketch; its raw OPEN line/arc segments become the member
   paths — closed loops like circles are skipped) · `segments: [entity-id]?` (default ALL segments).
-- compiler: `features/weldment.py::compile_weld_member`. Per segment: build the profile face,
+- compiler: `core/doc/document.cpp::compile_weld_member`. Per segment: build the profile face,
   orient it perpendicular to the segment at its start (profile plane normal = path tangent), sweep
   along that one segment via OCCT `BRepOffsetAPI_MakePipe` → one member solid. Members are kept as
   SEPARATE bodies (an assembly of members), each appended to the rolling body list so it is
@@ -411,7 +411,7 @@ SEPARATE weldment body (welded in, not fused into a member).
 - refs: `faces: [sel(face)]` — **exactly two** planar face selectors, one on each member at the
   corner (the two coplanar faces facing into the corner, e.g. the members' top faces). Faces resolve
   against ALL current member bodies (members are separate bodies).
-- compiler: `features/weldment.py::compile_weld_gusset`. Recovers each member's axis as the picked
+- compiler: `core/doc/document.cpp::compile_weld_gusset`. Recovers each member's axis as the picked
   face's longest in-plane edge; the corner apex = the near-intersection of the two axis lines; each
   leg points from the apex toward its face centre; the plate (right triangle `apex, apex+d1·leg1,
   apex+d2·leg2`, or the cut-corner pentagon for `polygonal`) is extruded by `thickness` along the
@@ -432,7 +432,7 @@ A plate closing the open END of a hollow member (a tube). SEPARATE weldment body
   plate past the profile on every side).
 - refs: `face: sel(face)` — one planar member END face (its outline is the member's cross-section).
   Resolves against all member bodies.
-- compiler: `features/weldment.py::compile_weld_end_cap`. Outer: a plate from the end face's OUTER
+- compiler: `core/doc/document.cpp::compile_weld_end_cap`. Outer: a plate from the end face's OUTER
   boundary (covers the whole end incl. the bore), optionally grown by `overhang`, extruded outward by
   `thickness`. Inner: a plate from the end face's INNER boundary (the bore), inset into the tube by
   `thickness`. `resolved`: `{thickness, overhang, _cap_area, volume}`.
@@ -467,7 +467,7 @@ A plate closing the open END of a hollow member (a tube). SEPARATE weldment body
   line, or a chain of lines/arcs near the gap it bridges) is the rib's silhouette trace. The PM
   profile well emits a 1-list (parity with extrude); the engine reads that sketch's raw open
   contour (NOT closed-region detection — a rib needs an open contour).
-- compiler: `features/rib.py::compile_rib`. Robust v1: lift the open contour into its sketch plane,
+- compiler: `core/doc/document.cpp::compile_rib`. Robust v1: lift the open contour into its sketch plane,
   extrude it along the in-plane **drop direction** (perpendicular to the contour, toward the body's
   bbox centre) by 1.5× the body diagonal to make the rib **silhouette** face; **thicken** that face
   by `thickness` across the sketch-plane normal (centred for `both`, one-sided for `one`; `draft`
@@ -486,7 +486,7 @@ A plate closing the open END of a hollow member (a tube). SEPARATE weldment body
 - params: `keep: "both"|"above"|"below"` ("both")
 - refs: `tool: sel(face[plane], datum)` — a planar model face or a datum plane that divides the
   body. `+normal` of the plane defines "above".
-- compiler: `features/split.py::compile_split`. Realises the plane's two half-spaces as a large box
+- compiler: `core/doc/document.cpp::compile_split`. Realises the plane's two half-spaces as a large box
   on the +normal side: per running body `above = body ∩ half_space`, `below = body − half_space`.
   `keep="both"` → the body becomes TWO bodies; `above`/`below` → one. Every running body is split;
   a body the plane misses passes through unchanged. `resolved`: `{_split_bodies, _pieces_kept,

@@ -6,7 +6,8 @@
 // This header exposes the SAME shape (a JSON-RPC-style string-in / string-out
 // dispatch) from an in-process C++ DLL, so the host can route already-ported
 // methods here and fall through to Python for the rest. As each feature reaches
-// parity it gets cut over and its Python is deleted (see docs/CPP_MIGRATION.md).
+// parity it gets cut over and its Python is deleted (see docs/REFACTOR_LOG.md,
+// T-RF20/T-RF21 zero-Python cutover).
 //
 // Why a flat C ABI (not C++ classes across the boundary): a C ABI is stable
 // across compilers / CRT versions, so the host (its own MSVC build) and this DLL

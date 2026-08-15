@@ -1,7 +1,7 @@
 # contracts/design_pipeline.md — Design pipeline contract (`aicad.designpipe/1`)
 
 Frozen 2026-07-05 (T-DP1). This is the FROZEN seam for the guided design-thinking
-pipeline — workstream DP. Architecture of record: `docs/AGENT_DESIGN_PIPELINE.md`
+pipeline — workstream DP. Architecture of record: `docs/design/AGENT_DESIGN_PIPELINE.md`
 (Hunter, 2026-07-05). It **refines, it does not replace**, the existing phase machine
 (`services/agent/pipeline/phases.py`), the design ledger (`aicad.ledger/1`,
 `contracts/advisor.md` §2), the design-cognition ladder (`aicad.ladder/1`, §22), the
@@ -20,7 +20,7 @@ interaction contract's `normalize_dimension`).
 
 ## §1 What this contract freezes
 
-Per `docs/AGENT_DESIGN_PIPELINE.md` §5, T-DP1 freezes exactly five things:
+Per `docs/design/AGENT_DESIGN_PIPELINE.md` §5, T-DP1 freezes exactly five things:
 
 1. **Stage IO schemas** — the typed handoffs `feature`, `geometry_spec`, `linkage`,
    `build_node` (§3), written to the ledger as new event kinds (§4).

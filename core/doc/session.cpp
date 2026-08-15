@@ -9851,7 +9851,7 @@ json eval_overlap_bbox(const TopoDS_Shape& common_shape) {
 // ok iff nothing interferes.
 // `include_coincident` (B4, default false) additionally classifies a near-zero-clearance
 // pair (common volume < eps AND DistShapeShape distance <= 1e-6) as a `contacts` entry
-// instead of a `clearances` one (SW-parity "coincident faces" gap, docs/SW_PARITY_GAPS.md).
+// instead of a `clearances` one (SW-parity "coincident faces" gap, docs/SW_PARITY_SPEC.md).
 // `min_clearance_mm` (B4, default 0) tags a `clearances` entry below it with
 // `"warning":"below min clearance"`.
 json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>& members,

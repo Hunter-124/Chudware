@@ -1,11 +1,11 @@
 # Contract: Icon Pipeline — v1
 
-> ~90 programmatically generated icons (PIL, like the proven `host/assets/make_logo.py`),
+> ~90 programmatically generated icons (PIL, like the proven `assets/make_logo.py`),
 > rendered into TWO atlases (light + dark theme) at TWO sizes. No hand-drawn assets.
 
 ## Generation
 
-- Script: `host/assets/make_icons.py` → `host/assets/icons/atlas_dark.png`,
+- Script: `assets/make_icons.py` → `host/assets/icons/atlas_dark.png`,
   `atlas_light.png`, `atlas.json`. Deterministic (no timestamps) so regeneration is diffable.
 - Each icon drawn at 8× supersample, downsampled LANCZOS. Cell sizes: **32 px** (ribbon big
   buttons) and **20 px** (small buttons, tree rows) — both sizes packed into the same atlas,

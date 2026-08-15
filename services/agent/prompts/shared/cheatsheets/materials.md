@@ -32,8 +32,8 @@ flag to the user when a real cert/datasheet matters (aerospace, pressure, safety
 - **Yield vs. ultimate**: printed-polymer "yield" above is closer to an onset-of-permanent-
   deformation number; brittle polymers (PLA) may fracture near or before this value rather than
   yielding plastically — don't assume ductile margin the way you would for the metals.
-- Default the material to PLA for a generic "3D print this" request (matches the FDM/PLA default
-  in `docs/INTAKE_MEASUREMENT_DFM_PLAN.md`'s process profile) unless the user specifies otherwise.
+- Default the material to PLA for a generic "3D print this" request unless the
+  user specifies otherwise.
 
 Sources: MatWeb typical/generic material datasheets (steel, aluminum 6061-T6, 304 stainless,
 brass C360, ABS/PLA/PETG/PA12), consistent with the material table already in `hardware.md` §7.

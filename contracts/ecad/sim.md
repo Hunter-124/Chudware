@@ -1,6 +1,6 @@
 # Contract: Circuit Simulation — v1
 
-> Native Modified-Nodal-Analysis simulator (`engine/sim/circuit.py` + `devices.py`), GPL-clean
+> Native Modified-Nodal-Analysis simulator (`core/sim/spice.cpp` + `devices.py`), GPL-clean
 > (numpy/scipy, BSD). Runs in the sim worker. Inputs: an internal `Circuit` (from a netlist or a
 > SPICE deck) + a `study`. The mandate is to be **better-coupled and more transparent than KiCad's
 > ngspice integration**, not to out-feature SPICE on device count.

@@ -177,7 +177,7 @@ never raises.
 **Hard rules (legal pass):** never wire an agent to MatWeb / MakeItFrom / Matmatch /
 McMaster-Carr (all prohibit programmatic access). _(Exception, owner-directed 2026-07-08:
 an OPT-IN, off-by-default, rate-limited point-lookup path exists at
-`engine_oracle/research/material_web_lookup.py` — tracked as an accepted-risk override in
+`services/research/material_web_lookup.py` — tracked as an accepted-risk override in
 `contracts/license_debt.md` row 17. MatWeb stays effectively unreachable there: it serves a
 CAPTCHA to automated sessions, so that path returns no data. The default automated path
 remains the first-party `material_lookup`.)_ **AGPL never in-process** (e.g.
@@ -192,7 +192,7 @@ Future helpers (T-F2+: `extract_structured`, `material_lookup`, `thread_spec`,
 
 ## 9. `datasheet_fetch(source, tier?)` — authenticated-browser fallback (T-X4, additive)
 
-`engine_oracle/research/datasheet_fetch.py` extracts a datasheet PDF (local path or
+`services/research/datasheet_fetch.py` extracts a datasheet PDF (local path or
 `http(s)` URL) to markdown, returning the §1 envelope plus `url`, `title`, `content`,
 `extractor`, `tier`.
 
@@ -231,7 +231,7 @@ The envelope gains one additive field:
 
 ## Addendum (2026-07-18): Firecrawl key pool
 
-`engine/research/firecrawl_pool.py` supersedes the single-`FIRECRAWL_API_KEY` behavior
+`services/research/firecrawl_pool.py` supersedes the single-`FIRECRAWL_API_KEY` behavior
 described above for Firecrawl-backed fetching. Key sources (merged, deduped, env wins):
 `FIRECRAWL_API_KEYS` (separated list), `FIRECRAWL_API_KEY`, config.json
 `keys.firecrawl` (list or separated string). Rotation semantics: 429 → cool the key

@@ -46,7 +46,7 @@ agent loop (services/agent/loop.py) already writes to the same path pattern via
 `contracts/events.md`; future versions SHOULD also emit the DAG-vocabulary events when
 wrapping a DAG run.
 
-**Replay:** The mission-control panel (`host/src/ui/mission_control_panel.cpp`) scans
+**Replay:** The mission-control panel (`host/src/ui/copilot/activity_timeline.cpp`) scans
 `~/.local/share/Chudware/cache/runs/` for directories containing `events.jsonl` and
 presents them as replayable runs. Loading is triggered on panel open; it re-reads the
 file if the mtime changed.
@@ -251,7 +251,7 @@ Engines (pure): agent.compaction — serialize_transcript, snapcompact_archive (
 Prewalk (C++): planning stages (intake|plan|decompose|review|memory) keep the strong model; implementation stages (model|fix|execute|build) switch once to agent.prewalk_target; run_note on switch; off = byte-identical.
 
 ## Session command RPCs (batch 2b)
-Host passes its ChatMsg transcript as messages[]; RPCs are pure transforms, host applies result. engine_oracle/parts_hub/session_rpc.py SESSION_METHODS merged into worker_rpc.py WORKER_METHODS.
+Host passes its ChatMsg transcript as messages[]; RPCs are pure transforms, host applies result. services/agent/worker_rpc.py SESSION_METHODS merged into worker_rpc.py WORKER_METHODS.
 - session_compact {messages, strategy, keep_recent_tokens?, supersede_reads?, drop_useless?, prior_archive?} -> {ok, kept_messages, archive?, summary, short_summary}
 - session_shake {messages, mode(elide|images), aggressive?} -> {ok, messages, saved_tokens, notice}
 - session_handoff {messages, focus?, provider, model} -> {ok, document} (## Goal/Constraints/Progress/Key Decisions/Critical Context/Next Steps; new-session is host-side)
@@ -273,7 +273,7 @@ Python producer (2026-07-29, additive): `services/agent/task_list.py` publishes 
 | corporate_force | bool | false (true when mode=swarm) | force subagent-manager/corporate |
 | scope | obj | {} | edit targeting {doc_id, feature_ids?, selection?, section?} |
 | advisor | bool | true | advisor on for run + subagents; config agent.advisor default true, env CHUDWARE_ADVISOR honored |
-Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit→task, ask→default(read-only). Mode→tools (Python copilot_mode_tools): ask=read-only; plan=read+plan no mutation; edit=doc mutators no new_part/mission; agent=full+delegate; swarm=full+corporate/delegate. Subagents available in every mode. Plan gate: mode=plan → plan_only run → GUI drawPlanApproveCard (Execute as Agent/Swarm/Cancel) → resend approved_plan+execute_as. C++ (run.cpp/libchudware.cpp) parses these; absent mode = legacy byte-identical.
+Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit→task, ask→default(read-only). Mode→tools (Python copilot_mode_tools): ask=read-only; plan=read+plan no mutation; edit=doc mutators no new_part/mission; agent=full+delegate; swarm=full+corporate/delegate. Subagents available in every mode. Plan gate: mode=plan → plan_only run → GUI drawPlanApproveCard (Execute as Agent/Swarm/Cancel) → resend approved_plan+execute_as. C++ (core/agent/run.cpp / core/api/libchudware.cpp) parses these; absent mode = legacy byte-identical.
 
 ## Mid-run steering (2026-07-19, additive)
 - `agent_steer` (new kind): emitted by the C++ run machine when a queued user steering

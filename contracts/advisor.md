@@ -5,7 +5,7 @@ Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 �
 §23 harness effort presets & user overrides (1.4 → 1.5, T-W28),
 §12 T-DP9 recursion + budget_meter + kill-switch (1.5 → 1.6, additive),
 §11 T-DP5 verdict `targeted_reentry` reroute field (1.6 → 1.7, additive). All bumps additive. Companion to
-`docs/ADVISOR_ARCHITECTURE.md` (Pillar 20) and `docs/COPILOT_MISSION_PIPELINE.md`
+`docs/design/ADVISOR_ARCHITECTURE.md` (Pillar 20) and `docs/design/COPILOT_MISSION_PIPELINE.md`
 (pipeline operation).
 
 1.3 additive amendments to earlier sections:

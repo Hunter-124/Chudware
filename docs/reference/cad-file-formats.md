@@ -44,8 +44,8 @@ short structural summary drawn from that public spec.
   sections: `HEADER` (drawing variables), `CLASSES`, `TABLES` (symbol tables:
   layers, linetypes, text styles, views, UCS, viewports, dimstyles, block records),
   `BLOCKS`, `ENTITIES`, `OBJECTS` (dictionaries, non-graphical objects), `THUMBNAIL`.
-- **This repo:** DXF **import is implemented** — `engine/doc/formats.py` +
-  `engine/doc/formats_dxf.py`, via **ezdxf** (MIT). Modelspace entities
+- **This repo:** DXF **import is implemented** — `services/formats/formats.py` +
+  `services/formats/formats_dxf.py`, via **ezdxf** (MIT). Modelspace entities
   (LINE/CIRCLE/ARC/LWPOLYLINE/POLYLINE/ELLIPSE/SPLINE/INSERT) are converted to
   build123d planar B-rep (closed wires → faces, open wires kept as reference
   wires); text/dimensions/hatches/points/3D-mesh entities are skipped and counted.
@@ -91,7 +91,7 @@ short structural summary drawn from that public spec.
 - **Structure:** `DATA` section of `#id = ENTITY(args);` records; geometry via
   BREP topology (manifold solids, faces on surfaces, edges on curves).
 - **This repo:** **STEP (AP214) is a first-class, bidirectional format** — see
-  `engine/doc/formats.py` (via `build123d.export_step` / `import_step`) and the
+  `services/formats/formats.py` (via `build123d.export_step` / `import_step`) and the
   `.step+` native container contract (`contracts/stepplus.md`), which embeds an
   AP214 `geometry.step` snapshot alongside the full parametric document.
 
@@ -101,7 +101,7 @@ short structural summary drawn from that public spec.
 - **Authoritative public spec:** **IGES 5.3** (publicly available).
 - **Structure:** fixed 80-column records in five sections (Start, Global,
   Directory Entry, Parameter Data, Terminate); entities referenced by DE pointer.
-- **This repo:** **implemented** — `engine/doc/formats.py` via `OCP.IGESControl`
+- **This repo:** **implemented** — `services/formats/formats.py` via `OCP.IGESControl`
   (reader result is face-soup, re-sewn to a shell; volume computed from the
   closed shell).
 
@@ -127,7 +127,7 @@ short structural summary drawn from that public spec.
   (`.dae`, Khronos open), **glTF** (Khronos open spec), Three.js JSON (open),
   SVG (W3C). Easiest format family to implement — no proprietary encoding at all.
 - **This repo:** **STL, OBJ, PLY, glTF/GLB, and 3MF are all implemented**
-  (mesh lane, `engine/doc/formats.py`, via `build123d` mesh export/import,
+  (mesh lane, `services/formats/formats.py`, via `build123d` mesh export/import,
   `trimesh`, and `lib3mf` — see `contracts/licenses.md`). Collada/Three.js
   JSON/SVG are not on the current surface; reference-only.
 
@@ -154,4 +154,4 @@ independent-implementation path is the same one Chudware already follows for
 STEP/IGES/DXF/mesh formats: cite and build from the public spec (or an
 appropriately-licensed open-source library — see `building-format-support.md`),
 never from a proprietary binary. See `docs/reference/README.md` for how this
-survey maps onto `engine/doc/formats.py`'s actual `FORMAT_REGISTRY`.
+survey maps onto `services/formats/formats.py`'s actual `FORMAT_REGISTRY`.

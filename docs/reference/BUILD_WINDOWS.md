@@ -44,7 +44,7 @@ convergence difference.
 
 Windows portability notes baked into the build:
 - `core/cam` gets `_USE_MATH_DEFINES` (MSVC hides `M_PI` behind it; GCC/Clang don't).
-- `ui/abstract` links `nlohmann_json` explicitly (no ambient system include on Windows).
+- The core and host targets link `nlohmann_json` explicitly (no ambient system include on Windows).
 - `test_cam` uses `temp_directory_path()` instead of a hardcoded `/tmp`.
 
 ## 2b. Build the core WITH the OCCT geometry kernel

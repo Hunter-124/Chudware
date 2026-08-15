@@ -67,8 +67,9 @@ largely missing — and **Sheet Metal (39%) / Weldments (36%)** where cuts now p
 flat patterns and corner relief is generated, but miter flange, gauge tables, and
 complete joint trim types remain open.
 
-The implementation backlog derived from every `partial` and `missing` row below is in
-[SW_PARITY_GAPS.md](SW_PARITY_GAPS.md).
+The implementation backlog derived from every `partial` and `missing` row below used to
+live in `SW_PARITY_GAPS.md` (pruned 2026-07-23 in bb29af1c); the status rows in this
+document are now the single source of truth.
 
 ---
 
@@ -730,7 +731,7 @@ genuine differentiators KiCad lacks. Gaps: KiCad write-back export, cross-probe,
 ## Maintenance
 
 This standard is regenerated from the per-area parity catalogs. When a capability lands,
-update its status row here (with new concrete evidence), recompute the affected area's
-scorecard line, and move the corresponding row out of [SW_PARITY_GAPS.md](SW_PARITY_GAPS.md).
+update its status row here (with new concrete evidence) and recompute the affected area's
+scorecard line.
 A capability graduates to `done` only when its evidence is concrete and its full SW
 acceptance condition is met — partial credit stays `partial`.

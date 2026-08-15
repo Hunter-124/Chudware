@@ -12,12 +12,12 @@ Contracts: `contracts/cam.md` — aicad.cam_sim_frames/1, aicad.cam_audit/1, aic
 - core/api/libchudware.cpp:493 `cam_program_from_part()` — AI copilot entry: parses a request string, auto-detects material/dialect, orchestrates cam_new + cam_apply_ops + cam_generate + cam_simulate + cam_post to produce a job tree + gcode
 
 ## How it connects
-CAM is OCCT-free (pure numerics + JSON); geometry arrives inline as Regions/Path2/drill points/TriMesh from either tests/MCP (inline) or a separate geom-layer extractor (product). The session (cam_new/cam_apply_ops/cam_generate) is the state holder; core/cam/session.cpp:103 `generate_setup()` and :291 `cam_generate()` call core/cam/operations.cpp:12 `generate()` to build toolpaths. Feeds/speeds resolve from a cutting database (core/cam/feeds.h/.cpp). This subsystem is complete/parity with Python (engine/cam/ frozen); cam_program_from_part is the AI fast-path used by the MCP `cam_add_operation` / `cam_generate` / `cam_post` chain to automate CAM program generation from a live part.
+CAM is OCCT-free (pure numerics + JSON); geometry arrives inline as Regions/Path2/drill points/TriMesh from either tests/MCP (inline) or a separate geom-layer extractor (product). The session (cam_new/cam_apply_ops/cam_generate) is the state holder; core/cam/session.cpp:103 `generate_setup()` and :291 `cam_generate()` call core/cam/operations.cpp:12 `generate()` to build toolpaths. Feeds/speeds resolve from a cutting database (core/cam/feeds.h/.cpp). `cam_program_from_part` is the AI fast-path used by the MCP `cam_add_operation` / `cam_generate` / `cam_post` chain to automate CAM program generation from a live part.
 
 ## Debugging playbook
 - Build: `cmake -S core -B core/build-standalone && cmake --build core/build-standalone` (CAM builds standalone; no OCCT required)
 - Tests: `ctest --test-dir core/build-standalone -R cam --output-on-failure` (test_cam.cpp ~L39KB; exercises all generators, post dialects, stock sim)
-- Known gotcha: feeds resolution falls back to aluminum defaults if material_id is unrecognized (core/cam/feeds.cpp) — match engine/cam cuts or tests fail
+- Known gotcha: feeds resolution falls back to aluminum defaults if material_id is unrecognized (core/cam/feeds.cpp)
 - Known gotcha: post_setup() escapes GCode comments; ensure dialect comment_open/close match public NC references (no vendor posts copied; clean-room authoring)
 - Stock simulation uses exact triangle-mesh collision; hollow regions (islands) are supported; check SimResult.remaining_stock for leftover material
 

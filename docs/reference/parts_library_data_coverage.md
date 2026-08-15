@@ -9,7 +9,7 @@ validators without manual re-entry.
 
 `research_material_lookup` (`services/research/material_lookup.py`) serves the
 full mechanical property set for named alloys from the **first-party bundled
-registry** (`engine/materials/registry.json`, ASM/MMPDS nominal values), cited,
+registry** (`core/data/materials/registry.json`, ASM/MMPDS nominal values), cited,
 `confidence:"bundled"`, offline-safe. Verified live for the rover alloys:
 
 | alloy    | yield (MPa) | ultimate (MPa) | endurance/fatigue (MPa) | density (g/cm³) | E (MPa) |

@@ -3,7 +3,7 @@
 > One format for everything the viewport draws: B-rep tessellation with picking metadata,
 > Evaluate scalar overlays, FEA results, CFD streamlines. Unknown chunks are skipped (forward
 > compatible). Golden fixture: `fixtures/box.aicm` (+ generator `fixtures/make_box_aicm.py`,
-> byte-stable). Python writer: `engine/doc/tessellate.py`. C++ reader: `host/src/render/aicm_loader`.
+> byte-stable). Python writer: `services/sim/tessellate.py`. C++ reader: `host/src/render/aicm_loader`.
 
 ## 1. Encoding rules
 

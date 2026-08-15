@@ -2,10 +2,11 @@
 
 Run as ``python -m services.intake.test_intake`` from the repo root. Prints one line per case
 (PASS/FAIL) and exits nonzero if anything failed — the project's script-style convention
-(cf. ``engine/dfm/test_process_profiles.py`` / ``engine/test_parts_library.py`` /
+(cf. ``services/parts/test_parts_library.py`` /
 ``services.mcp.test_ecad_tools``), NOT pytest.
 
-Coverage maps to ``docs/INTAKE_MEASUREMENT_DFM_PLAN.md`` and the build spec:
+Coverage maps to the intake design summary in ``services/intake/__init__.py``
+(``docs/INTAKE_MEASUREMENT_DFM_PLAN.md`` was pruned 2026-07-23) and the build spec:
 
 * the worked gearmotor-bracket journey (§1): shaft slip demands a measured value, vision-low and
   hole-spacing-medium both raise demands, a cosmetic dim defaults+flags with no demand, the gate

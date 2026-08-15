@@ -1,7 +1,9 @@
 """Chudware requirements-intake / photo-measurement / first-try-fit "intake brain".
 
-This package is the **pure decision logic** for the subsystem designed in
-``docs/INTAKE_MEASUREMENT_DFM_PLAN.md`` — the part that decides *which* real-world
+This package is the **pure decision logic** for the requirements-intake subsystem
+(designed in ``docs/INTAKE_MEASUREMENT_DFM_PLAN.md``, pruned 2026-07-23 once the wave
+shipped; the design now lives in this docstring and ``contracts/requirements.md``)
+— the part that decides *which* real-world
 dimensions actually gate a mating interface, *how confident* a measurement is, *what to
 ask the user for*, and *whether a part is safe to build*. The plan's north star: the parts
 that **matter** fit on the first try, so metrology and "go measure with calipers" demands

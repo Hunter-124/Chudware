@@ -106,7 +106,7 @@ Rules that make this boundary real:
   `engine::call`. This is 5 added lines in an existing integrator-owned file — no behavior change for
   any existing method.
 - **The Python bridge is a proxy, not a decision maker.** `services/manufacturing/rpc/gateway_rpc.py`
-  exports `WORKER_METHODS` (same registration pattern `engine/doc/drawing.py` uses per
+  exports `WORKER_METHODS` (same registration pattern `services/worker_main.py` uses per
   `contracts/worker_rpc.md` §2 Drawings) and forwards each `mfg_*` request verbatim over a local
   socket, then relays gateway events as worker `event` lines. It contains **zero** policy: no
   approval check, no gate, no lease decision, no state derivation. If the daemon is unreachable it

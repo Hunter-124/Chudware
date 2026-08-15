@@ -6,8 +6,8 @@ owner: unassigned
 status: todo
 branch: task/T-BL61-fillet-segv
 depends_on: []
-lane: core-geom
-kind: bug
+lane: modeling-core
+kind: fix
 priority: 1
 ---
 

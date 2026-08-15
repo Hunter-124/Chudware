@@ -7,7 +7,7 @@ source of truth for workstream R. Detailed schemas freeze in `contracts/plm.md`
 (T-R1) — this doc fixes intent, UX model, and architecture direction.
 
 > **T-R1 CONTRACT FROZEN (2026-07-03).** The detailed schemas are now frozen in
-> [`contracts/plm.md`](../contracts/plm.md) (`aicad.plm/1`). The OSS survey +
+> [`contracts/plm.md`](../../contracts/plm.md) (`aicad.plm/1`). The OSS survey +
 > git-binding verdict live in [`docs/review/PLM_OSS_SURVEY.md`](../review/PLM_OSS_SURVEY.md):
 > **git binding = dulwich (Apache-2.0 arm) primary, subprocess `git` optional
 > accelerator, pygit2 declined** (lightweight + cross-platform + Fedora/Windows

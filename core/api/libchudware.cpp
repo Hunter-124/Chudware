@@ -7,7 +7,8 @@
 //                    env, runs chudware::doc::compile_document, writes the surviving
 //                    bodies to an AICM file, and returns the per-feature statuses
 //                    + body count + the AICM path. This is the strangler's
-//                    parity probe (Step 2 of docs/CPP_MIGRATION.md): the host can
+//                    parity probe (Step 2 of the strangler migration recorded in
+//                    docs/REFACTOR_LOG.md): the host can
 //                    feed the SAME tree it sends to the Python worker and diff the
 //                    results, WITHOUT changing the production Python path.
 //

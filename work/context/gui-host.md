@@ -1,7 +1,7 @@
-# host/src — GLFW+ImGui+OpenGL production desktop GUI (deprecated, porting to ui/imgui/)
+# host/src — sole GLFW+ImGui+OpenGL desktop and web GUI
 
 Scope: host/src/**, host/CMakeLists.txt, host/build-linux
-Contracts: ui/abstract/command_registry (ICommandDispatcher::dispatch routed from app.cpp), contracts/worker_rpc.md (worker JSON-RPC for doc_apply_ops)
+Contracts: contracts/worker_rpc.md (worker JSON-RPC), contracts/doc_ops.md (modeling commands)
 
 ## Entry points
 - host/src/main.cpp:28 `main()` — GLFW window bootstrap, ImGui docking context init, worker stdio bridge spawning
@@ -10,11 +10,10 @@ Contracts: ui/abstract/command_registry (ICommandDispatcher::dispatch routed fro
 - host/src/ui_theme.cpp:1 `glassPanel()` / `glassRowBackground()` / `adaptiveSurface()` — liquid-glass v2 API: blur shaders, elevation levels, text-contrast lookups
 - host/src/ui/scenarios.cpp:1 `loadScenario()` — screenshot harness: m1, sketch, appearance, fea, drawing, asm scenarios
 - host/src/ui/layout.cpp — pinned FeatureManager (left) + Copilot (right) glass columns, doc tabs, ribbon
-- host/src/ui/legacy_chat.cpp — Copilot panel (collapse-to-pill, glass rows, command form integration)
 - host/CMakeLists.txt — deps: GLFW 3.4, Dear ImGui v1.91.6-docking, OpenGL/glad, stb, nlohmann/json
 
 ## How it connects
-Liquid-glass v2 overlay design (docs/GLASS_DESIGN_SPEC.md, HANDOFF_GUI_OVERHAUL.md): pinned glass columns float over full-width viewport; adaptive text contrast + per-group tint settings (AppearanceSettings). Porting to ui/imgui/ in progress; host/ will be deleted once ui/imgui passes deletion criteria (host/DEPRECATED.md: standalone build, feature-surface parity, headless screenshot smoke, feature_surface_audit.py retarget). graphify does NOT index host/src (only ui/abstract + core) — direct grep/read expected and allowed here.
+`host/` is the sole active GUI target. Pinned glass columns float over the full-width viewport, with adaptive text contrast and per-group tint settings. The same host UI tree compiles to WASM for the web app; the retired `ui/imgui` and `ui/abstract` shell has been deleted.
 
 ## Debugging playbook
 - Build (serialized): `flock /tmp/host-build-linux.lock -c "cmake --build host/build-linux -j$(nproc)"` (never run two builds against one dir concurrently)
@@ -24,13 +23,11 @@ Liquid-glass v2 overlay design (docs/GLASS_DESIGN_SPEC.md, HANDOFF_GUI_OVERHAUL.
 - Gotcha: PropertyManager tab removed — PM commands now nested inside FeatureManager tab (header text switches to "Property Manager" when active)
 
 ## Graphify starters
-- graphify query "liquid glass adaptive surface backdrop" (crosses into ui/abstract appearance settings)
-- graphify explain "glass theme API" (GLASS_DESIGN_SPEC material levels + elevation)
+- graphify query "liquid glass adaptive surface backdrop"
+- graphify explain "glass theme API"
 Note: graphify-out does NOT index host/src directly — use targeted grep/read for renderer.cpp details, panel editors, input dispatch.
 
 ## Related tasks/docs
 - work/tasks: grep T-G* (GUI workstream 1–10 tasks, landing liquid-glass, renaming to Chudware, migration DAG)
-- docs/HANDOFF_GUI_OVERHAUL.md (glass core API + styling wave audit), docs/HANDOFF_CHUDWARE_GUI_POLISH.md (FM input fix, transparent columns, Copilot header, sketch HUD dodge)
-- docs/GUI_MIGRATION_DAG.md (node specs, write-sets, verify commands for porting to ui/imgui/)
-- host/DEPRECATED.md (deletion gate criteria: ui/imgui standalone build, feature-surface parity, headless screenshot smoke)
-- docs/GLASS_DESIGN_SPEC.md (design principles, 4 material levels, spacing grid, per-panel rules)
+- docs/design/GLASS_DESIGN_SPEC.md (current design language; the former UI_PATTERN_LIBRARY.md was deleted with the retired ui/imgui shell — the live widget kit is host/src/ui/widgets/kit.{h,cpp})
+- work/WORKFLOW.md §3c (sole-GUI ownership policy)

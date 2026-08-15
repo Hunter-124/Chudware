@@ -5,7 +5,7 @@ Contracts: contracts/doc_schema.md (entities/constraints §3), contracts/feature
 
 ## Entry points
 - core/solver/nsolve.h:64 `System` — numeric residual-based constraint solver (Levenberg-Marquardt, Eigen-based, analytic Jacobians)
-- core/sketch/sketch.h:66 `solve_sketch()` — parameterizes sketch entities to nsolve variables and solves 2D constraints (C++ port of engine/doc/sketch_solver.py); returns SketchSolution + warm-start state
+- core/sketch/sketch.h:66 `solve_sketch()` — parameterizes sketch entities to nsolve variables and solves 2D constraints; returns SketchSolution + warm-start state
 - core/sketch/sketch.h:92 `drag()` — constrained interactive drag with 10ms wall-clock budget
 - core/sketch/sketch.h:75 `measure_constraint()` — read solved values from dimensional constraints (distance/angle/radius)
 - core/geom/aicm.h — ASCII-Compressed-Index-Mesh tessellation format (STEP+ container read/write)
@@ -13,7 +13,7 @@ Contracts: contracts/doc_schema.md (entities/constraints §3), contracts/feature
 - core/geom/dress.h — dress-up features (fillet/chamfer/shell/draft); calls OCCT's ShapeUpgrade
 
 ## How it connects
-core/solver is a standalone numeric solver (knows nothing about geometry); core/sketch wraps it to solve 2D constraint problems (sketch entities → nsolve variables, constraints → residual blocks). core/geom provides OCCT-backed B-rep primitives for the 3D feature compiler. The feature tree (core/doc/session.cpp) uses core/sketch to resolve sketches on faces, then core/geom to build 3D solids. Sketch-plane lift (2D→3D) is in core/geom/plane.h. Python oracle: engine/doc/{nsolve,sketch_solver}.py (frozen). README reports 24/24 geometric-feature parity.
+core/solver is a standalone numeric solver (knows nothing about geometry); core/sketch wraps it to solve 2D constraint problems (sketch entities → nsolve variables, constraints → residual blocks). core/geom provides OCCT-backed B-rep primitives for the 3D feature compiler. The feature tree (core/doc/session.cpp) uses core/sketch to resolve sketches on faces, then core/geom to build 3D solids. Sketch-plane lift (2D→3D) is in core/geom/plane.h. README reports 24/24 geometric-feature parity.
 
 ## Debugging playbook
 - Build: `cmake -S core -B core/build-linux -DCHUDWARE_WITH_OCCT=ON && cmake --build core/build-linux`
@@ -29,6 +29,6 @@ core/solver is a standalone numeric solver (knows nothing about geometry); core/
 
 ## Related tasks/docs
 - work/tasks: grep `sketch|solver|geom|polygon` (polygon entity T-G1; constraint parity T-C1..C5)
-- docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md (GSL `describe_sketch` built on solver output)
+- docs/review/GEOMETRY_LLM_REPRESENTATION_REVIEW.md (GSL `describe_sketch` built on solver output)
 - contracts/doc_schema.md §3 (entity/constraint schema + coverage list)
 - contracts/feature_params.md (B-rep feature vocabulary — primitives, dress-up, patterns, multi-body)

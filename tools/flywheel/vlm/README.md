@@ -17,7 +17,7 @@ training runs.** The `recipes/` files may land but never execute in CI (`recipes
 | `corpus_gen.py` | synthetic corpus v1: labeled renders, drawings w/ known callouts, known-diff render pairs; geometry KNOWN; provenance=synthetic; frozen hash | yes |
 | `candidate_eval.py` | zero-shot residual harness — candidate claims → T-H8 bench scoring → residual vs deterministic ceiling → GO/NO-GO. Mock-proven end-to-end. | yes (mock); real when provisioned |
 | `serving.py` | `experimental.vision_review` seam: render self-review via providers/1, loopback-guarded | yes (guards); real when served |
-| `residual_report.py` | emits the go/no-go section into `docs/RECOGNITION_RESIDUAL.md` | yes |
+| `residual_report.py` | emits the go/no-go section into `docs/review/RECOGNITION_RESIDUAL.md` | yes |
 | `dvc_track.py` | DVC-version the corpus (reuses T-H5 helpers) | yes (round-trip test) |
 | `recipes/` | SFT/DPO/GRPO scaffold + deterministic reward + CI guard | **guarded — never trains in CI** |
 

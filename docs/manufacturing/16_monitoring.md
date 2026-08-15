@@ -643,7 +643,7 @@ be a machine's data source.
 
 ### 6.1 `contracts/worker_rpc.md` §8 "Manufacturing monitor (read-only)" (allocated, `MFG-SECT-1`)
 
-Served by `services/manufacturing/monitor/service.py` inside the manufacturing gateway — not `engine/worker.py`,
+Served by `services/manufacturing/monitor/service.py` inside the manufacturing gateway — not `services/worker_main.py`,
 not hostd. Same wire format (newline-delimited JSON, structured error envelope). Every method is read-only; the set
 is frozen and contract-tested. Every `at_seq` is the gateway journal's stamp.
 

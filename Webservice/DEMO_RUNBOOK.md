@@ -11,7 +11,7 @@
 Use this exact URL (bookmark it):
 
 ```
-https://chudware.com/app/
+https://app.chudware.com/app/
 ```
 
 Notes:
@@ -24,15 +24,14 @@ Notes:
 
 ## Login (self-serve accounts, in the gateway)
 
-1. Open `https://chudware.com/app/` in **Chrome** (preferred) or Firefox.
-2. Sign-in is the gateway's own now, and in this slice it is **API-only** — the hosted
-   sign-in form and marketing page land later. An unauthenticated HTML request gets a
-   401 page from `auth._deny_http`; an account that is authenticated but not `active`
-   gets a 403 status page whose copy depends on its state (pending / denied /
-   suspended / trial_expired).
+1. Open `https://app.chudware.com/app/` in **Chrome** (preferred) or Firefox.
+2. Sign-in is the gateway's own. An unauthenticated browser is sent to the
+   hosted sign-in page; an authenticated but non-`active` account gets a 403
+   status page whose copy depends on its state (pending / denied / suspended /
+   trial_expired).
 3. So seed every attendee **before** showtime:
    ```bash
-   curl -sS -X POST https://chudware.com/api/auth/register \
+   curl -sS -X POST https://app.chudware.com/api/auth/register \
      -H 'content-type: application/json' \
      -d '{"email":"guest@crimson.ua.edu","password":"<their password>"}'
    ```
@@ -107,8 +106,8 @@ curl -sI -X GET 'http://127.0.0.1:8399/app/Chudware.wasm?dev_user=haedmonds69@gm
 #   content-type: application/wasm   (for Chudware.wasm)
 
 # 4) Public path is served by the gateway, and refuses anonymous callers
-curl -sI https://chudware.com/app/ | head -15
-# Expect 401 from the gateway itself — NOT a redirect to bruh234324.cloudflareaccess.com
+curl -sI https://app.chudware.com/app/ | head -15
+# Expect a redirect to the gateway sign-in page — NOT to bruh234324.cloudflareaccess.com
 ```
 
 Bundle on disk (served from `CHUDWARE_WEB_APP_DIR` default `~/chudware-web/app/`):

@@ -3,9 +3,9 @@
 Design language for the `host/` GUI (the single target since the `ui/imgui` shell was retired).
 All panel code consumes **tokens/theme accessors only** (`host/src/ui_theme.*`);
 `scripts/check.py gui_lint theme` enforces no literal colors in panel files. Read this doc before
-writing or restyling any host panel. (Code pointers below that name `ui/imgui/...` paths refer to
-the retired shell — the patterns and token discipline are what carry over; the host equivalents
-live under `host/src/ui/` + `host/src/ui_theme.*`.)
+writing or restyling any host panel. The live widget kit is
+`host/src/ui/widgets/kit.{h,cpp}`; palette and glass APIs live in
+`host/src/ui_theme.{h,cpp}`.
 
 ---
 
@@ -195,7 +195,7 @@ P1 is done when integrator signs off on all of:
 
 1. **Screenshot spot-check** — `tree`, `chat`, `pick`, `multidoc` on AI-CAD2: glass reads as
    frosted over viewport (blur visible on model edges through panels).
-2. **Lint** — `python3 scripts/check.py gui_lint theme` PASS (zero hardcoded colors in `ui/imgui/src/ui/**`).
+2. **Lint** — `python3 scripts/check.py gui_lint theme` PASS (zero hardcoded colors in `host/src/ui/**`).
 3. **Shortcomings table** — all six IDs in §7 resolved.
 4. **Contrast** — body text ≥ 4.5:1 effective contrast on both dark-model and bright-floor viewport samples (visual review).
 5. **HUD** — toolbar fades to ≤0.25 opacity idle; full opacity within 120ms of hover.
@@ -222,9 +222,9 @@ Host baselines: `scratch/gui_baseline/<scenario>.png` (G0). Styling on AI-CAD2 s
 
 | Concern | Owner node | Path |
 |---------|------------|------|
-| Blur FBO + luminance | F1 | `ui/viewport/renderer.*` |
-| Tokens + glass APIs | F2 | `ui/imgui/src/theme/*` |
-| Panel consumption | S*, C*, H*, P1 | `ui/imgui/src/ui/*` |
+| Blur FBO + luminance | F1 | `host/src/ui_theme.{h,cpp}` |
+| Tokens + glass APIs | F2 | `host/src/ui_theme.{h,cpp}` |
+| Panel consumption | S*, C*, H*, P1 | `host/src/ui/*` |
 | Lint enforcement | G5 | `scripts/check.py` |
 
 Do not add literal `ImVec4{...}` or `IM_COL32(...)` in panel files — only `theme::` / `palette.` accessors.

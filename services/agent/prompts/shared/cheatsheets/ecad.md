@@ -30,7 +30,7 @@ VENDOR MODEL IMPORT: attach a SPICE library to a component via its sim dict:
              "lib": "/path/to/ua741.lib", "pin_order": ["1","2","3",...]}}
   netlist_to_spice_circuit records an X instance + .include; only the ngspice
   backend simulates it (MNA warns and ignores). Parity gated in
-  engine/sim/test_ngspice_backend.py (RC + divider fixtures match across backends).
+  services/sim/test_ngspice_backend.py (RC + divider fixtures match across backends).
 
 ENGINEERING METADATA (T-FIN8; contract: contracts/ecad/boardphys.md):
   The bundled library carries per-part engineering seeds — power_w (typ/max),
@@ -182,7 +182,7 @@ PDN / IR-DROP (T-FIN13; DC resistive solve of power-net copper):
   fix drops by widening copper / adding a pour / stitching vias, then re-run.
 
 FPGA SUPPORT PACK (T-FIN11; model schema aicad.fpga_device/1):
-  Data-driven FPGA part model in engine/ecad/fpga_devices/*.json — banks -> pins, VCCIO
+  Data-driven FPGA part model in services/ecad/fpga_devices/*.json — banks -> pins, VCCIO
   domains, clock-capable pins, TRUE differential-pair pins, config/JTAG pins. Adding a
   new family/package is a DATA addition (one JSON), not code. Shipped seeds:
     iCE40UP5K-SG48       FULL (icestorm + iCEBreaker sources); placeable starter symbol
@@ -206,7 +206,7 @@ FPGA SUPPORT PACK (T-FIN11; model schema aicad.fpga_device/1):
       board is the source of truth for the HDL flow): native dialect per vendor — XDC
       (Xilinx) or LPF (Lattice) — plus a neutral CSV pinout (pin,net,port,site,bank,
       clock_capable,diff_pair,polarity,iostandard). One <ref>_pins.* set per FPGA,
-      byte-deterministic (golden-tested in engine/ecad/test_fpga.py).
+      byte-deterministic (golden-tested in services/ecad/test_fpga.py).
   Typical flow: place FPGA symbol -> wire IO/power/config -> ecad_run_erc() ->
   ecad_fpga_check() -> fix -> ecad_export('constraints') -> feed XDC/LPF to Vivado/nextpnr.
 

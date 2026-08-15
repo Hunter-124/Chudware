@@ -1,6 +1,6 @@
 // CppCore — the host side of the strangler seam to the pure-C++ core.
 //
-// Loads libchudware.dll (the SEPARATE C++ core DLL; see docs/CPP_MIGRATION.md) at
+// Loads libchudware.dll (the SEPARATE C++ core DLL) at
 // RUNTIME via LoadLibrary and dispatches JSON-RPC-style calls into it through the
 // flat C ABI in core/api/libchudware.h. The host build links NEITHER the core nor
 // OCCT — the DLL and its OCCT runtime DLLs are loaded lazily on first use, so the

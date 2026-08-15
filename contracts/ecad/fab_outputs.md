@@ -3,7 +3,7 @@
 > Manufacturing exports and the headline **PCB → 3D solid** bridge into the CAD app. All writers are
 > pure functions `BoardDocument → file(s)`; no external tools required (GPL-clean, native writers).
 
-## 1. Gerber (RS-274X) — `fab/gerber.py`
+## 1. Gerber (RS-274X) — `services/ecad/fab/gerber.py`
 
 - One file per fabrication layer; standard extensions: `.GTL/.GBL` (copper top/bottom),
   `.GTO/.GBO` (silk), `.GTS/.GBS` (mask), `.GTP/.GBP` (paste), `.GM1`/`.GKO` (outline/Edge.Cuts),
@@ -17,26 +17,26 @@
   balanced `G36/G37`; `M02*` terminator); aperture count and flash count match the board's pad
   count per layer.
 
-## 2. Excellon drill — `fab/excellon.py`
+## 2. Excellon drill — `services/ecad/fab/excellon.py`
 
 - One PTH file + one NPTH file (or combined w/ `M48` header + tool table). Header `METRIC,TZ`,
   tool defs `T1C0.600`, `T01` select, `X..Y..` coordinates, `M30` end. Round drills as hits; ovals
   as routed slots (`G85`). Plated vs non-plated separated.
 - **Test:** tool diameters == distinct pad/via drill sizes; hit count == drilled pad+via count.
 
-## 3. BOM — `fab/bom.py`
+## 3. BOM — `services/ecad/fab/bom.py`
 
 - Group rows by (`value`, `footprint`, sorted user fields), `dnp` excluded by default. Columns:
   `Refs, Qty, Value, Footprint, MPN, <user fields>`. CSV + JSON. Stable ref sorting (`R1,R2,R10`
   natural order). **Test:** N parts → correct grouping & quantities; DNP excluded.
 
-## 4. Pick-and-place (CPL) — `fab/placement.py`
+## 4. Pick-and-place (CPL) — `services/ecad/fab/placement.py`
 
 - CSV: `Designator, MidX(mm), MidY(mm), Layer(Top/Bottom), Rotation(deg)`. Position = footprint
   origin in board coords (drill/place origin applied). Bottom parts rotation mirrored per convention.
   THT-only / `virtual` excluded by default. **Test:** placements match footprint `pos/angle/side`.
 
-## 5. 3D bridge — `engine/ecad/threed.py` (the integration that makes this one program)
+## 5. 3D bridge — `services/ecad/threed.py` (the integration that makes this one program)
 
 `board_to_step(board, opts) -> {step_path, summary}` and `board_to_part_doc(board, opts) ->
 aicad.part/1 doc` (a thin CAD document whose single `import` feature references the STEP):

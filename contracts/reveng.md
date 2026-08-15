@@ -22,7 +22,7 @@
 - **Fit-critical dimensions** route through the intake ledger (`confirm_dimensions`) with
   `provenance.method` in `photo_fiducial` | `datasheet` | `fitted` | `guessed` — no silent
   guessing (see `contracts/interaction.md`).
-- **Honesty tiers** for photo-derived dims reuse `engine_oracle/vision/measure.py`:
+- **Honesty tiers** for photo-derived dims reuse `services/vision/measure.py`:
   `high` (±2%), `medium` (±5%), `low` (±10%, out-of-plane capped). UI shows
   `HONESTY_STRING` from measure.py wherever a photo dimension appears.
 - **Long jobs** return `run_id` immediately; progress via `aicad.reveng_events/1` on the

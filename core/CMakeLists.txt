@@ -2083,7 +2083,7 @@ if(CHUDWARE_WITH_OCCT)
   # api/libchudware.{h,cpp} exposes a flat C ABI (chudware_call/chudware_free/chudware_abi_version)
   # over chudware::doc::compile_document so the host can load this lib at runtime
   # (LoadLibrary on Windows / dlopen on Linux) and route ported methods to the in-process
-  # C++ core (the strangler seam; see docs/CPP_MIGRATION.md). chudware_doc (STATIC) drags in
+  # C++ core (the strangler seam; see docs/REFACTOR_LOG.md). chudware_doc (STATIC) drags in
   # the whole OCCT geom kernel transitively. The Netgen FEA-mesh RPCs in libchudware.cpp are
   # compiled out unless CHUDWARE_WITH_NETGEN, so the lib builds without the mesher (geometry,
   # sketch, features, STEP/IGES/STL still work — those need only OCCT).

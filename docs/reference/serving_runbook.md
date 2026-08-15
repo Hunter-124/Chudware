@@ -133,11 +133,9 @@ no-signoff-refused, report-missing-refused, ineligible-refused, and the happy pa
 ## 6a. Settings visibility — "which brain answered"
 
 The read-only data is `serving_status()` (per-IP provider/model/adapter_version/canary%/
-fallback). Wiring it into the desktop Settings panel is a C++ read-side seam: the imgui and
-legacy settings panels (`ui/imgui/.../settings_modal.cpp`, `host/src/ui/settings_modal.cpp`)
-have a "Model routing" section and diverged duplicate copies (GUI-parity churn), so per the
-first-claimer / hot-spot rule this task exposes the DATA and leaves the panel line to the
-G-wave owner. See `work/questions/T-H9.md`.
+fallback). The desktop implementation lives in
+`host/src/ui/settings_modal.cpp`; its "Model routing" section is the sole GUI
+surface. See `work/tasks/T-H9.md`.
 
 ## 7. Two-OS reachability  `[~] live`
 

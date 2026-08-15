@@ -1,7 +1,7 @@
 # Contract: ECAD Worker RPC — v1
 
-> ECAD methods on the existing JSON-RPC worker (`engine/worker.py`, protocol 2, newline-delimited
-> JSON over stdio). Registered by appending `engine/ecad/rpc.py`'s `METHODS` dict into the worker's
+> ECAD methods on the existing JSON-RPC worker (`core/api/libchudware.cpp`, protocol 2, newline-delimited
+> JSON over stdio). Registered by appending `core/ecad/session.cpp`'s `METHODS` dict into the worker's
 > `_METHODS` (single fenced append — see `ECAD_PLAN §6`). Error envelope identical to `worker_rpc.md`:
 > `{ "code", "message", "detail" }`. Long simulations run on the **sim worker** (`sim_*`).
 

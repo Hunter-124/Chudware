@@ -133,7 +133,7 @@ fixtures/mfg/print/                      # ratified fixtures root; every entry i
   fake_moonraker.py  fake_octoprint.py   # printer-lane E4/E5 fixtures (my spec, Gateway-run)
   goldens/                               # owned golden projects + expected invariants
 
-engine/slice/worker.py                   # separate process, one job in flight (engine/sim/worker.py pattern)
+services/manufacturing/slicer/sidecar.py                   # separate process, one job in flight (services/sim/job_worker.py pattern)
 
 services/mcp/mfg_print_tools.py  test_mfg_print_tools.py
 
@@ -562,7 +562,7 @@ that is asserted structurally by `mfg-abi`, not inferred from the name.
 `core/hostd/doc_registry.cpp`'s read-only method list gains `print_describe`, `print_tree`,
 `print_artifact_list`.
 
-### 5.2 Slice worker — `engine/slice/worker.py`
+### 5.2 Slice worker — `services/manufacturing/slicer/sidecar.py`
 
 Separate process, spawned on demand, one job in flight, `job_id` correlates events, structured
 error envelope — verbatim the §3 sim-worker shape. Methods carry the wire prefix, because a
@@ -1350,7 +1350,7 @@ graph LR
   GW1 --> G
   GW[Gateway: CapabilityTruth, run identity, ApprovalRecord] --> C[C. core/print preflight + capability]
   UX[UX: app_state.h + mfg.mode + FreshValue] --> F
-  A --> D[D. services/manufacturing/slicer + engine/slice/worker.py]
+  A --> D[D. services/manufacturing/slicer + services/manufacturing/slicer/sidecar.py]
   B --> D
   B --> E[E. libchudware print_* dispatch + doc_registry + CMake]
   B --> C
@@ -1659,7 +1659,7 @@ remains in scope exactly as accepted, and physical execution stays deferred behi
 | `services/mcp/print_tools.py` | **`services/mcp/mfg_print_tools.py`** |
 | `services/mcp/test_print_tools.py` | **`services/mcp/test_mfg_print_tools.py`** |
 | `core/print/**` | unchanged — `core/<domain>/**` is explicitly permitted by `GW-PATHS-ROOTS` |
-| `engine/slice/worker.py` | unchanged — `engine/` is the repo's existing worker root (`engine/sim/worker.py`), not a new service tree; only its RPC method names change (§14.3) |
+| `services/manufacturing/slicer/sidecar.py` | unchanged — the shipped slicer sidecar is the existing separate-process worker; only its RPC method names change (§14.3) |
 | `vendor/slicer/**` | unchanged — a vendor pin/patch/notices tree, not a service tree |
 | `core/tests/test_print_*.cpp` | unchanged, plus the new `test_print_kinds.cpp` |
 | `contracts/manufacturing_print.md` | unchanged |
@@ -1670,7 +1670,7 @@ remains in scope exactly as accepted, and physical execution stays deferred behi
 |---|---|---|
 | events | `mfg.print.*` | already compliant; now exactly **one** invalidation event on it, `mfg.print.invalidated` |
 | MCP tools | **`mfg_print_*`** | `GW-PATHS-ROOTS`: RPC/events stay `mfg_*`/`mfg.*` |
-| slice-worker RPC (`engine/slice/worker.py`) | **`mfg_print_*`** | same ruling; a worker method is not a `libchudware` symbol, so DoD 16 does not bite |
+| slice-worker RPC (`services/manufacturing/slicer/sidecar.py`) | **`mfg_print_*`** | same ruling; a worker method is not a `libchudware` symbol, so DoD 16 does not bite |
 | `libchudware` C ABI (the sixteen authoring methods) | **`print_*`** — ratified exception | DoD 16 forbids an `mfg_*` symbol in the public C ABI, so renaming these would *create* the violation. Recorded in `contracts/manufacturing_gateway.md`, and mechanized prefix-independently by the strengthened `mfg-abi` (§12) so the exception costs no safety |
 | document schemas | `chudware.print_*/1` | unchanged — a document schema id is not an RPC name |
 | document extension | `.print+` | unchanged |

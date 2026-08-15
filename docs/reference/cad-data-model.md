@@ -75,7 +75,7 @@ Each entity carries: owner handle, layer, linetype, color, lineweight,
 transparency, and its geometry-defining group codes (documented per-entity in the
 DXF reference).
 
-**Relevance to this repo's DXF importer:** `engine/doc/formats_dxf.py` (via ezdxf,
+**Relevance to this repo's DXF importer:** `services/formats/formats_dxf.py` (via ezdxf,
 MIT) currently walks modelspace and converts a subset of this entity catalog —
 LINE, CIRCLE, ARC, LWPOLYLINE/POLYLINE (bulge → true arc), ELLIPSE/SPLINE
 (flattened), and INSERT (exploded recursively) — into build123d planar B-rep.

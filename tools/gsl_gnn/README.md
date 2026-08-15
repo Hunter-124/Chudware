@@ -5,20 +5,20 @@ Per-face graph classifier over the synthetic GSL corpus
 are face adjacency (`doc_adjacency`), and the label is the feature TYPE that
 created the face (free synthetic supervision — no hand-labeling). This is
 the "learned model" branch that
-`docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md` §3.4/§3.6 permits ONLY after a
+`docs/review/GEOMETRY_LLM_REPRESENTATION_REVIEW.md` §3.4/§3.6 permits ONLY after a
 measured residual proves deterministic recognition (`tools/gsl_eval.py` →
-`docs/RECOGNITION_RESIDUAL.md`) actually fails for a given part class.
+`docs/review/RECOGNITION_RESIDUAL.md`) actually fails for a given part class.
 
 **No training run is part of this change. This directory is scaffolding
 only.**
 
 ## Hard gate (binding)
 
-Train ONLY for part classes that `docs/RECOGNITION_RESIDUAL.md` flags
+Train ONLY for part classes that `docs/review/RECOGNITION_RESIDUAL.md` flags
 (median match_pct < 90% or faces-claimed < 70%). The model output feeds a
 TEMPLATED caption head only — never free-form numbers; it never suppresses
 or replaces the raw face list; no soft-token/vision adapter
-(`docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md` §3.6). Wiring inference into
+(`docs/review/GEOMETRY_LLM_REPRESENTATION_REVIEW.md` §3.6). Wiring inference into
 the engine is a separate, later decision.
 
 ## Files
@@ -57,7 +57,7 @@ python3 tools/gsl_dataset_gen.py --count 50
 ```
 
 See `corpora/gsl_dataset/README.md` for the full layout and family list, and
-`tools/gsl_eval.py` / `docs/RECOGNITION_RESIDUAL.md` for the measured
+`tools/gsl_eval.py` / `docs/review/RECOGNITION_RESIDUAL.md` for the measured
 residual that decides WHICH families/classes, if any, clear the hard gate
 above.
 

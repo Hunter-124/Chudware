@@ -1,7 +1,7 @@
 # gsl_dataset — synthetic GSL corpus (labels for free)
 
 Procedurally generated parametric parts with per-face supervision, per
-`docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md` §3.4 ("synthetic-label factory":
+`docs/review/GEOMETRY_LLM_REPRESENTATION_REVIEW.md` §3.4 ("synthetic-label factory":
 the feature op that created a face labels that face — zero hand-labeling).
 
 Samples are **regenerable artifacts and are NOT committed** (see `.gitignore`).
@@ -47,6 +47,6 @@ Ownerless faces get `"import_or_base"`.
 ## Consumers
 
 - `tools/gsl_eval.py` — recognition measured-residual harness
-  (`docs/RECOGNITION_RESIDUAL.md`).
+  (`docs/review/RECOGNITION_RESIDUAL.md`).
 - `tools/gsl_gnn/` — gated GNN adapter scaffold (train only where the residual
   report justifies it).

@@ -17,7 +17,7 @@
 The host refuses to run against a worker whose `protocol` major differs from what it was built
 for, and shows the repair-runtime flow. Workers tolerate unknown OPTIONAL params (ignore).
 
-## 2. Doc worker (`engine/worker.py`) — method table
+## 2. Doc worker (`core/api/libchudware.cpp`) — method table
 
 ### Legacy (unchanged, frozen)
 `ping` · `run_model {code, name?}` · `get_prompts` · `shutdown`
@@ -139,9 +139,9 @@ would produce an invalid document (e.g. an override/suppression naming a non-exi
 rejected with `invalid_op` and the session document is left **unchanged**. A config that fails to
 compile reports per-feature errors in `rebuild.feature_status` exactly like a normal rebuild.
 
-Implemented by `engine/worker.py` (`config_*`) over `engine/doc/session.py`
+Implemented by `core/api/libchudware.cpp` (`config_*`) over `core/doc/session.cpp`
 (`config_list`/`config_add`/`config_delete`/`config_activate`/`config_set_override`/
-`config_set_suppression`); machine-checked by `engine/doc/test_configurations.py`.
+`config_set_suppression`).
 
 #### 2.3 Weldments cut list (`weld_cut_list`)
 
@@ -172,10 +172,10 @@ member lengths; `profiles` lists the distinct profile names present.
 }
 ```
 
-Implemented by `engine/worker.py` (`weld_cut_list`) → `engine/doc/cutlist.py`
+Implemented by `core/api/libchudware.cpp` (`weld_cut_list`) → `core/doc/session.cpp`
 (`cut_list_for_session` forces a fresh uncached compile so the `weld_member` compiler repopulates
 the `_weld_members` side-channel surfaced on `CompileResult.weld_members`, then `build_cut_list`
-groups it); machine-checked by `engine/doc/test_weld_cutlist.py`. Host passthrough:
+groups it). Host passthrough:
 `DocMirror::weldCutList` + the "Cut List" panel.
 
 ### Sketch interaction (M2)
@@ -248,7 +248,7 @@ Driven (reference) dims still report `measured`.
 ### Drawings (W12 — 2D orthographic/iso views of a part/assembly via HLR)
 
 A drawing document (`aicad.drawing/1`, doc_schema.md §8) projects a SOURCE part/assembly into 2D
-views. These methods live in `engine/doc/drawing.py` (registered via `drawing.WORKER_METHODS`) and
+views. These methods live in `core/doc/drawing.cpp` (registered via `drawing.WORKER_METHODS`) and
 keep a SEPARATE registry from `doc_*` sessions — a `drawing_*` `doc_id` is a drawing id, not a part
 session id. All use the **structured error envelope**. The projected geometry is recomputed from the
 source's CURRENT bodies on every fetch (associative); the host re-fetches after editing the source.
@@ -360,8 +360,8 @@ section of canonical `POLYLINE`/`VERTEX`/`SEQEND` chains (opens in LibreCAD / Au
 ezdxf). **PDF** is a single-page 1:1 mm vector page (hand-written PDF 1.4; no library dependency —
 solid strokes for visible/outline, dashed for hidden/bend). Format comes from an explicit `format`
 param else the path extension; structured error envelope; contained errors (bad path/format/no
-geometry) never crash the worker. Implemented by `engine/worker.py` → `engine/doc/export2d.py`
-(+ `engine/doc/dxf.py`, `engine/doc/pdfvec.py`).
+geometry) never crash the worker. Implemented by `core/api/libchudware.cpp` → `core/doc/export2d.cpp`
+(+ `core/doc/dxf.cpp`, `core/doc/pdfvec.cpp`).
 
 | method | params → result |
 |---|---|
@@ -418,7 +418,7 @@ the app data vendor cache for local AI workflows.
 | `vendor_part_context` | `{limit?, query?}` → `{count, parts, llm_context, capabilities}` compact enough to inject into local-model prompts. |
 | `vendor_part_insert` | `{supplier, part_number, doc_id?/into?, base_revision?, name?}` → normal doc ops response after adding an `import` feature with vendor metadata preserved in feature params. |
 
-### Recognition & overlap (AI-experience wave — appended; see docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md)
+### Recognition & overlap (AI-experience wave — appended; see docs/review/GEOMETRY_LLM_REPRESENTATION_REVIEW.md)
 
 | method | params → result |
 |---|---|
@@ -447,7 +447,7 @@ the mic with a tooltip hint — never crashes.
 
 Env: `CHUDWARE_STT_MODEL` overrides the default model key (`fast`).
 
-## 3. Sim worker (`engine/sim/worker.py`, separate process, spawned on demand)
+## 3. Sim worker (`core/api/libchudware.cpp`, separate process, spawned on demand)
 
 Same wire protocol. One job in flight; `job_id` correlates events.
 

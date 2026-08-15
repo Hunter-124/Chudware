@@ -48,7 +48,7 @@ Usage:
 
 Exit code: 0 = every advertised tool reachable, 1 = defect found, 2 = parse/invocation
 error (which INCLUDES the extractor matching nothing: a gate that can pass by finding zero
-candidates verifies nothing — see docs/TESTING_STANDARDS.md).
+candidates verifies nothing).
 """
 from __future__ import annotations
 

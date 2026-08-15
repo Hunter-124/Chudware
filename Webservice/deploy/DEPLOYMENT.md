@@ -31,21 +31,20 @@ curl -X GET "https://api.cloudflare.com/client/v4/accounts/9a800a5f674233fe127cd
 
 ## Domains
 
-- Primary: `chudware.com` (zone `0cebfc25c546a96058479d6ba227cd21`), also `www.chudware.com`
-- Legacy: `cad.scootware.us` (zone `175dbe20817f2b573a81e085031ef922`) — still live
+- Application: `app.chudware.com`
+- Marketing: `chudware.com` and `www.chudware.com` (Cloudflare Pages)
 
 ## Tunnel
 
-- Name: `billet-web`, ID `95256541-2ebf-4101-92a1-daecd240c087` (remotely managed)
-- DNS: each host is a PROXIED CNAME → `<tunnel-id>.cfargotunnel.com`
+- Name: `chudware-web`, ID `95256541-2ebf-4101-92a1-daecd240c087` (remotely managed)
+- DNS: `app.chudware.com` is a PROXIED CNAME → `<tunnel-id>.cfargotunnel.com`;
+  the apex and `www` are Cloudflare Pages custom domains.
 
 Ingress table (all → local services on `127.0.0.1`):
 
 | Hostname | Service |
 | --- | --- |
-| `cad.scootware.us` | `http://127.0.0.1:8300` (FastAPI gateway) |
-| `chudware.com` | `http://127.0.0.1:8300` |
-| `www.chudware.com` | `http://127.0.0.1:8300` |
+| `app.chudware.com` | `http://127.0.0.1:8300` (FastAPI gateway) |
 | *(catch-all)* | `http_status:404` |
 
 ### Staging ingress
@@ -64,16 +63,13 @@ engine, but never mutable gateway state or database credentials.
 ## Cloudflare Access
 
 - ONE self-hosted app "Billet Web", ID `a5c88ac6-8364-4fa1-9610-c2ab5dcf9fa8`
-- `self_hosted_domains = [cad.scootware.us, chudware.com, www.chudware.com]`
+- `self_hosted_domains = [app.chudware.com/admin*]`
 - Shared AUD: `b375474d216c1f4a1925493000f31c32e85ed9b198001fbd2622fe451a5a879f`
   → gateway env `CHUDWARE_WEB_CF_AUD`
-- **All domains share ONE app so they share ONE AUD** — the gateway validates a
-  single `CHUDWARE_WEB_CF_AUD` (`Webservice/gateway/auth.py`). A per-domain app
-  would mint a different AUD and JWT validation would fail. Add new domains to
-  THIS app's `self_hosted_domains`, never as a new app.
-- Policy "billet-users": explicit operator allowlist + `email_domain` rules
-  (`ua.edu`, `crimson.ua.edu`). CF `email_domain` is an EXACT match (no
-  subdomain wildcard), so each domain must be listed explicitly.
+- Keep `/admin` on this existing app so the gateway continues to validate the
+  same `CHUDWARE_WEB_CF_AUD`; creating a second app would mint another AUD.
+- Policy "billet-users": explicit operator allowlist. Ordinary visitors do not
+  pass through this policy.
 - Access is the **operator door only** — it gates `/admin`. Ordinary visitors
   authenticate to the gateway itself with a `chudware_sid` session, and the
   gateway assigns roles from the account store, never from this policy.
@@ -187,7 +183,7 @@ them; treat anything derived from the old token as compromised.
    `chmod 600`) and in `$CF_API_TOKEN` wherever the operator shell exports it.
 4. Re-run `python3 Webservice/deploy/cf_provision.py` only if tunnel/app
    config must be re-pushed; the running tunnel itself authenticates with
-   `TUNNEL_TOKEN` in `~/chudware-web-data/gateway.env`, not this API token.
+   `TUNNEL_TOKEN` in `~/chudware-web-data/cloudflared.env`, not the gateway environment.
 
 **R2 S3 credentials:**
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Machine-checkable SolidWorks-parity audit for AI-opencad.
 
-A "typechecker" for the parity standard in docs/SW_PARITY_SPEC.md (and its backlog twin
-docs/SW_PARITY_GAPS.md). The spec is hand-maintained prose: every capability row carries a
+A "typechecker" for the parity standard in docs/SW_PARITY_SPEC.md (its backlog twin
+docs/SW_PARITY_GAPS.md was pruned 2026-07-23; the status rows carry the backlog now).
+The spec is hand-maintained prose: every capability row carries a
 status (`done` / `partial` / `missing` / `beyond`) and an Evidence cell naming the code that
 backs it. Prose drifts — a row can stay `done` after its compiler is renamed, a ribbon command
 deleted, or an RPC method removed. This script re-derives the machine-checkable subset of that

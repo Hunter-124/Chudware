@@ -1,5 +1,6 @@
 """The "intake brain" — pure, stdlib-only logic for requirements intake, photo measurement,
-and first-try fit, per ``docs/INTAKE_MEASUREMENT_DFM_PLAN.md``.
+and first-try fit, per ``docs/INTAKE_MEASUREMENT_DFM_PLAN.md`` (pruned 2026-07-23; see
+``services/intake/__init__.py`` for the surviving design summary).
 
 This module owns every deterministic decision the plan describes so that the MCP tools and the
 in-app agent stage are *thin adapters* over one shared core (the plan's parity contract:

@@ -40,14 +40,14 @@ What already exists, so we build on it instead of duplicating:
 | Reverse engineering | **Working.** 5-pass deterministic recognizer, `eval_compare` verification, editability proof (`recon_tools.py`). Solids/mesh input only. |
 | Providers | **Fragmented ×3.** Python `services/agent/providers/` (Anthropic/OpenAI/Gemini/llama.cpp/LM Studio + offline/ITAR mode), C++ `core/agent/providers.cpp` (port of same), external MCP clients. No subscription-session auth. |
 | Tool governance | **Absent.** All ~150 MCP tools register unconditionally; no allow-listing (the DAG node contract requires it). |
-| Material data | **Fragmented ×3.** `engine/sim/materials.json` (FEA), CAM cutting DB, DFM process profiles — no unified registry, no live lookup. |
+| Material data | **Fragmented ×3.** `services/sim/materials.json` (FEA), CAM cutting DB, DFM process profiles — no unified registry, no live lookup. |
 | ML scaffold | **Gated scaffold.** `tools/gsl_dataset_gen.py` (7 families, per-face labels) + `tools/gsl_gnn/` GraphSAGE; hard go/no-go gate on `docs/review/RECOGNITION_RESIDUAL.md`. |
 
 ## 2. The seven capability pillars
 
 Numbered continuing from the platform ADR (pillars 1–6 + interop track = 7).
 
-### Pillar 8 — Research & knowledge tools (`engine/research/` + `research_*` MCP family)
+### Pillar 8 — Research & knowledge tools (`services/research/` + `research_*` MCP family)
 
 The model must be able to *look things up* instead of recalling. One tool family,
 ECAD-precedent module layout, with source-specific helpers so limited models get
@@ -122,7 +122,7 @@ One frozen contract for "agent asks the human", replacing three ad-hoc mechanism
 - Q/A is also *proactive*: verify-node failures can raise a question with the evidence
   attached (render + numbers) rather than silently retrying.
 
-### Pillar 10 — Vision & capture: images and cameras in (`engine/vision/` + `vision_*` tools)
+### Pillar 10 — Vision & capture: images and cameras in (`services/vision/` + `vision_*` tools)
 
 Close the loop that `request_part_photos` only gestures at: real pixels into the agent.
 
@@ -180,8 +180,8 @@ Finish what GSL started: **every domain state the app holds must have a determin
   open questions (feeds WS-A `dag_status`).
 - Shared narration style guide + `sid`-stable naming, same as `describe_part`; every
   number traceable to a query the model could run itself.
-- **Unified material registry** (`engine/materials/`) merging sim/CAM/DFM tables with
-  provenance + research-tool write-back; single source for all narrations.
+- **Unified material registry** (`core/data/materials/registry.json`) merging
+  sim/CAM/DFM tables with provenance; single source for all narrations.
 
 ### Pillar 12 — Provider & session layer (`contracts/providers.md`)
 
@@ -487,7 +487,7 @@ Proposed as **Workstream F** task files (claimable by autopilot agents) once app
 
 | Task | Pillar | Content | Depends on |
 |---|---|---|---|
-| T-F1 | 8 | `contracts/research_tools.md` + `engine/research/` scaffold + `web_search`/`fetch_page` with provider interface + cache | — |
+| T-F1 | 8 | `contracts/research_tools.md` + `services/research/` scaffold + `web_search`/`fetch_page` with provider interface + cache | — |
 | T-F2 | 8 | Source helpers v1 (material_lookup, datasheet_fetch, standards_ref, unit_convert) + unified material registry seed | T-F1 |
 | T-F3 | 9 | `contracts/interaction.md` + `ask_user` core + in-app dialog + MCP elicitation transport | — |
 | T-F4 | 9 | Migrate intake/clarify/DAG-gate callers onto interaction contract | T-F3, T-A3 |

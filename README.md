@@ -101,9 +101,9 @@ verify with `bash scripts/gate.sh` before review.
 | [platform/](platform) | Cross-OS shims (`_linux`/`_win32`) |
 | [contracts/](contracts) | Frozen interface contracts — the seams (append-only) |
 | [corpora/](corpora) | Test fixtures, referenced through canonical `corpora/...` paths |
-| [work/](work) | Git-tracked solo task board (`tools/work.py`, `WORKFLOW.md`) |
+| [work/](work) | Git-tracked solo task board (`work/tools/work.py`, `WORKFLOW.md`) |
 | [docs/](docs) | Design docs, status notes, handoffs |
-| tools/, scripts/, third_party/, assets/, packaging/, benchmarks/, training/ | Dev tools, repo gates, vendored deps, icons/fonts, packaging, perf benches, ML eval |
+| tools/, scripts/, vendor/, assets/, packaging/, benchmarks/, training/ | Dev tools, repo gates, vendored deps, icons/fonts, packaging, perf benches, ML eval |
 
 ## Docs & process
 

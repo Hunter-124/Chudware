@@ -1,6 +1,6 @@
 # Contract: Requirements layer — `aicad.req/1`
 
-> Normative v1. Promoted from `docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §3.5 by T-H3.
+> Normative v1. Promoted from `docs/review/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §3.5 by T-H3.
 > Changes require a schema-string bump and a migration note here.
 > Consumed by: IP-12 (elicitation), T-F17 (design-brief sign-off), WS-A (verify nodes),
 > T-H8 (spec→sketch/part benchmarks).
@@ -218,6 +218,6 @@ Ordering is deterministic (by requirement ID, lexicographic), diff-stable.
 
 ## 6. Example — worked end-to-end
 
-See `engine_oracle/requirements/example.py` for a worked example: a design brief authored from
+See `services/requirements/example.py` for a worked example: a design brief authored from
 a chat transcript, `R1` verified by `measure_between`, status transitions to `verified` with
 an evidence reference.

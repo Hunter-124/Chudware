@@ -47,10 +47,10 @@ to them, and they are not part of the set listed below.
 This repo's actual format-interop surface — what's implemented, not just
 referenced — lives here:
 
-- **`engine/doc/formats.py`** — the single source of truth for the format matrix
+- **`services/formats/formats.py`** — the single source of truth for the format matrix
   (`FORMAT_REGISTRY`) and the import entry point (`import_path`). Today: STEP
   (AP214), IGES, BREP, STL, OBJ, PLY, glTF/GLB, 3MF, and Rhino `.3dm` at the mesh
-  level are fully wired; **DXF import** (via `engine/doc/formats_dxf.py`, ezdxf
+  level are fully wired; **DXF import** (via `services/formats/formats_dxf.py`, ezdxf
   MIT) is the newest addition (2D vector drawings → planar B-rep, import-only);
   SolidWorks `.sldprt`/`.sldasm` and Parasolid `.x_t`/`.x_b` are experimental,
   import-only, non-export entries. **DWG import is not yet implemented** — see

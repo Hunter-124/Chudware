@@ -6,7 +6,7 @@
 
 # Research: Web / Network / Auth Surfaces (Chudware → multi-user web)
 
-Scope: Webservice/, .env (keys only), config.example.json, services/ipc/, services/browser/, services/agent/ (server/event surface only), services/mcp/ (transport/server only), docs/REDACTION_DESIGN.md, docs/AI_HARNESS_ROADMAP.md, opencode.json, .mcp.json, README webservice mentions, git posture of Webservice/Cloudflare-info.txt.
+Scope: Webservice/, .env (keys only), config.example.json, services/ipc/, services/browser/, services/agent/ (server/event surface only), services/mcp/ (transport/server only), docs/design/REDACTION_DESIGN.md, docs/plans/AI_HARNESS_ROADMAP.md, opencode.json, .mcp.json, README webservice mentions, git posture of Webservice/Cloudflare-info.txt.
 
 Read-only. Secret **values redacted** — only key names reported.
 
@@ -16,7 +16,7 @@ Read-only. Secret **values redacted** — only key names reported.
 
 | Surface | Transport | Bind / address | Evidence |
 |---|---|---|---|
-| **MCP server** | **stdio only** (JSON-RPC over stdin/stdout) | No TCP/HTTP port | `services/mcp/server.py:15` “Runs over stdio”; `services/mcp/AGENTS.md:5-8`; main uses `mcp.server.stdio.stdio_server` / `mcp.run()` at `server.py:682-700` |
+| **MCP server** | **stdio only** (JSON-RPC over stdin/stdout) | No TCP/HTTP port | `services/mcp/server.py:15` “Runs over stdio”; main uses `mcp.server.stdio.stdio_server` / `mcp.run()` at `server.py:682-700` |
 | **chudware-hostd** (engine daemon) | NDJSON over **AF_UNIX** (POSIX) / named pipe (Win) | `$XDG_RUNTIME_DIR/chudware/hostd-<key>.sock` (or `/run/user/<uid>/chudware/…` or `/tmp/chudware-<uid>/…`) | `services/ipc/ipc_transport.h:8-11`; `services/ipc/ipc_discovery.cpp:47-89` (`runtimeDir`, `socketPath`); `services/mcp/daemon_bridge.py:168-200`; `core/hostd/main.cpp:206-214` `listener.listen(sock)` |
 | **CEF daemon** (`--cef-daemon`) | NDJSON over **AF_UNIX** | `$XDG_RUNTIME_DIR/chudware/cefd-<key>.sock` or `/tmp/…` | `services/browser/cef_client.py:1-17,69-78,81-91` |
 | **OAuth CallbackServer** (LLM subscription login) | **localhost HTTP** (stdlib `http.server.HTTPServer`) | **Fixed ports:** Codex `1455`, Anthropic `54545`; path `/auth/callback` or `/callback` | `services/agent/providers/sub_auth.py:47-143`; `codex_sub_provider.py:20-22`; `anthropic_sub_provider.py:26-28` |
@@ -54,7 +54,7 @@ IPC framing (reuse-worthy pattern, not a web server): newline-delimited JSON-RPC
 | **LLM subscription OAuth** (codex/claude/cursor/xai) | PKCE + `CallbackServer` + tokens in `config.json` → `subscription_auth` | **No** — single-operator AI provider login |
 | **API keys** (`api_key`, OPENROUTER_*, etc.) | Cloud model providers via `config.get_provider` | **No** |
 | **Browser site sessions** | Cookie jars in local profiles for McMaster/DigiKey/… | **No** — vendor shopping logins |
-| **Redaction / compliance_mode** | ITAR scrub of outbound prompts (`redaction.py`, `docs/REDACTION_DESIGN.md`) | Explicitly **out of scope:** “multi-user shared sessions” (`REDACTION_DESIGN.md:20-22`) |
+| **Redaction / compliance_mode** | ITAR scrub of outbound prompts (`redaction.py`, `docs/design/REDACTION_DESIGN.md`) | Explicitly **out of scope:** “multi-user shared sessions” (`docs/design/REDACTION_DESIGN.md:20-22`) |
 | **hostd trust model** | Unix socket same-user DACL; “no additional authentication” | **No** — same OS user (`core/hostd/child_supervisor.h:30-33`) |
 | **MCP tool allow-lists** | Per-context tool policy (`server.py` tool_registry) | Capability gating, not users |
 
@@ -126,7 +126,7 @@ Env examples (keys only):
 | **Discord notify** | Outbound ops alerts only | `work/tools/notify_discord.py` — bot token in gitignored `work/sync/`, polls “inbox” via missing teamsync. |
 | **loop Session.messages** | No | LLM chat history, not multi-user. |
 
-**README / roadmap:** README parks “SaaS/cloud hosting” (`README.md` “Currently parked”); no Webservice architecture. `docs/AI_HARNESS_ROADMAP.md` is agent harness (WS0–WS5), not web multi-user. `docs/REDACTION_DESIGN.md` multi-user shared sessions OOS.
+**README / roadmap:** README parks “SaaS/cloud hosting” (`README.md` “Currently parked”); no Webservice architecture. `docs/plans/AI_HARNESS_ROADMAP.md` is agent harness (WS0–WS5), not web multi-user. `docs/design/REDACTION_DESIGN.md` multi-user shared sessions OOS.
 
 `opencode.json` / `.mcp.json`: local stdio MCP client configs with absolute paths; **gitignored** (`.gitignore:42-47`).
 

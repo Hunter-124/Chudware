@@ -159,7 +159,7 @@ Results are returned sorted descending by total score. The caller may pass `limi
 
 T-P2 adds `CatalogProvider` adapters for `section`, `fitting`, `hydraulic`, `ecad`
 domains, plus live-vendor search providers (Nexar, DigiKey, Mouser — already in
-`engine_oracle/parts_providers.py`). Live providers implement `search()` only
+`core/sourcing/providers.cpp`). Live providers implement `search()` only
 (no `iter_records()`); the hub falls back to live search when the local index has no hits
 and a live provider covers the query domain.
 
@@ -175,7 +175,7 @@ the doc_id. It also wires the parts search into the agent context guide
 TraceParts / Werk24 and similar paid catalogs join as `CatalogProvider` adapters
 (live-search, no `iter_records`) behind the same seam when volume justifies spend.
 **Populated instead by T-X2/T-X3 (Hunter directive 2026-07-04):** `services/browser/
-adapters/parts_provider.py`'s `BrowserCatalogAdapter` wraps GrabCAD/TraceParts as
+services/browser/adapters/parts_provider.py`'s `BrowserCatalogAdapter` wraps GrabCAD/TraceParts as
 `domain="catalog"` live-search providers using the user's own authenticated browser
 session rather than a paid API — the parked `work/backlog/T-BL12.md` plan is a
 different mechanism for an overlapping catalog and is untouched by this. Both
@@ -185,7 +185,7 @@ mechanisms can coexist behind this same seam if the paid-API plan is ever revive
 
 > Added 2026-07-07 (workstream 1, Parts Library V2). Everything in this section is
 > ADDITIVE per §0 — no frozen field changes, no version bump. Producers:
-> `engine_oracle/parts_hub/taxonomy.json` + `taxonomy.py` + `gui_rpc.py`.
+> `services/parts/taxonomy.json` + `taxonomy.py` + `gui_rpc.py`.
 > Consumers: the Parts Library workspace GUI (`host/src/ui/parts/`) and the
 > vendor-adapter workstream (`services/browser/`).
 
@@ -195,7 +195,7 @@ mechanisms can coexist behind this same seam if the paid-API plan is ever revive
 |---|---|---|---|
 | `category_id` | `str \| null` | no | Dotted taxonomy node id (§7.2) the record belongs to, e.g. `"fasteners.bolts_screws.socket_head"`. Absent on legacy records; adapters may set it when they can classify a hit. |
 
-### 7.2 Taxonomy node schema (`engine_oracle/parts_hub/taxonomy.json`)
+### 7.2 Taxonomy node schema (`services/parts/taxonomy.json`)
 
 Top-level document: `{"version": 1, "categories": [<node>, ...]}` — 11 root folders.
 Node ids are dotted paths (`parent.child`), globally unique.

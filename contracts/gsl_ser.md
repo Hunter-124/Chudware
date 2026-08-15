@@ -147,7 +147,7 @@ Extrinsic-hallucination detection (a caption numeral that grounds to no slot) is
 groundedness question, owned by **T-H4**'s verifier battery. `gsl-ser/v1` defines only
 the seam (`tools/translator/groundedness.py`: the `GroundednessChecker` protocol +
 `check(text, state) -> [Verdict]`); the T-F10 slot-fidelity metric is independent of it
-for its primary SER score. See `work/questions/T-F10.md` for the interface hand-off.
+for its primary SER score. See `work/questions/archive/T-F10.md` for the interface hand-off.
 
 ---
 

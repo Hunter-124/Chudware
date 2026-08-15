@@ -8,7 +8,7 @@
 >
 > **Contract-first.** This file is frozen BEFORE the storage engine
 > (`services/plm/`, T-R2) and the `plm_*` MCP tools. Design source of truth:
-> [docs/PLM_VERSION_CONTROL_PLAN.md](../docs/PLM_VERSION_CONTROL_PLAN.md)
+> [docs/design/PLM_VERSION_CONTROL_PLAN.md](../docs/design/PLM_VERSION_CONTROL_PLAN.md)
 > (Pillar 19, Workstream R). Supersedes backlog T-BL15 + T-BL10.
 >
 > **Builds on `contracts/doc_schema.md`.** History snapshots are the T-H2
@@ -19,9 +19,9 @@
 > remote seams around them.
 >
 > **OSS-first.** Git binding chosen in
-> [docs/PLM_OSS_SURVEY.md](../docs/PLM_OSS_SURVEY.md): **dulwich (Apache-2.0
+> [docs/review/PLM_OSS_SURVEY.md](../docs/review/PLM_OSS_SURVEY.md): **dulwich (Apache-2.0
 > arm), primary; subprocess `git` optional accelerator; pygit2 declined.**
-> Machine-checked by `services/plm/schema.py` (T-R2); fixtures in
+> Machine-checked by `services/plm/canonical.py` (T-R2); fixtures in
 > `contracts/fixtures/plm/`.
 
 ## 0. Conventions & the byte-stability law

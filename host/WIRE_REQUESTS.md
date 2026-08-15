@@ -155,7 +155,7 @@ Format:
 - [ ] (ai-workspace) `host/src/app.cpp` — 3 edits wire the new full-page AI hub
   (`host/src/ui/ai/ai_workspace.cpp`, already built + linked into Chudware):
 
-  1. Add the include next to the other ui includes (~L50, beside `ui/legacy_chat.h`):
+  1. Add the include next to the other UI includes (beside `ui/copilot/copilot.h`):
   ```cpp
   #include "ui/ai/ai_workspace.h"
   ```
@@ -227,7 +227,7 @@ Format:
 ## EM sim family agent (2026-07-07) — register EM study kinds in SimManager
 - [ ] (em-sim) `host/src/ui/sim_manager.cpp/.h` — add three study kinds to the Simulate study-type
   picker, gated by the `em_status` worker RPC (call once, cache; only offer kinds whose
-  `defaults.<analysis>` is non-null; show an "install openEMS — see docs/EM_SIMULATION.md"
+  `defaults.<analysis>` is non-null; show an "install openEMS — see `docs/reference/EM_SIMULATION.md`"
   hint when `defaults.driven == "analytic-uniform"` i.e. no full-wave solver installed):
   1. **EM Eigenmode** → worker RPC `em_eigenmode`. Params UI: waveguide standard combo
      (WR-90 default; free a_mm/b_mm or circular radius_mm as alternative), n_modes int (6),
@@ -240,9 +240,9 @@ Format:
      f0_ghz/bw_ghz. Result: waveform plot — x=`t_ns`, y=`ports.port1_v`+`ports.port2_v`;
      if `spectrum` present offer the S-param plot too.
   All three return `{ok:false, error, solvers}` on failure — surface `error` verbatim (it
-  contains the install hint). Full param schemas + payload shapes: docs/EM_SIMULATION.md §RPC
-  contract. Why: EM sim family landed engine-side (engine_oracle/sim/em/, worker-registered);
-  sim-GUI agent owns sim_manager so the GUI seam goes through this request.
+  contains the install hint). Full param schemas + payload shapes:
+  `docs/reference/EM_SIMULATION.md` §RPC contract. The EM simulation family lives in
+  `services/sim/em/`; sim-GUI owns SimManager, so the GUI seam goes through this request.
 
 ## sim-gui agent — EM ribbon tab wired ahead of the em_* backend (2026-07-07)
 - [ ] (sim-gui) `services/*` (EM backend agent) — the Simulate workspace now ships an "EM" ribbon

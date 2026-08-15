@@ -1,7 +1,7 @@
 # Contract: `aicad.hydraulic/1` — ISO 1219 Hydraulic Circuit Schema
 
 > Schema string: `"aicad.hydraulic/1"`
-> Owner module: `engine/hydraulic/schema.py`
+> Owner module: `core/hydraulic/schema.cpp`
 > Units: mm (positions), bar (pressures), L/min (flows), kN (forces)
 
 ---

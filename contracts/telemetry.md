@@ -2,7 +2,7 @@
 
 > **Scope anchor:** extends `contracts/events.md` v2. Defines capture semantics only.
 > Upload mechanics, exporter implementation, and `flywheel export` CLI are T-H5.
-> Cut ticket: T-H1. Survey source: `docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §2.3–2.4.
+> Cut ticket: T-H1. Survey source: `docs/review/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §2.3–2.4.
 
 ---
 

@@ -281,7 +281,7 @@ graph TD
   subgraph WS_W["workstream W"]
     T_W1["T-W1: Design ledger - persistent mission state with budgeted rendering (aicad.ledger/1)"]:::done
     T_W10["T-W10: Model tier profiles + local-model harness - budget enforcement, GBNF outputs, per-tier prompt sizing"]:::done
-    T_W11["T-W11: Advisory loop end-to-end benchmark - mission through roles+advisories on local and frontier tiers"]:::todo
+    T_W11["T-W11: Advisory loop end-to-end benchmark - mission through roles+advisories on local and frontier tiers"]:::review
     T_W12["T-W12: Tool preflight - dry-run plan validation on shadow doc clones (aicad.preflight/1)"]:::done
     T_W13["T-W13: Overseer plan-audit engine + user change-request routing (aicad.audit/1)"]:::done
     T_W14["T-W14: Hierarchical delegation with approval chain + model routing table (aicad.delegation/1, aicad.routing/1)"]:::done
@@ -386,6 +386,7 @@ graph TD
     T_BL58["T-BL58: 3D sketcher P3 — feature integration (sweep path, loft guide-curves)"]:::backlog
     T_BL59["T-BL59: 3D sketcher P4 — GUI viewport mode (3D dragging) + GSL describe"]:::backlog
     T_BL60["T-BL60: 3D sketcher P5 — advanced constraints + solver robustness"]:::backlog
+    T_BL61["T-BL61: Fillet on a compiled document SIGSEGVs hostd — OCCT PerformFilletOnVertex kills the daemon"]:::todo
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog

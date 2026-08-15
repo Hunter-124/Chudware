@@ -10,7 +10,7 @@ RPC surface).
 
 A DETERMINISTIC PYTHON STATE MACHINE drives the whole flow. Code decides every transition; the
 model only makes scoped decisions (the design intent) inside one bounded stage. This mirrors the
-CAD orchestrator philosophy (docs/PLAN.md sec 3.1 / ECAD_PLAN.md sec 2.6) and reuses the agent-loop
+CAD orchestrator philosophy (contracts/design_pipeline.md) and reuses the agent-loop
 discipline (services/agent/loop.py): bounded retries, a same-error / fail-streak detector, and rich,
 actionable feedback nudges. The point is that a WEAK local model succeeds because code does the
 bookkeeping + validation, and a recipe fallback guarantees a result no matter what the model emits.

@@ -94,7 +94,7 @@ caller, so a resumed or handed-off agent NEVER re-asks a resolved question.
   C++ run machine resolves it (`core/agent/paths.cpp` — `%APPDATA%/Chudware/cache` on Windows,
   `$XDG_DATA_HOME|~/.local/share`/`Chudware/cache` on Linux/macOS).
 - **`scope: doc`** → the document's intake ledger (`IntakeState`,
-  `engine_oracle/intake/intake.py`), round-tripped as JSON into the `.step+` record like
+  `services/intake/intake.py`), round-tripped as JSON into the `.step+` record like
   today's `confirm_dimensions`. Same records; different store.
 - **Replay:** before a batch is presented, the core loads the ledger and drops every
   question whose `id` already has an answer, re-emitting the stored answer with

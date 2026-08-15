@@ -13,10 +13,10 @@ attribution.
   when the joint sha changed. `./build.sh wasm` stages the web bundle into
   `~/chudware-web/app/` (served at `/app` with COOP/COEP). Day-to-day entry point is
   `deploy/update.sh`; nothing auto-promotes on rebuild.
-- Performance ratchet: `gateway/tests/perf_probe.py` (CHUDWARE_LIVE=1) — baseline in
-  `perf/baseline.json`, traces per git SHA in `perf/traces/`; p95 regressions
-  >15% (and >0.1 ms) fail. Run it before committing engine/gateway changes.
-  Browser boot/FPS beacons append to `perf/traces/client.jsonl` via `POST /perf/client`.
+- Performance ratchet: `Webservice/gateway/tests/perf_probe.py` (`CHUDWARE_LIVE=1`) —
+  baseline in `Webservice/perf/baseline.json`, traces per git SHA in
+  `Webservice/perf/traces/`; p95 regressions >15% (and >0.1 ms) fail. Run it
+  before committing engine/gateway changes.
 - The streamed-container portal (`sessions.py`, `proxy.py`, `image/`) was **removed**
   on 2026-08-10. `/app` is the only client. `deploy/monitor.py` survives as a host
   RAM/disk/GPU sampler and disk-pressure flag.

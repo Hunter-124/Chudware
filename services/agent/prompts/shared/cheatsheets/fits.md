@@ -42,8 +42,9 @@ squish, cooling shrink all add up), so use looser numbers than the ISO table abo
 - **Never model a true interference (negative-clearance) fit for FDM plastic.** Layer adhesion
   is weaker than the bulk polymer, elastic/plastic creep relaxes any interference within days to
   weeks, and the print tolerance band (±0.2–0.3 mm typical FDM) is often larger than the
-  interference you'd want anyway. This matches `docs/INTAKE_MEASUREMENT_DFM_PLAN.md`'s process
-  table (`hole_comp_mm ≈ 0.20`, `fit_classes_mm.press` steered to insert, not interference).
+  interference you'd want anyway. This matches the process profile in
+  `core/dfm/process_profiles.cpp` (`hole_comp_mm ≈ 0.20`, press fits steered to
+  inserts rather than interference).
   - **Permanent joins**: use heat-set threaded inserts (see `bearings.md`/`hardware.md` insert
     table) or a fastener, not a press fit.
   - **Bearings**: press the bearing into a metal sleeve/washer boss, or oversize the pocket
@@ -54,5 +55,5 @@ squish, cooling shrink all add up), so use looser numbers than the ISO table abo
 - Calibrate per printer/material when precision matters; treat the numbers above as a starting
   point, not a guarantee, and note the assumption in the design if fit is critical.
 
-Sources: ISO 286-2:2010 (fundamental tolerances/deviations, hole-basis system), general FDM
-process guidance consistent with `docs/INTAKE_MEASUREMENT_DFM_PLAN.md`'s process-profile table.
+Sources: ISO 286-2:2010 (fundamental tolerances/deviations, hole-basis system) and
+general FDM process guidance consistent with `core/dfm/process_profiles.cpp`.

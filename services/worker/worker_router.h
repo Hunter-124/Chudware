@@ -1,6 +1,7 @@
 #pragma once
-// Routing policy for the worker seam: libchudware (C++) vs engine_oracle (Python).
-// See contracts/worker_rpc.md and docs/CPP_MIGRATION.md.
+// Routing policy for the worker seam: libchudware (C++) vs the Python worker
+// (services/worker_main.py; the former engine_oracle tree was deleted in the
+// zero-Python cutover, T-RF20/T-RF21). See contracts/worker_rpc.md.
 #include <string>
 
 namespace chudware::services {

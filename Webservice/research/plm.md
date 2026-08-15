@@ -36,7 +36,7 @@
   2. Object-store / pack writes are not coordinated beyond ref CAS; concurrent loose-object writes to the same bare repo are generally OK in git, but `repack`/`gc` via subprocess (`gitbind.py:212-229`) is unsafe concurrent with writers.
   3. `.aicadvault/config.json` is read-modify-write with **no CAS** (`vault.py:420-432`) → last writer wins for local settings.
   4. Working `.step+` containers and AI-VC store under `ai_vc/` have **no** multi-writer protocol.
-- **Verdict:** Concurrent access from multiple processes on one vault is **partially safe for history append** (CAS), **unsafe for shared working tree / multi-user CAD**. Contract v1 assumes one writer per item via advisory locks + sync, not simultaneous writers on one checkout (`contracts/plm.md:233-238`, T-BL15.md:71-72).
+- **Verdict:** Concurrent access from multiple processes on one vault is **partially safe for history append** (CAS), **unsafe for shared working tree / multi-user CAD**. Contract v1 assumes one writer per item via advisory locks + sync, not simultaneous writers on one checkout (`contracts/plm.md:233-238`, `work/backlog/T-BL15.md:71-72`).
 
 ---
 
@@ -52,7 +52,7 @@
 ### Code reality
 - **No** `services/plm/remote.py`, `locks.py`, `conflict.py`, or `server` (glob empty).
 - MCP explicitly defers: “Remote/lock tools … are T-R7” (`services/mcp/plm_tools.py:18`).
-- Binding: **dulwich primary** for vault; subprocess `git` optional for `gc`/`repack` only (`gitbind.py:5-12`, `docs/PLM_VERSION_CONTROL_PLAN.md` T-R1 note).
+- Binding: **dulwich primary** for vault; subprocess `git` optional for `gc`/`repack` only (`gitbind.py:5-12`, `docs/design/PLM_VERSION_CONTROL_PLAN.md` T-R1 note).
 - **`gitscm.py` is a different surface:** drives system `git`/`gh` against the project’s real **`.git`**, NOT `.aicadvault/` (`gitscm.py:1-8`). Power-user “Git” tab: status/log/branches/remotes/fetch/pull/push (`gitscm.py:339-373`, `worker_rpc.py:548-620`). **Must not be confused with PLM vault remotes.**
 
 ---
@@ -60,7 +60,7 @@
 ## 3. How GUI / agent talk to PLM; who owns the vault
 
 ### Paths
-1. **Worker RPC (GUI primary):** `services/plm/worker_rpc.py` `WORKER_METHODS` → registered in `engine_oracle/worker.py:323-330`. Host ImGui calls `st.rpc.call("plm_*", {path: projectDir})` (`host/.../plm_state.cpp` pattern). Methods: open/status/history/save/checkpoint/release/restore/compare/item_*/where_used/set_ai_mode/plan/overview/settings/scheme/draft/timeline/rollback + `git_*` (`worker_rpc.py:618-668`).
+1. **Worker RPC (GUI primary):** `services/plm/worker_rpc.py` `WORKER_METHODS` → registered in `services/worker_main.py:138-139`. Host ImGui calls `st.rpc.call("plm_*", {path: projectDir})` (`host/src/ui/plm/plm_state.cpp` pattern). Methods: open/status/history/save/checkpoint/release/restore/compare/item_*/where_used/set_ai_mode/plan/overview/settings/scheme/draft/timeline/rollback + `git_*` (`worker_rpc.py:618-668`).
 2. **MCP tools:** `services/mcp/plm_tools.py` registered in `server.py:328-330`. Same vault implementation; agent/external clients.
 3. **In-process client:** `services/plm/client.py` `PLMVaultClient` — agent `plm_bridge` AI checkpoints with §3.4 `ai` block (`client.py:1-18,86-139`; `contracts/plm.md` §7.1).
 4. **AI-VC hooks:** `ai_vc.py` + agent_turn/guardrails; storage under vault `ai_vc/` (`contracts/ai_vc.md`).
@@ -76,7 +76,7 @@
 
 | Task | Intent | Status | Built? |
 |---|---|---|---|
-| T-R1 | Freeze contract + OSS survey | done (DAG) | Yes — `contracts/plm.md`, `docs/PLM_OSS_SURVEY.md` |
+| T-R1 | Freeze contract + OSS survey | done (DAG) | Yes — `contracts/plm.md`, `docs/review/PLM_OSS_SURVEY.md` |
 | T-R2–R4 | Vault core, change intel, items/releases | done | Yes — `services/plm/*` |
 | T-R5 | In-editor GUI | doing | Partial GUI over existing RPCs |
 | T-R6 | Project Hub | todo | Partial hub UI; no team chips wired to real locks |
@@ -210,7 +210,7 @@ Until T-R7 is implemented, even clone+manual git of `.aicadvault` is unsupported
 - Remotes schema only: `services/plm/manifest.py:29,51-52`
 - gitscm ≠ vault: `services/plm/gitscm.py:1-8`
 - MCP T-R7 gap: `services/mcp/plm_tools.py:18`
-- Worker registration: `engine_oracle/worker.py:323-330`
+- Worker registration: `services/worker_main.py:138-139`
 - Contract §6: `contracts/plm.md:233-342`
 - T-R7/R8 cards: `work/tasks/T-R7.md`, `work/tasks/T-R8.md`
 - DAG status: `work/DAG.md:187-189`

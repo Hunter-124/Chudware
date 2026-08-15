@@ -1,6 +1,6 @@
 # Contract: Copilot Skills — v1
 
-Append-only. Integrator-owned. Producer: `services/agent/skills.py`.
+Append-only. Integrator-owned. Producer: `services/agent/worker_rpc.py`.
 Consumers: agent loop (context injection), chat slash-commands, AI-settings skills editor, MCP.
 
 Skills are folders of instructions + resources the copilot (and humans) can invoke,

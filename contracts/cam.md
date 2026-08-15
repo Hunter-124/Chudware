@@ -99,7 +99,7 @@ toolpath bbox round-trip, rapids below clearance (warning).
 
 ## 5. `aicad.machines/1` — machine profile records
 
-Canonical store: `engine_oracle/research/data/machines.json`
+Canonical store: `services/research/data/machines.json`
 
 ```jsonc
 {

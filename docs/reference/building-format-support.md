@@ -19,7 +19,7 @@ in this repo that check is `contracts/licenses.md`, not this file.
   Reference**. It's a tagged (group-code, value) format — a weekend to a basic
   reader, and it teaches the whole data model (see `cad-data-model.md`).
   **This repo already did this step**: DXF import via **ezdxf** (MIT),
-  `engine/doc/formats.py` + `engine/doc/formats_dxf.py`.
+  `services/formats/formats.py` + `services/formats/formats_dxf.py`.
 - **DWG:** implement from the **ODA Open Design Specification for .dwg files**
   (public). Or use open-source:
   - **LibreDWG** (GNU LGPL/GPL — check which; affects linking) — reads/writes DWG.
@@ -54,7 +54,7 @@ in this repo that check is `contracts/licenses.md`, not this file.
   Open tooling: **OpenCASCADE** (LGPL-style) has robust STEP/IGES import/export.
   **This repo already implements both**: STEP (AP214) via
   `build123d.export_step`/`import_step`, IGES via `OCP.IGESControl` — both in
-  `engine/doc/formats.py`, both riding on OCCT (see `contracts/licenses.md`, row
+  `services/formats/formats.py`, both riding on OCCT (see `contracts/licenses.md`, row
   `cadquery-ocp / OCCT`).
 - **IGES:** **IGES 5.3** public; OpenCASCADE handles it too (same as above).
 
@@ -75,7 +75,7 @@ in this repo that check is `contracts/licenses.md`, not this file.
   is already one of this repo's supported mesh formats.
 - **This repo's actual render path:** the AICM tessellation format
   (`contracts/mesh_format.md`) plays the "abstract primitive stream" role, fed to
-  the C++ host's render backend (`host/src/render/aicm_loader`).
+  the C++ host's render backend (`host/src/render/aicm_loader.cpp`).
 
 ## Goal: export to PDF / SVG / STL / glTF
 
@@ -107,7 +107,7 @@ in this repo that check is `contracts/licenses.md`, not this file.
 
 Keep the format layer isolated so adding a format never touches the document
 model, and keep geometry/graphics swappable. **This repo already follows this
-shape**: `engine/doc/formats.py`'s `FORMAT_REGISTRY`/`import_path` is the isolated
+shape**: `services/formats/formats.py`'s `FORMAT_REGISTRY`/`import_path` is the isolated
 format-I/O layer; it feeds build123d/OCCT shapes into the document model
 (`contracts/doc_schema.md`); tessellation to AICM (`contracts/mesh_format.md`) is
 the Gi/Gs-equivalent boundary to the render backend. Adding a new format (per

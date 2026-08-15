@@ -14,10 +14,6 @@
 
 Implementations split by OS: `*_win32.cpp`, `*_linux.cpp`. Build via `platform/CMakeLists.txt` → static lib `chudware_platform`.
 
-## Retired-shell wrappers (historical)
-
-`ui/imgui/src/platform/file_dialog.*` — CAD-specific `openCadFile` / `saveCadFile` over `dialogs.h` (retired with the old shell; `host/` is now the single GUI).
-
 ## Headless
 
 `CHUDWARE_NO_FILE_DIALOGS=1` → all dialog calls return empty / -1 (CI / `--shot`).

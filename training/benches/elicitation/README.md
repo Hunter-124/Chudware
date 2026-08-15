@@ -31,7 +31,7 @@ for the implementation.
 
 A candidate brief is schema-valid iff every `kind`/`status`/`verify_by[].verifier` value is
 a member of `VALID_KINDS` / `VALID_STATUSES` / `VALID_VERIFIERS` (imported from
-`engine_oracle/requirements/requirements.py`, with a local fallback copy if that import path
+`services/requirements/requirements.py`, with a local fallback copy if that import path
 isn't wired), every requirement names >=1 verifier, and every `need` resolves to a declared
 stakeholder need. An invalid brief scores `0.0` outright — coverage/precision are not
 computed for it. This is narrower than the full `RequirementsDoc.validate()` (it does not

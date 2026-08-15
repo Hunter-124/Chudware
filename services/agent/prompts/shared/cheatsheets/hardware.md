@@ -4,7 +4,7 @@ Real published dimensions for common off-the-shelf hardware, so the planner/mode
 pockets, bosses, clearance holes and counterbores that **actually fit** named parts instead of
 guessing. All values **millimetres** unless an inch size is named. This is the engineer's
 reference; the parametric parts library (`parts_make` RPC, `core/parts`) generates real geometry
-from the SAME numbers, and the vendor-parts registry (`engine/vendor_parts.py`) can cache supplier
+from the SAME numbers, and the vendor-parts registry (`services/parts/vendor_parts.py`) can cache supplier
 CAD by part number. See the import seam at the bottom.
 
 > Rule of thumb when a value isn't listed: clearance-hole Ø ≈ nominal + (0.4 small … 1.0 large);

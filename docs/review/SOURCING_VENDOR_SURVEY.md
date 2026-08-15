@@ -4,7 +4,7 @@ Shortlist of **manufacturing-service bureaus** (make-to-order: CNC, 3D printing,
 metal, PCB fab) worth wrapping as sourcing adapters next, ranked by how automatable their
 quote flow is (public API vs. browser-only) and their fit for Chudware's BOM → quote → order
 pipeline. This survey has **no adapter code** — it feeds the ordering work in
-[T-X9](../work/tasks/T-X9.md) (BOM → vendor carts / quote submission) and picks the next
+[T-X9](../../work/tasks/T-X9.md) (BOM → vendor carts / quote submission) and picks the next
 adapter targets after the wave-2 commerce/catalog vendors (Amazon, McMaster-Carr, JLCPCB,
 PCBWay) shipped in T-X7.
 

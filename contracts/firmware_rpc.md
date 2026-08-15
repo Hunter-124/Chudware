@@ -143,7 +143,7 @@ Event object:
 - **QEMU** (semihosting shim): QEMU exposes no external pin observer, so the firmware
   reports its own transitions via `CHUDWARE_GPIO_TRACE(pin_str, level, t_ms)` /
   `CHUDWARE_GPIO_TRACE_NT(pin_str, level)` from the project template header
-  `include/chudware_trace.h` — a printf of the same `CHUDWARE_GPIO_EVT` line
+  `core/firmware/templates_embedded.cpp` — a printf of the same `CHUDWARE_GPIO_EVT` line
   (optionally `t=<n>ms`, also accepting `us`/`s`) over the semihosting console.
 
 ### 7.3 Timeline assertion form (extends the `fw_sim_run` assertion grammar)
@@ -157,8 +157,8 @@ only; when the pin has none, the assertion fails with detail
 ## 8. Worker endpoints — GUI seam (T-FIN5, appended)
 
 The desktop Firmware workspace (host GUI) talks to the engine over the JSON-RPC worker
-(`contracts/worker_rpc.md`), not MCP. `engine/firmware/worker_rpc.py` registers a
-GUI-facing mirror of the fw_* tools into `engine_oracle/worker.py`; every method is a thin
+(`contracts/worker_rpc.md`), not MCP. `core/firmware/firmware_rpc.cpp` registers a
+GUI-facing mirror of the fw_* tools into `core/api/libchudware.cpp`; every method is a thin
 adapter over the SAME `engine.firmware.mcp_tools` implementation the MCP server uses, so
 tool and GUI behavior can never drift.
 
@@ -179,7 +179,7 @@ worker error.
 
 The previously-reserved `scenario` param of `fw_sim_run` (§5) is now defined: a declarative
 set of time-series stimulus tracks bound to emulated peripherals, compiled into the generated
-Renode `.resc` (`engine/firmware/scenario.py`). Accepted as a dict, a JSON string, or a
+Renode `.resc` (`core/firmware/scenario.cpp`). Accepted as a dict, a JSON string, or a
 fixture reference `"fixture:<name>"` (library: `engine/firmware/fixtures/`, ≥4 sensor
 archetypes: `i2c_temp_tmp103`, `spi_imu_stub`, `quadrature_encoder`, `adc_thermistor`,
 `user_button`). Scenarios are **Renode-path only** — QEMU exposes no peripheral-stimulus
@@ -277,7 +277,7 @@ A duty-cycle-weighted per-rail current profile derived from a §7 emulation trac
 the T-FIN8 per-component rail metadata (`contracts/ecad/boardphys.md` `eng.supply.rails`).
 **Bookkeeping, not SPICE** — datasheet envelope currents scaled by observed/derived
 activity; the artifact's `model` field states this. Producer:
-`engine/firmware/powerprofile.py` (`build_power_profile`). Consumers: system power
+`core/firmware/powerprofile.cpp` (`build_power_profile`). Consumers: system power
 budget (T-FIN23); each rail's `schedule` is exactly the `{duty, period_s}` /
 `{points:[[t_s,scale]], period_s}` heat-load schedule shape the transient-thermal path
 accepts (T-FIN18) — no re-parsing of raw traces downstream.

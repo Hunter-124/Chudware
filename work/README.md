@@ -75,14 +75,11 @@ Run `validate` before committing.
 | D | Civil / structural | _teammate 3_ |
 | E | Piping / hydraulics (sprint 2) | _unassigned_ |
 | F | AI experience: research/interaction/vision/narration/providers/translator/deliverables (docs/AI_TOOLING_MASTER_PLAN.md) | _agents_ |
-| G | GUI: polish, Chudware rename, ui/imgui migration, host/ deletion | Erik + agents |
+| G | GUI: unified `host/src/ui/` desktop + web surface | Erik + agents |
 
 ## Special tasks: `owner: main-checkout`
 
 A few tasks (T-G1, T-S2) land verified-but-uncommitted work that only exists in the main
 checkout's dirty working tree. They keep `owner: main-checkout` so `work.py claim` never
 hands them to a worktree agent (a worktree can't see the dirty files). Run them from the
-main checkout, human-supervised; their bodies carry the exact commit protocol. The GUI
-migration waves (T-G5..T-G9) are integrator-style tasks — one driver orchestrating
-subagents per `docs/GUI_MIGRATION_DAG.md` node specs, with that doc as the single source
-of truth for write-sets and verify commands.
+main checkout, human-supervised; their bodies carry the exact commit protocol.

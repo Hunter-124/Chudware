@@ -25,6 +25,18 @@ documents cite.
 | `18_cutting.md` | laser / plasma / waterjet process profiles |
 | `19_pnp.md` | OpenPnP virtual + job interchange |
 | `20_robot.md` | ROS 2 / MoveIt offline planning |
+| `21_qualification.md` | hermetic E3 gateway and virtual-printer qualification procedures |
+| `22_perception_model.md` | Forecast-to-Compress evaluation protocol and measured publication limits |
+| `23_security_review.md` | manufacturing/perception security-review baseline and findings |
+| `24_code_review.md` | implementation code-review baseline and hardware-pilot blockers |
+| `25_viewpoint_model.md` | learned viewpoint policy evaluation against limited-information baselines and the oracle |
+| `26_viewpoint_feedback.md` | Stage-2 consumer-feedback protocol for viewpoint usefulness labels |
+| `27_viewpoint_render.md` | viewpoint pose-to-image and physical-camera bridge |
+| `28_viewpoint_observation.md` | information-limited viewpoint observation contract |
+| `29_viewpoint_accel.md` | optional Torch acceleration for the frozen viewpoint oracle |
+| `30_viewpoint_pixels.md` | rendered-pixel corpus for the learned viewpoint encoder |
+| `31_viewpoint_usefulness.md` | task-grounded viewpoint usefulness benchmark |
+| `32_viewpoint_flywheel.md` | opt-in judgement and outcome-data flywheel |
 | `90_research_printers.md` | primary-source printer-integration research |
 
 ## Non-negotiables (short form)

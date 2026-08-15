@@ -3,7 +3,7 @@
 > Version 1 (DESIGN / SCOPING — NOT YET IMPLEMENTED). Defines the seam for **instant-quote
 > cut/machine services** (SendCutSend, OSH Cut, Xometry, Fictiv, Protolabs, …). Producers:
 > a future `engine_oracle/fab_hub/` + `services/browser/fab/` layer. Consumers:
-> `services/mcp/fab_tools.py` (new), the Parts Library / Manufacture GUI.
+> the Parts Library / Manufacture GUI.
 >
 > **Append-only per `contracts/README.md`.** This document is a scoping deliverable: it fixes
 > the RPC surface, envelopes, taxonomy placement, and phasing so implementation can land
@@ -164,7 +164,7 @@ the tool's job ends at "browser open on the checkout page".
 ### 2.4 How geometry reaches the service (export formats — real vs. gap)
 
 Geometry is exported from the doc via the **existing** primitive
-`engine_oracle/doc/formats.py::export_document(doc, path, fmt=…)`.
+`services/formats/formats.py::export_document(doc, path, fmt=…)`.
 
 | process class | export format | status of the export primitive |
 |---|---|---|
@@ -184,7 +184,7 @@ follow-up. This contract does not assume it exists.
 
 `contracts/parts.md` §7.2 says a node's `sites` are the vendor adapters its `part_search`
 routing fans out to. That field is **validated**:
-`engine_oracle/parts_hub/test_taxonomy.py::test_every_routed_site_is_a_registered_adapter`
+`services/parts/test_taxonomy.py::test_every_routed_site_is_a_registered_adapter`
 (line 304) asserts `referenced_sites ⊆ registered SourceAdapter keys`. A fab service is **not**
 a registered `SourceAdapter` (it has no `search`/`acquire`), so listing `"sendcutsend"` in any
 `sites` array would break that test. **Do not put fab services in `sites`.**
@@ -193,7 +193,7 @@ a registered `SourceAdapter` (it has no `search`/`acquire`), so listing `"sendcu
 
 Two compatible options; **(A) is preferred** because it keeps `taxonomy.json` untouched:
 
-- **(A) Standalone registry module** — `engine_oracle/fab_hub/registry.py` holds the fab
+- **(A) Standalone registry module** — `services/parts/registry.py` holds the fab
   service catalog (the `fab_services()` payload of §2.1). No taxonomy edit; `fab_services()`
   reads this module directly. A parallel `test_every_fab_service_is_registered` guards it,
   mirroring the `sites` test but over the fab registry — never crossing into `sites`.

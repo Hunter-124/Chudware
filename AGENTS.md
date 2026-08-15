@@ -82,9 +82,9 @@ Canonical references:
 | `platform/` | Cross-OS shims (dialogs, DPI, paths, resources, window) with `_linux`/`_win32` implementations. |
 | `contracts/` | Frozen interface contracts — THE seams. Append-only, integrator-owned. |
 | `corpora/` | Consolidated test fixtures (`sketch/`, `render/`, `sw_parity/`, `sw_fixtures/`), referenced directly by their canonical paths. |
-| `work/` | Git-tracked solo task board (`tasks/`, `backlog/`, `tools/work.py`, `WORKFLOW.md` policy). |
+| `work/` | Git-tracked solo task board (`tasks/`, `backlog/`, `work/tools/work.py`, `WORKFLOW.md` policy). |
 | `docs/` | Design docs, status notes, parity specs, handoffs, perf audits. |
-| `tools/`, `scripts/`, `third_party/`, `assets/`, `packaging/`, `benchmarks/`, `training/` | Dev tools; repo gates + audits (`check.py`, `gate.sh`); vendored deps; icons/fonts; packaging; perf benches; ML eval/telemetry (training itself is a deferred plan). |
+| `tools/`, `scripts/`, `vendor/`, `assets/`, `packaging/`, `benchmarks/`, `training/` | Dev tools; repo gates + audits (`check.py`, `gate.sh`); vendored deps; icons/fonts; packaging; perf benches; ML eval/telemetry (training itself is a deferred plan). |
 | `scratch/` | Throwaway area (non-blocking). |
 
 ## GUI ownership policy
@@ -126,7 +126,7 @@ green. It runs, in order:
    **web parity probe** (`scripts/web_parity_probe.py` enforcing
    `contracts/web_parity.md` over a scratch hostd with the Python worker bridge
    disabled — what the WASM client faces).
-5. Engine + agent pytest suites: `<venv>/python -X utf8 -m pytest engine/doc services/agent -q`.
+5. Agent pytest suite: `<venv>/python -X utf8 -m pytest services/agent -q`.
    SKIPPED if the runtime venv/pytest is not provisioned on the box — again a
    SKIP, not a failure.
 6. `CHUDWARE_SHOT=m1` headless screenshot smoke via `xvfb-run`, plus the
@@ -194,9 +194,10 @@ Other entry points:
   `engine.*`/`engine_oracle.*` import in `services/`. New engine functionality
   lands in `core/` (C++) behind the RPC surface; services-side Python is for
   MCP tools, the agent loop, and pure helpers with no C++ counterpart.
-- Subsystem-local `AGENTS.md` files exist (e.g. `engine/AGENTS.md`,
-  `platform/AGENTS.md`); the deeper, more specific one wins. Keep them current
-  when you change the conventions they describe.
+- Subsystem-local `AGENTS.md` files exist (for example,
+  `services/agent/AGENTS.md`, `services/mcp/AGENTS.md`, and `platform/AGENTS.md`);
+  the deeper, more specific one wins. Keep them current when you change the
+  conventions they describe.
 - CMake 4.x note for `core/`: doctest's old `cmake_minimum_required` is
   bypassed via `SOURCE_SUBDIR`; do **not** set
   `CMAKE_POLICY_VERSION_MINIMUM` (it poisons the cache — wipe `core/build` if

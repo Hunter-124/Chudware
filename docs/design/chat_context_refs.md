@@ -50,7 +50,7 @@ them (feed to describe_part/query_geometry/measure_* by id). Chips clear on send
 ## Scope split (Wave 4 workers, disjoint write-sets)
 - R_Icons: remade paperclip glyph + new logo-cube icon (black lines, transparent bg). Icon
   draw files per gui-icons; returns icon id(s) -> integrator appends contracts/icons.md.
-- S_Composer: host/src/ui/legacy_chat.cpp(+.h) — cube button, chips row, arm/disarm, chip x,
+- S_Composer: `host/src/ui/copilot/composer.cpp` — cube button, chips row, arm/disarm, chip x,
   submit `context_refs`, toolbar fill/align. Consumes R's icon ids + app_state fields.
 - T_PickCapture: host/src/ui/viewport_panel.cpp + host/src/ui/feature_tree.cpp — when
   contextPickActive, route viewport picks / tree-row clicks into pendingContextRefs; RMB

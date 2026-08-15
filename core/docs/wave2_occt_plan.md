@@ -17,9 +17,9 @@
 OCCT 8.0 has significant breaking changes that would require immediate port work:
 
 - `BRepMesh_IncrementalMesh` constructor signature changed (the `adaptiveMin` parameter removed,
-  `BRepMesh_FastDiscret::Parameters` moved to `IMeshTools_Parameters`). Our tessellate port copies
-  `engine/doc/tessellate.py` directly — that code was written against OCP 7.8.1 and uses the 7.x
-  call signature `BRepMesh_IncrementalMesh(shape, lin_defl, False, ang_defl, True).Perform()`.
+  `BRepMesh_FastDiscret::Parameters` moved to `IMeshTools_Parameters`). The
+  original tessellation port targeted the 7.x constructor signature
+  `BRepMesh_IncrementalMesh(shape, lin_defl, False, ang_defl, True).Perform()`.
 - `BRepAlgoAPI_BooleanOperation`: `BuilderCanWork`, `FuseEdges`, `RefineEdges` removed.
 - `BRepAlgo_BooleanOperations` and `BRepAlgo_DSAccess` removed entirely.
 - 8.0 provides automated migration scripts (`adm/scripts/migration_800/`) but they run on source —
@@ -150,7 +150,7 @@ their plain `TK*` names (the prebuilt config exports them without a namespace pr
 # --- libchudware_geom: OCCT-backed geometry + tessellation ---------------------
 add_library(chudware_geom_occt STATIC
   geom/occt_box.cpp          # smoke test first
-  geom/tessellate.cpp        # port of engine/doc/tessellate.py
+  geom/tessellate.cpp        # tessellation implementation
   # ... feature compilers added incrementally
 )
 
@@ -193,9 +193,9 @@ target_link_libraries(chudware_geom_occt PUBLIC
 )
 ```
 
-**Python OCP → C++ OCCT mapping:**
+**OCCT API → toolkit mapping:**
 
-| Python (engine/doc/tessellate.py or evaluate.py)               | C++ toolkit |
+| API                                                           | C++ toolkit |
 |----------------------------------------------------------------|-------------|
 | `BRepMesh_IncrementalMesh`, `BRepLib_ToolTriangulatedShape`    | TKMesh      |
 | `TopExp.MapShapes_s`, `TopTools_IndexedMapOfShape`             | TKTopAlgo   |
@@ -449,10 +449,9 @@ If you get `The application was unable to start correctly (0xc000007b)` or a mis
 the DLL copy step didn't fire — check the `OCCT_ROOT` and `OCCT_3RDPARTY_ROOT` cache vars and
 re-run the build.
 
-### Step 6 — Port tessellate.py → core/geom/tessellate.cpp
+### Step 6 — Implement `core/geom/tessellate.cpp`
 
-Priority mapping of `engine/doc/tessellate.py` to C++ (each call in Python → same call in C++
-with same semantic):
+Priority mapping of the tessellation calls:
 
 ```
 tessellate_body()
@@ -469,20 +468,13 @@ tessellate_body()
   → BRep_Tool::Pnt(vertex)              for B-rep vertex xyz
 ```
 
-The Python tessellate writes the AICM binary using `struct.pack`. The C++ port writes the same
-format using `fwrite` / `std::vector<uint8_t>` with identical little-endian layout — use
-`docs/contracts/mesh_format.md` as the contract and `docs/contracts/fixtures/box.aicm` as the
-golden fixture (byte-identical gate).
+The tessellator writes the AICM binary with the contract in
+`contracts/mesh_format.md`.
 
-### Step 7 — Wire into the AICM differential harness
+### Step 7 — Verify the AICM output
 
-Once tessellate.cpp passes the `box.aicm` golden fixture, extend the Wave-1 differential harness
-(`tools/solver_diff.py` pattern) to run:
-- Python: `engine/doc/tessellate.py` → AICM bytes
-- C++: `sketch_cli`-style binary that reads a STEP file and writes AICM bytes
-
-Diff outputs within mesh tolerance (not byte-identical for arbitrary shapes, but `box.aicm` should
-be byte-identical since the same meshing parameters produce deterministic triangulation on a box).
+Verify `core/geom/tessellate.cpp` against the mesh-format contract and corpus
+fixtures, including mesh tolerance and deterministic output for the box fixture.
 
 ---
 

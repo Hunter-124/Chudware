@@ -1,9 +1,8 @@
 # services/worker — engine routing seam
 
 Single dispatch point for all host→engine calls. Routes to in-process
-`libchudware` (`core/api/libchudware.h` `chudware_call`) or the Python oracle fallback
-(`engine_oracle/` via subprocess JSON-RPC). Mirrors the contract in
-`contracts/worker_rpc.md`.
+`libchudware` (`core/api/libchudware.h` `chudware_call`) or the daemon backend.
+Mirrors the contract in `contracts/worker_rpc.md`.
 
 ## Contents (the only modules — R0b purged everything else)
 
@@ -25,8 +24,7 @@ host copies are canonical.
 ## Write-set rules
 
 - Append-only shared: routing table in `worker_client.*` (integrator merges).
-- Depends on: `core/api/libchudware.h`, `engine_oracle/worker.py`,
-  `services/ipc/*` (IPC transport/discovery).
+- Depends on: `core/api/libchudware.h` and `services/ipc/*` (IPC transport/discovery).
 - `worker_client.cpp` includes `bootstrap.h` resolved from `host/src`
   (runtime provisioning lives with the host) — do not reintroduce a local
   copy here.

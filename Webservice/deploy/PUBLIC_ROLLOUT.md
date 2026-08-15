@@ -83,33 +83,28 @@ Admin API: `GET /api/admin/accounts`, `.../approve|deny|suspend|plan`,
 
 ---
 
-## 3. Blocking gaps — do NOT open registration until these are closed
+## 3. Remaining public-registration risks
 
-These are real and currently unaddressed. Listed in the order they matter.
+The first two former blockers are now shipped; the remaining process-isolation
+and host-boundary risks still matter.
 
-1. **Plan entitlements are defined but not enforced.** `plans.py` declares
-   storage/token limits per tier and `/api/billing/status` reports them, but
-   nothing consults a plan. Today a `free` account and a `team` account get
-   identical resources. Monetization is not functional until the plan is wired
-   into the disk-quota check (storage) and the token budget.
-2. **No LLM token metering.** `monthly_llm_tokens` is a number in a dataclass.
-   Nothing counts tokens, nothing stops a user spending your provider balance.
-   Every web turn spends the **host account's** provider balance — there is no
-   per-user credential and no per-user budget. This is the single biggest
-   unpriced cost in the service; it must be metered before you bill for copilot
-   use or open registration.
+1. **Plan entitlements and storage limits are now enforced.** `limits.py`
+   applies each plan's storage quota, and `/engine` checks whether the plan has
+   cloud access before opening a bridge.
+2. **Pooled AI use is metered.** `credits.py` reserves and reconciles prepaid
+   credits against provider token costs; a zero-balance pooled actor is stopped
+   before provider dispatch. BYOK remains outside the pooled credit ledger.
 3. **The CAD daemon is still one shared process.** The path jail stops user A
    naming user B's files, but a malformed or expensive RPC still degrades the
    daemon for *everyone*. True isolation needs a daemon per user, bound to a
    per-user socket.
-4. **Host blast radius.** The gateway account `liveuser` is in `wheel` with
-   `NOPASSWD: ALL` and holds SSH private keys to another LAN machine
-   (`192.168.0.123`). Any RCE in the web app is root on the box and a pivot into
-   the house. `deploy/harden_host.sh` fixes this; it has not been applied.
-5. **Live credentials in the repo.** `Webservice/Cloudflare-info.txt` holds a
-   Cloudflare API token (verified still ACTIVE) and R2 access keys. The file is
-   gitignored now, but the values are in git history from commit `84963165`. The
-   repo is currently private. **Rotate both** — see DEPLOYMENT.md.
+4. **Host blast radius remains material.** The gateway account `liveuser` still
+   has elevated host access by owner choice. `deploy/harden_host.sh` applies the
+   accepted firewall, tunnel, update, key, backup, and gateway controls; revisit
+   its declined `sudo` and `sshd` items before treating the host as isolated.
+5. **Credentials exposed in git history must remain rotated.**
+   `Webservice/Cloudflare-info.txt` is untracked and gitignored, but old values
+   remain in commit `84963165`; never rely on any credential found there.
 
 ---
 
@@ -162,7 +157,7 @@ What was applied, in the order it has to happen:
    made public signup possible at all: the older commit had no `PUBLIC_PATHS`,
    so `/signin` and `/signup` answered `401 missing Cf-Access-Jwt-Assertion`
    and a visitor could not reach a sign-up form by any route.
-3. `CHUDWARE_WEB_PUBLIC_URL` repointed to `https://app.chudware.com`. It builds
+3. `CHUDWARE_WEB_PUBLIC_BASE_URL` repointed to `https://app.chudware.com`. It builds
    every verification and reset link, so leaving it on the apex would have
    mailed people links into the static site.
 4. Access removed from the apex **before** DNS moved. In the other order the

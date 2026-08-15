@@ -30,7 +30,7 @@ CAD-Coder, ReCAD corroborate (GRPO + geometric reward).
 
 ## The gate (do NOT start training before this)
 
-`docs/RECOGNITION_RESIDUAL.md` "VLM candidate go/no-go" must read **GO** for a candidate
+`docs/review/RECOGNITION_RESIDUAL.md` "VLM candidate go/no-go" must read **GO** for a candidate
 (its zero-shot bench F1 beats the deterministic ceiling AND precision==1.0). Kill switch:
 the trained model must beat the frontier-VLM-via-API **per dollar** on the frozen bench AND
 never lose to the deterministic/claims-protocol fallback. If either fails, we ship the

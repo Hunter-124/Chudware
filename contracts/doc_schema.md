@@ -1,7 +1,7 @@
 # Contract: Document Schema — `aicad.part/1` · `aicad.asm/1` · `aicad.drawing/1`
 
 > Version 1. Changes require a schema-string bump and a migration note here.
-> Machine-checked by `engine/doc/schema.py`; fixtures in `contracts/fixtures/`.
+> Machine-checked by `core/doc/validate.cpp`; fixtures in `contracts/fixtures/`.
 >
 > **W12 minor version bump (additive).** A NEW top-level document kind `aicad.drawing/1`
 > (`DrawingDocument`, §8) is added — a 2D detailing document that projects a source part/assembly
@@ -57,7 +57,7 @@
 }
 ```
 
-- `material` may be `null`. `key` indexes `engine/sim/materials.json`.
+- `material` may be `null`. `key` indexes `services/sim/materials.json`.
 - `features` array order **is** the history; the rollback bar is an index into it.
 - `equations.globals` evaluate in dependency order; cycles are a document error.
 - `rollback_after` (optional, C35-overhaul): the rollback bar. `null`/absent = bar at the end
@@ -358,7 +358,7 @@ const  := pi
 - **Trig is in DEGREES** (in and out: `sin(30) = 0.5`, `asin(0.5) = 30`). CAD-user convention.
 - Names resolve against `equations.globals` (v1 scope). Unknown name, cycle, division by zero,
   or non-finite result = evaluation error → the owning feature gets an error state.
-- Implemented by `engine/doc/equations.py` (whitelisted-AST evaluator; nothing else executes).
+- Implemented by `core/util/expr.cpp` (whitelisted-AST evaluator; nothing else executes).
 
 ## 5. Reserved built-in datum ids
 
@@ -479,7 +479,7 @@ Canonical units mm. A projection failure on one view is **contained**: that view
 
 The 2D view-geometry JSON shape (what `drawing_get` / `drawing_add_view` return per view) is
 normative in [worker_rpc.md §Drawings](worker_rpc.md). Implemented + machine-checked by
-`engine/doc/drawing.py` + `engine/doc/schema.py::validate_drawing`.
+`core/doc/drawing.cpp` + `core/doc/validate.cpp::validate_drawing`.
 
 ## 9. Configurations (CONFIG — additive)
 
@@ -536,9 +536,9 @@ reports per-feature errors like any normal rebuild — it never crashes.
 **Persistence.** `configurations` + `active_configuration` are part of `document.json` and round-trip
 through `.step+` save/open. Reopening recompiles the active configuration.
 
-Implemented + machine-checked by `engine/doc/schema.py::_validate_configurations`,
-`engine/doc/compiler.py` (`resolve_active_config` / `apply_configuration_to_doc` /
-`_config_effective_features`), and `engine/doc/test_configurations.py`. The `config_*` worker RPCs
+Implemented + machine-checked by `core/doc/validate.cpp::_validate_configurations`,
+`core/doc/document.cpp` (`resolve_active_config` / `apply_configuration_to_doc` /
+`_config_effective_features`). The `config_*` worker RPCs
 that drive configurations live in [worker_rpc.md §Configurations](worker_rpc.md).
 
 ## Appendix A — Canonical `document.json` dump policy (T-H2)
@@ -569,10 +569,10 @@ byte-identical `document.json` so that PDM-lite (T-BL10), correction-trace diffi
 
 - **C++** (`.step+` save path): `core/doc/stepplus.cpp::canonical_doc_json()` — calls
   `round_floats(doc, 6).dump(2)`. `nlohmann::json` uses `std::map` → keys are already sorted.
-- **Python** (utility + ECAD already canonical): `engine/doc/canonical.py::canonical_dump()` —
+- **Python** (utility + ECAD already canonical): `services/plm/canonical.py::canonical_dump()` —
   calls `json.dumps(round_floats_doc(doc), indent=2, sort_keys=True)`.
-- ECAD `.ecad+` save (`engine/ecad/formats.py:107`) already uses `sort_keys=True`; the float
-  rounding rule applies there too via `engine/doc/canonical.py` if ECAD floats ever carry dust.
+- ECAD `.ecad+` save (`services/formats/formats.py:107`) already uses `sort_keys=True`; the float
+  rounding rule applies there too via `services/plm/canonical.py` if ECAD floats ever carry dust.
 
 ### `doc_diff` — semantic document diff
 

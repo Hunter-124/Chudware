@@ -1,6 +1,6 @@
 # Product-task eval benchmark suite (T-H8)
 
-Source of truth: `docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §5 item 6 + §6.
+Source of truth: `docs/review/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §5 item 6 + §6.
 One bench per insertion point that will ship a model. Each bench is:
 
     frozen dataset (content hash / DVC ref)
@@ -55,7 +55,7 @@ insertion point may start. The runner reports the residual explicitly.
 
 ## No new dependencies
 
-Framework is stdlib + the in-repo engine/battery. Frontier baselines call the existing
+Framework is stdlib + the in-repo services/verify/battery. Frontier baselines call the existing
 provider layer (T-F9) when credentials exist; offline they stub. No license ledger row.
 
 ## Gate hook

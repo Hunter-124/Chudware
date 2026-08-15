@@ -32,6 +32,5 @@ Autonomous part design runs in the C++ core (`core/agent/run.cpp`, `agent_run_v2
 
 ## Related tasks/docs
 - work/tasks: T-F* tasks (AI experience workstream; T-F9 ≈ agentic workflow UX); T-A* tasks (DAG orchestrator; agent runs execute in core/agent/run.cpp)
-- docs/PLATFORM_ADR.md (pillar "DAG workflow orchestrator" + pillar 14 "agentic workflow completion")
+- docs/design/PLATFORM_ADR.md (platform architecture)
 - docs/AI_TOOLING_MASTER_PLAN.md (pillars 8–14: MCP integration, copilot modes, offline design)
-- memory/ai-tooling-master-plan.md (quick ref: no subscription-OAuth reuse, MCP-first, Qwen3-4B translator)

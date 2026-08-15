@@ -116,9 +116,11 @@ bool blend_is_watertight(const TopoDS_Shape& shape) {
     }
 }
 
-// A blend build gets 30 s in its isolated child. Nothing legitimate takes that long on a
-// document-sized body; past it the caller treats the subset as unbuildable.
-constexpr std::chrono::seconds kBlendTimeout{30};
+// A blend build gets 5 s in its isolated child. A document-scale blend is milliseconds, so this
+// is already three orders of magnitude of headroom; past it the child is assumed wedged (see
+// process_isolation.cpp on the fork-in-a-multithreaded-process hazard) and the build is retried
+// in-process rather than being reported as a failed feature.
+constexpr std::chrono::seconds kBlendTimeout{5};
 
 // Unique blendable edges of `shape`, optionally filtered to those parallel to `dir`.
 // A raw explorer would visit each shared edge once per incident face (a box -> 24 hits

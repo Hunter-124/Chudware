@@ -172,13 +172,24 @@ void fetchTimeline(AppState& st, const PlmVersionNodeRow& node) {
         if (!plmOk(r, V.timelineError)) return;
         auto rows = r.result.find("checkpoints");
         if (rows == r.result.end() || !rows->is_array()) return;
+        // nlohmann's value() THROWS type_error.302 when the key exists but holds null, and
+        // plm_timeline emits null for authored_by / session_id / msg_idx on records that have
+        // no attribution. That threw inside the rpc callback on a live run:
+        //   [async_rpc] callback for 'plm_timeline' threw: type must be string, but is null
+        // so every row after the first null was silently lost. Read defensively.
+        auto str = [](const nlohmann::json& o, const char* k) -> std::string {
+            auto it = o.find(k);
+            if (it == o.end() || !it->is_string()) return std::string();
+            return it->get<std::string>();
+        };
         for (const auto& row : *rows) {
             if (!row.is_object()) continue;
             VersionsView::TimelineRow t;
-            t.authoredAt = row.value("when", row.value("time", std::string()));
-            t.authoredBy = row.value("authored_by", std::string());
-            t.summary = row.value("label", std::string());
-            const std::string kind = row.value("kind", std::string());
+            t.authoredAt = str(row, "when");
+            if (t.authoredAt.empty()) t.authoredAt = str(row, "time");
+            t.authoredBy = str(row, "authored_by");
+            t.summary = str(row, "label");
+            const std::string kind = str(row, "kind");
             if (!kind.empty()) t.summary = kind + ": " + t.summary;
             V.timeline.push_back(std::move(t));
         }

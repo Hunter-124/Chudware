@@ -30,10 +30,27 @@ bool shape_isolation_enabled() {
     return !v || (v[0] != '0' || v[1] != '\0');
 }
 
+namespace {
+// A process where fork() is unsafe cannot use fork-isolation at all, and must not pay the
+// timeout for every blend it ever builds.
+//
+// fork() in a MULTITHREADED process gives the child a snapshot of every lock, so if another
+// thread held the malloc arena at fork time the child deadlocks on its first allocation - and
+// OCCT allocates immediately. That is not hypothetical: the desktop GUI links libchudware
+// in-process alongside its worker-bridge and RPC threads, and CHUDWARE_SHOT=fea went from a
+// 90 s scenario to a hard hang because each blend burned the full child timeout.
+//
+// So a TIMEOUT is treated as "fork is unusable here", not as "this geometry is bad": the build
+// is retried in-process (identical inputs, identical result) and isolation is disabled for the
+// rest of the process. A SIGNAL still means the geometry killed OCCT and is still contained -
+// which is the case T-BL61 exists for, and it is reported immediately, with no timeout.
+bool g_fork_unusable = false;
+}  // namespace
+
 IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& build,
                                         std::chrono::milliseconds timeout) {
 #if defined(__unix__) || defined(__APPLE__)
-    if (!shape_isolation_enabled()) {
+    if (g_fork_unusable || !shape_isolation_enabled()) {
         TopoDS_Shape s = build();
         return {!s.IsNull(), s};
     }
@@ -90,17 +107,21 @@ IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& bui
             ::waitpid(pid, &status, 0);
             ::close(fd);
             ::unlink(filename.c_str());
-            return {};
+            g_fork_unusable = true;
+            TopoDS_Shape s = build();
+            return {!s.IsNull(), s};
         }
         if (std::chrono::steady_clock::now() >= deadline) {
-            // Timeout. A fork() in a multithreaded process can deadlock in the child on
-            // a malloc lock another thread held at fork time, so this is not necessarily
-            // a hung blend; either way the caller treats it as an unbuildable subset.
+            // The child never finished. Almost certainly a fork-in-a-multithreaded-process
+            // deadlock rather than a slow blend (a document-scale blend is milliseconds, and
+            // the budget is seconds), so stop isolating in THIS process and answer in-process.
             ::kill(pid, SIGKILL);
             ::waitpid(pid, &status, 0);
             ::close(fd);
             ::unlink(filename.c_str());
-            return {};
+            g_fork_unusable = true;
+            TopoDS_Shape s = build();
+            return {!s.IsNull(), s};
         }
         ::usleep(nap);
         if (nap < 10000) nap *= 2;

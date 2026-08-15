@@ -1388,10 +1388,20 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
             }
             ImGui::EndCombo();
         }
+        // Density is stored and sent in g/cm3 (the eval RPC's density_g_cm3), but Volume and
+        // Mass above already honour st.ips() - so an IPS document read "Volume 4.322in^3,
+        // Mass 0.4216lb, Density 2.700 g/cm3", mixing unit systems inside one panel. Edit and
+        // display a converted proxy in IPS; the wire value stays metric.
+        constexpr double kLbPerIn3PerGcm3 = 0.0361272929;
+        const bool ips = st.ips();
         ImGui::SetNextItemWidth(140 * ui::uiScale);
-        if (ImGui::DragFloat("Density (override)", &massDensity_, 0.01f, 0.0f, 25.0f,
-                             "%.3f g/cm3", ImGuiSliderFlags_AlwaysClamp))
+        float shown = ips ? (float)(massDensity_ * kLbPerIn3PerGcm3) : massDensity_;
+        const float shownMax = ips ? (float)(25.0 * kLbPerIn3PerGcm3) : 25.0f;
+        if (ImGui::DragFloat("Density (override)", &shown, ips ? 0.0005f : 0.01f, 0.0f, shownMax,
+                             ips ? "%.4f lb/in3" : "%.3f g/cm3", ImGuiSliderFlags_AlwaysClamp)) {
+            massDensity_ = ips ? (float)(shown / kLbPerIn3PerGcm3) : shown;
             massCustomDensity_ = true;
+        }
         if (ImGui::IsItemDeactivatedAfterEdit())
             runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
         if (massCustomDensity_ && !massDocKey_.empty()) {
@@ -1418,14 +1428,23 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
                         pmFormatVolume(massResult_.value("volume_mm3", 0.0), st.ips()).c_str());
             ImGui::Text("Mass:    %s",
                         pmFormatMass(massResult_.value("mass_g", 0.0), st.ips()).c_str());
-            ImGui::Text("Density: %.3f g/cm3", massDensity_);
+            if (ips)
+                ImGui::Text("Density: %.4f lb/in3", massDensity_ * kLbPerIn3PerGcm3);
+            else
+                ImGui::Text("Density: %.3f g/cm3", massDensity_);
             if (massResult_.contains("com") && massResult_["com"].is_array() &&
                 massResult_["com"].size() == 3) {
                 ImGui::SeparatorText("Center of gravity");
+                // A CG on a symmetry plane comes back as floating-point zero noise, and the panel
+                // printed it verbatim: "X: 4.449e-17in  Y: -1.062e-17in  Z: -6.856e-19in" for a
+                // centred box. Anything under a nanometre is zero at any display precision.
+                auto com = [&](int i) {
+                    double mm = massResult_["com"][i].get<double>();
+                    if (std::abs(mm) < 1e-6) mm = 0.0;
+                    return evalLen(st, mm);
+                };
                 ImGui::Text("X: %s   Y: %s   Z: %s",
-                            evalLen(st, massResult_["com"][0].get<double>()).c_str(),
-                            evalLen(st, massResult_["com"][1].get<double>()).c_str(),
-                            evalLen(st, massResult_["com"][2].get<double>()).c_str());
+                            com(0).c_str(), com(1).c_str(), com(2).c_str());
             }
 
             // ---- Moment of inertia (bending area I + polar J) — clear callout ----

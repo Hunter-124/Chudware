@@ -17,7 +17,10 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <thread>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -430,5 +433,54 @@ TEST_CASE("fillet: isolated OCCT fault is a failed feature and process survives"
     CHECK(allFailed.IsNull());
     TopoDS_Shape allHealthy = geom::fillet_edges(box, 2.0, std::nullopt);
     CHECK_FALSE(allHealthy.IsNull());
+#endif
+}
+
+// T-BL61: does fork-based blend isolation survive a MULTITHREADED process?
+//
+// fork() hands the child a snapshot of every lock, so if another thread held the malloc arena
+// at fork time the child deadlocks on its first allocation - and OCCT allocates immediately.
+// That is not theory: with isolation on, CHUDWARE_SHOT=fea went from a 90 s scenario to a hard
+// hang, because the desktop GUI links libchudware in-process alongside its worker-bridge and
+// RPC threads. Isolation now falls back in-process on a timeout, which is what un-hung it.
+//
+// This case pins the property the DAEMON depends on: with allocator-hammering threads running,
+// an isolated fillet still returns the right body, and it does so fast enough to prove the
+// child was not wedged for its whole budget.
+TEST_CASE("fillet: isolated blend survives allocator pressure from other threads") {
+#if defined(__unix__) || defined(__APPLE__)
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> hammers;
+    for (int i = 0; i < 4; ++i)
+        hammers.emplace_back([&stop] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                // Churn the allocator so a fork is likely to land while the arena lock is held.
+                std::vector<std::string> junk;
+                junk.reserve(64);
+                for (int k = 0; k < 64; ++k) junk.emplace_back(256, 'x');
+            }
+        });
+
+    TopoDS_Shape box = geom::make_box(60.0, 40.0, 10.0);
+    TopTools_IndexedMapOfShape emap;
+    TopExp::MapShapes(box, TopAbs_EDGE, emap);
+    std::vector<TopoDS_Edge> edges;
+    for (int i = 1; i <= emap.Extent(); ++i) edges.push_back(TopoDS::Edge(emap(i)));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    int dropped = -1;
+    TopoDS_Shape rounded = geom::fillet_edges(box, 3.0, edges, &dropped);
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& t : hammers) t.join();
+
+    MESSAGE("threaded isolated fillet: " << ms << " ms, dropped=" << dropped);
+    REQUIRE_FALSE(rounded.IsNull());
+    CHECK(dropped == 0);
+    // The child budget is 5 s per attempt. Anything near it means the fork wedged and we only
+    // survived through the in-process fallback - which is worth failing the build over, because
+    // it is the daemon that loses its crash containment.
+    CHECK(ms < 4000.0);
 #endif
 }

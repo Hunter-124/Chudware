@@ -135,7 +135,14 @@ ui::AdaptiveSurface glyphSurface() {
 // centre and `dotR` its radius; the mark rides just OUTSIDE the disc (the same trick StepTrack
 // uses for a busy step node) so nothing has to be erased and the accent dot still reads.
 void overlayBusyMark(ImVec2 center, float dotR) {
-    ui::kit::statusGlyph(ImGui::GetWindowDrawList(), center, dotR + ui::metrics::stroke(1.5f),
+    // statusGlyph derives its glyph CELL from the radius it is handed (box = r / kGlyphRadiusFrac
+    // = r / 0.30), so passing dotR plus a stroke made a 3 px tone dot claim a ~15 px cell - above
+    // the tesseract's legibility floor, so it painted a 15 px wireframe across the text baseline
+    // that reads as a broken glyph box (visible in front of "Loading sessions..." in the RE
+    // workspace). Size the cell from the mark's real footprint and let statusGlyph fall back to
+    // the comet arc below the floor, which is what that floor exists for.
+    const float cell = dotR * 2.0f + ui::metrics::stroke(1.0f) * 2.0f;
+    ui::kit::statusGlyph(ImGui::GetWindowDrawList(), center, cell * 0.30f,
                          ui::kit::Status::Running, glyphSurface());
 }
 

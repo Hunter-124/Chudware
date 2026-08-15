@@ -5060,7 +5060,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 s_triadLeft += (targetLeft - s_triadLeft) * k;
                 if (std::fabs(targetLeft - s_triadLeft) < 0.5f) s_triadLeft = targetLeft;
             }
-            const float hudLeft = s_triadLeft;
+            // The ease is a nicety on the way BACK; on the way out it is a bug. While the smoothing
+            // runs (~200 ms) the triad sits inside the manager column it is supposed to dodge, which
+            // is exactly what a CHUDWARE_SHOT=fea capture caught: the Z/Y axis chips drawn on top of
+            // the Simulation Manager's "Deformation scale" row. Never render left of the current
+            // target: dodge right immediately, slide left only as the column shrinks.
+            const float hudLeft = std::max(s_triadLeft, targetLeft);
             float cx = hudLeft + 52.0f * ts, cy = cr1.y - 52.0f * ts;
             float L = 30.0f * ts;
             float yawR = st.yaw * 3.14159265f / 180.0f, pitR = st.pitch * 3.14159265f / 180.0f;

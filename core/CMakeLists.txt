@@ -1191,8 +1191,10 @@ if(CHUDWARE_WITH_OCCT)
   endif()
 
   # --- Polyhedral-FEA (`polymesh`) second mesher backend — BSD-3, static ------
-  # A graded Cartesian tet fill that succeeds on STEP topology Netgen's advancing
-  # front rejects, and an independent second opinion on any stress result. It plugs in
+  # A graded Cartesian tet fill: an INDEPENDENT second discretization for checking whether
+  # a stress result is a property of the part or of the mesh, and the only backend that
+  # accepts a size field, so adaptive refinement (sim/fea_adaptive.cpp) requires it. It is
+  # not a robustness fallback — measured, it meshes no part that Netgen refuses. It plugs in
   # behind the SAME chudware::sim::MeshOut contract (sim/polymesh_backend.cpp), so no
   # solver, overlay, RPC or viewport path knows which mesher ran.
   #

@@ -28,9 +28,12 @@ triggers:
 3. Run a cheap discretization, then a finer one with identical setup. Report both
    discretizations and require the governing value to settle (normally <10% change)
    or remain consistent with the independent anchor. One favorable mesh is not PASS.
-   Netgen is the default mesher. Use `mesher_backend="polymesh"` when Netgen fails
-   to mesh, or as a second-opinion cross-check for mesher-sensitive stress; polymesh
-   has no curvature refinement, structured hex elements, or quad-dominated surfaces.
+   Netgen is the default mesher. `mesher_backend="polymesh"` is an INDEPENDENT second
+   discretization — the right tool for the cross-check this step already demands, since
+   a different mesher is stronger evidence than a different fineness. It is not a
+   robustness fallback (it fails on its own set of awkward topology, and is not more
+   likely to mesh a part Netgen refused), and it has no curvature refinement, structured
+   hex elements, or quad-dominated surfaces.
    When a peak stress drives the decision or a coarse result looks mesher-sensitive,
    use `run_fea_adaptive`; it costs several solves. Its error indicator is dimensionless
    and relative (smaller is better), not a percentage.

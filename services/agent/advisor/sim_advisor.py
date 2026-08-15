@@ -1456,9 +1456,12 @@ def postcheck(
         and (mesh_stable or anchor_consistent)
     )
 
-    # Postcheck is the existing post-failure advisory seam. Recommend the robust fallback
-    # only when Netgen failed during meshing; a successful mesh or a solve-stage failure
-    # must not turn into an accuracy claim for another mesher.
+    # Postcheck is the existing post-failure advisory seam. The other backend is offered as
+    # a SECOND ATTEMPT WITH DIFFERENT FAILURE MODES, not as a robustness upgrade: a
+    # measured comparison over five awkward solids found no case where polymesh meshed a
+    # part Netgen refused, and one where polymesh's own watertightness guard rejected a
+    # part Netgen meshed. Promising robustness here would spend a tool call on a promise
+    # the data does not support, so the finding says exactly what is known.
     requested_mesher = str(
         study.get("mesher_backend") or results.get("mesher_backend") or "netgen"
     ).strip().lower()
@@ -1477,10 +1480,12 @@ def postcheck(
             "check": "sim_mesh",
             "severity": "action",
             "finding": (
-                "Netgen failed during the mesh stage. Retry with "
-                'mesher_backend="polymesh": its graded Cartesian fill often succeeds '
-                "on topology an advancing-front mesh rejects; this is a robustness "
-                "fallback, not an accuracy upgrade."
+                "Netgen failed during the mesh stage. The geometry is the first suspect: "
+                "check for non-manifold contact, zero-thickness walls or a body that is "
+                'not a closed solid. One retry with mesher_backend="polymesh" is '
+                "reasonable because its Cartesian fill fails on a different set of "
+                "topology, but it is not a robustness upgrade and it is not more likely "
+                "than not to succeed here."
             ),
             "refs": {},
             "numbers": {},
@@ -1488,7 +1493,9 @@ def postcheck(
                 "action": "retry_with_polymesh",
                 "params": {"mesher_backend": "polymesh"},
                 "basis": "The Netgen mesh stage failed before a solved result existed.",
-                "predicted_effect": "A robust second meshing attempt on difficult topology.",
+                "predicted_effect": (
+                    "A second meshing attempt with different failure modes; it may fail too."
+                ),
                 "confidence": "heuristic",
             }],
             "helper_tools": ["run_fea_static", "run_fea_modal", "run_fea_fatigue",

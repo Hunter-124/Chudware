@@ -103,9 +103,11 @@ struct MeshOptions {
     // Which mesh generator produces the volume mesh. Netgen (nglib, LGPL) is the
     // default and the only backend that supports curvature-adaptive sizing and
     // structured hex. Polymesh (Polyhedral-FEA, BSD-3) is a second, independent
-    // generator: a Cartesian grid fill with a graded boundary skin, useful both as a
-    // fallback when Netgen rejects a STEP and as a cross-check that a result is not
-    // an artifact of one mesher. Both emit the same tet4 / tet10 contract.
+    // generator: a graded Cartesian fill. It is NOT a robustness fallback (measured: no
+    // case where it meshed a part Netgen refused), it is an INDEPENDENT second
+    // discretization for checking whether a result depends on the mesh, and the only
+    // backend that accepts a size field, so adaptive refinement requires it.
+    // Both emit the same tet4 / tet10 contract.
     MesherBackend backend = MesherBackend::Netgen;
 
     // Structured hexahedral meshing: when true, mesh_step delegates to mesh_box_hex,

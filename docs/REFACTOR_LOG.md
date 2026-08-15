@@ -7706,3 +7706,30 @@ guarded only by the cross-backend solve test. Polymesh emits tet4/tet10 only; it
 element families cannot fit `MeshOut`'s fixed-stride connectivity. Verification: core ctest
 101/101; cantilever analytic tip deflection 0.2000 mm, Netgen 0.19270 mm, polymesh
 0.19068 mm.
+
+Then the adaptive solver, which is the reason the backend was worth having.
+`sim/fea_adaptive.{h,cpp}` + the `sim_run_adaptive` RPC mesh, solve, score per-element
+Zienkiewicz-Zhu error, refine and repeat to an error target, reusing `fea_run_static`
+verbatim each pass by handing it an inline mesh — so BC resolution, bonded ties,
+cancellation and the result payload cannot drift from an ordinary study. Surfaced as the
+Simulation panel's adaptive controls plus convergence readout, and the `run_fea_adaptive`
+MCP tool (registered in `advisor/triggers.{yaml,py}`, `sim_engineer.yaml`, the simulate
+skill, `advisor/stages.py`, and BOTH `agent_turn.py` fabricated-success sets — miss those
+and a model that ran only an adaptive study is told it ran none). Measured on a
+120x60x8 plate with a 16 mm hole: eta 0.157 → 0.100 over three passes, 41.5k → 187.5k
+elements, peak 170.0 MPa against a 56.8 MPa net-section nominal, i.e. SCF 2.99 vs the
+classical Kirsch 3.
+
+Two traps for whoever touches this next. First, `polymesh`'s graded-tet fill is a
+three-level lattice (h, h/2, h/4): a size field alone only decides WHERE the fine cells
+go, and on a part that is mostly boundary skin the fill is already saturated, so the
+field changes nothing — measured, an identical 41,515 elements whether it asked for
+4.87 mm or 1.96 mm. The background size is therefore the lever that guarantees progress;
+the error field rides along as a bias. Second, and more embarrassing: this integration
+first shipped the claim that polymesh "succeeds on geometry Netgen rejects" — in a GUI
+tooltip, the sim role card, the simulate skill and an advisor finding — on no evidence.
+Measuring five awkward solids found no case where polymesh meshed a part Netgen refused,
+and one where the reverse held (two boxes fused along a single edge: Netgen meshes it,
+polymesh's own watertightness guard refuses). Every one of those texts now describes
+polymesh as an INDEPENDENT second discretization, which is what the measurement supports,
+and `test_polymesh_backend.cpp` pins the edge-touch case so the claim cannot drift back.

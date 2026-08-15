@@ -6287,7 +6287,7 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
       ImGui::Spacing();
       ImGui::TextUnformatted("Mesher backend");
       static const char *kBackend[2] = {"Netgen (default)",
-                                        "Polymesh (robust fill)"};
+                                        "Polymesh (second opinion)"};
       int backendIndex = s.meshBackend == "polymesh" ? 1 : 0;
       ImGui::SetNextItemWidth(-FLT_MIN);
       if (ImGui::BeginCombo("##mesherbackend", kBackend[backendIndex])) {
@@ -6300,10 +6300,11 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
         ImGui::EndCombo();
       }
       simTip("Netgen is the default and the only backend with curvature "
-             "refinement, structured hex and quad surfaces. Polymesh is a "
-             "graded Cartesian tet fill (BSD-licensed) that succeeds on "
-             "geometry Netgen rejects and serves as an independent second "
-             "opinion, at the cost of a stair-cased boundary.");
+             "refinement, structured hex and quad surfaces. Polymesh is an "
+             "independent graded Cartesian tet fill: use it to check whether a "
+             "stress result depends on the mesh rather than the part, and note "
+             "that adaptive refinement always uses it. It is not a fallback for "
+             "geometry Netgen refuses, and it stair-cases the boundary.");
       ImGui::Unindent();
     }
     ImGui::Spacing();

@@ -1,14 +1,18 @@
 // Polymesh mesher backend — Polyhedral-FEA (github.com/Hunter-124/Polyhedral-FEA) driving
 // chudware::sim::MeshOut.
 //
-// WHY a second mesher. Netgen is an advancing-front/Delaunay mesher on the exact BRep: it
-// produces the better-shaped elements and it is the default. It also REFUSES some real
-// STEP files outright (self-intersecting seams, sliver faces surviving the healing pass),
-// and when it does, the FEA surface has nothing to fall back to except an STL
-// re-tessellation of the same broken topology. Polymesh fills the bounding volume on a
-// graded Cartesian lattice and only projects the boundary, so it is robust exactly where
-// a front-marching mesher is fragile. Two independent meshers also mean a stress result
-// can be checked for mesher dependence without leaving the app.
+// WHY a second mesher. Netgen is an advancing-front/Delaunay mesher on the exact BRep. It
+// produces the better-shaped elements, it is the default, and it stays the default.
+// Polymesh fills the bounding volume on a graded Cartesian lattice and projects the
+// boundary. Its value here is NOT robustness — that was measured and is not supported:
+// across five awkward solids (edge-touching fuse, disjoint compound, sliver wall, tangent
+// sphere, plain block) there was no case where polymesh succeeded and Netgen failed, and
+// one where the reverse held (a pair of boxes fused along a single edge, where polymesh's
+// own watertightness guard rejects the fill). Its value is that it is INDEPENDENT: a
+// second discretization of the same part, which is how you find out whether a stress
+// number is a property of the part or of the mesh, and — because it accepts a spatial
+// size field, which the Netgen route does not expose — it is what makes the adaptive
+// solver in sim/fea_adaptive.h possible at all.
 //
 // The seam is deliberately narrow: this file converts geometry -> MeshOut and nothing
 // else. Everything downstream (fea_static/modal/thermal, overlay skinning, the RPC

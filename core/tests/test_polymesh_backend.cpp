@@ -24,6 +24,7 @@
 
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
+#include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Dir.hxx>
@@ -243,5 +244,46 @@ TEST_CASE("adaptive refinement drives the error down and finds the stress concen
                                      std::string::npos)
                 warned = true;
         CHECK(warned);
+    }
+}
+
+TEST_CASE("the two backends' failure sets are measured, not assumed") {
+    if (!mesher_backend_available(MesherBackend::Polymesh)) return;
+    // The reason this exists: the integration originally shipped a claim that polymesh
+    // "succeeds on geometry Netgen rejects", in a tooltip, a role card and an advisor
+    // finding. Measuring it showed the opposite — on a pair of boxes fused along one edge,
+    // Netgen meshes and polymesh's own watertightness guard refuses. All that text now
+    // says polymesh is an independent second discretization, which is what it is. This
+    // test pins the measurement so the claim cannot quietly drift back.
+    TopoDS_Shape a = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 20, 20, 20).Shape();
+    TopoDS_Shape b = BRepPrimAPI_MakeBox(gp_Pnt(20, 20, 0), 20, 20, 20).Shape();
+    TopoDS_Shape fused = BRepAlgoAPI_Fuse(a, b).Shape();
+    auto path = std::filesystem::temp_directory_path() / "chudware_edge_touch.step";
+    STEPControl_Writer wr;
+    REQUIRE(wr.Transfer(fused, STEPControl_AsIs) == IFSelect_RetDone);
+    REQUIRE(wr.Write(path.string().c_str()) == IFSelect_RetDone);
+
+    MeshOptions o;
+    o.fineness = 0.4;
+    o.order = 1;
+    o.backend = MesherBackend::Netgen;
+    const MeshOut ng = mesh_step(path.string(), o);
+    o.backend = MesherBackend::Polymesh;
+    const MeshOut pm = mesh_step(path.string(), o);
+    MESSAGE("edge-touching fuse: netgen ok=" << ng.ok << " polymesh ok=" << pm.ok
+                                             << " polymesh error=" << pm.error);
+
+    // Whatever each backend does here, a FAILURE must be a clean, explained refusal —
+    // never a silently empty or malformed mesh handed to a solver.
+    for (const MeshOut* m : {&ng, &pm}) {
+        if (m->ok) {
+            CHECK(m->n_elems > 0);
+            CHECK(m->tets.size() ==
+                  static_cast<size_t>(m->n_elems) * static_cast<size_t>(m->nodes_per_elem));
+        } else {
+            CHECK_FALSE(m->error.empty());
+            CHECK(m->n_elems == 0);
+            CHECK(m->tets.empty());
+        }
     }
 }

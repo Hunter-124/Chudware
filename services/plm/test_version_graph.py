@@ -9,6 +9,7 @@ import pytest
 from services.plm import branches
 from services.plm.vault import Vault, VaultError
 from services.plm.worker_rpc import WORKER_METHODS
+from services.plm import history
 
 
 def _write_part(root, wall: float) -> None:
@@ -78,3 +79,22 @@ def test_real_dag_versions_release_and_rpc(tmp_path):
         "commit", "parents", "kind", "scope", "authored_at", "author", "ai",
         "message", "summary", "thumbnail_ref", "refs", "release", "pin",
     }
+
+
+def test_a_pre_rebrand_vault_still_reports_kind_scope_and_a_clean_message():
+    """The rename to chudware-plm-* renamed the readers, blinding legacy vaults."""
+    legacy = ("Release rev A\n\n"
+              "aicad-plm-kind: release\n"
+              "aicad-plm-scope: planning\n"
+              "aicad-plm-pin: 1\n")
+    assert history.kind_from_commit_message(legacy) == "release"
+    assert history.scope_from_commit_message(legacy) == "planning"
+    assert history.pin_from_commit_message(legacy) is True
+    assert history.user_message_from_commit(legacy) == "Release rev A"
+
+    current = ("Checkpoint\n\n"
+               "chudware-plm-kind: checkpoint\n"
+               "chudware-plm-scope: design\n")
+    assert history.kind_from_commit_message(current) == "checkpoint"
+    assert history.scope_from_commit_message(current) == "design"
+    assert history.user_message_from_commit(current) == "Checkpoint"

@@ -80,40 +80,50 @@ def make_ai_block(
     }
 
 
-def kind_from_commit_message(message: str) -> str:
-    """Extract the entry kind from a commit message trailer (default 'auto')."""
+# A pre-rebrand vault wrote `aicad-plm-*` trailers. The rename to `chudware-plm-*`
+# renamed the READERS too, so every legacy commit silently lost its kind and scope
+# (a release rendered as `auto`) and leaked the raw trailer lines into the
+# user-facing message on every timeline. Readers accept both spellings; writers
+# emit only the current one.
+_LEGACY_PREFIX = "aicad-plm-"
+_CURRENT_PREFIX = "chudware-plm-"
+
+
+def _trailer_value(message: str, trailer: str) -> str | None:
+    """Return the value of `trailer` (current or legacy spelling), else None."""
+    legacy = trailer.replace(_CURRENT_PREFIX, _LEGACY_PREFIX)
     for line in message.splitlines():
         line = line.strip()
-        if line.startswith(_KIND_TRAILER):
-            k = line[len(_KIND_TRAILER):].strip()
-            if k in ENTRY_KINDS:
-                return k
-    return KIND_AUTO
+        for prefix in (trailer, legacy):
+            if line.startswith(prefix):
+                return line[len(prefix):].strip()
+    return None
+
+
+def _is_trailer_line(line: str) -> bool:
+    s = line.strip()
+    return any(s.startswith(p) or s.startswith(p.replace(_CURRENT_PREFIX, _LEGACY_PREFIX))
+               for p in (_KIND_TRAILER, _SCOPE_TRAILER, PIN_TRAILER))
+
+
+def kind_from_commit_message(message: str) -> str:
+    """Extract the entry kind from a commit message trailer (default 'auto')."""
+    k = _trailer_value(message, _KIND_TRAILER)
+    return k if k in ENTRY_KINDS else KIND_AUTO
 
 
 def scope_from_commit_message(message: str) -> str:
     """Extract the entry scope from a commit trailer (default 'design')."""
-    for line in message.splitlines():
-        line = line.strip()
-        if line.startswith(_SCOPE_TRAILER):
-            s = line[len(_SCOPE_TRAILER):].strip()
-            if s in SCOPES:
-                return s
-    return SCOPE_DESIGN
+    s = _trailer_value(message, _SCOPE_TRAILER)
+    return s if s in SCOPES else SCOPE_DESIGN
+
 
 def pin_from_commit_message(message: str) -> bool:
     """Return whether the commit is a release manifest back-fill pin."""
-    for line in message.splitlines():
-        line = line.strip()
-        if line.startswith(PIN_TRAILER):
-            return line[len(PIN_TRAILER):].strip() == "1"
-    return False
+    return _trailer_value(message, PIN_TRAILER) == "1"
 
 
 def user_message_from_commit(message: str) -> str:
     """Return the user-facing message (commit body with the trailers stripped)."""
-    lines = [ln for ln in message.splitlines()
-             if not ln.strip().startswith(_KIND_TRAILER)
-             and not ln.strip().startswith(_SCOPE_TRAILER)
-             and not ln.strip().startswith(PIN_TRAILER)]
-    return "\n".join(lines).strip()
+    return "\n".join(ln for ln in message.splitlines()
+                     if not _is_trailer_line(ln)).strip()

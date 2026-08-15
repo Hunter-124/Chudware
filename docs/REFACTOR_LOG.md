@@ -7675,6 +7675,15 @@ containment is measured rather than assumed, and fails the build if it drifts to
 Verification: all 25 scenarios exit 0 with zero `unknown icon` lines at 1280x800;
 `scripts/gui_lint.py` clean; `python3 scripts/check.py` **all 9 gates PASS** — it had been red
 before this session on a committed `.kimi-code/skills` symlink that a Windows checkout turns
-into a text file, now untracked. Deferred: the "New study" popup covers the manager panel it was
-opened from; ECAD zoom-to-fit does not frame the whole board inside the visible canvas; the AI
-workspace's trace hint line collides with its last card.
+into a text file, now untracked.
+
+All three items first listed as deferred were then fixed in the same session. The "New study"
+picker opened on top of the panel it was launched from (ImGui parks a popup at the cursor) and
+now flies out beside the manager column — which also proved the earlier "clipped prose" reading
+of that panel was occlusion, not clipping. ECAD zoom-to-fit measured the FULL canvas region
+while the pinned Copilot column floats over its right side, so the board's right Edge.Cuts edge
+sat under the column; fit now measures the visible strip and offsets the pan to centre the board
+in what you can actually see. And the agent DAG's "drag to pan" hint was painted onto the canvas
+with no backing, overprinting whatever node card sat in the corner; it gets a washed plate.
+Re-verified after all three: 25/25 scenarios exit 0 with zero icon misses, gui_lint clean,
+check.py 9/9, test_ops 3702 assertions green.

@@ -6,7 +6,10 @@
 // All calls pass {"path": st.plmProjectPath()} — the vault worker is path-addressed.
 #include "plm_hub.h"
 
+#include <algorithm>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "core/app_state.h"
 #include "core/async_rpc.h"
@@ -59,6 +62,89 @@ PlmEntryRow parseEntry(const nlohmann::json& e) {
     r.message    = getStr(e, "message");
     r.summary    = getStr(e, "summary");
     return r;
+}
+
+PlmVersionNodeRow parseVersionNode(const nlohmann::json& e) {
+    PlmVersionNodeRow r;
+    r.commit       = getStr(e, "commit");
+    r.kind         = getStr(e, "kind");
+    r.scope        = getStr(e, "scope");
+    r.authoredAt   = getStr(e, "authored_at");
+    r.message      = getStr(e, "message");
+    r.summary      = getStr(e, "summary");
+    r.thumbnailRef = getStr(e, "thumbnail_ref");
+    r.pin           = e.value("pin", false);
+    if (auto p = e.find("parents"); p != e.end() && p->is_array())
+        for (const auto& parent : *p)
+            if (parent.is_string()) r.parents.push_back(parent.get<std::string>());
+    if (auto a = e.find("author"); a != e.end() && a->is_object()) {
+        r.author.kind = getStr(*a, "kind");
+        r.author.id = getStr(*a, "id");
+        r.author.display = getStr(*a, "display");
+    }
+    if (auto a = e.find("ai"); a != e.end() && a->is_object()) {
+        r.ai.provider = getStr(*a, "provider");
+        r.ai.model = getStr(*a, "model");
+        r.ai.runId = getStr(*a, "run_id");
+    }
+    if (auto refs = e.find("refs"); refs != e.end() && refs->is_array())
+        for (const auto& ref : *refs) {
+            if (!ref.is_object()) continue;
+            r.refs.push_back({getStr(ref, "type"), getStr(ref, "name")});
+        }
+    if (auto release = e.find("release"); release != e.end() && release->is_object()) {
+        r.hasRelease = true;
+        r.release.itemId = getStr(*release, "item_id");
+        r.release.rev = getStr(*release, "rev");
+    }
+    return r;
+}
+
+// A release is two commits: the release itself, then a manifest back-fill that pins the rev
+// to its commit (contract plm.md Appendix C.4). Showing both puts the same release on the
+// graph twice, so the pin is folded into its parent: the pin's decorations (the branch and
+// HEAD chips, since the pin is usually the tip) move onto the release node, and anything
+// that pointed at the pin is re-parented to what the pin pointed at.
+void collapseReleasePins(std::vector<PlmVersionNodeRow>& nodes) {
+    std::unordered_map<std::string, std::vector<std::string>> pinParents;
+    for (const auto& n : nodes)
+        if (n.pin && !n.parents.empty()) pinParents[n.commit] = n.parents;
+    for (auto& n : nodes) {
+        if (n.pin) continue;
+        std::vector<std::string> rewritten;
+        for (const auto& parent : n.parents) {
+            auto it = pinParents.find(parent);
+            if (it == pinParents.end()) { rewritten.push_back(parent); continue; }
+            for (const auto& grand : it->second)
+                if (std::find(rewritten.begin(), rewritten.end(), grand) == rewritten.end())
+                    rewritten.push_back(grand);
+        }
+        n.parents = std::move(rewritten);
+    }
+    // Carry each pin's refs onto the release commit it pinned before dropping it.
+    for (const auto& n : nodes) {
+        if (!n.pin || n.refs.empty()) continue;
+        for (auto& target : nodes) {
+            if (target.pin || n.parents.empty() || target.commit != n.parents.front()) continue;
+            for (const auto& ref : n.refs) target.refs.push_back(ref);
+        }
+    }
+    nodes.erase(std::remove_if(nodes.begin(), nodes.end(),
+                               [](const PlmVersionNodeRow& n) { return n.pin; }),
+                nodes.end());
+}
+
+bool versionRpcAbsent(const core::RpcResult& r) {
+    if (!r.ok)
+        return r.err.find("unknown") != std::string::npos ||
+               r.err.find("not found") != std::string::npos ||
+               r.err.find("method") != std::string::npos;
+    if (!r.result.is_object()) return false;
+    const std::string code = r.result.value("code", std::string());
+    const std::string reason = r.result.value("reason", std::string());
+    return code == "unknown_method" || code == "method_not_found" ||
+           code == "not_implemented" || reason == "unknown_method" ||
+           reason == "method_not_found" || reason == "not_implemented";
 }
 
 PlmTaskRow parseTask(const nlohmann::json& t) {
@@ -232,6 +318,65 @@ void plmEnsureHistory(AppState& st) {
         H.history.clear();
         if (auto e = r.result.find("entries"); e != r.result.end() && e->is_array())
             for (const auto& en : *e) H.history.push_back(parseEntry(en));
+    });
+}
+
+void plmEnsureVersionGraph(AppState& st) {
+    auto& V = g_plmHub.versionsGraph;
+    if (!V.available || V.loading || V.gen == g_plmHub.generation) return;
+    V.loading = true;
+    const int gen = g_plmHub.generation;
+    nlohmann::json p = pathParam(st);
+    p["limit"] = 400;
+    p["scope"] = (V.scope == 0) ? "design" : (V.scope == 1) ? "planning" : "all";
+    st.rpc.call("plm_version_graph", p, [gen](const core::RpcResult& r) {
+        auto& V = g_plmHub.versionsGraph;
+        V.loading = false;
+        V.gen = gen;
+        if (versionRpcAbsent(r)) {
+            V.available = false;
+            V.err = "Versions are not supported by this service.";
+            return;
+        }
+        if (!plmOk(r, V.err)) return;
+        V.err.clear();
+        V.head = getStr(r.result, "head");
+        V.activeBranch = getStr(r.result, "active_branch");
+        V.truncated = r.result.value("truncated", false);
+        V.nodes.clear();
+        V.branches.clear();
+        V.versions.clear();
+        if (auto nodes = r.result.find("nodes"); nodes != r.result.end() && nodes->is_array())
+            for (const auto& node : *nodes) V.nodes.push_back(parseVersionNode(node));
+        collapseReleasePins(V.nodes);
+        if (auto branches = r.result.find("branches");
+            branches != r.result.end() && branches->is_array())
+            for (const auto& b : *branches) {
+                if (!b.is_object()) continue;
+                PlmVersionBranchRow row;
+                row.name = getStr(b, "name");
+                row.head = getStr(b, "head");
+                row.current = b.value("current", false);
+                row.createdAt = getStr(b, "created_at");
+                row.from = getStr(b, "from");
+                row.ahead = b.value("ahead", 0);
+                row.behind = b.value("behind", 0);
+                row.mergeBase = getStr(b, "merge_base");
+                V.branches.push_back(std::move(row));
+            }
+        if (auto versions = r.result.find("versions");
+            versions != r.result.end() && versions->is_array())
+            for (const auto& v : *versions) {
+                if (!v.is_object()) continue;
+                PlmNamedVersionRow row;
+                row.name = getStr(v, "name");
+                row.commit = getStr(v, "commit");
+                row.createdAt = getStr(v, "created_at");
+                row.author = getStr(v, "author");
+                row.message = getStr(v, "message");
+                V.versions.push_back(std::move(row));
+            }
+        if (V.selected.empty() && !V.nodes.empty()) V.selected = V.nodes.front().commit;
     });
 }
 

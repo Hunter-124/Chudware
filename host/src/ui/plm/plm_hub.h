@@ -22,7 +22,7 @@ bool        plmOk(const core::RpcResult& r, std::string& hint);
 std::string plmReason(const core::RpcResult& r);   // the machine reason code ("" if none/ok)
 
 enum class PlmPage {
-    Overview, Files, History, Compare, Releases, Planning, Issues, Team, Git, Graph, Settings
+    Overview, Files, Versions, Compare, Releases, Planning, Issues, Team, Git, Graph, Settings
 };
 
 // ---- cached row shapes (parsed from the plm_* envelopes) ----------------------
@@ -83,6 +83,56 @@ struct PlmOverview {
     std::string nextMilestone;            // title of the next open milestone ("" = none)
 };
 
+struct PlmVersionRefRow {
+    std::string type, name;
+};
+
+struct PlmVersionAuthorRow {
+    std::string kind, id, display;
+};
+
+struct PlmVersionAiRow {
+    std::string provider, model, runId;
+};
+
+struct PlmVersionReleaseRow {
+    std::string itemId, rev;
+};
+
+struct PlmVersionNodeRow {
+    std::string commit, kind, scope, authoredAt, message, summary, thumbnailRef;
+    std::vector<std::string> parents;
+    PlmVersionAuthorRow author;
+    PlmVersionAiRow ai;
+    std::vector<PlmVersionRefRow> refs;
+    PlmVersionReleaseRow release;
+    bool hasRelease = false;
+    bool pin = false;
+};
+
+struct PlmVersionBranchRow {
+    std::string name, head, createdAt, from, mergeBase;
+    bool current = false;
+    int ahead = 0, behind = 0;
+};
+
+struct PlmNamedVersionRow {
+    std::string name, commit, createdAt, author, message;
+};
+
+// versions (full commit DAG)
+struct PlmVersionsState {
+    int gen = -1;
+    bool loading = false;
+    bool available = true;
+    bool truncated = false;
+    std::string err, head, activeBranch, selected, compareSecond;
+    int scope = 2;  // 0 design | 1 planning | 2 all
+    char search[192] = {};
+    std::vector<PlmVersionNodeRow> nodes;
+    std::vector<PlmVersionBranchRow> branches;
+    std::vector<PlmNamedVersionRow> versions;
+};
 // ---- the hub state ------------------------------------------------------------
 
 struct PlmHubState {
@@ -107,6 +157,7 @@ struct PlmHubState {
     std::vector<PlmEntryRow> history;
     std::string selectedEntry;
 
+
     // planning (Planning/Issues pages)
     int         planGen = -1; bool planLoading = false; std::string planErr;
     std::vector<PlmTaskRow>      allTasks;
@@ -119,6 +170,8 @@ struct PlmHubState {
     bool        autoCommit = true;        // record saves to history automatically
     // Fired once per projectDir when the hub first loads it (setActiveProjectDir
     // also fires plm_record_outside; this covers "open PLM tab on already-set dir").
+
+    PlmVersionsState versionsGraph;
     std::string outsideRecordedFor;
 
     // git (Git page) — real git / GitHub client
@@ -197,6 +250,7 @@ std::string plmProjectName(AppState& st);    // display name of the current proj
 void        plmEnsureOverview(AppState& st);
 void        plmEnsureItems(AppState& st);
 void        plmEnsureHistory(AppState& st);
+void        plmEnsureVersionGraph(AppState& st);
 void        plmEnsurePlanning(AppState& st);
 void        plmEnsureSettings(AppState& st);
 void        plmEnsureGit(AppState& st);
@@ -213,5 +267,6 @@ void plmDrawIssuesPage(AppState& st);
 void plmDrawTeamPage(AppState& st);
 void plmDrawGitPage(AppState& st);
 void plmDrawSettingsPage(AppState& st);
+void plmDrawVersionsPage(AppState& st);
 
 }  // namespace ui

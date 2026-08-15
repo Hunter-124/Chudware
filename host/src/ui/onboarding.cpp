@@ -486,7 +486,14 @@ void drawOnboarding(AppState& st, bool appBusy) {
     if (!s_wizard.gateRead) {
         s_wizard.gateRead = true;
         s_wizard.completedVersion = readCompletedVersion();
-        if (s_wizard.completedVersion < kOnboardingVersion) s_wizard.requestOpen = true;
+        // A headless capture must show the surface under test. The wizard opens whenever the
+        // config's completed version is stale, which covered two thirds of every PLM/graph
+        // shot with a sign-in step nobody was verifying. Scenarios that DO want it call
+        // forceOnboardingForScenario, which sets requestOpen directly and is unaffected.
+        const char* shot = std::getenv("CHUDWARE_SHOT");
+        const bool headlessShot = shot && *shot;
+        if (s_wizard.completedVersion < kOnboardingVersion && !headlessShot)
+            s_wizard.requestOpen = true;
     }
     if (s_wizard.requestOpen) {
         ImGui::OpenPopup("Welcome to Chudware");

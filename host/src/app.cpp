@@ -3194,6 +3194,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       ui::plmSelectGraphPage();
     else if (pg && std::strcmp(pg, "compare") == 0)
       ui::plmSelectComparePage();
+    else if (pg && std::strcmp(pg, "versions") == 0)
+      ui::plmSelectVersionsPage();
     else
       ui::plmSelectGitPage();
     // CHUDWARE_PLM_PROJECT points the capture at a specific project folder.

@@ -14,6 +14,7 @@
 #include "plm_hub.h"
 #include "graph_tab.h"
 #include "plm_compare.h"
+#include "versions_tab.h"
 
 #include <algorithm>
 #include <cstring>
@@ -157,8 +158,7 @@ struct RailItem { PlmPage page; const char* label; const char* icon; };
 static const RailItem kRail[] = {
     {PlmPage::Overview, "Overview", "app"},
     {PlmPage::Files,    "Files",    "body_folder"},
-    // Compare is a history operation (diff two revisions); History itself is
-    // folded into the Files page, so Compare sits directly after it.
+    {PlmPage::Versions, "Versions", "history"},
     {PlmPage::Compare,  "Compare",  "split"},
     {PlmPage::Planning, "Planning", "plan_board"},
     {PlmPage::Graph,    "Graph",    "mesh"},
@@ -262,6 +262,7 @@ static void drawTopNav(AppState& st) {
     for (int i = 0; i < (int)(sizeof(kRail) / sizeof(kRail[0])); ++i) {
         // Degrade: hide Graph when the worker lacks cad_graph_* RPCs.
         if (kRail[i].page == PlmPage::Graph && !plmGraphAvailable()) continue;
+        if (kRail[i].page == PlmPage::Versions && !plmVersionsAvailable()) continue;
         if (i) ImGui::SameLine(0, gap);
         int badge = 0;
         if (kRail[i].page == PlmPage::Files)    badge = g_plmHub.overview.dirtyCount;
@@ -296,19 +297,21 @@ void plmSelectPlanningPage() { g_plmHub.page = PlmPage::Planning; }
 void plmSelectOverviewPage() { g_plmHub.page = PlmPage::Overview; }
 void plmSelectFilesPage() { g_plmHub.page = PlmPage::Files; }
 void plmSelectGraphPage() { g_plmHub.page = PlmPage::Graph; }
+void plmSelectVersionsPage() { g_plmHub.page = PlmPage::Versions; }
 void plmSelectComparePage() { g_plmHub.page = PlmPage::Compare; }
 
 // Whatever page is showing, is it still waiting on data? Only the fetches that
 // gate visible content count — this is the headless capture's "settled" signal.
 bool plmBusy() {
     const PlmHubState& H = g_plmHub;
-    if (H.itemsLoading || H.histLoading) return true;
+    if (H.itemsLoading || H.histLoading || H.versionsGraph.loading) return true;
     switch (H.page) {
         case PlmPage::Overview: return H.ovLoading;
         case PlmPage::Planning:
         case PlmPage::Issues:   return H.planLoading;
         case PlmPage::Git:      return H.gitLoading;
         case PlmPage::Compare:  return plmCompareBusy();
+        case PlmPage::Versions: return H.versionsGraph.loading;
         default:                return false;
     }
 }
@@ -328,11 +331,13 @@ void drawPlmWorkspace(AppState& st) {
         g_plmHub.projectDir = proj;
         plmInvalidate();
         plmGraphOnProjectChanged();
+        plmVersionsOnProjectChanged();
     }
     if (proj.empty()) { drawOnboarding(st); return; }
 
-    // If Graph was selected but the RPC is gone, fall back to Overview.
-    if (g_plmHub.page == PlmPage::Graph && !plmGraphAvailable())
+    // If an optional RPC is gone, fall back to Overview.
+    if ((g_plmHub.page == PlmPage::Graph && !plmGraphAvailable()) ||
+        (g_plmHub.page == PlmPage::Versions && !plmVersionsAvailable()))
         g_plmHub.page = PlmPage::Overview;
 
     // keep the dashboard aggregate fresh (drives rail badges + Overview)
@@ -364,7 +369,7 @@ void drawPlmWorkspace(AppState& st) {
     switch (g_plmHub.page) {
         case PlmPage::Overview: plmDrawOverviewPage(st); break;
         case PlmPage::Files:    plmDrawFilesPage(st);    break;
-        case PlmPage::History:  plmDrawHistoryPage(st);  break;
+        case PlmPage::Versions: plmDrawVersionsPage(st); break;
         case PlmPage::Compare:  plmDrawComparePage(st);  break;
         case PlmPage::Releases: plmDrawReleasesPage(st); break;
         case PlmPage::Planning: plmDrawPlanningPage(st); break;

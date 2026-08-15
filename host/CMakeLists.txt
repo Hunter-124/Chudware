@@ -293,6 +293,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/plm/plm_workspace.cpp
   src/ui/plm/plm_pages.cpp   # plmDraw*Page implementations (split out of plm_workspace)
   src/ui/plm/plm_state.cpp   # plmInvalidate/plmEnsureOverview/plmProjectName
+  src/ui/plm/versions_tab.cpp # PLM Versions and history commit DAG
   src/ui/plm/plm_compare.cpp # PLM Compare page: rendered geometry diff of two revisions
   src/ui/plm/plm_quickbar.cpp # embedded per-doc PLM control (status-bar chip + popover)
   src/ui/plm/graph_tab.cpp     # PLM Graph tab (cad_graph_get/blast draw-list)

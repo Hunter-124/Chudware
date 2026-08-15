@@ -16,6 +16,7 @@ void plmSelectGitPage();
 void plmSelectPlanningPage();
 void plmSelectOverviewPage();
 void plmSelectFilesPage();
+void plmSelectVersionsPage();
 void plmSelectGraphPage();
 void plmSelectComparePage();
 

@@ -183,7 +183,10 @@ def summarize_diff(diff: dict[str, Any],
             verb = "Increased" if new > old else ("Decreased" if new < old else "Changed")
         else:
             verb = "Changed"
-        clauses.append(f"{verb} {param} on {label} {_fmt_value(old)} → {_fmt_value(new)}")
+        # ASCII "to", not "→": these summaries are rendered by the desktop UI, whose font
+        # requests Latin-1 plus a small CAD symbol set, so an arrow ships as "?"
+        # (visible in the PLM Versions inspector as "wall 1.7 ? 1.8").
+        clauses.append(f"{verb} {param} on {label} {_fmt_value(old)} to {_fmt_value(new)}")
 
     # 2. features added / removed
     added = diff.get("features_added", []) or []

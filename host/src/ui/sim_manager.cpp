@@ -28,6 +28,7 @@
 #include "engine_backend.h" // engine::daemonMode — server-owned export paths
 #include "feature_tree.h" // fmRowPill/fmTreeIcon/fmSectionDivider — FM-grade row styling
 #include "icons.h"
+#include "layout.h"    // ui::overlayColumnEdge — the study picker flies out beside the column
 #include "metrics.h"
 #include "property_manager.h" // PropertyManager::active() — mutual-exclusion pick guard
 #include "util/aicm_handoff.h" // is_shm_uri — overlay paths are aicm-shm:// handoff URIs, not files
@@ -5191,6 +5192,16 @@ void SimManager::drawTreeBody(AppState &st) {
          "open.");
 
   const float S2 = ui::uiScale;
+  // ImGui parks a popup at the cursor, i.e. on top of the "+ New Study" button - so the picker
+  // covered the very panel it was opened from (in a CHUDWARE_SHOT=simdisc_ecad capture it hid the
+  // study list and the empty-state prose, which read as clipped text). Fly it out to the RIGHT of
+  // the manager column instead; ImGui still clamps it into the viewport.
+  {
+    const float colEdge = ui::overlayColumnEdge(0);
+    if (colEdge > 0.0f)
+      ImGui::SetNextWindowPos(ImVec2(colEdge + 8.0f * S2, ImGui::GetCursorScreenPos().y),
+                              ImGuiCond_Appearing);
+  }
   ImGui::SetNextWindowBgAlpha(
       0.0f); // suppress the flat PopupBg — the glass panel replaces it
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,

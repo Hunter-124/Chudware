@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "../../ui_theme.h"
+#include "../layout.h"   // ui::overlayColumnEdge — fit frames the board clear of the Copilot column
 
 namespace ui {
 
@@ -521,9 +522,22 @@ EcadCanvasIO EcadCanvas::draw(const EcadMirror& doc, const ImVec2& avail) {
     imgMin_ = ImGui::GetCursorScreenPos();
     imgSize_ = avail;
 
-    // First-frame / requested fit.
+    // First-frame / requested fit. Fit to the VISIBLE canvas, not the full region: the pinned
+    // Copilot column floats over this canvas's right side, so fitting to `avail` framed the
+    // board partly underneath it (its right Edge.Cuts edge vanished in the ecad capture).
     if (!inited_ || wantFit_) {
-        zoomToFit(doc, avail);
+        ImVec2 visible = avail;
+        float hiddenPx = 0.0f;
+        const float copilotEdge = ui::overlayColumnEdge(1);
+        if (copilotEdge > imgMin_.x) {
+            visible.x = std::max(64.0f, std::min(visible.x, copilotEdge - imgMin_.x));
+            hiddenPx = avail.x - visible.x;
+        }
+        zoomToFit(doc, visible);
+        // toWorld/toScreen centre on the FULL region, so shrinking the zoom alone still parks the
+        // board's middle under the column. Push the pan so the board's centre lands on the centre
+        // of the visible strip instead.
+        if (hiddenPx > 0.0f && pxPerMm_ > 0.0f) pan_.x += (hiddenPx * 0.5f) / pxPerMm_;
         wantFit_ = false;
     }
 

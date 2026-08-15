@@ -1292,11 +1292,22 @@ static void drawAgentDagCanvas(AppState& st, AgentDagStore& dag, int verbosity) 
         }
     }
 
-    dl->AddText(ImVec2(cMin.x + 8.0f * S, cMax.y - ImGui::GetTextLineHeight() - 6.0f * S),
-        ImGui::ColorConvertFloat4ToU32(
-            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                   palette.textDisabled[2], 0.8f)),
-        "drag to pan · wheel to zoom · [-] collapse a branch");
+    // The hint floats over the canvas, so without a backing it overprints whatever node card
+    // happens to sit in the bottom-left corner (it collided with a `tool` card in the aiws
+    // capture). Wash a plate behind it, the way the graph tab haloes its labels.
+    {
+        const char* hint = "drag to pan · wheel to zoom · [-] collapse a branch";
+        const ImVec2 hs = ImGui::CalcTextSize(hint);
+        const ImVec2 hp(cMin.x + 8.0f * S, cMax.y - ImGui::GetTextLineHeight() - 6.0f * S);
+        dl->AddRectFilled(ImVec2(hp.x - 4.0f * S, hp.y - 2.0f * S),
+                          ImVec2(hp.x + hs.x + 4.0f * S, hp.y + hs.y + 2.0f * S),
+                          ui::Palette::toU32(palette.panelBg), 3.0f * S);
+        dl->AddText(hp,
+            ImGui::ColorConvertFloat4ToU32(
+                ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                       palette.textDisabled[2], 0.9f)),
+            hint);
+    }
 
     dl->PopClipRect();
     ImGui::EndChild();

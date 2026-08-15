@@ -150,6 +150,28 @@ def _plm_history(params: dict, _emit: Callable) -> dict:
         return {"ok": True, "entries": entries, "head": v.status()["head"]}
     return _with_vault(params, run)
 
+def _plm_version_graph(params: dict, _emit: Callable) -> dict:
+    def run(v: Any) -> dict:
+        limit = int((params or {}).get("limit") or 400)
+        scope = str((params or {}).get("scope") or "all")
+        return {"ok": True, **v.version_graph(limit=limit, scope=scope)}
+    return _with_vault({"path": _path(params)}, run)
+
+
+def _plm_version_tag(params: dict, _emit: Callable) -> dict:
+    def run(v: Any) -> dict:
+        result = v.tag_version(
+            commit=(params or {}).get("commit") or None,
+            name=(params or {}).get("name") or None,
+            message=str((params or {}).get("message") or ""),
+        )
+        return {"ok": True, **result}
+    return _with_vault({"path": _path(params)}, run)
+
+def _plm_version_list(params: dict, _emit: Callable) -> dict:
+    def run(v: Any) -> dict:
+        return {"ok": True, "versions": v.list_versions()}
+    return _with_vault({"path": _path(params)}, run)
 
 def _plm_save(params: dict, _emit: Callable) -> dict:
     """An explicit save → one auto (or checkpoint) history entry."""
@@ -381,20 +403,9 @@ def _plm_timeline(params: dict, _emit: Callable) -> dict:
     doc_id = (params or {}).get("doc_id") or None
     if doc_id is not None:
         doc_id = str(doc_id) or None
-    path = str((params or {}).get("path") or (params or {}).get("project_dir") or "").strip()
-    store = None
-    if path:
-        try:
-            from services.plm import branches
-            from services.plm.vault import Vault
-            v = Vault.open(path)
-            try:
-                root = branches.bind_ai_vc_to_branch(v)
-                store = ai_vc.get_store(root)
-            finally:
-                v.close()
-        except Exception:  # noqa: BLE001 — fall through to default store
-            store = None
+    project_dir = ((params or {}).get("path")
+                   or (params or {}).get("project_dir"))
+    store = ai_vc.resolve_store(project_dir)
     try:
         return ai_vc.plm_timeline(doc_id, store=store)
     except Exception as e:  # noqa: BLE001
@@ -415,8 +426,11 @@ def _plm_rollback(params: dict, _emit: Callable) -> dict:
     if doc_id is not None:
         doc_id = str(doc_id) or None
     to = str((params or {}).get("to", "") or "")
+    project_dir = ((params or {}).get("path")
+                   or (params or {}).get("project_dir"))
+    store = ai_vc.resolve_store(project_dir)
     try:
-        return ai_vc.plm_rollback(doc_id, to)
+        return ai_vc.plm_rollback(doc_id, to, store=store)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": "internal",
                 "hint": f"{type(e).__name__}: {e}"}
@@ -441,13 +455,16 @@ def _plm_rollback_check(params: dict, _emit: Callable) -> dict:
     to = str((params or {}).get("to", "") or "")
     file_path = str((params or {}).get("file_path") or "") or None
     chat_size = (params or {}).get("chat_size")
+    project_dir = ((params or {}).get("path")
+                   or (params or {}).get("project_dir"))
+    store = ai_vc.resolve_store(project_dir)
     try:
         chat_size = int(chat_size) if chat_size is not None else None
     except (TypeError, ValueError):
         chat_size = None
     try:
-        return ai_vc.plm_rollback_check(doc_id, to, file_path=file_path,
-                                        chat_size=chat_size)
+        return ai_vc.plm_rollback_check(doc_id, to, store=store,
+                                        file_path=file_path, chat_size=chat_size)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": "internal",
                 "hint": f"{type(e).__name__}: {e}"}
@@ -789,6 +806,9 @@ WORKER_METHODS = {
     "plm_open": _plm_open,
     "plm_status": _plm_status,
     "plm_history": _plm_history,
+    "plm_version_graph": _plm_version_graph,
+    "plm_version_tag": _plm_version_tag,
+    "plm_version_list": _plm_version_list,
     "plm_save": _plm_save,
     "plm_checkpoint": _plm_checkpoint,
     "plm_release": _plm_release,

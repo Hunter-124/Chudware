@@ -693,8 +693,13 @@ class AiVcStore:
                 file_rec = file_fingerprint(doc_file)
             if file_rec and not file_rec.get("sha256"):
                 file_rec = None
+        meta = self._read_meta(doc_id)
+        parent = meta.get("head")
+        if not parent and chain:
+            parent = chain[-1].get("id")
         rec = {
             "id": cid,
+            "parent": parent,
             "doc_id": doc_id,
             "turn": int(turn_id) if str(turn_id).lstrip("-").isdigit() else turn_id,
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
@@ -788,6 +793,7 @@ class AiVcStore:
             "kind": event_kind,
             "content_hash": r.get("content_hash"),
             "authored_by": r.get("authored_by"),
+            "parent": r.get("parent"),
             "doc_id": r.get("doc_id"),
             "stored_bytes": r.get("stored_bytes", 0),
             "raw_bytes": r.get("raw_bytes", 0),
@@ -902,10 +908,11 @@ class AiVcStore:
         if restore_fn is not None:
             engine_result = restore_fn(doc_id, data)
             applied = True
-        # advance head marker
         meta = self._read_meta(doc_id)
+        rolled_back_from = meta.get("head")
         meta["head"] = rec["id"]
         meta["rolled_back_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        meta["rolled_back_from"] = rolled_back_from
         self._write_meta(doc_id, meta)
         chat_truncate_to = rec.get("msg_idx")
         if chat_truncate_to is None and isinstance(rec.get("call"), dict):
@@ -1049,6 +1056,57 @@ def get_store(root: str | os.PathLike | None = None,
         _STORE = AiVcStore(default_store_root(), cfg=cfg)
         _STORE_ROOT = _STORE.root
     return _STORE
+
+
+def _active_branch_name(project_root: Path) -> str:
+    """Read the active branch WITHOUT opening the vault.
+
+    ``branches.active_branch`` routes through ``ensure_default_branch``, which
+    rewrites ``branches/meta.json`` and the local config on every call. This is
+    the AI-VC hot path — one resolution per tool call — so it reads the side
+    table directly and falls back to the same default that bootstrap would seed.
+    """
+    meta_path = project_root / ".aicadvault" / "branches" / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        name = str(meta.get("active") or "").strip()
+        if name:
+            return name
+    except (OSError, ValueError):
+        pass
+    return "main"
+
+
+def resolve_store(
+    project_dir: str | os.PathLike | None = None,
+    *,
+    cfg: dict | None = None,
+) -> AiVcStore:
+    """Resolve and bind the branch-local store for the active project.
+
+    Explicit project paths win, followed by the agent's project and filesystem
+    roots. With no project context — a headless MCP client — the cache-backed
+    fallback store is preserved. Writers and readers both come through here, so
+    a checkpoint written during an agent turn lands in the same branch-scoped
+    root that ``plm_timeline`` and ``plm_rollback`` later read.
+    """
+    candidate = str(project_dir or "").strip()
+    if not candidate:
+        candidate = (os.environ.get("CHUDWARE_PROJECT_DIR", "").strip()
+                     or os.environ.get("CHUDWARE_FS_ROOT", "").strip())
+    if not candidate:
+        return get_store(cfg=cfg)
+    try:
+        from services.agent.project_context import resolve_project_root
+        from services.plm import branches
+
+        root = Path(resolve_project_root(candidate))
+        if not (root / ".aicadvault").is_dir():
+            return get_store(cfg=cfg)
+        store_root = branches.ai_vc_root_for(root, _active_branch_name(root))
+        return get_store(store_root, cfg=cfg)
+    except Exception:  # noqa: BLE001 — headless/uninitialised clients keep fallback
+        return get_store(cfg=cfg)
 
 
 def reset_store_for_tests(root: str | os.PathLike | None = None,
@@ -1249,7 +1307,7 @@ def on_prompt_start(
     label = _prompt_label(prompt)
     op_batch = {"kind": "prompt", "msg_idx": msg_idx, "label": label}
 
-    st = store or get_store(cfg=cfg)
+    st = store or resolve_store(project_dir, cfg=cfg)
     try:
         if content is not None:
             raw = content
@@ -1356,7 +1414,7 @@ def on_before_tool(
     op_batch = {"kind": "tool", "tool": tool, "call": call,
                 "args": _op_batch_from(tool, args)}
 
-    st = store or get_store(cfg=cfg)
+    st = store or resolve_store(project_dir, cfg=cfg)
     try:
         if content is not None:
             raw = content
@@ -1456,7 +1514,7 @@ def on_ai_tool_success(
     if not is_ai_policy_doc(doc_id):
         return None
 
-    st = store or get_store(cfg=cfg)
+    st = store or resolve_store(project_dir, cfg=cfg)
     op_batch = _op_batch_from(tool, args)
     if msg_idx is None:
         mi = _SESSION_TURN.get("msg_idx")

@@ -867,3 +867,68 @@ def test_old_records_without_file_field_still_roll_back(store, tmp_path):
     out = ai_vc.plm_rollback("fp6", r0["id"], store=reopened, restore_fn=_restore)
     assert out["ok"] and out["checkpoint_id"] == r0["id"]
     assert restored["doc"]["features"][0]["params"]["wall"] == 1.0
+
+
+def test_branch_bound_policy_timeline_and_rollback(tmp_path, monkeypatch):
+    from services.plm import branches
+    from services.plm.vault import Vault
+    from services.plm.worker_rpc import _plm_rollback_check, _plm_timeline
+
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    vault = Vault.open(tmp_path)
+    try:
+        ai_vc.clear_provenance()
+        ai_vc.stamp_authored("branch-doc", "agent")
+        first = ai_vc.on_prompt_start(
+            "main checkpoint", doc_id="branch-doc", turn_id=1,
+            content=_part(2), project_dir=str(tmp_path),
+        )
+        assert first and first["ok"]
+        main_tl = _plm_timeline({"doc_id": "branch-doc"}, lambda *_: None)
+        assert [c["id"] for c in main_tl["checkpoints"]] == [first["id"]]
+
+        branches.create_branch(vault, "feature")
+        branches.switch_branch(vault, "feature")
+        second = ai_vc.on_before_tool(
+            "add_features", {"doc_id": "branch-doc"}, turn_id=2,
+            content=_part(3), project_dir=str(tmp_path),
+        )
+        assert second and second["ok"]
+        feature_tl = _plm_timeline({"doc_id": "branch-doc"}, lambda *_: None)
+        assert [c["id"] for c in feature_tl["checkpoints"]] == [second["id"]]
+        check = _plm_rollback_check(
+            {"doc_id": "branch-doc", "to": second["id"]}, lambda *_: None)
+        assert check["ok"] and check["checkpoint_id"] == second["id"]
+
+        branches.switch_branch(vault, "main")
+        restored_tl = _plm_timeline({"doc_id": "branch-doc"}, lambda *_: None)
+        assert [c["id"] for c in restored_tl["checkpoints"]] == [first["id"]]
+    finally:
+        vault.close()
+
+
+def test_parent_legacy_and_post_rollback_fork(store):
+    ai_vc.stamp_authored("ancestry", "agent")
+    first = store.checkpoint(
+        "ancestry", _part(2), turn_id=1, op_batch={"n": 1})
+    second = store.checkpoint(
+        "ancestry", _part(3), turn_id=2, op_batch={"n": 2})
+    assert first["record"]["parent"] is None
+    assert second["record"]["parent"] == first["id"]
+    timeline = store.timeline("ancestry")["checkpoints"]
+    assert timeline[0]["parent"] == first["id"]
+
+    chain_path = store._chain_path("ancestry")
+    records = store.read_chain("ancestry")
+    records[0].pop("parent")
+    chain_path.write_text(
+        "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    assert store.timeline("ancestry")["checkpoints"][-1]["parent"] is None
+    assert store.materialize("ancestry", first["id"])
+
+    store.rollback("ancestry", first["id"])
+    fork = store.checkpoint(
+        "ancestry", _part(4), turn_id=3, op_batch={"n": 3})
+    assert fork["record"]["parent"] == first["id"]
+    assert store._read_meta("ancestry")["rolled_back_from"] == second["id"]

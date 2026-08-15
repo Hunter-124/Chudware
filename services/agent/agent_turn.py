@@ -2139,6 +2139,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             session_id=run_id,
             ledger=ledger,
             actor=actor or "agent_turn",
+            project_dir=_pc_root,
         )
     except Exception:  # noqa: BLE001 — AI-VC never breaks the turn
         pass
@@ -3782,6 +3783,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     session_id=run_id,
                     ledger=ledger,
                     actor=actor or "agent_turn",
+                    project_dir=_pc_root,
                 )
             except Exception:  # noqa: BLE001 — AI-VC never breaks the turn
                 pass
@@ -4365,6 +4367,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     call_i=tool_calls_made - 1,
                     ledger=ledger,
                     actor=actor or "agent_turn",
+                    project_dir=_pc_root,
                 )
             except Exception:  # noqa: BLE001 — AI-VC never breaks the turn
                 pass

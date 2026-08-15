@@ -404,3 +404,31 @@ TEST_CASE("fillet: 3-way corner (3 edges at one vertex) all round") {
     CHECK(cdrop2 == 0);
     REQUIRE_FALSE(ctwo.IsNull());
 }
+
+TEST_CASE("fillet: isolated OCCT fault is a failed feature and process survives") {
+#if defined(__unix__) || defined(__APPLE__)
+    TopoDS_Shape box = geom::make_box(40.0, 30.0, 20.0);
+    TopTools_IndexedMapOfShape emap;
+    TopExp::MapShapes(box, TopAbs_EDGE, emap);
+    std::vector<TopoDS_Edge> one{TopoDS::Edge(emap(1))};
+    setenv("CHUDWARE_TEST_BLEND_SIGSEGV", "1", 1);
+    int dropped = -1;
+    TopoDS_Shape failed = geom::fillet_edges(box, 4.0, one, &dropped);
+    unsetenv("CHUDWARE_TEST_BLEND_SIGSEGV");
+    CHECK(failed.IsNull());
+    CHECK(dropped == 1);
+    // The same process remains usable after the isolated child dies.
+    TopoDS_Shape healthy = geom::fillet_edges(box, 4.0, one, &dropped);
+    CHECK_FALSE(healthy.IsNull());
+    CHECK(dropped == 0);
+
+    // The whole-body ("round every edge") overload is isolated too — it reaches the same
+    // OCCT corner resolver, so an unguarded build there would kill the daemon just as dead.
+    setenv("CHUDWARE_TEST_BLEND_SIGSEGV", "1", 1);
+    TopoDS_Shape allFailed = geom::fillet_edges(box, 2.0, std::nullopt);
+    unsetenv("CHUDWARE_TEST_BLEND_SIGSEGV");
+    CHECK(allFailed.IsNull());
+    TopoDS_Shape allHealthy = geom::fillet_edges(box, 2.0, std::nullopt);
+    CHECK_FALSE(allHealthy.IsNull());
+#endif
+}

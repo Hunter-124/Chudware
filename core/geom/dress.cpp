@@ -1,8 +1,10 @@
 #include "geom/dress.h"
+#include "util/process_isolation.h"
 
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -114,6 +116,30 @@ bool blend_is_watertight(const TopoDS_Shape& shape) {
     }
 }
 
+// A blend build gets 30 s in its isolated child. Nothing legitimate takes that long on a
+// document-sized body; past it the caller treats the subset as unbuildable.
+constexpr std::chrono::seconds kBlendTimeout{30};
+
+// Unique blendable edges of `shape`, optionally filtered to those parallel to `dir`.
+// A raw explorer would visit each shared edge once per incident face (a box -> 24 hits
+// for 12 edges); the indexed map de-dups so every edge is Add()ed exactly once.
+std::vector<TopoDS_Edge> select_blendable(const TopoDS_Shape& shape,
+                                         const std::optional<Eigen::Vector3d>& dir) {
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+    std::vector<TopoDS_Edge> sel;
+    sel.reserve((size_t)edges.Extent());
+    for (int i = 1; i <= edges.Extent(); ++i) {
+        const TopoDS_Edge edge = TopoDS::Edge(edges(i));
+        if (!is_blendable_edge(edge, edge_faces)) continue;  // skip seams/degenerates
+        if (dir.has_value() && !edge_parallel_to(edge, *dir)) continue;
+        sel.push_back(edge);
+    }
+    return sel;
+}
+
 // Build a fillet/chamfer over `good`, dropping any edge that breaks the build instead of failing
 // the whole feature. Fast path adds them all at once (the common, correct case); on failure it
 // re-adds one at a time and keeps only the edges that still produce a valid solid. This is what
@@ -130,37 +156,38 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
                                 int* n_dropped) {
     if (n_dropped) *n_dropped = 0;
     if (good.empty()) return TopoDS_Shape();
-    try {
-        Builder mk(shape);
-        for (const TopoDS_Edge& e : good) add(mk, e);
-        mk.Build();
-        if (mk.IsDone()) {
-            TopoDS_Shape s = mk.Shape();
-            if (blend_is_watertight(s)) return s;  // common case: every edge rounded cleanly
-        }
-    } catch (const Standard_Failure&) { /* fall through to incremental */ }
+
+    auto build = [&](const std::vector<TopoDS_Edge>& edges) -> TopoDS_Shape {
+        auto result = chudware::util::isolate_shape_build([&]() -> TopoDS_Shape {
+            try {
+                Builder mk(shape);
+                for (const TopoDS_Edge& e : edges) add(mk, e);
+                mk.Build();
+                if (!mk.IsDone()) return {};
+                TopoDS_Shape s = mk.Shape();
+                return blend_is_watertight(s) ? s : TopoDS_Shape();
+            } catch (const Standard_Failure&) {
+                return {};
+            }
+        }, kBlendTimeout);
+        return result.ok ? result.shape : TopoDS_Shape();
+    };
+
+    TopoDS_Shape all = build(good);
+    if (!all.IsNull()) return all;
 
     // T-PERF10: bisect over the edge list instead of O(E²) one-edge-at-a-time rebuilds.
-    // Try the whole span first (common case: all edges succeed — one build). On failure, recurse
-    // into halves, then greedily merge right into left (same semantics as the old linear scan,
-    // but only on residual failing edges). Typical partial-fail is log-depth rather than E full
-    // rebuilds.
+    // A crashing subset is indistinguishable from any other failed build, preserving the
+    // established drop count and \"round what you can\" behavior.
     auto try_build = [&](const std::vector<TopoDS_Edge>& edges) -> bool {
         if (edges.empty()) return true;
-        try {
-            Builder mk(shape);
-            for (const TopoDS_Edge& e : edges) add(mk, e);
-            mk.Build();
-            return mk.IsDone() && blend_is_watertight(mk.Shape());
-        } catch (const Standard_Failure&) {
-            return false;
-        }
+        return !build(edges).IsNull();
     };
     std::function<std::vector<TopoDS_Edge>(const std::vector<TopoDS_Edge>&)> select;
     select = [&](const std::vector<TopoDS_Edge>& span) -> std::vector<TopoDS_Edge> {
         if (span.empty()) return {};
         if (try_build(span)) return span;
-        if (span.size() == 1) return {};  // single edge fails — drop it
+        if (span.size() == 1) return {};
         const size_t mid = span.size() / 2;
         std::vector<TopoDS_Edge> left(span.begin(), span.begin() + (std::ptrdiff_t)mid);
         std::vector<TopoDS_Edge> right(span.begin() + (std::ptrdiff_t)mid, span.end());
@@ -169,7 +196,6 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
         std::vector<TopoDS_Edge> merged = L;
         merged.insert(merged.end(), R.begin(), R.end());
         if (try_build(merged)) return merged;
-        // Halves don't compose — greedily fold R into L (old linear semantics, small residual).
         merged = L;
         for (const TopoDS_Edge& e : R) {
             std::vector<TopoDS_Edge> trial = merged;
@@ -180,17 +206,7 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
     };
     std::vector<TopoDS_Edge> accepted = select(good);
     if (n_dropped) *n_dropped = (int)(good.size() - accepted.size());
-    if (accepted.empty()) return TopoDS_Shape();
-    try {
-        Builder mk(shape);
-        for (const TopoDS_Edge& e : accepted) add(mk, e);
-        mk.Build();
-        if (mk.IsDone()) {
-            TopoDS_Shape s = mk.Shape();
-            if (blend_is_watertight(s)) return s;
-        }
-    } catch (const Standard_Failure&) {}
-    return TopoDS_Shape();
+    return accepted.empty() ? TopoDS_Shape() : build(accepted);
 }
 
 }  // namespace
@@ -201,57 +217,44 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
 // partial round of whichever subset happens to fit. The drop-failing/best-effort behaviour is
 // reserved for the EXPLICIT-edge selector overloads (the doc model's `refs.edges` path — the
 // "round these specific edges, skip the few too tight" case the rover seats hit).
+// The two whole-body overloads route through the SAME fault isolation as the explicit-edge
+// path: the crash class lives in OCCT's corner resolver, which a "round every edge" call
+// reaches just as readily. Semantics are unchanged — all-or-nothing, an empty shape on
+// failure — because an oversize radius on a whole-body round is a mistake the caller wants
+// flagged, not silently turned into a partial round.
 TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
                           std::optional<Eigen::Vector3d> dir) {
-    BRepFilletAPI_MakeFillet mk(shape);
-
-    // Enumerate UNIQUE edges. A raw explorer would visit each shared edge once per
-    // incident face (a box -> 24 hits for 12 edges); the indexed map de-dups so every
-    // edge is Add()ed to the builder exactly once.
-    TopTools_IndexedMapOfShape edges;
-    TopExp::MapShapes(shape, TopAbs_EDGE, edges);
-    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
-    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
-
-    int added = 0;
-    for (int i = 1; i <= edges.Extent(); ++i) {
-        const TopoDS_Edge edge = TopoDS::Edge(edges(i));
-        if (!is_blendable_edge(edge, edge_faces)) continue;  // skip seams/degenerates
-        if (dir.has_value() && !edge_parallel_to(edge, *dir)) continue;
-        mk.Add(r, edge);
-        ++added;
-    }
-    if (added == 0) return TopoDS_Shape();  // nothing selected -> nothing to do
-
-    mk.Build();
-    if (!mk.IsDone()) return TopoDS_Shape();
-    return mk.Shape();
+    const std::vector<TopoDS_Edge> sel = select_blendable(shape, dir);
+    if (sel.empty()) return TopoDS_Shape();  // nothing selected -> nothing to do
+    auto built = chudware::util::isolate_shape_build([&]() -> TopoDS_Shape {
+        try {
+            BRepFilletAPI_MakeFillet mk(shape);
+            for (const TopoDS_Edge& e : sel) mk.Add(r, e);
+            mk.Build();
+            return mk.IsDone() ? mk.Shape() : TopoDS_Shape();
+        } catch (const Standard_Failure&) {
+            return {};
+        }
+    }, kBlendTimeout);
+    return built.ok ? built.shape : TopoDS_Shape();
 }
 
 TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
                            std::optional<Eigen::Vector3d> dir) {
-    BRepFilletAPI_MakeChamfer mk(shape);
-
-    // Same unique-edge enumeration as fillet_edges (see note there).
-    TopTools_IndexedMapOfShape edges;
-    TopExp::MapShapes(shape, TopAbs_EDGE, edges);
-    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
-    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
-
-    int added = 0;
-    for (int i = 1; i <= edges.Extent(); ++i) {
-        const TopoDS_Edge edge = TopoDS::Edge(edges(i));
-        if (!is_blendable_edge(edge, edge_faces)) continue;  // skip seams/degenerates
-        if (dir.has_value() && !edge_parallel_to(edge, *dir)) continue;
-        // Symmetric chamfer: the single-distance Add(d, edge) sets both legs to d.
-        mk.Add(d, edge);
-        ++added;
-    }
-    if (added == 0) return TopoDS_Shape();
-
-    mk.Build();
-    if (!mk.IsDone()) return TopoDS_Shape();
-    return mk.Shape();
+    const std::vector<TopoDS_Edge> sel = select_blendable(shape, dir);
+    if (sel.empty()) return TopoDS_Shape();
+    auto built = chudware::util::isolate_shape_build([&]() -> TopoDS_Shape {
+        try {
+            BRepFilletAPI_MakeChamfer mk(shape);
+            // Symmetric chamfer: the single-distance Add(d, edge) sets both legs to d.
+            for (const TopoDS_Edge& e : sel) mk.Add(d, e);
+            mk.Build();
+            return mk.IsDone() ? mk.Shape() : TopoDS_Shape();
+        } catch (const Standard_Failure&) {
+            return {};
+        }
+    }, kBlendTimeout);
+    return built.ok ? built.shape : TopoDS_Shape();
 }
 
 // --- explicit-edge overloads ---

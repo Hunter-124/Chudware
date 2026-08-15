@@ -63,6 +63,7 @@ inline void wasmBootDom(const char *msg) {
 #include "stb_image_write.h"
 
 #include <nlohmann/json.hpp>
+#include "miniz.h"
 
 #include <algorithm>
 #include <cctype>
@@ -3205,9 +3206,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       st.plmProjectDir = ec ? std::string(".") : cwd.string();
     }
   }
-  // Pin whatever workspace the scenario just selected (see AppState::shotWorkspacePin).
-  // The `workspaces` scenario cycles all of them on purpose, so it stays unpinned.
-  if (shot && !st.wantWorkspace)
+  // Seed the pin from the scenario's own selection (see AppState::shotWorkspacePin). Model is
+  // not a pin target: scenarios that reach their workspace mid-run adopt it in the frame loop.
+  if (shot && !st.wantWorkspace && st.activeWorkspace != AppState::Workspace::Model)
     st.shotWorkspacePin = (int)st.activeWorkspace;
   // C20b: assembly shot — author base/peg parts, new assembly, insert + mate +
   // interference.
@@ -5206,11 +5207,79 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       }
     }
 
-    // Wave N: ECAD GUI shot — build a verified design via the worker and load
-    // it into the editor mirror so the screenshot shows a live schematic/board
-    // (mirrors the wantTree flow). Default shows the schematic (always
-    // populated via the orchestrator's recipe fallback); CHUDWARE_ECAD_KIND=pcb
-    // shows the laid-out + autorouted board instead.
+    auto seedEcadShotFixture = [&](nlohmann::json &out) -> bool {
+      using json = nlohmann::json;
+      const std::string path = appdataAppDir() + "/ecad-shot-fixture.ecad+";
+      std::error_code ec;
+      std::filesystem::create_directories(appdataAppDir(), ec);
+      json doc = {
+          {"schema", "aicad.pcb/1"},
+          {"id", ""},
+          {"name", "ECAD Shot Fixture"},
+          {"linked_sch", nullptr},
+          {"stackup",
+           {{"copper_layers", 2},
+            {"thickness", 1.6},
+            {"layers",
+             json::array({{{"id", "F.Cu"}, {"type", "copper"}, {"thickness", 0.035}},
+                          {{"id", "diel1"}, {"type", "core"}, {"thickness", 1.53}, {"er", 4.5}},
+                          {{"id", "B.Cu"}, {"type", "copper"}, {"thickness", 0.035}}})}}},
+          {"outline", {{"shapes", json::array()}, {"closed", false}}},
+          {"footprints", json::array()},
+          {"tracks", json::array()},
+          {"vias", json::array()},
+          {"zones", json::array()},
+          {"graphics", json::array()},
+          {"rules",
+           {{"clearance", 0.2},
+            {"track_width_min", 0.15},
+            {"via_diameter_min", 0.45},
+            {"via_drill_min", 0.2},
+            {"annular_ring_min", 0.13},
+            {"hole_to_hole_min", 0.25},
+            {"edge_clearance", 0.3},
+            {"silk_to_mask_min", 0.15}}},
+          {"nets", json::array({{{"name", "GND"}, {"class", "default"}},
+                                {{"name", "SIG"}, {"class", "default"}}})},
+          {"net_classes",
+           {{"default",
+             {{"clearance", 0.2},
+              {"track_width", 0.25},
+              {"via_diameter", 0.8},
+              {"via_drill", 0.4}}}}},
+          {"origin", json::array({0.0, 0.0})}};
+      json meta = {{"container", "aicad.ecad+/1"},
+                   {"app_version", "ecad-shot"},
+                   {"kind", "pcb"},
+                   {"schema", "aicad.pcb/1"},
+                   {"created", ""},
+                   {"modified", ""},
+                   {"units", json::object()},
+                   {"name", "ECAD Shot Fixture"}};
+      mz_zip_archive zip{};
+      if (!mz_zip_writer_init_file(&zip, path.c_str(), 0))
+        return false;
+      const std::string metaText = meta.dump();
+      const std::string docText = doc.dump();
+      bool ok = mz_zip_writer_add_mem(&zip, "meta.json", metaText.data(),
+                                      metaText.size(), MZ_BEST_SPEED) &&
+                mz_zip_writer_add_mem(&zip, "document.json", docText.data(),
+                                      docText.size(), MZ_BEST_SPEED) &&
+                mz_zip_writer_finalize_archive(&zip);
+      mz_zip_writer_end(&zip);
+      if (!ok)
+        return false;
+      std::string err;
+      ok = st.worker.call("ecad_open", {{"path", path}}, out, err, 60000);
+      std::filesystem::remove(path, ec);
+      std::printf("[ecad-shot] fixture_open ok=%d%s\n", (int)ok,
+                  (out.is_object() && out.contains("code")) ? " (code-err)" : "");
+      std::fflush(stdout);
+      return ok && !(out.is_object() && out.contains("code"));
+    };
+
+    // ECAD GUI shot — seed a deterministic routed PCB through the native worker
+    // RPCs. Only the explicit AI variants use a provider.
     if (st.wantEcad && !st.ecadShotDone && st.workerStarted) {
       st.ecadShotDone = true;
       auto ecall = [&](const char *m, const nlohmann::json &p,
@@ -5224,9 +5293,16 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         return ok && !(out.is_object() && out.contains("code"));
       };
       const char *kindEnv = std::getenv("CHUDWARE_ECAD_KIND");
-      const bool wantPcb = kindEnv && std::strcmp(kindEnv, "pcb") == 0;
+      const bool wantPcb =
+          !kindEnv || std::strcmp(kindEnv, "pcb") == 0 ||
+          std::strcmp(kindEnv, "hidefront") == 0 ||
+          std::strcmp(kindEnv, "netselect") == 0;
       const bool want3d = kindEnv && std::strcmp(kindEnv, "3d") == 0;
       const bool wantAi = kindEnv && std::strcmp(kindEnv, "ai") == 0;
+      const bool wantHideFront =
+          kindEnv && std::strcmp(kindEnv, "hidefront") == 0;
+      const bool wantNetSelect =
+          kindEnv && std::strcmp(kindEnv, "netselect") == 0;
       const bool wantEdit = kindEnv && std::strcmp(kindEnv, "editsch") == 0;
       const bool wantSelect =
           kindEnv && std::strcmp(kindEnv, "select") == 0; // selection highlight
@@ -5338,10 +5414,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           }
         }
       } else if (wantPcb || want3d) {
-        // Build a small demo board explicitly: outline + two 0603 footprints
-        // (pads resolved from the library) + a routed track + a GND copper
-        // pour, then fill it.
-        if (ecall("ecad_new", {{"kind", "pcb"}}, r)) {
+        if (seedEcadShotFixture(r)) {
           const std::string pcbId = jstr(r, "doc_id");
           const int rev = jint(r, "revision");
           nlohmann::json ops = nlohmann::json::array();
@@ -5350,39 +5423,142 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                {"closed", true},
                {"shapes",
                 nlohmann::json::array(
-                    {{{"type", "line"}, {"p1", {0, 0}}, {"p2", {40, 0}}},
-                     {{"type", "line"}, {"p1", {40, 0}}, {"p2", {40, 30}}},
-                     {{"type", "line"}, {"p1", {40, 30}}, {"p2", {0, 30}}},
-                     {{"type", "line"}, {"p1", {0, 30}}, {"p2", {0, 0}}}})}});
+                    {{{"type", "line"}, {"p1", {0, 0}}, {"p2", {48, 0}}},
+                     {{"type", "line"}, {"p1", {48, 0}}, {"p2", {48, 32}}},
+                     {{"type", "line"}, {"p1", {48, 32}}, {"p2", {0, 32}}},
+                     {{"type", "line"}, {"p1", {0, 32}}, {"p2", {0, 0}}}})}});
+          const auto twoPadDef = [](const char *fpid) {
+            return nlohmann::json{
+                {"fpid", fpid},
+                {"pads",
+                 nlohmann::json::array(
+                     {{{"id", "p1"},
+                       {"number", "1"},
+                       {"pos", {-1.0, 0.0}},
+                       {"size", {1.4, 1.4}},
+                       {"shape", "roundrect"},
+                       {"roundrect_ratio", 0.25},
+                       {"type", "smd"},
+                       {"layers", {"F.Cu", "F.Mask", "F.Paste"}}},
+                      {{"id", "p2"},
+                       {"number", "2"},
+                       {"pos", {1.0, 0.0}},
+                       {"size", {1.4, 1.4}},
+                       {"shape", "roundrect"},
+                       {"roundrect_ratio", 0.25},
+                       {"type", "smd"},
+                       {"layers", {"F.Cu", "F.Mask", "F.Paste"}}}})}};
+          };
           ops.push_back({{"op", "pcb_add_footprint"},
                          {"fpid", "Resistor_SMD:R_0603"},
-                         {"pos", {14, 15}},
+                         {"def", twoPadDef("Resistor_SMD:R_0603")},
+                         {"pads",
+                          nlohmann::json::array(
+                              {{{"id", "p1"},
+                                {"number", "1"},
+                                {"pos", {-1.0, 0.0}},
+                                {"size", {1.4, 1.4}},
+                                {"shape", "roundrect"},
+                                {"roundrect_ratio", 0.25},
+                                {"type", "smd"},
+                                {"layers", {"F.Cu", "F.Mask", "F.Paste"}},
+                                {"net", "GND"}},
+                               {{"id", "p2"},
+                                {"number", "2"},
+                                {"pos", {1.0, 0.0}},
+                                {"size", {1.4, 1.4}},
+                                {"shape", "roundrect"},
+                                {"roundrect_ratio", 0.25},
+                                {"type", "smd"},
+                                {"layers", {"F.Cu", "F.Mask", "F.Paste"}},
+                                {"net", "SIG"}}})},
+                         {"pos", {12, 20}},
                          {"ref", "R1"},
                          {"value", "10k"}});
           ops.push_back({{"op", "pcb_add_footprint"},
+                         {"fpid", "Capacitor_SMD:C_0603"},
+                         {"def", twoPadDef("Capacitor_SMD:C_0603")},
+                         {"pads",
+                          nlohmann::json::array(
+                              {{{"id", "p1"},
+                                {"number", "1"},
+                                {"pos", {-1.0, 0.0}},
+                                {"size", {1.4, 1.4}},
+                                {"shape", "roundrect"},
+                                {"roundrect_ratio", 0.25},
+                                {"type", "smd"},
+                                {"layers", {"F.Cu", "F.Mask", "F.Paste"}},
+                                {"net", "GND"}},
+                               {{"id", "p2"},
+                                {"number", "2"},
+                                {"pos", {1.0, 0.0}},
+                                {"size", {1.4, 1.4}},
+                                {"shape", "roundrect"},
+                                {"roundrect_ratio", 0.25},
+                                {"type", "smd"},
+                                {"layers", {"F.Cu", "F.Mask", "F.Paste"}},
+                                {"net", "SIG"}}})},
+                         {"pos", {36, 20}},
+                         {"ref", "C1"},
+                         {"value", "100n"}});
+          ops.push_back({{"op", "pcb_add_footprint"},
                          {"fpid", "Resistor_SMD:R_0603"},
-                         {"pos", {26, 15}},
-                         {"ref", "R2"},
-                         {"value", "10k"}});
+                         {"def", twoPadDef("Resistor_SMD:R_0603")},
+                         {"pads",
+                          nlohmann::json::array(
+                              {{{"id", "p1"},
+                                {"number", "1"},
+                                {"pos", {-1.0, 0.0}},
+                                {"size", {1.4, 1.4}},
+                                {"shape", "roundrect"},
+                                {"roundrect_ratio", 0.25},
+                                {"type", "smd"},
+                                {"layers", {"F.Cu", "F.Mask", "F.Paste"}},
+                                {"net", "SIG"}},
+                               {{"id", "p2"},
+                                {"number", "2"},
+                                {"pos", {1.0, 0.0}},
+                                {"size", {1.4, 1.4}},
+                                {"shape", "roundrect"},
+                                {"roundrect_ratio", 0.25},
+                                {"type", "smd"},
+                                {"layers", {"F.Cu", "F.Mask", "F.Paste"}},
+                                {"net", "SIG"}}})},
+                         {"pos", {24, 10}},
+                         {"value", "1k"}});
           ops.push_back({{"op", "pcb_add_track"},
+                         {"net", "GND"},
                          {"layer", "F.Cu"},
-                         {"width", 0.3},
-                         {"p1", {15.6, 15}},
-                         {"p2", {24.4, 15}}});
-          ops.push_back(
-              {{"op", "pcb_add_zone"},
-               {"net", "GND"},
-               {"layer", "B.Cu"},
-               {"polygon",
-                nlohmann::json::array({{1, 1}, {39, 1}, {39, 29}, {1, 29}})}});
-          ecall("ecad_apply_ops",
-                {{"doc_id", pcbId}, {"base_revision", rev}, {"ops", ops}}, r);
-          ecall("ecad_fill_zones", {{"doc_id", pcbId}}, r);
-          if (want3d) {
-            st.ecadDocId = pcbId; // ecadTo3d exports the current ecad doc
-            ecadTo3d(st); // STEP -> CAD part -> 3D viewport (leave ECAD empty)
-          } else {
-            showId = pcbId; // show the board in the ECAD canvas
+                         {"width", 0.4},
+                         {"p1", {11, 20}},
+                         {"p2", {35, 20}}});
+          ops.push_back({{"op", "pcb_add_track"},
+                         {"net", "SIG"},
+                         {"layer", "F.Cu"},
+                         {"width", 0.1},
+                         {"p1", {13, 20.5}},
+                         {"p2", {23, 10}}});
+          ops.push_back({{"op", "pcb_add_via"},
+                         {"net", "SIG"},
+                         {"at", {23, 10}},
+                         {"diameter", 0.8},
+                         {"drill", 0.4},
+                         {"layers", {"F.Cu", "B.Cu"}}});
+          ops.push_back({{"op", "pcb_add_track"},
+                         {"net", "SIG"},
+                         {"layer", "B.Cu"},
+                         {"width", 0.4},
+                         {"p1", {23, 10}},
+                         {"p2", {37, 20}}});
+          if (ecall("ecad_apply_ops",
+                    {{"doc_id", pcbId}, {"base_revision", rev}, {"ops", ops}},
+                    r)) {
+            if (want3d) {
+              st.ecadDocId = pcbId;
+              ecadTo3d(st);
+            } else {
+              showId = pcbId;
+            }
           }
         }
       } else if (wantUndo) {
@@ -5457,9 +5633,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                   r))
           showId = jstr(r, "doc_id");
         st.ecadSimAnalysis = 1; // AC sweep (frequency response)
-      } else {
-        // AI design -> a verified divider schematic (recipe fallback; no model
-        // needed).
+      } else if (!wantHideFront && !wantNetSelect) {
+        // Provider-backed path retained only for explicit non-default variants.
         if (ecall("ecad_design",
                   {{"request", "5V resistive divider with 2.5V output"}}, r))
           showId = jstr(r, "doc_id");
@@ -5469,8 +5644,21 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         st.ecadRevision = jint(r, "revision");
         ui::ecadEditorMirror().setDocId(showId);
         ui::ecadEditorLoadResponse(r);
-        std::printf("[ecad-shot] showing %s rev=%d\n", showId.c_str(),
-                    st.ecadRevision);
+        if (wantHideFront)
+          ui::ecadEditorMirror().setLayerVisible("F.Cu", false);
+        if (wantNetSelect)
+          ui::ecadEditorMirror().setNetVisible("SIG", false);
+        std::printf(
+            "[ecad-shot] showing %s rev=%d footprints=%d tracks=%d vias=%d "
+            "nets=%d drc=%d front_visible=%d sig_visible=%d\n",
+            showId.c_str(), st.ecadRevision,
+            (int)ui::ecadEditorMirror().footprints().size(),
+            (int)ui::ecadEditorMirror().tracks().size(),
+            (int)ui::ecadEditorMirror().vias().size(),
+            (int)ui::ecadEditorMirror().nets().size(),
+            (int)ui::ecadEditorMirror().drc().size(),
+            (int)ui::ecadEditorMirror().layerVisible("F.Cu"),
+            (int)ui::ecadEditorMirror().netVisible("SIG"));
         if (wantSelect || wantRotate) {
           // Drive selection without a mouse so the shot shows the highlight
           // halo (+ the property inspector). Pick a real symbol id from the
@@ -6122,8 +6310,18 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // while verifying nothing. This was hand-patched for parts, then reveng, then PLM, and
     // still bit ECAD, the AI workspace and Drawing — three scenarios exiting 0 having
     // photographed the wrong surface. One pin covers the class (AppState::shotWorkspacePin).
-    if (st.shotWorkspacePin >= 0)
-      st.activeWorkspace = (AppState::Workspace)st.shotWorkspacePin;
+    // The pin ADOPTS any non-Model workspace the run selects and only ever restores it when
+    // something has yanked us back to Model. A blunt "force the setup workspace every frame"
+    // pin broke the other direction: fea / flow / simdisc_* select their workspace DURING the
+    // run (they set only the ribbon and left-pane tab up front), so pinning Model at setup
+    // pinned them to Model forever - the Simulation Manager scenarios then captured the
+    // Feature Manager. Model is never a pin target for exactly that reason.
+    if (shot && !st.wantWorkspace) {
+      if (st.activeWorkspace != AppState::Workspace::Model)
+        st.shotWorkspacePin = (int)st.activeWorkspace;
+      else if (st.shotWorkspacePin >= 0)
+        st.activeWorkspace = (AppState::Workspace)st.shotWorkspacePin;
+    }
 
     using WS = AppState::Workspace;
     const WS ws = st.activeWorkspace;

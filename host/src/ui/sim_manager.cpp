@@ -319,7 +319,8 @@ static void drawStudyTypeBanner(StudyType t, const char *desc) {
     ImGui::Image(iv.texId, ImVec2(18.0f * S, 18.0f * S), iv.uv0, iv.uv1);
     ImGui::SameLine(0, 7.0f * S);
   }
-  ImGui::PushTextWrapPos(p0.x + w - pad.x);
+  ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+                         ImGui::GetContentRegionAvail().x);
   ImGui::TextWrapped("%s", desc);
   ImGui::PopTextWrapPos();
   ImGui::Unindent(pad.x);
@@ -5125,6 +5126,16 @@ void SimManager::drawTreeBody(AppState &st) {
     ~SpacingPop() { ImGui::PopStyleVar(); }
   } spacingPop;
 
+  // The body is embedded in a padded child.  ImGui's default wrap edge can
+  // still point at the parent window, so bind wrapping to this child's live
+  // content width.  This also keeps long study names, empty-state guidance and
+  // qualitative warnings inside the rail at narrower window sizes.
+  ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+                         ImGui::GetContentRegionAvail().x);
+  struct WrapPop {
+    ~WrapPop() { ImGui::PopTextWrapPos(); }
+  } wrapPop;
+
   // ---- EM (electromagnetics) panel takes over the pane when open. EM is
   // standalone (no doc Study), so it must be handled BEFORE the study-panel
   // block below (which requires a valid sel_).
@@ -5169,7 +5180,8 @@ void SimManager::drawTreeBody(AppState &st) {
   // ---- Single "+ New Study" entry point: opens a picker popup for the study
   // types. The per-type ribbon tabs' "New Study" buttons route to the same
   // newStudy path.
-  if (ImGui::Button("+ New Study", ImVec2(-FLT_MIN, 0)) || shotForcePicker)
+  const ImVec2 newStudySize(ImGui::GetContentRegionAvail().x, 0.0f);
+  if (ImGui::Button("+ New Study", newStudySize) || shotForcePicker)
     ImGui::OpenPopup("##newStudyPicker");
   simTip("Add a simulation study. The offered kinds follow what you have open: "
          "mechanical "
@@ -5430,7 +5442,8 @@ void SimManager::drawTreeBody(AppState &st) {
       }
     if (pcbTab >= 0) {
       ui::fmSectionDivider("Cross-sim handoffs");
-      if (ImGui::Button("Send board to thermal FEA", ImVec2(-FLT_MIN, 0)))
+      const ImVec2 handoffSize(ImGui::GetContentRegionAvail().x, 0.0f);
+      if (ImGui::Button("Send board to thermal FEA", handoffSize))
         openHandoffPanel(st, pcbTab);
       simTip("ECAD -> thermal handoff (aicad.simhandoff/1): fuses the routed "
              "board into "
@@ -7211,11 +7224,7 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
   }
   // Motion results: timeline + trace plot — no colormap, no metric table.
   if (s.type == StudyType::Motion) {
-    float rH = ImGui::GetContentRegionAvail().y - 50.0f * ui::uiScale;
-    ImGui::BeginChild("##motionresults",
-                      ImVec2(0, std::max(rH, 80.0f * ui::uiScale)), false);
     drawMotionResults(st, s);
-    ImGui::EndChild();
     return;
   }
 
@@ -7226,11 +7235,9 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
   const UnitSys u = unitSys(st);
   char b[80];
 
-  // Scroll so a long metric list never clips at the bottom of the narrow pane.
-  // Reserve ~50px for the Run button that drawForm places after the switch.
-  float rH = ImGui::GetContentRegionAvail().y - 50.0f * ui::uiScale;
-  ImGui::BeginChild("##simresults",
-                    ImVec2(0, std::max(rH, 80.0f * ui::uiScale)), false);
+  // drawForm owns the single scrolling body.  Keeping results in that same
+  // child avoids nested height calculations and leaves the pinned Run action
+  // outside the scrolling region.
 
   ImGui::PushFont(st.fonts.medium);
   ImGui::TextUnformatted("Results");
@@ -7433,8 +7440,11 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
         ImGui::Text("Elements: %d", s.nElems);
       if (s.nDof > 0)
         ImGui::Text("Equations (DOF): %d", s.nDof);
-      for (const auto &n : s.solverNotes)
-        ImGui::BulletText("%s", n.c_str());
+      for (const auto &n : s.solverNotes) {
+        ImGui::Bullet();
+        ImGui::SameLine();
+        ImGui::TextWrapped("%s", n.c_str());
+      }
       ImGui::TreePop();
     }
   }
@@ -7497,7 +7507,7 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
     }
   }
 
-  ImGui::EndChild();
+
 }
 
 // ---- Stepwise setup checklist (all structural sub-nodes)
@@ -7754,6 +7764,20 @@ void SimManager::drawForm(AppState &st, Study &s) {
   }
 
   ImGui::Spacing();
+  // Everything above the action belongs to one scrolling region.  The Run
+  // action is drawn after EndChild(), so long forms, study lists and result
+  // warnings can scroll without ever disappearing behind it.
+  const float runButtonHeight = 30.0f * S;
+  const float actionReserve =
+      runButtonHeight + ImGui::GetStyle().ItemSpacing.y * 4.0f +
+      1.0f * S;
+  const float bodyHeight =
+      std::max(ImGui::GetContentRegionAvail().y - actionReserve,
+               ImGui::GetFrameHeight());
+  ImGui::BeginChild("##sim_form_scroll", ImVec2(0.0f, bodyHeight),
+                    ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+  ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+                         ImGui::GetContentRegionAvail().x);
 
   // sim-gui rework: each panel shows ONLY the invoked tool's editor
   // (PropertyManager flow) — the numbered always-open accordion stack
@@ -8036,6 +8060,9 @@ void SimManager::drawForm(AppState &st, Study &s) {
     }
     break;
   }
+  ImGui::PopTextWrapPos();
+  ui::drawWindowPillScrollbarV(simSurf());
+  ImGui::EndChild();
 
   // ---- Gated Run button (always at the bottom, visible on every sub-node)
   // -------- Disabled when a solve is running OR prerequisites are unmet
@@ -8102,8 +8129,8 @@ void SimManager::drawForm(AppState &st, Study &s) {
     const bool canRun = ready && !busy;
     if (!canRun)
       ImGui::BeginDisabled();
-    if (ImGui::Button(busy ? "Running\xe2\x80\xa6" : "Run",
-                      ImVec2(-FLT_MIN, 30.0f * S)))
+    const ImVec2 runSize(ImGui::GetContentRegionAvail().x, runButtonHeight);
+    if (ImGui::Button(busy ? "Running\xe2\x80\xa6" : "Run", runSize))
       run(st, s);
     if (!canRun)
       ImGui::EndDisabled();
@@ -8649,18 +8676,49 @@ bool SimManager::prepareMotionCache(AppState &st, Study &s,
 }
 
 // ---------- buildMotionTrace
-// ----------------------------------------------------------- Validates the
-// trajectory parse; per-body traces are derived on demand in drawMotionResults.
-
+// ----------------------------------------------------------- Pick the body
+// with the largest world-translation span after each solve.  Assemblies list
+// fixed components first, so defaulting to index zero produced a valid but
+// constant trace that ImGui could not visibly auto-scale.
 void SimManager::buildMotionTrace(Study &s) {
   if (s.motionBodyLabels.size() != s.motionBodyIds.size())
     s.motionBodyLabels = s.motionBodyIds;
-  if (s.motionBodyIds.empty())
+  if (s.motionBodyIds.empty()) {
     s.motionPlotBody = 0;
-  else
-    s.motionPlotBody =
-        std::max(0, std::min(s.motionPlotBody,
-                             static_cast<int>(s.motionBodyIds.size()) - 1));
+    return;
+  }
+
+  int bestBody = 0;
+  double bestSpan = -1.0;
+  for (int i = 0; i < static_cast<int>(s.motionBodyIds.size()); ++i) {
+    double minMagnitude = std::numeric_limits<double>::infinity();
+    double maxMagnitude = -std::numeric_limits<double>::infinity();
+    for (const auto &frameJ : s.motionTrajectory) {
+      if (!frameJ.contains("bodies") || !frameJ["bodies"].is_array())
+        continue;
+      for (const auto &bodyJ : frameJ["bodies"]) {
+        if (bodyJ.value("component", std::string()) != s.motionBodyIds[i])
+          continue;
+        const auto &transform = bodyJ["transform"];
+        if (!transform.is_array() || transform.size() < 15)
+          break;
+        const double tx = transform[12].get<double>();
+        const double ty = transform[13].get<double>();
+        const double tz = transform[14].get<double>();
+        const double magnitude = std::sqrt(tx * tx + ty * ty + tz * tz);
+        minMagnitude = std::min(minMagnitude, magnitude);
+        maxMagnitude = std::max(maxMagnitude, magnitude);
+        break;
+      }
+    }
+    const double span =
+        std::isfinite(minMagnitude) ? maxMagnitude - minMagnitude : -1.0;
+    if (span > bestSpan) {
+      bestSpan = span;
+      bestBody = i;
+    }
+  }
+  s.motionPlotBody = bestBody;
 }
 
 // ---------- applyMotionFrame -----------------------------------------------------------
@@ -9146,26 +9204,44 @@ void SimManager::drawMotionResults(AppState &st, Study &s) {
             : std::string();
     std::vector<float> trace;
     trace.reserve(nFrames);
+    bool completeTrace = !plotComponent.empty();
     for (const auto &frameJ : s.motionTrajectory) {
-      float magnitude = 0.0f;
-      for (const auto &bodyJ : frameJ["bodies"]) {
-        if (bodyJ.value("component", std::string()) != plotComponent)
-          continue;
-        const auto &transform = bodyJ["transform"];
-        const double tx = transform[12].get<double>();
-        const double ty = transform[13].get<double>();
-        const double tz = transform[14].get<double>();
-        magnitude = static_cast<float>(
-            std::sqrt(tx * tx + ty * ty + tz * tz));
+      bool found = false;
+      if (frameJ.contains("bodies") && frameJ["bodies"].is_array()) {
+        for (const auto &bodyJ : frameJ["bodies"]) {
+          if (bodyJ.value("component", std::string()) != plotComponent)
+            continue;
+          const auto &transform = bodyJ["transform"];
+          if (!transform.is_array() || transform.size() < 15)
+            break;
+          const double tx = transform[12].get<double>();
+          const double ty = transform[13].get<double>();
+          const double tz = transform[14].get<double>();
+          trace.push_back(static_cast<float>(
+              std::sqrt(tx * tx + ty * ty + tz * tz)));
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        completeTrace = false;
         break;
       }
-      trace.push_back(magnitude);
     }
-    if (!trace.empty()) {
+    if (completeTrace && !trace.empty()) {
+      const auto [minIt, maxIt] =
+          std::minmax_element(trace.begin(), trace.end());
+      float minPlot = *minIt;
+      float maxPlot = *maxIt;
+      if (maxPlot - minPlot < 1e-5f) {
+        const float pad = std::max(std::fabs(maxPlot) * 0.05f, 1.0f);
+        minPlot -= pad;
+        maxPlot += pad;
+      }
       const float plotH = 60.0f * S;
       ImGui::PlotLines("##motiontrace", trace.data(),
                        static_cast<int>(trace.size()), 0, "|pos| (mm)",
-                       FLT_MAX, FLT_MAX, ImVec2(-FLT_MIN, plotH));
+                       minPlot, maxPlot, ImVec2(-FLT_MIN, plotH));
       if (nFrames > 1) {
         ImVec2 rMin = ImGui::GetItemRectMin(), rMax = ImGui::GetItemRectMax();
         float xCur = rMin.x + (rMax.x - rMin.x) *
@@ -9175,6 +9251,9 @@ void SimManager::drawMotionResults(AppState &st, Study &s) {
             ImVec2(xCur, rMin.y), ImVec2(xCur, rMax.y),
             simRoleU32(ui::palette.statusWarn, 0.784f), 1.5f * S);
       }
+    } else {
+      kit::dimText(
+          "Position samples are unavailable for the selected component.");
     }
   }
 

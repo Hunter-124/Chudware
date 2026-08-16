@@ -35,6 +35,14 @@ All values live in one gitignored, mode-600 file:
 `deploy/setup.sh` writes the skeleton. Never commit it, and never put these
 values in a repo file, a systemd unit's `Environment=`, or a command line.
 
+**Quote any value containing shell metacharacters** — `<`, `>`, `|`, `&`, spaces
+with punctuation. systemd's `EnvironmentFile` strips surrounding quotes, but
+`RUNBOOK.md` also sources this file with `set -a; . gateway.env`, where an
+unquoted `CHUDWARE_MAIL_FROM=Chudware <noreply@chudware.com>` is a shell
+redirection: the source aborts on a syntax error and **every variable after that
+line silently goes unset**. Verify with `bash -c 'set -a; . gateway.env'` after
+editing.
+
 ## 1. Session secret — REQUIRED
 
 It signs the single-use OAuth `state` parameter. The gateway **refuses to boot**

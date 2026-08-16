@@ -19,6 +19,7 @@ in dev mode and the whole point is to exercise the real one.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sys
 import time
@@ -1001,3 +1002,55 @@ def test_the_denial_page_escapes_the_email_it_echoes():
     page = auth.status_page_html('<script>alert(1)</script>@x.test', "denied")
     assert "<script>" not in page
     assert "&lt;script&gt;" in page
+
+
+# ---------------------------------------------------------------------------
+# Operator bootstrap CLI (grant-admin)
+# ---------------------------------------------------------------------------
+
+
+def _grant(email: str, password: str, monkeypatch) -> int:
+    monkeypatch.setattr("sys.stdin", io.StringIO(password + "\n"))
+    return authn._cli(["grant-admin", "--email", email, "--password-stdin"])
+
+
+def test_grant_admin_creates_an_active_admin_that_can_sign_in(client, monkeypatch):
+    """The bootstrap has to produce an account that reaches /admin with no
+    mailed verification link — a first admin exists before mail works."""
+    assert _grant("Hunter@Chudware.com", "correct horse battery", monkeypatch) == 0
+
+    account = accounts.get_account("hunter@chudware.com")
+    assert account is not None
+    assert (account.status, account.role) == ("active", "admin")
+    assert accounts.effective_role(account) == "admin"
+
+    response = client.post(
+        "/api/auth/login",
+        json={"email": "hunter@chudware.com", "password": "correct horse battery"},
+    )
+    assert response.status_code == 200
+
+
+def test_grant_admin_is_idempotent_and_resets_the_password(monkeypatch):
+    assert _grant("hunter@chudware.com", "first password here", monkeypatch) == 0
+    assert _grant("hunter@chudware.com", "second password here", monkeypatch) == 0
+
+    stored = authn.get_credential("hunter@chudware.com")
+    assert stored is not None
+    assert authn.verify_password(stored["password_hash"], "second password here")
+    assert not authn.verify_password(stored["password_hash"], "first password here")
+
+
+def test_grant_admin_refuses_a_password_under_the_minimum(monkeypatch):
+    """A weak password must fail before the role is granted, not after."""
+    assert _grant("weak@chudware.com", "x" * (authn.MIN_PASSWORD_CHARS - 1), monkeypatch) == 1
+    assert accounts.get_account("weak@chudware.com") is None
+
+
+def test_grant_admin_refuses_a_malformed_address(monkeypatch):
+    assert _grant("not-an-email", "correct horse battery", monkeypatch) == 1
+
+
+def test_ops_session_still_refuses_an_inactive_account():
+    accounts.ensure_account("pending@chudware.com")
+    assert authn._cli(["ops-session", "--email", "pending@chudware.com"]) == 1

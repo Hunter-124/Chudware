@@ -240,6 +240,27 @@ def set_plan(email: str, plan: str) -> Account | None:
     return _row_to_account(row)
 
 
+def set_role(email: str, role: str) -> Account | None:
+    """Grant or revoke the admin role.
+
+    Deliberately NOT reachable from the HTTP API: role is the one column an
+    authenticated caller must never be able to move, so the only writer is the
+    operator CLI (``python -m authn grant-admin``) running against the store
+    with database credentials. That replaces the hand-written
+    ``UPDATE accounts SET role='admin'`` the cutover had to use because no
+    mechanism existed at all.
+    """
+    email = _normalize_email(email)
+    if role not in ROLES:
+        raise ValueError(f"unknown role: {role}")
+    with tx() as cur:
+        cur.execute(
+            "UPDATE accounts SET role = %s WHERE email = %s RETURNING *", (role, email)
+        )
+        row = cur.fetchone()
+    return _row_to_account(row)
+
+
 def set_stripe_customer(email: str, customer_id: str) -> Account | None:
     email = _normalize_email(email)
     customer_id = (customer_id or "").strip()

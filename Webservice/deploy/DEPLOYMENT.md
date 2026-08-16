@@ -92,10 +92,12 @@ credential, session and email-token tables created by
   with `python3 -c 'import secrets;print(secrets.token_urlsafe(48))'`.
 - Admins approve, deny and suspend from `/admin`
   (`POST /api/admin/accounts/{email}/{approve,deny,suspend}`).
-- **Recovery if locked out:** promote yourself in the database —
-  `UPDATE accounts SET role='admin', status='active' WHERE email='you@example.com';`
-  — then sign in normally. `/admin` also sits behind Cloudflare Access, so that
-  address must be in the Access allow policy too.
+- **First admin / recovery if locked out:** `cd Webservice/gateway && .venv/bin/python
+  -m authn grant-admin --email you@example.com` against `CHUDWARE_DB_URL`, then sign
+  in normally. It creates-or-promotes, sets the password (prompted, never in argv),
+  and marks the address verified without needing working outbound mail. `/admin`
+  also sits behind Cloudflare Access, so that address must be in the Access allow
+  policy too.
 
 ## Safe application updates
 

@@ -488,16 +488,15 @@ Fixed in this pass:
 
 Found, NOT fixed — each is a real gap:
 
-- **No code path can create an admin.** `accounts.py` only ever *reads* `role`;
-  nothing writes it. `users.yaml` — which the runbooks and the
-  `chudware-webservice-multitenant` skill both describe as the allowlist and
-  role source, imported idempotently at startup — is **dead**: no module reads
-  it and `config.py` has no `users_file` setting at all, so
-  `CHUDWARE_WEB_USERS_FILE` in `gateway.env` is dead env. Production had
-  **zero** admins and the owner's `role: admin` line had no effect; it was set
-  with a direct `UPDATE` to unblock the cutover. Either restore an import or
-  give `accounts.py` a `set_role` reachable from the admin API, and delete
-  whichever mechanism loses.
+- ~~**No code path can create an admin.**~~ **FIXED.** `accounts.set_role` now
+  exists and `python -m authn grant-admin --email …` creates-or-promotes an
+  active admin (password from a prompt or stdin, verified without needing
+  outbound mail, idempotent). It is deliberately CLI-only — `role` is the one
+  column an authenticated caller must never move, so there is no admin-API
+  writer. `users.yaml` lost: no module reads it, `config.py` has no
+  `users_file` setting, and `CHUDWARE_WEB_USERS_FILE` in `gateway.env` is dead
+  env — delete that line. The raw `UPDATE accounts SET role='admin'` used to
+  unblock the cutover is no longer the only mechanism.
 - **`CHUDWARE_WEB_SSO_SHARED_SECRET` is dead env too.** The HTTP-Basic-on-
   loopback handoff it belonged to is gone from `auth.py` (no `Basic` handling
   anywhere), and there is no oauth2-proxy unit. The deploy runbook's

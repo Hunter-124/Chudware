@@ -7,6 +7,11 @@ Public portal: `https://app.chudware.com` through the tunnel. The marketing site
 at `https://chudware.com` and `https://www.chudware.com` is Cloudflare Pages.
 Staging ingress is `https://staging.chudware.com`.
 
+Setting up external credentials for the first time (OAuth clients, Stripe, mail,
+session secret, first admin) is a separate walkthrough:
+[`SETUP_CREDENTIALS.md`](SETUP_CREDENTIALS.md). This file covers operating a
+deployment that already has them.
+
 ---
 
 ## (a) SECURITY FIRST — rotate leaked credentials
@@ -225,8 +230,17 @@ GET  /api/auth/oauth/{google|github}/start | /callback
 - **heavy** is a persisted per-account flag surfaced in `/admin` and `/api/me`.
   Nothing enforces it since the streamed-session product was removed; it is kept
   as the hook plan entitlements will use.
-- **Locked out?** `UPDATE accounts SET role='admin', status='active' WHERE email='you@…';`
-  against `CHUDWARE_DB_URL`, then sign in normally.
+- **First admin, or locked out?** Run the operator bootstrap as the service user, in
+  the gateway directory, with `CHUDWARE_DB_URL` set. It registers the address if
+  needed, sets the password, marks it verified, activates it, and grants `admin`:
+  ```bash
+  cd Webservice/gateway && .venv/bin/python -m authn grant-admin --email you@chudware.com
+  ```
+  It prompts twice for the password (or reads one line from stdin with
+  `--password-stdin`); the password never appears in argv. Idempotent — rerun it to
+  reset a forgotten password. `role` has no HTTP writer by design, so this CLI is
+  the only way to grant it. `/admin` also sits behind Cloudflare Access, so that
+  address must be in the Access allow policy too.
 
 ---
 

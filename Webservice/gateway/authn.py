@@ -850,15 +850,24 @@ __all__ = [
 
 def _cli(argv: list[str] | None = None) -> int:
     """``python -m authn ops-session --email you@example.com``
+    ``python -m authn grant-admin --email you@example.com``
 
-    Prints one short-lived session id on stdout. Deploy scripts that must call
-    an authenticated loopback endpoint — install_webd.sh polls /healthz for the
-    active engine-bridge count before it drops users — used to do that with the
-    oauth2-proxy shared secret. That secret is gone, and inventing a second
-    machine credential to replace it would just be the same trusted-string
-    problem under a new name. A real session row is better in every way: it
-    expires on its own, it is revocable, and it is the exact credential path
-    the middleware already verifies.
+    ``ops-session`` prints one short-lived session id on stdout. Deploy scripts
+    that must call an authenticated loopback endpoint — install_webd.sh polls
+    /healthz for the active engine-bridge count before it drops users — used to
+    do that with the oauth2-proxy shared secret. That secret is gone, and
+    inventing a second machine credential to replace it would just be the same
+    trusted-string problem under a new name. A real session row is better in
+    every way: it expires on its own, it is revocable, and it is the exact
+    credential path the middleware already verifies.
+
+    ``grant-admin`` is the operator bootstrap: it registers the address if
+    needed, sets a password read from stdin (never argv, which is world-visible
+    in /proc), marks it verified, activates it, and promotes it to ``admin``.
+    Verification is granted by the operator's database access rather than by a
+    mailed link, so this works on a deployment whose mail backend is still
+    ``console`` — which is exactly the state a first admin is created in. It is
+    idempotent, and it is the only writer of the role column.
     """
     import argparse
 
@@ -867,15 +876,61 @@ def _cli(argv: list[str] | None = None) -> int:
     mint = sub.add_parser("ops-session", help="mint a short-lived session id")
     mint.add_argument("--email", required=True)
     mint.add_argument("--ttl-seconds", type=int, default=900)
+    grant = sub.add_parser("grant-admin", help="create/promote an admin account")
+    grant.add_argument("--email", required=True)
+    grant.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="read the password from stdin instead of prompting",
+    )
     args = parser.parse_args(argv)
 
     email = normalize_email(args.email)
+    if not valid_email(email):
+        print(f"not a usable email address: {email!r}", file=sys.stderr)
+        return 1
+
+    if args.command == "grant-admin":
+        return _cli_grant_admin(email, password_stdin=args.password_stdin)
+
     account = accounts.get_account(email)
     if account is None or not accounts.is_authorized(account):
         print(f"no active account for {email!r}", file=sys.stderr)
         return 1
     ttl = timedelta(seconds=max(1, args.ttl_seconds))
     print(create_session(email, user_agent="chudware-ops-cli", ttl=ttl))
+    return 0
+
+
+def _cli_grant_admin(email: str, *, password_stdin: bool) -> int:
+    import getpass
+
+    if password_stdin:
+        password = sys.stdin.readline().rstrip("\n")
+    else:
+        password = getpass.getpass(f"password for {email}: ")
+        if password != getpass.getpass("confirm: "):
+            print("passwords did not match", file=sys.stderr)
+            return 1
+    if len(password) < MIN_PASSWORD_CHARS:
+        print(
+            f"password must be at least {MIN_PASSWORD_CHARS} characters",
+            file=sys.stderr,
+        )
+        return 1
+
+    accounts.ensure_account(email)
+    # verified=True: the operator's database access is the proof of control
+    # here, standing in for a mailed link the deployment may not be able to
+    # send yet.
+    set_password(email, password, verified=True)
+    mark_verified(email)
+    accounts.set_status(email, "active", decided_by="chudware-ops-cli")
+    account = accounts.set_role(email, "admin")
+    if account is None:
+        print(f"account vanished while promoting {email!r}", file=sys.stderr)
+        return 1
+    print(f"{account.email}: status={account.status} role={account.role}")
     return 0
 
 

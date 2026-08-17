@@ -23,6 +23,17 @@
   document.querySelectorAll("[data-mode-link]").forEach(function (link) { link.classList.toggle("active", link.dataset.modeLink === mode); });
   el("auth-tabs").hidden = mode === "forgot" || mode === "reset";
   el("oauth-block").hidden = mode === "forgot" || mode === "reset";
+  // The OAuth links are plain anchors in the markup: the gateway has no
+  // templating, so the destination the password form already honours has to be
+  // stamped onto them here or a desktop sign-in could only ever finish with a
+  // password. The server re-validates and signs whatever arrives.
+  (function () {
+    var next = safeNext();
+    if (next === "/") return;
+    document.querySelectorAll("#oauth-block a[href^='/api/auth/oauth/']").forEach(function (link) {
+      link.href = link.getAttribute("href").split("?")[0] + "?next=" + encodeURIComponent(next);
+    });
+  }());
 
   el("login-form").addEventListener("submit", async function (event) {
     event.preventDefault(); var button = this.querySelector("button[type=submit]"); button.disabled = true; setStatus("Signing in…", false);

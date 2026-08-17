@@ -850,7 +850,8 @@ __all__ = [
 
 def _cli(argv: list[str] | None = None) -> int:
     """``python -m authn ops-session --email you@example.com``
-    ``python -m authn grant-admin --email you@example.com``
+    ``python -m authn grant-admin --email you@example.com [--oauth-only]``
+    ``python -m authn grant-subscription --email you@example.com``
 
     ``ops-session`` prints one short-lived session id on stdout. Deploy scripts
     that must call an authenticated loopback endpoint — install_webd.sh polls
@@ -864,10 +865,17 @@ def _cli(argv: list[str] | None = None) -> int:
     ``grant-admin`` is the operator bootstrap: it registers the address if
     needed, sets a password read from stdin (never argv, which is world-visible
     in /proc), marks it verified, activates it, and promotes it to ``admin``.
+    With ``--oauth-only`` no password is set at all, because an operator who
+    signs in through Google/GitHub/Microsoft has no password by design and a
+    throwaway one would only be a second, weaker way into the admin account.
     Verification is granted by the operator's database access rather than by a
     mailed link, so this works on a deployment whose mail backend is still
     ``console`` — which is exactly the state a first admin is created in. It is
     idempotent, and it is the only writer of the role column.
+
+    ``grant-subscription`` opens the desktop entitlement window for an account
+    without going through Stripe, which is how an operator or an internal seat
+    gets a working desktop licence.
     """
     import argparse
 
@@ -878,10 +886,28 @@ def _cli(argv: list[str] | None = None) -> int:
     mint.add_argument("--ttl-seconds", type=int, default=900)
     grant = sub.add_parser("grant-admin", help="create/promote an admin account")
     grant.add_argument("--email", required=True)
-    grant.add_argument(
+    credential = grant.add_mutually_exclusive_group()
+    credential.add_argument(
         "--password-stdin",
         action="store_true",
         help="read the password from stdin instead of prompting",
+    )
+    credential.add_argument(
+        "--oauth-only",
+        action="store_true",
+        help="set no password; the admin signs in through an OAuth provider",
+    )
+    grant_sub = sub.add_parser(
+        "grant-subscription",
+        help="give an account an effectively unlimited subscription",
+    )
+    grant_sub.add_argument("--email", required=True)
+    grant_sub.add_argument("--plan", default="enterprise")
+    grant_sub.add_argument(
+        "--years",
+        type=int,
+        default=100,
+        help="entitlement horizon in years (default 100)",
     )
     args = parser.parse_args(argv)
 
@@ -891,7 +917,12 @@ def _cli(argv: list[str] | None = None) -> int:
         return 1
 
     if args.command == "grant-admin":
-        return _cli_grant_admin(email, password_stdin=args.password_stdin)
+        return _cli_grant_admin(
+            email, password_stdin=args.password_stdin, oauth_only=args.oauth_only
+        )
+
+    if args.command == "grant-subscription":
+        return _cli_grant_subscription(email, plan=args.plan, years=args.years)
 
     account = accounts.get_account(email)
     if account is None or not accounts.is_authorized(account):
@@ -902,28 +933,31 @@ def _cli(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _cli_grant_admin(email: str, *, password_stdin: bool) -> int:
+def _cli_grant_admin(email: str, *, password_stdin: bool, oauth_only: bool) -> int:
     import getpass
 
-    if password_stdin:
-        password = sys.stdin.readline().rstrip("\n")
-    else:
-        password = getpass.getpass(f"password for {email}: ")
-        if password != getpass.getpass("confirm: "):
-            print("passwords did not match", file=sys.stderr)
+    password = ""
+    if not oauth_only:
+        if password_stdin:
+            password = sys.stdin.readline().rstrip("\n")
+        else:
+            password = getpass.getpass(f"password for {email}: ")
+            if password != getpass.getpass("confirm: "):
+                print("passwords did not match", file=sys.stderr)
+                return 1
+        if len(password) < MIN_PASSWORD_CHARS:
+            print(
+                f"password must be at least {MIN_PASSWORD_CHARS} characters",
+                file=sys.stderr,
+            )
             return 1
-    if len(password) < MIN_PASSWORD_CHARS:
-        print(
-            f"password must be at least {MIN_PASSWORD_CHARS} characters",
-            file=sys.stderr,
-        )
-        return 1
 
     accounts.ensure_account(email)
     # verified=True: the operator's database access is the proof of control
     # here, standing in for a mailed link the deployment may not be able to
     # send yet.
-    set_password(email, password, verified=True)
+    if not oauth_only:
+        set_password(email, password, verified=True)
     mark_verified(email)
     accounts.set_status(email, "active", decided_by="chudware-ops-cli")
     account = accounts.set_role(email, "admin")
@@ -931,6 +965,64 @@ def _cli_grant_admin(email: str, *, password_stdin: bool) -> int:
         print(f"account vanished while promoting {email!r}", file=sys.stderr)
         return 1
     print(f"{account.email}: status={account.status} role={account.role}")
+    return 0
+
+
+def _cli_grant_subscription(email: str, *, plan: str, years: int) -> int:
+    """Open the desktop entitlement window for ``email`` without Stripe.
+
+    There is no "unlimited" sentinel to write, and adding one would mean a new
+    branch in every entitlement reader. ``entitlement._entitlement_window``
+    requires ``paid_through > now`` and ``subscribed_since > 0`` for any paid
+    plan, so "unlimited" is representable only as a far-future ``paid_through``;
+    a century is past the life of any signing key or schema this would outlive.
+    ``accounts.set_subscription`` only ever advances ``paid_through``, so
+    re-running this is idempotent and can never shorten an entitlement. The
+    account must also be active for the window to open, which is why the status
+    is asserted here rather than assumed.
+    """
+    try:
+        from . import plans
+    except ImportError:  # uvicorn app:app from the package dir
+        import plans  # type: ignore
+
+    if plan not in plans.PLANS:
+        known = ", ".join(sorted(plans.PLANS))
+        print(f"unknown plan {plan!r}; known plans: {known}", file=sys.stderr)
+        return 1
+    if years < 1:
+        print("--years must be at least 1", file=sys.stderr)
+        return 1
+    if accounts.get_account(email) is None:
+        print(
+            f"no account for {email!r}; run grant-admin or register first",
+            file=sys.stderr,
+        )
+        return 1
+
+    now = int(time.time())
+    paid_through = now + years * 365 * 86_400
+    accounts.set_plan(email, plan)
+    accounts.set_status(email, "active", decided_by="chudware-ops-cli")
+    account = accounts.set_subscription(
+        email,
+        subscription_id="",
+        subscription_status="active",
+        price_id="",
+        subscribed_since=now,
+        paid_through=paid_through,
+        is_edu=False,
+    )
+    if account is None:
+        print(f"account vanished while granting {email!r}", file=sys.stderr)
+        return 1
+    through = datetime.fromtimestamp(
+        int(account.paid_through or 0), tz=timezone.utc
+    ).isoformat()
+    print(
+        f"{account.email}: plan={account.plan} "
+        f"subscription_status={account.subscription_status} paid_through={through}"
+    )
     return 0
 
 

@@ -19,19 +19,23 @@ CSRF on the callback is the ``state`` parameter: a random nonce, HMAC-signed
 with the session secret and bound to the provider, stored as a SHA-256 in
 ``email_tokens`` so redeeming it is atomically single-use, and paired with a
 short-lived browser cookie so a stolen state cannot swap another browser's
-session.
+session. The post-sign-in destination travels the same way: it is covered by
+the state signature and carried beside the verifier in that one cookie, so a
+desktop sign-in can be resumed at ``/desktop/authorize`` without the redirect
+target ever being attacker-controlled.
 """
 
 from __future__ import annotations
 
 import hmac
 import logging
+import re
 import secrets
 from html import escape
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, unquote, urlencode
 
 import httpx
 from fastapi import APIRouter, Request
@@ -168,42 +172,84 @@ def _redirect_uri(provider: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _sign_state(provider: str, nonce: str, verifier: str) -> str:
-    """Bind the provider state to the verifier held only by its browser."""
+# A destination is only ever a path on this origin. Anything else — an absolute
+# URL, a scheme-relative "//host", a backslash that some browsers fold into a
+# separator, a control character smuggled into a header — collapses to "/".
+# These are the same rules ``safeNext()`` applies in static/login*.js, so the
+# link the browser builds and the link the server honours cannot disagree.
+_UNSAFE_NEXT_RE = re.compile(r"[\x00-\x1f\x7f\\]")
+DEFAULT_NEXT = "/"
+
+
+def _safe_next(value: str) -> str:
+    """``value`` if it is a same-origin local path, else ``"/"``."""
+    candidate = value or DEFAULT_NEXT
+    if not candidate.startswith("/") or candidate.startswith("//"):
+        return DEFAULT_NEXT
+    if _UNSAFE_NEXT_RE.search(candidate):
+        return DEFAULT_NEXT
+    return candidate
+
+
+def _sign_state(provider: str, nonce: str, verifier: str, next_path: str) -> str:
+    """Bind the provider state to the verifier held only by its browser, and to
+    the destination that state is allowed to land on."""
     return hmac.new(
         settings.session_secret.encode("utf-8"),
-        f"{provider}:{nonce}:{verifier}".encode("utf-8"),
+        f"{provider}:{nonce}:{verifier}:{next_path}".encode("utf-8"),
         sha256,
     ).hexdigest()
 
 
-def mint_state(provider: str) -> tuple[str, str]:
+def mint_state(provider: str, next_path: str = DEFAULT_NEXT) -> tuple[str, str]:
     nonce = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(32)
-    state = f"{nonce}.{_sign_state(provider, nonce, verifier)}"
+    state = f"{nonce}.{_sign_state(provider, nonce, verifier, next_path)}"
     # store_token, not mint_token: the value is ours, signature and all.
     authn.store_token(state, "", authn.PURPOSE_OAUTH_STATE, authn.OAUTH_STATE_TTL)
     return state, verifier
 
 
-def check_state(provider: str, state: str, verifier: str) -> bool:
+def check_state(
+    provider: str, state: str, verifier: str, next_path: str = DEFAULT_NEXT
+) -> bool:
     """Require its browser verifier, then atomically redeem the signed state."""
     nonce, separator, signature = (state or "").partition(".")
     if not nonce or not separator or not signature or not verifier:
         return False
-    if not hmac.compare_digest(signature, _sign_state(provider, nonce, verifier)):
+    if not hmac.compare_digest(
+        signature, _sign_state(provider, nonce, verifier, next_path)
+    ):
         return False
     # consume_token returns the (empty) email it was minted against, so success
     # is "not None" rather than truthiness.
     return authn.consume_token(state, authn.PURPOSE_OAUTH_STATE) is not None
 
 
-def _attach_transaction_cookie(response: Response, request: Request, verifier: str) -> None:
+def _transaction_value(verifier: str, next_path: str) -> str:
+    """One cookie, one value: the verifier, then the percent-encoded
+    destination. The verifier is ``token_urlsafe`` and the encoding leaves no
+    dot in the destination, so the first dot is an unambiguous separator."""
+    return f"{verifier}.{quote(next_path, safe='')}"
+
+
+def _split_transaction(raw: str) -> tuple[str, str]:
+    """(verifier, destination) from a transaction cookie. A malformed value
+    yields an empty verifier, which no state can be checked against."""
+    verifier, separator, encoded = (raw or "").partition(".")
+    if not verifier or not separator:
+        return "", DEFAULT_NEXT
+    return verifier, _safe_next(unquote(encoded))
+
+
+def _attach_transaction_cookie(
+    response: Response, request: Request, verifier: str, next_path: str
+) -> None:
     response.headers.append(
         "set-cookie",
         authn._cookie(
             OAUTH_TRANSACTION_COOKIE,
-            verifier,
+            _transaction_value(verifier, next_path),
             max_age=OAUTH_TRANSACTION_MAX_AGE,
             secure=authn._cookie_secure(request),
         ),
@@ -465,13 +511,14 @@ def _error_page(message: str) -> Response:
 
 
 @router.get("/api/auth/oauth/{provider}/start", response_model=None)
-async def oauth_start(provider: str, request: Request) -> Response:
+async def oauth_start(provider: str, request: Request, next: str = "") -> Response:
     login_by_ip.enforce(authn.client_ip(request), "authentication attempts")
     try:
         entry = _provider_or_error(provider)
     except OAuthError as exc:
         return _error_page(exc.message)
-    state, verifier = mint_state(entry.name)
+    next_path = _safe_next(next)
+    state, verifier = mint_state(entry.name, next_path)
     query = urlencode(
         {
             "client_id": _credentials(entry.name)[0],
@@ -492,7 +539,7 @@ async def oauth_start(provider: str, request: Request) -> Response:
     response = RedirectResponse(
         f"{_endpoint(entry.authorize_url)}?{query}", status_code=302
     )
-    _attach_transaction_cookie(response, request, verifier)
+    _attach_transaction_cookie(response, request, verifier, next_path)
     return response
 
 
@@ -501,14 +548,16 @@ async def oauth_callback(
     provider: str, request: Request, code: str = "", state: str = "", error: str = ""
 ) -> Response:
     login_by_ip.enforce(authn.client_ip(request), "authentication attempts")
-    verifier = request.cookies.get(OAUTH_TRANSACTION_COOKIE, "")
+    verifier, next_path = _split_transaction(
+        request.cookies.get(OAUTH_TRANSACTION_COOKIE, "")
+    )
     try:
         entry = _provider_or_error(provider)
         if error:
             raise OAuthError(f"{entry.label} reported: {error}")
         if not code:
             raise OAuthError("that sign-in response carried no authorization code")
-        if not check_state(entry.name, state, verifier):
+        if not check_state(entry.name, state, verifier, next_path):
             raise OAuthError("that sign-in link expired or was already used")
         subject, email = await resolve_identity(entry, code)
     except OAuthError as exc:
@@ -522,13 +571,14 @@ async def oauth_callback(
     # pending account onto the trial, exactly as clicking a verify link would.
     sid = authn.complete_verification(request, account_email)
     log.info("oauth: %s sign-in for %s", entry.name, account_email)
-    response = RedirectResponse("/", status_code=303)
+    response = RedirectResponse(next_path, status_code=303)
     authn.attach_session_cookie(response, request, sid)
     _clear_transaction_cookie(response, request)
     return response
 
 
 __all__ = [
+    "DEFAULT_NEXT",
     "GOOGLE_ISSUERS",
     "GOOGLE_JWKS_URL",
     "MICROSOFT_AUTHORITY",

@@ -1,0 +1,207 @@
+"""The desktop app's sign-in, end to end, driven by a provider identity.
+
+The unit tests around ``oauth.mint_state`` prove the destination survives one
+start/callback pair. This file proves the thing the user actually does: the
+native app opens the system browser at ``/desktop/authorize``, is bounced to
+``/signin``, clicks *Google* instead of typing a password, and the loopback
+listener the app is holding open receives the signed entitlement. Every link in
+that chain lives in a different module (auth middleware, oauth, entitlement), so
+only a composed test can catch a break in the seams between them.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from urllib.parse import parse_qs, quote, urlparse
+
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+import accounts  # noqa: E402
+import auth  # noqa: E402
+import authn  # noqa: E402
+import entitlement  # noqa: E402
+import oauth  # noqa: E402
+from config import settings  # noqa: E402
+
+CLIENT = ("203.0.113.77", 51000)
+EMAIL = "social@example.com"
+PORT = 49152
+DEVICE = "hunter-desktop"
+STATE = "s" * 43
+
+
+async def _identity(_provider, _code):
+    return "provider-subject", EMAIL
+
+
+@pytest.fixture()
+def signing_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Ed25519PrivateKey:
+    key = Ed25519PrivateKey.generate()
+    path = tmp_path / "entitlement.key"
+    path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+    )
+    path.chmod(0o600)
+    monkeypatch.setenv("CHUDWARE_ENTITLEMENT_KEY_PATH", str(path))
+    public = key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    monkeypatch.setattr(entitlement, "EMBEDDED_PUBLIC_KEY", public)
+    return key
+
+
+@pytest.fixture()
+def client(pg, signing_key, monkeypatch):
+    """The real auth middleware over the real oauth and entitlement routers."""
+    monkeypatch.setattr(settings, "dev_mode", False)
+    monkeypatch.setattr(settings, "session_secret", "test-session-secret")
+    monkeypatch.setattr(settings, "public_base_url", "https://chudware.test")
+    monkeypatch.setattr(settings, "google_client_id", "client-id")
+    monkeypatch.setattr(settings, "google_client_secret", "client-secret")
+    monkeypatch.setattr(oauth, "resolve_identity", _identity)
+    app = FastAPI()
+    app.include_router(oauth.router)
+    app.include_router(entitlement.router)
+    app.add_middleware(auth.AuthMiddleware)
+    with TestClient(app, client=CLIENT, base_url="https://testserver") as c:
+        yield c
+
+
+def _device_public_key() -> str:
+    key = Ed25519PrivateKey.generate()
+    return entitlement._b64(
+        key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+    )
+
+
+def _authorize_path(device_public_key: str) -> str:
+    return (
+        f"/desktop/authorize?port={PORT}&state={STATE}&device={DEVICE}"
+        f"&device_public_key={quote(device_public_key, safe='')}"
+    )
+
+
+def _entitle(email: str) -> None:
+    """An account whose desktop window is open, as `grant-subscription` leaves it."""
+    now = time.time()
+    accounts.set_status(email, "active", decided_by="test")
+    accounts.set_plan(email, "enterprise")
+    accounts.set_subscription(
+        email,
+        subscription_status="active",
+        subscribed_since=now - 86400,
+        paid_through=now + 3650 * 86400,
+        is_edu=False,
+    )
+
+
+def test_desktop_signin_completes_through_google(client):
+    device_public_key = _device_public_key()
+    authorize = _authorize_path(device_public_key)
+
+    # 1. The app opens the browser at /desktop/authorize with no session.
+    bounced = client.get(
+        authorize, headers={"accept": "text/html"}, follow_redirects=False
+    )
+    assert bounced.status_code == 303
+    signin = bounced.headers["location"]
+    assert signin == "/signin?next=" + quote(authorize, safe="")
+    next_path = parse_qs(urlparse(signin).query)["next"][0]
+
+    # 2. The user clicks Google. login*.js stamps that next onto the anchor.
+    start = client.get(
+        f"/api/auth/oauth/google/start?next={quote(next_path, safe='')}",
+        follow_redirects=False,
+    )
+    assert start.status_code == 302
+    assert start.headers["location"].startswith("https://accounts.google.com/")
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+
+    # 3. Google redirects back. The session lands on the desktop handshake,
+    #    not on the marketing page.
+    callback = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == authorize
+
+    # 4. The account now needs an open desktop window to be handed a token.
+    _entitle(EMAIL)
+    consent = client.get(authorize, follow_redirects=False)
+    assert consent.status_code == 200
+    assert "Authorize Chudware" in consent.text
+
+    # 5. Confirming hands the token to the loopback listener the app is holding.
+    confirmed = client.post(
+        "/desktop/authorize",
+        data={
+            "port": str(PORT),
+            "state": STATE,
+            "device": DEVICE,
+            "device_public_key": device_public_key,
+        },
+        follow_redirects=False,
+    )
+    assert confirmed.status_code == 303
+    loopback = urlparse(confirmed.headers["location"])
+    assert (loopback.scheme, loopback.hostname, loopback.port) == (
+        "http",
+        "127.0.0.1",
+        PORT,
+    )
+    assert loopback.path == "/callback"
+    query = parse_qs(loopback.query)
+    assert query["state"] == [STATE]
+    payload = entitlement.verify_compact(query["token"][0])
+    assert payload["email"] == EMAIL
+    assert payload["plan"] == "enterprise"
+    assert payload["paid_through"] > time.time() + 3000 * 86400
+
+
+def test_oauth_cannot_be_redirected_off_origin(client):
+    """A hostile ``next`` cannot turn the sign-in link into an open redirect."""
+    start = client.get(
+        "/api/auth/oauth/google/start?next=https%3A%2F%2Fevil.test%2Fsteal",
+        follow_redirects=False,
+    )
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/"
+
+
+def test_desktop_signin_refuses_an_account_without_a_desktop_window(client):
+    """Signing in through Google is not itself an entitlement."""
+    device_public_key = _device_public_key()
+    authorize = _authorize_path(device_public_key)
+    start = client.get(
+        f"/api/auth/oauth/google/start?next={quote(authorize, safe='')}",
+        follow_redirects=False,
+    )
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    accounts.set_status(EMAIL, "active", decided_by="test")
+    accounts.set_plan(EMAIL, "desktop")  # paid plan, never paid for
+
+    refused = client.get(authorize, follow_redirects=False)
+    assert refused.status_code == 403
+    assert "not active" in refused.text
+    assert authn.oauth_providers_for(EMAIL) == ["google"]

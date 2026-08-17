@@ -24,7 +24,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import jwt
 import pytest
@@ -663,7 +663,9 @@ def test_matching_oauth_cookie_succeeds_once_and_is_cleared(client, monkeypatch)
     monkeypatch.setattr(settings, "google_client_secret", "client-secret")
     monkeypatch.setattr(oauth, "resolve_identity", _identity)
     state, verifier = oauth.mint_state("google")
-    client.cookies.set(oauth.OAUTH_TRANSACTION_COOKIE, verifier)
+    client.cookies.set(
+        oauth.OAUTH_TRANSACTION_COOKIE, oauth._transaction_value(verifier, "/")
+    )
 
     response = client.get(
         f"/api/auth/oauth/google/callback?code=abc&state={state}",
@@ -677,7 +679,9 @@ def test_matching_oauth_cookie_succeeds_once_and_is_cleared(client, monkeypatch)
         for cookie in cookies
     )
 
-    client.cookies.set(oauth.OAUTH_TRANSACTION_COOKIE, verifier)
+    client.cookies.set(
+        oauth.OAUTH_TRANSACTION_COOKIE, oauth._transaction_value(verifier, "/")
+    )
     replay = client.get(
         f"/api/auth/oauth/google/callback?code=abc&state={state}",
         follow_redirects=False,
@@ -770,9 +774,129 @@ def test_a_configured_provider_binds_state_to_a_short_lived_browser_cookie(clien
     assert f"Max-Age={oauth.OAUTH_TRANSACTION_MAX_AGE}" in cookie
 
     state = query["state"][0]
-    verifier = client.cookies.get(oauth.OAUTH_TRANSACTION_COOKIE)
-    assert oauth.check_state("google", state, verifier) is True
-    assert oauth.check_state("google", state, verifier) is False
+    verifier, next_path = oauth._split_transaction(
+        client.cookies.get(oauth.OAUTH_TRANSACTION_COOKIE)
+    )
+    assert next_path == "/", "an absent next must not become a destination"
+    assert oauth.check_state("google", state, verifier, next_path) is True
+    assert oauth.check_state("google", state, verifier, next_path) is False
+
+
+# The shape the desktop app sends: it parks a loopback listener and needs the
+# browser to land back on /desktop/authorize with every one of these intact.
+DESKTOP_NEXT = (
+    "/desktop/authorize?port=49152&state=" + "d" * 40 + "&device=x&device_public_key=y"
+)
+
+
+def _google(monkeypatch):
+    monkeypatch.setattr(settings, "google_client_id", "client-id")
+    monkeypatch.setattr(settings, "google_client_secret", "client-secret")
+    monkeypatch.setattr(oauth, "resolve_identity", _identity)
+
+
+def _start(client, next_value: str) -> str:
+    """Drive /start with a raw ``next`` and return the minted state."""
+    response = client.get(
+        f"/api/auth/oauth/google/start?next={quote(next_value, safe='')}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    return parse_qs(urlparse(response.headers["location"]).query)["state"][0]
+
+
+def test_a_desktop_next_survives_start_and_is_the_callback_destination(
+    client, monkeypatch
+):
+    _google(monkeypatch)
+    state = _start(client, DESKTOP_NEXT)
+
+    response = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == DESKTOP_NEXT
+    assert any(
+        cookie.startswith(f"{authn.SESSION_COOKIE}=")
+        for cookie in response.headers.get_list("set-cookie")
+    )
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "https://evil.example/steal",
+        "//evil.example/steal",
+        "/\\evil.example/steal",
+        "/desktop/authorize\\?port=1",
+        "/desktop\r\nSet-Cookie: x=1",
+        "desktop/authorize",
+    ],
+)
+def test_an_offsite_next_collapses_to_the_portal_root(client, monkeypatch, hostile):
+    _google(monkeypatch)
+    state = _start(client, hostile)
+
+    response = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+
+
+def test_swapping_the_cookies_next_invalidates_the_state(client, monkeypatch):
+    _google(monkeypatch)
+    state = _start(client, DESKTOP_NEXT)
+    verifier, _ = oauth._split_transaction(
+        client.cookies.get(oauth.OAUTH_TRANSACTION_COOKIE)
+    )
+    client.cookies.set(
+        oauth.OAUTH_TRANSACTION_COOKIE,
+        oauth._transaction_value(verifier, "/admin"),
+    )
+
+    response = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    assert "expired or was already used" in response.text
+
+
+def test_a_malformed_transaction_cookie_is_not_a_verifier(client, monkeypatch):
+    _google(monkeypatch)
+    state = _start(client, DESKTOP_NEXT)
+    verifier, _ = oauth._split_transaction(
+        client.cookies.get(oauth.OAUTH_TRANSACTION_COOKIE)
+    )
+    # The old, unstructured value: a bare verifier with no destination beside it.
+    client.cookies.set(oauth.OAUTH_TRANSACTION_COOKIE, verifier)
+
+    response = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+
+
+def test_a_desktop_state_is_still_single_use(client, monkeypatch):
+    _google(monkeypatch)
+    state = _start(client, DESKTOP_NEXT)
+    cookie = client.cookies.get(oauth.OAUTH_TRANSACTION_COOKIE)
+
+    first = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    assert first.status_code == 303
+    client.cookies.set(oauth.OAUTH_TRANSACTION_COOKIE, cookie)
+    replay = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}",
+        follow_redirects=False,
+    )
+    assert replay.status_code == 400
 
 
 # ---------------------------------------------------------------------------
@@ -867,8 +991,10 @@ def test_configured_microsoft_redirects_to_its_tenant_with_a_state(client, monke
     ]
     assert query["response_type"] == ["code"]
     assert query["prompt"] == ["select_account"]
-    verifier = client.cookies.get(oauth.OAUTH_TRANSACTION_COOKIE)
-    assert oauth.check_state("microsoft", query["state"][0], verifier) is True
+    verifier, next_path = oauth._split_transaction(
+        client.cookies.get(oauth.OAUTH_TRANSACTION_COOKIE)
+    )
+    assert oauth.check_state("microsoft", query["state"][0], verifier, next_path) is True
 
 
 @pytest.mark.parametrize("edov", [True, "true", "1"])
@@ -1054,3 +1180,78 @@ def test_grant_admin_refuses_a_malformed_address(monkeypatch):
 def test_ops_session_still_refuses_an_inactive_account():
     accounts.ensure_account("pending@chudware.com")
     assert authn._cli(["ops-session", "--email", "pending@chudware.com"]) == 1
+
+
+def test_grant_admin_oauth_only_creates_an_admin_with_no_password(monkeypatch):
+    """An OAuth operator must get the role without a password row existing —
+    a throwaway password would be a second, weaker way into /admin."""
+
+    def _no_prompt(*_a, **_k):
+        raise AssertionError("--oauth-only must not prompt for a password")
+
+    monkeypatch.setattr("getpass.getpass", _no_prompt)
+    assert authn._cli(["grant-admin", "--email", "sso@chudware.com", "--oauth-only"]) == 0
+    account = accounts.get_account("sso@chudware.com")
+    assert (account.status, account.role) == ("active", "admin")
+    assert authn.get_credential("sso@chudware.com") is None
+
+
+def test_grant_admin_refuses_oauth_only_together_with_a_password(monkeypatch):
+    monkeypatch.setattr("sys.stdin", io.StringIO("correct horse battery\n"))
+    with pytest.raises(SystemExit) as caught:
+        authn._cli(
+            [
+                "grant-admin",
+                "--email",
+                "both@chudware.com",
+                "--oauth-only",
+                "--password-stdin",
+            ]
+        )
+    assert caught.value.code != 0
+    assert accounts.get_account("both@chudware.com") is None
+
+
+def test_grant_subscription_opens_a_far_future_entitlement_window():
+    """There is no infinity sentinel: _entitlement_window only accepts
+    paid_through > now with subscribed_since > 0, so the grant has to land as a
+    real far-future epoch on an active account."""
+    import entitlement
+
+    accounts.ensure_account("seat@chudware.com")
+    assert authn._cli(["grant-subscription", "--email", "seat@chudware.com"]) == 0
+    account = accounts.get_account("seat@chudware.com")
+    assert account.plan == "enterprise"
+    assert account.subscription_status == "active"
+    now = int(time.time())
+    window = entitlement._entitlement_window(account, now)
+    assert window is not None
+    paid_through, subscribed_since = window
+    assert subscribed_since > 0
+    # At least 99 years out; the CLI grants 100 by default.
+    assert paid_through - now > 99 * 365 * 86_400
+
+
+def test_grant_subscription_is_idempotent_and_never_shortens_the_window():
+    accounts.ensure_account("repeat@chudware.com")
+    assert authn._cli(["grant-subscription", "--email", "repeat@chudware.com"]) == 0
+    first = accounts.get_account("repeat@chudware.com").paid_through
+    assert (
+        authn._cli(
+            ["grant-subscription", "--email", "repeat@chudware.com", "--years", "1"]
+        )
+        == 0
+    )
+    assert accounts.get_account("repeat@chudware.com").paid_through == first
+
+
+def test_grant_subscription_refuses_an_unknown_account_and_an_unknown_plan():
+    assert authn._cli(["grant-subscription", "--email", "ghost@chudware.com"]) == 1
+    accounts.ensure_account("known@chudware.com")
+    assert (
+        authn._cli(
+            ["grant-subscription", "--email", "known@chudware.com", "--plan", "moon"]
+        )
+        == 1
+    )
+    assert accounts.get_account("known@chudware.com").plan != "moon"

@@ -8,6 +8,7 @@ no algorithm field, parser registry, or negotiation surface.
 from __future__ import annotations
 
 import base64
+import datetime
 import html
 import json
 import os
@@ -36,13 +37,13 @@ try:
     from .auth import get_current_user
     from .db import tx
     from .limits import RateLimiter
-    from .plans import limits_for
+    from .plans import PLANS, limits_for
 except ImportError:  # uvicorn app:app from package dir
     import accounts  # type: ignore
     from auth import get_current_user  # type: ignore
     from db import tx  # type: ignore
     from limits import RateLimiter  # type: ignore
-    from plans import limits_for  # type: ignore
+    from plans import PLANS, limits_for  # type: ignore
 
 router = APIRouter(tags=["entitlement"])
 
@@ -444,6 +445,51 @@ def _validate_authorize_params(port: Any, state_value: str, device: str) -> int:
     return parsed_port
 
 
+# The sign-in page the user just came from is the design language; this page is
+# the last step of that same flow, so it links the same content-hashed
+# stylesheet instead of carrying a second look. Only the summary rows are
+# page-specific, and they are the whole point of a consent screen: name the
+# device, the account, the tier, and where the credential is about to go.
+_AUTH_CSS = "/auth-assets/login.dc48293a5489.css"
+_PAGE_CSS = """
+    .authz{max-width:33rem;margin:0 auto;padding:clamp(32px,6vw,72px) 22px}
+    .authz .mark{width:58px;height:58px;color:var(--teal);
+      filter:drop-shadow(0 0 18px rgba(66,236,206,.28))}
+    .authz h1{margin:26px 0 12px;font-size:clamp(1.7rem,4vw,2.3rem);
+      line-height:1.1;letter-spacing:-.045em}
+    .authz h1 .device{color:var(--teal)}
+    .authz .lede{margin:0;color:var(--muted);font-size:.9rem;line-height:1.65}
+    .facts{display:grid;gap:1px;margin:30px 0 26px;border:1px solid var(--edge);
+      border-radius:11px;background:var(--edge);overflow:hidden}
+    .facts div{display:flex;align-items:baseline;justify-content:space-between;
+      gap:16px;padding:13px 16px;background:#0b1118}
+    .facts dt{color:var(--muted);font:650 .68rem ui-monospace,monospace;
+      letter-spacing:.11em;text-transform:uppercase}
+    .facts dd{margin:0;font-size:.86rem;font-weight:650;text-align:right;
+      word-break:break-word}
+    .authz form{display:grid;gap:14px}
+    .authz .legal{margin:22px 0 0}
+"""
+
+
+def _authorize_shell(title: str, body: str, status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        '<meta name=viewport content="width=device-width,initial-scale=1">'
+        f"<title>{html.escape(title)} · Chudware</title>"
+        f'<link rel=stylesheet href="{_AUTH_CSS}">'
+        f"<style>{_PAGE_CSS}</style></head><body><main class=authz>"
+        '<svg class=mark viewBox="0 0 64 64" aria-hidden=true>'
+        '<g fill=none stroke=currentColor stroke-width=2.4>'
+        '<rect x=6 y=16 width=42 height=42/><rect x=16 y=6 width=42 height=42/>'
+        '<rect x=21 y=25 width=18 height=18/><rect x=25 y=21 width=18 height=18/>'
+        '<path d="M6 16L16 6M48 16L58 6M48 58L58 48M6 58L16 48M21 25L25 21'
+        'M39 25L43 21M39 43L43 39M21 43L25 39"/></g></svg>'
+        f"{body}</main></body></html>",
+        status_code=status_code,
+    )
+
+
 @router.get("/desktop/authorize", response_class=HTMLResponse)
 async def desktop_authorize_page(
     request: Request, port: int, state: str, device: str, device_public_key: str
@@ -452,23 +498,54 @@ async def desktop_authorize_page(
     _validate_authorize_params(port, state, device)
     _device_public_key(device_public_key)
     account = accounts.get_account(user.email)
-    if _entitlement_window(account, int(time.time())) is None:
-        return HTMLResponse(
+    window = _entitlement_window(account, int(time.time()))
+    if window is None:
+        return _authorize_shell(
+            "Desktop access is not active",
+            '<p class=eyebrow>Desktop authorization</p>'
             "<h1>Desktop access is not active</h1>"
-            '<p><a href="/#pricing">Manage subscription</a></p>',
+            "<p class=lede>This account has no current desktop entitlement, so"
+            " there is nothing to hand the app yet. Pick up a plan and the"
+            f" device <strong>{html.escape(device)}</strong> can be authorized"
+            " straight away.</p>"
+            '<dl class=facts><div><dt>Account</dt>'
+            f"<dd>{html.escape(user.email)}</dd></div></dl>"
+            '<a class=primary href="/#pricing">Manage subscription</a>',
             status_code=403,
         )
     escaped_device = html.escape(device)
-    return HTMLResponse(
-        "<!doctype html><html><head><meta charset=utf-8><title>Authorize Chudware</title></head>"
-        f"<body><main><h1>Authorize Chudware on <strong>{escaped_device}</strong>?</h1>"
-        "<p>The desktop app will receive an offline entitlement for this account.</p>"
+    plan = str(getattr(account, "plan", ""))
+    plan_label = PLANS[plan].display_name if plan in PLANS else plan
+    # The token expires with the subscription; grace_days in _issue keeps the app
+    # working offline past that, and saying so here is why the user can trust it.
+    entitled_through = datetime.datetime.fromtimestamp(
+        window[0], datetime.timezone.utc
+    )
+    through = f"{entitled_through:%B} {entitled_through.day}, {entitled_through:%Y}"
+    return _authorize_shell(
+        "Authorize Chudware",
+        '<p class=eyebrow>Desktop authorization</p>'
+        f'<h1>Authorize Chudware on <span class=device>{escaped_device}</span>?</h1>'
+        "<p class=lede>The app will receive a signed offline entitlement for this"
+        " account. It is delivered only to the app waiting on this computer, and"
+        " you can revoke the device at any time from your account portal.</p>"
+        "<dl class=facts>"
+        f"<div><dt>Account</dt><dd>{html.escape(user.email)}</dd></div>"
+        f"<div><dt>Plan</dt><dd>{html.escape(plan_label)}</dd></div>"
+        f"<div><dt>Entitled through</dt><dd>{through}</dd></div>"
+        f"<div><dt>Device</dt><dd>{escaped_device}</dd></div>"
+        f"<div><dt>Delivered to</dt><dd>127.0.0.1:{port}</dd></div>"
+        "</dl>"
         '<form method="post" action="/desktop/authorize">'
         f'<input type="hidden" name="port" value="{port}">'
         f'<input type="hidden" name="state" value="{html.escape(state)}">'
         f'<input type="hidden" name="device" value="{escaped_device}">'
         f'<input type="hidden" name="device_public_key" value="{html.escape(device_public_key)}">'
-        '<button type="submit">Authorize Chudware</button></form></main></body></html>'
+        '<button class=primary type=submit>Authorize Chudware</button>'
+        '<a class=text-button href="/">Cancel and return to my account</a>'
+        "</form>"
+        "<p class=legal>Not expecting this? Close this tab — nothing is issued"
+        " until you authorize.</p>",
     )
 
 

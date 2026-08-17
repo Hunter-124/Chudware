@@ -250,21 +250,32 @@
   const angle = document.querySelector<HTMLElement>('[data-tess-angle]');
 
   if (canvas) {
-    canvas.hidden = false;
-    const mark = createTesseract(canvas, {
-      still: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
-      onAngle(deg) {
-        if (angle) angle.textContent = deg.toFixed(1);
-      },
-    });
+    const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let attempts = 0;
+    const boot = () => {
+      canvas.hidden = false;
+      const mark = createTesseract(canvas, {
+        still,
+        onAngle(deg) {
+          if (angle) angle.textContent = deg.toFixed(1);
+        },
+      });
 
-    if (mark) {
-      // Same contract as the part builder: the static mark only steps aside
-      // once the canvas has a live context and a first frame.
-      canvas.dataset.ready = '';
-      fallback?.setAttribute('hidden', '');
-    } else {
-      canvas.hidden = true;
-    }
+      if (mark) {
+        // Same contract as the part builder: the static mark only steps aside
+        // once the canvas has a live context and a first frame.
+        canvas.dataset.ready = '';
+        fallback?.setAttribute('hidden', '');
+      } else if (++attempts < 4) {
+        // A GPU-process warmup race can hand back a null context at parse
+        // time and a live one a few hundred milliseconds later. Retry before
+        // conceding to the fallback.
+        canvas.hidden = true;
+        setTimeout(boot, 400);
+      } else {
+        canvas.hidden = true;
+      }
+    };
+    boot();
   }
 </script>

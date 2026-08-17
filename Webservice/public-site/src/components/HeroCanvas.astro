@@ -317,34 +317,44 @@ import { HERO_STAGES } from '../scripts/hero-timeline';
   );
 
   if (stage && canvas && panel) {
-    canvas.hidden = false;
-    const hero = createHero(canvas, {
-      centered: true,
-      still: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
-      onStage(index, building) {
-        for (let i = 0; i < features.length; i++) {
-          features[i].dataset.state = !building || i < index
-            ? 'done'
-            : i === index
-              ? 'building'
-              : 'pending';
-        }
-        if (status) {
-          status.textContent = building
-            ? `Rebuilding ${HERO_STAGES[index]?.label ?? ''}`
-            : 'Rebuild complete';
-        }
-      },
-    });
+    const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let attempts = 0;
+    const boot = () => {
+      canvas.hidden = false;
+      const hero = createHero(canvas, {
+        centered: true,
+        still,
+        onStage(index, building) {
+          for (let i = 0; i < features.length; i++) {
+            features[i].dataset.state = !building || i < index
+              ? 'done'
+              : i === index
+                ? 'building'
+                : 'pending';
+          }
+          if (status) {
+            status.textContent = building
+              ? `Rebuilding ${HERO_STAGES[index]?.label ?? ''}`
+              : 'Rebuild complete';
+          }
+        },
+      });
 
-    if (hero) {
-      // The screenshot is the fallback. It only steps aside once the canvas
-      // has actually produced a context and a first frame.
-      canvas.dataset.ready = '';
-      panel.hidden = false;
-    } else {
-      canvas.hidden = true;
-      stage.hidden = true;
-    }
+      if (hero) {
+        // The screenshot is the fallback. It only steps aside once the canvas
+        // has actually produced a context and a first frame.
+        canvas.dataset.ready = '';
+        panel.hidden = false;
+      } else if (++attempts < 4) {
+        // Same GPU-warmup retry as the brand hero: parse-time null contexts
+        // are transient, and the screenshot fallback is for real absence.
+        canvas.hidden = true;
+        setTimeout(boot, 400);
+      } else {
+        canvas.hidden = true;
+        stage.hidden = true;
+      }
+    };
+    boot();
   }
 </script>

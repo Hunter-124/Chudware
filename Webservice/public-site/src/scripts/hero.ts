@@ -22,6 +22,8 @@ export interface HeroOptions {
   onStage?: (index: number, building: boolean) => void;
   /** Render a single frame and stop. Used for prefers-reduced-motion. */
   still?: boolean;
+  /** Centre the part in frame (framed showcase box, no copy column). */
+  centered?: boolean;
 }
 
 export interface HeroHandle {
@@ -561,11 +563,16 @@ export function createHero(canvas: HTMLCanvasElement, opts: HeroOptions = {}): H
     // offset pushes the subject the other way. uv is normalised by height, so
     // targeting fraction f of the width means an offset of (f - 0.5) * 2 * aspect.
     const aspect = width / Math.max(1, height);
-    const wide = aspect > 1.15;
+    const wide = !opts.centered && aspect > 1.15;
 
     gl2.uniform2f(loc.uRes, width, height);
-    gl2.uniform3f(loc.uCam, yaw, pitch, 6.6 - 0.4 * showcase);
-    gl2.uniform2f(loc.uShift, wide ? 0.16 * aspect : 0.0, wide ? -0.08 : 0.06);
+    // The framed showcase box is much shorter than the old full-bleed hero,
+    // and uv is normalised by the shorter axis: the same part at the same
+    // distance would crop. uShift signs follow the FRAG (uv -= uShift):
+    // negative x walks the subject left, clear of the docked panel.
+    const distance = opts.centered ? 7.2 - 0.3 * showcase : 6.6 - 0.4 * showcase;
+    gl2.uniform3f(loc.uCam, yaw, pitch, distance);
+    gl2.uniform2f(loc.uShift, wide ? 0.16 * aspect : opts.centered ? -0.62 : 0.0, wide ? -0.08 : opts.centered ? -0.10 : 0.06);
     gl2.uniform1f(loc.uTime, elapsed);
     gl2.uniform1f(loc.uSketch, values.Sketch);
     gl2.uniform1f(loc.uExtrude, values.Extrude);

@@ -7733,3 +7733,27 @@ and one where the reverse held (two boxes fused along a single edge: Netgen mesh
 polymesh's own watertightness guard refuses). Every one of those texts now describes
 polymesh as an INDEPENDENT second discretization, which is what the measurement supports,
 and `test_polymesh_backend.cpp` pins the edge-touch case so the claim cannot drift back.
+
+**Public site (2026-08-16): tesseract brand hero + homepage restructure.** The
+homepage hero is now the live brand mark: `src/scripts/tesseract.ts` renders the
+tesseract in WebGL2 with the exact math of `host/src/ui/tesseract.cpp`
+(DoubleRotation style, kSpin, kCamYaw/Pitch, fitStyle's d4/d3/depth/scale —
+computed offline by the same sweeps and baked as constants, then verified over a
+60k-sample trajectory sweep: pole margin 0.891, worst screen radius 0.9652 with
+full camera wobble). 32 edges + 3x96 ring segments are instanced glow ribbons
+(one-pass analytic bloom, no FBO), 16 vertex dots + the logo's 8-point spark are
+billboard sprites, 240 dust points; two programs, three instanced draws, zero
+dependencies, adaptive pixel budget like hero.ts. Two gotchas worth keeping:
+(1) additive blending into a premultiplied canvas MUST write alpha =
+accumulated intensity, not 1.0 — a constant alpha composites as opaque black
+wherever the glow falls off (this rendered as black quads at every vertex);
+(2) the part-builder panel needed its positioning UNLAYERED because
+global.css's motion layer gives `[data-lift]` `position: relative` and later
+layers beat earlier ones. The old SDF part hero moved down-page as a framed
+showcase (`HeroCanvas.astro`, still the same renderer + `centered` option in
+hero.ts that re-frames camera distance/uShift for a short box). index.astro:
+hero copy slots into `TesseractHero.astro`; global.css: glass header, gradient
+display text, gradient primary buttons, ambient body washes. Fallbacks kept:
+prefers-reduced-motion parks the exact brand-pose frame (t=0), no-WebGL2 shows
+the static mark; verified headless Chrome desktop/mobile/reduced-motion/
+no-WebGL, zero console errors.

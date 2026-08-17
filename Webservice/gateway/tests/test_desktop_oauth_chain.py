@@ -11,6 +11,8 @@ only a composed test can catch a break in the seams between them.
 
 from __future__ import annotations
 
+import html
+import re
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
@@ -150,6 +152,9 @@ def test_desktop_signin_completes_through_google(client):
         assert shown in consent.text, f"consent page never names {shown}"
 
     # 5. Confirming hands the token to the loopback listener the app is holding.
+    #    It must arrive as a document navigation, not a redirected form POST:
+    #    the app's `form-action 'self'` CSP aborts the loopback hop otherwise,
+    #    which is what made clicking Authorize appear to do nothing.
     confirmed = client.post(
         "/desktop/authorize",
         data={
@@ -160,8 +165,16 @@ def test_desktop_signin_completes_through_google(client):
         },
         follow_redirects=False,
     )
-    assert confirmed.status_code == 303
-    loopback = urlparse(confirmed.headers["location"])
+    assert confirmed.status_code == 200
+    assert "location" not in confirmed.headers
+    refresh = re.search(
+        r'<meta http-equiv="refresh" content="0;url=([^"]+)"', confirmed.text
+    )
+    assert refresh, "handoff page never navigates to the loopback listener"
+    target = html.unescape(refresh.group(1))
+    # The manual fallback button has to point at the same place.
+    assert f'class="primary" href="{refresh.group(1)}"' in confirmed.text
+    loopback = urlparse(target)
     assert (loopback.scheme, loopback.hostname, loopback.port) == (
         "http",
         "127.0.0.1",

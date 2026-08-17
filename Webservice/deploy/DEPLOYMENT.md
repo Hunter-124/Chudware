@@ -142,7 +142,8 @@ shell deployment logic:
 - **Production:** trigger only by `workflow_dispatch`; require a `v*` tag input
   and invoke `update.sh prod --tag <tag>`. The script independently verifies
   that deployed HEAD is exactly that release tag.
-- Adapt the existing `pick-windows-runner.yml` selection-job pattern to Linux.
+- No deploy workflow exists yet. Follow the single-runner selection shape of
+  `native-build.yml`'s `runs-on: [self-hosted, …]` matrix rows (line 45).
   Deployment is one side effect, never a matrix: exactly one selected runner
   may execute it.
 - Serialize prod and staging through the updater's host-wide flock. Propagate

@@ -84,7 +84,7 @@ static AiWsState s_ai;
 // ==================================================================================
 // Phase 2 (M9/M10) — live Agent Workflow DAG store.
 //
-// A DIFFERENT graph from the buildgraph Session Plan (AI_WORKSPACE_V2_PLAN.md §3): this is the
+// A DIFFERENT graph from the buildgraph Session Plan (GUI_POLISH_TRACKER.md §M): this is the
 // agent loop's own execution trace — tool calls (+ what they act on), context injections, thoughts,
 // and (when a production sink lands) subagent/advisor branches. It is built purely from the drained
 // `aicad.agent_events/2` stream by joining `parent_id`→`id` (§2.1). No buildgraph sidecar, no RPC.

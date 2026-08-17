@@ -1,6 +1,15 @@
 # Wave 2 OCCT Integration Plan — Prebuilt Binary on Windows / MSVC x64
 
-> Status: **PLAN** (not yet installed). Review this doc, then execute the checklist.
+> Status (2026-08-16): **LANDED — via a different mechanism than this plan describes.**
+> OCCT 7.9.3 is now auto-provisioned by `core/cmake/ProvisionOCCT.cmake` (Windows:
+> downloads the official vc14 combined zip into `third_party/occt/`; Linux/macOS:
+> uses the system OCCT), enabled by `-DCHUDWARE_WITH_OCCT=ON` in
+> `core/CMakeLists.txt`, which builds the `chudware_geom_occt` static library and
+> its test suite. No manual download/extract/checklist run is required.
+> The manual-setup sections below (§3–§7) are kept as **historical reference**
+> only — the rationale (version pinning, LGPL exception, /MD runtime, gotchas)
+> still applies, but the steps were superseded by the provisioner.
+>
 > Wave 2 goal (from `~/.claude/plans/im-planning-on-doing-noble-glacier.md`): link OCCT into the
 > process, port feature compilers → `core/geom/`, port the tessellation/AICM emitter, and replace
 > the Python modeling worker with in-process `libchudware` calls.
@@ -330,7 +339,12 @@ When the `Chudware` host target eventually links `libchudware_geom_occt`, attach
 
 ---
 
-## 5. Step-by-Step Wave-2 Bring-Up Checklist
+## 5. Step-by-Step Wave-2 Bring-Up Checklist — HISTORICAL
+
+> Superseded 2026-08-16: `core/cmake/ProvisionOCCT.cmake` performs the download,
+> extraction, `find_package`, and DLL staging automatically when
+> `-DCHUDWARE_WITH_OCCT=ON`. Do not run this checklist by hand; it remains only
+> to explain what the provisioner does.
 
 ### Step 0 — Agree on install path
 

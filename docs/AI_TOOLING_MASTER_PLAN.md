@@ -22,9 +22,16 @@ learned second, and the model never guesses what a tool can tell it.** Every cap
 below is a tool the model is *told how to use*, with structured input/output a small model
 can handle.
 
-## 1. Current-state inventory (verified 2026-07-02)
+## 1. Current-state inventory (verified 2026-07-02) — HISTORICAL
 
-What already exists, so we build on it instead of duplicating:
+> Superseded. This table is the *pre-implementation* snapshot that motivated
+> the pillars below; every `T-F1`..`T-F17` task it spawned is now
+> `status:done`. Items it calls Missing/Absent/Fragmented now exist:
+> `services/research/`, `services/vision/`, `contracts/providers.md`,
+> `contracts/interaction.md`, `contracts/narration.md`, and
+> `core/data/materials/registry.json`. Kept for rationale only.
+
+What existed then, so we built on it instead of duplicating:
 
 | Area | State |
 |---|---|

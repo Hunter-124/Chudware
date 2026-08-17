@@ -43,11 +43,12 @@ Canonical references:
 - `docs/REFACTOR_LOG.md` — refactor
   handoff log (each DAG node appends a paragraph: files touched, deferred,
   gotchas). Active plans live under `docs/plans/`.
-- The active refactor plan (source of truth for the current consolidation
-  effort — hygiene → agent harness → UI/UX → perf → zero-Python cutover):
-  `docs/plans/2026-07-22-consolidation-refactor-dag.md`, tracked on the board
-  as workstream `T-RF*`. (The older cursor-plan file was superseded
-  2026-07-22 — see `docs/REFACTOR_LOG.md`.)
+- The consolidation refactor (hygiene → agent harness → UI/UX → perf →
+  zero-Python cutover) is **complete**: `T-RF1`..`T-RF23` are all `status:done`
+  as of 2026-07-23. Its plan,
+  `docs/plans/2026-07-22-consolidation-refactor-dag.md`, is historical record —
+  read it for rationale, not for pending work. (The older cursor-plan file was
+  superseded 2026-07-22 — see `docs/REFACTOR_LOG.md`.)
 
 ## Agent workflow on this repo (read before starting any task)
 

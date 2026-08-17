@@ -9,11 +9,48 @@ stdio worker.
 
 ```
 core/
-  solver/   nsolve.{h,cpp}   damped-LM constraint solver core
-  sketch/   sketch.{h,cpp}   entity parameterization + constraints
-  tests/    test_nsolve.cpp  solver-core unit tests (doctest)
-            test_sketch.cpp  sketch-solver unit tests
-  CMakeLists.txt             standalone build (Eigen + doctest + nlohmann/json via FetchContent)
+  Geometry & constraint kernel
+    geom/     OCCT B-rep kernel: feature compilers, tessellation, AICM emitter, STEP IO
+    sketch/   sketch.{h,cpp} + sketch3d: entity parameterization + constraints (2D and 3D)
+    solver/   nsolve.{h,cpp}   damped-LM constraint solver core
+    mate/     assembly mates + mate solver (+ corpus fixtures)
+  Document & API
+    doc/      document model, sessions, formats/import/export, validation, picks, drawings
+    api/      libchudware.{h,cpp}: the C ABI surface every client binds to
+  Simulation
+    sim/      FEA/CFD runs, mesher, polymesh backend, SPICE, fatigue/adaptive studies
+    twin/     digital-twin runtime (wide-math state propagation)
+  Manufacturing & domain engines
+    cam/      toolpaths, operations, posts, stock simulation
+    print/    3D-print model/slicing prep
+    ecad/     PCB container, impedance, zone fill, autoroute, MCAD sync
+    piping/   piping schema, flow solve, CFD handoff
+    hydraulic/ hydraulic schema + solve + BOM
+    structural/ structural solver, checks, estimates, RPC
+    mechanical/ mechanical-design helpers
+    materials/ material database
+    tolerance/ GD&T stackup analysis
+    dfm/      DFM process profiles
+    parts/    standard-parts catalog, generation, placement
+    sourcing/ vendor registry, spec match, quotes, costing, BOM
+    firmware/ MCU emulator, sensor models, toolchains, co-verify
+  Agent, daemon & device
+    agent/    copilot runtime: roles, providers, auth, OMP bridge client
+    hostd/    chudware-hostd daemon: server, doc registry, worker bridge, mfg lane
+    device/   machine transports: GRBL protocol/adapter, emulator, capability
+  Infrastructure
+    util/     paths, process isolation, entitlement, secret store, AICM handoff
+    security/ integrity, runtime guard, containment, event queue
+    manufacturing/ authorization arbiter, gates, leases, journal
+    prof/     profiling: phase timers, tree, sampler
+    cmake/    Provision*.cmake auto-provisioners (OCCT, Netgen, OpenNURBS, lib3mf, …)
+    data/     bundled data (materials)
+    third_party/ vendored sources (rhino3dm-src)
+    docs/     design docs (wave2_occt_plan.md, kicad_reference.md)
+  Tests
+    tests/    doctest suites: test_nsolve.cpp, test_sketch.cpp, plus ~100 subsystem tests
+  CMakeLists.txt            build: Eigen + doctest + nlohmann/json via FetchContent;
+                            -DCHUDWARE_WITH_OCCT=ON provisions OCCT (cmake/ProvisionOCCT.cmake)
 ```
 
 ## Build & test (Windows, VS2022)

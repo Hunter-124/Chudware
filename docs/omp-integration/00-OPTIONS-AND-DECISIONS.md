@@ -41,7 +41,7 @@ improvements. Fork stays a *later, optional* move for the engine loop only.
 
 - **Vendored subtree**: `vendor/omp/` holding only the OMP packages we consume, pinned to an
   upstream commit recorded in `vendor/omp/OMP_VENDOR.lock`.
-- **Deterministic update**: `scripts/vendor-omp.py <git-sha>` clones/fetches upstream at the
+- **Deterministic update**: `scripts/vendor_omp.py --sha <git-sha>` (also `--from`, `--verify`) clones/fetches upstream at the
   pinned SHA, copies the whitelisted package paths, rewrites the lockfile, and verifies a
   content hash. Re-run with a newer SHA = pull upstream "goodies"; diff is reviewable.
 - **The bridge**: one bun subprocess, launched like CAD's other `worker_rpc` workers

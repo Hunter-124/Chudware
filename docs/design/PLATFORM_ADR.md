@@ -1,7 +1,7 @@
 # ADR-001: Idea-to-Production Platform on Chudware
 
-**Status:** Proposed
-**Date:** 2026-07-02
+**Status:** Adopted — pillars landed (`T-A1`, `T-D1`, `T-F1`..`T-F17` all `status:done`)
+**Date:** 2026-07-02 (status updated 2026-08-17)
 **Deciders:** Bruh + team (4 people)
 
 ## Context

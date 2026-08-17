@@ -1,4 +1,18 @@
-# platform — cross-OS shims
+# platform — cross-OS shims (ORPHANED — dead remnant)
+
+> **Orphaned (2026-08-16):** this directory was the planned portable-API
+> consolidation for OS-specific host code, along the retired ui/imgui
+> consolidation path. That consolidation never happened here: nothing in the
+> root `CMakeLists.txt` or `host/CMakeLists.txt` references `platform/` or
+> builds a `chudware_platform` library, and no host source includes these
+> headers. What the host actually uses instead:
+> - file dialogs → `host/src/ui/file_dialog.{h,cpp}` (compiled into `Chudware`)
+> - borderless window chrome → `host/src/win_chrome.{h,cpp}` (compiled into `Chudware`)
+> - paths → `core/util/platform_paths.cpp` (compiled into the host from core/)
+> - camera backends → `host/src/platform/camera_{stub,v4l2,mf}.cpp` (a different
+>   `platform/` dir, inside `host/src/`, that IS live)
+>
+> Treat everything below as the original migration design doc, not live API.
 
 **Owner:** F3 / G1 integrator. Portable replacements for OS-specific code in `host/`.
 

@@ -33,7 +33,7 @@ Format:
   Filed by: unify-build finisher. Owner: workspace-shell/sim-kinematics agent.
 
 ## chrome-tabs agent — ribbon.cpp duplicate static variable (build blocker)
-- [ ] (chrome-tabs) `host/src/ui/widgets/ribbon.cpp` — File has `static int s_workspace = 0;`
+- [x] (chrome-tabs) `host/src/ui/widgets/ribbon.cpp` — LANDED (verified 2026-08-16): exactly one `static int s_workspace = 0;` remains (ribbon.cpp:95); no duplicate declaration. Original request: File has `static int s_workspace = 0;`
   declared TWICE: once at line ~71 and again at line ~333. The second declaration causes a
   "was not declared in this scope" compile error on ribbon_tabVisible() (lines ~90–104) because
   the function sees only one of them depending on TU linkage. Fix: remove the DUPLICATE declaration
@@ -53,7 +53,7 @@ Format:
   inspected in both themes by the dialogs finisher agent.
 
 ## Polish agent requests (build fix — parts_workspace.cpp fonts member)
-- [ ] (polish) `host/src/ui/parts/parts_workspace.cpp:93,111` — `ui::fonts` should be `ui::Fonts` (capital F). The struct is declared as `ui::Fonts` in ui_theme.h (L13) but parts_workspace.cpp references it as lowercase `ui::fonts`. Fix: replace `ui::fonts.h2` with `ui::Fonts.h2` at L93 and `ui::fonts.h1` with `ui::Fonts.h1` at L111. This is blocking the build (not in polish file ownership).
+- [x] (polish) `host/src/ui/parts/parts_workspace.cpp:93,111` — LANDED (verified 2026-08-16): no `ui::fonts` reference remains anywhere in parts_workspace.cpp; the file now reaches fonts via `S().fonts = &st.fonts` (parts_workspace.cpp:919, used at :1332-1337). Original request: `ui::fonts` should be `ui::Fonts` (capital F). The struct is declared as `ui::Fonts` in ui_theme.h (L13) but parts_workspace.cpp references it as lowercase `ui::fonts`. Fix: replace `ui::fonts.h2` with `ui::Fonts.h2` at L93 and `ui::fonts.h1` with `ui::Fonts.h1` at L111. This is blocking the build (not in polish file ownership).
 
 ## ribbon agent — per-workspace ribbon filter (2026-07-06)
 - [x] (ribbon) `host/src/app.cpp` — DONE e5e90805. before each `drawRibbon(...)` call, add:
@@ -65,7 +65,7 @@ Format:
   Owner: workspace-shell.
 
 ## Polish agent — parts_workspace.cpp build fix (correct fonts access)
-- [ ] (polish) `host/src/ui/parts/parts_workspace.cpp:93,111` — `ui::fonts` is not a member of namespace `ui`; fonts live on AppState. Fix: replace `ui::fonts.h2` with `st.fonts.h2` at L93 (in sectionHeader) and `ui::fonts.h1` with `st.fonts.h1` at L111 (in emptyState). The `st` AppState& param is in scope in both functions. This blocks the ninja build — not in polish file ownership so filing as wire request.
+- [x] (polish) `host/src/ui/parts/parts_workspace.cpp:93,111` — LANDED (verified 2026-08-16): same resolution as the bullet above — `st.fonts` won; fonts flow through `S().fonts` (parts_workspace.cpp:919). Original request: `ui::fonts` is not a member of namespace `ui`; fonts live on AppState. Fix: replace `ui::fonts.h2` with `st.fonts.h2` at L93 (in sectionHeader) and `ui::fonts.h1` with `st.fonts.h1` at L111 (in emptyState). The `st` AppState& param is in scope in both functions. This blocks the ninja build — not in polish file ownership so filing as wire request.
 
 ## sim-kinematics agent — motion scenario (2026-07-06)
 - [x] (sim-kinematics) `host/src/ui/scenarios.cpp` — DONE e5e90805. Add a `motion` scenario
@@ -90,7 +90,7 @@ Format:
   step 1 and step 2 screenshots to prove motion playback is live.
 
 ## parts-plm agent requests
-- [ ] (parts-plm) `host/src/app.cpp` — After the PLM/PartsLibrary workspace blocks, wire a
+- [x] (parts-plm) `host/src/app.cpp` — LANDED (verified 2026-08-16): success toast shipped in `insertItem` at `host/src/ui/parts/parts_workspace.cpp:771` — `st.toast(ui::ToastLevel::Success, "Inserted " + name + ...)` on a successful `parts_insert_into_doc` RPC (fired at :767). Original request: After the PLM/PartsLibrary workspace blocks, wire a
   `parts_insert_into_doc` RPC result handler: when the worker returns successfully from
   `parts_insert_into_doc`, call `st.addToast("Part inserted into document", ToastLevel::Ok)`.
   The RPC is already fired from parts_workspace.cpp; only the success toast is missing.
@@ -152,7 +152,7 @@ Format:
   renders) and the GLFWwindow* variable in scope (`window` in run_gui). Owner: workspace-shell.
 
 ## ai-workspace agent — route WS::AI to the full AI hub (2026-07-06)
-- [ ] (ai-workspace) `host/src/app.cpp` — 3 edits wire the new full-page AI hub
+- [x] (ai-workspace) `host/src/app.cpp` — LANDED (verified 2026-08-16): `#include "ui/ai/ai_workspace.h"` at app.cpp:110; the docked-Copilot gate `if (ws != WS::AI && !webActive)` at app.cpp:6496; the `WS::AI` branch renders the hub via `ui::drawAiWorkspace(st)` at app.cpp:6622. Original request: 3 edits wire the new full-page AI hub
   (`host/src/ui/ai/ai_workspace.cpp`, already built + linked into Chudware):
 
   1. Add the include next to the other UI includes (beside `ui/copilot/copilot.h`):
@@ -225,7 +225,7 @@ Format:
   temporary hook (since removed); proof at /tmp/hunter-verify/explorer_restyle.png.
 
 ## EM sim family agent (2026-07-07) — register EM study kinds in SimManager
-- [ ] (em-sim) `host/src/ui/sim_manager.cpp/.h` — add three study kinds to the Simulate study-type
+- [x] (em-sim) `host/src/ui/sim_manager.cpp/.h` — LANDED (verified 2026-08-16): all three RPCs dispatched from the EM panel — `em_eigenmode` (sim_manager.cpp:1852), `em_driven` (:1857), `em_timedomain` (:1870); `em_status` probed once async (:1679, `probeEmStatus`). Original request: add three study kinds to the Simulate study-type
   picker, gated by the `em_status` worker RPC (call once, cache; only offer kinds whose
   `defaults.<analysis>` is non-null; show an "install openEMS — see `docs/reference/EM_SIMULATION.md`"
   hint when `defaults.driven == "analytic-uniform"` i.e. no full-wave solver installed):
@@ -245,7 +245,7 @@ Format:
   `services/sim/em/`; sim-GUI owns SimManager, so the GUI seam goes through this request.
 
 ## sim-gui agent — EM ribbon tab wired ahead of the em_* backend (2026-07-07)
-- [ ] (sim-gui) `services/*` (EM backend agent) — the Simulate workspace now ships an "EM" ribbon
+- [x] (sim-gui) `services/*` (EM backend agent) — LANDED (verified 2026-08-16): the EM ribbon tab ships in ribbon_def.cpp:635-642 (`sim_em_eigen/sweep/time/ports/boundary/range/run/results`); `SimManager::handleEmCommand` (sim_manager.cpp:1698) routes every `sim_em_*` command; a missing backend greys the set via `ui::setRibbonDisabledPrefix("sim_em_", "EM solver not installed")` (:1691). Original request: the Simulate workspace now ships an "EM" ribbon
   tab (Eigenmode / Freq Sweep / Time Domain study buttons + Ports / Boundaries / Freq Range /
   Run / Results; cmd_ids `sim_em_*`, dispatched in SimManager::handleEmCommand). The GUI probes
   `em_status` ONCE (async st.rpc, 5s timeout) on Simulate-workspace entry; a missing/unknown
@@ -256,8 +256,13 @@ Format:
   honest-disabled and no fake UI ships.
 
 ## M20 backend agent → GUI drain: accept `aicad.agent_events/2` fields (2026-07-07)
-- [ ] (Phase 2/3 GUI agent) `host/src/core/app_state.h` + `host/src/core/jobs.cpp` + the
-  `app.cpp` `JobState.events` drain — the backend now emits the net-new `/2` agent-execution
+- [x] (Phase 2/3 GUI agent) `host/src/core/app_state.h` + `host/src/core/jobs.cpp` + the
+  `app.cpp` `JobState.events` drain — LANDED (verified 2026-08-16), via a raw-JSON seam instead
+  of extending `AgentEvent`: the app.cpp drain feeds each `/2` record to
+  `ui::feedAgentDagEvent` (app.cpp:4055; store in `ai_workspace.cpp`, parsing `id`/`parent_id`/
+  `actor` at :218-220, `target` on `agent.tool_call`, `agent.context_injected` at :245) and to
+  the chat transparency rows via `feedTurnActivity` (`ui/copilot/feed.cpp:1617+`). Original request:
+  the backend now emits the net-new `/2` agent-execution
   event kinds live through the SAME streaming `onEvent`→`JobState.events` transport (no new
   RPC). Extend `AgentEvent` + the jobs.cpp wrapper to carry these fields so the Agent Workflow
   DAG (M9) + transparency chat (M12/M13/M14) can render them. Contract: `contracts/agent_events.md`

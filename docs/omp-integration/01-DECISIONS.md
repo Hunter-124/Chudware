@@ -69,7 +69,7 @@ the "Open decisions" section of `00-OPTIONS-AND-DECISIONS.md`. Implementation fo
   against the vendored workspace (gitignored node_modules).
 
 ## Implementation order (YAGNI, focus-first)
-1. **Foundation**: vendoring layout + `scripts/vendor-omp.py` (pinned SHA, whitelist, lockfile);
+1. **Foundation**: vendoring layout + `scripts/vendor_omp.py` (pinned SHA, whitelist, lockfile);
    bun bridge with `complete` op (providers); proven end-to-end.
 2. **Live providers + UI sign-in**: C++ branch in `providers.cpp` → bridge; provider catalog +
    sign-in UI (designer-driven).

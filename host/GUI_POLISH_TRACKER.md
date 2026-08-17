@@ -103,7 +103,7 @@ Canonical checklist of every GUI change Hunter has requested for the host/ light
 | L2 | Remaining crash/freeze on rapid Model→Drawing→Simulate→Electronics→Manufacture switching (Electronics per-frame ECAD focus-grab ate every click outside its window) | ✅ | `9178c8f6` |
 
 ## M. AI workspace v2 redesign (2026-07-07 — screenshot-specified, major rework)
-Hunter's red-pen on the shipped AI hub: make it compact, transparency-first, DAG-centric. Screenshot marks regions: **DAG** upper-center, **conversation** lower-left (green box), **workflow settings** lower-right ("Settings/Options/Defaults"), inference settings **wiped**. Full plan: `host/AI_WORKSPACE_V2_PLAN.md` (`1761eafb`).
+Hunter's red-pen on the shipped AI hub: make it compact, transparency-first, DAG-centric. Screenshot marks regions: **DAG** upper-center, **conversation** lower-left (green box), **workflow settings** lower-right ("Settings/Options/Defaults"), inference settings **wiped**. Full plan landed as commit `1761eafb`; the plan doc (`host/AI_WORKSPACE_V2_PLAN.md`) was retired 2026-08-16 after every row below (M1–M23) shipped — this section is now the canonical record.
 
 **Locked decisions (Hunter, 2026-07-07):**
 - **Subagent steering = FULL** (M11/M15–M17): build the live subagent-session registry + steering RPCs up front — inject-into-running-subagent works, not read-only.
@@ -183,7 +183,7 @@ Fresh cluster of GUI asks. Disjoint files → worked per-cluster, committed indi
 ---
 
 ## Open / next-up queue (orchestrator dispatches on Hunter's go)
-- **M (AI workspace v2)** — 🔧 architecture/plan pass running (2026-07-07). Big multi-phase rework; will decompose into ordered build agents after the plan lands. M20 (event model) is the load-bearing prerequisite for M9/M12–M14.
+- **M (AI workspace v2)** — ✅ COMPLETE (2026-08-16). All rows M1–M23 above are checked with landed commits (`500340e9` → `0b37f47e`); the load-bearing M20 event model (`agent_events/2`) shipped and feeds the DAG + transparency chat. The architecture/plan pass is done and the plan doc was retired; nothing left to decompose.
 - **K2** — EM study forms — ✅ committed `34964e5a`+`aac390c3` (2026-07-07), awaiting Hunter's live verify.
 - **G3** — richer live sub-agent enumeration. **SUBSUMED by M11 (`b3d1e923`/`9a18af77`):** the worker now exposes `subagent_list` and the sidebar lists live registry sessions (clickable → open/steer). Empty-state remains honest when nothing has been delegated.
 - _(new rows land here as Hunter red-pens the list above)_

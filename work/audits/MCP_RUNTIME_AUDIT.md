@@ -5,6 +5,31 @@
 **Library:** `/home/hunter/Repositories/CAD/core/build-linux/bin/libchudware.so`
 **Total registered tools:** 184
 
+---
+## Superseded — 2026-08-16
+
+The 2026-07-02 snapshot below (184 registered tools, 10 DEGRADED) predates the T-FIN* MCP
+tool families, the T-RF15..T-RF21 C++ cutover, T-V4's `.venv-mcp` provisioning, and T-SIM5's
+OpenFOAM install. Its headline numbers no longer describe the live registry: the registry and
+its gate test now cite ~400 registered tools (`services/mcp/tool_registry.py`,
+`services/mcp/test_family_gate_refusal.py` — "365 of the ~400 registered tools declare
+``-> str``"), and the artifact-validity benchmark cites ~418
+(`benchmarks/artifact_validity/scoring.py` and its recorded run output
+`benchmarks/artifact_validity/results/smoke.txt`). The DEGRADED row for
+`run_cfd_accurate` ("openfoam is not available on this machine") is likewise stale: OpenFOAM
+v2412 is provisioned and its live solve passes (see the 2026-08-07 follow-up in
+`work/audits/SIM_AUDIT.md`).
+
+The detailed 2026-07-02 tables below are retained as historical baseline; their tool counts,
+family table, and DEGRADED/INCONCLUSIVE verdicts are superseded. Regenerate them from the
+repository root with the same script that produced them:
+
+```bash
+.venv-mcp/bin/python -X utf8 scripts/mcp_runtime_audit.py
+```
+
+---
+
 ## Summary
 
 | Verdict | Count |

@@ -474,6 +474,9 @@ _PAGE_CSS = """
       letter-spacing:.11em;text-transform:uppercase}
     .facts dd{margin:0;font-size:.86rem;font-weight:650;text-align:right;
       word-break:break-word}
+    /* A <button> shrink-fits even as a flex box, so the action stack is an
+       explicit grid; that also centres the cancel link under it. */
+    .auth-card form{display:grid;gap:14px}
     a.primary{text-decoration:none}
 """
 

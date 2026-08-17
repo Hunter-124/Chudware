@@ -521,3 +521,41 @@ Found, NOT fixed — each is a real gap:
   who cannot receive mail has no self-service recovery at all: no OAuth, and
   password reset needs the transport in §9. Configuring OAuth would give a mail-
   independent way in.
+
+## 11. Desktop sign-in through OAuth (2026-08-17)
+
+The native app has always signed in by opening the system browser at
+`/desktop/authorize` and waiting on a loopback listener; there is no
+email/password field in the desktop UI at all. An unauthenticated caller is
+bounced to `/signin?next=<that>`, and the password form honoured `next` — but
+the three OAuth anchors dropped it and the callback always redirected to `/`.
+Signing in with a provider therefore stranded the browser on the portal and the
+app's listener timed out. Fixed: `oauth.py` threads a validated same-origin
+destination through start → callback, bound into the signed state and carried
+beside the verifier in the one transaction cookie, and `login*.js` stamps it
+onto the anchors. `tests/test_desktop_oauth_chain.py` drives the whole chain.
+
+Three live-config defects surfaced while deploying it:
+
+- **`CHUDWARE_WEB_PUBLIC_URL` in `gateway.env` was dead env.** `config.py` reads
+  `CHUDWARE_WEB_PUBLIC_BASE_URL`, so §5's "repointed to app.chudware.com" was
+  never in effect: every verification, reset, and OAuth `redirect_uri` was built
+  for the apex static site. Renamed in place. The repo's staging unit had the
+  same dead spelling and is fixed too.
+- **`CHUDWARE_WEB_SESSION_SECRET` was absent**, so the OAuth state HMAC was
+  keyed on the empty string. Generated and set.
+- **Prod was one restart away from not booting.** The installed
+  `chudware-gateway.service` predated the entitlement signing key becoming a
+  startup hard requirement, and no `~/.config/credstore.encrypted` existed —
+  the running process only survived because it had never been restarted since.
+  The raw key was sitting at `~/chudware-web-data/entitlement_ed25519.key`; it
+  is now encrypted into `chudware-entitlement.cred` and the canonical hardened
+  unit from `deploy/` is installed. **Staging is in exactly this state**: it
+  still runs pre-requirement code and has no
+  `chudware-entitlement-staging.cred`, so the next restart will fail its
+  startup. Provision that credential before touching it.
+
+What is still missing is not code: **no provider client credentials exist on the
+host** (`oauth.configured_providers()` returns `[]`). Register the apps and add
+the pairs to `gateway.env` — the redirect URIs are
+`https://app.chudware.com/api/auth/oauth/{google,github,microsoft}/callback`.

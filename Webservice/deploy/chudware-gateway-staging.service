@@ -11,7 +11,10 @@ EnvironmentFile=%h/chudware-web-staging/gateway.env
 EnvironmentFile=-%h/chudware-web/webd.env
 Environment=CHUDWARE_WEB_DATA=%h/chudware-web-staging
 Environment=CHUDWARE_WEB_DATA_ROOT=%h/chudware-web-staging
-Environment=CHUDWARE_WEB_PUBLIC_URL=https://staging.chudware.com
+# config.py reads CHUDWARE_WEB_PUBLIC_BASE_URL; the shorter spelling was dead,
+# so staging built its verification, reset, and OAuth redirect URLs for the
+# production apex instead of itself.
+Environment=CHUDWARE_WEB_PUBLIC_BASE_URL=https://staging.chudware.com
 Environment=CHUDWARE_MAIL_BACKEND=console
 Environment=CHUDWARE_DEPLOY_ENV=staging
 Environment=CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES=4194304

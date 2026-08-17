@@ -142,6 +142,12 @@ def test_desktop_signin_completes_through_google(client):
     consent = client.get(authorize, follow_redirects=False)
     assert consent.status_code == 200
     assert "Authorize Chudware" in consent.text
+    # A consent screen has to say what is being consented to, and it has to
+    # arrive styled: this page is the last step of the sign-in flow, so it
+    # carries that flow's stylesheet rather than browser defaults.
+    assert entitlement._AUTH_CSS in consent.text
+    for shown in (EMAIL, "Enterprise", DEVICE, f"127.0.0.1:{PORT}"):
+        assert shown in consent.text, f"consent page never names {shown}"
 
     # 5. Confirming hands the token to the loopback listener the app is holding.
     confirmed = client.post(
@@ -204,4 +210,8 @@ def test_desktop_signin_refuses_an_account_without_a_desktop_window(client):
     refused = client.get(authorize, follow_redirects=False)
     assert refused.status_code == 403
     assert "not active" in refused.text
+    # The refusal is a dead end for the user, so it gets the same shell and a
+    # way forward rather than a bare heading.
+    assert entitlement._AUTH_CSS in refused.text
+    assert "#pricing" in refused.text
     assert authn.oauth_providers_for(EMAIL) == ["google"]

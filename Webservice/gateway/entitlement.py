@@ -453,8 +453,8 @@ def _validate_authorize_params(port: Any, state_value: str, device: str) -> int:
 _AUTH_CSS = "/auth-assets/login.dc48293a5489.css"
 _PAGE_CSS = """
     .authz{max-width:33rem;margin:0 auto;padding:clamp(32px,6vw,72px) 22px}
-    .authz .mark{width:58px;height:58px;color:var(--teal);
-      filter:drop-shadow(0 0 18px rgba(66,236,206,.28))}
+    .authz .mark{display:block;width:58px;height:58px;margin-bottom:20px;
+      color:var(--teal);filter:drop-shadow(0 0 18px rgba(66,236,206,.28))}
     .authz h1{margin:26px 0 12px;font-size:clamp(1.7rem,4vw,2.3rem);
       line-height:1.1;letter-spacing:-.045em}
     .authz h1 .device{color:var(--teal)}
@@ -468,7 +468,7 @@ _PAGE_CSS = """
     .facts dd{margin:0;font-size:.86rem;font-weight:650;text-align:right;
       word-break:break-word}
     .authz form{display:grid;gap:14px}
-    .authz .legal{margin:22px 0 0}
+    .authz a.primary{text-decoration:none}
 """
 
 

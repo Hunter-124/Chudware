@@ -43,7 +43,7 @@ Design rules:
 
 | Existing | Where | Role in Pillar 20 |
 |---|---|---|
-| Agent loop (plan→code→render→verify, 4-level compaction) | `core/agent/run.cpp` (`agent_run_v2`/`agent_mission_v1`; the Python `services/agent/loop.py` loop was removed in `T-RF5`) | Host for advisory injection (seam: message assembly before `provider.complete_ex`) |
+| Agent loop (plan→code→render→verify, 4-level compaction) | `core/agent/run.cpp` (the loop behind the `agent_run_v2`/`agent_mission_v1` RPCs dispatched in `core/api/libchudware.cpp`; the Python `services/agent/loop.py` loop was removed in `T-RF5`) | Host for advisory injection (seam: message assembly before `provider.complete_ex`) |
 | DAG orchestrator, autonomy dial, `dag_replan` | `services/dag/` | Host for role cards per node; escalation target |
 | Tool registry w/ risk classes + allow-lists | `services/mcp/tool_registry.py` | Enforcement of role-card tool scopes (already supports `CHUDWARE_TOOLS_ALLOW` / node `tools:`) |
 | GSL describers (`describe_part/sketch/scene/...`) | `services/mcp/gsl_tools.py` | State→text for ledger snapshots and role handoffs |

@@ -555,7 +555,25 @@ Three live-config defects surfaced while deploying it:
   `chudware-entitlement-staging.cred`, so the next restart will fail its
   startup. Provision that credential before touching it.
 
-What is still missing is not code: **no provider client credentials exist on the
-host** (`oauth.configured_providers()` returns `[]`). Register the apps and add
-the pairs to `gateway.env` — the redirect URIs are
-`https://app.chudware.com/api/auth/oauth/{google,github,microsoft}/callback`.
+Provider credentials existed nowhere on the host when this landed. **Google and
+GitHub are now configured and live**, both probed against their token endpoints
+(`invalid_grant` / `bad_verification_code` prove the client pair is accepted,
+as opposed to `invalid_client` / `incorrect_client_credentials`):
+
+- Google: project `chudware`, client `Chudware`, consent screen published to
+  production (External). `openid email` are non-sensitive, so publishing needed
+  no verification review.
+- GitHub: OAuth app `Chudware` (owner `Hunter-124`). Generating its secret needs
+  GitHub sudo mode, i.e. a fresh 2FA challenge.
+
+Proven end to end afterwards: a sign-in that touched no password landed on
+`/desktop/authorize`, and a loopback listener standing in for the desktop app
+captured a signed `enterprise` entitlement.
+
+**Microsoft is still unconfigured.** The tenant is `Default Directory`
+(`haedmonds69gmail.onmicrosoft.com`) and the Entra portal session is live, but
+finishing it needs an interactive Microsoft sign-in, and `oauth.py`'s nOAuth
+guard additionally requires the `xms_edov` optional ID-token claim on the app
+registration — configure that at the same time or Microsoft sign-ins will be
+refused by our own callback. Redirect URI:
+`https://app.chudware.com/api/auth/oauth/microsoft/callback`.

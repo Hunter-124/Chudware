@@ -478,6 +478,9 @@ _PAGE_CSS = """
        explicit grid; that also centres the cancel link under it. */
     .auth-card form{display:grid;gap:14px}
     a.primary{text-decoration:none}
+    /* Stacked layout puts the brand mark directly above the card, and the
+       absolutely positioned wordmark then lands on top of a fact row. */
+    @media(max-width:850px){.wordmark{display:none}}
 """
 
 

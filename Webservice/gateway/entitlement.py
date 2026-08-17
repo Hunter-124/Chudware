@@ -479,10 +479,14 @@ def _authorize_shell(title: str, body: str, status_code: int = 200) -> HTMLRespo
         f"<title>{html.escape(title)} · Chudware</title>"
         f'<link rel=stylesheet href="{_AUTH_CSS}">'
         f"<style>{_PAGE_CSS}</style></head><body><main class=authz>"
-        '<svg class=mark viewBox="0 0 64 64" aria-hidden=true>'
-        '<g fill=none stroke=currentColor stroke-width=2.4>'
-        '<rect x=6 y=16 width=42 height=42/><rect x=16 y=6 width=42 height=42/>'
-        '<rect x=21 y=25 width=18 height=18/><rect x=25 y=21 width=18 height=18/>'
+        # Quote every attribute: an unquoted `height=42/>` swallows the slash
+        # into the value, and the whole mark silently renders as nothing.
+        '<svg class="mark" viewBox="0 0 64 64" aria-hidden="true">'
+        '<g fill="none" stroke="currentColor" stroke-width="2.4">'
+        '<rect x="6" y="16" width="42" height="42"/>'
+        '<rect x="16" y="6" width="42" height="42"/>'
+        '<rect x="21" y="25" width="18" height="18"/>'
+        '<rect x="25" y="21" width="18" height="18"/>'
         '<path d="M6 16L16 6M48 16L58 6M48 58L58 48M6 58L16 48M21 25L25 21'
         'M39 25L43 21M39 43L43 39M21 43L25 39"/></g></svg>'
         f"{body}</main></body></html>",

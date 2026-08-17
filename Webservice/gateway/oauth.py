@@ -293,8 +293,26 @@ async def _exchange_code(provider: _Provider, code: str) -> dict[str, Any]:
             headers={"Accept": "application/json"},
         )
     if response.status_code != 200:
+        # The provider's own error code is the only thing that distinguishes a
+        # stale code from a rejected credential or a misconfigured redirect, and
+        # it is a diagnostic rather than a secret. The code and the client
+        # secret stay out of the log; the description is truncated because
+        # providers put whole paragraphs in it.
+        detail = ""
+        try:
+            body = response.json()
+            if isinstance(body, dict):
+                detail = " ".join(
+                    str(body.get(field, ""))
+                    for field in ("error", "error_description")
+                ).strip()[:200]
+        except ValueError:
+            detail = ""
         log.warning(
-            "oauth: %s token exchange failed (%s)", provider.name, response.status_code
+            "oauth: %s token exchange failed (%s) %s",
+            provider.name,
+            response.status_code,
+            detail,
         )
         raise OAuthError("the sign-in provider rejected that request")
     try:

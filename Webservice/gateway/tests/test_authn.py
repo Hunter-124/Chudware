@@ -1042,6 +1042,36 @@ def test_a_single_tenant_deployment_refuses_another_tenants_token(monkeypatch, m
     assert "not in this deployment's directory" in caught.value.message
 
 
+def test_a_personal_microsoft_account_signs_in_without_xms_edov(monkeypatch, ms_key):
+    """MSA never emits xms_edov, and nOAuth does not apply to it.
+
+    The claim is Entra-only, so requiring it in the consumers tenant refuses
+    every personal Microsoft account. That tenant has no administrator who can
+    mint a user with someone else's address, which is the whole premise of the
+    guard, so the exemption is narrow rather than a hole.
+    """
+    consumers = oauth.MICROSOFT_CONSUMERS_TID
+    token = ms_signed(
+        monkeypatch,
+        ms_key,
+        ms_claims(tid=consumers, xms_edov=ABSENT, email="hunter@outlook.com"),
+        tenant="common",
+    )
+    subject, email = oauth._verify_microsoft_id_token(token)
+    assert subject == f"{consumers}.{MS_OID}"
+    assert email == "hunter@outlook.com"
+
+
+def test_the_consumers_exemption_does_not_leak_to_a_real_tenant(monkeypatch, ms_key):
+    """A directory that merely claims a consumers-like issuer is still Entra."""
+    token = ms_signed(
+        monkeypatch, ms_key, ms_claims(xms_edov=ABSENT), tenant="common"
+    )
+    with pytest.raises(oauth.OAuthError) as caught:
+        oauth._verify_microsoft_id_token(token)
+    assert "owns that email address" in caught.value.message
+
+
 # ---------------------------------------------------------------------------
 # Public-path boundary and the startup guard
 # ---------------------------------------------------------------------------

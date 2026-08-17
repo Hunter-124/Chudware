@@ -73,6 +73,10 @@ MICROSOFT_ISSUER_TEMPLATE = f"{MICROSOFT_AUTHORITY}/{{tid}}/v2.0"
 # of these the token's own ``tid`` is the only tenant we learn, so it cannot be
 # compared against configuration.
 MICROSOFT_MULTI_TENANT = frozenset({"common", "organizations", "consumers"})
+# The fixed tenant id every personal Microsoft account (MSA) signs in under.
+# It is not a directory anyone administers, which is why it is exempted from
+# the xms_edov requirement below.
+MICROSOFT_CONSUMERS_TID = "9188040d-6c67-4c5b-b112-36a304b66dad"
 
 _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 OAUTH_TRANSACTION_COOKIE = "chudware_oauth_transaction"
@@ -393,7 +397,12 @@ def _verify_microsoft_id_token(id_token: str) -> tuple[str, str]:
     # account-takeover vector. ``xms_edov`` is Microsoft asserting the domain
     # is verified as owned by the issuing tenant, so it is the only condition
     # under which the claim is proof rather than tenant-controlled input.
-    if not _edov_is_true(claims.get("xms_edov")):
+    # Personal accounts are the exception, and only because the premise above
+    # does not hold for them: the consumers tenant has no administrator who can
+    # mint users, Microsoft owns the address space, and xms_edov is an Entra-only
+    # claim that MSA never emits. Requiring it there would refuse every personal
+    # Microsoft account instead of stopping an attack.
+    if tid != MICROSOFT_CONSUMERS_TID and not _edov_is_true(claims.get("xms_edov")):
         raise OAuthError(
             "that Microsoft tenant has not proven it owns that email address, so "
             "we cannot sign you in with it — use another sign-in method, or ask "

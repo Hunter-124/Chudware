@@ -550,10 +550,9 @@ Three live-config defects surfaced while deploying it:
   the running process only survived because it had never been restarted since.
   The raw key was sitting at `~/chudware-web-data/entitlement_ed25519.key`; it
   is now encrypted into `chudware-entitlement.cred` and the canonical hardened
-  unit from `deploy/` is installed. **Staging is in exactly this state**: it
-  still runs pre-requirement code and has no
-  `chudware-entitlement-staging.cred`, so the next restart will fail its
-  startup. Provision that credential before touching it.
+  unit from `deploy/` is installed. Staging was in exactly this state and has
+  since been fixed the same way — see the staging note at the end of this
+  section.
 
 Provider credentials existed nowhere on the host when this landed. **Google and
 GitHub are now configured and live**, both probed against their token endpoints
@@ -570,10 +569,57 @@ Proven end to end afterwards: a sign-in that touched no password landed on
 `/desktop/authorize`, and a loopback listener standing in for the desktop app
 captured a signed `enterprise` entitlement.
 
-**Microsoft is still unconfigured.** The tenant is `Default Directory`
-(`haedmonds69gmail.onmicrosoft.com`) and the Entra portal session is live, but
-finishing it needs an interactive Microsoft sign-in, and `oauth.py`'s nOAuth
-guard additionally requires the `xms_edov` optional ID-token claim on the app
-registration — configure that at the same time or Microsoft sign-ins will be
-refused by our own callback. Redirect URI:
-`https://app.chudware.com/api/auth/oauth/microsoft/callback`.
+**Microsoft is now configured and proven end to end** (personal Microsoft
+account, no password, landed in the portal as an Enterprise admin). App
+registration `Chudware` = `19a4341c-3a4e-41ac-aa3e-358743497856`, tenant
+`d8b2abaa-94b3-475a-83a3-dcee5131d7c4` (`Default Directory` /
+`haedmonds69gmail.onmicrosoft.com`), audience "all Microsoft account users",
+redirect `https://app.chudware.com/api/auth/oauth/microsoft/callback`, optional
+ID-token claims `email` + `xms_edov`, Graph `email` permission on. A duplicate
+`Chudware` registration (`8e081bc7…`) was deleted; only one exists now.
+`CHUDWARE_WEB_MICROSOFT_CLIENT_SECRET` is the key name — `_SECRET` is dead env.
+
+Four things cost real time here, all worth knowing before touching Entra again:
+
+- **Device-code flows cannot be used in this tenant.** Both Azure CLI and Graph
+  CLI die with `AADSTS530035` after a *successful* sign-in. There are no
+  Conditional Access policies to relax (no Premium licence), so this is
+  security defaults blocking device code outright. Portal or nothing.
+- **A client secret scraped from the portal DOM can be wrong.** The value read
+  out of the row's input did not match the real secret, and
+  `grant_type=authorization_code` still answers `invalid_grant` for a bad
+  secret because the code is checked first. Validate every secret with
+  `grant_type=client_credentials&scope=…/.default` before deploying it: that
+  answers `invalid_client` / `AADSTS7000215` immediately, or returns a token.
+- **An app registration holds at most two client secrets.** Creating a third
+  fails with "credential limit has been reached".
+- **`xms_edov` is Entra-only.** Requiring it from every Microsoft identity
+  refused every *personal* Microsoft account, which is the common case. The
+  guard now exempts the fixed consumers tenant
+  (`9188040d-6c67-4c5b-b112-36a304b66dad`) and still demands proof of domain
+  ownership from every real directory — see `oauth.MICROSOFT_CONSUMERS_TID`.
+
+### Clicking "Authorize" did nothing — CSP `form-action`
+
+The consent form POSTs to `/desktop/authorize`, which used to answer `303` to
+`http://127.0.0.1:<port>/callback`. Chromium enforces `form-action 'self'`
+against the *redirect target* of a form submission, so the loopback hop was
+aborted inside the browser (`net::ERR_ABORTED`, and a
+`securitypolicyviolation` event naming `form-action` when instrumented live).
+`curl` never reproduced it. The POST now returns a handoff page whose meta
+refresh is an ordinary document navigation, plus a manual button for when the
+app is not listening; `tests/test_desktop_oauth_chain.py` pins that a redirect
+cannot come back.
+
+The consent page also reuses `/signin`'s two-panel `auth-shell` so it fills the
+viewport instead of being a narrow centred column.
+
+### Staging is no longer one restart from failing
+
+`chudware-entitlement-staging.cred` was provisioned from
+`~/chudware-web-data/entitlement_ed25519.key` with
+`systemd-creds encrypt --user --name=entitlement.key`, and the installed
+staging unit — still the pre-hardening one, with the dead
+`CHUDWARE_WEB_PUBLIC_URL` spelling and no `LoadCredentialEncrypted` — was
+replaced with the canonical `Webservice/deploy/chudware-gateway-staging.service`.
+Staging restarts clean on port 8310 (`healthz=200`).

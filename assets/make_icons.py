@@ -121,6 +121,16 @@ CONTRACT_NAMES: list[str] = [
     "file_code", "file_archive", "file_generic",
     "artifacts",
     "orbit_auto", "depth_3d", "legend", "isolate",
+    # ---- 2026-08-17 full 3D-render coverage (append-only; appended LAST so
+    # every pre-existing row keeps its packed UVs). Engine-rendered tiles via
+    # scripts/icon_pipeline.py recipes; the drawers below are FALLBACK glyphs. ----
+    "rotate_ent", "stock",
+    "ws_model", "ws_drawing", "ws_electronics", "ws_simulate",
+    "ecad_pcb", "ecad_board3d", "ecad_footprint", "ecad_route", "ecad_via",
+    "ecad_zone", "ecad_autoroute", "ecad_fill", "ecad_gerber", "ecad_drill",
+    "ecad_drc", "ecad_update",
+    "sch_new", "sch_symbol", "sch_wire", "sch_power", "sch_label", "sch_erc",
+    "sch_simulate",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -4207,6 +4217,331 @@ def draw_isolate(d, cell, p):
     circle(d, cx, cy, ring, outline=p.accent, lw=max(1, int(lw * 0.9)))
     filled_circle(d, cx, cy, s * 0.12, p.accent)
 
+# ---- 2026-08-17 fallback glyphs for engine-rendered tiles ----------------
+# These are only ever seen if scratch/icon_render/<name>.png is missing, so they
+# stay deliberately minimal: 2 px stroke, one motif, both themes come free.
+
+def _board_rect(d, s, p, lw, fill_alpha=26):
+    """Shared ECAD substrate: the PCB outline every ecad_* fallback sits on."""
+    x0, y0, x1, y1 = s * 0.12, s * 0.20, s * 0.88, s * 0.80
+    d.rounded_rectangle([x0, y0, x1, y1], radius=int(s * 0.05),
+                        fill=_rgba(p.stroke, fill_alpha), outline=p.stroke, width=lw)
+    return x0, y0, x1, y1
+
+
+def _sheet_rect(d, s, p, lw):
+    """Shared schematic sheet: the paper outline every sch_* fallback sits on."""
+    x0, y0, x1, y1 = s * 0.16, s * 0.14, s * 0.84, s * 0.86
+    d.rectangle([x0, y0, x1, y1], fill=_rgba(p.stroke, 22), outline=p.stroke, width=lw)
+    return x0, y0, x1, y1
+
+
+@icon("rotate_ent")
+def draw_rotate_ent(d, cell, p):
+    """Sketch rotate: curved arrow swinging a bar about a pivot."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.line([(s * 0.24, s * 0.78), (s * 0.78, s * 0.78)], fill=p.stroke, width=lw)
+    filled_circle(d, s * 0.24, s * 0.78, lw * 1.1, p.stroke)
+    arc_segment(d, s * 0.24, s * 0.78, s * 0.46, 250, 340, p.accent, lw)
+    arrow(d, s * 0.62, s * 0.40, s * 0.70, s * 0.34, p.accent, lw)
+
+
+@icon("stock")
+def draw_stock(d, cell, p):
+    """Stock body: a plain rectangular billet."""
+    s = cell * SS
+    shaded_prism(d, s, s * 0.16, s * 0.44, s * 0.50, s * 0.34, s * 0.18, s * 0.14,
+                 p, accent=False)
+
+
+@icon("ws_model")
+def draw_ws_model(d, cell, p):
+    """Workspace tab: Model — the solid part itself."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    iso_box(d, s * 0.50, s * 0.52, s * 0.34, p.stroke, lw)
+
+
+@icon("ws_drawing")
+def draw_ws_drawing(d, cell, p):
+    """Workspace tab: Drawing — a sheet with a view and a dimension line."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rectangle([s * 0.12, s * 0.16, s * 0.88, s * 0.84],
+                fill=_rgba(p.stroke, 22), outline=p.stroke, width=lw)
+    d.rectangle([s * 0.24, s * 0.28, s * 0.62, s * 0.56],
+                fill=_rgba(p.accent, 55), outline=p.accent, width=max(1, lw // 2))
+    d.line([(s * 0.24, s * 0.70), (s * 0.76, s * 0.70)], fill=p.accent, width=max(1, lw // 2))
+    for x in (0.24, 0.76):
+        d.line([(s * x, s * 0.64), (s * x, s * 0.76)], fill=p.accent, width=max(1, lw // 2))
+
+
+@icon("ws_electronics")
+def draw_ws_electronics(d, cell, p):
+    """Workspace tab: Electronics — a board with a chip and traces."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _board_rect(d, s, p, lw)
+    d.rectangle([s * 0.36, s * 0.38, s * 0.64, s * 0.62],
+                fill=_rgba(p.accent, 80), outline=p.accent, width=max(1, lw // 2))
+    for y in (0.44, 0.56):
+        d.line([(s * 0.20, s * y), (s * 0.36, s * y)], fill=p.accent, width=max(1, lw // 2))
+        d.line([(s * 0.64, s * y), (s * 0.80, s * y)], fill=p.accent, width=max(1, lw // 2))
+
+
+@icon("ws_simulate")
+def draw_ws_simulate(d, cell, p):
+    """Workspace tab: Simulate — a loaded, meshed body deflecting."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rectangle([s * 0.16, s * 0.52, s * 0.84, s * 0.78],
+                fill=_rgba(p.stroke, 26), outline=p.stroke, width=lw)
+    for x in (0.39, 0.61):
+        d.line([(s * x, s * 0.52), (s * x, s * 0.78)], fill=_rgba(p.stroke, 130),
+               width=max(1, lw // 2))
+    d.line([(s * 0.16, s * 0.65), (s * 0.84, s * 0.65)], fill=_rgba(p.stroke, 130),
+           width=max(1, lw // 2))
+    arrow(d, s * 0.50, s * 0.16, s * 0.50, s * 0.46, p.accent, lw)
+
+
+@icon("ecad_pcb")
+def draw_ecad_pcb(d, cell, p):
+    """ECAD board editor: substrate with a chip footprint centred."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _board_rect(d, s, p, lw)
+    d.rectangle([s * 0.34, s * 0.36, s * 0.66, s * 0.64],
+                fill=_rgba(p.accent, 70), outline=p.accent, width=max(1, lw // 2))
+    for i in range(3):
+        y = s * (0.42 + i * 0.08)
+        d.line([(s * 0.24, y), (s * 0.34, y)], fill=p.accent, width=max(1, lw // 2))
+        d.line([(s * 0.66, y), (s * 0.76, y)], fill=p.accent, width=max(1, lw // 2))
+
+
+@icon("ecad_board3d")
+def draw_ecad_board3d(d, cell, p):
+    """3D board preview: the substrate seen in isometric with a component on top."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    board = [(s * 0.10, s * 0.60), (s * 0.52, s * 0.80), (s * 0.90, s * 0.58),
+             (s * 0.48, s * 0.38)]
+    d.polygon(board, fill=_rgba(p.stroke, 40))
+    d.line(board + [board[0]], fill=p.stroke, width=lw)
+    chip = [(s * 0.38, s * 0.48), (s * 0.56, s * 0.57), (s * 0.72, s * 0.48),
+            (s * 0.54, s * 0.39)]
+    d.polygon(chip, fill=_rgba(p.accent, 90))
+    d.line(chip + [chip[0]], fill=p.accent, width=max(1, lw // 2))
+
+
+@icon("ecad_footprint")
+def draw_ecad_footprint(d, cell, p):
+    """Footprint editor: pad rows framing an empty body outline."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rectangle([s * 0.34, s * 0.28, s * 0.66, s * 0.72],
+                outline=p.stroke, width=lw)
+    for i in range(3):
+        y0 = s * (0.32 + i * 0.16)
+        d.rectangle([s * 0.14, y0, s * 0.30, y0 + s * 0.09],
+                    fill=_rgba(p.accent, 110), outline=p.accent, width=max(1, lw // 2))
+        d.rectangle([s * 0.70, y0, s * 0.86, y0 + s * 0.09],
+                    fill=_rgba(p.accent, 110), outline=p.accent, width=max(1, lw // 2))
+
+
+@icon("ecad_route")
+def draw_ecad_route(d, cell, p):
+    """Route trace: a manual dog-leg track between two pads."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _board_rect(d, s, p, lw, fill_alpha=18)
+    pts = [(s * 0.22, s * 0.68), (s * 0.44, s * 0.68), (s * 0.60, s * 0.40),
+           (s * 0.80, s * 0.40)]
+    polyline(d, pts, p.accent, lw)
+    filled_circle(d, pts[0][0], pts[0][1], lw * 1.1, p.accent)
+    filled_circle(d, pts[-1][0], pts[-1][1], lw * 1.1, p.accent)
+
+
+@icon("ecad_via")
+def draw_ecad_via(d, cell, p):
+    """Via: an annular ring punched through the board, trace entering it."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _board_rect(d, s, p, lw, fill_alpha=18)
+    cx, cy = s * 0.56, s * 0.50
+    circle(d, cx, cy, s * 0.20, fill=_rgba(p.accent, 90), outline=p.accent, lw=lw)
+    filled_circle(d, cx, cy, s * 0.085, (0, 0, 0, 0))
+    circle(d, cx, cy, s * 0.085, outline=p.accent, lw=max(1, lw // 2))
+    d.line([(s * 0.18, s * 0.50), (cx - s * 0.20, s * 0.50)], fill=p.accent, width=lw)
+
+
+@icon("ecad_zone")
+def draw_ecad_zone(d, cell, p):
+    """Copper zone: a hatched pour region inside the board outline."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    x0, y0, x1, y1 = _board_rect(d, s, p, lw, fill_alpha=18)
+    zx0, zy0, zx1, zy1 = s * 0.22, s * 0.30, s * 0.78, s * 0.70
+    d.rectangle([zx0, zy0, zx1, zy1], fill=_rgba(p.accent, 55),
+                outline=p.accent, width=max(1, lw // 2))
+    step = s * 0.12
+    x = zx0
+    while x < zx1 + (zy1 - zy0):
+        a = (max(zx0, x - (zy1 - zy0)), min(zy1, zy0 + (x - zx0)))
+        b = (min(zx1, x), max(zy0, zy1 - (zx1 - min(zx1, x))))
+        d.line([a, b], fill=_rgba(p.accent, 150), width=max(1, lw // 2))
+        x += step
+
+
+@icon("ecad_autoroute")
+def draw_ecad_autoroute(d, cell, p):
+    """Autoroute: several tracks laid automatically across the board."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _board_rect(d, s, p, lw, fill_alpha=18)
+    for i, y in enumerate((0.34, 0.50, 0.66)):
+        bend = s * (0.44 + i * 0.08)
+        polyline(d, [(s * 0.20, s * y), (bend, s * y), (bend + s * 0.10, s * 0.50),
+                     (s * 0.80, s * 0.50)], p.accent, max(1, lw * 2 // 3))
+
+
+@icon("ecad_fill")
+def draw_ecad_fill(d, cell, p):
+    """Fill zones: solid copper pour flooding the board around a keep-out."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    x0, y0, x1, y1 = _board_rect(d, s, p, lw, fill_alpha=18)
+    d.rectangle([s * 0.20, s * 0.28, s * 0.80, s * 0.72], fill=_rgba(p.accent, 120),
+                outline=p.accent, width=max(1, lw // 2))
+    d.rectangle([s * 0.42, s * 0.42, s * 0.58, s * 0.58], fill=(0, 0, 0, 0),
+                outline=p.stroke, width=max(1, lw // 2))
+
+
+@icon("ecad_gerber")
+def draw_ecad_gerber(d, cell, p):
+    """Gerber export: stacked layer sheets peeling off the board."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    for i, (dx, dy, col) in enumerate((( 0.00, 0.00, p.stroke),
+                                       (-0.06, -0.13, p.stroke),
+                                       (-0.12, -0.26, p.accent))):
+        pts = [(s * (0.22 + dx), s * (0.74 + dy)), (s * (0.56 + dx), s * (0.88 + dy)),
+               (s * (0.90 + dx), s * (0.74 + dy)), (s * (0.56 + dx), s * (0.60 + dy))]
+        d.polygon(pts, fill=_rgba(col, 55 if i < 2 else 90))
+        d.line(pts + [pts[0]], fill=col, width=max(1, lw // 2))
+
+
+@icon("ecad_drill")
+def draw_ecad_drill(d, cell, p):
+    """Drill file: the board's hole pattern punched through."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _board_rect(d, s, p, lw, fill_alpha=18)
+    for cx, cy in ((0.30, 0.36), (0.50, 0.58), (0.70, 0.36), (0.70, 0.66)):
+        circle(d, s * cx, s * cy, s * 0.085, fill=(0, 0, 0, 0), outline=p.accent, lw=lw)
+
+
+@icon("ecad_drc")
+def draw_ecad_drc(d, cell, p):
+    """Design-rule check: the board validated with a check mark."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _board_rect(d, s, p, lw, fill_alpha=18)
+    check_mark(d, s * 0.52, s * 0.50, s * 0.28, p.accent, lw)
+
+
+@icon("ecad_update")
+def draw_ecad_update(d, cell, p):
+    """Update board from schematic: the board with a refresh arc."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _board_rect(d, s, p, lw, fill_alpha=18)
+    cx, cy, r = s * 0.52, s * 0.50, s * 0.24
+    arc_segment(d, cx, cy, r, 40, 320, p.accent, lw)
+    arrow(d, cx + r * 0.55, cy - r * 0.95, cx + r * 1.05, cy - r * 0.45, p.accent, lw)
+
+
+@icon("sch_new")
+def draw_sch_new(d, cell, p):
+    """New schematic: a blank sheet with a plus."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _sheet_rect(d, s, p, lw)
+    plus_sign(d, s * 0.50, s * 0.50, s * 0.20, p.accent, lw)
+
+
+@icon("sch_symbol")
+def draw_sch_symbol(d, cell, p):
+    """Place symbol: a resistor zigzag with leads on the sheet."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _sheet_rect(d, s, p, lw)
+    y = s * 0.50
+    pts = [(s * 0.22, y), (s * 0.34, y), (s * 0.40, s * 0.36), (s * 0.50, s * 0.64),
+           (s * 0.60, s * 0.36), (s * 0.66, y), (s * 0.78, y)]
+    polyline(d, pts, p.accent, lw)
+
+
+@icon("sch_wire")
+def draw_sch_wire(d, cell, p):
+    """Draw wire: an orthogonal net with junction dots."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _sheet_rect(d, s, p, lw)
+    pts = [(s * 0.24, s * 0.32), (s * 0.50, s * 0.32), (s * 0.50, s * 0.68),
+           (s * 0.76, s * 0.68)]
+    polyline(d, pts, p.accent, lw)
+    filled_circle(d, s * 0.50, s * 0.32, lw * 1.1, p.accent)
+    filled_circle(d, s * 0.50, s * 0.68, lw * 1.1, p.accent)
+
+
+@icon("sch_power")
+def draw_sch_power(d, cell, p):
+    """Power/ground port: a lead dropping into a ground symbol."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _sheet_rect(d, s, p, lw)
+    d.line([(s * 0.50, s * 0.26), (s * 0.50, s * 0.54)], fill=p.accent, width=lw)
+    for i, half in enumerate((0.22, 0.14, 0.07)):
+        y = s * (0.54 + i * 0.09)
+        d.line([(s * (0.50 - half), y), (s * (0.50 + half), y)], fill=p.accent, width=lw)
+
+
+@icon("sch_label")
+def draw_sch_label(d, cell, p):
+    """Net label: a tag flag attached to a wire."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _sheet_rect(d, s, p, lw)
+    d.line([(s * 0.22, s * 0.62), (s * 0.40, s * 0.62)], fill=p.stroke, width=lw)
+    tag = [(s * 0.40, s * 0.62), (s * 0.52, s * 0.38), (s * 0.80, s * 0.38),
+           (s * 0.80, s * 0.62)]
+    d.polygon(tag, fill=_rgba(p.accent, 80))
+    d.line(tag + [tag[0]], fill=p.accent, width=max(1, lw // 2))
+
+
+@icon("sch_erc")
+def draw_sch_erc(d, cell, p):
+    """Electrical-rule check: the sheet validated with a check mark."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _sheet_rect(d, s, p, lw)
+    check_mark(d, s * 0.50, s * 0.50, s * 0.26, p.accent, lw)
+
+
+@icon("sch_simulate")
+def draw_sch_simulate(d, cell, p):
+    """Simulate circuit: a waveform traced across the sheet."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _sheet_rect(d, s, p, lw)
+    pts = []
+    for i in range(25):
+        t = i / 24.0
+        pts.append((s * (0.22 + 0.56 * t), s * (0.50 - 0.20 * math.sin(t * 2 * math.pi))))
+    polyline(d, pts, p.accent, lw)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -4249,6 +4584,37 @@ RENDERED_RECIPE_NAMES: set[str] = {
     "sm_base_flange", "sm_edge_flange", "sm_flat_pattern", "sm_hem", "sm_jog",
     "split", "stock", "subtract", "sweep", "sweep_cut", "thread",
     "weld_end_cap", "weld_gusset", "weld_member",
+    # ---- 2026-08-17: full 3D-render coverage. Every ribbon tool icon across
+    # Sketch / Evaluate / Simulation / Assembly / ECAD / Schematic / workspaces
+    # now ships an engine-rendered tile from scripts/icon_pipeline.py recipes;
+    # the make_icons drawers above are fallback-only. ----
+    "sketch", "line", "rect_corner", "rect_center", "rect_3pt_corner",
+    "rect_3pt_center", "parallelogram", "circle", "circle_perimeter",
+    "arc_3pt", "arc_center", "arc_tangent", "polygon", "poly_triangle",
+    "poly_square", "poly_pentagon", "poly_octagon", "poly_star",
+    "slot", "slot_ctr_str", "slot_arc_3pt", "slot_arc_ctr",
+    "spline", "spline_style", "spline_surface", "spline_equation",
+    "ellipse", "ellipse_partial", "parabola", "conic", "airfoil",
+    "trim", "extend", "offset_ent", "convert_ent", "mirror_ent",
+    "pattern_lin_ent", "pattern_circ_ent", "move_ent", "rotate_ent",
+    "construction", "relations", "fix", "smart_dim", "point_ent", "text_ent",
+    "study_static", "study_modal", "study_flow", "study_thermal",
+    "study_fatigue", "fixture", "load_force", "load_pressure",
+    "mesh", "mesh_tet", "mesh_hex", "mesh_auto", "run_study", "results",
+    "flow_arrow", "ws_simulate",
+    "measure", "mass_props", "section_props", "interference_eval",
+    "draft_analysis", "thickness", "curvature", "zebra", "symmetry_check",
+    "check", "geometry_analysis", "performance",
+    "insert_component", "mate", "move_component", "rotate_component",
+    "pattern_component", "smart_fasteners", "exploded_view", "bom",
+    "interference",
+    "boundary", "wrap", "ref_plane", "ref_axis", "ref_point", "ref_csys",
+    "ws_model", "ws_drawing", "ws_electronics",
+    "ecad_pcb", "ecad_board3d", "ecad_footprint", "ecad_route", "ecad_via",
+    "ecad_zone", "ecad_autoroute", "ecad_fill", "ecad_gerber", "ecad_drill",
+    "ecad_drc", "ecad_update",
+    "sch_new", "sch_symbol", "sch_wire", "sch_power", "sch_label", "sch_erc",
+    "sch_simulate",
 }
 
 # Scratch dir of engine-rendered tiles. Prefer these over whatever is already in

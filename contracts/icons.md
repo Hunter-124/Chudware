@@ -199,3 +199,68 @@ motif is one bold shape, never fine detail.
   focus ring, three neighbours dimmed to outlines on dim links. Neighbour alpha
   is 170, not the ~100 that reads as "dim" at 32 px — below ~150 they downsample
   to nothing at 20 px and the glyph collapses into a plain target mark.
+---
+
+## 2026-08-17 — Full 3D-render coverage
+
+**25 new cells (appended LAST in `CONTRACT_NAMES`, so every pre-existing cell
+keeps its packed UVs).** Each ships an engine-rendered tile; the `make_icons.py`
+drawers added alongside them are FALLBACK glyphs only, seen if a render is
+missing.
+
+**Sketch / model.**
+
+- `rotate_ent` — rotate selected sketch entities about a pivot.
+- `stock` — the raw rectangular billet a part starts from.
+
+**Workspace tabs.**
+
+- `ws_model` — Model workspace: the solid part itself.
+- `ws_drawing` — Drawing workspace: sheet with a projected view and a dimension.
+- `ws_electronics` — Electronics workspace: board with a chip and traces.
+- `ws_simulate` — Simulate workspace: a loaded, meshed body.
+
+**ECAD (board editor).**
+
+- `ecad_pcb` — open/edit the PCB layout.
+- `ecad_board3d` — 3D board preview with placed components.
+- `ecad_footprint` — footprint (land-pattern) editor.
+- `ecad_route` — route a track manually.
+- `ecad_via` — place a via through the stack-up.
+- `ecad_zone` — define a copper zone (hatched pour region).
+- `ecad_autoroute` — route the remaining nets automatically.
+- `ecad_fill` — flood/refill zones with copper, honouring keep-outs.
+- `ecad_gerber` — export Gerber layer set.
+- `ecad_drill` — export the drill (hole) file.
+- `ecad_drc` — run design-rule check.
+- `ecad_update` — update the board from the schematic.
+
+**Schematic.**
+
+- `sch_new` — new schematic sheet.
+- `sch_symbol` — place a component symbol.
+- `sch_wire` — draw a wire/net with junctions.
+- `sch_power` — place a power or ground port.
+- `sch_label` — attach a net label.
+- `sch_erc` — run electrical-rule check.
+- `sch_simulate` — simulate the circuit (waveform).
+
+**Render coverage.** Every ribbon tool icon across Sketch, Evaluate, Simulation,
+Assembly, the Features leftovers (`boundary`, `wrap`, `ref_*`), the workspace
+tabs, ECAD and Schematic now ships an engine-rendered tile produced by
+`scripts/icon_pipeline.py` recipes (`CHUDWARE_SHOT=iconpipe`, real modelling
+engine, no hand-painted pixels). All of those names are listed in
+`RENDERED_RECIPE_NAMES`, so a full `python assets/make_icons.py` glyph regen
+pastes the rendered pixels back instead of clobbering them; the procedural
+drawers remain as the never-blank fallback.
+
+**Colour language** (supersedes the old flat-teal look).
+
+- Base / stock / source / ghost / cut bodies: steel grey (`0.66, 0.69, 0.73`,
+  metallic 0.85, roughness 0.38).
+- The tool's ACTION — newly created material, the result or the copy — carries
+  the teal accent. Domain materials keep their own colour: PCB green, copper,
+  black plastic, white sheet, red-hot / blue-cold for thermal.
+- Each tile carries at most one (rarely two) annotation cue — arrow, dimension
+  arrow, dash, arc, ring, dots or a corner badge — pointing in the tool's
+  direction of action, overlaid after render and bolded so it reads at 32 px.

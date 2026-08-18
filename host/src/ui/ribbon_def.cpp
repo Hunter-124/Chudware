@@ -262,7 +262,7 @@ static const RibbonCmd kCmds[] = {
     // deliverable home) in its own group. From an open part it creates a drawing sheet with the
     // standard four views and opens it as a Drawing tab. Reuses the section_props icon as a
     // sheet-ish glyph until a dedicated drawing icon ships.
-    { "make_drawing",        "Make Drawing",    "section_props",    "Evaluate", "Drawing",        true,  nullptr,          false },
+    { "make_drawing",        "Make Drawing",    "file_doc",         "Evaluate", "Drawing",        true,  nullptr,          false },
 
     // =========================================================================
     // Tab: Sheet Metal — base + edge flange drive the engine sm_* features.
@@ -307,29 +307,29 @@ static const RibbonCmd kCmds[] = {
 
     // --- Group: New ---
     { "ecad_ai_design",     "AI Design",      "ai_panel",        "PCB Design", "New",        true,  nullptr, false },
-    { "ecad_new_pcb",       "PCB Layout",     "extrude_boss",    "PCB Design", "New",        true,  nullptr, false },
-    { "ecad_open",          "Open",           "ref_plane",       "PCB Design", "New",        false, nullptr, false },
-    { "ecad_save",          "Save",           "ok_check",        "PCB Design", "New",        false, nullptr, false },
+    { "ecad_new_pcb",       "PCB Layout",     "ecad_pcb",        "PCB Design", "New",        true,  nullptr, false },
+    { "ecad_open",          "Open",           "open",            "PCB Design", "New",        false, nullptr, false },
+    { "ecad_save",          "Save",           "save",            "PCB Design", "New",        false, nullptr, false },
 
     // --- Group: Board ---
-    { "pcb_update_from_sch","Update Board",   "ok_check",        "PCB Design", "Board",      true,  nullptr, false },
-    { "pcb_add_footprint",  "Footprint",      "point_ent",       "PCB Design", "Board",      false, nullptr, false },
-    { "pcb_add_track",      "Route",          "line",            "PCB Design", "Board",      false, nullptr, false },
-    { "pcb_add_via",        "Via",            "circle",          "PCB Design", "Board",      false, nullptr, false },
-    { "pcb_add_zone",       "Copper Zone",    "rect_center",     "PCB Design", "Board",      false, nullptr, false },
-    { "ecad_autoroute",     "Autoroute",      "sweep",           "PCB Design", "Board",      true,  nullptr, false },
-    { "ecad_fill_zones",    "Fill Zones",     "shell",           "PCB Design", "Board",      false, nullptr, false },
+    { "pcb_update_from_sch","Update Board",   "ecad_update",     "PCB Design", "Board",      true,  nullptr, false },
+    { "pcb_add_footprint",  "Footprint",      "ecad_footprint",  "PCB Design", "Board",      false, nullptr, false },
+    { "pcb_add_track",      "Route",          "ecad_route",      "PCB Design", "Board",      false, nullptr, false },
+    { "pcb_add_via",        "Via",            "ecad_via",        "PCB Design", "Board",      false, nullptr, false },
+    { "pcb_add_zone",       "Copper Zone",    "ecad_zone",       "PCB Design", "Board",      false, nullptr, false },
+    { "ecad_autoroute",     "Autoroute",      "ecad_autoroute",  "PCB Design", "Board",      true,  nullptr, false },
+    { "ecad_fill_zones",    "Fill Zones",     "ecad_fill",       "PCB Design", "Board",      false, nullptr, false },
 
     // --- Group: Outputs ---
-    { "ecad_to_3d",         "Board to 3D",    "extrude_boss",    "PCB Design", "Outputs",    true,  nullptr, false },
-    { "ecad_export_gerber", "Gerbers",        "ref_plane",       "PCB Design", "Outputs",    false, nullptr, false, CommandCapability::Export },
-    { "ecad_export_drill",  "Drill",          "hole_wizard",     "PCB Design", "Outputs",    false, nullptr, false, CommandCapability::Export },
+    { "ecad_to_3d",         "Board to 3D",    "ecad_board3d",    "PCB Design", "Outputs",    true,  nullptr, false },
+    { "ecad_export_gerber", "Gerbers",        "ecad_gerber",     "PCB Design", "Outputs",    false, nullptr, false, CommandCapability::Export },
+    { "ecad_export_drill",  "Drill",          "ecad_drill",      "PCB Design", "Outputs",    false, nullptr, false, CommandCapability::Export },
     { "ecad_export_bom",    "BOM",            "bom",             "PCB Design", "Outputs",    false, nullptr, false, CommandCapability::Export },
 
     // --- Group: Checks --- (Run DRC promoted to a big primary button to the right of Outputs,
     // sized like Board to 3D / PCB Layout; the old small Board-group entry + the manager toolbar
     // icon were removed so there is one obvious DRC affordance.)
-    { "ecad_run_drc",       "Run DRC",        "interference",    "PCB Design", "Checks",     true,  nullptr, false },
+    { "ecad_run_drc",       "Run DRC",        "ecad_drc",        "PCB Design", "Checks",     true,  nullptr, false },
 
     // =========================================================================
     // Tab: Schematic  (split from the old "PCB" tab — schematic capture + analog sim)
@@ -338,18 +338,18 @@ static const RibbonCmd kCmds[] = {
     // =========================================================================
 
     // --- Group: New ---
-    { "ecad_new_sch",       "New Schematic",  "sketch",          "Schematic", "New",        true,  nullptr, false },
+    { "ecad_new_sch",       "New Schematic",  "sch_new",         "Schematic", "New",        true,  nullptr, false },
 
     // --- Group: Schematic ---
-    { "sch_add_symbol",     "Place Symbol",   "point_ent",       "Schematic", "Schematic",  true,  nullptr, false },
-    { "sch_add_wire",       "Wire",           "line",            "Schematic", "Schematic",  false, nullptr, false },
-    { "sch_add_label",      "Net Label",      "text_ent",        "Schematic", "Schematic",  false, nullptr, false },
-    { "sch_add_power",      "Power Port",     "construction",    "Schematic", "Schematic",  false, nullptr, false },
+    { "sch_add_symbol",     "Place Symbol",   "sch_symbol",      "Schematic", "Schematic",  true,  nullptr, false },
+    { "sch_add_wire",       "Wire",           "sch_wire",        "Schematic", "Schematic",  false, nullptr, false },
+    { "sch_add_label",      "Net Label",      "sch_label",       "Schematic", "Schematic",  false, nullptr, false },
+    { "sch_add_power",      "Power Port",     "sch_power",       "Schematic", "Schematic",  false, nullptr, false },
     { "sch_annotate",       "Annotate",       "ok_check",        "Schematic", "Schematic",  false, nullptr, false },
-    { "ecad_run_erc",       "Run ERC",        "interference",    "Schematic", "Schematic",  false, nullptr, false },
+    { "ecad_run_erc",       "Run ERC",        "sch_erc",         "Schematic", "Schematic",  false, nullptr, false },
 
     // --- Group: Analyze (native analog simulator) ---
-    { "ecad_simulate",      "Simulate",       "study_flow",      "Schematic", "Analyze",    true,  nullptr, false },
+    { "ecad_simulate",      "Simulate",       "sch_simulate",    "Schematic", "Analyze",    true,  nullptr, false },
 
     // =========================================================================
     // Tab: Surfaces — open-surface (kind="surface") body features. cmd_id == the
@@ -397,7 +397,7 @@ static const RibbonCmd kCmds[] = {
     { "dwg_sheet_props",  "Sheet Props",   "settings",      "View Layout", "Sheet", true,  nullptr, false },
     { "dwg_rebuild",      "Rebuild",       "refresh",       "View Layout", "Sheet", false, nullptr, false },
     { "dwg_fit",          "Fit",           "zoom_fit",      "View Layout", "Sheet", false, nullptr, false, CommandCapability::Inspect },
-    { "dwg_export_dxf",   "Export DXF",    "section_props", "View Layout", "Sheet", false, nullptr, false, CommandCapability::Export },
+    { "dwg_export_dxf",   "Export DXF",    "file_doc",     "View Layout", "Sheet", false, nullptr, false, CommandCapability::Export },
     { "dwg_export_pdf",   "Export PDF",    "save",          "View Layout", "Sheet", false, nullptr, false, CommandCapability::Export },
     // --- Group: Section --- custom-section controls applied by the Section tool.
     { "dwg_section_half",   "Half Section",  "section_view",  "View Layout", "Section", false, nullptr, false },
@@ -656,29 +656,29 @@ static const RibbonCmd kCmds[] = {
 
     // RE-ANCHOR(reveng): tab "Reverse Eng" ribbon rows — RE-03 appends shell; RE-27 polishes.
     // Session · Sources · Scale · Reconstruct · Model · Deliver groups (contracts/reveng.md).
-    { "reveng_new",          "New Session",    "new_part",        "Reverse Eng", "Session",     true,  nullptr, false },
-    { "reveng_open",         "Open Session",   "open_part",       "Reverse Eng", "Session",     false, nullptr, false },
+    { "reveng_new",          "New Session",    "new_doc",         "Reverse Eng", "Session",     true,  nullptr, false },
+    { "reveng_open",         "Open Session",   "open",            "Reverse Eng", "Session",     false, nullptr, false },
     { "reveng_from_library", "From Library",   "insert_component","Reverse Eng", "Session",     false, nullptr, false },
     // Sources group — photos / video / webcam / datasheet ingest lanes (RE-19 / RE-30).
-    { "reveng_add_photos",   "Add Photos",     "new_part",        "Reverse Eng", "Sources",     true,  nullptr, false },
+    { "reveng_add_photos",   "Add Photos",     "file_image",      "Reverse Eng", "Sources",     true,  nullptr, false },
     { "reveng_add_video",    "Add Video",      "sweep",           "Reverse Eng", "Sources",     false, nullptr, false },
     { "reveng_webcam",       "Webcam",         "measure",         "Reverse Eng", "Sources",     false, nullptr, false },
-    { "reveng_datasheet",    "Datasheet",      "open_part",       "Reverse Eng", "Sources",     false, nullptr, false },
+    { "reveng_datasheet",    "Datasheet",      "file_doc",        "Reverse Eng", "Sources",     false, nullptr, false },
     // Scale group — ArUco mat / two-point pick / known dimension (contracts/reveng.md §3.1).
     { "reveng_scale_aruco",  "ArUco Mat",      "smart_dim",       "Reverse Eng", "Scale",       true,  nullptr, false },
-    { "reveng_scale_points", "Two Points",     "eval_measure",    "Reverse Eng", "Scale",       false, nullptr, false },
+    { "reveng_scale_points", "Two Points",     "measure",         "Reverse Eng", "Scale",       false, nullptr, false },
     { "reveng_scale_known",  "Known Dim",      "measure",         "Reverse Eng", "Scale",       false, nullptr, false },
     // Reconstruct group — sparse → dense → mesh + 3DGS splat view (RE-21 / RE-28 / RE-27).
-    { "reveng_reconstruct",  "Reconstruct",    "dwg_rebuild",     "Reverse Eng", "Reconstruct", true,  nullptr, false },
+    { "reveng_reconstruct",  "Reconstruct",    "refresh",         "Reverse Eng", "Reconstruct", true,  nullptr, false },
     { "reveng_splat_view",   "Splat View",     "mesh",            "Reverse Eng", "Reconstruct", false, nullptr, false },
     // Model group — fit primitives, AI-driven model, mesh-body fallback (contracts/reveng.md §4).
     { "reveng_fit",          "Fit Primitives", "fillet",          "Reverse Eng", "Model",       true,  nullptr, false },
-    { "reveng_ai_model",     "AI Model",       "new_part",        "Reverse Eng", "Model",       false, nullptr, false },
-    { "reveng_mesh_body",    "Mesh Body",      "sim_mesh",        "Reverse Eng", "Model",       false, nullptr, false },
+    { "reveng_ai_model",     "AI Model",       "ai_panel",        "Reverse Eng", "Model",       false, nullptr, false },
+    { "reveng_mesh_body",    "Mesh Body",      "mesh",            "Reverse Eng", "Model",       false, nullptr, false },
     // Deliver group — export bundle / add to Parts Hub / print scale mat.
-    { "reveng_export",       "Export",         "dwg_export_pdf",  "Reverse Eng", "Deliver",     true,  nullptr, false, CommandCapability::Export },
+    { "reveng_export",       "Export",         "save",            "Reverse Eng", "Deliver",     true,  nullptr, false, CommandCapability::Export },
     { "reveng_to_parts",     "Add to Parts",   "insert_component","Reverse Eng", "Deliver",     false, nullptr, false },
-    { "reveng_print_mat",    "Print Scale Mat","make_drawing",    "Reverse Eng", "Deliver",     false, nullptr, false },
+    { "reveng_print_mat",    "Print Scale Mat","file_doc",        "Reverse Eng", "Deliver",     false, nullptr, false },
 };
 // clang-format on
 

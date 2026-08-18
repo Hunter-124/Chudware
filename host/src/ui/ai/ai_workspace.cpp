@@ -9,7 +9,7 @@
 //
 // v3 (Hunter's UI directive): the main conversation owns the left; EVERYTHING else lives in
 // the right utility panel, switched by a vertical nav menu (Agent Hub | Session Plan |
-// Active Work | Documents | Sessions | Leaderboard | Metrics | Options). No permanent
+// Activity | Sessions | Insights | Options). No permanent
 // sessions rail, no bottom options strip. "Agent Hub" (OMP-style) lists every registered
 // sub-agent as
 // role-color-coded rows; clicking a row POPS UP a floating, role-themed chat window for that
@@ -44,13 +44,12 @@
 #include "ui_theme.h"
 #include "ui/metrics.h"            // cpMenu* rhythm tokens (gutter / row pad / gap / corner)
 #include "ui/widgets/kit.h"        // ui::kit — the app-wide section header / empty state
-#include "ui/leaderboard_ui.h"
-#include "ui/ai/active_work.h"
+#include "ui/ai/active_work.h"     // activeWorkPump (per-frame thumb queue)
 #include "ui/ai/plan_board.h"
-#include "ui/ai/docs_panel.h"
 #include "ui/ai/ai_prefs.h"
 #include "ui/settings_modal.h"     // drawHarnessSessionKnobs (shared Options-tab run-behavior grid)
-#include "ui/ai/metrics_view.h"
+#include "ui/ai/activity_view.h"   // composed Activity view (Active Work + Documents)
+#include "ui/ai/insights_view.h"   // composed Insights view (Leaderboard + Metrics)
 
 namespace ui {
 
@@ -60,8 +59,8 @@ namespace {
 struct AiWsState {
     // Which view the right utility panel shows (v3 vertical nav): 0 = Agent Hub (sub-agent
     // rows + live agent-execution DAG), 1 = Session Plan (plan board over persisted buildgraph
-    // runs), 2 = Active Work, 3 = Documents, 4 = Sessions, 5 = Leaderboard, 6 = Metrics,
-    // 7 = Options.
+    // runs), 2 = Activity (active work + documents), 3 = Sessions, 4 = Insights (leaderboard +
+    // metrics), 5 = Options.
     // The conversation window is always visible on the left, never a tab.
     int  view = 0;     // default to Agent Hub
 
@@ -73,10 +72,6 @@ struct AiWsState {
     // canvas pan/zoom
     ImVec2 pan{0.0f, 0.0f};
     float  zoom = 1.0f;
-
-    // Leaderboard cache (aicad.leaderboard/1).
-    ui::leaderboard::Board lb;
-    bool                   lbLoaded = false;
 };
 
 static AiWsState s_ai;
@@ -1598,7 +1593,7 @@ static void drawNavColumn(AppState& st, float navW) {
 
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
 
-    // Live-agent badge for the Agent Hub row; in-flight doc badge for Active Work.
+    // Live-agent badge for the Agent Hub row; in-flight doc badge for Activity.
     int live = 0;
     for (const auto& s : s_sub.sessions)
         if (s.status == "running" || s.status == "pending" ||
@@ -1610,11 +1605,9 @@ static void drawNavColumn(AppState& st, float navW) {
 
     if (navRow(0, "Agent Hub",    s_ai.view == 0, surf, live)) s_ai.view = 0;
     if (navRow(1, "Session Plan", s_ai.view == 1, surf))       s_ai.view = 1;
-    if (navRow(2, "Active Work",  s_ai.view == 2, surf, wip))  s_ai.view = 2;
-    if (navRow(3, "Documents",    s_ai.view == 3, surf))       s_ai.view = 3;
-    if (navRow(4, "Sessions",     s_ai.view == 4, surf))       s_ai.view = 4;
-    if (navRow(5, "Leaderboard",  s_ai.view == 5, surf))       s_ai.view = 5;
-    if (navRow(6, "Metrics",      s_ai.view == 6, surf))       s_ai.view = 6;
+    if (navRow(2, "Activity",     s_ai.view == 2, surf, wip))  s_ai.view = 2;
+    if (navRow(3, "Sessions",     s_ai.view == 3, surf))       s_ai.view = 3;
+    if (navRow(4, "Insights",     s_ai.view == 4, surf))       s_ai.view = 4;
 
     // Hairline + the utility section.
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
@@ -1626,7 +1619,7 @@ static void drawNavColumn(AppState& st, float navW) {
     }
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
 
-    if (navRow(7, "Options",      s_ai.view == 7, surf))       s_ai.view = 7;
+    if (navRow(5, "Options",      s_ai.view == 5, surf))       s_ai.view = 5;
 
     drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
@@ -1786,7 +1779,7 @@ static void drawOptionsView(AppState& st) {
 // ---- public entry point ------------------------------------------------------------
 
 // The right-panel content view: one glass pane hosting the nav-selected view (Agent Hub |
-// Session Plan | Active Work | Documents | Sessions | Leaderboard | Metrics | Options).
+// Session Plan | Activity | Sessions | Insights | Options).
 static void drawViewPane(AppState& st, bool busy) {
     // (no local uiScale: every dimension below comes from ui::metrics)
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
@@ -1830,32 +1823,16 @@ static void drawViewPane(AppState& st, bool busy) {
             else
                 drawPlanBoardView(st);
             break;
-        case 2:  // Active Work: live render grid of the docs agents are editing.
-            drawActiveWorkView(st);
+        case 2:  // Activity: live render grid of agent-edited docs + the documents panel.
+            drawActivityView(st);
             break;
-        case 3:  // Documents: in-tab office-document attach / preview / edit panel.
-            drawDocsPanel(st);
-            break;
-        case 4:  // Sessions: the docked Copilot's exact session list, in a wider pane.
+        case 3:  // Sessions: the docked Copilot's exact session list, in a wider pane.
             chatDrawSessionsList(st, busy);
             break;
-        case 5: {  // Leaderboard (aicad.leaderboard/1).
-            if (!s_ai.lbLoaded) {
-                s_ai.lb = ui::leaderboard::load();
-                s_ai.lbLoaded = true;
-            }
-            bool wantRefresh = false;
-            ui::leaderboard::drawFullPane(s_ai.lb, wantRefresh);
-            if (wantRefresh) {
-                s_ai.lb = ui::leaderboard::load();
-                s_ai.lbLoaded = true;
-            }
+        case 4:  // Insights: leaderboard board + token spend / usage aggregation.
+            drawInsightsView(st);
             break;
-        }
-        case 6:  // Metrics: token spend / usage aggregation across every session.
-            drawMetricsView(st);
-            break;
-        case 7:  // Options: run-behavior + workspace-visibility knobs.
+        case 5:  // Options: run-behavior + workspace-visibility knobs.
             drawOptionsView(st);
             break;
         default:

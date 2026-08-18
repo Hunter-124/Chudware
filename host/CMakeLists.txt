@@ -302,6 +302,8 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/plm/graph_thumbs.cpp   # PLM Graph grid-view iso thumbnails (.plm/thumbs cache)
   src/ui/plm_overview.cpp        # compact PLM overview (left manager tab, left of Explorer)
   src/ui/ai/ai_workspace.cpp
+  src/ui/ai/activity_view.cpp    # Activity view: Active Work + Documents composed sections
+  src/ui/ai/insights_view.cpp    # Insights view: Leaderboard + Metrics composed sections
   src/ui/ai/active_work.cpp     # Active Work: live grid of agent-modified docs + op tickers
   src/ui/ai/ai_prefs.cpp        # AI workspace UI prefs (verbosity / follow / previews)
   src/ui/ai/metrics_view.cpp    # AI workspace Metrics view (token spend / usage aggregation)

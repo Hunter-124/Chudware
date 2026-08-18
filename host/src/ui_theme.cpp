@@ -570,6 +570,91 @@ void glassSelectionGlow(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, co
     }
 }
 
+// Lerp two packed colours channel-wise (non-premultiplied, matching ImGui's blend).
+static inline ImU32 lerpU32(ImU32 a, ImU32 b, float t) {
+    const float u = 1.0f - t;
+    const int r = (int)(((a >> IM_COL32_R_SHIFT) & 0xFF) * u + ((b >> IM_COL32_R_SHIFT) & 0xFF) * t + 0.5f);
+    const int g = (int)(((a >> IM_COL32_G_SHIFT) & 0xFF) * u + ((b >> IM_COL32_G_SHIFT) & 0xFF) * t + 0.5f);
+    const int bl= (int)(((a >> IM_COL32_B_SHIFT) & 0xFF) * u + ((b >> IM_COL32_B_SHIFT) & 0xFF) * t + 0.5f);
+    const int al= (int)(((a >> IM_COL32_A_SHIFT) & 0xFF) * u + ((b >> IM_COL32_A_SHIFT) & 0xFF) * t + 0.5f);
+    return IM_COL32(r, g, bl, al);
+}
+
+// Fill a CONVEX polygon with a horizontal gradient as ONE mesh (per-vertex colour lerped along x),
+// with the same 1px alpha-0 fringe ring ImDrawList::AddConvexPolyFilled builds. This exists because
+// a translucent tint CANNOT be assembled from several abutting fills: every shared edge either
+// double-covers (alpha compounds into a visible crescent) or under-covers (AA hairline). One mesh
+// touches every pixel exactly once, so there is nothing to seam and nothing to snap.
+static void fillConvexHGradient(ImDrawList* dl, const ImVec2* pts, int n,
+                                float gx0, float gx1, ImU32 colL, ImU32 colR) {
+    if (n < 3) return;
+    const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+    const float span = gx1 - gx0;
+    auto colAt = [&](float x) {
+        const float t = (span > 0.0f) ? ImClamp((x - gx0) / span, 0.0f, 1.0f) : 0.0f;
+        return lerpU32(colL, colR, t);
+    };
+    auto edgeNormal = [&](int i0, int i1) {
+        float dx = pts[i1].x - pts[i0].x, dy = pts[i1].y - pts[i0].y;
+        const float d2 = dx * dx + dy * dy;
+        if (d2 > 0.0f) { const float inv = ImRsqrt(d2); dx *= inv; dy *= inv; }
+        return ImVec2(dy, -dx);
+    };
+
+    if (dl->Flags & ImDrawListFlags_AntiAliasedFill) {
+        const float aa = dl->_FringeScale;
+        dl->PrimReserve((n - 2) * 3 + n * 6, n * 2);
+        const unsigned int inner = dl->_VtxCurrentIdx;      // vertex 2*i   (opaque, inset by aa/2)
+        const unsigned int outer = dl->_VtxCurrentIdx + 1;  // vertex 2*i+1 (alpha 0, outset by aa/2)
+        for (int i = 2; i < n; ++i) {                        // interior fan over the inner ring
+            dl->_IdxWritePtr[0] = (ImDrawIdx)inner;
+            dl->_IdxWritePtr[1] = (ImDrawIdx)(inner + ((i - 1) << 1));
+            dl->_IdxWritePtr[2] = (ImDrawIdx)(inner + (i << 1));
+            dl->_IdxWritePtr += 3;
+        }
+        ImVec2 nPrev = edgeNormal(n - 1, 0);
+        for (int i1 = 0, i0 = n - 1; i1 < n; i0 = i1++) {
+            const ImVec2 nNext = edgeNormal(i1, (i1 + 1) % n);
+            ImVec2 dm((nPrev.x + nNext.x) * 0.5f, (nPrev.y + nNext.y) * 0.5f);
+            float dm2 = dm.x * dm.x + dm.y * dm.y;          // miter fix-up (IM_FIXNORMAL2F)
+            if (dm2 < 0.5f) dm2 = 0.5f;
+            const float inv = (aa * 0.5f) / dm2;
+            dm.x *= inv; dm.y *= inv;
+            const ImU32 c = colAt(pts[i1].x);
+            dl->_VtxWritePtr[0].pos = ImVec2(pts[i1].x - dm.x, pts[i1].y - dm.y);
+            dl->_VtxWritePtr[0].uv = uv; dl->_VtxWritePtr[0].col = c;
+            dl->_VtxWritePtr[1].pos = ImVec2(pts[i1].x + dm.x, pts[i1].y + dm.y);
+            dl->_VtxWritePtr[1].uv = uv; dl->_VtxWritePtr[1].col = c & ~IM_COL32_A_MASK;
+            dl->_VtxWritePtr += 2;
+            dl->_IdxWritePtr[0] = (ImDrawIdx)(inner + (i1 << 1));
+            dl->_IdxWritePtr[1] = (ImDrawIdx)(inner + (i0 << 1));
+            dl->_IdxWritePtr[2] = (ImDrawIdx)(outer + (i0 << 1));
+            dl->_IdxWritePtr[3] = (ImDrawIdx)(outer + (i0 << 1));
+            dl->_IdxWritePtr[4] = (ImDrawIdx)(outer + (i1 << 1));
+            dl->_IdxWritePtr[5] = (ImDrawIdx)(inner + (i1 << 1));
+            dl->_IdxWritePtr += 6;
+            nPrev = nNext;
+        }
+        dl->_VtxCurrentIdx += (unsigned int)(n * 2);
+    } else {
+        dl->PrimReserve((n - 2) * 3, n);
+        const unsigned int base = dl->_VtxCurrentIdx;
+        for (int i = 0; i < n; ++i) {
+            dl->_VtxWritePtr[0].pos = pts[i];
+            dl->_VtxWritePtr[0].uv = uv;
+            dl->_VtxWritePtr[0].col = colAt(pts[i].x);
+            dl->_VtxWritePtr += 1;
+        }
+        for (int i = 2; i < n; ++i) {
+            dl->_IdxWritePtr[0] = (ImDrawIdx)base;
+            dl->_IdxWritePtr[1] = (ImDrawIdx)(base + i - 1);
+            dl->_IdxWritePtr[2] = (ImDrawIdx)(base + i);
+            dl->_IdxWritePtr += 3;
+        }
+        dl->_VtxCurrentIdx += (unsigned int)n;
+    }
+}
+
 void coloredRowWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
                     const float tint[3], float strength, bool selected) {
     const float s = uiScale;
@@ -588,53 +673,18 @@ void coloredRowWash(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding,
     };
     // Translucent left->right tint over the frosted glass, bounded to the rounded pill: bright at
     // the left edge (`strength`), fading to a faint right edge (~15% of strength, min 0.02).
-    // PAINT-ONCE construction (translucent fills compound alpha, so NO base rect under slabs):
-    //   - MIDDLE slab (y inset by rnd) spans the FULL width — the sides are straight there;
-    //   - TOP/BOTTOM slabs span x∈[rnd, W-rnd] with endpoint colours sampled from the same linear
-    //     ramp, so all three slabs share one gradient slope — boundaries are colour-continuous;
-    //   - the 4 corner arc wedges are quarter-disc path fills in the LOCAL ramp colour.
-    // Every pixel is painted exactly once: no seams, no corner bleed, no compounded alpha.
+    // ONE MESH, painted once: the rounded-pill outline is filled as a single per-vertex-coloured
+    // triangle fan plus an AA fringe ring. The earlier 3-slab + 4-corner-wedge construction could
+    // not avoid the artifact it was built to hide — the deliberate wedge/slab overlap compounded
+    // alpha into a visible arc in every corner.
     const float aL = strength;
     const float aR = std::max(0.02f, strength * 0.15f);
-    const float W  = mx.x - mn.x;
-    const float H  = mx.y - mn.y;
-    const float rnd = ImClamp(rr, 0.0f, ImMin(W, H) * 0.5f);
-    auto mixAt = [&](float t) { return dye(aL * (1.0f - t) + aR * t); };
+    const float rnd = ImClamp(rr, 0.0f, ImMin(mx.x - mn.x, mx.y - mn.y) * 0.5f);
 
-    // Interior slab boundaries snapped to whole pixels: at a fractional shared edge, two
-    // translucent fills each cover the seam pixel PARTIALLY and composite lighter than one full
-    // fill — a visible hairline. Integer edges tile exactly.
-    const float x0 = IM_ROUND(mn.x + rnd), x1 = IM_ROUND(mx.x - rnd);
-    const float y0 = IM_ROUND(mn.y + rnd), y1 = IM_ROUND(mx.y - rnd);
-    if (x1 > x0) {
-        const float tA = rnd / W, tB = (W - rnd) / W;
-        if (y1 > y0)  // middle slab: full width, straight-side region
-            dl->AddRectFilledMultiColor(ImVec2(mn.x, y0), ImVec2(mx.x, y1),
-                                        dye(aL), dye(aR), dye(aR), dye(aL));
-        if (rnd > 0.5f) {
-            dl->AddRectFilledMultiColor(ImVec2(x0, mn.y), ImVec2(x1, y0),
-                                        mixAt(tA), mixAt(tB), mixAt(tB), mixAt(tA));
-            dl->AddRectFilledMultiColor(ImVec2(x0, y1), ImVec2(x1, mx.y),
-                                        mixAt(tA), mixAt(tB), mixAt(tB), mixAt(tA));
-            // Corner quarter-discs, local ramp colour (ramp error across rnd px is invisible).
-            // PathArcToFast quadrants: 0=+x, 3=+y(down), 6=-x, 9=-y(up). The apex is nudged ~0.75px
-            // INTO the slab region (diagonal `bias`): PathFillConvex feathers its straight edges,
-            // and an exactly-abutting unfeathered rect underpaints ~half a pixel — the overlap
-            // buries that hairline under the slabs' full coverage.
-            auto wedge = [&](ImVec2 c, ImVec2 bias, int q0, int q1, ImU32 col) {
-                dl->PathLineTo(ImVec2(c.x + bias.x, c.y + bias.y));
-                dl->PathArcToFast(c, rnd, q0, q1);
-                dl->PathFillConvex(col);
-            };
-            const float ov = 0.75f;
-            wedge(ImVec2(x0, y0), ImVec2(+ov, +ov), 6, 9,  mixAt(tA * 0.5f));          // top-left
-            wedge(ImVec2(x1, y0), ImVec2(-ov, +ov), 9, 12, mixAt((tB + 1.0f) * 0.5f)); // top-right
-            wedge(ImVec2(x1, y1), ImVec2(-ov, -ov), 0, 3,  mixAt((tB + 1.0f) * 0.5f)); // bottom-right
-            wedge(ImVec2(x0, y1), ImVec2(+ov, -ov), 3, 6,  mixAt(tA * 0.5f));          // bottom-left
-        }
-    } else {
-        dl->AddRectFilled(mn, mx, dye(aL), rnd);  // too narrow for the slabs
-    }
+    dl->PathClear();
+    dl->PathRect(mn, mx, rnd, ImDrawFlags_RoundCornersAll);
+    fillConvexHGradient(dl, dl->_Path.Data, dl->_Path.Size, mn.x, mx.x, dye(aL), dye(aR));
+    dl->PathClear();
 
     if (selected) {
         const float glow[4] = {tint[0], tint[1], tint[2], 1.0f};

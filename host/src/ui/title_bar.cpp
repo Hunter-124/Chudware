@@ -361,19 +361,21 @@ static ChipResult drawChipAt(const char* btnId,
     const ImVec2 p1(p0.x + chipW, p0.y + chipH);
 
     // ONE continuous liquid-glass pill background across the whole chip: frosted base +
-    // ui::coloredRowWash (seamless 3-slab L→R gradient, no corner bleed, no cap seams).
+    // ui::coloredRowWash (single-mesh L→R gradient, painted once, no corner overlap).
     // Active glow is applied once below (glassRowBackground(selected=false) so we own the glow).
+    // All three glass helpers take a LOGICAL dp radius and scale it internally; `rnd` arrives in
+    // screen px, so convert ONCE here — passing px to glassRowBackground/glassSelectionGlow
+    // double-scaled the corner radius at uiScale != 1.
     const float sChip = ui::uiScale;
+    const float rndDp = rnd / sChip;
     float tint[3] = { ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2] };
-    ui::glassRowBackground(dl, p0, p1, rnd, /*stripe*/false, /*selected*/false, /*washAlpha*/0.42f);
+    ui::glassRowBackground(dl, p0, p1, rndDp, /*stripe*/false, /*selected*/false, /*washAlpha*/0.42f);
     {
         const float strength = isActive ? 0.40f : (hovered ? 0.30f : 0.18f);
-        // coloredRowWash multiplies rounding by uiScale and self-insets by 2dp; chips carry rnd in
-        // screen px, so hand it back in dp.
-        ui::coloredRowWash(dl, p0, p1, rnd / sChip, tint, strength, /*selected*/false);
+        ui::coloredRowWash(dl, p0, p1, rndDp, tint, strength, /*selected*/false);
     }
     if (isActive)
-        ui::glassSelectionGlow(dl, p0, p1, rnd, ui::palette.accent);
+        ui::glassSelectionGlow(dl, p0, p1, rndDp, ui::palette.accent);
 
     // Icon + label group centered in chip. Measure text ALWAYS with boldFont (when present)
     // so chipMeasureW and the layout share one width — previously active pills measured with

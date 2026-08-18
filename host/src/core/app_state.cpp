@@ -1103,11 +1103,16 @@ Tex loadTexture(const std::string& path) {
     if (!d) return t;
     glGenTextures(1, &t.id);
     glBindTexture(GL_TEXTURE_2D, t.id);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    // Mipmapped minification. The brand wordmark is a 687x200 PNG drawn ~14 px tall in the
+    // title bar; plain GL_LINEAR minification samples 4 of ~14 source texels per output pixel
+    // and shredded the type into the blocky mark the title bar shipped with. A mip chain makes
+    // that a properly filtered box-average instead. Magnification stays GL_LINEAR.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, t.w, t.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, d);
+    glGenerateMipmap(GL_TEXTURE_2D);
     stbi_image_free(d);
     return t;
 }

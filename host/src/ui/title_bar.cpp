@@ -35,6 +35,7 @@
 #include "property_manager.h"  // PropertyManager::active() (used in View sub-menu)
 #include "widgets/interwebz.h" // ui::InterwebzDemoToggle (View > Interwebz demo)
 #include "plm/plm_hub.h"       // ui::plmProjectName (active-project status control)
+#include "tesseract.h"         // ui::drawTesseract (vector brand mark in the title bar)
 
 #include <filesystem>      // Recent-files menu labels
 #include <cstdio>          // snprintf
@@ -840,29 +841,37 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         // Right boundary of the usable zone (= where caption buttons begin), window-relative.
         const float rightGroupStartRelX = winW - captionZoneW - 4.0f * s;
 
-        // ---- Brand wordmark / logo (left edge) -----------------------------------
-        ImGui::SetCursorPosX(12.0f * s);
-        const Tex& wm = (ui::activeTheme == ui::Theme::Light && st.wordmarkDark.id)
-                            ? st.wordmarkDark : st.wordmark;
-        float logoEndRelX = 12.0f * s;  // window-relative right edge of logo
-        if (wm.id) {
-            const float wmH = barH * 0.40f;
-            float wmW = wmH * (float)wm.w / wm.h;
-            if (ImGui::GetCursorPosX() + wmW + 18.0f * s < rightGroupStartRelX - 240.0f * s) {
-                ImGui::SetCursorPosY((barH - wmH) * 0.5f);
-                ImGui::Image((ImTextureID)(intptr_t)wm.id, ImVec2(wmW, wmH));
-                // GetItemRectMax().x is the screen-right edge of the Image item — reliable even
-                // after ImGui resets CursorPosX to indent. Convert to window-relative.
-                logoEndRelX = ImGui::GetItemRectMax().x - winX;
-                ImGui::SameLine(0, 16.0f * s);
-            }
-        } else if (st.logoIcon.id) {
-            const float iconH = barH * 0.52f;
-            if (ImGui::GetCursorPosX() + iconH + 18.0f * s < rightGroupStartRelX - 240.0f * s) {
-                ImGui::SetCursorPosY((barH - iconH) * 0.5f);
-                ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(iconH, iconH));
-                logoEndRelX = ImGui::GetItemRectMax().x - winX;
-                ImGui::SameLine(0, 16.0f * s);
+        // ---- Brand lockup (left edge): vector mark + typed wordmark -----------------
+        // This used to blit assets/logo_wordmark.png scaled to ~14 px tall. A 687x200 bitmap
+        // minified that far is unrecoverable — the type broke into blocks and the mark turned
+        // into a green smudge. The brand is drawn instead: the live tesseract (pure ImDrawList
+        // geometry, crisp at every DPI, the same mark the copilot header paints) plus the
+        // wordmark set in the app's own medium font. Nothing here samples a texture, so it is
+        // resolution-independent. The About dialog still shows the PNG, at a size it suits.
+        float logoEndRelX = 12.0f * s;  // window-relative right edge of the lockup
+        {
+            const float markSz = ImFloor(barH * 0.58f);
+            const float markGap = 7.0f * s;
+            ImFont* wordFont = st.fonts.medium ? st.fonts.medium : ImGui::GetFont();
+            ImGui::PushFont(wordFont);
+            const float wordW = ImGui::CalcTextSize("Chudware").x;
+            const float wordH = ImGui::GetTextLineHeight();
+            ImGui::PopFont();
+            const float lockupW = markSz + markGap + wordW;
+            if (12.0f * s + lockupW + 18.0f * s < rightGroupStartRelX - 240.0f * s) {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImVec2 markMin(winX + 12.0f * s,
+                                     ImGui::GetWindowPos().y + ImFloor((barH - markSz) * 0.5f));
+                ui::drawTesseract(dl, ImVec2(markMin.x + markSz * 0.5f, markMin.y + markSz * 0.5f),
+                                  markSz, ImGui::GetTime(),
+                                  ui::tesseractAnimFromInt(st.settings.brandAnim),
+                                  ui::Palette::toU32(ui::palette.accent));
+                ImGui::PushFont(wordFont);
+                dl->AddText(ImVec2(markMin.x + markSz + markGap,
+                                   ImGui::GetWindowPos().y + ImFloor((barH - wordH) * 0.5f)),
+                            ui::Palette::toU32(ui::palette.text), "Chudware");
+                ImGui::PopFont();
+                logoEndRelX = 12.0f * s + lockupW;
             }
         }
 

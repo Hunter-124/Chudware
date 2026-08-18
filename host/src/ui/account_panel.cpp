@@ -70,6 +70,10 @@ struct PendingResult {
     std::string detail;
     std::string securityPolicy;
     std::string enforcementState;
+    // Stamped by setPending from Controller::generation. Sign-out bumps that counter, so a
+    // refresh or loopback login that was already in flight cannot silently sign the user
+    // back in when its result lands (the thread is still joined, only its result is dropped).
+    std::uint64_t generation = 0;
 };
 
 struct Controller {
@@ -85,6 +89,7 @@ struct Controller {
     bool loginRunning = false;
     std::string securityPolicyId;
     bool authoritativeRefused = false;
+    std::uint64_t generation = 0;
 
     ~Controller() {
         stopping.store(true);
@@ -411,6 +416,7 @@ std::string refreshUrl() {
 void setPending(PendingResult result) {
     Controller& c = controller();
     std::lock_guard<std::mutex> lock(c.mutex);
+    result.generation = c.generation;
     c.pending = std::move(result);
     c.refreshRunning = false;
     c.loginRunning = false;
@@ -613,12 +619,61 @@ std::string randomState() {
     return out;
 }
 
+// The loopback callback page is the ONLY Chudware surface that renders in the user's browser
+// during sign-in, so it is branded and self-contained: no external CSS, fonts or images (the
+// listener answers exactly one request and then closes, and the tab is offline-loopback, so any
+// remote reference would just render as a broken box). `Cache-Control: no-store` and
+// `Referrer-Policy: no-referrer` keep the token-bearing URL out of caches and out of any
+// onward request.
+std::string browserPageHtml(bool ok) {
+    const char* title = ok ? "You're signed in" : "Authorization failed";
+    const char* detail = ok
+        ? "This device is now linked to your Chudware account. Close this tab and return to "
+          "the app &mdash; editing is already unlocked there."
+        : "Chudware could not verify this authorization. Close this tab, return to the app and "
+          "start sign-in again.";
+    const char* accent = ok ? "#2ec4a6" : "#e0605e";
+    return std::string(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>Chudware &middot; ") + title + "</title><style>"
+        ":root{color-scheme:dark}"
+        "*{box-sizing:border-box}"
+        "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
+        "background:radial-gradient(1200px 600px at 50% -10%,#1b2733 0%,#0e141b 55%,#0a0f14 100%);"
+        "color:#e8edf2;font:16px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Inter,"
+        "Roboto,'Helvetica Neue',Arial,sans-serif;padding:32px}"
+        ".card{width:100%;max-width:460px;padding:36px 34px 32px;border-radius:18px;"
+        "background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.10);"
+        "box-shadow:0 24px 60px rgba(0,0,0,.45);text-align:center}"
+        ".mark{width:56px;height:56px;margin:0 auto 18px;display:block}"
+        ".brand{font-size:12px;letter-spacing:.18em;text-transform:uppercase;"
+        "color:rgba(232,237,242,.55);margin:0 0 22px}"
+        "h1{margin:0 0 10px;font-size:24px;font-weight:600;letter-spacing:-.01em}"
+        "p{margin:0;color:rgba(232,237,242,.72)}"
+        ".pill{display:inline-flex;align-items:center;gap:8px;margin-top:24px;padding:7px 14px;"
+        "border-radius:999px;font-size:13px;background:rgba(255,255,255,.05);"
+        "border:1px solid rgba(255,255,255,.09);color:rgba(232,237,242,.66)}"
+        ".dot{width:8px;height:8px;border-radius:50%;background:" + accent + "}"
+        "</style></head><body><main class=\"card\">"
+        "<svg class=\"mark\" viewBox=\"0 0 64 64\" fill=\"none\" aria-hidden=\"true\">"
+        "<rect x=\"6\" y=\"6\" width=\"38\" height=\"38\" rx=\"3\" stroke=\"" + accent +
+        "\" stroke-width=\"2.4\"/>"
+        "<rect x=\"20\" y=\"20\" width=\"38\" height=\"38\" rx=\"3\" stroke=\"" + accent +
+        "\" stroke-width=\"2.4\" stroke-opacity=\".65\"/>"
+        "<path d=\"M6 6l14 14M44 6l14 14M6 44l14 14M44 44l14 14\" stroke=\"" + accent +
+        "\" stroke-width=\"2.4\" stroke-opacity=\".45\"/></svg>"
+        "<p class=\"brand\">Chudware</p><h1>" + title + "</h1><p>" + detail + "</p>"
+        "<span class=\"pill\"><span class=\"dot\"></span>" +
+        (ok ? "Device authorized" : "Not authorized") +
+        "</span></main></body></html>";
+}
+
 void sendBrowserResponse(Socket client, bool ok) {
-    const std::string body = ok
-        ? "<!doctype html><title>Chudware authorized</title><h1>Authorized</h1><p>You can close this tab and return to Chudware.</p>"
-        : "<!doctype html><title>Authorization failed</title><h1>Authorization failed</h1><p>Return to Chudware and try again.</p>";
+    const std::string body = browserPageHtml(ok);
     const std::string response = std::string("HTTP/1.1 ") + (ok ? "200 OK" : "400 Bad Request") +
-        "\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: " +
+        "\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store"
+        "\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\nContent-Length: " +
         std::to_string(body.size()) + "\r\n\r\n" + body;
     (void)::send(client, response.data(), static_cast<int>(response.size()), 0);
 }
@@ -766,6 +821,10 @@ void tickAccountPanel(AppState& state) {
             c.pending = {};
         }
         c.worker.join();
+        // Signed out while this thread was in flight: the thread is joined above (never
+        // detached), but its verdict is void — applying it would resurrect the session the
+        // user just ended.
+        if (result.generation != c.generation) return;
         if (result.kind == PendingResult::Kind::Fresh) {
             chudware::entitlement::TokenPayload fresh;
             std::string error;
@@ -854,6 +913,36 @@ void tickAccountPanel(AppState& state) {
         startRefresh(state.entitlementToken);
 }
 
+void signOutDesktopAccount(AppState& state) {
+    Controller& c = controller();
+    // Bump FIRST: any refresh/login thread already running keeps its own copies, and its
+    // result is dropped by the generation check in tickAccountPanel.
+    {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        ++c.generation;
+        c.pending = {};
+    }
+    // Everything device-bound about the session: the sealed token, the subject, and the
+    // signed security policy. The device authorization key stays — it is device identity,
+    // not session state, and the next sign-in re-attests with it.
+    chudware::secret_store::erase(kService, kAccount, appdataAppDir());
+    chudware::secret_store::erase(kService, kSubjectAccount, appdataAppDir());
+    chudware::secret_store::erase(kService, kSecurityAccount, appdataAppDir());
+    c.payload = {};
+    c.stamp = {};
+    c.authoritativeRefused = false;
+    c.lastAttemptMonotonic = -1.0;
+    state.entitlementToken.clear();
+    state.entitlementPlan.clear();
+    state.entitlementEmail.clear();
+    state.entitlementSignedIn = false;
+    state.entitlementReadOnly = true;
+    state.entitlementGraceExpiring = false;
+    state.entitlementMutationVerified = false;
+    state.entitlementAiVerified = false;
+    state.entitlementStatus = "Signed out — sign in to activate desktop editing";
+}
+
 void drawAccountSettings(AppState& state) {
     ImGui::Text("Status: %s", state.entitlementSignedIn
         ? (state.entitlementReadOnly ? "Read-only" : "Active") : "Not signed in");
@@ -868,6 +957,13 @@ void drawAccountSettings(AppState& state) {
     ImGui::SameLine();
     if (ImGui::Button("Manage subscription"))
         openExternalHttpUrl("https://app.chudware.com/account/billing");
+    if (state.entitlementSignedIn) {
+        ImGui::SameLine();
+        if (ImGui::Button("Sign out")) signOutDesktopAccount(state);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Forgets this device's stored subscription token. Files stay "
+                              "openable and exportable; editing needs a sign-in again.");
+    }
     if (!state.entitlementStatus.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(
             state.entitlementReadOnly ? palette.statusWarn : palette.textDim));
@@ -928,10 +1024,13 @@ void drawEntitlementBanner(AppState& state, float x, float y, float w, float h) 
         // Actions are laid out from the RIGHT edge first so the headline gets whatever width is
         // left and elides into it, instead of the buttons being pushed off a narrow window.
         const float gap = 8.0f * uiScale;
-        const float signW = ImGui::CalcTextSize("Sign in").x + ImGui::GetStyle().FramePadding.x * 2;
-        const float mgmtW =
-            ImGui::CalcTextSize("Manage subscription").x + ImGui::GetStyle().FramePadding.x * 2;
-        const float actionsW = signW + mgmtW + gap;
+        const float pad2 = ImGui::GetStyle().FramePadding.x * 2;
+        const bool canSignOut = state.entitlementSignedIn;
+        const char* signLabel = canSignOut ? "Sign in again" : "Sign in";
+        const float signW = ImGui::CalcTextSize(signLabel).x + pad2;
+        const float mgmtW = ImGui::CalcTextSize("Manage subscription").x + pad2;
+        const float outW = canSignOut ? ImGui::CalcTextSize("Sign out").x + pad2 + gap : 0.0f;
+        const float actionsW = signW + mgmtW + gap + outW;
         const float textW = std::max(80.0f * uiScale, w - padX * 2.0f - actionsW - gap * 2.0f);
 
         ImGui::BeginGroup();
@@ -942,13 +1041,23 @@ void drawEntitlementBanner(AppState& state, float x, float y, float w, float h) 
         ImGui::PopTextWrapPos();
         ImGui::EndGroup();
 
+        // Every action sits on ONE centered baseline. SameLine() alone does NOT hold it:
+        // it restores the cursor to the PREVIOUS line's y — here the multi-line text group's
+        // last line — so the second and third buttons drifted several pixels above the first
+        // (measured 6 px at uiScale 1.0). Re-assert the row y before each button instead.
+        const float rowY = (h - ImGui::GetFrameHeight()) * 0.5f;
         ImGui::SameLine();
-        ImGui::SetCursorPosX(w - padX - actionsW);
-        ImGui::SetCursorPosY((h - ImGui::GetFrameHeight()) * 0.5f);
-        if (ImGui::Button("Sign in")) beginDesktopAccountLogin(state);
+        ImGui::SetCursorPos(ImVec2(w - padX - actionsW, rowY));
+        if (ImGui::Button(signLabel)) beginDesktopAccountLogin(state);
         ImGui::SameLine(0.0f, gap);
+        ImGui::SetCursorPosY(rowY);
         if (ImGui::Button("Manage subscription"))
             openExternalHttpUrl("https://app.chudware.com/account/billing");
+        if (canSignOut) {
+            ImGui::SameLine(0.0f, gap);
+            ImGui::SetCursorPosY(rowY);
+            if (ImGui::Button("Sign out")) signOutDesktopAccount(state);
+        }
     }
     ImGui::End();
     ImGui::PopStyleColor();

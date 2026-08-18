@@ -127,6 +127,7 @@ inline void wasmBootDom(const char *msg) {
 #include "ui/file_explorer.h" // Wave 3: File Explorer + workspace/recent helpers
 #ifndef __EMSCRIPTEN__
 #include "ui/account_panel.h"
+#include "util/secret_store.h"  // entitlement_signout shot: proves the sealed token is erased
 #endif
 #include "ui/firmware/fw_workspace.h" // T-FIN5 Firmware workspace (drawFirmwareWorkspace + shot fixture)
 #include "ui/manufacture/manufacture_panel.h" // P4 manufacturing operator surface + RPC dispatch
@@ -2899,6 +2900,32 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 editBlocked, viewAllowed, measureAllowed, exportAllowed);
     std::fflush(stdout);
   }
+#ifndef __EMSCRIPTEN__
+  // Sign-out smoke: seed a stored session, sign out, and assert BOTH halves of the contract —
+  // the desktop is back to signed-out read-only, and the sealed token is gone from the store
+  // (a state-only reset would silently sign back in on the next launch).
+  if (shot && shotMode && std::strcmp(shotMode, "entitlement_signout") == 0) {
+    const std::string dataDir = appdataAppDir();
+    const std::vector<unsigned char> seeded{'s', 'e', 'e', 'd'};
+    chudware::secret_store::store("com.chudware.desktop", "entitlement", seeded, dataDir);
+    std::vector<unsigned char> probe;
+    const bool seededOk =
+        chudware::secret_store::load("com.chudware.desktop", "entitlement", probe, dataDir);
+    st.entitlementSignedIn = true;
+    st.entitlementReadOnly = false;
+    st.entitlementEmail = "shot@example.com";
+    st.entitlementPlan = "studio";
+    st.entitlementToken = "seed.token";
+    ui::signOutDesktopAccount(st);
+    const bool tokenGone =
+        !chudware::secret_store::load("com.chudware.desktop", "entitlement", probe, dataDir);
+    std::printf("[entitlement-signout-shot] seeded=%d signed_out=%d read_only=%d "
+                "token_cleared=%d store_erased=%d\n",
+                seededOk, !st.entitlementSignedIn, st.entitlementReadOnly,
+                st.entitlementToken.empty() && st.entitlementEmail.empty(), tokenGone);
+    std::fflush(stdout);
+  }
+#endif
 #ifndef __EMSCRIPTEN__
   if (shot && shotMode &&
       (std::strcmp(shotMode, "update_available") == 0 ||

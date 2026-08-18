@@ -28,5 +28,9 @@ void  drawEntitlementBanner(AppState& state, float x, float y, float w, float h)
 void  drawEntitlementGraceChip(AppState& state);
 // System-browser loopback login. Non-blocking after the listener is armed.
 bool beginDesktopAccountLogin(AppState& state);
+// Forgets this device's stored subscription session (sealed token, subject, signed security
+// policy) and drops the verdict of any refresh/login still in flight. The device authorization
+// key survives — it is identity, not session state. Read-only mode resumes immediately.
+void signOutDesktopAccount(AppState& state);
 
 }  // namespace ui

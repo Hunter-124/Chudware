@@ -2,14 +2,14 @@
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import '../../styles/product.css';
 ---
-<BaseLayout title="Parametric modeling" description="Constraint sketching, driving dimensions, ordered features, and the Feature Manager, running on the OpenCascade 7.9 geometry kernel.">
+<BaseLayout title="Parametric modeling" description="Constraint sketching, driving dimensions, ordered features, and the Feature Manager, working on exact solid geometry rather than a mesh approximation.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Product / Model</p>
       <h1>Sketches that explain how the part may move.</h1>
       <p class="lede">Chudware modeling is feature-based and history-driven. A constrained 2D sketch defines intent, a feature turns it into solid geometry, and the Feature Manager keeps that sequence editable for as long as the design lives.</p>
       <ul class="product-hero-meta">
-        <li>OpenCascade / OCCT 7.9 kernel</li>
+        <li>Exact solids, not a mesh approximation</li>
         <li>2D constraint solver with degrees-of-freedom reporting</li>
         <li>Native <code>.step+</code> documents</li>
       </ul>
@@ -22,12 +22,12 @@ import '../../styles/product.css';
         <p class="eyebrow" id="workspace-title">The workspace</p>
         <h2>Geometry on the left, construction history on the right.</h2>
         <p class="lede">Features are not baked away when they are created. A box, a fillet, and a shell stay listed in order beside the model, and each one can be reopened, re-dimensioned, or reordered.</p>
-        <p class="supporting-copy">Saving as <code>.step+</code> keeps the feature tree, dimensions, materials, studies, and drawings in one editable document. STEP and STL exports exist for handing a flattened result to another tool, not for storing your design.</p>
+        <p class="supporting-copy">Saving as <code>.step+</code> keeps the feature tree, dimensions, materials, studies, and drawings in one editable document. Neutral exports exist for handing a flattened result to another tool, not for storing your design.</p>
         <div class="actions"><a class="button button-secondary" href="/docs/first-part/">Read the first-part guide</a></div>
       </header>
       <figure class="product-figure" data-lift>
-        <img src="/images/modeling.png" width="1340" height="838" loading="lazy" alt="Chudware parametric modeling workspace showing a shelled enclosure in the 3D view with its Box, Fillet, and Shell features listed in the Feature Manager" />
-        <figcaption><span>Chudware modeling workspace</span><span>Ordered features &middot; OCCT 7.9</span></figcaption>
+        <img src="/images/modeling.png" width="1340" height="838" loading="lazy" alt="Chudware parametric modeling workspace: a solid part in the 3D view with its ordered construction history in the Feature Manager" />
+        <figcaption><span>Chudware modeling workspace</span><span>Ordered features &middot; exact solids</span></figcaption>
       </figure>
     </div>
   </section>
@@ -83,7 +83,7 @@ import '../../styles/product.css';
       <header class="section-heading">
         <p class="eyebrow" id="sketch-title">Constraint sketching</p>
         <h2>Constrain intent, not the picture.</h2>
-        <p class="lede">Start with relations &mdash; coincident, horizontal, vertical, parallel, tangent, equal &mdash; then add only the dimensions that set size and position. The sketch status reports remaining degrees of freedom and flags conflicting constraints, so an under-defined profile is visible rather than surprising.</p>
+        <p class="lede">Start with relations &mdash; coincident, horizontal, vertical, parallel, perpendicular, tangent, concentric, collinear, equal, midpoint, symmetric, fix &mdash; then add only the dimensions that set size and position. The sketch status reports remaining degrees of freedom and flags conflicting constraints, so an under-defined profile is visible rather than surprising.</p>
         <p class="supporting-copy">Where a part is naturally symmetric, reference the origin and construction geometry and mirror half the profile. That is more stable than dimensioning two nearly identical sides. If a sketch becomes over-defined, remove the newest redundant relation instead of suppressing the warning.</p>
         <div class="actions"><a class="button button-secondary" href="/docs/sketching/">Sketching guide</a></div>
       </header>
@@ -125,16 +125,36 @@ import '../../styles/product.css';
         <li>
           <div>
             <h3>Refine on the solid</h3>
-            <p>Select edges and apply Fillet or Shell. If a preview fails, reduce the radius or check whether the selected edges meet a very short face.</p>
+            <p>Select edges or faces and apply Fillet, Chamfer, Shell, Draft, or Rib. If a preview fails, reduce the radius or check whether the selected edges meet a very short face.</p>
           </div>
         </li>
         <li>
           <div>
             <h3>Save an editable design</h3>
-            <p>Save as <code>.step+</code> so the tree, dimensions, materials, studies, and drawings travel with the geometry. Export STEP or STL only for a downstream handoff.</p>
+            <p>Save as <code>.step+</code> so the tree, dimensions, materials, studies, and drawings travel with the geometry. Export a neutral format only for a downstream handoff.</p>
           </div>
         </li>
       </ol>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="drawing-title">
+    <div class="wrap">
+      <header class="section-heading">
+        <p class="eyebrow" id="drawing-title">Drawings</p>
+        <h2>The sheet lives in the same document as the model.</h2>
+        <p class="lede">A drawing is not a side file that quietly goes stale. Sheets are stored inside the <code>.step+</code> document, and every view is re-projected from the current solid each time the sheet is opened, so a dimension change upstream cannot leave the drawing disagreeing with the part.</p>
+      </header>
+      <ul class="product-tiles product-stack">
+        <li class="product-tile" data-lift><strong>Views</strong><span>Model, projected, standard three, section &mdash; including half section &mdash; and detail views, each at its own scale.</span></li>
+        <li class="product-tile" data-lift><strong>Dimensions</strong><span>Smart dimensions, model items pulled from the feature tree, hole callouts, center marks, center lines, notes, and balloons.</span></li>
+        <li class="product-tile" data-lift><strong>Tolerancing</strong><span>Per-dimension symmetric, deviation, limit, or basic tolerance at zero to four decimal places, plus ASME Y14.5 feature control frames &mdash; all fourteen geometric characteristics, with material-condition modifiers &mdash; datums, datum targets, surface finish, and weld symbols.</span></li>
+        <li class="product-tile" data-lift><strong>Sheets and tables</strong><span>ISO A4 to A0 and ANSI A to E sheet sizes, an editable title block, and a bill of materials rolled up from the assembly &mdash; identical components grouped with quantities, pattern instances already counted.</span></li>
+      </ul>
+      <div class="product-note product-stack" data-lift>
+        <p class="eyebrow">Output</p>
+        <p>Drawings export to DXF and PDF. Those are the only two formats the export path accepts, and it rejects anything else rather than writing a file that looks plausible. A sheet-metal part flattens to its own DXF with the outline and the bend lines on separate layers.</p>
+      </div>
     </div>
   </section>
 
@@ -145,21 +165,33 @@ import '../../styles/product.css';
           <p class="eyebrow" id="spec-title">Specifics</p>
           <h2>What the modeling workspace gives you.</h2>
         </header>
-        <p class="product-body">Chudware is a large C++, Python, and TypeScript system built around the OpenCascade geometry kernel, a 2D constraint solver, and a feature tree. The browser workspace and the native Windows and Linux builds present the same modeling surface.</p>
+        <p class="product-body">Chudware models on exact solid geometry, so a fillet is a real surface and a hole is a real cylinder &mdash; not a facet count that has to be turned up before the part measures correctly. A 2D constraint solver drives the sketches, and the feature tree keeps the construction order editable. The browser workspace and the native Windows and Linux builds present the same modeling surface.</p>
         <p class="product-body">View control stays out of the way: <code>F</code> fits the model, <code>0</code> returns to isometric, and the numbered keys jump to standard views while a command is running.</p>
       </div>
       <div class="product-spec-wrap">
         <table class="product-spec">
           <caption>Modeling reference</caption>
           <tbody>
-            <tr><th scope="row">Geometry kernel</th><td>OpenCascade / OCCT 7.9</td></tr>
-            <tr><th scope="row">Sketch relations</th><td>Coincident, horizontal, vertical, parallel, tangent, equal</td></tr>
+            <tr><th scope="row">Geometry</th><td>Exact B-rep solids &mdash; analytic faces, not a triangle mesh</td></tr>
+            <tr><th scope="row">Sketch relations</th><td>Coincident, horizontal, vertical, parallel, perpendicular, tangent, concentric, collinear, equal, midpoint, symmetric, fix; linear and angular dimensions</td></tr>
             <tr><th scope="row">Sketch feedback</th><td>Remaining degrees of freedom and conflicting-constraint reporting</td></tr>
-            <tr><th scope="row">Profile features</th><td>Extrude, Revolve, Loft, Sweep, Pattern</td></tr>
-            <tr><th scope="row">Solid features</th><td>Fillet, Shell</td></tr>
+            <tr><th scope="row">Profile features</th><td>Extrude, Revolve, Sweep, Loft &mdash; each as a boss or a cut</td></tr>
+            <tr><th scope="row">Dress-up features</th><td>Fillet, Chamfer, Shell, Draft, Rib</td></tr>
+            <tr><th scope="row">Holes and threads</th><td>Hole Wizard, plus ISO and Unified threads on a selected cylindrical face</td></tr>
+            <tr><th scope="row">Patterns</th><td>Linear, circular, mirror</td></tr>
+            <tr><th scope="row">Multi-body</th><td>Combine, subtract, intersect, split</td></tr>
+            <tr><th scope="row">Reference geometry</th><td>Planes, axes, points, coordinate systems, helix curves</td></tr>
+            <tr><th scope="row">Surfaces</th><td>Extruded, revolved, swept, lofted, planar, offset, ruled, boundary; knit, thicken, trim</td></tr>
+            <tr><th scope="row">Sheet metal</th><td>Base flange, edge flange, hem, jog, flat pattern with layered DXF output</td></tr>
+            <tr><th scope="row">Weldments</th><td>Structural members swept along a path sketch, gussets, end caps</td></tr>
+            <tr><th scope="row">Drawings</th><td>Multi-view sheets with dimensions, ASME Y14.5 geometric tolerancing, title block, and BOM; DXF and PDF output</td></tr>
+            <tr><th scope="row">Units</th><td>Millimeter or inch per document; geometry is stored in millimeters either way, so switching units never rescales a part</td></tr>
+            <tr><th scope="row">Modeling tolerance</th><td>0.0000001 mm coincidence tolerance; boolean operations run at a 0.0001 mm fuzzy tolerance</td></tr>
+            <tr><th scope="row">Mesh export quality</th><td>0.05 mm chord deviation and 0.35 rad normal deviation by default, adjustable per export</td></tr>
             <tr><th scope="row">History</th><td>Ordered Feature Manager tree, editable after the fact</td></tr>
             <tr><th scope="row">Native format</th><td><code>.step+</code> &mdash; tree, dimensions, materials, studies, drawings</td></tr>
-            <tr><th scope="row">Neutral export</th><td>STEP, STL for downstream handoff</td></tr>
+            <tr><th scope="row">Import</th><td>STEP, IGES, and BREP solids; STL, OBJ, PLY, and glTF meshes; DXF for 2D profiles</td></tr>
+            <tr><th scope="row">Neutral export</th><td>STEP, IGES, BREP, STL, OBJ, PLY, glTF for downstream handoff</td></tr>
           </tbody>
         </table>
       </div>

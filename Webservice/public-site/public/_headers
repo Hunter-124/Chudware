@@ -17,8 +17,15 @@
 # NOT content-hashed (unlike /_astro/*), so `immutable` made a re-captured product
 # screenshot invisible for a year: the deploy shipped the new bytes and every edge and
 # browser kept serving the old ones off the same URL. Revalidate instead.
+#
+# And revalidate SOON. `must-revalidate` only governs what happens once an entry is
+# already stale, so a day of freshness still meant a day of serving the previous
+# capture to anyone who had loaded the site recently — a re-capture looked like it had
+# not deployed. Five minutes keeps the within-session reuse that actually matters and
+# bounds how long a stale product shot can survive a deploy. The permanent fix is
+# content-hashed names for these three files; until then this is the honest ceiling.
 /images/*
-  Cache-Control: public, max-age=86400, must-revalidate
+  Cache-Control: public, max-age=300, must-revalidate
 
 /pagefind/*
   Cache-Control: public, max-age=31536000, immutable

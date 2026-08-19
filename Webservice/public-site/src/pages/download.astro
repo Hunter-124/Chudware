@@ -16,11 +16,11 @@ import BaseLayout from '../layouts/BaseLayout.astro';
       <header class="section-heading">
         <p class="eyebrow">Available now</p>
         <h2>Full product, running in your tab.</h2>
-        <p class="lede">Chudware in the browser is the same application as the desktop build, compiled to WebAssembly. It runs in your tab and renders with WebGL2, calling the engine over a single JSON-RPC WebSocket. The gateway verifies your identity and clamps every file path to your own workspace root.</p>
+        <p class="lede">Chudware in the browser is the same application as the desktop build, running in your tab — not a video stream of a machine in a data centre, and not a viewer. The gateway verifies your identity and clamps every file path to your own workspace root.</p>
       </header>
       <div class="pricing-note">
         <p class="eyebrow">No local setup</p>
-        <p>Use parametric modeling, assemblies, CAM, PLM, simulation, reverse engineering, and the AI copilot without installing a desktop package.</p>
+        <p>Use parametric modeling, assemblies, CAM, PLM, <a class="text-link" href="/product/simulation/">simulation</a>, reverse engineering, and the AI copilot without installing a desktop package. Open STEP, IGES, and BREP solids or STL, OBJ, PLY, and glTF meshes straight from the tab.</p>
         <a class="text-link" href="https://app.chudware.com/signup">Open the signup page <span aria-hidden="true">→</span></a>
       </div>
     </div>
@@ -32,6 +32,7 @@ import BaseLayout from '../layouts/BaseLayout.astro';
         <p class="eyebrow">Native desktop preview</p>
         <h2>Windows and Linux builds exist, but are not publicly published yet.</h2>
         <p class="lede">Native preview access is available on request while the public release channel is being prepared. There are no public artifact links, version numbers, or checksums to publish today.</p>
+        <p class="supporting-copy">Both native builds are 64-bit only and need a graphics driver capable of a modern hardware-accelerated 3D context; without one the application does not start. No minimum RAM, CPU, or disk figures are published, because none have been measured and ratified — the browser workspace is the quickest way to find out whether a machine is comfortable.</p>
       </header>
       <div class="platform-grid platform-grid-native">
         <article class="panel platform-card"><p class="eyebrow">Native build</p><h3>Windows</h3><p>Ask about access to the Windows desktop preview.</p><a class="button button-secondary" href="mailto:sales@chudware.com?subject=Windows%20desktop%20preview">Request Windows access</a></article>

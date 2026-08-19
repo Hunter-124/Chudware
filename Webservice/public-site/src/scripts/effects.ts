@@ -11,7 +11,7 @@
  * listener per card: a page with thirty cards should not install thirty
  * handlers.
  */
-const SURFACES = '.panel, .access-option, .gallery-card, .stack-node, [data-lift]';
+const SURFACES = '.panel, .access-option, .gallery-card, [data-lift]';
 
 /** Peak tilt in degrees at the corner of a surface. Small on purpose. */
 const TILT = 2.6;

@@ -2,14 +2,14 @@
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import '../../styles/product.css';
 ---
-<BaseLayout title="Product" description="Chudware covers parametric modeling, assemblies, CAM, product data, and an in-product AI copilot in one engineering environment, in a browser or on a native Windows or Linux build.">
+<BaseLayout title="Product" description="Chudware covers parametric modeling, assemblies, simulation, CAM, product data, and an in-product AI copilot in one engineering environment, in a browser or on a native Windows or Linux build.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Product</p>
       <h1>One environment, from constrained sketch to posted G-code.</h1>
-      <p class="lede">Chudware is a parametric CAD system built on the OpenCascade geometry kernel. Modeling, assemblies, manufacturing, product data, and the AI copilot operate on the same documents and the same feature tree, so design intent does not get lost between tools.</p>
+      <p class="lede">Chudware is a parametric CAD system working on exact solid geometry &mdash; a fillet is a real surface, not a facet approximation of one. Modeling, assemblies, simulation, manufacturing, product data, and the AI copilot operate on the same documents and the same feature tree, so design intent does not get lost between tools.</p>
       <ul class="product-hero-meta">
-        <li>OCCT 7.9 geometry kernel</li>
+        <li>Exact solids, not mesh approximations</li>
         <li>Editable native <code>.step+</code> files</li>
         <li>Browser workspace or native Windows and Linux builds</li>
       </ul>
@@ -20,7 +20,7 @@ import '../../styles/product.css';
     <div class="wrap">
       <header class="section-heading">
         <p class="eyebrow" id="capabilities-title">Capabilities</p>
-        <h2>Five surfaces of the same model.</h2>
+        <h2>Six surfaces of the same model.</h2>
         <p class="lede">Each page below describes what the capability actually does today, and says plainly where something is preview-grade.</p>
       </header>
       <div class="product-hub-grid">
@@ -45,7 +45,17 @@ import '../../styles/product.css';
           </ul>
         </article>
         <article class="product-card" data-lift>
-          <p class="product-card-index">03 / Manufacture</p>
+          <p class="product-card-index">03 / Simulate</p>
+          <h2><a href="/product/simulation/">Simulation</a></h2>
+          <p>Stress studies live inside the part, and a static result reports how far its own error indicator got instead of asking you to trust a fineness slider.</p>
+          <ul class="fact-list">
+            <li>Fixtures and loads picked in the viewport and previewed before the solve</li>
+            <li>Two independent mesh generators for the same geometry, so a number can be checked</li>
+            <li>Error-driven refinement with a per-pass convergence table</li>
+          </ul>
+        </article>
+        <article class="product-card" data-lift>
+          <p class="product-card-index">04 / Manufacture</p>
           <h2><a href="/product/cam/">CAM</a></h2>
           <p>Jobs are built from the active part, so the manufacturing plan stays attached to the design that produced it.</p>
           <ul class="fact-list">
@@ -55,7 +65,7 @@ import '../../styles/product.css';
           </ul>
         </article>
         <article class="product-card" data-lift>
-          <p class="product-card-index">04 / Collaborate</p>
+          <p class="product-card-index">05 / Collaborate</p>
           <h2><a href="/product/plm/">Product data</a></h2>
           <p>A project is the boundary for designs, assemblies, manufacturing artifacts, and revision history.</p>
           <ul class="fact-list">
@@ -64,8 +74,8 @@ import '../../styles/product.css';
             <li>Handoff carries the deliverable and the decision trail together</li>
           </ul>
         </article>
-        <article class="product-card" data-lift>
-          <p class="product-card-index">05 / Collaborate</p>
+        <article class="product-card product-card-span" data-lift>
+          <p class="product-card-index">06 / Collaborate</p>
           <h2><a href="/product/copilot/">AI copilot</a></h2>
           <p>Describe the engineering outcome; the copilot drives the same modeling operations you use by hand.</p>
           <ul class="fact-list">
@@ -83,7 +93,7 @@ import '../../styles/product.css';
       <header class="section-heading">
         <p class="eyebrow" id="scope-title">Scope, stated plainly</p>
         <h2>What is shipping, and what is still preview.</h2>
-        <p class="lede">The modeling, assembly, manufacturing, product data, and copilot workspaces exist in the product today and are documented. Delivery is where the qualifiers belong.</p>
+        <p class="lede">The modeling, assembly, simulation, manufacturing, product data, and copilot workspaces exist in the product today and are documented. Delivery is where the qualifiers belong.</p>
         <p class="supporting-copy">Native Windows and Linux builds are preview builds available on request rather than through a public release channel, and the commercial rate card is not published yet.</p>
       </header>
       <div class="product-note" data-lift>

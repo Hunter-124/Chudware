@@ -7,6 +7,7 @@
   .product-card { position: relative; display: flex; min-width: 0; flex-direction: column; gap: var(--s4); padding: var(--s6); border-top: var(--border-strong) solid var(--line-hi); background: var(--surface); transition: border-color .18s var(--ease), background .18s var(--ease); }
   .product-card:hover { border-color: var(--accent); background: var(--surface-hi); }
   .product-card-lead { grid-column: 1 / -1; border-color: var(--accent); }
+  .product-card-span { grid-column: 1 / -1; }
   .product-card-index { color: var(--technical); font: var(--step--1)/1 var(--mono); letter-spacing: .12em; }
   .product-card h2 { font-size: var(--step-2); }
   .product-card h2 a { color: var(--text); text-decoration: none; }
@@ -98,7 +99,29 @@
   @media (max-width: 45rem) {
     .product-crosslinks, .product-tiles { grid-template-columns: 1fr; }
     .product-card, .product-compare > div, .product-note { padding: var(--s5); }
-    .product-diagram { padding: var(--s4); overflow-x: auto; }
+    /* A 640-unit flow diagram with mono labels cannot shrink to a phone and
+       stay legible, so it scrolls — but a silently clipped diagram reads as a
+       broken one. These are Komarov's scrolling shadows: the two `local`
+       layers are pinned to the content box and paint over the two `scroll`
+       layers pinned to the scroll port, so an edge shadow shows only while
+       there is more diagram past that edge, and nothing shows at all when the
+       whole thing fits. `background-color` stays separate: the shorthand would
+       drop the surface the diagram is drawn on. */
+    .product-diagram {
+      padding: var(--s4);
+      overflow-x: auto;
+      overscroll-behavior-x: contain;
+      background-color: var(--bg-deep);
+      background-image:
+        linear-gradient(to right, var(--bg-deep), transparent),
+        linear-gradient(to left, var(--bg-deep), transparent),
+        linear-gradient(to right, var(--line-hi), transparent),
+        linear-gradient(to left, var(--line-hi), transparent);
+      background-repeat: no-repeat;
+      background-size: 2.5rem 100%, 2.5rem 100%, .75rem 100%, .75rem 100%;
+      background-position: left center, right center, left center, right center;
+      background-attachment: local, local, scroll, scroll;
+    }
     .product-svg { min-width: 30rem; }
     .product-spec tbody th { width: auto; }
   }

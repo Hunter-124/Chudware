@@ -27,6 +27,15 @@ export interface TesseractOptions {
   onAngle?: (zwDeg: number) => void;
   /** Render one parked frame at the brand pose (prefers-reduced-motion). */
   still?: boolean;
+  /**
+   * The driver took the context away. Mobile browsers do this routinely — a
+   * backgrounded tab, memory pressure, or simply opening a second WebGL
+   * context on the same page is enough — so this is a normal event, not an
+   * error path. The handle is dead by the time this fires; the caller shows
+   * its static fallback and waits for `webglcontextrestored` on the canvas
+   * before building a new one.
+   */
+  onLost?: () => void;
 }
 
 export interface TesseractHandle {
@@ -478,8 +487,14 @@ export function createTesseract(
   gl.blendFunc(gl.ONE, gl.ONE); // additive: overlaps bloom on their own
 
   // ---- sizing ---------------------------------------------------------------
-  const PIXEL_CEILING = 1_200_000;
-  const PIXEL_FLOOR = 260_000;
+  // A phone GPU is asked for a decorative mark, not a product feature, and it
+  // is the platform most likely to answer by taking the context away. Half the
+  // desktop ceiling is still comfortably above this figure's legibility floor
+  // (32 edges of analytic line art, sharp at any backing-store size) and it
+  // roughly halves the render target the driver has to keep resident.
+  const SMALL_VIEWPORT = window.matchMedia('(max-width: 60rem)').matches;
+  const PIXEL_CEILING = SMALL_VIEWPORT ? 600_000 : 1_200_000;
+  const PIXEL_FLOOR = SMALL_VIEWPORT ? 160_000 : 260_000;
   let pixelBudget = PIXEL_CEILING;
   let width = 0;
   let height = 0;
@@ -526,6 +541,22 @@ export function createTesseract(
   const onVisibility = () => { if (!document.hidden) last = performance.now(); };
   document.addEventListener('visibilitychange', onVisibility);
 
+  // Context loss. `preventDefault()` here is not defensive tidiness — it is the
+  // only thing that makes the loss recoverable at all: without it the browser
+  // never fires `webglcontextrestored` and the canvas stays a blank rectangle
+  // for the life of the page. Every GL object above is already gone, so this
+  // handle is finished; the caller reinstates its static fallback and builds a
+  // fresh renderer if and when the context comes back.
+  let contextAlive = true;
+  const onLost = (event: Event) => {
+    event.preventDefault();
+    if (!contextAlive) return;
+    contextAlive = false;
+    cancelAnimationFrame(frame);
+    opts.onLost?.();
+  };
+  canvas.addEventListener('webglcontextlost', onLost);
+
   let last = performance.now();
   let frame = 0;
   let lastReported = -1;
@@ -555,11 +586,20 @@ export function createTesseract(
     const wide = aspect > 1.2;
     const radius = Math.min(width, height) * (wide ? 0.44 : 0.46);
     const shiftX = wide ? width * 0.20 : 0;
-    // Portrait stages are tall (copy flows under the mark's lane), so the
-    // figure anchors near the top instead of the geometric centre, where it
-    // would land behind the lede. +y in shader px is down-screen.
+    // Portrait stages used to span the whole hero, so the figure anchored near
+    // the top rather than at the geometric centre, which would have landed
+    // behind the lede. The portrait stage is now bounded to the mark's own
+    // lane, so that preference has to be clamped: keep a full radius of
+    // clearance at both edges, and centre outright on any stage too short to
+    // honour the preference. Unclamped, the old expression pushed the figure's
+    // top edge off a short stage. +y in shader px is down-screen.
+    const half = height * 0.5;
+    const margin = radius * 1.04;
     const targetTop = Math.min(Math.max(height * 0.2, 170), 260);
-    const shiftY = wide ? 0 : -(height * 0.5 - targetTop);
+    const centreY = height - margin <= margin
+      ? half
+      : Math.min(Math.max(targetTop, margin), height - margin);
+    const shiftY = wide ? 0 : centreY - half;
     const coreWidth = Math.max(1.4, Math.min(4.0, Math.min(width, height) * 0.0052));
 
     gl2.clearColor(0, 0, 0, 0);
@@ -619,6 +659,8 @@ export function createTesseract(
       frame = requestAnimationFrame(loop);
       const delta = now - last;
       last = now;
+      // A loss can land between the frame request and this callback.
+      if (!contextAlive) return;
       if (document.hidden || !visible) return;
 
       ema = ema === 0 ? delta : ema * 0.9 + delta * 0.1;
@@ -640,10 +682,12 @@ export function createTesseract(
   return {
     destroy() {
       cancelAnimationFrame(frame);
+      contextAlive = false;
       observer.disconnect();
       resizeObserver.disconnect();
       window.removeEventListener('pointermove', onPointer);
       document.removeEventListener('visibilitychange', onVisibility);
+      canvas.removeEventListener('webglcontextlost', onLost);
       gl.deleteProgram(ribbonProg);
       gl.deleteProgram(spriteProg);
       gl.deleteProgram(dustProg);
@@ -655,6 +699,14 @@ export function createTesseract(
       gl.deleteBuffer(spriteCorner);
       gl.deleteBuffer(sprBuf);
       gl.deleteBuffer(dustBuf);
+      // Deleting the objects does not release the drawing buffer, which is the
+      // bulk of what a suspended stage still costs the GPU — so shrink it to
+      // nothing. Deliberately NOT `WEBGL_lose_context.loseContext()`: a loss
+      // nobody `preventDefault()`s is permanent, and `getContext` on that
+      // canvas returns the dead context forever, so a stage torn down on
+      // scroll-out could never be rebuilt on scroll-in.
+      canvas.width = 1;
+      canvas.height = 1;
     },
   };
 }

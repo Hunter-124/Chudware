@@ -160,16 +160,6 @@
   .capability-index li::before { content: "/"; margin-right: var(--s2); color: var(--accent); font-family: var(--mono); }
   .architecture-layout { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: clamp(2rem, 8vw, 7rem); align-items: center; }
   .architecture-copy { margin-bottom: 0; }
-  .stack-diagram { position: relative; display: grid; gap: var(--s3); padding-left: var(--s7); }
-  .stack-diagram::before { content: "BROWSER TO ENGINE"; position: absolute; inset-block: 0; left: 0; writing-mode: vertical-rl; transform: rotate(180deg); color: var(--faint); font: .65rem/1 var(--mono); letter-spacing: .14em; }
-  .stack-node { display: grid; grid-template-columns: auto 1fr; gap: 0 var(--s4); padding: var(--s5); border: var(--border) solid var(--line); background: var(--surface); }
-  .stack-node > span { grid-row: 1 / 3; color: var(--accent); font: var(--step--1)/1.4 var(--mono); }
-  .stack-node strong { font-size: var(--step-1); }
-  .stack-node small { margin-top: var(--s1); color: var(--muted); font: var(--step--1)/1.5 var(--mono); }
-  .stack-client { border-color: var(--technical); }
-  .stack-core { border-color: var(--accent); background: var(--accent-wash); }
-  .stack-link { display: flex; justify-content: space-between; padding-inline: var(--s5); color: var(--faint); font: .68rem/1.4 var(--mono); text-transform: uppercase; }
-  .stack-link::before { content: "↓"; color: var(--technical); }
   .workbench { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(18rem, .55fr); gap: var(--s7); align-items: start; }
   .workbench-image { min-width: 0; }
   .workbench-image img { width: 100%; border: var(--border) solid var(--line-hi); border-radius: var(--radius-sm); }
@@ -303,8 +293,6 @@
     .hero { padding-block: var(--s7) var(--s6); }
     .hero-grid { gap: var(--s7); }
     .capability-index .wrap { grid-template-columns: 1fr; gap: var(--s4); }
-    .stack-diagram { padding-left: 0; }
-    .stack-diagram::before { display: none; }
     .source-band, .access-grid, .access-contact, .platform-grid, .gallery-grid { grid-template-columns: 1fr; }
     .source-band .text-link, .access-contact, .gallery-card-wide { grid-column: auto; }
     .access-contact { align-items: start; }
@@ -344,12 +332,12 @@
   /* Pointer spotlight and tilt. The custom properties come from
      scripts/effects.ts; with no script the initial values leave every surface
      centred, unlit, and untilted, so this degrades to the plain card. */
-  .panel, .access-option, .gallery-card, .stack-node, [data-lift] {
+  .panel, .access-option, .gallery-card, [data-lift] {
     position: relative;
     transform: perspective(52rem) rotateX(var(--tilt-x)) rotateY(var(--tilt-y));
     transition: transform .4s var(--ease), box-shadow .4s var(--ease), border-color .4s var(--ease);
   }
-  .panel::after, .access-option::after, .gallery-card::after, .stack-node::after, [data-lift]::after {
+  .panel::after, .access-option::after, .gallery-card::after, [data-lift]::after {
     content: ""; position: absolute; inset: 0; z-index: 0; opacity: 0; pointer-events: none;
     background: radial-gradient(18rem 18rem at var(--mx) var(--my), var(--accent-wash), transparent 70%);
     /* Screen so the wash can only lighten; it sits above the card's own text. */
@@ -363,7 +351,7 @@
     @supports (animation-timeline: view()) {
       /* `translate`, not `transform`: the reveal has to compose with the
          pointer tilt rather than overwrite it once the animation fills. */
-      .section-heading, .stack-diagram, .workbench, .tool-loop, .gallery-card, .access-option { animation: enter linear both; animation-timeline: view(); animation-range: entry 0% entry 28%; }
+      .section-heading, .pricing-note, .workbench, .tool-loop, .gallery-card, .access-option { animation: enter linear both; animation-timeline: view(); animation-range: entry 0% entry 28%; }
       @keyframes enter { from { opacity: .35; translate: 0 var(--s4); } to { opacity: 1; translate: none; } }
     }
 

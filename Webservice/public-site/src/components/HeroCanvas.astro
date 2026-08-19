@@ -341,7 +341,7 @@ import { HERO_STAGES } from '../scripts/hero-timeline';
 </style>
 
 <script>
-  import { createHero } from '../scripts/hero';
+  import { createHero, type HeroHandle } from '../scripts/hero';
   import { HERO_STAGES } from '../scripts/hero-timeline';
 
   const stage = document.querySelector<HTMLElement>('[data-hero]');
@@ -357,10 +357,33 @@ import { HERO_STAGES } from '../scripts/hero-timeline';
     // Mirrors the responsive breakpoint below which the panel stops covering
     // the render, so the camera stops walking the part aside for it.
     const dockedQuery = window.matchMedia('(min-width: 78.0625rem)');
+    let hero: HeroHandle | null = null;
     let attempts = 0;
+    let retry = 0;
+
+    // The product screenshot underneath is the resting state. Previously
+    // `data-ready` was set once and never cleared, so a context the driver
+    // later reclaimed left a blank pane over the screenshot instead of letting
+    // it show through — the failure a phone actually hits.
+    const showShot = () => {
+      delete canvas.dataset.ready;
+      canvas.hidden = true;
+      // The panel duplicates the FeatureManager already visible inside the
+      // screenshot, so it belongs to the live render only.
+      panel.hidden = true;
+    };
+
+    const teardown = () => {
+      window.clearTimeout(retry);
+      hero?.destroy();
+      hero = null;
+      showShot();
+    };
+
     const boot = () => {
+      if (hero) return;
       canvas.hidden = false;
-      const hero = createHero(canvas, {
+      hero = createHero(canvas, {
         centered: true,
         panelDocked: () => dockedQuery.matches,
         still,
@@ -378,23 +401,48 @@ import { HERO_STAGES } from '../scripts/hero-timeline';
               : 'Rebuild complete';
           }
         },
+        // Not an error: mobile drivers reclaim contexts under memory pressure
+        // and when a page asks for more than they allow. Show the screenshot
+        // and let `webglcontextrestored` bring the render back.
+        onLost() {
+          hero = null;
+          showShot();
+        },
       });
 
       if (hero) {
         // The screenshot is the fallback. It only steps aside once the canvas
         // has actually produced a context and a first frame.
+        attempts = 0;
         canvas.dataset.ready = '';
         panel.hidden = false;
       } else if (++attempts < 4) {
         // Same GPU-warmup retry as the brand hero: parse-time null contexts
         // are transient, and the screenshot fallback is for real absence.
-        canvas.hidden = true;
-        setTimeout(boot, 400);
+        showShot();
+        retry = window.setTimeout(boot, 400);
       } else {
-        canvas.hidden = true;
-        stage.hidden = true;
+        showShot();
       }
     };
-    boot();
+
+    canvas.addEventListener('webglcontextrestored', () => {
+      attempts = 0;
+      boot();
+    });
+
+    // Own a context only while the showcase is worth rendering. A phone's
+    // WebGL context ceiling is low enough that this and the brand hero can
+    // exceed it between them, and the driver's answer is to take one away —
+    // so the two are never both live. Observe the framed box rather than the
+    // overlay stage, because the stage is hidden while the render is down and
+    // a hidden element never intersects anything again.
+    new IntersectionObserver(
+      (entries) => {
+        if (entries[entries.length - 1]?.isIntersecting) boot();
+        else teardown();
+      },
+      { rootMargin: '100% 0px' },
+    ).observe(stage.parentElement ?? stage);
   }
 </script>

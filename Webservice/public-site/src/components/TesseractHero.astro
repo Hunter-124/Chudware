@@ -208,24 +208,38 @@
     @media (max-width: 60rem) {
       /* Portrait: the mark drops behind the copy as a centred backdrop, the
          HUD thins to what still reads. */
+
+      /* The stage stops spanning the whole hero. Portrait copy flows *under*
+         the mark's lane, which makes the hero about 1.7 screens tall on a
+         phone — so a full-bleed stage was asking the GPU for a canvas nearly
+         twice the viewport, most of it behind opaque copy, and putting the
+         figure's centre somewhere below the fold. Bounding it to the reserved
+         lane cuts the backing store to roughly a third and puts the mark
+         where the layout already made room for it. */
+      .bhero-stage {
+        bottom: auto;
+        height: calc(38svh + 12rem);
+      }
+
       .bhero-veil {
         background: linear-gradient(
           180deg,
           color-mix(in srgb, var(--bg) 55%, transparent) 0%,
           color-mix(in srgb, var(--bg) 30%, transparent) 45%,
-          var(--bg) 88%
+          var(--bg) 92%
         );
       }
 
       .bhero-fallback {
         left: 50%;
-        top: 13rem;
+        top: 55%;
       }
 
       /* The two static caption blocks go; the live θ readout stays, because it
-         is the tell that the mark is a real render rather than a picture. It
-         stacks under the title block instead of hanging off a bottom frame
-         corner, which on a tall portrait hero lands in the copy. */
+         is the tell that the mark is a real render rather than a picture. Both
+         surviving blocks stack down the left edge: the title block used to sit
+         at `left: 50%`, which on a 390 px viewport is a 183 px column that
+         wraps "8-cell" onto a second line and crowds the θ readout beside it. */
       .bhero-hud-tr,
       .bhero-hud-bl,
       .bhero-frame .bl,
@@ -233,12 +247,27 @@
         display: none;
       }
 
+      .bhero-hud-tl {
+        left: var(--s3);
+        /* Bounded by the frame it sits in, not by a character count: at .6rem
+           mono with .12em tracking, a 28ch cap is ~190px and wraps both labels
+           onto second lines inside a frame that is 340px wide. */
+        max-width: calc(100% - var(--s3));
+      }
+
       .bhero-hud-br {
-        top: 4.25rem;
+        top: 4.75rem;
         right: auto;
         bottom: auto;
         left: var(--s3);
         text-align: left;
+      }
+
+      /* The frame ends with the stage now, not 7.25rem above the hero's
+         bottom — that offset was measured against the architecture strip,
+         which no longer shares the stage's box on portrait. */
+      .bhero-frame {
+        bottom: var(--s2);
       }
 
       .bhero-spacer {
@@ -257,39 +286,85 @@
 </style>
 
 <script>
-  import { createTesseract } from '../scripts/tesseract';
+  import { createTesseract, type TesseractHandle } from '../scripts/tesseract';
 
+  const stage = document.querySelector<HTMLElement>('[data-tess]');
   const canvas = document.querySelector<HTMLCanvasElement>('[data-tess-canvas]');
   const fallback = document.querySelector<HTMLElement>('[data-tess-fallback]');
   const angle = document.querySelector<HTMLElement>('[data-tess-angle]');
 
-  if (canvas) {
+  if (stage && canvas) {
     const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let mark: TesseractHandle | null = null;
     let attempts = 0;
+    let retry = 0;
+
+    // The static mark is the resting state, and every path that has no live
+    // render returns to it. Previously `data-ready` was set once and never
+    // cleared, so a context the driver later reclaimed left an empty rectangle
+    // where the brand mark should be — which is precisely what a phone does.
+    const showFallback = () => {
+      delete canvas.dataset.ready;
+      canvas.hidden = true;
+      fallback?.removeAttribute('hidden');
+    };
+
+    const teardown = () => {
+      window.clearTimeout(retry);
+      mark?.destroy();
+      mark = null;
+      showFallback();
+    };
+
     const boot = () => {
+      if (mark) return;
       canvas.hidden = false;
-      const mark = createTesseract(canvas, {
+      mark = createTesseract(canvas, {
         still,
         onAngle(deg) {
           if (angle) angle.textContent = deg.toFixed(1);
         },
+        // Not an error: mobile drivers reclaim contexts under memory pressure
+        // and when a page asks for more than they allow. Fall back to the
+        // static mark and let `webglcontextrestored` bring the render back.
+        onLost() {
+          mark = null;
+          showFallback();
+        },
       });
 
       if (mark) {
-        // Same contract as the part builder: the static mark only steps aside
-        // once the canvas has a live context and a first frame.
+        attempts = 0;
         canvas.dataset.ready = '';
         fallback?.setAttribute('hidden', '');
       } else if (++attempts < 4) {
         // A GPU-process warmup race can hand back a null context at parse
         // time and a live one a few hundred milliseconds later. Retry before
         // conceding to the fallback.
-        canvas.hidden = true;
-        setTimeout(boot, 400);
+        showFallback();
+        retry = window.setTimeout(boot, 400);
       } else {
-        canvas.hidden = true;
+        showFallback();
       }
     };
-    boot();
+
+    canvas.addEventListener('webglcontextrestored', () => {
+      attempts = 0;
+      boot();
+    });
+
+    // Own a context only while the stage is worth rendering. A phone's WebGL
+    // context ceiling is low enough that this hero and the part-builder
+    // showcase further down the page can exceed it between them, and the
+    // driver's answer is to take one away — so the two are never both live.
+    // One viewport of lead time means the render is already running by the
+    // time the stage scrolls into view.
+    new IntersectionObserver(
+      (entries) => {
+        if (entries[entries.length - 1]?.isIntersecting) boot();
+        else teardown();
+      },
+      { rootMargin: '100% 0px' },
+    ).observe(stage);
   }
 </script>

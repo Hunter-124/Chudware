@@ -2,7 +2,7 @@
 import BaseLayout from '../layouts/BaseLayout.astro';
 import '../styles/company.css';
 ---
-<BaseLayout title="FAQ" description="Straight answers about Chudware: browser versus native access, supported platforms, file formats, where files live, how the AI copilot works, and commercial-preview status.">
+<BaseLayout title="FAQ" description="Straight answers about Chudware: browser versus native access, supported platforms, which files it opens and exports, migrating from another CAD system, where files live, how the AI copilot works, and commercial-preview status.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Frequently asked</p>
@@ -26,14 +26,21 @@ import '../styles/company.css';
         <details class="co-faq">
           <summary>What is Chudware?</summary>
           <div class="co-faq-answer">
-            <p>A parametric CAD system for mechanical engineers, built on the OpenCascade (OCCT 7.9) geometry kernel. One workspace covers constraint sketching, feature-based modeling, assemblies, CAM, simulation, reverse engineering, PLM, and an AI copilot.</p>
+            <p>A parametric CAD system for mechanical engineers, with an industrial solid-geometry kernel underneath it. One workspace covers constraint sketching, feature-based modeling, assemblies, CAM, <a href="/product/simulation/">simulation</a>, reverse engineering, PLM, and an AI copilot.</p>
             <p>It is a modeling system, not a viewer. Features stay ordered and editable, sketches can be fully defined, and the geometry is real B-rep rather than a mesh approximation.</p>
           </div>
         </details>
         <details class="co-faq">
           <summary>Is this a web viewer with a CAD skin?</summary>
           <div class="co-faq-answer">
-            <p>No. The full application, including the OCCT geometry kernel, is compiled to WebAssembly and runs in your tab, rendering with WebGL2. It calls out to the shared Chudware engine over a JSON-RPC socket for model state and tool calls. Nothing about the toolchain is reduced to fit a web page.</p>
+            <p>No. The full application runs in your tab — the same product surface as the desktop build, not a stripped-down web edition and not a video stream of a machine in a data centre. Model state and tool calls travel over the wire to the engine service. Nothing about the toolchain is reduced to fit a web page.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>What can it simulate?</summary>
+          <div class="co-faq-answer">
+            <p>Linear static stress, modal (free-vibration) frequencies, and steady-state or transient thermal conduction, run against the part in the open document rather than in a separate application. High-cycle fatigue life is derived from the static stress field.</p>
+            <p>Meshing is automatic, error-driven adaptive refinement is available, and a second, independent mesher can be switched in to check whether a result is a property of the part or of the mesh. What is not there is nonlinear or explicit-dynamics structural analysis on your actual geometry. The <a href="/product/simulation/">simulation page</a> sets out the scope and the caveats.</p>
           </div>
         </details>
         <details class="co-faq">
@@ -60,8 +67,8 @@ import '../styles/company.css';
         <details class="co-faq">
           <summary>What does the browser client actually run?</summary>
           <div class="co-faq-answer">
-            <p>The real Chudware GUI, compiled to WebAssembly, running in your tab and drawing with WebGL2. It calls the shared Chudware engine over one JSON-RPC WebSocket; your keyboard and pointer input drive the same tools directly. Your machine only needs a current browser and a usable network connection — no GPU driver work, no installer, no licence dongle.</p>
-            <p>Identity, authorization, and per-account file isolation are enforced by the gateway in front of the shared engine daemon. See <a href="/security/">security</a> for what that means concretely.</p>
+            <p>The real Chudware application, running in your tab — the same product surface as the desktop build, with your keyboard and pointer driving the same tools directly. It is not a video stream of a machine in a data centre and it is not a viewer: model state and tool calls travel over the wire, so the geometry kernel and the full engineering toolchain stay intact. Your machine only needs a current desktop browser and a usable network connection — no graphics driver work, no installer, no licence dongle.</p>
+            <p>Identity, authorization, and per-account file isolation are enforced by the gateway in front of the shared engine service. See <a href="/security/">security</a> for what that means concretely.</p>
           </div>
         </details>
         <details class="co-faq">
@@ -69,9 +76,11 @@ import '../styles/company.css';
           <div class="co-faq-answer">
             <ul>
               <li><strong>Any modern desktop browser</strong>, including on macOS — this is the supported route today.</li>
-              <li><strong>Windows and Linux</strong> native preview builds, on request.</li>
+              <li><strong>Windows and Linux</strong> native preview builds, on request. Both are 64-bit only and both need a graphics driver capable of a modern hardware-accelerated 3D context; without one the application does not start.</li>
               <li><strong>No native macOS package</strong> is published, and no installer or checksum exists to verify. Use the browser workspace on a Mac.</li>
+              <li><strong>Phones and tablets are not supported.</strong> This site reads fine on a phone; the CAD workspace does not. It is built around a keyboard, a precise pointer, and a large viewport, and there is no touch-first interface for it. Treat Chudware as a desktop product.</li>
             </ul>
+            <p>No minimum RAM, CPU, or disk figures are published, because none have been measured and ratified. Opening the browser workspace is the honest way to find out whether a given machine is comfortable.</p>
             <p>Do not install anything presented as an official Chudware release from a third-party source; there is no public download channel yet.</p>
           </div>
         </details>
@@ -98,9 +107,25 @@ import '../styles/company.css';
           </div>
         </details>
         <details class="co-faq">
+          <summary>Can Chudware open a file somebody else made?</summary>
+          <div class="co-faq-answer">
+            <p>Yes. It opens STEP (<code>.step</code>, <code>.stp</code>), IGES (<code>.iges</code>, <code>.igs</code>), and BREP solids directly, and reads STL, OBJ, PLY, and glTF meshes, sewing them into a solid body on open. DXF is read for 2D profiles — lines, arcs, circles, and polylines; splines, ellipses, text, dimensions, and hatch are skipped rather than half-imported.</p>
+            <p>Imported geometry arrives as solid bodies you can measure, section, mate, and build new features on. It does not arrive carrying somebody else's feature history, because a neutral format does not store one.</p>
+          </div>
+        </details>
+        <details class="co-faq">
           <summary>Can I get my geometry into other tools?</summary>
           <div class="co-faq-answer">
-            <p>Yes. Export STEP or STL when another tool needs a handoff. A neutral export loses the feature history by definition, so keep the <code>.step+</code> document as the source of truth and treat the export as a deliverable.</p>
+            <p>Yes. Export STEP, IGES, BREP, STL, OBJ, PLY, or glTF when another tool needs a handoff. A neutral export loses the feature history by definition, so keep the <code>.step+</code> document as the source of truth and treat the export as a deliverable.</p>
+            <p>The native document is not a lock-in either: <code>.step+</code> is a container that stores a neutral STEP body next to the parametric tree, so any CAD system can open the geometry inside it even if it cannot read the tree.</p>
+          </div>
+        </details>
+        <details class="co-faq">
+          <summary>I use SolidWorks, Fusion, or Onshape. Can I move my models across?</summary>
+          <div class="co-faq-answer">
+            <p>Through neutral formats, which is the path that actually works. Every one of those tools exports STEP or IGES; Chudware opens it as solid geometry and you continue modeling with new features on top.</p>
+            <p>What Chudware does not do is read a native <code>.sldprt</code>, <code>.f3d</code>, or Onshape document and reconstruct the original feature tree, and no one should promise you that. There is an experimental Windows-only path that drives an installed, licensed copy of SolidWorks to convert its own files, but it is not something to plan a migration around.</p>
+            <p>In practice, migration means bringing geometry over and rebuilding the parametric intent where you need it to be editable — which is the same trade you make moving between any two CAD systems.</p>
           </div>
         </details>
         <details class="co-faq">

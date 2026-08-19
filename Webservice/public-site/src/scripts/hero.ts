@@ -32,6 +32,15 @@ export interface HeroOptions {
    * across the breakpoint reframes without a reboot.
    */
   panelDocked?: () => boolean;
+  /**
+   * The driver took the context away. Mobile browsers do this routinely — a
+   * backgrounded tab, memory pressure, or simply opening a second WebGL
+   * context on the same page is enough — so this is a normal event, not an
+   * error path. The handle is dead by the time this fires; the caller shows
+   * its static fallback and waits for `webglcontextrestored` on the canvas
+   * before building a new one.
+   */
+  onLost?: () => void;
 }
 
 export interface HeroHandle {
@@ -471,8 +480,12 @@ export function createHero(canvas: HTMLCanvasElement, opts: HeroOptions = {}): H
   // The budget then adapts to what the GPU actually delivers, because "which
   // GPU is this" is not knowable up front and an integrated part running this
   // shader at native resolution would crawl.
-  const PIXEL_CEILING = 900_000;
-  const PIXEL_FLOOR = 200_000;
+  // A phone GPU raymarching a boolean field is the case most likely to be
+  // answered by the driver reclaiming the context, so it gets a lower ceiling
+  // than a workstation.
+  const SMALL_VIEWPORT = window.matchMedia('(max-width: 60rem)').matches;
+  const PIXEL_CEILING = SMALL_VIEWPORT ? 450_000 : 900_000;
+  const PIXEL_FLOOR = SMALL_VIEWPORT ? 120_000 : 200_000;
   let pixelBudget = PIXEL_CEILING;
   let width = 0;
   let height = 0;
@@ -522,6 +535,22 @@ export function createHero(canvas: HTMLCanvasElement, opts: HeroOptions = {}): H
 
   const resizeObserver = new ResizeObserver(() => { resize(); });
   resizeObserver.observe(canvas);
+
+  // Context loss. `preventDefault()` here is not defensive tidiness — it is the
+  // only thing that makes the loss recoverable at all: without it the browser
+  // never fires `webglcontextrestored` and the canvas stays a blank rectangle
+  // for the life of the page. Every GL object above is already gone, so this
+  // handle is finished; the caller reinstates the product screenshot and builds
+  // a fresh renderer if and when the context comes back.
+  let contextAlive = true;
+  const onLost = (event: Event) => {
+    event.preventDefault();
+    if (!contextAlive) return;
+    contextAlive = false;
+    cancelAnimationFrame(frame);
+    opts.onLost?.();
+  };
+  canvas.addEventListener('webglcontextlost', onLost);
 
   let clock = 0;
   let last = performance.now();
@@ -618,6 +647,8 @@ export function createHero(canvas: HTMLCanvasElement, opts: HeroOptions = {}): H
       frame = requestAnimationFrame(loop);
       const delta = now - last;
       last = now;
+      // A loss can land between the frame request and this callback.
+      if (!contextAlive) return;
       if (document.hidden || !visible) return;
 
       ema = ema === 0 ? delta : ema * 0.9 + delta * 0.1;
@@ -641,12 +672,22 @@ export function createHero(canvas: HTMLCanvasElement, opts: HeroOptions = {}): H
   return {
     destroy() {
       cancelAnimationFrame(frame);
+      contextAlive = false;
       observer.disconnect();
       resizeObserver.disconnect();
       window.removeEventListener('pointermove', onPointer);
       document.removeEventListener('visibilitychange', onVisibility);
+      canvas.removeEventListener('webglcontextlost', onLost);
       gl.deleteProgram(program);
       gl.deleteVertexArray(vao);
+      // Deleting the objects does not release the drawing buffer, which is the
+      // bulk of what a suspended stage still costs the GPU — so shrink it to
+      // nothing. Deliberately NOT `WEBGL_lose_context.loseContext()`: a loss
+      // nobody `preventDefault()`s is permanent, and `getContext` on that
+      // canvas returns the dead context forever, so a stage torn down on
+      // scroll-out could never be rebuilt on scroll-in.
+      canvas.width = 1;
+      canvas.height = 1;
     },
   };
 }

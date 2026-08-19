@@ -8,15 +8,15 @@ import HeroCanvas from '../components/HeroCanvas.astro';
     <p class="eyebrow">Parametric CAD · Browser or native</p>
     <h1>Parametric CAD, <span class="text-gradient">from sketch to shop floor.</span></h1>
     <p class="lede">Chudware is built for mechanical engineers and product teams who want modeling, assemblies, CAM, PLM, simulation, reverse engineering, and an AI copilot in the same workspace.</p>
-    <p class="hero-note">Browser seats run in isolated rootless containers and stream to a tab. Native Windows and Linux preview builds are available on request.</p>
+    <p class="hero-note">In a browser, the real application runs in your tab as WebAssembly and calls the engine over one JSON-RPC socket. Native Windows and Linux preview builds are available on request.</p>
     <div class="actions">
       <a class="button" href="https://app.chudware.com/signup">Create an account</a>
       <a class="button button-secondary" href="/product/">Tour the product</a>
     </div>
     <dl class="architecture-strip" slot="strip" aria-label="Chudware architecture at a glance">
       <div><dt>Geometry</dt><dd>OpenCascade / OCCT 7.9</dd></div>
-      <div><dt>Browser delivery</dt><dd>Video-streamed workspace</dd></div>
-      <div><dt>Isolation</dt><dd>Rootless container per seat</dd></div>
+      <div><dt>Browser delivery</dt><dd>WebAssembly client, WebGL2</dd></div>
+      <div><dt>Isolation</dt><dd>Per-account roots at the gateway</dd></div>
       <div><dt>Native</dt><dd>Windows + Linux</dd></div>
     </dl>
   </TesseractHero>
@@ -41,13 +41,13 @@ import HeroCanvas from '../components/HeroCanvas.astro';
       <header class="section-heading architecture-copy">
         <p class="eyebrow">The architecture is the product</p>
         <h2>Full CAD in a browser tab, without turning CAD into a web toy.</h2>
-        <p class="lede">A browser seat runs server-side in its own isolated rootless container. Chudware streams the workspace as video and sends input back to the application, so the geometry kernel and the full engineering toolchain stay intact.</p>
+        <p class="lede">The browser runs the same C++ application as the desktop build, compiled to WebAssembly and drawing through WebGL2 in your tab. It calls the geometry engine over a single JSON-RPC socket — model state and tool calls on the wire, never a video stream — so the kernel and the full engineering toolchain stay intact.</p>
         <p class="supporting-copy">Prefer local execution? Native Windows and Linux builds use the same product surface on an engineering workstation.</p>
       </header>
       <div class="stack-diagram" aria-label="Browser delivery architecture">
-        <div class="stack-node stack-client"><span>01</span><strong>Browser tab</strong><small>Display + input</small></div>
-        <div class="stack-link"><span>Video</span><span>Input</span></div>
-        <div class="stack-node"><span>02</span><strong>Isolated seat</strong><small>Rootless container</small></div>
+        <div class="stack-node stack-client"><span>01</span><strong>Browser tab</strong><small>WebAssembly client · WebGL2</small></div>
+        <div class="stack-link"><span>JSON-RPC</span><span>Events</span></div>
+        <div class="stack-node"><span>02</span><strong>Gateway</strong><small>Verified identity · per-account file roots</small></div>
         <div class="stack-link"><span>Model state</span><span>Tool calls</span></div>
         <div class="stack-node stack-core"><span>03</span><strong>Chudware core</strong><small>C++ · Python · TypeScript · OCCT 7.9</small></div>
       </div>
@@ -102,7 +102,7 @@ import HeroCanvas from '../components/HeroCanvas.astro';
   <section class="section source-section">
     <div class="wrap source-band">
       <div><p class="eyebrow">Built as a system</p><h2>Deep software for physical products.</h2></div>
-      <p>Chudware is a large C++, Python, and TypeScript codebase built around the OpenCascade geometry kernel, a feature tree, a 2D constraint solver, manufacturing workflows, product data, and isolated streamed sessions.</p>
+      <p>Chudware is a large C++, Python, and TypeScript codebase built around the OpenCascade geometry kernel, a feature tree, a 2D constraint solver, manufacturing workflows, product data, and a WebAssembly build of the same client.</p>
       <a class="text-link" href="/changelog/">Read the changelog <span aria-hidden="true">→</span></a>
     </div>
   </section>

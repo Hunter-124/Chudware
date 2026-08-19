@@ -210,8 +210,7 @@ void main() {
 
 const SPRITE_VERT = `#version 300 es
 layout(location = 0) in vec2 aCorner; // -1..1 billboard quad
-layout(location = 1) in vec4 aP;      // model-space anchor (w used only when kind 0)
-layout(location = 2) in float aKind;  // 0 = vertex dot, 1 = spark
+layout(location = 1) in vec4 aP;      // model-space vertex anchor
 
 uniform vec2 uPhase;
 uniform vec2 uCam;
@@ -219,11 +218,9 @@ uniform vec2 uRes;
 uniform vec2 uShift;
 uniform float uRadius;
 uniform float uWidth;
-uniform float uTime;
 
 out vec2 vUv;
 out float vN01;
-out float vKind;
 
 vec4 rotate4(vec4 p, float xy, float zw) {
   float c = cos(xy), s = sin(xy);
@@ -233,39 +230,22 @@ vec4 rotate4(vec4 p, float xy, float zw) {
 }
 
 void main() {
-  vec4 p = aP;
-  float n01 = 0.85;
-  float radiusPx;
-  if (aKind < 0.5) {
-    p = rotate4(p, uPhase.x, uPhase.y);
-    float k = ${D4.toFixed(5)} / (${D4.toFixed(5)} - p.w);
-    vec3 m = p.xyz * k;
-    float cy = cos(uCam.x), sy = sin(uCam.x);
-    float cp = cos(uCam.y), sp = sin(uCam.y);
-    vec3 c3 = vec3(m.x * cy + m.z * sy, 0.0, -m.x * sy + m.z * cy);
-    c3 = vec3(c3.x, m.y * cp - c3.z * sp, m.y * sp + c3.z * cp);
-    n01 = clamp(0.5 - c3.z / (2.0 * ${DEPTH.toFixed(5)}), 0.0, 1.0);
-    float q = ${D3.toFixed(5)} / (${D3.toFixed(5)} + c3.z);
-    vec2 s2 = c3.xy * q * ${SCALE.toFixed(5)} * uRadius;
-    radiusPx = uWidth * (1.5 + 1.1 * n01) * 2.2;
-    vec2 px = s2 + aCorner * radiusPx + uShift;
-    vUv = aCorner;
-    vN01 = n01;
-    vKind = aKind;
-    vec2 clip = vec2(px.x / uRes.x, -px.y / uRes.y) * 2.0;
-    gl_Position = vec4(clip, 0.0, 1.0);
-  } else {
-    // The spark seats at the origin of the figure, sized off the box rather
-    // than the stroke so it stays the calm centre of the mark — and small
-    // enough that the inner cell stays readable when the fold passes through.
-    radiusPx = uRadius * (0.115 + 0.009 * sin(uTime * 1.35));
-    vec2 px = aCorner * radiusPx * 2.2 + uShift;
-    vUv = aCorner;
-    vN01 = 1.0;
-    vKind = aKind;
-    vec2 clip = vec2(px.x / uRes.x, -px.y / uRes.y) * 2.0;
-    gl_Position = vec4(clip, 0.0, 1.0);
-  }
+  vec4 p = rotate4(aP, uPhase.x, uPhase.y);
+  float k = ${D4.toFixed(5)} / (${D4.toFixed(5)} - p.w);
+  vec3 m = p.xyz * k;
+  float cy = cos(uCam.x), sy = sin(uCam.x);
+  float cp = cos(uCam.y), sp = sin(uCam.y);
+  vec3 c3 = vec3(m.x * cy + m.z * sy, 0.0, -m.x * sy + m.z * cy);
+  c3 = vec3(c3.x, m.y * cp - c3.z * sp, m.y * sp + c3.z * cp);
+  float n01 = clamp(0.5 - c3.z / (2.0 * ${DEPTH.toFixed(5)}), 0.0, 1.0);
+  float q = ${D3.toFixed(5)} / (${D3.toFixed(5)} + c3.z);
+  vec2 s2 = c3.xy * q * ${SCALE.toFixed(5)} * uRadius;
+  float radiusPx = uWidth * (1.5 + 1.1 * n01) * 2.2;
+  vec2 px = s2 + aCorner * radiusPx + uShift;
+  vUv = aCorner;
+  vN01 = n01;
+  vec2 clip = vec2(px.x / uRes.x, -px.y / uRes.y) * 2.0;
+  gl_Position = vec4(clip, 0.0, 1.0);
 }`;
 
 const SPRITE_FRAG = `#version 300 es
@@ -273,36 +253,19 @@ precision highp float;
 
 in vec2 vUv;
 in float vN01;
-in float vKind;
 
 uniform vec3 uNear;
 uniform vec3 uFar;
-uniform vec3 uSpark;
-uniform float uTime;
 
 out vec4 outColor;
 
 void main() {
-  if (vKind < 0.5) {
-    float d = length(vUv);
-    float core = 1.0 - smoothstep(0.18, 0.42, d);
-    float halo = exp(-d * d * 3.4) * 0.34;
-    vec3 col = mix(uFar, uNear, 0.2 + 0.8 * vN01);
-    float e = core * 1.3 + halo;
-    outColor = vec4(col * e, clamp(e, 0.0, 1.0));
-  } else {
-    // Eight-point star, matching the logo's spark: straight-edged points via
-    // a triangle wave over the angle — long tips on the cardinals, short on
-    // the diagonals — plus a tight halo. The pulse breathes around the seam.
-    float r = length(vUv);
-    float w = abs(mod(atan(vUv.y, vUv.x), 1.5707963) / 1.5707963 * 2.0 - 1.0);
-    float starR = mix(0.30, 0.66, w);
-    float body = 1.0 - smoothstep(starR * 0.72, starR, r);
-    float halo = exp(-r * r * 11.0) * 0.3;
-    float pulse = 0.9 + 0.1 * sin(uTime * 1.35);
-    float e = (body * 1.25 + halo) * pulse;
-    outColor = vec4(uSpark * e, clamp(e, 0.0, 1.0));
-  }
+  float d = length(vUv);
+  float core = 1.0 - smoothstep(0.18, 0.42, d);
+  float halo = exp(-d * d * 3.4) * 0.34;
+  vec3 col = mix(uFar, uNear, 0.2 + 0.8 * vN01);
+  float e = core * 1.3 + halo;
+  outColor = vec4(col * e, clamp(e, 0.0, 1.0));
 }`;
 
 const DUST_VERT = `#version 300 es
@@ -350,7 +313,6 @@ void main() {
 // ---- palette (make_logo.py) -------------------------------------------------
 const TEAL_HI: readonly [number, number, number] = [66 / 255, 236 / 255, 206 / 255];
 const TEAL_DK: readonly [number, number, number] = [16 / 255, 128 / 255, 115 / 255];
-const SPARK: readonly [number, number, number] = [235 / 255, 255 / 255, 250 / 255];
 // The site's warm accent, kept faint: the cage should read as instrumentation,
 // not as a second brand colour.
 const RING_COL: readonly [number, number, number] = [255 / 255 * 0.85, 138 / 255 * 0.85, 61 / 255 * 0.85];
@@ -412,7 +374,7 @@ export function createTesseract(
     return out;
   };
   const uRib = uniforms(ribbonProg, ['uPhase', 'uCam', 'uRes', 'uShift', 'uRadius', 'uWidth', 'uTime', 'uNear', 'uFar', 'uRing'] as const);
-  const uSpr = uniforms(spriteProg, ['uPhase', 'uCam', 'uRes', 'uShift', 'uRadius', 'uWidth', 'uTime', 'uNear', 'uFar', 'uSpark'] as const);
+  const uSpr = uniforms(spriteProg, ['uPhase', 'uCam', 'uRes', 'uShift', 'uRadius', 'uWidth', 'uNear', 'uFar'] as const);
   const uDst = uniforms(dustProg, ['uCam', 'uRes', 'uRadius', 'uTime', 'uDust'] as const);
 
   // ---- geometry -------------------------------------------------------------
@@ -471,24 +433,15 @@ export function createTesseract(
   gl.enableVertexAttribArray(0);
   gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-  // 16 vertex dots + 1 spark at the origin.
-  const spr = new Float32Array(17 * 5);
-  o = 0;
-  for (let i = 0; i < 16; i++) {
-    for (let k = 0; k < 4; k++) spr[o + k] = VERTS[i * 4 + k];
-    spr[o + 4] = 0;
-    o += 5;
-  }
-  spr[o] = 0; spr[o + 1] = 0; spr[o + 2] = 0; spr[o + 3] = 0; spr[o + 4] = 1;
+  // The 16 cell vertices, one billboard each. Nothing sits at the origin: the
+  // inner cell reads as an empty room, which is the whole point of the figure.
+  const spr = new Float32Array(VERTS);
   const sprBuf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, sprBuf);
   gl.bufferData(gl.ARRAY_BUFFER, spr, gl.STATIC_DRAW);
   gl.enableVertexAttribArray(1);
-  gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 20, 0);
+  gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 16, 0);
   gl.vertexAttribDivisor(1, 1);
-  gl.enableVertexAttribArray(2);
-  gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 20, 16);
-  gl.vertexAttribDivisor(2, 1);
 
   const dustVao = gl.createVertexArray();
   gl.bindVertexArray(dustVao);
@@ -647,12 +600,10 @@ export function createTesseract(
     gl2.uniform2f(uSpr.uShift, shiftX, shiftY);
     gl2.uniform1f(uSpr.uRadius, radius);
     gl2.uniform1f(uSpr.uWidth, coreWidth);
-    gl2.uniform1f(uSpr.uTime, elapsed);
     gl2.uniform3f(uSpr.uNear, TEAL_HI[0], TEAL_HI[1], TEAL_HI[2]);
     gl2.uniform3f(uSpr.uFar, TEAL_DK[0], TEAL_DK[1], TEAL_DK[2]);
-    gl2.uniform3f(uSpr.uSpark, SPARK[0], SPARK[1], SPARK[2]);
     gl2.bindVertexArray(spriteVao);
-    gl2.drawArraysInstanced(gl2.TRIANGLE_STRIP, 0, 4, 17);
+    gl2.drawArraysInstanced(gl2.TRIANGLE_STRIP, 0, 4, 16);
 
     gl2.bindVertexArray(null);
   }

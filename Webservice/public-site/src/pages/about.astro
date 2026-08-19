@@ -19,11 +19,11 @@ import '../styles/company.css';
         <p>Chudware exists because that gap is an engineering problem, not a marketing one. Solving it means carrying a genuine geometry kernel — <strong>OpenCascade / OCCT 7.9</strong> — all the way through the product, rather than approximating solids with meshes and hoping nobody asks for a section view.</p>
 
         <h2>What that actually means</h2>
-        <p>The system is a large C++, Python, and TypeScript codebase built around the OCCT kernel, a feature tree, a 2D constraint solver, manufacturing workflows, product data, and isolated sessions. Design intent stays attached as work moves downstream: the same document carries the sketches, the features, the CAM job, and the project history, instead of being handed between disconnected tools and losing a little truth at every boundary.</p>
+        <p>The system is a large C++, Python, and TypeScript codebase built around the OCCT kernel, a feature tree, a 2D constraint solver, manufacturing workflows, product data, and per-account isolation enforced at the gateway. Design intent stays attached as work moves downstream: the same document carries the sketches, the features, the CAM job, and the project history, instead of being handed between disconnected tools and losing a little truth at every boundary.</p>
         <p>The native file format is <code>.step+</code>, which keeps the feature tree, dimensions, materials, studies, and drawings. STEP and STL exports exist for the moment another tool needs a flattened handoff — but the editable design is not held hostage inside a proprietary blob you cannot open elsewhere.</p>
 
         <h2>How it is delivered</h2>
-        <p>A browser seat runs server-side in an isolated rootless container and streams the workspace to a tab, so the geometry kernel and the full engineering toolchain stay intact rather than being reduced to whatever a page can do on its own. Native Windows and Linux preview builds run the same product surface on an engineering workstation and are available on request while a public release channel is prepared. There is no native macOS package today; Macs use the browser workspace.</p>
+        <p>The browser runs the same application as the desktop build, compiled to WebAssembly, rendering with WebGL2 directly in the tab. It talks to the engine over a single JSON-RPC WebSocket, so the geometry kernel and the full engineering toolchain stay intact rather than being reduced to whatever a page can do on its own. Native Windows and Linux preview builds run the same product surface on an engineering workstation and are available on request while a public release channel is prepared. There is no native macOS package today; Macs use the browser workspace.</p>
 
         <h2>The posture, honestly</h2>
         <p>Chudware is built by a small team and is in <strong>commercial preview</strong>. Preview means the product modes are real and in daily use, and it also means the public rate card is not finished, native distribution is on request, and features still move. Where a page cannot yet state something true, it says so — that is why <a class="text-link" href="/pricing/">pricing</a> publishes no numbers it has not ratified and <a class="text-link" href="/security/">security</a> claims no certification it has not earned.</p>
@@ -44,7 +44,7 @@ import '../styles/company.css';
           </li>
           <li>
             <h3>The architecture is the product</h3>
-            <p>Isolation, the engine bridge, and the file boundary are load-bearing engineering, not deployment trivia.</p>
+            <p>The gateway's isolation, the engine bridge, and the file-path boundary are load-bearing engineering, not deployment trivia.</p>
           </li>
           <li>
             <h3>Ship preview builds, label them</h3>

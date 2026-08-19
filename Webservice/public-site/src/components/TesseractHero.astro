@@ -134,7 +134,10 @@
       padding: var(--s2);
     }
 
-    .bhero-hud-tl { top: var(--s2); left: var(--s3); }
+    /* Over the mark's lane, not the copy's: at any viewport shorter than
+       ~1000px the hero copy rides up into the top-left corner, and a caption
+       parked there lands on the eyebrow. */
+    .bhero-hud-tl { top: var(--s2); left: 50%; }
     .bhero-hud-tr { top: var(--s2); right: var(--s3); text-align: right; }
     .bhero-hud-bl { bottom: var(--s2); left: var(--s3); }
     .bhero-hud-br { bottom: var(--s2); right: var(--s3); text-align: right; }

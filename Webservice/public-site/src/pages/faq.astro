@@ -33,7 +33,7 @@ import '../styles/company.css';
         <details class="co-faq">
           <summary>Is this a web viewer with a CAD skin?</summary>
           <div class="co-faq-answer">
-            <p>No. The browser is a display surface. The full application, including the geometry kernel, runs server-side in an isolated rootless container and streams the workspace to your tab while your input drives it. Nothing about the toolchain is reduced to fit a web page.</p>
+            <p>No. The full application, including the OCCT geometry kernel, is compiled to WebAssembly and runs in your tab, rendering with WebGL2. It calls out to the shared Chudware engine over a JSON-RPC socket for model state and tool calls. Nothing about the toolchain is reduced to fit a web page.</p>
           </div>
         </details>
         <details class="co-faq">
@@ -58,10 +58,10 @@ import '../styles/company.css';
           </div>
         </details>
         <details class="co-faq">
-          <summary>What does a browser seat actually run on?</summary>
+          <summary>What does the browser client actually run?</summary>
           <div class="co-faq-answer">
-            <p>A server-side seat in an isolated rootless container. The application renders there and is streamed to your tab as video; your keyboard and pointer input travel back to it. Your machine only needs a current browser and a usable network connection — no GPU driver work, no installer, no licence dongle.</p>
-            <p>Identity, authorization, and per-account file isolation are enforced by the gateway in front of that seat. See <a href="/security/">security</a> for what that means concretely.</p>
+            <p>The real Chudware GUI, compiled to WebAssembly, running in your tab and drawing with WebGL2. It calls the shared Chudware engine over one JSON-RPC WebSocket; your keyboard and pointer input drive the same tools directly. Your machine only needs a current browser and a usable network connection — no GPU driver work, no installer, no licence dongle.</p>
+            <p>Identity, authorization, and per-account file isolation are enforced by the gateway in front of the shared engine daemon. See <a href="/security/">security</a> for what that means concretely.</p>
           </div>
         </details>
         <details class="co-faq">

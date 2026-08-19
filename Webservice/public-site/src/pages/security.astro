@@ -21,7 +21,7 @@ import '../styles/company.css';
       <header class="section-heading">
         <p class="eyebrow">Request path</p>
         <h2 id="co-path" class="co-anchor">One ingress, one place where identity is decided.</h2>
-        <p class="lede">A browser seat runs server-side in an isolated rootless container and streams the workspace to your tab. Every request and websocket behind that seat still passes the same gateway, which replaces whatever identity the client claims with the one it verified.</p>
+        <p class="lede">The browser client is Chudware compiled to WebAssembly, running in your tab and calling the engine over one JSON-RPC WebSocket. Every request and websocket behind that connection still passes the same gateway, which replaces whatever identity the client claims with the one it verified.</p>
       </header>
       <figure class="co-diagram" data-lift>
         <svg class="co-dg" viewBox="0 0 910 320" role="img" aria-label="Request path: a browser tab connects over HTTPS and WSS through the Cloudflare tunnel, which is the only ingress, to the gateway. The gateway verifies the chudware_sid session cookie and sits inside the gateway-enforced boundary together with the shared chudware-hostd daemon and the per-account workspace and bucket roots. Remote procedure calls to the daemon and file paths are clamped to the calling account.">
@@ -85,7 +85,7 @@ import '../styles/company.css';
             <h3>Proving who is calling</h3>
             <span class="co-source">gateway/auth.py</span>
           </div>
-          <p>Identity is resolved by pure ASGI middleware that covers HTTP and websocket connections alike, so a streamed engine socket is authenticated the same way a page load is. A signed-in session is the front door; a Cloudflare Access assertion, verified against the team JWKS, is scoped to the operator's admin surface. Public paths are matched exactly or as a real subpath, never as a shared string prefix.</p>
+          <p>Identity is resolved by pure ASGI middleware that covers HTTP and websocket connections alike, so the engine websocket is authenticated the same way a page load is. A signed-in session is the front door; a Cloudflare Access assertion, verified against the team JWKS, is scoped to the operator's admin surface. Public paths are matched exactly or as a real subpath, never as a shared string prefix.</p>
         </li>
         <li>
           <span class="co-controls-index">02</span>

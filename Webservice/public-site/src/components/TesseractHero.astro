@@ -219,12 +219,23 @@
         top: 13rem;
       }
 
+      /* The two static caption blocks go; the live θ readout stays, because it
+         is the tell that the mark is a real render rather than a picture. It
+         stacks under the title block instead of hanging off a bottom frame
+         corner, which on a tall portrait hero lands in the copy. */
       .bhero-hud-tr,
       .bhero-hud-bl,
-      .bhero-hud-br,
       .bhero-frame .bl,
       .bhero-frame .br {
         display: none;
+      }
+
+      .bhero-hud-br {
+        top: 4.25rem;
+        right: auto;
+        bottom: auto;
+        left: var(--s3);
+        text-align: left;
       }
 
       .bhero-spacer {

@@ -268,6 +268,35 @@ import { HERO_STAGES } from '../scripts/hero-timeline';
         grid-template-columns: 1fr;
       }
     }
+
+    /* The panel only docks over the render once the box is tall enough to
+       hold it: the FeatureManager's seven rows are ~27rem, and the box is
+       only as tall as its own width / 1.28. Below that the box becomes a
+       two-row stack — render on top, FeatureManager underneath — with the
+       shot and the live stage sharing the first row so the canvas still
+       overlays the screenshot exactly. Without this the panel is either a
+       flow sibling below a full-height shot or a docked card taller than its
+       container, and the box's own overflow clips it out of existence. */
+    @media (max-width: 78rem) {
+      .partshow-box {
+        aspect-ratio: auto;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: auto auto;
+      }
+
+      .partshow-shot {
+        grid-area: 1 / 1;
+        aspect-ratio: 1.5;
+        height: auto;
+      }
+
+      .partshow-stage {
+        grid-area: 1 / 1;
+        position: relative;
+        inset: auto;
+      }
+    }
   }
 
   @layer motion {
@@ -292,14 +321,21 @@ import { HERO_STAGES } from '../scripts/hero-timeline';
     margin: 0;
   }
 
-  @media (max-width: 60rem) {
+  @media (max-width: 78rem) {
+    /* Second row of the box: a full-width instrument strip welded under the
+       render rather than a card floating over it. */
     .partshow-panel {
       position: relative;
       z-index: 2;
+      grid-area: 2 / 1;
       right: auto;
       bottom: auto;
       width: auto;
-      margin: var(--s4);
+      margin: 0;
+      border-width: var(--border) 0 0;
+      border-radius: 0;
+      background: var(--surface);
+      backdrop-filter: none;
     }
   }
 </style>
@@ -318,11 +354,15 @@ import { HERO_STAGES } from '../scripts/hero-timeline';
 
   if (stage && canvas && panel) {
     const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    // Mirrors the responsive breakpoint below which the panel stops covering
+    // the render, so the camera stops walking the part aside for it.
+    const dockedQuery = window.matchMedia('(min-width: 78.0625rem)');
     let attempts = 0;
     const boot = () => {
       canvas.hidden = false;
       const hero = createHero(canvas, {
         centered: true,
+        panelDocked: () => dockedQuery.matches,
         still,
         onStage(index, building) {
           for (let i = 0; i < features.length; i++) {

@@ -979,4 +979,274 @@
       listEl.innerHTML = "<p class='deploy-note'>Failed to load releases: " + esc(e.message || e) + "</p>";
     });
   })();
+
+  /* ---- AI subscription accounts: the shared Claude / ChatGPT sign-ins ---- */
+  (function initSubscriptionAccounts() {
+    var flowHost = document.getElementById("sub-flow");
+    var listEl = document.getElementById("sub-list");
+    var status = document.getElementById("sub-status");
+    if (!flowHost || !listEl || !status) return;
+
+    var connectBtns = Array.prototype.slice.call(
+      document.querySelectorAll("#sub-connect button[data-provider]"));
+
+    var POLL_MS = 5000;
+    var providerLabels = {};
+    var pollTimer = null;
+    // Bumped whenever a flow is cancelled or replaced, so a request already in
+    // flight can tell that its answer is no longer the one being waited on.
+    var flowSeq = 0;
+
+    function setSubStatus(msg, isErr) {
+      status.textContent = msg || "";
+      status.className = isErr ? "ac-dim err" : "ac-dim";
+    }
+
+    function clearFlow() {
+      flowSeq++;
+      if (pollTimer != null) { clearTimeout(pollTimer); pollTimer = null; }
+      flowHost.textContent = "";
+      flowHost.hidden = true;
+    }
+
+    function providerLabel(provider) {
+      return providerLabels[provider] || provider;
+    }
+
+    function fmtSubWhen(iso) {
+      var d = iso ? new Date(iso) : null;
+      return d && !isNaN(d.getTime()) ? d.toLocaleString() : "\u2014";
+    }
+
+    function accountUrlFor(provider, key) {
+      return "/api/providers/accounts/" + encodeURIComponent(provider) +
+             (key == null ? "" : "/" + encodeURIComponent(key));
+    }
+
+    async function disconnect(account) {
+      if (!window.confirm("Disconnect " + providerLabel(account.provider) +
+                          " from the shared pool?")) return;
+      setSubStatus("Disconnecting \u2026");
+      await api(accountUrlFor(account.provider, account.account_key), { method: "DELETE" });
+      setSubStatus(providerLabel(account.provider) + " disconnected.");
+      await refresh();
+    }
+
+    function renderAccounts(accounts) {
+      listEl.textContent = "";
+      if (!accounts.length) {
+        listEl.innerHTML = "<p class='ac-dim'>No shared accounts connected yet.</p>";
+        return;
+      }
+      accounts.forEach(function (account) {
+        var row = document.createElement("div");
+        row.className = "sub-row";
+
+        var info = document.createElement("div");
+        var who = document.createElement("div");
+        who.className = "sub-who";
+        who.appendChild(document.createTextNode(providerLabel(account.provider)));
+        if (account.expired) {
+          var flag = document.createElement("span");
+          flag.className = "pill st-denied";
+          flag.textContent = "needs reconnecting";
+          who.appendChild(flag);
+        }
+        info.appendChild(who);
+
+        var bits = [];
+        if (account.label) bits.push(account.label);
+        if (account.plan) bits.push(account.plan + " plan");
+        bits.push("connected " + fmtSubWhen(account.created_at));
+        bits.push(account.last_used_at
+          ? "last used " + fmtSubWhen(account.last_used_at)
+          : "not used yet");
+        var meta = document.createElement("p");
+        meta.className = "sub-meta";
+        meta.textContent = bits.join(" \u00b7 ");
+        info.appendChild(meta);
+        row.appendChild(info);
+
+        var actions = document.createElement("div");
+        actions.className = "ac-actions";
+        actions.appendChild(actionBtn("Disconnect", "btn ghost danger", function () {
+          disconnect(account).catch(function (e) { setSubStatus(String(e.message || e), true); });
+        }));
+        row.appendChild(actions);
+
+        listEl.appendChild(row);
+      });
+    }
+
+    async function refresh() {
+      var data = await api("/api/providers/accounts");
+      (data.providers || []).forEach(function (p) {
+        providerLabels[p.provider] = p.label || p.provider;
+      });
+      renderAccounts((data.accounts || []).filter(function (a) { return a.scope === "shared"; }));
+    }
+
+    function reloadAccounts() {
+      refresh().catch(function (e) {
+        listEl.innerHTML = "<p class='ac-dim'>Couldn't load subscription accounts.</p>";
+        setSubStatus(String(e.message || e), true);
+      });
+    }
+
+    function flowShell(provider, instructions) {
+      flowHost.textContent = "";
+      flowHost.hidden = false;
+      var head = document.createElement("p");
+      head.className = "sub-step";
+      var name = document.createElement("strong");
+      name.textContent = "Connecting " + providerLabel(provider);
+      head.appendChild(name);
+      flowHost.appendChild(head);
+      if (instructions) {
+        var step = document.createElement("p");
+        step.className = "sub-step ac-dim";
+        step.textContent = instructions;
+        flowHost.appendChild(step);
+      }
+    }
+
+    function flowLink(url, label) {
+      var a = document.createElement("a");
+      a.className = "btn ghost";
+      a.href = url;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.textContent = label;
+      return a;
+    }
+
+    function cancelBtn() {
+      return actionBtn("Cancel", "btn ghost", function () {
+        clearFlow();
+        setSubStatus("");
+      });
+    }
+
+    // Resolves true when the flow is finished with (connected, cancelled or
+    // superseded) and false while the provider is still waiting on the person.
+    async function completeFlow(provider, body, seq) {
+      var res = await api(accountUrlFor(provider) + "/complete", {
+        method: "POST", body: JSON.stringify(body)
+      });
+      if (seq !== flowSeq) return true;
+      if (res && res.status === "connected") {
+        clearFlow();
+        await refresh();
+        setSubStatus(providerLabel(provider) + " connected.");
+        return true;
+      }
+      setSubStatus((res && res.detail) || "Waiting for you to approve the sign-in \u2026");
+      return false;
+    }
+
+    function showPasteFlow(provider, flow) {
+      flowShell(provider, flow.instructions);
+      var seq = flowSeq;
+      if (flow.authorize_url) window.open(flow.authorize_url, "_blank", "noopener");
+
+      var input = document.createElement("input");
+      input.type = "text";
+      input.className = "sub-paste";
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      input.placeholder = "Paste the whole address here";
+      input.setAttribute("aria-label", "Address from the approval page");
+      flowHost.appendChild(input);
+
+      var actions = document.createElement("div");
+      actions.className = "ac-actions";
+      var finish = actionBtn("Finish", "btn primary", function () {
+        var code = input.value.trim();
+        if (!code) {
+          setSubStatus("Paste the address from the approval page first.", true);
+          return;
+        }
+        finish.disabled = true;
+        setSubStatus("Finishing sign-in \u2026");
+        completeFlow(provider, { flow_id: flow.flow_id, code: code }, seq)
+          .then(function (done) { if (!done) finish.disabled = false; })
+          .catch(function (e) {
+            if (seq !== flowSeq) return;
+            finish.disabled = false;
+            setSubStatus(String(e.message || e), true);
+          });
+      });
+      actions.appendChild(finish);
+      if (flow.authorize_url) actions.appendChild(flowLink(flow.authorize_url, "Open the page again"));
+      actions.appendChild(cancelBtn());
+      flowHost.appendChild(actions);
+      setSubStatus("");
+      input.focus();
+    }
+
+    function showDeviceFlow(provider, flow) {
+      flowShell(provider, flow.instructions);
+      var seq = flowSeq;
+
+      if (flow.user_code) {
+        var code = document.createElement("code");
+        code.className = "sub-code";
+        code.textContent = flow.user_code;
+        flowHost.appendChild(code);
+      }
+      var actions = document.createElement("div");
+      actions.className = "ac-actions";
+      if (flow.verification_url) {
+        actions.appendChild(flowLink(flow.verification_url, "Open the sign-in page"));
+      }
+      actions.appendChild(cancelBtn());
+      flowHost.appendChild(actions);
+
+      var deadline = Date.now() + (Number(flow.expires_in) || 600) * 1000;
+      setSubStatus("Waiting for you to approve the sign-in \u2026");
+
+      function tick() {
+        pollTimer = null;
+        if (seq !== flowSeq) return;
+        if (Date.now() >= deadline) {
+          clearFlow();
+          setSubStatus("The sign-in code ran out. Start again when you're ready.", true);
+          return;
+        }
+        completeFlow(provider, { flow_id: flow.flow_id }, seq)
+          .then(function (done) { if (!done && seq === flowSeq) pollTimer = setTimeout(tick, POLL_MS); })
+          .catch(function (e) {
+            if (seq !== flowSeq) return;
+            clearFlow();
+            setSubStatus(String(e.message || e), true);
+          });
+      }
+      pollTimer = setTimeout(tick, POLL_MS);
+    }
+
+    async function beginFlow(provider) {
+      clearFlow();
+      connectBtns.forEach(function (b) { b.disabled = true; });
+      setSubStatus("Starting sign-in \u2026");
+      try {
+        var flow = await api(accountUrlFor(provider) + "/begin", {
+          method: "POST", body: JSON.stringify({ scope: "shared" })
+        });
+        if (flow.kind === "device") showDeviceFlow(provider, flow);
+        else showPasteFlow(provider, flow);
+      } catch (e) {
+        setSubStatus(String(e.message || e), true);
+      } finally {
+        connectBtns.forEach(function (b) { b.disabled = false; });
+      }
+    }
+
+    connectBtns.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        beginFlow(btn.getAttribute("data-provider"));
+      });
+    });
+
+    reloadAccounts();
+  })();
 })();

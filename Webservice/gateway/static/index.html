@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <title>Chudware account</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23090d12'/%3E%3Cg fill='none' stroke='%2342ECCE' stroke-width='1.7'%3E%3Crect x='5' y='5' width='22' height='22'/%3E%3Crect x='10.5' y='10.5' width='11' height='11'/%3E%3Cpath d='M5 5L10.5 10.5M27 5L21.5 10.5M27 27L21.5 21.5M5 27L10.5 21.5'/%3E%3C/g%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/portal-assets/portal.ccd14c744436.css">
-  <script src="/portal-assets/portal.c2eea3c72329.js" defer></script>
+  <link rel="stylesheet" href="/portal-assets/portal.dd9b80445598.css">
+  <script src="/portal-assets/portal.ded78011d592.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#page-title">Skip to content</a>
@@ -109,10 +109,11 @@
         <div class="section-intro"><div><p class="eyebrow">AI onboarding</p><h2>Choose how the copilot is powered</h2><p>The same three choices as desktop onboarding, explained without jargon.</p></div></div>
         <div class="grid three setup-options">
           <article id="credits-option" class="card featured"><span class="step">01</span><h2>Chudware credits</h2><p>The simplest option. Models run through the managed pool and draw from your portal balance.</p><strong id="ai-credit-balance">— credits available</strong><button class="primary" data-go="usage">View usage</button></article>
-          <article class="card"><span class="step">02</span><h2>Your AI subscription</h2><p>Use a supported subscription you already pay for. Open desktop Settings → Providers and choose Sign in.</p><span class="setup-note">Claude · ChatGPT · Cursor · xAI · Kimi</span><button class="secondary" data-go="downloads">Get desktop app</button></article>
+          <article class="card"><span class="step">02</span><h2>Your AI subscription</h2><p>Connect a Claude or ChatGPT subscription you already pay for. Those turns run on your own subscription instead of drawing Chudware credits.</p><span class="setup-note">Claude · ChatGPT</span><div class="button-row"><button class="secondary small" type="button" data-suboauth-begin="anthropic-sub">Connect Claude</button><button class="secondary small" type="button" data-suboauth-begin="openai-codex">Connect ChatGPT</button></div><div id="suboauth-flow" class="suboauth-flow" role="status"></div></article>
           <article class="card"><span class="step">03</span><h2>Your API key</h2><p>Paste a key once. Chudware validates it before encrypted storage and never displays it again.</p><form id="byok-form" class="form-stack"><label>Provider<select id="byok-provider" required><option value="openrouter">OpenRouter</option><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option><option value="xai">xAI</option><option value="moonshot">Moonshot</option></select></label><label>API key<input id="byok-key" type="password" autocomplete="off" required placeholder="Paste key — write only"></label><button class="primary" type="submit">Validate and save</button><p id="byok-status" class="fine" role="status"></p></form></article>
         </div>
         <article class="card"><div class="card-head"><div><p class="eyebrow">Your keys</p><h2>Validated providers</h2></div><span class="zero-credit">BYOK turns use 0 credits</span></div><div id="byok-list" class="provider-list"><p class="empty">Checking your providers…</p></div></article>
+        <article class="card suboauth-card"><div class="card-head"><div><p class="eyebrow">Your subscriptions</p><h2>Connected accounts</h2></div><span class="zero-credit">Subscription turns use 0 credits</span></div><div id="suboauth-list" class="provider-list"><p class="empty">Checking your connected accounts…</p></div></article>
       </section>
 
       <section class="page" data-view="downloads" aria-labelledby="page-title">

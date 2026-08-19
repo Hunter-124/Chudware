@@ -319,6 +319,27 @@
   .appeal-resolve label { display: grid; gap: 4px; color: var(--muted, #8b93a3); font-size: .76rem; }
   .appeal-resolve textarea { width: 100%; min-height: 64px; resize: vertical; }
   .appeal-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .sub-actions { margin: 0 0 10px; }
+  .sub-list { display: grid; gap: 10px; }
+  .sub-row { border: 1px solid var(--border, #2a2e36); border-radius: 10px; padding: 10px 12px;
+             background: var(--bg, #0e1013); display: flex; flex-wrap: wrap; gap: 8px;
+             justify-content: space-between; align-items: flex-start; }
+  .sub-row .sub-who { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+                      font-weight: 600; word-break: break-all; }
+  .sub-row .sub-meta { color: var(--muted, #8b93a3); font-size: .74rem; margin: 4px 0 0;
+                       word-break: break-word; }
+  .sub-flow { border: 1px solid var(--border, #2a2e36); border-radius: 10px; padding: 12px;
+              background: var(--bg, #0e1013); margin: 0 0 10px; }
+  .sub-flow[hidden] { display: none; }
+  .sub-step { font-size: .82rem; line-height: 1.5; margin: 0 0 8px; }
+  .sub-code { display: block; font-family: monospace; font-size: 1.3rem; letter-spacing: .12em;
+              color: var(--teal-hi, #42ecce); user-select: all; word-break: break-all;
+              margin: 0 0 10px; }
+  .sub-paste { width: 100%; background: var(--bg, #0e1013); color: var(--fg, #e8eaf0);
+               border: 1px solid var(--border, #2a2e36); border-radius: 8px; padding: 7px 8px;
+               font: inherit; box-sizing: border-box; margin: 0 0 10px; }
+  #sub-status { margin-top: 10px; font-size: .82rem; white-space: pre-wrap; }
+  #sub-status.err { color: #e07a8a; }
   #browse-modal > div {
     max-width: 640px;
     margin: 8vh auto;
@@ -430,6 +451,19 @@
       <div id="admin-status" aria-live="polite"></div>
     </div>
     <div class="admin-card">
+      <h2>AI subscription accounts</h2>
+      <p style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 10px">
+        The shared Claude and ChatGPT sign-ins every managed turn can draw on.
+      </p>
+      <div class="ac-actions sub-actions" id="sub-connect">
+        <button type="button" class="btn ghost" data-provider="anthropic-sub">Connect Claude</button>
+        <button type="button" class="btn ghost" data-provider="openai-codex">Connect ChatGPT</button>
+      </div>
+      <div class="sub-flow" id="sub-flow" aria-live="polite" hidden></div>
+      <div class="sub-list" id="sub-list" aria-live="polite">Loading…</div>
+      <div class="ac-dim" id="sub-status" role="status" aria-live="polite"></div>
+    </div>
+    <div class="admin-card">
       <h2>Security appeals <span class="pill st-pending" id="appeal-pending" hidden></span></h2>
       <p style="font-size:.85rem;color:var(--muted,#8b93a3);margin:0 0 10px">Review customer-provided context and bounded reason categories. Internal evidence and score thresholds are not shown. Restoring requires the customer to sign in again and never reactivates a compromised device key.</p>
       <div id="admin-appeal-list" class="appeal-admin-list" aria-live="polite"><p class="ac-dim">Loading appeals…</p></div>
@@ -497,7 +531,7 @@
     </div>
   </div>
 </div>
-<script src="/static/admin.js?v=10"></script>
+<script src="/static/admin.js?v=11"></script>
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/winbox/winbox.bundle.min.js"></script>

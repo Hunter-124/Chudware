@@ -1,7 +1,7 @@
 "use strict";
 
 (function () {
-  var state = { account: null, loaded: {}, releases: new Map() };
+  var state = { account: null, loaded: {}, releases: new Map(), subProviders: new Map(), subFlows: {} };
   var pages = ["account", "billing", "usage", "ai", "downloads", "devices"];
 
   function el(id) { return document.getElementById(id); }
@@ -88,6 +88,7 @@
     qa(".page").forEach(function (page) {
       page.classList.toggle("active", page.dataset.view === name);
     });
+    if (name !== "ai") { stopSubscriptionFlows(); clear(el("suboauth-flow")); }
     el("page-title").textContent = titleCase(name === "ai" ? "AI setup" : name);
     document.title = "Chudware · " + titleCase(name === "ai" ? "AI setup" : name);
     document.body.classList.remove("menu-open");
@@ -279,11 +280,186 @@
     });
   }
 
+  function subscriptionPath(provider, action) {
+    return "/api/providers/accounts/" + encodeURIComponent(provider) + "/" + action;
+  }
+
+  function subscriptionLabel(provider) {
+    var meta = state.subProviders.get(provider);
+    return meta ? meta.label : titleCase(provider);
+  }
+
+  function timeLeft(seconds) {
+    var minutes = Math.floor(seconds / 60);
+    var rest = seconds % 60;
+    return minutes + ":" + (rest < 10 ? "0" : "") + rest;
+  }
+
+  function stopSubscriptionFlow(provider) {
+    var flow = state.subFlows[provider];
+    if (!flow) return;
+    if (flow.timer) window.clearInterval(flow.timer);
+    delete state.subFlows[provider];
+  }
+
+  function stopSubscriptionFlows() {
+    Object.keys(state.subFlows).forEach(function (provider) { stopSubscriptionFlow(provider); });
+  }
+
+  function subscriptionFlowHost() {
+    var host = el("suboauth-flow");
+    clear(host);
+    return host;
+  }
+
+  function renderSubscriptionAccounts(accounts) {
+    var host = el("suboauth-list");
+    clear(host);
+    if (!accounts.length) {
+      host.appendChild(text("p", "No subscription is connected yet. Connect Claude or ChatGPT in step 02 above.", "empty"));
+      return;
+    }
+    accounts.forEach(function (account) {
+      var chip = text("span", "", "provider-chip byok-chip");
+      chip.append(text("i", ""), text("span", subscriptionLabel(account.provider)));
+      var detail = account.label || "Connected";
+      if (account.plan) detail += " · " + titleCase(account.plan);
+      chip.appendChild(text("small", detail));
+      if (account.expired) chip.appendChild(text("small", "Expired", "status-revoked"));
+      var remove = text("button", "Disconnect", "danger small");
+      remove.type = "button";
+      remove.dataset.suboauthProvider = account.provider;
+      remove.dataset.suboauthAccount = account.account_key;
+      chip.appendChild(remove);
+      host.appendChild(chip);
+    });
+  }
+
+  async function loadSubscriptionAccounts() {
+    try {
+      var payload = await api("/api/providers/accounts");
+      state.subProviders = new Map((payload.providers || []).map(function (provider) { return [provider.provider, provider]; }));
+      qa("[data-suboauth-begin]").forEach(function (button) { button.hidden = !state.subProviders.has(button.dataset.suboauthBegin); });
+      renderSubscriptionAccounts((payload.accounts || []).filter(function (account) { return account.scope === "personal"; }));
+    } catch (error) {
+      var host = el("suboauth-list");
+      clear(host);
+      host.appendChild(text("p", error.message, "empty"));
+    }
+  }
+
+  async function subscriptionConnected(provider, account) {
+    stopSubscriptionFlows();
+    var host = subscriptionFlowHost();
+    var label = account && account.label ? account.label : subscriptionLabel(provider);
+    host.appendChild(text("p", "Connected " + label + ". Turns on this subscription use no Chudware credits.", "fine"));
+    state.loaded.ai = false;
+    state.loaded.usage = false;
+    await loadAI(true);
+  }
+
+  function renderPasteFlow(provider, flow) {
+    window.open(flow.authorize_url, "_blank", "noopener");
+    var host = subscriptionFlowHost();
+    host.appendChild(text("p", flow.instructions, "fine"));
+    var field = document.createElement("input");
+    field.type = "text";
+    field.autocomplete = "off";
+    field.spellcheck = false;
+    field.placeholder = "Paste the address here";
+    field.setAttribute("aria-label", "Address from the finished sign-in tab");
+    var link = text("a", "Open the sign-in page", "secondary small");
+    link.href = flow.authorize_url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    var finish = text("button", "Finish connecting", "primary small");
+    finish.type = "button";
+    var status = text("p", "", "fine");
+    var row = text("div", "", "button-row");
+    row.append(link, finish);
+    host.append(field, row, status);
+    state.subFlows[provider] = { flowId: flow.flow_id, timer: 0 };
+    finish.addEventListener("click", async function () {
+      var pasted = field.value.trim();
+      if (!pasted) { status.textContent = "Paste the address from the finished sign-in tab first."; return; }
+      finish.disabled = true;
+      status.textContent = "Finishing the connection…";
+      try {
+        var result = await api(subscriptionPath(provider, "complete"), { method: "POST", body: JSON.stringify({ flow_id: flow.flow_id, code: pasted }) });
+        if (result.status === "connected") { field.value = ""; await subscriptionConnected(provider, result.account); return; }
+        status.textContent = result.detail || "Waiting for you to approve access.";
+        finish.disabled = false;
+      } catch (error) {
+        status.textContent = error.message;
+        finish.disabled = false;
+      }
+    });
+  }
+
+  function renderDeviceFlow(provider, flow) {
+    var host = subscriptionFlowHost();
+    host.appendChild(text("p", flow.instructions, "fine"));
+    host.appendChild(text("strong", flow.user_code, "device-code"));
+    var link = text("a", "Open the sign-in page", "secondary small");
+    link.href = flow.verification_url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    var row = text("div", "", "button-row");
+    row.appendChild(link);
+    var status = text("p", "Waiting for you to approve the code…", "fine");
+    host.append(row, status);
+    var record = { flowId: flow.flow_id, timer: 0, deadline: Date.now() + Number(flow.expires_in || 600) * 1000 };
+    state.subFlows[provider] = record;
+    record.timer = window.setInterval(function () {
+      pollDeviceFlow(provider, record, status).catch(function (error) { status.textContent = error.message; });
+    }, 5000);
+  }
+
+  async function pollDeviceFlow(provider, record, status) {
+    if (state.subFlows[provider] !== record) return;
+    var remaining = Math.max(0, Math.ceil((record.deadline - Date.now()) / 1000));
+    if (!remaining) {
+      stopSubscriptionFlow(provider);
+      status.textContent = "This code expired before it was approved. Start again to get a new one.";
+      return;
+    }
+    var result;
+    try {
+      result = await api(subscriptionPath(provider, "complete"), { method: "POST", body: JSON.stringify({ flow_id: record.flowId }) });
+    } catch (error) {
+      if (state.subFlows[provider] !== record) return;
+      stopSubscriptionFlow(provider);
+      status.textContent = error.message;
+      return;
+    }
+    if (state.subFlows[provider] !== record) return;
+    if (result.status === "connected") { await subscriptionConnected(provider, result.account); return; }
+    status.textContent = (result.detail || "Waiting for you to approve the code.") + " · " + timeLeft(remaining) + " left";
+  }
+
+  async function beginSubscriptionFlow(provider, button) {
+    stopSubscriptionFlows();
+    var host = subscriptionFlowHost();
+    host.appendChild(text("p", "Preparing the sign-in link…", "fine"));
+    button.disabled = true;
+    try {
+      var flow = await api(subscriptionPath(provider, "begin"), { method: "POST", body: JSON.stringify({ scope: "personal" }) });
+      if (flow.kind === "device") renderDeviceFlow(provider, flow);
+      else renderPasteFlow(provider, flow);
+    } catch (error) {
+      clear(host);
+      host.appendChild(text("p", error.message, "fine flow-error"));
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   async function loadAI(force) {
     if (state.loaded.ai && !force) return;
     await loadUsage();
     var payload = await api("/api/providers/keys");
     renderByok(payload.keys || []);
+    await loadSubscriptionAccounts();
     state.loaded.ai = true;
   }
 
@@ -395,6 +571,21 @@
       state.loaded.ai = false;
       await loadAI(true);
       showMessage("Provider key removed.", false);
+    } catch (error) {
+      button.disabled = false;
+      showMessage(error.message, true);
+    }
+  });
+  qa("[data-suboauth-begin]").forEach(function (button) { button.addEventListener("click", function () { beginSubscriptionFlow(button.dataset.suboauthBegin, button).catch(function (error) { showMessage(error.message, true); }); }); });
+  el("suboauth-list").addEventListener("click", async function (event) {
+    var button = event.target.closest("button[data-suboauth-provider]");
+    if (!button || !window.confirm("Disconnect this subscription? Its turns will stop running on your own account.")) return;
+    button.disabled = true;
+    try {
+      await api("/api/providers/accounts/" + encodeURIComponent(button.dataset.suboauthProvider) + "/" + encodeURIComponent(button.dataset.suboauthAccount), { method: "DELETE" });
+      state.loaded.ai = false;
+      await loadAI(true);
+      showMessage("Subscription disconnected.", false);
     } catch (error) {
       button.disabled = false;
       showMessage(error.message, true);

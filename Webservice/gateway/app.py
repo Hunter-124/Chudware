@@ -52,6 +52,7 @@ try:
     from .perf_client import router as perf_router
     from .providers import router as providers_router
     from .provider_keys import router as provider_keys_router
+    from .provider_accounts import router as provider_accounts_router
     from .terminal import router as terminal_router
     from .deploy_ops import router as deploy_router
     from .releases import router as releases_router
@@ -70,6 +71,7 @@ except ImportError:
     from perf_client import router as perf_router
     from providers import router as providers_router
     from provider_keys import router as provider_keys_router
+    from provider_accounts import router as provider_accounts_router  # type: ignore
     from terminal import router as terminal_router
     from deploy_ops import router as deploy_router
     from releases import router as releases_router
@@ -453,6 +455,7 @@ app.include_router(appserve_router)
 app.include_router(perf_router)
 app.include_router(providers_router)
 app.include_router(provider_keys_router)
+app.include_router(provider_accounts_router)
 app.include_router(terminal_router)
 app.include_router(deploy_router)
 app.include_router(releases_router)

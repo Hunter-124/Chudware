@@ -1596,8 +1596,9 @@ class Actor:
             remaining = max(0, int(value.get("credits_remaining") or 0))
         except (TypeError, ValueError) as exc:
             raise ValueError("_chudware_actor credits_remaining must be an integer") from exc
-        if not email or source not in {"byok", "pool"}:
-            raise ValueError("_chudware_actor requires email and key_source=byok|pool")
+        if not email or source not in {"byok", "pool", "subscription"}:
+            raise ValueError(
+                "_chudware_actor requires email and key_source=byok|pool|subscription")
         raw_rate = value.get("_rate")
         rated_model = ""
         prompt_rate = completion_rate = None
@@ -1671,11 +1672,77 @@ def pooled_credit_preflight(
 _pooled_keys: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
     "chudware_pooled_provider_keys", default={}
 )
+# The gateway's per-account subscription grant for THIS rpc only. Same run-scoped
+# lifetime as _pooled_keys: bound by worker_rpc after the actor is validated, zeroed
+# by clear_pooled_credentials() before the next rpc is accepted, so one web caller's
+# bearer can never carry a following caller's turn.
+_subscription_grant: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "chudware_subscription_grant", default=None
+)
+
+# Gateway grant provider id (Webservice/gateway/provider_accounts.SUBSCRIPTION_PROVIDERS)
+# -> the config `provider` name _resolve_provider selects the sub-provider class by.
+# "openai-codex" is also an OMP-sidecar id, so it must normalize to the native
+# "codex-sub" adapter that can carry an explicit bearer.
+SUBSCRIPTION_GRANT_PROVIDERS = {
+    "anthropic-sub": "anthropic-sub",
+    "openai-codex": "codex-sub",
+}
+
+# cfg slot carrying the injected bearer from _subscription_provider_config into
+# _resolve_provider, mirroring _chudware_pool_api_key's named-slot convention.
+_SUBSCRIPTION_TOKEN_CFG_KEY = "_chudware_subscription_access_token"
+
+
 def clear_pooled_credentials() -> None:
     """Clear every run-scoped web credential before a new worker RPC is accepted."""
     _pooled_keys.set({})
+    _subscription_grant.set(None)
 
 
+def bind_subscription_grant(value: object) -> dict[str, str]:
+    """Validate the gateway-injected ``params["subscription"]`` and bind it to this run.
+
+    The worker never refreshes and never persists a gateway grant — the gateway owns
+    refresh and guarantees remaining lifetime. Anything malformed raises instead of
+    returning, so a bad grant refuses the turn rather than silently falling through to
+    the desktop user's own subscription credentials.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("subscription grant must be an object")
+    provider = str(value.get("provider") or "").strip().lower()
+    token = value.get("access_token")
+    if provider not in SUBSCRIPTION_GRANT_PROVIDERS:
+        raise ValueError(
+            "subscription grant provider must be anthropic-sub|openai-codex")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("subscription grant requires a non-empty access_token")
+    grant = {"provider": provider, "access_token": token}
+    _subscription_grant.set(grant)
+    return grant
+
+
+def _subscription_provider_config(
+    name: str | None, cfg: dict, actor: Actor
+) -> tuple[str | None, dict]:
+    """Force this run onto the gateway's injected subscription grant.
+
+    Returns ``(provider_name, cfg)`` because ``_resolve_provider`` reads the explicit
+    *name* argument ahead of ``cfg["provider"]``: the browser selects a wire provider
+    ("anthropic"), while the grant names the subscription adapter ("anthropic-sub"),
+    and the grant is the authority. Never reads ambient credentials.
+    """
+    if actor.key_source != "subscription":
+        return name, cfg
+    grant = _subscription_grant.get() or {}
+    provider = SUBSCRIPTION_GRANT_PROVIDERS.get(str(grant.get("provider") or ""), "")
+    token = str(grant.get("access_token") or "")
+    if not provider or not token:
+        raise ValueError("subscription provider credential unavailable")
+    resolved = copy.deepcopy(cfg)
+    resolved["provider"] = provider
+    resolved[_SUBSCRIPTION_TOKEN_CFG_KEY] = token
+    return provider, resolved
 
 
 def _byok_provider_config(name: str | None, cfg: dict, actor: Actor) -> dict:
@@ -1779,6 +1846,9 @@ def get_provider(name: str | None = None, cfg: dict | None = None,
     if actor is not None:
         cfg = _byok_provider_config(name, cfg, actor)
         cfg = _pooled_provider_config(name, cfg, actor)
+        # Last, and it may override *name*: the grant, not the browser's provider
+        # field, decides which subscription adapter runs a subscription turn.
+        name, cfg = _subscription_provider_config(name, cfg, actor)
     # token_usage's event sink is request-scoped and bound by worker_rpc. Provider
     # construction carries no gateway/database dependency.
     provider = _resolve_provider(name, cfg, role=role)
@@ -2058,12 +2128,17 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             return RoleScriptedProvider(by_role)
         return MockProvider(replies or [""])
 
-    if name in OMP_BRIDGE_PROVIDER_IDS:
+    if name in OMP_BRIDGE_PROVIDER_IDS and not cfg.get(_SUBSCRIPTION_TOKEN_CFG_KEY):
         # Cloud providers served by the OMP bun sidecar instead of a raw vendor SDK: the
         # sidecar owns CAD's shared credential store, so an OAuth-only subscription (Claude
         # Pro/Max, Kimi For Coding, …) completes here with no api_key at all, and no pip
         # package has to be installed for the provider to work. Deliberately ahead of the
         # native cloud branches below so a bridge id wins over a same-named SDK adapter.
+        # One exception, and it is a tenancy boundary, not a preference: an injected web
+        # subscription grant (_subscription_provider_config) must reach the native
+        # sub-provider that carries an explicit per-account bearer. "anthropic-sub" is also
+        # a bridge id, and the sidecar would resolve it from ITS OWN AuthStorage — i.e. the
+        # host operator's login — silently spending the wrong subscription.
         from .providers.omp_bridge_provider import OmpBridgeProvider
 
         aliases = _provider_cfg_names(name)
@@ -2218,15 +2293,23 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
 
     if name == "anthropic-sub":
         # Subscription auth (§4.4): uses the user's Claude Pro/Max login, not an api_key.
+        # access_token is the gateway's per-account bearer on a web turn and None on the
+        # desktop, where the provider reads its own credential store exactly as before.
         from .providers.anthropic_sub_provider import AnthropicSubProvider, DEFAULT_MODEL
 
-        return AnthropicSubProvider(model=cfg.get("model", DEFAULT_MODEL))
+        return AnthropicSubProvider(
+            model=cfg.get("model", DEFAULT_MODEL),
+            access_token=cfg.get(_SUBSCRIPTION_TOKEN_CFG_KEY) or None,
+        )
 
     if name == "codex-sub":
         # Subscription auth (§4.4): uses the user's ChatGPT Plus/Pro login.
         from .providers.codex_sub_provider import CodexSubProvider, DEFAULT_MODEL
 
-        return CodexSubProvider(model=cfg.get("model", DEFAULT_MODEL))
+        return CodexSubProvider(
+            model=cfg.get("model", DEFAULT_MODEL),
+            access_token=cfg.get(_SUBSCRIPTION_TOKEN_CFG_KEY) or None,
+        )
 
     if name == "cursor-sub":
         # Subscription auth (§4.4): uses the user's Cursor Pro login.

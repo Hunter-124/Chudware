@@ -27,6 +27,7 @@ try:
     from .credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
     from .config import settings
     from .provider_keys import resolve_validated_key
+    from .provider_accounts import resolve_subscription_token
     from .limits import user_slug
     from .plans import limits_for
 except ImportError:  # uvicorn app:app from package dir
@@ -35,6 +36,7 @@ except ImportError:  # uvicorn app:app from package dir
     from credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
     from config import settings
     from provider_keys import resolve_validated_key
+    from provider_accounts import resolve_subscription_token
     from limits import user_slug
     from plans import limits_for
 
@@ -188,7 +190,7 @@ _OPERATOR_SUBSCRIPTION_METHODS = frozenset({
 })
 # Secrets / server-owned endpoint config — never accept from the browser.
 _STRIP_SECRET_FIELDS = (
-    "api_key", "base_url", "fallback_api_keys", "auth_mode",
+    "api_key", "base_url", "fallback_api_keys", "auth_mode", "subscription",
 )
 
 # agent_list_models is a C++ probe in libchudware — it does NOT load host config.json.
@@ -578,14 +580,31 @@ def _agent_provider(line: str) -> str:
 
 
 def _actor_for_turn(email: str, line: str) -> dict[str, Any]:
-    """Prefer this account's validated key for the selected provider."""
+    """Prefer this account's own credential for the selected provider.
+
+    Order is deliberate: an explicitly pasted API key beats a subscription,
+    because the account chose it for this provider; a personal subscription
+    beats the operator's shared pool; the metered credit pool is the fallback.
+    Both self-supplied sources are unmetered, so neither reserves credits.
+    """
     actor = actor_for(email)
     provider = _agent_provider(line)
-    key = resolve_validated_key(email, provider) if provider else None
+    if not provider:
+        actor["_byok_validated"] = False
+        return actor
+    key = resolve_validated_key(email, provider)
     actor["_byok_validated"] = key is not None
     if key is not None:
         actor["key_source"] = "byok"
         actor["_byok_api_key"] = key
+        return actor
+    grant = resolve_subscription_token(email, provider)
+    if grant is not None:
+        actor["key_source"] = "subscription"
+        actor["_subscription"] = {
+            "provider": grant["provider"],
+            "access_token": grant["access_token"],
+        }
     return actor
 
 
@@ -690,6 +709,17 @@ def _sanitize_agent_rpc(line: str, actor: Mapping[str, Any]) -> str:
         injected["_reservation_credits"] = max(
             0, int(actor.get("_reservation_credits") or 0)
         )
+    grant = actor.get("_subscription")
+    if isinstance(grant, Mapping):
+        # Rides inside the actor rather than as a sibling param on purpose. The
+        # actor is the one object hostd forwards to the worker verbatim
+        # (core/agent/run.cpp:825), so the grant and the key_source decision it
+        # belongs to cannot be separated in transit, and no hostd change is
+        # needed to carry it.
+        injected["_subscription"] = {
+            "provider": str(grant["provider"]),
+            "access_token": str(grant["access_token"]),
+        }
     options["_chudware_actor"] = injected
     return json.dumps(msg, separators=(",", ":"))
 
@@ -846,6 +876,7 @@ async def engine_ws(ws: WebSocket) -> None:
                         method in _AGENT_TURN_PROVIDER_METHODS
                         and actor.get("key_source") != "pool"
                         and not actor.get("_byok_validated")
+                        and not actor.get("_subscription")
                         and not settings.share_provider_keys
                     ):
                         # A shared hostd's ambient config belongs to the operator.

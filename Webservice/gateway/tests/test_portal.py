@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from pathlib import Path
 
 os.environ["CHUDWARE_WEB_DEV"] = "1"
@@ -68,11 +69,21 @@ def test_portal_has_ordinary_csp_and_hashed_assets_are_immutable(pg, monkeypatch
     assert "cross-origin-embedder-policy" not in page.headers
     assert page.headers["cache-control"] == "no-cache"
 
-    asset = client.get("/portal-assets/portal.c2eea3c72329.js")
+    # Derived from the page, not hardcoded: the filename embeds a content hash,
+    # so any edit to the portal script renames it. Pinning the literal name made
+    # this test fail for the wrong reason every time the portal changed, while
+    # proving nothing extra. What matters is that whatever the page asks for is
+    # served immutable and its name really is its digest.
+    served = re.search(r'src="/portal-assets/(portal\.[0-9a-f]{12}\.js)"', page.text)
+    assert served, "portal page must load a content-hashed script"
+    name = served.group(1)
+    digest = name.split(".")[1]
+
+    asset = client.get(f"/portal-assets/{name}")
     assert asset.status_code == 200
     assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
     assert asset.headers["content-type"].startswith("application/javascript")
-    assert hashlib.sha256(asset.content).hexdigest().startswith("c2eea3c72329")
+    assert hashlib.sha256(asset.content).hexdigest().startswith(digest)
 
 
 def test_every_oauth_provider_has_a_button_on_the_signin_page(pg, monkeypatch):

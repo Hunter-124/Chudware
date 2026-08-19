@@ -33,6 +33,14 @@ ORIGINATOR = "chudware"
 # via config.json "model".
 DEFAULT_MODEL = "gpt-5-codex"
 
+# Raised when an injected (caller-owned) bearer is refused: this process holds no
+# refresh token for it and must never write one, so the connection has to be
+# re-established where it was granted.
+_INJECTED_REJECTED = (
+    "ChatGPT subscription connection is no longer valid — re-connect ChatGPT "
+    "from the account portal."
+)
+
 
 class CodexSubProvider(Provider):
     """Chat completion via OpenAI Codex subscription (ChatGPT Plus/Pro)."""
@@ -43,9 +51,22 @@ class CodexSubProvider(Provider):
     # provider would silently discard (frozen §2 semantics).
     supports_vision = False
 
-    def __init__(self, model: str = DEFAULT_MODEL) -> None:
+    def __init__(self, model: str = DEFAULT_MODEL, *, access_token: str | None = None) -> None:
         self.model = model
-        self._cred = sub_auth.load_credential(PROVIDER_ID)
+        # An injected bearer belongs to a web account, not to this machine's user: the
+        # gateway owns its refresh and its storage, so this process must neither read
+        # nor write the desktop credential store for that turn. chatgpt-account-id is a
+        # claim inside the bearer itself, so decoding it (a pure base64/JSON unpack, not
+        # a store read) keeps the request shape identical to a desktop turn.
+        self._injected = bool(access_token)
+        if self._injected:
+            claims = sub_auth.decode_jwt_payload(access_token or "")
+            account_id = (
+                claims.get("https://api.openai.com/auth") or {}
+            ).get("chatgpt_account_id")
+            self._cred = {"access_token": access_token, "account_id": account_id}
+        else:
+            self._cred = sub_auth.load_credential(PROVIDER_ID)
 
     # ── Auth flows ───────────────────────────────────────────────────────────
 
@@ -182,6 +203,10 @@ class CodexSubProvider(Provider):
 
     def refresh(self) -> dict:
         """Exchange the stored refresh token for a new access token."""
+        if self._injected:
+            # Guarded here rather than only in _ensure_auth so the mid-request 401 retry
+            # below cannot persist or rotate a credential this process does not own.
+            raise RuntimeError(_INJECTED_REJECTED)
         resp = sub_auth.post_form(TOKEN_URL, {
             "grant_type": "refresh_token",
             "refresh_token": self._cred["refresh_token"],
@@ -193,6 +218,12 @@ class CodexSubProvider(Provider):
         return self._store_tokens(resp)
 
     def _ensure_auth(self) -> None:
+        if self._injected:
+            # No refresh_token was handed over and none is wanted: whoever owns this
+            # grant refreshes it and guarantees its remaining lifetime.
+            if not (self._cred or {}).get("access_token"):
+                raise RuntimeError(_INJECTED_REJECTED)
+            return
         if not self._cred:
             raise RuntimeError(
                 "Not logged in to Codex subscription. "

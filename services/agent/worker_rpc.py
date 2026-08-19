@@ -1606,6 +1606,19 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             credit_actor = agent_config.Actor.from_mapping(raw_actor)
         except ValueError:
             return {"ok": False, "reason": "invalid_chudware_actor"}
+    if credit_actor is not None and credit_actor.key_source == "subscription":
+        # The gateway decrypted this account's own subscription grant and injected
+        # it INSIDE the actor, which is the one object hostd forwards verbatim
+        # (core/agent/run.cpp:825) — so the grant cannot be separated in transit
+        # from the key_source decision that authorises it, and no hostd change is
+        # needed to carry it. It binds run-scoped, is never written to the desktop
+        # credential store, and a malformed grant refuses the turn: falling through
+        # would silently spend the machine owner's own Claude/ChatGPT subscription
+        # on a web caller's request.
+        try:
+            agent_config.bind_subscription_grant(raw_actor.get("_subscription"))
+        except (AttributeError, ValueError):
+            return {"ok": False, "reason": "invalid_subscription_grant"}
 
 
     cfg = dict(agent_config.load_config() or {})

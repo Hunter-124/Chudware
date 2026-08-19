@@ -5755,6 +5755,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
+    // Headless-capture hygiene, same reasoning as the toast suppression above: the
+    // window opens under wherever the real cursor happens to sit, so a --ui-screenshot
+    // frame can catch a ribbon/button tooltip parked over the very chrome the shot is
+    // meant to show (the Manufacture captures kept eating the "Simulate" tooltip).
+    // Queue a final out-of-bounds mouse position so NewFrame resolves no hovered
+    // window at all. Shots never synthesize pointer input, so nothing else loses.
+    if (st.shot) ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
     ImGui::NewFrame();
 
     // Liquid glass v2.1: per-frame Settings -> resolved-glass push. Idempotent

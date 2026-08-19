@@ -27,7 +27,7 @@ the frame loop in `host/src/app.cpp`.
 | **Drawing** | `host/src/ui/drawing_panel.cpp` | Sheet layout, views, DXF export |
 | **Simulation** | `host/src/ui/sim_manager.cpp`, `host/src/ui/evaluate_dialogs.cpp` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …) |
 | **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | T-FIN5: project rail + sources, build console (parsed warnings), emulation + UART console, GPIO trace viewer (`contracts/firmware_rpc.md` §7/§8); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `CHUDWARE_SHOT=firmware` |
-| **Manufacture** | `host/src/ui/manufacture/{manufacture_panel,device_panel,run_panel,approval_dialog,attention_panel,mfg_mirror}.cpp/.h` | Capability-truth chips, gate-report rendering. **No floating operator surface**: Devices / Run / Attention are rail tabs 3–5 of the pinned left column (`layout.cpp`), and the Offline/Live mode strip is chrome under the ribbon. Shot: `CHUDWARE_SHOT=manufacture` |
+| **Manufacture** | `host/src/ui/manufacture/{manufacture_panel,device_panel,run_panel,approval_dialog,attention_panel,mfg_mirror}.cpp/.h` | Capability-truth chips, gate-report rendering. **No floating operator surface**: Devices / Run / Attention are rail tabs 3–5 of the pinned left column (`layout.cpp`), and the Offline/Live mode strip is chrome under the ribbon. All three bodies draw with `ui::kit` — cards, tone chips, `keyValueRow`, `emptyState`/`blockedState`, `inlineStatus` — never bespoke text dumps. **Tone convention: Offline Simulation is the SAFE state and reads calm (`Tone::Ok` dot chip on neutral glass); LIVE MACHINE is the hazardous one and is the only state that gets the `statusErr` wash + danger button.** Shot: `CHUDWARE_SHOT=manufacture` (the rail opens on Attention for that shot only — `layout.cpp` resolves the shot tab ONCE from `CHUDWARE_SHOT`, so `cam` keeps the Job Manager default) |
 
 ### CAM / Manufacture internals (native viewport cutover)
 
@@ -55,6 +55,12 @@ the frame loop in `host/src/app.cpp`.
   `Overlays::drawCamSegments`, direction glyphs, stock, tool/spindle marker, and remnant-stock
   frames inside the existing renderer color FBO. `camDrawViewportHud()` adds controls/telemetry
   over that same view; it is not a second geometry surface.
+- `camDrawViewportHud()` publishes its card rect through `publishViewportHudRect()` /
+  `viewportHudRect()` (declared in `cam/cam_panel.h`, frame-stamped like
+  `publishOverlayColumnHeight`). The orientation triad and the model-dimensions readout in
+  `viewport_panel.cpp` READ it and lift above the card, so the bottom-centre HUD and the
+  bottom-left triad can no longer overlap on a 360dp-rail workspace. Any new bottom-anchored
+  viewport card should publish the same way instead of hoping for empty space.
 - CAM UI state is one process-level active job. Extraction pins the source **Part doc id** instead
   of following whichever tab becomes active later. Mutations use the mirrored revision, reject
   overlap with long RPCs, and clear derived simulation/post/audit state.

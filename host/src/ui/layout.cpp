@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // Overlay layout: the dockspace hosts ONLY the central document windows, tabbed in one node, so
 // the viewport runs edge to edge between the ribbon and the status bar. The FeatureManager and
@@ -502,9 +503,16 @@ void drawLeftPane(AppState& st,
         // Explorer + Job Manager + NC Output + Devices + Run + Attention rail — same chrome as the
         // Electronics/Simulate rails.
         static int s_camTab = 1;   // 0=Explorer 1=Job Manager 2=NC Output 3=Devices 4=Run 5=Attention
-        // Headless-shot parity: the retired floating drawer opened on Attention under CHUDWARE_SHOT
-        // so `manufacture` captured the safety-critical view. The rail keeps that behaviour.
-        if (st.shot) s_camTab = 5;
+        // Headless-shot parity: `CHUDWARE_SHOT=manufacture` is the operator-safety capture, so it
+        // opens on Attention the way the retired floating drawer did. Every other shot (notably
+        // `cam`, the marketing capture) keeps the Job Manager default. Resolved ONCE — the old
+        // per-frame assignment also made the rail unclickable under any shot.
+        static bool s_camTabShotInit = false;
+        if (st.shot && !s_camTabShotInit) {
+            s_camTabShotInit = true;
+            const char* shotName = std::getenv("CHUDWARE_SHOT");
+            if (shotName && std::strcmp(shotName, "manufacture") == 0) s_camTab = 5;
+        }
         const float ebtn = 30.0f * S, eglyph = 18.0f * S, egap = 6.0f * S, erowPad = 6.0f * S;
         const float erailRowH = erowPad + ebtn + erowPad;
         const float erailW = 6.0f * ebtn + 5.0f * egap;

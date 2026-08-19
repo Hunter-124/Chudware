@@ -3,11 +3,19 @@
 // (drawManufactureModeBar, whose height app.cpp reserves before the dockspace), and the
 // Devices / Run / Attention views are bodies hosted by the pinned left column
 // (ui/layout.cpp). This file owns the mode strip, those bodies, and the RPC queue.
+//
+// The strip is CHROME, not a warning banner. It is one compact frosted row (ui::glassPanel over
+// the panel's AdaptiveSurface) carrying a kit::chip for the mode, one dim explanation line and a
+// right-aligned action. Offline Simulation is the SAFE state, so it gets the calm neutral glass
+// and an Ok chip; LIVE MACHINE is the hazardous one, so it is the only state that tints the
+// chrome (glassCardWash in palette.statusErr) and the only one with a danger action. Every
+// widget here comes from ui::kit — this file paints no chips, buttons or empty states of its own.
 #include "manufacture_panel.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -23,6 +31,7 @@
 #include "mfg_mirror.h"
 #include "run_panel.h"
 #include "../metrics.h"
+#include "../widgets/kit.h"
 #include "../../core/app_state.h"
 #include "../../ui_theme.h"
 
@@ -73,42 +82,46 @@ bool resultAccepted(const core::RpcResult& result) {
     return result.result.value("accepted", true);
 }
 
-void drawInlineWarning(const std::string& text) {
-    if (text.empty()) return;
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.statusWarn[0], palette.statusWarn[1],
-                                                palette.statusWarn[2], palette.statusWarn[3]));
-    ImGui::TextWrapped("%s", text.c_str());
-    ImGui::PopStyleColor();
+// The strip's live-machine chrome tint. Strong enough to read as "this is not simulation" at a
+// glance, far short of an alarm fill — the danger button and the Err chip carry the emphasis.
+constexpr float kLiveWashTopAlpha = 0.22f;
+
+// Geometry of a kit::chip drawn WITH a dot. The kit does not export its chip metrics, so this
+// mirrors kit::chipGeom() out of the same ui::metrics tokens (padX U(1.5), padY U(0.5), gap U(1),
+// dot radius U(0.75)). The strip needs the height to centre the chip against the frame-height
+// action button, and the chrome width to know how much room a device id has left in the pill.
+struct DotChipBox {
+    float chromeW = 0.0f;   // everything in the pill that is not the label
+    float height  = 0.0f;
+};
+
+DotChipBox dotChipBox() {
+    DotChipBox b;
+    b.chromeW = metrics::U(1.5f) * 2.0f + metrics::U(0.75f) * 2.0f + metrics::U(1.0f);
+    b.height  = ImGui::GetTextLineHeight() + metrics::U(0.5f) * 2.0f;
+    return b;
 }
 
-// Single-line trailing note for the mode strip. Renders the full text when it fits on the
-// current row, otherwise a hoverable marker — a safety statement is never half-painted.
-void drawTrailingNote(const char* text, const float* color) {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(color[0], color[1], color[2], color[3]));
-    if (ImGui::CalcTextSize(text).x <= ImGui::GetContentRegionAvail().x) {
-        ImGui::TextUnformatted(text);
-        ImGui::PopStyleColor();
-        return;
-    }
-    ImGui::TextUnformatted("(?)");
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        ImGui::TextUnformatted(text);
-        ImGui::EndTooltip();
-    }
+// The strip's single dim explanation line, shortened in fixed tiers so a safety statement is
+// never half-painted: full sentence -> compact sentence -> nothing at all. The mode chip beside
+// it always states the mode, so dropping the line loses no mode information.
+const char* fittingNote(const char* full, const char* compact, float budget) {
+    if (budget <= 0.0f) return nullptr;
+    if (ImGui::CalcTextSize(full).x <= budget) return full;
+    if (ImGui::CalcTextSize(compact).x <= budget) return compact;
+    return nullptr;
 }
 
 // Global operator notices. Every rail body repeats them: the rail shows one tab at a time, so
 // a notice parked on a sibling tab would be invisible exactly when the operator needs it.
 void drawOperatorNotices(AppState& st) {
-    if (!st.mfg.lastError.empty()) drawInlineWarning(st.mfg.lastError);
+    kit::inlineStatus(st.mfg.lastError.c_str(), kit::Tone::Warn);   // no-op while empty
     if (st.daemonUnreachable || !st.mfgMirror || !st.mfgMirror->gatewayReachable()) {
         const std::string why = st.daemonUnreachable
             ? "Manufacturing gateway unreachable — live values are unknown and cached rows are not shown as current."
             : (st.mfgMirror ? st.mfgMirror->gatewayWhy()
                             : "Manufacturing mirror unavailable.");
-        drawInlineWarning(why);
+        kit::blockedState("Manufacturing gateway unreachable", why.c_str());
     }
 }
 
@@ -156,12 +169,10 @@ void drawAttentionBody(AppState& st) {
 
 float manufactureModeBarHeight(const AppState& st) {
     if (st.activeWorkspace != AppState::Workspace::Manufacture || st.showWeb) return 0.0f;
-    // One row: the mode word (h2 font) beside the mode button, so size from the taller of the
-    // two. Called before drawManufacturePanel, so it must never read st.mfgMirror (null on
-    // the first frame) or anything else produced later in the frame.
-    float row = std::max(ImGui::GetFrameHeight(), ImGui::GetTextLineHeight());
-    if (st.fonts.h2) row = std::max(row, st.fonts.h2->FontSize);
-    return 2.0f * metrics::cpMenuRowPadY() + row;
+    // One compact chrome row: the mode chip and its action button, neither taller than a frame.
+    // Called before drawManufacturePanel, so it must never read st.mfgMirror (null on the first
+    // frame) or anything else produced later in the frame.
+    return ImGui::GetFrameHeight() + 2.0f * metrics::camRowPadY();
 }
 
 void drawManufactureModeBar(AppState& st, float x, float y, float w, float h) {
@@ -170,13 +181,10 @@ void drawManufactureModeBar(AppState& st, float x, float y, float w, float h) {
 
     ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,
-                          offline ? ImVec4(palette.setupWarnBg[0], palette.setupWarnBg[1],
-                                           palette.setupWarnBg[2], palette.setupWarnBg[3])
-                                  : ImVec4(palette.proseBg[0], palette.proseBg[1],
-                                           palette.proseBg[2], palette.proseBg[3]));
+    // Transparent — the glass painted below is the only background.
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(metrics::cpMenuGutter(), metrics::cpMenuRowPadY()));
+                        ImVec2(metrics::camGutter(), metrics::camRowPadY()));
     ImGui::Begin("##ManufactureModeBar", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
@@ -185,78 +193,89 @@ void drawManufactureModeBar(AppState& st, float x, float y, float w, float h) {
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
 
-    // The whole strip is one row: mode word, mode button, then the reason/no-op note.
-    const char* button = offline ? "Claim command ownership & enter Live Machine"
-                                 : "Return to Offline Simulation";
-    const float gap = metrics::U(2);
-    const float buttonWidth = ImGui::CalcTextSize(button).x +
-                              ImGui::GetStyle().FramePadding.x * 2.0f;
-    const float textBudget =
-        std::max(0.0f, ImGui::GetContentRegionAvail().x - buttonWidth - gap);
+    // Chrome material: the app's frosted glass, square-cornered because the strip is full-bleed
+    // between the ribbon and the dockspace. Only LIVE MACHINE tints it.
+    ImDrawList*             dl   = ImGui::GetWindowDrawList();
+    const ImRect            rect(ImVec2(x, y), ImVec2(x + w, y + h));
+    const AdaptiveSurface&  surf = adaptivePanel(panelId("mfg_mode_bar"), rect);
+    glassPanel(dl, rect, GlassLevel::Thin, 0.0f, surf);
+    if (!offline)
+        glassCardWash(dl, rect.Min, rect.Max, 0.0f, palette.statusErr, kLiveWashTopAlpha);
 
-    ImGui::AlignTextToFramePadding();
-    const float* semantic = offline ? palette.statusWarn : palette.statusErr;
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(semantic[0], semantic[1], semantic[2], semantic[3]));
-    if (st.fonts.h2) ImGui::PushFont(st.fonts.h2);
-    auto fits = [textBudget](const char* text) {
-        return ImGui::CalcTextSize(text).x <= textBudget;
+    const float      gap    = metrics::camBtnGap();
+    const float      rowTop = ImGui::GetCursorPosY();
+    const float      rowH   = ImGui::GetFrameHeight();
+    const DotChipBox box    = dotChipBox();
+    // Every element on the row places its own baseline: the chip is shorter than the button, and
+    // ImGui aligns a line's items by their tops, not their centres.
+    auto centerY = [rowTop, rowH](float itemH) {
+        ImGui::SetCursorPosY(rowTop + std::max(0.0f, (rowH - itemH) * 0.5f));
     };
 
-    if (offline) {
-        constexpr const char* mode = "OFFLINE SIMULATION";
-        constexpr const char* compact = "OFFLINE SIMULATION — no machine output";
-        constexpr const char* full = "OFFLINE SIMULATION — nothing is sent to a machine";
-        ImGui::TextUnformatted(fits(full) ? full : (fits(compact) ? compact : mode));
-    } else if (st.mfg.liveDeviceId.empty()) {
-        constexpr const char* mode = "LIVE MACHINE";
-        constexpr const char* compact = "LIVE MACHINE — identity unknown";
-        constexpr const char* full = "LIVE MACHINE — device identity unknown";
-        ImGui::TextUnformatted(fits(full) ? full : (fits(compact) ? compact : mode));
-    } else {
-        const std::string full = "LIVE MACHINE — " + st.mfg.liveDeviceId;
-        ImGui::TextUnformatted(fits(full.c_str()) ? full.c_str() : "LIVE MACHINE");
-    }
-    if (st.fonts.h2) ImGui::PopFont();
-    ImGui::PopStyleColor();
+    // Measured before anything is drawn so the explanation line gets the honest leftover width.
+    const char* actionLabel = offline ? "Enter Live Machine…" : "Return to Offline Simulation";
+    const float actionW     = ImGui::CalcTextSize(actionLabel).x +
+                              ImGui::GetStyle().FramePadding.x * 2.0f;
+    const float rowW        = ImGui::GetContentRegionAvail().x;
 
+    // ---- mode chip: the one element that always survives, however narrow the window ----
+    const kit::Tone   chipTone  = offline ? kit::Tone::Ok : kit::Tone::Err;
+    const char* const chipShort = offline ? "Offline simulation" : "LIVE MACHINE";
+    const std::string chipFull  =
+        offline ? std::string("Offline simulation")
+                : (st.mfg.liveDeviceId.empty()
+                       ? std::string("LIVE MACHINE — device identity unknown")
+                       : "LIVE MACHINE — " + st.mfg.liveDeviceId);
+    const float chipBudget = std::max(0.0f, rowW - actionW - gap * 2.0f - box.chromeW);
+    std::string chipLabel  = kit::elide(chipFull.c_str(), chipBudget);
+    if (chipLabel.empty()) chipLabel = chipShort;   // not even an elided id fits: mode word only
+    centerY(box.height);
+    kit::chip(chipLabel.c_str(), chipTone, /*dot=*/true,
+              chipLabel == chipFull ? nullptr : chipFull.c_str());
+
+    // ---- explanation ----
     ImGui::SameLine(0, gap);
+    const float noteBudget = ImGui::GetContentRegionAvail().x - actionW - gap;
+    const char* note =
+        offline ? fittingNote("Nothing is sent to a machine.", "No machine output.", noteBudget)
+                : fittingNote("Opening a panel or observing a run never changes this mode.",
+                              "Observing a run never changes this mode.", noteBudget);
+    if (note) {
+        centerY(ImGui::GetTextLineHeight());
+        kit::dimText(note);
+        ImGui::SameLine(0, 0);
+    }
+
+    // ---- right-aligned action: spacer measured from what the row has left, never an offset ----
+    ImGui::Dummy(ImVec2(std::max(0.0f, ImGui::GetContentRegionAvail().x - actionW - gap), 0.0f));
+    ImGui::SameLine(0, gap);
+    centerY(rowH);
     if (offline) {
-        const bool disabled = st.mfg.selectedDeviceId.empty() || st.mfg.requestInFlight;
-        ImGui::BeginDisabled(disabled);
-        if (ImGui::Button(button)) {
+        const bool  ready  = !st.mfg.selectedDeviceId.empty() && !st.mfg.requestInFlight;
+        const char* reason = st.mfg.selectedDeviceId.empty()
+            ? "Live Machine unavailable — select a device, then explicitly claim command ownership."
+            : "Live Machine unavailable — another manufacturing request is in flight.";
+        if (kit::secondaryButton(actionLabel, ready, ready ? nullptr : reason)) {
             queueManufactureRequest(st, "mfg_device_claim",
                                     {{"device_id", st.mfg.selectedDeviceId},
                                      {"role", "commander"}}, "enter_live");
         }
-        ImGui::EndDisabled();
-        if (disabled) {
-            ImGui::SameLine(0, gap);
-            drawTrailingNote(st.mfg.selectedDeviceId.empty()
-                ? "Live Machine unavailable — select a device, then explicitly claim command ownership."
-                : "Live Machine unavailable — another manufacturing request is in flight.",
-                palette.statusWarn);
-        }
-    } else {
-        if (ImGui::Button(button)) {
-            const std::string deviceId = st.mfg.liveDeviceId;
-            json release{{"device_id", deviceId}};
-            const MfgDevice* device =
-                st.mfgMirror ? st.mfgMirror->device(deviceId) : nullptr;
-            if (device && !device->leaseId.empty())
-                release["lease_id"] = device->leaseId;
-            else if (leaseHeartbeat.deviceId == deviceId &&
-                     !leaseHeartbeat.leaseId.empty())
-                release["lease_id"] = leaseHeartbeat.leaseId;
-            st.mfg.mode = MfgUi::Mode::OfflineSimulation;
-            st.mfg.liveDeviceId.clear();
-            leaseHeartbeat.clear();
-            if (!deviceId.empty())
-                queueManufactureRequest(st, "mfg_device_release", std::move(release),
-                                        "leave_live");
-        }
-        ImGui::SameLine(0, gap);
-        drawTrailingNote("Opening a panel or observing a run never changes this mode.",
-                         palette.textDim);
+    } else if (kit::dangerButton(actionLabel)) {
+        const std::string deviceId = st.mfg.liveDeviceId;
+        json release{{"device_id", deviceId}};
+        const MfgDevice* device =
+            st.mfgMirror ? st.mfgMirror->device(deviceId) : nullptr;
+        if (device && !device->leaseId.empty())
+            release["lease_id"] = device->leaseId;
+        else if (leaseHeartbeat.deviceId == deviceId &&
+                 !leaseHeartbeat.leaseId.empty())
+            release["lease_id"] = leaseHeartbeat.leaseId;
+        st.mfg.mode = MfgUi::Mode::OfflineSimulation;
+        st.mfg.liveDeviceId.clear();
+        leaseHeartbeat.clear();
+        if (!deviceId.empty())
+            queueManufactureRequest(st, "mfg_device_release", std::move(release),
+                                    "leave_live");
     }
     ImGui::End();
 }
@@ -279,20 +298,16 @@ void drawManufactureAttentionBody(AppState& st) {
     drawOperatorNotices(st);
     const std::size_t criticalCount = manufactureCriticalCount(st);
     if (criticalCount > 0) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ImVec4(palette.statusErr[0], palette.statusErr[1],
-                                     palette.statusErr[2], palette.statusErr[3]));
-        ImGui::TextWrapped("%zu unacknowledged critical attention item%s",
-                           criticalCount, criticalCount == 1 ? "" : "s");
-        ImGui::PopStyleColor();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ImVec4(palette.textDim[0], palette.textDim[1],
-                                     palette.textDim[2], palette.textDim[3]));
-        ImGui::TextWrapped("Acknowledge them before operating the machine.");
-        ImGui::PopStyleColor();
+        char label[64];
+        char full[96];
+        std::snprintf(label, sizeof(label), "%zu unacknowledged critical", criticalCount);
+        std::snprintf(full, sizeof(full), "%zu unacknowledged critical attention item%s",
+                      criticalCount, criticalCount == 1 ? "" : "s");
+        kit::chip(label, kit::Tone::Err, /*dot=*/true, full);
+        kit::dimText("Acknowledge them before operating the machine.");
     }
     if (!st.mfgMirror) {
-        ImGui::TextDisabled("Manufacturing mirror unavailable.");
+        kit::blockedState("Manufacturing mirror unavailable.", nullptr);
         return;
     }
     drawAttentionBody(st);

@@ -46,6 +46,19 @@ double camPlayTotalTime();
 double camPlayT();
 // Viewport-local controls and telemetry; all geometry remains in the native renderer.
 void camDrawViewportHud(AppState& st, const ImVec2& vpMin, const ImVec2& vpSize);
+
+// ---- bottom-anchored viewport HUD rect (obstacle seam) ------------------------------------------
+// The playback card pins to the bottom CENTRE of the viewport, i.e. straight across the row the
+// orientation triad anchors in. camDrawViewportHud publishes the card's real screen rect every
+// frame it draws (publishViewportHudRect); the triad block in viewport_panel.cpp reads
+// viewportHudRect() and slides/lifts around it, and feeds the same anchor to the
+// model-dimensions pill above it. Frame-stamped exactly like ui::overlayColumnHeight /
+// ui::evalRibbonDock, so a workspace switch (nobody publishing) drops back to `valid == false`
+// one frame later and the triad returns to its plain bottom-left anchor — a stale rect can never
+// deflect it forever.
+struct ViewportHudRect { float minX = 0, minY = 0, maxX = 0, maxY = 0; bool valid = false; };
+void publishViewportHudRect(float minX, float minY, float maxX, float maxY);
+ViewportHudRect viewportHudRect();
 // Shot-only: park the playhead at a fraction of total time.
 void camDebugSetPlayhead(float frac);
 // Cached stock-box overlay geometry for the selected setup.

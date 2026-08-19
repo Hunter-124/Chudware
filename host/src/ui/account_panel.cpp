@@ -63,6 +63,13 @@ constexpr const char* kService = "com.chudware.desktop";
 constexpr const char* kSecurityAccount = "security-policy-v1";
 constexpr const char* kAccount = "entitlement";
 constexpr const char* kSubjectAccount = "entitlement-subject-v1";
+// Random per-install key that seals the stored entitlement. Before it existed the seal key was
+// DERIVED from hostname + $USER + the appdata path, so any of those wobbling — an unset $USER
+// under a .desktop/systemd launch, a renamed or DHCP-renamed host, a redirected XDG_DATA_HOME —
+// made the sealed blob unopenable and signed the user out. The key is a secret in the same store
+// as the token (OS keychain, else the 0600 fallback file), so its protection is the store's, not
+// the guessability of a hostname.
+constexpr const char* kSealKeyAccount = "entitlement-seal-key-v1";
 constexpr double kRefreshIntervalSeconds = 12.0 * 60.0 * 60.0;
 struct PendingResult {
     enum class Kind { None, Fresh, Refused, Unreachable, Invalid } kind = Kind::None;
@@ -146,17 +153,40 @@ std::string deviceName() {
     return "this computer";
 }
 
-std::string stableDeviceMaterial() {
+// LEGACY seal material — hostname + user + appdata path. Kept ONLY so an entitlement sealed by an
+// older build can be opened once and re-sealed under the persisted key (see sealKeys()). Never used
+// to seal anything new.
+std::string legacyDeviceMaterial(bool withUser) {
     std::string material = deviceName();
     material.push_back('\n');
+    if (withUser) {
 #if defined(_WIN32)
-    if (const char* user = std::getenv("USERNAME")) material += user;
+        if (const char* user = std::getenv("USERNAME")) material += user;
 #else
-    if (const char* user = std::getenv("USER")) material += user;
+        if (const char* user = std::getenv("USER")) material += user;
 #endif
+    }
     material.push_back('\n');
     material += appdataAppDir();
     return material;
+}
+
+// The persisted per-install seal key, created on first use. Returns false only when the store
+// itself refuses both the read and the write — in that case the caller must NOT treat a failed
+// unseal as a damaged token.
+bool sealKey(std::array<unsigned char, 32>& key, bool& created) {
+    created = false;
+    std::vector<unsigned char> stored;
+    if (chudware::secret_store::load(kService, kSealKeyAccount, stored, appdataAppDir()) &&
+        stored.size() == key.size()) {
+        std::copy(stored.begin(), stored.end(), key.begin());
+        return true;
+    }
+    randombytes(key.data(), key.size());
+    created = true;
+    return chudware::secret_store::store(
+        kService, kSealKeyAccount,
+        std::vector<unsigned char>(key.begin(), key.end()), appdataAppDir());
 }
 
 std::string urlEncode(std::string_view value) {
@@ -267,7 +297,9 @@ bool persist(const std::string& token, const chudware::entitlement::CheckinStamp
         {"last_successful_checkin_monotonic", stamp.monotonicSeconds},
         {"last_successful_checkin_boot_id", stamp.bootId},
     };
-    const auto key = chudware::entitlement::deviceKey(stableDeviceMaterial());
+    std::array<unsigned char, 32> key{};
+    bool created = false;
+    if (!sealKey(key, created)) return false;
     const auto sealed = chudware::entitlement::sealForDevice(stored.dump(), key);
     return !sealed.empty() && chudware::secret_store::store(
         kService, kAccount, sealed, appdataAppDir());
@@ -280,23 +312,52 @@ bool persistSubject(std::string_view subject) {
         std::vector<unsigned char>(subject.begin(), subject.end()), appdataAppDir());
 }
 
-bool loadStored(std::string& token, chudware::entitlement::CheckinStamp& stamp) {
+// Load outcome. `Missing` and `Unreadable` are DIFFERENT: nothing was ever stored versus a stored
+// blob this launch could not open. Only the first justifies "sign in"; the second must leave the
+// blob alone, because the fault may be the environment (an unavailable keychain, a store the
+// process cannot read yet) and destroying the session would be unrecoverable.
+enum class StoredLoad { Ok, Missing, Unreadable };
+
+StoredLoad loadStored(std::string& token, chudware::entitlement::CheckinStamp& stamp) {
     std::vector<unsigned char> sealed;
-    if (!chudware::secret_store::load(kService, kAccount, sealed, appdataAppDir())) return false;
+    if (!chudware::secret_store::load(kService, kAccount, sealed, appdataAppDir()))
+        return StoredLoad::Missing;
+
+    // Current key first, then the two legacy derivations (with and without $USER — an unset $USER
+    // under a desktop-file or systemd launch produced the second spelling). A legacy hit is
+    // re-sealed under the persisted key so the migration happens once, silently.
     std::string plaintext;
-    if (!chudware::entitlement::openForDevice(
-            sealed, chudware::entitlement::deviceKey(stableDeviceMaterial()), plaintext))
-        return false;
+    bool viaLegacy = false;
+    std::array<unsigned char, 32> key{};
+    bool created = false;
+    const bool haveKey = sealKey(key, created);
+    bool opened = haveKey && !created &&
+                  chudware::entitlement::openForDevice(sealed, key, plaintext);
+    if (!opened) {
+        for (const bool withUser : {true, false}) {
+            if (chudware::entitlement::openForDevice(
+                    sealed, chudware::entitlement::deviceKey(legacyDeviceMaterial(withUser)),
+                    plaintext)) {
+                opened = true;
+                viaLegacy = true;
+                break;
+            }
+        }
+    }
+    if (!opened) return StoredLoad::Unreadable;
+
     try {
         const json stored = json::parse(plaintext);
         token = stored.at("token").get<std::string>();
         stamp.wallSeconds = stored.at("last_successful_checkin_wall").get<std::int64_t>();
         stamp.monotonicSeconds = stored.at("last_successful_checkin_monotonic").get<double>();
         stamp.bootId = stored.at("last_successful_checkin_boot_id").get<std::string>();
-        return !token.empty() && stamp.wallSeconds > 0;
+        if (token.empty() || stamp.wallSeconds <= 0) return StoredLoad::Unreadable;
     } catch (const std::exception&) {
-        return false;
+        return StoredLoad::Unreadable;
     }
+    if (viaLegacy) persist(token, stamp);   // best effort: a failed re-seal still signs in
+    return StoredLoad::Ok;
 }
 
 bool persistSecurityPolicy(std::string_view subject, const json& policy) {
@@ -698,20 +759,27 @@ void initializeAccountPanel(AppState& state) {
         return action != OnboardingAccountAction::UseCredits || summary.pooledKeysAllowed;
     });
 
+    // A stored session is only DISCARDED on explicit sign-out (signOutDesktopAccount). Startup
+    // never erases it: a launch that cannot open or verify the blob reports read-only and leaves
+    // the bytes in place, so the next launch — after the keychain is available again, or once the
+    // legacy-material migration in loadStored() succeeds — signs the user back in instead of
+    // demanding credentials. Erasing here is what made sign-ins evaporate.
     std::string token;
-    if (!loadStored(token, c.stamp) || !launchSignatureValid(token)) {
-        chudware::secret_store::erase(kService, kAccount, appdataAppDir());
+    const StoredLoad stored = loadStored(token, c.stamp);
+    if (stored != StoredLoad::Ok || !launchSignatureValid(token)) {
         state.entitlementReadOnly = true;
         state.entitlementSignedIn = false;
-        state.entitlementStatus = "Sign in to activate desktop editing";
+        state.entitlementStatus =
+            stored == StoredLoad::Missing
+                ? "Sign in to activate desktop editing"
+                : "Stored sign-in could not be read on this launch — retrying next start; sign in to activate editing now";
         return;
     }
     std::string error;
     if (!chudware::entitlement::verifyEmbeddedToken(token, c.payload, &error)) {
-        chudware::secret_store::erase(kService, kAccount, appdataAppDir());
         state.entitlementReadOnly = true;
         state.entitlementSignedIn = false;
-        state.entitlementStatus = "Stored entitlement was damaged; sign in again";
+        state.entitlementStatus = "Stored entitlement did not verify; sign in again";
         return;
     }
     state.entitlementToken = token;

@@ -5020,6 +5020,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             renderer.setGroundShadow(vpal.groundShadow[0], vpal.groundShadow[1],
                                      vpal.groundShadow[2], alpha);
         }
+        // The row the triad resolves to, shared with the model-dimensions readout below (that pill
+        // documents itself as sitting ABOVE the triad, so it has to follow when an obstacle lifts
+        // the triad). Value here = today's placement, used verbatim when the triad is hidden.
+        float triadInfoBottom = cr1.y - 112.0f * ui::uiScale;
         // ---- C24 / C26-C: orientation triad, bottom-left of the viewport (SolidWorks-style) ----
         // C25 W3-J: gated by st.showTriad.
         // C26-C: each axis tip is a small invisible ImGui button. Clicking an axis goes to the
@@ -5030,43 +5034,92 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Hover: accentSoft circle behind the label. Tooltip: view name.
         if (st.showTriad) {
             const float ts = ui::uiScale;
+            // Half-extent of everything the triad paints AND clicks: arm (30) + label-chip offset
+            // (12) + the invisible axis button's half size (8). Every obstacle test below measures
+            // against this, so the hit targets — not just the ink — stay clear.
+            const float reach  = 50.0f * ts;
+            const float clearM = 12.0f * ts;   // clearance, same 12dp rhythm as the chip offset
             // Anchor RIGHT of the pinned FeatureManager column — the old cr0-relative anchor put
             // the triad underneath the floating glass column (visual-review fix).
+            const float e = ui::overlayColumnEdge(0);
+            const bool colDodgeable = (e > cr0.x && e < cr1.x - 140.0f * ts);
+            // Does the pinned column's content reach down to a triad whose box top sits at topAbs?
+            // overlayColumnHeight(0) is the column's occupied bottom as an absolute screen Y —
+            // republished per frame for whichever tab (Explorer / Feature Manager / Configurations)
+            // is showing, so expanding or collapsing a tab re-targets the triad.
+            auto colReaches = [&](float topAbs) {
+                const float colBottomAbs = ui::overlayColumnHeight(0);
+                return (colBottomAbs > 0.0f) && (colBottomAbs >= topAbs);
+            };
             float targetLeft = cr0.x;
-            {
-                const float e = ui::overlayColumnEdge(0);
-                if (e > cr0.x && e < cr1.x - 140.0f * ts) {
-                    // Only push the triad right of the FM column when the column's CONTENT actually
-                    // reaches down to the triad's row (they would overlap). Otherwise there's room
-                    // underneath the column (below the tab's bottom-most element), so the triad tucks
-                    // to the far-left anchor (cr0.x). overlayColumnHeight(0) is the column's occupied
-                    // bottom as an absolute screen Y — republished per frame for whichever tab
-                    // (Explorer / Feature Manager / Configurations) is showing, so expanding or
-                    // collapsing a tab re-targets the triad.
-                    const float colBottomAbs = ui::overlayColumnHeight(0);
-                    const float triadTopAbs  = cr1.y - 90.0f * ts;   // triad box top (cy-52 - ~30 arm - margin)
-                    const bool colReachesTriad = (colBottomAbs > 0.0f) && (colBottomAbs >= triadTopAbs);
-                    if (colReachesTriad) targetLeft = e;
-                }
+            // Only push the triad right of the FM column when the column's CONTENT actually reaches
+            // down to the triad's row (they would overlap). Otherwise there's room underneath the
+            // column (below the tab's bottom-most element), so the triad tucks to the far-left
+            // anchor (cr0.x).
+            if (colDodgeable && colReaches(cr1.y - 90.0f * ts))   // triad box top at the base row
+                targetLeft = e;
+
+            // ---- obstacle 2: a bottom-anchored viewport HUD ------------------------------------
+            // The Manufacture playback card pins bottom-CENTRE, i.e. straight across the triad's
+            // row, and the column dodge knew nothing about it: on Manufacture's 360dp column the
+            // dodge parked the axis chips on the card's Play button. Resolution order is
+            // horizontal-first — slide LEFT until the triad's right edge clears the card's left
+            // edge, bounded by the leftmost legal anchor (`targetLeft`: the viewport edge, or the
+            // column's edge when its content reaches this row, and never left of the current
+            // target). That bound is why the slide can only rescue the EASED position — clamped
+            // below, beside the column guard. When the target itself lands on the card no legal x
+            // fits, so LIFT the triad above the card instead, keeping the horizontal dodge.
+            const ui::ViewportHudRect hud = ui::viewportHudRect();
+            auto hudHitX = [&](float left) {
+                const float bcx = left + 52.0f * ts;   // triad hub x for that left anchor
+                return hud.valid && bcx + reach + clearM > hud.minX &&
+                                    bcx - reach - clearM < hud.maxX;
+            };
+            auto hudHitY = [&](float row) {
+                return hud.valid && row + reach + clearM > hud.minY &&
+                                    row - reach - clearM < hud.maxY;
+            };
+            const float hudClearLeft = hud.minX - clearM - reach - 52.0f * ts;
+            float targetCy = cr1.y - 52.0f * ts;
+            if (hudHitY(targetCy) && hudHitX(targetLeft)) {
+                // Lift the box's bottom clear of the card's top, staying inside the viewport rect.
+                targetCy = std::max(hud.minY - clearM - reach, cr0.y + reach + clearM);
+                // The lifted box sits higher up, where a column that stopped short of the base row
+                // may now reach it — re-run the same test against the row we actually landed on.
+                if (colDodgeable && targetLeft < e && colReaches(targetCy - reach)) targetLeft = e;
             }
+
             // Ease the triad horizontally toward its target so opening/collapsing a manager tab (or
             // the column growing past the triad's row) SLIDES it aside and back instead of snapping
             // after a pause. Frame-rate-independent exponential smoothing; snap the last sub-pixel.
             static float s_triadLeft = -1.0f;
+            static float s_triadRow  = -1.0f;
             if (s_triadLeft < 0.0f) s_triadLeft = targetLeft;   // first frame: place, don't slide in
+            if (s_triadRow  < 0.0f) s_triadRow  = targetCy;
             {
                 const float dt = ImGui::GetIO().DeltaTime;
                 const float k  = 1.0f - std::exp(-12.0f * (dt > 0.0f ? dt : 1.0f / 60.0f));
                 s_triadLeft += (targetLeft - s_triadLeft) * k;
                 if (std::fabs(targetLeft - s_triadLeft) < 0.5f) s_triadLeft = targetLeft;
+                s_triadRow += (targetCy - s_triadRow) * k;
+                if (std::fabs(targetCy - s_triadRow) < 0.5f) s_triadRow = targetCy;
             }
             // The ease is a nicety on the way BACK; on the way out it is a bug. While the smoothing
             // runs (~200 ms) the triad sits inside the manager column it is supposed to dodge, which
             // is exactly what a CHUDWARE_SHOT=fea capture caught: the Z/Y axis chips drawn on top of
             // the Simulation Manager's "Deformation scale" row. Never render left of the current
-            // target: dodge right immediately, slide left only as the column shrinks.
-            const float hudLeft = std::max(s_triadLeft, targetLeft);
-            float cx = hudLeft + 52.0f * ts, cy = cr1.y - 52.0f * ts;
+            // target: dodge right immediately, slide left only as the column shrinks. Same rule
+            // vertically — a lift is a dodge, so take it instantly and only settle back down eased.
+            float hudLeft = std::max(s_triadLeft, targetLeft);
+            const float cy = std::min(s_triadRow, targetCy);
+            // …and the eased horizontal position must not park the triad ON the card either, so pull
+            // it back to the card's clearance line, never past the target.
+            if (hudHitY(cy) && hudHitX(hudLeft))
+                hudLeft = std::max(targetLeft, std::min(hudLeft, hudClearLeft));
+            // Keep the readout below at its documented distance above the resolved triad row (at the
+            // base row this is exactly the cr1.y - 112 * uiScale it used to hard-code).
+            triadInfoBottom = cy - 60.0f * ts;
+            float cx = hudLeft + 52.0f * ts;
             float L = 30.0f * ts;
             float yawR = st.yaw * 3.14159265f / 180.0f, pitR = st.pitch * 3.14159265f / 180.0f;
             float cyaw = std::cos(yawR), syaw = std::sin(yawR);
@@ -5202,7 +5255,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // viewport's parameter readout; avoids visual clutter / overlap).
         bool pmActive = st.propertyManager && st.propertyManager->active();
         if (!st.modelInfo.empty() && renderer.hasMesh() && !pmActive) {
-            // dimensions readout, bottom-left (sits above the orientation triad)
+            // dimensions readout, bottom-left (sits above the orientation triad — triadInfoBottom
+            // is the row the triad resolved to, so the pill rides up with a lifted triad)
             ImFont* mf = st.fonts.mono ? st.fonts.mono : ImGui::GetFont();
             float fs = mf->FontSize * 0.92f;
             ImVec2 ts = mf->CalcTextSizeA(fs, 1e30f, 0.0f, st.modelInfo.c_str());
@@ -5212,7 +5266,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 const float e = ui::overlayColumnEdge(0);
                 if (e > cr0.x && e < cr1.x - 140.0f * ui::uiScale) infoLeft = e;
             }
-            ImVec2 p0(infoLeft + 12, cr1.y - ts.y - 112.0f * ui::uiScale);
+            ImVec2 p0(infoLeft + 12, triadInfoBottom - ts.y);
             ImVec2 p1(p0.x + ts.x + 20.0f, p0.y + ts.y + 10.0f);
             const ui::AdaptiveSurface& infoSurf =
                 ui::adaptivePanel(ui::panelId("vp_model_info"), ImRect(p0, p1), ui::GlassGroup::Hud);

@@ -901,6 +901,24 @@ const std::vector<float>* camStockBoxSegments() {
     return &g.mirror.setups()[g.selSetup].stockSegments;
 }
 
+// ---- bottom-anchored viewport HUD rect (see cam_panel.h) ----------------------------------------
+// Mirrors ui::publishOverlayColumnHeight / ui::overlayColumnHeight: camDrawViewportHud (below)
+// publishes once per frame, the orientation-triad block in viewport_panel.cpp reads. Frame-stamped
+// so leaving Manufacture invalidates the rect instead of deflecting the triad forever.
+static ViewportHudRect g_vpHudRect;
+static int             g_vpHudRectFrame = -1;
+
+void publishViewportHudRect(float minX, float minY, float maxX, float maxY) {
+    g_vpHudRect.minX = minX; g_vpHudRect.minY = minY;
+    g_vpHudRect.maxX = maxX; g_vpHudRect.maxY = maxY;
+    g_vpHudRect.valid = (maxX > minX && maxY > minY);
+    g_vpHudRectFrame = ImGui::GetFrameCount();
+}
+ViewportHudRect viewportHudRect() {
+    if (g_vpHudRectFrame < ImGui::GetFrameCount() - 1) { ViewportHudRect r; return r; }
+    return g_vpHudRect;
+}
+
 // Viewport-local telemetry and transport. Geometry is rendered exclusively by the native overlay.
 void camDrawViewportHud(AppState& /*st*/, const ImVec2& vpMin, const ImVec2& vpSize) {
     if (g.docId.empty()) return;
@@ -936,6 +954,10 @@ void camDrawViewportHud(AppState& /*st*/, const ImVec2& vpMin, const ImVec2& vpS
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
     if (ImGui::Begin("##cam_viewport_hud", nullptr, flags)) {
+        // Publish the card's real rect (post-layout, not the requested size) so the viewport's
+        // bottom-left HUD family — orientation triad, model-dimensions pill — can dodge it.
+        const ImVec2 hudPos = ImGui::GetWindowPos(), hudSize = ImGui::GetWindowSize();
+        publishViewportHudRect(hudPos.x, hudPos.y, hudPos.x + hudSize.x, hudPos.y + hudSize.y);
         const std::string job = g.mirror.name().empty() ? "CAM Job" : g.mirror.name();
         ImGui::TextUnformatted(job.c_str());
         ImGui::SameLine(0.0f, ui::metrics::camBtnGap());

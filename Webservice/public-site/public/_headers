@@ -14,8 +14,11 @@
 /assets/*
   Cache-Control: public, max-age=86400, must-revalidate
 
+# NOT content-hashed (unlike /_astro/*), so `immutable` made a re-captured product
+# screenshot invisible for a year: the deploy shipped the new bytes and every edge and
+# browser kept serving the old ones off the same URL. Revalidate instead.
 /images/*
-  Cache-Control: public, max-age=31536000, immutable
+  Cache-Control: public, max-age=86400, must-revalidate
 
 /pagefind/*
   Cache-Control: public, max-age=31536000, immutable

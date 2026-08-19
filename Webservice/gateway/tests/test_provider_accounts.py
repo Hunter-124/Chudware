@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from gateway import accounts, credits, db, engine_bridge, provider_accounts
+from gateway import accounts, db, engine_bridge, provider_accounts
 from gateway.config import settings
 from gateway.limits import RateLimiter
 

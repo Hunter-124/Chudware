@@ -16,28 +16,24 @@ if str(GATEWAY_DIR.parent) not in sys.path:
 
 
 @pytest.fixture()
-def accounts_env(pg, tmp_path, monkeypatch):
-    """Fresh accounts module bound to a tmp_path data root and a virgin schema."""
+def accounts_env(pg, tmp_path, monkeypatch, reload_settings):
+    """Fresh settings bound to a tmp_path data root and a virgin schema.
+
+    ``reload_settings`` mutates the ONE settings object rather than swapping
+    ``config.settings`` for a new one, so modules that captured it at import time
+    (``auth``, ``limits``, ``accounts``) do not silently keep reading the old
+    values — see the fixture's own note for what that cost.
+    """
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setenv("CHUDWARE_WEB_DATA_ROOT", str(data))
     monkeypatch.delenv("CHUDWARE_WEB_AUTO_APPROVE_DOMAINS", raising=False)
 
-    for mod in ("gateway.config", "gateway.limits", "gateway.accounts",
-                "config", "limits", "accounts"):
-        sys.modules.pop(mod, None)
-
-    import config  # type: ignore
-
-    config.settings = config.load_settings()
-
-    import limits  # type: ignore
-
-    limits.settings = config.settings
+    reload_settings()
 
     import accounts  # type: ignore
+    import config  # type: ignore
 
-    accounts.settings = config.settings
     return accounts, config, data
 
 

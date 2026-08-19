@@ -312,33 +312,6 @@ def test_terminal_demotion_closes_before_next_input(client, _tmux_env):
             ws.receive_bytes()
         assert exc.value.code == 4403
 
-# --- Access-policy include list (cf_provision) ------------------------------
-#
-# The Access policy is what decides whether a person ever receives a One-Time
-# PIN: CF silently drops the OTP email for any address not in an Allow policy.
-# An address mangled on the way into the policy = that user never gets a code.
-
-def _load_cf_provision():
-    import importlib.util
-
-    path = GATEWAY_DIR.parent / "deploy" / "cf_provision.py"
-    spec = importlib.util.spec_from_file_location("cf_provision", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def test_include_list_emits_verbatim_emails_plus_domain_rules():
-    cf = _load_cf_provision()
-    inc = cf._include_list(["brother@gmail.com", "plain@ua.edu"])
-    emails = [r["email"]["email"] for r in inc if "email" in r]
-    # A stray-quote or otherwise wrapped email can never match in CF Access
-    # -> silently no OTP. Each address goes in exactly as supplied.
-    assert emails == ["brother@gmail.com", "plain@ua.edu"]
-    assert all('"' not in e for e in emails)
-    domains = [r["email_domain"]["domain"] for r in inc if "email_domain" in r]
-    assert domains == list(cf.ACCESS_DOMAINS)
-
 
 def test_releases_requires_admin(client):
     r = client.get("/api/admin/releases", headers=_auth("demo@example.com"))

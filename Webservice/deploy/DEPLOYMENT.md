@@ -60,19 +60,19 @@ Production remains on port 8300 with data under `~/chudware-web-data` and
 database `chudware_prod`. Both gateways share application source and the webd
 engine, but never mutable gateway state or database credentials.
 
-## Cloudflare Access
+## The `/admin` door
 
-- ONE self-hosted app "Billet Web", ID `a5c88ac6-8364-4fa1-9610-c2ab5dcf9fa8`
-- `self_hosted_domains = [app.chudware.com/admin*]`
-- Shared AUD: `b375474d216c1f4a1925493000f31c32e85ed9b198001fbd2622fe451a5a879f`
-  → gateway env `CHUDWARE_WEB_CF_AUD`
-- Keep `/admin` on this existing app so the gateway continues to validate the
-  same `CHUDWARE_WEB_CF_AUD`; creating a second app would mint another AUD.
-- Policy "billet-users": explicit operator allowlist. Ordinary visitors do not
-  pass through this policy.
-- Access is the **operator door only** — it gates `/admin`. Ordinary visitors
-  authenticate to the gateway itself with a `chudware_sid` session, and the
-  gateway assigns roles from the account store, never from this policy.
+- `/admin` is gated by the gateway alone: a `chudware_sid` session whose `accounts`
+  row carries `role = 'admin'`. `cf_provision.py` provisions no Access application.
+- The legacy self-hosted app "Billet Web"
+  (ID `a5c88ac6-8364-4fa1-9610-c2ab5dcf9fa8`, `self_hosted_domains =
+  [app.chudware.com/admin*]`) must be **deleted by hand in Zero Trust**. While it
+  lives, Cloudflare answers `/admin` with its own login page instead of the
+  gateway's `/signin` — which is the reason it is being removed.
+- Cloudflare Access remains a *fallback* credential the gateway accepts from a
+  caller with **no** session: set `CHUDWARE_WEB_CF_TEAM_DOMAIN` and
+  `CHUDWARE_WEB_CF_AUD` by hand if you want that, and nothing provisions them.
+  Roles are read from the account store either way, never from an Access policy.
 
 ## Accounts (production)
 
@@ -87,17 +87,17 @@ credential, session and email-token tables created by
 - Optional Google/GitHub sign-in resolves to the same rows — set
   `CHUDWARE_WEB_GOOGLE_CLIENT_ID`/`_SECRET` and/or
   `CHUDWARE_WEB_GITHUB_CLIENT_ID`/`_SECRET` in the gateway env.
-- `CHUDWARE_WEB_SESSION_SECRET` is required: outside dev mode the gateway
-  refuses to start without it unless CF Access is fully configured. Generate one
-  with `python3 -c 'import secrets;print(secrets.token_urlsafe(48))'`.
+- `CHUDWARE_WEB_SESSION_SECRET` is required: outside dev mode the gateway refuses
+  to start without it unless the optional CF Access fallback is fully configured.
+  Generate one with `python3 -c 'import secrets;print(secrets.token_urlsafe(48))'`.
 - Admins approve, deny and suspend from `/admin`
   (`POST /api/admin/accounts/{email}/{approve,deny,suspend}`).
 - **First admin / recovery if locked out:** `cd Webservice/gateway && .venv/bin/python
   -m authn grant-admin --email you@example.com` against `CHUDWARE_DB_URL`, then sign
   in normally. It creates-or-promotes, sets the password (prompted, never in argv),
-  and marks the address verified without needing working outbound mail. `/admin`
-  also sits behind Cloudflare Access, so that address must be in the Access allow
-  policy too.
+  and marks the address verified without needing working outbound mail. This CLI is
+  the only writer of `role`, and it is now the only gate on `/admin` — there is no
+  Access allow policy to add the address to as well.
 
 ## Safe application updates
 
@@ -180,8 +180,8 @@ them; treat anything derived from the old token as compromised.
 
 1. Cloudflare dashboard → profile (top right) → **My Profile → API Tokens**.
 2. Find the token used by this deployment and **Roll** it (or **Delete** and
-   create a replacement with the same permissions: Tunnel edit, DNS edit,
-   Access edit on the account).
+   create a replacement with the same permissions minus Access: Tunnel edit and
+   DNS edit on the account).
 3. Update the value in `Webservice/Cloudflare-info.txt` (local only,
    `chmod 600`) and in `$CF_API_TOKEN` wherever the operator shell exports it.
 4. Re-run `python3 Webservice/deploy/cf_provision.py` only if tunnel/app

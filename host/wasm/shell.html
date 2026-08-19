@@ -52,6 +52,40 @@
     }
     #status.error { color: #ff8a8a; }
 
+    /* Hard-requirement failure panel. #status is a 12px corner chip with
+       pointer-events:none — useless for an explanation a phone user has to read and
+       act on, so a real blocking panel replaces it. Text is selectable here on
+       purpose: html/body disable selection for the canvas. */
+    #unsupported {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      background: #12181c;
+      padding: max(24px, env(safe-area-inset-top)) 22px
+               max(24px, env(safe-area-inset-bottom)) 22px;
+      box-sizing: border-box;
+      -webkit-user-select: text;
+      user-select: text;
+      touch-action: auto;
+    }
+    #unsupported.visible { display: block; }
+    #unsupported .wrap { max-width: 34em; margin: 0 auto; }
+    #unsupported h1 { font-size: 19px; margin: 0 0 12px; }
+    #unsupported p, #unsupported li { font-size: 15px; line-height: 1.5; margin: 0 0 10px; }
+    #unsupported ol { padding-left: 1.3em; margin: 0 0 14px; }
+    #unsupported code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 4px;
+      padding: 1px 5px;
+    }
+    #unsupported .why { color: #ff8a8a; }
+    #unsupported .dim { color: #9aa7b2; font-size: 13px; }
+
     /* On-screen camera HUD — only shown on narrow / touch viewports. */
     #mobile-hud {
       display: none;
@@ -117,6 +151,8 @@
 <body>
   <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
   <div id="status">Loading Chudware…</div>
+  <div id="unsupported" role="alert" aria-live="assertive"><div class="wrap"
+       id="unsupported-body"></div></div>
   <div id="mobile-hud" aria-label="Camera controls">
     <div class="hud-row">
       <button type="button" data-cmd="menu" class="wide" title="Toggle panels">Menu</button>
@@ -143,10 +179,95 @@
     var statusEl = document.getElementById('status');
     function setStatus(text, isError) {
       if (!statusEl) return;
+      // A hard-requirement failure is the LAST word: the module keeps calling setStatus
+      // while it fails to instantiate, and letting "Aborted: …" overwrite the real
+      // diagnosis is exactly how this turned into a blank page with no explanation.
+      if (window.__chudwareUnsupported) return;
       statusEl.textContent = text;
       statusEl.className = isError ? 'error' : '';
     }
 
+    // ---- Hard-requirement preflight ---------------------------------------------
+    // This build needs three things the browser either has or does not:
+    //   * WebAssembly                       — it IS the application
+    //   * SharedArrayBuffer + cross-origin isolation — linked -pthread with
+    //     PTHREAD_POOL_SIZE=8 (host/CMakeLists.txt), so the worker pool cannot start
+    //     without shared memory
+    //   * WebGL2                            — MAX_WEBGL_VERSION=2, the only renderer
+    // Without this check a browser missing any of them downloaded ~12 MB and then sat
+    // on "Loading Chudware…" or printed a raw "Exception: …", which is what an iPhone
+    // in Lockdown Mode does: Lockdown Mode disables WebAssembly in Safari outright.
+    // Lockdown Mode is per-site excludable, so this is an instruction, not an apology.
+    (function preflight() {
+      var isApple = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                    (/Mac/.test(navigator.userAgent) && 'ontouchend' in document);
+      var missing = [];
+      if (typeof WebAssembly !== 'object' || typeof WebAssembly.instantiate !== 'function')
+        missing.push('WebAssembly');
+      if (typeof SharedArrayBuffer !== 'function') missing.push('SharedArrayBuffer');
+      // crossOriginIsolated false with SharedArrayBuffer present means COOP/COEP did not
+      // survive the network path — a proxy or extension stripped them.
+      var isolated = (typeof crossOriginIsolated === 'undefined') || crossOriginIsolated;
+      var webgl2 = false;
+      try {
+        var probe = document.createElement('canvas');
+        webgl2 = !!(probe.getContext('webgl2') || probe.getContext('experimental-webgl2'));
+      } catch (e) {}
+      if (!webgl2) missing.push('WebGL2');
+      if (!missing.length && isolated) return;
+
+      window.__chudwareUnsupported = true;
+      var reason = missing.length
+        ? 'This browser is missing: ' + missing.join(', ') + '.'
+        : 'This page is not cross-origin isolated, so shared memory is unavailable.';
+      chudwareLog('err', 'preflight: ' + reason);
+
+      var html = '<h1>Chudware can\u2019t run in this browser</h1>' +
+                 '<p class="why">' + reason + '</p>';
+      // Any missing hard requirement on an Apple browser: Lockdown Mode is the cause worth
+      // naming first. Newer Safari runs JIT-less Wasm under Lockdown Mode but still withholds
+      // shared memory, so keying this on WebAssembly alone would send those users the generic
+      // "use a current browser" text while they are already on the newest one.
+      if (isApple && missing.length) {
+        html +=
+          '<p><strong>Lockdown Mode is the usual cause.</strong> It disables WebAssembly and ' +
+          'shared memory in Safari, and WebAssembly is what Chudware is compiled to. You can ' +
+          'keep Lockdown Mode on everywhere else and allow just this site:</p>' +
+          '<ol>' +
+          '<li>Open this page in Safari and tap <code>a\u1d00</code> in the address bar.</li>' +
+          '<li>Choose <em>Turn off Lockdown Mode\u2026</em> \u2192 <em>Turn Off for This ' +
+          'Website</em>, then reload.</li>' +
+          '</ol>' +
+          '<p class="dim">Same exclusion from Settings: <em>Privacy &amp; Security</em> ' +
+          '\u2192 <em>Lockdown Mode</em> \u2192 <em>Configure Web Browsing</em> \u2192 ' +
+          '<em>Excluded Safari Websites</em>.</p>' +
+          '<p class="dim">If Lockdown Mode is already off for this site, the browser is ' +
+          'simply too old \u2014 Chudware needs Safari 16.4 or newer.</p>';
+      } else if (missing.length) {
+        html +=
+          '<p>Chudware runs as WebAssembly with a shared-memory worker pool and WebGL2. ' +
+          'Use a current Chrome, Edge, Firefox or Safari with those enabled \u2014 or run ' +
+          'the desktop app, which needs none of this.</p>';
+      } else {
+        html +=
+          '<p>Chudware needs the <code>Cross-Origin-Opener-Policy</code> and ' +
+          '<code>Cross-Origin-Embedder-Policy</code> headers this server sends. Something ' +
+          'between you and it removed them \u2014 usually a corporate proxy or a browser ' +
+          'extension. Try a different network, or a private window with extensions off.</p>';
+      }
+      html += '<p class="dim">Desktop builds: <a href="/#downloads">chudware.com downloads' +
+              '</a>.</p>';
+
+      var panel = document.getElementById('unsupported');
+      var body = document.getElementById('unsupported-body');
+      if (body) body.innerHTML = html;
+      if (panel) panel.className = 'visible';
+      if (statusEl) statusEl.style.display = 'none';
+      var c = document.getElementById('canvas');
+      if (c) c.style.display = 'none';
+      var hud = document.getElementById('mobile-hud');
+      if (hud) hud.style.display = 'none';
+    })();
     // ---- DPR-aware canvas sizing helpers ----------------------------------------
     function syncCanvasBackingStore(c) {
       if (!c) return;
@@ -362,6 +483,12 @@
       // stale Chudware.wasm/.data (fatal LinkError). __CHUDWARE_VER__ is replaced at stage time
       // (build.sh); the script-src URLs for Chudware.js / coi-serviceworker.js are versioned there too.
       locateFile: function(path, prefix){ return prefix + path + (/\.(wasm|data)$/.test(path) ? "?v=__CHUDWARE_VER__" : ""); },
+      // Preflight already decided this browser cannot run the module. Emscripten calls this
+      // hook INSTEAD of fetching and instantiating Chudware.wasm itself, so returning here
+      // spares an ~12 MB download that could only end in the panel already on screen.
+      instantiateWasm: window.__chudwareUnsupported
+          ? function() { throw new Error('unsupported browser (see preflight)'); }
+          : undefined,
       canvas: (function() {
         var c = document.getElementById('canvas');
         // Size the drawing buffer to CSS × DPR before first GL frame.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -11,7 +12,7 @@ cf = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cf)
 
 
-def test_provision_sets_portal_staging_pages_and_one_admin_access_app(monkeypatch):
+def test_provision_sets_portal_staging_pages_and_no_access_application(monkeypatch):
     calls = []
     env = {}
     tunnel_env = {}
@@ -25,13 +26,10 @@ def test_provision_sets_portal_staging_pages_and_one_admin_access_app(monkeypatc
         if "/dns_records?name=" in path:
             return []
         if path.endswith("/access/apps") and method == "GET":
-            return [{"id": "access-1", "name": cf.APP_NAME, "domain": "chudware.com"}]
-        if path.endswith("/access/apps/access-1") and method == "PUT":
-            return {"id": "access-1", "aud": "one-aud", **body}
-        if path.endswith("/access/apps/access-1/policies") and method == "GET":
-            return []
-        if path.endswith("/access/organizations"):
-            return {"auth_domain": "https://team.cloudflareaccess.com"}
+            # Present on the account and deliberately ignored: consolidating or
+            # deleting the leftover /admin* application is a Zero Trust dashboard
+            # decision, not something a DNS/tunnel run gets to make.
+            return [{"id": "access-1", "name": "Chudware Web", "domain": "chudware.com"}]
         if path.endswith("/cfd_tunnel/tunnel-1/token"):
             return "tunnel-token"
         return {}
@@ -39,7 +37,7 @@ def test_provision_sets_portal_staging_pages_and_one_admin_access_app(monkeypatc
     monkeypatch.setattr(cf, "api", fake_api)
     monkeypatch.setattr(cf, "upsert_env", lambda updates: env.update(updates))
     monkeypatch.setattr(cf, "write_tunnel_env", lambda token: tunnel_env.update(TUNNEL_TOKEN=token))
-    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--emails", "operator@example.com"])
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT)])
     cf.main()
 
     config = next(body for method, path, body in calls if path.endswith("/configurations"))
@@ -57,15 +55,25 @@ def test_provision_sets_portal_staging_pages_and_one_admin_access_app(monkeypatc
         ("www.chudware.com", "chudware-site.pages.dev"),
     }
 
-    app_updates = [body for method, path, body in calls if path.endswith("/access/apps/access-1")]
-    assert len(app_updates) == 1
-    assert app_updates[0]["domain"] == "app.chudware.com/admin*"
-    assert app_updates[0]["self_hosted_domains"] == ["app.chudware.com/admin*"]
-    assert not any(method == "POST" and path.endswith("/access/apps") for method, path, _ in calls)
-    assert env["CHUDWARE_WEB_CF_AUD"] == "one-aud"
+    # /admin is gated by the gateway's session cookie plus accounts.role now, so
+    # this script must not read, rewrite or create an Access application — and
+    # must emit no AUD, since fronting /admin* with Access is what made the
+    # operator meet Cloudflare's login page instead of the gateway's.
+    assert not any("/access/" in path for _, path, _ in calls)
+    assert "CHUDWARE_WEB_CF_AUD" not in env
+    assert "CHUDWARE_WEB_CF_TEAM_DOMAIN" not in env
     assert env["CHUDWARE_WEB_PUBLIC_BASE_URL"] == "https://app.chudware.com"
     assert "TUNNEL_TOKEN" not in env
     assert tunnel_env == {"TUNNEL_TOKEN": "tunnel-token"}
+
+
+def test_module_carries_no_admin_access_application_logic():
+    """The deletion, pinned by symbol rather than by grepping the source, which
+    still discusses the removed application in prose. Re-adding an Access
+    application over /admin* would put Cloudflare's login page back in front of
+    the operator's own account."""
+    for gone in ("APP_NAME", "ACCESS_DOMAIN", "ACCESS_DOMAINS", "_include_list"):
+        assert not hasattr(cf, gone), f"{gone} came back: /admin* Access app re-added"
 
 
 def test_env_writes_are_private_atomic_and_remove_legacy_tunnel_token(monkeypatch, tmp_path):
@@ -116,4 +124,12 @@ def test_setup_and_launch_profile_default_to_least_privilege():
     harden = (deploy / "harden_host.sh").read_text()
     assert "TUNNEL_TOKEN=" not in setup.split('cat >"${ENV_FILE}"', 1)[1].split("EOF", 1)[0]
     assert 'cloudflared.env' in setup
-    assert 'SAFE_ITEMS=" sudo firewall tunnel updates keys backups gateway "' in harden
+    # The launch profile applies every "safe" item unattended, and sshd is the one item that can
+    # lock the operator out of the box, so it must never appear there. Pinning the exact SAFE_ITEMS
+    # literal instead meant each newly added safe item (`entitlement`, most recently) failed this
+    # test while the invariant it exists to protect was never in doubt.
+    declared = re.search(r'^SAFE_ITEMS="([^"]*)"', harden, re.M)
+    assert declared, "harden_host.sh no longer declares SAFE_ITEMS"
+    safe_items = set(declared.group(1).split())
+    assert "sshd" not in safe_items
+    assert {"sudo", "firewall", "tunnel", "updates", "keys", "backups", "gateway"} <= safe_items

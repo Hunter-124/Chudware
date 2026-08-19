@@ -42,6 +42,7 @@
 #include "../update/updater.h"
 #endif
 #include "web_capabilities.h"  // ui::webGapReason (T-RF12: sign-in is desktop-only on web)
+#include "web_provider_keys.h" // ui::webProviderKey* — per-account BYOK on web
 #include "../core/async_rpc.h"  // core::RpcResult for skills/triggers RPCs
 #include "widgets/interwebz.h"  // Skills/Rules two-column editors
 #include "ui/provider_logos.h"  // ui::drawProviderLogo/providerBrandColor (Providers list badges)
@@ -2155,12 +2156,107 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     ImGui::PopID();
 }
 
+// Settings -> Providers in the browser.
+//
+// The OMP manager below it is the wrong model on web and cannot be made right: its credentials
+// live in the ONE shared daemon's bridge AuthStorage, and every agent_provider_* RPC it drives is
+// refused for any account that is not an admin (Webservice/gateway/engine_bridge.py). A standard
+// web account therefore got an empty provider list, a refusal string, and an "Add API key" field
+// whose Validate & add could only fail — with no other way to give the app a credential.
+//
+// This is that way: the gateway's account-scoped store (POST/GET/DELETE /api/providers/keys),
+// which validates a key with the provider, seals it to the account, and resolves it server-side
+// for that account's turns only. The six providers listed are exactly the ones the gateway has a
+// validation endpoint for, and each name is the wire provider an agent turn carries, which is how
+// the stored key gets found again.
+static void drawWebAccountProviderManager(AppState& st) {
+    const float sc = ui::uiScale;
+    const auto& pal = ui::palette;
+    static const char* kProviders[] = {
+        "anthropic", "openai", "gemini", "xai", "openrouter", "moonshot",
+    };
+    static std::string s_selected = kProviders[0];
+    static char s_keyBuf[4097] = {};
+    static std::string s_keyFor;
+
+    settingsGlassSectionBegin("##web_account_keys", "Your provider keys");
+    dimText("Keys you add here belong to your account alone: the server validates each one with "
+            "the provider, stores it encrypted, and never shows or shares it again. Turns that use "
+            "your own key spend no Chudware credits.");
+
+    const std::vector<ui::WebProviderKey>& stored = ui::webProviderKeys();
+    for (const char* id : kProviders) {
+        const bool selected = (s_selected == id);
+        std::string hint;
+        bool present = false;
+        for (const ui::WebProviderKey& k : stored)
+            if (k.provider == id) { present = true; hint = k.hint; break; }
+        char label[160];
+        std::snprintf(label, sizeof(label), "%s  \xe2\x80\xa2 %s##webprov_%s",
+                      ui::categoryLabel(id), present ? "key stored" : "no key", id);
+        if (ImGui::Selectable(label, selected)) {
+            s_selected = id;
+            std::memset(s_keyBuf, 0, sizeof(s_keyBuf));
+            s_keyFor = id;
+        }
+        if (present && !hint.empty()) {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusOk));
+            ImGui::Text("\xe2\x80\xa6%s", hint.c_str());
+            ImGui::PopStyleColor();
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+    // Never carry a secret across a provider switch: the buffer belongs to exactly one name.
+    if (s_keyFor != s_selected) {
+        s_keyFor = s_selected;
+        std::memset(s_keyBuf, 0, sizeof(s_keyBuf));
+    }
+    const bool busy = ui::webProviderKeyBusy();
+    const bool present = ui::webProviderKeyPresent(s_selected);
+    ImGui::TextUnformatted(present ? "Replace API key" : "Add API key");
+    ImGui::SetNextItemWidth(-1);
+    const bool entered = ImGui::InputTextWithHint(
+        "##web_key", "Paste key\xe2\x80\xa6", s_keyBuf, sizeof(s_keyBuf),
+        ImGuiInputTextFlags_Password | ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::BeginDisabled(busy || s_keyBuf[0] == 0);
+    const bool clicked = ImGui::SmallButton(busy ? "Validating\xe2\x80\xa6" : "Validate \x26 add");
+    ImGui::EndDisabled();
+    if ((entered || clicked) && !busy && s_keyBuf[0] != 0) {
+        ui::webProviderKeySave(s_selected, s_keyBuf);
+        std::memset(s_keyBuf, 0, sizeof(s_keyBuf));  // out of the ImGui buffer immediately
+    }
+    if (present) {
+        ImGui::SameLine(0, 6.0f * sc);
+        ImGui::BeginDisabled(busy);
+        if (ImGui::SmallButton("Remove##web_key")) ui::webProviderKeyDelete(s_selected);
+        ImGui::EndDisabled();
+    }
+    const std::string& status = ui::webProviderKeyStatus();
+    if (!status.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(
+            ui::webProviderKeyStatusIsError() ? pal.statusErr : pal.statusOk));
+        ImGui::TextWrapped("%s", status.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (const char* why = ui::webGapReason("account_signin")) dimText(why);
+    settingsGlassSectionEnd();
+}
+
 // Two-pane provider manager: left = provider list with sign-in state, right = detail
 // (Sign-in / Usage / Models). Footer = per-session cost strip. Single-column fallback under
 // 640*sc: the list collapses to a combo (design §3.1).
 static void drawOmpProviderManager(AppState& st) {
     const float sc = ui::uiScale;
     const auto& pal = ui::palette;
+    if (ui::webProviderKeysAvailable()) {
+        // Not merely hidden: the polls below drive agent_provider_* every TTL tick, which a
+        // non-admin account cannot call at all and an admin should not be driving from a browser
+        // into the operator's own credential store.
+        drawWebAccountProviderManager(st);
+        return;
+    }
     enterOmpProviderView();
     pollOmpProviderList(st, false);
     pollOmpOAuth(st);
@@ -7765,8 +7861,12 @@ void drawSettingsModal(AppState& st, bool busy) {
                                                      : ImGuiTabItemFlags_None)) {
                 providerTabDrawn = true;
                 settingsTabBodyBegin("##tab_providers");
-                dimText("API providers, sign-in, and model routing. Credentials are stored by "
-                        "the auth bridge \xe2\x80\x94 never written to config.json.");
+                dimText(ui::webProviderKeysAvailable()
+                            ? "API providers and model routing. Keys are validated by the provider, "
+                              "then stored encrypted against your account on the server \xe2\x80\x94 "
+                              "never in this browser and never shared with another account."
+                            : "API providers, sign-in, and model routing. Credentials are stored by "
+                              "the auth bridge \xe2\x80\x94 never written to config.json.");
                 drawOmpProviderManager(st);
                 settingsGlassSectionBegin("##prov_freeai", "Free AI (FreeLLMAPI)");
                 if (ui::drawFreeAiProviderCard(st)) saveSettings(st.settings);

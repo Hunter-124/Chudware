@@ -51,9 +51,11 @@ if [[ ! -f "${ENV_FILE}" ]]; then
 # chudware-web gateway env — NEVER commit this file.
 # Filled by Webservice/deploy/cf_provision.py (driver) and/or hand edits.
 
-# Access JWT verification (team domain + Application Audience AUD tag)
-CHUDWARE_CF_TEAM_DOMAIN=https://bruh234324.cloudflareaccess.com
-CHUDWARE_CF_AUD=
+# Optional Cloudflare Access fallback, for a caller with no gateway session.
+# Leave both blank: /admin is gated by the chudware_sid session plus
+# accounts.role='admin', and nothing provisions an Access application.
+# CHUDWARE_WEB_CF_TEAM_DOMAIN=https://bruh234324.cloudflareaccess.com
+# CHUDWARE_WEB_CF_AUD=
 
 # Self-serve auth: signs the chudware_sid session cookie (required in production)
 CHUDWARE_WEB_SESSION_SECRET=
@@ -71,7 +73,7 @@ CHUDWARE_WEB_SESSION_SECRET=
 # CHUDWARE_WEB_DATA=/home/YOU/chudware-web-data
 EOF
   chmod 600 "${ENV_FILE}"
-  echo "    wrote skeleton ${ENV_FILE} (chmod 600) — fill CHUDWARE_CF_AUD and CHUDWARE_WEB_SESSION_SECRET"
+  echo "    wrote skeleton ${ENV_FILE} (chmod 600) — fill CHUDWARE_WEB_SESSION_SECRET"
 else
   echo "    keep existing ${ENV_FILE}"
 fi
@@ -143,7 +145,7 @@ echo
 echo "==> next steps checklist"
 cat <<EOF
   [ ] SECURITY: rotate Cloudflare API token + R2 keys (leaked in git history) — see RUNBOOK.md §SECURITY
-  [ ] Confirm cf_provision.py wrote TUNNEL_TOKEN into ${TUNNEL_ENV_FILE} and CHUDWARE_CF_AUD into ${ENV_FILE}
+  [ ] Confirm cf_provision.py wrote TUNNEL_TOKEN into ${TUNNEL_ENV_FILE}
   [ ] Set CHUDWARE_WEB_SESSION_SECRET in ${ENV_FILE} — REQUIRED; the gateway refuses to
       start without it. Generate with:
       python3 -c 'import secrets;print(secrets.token_urlsafe(48))'
@@ -153,8 +155,11 @@ cat <<EOF
       cat /secure/owner-source/entitlement.key | Webservice/deploy/provision_entitlement_credential.sh prod
       TPM2 is preferred; otherwise systemd-creds uses the host key and owner unlock at boot.
   [ ] Nothing to seed: users register themselves and verify by email; approve them at /admin
-  [ ] Optional: Google IdP for the CF Access /admin door (CF Zero Trust) — RUNBOOK.md
-  [ ] Edit Access allowlist emails — Access gates /admin only (dashboard or API)
+  [ ] Grant yourself the /admin role — this is the whole operator allowlist now:
+      cd Webservice/gateway && .venv/bin/python -m authn grant-admin --email <addr>
+      then sign in at /signin and open /admin
+  [ ] Delete the leftover app.chudware.com/admin* Cloudflare Access application in
+      Zero Trust — while it exists CF shows its login page instead of /signin
   [ ] systemctl --user start ${GATEWAY_UNIT} chudware-cloudflared chudware-monitor.timer ${RETENTION_TIMER}
   [ ] curl -sS http://127.0.0.1:8300/healthz | jq .
   [ ] Full ops: Webservice/deploy/RUNBOOK.md

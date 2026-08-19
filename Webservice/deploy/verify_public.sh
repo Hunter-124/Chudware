@@ -62,12 +62,18 @@ for p in / /workspace/list /bucket /api/me /api/sessions /api/provider-keys \
 done
 
 echo
-echo 'ADMIN IS BEHIND CLOUDFLARE ACCESS'
-loc=$(curl -s -o /dev/null -w '%{redirect_url}' -A "$UA" --max-time 25 https://app.chudware.com/admin)
+echo 'ADMIN IS BEHIND THE ACCOUNT SYSTEM, NOT CLOUDFLARE ACCESS'
+# Accept: text/html is load-bearing: auth.py::_deny_http answers a browser
+# navigation with the 303 to /signin and an XHR with a JSON 401, so curl's
+# default 'Accept: */*' would measure the wrong branch and read as a failure.
+read -r code loc < <(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
+  -A "$UA" -H 'Accept: text/html' --max-time 25 https://app.chudware.com/admin)
 if [[ "$loc" == *cloudflareaccess.com* ]]; then
-  echo '  ok   /admin redirects to the Access login'; PASS_COUNT=$((PASS_COUNT + 1))
+  echo "  FAIL /admin still walled off by Cloudflare Access: $loc"; FAIL_COUNT=$((FAIL_COUNT + 1))
+elif [ "$code" = "303" ] && [[ "$loc" == */signin?next=%2Fadmin ]]; then
+  echo '  ok   /admin sends an anonymous browser to the gateway sign-in'; PASS_COUNT=$((PASS_COUNT + 1))
 else
-  echo "  FAIL /admin did not hit Access: '$loc'"; FAIL_COUNT=$((FAIL_COUNT + 1))
+  echo "  FAIL /admin gave $code -> '$loc', wanted 303 to /signin?next=%2Fadmin"; FAIL_COUNT=$((FAIL_COUNT + 1))
 fi
 
 echo
@@ -92,6 +98,17 @@ if [[ "$me" == *'"role":"admin"'* ]] || [[ "$me" == *'"role": "admin"'* ]]; then
 else
   echo "  FAIL /api/me did not show an admin session: $(echo "$me" | cut -c1-160)"
   FAIL_COUNT=$((FAIL_COUNT + 1))
+fi
+
+# The whole point of the cutover: the session cookie alone opens /admin. This
+# jar holds no CF_Authorization, so a 200 here proves the account store is the
+# authority and no edge credential is involved.
+admin=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" -H 'Accept: text/html' \
+  --max-time 25 -b "$JAR" https://app.chudware.com/admin)
+if [ "$admin" = "200" ]; then
+  echo '  ok   /admin opens on the session cookie alone'; PASS_COUNT=$((PASS_COUNT + 1))
+else
+  echo "  FAIL /admin gave $admin to a signed-in admin session"; FAIL_COUNT=$((FAIL_COUNT + 1))
 fi
 rm -f "$JAR"
 fi

@@ -157,6 +157,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/provider_usage.cpp             # shared subscription usage poll (Settings + composer rings)
   src/ui/oauth_capture.cpp  # in-app xAI multi-account CEF OAuth (Settings → Accounts)
   src/ui/web_capabilities.cpp  # T-RF12: WASM-build gap table (ui::webBuild / ui::webGapReason)
+  src/ui/web_provider_keys.cpp  # WASM-build per-account BYOK client (/api/providers/keys)
   src/ui/console_panel.cpp
   # --- W1-B: core infrastructure (toast / cursor manager / shared appearance picker) ---
   src/ui/toast.cpp

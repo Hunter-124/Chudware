@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Idempotently describe the production Chudware Cloudflare topology.
 
-The tunnel serves only the authenticated portal and staging gateway. The public
-marketing apex/www live on Cloudflare Pages. One Access application protects
-``app.chudware.com/admin*`` and therefore emits the gateway's single accepted
-AUD; this script never creates a second Access application.
+The tunnel serves the portal and staging gateway. The public marketing apex/www
+live on Cloudflare Pages. This script provisions NO Cloudflare Access
+application: the door to ``app.chudware.com/admin`` is the gateway's own
+session cookie plus ``accounts.role == 'admin'``, granted by
+``python -m authn grant-admin``. Fronting ``/admin*`` with Access meant the
+operator met Cloudflare's login page instead of the gateway's, and every
+browser that had completed Access for the zone carried a CF_Authorization
+cookie that the middleware once preferred over the live session.
 
-IMPORTANT: deploy and verify gateway session-cookie auth before running this
-script to narrow Access. See deploy/RUNBOOK.md for the required ordering.
+Access remains supported by the gateway as a fallback credential for a caller
+with no session, but it is configured by hand in Zero Trust if wanted at all;
+nothing here writes CHUDWARE_WEB_CF_TEAM_DOMAIN or CHUDWARE_WEB_CF_AUD.
 
 Secrets: reads $CF_API_TOKEN or the gitignored Cloudflare-info.txt. Gateway
 settings are written to ~/chudware-web-data/gateway.env; the tunnel credential
@@ -28,10 +33,8 @@ from pathlib import Path
 API = "https://api.cloudflare.com/client/v4"
 ACCOUNT_ID = "9a800a5f674233fe127cdb44b395ebfa"
 TUNNEL_NAME = "chudware-web"
-APP_NAME = "Chudware Web"
 PORTAL_HOST = "app.chudware.com"
 STAGING_HOST = "staging.chudware.com"
-ACCESS_DOMAIN = f"{PORTAL_HOST}/admin*"
 PRODUCTION_SERVICE = "http://127.0.0.1:8300"
 STAGING_SERVICE = "http://127.0.0.1:8310"
 PAGES_PROJECT = "chudware-site"
@@ -73,15 +76,6 @@ def api(method: str, path: str, body: dict | None = None) -> dict | list:
 
 def find(items: list[dict], key: str, value: str) -> dict | None:
     return next((item for item in items if item.get(key) == value), None)
-
-
-ACCESS_DOMAINS = ["ua.edu", "crimson.ua.edu"]
-
-
-def _include_list(emails: list[str]) -> list[dict]:
-    result: list[dict] = [{"email": {"email": email}} for email in emails]
-    result += [{"email_domain": {"domain": domain}} for domain in ACCESS_DOMAINS]
-    return result
 
 
 def _atomic_write_env(path: Path, values: dict[str, str]) -> None:
@@ -133,15 +127,8 @@ def _upsert_cname(zones: list[dict], hostname: str, target: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--emails", required=True,
-        help="comma-separated operator allowlist for app.chudware.com/admin*",
-    )
     parser.add_argument("--pages-project", default=PAGES_PROJECT)
     args = parser.parse_args()
-    emails = [email.strip().lower() for email in args.emails.split(",") if email.strip()]
-    if not emails:
-        parser.error("--emails parsed to an empty allowlist")
 
     tunnels = api("GET", f"/accounts/{ACCOUNT_ID}/cfd_tunnel?is_deleted=false")
     assert isinstance(tunnels, list)
@@ -172,65 +159,17 @@ def main() -> None:
     for hostname in PAGES_HOSTS:
         _upsert_cname(zones, hostname, pages_target)
 
-    apps = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps")
-    assert isinstance(apps, list)
-    candidates = [
-        item for item in apps
-        if item.get("name") == APP_NAME
-        or item.get("domain") in {"chudware.com", PORTAL_HOST, ACCESS_DOMAIN}
-    ]
-    if len(candidates) > 1:
-        sys.exit(
-            "multiple Chudware Access applications exist; consolidate them in Zero Trust "
-            "before provisioning so the gateway continues to validate exactly one AUD"
-        )
-    app_body = {
-        "name": APP_NAME,
-        "type": "self_hosted",
-        "domain": ACCESS_DOMAIN,
-        "self_hosted_domains": [ACCESS_DOMAIN],
-        "session_duration": "24h",
-        "skip_interstitial": True,
-        "auto_redirect_to_identity": False,
-    }
-    if candidates:
-        app = api("PUT", f"/accounts/{ACCOUNT_ID}/access/apps/{candidates[0]['id']}", app_body)
-    else:
-        app = api("POST", f"/accounts/{ACCOUNT_ID}/access/apps", app_body)
-    assert isinstance(app, dict)
-    print(f"access app: {ACCESS_DOMAIN} id={app['id']} aud={app['aud']}")
-
-    policies = api("GET", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies")
-    assert isinstance(policies, list)
-    allow_policies = [policy for policy in policies if policy.get("decision") == "allow"]
-    policy = find(policies, "name", "chudware-admins") or (
-        allow_policies[0] if len(allow_policies) == 1 else None
-    )
-    policy_body = {
-        "name": policy["name"] if policy else "chudware-admins",
-        "decision": "allow",
-        "precedence": policy["precedence"] if policy else 1,
-        "include": _include_list(emails),
-    }
-    if policy:
-        api("PUT", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies/{policy['id']}", policy_body)
-    else:
-        api("POST", f"/accounts/{ACCOUNT_ID}/access/apps/{app['id']}/policies", policy_body)
-    print(f"policy {policy_body['name']!r}: {len(emails)} operator email(s)")
-
-    organizations = api("GET", f"/accounts/{ACCOUNT_ID}/access/organizations")
-    assert isinstance(organizations, dict)
     tunnel_token = api("GET", f"/accounts/{ACCOUNT_ID}/cfd_tunnel/{tunnel_id}/token")
     assert isinstance(tunnel_token, str)
     write_tunnel_env(tunnel_token)
-    upsert_env({
-        "CHUDWARE_WEB_CF_TEAM_DOMAIN": organizations["auth_domain"],
-        "CHUDWARE_WEB_CF_AUD": app["aud"],
-        "CHUDWARE_WEB_PUBLIC_BASE_URL": f"https://{PORTAL_HOST}",
-    })
-    print(f"gateway env written: {ENV_FILE} (team={organizations['auth_domain']})")
+    # Only the public base URL. CHUDWARE_WEB_CF_TEAM_DOMAIN / CHUDWARE_WEB_CF_AUD
+    # are deliberately absent: no Access application is provisioned, so there is
+    # no AUD to emit. upsert_env merges, so a gateway.env that already carries
+    # those two keys from a hand-configured Access fallback keeps them.
+    upsert_env({"CHUDWARE_WEB_PUBLIC_BASE_URL": f"https://{PORTAL_HOST}"})
+    print(f"gateway env written: {ENV_FILE}")
     print(f"tunnel env written: {TUNNEL_ENV_FILE}")
-    print("Access is narrowed only after session-cookie auth verification; see RUNBOOK.md.")
+    print(f"admin access: python -m authn grant-admin --email <addr>, then sign in at https://{PORTAL_HOST}/signin")
 
 
 if __name__ == "__main__":

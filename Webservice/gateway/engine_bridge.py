@@ -169,6 +169,23 @@ _AGENT_TURN_PROVIDER_METHODS = frozenset({
     "agent_run_v2", "agent_ask_v2", "agent_clarify_v1", "agent_mission_v1",
     "session_btw", "session_handoff",
 })
+# The subscription (OAuth) credentials these RPCs read and write live in the ONE
+# shared chudware-hostd process, in its single process-wide sub_auth store: there
+# is no per-tenant copy. A tenant calling subscription_login therefore replaces
+# the operator's Claude/Codex/Cursor/xAI/Kimi credential for everybody, and the
+# flow runs on the server — anthropic_sub_provider/codex_sub_provider call
+# webbrowser.open() and bind a loopback callback (localhost:54545,
+# localhost:1455) on the gateway host, which no remote caller's browser reaches.
+# The read-only three leak operator identity: providers.py withholds account
+# emails and labels from non-admins (include_operator_detail), and raw
+# subscription_status / _accounts / _usage answer with none of that scrubbing.
+# Named one by one, never a "subscription_" prefix test, so a future
+# subscription RPC has to be classified deliberately at review instead of
+# silently inheriting whichever policy the prefix happened to imply.
+_OPERATOR_SUBSCRIPTION_METHODS = frozenset({
+    "subscription_login", "subscription_logout", "subscription_switch",
+    "subscription_status", "subscription_accounts", "subscription_usage",
+})
 # Secrets / server-owned endpoint config — never accept from the browser.
 _STRIP_SECRET_FIELDS = (
     "api_key", "base_url", "fallback_api_keys", "auth_mode",
@@ -776,6 +793,18 @@ async def engine_ws(ws: WebSocket) -> None:
                 if method.startswith("agent_provider_") and current_user.role != "admin":
                     log.warning(
                         "engine bridge %s: rejected administrator provider RPC",
+                        user.email,
+                    )
+                    await ws.send_text(_rpc_error(
+                        line, -32003, "administrator authorization required"
+                    ))
+                    continue
+                if (
+                    method in _OPERATOR_SUBSCRIPTION_METHODS
+                    and current_user.role != "admin"
+                ):
+                    log.warning(
+                        "engine bridge %s: rejected operator subscription RPC",
                         user.email,
                     )
                     await ws.send_text(_rpc_error(

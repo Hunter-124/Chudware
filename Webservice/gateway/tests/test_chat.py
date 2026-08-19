@@ -25,23 +25,28 @@ class _User:
 
 
 @pytest.fixture()
-def chat_env(pg, tmp_path, monkeypatch):
+def chat_env(pg, tmp_path, monkeypatch, reload_settings):
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setenv("CHUDWARE_WEB_DATA_ROOT", str(data))
     monkeypatch.setenv("CHUDWARE_WEB_DEV", "1")
 
-    for mod in ("gateway.config", "gateway.chat", "config", "chat"):
-        sys.modules.pop(mod, None)
-
-    import config  # type: ignore
-    import chat  # type: ignore
+    # In-place, so the `settings` object `auth` bound at import time is the one
+    # that now carries dev_mode=True. Swapping `config.settings` for a new object
+    # instead left `auth` on the old one, `AuthMiddleware.__init__` hit its
+    # no-strong-auth fail-fast inside the WS message loop, no frame was ever
+    # broadcast, and the `receive_json()` below blocked forever — but only when
+    # some earlier test file had already imported `auth`.
+    reload_settings()
 
     import auth  # type: ignore
+    import chat  # type: ignore
+    import config  # type: ignore
 
-    config.settings = config.load_settings()
+    # Per-test fan-out state; the module singletons outlive one test otherwise.
     chat.presence = chat.Presence()
     chat.hub = chat.Hub()
+
     import accounts  # type: ignore
     accounts.ensure_account("alice@example.com", display="Alice")
     accounts.set_status("alice@example.com", "active", decided_by="test")

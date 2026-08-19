@@ -30,6 +30,40 @@ if str(GATEWAY_DIR.parent) not in sys.path:
     sys.path.insert(0, str(GATEWAY_DIR.parent))
 
 
+@pytest.fixture()
+def reload_settings(monkeypatch):
+    """Re-read ``Settings`` from the current environment WITHOUT replacing the
+    singleton, and undo it after the test.
+
+    ``auth``, ``accounts``, ``limits`` and friends all do ``from config import
+    settings`` at import time, so they hold a REFERENCE to one object. Fixtures
+    that instead did ``config.settings = config.load_settings()`` left whichever
+    module imported first reading the discarded object — and which module that is
+    depends purely on pytest's file order. Every symptom of that has been an
+    order-dependent result rather than an honest one: ``test_auth_accounts_gate``
+    failing "no strong auth configured" only when ``test_accounts`` ran first, and
+    ``test_chat``'s WS broadcast blocking forever because ``AuthMiddleware`` hit
+    that same fail-fast inside the message loop and no frame was ever sent.
+
+    Mutating field-by-field through ``monkeypatch`` keeps one object for everyone
+    and restores each value at teardown, so a later module is never handed a
+    settings object shaped by an earlier one.
+    """
+    import dataclasses  # noqa: PLC0415
+
+    def _reload():
+        import config  # noqa: PLC0415
+
+        fresh = config.load_settings()
+        for field in dataclasses.fields(fresh):
+            monkeypatch.setattr(
+                config.settings, field.name, getattr(fresh, field.name), raising=False
+            )
+        return config.settings
+
+    return _reload
+
+
 # Fedora installs the server binaries in /usr/bin, but only from
 # postgresql-server (the client package gives psql and no initdb); versioned
 # side-by-side installs land under /usr/pgsql-NN/bin or

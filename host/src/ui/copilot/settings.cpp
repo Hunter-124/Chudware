@@ -6,6 +6,9 @@
 
 #include "copilot_internal.h"
 
+#include "../web_capabilities.h"    // ui::webGapReason — subscription sign-in is not a web path
+#include "../web_provider_keys.h"   // per-account BYOK on web (/api/providers/keys)
+
 namespace ui {
 
 namespace {
@@ -252,12 +255,99 @@ std::vector<ModelInfo> providerPickerModels(AppState& st, int provider) {
     return out;
 }
 
-// Free AI (FreeLLMAPI, github.com/tashfeenahmed/freellmapi) provider card — reused from BOTH
-// the classic Settings -> AI provider picker and the live Settings -> Providers tab. Endpoint
-// and model controls remain here; credentials never do. All keys are validated and stored by
-// the OMP AuthStorage flow in Settings -> Providers.
-// Returns true when a non-credential field changed (caller saves).
+// The AI tab's credential surface in the browser. Desktop keeps its pointer to
+// Settings -> Providers; on web that pointer is a dead end, so this is the ONLY working path and
+// it has to be honest about which providers it can serve and what a stored key means.
+static void drawWebProviderKeyForm(AppState& st) {
+    Settings& s = st.settings;
+    const std::string provider = ui::webProviderKeyName(s.provider, s.baseUrl);
+    if (provider.empty()) {
+        dimText("There is no per-account credential for this provider in the browser: it is either "
+                "a subscription or OMP-bridge grant held by the shared engine, or a service the "
+                "server has no validation endpoint for. Anthropic, OpenAI, Gemini, xAI, OpenRouter "
+                "and Moonshot take your own key \xe2\x80\x94 add it under Settings \xe2\x86\x92 "
+                "Providers.");
+        return;
+    }
+
+    // One buffer, cleared whenever the selected provider changes: a key typed for Anthropic must
+    // never be submitted under xAI's name because the provider combo moved underneath it.
+    static char keyBuf[4097] = {};
+    static std::string keyBufProvider;
+    static bool replacing = false;
+    if (keyBufProvider != provider) {
+        keyBufProvider = provider;
+        std::memset(keyBuf, 0, sizeof(keyBuf));
+        replacing = false;
+    }
+
+    const bool stored = ui::webProviderKeyPresent(provider);
+    const bool busy = ui::webProviderKeyBusy();
+
+    if (stored && !replacing) {
+        std::string hint;
+        for (const ui::WebProviderKey& k : ui::webProviderKeys())
+            if (k.provider == provider) { hint = k.hint; break; }
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
+        if (hint.empty())
+            ImGui::TextUnformatted("Your own key is stored for this account.");
+        else
+            ImGui::Text("Your own key is stored for this account (\xe2\x80\xa6%s).", hint.c_str());
+        ImGui::PopStyleColor();
+        dimText("Turns on this account use it directly and spend no Chudware credits.");
+        ImGui::BeginDisabled(busy);
+        if (ImGui::SmallButton("Replace##webkey")) replacing = true;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove##webkey")) ui::webProviderKeyDelete(provider);
+        ImGui::EndDisabled();
+    } else {
+        dimText("Paste your own API key. The server validates it with the provider, then stores it "
+                "encrypted against your account only \xe2\x80\x94 it is never shown again and "
+                "never reachable by another account on this server.");
+        ImGui::SetNextItemWidth(-1);
+        const bool submitted = ImGui::InputText(
+            "##webproviderkey", keyBuf, sizeof(keyBuf),
+            ImGuiInputTextFlags_Password | ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::BeginDisabled(busy || keyBuf[0] == '\0');
+        const bool clicked = ImGui::Button(busy ? "Validating\xe2\x80\xa6" : "Validate and save",
+                                           ImVec2(-1, 0));
+        ImGui::EndDisabled();
+        if ((submitted || clicked) && !busy && keyBuf[0] != '\0') {
+            ui::webProviderKeySave(provider, keyBuf);
+            // Never leave the secret sitting in an ImGui buffer past the request that needs it.
+            std::memset(keyBuf, 0, sizeof(keyBuf));
+            // The outcome lands in the status line below either way; a rejection leaves any
+            // previously stored key intact, so returning to the stored row is not a lie.
+            replacing = false;
+        }
+        if (stored && ImGui::SmallButton("Keep the stored key##webkey")) replacing = false;
+    }
+
+    const std::string& status = ui::webProviderKeyStatus();
+    if (!status.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(
+            ui::webProviderKeyStatusIsError() ? ui::palette.statusErr : ui::palette.statusOk));
+        ImGui::TextWrapped("%s", status.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
+// Every provider card routes its credential copy through here, which is why the web path is
+// installed at this one seam: all of them gain the working form at once.
+//
+// Desktop: the AI tab never holds credentials. Settings -> Providers validates a key and the OMP
+// AuthStorage flow persists it, so this is the pointer to that tab.
+//
+// Web: that tab cannot work. It drives agent_provider_* RPCs, which the gateway refuses for every
+// account that is not an admin (Webservice/gateway/engine_bridge.py), and a credential written
+// through it would land in the ONE shared daemon's auth db belonging to the operator rather than
+// to the signed-in account. The account-scoped endpoint is the browser's real path, so on web
+// this draws that form instead of a link to a locked door.
 static void drawValidatedCredentialHint(AppState& st, const char* detail) {
+    if (ui::webProviderKeysAvailable()) {
+        drawWebProviderKeyForm(st);
+        return;
+    }
     dimText(detail);
     if (ImGui::SmallButton("Manage validated credentials##provider_credentials")) {
         st.openSettings = true;
@@ -265,6 +355,11 @@ static void drawValidatedCredentialHint(AppState& st, const char* detail) {
     }
 }
 
+// Free AI (FreeLLMAPI, github.com/tashfeenahmed/freellmapi) provider card — reused from BOTH
+// the classic Settings -> AI provider picker and the live Settings -> Providers tab. Endpoint
+// and model controls remain here; credentials never do. All keys are validated and stored by
+// the OMP AuthStorage flow in Settings -> Providers.
+// Returns true when a non-credential field changed (caller saves).
 bool drawFreeAiProviderCard(AppState& st) {
     Settings& s = st.settings;
     const float S = ui::uiScale;
@@ -614,6 +709,14 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                     : "API keys are no longer pasted into the AI tab. Add one under Settings \xe2\x86\x92 Providers; it is saved only after the provider validates it.");
     } else if (s.provider == ui::PROV_FREELLMAPI) {
         if (drawFreeAiProviderCard(st)) changed = true;
+    } else if (s.provider == ui::PROV_XAI && ui::webGapReason("account_signin")) {
+        // Web: the device-code flow signs the ONE shared engine process into an xAI account, so a
+        // tenant clicking it either hands the operator their subscription or overwrites the
+        // operator's for everybody. The gateway now refuses subscription_* for non-admins
+        // (engine_bridge.py), so the button could only fail — it is not drawn at all.
+        dimText(ui::webGapReason("account_signin"));
+        drawWebProviderKeyForm(st);
+        if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (s.provider == ui::PROV_XAI) {
         // xAI: SuperGrok / X Premium+ device-code OAuth AND/OR classic API key (console.x.ai).
         // Sign-in uses subscription_login{provider:"xai",device:true}; GUI polls subscription_status.
@@ -1292,6 +1395,10 @@ static void pollSubConnected(AppState& st) {
 #ifdef __EMSCRIPTEN__
     wasmKickHostProvidersFetch();
 #endif
+    // On web GET /api/providers already reports host-shared subscription presence, scrubbed of
+    // operator identity. The raw RPC is now refused for non-admin accounts (engine_bridge.py), so
+    // polling it every two seconds would only log a refusal per tick and learn nothing.
+    if (ui::webBuild()) return;
     if (s_subConn.inFlight || (now - s_subConn.lastPoll) < 2.0) return;
     s_subConn.lastPoll = now;
     s_subConn.inFlight = true;
@@ -1334,6 +1441,12 @@ bool providerUsable(AppState& st, int provider) {
             break;
         default: break;
     }
+    // A credential this account posted to the gateway is proof too, and on web it is the only
+    // credential the user CAN supply: the local key buffers live in a browser IDBFS config.json
+    // the shared engine never reads. Without this the BYOK web user stored a validated key and
+    // still watched every model stay greyed out.
+    const std::string accountKey = ui::webProviderKeyName(provider, st.settings.baseUrl);
+    if (!accountKey.empty() && ui::webProviderKeyPresent(accountKey)) return true;
     switch (provider) {
         case ui::PROV_GEMINI:
             return st.settings.geminiKey[0] != 0 || s_subConn.hostGemini;
@@ -1359,14 +1472,18 @@ bool providerUsable(AppState& st, int provider) {
     return false;
 }
 
+// Both gate picker rows on "is there a credential for this cloud slot at all", so both must also
+// see a key this account posted to the gateway — on web that is the only one it can have.
 bool cloudCompatKeyPresent(AppState& st) {
     pollSubConnected(st);
-    return st.settings.cloudKey[0] != 0 || s_subConn.hostCloud;
+    return st.settings.cloudKey[0] != 0 || s_subConn.hostCloud ||
+           ui::webProviderKeyPresent("openrouter");
 }
 
 bool moonshotKeyPresent(AppState& st) {
     pollSubConnected(st);
-    return st.settings.moonshotKey[0] != 0 || s_subConn.hostMoonshot;
+    return st.settings.moonshotKey[0] != 0 || s_subConn.hostMoonshot ||
+           ui::webProviderKeyPresent("moonshot");
 }
 
 // ============================ OMP bridge model catalog + session cost (S-UI-PROV) ===

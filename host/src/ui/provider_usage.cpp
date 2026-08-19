@@ -12,6 +12,7 @@
 #include "core/app_state.h"
 #include "model_registry.h"
 #include "ui_theme.h"
+#include "web_capabilities.h"  // ui::webBuild — subscription_* is admin-only over the web bridge
 
 namespace ui {
 namespace {
@@ -176,8 +177,13 @@ void parseBridgeWindows(const nlohmann::json& wins, std::vector<UsageWindow>& ou
 
 // ---- polling -----------------------------------------------------------------------------------
 
+// Subscription accounts and usage describe the OPERATOR's subscriptions: on web there is one
+// shared engine process, so the gateway refuses subscription_* for any non-admin account
+// (Webservice/gateway/engine_bridge.py). Returning here keeps the browser from re-asking on every
+// TTL tick and logging a refusal each time; the surfaces that consume this model already render
+// their "unavailable" path on an empty model.
 void providerUsagePollUsage(AppState& st, bool force) {
-    if (g.rpcMissing) return;
+    if (g.rpcMissing || webBuild()) return;
     const double now = ImGui::GetTime();
     if (!force && (now - g.lastUsagePoll) < kUsageTtlSec) return;
     if (g.usageInFlight) return;
@@ -236,6 +242,7 @@ void providerUsagePollBridge(AppState& st, const char* bridgeProviderId, bool fo
 }
 
 void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {
+    if (webBuild()) return;  // operator-owned; refused for non-admins over the web bridge
     const double now = ImGui::GetTime();
     if (!force && (now - g.lastAccountsPoll) < ttlSec) return;
     if (g.accountsInFlight) return;

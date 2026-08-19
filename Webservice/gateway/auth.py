@@ -408,14 +408,17 @@ class AuthMiddleware:
             user = self._resolve_user(email)
             return user, (email if from_query else None)
 
-        # Self-serve session cookie. Tried before Cloudflare Access, and skipped
-        # entirely when an Access assertion is present so an operator reaching
-        # /admin through Access is never shadowed by a stale user session.
-        cf_present = (
-            "cf-access-jwt-assertion" in headers or "CF_Authorization" in cookies
-        )
+        # The account store is the authority on identity and role, so the
+        # self-serve session cookie is the front door and is tried FIRST — even
+        # when a Cloudflare Access assertion rides along. Preferring the edge
+        # assertion instead meant any browser that had ever completed Access
+        # for the zone carried a CF_Authorization cookie that shadowed its live
+        # session on EVERY request, and was denied outright once that cookie
+        # expired or stopped matching cf_aud. Access remains a fallback
+        # credential for callers with no gateway session (and matches
+        # revalidate_websocket_user, which has always preferred the session).
         sid = cookies.get(authn.SESSION_COOKIE, "")
-        if sid and not cf_present:
+        if sid:
             session_email = authn.lookup_session(sid)
             if session_email:
                 try:

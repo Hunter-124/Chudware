@@ -296,9 +296,10 @@ Idempotent: rerun it to reset a forgotten password.
 
 Then sign in at `https://app.chudware.com/signin` and open `/admin`.
 
-`/admin` **also** sits behind Cloudflare Access, so that address must be in the
-Access allow policy too (`RUNBOOK.md` §(b)) — Access is the operator door, the
-gateway's own `role` check is the authorization.
+That `role` grant is the *whole* `/admin` allowlist: there is no Cloudflare Access
+policy to add the address to as well. If `/admin` shows a Cloudflare login page
+instead of the gateway's, the retired `app.chudware.com/admin*` Access application
+still exists — delete it in Zero Trust (`RUNBOOK.md` §(b)).
 
 ## 8. AI provider keys (server-side agent turns)
 

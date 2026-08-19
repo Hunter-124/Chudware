@@ -74,9 +74,12 @@ the Cloudflare Access edge into the gateway itself (`gateway/authn.py`,
   self-registered account can never be `admin`.
 - A login writes a **server-side session row** and sets the opaque
   `chudware_sid` cookie, so revoking the row logs that browser out at once.
-- Cloudflare Access is no longer the front door. It is kept in front of `/admin`
-  as the operator door, and there is no domain auto-approval knob anywhere —
-  the only paths to `active` are email verification and an admin approval.
+- Cloudflare Access is no longer a door at all — not to the site and, since
+  2026-08-19, not to `/admin` either. `/admin` takes a `chudware_sid` session whose
+  account row carries `role = 'admin'` (`python -m authn grant-admin`). Access is
+  only a fallback credential the gateway accepts from a caller with no session, and
+  there is no domain auto-approval knob anywhere — the only paths to `active` are
+  email verification and an admin approval.
 
 Admin API: `GET /api/admin/accounts`, `.../approve|deny|suspend|plan`,
 `GET /api/admin/accounts/pending-count`. Self-service: `GET /api/me/account`.
@@ -146,7 +149,7 @@ chudware.com, www.chudware.com  -> Cloudflare Pages (project chudware-site)
                                    PUBLIC. No Access. No tunnel. 23 pages.
 app.chudware.com                -> cloudflared tunnel -> 127.0.0.1:8300
                                    gateway's own authn is the front door
-app.chudware.com/admin          -> Cloudflare Access (SAME app, same AUD)
+app.chudware.com/admin          -> same gateway; chudware_sid + accounts.role='admin'
 ```
 
 What was applied, in the order it has to happen:
@@ -168,16 +171,20 @@ What was applied, in the order it has to happen:
 6. Apex, `www` and `sso.chudware.com` removed from the tunnel ingress, and the
    `sso` DNS record deleted — it pointed at an oauth2-proxy on `:8301` that no
    longer exists as a unit.
-7. Access scoped to `app.chudware.com/admin` on the *existing* app, so the AUD
-   is unchanged. A second app would mint a different AUD and the gateway
-   validates exactly one `CHUDWARE_WEB_CF_AUD`.
+7. Access scoped to `app.chudware.com/admin` on the *existing* app. **Superseded
+   2026-08-19:** that scoping is what made an operator meet Cloudflare's login
+   page instead of the gateway's, and any browser holding a stale
+   `CF_Authorization` cookie was 401'd while carrying a valid session.
+   `cf_provision.py` no longer provisions Access; delete the leftover
+   `app.chudware.com/admin*` application in Zero Trust.
 
 Verified from outside the LAN, anonymously, 28/28 checks: every marketing route
 200 with no Access redirect; `/signin`, `/signup` and `/healthz` 200 on the app
 host; `/`, `/workspace/list`, `/bucket`, `/api/me`, `/api/sessions`,
 `/api/provider-keys`, `/api/admin/*` and `/static/admin.js` all 401 to an
-anonymous caller; `/admin` redirects to the Access login; and a real password
-sign-in returns a `chudware_sid` session that reports `role: admin`.
+anonymous caller; and a real password sign-in returns a `chudware_sid` session
+that reports `role: admin`. The one check that changed on 2026-08-19: `/admin`
+now redirects to the gateway's `/signin?next=%2Fadmin`, not to the Access login.
 
 Use curl, not Python `urllib`, to re-run any of that. Cloudflare's bot
 protection 403s the default `Python-urllib` user agent, which is
@@ -191,8 +198,8 @@ chasing a security regression that is not there.
   shape before putting figures back.
 - **Stripe webhook bypass.** Not needed yet: Stripe is unconfigured, and
   `/api/billing/webhook` is in `PUBLIC_PATHS` so it is not gated by the app.
-  It is also outside the `/admin` Access scope, so no edge bypass is required
-  unless Access is ever widened back to the whole host.
+  No `/admin` Access scope exists to sit outside of any more, so no edge bypass is
+  required at all.
 - **`cad.scootware.us`** is already gone from Access and the tunnel ingress.
 - **Watch the queue.** Every registration is created `pending`; only email
   verification (which starts the trial) or an admin approval makes it `active`.

@@ -22,7 +22,7 @@ deployment that already has them.
 
 1. **Cloudflare API token**
    - Dashboard → My Profile → API Tokens → find/revoke the leaked token.
-   - Create a replacement with least privilege needed for `cf_provision.py` (Access apps, tunnels, DNS on `chudware.com`).
+   - Create a replacement with least privilege needed for `cf_provision.py` (tunnels, DNS on `chudware.com`) — it no longer touches Access applications, so that permission is not needed.
    - Store the new token **only** outside git (password manager / `~/chudware-web-data/secrets/`). Never re-commit.
 
 2. **R2 Access Key ID + Secret**
@@ -136,7 +136,7 @@ Do **not** hand-create these if provision already ran:
 | Staging ingress | `staging.chudware.com` → `http://127.0.0.1:8310` |
 | Catch-all ingress | `http_status:404` — no apex, www, `cad.scootware.us`, or `sso.chudware.com` origin route |
 | Pages DNS | `chudware.com`, `www.chudware.com` → `chudware-site.pages.dev` |
-| Access application | the one existing app, narrowed to `app.chudware.com/admin*`; one app means one gateway AUD |
+| Access application | **none.** `/admin` is gated by the gateway itself; provisioning neither creates nor rewrites an Access app, so there is no gateway AUD to keep unique |
 
 `cf_provision.py` is **driver-owned** and lands beside these deploy files — DeployOps does
 not implement it. It writes the gateway's Cloudflare values into
@@ -145,33 +145,45 @@ not implement it. It writes the gateway's Cloudflare values into
 the dedicated mode-600 file and removes it from the gateway environment:
 
 ```bash
-CHUDWARE_WEB_CF_TEAM_DOMAIN=https://bruh234324.cloudflareaccess.com
-CHUDWARE_WEB_CF_AUD=...          # the single Access Application AUD
-CHUDWARE_WEB_PUBLIC_BASE_URL=https://app.chudware.com
+CHUDWARE_WEB_PUBLIC_BASE_URL=https://app.chudware.com   # the only value provisioning writes
 sudo Webservice/deploy/harden_host.sh --apply tunnel
 ```
 
-Access is the operator door for `/admin`. When an Access credential is present the gateway verifies `Cf-Access-Jwt-Assertion` against team JWKS (`…/cdn-cgi/access/certs`) with `iss` = team domain and `aud` = `CHUDWARE_WEB_CF_AUD`. JWKS rotates ~every 6 weeks (previous key valid ~7 days) — always fetch remotely, match `kid`. Everyone else authenticates to the gateway itself (§c).
+The operator door for `/admin` is the account store: a `chudware_sid` session whose
+`accounts` row carries `role = 'admin'`, granted only by
+`python -m authn grant-admin` (§c). Cloudflare Access is a *fallback* credential the
+gateway still accepts from a caller with **no** session — set
+`CHUDWARE_WEB_CF_TEAM_DOMAIN` + `CHUDWARE_WEB_CF_AUD` by hand if you want it, and the
+gateway verifies `Cf-Access-Jwt-Assertion` against team JWKS
+(`…/cdn-cgi/access/certs`) with `iss` = team domain and `aud` = `CHUDWARE_WEB_CF_AUD`.
+JWKS rotates ~every 6 weeks (previous key valid ~7 days) — always fetch remotely,
+match `kid`. Leaving both unset is the supported configuration.
 
 ### Required cutover order — do not invert
 
-Narrowing Access first would expose the origin before its replacement login is
-known-good. Perform this cutover in order:
+Removing the Access wall in front of `/admin` before the gateway's own sign-in is
+known-good would expose the origin with no login at all. Perform this cutover in
+order:
 
-1. Deploy the gateway build while the existing broad Access application still
-   protects the origin.
+1. Deploy the gateway build while the existing Access application still protects
+   the origin.
 2. Through the origin or a temporary hosts override, register, verify, and sign
    in with the gateway's `chudware_sid` cookie. Confirm `/`, `/api/portal/account`,
    and `/app/` enforce that session and sign-out makes them inaccessible.
-3. Confirm an account with role `user` receives 403 at `/admin`, while an
-   `admin` account reaches it.
-4. Only after steps 1–3 pass, run
-   `python3 Webservice/deploy/cf_provision.py --emails <operators>`. It changes
-   ingress/DNS and rewrites the **same** Access application to
-   `app.chudware.com/admin*`; it must not create another application/AUD.
+3. Grant yourself the role and confirm it is the gate:
+   `cd Webservice/gateway && .venv/bin/python -m authn grant-admin --email <addr>`,
+   then check that this account reaches `/admin` while a `role = 'user'` account
+   receives 403 there.
+4. Only after steps 1–3 pass, run `python3 Webservice/deploy/cf_provision.py`. It
+   changes ingress/DNS/Pages only — it no longer touches Access at all, so the
+   leftover `app.chudware.com/admin*` application must be deleted by hand in the
+   Zero Trust dashboard, otherwise Cloudflare keeps showing its own login page in
+   front of the gateway's.
 5. From an incognito browser, re-check public marketing pages at the apex,
-   session-cookie login at `app.chudware.com`, Access plus gateway admin-role
-   enforcement at `/admin`, and staging isolation.
+   session-cookie login at `app.chudware.com`, an anonymous `GET /admin`
+   redirecting to `/signin?next=%2Fadmin` (not to `cloudflareaccess.com`),
+   admin-role enforcement at `/admin`, and staging isolation.
+   `Webservice/deploy/verify_public.sh` asserts exactly this.
 
 This repository change records the cutover but does **not** apply it to live
 Cloudflare.
@@ -179,13 +191,16 @@ Cloudflare.
 ### Hunter remaining manual steps
 
 1. **Rotate leaked API token + R2 keys** (§a) — do this before relying on any old token in scripts.
-2. **Optional Google IdP for the `/admin` door** (Access-side, not the site login):
-   - [Google Cloud Console](https://console.cloud.google.com/) → project → OAuth consent **External**.
-   - OAuth client type **Web**:
-     - Authorized JS origin: `https://bruh234324.cloudflareaccess.com`
-     - Redirect URI: `https://bruh234324.cloudflareaccess.com/cdn-cgi/access/callback`
-   - Zero Trust → Integrations → Identity providers → **Google** → paste Client ID/Secret → Test.
-3. **Edit the Access allowlist** (Access policy Include → Emails), via Zero Trust dashboard **or** API after the new token exists. This list is operators only — it decides who may reach `/admin`, not who may use the site. Prefer **exact emails** over whole domains.
+2. **Delete the `app.chudware.com/admin*` Access application** in Zero Trust →
+   Access → Applications. `cf_provision.py` deliberately stopped managing it, so
+   nothing in this repo will remove it for you, and while it exists Cloudflare
+   answers `/admin` with its own login page instead of the gateway's.
+3. **Grant the admin role** to each operator address, which is now the *whole*
+   `/admin` allowlist — there is no second list to keep in sync:
+   ```bash
+   cd Webservice/gateway && .venv/bin/python -m authn grant-admin --email <addr>
+   ```
+   Then sign in at `https://app.chudware.com/signin` and open `/admin`.
 
 ### Auth honesty (what a login actually proves)
 
@@ -194,8 +209,10 @@ OAuth if those client credentials are configured. Both prove control of an **ema
 or of a Google/GitHub account. Neither is Microsoft Entra / "sign in with your school
 Microsoft account", and nothing here is an institutional SSO — do not market it as one.
 
-Cloudflare Access One-Time PIN still guards `/admin`, and it proves the same thing: mailbox
-control for an address listed in the Access policy.
+`/admin` proves possession of a gateway session for an account whose `role` column an
+operator set from the CLI. That is a deliberate step someone with database access took,
+not a mailbox check — which is what the Cloudflare Access One-Time PIN in front of
+`/admin` used to prove, and the reason it was the wrong door.
 
 ---
 
@@ -216,8 +233,9 @@ GET  /api/auth/oauth/{google|github}/start | /callback
   opaque id, so revoking a row logs that browser out immediately. TTL
   `CHUDWARE_WEB_SESSION_TTL_DAYS` (30), trial window `CHUDWARE_WEB_TRIAL_DAYS` (14).
 - `CHUDWARE_WEB_SESSION_SECRET` must be set in `gateway.env`; outside `CHUDWARE_WEB_DEV=1`
-  the gateway refuses to start without it unless CF Access is fully configured. Generate
-  one with `python3 -c 'import secrets;print(secrets.token_urlsafe(48))'`. Optional
+  the gateway refuses to start without it unless the optional CF Access fallback is
+  fully configured. Generate one with
+  `python3 -c 'import secrets;print(secrets.token_urlsafe(48))'`. Optional
   `CHUDWARE_WEB_GOOGLE_CLIENT_ID`/`_SECRET` and `CHUDWARE_WEB_GITHUB_CLIENT_ID`/`_SECRET`
   enable the OAuth buttons.
 - These endpoints are **API-only today** — the hosted sign-in form and marketing page are
@@ -239,8 +257,8 @@ GET  /api/auth/oauth/{google|github}/start | /callback
   It prompts twice for the password (or reads one line from stdin with
   `--password-stdin`); the password never appears in argv. Idempotent — rerun it to
   reset a forgotten password. `role` has no HTTP writer by design, so this CLI is
-  the only way to grant it. `/admin` also sits behind Cloudflare Access, so that
-  address must be in the Access allow policy too.
+  the only way to grant it, and it is now the *only* gate on `/admin` — there is no
+  Access allow policy to add the address to as well.
 
 ---
 
@@ -299,26 +317,37 @@ running process as above, then parse the database name from that process's
 
 ## (e) Demo-day checklist
 
-- [ ] Secrets rotated; `gateway.env` has `CHUDWARE_WEB_CF_TEAM_DOMAIN`, `CHUDWARE_WEB_CF_AUD`, `CHUDWARE_WEB_SESSION_SECRET`; `cloudflared.env` has `TUNNEL_TOKEN` (both mode 600).
+- [ ] Secrets rotated; `gateway.env` has `CHUDWARE_WEB_SESSION_SECRET`; `cloudflared.env` has `TUNNEL_TOKEN` (both mode 600).
 - [ ] `bash Webservice/deploy/setup.sh` already run; linger enabled.
 - [ ] `systemctl --user start chudware-gateway chudware-cloudflared chudware-monitor.timer`
 - [ ] `curl -sS http://127.0.0.1:8300/healthz` — free RAM, VRAM, engine bridges look sane.
 - [ ] Every demo attendee has registered and verified (or you approved them at `/admin`).
 - [ ] Browser smoke: `https://app.chudware.com` → sign in → portal → `/app` loads.
 - [ ] Know the not-yet-approved path (the gateway's pending/denied status page) and the
-      Access deny page for `/admin`.
+      403 status page a non-admin account gets at `/admin`.
 - [ ] Confirm `REFUSE_NEW` is absent unless disk is actually critical: `ls ~/chudware-web-data/REFUSE_NEW`.
 
 ---
 
 ## (f) Troubleshooting
 
-### JWKS / 401 after Access login
+### JWKS / 401 after an Access login
+
+Only relevant when the optional Access fallback is configured; with it unset a caller
+with no session simply gets `/signin`.
 
 - Confirm `CHUDWARE_WEB_CF_AUD` matches Access app → Overview / Additional settings → Application Audience.
 - Team domain must be exactly `https://bruh234324.cloudflareaccess.com` (no trailing slash mismatch vs gateway config).
 - Force JWKS refresh: restart gateway after Access app recreation (AUD changes if app is recreated).
 - CF rotates Access signing keys ~6 weeks; gateway must use live JWKS URL, not a pinned PEM.
+
+### 401 or a Cloudflare login page at `/admin` while signed in
+
+- A Cloudflare login page means the old `app.chudware.com/admin*` Access application
+  still exists; delete it in Zero Trust (§b manual steps). The gateway no longer
+  provisions it, so nothing here removes it for you.
+- A 403 status page means the session is fine and the account's `role` is not `admin`:
+  run `python -m authn grant-admin --email <addr>` and reload.
 
 ### cloudflared not connecting
 
@@ -581,7 +610,7 @@ Desktop against the **shared** daemon (same engine the web client uses):
 | `Webservice/deploy/install_webd.sh` | Promote engine build and install hostd plus both gateway units |
 | `Webservice/deploy/chudware-gateway{,-staging}.service` | Production 8300 / staging 8310 systemd **user** units |
 | `Webservice/deploy/monitor.py` | Host sample + disk-pressure flag (stdlib) |
-| `Webservice/deploy/cf_provision.py` | Driver: tunnel/DNS/Access via API |
+| `Webservice/deploy/cf_provision.py` | Driver: tunnel/DNS/Pages via API — no Access application |
 | `~/chudware-web-data/gateway.env` | Production DB/session/Stripe/OAuth settings and hardened gateway flags (never commit) |
 | `~/chudware-web-data/cloudflared.env` | Tunnel token only; mode 600; loaded only by cloudflared |
 | `~/chudware-web-staging/gateway.env` | Staging DB/session secret, disabled attack surfaces, and test-only settings (never commit) |

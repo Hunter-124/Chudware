@@ -12,8 +12,8 @@ no pixel streaming, and no session manager: every signed-in account shares one
 
 ```mermaid
 flowchart LR
-  B[Browser: WASM /app] -->|HTTPS/WSS| CF[Cloudflare Tunnel\nsole ingress; Access gates /admin only]
-  CF -->|chudware_sid session cookie| GW[Gateway: FastAPI on 127.0.0.1:8300\nself-serve auth + /engine bridge + workspace/bucket + chat WS + admin]
+  B[Browser: WASM /app] -->|HTTPS/WSS| CF[Cloudflare Tunnel\nsole ingress; no Access wall]
+  CF -->|chudware_sid session cookie| GW[Gateway: FastAPI on 127.0.0.1:8300\nself-serve auth + role='admin' gate on /admin + /engine bridge + workspace/bucket + chat WS]
   GW -->|unix socket, NDJSON-RPC| WD[(chudware-hostd\nONE shared daemon)]
   GW --> WS[(~/chudware-web-data/workspace/&lt;slug&gt;\nper-account trees)]
   GW --> PLM[(~/chudware-web-data/plm/*.git\ncentral bare vaults)]

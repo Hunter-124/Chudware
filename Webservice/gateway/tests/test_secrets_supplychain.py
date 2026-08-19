@@ -2,8 +2,8 @@
 
 Each test fails if the corresponding vulnerability is reintroduced:
 a file-backed allowlist back beside the account store, unpinned requirements,
-the cf_provision.py token file mode check removed, a personal --emails default
-restored, or live secrets pasted into DEPLOYMENT.md.
+the cf_provision.py token file mode check removed, a personal operator email
+hardcoded into cf_provision.py, or live secrets pasted into DEPLOYMENT.md.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import importlib.util
 import stat
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -78,14 +77,11 @@ def test_token_reads_owner_only_info_file(tmp_path, monkeypatch) -> None:
     assert mod.token() == "cfat_faketoken"
 
 
-def test_emails_has_no_personal_default(monkeypatch) -> None:
-    """--emails must be required; the hardcoded personal default must stay gone."""
+def test_no_personal_operator_email_is_hardcoded() -> None:
+    """cf_provision.py talks to a live Cloudflare account. A personal address
+    baked into it once became the default Access allowlist; the /admin* Access
+    application it fed is gone, but the file must still name nobody."""
     assert "haedmonds" not in CF_PROVISION.read_text(), "personal email default restored"
-    mod = _load_cf_provision()
-    monkeypatch.setattr(sys, "argv", ["cf_provision.py"])
-    with pytest.raises(SystemExit) as exc:
-        mod.main()
-    assert exc.value.code == 2  # argparse error: --emails required
 
 
 def test_deployment_md_contains_no_live_secrets() -> None:

@@ -40,8 +40,10 @@ constexpr WebGap kWebGaps[] = {
      "Vendor sign-in is desktop-only: it drives an embedded browser session the web "
      "app cannot host. Sign in from the desktop app."},
     {"account_signin",
-     "Account sign-in is desktop-only: the subscription token store runs in the "
-     "desktop app's engine worker, which the web build does not have."},
+     "Subscription sign-in is desktop-only. The web app's engine is one server process shared by "
+     "every account, so a subscription grant stored there would belong to the operator and to "
+     "everyone else at once. Paste your own provider API key instead \xe2\x80\x94 it is validated, "
+     "encrypted and used only for your account."},
     // Python-worker-only methods (contracts/web_parity.md web_unsupported).
     {"ecad_ai_design",
      "AI circuit design is desktop-only until the ECAD design orchestrator is ported "

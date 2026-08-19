@@ -7757,3 +7757,75 @@ display text, gradient primary buttons, ambient body washes. Fallbacks kept:
 prefers-reduced-motion parks the exact brand-pose frame (t=0), no-WebGL2 shows
 the static mark; verified headless Chrome desktop/mobile/reduced-motion/
 no-WebGL, zero console errors.
+
+**Web (2026-08-19): the account system is the /admin door, and provider login
+works in the browser.** Two owner-reported faults, one root cause each.
+(1) `AuthMiddleware._authenticate` computed `cf_present` from the mere PRESENCE
+of a `Cf-Access-Jwt-Assertion` header or `CF_Authorization` cookie and, when
+present, skipped the `chudware_sid` branch entirely — so every browser that had
+ever passed Cloudflare Access for the zone had its live session ignored on
+EVERY request and was hard-401'd ("invalid access token") once that CF cookie
+expired or stopped matching `cf_aud`, while holding a perfectly valid admin
+session. `revalidate_websocket_user` had always preferred the session, so the
+two disagreed. The session cookie is now tried first, unconditionally; Access
+survives only as a fallback for a caller with no session. Proven by restoring
+HEAD's `auth.py` under the new `tests/test_admin_account_door.py`: 4 of 6 cases
+fail 401 there and pass now. The edge half is `cf_provision.py`, which no longer
+provisions the `app.chudware.com/admin*` Access application or emits its AUD;
+`verify_public.sh` now asserts the gateway's own `303 -> /signin?next=%2Fadmin`.
+**The leftover Access application must be deleted by hand in Zero Trust** —
+Access runs before the origin, so until then Cloudflare still answers /admin.
+(2) Provider login in the WASM build had no working path at all. Every
+credential surface funnelled into `drawOmpProviderManager`'s `agent_provider_*`
+RPCs, which the gateway refuses for non-admins and which write into the ONE
+shared daemon's bridge AuthStorage anyway; `-32003` is not `unknown_method`, so
+`s_omp.available` stayed true and the legacy degrade section never drew. The
+sound mechanism — the gateway's account-scoped `/api/providers/keys` (validate,
+AES-256-GCM seal, resolve server-side for that account's turns) — had exactly
+one client in the repo: the portal's own JS page. New `ui/web_provider_keys.{h,cpp}`
+is an `emscripten_fetch` client for it (no-op off `__EMSCRIPTEN__`), Settings ->
+Providers routes to `drawWebAccountProviderManager` on web, `providerUsable` /
+`cloudCompatKeyPresent` / `moonshotKeyPresent` count an account key so a BYOK
+user's models are selectable, and `drawValidatedCredentialHint` draws the form
+instead of linking a locked door. Supported names are the six the gateway can
+validate, and each IS the wire provider a turn carries — that identity is what
+makes the stored key resolvable, so do not "tidy" it into a display name.
+Subscription sign-in is now honestly closed on web: `subscription_login/logout/
+switch/status/accounts/usage` are admin-only on the bridge
+(`_OPERATOR_SUBSCRIPTION_METHODS`) because two of five providers use a fixed
+server-loopback OAuth redirect a remote browser can never answer, and the status
+RPCs leak the operator identity `providers.py` deliberately scrubs; the client
+stops polling them under `webBuild()`. Verified in a real browser against a live
+daemon: pasting a key into Settings -> Providers surfaced OpenAI's own 401
+through the full WASM -> fetch -> gateway -> provider round trip.
+Third fault, same session: the WASM client would not load on an iPhone in
+Lockdown Mode (it worked on Android). Lockdown Mode disables WebAssembly in
+Safari, and `host/wasm/shell.html` had NO capability preflight — the browser
+downloaded ~12 MB and then either sat on "Loading Chudware…" or printed a raw
+`Exception: …` from `window.onerror`, with `Module.onAbort`/`setStatus`
+overwriting whatever was on screen. There is nothing to "fix" about Apple's
+policy, but Lockdown Mode is excludable per site, so the honest failure IS the
+deliverable. `shell.html` now preflights the three hard requirements —
+WebAssembly, SharedArrayBuffer + cross-origin isolation (the build links
+`-pthread -sPTHREAD_POOL_SIZE=8`), WebGL2 — names the missing one in a real
+full-screen panel with selectable text, and on an Apple UA leads with the
+per-site Lockdown exclusion steps. `setStatus` becomes a no-op once the panel is
+up so the module's own churn cannot bury the diagnosis, and
+`Module.instantiateWasm` is stubbed so the 11.6 MB `Chudware.wasm` is never
+fetched at all. Verified headless with `WebAssembly` deleted before page scripts,
+under both a desktop and an iPhone UA/viewport: panel renders, canvas hidden,
+only `Chudware.js` and `Chudware.data` on the wire.
+
+Suite note (pre-existing, fixed here because it hid the above): several gateway
+fixtures did `config.settings = config.load_settings()`, replacing the singleton
+that `auth`/`accounts`/`limits` had already bound `from config import settings`.
+Whether a test saw the live object depended on pytest's file order, and the
+symptoms were order-dependent rather than honest — `test_chat`'s WS broadcast
+blocked FOREVER (`AuthMiddleware.__init__`'s no-strong-auth fail-fast firing
+inside the message loop, so no frame was ever sent) and `test_auth_accounts_gate`
+failed "no strong auth configured" only when `test_accounts` ran first. Both
+reproduce on pristine HEAD from a two-file selection. `tests/conftest.py` now
+offers `reload_settings`, which re-reads Settings from the environment and
+monkeypatches it field-by-field ONTO the existing object; `test_accounts` and
+`test_chat` use it and no longer pop `config` out of `sys.modules`. Do not
+reintroduce a `config.settings = …` rebind in a fixture.

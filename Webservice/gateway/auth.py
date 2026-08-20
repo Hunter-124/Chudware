@@ -46,10 +46,18 @@ SUPPORT_EMAIL = "support@chudware.com"
 # /healthz is liveness. The Stripe webhook and desktop entitlement refresh cannot
 # present a session cookie; each verifies its own signed request before parsing
 # or trusting payload fields. /api/auth is the sign-in surface itself.
+#
+# The three release entries are soft-auth pass-throughs, NOT unguarded routes:
+#   base-version  genuinely anonymous (a rate-limited integer CI reads)
+#   ci            Bearer CHUDWARE_GATEWAY_RELEASE_TOKEN, enforced in the handler
+#                 because a CI runner has no browser session to present
+#   artifact      _may_download decides inside the route, so an entitlement
+#                 token works exactly as it already does for /api/releases/latest
 PUBLIC_PATHS = frozenset(
     {
         "/healthz", "/api/billing/webhook", "/api/entitlement/refresh",
         "/api/security/events", "/api/releases/latest", "/api/auth",
+        "/api/releases/base-version", "/api/releases/ci", "/api/releases/artifact",
         "/signin", "/signup", "/forgot", "/reset", "/auth-assets",
     }
 )

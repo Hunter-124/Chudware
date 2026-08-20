@@ -33,6 +33,146 @@
     return d.innerHTML;
   }
 
+  /* ---- tab shell: hash-routed panels (Dashboard/Releases/Accounts/Terminal/System) ---- */
+  var TABS = ["dashboard", "releases", "accounts", "terminal", "system"];
+  var shellEl = document.querySelector(".admin-shell");
+  var tabLinks = Array.prototype.slice.call(document.querySelectorAll(".admin-tab"));
+  var currentTab = null;
+  if (shellEl) shellEl.classList.add("js-tabs");
+
+  function tabFromHash() {
+    var name = String(location.hash || "").replace(/^#/, "");
+    return TABS.indexOf(name) >= 0 ? name : "dashboard";
+  }
+
+  // admin_terminal.js exports no fit hook on window.__wm, but it debounces a
+  // scheduleFit() off window "resize" (and a ResizeObserver on #term-host /
+  // #wm-root). The pane keeps its box while hidden, so a synthetic resize is
+  // the supported way to re-fit xterm and re-clamp WinBox after activation.
+  function fitTerminal() {
+    requestAnimationFrame(function () {
+      window.dispatchEvent(new Event("resize"));
+    });
+  }
+
+  function showTab(name) {
+    if (TABS.indexOf(name) < 0) name = "dashboard";
+    TABS.forEach(function (tab) {
+      var panel = document.getElementById("panel-" + tab);
+      if (panel) panel.classList.toggle("active", tab === name);
+    });
+    tabLinks.forEach(function (link) {
+      var on = link.getAttribute("data-tab") === name;
+      link.classList.toggle("active", on);
+      link.setAttribute("aria-selected", on ? "true" : "false");
+      // Narrow viewports scroll the tab strip; keep the active tab reachable.
+      if (on && link.scrollIntoView) link.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+    var changed = currentTab !== name;
+    currentTab = name;
+    if (name === "terminal") fitTerminal();
+    else if (changed && name === "dashboard") refreshDashboard();
+    else if (changed && name === "releases") refreshReleaseTables();
+  }
+
+  window.addEventListener("hashchange", function () { showTab(tabFromHash()); });
+  Array.prototype.forEach.call(document.querySelectorAll("[data-goto]"), function (btn) {
+    btn.addEventListener("click", function () {
+      location.hash = "#" + btn.getAttribute("data-goto");
+      showTab(tabFromHash());
+    });
+  });
+  // Initial routing happens at the bottom of this file: showTab() kicks off the
+  // panel's data load, and those loaders are declared further down.
+
+  /* ---- shared formatting ---- */
+  function fmtBytes(n) {
+    var v = Number(n);
+    if (!isFinite(v) || v < 0) return "\u2014";
+    if (v < 1024) return v + " B";
+    var units = ["KB", "MB", "GB", "TB"];
+    var i = 0;
+    v /= 1024;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return v.toFixed(v < 10 ? 2 : 1) + " " + units[i];
+  }
+
+  function fmtStamp(value) {
+    if (value == null || value === "") return "\u2014";
+    var d = new Date(value);
+    return isNaN(d.getTime()) ? String(value) : d.toLocaleString();
+  }
+
+  function shortHash(value, n) {
+    var s = String(value || "");
+    return s ? s.slice(0, n || 12) : "\u2014";
+  }
+
+  function platformLabel(row) {
+    return String(row.platform || "?") + "/" + String(row.arch || "?");
+  }
+
+  // The server flags these, but fall back to the raw columns so a stale gateway
+  // still renders honest badges instead of claiming evidence is missing.
+  var EVIDENCE_COLUMNS = [
+    "commit_sha", "sbom_key", "sbom_sha256", "sbom_signature_key", "sbom_signature_sha256",
+    "provenance_key", "provenance_sha256", "provenance_signature_key",
+    "provenance_signature_sha256", "platform_test_key", "platform_test_sha256",
+    "platform_test_signature_key", "platform_test_signature_sha256"
+  ];
+  function evidenceComplete(row) {
+    if (typeof row.evidence_complete === "boolean") return row.evidence_complete;
+    return EVIDENCE_COLUMNS.every(function (col) {
+      return row[col] != null && row[col] !== "";
+    });
+  }
+  function hasStablePair(row) {
+    if (typeof row.has_stable_pair === "boolean") return row.has_stable_pair;
+    return Boolean(row.stable_version && row.stable_signature);
+  }
+
+  /* ---- shared release-manifest fetch: dashboard, table and manual card ---- */
+  var manifestCache = { at: 0, promise: null };
+  var manifestReloaders = [];
+
+  function fetchManifests() {
+    var now = Date.now();
+    if (manifestCache.promise && now - manifestCache.at < 2500) return manifestCache.promise;
+    manifestCache.at = now;
+    manifestCache.promise = api("/api/admin/release-manifests").then(function (rows) {
+      return Array.isArray(rows) ? rows : (rows && rows.releases) || [];
+    });
+    return manifestCache.promise;
+  }
+
+  function reloadManifestViews() {
+    manifestCache.promise = null;
+    manifestReloaders.forEach(function (fn) { fn(); });
+  }
+
+  function fetchCiBuilds(limit) {
+    return api("/api/admin/ci/builds?limit=" + (limit || 20)).then(function (rows) {
+      return Array.isArray(rows) ? rows : (rows && rows.builds) || [];
+    });
+  }
+
+  var CI_STATUS_CLASS = {
+    published: "st-active",
+    failed: "st-denied",
+    queued: "st-pending",
+    building: "st-running",
+    testing: "st-running",
+    packaging: "st-running",
+    publishing: "st-running"
+  };
+  function ciPill(status) {
+    var key = String(status || "").toLowerCase();
+    var span = document.createElement("span");
+    span.className = "pill " + (CI_STATUS_CLASS[key] || "st-unknown");
+    span.textContent = key || "unknown";
+    return span;
+  }
+
   var SAFE_REASON_LABELS = {
     integrity_violation: "App integrity issue",
     identity_mismatch: "Device identity changed",
@@ -57,6 +197,7 @@
     var appeals = payload.appeals || [];
     var pending = appeals.filter(function (appeal) { return appeal.state === "pending"; }).length;
     var badge = document.getElementById("appeal-pending"); badge.textContent = pending ? pending + " pending" : ""; badge.hidden = !pending;
+    setDashNumber("dash-appeals-pending", pending);
     host.innerHTML = "";
     if (!appeals.length) { host.innerHTML = "<p class='ac-dim'>No security appeals.</p>"; return; }
     appeals.forEach(function (appeal) {
@@ -142,6 +283,7 @@
     var v = Number(n) || 0;
     pendingEl.textContent = v ? v + " pending" : "";
     pendingEl.hidden = !v;
+    setDashNumber("dash-accounts-pending", v);
   }
 
   async function act(email, action, verb) {
@@ -575,8 +717,8 @@
 
   /* ---- deploy: rebuild / redeploy ---- */
   (function initDeploy() {
-    var side = document.querySelector(".admin-side");
-    if (!side) return;
+    var mount = document.getElementById("deploy-mount");
+    if (!mount) return;
 
     var card = document.createElement("div");
     card.className = "admin-card deploy-card";
@@ -599,15 +741,7 @@
       "</div>" +
       "<pre class='deploy-log' id='deploy-log'>(no deploy log yet)</pre>";
 
-    // Insert right after the first admin-card (Host health).
-    var firstCard = side.querySelector(".admin-card");
-    if (firstCard && firstCard.nextSibling) {
-      side.insertBefore(card, firstCard.nextSibling);
-    } else if (firstCard) {
-      firstCard.insertAdjacentElement("afterend", card);
-    } else {
-      side.appendChild(card);
-    }
+    mount.appendChild(card);
 
     var statusPill = document.getElementById("deploy-status");
     var logPre = document.getElementById("deploy-log");
@@ -822,10 +956,10 @@
       });
       await api("/api/admin/release-manifests?" + query.toString(), { method: "DELETE" });
       status.textContent = "Manifest deleted.";
-      await loadManifests();
+      reloadManifestViews();
     }
     async function loadManifests() {
-      var rows = await api("/api/admin/release-manifests");
+      var rows = await fetchManifests();
       list.textContent = "";
       if (!rows.length) {
         list.appendChild(document.createTextNode("No customer release manifests published."));
@@ -861,32 +995,36 @@
           method: "POST", body: JSON.stringify(payload())
         });
         status.textContent = "Manifest saved.";
-        await loadManifests();
+        reloadManifestViews();
       } catch (e) {
         status.textContent = e.message || String(e);
       }
     });
-    loadManifests().catch(function (e) {
-      list.textContent = "Failed to load manifests: " + (e.message || e);
-    });
+    function reloadManualList() {
+      loadManifests().catch(function (e) {
+        list.textContent = "Failed to load manifests: " + (e.message || e);
+      });
+    }
+    manifestReloaders.push(reloadManualList);
+    reloadManualList();
   })();
 
-  /* ---- releases: installer downloads for testing ---- */
+  /* ---- installer files: raw uploads on the gateway host ---- */
   (function initReleases() {
-    var side = document.querySelector(".admin-side");
-    if (!side) return;
+    var mount = document.getElementById("releases-files-mount");
+    if (!mount) return;
 
     var card = document.createElement("div");
     card.className = "admin-card releases-card";
     card.innerHTML =
-      "<h2>Releases</h2>" +
+      "<h2>Installer files</h2>" +
       "<div class='releases-list' id='releases-list'>Loading…</div>" +
       "<div class='release-upload'>" +
         "<input type='file' id='release-file' />" +
         "<button type='button' class='btn ghost' id='release-upload-btn'>Upload</button>" +
         "<span class='release-upload-status' id='release-upload-status'></span>" +
       "</div>";
-    side.appendChild(card);
+    mount.appendChild(card);
 
     var listEl = document.getElementById("releases-list");
     var fileEl = document.getElementById("release-file");
@@ -1249,4 +1387,311 @@
 
     reloadAccounts();
   })();
+
+  /* ---- dashboard aggregates ---- */
+  function setDashNumber(id, value) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = value == null ? "\u2014" : String(value);
+  }
+
+  function dashList(id) {
+    var host = document.getElementById(id);
+    if (host) { host.textContent = ""; host.className = "dash-list"; }
+    return host;
+  }
+
+  function dashMessage(id, text, isErr) {
+    var host = document.getElementById(id);
+    if (!host) return;
+    host.textContent = text;
+    host.className = "dash-list ac-dim" + (isErr ? " err" : "");
+  }
+
+  function dashItem(host, who, what, pill) {
+    var row = document.createElement("div");
+    row.className = "dash-item";
+    var left = document.createElement("div");
+    var name = document.createElement("div");
+    name.className = "dash-who";
+    name.textContent = who;
+    left.appendChild(name);
+    if (what) {
+      var meta = document.createElement("div");
+      meta.className = "dash-what";
+      meta.textContent = what;
+      left.appendChild(meta);
+    }
+    row.appendChild(left);
+    if (pill) row.appendChild(pill);
+    host.appendChild(row);
+  }
+
+  // Newest row wins per bucket; the endpoints already order newest-first.
+  function latestPerKey(rows, keyOf) {
+    var seen = Object.create(null);
+    var out = [];
+    rows.forEach(function (row) {
+      var key = keyOf(row);
+      if (seen[key]) return;
+      seen[key] = true;
+      out.push(row);
+    });
+    return out;
+  }
+
+  async function dashLoadReleases() {
+    var rows = await fetchManifests();
+    var host = dashList("dash-releases");
+    if (!host) return;
+    if (!rows.length) {
+      dashMessage("dash-releases", "Nothing published yet.");
+      return;
+    }
+    latestPerKey(rows, function (row) {
+      return row.channel + "|" + row.platform + "|" + row.arch;
+    }).slice(0, 8).forEach(function (row) {
+      var pill = document.createElement("span");
+      pill.className = "pill " + (row.channel === "stable" ? "st-active" : "st-pending");
+      pill.textContent = row.channel;
+      dashItem(host,
+        row.version + " \u00b7 " + platformLabel(row),
+        fmtBytes(row.size) + " \u00b7 " + fmtStamp(row.published_at),
+        pill);
+    });
+  }
+
+  async function dashLoadCi() {
+    var builds = await fetchCiBuilds(50);
+    var host = dashList("dash-ci");
+    if (!host) return;
+    if (!builds.length) {
+      dashMessage("dash-ci", "No CI builds reported yet.");
+      return;
+    }
+    latestPerKey(builds, function (build) {
+      return build.platform + "|" + build.arch;
+    }).slice(0, 8).forEach(function (build) {
+      dashItem(host,
+        platformLabel(build) + " \u00b7 " + (build.version || "?"),
+        "run " + shortHash(build.run_id, 10) + " \u00b7 " + shortHash(build.commit_sha, 8) +
+          " \u00b7 " + fmtStamp(build.updated_at),
+        ciPill(build.status));
+    });
+  }
+
+  async function dashLoadAccounts() {
+    // limit=1 keeps this cheap: only the unfiltered totals are wanted here.
+    var data = await api("/api/admin/accounts?limit=1");
+    setDashNumber("dash-accounts-total", Number(data.total) || 0);
+    setDashNumber("dash-accounts-pending", Number(data.pending) || 0);
+  }
+
+  async function dashLoadAppeals() {
+    var payload = await api("/api/admin/security/appeals");
+    var appeals = (payload && payload.appeals) || [];
+    setDashNumber("dash-appeals-pending", appeals.filter(function (appeal) {
+      return appeal.state === "pending";
+    }).length);
+  }
+
+  function refreshDashboard() {
+    if (!document.getElementById("panel-dashboard")) return;
+    dashLoadReleases().catch(function (e) {
+      dashMessage("dash-releases", "Couldn't load releases: " + (e.message || e), true);
+    });
+    dashLoadCi().catch(function (e) {
+      dashMessage("dash-ci", "Couldn't load CI builds: " + (e.message || e), true);
+    });
+    dashLoadAccounts().catch(function () {});
+    dashLoadAppeals().catch(function () {});
+  }
+
+  /* ---- releases tab: published manifests (with promote) + CI builds ---- */
+  function relStatus(msg, isErr) {
+    var el = document.getElementById("rel-status");
+    if (!el) return;
+    el.textContent = msg || "";
+    el.className = isErr ? "ac-dim err" : "ac-dim";
+  }
+
+  function tableMessage(tbody, cols, text, isErr) {
+    tbody.innerHTML = "";
+    var tr = document.createElement("tr");
+    if (isErr) tr.className = "row-err";
+    var td = document.createElement("td");
+    td.colSpan = cols;
+    td.className = isErr ? "" : "ac-dim";
+    td.textContent = text;
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+
+  async function promoteRelease(row) {
+    var target = row.stable_version || "the paired stable version";
+    if (!window.confirm(
+          "Promote " + row.version + " (" + platformLabel(row) + ") to the stable channel as " +
+          target + "?\n\nEvery customer on stable will be offered this build.")) return false;
+    relStatus("Promoting " + row.version + " \u2192 " + target + " \u2026");
+    var created = await api("/api/admin/releases/promote", {
+      method: "POST",
+      body: JSON.stringify({
+        channel: "beta", version: row.version,
+        platform: row.platform, arch: row.arch
+      })
+    });
+    relStatus("Published stable " + ((created && created.version) || target) + " for " +
+              platformLabel(row) + ".");
+    return true;
+  }
+
+  async function deleteRelease(row) {
+    if (!window.confirm("Delete the " + row.channel + " " + row.version + " " +
+                        platformLabel(row) + " manifest?")) return false;
+    var query = new URLSearchParams({
+      channel: row.channel, version: row.version,
+      platform: row.platform, arch: row.arch
+    });
+    relStatus("Deleting " + row.channel + " " + row.version + " \u2026");
+    await api("/api/admin/release-manifests?" + query.toString(), { method: "DELETE" });
+    relStatus("Manifest deleted.");
+    return true;
+  }
+
+  function releaseActions(row) {
+    var host = document.createElement("div");
+    host.className = "ac-actions";
+    var evidence = evidenceComplete(row);
+    var pair = hasStablePair(row);
+    if (row.channel === "beta") {
+      if (pair && evidence) {
+        host.appendChild(actionBtn("Promote to stable", "btn primary", function () {
+          promoteRelease(row).then(function (done) {
+            if (done) reloadManifestViews();
+          }).catch(function (e) {
+            relStatus("Promote failed: " + (e.message || e), true);
+          });
+        }));
+      } else {
+        var why = document.createElement("span");
+        why.className = "ac-dim";
+        why.style.fontSize = ".74rem";
+        why.textContent = !pair ? "no stable signature pair" : "evidence incomplete";
+        why.title = "Only CI-signed beta builds carrying both signatures and the full " +
+                    "evidence bundle can be promoted.";
+        host.appendChild(why);
+      }
+    }
+    host.appendChild(actionBtn("Delete", "rm-btn", function () {
+      deleteRelease(row).then(function (done) {
+        if (done) reloadManifestViews();
+      }).catch(function (e) {
+        relStatus("Delete failed: " + (e.message || e), true);
+      });
+    }));
+    return host;
+  }
+
+  function renderReleaseRows(tbody, rows) {
+    tbody.innerHTML = "";
+    rows.forEach(function (row) {
+      var tr = document.createElement("tr");
+      var evidence = evidenceComplete(row);
+      tr.innerHTML =
+        "<td><span class='pill " + (row.channel === "stable" ? "st-active" : "st-pending") + "'>" +
+          esc(row.channel) + "</span></td>" +
+        "<td>" + esc(row.version) +
+          (hasStablePair(row) && row.channel === "beta"
+            ? "<span class='pair-badge' title='Signed stable pair ready'>\u2192 " +
+              esc(row.stable_version || "stable") + "</span>"
+            : "") + "</td>" +
+        "<td>" + esc(platformLabel(row)) + "</td>" +
+        "<td class='col-num'>" + esc(fmtBytes(row.size)) + "</td>" +
+        "<td class='col-mono' title='" + esc(row.sha256) + "'>" + esc(shortHash(row.sha256, 12)) + "</td>" +
+        "<td><span class='evi-badge " + (evidence ? "ok" : "missing") + "'>" +
+          (evidence ? "complete" : "missing") + "</span></td>" +
+        "<td class='col-when'>" + esc(fmtStamp(row.published_at)) + "</td>" +
+        "<td class='col-act'></td>";
+      tr.querySelector(".col-act").appendChild(releaseActions(row));
+      tbody.appendChild(tr);
+    });
+  }
+
+  async function loadReleaseTable() {
+    var tbody = document.getElementById("rel-rows");
+    if (!tbody) return;
+    var rows = await fetchManifests();
+    if (!rows.length) {
+      tableMessage(tbody, 8, "No customer release manifests published.");
+      return;
+    }
+    renderReleaseRows(tbody, rows);
+  }
+
+  async function loadCiTable() {
+    var tbody = document.getElementById("ci-rows");
+    if (!tbody) return;
+    var builds = await fetchCiBuilds(30);
+    if (!builds.length) {
+      tableMessage(tbody, 7, "No CI builds reported yet.");
+      return;
+    }
+    tbody.innerHTML = "";
+    builds.forEach(function (build) {
+      var tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td class='col-mono' title='" + esc(build.run_id) + "'>" + esc(shortHash(build.run_id, 10)) + "</td>" +
+        "<td>" + esc(platformLabel(build)) + "</td>" +
+        "<td>" + esc(build.version || "\u2014") + "</td>" +
+        "<td class='col-pill'></td>" +
+        "<td class='col-mono' title='" + esc(build.commit_sha) + "'>" + esc(shortHash(build.commit_sha, 8)) + "</td>" +
+        "<td class='col-when'>" + esc(fmtStamp(build.updated_at)) + "</td>" +
+        "<td class='col-detail'>" + esc(build.detail || "") + "</td>";
+      tr.querySelector(".col-pill").appendChild(ciPill(build.status));
+      tbody.appendChild(tr);
+    });
+  }
+
+  function refreshReleaseTables() {
+    var relBody = document.getElementById("rel-rows");
+    if (relBody) {
+      loadReleaseTable().catch(function (e) {
+        tableMessage(relBody, 8, "Couldn't load release manifests: " + (e.message || e), true);
+      });
+    }
+    var ciBody = document.getElementById("ci-rows");
+    if (ciBody) {
+      loadCiTable().catch(function (e) {
+        tableMessage(ciBody, 7, "Couldn't load CI builds: " + (e.message || e), true);
+      });
+    }
+  }
+
+  (function initReleaseTables() {
+    if (!document.getElementById("rel-rows")) return;
+    manifestReloaders.push(function () {
+      var relBody = document.getElementById("rel-rows");
+      loadReleaseTable().catch(function (e) {
+        if (relBody) tableMessage(relBody, 8, "Couldn't load release manifests: " + (e.message || e), true);
+      });
+      refreshDashboard();
+    });
+    var relRefresh = document.getElementById("rel-refresh");
+    if (relRefresh) relRefresh.addEventListener("click", function () {
+      manifestCache.promise = null;
+      relStatus("");
+      refreshReleaseTables();
+    });
+    var ciRefresh = document.getElementById("ci-refresh");
+    if (ciRefresh) ciRefresh.addEventListener("click", function () {
+      var ciStatus = document.getElementById("ci-status");
+      if (ciStatus) ciStatus.textContent = "";
+      loadCiTable().catch(function (e) {
+        if (ciStatus) { ciStatus.textContent = e.message || String(e); ciStatus.className = "ac-dim err"; }
+      });
+    });
+    // The tables load on first activation of the Releases tab (see showTab).
+  })();
+
+  // Route now that every panel loader above exists.
+  showTab(tabFromHash());
 })();

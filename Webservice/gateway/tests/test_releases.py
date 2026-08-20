@@ -79,6 +79,8 @@ def test_anonymous_and_bad_entitlement_receive_byte_identical_metadata(
 def test_valid_entitlement_gets_fifteen_minute_presigned_download(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    for name in releases._R2_ENV:
+        monkeypatch.setenv(name, "configured")
     monkeypatch.setattr(releases, "_active_entitlement", lambda token: token == "valid")
     monkeypatch.setattr(releases, "_presigned_url", lambda _key: "https://r2.example/signed")
     response = client.get(
@@ -90,20 +92,41 @@ def test_valid_entitlement_gets_fifteen_minute_presigned_download(
     assert response.headers["cache-control"] == "private, no-store"
 
 
-def test_authenticated_download_fails_actionably_when_r2_is_unconfigured(
+def test_authenticated_download_falls_back_to_this_host_when_r2_is_absent(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """No CDN credential is a supported deployment, not a broken one.
+
+    Answering 503 here left a complete, correctly signed release undownloadable
+    and every updater permanently stuck, so the gateway now points at its own
+    artifact route instead.
+    """
     monkeypatch.setattr(releases, "_active_entitlement", lambda _token: True)
-    for name in ("R2_ENDPOINT", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"):
+    for name in releases._R2_ENV:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("CHUDWARE_RELEASES_PUBLIC_BASE_URL", raising=False)
     response = client.get(
         "/api/releases/latest?channel=stable&platform=linux&arch=x86_64",
         headers={"X-Chudware-Entitlement": "valid"},
     )
-    assert response.status_code == 503
-    assert "R2_ENDPOINT" in response.json()["detail"]
-    assert "R2_ACCESS_KEY_ID" in response.json()["detail"]
-    assert "R2_SECRET_ACCESS_KEY" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["url"] == (
+        "https://app.chudware.com/api/releases/artifact/"
+        "stable/1.2.0/Chudware-1.2.0-linux-x86_64.AppImage"
+    )
+    assert response.headers["cache-control"] == "private, no-store"
+
+
+def test_presigned_url_still_names_every_missing_r2_variable(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in releases._R2_ENV:
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(Exception) as error:
+        releases._presigned_url("stable/1.2.0/artifact")
+    assert getattr(error.value, "status_code", None) == 503
+    for name in releases._R2_ENV:
+        assert name in error.value.detail
 
 
 def test_publish_is_bearer_gated_and_idempotent(

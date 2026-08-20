@@ -773,9 +773,15 @@ jobs:
           [IO.File]::WriteAllText($key, ($env:GATEWAY_SSH_KEY -replace "`r`n", "`n").TrimEnd() + "`n", (New-Object Text.ASCIIEncoding))
           [IO.File]::WriteAllText($known, ($env:GATEWAY_HOST_KEY -replace "`r`n", "`n").TrimEnd() + "`n", (New-Object Text.ASCIIEncoding))
           # The runner account must be the key file's only reader or ssh refuses it.
-          & icacls $key /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
+          # Grant by SID: under a service account $env:USERNAME is the machine
+          # account (HOST$), which icacls cannot resolve.
+          $meSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          & icacls $key /inheritance:r /grant:r "*${meSid}:(R)" | Out-Null
           "GATEWAY_SSH_KEY_FILE=$key" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "GATEWAY_KNOWN_HOSTS=$known" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # GITHUB_ENV only reaches LATER steps; this step uses the values too.
+          $env:GATEWAY_SSH_KEY_FILE = $key
+          $env:GATEWAY_KNOWN_HOSTS = $known
 
           # The publish/status helper runs ON the gateway box: the release token is
           # read there, used against 127.0.0.1:8300, and never crosses the network.

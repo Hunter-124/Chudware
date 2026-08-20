@@ -1,0 +1,88 @@
+# One-shot / on-demand provisioning for the self-hosted Windows packaging runner.
+# The nightly windows-beta job fails loudly when a prerequisite is missing; this
+# workflow installs them (user-level, no system-wide changes beyond Inno Setup)
+# and prints a capability report at the end. Safe to re-run: every step is
+# idempotent and skips anything already present.
+name: runner-provision
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: windows runner label set to provision
+        required: true
+        type: choice
+        options: [cc-win-package]
+
+permissions:
+  contents: read
+
+jobs:
+  provision-windows:
+    name: Provision Windows packaging runner
+    runs-on: [self-hosted, Windows, X64, cloudcastle-ci, "${{ inputs.runner_label }}"]
+    timeout-minutes: 60
+    steps:
+      - name: Install Bun if missing
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Get-Command bun -ErrorAction SilentlyContinue) {
+            Write-Host "bun already present: $(bun --version)"
+          } else {
+            Write-Host "installing bun user-level..."
+            powershell -NoProfile -ExecutionPolicy Bypass -Command "irm bun.sh/install.ps1 | iex"
+            $bunBin = Join-Path $env:USERPROFILE '.bun\bin'
+            if (Test-Path (Join-Path $bunBin 'bun.exe')) {
+              Add-Content $env:GITHUB_PATH $bunBin
+              # Persist for FUTURE runs: the runner service PATH only picks up
+              # the user PATH on service restart, so also drop a machine-wide
+              # shim dir that is already on the runner PATH if one exists.
+              [Environment]::SetEnvironmentVariable('Path',
+                [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + $bunBin, 'User')
+              Write-Host "bun installed to $bunBin (added to user PATH)"
+            } else {
+              throw "bun install completed but bun.exe not found under $bunBin"
+            }
+          }
+
+      - name: Install Inno Setup 6 if missing
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          $defaultPath = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if ($iscc -or (Test-Path $defaultPath)) {
+            Write-Host "Inno Setup already present"
+          } else {
+            $installed = $false
+            if (Get-Command winget -ErrorAction SilentlyContinue) {
+              Write-Host "installing Inno Setup via winget..."
+              winget install --id JRSoftware.InnoSetup -e --accept-source-agreements --accept-package-agreements --silent
+              $installed = $LASTEXITCODE -eq 0
+            }
+            if (-not $installed -and -not (Test-Path $defaultPath)) {
+              Write-Host "winget unavailable or failed; downloading installer..."
+              $tmp = Join-Path $env:TEMP 'innosetup-6.exe'
+              Invoke-WebRequest -Uri 'https://jrsoftware.org/download.php/is.exe' -OutFile $tmp
+              & $tmp /VERYSILENT /NORESTART | Out-Null
+            }
+            if (Test-Path $defaultPath) {
+              Add-Content $env:GITHUB_PATH (Split-Path $defaultPath)
+              Write-Host "Inno Setup installed at $defaultPath"
+            } else {
+              throw "Inno Setup install failed — $defaultPath missing"
+            }
+          }
+
+      - name: Capability report
+        shell: powershell
+        run: |
+          $bun = (Get-Command bun -ErrorAction SilentlyContinue) ? (bun --version) : 'MISSING'
+          $iscc = Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = (Test-Path $vswhere) ? ((& $vswhere -latest -property displayName) -join ', ') : 'vswhere MISSING'
+          Write-Host "bun: $bun"
+          Write-Host "Inno Setup 6: $iscc"
+          Write-Host "Visual Studio: $vs"
+          if ($bun -eq 'MISSING' -or -not $iscc -or $vs -eq 'vswhere MISSING') { exit 1 }

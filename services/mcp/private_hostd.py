@@ -51,10 +51,21 @@ def spawn_private_daemon(tmp: Path) -> tuple[subprocess.Popen, str] | None:
     exe = tmp / "chudware-hostd"
     exe.chmod(0o755)
     before = _sockets()
+    # The manufacturing journal takes an exclusive flock in its state dir
+    # (core/hostd/mfg_lane.cpp defaultStateDirectory); without a private override the
+    # spawned daemon collides with any already-running hostd (the web daemon, a gate
+    # leftover) and aborts in the Journal constructor before it ever listens.
+    # start_new_session: the daemon must be outside the test runner's process group.
+    # The engine forks isolation children during heavy solves; without a private
+    # session any group-directed signal from that subtree (or a terminal Ctrl+C
+    # intended for the runner) lands on pytest as a phantom KeyboardInterrupt mid-RPC.
     proc = subprocess.Popen(
         [str(exe), "--foreground"], cwd=str(tmp),
-        env=dict(os.environ, LD_LIBRARY_PATH=str(tmp)),
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        env=dict(os.environ, LD_LIBRARY_PATH=str(tmp),
+                 CHUDWARE_MFG_STATE_DIR=str(tmp / "mfg-state")),
+        stdout=subprocess.DEVNULL,
+        stderr=open(Path(tempfile.gettempdir()) / f"private-hostd-{os.getpid()}.log", "wb"),
+        start_new_session=True)
     deadline = time.time() + 60
     while time.time() < deadline:
         if proc.poll() is not None:

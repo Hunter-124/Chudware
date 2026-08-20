@@ -28,7 +28,7 @@ on:
         description: runner label set to provision (cc-win-* or cc-mac-*)
         required: true
         type: choice
-        options: [cc-win-package, cc-mac-intel, cc-mac-arm]
+        options: [cc-win-package, cc-mac-intel, cc-mac-arm, cc-linux-build]
 
 permissions:
   contents: read
@@ -324,3 +324,60 @@ jobs:
             exit 1
           fi
           echo "capability report: complete for macos-beta"
+
+  provision-linux:
+    name: Provision Linux release runner
+    if: startsWith(inputs.runner_label, 'cc-linux-')
+    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, "${{ inputs.runner_label }}"]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Provision the release Python (Nuitka, cryptography, pyyaml)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The AppImage compiles the Python sidecars with Nuitka; the system
+          # interpreter is externally managed (PEP 668), so the release
+          # dependencies live in this venv, which the nightly resolves as
+          # CHUDWARE_RELEASE_PYTHON.
+          venv="${HOME}/chudware-ci-tools/release-python"
+          if [ -x "${venv}/bin/python3" ] \
+            && "${venv}/bin/python3" -c 'import nuitka, cryptography, yaml' >/dev/null 2>&1; then
+            echo "release python already provisioned: $("${venv}/bin/python3" --version)"
+            exit 0
+          fi
+          mkdir -p "$(dirname "${venv}")"
+          rm -rf "${venv}"
+          python3 -m venv "${venv}"
+          "${venv}/bin/python3" -m pip install --quiet --upgrade pip
+          "${venv}/bin/python3" -m pip install --quiet -r packaging/requirements-release.txt
+          "${venv}/bin/python3" -c 'import nuitka, cryptography, yaml; print("release python deps installed")'
+
+      - name: Capability report
+        shell: bash
+        run: |
+          set -uo pipefail
+          venv="${HOME}/chudware-ci-tools/release-python/bin/python3"
+          missing=0
+          for tool in cmake ninja ctest bun xvfb-run rsync strip; do
+            if command -v "${tool}" >/dev/null 2>&1; then
+              printf '%-22s %s\n' "${tool}" "$(command -v "${tool}")"
+            else
+              printf '%-22s %s\n' "${tool}" MISSING; missing=1
+            fi
+          done
+          if [ -x "${venv}" ]; then
+            printf '%-22s %s\n' release-python "$("${venv}" --version)"
+          else
+            printf '%-22s %s\n' release-python MISSING; missing=1
+          fi
+          if ls -d "${HOME}"/chudware-cef-sdk/cef_binary_* >/dev/null 2>&1; then
+            printf '%-22s %s\n' cef-sdk "$(ls -d "${HOME}"/chudware-cef-sdk/cef_binary_* | head -1)"
+          else
+            printf '%-22s %s\n' cef-sdk MISSING; missing=1
+          fi
+          [ "${missing}" -eq 0 ] || { echo "::error::provisioning incomplete"; exit 1; }
+          echo "capability report: complete for linux-beta"

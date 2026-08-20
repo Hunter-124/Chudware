@@ -240,6 +240,10 @@ if [ "$MODE" = prepare ]; then
     rm -rf "$APPDIR"
     HOST_BUILD="$(dirname "$(dirname "$BIN")")"
     require_production_cache "$HOST_BUILD" "host GUI"
+    # The staging below copies straight into these directories; nothing else
+    # creates them (the later `mkdir -p "$OUT"` runs after all of it), so a
+    # prepare run without this died on the first cp.
+    mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
 else
     [ -d "$APPDIR" ] && [ -f "$APPDIR/payload-manifest.v1.json" ] || {
         echo "error: retained prepared AppDir is missing under $OUT" >&2; exit 1;
@@ -251,7 +255,7 @@ if [ "$MODE" = prepare ]; then
 
 echo "==> staging binary + resources"
 cp "$BIN" "$APPDIR/usr/bin/chudware"
-ASSETS_SRC="$REPO/host/build-linux/bin/assets"
+ASSETS_SRC="$HOST_BUILD/bin/assets"
 [ -d "$ASSETS_SRC" ] || {
     echo "error: production AppImage requires staged GUI assets: $ASSETS_SRC" >&2
     exit 1

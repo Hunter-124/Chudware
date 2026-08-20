@@ -240,8 +240,18 @@ jobs:
           for tool in cmake ninja ctest python3 curl tar file ldd sha256sum strip rsync xvfb-run bun; do
             command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
           done
+          # The AppImage compiles the Python sidecars with Nuitka, which the
+          # system interpreter does not carry (PEP 668). runner-provision's
+          # provision-linux job creates this venv.
+          release_python="${HOME}/chudware-ci-tools/release-python/bin/python3"
+          if [ -x "${release_python}" ] && "${release_python}" -c 'import nuitka, cryptography, yaml' >/dev/null 2>&1; then
+            echo "CHUDWARE_RELEASE_PYTHON=${release_python}" >> "$GITHUB_ENV"
+            echo "release python: $("${release_python}" --version) with nuitka"
+          else
+            missing+=("release-python-with-packaging/requirements-release.txt")
+          fi
           if [ "${#missing[@]}" -ne 0 ]; then
-            echo "::error::runner ${RUNNER_NAME:-unknown} is missing required tools: ${missing[*]}"
+            echo "::error::runner ${RUNNER_NAME:-unknown} is missing required tools: ${missing[*]}. Run runner-provision (provision-linux) against this label and re-dispatch."
             exit 1
           fi
 

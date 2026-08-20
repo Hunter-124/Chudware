@@ -124,7 +124,7 @@ std::string resolveHostdBin(const std::string& hint) {
     const fs::path candidate = self.parent_path() / "chudware-hostd";
     std::error_code ec;
     const std::string relative = fs::relative(candidate, root, ec).generic_string();
-    if (ec || relative.empty() || relative.starts_with("../")) return "";
+    if (ec || relative.empty() || relative.rfind("../", 0) == 0) return "";
     const auto verified =
         chudware::security::verifyInstalledManifestEntry(self, relative, "worker");
     return verified.ok ? candidate.string() : std::string();
@@ -177,7 +177,7 @@ bool spawnDetached(const std::string& exe, const std::string& arg, std::string& 
     const fs::path root = chudware::security::installedPayloadRoot(self);
     std::error_code ec;
     const std::string relative = fs::relative(fs::path(exe), root, ec).generic_string();
-    if (ec || relative.empty() || relative.starts_with("../")) {
+    if (ec || relative.empty() || relative.rfind("../", 0) == 0) {
         err = "hostd path is outside the installed payload";
         return false;
     }
@@ -217,7 +217,17 @@ bool spawnDetached(const std::string& exe, const std::string& arg, std::string& 
 #else
         char* const argvNoArg[] = {const_cast<char*>(exe.c_str()), nullptr};
         char* const argvArg[] = {const_cast<char*>(exe.c_str()), const_cast<char*>(arg.c_str()), nullptr};
+#ifdef __APPLE__
+        // macOS has no fexecve. F_GETPATH re-derives the verified binary's path
+        // from the pinned fd (the fd itself was integrity-checked before this
+        // point, and the path is what execve needs), which is the accepted
+        // Darwin equivalent.
+        char resolved[MAXPATHLEN];
+        if (::fcntl(pinnedFd, F_GETPATH, resolved) == 0)
+            ::execve(resolved, arg.empty() ? argvNoArg : argvArg, environ);
+#else
         ::fexecve(pinnedFd, arg.empty() ? argvNoArg : argvArg, environ);
+#endif
 #endif
         ::_exit(127);
     }

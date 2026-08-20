@@ -177,7 +177,7 @@ std::string resolveHostdBin(const std::string& hint) {
     const fs::path candidate = self.parent_path() / "chudware-hostd.exe";
     std::error_code ec;
     const std::string relative = fs::relative(candidate, root, ec).generic_string();
-    if (ec || relative.empty() || relative.starts_with("../")) return "";
+    if (ec || relative.empty() || relative.rfind("../", 0) == 0) return "";
     const auto verified =
         chudware::security::verifyInstalledManifestEntry(self, relative, "worker");
     return verified.ok ? candidate.string() : std::string();
@@ -228,7 +228,7 @@ bool spawnDetached(const std::string& exe, const std::string& arg, std::string& 
     const fs::path root = chudware::security::installedPayloadRoot(self);
     std::error_code ec;
     const std::string relative = fs::relative(fs::path(exe), root, ec).generic_string();
-    if (ec || relative.empty() || relative.starts_with("../")) {
+    if (ec || relative.empty() || relative.rfind("../", 0) == 0) {
         err = "hostd path is outside the installed payload";
         return false;
     }

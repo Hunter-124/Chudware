@@ -97,7 +97,7 @@ const std::filesystem::path candidate = self.parent_path() / kEngineLib;
 #endif
 std::error_code ec;
 const std::string relative = std::filesystem::relative(candidate, root, ec).generic_string();
-if (self.empty() || ec || relative.empty() || relative.starts_with("../")) {
+if (self.empty() || ec || relative.empty() || relative.rfind("../", 0) == 0) {
     err = "canonical libchudware path is outside the installed payload";
     return false;
 }
@@ -205,7 +205,7 @@ return true;
     const std::filesystem::path candidate = self.parent_path() / "libchudware.dll";
     std::error_code ec;
     const std::string relative = std::filesystem::relative(candidate, root, ec).generic_string();
-    if (self.empty() || ec || relative.empty() || relative.starts_with("../")) {
+    if (self.empty() || ec || relative.empty() || relative.rfind("../", 0) == 0) {
         err = "canonical libchudware path is outside the installed payload";
         return false;
     }

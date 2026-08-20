@@ -206,13 +206,13 @@ GOLDEN DEMO (T-FIN25 — living E2E worked example):
   co-verify (fw_sim_run with fixture:i2c_temp_tmp103 when Renode is present) →
   ecad_thermal_handoff → heatsink_select(U1, tj_target_c=85) → power_budget →
   make_report. Wired into scripts/gate.sh as stage 4.7 (CHUDWARE_SKIP_FIN25=1 to opt out).
-  Narrative + artifacts: `docs/reference/FIN25_SENSOR_NODE_GOLDEN_DEMO.md`. Prefer this script over
+  Narrative + artifacts: docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Prefer this script over
   inventing a new end-to-end recipe when demonstrating the content is finished.
 
 SIMULATE TAB (T-FIN24, host GUI): one multiphysics Simulate workspace hosts every live
   study kind with progressive disclosure by open doc type, plus handoff actions
   (Send board to thermal FEA, Pick heatsink, …) driven by aicad.simhandoff/1. Worker
-  seam: `services/sim/multiphysics_rpc.py` (sim_caps / sim_run_buckling /
+  seam: engine_oracle/sim/multiphysics_rpc.py (sim_caps / sim_run_buckling /
   sim_run_contact / sim_freq_response / ecad_thermal_handoff / heatsink_select /
   piping_verify_cfd). EM forms wire the live EM backend; deeper EM solvers stay on
   T-SIM11. Supersedes the deferred T-SIM10 host-path brief.

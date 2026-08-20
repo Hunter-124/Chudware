@@ -1,6 +1,6 @@
 # Contracts Summary
 
-45 frozen contracts under `contracts/`:
+46 frozen contracts under `contracts/`:
 
 - `README.md` — contracts/ — frozen interface seams
 - `advisor.md` — contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.7)
@@ -25,6 +25,7 @@
 - `leaderboard.md` — Contract: Model Leaderboard (`aicad.leaderboard/1`)
 - `license_debt.md` — License debt register — cleanroom-before-SaaS
 - `licenses.md` — Contract: Dependency License Ledger
+- `manufacturing_gateway.md` — Contract: Manufacturing Gateway — v1
 - `mesh_format.md` — Contract: AICM v1 — tessellation + overlay binary format
 - `narration.md` — Narration Style Guide
 - `office.md` — Contract: Office documents — `office/1` (T-office)

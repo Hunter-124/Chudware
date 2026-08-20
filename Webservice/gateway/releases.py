@@ -784,6 +784,40 @@ async def ci_publish_release(value: CiPublish, request: Request) -> dict[str, An
     }
 
 
+@router.put("/api/releases/ci/upload/{name}")
+async def ci_upload_artifact(name: str, request: Request) -> dict[str, Any]:
+    """Stream a CI artifact into ``incoming/`` ahead of publication.
+
+    The Windows/macOS runners cannot reach the gateway host's LAN address (the
+    networks do not route), so artifacts arrive here over the public endpoint
+    instead of scp. The body streams to a ``.part`` file and is atomically
+    renamed into place, so ci/publish never sees a torn upload; nothing in this
+    handler is trusted — publish re-digests the bytes from disk before anything
+    moves into the store.
+    """
+    client = request.client.host if request.client else "unknown"
+    _publish_by_ip.enforce(client, "release publications")
+    _require_publish_token(request)
+    safe = _safe_name(name)
+    target = _incoming_dir() / (safe + ".part")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with target.open("wb") as out:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > 2 * 1024**3:
+                    raise HTTPException(413, "release artifact exceeds the 2 GiB ceiling")
+                digest.update(chunk)
+                out.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    os.replace(target, _incoming_dir() / safe)
+    return {"ok": True, "name": safe, "size": size, "sha256": digest.hexdigest()}
+
+
 @router.post("/api/releases/ci/status")
 async def ci_report_status(value: CiStatus, request: Request) -> dict[str, Any]:
     client = request.client.host if request.client else "unknown"

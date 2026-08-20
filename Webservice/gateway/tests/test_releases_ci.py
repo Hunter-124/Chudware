@@ -815,3 +815,55 @@ def test_new_release_routes_are_reachable_through_the_auth_middleware() -> None:
     assert not auth._is_public_path("/api/admin/releases/promote")
     assert not auth._is_public_path("/api/admin/ci/builds")
     assert not auth._is_public_path("/api/releases/artifactory")
+
+
+def test_ci_upload_streams_into_incoming_and_digests(ci: TestClient, ci_env) -> None:
+    payload = b"fake-installer-bytes" * 4096
+    expected = hashlib.sha256(payload).hexdigest()
+    response = ci.put(
+        "/api/releases/ci/upload/Chudware-0.1.0-beta.1-linux-x86_64.AppImage",
+        content=payload,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["size"] == len(payload)
+    assert body["sha256"] == expected
+    staged = releases._incoming_dir() / "Chudware-0.1.0-beta.1-linux-x86_64.AppImage"
+    assert staged.read_bytes() == payload
+    assert not (releases._incoming_dir() / (staged.name + ".part")).exists()
+
+
+def test_ci_upload_requires_the_publish_token(ci_env) -> None:
+    anonymous = TestClient(app_mod.app)
+    response = anonymous.put("/api/releases/ci/upload/payload.bin", content=b"x")
+    assert response.status_code == 401
+    wrong = TestClient(app_mod.app, headers={"Authorization": "Bearer wrong"})
+    assert wrong.put("/api/releases/ci/upload/payload.bin", content=b"x").status_code == 401
+
+
+def test_ci_upload_sanitizes_the_name(ci: TestClient, ci_env) -> None:
+    response = ci.put("/api/releases/ci/upload/..%2f..%2fevil", content=b"x")
+    assert response.status_code in (400, 404, 422)
+
+
+def test_ci_upload_then_publish_round_trip(ci: TestClient, ci_key, ci_env) -> None:
+    version, platform, arch = BETA, "linux", "x86_64"
+    name = releases._canonical_artifact(version, platform, arch)
+    # Stage via the upload endpoint instead of _stage()'s direct file writes: the
+    # upload path is the one the Windows and macOS runners actually use.
+    artifact = b"round-trip-artifact" * 1024
+    uploaded = ci.put(f"/api/releases/ci/upload/{name}", content=artifact)
+    assert uploaded.status_code == 200, uploaded.text
+    assert uploaded.json()["sha256"] == hashlib.sha256(artifact).hexdigest()
+    for suffix in (".payload-manifest.v1.json", ".payload-manifest.v1.sig"):
+        small = b"sidecar" + suffix.encode()
+        assert ci.put(
+            f"/api/releases/ci/upload/{name}{suffix}", content=small
+        ).status_code == 200
+    files = {name: artifact}
+    for suffix in (".payload-manifest.v1.json", ".payload-manifest.v1.sig"):
+        files[f"{name}{suffix}"] = b"sidecar" + suffix.encode()
+    response = ci.post(
+        "/api/releases/ci/publish", json=_body(ci_key, files, evidence=False)
+    )
+    assert response.status_code == 200, response.text

@@ -47,10 +47,13 @@ permissions:
   contents: read
 
 concurrency:
-  # One nightly at a time, and never cancelled: a half-finished build leaves
-  # unpublished bytes in the gateway staging directory.
+  # One nightly at a time. A fresh dispatch SUPERSEDES a stale one: an always-
+  # offline runner (the cc-mac-arm laptop sleeps most days) would otherwise hold
+  # this group hostage for GitHub's 24h queued-job timeout and stop every later
+  # build. ci/publish is idempotent by run identity and the gateway re-digests
+  # anything staged, so a cancelled leg leaves nothing trusted behind.
   group: nightly-release
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   CHUDWARE_RELEASE_KEY_ID: release-ci-v1

@@ -237,7 +237,7 @@ jobs:
           set -euo pipefail
 
           missing=()
-          for tool in cmake ninja ctest python3 curl tar file ldd sha256sum strip rsync xvfb-run bun; do
+          for tool in cmake ninja ctest python3 curl tar file ldd sha256sum strip rsync xvfb-run bun patchelf; do
             command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
           done
           # The AppImage compiles the Python sidecars with Nuitka, which the

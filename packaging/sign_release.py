@@ -80,15 +80,25 @@ def validate_request(kind: str, request: bytes) -> None:
     if not request.startswith(domain) or len(request) == len(domain):
         raise SigningError(f"request is not in the {kind!r} release-signing domain")
     if kind == "artifact":
+        # Exactly the preimage every builder emits and every verifier recomputes:
+        # key id, version, platform, arch, lowercase sha256 of the artifact bytes
+        # (packaging/linux/build_appimage.sh, services/installer/build_release.py,
+        # packaging/finalize_release.py, Webservice/gateway/releases.py,
+        # host/src/update/updater.cpp). A short request here would sign an identity
+        # nothing can verify.
         parts = request[len(domain):].split(b"\0")
-        if len(parts) != 2 or not parts[0] or len(parts[1]) != 64:
-            raise SigningError("artifact request must contain key id and lowercase SHA-256")
+        if len(parts) != 5 or not all(parts[:4]) or len(parts[4]) != 64:
+            raise SigningError(
+                "artifact request must be key id, version, platform, arch and lowercase SHA-256")
         try:
-            digest = parts[1].decode("ascii")
+            digest = parts[4].decode("ascii")
+            identity = b"\0".join(parts[:4]).decode("ascii")
         except UnicodeDecodeError as exc:
-            raise SigningError("artifact digest is not ASCII") from exc
+            raise SigningError("artifact request is not ASCII") from exc
         if any(ch not in "0123456789abcdef" for ch in digest):
             raise SigningError("artifact digest is not lowercase SHA-256")
+        if any(ch in "\r\n" for ch in identity):
+            raise SigningError("artifact request identity contains a line break")
     elif kind in {"sbom", "provenance", "platform-test"}:
         body = request[len(domain):]
         try:
@@ -99,17 +109,28 @@ def validate_request(kind: str, request: bytes) -> None:
             raise SigningError(f"{kind} request body is not canonical JSON")
 
 
+def sign_request_with_key(kind: str, request: bytes, key: Any) -> str:
+    """Sign a validated request with an already-loaded Ed25519 private key.
+
+    The one place a signature is produced. sign_request() sources the key from an
+    age-encrypted file (owner workstation); packaging/ci_sign.py sources it from
+    the CI secret. Neither reimplements validation or crypto.
+    """
+    validate_request(kind, request)
+    return base64.b64encode(key.sign(request)).decode("ascii")
+
+
 def sign_request(kind: str, request: bytes, encrypted_key: Path, identity: Path,
                  *, age: str = "age") -> str:
+    # Validate BEFORE decrypting: a malformed request must never cause the release
+    # key to be decrypted at all.
     validate_request(kind, request)
     key_bytes = bytearray(decrypt_key(encrypted_key, identity, age=age))
     try:
-        key = load_private_key(bytes(key_bytes))
-        signature = key.sign(request)
+        return sign_request_with_key(kind, request, load_private_key(bytes(key_bytes)))
     finally:
         for index in range(len(key_bytes)):
             key_bytes[index] = 0
-    return base64.b64encode(signature).decode("ascii")
 
 
 def parser() -> argparse.ArgumentParser:

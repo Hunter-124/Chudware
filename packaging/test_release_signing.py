@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+)
 
 def _load_signer():
     path = Path(__file__).with_name("sign_release.py")
@@ -144,3 +149,75 @@ def test_publisher_rejects_noncanonical_or_prerelease_versions(value: str):
     publish = _load_publish()
     with pytest.raises(publish.PublishError, match="canonical major.minor.patch"):
         publish.parse_release_version(value)
+
+
+def _load_ci_signer():
+    path = Path(__file__).with_name("ci_sign.py")
+    spec = importlib.util.spec_from_file_location("chudware_ci_sign", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_artifact_request_must_carry_the_full_verifier_identity():
+    # Every verifier (gateway, updater, publish.py) recomputes
+    # domain\0key_id\0version\0platform\0arch\0sha256. A shorter request would be
+    # signed happily and then verify nowhere.
+    digest = hashlib.sha256(b"artifact").hexdigest().encode("ascii")
+    complete = sign_release.DOMAINS["artifact"] + b"\0".join(
+        (b"release-ci-v1", b"0.1.0-beta.42", b"linux", b"x86_64", digest))
+    sign_release.validate_request("artifact", complete)
+    for truncated in (
+        sign_release.DOMAINS["artifact"] + b"release-ci-v1\0" + digest,
+        sign_release.DOMAINS["artifact"] + b"\0".join((b"release-ci-v1", b"0.1.0", b"linux", digest)),
+        sign_release.DOMAINS["artifact"] + b"\0".join((b"release-ci-v1", b"", b"linux", b"x86_64", digest)),
+        sign_release.DOMAINS["artifact"] + b"\0".join(
+            (b"release-ci-v1", b"0.1.0", b"linux", b"x86_64", digest.upper())),
+    ):
+        with pytest.raises(sign_release.SigningError):
+            sign_release.validate_request("artifact", truncated)
+
+
+def test_ci_signer_signs_the_gateway_preimage_from_the_environment_seed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ci_sign = _load_ci_signer()
+    key = Ed25519PrivateKey.generate()
+    seed = key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    artifact = tmp_path / "Chudware-0.1.0-beta.42-linux-x86_64.AppImage"
+    artifact.write_bytes(b"appimage")
+    monkeypatch.setenv("CHUDWARE_RELEASE_CI_KEY", base64.b64encode(seed).decode("ascii"))
+
+    request_path = tmp_path / "request.bin"
+    assert ci_sign.main([
+        "--expect-public-key", public.hex(), "--output", str(tmp_path / "artifact.sig"),
+        "artifact", "--key-id", "release-ci-v1", "--version", "0.1.0-beta.42",
+        "--platform", "linux", "--arch", "x86_64", "--artifact", str(artifact),
+        "--request-out", str(request_path),
+    ]) == 0
+    expected = b"\0".join((
+        b"chudware-artifact-v1", b"release-ci-v1", b"0.1.0-beta.42", b"linux", b"x86_64",
+        hashlib.sha256(b"appimage").hexdigest().encode("ascii"),
+    ))
+    assert request_path.read_bytes() == expected
+    signature = base64.b64decode((tmp_path / "artifact.sig").read_text(encoding="ascii").strip())
+    key.public_key().verify(signature, expected)
+
+
+def test_ci_signer_refuses_a_seed_that_is_not_the_expected_release_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    ci_sign = _load_ci_signer()
+    seed = Ed25519PrivateKey.generate().private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    other = Ed25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    request = tmp_path / "payload.bin"
+    request.write_bytes(sign_release.DOMAINS["payload"] + b"body")
+    monkeypatch.setenv("CHUDWARE_RELEASE_CI_KEY", base64.b64encode(seed).decode("ascii"))
+    assert ci_sign.main(["--expect-public-key", other.hex(), "sign", "payload", str(request)]) == 2
+    assert "does not match the expected release public key" in capsys.readouterr().err
+
+    monkeypatch.delenv("CHUDWARE_RELEASE_CI_KEY")
+    assert ci_sign.main(["sign", "payload", str(request)]) == 2
+    assert "CHUDWARE_RELEASE_CI_KEY is not set" in capsys.readouterr().err

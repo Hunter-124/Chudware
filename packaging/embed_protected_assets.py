@@ -93,7 +93,11 @@ def _raw_literal(text: str) -> str:
     for offset in range(0, len(seed) - 11):
         delimiter = "cw" + seed[offset : offset + 12]
         if f"){delimiter}\"" not in text:
-            return f'R"{delimiter}({text}){delimiter}"'
+            # MSVC (C2026) refuses a single string literal over 16380 chars, so
+            # big assets are emitted as ADJACENT raw literals; the compiler
+            # concatenates them (concatenated ceiling 65535 covers our max).
+            pieces = [text[i : i + 16000] for i in range(0, len(text), 16000)] or [""]
+            return "\n".join(f'R"{delimiter}({piece}){delimiter}"' for piece in pieces)
     raise ValueError("unable to choose a collision-free C++ raw-string delimiter")
 
 

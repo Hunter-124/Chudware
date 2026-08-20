@@ -222,7 +222,7 @@ bool spawnDetached(const std::string& exe, const std::string& arg, std::string& 
         // from the pinned fd (the fd itself was integrity-checked before this
         // point, and the path is what execve needs), which is the accepted
         // Darwin equivalent.
-        char resolved[MAXPATHLEN];
+        char resolved[PATH_MAX];
         if (::fcntl(pinnedFd, F_GETPATH, resolved) == 0)
             ::execve(resolved, arg.empty() ? argvNoArg : argvArg, environ);
 #else

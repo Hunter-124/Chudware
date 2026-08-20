@@ -816,7 +816,10 @@ async def ci_upload_artifact(name: str, request: Request) -> dict[str, Any]:
                 digest.update(chunk)
                 out.write(chunk)
     except Exception:
-        target.unlink(missing_ok=True)
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass  # never mask the real failure with a cleanup failure
         raise
     os.replace(target, _incoming_dir() / safe)
     return {"ok": True, "name": safe, "size": size, "sha256": digest.hexdigest()}

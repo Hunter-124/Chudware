@@ -840,6 +840,13 @@ struct Updater::Impl {
         std::vector<std::pair<std::string, std::string>> headers;
         if (!entitlementToken.empty()) headers.emplace_back("X-Chudware-Entitlement", entitlementToken);
         const auto response = agent::http_get(url, headers, 8000);
+        if (response.status == 404) {
+            // No manifest on this channel at all. That is "nothing newer
+            // exists", not a failure — never surface an HTTP status to the
+            // user for the normal empty-channel case.
+            setStatus(State::Current, nullptr, "Chudware is up to date");
+            return true;
+        }
         if (response.status != 200) {
             setStatus(State::Error, nullptr, response.status
                 ? "Update check returned HTTP " + std::to_string(response.status)

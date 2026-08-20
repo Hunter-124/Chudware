@@ -11,13 +11,19 @@
 # promote button will publish later without rebuilding a byte.
 #
 # Trust boundaries that shape every step below:
-#   * The gateway release token NEVER leaves the gateway host. Both publish and
-#     status calls go to http://127.0.0.1:8300 on that box, reading the token
-#     from /home/liveuser/chudware-web-data/gateway.env at the point of use and
-#     handing it to curl through a 0600 --config file, never argv, never a log.
-#     The Windows and macOS builders therefore upload over scp and run the
-#     loopback curl through ssh; they never learn the token and never post to
-#     the public URL.
+#   * The gateway release token is used two different ways, because the runners
+#     are not on one network. `plan` and `linux-beta` run ON the gateway host:
+#     they read the token from /home/liveuser/chudware-web-data/gateway.env at
+#     the point of use and talk to http://127.0.0.1:8300, so the token never
+#     leaves the box. The Windows and macOS builders cannot route to that host
+#     at all (192.168.1.x and 192.168.0.x do not talk to each other, proven by
+#     diagnostic), so they hold the same token as the GitHub secret
+#     CHUDWARE_GATEWAY_RELEASE_TOKEN and reach the gateway over TLS on
+#     https://app.chudware.com: artifacts stream in through
+#     PUT /api/releases/ci/upload/<name>, then the ordinary ci/publish and
+#     ci/status calls follow. Those runners need nothing but outbound 443.
+#   * On every host the token reaches curl through a 0600 --config file, never
+#     argv (a shared runner's process list is readable), never a log.
 #   * The CI signing seed is only in the environment of the steps that sign.
 #   * No actions/upload-artifact anywhere: artifact storage is metered and the
 #     installers are ~500 MB. Diagnostics go to the (unmetered) step summary.
@@ -65,6 +71,18 @@ env:
   # installed client. Raising the floor is a deliberate stable-release decision
   # made through packaging/publish.py register --min-supported.
   CHUDWARE_RELEASE_MIN_SUPPORTED: 0.1.0
+  # The Windows and macOS builders cannot route to the gateway's LAN address, so
+  # they use the public origin. Uploading is authenticated with the release
+  # token; /api/releases/ci is a public pass-through in auth.py precisely so
+  # these three endpoints can be reached from off-LAN with the Bearer enforced
+  # in the handler.
+  CHUDWARE_GATEWAY_PUBLIC_BASE: https://app.chudware.com
+  # Shared by both off-LAN legs. The CI endpoints have their own per-IP budget
+  # (_ci_by_ip, 240/min) rather than the 20/min manual publish limiter, so a
+  # normal night is nowhere near it; these retries are belt-and-suspenders for a
+  # throttle, a 5xx or a dropped connection part-way through a 500 MB upload.
+  # curl has retried 429 as well as 5xx since 7.51.
+  CHUDWARE_GATEWAY_CURL_RETRY: --retry 5 --retry-delay 15 --retry-max-time 600
 
 jobs:
   plan:
@@ -658,8 +676,9 @@ jobs:
       RELEASE_ARCH: x86_64
       CORE_PRESET: windows-occt
       HOST_BUILD_DIR: host/build-win
-      GATEWAY_SSH_HOST: ${{ secrets.CHUDWARE_LIVINGROOM_SSH_HOST }}
-      GATEWAY_SSH_USER: liveuser
+      # This runner cannot route to the gateway host's LAN address, so it holds
+      # the release token itself and publishes over TLS to the public origin.
+      GATEWAY_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
     steps:
       - name: Check runner capabilities and enter the MSVC environment
         # Windows PowerShell 5.1 - these hosts have no pwsh and their `bash` is an
@@ -677,7 +696,9 @@ jobs:
               $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
             }
           }
-          foreach ($tool in @('cmake', 'ninja', 'ctest', 'git', 'python', 'bun', 'ssh', 'scp')) {
+          # curl.exe, not ssh/scp: this runner reaches the gateway over TLS on
+          # the public origin because the two LANs do not route to each other.
+          foreach ($tool in @('cmake', 'ninja', 'ctest', 'git', 'python', 'bun', 'curl')) {
             if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
               Write-Host "::error::runner $env:RUNNER_NAME is missing required tool: $tool"
               exit 1
@@ -762,114 +783,50 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Open the authenticated channel to the gateway host
-        env:
-          GATEWAY_SSH_KEY: ${{ secrets.CHUDWARE_LIVINGROOM_SSH_KEY }}
-          GATEWAY_HOST_KEY: ${{ secrets.CHUDWARE_LIVINGROOM_HOST_KEY }}
+      - name: Open the authenticated channel to the gateway
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not $env:GATEWAY_SSH_HOST) { Write-Host '::error::CHUDWARE_LIVINGROOM_SSH_HOST is not set'; exit 1 }
-          if (-not $env:GATEWAY_SSH_KEY) { Write-Host '::error::CHUDWARE_LIVINGROOM_SSH_KEY is not set'; exit 1 }
-          if (-not $env:GATEWAY_HOST_KEY) { Write-Host '::error::CHUDWARE_LIVINGROOM_HOST_KEY is not set'; exit 1 }
+          if (-not $env:GATEWAY_TOKEN) {
+            Write-Host '::error::CHUDWARE_GATEWAY_RELEASE_TOKEN is not set; this runner publishes over TLS and has no other credential'
+            exit 1
+          }
+          if (-not $env:CHUDWARE_GATEWAY_PUBLIC_BASE) {
+            Write-Host '::error::CHUDWARE_GATEWAY_PUBLIC_BASE is not set'
+            exit 1
+          }
 
-          # Run-scoped: RUNNER_TEMP is wiped between jobs.
-          $ssh = Join-Path $env:RUNNER_TEMP 'ssh'
-          New-Item -ItemType Directory -Force -Path $ssh | Out-Null
-          $key = Join-Path $ssh 'id'
-          $known = Join-Path $ssh 'known_hosts'
-          # ASCII, LF, no BOM: OpenSSH rejects a key file it cannot parse, and a
-          # CRLF private key is the classic silent failure here.
-          [IO.File]::WriteAllText($key, ($env:GATEWAY_SSH_KEY -replace "`r`n", "`n").TrimEnd() + "`n", (New-Object Text.ASCIIEncoding))
-          [IO.File]::WriteAllText($known, ($env:GATEWAY_HOST_KEY -replace "`r`n", "`n").TrimEnd() + "`n", (New-Object Text.ASCIIEncoding))
-          # The runner account must be the key file's only reader or ssh refuses it.
-          # Grant by SID: under a service account $env:USERNAME is the machine
-          # account (HOST$), which icacls cannot resolve.
+          # Run-scoped: RUNNER_TEMP is wiped between jobs. The token goes to a
+          # curl --config file, never to argv: another process on this runner can
+          # read a command line, and GitHub's log masking does not help there.
+          $curlrc = Join-Path $env:RUNNER_TEMP 'gw.curlrc'
+          [IO.File]::WriteAllText($curlrc, "header = `"Authorization: Bearer $env:GATEWAY_TOKEN`"`n", (New-Object Text.ASCIIEncoding))
+          # The runner account must be the config file's only reader. Grant by
+          # SID: under a service account $env:USERNAME is the machine account
+          # (HOST$), which icacls cannot resolve.
           $meSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-          & icacls $key /inheritance:r /grant:r "*${meSid}:(R)" | Out-Null
-          "GATEWAY_SSH_KEY_FILE=$key" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "GATEWAY_KNOWN_HOSTS=$known" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          # GITHUB_ENV only reaches LATER steps; this step uses the values too.
-          $env:GATEWAY_SSH_KEY_FILE = $key
-          $env:GATEWAY_KNOWN_HOSTS = $known
+          & icacls $curlrc /inheritance:r /grant:r "*${meSid}:(R)" | Out-Null
+          "GATEWAY_CURLRC=$curlrc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # GITHUB_ENV only reaches LATER steps; this step uses the value too.
+          $env:GATEWAY_CURLRC = $curlrc
 
-          # The publish/status helper runs ON the gateway box: the release token is
-          # read there, used against 127.0.0.1:8300, and never crosses the network.
-          $helper = Join-Path $env:RUNNER_TEMP 'remote_gateway.sh'
-          $script = @'
-          #!/usr/bin/env bash
-          # Written by .github/workflows/nightly-release.yml; runs on the gateway host only.
-          set -euo pipefail
-          ENV_FILE="${CHUDWARE_GATEWAY_ENV_FILE:-/home/liveuser/chudware-web-data/gateway.env}"
-          LOOPBACK="http://127.0.0.1:8300"
-
-          gw_value() {
-            python3 - "$ENV_FILE" "$1" <<'PY'
-          import sys
-          value = ""
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              for line in stream:
-                  line = line.strip()
-                  if line.startswith(sys.argv[2] + "="):
-                      value = line.split("=", 1)[1].strip().strip("'\"")
-          print(value)
-          PY
+          # Reachability is proven before an hour of building depends on it. This
+          # endpoint is anonymous and read-only, so a 200 here means DNS, TLS and
+          # routing all work; the token itself is proven by the first ci/status.
+          # No 2>&1 on any native command in this step: with 'Stop' in effect,
+          # PowerShell 5.1 promotes redirected stderr to a terminating error.
+          $probe = & curl.exe --fail-with-body -sS --max-time 30 "$env:CHUDWARE_GATEWAY_PUBLIC_BASE/api/releases/base-version"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::cannot reach $env:CHUDWARE_GATEWAY_PUBLIC_BASE from this runner: $probe"
+            exit 1
           }
-
-          curlrc() {
-            local token
-            token="$(gw_value CHUDWARE_GATEWAY_RELEASE_TOKEN)"
-            [ -n "$token" ] || { echo "gateway.env has no CHUDWARE_GATEWAY_RELEASE_TOKEN" >&2; exit 1; }
-            umask 077
-            printf 'header = "Authorization: Bearer %s"\n' "$token" > "$1"
-          }
-
-          case "${1:-}" in
-            releases-dir)
-              dir="$(gw_value CHUDWARE_RELEASES_DIR)"
-              [ -n "$dir" ] || dir="$HOME/chudware-releases"
-              mkdir -p "$dir/incoming"
-              printf '%s\n' "$dir"
-              ;;
-            status|publish)
-              body="${2:?body file required}"
-              [ -s "$body" ] || { echo "empty request body: $body" >&2; exit 1; }
-              path="/api/releases/ci/status"
-              [ "$1" = publish ] && path="/api/releases/ci/publish"
-              config="$(mktemp)"
-              trap 'rm -f "$config"' EXIT
-              curlrc "$config"
-              curl --config "$config" --fail-with-body --silent --show-error --max-time 300 \
-                -H 'Content-Type: application/json' --data-binary "@$body" "${LOOPBACK}${path}"
-              printf '\n'
-              ;;
-            *)
-              echo "usage: remote_gateway.sh releases-dir|status BODY|publish BODY" >&2
-              exit 2
-              ;;
-          esac
-          '@
-          [IO.File]::WriteAllText($helper, ($script -replace "`r`n", "`n"), (New-Object Text.ASCIIEncoding))
-
-          $sshArgs = @('-i', $env:GATEWAY_SSH_KEY_FILE, '-o', "UserKnownHostsFile=$known",
-                       '-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20')
-          $target = "$($env:GATEWAY_SSH_USER)@$($env:GATEWAY_SSH_HOST)"
-          $remoteDir = "/tmp/chudware-ci-$env:GITHUB_RUN_ID"
-          & ssh @sshArgs $target "mkdir -p '$remoteDir'"
-          if ($LASTEXITCODE -ne 0) { Write-Host '::error::cannot reach the gateway host over ssh'; exit 1 }
-          & scp @sshArgs $helper "${target}:$remoteDir/remote_gateway.sh"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $releases = (& ssh @sshArgs $target "bash '$remoteDir/remote_gateway.sh' releases-dir") | Select-Object -Last 1
-          if ($LASTEXITCODE -ne 0 -or -not $releases) { Write-Host '::error::could not resolve the remote releases directory'; exit 1 }
-          Write-Host "remote releases dir=$releases"
-          "GATEWAY_REMOTE_DIR=$remoteDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "GATEWAY_RELEASES_DIR=$releases" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "gateway reachable: $probe"
 
           # Status reporting from this job goes through the same channel.
           $reporter = Join-Path $env:RUNNER_TEMP 'ci_status.ps1'
           $reporterBody = @'
           param([Parameter(Mandatory=$true)][string]$Status, [string]$Detail = '')
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
           $body = Join-Path $env:RUNNER_TEMP 'ci-status.json'
           $payload = [ordered]@{
             run_id     = $env:GITHUB_RUN_ID
@@ -882,11 +839,10 @@ jobs:
             detail     = $Detail
           }
           [IO.File]::WriteAllText($body, ($payload | ConvertTo-Json -Compress), (New-Object Text.ASCIIEncoding))
-          $sshArgs = @('-i', $env:GATEWAY_SSH_KEY_FILE, '-o', "UserKnownHostsFile=$env:GATEWAY_KNOWN_HOSTS",
-             '-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20')
-          $target = "$($env:GATEWAY_SSH_USER)@$($env:GATEWAY_SSH_HOST)"
-          & scp @sshArgs $body "${target}:$env:GATEWAY_REMOTE_DIR/ci-status.json" | Out-Null
-          & ssh @sshArgs $target "bash '$env:GATEWAY_REMOTE_DIR/remote_gateway.sh' status '$env:GATEWAY_REMOTE_DIR/ci-status.json'"
+          $retry = $env:CHUDWARE_GATEWAY_CURL_RETRY -split ' '
+          & curl.exe --config $env:GATEWAY_CURLRC --fail-with-body -sS --max-time 120 @retry `
+            -H 'Content-Type: application/json' --data-binary "@$body" `
+            "$env:CHUDWARE_GATEWAY_PUBLIC_BASE/api/releases/ci/status" | Out-Null
           if ($LASTEXITCODE -ne 0) { Write-Host "::warning::ci/status $Status was not recorded" }
           '@
           [IO.File]::WriteAllText($reporter, ($reporterBody -replace "`r`n", "`n"), (New-Object Text.ASCIIEncoding))
@@ -1102,16 +1058,14 @@ jobs:
           }
           "HAS_EVIDENCE=$(if ($ok) { '1' } else { '0' })" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Upload the installer and publish over the gateway loopback
+      - name: Upload the installer and publish over the gateway API
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $sshArgs = @('-i', $env:GATEWAY_SSH_KEY_FILE, '-o', "UserKnownHostsFile=$env:GATEWAY_KNOWN_HOSTS",
-                       '-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20')
-          $target = "$($env:GATEWAY_SSH_USER)@$($env:GATEWAY_SSH_HOST)"
-          $incoming = "$env:GATEWAY_RELEASES_DIR/incoming"
           $name = $env:ARTIFACT_NAME
           $evidence = Join-Path $env:RUNNER_TEMP 'evidence'
+          $base = $env:CHUDWARE_GATEWAY_PUBLIC_BASE
+          $retry = $env:CHUDWARE_GATEWAY_CURL_RETRY -split ' '
 
           # Sidecars carry the artifact's own name plus a suffix; the payload
           # signature REPLACES the .json (payload-manifest.v1.sig), while evidence
@@ -1129,10 +1083,35 @@ jobs:
           }
           foreach ($item in $uploads) {
             if (-not (Test-Path $item.Local)) { Write-Host "::error::missing upload $($item.Local)"; exit 1 }
-            & scp @sshArgs $item.Local "${target}:$incoming/$($item.Remote)"
-            if ($LASTEXITCODE -ne 0) { Write-Host "::error::scp failed for $($item.Remote)"; exit 1 }
+            $expected = (Get-FileHash -Path $item.Local -Algorithm SHA256).Hash.ToLower()
+            # --upload-file streams from disk; --data-binary would read a ~500 MB
+            # installer into memory first, and the handler wants a raw body either
+            # way. The gateway writes to <name>.part and renames, so ci/publish
+            # never sees a torn upload.
+            # No 2>&1: under $ErrorActionPreference = 'Stop', PowerShell 5.1 turns
+            # a native command's redirected stderr into a terminating
+            # NativeCommandError, which would abort before the check below and
+            # report the wrong cause. --fail-with-body puts the gateway's reply on
+            # stdout; its diagnostics stay in the step log where they belong.
+            $response = & curl.exe --config $env:GATEWAY_CURLRC --fail-with-body -sS `
+              --max-time 3600 @retry --upload-file $item.Local `
+              "$base/api/releases/ci/upload/$($item.Remote)"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::upload failed for $($item.Remote): $response"
+              exit 1
+            }
+            # The gateway re-digests these bytes again at publish time; comparing
+            # here names transport corruption at the file that caused it instead
+            # of as a 422 an hour later.
+            $reported = ''
+            try { $reported = (($response -join '') | ConvertFrom-Json).sha256 } catch { $reported = '' }
+            if ($reported -ne $expected) {
+              Write-Host "::error::the gateway stored a different digest for $($item.Remote): expected $expected, got '$reported'"
+              exit 1
+            }
+            Write-Host "uploaded $($item.Remote) sha256=$reported"
           }
-          Write-Host "uploaded $($uploads.Count) files to $incoming"
+          Write-Host "uploaded $($uploads.Count) files into the gateway staging directory"
 
           & (Join-Path $env:RUNNER_TEMP 'ci_status.ps1') -Status 'publishing' -Detail "posting ci/publish for $name"
 
@@ -1189,10 +1168,14 @@ jobs:
           & python $builder
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          & scp @sshArgs $body "${target}:$env:GATEWAY_REMOTE_DIR/publish.json"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & ssh @sshArgs $target "bash '$env:GATEWAY_REMOTE_DIR/remote_gateway.sh' publish '$env:GATEWAY_REMOTE_DIR/publish.json'"
-          if ($LASTEXITCODE -ne 0) { Write-Host '::error::ci/publish rejected the Windows installer'; exit 1 }
+          $response = & curl.exe --config $env:GATEWAY_CURLRC --fail-with-body -sS `
+            --max-time 300 @retry -H 'Content-Type: application/json' `
+            --data-binary "@$body" "$base/api/releases/ci/publish"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::ci/publish rejected the Windows installer: $response"
+            exit 1
+          }
+          Write-Host ($response -join '')
 
           & (Join-Path $env:RUNNER_TEMP 'ci_status.ps1') -Status 'published' -Detail "$name published to beta"
           @(
@@ -1211,17 +1194,6 @@ jobs:
           $reporter = Join-Path $env:RUNNER_TEMP 'ci_status.ps1'
           if (-not (Test-Path $reporter)) { exit 0 }
           & $reporter -Status 'failed' -Detail "windows-beta ${{ job.status }} in run $env:GITHUB_RUN_NUMBER"
-
-      - name: Remove the run-scoped remote staging directory
-        if: always()
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          if (-not $env:GATEWAY_REMOTE_DIR -or -not $env:GATEWAY_SSH_KEY_FILE) { exit 0 }
-          $sshArgs = @('-i', $env:GATEWAY_SSH_KEY_FILE, '-o', "UserKnownHostsFile=$env:GATEWAY_KNOWN_HOSTS",
-                       '-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20')
-          & ssh @sshArgs "$($env:GATEWAY_SSH_USER)@$($env:GATEWAY_SSH_HOST)" "rm -rf '$env:GATEWAY_REMOTE_DIR'"
-          exit 0
 
   macos-beta:
     name: macOS beta app (${{ matrix.arch }})
@@ -1249,8 +1221,9 @@ jobs:
       RELEASE_ARCH: ${{ matrix.arch }}
       CORE_PRESET: ${{ matrix.preset }}
       HOST_BUILD_DIR: ${{ matrix.host_build_dir }}
-      GATEWAY_SSH_HOST: ${{ secrets.CHUDWARE_LIVINGROOM_SSH_HOST }}
-      GATEWAY_SSH_USER: liveuser
+      # Neither Mac can route to the gateway host's LAN address, so each holds
+      # the release token itself and publishes over TLS to the public origin.
+      GATEWAY_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
     steps:
       - name: Check runner capabilities and select the release Python
         shell: bash
@@ -1275,7 +1248,9 @@ jobs:
           # String accumulator, not an array: bash 3.2 treats an empty array
           # expansion under `set -u` as an unbound variable.
           missing=""
-          for tool in cmake ninja ctest python3 git curl tar zip rsync scp ssh bun \
+          # curl, not ssh/scp: this runner reaches the gateway over TLS on the
+          # public origin because the two LANs do not route to each other.
+          for tool in cmake ninja ctest python3 git curl tar zip rsync bun \
             clang xcrun xcode-select ditto otool install_name_tool plutil codesign; do
             command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
           done
@@ -1352,118 +1327,53 @@ jobs:
           # reads tags for provenance and build_app.sh sources build.sh.
           fetch-depth: 0
 
-      - name: Open the authenticated channel to the gateway host
-        env:
-          GATEWAY_SSH_KEY: ${{ secrets.CHUDWARE_LIVINGROOM_SSH_KEY }}
-          GATEWAY_HOST_KEY: ${{ secrets.CHUDWARE_LIVINGROOM_HOST_KEY }}
+      - name: Open the authenticated channel to the gateway
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "${GATEWAY_SSH_HOST:-}" ] || { echo '::error::CHUDWARE_LIVINGROOM_SSH_HOST is not set'; exit 1; }
-          [ -n "${GATEWAY_SSH_KEY:-}" ] || { echo '::error::CHUDWARE_LIVINGROOM_SSH_KEY is not set'; exit 1; }
-          [ -n "${GATEWAY_HOST_KEY:-}" ] || { echo '::error::CHUDWARE_LIVINGROOM_HOST_KEY is not set'; exit 1; }
-
-          # Run-scoped: RUNNER_TEMP is wiped between jobs. Its path contains no
-          # spaces on these hosts, which is what lets ${ssh_opts} below stay a
-          # word-split string instead of a bash 4 array.
-          ssh_dir="${RUNNER_TEMP}/ssh"
-          rm -rf "${ssh_dir}"
-          umask 077
-          mkdir -p "${ssh_dir}"
-          key="${ssh_dir}/id"
-          known="${ssh_dir}/known_hosts"
-          # LF only, trailing newline, and never through argv: OpenSSH rejects a
-          # key it cannot parse and a stray CR is the classic silent failure.
-          # chmod 600 is the POSIX half of the Windows leg's icacls SID grant.
-          printf '%s\n' "${GATEWAY_SSH_KEY}" | tr -d '\r' > "${key}"
-          printf '%s\n' "${GATEWAY_HOST_KEY}" | tr -d '\r' > "${known}"
-          chmod 600 "${key}" "${known}"
-
-          # The publish/status helper runs ON the gateway box: the release token
-          # is read there, used against 127.0.0.1:8300, and never crosses the
-          # network. Byte-for-byte the script the Windows leg writes.
-          helper="${RUNNER_TEMP}/remote_gateway.sh"
-          cat > "${helper}" <<'SH'
-          #!/usr/bin/env bash
-          # Written by .github/workflows/nightly-release.yml; runs on the gateway host only.
-          set -euo pipefail
-          ENV_FILE="${CHUDWARE_GATEWAY_ENV_FILE:-/home/liveuser/chudware-web-data/gateway.env}"
-          LOOPBACK="http://127.0.0.1:8300"
-
-          gw_value() {
-            python3 - "$ENV_FILE" "$1" <<'PY'
-          import sys
-          value = ""
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              for line in stream:
-                  line = line.strip()
-                  if line.startswith(sys.argv[2] + "="):
-                      value = line.split("=", 1)[1].strip().strip("'\"")
-          print(value)
-          PY
-          }
-
-          curlrc() {
-            local token
-            token="$(gw_value CHUDWARE_GATEWAY_RELEASE_TOKEN)"
-            [ -n "$token" ] || { echo "gateway.env has no CHUDWARE_GATEWAY_RELEASE_TOKEN" >&2; exit 1; }
-            umask 077
-            printf 'header = "Authorization: Bearer %s"\n' "$token" > "$1"
-          }
-
-          case "${1:-}" in
-            releases-dir)
-              dir="$(gw_value CHUDWARE_RELEASES_DIR)"
-              [ -n "$dir" ] || dir="$HOME/chudware-releases"
-              mkdir -p "$dir/incoming"
-              printf '%s\n' "$dir"
-              ;;
-            status|publish)
-              body="${2:?body file required}"
-              [ -s "$body" ] || { echo "empty request body: $body" >&2; exit 1; }
-              path="/api/releases/ci/status"
-              [ "$1" = publish ] && path="/api/releases/ci/publish"
-              config="$(mktemp)"
-              trap 'rm -f "$config"' EXIT
-              curlrc "$config"
-              curl --config "$config" --fail-with-body --silent --show-error --max-time 300 \
-                -H 'Content-Type: application/json' --data-binary "@$body" "${LOOPBACK}${path}"
-              printf '\n'
-              ;;
-            *)
-              echo "usage: remote_gateway.sh releases-dir|status BODY|publish BODY" >&2
-              exit 2
-              ;;
-          esac
-          SH
-
-          ssh_opts="-i ${key} -o UserKnownHostsFile=${known} -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20"
-          target="${GATEWAY_SSH_USER}@${GATEWAY_SSH_HOST}"
-          # Prove the channel before hours of building depend on it.
-          ssh ${ssh_opts} "${target}" true || {
-            echo '::error::cannot reach the gateway host over ssh; check CHUDWARE_LIVINGROOM_SSH_KEY and the pinned host key'
+          [ -n "${GATEWAY_TOKEN:-}" ] || {
+            echo '::error::CHUDWARE_GATEWAY_RELEASE_TOKEN is not set; this runner publishes over TLS and has no other credential'
             exit 1
           }
-          # Both macOS rows share one GITHUB_RUN_ID, so the staging directory is
-          # per-arch or the two would delete each other's helper.
-          remote_dir="/tmp/chudware-ci-${GITHUB_RUN_ID}-macos-${RELEASE_ARCH}"
-          ssh ${ssh_opts} "${target}" "mkdir -p '${remote_dir}'"
-          scp ${ssh_opts} "${helper}" "${target}:${remote_dir}/remote_gateway.sh"
-          releases_dir="$(ssh ${ssh_opts} "${target}" "bash '${remote_dir}/remote_gateway.sh' releases-dir" | tail -n 1)"
-          [ -n "${releases_dir}" ] || {
-            echo '::error::could not resolve the remote releases directory'; exit 1; }
-          echo "remote releases dir=${releases_dir}"
+          [ -n "${CHUDWARE_GATEWAY_PUBLIC_BASE:-}" ] || {
+            echo '::error::CHUDWARE_GATEWAY_PUBLIC_BASE is not set'; exit 1; }
 
-          # One helper, sourced by every later step.
-          cat > "${RUNNER_TEMP}/gw.sh" <<SH
-          GATEWAY_SSH_OPTS="${ssh_opts}"
-          GATEWAY_TARGET="${target}"
-          GATEWAY_REMOTE_DIR="${remote_dir}"
-          GATEWAY_RELEASES_DIR="${releases_dir}"
-          SH
-          cat >> "${RUNNER_TEMP}/gw.sh" <<'SH'
-          gw_ssh() { ssh ${GATEWAY_SSH_OPTS} "${GATEWAY_TARGET}" "$@"; }
-          gw_scp() { scp ${GATEWAY_SSH_OPTS} "$1" "${GATEWAY_TARGET}:$2"; }
+          # Run-scoped: RUNNER_TEMP is wiped between jobs. The token goes to a
+          # 0600 curl --config file, never to argv: another process on this Mac
+          # can read a command line, and GitHub's log masking does not help there.
+          curlrc="${RUNNER_TEMP}/gw.curlrc"
+          umask 077
+          printf 'header = "Authorization: Bearer %s"\n' "${GATEWAY_TOKEN}" > "${curlrc}"
+          chmod 600 "${curlrc}"
+
+          # Reachability is proven before hours of building depend on it. This
+          # endpoint is anonymous and read-only, so a 200 here means DNS, TLS and
+          # routing all work; the token itself is proven by the first ci/status.
+          probe="$(curl --fail-with-body --silent --show-error --max-time 30 \
+            "${CHUDWARE_GATEWAY_PUBLIC_BASE}/api/releases/base-version")" || {
+            echo "::error::cannot reach ${CHUDWARE_GATEWAY_PUBLIC_BASE} from this runner"
+            exit 1
+          }
+          echo "gateway reachable: ${probe}"
+
+          # One helper, sourced by every later step: public origin, token only
+          # from the config file, and the shared retry budget on every call.
+          cat > "${RUNNER_TEMP}/gw.sh" <<'SH'
+          gw_post() {  # gw_post <path> <json file>
+            curl --config "${RUNNER_TEMP}/gw.curlrc" --fail-with-body --silent --show-error \
+              --max-time 300 ${CHUDWARE_GATEWAY_CURL_RETRY} \
+              -H 'Content-Type: application/json' --data-binary "@$2" \
+              "${CHUDWARE_GATEWAY_PUBLIC_BASE}$1"
+          }
+          gw_upload() {  # gw_upload <local file> <remote name>; echoes the gateway's json
+            # --upload-file streams from disk; --data-binary would read a ~500 MB
+            # zip into memory first, and the handler wants a raw body either way.
+            # The gateway writes <name>.part and renames, so ci/publish never
+            # sees a torn upload.
+            curl --config "${RUNNER_TEMP}/gw.curlrc" --fail-with-body --silent --show-error \
+              --max-time 3600 ${CHUDWARE_GATEWAY_CURL_RETRY} --upload-file "$1" \
+              "${CHUDWARE_GATEWAY_PUBLIC_BASE}/api/releases/ci/upload/$2"
+          }
           ci_status() {  # ci_status <status> <detail>
             body="${RUNNER_TEMP}/ci-status.json"
             "${RELEASE_PYTHON}" - "$1" "$2" > "${body}" <<'PY'
@@ -1479,12 +1389,8 @@ jobs:
               "detail": sys.argv[2],
           }, sys.stdout)
           PY
-            if gw_scp "${body}" "${GATEWAY_REMOTE_DIR}/ci-status.json" > /dev/null; then
-              gw_ssh "bash '${GATEWAY_REMOTE_DIR}/remote_gateway.sh' status '${GATEWAY_REMOTE_DIR}/ci-status.json'" \
-                > /dev/null || echo "::warning::ci/status $1 was not recorded"
-            else
-              echo "::warning::ci/status $1 was not uploaded"
-            fi
+            gw_post /api/releases/ci/status "${body}" > /dev/null \
+              || echo "::warning::ci/status $1 was not recorded"
           }
           SH
           . "${RUNNER_TEMP}/gw.sh"
@@ -1769,40 +1675,56 @@ jobs:
           cp "${app}/payload-manifest.v1.json" "${work}/payload-manifest.v1.json"
           cp "${app}/payload-manifest.v1.sig" "${work}/payload-manifest.v1.sig"
 
-      - name: Upload the app and publish over the gateway loopback
+      - name: Upload the app and publish over the gateway API
         shell: bash
         run: |
           set -euo pipefail
           . "${RUNNER_TEMP}/gw.sh"
           name="Chudware-${RELEASE_VERSION}-macos-${RELEASE_ARCH}.zip"
-          incoming="${GATEWAY_RELEASES_DIR}/incoming"
+
+          upload_one() {  # upload_one <local file> <remote name>
+            local file="$1" remote="$2" expected reported response
+            test -f "${file}" || { echo "::error::missing upload ${file}"; exit 1; }
+            expected="$("${RELEASE_PYTHON}" - "${file}" <<'PY'
+          import hashlib, sys
+          value = hashlib.sha256()
+          with open(sys.argv[1], "rb") as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                  value.update(chunk)
+          print(value.hexdigest())
+          PY
+          )"
+            response="$(gw_upload "${file}" "${remote}")" || {
+              echo "::error::upload failed for ${remote}"; exit 1; }
+            # The gateway re-digests these bytes again at publish time; comparing
+            # here names transport corruption at the file that caused it instead
+            # of as a 422 an hour later.
+            reported="$(printf '%s' "${response}" | "${RELEASE_PYTHON}" -c \
+              'import json,sys; print(json.load(sys.stdin).get("sha256",""))')" || reported=""
+            if [ "${reported}" != "${expected}" ]; then
+              echo "::error::the gateway stored a different digest for ${remote}: expected ${expected}, got '${reported}'"
+              exit 1
+            fi
+            echo "uploaded ${remote} sha256=${reported}"
+            uploaded=$((uploaded + 1))
+          }
 
           # Sidecars carry the artifact's own name plus a suffix; the payload
           # signature REPLACES the .json (payload-manifest.v1.sig), while
           # evidence signatures append .sig to the full evidence file name.
-          gw_scp "${ARTIFACT}" "${incoming}/${name}" > /dev/null || {
-            echo "::error::scp failed for ${name}"; exit 1; }
-          gw_scp "${RUNNER_TEMP}/verify/payload-manifest.v1.json" \
-            "${incoming}/${name}.payload-manifest.v1.json" > /dev/null || {
-            echo '::error::scp failed for the payload manifest'; exit 1; }
-          gw_scp "${RUNNER_TEMP}/verify/payload-manifest.v1.sig" \
-            "${incoming}/${name}.payload-manifest.v1.sig" > /dev/null || {
-            echo '::error::scp failed for the payload manifest signature'; exit 1; }
-          uploaded=3
+          uploaded=0
+          upload_one "${ARTIFACT}" "${name}"
+          upload_one "${RUNNER_TEMP}/verify/payload-manifest.v1.json" "${name}.payload-manifest.v1.json"
+          upload_one "${RUNNER_TEMP}/verify/payload-manifest.v1.sig" "${name}.payload-manifest.v1.sig"
           if [ "${HAS_EVIDENCE}" = 1 ]; then
             for document in sbom.cdx.json provenance.slsa.json platform-test.v1.json; do
               for suffix in '' '.sig'; do
-                local_path="${RUNNER_TEMP}/evidence/${document}${suffix}"
-                test -f "${local_path}" || {
-                  echo "::error::missing upload ${local_path}"; exit 1; }
-                gw_scp "${local_path}" "${incoming}/${name}.${document}${suffix}" > /dev/null || {
-                  echo "::error::scp failed for ${name}.${document}${suffix}"; exit 1; }
-                uploaded=$((uploaded + 1))
+                upload_one "${RUNNER_TEMP}/evidence/${document}${suffix}" "${name}.${document}${suffix}"
               done
             done
           fi
           echo "ARTIFACT_NAME=${name}" >> "$GITHUB_ENV"
-          echo "uploaded ${uploaded} files to ${incoming}"
+          echo "uploaded ${uploaded} files into the gateway staging directory"
 
           ci_status publishing "posting ci/publish for ${name}"
 
@@ -1850,11 +1772,14 @@ jobs:
           PY
 
           # A 422 for a digest/size mismatch makes the gateway DELETE the staged
-          # artifact (sidecars survive), so a retry must re-stage it. Re-running
-          # this job does exactly that: it rebuilds and re-uploads first.
-          gw_scp "${body}" "${GATEWAY_REMOTE_DIR}/publish.json" > /dev/null
-          gw_ssh "bash '${GATEWAY_REMOTE_DIR}/remote_gateway.sh' publish '${GATEWAY_REMOTE_DIR}/publish.json'" || {
+          # artifact (sidecars survive), so a retry must re-upload it. Re-running
+          # this job does exactly that: it rebuilds and re-uploads before
+          # publishing.
+          response="$(gw_post /api/releases/ci/publish "${body}")" || {
             echo '::error::ci/publish rejected the macOS app'; exit 1; }
+          printf '%s\n' "${response}" | "${RELEASE_PYTHON}" -c \
+            'import json,sys; print(json.dumps(json.load(sys.stdin), indent=2, sort_keys=True))' \
+            || printf '%s\n' "${response}"
 
           ci_status published "${name} published to beta"
           {
@@ -1873,13 +1798,3 @@ jobs:
           test -r "${RUNNER_TEMP}/gw.sh" || exit 0
           . "${RUNNER_TEMP}/gw.sh"
           ci_status failed "macos-beta ${RELEASE_ARCH} ${{ job.status }} in run ${GITHUB_RUN_NUMBER}"
-
-      - name: Remove the run-scoped remote staging directory
-        if: always()
-        shell: bash
-        run: |
-          set -uo pipefail
-          test -r "${RUNNER_TEMP}/gw.sh" || exit 0
-          . "${RUNNER_TEMP}/gw.sh"
-          gw_ssh "rm -rf '${GATEWAY_REMOTE_DIR}'" || true
-          exit 0

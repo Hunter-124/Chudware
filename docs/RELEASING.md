@@ -68,15 +68,25 @@ Every night, and on demand from the Actions tab:
    regardless, and a row that never starts runs no steps, so it posts no
    `failed` transition — it stays `queued` in `/admin` until the next night's
    run supersedes it.
-5. **Publish.** Each job stages the artifact and its sidecars in
-   `<releases_dir>/incoming/` and calls `POST /api/releases/ci/publish` on
-   **`http://127.0.0.1:8300`**, on the gateway host. The Windows and macOS
-   builders get there over `scp` + `ssh`, through the same
-   `remote_gateway.sh` helper each job writes to the box; the release token
-   never leaves the gateway box and is never passed on a command line.
-   The gateway recomputes the digest and size,
-   verifies both signatures, and moves everything into
-   `<releases_dir>/store/beta/<version>/`.
+5. **Publish.** Every job gets its bytes into `<releases_dir>/incoming/` on the
+   gateway host and then calls `POST /api/releases/ci/publish`. There are two
+   transports, because the fleet is not one network:
+   * **`linux-beta` runs ON the gateway host.** It copies the files into
+     `incoming/` directly and posts to **`http://127.0.0.1:8300`**, reading the
+     token from `gateway.env` at the point of use. The token never leaves the box.
+   * **`windows-beta` and `macos-beta` cannot route to it at all** (the builders
+     are on `192.168.1.x`, the gateway is `192.168.0.183`; proven by diagnostic).
+     They hold the same token as the `CHUDWARE_GATEWAY_RELEASE_TOKEN` secret and
+     reach the gateway over TLS on `https://app.chudware.com`: each produced file
+     is streamed in with `PUT /api/releases/ci/upload/<name>` (curl
+     `--upload-file`, so a 500 MB installer is never buffered in memory), and the
+     job compares the sha256 the endpoint reports against the local digest before
+     moving on. Then the ordinary `ci/publish` and `ci/status` calls follow over
+     the same origin. Those runners need nothing but outbound 443.
+
+   On every host the token reaches curl through a `0600` `--config` file, never
+   on a command line. The gateway recomputes the digest and size, verifies both
+   signatures, and moves everything into `<releases_dir>/store/beta/<version>/`.
 6. **Status.** Every transition (`queued`, `building`, `testing`, `packaging`,
    `publishing`, `published`, `failed`) is posted to `POST
    /api/releases/ci/status` and shows up in `/admin` under Dashboard and
@@ -131,13 +141,22 @@ floor is a deliberate act through `packaging/publish.py register --min-supported
 | Secret | Used by | Content |
 |---|---|---|
 | `CHUDWARE_RELEASE_CI_KEY` | all three build jobs | base64 32-byte Ed25519 **seed** for `release-ci-v1` (single line, no PEM). Offline copy: `~/.chudware/release-ci-v1.seed.b64` on the owner workstation. |
-| `CHUDWARE_LIVINGROOM_SSH_HOST` | `windows-beta`, `macos-beta` | gateway host address, e.g. `192.168.0.183` |
-| `CHUDWARE_LIVINGROOM_SSH_KEY` | `windows-beta`, `macos-beta` | OpenSSH **private** key authorized for `liveuser` on the gateway host |
-| `CHUDWARE_LIVINGROOM_HOST_KEY` | `windows-beta`, `macos-beta` | the gateway host's `known_hosts` line (ed25519). Host-key checking is strict; without this the upload fails closed. |
+| `CHUDWARE_GATEWAY_RELEASE_TOKEN` | `windows-beta`, `macos-beta` | the gateway's release publishing token, the same value as `CHUDWARE_GATEWAY_RELEASE_TOKEN` in `gateway.env`. Those two runners cannot route to the gateway host's LAN address, so they authenticate to `https://app.chudware.com` with this Bearer token over TLS. `plan` and `linux-beta` do **not** use it: they run on the gateway host and read the token from `gateway.env` at the point of use. |
 
-Nothing else is secret: the CI public key, loopback URL and gateway env path are
-in the workflow in the clear on purpose, so a rotated key fails loudly at
-`ci_sign.py --expect-public-key` instead of silently signing with the wrong key.
+There are no SSH secrets any more. `CHUDWARE_LIVINGROOM_SSH_HOST`,
+`CHUDWARE_LIVINGROOM_SSH_KEY` and `CHUDWARE_LIVINGROOM_HOST_KEY` were removed
+when the transport moved from `scp` + `ssh` to the gateway's upload endpoint:
+`192.168.1.x` and `192.168.0.x` do not route to each other, so the SSH path
+never worked from those builders. The off-LAN runners now need **outbound 443
+only** - no LAN reachability, no host key, no shell on the gateway box.
+
+Nothing else is secret: the CI public key, the public base URL, the loopback URL
+and the gateway env path are in the workflow in the clear on purpose, so a
+rotated key fails loudly at `ci_sign.py --expect-public-key` instead of silently
+signing with the wrong key.
+On every host the token is handed to curl through a `0600` `--config` file, never
+on a command line: a shared runner's process list is readable, and GitHub's log
+masking does not help there.
 
 Rotating `release-ci-v1` means: generate a new seed, add the new public key to
 all three keyrings (`core/security/release_keys.h`,
@@ -162,7 +181,7 @@ fails at its capability check with an explicit message otherwise):
 **`cc-win-package`:**
 
 * Visual Studio with the x64 C++ toolset (`vcvars64.bat` or the DevShell module)
-* `cmake`, `ninja`, `ctest`, `git`, `python`, `bun`, `ssh`, `scp` on `PATH`
+* `cmake`, `ninja`, `ctest`, `git`, `python`, `bun`, `curl` on `PATH`
   (`%USERPROFILE%\chudware-ci-tools\{bin,python}` is added automatically, as in
   `native-build.yml`)
 * **Inno Setup 6** — `ISCC.exe` in `%USERPROFILE%\chudware-ci-tools\innosetup`
@@ -173,6 +192,10 @@ fails at its capability check with an explicit message otherwise):
 * Nuitka and `packaging/requirements-release.txt` for the compiled sidecars
 * `CHUDWARE_SIGN_IDENTITY` if you want Authenticode on the installer; without it
   the installer is unsigned and SmartScreen will warn (see `docs/SIGNING.md`)
+* outbound HTTPS to `app.chudware.com`. This runner cannot reach the gateway's
+  LAN address and does not need to: it uploads and publishes over TLS, and the
+  job's first channel step fails loudly with the unreachable origin if 443 is
+  blocked.
 
 **`cc-mac-intel` (imac-intel, x86_64) and `cc-mac-arm` (macbook-air-m2, arm64):**
 
@@ -180,8 +203,8 @@ fails at its capability check with an explicit message otherwise):
   step uses `xcodebuild`, and the capability check asserts the compiler rather
   than the IDE.
 * `cmake`, `ninja`, `ctest`, `python3`, `git`, `curl`, `tar`, `zip`, `rsync`,
-  `ssh`, `scp`, `bun`, plus the Command Line Tools' `ditto`, `otool`,
-  `install_name_tool`, `plutil` and `codesign`
+  `bun`, plus the Command Line Tools' `ditto`, `otool`, `install_name_tool`,
+  `plutil` and `codesign`
 * Homebrew, with `opencascade` installed: off Windows `ProvisionOCCT.cmake`
   downloads nothing and the `macos-*` presets `find_package` OCCT through the
   brew prefix (`/opt/homebrew` on arm64, `/usr/local` on Intel)
@@ -194,6 +217,8 @@ fails at its capability check with an explicit message otherwise):
 * `bun` for the compiled OMP bridge sidecar. `~/.bun/bin`, `/opt/homebrew/bin`
   and `/usr/local/bin` are prepended to `PATH` by the job itself, since the
   runner service starts with a minimal `PATH`.
+* outbound HTTPS to `app.chudware.com`, for the same reason as the Windows
+  builder: neither Mac can route to `192.168.0.183`.
 
 `runner-provision.yml` covers both Macs: dispatch it with `runner_label` set to
 `cc-mac-intel` or `cc-mac-arm` and it installs bun, the brew formulae
@@ -259,6 +284,17 @@ pipeline pinned the commit it built.
       --platform linux --arch x86_64 --artifact dist/Chudware-0.1.0-beta.42-linux-x86_64.AppImage
   ```
 
-* **Never** post a publish or status call to `https://app.chudware.com` from a
-  runner. The release token lives on the gateway host; loopback is the only
-  publish path, and that is what makes the token non-exportable.
+* **A failed upload:** `PUT /api/releases/ci/upload/<name>` streams to
+  `incoming/<name>.part` and renames only on success, so a dropped connection
+  leaves no half-file for `ci/publish` to trip over. Every call carries
+  `--retry 5 --retry-delay 15 --retry-max-time 600`, and the job compares the
+  sha256 the endpoint returns against the local digest, so transport corruption
+  is named at the file that caused it instead of as a 422 an hour later. A 413
+  means the artifact passed the endpoint's 2 GiB ceiling.
+* **Transport rules.** `plan` and `linux-beta` run on the gateway host: they must
+  use `http://127.0.0.1:8300` and read the token from `gateway.env`, never the
+  public URL. `windows-beta` and `macos-beta` are off-LAN and must use
+  `https://app.chudware.com` with the `CHUDWARE_GATEWAY_RELEASE_TOKEN` secret;
+  there is no SSH path any more, and adding one back would not work - those
+  subnets do not route. On both transports the token goes to curl in a `0600`
+  `--config` file, never in argv.

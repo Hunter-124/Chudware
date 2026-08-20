@@ -78,6 +78,9 @@ function Build-OmpBridge([string]$Destination) {
             "--no-compile-autoload-package-json", "--windows-hide-console",
             "bridge/src/bridge.ts", "--outfile", $Destination
         )
+        # bun --compile writes bridge.js.map beside the outfile even under
+        # --sourcemap=none; the payload guard rejects debug artifacts.
+        Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path (Split-Path $destination) "bridge.js.map")
     } finally {
         Pop-Location
     }

@@ -91,6 +91,9 @@ build_omp_bridge() {
         --allow-unresolved='' --allow-unresolved='@img/sharp-*/versions' --allow-unresolved='@img/sharp-libvips-*/lib' --allow-unresolved='@img/sharp-libvips-*/package' --allow-unresolved='@img/sharp-libvips-*/versions' --allow-unresolved='@img/sharp-libvips-dev-*/include' --allow-unresolved='@img/sharp-libvips-dev-*/lib' \
         --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
         --no-compile-autoload-package-json bridge/src/bridge.ts --outfile "$destination")
+    # bun --compile writes <entry>.js.map beside the outfile even under
+    # --sourcemap=none; the staging guard rightly rejects debug artifacts.
+    rm -f "$(dirname "$destination")/bridge.js.map"
     [ -x "$destination" ] || { echo "error: Bun did not produce $destination" >&2; exit 1; }
 }
 

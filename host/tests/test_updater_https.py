@@ -100,6 +100,32 @@ def main() -> int:
                 raise AssertionError("updater accepted a plaintext HTTP artifact URL")
             if (plaintext / "data" / "updates" / "staged.json").exists():
                 raise AssertionError("plaintext HTTP artifact was staged")
+
+            # An empty channel (404 manifest) is the normal pre-release state and
+            # must read as a quiet "up to date", not an HTTP error. The manifest
+            # fetch goes over plain loopback here: only artifact downloads are
+            # pinned to TLS, and the manifest carries no secrets.
+            class _Empty(http.server.BaseHTTPRequestHandler):
+                def do_GET(self) -> None:  # noqa: N802
+                    self.send_error(404)
+
+                def log_message(self, *_args: object) -> None:
+                    pass
+
+            empty_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Empty)
+            empty_thread = threading.Thread(target=empty_server.serve_forever, daemon=True)
+            empty_thread.start()
+            try:
+                subprocess.run(
+                    [str(args.test_updater), "--check-once",
+                     f"http://127.0.0.1:{empty_server.server_address[1]}/latest",
+                     str(root / "empty-channel")],
+                    env=env, check=True,
+                )
+            finally:
+                empty_server.shutdown()
+                empty_thread.join()
+                empty_server.server_close()
         finally:
             server.shutdown()
             thread.join()

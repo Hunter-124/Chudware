@@ -3,13 +3,16 @@
 #include "update/windows_update_helper.h"
 
 #include <cstdlib>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 
 namespace fs = std::filesystem;
 using chudware::update::Manifest;
+using chudware::update::State;
 using chudware::update::Updater;
 
 namespace {
@@ -349,6 +352,41 @@ void servedSecurityTest(const std::string& kind, const std::string& url,
               << " rejected=yes deleted=yes reported=1 running-app=untouched\n";
 }
 
+// The manifest endpoint answering 404 means "no release on this channel at
+// all". That is the normal state before the first publish and must read as a
+// quiet up-to-date, never as an HTTP error in the user's face.
+void emptyChannelTest(const std::string& endpoint, const fs::path& root) {
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path running = root / "running-app";
+    writeFile(running, "RUNNING APP MUST STAY UNTOUCHED\n");
+#ifdef _WIN32
+    _putenv_s("CHUDWARE_UPDATE_MANIFEST_URL", endpoint.c_str());
+#else
+    setenv("CHUDWARE_UPDATE_MANIFEST_URL", endpoint.c_str(), 1);
+#endif
+    Updater updater;
+    updater.configure("0.0.9", root / "data", running);
+    updater.start();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    for (;;) {
+        const auto snap = updater.snapshot();
+        // Idle (worker not yet scheduled) and Checking are both non-terminal.
+        if (snap.state != State::Idle && snap.state != State::Checking) {
+            require(snap.state == State::Current,
+                    "empty channel (404) must map to Current, not Error");
+            require(snap.message == "Chudware is up to date",
+                    "empty channel must not surface an HTTP status to the user");
+            break;
+        }
+        require(std::chrono::steady_clock::now() < deadline,
+                "first update check never completed");
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    updater.stop();
+    std::cout << "check-once: empty-channel-404=current-quiet\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -357,6 +395,8 @@ int main(int argc, char** argv) {
     stagedLifecycleTests(fs::temp_directory_path() / "chudware-updater-state-test");
     if (argc == 5 && std::string(argv[1]) == "--served") {
         servedSecurityTest(argv[2], argv[3], argv[4]);
+    } else if (argc == 4 && std::string(argv[1]) == "--check-once") {
+        emptyChannelTest(argv[2], argv[3]);
     } else {
         localSecurityTests(fs::temp_directory_path() / "chudware-updater-test");
     }

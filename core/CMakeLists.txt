@@ -8,7 +8,10 @@ cmake_minimum_required(VERSION 3.20)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ChudwareVersion.cmake")
 chudware_version_derive()
 
-project(chudware_core VERSION ${CHUDWARE_VERSION} LANGUAGES C CXX)  # C enabled for chudware_miniz (miniz.c); the VS generator
+# project(VERSION) accepts only a numeric triple; CHUDWARE_VERSION may carry a
+# prerelease suffix (CHUDWARE_VERSION_OVERRIDE, e.g. 0.1.0-beta.3), which belongs
+# in the generated header but cannot reach project().
+project(chudware_core VERSION ${CHUDWARE_VERSION_MAJOR}.${CHUDWARE_VERSION_MINOR}.${CHUDWARE_VERSION_PATCH} LANGUAGES C CXX)  # C enabled for chudware_miniz (miniz.c); the VS generator
                                      # tolerates an implicit C, but Ninja/Make + GCC/Clang need it explicit.
 
 # The new pure-C++ engine (libchudware). Wave 1 = the constraint solver core; later

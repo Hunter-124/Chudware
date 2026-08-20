@@ -52,6 +52,15 @@ json fea_run_adaptive(const json& study) {
                                   "backend, which this build was configured without "
                                   "(CHUDWARE_WITH_POLYMESH)"}};
 
+#ifndef CHUDWARE_WITH_POLYMESH
+        // The availability check above already answered, but the
+        // PolymeshAdaptiveMesher definitions are compiled OUT of this build —
+        // every reference below must be compiled away or the link fails.
+        return json{{"ok", false},
+                    {"error", "fea_adaptive: adaptive refinement needs the polymesh "
+                              "backend, which this build was configured without "
+                              "(CHUDWARE_WITH_POLYMESH)"}};
+#else
         const std::string step_path = study.value("step_path", std::string());
         if (step_path.empty())
             return json{{"ok", false},
@@ -201,6 +210,7 @@ json fea_run_adaptive(const json& study) {
             }
         }
         return result;
+#endif  // CHUDWARE_WITH_POLYMESH
     } catch (const json::exception& e) {
         return json{{"ok", false},
                     {"error", std::string("fea_adaptive: invalid study JSON: ") + e.what()}};

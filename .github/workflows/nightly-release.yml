@@ -786,6 +786,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Install the release Python requirements
+        # The chudware-ci-tools python ships bare; embed_protected_assets and the
+        # sidecar compilers need pyyaml/Nuitka and friends. pip is near-instant
+        # when the pinned set is already satisfied.
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --quiet --disable-pip-version-check -r packaging\requirements-release.txt
+          python -c "import yaml" 2>$null
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::release requirements did not install (pyyaml still missing)'; exit 1 }
+
       - name: Open the authenticated channel to the gateway
         shell: powershell
         run: |

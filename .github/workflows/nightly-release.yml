@@ -370,9 +370,16 @@ jobs:
           set -euo pipefail
           mkdir -p scratch
           rm -f scratch/smoke.png
-          xvfb-run -a --server-args='-screen 0 1920x1080x24' \
-            env CHUDWARE_SHOT=m1 "./${HOST_BUILD_DIR}/bin/chudware" \
-              --ui-screenshot "${GITHUB_WORKSPACE}/scratch/smoke.png"
+          # CHUDWARE_CEF_LAZY=1 defers Chromium init to the first webview open —
+          # the m1 scene never opens one, so the capture cannot hit the tracked
+          # CEF exit deadlock (T-RF23). The timeout turns a hang into a loud
+          # failure instead of a stalled job.
+          timeout --signal=KILL 180 \
+            xvfb-run -a --server-args='-screen 0 1920x1080x24' \
+            env CHUDWARE_SHOT=m1 CHUDWARE_CEF_LAZY=1 "./${HOST_BUILD_DIR}/bin/chudware" \
+              --ui-screenshot "${GITHUB_WORKSPACE}/scratch/smoke.png" || {
+            rc=$?
+            echo "::error::headless capture did not exit cleanly (rc=${rc}; 124/137 = hang, not a crash-check pass)"; exit 1; }
           test -s scratch/smoke.png || {
             echo "::error::headless capture produced no screenshot"; exit 1; }
           python3 -c 'import sys; sys.exit(0 if open("scratch/smoke.png","rb").read(8) == b"\x89PNG\r\n\x1a\n" else "smoke capture is not a PNG")'

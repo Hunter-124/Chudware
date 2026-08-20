@@ -679,6 +679,7 @@ jobs:
           $iscc = $env:ISCC
           if (-not $iscc) {
             $candidates = @(
+              (Join-Path $tools 'innosetup\ISCC.exe'),
               (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
               (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
             )

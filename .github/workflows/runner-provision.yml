@@ -1,9 +1,14 @@
 # One-shot / on-demand provisioning for the self-hosted Windows packaging runner.
 # The nightly windows-beta job fails loudly when a prerequisite is missing; this
-# workflow installs them (user-level, no system-wide changes beyond Inno Setup)
-# and prints a capability report at the end. Safe to re-run: every step is
-# idempotent and skips anything already present.
-# NOTE: steps run under Windows PowerShell 5.1 — ASCII only, no ternary.
+# workflow installs them and prints a capability report at the end. Safe to
+# re-run: every step is idempotent and skips anything already present.
+#
+# Runner realities (measured 2026-08-20): the service runs as NetworkService, so
+# Program Files is off-limits. Everything lands under %USERPROFILE%\chudware-ci-tools
+# (the nightly prepends its bin\ dir to PATH itself, so no service restart is
+# needed). Inno Setup's installer needs admin, so we unpack it with innounp
+# instead of executing it. Steps run under Windows PowerShell 5.1: ASCII only,
+# no ternary.
 name: runner-provision
 
 on:
@@ -24,66 +29,73 @@ jobs:
     runs-on: [self-hosted, Windows, X64, cloudcastle-ci, "${{ inputs.runner_label }}"]
     timeout-minutes: 60
     steps:
-      - name: Install Bun if missing
+      - name: Install Bun into the CI tools dir
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $existing = Get-Command bun -ErrorAction SilentlyContinue
-          if ($existing) {
-            Write-Host "bun already present: $(bun --version)"
+          $toolsBin = Join-Path $env:USERPROFILE 'chudware-ci-tools\bin'
+          New-Item -ItemType Directory -Force $toolsBin | Out-Null
+          $bunExe = Join-Path $toolsBin 'bun.exe'
+          if (Test-Path $bunExe) {
+            Write-Host "bun already present: $(& $bunExe --version)"
           } else {
-            Write-Host "installing bun user-level..."
+            Write-Host "installing bun..."
             powershell -NoProfile -ExecutionPolicy Bypass -Command "irm bun.sh/install.ps1 | iex"
-            $bunBin = Join-Path $env:USERPROFILE '.bun\bin'
-            $bunExe = Join-Path $bunBin 'bun.exe'
-            if (-not (Test-Path $bunExe)) { throw "bun install completed but $bunExe is missing" }
-            # Persist for future runs: the runner service reads its PATH at
-            # service start, so write the user PATH durably.
-            $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-            if ($userPath -notlike "*$bunBin*") {
-              [Environment]::SetEnvironmentVariable('Path', "$userPath;$bunBin", 'User')
-            }
-            Add-Content $env:GITHUB_PATH $bunBin
-            Write-Host "bun installed to $bunBin and persisted to user PATH"
+            $installed = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
+            if (-not (Test-Path $installed)) { throw "bun install completed but $installed is missing" }
+            Copy-Item $installed $bunExe
+            $bunx = Join-Path $env:USERPROFILE '.bun\bin\bunx.exe'
+            if (Test-Path $bunx) { Copy-Item $bunx (Join-Path $toolsBin 'bunx.exe') }
+            Write-Host "bun $(& $bunExe --version) installed to $toolsBin"
           }
 
-      - name: Install Inno Setup 6 if missing
+      - name: Unpack Inno Setup 6 (no admin needed)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
-          $isccPath = Join-Path $pf86 'Inno Setup 6\ISCC.exe'
-          if ((Get-Command iscc -ErrorAction SilentlyContinue) -or (Test-Path $isccPath)) {
-            Write-Host "Inno Setup already present"
+          $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
+          $innoDir = Join-Path $tools 'innosetup'
+          $iscc = Join-Path $innoDir 'ISCC.exe'
+          if (Test-Path $iscc) {
+            Write-Host "Inno Setup already unpacked at $innoDir"
           } else {
-            $done = $false
-            if (Get-Command winget -ErrorAction SilentlyContinue) {
-              Write-Host "installing Inno Setup via winget..."
-              winget install --id JRSoftware.InnoSetup -e --accept-source-agreements --accept-package-agreements --silent
-              if (Test-Path $isccPath) { $done = $true }
+            $work = Join-Path $env:TEMP 'inno-provision'
+            New-Item -ItemType Directory -Force $work | Out-Null
+            $isexe = Join-Path $work 'is.exe'
+            $innounpZip = Join-Path $work 'innounp.zip'
+            $innounpDir = Join-Path $work 'innounp'
+            Write-Host "downloading Inno Setup installer..."
+            Invoke-WebRequest -Uri 'https://jrsoftware.org/download.php/is.exe' -OutFile $isexe -UserAgent 'Mozilla/5.0'
+            if ((Get-Item $isexe).Length -lt 1000000) { throw "is.exe download looks wrong (too small) — install Inno Setup 6 manually" }
+            Write-Host "downloading innounp..."
+            Invoke-WebRequest -Uri 'https://www.rathlev-home.de/tools/download/innounp-2.zip' -OutFile $innounpZip -UserAgent 'Mozilla/5.0'
+            Expand-Archive $innounpZip $innounpDir -Force
+            $innounp = Get-ChildItem $innounpDir -Recurse -Filter innounp.exe | Select-Object -First 1
+            if (-not $innounp) { throw "innounp.exe not found in its archive" }
+            Write-Host "extracting Inno Setup payload..."
+            & $innounp.FullName -x -y -d"$innoDir" $isexe | Out-Null
+            # innounp unpacks into {app}\ below the target dir.
+            $found = Get-ChildItem $innoDir -Recurse -Filter ISCC.exe | Select-Object -First 1
+            if (-not $found) { throw "ISCC.exe not found after extraction" }
+            if ($found.FullName -ne $iscc) {
+              Get-ChildItem (Split-Path $found.FullName) -Recurse | Copy-Item -Destination $innoDir -Force -Recurse
             }
-            if (-not $done) {
-              Write-Host "winget unavailable or failed; downloading installer..."
-              $tmp = Join-Path $env:TEMP 'innosetup-6.exe'
-              Invoke-WebRequest -Uri 'https://jrsoftware.org/download.php/is.exe' -OutFile $tmp
-              & $tmp /VERYSILENT /NORESTART | Out-Null
-            }
-            if (-not (Test-Path $isccPath)) { throw "Inno Setup install failed: $isccPath missing" }
-            Add-Content $env:GITHUB_PATH (Split-Path $isccPath)
-            Write-Host "Inno Setup installed at $isccPath"
+            if (-not (Test-Path $iscc)) { throw "ISCC.exe missing after flatten" }
+            Remove-Item $work -Recurse -Force
+            Write-Host "Inno Setup unpacked to $innoDir"
           }
 
       - name: Capability report
         shell: powershell
         run: |
-          $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
-          $isccPath = Join-Path $pf86 'Inno Setup 6\ISCC.exe'
-          $vswhere = Join-Path $pf86 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $bunCmd = Get-Command bun -ErrorAction SilentlyContinue
-          if ($bunCmd) { $bunVer = bun --version } else { $bunVer = 'MISSING' }
-          $hasIscc = Test-Path $isccPath
+          $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
+          $bunExe = Join-Path $tools 'bin\bun.exe'
+          $iscc = Join-Path $tools 'innosetup\ISCC.exe'
+          $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (Test-Path $bunExe) { $bunVer = & $bunExe --version } else { $bunVer = 'MISSING' }
+          $hasIscc = Test-Path $iscc
           if (Test-Path $vswhere) { $vsName = (& $vswhere -latest -property displayName) -join ', ' } else { $vsName = 'MISSING' }
           Write-Host "bun: $bunVer"
-          Write-Host "Inno Setup 6 present: $hasIscc"
+          Write-Host "Inno Setup 6 (portable): $hasIscc"
           Write-Host "Visual Studio: $vsName"
           if ($bunVer -eq 'MISSING' -or -not $hasIscc -or $vsName -eq 'MISSING') { exit 1 }

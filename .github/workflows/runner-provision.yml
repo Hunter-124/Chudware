@@ -1,7 +1,8 @@
-# One-shot / on-demand provisioning for the self-hosted Windows packaging runner.
-# The nightly windows-beta job fails loudly when a prerequisite is missing; this
-# workflow installs them and prints a capability report at the end. Safe to
-# re-run: every step is idempotent and skips anything already present.
+# One-shot / on-demand provisioning for the self-hosted packaging runners.
+# The nightly windows-beta and macos-beta jobs fail loudly when a prerequisite
+# is missing; this workflow installs them and prints a capability report at the
+# end. Safe to re-run: every step is idempotent and skips anything already
+# present.
 #
 # Runner realities (measured 2026-08-20): the service runs as NetworkService, so
 # Program Files is off-limits. Everything lands under %USERPROFILE%\chudware-ci-tools
@@ -9,23 +10,42 @@
 # needed). Inno Setup's installer needs admin, so we unpack it with innounp
 # instead of executing it. Steps run under Windows PowerShell 5.1: ASCII only,
 # no ternary.
+#
+# The Macs (imac-intel, macbook-air-m2) carry the Command Line Tools only, no
+# full Xcode, so nothing here may reach for xcodebuild. Their step bodies are
+# bash 3.2: no associative arrays, no mapfile, no ${var^^}, and string
+# accumulators instead of arrays, because expanding an empty array under
+# `set -u` is an unbound-variable error before bash 4.4. Homebrew is the only
+# unattended install path on macOS and it cannot install itself in CI (its
+# installer needs an interactive sudo), so a Mac without brew is reported as a
+# manual job rather than silently half-provisioned.
 name: runner-provision
 
 on:
   workflow_dispatch:
     inputs:
       runner_label:
-        description: windows runner label set to provision
+        description: runner label set to provision (cc-win-* or cc-mac-*)
         required: true
         type: choice
-        options: [cc-win-package]
+        options: [cc-win-package, cc-mac-intel, cc-mac-arm]
 
 permissions:
   contents: read
 
+concurrency:
+  # Per label: provisioning imac-intel must not queue behind ryzen-7900x3d, but
+  # two dispatches at the same runner would fight over the same tools dir.
+  group: runner-provision-${{ inputs.runner_label }}
+  cancel-in-progress: false
+
 jobs:
   provision-windows:
     name: Provision Windows packaging runner
+    # The label choice selects the platform; the other job would otherwise queue
+    # against a runner set that can never match and sit there until GitHub
+    # fails it 24 hours later.
+    if: startsWith(inputs.runner_label, 'cc-win-')
     runs-on: [self-hosted, Windows, X64, cloudcastle-ci, "${{ inputs.runner_label }}"]
     timeout-minutes: 60
     steps:
@@ -99,3 +119,182 @@ jobs:
           Write-Host "Inno Setup 6 (portable): $hasIscc"
           Write-Host "Visual Studio: $vsName"
           if ($bunVer -eq 'MISSING' -or -not $hasIscc -or $vsName -eq 'MISSING') { exit 1 }
+
+  provision-macos:
+    name: Provision macOS packaging runner
+    if: startsWith(inputs.runner_label, 'cc-mac-')
+    runs-on: [self-hosted, macOS, cloudcastle-ci, "${{ inputs.runner_label }}"]
+    timeout-minutes: 90
+    env:
+      # cmake/ninja because the macos-* presets build with Ninja; python@3.13
+      # because macOS ships 3.9.6 and Nuitka needs 3.11+; opencascade because
+      # ProvisionOCCT.cmake downloads nothing off Windows and find_package()s a
+      # system OCCT from the preset's brew CMAKE_PREFIX_PATH.
+      MACOS_FORMULAE: cmake ninja python@3.13 opencascade
+      # Same convention as the Windows runners: a runner-owned tools directory,
+      # because the release Python is a venv (Homebrew's interpreter is
+      # externally managed and refuses a direct pip install), and macos-beta
+      # looks here first when it picks its release interpreter.
+      RELEASE_VENV_SUBDIR: chudware-ci-tools/release-python
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in /opt/homebrew/bin /usr/local/bin "${HOME}/.bun/bin"; do
+            if [ -d "${dir}" ]; then PATH="${dir}:${PATH}"; fi
+          done
+          export PATH
+
+          if command -v bun >/dev/null 2>&1; then
+            echo "bun already present: $(command -v bun) $(bun --version)"
+            exit 0
+          fi
+          echo 'installing bun...'
+          curl -fsSL https://bun.sh/install.sh | bash
+          bun_exe="${HOME}/.bun/bin/bun"
+          [ -x "${bun_exe}" ] || {
+            echo "::error::bun install completed but ${bun_exe} is missing"; exit 1; }
+          echo "bun $("${bun_exe}" --version) installed to ${bun_exe}"
+
+          # A symlink is a convenience, not a requirement: /usr/local/bin is
+          # root-owned on a stock Mac and the nightly puts ~/.bun/bin on PATH
+          # itself. Say which of the two happened rather than failing.
+          if [ -w /usr/local/bin ]; then
+            ln -sf "${bun_exe}" /usr/local/bin/bun
+            echo "linked ${bun_exe} into /usr/local/bin"
+          else
+            echo "::notice::/usr/local/bin is not writable by $(whoami); bun stays at ${bun_exe}, which macos-beta prepends to PATH itself"
+          fi
+
+      - name: Install the Homebrew formulae the release build needs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in /opt/homebrew/bin /usr/local/bin; do
+            if [ -d "${dir}" ]; then PATH="${dir}:${PATH}"; fi
+          done
+          export PATH
+
+          if ! command -v brew >/dev/null 2>&1; then
+            echo "::error::this Mac has no Homebrew, and CI cannot install it unattended: the installer needs an interactive sudo. Install it by hand from https://brew.sh as the login user, then re-run this workflow. cmake, ninja, python@3.13 and opencascade all come from brew, and the macos-* presets find OCCT through the brew prefix."
+            exit 1
+          fi
+          prefix="$(brew --prefix)"
+          echo "brew=$(brew --version | head -n 1) prefix=${prefix}"
+
+          # Idempotent by construction: an already-installed formula is left
+          # exactly as it is. This job repairs a gap, it does not upgrade a
+          # working builder underneath a running release.
+          for formula in ${MACOS_FORMULAE}; do
+            if brew list --versions "${formula}" >/dev/null 2>&1; then
+              echo "present: $(brew list --versions "${formula}")"
+            else
+              echo "installing: ${formula}"
+              brew install "${formula}"
+            fi
+          done
+
+      - name: Provision the release Python (Nuitka, cryptography)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in /opt/homebrew/bin /usr/local/bin; do
+            if [ -d "${dir}" ]; then PATH="${dir}:${PATH}"; fi
+          done
+          export PATH
+
+          venv="${HOME}/${RELEASE_VENV_SUBDIR}"
+          if [ -x "${venv}/bin/python3" ] \
+            && "${venv}/bin/python3" -c 'import cryptography, nuitka' >/dev/null 2>&1; then
+            echo "release python already provisioned: $("${venv}/bin/python3" --version)"
+            exit 0
+          fi
+
+          # Homebrew's interpreter is externally managed (PEP 668), so the
+          # release dependencies live in a venv rather than in the formula.
+          base=""
+          for candidate in python3.14 python3.13 python3.12 python3.11; do
+            resolved="$(command -v "${candidate}" 2>/dev/null || true)"
+            [ -n "${resolved}" ] || continue
+            "${resolved}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+              >/dev/null 2>&1 || continue
+            base="${resolved}"
+            break
+          done
+          [ -n "${base}" ] || {
+            echo '::error::no python 3.11+ on PATH after installing python@3.13; check the brew step above'
+            exit 1
+          }
+          echo "base interpreter=${base} ($("${base}" --version 2>&1))"
+
+          mkdir -p "$(dirname "${venv}")"
+          rm -rf "${venv}"
+          "${base}" -m venv "${venv}"
+          "${venv}/bin/python3" -m pip install --upgrade pip
+          "${venv}/bin/python3" -m pip install -r packaging/requirements-release.txt
+          "${venv}/bin/python3" -c 'import cryptography, nuitka; print("release python deps installed")'
+
+      - name: Capability report
+        shell: bash
+        run: |
+          set -uo pipefail
+          for dir in /opt/homebrew/bin /usr/local/bin "${HOME}/.bun/bin"; do
+            if [ -d "${dir}" ]; then PATH="${dir}:${PATH}"; fi
+          done
+          export PATH
+
+          # String accumulator, not an array: bash 3.2 treats an empty array
+          # expansion under `set -u` as an unbound variable.
+          missing=""
+          report() {  # report <label> <value-or-MISSING>
+            printf '%-22s %s\n' "$1" "$2"
+            if [ "$2" = MISSING ]; then missing="${missing} $1"; fi
+          }
+
+          sw_vers
+          for tool in cmake ninja ctest git curl tar zip rsync scp ssh bun \
+            clang xcrun xcode-select ditto otool install_name_tool plutil codesign; do
+            if command -v "${tool}" >/dev/null 2>&1; then
+              report "${tool}" "$(command -v "${tool}")"
+            else
+              report "${tool}" MISSING
+            fi
+          done
+
+          if xcode-select -p >/dev/null 2>&1; then
+            report command-line-tools "$(xcode-select -p)"
+            clang --version | head -n 1
+          else
+            report command-line-tools MISSING
+          fi
+
+          if command -v brew >/dev/null 2>&1; then
+            report homebrew "$(brew --prefix)"
+            if brew list --versions opencascade >/dev/null 2>&1; then
+              report opencascade "$(brew list --versions opencascade)"
+            else
+              report opencascade MISSING
+            fi
+          else
+            report homebrew MISSING
+            report opencascade MISSING
+          fi
+
+          venv="${HOME}/${RELEASE_VENV_SUBDIR}"
+          if [ -x "${venv}/bin/python3" ] \
+            && "${venv}/bin/python3" -c 'import cryptography, nuitka' >/dev/null 2>&1; then
+            report release-python "${venv}/bin/python3 ($("${venv}/bin/python3" --version 2>&1))"
+          else
+            report release-python MISSING
+          fi
+
+          if [ -n "${missing}" ]; then
+            echo "::error::${RUNNER_NAME:-unknown} is still missing:${missing}"
+            exit 1
+          fi
+          echo "capability report: complete for macos-beta"

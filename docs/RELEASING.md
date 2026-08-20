@@ -24,7 +24,8 @@ Every night, and on demand from the Actions tab:
    nightly version `<base>-beta.<run number>` — e.g. `0.1.0-beta.42`. On a
    *scheduled* run it asks the gateway over loopback whether `ci_builds` already
    holds a `published` row for `HEAD`; if so the night is skipped. A manual
-   dispatch always builds. Both platforms are recorded as `queued`.
+   dispatch always builds. Every build leg is recorded as `queued`:
+   `linux/x86_64`, `windows/x86_64`, `macos/arm64` and `macos/x86_64`.
 2. **`linux-beta`** (gateway host, `cc-linux-build`) configures core and host with
    `-DCHUDWARE_VERSION_OVERRIDE=<version> -DCHUDWARE_DEVELOPER_BUILD=OFF`, builds,
    runs `ctest` for core and host, takes a headless `CHUDWARE_SHOT=m1` screenshot
@@ -42,14 +43,41 @@ Every night, and on demand from the Actions tab:
    `Chudware-Setup-<version>-x86_64.exe`. `ISCC.exe` is a hard requirement: if
    Inno Setup is missing the job fails at the capability check. It never
    substitutes a zip.
-4. **Publish.** Each job stages the artifact and its sidecars in
+4. **`macos-beta`** (`cc-mac-intel` and `cc-mac-arm`, one matrix row each,
+   `fail-fast: false`) configures the `macos-x86_64` / `macos-arm64` core preset
+   and `host/build-macos-<arch>` at the pinned version, runs `ctest` for core and
+   host, then packages with `packaging/macos/build_app.sh`: `--prepare-signing`
+   retains the immutable `Chudware.app` and emits the payload preimage,
+   `packaging/ci_sign.py` signs it, and `--finalize-signing` seals that exact
+   bundle and archives it with `ditto` as
+   `Chudware-<version>-macos-<arch>.zip`. The finished zip is then expanded and
+   verified before anything is offered to a customer: `Chudware.app` is present
+   with its `payload-manifest.v1.json` + `.sig` verifying against
+   `release-ci-v1`, `otool -L` shows no shipped Mach-O file loading an absolute
+   path outside `/System` or `/usr/lib`, and `chudware-hostd --status` loads and
+   reports this exact version. That is the same shape
+   `host/src/update/apply_macos.cpp` requires of an update: it expands the zip
+   with `ditto -x -k`, refuses an archive whose root is not `Chudware.app`, and
+   re-verifies the in-bundle payload manifest before swapping the app.
+
+   Both Macs are Command Line Tools only, so no step here uses `xcodebuild`, and
+   both Macs sign unnotarized: a nightly beta makes no Gatekeeper claim.
+   `macbook-air-m2` (`cc-mac-arm`) is a laptop and is often asleep. Its row then
+   sits **queued** until the runner returns, and GitHub fails it after 24 hours
+   queued. That is accepted: the rows are independent, so `imac-intel` publishes
+   regardless, and a row that never starts runs no steps, so it posts no
+   `failed` transition — it stays `queued` in `/admin` until the next night's
+   run supersedes it.
+5. **Publish.** Each job stages the artifact and its sidecars in
    `<releases_dir>/incoming/` and calls `POST /api/releases/ci/publish` on
-   **`http://127.0.0.1:8300`**, on the gateway host. The Windows builder gets
-   there over `scp` + `ssh`; the release token never leaves the gateway box and is
-   never passed on a command line. The gateway recomputes the digest and size,
+   **`http://127.0.0.1:8300`**, on the gateway host. The Windows and macOS
+   builders get there over `scp` + `ssh`, through the same
+   `remote_gateway.sh` helper each job writes to the box; the release token
+   never leaves the gateway box and is never passed on a command line.
+   The gateway recomputes the digest and size,
    verifies both signatures, and moves everything into
    `<releases_dir>/store/beta/<version>/`.
-5. **Status.** Every transition (`queued`, `building`, `testing`, `packaging`,
+6. **Status.** Every transition (`queued`, `building`, `testing`, `packaging`,
    `publishing`, `published`, `failed`) is posted to `POST
    /api/releases/ci/status` and shows up in `/admin` under Dashboard and
    Releases -> CI builds. A failed job reports `failed` from an `if: always()`
@@ -102,10 +130,10 @@ floor is a deliberate act through `packaging/publish.py register --min-supported
 
 | Secret | Used by | Content |
 |---|---|---|
-| `CHUDWARE_RELEASE_CI_KEY` | both build jobs | base64 32-byte Ed25519 **seed** for `release-ci-v1` (single line, no PEM). Offline copy: `~/.chudware/release-ci-v1.seed.b64` on the owner workstation. |
-| `CHUDWARE_LIVINGROOM_SSH_HOST` | `windows-beta` | gateway host address, e.g. `192.168.0.183` |
-| `CHUDWARE_LIVINGROOM_SSH_KEY` | `windows-beta` | OpenSSH **private** key authorized for `liveuser` on the gateway host |
-| `CHUDWARE_LIVINGROOM_HOST_KEY` | `windows-beta` | the gateway host's `known_hosts` line (ed25519). Host-key checking is strict; without this the upload fails closed. |
+| `CHUDWARE_RELEASE_CI_KEY` | all three build jobs | base64 32-byte Ed25519 **seed** for `release-ci-v1` (single line, no PEM). Offline copy: `~/.chudware/release-ci-v1.seed.b64` on the owner workstation. |
+| `CHUDWARE_LIVINGROOM_SSH_HOST` | `windows-beta`, `macos-beta` | gateway host address, e.g. `192.168.0.183` |
+| `CHUDWARE_LIVINGROOM_SSH_KEY` | `windows-beta`, `macos-beta` | OpenSSH **private** key authorized for `liveuser` on the gateway host |
+| `CHUDWARE_LIVINGROOM_HOST_KEY` | `windows-beta`, `macos-beta` | the gateway host's `known_hosts` line (ed25519). Host-key checking is strict; without this the upload fails closed. |
 
 Nothing else is secret: the CI public key, loopback URL and gateway env path are
 in the workflow in the clear on purpose, so a rotated key fails loudly at
@@ -146,6 +174,38 @@ fails at its capability check with an explicit message otherwise):
 * `CHUDWARE_SIGN_IDENTITY` if you want Authenticode on the installer; without it
   the installer is unsigned and SmartScreen will warn (see `docs/SIGNING.md`)
 
+**`cc-mac-intel` (imac-intel, x86_64) and `cc-mac-arm` (macbook-air-m2, arm64):**
+
+* Xcode **Command Line Tools** only (`xcode-select -p`, `clang`, `xcrun`). No
+  step uses `xcodebuild`, and the capability check asserts the compiler rather
+  than the IDE.
+* `cmake`, `ninja`, `ctest`, `python3`, `git`, `curl`, `tar`, `zip`, `rsync`,
+  `ssh`, `scp`, `bun`, plus the Command Line Tools' `ditto`, `otool`,
+  `install_name_tool`, `plutil` and `codesign`
+* Homebrew, with `opencascade` installed: off Windows `ProvisionOCCT.cmake`
+  downloads nothing and the `macos-*` presets `find_package` OCCT through the
+  brew prefix (`/opt/homebrew` on arm64, `/usr/local` on Intel)
+* a release Python 3.11+ carrying `packaging/requirements-release.txt` (Nuitka
+  for the compiled `chudware-worker`/`chudware-mcp` sidecars, `cryptography` for
+  every signature). macOS ships 3.9.6, so the job picks its interpreter by
+  capability: `~/chudware-ci-tools/release-python/bin/python3` first, then
+  `python3.14`..`python3` from `PATH`, and the first one that imports both
+  `cryptography` and `nuitka` wins.
+* `bun` for the compiled OMP bridge sidecar. `~/.bun/bin`, `/opt/homebrew/bin`
+  and `/usr/local/bin` are prepended to `PATH` by the job itself, since the
+  runner service starts with a minimal `PATH`.
+
+`runner-provision.yml` covers both Macs: dispatch it with `runner_label` set to
+`cc-mac-intel` or `cc-mac-arm` and it installs bun, the brew formulae
+(`cmake ninja python@3.13 opencascade`), and the release-Python venv at
+`~/chudware-ci-tools/release-python`, then prints a capability report that exits
+non-zero on any `MISSING`. Homebrew itself is the one thing it will not install:
+that installer needs an interactive sudo, so it fails with an explicit
+instruction instead. macOS steps are bash 3.2 (Apple's `/bin/bash`): no
+associative arrays, no `mapfile`, no `${var^^}`, and string accumulators instead
+of arrays, because expanding an empty array under `set -u` is an
+unbound-variable error before bash 4.4.
+
 Windows steps are Windows PowerShell 5.1 with ASCII-only bodies. `bash` on those
 hosts is an empty WSL shim that exits 0 without running anything, and PowerShell
 5.1 misreads non-ASCII in the runner's BOM-less script; `scripts/verify-ci-workflows.py`
@@ -174,6 +234,12 @@ pipeline pinned the commit it built.
   the "already published" check, so it always builds.
 * **Watch progress without Actions:** `/admin` -> Releases -> CI builds, or
   `GET /api/admin/ci/builds?limit=20`.
+* **A macOS row stuck on `queued`:** its Mac is asleep or offline (usually
+  `macbook-air-m2` / `cc-mac-arm`). GitHub keeps the row queued and fails it
+  after 24 hours; the job never runs a step, so it never posts `failed` and the
+  `/admin` row stays `queued` for that `run_id`. Wake the Mac and re-dispatch,
+  or ignore it: the next night's run publishes the arch again. The Intel row is
+  unaffected (`fail-fast: false`).
 * **A rejected publish:** the gateway recomputes the digest and size, and a
   mismatch (422) **deletes the staged artifact** from `incoming/` while leaving
   the sidecars. Re-run the job: it rebuilds and re-stages everything before

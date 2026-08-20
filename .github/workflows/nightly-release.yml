@@ -15,15 +15,20 @@
 #     status calls go to http://127.0.0.1:8300 on that box, reading the token
 #     from /home/liveuser/chudware-web-data/gateway.env at the point of use and
 #     handing it to curl through a 0600 --config file, never argv, never a log.
-#     The Windows builder therefore uploads over scp and runs the loopback curl
-#     through ssh; it never learns the token and never posts to the public URL.
+#     The Windows and macOS builders therefore upload over scp and run the
+#     loopback curl through ssh; they never learn the token and never post to
+#     the public URL.
 #   * The CI signing seed is only in the environment of the steps that sign.
 #   * No actions/upload-artifact anywhere: artifact storage is metered and the
 #     installers are ~500 MB. Diagnostics go to the (unmetered) step summary.
 #
 # `bash` on the Windows builders is an empty WSL shim that exits 0 without
 # running anything (see native-build.yml), so every Windows step is Windows
-# PowerShell 5.1 with an ASCII-only body.
+# PowerShell 5.1 with an ASCII-only body. The Macs are the mirror image: they
+# have a real bash, but it is Apple's bash 3.2, so every macOS step body stays
+# within 3.2 (no associative arrays, no mapfile, no ${var^^}) and uses string
+# accumulators rather than arrays, because `"${array[@]}"` on an empty array
+# under `set -u` is an unbound-variable error before bash 4.4.
 name: nightly-release
 
 on:
@@ -152,22 +157,27 @@ jobs:
             echo "* skip: \`${skip}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Record both platforms as queued
+      - name: Record every platform and architecture as queued
         if: steps.plan.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
           body="${RUNNER_TEMP}/queued.json"
-          for platform in linux windows; do
-            python3 - "${platform}" "${{ steps.plan.outputs.version }}" > "${body}" <<'PY'
+          # One row per build leg, keyed the way ci_builds is: (run_id, platform,
+          # arch). The macOS rows matter most: cc-mac-arm is often asleep, and a
+          # queued row is the only honest record that a leg was expected at all.
+          for target in linux:x86_64 windows:x86_64 macos:arm64 macos:x86_64; do
+            platform="${target%%:*}"
+            arch="${target##*:}"
+            python3 - "${platform}" "${arch}" "${{ steps.plan.outputs.version }}" > "${body}" <<'PY'
           import json, os, sys
           json.dump({
               "run_id": os.environ["GITHUB_RUN_ID"],
               "commit_sha": os.environ["GITHUB_SHA"],
               "channel": "beta",
               "platform": sys.argv[1],
-              "arch": "x86_64",
-              "version": sys.argv[2],
+              "arch": sys.argv[2],
+              "version": sys.argv[3],
               "status": "queued",
               "detail": "nightly-release run %s" % os.environ["GITHUB_RUN_NUMBER"],
           }, sys.stdout)
@@ -175,7 +185,7 @@ jobs:
             curl --config "${RUNNER_TEMP}/gw.curlrc" --fail-with-body --silent --show-error \
               --max-time 60 -H 'Content-Type: application/json' \
               --data-binary "@${body}" "${CHUDWARE_GATEWAY_LOOPBACK}/api/releases/ci/status" \
-              > /dev/null || echo "::warning::could not record queued status for ${platform}"
+              > /dev/null || echo "::warning::could not record queued status for ${platform} ${arch}"
           done
 
   linux-beta:
@@ -1211,4 +1221,665 @@ jobs:
           $sshArgs = @('-i', $env:GATEWAY_SSH_KEY_FILE, '-o', "UserKnownHostsFile=$env:GATEWAY_KNOWN_HOSTS",
                        '-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20')
           & ssh @sshArgs "$($env:GATEWAY_SSH_USER)@$($env:GATEWAY_SSH_HOST)" "rm -rf '$env:GATEWAY_REMOTE_DIR'"
+          exit 0
+
+  macos-beta:
+    name: macOS beta app (${{ matrix.arch }})
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: [self-hosted, macOS, "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
+    # Longer than the other two legs: the macOS core carries OCCT plus a
+    # source-built Netgen, and the two Nuitka sidecars are compiled per arch.
+    timeout-minutes: 420
+    strategy:
+      # macbook-air-m2 (cc-mac-arm) is a laptop and is regularly asleep. GitHub
+      # queues its row until the runner comes back and auto-fails it after 24
+      # hours queued; that is accepted. imac-intel must publish regardless, so
+      # the rows are independent.
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: arm64, runner_arch: ARM64, runner_label: cc-mac-arm, preset: macos-arm64, host_build_dir: host/build-macos-arm64}
+          - {arch: x86_64, runner_arch: X64, runner_label: cc-mac-intel, preset: macos-x86_64, host_build_dir: host/build-macos-x86_64}
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+      RELEASE_STABLE_VERSION: ${{ needs.plan.outputs.stable_version }}
+      RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+      RELEASE_PLATFORM: macos
+      RELEASE_ARCH: ${{ matrix.arch }}
+      CORE_PRESET: ${{ matrix.preset }}
+      HOST_BUILD_DIR: ${{ matrix.host_build_dir }}
+      GATEWAY_SSH_HOST: ${{ secrets.CHUDWARE_LIVINGROOM_SSH_HOST }}
+      GATEWAY_SSH_USER: liveuser
+    steps:
+      - name: Check runner capabilities and select the release Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner=${RUNNER_NAME:-unknown} $(uname -s) $(uname -m)"
+          sw_vers
+
+          # The runner service starts with a minimal PATH: Homebrew and a bun
+          # installed under $HOME are invisible until this job puts them there
+          # itself, exactly as the Windows leg prepends its chudware-ci-tools dir.
+          for dir in /opt/homebrew/bin /usr/local/bin "${HOME}/.bun/bin"; do
+            if [ -d "${dir}" ]; then
+              case ":${PATH}:" in
+                *":${dir}:"*) ;;
+                *) PATH="${dir}:${PATH}"; echo "${dir}" >> "$GITHUB_PATH" ;;
+              esac
+            fi
+          done
+          export PATH
+
+          # String accumulator, not an array: bash 3.2 treats an empty array
+          # expansion under `set -u` as an unbound variable.
+          missing=""
+          for tool in cmake ninja ctest python3 git curl tar zip rsync scp ssh bun \
+            clang xcrun xcode-select ditto otool install_name_tool plutil codesign; do
+            command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
+          done
+
+          # Both Macs carry the Command Line Tools only, by design: nothing in
+          # this repository may reach for xcodebuild, so the compiler itself is
+          # the assertion.
+          if xcode-select -p >/dev/null 2>&1; then
+            echo "clt=$(xcode-select -p)"
+            clang --version | head -n 1
+            echo "sdk=$(xcrun --show-sdk-version 2>/dev/null || echo unknown)"
+          else
+            missing="${missing} xcode-command-line-tools"
+          fi
+
+          # The macos-* presets configure with CHUDWARE_WITH_OCCT=ON and, off
+          # Windows, ProvisionOCCT.cmake downloads nothing: it find_package()s a
+          # system OCCT from the preset's brew CMAKE_PREFIX_PATH.
+          if command -v brew >/dev/null 2>&1; then
+            echo "brew=$(brew --prefix)"
+            brew list --versions opencascade >/dev/null 2>&1 \
+              || missing="${missing} opencascade(brew-install-opencascade)"
+          else
+            missing="${missing} brew"
+          fi
+
+          # macOS ships python 3.9.6, which cannot even install the pinned
+          # Nuitka. packaging/macos/build_app.sh compiles the worker and MCP
+          # sidecars with Nuitka and every signature here needs cryptography, so
+          # the interpreter is chosen by capability rather than by name.
+          release_python=""
+          for candidate in "${HOME}/chudware-ci-tools/release-python/bin/python3" \
+            python3.14 python3.13 python3.12 python3.11 python3; do
+            resolved=""
+            case "${candidate}" in
+              /*) if [ -x "${candidate}" ]; then resolved="${candidate}"; fi ;;
+              *) resolved="$(command -v "${candidate}" 2>/dev/null || true)" ;;
+            esac
+            [ -n "${resolved}" ] || continue
+            "${resolved}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+              >/dev/null 2>&1 || continue
+            "${resolved}" -c 'import cryptography, nuitka' >/dev/null 2>&1 || continue
+            release_python="${resolved}"
+            break
+          done
+          if [ -n "${release_python}" ]; then
+            echo "release-python=${release_python} ($("${release_python}" --version 2>&1))"
+          else
+            missing="${missing} python>=3.11-with-packaging/requirements-release.txt"
+          fi
+
+          if [ -n "${missing}" ]; then
+            echo "::error::runner ${RUNNER_NAME:-unknown} is missing required tools:${missing}. Run the runner-provision workflow against this runner label (provision-macos) and re-dispatch."
+            exit 1
+          fi
+
+          # A row labelled cc-mac-intel that answers arm64 would publish bytes
+          # under the wrong canonical name; build_app.sh names the zip from
+          # `uname -m`, so the two must agree before anything is built.
+          if [ "$(uname -m)" != "${RELEASE_ARCH}" ]; then
+            echo "::error::this runner is $(uname -m) but the matrix row is ${RELEASE_ARCH}; the runner labels and the matrix disagree"
+            exit 1
+          fi
+
+          {
+            echo "RELEASE_PYTHON=${release_python}"
+            echo "CHUDWARE_RELEASE_PYTHON=${release_python}"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          # The version override replaces `git describe`, but packaging still
+          # reads tags for provenance and build_app.sh sources build.sh.
+          fetch-depth: 0
+
+      - name: Open the authenticated channel to the gateway host
+        env:
+          GATEWAY_SSH_KEY: ${{ secrets.CHUDWARE_LIVINGROOM_SSH_KEY }}
+          GATEWAY_HOST_KEY: ${{ secrets.CHUDWARE_LIVINGROOM_HOST_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${GATEWAY_SSH_HOST:-}" ] || { echo '::error::CHUDWARE_LIVINGROOM_SSH_HOST is not set'; exit 1; }
+          [ -n "${GATEWAY_SSH_KEY:-}" ] || { echo '::error::CHUDWARE_LIVINGROOM_SSH_KEY is not set'; exit 1; }
+          [ -n "${GATEWAY_HOST_KEY:-}" ] || { echo '::error::CHUDWARE_LIVINGROOM_HOST_KEY is not set'; exit 1; }
+
+          # Run-scoped: RUNNER_TEMP is wiped between jobs. Its path contains no
+          # spaces on these hosts, which is what lets ${ssh_opts} below stay a
+          # word-split string instead of a bash 4 array.
+          ssh_dir="${RUNNER_TEMP}/ssh"
+          rm -rf "${ssh_dir}"
+          umask 077
+          mkdir -p "${ssh_dir}"
+          key="${ssh_dir}/id"
+          known="${ssh_dir}/known_hosts"
+          # LF only, trailing newline, and never through argv: OpenSSH rejects a
+          # key it cannot parse and a stray CR is the classic silent failure.
+          # chmod 600 is the POSIX half of the Windows leg's icacls SID grant.
+          printf '%s\n' "${GATEWAY_SSH_KEY}" | tr -d '\r' > "${key}"
+          printf '%s\n' "${GATEWAY_HOST_KEY}" | tr -d '\r' > "${known}"
+          chmod 600 "${key}" "${known}"
+
+          # The publish/status helper runs ON the gateway box: the release token
+          # is read there, used against 127.0.0.1:8300, and never crosses the
+          # network. Byte-for-byte the script the Windows leg writes.
+          helper="${RUNNER_TEMP}/remote_gateway.sh"
+          cat > "${helper}" <<'SH'
+          #!/usr/bin/env bash
+          # Written by .github/workflows/nightly-release.yml; runs on the gateway host only.
+          set -euo pipefail
+          ENV_FILE="${CHUDWARE_GATEWAY_ENV_FILE:-/home/liveuser/chudware-web-data/gateway.env}"
+          LOOPBACK="http://127.0.0.1:8300"
+
+          gw_value() {
+            python3 - "$ENV_FILE" "$1" <<'PY'
+          import sys
+          value = ""
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              for line in stream:
+                  line = line.strip()
+                  if line.startswith(sys.argv[2] + "="):
+                      value = line.split("=", 1)[1].strip().strip("'\"")
+          print(value)
+          PY
+          }
+
+          curlrc() {
+            local token
+            token="$(gw_value CHUDWARE_GATEWAY_RELEASE_TOKEN)"
+            [ -n "$token" ] || { echo "gateway.env has no CHUDWARE_GATEWAY_RELEASE_TOKEN" >&2; exit 1; }
+            umask 077
+            printf 'header = "Authorization: Bearer %s"\n' "$token" > "$1"
+          }
+
+          case "${1:-}" in
+            releases-dir)
+              dir="$(gw_value CHUDWARE_RELEASES_DIR)"
+              [ -n "$dir" ] || dir="$HOME/chudware-releases"
+              mkdir -p "$dir/incoming"
+              printf '%s\n' "$dir"
+              ;;
+            status|publish)
+              body="${2:?body file required}"
+              [ -s "$body" ] || { echo "empty request body: $body" >&2; exit 1; }
+              path="/api/releases/ci/status"
+              [ "$1" = publish ] && path="/api/releases/ci/publish"
+              config="$(mktemp)"
+              trap 'rm -f "$config"' EXIT
+              curlrc "$config"
+              curl --config "$config" --fail-with-body --silent --show-error --max-time 300 \
+                -H 'Content-Type: application/json' --data-binary "@$body" "${LOOPBACK}${path}"
+              printf '\n'
+              ;;
+            *)
+              echo "usage: remote_gateway.sh releases-dir|status BODY|publish BODY" >&2
+              exit 2
+              ;;
+          esac
+          SH
+
+          ssh_opts="-i ${key} -o UserKnownHostsFile=${known} -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20"
+          target="${GATEWAY_SSH_USER}@${GATEWAY_SSH_HOST}"
+          # Prove the channel before hours of building depend on it.
+          ssh ${ssh_opts} "${target}" true || {
+            echo '::error::cannot reach the gateway host over ssh; check CHUDWARE_LIVINGROOM_SSH_KEY and the pinned host key'
+            exit 1
+          }
+          # Both macOS rows share one GITHUB_RUN_ID, so the staging directory is
+          # per-arch or the two would delete each other's helper.
+          remote_dir="/tmp/chudware-ci-${GITHUB_RUN_ID}-macos-${RELEASE_ARCH}"
+          ssh ${ssh_opts} "${target}" "mkdir -p '${remote_dir}'"
+          scp ${ssh_opts} "${helper}" "${target}:${remote_dir}/remote_gateway.sh"
+          releases_dir="$(ssh ${ssh_opts} "${target}" "bash '${remote_dir}/remote_gateway.sh' releases-dir" | tail -n 1)"
+          [ -n "${releases_dir}" ] || {
+            echo '::error::could not resolve the remote releases directory'; exit 1; }
+          echo "remote releases dir=${releases_dir}"
+
+          # One helper, sourced by every later step.
+          cat > "${RUNNER_TEMP}/gw.sh" <<SH
+          GATEWAY_SSH_OPTS="${ssh_opts}"
+          GATEWAY_TARGET="${target}"
+          GATEWAY_REMOTE_DIR="${remote_dir}"
+          GATEWAY_RELEASES_DIR="${releases_dir}"
+          SH
+          cat >> "${RUNNER_TEMP}/gw.sh" <<'SH'
+          gw_ssh() { ssh ${GATEWAY_SSH_OPTS} "${GATEWAY_TARGET}" "$@"; }
+          gw_scp() { scp ${GATEWAY_SSH_OPTS} "$1" "${GATEWAY_TARGET}:$2"; }
+          ci_status() {  # ci_status <status> <detail>
+            body="${RUNNER_TEMP}/ci-status.json"
+            "${RELEASE_PYTHON}" - "$1" "$2" > "${body}" <<'PY'
+          import json, os, sys
+          json.dump({
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "commit_sha": os.environ["RELEASE_COMMIT"],
+              "channel": "beta",
+              "platform": os.environ["RELEASE_PLATFORM"],
+              "arch": os.environ["RELEASE_ARCH"],
+              "version": os.environ["RELEASE_VERSION"],
+              "status": sys.argv[1],
+              "detail": sys.argv[2],
+          }, sys.stdout)
+          PY
+            if gw_scp "${body}" "${GATEWAY_REMOTE_DIR}/ci-status.json" > /dev/null; then
+              gw_ssh "bash '${GATEWAY_REMOTE_DIR}/remote_gateway.sh' status '${GATEWAY_REMOTE_DIR}/ci-status.json'" \
+                > /dev/null || echo "::warning::ci/status $1 was not recorded"
+            else
+              echo "::warning::ci/status $1 was not uploaded"
+            fi
+          }
+          SH
+          . "${RUNNER_TEMP}/gw.sh"
+          ci_status building "configuring core + host for ${RELEASE_VERSION}"
+
+      - name: Generate protected assets and build core + host at the pinned version
+        shell: bash
+        run: |
+          set -euo pipefail
+          protected_assets="${HOST_BUILD_DIR}/generated/protected-assets"
+          "${RELEASE_PYTHON}" packaging/embed_protected_assets.py --source-root . \
+            --output-dir "${protected_assets}"
+
+          cmake --preset "${CORE_PRESET}" \
+            -DCHUDWARE_DEVELOPER_BUILD=OFF \
+            -DCHUDWARE_VERSION_OVERRIDE="${RELEASE_VERSION}" \
+            -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
+          cmake --build --preset "${CORE_PRESET}"
+
+          cmake -S host -B "${HOST_BUILD_DIR}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCHUDWARE_DEVELOPER_BUILD=OFF \
+            -DCHUDWARE_VERSION_OVERRIDE="${RELEASE_VERSION}" \
+            -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
+          cmake --build "${HOST_BUILD_DIR}"
+
+          # Prove both caches carry the release identity rather than a
+          # git-derived 0.0.0-dirty, and that neither tree is a developer build.
+          # build_app.sh re-checks the second property and reads the version from
+          # the generated header, so a mismatch here would name the wrong zip.
+          for cache in "build/${CORE_PRESET}/CMakeCache.txt" "${HOST_BUILD_DIR}/CMakeCache.txt"; do
+            grep -Fqx "CHUDWARE_VERSION_OVERRIDE:STRING=${RELEASE_VERSION}" "${cache}" || {
+              echo "::error::${cache} does not carry CHUDWARE_VERSION_OVERRIDE=${RELEASE_VERSION}"; exit 1; }
+            grep -Fqx 'CHUDWARE_DEVELOPER_BUILD:BOOL=OFF' "${cache}" || {
+              echo "::error::${cache} is not an explicit production configure"; exit 1; }
+          done
+          grep -Fq "\"${RELEASE_VERSION}\"" "${HOST_BUILD_DIR}/generated/api/chudware_version.h" || {
+            echo "::error::generated version header does not contain ${RELEASE_VERSION}"; exit 1; }
+
+      - name: Run the core and host test suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "${RUNNER_TEMP}/gw.sh"
+          ci_status testing "ctest core + host"
+
+          log="${RUNNER_TEMP}/ctest.log"
+          ctest --test-dir "build/${CORE_PRESET}/core" --output-on-failure 2>&1 | tee "${log}"
+          ctest --test-dir "${HOST_BUILD_DIR}" --output-on-failure 2>&1 | tee -a "${log}"
+          if grep -qE 'No tests were found' "${log}"; then
+            echo "::error::a configure registered no tests; the platform-test evidence would be a lie"
+            exit 1
+          fi
+          {
+            echo "## ctest -- macOS ${RELEASE_ARCH} beta"
+            echo '```text'
+            tail -n 30 "${log}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage the immutable Chudware.app and sign its payload manifest
+        env:
+          CHUDWARE_RELEASE_CI_KEY: ${{ secrets.CHUDWARE_RELEASE_CI_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "${RUNNER_TEMP}/gw.sh"
+          ci_status packaging "staging Chudware.app and signing the payload manifest"
+
+          # --prepare-signing retains the immutable .app under --out and emits the
+          # payload preimage; --finalize-signing seals that exact bundle. Both
+          # calls must therefore name the same --out.
+          out="${RUNNER_TEMP}/prepared"
+          rm -rf "${out}"
+          mkdir -p "${out}"
+          packaging/macos/build_app.sh --prepare-signing \
+            --key-id "${CHUDWARE_RELEASE_KEY_ID}" --out "${out}"
+
+          request="$(find "${out}" -type f -name '*payload-signing-request.bin' -print -quit)"
+          test -s "${request}" || { echo '::error::payload signing request missing'; exit 1; }
+          "${RELEASE_PYTHON}" packaging/ci_sign.py \
+            --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+            --output "${RUNNER_TEMP}/payload.sig" \
+            sign payload "${request}" > /dev/null
+          echo "payload manifest signed with ${CHUDWARE_RELEASE_KEY_ID}"
+
+      - name: Seal the app into a zip, then sign the artifact pair and evidence
+        env:
+          CHUDWARE_RELEASE_CI_KEY: ${{ secrets.CHUDWARE_RELEASE_CI_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/prepared"
+          public_key_b64="$("${RELEASE_PYTHON}" -c 'import base64,os,sys; sys.stdout.write(base64.b64encode(bytes.fromhex(os.environ["CHUDWARE_RELEASE_CI_PUBLIC_KEY"])).decode())')"
+          echo "RELEASE_PUBLIC_KEY_B64=${public_key_b64}" >> "$GITHUB_ENV"
+
+          # Embeds the signature, re-verifies every manifest-owned byte of the
+          # retained bundle, then archives it with ditto.
+          packaging/macos/build_app.sh --finalize-signing "${RUNNER_TEMP}/payload.sig" \
+            --release-public-key "${public_key_b64}" --out "${out}"
+
+          artifact="${out}/Chudware-${RELEASE_VERSION}-macos-${RELEASE_ARCH}.zip"
+          test -s "${artifact}" || {
+            echo "::error::build_app.sh did not produce ${artifact}"; exit 1; }
+          echo "ARTIFACT=${artifact}" >> "$GITHUB_ENV"
+
+          sha="$("${RELEASE_PYTHON}" - "${artifact}" <<'PY'
+          import hashlib, sys
+          value = hashlib.sha256()
+          with open(sys.argv[1], "rb") as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                  value.update(chunk)
+          print(value.hexdigest())
+          PY
+          )"
+          echo "ARTIFACT_SHA256=${sha}" >> "$GITHUB_ENV"
+          echo "artifact=${artifact} sha256=${sha}"
+
+          # Sign the artifact identity twice over the same bytes: the beta
+          # version published now, and the stable version /admin will promote to.
+          "${RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+            --output "${RUNNER_TEMP}/artifact.sig" \
+            artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_VERSION}" \
+            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" \
+            --request-out "${RUNNER_TEMP}/artifact-request.bin" > /dev/null
+          "${RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+            --output "${RUNNER_TEMP}/artifact-stable.sig" \
+            artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_STABLE_VERSION}" \
+            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" > /dev/null
+
+          # build_app.sh bound its own copy of the beta preimage; if the two ever
+          # disagreed the gateway would reject one of them.
+          emitted="${artifact}.artifact-signing-request.bin"
+          if [ -f "${emitted}" ]; then
+            cmp -s "${emitted}" "${RUNNER_TEMP}/artifact-request.bin" || {
+              echo '::error::build_app.sh and ci_sign disagree about the artifact preimage'; exit 1; }
+          fi
+
+          # Evidence is required for promotion to stable but not for a beta
+          # publish. A failure here is a loud warning and an evidence-less beta,
+          # never a silently incomplete bundle.
+          evidence="${RUNNER_TEMP}/evidence"
+          rm -rf "${evidence}"
+          status=0
+          "${RELEASE_PYTHON}" packaging/generate_release_evidence.py "${artifact}" \
+            --artifact-sha256 "${sha}" --version "${RELEASE_VERSION}" \
+            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --commit "${RELEASE_COMMIT}" \
+            --locked-input CMakePresets.json --locked-input packaging/requirements-release.txt \
+            --locked-input vendor/omp/bun.lock --command 'ctest core' --command 'ctest host' \
+            --passed --out "${evidence}" || status=$?
+
+          if [ "${status}" -eq 0 ]; then
+            # A request is the evidence domain plus the exact canonical bytes.
+            # The domain table lives in packaging/sign_release.py and is
+            # imported, never retyped. The same script proves the platform-test
+            # document names the suites this job actually ran.
+            EVIDENCE_DIR="${evidence}" "${RELEASE_PYTHON}" - <<'PY' || status=$?
+          import json
+          import os
+          import pathlib
+          import sys
+
+          sys.path.insert(0, os.getcwd())
+          try:
+              from packaging.sign_release import DOMAINS
+          except ImportError:
+              # An installed distribution named `packaging` shadows the repository
+              # directory, which has no __init__.py. Import the module directly.
+              sys.path.insert(0, os.path.join(os.getcwd(), "packaging"))
+              from sign_release import DOMAINS
+
+          directory = pathlib.Path(os.environ["EVIDENCE_DIR"])
+          for name, kind in (("sbom.cdx.json", "sbom"),
+                             ("provenance.slsa.json", "provenance"),
+                             ("platform-test.v1.json", "platform-test")):
+              body = (directory / name).read_bytes()
+              (directory / (name + ".signing-request.bin")).write_bytes(DOMAINS[kind] + body)
+
+          document = json.loads((directory / "platform-test.v1.json").read_text(encoding="utf-8"))
+          missing = {"ctest core", "ctest host"} - set(document.get("commands", []))
+          if missing or document.get("passed") is not True:
+              raise SystemExit("platform-test evidence does not record the executed suites: %s" % sorted(missing))
+          PY
+          fi
+
+          if [ "${status}" -eq 0 ]; then
+            for pair in 'sbom.cdx.json:sbom' 'provenance.slsa.json:provenance' 'platform-test.v1.json:platform-test'; do
+              name="${pair%%:*}"
+              kind="${pair##*:}"
+              "${RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+                --output "${evidence}/${name}.sig" \
+                sign "${kind}" "${evidence}/${name}.signing-request.bin" > /dev/null || { status=1; break; }
+            done
+          fi
+
+          if [ "${status}" -eq 0 ]; then
+            echo 'HAS_EVIDENCE=1' >> "$GITHUB_ENV"
+            echo "evidence signed: sbom, provenance, platform-test"
+          else
+            echo "::warning::release evidence generation or signing failed (exit ${status}); publishing this beta WITHOUT an evidence bundle, so it cannot be promoted to stable until a later build succeeds"
+            echo 'HAS_EVIDENCE=0' >> "$GITHUB_ENV"
+          fi
+
+      - name: Verify the built app before it is offered to anyone
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/verify"
+          rm -rf "${work}"
+          mkdir -p "${work}"
+          # ditto -c -k --keepParent produced the zip, so Chudware.app sits at
+          # the archive root; unpacking with ditto keeps resource forks intact.
+          ditto -x -k "${ARTIFACT}" "${work}"
+          app="${work}/Chudware.app"
+          test -d "${app}" || {
+            echo '::error::the published zip does not contain Chudware.app'; exit 1; }
+          for required in Contents/MacOS/Chudware Contents/MacOS/Chudware-bin \
+            Contents/MacOS/chudware-hostd Contents/Frameworks/libchudware.dylib; do
+            test -e "${app}/${required}" || {
+              echo "::error::Chudware.app is missing ${required}"; exit 1; }
+          done
+          test -s "${app}/payload-manifest.v1.json" || {
+            echo '::error::Chudware.app carries no payload-manifest.v1.json'; exit 1; }
+          test -s "${app}/payload-manifest.v1.sig" || {
+            echo '::error::Chudware.app carries no payload-manifest.v1.sig'; exit 1; }
+
+          # 1. Nothing in the shipped bundle may load a library the bundle does
+          #    not carry. The macOS equivalent of the AppImage ldd sweep: any
+          #    absolute path outside /System or /usr/lib is a Homebrew or build
+          #    tree leak that only fails on a customer's Mac.
+          leaked=""
+          checked=0
+          for binary in "${app}/Contents/MacOS/Chudware-bin" "${app}/Contents/MacOS/chudware-hostd" \
+            "${app}/Contents/MacOS/chudware-worker" "${app}/Contents/MacOS/chudware-mcp" \
+            "${app}/Contents/MacOS/chudware-omp-bridge" "${app}/Contents/Frameworks"/*.dylib; do
+            [ -f "${binary}" ] || continue
+            checked=$((checked + 1))
+            outside="$(otool -L "${binary}" | sed -n '2,$p' | awk '{print $1}' \
+              | grep -v '^@' | grep -v '^/System/' | grep -v '^/usr/lib/' || true)"
+            if [ -n "${outside}" ]; then
+              leaked="${leaked} $(basename "${binary}")"
+              printf '%s: %s\n' "${binary}" "${outside}" >&2
+            fi
+          done
+          [ "${checked}" -gt 0 ] || {
+            echo '::error::the extracted bundle has no Mach-O payload to check'; exit 1; }
+          [ -z "${leaked}" ] || {
+            echo "::error::shipped Mach-O files still load libraries from outside the bundle:${leaked}"
+            exit 1
+          }
+          echo "otool: ${checked} Mach-O files, zero external absolute dependencies"
+
+          # 2. The daemon must load and report THIS release. --status verifies the
+          #    installed payload at startup, prints "chudware <version>" on stderr
+          #    and then exits nonzero because no daemon is running: the banner is
+          #    the assertion, the exit status is not.
+          banner="$(CHUDWARE_LIBCHUDWARE="${app}/Contents/Frameworks/libchudware.dylib" \
+            "${app}/Contents/MacOS/chudware-hostd" --status 2>&1 >/dev/null || true)"
+          printf '%s\n' "${banner}"
+          printf '%s' "${banner}" | grep -Fq "${RELEASE_VERSION}" || {
+            echo "::error::chudware-hostd did not load and report ${RELEASE_VERSION}"; exit 1; }
+
+          # 3. The signed payload manifest must describe the extracted bytes, and
+          #    its signature must verify against release-ci-v1.
+          PYTHONPATH="${GITHUB_WORKSPACE}" "${RELEASE_PYTHON}" - "${app}" "${RELEASE_PUBLIC_KEY_B64}" <<'PY'
+          import sys
+          from pathlib import Path
+          from services.installer.payload_manifest import read_manifest, verify_manifest_payload, verify_signature
+          root = Path(sys.argv[1])
+          manifest, canonical = read_manifest(root)
+          verify_manifest_payload(root, canonical)
+          verify_signature(key_id=str(manifest["key_id"]), canonical_json=canonical,
+                           signature_path=root / "payload-manifest.v1.sig", public_key=sys.argv[2])
+          if manifest["platform"] != "macos":
+              raise SystemExit("payload manifest claims platform %r" % manifest["platform"])
+          print("payload manifest verified: %d files, key_id %s, version %s"
+                % (len(manifest["files"]), manifest["key_id"], manifest["version"]))
+          PY
+
+          # The manifest and its signature ride beside the artifact as sidecars;
+          # they live inside the bundle, so take them from the verified tree.
+          cp "${app}/payload-manifest.v1.json" "${work}/payload-manifest.v1.json"
+          cp "${app}/payload-manifest.v1.sig" "${work}/payload-manifest.v1.sig"
+
+      - name: Upload the app and publish over the gateway loopback
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "${RUNNER_TEMP}/gw.sh"
+          name="Chudware-${RELEASE_VERSION}-macos-${RELEASE_ARCH}.zip"
+          incoming="${GATEWAY_RELEASES_DIR}/incoming"
+
+          # Sidecars carry the artifact's own name plus a suffix; the payload
+          # signature REPLACES the .json (payload-manifest.v1.sig), while
+          # evidence signatures append .sig to the full evidence file name.
+          gw_scp "${ARTIFACT}" "${incoming}/${name}" > /dev/null || {
+            echo "::error::scp failed for ${name}"; exit 1; }
+          gw_scp "${RUNNER_TEMP}/verify/payload-manifest.v1.json" \
+            "${incoming}/${name}.payload-manifest.v1.json" > /dev/null || {
+            echo '::error::scp failed for the payload manifest'; exit 1; }
+          gw_scp "${RUNNER_TEMP}/verify/payload-manifest.v1.sig" \
+            "${incoming}/${name}.payload-manifest.v1.sig" > /dev/null || {
+            echo '::error::scp failed for the payload manifest signature'; exit 1; }
+          uploaded=3
+          if [ "${HAS_EVIDENCE}" = 1 ]; then
+            for document in sbom.cdx.json provenance.slsa.json platform-test.v1.json; do
+              for suffix in '' '.sig'; do
+                local_path="${RUNNER_TEMP}/evidence/${document}${suffix}"
+                test -f "${local_path}" || {
+                  echo "::error::missing upload ${local_path}"; exit 1; }
+                gw_scp "${local_path}" "${incoming}/${name}.${document}${suffix}" > /dev/null || {
+                  echo "::error::scp failed for ${name}.${document}${suffix}"; exit 1; }
+                uploaded=$((uploaded + 1))
+              done
+            done
+          fi
+          echo "ARTIFACT_NAME=${name}" >> "$GITHUB_ENV"
+          echo "uploaded ${uploaded} files to ${incoming}"
+
+          ci_status publishing "posting ci/publish for ${name}"
+
+          body="${RUNNER_TEMP}/publish.json"
+          # The gateway recomputes every digest from the staged files and rejects
+          # a mismatch, so the body is built from the exact bytes that were
+          # uploaded.
+          EVIDENCE_DIR="${RUNNER_TEMP}/evidence" "${RELEASE_PYTHON}" - "${ARTIFACT}" \
+            "${RUNNER_TEMP}/artifact.sig" "${RUNNER_TEMP}/artifact-stable.sig" > "${body}" <<'PY'
+          import hashlib, json, os, pathlib, sys
+
+          def digest(path):
+              value = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(chunk)
+              return value.hexdigest()
+
+          artifact = pathlib.Path(sys.argv[1])
+          body = {
+              "version": os.environ["RELEASE_VERSION"],
+              "stable_version": os.environ["RELEASE_STABLE_VERSION"],
+              "platform": os.environ["RELEASE_PLATFORM"],
+              "arch": os.environ["RELEASE_ARCH"],
+              "channel": "beta",
+              "key_id": os.environ["CHUDWARE_RELEASE_KEY_ID"],
+              "min_supported": os.environ["CHUDWARE_RELEASE_MIN_SUPPORTED"],
+              "sha256": os.environ["ARTIFACT_SHA256"],
+              "size": artifact.stat().st_size,
+              "signature": pathlib.Path(sys.argv[2]).read_text(encoding="ascii").strip(),
+              "stable_signature": pathlib.Path(sys.argv[3]).read_text(encoding="ascii").strip(),
+              "notes_url": os.environ["CHUDWARE_RELEASE_NOTES_URL"],
+              "commit_sha": os.environ["RELEASE_COMMIT"],
+          }
+          if os.environ.get("HAS_EVIDENCE") == "1":
+              directory = pathlib.Path(os.environ["EVIDENCE_DIR"])
+              evidence = {}
+              for field, name in (("sbom", "sbom.cdx.json"),
+                                  ("provenance", "provenance.slsa.json"),
+                                  ("platform_test", "platform-test.v1.json")):
+                  evidence[field + "_sha256"] = digest(directory / name)
+                  evidence[field + "_signature_sha256"] = digest(directory / (name + ".sig"))
+              body["evidence"] = evidence
+          json.dump(body, sys.stdout)
+          PY
+
+          # A 422 for a digest/size mismatch makes the gateway DELETE the staged
+          # artifact (sidecars survive), so a retry must re-stage it. Re-running
+          # this job does exactly that: it rebuilds and re-uploads first.
+          gw_scp "${body}" "${GATEWAY_REMOTE_DIR}/publish.json" > /dev/null
+          gw_ssh "bash '${GATEWAY_REMOTE_DIR}/remote_gateway.sh' publish '${GATEWAY_REMOTE_DIR}/publish.json'" || {
+            echo '::error::ci/publish rejected the macOS app'; exit 1; }
+
+          ci_status published "${name} published to beta"
+          {
+            echo "## macOS ${RELEASE_ARCH} beta published"
+            echo ''
+            echo "* artifact: \`${name}\`"
+            echo "* stable pair signed for: \`${RELEASE_STABLE_VERSION}\`"
+            echo "* evidence bundle: \`${HAS_EVIDENCE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report failure to the gateway
+        if: always() && job.status != 'success'
+        shell: bash
+        run: |
+          set -uo pipefail
+          test -r "${RUNNER_TEMP}/gw.sh" || exit 0
+          . "${RUNNER_TEMP}/gw.sh"
+          ci_status failed "macos-beta ${RELEASE_ARCH} ${{ job.status }} in run ${GITHUB_RUN_NUMBER}"
+
+      - name: Remove the run-scoped remote staging directory
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          test -r "${RUNNER_TEMP}/gw.sh" || exit 0
+          . "${RUNNER_TEMP}/gw.sh"
+          gw_ssh "rm -rf '${GATEWAY_REMOTE_DIR}'" || true
           exit 0

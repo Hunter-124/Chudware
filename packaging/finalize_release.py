@@ -20,6 +20,15 @@ except ImportError:
     from release_json import canonical_json_bytes, parse_canonical_json_bytes
 
 REPO = Path(__file__).resolve().parent.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+# The payload manifest has its OWN canonical form (no trailing newline): the
+# detached signature and the C++ verifier both cover exactly those bytes.
+from services.installer.payload_manifest import (  # noqa: E402
+    PayloadManifestError,
+    canonical_manifest_bytes,
+)
+
 _DOMAINS = {
     "sbom.cdx.json": b"chudware-sbom-v1\0",
     "provenance.slsa.json": b"chudware-provenance-v1\0",
@@ -66,10 +75,34 @@ def _relative(path: Path, root: Path, label: str) -> str:
         raise FinalizeError(f"{label} must be retained inside the portable finalize bundle") from exc
 
 
+def _parse_payload_manifest(raw: bytes) -> dict[str, Any]:
+    """Parse a payload manifest with the PAYLOAD canonical form.
+
+    services/installer/payload_manifest.py emits (and the C++ verifier in
+    core/security/integrity.cpp checks) compact key-sorted JSON with NO
+    trailing newline, because the detached signature covers exactly those
+    bytes. release_json's canonical form requires a terminating LF and is for
+    evidence/handoff documents; using it here rejected every real manifest
+    with "payload manifest bytes are not canonical".
+    """
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise FinalizeError("payload manifest is not UTF-8 JSON") from exc
+    if not isinstance(parsed, dict):
+        raise FinalizeError("payload manifest must be a JSON object")
+    try:
+        if canonical_manifest_bytes(parsed) != raw:
+            raise FinalizeError("payload manifest bytes are not canonical")
+    except PayloadManifestError as exc:
+        raise FinalizeError(f"payload manifest is invalid: {exc}") from exc
+    return parsed
+
+
 def load_handoff(args: argparse.Namespace, staging: Path) -> tuple[dict[str, Any], Path, str]:
     manifest_path = _single("payload-manifest.v1.json", staging)
     try:
-        payload = parse_canonical_json_bytes(manifest_path.read_bytes(), "payload manifest", FinalizeError)
+        payload = _parse_payload_manifest(manifest_path.read_bytes())
     except OSError as exc:
         raise FinalizeError(f"cannot read retained payload manifest: {exc}") from exc
     key_id = payload.get("key_id")
@@ -167,7 +200,7 @@ def host_script(args: argparse.Namespace, handoff_dir: Path) -> Path:
 
 def finalize_linux(args: argparse.Namespace, handoff_dir: Path) -> Path:
     appdir = _single("AppDir", handoff_dir)
-    manifest = parse_canonical_json_bytes(_single("payload-manifest.v1.json", handoff_dir).read_bytes(), "payload manifest", FinalizeError)
+    manifest = _parse_payload_manifest(_single("payload-manifest.v1.json", handoff_dir).read_bytes())
     command = [str(REPO / "packaging/linux/build_appimage.sh"), "--out", str(appdir.parent),
                "--key-id", str(manifest["key_id"]), "--finalize-signing", str(args.payload_signature.resolve()),
                "--release-public-key", args.release_public_key]

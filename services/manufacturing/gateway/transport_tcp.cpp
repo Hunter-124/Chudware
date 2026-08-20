@@ -208,7 +208,13 @@ bool resolve_addresses(std::string_view host, std::string_view port,
         const int lookup = getaddrinfo(lookup_host.c_str(), std::string(port).c_str(),
                                        &hints, &addresses);
         if (lookup != 0) {
+            #ifdef _WIN32
+            // gai_strerror maps to gai_strerrorW under UNICODE and returns
+            // WCHAR*, which does not concatenate onto std::string (C2676).
+            why = std::string("TCP endpoint resolution failed: ") + gai_strerrorA(lookup);
+#else
             why = std::string("TCP endpoint resolution failed: ") + gai_strerror(lookup);
+#endif
             return false;
         }
         for (const addrinfo* candidate = addresses; candidate != nullptr;

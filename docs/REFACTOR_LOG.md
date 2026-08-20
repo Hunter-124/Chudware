@@ -7829,3 +7829,26 @@ offers `reload_settings`, which re-reads Settings from the environment and
 monkeypatches it field-by-field ONTO the existing object; `test_accounts` and
 `test_chat` use it and no longer pop `config` out of `sys.modules`. Do not
 reintroduce a `config.settings = …` rebind in a fixture.
+
+### 2026-08-19 — automatic release pipeline + dashboard-first /admin
+Reworked /admin into a tabbed dashboard-first app (Dashboard/Releases/Accounts/
+Terminal/System) and stood up the automatic release path end-to-end:
+`.github/workflows/nightly-release.yml` (nightly-if-changed + dispatch) builds
+Linux AppImage + Windows Inno on the self-hosted runners at a pinned
+`CHUDWARE_VERSION_OVERRIDE`, runs ctest + a headless GUI smoke, signs with a
+CI-held Ed25519 key (`release-ci-v1`; private seed in GitHub secrets, public
+half in `core/security/release_keys.h`, the gateway keyring, and
+`packaging/publish.py`), and publishes over the gateway LOOPBACK only
+(`POST /api/releases/ci/publish`, bearer token in gateway.env, artifact
+re-digested from disk before any trust). Beta rows carry a paired stable
+signature; /admin's Releases tab promotes beta→stable in one click
+(`POST /api/admin/releases/promote`, requires the full evidence bundle).
+Updater got `requestCheckNow()` + a Settings "Check now" button, and
+empty-channel 404 now reads "up to date" instead of HTTP noise. Gotchas:
+`project(VERSION)` rejects prerelease — the override keeps MAJOR/MINOR/PATCH
+numeric for cmake and puts the full string only in the version header;
+`releases_version_canonical_check` (0011) forbade prerelease, so 0014 replaces
+it allowing `-suffix` on beta only; `services/mcp/private_hostd.py` now sets
+`CHUDWARE_MFG_STATE_DIR` and `start_new_session=True` for the spawned daemon
+(a shared journal flock aborted it when any other hostd ran, and sharing the
+test runner's process group delivered phantom SIGINT mid-suite).

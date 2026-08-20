@@ -50,7 +50,7 @@ def ci_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for name in releases._R2_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("CHUDWARE_RELEASES_PUBLIC_BASE_URL", raising=False)
-    for limiter in ("_manifest_by_ip", "_publish_by_ip", "_base_version_by_ip", "_artifact_by_ip"):
+    for limiter in ("_manifest_by_ip", "_publish_by_ip", "_base_version_by_ip", "_artifact_by_ip", "_ci_by_ip"):
         monkeypatch.setattr(releases, limiter, releases.RateLimiter(10_000, 60.0))
     return root
 

@@ -116,6 +116,10 @@ _DEFAULT_PUBLIC_BASE_URL = "https://app.chudware.com"
 _SAFE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 _manifest_by_ip = RateLimiter(120, 60.0)
 _publish_by_ip = RateLimiter(20, 60.0)
+# CI runners all NAT through one public address, and a single platform leg can
+# legitimately make ~15 calls a minute (per-file uploads + status posts); the
+# ci/* routes are Bearer-token gated, so this limiter is only an abuse backstop.
+_ci_by_ip = RateLimiter(240, 60.0)
 _base_version_by_ip = RateLimiter(60, 60.0)
 _artifact_by_ip = RateLimiter(30, 60.0)
 
@@ -704,7 +708,7 @@ async def ci_publish_release(value: CiPublish, request: Request) -> dict[str, An
     move could publish a manifest pointing at bytes that never arrived.
     """
     client = request.client.host if request.client else "unknown"
-    _publish_by_ip.enforce(client, "release publications")
+    _ci_by_ip.enforce(client, "ci release calls")
     _require_publish_token(request)
     signature, stable_signature = _validate_ci_publish(value)
 
@@ -796,7 +800,7 @@ async def ci_upload_artifact(name: str, request: Request) -> dict[str, Any]:
     moves into the store.
     """
     client = request.client.host if request.client else "unknown"
-    _publish_by_ip.enforce(client, "release publications")
+    _ci_by_ip.enforce(client, "ci release calls")
     _require_publish_token(request)
     safe = _safe_name(name)
     target = _incoming_dir() / (safe + ".part")
@@ -821,7 +825,7 @@ async def ci_upload_artifact(name: str, request: Request) -> dict[str, Any]:
 @router.post("/api/releases/ci/status")
 async def ci_report_status(value: CiStatus, request: Request) -> dict[str, Any]:
     client = request.client.host if request.client else "unknown"
-    _publish_by_ip.enforce(client, "release publications")
+    _ci_by_ip.enforce(client, "ci release calls")
     _require_publish_token(request)
     if value.status not in _CI_STATUSES:
         raise HTTPException(422, "status must be one of " + ", ".join(sorted(_CI_STATUSES)))
@@ -893,7 +897,7 @@ async def ci_list_builds(
     admin session: the nightly planner runs on a runner that has neither a
     browser session nor any business holding database credentials."""
     client = request.client.host if request.client else "unknown"
-    _publish_by_ip.enforce(client, "release publications")
+    _ci_by_ip.enforce(client, "ci release calls")
     _require_publish_token(request)
     return {"builds": _recent_ci_builds(limit, commit_sha, status)}
 

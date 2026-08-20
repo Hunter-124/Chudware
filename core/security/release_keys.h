@@ -26,6 +26,18 @@ inline constexpr std::array kKeys = {
             0x97, 0x94, 0xbc, 0x93, 0x22, 0x96, 0x6d, 0xd7,
         },
     },
+    // CI beta/signing key (`release-ci-v1`). Nightly CI signs every beta artifact
+    // and the paired stable preimage with this key, so packaged builds must trust
+    // it unconditionally — it is not a developer-only test key.
+    Key{
+        "release-ci-v1",
+        {
+            0xd7, 0x43, 0x4d, 0xc6, 0x7f, 0x4d, 0x6e, 0x11,
+            0xcd, 0x4c, 0x8c, 0xed, 0x9b, 0x5e, 0xbb, 0xcc,
+            0xf2, 0xe1, 0x47, 0x7b, 0x59, 0x49, 0xd5, 0x2d,
+            0x76, 0x85, 0xb6, 0xca, 0x43, 0xa0, 0x10, 0xf6,
+        },
+    },
 #ifdef CHUDWARE_DEVELOPER_BUILD
     // Deterministic developer-only key (seed 00..1f) for updater regression
     // vectors. It is never trusted by packaged builds.

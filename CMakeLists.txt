@@ -16,7 +16,10 @@ cmake_minimum_required(VERSION 3.20)
 include(core/cmake/ChudwareVersion.cmake)
 chudware_version_derive()
 
-project(chudware VERSION ${CHUDWARE_VERSION} LANGUAGES C CXX)
+# The numeric triple, not CHUDWARE_VERSION: an overridden version may carry a
+# prerelease suffix (0.1.0-beta.42), which project(VERSION) rejects outright.
+project(chudware VERSION ${CHUDWARE_VERSION_MAJOR}.${CHUDWARE_VERSION_MINOR}.${CHUDWARE_VERSION_PATCH}
+        LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

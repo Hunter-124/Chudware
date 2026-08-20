@@ -336,6 +336,25 @@ DWORD run(const fs::path& program, const std::wstring& args, bool elevate, std::
     WaitForSingleObject(info.hProcess, INFINITE); DWORD code = UINT32_MAX; GetExitCodeProcess(info.hProcess, &code); CloseHandle(info.hProcess); return code;
 }
 
+// The installer is PrivilegesRequired=lowest and its default location is
+// {localappdata}\Programs\Chudware, so the ordinary per-user update needs no
+// elevation: raising UAC there is both a needless prompt and wrong (an elevated
+// Inno run writes the uninstall registration into the administrator's hive and
+// leaves admin-owned files inside the user's LocalAppData). A standard account
+// cannot satisfy "runas" at all, which would make the update unappliable. Only
+// a machine-wide install root that this user cannot write needs elevation.
+bool writableDirectory(const fs::path& directory) {
+    const fs::path probe = directory / L"chudware-update-write-probe.tmp";
+    const HANDLE handle = CreateFileW(probe.c_str(), GENERIC_WRITE | DELETE, 0, nullptr,
+                                      CREATE_ALWAYS,
+                                      FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE |
+                                          FILE_FLAG_OPEN_REPARSE_POINT,
+                                      nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(handle);
+    return true;
+}
+
 bool canonicalRoot(const fs::path& executable, const fs::path& claimed, fs::path& root) {
     std::error_code ec; const fs::path exe = fs::weakly_canonical(executable, ec); if (ec || !realFile(exe)) return false;
     const fs::path actual = fs::weakly_canonical(exe.parent_path(), ec); if (ec || !realDirectory(actual)) return false;
@@ -400,7 +419,8 @@ int runWindowsUpdateHelper(int argc, wchar_t** argv) {
     const std::string key = pendingMacKey(manifestBytes, signatureBytes);
     if (key.empty() || !hmacSha256(key, state.dump(), mac) ||
         !writeJsonAtomic(session / L"pending.json", {{"state", state}, {"mac", mac}})) return 6;
-    const DWORD installCode = run(installer, L"/SILENT /NORESTART /DIR=" + quote(install), true, &error);
+    const DWORD installCode = run(installer, L"/SILENT /NORESTART /DIR=" + quote(install),
+                                  !writableDirectory(install), &error);
     const DWORD verifyCode = installCode == 0 ? run(executable, L"--verify-payload-manifest " + quote(install / kManifest) + L" " + quote(install / kSignature), false, &error) : installCode;
     if (installCode != 0 || verifyCode != 0) { restore(install, session / L"rollback", files, &error); return 7; }
     if (!writeJsonAtomic(session / L"committed.json", {{"session_id", std::string(sessionId.begin(), sessionId.end())}})) { restore(install, session / L"rollback", files, &error); return 8; }

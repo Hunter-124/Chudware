@@ -7,7 +7,11 @@ cmake_minimum_required(VERSION 3.20)
 include("${CMAKE_CURRENT_SOURCE_DIR}/../core/cmake/ChudwareVersion.cmake")
 chudware_version_derive()
 
-project(CHUDWARE_Host VERSION ${CHUDWARE_VERSION} LANGUAGES C CXX)
+# The numeric triple, not CHUDWARE_VERSION: an overridden version may carry a
+# prerelease suffix (0.1.0-beta.42), which project(VERSION) rejects outright.
+project(CHUDWARE_Host
+        VERSION ${CHUDWARE_VERSION_MAJOR}.${CHUDWARE_VERSION_MINOR}.${CHUDWARE_VERSION_PATCH}
+        LANGUAGES C CXX)
 
 # MSVC: <windows.h> defines min()/max() macros that clobber std::min, std::max and
 # std::numeric_limits<>::max. core/CMakeLists.txt:71 already suppresses this

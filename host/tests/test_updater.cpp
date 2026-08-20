@@ -1,3 +1,4 @@
+#include "security/release_keys.h"
 #include "update/updater.h"
 #include "update/windows_update_helper.h"
 
@@ -97,6 +98,33 @@ void versionTests() {
     require(requiresMandatoryUpdate("1.0.0-rc.1", "1.0.0"),
             "prerelease build hits release kill switch");
     require(!requiresMandatoryUpdate("1.2.0", "1.0.0"), "supported release is not killed");
+    // Nightly CI publishes <base>-beta.<run>, so beta builds must order among
+    // themselves numerically and below the stable release they promote into.
+    require(compareVersions("0.1.0-beta.42", "0.1.0-beta.43") < 0,
+            "nightly beta builds order by run number");
+    require(compareVersions("0.1.0-beta.43", "0.1.0") < 0,
+            "nightly beta sorts below the stable release it promotes into");
+    require(compareVersions("0.1.0-beta.9", "0.1.0-beta.10") < 0,
+            "beta run numbers compare numerically, not lexically");
+    require(!requiresMandatoryUpdate("0.1.0-beta.43", "0.1.0-beta.42"),
+            "a newer beta is not killed by an older minimum");
+}
+
+// The CI signing key must be trusted by packaged builds, not only developer
+// builds: every nightly beta artifact signature carries key id release-ci-v1.
+void releaseKeyringTests() {
+    using chudware::security::release::findKey;
+    const auto* ci = findKey("release-ci-v1");
+    require(ci != nullptr, "release-ci-v1 must be a trusted release key");
+    require(ci->publicKey[0] == 0xd7 && ci->publicKey[7] == 0x11 &&
+                ci->publicKey[31] == 0xf6,
+            "release-ci-v1 public key bytes must match the published key");
+    require(findKey("release-v1") != nullptr, "release-v1 must stay trusted");
+    require(findKey("unknown-release-key") == nullptr, "unknown key ids stay untrusted");
+#ifndef CHUDWARE_DEVELOPER_BUILD
+    require(findKey("dev-test-v1") == nullptr,
+            "developer test key must not be trusted by packaged builds");
+#endif
 }
 
 void stagedLifecycleTests(const fs::path& root) {
@@ -325,6 +353,7 @@ void servedSecurityTest(const std::string& kind, const std::string& url,
 
 int main(int argc, char** argv) {
     versionTests();
+    releaseKeyringTests();
     stagedLifecycleTests(fs::temp_directory_path() / "chudware-updater-state-test");
     if (argc == 5 && std::string(argv[1]) == "--served") {
         servedSecurityTest(argv[2], argv[3], argv[4]);
@@ -338,6 +367,7 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
         windowsRollbackTests(fs::temp_directory_path() / "chudware-updater-test");
 #endif
-    std::cout << "versions: semver+prerelease+0.0.0+min-supported=ok\n";
+    std::cout << "versions: semver+prerelease+beta-order+0.0.0+min-supported=ok\n";
+    std::cout << "keyring: release-v1+release-ci-v1 trusted, unknown rejected\n";
     return 0;
 }

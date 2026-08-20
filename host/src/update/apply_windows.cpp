@@ -17,17 +17,6 @@
 namespace chudware::update {
 namespace {
 
-std::wstring wide(const std::string& value) {
-    if (value.empty()) return {};
-    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-                                         static_cast<int>(value.size()), nullptr, 0);
-    if (size <= 0) return {};
-    std::wstring out(static_cast<std::size_t>(size), L'\0');
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-                        static_cast<int>(value.size()), out.data(), size);
-    return out;
-}
-
 std::string windowsError(const char* prefix) {
     return std::string(prefix) + " (Windows error " + std::to_string(GetLastError()) + ")";
 }

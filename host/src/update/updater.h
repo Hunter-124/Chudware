@@ -68,6 +68,9 @@ public:
     void start();
     void stop();
     void setEntitlementToken(std::string token);
+    // Wakes the polling worker so a manual "Check now" does not have to wait out
+    // the remaining poll interval. No-op when no worker is running.
+    void requestCheckNow();
     Snapshot snapshot() const;
 
     // The download is streamed into the update directory, then size, SHA-256 and

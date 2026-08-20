@@ -7959,8 +7959,24 @@ void drawSettingsModal(AppState& st, bool busy) {
                 if (!update.downloadUrl.empty() &&
                     ImGui::SmallButton("Open update download"))
                     ui::openExternalHttpUrl(update.downloadUrl);
+            } else if (update.state == chudware::update::State::Checking) {
+                dimText("Checking for updates\xe2\x80\xa6");
             } else if (update.state == chudware::update::State::Current) {
                 dimText("Chudware is up to date");
+            } else if (update.state == chudware::update::State::Error) {
+                dimText(update.message.c_str());
+            }
+            // Manual re-check. The worker polls on a long interval, so this is the
+            // only way to pick up a release published since launch without a
+            // restart. Idle means no worker is running (headless capture, or the
+            // updater was never configured), so there is nothing to wake.
+            if (update.state != chudware::update::State::Idle) {
+                const bool inFlight = update.state == chudware::update::State::Checking ||
+                                      update.state == chudware::update::State::Downloading;
+                ImGui::BeginDisabled(inFlight);
+                if (ImGui::SmallButton("Check now##desktop_update_check"))
+                    chudware::update::globalUpdater().requestCheckNow();
+                ImGui::EndDisabled();
             }
         }
 #endif

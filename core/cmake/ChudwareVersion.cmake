@@ -28,8 +28,20 @@
 #       Writes <out_dir>/api/chudware_version.h. Put <out_dir> on a target's
 #       include path and `#include "api/chudware_version.h"` resolves exactly the
 #       way `#include "api/libchudware.h"` already does from the core source root.
+#
+#   -DCHUDWARE_VERSION_OVERRIDE=<major>.<minor>.<patch>[-prerelease]
+#       Names the version explicitly instead of deriving it from git. The nightly
+#       release pipeline needs this: it publishes <base>-beta.<run number> long
+#       before any tag carries that string, and a git-derived 0.0.0 dirty build
+#       must never be shipped as one. Validated at configure; the numeric triple
+#       feeds project(VERSION) (which rejects prerelease suffixes) while the full
+#       string, suffix included, is what CHUDWARE_VERSION and every artifact name
+#       carry. dirty is 0: the pipeline pinned the commit it built.
 
 set(_CHUDWARE_VERSION_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+
+set(CHUDWARE_VERSION_OVERRIDE "" CACHE STRING
+    "Exact product version <major>.<minor>.<patch>[-prerelease] (release pipeline); empty derives from git")
 
 macro(chudware_version_derive)
   # Re-derive once per configure run. A GLOBAL property (not a cache entry) is the
@@ -40,6 +52,7 @@ macro(chudware_version_derive)
     set(_cw_major 0)
     set(_cw_minor 0)
     set(_cw_patch 0)
+    set(_cw_full "")
     set(_cw_dirty 1)
     set(_cw_sha "unknown")
 
@@ -57,7 +70,24 @@ macro(chudware_version_derive)
       set(_cw_sha "${CMAKE_MATCH_1}")
     endif()
 
-    if(_cw_desc)
+    if(CHUDWARE_VERSION_OVERRIDE)
+      # CI stamps a version that no tag carries yet (nightly beta.<run number>),
+      # so the override wins over git describe. Validated here, at configure, so a
+      # malformed value stops the build instead of producing an installer whose
+      # file name, payload manifest and update manifest disagree.
+      if(NOT CHUDWARE_VERSION_OVERRIDE MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)(-[0-9A-Za-z.-]+)?$")
+        message(FATAL_ERROR
+          "CHUDWARE_VERSION_OVERRIDE must be <major>.<minor>.<patch>[-prerelease], got "
+          "'${CHUDWARE_VERSION_OVERRIDE}'")
+      endif()
+      set(_cw_major "${CMAKE_MATCH_1}")
+      set(_cw_minor "${CMAKE_MATCH_2}")
+      set(_cw_patch "${CMAKE_MATCH_3}")
+      # An override names an exact release identity handed down by the pipeline,
+      # which already pinned the commit: never marked dirty.
+      set(_cw_dirty 0)
+      set(_cw_full "${CHUDWARE_VERSION_OVERRIDE}")
+    elseif(_cw_desc)
       set(_cw_tag "${_cw_desc}")
       if(_cw_tag MATCHES "-dirty$")
         string(REGEX REPLACE "-dirty$" "" _cw_tag "${_cw_tag}")
@@ -77,12 +107,19 @@ macro(chudware_version_derive)
       endif()
     endif()
 
+    # Only an override carries a prerelease suffix; the git path is the numeric
+    # triple. MAJOR/MINOR/PATCH stay numeric in both cases so project(VERSION),
+    # which rejects a prerelease, can consume them.
+    if(NOT _cw_full)
+      set(_cw_full "${_cw_major}.${_cw_minor}.${_cw_patch}")
+    endif()
+
     string(TIMESTAMP _cw_date "%Y-%m-%d" UTC)
 
     set(CHUDWARE_VERSION_MAJOR "${_cw_major}" CACHE INTERNAL "Chudware major version" FORCE)
     set(CHUDWARE_VERSION_MINOR "${_cw_minor}" CACHE INTERNAL "Chudware minor version" FORCE)
     set(CHUDWARE_VERSION_PATCH "${_cw_patch}" CACHE INTERNAL "Chudware patch version" FORCE)
-    set(CHUDWARE_VERSION "${_cw_major}.${_cw_minor}.${_cw_patch}"
+    set(CHUDWARE_VERSION "${_cw_full}"
         CACHE INTERNAL "Chudware semver" FORCE)
     set(CHUDWARE_GIT_SHA "${_cw_sha}" CACHE INTERNAL "Chudware build commit" FORCE)
     set(CHUDWARE_BUILD_DIRTY "${_cw_dirty}" CACHE INTERNAL "Chudware working tree dirty" FORCE)
@@ -93,6 +130,7 @@ macro(chudware_version_derive)
     unset(_cw_major)
     unset(_cw_minor)
     unset(_cw_patch)
+    unset(_cw_full)
     unset(_cw_dirty)
     unset(_cw_sha)
     unset(_cw_head)

@@ -1057,6 +1057,13 @@ void Updater::setEntitlementToken(std::string token) {
     impl_->wake.notify_all();
 }
 
+void Updater::requestCheckNow() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->running) return;
+    impl_->forceCheck = true;
+    impl_->wake.notify_all();
+}
+
 Snapshot Updater::snapshot() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->status;

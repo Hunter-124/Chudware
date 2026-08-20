@@ -65,7 +65,7 @@ jobs:
             $innounpZip = Join-Path $work 'innounp.zip'
             $innounpDir = Join-Path $work 'innounp'
             Write-Host "downloading Inno Setup installer..."
-            Invoke-WebRequest -Uri 'https://jrsoftware.org/download.php/is.exe' -OutFile $isexe -UserAgent 'Mozilla/5.0'
+            Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $isexe -UserAgent 'Mozilla/5.0'
             if ((Get-Item $isexe).Length -lt 1000000) { throw "is.exe download looks wrong (too small); install Inno Setup 6 manually" }
             Write-Host "downloading innounp..."
             Invoke-WebRequest -Uri 'https://www.rathlev-home.de/tools/download/innounp-2.zip' -OutFile $innounpZip -UserAgent 'Mozilla/5.0'

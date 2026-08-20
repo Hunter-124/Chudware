@@ -231,6 +231,9 @@ return true;
 #endif
     std::string loadDiag;
     std::wstring winnerW;
+    // The POSIX branch above declares its own `h`; this one never did, so the
+    // Windows path did not compile in either build mode.
+    HMODULE h = nullptr;
     for (const std::wstring& path : candidates) {
 #ifdef CHUDWARE_DEVELOPER_BUILD
         size_t slash = path.find_last_of(L"\\/");

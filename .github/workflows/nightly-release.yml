@@ -377,6 +377,10 @@ jobs:
       - name: Headless GUI smoke capture (advisory)
         shell: bash
         run: |
+          # The runner invokes bash with -e on the command line; an in-script
+          # `set -uo pipefail` does NOT clear it, which is why the advisory step
+          # still failed the job. Turn -e off explicitly.
+          set +e
           set -uo pipefail
           mkdir -p scratch
           rm -f scratch/smoke.png

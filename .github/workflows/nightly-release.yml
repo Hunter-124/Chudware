@@ -456,7 +456,7 @@ jobs:
 
           request="$(find "${out}" -type f -name '*payload-signing-request.bin' -print -quit)"
           test -s "${request}" || { echo '::error::payload signing request missing'; exit 1; }
-          python3 packaging/ci_sign.py \
+          "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py \
             --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
             --output "${RUNNER_TEMP}/payload.sig" \
             sign payload "${request}" > /dev/null
@@ -481,7 +481,7 @@ jobs:
           # without an evidence bundle (promotion to stable may not), and that is a
           # loud warning rather than a silent omission.
           status=0
-          python3 packaging/finalize_release.py "${RUNNER_TEMP}/prepared.tar" \
+          "${CHUDWARE_RELEASE_PYTHON}" packaging/finalize_release.py "${RUNNER_TEMP}/prepared.tar" \
             --payload-signature "${RUNNER_TEMP}/payload.sig" \
             --release-public-key "${public_key_b64}" \
             --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" \
@@ -507,12 +507,12 @@ jobs:
 
           # Sign the artifact identity twice over the same bytes: the beta version
           # published now, and the stable version /admin will promote to.
-          python3 packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+          "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
             --output "${RUNNER_TEMP}/artifact.sig" \
             artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_VERSION}" \
             --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" \
             --request-out "${RUNNER_TEMP}/artifact-request.bin" > /dev/null
-          python3 packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+          "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
             --output "${RUNNER_TEMP}/artifact-stable.sig" \
             artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_STABLE_VERSION}" \
             --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" > /dev/null
@@ -530,7 +530,7 @@ jobs:
             for pair in 'sbom.cdx.json:sbom' 'provenance.slsa.json:provenance' 'platform-test.v1.json:platform-test'; do
               name="${pair%%:*}"
               kind="${pair##*:}"
-              python3 packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+              "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
                 --output "${dir}/${name}.sig" \
                 sign "${kind}" "${dir}/${name}.signing-request.bin" > /dev/null
             done

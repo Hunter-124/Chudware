@@ -88,7 +88,8 @@ build_omp_bridge() {
     echo "==> installing locked vendored OMP workspace"
     (cd "$REPO/vendor/omp" && bun install --frozen-lockfile)
     (cd "$REPO/vendor/omp" && bun build --compile --sourcemap=none --packages=bundle \
-        --reject-unresolved --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
+        --allow-unresolved='' --allow-unresolved='@img/sharp-*/versions' --allow-unresolved='@img/sharp-libvips-*/lib' --allow-unresolved='@img/sharp-libvips-*/package' --allow-unresolved='@img/sharp-libvips-*/versions' --allow-unresolved='@img/sharp-libvips-dev-*/include' --allow-unresolved='@img/sharp-libvips-dev-*/lib' \
+        --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
         --no-compile-autoload-package-json bridge/src/bridge.ts --outfile "$destination")
     [ -x "$destination" ] || { echo "error: Bun did not produce $destination" >&2; exit 1; }
 }

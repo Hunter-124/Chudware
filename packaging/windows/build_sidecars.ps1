@@ -72,7 +72,8 @@ function Build-OmpBridge([string]$Destination) {
         Invoke-Checked $bun @("install", "--frozen-lockfile")
         Write-Host "==> compiling chudware-omp-bridge.exe"
         Invoke-Checked $bun @(
-            "build", "--compile", "--sourcemap=none", "--packages=bundle", "--reject-unresolved",
+            "build", "--compile", "--sourcemap=none", "--packages=bundle",
+            "--allow-unresolved=", "--allow-unresolved=@img/sharp-*/versions", "--allow-unresolved=@img/sharp-libvips-*/lib", "--allow-unresolved=@img/sharp-libvips-*/package", "--allow-unresolved=@img/sharp-libvips-*/versions", "--allow-unresolved=@img/sharp-libvips-dev-*/include", "--allow-unresolved=@img/sharp-libvips-dev-*/lib",
             "--no-compile-autoload-dotenv", "--no-compile-autoload-bunfig",
             "--no-compile-autoload-package-json", "--windows-hide-console",
             "bridge/src/bridge.ts", "--outfile", $Destination

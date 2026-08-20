@@ -167,7 +167,13 @@ bool verifySecurityAcknowledgement(std::string_view body,std::string_view batchI
         for(auto f:fields)if(!value.contains(std::string(f)))return false;
         const std::string status=value.at("status").get<std::string>();
         if(status!="acknowledged"&&status!="contained"&&status!="reauthorize")return false;
-        if(value.at("batch_id")!=batchId||value.at("subject")!=subject||value.at("policy_id")!=policy||value.at("sequence")!=sequence||!value.at("enforcement_state").is_object())return false;
+        // Typed gets: MSVC (C2666) rejects the implicit-conversion soup of
+        // nlohmann::json::operator!= against string_view/uint64_t.
+        if(value.at("batch_id").get<std::string>()!=batchId||
+           value.at("subject").get<std::string>()!=subject||
+           value.at("policy_id").get<std::string>()!=policy||
+           value.at("sequence").get<std::uint64_t>()!=sequence||
+           !value.at("enforcement_state").is_object())return false;
         const std::string issuedAt=value.at("issued_at").get<std::string>();
         if(issuedAt.size()!=20||issuedAt[4]!='-'||issuedAt[7]!='-'||issuedAt[10]!='T'||issuedAt[13]!=':'||issuedAt[16]!=':'||issuedAt[19]!='Z')return false;
         std::vector<unsigned char> signature;

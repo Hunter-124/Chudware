@@ -240,7 +240,9 @@ target_link_libraries(chudware_util PUBLIC Threads::Threads nlohmann_json::nlohm
 if(WIN32)
   target_link_libraries(chudware_util PUBLIC bcrypt crypt32)
 elseif(APPLE)
-  target_link_libraries(chudware_util PUBLIC "-framework Security")
+  # secret_store.cpp calls CoreFoundation directly (CFRelease et al.); Security
+  # alone does not satisfy those symbols for a static-lib link order.
+  target_link_libraries(chudware_util PUBLIC "-framework CoreFoundation" "-framework Security")
 elseif(UNIX)
   # shm_open/shm_unlink live in librt on older glibc; harmless empty on new glibc.
   target_link_libraries(chudware_util PUBLIC rt)

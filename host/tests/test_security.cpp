@@ -1,5 +1,6 @@
 #include "security/integrity.h"
 #include "security/containment.h"
+#include "security/event_queue.h"
 #include "security/runtime_guard.h"
 #include "security/release_keys.h"
 #include "util/device_identity.h"

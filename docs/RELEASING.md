@@ -137,8 +137,11 @@ fails at its capability check with an explicit message otherwise):
 * `cmake`, `ninja`, `ctest`, `git`, `python`, `bun`, `ssh`, `scp` on `PATH`
   (`%USERPROFILE%\chudware-ci-tools\{bin,python}` is added automatically, as in
   `native-build.yml`)
-* **Inno Setup 6** — `ISCC.exe` in `%ProgramFiles(x86)%\Inno Setup 6`, on `PATH`,
-  or named by the `ISCC` environment variable
+* **Inno Setup 6** — `ISCC.exe` in `%USERPROFILE%\chudware-ci-tools\innosetup`
+  (portable unpack; the runner service account cannot run Inno's installer),
+  `%ProgramFiles(x86)%\Inno Setup 6`, on `PATH`, or named by the `ISCC`
+  environment variable. `runner-provision.yml` (Actions -> run) installs bun
+  and Inno into exactly these locations.
 * Nuitka and `packaging/requirements-release.txt` for the compiled sidecars
 * `CHUDWARE_SIGN_IDENTITY` if you want Authenticode on the installer; without it
   the installer is unsigned and SmartScreen will warn (see `docs/SIGNING.md`)

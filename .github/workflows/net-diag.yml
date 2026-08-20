@@ -1,0 +1,20 @@
+# Throwaway network diagnostic — do not keep. Delete after the LAN question is answered.
+name: net-diag
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: [self-hosted, Windows, X64, cloudcastle-ci, cc-win-package]
+    timeout-minutes: 5
+    steps:
+      - name: Probe gateway host
+        shell: powershell
+        run: |
+          Test-Connection -ComputerName 192.168.0.183 -Count 2 -ErrorAction SilentlyContinue | Format-Table -AutoSize
+          $t = Test-NetConnection -ComputerName 192.168.0.183 -Port 22 -WarningAction SilentlyContinue
+          Write-Host "tcp22: $($t.TcpTestSucceeded)"
+          $t80 = Test-NetConnection -ComputerName 192.168.0.183 -Port 80 -WarningAction SilentlyContinue
+          Write-Host "tcp80: $($t80.TcpTestSucceeded)"
+          ipconfig | Select-String 'IPv4'

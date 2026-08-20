@@ -239,6 +239,32 @@ jobs:
           "${venv}/bin/python3" -m pip install -r packaging/requirements-release.txt
           "${venv}/bin/python3" -c 'import cryptography, nuitka; print("release python deps installed")'
 
+      - name: Provision the CEF SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The release build enables the CEF webview and cef.cmake takes it from
+          # -DCEF_ROOT; the nightly resolves the newest dir under ~/chudware-cef-sdk.
+          root="${HOME}/chudware-cef-sdk"
+          if ls -d "${root}"/cef_binary_* >/dev/null 2>&1; then
+            echo "CEF SDK already present: $(ls -d "${root}"/cef_binary_* | head -1)"
+            exit 0
+          fi
+          case "$(uname -m)" in
+            arm64) flavor=macosarm64 ;;
+            x86_64) flavor=macosx64 ;;
+            *) echo "::error::unhandled mac arch $(uname -m)"; exit 1 ;;
+          esac
+          version="149.0.6+g0d0eeb6+chromium-149.0.7827.201"
+          fname="cef_binary_${version}_${flavor}_minimal.tar.bz2"
+          url="https://cef-builds.spotifycdn.com/$(printf '%s' "${fname}" | sed 's/+/%2B/g')"
+          mkdir -p "${root}"
+          echo "downloading ${url}"
+          curl -fL --retry 3 -o "${root}/${fname}" "${url}"
+          tar -xjf "${root}/${fname}" -C "${root}"
+          rm -f "${root}/${fname}"
+          ls -d "${root}"/cef_binary_* || { echo "::error::CEF SDK extract produced nothing"; exit 1; }
+
       - name: Capability report
         shell: bash
         run: |

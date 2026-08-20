@@ -318,11 +318,18 @@ jobs:
             -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
           cmake --build --preset "${CORE_PRESET}"
 
+          # The shipped build has the CEF webview on; the SDK is provisioned on
+          # the runner outside the repo (fresh checkouts carry no extern/cef).
+          cef_root="$(ls -d "${HOME}"/chudware-cef-sdk/cef_binary_* 2>/dev/null | sort | tail -1 || true)"
+          [ -n "${cef_root}" ] || {
+            echo "::error::no CEF SDK under ${HOME}/chudware-cef-sdk — the release build needs CHUDWARE_ENABLE_CEF=ON and cef.cmake only searches extern/cef without CEF_ROOT"; exit 1; }
+
           cmake -S host -B "${HOST_BUILD_DIR}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCHUDWARE_DEVELOPER_BUILD=OFF \
             -DCHUDWARE_VERSION_OVERRIDE="${RELEASE_VERSION}" \
-            -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
+            -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}" \
+            -DCEF_ROOT="${cef_root}"
           cmake --build "${HOST_BUILD_DIR}"
 
           # Prove both caches carry the release identity rather than a git-derived
@@ -889,7 +896,10 @@ jobs:
           # native-build compile gate: this job produces the installer customers
           # run, and it must carry the same feature set release.yml ships. A runner
           # without the provisioned CEF SDK fails this configure loudly instead of
-          # quietly shipping a Chudware with no web view.
+          # quietly shipping a Chudware with no web view. Fresh checkouts carry no
+          # extern/cef, so fetch the pinned SDK first (idempotent).
+          & powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fetch_cef_windows.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & cmake -S host -B $env:HOST_BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCHUDWARE_DEVELOPER_BUILD=OFF `
             "-DCHUDWARE_VERSION_OVERRIDE=$env:RELEASE_VERSION" `
@@ -1424,11 +1434,18 @@ jobs:
             -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
           cmake --build --preset "${CORE_PRESET}"
 
+          # The shipped build has the CEF webview on; the SDK is provisioned on
+          # the runner outside the repo (fresh checkouts carry no extern/cef).
+          cef_root="$(ls -d "${HOME}"/chudware-cef-sdk/cef_binary_* 2>/dev/null | sort | tail -1 || true)"
+          [ -n "${cef_root}" ] || {
+            echo "::error::no CEF SDK under ${HOME}/chudware-cef-sdk — the release build needs CHUDWARE_ENABLE_CEF=ON and cef.cmake only searches extern/cef without CEF_ROOT"; exit 1; }
+
           cmake -S host -B "${HOST_BUILD_DIR}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCHUDWARE_DEVELOPER_BUILD=OFF \
             -DCHUDWARE_VERSION_OVERRIDE="${RELEASE_VERSION}" \
-            -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
+            -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}" \
+            -DCEF_ROOT="${cef_root}"
           cmake --build "${HOST_BUILD_DIR}"
 
           # Prove both caches carry the release identity rather than a

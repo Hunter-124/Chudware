@@ -695,12 +695,44 @@ jobs:
 
       - name: Report failure to the gateway
         if: always() && job.status != 'success'
+        env:
+          GATEWAY_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
         shell: bash
         run: |
           set -uo pipefail
-          test -r "${RUNNER_TEMP}/gw.sh" || exit 0
-          . "${RUNNER_TEMP}/gw.sh"
-          ci_status failed "linux-beta ${{ job.status }} in run ${GITHUB_RUN_NUMBER}"
+          detail="linux-beta ${{ job.status }} in run ${GITHUB_RUN_NUMBER}"
+          if [ -r "${RUNNER_TEMP}/gw.sh" ]; then
+            . "${RUNNER_TEMP}/gw.sh"
+            ci_status failed "${detail}"
+            exit 0
+          fi
+          # The capability step failed before gw.sh existed. Without this the
+          # queued row the plan job wrote stays "queued" in /admin forever,
+          # which reads as a hung runner instead of a failed leg. Public origin
+          # and the secret token: the loopback credential lives in a file this
+          # runner may not have been able to read.
+          [ -n "${GATEWAY_TOKEN:-}" ] || exit 0
+          umask 077
+          curlrc="${RUNNER_TEMP}/gw-fallback.curlrc"
+          printf 'header = "Authorization: Bearer %s"\n' "${GATEWAY_TOKEN}" > "${curlrc}"
+          body="${RUNNER_TEMP}/ci-status-fallback.json"
+          python3 - failed "${detail}" > "${body}" <<'PY'
+          import json, os, sys
+          json.dump({
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "commit_sha": os.environ["RELEASE_COMMIT"],
+              "channel": "beta",
+              "platform": os.environ["RELEASE_PLATFORM"],
+              "arch": os.environ["RELEASE_ARCH"],
+              "version": os.environ["RELEASE_VERSION"],
+              "status": sys.argv[1],
+              "detail": sys.argv[2],
+          }, sys.stdout)
+          PY
+          curl --config "${curlrc}" --fail-with-body --silent --show-error --max-time 60 \
+            -H 'Content-Type: application/json' --data-binary "@${body}" \
+            "${CHUDWARE_GATEWAY_PUBLIC_BASE}/api/releases/ci/status" > /dev/null \
+            || echo "::warning::fallback ci/status was not recorded"
 
   windows-beta:
     name: Windows beta installer
@@ -1242,12 +1274,39 @@ jobs:
 
       - name: Report failure to the gateway
         if: always() && job.status != 'success'
+        env:
+          GATEWAY_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
+          $detail = "windows-beta ${{ job.status }} in run $env:GITHUB_RUN_NUMBER"
           $reporter = Join-Path $env:RUNNER_TEMP 'ci_status.ps1'
-          if (-not (Test-Path $reporter)) { exit 0 }
-          & $reporter -Status 'failed' -Detail "windows-beta ${{ job.status }} in run $env:GITHUB_RUN_NUMBER"
+          if (Test-Path $reporter) {
+            & $reporter -Status 'failed' -Detail $detail
+            exit 0
+          }
+          # The capability step failed before ci_status.ps1 existed. Without
+          # this the queued row the plan job wrote stays 'queued' in /admin
+          # forever, which reads as a hung runner instead of a failed leg.
+          if (-not $env:GATEWAY_TOKEN) { exit 0 }
+          $body = @{
+            run_id      = $env:GITHUB_RUN_ID
+            commit_sha  = $env:RELEASE_COMMIT
+            channel     = 'beta'
+            platform    = $env:RELEASE_PLATFORM
+            arch        = $env:RELEASE_ARCH
+            version     = $env:RELEASE_VERSION
+            status      = 'failed'
+            detail      = $detail
+          } | ConvertTo-Json -Compress
+          try {
+            Invoke-RestMethod -Method Post -TimeoutSec 60 `
+              -Uri ($env:CHUDWARE_GATEWAY_PUBLIC_BASE + '/api/releases/ci/status') `
+              -Headers @{ Authorization = 'Bearer ' + $env:GATEWAY_TOKEN } `
+              -ContentType 'application/json' -Body $body | Out-Null
+          } catch {
+            Write-Host ('::warning::fallback ci/status was not recorded: ' + $_.Exception.Message)
+          }
 
   macos-beta:
     name: macOS beta app (${{ matrix.arch }})
@@ -1853,9 +1912,38 @@ jobs:
 
       - name: Report failure to the gateway
         if: always() && job.status != 'success'
+        env:
+          GATEWAY_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
         shell: bash
         run: |
           set -uo pipefail
-          test -r "${RUNNER_TEMP}/gw.sh" || exit 0
-          . "${RUNNER_TEMP}/gw.sh"
-          ci_status failed "macos-beta ${RELEASE_ARCH} ${{ job.status }} in run ${GITHUB_RUN_NUMBER}"
+          detail="macos-beta ${RELEASE_ARCH} ${{ job.status }} in run ${GITHUB_RUN_NUMBER}"
+          if [ -r "${RUNNER_TEMP}/gw.sh" ]; then
+            . "${RUNNER_TEMP}/gw.sh"
+            ci_status failed "${detail}"
+            exit 0
+          fi
+          # The capability step failed before gw.sh existed; without this the
+          # queued row the plan job wrote stays "queued" in /admin forever.
+          [ -n "${GATEWAY_TOKEN:-}" ] || exit 0
+          umask 077
+          curlrc="${RUNNER_TEMP}/gw-fallback.curlrc"
+          printf 'header = "Authorization: Bearer %s"\n' "${GATEWAY_TOKEN}" > "${curlrc}"
+          body="${RUNNER_TEMP}/ci-status-fallback.json"
+          python3 - failed "${detail}" > "${body}" <<'PY'
+          import json, os, sys
+          json.dump({
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "commit_sha": os.environ["RELEASE_COMMIT"],
+              "channel": "beta",
+              "platform": os.environ["RELEASE_PLATFORM"],
+              "arch": os.environ["RELEASE_ARCH"],
+              "version": os.environ["RELEASE_VERSION"],
+              "status": sys.argv[1],
+              "detail": sys.argv[2],
+          }, sys.stdout)
+          PY
+          curl --config "${curlrc}" --fail-with-body --silent --show-error --max-time 60 \
+            -H 'Content-Type: application/json' --data-binary "@${body}" \
+            "${CHUDWARE_GATEWAY_PUBLIC_BASE}/api/releases/ci/status" > /dev/null \
+            || echo "::warning::fallback ci/status was not recorded"

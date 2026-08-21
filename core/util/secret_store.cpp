@@ -247,27 +247,36 @@ bool store(std::string_view service, std::string_view account,
     LocalFree(encrypted.pbData);
     return atomicWriteProtectedFile(fallbackPath(service, account, dataDir, ".dpapi"), bytes);
 #elif defined(__APPLE__)
-    UInt32 oldLength = 0;
-    void* oldData = nullptr;
-    SecKeychainItemRef item = nullptr;
-    const OSStatus found = SecKeychainFindGenericPassword(
-        nullptr, static_cast<UInt32>(service.size()), service.data(),
-        static_cast<UInt32>(account.size()), account.data(), &oldLength, &oldData, &item);
-    if (oldData) SecKeychainItemFreeContent(nullptr, oldData);
-    OSStatus status = errSecSuccess;
-    if (found == errSecSuccess) {
-        status = SecKeychainItemModifyAttributesAndData(
-            item, nullptr, static_cast<UInt32>(value.size()), value.data());
-        CFRelease(item);
-    } else if (found == errSecItemNotFound) {
-        status = SecKeychainAddGenericPassword(
+    // Same rule the Linux branch documents below: an explicit data directory
+    // means an isolated test or a recovery tool, so bind the secret to the
+    // directory-backed 0600 store instead of the process-global login
+    // keychain. On macOS that is a liveness rule too, not only isolation:
+    // SecKeychainAddGenericPassword wants to prompt for an unlock, and a
+    // headless CI session has nobody to answer it, so the call hangs. That is
+    // what timed out host test_security on the release runner.
+    if (dataDir.empty()) {
+        UInt32 oldLength = 0;
+        void* oldData = nullptr;
+        SecKeychainItemRef item = nullptr;
+        const OSStatus found = SecKeychainFindGenericPassword(
             nullptr, static_cast<UInt32>(service.size()), service.data(),
-            static_cast<UInt32>(account.size()), account.data(),
-            static_cast<UInt32>(value.size()), value.data(), nullptr);
-    } else {
-        status = found;
+            static_cast<UInt32>(account.size()), account.data(), &oldLength, &oldData, &item);
+        if (oldData) SecKeychainItemFreeContent(nullptr, oldData);
+        OSStatus status = errSecSuccess;
+        if (found == errSecSuccess) {
+            status = SecKeychainItemModifyAttributesAndData(
+                item, nullptr, static_cast<UInt32>(value.size()), value.data());
+            CFRelease(item);
+        } else if (found == errSecItemNotFound) {
+            status = SecKeychainAddGenericPassword(
+                nullptr, static_cast<UInt32>(service.size()), service.data(),
+                static_cast<UInt32>(account.size()), account.data(),
+                static_cast<UInt32>(value.size()), value.data(), nullptr);
+        } else {
+            status = found;
+        }
+        if (status == errSecSuccess) return true;
     }
-    if (status == errSecSuccess) return true;
 #else
     const std::string encoded = base64(value);
     // Explicit data directories are used by isolated tests and recovery tools;
@@ -298,17 +307,19 @@ bool load(std::string_view service, std::string_view account,
     LocalFree(plain.pbData);
     return true;
 #elif defined(__APPLE__)
-    UInt32 length = 0;
-    void* data = nullptr;
-    SecKeychainItemRef item = nullptr;
-    const OSStatus status = SecKeychainFindGenericPassword(
-        nullptr, static_cast<UInt32>(service.size()), service.data(),
-        static_cast<UInt32>(account.size()), account.data(), &length, &data, &item);
-    if (status == errSecSuccess) value.assign(static_cast<unsigned char*>(data),
-                                             static_cast<unsigned char*>(data) + length);
-    if (data) SecKeychainItemFreeContent(nullptr, data);
-    if (item) CFRelease(item);
-    if (status == errSecSuccess) return true;
+    if (dataDir.empty()) {
+        UInt32 length = 0;
+        void* data = nullptr;
+        SecKeychainItemRef item = nullptr;
+        const OSStatus status = SecKeychainFindGenericPassword(
+            nullptr, static_cast<UInt32>(service.size()), service.data(),
+            static_cast<UInt32>(account.size()), account.data(), &length, &data, &item);
+        if (status == errSecSuccess) value.assign(static_cast<unsigned char*>(data),
+                                                 static_cast<unsigned char*>(data) + length);
+        if (data) SecKeychainItemFreeContent(nullptr, data);
+        if (item) CFRelease(item);
+        if (status == errSecSuccess) return true;
+    }
 #else
     if (dataDir.empty()) {
         std::string encoded;
@@ -331,17 +342,19 @@ bool erase(std::string_view service, std::string_view account, std::string_view 
     return !ec;
 #else
 #  if defined(__APPLE__)
-    UInt32 length = 0;
-    void* data = nullptr;
-    SecKeychainItemRef item = nullptr;
-    const OSStatus found = SecKeychainFindGenericPassword(
-        nullptr, static_cast<UInt32>(service.size()), service.data(),
-        static_cast<UInt32>(account.size()), account.data(), &length, &data, &item);
-    if (data) SecKeychainItemFreeContent(nullptr, data);
-    if (found == errSecItemNotFound) return true;
-    const OSStatus status = found == errSecSuccess ? SecKeychainItemDelete(item) : found;
-    if (item) CFRelease(item);
-    if (status == errSecSuccess) return true;
+    if (dataDir.empty()) {
+        UInt32 length = 0;
+        void* data = nullptr;
+        SecKeychainItemRef item = nullptr;
+        const OSStatus found = SecKeychainFindGenericPassword(
+            nullptr, static_cast<UInt32>(service.size()), service.data(),
+            static_cast<UInt32>(account.size()), account.data(), &length, &data, &item);
+        if (data) SecKeychainItemFreeContent(nullptr, data);
+        if (found == errSecItemNotFound) return true;
+        const OSStatus status = found == errSecSuccess ? SecKeychainItemDelete(item) : found;
+        if (item) CFRelease(item);
+        if (status == errSecSuccess) return true;
+    }
 #  else
     if (dataDir.empty() &&
         runSecretTool({"clear", "service", std::string(service), "account",

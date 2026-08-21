@@ -233,7 +233,12 @@ fails at its capability check with an explicit message otherwise):
   `%ProgramFiles(x86)%\Inno Setup 6`, on `PATH`, or named by the `ISCC`
   environment variable. `runner-provision.yml` (Actions -> run) installs bun
   and Inno into exactly these locations.
-* Nuitka and `packaging/requirements-release.txt` for the compiled sidecars
+* Nuitka and `packaging/requirements-release.txt` for the compiled sidecars.
+  Nuitka's onefile mode on Windows needs Dependency Walker and asks for it
+  interactively, which a CI shell answers "no"; `build_sidecars.ps1` passes
+  `--assume-yes-for-downloads`, so the first release build fetches it into
+  `%LOCALAPPDATA%\Nuitka` and later builds reuse the cache. That runner
+  therefore needs outbound HTTPS beyond app.chudware.com on its first build.
 * `CHUDWARE_SIGN_IDENTITY` if you want Authenticode on the installer; without it
   the installer is unsigned and SmartScreen will warn (see `docs/SIGNING.md`)
 * outbound HTTPS to `app.chudware.com`. This runner cannot reach the gateway's

@@ -129,8 +129,13 @@ function Build-PythonSidecar([string]$Module, [string]$Name) {
         )
     }
 
+    # --assume-yes-for-downloads: on Windows Nuitka refuses standalone/onefile
+    # mode without Dependency Walker and asks interactively for permission to
+    # fetch it. A CI shell answers "no (default non-interactive)" and the
+    # compile dies. The tool is cached under LOCALAPPDATA after the first run.
     $arguments = @(
         "-m", "nuitka", "--mode=onefile", "--remove-output",
+        "--assume-yes-for-downloads",
         "--output-dir=$work", "--output-filename=$Name.exe",
         "--nofollow-import-to=*.tests", "--nofollow-import-to=*.test_*"
     ) + $includes + @($Entry)

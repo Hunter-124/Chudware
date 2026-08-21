@@ -125,3 +125,45 @@ def test_snapshot_survives_a_metadata_change_that_settles(
     assert calls["n"] > 1
     assert snapshot.size == len(b"payload bytes")
     assert snapshot.sha256 == hashlib.sha256(b"payload bytes").hexdigest()
+
+
+def _restat(result: os.stat_result, **overrides: int) -> os.stat_result:
+    """Rebuild a stat_result, keeping the nanosecond fields intact."""
+    fields = list(result)
+    named = {
+        "st_atime": result.st_atime, "st_mtime": result.st_mtime, "st_ctime": result.st_ctime,
+        "st_atime_ns": result.st_atime_ns, "st_mtime_ns": result.st_mtime_ns,
+        "st_ctime_ns": result.st_ctime_ns,
+    }
+    for name, value in overrides.items():
+        index = {"st_ino": 1, "st_dev": 2, "st_size": 6}[name]
+        fields[index] = value
+    return os.stat_result(fields, named)
+
+
+def test_snapshot_tolerates_the_windows_cross_api_file_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """os.stat() and os.fstat() report different file ids for the same Windows file.
+
+    The path form reports FileIdInfo, the handle form the older 64-bit index, so
+    comparing them across the two flavours rejected every payload file and no
+    Windows release could be staged. Every other field is still compared.
+    """
+    root = tmp_path / "payload"
+    root.mkdir()
+    (root / "FreeImage.dll").write_bytes(b"dll bytes")
+    real_fstat = os.fstat
+
+    def other_flavour_fstat(descriptor: int) -> os.stat_result:
+        result = real_fstat(descriptor)
+        return _restat(result, st_ino=result.st_ino + 2**64, st_dev=result.st_dev + 1)
+
+    monkeypatch.setattr(payload_manifest.os, "fstat", other_flavour_fstat)
+    monkeypatch.setattr(payload_manifest, "_CROSS_FLAVOUR_IGNORED", ("dev", "ino"))
+    snapshot = payload_manifest._snapshot_file(root, "FreeImage.dll", "library", attempts=1)
+    assert snapshot.sha256 == hashlib.sha256(b"dll bytes").hexdigest()
+
+    monkeypatch.setattr(payload_manifest, "_CROSS_FLAVOUR_IGNORED", ())
+    with pytest.raises(payload_manifest.PayloadManifestError, match="ino="):
+        payload_manifest._snapshot_file(root, "FreeImage.dll", "library", attempts=1)

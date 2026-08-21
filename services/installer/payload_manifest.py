@@ -184,15 +184,45 @@ def default_kind(relative: str) -> str:
     return "resource"
 
 
-def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
-    return (
-        left.st_dev == right.st_dev
-        and left.st_ino == right.st_ino
-        and left.st_size == right.st_size
-        and stat.S_IMODE(left.st_mode) == stat.S_IMODE(right.st_mode)
-        and left.st_mtime_ns == right.st_mtime_ns
-        and left.st_ctime_ns == right.st_ctime_ns
+# os.stat() and os.fstat() fill st_dev/st_ino from different Windows APIs (the
+# path form reports the 128-bit FileIdInfo, the handle form the older 64-bit
+# file index), so those two fields cannot be compared ACROSS the two flavours
+# there — they disagree for every file, which failed the Windows release on the
+# first payload entry it looked at. Everything else is still compared, and
+# handle-vs-handle comparisons (the ones that prove the bytes did not move
+# while being hashed) stay strict on every platform.
+_CROSS_FLAVOUR_IGNORED = ("dev", "ino") if os.name == "nt" else ()
+
+
+def _identity_fields(value: os.stat_result) -> dict[str, object]:
+    return {
+        "dev": value.st_dev,
+        "ino": value.st_ino,
+        "size": value.st_size,
+        "mode": stat.S_IMODE(value.st_mode),
+        "mtime_ns": value.st_mtime_ns,
+        "ctime_ns": value.st_ctime_ns,
+    }
+
+
+def _identity_mismatch(
+    left: os.stat_result, right: os.stat_result, *, ignore: Sequence[str] = ()
+) -> str:
+    first, second = _identity_fields(left), _identity_fields(right)
+    return ", ".join(
+        f"{name}={first[name]!r}->{second[name]!r}"
+        for name in first
+        if name not in ignore and first[name] != second[name]
     )
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return not _identity_mismatch(left, right)
+
+
+def _same_open_identity(path_stat: os.stat_result, handle_stat: os.stat_result) -> str:
+    """Empty string when a descriptor still refers to the file that was stat'd."""
+    return _identity_mismatch(path_stat, handle_stat, ignore=_CROSS_FLAVOUR_IGNORED)
 
 
 def _read_regular_file(path: Path, label: str) -> bytes:
@@ -207,16 +237,18 @@ def _read_regular_file(path: Path, label: str) -> bytes:
     content = bytearray()
     try:
         opened = os.fstat(descriptor)
-        if not _same_identity(before, opened):
-            raise PayloadManifestError(f"{label} changed while opening: {path}")
+        mismatch = _same_open_identity(before, opened)
+        if mismatch:
+            raise PayloadManifestError(f"{label} changed while opening: {path} ({mismatch})")
         while chunk := os.read(descriptor, 1024 * 1024):
             content.extend(chunk)
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
     final = path.lstat()
-    if not _same_identity(opened, after) or not _same_identity(after, final):
-        raise PayloadManifestError(f"{label} changed while reading: {path}")
+    mismatch = _identity_mismatch(opened, after) or _same_open_identity(final, after)
+    if mismatch:
+        raise PayloadManifestError(f"{label} changed while reading: {path} ({mismatch})")
     return bytes(content)
 
 
@@ -258,16 +290,20 @@ def _snapshot_file_once(root: Path, relative: str, kind: str) -> FileSnapshot:
     digest = hashlib.sha256()
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or not _same_identity(before, opened):
-            raise PayloadManifestError(f"payload file changed while opening: {relative}")
+        mismatch = _same_open_identity(before, opened)
+        if not stat.S_ISREG(opened.st_mode) or mismatch:
+            raise PayloadManifestError(
+                f"payload file changed while opening: {relative} ({mismatch or 'not a regular file'})"
+            )
         while chunk := os.read(descriptor, 1024 * 1024):
             digest.update(chunk)
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
     final = path.lstat()
-    if not _same_identity(opened, after) or not _same_identity(after, final):
-        raise PayloadManifestError(f"payload file changed while hashing: {relative}")
+    mismatch = _identity_mismatch(opened, after) or _same_open_identity(final, after)
+    if mismatch:
+        raise PayloadManifestError(f"payload file changed while hashing: {relative} ({mismatch})")
     return FileSnapshot(
         path=relative,
         size=after.st_size,

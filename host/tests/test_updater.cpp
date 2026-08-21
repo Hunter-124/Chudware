@@ -271,9 +271,10 @@ void innerPayloadMismatchTest(const fs::path& root) {
         "cat > squashfs-root/payload-manifest.v1.json <<'EOF'\n" + inner +
         "\nEOF\nprintf '%s' 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==' > squashfs-root/payload-manifest.v1.sig\n"
         "exit 0\n");
-    fs::permissions(artifact, fs::perms::owner_read | fs::perms::owner_write |
-                              fs::perms::owner_exec);
-
+    // 0600, exactly as a streamed download lands: the inspector must make the
+    // artifact executable itself, or every real update is rejected before its
+    // inner payload is ever read.
+    fs::permissions(artifact, fs::perms::owner_read | fs::perms::owner_write);
     Manifest outer;
     outer.version = "1.2.4";
     outer.minSupported = "1.0.0";
@@ -411,24 +412,45 @@ void liveChannelTest(const std::string& endpoint, const std::string& currentVers
     if (const char* token = std::getenv("CHUDWARE_UPDATE_ENTITLEMENT"); token && *token)
         updater.setEntitlementToken(token);
     updater.start();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(15);
+    // A staged download is the assertion, not the reported state: once a
+    // release's min_supported outranks the running build (every 0.1.0-beta.N
+    // against min_supported 0.1.0), setStatus pins the state to Mandatory and
+    // only the message tracks check -> download -> staged. So poll for the
+    // staged transaction and, if the worker gives up first, report the message
+    // it left behind.
+    const fs::path metadata = root / "data/updates/staged.json";
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(20);
+    std::string last;
     for (;;) {
         const auto snap = updater.snapshot();
-        if (snap.state != State::Idle && snap.state != State::Checking &&
-            snap.state != State::Available && snap.state != State::Downloading) {
-            require(snap.state == State::Staged,
-                    ("live channel did not stage an update: " + snap.message).c_str());
-            std::cout << "live: staged " << snap.version << " over " << currentVersion << '\n';
+        if (snap.message != last) {
+            last = snap.message;
+            std::cout << "live: [" << static_cast<int>(snap.state) << "] " << last
+                      << std::endl;
+        }
+        if (fs::exists(metadata)) {
+            std::cout << "live: staged " << snap.version << " over " << currentVersion
+                      << " (mandatory=" << (snap.mandatory ? "yes" : "no") << ")\n";
+            require(snap.state == State::Staged || snap.mandatory,
+                    "a staged update must read as Staged or Mandatory");
             break;
         }
+        // A mandatory update pins the state, so a rejection is only visible in
+        // the message; every verification refusal names its reason.
+        for (const char* marker : {"failed", "does not match", "invalid", "unknown",
+                                   "exceeds", "not writable", "up to date"})
+            require(last.find(marker) == std::string::npos,
+                    ("live channel did not stage an update: " + last).c_str());
+        require(snap.state != State::Error && snap.state != State::ManualDownload &&
+                    snap.state != State::Current,
+                ("live channel did not stage an update: " + snap.message).c_str());
         require(std::chrono::steady_clock::now() < deadline,
-                "live update check/download never completed");
+                ("live update never staged; last status: " + last).c_str());
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     updater.stop();
     require(readFile(running) == "RUNNING APP MUST STAY UNTOUCHED\n",
             "staging must not touch the running app");
-    const fs::path metadata = root / "data/updates/staged.json";
     require(fs::exists(metadata), "live staged transaction metadata is missing");
     require(chudware::update::testing::stagedTransactionState(metadata) ==
                 chudware::update::testing::StagedTransactionState::Staged,

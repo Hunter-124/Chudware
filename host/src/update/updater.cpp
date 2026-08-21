@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -439,6 +440,20 @@ bool verifyInnerPayload(const std::filesystem::path& artifact, const Manifest& o
         ~Cleanup() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
     } cleanup{base};
 
+#if !defined(__APPLE__)
+    // On Linux the artifact IS the extractor: --appimage-extract is implemented
+    // by the AppImage runtime inside the file, so it has to be executable. A
+    // streamed download lands 0644, which made ::execl fail and rejected every
+    // real update as "could not be safely inspected". The bytes have already
+    // passed size, SHA-256 and Ed25519 verification here, so only the mode
+    // changes, and 0700 keeps the staged artifact private to this user.
+    if (::chmod(artifact.c_str(), 0700) != 0) {
+        error = "could not prepare the update artifact for inspection: " +
+                std::string(std::strerror(errno));
+        return false;
+    }
+#endif
+
     if (!runExtractor(artifact, base, error)) return false;
 #if defined(__APPLE__)
     const auto root = base / "Chudware.app";
@@ -509,6 +524,42 @@ struct Updater::Impl {
     std::filesystem::path updateDir() const { return dataDir / "updates"; }
     std::filesystem::path reportsPath() const { return updateDir() / "reported-rejections.txt"; }
     std::filesystem::path stagedMetadata() const { return updateDir() / "staged.json"; }
+
+    // The manifest endpoint the update check uses. Shared with the download so
+    // both agree on the single origin allowed to see the entitlement.
+    static std::string manifestEndpoint() {
+        const char* endpoint = std::getenv("CHUDWARE_UPDATE_MANIFEST_URL");
+        return endpoint && *endpoint ? endpoint
+                                     : "https://app.chudware.com/api/releases/latest";
+    }
+
+    static std::string originOf(const std::string& url) {
+        const auto scheme = url.find("://");
+        if (scheme == std::string::npos) return {};
+        const auto slash = url.find('/', scheme + 3);
+        std::string origin = url.substr(0, slash == std::string::npos ? url.size() : slash);
+        std::transform(origin.begin(), origin.end(), origin.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return origin;
+    }
+
+    // The gateway's own artifact route is entitlement-gated (a presigned CDN
+    // URL is not), so a self-hosted download must carry the same credential
+    // the manifest check used or it is answered 403 and no build ever
+    // installs. The credential goes back ONLY to the origin that issued the
+    // manifest: never to third-party storage.
+    std::string entitlementHeader(const std::string& url) const {
+        std::string value;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            value = token;
+        }
+        if (value.empty()) return {};
+        const std::string origin = originOf(url);
+        if (origin.empty() || origin != originOf(manifestEndpoint())) return {};
+        return "X-Chudware-Entitlement: " + value;
+    }
 
     void setStatus(State state, const Manifest* manifest, std::string message,
                    std::string url = {}) {
@@ -747,8 +798,19 @@ struct Updater::Impl {
         Handle connection{session ? WinHttpConnect(session, host.c_str(), uc.nPort, 0) : nullptr};
         Handle request{connection ? WinHttpOpenRequest(connection, L"GET", path.c_str(), nullptr,
             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr};
+        // Credentialed downloads must not chase a redirect: WinHTTP replays
+        // request headers on the hop, and the entitlement belongs to this
+        // origin only.
+        const std::wstring extraHeaders = widen(entitlementHeader(manifest.url));
+        if (request && !extraHeaders.empty()) {
+            DWORD disable = WINHTTP_DISABLE_REDIRECTS;
+            WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &disable, sizeof(disable));
+        }
         if (!session || !connection || !request ||
-            !WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            !WinHttpSendRequest(request,
+                                extraHeaders.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS
+                                                     : extraHeaders.c_str(),
+                                extraHeaders.empty() ? 0 : static_cast<DWORD>(extraHeaders.size()),
                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
             !WinHttpReceiveResponse(request, nullptr)) {
             error = "WinHTTP update download failed"; return false;
@@ -796,10 +858,23 @@ struct Updater::Impl {
         if (const char* caFile = std::getenv("CHUDWARE_UPDATE_CA_FILE"); caFile && *caFile)
             curl_easy_setopt(curl, CURLOPT_CAINFO, caFile);
 #endif
+        // libcurl replays custom headers on every redirect hop and has no
+        // same-origin restriction for them, so a credentialed download refuses
+        // to follow redirects at all. The gateway's artifact route answers with
+        // the bytes; only a presigned CDN URL redirects, and that carries its
+        // own authorization instead of this header.
+        const std::string entitlement = entitlementHeader(manifest.url);
+        curl_slist* requestHeaders = nullptr;
+        if (!entitlement.empty()) {
+            requestHeaders = curl_slist_append(requestHeaders, entitlement.c_str());
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, requestHeaders);
+            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+        }
         const CURLcode rc = curl_easy_perform(curl);
         long status = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
         curl_easy_cleanup(curl);
+        curl_slist_free_all(requestHeaders);
         if (rc != CURLE_OK || status < 200 || status >= 300) {
             error = sink.overflow
                 ? "integrity: downloaded update exceeds manifest size"
@@ -828,13 +903,10 @@ struct Updater::Impl {
             entitlementToken = token;
             executable = executablePath;
         }
-        const char* endpointEnv = std::getenv("CHUDWARE_UPDATE_MANIFEST_URL");
         const char* channelEnv = std::getenv("CHUDWARE_UPDATE_CHANNEL");
         const std::string channel = channelEnv && std::strcmp(channelEnv, "beta") == 0
             ? "beta" : "stable";
-        const std::string endpoint = endpointEnv && *endpointEnv
-            ? endpointEnv
-            : "https://app.chudware.com/api/releases/latest";
+        const std::string endpoint = manifestEndpoint();
         const std::string url = endpoint + "?channel=" + channel + "&platform=" +
             platformName() + "&arch=" + architectureName();
         std::vector<std::pair<std::string, std::string>> headers;

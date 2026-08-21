@@ -588,7 +588,9 @@ jobs:
 
           # 3. The signed payload manifest must describe the extracted bytes, and
           #    its signature must verify against release-ci-v1.
-          PYTHONPATH="${GITHUB_WORKSPACE}" python3 - "${root}" "${RELEASE_PUBLIC_KEY_B64}" <<'PY'
+          # The release Python, not the system one: verify_signature needs
+          # `cryptography`, which only the release venv carries.
+          PYTHONPATH="${GITHUB_WORKSPACE}" "${CHUDWARE_RELEASE_PYTHON}" - "${root}" "${RELEASE_PUBLIC_KEY_B64}" <<'PY'
           import sys
           from pathlib import Path
           from services.installer.payload_manifest import read_manifest, verify_manifest_payload, verify_signature

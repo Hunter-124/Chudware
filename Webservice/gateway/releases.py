@@ -796,8 +796,50 @@ async def ci_publish_release(value: CiPublish, request: Request) -> dict[str, An
     }
 
 
+_ARTIFACT_CEILING = 2 * 1024**3
+
+
+async def _receive_chunk(
+    request: Request, part: Path, safe: str, offset: int, complete: bool
+) -> dict[str, Any]:
+    """Append one chunk at ``offset``, and finalize when ``complete`` is set."""
+    if offset < 0:
+        raise HTTPException(422, "offset must not be negative")
+    current = part.stat().st_size if part.exists() else 0
+    if offset != current:
+        raise HTTPException(
+            409, f"chunk offset {offset} does not continue the staged {current} bytes"
+        )
+    size = current
+    with part.open("r+b" if current else "wb") as out:
+        out.seek(current)
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > _ARTIFACT_CEILING:
+                raise HTTPException(413, "release artifact exceeds the 2 GiB ceiling")
+            out.write(chunk)
+        out.flush()
+        os.fsync(out.fileno())
+    if not complete:
+        return {"ok": True, "name": safe, "received": size, "complete": False}
+    digest = hashlib.sha256()
+    with part.open("rb") as staged:
+        for block in iter(lambda: staged.read(1024 * 1024), b""):
+            digest.update(block)
+    os.replace(part, part.with_name(safe))
+    return {
+        "ok": True, "name": safe, "size": size, "sha256": digest.hexdigest(),
+        "complete": True,
+    }
+
+
 @router.put("/api/releases/ci/upload/{name}")
-async def ci_upload_artifact(name: str, request: Request) -> dict[str, Any]:
+async def ci_upload_artifact(
+    name: str,
+    request: Request,
+    offset: int | None = None,
+    complete: bool = False,
+) -> dict[str, Any]:
     """Stream a CI artifact into ``incoming/`` ahead of publication.
 
     The Windows/macOS runners cannot reach the gateway host's LAN address (the
@@ -806,6 +848,13 @@ async def ci_upload_artifact(name: str, request: Request) -> dict[str, Any]:
     renamed into place, so ci/publish never sees a torn upload; nothing in this
     handler is trusted — publish re-digests the bytes from disk before anything
     moves into the store.
+
+    ``offset`` uploads one chunk at that byte position instead of the whole
+    artifact, and ``complete=1`` renames the assembled ``.part`` into place.
+    That exists because the public origin sits behind a proxy that answers 413
+    for bodies over 100 MB, and a Windows installer is ~300 MB. The offset must
+    equal the current ``.part`` size, so a retried or interleaved chunk cannot
+    silently corrupt an artifact, and only the finalizing call reports a digest.
     """
     client = request.client.host if request.client else "unknown"
     _ci_by_ip.enforce(client, "ci release calls")
@@ -813,13 +862,15 @@ async def ci_upload_artifact(name: str, request: Request) -> dict[str, Any]:
     safe = _safe_name(name)
     target = _incoming_dir() / (safe + ".part")
     target.parent.mkdir(parents=True, exist_ok=True)
+    if offset is not None:
+        return await _receive_chunk(request, target, safe, offset, complete)
     digest = hashlib.sha256()
     size = 0
     try:
         with target.open("wb") as out:
             async for chunk in request.stream():
                 size += len(chunk)
-                if size > 2 * 1024**3:
+                if size > _ARTIFACT_CEILING:
                     raise HTTPException(413, "release artifact exceeds the 2 GiB ceiling")
                 digest.update(chunk)
                 out.write(chunk)

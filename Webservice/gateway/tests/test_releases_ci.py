@@ -833,6 +833,48 @@ def test_ci_upload_streams_into_incoming_and_digests(ci: TestClient, ci_env) -> 
     assert not (releases._incoming_dir() / (staged.name + ".part")).exists()
 
 
+def test_ci_upload_assembles_chunks_and_reports_one_digest(ci: TestClient, ci_env) -> None:
+    """The public origin answers 413 over 100 MB, so big artifacts arrive in pieces."""
+    name = "Chudware-Setup-0.1.0-beta.1-x86_64.exe"
+    payload = bytes(range(256)) * 4096
+    chunk = len(payload) // 4
+    offset = 0
+    body: dict[str, object] = {}
+    while offset < len(payload):
+        piece = payload[offset:offset + chunk]
+        last = offset + len(piece) >= len(payload)
+        response = ci.put(
+            f"/api/releases/ci/upload/{name}?offset={offset}"
+            + ("&complete=1" if last else ""),
+            content=piece,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["complete"] is last
+        # Only the finalizing call may claim a digest: a per-chunk digest is a
+        # digest of a fragment, which nothing should mistake for the artifact's.
+        assert ("sha256" in body) is last
+        offset += len(piece)
+    staged = releases._incoming_dir() / name
+    assert staged.read_bytes() == payload
+    assert not (releases._incoming_dir() / (name + ".part")).exists()
+    assert body["sha256"] == hashlib.sha256(payload).hexdigest()
+
+
+def test_ci_upload_rejects_a_chunk_that_does_not_continue_the_part(
+    ci: TestClient, ci_env
+) -> None:
+    name = "Chudware-Setup-0.1.0-beta.2-x86_64.exe"
+    assert ci.put(f"/api/releases/ci/upload/{name}?offset=0", content=b"abc").status_code == 200
+    # A repeated first chunk, or a gap, would corrupt the artifact silently.
+    assert ci.put(f"/api/releases/ci/upload/{name}?offset=0", content=b"abc").status_code == 409
+    assert ci.put(f"/api/releases/ci/upload/{name}?offset=9", content=b"abc").status_code == 409
+    assert ci.put(f"/api/releases/ci/upload/{name}?offset=-1", content=b"abc").status_code == 422
+    finalized = ci.put(f"/api/releases/ci/upload/{name}?offset=3&complete=1", content=b"def")
+    assert finalized.status_code == 200, finalized.text
+    assert (releases._incoming_dir() / name).read_bytes() == b"abcdef"
+
+
 def test_ci_upload_requires_the_publish_token(ci_env) -> None:
     anonymous = TestClient(app_mod.app)
     response = anonymous.put("/api/releases/ci/upload/payload.bin", content=b"x")

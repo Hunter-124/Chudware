@@ -1181,16 +1181,54 @@ jobs:
             # NativeCommandError, which would abort before the check below and
             # report the wrong cause. --fail-with-body puts the gateway's reply on
             # stdout; its diagnostics stay in the step log where they belong.
-            $response = & curl.exe --config $env:GATEWAY_CURLRC --fail-with-body -sS `
-              --max-time 3600 @retry --upload-file $item.Local `
-              "$base/api/releases/ci/upload/$($item.Remote)"
+            #
+            # Anything over the edge's 100 MB body cap goes up in chunks: the
+            # installer is ~300 MB and a single PUT is answered 413 by the proxy
+            # in front of the public origin. Each chunk names the offset it
+            # continues, and the last one finalizes and returns the digest.
+            $size = (Get-Item $item.Local).Length
+            if ($size -gt 67108864) {
+              $chunkFile = Join-Path $env:RUNNER_TEMP 'upload.chunk'
+              $chunkSize = 67108864
+              $stream = [IO.File]::OpenRead($item.Local)
+              $buffer = New-Object byte[] $chunkSize
+              $offset = 0
+              $response = ''
+              try {
+                while ($offset -lt $size) {
+                  $read = $stream.Read($buffer, 0, $chunkSize)
+                  if ($read -le 0) { break }
+                  $out = [IO.File]::Open($chunkFile, 'Create', 'Write')
+                  $out.Write($buffer, 0, $read)
+                  $out.Close()
+                  $query = "offset=$offset"
+                  if (($offset + $read) -ge $size) { $query = "offset=$offset&complete=1" }
+                  $response = & curl.exe --config $env:GATEWAY_CURLRC --fail-with-body -sS `
+                    --max-time 3600 @retry --upload-file $chunkFile `
+                    "$base/api/releases/ci/upload/$($item.Remote)?$query"
+                  if ($LASTEXITCODE -ne 0) {
+                    Write-Host "::error::chunk upload failed for $($item.Remote) at offset $offset : $response"
+                    exit 1
+                  }
+                  $offset += $read
+                }
+              } finally {
+                $stream.Close()
+                Remove-Item -Force -ErrorAction SilentlyContinue $chunkFile
+              }
+            } else {
+              $response = & curl.exe --config $env:GATEWAY_CURLRC --fail-with-body -sS `
+                --max-time 3600 @retry --upload-file $item.Local `
+                "$base/api/releases/ci/upload/$($item.Remote)"
+            }
             if ($LASTEXITCODE -ne 0) {
               Write-Host "::error::upload failed for $($item.Remote): $response"
               exit 1
             }
             # The gateway re-digests these bytes again at publish time; comparing
             # here names transport corruption at the file that caused it instead
-            # of as a 422 an hour later.
+            # of as a 422 an hour later. A chunked upload reports its digest only
+            # on the finalizing call, which is the response still in $response.
             $reported = ''
             try { $reported = (($response -join '') | ConvertFrom-Json).sha256 } catch { $reported = '' }
             if ($reported -ne $expected) {
@@ -1485,9 +1523,38 @@ jobs:
             # zip into memory first, and the handler wants a raw body either way.
             # The gateway writes <name>.part and renames, so ci/publish never
             # sees a torn upload.
-            curl --config "${RUNNER_TEMP}/gw.curlrc" --fail-with-body --silent --show-error \
-              --max-time 3600 ${CHUDWARE_GATEWAY_CURL_RETRY} --upload-file "$1" \
-              "${CHUDWARE_GATEWAY_PUBLIC_BASE}/api/releases/ci/upload/$2"
+            #
+            # Over the edge's 100 MB body cap the artifact goes up in chunks (a
+            # single PUT of the ~300 MB zip is answered 413 by the proxy in front
+            # of the public origin). Each chunk names the offset it continues and
+            # the last one finalizes, so only that reply carries a digest.
+            size="$(wc -c < "$1" | tr -d ' ')"
+            if [ "${size}" -le 67108864 ]; then
+              curl --config "${RUNNER_TEMP}/gw.curlrc" --fail-with-body --silent --show-error \
+                --max-time 3600 ${CHUDWARE_GATEWAY_CURL_RETRY} --upload-file "$1" \
+                "${CHUDWARE_GATEWAY_PUBLIC_BASE}/api/releases/ci/upload/$2"
+              return $?
+            fi
+            chunk="${RUNNER_TEMP}/upload.chunk"
+            offset=0
+            while [ "${offset}" -lt "${size}" ]; do
+              dd if="$1" of="${chunk}" bs=1048576 skip="$((offset / 1048576))" count=64 \
+                 status=none || return 1
+              read_bytes="$(wc -c < "${chunk}" | tr -d ' ')"
+              [ "${read_bytes}" -gt 0 ] || return 1
+              query="offset=${offset}"
+              if [ "$((offset + read_bytes))" -ge "${size}" ]; then
+                query="offset=${offset}&complete=1"
+              fi
+              response="$(curl --config "${RUNNER_TEMP}/gw.curlrc" --fail-with-body --silent \
+                --show-error --max-time 3600 ${CHUDWARE_GATEWAY_CURL_RETRY} \
+                --upload-file "${chunk}" \
+                "${CHUDWARE_GATEWAY_PUBLIC_BASE}/api/releases/ci/upload/$2?${query}")" || {
+                  rm -f "${chunk}"; printf '%s' "${response}"; return 1; }
+              offset="$((offset + read_bytes))"
+            done
+            rm -f "${chunk}"
+            printf '%s' "${response}"
           }
           ci_status() {  # ci_status <status> <detail>
             body="${RUNNER_TEMP}/ci-status.json"

@@ -387,6 +387,61 @@ void emptyChannelTest(const std::string& endpoint, const fs::path& root) {
     std::cout << "check-once: empty-channel-404=current-quiet\n";
 }
 
+// Ops verification against a REAL published release: point the production
+// check-and-stage path at a live manifest endpoint and require that it fetches
+// the manifest, downloads the artifact, and passes every verification gate
+// (size, SHA-256, Ed25519 over the release keyring, and the inner payload
+// manifest) before the atomic stage rename. Only runs when invoked with
+// --live, so ctest never depends on the network. An entitlement token, when
+// the endpoint needs one to hand out a download URL, comes from
+// CHUDWARE_UPDATE_ENTITLEMENT.
+void liveChannelTest(const std::string& endpoint, const std::string& currentVersion,
+                     const fs::path& root) {
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path running = root / "running-app";
+    writeFile(running, "RUNNING APP MUST STAY UNTOUCHED\n");
+#ifdef _WIN32
+    _putenv_s("CHUDWARE_UPDATE_MANIFEST_URL", endpoint.c_str());
+#else
+    setenv("CHUDWARE_UPDATE_MANIFEST_URL", endpoint.c_str(), 1);
+#endif
+    Updater updater;
+    updater.configure(currentVersion, root / "data", running);
+    if (const char* token = std::getenv("CHUDWARE_UPDATE_ENTITLEMENT"); token && *token)
+        updater.setEntitlementToken(token);
+    updater.start();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(15);
+    for (;;) {
+        const auto snap = updater.snapshot();
+        if (snap.state != State::Idle && snap.state != State::Checking &&
+            snap.state != State::Available && snap.state != State::Downloading) {
+            require(snap.state == State::Staged,
+                    ("live channel did not stage an update: " + snap.message).c_str());
+            std::cout << "live: staged " << snap.version << " over " << currentVersion << '\n';
+            break;
+        }
+        require(std::chrono::steady_clock::now() < deadline,
+                "live update check/download never completed");
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    updater.stop();
+    require(readFile(running) == "RUNNING APP MUST STAY UNTOUCHED\n",
+            "staging must not touch the running app");
+    const fs::path metadata = root / "data/updates/staged.json";
+    require(fs::exists(metadata), "live staged transaction metadata is missing");
+    require(chudware::update::testing::stagedTransactionState(metadata) ==
+                chudware::update::testing::StagedTransactionState::Staged,
+            "live staged transaction is not in the Staged state");
+    std::uintmax_t staged = 0;
+    for (const auto& entry : fs::directory_iterator(root / "data/updates"))
+        if (entry.is_regular_file() && entry.path().extension() != ".json")
+            staged = std::max(staged, entry.file_size());
+    require(staged > 0, "live staged artifact is empty");
+    std::cout << "live: verified size+sha256+ed25519+inner-payload, staged " << staged
+              << " bytes, running app untouched\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -397,6 +452,8 @@ int main(int argc, char** argv) {
         servedSecurityTest(argv[2], argv[3], argv[4]);
     } else if (argc == 4 && std::string(argv[1]) == "--check-once") {
         emptyChannelTest(argv[2], argv[3]);
+    } else if (argc == 5 && std::string(argv[1]) == "--live") {
+        liveChannelTest(argv[2], argv[3], argv[4]);
     } else {
         localSecurityTests(fs::temp_directory_path() / "chudware-updater-test");
     }

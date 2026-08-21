@@ -220,7 +220,32 @@ def _read_regular_file(path: Path, label: str) -> bytes:
     return bytes(content)
 
 
-def _snapshot_file(root: Path, relative: str, kind: str) -> FileSnapshot:
+def _snapshot_file(root: Path, relative: str, kind: str, *, attempts: int = 4) -> FileSnapshot:
+    """Snapshot one payload file, retrying a transient metadata change.
+
+    Every attempt is self-consistent on its own: the descriptor is proven to be
+    the file that was stat'd, and the bytes hashed are proven unchanged
+    afterwards. Retrying therefore weakens nothing — it only tolerates a file
+    whose metadata was still settling when staging reached it. Windows does
+    exactly that: a freshly copied DLL can report one timestamp through the path
+    and another through the handle, which failed a byte-correct Windows release
+    with "payload file changed while opening: FreeImage.dll".
+    """
+    last: PayloadManifestError | None = None
+    for attempt in range(attempts):
+        try:
+            return _snapshot_file_once(root, relative, kind)
+        except PayloadManifestError as exc:
+            if "changed while" not in str(exc):
+                raise
+            last = exc
+            if attempt + 1 < attempts:
+                time.sleep(0.25 * (attempt + 1))
+    assert last is not None
+    raise last
+
+
+def _snapshot_file_once(root: Path, relative: str, kind: str) -> FileSnapshot:
     if kind not in KINDS:
         raise PayloadManifestError(f"invalid payload kind {kind!r} for {relative}")
     path = _checked_file(root, relative)

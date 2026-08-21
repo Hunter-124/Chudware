@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-from services.installer import build_release
+from services.installer import build_release, payload_manifest
 from services.installer.payload_manifest import build_manifest
 
 
@@ -91,3 +93,35 @@ def test_windows_stage_excludes_debug_source_and_repo_metadata(tmp_path: Path, r
         dst, host_bin=runtime / "chudware.exe", **_sidecars(tmp_path)
     )
     assert not (dst / relative).exists()
+
+
+def test_snapshot_survives_a_metadata_change_that_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file whose timestamps settle late must still be snapshotted.
+
+    Windows reported one mtime through the path and another through the handle
+    for a freshly copied DLL, which failed a byte-correct release. Only a
+    transient disagreement is tolerated: the accepted snapshot is still proven
+    self-consistent.
+    """
+    root = tmp_path / "payload"
+    root.mkdir()
+    (root / "chudware.exe").write_bytes(b"payload bytes")
+    real_fstat = os.fstat
+    calls = {"n": 0}
+
+    def flaky_fstat(descriptor: int) -> os.stat_result:
+        calls["n"] += 1
+        result = real_fstat(descriptor)
+        if calls["n"] == 1:
+            fields = list(result)
+            fields[8] = fields[8] + 5  # st_mtime the path stat did not see yet
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(payload_manifest.os, "fstat", flaky_fstat)
+    snapshot = payload_manifest._snapshot_file(root, "chudware.exe", "executable")
+    assert calls["n"] > 1
+    assert snapshot.size == len(b"payload bytes")
+    assert snapshot.sha256 == hashlib.sha256(b"payload bytes").hexdigest()

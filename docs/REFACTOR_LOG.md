@@ -7852,3 +7852,33 @@ it allowing `-suffix` on beta only; `services/mcp/private_hostd.py` now sets
 `CHUDWARE_MFG_STATE_DIR` and `start_new_session=True` for the spawned daemon
 (a shared journal flock aborted it when any other hostd ran, and sharing the
 test runner's process group delivered phantom SIGINT mid-suite).
+
+### 2026-08-21 — first published release, and the defects it exposed
+`0.1.0-beta.22` (linux/x86_64) is published, promoted to stable `0.1.0`, and
+proven installable: `test_updater --live` drove the production check-and-stage
+path against app.chudware.com and verified 340,724,216 bytes (size, SHA-256,
+Ed25519, inner payload manifest) before the atomic stage. Getting there took
+four fixes, each invisible until a real artifact existed:
+(1) appimagetool REWRITES the AppDir's desktop entry while packing
+(`X-AppImage-Version=$VERSION`, inserted after the group's last key), so the
+shipped payload no longer matched the manifest signed before packing —
+`stage_desktop_entry` now writes that key itself (a proven fixed point) and
+finalize re-verifies the manifest AFTER packing;
+(2) `local artifact="$1" request="$artifact…"` never works: the shell expands
+every word before the builtin assigns any of them, so `$artifact` was unset and
+`set -u` killed both finalizers at their last step;
+(3) both finalizers delete the staged tree that held the only copy of
+`payload-manifest.v1.{json,sig}`, so `finalize_release complete` aborted with
+"found 0" and the published beta carried no evidence bundle (unpromotable) —
+the pair is now retained beside the artifact;
+(4) the updater could not consume its own manifest: the gateway omitted
+`platform`/`arch` (which `manifestFromJson` requires), the artifact GET did not
+send the entitlement the gateway's own artifact route demands (403), and the
+inner-payload inspector execs the artifact while a streamed download lands 0644
+("could not be safely inspected"). The credential now goes back only to the
+origin that issued the manifest, and a credentialed download does not follow
+redirects (libcurl and WinHTTP both replay custom headers across hops).
+Also: each leg's failure reporter no longer depends on the helper the capability
+step writes, so a leg that dies there stops reading as "queued" forever in
+/admin. Windows and macOS legs remain unproven only because `ryzen-7900x3d` and
+`macbook-air-m2` are offline; `192.168.1.x` does not route from this network.

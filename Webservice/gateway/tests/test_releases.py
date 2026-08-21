@@ -70,10 +70,25 @@ def test_anonymous_and_bad_entitlement_receive_byte_identical_metadata(
     assert anonymous.content == invalid.content
     assert "url" not in anonymous.json()
     assert set(anonymous.json()) == {
-        "version", "min_supported", "key_id", "sha256", "size", "signature", "notes_url",
-        "payload_manifest_key", "payload_manifest_sha256", "payload_signature_key",
-        "payload_signature_sha256",
+        "version", "min_supported", "platform", "arch", "key_id", "sha256", "size",
+        "signature", "notes_url", "payload_manifest_key", "payload_manifest_sha256",
+        "payload_signature_key", "payload_signature_sha256",
     }
+
+
+def test_manifest_names_the_target_identity_the_updater_requires(
+    client: TestClient,
+) -> None:
+    """The desktop updater refuses a manifest that is not for its own target.
+
+    manifestFromJson() reads platform and arch and compares them with the
+    running build's, so a manifest without them is unparseable and the app can
+    never update.
+    """
+    body = client.get(
+        "/api/releases/latest?channel=stable&platform=linux&arch=x86_64"
+    ).json()
+    assert (body["platform"], body["arch"]) == ("linux", "x86_64")
 
 
 def test_valid_entitlement_gets_fifteen_minute_presigned_download(

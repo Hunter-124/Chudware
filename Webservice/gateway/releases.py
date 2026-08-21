@@ -503,6 +503,13 @@ async def latest_release(
     manifest = {
         "version": str(row["version"]),
         "min_supported": str(row["min_supported"]),
+        # The desktop updater requires these two and rejects a manifest whose
+        # target identity is not its own (host/src/update/updater.cpp,
+        # manifestFromJson). They are also half of the Ed25519 artifact
+        # preimage, so omitting them made every published release unparseable
+        # to the shipped client: "key 'platform' not found".
+        "platform": str(row["platform"]),
+        "arch": str(row["arch"]),
         "key_id": str(row["key_id"]),
         "sha256": str(row["sha256"]),
         "size": int(row["size"]),

@@ -51,7 +51,12 @@ bool selected(std::string_view kind, VerifyMode mode, std::string_view path,
 
 fs::path installedPayloadRoot(const fs::path& executable){fs::path p=executable.lexically_normal();
 #if defined(__APPLE__)
-for(fs::path q=p.parent_path();!q.empty();q=q.parent_path())if(q.extension()==".app")return q;
+// Walk up to the enclosing .app. Stop when parent_path() stops changing: for an
+// absolute path it converges on "/" and NEVER becomes empty, so the obvious
+// `q=q.parent_path()` loop spins forever for any executable that is not inside
+// a bundle -- every unbundled layout, and the reason host test_security burned
+// its entire ctest timeout on macOS with no output.
+for(fs::path q=p.parent_path();!q.empty();){if(q.extension()==".app")return q;fs::path next=q.parent_path();if(next==q)break;q=std::move(next);}
 #elif defined(__linux__)
 auto q=p.parent_path();if(q.filename()=="bin"&&q.parent_path().filename()=="usr")return q.parent_path().parent_path();
 #endif

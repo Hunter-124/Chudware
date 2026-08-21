@@ -1034,10 +1034,12 @@ jobs:
             --omp-bridge-bin "$sidecars/chudware-omp-bridge.exe" `
             --uninstall-helper-bin "$env:HOST_BUILD_DIR/bin/chudware-uninstall-helper.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          $request = Get-ChildItem -Path $out -Recurse -Filter '*payload-signing-request.bin' |
+          # build_release names the preimage payload-manifest.v1.preimage (the
+          # *.payload-signing-request.bin name is the shell builders'), so take
+          # the path the builder itself reports rather than guessing a glob.
+          $request = Get-ChildItem -Path $out -Recurse -Filter 'payload-manifest.v1.preimage' |
             Select-Object -First 1
-          if (-not $request) { Write-Host '::error::payload signing request missing'; exit 1 }
+          if (-not $request) { Write-Host '::error::payload signing preimage missing'; exit 1 }
           $payloadSig = Join-Path $env:RUNNER_TEMP 'payload.sig'
           & python packaging\ci_sign.py --expect-public-key $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY `
             --output $payloadSig sign payload $request.FullName | Out-Null

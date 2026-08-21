@@ -136,6 +136,36 @@ Promotion never moves the supported-version floor. Nightly publishes send
 backward, so a nightly that raised it would strand installed clients. Raising the
 floor is a deliberate act through `packaging/publish.py register --min-supported`.
 
+## Verifying a published release end to end
+
+`GET /api/releases/latest` names the target identity and, for an entitled
+caller, a download URL. When no CDN credential is configured the URL is this
+gateway's own `/api/releases/artifact/<key>` route, and **that route is
+entitlement-gated**: the updater sends its entitlement with the artifact GET
+too (same origin only), so an unentitled client sees metadata and no URL.
+
+To prove a published build actually installs, run the production check-and-stage
+path against the live endpoint from a host build:
+
+```sh
+ninja -C host/build-linux test_updater
+CHUDWARE_UPDATE_CHANNEL=beta \
+CHUDWARE_UPDATE_ENTITLEMENT="<compact entitlement token>" \
+  host/build-linux/bin/test_updater --live \
+  https://app.chudware.com/api/releases/latest 0.1.0-beta.0 /tmp/live-updater
+```
+
+It fetches the manifest, downloads the artifact, and verifies size, SHA-256,
+the Ed25519 release signature and the *inner* payload manifest of the extracted
+tree before the atomic stage rename; it prints every status transition and
+asserts the running app was untouched. A token comes from the same flow the app
+uses — `POST /desktop/authorize` with an admin session cookie and a
+base64url Ed25519 device key returns a handoff URL carrying `token=`.
+
+Note that while `min_supported` is `0.1.0` every `0.1.0-beta.N` client is
+*below* the floor, so the status reads **Mandatory** the whole way through:
+`setStatus` pins that state and only the message tracks progress.
+
 ## Required GitHub secrets
 
 | Secret | Used by | Content |

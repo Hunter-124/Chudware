@@ -122,10 +122,14 @@ chudware_read_version() {
     local hdr="$1/generated/api/chudware_version.h"
     [ -f "$hdr" ] || return 1
     local ver sha dirty date
-    ver="$(sed -n 's/^#define CHUDWARE_VERSION[[:space:]]\+"\(.*\)"$/\1/p' "$hdr")"
-    sha="$(sed -n 's/^#define CHUDWARE_GIT_SHA[[:space:]]\+"\(.*\)"$/\1/p' "$hdr")"
-    dirty="$(sed -n 's/^#define CHUDWARE_BUILD_DIRTY[[:space:]]\+\([0-9]\+\)$/\1/p' "$hdr")"
-    date="$(sed -n 's/^#define CHUDWARE_BUILD_DATE[[:space:]]\+"\(.*\)"$/\1/p' "$hdr")"
+    # POSIX BRE only: BSD sed (macOS /usr/bin/sed) does not understand `\+`, so
+    # the GNU form matched nothing there and every caller concluded the header
+    # was "missing or invalid" -- which stopped packaging/macos/build_app.sh dead
+    # on the release runner after a fully successful build and test run.
+    ver="$(sed -n 's/^#define CHUDWARE_VERSION[[:space:]][[:space:]]*"\(.*\)"$/\1/p' "$hdr")"
+    sha="$(sed -n 's/^#define CHUDWARE_GIT_SHA[[:space:]][[:space:]]*"\(.*\)"$/\1/p' "$hdr")"
+    dirty="$(sed -n 's/^#define CHUDWARE_BUILD_DIRTY[[:space:]][[:space:]]*\([0-9][0-9]*\)$/\1/p' "$hdr")"
+    date="$(sed -n 's/^#define CHUDWARE_BUILD_DATE[[:space:]][[:space:]]*"\(.*\)"$/\1/p' "$hdr")"
     [ -n "$ver" ] && [ -n "$sha" ] || return 1
     export CHUDWARE_VERSION="$ver" CHUDWARE_GIT_SHA="$sha"
     export CHUDWARE_BUILD_DIRTY="${dirty:-1}" CHUDWARE_BUILD_DATE="$date"

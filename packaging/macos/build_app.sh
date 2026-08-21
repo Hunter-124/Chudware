@@ -536,6 +536,11 @@ if [ -n "$NOTARIZE_PROFILE" ]; then
     archive_signed_bundle "$ZIP"
 fi
 emit_artifact_signing_request "$ZIP"
+# Same retention the Linux builder does: the bundle about to be deleted holds
+# the only copy of the signed manifest pair, and finalize_release.py's
+# `complete` stage re-reads it to name it and its key id in the publish bundle.
+cp "$MANIFEST_PATH" "$OUT/payload-manifest.v1.json"
+cp "$SIGNATURE_PATH" "$OUT/payload-manifest.v1.sig"
 
 if [ "$KEEP_APP" != "1" ]; then rm -rf "$APP"; fi
 size="$(stat -f %z "$ZIP")"

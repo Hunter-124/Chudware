@@ -530,6 +530,13 @@ fi
 verify_staged_manifest "$APPDIR"
 echo "==> packed payload still matches the signed manifest"
 emit_artifact_signing_request "$OUTFILE"
+# The AppDir holds the only copy of the signed manifest pair and is about to be
+# removed, but finalize_release.py's `complete` stage re-reads that manifest to
+# name it (and its key id) in the publish bundle: without this it aborts with
+# "handoff must contain exactly one payload-manifest.v1.json, found 0" and the
+# release ships with no evidence bundle, which blocks promotion to stable.
+cp "$APPDIR/payload-manifest.v1.json" "$OUT/payload-manifest.v1.json"
+cp "$APPDIR/payload-manifest.v1.sig" "$OUT/payload-manifest.v1.sig"
 if [ "$KEEP_APPDIR" != "1" ]; then
     rm -rf "$APPDIR"
 fi

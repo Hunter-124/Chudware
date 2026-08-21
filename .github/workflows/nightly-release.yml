@@ -361,8 +361,8 @@ jobs:
           ci_status testing "ctest core + host"
 
           log="${RUNNER_TEMP}/ctest.log"
-          ctest --test-dir "build/${CORE_PRESET}/core" --output-on-failure 2>&1 | tee "${log}"
-          ctest --test-dir "${HOST_BUILD_DIR}" --output-on-failure 2>&1 | tee -a "${log}"
+          ctest --test-dir "build/${CORE_PRESET}/core" --timeout 900 --output-on-failure 2>&1 | tee "${log}"
+          ctest --test-dir "${HOST_BUILD_DIR}" --timeout 900 --output-on-failure 2>&1 | tee -a "${log}"
           if grep -qE 'No tests were found' "${log}"; then
             echo "::error::a configure registered no tests; the platform-test evidence would be a lie"
             exit 1
@@ -992,9 +992,9 @@ jobs:
           & (Join-Path $env:RUNNER_TEMP 'ci_status.ps1') -Status 'testing' -Detail 'ctest core + host'
 
           $log = Join-Path $env:RUNNER_TEMP 'ctest.log'
-          ctest --test-dir "build/$env:CORE_PRESET/core" --output-on-failure 2>&1 | Tee-Object -FilePath $log
+          ctest --test-dir "build/$env:CORE_PRESET/core" --timeout 900 --output-on-failure 2>&1 | Tee-Object -FilePath $log
           $core = $LASTEXITCODE
-          ctest --test-dir $env:HOST_BUILD_DIR --output-on-failure 2>&1 | Tee-Object -FilePath $log -Append
+          ctest --test-dir $env:HOST_BUILD_DIR --timeout 900 --output-on-failure 2>&1 | Tee-Object -FilePath $log -Append
           $host_status = $LASTEXITCODE
           if (Select-String -Path $log -Pattern 'No tests were found' -Quiet) {
             Write-Host '::error::a configure registered no tests; the platform-test evidence would be a lie'
@@ -1558,8 +1558,11 @@ jobs:
           ci_status testing "ctest core + host"
 
           log="${RUNNER_TEMP}/ctest.log"
-          ctest --test-dir "build/${CORE_PRESET}/core" --output-on-failure 2>&1 | tee "${log}"
-          ctest --test-dir "${HOST_BUILD_DIR}" --output-on-failure 2>&1 | tee -a "${log}"
+          # --timeout per test: a stalled test used to sit here until the job's
+          # own 6-hour budget expired (and, with cancel-in-progress, blocked
+          # every later nightly). 900s is ~20x the slowest suite on this Mac.
+          ctest --test-dir "build/${CORE_PRESET}/core" --timeout 900 --output-on-failure 2>&1 | tee "${log}"
+          ctest --test-dir "${HOST_BUILD_DIR}" --timeout 900 --output-on-failure 2>&1 | tee -a "${log}"
           if grep -qE 'No tests were found' "${log}"; then
             echo "::error::a configure registered no tests; the platform-test evidence would be a lie"
             exit 1

@@ -4,7 +4,11 @@
 #if defined(__EMSCRIPTEN__)
 // Browser: no executable image, no process table. Both queries answer "unknown".
 #elif defined(_WIN32)
-#  define WIN32_LEAN_AND_MEAN
+// Guarded: the CEF helper target already defines this on the command line and
+// compiles /W4 /WX, so a bare redefinition is a hard error there (C4005).
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
 #  include <windows.h>
 #else
 #  include <cerrno>

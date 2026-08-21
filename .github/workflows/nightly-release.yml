@@ -1558,6 +1558,11 @@ jobs:
           ci_status testing "ctest core + host"
 
           log="${RUNNER_TEMP}/ctest.log"
+          # mesher_advanced asserts a mesh+solve wall-clock ceiling meant to catch
+          # an -O0 or DOF-blowup regression. The 2017 Intel iMac needs 114s for the
+          # boss+pocket part with identical element counts and physics, so scale the
+          # ceiling on this runner instead of raising it for every developer.
+          export CHUDWARE_TEST_WALL_SCALE=3
           # --timeout per test: a stalled test used to sit here until the job's
           # own 6-hour budget expired (and, with cancel-in-progress, blocked
           # every later nightly). 900s is ~20x the slowest suite on this Mac.

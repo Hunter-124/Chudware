@@ -30,6 +30,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -139,7 +140,19 @@ void check_static_ok(const json& r, const char* what) {
 // Generous per-part wall-clock ceiling (seconds). A moderate tet10 mesh + direct static solve
 // on parts this size takes a few seconds on a dev box; 90s catches an -O0 regression or a
 // fineness/DOF blow-up without ever flaking on a loaded CI machine.
-constexpr double kWallCeilingSec = 90.0;
+//
+// CHUDWARE_TEST_WALL_SCALE multiplies it for hosts that are slow by construction rather than
+// by regression: the 2017 Intel iMac release runner needs 114s for the boss+pocket part while
+// producing identical element counts and physics. Scaling there keeps the ceiling meaningful
+// everywhere else instead of raising it for everyone.
+double wall_ceiling_sec() {
+    double scale = 1.0;
+    if (const char* value = std::getenv("CHUDWARE_TEST_WALL_SCALE")) {
+        const double parsed = std::atof(value);
+        if (parsed > 1.0 && parsed <= 10.0) scale = parsed;
+    }
+    return 90.0 * scale;
+}
 
 // ── Advanced part builders ─────────────────────────────────────────────────────────────────
 
@@ -296,7 +309,7 @@ TEST_CASE("advanced part: boss+pocket plate meshes (tet10) + solves static, boun
     const double secs = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - t0).count();
     MESSAGE("boss+pocket plate mesh+solve wall time = " << secs << " s");
-    CHECK(secs < kWallCeilingSec);
+    CHECK(secs < wall_ceiling_sec());
 }
 
 TEST_CASE("advanced part: hole-array bracket meshes (tet10) + solves static, bounded time") {
@@ -325,7 +338,7 @@ TEST_CASE("advanced part: hole-array bracket meshes (tet10) + solves static, bou
     const double secs = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - t0).count();
     MESSAGE("hole-array bracket mesh+solve wall time = " << secs << " s");
-    CHECK(secs < kWallCeilingSec);
+    CHECK(secs < wall_ceiling_sec());
 }
 
 TEST_CASE("advanced part: stepped filleted block meshes (tet10) + solves static, bounded time") {
@@ -357,5 +370,5 @@ TEST_CASE("advanced part: stepped filleted block meshes (tet10) + solves static,
     const double secs = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - t0).count();
     MESSAGE("stepped filleted block mesh+solve wall time = " << secs << " s");
-    CHECK(secs < kWallCeilingSec);
+    CHECK(secs < wall_ceiling_sec());
 }

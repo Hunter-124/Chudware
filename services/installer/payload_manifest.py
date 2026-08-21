@@ -184,14 +184,19 @@ def default_kind(relative: str) -> str:
     return "resource"
 
 
-# os.stat() and os.fstat() fill st_dev/st_ino from different Windows APIs (the
-# path form reports the 128-bit FileIdInfo, the handle form the older 64-bit
-# file index), so those two fields cannot be compared ACROSS the two flavours
-# there — they disagree for every file, which failed the Windows release on the
-# first payload entry it looked at. Everything else is still compared, and
-# handle-vs-handle comparisons (the ones that prove the bytes did not move
-# while being hashed) stay strict on every platform.
-_CROSS_FLAVOUR_IGNORED = ("dev", "ino") if os.name == "nt" else ()
+# os.stat() and os.fstat() do not agree on Windows for the same file:
+#   * st_dev/st_ino come from different APIs (the path form reports FileIdInfo,
+#     the handle form the older 64-bit file index);
+#   * st_ctime is a creation time there, and the two flavours can report
+#     different ones for a freshly copied file. Measured on the release runner:
+#     path 1787294547120924100 vs handle 1787293683876298200 for FreeImage.dll,
+#     14 minutes apart and stable across retries (NTFS caches a creation time
+#     for a replaced name; the handle sees the tunneled value).
+# Comparing those fields ACROSS the two flavours therefore rejects every payload
+# file on Windows. Size, mode and mtime are still compared, and handle-vs-handle
+# comparisons — the ones that prove the hashed bytes did not move — stay strict
+# on every platform.
+_CROSS_FLAVOUR_IGNORED = ("dev", "ino", "ctime_ns") if os.name == "nt" else ()
 
 
 def _identity_fields(value: os.stat_result) -> dict[str, object]:

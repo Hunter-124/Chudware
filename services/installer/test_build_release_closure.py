@@ -136,19 +136,24 @@ def _restat(result: os.stat_result, **overrides: int) -> os.stat_result:
         "st_ctime_ns": result.st_ctime_ns,
     }
     for name, value in overrides.items():
-        index = {"st_ino": 1, "st_dev": 2, "st_size": 6}[name]
-        fields[index] = value
+        index = {"st_ino": 1, "st_dev": 2, "st_size": 6}.get(name)
+        if index is None:
+            named[name] = value
+        else:
+            fields[index] = value
     return os.stat_result(fields, named)
 
 
 def test_snapshot_tolerates_the_windows_cross_api_file_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """os.stat() and os.fstat() report different file ids for the same Windows file.
+    """os.stat() and os.fstat() disagree about identity for the same Windows file.
 
-    The path form reports FileIdInfo, the handle form the older 64-bit index, so
-    comparing them across the two flavours rejected every payload file and no
-    Windows release could be staged. Every other field is still compared.
+    The path form reports FileIdInfo and the copy's creation time; the handle
+    form reports the older 64-bit index and NTFS's tunneled creation time. Both
+    disagreements were observed on the release runner and rejected every payload
+    file, so no Windows release could be staged. Every other field is still
+    compared, and a real content change still fails.
     """
     root = tmp_path / "payload"
     root.mkdir()
@@ -157,10 +162,17 @@ def test_snapshot_tolerates_the_windows_cross_api_file_id(
 
     def other_flavour_fstat(descriptor: int) -> os.stat_result:
         result = real_fstat(descriptor)
-        return _restat(result, st_ino=result.st_ino + 2**64, st_dev=result.st_dev + 1)
+        return _restat(
+            result,
+            st_ino=result.st_ino + 2**64,
+            st_dev=result.st_dev + 1,
+            st_ctime_ns=result.st_ctime_ns - 864_000_000_000,
+        )
 
     monkeypatch.setattr(payload_manifest.os, "fstat", other_flavour_fstat)
-    monkeypatch.setattr(payload_manifest, "_CROSS_FLAVOUR_IGNORED", ("dev", "ino"))
+    monkeypatch.setattr(
+        payload_manifest, "_CROSS_FLAVOUR_IGNORED", ("dev", "ino", "ctime_ns")
+    )
     snapshot = payload_manifest._snapshot_file(root, "FreeImage.dll", "library", attempts=1)
     assert snapshot.sha256 == hashlib.sha256(b"dll bytes").hexdigest()
 

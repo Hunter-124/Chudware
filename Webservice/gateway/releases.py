@@ -507,9 +507,10 @@ async def latest_release(
         # target identity is not its own (host/src/update/updater.cpp,
         # manifestFromJson). They are also half of the Ed25519 artifact
         # preimage, so omitting them made every published release unparseable
-        # to the shipped client: "key 'platform' not found".
-        "platform": str(row["platform"]),
-        "arch": str(row["arch"]),
+        # to the shipped client: "key 'platform' not found". The row was
+        # selected by exactly these two values, so echoing them is exact.
+        "platform": platform,
+        "arch": arch,
         "key_id": str(row["key_id"]),
         "sha256": str(row["sha256"]),
         "size": int(row["size"]),

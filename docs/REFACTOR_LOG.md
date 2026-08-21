@@ -7880,5 +7880,43 @@ origin that issued the manifest, and a credentialed download does not follow
 redirects (libcurl and WinHTTP both replay custom headers across hops).
 Also: each leg's failure reporter no longer depends on the helper the capability
 step writes, so a leg that dies there stops reading as "queued" forever in
-/admin. Windows and macOS legs remain unproven only because `ryzen-7900x3d` and
-`macbook-air-m2` are offline; `192.168.1.x` does not route from this network.
+/admin.
+
+### 2026-08-21 — all three platforms publish, and what stood in the way
+`0.1.1-beta.32` published for linux, windows and macos x86_64 in one nightly and
+was promoted to stable `0.1.1` for all three; the portal serves each. Every
+blocker after the Linux one was platform-specific, and none of it was visible
+before a real artifact existed:
+(1) Windows never compiled: `core/util/platform_paths.cpp` defined
+`WIN32_LEAN_AND_MEAN` while the CEF helper target already defines it on the
+command line and compiles `/W4 /WX` (C4005 -> C2220);
+(2) Nuitka refuses onefile mode on Windows without Dependency Walker and asks
+interactively -- CI answers "no" -- so `build_sidecars.ps1` passes
+`--assume-yes-for-downloads`;
+(3) `os.stat()` and `os.fstat()` disagree on Windows for the SAME file:
+st_dev/st_ino come from different APIs, st_ctime is a creation time NTFS tunnels
+onto a replaced name (measured 14 minutes apart), and st_mode's executable bits
+are a PATH heuristic os.fstat cannot apply. The payload TOCTOU guard compared
+all of them and rejected every payload file; those three are now excluded from
+PATH-vs-HANDLE comparisons on Windows only, handle-vs-handle stays strict, and
+every mismatch message names the fields -- which is what turned each round trip
+into a measurement instead of a guess;
+(4) the Windows step signed a preimage name only the shell builders write;
+(5) uploads died on **413**: the edge in front of the public origin caps bodies
+at 100 MB, so the gateway now accepts `?offset=`/`&complete=1` chunks and both
+off-LAN legs push 64 MiB at a time (proven against the live origin with a 220 MB
+probe before it was wired in);
+(6) macOS `installedPayloadRoot` looped forever: `for (q = p.parent_path();
+!q.empty(); q = q.parent_path())` converges on "/" and "/" is never empty, so
+ANY executable outside a .app bundle spun in place -- a shipped-app startup
+hang, found because host test_security burned a whole ctest timeout;
+(7) `chudware_read_version` used GNU-only `\+` in sed, so BSD sed read no
+version and every macOS packaging step reported a missing header;
+(8) onnxruntime-node 1.26.0 ships no darwin/x64 prebuild at all, so Intel macOS
+leaves it `--external` (allow-unresolved matches module specifiers, not the
+relative path that package computes);
+(9) mesher_advanced's 90s wall ceiling is real on a 2017 iMac (114s) --
+CHUDWARE_TEST_WALL_SCALE relaxes it on that runner only.
+ctest now runs with `--timeout 900` everywhere: an unbounded stall used to burn
+the job's whole 6-hour budget and, with cancel-in-progress, every nightly behind
+it. macos/arm64 stays unproven only because `macbook-air-m2` is asleep.

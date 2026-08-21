@@ -79,10 +79,17 @@ Every night, and on demand from the Actions tab:
      They hold the same token as the `CHUDWARE_GATEWAY_RELEASE_TOKEN` secret and
      reach the gateway over TLS on `https://app.chudware.com`: each produced file
      is streamed in with `PUT /api/releases/ci/upload/<name>` (curl
-     `--upload-file`, so a 500 MB installer is never buffered in memory), and the
+     `--upload-file`, so a 300 MB installer is never buffered in memory), and the
      job compares the sha256 the endpoint reports against the local digest before
      moving on. Then the ordinary `ci/publish` and `ci/status` calls follow over
      the same origin. Those runners need nothing but outbound 443.
+
+     Anything larger than 64 MiB goes up in 64 MiB chunks
+     (`?offset=<n>`, and `&complete=1` on the last one), because the proxy in
+     front of the public origin answers **413** for bodies over 100 MB and the
+     Windows installer is ~230 MB. The offset must equal the bytes already
+     staged, so a retried or interleaved chunk is rejected instead of corrupting
+     an artifact, and only the finalizing call reports a digest.
 
    On every host the token reaches curl through a `0600` `--config` file, never
    on a command line. The gateway recomputes the digest and size, verifies both

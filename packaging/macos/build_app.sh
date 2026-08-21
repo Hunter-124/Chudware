@@ -67,8 +67,15 @@ build_omp_bridge() {
     echo "==> installing locked vendored OMP workspace"
     (cd "$REPO/vendor/omp" && bun install --frozen-lockfile)
     echo "==> compiling chudware-omp-bridge"
+    # onnxruntime-node resolves `../bin/napi-v6/${process.platform}/${process.arch}/
+    # onnxruntime_binding.node`, and the locked tree carries darwin/arm64,
+    # linux/{arm64,x64} and win32/{arm64,x64} -- but no darwin/x64, so bundling on
+    # the Intel Mac cannot resolve that one specifier. It is opaque to the bundler
+    # either way; the shape is listed on all three platforms so the lists stay
+    # identical. ONNX-backed features are unavailable on Intel macOS until the
+    # lockfile carries that optional binary.
     (cd "$REPO/vendor/omp" && bun build --compile --sourcemap=none --packages=bundle \
-        --allow-unresolved='' --allow-unresolved='@img/sharp-*/versions' --allow-unresolved='@img/sharp-libvips-*/lib' --allow-unresolved='@img/sharp-libvips-*/package' --allow-unresolved='@img/sharp-libvips-*/versions' --allow-unresolved='@img/sharp-libvips-dev-*/include' --allow-unresolved='@img/sharp-libvips-dev-*/lib' \
+        --allow-unresolved='' --allow-unresolved='@img/sharp-*/versions' --allow-unresolved='@img/sharp-libvips-*/lib' --allow-unresolved='@img/sharp-libvips-*/package' --allow-unresolved='@img/sharp-libvips-*/versions' --allow-unresolved='@img/sharp-libvips-dev-*/include' --allow-unresolved='@img/sharp-libvips-dev-*/lib' --allow-unresolved='../bin/napi-v6/darwin/x64/onnxruntime_binding.node' \
         --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
         --no-compile-autoload-package-json bridge/src/bridge.ts --outfile "$destination")
     # bun --compile writes <entry>.js.map beside the outfile even under

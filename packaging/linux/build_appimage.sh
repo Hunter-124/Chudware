@@ -144,7 +144,10 @@ finalize_signature(root, key_id=manifest["key_id"], canonical_json=canonical,
 }
 
 emit_artifact_signing_request() {
-    local artifact="$1" request="$artifact.artifact-signing-request.bin"
+    # Split: `local a="$1" b="$a"` expands every word before the builtin
+    # assigns any of them, so $artifact would still be unset (fatal under -u).
+    local artifact="$1"
+    local request="$artifact.artifact-signing-request.bin"
     PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
 import hashlib, sys
 from pathlib import Path
@@ -165,6 +168,42 @@ from services.installer.payload_manifest import verify_manifest_payload
 root = Path(sys.argv[1])
 verify_manifest_payload(root, (root / "payload-manifest.v1.json").read_bytes())
 ' "$root"
+}
+
+stage_desktop_entry() {
+    # appimagetool MUTATES the AppDir's desktop entry while packing: it writes
+    # X-AppImage-Version=$VERSION into the [Desktop Entry] group (via GKeyFile,
+    # i.e. after the group's last key=value line, before trailing comments).
+    # The payload manifest is hashed and signed BEFORE packing, so leaving that
+    # mutation to the tool ships an AppImage whose desktop entry no longer
+    # matches the signed manifest — the extracted-artifact verification and the
+    # runtime integrity check both reject it. Writing the key here makes the
+    # staged file a fixed point of the tool's rewrite (proven: a second pack of
+    # the rewritten file is byte-identical), and the post-pack check below
+    # fails loudly if a future appimagetool touches anything else.
+    local source="$1" destination="$2" version="$3"
+    "$RELEASE_PYTHON" -c '
+import re, sys
+from pathlib import Path
+source, destination, version = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+lines = source.read_text(encoding="utf-8").splitlines(keepends=True)
+group = next((i for i, line in enumerate(lines) if line.strip() == "[Desktop Entry]"), None)
+if group is None:
+    raise SystemExit("desktop entry has no [Desktop Entry] group")
+end = next((i for i in range(group + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
+entry = f"X-AppImage-Version={version}\n"
+key = re.compile(r"\s*X-AppImage-Version\s*=")
+existing = next((i for i in range(group + 1, end) if key.match(lines[i])), None)
+if existing is not None:
+    lines[existing] = entry
+else:
+    keys = [i for i in range(group + 1, end) if re.match(r"\s*[A-Za-z0-9-]+(\[[^]]*\])?\s*=", lines[i])]
+    if not keys:
+        raise SystemExit("desktop entry group has no keys")
+    lines.insert(keys[-1] + 1, entry)
+destination.write_text("".join(lines), encoding="utf-8")
+' "$source" "$destination" "$version"
+    chmod 0644 "$destination"
 }
 
 build_python_sidecar() {
@@ -418,7 +457,7 @@ EOF
 chmod +x "$APPDIR/AppRun"
 # The staged binary is usr/bin/chudware, matching the desktop entry's Exec.
 # Lowercase on disk so the desktop entry's Icon=chudware resolves exactly.
-cp "$REPO/packaging/linux/chudware.desktop" "$APPDIR/chudware.desktop"
+stage_desktop_entry "$REPO/packaging/linux/chudware.desktop" "$APPDIR/chudware.desktop" "$VERSION"
 cp "$REPO/assets/logo_icon.png" "$APPDIR/chudware.png"
 cp "$APPDIR/chudware.png" "$APPDIR/.DirIcon"
 
@@ -484,6 +523,12 @@ if ! ARCH=x86_64 VERSION="$VERSION" "$APPIMAGETOOL" "$APPDIR" "$OUTFILE" 2>"$OUT
     echo "==> direct run failed, retrying with --appimage-extract-and-run (no-FUSE environments)"
     ARCH=x86_64 VERSION="$VERSION" "$APPIMAGETOOL" --appimage-extract-and-run "$APPDIR" "$OUTFILE"
 fi
+# appimagetool rewrites files inside the AppDir as it packs (see
+# stage_desktop_entry). The packed bytes are the shipped payload, so re-verify
+# the manifest against the staged tree: a mismatch here means the artifact would
+# fail its own runtime integrity check, and must never reach the publish step.
+verify_staged_manifest "$APPDIR"
+echo "==> packed payload still matches the signed manifest"
 emit_artifact_signing_request "$OUTFILE"
 if [ "$KEEP_APPDIR" != "1" ]; then
     rm -rf "$APPDIR"

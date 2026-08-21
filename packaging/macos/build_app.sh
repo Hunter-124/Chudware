@@ -160,7 +160,11 @@ archive_signed_bundle() {
 }
 
 emit_artifact_signing_request() {
-    local artifact="$1" request="$artifact.artifact-signing-request.bin"
+    # `local a="$1" b="$a"` does NOT work: the shell expands every word before
+    # the builtin assigns any of them, so $artifact is still unset (fatal under
+    # `set -u`). Two statements.
+    local artifact="$1"
+    local request="$artifact.artifact-signing-request.bin"
     PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
 import hashlib, sys
 from pathlib import Path

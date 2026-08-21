@@ -190,13 +190,17 @@ def default_kind(relative: str) -> str:
 #   * st_ctime is a creation time there, and the two flavours can report
 #     different ones for a freshly copied file. Measured on the release runner:
 #     path 1787294547120924100 vs handle 1787293683876298200 for FreeImage.dll,
-#     14 minutes apart and stable across retries (NTFS caches a creation time
-#     for a replaced name; the handle sees the tunneled value).
-# Comparing those fields ACROSS the two flavours therefore rejects every payload
-# file on Windows. Size, mode and mtime are still compared, and handle-vs-handle
-# comparisons — the ones that prove the hashed bytes did not move — stay strict
-# on every platform.
-_CROSS_FLAVOUR_IGNORED = ("dev", "ino", "ctime_ns") if os.name == "nt" else ()
+#     14 minutes apart and stable across retries (NTFS tunnels a creation time
+#     onto a replaced name; the handle sees the tunneled value);
+#   * st_mode's executable bits come from a PATH heuristic — CPython ORs 0o111
+#     in for .exe/.bat/.cmd/.com — which os.fstat() cannot apply because it has
+#     no name. Measured: mode=511 through the path, 438 through the handle for
+#     chudware-hostd.exe.
+# Comparing those fields ACROSS the two flavours therefore rejects payload files
+# on Windows for reasons that have nothing to do with the bytes. Size and mtime
+# still are, and handle-vs-handle comparisons — the ones that prove the hashed
+# bytes did not move — stay strict on every platform.
+_CROSS_FLAVOUR_IGNORED = ("dev", "ino", "ctime_ns", "mode") if os.name == "nt" else ()
 
 
 def _identity_fields(value: os.stat_result) -> dict[str, object]:

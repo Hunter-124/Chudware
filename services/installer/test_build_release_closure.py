@@ -136,7 +136,7 @@ def _restat(result: os.stat_result, **overrides: int) -> os.stat_result:
         "st_ctime_ns": result.st_ctime_ns,
     }
     for name, value in overrides.items():
-        index = {"st_ino": 1, "st_dev": 2, "st_size": 6}.get(name)
+        index = {"st_mode": 0, "st_ino": 1, "st_dev": 2, "st_size": 6}.get(name)
         if index is None:
             named[name] = value
         else:
@@ -167,11 +167,12 @@ def test_snapshot_tolerates_the_windows_cross_api_file_id(
             st_ino=result.st_ino + 2**64,
             st_dev=result.st_dev + 1,
             st_ctime_ns=result.st_ctime_ns - 864_000_000_000,
+            st_mode=result.st_mode & ~0o111,
         )
 
     monkeypatch.setattr(payload_manifest.os, "fstat", other_flavour_fstat)
     monkeypatch.setattr(
-        payload_manifest, "_CROSS_FLAVOUR_IGNORED", ("dev", "ino", "ctime_ns")
+        payload_manifest, "_CROSS_FLAVOUR_IGNORED", ("dev", "ino", "ctime_ns", "mode")
     )
     snapshot = payload_manifest._snapshot_file(root, "FreeImage.dll", "library", attempts=1)
     assert snapshot.sha256 == hashlib.sha256(b"dll bytes").hexdigest()

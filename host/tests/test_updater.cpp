@@ -2,6 +2,7 @@
 #include "update/updater.h"
 #include "update/windows_update_helper.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <chrono>
 #include <filesystem>
@@ -9,6 +10,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 using chudware::update::Manifest;
@@ -464,6 +466,54 @@ void liveChannelTest(const std::string& endpoint, const std::string& currentVers
               << " bytes, running app untouched\n";
 }
 
+// The other half of an update: install the staged artifact over the running
+// one. applyPlatformArtifact ends in execv, which would launch the GUI, so run
+// this with the install directory on a noexec mount — the replacement is
+// already on disk by then, and the blocked relaunch is what makes the result
+// inspectable:
+//   unshare -Ur -m sh -c 'mount -t tmpfs -o noexec tmpfs /mnt &&
+//     test_updater --apply-once <staged root> /mnt/Chudware.AppImage'
+void applyStagedOnceTest(const fs::path& root, const fs::path& installed) {
+    const fs::path metadata = root / "data/updates/staged.json";
+    require(fs::exists(metadata), "no staged update under this root; run --live first");
+    fs::path staged;
+    for (const auto& entry : fs::directory_iterator(root / "data/updates"))
+        if (entry.is_regular_file() && entry.path().extension() != ".json")
+            staged = entry.path();
+    require(!staged.empty(), "staged artifact is missing");
+    writeFile(installed, "OLD INSTALLED BUILD\n");
+#ifndef _WIN32
+    setenv("APPIMAGE", installed.c_str(), 1);
+#endif
+    Updater updater;
+    updater.configure("0.1.0-beta.0", root / "data", installed);
+    const auto result = updater.applyStagedBeforeWindow();
+    const char* name = result == chudware::update::ApplyResult::Relaunching ? "Relaunching"
+        : result == chudware::update::ApplyResult::Failed ? "Failed"
+        : result == chudware::update::ApplyResult::ManualDownload ? "ManualDownload"
+        : result == chudware::update::ApplyResult::Rejected ? "Rejected" : "NothingStaged";
+    std::cout << "apply-once: result=" << name << std::endl;
+    require(result == chudware::update::ApplyResult::Relaunching ||
+                result == chudware::update::ApplyResult::Failed,
+            "apply must reach the relaunch, not refuse the staged update");
+    require(fs::file_size(installed) == fs::file_size(staged),
+            "installed file is not the staged artifact's size");
+    std::ifstream left(installed, std::ios::binary), right(staged, std::ios::binary);
+    std::vector<char> a(1 << 20), b(1 << 20);
+    std::uintmax_t compared = 0;
+    while (left.read(a.data(), static_cast<std::streamsize>(a.size())) || left.gcount()) {
+        right.read(b.data(), left.gcount());
+        require(right.gcount() == left.gcount() &&
+                    std::equal(a.begin(), a.begin() + left.gcount(), b.begin()),
+                "installed bytes differ from the staged artifact");
+        compared += static_cast<std::uintmax_t>(left.gcount());
+    }
+    require((fs::status(installed).permissions() & fs::perms::owner_exec) != fs::perms::none,
+            "installed AppImage must be executable");
+    std::cout << "apply-once: installed " << compared << " staged bytes over " << installed
+              << ", executable, relaunch " << name << '\n';
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -476,6 +526,8 @@ int main(int argc, char** argv) {
         emptyChannelTest(argv[2], argv[3]);
     } else if (argc == 5 && std::string(argv[1]) == "--live") {
         liveChannelTest(argv[2], argv[3], argv[4]);
+    } else if (argc == 4 && std::string(argv[1]) == "--apply-once") {
+        applyStagedOnceTest(argv[2], argv[3]);
     } else {
         localSecurityTests(fs::temp_directory_path() / "chudware-updater-test");
     }

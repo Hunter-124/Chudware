@@ -166,6 +166,20 @@ Note that while `min_supported` is `0.1.0` every `0.1.0-beta.N` client is
 *below* the floor, so the status reads **Mandatory** the whole way through:
 `setStatus` pins that state and only the message tracks progress.
 
+The install half — replacing the running AppImage with the staged one — ends in
+`execv`, which would launch the GUI. Run it with the install directory on a
+noexec mount so the relaunch is blocked *after* the replacement lands:
+
+```sh
+unshare -Ur -m sh -c 'mkdir -p /tmp/nx && mount -t tmpfs -o noexec,size=600M tmpfs /tmp/nx &&
+  host/build-linux/bin/test_updater --apply-once /tmp/live-updater /tmp/nx/Chudware.AppImage'
+```
+
+`result=Failed` with `relaunch Failed` is the expected outcome there: it means
+the staged artifact was re-verified, installed byte for byte over the old file
+and left executable, and only the (deliberately blocked) relaunch failed. On a
+normal mount the same call returns `Relaunching` and the new build takes over.
+
 ## Required GitHub secrets
 
 | Secret | Used by | Content |

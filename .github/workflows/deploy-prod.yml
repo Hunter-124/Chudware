@@ -153,6 +153,34 @@ jobs:
             exit 1
           fi
 
+          # install_webd.sh and rollback.sh drive `systemctl --user`, which needs
+          # a user session bus. A runner service is NOT a login session: it
+          # inherits no XDG_RUNTIME_DIR and no DBUS_SESSION_BUS_ADDRESS, so
+          # `systemctl --user daemon-reload` fails with a message that names
+          # neither. That is exactly how the first real automated deploy died --
+          # after the swap, leaving rollback to fail the same way one line later
+          # and report "ROLLBACK ITSELF FAILED" for a missing environment
+          # variable. Deploying by hand over ssh worked precisely because ssh
+          # DOES create a session.
+          #
+          # Exported through $GITHUB_ENV so every later step inherits it, and
+          # derived from `id -u` rather than hardcoding 1000. Mirrors the
+          # user_systemctl helper in Webservice/deploy/harden_host.sh.
+          runtime_dir="/run/user/$(id -u)"
+          if [ ! -d "${runtime_dir}" ]; then
+            echo "::error title=No user runtime directory::${runtime_dir} does not exist, so systemctl --user cannot reach liveuser's session bus and the updater would fail after promoting. Enable lingering: sudo loginctl enable-linger ${user}"
+            exit 1
+          fi
+          if [ ! -S "${runtime_dir}/bus" ]; then
+            echo "::error title=No user session bus::${runtime_dir}/bus is missing. systemctl --user needs it. Enable lingering: sudo loginctl enable-linger ${user}"
+            exit 1
+          fi
+          {
+            echo "XDG_RUNTIME_DIR=${runtime_dir}"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${runtime_dir}/bus"
+          } >> "$GITHUB_ENV"
+          echo "user session bus: ${runtime_dir}/bus"
+
           # The deploy tooling is NOT asserted here. It cannot be: update.sh,
           # rollback.sh and the retention flag arrive in the canonical checkout
           # only when something pulls, and the only thing that pulls is a

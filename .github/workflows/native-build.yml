@@ -299,22 +299,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ matrix.preset }}" = "linux-core" ]; then
-            for tool in clang-tidy run-clang-tidy; do
-              command -v "${tool}" >/dev/null || {
-                echo "::error::${tool} is missing from the Linux build runner"
-                exit 1
-              }
-            done
-            clang-tidy --version | head -n 1
-          fi
           cmake --preset ${{ matrix.preset }} -DNETGEN_ROOT="${{ env.NETGEN_ROOT }}"
           cmake --build --preset ${{ matrix.preset }}
-
-          if [ "${{ matrix.preset }}" = "linux-core" ]; then
-            run-clang-tidy -p build/linux-core -j 0 \
-              -source-filter='.*[/\\]core[/\\]'
-          fi
 
       - name: Configure and build core (${{ matrix.preset }}) (Windows)
         if: runner.os == 'Windows'
@@ -401,11 +387,6 @@ jobs:
           cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF
           cmake --build ${{ matrix.host_build_dir }}
 
-          if [ "${{ matrix.preset }}" = "linux-core" ]; then
-            run-clang-tidy -p ${{ matrix.host_build_dir }} -j 0 \
-              -source-filter='.*[/\\](host|core|platform)[/\\]'
-          fi
-
       - name: Configure and build host GUI (Windows)
         if: matrix.build_host && runner.os == 'Windows'
         shell: powershell
@@ -440,6 +421,24 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           exit "${status}"
+
+      - name: clang-tidy first-party Linux sources
+        if: matrix.preset == 'linux-core'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in clang-tidy run-clang-tidy; do
+            command -v "${tool}" >/dev/null || {
+              echo "::error::${tool} is missing from the Linux build runner"
+              exit 1
+            }
+          done
+          clang-tidy --version | head -n 1
+          run-clang-tidy -p build/linux-core -j 0 --quiet \
+            -source-filter='.*[/\\]core[/\\]'
+          run-clang-tidy -p ${{ matrix.host_build_dir }} -j 0 --quiet \
+            -source-filter='.*[/\\](host|core|platform)[/\\]'
 
       - name: ctest host GUI (Windows)
         if: matrix.build_host && runner.os == 'Windows'

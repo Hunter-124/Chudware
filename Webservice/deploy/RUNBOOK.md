@@ -566,7 +566,10 @@ The same script deploys both environments:
 # Automatic after green linux-gate.yml on canonical master:
 bash Webservice/deploy/update.sh staging
 
-# Explicit workflow_dispatch only; the tag is mandatory and re-verified at HEAD:
+# Automatic: deploy-prod.yml promotes green master continuously, with no tag:
+bash Webservice/deploy/update.sh prod --continuous
+
+# Deliberate pinned release; the tag is mandatory and re-verified at HEAD:
 bash Webservice/deploy/update.sh prod --tag v1.2.0
 
 # Operational variants retain the same environment guardrails:
@@ -581,8 +584,21 @@ anonymous `/healthz` and authenticated `/api/me`. Logs and status live under
 the selected data root; the flock is shared under
 `~/chudware-web-data/logs/deploy.lock` so two environments cannot mutate the
 single checkout concurrently. Staging defaults to gateway-only. Production
-keeps the joint native hostd/WASM promotion and refuses any HEAD that is not an
-exact `v*` tag.
+keeps the joint native hostd/WASM promotion; `--tag` still refuses any HEAD
+that is not an exact `v*` tag, while `--continuous` — what
+`.github/workflows/deploy-prod.yml` uses — waives only that tag check and
+keeps every other guardrail. A prod run must pick exactly one policy: bare
+`update.sh prod` exits 2, `--continuous --tag` exits 2, and `staging
+--continuous` exits 2. CI also exports
+`CHUDWARE_DEPLOY_HEALTH_BASE_URL=http://127.0.0.1:8300` for prod runs; a hand
+run no longer needs it now that the prod arm sets `GATEWAY_PORT=8300` itself,
+but setting it is harmless.
+
+`~/chudware-web-data/logs/deploy-status.json` records the last deploy's
+`release`: the `v*` tag for a pinned run, the full commit sha for a continuous
+one. In continuous mode that sha is the only name for what shipped, so read it
+before assuming which commit production is on. It is also what the `/admin`
+Deploy card shows.
 
 To prove the fail-closed assertion without changing code, set
 `CHUDWARE_DEPLOY_HEALTHZ_PATH=/deliberately-broken` and
@@ -590,13 +606,86 @@ To prove the fail-closed assertion without changing code, set
 run. It must exit nonzero; immediately rerun without those overrides.
 
 `install_webd.sh` builds the WASM client and promotes the engine in one joint
-release, then restarts `chudware-hostd` only when the joint sha changed.
+release, then restarts `chudware-hostd` only when the joint sha changed. It
+retains the newest `CHUDWARE_WEBD_KEEP_RELEASES` releases (default 3) under
+`~/chudware-web/releases/` rather than deleting the one it replaced, which is
+what makes the rollback below possible at all.
 
 Desktop against the **shared** daemon (same engine the web client uses):
 
 ```bash
 ~/chudware-web/chudware-shared.sh
 ```
+
+### Roll back a bad production release
+
+`deploy-prod.yml` already runs `rollback.sh` itself when a deploy or its
+post-deploy verification fails, so production may already be back on the
+previous release by the time you look. Establish what is actually deployed
+before touching anything:
+
+```bash
+cat ~/chudware-web/.webd-running-joint    # joint sha the running hostd was started for
+readlink -f ~/chudware-web/current        # promoted release directory
+grep -E '^(release_id|joint_sha256|checkout_head|built_at_utc)=' \
+  ~/chudware-web/current/deploy-manifest
+cat ~/chudware-web-data/logs/deploy-status.json   # last deploy: rc + release (tag or sha)
+bash Webservice/deploy/rollback.sh --list # retained releases, newest first, current marked
+```
+
+If `--list` shows only one release, skip to "When there is no way back" below.
+
+Roll back:
+
+```bash
+# newest retained release that is not the current one:
+bash Webservice/deploy/rollback.sh
+
+# or a specific release id from --list:
+bash Webservice/deploy/rollback.sh --to 20260822T171130Z-4f2a9c1d3b07-8241
+
+# only when production is already broken and bridges will never drain:
+bash Webservice/deploy/rollback.sh --force
+```
+
+Exit 0 restored, 1 failure, 2 usage error or no rollback target. On exit 1 read
+the output before retrying — `current` is swapped atomically, so a failure
+leaves either the old or the restored tree promoted, never a half state.
+Without `--force` the restart waits for live `/engine` bridges to drain, up to
+`CHUDWARE_WEBD_RESTART_MAX_WAIT` (600s). Do not reach for `--force` because
+that wait feels slow; it exists so a rollback does not cut off connected
+users.
+
+Confirm it took:
+
+```bash
+chudware-hostd --status                     # banner on stderr, daemon_status JSON on stdout
+curl -fsS http://127.0.0.1:8300/healthz     # must be {"ok": true}
+cat ~/chudware-web/.webd-running-joint      # must equal the restored release's joint_sha256
+python3 ~/Repositories/CAD/scripts/check_web_parity.py --bundle ~/chudware-web/app
+```
+
+`chudware-hostd --status` exits 1 with "no running instance" when the daemon is
+down. `check_web_parity.py` exits 0 for parity, 1 for divergence, and 2 when it
+cannot evaluate — treat 2 as unresolved, never as a pass. The gateway needs no
+restart: it resolves the app root per request, so a swapped `current` is served
+immediately.
+
+Rollback swaps a built tree and nothing else. It does not undo a database
+migration; if the bad deploy migrated the schema, restore that deploy's
+`~/chudware-web-data/backups/pre-deploy-prod-<UTC>.dump` as well.
+
+**When there is no way back.** Retention only starts accumulating from the
+first deploy that ran with `CHUDWARE_WEBD_KEEP_RELEASES` honoured; before that,
+`install_webd.sh` deleted the previous release on every success. If
+`rollback.sh --list` shows a single release, or the only other retained release
+is the bad one, `rollback.sh` exits 2 and there is no automated recovery —
+nothing on disk holds a known-good bundle. The only route is to fix forward:
+push a corrected commit to `master` and let `deploy-prod.yml` promote it, or run
+`update.sh prod --continuous` on the box, and accept the full engine + WASM
+build time. Check `--list` before you need it rather than assuming a safety net
+is there, and raise `CHUDWARE_WEBD_KEEP_RELEASES` (disk is the only cost) if one
+spare release is not enough margin.
 
 ---
 
@@ -608,6 +697,7 @@ Desktop against the **shared** daemon (same engine the web client uses):
 | `Webservice/deploy/update.sh` | Environment-aware dump → pull → migrate → restart → health assertion |
 | `Webservice/deploy/rebuild.sh` / `redeploy.sh` | Admin-locked rebuild targets / production gateway restart |
 | `Webservice/deploy/install_webd.sh` | Promote engine build and install hostd plus both gateway units |
+| `Webservice/deploy/rollback.sh` | `--list` retained releases / swap `current` back, drain-restart hostd, rewrite `.webd-running-joint` |
 | `Webservice/deploy/chudware-gateway{,-staging}.service` | Production 8300 / staging 8310 systemd **user** units |
 | `Webservice/deploy/monitor.py` | Host sample + disk-pressure flag (stdlib) |
 | `Webservice/deploy/cf_provision.py` | Driver: tunnel/DNS/Pages via API — no Access application |

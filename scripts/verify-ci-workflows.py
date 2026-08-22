@@ -83,6 +83,14 @@ REQUIRED_WORKFLOWS: Tuple[str, ...] = (
     # Commercial payload preparation must remain self-hosted, bounded, and stop at
     # the authenticated offline-owner signing boundary.
     "release.yml",
+    # The continuous-deployment actuator. Without it a green master commit is
+    # never promoted, which is exactly how production served a fifteen-day-old
+    # web bundle behind a fully green tree. It is required rather than
+    # advisory for a second reason: it is the only workflow that runs on the
+    # production host and the only one that can restart the customer-facing
+    # daemon, so a routing or permissions regression in it is a production
+    # incident, not a CI annoyance.
+    "deploy-prod.yml",
 )
 
 # This gate polices itself too.

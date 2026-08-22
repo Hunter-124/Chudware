@@ -5,6 +5,8 @@
 #  The engine and browser bundle are built/staged as one immutable release,
 #  validated before the live `current` symlink moves, and restarted only after
 #  authenticated gateway telemetry proves no engine bridges are active.
+#  Superseded releases are retained rather than deleted, so rollback.sh always
+#  has a validated tree to go back to.
 # ===========================================================================
 set -euo pipefail
 
@@ -28,6 +30,15 @@ fatal() {
   echo "[webd] ERROR: $*" >&2
   exit 1
 }
+
+# Retention depth for `releases/`, counting the release this run promotes. Before
+# this existed the previous release was deleted the instant a promotion succeeded,
+# which meant a bad build reaching production had nothing behind it to restore.
+# Validated here rather than at GC time: the GC runs after a ~20 minute build and
+# a service restart, and discovering a typo'd retention count there is useless.
+KEEP_RELEASES="${CHUDWARE_WEBD_KEEP_RELEASES:-3}"
+[[ "$KEEP_RELEASES" =~ ^[0-9]+$ ]] && [ "$KEEP_RELEASES" -ge 1 ] \
+  || fatal "CHUDWARE_WEBD_KEEP_RELEASES must be an integer >= 1 (got '$KEEP_RELEASES')"
 
 PYTHON="$ROOT/Webservice/gateway/.venv/bin/python"
 if [ ! -x "$PYTHON" ]; then
@@ -206,8 +217,16 @@ CHECKOUT_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')"
 JOINT_SHA="$(printf '%s\n' "$HOSTD_SHA" "$LIB_SHA" "$WASM_SHA" "$JS_SHA" \
   "$PROVIDER_SHA" "$HOSTD_UNIT_SHA" "$GATEWAY_UNIT_SHA" "$STAGING_GATEWAY_UNIT_SHA" \
   "$PROMPTS_SHA" | sha256sum | cut -d' ' -f1)"
+# One clock read feeds both the release id and the manifest timestamp, so the two
+# can never straddle a second boundary and disagree. UTC rather than local time:
+# release retention and rollback order trees by their lexicographic directory
+# name, and a local-time stamp runs backwards for an hour on every DST fall-back,
+# which would let the collector reap the newest release instead of the oldest.
+BUILT_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+RELEASE_ID="${BUILT_AT_UTC//[:-]/}-${JOINT_SHA:0:12}-$$"
 cat > "$STAGE_ROOT/deploy-manifest" <<EOF
-schema=1
+schema=2
+release_id=$RELEASE_ID
 joint_sha256=$JOINT_SHA
 hostd_sha256=$HOSTD_SHA
 libchudware_sha256=$LIB_SHA
@@ -221,7 +240,7 @@ prompts_sha256=$PROMPTS_SHA
 wasm_token=$WASM_TOKEN
 checkout_head=$CHECKOUT_HEAD
 source=$SRC
-prepared_at=$(date -Is)
+built_at_utc=$BUILT_AT_UTC
 EOF
 echo "[webd] joint release validated (sha ${JOINT_SHA:0:12})"
 
@@ -384,8 +403,6 @@ fi
 
 LEGACY_BIN=""
 LEGACY_APP=""
-OLD_CURRENT_REAL=""
-RELEASE_DIR=""
 if [ "$NEEDS_PROMOTION" = 1 ]; then
   [ ! -e "$DST/current" ] || [ -L "$DST/current" ] || fatal "$DST/current exists and is not a symlink"
   if [ -L "$BIN" ] && [ "$(readlink "$BIN")" != "current/bin" ]; then
@@ -394,8 +411,6 @@ if [ "$NEEDS_PROMOTION" = 1 ]; then
   if [ -L "$APP" ] && [ "$(readlink "$APP")" != "current/app" ]; then
     fatal "$APP points somewhere unexpected: $(readlink "$APP")"
   fi
-  OLD_CURRENT_REAL="$(readlink -f "$DST/current" 2>/dev/null || true)"
-  RELEASE_ID="$(date +%Y%m%dT%H%M%S)-${JOINT_SHA:0:12}-$$"
   RELEASE_DIR="$RELEASES/$RELEASE_ID"
   # Parity gate before anything live moves. The browser bundle bakes assets/ in at LINK
   # time (the --preload-file flags in host/CMakeLists.txt), so $STAGE_APP can be a
@@ -479,13 +494,49 @@ else
   echo "[webd] release installed; start it with: systemctl --user start chudware-hostd.service"
 fi
 
-# Old trees/releases are removed only after the requested service operation has
-# completed successfully, preserving a rollback artifact on restart/readiness failure.
+# Old trees are removed only after the requested service operation has completed
+# successfully, preserving a rollback artifact on restart/readiness failure.
+# LEGACY_BIN/LEGACY_APP are pre-`releases/`-layout leftovers, not release history.
 [ -z "$LEGACY_BIN" ] || rm -rf "$LEGACY_BIN"
 [ -z "$LEGACY_APP" ] || rm -rf "$LEGACY_APP"
-if [ -n "$OLD_CURRENT_REAL" ] && [ "$OLD_CURRENT_REAL" != "$RELEASE_DIR" ]; then
-  case "$OLD_CURRENT_REAL" in
-    "$RELEASES"/*) rm -rf "$OLD_CURRENT_REAL" ;;
-  esac
-fi
-echo "[webd] deployment complete (joint sha ${JOINT_SHA:0:12})"
+
+# Retention, not deletion. This block used to `rm -rf` whatever `current` pointed at
+# the instant a promotion succeeded, which left production with literally nothing to
+# roll back to; now the newest $KEEP_RELEASES trees survive (the release promoted by
+# this run counts as the first of them) and rollback.sh picks a target out of them.
+#
+# Ordering is by release id, which begins with the UTC promotion stamp and therefore
+# sorts chronologically as plain text — mtime is not trusted for those, because a
+# `cp -a`, a restore, or a parity re-read can touch a directory long after it was
+# built. A directory whose name does not carry that stamp (hand-copied, or predating
+# the timestamped ids) is slotted in by its mtime rendered into the same shape, so
+# the two kinds interleave chronologically instead of one always sorting first.
+CURRENT_REAL="$(readlink -f "$DST/current" 2>/dev/null || true)"
+kept=0
+while IFS=$'\t' read -r _ name; do
+  dir="$RELEASES/$name"
+  # The `-ef` clause is belt and braces: the live tree is never reaped even if the
+  # retention count is wrong or an interrupted promotion left `current` pointing at
+  # something that does not sort into the newest $KEEP_RELEASES.
+  if [ "$kept" -lt "$KEEP_RELEASES" ] \
+     || { [ -n "$CURRENT_REAL" ] && [ "$dir" -ef "$CURRENT_REAL" ]; }; then
+    kept=$((kept + 1))
+    continue
+  fi
+  rm -rf "$dir"
+  echo "[webd] reaped superseded release $name"
+done < <(
+  for dir in "$RELEASES"/*; do
+    [ -d "$dir" ] || continue
+    name="${dir##*/}"
+    if [[ "$name" =~ ^[0-9]{8}T[0-9]{6}Z?- ]]; then
+      printf '%s\t%s\n' "$name" "$name"
+    else
+      # An unstattable directory sorts as epoch 0: unknown age is treated as oldest
+      # rather than crashing the collector or letting the tree accumulate forever.
+      printf '%s\t%s\n' \
+        "$(date -u -d "@$(stat -c %Y "$dir" 2>/dev/null || echo 0)" +%Y%m%dT%H%M%SZ)" "$name"
+    fi
+  done | sort -r
+)
+echo "[webd] deployment complete (joint sha ${JOINT_SHA:0:12}; $kept release(s) retained)"

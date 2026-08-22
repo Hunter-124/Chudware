@@ -5,9 +5,23 @@
 # Usage:
 #   bash Webservice/deploy/update.sh staging
 #   bash Webservice/deploy/update.sh prod --tag v1.2.0
+#   bash Webservice/deploy/update.sh prod --continuous
 #
 # Staging follows origin/master and deploys only the gateway by default.
-# Production requires an explicit v* tag and keeps the native release steps.
+# Production accepts exactly one of two release policies:
+#   --tag vX.Y.Z  pinned release; HEAD must be that exact v* tag.
+#   --continuous  untagged continuous deployment of origin/master HEAD, used by
+#                 .github/workflows/deploy-prod.yml so production tracks master
+#                 instead of silently serving a weeks-old bundle. The tradeoff
+#                 is deliberate and it is a policy change: a v* tag no longer
+#                 gates production. What gates it instead is the green master
+#                 CI gate upstream, plus every check below (clean tree,
+#                 ff-only pull, pg_dump rollback point, database-name and
+#                 entitlement asserts, joint-release parity validation and the
+#                 two post-deploy health assertions), with rollback.sh
+#                 restoring the previous retained joint release on failure.
+# The two policies are mutually exclusive, and a bare `prod` with neither flag
+# still refuses to deploy an untagged HEAD.
 # Both environments share this implementation so backup, migration, restart,
 # and authenticated health behavior cannot drift.
 # ===========================================================================
@@ -18,9 +32,12 @@ usage() {
 usage: update.sh <prod|staging> [options]
 
 Options:
-  --tag vX.Y.Z     Required for a production pull; forbidden for staging
+  --tag vX.Y.Z     Pinned production release; forbidden for staging
+  --continuous     Production only: deploy the untagged current master HEAD;
+                   rejected for staging and rejected together with --tag
   --pull-only      Fetch/pull only (no build, migration, or restart)
-  --no-pull        Deploy the current checkout (prod HEAD must be a v* tag)
+  --no-pull        Deploy the current checkout (prod HEAD must be a v* tag
+                   unless --continuous is given)
   --gateway-only   Skip desktop, engine, and webd promotion
   --host-only      Build the desktop binary only
   --web-only       Skip the desktop build; deploy engine/webd and gateway
@@ -42,6 +59,13 @@ case "$ENVIRONMENT" in
     DATA_ROOT="${CHUDWARE_WEB_DATA:-$HOME/chudware-web-data}"
     GATEWAY_ENV="${CHUDWARE_WEB_GATEWAY_ENV:-$DATA_ROOT/gateway.env}"
     GATEWAY_UNIT="chudware-gateway.service"
+    # post_deploy_health_assert defaults its base URL to
+    # http://127.0.0.1:$GATEWAY_PORT. Under `set -u` an unset GATEWAY_PORT
+    # aborts the run at the health assert — i.e. after the pg_dump, both
+    # builds, the joint-release promotion and the hostd restart have already
+    # landed — leaving a half-reported deploy that looks like a shell bug.
+    # The port belongs here with the other per-environment settings.
+    GATEWAY_PORT=8300
     RETENTION_UNIT="chudware-security-retention.service"
     RETENTION_TIMER="chudware-security-retention.timer"
     EXPECTED_DB="chudware_prod"
@@ -56,6 +80,10 @@ case "$ENVIRONMENT" in
     GATEWAY_PORT=8310
     RETENTION_UNIT="chudware-security-retention-staging.service"
     RETENTION_TIMER="chudware-security-retention-staging.timer"
+    # assert_database_target, backup_database and run_migrations all reference
+    # EXPECTED_DB unconditionally whenever the gateway is deployed, so leaving
+    # it out of this arm would abort every staging run on an unbound variable.
+    EXPECTED_DB="chudware_staging"
     DO_HOST=0
     DO_ENGINE=0
     DO_WEBD=0
@@ -74,12 +102,17 @@ esac
 DO_PULL=1
 DO_GATEWAY=1
 RELEASE_TAG=""
+CONTINUOUS=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tag)
       [[ $# -ge 2 ]] || { echo "ERROR: --tag requires a value" >&2; exit 2; }
       RELEASE_TAG="$2"
       shift 2
+      ;;
+    --continuous)
+      CONTINUOUS=1
+      shift
       ;;
     --pull-only)
       DO_HOST=0; DO_ENGINE=0; DO_WEBD=0; DO_GATEWAY=0
@@ -117,8 +150,16 @@ if [[ "$ENVIRONMENT" = staging && -n "$RELEASE_TAG" ]]; then
   echo "ERROR: staging follows master; --tag is forbidden" >&2
   exit 2
 fi
-if [[ "$ENVIRONMENT" = prod && "$DO_PULL" = 1 && ! "$RELEASE_TAG" =~ ^v[0-9] ]]; then
-  echo "ERROR: production deploy requires an explicit v* tag (use --tag vX.Y.Z)" >&2
+if [[ "$ENVIRONMENT" = staging && "$CONTINUOUS" = 1 ]]; then
+  echo "ERROR: staging already follows master; --continuous is meaningless there" >&2
+  exit 2
+fi
+if [[ "$CONTINUOUS" = 1 && -n "$RELEASE_TAG" ]]; then
+  echo "ERROR: --continuous and --tag are contradictory release policies; pass exactly one" >&2
+  exit 2
+fi
+if [[ "$ENVIRONMENT" = prod && "$CONTINUOUS" = 0 && "$DO_PULL" = 1 && ! "$RELEASE_TAG" =~ ^v[0-9] ]]; then
+  echo "ERROR: production deploy requires --tag vX.Y.Z or --continuous" >&2
   exit 2
 fi
 
@@ -127,7 +168,12 @@ REPO="${CHUDWARE_OMP_DIR:-$REPO}"
 cd "$REPO"
 REMOTE="${CHUDWARE_UPDATE_REMOTE:-origin}"
 REF="${CHUDWARE_UPDATE_BRANCH:-master}"
-[[ "$ENVIRONMENT" = staging ]] || REF="$RELEASE_TAG"
+# A pinned production deploy pulls the tag ref. Staging and a continuous
+# production deploy both track the branch, which is the only ref that exists
+# for an untagged HEAD.
+if [[ "$ENVIRONMENT" = prod && "$CONTINUOUS" = 0 ]]; then
+  REF="$RELEASE_TAG"
+fi
 
 mkdir -p "$DATA_ROOT/logs"
 LOGFILE="$DATA_ROOT/logs/update.log"
@@ -146,12 +192,22 @@ exec > >(tee -a "$LOGFILE") 2>&1
 STARTED_AT="$(date +%s)"
 printf '{"running":true,"kind":"deploy-%s","started_at":%s,"last":null}\n' \
   "$ENVIRONMENT" "$STARTED_AT" >"$STATUS"
+# What actually went out, resolved once the working tree is final. Declared
+# before the EXIT trap so an early failure cannot trip `set -u` inside it.
+RELEASE_ID=""
 _cleanup() {
   local rc=$?
-  local finished_at
+  local finished_at release_json
   finished_at="$(date +%s)"
-  printf '{"running":false,"kind":null,"started_at":null,"last":{"kind":"deploy-%s","rc":%s,"finished_at":%s}}\n' \
-    "$ENVIRONMENT" "$rc" "$finished_at" >"$STATUS"
+  # The revision rides inside "last": deploy_ops._read_status() drops unknown
+  # top-level keys but passes "last" through verbatim, so the admin Deploy card
+  # and the CI log agree on which revision this run promoted. The substitution
+  # keeps the file parseable even for an exotic refname; no tag or sha we would
+  # ever deploy contains a JSON-hostile character.
+  release_json=null
+  [[ -z "$RELEASE_ID" ]] || release_json="\"${RELEASE_ID//[^A-Za-z0-9._+@\/-]/_}\""
+  printf '{"running":false,"kind":null,"started_at":null,"last":{"kind":"deploy-%s","rc":%s,"finished_at":%s,"release":%s}}\n' \
+    "$ENVIRONMENT" "$rc" "$finished_at" "$release_json" >"$STATUS"
 }
 trap _cleanup EXIT
 
@@ -418,15 +474,22 @@ if [[ "$DO_PULL" = 1 ]]; then
   fi
 fi
 
+RELEASE_ID="$(git rev-parse HEAD)"
 if [[ "$ENVIRONMENT" = prod ]]; then
-  HEAD_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
-  [[ "$HEAD_TAG" =~ ^v[0-9] ]] \
-    || { echo "ERROR: production HEAD is not an exact v* release tag" >&2; exit 1; }
-  if [[ -n "$RELEASE_TAG" && "$HEAD_TAG" != "$RELEASE_TAG" ]]; then
-    echo "ERROR: production HEAD tag $HEAD_TAG does not match requested $RELEASE_TAG" >&2
-    exit 1
+  if [[ "$CONTINUOUS" = 1 ]]; then
+    echo "    UNTAGGED CONTINUOUS DEPLOYMENT: promoting current $REF HEAD to production; no v* release tag gates this run"
+    echo "    production commit: $RELEASE_ID $(git log -1 --format=%s HEAD)"
+  else
+    HEAD_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+    [[ "$HEAD_TAG" =~ ^v[0-9] ]] \
+      || { echo "ERROR: production HEAD is not an exact v* release tag" >&2; exit 1; }
+    if [[ -n "$RELEASE_TAG" && "$HEAD_TAG" != "$RELEASE_TAG" ]]; then
+      echo "ERROR: production HEAD tag $HEAD_TAG does not match requested $RELEASE_TAG" >&2
+      exit 1
+    fi
+    RELEASE_ID="$HEAD_TAG"
+    echo "    production release tag: $HEAD_TAG"
   fi
-  echo "    production release tag: $HEAD_TAG"
 fi
 
 if [[ "$DO_HOST" = 1 ]]; then

@@ -45,7 +45,26 @@ static std::unordered_set<std::string> gWarnedMissing;
 
 // ---------------------------------------------------------------------------
 
-static GLuint uploadTexture(unsigned char* px, int w, int h) {
+// Upload one atlas image. Returns 0 when the driver refused it.
+//
+// The size check is not paranoia. The atlas used to be packed as a single 56 px
+// column, so it grew one 34 px row per icon and reached 9418 px tall — past the
+// 8192 GL_MAX_TEXTURE_SIZE that ANGLE/SwiftShader and plenty of real GPUs report,
+// and far past the 2048 that GLES3/WebGL2 merely GUARANTEE. glTexImage2D then
+// failed with GL_INVALID_VALUE, the texture stayed incomplete, and every icon
+// sampled as opaque black. Nothing in any log mentioned icons, which is why it
+// took a pixel inspection to find. An oversized atlas now says so, by name.
+static GLuint uploadTexture(unsigned char* px, int w, int h, const char* what) {
+    GLint maxTex = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
+    if (maxTex > 0 && (w > maxTex || h > maxTex)) {
+        std::fprintf(stderr,
+                     "[icons] %s is %dx%d but GL_MAX_TEXTURE_SIZE is %d — every icon "
+                     "would draw as a black square. Re-pack the atlas "
+                     "(python3 assets/make_icons.py --relayout).\n",
+                     what, w, h, (int)maxTex);
+        return 0;
+    }
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -54,6 +73,15 @@ static GLuint uploadTexture(unsigned char* px, int w, int h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    // A driver that rejected the level leaves an incomplete texture that samples
+    // black; better to fall through to the magenta placeholder than to ship that.
+    if (GLenum err = glGetError(); err != GL_NO_ERROR) {
+        std::fprintf(stderr, "[icons] %s upload failed (%dx%d, GL error 0x%04X)\n",
+                     what, w, h, (unsigned)err);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glDeleteTextures(1, &tex);
+        return 0;
+    }
     glBindTexture(GL_TEXTURE_2D, 0);
     return tex;
 }
@@ -132,7 +160,7 @@ void loadIcons(const std::string& assetsDir) {
         stbi_set_flip_vertically_on_load(0);
         unsigned char* px = stbi_load(path.c_str(), &w, &h, &ch, 4);
         if (px) {
-            gAtlas.texDark = uploadTexture(px, w, h);
+            gAtlas.texDark = uploadTexture(px, w, h, "atlas_dark.png");
             // SDF derivation reads the still-live pixel buffer (shape is theme-independent, so
             // deriving once from the dark atlas covers both themes) — freed right after.
             icons_sdf::build(px, w, h, gAtlas.cells, rasterOnly);
@@ -148,7 +176,7 @@ void loadIcons(const std::string& assetsDir) {
         int w, h, ch;
         unsigned char* px = stbi_load(path.c_str(), &w, &h, &ch, 4);
         if (px) {
-            gAtlas.texLight = uploadTexture(px, w, h);
+            gAtlas.texLight = uploadTexture(px, w, h, "atlas_light.png");
             stbi_image_free(px);
         } else {
             std::fprintf(stderr, "[icons] failed to load atlas_light.png: %s\n", stbi_failure_reason());
@@ -158,7 +186,7 @@ void loadIcons(const std::string& assetsDir) {
     // --- placeholder: 1x1 magenta ---
     {
         unsigned char mag[4] = {255, 0, 255, 255};
-        gAtlas.texPlaceholder = uploadTexture(mag, 1, 1);
+        gAtlas.texPlaceholder = uploadTexture(mag, 1, 1, "icon placeholder");
     }
 
     gAtlas.loaded = true;

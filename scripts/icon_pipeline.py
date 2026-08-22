@@ -1299,6 +1299,16 @@ def load_tile(name: str) -> Image.Image | None:
 # ---------------------------------------------------------------------------------------
 
 def ensure_cells(names: list[str]) -> None:
+    """Give every name in ``names`` an @32/@20 cell, re-laying the grid if needed.
+
+    This used to append one 34 px row to the BOTTOM of a single 56 px-wide column
+    per new name, growing the atlas without bound. That is how it reached 9418 px
+    tall — past the 8192 GL_MAX_TEXTURE_SIZE that ANGLE/SwiftShader and many real
+    GPUs report, so the web client's texture upload failed and every icon drew as
+    an opaque black square. The layout now comes from make_icons.layout_cells, the
+    one place that knows the grid, and existing art is carried across BY NAME so a
+    re-layout can never scramble or drop a curated tile.
+    """
     atlas_path = ICON_DIR / "atlas.json"
     atlas = json.loads(atlas_path.read_text(encoding="utf-8"))
     cells = atlas["cell"]
@@ -1307,7 +1317,8 @@ def ensure_cells(names: list[str]) -> None:
         return
     # placeholder glyphs come from make_icons.py's registered drawers (SDF-style line
     # art) so a cell is never blank even if its toolpath render fails.
-    sys.path.insert(0, str(REPO / "host" / "assets"))
+    sys.path.insert(0, str(REPO / "assets"))
+    mi = None
     try:
         import make_icons as mi
 
@@ -1324,27 +1335,46 @@ def ensure_cells(names: list[str]) -> None:
 
         def placeholder(name, sz, fn):
             return Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
-    row_h = 34
-    w, h = atlas["atlas_px"]
-    new_h = h + row_h * len(missing)
+
+    if mi is None:
+        # Without the layout helpers there is no safe way to place a new cell:
+        # guessing would be how the unbounded column came back.
+        raise RuntimeError(
+            "icon_pipeline: cannot extend the atlas without assets/make_icons.py "
+            "(needed for the atlas grid geometry)"
+        )
+
+    # Existing names keep their current order, read back from the committed
+    # layout so the grid is rebuilt rather than reshuffled; new names append.
+    def _block_key(name: str) -> tuple[int, int]:
+        c = cells[f"{name}@32"]
+        return c["x"], c["y"]
+
+    existing = sorted({k.rsplit("@", 1)[0] for k in cells}, key=_block_key)
+    order = existing + missing
+    new_w, new_h, new_cells = mi.layout_cells(order)
+
     for fn in ("atlas_dark.png", "atlas_light.png"):
-        im = Image.open(ICON_DIR / fn).convert("RGBA")
-        grown = Image.new("RGBA", (w, new_h), (0, 0, 0, 0))
-        grown.paste(im, (0, 0))
-        for i, name in enumerate(missing):
-            y = h + i * row_h
-            for x, sz, yoff in ((0, 32, 1), (34, 20, 7)):
-                g = placeholder(name, sz, fn)
-                grown.paste(g, (x, y + yoff), g)
+        old = Image.open(ICON_DIR / fn).convert("RGBA")
+        grown = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
+        for key, c in new_cells.items():
+            src = cells.get(key)
+            if src is not None:
+                tile = old.crop(
+                    (src["x"], src["y"], src["x"] + src["w"], src["y"] + src["h"])
+                )
+                if src["w"] != c["w"] or src["h"] != c["h"]:
+                    tile = tile.resize((c["w"], c["h"]), Image.LANCZOS)
+            else:
+                tile = placeholder(key.rsplit("@", 1)[0], c["w"], fn)
+            grown.paste(tile, (c["x"], c["y"]))
         grown.save(ICON_DIR / fn)
-    for i, name in enumerate(missing):
-        y = h + i * row_h
-        cells[f"{name}@32"] = {"x": 0, "y": y + 1, "w": 32, "h": 32}
-        cells[f"{name}@20"] = {"x": 34, "y": y + 7, "w": 20, "h": 20}
-    atlas["atlas_px"] = [w, new_h]
+
+    atlas["cell"] = new_cells
+    atlas["atlas_px"] = [new_w, new_h]
     atlas_path.write_text(json.dumps(atlas, indent=1), encoding="utf-8")
-    print(f"[icon_pipeline] atlas extended with {len(missing)} new cell row(s): "
-          f"{', '.join(missing)}")
+    print(f"[icon_pipeline] atlas relaid to {new_w}x{new_h} px for "
+          f"{len(missing)} new cell(s): {', '.join(missing)}")
 
 
 def _flatten_steps(steps: list) -> list:

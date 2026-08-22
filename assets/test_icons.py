@@ -8,7 +8,8 @@ Checks:
   2. Both PNG atlases decode successfully
   3. Both atlases share the same dimensions
   4. atlas.json layout matches what is in both PNGs (consistency check)
-  5. Regeneration into a temp dir is byte-identical to original (determinism)
+  5. The atlas fits inside the smallest MAX_TEXTURE_SIZE we target
+  6. Regeneration into a temp dir is byte-identical to original (determinism)
 """
 from __future__ import annotations
 
@@ -26,7 +27,14 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from PIL import Image
 
-from assets.make_icons import CONTRACT_NAMES, CELL_SIZES, build_atlas, OUT_DIR, check_coverage
+from assets.make_icons import (
+    ATLAS_MAX_PX,
+    CELL_SIZES,
+    CONTRACT_NAMES,
+    OUT_DIR,
+    build_atlas,
+    check_coverage,
+)
 import assets.make_icons as _mod
 
 import json as _json
@@ -83,6 +91,28 @@ def test_layout_consistency():
         assert x + cw <= w, f"{key}: x+w={x+cw} exceeds atlas width {w}"
         assert y + ch <= h, f"{key}: y+h={y+ch} exceeds atlas height {h}"
     print(f"  PASS layout_consistency: {len(data['cell'])} cells within bounds")
+
+
+def test_fits_in_a_texture():
+    """DURABLE GUARD: the atlas must fit in the smallest MAX_TEXTURE_SIZE we target.
+
+    This is the regression that shipped. The atlas was packed as one 56 px column,
+    so it grew a 34 px row per icon and reached 9418 px tall. ANGLE/SwiftShader and
+    plenty of real GPUs cap MAX_TEXTURE_SIZE at 8192, and GLES3/WebGL2 only
+    GUARANTEE 2048, so glTexImage2D failed and every icon in the browser client
+    drew as an opaque black square — with nothing in any log mentioning icons.
+
+    Both dimensions are checked, not just the one that happened to blow up: a
+    grid that grows sideways without bound is the same bug rotated 90 degrees.
+    """
+    data = load_json()
+    w, h = data["atlas_px"]
+    assert max(w, h) <= ATLAS_MAX_PX, (
+        f"atlas is {w}x{h}, over the {ATLAS_MAX_PX} px budget — icons will render "
+        f"black wherever MAX_TEXTURE_SIZE is smaller. Re-pack with "
+        f"`python3 assets/make_icons.py --relayout`."
+    )
+    print(f"  PASS fits_in_a_texture: {w}x{h} within {ATLAS_MAX_PX} px budget")
 
 
 def test_determinism():
@@ -185,6 +215,7 @@ def main():
     test_ribbon_icon_coverage()
     test_same_dimensions()
     test_layout_consistency()
+    test_fits_in_a_texture()
     test_determinism()
 
     print("=== ALL TESTS PASSED ===")

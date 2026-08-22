@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Callable
 
@@ -4561,6 +4562,95 @@ CELL_SIZES = [32, 20]
 HERE = Path(__file__).resolve().parent
 OUT_DIR = HERE / "icons"
 
+# Atlas geometry. One "row block" per icon name carries that name's @32 and @20
+# cells side by side; blocks are laid out top-to-bottom in bounded-height columns.
+#
+# The column bound is the whole point. This used to be a single column, so the
+# atlas was 56 px wide and as tall as the contract was long — 277 names x 34 px
+# = 9418 px. GLES3 and WebGL2 only GUARANTEE a 2048 px MAX_TEXTURE_SIZE, and
+# ANGLE/SwiftShader plus plenty of real GPUs report 8192, so glTexImage2D failed
+# outright in the browser client and every icon sampled as opaque black. Nothing
+# logged it as an icon problem; the ribbon just filled with black squares.
+#
+# 2048 is therefore the budget for BOTH dimensions, not the observed 8192: an
+# atlas that needs more than the guaranteed minimum is a bug waiting for the next
+# device. At 34 px per block that is 60 rows per column, which leaves room for
+# 3600 icons before the width even reaches 2048.
+ATLAS_MAX_PX = 2048
+ROW_PAD = 2
+
+
+def _block_size(sizes: list[int] | None = None) -> tuple[int, int]:
+    """(width, height) of one name's row block, padding included."""
+    sizes = sizes if sizes is not None else CELL_SIZES
+    return sum(s + ROW_PAD for s in sizes), max(sizes) + ROW_PAD
+
+
+def atlas_geometry(
+    n_names: int, sizes: list[int] | None = None
+) -> tuple[int, int, int]:
+    """(rows_per_column, atlas_w, atlas_h) for ``n_names`` row blocks.
+
+    Columns are filled to ``ATLAS_MAX_PX`` tall, then the row count is pulled
+    back to what the resulting column count actually needs, so the atlas never
+    carries a tall mostly-empty final column.
+
+    Raises when the contract cannot fit in the budget at all. That is deliberate:
+    the failure this replaces was silent — the atlas simply grew past the texture
+    limit, the GL upload failed, and the ribbon filled with black squares with
+    nothing in any log naming icons. A build-time exception is the only version of
+    this that anyone notices.
+    """
+    block_w, block_h = _block_size(sizes)
+    max_rows = max(1, ATLAS_MAX_PX // block_h)
+    max_cols = max(1, ATLAS_MAX_PX // block_w)
+    n = max(1, n_names)
+    cols = -(-n // max_rows)
+    if cols > max_cols:
+        raise ValueError(
+            f"{n} icons need {cols} columns of {block_w} px but only {max_cols} "
+            f"fit in the {ATLAS_MAX_PX} px budget (capacity "
+            f"{max_cols * max_rows} icons). Shrink CELL_SIZES, split the atlas, "
+            f"or raise ATLAS_MAX_PX only after checking the GL_MAX_TEXTURE_SIZE "
+            f"of every target — WebGL2 guarantees just 2048."
+        )
+    rows = -(-n // cols)
+    return rows, cols * block_w, rows * block_h
+
+
+def block_origin(
+    index: int, rows_per_col: int, sizes: list[int] | None = None
+) -> tuple[int, int]:
+    """Top-left pixel of row block ``index``, filling each column before the next."""
+    block_w, block_h = _block_size(sizes)
+    return (index // rows_per_col) * block_w, (index % rows_per_col) * block_h
+
+
+def layout_cells(
+    names: list[str], sizes: list[int] | None = None
+) -> tuple[int, int, dict[str, dict[str, int]]]:
+    """(atlas_w, atlas_h, {"name@size": {x,y,w,h}}) for ``names`` in order.
+
+    The single source of truth for where a cell lands. make_icons draws into
+    this layout and scripts/icon_pipeline.py re-lays the committed atlas out
+    through it when a recipe introduces a name, so the two can never disagree
+    about the grid.
+    """
+    sizes = sizes if sizes is not None else CELL_SIZES
+    rows_per_col, atlas_w, atlas_h = atlas_geometry(len(names), sizes)
+    row_h = max(sizes) + ROW_PAD
+    cells: dict[str, dict[str, int]] = {}
+    for i, name in enumerate(names):
+        bx, by = block_origin(i, rows_per_col, sizes)
+        x = bx
+        for sz in sizes:
+            cells[f"{name}@{sz}"] = {
+                "x": x, "y": by + (row_h - sz) // 2, "w": sz, "h": sz,
+            }
+            x += sz + ROW_PAD
+    return atlas_w, atlas_h, cells
+
+
 # ---------------------------------------------------------------------------
 # Rendered-tile protection.
 #
@@ -4713,36 +4803,11 @@ def _render_icon(name: str, cell: int, palette: Palette) -> Image.Image:
 def build_atlas(palette: Palette) -> tuple[Image.Image, dict]:
     """Returns (atlas_image, cell_map)."""
     names = CONTRACT_NAMES
-    sizes = CELL_SIZES  # [32, 20]
-    # layout: rows = names, columns = sizes
-    # padding between cells
-    pad = 2
-    col_w = [s + pad for s in sizes]
-    total_w = sum(col_w)
-    row_h = [max(sizes) + pad] * len(names)  # uniform row height = 32+pad
-    # actually pack tightly per row
-    # each row height = the cell size for that row? No — rows contain both sizes.
-    # We'll put @32 in column 0, @20 in column 1 — both in the same row, vertically centered.
-    row_heights = [max(sizes) + pad] * len(names)
-    total_h = sum(row_heights)
-
+    total_w, total_h, cell_map = layout_cells(names)
     atlas = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
-    cell_map: dict[str, dict] = {}
-
-    y = 0
-    for i, name in enumerate(names):
-        rh = row_heights[i]
-        x = 0
-        for j, sz in enumerate(sizes):
-            icon_img = _render_icon(name, sz, palette)
-            # center vertically in row
-            y_off = (rh - sz) // 2
-            atlas.paste(icon_img, (x, y + y_off), icon_img)
-            key = f"{name}@{sz}"
-            cell_map[key] = {"x": x, "y": y + y_off, "w": sz, "h": sz}
-            x += col_w[j]
-        y += rh
-
+    for key, c in cell_map.items():
+        icon_img = _render_icon(key.rsplit("@", 1)[0], c["w"], palette)
+        atlas.paste(icon_img, (c["x"], c["y"]), icon_img)
     return atlas, cell_map
 
 
@@ -4836,5 +4901,45 @@ def main():
         raise RuntimeError(f"Missing draw functions: {missing}")
 
 
+def relayout_committed_atlas() -> tuple[int, int]:
+    """Re-pack the COMMITTED atlas into the current grid without redrawing anything.
+
+    Every cell is moved by name and copied pixel-for-pixel, and ``raster_only`` is
+    carried across untouched, so this changes coordinates and nothing else. That
+    matters: a full ``main()`` regen re-fits the ~170 engine-rendered tiles from
+    scratch/icon_render and re-derives raster_only, which is the right thing when
+    you actually want fresh art and the wrong thing when all you need is an atlas
+    that fits in a texture.
+
+    Use it when the committed atlas outgrows ATLAS_MAX_PX. Returns the new size.
+    """
+    old = json.loads((OUT_DIR / "atlas.json").read_text(encoding="utf-8"))
+    old_cells = old["cell"]
+    order = sorted(
+        {k.rsplit("@", 1)[0] for k in old_cells},
+        key=lambda n: (old_cells[f"{n}@32"]["x"], old_cells[f"{n}@32"]["y"]),
+    )
+    new_w, new_h, new_cells = layout_cells(order)
+    for fn in ("atlas_dark.png", "atlas_light.png"):
+        src = Image.open(OUT_DIR / fn).convert("RGBA")
+        dst = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
+        for key, c in new_cells.items():
+            o = old_cells[key]
+            dst.paste(
+                src.crop((o["x"], o["y"], o["x"] + o["w"], o["y"] + o["h"])),
+                (c["x"], c["y"]),
+            )
+        dst.save(OUT_DIR / fn)
+    old["cell"] = new_cells
+    old["atlas_px"] = [new_w, new_h]
+    (OUT_DIR / "atlas.json").write_text(json.dumps(old, indent=2), encoding="utf-8")
+    print(f"relaid {len(order)} icons -> {new_w} × {new_h} px "
+          f"(budget {ATLAS_MAX_PX} per side)")
+    return new_w, new_h
+
+
 if __name__ == "__main__":
-    main()
+    if "--relayout" in sys.argv[1:]:
+        relayout_committed_atlas()
+    else:
+        main()

@@ -254,9 +254,21 @@ IconUV getIcon(const char* name, int size) {
 
     if (it == gAtlas.cells.end()) {
 #ifdef __EMSCRIPTEN__
-        // Web atlas ships a subset of desktop tiles; workspace chips (ws_model etc.)
-        // already fall through to procedural TbIcon when valid=false. Don't spam the
-        // browser console with first-time-missing warnings during boot.
+        // NOT a subset: host/CMakeLists.txt --preload-file's the very same
+        // assets/icons/atlas.json + atlas_{dark,light}.png the desktop reads off
+        // disk, so both targets load a byte-identical atlas. A miss here is a
+        // genuine contract bug on BOTH targets (a name with no cell), never an
+        // expected web gap — an earlier version of this comment claimed "web
+        // ships a subset of desktop tiles", and that false licence is exactly
+        // why a real divergence went unquestioned for ten days: prod served an
+        // atlas linked 2026-08-07 while 69690e57 (2026-08-17) had replaced every
+        // ribbon tool icon with an engine-rendered 3D tile. Byte-parity between a
+        // linked bundle and the repo is now enforced by
+        // scripts/check_web_parity.py; staleness is that gate's job, not a thing
+        // to shrug at here. The web branch stays silent purely on console-spam
+        // volume — a missing name is hit every frame by every ribbon draw and
+        // would flood devtools during boot; it still falls through to procedural
+        // TbIcon art via valid=false, exactly as on desktop.
         gWarnedMissing.insert(name);
 #else
         if (gWarnedMissing.find(name) == gWarnedMissing.end()) {

@@ -397,6 +397,17 @@ if [ "$NEEDS_PROMOTION" = 1 ]; then
   OLD_CURRENT_REAL="$(readlink -f "$DST/current" 2>/dev/null || true)"
   RELEASE_ID="$(date +%Y%m%dT%H%M%S)-${JOINT_SHA:0:12}-$$"
   RELEASE_DIR="$RELEASES/$RELEASE_ID"
+  # Parity gate before anything live moves. The browser bundle bakes assets/ in at LINK
+  # time (the --preload-file flags in host/CMakeLists.txt), so $STAGE_APP can be a
+  # perfectly valid, freshly linked WASM bundle carrying stale assets — the hashes above
+  # pin the release to itself, never to its sources. That shipped once: 69690e57
+  # (2026-08-17) re-rendered every ribbon tool icon, webd kept serving the bundle linked
+  # 2026-08-07, and ten days passed before anyone hand-scanned Chudware.data for PNG bytes
+  # and found it. Refuse the promotion instead of moving `current` onto a stale release.
+  [ -f "$ROOT/scripts/check_web_parity.py" ] \
+    || fatal "$ROOT/scripts/check_web_parity.py missing; cannot prove the staged bundle matches its sources"
+  "$PYTHON" "$ROOT/scripts/check_web_parity.py" --bundle "$STAGE_APP" \
+    || fatal "staged web bundle does not match $ROOT (see [web-parity] output above); refusing to promote a stale release"
   mv "$STAGE_ROOT" "$RELEASE_DIR"
   STAGE_ROOT=""
 

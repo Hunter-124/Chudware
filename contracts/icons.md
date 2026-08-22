@@ -264,3 +264,63 @@ drawers remain as the never-blank fallback.
 - Each tile carries at most one (rarely two) annotation cue — arrow, dimension
   arrow, dash, arc, ring, dots or a corner badge — pointing in the tool's
   direction of action, overlaid after render and bolded so it reads at 32 px.
+
+## Texture-size budget — `ATLAS_MAX_PX`
+
+The packed atlas MUST stay within **`ATLAS_MAX_PX` (2048)** on **both** sides.
+GLES3 and WebGL2 only *guarantee* a 2048 px `MAX_TEXTURE_SIZE`; a desktop GPU
+that happily takes more tells you nothing about the browser. A 56x9418
+single-column atlas made `glTexImage2D` fail outright, and because the loader
+then had no texture, **every icon in the browser drew as an opaque black
+square** — a total-loss failure with no partial symptom to notice early.
+
+Growth is therefore packed in columns, not one endless strip: `make_icons.py`
+fills a column to the budget before starting the next. When a committed atlas
+outgrows the budget, `python3 assets/make_icons.py --relayout` re-packs it
+**pixel-for-pixel** (same cells, new grid, UVs recomputed in `atlas.json`) —
+no glyph is redrawn, so nothing regresses visually.
+`assets/test_icons.py::test_fits_in_a_texture` is the guard and asserts on the
+committed `atlas_px`. Raise `ATLAS_MAX_PX` only after checking the real
+`GL_MAX_TEXTURE_SIZE` of every target, WebGL2 included.
+
+## Desktop/web parity — the atlas is baked into the web bundle
+
+The two targets load the **same bytes by different mechanisms**, and this is
+the trap:
+
+- **Desktop** reads `assets/icons/` off disk at startup. Regenerate the atlas
+  and the next launch picks it up — free, immediate, no build step.
+- **Web** has no filesystem. `host/CMakeLists.txt` `--preload-file`s
+  `assets/icons/atlas.json`, `atlas_dark.png` and `atlas_light.png` (alongside
+  the fonts and logos) and Emscripten bakes them into `Chudware.data` at
+  **LINK** time. The bundle is a derived artifact: it freezes whatever the
+  assets were when it was linked.
+
+**Therefore any atlas regeneration requires relinking the web bundle
+(`./build.sh wasm`) and redeploying it.** An atlas change that is not followed
+by a relink reaches desktop for free and web *never* — and both targets keep
+working, so nothing fails, nothing warns, and the divergence is invisible.
+Note also that a preloaded asset is not a tracked build input, so editing one
+does not by itself make ninja relink.
+
+This is not hypothetical. Commit **69690e57 (2026-08-17)** replaced every
+ribbon tool icon with an engine-rendered 3D tile. Desktop showed the new tiles
+the same day; production served a bundle linked **2026-08-07** until
+2026-08-22 — **ten days of stale icons**, found only by hand-scanning
+`Chudware.data` for PNG bytes. Nothing else could have caught it: no CI job
+built WASM, and no check compared a bundle against its sources.
+
+`scripts/check_web_parity.py` is now that check. It reads **Emscripten's own
+file table** out of `Chudware.js` and compares the bytes actually embedded in
+the pack against the files in the repo, so it measures the shipped artifact
+rather than trusting a build log. It verifies a staged directory (`--bundle`)
+or what a server really serves (`--url`, via HTTP Range requests for just the
+bytes it needs). Its expected-asset list is derived from the `--preload-file`
+flags in `host/CMakeLists.txt`, so **new preloaded assets join the gate
+automatically** — nothing to remember when adding one. Exit 0 = parity,
+1 = divergence, 2 = cannot evaluate (no bundle to inspect: an explicit SKIP,
+never a silent pass).
+
+Corollary for this contract: an atlas relayout (above) rewrites both PNGs and
+`atlas.json`, so it is an atlas regeneration like any other and carries the
+same relink obligation.

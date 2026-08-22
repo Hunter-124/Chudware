@@ -356,6 +356,23 @@ build_wasm() {
         done
         echo "[build] precompressed bundle (.br/.gz) for gateway content-encoding"
     fi
+    # Parity gate. The web bundle bakes assets/ in at LINK time (the --preload-file flags
+    # in host/CMakeLists.txt), so a bundle is a DERIVED artifact that goes stale the moment
+    # any preloaded asset changes — and it goes stale silently, because the desktop build
+    # reads assets/ off disk at startup and therefore never notices. That is not
+    # hypothetical: 69690e57 (2026-08-17) re-rendered every ribbon tool icon, the served
+    # bundle was still the one linked 2026-08-07, and ten days of stale icons went
+    # unnoticed because nothing compared a bundle to its sources (it was finally caught by
+    # hand-scanning Chudware.data for PNG bytes). This runs against the directory we just
+    # staged and FAILS the build, so nobody walks away from `./build.sh wasm` believing
+    # they shipped current assets when they did not.
+    local parity_rc=0
+    python3 "$ROOT/scripts/check_web_parity.py" --bundle "$stage" || parity_rc=$?
+    if [ "$parity_rc" -ne 0 ]; then
+        echo "[build] ERROR: web parity gate rejected the staged bundle (exit $parity_rc; 1=stale asset, 2=gate could not evaluate)"
+        echo "[build]        $stage is NOT deployable — fix the divergence reported above, then re-run ./build.sh wasm"
+        return 1
+    fi
     echo "[build] WASM bundle ready: $stage  (serve with: python3 host/wasm/coop_server.py)"
 }
 

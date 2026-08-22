@@ -376,6 +376,38 @@ static int ribbon_rowsPerCol() {
     return n < 1 ? 1 : n;
 }
 
+// Rows this particular group should stack into, given the height budget.
+//
+// A group of exactly TWO small rows lays out as a horizontal PAIR (one row, two columns)
+// rather than a two-high stack. A two-high stack in a three-row zone leaves a single empty
+// cell, which reads as a button that failed to load rather than as a deliberate short group;
+// side by side reads as intentional and costs only the narrower label's width.
+//
+// Three stays vertical on purpose: three rows fill the zone exactly, and a horizontal triple
+// is wide enough to push its neighbours into the overflow chevron on a narrow window. This is
+// the tight ribbon idiom and the reason the zone is three rows tall in the first place.
+static int ribbon_rowsForGroup(int nRows, int rowsPerCol) {
+    if (nRows == 2) return 1;
+    return rowsPerCol;
+}
+
+// A one-row-tall stack is centred in the content zone instead of top-aligned. Top alignment
+// exists so a partially-filled column shares its top edge with the full stacks beside it, and
+// that is right for a 2-of-3 column -- but a single row pinned to the top of a three-row zone
+// just looks like it fell upwards. Only the one-row case is re-aligned; taller partial columns
+// keep the shared top edge.
+static float ribbon_smStackY(float contentY, int maxRows) {
+    if (maxRows != 1) return contentY;
+    float rowH = snap(kSmRowH * ui::uiScale);
+    return snap(contentY + (ribbon_contentH() - rowH) * 0.5f);
+}
+
+static int ribbon_maxColRows(const std::vector<SmColumn>& cols) {
+    int m = 0;
+    for (const auto& c : cols) m = ImMax(m, c.count);
+    return m;
+}
+
 // Group descriptor built each frame for the active tab
 struct RibbonGroup {
     const char*                        label;
@@ -616,7 +648,8 @@ static float ribbon_smZoneW(const RibbonGroup& grp,
     for (const auto* cmd : grp.smCmds)
         widths.push_back(ribbon_smBtnW(cmd->label));
     if (widths.empty()) return 0.0f;
-    auto cols = ribbon_packColumns(widths, ribbon_rowsPerCol());
+    auto cols = ribbon_packColumns(
+        widths, ribbon_rowsForGroup((int)widths.size(), ribbon_rowsPerCol()));
     return ribbon_columnsTotalW(cols);
 }
 
@@ -2193,12 +2226,15 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 if (!grp.bigCmds.empty()) bx += 2.0f * s;  // mid-gap between big and small zones
                 std::vector<float> widths;
                 for (const auto* cmd : grp.smCmds) widths.push_back(ribbon_smBtnW(cmd->label));
-                auto cols = ribbon_packColumns(widths, rowsPerCol);
+                auto cols = ribbon_packColumns(
+                    widths, ribbon_rowsForGroup((int)widths.size(), rowsPerCol));
+                const float stackY = ribbon_smStackY(contentY, ribbon_maxColRows(cols));
                 float sx = bx;
                 for (const auto& col : cols) {
-                    // Top-align a partially-filled small column (e.g. Curves' lone Split) so it
-                    // shares the same top edge as full 3-row stacks in neighboring groups.
-                    float sy = contentY;
+                    // Top-align a partially-filled small column (e.g. Reference's 2-of-3) so it
+                    // shares the same top edge as full 3-row stacks in neighboring groups;
+                    // ribbon_smStackY re-centres only the one-row-tall horizontal-pair case.
+                    float sy = stackY;
                     for (int r = 0; r < col.count; ++r) {
                         const auto* cmd = grp.smCmds[col.first + r];
                         ImGui::SetCursorPos(ImVec2(sx, sy));
@@ -2226,11 +2262,13 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                     widths.push_back(ribbon_smBtnW(rows[i]->label));
                 }
             }
-            auto cols = ribbon_packColumns(widths, rowsPerCol);
+            auto cols = ribbon_packColumns(
+                widths, ribbon_rowsForGroup((int)widths.size(), rowsPerCol));
+            const float stackY = ribbon_smStackY(contentY, ribbon_maxColRows(cols));
             float sx = startX;
             for (const auto& col : cols) {
                 // Top-align partial columns (same rule as the big-layout small zone).
-                float sy = contentY;
+                float sy = stackY;
                 for (int r = 0; r < col.count; ++r) {
                     int idx = col.first + r;
                     const auto* cmd = rows[idx];

@@ -189,10 +189,23 @@ Production is **continuous**: it tracks canonical `master`, not tags.
   `livingroom-pc` self-hosted Linux runner, and invoke
   `/home/liveuser/Repositories/CAD/Webservice/deploy/update.sh staging`.
 - **Production:** `.github/workflows/deploy-prod.yml` reacts to a successful
-  `linux-gate` completion on canonical `master` and promotes only when
-  `native-build` is green **for the same commit sha** — a green gate alone is
-  not a green build. It runs on the single `cc-linux-livingroom` runner as
-  `liveuser` and invokes:
+  `linux-gate` completion on canonical `master`. `linux-gate` is the entire
+  production gate, and deliberately so: production *is* Linux plus a WASM
+  bundle, and `scripts/gate.sh --strict` builds and exercises exactly that —
+  core, host, the Emscripten relink, `ctest`, the hostd smoke, and the web
+  parity probe that compares the linked bundle's baked assets against the repo.
+
+  `native-build` is **read and reported, never blocking**. It compiles macOS
+  arm64, macOS x86_64 and Windows and only concludes success when all four legs
+  pass, and two of those legs live on laptops. Gating production on it would
+  mean master stops reaching customers whenever someone's MacBook is asleep —
+  silently, behind a green tree, which is precisely how production sat fifteen
+  days stale in the first place. Swapping one silent-staleness mechanism for
+  another is not a safety gate. A broken macOS compile cannot reach a
+  Linux + WASM deployment; `native-build` still runs on every push and still
+  goes red where developers see it.
+
+  It runs on the single `cc-linux-livingroom` runner as `liveuser` and invokes:
 
   ```
   CHUDWARE_DEPLOY_HEALTH_BASE_URL=http://127.0.0.1:8300 \

@@ -13,10 +13,10 @@
 # deployment and that supersedes the tag gate. The tradeoff is real and is
 # accepted deliberately: a bad master commit reaches customers in one build
 # cycle instead of waiting for a human to cut a tag. What buys that back is the
-# AND-gate below (two independent CI workflows must both be green for the exact
-# same commit), the post-deploy verification step, and the automatic rollback --
-# which is why Webservice/deploy/rollback.sh and retained releases had to exist
-# before this file could.
+# strict gate below (linux-gate must be green for this exact commit), the
+# post-deploy verification step, and the automatic rollback -- which is why
+# Webservice/deploy/rollback.sh and retained releases had to exist before this
+# file could.
 #
 # No v* tag is created anywhere in here. release.yml triggers on `push: tags:
 # 'v*'` and builds desktop installers; a tag from this pipeline would spuriously
@@ -28,9 +28,11 @@
 name: deploy-prod
 
 on:
-  # Triggered by BOTH gates, not just linux-gate. See "the AND-gate" below.
+  # linux-gate only. native-build is reported but never blocks -- see "THE GATE"
+  # in the preflight step for why a macOS/Windows compile matrix must not be able
+  # to veto a Linux + WASM release.
   workflow_run:
-    workflows: [linux-gate, native-build]
+    workflows: [linux-gate]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -163,38 +165,37 @@ jobs:
           set -euo pipefail
 
           # ---------------------------------------------------------------
-          # THE AND-GATE, part two: promote only when linux-gate AND
-          # native-build are both green for the SAME head sha.
+          # THE GATE: linux-gate, for this exact head sha.
           #
-          # linux-gate succeeding is necessary but not sufficient: native-build
-          # runs on the same master push and fails independently, so a tree can
-          # be linux-green and Windows-red at the same instant. Deploying on one
-          # of two gates is deploying on a half-green tree.
+          # linux-gate is the whole production-readiness signal, because
+          # production IS Linux plus a WASM bundle and scripts/gate.sh --strict
+          # builds and exercises exactly that: core, host, the Emscripten
+          # relink, ctest, the hostd smoke and the web parity probe that
+          # compares the linked bundle's baked assets against the repo.
           #
-          # Chosen design: trigger on BOTH workflows completing and let whichever
-          # fires SECOND do the deploy. Each run asks the API for the state of
-          # both gates at this exact head sha; the first event finds its sibling
-          # still pending and skips cleanly, the second finds both green and
-          # deploys. It is fully event-driven and symmetric.
+          # native-build is deliberately NOT part of this gate, and that is a
+          # reversal of this file's first design. It compiles macOS arm64,
+          # macOS x86_64 and Windows, and only concludes success when ALL FOUR
+          # legs pass. Two of those legs live on laptops. Requiring it would
+          # mean production stops tracking master whenever someone's MacBook is
+          # asleep -- silently, with a green tree, exactly the way production
+          # sat fifteen days stale behind green CI and nobody noticed. Trading
+          # one silent-staleness mechanism for another is not a safety gate, it
+          # is the same bug wearing a different hat.
           #
-          # The alternative -- trigger on linux-gate only and poll for
-          # native-build -- was rejected. native-build's Windows and macOS legs
-          # take up to 180 minutes and the macOS endpoints are frequently
-          # asleep, so "poll briefly" would mean holding a slot on the
-          # PRODUCTION host, doing nothing, for hours, and still timing out into
-          # a false red on the common case. An event costs nothing to wait for.
+          # Nothing is lost by dropping it: a broken macOS compile cannot reach
+          # a Linux + WASM deployment, and native-build still runs on every
+          # push and still goes red where developers see it. Its state is read
+          # and reported below so the run summary records the whole tree, it
+          # just does not veto a release it has no bearing on.
           #
-          # Double-fire is harmless: two events that conclude within the same
-          # instant both see two greens, and `concurrency: deploy-prod` with
-          # cancel-in-progress false serialises them, so the second run finds
+          # Double-fire is harmless: `concurrency: deploy-prod` with
+          # cancel-in-progress false serialises runs, and a second run finds
           # this commit already recorded as deployed and skips below.
           #
-          # Honest limitation: if native-build can never conclude success -- an
-          # offline macOS endpoint queues until GitHub's 24h timeout and the run
-          # concludes failure -- nothing deploys, by design. The escape hatch is
-          # a workflow_dispatch with force=true, which overrides this gate, the
+          # workflow_dispatch with force=true still overrides this gate, the
           # drift guard and the already-deployed check, and says so loudly in
-          # the log and the run summary.
+          # both the log and the run summary.
           # ---------------------------------------------------------------
 
           state_dir="${HOME}/.local/state/chudware-deploy-prod"
@@ -262,17 +263,24 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           # Accumulated so the run summary states what was overridden rather
-          # than repeating the unconditional "both gates are green" line, which
+          # than repeating the unconditional "the gate is green" line, which
           # under --force would be a false record of why production changed.
           override=""
-          if [ "${linux_gate}" != success ] || [ "${native_build}" != success ]; then
+          if [ "${linux_gate}" != success ]; then
             if [ "${FORCE_DEPLOY}" = true ]; then
-              echo "::warning title=Gate override::forced deploy of ${target} with linux-gate=${linux_gate} and native-build=${native_build}. This commit is NOT fully gated."
-              override="${override} half-green tree (linux-gate=${linux_gate}, native-build=${native_build});"
+              echo "::warning title=Gate override::forced deploy of ${target} with linux-gate=${linux_gate}. This commit is NOT gated."
+              override="${override} ungated tree (linux-gate=${linux_gate});"
             else
-              emit false "SKIP: not deploying ${target} on a half-green tree (linux-gate=${linux_gate}, native-build=${native_build}). Whichever gate concludes last re-triggers this workflow."
+              emit false "SKIP: not deploying ${target}, linux-gate=${linux_gate}. A later green run of linux-gate re-triggers this workflow."
               exit 0
             fi
+          fi
+
+          # native-build is REPORTED, never blocking. See the rationale block
+          # above: it is a cross-platform developer signal, not a statement
+          # about whether this Linux + WASM release is safe to ship.
+          if [ "${native_build}" != success ]; then
+            echo "::notice title=native-build not green::native-build=${native_build} for ${target}. Not blocking: production runs Linux and WASM, both covered by linux-gate."
           fi
 
           # ---------------------------------------------------------------

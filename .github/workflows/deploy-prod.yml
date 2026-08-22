@@ -145,20 +145,20 @@ jobs:
             exit 1
           fi
 
-          for path in "${CANONICAL}/Webservice/deploy/update.sh" \
-                      "${CANONICAL}/Webservice/deploy/rollback.sh" \
-                      "${CANONICAL}/scripts/check_web_parity.py"; do
-            test -r "${path}" || {
-              echo "::error title=Canonical checkout incomplete::${path} is missing or unreadable"
-              exit 1
-            }
-          done
+          # The deploy tooling is NOT asserted here. It cannot be: update.sh,
+          # rollback.sh and the retention flag arrive in the canonical checkout
+          # only when something pulls, and the only thing that pulls is a
+          # deploy. Asserting their presence before the sync deadlocks the very
+          # first run -- the tooling is missing, so the deploy aborts, so the
+          # tooling stays missing, forever. The sync step below fast-forwards
+          # the checkout to the gated commit and asserts the tooling there,
+          # where the assert can actually be satisfied.
           for tool in git gh python3; do
             command -v "${tool}" >/dev/null 2>&1 || {
               echo "::error::runner ${RUNNER_NAME:-unknown} is missing ${tool}"; exit 1; }
           done
 
-      - name: Confirm both gates are green for this commit and that master has not advanced
+      - name: Confirm the gate is green for this commit and that master has not advanced
         id: preflight
         shell: bash
         run: |
@@ -327,6 +327,77 @@ jobs:
           else
             emit true "DEPLOY: ${target} is master's tip and both gates are green"
           fi
+
+      - name: Sync the canonical checkout to the gated commit
+        if: steps.preflight.outputs.proceed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # WHY THIS STEP EXISTS.
+          #
+          # Every script this workflow runs -- update.sh, install_webd.sh,
+          # rollback.sh, check_web_parity.py -- is read off the canonical
+          # checkout on this host, not off an actions/checkout. update.sh does
+          # pull master itself, but that pull happens INSIDE the already-running
+          # script, so the version that parses the command line is whatever was
+          # on disk beforehand. On the first continuous deploy that copy predates
+          # `--continuous`, does not ship rollback.sh, and has no release
+          # retention: the run would either reject its own flag or, worse, deploy
+          # with the old delete-the-previous-release behaviour and leave nothing
+          # to roll back to.
+          #
+          # So the checkout is fast-forwarded to the gated commit FIRST, and the
+          # tooling is asserted afterwards, against the tree that will actually
+          # run.
+          target="${{ steps.preflight.outputs.sha }}"
+          echo "syncing ${CANONICAL} to ${target}"
+          git -C "${CANONICAL}" fetch --quiet origin master
+
+          # --ff-only, never reset --hard. This is a real working tree on a box
+          # people log into; a hard reset would silently discard whatever is
+          # uncommitted there. If the fast-forward is refused, that is a human
+          # problem on the deploy host and the deploy must stop rather than
+          # paper over it.
+          if ! git -C "${CANONICAL}" merge --ff-only "${target}" 2>&1; then
+            echo "::error title=Deploy checkout will not fast-forward::${CANONICAL} cannot fast-forward to ${target}. It has diverged or has local changes. Resolve it on livingroom-pc; this deploy is not touching a tree it does not understand."
+            git -C "${CANONICAL}" status --short | head -20
+            exit 1
+          fi
+
+          head="$(git -C "${CANONICAL}" rev-parse HEAD)"
+          if [ "${head}" != "${target}" ]; then
+            echo "::error title=Deploy checkout is not at the gated commit::expected ${target}, got ${head}"
+            exit 1
+          fi
+          echo "checkout HEAD: ${head}"
+
+          # Presence is not enough -- a file can exist and still be the version
+          # that does not understand the flag it is about to be handed. Each
+          # assert names the capability, so a failure says what is stale instead
+          # of dying later inside the updater.
+          for path in "${CANONICAL}/Webservice/deploy/update.sh" \
+                      "${CANONICAL}/Webservice/deploy/rollback.sh" \
+                      "${CANONICAL}/Webservice/deploy/install_webd.sh" \
+                      "${CANONICAL}/scripts/check_web_parity.py"; do
+            test -r "${path}" || {
+              echo "::error title=Canonical checkout incomplete::${path} is missing or unreadable at ${head}"
+              exit 1
+            }
+          done
+          grep -q -- '--continuous' "${CANONICAL}/Webservice/deploy/update.sh" || {
+            echo "::error title=Updater too old::update.sh at ${head} does not support --continuous"
+            exit 1
+          }
+          grep -q 'CHUDWARE_WEBD_KEEP_RELEASES' "${CANONICAL}/Webservice/deploy/install_webd.sh" || {
+            echo "::error title=No release retention::install_webd.sh at ${head} still deletes the previous release on success, so a rollback would have no target. Refusing to deploy without a safety net."
+            exit 1
+          }
+          test -x "${CANONICAL}/Webservice/deploy/rollback.sh" || {
+            echo "::error title=rollback.sh not executable::${CANONICAL}/Webservice/deploy/rollback.sh lacks the execute bit"
+            exit 1
+          }
+          echo "deploy tooling verified at ${head}"
 
       - name: Record the pre-deploy state
         if: steps.preflight.outputs.proceed == 'true'

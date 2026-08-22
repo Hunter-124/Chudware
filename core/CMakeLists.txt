@@ -13,6 +13,7 @@ chudware_version_derive()
 # in the generated header but cannot reach project().
 project(chudware_core VERSION ${CHUDWARE_VERSION_MAJOR}.${CHUDWARE_VERSION_MINOR}.${CHUDWARE_VERSION_PATCH} LANGUAGES C CXX)  # C enabled for chudware_miniz (miniz.c); the VS generator
                                      # tolerates an implicit C, but Ninja/Make + GCC/Clang need it explicit.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # The new pure-C++ engine (libchudware). Wave 1 = the constraint solver core; later
 # waves add doc/geom (OCCT) and sim (CUDA). Built standalone here so the solver is

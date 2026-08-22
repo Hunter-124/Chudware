@@ -12,6 +12,7 @@ chudware_version_derive()
 project(CHUDWARE_Host
         VERSION ${CHUDWARE_VERSION_MAJOR}.${CHUDWARE_VERSION_MINOR}.${CHUDWARE_VERSION_PATCH}
         LANGUAGES C CXX)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # MSVC: <windows.h> defines min()/max() macros that clobber std::min, std::max and
 # std::numeric_limits<>::max. core/CMakeLists.txt:71 already suppresses this

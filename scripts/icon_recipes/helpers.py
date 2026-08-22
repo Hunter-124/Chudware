@@ -140,17 +140,41 @@ def body_sel(feature_id: str) -> dict:
 # same camera as the part — which is the whole point: it has to look like it is pointing
 # out of the model in 3-space, not stuck on the glass in front of it.
 #
-# Construction: a cylindrical shaft (circle extruded along the plane normal) plus a conical
-# head (a right triangle revolved a full turn).  Both are separate, non-merged bodies so
-# the caller can paint them with accent2().
+# Construction: a cylindrical shaft (a circle extruded along its sketch plane's normal)
+# plus a conical head (a right triangle revolved a full turn about the same axis).  Both
+# are separate, non-merged bodies so the caller can paint them with accent2().
 #
-# Plane/axis convention, as used by the existing recipes:
-#   plane.top   sketch (u,v) -> world (x,y); extrude runs along +Z.
-#   plane.front sketch (u,v) -> world (u = radius from Z axis, v = z); this is the plane a
-#               revolve about axis.z sweeps, so a triangle here becomes a cone on the axis.
+# Sketch-plane convention, confirmed against the existing recipes and by render:
+#   plane.top   = XY, normal +Z.  Sketch (u,v) -> world (x,y).
+#   plane.front = XZ, normal +Y.  Sketch (u,v) -> world (x,z).
+#   plane.right = YZ, normal +X.  Sketch (u,v) -> world (y,z).
+# An extrude therefore runs along the plane's normal, and a revolve about a datum axis
+# treats the in-plane coordinate perpendicular to that axis as the radius.
+#
+# LIMITATION, stated plainly because it shapes every caller: the engine revolves only about
+# the global datum axes, which all pass through the origin.  A cone can therefore only be
+# built centred on X, Y or Z.  Arrows are consequently available along +/-X, +/-Y and +/-Z
+# THROUGH THE ORIGIN, and a tangential arrow (one pointing along a circle's tangent, as a
+# true rotation arrowhead would) is not constructible at all — which is why arc_arrow3d
+# below flares its tip radially instead of pretending otherwise.
 # ---------------------------------------------------------------------------------------
 
 _ARROW_SEQ = [0]
+
+# axis -> (shaft sketch plane, head profile plane, datum axis, axial coord is first?).
+#
+# The last flag is the one that matters and the one that was wrong first time round: in the
+# head's sketch, WHICH of (u,v) runs along the arrow and which is the revolve radius. Get
+# it backwards and the triangle revolves into a wide flat disc instead of a cone — it still
+# builds, every step still reports ok=1, and you only notice by looking at the render.
+#   axis.z, profile on plane.front (u=x, v=z): x is the radius, z runs along  -> False
+#   axis.y, profile on plane.top   (u=x, v=y): x is the radius, y runs along  -> False
+#   axis.x, profile on plane.top   (u=x, v=y): y is the radius, x runs along  -> True
+_ARROW_AXES = {
+    "z": ("plane.top",   "plane.front", "axis.z", False),
+    "y": ("plane.front", "plane.top",   "axis.y", False),
+    "x": ("plane.right", "plane.top",   "axis.x", True),
+}
 
 
 def _arrow_tag() -> str:
@@ -160,62 +184,94 @@ def _arrow_tag() -> str:
 
 
 def arrow3d(fid_shaft: str, fid_head: str, *, base: float, length: float,
-            radius: float = 2.6, head_len: float | None = None,
-            head_radius: float | None = None, plane: str = "plane.top",
-            offset_axis: float = 0.0) -> list:
-    """A solid 3D arrow on the Z axis pointing along +Z (the extrude direction).
+            axis: str = "z", direction: int = 1,
+            radius: float = 3.0, head_len: float | None = None,
+            head_radius: float | None = None, offset_axis: float = 0.0) -> list:
+    """A solid 3D arrow lying on a global axis, pointing along it.
 
-    `base` is where the shaft starts (mm along the axis), `length` the total arrow length
-    including the head.  `fid_shaft`/`fid_head` are the persistent feature ids the engine
-    will assign to the two sketches — the caller must count features to get these right,
-    exactly like sketch_with_id elsewhere in this package.
+    `axis` is "x", "y" or "z"; `direction` is +1 or -1.  `base` is where the tail sits (mm
+    along that axis, signed world coordinate) and `length` the total arrow length including
+    the head, measured in the pointing direction.  `offset_axis` slides the whole arrow
+    along the axis without resizing it — how a caller nudges an arrow clear of the body it
+    grows out of.
 
-    `offset_axis` shifts the whole arrow along the axis without changing its length, which
-    is how a caller nudges the arrow clear of the body it grows out of.
+    Adds exactly 4 features (shaft sketch, shaft extrude, head sketch, head revolve) and
+    exactly 2 bodies.  `fid_shaft`/`fid_head` are the persistent feature ids the engine will
+    assign to the two SKETCHES; scripts/check_icon_recipes.py resolves them statically, so
+    run it rather than counting by hand.
     """
-    hl = head_len if head_len is not None else max(6.0, length * 0.40)
-    hr = head_radius if head_radius is not None else radius * 2.35
-    b = base + offset_axis
+    if axis not in _ARROW_AXES:
+        raise ValueError(f"arrow3d: axis must be x, y or z (got {axis!r})")
+    if direction not in (1, -1):
+        raise ValueError(f"arrow3d: direction must be +1 or -1 (got {direction!r})")
+    shaft_plane, head_plane, datum_axis, axial_first = _ARROW_AXES[axis]
+
+    hl = head_len if head_len is not None else max(7.0, length * 0.42)
+    hr = head_radius if head_radius is not None else radius * 2.6
     shaft_len = max(1.0, length - hl)
-    tip = b + length
-    neck = b + shaft_len
+    tail = base + offset_axis
+    neck = tail + direction * shaft_len       # where the shaft stops and the cone starts
+    tip = tail + direction * length
+
+    # The shaft sketch sits at whichever end is lower along the axis, because an extrude
+    # only runs in the +normal direction: for a -direction arrow the sketch goes at the
+    # NECK and grows back up to the tail.
+    shaft_origin = tail if direction > 0 else neck
+
+    def head_pt(along: float, radial: float) -> list:
+        """Head-profile point in its sketch's own (u,v), given axial and radial extent."""
+        return [along, radial] if axial_first else [radial, along]
+
     tag = _arrow_tag()
     return [
-        # Shaft: a circle on the base plane pushed along the normal.
         *sketch_with_id([{"type": "circle", "center": [0, 0], "radius": radius,
                           "id": tag + "s"}],
-                        plane=plane, name="ArrShaftSk" + tag, fid=fid_shaft, offset=b),
+                        plane=shaft_plane, name="ArrShaftSk" + tag, fid=fid_shaft,
+                        offset=shaft_origin),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "ArrShaft" + tag,
             "params": {"mode": "boss", "depth": dim(shaft_len)}, "merge": False,
             "refs": {"profile": [region(fid_shaft, 0, 0)]}}},
-        # Head: right triangle (axis edge -> base radius -> apex) revolved about Z.
+        # Head: a right triangle with one edge ON the revolve axis (radius 0), so the full
+        # turn closes it into a cone rather than a tube.
         *sketch_with_id([
-            {"type": "line", "p1": [0, neck], "p2": [hr, neck], "id": tag + "h1"},
-            {"type": "line", "p1": [hr, neck], "p2": [0, tip], "id": tag + "h2"},
-            {"type": "line", "p1": [0, tip], "p2": [0, neck], "id": tag + "h3"},
-        ], plane="plane.front", name="ArrHeadSk" + tag, fid=fid_head),
+            {"type": "line", "p1": head_pt(neck, 0), "p2": head_pt(neck, hr),
+             "id": tag + "h1"},
+            {"type": "line", "p1": head_pt(neck, hr), "p2": head_pt(tip, 0),
+             "id": tag + "h2"},
+            {"type": "line", "p1": head_pt(tip, 0), "p2": head_pt(neck, 0),
+             "id": tag + "h3"},
+        ], plane=head_plane, name="ArrHeadSk" + tag, fid=fid_head),
         {"op": "add_feature", "feature": {
             "type": "revolve", "name": "ArrHead" + tag,
             "params": {"mode": "boss", "angle": dim(360)}, "merge": False,
-            "refs": {"profile": [region(fid_head, hr * 0.33, neck + (tip - neck) * 0.25)],
-                     "axis": datum("axis.z")}}},
+            "refs": {"profile": [region(fid_head,
+                                        *head_pt(neck + direction * hl * 0.3, hr * 0.3))],
+                     "axis": datum(datum_axis)}}},
     ]
 
 
 def arc_arrow3d(fid_tube: str, fid_head: str, *, radius: float, height: float,
-                tube_radius: float = 2.2, sweep: float = 250.0,
-                head_len: float = 11.0, head_radius: float = 5.2) -> list:
-    """A curved 3D arrow that wraps around the Z axis — the rotational cue for revolve,
-    circular patterns and anything else whose action is a turn rather than a push.
+                tube_radius: float = 3.4, sweep: float = 175.0,
+                head_len: float = 16.0, head_radius: float = 10.0,
+                head_sweep: float = 46.0) -> list:
+    """A curved 3D arrow wrapping the Z axis — the rotational cue for revolve, circular
+    patterns, helices and anything else whose action is a turn rather than a push.
 
-    The tube is a small circle revolved `sweep` degrees about axis.z at `radius` from it,
-    sitting at `height`.  The head is a cone revolved about the same axis, so it lands
-    tangent to the tube's leading end and reads as the arrowhead of the turn.
+    The tube is a circle at (`radius`, `height`) in the front plane swept `sweep` degrees
+    about axis.z.  The head is a wedge at the arc's leading end, swept `head_sweep` degrees.
+
+    On the head: a real arrowhead would taper along the SWEEP, and that cannot be built
+    here.  A revolve has a constant cross-section by definition, and the engine only
+    revolves about the global datum axes, so there is no way to stand a cone up tangent to
+    the arc.  What this builds instead is a short wedge that flares RADIALLY well proud of
+    the tube — which is the convention low-resolution CAD icons use for a rotation arrow,
+    and which does survive the downsample.  The defaults were picked by rendering three
+    variants at 32px and taking the one that still read as a turn; a thinner tube or a
+    fuller sweep closes the arc into a plain ring and loses the direction entirely.
     """
     tag = _arrow_tag()
     return [
-        # Tube: circle in the front plane at (radius, height), swept partway round Z.
         *sketch_with_id([{"type": "circle", "center": [radius, height],
                           "radius": tube_radius, "id": tag + "t"}],
                         plane="plane.front", name="ArcTubeSk" + tag, fid=fid_tube),
@@ -224,18 +280,19 @@ def arc_arrow3d(fid_tube: str, fid_head: str, *, radius: float, height: float,
             "params": {"mode": "boss", "angle": dim(sweep)}, "merge": False,
             "refs": {"profile": [region(fid_tube, radius, height)],
                      "axis": datum("axis.z")}}},
-        # Head: a cone pointing along +Z, revolved about Z then left at the tube radius.
+        # Head: a radially-flared wedge sharing the tube's start angle, so the arc reads as
+        # running from its far end round to this tip.
         *sketch_with_id([
-            {"type": "line", "p1": [radius - head_radius, height], "p2": [radius + head_radius, height],
-             "id": tag + "c1"},
-            {"type": "line", "p1": [radius + head_radius, height], "p2": [radius, height + head_len],
-             "id": tag + "c2"},
-            {"type": "line", "p1": [radius, height + head_len], "p2": [radius - head_radius, height],
-             "id": tag + "c3"},
+            {"type": "line", "p1": [radius - head_radius, height],
+             "p2": [radius + head_radius, height], "id": tag + "c1"},
+            {"type": "line", "p1": [radius + head_radius, height],
+             "p2": [radius, height + head_len], "id": tag + "c2"},
+            {"type": "line", "p1": [radius, height + head_len],
+             "p2": [radius - head_radius, height], "id": tag + "c3"},
         ], plane="plane.front", name="ArcHeadSk" + tag, fid=fid_head),
         {"op": "add_feature", "feature": {
             "type": "revolve", "name": "ArcHead" + tag,
-            "params": {"mode": "boss", "angle": dim(26)}, "merge": False,
+            "params": {"mode": "boss", "angle": dim(head_sweep)}, "merge": False,
             "refs": {"profile": [region(fid_head, radius, height + head_len * 0.3)],
                      "axis": datum("axis.z")}}},
     ]

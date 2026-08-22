@@ -324,3 +324,56 @@ never a silent pass).
 Corollary for this contract: an atlas relayout (above) rewrites both PNGs and
 `atlas.json`, so it is an atlas regeneration like any other and carries the
 same relink obligation.
+
+## 2026-08-22 append — two-role accent (PRIMARY / SECONDARY)
+
+The single teal accent is retired. Every icon surface now speaks a two-role
+vocabulary, and the roles are semantic, not decorative:
+
+- **PRIMARY — `#F28216` orange, `(0.949, 0.510, 0.086)`.** *What the operation
+  produced.* The new boss, the swept solid, the filleted edge, the drilled hole.
+  One tile has exactly one primary subject; if two things are orange, the tile is
+  not saying anything.
+- **SECONDARY — `#0078D7` blue, `(0.000, 0.471, 0.843)`.** *The direction or
+  annotation cue.* Extrude/sweep/pattern arrows, mirror planes, rotation axes.
+  Never the result. The split is what lets a 32 px tile be read at a glance:
+  orange answers "what do I get", blue answers "which way".
+
+Both live in `scripts/icon_recipes/helpers.py` as `PRIMARY_RGB` / `SECONDARY_RGB`,
+applied by the `accent()` and `accent2()` recipe steps. `ACCENT_RGB` remains as an
+alias of `PRIMARY_RGB` so pre-existing recipes keep compiling. The line-art palette
+in `assets/make_icons.py` (`DARK`/`LIGHT`) carries the same two roles, with the
+light sheet using a deepened `#C25E05` — `#F28216` measures only 2.4:1 against
+`#F3F5F7`, which a 2 px hairline cannot survive at @20.
+
+### `atlas.json` gains `accent_tinted` + `accent_ref`
+
+Engine-rendered tiles have the accent **baked into their pixels**, so a user-chosen
+accent cannot reach them by tinting at draw time the way line-art SDF glyphs are
+tinted. `scripts/icon_pipeline.py --render` therefore records what it baked:
+
+```json
+"accent_tinted": ["extrude_boss", "..."],
+"accent_ref": {"primary": [0.949, 0.51, 0.086],
+               "secondary": [0.0, 0.471, 0.843]}
+```
+
+`accent_tinted` is derived from the recipe steps, not a hand-kept list: a tile is in
+it iff its recipe calls `accent()`/`accent2()`, so one that stops using them drops
+out on the next render. `accent_ref` is the hue pair those tiles were baked WITH.
+Everything not listed keeps the color it is *depicting* — a brass appearance swatch
+or a CAM toolpath tile must never rotate.
+`host/src/ui/icons.cpp::recolorIconAtlas()` maps those reference hues to the user's
+colors across those cells only, always recomputing from a pristine copy of the
+decoded atlas so repeated recolors never compound. `ui::setAccentColors()`
+(`host/src/ui_theme.cpp`) is the single entry point: it writes the accent/accent2
+palette families and calls the retint, and the chosen pair persists as
+`appearance.accent.primary` / `appearance.accent.secondary`.
+
+**Both keys are pipeline-owned and load-bearing.** `assets/make_icons.py` rewrites
+`atlas.json` wholesale, so it carries them forward explicitly via
+`PIPELINE_OWNED_ATLAS_KEYS` in both the full regen and `--relayout`. Losing them
+does not fail, warn or log: `recolorIconAtlas` finds no cells, returns, and the
+user's accent silently stops reaching the 3D tiles — the same shape as the
+`raster_only` bug that made icons "break every rebuild". A new pipeline-owned key
+must be added to that tuple in the same commit that starts writing it.

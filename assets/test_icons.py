@@ -10,6 +10,7 @@ Checks:
   4. atlas.json layout matches what is in both PNGs (consistency check)
   5. The atlas fits inside the smallest MAX_TEXTURE_SIZE we target
   6. Regeneration into a temp dir is byte-identical to original (determinism)
+  7. The accent-retint metadata the C++ loader recolors from is well-formed
 """
 from __future__ import annotations
 
@@ -203,6 +204,78 @@ def test_ribbon_icon_coverage():
           f"({len(aliases)} via alias table)")
 
 
+def test_accent_retint_contract():
+    """DURABLE GUARD: the atlas.json accent metadata that ui::recolorIconAtlas() (host/src/ui/
+    icons.cpp) reads to retint the baked engine-rendered tiles to the user's accent colors.
+
+    Both keys are optional on the C++ side — an atlas predating them just cannot be retinted —
+    so this only fires once the pipeline has written them. From then on the loader indexes cells
+    by these names and classifies texels against these reference colors, and every part of that
+    shape has to hold:
+
+      * a name with no @32/@20 cell resolves to no rect at all, so the tile silently keeps the
+        shipped orange while its neighbours change — the worst kind of failure, a half-retinted
+        ribbon that looks like a rendering bug;
+      * accent_tinted must stay inside raster_only, because a tile that took the SDF path is
+        drawn as a tinted silhouette and has no accent texels to rotate;
+      * >= 90 degrees between the two reference hues is what makes the loader's classifier
+        (nearest reference by circular hue distance) sound. Two similar references would still
+        render perfectly here and silently start assigning primary texels to the secondary role
+        in the GUI. This is the only place that assumption can be caught.
+    """
+    import colorsys
+
+    data = load_json()
+    if "accent_tinted" not in data:
+        print("  SKIP accent_retint_contract: atlas.json has no accent_tinted "
+              "(pre-retint atlas — the loader disables the recolor)")
+        return
+
+    tinted = data["accent_tinted"]
+    assert isinstance(tinted, list) and tinted, "accent_tinted must be a non-empty list"
+    cells = data["cell"]
+    raster_only = set(data.get("raster_only", []))
+    for name in tinted:
+        assert isinstance(name, str), f"accent_tinted entry is not a string: {name!r}"
+        for sz in CELL_SIZES:
+            assert f"{name}@{sz}" in cells, (
+                f"accent_tinted names '{name}' but atlas.json has no {name}@{sz} cell — "
+                f"recolorIconAtlas() would skip it and the tile would keep the baked accent."
+            )
+        assert name in raster_only, (
+            f"accent_tinted names '{name}' but it is not raster_only — an SDF-derived glyph "
+            f"carries no accent texels to retint."
+        )
+
+    assert "accent_ref" in data, (
+        "atlas.json has accent_tinted but no accent_ref — the loader needs the reference "
+        "colors the tiles were baked with and disables the whole recolor without them."
+    )
+    ref = data["accent_ref"]
+    hue = {}
+    for role in ("primary", "secondary"):
+        rgb = ref.get(role)
+        assert isinstance(rgb, list) and len(rgb) == 3, (
+            f"accent_ref.{role} must be a 3-element RGB array, got {rgb!r}"
+        )
+        assert all(isinstance(c, (int, float)) and 0.0 <= c <= 1.0 for c in rgb), (
+            f"accent_ref.{role} must be floats in 0..1, got {rgb!r}"
+        )
+        hue[role] = colorsys.rgb_to_hsv(*rgb)[0] * 360.0
+
+    sep = abs(hue["primary"] - hue["secondary"]) % 360.0
+    sep = min(sep, 360.0 - sep)
+    assert sep >= 90.0, (
+        f"accent_ref hues are only {sep:.0f} deg apart (primary {hue['primary']:.0f}, "
+        f"secondary {hue['secondary']:.0f}). recolorIconAtlas() tells the two roles apart by "
+        f"nearest hue, so references this close would misclassify texels and swap the roles on "
+        f"some tiles. Pick reference colors further apart in "
+        f"scripts/icon_recipes/helpers.py."
+    )
+    print(f"  PASS accent_retint_contract: {len(tinted)} accent-tinted tiles, "
+          f"reference hues {sep:.0f} deg apart")
+
+
 def main():
     print("=== test_icons ===")
     print(f"Icon dir: {ICON_DIR}")
@@ -216,6 +289,7 @@ def main():
     test_same_dimensions()
     test_layout_consistency()
     test_fits_in_a_texture()
+    test_accent_retint_contract()
     test_determinism()
 
     print("=== ALL TESTS PASSED ===")

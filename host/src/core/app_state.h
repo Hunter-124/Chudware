@@ -215,6 +215,16 @@ struct Settings {
     // int, not ui::TesseractAnim, so core/ stays free of the UI header; the UI clamps it on
     // read via ui::tesseractAnimFromInt. Serialized "appearance.brand_anim" (omitted when 0).
     int brandAnim = 0;
+
+    // User accent pair (Settings → Appearance). PRIMARY is the color a modelling operation's
+    // RESULT is drawn in — including the geometry baked into the 3D ribbon icon tiles; SECONDARY
+    // is the direction cue those tiles' arrows use. Mirrored into ui::setAccentColors, which
+    // writes the palette AND retints the baked atlas so chrome and ribbon never disagree. Plain
+    // float[3] (not an ImVec4) so core/ carries no ImGui type. Serialized
+    // "appearance.accent.primary" / "appearance.accent.secondary" as 3-element arrays, omitted
+    // when they equal the defaults below (== ui::kDefaultAccentPrimary/Secondary).
+    float accentPrimary[3]   = {0.949f, 0.510f, 0.086f};   // #F28216 orange
+    float accentSecondary[3] = {0.000f, 0.471f, 0.843f};   // #0078D7 blue
 };
 
 std::string appdataDir();

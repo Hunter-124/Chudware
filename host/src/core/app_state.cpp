@@ -663,6 +663,26 @@ void loadSettings(Settings& s) {
             // older build) falls back to the default 8-cell.
             const int ba = app.is_object() ? app.value("brand_anim", 0) : 0;
             s.brandAnim = (ba >= 0 && ba <= 3) ? ba : 0;
+            // User accent pair ("appearance.accent.primary"/".secondary", 3-element arrays).
+            // Absent or malformed (wrong length / non-numeric) leaves the Settings default in
+            // place, so a hand-edited config can never paint the whole UI black.
+            {
+                auto ac = app.is_object() ? app.value("accent", nlohmann::json::object())
+                                          : nlohmann::json::object();
+                auto rgb = [&ac](const char* key, float dst[3]) {
+                    if (!ac.is_object()) return;
+                    auto it = ac.find(key);
+                    if (it == ac.end() || !it->is_array() || it->size() != 3) return;
+                    float v[3];
+                    for (size_t i = 0; i < 3; ++i) {
+                        if (!(*it)[i].is_number()) return;
+                        v[i] = std::clamp((*it)[i].get<float>(), 0.0f, 1.0f);
+                    }
+                    dst[0] = v[0]; dst[1] = v[1]; dst[2] = v[2];
+                };
+                rgb("primary",   s.accentPrimary);
+                rgb("secondary", s.accentSecondary);
+            }
         }
         // T-G21: pinned-column vertical-collapse state.
         s.fmCollapsed = j.value("fm_collapsed", false);
@@ -1047,11 +1067,24 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
             if (g.dynamicColor      != def.dynamicColor)      go["dynamic_color"] = (g.dynamicColor == 1);
             if (!go.empty()) glassJ[kGlassGroupKey[gi]] = go;
         }
-        // "appearance" now carries two independent keys, so build the object incrementally:
-        // either may be absent, and a wholly default config still writes no block at all.
+        // "appearance" now carries several independent keys, so build the object incrementally:
+        // any may be absent, and a wholly default config still writes no block at all.
         nlohmann::json appJ = nlohmann::json::object();
         if (!glassJ.empty()) appJ["glass"] = glassJ;
         if (s.brandAnim != 0) appJ["brand_anim"] = s.brandAnim;
+        // Accent pair: same omit-when-default rule as the glass sentinels. Exact compare against
+        // the shipped defaults, not an epsilon — the picker writes whatever ColorEdit3 produced,
+        // and "Reset to defaults" copies the constants back byte-for-byte.
+        {
+            nlohmann::json accentJ = nlohmann::json::object();
+            auto emitIfMoved = [&accentJ](const char* key, const float v[3], const float def[3]) {
+                if (v[0] == def[0] && v[1] == def[1] && v[2] == def[2]) return;
+                accentJ[key] = {v[0], v[1], v[2]};
+            };
+            emitIfMoved("primary",   s.accentPrimary,   ui::kDefaultAccentPrimary);
+            emitIfMoved("secondary", s.accentSecondary, ui::kDefaultAccentSecondary);
+            if (!accentJ.empty()) appJ["accent"] = accentJ;
+        }
         if (!appJ.empty()) j["appearance"] = appJ;
     }
     // T-G21: pinned-column vertical-collapse state.

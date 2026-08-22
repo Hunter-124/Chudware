@@ -183,8 +183,49 @@ def tube(path_pts, r: float = 4.0, yaw=34, pitch=28) -> dict:
     ]}
 
 
+def gon_tile(ents, pad_r: float, depth: float, name: str, yaw=32, pitch=34) -> dict:
+    """Polygon-family tile: the accent N-gon prism standing on a thin steel disc whose
+    radius is the polygon tool's circumscribed circle.
+
+    Why the disc: a bare square prism is pixel-identical to the rect_corner slab at 32 px,
+    so poly_square read as "another rectangle" and the rest of the family read as "some
+    slab". The disc is the tool's own defining construct — the vertices bite into its rim
+    and the circular segments left between them make the facet count countable, which is
+    the only thing that separates a pentagon from an octagon at this size. It is reference
+    geometry, so it is steel, never accent.
+    """
+    return {"yaw": yaw, "pitch": pitch, "steps": [
+        *sketch_with_id([{"type": "circle", "center": [0, 0], "radius": pad_r,
+                          "id": "gd"}], plane="plane.top", name=name + "CircSk",
+                        fid="f1", offset=-2.5),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": name + "Circ",
+            "params": {"mode": "boss", "depth": dim(2.5)},
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        *sketch_with_id(ents, plane="plane.top", name=name + "Sk", fid="f3"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": name,
+            "params": {"mode": "boss", "depth": dim(depth)}, "merge": False,
+            "refs": {"profile": [region("f3", 0, 0)]}}},
+        steel("b1"), accent("b2"),
+    ]}
+
+
 # --- shared geometry ------------------------------------------------------------------
 PLATE = rect_pts(40, 28)
+
+# The "sketch" tile's drawn profile: deliberately IRREGULAR. A rectangle or a circle here
+# would collide with the shape tools that own those silhouettes; an arbitrary angular loop
+# is the one thing that reads as "a profile somebody drew" rather than "a shape tool".
+SK_PROFILE = [[-15, -9], [4, -9], [15, -1], [15, 9], [-2, 9], [-15, 1]]
+
+# rect_center's symmetry cross: a plus-shaped loop whose arms run 4 mm PAST the plate edge,
+# the way construction centrelines do, so the tile shows the centre pick and both mirror
+# axes at once instead of relying on the annotation dot alone.
+_XA, _XL = 2.5, 19.0
+CTR_CROSS = [[-_XA, -_XL], [_XA, -_XL], [_XA, -_XA], [_XL, -_XA], [_XL, _XA],
+             [_XA, _XA], [_XA, _XL], [-_XA, _XL], [-_XA, _XA], [-_XL, _XA],
+             [-_XL, -_XA], [-_XA, -_XA]]
 
 # Curved teal wall / arc-slot band (arc-spine capsule, exact arcs).
 ARC_WALL = band_ents([0, -10], 22, 20, 160, 6, "aw")
@@ -212,42 +253,69 @@ AF_LOWER = [[26, 0], [18, -2.6], [10, -4.4], [0, -5.0], [-10, -4.4], [-18, -3.0]
             [-22, -1.4], [-24, 0]]
 
 RECIPES: dict[str, dict] = {
-    # sketch: grey sketch-plane plate with a teal rectangle outline drawn on it.
-    "sketch": {"yaw": 34, "pitch": 30, "steps": [
-        box(40, 40, 2, name="Plane"),
-        *sketch_with_id(poly(rect_pts(30, 3, 0, 13.5), "ob"), plane="plane.top",
-                        name="OL1Sk", fid="f2", offset=1),
+    # sketch: a thin steel PLANE carrying one accent profile drawn on it. The old tile
+    # built the profile as four separate 3 mm outline bars, which downsampled into a dark
+    # keyline round a white square — it read as an empty plane, not as "start a sketch".
+    # One filled irregular loop on a plate that is visibly thinner than it is the whole cue.
+    "sketch": {"yaw": 32, "pitch": 34, "steps": [
+        box(44, 32, 2, name="Plane"),
+        *sketch_with_id(poly(SK_PROFILE, "sp"), plane="plane.top",
+                        name="ProfSk", fid="f2", offset=1),
         {"op": "add_feature", "feature": {
-            "type": "extrude", "name": "OL1",
-            "params": {"mode": "boss", "depth": dim(2)}, "merge": False,
-            "refs": {"profile": [region("f2", 0, 13.5)]}}},
-        *sketch_with_id(poly(rect_pts(30, 3, 0, -13.5), "oc"), plane="plane.top",
-                        name="OL2Sk", fid="f4", offset=1),
-        {"op": "add_feature", "feature": {
-            "type": "extrude", "name": "OL2",
-            "params": {"mode": "boss", "depth": dim(2)}, "merge": False,
-            "refs": {"profile": [region("f4", 0, -13.5)]}}},
-        *sketch_with_id(poly(rect_pts(3, 24, -13.5, 0), "od"), plane="plane.top",
-                        name="OL3Sk", fid="f6", offset=1),
-        {"op": "add_feature", "feature": {
-            "type": "extrude", "name": "OL3",
-            "params": {"mode": "boss", "depth": dim(2)}, "merge": False,
-            "refs": {"profile": [region("f6", -13.5, 0)]}}},
-        *sketch_with_id(poly(rect_pts(3, 24, 13.5, 0), "oe"), plane="plane.top",
-                        name="OL4Sk", fid="f8", offset=1),
-        {"op": "add_feature", "feature": {
-            "type": "extrude", "name": "OL4",
-            "params": {"mode": "boss", "depth": dim(2)}, "merge": False,
-            "refs": {"profile": [region("f8", 13.5, 0)]}}},
-        steel("b1"), accent("b2"), accent("b3"), accent("b4"), accent("b5"),
+            "type": "extrude", "name": "Prof",
+            "params": {"mode": "boss", "depth": dim(4)}, "merge": False,
+            "refs": {"profile": [region("f2", 0, 0)]}}},
+        steel("b1"), accent("b2"),
     ]},
 
     # line: a single teal bar.
     "line": prism(rect_pts(44, 6), 4, "Line", "ln", yaw=34, pitch=30),
 
-    # rectangle family: one teal plate; the annotation dots carry the pick semantics.
-    "rect_corner": prism(PLATE, 4, "Rect", "rc", yaw=34, pitch=30),
-    "rect_center": prism(PLATE, 4, "Rect", "rd", yaw=34, pitch=30),
+    # rectangle family. rect_corner and rect_center were the SAME 40x28 slab differing only
+    # by one annotation dot, which is invisible at 32 px; each now carries the geometry of
+    # its own pick instead.
+    #
+    # rect_corner: the defining corner is a raised block standing on the plate, so the
+    # corner you drag from is a physical handle on the silhouette. It is left un-merged
+    # (and painted accent alongside the plate) because the static id checker cannot model
+    # a fusion, and a b-number it cannot see is a set_appearance that silently misses.
+    "rect_corner": {"yaw": 34, "pitch": 30, "steps": [
+        *sketch_with_id(poly(rect_pts(36, 24), "rc"), plane="plane.top",
+                        name="RectSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Rect",
+            "params": {"mode": "boss", "depth": dim(4)},
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        *sketch_with_id(poly(rect_pts(11, 11, 18, -12), "rk"), plane="plane.top",
+                        name="CornSk", fid="f3"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Corner",
+            "params": {"mode": "boss", "depth": dim(10)}, "merge": False,
+            "refs": {"profile": [region("f3", 18, -12)]}}},
+        accent("b1"), accent("b2"),
+    ]},
+
+    # rect_center: a SQUARE plate (different aspect from rect_corner on its own) under a
+    # steel symmetry cross whose arms overhang both edges — centre pick plus both mirror
+    # axes. The cross is reference geometry, hence steel and not accent.
+    "rect_center": {"yaw": 34, "pitch": 30, "steps": [
+        *sketch_with_id(poly(rect_pts(30, 30), "rd"), plane="plane.top",
+                        name="RectSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Rect",
+            "params": {"mode": "boss", "depth": dim(4)},
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        *sketch_with_id(poly(CTR_CROSS, "rx"), plane="plane.top",
+                        name="CtrSk", fid="f3", offset=4),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Ctr",
+            "params": {"mode": "boss", "depth": dim(3)}, "merge": False,
+            "refs": {"profile": [region("f3", 0, 0)]}}},
+        accent("b1"), steel("b2"),
+    ]},
+
+    # the 3-point variants stay plain slabs: their three annotation dots are the whole
+    # distinction, and adding pick geometry would collide with rect_corner/rect_center.
     "rect_3pt_corner": prism(PLATE, 4, "Rect", "re", yaw=34, pitch=30),
     "rect_3pt_center": prism(PLATE, 4, "Rect", "rf", yaw=34, pitch=30),
 
@@ -281,13 +349,20 @@ RECIPES: dict[str, dict] = {
         accent("b1"), accent("b2"),
     ]},
 
-    # polygon family.
-    "polygon": prism(ngon(6, 20), 10, "Hex", "hx"),
-    "poly_triangle": prism(ngon(3, 20), 8, "Tri", "tr"),
-    "poly_square": prism(rect_pts(30, 30), 8, "Sq", "sq"),
-    "poly_pentagon": prism(ngon(5, 20), 8, "Pent", "pt"),
-    "poly_octagon": prism(ngon(8, 20), 8, "Oct", "oc"),
-    "poly_star": prism(star(5, 22, 9), 8, "Star", "st"),
+    # polygon family. Every member now stands on its circumscribed circle (see gon_tile):
+    # poly_square as a bare prism WAS the rect_corner slab, and pentagon/octagon slabs were
+    # indistinguishable from each other once downsampled.
+    "polygon": gon_tile(poly(ngon(6, 21), "hx"), 22.5, 9, "Hex"),
+    "poly_triangle": gon_tile(poly(ngon(3, 23), "tr"), 24.5, 9, "Tri"),
+    # rot=45 puts the square's vertices on the diagonals, so its sides stay axis-aligned
+    # and the four rim segments sit at the compass points where they read best.
+    "poly_square": gon_tile(poly(ngon(4, 21, rot=45), "sq"), 22.5, 9, "Sq"),
+    "poly_pentagon": gon_tile(poly(ngon(5, 21), "pt"), 22.5, 9, "Pent"),
+    "poly_octagon": gon_tile(poly(ngon(8, 21), "oc"), 22.5, 9, "Oct"),
+    # the star gets the same disc, and its points reach the rim exactly like the regular
+    # polygons' vertices do — which is what makes the star-polygon tool read as one of
+    # this family rather than as a decorative glyph.
+    "poly_star": gon_tile(poly(star(5, 23, 9.5), "st"), 24.5, 9, "Star"),
 
     # straight slot family (stadium: lines + exact semicircular caps).
     "slot": ent_prism(slot_ents([-18, 0], [18, 0], 14, "s1"), 8, "Slot"),
@@ -319,7 +394,10 @@ RECIPES: dict[str, dict] = {
     ]},
 
     # ellipse: teal elliptical boss (closed interpolated spline through the ellipse).
-    "ellipse": ent_prism([spl(ell_pts([0, 0], 24, 14, 0, 360, 20), "el")],
+    # 28x9 (a:b = 3.1) rather than the old 24x14 (1.7): at 32 px a 1.7 ratio antialiases
+    # into the same round blob as the r=20 `circle` cylinder, and the two tiles sit in the
+    # same ribbon group. It also runs flatter than ellipse_partial's 22x12 band.
+    "ellipse": ent_prism([spl(ell_pts([0, 0], 28, 9, 0, 360, 20), "el")],
                          10, "Ellipse"),
 
     # ellipse_partial: teal elliptical band -- outer + inner elliptical arc, chord-closed.
@@ -357,7 +435,9 @@ RECIPES: dict[str, dict] = {
 }
 
 ANN: dict[str, dict] = {
-    "rect_corner": {"dots": [[0.28, 0.62]]},
+    # the pick dot now lands on the raised corner block's top face; the old [0.28,0.62]
+    # was tuned against the 40x28 slab and would float off the new silhouette.
+    "rect_corner": {"dots": [[0.64, 0.57]]},
     "rect_center": {"dots": [[0.5, 0.45]]},
     "rect_3pt_corner": {"dots": [[0.28, 0.62], [0.72, 0.62], [0.72, 0.30]]},
     "rect_3pt_center": {"dots": [[0.5, 0.45], [0.72, 0.45], [0.5, 0.22]]},

@@ -85,21 +85,25 @@ _crescent_pts += [(15.0 * math.cos(math.radians(a)), 15.0 * math.sin(math.radian
 
 RECIPES: dict[str, dict] = {
 
-    # measure: a steel caliper. Grey beam + fused fixed jaw (b1); teal sliding jaw (b2)
-    # and teal slider block (b3) at 60% along the beam = the moving measuring element.
+    # measure: a steel caliper. Grey beam (b1) + grey fixed jaw (b2) at the left end;
+    # orange sliding jaw (b3) and orange slider block (b4) at 60% along the beam = the
+    # moving measuring element, which is what the tool actually reports.
     "measure": {"yaw": 35, "pitch": 26, "steps": [
         *sketch_with_id(rect(-24, -4, 24, 4, "bm"), "plane.top", "BeamSk", "f1"),
         ext("Beam", "f1", 0, 0, 7, merge=False),
-        # fixed jaw at the left end, fused into the beam body
+        # Fixed jaw at the left end. merge=False: fusing it into the beam left the engine one
+        # body short of the recipe's own numbering, so the slider was painted as b3 and a
+        # fourth body shipped in the engine default material. One body per feature instead --
+        # the two touching grey bodies still read as one jaw-and-beam.
         *sketch_with_id(rect(-24, -4, -18, 4, "fj"), "plane.top", "FixJawSk", "f3"),
-        ext("FixJaw", "f3", -21, 0, 28),
+        ext("FixJaw", "f3", -21, 0, 28, merge=False),
         # sliding jaw at 60% along the beam
         *sketch_with_id(rect(4.8, -4, 10.8, 4, "sj"), "plane.top", "SlideJawSk", "f5"),
         ext("SlideJaw", "f5", 7.8, 0, 28, merge=False),
         # slider block riding on top of the beam
         *sketch_with_id(rect(0, -7, 12, 7, "sb"), "plane.top", "SliderSk", "f7", offset=7),
         ext("Slider", "f7", 6, 0, 7, merge=False),
-        steel("b1"), accent("b2"), accent("b3"),
+        steel("b1"), steel("b2"), accent("b3"), accent("b4"),
     ]},
 
     # mass_props: teal block whose top face sits at z=0, with a small steel sphere

@@ -2159,6 +2159,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // the first frame (idempotent; re-pushed every frame in the loop below so
   // runtime mutations self-heal).
   ui::setGlassConfig(st.settings.glassCfg);
+  // User accent pair: writes the palette + accent-derived ImGuiCol slots and
+  // retints the baked ribbon atlas. Ordered after loadIcons (line ~1939) so the
+  // atlas is decoded and the first retint actually lands.
+  ui::setAccentColors(st.settings.accentPrimary, st.settings.accentSecondary);
   // editor buffer for the system-prompt override (Settings > Agent)
   std::strncpy(st.spBuf.data(), st.settings.systemPrompt.c_str(),
                st.spBuf.size() - 1);

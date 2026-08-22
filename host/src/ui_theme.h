@@ -1,4 +1,4 @@
-// Chudware UI theme: named palette roles, two palettes (dark/teal + SolidWorks-light),
+// Chudware UI theme: named palette roles, two palettes (dark + SolidWorks-light),
 // runtime-switchable. applyTheme(Theme, scale) fills ImGuiStyle + the global palette;
 // all panels read ONLY role fields — never hardcode ImVec4/ImU32 colors in panel code.
 #pragma once
@@ -42,11 +42,23 @@ struct Palette {
     float textDim[4]       = {0.620f,0.660f,0.720f, 1};   // secondary / dim text (glass rows)
     float textDisabled[4]  = {0.471f,0.502f,0.549f, 1};
 
-    // ---- accent ----
-    float accent[4]        = {0.176f,0.831f,0.749f, 1};   // teal #2DD4BF
-    float accentDim[4]     = {0.118f,0.553f,0.498f, 1};
-    float accentSoft[4]    = {0.176f,0.831f,0.749f, 0.22f};
-    float accentMid[4]     = {0.176f,0.831f,0.749f, 0.40f};
+    // ---- accent (PRIMARY: what an operation PRODUCED) ----
+    // Shared by both palettes and user-overridable — see setAccentColors. Dim/Soft/Mid are
+    // DERIVED from the base at install time; the literals below are only the out-of-box pair
+    // (#F28216 orange / #0078D7 blue) so a default-constructed Palette matches what ships.
+    float accent[4]        = {0.949f,0.510f,0.086f, 1};   // orange #F28216
+    float accentDim[4]     = {0.664f,0.357f,0.060f, 1};
+    float accentSoft[4]    = {0.949f,0.510f,0.086f, 0.22f};
+    float accentMid[4]     = {0.949f,0.510f,0.086f, 0.40f};
+
+    // ---- accent2 (SECONDARY: direction / annotation cue) ----
+    // The ribbon's 3D icon tiles bake direction arrows in this hue while the operation's result
+    // is baked in the primary, so the chrome must carry BOTH roles or a retinted ribbon reads as
+    // a different product than the panel it sits on. Same Dim/Soft/Mid contract as the accent.
+    float accent2[4]       = {0.000f,0.471f,0.843f, 1};   // blue #0078D7
+    float accent2Dim[4]    = {0.000f,0.330f,0.590f, 1};
+    float accent2Soft[4]   = {0.000f,0.471f,0.843f, 0.22f};
+    float accent2Mid[4]    = {0.000f,0.471f,0.843f, 0.40f};
 
     // ---- interactive ----
     float button[4]        = {0.149f,0.176f,0.220f, 1};
@@ -67,7 +79,7 @@ struct Palette {
     float partDefault[4]   = {0.776f,0.792f,0.847f, 1};   // default body color (#C6CAD8)
     float groundShadow[4]  = {0.200f,0.220f,0.260f, 0.35f}; // soft contact shadow (a = max)
     float overlayBg[4]     = {0.039f,0.055f,0.075f, 0.843f}; // pill overlays on 3D view
-    float overlayBorder[4] = {0.176f,0.831f,0.749f, 0.275f};
+    float overlayBorder[4] = {0.949f,0.510f,0.086f, 0.275f};   // accent-derived (setAccentColors)
     float overlayText[4]   = {0.886f,0.906f,0.941f, 0.941f};
     // W4-K: SolidWorks-style datum planes — subtle light-blue translucent fill + thin blue
     // outline (alpha in [3] is the base; the renderer scales it per emphasis state).
@@ -78,8 +90,8 @@ struct Palette {
     // Selection is the persistent state and must read as more emphatic than the transient hover
     // wash, so its alpha sits above hoverHighlight's (previously inverted: 0.22 vs 0.40, which made
     // a selected-but-unhovered face look lighter/weaker than a merely-hovered one).
-    float selectionHighlight[4] = {0.176f,0.831f,0.749f, 0.50f};
-    float hoverHighlight[4]     = {0.176f,0.831f,0.749f, 0.40f};
+    float selectionHighlight[4] = {0.949f,0.510f,0.086f, 0.50f};
+    float hoverHighlight[4]     = {0.949f,0.510f,0.086f, 0.40f};
 
     // ---- C24: orientation-triad axis colors (X/Y/Z) ----
     float axisX[4]         = {0.910f,0.380f,0.380f, 1};   // red
@@ -127,19 +139,21 @@ struct Palette {
     float sketchExternalStale[4] = {0.953f,0.610f,0.220f, 1};   // stale (dashed) entities
 
     // ---- status ----
-    float statusOk[4]   = {0.176f,0.831f,0.749f, 1};   // same as accent
+    // statusOk is SUCCESS, not brand: it used to be the accent literal verbatim, so a user
+    // recoloring the app would have silently recolored "ok" too. It is green in both palettes now.
+    float statusOk[4]   = {0.459f,0.859f,0.549f, 1};   // green
     float statusWarn[4] = {0.953f,0.761f,0.420f, 1};   // amber
     float statusErr[4]  = {0.961f,0.549f,0.420f, 1};   // red-orange
 
     // ---- console colors ----
     float consoleDefault[4]= {0.780f,0.820f,0.880f, 1};
-    float consoleOk[4]     = {0.176f,0.831f,0.749f, 1};
+    float consoleOk[4]     = {0.459f,0.859f,0.549f, 1};   // success green, not the accent
     float consoleWarn[4]   = {0.953f,0.761f,0.420f, 1};
     float consoleErr[4]    = {0.961f,0.549f,0.420f, 1};
     float consoleDim[4]    = {0.620f,0.660f,0.720f, 1};
 
     // ---- code / diff ----
-    float chipBg[4]        = {0.176f,0.831f,0.749f, 0.30f};
+    float chipBg[4]        = {0.949f,0.510f,0.086f, 0.30f};   // accent-derived (setAccentColors)
     float codeBg[4]        = {0.055f,0.065f,0.085f, 1};
     // NOTE: proseBg is ≈ the Copilot pane's dark base (windowBg ~0.082) since the panes
     // went opaque-dark, so prose cards now read by their BORDER, not fill contrast. If chat
@@ -193,7 +207,7 @@ struct Palette {
     // ---- tree (feature-manager rows: hover wash + section header label) ----
     // treeHover:   accent-tinted row hover wash (low alpha so text stays legible).
     // treeSection: muted label color for collapsible section headers.
-    float treeHover[4]      = {0.176f, 0.831f, 0.749f, 0.10f};
+    float treeHover[4]      = {0.949f, 0.510f, 0.086f, 0.10f};   // accent-derived
     float treeSection[4]    = {0.620f, 0.660f, 0.720f, 1.0f};
 
     // ---- copilot blocks (chat action cards) ----
@@ -219,6 +233,22 @@ struct Palette {
 // Fill ImGuiStyle + the global palette for the given theme.
 // Must be called after ImGui::CreateContext() and whenever the theme is toggled.
 void applyTheme(Theme t, float scale = 1.0f);
+
+// Out-of-box accent pair. PRIMARY is the color an operation's RESULT is drawn in (and the hue the
+// baked 3D ribbon tiles paint new geometry with); SECONDARY is the direction cue (arrows, axes,
+// annotation). Settings persists the user's override; these are the values it falls back to and
+// the values the Appearance tab's "Reset to defaults" restores.
+extern const float kDefaultAccentPrimary[3];    // #F28216 orange
+extern const float kDefaultAccentSecondary[3];  // #0078D7 blue
+
+// Install an accent pair: writes the accent*/accent2* families plus every accent-DERIVED wash
+// (selection, hover, overlay border, chip fill, tree hover), re-points the ~18 accent-dependent
+// ImGuiCol slots, and retints the baked icon atlas via ui::recolorIconAtlas so the ribbon tracks
+// the chrome. The pair is remembered and re-installed by applyTheme(), because a theme switch
+// re-runs the palette fill and would otherwise stomp the user's colors back to the default.
+// Call once at startup (after loadSettings AND loadIcons) and on every Appearance-tab edit.
+// GUI thread only.
+void setAccentColors(const float primary[3], const float secondary[3]);
 
 Fonts loadFonts(const std::string& assetsDir, float pxScale = 1.0f);
 

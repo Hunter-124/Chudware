@@ -1178,8 +1178,18 @@ for _m in (restyle_features, sketch_entities, sketch_edits, simulation,
     ANNOTATIONS.update(getattr(_m, "ANN", {}))
 del _m
 
-_TEAL = (45, 212, 191, 255)
-_KEYLINE = (8, 34, 30, 210)
+# Flat annotation ink. These pixels are baked into the tile exactly like the rendered
+# geometry, so they MUST be one of the two accent references — a third hue here would sit
+# out the runtime retint in host/src/ui/icons.cpp and leave every ring, badge and dash the
+# factory color while the rest of the tile followed the user's pick.
+#
+# Secondary, not primary: an annotation is a cue laid over the result, which is the same
+# role the 3D direction arrows carry. Keeping them one color also means a ring and an arrow
+# on the same tile read as one annotation layer.
+_ANN_INK = tuple(round(c * 255) for c in SECONDARY_RGB) + (255,)
+# Dark keyline under the ink so it survives on both the light and dark atlas. Neutral, and
+# far enough below the saturation gate (kAccentSatLo) that the retint leaves it alone.
+_KEYLINE = (10, 14, 20, 210)
 
 
 def _draw_arrow(d, p0, p1, w, col):
@@ -1206,7 +1216,7 @@ def _annotation_layer(spec: dict, px: int) -> Image.Image:
     def P(x, y):
         return (x * sp, y * sp)
 
-    for col, w in ((_KEYLINE, KW), (_TEAL, W)):
+    for col, w in ((_KEYLINE, KW), (_ANN_INK, W)):
         if "arrow" in spec:
             x0, y0, x1, y1 = spec["arrow"]
             _draw_arrow(d, P(x0, y0), P(x1, y1), w, col)
@@ -1256,7 +1266,9 @@ def _annotation_layer(spec: dict, px: int) -> Image.Image:
                 sym = spec["badge"]
                 sw = max(3, W)
                 a = r * 0.52
-                ink = (6, 26, 23, 255)
+                # Knocked-out glyph on the badge disc. Near-black and unsaturated so the
+                # retint leaves it alone and it stays legible whatever hue the disc becomes.
+                ink = (8, 12, 18, 255)
                 if sym == "+":
                     d.line([bx - a, by, bx + a, by], fill=ink, width=sw)
                     d.line([bx, by - a, bx, by + a], fill=ink, width=sw)

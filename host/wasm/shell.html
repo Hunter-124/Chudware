@@ -8,6 +8,21 @@
        them, so SharedArrayBuffer/pthreads work. No-ops when already crossOriginIsolated. -->
   <script src="coi-serviceworker.js"></script>
   <style>
+    /* Single source of truth for the brand accent on this page. The touch-HUD
+       buttons below tint their border, active fill and active label from it, and
+       those three rules used to hardcode it five times over in two different teals
+       (rgba(66,236,206) for the resting border, rgba(48,216,190) + #42ecce for the
+       pressed/active states) — proof that a recolor by hand drifts. The channel
+       triple exists because rgba() needs components, not a hex, to keep the
+       per-rule alpha values that give the HUD its glass look.
+
+       Primary only, deliberately: the secondary accent is the direction cue for
+       3D op icons and this page has no such cue, so a --chudware-accent-secondary
+       here would be a variable nothing reads. */
+    :root {
+      --chudware-accent: #F28216;
+      --chudware-accent-rgb: 242, 130, 22;
+    }
     html, body {
       margin: 0;
       padding: 0;
@@ -111,7 +126,7 @@
       min-width: 48px;
       min-height: 48px;
       border-radius: 14px;
-      border: 1px solid rgba(66, 236, 206, 0.28);
+      border: 1px solid rgba(var(--chudware-accent-rgb), 0.28);
       background: rgba(18, 24, 30, 0.78);
       color: #e6edf3;
       font-size: 13px;
@@ -128,14 +143,14 @@
     }
     #mobile-hud button:active {
       transform: translateY(1px);
-      background: rgba(48, 216, 190, 0.22);
-      border-color: rgba(48, 216, 190, 0.5);
-      color: #42ecce;
+      background: rgba(var(--chudware-accent-rgb), 0.22);
+      border-color: rgba(var(--chudware-accent-rgb), 0.5);
+      color: var(--chudware-accent);
     }
     #mobile-hud button.active {
-      background: rgba(48, 216, 190, 0.28);
-      border-color: rgba(48, 216, 190, 0.55);
-      color: #42ecce;
+      background: rgba(var(--chudware-accent-rgb), 0.28);
+      border-color: rgba(var(--chudware-accent-rgb), 0.55);
+      color: var(--chudware-accent);
     }
     #mobile-hud button.wide {
       width: auto;

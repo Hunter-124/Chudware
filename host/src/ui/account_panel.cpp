@@ -693,7 +693,12 @@ std::string browserPageHtml(bool ok) {
           "the app &mdash; editing is already unlocked there."
         : "Chudware could not verify this authorization. Close this tab, return to the app and "
           "start sign-in again.";
-    const char* accent = ok ? "#2ec4a6" : "#e0605e";
+    // Hardcoded on purpose: this page is served to an external browser over loopback,
+    // so it cannot read ui::palette — the native theme, and any accent the user picked
+    // in Settings, are unreachable from here. #F28216 is the default brand primary; if
+    // that default ever moves, this literal has to move with it by hand. The failure
+    // red stays as-is: a failure is not an accent and must not follow the brand.
+    const char* accent = ok ? "#F28216" : "#e0605e";
     return std::string(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"

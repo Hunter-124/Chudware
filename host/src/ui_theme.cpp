@@ -1,5 +1,7 @@
 // Chudware UI theme implementation.
-// Two named palettes: Dark (original teal-on-dark brand) and Light (SolidWorks-style).
+// Two named palettes: Dark (original dark brand chrome) and Light (SolidWorks-style). The ACCENT
+// pair is not part of either palette: it is a user-owned brand role installed over both by
+// setAccentColors, so the same orange/blue reads identically in dark and light.
 // applyTheme(Theme, scale) populates both ui::palette and ImGuiStyle from the chosen set.
 // Panels read ONLY ui::palette — never hardcode color literals.
 #include "ui_theme.h"
@@ -7,6 +9,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"   // ImHashStr (panelId)
 #include "ui/tesseract.h"     // drawTesseractSpinner — the brand mark doubles as the busy indicator
+#include "ui/icons.h"         // recolorIconAtlas — the baked 3D ribbon tiles track the accent pair
 
 #include <algorithm>
 #include <cmath>
@@ -29,7 +32,98 @@ static void set4(float dst[4], float r, float g, float b, float a = 1.0f) {
 static ImVec4 fromRole(const float f[4]) { return ImVec4(f[0],f[1],f[2],f[3]); }
 
 // =========================================================================
-// Dark palette (original teal-on-dark, byte-for-byte where possible)
+// Accent roles (user-owned, shared by both palettes)
+// =========================================================================
+const float kDefaultAccentPrimary[3]   = {0.949f, 0.510f, 0.086f};   // #F28216 orange
+const float kDefaultAccentSecondary[3] = {0.000f, 0.471f, 0.843f};   // #0078D7 blue
+
+// The LIVE pair, seeded from the defaults above (ordered init inside this TU, so the copy is
+// well-defined) and overwritten in place by setAccentColors. fillDark/fillLight read this and
+// never a literal: they re-run on every theme toggle and would otherwise silently revert the
+// user's colors to whichever hue the theme happened to be authored with.
+static float gAccentPrimary[3]   = {kDefaultAccentPrimary[0], kDefaultAccentPrimary[1],
+                                    kDefaultAccentPrimary[2]};
+static float gAccentSecondary[3] = {kDefaultAccentSecondary[0], kDefaultAccentSecondary[1],
+                                    kDefaultAccentSecondary[2]};
+
+// Hue-preserving darken for the *Dim members. 0.70 reproduces the hand-authored Dim literals both
+// palettes used to carry (teal 0.665x, SW blue 0.75x) to within one 8-bit step — and unlike those,
+// it cannot drift in hue when the base color moves, which is what made "edit eight literals in
+// lockstep" the only way to recolor the app.
+static constexpr float kAccentDimScale = 0.70f;
+
+// Per-theme wash alphas for the accent families and every accent-DERIVED role. Only the alphas
+// differ between palettes — the hue is the user's, identically in both — so this is the whole of
+// what a theme still gets to say about the accent. Recoloring the app is now two RGB triples.
+struct AccentAlphas {
+    float soft, mid;          // accentSoft / accentMid (and their accent2 twins)
+    float selection, hover;   // selection + hover face washes
+    float overlayBorder;      // viewport pill-overlay border
+    float chip;               // code/diff chip fill
+    float treeHover;          // FeatureManager row hover wash
+};
+// Light needs the weaker set: the 0.40 wash that reads as a hint on near-black chrome reads as an
+// opaque slab on near-white.
+static constexpr AccentAlphas kDarkAccentAlphas {0.22f, 0.40f, 0.22f, 0.40f, 0.275f, 0.30f, 0.10f};
+static constexpr AccentAlphas kLightAccentAlphas{0.18f, 0.35f, 0.18f, 0.35f, 0.400f, 0.22f, 0.08f};
+
+// Derive one accent family (base / Dim / Soft / Mid) from a single RGB triple.
+static void fillAccentFamily(float base[4], float dim[4], float soft[4], float mid[4],
+                             const float rgb[3], float softA, float midA) {
+    set4(base, rgb[0], rgb[1], rgb[2], 1);
+    set4(dim,  rgb[0] * kAccentDimScale, rgb[1] * kAccentDimScale, rgb[2] * kAccentDimScale, 1);
+    set4(soft, rgb[0], rgb[1], rgb[2], softA);
+    set4(mid,  rgb[0], rgb[1], rgb[2], midA);
+}
+
+// Install an accent pair into a palette. Shared by fillDark/fillLight and setAccentColors, so the
+// two families plus their derived washes are authored ONCE instead of eight literals per theme.
+static void applyAccents(Palette& p, const float pri[3], const float sec[3],
+                         const AccentAlphas& a) {
+    fillAccentFamily(p.accent,  p.accentDim,  p.accentSoft,  p.accentMid,  pri, a.soft, a.mid);
+    fillAccentFamily(p.accent2, p.accent2Dim, p.accent2Soft, p.accent2Mid, sec, a.soft, a.mid);
+    // These five ARE the accent, just at a different wash weight — they used to repeat the accent
+    // literal verbatim, which is why they silently stopped matching whenever one of them was tuned.
+    // A user who picks orange expects the selection glow, the row hover and the HUD pill edge
+    // orange too. (Roles that merely HAPPENED to equal the old accent — statusOk/consoleOk, which
+    // mean SUCCESS, and the SolidWorks-blue datum-plane outline — are deliberately not here.)
+    set4(p.selectionHighlight, pri[0], pri[1], pri[2], a.selection);
+    set4(p.hoverHighlight,     pri[0], pri[1], pri[2], a.hover);
+    set4(p.overlayBorder,      pri[0], pri[1], pri[2], a.overlayBorder);
+    set4(p.chipBg,             pri[0], pri[1], pri[2], a.chip);
+    set4(p.treeHover,          pri[0], pri[1], pri[2], a.treeHover);
+}
+
+// The ImGuiCol slots that resolve from the accent. Owned here rather than inlined into
+// applyTheme's enum-ordered block, because setAccentColors has to re-point exactly these at
+// runtime: while they lived inline, a live recolor left every checkmark, header, resize grip and
+// tab-hover on the PREVIOUS accent until the user toggled the theme.
+static void applyAccentStyleColors() {
+    ImVec4* c = ImGui::GetStyle().Colors;
+    const Palette& p = palette;
+    c[ImGuiCol_ScrollbarGrabActive] = fromRole(p.accentMid);
+    c[ImGuiCol_CheckMark]           = fromRole(p.accent);
+    c[ImGuiCol_SliderGrab]          = fromRole(p.accent);
+    c[ImGuiCol_SliderGrabActive]    = fromRole(p.accentDim);
+    c[ImGuiCol_Header]              = fromRole(p.accentSoft);
+    c[ImGuiCol_HeaderHovered]       = fromRole(p.accentMid);
+    c[ImGuiCol_HeaderActive]        = fromRole(p.accentMid);
+    c[ImGuiCol_SeparatorHovered]    = fromRole(p.accentMid);
+    c[ImGuiCol_SeparatorActive]     = fromRole(p.accent);
+    c[ImGuiCol_ResizeGrip]          = fromRole(p.accentSoft);
+    c[ImGuiCol_ResizeGripHovered]   = fromRole(p.accentMid);
+    c[ImGuiCol_ResizeGripActive]    = fromRole(p.accent);
+    c[ImGuiCol_TabHovered]          = fromRole(p.accentMid);
+    c[ImGuiCol_DockingPreview]      = fromRole(p.accentMid);
+    c[ImGuiCol_PlotLines]           = fromRole(p.accent);
+    c[ImGuiCol_PlotHistogram]       = fromRole(p.accent);
+    c[ImGuiCol_TextSelectedBg]      = fromRole(p.accentSoft);
+    c[ImGuiCol_NavHighlight]        = fromRole(p.accent);
+}
+
+// =========================================================================
+// Dark palette (the original dark chrome, byte-for-byte where possible; accent comes from the
+// live user pair, so nothing in here names a brand hue)
 // =========================================================================
 static void fillDark(Palette& p) {
     // chrome
@@ -46,11 +140,9 @@ static void fillDark(Palette& p) {
     set4(p.text,          0.898f,0.918f,0.945f, 1);
     set4(p.textDim,       0.620f,0.660f,0.720f, 1);   // brighter on glass rows over viewport bleed
     set4(p.textDisabled,  0.471f,0.502f,0.549f, 1);
-    // accent  #2DD4BF
-    set4(p.accent,        0.176f,0.831f,0.749f, 1);
-    set4(p.accentDim,     0.118f,0.553f,0.498f, 1);
-    set4(p.accentSoft,    0.176f,0.831f,0.749f, 0.22f);
-    set4(p.accentMid,     0.176f,0.831f,0.749f, 0.40f);
+    // accent + accent2 families and every accent-derived wash (selection/hover/overlay border/
+    // chip/tree hover). Colors come from the LIVE user pair, never a literal.
+    applyAccents(p, gAccentPrimary, gAccentSecondary, kDarkAccentAlphas);
     // interactive
     set4(p.button,        0.149f,0.176f,0.220f, 1);
     set4(p.buttonHovered, 0.184f,0.224f,0.275f, 1);
@@ -67,14 +159,10 @@ static void fillDark(Palette& p) {
     set4(p.partDefault,   0.776f,0.792f,0.847f, 1);   // #C6CAD8
     set4(p.groundShadow,  0.200f,0.220f,0.260f, 0.35f);
     set4(p.overlayBg,     0.039f,0.055f,0.075f, 0.843f);
-    set4(p.overlayBorder, 0.176f,0.831f,0.749f, 0.275f);
     set4(p.overlayText,   0.886f,0.906f,0.941f, 0.941f);
     // datum planes (light-blue, SolidWorks look — viewport is light in both themes)
     set4(p.planeFill,    0.380f,0.620f,0.910f, 0.140f);   // C25: 0.085 was imperceptible
     set4(p.planeOutline, 0.290f,0.540f,0.870f, 0.700f);
-    // selection
-    set4(p.selectionHighlight, 0.176f,0.831f,0.749f, 0.22f);
-    set4(p.hoverHighlight,     0.176f,0.831f,0.749f, 0.40f);
     // C24 orientation-triad axes
     set4(p.axisX, 0.910f,0.380f,0.380f, 1);
     set4(p.axisY, 0.470f,0.820f,0.450f, 1);
@@ -106,17 +194,16 @@ static void fillDark(Palette& p) {
     // C49: inference ink (dashed alignment lines + snap markers) — amber on the light canvas.
     set4(p.sketchInfer,     0.950f,0.650f,0.200f, 0.85f);
     // status
-    set4(p.statusOk,   0.176f,0.831f,0.749f, 1);
+    set4(p.statusOk,   0.459f,0.859f,0.549f, 1);    // success green (was the accent literal)
     set4(p.statusWarn, 0.953f,0.761f,0.420f, 1);
     set4(p.statusErr,  0.961f,0.549f,0.420f, 1);
     // console
     set4(p.consoleDefault,0.780f,0.820f,0.880f,1);
-    set4(p.consoleOk,   0.176f,0.831f,0.749f, 1);
+    set4(p.consoleOk,   0.459f,0.859f,0.549f, 1);   // success green (was the accent literal)
     set4(p.consoleWarn, 0.953f,0.761f,0.420f, 1);
     set4(p.consoleErr,  0.961f,0.549f,0.420f, 1);
     set4(p.consoleDim,  0.620f,0.660f,0.720f, 1);
     // code/diff
-    set4(p.chipBg,     0.176f,0.831f,0.749f, 0.30f);
     set4(p.codeBg,     0.055f,0.065f,0.085f, 1);
     set4(p.proseBg,    0.085f,0.100f,0.130f, 1);
     set4(p.proseText,  0.780f,0.820f,0.880f, 1);
@@ -148,14 +235,13 @@ static void fillDark(Palette& p) {
     set4(p.glassHighlight, 1.000f, 1.000f, 1.000f, 0.09f);  // subtle white top shine
     set4(p.glassShadow,    0.000f, 0.000f, 0.000f, 0.40f);  // drop shadow
     // tree (feature-manager rows)
-    set4(p.treeHover,      0.176f, 0.831f, 0.749f, 0.10f);  // accent-tinted hover wash
     set4(p.treeSection,    0.620f, 0.660f, 0.720f, 1.0f);   // muted section-header label
     // copilot blocks (chat action cards)
     set4(p.blockActionBg,  0.094f, 0.110f, 0.141f, 0.96f);  // near-opaque action card
 }
 
 // =========================================================================
-// Light palette (SolidWorks-style: near-white chrome, slate text, #0078D7 accent)
+// Light palette (SolidWorks-style: near-white chrome, slate text; accent from the user pair)
 // =========================================================================
 static void fillLight(Palette& p) {
     // SolidWorks-ish neutral palette:
@@ -164,8 +250,8 @@ static void fillLight(Palette& p) {
     //   window bg:         #F5F5F5
     //   header / menu:     #E8E8E8
     //   text:              #1E2329 (near-black slate)
-    //   selection:         #0078D7 (Windows blue)
-    //   accent:            #1A8C7F (muted teal from icons contract)
+    //   selection:         the user's PRIMARY accent (orange out of the box)
+    //   datum planes:      #4A8ADE (a CAD convention, independent of the accent)
 
     // chrome
     set4(p.windowBg,      0.961f,0.961f,0.961f, 1);   // #F5F5F5
@@ -181,11 +267,8 @@ static void fillLight(Palette& p) {
     set4(p.text,          0.118f,0.137f,0.196f, 1);   // #1E2332 slate
     set4(p.textDim,       0.357f,0.384f,0.439f, 1);   // secondary grey (a touch darker = more legible)
     set4(p.textDisabled,  0.561f,0.580f,0.612f, 1);   // disabled (slightly stronger than before)
-    // accent: use SW blue #0078D7 for selection, muted teal for accent highlights
-    set4(p.accent,        0.000f,0.471f,0.843f, 1);   // #0078D7
-    set4(p.accentDim,     0.000f,0.353f,0.631f, 1);   // darker blue
-    set4(p.accentSoft,    0.000f,0.471f,0.843f, 0.18f);
-    set4(p.accentMid,     0.000f,0.471f,0.843f, 0.35f);
+    // accent + accent2: same live user pair as the dark palette, at the lighter wash alphas.
+    applyAccents(p, gAccentPrimary, gAccentSecondary, kLightAccentAlphas);
     // interactive
     set4(p.button,        0.922f,0.922f,0.922f, 1);
     set4(p.buttonHovered, 0.831f,0.886f,0.969f, 1);   // light-blue tint
@@ -202,14 +285,13 @@ static void fillLight(Palette& p) {
     set4(p.partDefault,   0.776f,0.792f,0.847f, 1);   // #C6CAD8
     set4(p.groundShadow,  0.200f,0.220f,0.260f, 0.35f);
     set4(p.overlayBg,     0.961f,0.961f,0.961f, 0.882f);
-    set4(p.overlayBorder, 0.000f,0.471f,0.843f, 0.40f);
     set4(p.overlayText,   0.118f,0.137f,0.196f, 0.941f);
     // datum planes (same light-blue as dark theme — viewport gradient is identical)
     set4(p.planeFill,    0.380f,0.620f,0.910f, 0.140f);   // C25: 0.090 was imperceptible
-    set4(p.planeOutline, 0.000f,0.471f,0.843f, 0.750f);
-    // selection
-    set4(p.selectionHighlight, 0.000f,0.471f,0.843f, 0.18f);
-    set4(p.hoverHighlight,     0.000f,0.471f,0.843f, 0.35f);
+    // planeOutline is the SolidWorks datum-plane blue, NOT the accent — it only looked like the
+    // accent while the light accent happened to be SW blue. Pinned to the dark palette's value so
+    // both themes draw datum planes identically (planeFill already matches).
+    set4(p.planeOutline, 0.290f,0.540f,0.870f, 0.750f);
     // in-viewport sim / flow / CAM overlay roles — saturated strokes carry over; the translucent
     // washes (mesh preview, domain box) darken slightly so they hold on the light canvas.
     set4(p.simFixture, 0.14f,0.62f,0.28f, 0.45f);
@@ -252,7 +334,6 @@ static void fillLight(Palette& p) {
     set4(p.consoleErr,  0.831f,0.118f,0.094f, 1);
     set4(p.consoleDim,  0.420f,0.447f,0.502f, 1);
     // code/diff
-    set4(p.chipBg,     0.000f,0.471f,0.843f, 0.22f);
     set4(p.codeBg,     0.933f,0.941f,0.957f, 1);    // #EEF0F4
     set4(p.proseBg,    0.949f,0.953f,0.965f, 1);
     set4(p.proseText,  0.235f,0.259f,0.318f, 1);
@@ -284,7 +365,6 @@ static void fillLight(Palette& p) {
     set4(p.glassHighlight, 1.000f, 1.000f, 1.000f, 0.35f);  // pronounced shine (2.2x => 0.77 for specular line, not blinding)
     set4(p.glassShadow,    0.000f, 0.000f, 0.000f, 0.18f);  // lighter shadow on light bg
     // tree (feature-manager rows)
-    set4(p.treeHover,      0.000f, 0.471f, 0.843f, 0.08f);  // SW-blue hover wash (lower alpha)
     set4(p.treeSection,    0.357f, 0.384f, 0.439f, 1.0f);   // darker grey section-header label
     // copilot blocks (chat action cards)
     set4(p.blockActionBg,  0.930f, 0.940f, 0.960f, 0.96f);  // near-opaque action card
@@ -375,38 +455,41 @@ void applyTheme(Theme t, float scale) {
     c[ImGuiCol_ScrollbarBg]         = rgba(0,0,0,0);
     c[ImGuiCol_ScrollbarGrab]       = fromRole(p.button);
     c[ImGuiCol_ScrollbarGrabHovered]= fromRole(p.buttonHovered);
-    c[ImGuiCol_ScrollbarGrabActive] = fromRole(p.accentMid);
-    c[ImGuiCol_CheckMark]           = fromRole(p.accent);
-    c[ImGuiCol_SliderGrab]          = fromRole(p.accent);
-    c[ImGuiCol_SliderGrabActive]    = fromRole(p.accentDim);
     c[ImGuiCol_Button]              = fromRole(p.button);
     c[ImGuiCol_ButtonHovered]       = fromRole(p.buttonHovered);
     c[ImGuiCol_ButtonActive]        = fromRole(p.buttonActive);
-    c[ImGuiCol_Header]              = fromRole(p.accentSoft);
-    c[ImGuiCol_HeaderHovered]       = fromRole(p.accentMid);
-    c[ImGuiCol_HeaderActive]        = fromRole(p.accentMid);
     c[ImGuiCol_Separator]           = fromRole(p.border);
-    c[ImGuiCol_SeparatorHovered]    = fromRole(p.accentMid);
-    c[ImGuiCol_SeparatorActive]     = fromRole(p.accent);
-    c[ImGuiCol_ResizeGrip]          = fromRole(p.accentSoft);
-    c[ImGuiCol_ResizeGripHovered]   = fromRole(p.accentMid);
-    c[ImGuiCol_ResizeGripActive]    = fromRole(p.accent);
     c[ImGuiCol_Tab]                 = fromRole(p.windowBg);
-    c[ImGuiCol_TabHovered]          = fromRole(p.accentMid);
     c[ImGuiCol_TabActive]           = fromRole(p.button);
     c[ImGuiCol_TabUnfocused]        = fromRole(p.panelBg);
     c[ImGuiCol_TabUnfocusedActive]  = fromRole(p.frameBg);
-    c[ImGuiCol_DockingPreview]      = fromRole(p.accentMid);
     c[ImGuiCol_DockingEmptyBg]      = fromRole(p.windowBg);
-    c[ImGuiCol_PlotLines]           = fromRole(p.accent);
-    c[ImGuiCol_PlotHistogram]       = fromRole(p.accent);
-    c[ImGuiCol_TextSelectedBg]      = fromRole(p.accentSoft);
-    c[ImGuiCol_NavHighlight]        = fromRole(p.accent);
     c[ImGuiCol_ModalWindowDimBg]    = (t == Theme::Light)
                                       ? rgba(0.1f, 0.1f, 0.1f, 0.45f)
                                       : rgba(0.02f, 0.027f, 0.039f, 0.65f);
+    // Accent-derived slots last, from the palette the fill above already installed.
+    applyAccentStyleColors();
 
     if (scale != 1.0f) s.ScaleAllSizes(scale);
+
+    // The ribbon tiles bake the accent pair into their pixels. A theme toggle re-runs the fill
+    // with the LIVE user pair, so re-derive the atlas from the same pair — never from the theme
+    // default, which would quietly discard a custom accent on every dark/light switch. No-ops
+    // before loadIcons has decoded an atlas (the very first applyTheme at startup).
+    recolorIconAtlas(gAccentPrimary, gAccentSecondary);
+}
+
+void setAccentColors(const float primary[3], const float secondary[3]) {
+    for (int i = 0; i < 3; ++i) {
+        gAccentPrimary[i]   = primary[i];
+        gAccentSecondary[i] = secondary[i];
+    }
+    // Only the accent-owned roles are touched: re-running the whole theme fill here would reset
+    // every unrelated chrome role and, at DPI != 100%, re-scale ImGuiStyle a second time.
+    applyAccents(palette, gAccentPrimary, gAccentSecondary,
+                 (activeTheme == Theme::Light) ? kLightAccentAlphas : kDarkAccentAlphas);
+    applyAccentStyleColors();
+    recolorIconAtlas(gAccentPrimary, gAccentSecondary);
 }
 
 // =========================================================================

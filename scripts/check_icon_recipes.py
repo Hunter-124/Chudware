@@ -52,6 +52,17 @@ _MODIFIER_TYPES = {
     "flatten", "boolean", "sm_flat_pattern", "sm_edge_flange", "sm_hem", "sm_jog",
 }
 
+# Feature types that are applied but never take a slot in the f-numbering. Every later
+# reference in the recipe therefore shifts down by one, which is the single nastiest way to
+# get this wrong: the sketch itself still reports ok=1, only its sketch_add_entity steps
+# fail, so the tile renders looking almost right with one piece of geometry missing.
+#
+# sm_flat_pattern is here on direct evidence, not inference. Rendered a probe of
+# [sketch, sm_base_flange, sm_flat_pattern, sketch] twice, once naming the trailing sketch
+# f3 and once f4: f3's sketch_add_entity returned ok=1, f4's returned ok=0 rev=-1. It
+# flattens the existing flange in place rather than adding to the tree.
+_NO_FID_TYPES = {"sm_flat_pattern"}
+
 
 def _is_body_producing(feat: dict) -> bool:
     ftype = feat.get("type", "")
@@ -87,16 +98,20 @@ def check(name: str, recipe: dict) -> tuple[list[str], list[str]]:
     painted: set[str] = set()
     fn = 0
 
-    # Pass 1: assign ids exactly as the engine does — one f-number per add_feature, one
-    # b-number per body-producing feature, both in step order.
+    # Pass 1: assign ids exactly as the engine does — one f-number per add_feature that
+    # actually takes a tree slot, one b-number per body-producing feature, both in step
+    # order.
     for step in steps:
         if step.get("op") != "add_feature":
             continue
-        fn += 1
         feat = step.get("feature") or {}
-        feature_types[f"f{fn}"] = feat.get("type", "?")
+        ftype = feat.get("type", "?")
         if _is_body_producing(feat):
             bodies.append(f"b{len(bodies) + 1}")
+        if ftype in _NO_FID_TYPES:
+            continue
+        fn += 1
+        feature_types[f"f{fn}"] = ftype
 
     # Pass 2: resolve every reference against those ids.
     def want_sketch(fid: str, where: str) -> None:

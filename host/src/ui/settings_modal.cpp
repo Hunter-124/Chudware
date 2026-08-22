@@ -5957,6 +5957,56 @@ void drawSettingsModal(AppState& st, bool busy) {
                 dimText("Switches the whole UI between the dark and light palettes. "
                         "Saved immediately.");
 
+                settingsSectionHeader("Accent colors");
+                dimText("Primary is the color a modelling operation's RESULT is drawn in \xe2\x80\x94 "
+                        "the same role the 3D ribbon icons bake their new geometry with. Secondary "
+                        "is the direction cue: arrows, axes, annotation. The ribbon retints as you "
+                        "drag. Saved immediately.");
+                ImGui::Dummy(ImVec2(0, 4 * sc));
+                {
+                    bool accentChanged = false;
+                    // Same aligned label column as the glass rows below.
+                    const float accLabelW = 150.0f * sc;
+                    auto accentRow = [&](const char* label) {
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted(label);
+                        ImGui::SameLine(accLabelW);
+                    };
+                    accentRow("Primary");
+                    if (ImGui::ColorEdit3("##accentprimary", settings.accentPrimary,
+                                          ImGuiColorEditFlags_NoInputs))
+                        accentChanged = true;
+                    ImGui::SameLine();
+                    dimText("(extrudes, bosses \xe2\x80\x94 what the operation produced)");
+                    accentRow("Secondary");
+                    if (ImGui::ColorEdit3("##accentsecondary", settings.accentSecondary,
+                                          ImGuiColorEditFlags_NoInputs))
+                        accentChanged = true;
+                    ImGui::SameLine();
+                    dimText("(direction arrows, axes, dimensions)");
+                    ImGui::Dummy(ImVec2(0, 4 * sc));
+                    // "##accent" only disambiguates the ImGui id: the Liquid Glass section below
+                    // has a button with the identical visible label, and two same-label buttons in
+                    // one window share an id (the second one becomes unclickable).
+                    if (ImGui::Button("Reset to defaults##accent",
+                                      ImVec2(150.0f * sc, 28.0f * sc))) {
+                        std::memcpy(settings.accentPrimary, ui::kDefaultAccentPrimary,
+                                    sizeof(settings.accentPrimary));
+                        std::memcpy(settings.accentSecondary, ui::kDefaultAccentSecondary,
+                                    sizeof(settings.accentSecondary));
+                        accentChanged = true;
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Restore the shipped orange / blue pair");
+                    if (accentChanged) {
+                        // Live-apply then persist, matching the glass pair below: setAccentColors
+                        // rewrites the palette, the accent-derived ImGuiCol slots and the baked
+                        // icon atlas in one call, so the whole UI tracks the drag.
+                        ui::setAccentColors(settings.accentPrimary, settings.accentSecondary);
+                        saveSettings(settings);
+                    }
+                }
+
                 settingsSectionHeader("Brand mark");
                 dimText("The copilot logo is a live 3D projection of a rotating tesseract "
                         "(a 4-cube) — this picks how it turns. Saved immediately.");

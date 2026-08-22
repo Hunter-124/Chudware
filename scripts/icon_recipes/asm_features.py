@@ -63,7 +63,10 @@ def ext(name, depth, fid, cx, cy, mode="boss", merge=True):
 
 RECIPES: dict[str, dict] = {
 
-    # insert_component: recessed grey base plate + teal component hovering above it.
+    # insert_component: grey base plate with a recess + orange component still in the air
+    # above it, and a real 3D arrow plunging DOWN the insertion axis. The flat overlay drew
+    # that arrow on the glass; arrow3d(direction=-1) puts it in the scene, so it is shaded
+    # and foreshortened by the same camera as the part it is pushing home.
     "insert_component": {"yaw": 35, "pitch": 26, "steps": [
         *sketch_with_id(rect(-18, -18, 18, 18, "bp"), "plane.top", "BaseSk", "f1"),
         ext("Base", 5, "f1", 0, 0),
@@ -71,7 +74,11 @@ RECIPES: dict[str, dict] = {
         ext("Recess", 3, "f3", 0, 0, mode="cut"),
         *sketch_with_id(rect(-9, -9, 9, 9, "cp"), "plane.top", "CompSk", "f5", offset=15),
         ext("Comp", 12, "f5", 0, 0, merge=False),
-        steel("b1"), accent("b2"),
+        # f7 = shaft sketch, f8 = shaft extrude, f9 = head sketch, f10 = head revolve.
+        # Tip stops 3mm above the component's top face so the cone stays a clean silhouette
+        # instead of merging into the block it points at.
+        *arrow3d("f7", "f9", base=45, length=15, direction=-1),
+        steel("b1"), accent("b2"), accent2("b3"), accent2("b4"),
     ]},
 
     # mate: two upright plates pressed face-to-face (grey source, teal mated part).
@@ -85,36 +92,58 @@ RECIPES: dict[str, dict] = {
         steel("b1"), accent("b2"),
     ]},
 
-    # move_component: a single grey block; the arrow carries the translation.
+    # move_component: the component itself in orange -- it is what the drag repositions --
+    # with a real 3D arrow along +X. A translation has no privileged direction, so the
+    # arrow goes on the X axis, which passes through the block's mid-height and reads as a
+    # slide across the tile rather than as the extrude family's "grows upward" cue.
     "move_component": {"yaw": 35, "pitch": 26, "steps": [
-        box(26, 20, 16, "MoveBlk"), steel("b1"),
+        box(26, 20, 16, "MoveBlk"),
+        # f2 = shaft sketch, f3 = shaft extrude, f4 = head sketch, f5 = head revolve
+        *arrow3d("f2", "f4", base=17, length=22, axis="x"),
+        accent("b1"), accent2("b2"), accent2("b3"),
     ]},
 
-    # rotate_component: same grey block; the arc carries the rotation.
+    # rotate_component: same orange component, but the cue is arc_arrow3d riding above the
+    # top face at r=21 -- clear of the block's 16.4mm corner radius, so the radially flared
+    # head never buries itself in the part it is turning.
     "rotate_component": {"yaw": 35, "pitch": 26, "steps": [
-        box(26, 20, 16, "RotBlk"), steel("b1"),
+        box(26, 20, 16, "RotBlk"),
+        # f2 = tube sketch, f3 = tube revolve, f4 = head sketch, f5 = head revolve
+        *arc_arrow3d("f2", "f4", radius=21, height=13),
+        accent("b1"), accent2("b2"), accent2("b3"),
     ]},
 
-    # pattern_component: grey rail carrying three teal hex-prism instances.
+    # pattern_component: grey rail carrying three orange instances plus a real 3D arrow
+    # continuing along the rail on +X, which is the actual pattern direction. The rail is
+    # sketched at offset=-2 so it straddles z=0: the arrow can only lie ON a global axis,
+    # and centring the rail on X is what puts the arrow down its middle instead of half
+    # buried under it. The instances are pulled in from +/-16 to +/-12 because adding 17mm
+    # of arrow to a 52mm rail turned the tile into a thin horizontal streak.
     "pattern_component": {"yaw": 34, "pitch": 28, "steps": [
-        *sketch_with_id(rect(-26, -5, 26, 5, "rl"), "plane.top", "RailSk", "f1"),
+        *sketch_with_id(rect(-20, -5, 20, 5, "rl"), "plane.top", "RailSk", "f1", offset=-2),
         ext("Rail", 4, "f1", 0, 0),
-        *sketch_with_id(hexagon(-16, 0, 5.6, "h1"), "plane.top", "Hex1Sk", "f3", offset=4),
-        ext("Hex1", 8, "f3", -16, 0, merge=False),
-        *sketch_with_id(hexagon(0, 0, 5.6, "h2"), "plane.top", "Hex2Sk", "f5", offset=4),
+        *sketch_with_id(hexagon(-12, 0, 5.2, "h1"), "plane.top", "Hex1Sk", "f3", offset=2),
+        ext("Hex1", 8, "f3", -12, 0, merge=False),
+        *sketch_with_id(hexagon(0, 0, 5.2, "h2"), "plane.top", "Hex2Sk", "f5", offset=2),
         ext("Hex2", 8, "f5", 0, 0, merge=False),
-        *sketch_with_id(hexagon(16, 0, 5.6, "h3"), "plane.top", "Hex3Sk", "f7", offset=4),
-        ext("Hex3", 8, "f7", 16, 0, merge=False),
+        *sketch_with_id(hexagon(12, 0, 5.2, "h3"), "plane.top", "Hex3Sk", "f7", offset=2),
+        ext("Hex3", 8, "f7", 12, 0, merge=False),
+        # f9 = shaft sketch, f10 = shaft extrude, f11 = head sketch, f12 = head revolve
+        *arrow3d("f9", "f11", base=24, length=17, axis="x", radius=2.6),
         steel("b1"), accent("b2"), accent("b3"), accent("b4"),
+        accent2("b5"), accent2("b6"),
     ]},
 
-    # smart_fasteners: steel hex bolt beside a drilled grey plate with a teal washer.
+    # smart_fasteners: steel hex bolt beside a drilled grey plate with an orange washer.
     "smart_fasteners": {"yaw": 34, "pitch": 26, "steps": [
         *sketch_with_id(hexagon(0, 0, 9, "hh"), "plane.top", "HeadSk", "f1"),
         ext("Head", 7, "f1", 0, 0),
         *sketch_with_id([{"type": "circle", "center": [0, 0], "radius": 5, "id": "shk"}],
                         "plane.top", "ShankSk", "f3", offset=7),
-        ext("Shank", 22, "f3", 0, 0),
+        # merge=False: with the shank fusing into the head, the engine produced one body
+        # fewer than the recipe counts, so the washer was painted as b3 and a fourth body
+        # was left in the engine default material. One body per feature, all four painted.
+        ext("Shank", 22, "f3", 0, 0, merge=False),
         *sketch_with_id(rect(15, -15, 45, 15, "pl"), "plane.top", "PlateSk", "f5"),
         ext("Plate", 5, "f5", 30, 0, merge=False),
         *sketch_with_id([{"type": "circle", "center": [30, 0], "radius": 6, "id": "hl"}],
@@ -127,10 +156,13 @@ RECIPES: dict[str, dict] = {
         ext("Washer", 2, "f9", 36.7, 0, merge=False),
         {"op": "set_appearance", "id": "b1", "color": [0.66, 0.69, 0.73],
          "metallic": 0.90, "roughness": 0.35},
-        steel("b2"), accent("b3"),
+        steel("b2"), steel("b3"), accent("b4"),
     ]},
 
-    # exploded_view: three plates separated by air gaps along Z.
+    # exploded_view: three plates separated by air gaps along Z, with a real 3D arrow
+    # continuing up the stack axis. The retired overlay was a double-headed arrow drawn
+    # beside the stack, which reads as a dimension; a single solid arrow standing on the
+    # axis the parts actually travelled along reads as the explode direction.
     "exploded_view": {"yaw": 34, "pitch": 22, "steps": [
         *sketch_with_id(rect(-18, -18, 18, 18, "e1"), "plane.top", "L1Sk", "f1"),
         ext("L1", 5, "f1", 0, 0, merge=False),
@@ -138,7 +170,9 @@ RECIPES: dict[str, dict] = {
         ext("L2", 4, "f3", 0, 0, merge=False),
         *sketch_with_id(rect(-10, -10, 10, 10, "e3"), "plane.top", "L3Sk", "f5", offset=26),
         ext("L3", 4, "f5", 0, 0, merge=False),
-        steel("b1"), accent("b2"), steel("b3"),
+        # f7 = shaft sketch, f8 = shaft extrude, f9 = head sketch, f10 = head revolve
+        *arrow3d("f7", "f9", base=34, length=18),
+        steel("b1"), accent("b2"), steel("b3"), accent2("b4"), accent2("b5"),
     ]},
 
     # bom: upright grey plate with three cut "rows" + a teal header strip.
@@ -192,51 +226,72 @@ RECIPES: dict[str, dict] = {
         steel("b1"), accent("b2"),
     ]},
 
-    # ref_plane: a thin light-grey datum plate.
+    # ref_plane: an orange datum plane floating proud of a grey host block and overhanging
+    # it on every side. The old tile was a bare light-grey parallelogram with no accent at
+    # all, which at 32px was indistinguishable from a blank slab -- nothing said "datum".
+    # The offset gap plus the overhang is what makes it read as a plane RELATIVE TO a body.
     "ref_plane": {"yaw": 35, "pitch": 26, "steps": [
-        *sketch_with_id(rect(-17, -17, 17, 17, "dp"), "plane.top", "PlaneSk", "f1"),
-        ext("DatumPlate", 1.5, "f1", 0, 0),
-        light("b1"),
+        *sketch_with_id(rect(-13, -11, 13, 11, "hb"), "plane.top", "HostSk", "f1"),
+        ext("HostBlock", 12, "f1", 0, 0),
+        *sketch_with_id(rect(-19, -16, 19, 16, "dp"), "plane.top", "PlaneSk", "f3",
+                        offset=20),
+        ext("DatumPlane", 1.6, "f3", 0, 0, merge=False),
+        steel("b1"), accent("b2"),
     ]},
 
-    # ref_axis: a long thin rod along X.
+    # ref_axis: a chunky orange rod driven straight through a grey block. The old rod was
+    # r=1.8 and rendered as a hairline diagonal that the downsample to 32px erased almost
+    # entirely; r=3.4 survives it. Running the rod THROUGH a host body is what separates
+    # "an axis" from "a stick", and it is the only thing that distinguished this tile from
+    # ref_point once both were lone grey primitives.
     "ref_axis": {"yaw": 35, "pitch": 26, "steps": [
-        *sketch_with_id([{"type": "circle", "center": [0, 0], "radius": 1.8, "id": "ax"}],
-                        "plane.right", "AxisSk", "f1", offset=-22),
-        ext("AxisRod", 44, "f1", 0, 0),
-        light("b1"),
+        box(30, 24, 14, "AxisHost"),
+        *sketch_with_id([{"type": "circle", "center": [0, 0], "radius": 3.4, "id": "ax"}],
+                        "plane.top", "AxisSk", "f2", offset=-24),
+        ext("AxisRod", 48, "f2", 0, 0, merge=False),
+        steel("b1"), accent("b2"),
     ]},
 
-    # ref_point: a small light-grey sphere.
+    # ref_point: a small orange marker ball sitting on the CORNER of a grey plate. The old
+    # tile was a lone grey sphere filling the frame, which reads as "a ball", not "a point":
+    # a point needs something to be a point ON. The plate is sketched from the origin out to
+    # (30,24) so the origin -- where sphere() always centres -- lands on its top corner
+    # vertex, and that off-centre composition is what keeps this tile clear of mass_props,
+    # which parks its marker in the MIDDLE of a face.
     "ref_point": {"yaw": 35, "pitch": 26, "steps": [
-        sphere(8, "RefPt"), light("b1"),
+        *sketch_with_id(rect(0, 0, 30, 24, "hp"), "plane.top", "HostSk", "f1", offset=-7),
+        ext("HostPlate", 7, "f1", 15, 12),
+        sphere(5.5, "RefPt"),
+        steel("b1"), accent("b2"),
     ]},
 
-    # ref_csys: three coloured rods meeting at the origin (X red, Y green, Z blue).
+    # ref_csys: three real 3D arrows through the origin, one per global axis, replacing
+    # three r=1.6 rods that at 32px were three coloured hairlines. Each arrow is a solid
+    # shaft plus a cone, so the triad still reads as a coordinate system after the
+    # downsample. Coloured by ROLE rather than by the red/green/blue axis convention: Z
+    # takes the primary orange, X the secondary blue, Y stays desaturated grey -- so the
+    # tile follows the user's chosen accent colors instead of freezing three hand-typed
+    # hues the runtime recolor cannot remap.
     "ref_csys": {"yaw": 35, "pitch": 26, "steps": [
-        *sketch_with_id([{"type": "circle", "center": [0, 0], "radius": 1.6, "id": "rx"}],
-                        "plane.right", "XSk", "f1"),
-        ext("XRod", 26, "f1", 0, 0, merge=False),
-        *sketch_with_id([{"type": "circle", "center": [0, 0], "radius": 1.6, "id": "ry"}],
-                        "plane.front", "YSk", "f3"),
-        ext("YRod", 26, "f3", 0, 0, merge=False),
-        *sketch_with_id([{"type": "circle", "center": [0, 0], "radius": 1.6, "id": "rz"}],
-                        "plane.top", "ZSk", "f5"),
-        ext("ZRod", 26, "f5", 0, 0, merge=False),
-        {"op": "set_appearance", "id": "b1", "color": [0.85, 0.30, 0.28],
-         "metallic": 0.30, "roughness": 0.45},
-        {"op": "set_appearance", "id": "b2", "color": [0.30, 0.75, 0.35],
-         "metallic": 0.30, "roughness": 0.45},
-        {"op": "set_appearance", "id": "b3", "color": [0.28, 0.45, 0.90],
-         "metallic": 0.30, "roughness": 0.45},
+        # f1/f3 = X arrow sketches, f5/f7 = Y, f9/f11 = Z; two bodies each, in that order.
+        *arrow3d("f1", "f3", base=0, length=27, axis="x", radius=2.8),
+        *arrow3d("f5", "f7", base=0, length=27, axis="y", radius=2.8),
+        *arrow3d("f9", "f11", base=0, length=27, axis="z", radius=2.8),
+        accent2("b1"), accent2("b2"),
+        light("b3"), light("b4"),
+        accent("b5"), accent("b6"),
     ]},
 }
 
 
 ANN: dict[str, dict] = {
-    "insert_component": {"arrow": [0.50, 0.12, 0.50, 0.38]},
-    "move_component": {"arrow": [0.25, 0.60, 0.70, 0.30]},
-    "rotate_component": {"arc": [0.50, 0.45, 0.30, -30, 150]},
-    "pattern_component": {"arrow": [0.22, 0.35, 0.78, 0.35]},
-    "exploded_view": {"darrow": [0.82, 0.20, 0.82, 0.75]},
+    # All five of these now carry real 3D arrow bodies (arrow3d / arc_arrow3d in their
+    # recipes above). The keys stay, empty, to record that the flat overlay was deliberately
+    # retired rather than quietly lost: a second arrow painted on the glass would fight the
+    # shaded one's perspective and double the cue.
+    "insert_component": {},
+    "move_component": {},
+    "rotate_component": {},
+    "pattern_component": {},
+    "exploded_view": {},
 }

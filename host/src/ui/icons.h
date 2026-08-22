@@ -37,6 +37,18 @@ const char* resolveIconAlias(const char* name);
 // calls use the new atlas.  UVs stay constant.
 void syncIconTheme();
 
+// Retint every atlas cell listed in atlas.json "accent_tinted" from the reference hues it
+// was baked with (atlas.json "accent_ref") to the caller's colors. Idempotent: always
+// recomputed from a pristine copy of the decoded atlas, never from the previous result.
+// rgb arrays are 3 floats in 0..1.
+//
+// This is the ONLY path by which a user-chosen accent reaches the engine-rendered ribbon
+// tiles: they are photographic bakes, so icons_sdf.cpp excludes them (raster_only) from the
+// tintable SDF path and ribbon.cpp draws them with an identity white tint. Passing the bake
+// reference colors back in restores the pristine atlas. No-op on an atlas whose json predates
+// the accent metadata. GUI thread only (touches GL).
+void recolorIconAtlas(const float primary[3], const float secondary[3]);
+
 // Liquid Glass v2 host port (H3 contract): SDF icon path derived at load time from the
 // already-decoded atlas alpha of monochrome-safe line-art glyphs (see icons_sdf.cpp). Renders
 // crisp at any pixel size via a CPU re-raster cache; falls back to the raster atlas for

@@ -183,22 +183,39 @@ class Palette:
         self.warn    = warn
         self.err     = err
 
+# Accent = the PRIMARY role of the two-role scheme: "what the operation produced".
+# accent2 = SECONDARY, the direction/annotation cue (arrows, sweep paths, mirror
+# planes), which keeps the blue family so a cue never competes with the result.
+#
+# Scope warning, so nobody debugs the wrong file: these baked pixels are largely
+# COSMETIC. icons_sdf.cpp re-rasterizes every line-art glyph into an SDF and
+# ribbon.cpp::ribbon_icon tints it at draw time from the live palette, so what
+# makes a line-art icon orange at runtime is ui_theme.cpp, NOT these constants.
+# They still have to be right: they keep the source honest, and they are what any
+# path that samples the atlas RGB directly (contact sheets, the raster_only blit
+# fallback, docs screenshots) actually gets.
 DARK = Palette(
     stroke  = (229, 234, 241),   # #E5EAF1
-    accent  = (45, 212, 191),    # #2DD4BF
+    accent  = (242, 130, 22),    # #F28216
     fill    = (255, 255, 255, 30),
     bg      = (0, 0, 0, 0),
-    accent2 = (94, 234, 212),
+    accent2 = (56, 148, 227),    # #3894E3 — #0078D7 lifted for dark-bg contrast
     ok      = (52, 211, 153),
     warn    = (251, 191, 36),
     err     = (239, 68, 68),
 )
 LIGHT = Palette(
     stroke  = (58, 67, 80),      # #3A4350
-    accent  = (26, 140, 127),    # #1A8C7F
+    # #C25E05 — the primary orange DEEPENED, not reused. #F28216 measures 2.4:1
+    # against the light ribbon sheet (#F3F5F7), well under the 3:1 a 2 px hairline
+    # needs at @20 — a light-theme accent stroke in it reads as a smudge. Holding
+    # the hue (30 deg -> 28 deg) while pushing saturation to full and dropping
+    # value to 0.76 gives 3.9:1, which also beats the 3.8:1 of the teal #1A8C7F it
+    # replaces, so nothing regresses on the light sheet.
+    accent  = (194, 94, 5),
     fill    = (0, 0, 0, 20),
     bg      = (0, 0, 0, 0),
-    accent2 = (31, 184, 166),
+    accent2 = (0, 94, 168),      # #005EA8 — secondary blue darkened to match
     ok      = (22, 163, 74),
     warn    = (217, 119, 6),
     err     = (220, 38, 38),
@@ -525,7 +542,7 @@ def draw_csys(d, cell, p):
     ox, oy = s*0.35, s*0.65
     arrow(d, ox, oy, ox + s*0.45, oy, p.err, lw)        # X red
     arrow(d, ox, oy, ox, oy - s*0.45, p.ok, lw)         # Y green
-    arrow(d, ox, oy, ox - s*0.22, oy + s*0.22, p.accent, lw)  # Z teal
+    arrow(d, ox, oy, ox - s*0.22, oy + s*0.22, p.accent, lw)  # Z accent
 
 @icon("origin")
 def draw_origin(d, cell, p):
@@ -3068,7 +3085,7 @@ def draw_ws_parts(d, cell, p):
     d.polygon(cog, fill=_rgba(p.accent, 110))
     d.line(cog + [cog[0]], fill=p.accent, width=lw)
     # Bore punched clean through (alpha 0, as in draw_hole_wizard): a solid-filled
-    # cog collapses into a teal blob once downsampled to 20 px.
+    # cog collapses into an accent-colored blob once downsampled to 20 px.
     filled_circle(d, cx, cy, s * 0.072, (0, 0, 0, 0))
     circle(d, cx, cy, s * 0.072, outline=p.accent, lw=max(1, lw // 2))
 
@@ -3114,7 +3131,7 @@ def draw_color_picker(d, cell, p):
         (pad, pad, (80, 170, 255)),                 # blue
         (pad + sw + gap, pad, (240, 90, 90)),       # red
         (pad, pad + sw + gap, (90, 210, 130)),      # green
-        (pad + sw + gap, pad + sw + gap, p.accent), # accent / teal
+        (pad + sw + gap, pad + sw + gap, p.accent), # accent
     ]
     for x, y, col in colors:
         d.rounded_rectangle([x, y, x + sw, y + sw], radius=int(s * 0.04),
@@ -4579,6 +4596,23 @@ OUT_DIR = HERE / "icons"
 ATLAS_MAX_PX = 2048
 ROW_PAD = 2
 
+# Top-level atlas.json keys this script does NOT author but MUST NOT destroy.
+# scripts/icon_pipeline.py --render injects them after the engine bakes the 3D
+# tiles; main() and relayout_committed_atlas() both rewrite atlas.json wholesale,
+# so anything not explicitly carried across is deleted.
+#
+# The failure is silent by construction, which is why this list exists instead of
+# a convention. "accent_tinted" (the tiles whose baked pixels carry the accent)
+# and "accent_ref" (the primary/secondary hues they were baked WITH) are the only
+# inputs host/src/ui/icons.cpp::recolorIconAtlas has: with the keys gone it finds
+# nothing to retint, returns immediately, and a user's chosen accent simply stops
+# reaching the 3D tiles. No exception, no warning, no log line — the ribbon just
+# keeps the factory orange forever. Same shape as the raster_only bug that made
+# icons "break every rebuild" until that key was carried forward here.
+#
+# Adding a pipeline-owned key? Add it HERE, or the next glyph regen eats it.
+PIPELINE_OWNED_ATLAS_KEYS = ("accent_tinted", "accent_ref")
+
 
 def _block_size(sizes: list[int] | None = None) -> tuple[int, int]:
     """(width, height) of one name's row block, padding included."""
@@ -4850,12 +4884,19 @@ def main():
     # ROOT CAUSE of "icons break every rebuild": this writer used to emit only
     # {atlas_px, cell}, silently dropping raster_only that icon_pipeline injects.
     prev_ro: set[str] = set()
+    prev_pipeline: dict[str, object] = {}
     old_json = OUT_DIR / "atlas.json"
     if old_json.exists():
         try:
-            prev_ro = set(json.loads(old_json.read_text(encoding="utf-8")).get("raster_only", []))
+            prev = json.loads(old_json.read_text(encoding="utf-8"))
+            prev_ro = set(prev.get("raster_only", []))
+            # Same class of bug, one generalization later: PIPELINE_OWNED_ATLAS_KEYS
+            # are injected by icon_pipeline and would be deleted by the wholesale
+            # rewrite below, disabling accent retinting with nothing in any log.
+            prev_pipeline = {k: prev[k] for k in PIPELINE_OWNED_ATLAS_KEYS if k in prev}
         except Exception:
             prev_ro = set()
+            prev_pipeline = {}
     ro = set(prev_ro)
     for name in CONTRACT_NAMES:
         if not _is_rendered_name(name):
@@ -4884,6 +4925,7 @@ def main():
         "atlas_px": [atlas_w, atlas_h],
         "cell": dark_map,
         "raster_only": sorted(ro),
+        **prev_pipeline,
     }
     with open(OUT_DIR / "atlas.json", "w", encoding="utf-8") as f:
         json.dump(json_data, f, indent=2)
@@ -4894,6 +4936,9 @@ def main():
     print(f"  FM refresh manifest: {len(FM_REFRESH_MANIFEST)} glyphs")
     print(f"  Atlas dimensions: {atlas_w} × {atlas_h} px")
     print(f"  raster_only: {len(ro)} photo/model tiles")
+    carried = [k for k in PIPELINE_OWNED_ATLAS_KEYS if k in json_data]
+    print(f"  carried from icon_pipeline: {', '.join(carried) if carried else 'none'}"
+          " (run scripts/icon_pipeline.py --render if that is not what you expect)")
 
     if fm_bad:
         raise RuntimeError(f"FM manifest invalid: {fm_bad}")
@@ -4904,12 +4949,13 @@ def main():
 def relayout_committed_atlas() -> tuple[int, int]:
     """Re-pack the COMMITTED atlas into the current grid without redrawing anything.
 
-    Every cell is moved by name and copied pixel-for-pixel, and ``raster_only`` is
-    carried across untouched, so this changes coordinates and nothing else. That
-    matters: a full ``main()`` regen re-fits the ~170 engine-rendered tiles from
-    scratch/icon_render and re-derives raster_only, which is the right thing when
-    you actually want fresh art and the wrong thing when all you need is an atlas
-    that fits in a texture.
+    Every cell is moved by name and copied pixel-for-pixel, and every top-level key
+    other than ``cell``/``atlas_px`` — ``raster_only`` plus
+    ``PIPELINE_OWNED_ATLAS_KEYS`` — rides across untouched, so this changes
+    coordinates and nothing else. That matters: a full ``main()`` regen re-fits the
+    ~170 engine-rendered tiles from scratch/icon_render and re-derives raster_only,
+    which is the right thing when you actually want fresh art and the wrong thing
+    when all you need is an atlas that fits in a texture.
 
     Use it when the committed atlas outgrows ATLAS_MAX_PX. Returns the new size.
     """
@@ -4930,9 +4976,12 @@ def relayout_committed_atlas() -> tuple[int, int]:
                 (c["x"], c["y"]),
             )
         dst.save(OUT_DIR / fn)
-    old["cell"] = new_cells
-    old["atlas_px"] = [new_w, new_h]
-    (OUT_DIR / "atlas.json").write_text(json.dumps(old, indent=2), encoding="utf-8")
+    # Copy-with-overrides, not a fresh dict: narrowing the written object to the
+    # keys this function computes would strip accent_tinted/accent_ref and silently
+    # stop accent retinting from reaching the baked 3D tiles — the same failure the
+    # carry-forward in main() exists to prevent, and just as invisible.
+    new_atlas = {**old, "cell": new_cells, "atlas_px": [new_w, new_h]}
+    (OUT_DIR / "atlas.json").write_text(json.dumps(new_atlas, indent=2), encoding="utf-8")
     print(f"relaid {len(order)} icons -> {new_w} × {new_h} px "
           f"(budget {ATLAS_MAX_PX} per side)")
     return new_w, new_h

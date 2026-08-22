@@ -66,19 +66,25 @@ RECIPES = {
         accent("b1"),
     ]},
 
-    # Bent pipe: circle profile on plane.right swept along an L path on plane.top.
+    # Bent pipe: circle profile on plane.right swept along an L path on plane.top, then a
+    # real 3D arrow leaving the outlet along +Y. The path is shifted 30mm in -X from where
+    # it used to sit so its second leg lands exactly ON the Y axis: an arrow can only be
+    # built on a global datum axis, so the pipe has to come to the axis rather than the
+    # arrow going to the pipe.
     "study_flow": {"yaw": 40, "pitch": 28, "steps": [
         *sketch_with_id([
             {"type": "circle", "center": [0, 0], "radius": 6, "id": "fc1"},
         ], "plane.right", "FlowProf", "f1"),
         *sketch_with_id([
-            {"type": "line", "p1": [0, 0], "p2": [30, 0], "id": "fp1"},
-            {"type": "line", "p1": [30, 0], "p2": [30, 26], "id": "fp2"},
+            {"type": "line", "p1": [-30, 0], "p2": [0, 0], "id": "fp1"},
+            {"type": "line", "p1": [0, 0], "p2": [0, 26], "id": "fp2"},
         ], "plane.top", "FlowPath", "f2"),
         {"op": "add_feature", "feature": {
             "type": "sweep", "name": "FlowPipe", "params": {"mode": "boss"},
-            "refs": {"profile": [region("f1", 0, 0)], "path": region("f2", 15, 0)}}},
-        accent("b1"),
+            "refs": {"profile": [region("f1", 0, 0)], "path": region("f2", -15, 0)}}},
+        # f4 = shaft sketch, f5 = shaft extrude, f6 = head sketch, f7 = head revolve
+        *arrow3d("f4", "f6", base=30, length=20, axis="y"),
+        accent("b1"), accent2("b2"), accent2("b3"),
     ]},
 
     # Hot/cold half-blocks side by side.
@@ -132,9 +138,22 @@ RECIPES = {
         steel("b3"),
     ]},
 
+    # load_force: grey stock with a real 3D arrow pressing DOWN onto its top face. A force
+    # vector is the one cue that cannot be faked flat -- drawn on the glass it reads as a
+    # sticker rather than as something bearing on the part -- so this is arrow3d with
+    # direction=-1, sized so the cone's tip lands exactly on the z=+7 face it loads.
     "load_force": {"yaw": 35, "pitch": 26, "steps": [
-        box(36, 24, 14), steel("b1")]},
+        box(36, 24, 14),
+        # f2 = shaft sketch, f3 = shaft extrude, f4 = head sketch, f5 = head revolve
+        *arrow3d("f2", "f4", base=29, length=22, direction=-1, radius=3.4),
+        steel("b1"), accent2("b2"), accent2("b3"),
+    ]},
 
+    # load_pressure: keeps its FLAT overlay, deliberately. Pressure is a field, and what
+    # distinguishes this tile from load_force is the RANK of parallel arrows over the face --
+    # but a 3D arrow can only be built on a global datum axis through the origin, so three
+    # side-by-side arrows are not constructible. One 3D arrow here would just be load_force
+    # again; three flat ones still say "pressure".
     "load_pressure": {"yaw": 35, "pitch": 26, "steps": [
         box(36, 24, 14), steel("b1")]},
 
@@ -197,20 +216,25 @@ RECIPES = {
     # Fringe legend: 5 thin bars.
     "results": {"yaw": 30, "pitch": 24, "steps": []},
 
-    # S-curved swept pipe.
+    # S-curved swept pipe with a real 3D arrow continuing out of the outlet along +X. The
+    # path is shifted 12mm in -Y so its last leg lies ON the X axis (an arrow only exists on
+    # a global datum axis), and the S is pulled in from 46mm to 36mm of run because the
+    # arrow adds another 17mm and the tile was already the widest in the family.
     "flow_arrow": {"yaw": 38, "pitch": 28, "steps": [
         *sketch_with_id([
             {"type": "circle", "center": [0, 0], "radius": 5, "id": "sc1"},
         ], "plane.right", "SProf", "f1"),
         *sketch_with_id([
-            {"type": "line", "p1": [-24, -12], "p2": [-6, -12], "id": "sp1"},
-            {"type": "line", "p1": [-6, -12], "p2": [-6, 12], "id": "sp2"},
-            {"type": "line", "p1": [-6, 12], "p2": [22, 12], "id": "sp3"},
+            {"type": "line", "p1": [-20, -20], "p2": [-6, -20], "id": "sp1"},
+            {"type": "line", "p1": [-6, -20], "p2": [-6, 0], "id": "sp2"},
+            {"type": "line", "p1": [-6, 0], "p2": [16, 0], "id": "sp3"},
         ], "plane.top", "SPath", "f2"),
         {"op": "add_feature", "feature": {
             "type": "sweep", "name": "SPipe", "params": {"mode": "boss"},
-            "refs": {"profile": [region("f1", 0, 0)], "path": region("f2", -15, -12)}}},
-        accent("b1"),
+            "refs": {"profile": [region("f1", 0, 0)], "path": region("f2", -13, -20)}}},
+        # f4 = shaft sketch, f5 = shaft extrude, f6 = head sketch, f7 = head revolve
+        *arrow3d("f4", "f6", base=21, length=17, axis="x"),
+        accent("b1"), accent2("b2"), accent2("b3"),
     ]},
 
     # Workspace tile: static scene + a 2x2 mesh patch on the bar near the wall.
@@ -267,11 +291,19 @@ RECIPES["ws_simulate"]["steps"] = (
 )
 
 ANN = {
+    # study_static keeps its flat arrow: the load bears down on the cantilever tip at
+    # (26, 0, 20), and a -Z arrow can only stand on the Z axis at x=y=0 -- which in this
+    # scene is inside the wall, nowhere near the tip that is being loaded.
     "study_static": {"arrow": [0.74, 0.30, 0.74, 0.55]},
-    "study_flow": {"arrow": [0.30, 0.60, 0.70, 0.30]},
-    "load_force": {"arrow": [0.50, 0.05, 0.50, 0.38]},
+    # study_flow / load_force / flow_arrow now carry real 3D arrow bodies; the keys stay,
+    # empty, so the retirement is on the record and nobody re-adds a flat arrow on top of a
+    # shaded one.
+    "study_flow": {},
+    "load_force": {},
+    # load_pressure keeps its rank of three flat arrows -- see the recipe comment: three
+    # parallel 3D arrows cannot be built off-axis, and one on-axis arrow is load_force.
     "load_pressure": {"arrows": [[0.32, 0.05, 0.32, 0.34],
                                  [0.50, 0.05, 0.50, 0.38],
                                  [0.68, 0.05, 0.68, 0.34]]},
-    "flow_arrow": {"arrow": [0.18, 0.18, 0.78, 0.30]},
+    "flow_arrow": {},
 }

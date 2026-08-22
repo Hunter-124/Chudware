@@ -24,6 +24,7 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -47,8 +48,24 @@ def find_hostd() -> str:
 
 
 def runtime_dir() -> str:
-    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/chudware-{os.getuid()}"
-    return os.path.join(base, "chudware") if os.environ.get("XDG_RUNTIME_DIR") else base
+    """Where the daemon puts its socket. MUST agree with the C++ the daemon actually runs.
+
+    Source of truth is services/ipc/ipc_discovery.cpp runtimeDir(); kept identical to
+    scripts/hostd_smoke.py. The old env-only rule resolved to /tmp/chudware-<uid> whenever
+    XDG_RUNTIME_DIR was unset, while the daemon it had just spawned was creating its socket
+    under /run/user/<uid>/chudware -- so this probe timed out against a healthy daemon on
+    exactly the hosts that matter, the systemd-launched CI runners.
+    """
+    if xdg := os.environ.get("XDG_RUNTIME_DIR"):
+        return os.path.join(xdg, "chudware")
+    run_user = f"/run/user/{os.getuid()}"
+    try:
+        st = os.lstat(run_user)
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
+            return os.path.join(run_user, "chudware")
+    except OSError:
+        pass
+    return f"/tmp/chudware-{os.getuid()}"
 
 
 def load_contract() -> dict:

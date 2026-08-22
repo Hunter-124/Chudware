@@ -19,6 +19,7 @@ import json
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -38,8 +39,28 @@ def find_hostd() -> str:
 
 
 def runtime_dir() -> str:
-    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/chudware-{os.getuid()}"
-    return os.path.join(base, "chudware") if os.environ.get("XDG_RUNTIME_DIR") else base
+    """Where the daemon puts its socket. MUST agree with the C++ the daemon actually runs.
+
+    Source of truth is services/ipc/ipc_discovery.cpp runtimeDir(). This used to be an
+    env-only rule -- XDG_RUNTIME_DIR or else /tmp/chudware-<uid> -- which is exactly the
+    split that file's comment warns about: with XDG_RUNTIME_DIR unset (a systemd-launched
+    CI runner, or any agent-spawned process) the daemon creates its socket under
+    /run/user/<uid>/chudware while this script sat waiting on /tmp/chudware-<uid>. Nothing
+    ever appeared there, so the smoke reported "hostd spawn timed out" against a perfectly
+    healthy daemon and took the whole strict gate red with it.
+    """
+    if xdg := os.environ.get("XDG_RUNTIME_DIR"):
+        return os.path.join(xdg, "chudware")
+    # Prefer the canonical /run/user/<uid>, but only when it exists and is OURS -- the
+    # same ownership test the C++ does before trusting it.
+    run_user = f"/run/user/{os.getuid()}"
+    try:
+        st = os.lstat(run_user)
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid():
+            return os.path.join(run_user, "chudware")
+    except OSError:
+        pass
+    return f"/tmp/chudware-{os.getuid()}"
 
 
 class Client:

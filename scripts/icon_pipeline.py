@@ -1392,10 +1392,10 @@ def _flatten_steps(steps: list) -> list:
     return out
 
 
-def write_recipes(path: Path) -> None:
+def write_recipes(path: Path, only: set[str] | None = None) -> None:
     recipes = [{"name": n, "yaw": r["yaw"], "pitch": r["pitch"],
                 "steps": _flatten_steps(r["steps"])}
-               for n, r in RECIPES.items()]
+               for n, r in RECIPES.items() if only is None or n in only]
     path.write_text(json.dumps({"out_dir": str(RENDER_DIR), "px": RENDER_PX,
                                 "recipes": recipes}, indent=1), encoding="utf-8")
 
@@ -1433,7 +1433,8 @@ def run_app(recipes_json: Path, theme: str = "dark", timeout_s: int = 300) -> in
     if sys.platform.startswith("linux") and shutil.which("xvfb-run"):
         env.pop("DISPLAY", None)  # force xvfb-run's own server; the live :0 may be unattended
         cmd = ["xvfb-run", "-a", *cmd]
-    print(f"[icon_pipeline] rendering {len(RECIPES)} recipes via {BIN.name} (theme={theme}) ...")
+    n_req = len(json.loads(recipes_json.read_text(encoding="utf-8"))["recipes"])
+    print(f"[icon_pipeline] rendering {n_req} recipes via {BIN.name} (theme={theme}) ...")
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout_s)
     for line in proc.stdout.splitlines():
         if "iconpipe" in line:
@@ -1452,6 +1453,25 @@ def _fit(img: Image.Image, w: int, h: int, inset: int) -> Image.Image:
     cell = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     cell.alpha_composite(img.resize((nw, nh), Image.LANCZOS), ((w - nw) // 2, (h - nh) // 2))
     return cell
+
+
+def _recipe_uses_accent(recipe: dict) -> bool:
+    """True when any build step paints a body with a PRIMARY/SECONDARY accent color.
+
+    Matched on the color VALUE, not on which helper produced it, so a recipe that inlines
+    the constant instead of calling accent() is still caught. Material presets (brass,
+    steel, ...) and CAM toolpaths use their own colors and correctly test False.
+    """
+    refs = (tuple(PRIMARY_RGB), tuple(SECONDARY_RGB))
+    for step in _flatten_steps(recipe["steps"]):
+        if step.get("op") != "set_appearance":
+            continue
+        col = step.get("color")
+        if not col or len(col) < 3:
+            continue
+        if any(all(abs(float(col[i]) - ref[i]) < 1e-4 for i in range(3)) for ref in refs):
+            return True
+    return False
 
 
 def inject(names: list[str]) -> list[str]:
@@ -1484,6 +1504,24 @@ def inject(names: list[str]) -> list[str]:
     # SDF glyphs from these (their neutral-grey shading can pass the loader's chroma gate, but an
     # SDF re-raster would flatten them to a tinted silhouette). See icons_sdf.h.
     atlas["raster_only"] = sorted(set(atlas.get("raster_only", [])) | set(done))
+    # Publish which tiles carry an accent role, and the reference colors they were baked
+    # with. host/src/ui/icons.cpp rotates exactly these cells from the reference hues to
+    # whatever primary/secondary the user picked, and leaves every other cell alone — so a
+    # brass appearance swatch or a CAM toolpath tile keeps the color it is *depicting*.
+    # Derived from the recipe steps rather than a hand-kept list: a recipe that stops using
+    # accent() drops out of the set automatically.
+    tinted = set(atlas.get("accent_tinted", []))
+    for name in done:
+        recipe = RECIPES.get(name)
+        if recipe is None:
+            continue  # CAM tiles etc. — rendered, but never accent-colored
+        if _recipe_uses_accent(recipe):
+            tinted.add(name)
+        else:
+            tinted.discard(name)
+    atlas["accent_tinted"] = sorted(tinted)
+    atlas["accent_ref"] = {"primary": [round(c, 6) for c in PRIMARY_RGB],
+                           "secondary": [round(c, 6) for c in SECONDARY_RGB]}
     (ICON_DIR / "atlas.json").write_text(json.dumps(atlas, indent=1), encoding="utf-8")
     # Deploy to the built app so a verification run picks the new art up immediately.
     if DEPLOYED_ICON_DIR.exists():
@@ -1533,6 +1571,9 @@ def main(argv=None) -> int:
     ap.add_argument("--inject-only", action="store_true", help="re-tile from existing renders")
     ap.add_argument("--list", action="store_true", help="print the recipe table and exit")
     ap.add_argument("--theme", default="dark", help="CHUDWARE_THEME for the render run")
+    ap.add_argument("--only", default=None,
+                    help="comma-separated icon names: render/inject just these (fast "
+                         "iteration on one family; every other atlas cell is untouched)")
     args = ap.parse_args(argv)
 
     if args.list:
@@ -1542,16 +1583,26 @@ def main(argv=None) -> int:
 
     from cam_toolpath_icons import CAM_CELLS, render_all as cam_render_all
 
-    names = list(RECIPES.keys()) + CAM_CELLS
+    only: set[str] | None = None
+    if args.only:
+        only = {n.strip() for n in args.only.split(",") if n.strip()}
+        unknown = sorted(only - set(RECIPES) - set(CAM_CELLS))
+        if unknown:
+            sys.exit(f"--only: no such recipe: {', '.join(unknown)}")
+
+    names = [n for n in list(RECIPES.keys()) + CAM_CELLS if only is None or n in only]
     cam_failures: dict[str, str] = {}
     if args.render:
         recipes_json = REPO / "scratch" / "icon_recipes.json"
         recipes_json.parent.mkdir(parents=True, exist_ok=True)
-        write_recipes(recipes_json)
+        write_recipes(recipes_json, only=only)
         rc = run_app(recipes_json, theme=args.theme)
         print(f"[icon_pipeline] app exit={rc}")
         # T-BL34: Manufacture tiles from the REAL CAM chain (also a CAM smoke test)
-        _, cam_failures = cam_render_all()
+        # Skipped under --only unless a cam_* tile was actually asked for: the CAM chain
+        # is minutes of solving and has nothing to do with a modeling-tile iteration.
+        if only is None or any(n.startswith("cam_") for n in only):
+            _, cam_failures = cam_render_all()
 
     if args.render or args.inject_only:
         # Append any missing atlas cells for RECIPE names too (e.g. a brand-new

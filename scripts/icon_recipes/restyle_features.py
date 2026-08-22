@@ -26,7 +26,9 @@ def rect(x0, y0, x1, y1, tag):
 RECIPES: dict[str, dict] = {
 
     # -------------------------------------------------------------- 3D Body
-    # extrude_boss: thin GREY sketch-plane plate + TEAL block grown out of it.
+    # extrude_boss: thin GREY sketch-plane plate, ORANGE block grown out of it, and a real
+    # 3D BLUE arrow continuing along the extrude direction so the tile shows which way the
+    # material went (Hunter: "arrows in 3d pointing out of them in the direction").
     "extrude_boss": {"yaw": 35, "pitch": 26, "steps": [
         *sketch_with_id(rect(-22, -18, 22, 18, "pl"), plane="plane.top",
                         name="PlateSk", fid="f1"),
@@ -40,8 +42,11 @@ RECIPES: dict[str, dict] = {
             "type": "extrude", "name": "Boss",
             "params": {"mode": "boss", "depth": dim(26)}, "merge": False,
             "refs": {"profile": [region("f3", 0, 0)]}}},
+        # f5 = shaft sketch, f6 = shaft extrude, f7 = head sketch, f8 = head revolve
+        *arrow3d("f5", "f7", base=34, length=30),
         grey("b1"),
         accent("b2"),
+        accent2("b3"), accent2("b4"),
     ]},
 
     # extrude_cut: grey block, pocket plunged into its top face.
@@ -760,7 +765,9 @@ RECIPES: dict[str, dict] = {
 
 
 ANN: dict[str, dict] = {
-    "extrude_boss":     {"arrow": [0.50, 0.42, 0.50, 0.06]},
+    # extrude_boss now carries a REAL 3D arrow body (arrow3d in its recipe); a flat
+    # overlay on top of it would double the cue and fight the perspective.
+    "extrude_boss":     {},
     "extrude_cut":      {"arrow": [0.50, 0.06, 0.50, 0.44]},
     "revolve_boss":     {"arc": [0.50, 0.22, 0.17, 210, 330]},
     "revolve_cut":      {"arc": [0.50, 0.22, 0.17, 210, 330]},

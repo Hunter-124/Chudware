@@ -49,6 +49,10 @@ on:
 
 permissions:
   contents: read
+  # Required to LIST workflow runs for the target sha. Without it `gh api
+  # .../actions/workflows/<f>/runs` 403s, which is exactly how the first
+  # push-triggered deploy died -- reading advisory CI state it does not act on.
+  actions: read
   # Failure alerting files and later closes one deduplicated GitHub issue, the
   # same recovery shape prod-external-watch uses. Nothing else here writes.
   issues: write
@@ -242,14 +246,22 @@ jobs:
             local runs status conclusion verdict=absent
             # Captured into a variable rather than expanded straight into the
             # heredoc: a command substitution inside a heredoc body swallows its
-            # exit status, so a gh outage would read as "that gate never ran"
-            # and this job would report a clean skip having measured nothing.
-            # Under `set -e` the assignment below turns that into a loud red.
+            # exit status, so a gh outage would read as "that gate never ran".
+            #
+            # This used to `return 1` and, under `set -e`, abort the deploy. That
+            # was right when these states BLOCKED the promotion; it is wrong now
+            # that they are advisory. It also failed closed for the wrong reason:
+            # listing workflow runs needs `actions: read`, which this job's
+            # permissions block did not grant, so the first push-triggered deploy
+            # died reading a signal it does not even act on. The permission is
+            # granted now; this degrades to `unreadable` regardless, because a
+            # value nothing branches on must never be able to stop a release.
             if ! runs="$(gh api \
                   "repos/${GITHUB_REPOSITORY}/actions/workflows/$1/runs?head_sha=${target}&per_page=100" \
-                  --jq '.workflow_runs[] | "\(.status) \(.conclusion)"')"; then
-              echo "::error title=Cannot read gate state::gh api could not list $1 runs for ${target}; refusing to guess whether the tree is green" >&2
-              return 1
+                  --jq '.workflow_runs[] | "\(.status) \(.conclusion)"' 2>/dev/null)"; then
+              echo "::notice title=Gate state unreadable::could not list $1 runs for ${target}; reporting it as unreadable. This does not block the deploy -- the blocking gate is scripts/check.py." >&2
+              echo unreadable
+              return 0
             fi
             while read -r status conclusion; do
               [ -n "${status}" ] || continue

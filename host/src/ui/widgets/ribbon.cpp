@@ -297,14 +297,37 @@ struct SmColumn {
     float width;   // measured width = max row width in this column (screen px)
 };
 
-// Pack `widths[]` (per-row measured widths) into vertical columns of at most `rowsPerCol` each,
-// returning the column descriptors. Total width of the stack = sum of column widths.
+// Pack `widths[]` (per-row measured widths) into vertical columns of at most `rowsPerCol`
+// each, returning the column descriptors. Total width of the stack = sum of column widths.
+//
+// The packing is BALANCED, not greedy. Filling each column to rowsPerCol before starting the
+// next is what produced the ribbon's worst-looking defect: a group of four small buttons came
+// out as a full column of three plus a lone button stranded at the top of a second column,
+// with two empty cells under it. "3D Body" (Extrude/Revolve/Sweep + Loft) and "Multi-body"
+// (Combine/Subtract/Intersect + Split) both read as broken for exactly that reason.
+//
+// Spreading the same rows over the same number of columns costs nothing -- the column count is
+// already ceil(n / rowsPerCol) either way, so this never widens a group -- and it turns 3+1
+// into 2+2. Short groups get shorter and wider, which is the horizontal reading Hunter asked
+// for, and no column is ever taller than the body zone allows.
+//
+// Remainder goes to the LEADING columns so heights are non-increasing left to right; a group
+// that steps down reads as deliberate where one that steps up reads as a wrap.
 static std::vector<SmColumn> ribbon_packColumns(const std::vector<float>& widths, int rowsPerCol) {
     std::vector<SmColumn> cols;
     if (rowsPerCol < 1) rowsPerCol = 1;
-    for (int i = 0; i < (int)widths.size(); ) {
+    const int n = (int)widths.size();
+    if (n <= 0) return cols;
+
+    const int ncols = (n + rowsPerCol - 1) / rowsPerCol;   // same count greedy would use
+    const int base  = n / ncols;
+    int       extra = n % ncols;                           // first `extra` columns take one more
+
+    for (int i = 0, c = 0; c < ncols; ++c) {
         SmColumn col; col.first = i; col.count = 0; col.width = 0.0f;
-        for (int r = 0; r < rowsPerCol && i < (int)widths.size(); ++r, ++i) {
+        int take = base + (extra > 0 ? 1 : 0);
+        if (extra > 0) --extra;
+        for (int r = 0; r < take && i < n; ++r, ++i) {
             col.width = ImMax(col.width, widths[i]);
             col.count++;
         }

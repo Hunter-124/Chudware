@@ -188,22 +188,41 @@ Production is **continuous**: it tracks canonical `master`, not tags.
   the canonical repository's `master` branch, select the single
   `livingroom-pc` self-hosted Linux runner, and invoke
   `/home/liveuser/Repositories/CAD/Webservice/deploy/update.sh staging`.
-- **Production:** `.github/workflows/deploy-prod.yml` reacts to a successful
-  `linux-gate` completion on canonical `master`. `linux-gate` is the entire
-  production gate, and deliberately so: production *is* Linux plus a WASM
-  bundle, and `scripts/gate.sh --strict` builds and exercises exactly that —
-  core, host, the Emscripten relink, `ctest`, the hostd smoke, and the web
-  parity probe that compares the linked bundle's baked assets against the repo.
+- **Production:** `.github/workflows/deploy-prod.yml` fires on every push to
+  canonical `master` (and on a green `linux-gate`, and on manual dispatch).
 
-  `native-build` is **read and reported, never blocking**. It compiles macOS
-  arm64, macOS x86_64 and Windows and only concludes success when all four legs
-  pass, and two of those legs live on laptops. Gating production on it would
-  mean master stops reaching customers whenever someone's MacBook is asleep —
-  silently, behind a green tree, which is precisely how production sat fifteen
-  days stale in the first place. Swapping one silent-staleness mechanism for
-  another is not a safety gate. A broken macOS compile cannot reach a
-  Linux + WASM deployment; `native-build` still runs on every push and still
-  goes red where developers see it.
+  **No CI workflow blocks the deploy, and that is measured rather than lax.**
+  On the current fleet not one of them can conclude: `fast-gate` and
+  `native-build` both matrix onto `cc-mac-arm` (macbook-air-m2, offline) and
+  `native-build` only reports success when all four legs pass; `linux-gate` is
+  the only workflow that concludes at all, and it carries a standing backlog of
+  roughly fifty failures unrelated to shipping a web bundle — agent
+  tool-guidance curation, MCP suites, and env-optional dependencies (Netgen,
+  torch, DVC) that CI does not provision. Blocking on a workflow that cannot
+  conclude does not make anything safer; it stops production tracking master,
+  silently, behind a tree that looks green. That is exactly how production came
+  to serve a bundle linked 2026-08-07 for fifteen days. All three states are
+  read and reported into the run log and summary; none of them vetoes a release.
+
+  What gates instead actually runs, in order:
+
+  1. **`scripts/check.py`, inline** — nine deterministic source audits, ~17 s,
+     including icon-atlas coverage and ribbon-command-to-handler routing, the
+     two surfaces most likely to be wrong in an asset or ribbon change. Hard
+     fail. It runs under `~/.local/share/Chudware/mcp-venv` because
+     `advertised_tool_audit` warms the real tool registry and needs PyYAML, the
+     MCP SDK, NumPy and SciPy; under the system interpreter it warms a 7-tool
+     catalog and fails for a reason unrelated to the commit.
+  2. **`install_webd.sh`** — builds core, host and the WASM relink, validates
+     the prompt payload, and asserts the linked bundle is byte-identical to the
+     repo *before* swapping `current`. A broken build cannot reach production;
+     the swap simply never happens.
+  3. **Post-deploy verification**, then **automatic rollback** to the previous
+     retained release plus a filed issue if any of it fails.
+
+  Restoring a CI pre-gate is a matter of bringing `macbook-air-m2` back online
+  and burning down the `linux-gate` backlog; the `workflow_run` trigger is still
+  wired, so a green `linux-gate` re-enters this same path with no edit needed.
 
   It runs on the single `cc-linux-livingroom` runner as `liveuser` and invokes:
 

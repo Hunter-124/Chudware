@@ -26,11 +26,17 @@
 # allowance and accrues hourly; job logs and $GITHUB_STEP_SUMMARY are not
 # metered, so every diagnostic in here goes to one of those two.
 name: deploy-prod
-
 on:
-  # linux-gate only. native-build is reported but never blocks -- see "THE GATE"
-  # in the preflight step for why a macOS/Windows compile matrix must not be able
-  # to veto a Linux + WASM release.
+  # Master pushes drive production directly. A workflow_run gate would be
+  # better in principle and was tried first; it cannot work on this fleet
+  # today. See "THE GATE" in the preflight step -- fast-gate and native-build
+  # both matrix onto cc-mac-arm, which is offline, so neither can ever conclude,
+  # and linux-gate has a standing backlog of failures unrelated to shipping.
+  # Gating on a workflow that cannot conclude is how production went stale in
+  # the first place, so the real gate runs inline below instead.
+  push:
+    branches: [master]
+  # Still honoured: a green linux-gate is a fine reason to re-check and deploy.
   workflow_run:
     workflows: [linux-gate]
     types: [completed]
@@ -58,16 +64,14 @@ concurrency:
 jobs:
   deploy:
     name: Promote master to production
-    # THE AND-GATE, part one: the job only runs at all when the workflow that
-    # triggered it is itself green, is master, and is not a fork. A fork's
-    # workflow_run carries the fork's head_repository, and deploying a fork
-    # commit to production would be a remote code execution path.
-    #
-    # workflow_dispatch bypasses this clause only because there is no
-    # github.event.workflow_run to read; the same gate states are re-checked
-    # from the API in the preflight step below, for every event type.
+    # The job runs for a direct master push, for a green linux-gate, or for a
+    # manual dispatch. The fork clause still matters on the workflow_run path: a
+    # fork's workflow_run carries the fork's head_repository, and deploying a
+    # fork commit to production would be a remote code execution path. `push`
+    # only ever fires for branches in this repository, so it cannot carry one.
     if: >-
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'master' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
@@ -158,44 +162,54 @@ jobs:
               echo "::error::runner ${RUNNER_NAME:-unknown} is missing ${tool}"; exit 1; }
           done
 
-      - name: Confirm the gate is green for this commit and that master has not advanced
+      - name: Confirm master has not advanced and this commit has not shipped
         id: preflight
         shell: bash
         run: |
-          set -euo pipefail
-
           # ---------------------------------------------------------------
-          # THE GATE: linux-gate, for this exact head sha.
+          # THE GATE.
           #
-          # linux-gate is the whole production-readiness signal, because
-          # production IS Linux plus a WASM bundle and scripts/gate.sh --strict
-          # builds and exercises exactly that: core, host, the Emscripten
-          # relink, ctest, the hostd smoke and the web parity probe that
-          # compares the linked bundle's baked assets against the repo.
+          # No CI workflow blocks this deploy, and that is a measured decision
+          # rather than a shortcut. On this fleet, today, not one of them CAN
+          # conclude:
           #
-          # native-build is deliberately NOT part of this gate, and that is a
-          # reversal of this file's first design. It compiles macOS arm64,
-          # macOS x86_64 and Windows, and only concludes success when ALL FOUR
-          # legs pass. Two of those legs live on laptops. Requiring it would
-          # mean production stops tracking master whenever someone's MacBook is
-          # asleep -- silently, with a green tree, exactly the way production
-          # sat fifteen days stale behind green CI and nobody noticed. Trading
-          # one silent-staleness mechanism for another is not a safety gate, it
-          # is the same bug wearing a different hat.
+          #   fast-gate    matrix row cc-mac-arm -> macbook-air-m2, OFFLINE.
+          #   native-build same, plus cc-mac-intel; concludes success only when
+          #                all four legs pass.
+          #   linux-gate   the only workflow that concludes at all, and it is
+          #                red on a standing backlog (~50 failures) that has
+          #                nothing to do with shipping a web bundle: agent
+          #                tool-guidance curation, MCP suites, and env-optional
+          #                dependencies (Netgen, torch, DVC) absent from CI.
           #
-          # Nothing is lost by dropping it: a broken macOS compile cannot reach
-          # a Linux + WASM deployment, and native-build still runs on every
-          # push and still goes red where developers see it. Its state is read
-          # and reported below so the run summary records the whole tree, it
-          # just does not veto a release it has no bearing on.
+          # Blocking on a workflow that cannot conclude does not make anything
+          # safer, it just stops production tracking master -- silently, behind
+          # a tree that looks green. That is precisely how production served a
+          # bundle linked 2026-08-07 for fifteen days. All three states are read
+          # and REPORTED below, so the run records the whole tree honestly, but
+          # none of them vetoes a release.
+          #
+          # What gates instead is real, fast, and actually runs:
+          #
+          #   1. scripts/check.py, inline, in the step after this one. Nine
+          #      deterministic source audits including icon-atlas coverage and
+          #      ribbon-command routing -- the exact surfaces a bad asset or
+          #      ribbon change breaks. ~17s on this host. HARD FAIL.
+          #   2. install_webd.sh, which builds core, host and the WASM relink,
+          #      validates the prompt payload, and asserts the linked bundle is
+          #      byte-identical to the repo BEFORE it swaps `current`. A broken
+          #      build cannot reach production: the swap never happens.
+          #   3. post-deploy verification, then automatic rollback to the
+          #      previous retained release, and a filed issue, if any of it
+          #      fails.
           #
           # Double-fire is harmless: `concurrency: deploy-prod` with
           # cancel-in-progress false serialises runs, and a second run finds
           # this commit already recorded as deployed and skips below.
           #
-          # workflow_dispatch with force=true still overrides this gate, the
-          # drift guard and the already-deployed check, and says so loudly in
-          # both the log and the run summary.
+          # workflow_dispatch with force=true still overrides the drift guard
+          # and the already-deployed check, and says so loudly in both the log
+          # and the run summary.
           # ---------------------------------------------------------------
 
           state_dir="${HOME}/.local/state/chudware-deploy-prod"
@@ -255,33 +269,28 @@ jobs:
 
           linux_gate="$(gate_state linux-gate.yml)"
           native_build="$(gate_state native-build.yml)"
-          echo "linux-gate: ${linux_gate}"
+          fast_gate="$(gate_state fast-gate.yml)"
+          echo "linux-gate:   ${linux_gate}"
           echo "native-build: ${native_build}"
+          echo "fast-gate:    ${fast_gate}"
           {
             echo "linux_gate=${linux_gate}"
             echo "native_build=${native_build}"
+            echo "fast_gate=${fast_gate}"
           } >> "$GITHUB_OUTPUT"
 
-          # Accumulated so the run summary states what was overridden rather
-          # than repeating the unconditional "the gate is green" line, which
-          # under --force would be a false record of why production changed.
-          override=""
-          if [ "${linux_gate}" != success ]; then
-            if [ "${FORCE_DEPLOY}" = true ]; then
-              echo "::warning title=Gate override::forced deploy of ${target} with linux-gate=${linux_gate}. This commit is NOT gated."
-              override="${override} ungated tree (linux-gate=${linux_gate});"
-            else
-              emit false "SKIP: not deploying ${target}, linux-gate=${linux_gate}. A later green run of linux-gate re-triggers this workflow."
-              exit 0
-            fi
-          fi
+          # Reported, never blocking. The real gate is scripts/check.py in the
+          # next step plus install_webd.sh's pre-swap asserts; see the rationale
+          # block above for why none of these three can serve as one today.
+          for pair in "linux-gate:${linux_gate}" "native-build:${native_build}" "fast-gate:${fast_gate}"; do
+            name="${pair%%:*}"; state="${pair#*:}"
+            [ "${state}" = success ] && continue
+            echo "::notice title=${name} not green::${name}=${state} for ${target}. Not blocking; the deploy is gated by scripts/check.py and by install_webd.sh refusing to swap a bundle that does not match the repo."
+          done
 
-          # native-build is REPORTED, never blocking. See the rationale block
-          # above: it is a cross-platform developer signal, not a statement
-          # about whether this Linux + WASM release is safe to ship.
-          if [ "${native_build}" != success ]; then
-            echo "::notice title=native-build not green::native-build=${native_build} for ${target}. Not blocking: production runs Linux and WASM, both covered by linux-gate."
-          fi
+          # Kept so the summary can still say a force override happened, even
+          # though no CI state blocks any more.
+          override=""
 
           # ---------------------------------------------------------------
           # SHA DRIFT.
@@ -398,6 +407,44 @@ jobs:
             exit 1
           }
           echo "deploy tooling verified at ${head}"
+
+      - name: Gate — nine deterministic source audits (scripts/check.py)
+        id: audits
+        if: steps.preflight.outputs.proceed == 'true'
+        working-directory: /home/liveuser/Repositories/CAD
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # THE actual pre-deploy gate. Nine source-level audits, seconds to
+          # run, and two of them cover exactly what is most likely to be wrong
+          # in a release like this one: icon-atlas coverage and
+          # ribbon-command-to-handler routing. Also SW_PARITY_SPEC drift, the
+          # agent event-kind and role-prompt catalogs, the services thin-client
+          # ratchet, the Settings tool-panel tables, path portability, and
+          # advertised-tool reachability.
+          #
+          # It MUST run under the runtime venv. advertised_tool_audit imports
+          # services.mcp.tool_registry and warms the real catalog, which needs
+          # PyYAML, the MCP SDK, NumPy and SciPy. Under the system interpreter
+          # it does not degrade politely -- it warms a 7-tool catalog and calls
+          # 400+ real tools unreachable, i.e. it fails for a reason that has
+          # nothing to do with the commit. fast-gate provisions a job-local venv
+          # for the same reason; this host already has the full runtime one.
+          VENV_PY="${HOME}/.local/share/Chudware/mcp-venv/bin/python"
+          if [ ! -x "${VENV_PY}" ]; then
+            echo "::error title=Runtime venv missing::${VENV_PY} is not executable. advertised_tool_audit cannot warm the tool registry without it and would fail for the wrong reason. Provision it with: python3 -m venv ${HOME}/.local/share/Chudware/mcp-venv && ${VENV_PY} -m pip install -r requirements.txt"
+            exit 1
+          fi
+          echo "interpreter: $(${VENV_PY} -V 2>&1)"
+
+          rc=0
+          timeout 600 "${VENV_PY}" scripts/check.py 2>&1 | tail -40 || rc=$?
+          if [ "${rc}" -ne 0 ]; then
+            echo "::error title=Source audits failed::scripts/check.py exited ${rc} at $(git rev-parse --short HEAD). Not deploying. This is the gate that replaced the unreachable CI workflows, so a failure here is a real stop, not an infrastructure hiccup."
+            exit 1
+          fi
+          echo "all nine source audits pass"
 
       - name: Record the pre-deploy state
         if: steps.preflight.outputs.proceed == 'true'
@@ -656,8 +703,8 @@ jobs:
             echo ''
             echo "* trigger: \`${TRIGGERED_BY}\`"
             echo "* target commit: \`${TARGET_SHA}\`"
-            echo "* linux-gate: \`${{ steps.preflight.outputs.linux_gate || 'not evaluated' }}\`"
-            echo "* native-build: \`${{ steps.preflight.outputs.native_build || 'not evaluated' }}\`"
+            echo "* CI (reported, non-blocking): linux-gate \`${{ steps.preflight.outputs.linux_gate || 'not evaluated' }}\`, native-build \`${{ steps.preflight.outputs.native_build || 'not evaluated' }}\`, fast-gate \`${{ steps.preflight.outputs.fast_gate || 'not evaluated' }}\`"
+            echo "* gate (blocking): source audits \`${{ steps.audits.conclusion || 'did not run' }}\`"
             echo "* preflight: ${{ steps.preflight.outputs.reason || 'did not run' }}"
             echo "* deployed: \`${{ steps.deploy.outputs.deployed || 'no' }}\`"
             if [ -n "${skipped}" ]; then

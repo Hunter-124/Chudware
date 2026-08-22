@@ -62,6 +62,7 @@ try:
     from .metrics import MetricsMiddleware, router as metrics_router
     from .security import router as security_router
     from .appeals import router as appeals_router
+    from .orgs import router as orgs_router
     from .portal_api import router as portal_api_router
     from .portal_serve import router as portal_serve_router
 except ImportError:
@@ -81,6 +82,7 @@ except ImportError:
     from metrics import MetricsMiddleware, router as metrics_router
     from security import router as security_router
     from appeals import router as appeals_router
+    from orgs import router as orgs_router
     from portal_api import router as portal_api_router
     from portal_serve import router as portal_serve_router
 
@@ -460,6 +462,7 @@ app.include_router(terminal_router)
 app.include_router(deploy_router)
 app.include_router(releases_router)
 app.include_router(bucket_router)
+app.include_router(orgs_router)
 app.include_router(accounts_router)
 app.include_router(billing_router)
 app.include_router(entitlement_router)

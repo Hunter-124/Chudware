@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +35,21 @@ def _env_float(name: str, default: float) -> float:
 
 def _expand_path(raw: str) -> Path:
     return Path(raw).expanduser().resolve()
+
+
+def _canonical_uuid(value: str) -> str:
+    """Canonical lowercase UUID text, or ValueError.
+
+    Used for the org/team path components of the shared bucket tree: only the
+    exact 8-4-4-4-12 form is accepted, so no separator, traversal sequence, or
+    absolute path can ever reach a path join.
+    """
+    raw = (value or "").strip()
+    parsed = uuid.UUID(raw)
+    if str(parsed) != raw.lower():
+        raise ValueError(f"non-canonical uuid: {value!r}")
+    return str(parsed)
+
 
 def _normalize_team_domain(raw: str) -> str:
     raw = raw.strip().rstrip("/")
@@ -178,14 +194,14 @@ class Settings:
     project_roots_raw: str = field(
         default_factory=lambda: _env("CHUDWARE_WEB_PROJECT_ROOTS", "") or ""
     )
-    # Web-native client: shared engine daemon socket + team workspace root.
+    # Web-native client: shared engine daemon socket + per-account workspace root.
     # Env overrides win; else webd.env (install_webd.sh); else deterministic
     # defaults (instance key "chudwareweb" is verbatim => socket name is stable).
     webd_socket: Path = field(default_factory=Path)
     workspace_root: Path = field(default_factory=Path)
-    # Team file-drop bucket (/bucket page): any logged-in user can upload/organize
-    # files here. Independent of workspace_root (the CAD engine's live doc tree) —
-    # separate concern so uploads don't collide with .aicm mesh cache / doc autosave.
+    # File bucket storage: the default scope is private to one account; explicit
+    # team scopes live under organizations/<org UUID>/teams/<team UUID> and are
+    # authorized from PostgreSQL memberships on every request.
     bucket_root: Path = field(default_factory=Path)
     # WASM web client static root (served at /app) + client perf traces.
     app_dir: Path = field(default_factory=Path)
@@ -215,6 +231,12 @@ class Settings:
     )
     trial_days: int = field(
         default_factory=lambda: _env_int("CHUDWARE_WEB_TRIAL_DAYS", 14)
+    )
+    # How long an organization invitation link stays redeemable. Long enough to
+    # survive a weekend and a forwarded mailbox, short enough that a link
+    # sitting in an old inbox is not a standing key to a customer's files.
+    org_invite_ttl_days: int = field(
+        default_factory=lambda: _env_int("CHUDWARE_WEB_ORG_INVITE_TTL_DAYS", 14)
     )
     # Absolute origin used to build verification, reset, and OAuth redirect
     # URLs. It has to be configuration, not a Host header: a link built from
@@ -418,6 +440,24 @@ class Settings:
     def user_bucket_root(self, slug: str) -> Path:
         """Per-account file drop. Isolation boundary for /api/bucket/*."""
         return self.bucket_root / "users" / slug
+
+    def team_bucket_root(self, org_id: str, team_id: str) -> Path:
+        """Shared team file drop. Isolation boundary for /api/bucket/*?team=.
+
+        Both identifiers become path components, so both are re-validated here
+        as canonical UUID text even though the caller already validated them:
+        this is the last function before the join, and a helper that accepts
+        ``"../"`` because somebody skipped a check upstream is the whole bug
+        class. Raises ``ValueError`` — a caller that reaches this with garbage
+        has a logic error, not a client with a bad request.
+        """
+        return (
+            self.bucket_root
+            / "orgs"
+            / _canonical_uuid(org_id)
+            / "teams"
+            / _canonical_uuid(team_id)
+        )
 
     @property
     def terminal_layout_file(self) -> Path:

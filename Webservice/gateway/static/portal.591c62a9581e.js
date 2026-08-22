@@ -1,8 +1,18 @@
 "use strict";
 
 (function () {
-  var state = { account: null, loaded: {}, releases: new Map(), subProviders: new Map(), subFlows: {} };
-  var pages = ["account", "billing", "usage", "ai", "downloads", "devices"];
+  var state = { account: null, loaded: {}, releases: new Map(), subProviders: new Map(), subFlows: {}, orgs: [], openTeams: {}, pendingInviteToken: null };
+  var pages = ["overview", "team", "downloads", "ai", "usage", "billing", "account", "devices"];
+  var PAGE_TITLES = {
+    overview: "Overview",
+    team: "Team & files",
+    downloads: "Download desktop",
+    ai: "AI setup",
+    usage: "Usage & credits",
+    billing: "Plans & billing",
+    account: "Account & security",
+    devices: "Devices"
+  };
 
   function el(id) { return document.getElementById(id); }
   function q(selector, root) { return (root || document).querySelector(selector); }
@@ -81,7 +91,7 @@
   }
 
   function setPage(name, updateHash) {
-    if (pages.indexOf(name) < 0) name = "account";
+    if (pages.indexOf(name) < 0) name = "overview";
     qa(".nav-item").forEach(function (button) {
       button.classList.toggle("active", button.dataset.page === name);
     });
@@ -89,8 +99,8 @@
       page.classList.toggle("active", page.dataset.view === name);
     });
     if (name !== "ai") { stopSubscriptionFlows(); clear(el("suboauth-flow")); }
-    el("page-title").textContent = titleCase(name === "ai" ? "AI setup" : name);
-    document.title = "Chudware · " + titleCase(name === "ai" ? "AI setup" : name);
+    el("page-title").textContent = PAGE_TITLES[name];
+    document.title = "Chudware · " + PAGE_TITLES[name];
     document.body.classList.remove("menu-open");
     el("menu-button").setAttribute("aria-expanded", "false");
     if (updateHash && window.location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
@@ -98,15 +108,26 @@
     window.scrollTo({ top: 0, behavior: "instant" });
   }
 
+  function arrowLink(link, label, glyph) {
+    clear(link);
+    link.appendChild(document.createTextNode(label + " "));
+    var mark = text(glyph === "→" ? "i" : "span", glyph);
+    mark.setAttribute("aria-hidden", "true");
+    link.appendChild(mark);
+  }
+
   function applyCloudGate() {
     var allowed = Boolean(state.account && state.account.cloud);
-    [el("open-cloud"), el("hero-cloud")].forEach(function (link) {
-      if (!link) return;
-      link.href = allowed ? "/app/" : "#billing";
-      link.classList.toggle("disabled", !allowed);
-      if (link.id === "hero-cloud") link.textContent = allowed ? "Open cloud workspace" : "Upgrade to Studio";
-      link.setAttribute("aria-disabled", allowed ? "false" : "true");
-    });
+    var topbar = el("open-cloud");
+    topbar.href = allowed ? "/app/" : "#billing";
+    arrowLink(topbar, allowed ? "Open Chudware" : "Get cloud access", "↗");
+    var hero = el("hero-cloud");
+    hero.href = allowed ? "/app/" : "#billing";
+    hero.textContent = allowed ? "Open cloud workspace" : "Upgrade to Studio";
+    var dest = el("dest-cloud");
+    dest.href = allowed ? "/app/" : "#billing";
+    dest.classList.toggle("gated", !allowed);
+    arrowLink(el("dest-cloud-cta"), allowed ? "Open workspace" : "Included with Studio — upgrade", "→");
   }
 
   function renderAccount(account) {
@@ -524,8 +545,531 @@
     });
   }
 
+  // ---- Team & files: organizations, teams, shared buckets ----
+
+  var ORG_ROLES = ["member", "admin"];
+  var TEAM_ROLES = ["member", "manager"];
+
+  function orgPath(orgId) { return "/api/orgs/" + encodeURIComponent(orgId); }
+  function teamPath(orgId, teamId) { return orgPath(orgId) + "/teams/" + encodeURIComponent(teamId); }
+  function canManageOrg(org) { return org.role === "owner" || org.role === "admin"; }
+  function canManageTeam(org, team) { return canManageOrg(org) || team.role === "manager"; }
+  function orgCreationAllowed() {
+    return Boolean(state.account)
+      && state.account.status === "active"
+      && (state.account.plan === "studio" || state.account.plan === "enterprise");
+  }
+
+  function roleChip(role) {
+    return text("span", titleCase(role), "role-chip role-" + String(role || "member"));
+  }
+
+  function roleSelect(current, roles, label) {
+    var select = document.createElement("select");
+    select.className = "role-select";
+    roles.forEach(function (role) {
+      var option = document.createElement("option");
+      option.value = role;
+      option.textContent = titleCase(role);
+      select.appendChild(option);
+    });
+    select.value = current;
+    select.setAttribute("aria-label", label);
+    return select;
+  }
+
+  function sectionTitle(label) { return text("h4", label); }
+
+  function confirmedOrgCall(message, request, done) {
+    if (!window.confirm(message)) return Promise.resolve();
+    return request().then(function () { return refreshTeam(done); });
+  }
+
+  async function refreshTeam(message) {
+    state.loaded.team = false;
+    await loadTeam(true);
+    if (message) showMessage(message, false);
+  }
+
+  function renderTeamGate() {
+    var allowed = orgCreationAllowed();
+    el("team-upsell").hidden = allowed;
+    el("org-create-card").hidden = !allowed;
+  }
+
+  function clearInviteParam() {
+    state.pendingInviteToken = null;
+    history.replaceState(null, "", window.location.pathname + "#team");
+  }
+
+  async function acceptInvitation(body, statusNode) {
+    statusNode.textContent = "Joining…";
+    var result = await api("/api/orgs/invitations/accept", { method: "POST", body: JSON.stringify(body) });
+    var org = result.org || {};
+    var team = result.team || {};
+    await refreshTeam("Joined " + (org.name || "the organization") + ". Shared files live in its " + (team.name || "General") + " team.");
+  }
+
+  function renderInviteBanner() {
+    var host = el("org-invite-banner");
+    clear(host);
+    if (!state.pendingInviteToken) { host.hidden = true; return; }
+    host.hidden = false;
+    host.appendChild(text("strong", "You have an invitation"));
+    host.appendChild(text("p", "Accept it to join the organization. You will be added to its General team right away, with access to the team's shared files.", "fine"));
+    var status = text("p", "", "fine");
+    var accept = text("button", "Accept invitation", "primary small");
+    accept.type = "button";
+    var dismiss = text("button", "Not now", "secondary small");
+    dismiss.type = "button";
+    var row = text("div", "", "button-row");
+    row.append(accept, dismiss);
+    host.append(row, status);
+    accept.addEventListener("click", async function () {
+      accept.disabled = true;
+      var token = state.pendingInviteToken;
+      try {
+        clearInviteParam();
+        await acceptInvitation({ token: token }, status);
+      } catch (error) {
+        accept.disabled = false;
+        state.pendingInviteToken = token;
+        status.textContent = error.message;
+      }
+    });
+    dismiss.addEventListener("click", function () {
+      clearInviteParam();
+      host.hidden = true;
+    });
+  }
+
+  function renderMyInvitations(invitations) {
+    var card = el("org-invitations-card");
+    var host = el("org-invitations");
+    clear(host);
+    card.hidden = !invitations.length;
+    invitations.forEach(function (invite) {
+      var row = text("div", "", "invite-row");
+      var line = text("div", "", "member-line");
+      var info = document.createElement("div");
+      info.appendChild(text("strong", invite.org_name || "Organization"));
+      var meta = "Invited by " + (invite.invited_by || "an organization admin") + " · Joins as " + titleCase(invite.role);
+      if (invite.expires_at) meta += " · Expires " + date(invite.expires_at);
+      info.appendChild(text("small", meta, "member-meta"));
+      var accept = text("button", "Accept", "primary small");
+      accept.type = "button";
+      var status = text("p", "", "fine");
+      line.append(info, accept);
+      row.append(line, status);
+      accept.addEventListener("click", async function () {
+        accept.disabled = true;
+        try {
+          await acceptInvitation({ invitation_id: invite.id }, status);
+        } catch (error) {
+          accept.disabled = false;
+          status.textContent = error.message;
+        }
+      });
+      host.appendChild(row);
+    });
+  }
+
+  function inlineForm(fields, submitLabel, onSubmit) {
+    var form = document.createElement("form");
+    form.className = "inline-form";
+    fields.forEach(function (field) {
+      var label = text("label", field.label + " ");
+      label.appendChild(field.control);
+      form.appendChild(label);
+    });
+    var submit = text("button", submitLabel, "secondary small");
+    submit.type = "submit";
+    var status = text("p", "", "fine");
+    status.setAttribute("role", "status");
+    form.append(submit, status);
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      submit.disabled = true;
+      status.textContent = "Working…";
+      try {
+        await onSubmit(status);
+      } catch (error) {
+        submit.disabled = false;
+        status.textContent = error.message;
+      }
+    });
+    return form;
+  }
+
+  function emailInput(placeholder) {
+    var input = document.createElement("input");
+    input.type = "email";
+    input.required = true;
+    input.autocomplete = "off";
+    input.placeholder = placeholder;
+    return input;
+  }
+
+  function orgHead(org) {
+    var head = text("div", "", "org-head");
+    var info = document.createElement("div");
+    info.appendChild(text("p", "Organization", "eyebrow"));
+    var title = text("h3", org.name + " ");
+    title.appendChild(roleChip(org.role));
+    info.appendChild(title);
+    info.appendChild(text("p", org.member_count + (org.member_count === 1 ? " member" : " members") + " · Owned by " + org.owner_email, "org-meta"));
+    head.appendChild(info);
+    if (canManageOrg(org)) {
+      var actions = text("div", "", "button-row");
+      var rename = text("button", "Rename", "secondary small");
+      rename.type = "button";
+      rename.addEventListener("click", async function () {
+        var name = window.prompt("Organization name", org.name);
+        if (!name || !name.trim() || name.trim() === org.name) return;
+        try {
+          await api(orgPath(org.id), { method: "PATCH", body: JSON.stringify({ name: name.trim() }) });
+          await refreshTeam("Organization renamed.");
+        } catch (error) { showMessage(error.message, true); }
+      });
+      actions.appendChild(rename);
+      if (org.role === "owner") {
+        var remove = text("button", "Delete organization", "danger small");
+        remove.type = "button";
+        remove.addEventListener("click", function () {
+          confirmedOrgCall(
+            "Delete " + org.name + "? Every team and its shared files become inaccessible to all members.",
+            function () { return api(orgPath(org.id), { method: "DELETE" }); },
+            "Organization deleted."
+          ).catch(function (error) { showMessage(error.message, true); });
+        });
+        actions.appendChild(remove);
+      }
+      head.appendChild(actions);
+    }
+    return head;
+  }
+
+  async function openTeamPanel(org, team, panel, toggle) {
+    state.openTeams[org.id + "/" + team.id] = true;
+    toggle.setAttribute("aria-expanded", "true");
+    toggle.textContent = "Hide members";
+    panel.hidden = false;
+    clear(panel);
+    panel.appendChild(text("p", "Loading members…", "fine"));
+    var detail;
+    try {
+      detail = await api(teamPath(org.id, team.id));
+    } catch (error) {
+      clear(panel);
+      panel.appendChild(text("p", error.message, "fine"));
+      return;
+    }
+    clear(panel);
+    var full = detail.team || team;
+    var members = detail.members || [];
+    var manage = canManageTeam(org, team);
+    if (!members.length) panel.appendChild(text("p", "No members in this team yet.", "fine"));
+    members.forEach(function (member) {
+      var row = text("div", "", "member-row");
+      var line = text("div", "", "member-line");
+      var info = document.createElement("div");
+      info.appendChild(text("strong", member.display || member.email));
+      info.appendChild(text("small", member.email + " · Added " + date(member.added_at), "member-meta"));
+      line.appendChild(info);
+      var controls = text("div", "", "button-row");
+      if (manage) {
+        var select = roleSelect(member.role, TEAM_ROLES, "Team role for " + member.email);
+        select.addEventListener("change", async function () {
+          try {
+            await api(teamPath(org.id, team.id) + "/members/" + encodeURIComponent(member.email), { method: "PATCH", body: JSON.stringify({ role: select.value }) });
+            await refreshTeam(member.email + " is now a team " + select.value + ".");
+          } catch (error) {
+            select.value = member.role;
+            showMessage(error.message, true);
+          }
+        });
+        controls.appendChild(select);
+        var remove = text("button", "Remove", "danger small");
+        remove.type = "button";
+        remove.addEventListener("click", function () {
+          confirmedOrgCall(
+            "Remove " + member.email + " from " + team.name + "? They immediately lose access to the team's shared files.",
+            function () { return api(teamPath(org.id, team.id) + "/members/" + encodeURIComponent(member.email), { method: "DELETE" }); },
+            member.email + " removed from " + team.name + "."
+          ).catch(function (error) { showMessage(error.message, true); });
+        });
+        controls.appendChild(remove);
+      } else {
+        controls.appendChild(roleChip(member.role));
+      }
+      line.appendChild(controls);
+      row.appendChild(line);
+      panel.appendChild(row);
+    });
+    if (manage) {
+      var email = emailInput("teammate@company.com");
+      var role = roleSelect("member", TEAM_ROLES, "Role for the new team member");
+      panel.appendChild(inlineForm(
+        [{ label: "Add an organization member to this team", control: email }, { label: "Team role", control: role }],
+        "Add to team",
+        async function () {
+          await api(teamPath(org.id, team.id) + "/members", { method: "POST", body: JSON.stringify({ email: email.value.trim(), role: role.value }) });
+          await refreshTeam(email.value.trim() + " added to " + team.name + ".");
+        }
+      ));
+    }
+    if (canManageOrg(org)) {
+      var adminRow = text("div", "", "button-row");
+      var renameTeam = text("button", "Rename team", "secondary small");
+      renameTeam.type = "button";
+      renameTeam.addEventListener("click", async function () {
+        var name = window.prompt("Team name", full.name);
+        if (!name || !name.trim() || name.trim() === full.name) return;
+        try {
+          await api(teamPath(org.id, team.id), { method: "PATCH", body: JSON.stringify({ name: name.trim() }) });
+          await refreshTeam("Team renamed.");
+        } catch (error) { showMessage(error.message, true); }
+      });
+      adminRow.appendChild(renameTeam);
+      if (!full.is_general) {
+        var removeTeam = text("button", "Delete team", "danger small");
+        removeTeam.type = "button";
+        removeTeam.addEventListener("click", function () {
+          confirmedOrgCall(
+            "Delete the " + team.name + " team? Its shared bucket becomes inaccessible to all members.",
+            function () { return api(teamPath(org.id, team.id), { method: "DELETE" }); },
+            "Team deleted."
+          ).catch(function (error) { showMessage(error.message, true); });
+        });
+        adminRow.appendChild(removeTeam);
+      }
+      panel.appendChild(adminRow);
+    }
+  }
+
+  function closeTeamPanel(org, team, panel, toggle) {
+    delete state.openTeams[org.id + "/" + team.id];
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.textContent = "Members";
+    panel.hidden = true;
+    clear(panel);
+  }
+
+  function teamRow(org, team) {
+    var row = text("div", "", "team-row");
+    var head = text("div", "", "team-row-head");
+    var info = document.createElement("div");
+    var name = text("strong", team.name + " ");
+    if (team.role) name.appendChild(roleChip(team.role));
+    info.appendChild(name);
+    info.appendChild(text("small", team.member_count + (team.member_count === 1 ? " member" : " members"), "team-meta"));
+    head.appendChild(info);
+    var actions = text("div", "", "button-row");
+    var open = text("a", "Open files", "secondary small");
+    open.href = team.bucket_url;
+    actions.appendChild(open);
+    var panel = text("div", "", "team-panel");
+    panel.hidden = true;
+    if (team.role || canManageOrg(org)) {
+      var toggle = text("button", "Members", "secondary small");
+      toggle.type = "button";
+      toggle.setAttribute("aria-expanded", "false");
+      toggle.addEventListener("click", function () {
+        if (panel.hidden) openTeamPanel(org, team, panel, toggle);
+        else closeTeamPanel(org, team, panel, toggle);
+      });
+      actions.appendChild(toggle);
+      if (state.openTeams[org.id + "/" + team.id]) openTeamPanel(org, team, panel, toggle);
+    }
+    head.appendChild(actions);
+    row.append(head, panel);
+    return row;
+  }
+
+  function orgTeamsSection(org, detail) {
+    var section = text("section", "", "org-section");
+    section.appendChild(sectionTitle("Teams"));
+    var list = text("div", "", "team-list");
+    var teams = detail.teams || [];
+    if (!teams.length) list.appendChild(text("p", "No teams yet.", "fine"));
+    teams.forEach(function (team) { list.appendChild(teamRow(org, team)); });
+    section.appendChild(list);
+    if (canManageOrg(org)) {
+      var name = document.createElement("input");
+      name.type = "text";
+      name.required = true;
+      name.maxLength = 120;
+      name.placeholder = "e.g. Drivetrain";
+      section.appendChild(inlineForm(
+        [{ label: "New team", control: name }],
+        "Create team",
+        async function () {
+          await api(orgPath(org.id) + "/teams", { method: "POST", body: JSON.stringify({ name: name.value.trim() }) });
+          await refreshTeam("Team created with its own shared bucket.");
+        }
+      ));
+    }
+    return section;
+  }
+
+  function orgMembersSection(org, detail) {
+    var section = text("section", "", "org-section");
+    section.appendChild(sectionTitle("Members"));
+    var list = text("div", "", "member-list");
+    (detail.members || []).forEach(function (member) {
+      var row = text("div", "", "member-row");
+      var line = text("div", "", "member-line");
+      var info = document.createElement("div");
+      info.appendChild(text("strong", member.display || member.email));
+      info.appendChild(text("small", member.email + " · Joined " + date(member.joined_at), "member-meta"));
+      line.appendChild(info);
+      var controls = text("div", "", "button-row");
+      if (member.role === "owner" || !canManageOrg(org)) {
+        controls.appendChild(roleChip(member.role));
+      } else {
+        var select = roleSelect(member.role, ORG_ROLES, "Organization role for " + member.email);
+        select.addEventListener("change", async function () {
+          try {
+            await api(orgPath(org.id) + "/members/" + encodeURIComponent(member.email), { method: "PATCH", body: JSON.stringify({ role: select.value }) });
+            await refreshTeam(member.email + " is now an organization " + select.value + ".");
+          } catch (error) {
+            select.value = member.role;
+            showMessage(error.message, true);
+          }
+        });
+        controls.appendChild(select);
+        if (org.role === "owner") {
+          var transfer = text("button", "Make owner", "secondary small");
+          transfer.type = "button";
+          transfer.addEventListener("click", function () {
+            confirmedOrgCall(
+              "Transfer ownership of " + org.name + " to " + member.email + "? You become an admin and the shared quota follows the new owner's plan.",
+              function () { return api(orgPath(org.id) + "/transfer-ownership", { method: "POST", body: JSON.stringify({ email: member.email }) }); },
+              member.email + " now owns " + org.name + "."
+            ).catch(function (error) { showMessage(error.message, true); });
+          });
+          controls.appendChild(transfer);
+        }
+        var remove = text("button", "Remove", "danger small");
+        remove.type = "button";
+        remove.addEventListener("click", function () {
+          confirmedOrgCall(
+            "Remove " + member.email + " from " + org.name + "? They immediately lose access to every team bucket.",
+            function () { return api(orgPath(org.id) + "/members/" + encodeURIComponent(member.email), { method: "DELETE" }); },
+            member.email + " removed from " + org.name + "."
+          ).catch(function (error) { showMessage(error.message, true); });
+        });
+        controls.appendChild(remove);
+      }
+      line.appendChild(controls);
+      row.appendChild(line);
+      list.appendChild(row);
+    });
+    section.appendChild(list);
+    return section;
+  }
+
+  function orgInvitesSection(org, detail) {
+    var section = text("section", "", "org-section");
+    var invitations = detail.invitations || [];
+    if (!invitations.length && !canManageOrg(org)) return section;
+    section.appendChild(sectionTitle("Invitations"));
+    var list = text("div", "", "invite-list");
+    if (!invitations.length) list.appendChild(text("p", "No pending invitations.", "fine"));
+    invitations.forEach(function (invite) {
+      var row = text("div", "", "invite-row");
+      var line = text("div", "", "member-line");
+      var info = document.createElement("div");
+      info.appendChild(text("strong", invite.email || "Pending invitation"));
+      var meta = "Joins as " + titleCase(invite.role) + " · Sent " + date(invite.created_at);
+      if (invite.expires_at) meta += " · Expires " + date(invite.expires_at);
+      info.appendChild(text("small", meta, "member-meta"));
+      line.appendChild(info);
+      if (canManageOrg(org)) {
+        var controls = text("div", "", "button-row");
+        var revoke = text("button", "Revoke", "danger small");
+        revoke.type = "button";
+        revoke.addEventListener("click", function () {
+          confirmedOrgCall(
+            "Revoke this invitation? Its email link stops working immediately.",
+            function () { return api(orgPath(org.id) + "/invitations/" + encodeURIComponent(invite.id), { method: "DELETE" }); },
+            "Invitation revoked."
+          ).catch(function (error) { showMessage(error.message, true); });
+        });
+        controls.appendChild(revoke);
+        line.appendChild(controls);
+      }
+      row.appendChild(line);
+      list.appendChild(row);
+    });
+    section.appendChild(list);
+    if (canManageOrg(org)) {
+      var email = emailInput("teammate@company.com");
+      var role = roleSelect("member", ORG_ROLES, "Organization role for the invitee");
+      section.appendChild(inlineForm(
+        [{ label: "Invite by email", control: email }, { label: "Organization role", control: role }],
+        "Send invitation",
+        async function () {
+          await api(orgPath(org.id) + "/invitations", { method: "POST", body: JSON.stringify({ email: email.value.trim(), role: role.value }) });
+          await refreshTeam("Invitation sent to " + email.value.trim() + ". They join the General team when they accept the emailed link.");
+        }
+      ));
+    }
+    return section;
+  }
+
+  async function renderOrgs(orgs) {
+    var host = el("org-list");
+    clear(host);
+    if (!orgs.length) {
+      host.appendChild(text(
+        "p",
+        orgCreationAllowed()
+          ? "You are not part of an organization yet. Create one above to share files with a team."
+          : "You are not part of an organization yet. Accept an invitation to join one, or choose Studio to create your own.",
+        "empty"
+      ));
+      return;
+    }
+    var mounts = orgs.map(function (org) {
+      var card = text("article", "", "card org-card");
+      card.appendChild(orgHead(org));
+      var body = text("div", "", "org-body");
+      body.appendChild(text("p", "Loading organization…", "empty"));
+      card.appendChild(body);
+      host.appendChild(card);
+      return { org: org, body: body };
+    });
+    await Promise.all(mounts.map(async function (mount) {
+      try {
+        var detail = await api(orgPath(mount.org.id));
+        clear(mount.body);
+        mount.body.append(
+          orgTeamsSection(mount.org, detail),
+          orgMembersSection(mount.org, detail),
+          orgInvitesSection(mount.org, detail)
+        );
+      } catch (error) {
+        clear(mount.body);
+        mount.body.appendChild(text("p", error.message, "empty"));
+      }
+    }));
+  }
+
+  async function loadTeam(force) {
+    if (state.loaded.team && !force) return;
+    renderTeamGate();
+    renderInviteBanner();
+    var payload = await api("/api/orgs");
+    state.orgs = payload.organizations || [];
+    renderMyInvitations(payload.invitations || []);
+    await renderOrgs(state.orgs);
+    state.loaded.team = true;
+  }
+
   async function loadPage(name) {
     if (!state.account) await loadAccount();
+    if (name === "team") await loadTeam(false);
     if (name === "billing") await loadBilling();
     if (name === "usage") await loadUsage();
     if (name === "ai") await loadAI();
@@ -538,6 +1082,20 @@
   el("menu-button").addEventListener("click", function () { var open = document.body.classList.toggle("menu-open"); this.setAttribute("aria-expanded", String(open)); });
   el("open-cloud").addEventListener("click", function (event) { if (state.account && !state.account.cloud) { event.preventDefault(); setPage("billing", true); showMessage("The cloud workspace is included with Studio. Choose Studio to continue.", false); } });
   el("hero-cloud").addEventListener("click", function (event) { if (state.account && !state.account.cloud) { event.preventDefault(); setPage("billing", true); showMessage("Upgrade to Studio to open Chudware in the browser.", false); } });
+  el("dest-cloud").addEventListener("click", function (event) { if (state.account && !state.account.cloud) { event.preventDefault(); setPage("billing", true); showMessage("The cloud workspace is included with Studio. Choose Studio to continue.", false); } });
+  el("org-create-form").addEventListener("submit", async function (event) {
+    event.preventDefault();
+    var status = el("org-create-status");
+    var input = el("org-create-name");
+    status.textContent = "Creating organization…";
+    try {
+      await api("/api/orgs", { method: "POST", body: JSON.stringify({ name: input.value.trim() }) });
+      this.reset();
+      await refreshTeam("Organization created. Invite teammates below — they join its General team automatically.");
+    } catch (error) {
+      status.textContent = error.message;
+    }
+  });
   el("password-form").addEventListener("submit", async function (event) { event.preventDefault(); var status = el("password-status"); status.textContent = "Updating…"; try { await api("/api/portal/password", { method: "POST", body: JSON.stringify({ current_password: el("current-password").value, new_password: el("new-password").value }) }); this.reset(); status.textContent = "Password updated."; } catch (error) { status.textContent = error.message; } });
   el("signout-all").addEventListener("click", async function () { if (!window.confirm("Sign out every session, including this browser?")) return; try { await api("/api/portal/signout-everywhere", { method: "POST" }); window.location.assign("/"); } catch (error) { showMessage(error.message, true); } });
   el("billing-portal").addEventListener("click", function () { openBillingPortal().catch(function (error) { showMessage(error.message, true); }); });
@@ -607,5 +1165,7 @@
   });
   window.addEventListener("hashchange", function () { setPage(window.location.hash.slice(1), false); });
 
-  setPage(window.location.hash.slice(1) || "account", false);
+  var bootQuery = new URLSearchParams(window.location.search);
+  if (bootQuery.get("org_invite")) state.pendingInviteToken = bootQuery.get("org_invite");
+  setPage(window.location.hash.slice(1) || (state.pendingInviteToken ? "team" : "overview"), false);
 }());

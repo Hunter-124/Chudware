@@ -7920,3 +7920,16 @@ CHUDWARE_TEST_WALL_SCALE relaxes it on that runner only.
 ctest now runs with `--timeout 900` everywhere: an unbounded stall used to burn
 the job's whole 6-hour budget and, with cancel-in-progress, every nightly behind
 it. macos/arm64 stays unproven only because `macbook-air-m2` is asleep.
+
+### 2026-08-22 — organizations, teams, and customer file destinations
+The web gateway now models organizations, organization memberships and invitations,
+teams, and team memberships in PostgreSQL (`migrations/0015_organizations.sql`,
+`orgs.py`), with owner-funded shared storage, opaque tenant authorization, and
+single-use invite links. `bucket.py` keeps personal files private while adding
+explicit team-scoped roots; the portal and bucket assets were rebuilt as
+content-hashed, accessible destination surfaces with real organization/team
+management and upload/rename/delete flows. Full gateway coverage is green (615
+passed, 4 skipped), including cross-team isolation and UI asset contracts. Billing
+remains deliberately account-owned: an organization derives shared-storage
+entitlement and quota from its active owner rather than introducing a second
+Stripe customer model.

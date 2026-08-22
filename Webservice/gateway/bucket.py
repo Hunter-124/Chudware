@@ -1,27 +1,40 @@
-"""Per-account file-drop bucket (/bucket page + /api/bucket/* API).
+"""File-drop bucket API (/api/bucket/*) — personal and shared team trees.
 
-Rooted at the CALLER's per-account tree
-(``settings.user_bucket_root(user_slug(email))``), created on demand. With
-``*.ua.edu`` auto-approval the bucket MUST be tenant-isolated: every path is
-clamped under the caller's own root, uploads carry per-account rate limits,
-size caps, and disk quotas, and only an admin may opt into the LEGACY shared
-tree (``settings.bucket_root`` itself) with ``?scope=shared`` — legacy content
-is never moved or deleted. Independent of /workspace/* (the CAD engine's live
-doc tree + .aicm mesh cache): keeping uploads out of that tree avoids
-colliding with autosave/mesh cache housekeeping there.
+Three roots, and a request addresses exactly one of them:
+
+* **personal** (default) — ``settings.user_bucket_root(user_slug(email))``,
+  created on demand, reachable only by that account.
+* **team** (``?team=<uuid>``) — ``bucket_root/orgs/<org>/teams/<team>``, shared
+  by the team's members plus the organization's owner/admin. Membership is
+  re-resolved from PostgreSQL on every request (``orgs.resolve_team_bucket``),
+  so a removal, a downgrade, or a suspension takes effect immediately; the
+  quota that governs it belongs to the organization's owner, while rate limits
+  stay keyed on the acting account.
+* **legacy shared** (``?scope=shared``) — the pre-tenant single-tenant tree,
+  admin-only, never moved or deleted.
+
+Every path is clamped under whichever of those roots was resolved, and the two
+uuid components of a team root are validated as canonical UUID text before they
+are joined onto a filesystem path. Independent of /workspace/* (the CAD
+engine's live doc tree + .aicm mesh cache): keeping uploads out of that tree
+avoids colliding with autosave/mesh cache housekeeping there.
+
+The page itself is served by ``portal_serve.py`` — this module is API only.
 """
 
 from __future__ import annotations
 
 import logging
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse
 
 try:
+    from . import orgs
     from .config import settings
     from .auth import User, get_current_user
     from .accounts import get_account
@@ -33,6 +46,7 @@ try:
         user_slug,
     )
 except ImportError:  # uvicorn app:app from package dir
+    import orgs  # type: ignore
     from config import settings
     from auth import User, get_current_user
     from accounts import get_account
@@ -49,6 +63,33 @@ log = logging.getLogger("chudware-web.bucket")
 router = APIRouter()
 
 
+@dataclass(frozen=True, slots=True)
+class _Scope:
+    """The one tree this request may address, and who pays for it."""
+
+    user: User
+    root: Path
+    kind: str  # personal | team | shared
+    team: orgs.TeamBucket | None
+
+    def quota_target(self) -> tuple[str, str]:
+        """(email, plan) whose storage limit governs writes into this tree.
+
+        For a team tree that is the organization's owner — the shared quota is
+        the owner's plan, not whichever member happens to be uploading.
+        """
+        if self.team is not None:
+            return self.team.owner_email, self.team.owner_plan
+        account = get_account(self.user.email)
+        return self.user.email, getattr(account, "plan", "trial")
+
+    def context(self) -> dict[str, Any]:
+        return {
+            "scope": self.kind,
+            "team": None if self.team is None else self.team.context(),
+        }
+
+
 def _bucket_root() -> Path:
     """Legacy single-tenant shared tree. Only reachable via admin scope=shared."""
     root = settings.bucket_root
@@ -57,28 +98,40 @@ def _bucket_root() -> Path:
     return Path(root).resolve()
 
 
-def _caller_root(request: Request, scope: str = "") -> tuple[User, Path]:
+def _caller_scope(
+    request: Request, scope: str = "", team: str = "", *, write: bool = False
+) -> _Scope:
     """Resolve the one root this caller is allowed to address.
 
-    Default is the account's own tree, created on demand. ``scope=shared`` is
-    an admin-only escape hatch onto the legacy shared tree; any other scope
-    value is rejected so a typo cannot silently widen access.
+    Default is the account's own tree, created on demand. ``team=<uuid>``
+    selects a shared team tree the caller is currently entitled to, and
+    ``scope=shared`` is the admin-only escape hatch onto the legacy tree. The
+    two selectors are mutually exclusive and any other scope value is rejected,
+    so neither a typo nor a combination can silently widen access.
     """
     user = get_current_user(request)
+    team = (team or "").strip()
+    if scope and team:
+        raise HTTPException(status_code=400, detail="scope and team are exclusive")
     if scope == "shared":
         if user.role != "admin":
             raise HTTPException(status_code=403, detail="scope=shared requires admin")
-        return user, _bucket_root()
+        return _Scope(user=user, root=_bucket_root(), kind="shared", team=None)
     if scope:
         raise HTTPException(status_code=400, detail="unknown scope")
     _bucket_root()  # base must still be configured (503 on misconfig)
+    if team:
+        bucket = orgs.resolve_team_bucket(user.email, team, write=write)
+        root = bucket.root
+        root.mkdir(parents=True, exist_ok=True)
+        return _Scope(user=user, root=root.resolve(), kind="team", team=bucket)
     root = settings.user_bucket_root(user_slug(user.email))
     root.mkdir(parents=True, exist_ok=True)
-    return user, root.resolve()
+    return _Scope(user=user, root=root.resolve(), kind="personal", team=None)
 
 
 def _resolve(root: Path, rel: str, *, must_exist: bool = True) -> Path:
-    """Clamp a client-relative path under ``root`` (the caller's own tree).
+    """Clamp a client-relative path under ``root`` (the resolved scope's tree).
 
     Containment is checked on the FULLY RESOLVED path, and a final-component
     symlink is always rejected, so a symlink planted inside the jail cannot be
@@ -114,8 +167,11 @@ def _content_length(request: Request) -> int | None:
 
 
 @router.get("/api/bucket/list")
-async def bucket_list(request: Request, dir: str = "", scope: str = "") -> dict[str, Any]:
-    _, root = _caller_root(request, scope)
+async def bucket_list(
+    request: Request, dir: str = "", scope: str = "", team: str = ""
+) -> dict[str, Any]:
+    resolved = _caller_scope(request, scope, team)
+    root = resolved.root
     base = _resolve(root, dir)
     if not base.is_dir():
         raise HTTPException(status_code=400, detail="not a directory")
@@ -135,15 +191,18 @@ async def bucket_list(request: Request, dir: str = "", scope: str = "") -> dict[
             files.append({"name": p.name, "path": rel, "size": st.st_size,
                           "mtime": int(st.st_mtime)})
     # Caller's OWN absolute jail root — same WASM client contract as
-    # /workspace/list (host/src/core/fs_backend.h).
+    # /workspace/list (host/src/core/fs_backend.h). The scope block is
+    # additive: existing consumers keep reading root/dir/dirs/files.
     return {"root": str(root), "dir": str(base.relative_to(root)) if base != root else "",
-            "dirs": dirs[:5000], "files": files[:5000]}
+            "dirs": dirs[:5000], "files": files[:5000], **resolved.context()}
 
 
 @router.get("/api/bucket/download")
-async def bucket_download(request: Request, path: str, scope: str = "") -> FileResponse:
-    _, root = _caller_root(request, scope)
-    target = _resolve(root, path)
+async def bucket_download(
+    request: Request, path: str, scope: str = "", team: str = ""
+) -> FileResponse:
+    resolved = _caller_scope(request, scope, team)
+    target = _resolve(resolved.root, path)
     if not target.is_file():
         raise HTTPException(status_code=400, detail="not a file")
     return FileResponse(str(target), filename=target.name,
@@ -156,6 +215,7 @@ async def bucket_upload(
     files: list[UploadFile] = File(...),
     dir: str = Form(""),
     scope: str = "",
+    team: str = "",
 ) -> dict[str, Any]:
     """Accept flat files or a whole dropped/selected folder tree.
 
@@ -168,16 +228,18 @@ async def bucket_upload(
     than aborting the whole batch, so one bad entry in a big folder drop
     doesn't lose everything else.
     """
-    user, root = _caller_root(request, scope)
+    resolved = _caller_scope(request, scope, team, write=True)
+    user, root = resolved.user, resolved.root
+    # Rate limits stay per acting account even on a shared tree: one member
+    # must not be able to spend the whole team's request budget.
     api_writes.enforce(user.email, "writes")
     uploads.enforce(user.email, "uploads")
     declared = _content_length(request)
     cap = enforce_upload_size(declared)
-    account = get_account(user.email)
-    plan = getattr(account, "plan", "trial")
+    quota_email, quota_plan = resolved.quota_target()
     enforce_disk_quota(
-        user.email,
-        plan,
+        quota_email,
+        quota_plan,
         root,
         incoming_bytes=declared or 0,
     )
@@ -215,7 +277,7 @@ async def bucket_upload(
                             detail=f"upload too large — {cap // (1024 * 1024)} MiB max",
                         )
                     out.write(chunk)
-            enforce_disk_quota(user.email, plan, root)
+            enforce_disk_quota(quota_email, quota_plan, root)
         except BaseException:
             target.unlink(missing_ok=True)
             raise
@@ -227,8 +289,11 @@ async def bucket_upload(
 
 
 @router.post("/api/bucket/mkdir")
-async def bucket_mkdir(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
-    user, root = _caller_root(request, scope)
+async def bucket_mkdir(
+    request: Request, body: dict[str, Any], scope: str = "", team: str = ""
+) -> dict[str, Any]:
+    resolved = _caller_scope(request, scope, team, write=True)
+    user, root = resolved.user, resolved.root
     api_writes.enforce(user.email, "writes")
     target = _resolve(root, str(body.get("path", "")), must_exist=False)
     target.mkdir(parents=True, exist_ok=True)
@@ -237,8 +302,11 @@ async def bucket_mkdir(request: Request, body: dict[str, Any], scope: str = "") 
 
 
 @router.post("/api/bucket/rename")
-async def bucket_rename(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
-    user, root = _caller_root(request, scope)
+async def bucket_rename(
+    request: Request, body: dict[str, Any], scope: str = "", team: str = ""
+) -> dict[str, Any]:
+    resolved = _caller_scope(request, scope, team, write=True)
+    user, root = resolved.user, resolved.root
     api_writes.enforce(user.email, "writes")
     src = _resolve(root, str(body.get("src", "")))
     new_name = Path(str(body.get("name", ""))).name
@@ -255,8 +323,11 @@ async def bucket_rename(request: Request, body: dict[str, Any], scope: str = "")
 
 
 @router.post("/api/bucket/delete")
-async def bucket_delete(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
-    user, root = _caller_root(request, scope)
+async def bucket_delete(
+    request: Request, body: dict[str, Any], scope: str = "", team: str = ""
+) -> dict[str, Any]:
+    resolved = _caller_scope(request, scope, team, write=True)
+    user, root = resolved.user, resolved.root
     api_writes.enforce(user.email, "writes")
     target = _resolve(root, str(body.get("path", "")))
     if target == root:
@@ -267,10 +338,3 @@ async def bucket_delete(request: Request, body: dict[str, Any], scope: str = "")
         target.unlink()
     log.info("bucket delete: %s by %s", target, user.email)
     return {"ok": True}
-
-
-@router.get("/bucket", response_model=None)
-async def bucket_page(request: Request) -> HTMLResponse:
-    get_current_user(request)  # AuthMiddleware already enforces this; explicit for clarity
-    static_dir = Path(__file__).resolve().parent / "static"
-    return HTMLResponse((static_dir / "bucket.html").read_text())

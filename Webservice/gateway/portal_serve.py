@@ -183,6 +183,13 @@ async def portal_index(request: Request) -> Response:
     return _file_response(_resolve_under_app(""), request, immutable=False)
 
 
+@router.get("/bucket", response_model=None)
+async def bucket_page(request: Request) -> Response:
+    """The files workspace. Same CSP and revalidated-HTML rules as the portal
+    index; its hashed CSS/JS ride the immutable /portal-assets pipeline."""
+    return _file_response(_resolve_under_app("bucket.html"), request, immutable=False)
+
+
 @router.get("/portal-assets/{asset_path:path}", response_model=None)
 async def portal_asset(asset_path: str, request: Request) -> Response:
     target = _resolve_under_app(asset_path)

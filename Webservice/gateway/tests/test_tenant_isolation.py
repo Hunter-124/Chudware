@@ -10,6 +10,7 @@ the legacy shared tree is reachable only by an explicit admin opt-in.
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import os
 import sys
 from pathlib import Path
@@ -26,7 +27,7 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import accounts, app as app_mod, db, plans  # noqa: E402
+from gateway import accounts, app as app_mod, db, mailer, orgs, plans  # noqa: E402
 from gateway.config import settings  # noqa: E402
 from gateway.limits import RateLimiter, user_slug  # noqa: E402
 import gateway.workspace as workspace_mod  # noqa: E402
@@ -65,6 +66,10 @@ def _isolate(pg, tmp_path, monkeypatch):
     bucket.mkdir()
     monkeypatch.setattr(settings, "workspace_root", ws)
     monkeypatch.setattr(settings, "bucket_root", bucket)
+    # Process-global limiters otherwise arrive with budget already spent by an
+    # earlier test file; the org/team cases below make many small writes.
+    monkeypatch.setattr(orgs, "api_writes", RateLimiter(10_000, 60.0))
+    monkeypatch.setattr(mailer, "outbound", RateLimiter(10_000, 3600.0))
 
     _seed("alice@crimson.ua.edu", "Alice")
     _seed("bob@crimson.ua.edu", "Bob")
@@ -476,3 +481,265 @@ def test_shared_scope_is_admin_only_and_preserves_legacy_data(client):
     # Legacy data survived everything above, unmoved and undeleted.
     assert (settings.workspace_root / "legacy.step").read_text() == "team data"
     assert (settings.bucket_root / "legacy.txt").read_text() == "team drop"
+
+
+# ---------------------------------------------------------------------------
+# Shared team buckets (?team=<uuid>)
+# ---------------------------------------------------------------------------
+
+ALICE = "alice@crimson.ua.edu"
+BOB = "bob@crimson.ua.edu"
+NO_SUCH_TEAM = "00000000-0000-4000-8000-00000000dead"
+
+
+def _invite_token(to: str) -> str:
+    with db.tx() as cur:
+        cur.execute(
+            "SELECT ctx_json FROM mail_outbox"
+            " WHERE to_addr = %s AND template = 'org_invite' ORDER BY id DESC LIMIT 1",
+            (to,),
+        )
+        row = cur.fetchone()
+    assert row is not None, f"no invitation queued for {to}"
+    ctx = row["ctx_json"]
+    ctx = json.loads(ctx) if isinstance(ctx, str) else ctx
+    return ctx["invite_url"].split("org_invite=", 1)[1].split("#", 1)[0]
+
+
+def _org_with_bob(client) -> tuple[str, str]:
+    """Alice owns an org on a studio plan; Bob accepts an invite into General."""
+    accounts.set_plan(ALICE, "studio")
+    created = client.post("/api/orgs", headers=A, json={"name": "Bridge Works"})
+    assert created.status_code == 201, created.text
+    org = created.json()
+    team_id = org["teams"][0]["id"]
+    r = client.post(
+        f"/api/orgs/{org['id']}/invitations", headers=A, json={"email": BOB, "role": "member"}
+    )
+    assert r.status_code == 201, r.text
+    accepted = client.post(
+        "/api/orgs/invitations/accept", headers=B, json={"token": _invite_token(BOB)}
+    )
+    assert accepted.status_code == 200, accepted.text
+    return org["id"], team_id
+
+
+def _team_root(org_id: str, team_id: str) -> Path:
+    return settings.bucket_root / "orgs" / org_id / "teams" / team_id
+
+
+def test_team_bucket_is_shared_by_the_team_and_lands_outside_personal_trees(client):
+    org_id, team_id = _org_with_bob(client)
+
+    r = _upload_bucket(client, A, name="shared.txt", data=b"team drop")
+    assert r.status_code == 200
+    r = client.post(
+        "/api/bucket/upload",
+        headers=A,
+        params={"team": team_id},
+        files=[("files", ("plan.txt", b"team plan"))],
+        data={"dir": ""},
+    )
+    assert r.status_code == 200, r.text
+
+    # It landed in the org/team tree, not in either personal tree.
+    assert (_team_root(org_id, team_id) / "plan.txt").is_file()
+    assert not (_bucket_user_root(ALICE) / "plan.txt").exists()
+    assert not (_bucket_user_root(BOB) / "plan.txt").exists()
+
+    # Bob sees it on the team destination and can read it back...
+    listing = client.get("/api/bucket/list", headers=B, params={"team": team_id}).json()
+    assert [f["name"] for f in listing["files"]] == ["plan.txt"]
+    assert listing["scope"] == "team"
+    assert listing["team"]["id"] == team_id
+    assert listing["team"]["org_id"] == org_id
+    assert listing["team"]["name"] == "General"
+    assert Path(listing["root"]) == _team_root(org_id, team_id)
+    got = client.get(
+        "/api/bucket/download", headers=B, params={"path": "plan.txt", "team": team_id}
+    )
+    assert got.status_code == 200
+    assert got.content == b"team plan"
+
+    # ...and can write to it, while Alice's personal drop stays private.
+    r = client.post(
+        "/api/bucket/upload",
+        headers=B,
+        params={"team": team_id},
+        files=[("files", ("bob.txt", b"from bob"))],
+        data={"dir": ""},
+    )
+    assert r.status_code == 200, r.text
+    personal = client.get("/api/bucket/list", headers=B).json()
+    assert [f["name"] for f in personal["files"]] == []
+    assert personal["scope"] == "personal"
+    assert personal["team"] is None
+    assert Path(personal["root"]) == _bucket_user_root(BOB)
+
+
+def test_personal_bucket_listing_keeps_its_existing_shape(client):
+    assert _upload_bucket(client, A, name="notes.txt").status_code == 200
+    listing = client.get("/api/bucket/list", headers=A).json()
+    assert {"root", "dir", "dirs", "files"} <= set(listing)
+    assert Path(listing["root"]) == _bucket_user_root(ALICE)
+    assert [f["name"] for f in listing["files"]] == ["notes.txt"]
+
+
+def test_team_bucket_is_404_for_outsiders_including_the_site_admin(client):
+    org_id, team_id = _org_with_bob(client)
+    client.post(
+        "/api/bucket/upload",
+        headers=A,
+        params={"team": team_id},
+        files=[("files", ("plan.txt", b"team plan"))],
+        data={"dir": ""},
+    )
+    # The site admin runs the gateway; that is not membership in a customer org.
+    for params in ({"team": team_id},):
+        assert client.get("/api/bucket/list", headers=ADMIN, params=params).status_code == 404
+        assert client.get(
+            "/api/bucket/download", headers=ADMIN, params={"path": "plan.txt", **params}
+        ).status_code == 404
+        assert client.post(
+            "/api/bucket/mkdir", headers=ADMIN, params=params, json={"path": "x"}
+        ).status_code == 404
+        assert client.post(
+            "/api/bucket/delete", headers=ADMIN, params=params, json={"path": "plan.txt"}
+        ).status_code == 404
+    assert (_team_root(org_id, team_id) / "plan.txt").is_file()
+
+
+@pytest.mark.parametrize(
+    "bad", ["not-a-uuid", NO_SUCH_TEAM, NO_SUCH_TEAM.upper(), "../../etc", ""]
+)
+def test_bad_team_ids_never_reach_the_filesystem(client, bad):
+    _org_with_bob(client)
+    r = client.get("/api/bucket/list", headers=A, params={"team": bad} if bad else {})
+    # An empty selector is simply the personal tree; anything else is opaque.
+    assert r.status_code == (200 if bad == "" else 404)
+    assert not (settings.bucket_root / "orgs").exists() or [
+        p.name for p in (settings.bucket_root / "orgs").iterdir()
+    ]
+    assert not (settings.bucket_root.parent / "etc").exists()
+
+
+def test_team_and_shared_scope_cannot_be_combined(client):
+    _, team_id = _org_with_bob(client)
+    r = client.get(
+        "/api/bucket/list", headers=ADMIN, params={"team": team_id, "scope": "shared"}
+    )
+    assert r.status_code == 400
+
+
+def test_removed_member_loses_team_bucket_access_immediately(client):
+    org_id, team_id = _org_with_bob(client)
+    assert client.get("/api/bucket/list", headers=B, params={"team": team_id}).status_code == 200
+
+    # Off the team but still in the org: an ordinary member cannot even see it.
+    assert client.delete(
+        f"/api/orgs/{org_id}/teams/{team_id}/members/{BOB}", headers=A
+    ).status_code == 200
+    assert client.get("/api/bucket/list", headers=B, params={"team": team_id}).status_code == 404
+    assert client.post(
+        "/api/bucket/upload",
+        headers=B,
+        params={"team": team_id},
+        files=[("files", ("sneak.txt", b"nope"))],
+        data={"dir": ""},
+    ).status_code == 404
+
+    # Back on the team, access returns; out of the org entirely, it goes again.
+    assert client.post(
+        f"/api/orgs/{org_id}/teams/{team_id}/members", headers=A, json={"email": BOB}
+    ).status_code == 201
+    assert client.get("/api/bucket/list", headers=B, params={"team": team_id}).status_code == 200
+    assert client.delete(f"/api/orgs/{org_id}/members/{BOB}", headers=A).status_code == 200
+    assert client.get("/api/bucket/list", headers=B, params={"team": team_id}).status_code == 404
+
+
+def test_org_admin_reaches_a_team_they_never_joined(client):
+    org_id, team_id = _org_with_bob(client)
+    made = client.post(f"/api/orgs/{org_id}/teams", headers=A, json={"name": "Fixtures"})
+    assert made.status_code == 201, made.text
+    other_team = made.json()["team"]["id"]
+    # Bob is an ordinary member and was never added: opaque 404.
+    assert client.get(
+        "/api/bucket/list", headers=B, params={"team": other_team}
+    ).status_code == 404
+    # Alice owns the org, so every team's tree is hers to reach.
+    assert client.get(
+        "/api/bucket/list", headers=A, params={"team": other_team}
+    ).status_code == 200
+
+
+def test_owner_downgrade_and_suspension_block_shared_writes_but_not_reads(client):
+    org_id, team_id = _org_with_bob(client)
+    assert client.post(
+        "/api/bucket/upload",
+        headers=B,
+        params={"team": team_id},
+        files=[("files", ("plan.txt", b"team plan"))],
+        data={"dir": ""},
+    ).status_code == 200
+
+    accounts.set_plan(ALICE, "desktop")  # the owner's plan no longer funds it
+    assert client.get("/api/bucket/list", headers=B, params={"team": team_id}).status_code == 200
+    assert client.get(
+        "/api/bucket/download", headers=B, params={"path": "plan.txt", "team": team_id}
+    ).status_code == 200
+    for call in (
+        lambda: client.post(
+            "/api/bucket/upload",
+            headers=B,
+            params={"team": team_id},
+            files=[("files", ("more.txt", b"blocked"))],
+            data={"dir": ""},
+        ),
+        lambda: client.post(
+            "/api/bucket/mkdir", headers=B, params={"team": team_id}, json={"path": "sub"}
+        ),
+        lambda: client.post(
+            "/api/bucket/rename",
+            headers=B,
+            params={"team": team_id},
+            json={"src": "plan.txt", "name": "renamed.txt"},
+        ),
+        lambda: client.post(
+            "/api/bucket/delete", headers=B, params={"team": team_id}, json={"path": "plan.txt"}
+        ),
+    ):
+        assert call().status_code == 402
+    assert (_team_root(org_id, team_id) / "plan.txt").is_file()
+
+    # Restored plan, writes resume; a suspended owner freezes them again.
+    accounts.set_plan(ALICE, "studio")
+    assert client.post(
+        "/api/bucket/mkdir", headers=B, params={"team": team_id}, json={"path": "sub"}
+    ).status_code == 200
+    accounts.set_status(ALICE, "suspended", decided_by="test")
+    assert client.post(
+        "/api/bucket/mkdir", headers=B, params={"team": team_id}, json={"path": "sub2"}
+    ).status_code == 402
+    assert client.get("/api/bucket/list", headers=B, params={"team": team_id}).status_code == 200
+
+
+def test_team_bucket_quota_comes_from_the_org_owner_plan(client, monkeypatch):
+    _, team_id = _org_with_bob(client)
+    studio = plans.PLANS["studio"]
+    monkeypatch.setitem(
+        plans.PLANS,
+        "studio",
+        replace(studio, limits=replace(studio.limits, storage_quota_bytes=10)),
+    )
+    # Bob is on the default trial plan, but the OWNER's (shrunken) studio quota
+    # is what governs the shared tree.
+    r = client.post(
+        "/api/bucket/upload",
+        headers=B,
+        params={"team": team_id},
+        files=[("files", ("big.bin", b"y" * 50))],
+        data={"dir": ""},
+    )
+    assert r.status_code == 507
+    # The same account's personal tree is unaffected: that one is Bob's plan.
+    assert _upload_bucket(client, B, name="big.bin", data=b"y" * 50).status_code == 200

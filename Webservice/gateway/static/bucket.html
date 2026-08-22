@@ -1,158 +1,86 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Team Bucket — Chudware</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2312161E'/%3E%3Cg fill='none' stroke='%2342ECCE' stroke-width='1.7' stroke-linejoin='round' stroke-linecap='round'%3E%3Crect x='5' y='5' width='22' height='22'/%3E%3Crect x='10.5' y='10.5' width='11' height='11'/%3E%3Cpath d='M5 5L10.5 10.5M27 5L21.5 10.5M27 27L21.5 21.5M5 27L10.5 21.5'/%3E%3C/g%3E%3C/svg%3E" />
-  <style>
-    :root {
-      --bg: #0f1418;
-      --bg2: #12181c;
-      --panel: #161d23;
-      --panel-edge: rgba(255,255,255,0.07);
-      --border: #2a2e36;
-      --text: #e6edf3;
-      --muted: #8b93a3;
-      --accent: #4f8cff;
-      --accent-hi: #6fa2ff;
-      --teal: #2fd4a7;
-      --danger: #e07a8a;
-    }
-    * { box-sizing: border-box; }
-    html, body { height: 100%; }
-    body {
-      margin: 0;
-      background: linear-gradient(180deg, var(--bg2), var(--bg));
-      color: var(--text);
-      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-      -webkit-font-smoothing: antialiased;
-      min-height: 100%;
-    }
-    header {
-      display: flex;
-      align-items: center;
-      gap: 11px;
-      padding: 16px 24px;
-      border-bottom: 1px solid var(--panel-edge);
-    }
-    header .logo { width: 26px; height: 26px; display: block; }
-    header .wordmark { font-size: 18px; font-weight: 700; letter-spacing: -0.01em; }
-    header .tag {
-      font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted);
-      border: 1px solid var(--panel-edge); padding: 3px 8px; border-radius: 999px;
-    }
-    header .spacer { flex: 1; }
-    header a.home-link {
-      color: var(--muted); text-decoration: none; font-size: 0.85rem;
-      display: inline-flex; align-items: center; gap: 6px;
-    }
-    header a.home-link:hover { color: var(--text); }
-
-    main { max-width: 960px; margin: 0 auto; padding: 24px 20px 60px; }
-    h1 { font-size: 1.5rem; margin: 0 0 4px; }
-    p.lead { color: var(--muted); margin: 0 0 20px; font-size: 0.92rem; }
-
-    .toolbar {
-      display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px;
-    }
-    .crumbs {
-      flex: 1; min-width: 200px; font-size: 0.88rem; color: var(--muted);
-      word-break: break-all; display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
-    }
-    .crumbs button {
-      background: none; border: none; color: var(--accent-hi); cursor: pointer;
-      font-size: 0.88rem; padding: 2px 4px; border-radius: 4px;
-    }
-    .crumbs button:hover { background: var(--panel); }
-    .crumbs .sep { color: var(--muted); }
-
-    button.btn {
-      display: inline-flex; align-items: center; gap: 6px;
-      background: var(--panel); border: 1px solid var(--border); color: var(--text);
-      border-radius: 8px; padding: 9px 14px; font-size: 0.88rem; cursor: pointer;
-      min-height: 38px; touch-action: manipulation;
-    }
-    button.btn:hover { border-color: var(--accent); }
-    button.btn.primary {
-      background: linear-gradient(180deg, var(--accent-hi), var(--accent));
-      border: none; color: #fff; font-weight: 600;
-    }
-    button.btn.danger { color: var(--danger); }
-    button.btn.danger:hover { border-color: var(--danger); background: #2a1a20; }
-
-    #drop-zone {
-      border: 2px dashed var(--border); border-radius: 12px; padding: 20px;
-      text-align: center; color: var(--muted); font-size: 0.88rem; margin-bottom: 16px;
-      transition: border-color .12s ease, background .12s ease;
-    }
-    #drop-zone.drag { border-color: var(--accent); background: rgba(79,140,255,0.06); color: var(--text); }
-
-    .list { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
-    .row {
-      display: flex; align-items: center; gap: 12px; padding: 11px 14px;
-      border-bottom: 1px solid var(--panel-edge); font-size: 0.9rem;
-    }
-    .row:last-child { border-bottom: none; }
-    .row:hover { background: var(--panel); }
-    .row .icon { width: 20px; height: 20px; flex: none; color: var(--muted); }
-    .row.dir .icon { color: var(--accent-hi); }
-    .row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .row.dir .name { cursor: pointer; color: var(--text); }
-    .row.dir .name:hover { color: var(--accent-hi); text-decoration: underline; }
-    .row .meta { color: var(--muted); font-size: 0.78rem; flex: none; white-space: nowrap; }
-    .row .actions { display: flex; gap: 6px; flex: none; }
-    .row .actions a, .row .actions button {
-      background: none; border: none; color: var(--muted); cursor: pointer; padding: 4px 6px;
-      border-radius: 6px; font-size: 0.78rem; text-decoration: none;
-    }
-    .row .actions a:hover { color: var(--accent-hi); background: rgba(79,140,255,0.08); }
-    .row .actions button.del:hover { color: var(--danger); background: #2a1a20; }
-    .empty { padding: 40px 20px; text-align: center; color: var(--muted); font-size: 0.9rem; }
-
-    #status {
-      margin-top: 14px; font-size: 0.85rem; min-height: 1.2em;
-    }
-    #status.err { color: var(--danger); }
-    #status.ok { color: var(--teal); }
-
-    input[type=file] { display: none; }
-  </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Files — Chudware</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23090d12'/%3E%3Cg fill='none' stroke='%2342ECCE' stroke-width='1.7'%3E%3Crect x='5' y='5' width='22' height='22'/%3E%3Crect x='10.5' y='10.5' width='11' height='11'/%3E%3Cpath d='M5 5L10.5 10.5M27 5L21.5 10.5M27 27L21.5 21.5M5 27L10.5 21.5'/%3E%3C/g%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/portal-assets/bucket.d2f837737db5.css">
+  <script src="/portal-assets/bucket.18dbf9cd99a2.js" defer></script>
 </head>
 <body>
-  <header>
-    <svg class="logo" viewBox="0 0 64 64" aria-label="Chudware">
-      <g fill="none" stroke="#42ECCE" stroke-width="3.4" stroke-linejoin="round" stroke-linecap="round">
-        <rect x="10" y="10" width="44" height="44"/>
-        <rect x="21" y="21" width="22" height="22"/>
-        <path d="M10 10L21 21M54 10L43 21M54 54L43 43M10 54L21 43"/>
-      </g>
-    </svg>
-    <span class="wordmark">Chudware</span>
-    <span class="tag">Bucket</span>
-    <span class="spacer"></span>
-    <a class="home-link" href="/">&larr; Home</a>
-  </header>
+  <a class="skip-link" href="#page-title">Skip to content</a>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Chudware account home">
+        <svg viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="3.2"><rect x="9" y="9" width="46" height="46"/><rect x="21" y="21" width="22" height="22"/><path d="M9 9l12 12M55 9L43 21M55 55L43 43M9 55l12-12"/></g></svg>
+        <span>Chudware</span>
+      </a>
+      <span class="brand-tag">Files</span>
+      <span class="topbar-spacer"></span>
+      <a class="back-link" href="/#team">&larr; Team &amp; files</a>
+    </header>
 
-  <main>
-    <h1>Team Bucket</h1>
-    <p class="lead">Drop files or folders here for the team. Anyone signed in can upload, organize, and download.</p>
+    <main>
+      <div class="page-head">
+        <div>
+          <h1 id="page-title"><span id="scope-title">Files</span></h1>
+          <p class="scope-context" id="scope-context">Loading destinations…</p>
+        </div>
+        <div class="dest-picker">
+          <label for="dest-select">Destination</label>
+          <select id="dest-select" aria-describedby="scope-context">
+            <option value="personal">Personal — only you</option>
+          </select>
+        </div>
+      </div>
 
-    <div class="toolbar">
-      <div class="crumbs" id="crumbs"></div>
-      <button class="btn" id="new-folder-btn">+ New folder</button>
-      <button class="btn" id="upload-folder-btn">Upload folder</button>
-      <button class="btn primary" id="upload-btn">Upload files</button>
-      <input type="file" id="file-input" multiple />
-      <input type="file" id="folder-input" webkitdirectory directory multiple />
-    </div>
+      <p class="notice" id="notice" role="alert" hidden></p>
 
-    <div id="drop-zone">Drag &amp; drop files anywhere in this box to upload them to the current folder</div>
+      <section class="card" aria-label="Files">
+        <div class="toolbar">
+          <nav class="crumbs" id="crumbs" aria-label="Folder path"></nav>
+          <button type="button" class="btn" id="new-folder-btn">+ New folder</button>
+          <button type="button" class="btn" id="upload-folder-btn">Upload folder</button>
+          <button type="button" class="btn primary" id="upload-btn">Upload files</button>
+          <input type="file" id="file-input" multiple hidden>
+          <input type="file" id="folder-input" webkitdirectory directory multiple hidden>
+        </div>
 
-    <div class="list" id="list"></div>
-    <div id="status"></div>
-  </main>
+        <div class="drop-zone" id="drop-zone">Drag &amp; drop files or folders anywhere on this page to upload them to the current folder</div>
 
-  <script src="/static/bucket.js?v=2"></script>
+        <div class="list" id="list" aria-busy="true"></div>
+
+        <div class="statusbar">
+          <progress id="upload-progress" aria-label="Upload progress" max="1" value="0" hidden></progress>
+          <div class="status" id="status" role="status" aria-live="polite"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="input-dialog" aria-labelledby="input-dialog-title">
+    <form method="dialog">
+      <h2 id="input-dialog-title">Rename</h2>
+      <label id="input-dialog-label" for="input-dialog-field">Name</label>
+      <input type="text" id="input-dialog-field" autocomplete="off" spellcheck="false">
+      <div class="dialog-actions">
+        <button type="submit" class="btn primary" id="input-dialog-confirm" value="confirm">Save</button>
+        <button type="submit" class="btn" value="cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-body">
+    <form method="dialog">
+      <h2 id="confirm-dialog-title">Delete</h2>
+      <p id="confirm-dialog-body"></p>
+      <div class="dialog-actions">
+        <button type="submit" class="btn" value="cancel" autofocus>Cancel</button>
+        <button type="submit" class="btn danger" id="confirm-dialog-confirm" value="confirm">Delete</button>
+      </div>
+    </form>
+  </dialog>
 </body>
 </html>

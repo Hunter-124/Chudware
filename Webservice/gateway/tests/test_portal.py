@@ -86,6 +86,71 @@ def test_portal_has_ordinary_csp_and_hashed_assets_are_immutable(pg, monkeypatch
     assert hashlib.sha256(asset.content).hexdigest().startswith(digest)
 
 
+def test_every_portal_asset_reference_is_hashed_served_and_digest_true(pg, monkeypatch):
+    """A stale asset reference ships a portal that 404s its own stylesheet.
+
+    Both the stylesheet and the script are discovered from the served page, so
+    renaming an asset without updating index.html — or leaving a reference to a
+    deleted hash — fails here rather than in a customer's browser. The filename
+    must really be the content digest for the immutable cache header to be safe.
+    """
+    email = "portal-assets@example.com"
+    _seed(email)
+    client = _client(monkeypatch, email)
+    page = client.get("/")
+    assert page.status_code == 200
+    refs = re.findall(r'"/portal-assets/([A-Za-z0-9_-]+\.[0-9a-f]{12}\.[a-z]+)"', page.text)
+    assert sorted(name.rsplit(".", 1)[1] for name in refs) == ["css", "js"]
+    for name in refs:
+        digest = name.split(".")[1]
+        asset = client.get(f"/portal-assets/{name}")
+        assert asset.status_code == 200
+        assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
+        assert hashlib.sha256(asset.content).hexdigest().startswith(digest)
+
+
+def test_portal_is_destination_oriented_and_keeps_every_legacy_route(pg, monkeypatch):
+    """Overview must land first and no legacy task may lose its view.
+
+    The portal is hash-routed static markup: a view that disappears from
+    index.html is a silently dead bookmark, and a nav entry without a matching
+    view is a dead button. The Team & files page additionally needs its org
+    scaffolding (create form, invite banner, upsell, org list) because the
+    script renders /api/orgs data into those exact ids.
+    """
+    email = "portal-markup@example.com"
+    _seed(email)
+    client = _client(monkeypatch, email)
+    html = client.get("/").text
+
+    assert 'class="page active" data-view="overview"' in html
+    assert html.count('class="page active"') == 1
+    for view in ("overview", "team", "account", "billing", "usage", "ai", "downloads", "devices"):
+        assert f'data-view="{view}"' in html, f"missing view: {view}"
+        assert f'data-page="{view}"' in html, f"missing nav entry: {view}"
+
+    # Overview offers every prominent destination as an outcome card.
+    assert 'id="dest-cloud"' in html
+    assert html.count("dest-card") >= 5
+    for target in ("team", "downloads", "ai", "billing"):
+        assert f'class="dest-card" data-go="{target}"' in html, f"no destination card for {target}"
+
+    # Team & files scaffolding the script renders the org flow into.
+    for element_id in ("org-create-form", "org-invite-banner", "org-invitations", "team-upsell", "org-list"):
+        assert f'id="{element_id}"' in html, f"missing team page element: {element_id}"
+
+    # Accessibility invariants: skip link, live status region, mobile menu state.
+    assert 'class="skip-link"' in html
+    assert 'id="global-message" class="message" role="status"' in html
+    assert 'id="menu-button"' in html and 'aria-expanded="false"' in html
+
+    # The served script drives the org/team contract, not a placeholder.
+    js_name = re.search(r'src="/portal-assets/(portal\.[0-9a-f]{12}\.js)"', html).group(1)
+    js = client.get(f"/portal-assets/{js_name}").text
+    for marker in ("/api/orgs", "org_invite", "/invitations/accept", "transfer-ownership", "bucket_url"):
+        assert marker in js, f"portal script lost the org flow marker: {marker}"
+
+
 def test_every_oauth_provider_has_a_button_on_the_signin_page(pg, monkeypatch):
     """A provider the gateway can complete but never offers is unreachable.
 

@@ -58,6 +58,7 @@ TEMPLATES = frozenset(
         "trial_ended",
         "payment_failed",
         "receipt",
+        "org_invite",
     }
 )
 

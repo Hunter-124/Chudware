@@ -90,7 +90,16 @@ for f in libchudware.so libngcore.so libnglib.so lib3mf.so chudware-hostd; do
 done
 
 # Prompts are part of the release because hostd resolves them through `current`.
-PROMPTS_SRC="$ROOT/agent/prompts"
+#
+# SOURCE is services/agent/prompts; the DESTINATION stays agent/prompts because
+# that is the runtime layout chudware-hostd.service bakes in via @PROMPTS@.
+# They stopped being the same path twice over: bf4f56c8 moved the tree under
+# services/ and left a root `agent` symlink so old paths kept working, then
+# d9db7f96 deleted that symlink on 2026-08-10 for Windows portability. This
+# line still pointed at the symlink, so every deploy from 2026-08-10 onward
+# died here -- which is the other half of why production served a bundle from
+# 2026-08-07 for fifteen days.
+PROMPTS_SRC="$ROOT/services/agent/prompts"
 [ -d "$PROMPTS_SRC" ] || fatal "$PROMPTS_SRC missing (agent roles would be unusable)"
 cp -a "$PROMPTS_SRC/." "$STAGE_PROMPTS/"
 if ! "$PYTHON" - "$STAGE_PROMPTS" <<'PY'

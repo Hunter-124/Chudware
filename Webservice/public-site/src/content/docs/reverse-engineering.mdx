@@ -1,0 +1,41 @@
+---
+title: Reverse engineering
+description: Capture source evidence, confirm scale and dimensions, build an editable approximation, review deviation, and preserve provenance at delivery.
+section: Reverse engineer
+order: 95
+---
+## Choose the session from the evidence
+
+Open the Reverse Eng workspace and start a session. Use **Add Photos**, **Add Video**, or **Webcam** for a physical part; import an existing scan mesh when a structured-light or laser scan already exists. Use **Datasheet** for a catalog document, or **From Library** when the part already has a library identity.
+
+The scan lane records **Source → Scale → Reconstruct → Model → Review → Deliver**. Datasheet and researched catalog lanes skip Scale and Reconstruct because their dimensions come from documents rather than image geometry. A library record follows the lane supported by its available evidence.
+
+## Capture enough of the part
+
+For photos or video, keep autofocus and exposure fixed, cover the full orbit at more than one elevation, and retain overlap between adjacent views. Read the coverage report before committing to the full reconstruction: it states whether coverage was measured from camera poses or estimated from image count, and flags frames whose blur was measured.
+
+Before starting reconstruction, check the workspace capability panel. Sparse, dense, splat, and single-photo paths depend on services that may not be present in every installation; the panel reports what is available instead of hiding a missing backend behind a failed job.
+
+## Establish and confirm scale
+
+Use a printed **ArUco Mat**, **Two Points**, or **Known Dim**. Print the scale mat at 100%, keep it flat, and include it in the same views as the part. ArUco and two-point methods need registered camera views, so the session may produce a sparse reconstruction before scale can be solved.
+
+Review the millimeters-per-unit ratio and residual, then confirm the scale. Until that confirmation, reconstructed geometry is not dimensionally usable.
+
+## Fit geometry and build the model
+
+Run **Fit Primitives** to identify supported planes, cylinders, spheres, cones, cross-sections, and hole or boss roles. Review those fits before **AI Model** builds sketches, extrudes, revolves, and holes.
+
+The build is an approximation of the available evidence. Shape the feature build cannot explain remains an explicit mesh-body fallback; it is not silently presented as an editable feature. A single-photo result is tagged `approximate`, has no metric scale, and is suitable only as reference or preview shape.
+
+## Review dimensions and deviation
+
+Read each dimension's source and honesty tier. Photo-derived values are labeled high (±2%), medium (±5%), or low (±10%). Replace photo estimates on fit-critical bores, shafts, and mating faces with a typed caliper value or another defensible source, then confirm those dimensions in the review ledger.
+
+Inspect geometric deviation between the rebuilt result and the reference. Return to the model for the worst regions, adjust the responsible features, and compare again. Keep any unexplained region or mesh fallback visible in the handoff.
+
+## Deliver with provenance
+
+The session provenance timeline records source ingestion, scale, reconstruction, primitive fitting, model build, and attachment; the dimension ledger preserves confirmed review values. Use **Add to Parts** to connect the reviewed geometry to its Parts identity. Use **Export** to write the complete session bundle, including its manifest and accumulated artifacts, so the final geometry does not leave its evidence behind.
+
+For the capability overview and its limits, see [Reverse engineering](/product/reverse-engineering/). For revision history and project artifacts, continue to [Product data and revisions](/docs/plm/).

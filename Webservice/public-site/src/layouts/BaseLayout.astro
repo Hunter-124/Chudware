@@ -42,14 +42,14 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
         </nav>
         <div class="header-actions">
           <a class="sign-in tap" href="https://app.chudware.com/signin">Sign in</a>
-          <a class="button button-small" href="https://app.chudware.com/signup">Create account</a>
+          <a class="button button-small" href="https://app.chudware.com/signup">Create an account</a>
         </div>
         <details class="mobile-nav">
           <summary class="tap">Menu</summary>
           <nav aria-label="Mobile primary">
             {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
             <a class="tap" href="https://app.chudware.com/signin">Sign in</a>
-            <a class="tap mobile-download" href="https://app.chudware.com/signup">Create account</a>
+            <a class="tap mobile-download" href="https://app.chudware.com/signup">Create an account</a>
           </nav>
         </details>
       </div>
@@ -61,25 +61,21 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
           <a class="brand tap" href="/"><img src="/assets/logo.svg" width="28" height="28" alt="" /><span>CHUDWARE</span></a>
           <p>Parametric CAD, manufacturing, product data, and AI—running in a browser or natively.</p>
         </div>
-        <nav aria-label="Product links">
-          <strong>Product</strong>
-          <a class="tap" href="/product/">Overview</a><a class="tap" href="/product/simulation/">Simulation</a><a class="tap" href="/gallery/">Gallery</a><a class="tap" href="/pricing/">Pricing</a><a class="tap" href="/download/">Access</a><a class="tap" href="/docs/">Docs</a>
+        <nav aria-label="Capability links">
+          <strong>Capabilities</strong>
+          <a class="tap" href="/product/modeling/">Modeling</a><a class="tap" href="/product/assemblies/">Assemblies</a><a class="tap" href="/product/simulation/">Simulation</a><a class="tap" href="/product/cam/">CAM &amp; manufacture</a><a class="tap" href="/product/plm/">PLM</a><a class="tap" href="/product/copilot/">AI copilot</a><a class="tap" href="/product/reverse-engineering/">Reverse engineering</a>
         </nav>
-        <nav aria-label="Company links">
-          <strong>Company</strong>
-          <a class="tap" href="/about/">About</a><a class="tap" href="/open-source/">Open source</a><a class="tap" href="/security/">Security</a><a class="tap" href="/faq/">FAQ</a><a class="tap" href="/contact/">Contact</a><a class="tap" href="/changelog/">Changelog</a>
+        <nav aria-label="Explore links">
+          <strong>Explore</strong>
+          <a class="tap" href="/product/">Overview</a><a class="tap" href="/gallery/">Gallery</a><a class="tap" href="/pricing/">Pricing</a><a class="tap" href="/download/">Access</a><a class="tap" href="/docs/">Docs</a><a class="tap" href="/faq/">FAQ</a><a class="tap" href="/changelog/">Changelog</a>
         </nav>
-        <nav aria-label="Legal links">
-          <strong>Legal</strong>
-          <a class="tap" href="/legal/terms/">Terms</a><a class="tap" href="/legal/privacy/">Privacy</a><a class="tap" href="/legal/eula/">EULA</a><a class="tap" href="/legal/refunds/">Refunds</a>
+        <nav aria-label="Company and legal links">
+          <strong>Company &amp; legal</strong>
+          <a class="tap" href="/about/">About</a><a class="tap" href="/open-source/">Open source</a><a class="tap" href="/security/">Security</a><a class="tap" href="/contact/">Contact</a><a class="tap" href="/legal/terms/">Terms</a><a class="tap" href="/legal/privacy/">Privacy</a><a class="tap" href="/legal/eula/">EULA</a><a class="tap" href="/legal/refunds/">Refunds</a>
         </nav>
       </div>
       <div class="wrap footer-bottom"><span>© 2026 Chudware</span><span>Exact solid geometry, from sketch to shop floor.</span></div>
     </footer>
 
-    <script>
-      import { mountPointerEffects } from '../scripts/effects';
-      mountPointerEffects();
-    </script>
   </body>
 </html>

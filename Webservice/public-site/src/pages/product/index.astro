@@ -2,12 +2,12 @@
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import '../../styles/product.css';
 ---
-<BaseLayout title="Product" description="Chudware covers parametric modeling, assemblies, simulation, CAM, product data, and an in-product AI copilot in one engineering environment, in a browser or on a native Windows or Linux build.">
+<BaseLayout title="Product" description="Chudware covers parametric modeling, assemblies, simulation, CAM, product data, an in-product AI copilot, and evidence-led reverse engineering in one environment, in a browser or on a native Windows or Linux build.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Product</p>
       <h1>One environment, from constrained sketch to posted G-code.</h1>
-      <p class="lede">Chudware is a parametric CAD system working on exact solid geometry &mdash; a fillet is a real surface, not a facet approximation of one. Modeling, assemblies, simulation, manufacturing, product data, and the AI copilot operate on the same documents and the same feature tree, so design intent does not get lost between tools.</p>
+      <p class="lede">Chudware is a parametric CAD system working on exact solid geometry &mdash; a fillet is a real surface, not a facet approximation of one. Modeling, assemblies, simulation, manufacturing, product data, and the AI copilot operate on the same documents and feature tree. Reverse Engineering adds a staged path from source evidence into that environment, with scale, dimension review, and provenance kept visible.</p>
       <ul class="product-hero-meta">
         <li>Exact solids, not mesh approximations</li>
         <li>Editable native <code>.step+</code> files</li>
@@ -20,11 +20,11 @@ import '../../styles/product.css';
     <div class="wrap">
       <header class="section-heading">
         <p class="eyebrow" id="capabilities-title">Capabilities</p>
-        <h2>Six surfaces of the same model.</h2>
+        <h2>Seven surfaces of the same model.</h2>
         <p class="lede">Each page below describes what the capability actually does today, and says plainly where something is preview-grade.</p>
       </header>
       <div class="product-hub-grid">
-        <article class="product-card product-card-lead" data-lift>
+        <article class="product-card product-card-lead">
           <p class="product-card-index">01 / Model</p>
           <h2><a href="/product/modeling/">Parametric modeling</a></h2>
           <p>Constrained 2D sketches drive ordered features. The Feature Manager keeps the construction sequence editable instead of collapsing it into dead geometry.</p>
@@ -34,7 +34,7 @@ import '../../styles/product.css';
             <li>Native <code>.step+</code> keeps tree, dimensions, materials, studies, and drawings</li>
           </ul>
         </article>
-        <article class="product-card" data-lift>
+        <article class="product-card">
           <p class="product-card-index">02 / Assemble</p>
           <h2><a href="/product/assemblies/">Assemblies</a></h2>
           <p>Components are located by mates against a fixed base, not by typed coordinates.</p>
@@ -44,7 +44,7 @@ import '../../styles/product.css';
             <li>Stable component identity keeps mates and BOM rows connected</li>
           </ul>
         </article>
-        <article class="product-card" data-lift>
+        <article class="product-card">
           <p class="product-card-index">03 / Simulate</p>
           <h2><a href="/product/simulation/">Simulation</a></h2>
           <p>Stress studies live inside the part, and a static result reports how far its own error indicator got instead of asking you to trust a fineness slider.</p>
@@ -54,7 +54,7 @@ import '../../styles/product.css';
             <li>Error-driven refinement with a per-pass convergence table</li>
           </ul>
         </article>
-        <article class="product-card" data-lift>
+        <article class="product-card">
           <p class="product-card-index">04 / Manufacture</p>
           <h2><a href="/product/cam/">CAM</a></h2>
           <p>Jobs are built from the active part, so the manufacturing plan stays attached to the design that produced it.</p>
@@ -64,7 +64,7 @@ import '../../styles/product.css';
             <li>Posted G-code targeted at a specific machine and controller profile</li>
           </ul>
         </article>
-        <article class="product-card" data-lift>
+        <article class="product-card">
           <p class="product-card-index">05 / Collaborate</p>
           <h2><a href="/product/plm/">Product data</a></h2>
           <p>A project is the boundary for designs, assemblies, manufacturing artifacts, and revision history.</p>
@@ -74,7 +74,7 @@ import '../../styles/product.css';
             <li>Handoff carries the deliverable and the decision trail together</li>
           </ul>
         </article>
-        <article class="product-card product-card-span" data-lift>
+        <article class="product-card">
           <p class="product-card-index">06 / Collaborate</p>
           <h2><a href="/product/copilot/">AI copilot</a></h2>
           <p>Describe the engineering outcome; the copilot drives the same modeling operations you use by hand.</p>
@@ -82,6 +82,16 @@ import '../../styles/product.css';
             <li>Inspects geometry, creates and edits features, renders views, measures results</li>
             <li>Chudware-managed capacity or your own provider key, chosen per account</li>
             <li>Machine-affecting actions still require explicit operator review</li>
+          </ul>
+        </article>
+        <article class="product-card">
+          <p class="product-card-index">07 / Reverse engineer</p>
+          <h2><a href="/product/reverse-engineering/">Reverse engineering</a></h2>
+          <p>Sessions keep source evidence, scale, reconstruction, modeling, review, and delivery connected instead of reducing a scan or photo to an unexplained shape.</p>
+          <ul class="fact-list">
+            <li>Photos, video, webcam, scan meshes, datasheets, and library records as starting points</li>
+            <li>Human-confirmed scale and fit dimensions, with single-photo shapes tagged approximate</li>
+            <li>Deviation review, provenance history, Parts attachment, and full-session export</li>
           </ul>
         </article>
       </div>
@@ -93,10 +103,10 @@ import '../../styles/product.css';
       <header class="section-heading">
         <p class="eyebrow" id="scope-title">Scope, stated plainly</p>
         <h2>What is shipping, and what is still preview.</h2>
-        <p class="lede">The modeling, assembly, simulation, manufacturing, product data, and copilot workspaces exist in the product today and are documented. Delivery is where the qualifiers belong.</p>
+        <p class="lede">The modeling, assembly, simulation, manufacturing, product data, copilot, and Reverse Engineering workspaces exist in the product today and are documented. Delivery is where the qualifiers belong.</p>
         <p class="supporting-copy">Native Windows and Linux builds are preview builds available on request rather than through a public release channel, and the commercial rate card is not published yet.</p>
       </header>
-      <div class="product-note" data-lift>
+      <div class="product-note">
         <p class="eyebrow">No invented numbers</p>
         <p>These pages avoid published benchmarks, customer counts, and certifications that do not exist. Every capability claim traces to the documentation, and the pricing page states outright that public rates are still being finalized.</p>
         <p><a class="text-link" href="/pricing/">Read the pricing position <span aria-hidden="true">&rarr;</span></a></p>
@@ -111,15 +121,15 @@ import '../../styles/product.css';
         <h2>Screenshots, documentation, and access.</h2>
       </header>
       <ul class="product-crosslinks">
-        <li class="product-crosslink" data-lift>
+        <li class="product-crosslink">
           <h3><a href="/gallery/">Gallery</a></h3>
           <p>Images captured from Chudware itself: the modeling workspace, the manufacturing workspace, and workspace onboarding. No concept renders.</p>
         </li>
-        <li class="product-crosslink" data-lift>
+        <li class="product-crosslink">
           <h3><a href="/docs/">Documentation</a></h3>
-          <p>Task guides for sketching, first parts, assemblies, CAM, product data, the copilot, installation, and the keyboard reference.</p>
+          <p>Task guides for sketching, first parts, assemblies, CAM, product data, reverse engineering, the copilot, installation, and the keyboard reference.</p>
         </li>
-        <li class="product-crosslink" data-lift>
+        <li class="product-crosslink">
           <h3><a href="/pricing/">Access and pricing</a></h3>
           <p>Browser workspace, native desktop preview builds, and organization contact while the commercial catalog is finalized.</p>
         </li>

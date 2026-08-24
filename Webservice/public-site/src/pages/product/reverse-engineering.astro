@@ -1,0 +1,119 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import '../../styles/product.css';
+---
+<BaseLayout title="Reverse engineering" description="Bring scans, photos, video, datasheets, or parts-library records into a staged Reverse Engineering session; confirm scale and dimensions, review deviation, and preserve provenance through export.">
+  <header class="page-hero">
+    <div class="wrap">
+      <p class="eyebrow">Product / Reverse engineer</p>
+      <h1>A rebuild that keeps the evidence attached.</h1>
+      <p class="lede">A Reverse Engineering session keeps source evidence, reconstruction, dimensions, and delivery in one record. A photo set or scan can seed an editable feature tree, but the result remains evidence-dependent: a person confirms scale, fit-critical dimensions are reviewed, and unexplained shape can remain a named mesh fallback.</p>
+      <ul class="product-hero-meta">
+        <li>Source, Scale, Reconstruct, Model, Review, Deliver</li>
+        <li>Photos, video, webcam, scan mesh, datasheet, or library record</li>
+        <li>Honesty tags, dimension evidence, deviation, and provenance</li>
+      </ul>
+    </div>
+  </header>
+
+  <section class="section" aria-labelledby="sources-title">
+    <div class="wrap">
+      <header class="section-heading">
+        <p class="eyebrow" id="sources-title">Starting evidence</p>
+        <h2>Choose the lane from what you have.</h2>
+        <p class="lede">A physical part, an existing scan, and a catalog record need different treatment. The session keeps that starting point visible so later dimensions are not detached from their source.</p>
+      </header>
+      <ul class="product-tiles">
+        <li class="product-tile"><strong>Photos or video</strong><span>Add stills, extract usable video frames, or capture from a webcam. Coverage states whether the orbit was measured or estimated and flags frames with measured blur.</span></li>
+        <li class="product-tile"><strong>Scan mesh</strong><span>Bring in an existing structured-light or laser mesh. Its units remain explicit; an unscaled mesh is reference geometry, not a dimensioned part.</span></li>
+        <li class="product-tile"><strong>Datasheet</strong><span>Ingest a catalog document or researched specification as sourced dimension candidates without running the image-reconstruction stages.</span></li>
+        <li class="product-tile"><strong>Parts library</strong><span>Seed a session from an existing library record, research the missing evidence, then attach the reviewed result back to that part identity.</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="workflow-title">
+    <div class="wrap">
+      <header class="section-heading">
+        <p class="eyebrow" id="workflow-title">Session workflow</p>
+        <h2>Six stages, with the review gates left in.</h2>
+        <p class="lede">The scan lane records Source, Scale, Reconstruct, Model, Review, and Deliver. Scale methods that use image geometry need registered views, so work may move between Scale and Reconstruct before a person accepts the millimeter ratio.</p>
+      </header>
+      <ol class="product-steps">
+        <li><div><h3>Source</h3><p>Add photos, video, webcam frames, or a scan mesh. The session records the files and reports whether the reconstruction services required by that evidence are available.</p></div></li>
+        <li><div><h3>Scale</h3><p>Use a printed ArUco mat, two picked points, or one known dimension. The computed ratio and residual stay unconfirmed until a person accepts them.</p></div></li>
+        <li><div><h3>Reconstruct</h3><p>The available reconstruction path registers views and produces sparse, dense, splat, or mesh artifacts as supported. Progress, selected backend, failures, and resulting artifacts remain in the session record.</p></div></li>
+        <li><div><h3>Model</h3><p>Fit planes, cylinders, spheres, cones, and sections, then build sketches and features where the evidence supports them. Shape the build cannot explain remains an explicit mesh-body fallback.</p></div></li>
+        <li><div><h3>Review</h3><p>Read dimension sources and honesty tiers, confirm fit-critical values, and inspect geometric deviation. Fix the worst regions and compare again before treating the rebuild as finished.</p></div></li>
+        <li><div><h3>Deliver</h3><p>Attach the reviewed geometry to its Parts record or export the full session bundle, including the artifacts and manifest that explain how the result was produced.</p></div></li>
+      </ol>
+      <div class="product-note product-stack">
+        <p class="eyebrow">Shorter evidence lanes</p>
+        <p>Datasheet and researched catalog sessions move from Source to Model, Review, and Deliver because there is no image reconstruction to scale. A library record routes through the lane supported by its source material.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="honesty-title">
+    <div class="wrap product-columns">
+      <div>
+        <header class="section-heading product-subhead">
+          <p class="eyebrow" id="honesty-title">Photo-derived honesty</p>
+          <h2>A shape estimate and a fit dimension are different evidence.</h2>
+        </header>
+        <p class="product-body">Single-photo results are tagged <code>approximate</code>. They have no metric scale and are suitable as reference or preview shape, not as a dimensionally usable replacement part.</p>
+        <p class="product-body">Measurements inferred from photos carry an honesty tier: high is ±2%, medium is ±5%, and low is ±10%. A fit-critical bore, shaft, or mating face still needs a typed confirmation from a caliper or another defensible source.</p>
+      </div>
+      <div class="product-spec-wrap">
+        <table class="product-spec">
+          <caption>How evidence appears in review</caption>
+          <thead><tr><th scope="col">Evidence</th><th scope="col">Treatment</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Caliper or known dimension</th><td>Typed by a person, preserved as the scale or dimension source</td></tr>
+            <tr><th scope="row">Datasheet</th><td>Kept as a sourced candidate and confirmed where fit depends on it</td></tr>
+            <tr><th scope="row">Photo measurement</th><td>Shown with its honesty tier and original photo-derived value</td></tr>
+            <tr><th scope="row">Primitive fit</th><td>Marked as fitted evidence from a scaled mesh, or approximate when scale is absent</td></tr>
+            <tr><th scope="row">Single photo</th><td>Reference shape only; no metric scale</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="review-title">
+    <div class="wrap split">
+      <header class="section-heading">
+        <p class="eyebrow" id="review-title">Review and provenance</p>
+        <h2>The model is delivered with its trail.</h2>
+        <p class="lede">The workspace keeps a timeline of source ingestion, scale method, reconstruction, primitive fits, parametric build, and attachment. The dimension ledger preserves review evidence. Deviation and match information describe how closely the rebuilt geometry follows the reference; they do not erase unresolved regions.</p>
+        <p class="supporting-copy">Attaching a result makes the best available geometry addressable from the Parts hub. Export writes the complete session directory as a bundle rather than separating the final file from the evidence used to make it.</p>
+      </header>
+      <div class="product-note">
+        <p class="eyebrow">Before delivery</p>
+        <ul class="fact-list">
+          <li>Confirm the session scale and read its residual</li>
+          <li>Replace photo estimates on fit-critical interfaces with measured values</li>
+          <li>Review the largest deviation regions and any mesh fallback</li>
+          <li>Keep the source files and provenance timeline with the result</li>
+        </ul>
+        <p><a class="text-link" href="/docs/reverse-engineering/">Reverse engineering guide <span aria-hidden="true">&rarr;</span></a></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section cta-band">
+    <div class="wrap section-heading">
+      <p class="eyebrow">Next</p>
+      <h2>Start with the evidence you already have.</h2>
+      <p class="lede">Open a browser workspace, or read the guide before you begin a capture session.</p>
+      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/docs/reverse-engineering/">Read the guide</a></div>
+      <ul class="product-jump">
+        <li><a href="/product/">All capabilities</a></li>
+        <li><a href="/product/modeling/">Modeling</a></li>
+        <li><a href="/product/plm/">Product data</a></li>
+        <li><a href="/product/copilot/">AI copilot</a></li>
+        <li><a href="/docs/reverse-engineering/">Docs</a></li>
+      </ul>
+    </div>
+  </section>
+</BaseLayout>

@@ -16,6 +16,8 @@
 #include "../ui_theme.h"
 #include "settings_modal.h"
 #include "web_capabilities.h"
+#include "metrics.h"
+#include "widgets/kit.h"
 
 namespace ui {
 namespace {
@@ -76,21 +78,29 @@ constexpr OAuthProvider kOAuthProviders[] = {
 struct WorkspaceChoice {
     const char* label;
     const char* detail;
+    const char* icon;
     const char* configName;
     AppState::Workspace workspace;
 };
 
 constexpr WorkspaceChoice kWorkspaces[] = {
-    {"Model", "Build parametric parts and assemblies", "model", AppState::Workspace::Model},
-    {"Drawing", "Create production drawings", "drawing", AppState::Workspace::Drawing},
-    {"Simulate", "Run structural and motion studies", "simulate", AppState::Workspace::Simulate},
-    {"Electronics", "Design schematics and PCBs", "electronics", AppState::Workspace::Electronics},
-    {"Manufacture", "Prepare CAM and shop workflows", "manufacture", AppState::Workspace::Manufacture},
-    {"PLM", "Organize projects and revisions", "plm", AppState::Workspace::PLM},
-    {"Parts Library", "Find reusable components", "parts_library", AppState::Workspace::PartsLibrary},
-    {"AI", "Start in the copilot command center", "ai", AppState::Workspace::AI},
-    {"Reverse Engineering", "Reconstruct scans and captures", "reverse_engineering", AppState::Workspace::ReverseEng},
-    {"Firmware", "Build and emulate device firmware", "firmware", AppState::Workspace::Firmware},
+    {"Model", "Parametric parts & assemblies", "ws_model", "model", AppState::Workspace::Model},
+    {"Drawing", "Production drawings & sheets", "ws_drawing", "drawing",
+     AppState::Workspace::Drawing},
+    {"Simulate", "Structural & motion studies", "ws_simulate", "simulate",
+     AppState::Workspace::Simulate},
+    {"Electronics", "Schematics & PCB layout", "ws_electronics", "electronics",
+     AppState::Workspace::Electronics},
+    {"Manufacture", "CAM setup, toolpaths & shop", "ws_manufacture", "manufacture",
+     AppState::Workspace::Manufacture},
+    {"PLM", "Projects, BOMs & revisions", "history", "plm", AppState::Workspace::PLM},
+    {"Parts Library", "Reusable components & suppliers", "ws_parts", "parts_library",
+     AppState::Workspace::PartsLibrary},
+    {"AI", "Copilot command center", "ai_panel", "ai", AppState::Workspace::AI},
+    {"Reverse Engineering", "Scans, meshes & reconstruction", "file_mesh",
+     "reverse_engineering", AppState::Workspace::ReverseEng},
+    {"Firmware", "Build, emulate & inspect firmware", "file_code", "firmware",
+     AppState::Workspace::Firmware},
 };
 
 std::string jsonString(const nlohmann::json& value, const char* key) {
@@ -396,23 +406,56 @@ void drawTestStep(AppState& st, bool appBusy) {
 
 void drawWorkspaceStep() {
     ImGui::TextUnformatted("Pick a starting workspace");
-    dimWrapped("Choose where Chudware should take you when setup finishes. You can switch workspaces at any time.");
-    ImGui::Dummy(ImVec2(0, 8.0f * uiScale));
-    if (ImGui::BeginTable("##onboarding_workspaces", 2, ImGuiTableFlags_SizingStretchSame)) {
+    kit::pushDensity(kit::Density::Roomy);
+    kit::dimText(
+        "Choose where Chudware should take you when setup finishes. You can switch workspaces at any time.");
+    kit::gapRow();
+
+    char workspaceCount[32];
+    std::snprintf(workspaceCount, sizeof(workspaceCount), "%zu workspaces",
+                  std::size(kWorkspaces));
+    kit::sectionHeader("Choose one", nullptr, workspaceCount, -1, /*first=*/true);
+
+    // Keep two balanced columns while both lines can remain intact. On narrower windows the
+    // cards become one scrollable column rather than clipping a capability label or destination.
+    float widestText = 0.0f;
+    for (const WorkspaceChoice& choice : kWorkspaces) {
+        widestText = std::max(widestText, ImGui::CalcTextSize(choice.label).x);
+        widestText = std::max(widestText, ImGui::CalcTextSize(choice.detail).x);
+    }
+    const float twoLineH =
+        ImGui::GetTextLineHeight() * 2.0f + metrics::U(0.5f);
+    const float selectedMetaW =
+        ImGui::CalcTextSize("Selected").x + metrics::U(1.5f);
+    const float minimumCardW =
+        kit::padX() * 2.0f + twoLineH + metrics::U(1.5f) + widestText + selectedMetaW;
+    const float availableW = ImGui::GetContentRegionAvail().x;
+    const int columns =
+        availableW >= minimumCardW * 2.0f + kit::rowGap() ? 2 : 1;
+
+    const ImGuiTableFlags tableFlags =
+        ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX |
+        ImGuiTableFlags_NoSavedSettings;
+    const float cellGap = kit::rowGap() * 0.5f;
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(cellGap, cellGap));
+    if (ImGui::BeginTable("##onboarding_workspaces", columns, tableFlags)) {
         for (int i = 0; i < static_cast<int>(std::size(kWorkspaces)); ++i) {
             ImGui::TableNextColumn();
-            ImGui::PushID(i);
             const bool selected = s_wizard.chosenWorkspace == i;
-            if (selected)
-                ImGui::PushStyleColor(ImGuiCol_Button, Palette::toU32(palette.accentSoft));
-            if (ImGui::Button(kWorkspaces[i].label, ImVec2(-1, 34.0f * uiScale)))
+            kit::RowStyle style;
+            style.icon = kWorkspaces[i].icon;
+            style.iconTone = selected ? kit::Tone::Accent : kit::Tone::Neutral;
+            style.secondary = kWorkspaces[i].detail;
+            style.meta = selected ? "Selected" : nullptr;
+            style.tooltip = kWorkspaces[i].detail;
+            style.selected = selected;
+            if (kit::row(kWorkspaces[i].configName, kWorkspaces[i].label, style))
                 s_wizard.chosenWorkspace = i;
-            if (selected) ImGui::PopStyleColor();
-            dimWrapped(kWorkspaces[i].detail);
-            ImGui::PopID();
         }
         ImGui::EndTable();
     }
+    ImGui::PopStyleVar();
+    kit::popDensity();
 }
 
 bool finishWizard(AppState& st) {

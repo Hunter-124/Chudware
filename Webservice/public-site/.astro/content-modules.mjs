@@ -10,6 +10,7 @@ export default new Map([
 ["src/content/docs/install-windows.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Finstall-windows.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/keyboard-reference.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fkeyboard-reference.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/plm.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fplm.mdx&astroContentModuleFlag=true")],
+["src/content/docs/reverse-engineering.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Freverse-engineering.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/sketching.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fsketching.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/troubleshooting.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Ftroubleshooting.mdx&astroContentModuleFlag=true")]]);
 		

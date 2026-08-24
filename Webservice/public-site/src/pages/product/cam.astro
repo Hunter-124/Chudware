@@ -25,7 +25,7 @@ import '../../styles/product.css';
         <p class="supporting-copy">Name setups and operations for the manufacturing intent &mdash; the face, the pocket, the bolt-circle drilling &mdash; rather than generic sequence numbers. The names are what a second person reads when the job comes back six months later.</p>
         <div class="actions"><a class="button button-secondary" href="/docs/cam/">CAM guide</a></div>
       </header>
-      <figure class="product-figure" data-lift>
+      <figure class="product-figure">
         <img src="/images/cam.png" width="1340" height="838" loading="lazy" alt="Chudware manufacturing workspace showing a CAM job with stock, tools, an operation list, and toolpath simulation controls" />
         <figcaption><span>Chudware manufacturing workspace</span><span>Job &middot; stock &middot; operations</span></figcaption>
       </figure>
@@ -39,7 +39,7 @@ import '../../styles/product.css';
         <h2>Everything the toolpath depends on is explicit.</h2>
         <p class="lede">Stock defines what exists before the first cut. The work coordinate system defines where the machine thinks the part is. Both are declared, not inferred.</p>
       </header>
-      <figure class="product-diagram" data-lift>
+      <figure class="product-diagram">
         <svg class="product-svg" viewBox="0 0 640 300" role="img" aria-labelledby="setup-diagram-title">
           <title id="setup-diagram-title">A machining setup in section: stock outline around the finished part, a tool approaching the machined face, the cut depth dimensioned, and the work coordinate system at the part corner.</title>
           <defs>
@@ -82,10 +82,10 @@ import '../../styles/product.css';
         <figcaption>Section through a setup. Stock is dashed, the finished part is solid, and the cut depth is the difference between them.</figcaption>
       </figure>
       <ul class="product-tiles product-stack">
-        <li class="product-tile" data-lift><strong>Facing</strong><span>Establish a reference surface on raw stock.</span></li>
-        <li class="product-tile" data-lift><strong>Pocketing</strong><span>Clear enclosed material to depth.</span></li>
-        <li class="product-tile" data-lift><strong>Contouring</strong><span>Finish profiles and outside walls.</span></li>
-        <li class="product-tile" data-lift><strong>Drilling</strong><span>Hole patterns from the model's own features.</span></li>
+        <li class="product-tile"><strong>Facing</strong><span>Establish a reference surface on raw stock.</span></li>
+        <li class="product-tile"><strong>Pocketing</strong><span>Clear enclosed material to depth.</span></li>
+        <li class="product-tile"><strong>Contouring</strong><span>Finish profiles and outside walls.</span></li>
+        <li class="product-tile"><strong>Drilling</strong><span>Hole patterns from the model's own features.</span></li>
       </ul>
       <p class="product-body product-stack">Tools come from the project library, and 3D operations are available where a surfaced form needs them. Operations are added in process order, which is the order the machine will run them.</p>
     </div>
@@ -142,7 +142,7 @@ import '../../styles/product.css';
         <p class="product-body">Simulation, collision inspection, and remaining-stock review exist so problems surface before a spindle turns. They are preparation tools. They do not certify a program.</p>
         <p class="product-body">Dry-run and single-block procedures at the machine still apply, according to your shop's safety process.</p>
       </div>
-      <div class="product-note product-note-warning" data-lift>
+      <div class="product-note product-note-warning">
         <p class="eyebrow">Operator responsibility</p>
         <p>The operator remains responsible for machine setup and execution. Inspect stock, tool, setup, simulation, and posted code before anything runs.</p>
         <p>This also applies to work the AI copilot prepares: it may build CAM operations and output, but actions affecting a physical machine require explicit operator review and control.</p>

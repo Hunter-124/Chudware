@@ -23,7 +23,7 @@ import '../../styles/product.css';
         <h2>The result, the mesh it came from, and the numbers behind it.</h2>
         <p class="lede">A finished static study reports von Mises, Tresca shear, both principal stresses, peak displacement, and the minimum factor of safety &mdash; alongside the node, element, and degree-of-freedom counts that produced them. The mesh is part of the result, not a setting you configured once and stopped looking at.</p>
       </header>
-      <figure class="product-figure" data-lift>
+      <figure class="product-figure">
         <img src="/images/fea.png" width="1340" height="838" loading="lazy" alt="Chudware Simulate workspace showing a completed static study: a von Mises stress colour map across the part with its scale bar, beside a results panel listing peak stresses, displacement, factor of safety, and mesh and solver counts" />
         <figcaption><span>Chudware Simulate workspace</span><span>Static study &middot; von Mises</span></figcaption>
       </figure>
@@ -38,7 +38,7 @@ import '../../styles/product.css';
         <p class="lede">Every stress result depends on how finely the part was divided. A mesh that is too coarse under-reports peak stress, which is the dangerous direction &mdash; it reads as a passing factor of safety. The usual answer to that is a fineness slider and a hope.</p>
         <p class="supporting-copy">Chudware ships two independent mesh generators. The default fills the exact solid from its own surfaces with curvature-driven refinement; the second lays a graded lattice through the volume and projects the boundary. They agree on nothing except the answer. Switch the generator on a study, re-run it, and compare: when two unrelated discretizations land on the same number, that number belongs to the part.</p>
       </header>
-      <div class="product-note" data-lift>
+      <div class="product-note">
         <p class="eyebrow">Measured, not asserted</p>
         <p>A cantilever with a closed-form answer. Analytic tip deflection: <strong>0.2000&nbsp;mm</strong>. Solved on a mesh from the default generator: <strong>0.19270&nbsp;mm</strong>. Solved on a mesh from the second generator: <strong>0.19068&nbsp;mm</strong>.</p>
         <p>3.7% and 4.7% under theory, and 1.0% of the analytic value apart from each other. Two generators that share no algorithm, converging on the same beam.</p>
@@ -54,7 +54,7 @@ import '../../styles/product.css';
         <h2>Refine where the error is, not everywhere.</h2>
         <p class="lede">Refining uniformly is the usual workaround for a mesh you do not trust, and it is expensive: element count grows with the cube of the size step, and almost all of those elements land where the stress field is already smooth.</p>
       </header>
-      <figure class="product-diagram" data-lift>
+      <figure class="product-diagram">
         <svg class="product-svg" viewBox="0 0 640 300" role="img" aria-labelledby="adapt-diagram-title">
           <title id="adapt-diagram-title">The adaptive loop: mesh, solve, score the discretization error element by element, mark the worst elements, tighten the mesh around them, and mesh again. The loop exits to a result when the error indicator reaches its target or the pass budget is spent.</title>
           <defs>
@@ -101,7 +101,7 @@ import '../../styles/product.css';
           <p class="product-body">The score is a Zienkiewicz&ndash;Zhu recovery estimator &mdash; the solved stress field compared against a smoothed reconstruction of itself &mdash; and the worst elements are marked before the next pass, so refinement is spent where it changes the answer.</p>
           <p class="product-body">Every pass reuses the ordinary static study verbatim: the same fixture resolution, the same bonded ties, the same material model, the same result fields. An adaptive result is not a different kind of answer, it is the same answer with its error stated.</p>
         </div>
-        <div class="product-note" data-lift>
+        <div class="product-note">
           <p class="eyebrow">Why it needs the second generator</p>
           <p>Refining selectively means handing the mesher a spatial size field &mdash; a map of how fine to be, place by place. Only one of the two generators accepts one, so adaptive studies run on that generator, and the study says so in its notes rather than switching silently.</p>
           <p>That is the honest reason a second mesher exists in the first place. It was not added as a robustness fallback, and it is not described as one.</p>
@@ -227,7 +227,7 @@ import '../../styles/product.css';
           </tbody>
         </table>
       </div>
-      <div class="product-note product-note-warning product-stack" data-lift>
+      <div class="product-note product-note-warning product-stack">
         <p class="eyebrow">Labeled, permanently</p>
         <p>Every flow result carries a banner that does not go away, and it says what the product means rather than what marketing would prefer: the result is <strong>qualitative</strong>, and a full CFD solver should be used for engineering decisions. The banner reports the Reynolds number it actually ran at, so you can see for yourself which regime you were in.</p>
       </div>
@@ -244,7 +244,7 @@ import '../../styles/product.css';
         <p class="product-body">The static solver is linear and elastic on an isotropic material. Loads are applied at once rather than stepped, displacements are assumed small, and there is no plasticity and no geometric non-linearity. The only joint model is a bonded tie across an assembly clearance &mdash; there is no sliding or frictional contact.</p>
         <p class="product-body">A part that would yield in reality does not yield in the model. It reports a stress above the yield strength, which is exactly what a factor of safety is for, and exactly why a factor of safety is not a proof.</p>
       </div>
-      <div class="product-note product-note-warning" data-lift>
+      <div class="product-note product-note-warning">
         <p class="eyebrow">What simulation does not do</p>
         <p>A study is evidence for an engineering decision, not a certification of a design. Chudware reports the fields, the mesh quality, and how far the error indicator got. It does not sign off on a part.</p>
         <p>A result whose mesh you did not inspect, on a load case you did not question, is a color picture. The value of the convergence table is that it makes that distinction checkable instead of a matter of taste.</p>

@@ -42,7 +42,7 @@ import '../styles/company.css';
           <div><dt>Repository</dt><dd>github.com/Hunter-124/Polyhedral-FEA</dd></div>
         </dl>
         <div class="actions"><a class="button" href="https://github.com/Hunter-124/Polyhedral-FEA">Read the source</a></div>
-        <div class="co-note" data-lift>
+        <div class="co-note">
           <p class="eyebrow">What BSD 3-Clause means for you</p>
           <p>Use it, change it, ship it inside something commercial and closed. The obligations are to keep the copyright notice and the disclaimer, and not to use the author's name to endorse your product. There is no copyleft, no obligation to publish your changes, and no distinction drawn between linking and copying the source in.</p>
           <p>It is the most permissive license in Chudware's dependency tree, and it is that way on purpose: a mesher nobody can adopt is a mesher nobody will check.</p>
@@ -127,17 +127,17 @@ import '../styles/company.css';
         <h2 id="os-orders" class="co-anchor">Convergence rate, cross-code parity, and what adaptivity is worth.</h2>
       </header>
       <div class="co-grid co-grid-3">
-        <div class="co-card" data-lift>
+        <div class="co-card">
           <h3>Convergence order, measured against theory</h3>
           <p>A solver can land on the right answer for the wrong reason. What it cannot fake is the <em>rate</em> at which error falls as the mesh is refined, because theory fixes that rate per element order. Against a manufactured solution, the project measures <strong>1.02, 1.99, 2.98, and 3.98</strong> where theory says 1, 2, 3, and 4.</p>
           <p>Orders that land on their theoretical values are the evidence that the element formulations and the integration are right, not merely calibrated.</p>
         </div>
-        <div class="co-card" data-lift>
+        <div class="co-card">
           <h3>Parity against an established solver</h3>
           <p>Run on identical eight-node hexahedral meshes, the project's solver and <strong>CalculiX 2.23</strong> &mdash; a long-established open-source finite-element code &mdash; agree in tip deflection to better than <strong>2&times;10<sup>&minus;5</sup>&nbsp;%</strong> at every rung of the refinement sequence.</p>
           <p>Agreement at that resolution is not two codes being roughly similar. It is two independent implementations of the same mathematics, which is the strongest statement available short of an analytical answer.</p>
         </div>
-        <div class="co-card" data-lift>
+        <div class="co-card">
           <h3>What adaptivity actually buys</h3>
           <p>On an L-shaped domain with a re-entrant corner &mdash; the standard hard case, because the stress is singular at the corner &mdash; reaching matched accuracy took <strong>6384</strong> degrees of freedom and <strong>2.762&nbsp;s</strong> uniformly, against <strong>1248</strong> degrees of freedom and <strong>0.227&nbsp;s</strong> adaptively.</p>
           <p>That is 5.12&times; fewer degrees of freedom and 12.2&times; less wall time for the same answer. Self-relative, one machine, one problem &mdash; a ratio, not a benchmark against anyone else.</p>
@@ -154,7 +154,7 @@ import '../styles/company.css';
         <p class="lede">The project is actively developed, with commits landing continuously. It has never cut a tagged release, and it has one star. Those are the honest headline numbers, and neither of them is a reason to trust it.</p>
         <p class="supporting-copy">What is worth judging is whether the work is disciplined enough that its numbers survive scrutiny. Read the repository and decide; that is the whole reason it is public.</p>
       </header>
-      <div class="co-note" data-lift>
+      <div class="co-note">
         <p class="eyebrow">What to judge instead</p>
         <ul class="fact-list">
           <li>Continuous integration and a unit-test suite that runs on every change</li>
@@ -174,7 +174,7 @@ import '../styles/company.css';
         <h2 id="os-retraction" class="co-anchor">A published benchmark claim that turned out to be measured on a broken engine.</h2>
         <p class="lede">The project's own documentation carries a retracted performance claim. The measurement had been taken against a comparison engine that was silently deleting a bore from the part, so the geometry being compared was not the geometry being described, and the number flattered the project for a reason that had nothing to do with the project.</p>
       </header>
-      <div class="co-note co-note-warn" data-lift>
+      <div class="co-note co-note-warn">
         <p class="eyebrow">Why that is on this page</p>
         <p>It would have been easy to delete the claim and say nothing. It is documented instead, with what went wrong and how it was found, because a scoreboard that has never been wrong in public is a scoreboard nobody has checked.</p>
         <p>Chudware's own pages are built the same way: the <a class="text-link" href="/security/">security</a> page lists what is not implemented, and <a class="text-link" href="/pricing/">pricing</a> publishes no rate it has not ratified.</p>

@@ -254,6 +254,33 @@ void plmPanelEnd() {
 
 void priorityDot(const std::string& pr);  // defined below; used by Overview too
 
+void severityBadge(const std::string& sev) {
+    ui::kit::Tone tone = ui::kit::Tone::Neutral;
+    if (sev == "critical" || sev == "high") tone = ui::kit::Tone::Err;
+    else if (sev == "med") tone = ui::kit::Tone::Warn;
+    else if (sev == "low") tone = ui::kit::Tone::Info;
+    ui::kit::chip(sev.empty() ? "med" : sev.c_str(), tone);
+}
+
+// Recent commits are rendered identically wherever the hub previews repository
+// history. Callers own the surrounding section header so an empty repository can
+// still keep its place in the page hierarchy.
+void drawGitActivity(size_t limit) {
+    auto& H = g_plmHub;
+    for (size_t i = 0; i < H.gitLog.size() && i < limit; ++i) {
+        const auto& c = H.gitLog[i];
+        ImGui::PushID("git_activity");
+        ImGui::PushID(c.hash.c_str());
+        plmCardBegin("##git_activity", false, 8.0f, 4.0f, palette.accent, 0.12f);
+        plmItemTitle(c.subject);
+        dimText("commit %s  \xc2\xb7  %s  \xc2\xb7  %s", c.hash.c_str(),
+                c.author.c_str(), c.date.c_str());
+        plmCardEnd();
+        ImGui::PopID();
+        ImGui::PopID();
+    }
+}
+
 void plmComingSoon(const char* title, const char* note) {
     plmSectionHeader(title);
     plmEmptyState(nullptr, note,
@@ -365,17 +392,17 @@ void plmDrawOverviewPage(AppState& st) {
     auto& H = g_plmHub;
     const float S = ui::uiScale;
     plmEnsureOverview(st);
-    plmEnsureGit(st);        // so Recent activity can fold in git commits
+    plmEnsureGit(st);
+    plmEnsurePlanning(st);
 
     if (!H.ovErr.empty()) { plmError(H.ovErr); return; }
 
     const auto& ov = H.overview;
+    constexpr size_t kPreviewRows = 3;
 
-    // Quadrant bodies. Laid out 2×2:  [ Save a checkpoint | Overview ]
-    //                                 [ Recent activity   | Open tasks ]
     auto bodyCheckpoint = [&]() {
         dimText("Record a point in this project's history you can return to.");
-        ImGui::Dummy(ImVec2(0, 2 * S));
+        ImGui::Dummy(ImVec2(0, ui::kit::rowGap()));
         ImGui::SetNextItemWidth(-1);
         bool enter = ImGui::InputTextWithHint("##plm_ckpt", "What changed? (optional)",
             H.checkpointMsg, sizeof(H.checkpointMsg), ImGuiInputTextFlags_EnterReturnsTrue);
@@ -383,13 +410,34 @@ void plmDrawOverviewPage(AppState& st) {
         if (save && !H.busy) doCheckpoint(st);
         if (H.busy) plmSpinner("Saving");
         plmError(H.actionErr);
-        if (!H.actionOk.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f));
-            ImGui::TextUnformatted(H.actionOk.c_str());
-            ImGui::PopStyleColor();
+        if (!H.actionOk.empty())
+            ui::kit::inlineStatus(H.actionOk.c_str(), ui::kit::Tone::Ok);
+
+        if (ov.dirtyCount > 0) {
+            ui::kit::gapSection();
+            plmSectionHeader("Unrecorded changes", "warning_badge");
+            char pending[96];
+            std::snprintf(pending, sizeof(pending), "%d changed file%s waiting to be recorded.",
+                          ov.dirtyCount, ov.dirtyCount == 1 ? " is" : "s are");
+            ui::kit::inlineStatus(pending, ui::kit::Tone::Warn);
+            const size_t shown = std::min(kPreviewRows, ov.dirtyItems.size());
+            for (size_t i = 0; i < shown; ++i) {
+                const auto& it = ov.dirtyItems[i];
+                plmDocTypeTag(it.docType, it.kind);
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextWrapped("%s", it.path.c_str());
+            }
+            if (ov.dirtyItems.size() > shown)
+                dimText("%zu more changed file%s", ov.dirtyItems.size() - shown,
+                        ov.dirtyItems.size() - shown == 1 ? "" : "s");
+            ui::kit::gapRow();
+            if (plmGlassButton("##rec_outside", "Record outside changes", "save",
+                               true) && !H.busy)
+                doRecordOutside(st);
         }
     };
+
     auto bodyStats = [&]() {
         struct SC { const char* label; int n; const float* col; };
         const SC scs[] = {
@@ -399,7 +447,8 @@ void plmDrawOverviewPage(AppState& st) {
             {"Issues",     ov.openIssues,     ov.openIssues ? palette.statusWarn : palette.textDim},
             {"Milestones", ov.openMilestones, palette.textDim},
         };
-        const float cw = 86 * S, cg = 8 * S;
+        const float cw = 86 * S;
+        const float cg = ui::kit::rowGap();
         int perRow = std::max(1, (int)std::floor(
             (ImGui::GetContentRegionAvail().x + cg) / (cw + cg)));
         for (int i = 0; i < (int)IM_ARRAYSIZE(scs); ++i) {
@@ -407,87 +456,206 @@ void plmDrawOverviewPage(AppState& st) {
             statCard(scs[i].label, scs[i].n, scs[i].col, cw);
         }
         if (!ov.nextMilestone.empty()) {
-            ImGui::Dummy(ImVec2(0, 2 * S));
+            ui::kit::gapRow();
             dimText("Next milestone: %s", ov.nextMilestone.c_str());
         }
     };
-    auto bodyRecent = [&]() {
-        if (ov.recent.empty() && H.gitLog.empty()) { dimText("No activity yet."); return; }
-        for (const auto& e : ov.recent) {
+
+    auto bodyCheckpointActivity = [&]() {
+        plmSectionHeader("Checkpoint activity", "history");
+        if (H.ovLoading && ov.recent.empty()) {
+            plmSpinner("Loading checkpoints");
+            return;
+        }
+        if (ov.recent.empty()) {
+            (void)ui::kit::emptyState(
+                "history", "No checkpoints yet",
+                "Save a checkpoint above to create a restorable project version.");
+            return;
+        }
+        const size_t shown = std::min(kPreviewRows, ov.recent.size());
+        for (size_t i = 0; i < shown; ++i) {
+            const auto& e = ov.recent[i];
             ImGui::PushID(e.commit.c_str());
-            plmCardBegin("##act", false, 8.0f, 3.0f,
+            plmCardBegin("##checkpoint_activity", false, 8.0f, 3.0f,
                          e.kind == "release" ? palette.statusOk : palette.accent, 0.15f);
-            std::string headline = !e.message.empty() ? e.message
-                                 : (!e.summary.empty() ? e.summary : "(saved)");
-            plmItemTitle(headline);          // wraps long messages instead of clipping
+            const std::string headline = !e.message.empty() ? e.message
+                                       : (!e.summary.empty() ? e.summary : "(saved)");
+            const char* entryLabel = "Checkpoint";
+            ui::kit::Tone entryTone = ui::kit::Tone::Accent;
+            if (e.kind == "release") {
+                entryLabel = "Release";
+                entryTone = ui::kit::Tone::Ok;
+            } else if (e.kind == "auto") {
+                entryLabel = "Auto-save";
+                entryTone = ui::kit::Tone::Neutral;
+            } else if (e.kind == "restore") {
+                entryLabel = "Restore";
+                entryTone = ui::kit::Tone::Info;
+            }
+            ui::kit::chip(entryLabel, entryTone);
+            ImGui::SameLine();
+            plmItemTitle(headline, nullptr, /*alignFrame=*/true);
             dimText("%s  \xc2\xb7  %s", e.author.c_str(), plmNiceTime(e.authoredAt).c_str());
             plmCardEnd();
             ImGui::PopID();
         }
-        // Git activity — the most recent commits from the working repo.
-        for (size_t i = 0; i < H.gitLog.size() && i < 6; ++i) {
-            const auto& c = H.gitLog[i];
-            ImGui::PushID(("g" + c.hash).c_str());
-            plmCardBegin("##gact", false, 8.0f, 3.0f, palette.accent, 0.12f);
-            plmItemTitle(c.subject);
-            dimText("commit %s  \xc2\xb7  %s  \xc2\xb7  %s", c.hash.c_str(),
-                    c.author.c_str(), c.date.c_str());
+        if (ov.recent.size() > shown)
+            dimText("%zu more checkpoint entries in History", ov.recent.size() - shown);
+    };
+
+    auto bodyGitHistory = [&]() {
+        plmSectionHeader("Git history", "git");
+        if (!H.gitErr.empty()) {
+            plmError(H.gitErr);
+            return;
+        }
+        if (H.gitLoading && H.gitLog.empty()) {
+            plmSpinner("Loading Git history");
+            return;
+        }
+        if (H.gitMissing) {
+            (void)ui::kit::blockedState(
+                "Git unavailable", "Git is not installed on this machine.",
+                "Install Git to show repository history for this project.");
+            return;
+        }
+        if (!H.gitIsRepo) {
+            (void)ui::kit::emptyState(
+                "git", "No Git history",
+                "This project folder is not a Git repository. Checkpoint history remains available.");
+            return;
+        }
+        if (H.gitLog.empty()) {
+            (void)ui::kit::emptyState(
+                "git", "No Git commits yet",
+                "Commits made in this repository will appear here.");
+            return;
+        }
+        drawGitActivity(kPreviewRows);
+        if (H.gitLog.size() > kPreviewRows)
+            dimText("%zu more commits in Git", H.gitLog.size() - kPreviewRows);
+    };
+
+    auto bodyTasks = [&]() {
+        if (H.ovLoading && ov.tasks.empty()) {
+            plmSpinner("Loading tasks");
+            return;
+        }
+        if (ov.tasks.empty()) {
+            (void)ui::kit::emptyState(
+                "prompt_edit", "No open tasks",
+                "Create and assign work from the Planning page.");
+            return;
+        }
+        const size_t shown = std::min(kPreviewRows, ov.tasks.size());
+        for (size_t i = 0; i < shown; ++i) {
+            const auto& t = ov.tasks[i];
+            ImGui::PushID(t.id.c_str());
+            plmCardBegin("##overview_task", false, 8.0f, 6.0f,
+                         plmTintPriority(t.priority), 0.32f);
+            plmItemTitle(t.title);
+            priorityDot(t.priority);
+            if (!t.assignee.empty()) dimText("@%s", t.assignee.c_str());
             plmCardEnd();
             ImGui::PopID();
         }
-    };
-    auto bodyTasks = [&]() {
-        if (ov.tasks.empty()) {
-            dimText("No open tasks.");
-        } else {
-            for (const auto& t : ov.tasks) {
-                ImGui::PushID(t.id.c_str());
-                plmCardBegin("##ovt", false, 8.0f, 6.0f, plmTintPriority(t.priority), 0.32f);
-                plmItemTitle(t.title);          // wraps long titles instead of clipping
-                priorityDot(t.priority);        // hover tooltip naming the priority
-                plmCardEnd();
-                ImGui::PopID();
-            }
-        }
-        if (ov.dirtyCount > 0) {
-            ImGui::Dummy(ImVec2(0, 6 * S));
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-            ImGui::TextUnformatted("Unsaved files");
-            ImGui::PopStyleColor();
-            for (const auto& it : ov.dirtyItems) {
-                plmDocTypeTag(it.docType, it.kind);
-                ImGui::SameLine();
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextWrapped("%s", it.path.c_str());
-            }
-            ImGui::Dummy(ImVec2(0, 4 * S));
-            if (plmGlassButton("##rec_outside", "Record outside changes", "save",
-                               true) && !H.busy)
-                doRecordOutside(st);
-        }
+        if (ov.tasks.size() > shown)
+            dimText("%zu more open task%s in Planning", ov.tasks.size() - shown,
+                    ov.tasks.size() - shown == 1 ? "" : "s");
     };
 
-    const float halfW = (ImGui::GetContentRegionAvail().x - 12 * S) * 0.5f;
+    auto bodyIssues = [&]() {
+        const bool planFailed = !H.planErr.empty();
+        if (planFailed) plmError(H.planErr);
 
-    // Row 1 — Save a checkpoint (left) · Overview (right)
-    plmPanelBegin("##ov_ckpt", "Save a checkpoint", "save", halfW);
+        size_t openCount = 0;
+        for (const auto& issue : H.issues)
+            if (issue.state != "closed") ++openCount;
+        if (H.planLoading && H.issues.empty()) {
+            plmSpinner("Loading issues");
+            return;
+        }
+        if (openCount == 0 && ov.openIssues > 0) {
+            plmSpinner("Loading issue details");
+            return;
+        }
+        if (openCount == 0) {
+            if (planFailed) return;
+            (void)ui::kit::emptyState(
+                "issue_bug", "No open issues",
+                "Log defects and follow them to closure from the Planning page.");
+            return;
+        }
+        size_t shown = 0;
+        for (const auto& issue : H.issues) {
+            if (shown == kPreviewRows) break;
+            if (issue.state == "closed") continue;
+            ImGui::PushID(issue.id.c_str());
+            plmCardBegin("##overview_issue", false, 8.0f, 6.0f,
+                         plmTintSeverity(issue.severity), 0.32f);
+            severityBadge(issue.severity);
+            ImGui::SameLine();
+            plmItemTitle(issue.title, nullptr, /*alignFrame=*/true);
+            if (!issue.assignee.empty()) dimText("@%s", issue.assignee.c_str());
+            plmCardEnd();
+            ImGui::PopID();
+            ++shown;
+        }
+        if (openCount > shown)
+            dimText("%zu more open issue%s in Planning", openCount - shown,
+                    openCount - shown == 1 ? "" : "s");
+    };
+
+    const float availableW = ImGui::GetContentRegionAvail().x;
+    const float panelGap = ui::kit::gutter();
+    const bool twoColumns = availableW >= ui::metrics::px(760.0f);
+    const float panelW = twoColumns ? (availableW - panelGap) * 0.5f : 0.0f;
+
+    // Primary actions and project health stay first; on a narrow pane they stack
+    // instead of squeezing either panel below a useful reading width.
+    plmPanelBegin("##ov_ckpt", "Save a checkpoint", "save", panelW);
     bodyCheckpoint();
     plmPanelEnd();
-    ImGui::SameLine(0, 12 * S);
-    plmPanelBegin("##ov_stats", "Overview", "app", halfW);
+    if (twoColumns) ImGui::SameLine(0, panelGap);
+    else ui::kit::gapRow();
+    plmPanelBegin("##ov_stats", "Project overview", "app", panelW);
     bodyStats();
     plmPanelEnd();
 
-    ImGui::Dummy(ImVec2(0, 10 * S));
+    ui::kit::gapRow();
 
-    // Row 2 — Recent activity (left) · Open tasks (right)
-    plmPanelBegin("##ov_recent", "Recent activity", "history", halfW);
-    bodyRecent();
+    // One activity region, two truthful timelines. The inner section headers keep
+    // PLM checkpoints distinct from raw repository commits without another card tier.
+    plmPanelBegin("##ov_recent", "Recent activity", "history");
+    if (twoColumns &&
+        ImGui::BeginTable("##overview_activity_columns", 2,
+                          ImGuiTableFlags_SizingStretchSame |
+                          ImGuiTableFlags_BordersInnerV |
+                          ImGuiTableFlags_NoPadOuterX)) {
+        ImGui::TableNextColumn();
+        bodyCheckpointActivity();
+        ImGui::TableNextColumn();
+        bodyGitHistory();
+        ImGui::EndTable();
+    } else {
+        bodyCheckpointActivity();
+        ui::kit::gapSection();
+        ui::kit::rule();
+        ui::kit::gapSection();
+        bodyGitHistory();
+    }
     plmPanelEnd();
-    ImGui::SameLine(0, 12 * S);
-    plmPanelBegin("##ov_tasks", "Open tasks", "prompt_edit", halfW);
+
+    ui::kit::gapRow();
+
+    plmPanelBegin("##ov_tasks", "Open tasks", "prompt_edit", panelW);
     bodyTasks();
+    plmPanelEnd();
+    if (twoColumns) ImGui::SameLine(0, panelGap);
+    else ui::kit::gapRow();
+    plmPanelBegin("##ov_issues", "Open issues", "issue_bug", panelW);
+    bodyIssues();
     plmPanelEnd();
 }
 
@@ -954,26 +1122,6 @@ void doRelease(AppState& st, const std::string& itemId, bool confirm) {
 }
 }  // namespace
 
-// Shared git-activity list: recent commits as liquid-glass cards. Reused by the
-// Releases panel and anywhere else that surfaces working-repo activity.
-static void drawGitActivity(AppState& st, size_t limit) {
-    (void)st;
-    auto& H = g_plmHub;
-    const float S = ui::uiScale;
-    if (H.gitLog.empty()) return;
-    plmSectionHeader("Git activity", "git");
-    ImGui::Dummy(ImVec2(0, 2 * S));
-    for (size_t i = 0; i < H.gitLog.size() && i < limit; ++i) {
-        const auto& c = H.gitLog[i];
-        ImGui::PushID(("rel_g" + c.hash).c_str());
-        plmCardBegin("##relg", false, 8.0f, 4.0f, palette.accent, 0.12f);
-        plmItemTitle(c.subject);
-        dimText("commit %s  \xc2\xb7  %s  \xc2\xb7  %s", c.hash.c_str(),
-                c.author.c_str(), c.date.c_str());
-        plmCardEnd();
-        ImGui::PopID();
-    }
-}
 
 void plmDrawReleasesPage(AppState& st) {
     auto& H = g_plmHub;
@@ -1052,7 +1200,12 @@ void plmDrawReleasesPage(AppState& st) {
         plmCardEnd();
         ImGui::PopID();
     }
-    if (!H.gitLog.empty()) { ImGui::Dummy(ImVec2(0, 8 * S)); drawGitActivity(st, 10); }
+    if (!H.gitLog.empty()) {
+        ImGui::Dummy(ImVec2(0, 8 * S));
+        plmSectionHeader("Git history", "git");
+        ImGui::Dummy(ImVec2(0, 2 * S));
+        drawGitActivity(10);
+    }
     ImGui::EndChild();
 }
 
@@ -1805,14 +1958,6 @@ void plmDrawPlanningPage(AppState& st) {
 namespace {
 static std::string s_selIssue;
 
-void severityBadge(const std::string& sev) {
-    const float* c = palette.textDim;
-    if (sev == "critical" || sev == "high") c = palette.statusErr;
-    else if (sev == "med") c = palette.statusWarn;
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], 1.0f));
-    ImGui::Text("[%s]", sev.empty() ? "med" : sev.c_str());
-    ImGui::PopStyleColor();
-}
 }  // namespace
 
 void plmDrawIssuesPage(AppState& st) {

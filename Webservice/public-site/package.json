@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build && pagefind --site dist",
-    "preview": "astro preview"
+    "preview": "astro preview",
+    "verify:product-images": "node src/scripts/verify-product-images.mjs"
   },
   "dependencies": {
     "@astrojs/mdx": "7.0.5",

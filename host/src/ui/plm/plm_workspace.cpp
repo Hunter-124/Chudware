@@ -306,7 +306,7 @@ bool plmBusy() {
     const PlmHubState& H = g_plmHub;
     if (H.itemsLoading || H.histLoading || H.versionsGraph.loading) return true;
     switch (H.page) {
-        case PlmPage::Overview: return H.ovLoading;
+        case PlmPage::Overview: return H.ovLoading || H.gitLoading || H.planLoading;
         case PlmPage::Planning:
         case PlmPage::Issues:   return H.planLoading;
         case PlmPage::Git:      return H.gitLoading;

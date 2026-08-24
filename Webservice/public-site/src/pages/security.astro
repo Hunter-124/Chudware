@@ -23,7 +23,7 @@ import '../styles/company.css';
         <h2 id="co-path" class="co-anchor">One ingress, one place where identity is decided.</h2>
         <p class="lede">The browser workspace is the whole application running in your tab, not a video stream of a machine in a data centre, and it reaches the engine over a single long-lived connection. Every call behind that connection still passes the same gateway, which replaces whatever identity the client claims with the one it verified.</p>
       </header>
-      <figure class="co-diagram" data-lift>
+      <figure class="co-diagram">
         <svg class="co-dg" viewBox="0 0 910 320" role="img" aria-label="Request path: a browser tab connects over HTTPS through a single outbound tunnel, which is the only ingress, to the gateway. The gateway verifies the session cookie and sits inside the gateway-enforced boundary together with the shared engine service and the per-account workspace and bucket roots. Both the engine calls and the file paths they name are clamped to the calling account.">
           <defs>
             <marker id="co-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -160,7 +160,7 @@ import '../styles/company.css';
           <li><strong>No regulated-data posture.</strong> Chudware is not offered for export-controlled, classified, or health data.</li>
         </ul>
       </header>
-      <div class="co-note co-note-warn" data-lift>
+      <div class="co-note co-note-warn">
         <p class="eyebrow">Why say this out loud</p>
         <p>A trust page that implies an audit it has not had is worse than no trust page. Everything above is a gap, stated as a gap, so an evaluator can price the risk instead of discovering it later.</p>
         <p>These entries will change only when the underlying work is actually done, in the same way <a class="text-link" href="/pricing/">pricing</a> will publish rates only once they are ratified.</p>
@@ -174,7 +174,7 @@ import '../styles/company.css';
         <p class="eyebrow">Responsible disclosure</p>
         <h2 id="co-disclosure" class="co-anchor">Found something? Send it straight to a human.</h2>
       </header>
-      <div class="co-disclose" data-lift>
+      <div class="co-disclose">
         <p class="eyebrow">Reporting</p>
         <a class="co-route-address" href="mailto:security@chudware.com?subject=Security%20report">security@chudware.com</a>
         <ol>

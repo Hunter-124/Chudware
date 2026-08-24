@@ -18,7 +18,7 @@ import '../../styles/product.css';
 
   <section class="section" aria-labelledby="structure-title">
     <div class="wrap split product-split-diagram">
-      <figure class="product-diagram" data-lift>
+      <figure class="product-diagram">
         <svg class="product-svg" viewBox="0 0 640 340" role="img" aria-labelledby="mate-diagram-title">
           <title id="mate-diagram-title">An assembly graph: a frame component fixed at the assembly origin, with a bearing, shaft, and cover each located by a named mate.</title>
           <defs>
@@ -100,20 +100,20 @@ import '../../styles/product.css';
         <p class="lede">Two habits do most of the work: check what actually collides, and never solve a revision by inserting a renamed copy.</p>
       </header>
       <div class="product-compare">
-        <div class="product-compare-good" data-lift>
+        <div class="product-compare-good">
           <p class="eyebrow">Do this</p>
           <h3>Revise through project history</h3>
           <p>Replace or revise a component in place. Stable component identity keeps mates, bill-of-material rows, and downstream references connected to the same part.</p>
           <p>Run <strong>Interference</strong> to find overlapping solids, then inspect clearances at moving and manufactured interfaces before anything is released.</p>
         </div>
-        <div data-lift>
+        <div>
           <p class="eyebrow">Not this</p>
           <h3>Insert a renamed copy</h3>
           <p>A duplicate named <code>housing_rev_b</code> is a new component as far as the assembly is concerned. Mates point at the old one, the bill of materials splits, and references quietly go stale.</p>
           <p>An exploded view is useful for assembly sequence and communication, but it is a presentation state. It does not change any mate definition.</p>
         </div>
       </div>
-      <div class="product-stack product-note" data-lift>
+      <div class="product-stack product-note">
         <p class="eyebrow">Interference is a check, not a verdict</p>
         <p>Interference detection reports overlapping solids and lets you measure clearances. Fit, tolerance stack, and whether a clearance is adequate for the process remain engineering decisions you make.</p>
       </div>

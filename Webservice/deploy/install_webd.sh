@@ -89,6 +89,45 @@ for f in libchudware.so libngcore.so libnglib.so lib3mf.so chudware-hostd; do
   echo "[webd] staged $f from $SRC"
 done
 
+# Stage the complete learned-mesh-advisor closure beside the engine. The backend
+# resolves both ONNX Runtime and polymesh-advisor/ relative to libchudware.so;
+# copying only the engine makes the optional advisor look installed while every
+# request silently falls back to deterministic meshing.
+command -v readelf >/dev/null 2>&1 \
+  || fatal "readelf is required to inspect the engine's ONNX Runtime dependency"
+if ! ENGINE_DEPS="$(readelf -d "$SRC/libchudware.so" 2>/dev/null |
+    sed -n 's/.*(NEEDED).*\[\([^]]*\)\].*/\1/p')"; then
+  fatal "could not inspect $SRC/libchudware.so dependencies"
+fi
+[ -n "$ENGINE_DEPS" ] \
+  || fatal "$SRC/libchudware.so has no recorded dependencies and cannot be validated"
+ADVISOR_RUNTIME_NAMES="$(printf '%s\n' "$ENGINE_DEPS" |
+  sed -n '/libonnxruntime/{s|.*/||;p}' | sort -u)"
+ADVISOR_PACKAGE_DIR="polymesh-advisor"
+ADVISOR_REQUIRED_FILES=(model.onnx normalization.json clamps.json ood.json)
+if [ -n "$ADVISOR_RUNTIME_NAMES" ]; then
+  for name in $ADVISOR_RUNTIME_NAMES; do
+    runtime=""
+    for candidate in "$SRC/$name" "$SRC/libonnxruntime.so"; do
+      if [ -f "$candidate" ]; then
+        runtime="$candidate"
+        break
+      fi
+    done
+    [ -n "$runtime" ] \
+      || fatal "$SRC/libchudware.so needs $name but no ONNX Runtime payload is staged"
+    cp -L "$runtime" "$STAGE_BIN/$name"
+    echo "[webd] staged $name from $runtime"
+  done
+  mkdir -p "$STAGE_BIN/$ADVISOR_PACKAGE_DIR"
+  for f in "${ADVISOR_REQUIRED_FILES[@]}"; do
+    [ -f "$SRC/$ADVISOR_PACKAGE_DIR/$f" ] \
+      || fatal "$SRC/$ADVISOR_PACKAGE_DIR/$f missing from advisor-enabled engine build"
+    cp -L "$SRC/$ADVISOR_PACKAGE_DIR/$f" "$STAGE_BIN/$ADVISOR_PACKAGE_DIR/$f"
+  done
+  echo "[webd] staged $ADVISOR_PACKAGE_DIR/ (${#ADVISOR_REQUIRED_FILES[@]} advisor artifacts)"
+fi
+
 # Prompts are part of the release because hostd resolves them through `current`.
 #
 # SOURCE is services/agent/prompts; the DESTINATION stays agent/prompts because
@@ -163,6 +202,24 @@ sed -e "s|@BIN@|$BIN|g" -e "s|@PROMPTS@|$PROMPTS_DST|g" -e "s|@REPO@|$ROOT|g" \
 
 HOSTD_SHA="$(sha256sum "$STAGE_BIN/chudware-hostd" | cut -d' ' -f1)"
 LIB_SHA="$(sha256sum "$STAGE_BIN/libchudware.so" | cut -d' ' -f1)"
+ADVISOR_RUNTIME_SHA="$("$PYTHON" - "$STAGE_BIN" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+files = sorted(
+    [path for path in root.glob("libonnxruntime*") if path.is_file()]
+    + [path for path in (root / "polymesh-advisor").glob("*") if path.is_file()]
+)
+h = sha256()
+for path in files:
+    h.update(path.relative_to(root).as_posix().encode())
+    h.update(b"\0")
+    h.update(path.read_bytes())
+    h.update(b"\0")
+print(h.hexdigest())
+PY
+)"
 WASM_SHA="$(sha256sum "$STAGE_APP/Chudware.wasm" | cut -d' ' -f1)"
 JS_SHA="$(sha256sum "$STAGE_APP/Chudware.js" | cut -d' ' -f1)"
 PROVIDER_SHA="$("$PYTHON" - "$VENDOR_OMP" <<'PY'
@@ -223,9 +280,9 @@ print(sha1(Path(sys.argv[1]).read_bytes()).hexdigest()[:12])
 PY
 )"
 CHECKOUT_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')"
-JOINT_SHA="$(printf '%s\n' "$HOSTD_SHA" "$LIB_SHA" "$WASM_SHA" "$JS_SHA" \
-  "$PROVIDER_SHA" "$HOSTD_UNIT_SHA" "$GATEWAY_UNIT_SHA" "$STAGING_GATEWAY_UNIT_SHA" \
-  "$PROMPTS_SHA" | sha256sum | cut -d' ' -f1)"
+JOINT_SHA="$(printf '%s\n' "$HOSTD_SHA" "$LIB_SHA" "$ADVISOR_RUNTIME_SHA" \
+  "$WASM_SHA" "$JS_SHA" "$PROVIDER_SHA" "$HOSTD_UNIT_SHA" "$GATEWAY_UNIT_SHA" \
+  "$STAGING_GATEWAY_UNIT_SHA" "$PROMPTS_SHA" | sha256sum | cut -d' ' -f1)"
 # One clock read feeds both the release id and the manifest timestamp, so the two
 # can never straddle a second boundary and disagree. UTC rather than local time:
 # release retention and rollback order trees by their lexicographic directory
@@ -234,11 +291,12 @@ JOINT_SHA="$(printf '%s\n' "$HOSTD_SHA" "$LIB_SHA" "$WASM_SHA" "$JS_SHA" \
 BUILT_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RELEASE_ID="${BUILT_AT_UTC//[:-]/}-${JOINT_SHA:0:12}-$$"
 cat > "$STAGE_ROOT/deploy-manifest" <<EOF
-schema=2
+schema=3
 release_id=$RELEASE_ID
 joint_sha256=$JOINT_SHA
 hostd_sha256=$HOSTD_SHA
 libchudware_sha256=$LIB_SHA
+advisor_runtime_sha256=$ADVISOR_RUNTIME_SHA
 wasm_sha256=$WASM_SHA
 javascript_sha256=$JS_SHA
 provider_runtime_sha256=$PROVIDER_SHA

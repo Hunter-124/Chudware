@@ -150,10 +150,13 @@ arithmetic says, and — unchanged from before — a *failed* promotion still
 leaves its partial tree behind for inspection.
 
 The set of `releases/*/deploy-manifest` files is the release index; there is no
-separate index file. Each is flat `key=value` (`schema=2`), and adds
+separate index file. Each is flat `key=value` (`schema=3`), and adds
 `release_id=` and `built_at_utc=` (strict `YYYY-MM-DDTHH:MM:SSZ`) to the
 existing `joint_sha256`, the `checkout_head` git rev it was built from, and the
-per-artifact digests, so a rollback target can be identified from disk alone.
+per-artifact digests. Advisor-enabled releases also hash the exact ONNX Runtime
+SONAME payload and four-file `polymesh-advisor/` package, so model-only changes
+produce a new joint release and a rollback target can be identified from disk
+alone.
 
 Release ids are `YYYYmmddTHHMMSSZ-<joint12>-<pid>`. The timestamp is UTC: it is
 what retention sorts on lexicographically, and a local-time stamp is

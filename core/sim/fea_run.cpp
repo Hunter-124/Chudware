@@ -35,6 +35,31 @@ using nlohmann::json;
 
 namespace chudware::sim {
 
+namespace detail {
+// The one advisor->JSON shape. Every study route that can carry a learned-advisor
+// envelope reports THIS object, sim/fea_adaptive.cpp included (it declares this
+// function and attaches the envelope its own mesher produced), so no route can drift
+// into a second spelling of the same telemetry.
+json mesh_advisor_json(const MeshAdvisor& advisor) {
+    return json{{"available", advisor.available},
+                {"applied", advisor.applied},
+                {"vetoed", advisor.vetoed},
+                {"budget_refusal", advisor.budget_refusal},
+                {"mesher", advisor.mesher},
+                {"h_rel", advisor.h_rel},
+                {"order", advisor.order},
+                {"adapt_passes", advisor.adapt_passes},
+                {"eta_target", advisor.eta_target},
+                {"predicted_dof", advisor.predicted_dof},
+                {"predicted_mesh_ms", advisor.predicted_mesh_ms},
+                {"predicted_solve_ms", advisor.predicted_solve_ms},
+                {"failure_prob", advisor.failure_prob},
+                {"ood_distance", advisor.ood_distance},
+                {"model_revision", advisor.model_revision},
+                {"note", advisor.note}};
+}
+}  // namespace detail
+
 namespace {
 
 // Round half-away-from-zero to `nd` decimals, matching Python's round() closely
@@ -47,6 +72,7 @@ double round_nd(double v, int nd) {
     double scale = std::pow(10.0, nd);
     return std::round(v * scale) / scale;
 }
+
 class SimJobScope {
 public:
     explicit SimJobScope(const json& study,
@@ -284,10 +310,11 @@ bool faceset_normal(const json& fs, std::array<double, 3>& face_normal, double& 
 // mesh_order (study["mesh_order"], default 1).
 bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<int>& tets,
                   int& nodes_per_elem, std::string& mesh_type_used, std::string& note,
-                  std::string& err) {
+                  std::optional<MeshAdvisor>& advisor, std::string& err) {
     nodes_per_elem = 4;
     mesh_type_used.clear();
     note.clear();
+    advisor.reset();
     // A present step_path ALWAYS re-meshes with the current options. Inline points/tets
     // are only used as a fallback when there is no step_path, so a cached/stale inline
     // mesh can never silently override the GUI mesh controls.
@@ -302,6 +329,16 @@ bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<in
             return false;
         }
         nodes_per_elem = study.value("nodes_per_elem", 4);
+        if (study.value("learned_advisor", false)) {
+            MeshAdvisor unavailable;
+            unavailable.order = nodes_per_elem == 10 ? 2 : 1;
+            unavailable.mesher = "inline";
+            unavailable.model_revision = "not-loaded";
+            unavailable.note =
+                "advisor unavailable: learned advising requires STEP geometry; "
+                "configured inline mesh retained";
+            advisor = std::move(unavailable);
+        }
         return true;
     }
     if (has_step) {
@@ -327,6 +364,8 @@ bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<in
         opts.quad_surface = study.value("quad_surface", false);
         opts.fallback_to_tet = study.value("fallback_to_tet", true);
         opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
+        opts.learned_advisor = study.value("learned_advisor", false);
+        opts.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
         MeshOut m = mesh_step_cached(step_path, opts);
         if (!m.ok) {
             err = "mesh failed: " + m.error;
@@ -337,6 +376,7 @@ bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<in
         nodes_per_elem = m.nodes_per_elem;
         mesh_type_used = m.mesh_type_used;
         note = m.note;
+        advisor = m.advisor;
         return true;
     }
     err = "study must have inline points/tets or a step_path";
@@ -1131,10 +1171,12 @@ static nlohmann::json fea_run_static_impl(
     std::vector<int> tets;
     int nodes_per_elem = 4;
     std::string mesh_type_used, mesh_note;
+    std::optional<MeshAdvisor> mesh_advisor;
     std::string err;
     {
         chudware::prof::phases::PhaseScope _p("mesh");
-        if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
+        if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used,
+                          mesh_note, mesh_advisor, err))
             return json{{"ok", false}, {"error", err}};
     }
     if (job.cancelled())
@@ -1559,6 +1601,7 @@ static nlohmann::json fea_run_static_impl(
                   {"max_tresca_mpa", round_nd(max_tresca, 4)},
                   {"max_abs_principal_mpa", round_nd(max_abs_principal, 4)}}},
                 {"solver_notes", notes}};
+    if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
     if (job.cancelled())
         return json{{"ok", false}, {"error", "fea_static: cancelled"}};
     chudware::sim::cache::store(chudware::sim::cache::Kind::FeaStatic, input_hash, out);
@@ -1675,6 +1718,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     std::vector<int> tets;
     int nodes_per_elem = 4;
     std::string mesh_type_used, mesh_note;
+    std::optional<MeshAdvisor> mesh_advisor;
     std::string err;
     std::vector<std::string> notes;
     // STEP modal meshes default to tet10 for bending accuracy. Inline meshes keep
@@ -1687,8 +1731,8 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     if (has_step) modal_study["mesh_order"] = study.value("mesh_order", 2);
     {
         chudware::prof::phases::PhaseScope _p("mesh");
-        if (!resolve_mesh(modal_study, points, tets, nodes_per_elem, mesh_type_used, mesh_note,
-                          err))
+        if (!resolve_mesh(modal_study, points, tets, nodes_per_elem,
+                          mesh_type_used, mesh_note, mesh_advisor, err))
             return json{{"ok", false}, {"error", err}};
     }
     if (job.cancelled())
@@ -1746,6 +1790,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
                 {"n_dof", r.n_dof},
                 {"mesh_type_used", mesh_type_used},
                 {"solver_notes", notes}};
+    if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
     if (job.cancelled())
         return json{{"ok", false}, {"error", "fea_modal: cancelled"}};
     chudware::sim::cache::store(chudware::sim::cache::Kind::FeaModal, input_hash, out);
@@ -1931,10 +1976,12 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
     std::vector<int> tets;
     int nodes_per_elem = 4;
     std::string mesh_type_used, mesh_note;
+    std::optional<MeshAdvisor> mesh_advisor;
     std::string err;
     {
         chudware::prof::phases::PhaseScope _p("mesh");
-        if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
+        if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used,
+                          mesh_note, mesh_advisor, err))
             return json{{"ok", false}, {"error", err}};
     }
     if (job.cancelled())
@@ -2248,6 +2295,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                                                   r.frames.back().temperature.end()), 4)}}},
                     {"flux_summary", flux_summary},
                     {"solver_notes", notes}};
+        if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
         if (job.cancelled())
             return json{{"ok", false}, {"error", "fea_thermal: cancelled"}};
         chudware::sim::cache::store(chudware::sim::cache::Kind::FeaThermal, input_hash, out);
@@ -2303,6 +2351,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                  {{"max_temp_c", round_nd(r.max_temp, 4)}, {"min_temp_c", round_nd(r.min_temp, 4)}}},
                 {"flux_summary", flux_summary},
                 {"solver_notes", notes}};
+    if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
     if (job.cancelled())
         return json{{"ok", false}, {"error", "fea_thermal: cancelled"}};
     chudware::sim::cache::store(chudware::sim::cache::Kind::FeaThermal, input_hash, out);
@@ -2330,9 +2379,14 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
 // low-end box.
 namespace {
 size_t mesh_out_bytes(const MeshOut& m) {
-    return m.points.size() * sizeof(double) + m.tets.size() * sizeof(int) +
-           m.aspect_hist.size() * sizeof(int) + m.mesh_type_used.size() + m.note.size() +
-           m.error.size() + 256;
+    size_t bytes =
+        m.points.size() * sizeof(double) + m.tets.size() * sizeof(int) +
+        m.aspect_hist.size() * sizeof(int) + m.mesh_type_used.size() + m.note.size() +
+        m.error.size() + 256;
+    if (m.advisor)
+        bytes += sizeof(MeshAdvisor) + m.advisor->mesher.size() +
+                 m.advisor->model_revision.size() + m.advisor->note.size();
+    return bytes;
 }
 uint64_t mesh_cache_budget_bytes() {
     const uint64_t host = chudware::governor::budget_bytes();
@@ -2374,6 +2428,8 @@ inline uint64_t mesh_opts_key(const MeshOptions& o, uint64_t h) {
     h = fnv1a(&o.quad_surface, sizeof o.quad_surface, h);
     h = fnv1a(&o.fallback_to_tet, sizeof o.fallback_to_tet, h);
     h = fnv1a(&o.thin_wall_layers, sizeof o.thin_wall_layers, h);
+    h = fnv1a(&o.learned_advisor, sizeof o.learned_advisor, h);
+    h = fnv1a(&o.advisor_max_dof, sizeof o.advisor_max_dof, h);
     return h;
 }
 struct MeshCacheCounters {

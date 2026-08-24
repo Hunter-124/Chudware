@@ -238,6 +238,74 @@ audit_production_payload() {
     [ -z "$bad" ] || { echo "error: forbidden source/debug/repository artifact survived staging: $bad" >&2; exit 1; }
 }
 
+# Learned mesh-advisor runtime (the polymesh ONNX advisor).
+#
+# core/sim/polymesh_backend.cpp resolves the model package relative to ITS OWN module —
+# libchudware.dylib — so the package rides in Contents/Frameworks beside the engine rather
+# than in Resources behind CHUDWARE_POLYMESH_ADVISOR_DIR: that override deliberately
+# reports its model revision as "override:<path>", which would turn a shipped release into
+# one that cannot name the model it recommended from. Only the four artifacts the advisor
+# opens are carried; the rest of bench/advisor is campaign evidence (cross-validation dumps
+# and a dashboard, tens of MB) with no runtime role.
+#
+# The engine's own load commands decide whether anything ships. polymesh pins no prebuilt
+# ONNX Runtime archive for macOS today, so an engine built here links none and needs no
+# package — that build stages nothing and stays valid. An advisor-linked engine whose
+# package is incomplete would ship a permanently dead optimizer that silently falls back on
+# every study, so that case fails packaging instead.
+ADVISOR_PACKAGE_DIR="polymesh-advisor"
+ADVISOR_REQUIRED_FILES=(model.onnx normalization.json clamps.json ood.json)
+
+stage_polymesh_advisor() {
+    local engine="$1" srcdir="$2" destdir="$3" dep base candidate found f
+    local deps=()
+    while IFS= read -r dep; do
+        case "$dep" in *onnxruntime*) deps+=("$dep") ;; esac
+    done < <(otool -L "$engine" | sed -n '2,$p' | awk '{print $1}')
+    if [ "${#deps[@]}" -eq 0 ]; then
+        echo "==> engine links no ONNX Runtime: mesh advisor disabled, no advisor payload to stage"
+        return 0
+    fi
+    for f in "${ADVISOR_REQUIRED_FILES[@]}"; do
+        [ -f "$srcdir/$ADVISOR_PACKAGE_DIR/$f" ] || {
+            echo "error: $engine links ONNX Runtime but its advisor package is incomplete:" >&2
+            echo "       missing $srcdir/$ADVISOR_PACKAGE_DIR/$f" >&2
+            echo "       rebuild the engine so CMake stages the advisor package; refusing to ship a dead optimizer" >&2
+            exit 1
+        }
+    done
+    mkdir -p "$destdir/$ADVISOR_PACKAGE_DIR"
+    for f in "${ADVISOR_REQUIRED_FILES[@]}"; do
+        cp -L "$srcdir/$ADVISOR_PACKAGE_DIR/$f" "$destdir/$ADVISOR_PACKAGE_DIR/$f"
+        chmod 0644 "$destdir/$ADVISOR_PACKAGE_DIR/$f"
+    done
+    # One ONNX Runtime per name the engine records, staged under that exact name: the build
+    # tree keeps libonnxruntime.dylib plus versioned symlinks, and the payload may hold no
+    # symlinks at all (audit_production_payload), so the resolvable name must be a real
+    # file. Rewriting the engine's reference here rather than leaving it to the dependency
+    # walk below keeps it correct even when the runtime came from a build tree that walk
+    # would not have bundled from; the walk then sees an already-final @loader_path entry.
+    for dep in "${deps[@]}"; do
+        base="${dep##*/}"
+        found=""
+        for candidate in "$srcdir/$base" "$srcdir/libonnxruntime.dylib"; do
+            if [ -f "$candidate" ]; then found="$candidate"; break; fi
+        done
+        [ -n "$found" ] || {
+            echo "error: $engine needs $base but no ONNX Runtime is staged beside it in $srcdir" >&2
+            echo "       rebuild the engine so CMake stages the ONNX Runtime; the advisor cannot load without it" >&2
+            exit 1
+        }
+        if [ ! -f "$destdir/$base" ]; then
+            cp -L "$found" "$destdir/$base"
+            chmod u+w "$destdir/$base"
+        fi
+        [ "$dep" = "@loader_path/$base" ] ||
+            install_name_tool -change "$dep" "@loader_path/$base" "$engine"
+    done
+    echo "==> staged advisor package (${#ADVISOR_REQUIRED_FILES[@]} artifacts) + ${#deps[@]} ONNX Runtime into $destdir"
+}
+
 [ "$(uname -s)" = "Darwin" ] || {
     echo "error: packaging/macos/build_app.sh must run on macOS" >&2
     exit 1
@@ -327,6 +395,10 @@ for sibling in libnglib.dylib libngcore.dylib lib3mf.dylib; do
         chmod u+w "$FRAMEWORKS/$sibling"
     fi
 done
+
+# Advisor model package + ONNX Runtime, beside the engine that resolves them. Runs before
+# the dependency walk below so the staged runtime is already the copy that walk resolves.
+stage_polymesh_advisor "$FRAMEWORKS/libchudware.dylib" "$ENGINE_DIR" "$FRAMEWORKS"
 
 HOSTD=""
 for candidate in \

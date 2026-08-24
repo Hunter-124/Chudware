@@ -5,8 +5,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <filesystem>
+#include <memory>
+#include <limits>
 #include <stdexcept>
+#include <optional>
+#include <system_error>
 #include <string>
 #include <vector>
 
@@ -50,6 +56,22 @@ MeshOut mesh_step_polymesh(const std::string&, const MeshOptions&) {
 
 #else
 
+// Module-path lookup for the staged advisor model directory — the one reason this TU ever
+// needs a platform header, so it is admitted only in an advisor-linked build. BEFORE the
+// OCCT and polymesh headers: OCCT defines WIN32_LEAN_AND_MEAN, which would poison a later
+// <windows.h>, and NOMINMAX has to land first or windows.h's min()/max() macros break the
+// std::max / std::clamp calls in this file and in polymesh's headers.
+#ifdef CHUDWARE_WITH_POLYMESH_ADVISOR
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>  // dladdr: locate the staged advisor model dir beside this module
+#endif
+#endif  // CHUDWARE_WITH_POLYMESH_ADVISOR
+
 #include <TopoDS_Shape.hxx>
 
 #include "sim/mesh_size_band.h"
@@ -63,6 +85,19 @@ MeshOut mesh_step_polymesh(const std::string&, const MeshOptions&) {
 #include <fea/nodal_mesh.hpp>
 #include <fea/p_elevate.hpp>
 #include <pipeline/scene.hpp>
+
+// CHUDWARE_WITH_POLYMESH_ADVISOR is a SEPARATE axis from CHUDWARE_WITH_POLYMESH: upstream
+// pins a prebuilt ONNX Runtime for Windows x64 and non-Apple 64-bit Unix only, so
+// polymesh::advisor — and therefore <advisor/advisor.hpp> — simply does not exist on
+// macOS or any other pointer width. The graded-tet fill and the adaptive loop above have
+// no advisor dependency, so everything the advisor owns (its header, the ONNX session, and
+// the module-relative model lookup that needs util/platform_paths.h) lives behind this
+// macro and an opted-in study on such a platform gets an honest unavailable report.
+#ifdef CHUDWARE_WITH_POLYMESH_ADVISOR
+#include "util/platform_paths.h"
+
+#include <advisor/advisor.hpp>
+#endif
 
 namespace chudware::sim {
 namespace {
@@ -139,6 +174,332 @@ bool load_model(const std::string& step_path, const MeshOptions& options, Loaded
     }
     return true;
 }
+
+#ifdef CHUDWARE_WITH_POLYMESH_ADVISOR
+
+// The four files pm::advisor::Advisor actually opens: the graph plus the three required
+// sidecars (normalization, clamp/candidate box, OOD veto). Everything else in the
+// upstream bench/advisor directory is campaign evidence — tens of megabytes of
+// cross-validation dumps — and is not a runtime input, so a package stages exactly this
+// list and a resolved directory is only accepted when it carries all of it.
+constexpr const char* kAdvisorModelFiles[] = {"model.onnx", "normalization.json",
+                                              "clamps.json", "ood.json"};
+
+bool advisor_model_dir_complete(const std::filesystem::path& dir) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return false;
+    for (const char* name : kAdvisorModelFiles)
+        if (!std::filesystem::is_regular_file(dir / name, ec)) return false;
+    return true;
+}
+
+// Directory of the module this code was linked into: libchudware.{so,dll}, or a test
+// executable that links the mesher archive directly. NOT simply the executable's
+// directory — the engine is dlopen'd, and a packaged layout keeps the daemon in bin/ and
+// the engine plus its staged siblings in lib/. Same module-relative discovery
+// doc/formats.cpp uses to find the lib3mf staged beside the engine.
+std::filesystem::path this_module_dir() {
+    std::filesystem::path module;
+#ifdef _WIN32
+    HMODULE self = nullptr;
+    if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCWSTR>(&advisor_model_dir_complete),
+                             &self) &&
+        self != nullptr) {
+        std::wstring buffer(MAX_PATH, L'\0');
+        for (;;) {
+            const DWORD n = ::GetModuleFileNameW(self, buffer.data(),
+                                                 static_cast<DWORD>(buffer.size()));
+            if (n == 0) {
+                buffer.clear();
+                break;
+            }
+            // GetModuleFileNameW truncates instead of failing when the buffer is short,
+            // so grow until the returned length is strictly inside it.
+            if (n < buffer.size()) {
+                buffer.resize(n);
+                break;
+            }
+            buffer.resize(buffer.size() * 2);
+        }
+        if (!buffer.empty()) module = std::filesystem::path(buffer);
+    }
+#else
+    Dl_info info;
+    if (::dladdr(reinterpret_cast<void*>(&advisor_model_dir_complete), &info) != 0 &&
+        info.dli_fname != nullptr)
+        module = std::filesystem::path(info.dli_fname);
+#endif
+    std::error_code ec;
+    if (!module.empty()) {
+        const std::filesystem::path resolved = std::filesystem::weakly_canonical(module, ec);
+        if (!ec && std::filesystem::exists(resolved, ec)) return resolved.parent_path();
+    }
+    // dladdr names the MAIN executable by the string it was exec'd with, which can be
+    // relative ("./test_x") and is then meaningless once the process changes directory.
+    // executablePath() is this repo's one canonical answer for that case (/proc/self/exe
+    // and its per-OS equivalents), so a test binary still finds the package beside it.
+    const std::string exe = chudware::platform::executablePath();
+    if (exe.empty()) return {};
+    return std::filesystem::path(exe).parent_path();
+}
+
+// Where the advisor's model artifacts live AT RUNTIME.
+//
+// A packaged install has neither a polymesh source checkout nor the build tree's `_deps`,
+// so the configure-time source path compiled into this TU is not an answer on its own —
+// baking it in as the only lookup made the advisor reachable on exactly one machine: the
+// one that built the binary. Resolution order, first hit wins:
+//
+//   1. CHUDWARE_POLYMESH_ADVISOR_DIR — explicit operator/test override. Set but
+//      incomplete is an ERROR, never a silent fall-through to some other directory: a run
+//      told which model to use must not quietly recommend from a different one.
+//   2. <this module's directory>/polymesh-advisor — the package the build stages beside
+//      libchudware, the daemon and the test binaries, and that a release ships beside the
+//      engine. This is the production path.
+//   3. CHUDWARE_POLYMESH_ADVISOR_SOURCE_DIR — the provisioned source checkout. Present
+//      only on a machine that has one, which is what makes an unstaged developer build
+//      work; a packaged install simply never finds it.
+struct ResolvedModelDir {
+    std::filesystem::path dir;
+    std::string revision;  // reported verbatim as MeshAdvisor::model_revision
+    std::string error;     // non-empty => nothing usable was found
+};
+
+ResolvedModelDir resolve_advisor_model_dir() {
+    ResolvedModelDir out;
+    if (const char* override_dir = std::getenv("CHUDWARE_POLYMESH_ADVISOR_DIR");
+        override_dir != nullptr && *override_dir != '\0') {
+        const std::filesystem::path dir(override_dir);
+        if (!advisor_model_dir_complete(dir)) {
+            out.error = "CHUDWARE_POLYMESH_ADVISOR_DIR=" + dir.string() +
+                        " does not contain model.onnx + normalization.json + clamps.json + "
+                        "ood.json";
+            return out;
+        }
+        out.dir = dir;
+        // The override may point at a re-exported or experimental model, so claiming the
+        // pinned upstream revision here would be a false provenance claim.
+        out.revision = "override:" + dir.string();
+        return out;
+    }
+
+    const std::filesystem::path module_dir = this_module_dir();
+    if (!module_dir.empty()) {
+        const std::filesystem::path staged =
+            module_dir / CHUDWARE_POLYMESH_ADVISOR_PACKAGE_DIR;
+        if (advisor_model_dir_complete(staged)) {
+            out.dir = staged;
+            out.revision = CHUDWARE_POLYMESH_MODEL_REVISION;
+            return out;
+        }
+    }
+
+    const std::filesystem::path source_dir(CHUDWARE_POLYMESH_ADVISOR_SOURCE_DIR);
+    if (advisor_model_dir_complete(source_dir)) {
+        out.dir = source_dir;
+        out.revision = CHUDWARE_POLYMESH_MODEL_REVISION;
+        return out;
+    }
+
+    out.error = "no advisor model directory found (looked for " +
+                (module_dir.empty()
+                     ? std::string("the package beside this module")
+                     : (module_dir / CHUDWARE_POLYMESH_ADVISOR_PACKAGE_DIR).string()) +
+                ", then " + source_dir.string() +
+                "); set CHUDWARE_POLYMESH_ADVISOR_DIR to a directory holding model.onnx "
+                "and its normalization/clamps/ood sidecars";
+    return out;
+}
+
+struct AdvisorRuntime {
+    std::unique_ptr<pm::advisor::Advisor> model;
+    std::string revision = "not-loaded";
+    std::string error;
+
+    AdvisorRuntime() {
+        ResolvedModelDir resolved = resolve_advisor_model_dir();
+        if (!resolved.error.empty()) {
+            error = std::move(resolved.error);
+            return;
+        }
+        try {
+            model = std::make_unique<pm::advisor::Advisor>(resolved.dir);
+            revision = std::move(resolved.revision);
+        } catch (const std::exception& e) {
+            error = e.what();
+        } catch (...) {
+            error = "unknown advisor model-load failure";
+        }
+    }
+};
+
+// ONNX session construction validates and loads all resolved advisor artifacts. It is
+// deliberately process-wide and lazy: optional-off studies never touch the model, while
+// every opted-in study shares the same deterministic single-threaded session.
+const AdvisorRuntime& advisor_runtime() {
+    static const AdvisorRuntime runtime;
+    return runtime;
+}
+
+#endif  // CHUDWARE_WITH_POLYMESH_ADVISOR
+
+// The mesh controls this build will actually use, with nothing predicted: the report a
+// study gets whenever the advisor cannot speak. The revision is passed IN rather than read
+// here because the honest answer differs per build — the revision loaded in THIS process
+// where an advisor exists ("not-loaded" when resolution or the ONNX session failed), and
+// "not-built" where the platform has no advisor at all. A configure-time constant would
+// name a revision that never ran.
+MeshAdvisor configured_advisor_fallback(const LoadedModel& loaded, const MeshOptions& options,
+                                        std::string model_revision) {
+    MeshAdvisor out;
+    out.mesher = "graded_tet";
+    out.h_rel = loaded.band.diag > 0.0 ? loaded.band.base / loaded.band.diag : 0.0;
+    out.order = options.order;
+    out.model_revision = std::move(model_revision);
+    return out;
+}
+
+struct AdvisorPlan {
+    MeshOptions options;
+    double h = 0.0;
+    std::optional<MeshAdvisor> result;
+};
+
+#ifdef CHUDWARE_WITH_POLYMESH_ADVISOR
+
+AdvisorPlan make_advisor_plan(const LoadedModel& loaded,
+                              const MeshOptions& configured) {
+    AdvisorPlan plan{configured, loaded.band.base, std::nullopt};
+    if (!configured.learned_advisor) return plan;
+
+    const AdvisorRuntime& runtime = advisor_runtime();
+    MeshAdvisor report = configured_advisor_fallback(loaded, configured, runtime.revision);
+    if (!runtime.model) {
+        report.note = "advisor unavailable; configured deterministic mesh controls retained: " +
+                      runtime.error;
+        plan.result = std::move(report);
+        return plan;
+    }
+
+    try {
+        // This backend seam does not receive resolved load/fixture regions. The upstream
+        // extractor still supplies exact/tessellated geometry features deterministically;
+        // empty BC spans and the conventional nu=0.3 sentinel are explicit rather than
+        // invented from post-mesh node selections.
+        const pm::pipeline::CaseFeatures features =
+            pm::pipeline::extract_case_features(
+                loaded.model, {}, {}, Eigen::Vector3d::Zero(), 0.3);
+        const pm::advisor::AdvisorDecision decision =
+            runtime.model->recommend(features, configured.advisor_max_dof);
+
+        report.available = true;
+        report.vetoed = decision.vetoed;
+        report.budget_refusal = decision.budget_refusal;
+        report.ood_distance = decision.ood_distance;
+        report.model_revision = runtime.revision;
+
+        if (decision.vetoed) {
+            // The upstream chooser suppresses predictions on refusals. Reassert that
+            // boundary here rather than relying on a model revision to keep zero defaults.
+            report.note = decision.note.empty()
+                              ? "advisor refused the case; configured deterministic mesh "
+                                "controls retained and predictions suppressed"
+                              : decision.note +
+                                    "; configured deterministic mesh controls retained "
+                                    "and predictions suppressed";
+            plan.result = std::move(report);
+            return plan;
+        }
+
+        if (!std::isfinite(decision.h_rel) || !(decision.h_rel > 0.0) ||
+            (decision.order != 1 && decision.order != 2) ||
+            decision.adapt_passes < 0 || !std::isfinite(decision.eta_target) ||
+            decision.eta_target < 0.0) {
+            report.available = false;
+            report.vetoed = true;
+            report.note =
+                "advisor returned unusable sizing/order/adaptation controls; configured "
+                "deterministic mesh controls retained and predictions suppressed";
+            plan.result = std::move(report);
+            return plan;
+        }
+
+        report.applied = true;
+        report.mesher = decision.mesher;
+        report.h_rel = decision.h_rel;
+        report.order = decision.order;
+        report.adapt_passes = decision.adapt_passes;
+        report.eta_target = decision.eta_target;
+        report.predicted_dof = decision.predicted_dof;
+        report.predicted_mesh_ms = decision.predicted_mesh_ms;
+        report.predicted_solve_ms = decision.predicted_solve_ms;
+        report.failure_prob = decision.failure_prob;
+        report.ood_distance = decision.ood_distance;
+        report.note = decision.note;
+
+        const double requested_h = decision.h_rel * loaded.band.diag;
+        plan.h = std::clamp(requested_h, loaded.band.min_len,
+                            loaded.band.max_len);
+        plan.options.order = decision.order;
+        if (plan.h != requested_h)
+            append_note(report.note,
+                        "advisor h_rel was clamped to Chudware's configured "
+                        "element-size band");
+
+        // MeshOut can represent only fixed-stride tet4/tet10 connectivity. Never pass the
+        // learned mesher family into volume_mesh: hybrid/VEM/poly cells cannot be flattened
+        // into that contract without lying. Compatible h/order controls are applied here;
+        // adaptation controls govern PolymeshAdaptiveMesher when that route is used.
+        if (decision.mesher != "graded_tet")
+            append_note(report.note,
+                        "advisor mesher '" + decision.mesher +
+                            "' is incompatible with Chudware's tet-only solve contract; "
+                            "retained graded_tet and applied only h/order controls");
+        if (decision.adapt_passes > 0)
+            append_note(report.note,
+                        "adaptation controls apply only when the adaptive study route "
+                        "requests error-driven refinement");
+        plan.result = std::move(report);
+        return plan;
+    } catch (const std::exception& e) {
+        report.note =
+            std::string("advisor unavailable during recommendation; configured "
+                        "deterministic mesh controls retained: ") +
+            e.what();
+    } catch (...) {
+        report.note =
+            "advisor unavailable during recommendation; configured deterministic mesh "
+            "controls retained: unknown inference failure";
+    }
+    plan.result = std::move(report);
+    return plan;
+}
+
+#else  // !CHUDWARE_WITH_POLYMESH_ADVISOR
+
+// Advisor-less build. The mesher, the shared element-size band and the adaptive loop are
+// all present and fully deterministic here — the ONLY missing capability is learned
+// advice. So an opted-in study gets a PRESENT report carrying available=false and the
+// reason: silence would mean "you never asked", and refusing to compile would take the
+// whole mesher down over an optional recommendation. plan.options and plan.h keep the
+// configured values, so this study meshes exactly as it would have without opting in.
+AdvisorPlan make_advisor_plan(const LoadedModel& loaded, const MeshOptions& configured) {
+    AdvisorPlan plan{configured, loaded.band.base, std::nullopt};
+    if (!configured.learned_advisor) return plan;
+
+    MeshAdvisor report = configured_advisor_fallback(loaded, configured, "not-built");
+    report.note =
+        "advisor unavailable; configured deterministic mesh controls retained: this build "
+        "has no learned mesh advisor. PolyMesh's advisor needs the prebuilt ONNX Runtime "
+        "upstream pins for Windows x64 and non-Apple 64-bit Unix only, so this platform/"
+        "architecture builds the mesher without it (CHUDWARE_WITH_POLYMESH_ADVISOR off)";
+    plan.result = std::move(report);
+    return plan;
+}
+
+#endif  // CHUDWARE_WITH_POLYMESH_ADVISOR
 
 // Fill at coarse element size `h`, optionally under a spatial size field h(x), promote to
 // tet10 when asked, and normalize into MeshOut. `nodal` keeps the polymesh-side mesh, which
@@ -253,10 +614,13 @@ MeshOut mesh_step_polymesh(const std::string& step_path, const MeshOptions& opti
             out.ok = false;
             return out;
         }
+        AdvisorPlan plan = make_advisor_plan(loaded, options);
+        out.advisor = plan.result;
         append_note(out.note, loaded.band.note);
-        append_note(out.note, inapplicable_options_note(options));
+        append_note(out.note, inapplicable_options_note(plan.options));
+        if (out.advisor) append_note(out.note, out.advisor->note);
         pm::fea::NodalMesh nodal;
-        build_mesh(loaded, options, loaded.band.base, {}, nodal, out);
+        build_mesh(loaded, plan.options, plan.h, {}, nodal, out);
         return out;
     } catch (const std::exception& e) {
         out.ok = false;
@@ -278,6 +642,11 @@ struct PolymeshAdaptiveMesher::Impl {
     double h_fine = 0.0;   // target size inside the marked region, mm (shrinks per pass)
     pm::mesh::SizeFieldFn size_field;  // empty on the first pass = uniform h
     pm::fea::NodalMesh nodal;          // the mesh the last mesh() returned
+    std::optional<MeshAdvisor> advisor;
+    int advisor_adapt_passes = -1;  // -1 = advisor absent/refused
+    int advisor_passes_used = 0;
+    double advisor_eta_target = 0.0;
+    double last_global_eta = std::numeric_limits<double>::infinity();
 };
 
 PolymeshAdaptiveMesher::PolymeshAdaptiveMesher(std::unique_ptr<Impl> impl)
@@ -290,10 +659,16 @@ std::unique_ptr<PolymeshAdaptiveMesher> PolymeshAdaptiveMesher::open(
     init_polymesh_runtime();
     try {
         auto impl = std::make_unique<Impl>();
-        impl->options = options;
         if (!load_model(step_path, options, impl->loaded, error)) return nullptr;
-        impl->h = impl->loaded.band.base;
-        impl->h_fine = impl->loaded.band.base;
+        AdvisorPlan plan = make_advisor_plan(impl->loaded, options);
+        impl->options = plan.options;
+        impl->h = plan.h;
+        impl->h_fine = plan.h;
+        impl->advisor = std::move(plan.result);
+        if (impl->advisor && impl->advisor->applied) {
+            impl->advisor_adapt_passes = impl->advisor->adapt_passes;
+            impl->advisor_eta_target = impl->advisor->eta_target;
+        }
         return std::unique_ptr<PolymeshAdaptiveMesher>(
             new PolymeshAdaptiveMesher(std::move(impl)));
     } catch (const std::exception& e) {
@@ -313,6 +688,8 @@ bool PolymeshAdaptiveMesher::mesh(MeshOut& out, std::string& error) {
     try {
         out = MeshOut();
         append_note(out.note, impl_->loaded.band.note);
+        out.advisor = impl_->advisor;
+        if (out.advisor) append_note(out.note, out.advisor->note);
         if (!build_mesh(impl_->loaded, impl_->options, impl_->h, impl_->size_field,
                         impl_->nodal, out)) {
             error = out.error;
@@ -349,6 +726,7 @@ bool PolymeshAdaptiveMesher::estimate_error(const std::vector<double>& disp_mm, 
         const pm::fea::ZzRecovery zz = pm::fea::recover_zz(impl_->nodal, material, u);
         element_eta = zz.element_eta;
         global_eta = zz.global_eta;
+        impl_->last_global_eta = global_eta;
         return true;
     } catch (const std::exception& e) {
         error = std::string("polymesh error recovery failed: ") + e.what();
@@ -364,6 +742,20 @@ bool PolymeshAdaptiveMesher::refine(const std::vector<double>& element_eta, std:
     if (element_eta.size() != impl_->nodal.elements.size()) {
         error = "polymesh adaptive: error field length does not match the current mesh";
         return false;
+    }
+    if (impl_->advisor_adapt_passes >= 0) {
+        if (impl_->advisor_passes_used >= impl_->advisor_adapt_passes) {
+            note = "advisor adaptation-pass limit reached (" +
+                   std::to_string(impl_->advisor_adapt_passes) + ")";
+            return false;
+        }
+        if (impl_->advisor_eta_target > 0.0 &&
+            impl_->last_global_eta <= impl_->advisor_eta_target) {
+            note = "advisor eta target met (" +
+                   std::to_string(impl_->last_global_eta) + " <= " +
+                   std::to_string(impl_->advisor_eta_target) + ")";
+            return false;
+        }
     }
     try {
         std::vector<Eigen::Vector3d> centroids;
@@ -410,6 +802,7 @@ bool PolymeshAdaptiveMesher::refine(const std::vector<double>& element_eta, std:
         // slivers without a separate smoothing pass.
         impl_->size_field = pm::adapt::size_field_from_sources(sources, impl_->h_fine,
                                                                impl_->h, /*beta=*/1.0);
+        if (impl_->advisor_adapt_passes >= 0) ++impl_->advisor_passes_used;
         return true;
     } catch (const std::exception& e) {
         error = std::string("polymesh refinement failed: ") + e.what();

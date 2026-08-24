@@ -16,10 +16,34 @@
 
 #include <memory>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace chudware::sim {
+
+// Learned advisor telemetry carried with a mesh only when MeshOptions::learned_advisor
+// was requested. The backend owns the advisor headers and converts their decision into
+// this stable, backend-free value type. A present value with available=false is an honest
+// model-load/inference fallback; absence preserves the historical optional-off contract.
+struct MeshAdvisor {
+    bool available = false;
+    bool applied = false;
+    bool vetoed = false;
+    bool budget_refusal = false;
+    std::string mesher;
+    double h_rel = 0.0;
+    int order = 1;
+    int adapt_passes = 0;
+    double eta_target = 0.0;
+    double predicted_dof = 0.0;
+    double predicted_mesh_ms = 0.0;
+    double predicted_solve_ms = 0.0;
+    double failure_prob = 0.0;
+    double ood_distance = 0.0;
+    std::string model_revision;
+    std::string note;
+};
 
 struct MeshOut {
     std::vector<double> points;  // n*3 flat, row-major (node i -> [3i,3i+1,3i+2]) mm
@@ -57,6 +81,7 @@ struct MeshOut {
     // e.g. 'auto-pick: axis-aligned box -> hex8' or 'structured hex not applicable: ...,
     // fell back to tet'. Surfaced by the simulation UI alongside the mesh.
     std::string note;
+    std::optional<MeshAdvisor> advisor;
 
     bool ok = false;
     std::string error;  // non-empty when ok==false
@@ -99,6 +124,8 @@ struct MeshOptions {
     double min_size_mm = 0.0;      // >0 overrides base*0.5 (the auto 2:1 size band floor)
     double max_size_mm = 0.0;      // >0 overrides base
     bool optimize = true;          // run Netgen's surface + volume quality optimizers
+    // Learned mesh advice is strictly opt-in. This bool occupies existing ABI padding.
+    bool learned_advisor = false;
     // --- Mesher backend -------------------------------------------------------
     // Which mesh generator produces the volume mesh. Netgen (nglib, LGPL) is the
     // default and the only backend that supports curvature-adaptive sizing and
@@ -132,9 +159,13 @@ struct MeshOptions {
     // meshing and annotate (mesh_type_used='tet4-fallback', note set) instead of hard-failing
     // as the post-gmsh path did. Set false to require hex and surface the original box error.
     bool fallback_to_tet = true;
+    // Learned candidate DOF budget; 0 disables it. uint32_t covers the solver's practical
+    // range while occupying existing MeshOptions padding, preserving its 80-byte ABI.
+    uint32_t advisor_max_dof = 0;
     // thin_wall_layers: auto-pick target for the number of tet layers through the smallest
     // bbox dimension of a thin-wall part (drives the element-size formula).
     double thin_wall_layers = 4.0;
+
 };
 // Validate every numerical sizing/control input before STEP parsing or meshing.
 // Returns false with a stable diagnostic instead of allowing NaN/Inf to reach

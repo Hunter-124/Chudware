@@ -16,6 +16,7 @@
 #include "sketch3d_mode.h" // 3D sketch status readout
 #include "plm/plm_quickbar.h"  // embedded per-doc PLM control
 #include "../core/sim_client.h"
+#include "sim_manager.h"
 #ifndef __EMSCRIPTEN__
 #include "../update/updater.h"
 #include "web_capabilities.h"
@@ -357,6 +358,38 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Click to focus the Simulation pane");
+    }
+    // ---- Simulation display-budget + setup-advisor readout ----------------------------------
+    // Honest disclosure while the Simulate workspace is up. Cached preview / flow-line geometry
+    // is decimated to a fixed display budget, so the viewport can be showing a fraction of the
+    // real mesh; say which fraction instead of letting it read as the whole thing. The advisor
+    // token reports whether the OPTIONAL setup advisor was applied to the selected study — it
+    // says nothing about which solver ran, and it is absent whenever no advisor envelope came
+    // back (which is the normal case).
+    if (st.inSimulation() && st.simManager) {
+        const std::string lod = st.simManager->previewLodStatus();
+        if (!lod.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(
+                ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 1),
+                "|  %s", lod.c_str());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Sim overlay geometry is decimated to a fixed display budget.\n"
+                    "The solve and the saved result always use the full data.");
+        }
+        const std::string adv = st.simManager->advisorStatusLine();
+        if (!adv.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(
+                ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1),
+                "|  %s", adv.c_str());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Setup advisor state for the selected study.\n"
+                    "The advisor only proposes mesh sizing, element order and adaptation.\n"
+                    "It does not choose or perform the solve.");
+        }
     }
     // W5C: pick / selection label (e.g. "Face 12 of Body1") — shown when not editing a sketch
     // (a sketch shows its DOF status instead). The label is maintained on hover/selection change.

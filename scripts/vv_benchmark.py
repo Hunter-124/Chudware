@@ -30,6 +30,7 @@ Zero executed checks = failure (all-skip = failure, per sprint policy).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -63,11 +64,13 @@ ENGINEERING = 10.0  # < 10.0%  — engineering-grade estimate (rough friction fa
 class VVResult:
     """One benchmark case result."""
     __slots__ = ("family", "case", "tier", "verdict", "got", "ref", "pct_err",
-                 "note", "citation", "executed")
+                 "note", "citation", "executed", "solver_source", "solver_revision")
 
     def __init__(self, family: str, case: str, tier: str, verdict: str,
                  got: float | None, ref: float | None, pct_err: float | None,
-                 note: str, citation: str, executed: bool = True):
+                 note: str, citation: str, executed: bool = True,
+                 solver_source: str | None = None,
+                 solver_revision: str | None = None):
         self.family = family
         self.case = case
         self.tier = tier
@@ -78,6 +81,8 @@ class VVResult:
         self.note = note
         self.citation = citation
         self.executed = executed
+        self.solver_source = solver_source
+        self.solver_revision = solver_revision
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -91,6 +96,8 @@ class VVResult:
             "note": self.note,
             "citation": self.citation,
             "executed": self.executed,
+            "solver_source": self.solver_source,
+            "solver_revision": self.solver_revision,
         }
 
 
@@ -101,12 +108,14 @@ _BROKEN = 0
 
 def _record(family: str, case: str, tier: str, verdict: str,
             got: float | None, ref: float | None, note: str, citation: str,
-            executed: bool = True) -> None:
+            executed: bool = True, *, solver_source: str | None = None,
+            solver_revision: str | None = None) -> None:
     global _EXECUTED, _BROKEN
     pct = None
     if got is not None and ref is not None and ref != 0:
         pct = abs(got - ref) / abs(ref) * 100.0
-    r = VVResult(family, case, tier, verdict, got, ref, pct, note, citation, executed)
+    r = VVResult(family, case, tier, verdict, got, ref, pct, note, citation, executed,
+                 solver_source, solver_revision)
     _RESULTS.append(r)
     if executed:
         _EXECUTED += 1
@@ -131,7 +140,8 @@ def _pct_err(got: float, ref: float) -> float:
 
 def _check(family: str, case: str, tier: str,
            got: float, ref: float, citation: str, note: str = "",
-           tol: float | None = None) -> None:
+           tol: float | None = None, *, solver_source: str | None = None,
+           solver_revision: str | None = None) -> None:
     """Record a numeric comparison against a named tolerance tier."""
     tol_map = {"EXACT": EXACT, "PRECISE": PRECISE, "ENGINEERING": ENGINEERING}
     tol_val = tol if tol is not None else tol_map[tier]
@@ -140,7 +150,8 @@ def _check(family: str, case: str, tier: str,
     msg = (f"got={got:.6g}, ref={ref:.6g}, err={err:.3f}% "
            f"(tol={tol_val}%) {note}").strip()
     _record(family, case, tier, "PASS" if passed else "FAIL",
-            got, ref, msg, citation)
+            got, ref, msg, citation, solver_source=solver_source,
+            solver_revision=solver_revision)
 
 
 # ===========================================================================
@@ -752,6 +763,36 @@ def _missing_fea_capability(error) -> bool:
     build-linux-vs-build-occt-linux split), as opposed to a real solve-time failure."""
     return bool(error) and "unknown method" in str(error)
 
+def _polymesh_provenance() -> tuple[str, str]:
+    """Identify the exact linked solver binary and pinned private-fork mesher source."""
+    lib_value = os.environ.get("CHUDWARE_LIBCHUDWARE", "")
+    binary_revision = "not-present"
+    if lib_value and Path(lib_value).is_file():
+        digest = hashlib.sha256()
+        with Path(lib_value).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        binary_revision = digest.hexdigest()
+
+    pin = os.environ.get("CHUDWARE_POLYMESH_REVISION", "").strip()
+    if not pin:
+        provision = _PROJECT_ROOT / "core" / "cmake" / "ProvisionPolymesh.cmake"
+        if provision.exists():
+            for line in provision.read_text(encoding="utf-8").splitlines():
+                if "set(POLYMESH_COMMIT" in line and '"' in line:
+                    pin = line.split('"', 2)[1]
+                    break
+    source = "Chudware core tet FEA + private-fork Polyhedral-FEA polymesh mesher"
+    revision = f"polymesh-git:{pin or 'unresolved'};libchudware-sha256:{binary_revision}"
+    return source, revision
+
+
+def _missing_polymesh_capability(error: Any) -> bool:
+    text = str(error or "").lower()
+    return ("polymesh" in text
+            and any(marker in text for marker in
+                    ("not available", "unavailable", "configured without", "unknown method")))
+
 
 # Explicit dict (not a named preset) so the analytic reference and the solver always
 # agree on the exact mechanical properties. NOTE density_g_cm3 is g/cm³ (steel ~7.85),
@@ -1092,6 +1133,91 @@ def bench_fea_static() -> None:
 
 
 # ===========================================================================
+# FAMILY 8b: private-fork Polyhedral-FEA / PolyMesh mesher + Chudware tet FEA
+#
+# This is deliberately distinct from FAMILY 8.  It exercises the independently
+# implemented graded Cartesian PolyMesh discretization while retaining Chudware's
+# tet10 solver boundary.  It does NOT claim a VEM or general polyhedral solve.
+# References are clean-room closed-form derivations in this file; no standards
+# documents or copied benchmark decks are bundled.
+# ===========================================================================
+
+def _polymesh_static_case(case: str) -> dict:
+    E = _VV_STEEL["E_mpa"]
+    if case == "PM1-cantilever-bending":
+        L, b, h, P = 1000.0, 50.0, 50.0, 1000.0
+        I = b * h ** 3 / 12.0
+        ref = P * L ** 3 / (3.0 * E * I)
+        load = [0.0, 0.0, -P]
+        note = "clean-room Euler-Bernoulli δ=PL³/(3EI)"
+    elif case == "PM2-axial-extension":
+        L, b, h, P = 800.0, 40.0, 30.0, 12000.0
+        ref = P * L / (E * b * h)
+        load = [P, 0.0, 0.0]
+        note = "clean-room uniform-bar δ=PL/(EA)"
+    else:
+        raise ValueError(f"unknown PolyMesh benchmark case: {case}")
+    doc = _build_box_part(f"vv_{case.lower().replace('-', '_')}", L, b, h)
+    result = _mcp_call("run_fea_static", {
+        "fixtures": [{"of": "face", "side": "left"}],
+        "loads": [{"face": {"of": "face", "side": "right"}, "force": load}],
+        "material": _VV_STEEL,
+        "mesh_fineness": 0.6,
+        "mesher_backend": "polymesh",
+        "doc_id": doc,
+    })
+    got = result.get("summary", {}).get("max_disp_mm") if result.get("ok") else None
+    return {
+        "ok": result.get("ok", False),
+        "got": got,
+        "ref": ref,
+        "error": result.get("error"),
+        "note": (f"{note}; mesher=polymesh, element=tet10, "
+                 "solver=Chudware core tet FEA (not a VEM/polyhedral solve)"),
+    }
+
+
+def bench_polymesh_fea() -> None:
+    """Independent PolyMesh discretization checked against two clean-room references."""
+    print("\n--- [polymesh-fea] private-fork Polyhedral-FEA mesher + core tet FEA ---")
+    cases = [
+        ("PM1-cantilever-bending", "ENGINEERING",
+         "Clean-room Euler-Bernoulli derivation: I=bh³/12; δ=PL³/(3EI)"),
+        ("PM2-axial-extension", "ENGINEERING",
+         "Clean-room Hooke-law derivation: σ=P/A; ε=σ/E; δ=PL/(EA)"),
+    ]
+    source, revision = _polymesh_provenance()
+    ready, reason = _fea_ready()
+    if not ready:
+        for case, _tier, citation in cases:
+            _record("polymesh-fea", case, "N/A", "SKIP", None, None, reason, citation,
+                    executed=False, solver_source=source, solver_revision=revision)
+        return
+    for case, tier, citation in cases:
+        try:
+            result = _polymesh_static_case(case)
+        except Exception as exc:
+            _record("polymesh-fea", case, "N/A", "FAIL", None, None,
+                    f"error: {exc}", citation, solver_source=source,
+                    solver_revision=revision)
+            traceback.print_exc()
+            continue
+        if not result["ok"]:
+            error = result.get("error")
+            if _missing_polymesh_capability(error):
+                _record("polymesh-fea", case, "N/A", "SKIP", None, None,
+                        f"private-fork PolyMesh backend unavailable: {error}", citation,
+                        executed=False, solver_source=source, solver_revision=revision)
+            else:
+                _record("polymesh-fea", case, "N/A", "FAIL", None, result["ref"],
+                        f"run_fea_static(polymesh) failed: {error}", citation,
+                        solver_source=source, solver_revision=revision)
+            continue
+        _check("polymesh-fea", case, tier, result["got"], result["ref"], citation,
+               note=result["note"], solver_source=source, solver_revision=revision)
+
+
+# ===========================================================================
 # FAMILY 9: CalculiX (ccx) — second structural opinion (T-BL20)
 # GPL-2 -> subprocess isolation per contracts/licenses.md (same posture as the
 # ngspice/Renode/QEMU rows: PATH-discovered, never bundled, degrades gracefully).
@@ -1426,6 +1552,15 @@ def _generate_report(elapsed: float) -> str:
     for family, results in families.items():
         lines.append(f"## Family: {family}")
         lines.append("")
+        provenance = sorted({
+            (r.solver_source, r.solver_revision)
+            for r in results if r.solver_source and r.solver_revision
+        })
+        for source, revision in provenance:
+            lines.append(f"**Solver source:** `{source}`  ")
+            lines.append(f"**Solver revision:** `{revision}`  ")
+        if provenance:
+            lines.append("")
         lines.append("| Case | Tier | Verdict | Got | Ref | Err% | Citation |")
         lines.append("|------|------|---------|-----|-----|------|----------|")
         for r in results:
@@ -1460,6 +1595,7 @@ def _generate_report(elapsed: float) -> str:
         "| Rao *Mechanical Vibrations* 5th §8.2 | M1, M2 |",
         "| Anderson *Introduction to Flight* 8th §5.4 | LBM-T1 |",
         "| CalculiX (ccx, GPL-2, subprocess-only) 3rd-opinion cross-check | CCX1 |",
+        "| Clean-room beam/bar derivations in this script | PM1, PM2 (PolyMesh family) |",
         "",
         "## CI Integration",
         "",
@@ -1503,6 +1639,7 @@ def main() -> int:
     bench_structural()
     bench_modal()
     bench_fea_static()
+    bench_polymesh_fea()
     bench_thermal_transient()   # T-FIN18: transient conduction vs analytic slab quench
     bench_calculix()
     bench_advanced_fea()   # T-BL04: fatigue + thermal + buckling + contact
@@ -2008,6 +2145,20 @@ class TestFull:
         assert res["ok"], res.get("error")
         err = _pct_err(res["got"], res["ref"])
         assert err < PRECISE, f"M2 f1 err={err:.3f}% > {PRECISE}%"
+
+    def test_polymesh_fea_clean_room_references(self):
+        """PM1/PM2: private-fork PolyMesh meshes, core tet solver, independent references."""
+        ready, reason = _fea_ready()
+        if not ready:
+            pytest.skip(reason)
+        for case in ("PM1-cantilever-bending", "PM2-axial-extension"):
+            result = _polymesh_static_case(case)
+            if not result["ok"] and _missing_polymesh_capability(result.get("error")):
+                pytest.skip(f"PolyMesh backend unavailable: {result.get('error')}")
+            assert result["ok"], result.get("error")
+            err = _pct_err(result["got"], result["ref"])
+            assert err < ENGINEERING, (
+                f"{case} err={err:.3f}% > {ENGINEERING}%")
 
     def test_calculix_cantilever(self):
         """CCX1 (T-BL20): ccx second opinion on the FEA1 cantilever — ENGINEERING tier."""

@@ -83,6 +83,7 @@ Overlays::~Overlays() {
 }
 
 void Overlays::destroy() {
+    clearSimulationBuffers();
     for (auto& kv : faces_) {
         if (kv.second.vao) glDeleteVertexArrays(1, &kv.second.vao);
         // kv.second.vbo is shared (owned by bodyVbos_) — do NOT delete it here.
@@ -357,6 +358,134 @@ void Overlays::drawSegments(const Renderer::CameraXform& cam, const std::vector<
     glDrawArrays(GL_LINES, 0, (int)(xyz.size() / 3));
     if (overSurface) glDepthRange(0.0, 1.0);
     glBindVertexArray(0);
+}
+
+void Overlays::beginSimulationFrame(uint64_t generation, uint64_t documentScope) {
+    if (generation != simulationGeneration_ || documentScope != simulationDocumentScope_) {
+        clearSimulationBuffers();
+        simulationGeneration_ = generation;
+        simulationDocumentScope_ = documentScope;
+    }
+    simulationFrameActive_ = true;
+    ++simulationFrame_;
+    if (simulationFrame_ == 0) {
+        // Keep zero as the never-used marker if the application survives a uint64 wrap.
+        simulationFrame_ = 1;
+        for (auto& kv : simulationBufs_) kv.second.lastFrame = 0;
+    }
+}
+
+Overlays::SimulationBuf* Overlays::prepareSimulationBuffer(
+    uint64_t batchKey, unsigned int primitive, const std::vector<float>& xyz,
+    uint64_t sourceRevision) {
+    if (!simulationFrameActive_ || xyz.empty() || !prog_) return nullptr;
+
+    // On-demand setup previews are regenerated into temporary vectors, so pointer identity is not
+    // meaningful. Fingerprint their float payload; cached SimManager sources pass their generation
+    // and avoid this scan (important for large streamline/slice batches).
+    if (sourceRevision == 0) {
+        sourceRevision = 1469598103934665603ull;
+        for (float value : xyz) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &value, sizeof(bits));
+            sourceRevision ^= bits;
+            sourceRevision *= 1099511628211ull;
+        }
+        sourceRevision ^= (uint64_t)xyz.size();
+        sourceRevision *= 1099511628211ull;
+        if (sourceRevision == 0) sourceRevision = 1;
+    }
+
+    SimulationBuf& buf = simulationBufs_[batchKey];
+    const int vertCount = (int)(xyz.size() / 3);
+    const bool needsUpload = !buf.vao || !buf.vbo || buf.primitive != primitive ||
+                             buf.vertCount != vertCount ||
+                             buf.sourceRevision != sourceRevision;
+    if (!buf.vao) glGenVertexArrays(1, &buf.vao);
+    if (!buf.vbo) glGenBuffers(1, &buf.vbo);
+    if (needsUpload) {
+        glBindVertexArray(buf.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, buf.vbo);
+        glBufferData(GL_ARRAY_BUFFER, xyz.size() * sizeof(float), xyz.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBindVertexArray(0);
+        buf.primitive = primitive;
+        buf.vertCount = vertCount;
+        buf.sourceRevision = sourceRevision;
+    }
+    buf.lastFrame = simulationFrame_;
+    return &buf;
+}
+
+void Overlays::drawSimulationSegments(const Renderer::CameraXform& cam, uint64_t batchKey,
+                                      const std::vector<float>& xyz, const float rgba[4],
+                                      float lineWidth, bool overSurface,
+                                      uint64_t sourceRevision) {
+    if (xyz.size() < 6) return;
+    SimulationBuf* buf =
+        prepareSimulationBuffer(batchKey, GL_LINES, xyz, sourceRevision);
+    if (!buf) return;
+
+    bindCommon(cam);
+    glUniform4fv(uColor_, 1, rgba);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    if (overSurface) glDepthRange(0.0, 0.999);
+    glBindVertexArray(buf->vao);
+    glLineWidth(lineWidth * widthScale_);
+    glDrawArrays(GL_LINES, 0, buf->vertCount);
+    if (overSurface) glDepthRange(0.0, 1.0);
+    glBindVertexArray(0);
+}
+
+void Overlays::drawSimulationTriangles(const Renderer::CameraXform& cam, uint64_t batchKey,
+                                       const std::vector<float>& xyz, const float rgba[4],
+                                       bool overSurface, uint64_t sourceRevision) {
+    if (xyz.size() < 9) return;
+    SimulationBuf* buf =
+        prepareSimulationBuffer(batchKey, GL_TRIANGLES, xyz, sourceRevision);
+    if (!buf) return;
+
+    bindCommon(cam);
+    glUniform4fv(uColor_, 1, rgba);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_CULL_FACE);
+    if (overSurface) glDepthRange(0.0, 0.999);
+    glBindVertexArray(buf->vao);
+    glDrawArrays(GL_TRIANGLES, 0, buf->vertCount);
+    if (overSurface) glDepthRange(0.0, 1.0);
+    glDisable(GL_BLEND);
+    glBindVertexArray(0);
+}
+
+void Overlays::endSimulationFrame() {
+    if (!simulationFrameActive_) return;
+    for (auto it = simulationBufs_.begin(); it != simulationBufs_.end();) {
+        if (it->second.lastFrame == simulationFrame_) {
+            ++it;
+            continue;
+        }
+        if (it->second.vao) glDeleteVertexArrays(1, &it->second.vao);
+        if (it->second.vbo) glDeleteBuffers(1, &it->second.vbo);
+        it = simulationBufs_.erase(it);
+    }
+    simulationFrameActive_ = false;
+}
+
+void Overlays::clearSimulationBuffers() {
+    for (auto& kv : simulationBufs_) {
+        if (kv.second.vao) glDeleteVertexArrays(1, &kv.second.vao);
+        if (kv.second.vbo) glDeleteBuffers(1, &kv.second.vbo);
+    }
+    simulationBufs_.clear();
+    simulationGeneration_ = 0;
+    simulationDocumentScope_ = 0;
+    simulationFrame_ = 0;
+    simulationFrameActive_ = false;
 }
 
 void Overlays::drawCamSegments(const Renderer::CameraXform& cam,

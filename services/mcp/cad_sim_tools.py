@@ -25,8 +25,9 @@ from .cad_common import (
     _resolve_material_name,
     _resolve_material,
     _sid_match,
-    _solve_sync_or_handoff,
-    _start_job,
+    collect_durable,
+    register_durable_collector,
+    solve_durable_or_handoff,
     _tmp,
     _SID_RE,
     cb,
@@ -383,6 +384,22 @@ def _norm_mesher_backend(value) -> str:
             "mesher_backend must be 'netgen' or 'polymesh'; "
             f"got {value!r}. Refusing to choose a different mesher silently.")
     return backend
+
+def _advisor_params(mesher_backend: str, learned_advisor: bool,
+                    advisor_max_dof: int) -> dict:
+    """Validate the default-off PolyMesh advisor seam and return its runtime keys."""
+    if not isinstance(learned_advisor, bool):
+        raise ValueError("learned_advisor must be true or false")
+    if isinstance(advisor_max_dof, bool) or not isinstance(advisor_max_dof, int):
+        raise ValueError("advisor_max_dof must be a non-negative integer")
+    if advisor_max_dof < 0 or advisor_max_dof > 0xFFFFFFFF:
+        raise ValueError("advisor_max_dof must be from 0 through 4294967295")
+    if learned_advisor and mesher_backend != "polymesh":
+        raise ValueError(
+            "learned_advisor requires mesher_backend='polymesh'; refusing to "
+            "silently run the default Netgen path without the requested advisor.")
+    return {"learned_advisor": learned_advisor,
+            "advisor_max_dof": advisor_max_dof}
 
 
 def _norm_direction(d, where: str) -> list:
@@ -911,7 +928,7 @@ def _reject_fully_constrained_loads(fixture_sets: list, load_specs: list,
 
 
 def _build_static_study(fixtures, loads, material, mesh_fineness, mesher_backend,
-                        doc_id, notes: list) -> dict:
+                        learned_advisor, advisor_max_dof, doc_id, notes: list) -> dict:
     """SETUP stage for run_fea_static / sim_run(analysis="fea_static")."""
     d = _doc(doc_id)
     _require_sim_geometry(d)
@@ -926,6 +943,7 @@ def _build_static_study(fixtures, loads, material, mesh_fineness, mesher_backend
     mesh_fineness = _norm_fineness(mesh_fineness)
     mesher_backend = _norm_mesher_backend(mesher_backend)
     mat = _resolve_study_material(material, "static")
+    advisor = _advisor_params(mesher_backend, learned_advisor, advisor_max_dof)
     # fixtures=[] and "fixtures that resolved to nothing" are DIFFERENT mistakes, and the
     # single old message diagnosed the wrong one — it told a caller who supplied no queries
     # at all to go check its queries with query_geometry(), buying a wasted retry.
@@ -961,14 +979,16 @@ def _build_static_study(fixtures, loads, material, mesh_fineness, mesher_backend
         "fineness": mesh_fineness,
         "mesher_backend": mesher_backend,
     }
+    study.update(advisor)
     return {"analysis": "fea_static", "doc": d, "study": study, "material": mat,
             "material_arg": material, "fixtures": fixtures, "loads": loads,
             "mesh_fineness": mesh_fineness, "mesher_backend": mesher_backend,
-            "step_path": step}
+            **advisor, "step_path": step}
 
 
 def _build_adaptive_study(fixtures, loads, material, mesh_fineness,
-                          max_passes, eta_target, doc_id, notes: list) -> dict:
+                          max_passes, eta_target, learned_advisor,
+                          advisor_max_dof, doc_id, notes: list) -> dict:
     """SETUP stage for run_fea_adaptive / sim_run_adaptive."""
     if isinstance(max_passes, bool) or not isinstance(max_passes, int):
         raise ValueError("max_passes must be an integer from 1 through 6")
@@ -977,48 +997,82 @@ def _build_adaptive_study(fixtures, loads, material, mesh_fineness,
     eta_target = _finite_float(eta_target, "eta_target")
     if eta_target <= 0.0:
         raise ValueError("eta_target must be finite and greater than 0")
-    ctx = _build_static_study(fixtures, loads, material, mesh_fineness,
-                              "polymesh", doc_id, notes)
+    ctx = _build_static_study(
+        fixtures, loads, material, mesh_fineness, "polymesh",
+        learned_advisor, advisor_max_dof, doc_id, notes)
     ctx["study"].pop("mesher_backend", None)
     ctx["study"]["adapt"] = {"max_passes": max_passes, "eta_target": eta_target}
+    # _build_static_study supplies its own analysis tag. Override it before _job_meta()
+    # serializes this context, or durable collection dispatches the adaptive result through
+    # the ordinary static collector after both a synchronous wait and an MCP reconnect.
+    ctx["analysis"] = "fea_adaptive"
     ctx["max_passes"] = max_passes
     ctx["eta_target"] = eta_target
     return ctx
 
 
 def _collect_adaptive(ctx: dict, res: dict, notes: list) -> dict:
-    """Shape an adaptive solve like static FEA while surfacing convergence."""
-    out = _collect_static(ctx, res, notes)
-    if not out.get("ok"):
-        return out
+    """Collect adaptive FEA without disguising an under-resolved pass as static success."""
+    if not res.get("ok"):
+        return _collect_static(ctx, res, notes)
     adapt = res.get("adapt")
     if not isinstance(adapt, dict):
         return {"ok": False, "doc_id": ctx["doc"],
                 "error": "adaptive solver reported success without convergence metadata."}
     try:
         global_eta = _finite_float(adapt.get("global_eta"), "adapt.global_eta")
+        eta_target = _finite_float(adapt.get("eta_target"), "adapt.eta_target")
         passes_run = _positive_int(adapt.get("passes_run"), "adapt.passes_run")
     except ValueError as exc:
         return {"ok": False, "doc_id": ctx["doc"],
                 "error": f"adaptive solver returned incomplete convergence metadata: {exc}"}
+    passes = adapt.get("passes")
     eta_target_met = adapt.get("eta_target_met")
     stop_reason = adapt.get("stop_reason")
+    if global_eta < 0.0 or eta_target <= 0.0:
+        return {"ok": False, "doc_id": ctx["doc"],
+                "error": "adaptive solver returned invalid global_eta or eta_target."}
+    if (not isinstance(passes, list) or len(passes) != passes_run
+            or not all(isinstance(item, dict) for item in passes)):
+        return {"ok": False, "doc_id": ctx["doc"],
+                "error": "adaptive solver returned missing or inconsistent pass metadata."}
     if not isinstance(eta_target_met, bool) or not isinstance(stop_reason, str) or not stop_reason:
         return {"ok": False, "doc_id": ctx["doc"],
                 "error": "adaptive solver returned invalid eta_target_met or stop_reason."}
-    out.update({"global_eta": global_eta, "eta_target_met": eta_target_met,
-                "passes_run": passes_run, "stop_reason": stop_reason,
-                "adapt": adapt})
+
+    if eta_target_met:
+        resolution_note = (
+            "The adaptive error target was met; the reported field is from the final "
+            "refined mesh.")
+    else:
+        resolution_note = (
+            "The adaptive error target was not met; this result is under-resolved and is "
+            "retained for diagnosis, not presented as a converged static result.")
+    out = _collect_static(
+        ctx, res, notes, study_type="fea_adaptive", study_name="Adaptive static stress",
+        study_extra={"adapt": adapt, "converged": eta_target_met,
+                     "resolution_note": resolution_note})
+    static_ok = bool(out.get("ok"))
+    out.update({"global_eta": global_eta, "eta_target": eta_target,
+                "eta_target_met": eta_target_met, "passes_run": passes_run,
+                "passes": passes, "stop_reason": stop_reason, "adapt": adapt,
+                "converged": static_ok and eta_target_met,
+                "resolution_note": resolution_note})
+    if not static_ok:
+        return out
     if not eta_target_met:
-        out["resolution_note"] = (
-            "The adaptive error target was not met; this result may be under-resolved.")
+        out["ok"] = False
+        out["error"] = (
+            f"adaptive solve stopped without meeting eta_target={eta_target:g} "
+            f"(global_eta={global_eta:g}, stop_reason={stop_reason}); the final-pass "
+            "diagnostics are retained below but are not a converged result.")
     return out
 
 
 
 
 def _build_modal_study(fixtures, material, mesh_fineness, mesher_backend,
-                       doc_id, notes: list) -> dict:
+                       learned_advisor, advisor_max_dof, doc_id, notes: list) -> dict:
     """SETUP stage for run_fea_modal / sim_run(analysis="fea_modal")."""
     d = _doc(doc_id)
     _require_sim_geometry(d)
@@ -1028,6 +1082,7 @@ def _build_modal_study(fixtures, material, mesh_fineness, mesher_backend,
     mesh_fineness = _norm_fineness(mesh_fineness)
     mesher_backend = _norm_mesher_backend(mesher_backend)
     mat = _resolve_study_material(material, "modal")
+    advisor = _advisor_params(mesher_backend, learned_advisor, advisor_max_dof)
     fixture_sets: list = []
     for q in fixtures:
         fixture_sets.extend(_sim_face_points(d, q))
@@ -1049,10 +1104,11 @@ def _build_modal_study(fixtures, material, mesh_fineness, mesher_backend,
     study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
              "mesh_order": 2, "fineness": mesh_fineness,
              "mesher_backend": mesher_backend}
+    study.update(advisor)
     return {"analysis": "fea_modal", "doc": d, "study": study, "material": mat,
             "material_arg": material, "fixtures": fixtures, "fixture_sets": fixture_sets,
             "free_free": not fixture_sets, "mesh_fineness": mesh_fineness,
-            "mesher_backend": mesher_backend, "step_path": step}
+            "mesher_backend": mesher_backend, **advisor, "step_path": step}
 
 
 # core/sim/fea_static.cpp clamps yield/stress into [0, 15]; 15 therefore means "saturated",
@@ -1060,8 +1116,10 @@ def _build_modal_study(fixtures, material, mesh_fineness, mesher_backend,
 _FOS_CAP = 15.0
 
 
-def _collect_static(ctx: dict, res: dict, notes: list) -> dict:
-    """COLLECT stage for a static solve — the ONE place the reply envelope is built."""
+def _collect_static(ctx: dict, res: dict, notes: list, *,
+                    study_type: str = "fea_static", study_name: str = "Static stress",
+                    study_extra: Optional[dict] = None) -> dict:
+    """COLLECT stage for a static-shaped solve — the one reply-envelope implementation."""
     d = ctx["doc"]
     mat = ctx.get("material") or {}
     if not res.get("ok"):
@@ -1092,21 +1150,29 @@ def _collect_static(ctx: dict, res: dict, notes: list) -> dict:
                 "error": "static solver returned an inconsistent mesh envelope: n_dof is "
                          "smaller than three translational DOFs per node."}
     summary = {**summary, **values}
+    advisor = res.get("advisor")
+    advisor_record = {"advisor": advisor} if isinstance(advisor, dict) else {}
     # Persist setup+results into the doc so they save inside the .step+.
-    sid = _persist_study(d, {
-        "type": "fea_static",
-        "name": f"Static stress ({mat.get('name', ctx.get('material_arg'))})",
+    study_record = {
+        "type": study_type,
+        "name": f"{study_name} ({mat.get('name', ctx.get('material_arg'))})",
         "engine": "cpp",
         "material": mat,
         "fixtures": ctx.get("fixtures"),
         "loads": ctx.get("loads"),
         "mesh_fineness": ctx.get("mesh_fineness"),
         "mesher_backend": ctx.get("mesher_backend"),
+        "learned_advisor": ctx.get("learned_advisor", False),
+        "advisor_max_dof": ctx.get("advisor_max_dof", 0),
         "results": summary,
         "n_dof": counts["n_dof"], "n_elems": counts["n_elems"],
         "n_nodes": counts["n_nodes"], "mesh": res.get("mesh_type_used"),
         "solver_notes": res.get("solver_notes", []),
-    })
+        **advisor_record,
+    }
+    if study_extra:
+        study_record.update(study_extra)
+    sid = _persist_study(d, study_record)
     # The engine's sim_run_static reply also carries n_elems / n_nodes / mesh_type_used /
     # solver_notes; only n_dof was forwarded, so a caller could not see the mesh it just
     # solved on (no way to judge whether a refinement is needed) and any solver WARNING
@@ -1119,6 +1185,8 @@ def _collect_static(ctx: dict, res: dict, notes: list) -> dict:
            "saved_to_study": bool(sid)}
     if res.get("solver_notes"):
         out["solver_notes"] = res["solver_notes"]
+    if advisor_record:
+        out.update(advisor_record)
     # min_fos saturates at 15 (core/sim/fea_static.cpp clamp_fos) — say so, otherwise a cap
     # is read as a computed margin.
     if values["min_fos"] >= _FOS_CAP:
@@ -1175,6 +1243,8 @@ def _collect_modal(ctx: dict, freqs: list, n_modes: int, notes: list,
         modal_meta = {"n_nodes": n_nodes, "n_dof": n_dof,
                       "mesh": diagnostics.get("mesh_type_used"),
                       "solver_notes": diagnostics.get("solver_notes", [])}
+        if isinstance(diagnostics.get("advisor"), dict):
+            modal_meta["advisor"] = diagnostics["advisor"]
     sid = _persist_study(d, {
         "type": "fea_modal",
         "name": f"Modal ({mat.get('name', ctx.get('material_arg'))})",
@@ -1184,6 +1254,8 @@ def _collect_modal(ctx: dict, freqs: list, n_modes: int, notes: list,
         "n_modes": n_modes,
         "mesh_fineness": ctx.get("mesh_fineness"),
         "mesher_backend": ctx.get("mesher_backend"),
+        "learned_advisor": ctx.get("learned_advisor", False),
+        "advisor_max_dof": ctx.get("advisor_max_dof", 0),
         "results": {"freqs_hz": freqs, "n_modes": len(freqs)},
         **modal_meta,
     })
@@ -1229,38 +1301,333 @@ def _merge_default_frequency_sweep(sweep: list, modal_freqs: list) -> list:
     return sorted(set(sweep + resonances))
 
 
-# Analyses whose SETUP produces a self-contained study (an exported STEP path + JSON), which
-# is the precondition for solving them in a separate, killable process. run_cfd_accurate is
-# deliberately absent: it already always-backgrounds with its own live progress channel, and
-# run_fea_frequency_response / run_fea_fatigue post-process a static field with Python between
-# engine calls, so their solve is not one atomic RPC. Those keep background=True + get_job().
+# ------------------------------------------------------- durable job wiring
+# Every heavy solve below runs its SOLVE stage in a child process tracked by the SQLite
+# registry in services/sim/jobs.py. What stays in this process is the SETUP (it needs the
+# live document to resolve face queries and export geometry) and the COLLECT (it writes
+# the solved study back into that document). The child gets a payload that is pure JSON
+# and references only files on disk, so it shares nothing with this process and can be
+# killed, polled from a later turn, or collected by a completely different server after a
+# restart.
+#
+# There is exactly ONE collector per job kind and the synchronous tool calls the SAME one,
+# so an asynchronous answer equals the synchronous answer by construction.
+
+#: Analyses `sim_run` will start. Every heavy solver is durable now; this list is only the
+#: subset `sim_run`'s own argument surface (fixtures/loads/material/n_modes) can express.
 _ASYNC_ANALYSES = ("fea_static", "fea_modal")
 
 
-def _collect_job(st: dict, raw: dict) -> dict:
-    """COLLECT stage for a finished async job: the job's own meta IS the setup context, so
-    this produces byte-identical envelopes to the synchronous tools."""
+def _job_notes(st: dict) -> tuple:
+    """A finished job's setup context and BC-normalization notes, from its own metadata."""
     meta = st.get("meta") or {}
-    kind = meta.get("analysis") or st.get("kind")
-    notes = list(meta.get("notes") or [])
-    if kind == "fea_static":
-        return _collect_static(meta, raw, notes)
-    if kind == "fea_modal":
-        if not raw.get("ok"):
-            return {"ok": False, "doc_id": meta.get("doc"),
-                    "error": raw.get("error", "modal solve failed")}
-        n = int(meta.get("n_modes") or 6)
-        freqs = list(raw.get("freqs_hz", []))
-        note = None
-        if meta.get("free_free"):
-            note = _modal_rigid_note(freqs)
-            if note:
-                note += (". The background path does NOT re-solve with a wider subspace the "
-                         "way the synchronous tool does (that would be a second job) — re-run "
-                         "run_fea_modal synchronously if the rigid-mode count matters")
-            freqs = freqs[:n]
-        return _collect_modal(meta, freqs, n, notes, note, raw)
-    return {"ok": False, "error": f"no result collector for job kind {kind!r}"}
+    return meta, list(meta.get("notes") or [])
+
+
+def _collect_job_static(st: dict, raw: dict) -> dict:
+    meta, notes = _job_notes(st)
+    return _collect_static(meta, raw, notes)
+
+
+def _collect_job_adaptive(st: dict, raw: dict) -> dict:
+    meta, notes = _job_notes(st)
+    return _collect_adaptive(meta, raw, notes)
+
+
+def _collect_job_modal(st: dict, raw: dict) -> dict:
+    meta, notes = _job_notes(st)
+    if not raw.get("ok"):
+        return {"ok": False, "doc_id": meta.get("doc"),
+                "error": raw.get("error", "modal solve failed")}
+    n = int(meta.get("n_modes") or 6)
+    freqs = list(raw.get("freqs_hz", []))
+    note = None
+    if meta.get("free_free"):
+        # The subspace widening itself happened in the child (jobs._stage_modal_rpc), so
+        # this is the SAME verdict the synchronous path reports, not a weaker one.
+        note = _modal_rigid_note(freqs)
+        freqs = freqs[:n]
+    return _collect_modal(meta, freqs, n, notes, note, raw)
+
+
+def _collect_job_fatigue(st: dict, raw: dict) -> dict:
+    """COLLECT stage for a fatigue solve: Marin-corrected endurance + Basquin life."""
+    from . import fea_advanced as fa  # noqa: PLC0415
+    meta, notes = _job_notes(st)
+    d = meta.get("doc")
+    mat = meta.get("material") or {}
+    theory = str(meta.get("theory") or "goodman")
+    corr = meta.get("marin") or {}
+    if not raw.get("ok"):
+        return {"ok": False, "doc_id": d, "error": raw.get("error", "fatigue solve failed")}
+    theories = (raw.get("summary") or {}).get("theories")
+    if not isinstance(theories, dict) or not theories:
+        return {"ok": False, "doc_id": d, "error":
+                "fatigue solver returned no mean-stress theory results; no life or safety "
+                "factor can be reported."}
+    if theory not in theories:
+        return {"ok": False, "doc_id": d, "error":
+                f"fatigue solver did not return the requested {theory!r} theory "
+                f"(available: {sorted(theories)})."}
+    try:
+        se = _finite_float(corr.get("se_corrected_mpa"), "marin.se_corrected_mpa")
+        sut = _finite_float(meta.get("ultimate_mpa"), "material.ultimate_mpa")
+    except ValueError as exc:
+        return {"ok": False, "doc_id": d,
+                "error": f"fatigue setup metadata is incomplete: {exc}"}
+    life = fa.fatigue_summarize(theories, se, sut, theory=theory)
+    life.update({"ok": True, "doc_id": d, "marin": corr,
+                 "material": mat.get("name", meta.get("material_arg"))})
+    sid = _persist_study(d, {
+        "type": "fea_fatigue",
+        "name": f"Fatigue ({mat.get('name', meta.get('material_arg'))}, {theory})",
+        "engine": "cpp",
+        "material": mat, "fixtures": meta.get("fixtures"), "loads": meta.get("loads"),
+        "results": {"theories": life["theories"], "regime": life["regime"],
+                    "cycles": life["cycles"], "fos_endurance": life["fos_endurance"]},
+    })
+    life["saved_to_study"] = bool(sid)
+    if not sid:
+        life["study_not_saved_reason"] = (
+            f"the results could not be written into document {d} (it is not open in this "
+            "process). The life numbers above are unaffected.")
+    return _interpreted(life, notes)
+
+
+def _collect_job_frequency_response(st: dict, raw: dict) -> dict:
+    """COLLECT stage for a frequency-response solve.
+
+    The child returns the raw eigensolution (frequencies + mode shapes); the modal
+    superposition is a pure numpy reduction with no engine in it, so it runs here where the
+    document is available to persist the study.
+    """
+    meta, notes = _job_notes(st)
+    d = meta.get("doc")
+    mat = meta.get("material") or {}
+    if not raw.get("ok"):
+        return {"ok": False, "doc_id": d, "error": raw.get("error", "modal solve failed")}
+    n_modes = int(meta.get("n_modes") or 6)
+    freqs = raw.get("freqs_hz")
+    shapes = raw.get("mode_shapes")
+    try:
+        n_nodes = _positive_int(raw.get("n_nodes"), "modal result.n_nodes")
+    except ValueError as exc:
+        return {"ok": False, "doc_id": d,
+                "error": f"modal solve returned invalid node diagnostics: {exc}"}
+    if not isinstance(freqs, list) or len(freqs) < n_modes:
+        got = len(freqs) if isinstance(freqs, list) else 0
+        return {"ok": False, "doc_id": d, "error":
+                f"modal solve returned only {got}/{n_modes} requested frequencies; "
+                "refusing a partial frequency-response basis."}
+    try:
+        freqs = [_finite_float(f, f"modal result.freqs_hz[{i}]")
+                 for i, f in enumerate(freqs)]
+    except ValueError as exc:
+        return {"ok": False, "doc_id": d,
+                "error": f"modal solve returned an invalid frequency: {exc}"}
+    if any(f < 0.0 for f in freqs):
+        return {"ok": False, "doc_id": d,
+                "error": "modal solve returned a negative frequency; refusing an "
+                         "unphysical frequency-response basis."}
+    if not isinstance(shapes, list) or not shapes:
+        return {"ok": False, "doc_id": d, "error":
+                "modal solve returned no mode shapes — cannot build the frequency response "
+                "(need freqs_hz + mode_shapes + n_nodes)"}
+    sweep = list(meta.get("sweep_hz") or [])
+    if meta.get("default_sweep"):
+        sweep = _merge_default_frequency_sweep(sweep, freqs)
+    zeta = float(meta.get("zeta") or 0.02)
+    psd = [tuple(pair) for pair in (meta.get("psd_breakpoints") or [])] or None
+    # Lazy import — keeps server module load independent of numpy availability.
+    from services.sim.vibration import (  # noqa: PLC0415
+        evaluate_vibration_spec, harmonic_response, miles_response)
+    kwargs = {"freqs_hz": freqs, "mode_shapes_flat": shapes, "n_nodes": n_nodes,
+              "total_mass_kg": float(meta["total_mass_kg"]),
+              "excitation_dir": list(meta.get("excitation_dir") or [0.0, 0.0, 1.0]),
+              "zeta": zeta}
+    harm = harmonic_response(sweep_hz=sweep,
+                             base_accel_g=float(meta.get("base_accel_g") or 1.0), **kwargs)
+    if psd is not None:
+        rand: dict = miles_response(psd_breakpoints=psd, **kwargs)
+        rand["ok"] = True
+    else:  # honest degrade — NEVER assume a default vibration profile
+        rand = {"ok": False, "reason": "no_psd_provided",
+                "hint": "Provide psd_breakpoints=[[f_hz, g2_per_hz], ...] "
+                        "(e.g. from the qualification spec) for random-"
+                        "vibration GRMS via Miles' equation."}
+    verdict = evaluate_vibration_spec(meta.get("vibration_spec"), harm,
+                                      rand if rand.get("ok") else None)
+    sid = _persist_study(d, {
+        "type": "fea_frequency_response",
+        "name": f"Frequency response ({mat.get('name', meta.get('material_arg'))})",
+        "engine": "cpp+py_modal_superposition",
+        "material": mat, "fixtures": meta.get("fixtures"), "n_modes": n_modes,
+        "mesh_fineness": meta.get("mesh_fineness"),
+        "results": {"freqs_hz": freqs,
+                    "peak_accel_g": harm.get("peak_accel_g"),
+                    "peak_freq_hz": harm.get("peak_freq_hz"),
+                    "total_grms": rand.get("total_grms"),
+                    "verdict": verdict},
+    })
+    out = {"ok": True, "doc_id": d, "material": mat.get("name", meta.get("material_arg")),
+           "freqs_hz": freqs, "harmonic": harm, "random": rand, "verdict": verdict,
+           "damping_assumption": f"zeta={zeta} (Q={1.0 / (2.0 * zeta):g}) — "
+                                 "assumed modal damping, not measured",
+           "saved_to_study": bool(sid)}
+    if not sid:
+        out["study_not_saved_reason"] = (
+            f"the results could not be written into document {d}; the response numbers are "
+            "unaffected.")
+    return _interpreted(out, notes)
+
+
+#: Engine keys the LBM wind-tunnel reply forwards verbatim.
+_FLOW_RESULT_KEYS = ("drag_n", "lift_n", "cd", "frontal_area_mm2", "reynolds",
+                     "ref_length_mm", "velocity_ms", "aoa_deg", "fluid", "grid",
+                     "converged", "residual", "voxel_mm", "min_feature_mm",
+                     "min_feature_voxels", "steps_run", "diverged", "warning")
+
+
+def _collect_job_cfd_flow(st: dict, raw: dict) -> dict:
+    """COLLECT stage for the built-in (LBM) wind tunnel."""
+    meta, _notes = _job_notes(st)
+    d = meta.get("doc")
+    if not raw.get("ok"):
+        return {"ok": False, "doc_id": d, "error": raw.get("error", "flow sim failed")}
+    if raw.get("diverged"):
+        return {"ok": False, "doc_id": d, "converged": False, "diverged": True,
+                "error": raw.get("warning") or
+                         "flow solver diverged; no result is reportable. "
+                         "Reduce velocity or refine the grid."}
+    try:
+        _validate_flow_result(raw, float(meta["velocity"]))
+    except (ValueError, KeyError, TypeError) as exc:
+        return {"ok": False, "doc_id": d,
+                "error": f"flow solver returned an incomplete/non-finite or degenerate "
+                         f"result: {exc}"}
+    out = {"ok": True, "doc_id": d}
+    for k in _FLOW_RESULT_KEYS:
+        if k in raw:
+            out[k] = raw[k]
+    sid = _persist_study(d, {
+        "type": "cfd_flow",
+        "name": (f"CFD wind tunnel ({meta.get('fluid')}, {meta.get('velocity')} m/s, "
+                 f"aoa {meta.get('aoa')})"),
+        "engine": "cpp-lbm",
+        "params": {"velocity": meta.get("velocity"), "aoa": meta.get("aoa"),
+                   "fluid": meta.get("fluid"), "cells": meta.get("cells"),
+                   "n_steps": meta.get("n_steps")},
+        "results": {k: out[k] for k in out if k not in ("ok", "doc_id")},
+    })
+    out["saved_to_study"] = bool(sid)
+    return out
+
+
+def _collect_job_openfoam(st: dict, raw: dict) -> dict:
+    """COLLECT stage for the OpenFOAM RANS wind tunnel."""
+    meta, _notes = _job_notes(st)
+    d = meta.get("doc")
+    if not raw.get("ok"):
+        return {"ok": False, "doc_id": d, "error": raw.get("error", "OpenFOAM run failed")}
+    try:
+        values = {k: _finite_float(raw.get(k), f"OpenFOAM {k}")
+                  for k in ("cd", "cl", "ld", "drag_n", "lift_n", "side_n", "reynolds",
+                            "ref_area_mm2", "vmax_mps")}
+        iters = _positive_int(raw.get("steps_run"), "OpenFOAM iterations")
+    except ValueError as exc:
+        return {"ok": False, "doc_id": d, "converged": False,
+                "error": f"OpenFOAM returned an incomplete result: {exc}"}
+    if (values["drag_n"] <= 0.0 or values["cd"] <= 0.0 or values["reynolds"] <= 0.0
+            or values["ref_area_mm2"] <= 0.0 or values["vmax_mps"] <= 0.0):
+        return {"ok": False, "doc_id": d, "converged": False,
+                "error": "OpenFOAM returned a degenerate zero/negative drag, coefficient, "
+                         "Reynolds number, reference area, or velocity; no aerodynamic "
+                         "result is reportable."}
+    diverged = bool(raw.get("diverged"))
+    out = {"ok": not diverged, "doc_id": d,
+           "solver": f"OpenFOAM RANS (k-omega SST, {meta.get('openfoam_kind')})",
+           "preset": meta.get("preset"), **values, "converged": (not diverged),
+           "iters": iters, "notes": list(raw.get("solver_notes") or []),
+           "velocity_ms": meta.get("velocity"), "aoa_deg": meta.get("aoa"),
+           "fluid": meta.get("fluid")}
+    if diverged:
+        out["error"] = ("OpenFOAM diverged; the diagnostic fields are retained but must not "
+                        "be used as converged coefficients.")
+        out["next_actions"] = ["retry with preset='medium' or lower velocity"]
+        return out
+    sid = _persist_study(d, {
+        "type": "cfd_openfoam",
+        "name": (f"OpenFOAM wind tunnel ({meta.get('fluid')}, {meta.get('velocity')} m/s, "
+                 f"aoa {meta.get('aoa')})"),
+        "engine": "openfoam",
+        "params": {"velocity": meta.get("velocity"), "aoa": meta.get("aoa"),
+                   "fluid": meta.get("fluid"), "preset": meta.get("preset")},
+        "results": {k: v for k, v in out.items() if k not in ("ok", "doc_id")}})
+    out["saved_to_study"] = bool(sid)
+    return out
+
+
+#: job kind -> COLLECT stage. `sim_results` and `get_job` both resolve through this, so a
+#: job collected from either surface produces the same envelope and persists its study once.
+_JOB_COLLECTORS = {
+    "fea_static": _collect_job_static,
+    "fea_adaptive": _collect_job_adaptive,
+    "fea_modal": _collect_job_modal,
+    "fea_fatigue": _collect_job_fatigue,
+    "fea_frequency_response": _collect_job_frequency_response,
+    "cfd_flow": _collect_job_cfd_flow,
+    "cfd_openfoam": _collect_job_openfoam,
+}
+
+for _kind, _fn in _JOB_COLLECTORS.items():
+    register_durable_collector(_kind, _fn)
+
+
+def _job_meta(ctx: dict, notes: list, extra: Optional[dict] = None) -> dict:
+    """The setup context the COLLECT stage needs, as pure JSON.
+
+    The study is dropped: it is already in the job payload, and its resolved face-point
+    sets are the bulkiest thing in a setup — duplicating them into the registry row would
+    put megabytes into a SQLite column for no reader.
+    """
+    meta = {k: v for k, v in ctx.items() if k != "study"}
+    meta["notes"] = list(notes)
+    if extra:
+        meta.update(extra)
+    return meta
+
+
+def _started(job: dict, doc_id) -> dict:
+    """The immediate reply for a background solve: a job id that outlives this process."""
+    jid = job["job_id"]
+    return {"ok": True, "job_id": jid, "status": "running", "state": "running",
+            "doc_id": doc_id, "pid": job.get("pid"), "cancel_supported": True,
+            "note": ("solving in a SEPARATE PROCESS — this call did not wait. The job is "
+                     "persisted on disk, so it survives an MCP restart and can be collected "
+                     f"in a later turn. Poll get_job('{jid}') or sim_status('{jid}'); "
+                     f"sim_cancel('{jid}') really terminates the solver."),
+            "next_actions": [f"get_job('{jid}')", f"sim_cancel('{jid}')"]}
+
+
+def _run_solve(kind: str, stage: str, payload: dict, meta: dict, *,
+               background: bool, doc_id) -> dict:
+    """Start one durable solve, and either hand back its id or wait out the sync budget."""
+    if background:
+        return _started(simjobs.start(kind, stage, payload, meta), doc_id)
+    return solve_durable_or_handoff(kind, stage, payload, meta)
+
+
+def _backend_missing(exc: Exception, method: str) -> bool:
+    """True when a job refused to start because the C++ solver isn't in this build.
+
+    `jobs.start` probes the backend before it queues anything, so an absent solver surfaces
+    as a start-time refusal rather than a job that can only fail — but it has to be told
+    apart from a genuinely bad study, which is the same exception type.
+    """
+    msg = str(exc).lower()
+    if "backend is unavailable" in msg:
+        return True
+    return method in msg and ("cannot dispatch" in msg or "unknown method" in msg)
 
 
 def register_cad_sim_tools(mcp: FastMCP) -> None:
@@ -1273,7 +1640,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     def run_fea_static(fixtures: Union[list, str], loads: Union[list, str],
                        material: Union[str, dict] = "steel",
                        mesh_fineness: Union[float, str] = 0.5,
-                       mesher_backend: str = "netgen", doc_id: Optional[str] = None,
+                       mesher_backend: str = "netgen",
+                       learned_advisor: bool = False, advisor_max_dof: int = 0,
+                       doc_id: Optional[str] = None,
                        background: bool = False) -> str:
         """Linear-static stress FEA on the current part. Returns max stress, displacement, and FoS.
 
@@ -1293,8 +1662,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    ("coarse"=0.25, "medium"=0.5, "fine"=0.75, "finest"=1.0).
                    Second-order (tet10) elements are used for accuracy.
         mesher_backend : "netgen" (default) or "polymesh"; no other value is accepted.
-        background : if True, return a job_id immediately and solve on a worker thread — poll
-                     get_job(job_id). Use it for fine meshes that may exceed the call timeout.
+        learned_advisor : opt-in PolyMesh mesh advice; false by default and valid only
+                          with mesher_backend="polymesh".
+        advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
+        background : if True, return a job_id immediately and solve in a separate process —
+                     poll get_job(job_id). Use it for fine meshes that may exceed the call
+                     timeout. The job is persisted on disk, so it survives an MCP restart
+                     and can be collected in a later turn; sim_cancel(job_id) kills it.
 
         Returns {ok, doc_id, material, n_nodes, n_elems, mesh, summary:{...}} — the
         scalars live under "summary", NOT at the top level: summary.min_fos,
@@ -1306,21 +1680,14 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         """
         try:
             bc_notes: list = []
-            ctx = _build_static_study(fixtures, loads, material, mesh_fineness,
-                                      mesher_backend, doc_id, bc_notes)
-            d = ctx["doc"]
-
-            def _solve() -> dict:
-                res = cb.call("sim_run_static", {"study": ctx["study"]})
-                return _collect_static(ctx, res, bc_notes)
-
+            ctx = _build_static_study(
+                fixtures, loads, material, mesh_fineness, mesher_backend,
+                learned_advisor, advisor_max_dof, doc_id, bc_notes)
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
-            if background:
-                jid = _start_job("fea_static", _solve)
-                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
-                               "note": "solving on a worker thread — poll get_job(job_id)",
-                               "next_actions": [f"get_job('{jid}')"]})
-            return _dumps(_solve_sync_or_handoff("fea_static", _solve))
+            return _dumps(_run_solve(
+                "fea_static", "core_rpc",
+                {"method": "sim_run_static", "params": {"study": ctx["study"]}},
+                _job_meta(ctx, bc_notes), background=background, doc_id=ctx["doc"]))
         except _StudyRefusal as r:
             return _dumps(r.payload)
         except Exception as e:  # noqa: BLE001
@@ -1333,6 +1700,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                          material: Union[str, dict] = "steel",
                          mesh_fineness: Union[float, str] = 0.5,
                          max_passes: int = 3, eta_target: float = 0.05,
+                         learned_advisor: bool = False, advisor_max_dof: int = 0,
                          doc_id: Optional[str] = None,
                          background: bool = False) -> str:
         """Adaptive linear-static stress FEA for decision-driving peak stresses.
@@ -1348,26 +1716,21 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         mesh_fineness : starting fineness from 0..1 or coarse/medium/fine/finest.
         max_passes : maximum remesh-and-solve passes, from 1 through 6.
         eta_target : finite positive target for the dimensionless relative error indicator.
-        background : if True, return a job_id immediately; poll get_job(job_id).
+        learned_advisor : opt in to upstream PolyMesh mesh advice; false by default.
+        advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
+        background : if True, return a job_id immediately; poll get_job(job_id). The job
+                     runs in its own process and survives an MCP restart.
         """
         try:
             bc_notes: list = []
-            ctx = _build_adaptive_study(fixtures, loads, material, mesh_fineness,
-                                        max_passes, eta_target, doc_id, bc_notes)
-            d = ctx["doc"]
-
-            def _solve() -> dict:
-                res = cb.call("sim_run_adaptive", {"study": ctx["study"]})
-                return _collect_adaptive(ctx, res, bc_notes)
-
+            ctx = _build_adaptive_study(
+                fixtures, loads, material, mesh_fineness, max_passes, eta_target,
+                learned_advisor, advisor_max_dof, doc_id, bc_notes)
             _autosave_all_open()
-            if background:
-                jid = _start_job("fea_adaptive", _solve)
-                return _dumps({"ok": True, "job_id": jid, "status": "running",
-                               "doc_id": d,
-                               "note": "solving on a worker thread — poll get_job(job_id)",
-                               "next_actions": [f"get_job('{jid}')"]})
-            return _dumps(_solve_sync_or_handoff("fea_adaptive", _solve))
+            return _dumps(_run_solve(
+                "fea_adaptive", "core_rpc",
+                {"method": "sim_run_adaptive", "params": {"study": ctx["study"]}},
+                _job_meta(ctx, bc_notes), background=background, doc_id=ctx["doc"]))
         except _StudyRefusal as r:
             return _dumps(r.payload)
         except Exception as e:  # noqa: BLE001
@@ -1378,7 +1741,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     def run_fea_modal(fixtures: Union[list, str], material: Union[str, dict] = "steel",
                       n_modes: int = 6,
                       mesh_fineness: Union[float, str] = 0.5,
-                      mesher_backend: str = "netgen", doc_id: Optional[str] = None,
+                      mesher_backend: str = "netgen",
+                      learned_advisor: bool = False, advisor_max_dof: int = 0,
+                      doc_id: Optional[str] = None,
                       background: bool = False) -> str:
         """Modal FEA — the natural frequencies (Hz) of the held part. Returns the first n_modes.
 
@@ -1389,54 +1754,34 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         material : name or explicit dict (density drives the mode frequencies).
         mesh_fineness : 0..1, or a preset word ("coarse"/"medium"/"fine"/"finest").
         mesher_backend : "netgen" (default) or "polymesh"; no other value is accepted.
-        background : if True, return a job_id and solve on a worker thread — poll get_job(job_id).
+        learned_advisor : opt-in PolyMesh mesh advice; false by default and valid only
+                          with mesher_backend="polymesh". It does not promote the
+                          static-trained model as a modal optimizer.
+        advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
+        background : if True, return a job_id and solve in a separate process — poll
+                     get_job(job_id). The job survives an MCP restart.
         """
         try:
             n_modes = _positive_int(n_modes, "n_modes")
             bc_notes: list = []
-            ctx = _build_modal_study(fixtures, material, mesh_fineness, mesher_backend,
-                                     doc_id, bc_notes)
-            d = ctx["doc"]
-            fixture_sets = ctx["fixture_sets"]
-            study = ctx["study"]
-
-            def _solve() -> dict:
-                # Free-free (no fixtures): the 0 Hz rigid-body cluster is 6-fold
-                # degenerate. FIXED IN THE ENGINE 2026-07-12 (fea_modal.cpp
-                # over-requests + widens the Krylov subspace + verifies the rigid
-                # count internally), so this caller-side over-request + verify is
-                # now a redundant SAFETY NET — kept because it is cheap and turns
-                # any regression into a visible warning note instead of silently
-                # wrong mode numbering.
-                free_free = not fixture_sets
-                solve_n = _modal_solve_n(n_modes, free_free)
-                res = cb.call("sim_run_modal", {"study": study, "n_modes": solve_n})
-                if not res.get("ok"):
-                    return {"ok": False, "doc_id": d,
-                            "error": res.get("error", "modal solve failed")}
-                freqs = list(res.get("freqs_hz", []))
-                note = None
-                if free_free:
-                    for _ in range(2):
-                        if _n_rigid_modes(freqs) >= 6:
-                            break
-                        solve_n += 6
-                        retry = cb.call("sim_run_modal",
-                                        {"study": study, "n_modes": solve_n})
-                        if not retry.get("ok"):
-                            break
-                        res, freqs = retry, list(retry.get("freqs_hz", []))
-                    note = _modal_rigid_note(freqs)
-                    freqs = freqs[:n_modes]
-                return _collect_modal(ctx, freqs, n_modes, bc_notes, note, res)
-
+            ctx = _build_modal_study(
+                fixtures, material, mesh_fineness, mesher_backend,
+                learned_advisor, advisor_max_dof, doc_id, bc_notes)
+            ctx["n_modes"] = n_modes
+            # Free-free (no fixtures): the 0 Hz rigid-body cluster is 6-fold degenerate.
+            # FIXED IN THE ENGINE 2026-07-12 (fea_modal.cpp over-requests + widens the
+            # Krylov subspace + verifies the rigid count internally), so the over-request
+            # and the re-solve below it are a redundant SAFETY NET — kept because they are
+            # cheap and turn any regression into a visible warning note instead of silently
+            # wrong mode numbering. Both live in the SOLVE stage (jobs._stage_modal_rpc) so
+            # the synchronous and background answers cannot drift apart.
+            free_free = ctx["free_free"]
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
-            if background:
-                jid = _start_job("fea_modal", _solve)
-                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
-                               "note": "solving on a worker thread — poll get_job(job_id)",
-                               "next_actions": [f"get_job('{jid}')"]})
-            return _dumps(_solve_sync_or_handoff("fea_modal", _solve))
+            return _dumps(_run_solve(
+                "fea_modal", "modal_rpc",
+                {"study": ctx["study"], "solve_n": _modal_solve_n(n_modes, free_free),
+                 "widen_free_free": free_free},
+                _job_meta(ctx, bc_notes), background=background, doc_id=ctx["doc"]))
         except _StudyRefusal as r:
             return _dumps(r.payload)
         except Exception as e:  # noqa: BLE001
@@ -1444,9 +1789,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
 
     # ------------------------------------------------ asynchronous solves (sim_* job family)
-    # The synchronous tools above are unchanged. These four are the non-blocking contract:
-    # start -> poll -> collect, with a cancel that really kills the solver, and results that
-    # are never presented as converged unless they are.
+    # The synchronous tools above start the SAME durable jobs; these four are the explicit
+    # non-blocking contract: start -> poll -> collect, with a cancel that really kills the
+    # solver, and results that are never presented as converged unless they are.
 
     @mcp.tool()
     def sim_run(analysis: str = "fea_static",
@@ -1455,6 +1800,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 material: Union[str, dict] = "steel",
                 mesh_fineness: Union[float, str] = 0.5,
                 mesher_backend: str = "netgen",
+                learned_advisor: bool = False,
+                advisor_max_dof: int = 0,
                 n_modes: int = 6,
                 doc_id: Optional[str] = None,
                 study: Optional[str] = None,
@@ -1472,6 +1819,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         and the study is built by the SAME setup code, so the answer is identical to the
         synchronous one.
         mesher_backend : "netgen" (default) or "polymesh"; invalid values are refused.
+        learned_advisor : default-off PolyMesh advice; requires mesher_backend="polymesh".
+        advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
 
         Then: sim_status(job_id) -> queued|running|done|failed|cancelled (+ progress, elapsed)
               sim_results(job_id) -> the full result once done (partial=True while running)
@@ -1485,36 +1834,37 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 kind = "fea_modal"
             if kind not in _ASYNC_ANALYSES:
                 return _dumps({"ok": False, "error":
-                               f"sim_run(analysis={analysis!r}) is not an asynchronous "
-                               f"analysis. Supported: {list(_ASYNC_ANALYSES)}. Every other "
-                               "solver keeps its own background=True + get_job(job_id) path "
-                               "(run_cfd_flow, run_cfd_accurate, run_fea_frequency_response, "
-                               "run_fea_fatigue)."})
+                               f"sim_run(analysis={analysis!r}) is not an analysis sim_run "
+                               f"can express. Supported: {list(_ASYNC_ANALYSES)}. Every "
+                               "other solver starts the same kind of durable job through "
+                               "its own tool with background=True (run_cfd_flow, "
+                               "run_fea_frequency_response, run_fea_fatigue) or always "
+                               "(run_cfd_accurate); sim_status/sim_results/sim_cancel "
+                               "accept those job ids too."})
             if fixtures is None:
                 raise ValueError(
                     "sim_run needs fixtures=[...] — the face queries held fixed, e.g. "
                     '["bottom"]. For an unconstrained modal solve pass fixtures=[].')
             notes: list = []
             if kind == "fea_static":
-                ctx = _build_static_study(fixtures, loads, material, mesh_fineness,
-                                          mesher_backend, doc_id, notes)
-                method = "sim_run_static"
-                params = {"study": ctx["study"]}
+                ctx = _build_static_study(
+                    fixtures, loads, material, mesh_fineness, mesher_backend,
+                    learned_advisor, advisor_max_dof, doc_id, notes)
+                stage = "core_rpc"
+                payload = {"method": "sim_run_static", "params": {"study": ctx["study"]}}
             else:
                 n_modes = _positive_int(n_modes, "n_modes")
-                ctx = _build_modal_study(fixtures, material, mesh_fineness,
-                                         mesher_backend, doc_id, notes)
+                ctx = _build_modal_study(
+                    fixtures, material, mesh_fineness, mesher_backend,
+                    learned_advisor, advisor_max_dof, doc_id, notes)
                 ctx["n_modes"] = n_modes
-                method = "sim_run_modal"
-                params = {"study": ctx["study"],
-                          "n_modes": _modal_solve_n(n_modes, ctx["free_free"])}
+                stage = "modal_rpc"
+                payload = {"study": ctx["study"],
+                           "solve_n": _modal_solve_n(n_modes, ctx["free_free"]),
+                           "widen_free_free": ctx["free_free"]}
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
-            meta = {k: v for k, v in ctx.items() if k != "study"}
-            meta["notes"] = notes
-            if label:
-                meta["label"] = label
-            job = simjobs.start(kind, "core_rpc",
-                                {"method": method, "params": params}, meta)
+            meta = _job_meta(ctx, notes, {"label": label} if label else None)
+            job = simjobs.start(kind, stage, payload, meta)
             return _dumps({"ok": True, "job_id": job["job_id"], "state": "running",
                            "analysis": kind, "doc_id": ctx["doc"], "pid": job["pid"],
                            "note": "solving in a separate process — this call did NOT wait. "
@@ -1576,7 +1926,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def sim_results(job_id: str, partial: bool = False) -> str:
-        """Collect a sim_run job's results.
+        """Collect a simulation job's results — from ANY tool that returned a job_id.
 
         partial=False (default): the full converged result, in exactly the shape the
         synchronous tool returns. On a job that has NOT finished this REFUSES — it will not
@@ -1585,6 +1935,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         partial=True: the last snapshot the solver published, always tagged
         `partial: true, converged: false`. When the stage published nothing (a direct FEA
         solve has no meaningful intermediate state) this says so instead of inventing one.
+
+        The collect stage runs exactly ONCE per job however many times it is polled and from
+        however many processes, so a solved study is written into the document once.
         """
         try:
             st = simjobs.status(job_id)
@@ -1621,13 +1974,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 elif st.get("error"):
                     out["solver_error"] = st["error"]
                 return _dumps(out)
-            raw = simjobs.raw_result(job_id)
-            if raw is None:
-                return _dumps({"ok": False, "job_id": job_id, "state": state,
-                               "error": "the job is marked done but its result file could not "
-                                        "be read — nothing can be reported honestly. Re-run "
-                                        "the solve."})
-            out = _collect_job(st, raw)
+            out = dict(collect_durable(job_id, st))
             out.update(job_id=job_id, state="done", converged=bool(out.get("ok")),
                        elapsed_s=st.get("elapsed_s"))
             return _dumps(out)
@@ -1772,106 +2119,32 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             cb.call("doc_export_step", {"doc_id": d, "path": step})
             study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
                      "mesh_order": 2, "fineness": mesh_fineness}
-
-            def _solve() -> dict:
-                res = cb.call("sim_run_modal", {"study": study, "n_modes": n_modes})
-                if not res.get("ok"):
-                    return {"ok": False, "doc_id": d,
-                            "error": res.get("error", "modal solve failed")}
-                freqs = res.get("freqs_hz")
-                shapes = res.get("mode_shapes")
-                try:
-                    n_nodes = _positive_int(res.get("n_nodes"), "modal result.n_nodes")
-                except ValueError as exc:
-                    return {"ok": False, "doc_id": d,
-                            "error": f"modal solve returned invalid node diagnostics: {exc}"}
-                if not isinstance(freqs, list) or len(freqs) < n_modes:
-                    got = len(freqs) if isinstance(freqs, list) else 0
-                    return {"ok": False, "doc_id": d, "error":
-                            f"modal solve returned only {got}/{n_modes} requested frequencies; "
-                            "refusing a partial frequency-response basis."}
-                try:
-                    freqs = [_finite_float(f, f"modal result.freqs_hz[{i}]")
-                             for i, f in enumerate(freqs)]
-                except ValueError as exc:
-                    return {"ok": False, "doc_id": d,
-                            "error": f"modal solve returned an invalid frequency: {exc}"}
-                if any(f < 0.0 for f in freqs):
-                    return {"ok": False, "doc_id": d,
-                            "error": "modal solve returned a negative frequency; refusing an "
-                                     "unphysical frequency-response basis."}
-                response_sweep = (_merge_default_frequency_sweep(sweep, freqs)
-                                  if using_default_sweep else sweep)
-                if not isinstance(shapes, list) or not shapes:
-                    return {"ok": False, "doc_id": d, "error":
-                            "modal solve returned no mode shapes — cannot build the "
-                            "frequency response (need freqs_hz + mode_shapes + n_nodes)"}
-                # Total mass from the solid at the study material's density (eval_mass
-                # returns mass_g = volume_mm3 * density; kg = g / 1000).
-                dens = _finite_float(mat.get("density_g_cm3"), "material.density_g_cm3")
-                meas = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": dens})
-                try:
-                    total_mass_kg = _finite_float(
-                        (meas or {}).get("mass_g"), "eval_mass.mass_g") / 1000.0
-                except (AttributeError, ValueError) as exc:
-                    return {"ok": False, "doc_id": d, "error":
-                            f"could not determine a finite part mass: {exc}"}
-                if total_mass_kg <= 0.0:
-                    return {"ok": False, "doc_id": d, "error":
-                            "could not determine part mass (volume or density missing) — "
-                            "set a material with density_g_cm3 and ensure the part has "
-                            "solid volume"}
-                # Lazy import — keeps server module load independent of numpy availability.
-                from services.sim.vibration import (
-                    evaluate_vibration_spec, harmonic_response, miles_response)
-                harm = harmonic_response(
-                    freqs_hz=freqs, mode_shapes_flat=shapes, n_nodes=n_nodes,
-                    total_mass_kg=total_mass_kg, excitation_dir=ex_dir,
-                    sweep_hz=response_sweep, zeta=zeta, base_accel_g=base_accel_g)
-                if psd is not None:
-                    rand: dict = miles_response(
-                        freqs_hz=freqs, mode_shapes_flat=shapes, n_nodes=n_nodes,
-                        total_mass_kg=total_mass_kg, excitation_dir=ex_dir,
-                        psd_breakpoints=psd, zeta=zeta)
-                    rand["ok"] = True
-                else:  # honest degrade — NEVER assume a default vibration profile
-                    rand = {"ok": False, "reason": "no_psd_provided",
-                            "hint": "Provide psd_breakpoints=[[f_hz, g2_per_hz], ...] "
-                                    "(e.g. from the qualification spec) for random-"
-                                    "vibration GRMS via Miles' equation."}
-                verdict = evaluate_vibration_spec(
-                    vibration_spec, harm, rand if rand.get("ok") else None)
-                sid = _persist_study(d, {
-                    "type": "fea_frequency_response",
-                    "name": f"Frequency response ({mat.get('name', material)})",
-                    "engine": "cpp+py_modal_superposition",
-                    "material": mat, "fixtures": fixtures, "n_modes": n_modes,
-                    "mesh_fineness": mesh_fineness,
-                    "results": {"freqs_hz": freqs,
-                                "peak_accel_g": harm.get("peak_accel_g"),
-                                "peak_freq_hz": harm.get("peak_freq_hz"),
-                                "total_grms": rand.get("total_grms"),
-                                "verdict": verdict},
-                })
-                out = {"ok": True, "doc_id": d, "material": mat.get("name", material),
-                       "freqs_hz": freqs, "harmonic": harm, "random": rand,
-                       "verdict": verdict,
-                       "damping_assumption": f"zeta={zeta} (Q={1.0 / (2.0 * zeta):g}) — "
-                                             "assumed modal damping, not measured",
-                       "saved_to_study": bool(sid)}
-                if not sid:
-                    out["study_not_saved_reason"] = (
-                        f"the results could not be written into document {d}; the response "
-                        "numbers are unaffected.")
-                return _interpreted(out, bc_notes)
-
+            # Total mass comes from the LIVE document at the study material's density
+            # (eval_mass returns mass_g = volume_mm3 * density; kg = g / 1000). It is a
+            # setup input to the modal superposition, so it is measured HERE, while the
+            # document is certainly open — the collect stage may run in a later turn, after
+            # a restart, with nothing but the job's metadata to work from.
+            dens = _finite_float(mat.get("density_g_cm3"), "material.density_g_cm3")
+            meas = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": dens}) or {}
+            total_mass_kg = _finite_float(meas.get("mass_g"), "eval_mass.mass_g") / 1000.0
+            if total_mass_kg <= 0.0:
+                raise ValueError(
+                    "could not determine part mass (volume or density missing) — set a "
+                    "material with density_g_cm3 and ensure the part has solid volume")
+            ctx = {"analysis": "fea_frequency_response", "doc": d, "material": mat,
+                   "material_arg": material, "fixtures": fixtures, "n_modes": n_modes,
+                   "mesh_fineness": mesh_fineness, "step_path": step,
+                   "excitation_dir": ex_dir, "sweep_hz": sweep,
+                   "default_sweep": using_default_sweep, "zeta": zeta,
+                   "base_accel_g": base_accel_g,
+                   "psd_breakpoints": [list(p) for p in psd] if psd is not None else None,
+                   "vibration_spec": vibration_spec, "total_mass_kg": total_mass_kg}
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
-            if background:
-                jid = _start_job("fea_frequency_response", _solve)
-                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
-                               "note": "solving on a worker thread — poll get_job(job_id)",
-                               "next_actions": [f"get_job('{jid}')"]})
-            return _dumps(_solve_sync_or_handoff("fea_frequency_response", _solve))
+            return _dumps(_run_solve(
+                "fea_frequency_response", "core_rpc",
+                {"method": "sim_run_modal",
+                 "params": {"study": study, "n_modes": n_modes}},
+                _job_meta(ctx, bc_notes), background=background, doc_id=d))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -1891,9 +2164,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         velocity : free-stream speed (m/s).   aoa : angle of attack (degrees).
         fluid    : "air" or "water".          cells : grid pitch = domain's longest span / cells
                    (higher = finer + slower; practical 48-200).  n_steps : LBM iterations (~500-4000).
-        background : if True, return a job_id immediately and solve on a worker thread (recommended
-                     for cells>=120 or n_steps>=2500, which can exceed the call timeout) — then poll
-                     get_job(job_id).
+        background : if True, return a job_id immediately and solve in a separate process
+                     (recommended for cells>=120 or n_steps>=2500, which can exceed the call
+                     timeout) — then poll get_job(job_id) for live {pct, step} progress. The
+                     job survives an MCP restart; sim_cancel(job_id) really kills the solver.
 
         RESOLUTION MATTERS: the result reports `voxel_mm`, `min_feature_mm`, and
         `min_feature_voxels` (how many cells span the thinnest part dimension). If a thin wing/tail
@@ -1927,55 +2201,25 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             n_steps = _positive_int(n_steps, "n_steps")
             d = _doc(doc_id)
             _require_sim_geometry(d)
-            # Live-progress side-channel: the engine writes {pct,step,n_steps} to this file as the
-            # LBM iterates; get_job reads it so a background run reports progress like OpenFOAM.
-            prog_path = _tmp(".json")
-            prog: dict = {"pct": 0, "stage": "lbm_solve", "progress_file": prog_path}
-
-            def _solve() -> dict:
-                res = cb.call("sim_run_flow", {"doc_id": d, "velocity": velocity, "aoa": aoa,
-                                               "fluid": fluid, "cells": cells, "n_steps": n_steps,
-                                               "progress_path": prog_path})
-                if not res.get("ok"):
-                    return {"ok": False, "doc_id": d,
-                            "error": res.get("error", "flow sim failed")}
-                if res.get("diverged"):
-                    return {"ok": False, "doc_id": d, "converged": False,
-                            "diverged": True,
-                            "error": res.get("warning") or
-                                     "flow solver diverged; no result is reportable. "
-                                     "Reduce velocity or refine the grid."}
-                try:
-                    _validate_flow_result(res, velocity)
-                except ValueError as exc:
-                    return {"ok": False, "doc_id": d,
-                            "error": f"flow solver returned an incomplete/non-finite or "
-                                     f"degenerate result: {exc}"}
-                out = {"ok": True, "doc_id": d}
-                for k in ("drag_n", "lift_n", "cd", "frontal_area_mm2", "reynolds",
-                          "ref_length_mm", "velocity_ms", "aoa_deg", "fluid", "grid",
-                          "converged", "residual", "voxel_mm", "min_feature_mm",
-                          "min_feature_voxels", "steps_run", "diverged", "warning"):
-                    if k in res:
-                        out[k] = res[k]
-                sid = _persist_study(d, {
-                    "type": "cfd_flow",
-                    "name": f"CFD wind tunnel ({fluid}, {velocity} m/s, aoa {aoa})",
-                    "engine": "cpp-lbm",
-                    "params": {"velocity": velocity, "aoa": aoa, "fluid": fluid,
-                               "cells": cells, "n_steps": n_steps},
-                    "results": {k: out[k] for k in out if k not in ("ok", "doc_id")},
-                })
-                out["saved_to_study"] = bool(sid)
-                return out
-
+            # The solve runs in a child process with its OWN engine and no document table,
+            # so the geometry travels as a file: export the solid once here, and the stage
+            # re-opens exactly that file (jobs._open_geometry) before the tunnel RPC.
+            step = _tmp(".step")
+            cb.call("doc_export_step", {"doc_id": d, "path": step})
+            ctx = {"analysis": "cfd_flow", "doc": d, "velocity": velocity, "aoa": aoa,
+                   "fluid": fluid, "cells": cells, "n_steps": n_steps, "step_path": step}
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
-            if background:
-                jid = _start_job("cfd_flow", _solve, progress=prog)
-                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
-                               "note": "solving on a worker thread — poll get_job(job_id)",
-                               "next_actions": [f"get_job('{jid}')"]})
-            return _dumps(_solve_sync_or_handoff("cfd_flow", _solve, progress=prog))
+            return _dumps(_run_solve(
+                "cfd_flow", "core_rpc",
+                {"method": "sim_run_flow", "open_step": step,
+                 # Live-progress side-channel: the engine writes {pct, step, n_steps} into
+                 # the job's own spool as the LBM iterates, and the worker folds it into the
+                 # partial snapshot get_job/sim_status report.
+                 "progress_file": simjobs.PROGRESS_TOKEN,
+                 "params": {"velocity": velocity, "aoa": aoa, "fluid": fluid,
+                            "cells": cells, "n_steps": n_steps,
+                            "progress_path": simjobs.PROGRESS_TOKEN}},
+                _job_meta(ctx, []), background=background, doc_id=d))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -1992,9 +2236,12 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         snappyHexMesh with boundary layers and solves to convergence, so it takes MINUTES and
         requires OpenFOAM installed — detected automatically on Linux (sourced env / system install /
         user-space conda env / CHUDWARE_OPENFOAM root), native Windows blueCFD, or WSL openfoam2412.
-        All OpenFOAM invocations are subprocesses (GPL isolation — never linked). It ALWAYS runs in
-        the background: returns a job_id immediately; poll get_job(job_id) (which reports live
-        meshing/solve progress) for the result.
+        All OpenFOAM invocations are subprocesses (GPL isolation — never linked), and they run
+        inside the JOB's process group, so they always run in the background: this returns a
+        job_id immediately; poll get_job(job_id) (which reports live meshing/solve progress)
+        for the result. The job is persisted on disk — it survives an MCP restart and can be
+        collected in a later turn — and sim_cancel(job_id) terminates the mesher and solver
+        for real instead of leaving them burning a core.
 
         CONVENTIONS match run_cfd_flow (Z-up): freestream +X, lift +Z, +aoa pitches nose up.
         velocity : m/s.   aoa : degrees.   fluid : "air" | "water".
@@ -2015,7 +2262,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 raise ValueError(f"fluid must be 'air' or 'water', got {fluid!r}; refusing "
                                  "to silently use air.")
             preset = str(preset).strip().lower()
-            if preset not in ("coarse", "medium", "fine", "xfine"):
+            if preset not in simjobs.FOAM_PRESETS:
                 return _dumps({"ok": False, "error": f"unknown preset {preset!r} — use "
                                "coarse|medium|fine|xfine"})
             from services.sim.foam_runner import capabilities
@@ -2038,66 +2285,21 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             cb.call("export_file", {"doc_id": d, "path": stl, "format": "stl"})
             fluid_dict = ({"nu": 1.0e-6, "rho": 1000.0} if fluid == "water"
                           else {"nu": 1.5e-5, "rho": 1.225})
-
-            prog: dict = {"pct": 0, "stage": "start", "text": "queued"}
-
-            def _on_progress(ev: dict) -> None:
-                prog.update(pct=ev.get("pct", 0), stage=ev.get("stage", ""),
-                            text=ev.get("text", ""))
-
-            def _solve() -> dict:
-                from services.sim.openfoam import run_openfoam_tunnel
-                r = run_openfoam_tunnel(stl, direction=(1.0, 0.0, 0.0),
-                                        speed_mps=float(velocity), preset=preset,
-                                        aoa_deg=float(aoa), fluid=fluid_dict,
-                                        on_progress=_on_progress)
-                values = {
-                    "cd": _finite_float(r.cd, "OpenFOAM cd"),
-                    "cl": _finite_float(r.cl, "OpenFOAM cl"),
-                    "ld": _finite_float(r.ld, "OpenFOAM lift/drag"),
-                    "drag_n": _finite_float(r.drag_n, "OpenFOAM drag_n"),
-                    "lift_n": _finite_float(r.lift_n, "OpenFOAM lift_n"),
-                    "side_n": _finite_float(r.side_n, "OpenFOAM side_n"),
-                    "reynolds": _finite_float(r.reynolds, "OpenFOAM reynolds"),
-                    "ref_area_mm2": _finite_float(r.ref_area_mm2, "OpenFOAM ref_area_mm2"),
-                    "vmax_mps": _finite_float(r.vmax_mps, "OpenFOAM vmax_mps"),
-                }
-                if (values["drag_n"] <= 0.0 or values["cd"] <= 0.0
-                        or values["reynolds"] <= 0.0 or values["ref_area_mm2"] <= 0.0
-                        or values["vmax_mps"] <= 0.0):
-                    return {"ok": False, "doc_id": d, "converged": False,
-                            "error": "OpenFOAM returned a degenerate zero/negative drag, "
-                                     "coefficient, Reynolds number, reference area, or velocity; "
-                                     "no aerodynamic result is reportable."}
-                out = {"ok": not r.diverged, "doc_id": d,
-                       "solver": f"OpenFOAM RANS (k-omega SST, {caps.get('openfoam_kind')})",
-                       "preset": preset, **values, "converged": (not r.diverged),
-                       "iters": _positive_int(r.steps_run, "OpenFOAM iterations"),
-                       "notes": r.solver_notes, "velocity_ms": velocity,
-                       "aoa_deg": aoa, "fluid": fluid}
-                if r.diverged:
-                    out["error"] = ("OpenFOAM diverged; the diagnostic fields are retained "
-                                    "but must not be used as converged coefficients.")
-                    out["next_actions"] = ["retry with preset='medium' or lower velocity"]
-                    return out
-                sid = _persist_study(d, {
-                    "type": "cfd_openfoam",
-                    "name": f"OpenFOAM wind tunnel ({fluid}, {velocity} m/s, aoa {aoa})",
-                    "engine": "openfoam",
-                    "params": {"velocity": velocity, "aoa": aoa, "fluid": fluid,
-                               "preset": preset},
-                    "results": {k: v for k, v in out.items()
-                                if k not in ("ok", "doc_id")}})
-                out["saved_to_study"] = bool(sid)
-                return out
-
+            ctx = {"analysis": "cfd_openfoam", "doc": d, "velocity": velocity, "aoa": aoa,
+                   "fluid": fluid, "preset": preset, "stl_path": stl,
+                   "openfoam_kind": caps.get("openfoam_kind")}
             _autosave_all_open()
-            jid = _start_job("cfd_openfoam", _solve, progress=prog)
-            return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
-                           "solver": caps.get("openfoam_version"), "preset": preset,
-                           "note": "OpenFOAM RANS runs for minutes — poll get_job(job_id); it "
-                                   "reports live meshing/solve progress.",
-                           "next_actions": [f"get_job('{jid}')"]})
+            job = simjobs.start("cfd_openfoam", "openfoam_tunnel",
+                                {"stl_path": stl, "speed_mps": velocity, "aoa_deg": aoa,
+                                 "preset": preset, "fluid": fluid_dict},
+                                _job_meta(ctx, []))
+            out = _started(job, d)
+            out.update(solver=caps.get("openfoam_version"), preset=preset)
+            out["note"] = ("OpenFOAM RANS runs for minutes — it solves in a SEPARATE PROCESS "
+                           f"and reports live meshing/solve progress. Poll get_job('"
+                           f"{job['job_id']}'); the job is persisted, so it survives an MCP "
+                           f"restart, and sim_cancel('{job['job_id']}') really stops it.")
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -2258,52 +2460,29 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                      "loads": load_specs, "mesh_order": 2, "fineness": mesh_fineness,
                      "mesher_backend": mesher_backend, "fatigue": fat}
 
-            def _solve() -> dict:
-                try:
-                    res = cb.call("sim_run_fatigue", {"study": study})
-                except CoreError as ce:
-                    if "unknown method" in str(ce):
-                        return {"ok": False, "skipped": True, "doc_id": d,
-                                "backend": "cpp fea",
-                                "reason": "the C++ FEA solver backend (sim_run_fatigue) is not "
-                                          "available in this build (mesher not compiled). Fatigue "
-                                          "reuses the static stress field — it needs the same FEA "
-                                          "backend as run_fea_static."}
-                    raise
-                if not res.get("ok"):
-                    return {"ok": False, "doc_id": d,
-                            "error": res.get("error", "fatigue solve failed")}
-                theories = res.get("summary", {}).get("theories", {})
-                if not isinstance(theories, dict) or not theories:
-                    return {"ok": False, "doc_id": d, "error":
-                            "fatigue solver returned no mean-stress theory results; no life "
-                            "or safety factor can be reported."}
-                if theory not in theories:
-                    return {"ok": False, "doc_id": d, "error":
-                            f"fatigue solver did not return the requested {theory!r} theory "
-                            f"(available: {sorted(theories)})."}
-                life = fa.fatigue_summarize(theories, corr["se_corrected_mpa"], Sut,
-                                            theory=theory)
-                life.update({"ok": True, "doc_id": d, "marin": corr,
-                             "material": mat.get("name", material)})
-                sid = _persist_study(d, {
-                    "type": "fea_fatigue",
-                    "name": f"Fatigue ({mat.get('name', material)}, {theory})",
-                    "engine": "cpp",
-                    "material": mat, "fixtures": fixtures, "loads": loads,
-                    "results": {"theories": life["theories"], "regime": life["regime"],
-                                "cycles": life["cycles"], "fos_endurance": life["fos_endurance"]},
-                })
-                life["saved_to_study"] = bool(sid)
-                return _interpreted(life, bc_notes)
-
+            ctx = {"analysis": "fea_fatigue", "doc": d, "material": mat,
+                   "material_arg": material, "fixtures": fixtures, "loads": loads,
+                   "mesh_fineness": mesh_fineness, "mesher_backend": mesher_backend,
+                   "step_path": step, "theory": theory, "marin": corr,
+                   "ultimate_mpa": Sut, "load_type": load_type}
             _autosave_all_open()
-            if background:
-                jid = _start_job("fea_fatigue", _solve)
-                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
-                               "note": "solving on a worker thread — poll get_job(job_id)",
-                               "next_actions": [f"get_job('{jid}')"]})
-            return _dumps(_solve_sync_or_handoff("fea_fatigue", _solve))
+            try:
+                return _dumps(_run_solve(
+                    "fea_fatigue", "core_rpc",
+                    {"method": "sim_run_fatigue", "params": {"study": study}},
+                    _job_meta(ctx, bc_notes), background=background, doc_id=d))
+            except ValueError as ve:
+                # The registry probes the solver before it queues anything, so an absent
+                # backend refuses the START rather than producing a job that can only fail.
+                # Same honest degrade the synchronous path always reported.
+                if not _backend_missing(ve, "sim_run_fatigue"):
+                    raise
+                return _dumps({"ok": False, "skipped": True, "doc_id": d,
+                               "backend": "cpp fea",
+                               "reason": "the C++ FEA solver backend (sim_run_fatigue) is not "
+                                         "available in this build (mesher not compiled). "
+                                         "Fatigue reuses the static stress field — it needs "
+                                         "the same FEA backend as run_fea_static."})
         except _StudyRefusal as r:
             return _dumps(r.payload)
         except CoreError as e:
@@ -2329,6 +2508,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         specific_heat_j_kgk: Optional[float] = None,
                         mesh_fineness: Union[float, str] = 0.5,
                         mesher_backend: str = "netgen",
+                        learned_advisor: bool = False, advisor_max_dof: int = 0,
                         doc_id: Optional[str] = None) -> str:
         """Thermal (heat-conduction) FEA — steady-state via CalculiX, TRANSIENT via the
         C++ core solver on the real part mesh.
@@ -2371,6 +2551,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                             (falls back to a typical value for the named material).
         mesher_backend : "netgen" (default) or "polymesh"; it applies to the transient
                          real-mesh path and invalid values are always refused.
+        learned_advisor : default-off PolyMesh mesh advice for the transient real-mesh
+                          route only; it requires mesher_backend="polymesh" and does not
+                          promote the static-trained model as a thermal optimizer.
+        advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
         """
         try:
             bc_notes: list = []
@@ -2386,6 +2570,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             cold_faces = _norm_bc_list(cold_faces, "cold_faces", notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
             mesher_backend = _norm_mesher_backend(mesher_backend)
+            advisor = _advisor_params(
+                mesher_backend, learned_advisor, advisor_max_dof)
+            if learned_advisor and transient is None:
+                raise ValueError(
+                    "learned_advisor is available only on the transient real-mesh "
+                    "thermal route; the steady route is a CalculiX box proxy and "
+                    "does not run the selected mesher.")
             material = coerce_json_or_repr(material)
             if conductivity_w_mk is not None:
                 conductivity_w_mk = _finite_float(
@@ -2515,6 +2706,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                        "t_init_c": t_init,
                                        "frame_times_s": frame_times,
                                        "capacitance": capacitance}}
+                study.update(advisor)
                 res = cb.call("sim_run_thermal", {"study": study})
                 if not res.get("ok"):
                     return _dumps({"ok": False, "doc_id": d,
@@ -2541,11 +2733,18 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                        "note": "summary.max_temp_c is the PEAK over the whole run "
                                "(max-temp envelope), at summary.max_temp_time_s; "
                                "per-frame nodal fields persisted in the doc study."}
+                advisor_record = (
+                    {"advisor": res["advisor"]}
+                    if isinstance(res.get("advisor"), dict) else {})
+                out.update(advisor_record)
                 sid = _persist_study(d, {"type": "fea_thermal_transient",
                                          "name": f"Transient thermal ({mat.get('name', material)})",
                                          "engine": "cpp",
                                          "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
                                          "transient": study["transient"],
+                                         "mesher_backend": mesher_backend,
+                                         **advisor,
+                                         **advisor_record,
                                          "results": {"summary": summary,
                                                      "frames": frames,
                                                      "envelope_max": checked["envelope_max"]}})

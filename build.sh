@@ -26,10 +26,11 @@
 #                          ~/chudware-web/app/. Requires emsdk (~/.emsdk).
 #                          Linux-only (GNU sed / sha1sum).
 #    ./build.sh stage      Deploy the built engine (libchudware.$SHLIB_EXT + Netgen/lib3mf
-#                          sibling shared libs) AND the chudware-hostd daemon from
-#                          core/build-occt-$PLATFORM_SUFFIX/bin into services/dist/Chudware/
-#                          — the dist dir core_bridge/daemon_bridge resolve
-#                          first. This replaces the old doc'd manual cp+mv;
+#                          sibling shared libs + the mesh-advisor ONNX Runtime and model
+#                          package when the engine links them) AND the chudware-hostd
+#                          daemon from core/build-occt-$PLATFORM_SUFFIX/bin into
+#                          services/dist/Chudware/ — the dist dir core_bridge/daemon_bridge
+#                          resolve first. This replaces the old doc'd manual cp+mv;
 #                          both binaries MUST come from the same build tree or
 #                          clients compute different hostd instance keys.
 #    ./build.sh clean      Wipe host/build-$PLATFORM_SUFFIX (core kept — OCCT is
@@ -392,6 +393,152 @@ build_daemon() {
     stage_libchudware_next_to_host
 }
 
+# Advisor closure of an already-located engine: the ONNX Runtime that engine links plus the
+# exact four artifacts pm::advisor::Advisor opens.
+#
+# core/sim/polymesh_backend.cpp resolves the model package relative to the ENGINE's OWN
+# module directory, so every directory this script copies the engine into needs the package
+# too. Copying the engine alone is the silent failure this exists to prevent: the advisor
+# finds no package, reports itself unavailable, and every study quietly falls back to the
+# heuristic mesher choice while the engine beside it looks perfectly current.
+#
+# Only those four files are copied. The rest of the model's bench/advisor directory is
+# campaign evidence — the cross-validation dumps alone are ~90 MB — with no runtime role.
+#
+# An engine configured without the advisor links no ONNX Runtime, so this is a no-op for it
+# and slim builds keep staging exactly as before. An engine that DOES link it but has no
+# complete package beside it is a hard failure: better a refused stage than a dead optimizer.
+ADVISOR_PACKAGE_DIR="polymesh-advisor"
+ADVISOR_REQUIRED_FILES="model.onnx normalization.json clamps.json ood.json"
+
+# The platform tool that can read a native module's recorded shared-library
+# dependencies, and how to get it when it is absent.
+engine_inspect_tool() {
+    case "$PLATFORM_SUFFIX" in
+        macos*) echo otool ;;
+        *)      echo readelf ;;
+    esac
+}
+engine_inspect_tool_hint() {
+    case "$PLATFORM_SUFFIX" in
+        macos*) echo "install the Xcode command line tools: xcode-select --install" ;;
+        *)      echo "install binutils (Fedora: dnf install binutils, Debian: apt install binutils)" ;;
+    esac
+}
+
+# Every shared library the engine records, one raw dependency token per line
+# (DT_NEEDED SONAMEs on ELF, load-command paths on Mach-O). A linked native
+# module ALWAYS records at least libc / libSystem, so an empty list means the
+# tool did not read a real module — not that the module needs nothing.
+engine_recorded_deps() {
+    case "$PLATFORM_SUFFIX" in
+        macos*)
+            # otool -L: line 1 is the file name, every later line is a load command
+            # ("\t/path/to/lib.dylib (compatibility version ..., current version ...)").
+            otool -L "$1" | awk 'NR>1 && /\(compatibility version /{print $1}'
+            ;;
+        *)
+            readelf -d "$1" | sed -n 's/.*(NEEDED).*\[\([^]]*\)\].*/\1/p'
+            ;;
+    esac
+}
+
+# Runtime names the engine itself records (SONAME on ELF, load-command basename on
+# Mach-O), one per line. Empty output means "this engine has no advisor" — and it
+# means ONLY that, because this decides whether the advisor payload ships and so it
+# FAILS CLOSED. A missing readelf/otool, an unreadable path, a non-native file, or a
+# tool error all return non-zero instead of the empty output they used to produce,
+# which was indistinguishable from an advisor-off build: the stage then shipped an
+# advisor-LINKED engine with no ONNX Runtime and no model package beside it, i.e. a
+# permanently dead optimizer that silently falls back to the heuristic mesher choice
+# on every study while the staged engine looks perfectly current.
+engine_onnxruntime_names() {
+    local engine="$1" tool deps
+    tool="$(engine_inspect_tool)"
+    if [ ! -f "$engine" ] || [ ! -r "$engine" ]; then
+        echo "[stage] ERROR: $engine is not a readable regular file, so its ONNX Runtime" >&2
+        echo "[stage]        linkage cannot be read. Refusing to guess whether the mesh" >&2
+        echo "[stage]        advisor ships. Build the engine first: ./build.sh core" >&2
+        return 1
+    fi
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "[stage] ERROR: $tool is required to read what the engine links and decide" >&2
+        echo "[stage]        whether the mesh advisor payload ships with it. Without it a" >&2
+        echo "[stage]        staged advisor-enabled engine would be left with no runtime and" >&2
+        echo "[stage]        no model package — a dead optimizer. Fix and re-run this stage:" >&2
+        echo "[stage]        $(engine_inspect_tool_hint)" >&2
+        return 1
+    fi
+    if ! deps="$(engine_recorded_deps "$engine")"; then
+        echo "[stage] ERROR: $tool could not read $engine (its own error is above)." >&2
+        echo "[stage]        A stage cannot tell an advisor-off engine from an advisor-on one" >&2
+        echo "[stage]        it failed to inspect, so this is a hard failure. Rebuild the" >&2
+        echo "[stage]        engine: ./build.sh core" >&2
+        return 1
+    fi
+    if [ -z "$deps" ]; then
+        echo "[stage] ERROR: $tool read $engine but found no recorded shared-library" >&2
+        echo "[stage]        dependencies at all. Every linked native module records at" >&2
+        echo "[stage]        least the C runtime, so this file is not a usable engine and" >&2
+        echo "[stage]        its advisor linkage is unknown. Rebuild it: ./build.sh core" >&2
+        return 1
+    fi
+    # Inspection succeeded on a real module: no onnxruntime among its dependencies is
+    # the genuine advisor-off answer, and prints nothing.
+    printf '%s\n' "$deps" | awk -F/ '/onnxruntime/{print $NF}' | sort -u
+}
+
+stage_advisor_beside_engine() {
+    local engine="$1" dst_dir="$2" src_dir names f name candidate found tmp
+    src_dir="$(dirname "$engine")"
+    # Inspection failure is a stage failure: the `|| true` this replaces turned a
+    # missing readelf/otool or an unreadable engine into "no advisor to stage".
+    if ! names="$(engine_onnxruntime_names "$engine")"; then
+        echo "[stage]        (refusing to stage $engine with its advisor state unknown)" >&2
+        return 1
+    fi
+    # Inspected clean and links no ONNX Runtime: a real advisor-off engine, nothing to add.
+    [ -n "$names" ] || return 0
+    for f in $ADVISOR_REQUIRED_FILES; do
+        if [ ! -f "$src_dir/$ADVISOR_PACKAGE_DIR/$f" ]; then
+            echo "[stage] ERROR: $engine links the ONNX Runtime but its advisor package is"
+            echo "[stage]        incomplete: $src_dir/$ADVISOR_PACKAGE_DIR/$f is missing."
+            echo "[stage]        Refusing to stage an engine whose mesh advisor can never load"
+            echo "[stage]        (it would silently fall back on every study). Rebuild the"
+            echo "[stage]        engine so CMake stages the package: ./build.sh core"
+            return 1
+        fi
+    done
+    # One ONNX Runtime per name the engine records, under that exact name: the build tree
+    # keeps libonnxruntime.$SHLIB_EXT plus versioned links while the engine records the
+    # SONAME, and the copy has to be the name the loader will actually look for.
+    for name in $names; do
+        found=""
+        for candidate in "$src_dir/$name" "$src_dir/libonnxruntime.$SHLIB_EXT"; do
+            if [ -f "$candidate" ]; then
+                found="$candidate"
+                break
+            fi
+        done
+        if [ -z "$found" ]; then
+            echo "[stage] ERROR: $engine needs $name but no ONNX Runtime sits beside it in"
+            echo "[stage]        $src_dir. Rebuild the engine: ./build.sh core"
+            return 1
+        fi
+        tmp="$dst_dir/.$name.staging.$$"
+        cp -L "$found" "$tmp"
+        mv -f "$tmp" "$dst_dir/$name"   # atomic rename: safe under a live engine
+        echo "[stage] $name -> $dst_dir/"
+    done
+    mkdir -p "$dst_dir/$ADVISOR_PACKAGE_DIR"
+    for f in $ADVISOR_REQUIRED_FILES; do
+        tmp="$dst_dir/$ADVISOR_PACKAGE_DIR/.$f.staging.$$"
+        cp -L "$src_dir/$ADVISOR_PACKAGE_DIR/$f" "$tmp"
+        mv -f "$tmp" "$dst_dir/$ADVISOR_PACKAGE_DIR/$f"
+    done
+    echo "[stage] $ADVISOR_PACKAGE_DIR/ (4 advisor artifacts) -> $dst_dir/"
+}
+
 # Copy the full-engine engine library next to $HOST_BUILD/bin/chudware so the
 # running GUI's in-process cpp_core (resolve tier 3: next to executable) picks up
 # the latest engine. Without this, ./build.sh core/daemon updates trees the host
@@ -411,6 +558,10 @@ stage_libchudware_next_to_host() {
         cp "$src" "$tmp"
         mv -f "$tmp" "$dst_dir/$LIBCHUDWARE"
         echo "[stage] $LIBCHUDWARE -> $dst_dir/ (host in-process engine)"
+        # The GUI loads this copy in-process, so its advisor package has to be here too —
+        # the engine resolves the package next to ITSELF, not next to the build tree it
+        # came from.
+        stage_advisor_beside_engine "$src" "$dst_dir" || return 1
     fi
 }
 
@@ -477,6 +628,7 @@ stage_dist() {
         echo "[stage] $f -> $dst/"
     done
     echo "[stage] staged $staged file(s) from $src"
+    stage_advisor_beside_engine "$src/$LIBCHUDWARE" "$dst" || return 1
     stage_libchudware_next_to_host
 }
 

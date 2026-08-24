@@ -66,8 +66,19 @@ def freq_tool(monkeypatch):
                         lambda d, q: [{"points": [[0.0, 0.0, 0.0]], "tol_mm": 1.0}])
     monkeypatch.setattr(cad_sim_tools, "_autosave_all_open", lambda: None)
     monkeypatch.setattr(cad_sim_tools, "_persist_study", lambda d, rec: "study1")
-    monkeypatch.setattr(cad_sim_tools, "_solve_sync_or_handoff",
-                        lambda kind, fn, *a, **kw: fn())
+
+    def _inline_solve(kind, stage, payload, meta, *, background=False, doc_id=None):
+        """Run SOLVE + COLLECT in-process against the fake bridge.
+
+        The tool now hands its solve to the durable registry, which runs the stage in a
+        CHILD process with a real engine — unreachable from a mocked bridge. Driving the
+        very same stage function and the very same collector here keeps the test exercising
+        production code on both sides of that boundary instead of a parallel path.
+        """
+        raw = cad_sim_tools.simjobs.STAGES[stage](payload, lambda snapshot: None)
+        return cad_sim_tools._JOB_COLLECTORS[kind]({"kind": kind, "meta": meta}, raw)
+
+    monkeypatch.setattr(cad_sim_tools, "_run_solve", _inline_solve)
 
     mcp = FastMCP("test-vibration")
     cad_tools.register_cad_tools(mcp)

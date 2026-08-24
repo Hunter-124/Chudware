@@ -18,6 +18,7 @@ from .cad_common import (
     _DOC_ALIASES,
     _JOBS,
     _JOB_LOCK,
+    _DURABLE_JOB_PREFIX,
     _LAST_DELIVER_REV,
     _LAST_VOLUME,
     _SID_RE,
@@ -37,6 +38,7 @@ from .cad_common import (
     _resolve_appearance,
     _sanitize_output_path,
     _sid_match,
+    durable_job_snapshot,
     _solve_sync_or_handoff,
     _start_job,
     _strip_version_suffix,
@@ -7812,11 +7814,18 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         Polling a long solve this way never trips the per-call transport timeout that would
         otherwise drop the whole session.
         """
+        # The process-local mapping lookup is the only work allowed under _JOB_LOCK.
+        # Durable lookup can touch SQLite; a DONE snapshot can additionally wait for a
+        # cross-process collect claim, call the engine, and persist a study.
         with _JOB_LOCK:
-            job = _JOBS.get(job_id)
-            if job is None:
-                return _dumps({"ok": False, "error": f"unknown job_id {job_id!r}"})
-            snap = dict(job)
+            thread_job = _JOBS.get(job_id)
+            snap = dict(thread_job) if thread_job is not None else None
+        if snap is None and isinstance(job_id, str) and job_id.startswith(
+                _DURABLE_JOB_PREFIX):
+            durable_job = durable_job_snapshot(job_id)
+            snap = dict(durable_job) if durable_job is not None else None
+        if snap is None:
+            return _dumps({"ok": False, "error": f"unknown job_id {job_id!r}"})
         out = {"ok": True, "job_id": job_id, "status": snap["status"], "kind": snap["kind"]}
         if snap["status"] == "running" and snap.get("progress"):
             progress = dict(snap["progress"])  # live {pct, stage, text} for long OpenFOAM runs

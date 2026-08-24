@@ -1090,3 +1090,408 @@ def test_swapping_steel_for_aluminium_changes_the_stiffness_it_solved_with(bc_do
     assert 2.4 < ratio < 3.4, (ratio, steel["summary"], alu["summary"])
     assert alu["summary"]["max_von_mises_mpa"] == pytest.approx(
         steel["summary"]["max_von_mises_mpa"], rel=0.05)
+
+
+# ===================================================== durable (out-of-process) solve jobs
+# Every heavy run_fea_* / run_cfd_* path now runs its SOLVE in a child process tracked by
+# the SQLite registry in services/sim/jobs.py. These tests are engine-free on purpose: what
+# they pin is the CONTRACT between the three stages — the payload the child receives, the
+# job id the agent is handed, and the fact that collect (which writes a study into the
+# document) runs exactly once no matter how many times, or from how many processes, a
+# finished job is polled.
+
+import uuid  # noqa: E402
+
+from services.mcp import cad_common  # noqa: E402
+from services.mcp import cad_doc_tools  # noqa: E402
+from services.sim import jobs as simjobs  # noqa: E402
+
+
+@pytest.fixture()
+def registry(tmp_path, monkeypatch):
+    """An isolated job spool, so a test can never see (or prune) a real solve."""
+    monkeypatch.setenv("CHUDWARE_SIM_JOBS_DIR", str(tmp_path / "sim_jobs"))
+    simjobs._LOCAL_PROCS.clear()
+    return tmp_path
+
+
+@pytest.fixture()
+def started(monkeypatch):
+    """Capture what would have been spawned instead of spawning it."""
+    seen: list = []
+
+    def fake_start(kind, stage, payload, meta=None):
+        seen.append({"kind": kind, "stage": stage, "payload": payload, "meta": meta or {}})
+        return {"job_id": f"sim-{len(seen):012x}", "state": "running", "pid": 4242,
+                "kind": kind, "stage": stage, "started_at": 0.0}
+
+    monkeypatch.setattr(simjobs, "start", fake_start)
+    return seen
+
+
+@pytest.fixture()
+def tools():
+    from mcp.server.fastmcp import FastMCP  # noqa: PLC0415
+    mcp = FastMCP("test-durable-sim")
+    sim_tools.register_cad_sim_tools(mcp)
+    return {name: tool.fn for name, tool in mcp._tool_manager._tools.items()}
+
+
+@pytest.fixture()
+def get_job_tool():
+    from mcp.server.fastmcp import FastMCP  # noqa: PLC0415
+    mcp = FastMCP("test-durable-get-job")
+    cad_doc_tools.register_cad_doc_tools(mcp)
+    return mcp._tool_manager._tools["get_job"].fn
+
+
+_MATERIAL = {"name": "Steel", "E_mpa": 200000.0, "nu": 0.29,
+             "density_g_cm3": 7.85, "yield_mpa": 250.0, "ultimate_mpa": 400.0}
+
+
+def _static_ctx(tmp_path) -> dict:
+    step = tmp_path / "part.step"
+    step.write_text("ISO-10303-21;", encoding="utf-8")
+    return {"analysis": "fea_static", "doc": "doc-1", "material": _MATERIAL,
+            "material_arg": "steel", "fixtures": ["bottom"],
+            "loads": [{"face": "top", "force": [0.0, 0.0, -200.0]}],
+            "mesh_fineness": 0.5, "mesher_backend": "netgen", "step_path": str(step),
+            "study": {"step_path": str(step), "material": _MATERIAL,
+                      "fixtures": [{"nodes": [0, 1, 2]}], "mesh_order": 2, "fineness": 0.5,
+                      "mesher_backend": "netgen",
+                      "loads": [{"type": "force", "vector": [0.0, 0.0, -200.0],
+                                 "faces": [{"nodes": [3, 4, 5]}]}]}}
+
+
+def test_background_static_hands_back_a_durable_job_not_a_thread(
+        tmp_path, monkeypatch, registry, started, tools):
+    """The whole point of the move: the id the agent gets back names a CHILD PROCESS in an
+    on-disk registry, so it is still meaningful after this server is gone."""
+    ctx = _static_ctx(tmp_path)
+    monkeypatch.setattr(sim_tools, "_build_static_study",
+                        lambda *a, **kw: ctx)
+    monkeypatch.setattr(sim_tools, "_autosave_all_open", lambda: None)
+    out = json.loads(tools["run_fea_static"](fixtures=["bottom"], loads=[], background=True))
+    assert out["ok"] and out["status"] == "running" and out["doc_id"] == "doc-1", out
+    assert out["job_id"].startswith("sim-"), out
+    assert out["cancel_supported"] is True, out
+    assert f"sim_cancel('{out['job_id']}')" in out["next_actions"], out
+    assert "survives an MCP restart" in out["note"], out
+
+    job = started[0]
+    assert (job["kind"], job["stage"]) == ("fea_static", "core_rpc"), job
+    assert job["payload"]["method"] == "sim_run_static", job
+    # The payload references only files on disk — nothing in it points back at this process.
+    assert job["payload"]["params"]["study"]["step_path"] == ctx["step_path"]
+    # The COLLECT stage's whole context travels with the job, minus the bulky study.
+    assert "study" not in job["meta"] and job["meta"]["doc"] == "doc-1", job["meta"]
+    assert job["meta"]["material"] == _MATERIAL and job["meta"]["notes"] == []
+
+
+def test_adaptive_sync_metadata_overrides_the_static_setup_analysis(
+        tmp_path, monkeypatch, registry, tools):
+    """Both the immediate wait and a later reconnect select collectors from job metadata."""
+    base = _static_ctx(tmp_path)
+    monkeypatch.setattr(sim_tools, "_build_static_study",
+                        lambda *a, **kw: dict(base))
+    ctx = sim_tools._build_adaptive_study(
+        ["bottom"], [{"face": "top", "force": [0.0, 0.0, -200.0]}], "steel", 0.5,
+        3, 0.05, False, 0, "doc-1", [])
+    assert ctx["analysis"] == "fea_adaptive"
+    assert ctx["study"]["adapt"] == {"max_passes": 3, "eta_target": 0.05}
+
+    captured: dict = {}
+
+    def fake_sync(kind, stage, payload, meta):
+        captured.update(kind=kind, stage=stage, payload=payload, meta=meta)
+        return {"ok": True, "collector_probe": True}
+
+    monkeypatch.setattr(sim_tools, "_build_adaptive_study", lambda *a, **kw: ctx)
+    monkeypatch.setattr(sim_tools, "_autosave_all_open", lambda: None)
+    monkeypatch.setattr(sim_tools, "solve_durable_or_handoff", fake_sync)
+    out = json.loads(tools["run_fea_adaptive"](
+        fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -200]}]))
+    assert out["ok"] and out["collector_probe"], out
+    assert (captured["kind"], captured["stage"]) == ("fea_adaptive", "core_rpc")
+    assert captured["meta"]["analysis"] == "fea_adaptive"
+    assert captured["payload"]["method"] == "sim_run_adaptive"
+
+
+def test_modal_widening_lives_in_the_stage_so_both_paths_solve_the_same_physics(
+        tmp_path, monkeypatch, registry, started, tools):
+    """A free-free part's 0 Hz cluster is six-fold degenerate and the tool has always
+    widened the subspace and re-solved. run_fea_modal and sim_run must hand the child the
+    SAME instruction, or the async answer is a second, weaker physics."""
+    step = tmp_path / "modal.step"
+    step.write_text("ISO-10303-21;", encoding="utf-8")
+    ctx = {"analysis": "fea_modal", "doc": "doc-2", "material": _MATERIAL,
+           "material_arg": "steel", "fixtures": [], "fixture_sets": [], "free_free": True,
+           "mesh_fineness": 0.5, "mesher_backend": "netgen", "step_path": str(step),
+           "study": {"step_path": str(step), "material": _MATERIAL, "fixtures": [],
+                     "mesh_order": 2, "fineness": 0.5, "mesher_backend": "netgen"}}
+    monkeypatch.setattr(sim_tools, "_build_modal_study", lambda *a, **kw: dict(ctx))
+    monkeypatch.setattr(sim_tools, "_autosave_all_open", lambda: None)
+
+    json.loads(tools["run_fea_modal"](fixtures=[], n_modes=6, background=True))
+    json.loads(tools["sim_run"](analysis="fea_modal", fixtures=[], n_modes=6))
+    assert [j["stage"] for j in started] == ["modal_rpc", "modal_rpc"], started
+    assert started[0]["payload"] == started[1]["payload"], started
+    assert started[0]["payload"]["widen_free_free"] is True
+    assert started[0]["payload"]["solve_n"] == sim_tools._modal_solve_n(6, True)
+
+
+def test_cfd_flow_payload_carries_its_geometry_and_a_spool_relative_progress_file(
+        tmp_path, monkeypatch, registry, started, tools):
+    """sim_run_flow tessellates a DOCUMENT, and the child shares none — so the solid ships
+    as a file. Its live progress file has to live in the job's own spool: a caller-minted
+    temp path is unreachable to the later process that reconnects to the job."""
+    exported: list = []
+
+    def fake_call(method, params=None):
+        params = params or {}
+        if method == "doc_export_step":
+            exported.append(params["path"])
+            open(params["path"], "w", encoding="utf-8").write("ISO-10303-21;")
+            return {"ok": True}
+        raise AssertionError(f"unexpected engine call {method!r}")
+
+    monkeypatch.setattr(sim_tools.cb, "call", fake_call)
+    monkeypatch.setattr(sim_tools, "_doc", lambda doc_id: "doc-3")
+    monkeypatch.setattr(sim_tools, "_require_sim_geometry", lambda d: [{}])
+    monkeypatch.setattr(sim_tools, "_autosave_all_open", lambda: None)
+
+    out = json.loads(tools["run_cfd_flow"](velocity=12.0, cells=48, n_steps=800,
+                                           background=True))
+    assert out["job_id"].startswith("sim-"), out
+    job = started[0]
+    assert (job["kind"], job["stage"]) == ("cfd_flow", "core_rpc"), job
+    assert job["payload"]["method"] == "sim_run_flow"
+    assert job["payload"]["open_step"] == exported[0], job["payload"]
+    assert job["payload"]["progress_file"] == simjobs.PROGRESS_TOKEN
+    assert job["payload"]["params"]["progress_path"] == simjobs.PROGRESS_TOKEN
+    # doc_id is filled by the stage from the re-opened solid, never carried across.
+    assert "doc_id" not in job["payload"]["params"], job["payload"]
+    assert job["meta"]["velocity"] == 12.0 and job["meta"]["doc"] == "doc-3"
+
+
+def test_openfoam_runs_on_its_own_stage_so_cancel_reaches_the_mesher(
+        tmp_path, monkeypatch, registry, started, tools):
+    """OpenFOAM is minutes of subprocesses. They belong to the JOB's process group, which
+    is the only way sim_cancel stops a snappyHexMesh instead of orphaning it."""
+    def fake_call(method, params=None):
+        params = params or {}
+        if method == "export_file":
+            open(params["path"], "w", encoding="utf-8").write("solid x\nendsolid x\n")
+            return {"ok": True}
+        raise AssertionError(f"unexpected engine call {method!r}")
+
+    monkeypatch.setattr(sim_tools.cb, "call", fake_call)
+    monkeypatch.setattr(sim_tools, "_doc", lambda doc_id: "doc-4")
+    monkeypatch.setattr(sim_tools, "_require_sim_geometry", lambda d: [{}])
+    monkeypatch.setattr(sim_tools, "_autosave_all_open", lambda: None)
+    monkeypatch.setattr("services.sim.foam_runner.capabilities",
+                        lambda: {"openfoam": True, "openfoam_kind": "native",
+                                 "openfoam_version": "v2412"})
+
+    out = json.loads(tools["run_cfd_accurate"](velocity=15.0, preset="coarse"))
+    assert out["job_id"].startswith("sim-") and out["preset"] == "coarse", out
+    assert out["solver"] == "v2412", out
+    job = started[0]
+    assert (job["kind"], job["stage"]) == ("cfd_openfoam", "openfoam_tunnel"), job
+    assert job["payload"]["speed_mps"] == 15.0 and job["payload"]["preset"] == "coarse"
+    assert job["payload"]["fluid"] == {"nu": 1.5e-5, "rho": 1.225}
+    assert job["payload"]["stl_path"].endswith(".stl")
+
+
+def _finished_job(kind: str, meta: dict, raw: dict) -> str:
+    """A DONE row plus the result artifact, exactly as a finished child leaves them."""
+    job_id = "sim-" + uuid.uuid4().hex[:12]
+    directory = simjobs.job_dir(job_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "result.json").write_text(
+        json.dumps({"result": raw, "done_at": time.time()}), encoding="utf-8")
+    now = time.time()
+    with simjobs._db() as connection:
+        connection.execute(
+            "INSERT INTO jobs(job_id,kind,stage,state,pid,pgid,proc_key,created_at,"
+            "started_at,done_at,cancel_requested,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (job_id, kind, "core_rpc", simjobs.DONE, None, None, None, now, now, now,
+             0, json.dumps(meta)))
+    return job_id
+
+
+_STATIC_RAW = {"ok": True, "n_dof": 300, "n_elems": 40, "n_nodes": 100,
+               "mesh_type_used": "tet10",
+               "summary": {"max_von_mises_mpa": 12.5, "max_disp_mm": 0.04, "min_fos": 20.0}}
+
+
+def _adaptive_raw(target_met: bool) -> dict:
+    eta = 0.03 if target_met else 0.08
+    stop = "eta_target_met" if target_met else "pass_budget_exhausted"
+    return {
+        **_STATIC_RAW,
+        "adapt": {
+            "passes": [
+                {"pass": 1, "global_eta": 0.12, "n_elems": 20},
+                {"pass": 2, "global_eta": eta, "n_elems": 40},
+            ],
+            "passes_run": 2,
+            "global_eta": eta,
+            "eta_target": 0.05,
+            "eta_target_met": target_met,
+            "stop_reason": stop,
+            "mesher_backend": "polymesh",
+        },
+    }
+
+
+def test_reconnected_adaptive_job_uses_adaptive_collector_and_keeps_convergence_metadata(
+        tmp_path, monkeypatch, registry):
+    persisted: list = []
+    monkeypatch.setattr(sim_tools, "_persist_study",
+                        lambda doc, record: persisted.append(record) or "study-adaptive")
+    job_id = _finished_job(
+        "fea_adaptive",
+        {"analysis": "fea_adaptive", "doc": "doc-adaptive", "material": _MATERIAL,
+         "material_arg": "steel", "notes": []},
+        _adaptive_raw(True))
+
+    out = cad_common.collect_durable(job_id)
+    assert out["ok"] is True and out["converged"] is True, out
+    assert out["global_eta"] == 0.03 and out["eta_target"] == 0.05
+    assert out["passes_run"] == 2 and len(out["passes"]) == 2
+    assert out["stop_reason"] == "eta_target_met"
+    assert out["adapt"]["mesher_backend"] == "polymesh"
+    assert "final refined mesh" in out["resolution_note"]
+    assert len(persisted) == 1 and persisted[0]["type"] == "fea_adaptive", persisted
+    assert persisted[0]["adapt"] == out["adapt"]
+
+
+def test_adaptive_collector_refuses_missing_metadata_before_persisting(monkeypatch):
+    persisted: list = []
+    monkeypatch.setattr(sim_tools, "_persist_study",
+                        lambda doc, record: persisted.append(record) or "study-wrong")
+    st = {"meta": {"analysis": "fea_adaptive", "doc": "doc-missing",
+                   "material": _MATERIAL, "material_arg": "steel", "notes": []}}
+
+    out = sim_tools._collect_job_adaptive(st, dict(_STATIC_RAW))
+    assert out["ok"] is False and "without convergence metadata" in out["error"], out
+    assert persisted == []
+
+
+def test_unconverged_adaptive_result_is_diagnostic_failure_not_static_success(monkeypatch):
+    persisted: list = []
+    monkeypatch.setattr(sim_tools, "_persist_study",
+                        lambda doc, record: persisted.append(record) or "study-diagnostic")
+    st = {"meta": {"analysis": "fea_adaptive", "doc": "doc-under-resolved",
+                   "material": _MATERIAL, "material_arg": "steel", "notes": []}}
+
+    out = sim_tools._collect_job_adaptive(st, _adaptive_raw(False))
+    assert out["ok"] is False and out["converged"] is False, out
+    assert out["eta_target_met"] is False
+    assert out["global_eta"] == 0.08 and out["eta_target"] == 0.05
+    assert out["passes_run"] == 2 and out["stop_reason"] == "pass_budget_exhausted"
+    assert out["summary"]["max_von_mises_mpa"] == 12.5
+    assert "under-resolved" in out["resolution_note"]
+    assert "not a converged result" in out["error"]
+    assert len(persisted) == 1 and persisted[0]["type"] == "fea_adaptive", persisted
+    assert persisted[0]["converged"] is False
+
+
+def test_a_finished_job_collects_once_however_often_it_is_polled(
+        tmp_path, monkeypatch, registry):
+    """Collect appends a study record to the document. Re-running it per poll would grow
+    one study per poll in the feature tree for a single solve."""
+    persisted: list = []
+    monkeypatch.setattr(sim_tools, "_persist_study",
+                        lambda doc, record: persisted.append(record) or "study-1")
+    job_id = _finished_job("fea_static", {"analysis": "fea_static", "doc": "doc-5",
+                                          "material": _MATERIAL, "material_arg": "steel",
+                                          "notes": []}, _STATIC_RAW)
+
+    first = cad_common.collect_durable(job_id)
+    assert first["ok"] is True and first["summary"]["min_fos"] == 20.0, first
+    assert first["saved_to_study"] is True
+    for _ in range(4):
+        assert cad_common.collect_durable(job_id) == first
+    assert len(persisted) == 1, persisted
+    assert persisted[0]["type"] == "fea_static"
+
+
+def test_a_finished_job_survives_the_server_that_started_it(
+        tmp_path, monkeypatch, registry):
+    """After an MCP restart the collector registry is fresh and the document is long gone,
+    but the agent still holds the job id — so the answer has to come back off the spool."""
+    monkeypatch.setattr(sim_tools, "_persist_study", lambda doc, record: "study-1")
+    job_id = _finished_job("fea_static", {"analysis": "fea_static", "doc": "doc-6",
+                                          "material": _MATERIAL, "material_arg": "steel",
+                                          "notes": []}, _STATIC_RAW)
+    collected = cad_common.collect_durable(job_id)
+
+    # A process that has not (yet) registered any collector must still replay the envelope
+    # the winner wrote, rather than re-deriving it or reporting the job unknown.
+    monkeypatch.delitem(cad_common._DURABLE_COLLECTORS, "fea_static")
+    assert cad_common.collect_durable(job_id) == collected
+
+
+def test_get_job_collects_a_reconnected_durable_job_only_after_releasing_thread_lock(
+        tmp_path, monkeypatch, registry, get_job_tool):
+    """DONE collection may wait and persist; neither operation belongs under _JOB_LOCK."""
+    persisted: list = []
+    monkeypatch.setattr(sim_tools, "_persist_study",
+                        lambda doc, record: persisted.append(record) or "study-1")
+    job_id = _finished_job("fea_static", {"analysis": "fea_static", "doc": "doc-7",
+                                          "material": _MATERIAL, "material_arg": "steel",
+                                          "notes": []}, _STATIC_RAW)
+    real_snapshot = cad_doc_tools.durable_job_snapshot
+    snapshot_calls: list = []
+
+    def unlocked_snapshot(requested_job_id):
+        acquired = cad_common._JOB_LOCK.acquire(blocking=False)
+        assert acquired, "durable registry/collection ran while _JOB_LOCK was held"
+        cad_common._JOB_LOCK.release()
+        snapshot_calls.append(requested_job_id)
+        return real_snapshot(requested_job_id)
+
+    monkeypatch.setattr(cad_doc_tools, "durable_job_snapshot", unlocked_snapshot)
+    first = json.loads(get_job_tool(job_id=job_id))
+    assert first["status"] == "done" and first["kind"] == "fea_static", first
+    assert first["result"]["summary"]["min_fos"] == 20.0
+    assert snapshot_calls == [job_id]
+    assert persisted and len(persisted) == 1
+    assert cad_common._JOBS.get(job_id) is None
+
+    second = json.loads(get_job_tool(job_id=job_id))
+    assert second == first
+    assert snapshot_calls == [job_id, job_id]
+    assert len(persisted) == 1
+
+
+def test_get_job_keeps_short_thread_jobs_on_the_in_process_fast_path(
+        monkeypatch, get_job_tool):
+    jid = "job-thread-probe"
+    monkeypatch.setitem(cad_common._JOBS, jid, {
+        "status": "done", "kind": "short_op", "result": {"value": 7}, "error": None,
+        "progress": {}, "started_at": 1.0, "done_at": 2.0,
+    })
+    durable_calls: list = []
+    monkeypatch.setattr(
+        cad_doc_tools, "durable_job_snapshot",
+        lambda job_id: durable_calls.append(job_id) or None)
+
+    out = json.loads(get_job_tool(job_id=jid))
+    assert out == {"ok": True, "job_id": jid, "status": "done",
+                   "kind": "short_op", "result": {"value": 7}}
+    assert durable_calls == []
+
+
+def test_a_failed_durable_job_is_reported_as_an_error_not_an_empty_result(
+        tmp_path, monkeypatch, registry, get_job_tool):
+    """A worker that died must never surface as a done job with a blank answer."""
+    job_id = _finished_job("fea_static", {"analysis": "fea_static", "doc": "doc-8",
+                                          "notes": []}, _STATIC_RAW)
+    simjobs._set(job_id, state=simjobs.FAILED, error="the solver process exited")
+    snapshot = json.loads(get_job_tool(job_id=job_id))
+    assert snapshot["status"] == "error", snapshot
+    assert snapshot["error"] == "the solver process exited", snapshot
+    assert "result" not in snapshot

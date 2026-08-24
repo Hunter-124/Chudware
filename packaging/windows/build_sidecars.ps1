@@ -7,7 +7,10 @@ param(
     [string]$OutputDir,
     [string]$Python = $env:CHUDWARE_RELEASE_PYTHON,
     [string]$HostBinary = "",
-    [string]$HostdBinary = ""
+    [string]$HostdBinary = "",
+    # Engine library whose advisor closure is carried into the GUI runtime root. Defaults to
+    # the first libchudware.dll found beside the host/hostd binaries or in the core build trees.
+    [string]$EngineBinary = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -179,8 +182,100 @@ function Assert-SourceFreePayload([string]$RootPath) {
     }
 }
 
+# Learned mesh-advisor runtime (the polymesh ONNX advisor).
+#
+# core/sim/polymesh_backend.cpp resolves the model package relative to ITS OWN module —
+# libchudware.dll — and the Windows payload is flat, so the package belongs in the GUI
+# runtime root that services/installer/build_release.py copies verbatim into the payload,
+# right beside the engine. Only the four artifacts the advisor opens are carried; the rest
+# of the model's bench/advisor directory is campaign evidence (cross-validation dumps and a
+# dashboard, tens of MB) with no runtime role.
+#
+# The engine's own import table decides whether anything ships. An engine configured
+# without the advisor imports no onnxruntime.dll and needs no package, so such a build
+# stages nothing and stays valid. An advisor-linked engine whose package is incomplete would
+# ship a permanently dead optimizer that silently falls back on every study, so that case
+# fails here — before the manifest is hashed — instead of reaching a customer.
+$AdvisorPackageDir = "polymesh-advisor"
+$AdvisorRequiredFiles = @("model.onnx", "normalization.json", "clamps.json", "ood.json")
+
+function Test-ImportsOnnxRuntime([string]$Binary) {
+    # The import directory stores the DLL name as plain ASCII, so a byte scan answers "was
+    # the advisor compiled in?" without dumpbin, which would drag a Visual Studio
+    # environment into a script that otherwise needs none. ISO-8859-1 maps every byte to one
+    # char, so IndexOf over the decoded image is an exact byte search.
+    $image = [IO.File]::ReadAllText($Binary, [Text.Encoding]::GetEncoding(28591))
+    return $image.IndexOf("onnxruntime.dll", [StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+function Resolve-EngineBinary {
+    if ($EngineBinary) {
+        if (-not (Test-Path -LiteralPath $EngineBinary -PathType Leaf)) {
+            throw "engine library not found: $EngineBinary"
+        }
+        return [IO.Path]::GetFullPath($EngineBinary)
+    }
+    $candidates = @(
+        (Join-Path (Split-Path -Parent $HostBinary) "libchudware.dll"),
+        (Join-Path (Split-Path -Parent $HostdBinary) "libchudware.dll"),
+        (Join-Path $Root "build\windows-occt\bin\libchudware.dll"),
+        (Join-Path $Root "build\windows-core\bin\libchudware.dll"),
+        (Join-Path $Root "core\build\bin\Release\libchudware.dll")
+    )
+    $found = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $found) {
+        throw ("libchudware.dll not found; the Windows release payload would have no engine. Searched: " +
+            ($candidates -join "; ") + ". Build the windows-occt preset, or pass -EngineBinary.")
+    }
+    return [IO.Path]::GetFullPath($found)
+}
+
+function Stage-AdvisorRuntime([string]$Engine, [string]$RuntimeRoot) {
+    $engineDir = Split-Path -Parent $Engine
+    if (-not (Test-ImportsOnnxRuntime $Engine)) {
+        Write-Host "==> engine imports no onnxruntime.dll: mesh advisor disabled, no advisor payload to stage"
+        return
+    }
+    $ortSource = Join-Path $engineDir "onnxruntime.dll"
+    if (-not (Test-Path -LiteralPath $ortSource -PathType Leaf)) {
+        throw ("$Engine imports onnxruntime.dll but none is staged beside it in $engineDir. " +
+            "Rebuild the engine so CMake stages the ONNX Runtime; the advisor cannot load without it.")
+    }
+    $sourcePackage = Join-Path $engineDir $AdvisorPackageDir
+    foreach ($artifact in $AdvisorRequiredFiles) {
+        $path = Join-Path $sourcePackage $artifact
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw ("$Engine imports onnxruntime.dll but its advisor package is incomplete: missing $path. " +
+                "Rebuild the engine so CMake stages the advisor package; refusing to hash a payload whose optimizer is dead.")
+        }
+    }
+    $runtimeRootFull = [IO.Path]::GetFullPath($RuntimeRoot)
+    $destinationPackage = Join-Path $runtimeRootFull $AdvisorPackageDir
+    New-Item -ItemType Directory -Force -Path $destinationPackage | Out-Null
+    foreach ($artifact in $AdvisorRequiredFiles) {
+        $source = Join-Path $sourcePackage $artifact
+        $destination = Join-Path $destinationPackage $artifact
+        # The engine build tree and the GUI runtime root are the same directory in some
+        # layouts; Copy-Item onto itself is an error, and the file is already in place.
+        if ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($destination)) {
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+        }
+    }
+    $ortDestination = Join-Path $runtimeRootFull "onnxruntime.dll"
+    if ([IO.Path]::GetFullPath($ortSource) -ne [IO.Path]::GetFullPath($ortDestination)) {
+        Copy-Item -LiteralPath $ortSource -Destination $ortDestination -Force
+    }
+    Write-Host "==> staged advisor package ($($AdvisorRequiredFiles.Count) artifacts) + onnxruntime.dll into $runtimeRootFull"
+}
+
 $HostBuildDir = Get-VerifiedBinaryBuildDir $HostBinary "host GUI"
 $HostdBuildDir = Get-VerifiedBinaryBuildDir $HostdBinary "chudware-hostd"
+
+# Advisor closure first: it is a cheap check that fails packaging before the multi-minute
+# Nuitka sidecar builds, and its output must be in the runtime root before
+# services/installer/build_release.py copies that tree into the hashed payload.
+$Engine = Resolve-EngineBinary
+Stage-AdvisorRuntime $Engine (Split-Path -Parent ([IO.Path]::GetFullPath($HostBinary)))
 
 Generate-ProtectedAssets
 Build-PythonSidecar "worker_main" "chudware-worker"
@@ -192,3 +287,4 @@ Write-Host "==> built compiled release sidecars in $OutputDir"
 Write-Host "==> verified host input: $HostBinary ($HostBuildDir)"
 Write-Host "==> verified hostd input: $HostdBinary ($HostdBuildDir)"
 Write-Host "==> release compiler pins: $ReleaseRequirements"
+Write-Host "==> verified engine input: $Engine"

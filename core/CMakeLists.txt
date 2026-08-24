@@ -1222,9 +1222,70 @@ if(CHUDWARE_WITH_OCCT)
   # keeps the mesher-backend confinement intact (fea_run.h itself is nglib-free).
   # chudware_mesh gains a PUBLIC dep on chudware_sim so fea_run.cpp can call the FEA solvers.
   # Gated on CHUDWARE_WITH_NETGEN: the mesher (mesher.cpp) is the only nglib consumer.
+  # Compile the polymesh-facing backend as its own object target so polymesh's include
+  # directories are visible to exactly one translation unit. chudware_mesh receives only
+  # the object and a link-only dependency; mesher.h and every other core TU remain free of
+  # advisor/pipeline headers.
+  if(CHUDWARE_WITH_POLYMESH)
+    add_library(chudware_polymesh_backend OBJECT sim/polymesh_backend.cpp)
+    # OCCT headers: this TU takes the loaded B-rep as a TopoDS_Shape (and
+    # sim/mesh_size_band.h declares resolve_size_band over one). Nothing propagates them
+    # here — polymesh_geom keeps its own OCCT include dir SYSTEM PRIVATE, and
+    # chudware_geom_occt, whose PUBLIC includes serve every other OCCT TU in this file, is
+    # declared further down — so use the same find_package variable those targets do
+    # rather than a literal path. OCCT *symbols* need no link line here: an OBJECT library
+    # has no link step, and the chudware_mesh archive that owns these objects already links
+    # chudware_geom_occt (which carries the TK* toolkits).
+    target_include_directories(chudware_polymesh_backend PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${OpenCASCADE_INCLUDE_DIR})
+    target_compile_definitions(chudware_polymesh_backend PRIVATE CHUDWARE_WITH_POLYMESH)
+    # polymesh::pipeline is the single source of everything this TU includes for the MESHER
+    # itself: its PUBLIC geom/mesh/fea/adapt chain carries those include dirs,
+    # Eigen3::Eigen, the POLYMESH_WITH_OCC define and (when polymesh found it)
+    # OpenMP::OpenMP_CXX. PRIVATE keeps all of it on this one target.
+    #
+    # The learned advisor is a SEPARATE axis. polymesh::advisor exists only where upstream
+    # pins a prebuilt ONNX Runtime — Windows x64 and non-Apple 64-bit Unix
+    # (POLYMESH_ADVISOR_ENABLED, see cmake/ProvisionPolymesh.cmake). On macOS or any other
+    # pointer width the target is never declared, so linking it unconditionally turned
+    # "no learned advice here" into a configure failure for the whole mesher. The tet fill
+    # and the adaptive loop have no advisor dependency, so build them and say so at
+    # runtime instead.
+    if(POLYMESH_ADVISOR_ENABLED)
+      # polymesh::advisor PUBLIC-links polymesh::pipeline, so this is a superset of the
+      # advisor-off link and adds only the advisor's own include dir.
+      target_link_libraries(chudware_polymesh_backend PRIVATE polymesh::advisor)
+      # CHUDWARE_WITH_POLYMESH_ADVISOR is the one macro that admits <advisor/advisor.hpp>,
+      # pm::advisor::Advisor and the model-directory lookup into this TU. The three paths
+      # below are that lookup's inputs and mean nothing without it, so they are defined in
+      # the same branch — an advisor-less build carries no advisor artifact paths at all.
+      #
+      # Runtime resolution, not a build-machine path: the backend looks at
+      # CHUDWARE_POLYMESH_ADVISOR_DIR, then at <its own module dir>/<PACKAGE_DIR> (what
+      # chudware_polymesh_stage_runtime stages), and only then at the source checkout —
+      # which exists solely on a machine that has one. Baking the source dir in as the
+      # ONLY lookup left the advisor dead in every packaged install.
+      target_compile_definitions(chudware_polymesh_backend PRIVATE
+        CHUDWARE_WITH_POLYMESH_ADVISOR
+        "CHUDWARE_POLYMESH_ADVISOR_SOURCE_DIR=\"${POLYMESH_ADVISOR_SOURCE_DIR}\""
+        "CHUDWARE_POLYMESH_ADVISOR_PACKAGE_DIR=\"${POLYMESH_ADVISOR_PACKAGE_DIR}\""
+        "CHUDWARE_POLYMESH_MODEL_REVISION=\"${POLYMESH_MODEL_REVISION}\"")
+    else()
+      target_link_libraries(chudware_polymesh_backend PRIVATE polymesh::pipeline)
+    endif()
+    target_compile_features(chudware_polymesh_backend PRIVATE cxx_std_20)
+    set_property(TARGET chudware_polymesh_backend PROPERTY
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    set(_chudware_polymesh_backend_source
+      $<TARGET_OBJECTS:chudware_polymesh_backend>)
+  else()
+    set(_chudware_polymesh_backend_source sim/polymesh_backend.cpp)
+  endif()
   if(CHUDWARE_WITH_NETGEN)
     add_library(chudware_mesh STATIC sim/mesher.cpp sim/hex_mesher.cpp sim/fea_run.cpp
-                                     sim/fea_fatigue.cpp sim/polymesh_backend.cpp
+                                     sim/fea_fatigue.cpp
+                                     ${_chudware_polymesh_backend_source}
                                      sim/fea_adaptive.cpp)
     target_include_directories(chudware_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_include_directories(chudware_mesh PRIVATE ${NETGEN_INCLUDE_DIRS})
@@ -1235,13 +1296,29 @@ if(CHUDWARE_WITH_OCCT)
     set_property(TARGET chudware_mesh PROPERTY
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
     if(CHUDWARE_WITH_POLYMESH)
-      # polymesh headers (pipeline/scene.hpp, fea/*.hpp) are PRIVATE: only
-      # polymesh_backend.cpp includes them, and sim/polymesh_backend.h stays
-      # backend-free exactly like sim/mesher.h.
-      target_link_libraries(chudware_mesh PRIVATE polymesh::pipeline)
+      # An OBJECT library has no link step, so the polymesh symbols those objects
+      # reference resolve on every consumer's link line — hence a LINK_ONLY dependency
+      # here (this archive itself compiles no polymesh header). Same pair of targets the
+      # object library picked: the advisor superset where it exists, the pipeline chain
+      # the mesher always needs otherwise.
+      if(POLYMESH_ADVISOR_ENABLED)
+        # ${CMAKE_DL_LIBS}: only the advisor path locates its staged model package beside
+        # its own module with dladdr, which lives in libdl on glibc < 2.34 (empty string
+        # on newer glibc and on Windows). A STATIC library's PRIVATE deps still reach
+        # every consumer's link line, so this covers libchudware and the tests.
+        target_link_libraries(chudware_mesh PRIVATE
+          "$<LINK_ONLY:polymesh::advisor>" ${CMAKE_DL_LIBS})
+      else()
+        target_link_libraries(chudware_mesh PRIVATE "$<LINK_ONLY:polymesh::pipeline>")
+      endif()
+      # sim/fea_adaptive.cpp is compiled HERE, not in the object target, and #ifdefs its
+      # entire real path on CHUDWARE_WITH_POLYMESH — without the define an ENABLED build
+      # answers every adaptive study with "this build was configured without polymesh".
+      # It costs this archive no polymesh headers: the PolymeshAdaptiveMesher it drives is
+      # declared in the advisor-free sim/polymesh_backend.h and defined (PImpl) in the
+      # object target. PRIVATE — no consumer of chudware_mesh reads the macro.
       target_compile_definitions(chudware_mesh PRIVATE CHUDWARE_WITH_POLYMESH)
-      # polymesh is C++20 (std::format, concepts, std::span); core/ is C++17.
-      target_compile_features(chudware_mesh PRIVATE cxx_std_20)
+      # Only chudware_polymesh_backend opts into polymesh's C++20 language level.
     endif()
   endif()
   # Smoke test: box -> volume (BRepGProp) -> tessellation (BRepMesh). Proves the
@@ -1356,6 +1433,16 @@ if(CHUDWARE_WITH_OCCT)
     list(APPEND _fatigue_envmod "PATH=path_list_prepend:${_b}")
   endforeach()
   list(APPEND _fatigue_envmod "PATH=path_list_prepend:${NETGEN_ROOT}/install/bin")
+  # ONNX Runtime on PATH only where the advisor is actually part of the build:
+  # POLYMESH_ONNXRUNTIME_RUNTIME is set by polymesh's advisor subdirectory, which returns
+  # early when POLYMESH_WITH_ADVISOR is OFF, so on a 32-bit Windows host this would
+  # otherwise prepend an empty directory.
+  if(CHUDWARE_WITH_POLYMESH AND POLYMESH_ADVISOR_ENABLED AND WIN32)
+    get_filename_component(_polymesh_ort_bin
+      "${POLYMESH_ONNXRUNTIME_RUNTIME}" DIRECTORY)
+    list(APPEND _fatigue_envmod
+      "PATH=path_list_prepend:${_polymesh_ort_bin}")
+  endif()
   get_filename_component(_ng_zlib_bin "${NETGEN_ZLIB_DLL}" DIRECTORY)
   list(APPEND _fatigue_envmod "PATH=path_list_prepend:${_ng_zlib_bin}")
   set_tests_properties(fatigue PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
@@ -1384,6 +1471,14 @@ if(CHUDWARE_WITH_OCCT)
   target_link_libraries(test_polymesh_backend PRIVATE chudware_mesh chudware_geom_occt)
   set_target_properties(test_polymesh_backend PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  if(CHUDWARE_WITH_POLYMESH)
+    # Where the advisor is buildable this test binary links polymesh::advisor, so it needs
+    # the ONNX Runtime beside it and is the one place a STAGED (not source-tree) advisor
+    # lookup gets exercised by ctest. Same output dir as libchudware, and
+    # copy_if_different, so the copies coalesce. On an advisor-less platform the staging
+    # helper is a documented no-op, so the predicate is not repeated here.
+    chudware_polymesh_stage_runtime(test_polymesh_backend)
+  endif()
   add_test(NAME polymesh_backend COMMAND test_polymesh_backend)
   set_tests_properties(polymesh_backend PROPERTIES RUN_SERIAL TRUE
     ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
@@ -2203,6 +2298,14 @@ if(CHUDWARE_WITH_OCCT)
   chudware_occt_copy_dlls(chudware)
   if(CHUDWARE_WITH_NETGEN)
     chudware_netgen_copy_dlls(chudware)  # nglib.dll + ngcore.dll + zlib.dll (chudware_mesh runtime deps)
+  endif()
+  if(CHUDWARE_WITH_POLYMESH)
+    # ONNX Runtime + the advisor model package beside libchudware. Upstream's own
+    # polymesh_stage_onnxruntime stages nothing on Linux and no model anywhere, so a
+    # packaged engine used to load with an unresolvable libonnxruntime.so and, if it got
+    # that far, no model directory to read. hostd and the ctest binaries share this output
+    # directory, so one staging serves every consumer in the tree.
+    chudware_polymesh_stage_runtime(chudware)
   endif()
   if(CHUDWARE_WITH_LIB3MF)
     chudware_lib3mf_copy_dll(chudware)   # lib3mf.dll for the CppDynamic 3MF binding

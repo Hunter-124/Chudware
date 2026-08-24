@@ -168,6 +168,11 @@ static bool isFlowFamily(StudyType t) {
   return t == StudyType::Flow || t == StudyType::Thermal;
 }
 
+static bool supportsLearnedAdvisor(StudyType t) {
+  return t == StudyType::Static || t == StudyType::Modal ||
+         t == StudyType::ThermalFea;
+}
+
 static const char *studyTypeKey(StudyType t) {
   switch (t) {
   case StudyType::Modal:
@@ -337,7 +342,7 @@ static void drawStudyTypeBanner(StudyType t, const char *desc) {
 // allowHex=false forces tetrahedral (e.g. modal studies have no hex8 mass
 // matrix).
 static void addMeshParams(nlohmann::json &j, const Study &s, int meshOrder,
-                          bool allowHex = true) {
+                          bool allowHex = true, bool allowAdvisor = false) {
   j["fineness"] = s.meshFineness; // primary control (0=coarse..1=fine)
   const bool hex = allowHex && s.meshHex;
   j["structured"] = hex;
@@ -353,6 +358,12 @@ static void addMeshParams(nlohmann::json &j, const Study &s, int meshOrder,
     j["min_size_mm"] = s.meshMinMm;
   j["mesher_backend"] = s.meshBackend;
   j["optimize"] = s.meshOptimize;
+  if (allowAdvisor) {
+    j["learned_advisor"] =
+        s.meshBackend == "polymesh" && s.learnedAdvisor;
+    j["advisor_max_dof"] =
+        static_cast<std::uint32_t>(std::max(0, s.advisorMaxDof));
+  }
   if (s.adaptEnabled)
     j["adapt"] = {{"max_passes", std::clamp(s.adaptMaxPasses, 1, 6)},
                   {"eta_target", s.adaptEtaTarget}};
@@ -369,6 +380,9 @@ static void clearTransientResult(Study &s) {
   s.frSweep.clear();
   s.frAccel.clear();
   s.dragTrace.clear();
+  s.dragTraceTotal = 0;
+  s.dragTraceStride = 1;
+  s.advisor = SimAdvisor{};
   s.dragN = s.liftN = s.sideN = 0.0;
   s.cd = s.cl = s.ld = s.reynolds = 0.0;
   s.frontalMm2 = s.refAreaMm2 = 0.0;
@@ -400,6 +414,117 @@ static bool finiteNumber(const nlohmann::json &j, const char *key, double &out) 
     return false;
   out = it->get<double>();
   return std::isfinite(out);
+}
+
+// ---- bounded live histories -------------------------------------------------------------------
+// The CFD progress stream emits one drag sample per solver iteration and a long OpenFOAM run has
+// no iteration ceiling, so appending blindly grows the study forever. Keep at most kDragTraceCap
+// samples by uniform power-of-two thinning: a sample is kept when its ARRIVAL index is a multiple
+// of the current stride, and when the buffer fills we drop every second retained sample and double
+// the stride — which keeps exactly the arrival indices that are multiples of the NEW stride, so the
+// series stays uniformly sampled over the whole run rather than truncated to a window. Deterministic
+// (no time or randomness) and the honest arrival count is retained in dragTraceTotal.
+static constexpr size_t kDragTraceCap = 2048;
+
+static void appendDragSample(Study &s, float v) {
+  const uint64_t arrival = s.dragTraceTotal++;
+  if (s.dragTraceStride > 1 && (arrival % s.dragTraceStride) != 0)
+    return;
+  s.dragTrace.push_back(v);
+  if (s.dragTrace.size() < kDragTraceCap)
+    return;
+  size_t w = 0;
+  for (size_t r = 0; r < s.dragTrace.size(); r += 2)
+    s.dragTrace[w++] = s.dragTrace[r];
+  s.dragTrace.resize(w);
+  s.dragTraceStride *= 2;
+}
+
+// ---- optional core-advisor envelope ------------------------------------------------------------
+// Parse the shared "advisor" object off a solver result. Absence is the norm and yields a default
+// (present == false) record, which every consumer treats as "no advisor" — identical to the
+// pre-advisor behaviour. Every field is read defensively: a partial envelope from an older core
+// still parses, with unstated numerics left as NaN.
+static SimAdvisor parseAdvisor(const nlohmann::json &res) {
+  SimAdvisor a;
+  if (!res.is_object())
+    return a;
+  auto it = res.find("advisor");
+  if (it == res.end() || !it->is_object())
+    return a;
+  const nlohmann::json &j = *it;
+  a.present = true;
+  auto flag = [&](const char *k, bool dflt) {
+    auto f = j.find(k);
+    return (f != j.end() && f->is_boolean()) ? f->get<bool>() : dflt;
+  };
+  auto num = [&](const char *k) {
+    double v = 0.0;
+    return finiteNumber(j, k, v) ? v : SimAdvisor::kUnset;
+  };
+  auto str = [&](const char *k) {
+    auto f = j.find(k);
+    return (f != j.end() && f->is_string()) ? f->get<std::string>() : std::string();
+  };
+  a.available = flag("available", false);
+  a.applied = flag("applied", false);
+  a.vetoed = flag("vetoed", false);
+  a.budgetRefusal = flag("budget_refusal", false);
+  a.mesher = str("mesher");
+  a.hRel = num("h_rel");
+  {
+    auto f = j.find("order");
+    if (f != j.end() && f->is_number_integer())
+      a.order = f->get<int>();
+  }
+  {
+    auto f = j.find("adapt_passes");
+    if (f != j.end() && f->is_number_integer())
+      a.adaptPasses = f->get<int>();
+  }
+  a.etaTarget = num("eta_target");
+  a.predictedDof = num("predicted_dof");
+  a.predictedMeshMs = num("predicted_mesh_ms");
+  a.predictedSolveMs = num("predicted_solve_ms");
+  a.failureProb = num("failure_prob");
+  a.oodDistance = num("ood_distance");
+  a.modelRevision = str("model_revision");
+  a.note = str("note");
+  return a;
+}
+
+// A mesher the advisor may recommend that Chudware's solve path cannot actually run. Chudware
+// solves tets; a polyhedral / VEM recommendation is reported as advice that was NOT executed.
+static bool advisorMesherIsPolyhedral(const std::string &mesher) {
+  std::string m;
+  m.reserve(mesher.size());
+  for (char c : mesher)
+    m.push_back((char)std::tolower((unsigned char)c));
+  return m.find("poly") != std::string::npos || m.find("vem") != std::string::npos ||
+         m.find("hedral") != std::string::npos;
+}
+
+// Group digits so six- and seven-figure counts read at a glance in a narrow pane.
+static std::string groupedCount(uint64_t n) {
+  const std::string d = std::to_string(n);
+  std::string out;
+  out.reserve(d.size() + d.size() / 3);
+  for (size_t i = 0; i < d.size(); ++i) {
+    const size_t fromRight = d.size() - i;
+    if (i && (fromRight % 3) == 0)
+      out.push_back(',');
+    out.push_back(d[i]);
+  }
+  return out;
+}
+
+// Uniform keep-every-Nth stride that brings `count` items under `budget`. Purely arithmetic, so
+// the same input always yields the same stride: ceil(count / stride) <= budget for every count,
+// and stride == 1 whenever the input already fits (no needless decimation of small studies).
+static size_t budgetStrideFor(size_t count, size_t budget) {
+  if (count == 0 || budget == 0 || count <= budget)
+    return 1;
+  return (count + budget - 1) / budget;
 }
 
 // Same solid-content policy as the FeatureManager's require-non-empty guard: a loaded
@@ -1065,6 +1190,9 @@ nlohmann::json SimManager::studyToJson(const Study &s) {
       {"mesh_min_mm", s.meshMinMm},
       {"mesher_backend", s.meshBackend},
       {"mesh_optimize", s.meshOptimize},
+      {"learned_advisor",
+       s.meshBackend == "polymesh" && s.learnedAdvisor},
+      {"advisor_max_dof", std::max(0, s.advisorMaxDof)},
       {"adapt_enabled", s.adaptEnabled},
       {"adapt_max_passes", std::clamp(s.adaptMaxPasses, 1, 6)},
       {"adapt_eta_target", s.adaptEtaTarget},
@@ -1165,6 +1293,9 @@ Study SimManager::studyFromJson(const nlohmann::json &j) {
   s.meshMinMm = j.value("mesh_min_mm", 0.0f);
   s.meshBackend = j.value("mesher_backend", std::string("netgen"));
   s.meshOptimize = j.value("mesh_optimize", true);
+  s.learnedAdvisor =
+      s.meshBackend == "polymesh" && j.value("learned_advisor", false);
+  s.advisorMaxDof = std::max(0, j.value("advisor_max_dof", 0));
   s.adaptEnabled = j.value("adapt_enabled", false);
   s.adaptMaxPasses =
       std::clamp(j.value("adapt_max_passes", 3), 1, 6);
@@ -1295,6 +1426,9 @@ void SimManager::refresh(AppState &st) {
           s.hasResult = p.hasResult;
           s.banner = p.banner;
           s.dragTrace = p.dragTrace;
+          s.dragTraceTotal = p.dragTraceTotal;
+          s.dragTraceStride = p.dragTraceStride;
+          s.advisor = p.advisor;
           s.resultSummary = p.resultSummary;
           s.advResult = p.advResult;
           s.overlayPath = p.overlayPath;
@@ -2656,8 +2790,14 @@ void SimManager::finishResultOverlay(AppState &st, Study &s) {
 }
 
 void SimManager::clearMeshPreview() {
+  const bool hadGeometry = !meshPreviewSegs_.empty();
   meshPreviewSegs_.clear();
   meshPreviewStudyId_.clear();
+  meshPreviewElemsTotal_ = meshPreviewElemsUsed_ = 0;
+  meshPreviewEdgesTotal_ = meshPreviewEdgesShown_ = 0;
+  meshPreviewCoarse_ = false;
+  if (hadGeometry)
+    bumpOverlayGeneration();
 }
 
 void SimManager::previewMesh(AppState &st, Study &s) {
@@ -2698,7 +2838,8 @@ void SimManager::previewMesh(AppState &st, Study &s) {
             break;
           }
         if (sp)
-          addMeshParams(params, *sp, meshOrder);
+          addMeshParams(params, *sp, meshOrder, /*allowHex=*/true,
+                        supportsLearnedAdvisor(sp->type));
         else
           params["order"] = meshOrder;
         st.rpc.call(
@@ -2764,35 +2905,65 @@ void SimManager::previewMesh(AppState &st, Study &s) {
                   res.value("nodes_per_elem", meshOrder == 2 ? 10 : 4);
               const int nT =
                   (stride > 0) ? (int)(T.size() / (size_t)stride) : 0;
-              if (nT > 0 && nT <= 250000) {
-                auto elNode = [&](int e, int k) {
-                  return T[(size_t)e * (size_t)stride + k].get<int>();
+              // Deterministic graduated edge decimation under a FIXED display
+              // budget. The old code emitted nothing above 250k elements, so a
+              // large study silently blanked its preview with no explanation.
+              // Now every mesh yields a bounded wireframe:
+              //   Tier A (<= kPreviewBoundaryElems): the exact boundary-face
+              //     wireframe, unchanged from before.
+              //   Tier B (larger): keep every elemStride'th element and emit
+              //     that subset's element edges. Sampling breaks adjacency, so
+              //     boundary extraction would return every face of every
+              //     sampled element anyway — this is the same coarse wire cloud
+              //     for a fraction of the work. Flagged meshPreviewCoarse_ so
+              //     the UI never presents it as the true surface mesh.
+              // Both tiers then pass through a uniform edge stride so the
+              // emitted segment count never exceeds kPreviewSegmentBudget.
+              // Every selection is index-strided: same mesh in, identical bytes
+              // out, no time/randomness/frame dependence.
+              meshPreviewElemsTotal_ = nT > 0 ? (size_t)nT : 0;
+              if (nT > 0) {
+                const size_t nP = P.size() / 3;
+                auto elNode = [&](size_t e, int k) {
+                  return T[e * (size_t)stride + (size_t)k].get<int>();
                 };
+                std::vector<std::pair<int, int>> edges;
                 std::unordered_set<uint64_t> seenEdge;
-                auto pt = [&](int i, float out[3]) {
-                  out[0] = (float)P[(size_t)i * 3 + 0].get<double>();
-                  out[1] = (float)P[(size_t)i * 3 + 1].get<double>();
-                  out[2] = (float)P[(size_t)i * 3 + 2].get<double>();
-                };
-                auto edge = [&](int a, int b) {
+                auto addEdge = [&](int a, int b) {
+                  if (a == b || a < 0 || b < 0 || (size_t)a >= nP ||
+                      (size_t)b >= nP)
+                    return;
                   if (a > b)
                     std::swap(a, b);
-                  uint64_t k = ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
+                  const uint64_t k = ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
                   if (!seenEdge.insert(k).second)
                     return;
-                  float pa[3], pb[3];
-                  pt(a, pa);
-                  pt(b, pb);
-                  meshPreviewSegs_.insert(
-                      meshPreviewSegs_.end(),
-                      {pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]});
+                  edges.emplace_back(a, b);
                 };
-                if (stride == 8) {
+                meshPreviewCoarse_ =
+                    meshPreviewElemsTotal_ > kPreviewBoundaryElems;
+                if (meshPreviewCoarse_) {
+                  const size_t elemStride = budgetStrideFor(
+                      meshPreviewElemsTotal_, kPreviewSampleElems);
+                  static const int tetE[6][2] = {{0, 1}, {0, 2}, {0, 3},
+                                                 {1, 2}, {1, 3}, {2, 3}};
+                  static const int hexE[12][2] = {
+                      {0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6},
+                      {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+                  const int(*el)[2] = (stride == 8) ? hexE : tetE;
+                  const int nEl = (stride == 8) ? 12 : 6;
+                  size_t used = 0;
+                  for (size_t e = 0; e < meshPreviewElemsTotal_;
+                       e += elemStride, ++used)
+                    for (int k = 0; k < nEl; ++k)
+                      addEdge(elNode(e, el[k][0]), elNode(e, el[k][1]));
+                  meshPreviewElemsUsed_ = used;
+                } else if (stride == 8) {
                   static const int hexF[6][4] = {{0, 1, 2, 3}, {4, 5, 6, 7},
                                                  {0, 1, 5, 4}, {2, 3, 7, 6},
                                                  {0, 3, 7, 4}, {1, 2, 6, 5}};
                   std::map<std::array<int, 4>, int> faceCount;
-                  for (int e = 0; e < nT; ++e)
+                  for (size_t e = 0; e < meshPreviewElemsTotal_; ++e)
                     for (int f = 0; f < 6; ++f) {
                       std::array<int, 4> q{
                           elNode(e, hexF[f][0]), elNode(e, hexF[f][1]),
@@ -2802,16 +2973,17 @@ void SimManager::previewMesh(AppState &st, Study &s) {
                     }
                   for (const auto &kv : faceCount)
                     if (kv.second == 1) {
-                      edge(kv.first[0], kv.first[1]);
-                      edge(kv.first[1], kv.first[2]);
-                      edge(kv.first[2], kv.first[3]);
-                      edge(kv.first[0], kv.first[3]);
+                      addEdge(kv.first[0], kv.first[1]);
+                      addEdge(kv.first[1], kv.first[2]);
+                      addEdge(kv.first[2], kv.first[3]);
+                      addEdge(kv.first[0], kv.first[3]);
                     }
+                  meshPreviewElemsUsed_ = meshPreviewElemsTotal_;
                 } else {
                   static const int fv[4][3] = {
                       {0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
                   std::map<std::array<int, 3>, int> faceCount;
-                  for (int e = 0; e < nT; ++e)
+                  for (size_t e = 0; e < meshPreviewElemsTotal_; ++e)
                     for (int f = 0; f < 4; ++f) {
                       std::array<int, 3> tri{elNode(e, fv[f][0]),
                                              elNode(e, fv[f][1]),
@@ -2821,11 +2993,33 @@ void SimManager::previewMesh(AppState &st, Study &s) {
                     }
                   for (const auto &kv : faceCount)
                     if (kv.second == 1) {
-                      edge(kv.first[0], kv.first[1]);
-                      edge(kv.first[1], kv.first[2]);
-                      edge(kv.first[0], kv.first[2]);
+                      addEdge(kv.first[0], kv.first[1]);
+                      addEdge(kv.first[1], kv.first[2]);
+                      addEdge(kv.first[0], kv.first[2]);
                     }
+                  meshPreviewElemsUsed_ = meshPreviewElemsTotal_;
                 }
+                meshPreviewEdgesTotal_ = edges.size();
+                const size_t budgetStride =
+                    budgetStrideFor(edges.size(), kPreviewSegmentBudget);
+                auto pt = [&](int i, float out[3]) {
+                  out[0] = (float)P[(size_t)i * 3 + 0].get<double>();
+                  out[1] = (float)P[(size_t)i * 3 + 1].get<double>();
+                  out[2] = (float)P[(size_t)i * 3 + 2].get<double>();
+                };
+                meshPreviewSegs_.reserve(
+                    6 * ((edges.size() + budgetStride - 1) / budgetStride));
+                for (size_t i = 0; i < edges.size(); i += budgetStride) {
+                  float pa[3], pb[3];
+                  pt(edges[i].first, pa);
+                  pt(edges[i].second, pb);
+                  meshPreviewSegs_.insert(
+                      meshPreviewSegs_.end(),
+                      {pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]});
+                  ++meshPreviewEdgesShown_;
+                }
+                if (!meshPreviewSegs_.empty())
+                  bumpOverlayGeneration();
               }
               std::string msg = "Mesh: " + std::to_string(s->nNodes) +
                                 " nodes, " + std::to_string(s->nElems) +
@@ -2841,6 +3035,13 @@ void SimManager::previewMesh(AppState &st, Study &s) {
                 std::snprintf(q, sizeof(q), " | min volume %.3g mm3", minVol);
                 st.addLog(std::string("[sim] mesh quality: ") + q);
               }
+              if (meshPreviewEdgesShown_ < meshPreviewEdgesTotal_ ||
+                  meshPreviewCoarse_)
+                msg += " | preview " +
+                       groupedCount((uint64_t)meshPreviewEdgesShown_) + " of " +
+                       groupedCount((uint64_t)meshPreviewEdgesTotal_) +
+                       " edges" +
+                       (meshPreviewCoarse_ ? " (coarse LOD)" : " (decimated)");
               st.toast(ui::ToastLevel::Info, msg);
             },
             180000);
@@ -2854,6 +3055,66 @@ bool SimManager::hasMeshPreview(AppState &st) const {
   if (sel_ < 0 || sel_ >= (int)studies_.size())
     return false;
   return meshPreviewStudyId_ == studies_[sel_].id && !meshPreviewSegs_.empty();
+}
+
+// ---- honest presentation-budget / advisor disclosure --------------------------------------
+// Both read the SELECTED study only, so a tab or study switch changes what they report without
+// any extra bookkeeping. Empty string means "nothing to disclose"; callers stay silent then.
+
+std::string SimManager::previewLodStatus() const {
+  if (sel_ < 0 || sel_ >= (int)studies_.size())
+    return {};
+  const Study &s = studies_[sel_];
+  std::string out;
+  if (meshPreviewStudyId_ == s.id && meshPreviewEdgesTotal_ > 0 &&
+      (meshPreviewEdgesShown_ < meshPreviewEdgesTotal_ || meshPreviewCoarse_)) {
+    out = "Mesh preview: showing " +
+          groupedCount((uint64_t)meshPreviewEdgesShown_) + " of " +
+          groupedCount((uint64_t)meshPreviewEdgesTotal_) + " edges";
+    if (meshPreviewCoarse_)
+      out += " from " + groupedCount((uint64_t)meshPreviewElemsUsed_) + " of " +
+             groupedCount((uint64_t)meshPreviewElemsTotal_) +
+             " elements (coarse LOD)";
+  }
+  if (flowLinesBuiltFor_ == s.id && flowSegsTotal_ > 0 && flowSegStride_ > 1) {
+    if (!out.empty())
+      out += "  |  ";
+    out += "Flow lines: showing " + groupedCount((uint64_t)flowSegsShown_) +
+           " of " + groupedCount((uint64_t)flowSegsTotal_) + " segments (1 in " +
+           std::to_string(flowSegStride_) + ")";
+  }
+  return out;
+}
+
+std::string SimManager::advisorStatusLine() const {
+  if (sel_ < 0 || sel_ >= (int)studies_.size())
+    return {};
+  const Study &s = studies_[sel_];
+  const SimAdvisor &a = s.advisor;
+  if (!a.present)
+    return {};
+  std::string out = "Advisor: ";
+  if (a.budgetRefusal)
+    out += "refused (over budget)";
+  else if (a.vetoed)
+    out += "vetoed";
+  else if (a.applied)
+    out += "applied";
+  else if (a.available)
+    out += "available, not applied";
+  else
+    out += "unavailable";
+  // Chudware's solve path is tet-only, so a polyhedral/VEM mesher recommendation was never
+  // executed no matter what the state token above says. The Results-panel disclosure spells this
+  // out; the always-visible line has to as well, or "applied" reads as if that mesher had run.
+  if (!a.mesher.empty() && advisorMesherIsPolyhedral(a.mesher)) {
+    out += " | " + a.mesher + " mesher advice NOT executed (tet-only solve)";
+    if (!s.meshBackendUsed.empty())
+      out += "; meshed with " + s.meshBackendUsed;
+  }
+  if (SimAdvisor::has(a.oodDistance) && a.oodDistance > 1.0)
+    out += " | out of distribution";
+  return out;
 }
 
 // ---- indicator geometry (fixture glyphs + load arrows) ----
@@ -3544,11 +3805,18 @@ bool SimManager::flowResultLinesActive(AppState &st) const {
 }
 
 void SimManager::rebuildFlowLines(AppState &st, Study &s) {
+  bool hadGeometry = false;
   for (int b = 0; b < kFlowBands; ++b) {
+    hadGeometry = hadGeometry || !flowStreamSegs_[b].empty() ||
+                  !flowSliceSegs_[b].empty();
     flowStreamSegs_[b].clear();
     flowSliceSegs_[b].clear();
   }
   flowLinesBuiltFor_.clear();
+  flowSegsTotal_ = flowSegsShown_ = 0;
+  flowSegStride_ = 1;
+  if (hadGeometry)
+    bumpOverlayGeneration();
   if (s.overlayPath.empty())
     return;
   // Overlay is normally an aicm-shm:// URI (see applyResultField) —
@@ -3598,56 +3866,91 @@ void SimManager::rebuildFlowLines(AppState &st, Study &s) {
     if (mdiag < 1e-3f)
       mdiag = 100.0f;
   }
+  // BOUNDED AT INGESTION. A fine OpenFOAM overlay can carry millions of
+  // streamline/slice segments and every one of them is redrawn each frame, so
+  // the cached bands are capped at kFlowSegmentBudget. Count the candidates
+  // first, then keep every flowSegStride_'th segment in traversal order — a
+  // uniform thinning of the whole field (not a truncation of the first N
+  // lines), deterministic for a given overlay. Direction barbs cost two extra
+  // segments each, so the line budget reserves room for them up front and the
+  // emitted total still lands under kFlowSegmentBudget.
+  auto forEachCandidate = [&](const auto &ls, auto &&fn) {
+    size_t p = 0;
+    for (uint32_t li = 0; li < ls.pts_per_line.size(); ++li) {
+      const uint32_t cnt = ls.pts_per_line[li];
+      for (uint32_t i = 0; i + 1 < cnt; ++i) {
+        const size_t a = p + i, c = p + i + 1;
+        if ((c * 3 + 2) >= ls.pts.size())
+          break;
+        fn(a, c, i);
+      }
+      p += cnt;
+    }
+  };
+  for (const auto &ls : doc.lines) {
+    if (ls.name != "slices" && ls.name != "streamlines")
+      continue;
+    forEachCandidate(ls, [&](size_t, size_t, uint32_t) { ++flowSegsTotal_; });
+  }
+  const size_t barbEvery = 6;  // one direction barb every N kept stream segments
+  const size_t lineBudget =
+      kFlowSegmentBudget * barbEvery / (barbEvery + 2);
+  flowSegStride_ = (uint32_t)budgetStrideFor(flowSegsTotal_, lineBudget);
   const float barbLen = 0.018f * mdiag; // barb leg length
-  const int kArrowEvery =
-      6; // one arrowhead every N segments along a streamline
+  size_t candidate = 0;                 // traversal index across the whole overlay
   for (const auto &ls : doc.lines) {
     const bool isSlice = (ls.name == "slices");
     const bool isStream = (ls.name == "streamlines");
     if (!isSlice && !isStream)
       continue;
     std::vector<float> *dst = isSlice ? flowSliceSegs_ : flowStreamSegs_;
-    size_t p = 0;
-    for (uint32_t li = 0; li < ls.pts_per_line.size(); ++li) {
-      uint32_t cnt = ls.pts_per_line[li];
-      for (uint32_t i = 0; i + 1 < cnt; ++i) {
-        size_t a = p + i, c = p + i + 1;
-        if ((c * 3 + 2) >= ls.pts.size())
-          break;
-        float spd = 0.0f;
-        if (ls.has_scalar && c < ls.scalar.size())
-          spd = 0.5f * (ls.scalar[a] + ls.scalar[c]);
-        int bi = bandOf(spd);
-        const float *pa = &ls.pts[a * 3];
-        const float *pc = &ls.pts[c * 3];
-        dst[bi].insert(dst[bi].end(),
-                       {pa[0], pa[1], pa[2], pc[0], pc[1], pc[2]});
-        // Sample a direction barb sparsely along streamlines only.
-        if (isStream && (i % kArrowEvery) == (uint32_t)(kArrowEvery / 2)) {
-          float d[3] = {pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]};
-          float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-          if (dl > 1e-6f) {
-            d[0] /= dl;
-            d[1] /= dl;
-            d[2] /= dl;
-            float perp[3];
-            perp3(d, perp); // any unit vector normal to d
-            // Barbs sweep back from the tip (pc) at ~30 deg on either side.
-            for (int sgn = -1; sgn <= 1; sgn += 2) {
-              float b[3] = {
-                  pc[0] - d[0] * barbLen + perp[0] * barbLen * 0.5f * sgn,
-                  pc[1] - d[1] * barbLen + perp[1] * barbLen * 0.5f * sgn,
-                  pc[2] - d[2] * barbLen + perp[2] * barbLen * 0.5f * sgn};
-              dst[bi].insert(dst[bi].end(),
-                             {pc[0], pc[1], pc[2], b[0], b[1], b[2]});
-            }
+    size_t keptInLine = 0;  // kept segments within the current polyline
+    forEachCandidate(ls, [&](size_t a, size_t c, uint32_t i) {
+      if (i == 0)
+        keptInLine = 0;
+      const bool keep = (candidate++ % flowSegStride_) == 0;
+      if (!keep)
+        return;
+      float spd = 0.0f;
+      if (ls.has_scalar && c < ls.scalar.size())
+        spd = 0.5f * (ls.scalar[a] + ls.scalar[c]);
+      const int bi = bandOf(spd);
+      const float *pa = &ls.pts[a * 3];
+      const float *pc = &ls.pts[c * 3];
+      dst[bi].insert(dst[bi].end(),
+                     {pa[0], pa[1], pa[2], pc[0], pc[1], pc[2]});
+      ++flowSegsShown_;
+      // Direction barb on every barbEvery'th KEPT streamline segment. At full
+      // resolution (stride 1) this reproduces the previous cadence exactly.
+      // Barbs are a decorative direction cue, not field data, so they are drawn
+      // and paid for out of the budget but never counted as shown segments —
+      // flowSegsShown_ must stay a true 1-in-stride sample of flowSegsTotal_.
+      const size_t slot = keptInLine++;
+      if (isStream && (slot % barbEvery) == (barbEvery / 2)) {
+        float d[3] = {pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]};
+        const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (dl > 1e-6f) {
+          d[0] /= dl;
+          d[1] /= dl;
+          d[2] /= dl;
+          float perp[3];
+          perp3(d, perp); // any unit vector normal to d
+          // Barbs sweep back from the tip (pc) at ~30 deg on either side.
+          for (int sgn = -1; sgn <= 1; sgn += 2) {
+            float b[3] = {
+                pc[0] - d[0] * barbLen + perp[0] * barbLen * 0.5f * sgn,
+                pc[1] - d[1] * barbLen + perp[1] * barbLen * 0.5f * sgn,
+                pc[2] - d[2] * barbLen + perp[2] * barbLen * 0.5f * sgn};
+            dst[bi].insert(dst[bi].end(),
+                           {pc[0], pc[1], pc[2], b[0], b[1], b[2]});
           }
         }
       }
-      p += cnt;
-    }
+    });
   }
   flowLinesBuiltFor_ = s.id;
+  if (flowSegsShown_ > 0)
+    bumpOverlayGeneration();
 }
 
 void SimManager::collectFlowResultLines(AppState &st,
@@ -3974,6 +4277,11 @@ void SimManager::runStaticOrModal(AppState &st, Study &s) {
   prep->meshOptions.meshMinMm = s.meshMinMm;
   prep->meshOptions.meshBackend = s.meshBackend;
   prep->meshOptions.meshOptimize = s.meshOptimize;
+  prep->meshOptions.learnedAdvisor = s.learnedAdvisor;
+  prep->meshOptions.advisorMaxDof = s.advisorMaxDof;
+  prep->meshOptions.adaptEnabled = s.adaptEnabled;
+  prep->meshOptions.adaptMaxPasses = s.adaptMaxPasses;
+  prep->meshOptions.adaptEtaTarget = s.adaptEtaTarget;
   prep->meshOptions.meshOrder = s.meshOrder;
 
   for (const auto &pick : s.fixtures.picks)
@@ -4164,7 +4472,8 @@ void SimManager::finishStaticModalPrep(
                 prep->type == StudyType::Static
                     ? prep->meshOptions.meshOrder
                     : 1,
-                prep->type == StudyType::Static);
+                prep->type == StudyType::Static,
+                supportsLearnedAdvisor(prep->type));
 
   std::string note;
   bool launched = false;
@@ -4505,7 +4814,7 @@ void SimManager::drainSimClientJob(AppState &st) {
             runningStudy_ < (int)studies_.size())
           traceStudy = runningStudy_;
         if (traceStudy >= 0)
-          studies_[traceStudy].dragTrace.push_back((float)ev.traceDrag);
+          appendDragSample(studies_[traceStudy], (float)ev.traceDrag);
       }
     }
   }
@@ -4567,6 +4876,10 @@ void SimManager::drainSimClientJob(AppState &st) {
       for (const auto &n : res["solver_notes"])
         if (n.is_string())
           s.solverNotes.push_back(n.get<std::string>());
+    // Optional shared core-advisor envelope. Absent for every solver route that
+    // does not carry one, which leaves s.advisor default-constructed and the
+    // whole advisor UI silent — the pre-advisor behaviour, unchanged.
+    s.advisor = parseAdvisor(res);
     if (isFlowFamily(s.type)) {
       const bool isThermal =
           res.contains("scalar_fields") && res["scalar_fields"].is_array() &&
@@ -4878,6 +5191,45 @@ void SimManager::drainSimClientJob(AppState &st) {
       }
       s.hasResult = true;
       st.addLog("[sim] FEA done: " + s.summary);
+    }
+    if (uiActive) {
+      // An adaptive static run only "completed" if the error target it was given was actually
+      // reached. The Results panel reads "Target met: No" straight off these same flags, so a
+      // teal "Adaptive static FEA complete" in the status bar would contradict it. Unmet, or an
+      // adapt envelope that never reported a target at all, both go out amber.
+      bool adaptUnproven = false;
+      switch (s.type) {
+      case StudyType::Static:
+        if (!s.adaptEnabled) {
+          st.status = "Static FEA complete";
+        } else if (s.adaptEtaTargetMet) {
+          st.status = "Adaptive static FEA complete (error target met)";
+        } else {
+          adaptUnproven = true;
+          if (s.adaptPasses.empty())
+            st.status = "Adaptive static FEA finished; error target not reported";
+          else if (s.adaptStopReason.empty())
+            st.status = "Adaptive static FEA stopped; error target not met";
+          else
+            st.status = "Adaptive static FEA stopped (" + s.adaptStopReason +
+                        "); error target not met";
+        }
+        break;
+      case StudyType::Modal:
+        st.status = "Modal analysis complete";
+        break;
+      case StudyType::Fatigue:
+        st.status = "Fatigue analysis complete";
+        break;
+      case StudyType::ThermalFea:
+        st.status = "Thermal FEA complete";
+        break;
+      default:
+        break;
+      }
+      if (s.type == StudyType::Static || s.type == StudyType::Modal ||
+          s.type == StudyType::Fatigue || s.type == StudyType::ThermalFea)
+        st.statusKind = adaptUnproven ? 1 : 0;
     }
     // Cache the summary into the document so it reopens with the last-run
     // headline.
@@ -6294,6 +6646,8 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
         for (int i = 0; i < 2; ++i)
           if (ImGui::Selectable(kBackend[i], backendIndex == i)) {
             s.meshBackend = i ? "polymesh" : "netgen";
+            if (s.meshBackend != "polymesh")
+              s.learnedAdvisor = false;
             persist(st, s);
             clearMeshPreview();
           }
@@ -6305,6 +6659,34 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
              "stress result depends on the mesh rather than the part, and note "
              "that adaptive refinement always uses it. It is not a fallback for "
              "geometry Netgen refuses, and it stair-cases the boundary.");
+      if (s.meshBackend == "polymesh" && supportsLearnedAdvisor(s.type)) {
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Use learned mesh advisor", &s.learnedAdvisor)) {
+          persist(st, s);
+          clearMeshPreview();
+        }
+        simTip("Opt in to the upstream learned advisor for mesh setup. Its "
+               "recommendation is advisory only: Chudware still enforces the "
+               "tetrahedral boundary, resource limits, mesher checks, solver "
+               "health checks, and convergence gates. Default runs do not use "
+               "the model.");
+        if (s.learnedAdvisor) {
+          ImGui::TextUnformatted("Advisor DOF budget (0 = unset)");
+          int maxDof = s.advisorMaxDof;
+          ImGui::SetNextItemWidth(-FLT_MIN);
+          if (ImGui::InputInt("##advisormaxdof", &maxDof, 1000, 10000)) {
+          }
+          if (ImGui::IsItemDeactivatedAfterEdit()) {
+            s.advisorMaxDof = std::max(0, maxDof);
+            persist(st, s);
+            clearMeshPreview();
+          }
+          simTip("Optional maximum degrees of freedom the advisor may choose. "
+                 "Zero leaves the budget unset; deterministic resource gates "
+                 "still apply.");
+          kit::dimText("Advice does not replace the selected mesher or solver.");
+        }
+      }
       ImGui::Unindent();
     }
     ImGui::Spacing();
@@ -6365,8 +6747,31 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
       ImGui::TextDisabled("Backend: %s", s.meshBackendUsed.c_str());
     if (!s.meshNote.empty())
       ImGui::TextWrapped("%s", s.meshNote.c_str());
-    if (!meshPreviewSegs_.empty() && meshPreviewStudyId_ == s.id)
+    if (!meshPreviewSegs_.empty() && meshPreviewStudyId_ == s.id) {
       ImGui::TextDisabled("Wireframe shown in the viewport.");
+      // Honest LOD disclosure: a big study used to draw nothing at all here.
+      // It now always draws something, and always says how much of the real
+      // mesh that something is. The solve itself uses the FULL mesh.
+      if (meshPreviewEdgesShown_ < meshPreviewEdgesTotal_ ||
+          meshPreviewCoarse_) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              simRole(ui::palette.statusWarn));
+        ImGui::TextWrapped(
+            "Showing %s of %s edges%s.",
+            groupedCount((uint64_t)meshPreviewEdgesShown_).c_str(),
+            groupedCount((uint64_t)meshPreviewEdgesTotal_).c_str(),
+            meshPreviewCoarse_ ? " (coarse LOD)" : " (display budget)");
+        ImGui::PopStyleColor();
+        if (meshPreviewCoarse_)
+          ImGui::TextDisabled(
+              "Coarse LOD samples %s of %s elements, so this is an indicative "
+              "wire cloud, not the exact surface mesh.",
+              groupedCount((uint64_t)meshPreviewElemsUsed_).c_str(),
+              groupedCount((uint64_t)meshPreviewElemsTotal_).c_str());
+        ImGui::TextDisabled("The solve uses the full mesh; only the preview is "
+                            "decimated.");
+      }
+    }
   }
 
   // --- Mesh quality readout
@@ -7316,6 +7721,100 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
   (void)S;
 }
 
+// ---- optional core-advisor disclosure -----------------------------------------------------
+// Draws nothing at all when the result carried no "advisor" object, so every pre-advisor solver
+// route renders exactly as before. When one IS present this reports what the advisor recommended
+// and whether it was honoured — it never asserts anything about which solver ran. Chudware's
+// solve path is tet-only, so a polyhedral/VEM recommendation is spelled out as advice that was
+// NOT executed rather than quietly displayed as if it had been.
+static void drawAdvisorDisclosure(AppState &st, const Study &s) {
+  const SimAdvisor &a = s.advisor;
+  if (!a.present)
+    return;
+  ImGui::Spacing();
+  if (!ImGui::TreeNodeEx("Setup advisor", ImGuiTreeNodeFlags_DefaultOpen))
+    return;
+  const char *state = a.budgetRefusal ? "Refused - predicted cost over budget"
+                      : a.vetoed      ? "Vetoed - recommendation rejected by a guard"
+                      : a.applied     ? "Applied - shaped this run's setup"
+                      : a.available   ? "Available - not applied to this run"
+                                      : "Unavailable - no recommendation produced";
+  const bool warn = a.budgetRefusal || a.vetoed || !a.available;
+  ImGui::PushStyleColor(ImGuiCol_Text,
+                        simRole(warn ? ui::palette.statusWarn
+                                     : ui::palette.statusOk));
+  ImGui::TextWrapped("%s", state);
+  ImGui::PopStyleColor();
+  simTip("The advisor only proposes mesh sizing, element order and adaptation. "
+         "It never chooses or performs the solve, and this block never reports "
+         "solver results.");
+  if (!a.mesher.empty()) {
+    ImGui::Text("Recommended mesher: %s", a.mesher.c_str());
+    if (advisorMesherIsPolyhedral(a.mesher)) {
+      ImGui::PushStyleColor(ImGuiCol_Text, simRole(ui::palette.statusWarn));
+      const std::string ranWith =
+          s.meshBackendUsed.empty()
+              ? std::string()
+              : "; the run meshed with " + s.meshBackendUsed;
+      ImGui::TextWrapped(
+          "Chudware solves tetrahedral meshes only. This polyhedral/VEM "
+          "recommendation was NOT executed%s.",
+          ranWith.c_str());
+      ImGui::PopStyleColor();
+    }
+  }
+  if (SimAdvisor::has(a.hRel))
+    ImGui::Text("Recommended relative size: %.4g", a.hRel);
+  if (a.order > 0)
+    ImGui::Text("Recommended element order: %d", a.order);
+  if (a.adaptPasses >= 0)
+    ImGui::Text("Recommended adaptive passes: %d", a.adaptPasses);
+  if (SimAdvisor::has(a.etaTarget))
+    ImGui::Text("Recommended error target: %.4g", a.etaTarget);
+  if (SimAdvisor::has(a.predictedDof))
+    ImGui::Text("Predicted DOF: %.0f", a.predictedDof);
+  if (SimAdvisor::has(a.predictedMeshMs) ||
+      SimAdvisor::has(a.predictedSolveMs)) {
+    const std::string meshMs =
+        SimAdvisor::has(a.predictedMeshMs)
+            ? std::to_string((long long)a.predictedMeshMs) + " ms"
+            : std::string("n/a");
+    const std::string solveMs =
+        SimAdvisor::has(a.predictedSolveMs)
+            ? std::to_string((long long)a.predictedSolveMs) + " ms"
+            : std::string("n/a");
+    ImGui::Text("Predicted time: mesh %s, solve %s", meshMs.c_str(),
+                solveMs.c_str());
+  }
+  if (SimAdvisor::has(a.failureProb)) {
+    const bool risky = a.failureProb >= 0.5;
+    if (risky)
+      ImGui::PushStyleColor(ImGuiCol_Text, simRole(ui::palette.statusWarn));
+    ImGui::Text("Predicted failure probability: %.1f%%", a.failureProb * 100.0);
+    if (risky)
+      ImGui::PopStyleColor();
+  }
+  if (SimAdvisor::has(a.oodDistance)) {
+    const bool ood = a.oodDistance > 1.0;
+    if (ood)
+      ImGui::PushStyleColor(ImGuiCol_Text, simRole(ui::palette.statusWarn));
+    ImGui::Text("Distance from training distribution: %.3g%s", a.oodDistance,
+                ood ? " (out of distribution)" : "");
+    if (ood)
+      ImGui::PopStyleColor();
+    simTip("How far this part/setup sits from the cases the advisor was "
+           "trained on. Large values mean its predictions are extrapolation.");
+  }
+  if (!a.modelRevision.empty())
+    ImGui::TextDisabled("Advisor model: %s", a.modelRevision.c_str());
+  if (!a.note.empty())
+    ImGui::TextWrapped("%s", a.note.c_str());
+  if (!a.anyDetail())
+    ImGui::TextDisabled("No further detail reported.");
+  (void)st;
+  ImGui::TreePop();
+}
+
 void SimManager::drawResultControls(AppState &st, Study &s) {
   // T-FIN24 kinds render numeric/plot results (no viewport overlay).
   if (s.type == StudyType::Buckling || s.type == StudyType::Contact ||
@@ -7565,10 +8064,18 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
     ImGui::TextWrapped("Qualitative result: %s", s.banner.c_str());
     ImGui::PopStyleColor();
   }
-  if (isFlowFamily(s.type) && !s.dragTrace.empty())
+  if (isFlowFamily(s.type) && !s.dragTrace.empty()) {
     ImGui::PlotLines("##drag", s.dragTrace.data(), (int)s.dragTrace.size(), 0,
                      "Drag trace", FLT_MAX, FLT_MAX,
                      ImVec2(-FLT_MIN, 50.0f * ui::uiScale));
+    // The live trace is thinned at ingestion so a long run cannot grow it
+    // without bound; say so rather than implying every iteration is plotted.
+    if (s.dragTraceStride > 1)
+      ImGui::TextDisabled("Showing %s of %s iterations (1 in %u).",
+                          groupedCount((uint64_t)s.dragTrace.size()).c_str(),
+                          groupedCount(s.dragTraceTotal).c_str(),
+                          s.dragTraceStride);
+  }
 
   // --- transparency: what the solver actually did ---
   if (s.nNodes > 0 || s.nElems > 0 || s.nDof > 0 || !s.solverNotes.empty()) {
@@ -7588,6 +8095,7 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
       ImGui::TreePop();
     }
   }
+  drawAdvisorDisclosure(st, s);
 
   // --- flow visualization controls: colormap + streamline / slice line
   // overlays ---
@@ -7609,6 +8117,12 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
       rebuildFlowLines(st, s);
     simTip("Velocity cross-section planes (mid-X / mid-Y / mid-Z) drawn as a "
            "speed-colored grid.");
+    if (flowLinesBuiltFor_ == s.id && flowSegStride_ > 1)
+      ImGui::TextDisabled(
+          "Line overlay: showing %s of %s segments (1 in %u) to stay inside "
+          "the display budget.",
+          groupedCount((uint64_t)flowSegsShown_).c_str(),
+          groupedCount((uint64_t)flowSegsTotal_).c_str(), flowSegStride_);
   }
 
   // --- visualization controls (stacked so nothing clips in the narrow pane)
@@ -8298,10 +8812,16 @@ void SimManager::drawForm(AppState &st, Study &s) {
           "This preparation/advanced stage has no cancellation route.");
     }
     // Live drag-convergence sparkline and final result summary
-    if (!s.dragTrace.empty())
+    if (!s.dragTrace.empty()) {
       ImGui::PlotLines("##drag", s.dragTrace.data(), (int)s.dragTrace.size(), 0,
                        "Drag trace", FLT_MAX, FLT_MAX,
                        ImVec2(-FLT_MIN, 50.0f * S));
+      if (s.dragTraceStride > 1)
+        ImGui::TextDisabled("Showing %s of %s iterations (1 in %u).",
+                            groupedCount((uint64_t)s.dragTrace.size()).c_str(),
+                            groupedCount(s.dragTraceTotal).c_str(),
+                            s.dragTraceStride);
+    }
     if (s.hasResult && node_ != SimNode::Results) {
       ImGui::Spacing();
       ImGui::TextWrapped("%s", s.summary.c_str());
@@ -9679,7 +10199,8 @@ void SimManager::runThermalFea(AppState &st, Study &s) {
       tr["dt_s"] = s.thermDtS;
     study["transient"] = tr;
   }
-  addMeshParams(study, s, /*order=*/1, /*allowHex=*/false);
+  addMeshParams(study, s, /*order=*/1, /*allowHex=*/false,
+                /*allowAdvisor=*/true);
 
   std::string note;
   if (sim->launch("sim_run_thermal", {{"study", study}}, note,
@@ -9775,6 +10296,7 @@ void SimManager::runBuckling(AppState &st, Study &s) {
             return;
           }
           stu.advResult = r.result;
+          stu.advisor = parseAdvisor(r.result);
           stu.hasResult = true;
           char buf[160];
           std::snprintf(buf, sizeof(buf),
@@ -9858,6 +10380,7 @@ void SimManager::runContact(AppState &st, Study &s) {
             return;
           }
           stu.advResult = r.result;
+          stu.advisor = parseAdvisor(r.result);
           stu.hasResult = true;
           char buf[160];
           std::snprintf(buf, sizeof(buf),
@@ -10033,6 +10556,7 @@ void SimManager::postFreqResponse(AppState &st, Study &s,
             return;
           }
           stu.advResult = r.result;
+          stu.advisor = parseAdvisor(r.result);
           char buf[160];
           std::snprintf(buf, sizeof(buf),
                         "peak %.2f g @ %.1f Hz (zeta %.3g)", peakAccel,
@@ -10142,6 +10666,7 @@ void SimManager::drawAdvancedResults(AppState &st, Study &s) {
   for (const auto &n : s.solverNotes) {
     kit::dimText(n.c_str());
   }
+  drawAdvisorDisclosure(st, s);
   drawProvenance(res);
 }
 

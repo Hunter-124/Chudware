@@ -13,6 +13,8 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -40,6 +42,42 @@ enum class StudyType { Static, Modal, Flow, Fatigue, Thermal, Motion,
 
 // Static failure theory used for the headline factor of safety + the FoS plot field.
 enum class FailureCriterion { VonMises = 0, Tresca = 1, MaxNormal = 2 };
+
+// Optional core-advisor envelope carried by a solver result under the shared "advisor" key.
+// ABSENCE IS THE NORM: a result without the key leaves `present` false and the UI silent, which
+// is the pre-advisor behaviour. Everything here is ADVICE about how the run was set up (sizing,
+// order, adaptation) plus the advisor's own self-assessment — it is never a claim about which
+// solver ran. Chudware's solve path is tet-only; if the advisor names a polyhedral/VEM mesher the
+// UI must report that as a recommendation the solver did NOT execute.
+struct SimAdvisor {
+    static constexpr double kUnset = std::numeric_limits<double>::quiet_NaN();
+
+    bool present = false;          // an "advisor" object was present in the result payload
+    bool available = false;        // advisor model was loaded and produced a recommendation
+    bool applied = false;          // the recommendation actually shaped this run
+    bool vetoed = false;           // a guard rejected the recommendation
+    bool budgetRefusal = false;    // refused because the predicted cost exceeded the budget
+    std::string mesher;            // recommended mesher (advice; may name a backend we cannot solve)
+    double hRel = kUnset;          // recommended relative element size
+    int    order = 0;              // recommended element order (0 = unstated)
+    int    adaptPasses = -1;       // recommended adaptive passes (<0 = unstated)
+    double etaTarget = kUnset;     // recommended error-indicator target
+    double predictedDof = kUnset;  // predicted system size
+    double predictedMeshMs = kUnset;
+    double predictedSolveMs = kUnset;
+    double failureProb = kUnset;   // predicted probability this configuration fails
+    double oodDistance = kUnset;   // distance from the advisor's training distribution
+    std::string modelRevision;     // advisor model revision that produced this
+    std::string note;              // free-form advisor note
+
+    static bool has(double v) { return v == v; }  // NaN-free test without <cmath> here
+    bool anyDetail() const {
+        return !mesher.empty() || has(hRel) || order > 0 || adaptPasses >= 0 ||
+               has(etaTarget) || has(predictedDof) || has(predictedMeshMs) ||
+               has(predictedSolveMs) || has(failureProb) || has(oodDistance) ||
+               !modelRevision.empty() || !note.empty();
+    }
+};
 
 // One picked face: the resolved selector plus the viewport id-pass identity at pick time so the
 // face can be highlighted in the preview overlay (and re-highlighted after a save/reopen — the
@@ -95,6 +133,8 @@ struct Study {
     float meshMinMm = 0.0f;         // advanced: min element size override (0 = auto)
     std::string meshBackend = "netgen"; // "netgen" | "polymesh"
     bool meshOptimize = true;       // Netgen surface + volume optimization pass
+    bool learnedAdvisor = false;    // Polymesh only: opt-in advisory mesh recommendation
+    int advisorMaxDof = 0;          // optional advisor budget; 0 = no explicit ceiling
     bool adaptEnabled = false;      // static only: error-driven re-mesh/re-solve
     int adaptMaxPasses = 3;         // adaptive pass budget, clamped to [1, 6]
     float adaptEtaTarget = 0.05f;   // dimensionless relative error indicator target
@@ -210,7 +250,14 @@ struct Study {
     bool hasResult = false;
     std::string summary;            // human result summary text (headline, also cached in the doc)
     std::string banner;             // permanent CFD qualitative-result banner (reynolds_note)
-    std::vector<float> dragTrace;   // live CFD drag sparkline samples
+    // Live CFD drag sparkline. BOUNDED AT INGESTION: a long OpenFOAM run streams one sample per
+    // iteration for as long as it runs, so the raw stream is unbounded. `dragTrace` holds at most
+    // kDragTraceCap samples, uniformly thinned by `dragTraceStride` (deterministic power-of-two
+    // halving — every retained sample sits at an arrival index that is a multiple of the stride).
+    // `dragTraceTotal` is the honest arrival count so the panel can say "showing X of Y".
+    std::vector<float> dragTrace;
+    uint64_t dragTraceTotal = 0;    // samples the solver actually streamed
+    uint32_t dragTraceStride = 1;   // 1 = every sample kept; >1 = uniformly thinned
 
     // Rich result payload (transient) so the Results panel can show a full metric table, switch
     // colormapped fields with no re-solve, and surface what the solver actually did (transparency).
@@ -234,6 +281,10 @@ struct Study {
     double adaptGlobalEta = 0.0;
     bool adaptEtaTargetMet = false;
     std::string adaptStopReason;
+
+    // Optional core-advisor envelope from the last run (transient; never persisted). Absent by
+    // default — `advisor.present == false` reproduces the pre-advisor UI exactly.
+    SimAdvisor advisor;
 };
 
 // Which sub-node of a study the tree has selected (drives the form + previews).
@@ -294,6 +345,25 @@ public:
     // study, or an empty batch. Only valid while the Sim tab is active and the preview matches sel_.
     bool hasMeshPreview(AppState& st) const;
     const std::vector<float>& meshPreviewSegments() const { return meshPreviewSegs_; }
+
+    // ---- cached sim overlay geometry generation (shared UI/renderer contract) -------------------
+    // Monotonically increasing counter, starting at 1, bumped ONLY when the manager's CACHED sim
+    // overlay geometry actually changes: the mesh-preview wireframe (meshPreviewSegs_) and the flow
+    // result line bands (flowStreamSegs_ / flowSliceSegs_). Setup indicator geometry is rebuilt per
+    // frame and is deliberately NOT covered. A consumer that caches GPU buffers can compare this
+    // against its last-seen value and re-upload only on a change. Per-SimManager (per-document), so
+    // it never resets or goes backwards for the life of one document's manager.
+    uint64_t overlayGeneration() const { return overlayGeneration_; }
+
+    // ---- honest presentation-budget disclosure ---------------------------------------------------
+    // One short line describing the decimation currently applied to the SELECTED study's cached
+    // preview / flow-line geometry ("Preview: showing 148,392 of 2,310,554 edges (coarse LOD)"), or
+    // "" when nothing is decimated. Presentation only — the solver payload is never thinned.
+    std::string previewLodStatus() const;
+    // One short line describing the SELECTED study's advisor state ("Advisor: applied"), or "" when
+    // no advisor envelope was present. Never asserts which solver ran, and it spells out a
+    // polyhedral/VEM mesher recommendation as advice the tet-only solve path did NOT execute.
+    std::string advisorStatusLine() const;
 
     // ---- flow-study setup preview (drawn while a Flow study is selected, before/without a result) ----
     // True when the selected study is a Flow study and no result colormap is up (so the wind-tunnel
@@ -656,10 +726,26 @@ private:
     // Finish legend/deform after an overlay mesh commit (sync path or async drain).
     void finishResultOverlay(AppState& st, Study& s);
 
+    // ---- presentation display budget -------------------------------------------------------------
+    // Cached overlay geometry is what the GPU has to draw every frame, so it is capped independently
+    // of the solver payload. Both caches below are built under a FIXED segment budget with uniform,
+    // deterministic strides (same input -> byte-identical output), and both retain the pre-decimation
+    // totals so the UI can say "showing X of Y" instead of silently blanking or silently lying.
+    static constexpr size_t kPreviewSegmentBudget = 150000;   // emitted mesh-preview GL_LINES segments
+    static constexpr size_t kPreviewBoundaryElems = 250000;   // above this, sample elements first
+    static constexpr size_t kPreviewSampleElems   = 100000;   // elements kept by that coarse sampling
+    static constexpr size_t kFlowSegmentBudget    = 120000;   // emitted flow line+barb segments
+
     // Mesh-preview state (built by previewMesh from sim_mesh; drawn in the viewport while setting up).
     std::vector<float> meshPreviewSegs_;   // flat GL_LINES xyz pairs (surface element edges)
     std::string meshPreviewStudyId_;       // study the preview belongs to ("" = none)
     bool meshPreviewPending_ = false;      // T-PERF4: sim_mesh async in flight
+    // Honest LOD bookkeeping for the wireframe above (0 = nothing built).
+    size_t meshPreviewElemsTotal_ = 0;     // elements the mesher actually produced
+    size_t meshPreviewElemsUsed_  = 0;     // elements this wireframe was derived from
+    size_t meshPreviewEdgesTotal_ = 0;     // unique candidate edges before the budget stride
+    size_t meshPreviewEdgesShown_ = 0;     // edges actually emitted
+    bool   meshPreviewCoarse_ = false;     // true = element-sampled cloud, not the exact boundary
 
     // Flow-result line overlays (streamlines + velocity slices) parsed from the cached overlay AICM
     // and split into speed bands so drawSegments (flat-colour) can fake a speed colormap. Rebuilt when
@@ -671,7 +757,14 @@ private:
     bool flowShowStreamlines_ = true;      // result-panel toggles
     bool flowShowSlices_ = false;
     double flowLinesVmax_ = 1.0;           // speed range the bands were built against
+    size_t flowSegsTotal_ = 0;             // candidate line segments in the overlay
+    size_t flowSegsShown_ = 0;             // retained source field segments (decorative barbs excluded)
+    uint32_t flowSegStride_ = 1;           // uniform ingestion stride applied to hit the budget
     void rebuildFlowLines(AppState& st, Study& s);  // (re)parse the overlay AICM into the band arrays
+
+    // Bumped by every path that mutates meshPreviewSegs_ / flowStreamSegs_ / flowSliceSegs_.
+    uint64_t overlayGeneration_ = 1;
+    void bumpOverlayGeneration() { ++overlayGeneration_; }
 
     // Motion study: this SimManager is owned by one DocSession, so keeping the cache here preserves
     // playback across workspace/document-tab switches without leaking it to another document.

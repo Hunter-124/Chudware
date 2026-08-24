@@ -93,10 +93,30 @@ spend/order actions; "AI as advisor" = all `manual` with AI pre-filling each nod
 **V&V'd open-source stack (chosen).** All copyleft solvers run as subprocesses (the
 FreeCAD/SimScale pattern): CalculiX & OpenFOAM (GPL, subprocess + source offer in installer),
 Elmer (LGPL lib linkable), ngspice (BSD, bundleable), Verilator (Artistic-2.0 path, bundleable)
-+ GHDL/Icarus (GPL, subprocess) for the FPGA pillar. Credibility package: MacNeal-Harder tests
-(public domain), CoFEA benchmarks (open), NASA TMR CFD cases (public domain), reproduced NAFEMS
-cases from literature — auto-run in CI, results in a generated V&V report citing ASME V&V 10/20
-methodology. Never bundle NAFEMS/ASME documents themselves.
++ GHDL/Icarus (GPL, subprocess) for the FPGA pillar. The V&V harness uses independently
+derived analytic references and openly distributable cases; it records failures and skips
+without aggregate masking. The private-fork Polyhedral-FEA/PolyMesh family is reported
+separately, with solver source and linked-binary revision, and remains a tet4/tet10
+discretization path into Chudware's solver rather than a VEM/polyhedral-solve claim.
+
+Credibility is derived from a durable evidence registry, never assigned by a solver or UI.
+The shared tiers are `S0_unvalidated`, `S1_benchmarked`, `S2_cross_solver`, and
+`S3_field_correlated`. Evidence is bound to ids, solver/model revision hashes, expiry and
+invalidation state. S2 requires registered independent-solver evidence depending on current
+S1 evidence; S3 requires registered field-correlation evidence depending on current S2
+evidence. Missing, malformed, expired, invalidated, or revision-mismatched evidence fails
+closed to the highest fully supported lower tier. Generated labels are allow-listed internal
+V&V descriptions; certification/accreditation language is rejected.
+
+Internal V&V and external approval are separate programs. Internal gates require complete
+family inventory, reproducible benchmark provenance, zero unexplained failures/unexpected
+skips, three-level discretization studies, cross-solver comparisons, uncertainty budgets,
+and field datasets before the corresponding evidence tier can be registered. External QMS,
+lawful standards acquisition, accredited-laboratory work, and certification-body engagement
+have independent owners and milestones and cannot be completed by code. The measurable
+program and current not-complete status are maintained in
+[ACCREDITATION_PROGRAM.md](../simulation/ACCREDITATION_PROGRAM.md). Never bundle
+NAFEMS/ASME documents themselves.
 
 ### Decision 4 — Building-code data posture
 

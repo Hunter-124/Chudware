@@ -30,6 +30,24 @@ A job runs one named stage from :data:`STAGES` (an allowlist — a job payload c
 name an arbitrary import). Stages are atomic and JSON-in/JSON-out, which is what lets the
 pipeline be split into *setup* (parent, needs the live doc) -> *solve* (child, pure) ->
 *collect* (parent, shapes the result and persists the study).
+
+* ``core_rpc`` — one engine solve RPC from :data:`CORE_RPC_METHODS`. A doc-shaped method
+  (``sim_run_flow`` tessellates a document) additionally names ``open_step``: the parent
+  exported the solid, and the child re-opens that ONE file, because it shares no document
+  table with the server that started it.
+* ``modal_rpc`` — ``sim_run_modal`` plus the free-free rigid-mode subspace widening, so an
+  asynchronous modal answer is the same physics as the synchronous one.
+* ``openfoam_tunnel`` — a steady-RANS wind tunnel over an exported STL. Every OpenFOAM
+  process is a subprocess inside this job's group, so cancel really stops the mesher.
+* ``selftest_sleep`` — the metered stage the cancel/partial contracts are proved against.
+
+COLLECT RUNS ONCE
+-----------------
+The collect stage writes the solved study into the document, so it is not replayable: the
+spool arbitrates it with an atomic claim file and caches the resulting envelope
+(:func:`collected` / :func:`claim_collect` / :func:`save_collected`). Every later poll —
+from this process, a later turn, or a server that restarted in between — reads that one
+envelope instead of persisting a duplicate study.
 """
 from __future__ import annotations
 
@@ -168,6 +186,95 @@ def pid_alive(pid: Optional[int], proc_key: Optional[str] = None) -> bool:
 
 # ---------------------------------------------------------------- stages
 
+#: Payload placeholder that :func:`start` rewrites to a path INSIDE the job's own spool
+#: directory. A solver that streams live progress to a file of its own (the LBM wind
+#: tunnel writes ``{pct, step, n_steps}`` there) cannot be handed that path by the caller:
+#: the job id does not exist yet, and a caller-minted temp path is unreachable to a LATER
+#: process reconnecting to the job. The token keeps the payload pure JSON and puts the
+#: progress file inside the spool ``_prune`` already owns.
+PROGRESS_TOKEN = "@job_progress"
+
+
+def _resolve_tokens(value: Any, progress_path: str) -> Any:
+    """Substitute :data:`PROGRESS_TOKEN` throughout a payload.
+
+    EXACT string matches only — the token is never spliced into a longer string, so a
+    payload cannot smuggle a path of its own choosing through a partial match.
+    """
+    if isinstance(value, str):
+        return progress_path if value == PROGRESS_TOKEN else value
+    if isinstance(value, dict):
+        return {k: _resolve_tokens(v, progress_path) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve_tokens(v, progress_path) for v in value]
+    return value
+
+
+#: The engine solve entry points a ``core_rpc`` payload may name. A payload names a
+#: METHOD from this closed list — never an import path, a module or a callable.
+CORE_RPC_METHODS = ("sim_run_static", "sim_run_modal", "sim_run_adaptive",
+                    "sim_run_fatigue", "sim_run_flow")
+
+#: Methods whose params carry a self-contained ``study`` (an exported STEP path + JSON),
+#: i.e. everything the child needs is already on disk.
+_STUDY_METHODS = ("sim_run_static", "sim_run_modal", "sim_run_adaptive", "sim_run_fatigue")
+
+#: Study methods whose payload is shaped like a static solve (fixtures + driving loads).
+_STATIC_SHAPED = ("sim_run_static", "sim_run_adaptive", "sim_run_fatigue")
+
+#: Methods that tessellate a DOCUMENT rather than a study file, so the child has to open
+#: the parent's exported solid first.
+_DOC_SHAPED_METHODS = ("sim_run_flow",)
+
+#: The only params key a geometry prelude is allowed to fill.
+_DOC_PARAM = "doc_id"
+
+
+def _finite(value: Any, label: str) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be a finite number, got {value!r}") from None
+    if not math.isfinite(out):
+        raise ValueError(f"{label} must be a finite number, got {value!r}")
+    return out
+
+
+def _require_geometry_file(path: Any, label: str) -> str:
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"{label} must be a filesystem path")
+    try:
+        ready = Path(path).is_file() and Path(path).stat().st_size > 0
+    except OSError:
+        ready = False
+    if not ready:
+        raise ValueError(f"{label} is unavailable: {path}")
+    return path
+
+
+def _open_geometry(payload: dict, emit) -> Optional[str]:
+    """Open the payload's ``open_step`` into a fresh document in THIS child.
+
+    A doc-shaped RPC (``sim_run_flow`` tessellates a document) cannot be replayed in a
+    child that shares no document table with the server that started it, so the parent
+    exports the solid once at setup and the child re-opens that ONE file. Nothing else in
+    the payload can name a file to open, and the only params key the fresh id may fill is
+    ``doc_id``.
+    """
+    step = payload.get("open_step")
+    if not step:
+        return None
+    from services.mcp import core_bridge as cb  # noqa: PLC0415
+    emit({"stage": "open_geometry", "note": "loading the exported study solid"})
+    res = cb.call("doc_open", {"path": str(step)}) or {}
+    doc_id = res.get("doc_id")
+    if not doc_id:
+        raise ValueError(
+            f"could not open the exported study geometry {step!r}: "
+            f"{res.get('error') or res}")
+    return str(doc_id)
+
+
 def _stage_core_rpc(payload: dict, emit) -> dict:
     """One C++ core RPC (``sim_run_static``, ``sim_run_modal``, ...) in this child.
 
@@ -176,10 +283,96 @@ def _stage_core_rpc(payload: dict, emit) -> dict:
     """
     from services.mcp import core_bridge as cb  # noqa: PLC0415
     method = payload.get("method")
-    if not method:
-        raise ValueError("core_rpc payload needs a 'method'")
+    if method not in CORE_RPC_METHODS:
+        raise ValueError(f"core_rpc method must be one of {list(CORE_RPC_METHODS)}")
+    params = dict(payload.get("params") or {})
+    doc_id = _open_geometry(payload, emit)
+    if doc_id is not None:
+        params[_DOC_PARAM] = doc_id
     emit({"stage": method, "note": "engine RPC in flight"})
-    return cb.call(str(method), payload.get("params") or {})
+    return cb.call(str(method), params)
+
+
+def _n_rigid(freqs) -> int:
+    """How many of `freqs` sit in the ~0 Hz rigid-body cluster (elastic modes are >> 0.5)."""
+    n = 0
+    for f in freqs or ():
+        try:
+            if float(f) < 0.5:
+                n += 1
+        except (TypeError, ValueError):
+            continue
+    return n
+
+
+def _stage_modal_rpc(payload: dict, emit) -> dict:
+    """``sim_run_modal`` plus the free-free rigid-mode safety net.
+
+    A free-free part spends its first six modes on rigid-body motion and that 0 Hz cluster
+    is six-fold degenerate, so an eigensolver can hand back fewer than six of them. The
+    synchronous tool has always widened the subspace and re-solved (up to twice) in that
+    case. Doing it HERE — inside the one killable child — is what keeps the asynchronous
+    answer IDENTICAL to the synchronous one instead of making the background path a
+    second, weaker physics that silently renumbers modes.
+    """
+    from services.mcp import core_bridge as cb  # noqa: PLC0415
+    study = payload.get("study")
+    solve_n = int(payload.get("solve_n") or 0)
+    emit({"stage": "sim_run_modal", "n_modes": solve_n, "note": "eigensolve in flight"})
+    res = cb.call("sim_run_modal", {"study": study, "n_modes": solve_n})
+    if not payload.get("widen_free_free") or not res.get("ok"):
+        return res
+    for _ in range(2):
+        if _n_rigid(res.get("freqs_hz")) >= 6:
+            break
+        solve_n += 6
+        emit({"stage": "sim_run_modal", "n_modes": solve_n,
+              "note": "widening the Krylov subspace for the rigid-body cluster"})
+        retry = cb.call("sim_run_modal", {"study": study, "n_modes": solve_n})
+        if not retry.get("ok"):
+            break
+        res = retry
+    return res
+
+
+#: OpenFOAM mesh/solve presets, in the vocabulary services/sim/foam_case.py accepts.
+FOAM_PRESETS = ("coarse", "medium", "fine", "xfine")
+
+#: The scalars an OpenFOAM tunnel result must carry to be reportable at all. Every one is
+#: checked finite HERE, in the child, so a NaN can never reach the spool (the result file
+#: is written with ``allow_nan=False``) and be mistaken for a missing artifact.
+_FOAM_SCALARS = ("cd", "cl", "ld", "drag_n", "lift_n", "side_n", "reynolds",
+                 "ref_area_mm2", "vmax_mps")
+
+
+def _stage_openfoam_tunnel(payload: dict, emit) -> dict:
+    """One OpenFOAM steady-RANS wind tunnel over an exported STL, in THIS child.
+
+    Every OpenFOAM invocation is a subprocess (GPL isolation — never linked), and each one
+    is born into this job's process group. That is what makes ``cancel`` actually stop a
+    run with minutes of snappyHexMesh left instead of orphaning a mesher that keeps a core
+    busy long after the agent was told the job was cancelled.
+    """
+    from services.sim.openfoam import run_openfoam_tunnel  # noqa: PLC0415
+    stl = _require_geometry_file(payload.get("stl_path"), "openfoam_tunnel STL geometry")
+    fluid = payload.get("fluid")
+    emit({"stage": "mesh", "pct": 0, "text": "queued"})
+    r = run_openfoam_tunnel(
+        stl,
+        direction=(1.0, 0.0, 0.0),
+        speed_mps=_finite(payload.get("speed_mps"), "speed_mps"),
+        preset=str(payload.get("preset") or "coarse"),
+        aoa_deg=_finite(payload.get("aoa_deg", 0.0), "aoa_deg"),
+        fluid=fluid if isinstance(fluid, dict) else None,
+        on_progress=lambda ev: emit({"stage": ev.get("stage", ""),
+                                     "pct": ev.get("pct", 0),
+                                     "text": ev.get("text", "")}))
+    out: dict = {"ok": True, "diverged": bool(r.diverged),
+                 "steps_run": int(r.steps_run),
+                 "solver_notes": list(r.solver_notes or [])}
+    for key in _FOAM_SCALARS:
+        out[key] = _finite(getattr(r, key), f"OpenFOAM {key}")
+    return out
 
 
 def _stage_selftest_sleep(payload: dict, emit) -> dict:
@@ -204,6 +397,8 @@ def _stage_selftest_sleep(payload: dict, emit) -> dict:
 
 STAGES: dict[str, Callable[[dict, Callable[[dict], None]], dict]] = {
     "core_rpc": _stage_core_rpc,
+    "modal_rpc": _stage_modal_rpc,
+    "openfoam_tunnel": _stage_openfoam_tunnel,
     "selftest_sleep": _stage_selftest_sleep,
 }
 
@@ -215,70 +410,57 @@ def _json_text(value: Any, label: str) -> str:
         raise ValueError(f"{label} must be finite JSON data: {exc}") from None
 
 
-def _validate_core_rpc_payload(payload: dict) -> None:
-    method = payload.get("method")
-    if method not in ("sim_run_static", "sim_run_modal"):
-        raise ValueError("core_rpc method must be sim_run_static or sim_run_modal")
-    params = payload.get("params")
-    if not isinstance(params, dict):
-        raise ValueError("core_rpc payload needs a params object")
-    study = params.get("study")
-    if not isinstance(study, dict):
-        raise ValueError(f"{method} params need a study object")
-    step_path = study.get("step_path")
-    if not isinstance(step_path, str) or not step_path.strip():
-        raise ValueError(f"{method} study needs a STEP geometry path")
-    geometry = Path(step_path)
-    try:
-        geometry_ready = geometry.is_file() and geometry.stat().st_size > 0
-    except OSError:
-        geometry_ready = False
-    if not geometry_ready:
-        raise ValueError(f"{method} STEP geometry is unavailable: {step_path}")
+def _validate_material(method: str, study: dict, keys: tuple) -> None:
     material = study.get("material")
     if not isinstance(material, dict) or not material:
         raise ValueError(f"{method} study needs a material object")
-    required_material = ("E_mpa", "nu", "yield_mpa") if method == "sim_run_static" \
-        else ("E_mpa", "nu", "density_g_cm3")
-    for key in required_material:
-        try:
-            value = float(material[key])
-        except (KeyError, TypeError, ValueError, OverflowError):
-            raise ValueError(f"{method} material needs finite {key}") from None
-        if not math.isfinite(value):
-            raise ValueError(f"{method} material needs finite {key}")
+    for key in keys:
+        value = _finite(material.get(key), f"{method} material {key}")
         if key != "nu" and value <= 0.0:
             raise ValueError(f"{method} material {key} must be > 0")
         if key == "nu" and not -1.0 < value < 0.5:
             raise ValueError(f"{method} material nu must be between -1 and 0.5")
+
+
+def _validate_driving_loads(method: str, study: dict) -> None:
+    """A study nothing drives solves to an identically zero field — a well-formed lie."""
+    loads = study.get("loads")
+    if not isinstance(loads, list) or not loads:
+        raise ValueError(f"{method} needs at least one non-zero load")
+    driven = False
+    for load in loads:
+        if not isinstance(load, dict) or not load.get("faces"):
+            raise ValueError(f"every {method} load needs resolved faces")
+        if load.get("type") == "pressure":
+            magnitude = _finite(load.get("magnitude", 0.0), f"{method} load magnitude")
+            driven = driven or magnitude != 0.0
+        elif load.get("type") == "force":
+            vector = load.get("vector")
+            if not isinstance(vector, list) or len(vector) != 3:
+                raise ValueError(f"{method} force load needs a three-component vector")
+            values = [_finite(v, f"{method} load vector") for v in vector]
+            driven = driven or any(value != 0.0 for value in values)
+        else:
+            raise ValueError(f"{method} load type must be pressure or force")
+    if not driven:
+        raise ValueError(f"{method} needs at least one non-zero load")
+
+
+def _validate_study_params(method: str, params: dict) -> None:
+    study = params.get("study")
+    if not isinstance(study, dict):
+        raise ValueError(f"{method} params need a study object")
+    _require_geometry_file(study.get("step_path"), f"{method} STEP geometry")
     fixtures = study.get("fixtures")
     if not isinstance(fixtures, list):
         raise ValueError(f"{method} study fixtures must be a list")
-    if method == "sim_run_static":
+    if method in _STATIC_SHAPED:
         if not fixtures:
-            raise ValueError("sim_run_static needs at least one fixture")
-        loads = study.get("loads")
-        if not isinstance(loads, list) or not loads:
-            raise ValueError("sim_run_static needs at least one non-zero load")
-        driven = False
-        for load in loads:
-            if not isinstance(load, dict) or not load.get("faces"):
-                raise ValueError("every static load needs resolved faces")
-            if load.get("type") == "pressure":
-                magnitude = float(load.get("magnitude", 0.0))
-                driven = driven or math.isfinite(magnitude) and magnitude != 0.0
-            elif load.get("type") == "force":
-                vector = load.get("vector")
-                if not isinstance(vector, list) or len(vector) != 3:
-                    raise ValueError("static force load needs a three-component vector")
-                values = [float(value) for value in vector]
-                driven = driven or all(math.isfinite(value) for value in values) \
-                    and any(value != 0.0 for value in values)
-            else:
-                raise ValueError("static load type must be pressure or force")
-        if not driven:
-            raise ValueError("sim_run_static needs at least one non-zero load")
+            raise ValueError(f"{method} needs at least one fixture")
+        _validate_material(method, study, ("E_mpa", "nu", "yield_mpa"))
+        _validate_driving_loads(method, study)
     else:
+        _validate_material(method, study, ("E_mpa", "nu", "density_g_cm3"))
         n_modes = params.get("n_modes")
         if isinstance(n_modes, bool):
             raise ValueError("sim_run_modal n_modes must be a positive integer")
@@ -289,19 +471,116 @@ def _validate_core_rpc_payload(payload: dict) -> None:
             raise ValueError("sim_run_modal n_modes must be a positive integer") from None
         if parsed_modes <= 0 or not math.isfinite(exact_modes) or exact_modes != parsed_modes:
             raise ValueError("sim_run_modal n_modes must be a positive integer")
+    if method == "sim_run_adaptive":
+        adapt = study.get("adapt")
+        if not isinstance(adapt, dict):
+            raise ValueError("sim_run_adaptive study needs an adapt object")
+        passes = adapt.get("max_passes")
+        if isinstance(passes, bool) or not isinstance(passes, int) or not 1 <= passes <= 6:
+            raise ValueError("sim_run_adaptive max_passes must be an integer from 1 to 6")
+        if _finite(adapt.get("eta_target"), "sim_run_adaptive eta_target") <= 0.0:
+            raise ValueError("sim_run_adaptive eta_target must be > 0")
+    if method == "sim_run_fatigue":
+        fatigue = study.get("fatigue")
+        if not isinstance(fatigue, dict) or not fatigue:
+            raise ValueError("sim_run_fatigue study needs a fatigue object")
+        for key in ("ultimate_mpa", "se_corrected_mpa"):
+            if _finite(fatigue.get(key), f"sim_run_fatigue fatigue.{key}") <= 0.0:
+                raise ValueError(f"sim_run_fatigue fatigue.{key} must be > 0")
 
+
+def _validate_flow_params(params: dict) -> None:
+    if _finite(params.get("velocity"), "sim_run_flow velocity") <= 0.0:
+        raise ValueError("sim_run_flow velocity must be > 0 m/s")
+    _finite(params.get("aoa", 0.0), "sim_run_flow aoa")
+    fluid = params.get("fluid", "air")
+    if fluid not in ("air", "water"):
+        raise ValueError("sim_run_flow fluid must be 'air' or 'water'")
+    for key, floor in (("cells", 16), ("n_steps", 1)):
+        value = params.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < floor:
+            raise ValueError(f"sim_run_flow {key} must be an integer >= {floor}")
+
+
+#: Substrings that mean "this build has no such solver", as opposed to "the solver is here
+#: and rejected an empty payload" — which is the answer a WORKING solver gives the probe.
+_MISSING_SOLVER_TOKENS = ("unknown method", "solver unavailable", "not compiled")
+
+
+def _probe_backend(method: str) -> None:
+    """Refuse a job the engine could never dispatch — without inventing the verdict.
+
+    The probe deliberately sends EMPTY params. A build WITHOUT the solver answers "unknown
+    method"; a build WITH it rejects the empty study on its own terms (a missing doc, a
+    missing study, a degenerate geometry). Only the first is a reason not to queue, so an
+    ordinary rejection — however it is delivered, return value or raise — is read as the
+    solver confirming it is there. Queuing a job that can only fail is bad; refusing one
+    that would have worked is worse.
+    """
     from services.mcp import core_bridge as cb  # noqa: PLC0415
     if not cb.available():
         raise ValueError("core simulation backend is unavailable in the job worker process")
     try:
         probe = cb.call(method, {})
-    except Exception as exc:
-        raise ValueError(f"core simulation backend cannot dispatch {method}: {exc}") from None
+    except Exception as exc:  # noqa: BLE001 — any error text is inspected, none is trusted
+        text = str(exc).lower()
+        if any(token in text for token in _MISSING_SOLVER_TOKENS):
+            raise ValueError(
+                f"core simulation backend cannot dispatch {method}: {exc}") from None
+        return
     probe_error = str(probe.get("error") or probe.get("message") or "").lower()
     if (probe.get("ok") is False
-            and any(token in probe_error for token in
-                    ("unknown method", "solver unavailable", "not compiled"))):
+            and any(token in probe_error for token in _MISSING_SOLVER_TOKENS)):
         raise ValueError(f"core simulation backend cannot dispatch {method}: {probe_error}")
+
+
+def _validate_core_rpc_payload(payload: dict) -> None:
+    method = payload.get("method")
+    if method not in CORE_RPC_METHODS:
+        raise ValueError(f"core_rpc method must be one of {list(CORE_RPC_METHODS)}")
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        raise ValueError("core_rpc payload needs a params object")
+    step = payload.get("open_step")
+    if step is None:
+        if method in _DOC_SHAPED_METHODS:
+            raise ValueError(
+                f"{method} solves a DOCUMENT, so its job payload needs "
+                "open_step=<exported STEP path>: a child process shares no document table "
+                "with the server that started it")
+    else:
+        _require_geometry_file(step, f"{method} exported document geometry")
+    if method in _STUDY_METHODS:
+        _validate_study_params(method, params)
+    else:
+        _validate_flow_params(params)
+    _probe_backend(method)
+
+
+def _validate_modal_rpc_payload(payload: dict) -> None:
+    solve_n = payload.get("solve_n")
+    if isinstance(solve_n, bool) or not isinstance(solve_n, int) or solve_n <= 0:
+        raise ValueError("modal_rpc solve_n must be a positive integer")
+    _validate_study_params("sim_run_modal", {"study": payload.get("study"),
+                                             "n_modes": solve_n})
+    _probe_backend("sim_run_modal")
+
+
+def _validate_openfoam_payload(payload: dict) -> None:
+    _require_geometry_file(payload.get("stl_path"), "openfoam_tunnel STL geometry")
+    if _finite(payload.get("speed_mps"), "openfoam_tunnel speed_mps") <= 0.0:
+        raise ValueError("openfoam_tunnel speed_mps must be > 0")
+    _finite(payload.get("aoa_deg", 0.0), "openfoam_tunnel aoa_deg")
+    preset = payload.get("preset", "coarse")
+    if preset not in FOAM_PRESETS:
+        raise ValueError(f"openfoam_tunnel preset must be one of {list(FOAM_PRESETS)}")
+    fluid = payload.get("fluid")
+    if fluid is not None:
+        if not isinstance(fluid, dict):
+            raise ValueError("openfoam_tunnel fluid must be an object")
+        for key in ("nu", "rho"):
+            if _finite(fluid.get(key), f"openfoam_tunnel fluid.{key}") <= 0.0:
+                raise ValueError(f"openfoam_tunnel fluid.{key} must be > 0")
 
 
 def _validate_start(kind: str, stage: str, payload: dict, meta: Optional[dict]) -> tuple[str, str]:
@@ -315,6 +594,10 @@ def _validate_start(kind: str, stage: str, payload: dict, meta: Optional[dict]) 
         raise ValueError("job metadata must be an object")
     if stage == "core_rpc":
         _validate_core_rpc_payload(payload)
+    elif stage == "modal_rpc":
+        _validate_modal_rpc_payload(payload)
+    elif stage == "openfoam_tunnel":
+        _validate_openfoam_payload(payload)
     elif stage == "selftest_sleep":
         seconds = float(payload.get("seconds", 5.0))
         steps = payload.get("steps", 10)
@@ -344,9 +627,12 @@ def _prune(conn: sqlite3.Connection) -> None:
 
 def start(kind: str, stage: str, payload: dict, meta: Optional[dict] = None) -> dict:
     """Validate setup, spawn one stage process, and return its durable job id."""
-    payload_json, meta_json = _validate_start(kind, stage, payload, meta)
     job_id = "sim-" + uuid.uuid4().hex[:12]
     d = job_dir(job_id)
+    # The job id has to exist BEFORE validation so a payload can address the job's own
+    # spool (PROGRESS_TOKEN) and be validated against the paths the child will really see.
+    payload = _resolve_tokens(payload, str(d / "progress.json"))
+    payload_json, meta_json = _validate_start(kind, stage, payload, meta)
     d.mkdir(parents=True, exist_ok=True)
     try:
         (d / "payload.json").write_text(payload_json, encoding="utf-8")
@@ -547,6 +833,70 @@ def raw_result(job_id: str) -> Optional[dict]:
         return None
     result = finished.get("result")
     return result if isinstance(result, dict) and result.get("ok") is True else None
+
+
+# ---------------------------------------------------------------- collect (exactly once)
+# The stage result is raw solver output; the COLLECT stage that turns it into the tool's
+# reply envelope runs back in the parent, because that is where the live document is and
+# therefore the only place the study can be written into the part. Collect is not pure:
+# `_persist_study` appends a study record to the document. So it must run ONCE per job, no
+# matter how many times (or from how many processes) the job is polled afterwards — the
+# alternative is one solve producing five identical studies in the feature tree.
+#
+# The claim file is the arbiter: O_EXCL creation is atomic across processes, so exactly one
+# poller collects and everybody else reads the artifact it wrote.
+
+def collected(job_id: str) -> Optional[dict]:
+    """The collected reply envelope for a finished job, or None when nobody collected yet."""
+    return _read_json(job_dir(job_id) / "collected.json")
+
+
+def claim_collect(job_id: str) -> bool:
+    """True for the ONE caller that may run the collect stage for `job_id`."""
+    try:
+        fd = os.open(str(job_dir(job_id) / "collect.claim"),
+                     os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        # No spool to arbitrate with (pruned, read-only): collecting twice is a lesser
+        # failure than never reporting the answer at all.
+        return True
+    try:
+        os.write(fd, f"{os.getpid()} {time.time():.3f}".encode())
+    finally:
+        os.close(fd)
+    return True
+
+
+def release_collect(job_id: str) -> None:
+    """Drop an UNFULFILLED claim so a later poll can retry the collect."""
+    try:
+        (job_dir(job_id) / "collect.claim").unlink()
+    except OSError:
+        pass
+
+
+def save_collected(job_id: str, value: dict) -> dict:
+    """Persist the collect stage's reply so every later poll returns the SAME answer.
+
+    Best-effort by design: a reply that cannot be spooled (non-finite float, unwritable
+    spool) is still returned to the caller who computed it — losing the answer would be a
+    worse outcome than losing the ability to replay it.
+    """
+    d = job_dir(job_id)
+    try:
+        text = json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        return value
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / "collected.json.tmp"
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, d / "collected.json")
+    except OSError:
+        pass
+    return value
 
 
 def list_jobs(limit: int = 20) -> list:

@@ -256,6 +256,74 @@ audit_production_payload() {
     [ -z "$bad" ] || { echo "error: forbidden source/debug/repository artifact survived staging: $bad" >&2; exit 1; }
 }
 
+# Learned mesh-advisor runtime (the polymesh ONNX advisor).
+#
+# core/sim/polymesh_backend.cpp resolves the model package relative to ITS OWN module —
+# libchudware.so — so the package belongs in usr/lib beside the engine, never in usr/bin
+# beside the GUI: the GUI dlopen's the engine and the two live in different directories
+# here. Only the four artifacts the advisor actually opens are carried; the rest of
+# bench/advisor is campaign evidence (the cross-validation dumps alone are ~90 MB, plus an
+# 8 MB dashboard) with no runtime role.
+#
+# The engine's own DT_NEEDED entries decide whether any of this ships. An engine configured
+# without the advisor links no ONNX Runtime and needs no package, so such a build stages
+# nothing and stays valid. An advisor-linked engine whose package is incomplete would ship a
+# permanently dead optimizer that silently falls back on every study, so that case fails
+# packaging instead of reaching a customer.
+ADVISOR_PACKAGE_DIR="polymesh-advisor"
+ADVISOR_REQUIRED_FILES=(model.onnx normalization.json clamps.json ood.json)
+
+engine_onnxruntime_sonames() {  # DT_NEEDED names matching libonnxruntime, one per line
+    readelf -d "$1" 2>/dev/null |
+        sed -n 's/.*(NEEDED).*\[\(libonnxruntime[^]]*\)\].*/\1/p'
+}
+
+stage_polymesh_advisor() {
+    local engine="$1" destdir="$2" srcdir f soname candidate found
+    srcdir="$(dirname "$engine")"
+    command -v readelf >/dev/null 2>&1 || {
+        echo "error: readelf (binutils) is required to check the engine's ONNX Runtime linkage" >&2
+        exit 1
+    }
+    local sonames=()
+    mapfile -t sonames < <(engine_onnxruntime_sonames "$engine")
+    if [ "${#sonames[@]}" -eq 0 ]; then
+        echo "==> engine links no ONNX Runtime: mesh advisor disabled, no advisor payload to stage"
+        return 0
+    fi
+    for f in "${ADVISOR_REQUIRED_FILES[@]}"; do
+        [ -f "$srcdir/$ADVISOR_PACKAGE_DIR/$f" ] || {
+            echo "error: $engine links ONNX Runtime but its advisor package is incomplete:" >&2
+            echo "       missing $srcdir/$ADVISOR_PACKAGE_DIR/$f" >&2
+            echo "       rebuild the engine so CMake stages the advisor package; refusing to ship a dead optimizer" >&2
+            exit 1
+        }
+    done
+    mkdir -p "$destdir/$ADVISOR_PACKAGE_DIR"
+    for f in "${ADVISOR_REQUIRED_FILES[@]}"; do
+        cp -L "$srcdir/$ADVISOR_PACKAGE_DIR/$f" "$destdir/$ADVISOR_PACKAGE_DIR/$f"
+        chmod 0644 "$destdir/$ADVISOR_PACKAGE_DIR/$f"
+    done
+    # One ONNX Runtime, staged under the exact name the engine asks for. The build tree
+    # keeps libonnxruntime.so plus its versioned symlinks while the engine records the
+    # SONAME (libonnxruntime.so.1), and the payload may hold no symlinks at all
+    # (audit_production_payload), so the resolvable name has to be the real file.
+    for soname in "${sonames[@]}"; do
+        found=""
+        for candidate in "$srcdir/$soname" "$srcdir/libonnxruntime.so"; do
+            if [ -f "$candidate" ]; then found="$candidate"; break; fi
+        done
+        [ -n "$found" ] || {
+            echo "error: $engine needs $soname but no ONNX Runtime is staged beside it in $srcdir" >&2
+            echo "       rebuild the engine so CMake stages the ONNX Runtime; the advisor cannot load without it" >&2
+            exit 1
+        }
+        cp -L "$found" "$destdir/$soname"
+        chmod 0755 "$destdir/$soname"
+    done
+    echo "==> staged advisor package (${#ADVISOR_REQUIRED_FILES[@]} artifacts) + ${#sonames[@]} ONNX Runtime into $destdir"
+}
+
 APPDIR="$OUT/AppDir"
 if [ "$MODE" = prepare ]; then
     [ -n "$BIN" ] && [ -n "$HOSTD" ] && [ -n "$PROTECTED_ASSETS_OUT" ] || {
@@ -361,6 +429,12 @@ if [ "$WITH_LIBCHUDWARE" = "1" ]; then
             fi
         done
         echo "==> bundled libchudware.so + siblings from $LIBDIR (real engine, not demo mode)"
+
+        # Advisor model package + ONNX Runtime, beside the engine that resolves them. Runs
+        # before the closure walk below so the walk finds the staged runtime already in
+        # place instead of pulling the build tree's _deps copy under a name the packaged
+        # engine cannot resolve.
+        stage_polymesh_advisor "$LIBCHUDWARE" "$APPDIR/usr/lib"
 
         # OCCT 7.9 + engine runtime closure. The engine links 34 libTK*.so.7.9 plus
         # TBB and a networking tail; none of it is bundled by default, so the AppImage

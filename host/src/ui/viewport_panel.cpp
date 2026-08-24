@@ -2558,54 +2558,124 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // the ghost would read muddy.
             if (!st.featureHighlightFaces.empty() && !pmPreviewing)
                 st.overlays->drawFeatureHighlight(renderer.camera(), st.featureHighlightFaces);
+            // Build the simulation CPU batches first: collectFlowResultLines may lazily rebuild its
+            // cached stream/slice geometry and advance overlayGeneration(). Capturing the generation
+            // afterwards ensures this frame's persistent GL buffers are keyed to the data drawn.
+            const bool inSimulation =
+                st.activeWorkspace == AppState::Workspace::Simulate && st.simManager;
+            const bool simPreview = inSimulation && st.simManager->previewActive(st);
+            const bool flowSetup = inSimulation && st.simManager->flowSetupActive(st);
+            const bool flowResult = inSimulation && st.simManager->flowResultLinesActive(st);
+            std::vector<uint64_t> fix, load;
+            std::vector<float> loadSegs, fixSegs, loadTris, fixTris;
+            std::vector<float> arrowSegs, domainSegs, inletSegs, arrowTris;
+            std::vector<ui::SimManager::FlowLineBatch> flowBatches;
+            bool meshPreview = false;
+            if (simPreview) {
+                st.simManager->collectFixtureFaces(fix);
+                st.simManager->collectLoadFaces(load);
+                st.simManager->collectIndicatorSegments(st, loadSegs, fixSegs,
+                                                        &loadTris, &fixTris);
+                meshPreview = st.simManager->hasMeshPreview(st);
+            }
+            if (flowSetup)
+                st.simManager->collectFlowSetup(st, arrowSegs, domainSegs, inletSegs,
+                                                &arrowTris);
+            if (flowResult) st.simManager->collectFlowResultLines(st, flowBatches);
+
+            const bool hasSimulationFrame = simPreview || flowSetup || flowResult;
+            uint64_t simulationGeneration = 0;
+            if (hasSimulationFrame) {
+                simulationGeneration = st.simManager->overlayGeneration();
+                // Scope the GL cache to the active worker document as well as its manager
+                // generation. This prevents equal generation values in different tabs from
+                // retaining one another's mesh/result buffers.
+                uint64_t documentScope = 1469598103934665603ull;
+                if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+                    documentScope ^= (uint64_t)(st.activeTab + 1);
+                    documentScope *= 1099511628211ull;
+                    for (unsigned char c : st.docTabs[st.activeTab].docId) {
+                        documentScope ^= c;
+                        documentScope *= 1099511628211ull;
+                    }
+                }
+                st.overlays->beginSimulationFrame(simulationGeneration, documentScope);
+            } else {
+                st.overlays->clearSimulationBuffers();
+            }
+
+            constexpr uint64_t kSimLoadSegments = 1;
+            constexpr uint64_t kSimFixtureSegments = 2;
+            constexpr uint64_t kSimLoadTriangles = 3;
+            constexpr uint64_t kSimFixtureTriangles = 4;
+            constexpr uint64_t kSimMeshSegments = 5;
+            constexpr uint64_t kSimFlowDomainSegments = 6;
+            constexpr uint64_t kSimFlowInletSegments = 7;
+            constexpr uint64_t kSimFlowArrowSegments = 8;
+            constexpr uint64_t kSimFlowArrowTriangles = 9;
+            constexpr uint64_t kSimFlowResultBase = 0x100;
+
             // Simulation pre-run previews: paint the selected study's fixture faces green and its
             // load faces red so the setup reads at a glance before solving (gated off while a result
             // colormap is showing so the tints don't muddy the stress plot).
-            if (st.simManager && st.simManager->previewActive(st)) {
-                std::vector<uint64_t> fix, load;
-                st.simManager->collectFixtureFaces(fix);
-                st.simManager->collectLoadFaces(load);
-                const auto& vpal = ui::palette;   // sim/flow/CAM overlay roles (theme-tunable)
+            if (simPreview) {
+                const auto& vpal = ui::palette;
                 if (!fix.empty())  st.overlays->drawFaceWash(renderer.camera(), fix, vpal.simFixture);
                 if (!load.empty()) st.overlays->drawFaceWash(renderer.camera(), load, vpal.simLoad);
-                // 3D indicators on top of the washes: red arrows for loads (force along the vector,
-                // pressure into the face) and green ground glyphs at fixtures — so direction + which
-                // faces are constrained/loaded read at a glance, not just a flat tint. The optional
-                // triangle batches carry the SOLID cone heads / anchor glyphs (sim_manager emits
-                // legacy wireframe heads when the out-params are omitted).
-                std::vector<float> loadSegs, fixSegs, loadTris, fixTris;
-                st.simManager->collectIndicatorSegments(st, loadSegs, fixSegs, &loadTris, &fixTris);
-                if (!loadSegs.empty()) st.overlays->drawSegments(renderer.camera(), loadSegs, vpal.simArrow, 2.5f);
-                if (!fixSegs.empty())  st.overlays->drawSegments(renderer.camera(), fixSegs,  vpal.simGlyph, 2.5f);
-                if (!loadTris.empty()) st.overlays->drawTriangles(renderer.camera(), loadTris, vpal.simArrow);
-                if (!fixTris.empty())  st.overlays->drawTriangles(renderer.camera(), fixTris,  vpal.simGlyph);
-                // Mesh-preview wireframe (surface element edges) while setting the study up.
-                if (st.simManager->hasMeshPreview(st)) {
-                    st.overlays->drawSegments(renderer.camera(),
-                                              st.simManager->meshPreviewSegments(), vpal.simMesh, 1.0f);
+                // On-demand indicator batches use content fingerprints because SimManager's
+                // generation intentionally covers only its retained mesh/flow geometry.
+                if (!loadSegs.empty())
+                    st.overlays->drawSimulationSegments(renderer.camera(), kSimLoadSegments,
+                                                        loadSegs, vpal.simArrow, 2.5f);
+                if (!fixSegs.empty())
+                    st.overlays->drawSimulationSegments(renderer.camera(), kSimFixtureSegments,
+                                                        fixSegs, vpal.simGlyph, 2.5f);
+                if (!loadTris.empty())
+                    st.overlays->drawSimulationTriangles(renderer.camera(), kSimLoadTriangles,
+                                                         loadTris, vpal.simArrow);
+                if (!fixTris.empty())
+                    st.overlays->drawSimulationTriangles(renderer.camera(), kSimFixtureTriangles,
+                                                         fixTris, vpal.simGlyph);
+                if (meshPreview)
+                    st.overlays->drawSimulationSegments(
+                        renderer.camera(), kSimMeshSegments,
+                        st.simManager->meshPreviewSegments(), vpal.simMesh, 1.0f, true,
+                        simulationGeneration);
+            }
+            // Flow-study setup preview: incoming-flow arrows + the wind-tunnel domain box + inlet
+            // plane, sized and oriented to the study. These generated batches are fingerprinted.
+            if (flowSetup) {
+                const auto& vpal = ui::palette;
+                if (!domainSegs.empty())
+                    st.overlays->drawSimulationSegments(renderer.camera(),
+                                                        kSimFlowDomainSegments, domainSegs,
+                                                        vpal.flowDomain, 1.2f);
+                if (!inletSegs.empty())
+                    st.overlays->drawSimulationSegments(renderer.camera(),
+                                                        kSimFlowInletSegments, inletSegs,
+                                                        vpal.flowInlet, 1.5f);
+                if (!arrowSegs.empty())
+                    st.overlays->drawSimulationSegments(renderer.camera(),
+                                                        kSimFlowArrowSegments, arrowSegs,
+                                                        vpal.flowArrow, 2.5f);
+                if (!arrowTris.empty())
+                    st.overlays->drawSimulationTriangles(renderer.camera(),
+                                                         kSimFlowArrowTriangles, arrowTris,
+                                                         vpal.flowArrow);
+            }
+            // Flow-study result: speed-colored streamlines + velocity slices drawn over the
+            // Cp-colored model. Stable logical batch keys plus overlayGeneration avoid both
+            // per-frame uploads and payload scans for these potentially large retained vectors.
+            if (flowResult) {
+                for (size_t i = 0; i < flowBatches.size(); ++i) {
+                    const auto& fb = flowBatches[i];
+                    if (fb.segs && !fb.segs->empty())
+                        st.overlays->drawSimulationSegments(
+                            renderer.camera(), kSimFlowResultBase + (uint64_t)i,
+                            *fb.segs, fb.color, 2.0f, true, simulationGeneration);
                 }
             }
-            // Flow-study setup preview: incoming-flow arrows + the wind-tunnel domain box + inlet plane,
-            // sized to the model and oriented by the base axis / AoA / sideslip, so the user sees how the
-            // analysis is framed before committing minutes to a solve.
-            if (st.simManager && st.simManager->flowSetupActive(st)) {
-                std::vector<float> arrowSegs, domainSegs, inletSegs, arrowTris;
-                st.simManager->collectFlowSetup(st, arrowSegs, domainSegs, inletSegs, &arrowTris);
-                const auto& vpal = ui::palette;
-                if (!domainSegs.empty()) st.overlays->drawSegments(renderer.camera(), domainSegs, vpal.flowDomain, 1.2f);
-                if (!inletSegs.empty())  st.overlays->drawSegments(renderer.camera(), inletSegs, vpal.flowInlet, 1.5f);
-                if (!arrowSegs.empty())  st.overlays->drawSegments(renderer.camera(), arrowSegs, vpal.flowArrow, 2.5f);
-                if (!arrowTris.empty())  st.overlays->drawTriangles(renderer.camera(), arrowTris, vpal.flowArrow);
-            }
-            // Flow-study result: speed-colored streamlines + velocity slices drawn OVER the (still
-            // visible, Cp-colored) model. Each batch is one speed band drawn in its ramp colour.
-            if (st.simManager && st.simManager->flowResultLinesActive(st)) {
-                std::vector<ui::SimManager::FlowLineBatch> batches;
-                st.simManager->collectFlowResultLines(st, batches);
-                for (const auto& fb : batches)
-                    if (fb.segs && !fb.segs->empty())
-                        st.overlays->drawSegments(renderer.camera(), *fb.segs, fb.color, 2.0f, true);
-            }
+            if (hasSimulationFrame) st.overlays->endSimulationFrame();
             // CAM geometry is a Manufacture-only native overlay. Path batches stay in their
             // original CPU buffers: drawCamSegments uploads each class once, then selects the
             // completed prefix and pending suffix with GL ranges using the end-time array.
@@ -2782,6 +2852,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
             st.overlays->draw(renderer.camera(), st.hover, selHits);
             renderer.endOverlay();
+        }
+        else if (st.overlays) {
+            // No active document mesh means no simulation geometry is eligible to render. Release
+            // retained batches immediately rather than waiting for a later pickable frame.
+            st.overlays->clearSimulationBuffers();
         }
 
         // W2 full-bleed viewport: the shaded 3D is composited on the BACKGROUND draw list so it sits

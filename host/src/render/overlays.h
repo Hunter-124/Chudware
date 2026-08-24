@@ -86,6 +86,24 @@ public:
     void drawTriangles(const Renderer::CameraXform& cam, const std::vector<float>& xyz,
                        const float rgba[4], bool overSurface = true);
 
+    // Persistent simulation geometry. beginSimulationFrame scopes the cache to the active
+    // document and SimManager geometry generation; a scope/generation change releases every old
+    // batch before any new draw. batchKey is a caller-stable identity for one logical source batch.
+    // sourceRevision=0 fingerprints the supplied vertices (for on-demand setup previews);
+    // non-zero revisions avoid re-scanning SimManager's already-versioned mesh/result caches.
+    void beginSimulationFrame(uint64_t generation, uint64_t documentScope);
+    void drawSimulationSegments(const Renderer::CameraXform& cam, uint64_t batchKey,
+                                const std::vector<float>& xyz, const float rgba[4],
+                                float lineWidth = 2.0f, bool overSurface = true,
+                                uint64_t sourceRevision = 0);
+    void drawSimulationTriangles(const Renderer::CameraXform& cam, uint64_t batchKey,
+                                 const std::vector<float>& xyz, const float rgba[4],
+                                 bool overSurface = true, uint64_t sourceRevision = 0);
+    // Removes batches not submitted since beginSimulationFrame. clearSimulationBuffers is also
+    // used when the simulation overlay is hidden or the active workspace/document changes.
+    void endSimulationFrame();
+    void clearSimulationBuffers();
+
 private:
     void destroy();
     // Bind prog_ + upload the per-frame camera/clip uniforms shared by every draw path.
@@ -96,6 +114,15 @@ private:
     struct FaceBuf { unsigned int vao = 0, vbo = 0, ebo = 0; int idxCount = 0; };
     struct EdgeBuf { unsigned int vao = 0, vbo = 0; int vertCount = 0; };
 
+    struct SimulationBuf {
+        unsigned int vao = 0, vbo = 0, primitive = 0;
+        int vertCount = 0;
+        uint64_t sourceRevision = 0;
+        uint64_t lastFrame = 0;
+    };
+    SimulationBuf* prepareSimulationBuffer(uint64_t batchKey, unsigned int primitive,
+                                           const std::vector<float>& xyz,
+                                           uint64_t sourceRevision);
     // lookups keyed by (body_id<<32)|topo_id — the same packing callers use for face keys.
     static uint64_t key(uint32_t body, uint32_t topo) { return ((uint64_t)body << 32) | topo; }
     const FaceBuf* findFace(uint32_t body, uint32_t face_id) const;
@@ -117,6 +144,11 @@ private:
     std::unordered_map<uint64_t, EdgeBuf> edges_;
     std::unordered_map<uint64_t, std::array<float, 3>> verts_;
     std::vector<unsigned int> bodyVbos_;  // owns the per-body shared position VBOs (FaceBuf.vbo refs)
+    std::unordered_map<uint64_t, SimulationBuf> simulationBufs_;
+    uint64_t simulationGeneration_ = 0;
+    uint64_t simulationDocumentScope_ = 0;
+    uint64_t simulationFrame_ = 0;
+    bool simulationFrameActive_ = false;
 
     float hoverCol_[4] = {0.176f, 0.831f, 0.749f, 0.45f};      // teal wash (hover, not selected)
     // Amber's bright RGB channels (esp. R=1.0) composite lighter than teal against gray shaded

@@ -2079,6 +2079,16 @@ def recover_skipped() -> int:
 import threading as _threading  # noqa: E402
 import uuid as _uuid  # noqa: E402
 
+
+#: Durable sim-job ids are minted by services/sim/jobs.py as ``sim-<hex>``; the thread
+#: table mints ``job-<hex>``. The prefixes are disjoint, so one id space can serve both.
+_DURABLE_JOB_PREFIX = "sim-"
+
+
+#: In-process thread jobs only. Durable ``sim-*`` jobs live in the SQLite registry and are
+#: resolved by ``get_job`` only after it releases ``_JOB_LOCK``; registry reads and DONE
+#: collection may wait, call the engine, and persist a study, so they must never hide behind
+#: this process-local bookkeeping lock.
 _JOBS: dict = {}
 _JOB_LOCK = _threading.Lock()
 
@@ -2163,6 +2173,150 @@ def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
             "note": (f"solve still running after {budget_s:.0f}s — continued in the BACKGROUND "
                      f"to avoid a transport timeout (which would drop open documents). "
                      f"Open parts were autosaved. Poll get_job('{jid}').")}
+
+
+# --- durable (out-of-process) sim jobs ---------------------------------------------------
+# The thread table above cannot do the three things a multi-minute solve needs: it cannot be
+# cancelled (a Python thread sitting in one ctypes call into libchudware is unkillable), it
+# cannot survive the process (an agent turn forks a fresh worker, and a client timeout can
+# restart the server outright), and it exposes nothing until the closure returns. So every
+# heavy run_fea_* / run_cfd_* path runs its SOLVE in a child process tracked by the SQLite
+# registry in services/sim/jobs.py, and only the SETUP (needs the live document) and the
+# COLLECT (writes the study back into the document) stay here.
+#
+# The thread table keeps serving everything else — add_features batches, ECAD autoroute —
+# which are engine mutations on the live doc table and therefore cannot be moved to a child
+# that shares no documents.
+
+from services.sim import jobs as _simjobs  # noqa: E402
+
+#: Durable job kind -> collector(status_dict, raw_stage_result) -> reply envelope.
+#: Registered by services/mcp/cad_sim_tools.py, which owns the reply shapes. ``get_job``
+#: calls ``durable_job_snapshot`` outside the thread-job lock for reconnect-safe lookup.
+_DURABLE_COLLECTORS: dict = {}
+
+#: How long a poller that lost the collect race waits for the winner's artifact before
+#: collecting itself. Collect is an engine round-trip on an open document, not a solve.
+_COLLECT_WAIT_S = 10.0
+
+
+def register_durable_collector(kind: str, fn) -> None:
+    """Register the COLLECT stage for a durable job kind."""
+    _DURABLE_COLLECTORS[str(kind)] = fn
+
+
+def _durable_kind(st: dict) -> str:
+    meta = st.get("meta") or {}
+    return str(meta.get("analysis") or st.get("kind") or "")
+
+
+def collect_durable(job_id: str, st: Optional[dict] = None) -> dict:
+    """The finished job's reply envelope, computed EXACTLY ONCE and replayed thereafter.
+
+    Collect is not a pure formatting step: it writes the solved study into the document, so
+    running it per poll would grow one study record per poll in the feature tree. The spool
+    arbitrates with an atomic claim file, so concurrent pollers — including pollers in
+    DIFFERENT processes after a restart — all read the one envelope the winner wrote.
+    """
+    cached = _simjobs.collected(job_id)
+    if cached is not None:
+        return cached
+    if st is None:
+        st = _simjobs.status(job_id)
+    if not _simjobs.claim_collect(job_id):
+        deadline = time.time() + _COLLECT_WAIT_S
+        while time.time() < deadline:
+            cached = _simjobs.collected(job_id)
+            if cached is not None:
+                return cached
+            time.sleep(0.05)
+        # The claim holder died mid-collect (or was killed with the server). Take over
+        # rather than strand a finished solve behind a stale lock file.
+    try:
+        raw = _simjobs.raw_result(job_id)
+        if raw is None:
+            return {"ok": False, "job_id": job_id, "state": st.get("state"),
+                    "error": "the job finished but its result artifact could not be read — "
+                             "nothing can be reported honestly. Re-run the solve."}
+        collector = _DURABLE_COLLECTORS.get(_durable_kind(st))
+        if collector is None:
+            return {"ok": False, "job_id": job_id,
+                    "error": f"no result collector for job kind {_durable_kind(st)!r}"}
+        out = collector(st, raw)
+    except Exception as exc:  # noqa: BLE001 — a broken collect must not strand the job
+        _simjobs.release_collect(job_id)
+        return {"ok": False, "job_id": job_id,
+                "error": f"collecting job {job_id} failed: {exc}"}
+    return _simjobs.save_collected(job_id, out)
+
+
+def durable_job_snapshot(job_id: str) -> Optional[dict]:
+    """Render a durable job in the THREAD table's record shape, or return None.
+
+    The caller must not hold ``_JOB_LOCK``: a DONE snapshot collects and persists the
+    solved study exactly once, which can wait on another process's collect claim and call
+    back into the document engine.
+    """
+    try:
+        st = _simjobs.status(job_id)
+    except Exception:  # noqa: BLE001 — an unreachable registry is "not our job", not a crash
+        return None
+    state = st.get("state")
+    if state == "unknown":
+        return None
+    rec = {"kind": _durable_kind(st), "durable": True, "job_id": job_id,
+           "result": None, "error": None, "progress": st.get("progress") or {},
+           "started_at": st.get("started_at"), "done_at": st.get("done_at")}
+    if state == _simjobs.DONE:
+        rec["status"] = "done"
+        rec["result"] = collect_durable(job_id, st)
+    elif state in (_simjobs.FAILED, _simjobs.CANCELLED):
+        rec["status"] = "error"
+        rec["error"] = st.get("error") or f"solve {state}"
+    else:
+        rec["status"] = "running"
+        rec["progress"] = {**rec["progress"], "elapsed_s": st.get("elapsed_s")}
+    return rec
+
+
+def durable_handoff(job_id: str, budget_s: float) -> dict:
+    """The reply for a solve that outran its synchronous budget and stayed in the child."""
+    return {"ok": True, "job_id": job_id, "status": "running", "state": "running",
+            "auto_backgrounded": True, "cancel_supported": True,
+            "note": (f"solve still running after {budget_s:.0f}s — continued in a SEPARATE "
+                     "PROCESS to avoid a transport timeout (which would drop open "
+                     "documents). Open parts were autosaved. The job is persisted on disk, "
+                     "so it survives an MCP restart and can be collected in a later turn: "
+                     f"poll get_job('{job_id}') or sim_status('{job_id}')."),
+            "next_actions": [f"get_job('{job_id}')", f"sim_cancel('{job_id}')"]}
+
+
+def solve_durable_or_handoff(kind: str, stage: str, payload: dict,
+                             meta: Optional[dict] = None,
+                             budget_s: float = _SYNC_SOLVE_BUDGET_S) -> dict:
+    """Start a durable solve and wait for it, but never past the transport's patience.
+
+    A fast solve returns its collected envelope inline — byte-identical to what the
+    synchronous tool always returned. A slow one is LEFT RUNNING in its own process and the
+    call returns the job id in time, so the transport never times out and kills the session.
+    """
+    job = _simjobs.start(kind, stage, payload, meta)
+    jid = job["job_id"]
+    deadline = time.time() + max(1.0, budget_s)
+    # Adaptive poll: fine at first so a small solve returns almost immediately, backing off
+    # so a multi-minute run isn't hammering SQLite for its whole budget.
+    interval = 0.02
+    while time.time() < deadline:
+        st = _simjobs.status(jid)
+        state = st.get("state")
+        if state == _simjobs.DONE:
+            return collect_durable(jid, st)
+        if state in (_simjobs.FAILED, _simjobs.CANCELLED):
+            return {"ok": False, "job_id": jid, "state": state,
+                    "error": st.get("error") or f"solve {state}"}
+        time.sleep(interval)
+        interval = min(0.4, interval * 1.5)
+    return durable_handoff(jid, budget_s)
 
 
 # A small material library so FEA tools take a friendly name. Fields are exactly what the

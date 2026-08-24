@@ -22,6 +22,13 @@ namespace chudware::sim {
 
 using nlohmann::json;
 
+namespace detail {
+// Defined in sim/fea_run.cpp, which owns the one advisor->JSON shape every study route
+// reports. Declared here rather than duplicated: an adaptive result's advisor envelope
+// must be field-for-field the same object an ordinary study returns.
+json mesh_advisor_json(const MeshAdvisor& advisor);
+}  // namespace detail
+
 namespace {
 
 constexpr int kDefaultMaxPasses = 3;
@@ -35,6 +42,11 @@ MeshOptions mesh_options_from_study(const json& study) {
     options.target_size_mm = study.value("target_size_mm", 0.0);
     options.min_size_mm = study.value("min_size_mm", 0.0);
     options.max_size_mm = study.value("max_size_mm", 0.0);
+    // The learned advisor is opt-in per study and is read from the SAME two keys
+    // fea_run.cpp's STEP route reads. Dropping them here is what previously made an
+    // opted-in adaptive study the one route that could never reach the advisor.
+    options.learned_advisor = study.value("learned_advisor", false);
+    options.advisor_max_dof = study.value("advisor_max_dof", uint32_t{0});
     // An adaptive run resolves its own element size every pass, so the Netgen-only shape
     // controls are not merely unused, they would be misleading if echoed.
     options.curvature = false;
@@ -92,6 +104,13 @@ json fea_run_adaptive(const json& study) {
         json pass_study = study;
         pass_study.erase("step_path");
         pass_study.erase("adapt");
+        // The advisor already ran, on the geometry, in PolymeshAdaptiveMesher::open. Left in
+        // place these two keys make fea_run_static's inline route report the envelope it
+        // owes an inline study — "advisor unavailable: learned advising requires STEP
+        // geometry" — which for THIS study would be a false statement about a decision that
+        // was made. The real envelope is attached to the result below.
+        pass_study.erase("learned_advisor");
+        pass_study.erase("advisor_max_dof");
 
         json result;
         json passes = json::array();
@@ -127,6 +146,7 @@ json fea_run_adaptive(const json& study) {
                 result["adapt"] = json{{"passes", passes},
                                        {"failed_pass", pass + 1},
                                        {"element_size_mm", mesher->element_size_mm()}};
+                if (mesh.advisor) result["advisor"] = detail::mesh_advisor_json(*mesh.advisor);
                 return result;
             }
             ++passes_run;
@@ -178,6 +198,11 @@ json fea_run_adaptive(const json& study) {
                                {"eta_target_met", target_met},
                                {"stop_reason", stop_reason},
                                {"mesher_backend", mesher_backend_name(MesherBackend::Polymesh)}};
+        // The envelope the advisor actually produced for THIS geometry, in the same shape
+        // every other study route reports it. mesh.advisor is the value
+        // PolymeshAdaptiveMesher::mesh attached on the final pass; it is absent exactly
+        // when the study never opted in.
+        if (mesh.advisor) result["advisor"] = detail::mesh_advisor_json(*mesh.advisor);
         // A result that missed its accuracy target must SAY so where a reader will see it,
         // not only in a nested block: an unconverged stress number that looks converged is
         // the exact failure this feature exists to prevent.

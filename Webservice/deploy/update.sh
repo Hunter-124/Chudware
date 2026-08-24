@@ -499,6 +499,12 @@ fi
 
 ENGINE_ARTIFACT_DIR="$REPO/core/build-occt-linux/bin"
 if [[ "$DO_ENGINE" = 1 ]]; then
+  if [[ "$DO_WEBD" = 1 ]]; then
+    [[ -f "$REPO/core/build-occt-linux/CMakeCache.txt" ]] \
+      || { echo "ERROR: webd engine tree is not configured: core/build-occt-linux" >&2; exit 1; }
+    echo "=== [$(date -Iseconds)] configure required webd PolyMesh backend ==="
+    cmake -S core -B core/build-occt-linux -DCHUDWARE_WITH_POLYMESH=ON
+  fi
   echo "=== [$(date -Iseconds)] ./build.sh daemon ==="
   ./build.sh daemon
   [[ -x "$ENGINE_ARTIFACT_DIR/chudware-hostd" && -f "$ENGINE_ARTIFACT_DIR/libchudware.so" ]] \

@@ -36,6 +36,7 @@
 #include "widgets/interwebz.h" // ui::InterwebzDemoToggle (View > Interwebz demo)
 #include "plm/plm_hub.h"       // ui::plmProjectName (active-project status control)
 #include "tesseract.h"         // ui::drawTesseract (vector brand mark in the title bar)
+#include "widgets/kit.h"       // ui::kit::elide (active-project label capping)
 
 #include <filesystem>      // Recent-files menu labels
 #include <cstdio>          // snprintf
@@ -411,129 +412,250 @@ static ChipResult drawChipAt(const char* btnId,
 // ---- Active-project status control (title bar) --------------------------
 // Distinct from the workspace-tab chips on purpose: this is a persistent piece of
 // app state (which project folder is active), not a page switch. It reads as a
-// recessed "field" — tight corners + an always-visible accent border + a trailing
-// chevron that signals "click opens a switcher" — where the tabs are borderless
-// pills that only wash on hover/active. Click opens the same folder picker the
-// old PLM-tab nav button used (see plm/plm_workspace.cpp drawNavFolderButton,
-// now removed in favor of this one shared control).
+// compact recessed "field" — tight corners, a leading status dot, an elided label
+// and a trailing chevron that signals "click opens a switcher" — where the tabs
+// are borderless pills that only wash on hover/active.
+//
+// COMPACTNESS IS A CONSTRAINT HERE, NOT A STYLE PREFERENCE. The label can be a
+// tenant string derived from an email address ("someone@example.com"), roughly 3x
+// the width of a folder name, and the centered workspace-tab strip pays for every
+// pixel this control takes: once the strip no longer fits it collapses to
+// icon-only. So the text is capped and elided, the full name lives in the tooltip,
+// and the chrome is one glass slab instead of the old always-on triple bloom.
+//
 // "Project Folder" affordance (File > Open Project Folder..., and the title-bar
 // active-project chip below) — same trigger, platform-appropriate target:
 //   - Native: an OS folder picker choosing the CAD workspace dir (unchanged).
 //   - Web: the native-dialog stand-in (openFolderDialog()'s Emscripten branch)
 //     browses /workspace/* — the engine's live doc tree, not a place a team
 //     drops arbitrary files. The Team Bucket (/bucket) is that place, so on
-//     web this opens the SAME centered-overlay treatment the workspace picker
-//     uses (see chudware_web_dialogs.js's #chudware-ws-browse: dark panel,
-//     backdrop, middle of the screen) with the bucket UI mounted as content.
+//     web this opens a centered overlay with the bucket UI mounted as content.
 //     NOT an <iframe src="/bucket">: Cloudflare Access refuses to let its own
 //     protected app be framed at all — even same-origin — which is the
 //     "chudware.com refused to connect" error an iframe here produces.
 //     Instead this does a normal same-page fetch('/bucket') (a plain AJAX
 //     request, not a nested browsing context, so Access allows it exactly
-//     like every other /api/* call this app already makes), pulls out
-//     bucket.html's <main> markup + <style> rules (scoped under our own
-//     container id so they can't leak into/collide with the rest of the
-//     app's page), mounts them, then loads bucket.js fresh against that
-//     mounted DOM. Reuses bucket.html/bucket.js/the /api/bucket/* surface
-//     wholesale — zero duplicated upload/drag-drop/rename/mkdir logic.
-//     Built once and toggled visible/hidden on repeat opens (not torn down
-//     each time) so bucket.js's IIFE — and its document-level drag/drop
-//     listeners — only ever run once. Fire-and-forget (no path is picked/
-//     returned), so no Asyncify and no setActiveProjectDir() call — the
-//     bucket is independent of the CAD workspace.
+//     like every other /api/* call this app already makes).
+//
+//     ASSET DISCOVERY. bucket.html is the single source of truth for its own
+//     assets: its stylesheet and script are content-hashed filenames under
+//     /portal-assets/ that change every time that CSS/JS changes. Nothing here
+//     may hardcode one (a stale /static/bucket.js path is exactly why the
+//     embedded bucket rendered unstyled and dead). The fetched document is
+//     parsed and its <link rel=stylesheet> + <script src> are read off the
+//     markup. There is no inline <style> to scrape any more, and no scoping
+//     rewrite: every bucket rule is authored under the .bucket-surface root, so
+//     the stylesheet is safe to link into this document as-is.
+//
+//     MOUNTING. The parsed .bucket-surface node (which carries the file list,
+//     the toolbar AND the rename/confirm <dialog>s) is kept detached as a
+//     template and a fresh clone is inserted on every open, so element ids are
+//     never duplicated. bucket.js is appended ONCE per document lifetime: it
+//     auto-binds the surface present when it runs and exports
+//     window.ChudwareBucket.mount(root) for later clones, and it installs its
+//     document-level drag/drop listeners internally exactly once. Assets are
+//     memoized by absolute URL so reopening never re-adds a <link>/<script>.
+//     Fire-and-forget (no path is picked/returned), so no Asyncify and no
+//     setActiveProjectDir() call — the bucket is independent of the CAD
+//     workspace.
 static void openProjectFolderAction(AppState& st) {
 #ifdef __EMSCRIPTEN__
     (void)st;
     EM_ASM({
+        var st = window.__chudwareBucket;
+        if (!st) {
+            st = {};
+            st.assets = {};      // absolute asset URL -> load Promise (dedupe)
+            st.template = null;  // detached .bucket-surface node, cloned per open
+            st.css = null;
+            st.js = null;
+            st.loading = false;
+            window.__chudwareBucket = st;
+        }
+
         var overlay = document.getElementById('chudware-bucket-modal');
-        if (overlay) { overlay.style.display = 'flex'; return; }
+        function hide() { overlay.style.display = 'none'; }
 
-        overlay = document.createElement('div');
-        overlay.id = 'chudware-bucket-modal';
-        overlay.style.cssText =
-            'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,0.45);' +
-            'display:flex;align-items:center;justify-content:center;font-family:' +
-            'system-ui,-apple-system,Segoe UI,Roboto,sans-serif;';
-        var panel = document.createElement('div');
-        panel.style.cssText =
-            'background:#1e1e24;color:#e8e8ee;border-radius:10px;' +
-            'width:min(1100px,94vw);height:min(760px,88vh);' +
-            'display:flex;flex-direction:column;overflow:hidden;' +
-            'box-shadow:0 12px 40px rgba(0,0,0,0.45);border:1px solid #3a3a48;';
-        var titleBar = document.createElement('div');
-        titleBar.style.cssText =
-            'padding:10px 14px;font-weight:600;font-size:14px;' +
-            'border-bottom:1px solid #3a3a48;flex:0 0 auto;' +
-            'display:flex;align-items:center;justify-content:space-between;';
-        var titleLbl = document.createElement('span');
-        titleLbl.textContent = 'Project Folder \u2014 Team Bucket';
-        var closeBtn = document.createElement('button');
-        closeBtn.textContent = '\u00d7';
-        closeBtn.setAttribute('aria-label', 'Close');
-        closeBtn.style.cssText =
-            'background:transparent;color:#c0c0cc;border:none;font-size:20px;' +
-            'line-height:1;cursor:pointer;padding:2px 9px;border-radius:6px;';
-        closeBtn.onmouseenter = function () { closeBtn.style.background = '#2a2a38'; };
-        closeBtn.onmouseleave = function () { closeBtn.style.background = 'transparent'; };
-        closeBtn.onclick = function () { overlay.style.display = 'none'; };
-        titleBar.appendChild(titleLbl);
-        titleBar.appendChild(closeBtn);
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.id = 'chudware-bucket-modal';
+            overlay.setAttribute('role', 'dialog');
+            overlay.setAttribute('aria-modal', 'true');
+            overlay.setAttribute('aria-label', 'Project Folder \u2014 Team Bucket');
+            overlay.style.cssText =
+                'position:fixed;inset:0;z-index:999999;background:rgba(4,7,11,0.62);' +
+                'display:flex;align-items:center;justify-content:center;font-family:' +
+                'system-ui,-apple-system,Segoe UI,Roboto,sans-serif;';
 
-        var body = document.createElement('div');
-        body.id = 'chudware-bucket-body';
-        body.style.cssText = 'flex:1 1 auto;overflow:auto;background:#0f1418;';
-        body.textContent = 'Loading\u2026';
+            var panel = document.createElement('div');
+            panel.style.cssText =
+                'background:#0b1014;color:#e8ecf2;border-radius:12px;' +
+                'width:min(1180px,94vw);height:min(800px,90vh);' +
+                'display:flex;flex-direction:column;overflow:hidden;' +
+                'box-shadow:0 24px 64px rgba(0,0,0,0.55);border:1px solid #22303b;';
 
-        panel.appendChild(titleBar);
-        panel.appendChild(body);
-        overlay.appendChild(panel);
-        overlay.addEventListener('mousedown', function (e) {
-            if (e.target === overlay) overlay.style.display = 'none';
-        });
-        document.body.appendChild(overlay);
+            var titleBar = document.createElement('div');
+            titleBar.style.cssText =
+                'padding:11px 14px;font-weight:600;font-size:13px;letter-spacing:0.02em;' +
+                'border-bottom:1px solid #1b2630;flex:0 0 auto;' +
+                'display:flex;align-items:center;';
+            var titleLbl = document.createElement('span');
+            titleLbl.textContent = 'Project Folder \u2014 Team Bucket';
+            var spacer = document.createElement('span');
+            spacer.style.cssText = 'flex:1 1 auto;';
+            var closeBtn = document.createElement('button');
+            closeBtn.type = 'button';
+            closeBtn.textContent = '\u00d7';
+            closeBtn.setAttribute('aria-label', 'Close');
+            closeBtn.style.cssText =
+                'background:transparent;color:#9fb0c0;border:none;font-size:20px;' +
+                'line-height:1;cursor:pointer;padding:2px 9px;border-radius:7px;';
+            closeBtn.onmouseenter = function () { closeBtn.style.background = '#1a242e'; };
+            closeBtn.onmouseleave = function () { closeBtn.style.background = 'transparent'; };
+            closeBtn.onclick = hide;
+            titleBar.appendChild(titleLbl);
+            titleBar.appendChild(spacer);
+            titleBar.appendChild(closeBtn);
 
-        fetch('/bucket').then(function (r) {
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            return r.text();
-        }).then(function (html) {
-            var doc = new DOMParser().parseFromString(html, 'text/html');
-            var mainEl = doc.querySelector('main');
-            if (!mainEl) throw new Error('bucket page markup missing <main>');
-            var styleText = Array.prototype.map.call(
-                doc.querySelectorAll('style'), function (s) { return s.textContent; }
-            ).join('\n');
+            var bodyEl = document.createElement('div');
+            bodyEl.id = 'chudware-bucket-body';
+            bodyEl.style.cssText = 'flex:1 1 auto;overflow:auto;';
 
-            // Scope every rule under #chudware-bucket-body so it can't leak
-            // into (or collide with) the rest of the app's own page styles.
-            // No @media/nested rules in this stylesheet, so a flat
-            // "selector { decl }" pass is safe.
-            var scoped = styleText.replace(/([^{}]+)\{([^{}]*)\}/g, function (m, sel, decl) {
-                sel = sel.trim();
-                if (sel === ':root') return '#chudware-bucket-body{' + decl + '}';
-                var out = sel.split(',').map(function (s) {
-                    s = s.trim();
-                    return (s === 'html' || s === 'body')
-                        ? '#chudware-bucket-body' : '#chudware-bucket-body ' + s;
-                }).join(', ');
-                return out + '{' + decl + '}';
+            panel.appendChild(titleBar);
+            panel.appendChild(bodyEl);
+            overlay.appendChild(panel);
+            overlay.addEventListener('mousedown', function (e) {
+                if (e.target === overlay) hide();
             });
-            var styleTag = document.createElement('style');
-            styleTag.textContent = scoped;
-            document.head.appendChild(styleTag);
+            document.body.appendChild(overlay);
 
-            body.textContent = '';
-            body.style.background = '';
-            var mount = document.createElement('div');
-            mount.innerHTML = mainEl.innerHTML;
-            body.appendChild(mount);
+            // ONE document-level Escape handler, installed with the overlay (built
+            // exactly once), so repeat opens can never stack handlers. It defers to an
+            // open <dialog> inside the surface: the browser closes that first and the
+            // same key must not also tear down the whole modal.
+            document.addEventListener('keydown', function (e) {
+                if (e.key !== 'Escape') return;
+                if (overlay.style.display === 'none') return;
+                if (overlay.querySelector('dialog[open]')) return;
+                hide();
+            });
+        }
 
-            var script = document.createElement('script');
-            script.src = '/static/bucket.js?v=2';
-            document.body.appendChild(script);
-        }).catch(function (err) {
-            body.textContent = 'Failed to load Team Bucket: ' + err.message;
-            body.style.cssText += 'padding:20px;color:#e07a8a;';
-        });
+        var body = document.getElementById('chudware-bucket-body');
+        overlay.style.display = 'flex';
+
+        function status(msg, tone) {
+            body.replaceChildren();
+            var note = document.createElement('div');
+            note.style.cssText = 'padding:26px 24px;font-size:13px;line-height:1.55;';
+            note.style.color = tone === 'error' ? '#f2a3ae' : '#93a5b6';
+            note.textContent = msg;
+            body.appendChild(note);
+            return note;
+        }
+
+        function fail(err) {
+            st.loading = false;
+            var msg = (err && err.message) ? err.message : String(err);
+            var note = status('Team Bucket did not load: ' + msg, 'error');
+            var retry = document.createElement('button');
+            retry.type = 'button';
+            retry.textContent = 'Try again';
+            retry.style.cssText =
+                'margin-top:14px;display:block;padding:6px 13px;border-radius:7px;' +
+                'cursor:pointer;background:#182430;color:#e8ecf2;' +
+                'border:1px solid #294050;font:inherit;';
+            retry.onclick = function () { load(); };
+            note.appendChild(retry);
+        }
+
+        // Memoized by absolute URL: the stylesheet and the script are appended to <head>
+        // at most once per document lifetime, no matter how often the modal is opened.
+        // A failed asset drops out of the cache so "Try again" can genuinely retry.
+        function asset(kind, url) {
+            if (st.assets[url]) return st.assets[url];
+            var p = new Promise(function (resolve, reject) {
+                var el;
+                if (kind === 'css') {
+                    el = document.createElement('link');
+                    el.rel = 'stylesheet';
+                    el.href = url;
+                } else {
+                    el = document.createElement('script');
+                    el.src = url;
+                }
+                el.setAttribute('data-chudware-bucket-asset', kind);
+                el.onload = function () { resolve(url); };
+                el.onerror = function () {
+                    delete st.assets[url];
+                    if (el.parentNode) el.parentNode.removeChild(el);
+                    reject(new Error('asset failed to load: ' + url));
+                };
+                document.head.appendChild(el);
+            });
+            st.assets[url] = p;
+            return p;
+        }
+
+        function assetUrls(doc, sel, attr) {
+            var out = [];
+            Array.prototype.forEach.call(doc.querySelectorAll(sel), function (el) {
+                var raw = el.getAttribute(attr);
+                if (!raw) return;
+                var abs = new URL(raw, location.href).href;
+                if (out.indexOf(abs) < 0) out.push(abs);
+            });
+            return out;
+        }
+
+        // A fresh clone every open: the previous surface is discarded first so element
+        // ids are never duplicated, and bucket.js re-binds the new nodes via mount().
+        // On the very first open the script has not run yet — it auto-binds whatever
+        // .bucket-surface it finds — so mount() is only called once the export exists.
+        function mountSurface() {
+            body.replaceChildren();
+            var root = st.template.cloneNode(true);
+            body.appendChild(root);
+            var api = window.ChudwareBucket;
+            if (api && typeof api.mount === 'function') api.mount(root);
+        }
+
+        // CSS before markup (no unstyled flash), markup before script.
+        function activate() {
+            var css = st.css.map(function (u) { return asset('css', u); });
+            Promise.all(css).then(function () {
+                mountSurface();
+                return st.js.reduce(function (chain, u) {
+                    return chain.then(function () { return asset('js', u); });
+                }, Promise.resolve());
+            }).then(function () {
+                st.loading = false;
+            }).catch(fail);
+        }
+
+        function load() {
+            if (st.loading) return;
+            st.loading = true;
+            status('Loading Team Bucket\u2026', 'info');
+            if (st.template) { activate(); return; }
+            fetch('/bucket', { credentials: 'same-origin' }).then(function (r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.text();
+            }).then(function (html) {
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                var root = doc.querySelector('.bucket-surface');
+                if (!root) throw new Error('bucket page has no .bucket-surface root');
+                st.template = document.importNode(root, true);
+                st.template.classList.add('bucket-surface');
+                st.css = assetUrls(doc, 'link[rel~="stylesheet"][href]', 'href');
+                st.js = assetUrls(doc, 'script[src]', 'src');
+                if (!st.css.length) throw new Error('bucket page links no stylesheet');
+                if (!st.js.length) throw new Error('bucket page links no script');
+                activate();
+            }).catch(fail);
+        }
+
+        load();
     });
 #else
     std::string abs = ui::openFolderDialog();
@@ -544,99 +666,108 @@ static void openProjectFolderAction(AppState& st) {
 static ChipResult drawActiveProjectControl(AppState& st, ImVec2 p0, float h, ImFont* boldFont,
                                             float& outW) {
     const float S = ui::uiScale;
-    std::string name = ui::plmProjectName(st);
-    if (name.empty()) name = "Open project\xe2\x80\xa6";
-
-    const float iconSz  = h * 0.44f;
-    const float padX    = 10.0f * S;
-    const float iconGap = 6.0f * S;
-    const float chevGap = 8.0f * S;
-    const float chevW   = h * 0.26f;
+    const std::string project = ui::plmProjectName(st);
+    const bool hasProject = !project.empty();
+    const char* label = hasProject ? project.c_str() : "Open project\xe2\x80\xa6";
 
     ImFont* font = boldFont ? boldFont : ImGui::GetFont();
-    const float textW = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0, name.c_str()).x;
-    // +5*S leading room for the status spine drawn at the left edge below.
-    const float w = padX + 5.0f * S + iconSz + iconGap + textW + chevGap + chevW + padX;
+    const float padX    = 8.0f * S;
+    const float dotSz   = ImFloor(5.0f * S);
+    const float dotGap  = 7.0f * S;
+    const float iconSz  = ImFloor(h * 0.40f);
+    const float iconGap = 5.0f * S;
+    const float chevGap = 7.0f * S;
+    const float chevW   = ImFloor(h * 0.22f);
+
+    // Hard width cap on the label: see the header comment — the workspace tab strip is
+    // what pays for an unbounded project name. The tooltip carries the full string.
+    ImGui::PushFont(font);
+    const std::string shown = ui::kit::elide(label, 128.0f * S);
+    const float textW = ImGui::CalcTextSize(shown.c_str()).x;
+    ImGui::PopFont();
+
+    const float w = padX * 2.0f + dotSz + dotGap + iconSz + iconGap + textW + chevGap + chevW;
     outW = w;
 
     ImGui::SetCursorScreenPos(p0);
-    bool clicked = ImGui::InvisibleButton("##tb_active_project", ImVec2(w, h));
-    bool hovered = ImGui::IsItemHovered();
-    bool held    = ImGui::IsItemActive();
+    const bool clicked = ImGui::InvisibleButton("##tb_active_project", ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held    = ImGui::IsItemActive();
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p1(p0.x + w, p0.y + h);
-    const float rnd = h * 0.16f;  // tighter than tab/chip rounding (~0.28-0.30) — reads as a field
+    const float rnd   = ImFloor(h * 0.24f);  // tighter than the tab pills -> reads as a field
+    const float rndDp = rnd / S;             // glass helpers take logical dp and scale internally
 
     const float* A = ui::palette.accent;
-    const float* AD = ui::palette.accentDim;
     auto accentU32 = [&](const float c[4], float a) {
         return ImGui::GetColorU32(ImVec4(c[0], c[1], c[2], a));
     };
-    const bool hasProject = !ui::plmProjectName(st).empty();
 
-    // ---- Outer accent bloom: 3 concentric rounded strokes fading outward, so the
-    // control reads as lit rather than merely outlined. This is the "it pops" pass —
-    // the title bar is otherwise all low-contrast frosted chips, so a soft halo is
-    // what separates persistent app state from the pill tabs beside it.
-    {
-        const float bloom = hovered ? 1.0f : 0.72f;
-        for (int i = 3; i >= 1; --i) {
-            const float g = (float)i;
-            const float a = (0.052f * bloom) / g;
-            dl->AddRect(ImVec2(p0.x - g * S, p0.y - g * S), ImVec2(p1.x + g * S, p1.y + g * S),
-                        accentU32(A, a), rnd + g * S, 0, ui::metrics::stroke(1.6f));
+    // One soft accent halo, on interaction only. The previous always-on triple bloom made
+    // a persistent, rarely-clicked control the loudest object in the title bar.
+    if (hovered || held) {
+        for (int i = 2; i >= 1; --i) {
+            const float g = (float)i * S;
+            dl->AddRect(ImVec2(p0.x - g, p0.y - g), ImVec2(p1.x + g, p1.y + g),
+                        accentU32(A, 0.075f / (float)i), rnd + g, 0, ui::metrics::stroke(1.4f));
         }
     }
 
-    ui::glassBackground(dl, p0, p1, rnd / S);
-
-    // ---- Always-on accent gradient wash (accentDim floor -> bright accent sheen at
-    // the top, owning the top corners). Previously this only appeared on hover, which
-    // is why the control read as an empty field.
+    // Shared glass vocabulary — the same frosted base + single-mesh accent wash the
+    // title-bar chips use, so this control sits in one material family with its neighbours.
+    ui::glassRowBackground(dl, p0, p1, rndDp, /*stripe*/false, /*selected*/false,
+                           /*washAlpha*/0.42f);
     {
-        const float aTop = held ? 0.46f : (hovered ? 0.38f : 0.26f);
-        const float aBot = held ? 0.24f : (hovered ? 0.19f : 0.12f);
-        dl->AddRectFilled(p0, p1, accentU32(AD, aBot), rnd);
-        const ImU32 cTop = accentU32(A, aTop);
-        const ImU32 cFade = accentU32(A, 0.0f);
-        dl->AddRectFilled(p0, ImVec2(p1.x, p0.y + rnd), cTop, rnd, ImDrawFlags_RoundCornersTop);
-        dl->AddRectFilledMultiColor(ImVec2(p0.x, p0.y + rnd), ImVec2(p1.x, p0.y + h * 0.60f),
-                                    cTop, cTop, cFade, cFade);
+        float tint[3] = { A[0], A[1], A[2] };
+        const float strength = held ? 0.40f : (hovered ? 0.32f : 0.22f);
+        ui::coloredRowWash(dl, p0, p1, rndDp, tint, strength, /*selected*/false);
     }
+    dl->AddRect(p0, p1, accentU32(A, hovered ? 0.88f : 0.52f), rnd, 0,
+                ui::metrics::stroke(hovered ? 1.5f : 1.1f));
 
-    // ---- Leading status spine: a solid rounded accent bar hard against the left
-    // edge. Reads as a live indicator (green = a project is open, muted = none), and
-    // gives the eye an anchor at the start of the control.
+    const ImU32 textU32 = ui::Palette::toU32(ui::palette.text);
+    const ImU32 dimU32  = ui::Palette::toU32(ui::palette.textDim);
+
+    // Leading status dot: live indicator (ok = a project is open, dim = none). Replaces the
+    // old full-height spine, which spent width the tab strip needed.
+    float x = p0.x + padX;
     {
-        const float spineW = 3.0f * S;
-        const float inset  = 3.0f * S;
         const float* sc = hasProject ? ui::palette.statusOk : ui::palette.textDim;
-        dl->AddRectFilled(ImVec2(p0.x + inset, p0.y + inset),
-                          ImVec2(p0.x + inset + spineW, p1.y - inset),
-                          accentU32(sc, hasProject ? 0.95f : 0.45f), spineW * 0.5f);
+        const ImVec2 c(x + dotSz * 0.5f, p0.y + h * 0.5f);
+        dl->AddCircleFilled(c, dotSz * 0.5f, accentU32(sc, hasProject ? 0.95f : 0.50f), 0);
+        if (hasProject)
+            dl->AddCircle(c, dotSz * 0.95f, accentU32(sc, 0.26f), 0, ui::metrics::stroke(1.0f));
     }
+    x += dotSz + dotGap;
 
-    dl->AddRect(p0, p1, accentU32(A, hovered ? 0.95f : 0.70f), rnd, 0,
-                ui::metrics::stroke(hovered ? 1.6f : 1.3f));
-
-    const ImU32 textU32 = ImGui::ColorConvertFloat4ToU32(ImVec4(
-        ui::palette.text[0], ui::palette.text[1], ui::palette.text[2], ui::palette.text[3]));
-    // Icon + label sit past the spine.
-    float x = p0.x + padX + 5.0f * S;
-    ui::drawIconGlass(dl, "body_folder", ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f), iconSz, textU32, 0);
+    ui::drawIconGlass(dl, "body_folder", ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f), iconSz,
+                      hasProject ? textU32 : dimU32, 0);
     x += iconSz + iconGap;
-    dl->AddText(font, font->FontSize, ImVec2(x, p0.y + (h - font->FontSize) * 0.5f), textU32, name.c_str());
+
+    dl->AddText(font, font->FontSize,
+                ImVec2(x, ImFloor(p0.y + (h - font->FontSize) * 0.5f)),
+                hasProject ? textU32 : dimU32, shown.c_str());
     x += textW + chevGap;
     {
         // Small chevron glyph — a switcher affordance, not a nav arrow.
         const float cy = p0.y + h * 0.5f;
-        const float cw = chevW, chh = chevW * 0.55f;
+        const float chh = chevW * 0.55f;
         const float th = ui::metrics::stroke(1.4f);
-        dl->AddLine(ImVec2(x, cy - chh * 0.5f), ImVec2(x + cw * 0.5f, cy + chh * 0.5f), textU32, th);
-        dl->AddLine(ImVec2(x + cw * 0.5f, cy + chh * 0.5f), ImVec2(x + cw, cy - chh * 0.5f), textU32, th);
+        dl->AddLine(ImVec2(x, cy - chh * 0.5f),
+                    ImVec2(x + chevW * 0.5f, cy + chh * 0.5f), dimU32, th);
+        dl->AddLine(ImVec2(x + chevW * 0.5f, cy + chh * 0.5f),
+                    ImVec2(x + chevW, cy - chh * 0.5f), dimU32, th);
     }
 
-    if (hovered) ImGui::SetTooltip("Change the active project folder");
+    // Discoverability: a compact slab with no visible verb, and the label may be elided —
+    // so the tooltip always names the destination in full plus the action.
+    if (hovered) {
+        if (hasProject)
+            ImGui::SetTooltip("Active project folder\n%s\n\nClick to change it", project.c_str());
+        else
+            ImGui::SetTooltip("No project folder is open\n\nClick to choose one");
+    }
     return {clicked, hovered};
 }
 
@@ -883,6 +1014,14 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         const float chipVPad  = 4.0f * s;      // vertical inset from bar top/bottom
         const float chipRound = barH * 0.28f;  // moderately rounded corners
         const float chipH     = barH - chipVPad * 2.0f;
+        // Workspace tabs ride a slightly shorter pill than the left-group chips: their
+        // hover/active wash spans the whole strip, and at full chip height it read as a
+        // solid band rather than a set of pills. The extra inset is applied symmetrically
+        // (tabVPad top AND bottom) so the smaller hit/highlight region stays centered in
+        // the bar. Left-group chips (File/Search/Settings/Web) and the active-project
+        // field keep chipVPad/chipH.
+        const float tabVPad = chipVPad + 3.0f * s;
+        const float tabH    = barH - tabVPad * 2.0f;
         const float padX      = 10.0f * s;     // horizontal text padding inside each chip
         const float chipGap   = 4.0f * s;      // gap between chips
 
@@ -1062,7 +1201,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         };
         constexpr int kTabCount = (int)(sizeof(kTabs) / sizeof(kTabs[0]));
 
-        const float tabRound = barH * 0.30f;
+        const float tabRound = tabH * 0.38f;
         const float tabGapX  = 3.0f * s;    // gap between tabs
         const float tabPadX  = 10.0f * s;   // horizontal text padding inside each tab
 
@@ -1134,12 +1273,12 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
                 dl->AddLine(ImVec2(dividerX + 0.5f * s, dy0), ImVec2(dividerX + 0.5f * s, dy1), dCol, 1.0f * s);
             }
 
-            const ImVec2 p0(tx, barTopScreenY + chipVPad);
+            const ImVec2 p0(tx, barTopScreenY + tabVPad);
 
             // drawChipAt places InvisibleButton + draws fill/label.
             char btnId[32];
             snprintf(btnId, sizeof(btnId), "##ws_%d", i);
-            auto res = drawChipAt(btnId, tabText, p0, chipW, chipH,
+            auto res = drawChipAt(btnId, tabText, p0, chipW, tabH,
                                   isActive, tabRound, boldFont,
                                   kTabs[i].icon, iconSz, iconGap, kTabs[i].rasterCell);
             // Icon-only chips must still announce which workspace they are.

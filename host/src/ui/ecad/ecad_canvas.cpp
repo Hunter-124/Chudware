@@ -159,14 +159,11 @@ void EcadCanvas::handleNavigation(const EcadCanvasIO& io, const ImVec2& avail) {
 
 void EcadCanvas::drawGrid(const ImVec2& avail) {
     const ui::Palette& p = ui::palette;
-    const ImU32 dotCol   = col(p.sketchGrid, 0.72f);
-    const ImU32 majorCol = col(p.sketchGrid, 1.9f);
-    const ImU32 xAxisCol = col(p.axisX, 0.28f);
-    const ImU32 yAxisCol = col(p.axisY, 0.28f);
 
-    // A 1/2/5 adaptive cadence keeps dots legible without exploding the draw count at either
-    // camera extreme. Major divisions remain lines so board scale is readable at a glance.
-    float stepMm = niceGridStep(pxPerMm_, ui::metrics::U(5.0f));
+    // A 1/2/5 adaptive cadence keeps the dot field legible without exploding the draw count at
+    // either camera extreme. Major divisions are landmarks only at their intersections: no rails.
+    float targetStepPx = ui::metrics::U(5.0f);
+    float stepMm = 0.0f;
     const EcadPt wTL = toWorld(imgMin_);
     const EcadPt wBR = toWorld(ImVec2(imgMin_.x + avail.x, imgMin_.y + avail.y));
     const float minX = std::min(wTL.x, wBR.x);
@@ -174,60 +171,78 @@ void EcadCanvas::drawGrid(const ImVec2& avail) {
     const float minY = std::min(wTL.y, wBR.y);
     const float maxY = std::max(wTL.y, wBR.y);
 
+    constexpr long long kMaxDotCount = 32000;
     int ix0 = 0, ix1 = 0, iy0 = 0, iy1 = 0;
     for (;;) {
+        stepMm = niceGridStep(pxPerMm_, targetStepPx);
         ix0 = static_cast<int>(std::floor(minX / stepMm));
         ix1 = static_cast<int>(std::ceil(maxX / stepMm));
         iy0 = static_cast<int>(std::floor(minY / stepMm));
         iy1 = static_cast<int>(std::ceil(maxY / stepMm));
         const long long dotCount =
             static_cast<long long>(ix1 - ix0 + 1) * static_cast<long long>(iy1 - iy0 + 1);
-        if (dotCount <= 32000) break;
-        stepMm *= 2.0f;
+        if (dotCount <= kMaxDotCount) break;
+        targetStepPx *= 2.0f;
     }
+
+    // The manager and Copilot are glass laid over this canvas. Leave their backing field calm while
+    // keeping the true canvas bounds unchanged for geometry projection and interaction.
+    const ImVec2 imgMax(imgMin_.x + avail.x, imgMin_.y + avail.y);
+    float gridMinX = imgMin_.x;
+    float gridMaxX = imgMax.x;
+    const float managerEdge = ui::overlayColumnEdge(0);
+    const float copilotEdge = ui::overlayColumnEdge(1);
+    if (managerEdge >= 0.0f)
+        gridMinX = std::clamp(managerEdge, imgMin_.x, imgMax.x);
+    if (copilotEdge >= 0.0f)
+        gridMaxX = std::clamp(copilotEdge, imgMin_.x, imgMax.x);
+    if (gridMaxX <= gridMinX) return;
+
+    dl_->PushClipRect(ImVec2(gridMinX, imgMin_.y), ImVec2(gridMaxX, imgMax.y), true);
 
     constexpr int kMajorEvery = 5;
     constexpr int kDotSegments = 6;
     constexpr int kOriginSegments = 12;
-    const float majorTh = ui::metrics::stroke(1.0f);
-    for (int ix = ix0; ix <= ix1; ++ix) {
-        if (ix == 0 || ix % kMajorEvery != 0) continue;
-        const float x = static_cast<float>(ix) * stepMm;
-        dl_->AddLine(toScreen({x, maxY}), toScreen({x, minY}), majorCol, majorTh);
-    }
-    for (int iy = iy0; iy <= iy1; ++iy) {
-        if (iy == 0 || iy % kMajorEvery != 0) continue;
-        const float y = static_cast<float>(iy) * stepMm;
-        dl_->AddLine(toScreen({minX, y}), toScreen({maxX, y}), majorCol, majorTh);
-    }
+    const float minorRadius = ui::metrics::px(0.65f);
+    const float majorRadius = ui::metrics::px(1.05f);
+    const float stepPx = stepMm * pxPerMm_;
+    const float fadeSpan = std::max(stepPx * 2.0f, ui::metrics::U(2.0f));
+    const ImVec2 first = toScreen(
+        {static_cast<float>(ix0) * stepMm, static_cast<float>(iy0) * stepMm});
 
-    const float dotRadius = ui::metrics::px(0.72f);
-    for (int iy = iy0; iy <= iy1; ++iy) {
-        const float y = static_cast<float>(iy) * stepMm;
-        for (int ix = ix0; ix <= ix1; ++ix) {
-            const float x = static_cast<float>(ix) * stepMm;
-            dl_->AddCircleFilled(toScreen({x, y}), dotRadius, dotCol, kDotSegments);
+    // Color conversion is per column, not per dot; y positions are affine increments rather than
+    // repeated camera transforms. The grid remains cheap even at the bounded maximum density.
+    for (int ix = ix0; ix <= ix1; ++ix) {
+        const float sx = first.x + static_cast<float>(ix - ix0) * stepPx;
+        if (sx <= gridMinX || sx >= gridMaxX) continue;
+        const float edgeDistance = std::min(sx - gridMinX, gridMaxX - sx);
+        const float edgeFade = std::clamp(edgeDistance / fadeSpan, 0.0f, 1.0f);
+        const ImU32 minorCol = col(p.sketchGrid, 0.55f * edgeFade);
+        const ImU32 majorCol = col(p.sketchGrid, 1.00f * edgeFade);
+        const bool majorX = ix % kMajorEvery == 0;
+
+        for (int iy = iy0; iy <= iy1; ++iy) {
+            if (ix == 0 && iy == 0) continue;  // the restrained origin cue owns this point
+            const float sy = first.y - static_cast<float>(iy - iy0) * stepPx;
+            const bool major = majorX && iy % kMajorEvery == 0;
+            dl_->AddCircleFilled(ImVec2(sx, sy), major ? majorRadius : minorRadius,
+                                 major ? majorCol : minorCol, kDotSegments);
         }
     }
 
-    if (minY <= 0.0f && maxY >= 0.0f)
-        dl_->AddLine(toScreen({minX, 0.0f}), toScreen({maxX, 0.0f}), xAxisCol,
-                     ui::metrics::stroke(1.4f));
-    if (minX <= 0.0f && maxX >= 0.0f)
-        dl_->AddLine(toScreen({0.0f, maxY}), toScreen({0.0f, minY}), yAxisCol,
-                     ui::metrics::stroke(1.4f));
-
-    // Compact origin cue: it is clipped away when the origin is off-screen and never captures input.
+    // Neutral, non-interactive origin cue. It is absent when off-canvas or occluded by glass and
+    // stays well below wire, ratsnest, outline, and copper contrast.
     if (minX <= 0.0f && maxX >= 0.0f && minY <= 0.0f && maxY >= 0.0f) {
         const ImVec2 origin = toScreen({0.0f, 0.0f});
-        const float arm = ui::metrics::U(1.5f);
-        dl_->AddLine(origin, ImVec2(origin.x + arm, origin.y), xAxisCol,
-                     ui::metrics::stroke(1.8f));
-        dl_->AddLine(origin, ImVec2(origin.x, origin.y - arm), yAxisCol,
-                     ui::metrics::stroke(1.8f));
-        dl_->AddCircle(origin, ui::metrics::px(2.5f), col(p.sketchInk, 0.58f), kOriginSegments,
-                       ui::metrics::stroke(1.0f));
+        if (origin.x >= gridMinX && origin.x <= gridMaxX) {
+            const ImU32 originCol = col(p.sketchInk, 0.20f);
+            dl_->AddCircle(origin, ui::metrics::px(2.25f), originCol, kOriginSegments,
+                           ui::metrics::stroke(1.0f));
+            dl_->AddCircleFilled(origin, ui::metrics::px(0.65f), originCol, kDotSegments);
+        }
     }
+
+    dl_->PopClipRect();
 }
 
 // ---- schematic -----------------------------------------------------------------------------

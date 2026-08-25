@@ -488,9 +488,14 @@ static void openProjectFolderAction(AppState& st) {
                 'system-ui,-apple-system,Segoe UI,Roboto,sans-serif;';
 
             var panel = document.createElement('div');
+            // max-height, never height: the bucket surface is content-sized (an empty
+            // personal destination is ~555px), and pinning the shell to 800px left a
+            // ~200px band of dead panel below the card. Capping instead lets the panel
+            // hug its content and still scroll (bodyEl owns overflow) once a long file
+            // listing exceeds the cap.
             panel.style.cssText =
                 'background:#0b1014;color:#e8ecf2;border-radius:12px;' +
-                'width:min(1180px,94vw);height:min(800px,90vh);' +
+                'width:min(1180px,94vw);max-height:min(800px,90vh);' +
                 'display:flex;flex-direction:column;overflow:hidden;' +
                 'box-shadow:0 24px 64px rgba(0,0,0,0.55);border:1px solid #22303b;';
 

@@ -11,6 +11,12 @@ EnvironmentFile=%h/chudware-web-staging/gateway.env
 EnvironmentFile=-%h/chudware-web/webd.env
 Environment=CHUDWARE_WEB_DATA=%h/chudware-web-staging
 Environment=CHUDWARE_WEB_DATA_ROOT=%h/chudware-web-staging
+# Staging must not share production's bucket tree. config.py defaults
+# bucket_root to ~/ME489, so without this override staging's /api/bucket/*
+# writes would land in the production bucket (and fail with EROFS besides,
+# since ~/ME489 is not in this unit's ReadWritePaths). Keeping the root inside
+# chudware-web-staging reuses the writable path already granted below.
+Environment=CHUDWARE_WEB_BUCKET_ROOT=%h/chudware-web-staging/bucket
 # config.py reads CHUDWARE_WEB_PUBLIC_BASE_URL; the shorter spelling was dead,
 # so staging built its verification, reset, and OAuth redirect URLs for the
 # production apex instead of itself.

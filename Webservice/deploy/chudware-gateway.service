@@ -33,7 +33,13 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/chudware-web-data %h/chudware-web
+# %h/ME489 is config.py's default bucket_root (CHUDWARE_WEB_BUCKET_ROOT), which
+# every /api/bucket/* write lands under: user_bucket_root() is
+# <bucket_root>/users/<slug> and team_bucket_root() is <bucket_root>/orgs/...
+# Without it ProtectHome=read-only made the whole tree read-only inside the
+# sandbox, so listing a bucket worked while mkdir/upload/rename/delete all
+# failed with EROFS ("[Errno 30] Read-only file system") and surfaced as a 500.
+ReadWritePaths=%h/chudware-web-data %h/chudware-web %h/ME489
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

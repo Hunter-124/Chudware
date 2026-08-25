@@ -333,6 +333,103 @@ def test_design_pipeline_flag_on_visits_four_stages():
     assert m.next_phase(Phase.BUILDPATH, {}) is Phase.PLAN  # org off → PLAN
 
 
+def test_design_pipeline_exits_checkpoint_typed_ledger_story(tmp_path):
+    """T-DP14: every typed boundary cuts one attributed History entry."""
+    from services.agent.ledger import Ledger
+    from services.agent.plm_bridge import MockVault, PLMBridge
+
+    ledger = Ledger("run_dp14", path=tmp_path / "ledger.json")
+    vault = MockVault()
+    vault.register_project("run_dp14", "project_dp14")
+    bridge = PLMBridge("run_dp14", vault=vault)
+    machine = PhaseMachine(
+        ledger=ledger,
+        flags=PipelineFlags(design_pipeline=True, org_layer=False),
+        checkpoint_bridge=bridge,
+    )
+    item_artifacts = {"item_bracket": "bg_bracket"}
+
+    feature = {
+        "id": "FT1",
+        "function": "mount to chassis rail",
+        "driving_requirement": "R1",
+    }
+    ledger.append("feature_architect", "feature", feature)
+    machine.exit(
+        Phase.DECOMPOSE,
+        machine.run_gate(Phase.DECOMPOSE, {"features": [feature]}),
+        item_artifacts=item_artifacts,
+    )
+
+    geometry = {
+        "id": "G1",
+        "realizes": ["FT1"],
+        "shapes": [{"op": "extrude"}],
+        "provenance": "derived from the recorded rail envelope",
+    }
+    ledger.append("geometry_designer", "geometry_spec", geometry)
+    machine.exit(
+        Phase.GEOMETRY,
+        machine.run_gate(
+            Phase.GEOMETRY,
+            {"features": [feature], "geometry_specs": [geometry]},
+        ),
+        item_artifacts=item_artifacts,
+    )
+
+    linkage = {
+        "id": "LINK_MAIN",
+        "reference_edges": [{
+            "from": "G1",
+            "to": "G1",
+            "relation": "references datum A",
+            "why": "keeps the mounting face stable",
+        }],
+    }
+    ledger.append("linkage_planner", "linkage", linkage)
+    machine.exit(
+        Phase.LINKAGE,
+        machine.run_gate(Phase.LINKAGE, {"linkages": [linkage]}),
+        item_artifacts=item_artifacts,
+    )
+
+    build_node = {
+        "id": "BN1",
+        "op": "extrude",
+        "elements": ["G1"],
+        "why": "establish the mounting face first",
+    }
+    ledger.append("build_strategist", "build_node", build_node)
+    machine.exit(
+        Phase.BUILDPATH,
+        machine.run_gate(
+            Phase.BUILDPATH,
+            {"geometry_specs": [geometry], "build_nodes": [build_node]},
+        ),
+        item_artifacts=item_artifacts,
+    )
+
+    checkpoints = vault.checkpoints
+    assert len(checkpoints) == 4
+    assert all(c["item_artifacts"] == item_artifacts for c in checkpoints)
+    messages = [c["entry"]["message"] for c in checkpoints]
+    assert "mount to chassis rail" in messages[0]
+    assert "extrude" in messages[1]
+    assert "keeps the mounting face stable" in messages[2]
+    assert "establish the mounting face first" in messages[3]
+    triggers = [
+        ev["payload"]["trigger"]
+        for ev in ledger.events
+        if ev.get("kind") == "plmlink"
+    ]
+    assert triggers == [
+        "stage_exit:decompose",
+        "stage_exit:geometry",
+        "stage_exit:linkage",
+        "stage_exit:buildpath",
+    ]
+
+
 def test_dp_flag_from_env():
     import os
     os.environ["CHUDWARE_DESIGN_PIPELINE"] = "1"

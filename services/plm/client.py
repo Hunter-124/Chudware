@@ -12,10 +12,10 @@ Bridge enablement precedence (see ``services.agent.plm_bridge``):
     2. ``CHUDWARE_PLM_BRIDGE=1`` → real client
     3. otherwise → MockVault (default off)
 
-Surface (frozen, must satisfy the Protocol verbatim):
+Surface (frozen, additive optional attribution map):
     is_available() -> bool
     checkpoint(project_id, message, item_id=None, author_kind="ai",
-               run_id=None, artifact_id=None) -> dict
+               run_id=None, artifact_id=None, item_artifacts=None) -> dict
     project_id_for_run(run_id) -> str | None
 
 ``project_id_for_run`` is BEST-EFFORT (contract §7.1): v1 keeps a small
@@ -138,6 +138,7 @@ class PLMVaultClient:
         author_kind: str = "ai",
         run_id: str | None = None,
         artifact_id: str | None = None,
+        item_artifacts: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Cut an AI-authored checkpoint, writing the §3.4 ai block.
 
@@ -163,22 +164,40 @@ class PLMVaultClient:
 
         author: dict[str, Any]
         ai_block: dict[str, Any] | None
+        ai_by_item: dict[str, dict[str, Any]] | None
         if author_kind == "ai":
             author = {"kind": "ai", "id": "agent", "display": "AI Assistant"}
             ai_block = history.make_ai_block(
                 provider=self._provider, model=self._model,
                 run_id=run_id, artifact_id=artifact_id,
             )
+            ai_by_item = {
+                str(mapped_item): history.make_ai_block(
+                    provider=self._provider,
+                    model=self._model,
+                    run_id=run_id,
+                    artifact_id=str(mapped_artifact),
+                )
+                for mapped_item, mapped_artifact in (item_artifacts or {}).items()
+                if str(mapped_item).strip() and str(mapped_artifact).strip()
+            } or None
         else:
             author = {"kind": "user", "id": "user", "display": "User"}
             ai_block = None
+            ai_by_item = None
 
         try:
             v = Vault.open(project_dir)
         except VaultError as e:
             return {"ok": False, "reason": e.reason, "hint": e.hint}
         try:
-            res = v.checkpoint(message, author=author, ai=ai_block, item_id=item_id)
+            res = v.checkpoint(
+                message,
+                author=author,
+                ai=ai_block,
+                ai_by_item=ai_by_item,
+                item_id=item_id,
+            )
         except VaultError as e:
             return {"ok": False, "reason": e.reason, "hint": e.hint}
         finally:

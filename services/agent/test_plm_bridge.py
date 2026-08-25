@@ -75,6 +75,10 @@ class TestTriggerTable:
     def test_change_request_enabled(self):
         assert _trigger_enabled("change_request") is True
 
+    @pytest.mark.parametrize("stage", ["decompose", "geometry", "linkage", "buildpath"])
+    def test_design_pipeline_stage_exits_enabled(self, stage):
+        assert _trigger_enabled("stage_exit", stage) is True
+
     def test_stage_exit_part_verify_enabled(self):
         assert _trigger_enabled("stage_exit", "part_verify") is True
 
@@ -346,8 +350,14 @@ class TestIdempotentFlush:
         bridge = PLMBridge(run_id="run_toggle", vault=vault)
         bridge.attach_ledger(tmp_ledger)
 
-        # Queue two events while vault unavailable
-        r1 = bridge.on_milestone(trigger="part_done", buildgraph_node="bg_004")
+        # Queue two events while vault unavailable. The first carries the
+        # per-item work-unit attribution that must survive the offline queue.
+        r1 = bridge.on_milestone(
+            trigger="part_done",
+            buildgraph_node="bg_004",
+            item_id="item_a",
+            item_artifacts={"item_a": "bg_part_a", "item_b": "bg_part_b"},
+        )
         r2 = bridge.on_milestone(trigger="mission_done", buildgraph_node="bg_005")
         assert r1["queued"] is True
         assert r2["queued"] is True
@@ -358,6 +368,12 @@ class TestIdempotentFlush:
         assert summary["flushed"] == 2
         assert summary["skipped"] == 0
         assert summary["failed"] == 0
+        first_call = vault._checkpoints[0]
+        assert first_call["item_id"] == "item_a"
+        assert first_call["item_artifacts"] == {
+            "item_a": "bg_part_a",
+            "item_b": "bg_part_b",
+        }
 
         # Second flush — no queued events remain
         summary2 = bridge.flush(project_id="proj_toggle")

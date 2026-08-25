@@ -171,10 +171,19 @@ class PhaseMachine:
         ledger: Any = None,
         flags: Optional[PipelineFlags] = None,
         actor: str = "pipeline",
+        checkpoint_bridge: Any = None,
     ) -> None:
         self.ledger = ledger
         self.flags = flags or PipelineFlags.from_env()
         self.actor = actor
+        self.checkpoint_bridge = checkpoint_bridge
+        if ledger is not None and checkpoint_bridge is not None:
+            attach = getattr(checkpoint_bridge, "attach_ledger", None)
+            if callable(attach):
+                try:
+                    attach(ledger)
+                except Exception:  # noqa: BLE001 — optional History seam
+                    pass
         self.current: Optional[Phase] = None
         self.history: list[Phase] = []
 
@@ -200,19 +209,45 @@ class PhaseMachine:
             except Exception:  # noqa: BLE001 — ledger is best-effort, never blocks
                 pass
 
-    def exit(self, phase: Phase, gate: GateResult) -> None:
-        """Record *phase* exit with its gate verdict.  Raises ``PhaseError`` if the
-        gate did not pass — a phase whose gate fails does not exit."""
+    def exit(
+        self,
+        phase: Phase,
+        gate: GateResult,
+        *,
+        item_artifacts: dict[str, str] | None = None,
+    ) -> None:
+        """Record a successful exit and its design-history checkpoint.
+
+        ``item_artifacts`` maps PLM item ids to the buildgraph work unit that
+        produced each part, preserving per-part attribution for assembly runs.
+        """
         if not gate.passed:
             raise PhaseError(
                 f"phase {phase.value} exit gate {gate.gate!r} failed: "
                 f"{'; '.join(gate.reasons)}")
+        stage_logged = False
         if self.ledger is not None:
             try:
                 from services.agent.ledger import _now  # local import, best-effort
                 self.ledger.log_stage(self.actor, phase.value,
                                       exited=_now(), exit_gate=gate.gate)
+                stage_logged = True
             except Exception:  # noqa: BLE001
+                pass
+        if (
+            stage_logged
+            and self.flags.design_pipeline
+            and phase in _DESIGN_PIPELINE_PHASES
+            and self.checkpoint_bridge is not None
+        ):
+            try:
+                self.checkpoint_bridge.on_milestone(
+                    trigger="stage_exit",
+                    stage=phase.value,
+                    buildgraph_node=f"phase:{phase.value}",
+                    item_artifacts=dict(item_artifacts or {}),
+                )
+            except Exception:  # noqa: BLE001 — History never blocks mission progress
                 pass
 
     def next_phase(self, phase: Phase, context: dict[str, Any]) -> Optional[Phase]:

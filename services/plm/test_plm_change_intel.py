@@ -402,6 +402,59 @@ def test_managed_scripted_run_cuts_attributed_checkpoint(tmp_path):
         v.close()
 
 
+def test_managed_multi_part_checkpoint_attributes_each_item(tmp_path):
+    """T-DP14: one boundary preserves each participant's work-unit join."""
+    from services.agent.plm_bridge import PLMBridge
+
+    part_a = _part(3.0)
+    part_a.update({"id": "uuid-part-a", "name": "Bracket A"})
+    part_b = _part(4.0)
+    part_b.update({"id": "uuid-part-b", "name": "Bracket B"})
+    _write(tmp_path, "BracketA.step+", part_a)
+    _write(tmp_path, "BracketB.step+", part_b)
+
+    vault = Vault.open(tmp_path)
+    pid = vault.status()["project_id"]
+    vault.set_ai_mode("managed")
+    items_by_path = {item["path"]: item["item_id"] for item in vault.manifest()["items"]}
+    item_a = items_by_path["BracketA.step+"]
+    item_b = items_by_path["BracketB.step+"]
+    vault.close()
+
+    # Both participants land a real document change before the shared boundary.
+    part_a["features"][0]["params"]["wall"] = 5.0
+    part_b["features"][0]["params"]["wall"] = 6.0
+    _write(tmp_path, "BracketA.step+", part_a)
+    _write(tmp_path, "BracketB.step+", part_b)
+
+    client = PLMVaultClient()
+    client.register_project(pid, str(tmp_path))
+    client.register_run("run_multi", pid)
+    bridge = PLMBridge("run_multi", vault=client)
+    link = bridge.on_milestone(
+        trigger="stage_exit",
+        stage="geometry",
+        buildgraph_node="phase:geometry",
+        item_artifacts={
+            item_a: "bg_participant_a",
+            item_b: "bg_participant_b",
+        },
+        project_id=pid,
+    )
+    assert link is not None and link["queued"] is False
+
+    reopened = Vault.open(tmp_path)
+    try:
+        newest_a = reopened.history(item_a)[0]
+        newest_b = reopened.history(item_b)[0]
+        assert newest_a["kind"] == newest_b["kind"] == "checkpoint"
+        assert newest_a["ai"]["run_id"] == newest_b["ai"]["run_id"] == "run_multi"
+        assert newest_a["ai"]["artifact_id"] == "bg_participant_a"
+        assert newest_b["ai"]["artifact_id"] == "bg_participant_b"
+    finally:
+        reopened.close()
+
+
 def test_assisted_mode_bridge_cuts_nothing(tmp_path):
     from services.agent.plm_bridge import PLMBridge
 

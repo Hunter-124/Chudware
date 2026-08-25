@@ -306,6 +306,7 @@ class Vault:
 
     def save(self, kind: str = hist.KIND_AUTO, *, message: str = "",
              author: dict[str, Any] | None = None, ai: dict[str, Any] | None = None,
+             ai_by_item: dict[str, dict[str, Any]] | None = None,
              item_id: str | None = None) -> dict[str, Any]:
         """Cut a history entry over the whole shadow tree (contract §3.1).
 
@@ -332,6 +333,7 @@ class Vault:
             # can always go back).
             files = self._explode_project_into_shadow(
                 m, kind=kind, message=message, author=author, ai=ai,
+                ai_by_item=ai_by_item,
                 enforce_released_lock=(kind != hist.KIND_RESTORE))
             try:
                 commit = self._bind.commit_tree(files, emeta)
@@ -344,7 +346,9 @@ class Vault:
                          "vault HEAD kept moving under concurrent writers; retry the save")
 
     def checkpoint(self, message: str = "", *, author: dict[str, Any] | None = None,
-                   ai: dict[str, Any] | None = None, item_id: str | None = None) -> dict[str, Any]:
+                   ai: dict[str, Any] | None = None,
+                   ai_by_item: dict[str, dict[str, Any]] | None = None,
+                   item_id: str | None = None) -> dict[str, Any]:
         """Cut a named checkpoint entry (contract §3.2).
 
         When *message* is empty and the project's assist tier allows drafting
@@ -355,8 +359,14 @@ class Vault:
         """
         if not message and assist.allowed(self.ai_mode(), "draft_message"):
             message = self.draft_message(item_id=item_id)
-        return self.save(hist.KIND_CHECKPOINT, message=message, author=author,
-                         ai=ai, item_id=item_id)
+        return self.save(
+            hist.KIND_CHECKPOINT,
+            message=message,
+            author=author,
+            ai=ai,
+            ai_by_item=ai_by_item,
+            item_id=item_id,
+        )
 
     # -- assist tier (T-R3, contract §4 ai_mode) ----------------------------
 
@@ -1019,6 +1029,7 @@ class Vault:
     def _explode_project_into_shadow(
         self, m: dict[str, Any], *, kind: str, message: str,
         author: dict[str, Any] | None = None, ai: dict[str, Any] | None = None,
+        ai_by_item: dict[str, dict[str, Any]] | None = None,
         geometry_for: dict[str, bytes] | None = None,
         enforce_released_lock: bool = False,
         inject: dict[str, dict[str, bytes]] | None = None,
@@ -1037,6 +1048,7 @@ class Vault:
         geometry_for = geometry_for or {}
         inject = inject or {}
         ai_block = ai if (ai and author.get("kind") == "ai") else None
+        item_ai_blocks = ai_by_item if author.get("kind") == "ai" else None
         files: dict[str, bytes] = {}
         head = self._bind.head_commit()
         head_tree = self._bind.read_tree(head) if head else {}
@@ -1065,7 +1077,7 @@ class Vault:
                 author_kind=author.get("kind", "user"), author_id=author["id"],
                 author_display=author["display"], message=message,
                 doc_uuid=doc_uuid, rev=item.get("rev"), lifecycle=item["lifecycle"],
-                ai=ai_block,
+                ai=(item_ai_blocks or {}).get(iid, ai_block),
             )
             # plain-language change summary per entry (T-R3, contract §2
             # summary.txt): deterministic, numerals copied from doc_diff.
@@ -1107,7 +1119,8 @@ class Vault:
                 author_kind=author.get("kind", "user"), author_id=author["id"],
                 author_display=author["display"], message=message,
                 doc_uuid=it.get("doc_uuid", ""), rev=it.get("rev"),
-                lifecycle=it["lifecycle"], ai=ai_block,
+                lifecycle=it["lifecycle"],
+                ai=(item_ai_blocks or {}).get(iid, ai_block),
             )
             p = snapshot.item_prefix(iid)
             files.update(content)

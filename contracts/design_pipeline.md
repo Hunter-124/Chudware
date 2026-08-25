@@ -361,3 +361,29 @@ Restated from doc §6 as contract invariants every DP task must honour:
 5. The pipeline **adds context and speed, never a fixed modeling path** — two models given
    the same brief may build different valid parts; the pipeline judges by the ledger + the
    verify battery, not by matching a template.
+
+---
+
+## §11 PLM stage-boundary history (T-DP14)
+
+When `PipelineFlags.design_pipeline` is enabled, every successful exit from
+`DECOMPOSE`, `GEOMETRY`, `LINKAGE`, and `BUILDPATH` emits one
+`aicad.plmlink/1` `stage_exit:<phase>` event after the exit event is durable in
+the ledger. The checkpoint message is deterministic from exactly the ledger
+slice since the previous checkpoint:
+
+| boundary | narrative source |
+|---|---|
+| `decompose` | `feature.function` and its stable feature id |
+| `geometry` | `geometry_spec.shapes`, `realizes`, and verbatim provenance |
+| `linkage` | reference edges, shared interfaces, and their `why` text |
+| `buildpath` | `build_node.op`, `elements`, and verbatim `why` text |
+
+No model call drafts this narrative and no numeric value may be introduced
+outside those ledger payloads. The boundary is best-effort with respect to PLM:
+a vault failure queues the full link and MUST NOT block mission progress.
+
+Multi-part runs pass `item_artifacts` (`item_id` → participant buildgraph node)
+through the link. The vault stores the mapped node in each item's own
+`meta.json.ai.artifact_id`; a project-wide history point therefore preserves
+per-participant attribution when each item's timeline is viewed independently.

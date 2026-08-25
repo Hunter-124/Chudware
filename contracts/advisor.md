@@ -464,6 +464,8 @@ never blocks — when a choice is likely to hurt (e.g. overseer on a 4B local mo
   "trigger": "stage_exit|plan_ratified|part_done|mission_done|change_request",
   "message": "plain-language, AI-drafted per Pillar 19 tier",
   "ledger_events": [/* seqs folded into the history annotation */],
+  "item_id": null,
+  "item_artifacts": {"<PLM item id>": "<buildgraph participant node>"},
   "change_request": {"audit_id": "aud_...", "modifies_checkpoint": null}
 }
 ```
@@ -472,6 +474,12 @@ Rules: agents never touch git directly — only Pillar 19 nouns (Project/History
 Checkpoint). Checkpoint messages are drafted from ledger events (provenance rule) and
 carry the dimension rationales verbatim. When the R vault is unavailable the links
 queue in the ledger and flush on availability (no lost annotations).
+
+T-DP14 additive attribution: a design-pipeline boundary MAY carry
+`item_artifacts`, mapping every changed PLM item to the buildgraph node that
+produced it. The vault writes that node into the item's own §3.4 AI metadata, so
+one multi-part checkpoint retains participant attribution in every per-item
+timeline. Queued links MUST persist both `item_id` and `item_artifacts` unchanged.
 
 ## §16 Deliverable manifest (`aicad.deliverables/1`)
 

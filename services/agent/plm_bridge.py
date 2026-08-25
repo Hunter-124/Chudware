@@ -15,10 +15,8 @@ Design decisions
     3. otherwise → MockVault (safe offline default)
   Reachable without the env flag via PLM Settings → AI assistance → Managed
   (``plm_set_ai_mode`` / worker twin already round-trip the tier).
-* Trigger config table: which buildgraph / pipeline events emit a PLM
-  checkpoint.  Only meaningful events (not every stage): part_done,
-  mission_done, plan_ratified, stage_exit (part_verify/assembly/sim only),
-  change_request.
+* Trigger config table: meaningful buildgraph / verification milestones plus
+  the four typed design-pipeline boundaries (decompose → buildpath).
 * Offline queue: plmlink events persist in the ledger (kind="plmlink");
   a flush routine runs on availability.  Idempotency key:
   (run_id, buildgraph_node, trigger) for build triggers, audit_id for
@@ -42,17 +40,21 @@ from typing import Any, Protocol, runtime_checkable
 # ---------------------------------------------------------------------------
 
 # Which (trigger, stage_exit_value) pairs create a PLM checkpoint by default.
-# stage_exit triggers only fire for meaningful verification milestones.
+# Besides verification milestones, T-DP14 checkpoints the four typed design
+# stages whose ledger slices form the Project History design narrative.
 CHECKPOINT_TRIGGERS: dict[str, bool] = {
     "plan_ratified": True,
     "part_done": True,
     "mission_done": True,
     "change_request": True,
-    # stage_exit fires only for the three verification stages below:
+    "stage_exit:decompose": True,
+    "stage_exit:geometry": True,
+    "stage_exit:linkage": True,
+    "stage_exit:buildpath": True,
     "stage_exit:part_verify": True,
     "stage_exit:assembly": True,
     "stage_exit:sim": True,
-    # NOT triggered for every stage — only verification milestones:
+    # Low-signal legacy stages remain suppressed.
     "stage_exit:sketch": False,
     "stage_exit:model": False,
     "stage_exit:layout": False,
@@ -93,6 +95,7 @@ class VaultClient(Protocol):
         author_kind: str = "ai",
         run_id: str | None = None,
         artifact_id: str | None = None,
+        item_artifacts: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Create a checkpoint history entry.
 
@@ -133,7 +136,13 @@ class MockVault:
         author_kind: str = "ai",
         run_id: str | None = None,
         artifact_id: str | None = None,
+        item_artifacts: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        effective_artifact = (
+            (item_artifacts or {}).get(item_id, artifact_id or "")
+            if item_id is not None
+            else artifact_id or ""
+        )
         commit = "mock_" + uuid.uuid4().hex[:8]
         entry = {
             "commit": commit,
@@ -145,11 +154,16 @@ class MockVault:
                 "provider": "anthropic",
                 "model": "claude-sonnet-4-6",
                 "run_id": run_id or "",
-                "artifact_id": artifact_id or "",
+                "artifact_id": effective_artifact,
                 "reversible": True,
             } if author_kind == "ai" else None,
         }
-        self._checkpoints.append({"project_id": project_id, "item_id": item_id, "entry": entry})
+        self._checkpoints.append({
+            "project_id": project_id,
+            "item_id": item_id,
+            "item_artifacts": dict(item_artifacts or {}),
+            "entry": entry,
+        })
         return {"ok": True, "commit": commit, "entry": entry}
 
     def project_id_for_run(self, run_id: str) -> str | None:
@@ -332,8 +346,12 @@ def draft_checkpoint_message(
       no hand-typed numbers.
     - No git vocabulary anywhere in the output.
     """
-    # Collect rationale snippets from decisions and dimension provenance
-    # since the last checkpoint (or from the beginning of the run).
+    # Collect the typed design story, rationale, and dimension provenance since
+    # the previous checkpoint. All user-visible numerals originate in payloads.
+    feature_parts: list[str] = []
+    geometry_parts: list[str] = []
+    linkage_parts: list[str] = []
+    build_parts: list[str] = []
     rationale_parts: list[str] = []
     dimension_parts: list[str] = []
 
@@ -341,7 +359,86 @@ def draft_checkpoint_message(
         kind = ev.get("kind", "")
         payload = ev.get("payload", {})
 
-        if kind == "decision":
+        if kind == "feature":
+            feature_id = str(payload.get("id", "")).strip()
+            function = str(payload.get("function", "")).strip()
+            if function:
+                feature_parts.append(
+                    f"{feature_id}: {function}" if feature_id else function
+                )
+
+        elif kind == "geometry_spec":
+            spec_id = str(payload.get("id", "")).strip()
+            ops = [
+                str(shape.get("op", "")).strip()
+                for shape in (payload.get("shapes") or [])
+                if isinstance(shape, dict) and str(shape.get("op", "")).strip()
+            ]
+            realizes = [
+                str(value) for value in (payload.get("realizes") or [])
+                if str(value).strip()
+            ]
+            provenance = str(payload.get("provenance", "")).strip()
+            details: list[str] = []
+            if ops:
+                details.append("uses " + ", ".join(ops))
+            if realizes:
+                details.append("realizes " + ", ".join(realizes))
+            if provenance:
+                details.append(provenance)
+            if details:
+                prefix = f"{spec_id}: " if spec_id else ""
+                geometry_parts.append(prefix + "; ".join(details))
+
+        elif kind == "linkage":
+            for edge in payload.get("reference_edges") or []:
+                if not isinstance(edge, dict):
+                    continue
+                source = str(edge.get("from", "")).strip()
+                target = str(edge.get("to", "")).strip()
+                relation = str(edge.get("relation", "")).strip()
+                why = str(edge.get("why", "")).strip()
+                relation_text = " → ".join(v for v in (source, target) if v)
+                if relation:
+                    relation_text += (": " if relation_text else "") + relation
+                if why:
+                    relation_text += (" — " if relation_text else "") + why
+                if relation_text:
+                    linkage_parts.append(relation_text)
+            for interface in payload.get("shared_interfaces") or []:
+                if not isinstance(interface, dict):
+                    continue
+                features = ", ".join(
+                    str(value) for value in (interface.get("features") or [])
+                    if str(value).strip()
+                )
+                location = str(interface.get("on", "")).strip()
+                agreement = str(interface.get("must_agree", "")).strip()
+                text = features
+                if location:
+                    text += (" on " if text else "") + location
+                if agreement:
+                    text += (": " if text else "") + agreement
+                if text:
+                    linkage_parts.append(text)
+
+        elif kind == "build_node":
+            node_id = str(payload.get("id", "")).strip()
+            op = str(payload.get("op", "")).strip()
+            elements = ", ".join(
+                str(value) for value in (payload.get("elements") or [])
+                if str(value).strip()
+            )
+            why = str(payload.get("why", "")).strip()
+            details = op
+            if elements:
+                details += (" builds " if details else "") + elements
+            if why:
+                details += (" — " if details else "") + why
+            if details:
+                build_parts.append(f"{node_id}: {details}" if node_id else details)
+
+        elif kind == "decision":
             rationale = payload.get("rationale", "")
             text = payload.get("text", "")
             if rationale:
@@ -361,10 +458,7 @@ def draft_checkpoint_message(
                     dim_str += f" ({provenance})"
                 dimension_parts.append(dim_str)
 
-    # Build message parts
     parts: list[str] = []
-
-    # Trigger prefix (Pillar 19 nouns — no git vocab)
     if trigger == "plan_ratified":
         parts.append("Project plan approved.")
     elif trigger == "part_done":
@@ -375,22 +469,30 @@ def draft_checkpoint_message(
         parts.append("Change request applied.")
     elif trigger == "stage_exit" and stage:
         stage_label = {
+            "decompose": "Functional decomposition complete.",
+            "geometry": "Geometry realization complete.",
+            "linkage": "Linkage definition complete.",
+            "buildpath": "Build path planning complete.",
             "part_verify": "Part verification passed.",
             "assembly": "Assembly verification passed.",
             "sim": "Simulation passed.",
         }.get(stage, f"{stage.replace('_', ' ').title()} complete.")
         parts.append(stage_label)
 
+    if feature_parts:
+        parts.append("Features: " + " | ".join(feature_parts))
+    if geometry_parts:
+        parts.append("Geometry: " + " | ".join(geometry_parts))
+    if linkage_parts:
+        parts.append("Linkage: " + " | ".join(linkage_parts))
+    if build_parts:
+        parts.append("Build path: " + " | ".join(build_parts))
     if dimension_parts:
         parts.append("Dimensions: " + "; ".join(dimension_parts) + ".")
-
     if rationale_parts:
-        # Verbatim splice — join as separate sentences
         parts.append("Rationale: " + " | ".join(rationale_parts))
-
     if not parts:
         parts.append("Checkpoint recorded.")
-
     return " ".join(parts)
 
 
@@ -448,6 +550,7 @@ class PLMBridge:
         audit_id: str | None = None,
         modifies_checkpoint: str | None = None,
         item_id: str | None = None,
+        item_artifacts: dict[str, str] | None = None,
         project_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Called when a pipeline milestone fires.
@@ -459,6 +562,8 @@ class PLMBridge:
             audit_id:           For change_request triggers, the audit id.
             modifies_checkpoint: The checkpoint the CR modifies (for timeline).
             item_id:            Optional PLM item_id for per-part checkpoints.
+            item_artifacts:     Per-item buildgraph artifact ids for multi-part
+                                attribution in each item's timeline metadata.
             project_id:         PLM project_id; looked up via vault if None.
 
         Returns the aicad.plmlink/1 record if a checkpoint was created, or
@@ -505,6 +610,8 @@ class PLMBridge:
             "trigger": trigger if trigger != "stage_exit" else f"stage_exit:{stage or ''}",
             "message": message,
             "ledger_events": ledger_event_seqs,
+            "item_id": item_id,
+            "item_artifacts": dict(item_artifacts or {}),
             "change_request": {
                 "audit_id": audit_id or "",
                 "modifies_checkpoint": modifies_checkpoint,
@@ -515,14 +622,17 @@ class PLMBridge:
 
         # Attempt vault call
         if self._vault is not None and self._vault.is_available() and resolved_project_id:
-            result = self._vault.checkpoint(
-                project_id=resolved_project_id,
-                message=message,
-                item_id=item_id,
-                author_kind="ai",
-                run_id=self.run_id,
-                artifact_id=buildgraph_node or "",
-            )
+            checkpoint_args: dict[str, Any] = {
+                "project_id": resolved_project_id,
+                "message": message,
+                "item_id": item_id,
+                "author_kind": "ai",
+                "run_id": self.run_id,
+                "artifact_id": buildgraph_node or "",
+            }
+            if item_artifacts:
+                checkpoint_args["item_artifacts"] = dict(item_artifacts)
+            result = self._vault.checkpoint(**checkpoint_args)
             if result.get("ok"):
                 entry = result.get("entry", {})
                 plmlink["checkpoint_ref"] = entry.get("commit", "")
@@ -598,14 +708,17 @@ class PLMBridge:
             message = record.get("message", "Checkpoint recorded.")
             buildgraph_node = record.get("buildgraph_node", "")
 
-            result = self._vault.checkpoint(
-                project_id=resolved_project_id,
-                message=message,
-                item_id=record.get("item_id"),
-                author_kind="ai",
-                run_id=self.run_id,
-                artifact_id=buildgraph_node,
-            )
+            checkpoint_args: dict[str, Any] = {
+                "project_id": resolved_project_id,
+                "message": message,
+                "item_id": record.get("item_id"),
+                "author_kind": "ai",
+                "run_id": self.run_id,
+                "artifact_id": buildgraph_node,
+            }
+            if record.get("item_artifacts"):
+                checkpoint_args["item_artifacts"] = dict(record["item_artifacts"])
+            result = self._vault.checkpoint(**checkpoint_args)
             if result.get("ok"):
                 # Update record with resolved checkpoint_ref
                 entry = result.get("entry", {})

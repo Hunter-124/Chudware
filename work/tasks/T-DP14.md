@@ -2,8 +2,8 @@
 id: T-DP14
 title: Design-pipeline ↔ PLM wiring (stage checkpoints + rationale narrative)
 workstream: DP
-owner: unassigned
-status: todo
+owner: codex
+status: done
 branch: task/T-DP14-pipeline-plm-wiring
 depends_on: [T-DP1, T-R5]
 lane: plm-projects
@@ -31,7 +31,14 @@ plm-fine-detail-decisions memory).
 
 ## Definition of done
 
-- [ ] Each stage boundary writes a vault checkpoint with the stage's ledger slice as rationale.
-- [ ] PLM history shows the design story (feature→geometry→build) in plain language (T-R3).
-- [ ] Multi-part attribution correct in the timeline.
-- [ ] gate.sh PASS; graphify update.
+- [x] Each stage boundary writes a vault checkpoint with the stage's ledger slice as rationale.
+- [x] PLM history shows the design story (feature→geometry→build) in plain language (T-R3).
+- [x] Multi-part attribution correct in the timeline.
+- [x] gate.sh PASS; graphify update.
+
+## Progress log
+
+- 2026-08-25: Wired all four typed phase exits to `PLMBridge`, added
+  ledger-derived History narratives, preserved per-item participant artifact ids
+  through immediate and queued checkpoints, and verified the real
+  PhaseMachine→Vault timeline path. Full Linux gate passed; graphify updated.

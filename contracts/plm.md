@@ -700,3 +700,20 @@ keeping with the history-is-never-rewritten MUST (§8).
 (§5's three states are frozen). No conflict-resolution state: `plm_branch_merge` still commits
 a dst-favoured tree and returns the conflict list for the caller to act on. Team sync remains
 linear-with-forward-replay (§6) — a merge node is a LOCAL construct and is never pushed as one.
+
+## Appendix D — design-pipeline participant attribution (additive, 2026-08)
+
+The §7.1 in-process `VaultClient.checkpoint` seam gains one OPTIONAL argument:
+`item_artifacts: {item_id: artifact_id}`. The MCP `plm_checkpoint` envelope
+remains unchanged.
+
+For an AI-authored whole-project checkpoint, the client constructs the ordinary
+§3.4 AI block once per mapped item, changing only `artifact_id` to the value for
+that item. Unmapped items retain the checkpoint-level `artifact_id`. User-authored
+entries ignore the map. `Vault.save`/`Vault.checkpoint` carry this internally as
+`ai_by_item`; it is not written into `document.json` and therefore preserves the
+byte-stability law.
+
+This is the T-DP14 multi-part rule: a shared design-pipeline boundary may produce
+one Project History point while each changed item's timeline still joins to the
+participant buildgraph node that produced it.

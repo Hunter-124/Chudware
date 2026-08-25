@@ -7933,3 +7933,16 @@ passed, 4 skipped), including cross-team isolation and UI asset contracts. Billi
 remains deliberately account-owned: an organization derives shared-storage
 entitlement and quota from its active owner rather than introducing a second
 Stripe customer model.
+
+### 2026-08-25 — T-DP14 design-pipeline history wiring
+
+The four typed design-pipeline exits now call the existing PLM bridge after
+their ledger exit event is durable, producing one deterministic Project History
+narrative from each stage-local `feature`, `geometry_spec`, `linkage`, or
+`build_node` slice. Multi-part boundaries carry an item-to-buildgraph-node map
+through immediate and queued checkpoints; the vault writes the mapped node into
+each item's AI metadata so per-item timelines retain the producing participant.
+Touched `services/agent/{pipeline/phases.py,plm_bridge.py}`,
+`services/plm/{client.py,vault.py}`, their focused tests, and the additive
+design-pipeline/PLM contract notes. The bridge remains best-effort and managed
+mode only; a vault failure queues metadata without blocking mission progress.

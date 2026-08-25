@@ -1,4 +1,4 @@
-// AI-ECAD UI scaffold (Wave D) — NOT yet build-verified; see docs/ECAD_UI_INTEGRATION.md
+// Native ECAD schematic/PCB editor and per-document pinned manager.
 #include "imgui.h"
 #include "imgui_internal.h"   // GetWindowDockNode + NoTabBar for the shared central-node doc tabs
 
@@ -7,8 +7,11 @@
 #include "../feature_tree.h"  // fmPaneHeaderChip/fmSectionDivider/fmRowPill/fmToolbarIconBtn — the
                               // ECAD manager body reuses the Feature Manager's own row/header chrome
                               // so the two panels read as the same design language (item 2).
+#include "../metrics.h"
+#include "../widgets/kit.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <memory>   // Wave 2: std::make_shared<EcadEditorState> for per-DocTab editor state
@@ -40,15 +43,28 @@ struct EcadEditorState {
     EcadMirror mirror;
     EcadCanvas canvas;
     EcadMirror::Kind lastKind = EcadMirror::Kind::None;
-    // Wave Q — canvas editing tool state.
-    std::string placeLib = "Device:R";             // symbol to place (Place tool, schematic)
-    std::string placeFp  = "Resistor_SMD:R_0603";  // footprint to place (Place tool, board)
-    bool  routing = false;       // a Route chain is in progress
-    float lastX = 0, lastY = 0;  // last routed point (world mm)
+    // Canvas editing context. Every value is per document so switching tabs restores the exact
+    // schematic/board command state instead of leaking the last document's choices.
+    std::string placeLib = "Device:R";
+    std::string placeFp  = "Resistor_SMD:R_0603";
+    int schPlaceKind = 0;       // 0 symbol, 1 net label, 2 power port, 3 junction, 4 no-connect
+    int pcbPlaceKind = 0;       // 0 footprint, 1 via
+    char placeLabel[96] = "NET";
+    int placeLabelScope = 0;    // 0 local, 1 global, 2 hierarchical
+    char placePowerNet[64] = "GND";
+    std::string placePowerSymbol = "GND";
+    std::string activeLayer = "F.Cu";
+    std::string activeNet;
+    float routeWidth = 0.25f;
+    float viaDrill = 0.30f;
+    float viaDiameter = 0.60f;
+    float snapGrid = 0.50f;
+    bool  routing = false;
+    float lastX = 0, lastY = 0;
     // Select-tool state: highlighted entity + live drag-move (symbols/footprints only).
-    std::string selected;        // "<kind>:<id>" ("" = nothing), kind in {s,fp,w,t}
-    bool  dragging = false;      // a left-drag-move of the selected sym/fp is in progress
-    float dragDx = 0, dragDy = 0;  // live drag offset (world mm) for visual feedback
+    std::string selected;        // "<kind>:<id>" ("" = nothing), kind in {s,fp,w,t,v}
+    bool  dragging = false;
+    float dragDx = 0, dragDy = 0;
     // Property inspector buffers (the selected symbol/footprint's editable Ref + Value). Reloaded
     // from the mirror whenever `selected` changes (tracked by editLoadedFor) so edits never bleed
     // between parts; committed via sch_edit_symbol / pcb_edit_footprint.
@@ -70,8 +86,19 @@ struct EcadEditorState {
     int  healthLevel = 0;       // 0 ok, 1 warn, 2 error
     int  healthScannedRev = -1; // mirror revision the current healthMsg was computed for
     std::string healthToasted;  // last healthMsg surfaced as a toast (post-once-per-change guard)
-    // Manager-tree row selection ("layer:<id>" / "net:<name>") — drives the fmRowPill selected
-    // highlight so Layers/Nets rows select + read like the Feature Manager's plane/feature rows.
+    // Dense manager state. These views, searches, routing settings and selection filters belong to
+    // the ECAD document and therefore survive tab switches independently.
+    int managerView = 0;        // 0 Design, 1 Inspect, 2 Checks
+    int hierarchyKind = 0;      // 0 all; remaining values are document-kind specific
+    char managerSearch[96] = "";
+    char checksSearch[96] = "";
+    int checksSeverity = 0;     // 0 all, 1 errors, 2 warnings
+    bool pickSymbols = true;
+    bool pickWires = true;
+    bool pickFootprints = true;
+    bool pickTracks = true;
+    bool pickVias = true;
+    // Manager-tree row selection ("layer:<id>" / "net:<name>").
     std::string mgrSel;
 };
 
@@ -86,9 +113,8 @@ namespace {
 // ---------------------------------------------------------------------------------------------
 AppState* g_app = nullptr;  // set by drawEcadEditor(st) each frame; null before the first draw
 
-// The fallback used when no ECAD tab is active (or no AppState is known yet). Single-document ECAD
-// behaviour (the only case the scaffold ever exercised) is unchanged: with zero ECAD tabs every
-// accessor resolves here, exactly like the old file-static singleton.
+// The fallback used when no ECAD tab is active (or no AppState is known yet). With zero ECAD tabs
+// every accessor resolves here, preserving the legacy single-document and headless paths.
 EcadEditorState& fallbackState() {
     static EcadEditorState s;
     return s;
@@ -186,41 +212,57 @@ float ptSegDistP(const EcadPt& p, const EcadPt& a, const EcadPt& b) {
     return std::hypot(p.x - cx, p.y - cy);
 }
 
-// Hit-test the mirror at world point w (tolerance worldTol mm). Returns a "<kind>:<id>" token for
-// the nearest entity, or "" for empty space. Symbols/footprints (by distance to pos within a
-// generous body radius) win over wires/tracks (by point-to-segment distance).
-std::string hitTest(const EcadMirror& m, const EcadPt& w, float worldTol) {
+// Hit-test the mirror at world point w (tolerance worldTol mm). The per-document Inspect filters
+// are authoritative: disabling a kind removes it from pick eligibility, not merely from the UI.
+std::string hitTest(const EcadEditorState& es, const EcadPt& w, float worldTol) {
+    const EcadMirror& m = es.mirror;
     std::string best;
     float bestD = 1e30f;
     if (m.isSch()) {
-        const float bodyR = std::max(worldTol, 2.6f);  // generous symbol body radius (mm)
-        for (const auto& s : m.symbols()) {
-            const float d = std::hypot(w.x - s.pos.x, w.y - s.pos.y);
-            if (d <= bodyR && d < bestD) { bestD = d; best = "s:" + s.id; }
+        if (es.pickSymbols) {
+            const float bodyR = std::max(worldTol, 2.6f);
+            for (const auto& s : m.symbols()) {
+                const float d = std::hypot(w.x - s.pos.x, w.y - s.pos.y);
+                if (d <= bodyR && d < bestD) { bestD = d; best = "s:" + s.id; }
+            }
+            if (!best.empty()) return best;
         }
-        if (!best.empty()) return best;  // symbols take priority over wires
-        for (const auto& wire : m.wires()) {
-            for (size_t i = 1; i < wire.pts.size(); ++i) {
-                const float d = ptSegDistP(w, wire.pts[i - 1], wire.pts[i]);
-                if (d <= worldTol && d < bestD) { bestD = d; best = "w:" + wire.id; }
+        if (es.pickWires) {
+            for (const auto& wire : m.wires()) {
+                for (size_t i = 1; i < wire.pts.size(); ++i) {
+                    const float d = ptSegDistP(w, wire.pts[i - 1], wire.pts[i]);
+                    if (d <= worldTol && d < bestD) { bestD = d; best = "w:" + wire.id; }
+                }
             }
         }
     } else if (m.isPcb()) {
-        for (const auto& fp : m.footprints()) {
-            // Body radius from the courtyard half-diagonal when present, else a default.
-            float bodyR = std::max(worldTol, 1.5f);
-            if (fp.hasCourtyard) {
-                bodyR = std::max(bodyR, 0.5f * std::hypot(fp.courtyardMax.x - fp.courtyardMin.x,
-                                                          fp.courtyardMax.y - fp.courtyardMin.y));
+        if (es.pickFootprints) {
+            for (const auto& fp : m.footprints()) {
+                float bodyR = std::max(worldTol, 1.5f);
+                if (fp.hasCourtyard) {
+                    bodyR = std::max(bodyR, 0.5f * std::hypot(
+                        fp.courtyardMax.x - fp.courtyardMin.x,
+                        fp.courtyardMax.y - fp.courtyardMin.y));
+                }
+                const float d = std::hypot(w.x - fp.pos.x, w.y - fp.pos.y);
+                if (d <= bodyR && d < bestD) { bestD = d; best = "fp:" + fp.id; }
             }
-            const float d = std::hypot(w.x - fp.pos.x, w.y - fp.pos.y);
-            if (d <= bodyR && d < bestD) { bestD = d; best = "fp:" + fp.id; }
+            if (!best.empty()) return best;
         }
-        if (!best.empty()) return best;  // footprints take priority over tracks
-        for (const auto& t : m.tracks()) {
-            const float tol = std::max(worldTol, t.width * 0.5f);
-            const float d = ptSegDistP(w, t.p1, t.p2);
-            if (d <= tol && d < bestD) { bestD = d; best = "t:" + t.id; }
+        if (es.pickVias) {
+            for (const auto& via : m.vias()) {
+                const float d = std::hypot(w.x - via.at.x, w.y - via.at.y);
+                const float tol = std::max(worldTol, via.diameter * 0.5f);
+                if (d <= tol && d < bestD) { bestD = d; best = "v:" + via.id; }
+            }
+            if (!best.empty()) return best;
+        }
+        if (es.pickTracks) {
+            for (const auto& t : m.tracks()) {
+                const float tol = std::max(worldTol, t.width * 0.5f);
+                const float d = ptSegDistP(w, t.p1, t.p2);
+                if (d <= tol && d < bestD) { bestD = d; best = "t:" + t.id; }
+            }
         }
     }
     return best;
@@ -271,41 +313,51 @@ void rotateOrFlipSelected(AppState& st, EcadEditorState& es, bool rotate) {
     st.ecadPendingOps = ops; st.ecadOpsGo = true;
 }
 
-// Property inspector (Select tool): when a symbol/footprint is selected, expose its Ref + Value as
-// inline editable fields. The buffers reload from the mirror whenever the selection target changes
-// (tracked by es.editLoadedFor) so edits never bleed between parts. Committing (Enter or Apply) emits
-// sch_edit_symbol / pcb_edit_footprint through the same st.ecadPendingOps/ecadOpsGo path used by
-// drag/place/delete. Returns true if an inspector was drawn (so the caller skips the Select hint).
+// Narrow-rail property editor for the selected symbol/footprint. Buffers reload on selection
+// changes, then commit through the same contract-valid edit ops used by canvas hotkeys.
 bool drawPropInspector(AppState& st, EcadEditorState& es, float sc) {
+    (void)sc;
     const auto c = es.selected.find(':');
     if (c == std::string::npos) return false;
     const std::string kind = es.selected.substr(0, c), id = es.selected.substr(c + 1);
-    const bool sch = (kind == "s"), pcb = (kind == "fp");
-    if (!sch && !pcb) return false;  // wires/tracks have no Ref/Value to edit
+    const bool sch = kind == "s";
+    if (!sch && kind != "fp") return false;
 
-    // Locate the live ref/value (+ a lib label for context) from the mirror. For schematic symbols we
-    // also keep the full EcadSymbol around so we can seed the footprint/dnp/sim-params fields.
-    const std::string* ref = nullptr; const std::string* value = nullptr; std::string libLabel;
-    const EcadSymbol* sym = nullptr;  // sch only
+    const std::string* ref = nullptr;
+    const std::string* value = nullptr;
+    std::string libLabel;
+    const EcadSymbol* sym = nullptr;
     if (sch) {
-        for (const auto& s : es.mirror.symbols())
-            if (s.id == id) { sym = &s; ref = &s.ref; value = &s.value; libLabel = s.libid; break; }
+        for (const auto& s : es.mirror.symbols()) {
+            if (s.id == id) {
+                sym = &s;
+                ref = &s.ref;
+                value = &s.value;
+                libLabel = s.libid;
+                break;
+            }
+        }
     } else {
-        for (const auto& fp : es.mirror.footprints())
-            if (fp.id == id) { ref = &fp.ref; value = &fp.value; libLabel = fp.fpid; break; }
+        for (const auto& fp : es.mirror.footprints()) {
+            if (fp.id == id) {
+                ref = &fp.ref;
+                value = &fp.value;
+                libLabel = fp.fpid;
+                break;
+            }
+        }
     }
-    if (!ref) return false;  // selection stale (just deleted) -> let the caller draw the hint
+    if (!ref) return false;
 
-    if (es.editLoadedFor != es.selected) {  // (re)load buffers on selection change
+    if (es.editLoadedFor != es.selected) {
         std::snprintf(es.editRef, sizeof(es.editRef), "%s", ref->c_str());
         std::snprintf(es.editValue, sizeof(es.editValue), "%s", value->c_str());
-        // Schematic-only buffers. sim_params is shown as compact JSON ("" when empty/absent).
         if (sym) {
             std::snprintf(es.editFootprint, sizeof(es.editFootprint), "%s", sym->footprint.c_str());
             es.editDnp = sym->dnp;
-            const std::string spText =
-                (sym->simParams.is_object() && !sym->simParams.empty()) ? sym->simParams.dump() : "";
-            std::snprintf(es.editSimParams, sizeof(es.editSimParams), "%s", spText.c_str());
+            const std::string params =
+                sym->simParams.is_object() && !sym->simParams.empty() ? sym->simParams.dump() : "";
+            std::snprintf(es.editSimParams, sizeof(es.editSimParams), "%s", params.c_str());
         } else {
             es.editFootprint[0] = '\0';
             es.editDnp = false;
@@ -314,106 +366,151 @@ bool drawPropInspector(AppState& st, EcadEditorState& es, float sc) {
         es.editLoadedFor = es.selected;
     }
 
-    const ui::Palette& pal = ui::palette;
-    ImGui::TextColored(v4(pal.accent), "%s", libLabel.empty() ? "Properties" : libLabel.c_str());
-    ImGui::SameLine(0, 10 * sc);
-    ImGui::SetNextItemWidth(80 * sc);
-    bool commit = ImGui::InputText("Ref", es.editRef, sizeof(es.editRef),
+    ui::kit::keyValueRow(sch ? "Symbol library" : "Footprint library", libLabel.c_str());
+    ui::kit::dimText("Reference");
+    ImGui::SetNextItemWidth(-1.0f);
+    bool commit = ImGui::InputText("##ecadEditRef", es.editRef, sizeof(es.editRef),
                                    ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(120 * sc);
-    commit |= ImGui::InputText("Value", es.editValue, sizeof(es.editValue),
+    ui::kit::dimText("Value");
+    ImGui::SetNextItemWidth(-1.0f);
+    commit |= ImGui::InputText("##ecadEditValue", es.editValue, sizeof(es.editValue),
                                ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SameLine();
-    if (ImGui::Button("Apply")) commit = true;
+    if (ui::kit::primaryButton("Apply properties", true, nullptr, ImVec2(-1.0f, 0.0f)))
+        commit = true;
     if (commit) {
-        nlohmann::json ops = nlohmann::json::array();
-        ops.push_back({{"op", sch ? "sch_edit_symbol" : "pcb_edit_footprint"},
-                       {"id", id}, {"ref", es.editRef}, {"value", es.editValue}});
-        st.ecadPendingOps = ops; st.ecadOpsGo = true;
-        es.editLoadedFor.clear();  // force a reload from the post-edit revision next frame
+        st.ecadPendingOps = nlohmann::json::array(
+            {{{"op", sch ? "sch_edit_symbol" : "pcb_edit_footprint"},
+              {"id", id}, {"ref", es.editRef}, {"value", es.editValue}}});
+        st.ecadOpsGo = true;
+        es.editLoadedFor.clear();
     }
-    // Orientation controls (also bound to R / F on the canvas — see handleSelectEdit).
-    ImGui::SameLine(0, 14 * sc);
-    if (ImGui::Button("Rotate (R)")) rotateOrFlipSelected(st, es, /*rotate=*/true);
-    ImGui::SameLine();
-    if (ImGui::Button(sch ? "Flip (F)" : "Flip side (F)")) rotateOrFlipSelected(st, es, false);
 
-    // ---- schematic-only extras: footprint assignment, DNP, sim-params ----
-    // PCB footprints already have their own fpid; these belong on the schematic symbol whose
-    // footprint/dnp/sim_params the engine's sch_edit_symbol patches (footprint/sim_params delete on
-    // JSON null, set on a string/object; dnp is a plain bool).
+    const float actionW =
+        (ImGui::GetContentRegionAvail().x - ui::kit::rowGap()) * 0.5f;
+    if (ui::kit::secondaryButton("Rotate (R)", true, nullptr, ImVec2(actionW, 0.0f)))
+        rotateOrFlipSelected(st, es, true);
+    ImGui::SameLine(0.0f, ui::kit::rowGap());
+    if (ui::kit::secondaryButton(sch ? "Flip (F)" : "Flip side (F)", true, nullptr,
+                                 ImVec2(actionW, 0.0f)))
+        rotateOrFlipSelected(st, es, false);
+
     if (sch) {
-        // Footprint: an editable text field, pre-populated from a combo seeded with the same library
-        // the Place tool offers. Empty string -> send JSON null so the engine CLEARS the key.
-        ImGui::SetNextItemWidth(210 * sc);
-        bool fpCommit = ImGui::InputText("Footprint", es.editFootprint, sizeof(es.editFootprint),
-                                         ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine();
-        if (ImGui::BeginCombo("##fpPick", "Pick", ImGuiComboFlags_NoPreview)) {
-            static const char* kFps[] = {"Resistor_SMD:R_0603", "Capacitor_SMD:C_0603",
-                "Package_SO:SOIC-8", "Package_TO_SOT_SMD:SOT-23"};
-            for (auto* f : kFps)
-                if (ImGui::Selectable(f, std::string(es.editFootprint) == f)) {
-                    std::snprintf(es.editFootprint, sizeof(es.editFootprint), "%s", f);
-                    fpCommit = true;
-                }
+        ui::kit::sectionHeader("Assembly", nullptr, nullptr, -1);
+        static const char* kFps[] = {
+            "Resistor_SMD:R_0603", "Capacitor_SMD:C_0603",
+            "Package_SO:SOIC-8", "Package_TO_SOT_SMD:SOT-23"};
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::BeginCombo("##ecadFootprintLibrary",
+                              es.editFootprint[0] ? es.editFootprint : "No footprint")) {
+            for (const char* fp : kFps) {
+                if (ImGui::Selectable(fp, std::string(es.editFootprint) == fp))
+                    std::snprintf(es.editFootprint, sizeof(es.editFootprint), "%s", fp);
+            }
             ImGui::EndCombo();
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pick a footprint from the library");
-        ImGui::SameLine();
-        if (ImGui::Button("Set##fp")) fpCommit = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Assign the footprint (blank clears it)");
+        ImGui::SetNextItemWidth(-1.0f);
+        bool fpCommit = ImGui::InputTextWithHint("##ecadFootprint",
+            "Footprint id (blank clears)", es.editFootprint, sizeof(es.editFootprint),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ui::kit::secondaryButton("Assign footprint", true, nullptr, ImVec2(-1.0f, 0.0f)))
+            fpCommit = true;
         if (fpCommit) {
-            nlohmann::json ops = nlohmann::json::array();
             nlohmann::json op = {{"op", "sch_edit_symbol"}, {"id", id}};
-            // Empty -> null (delete the key); non-empty -> the string.
-            op["footprint"] = (es.editFootprint[0] == '\0') ? nlohmann::json(nullptr)
-                                                            : nlohmann::json(std::string(es.editFootprint));
-            ops.push_back(op);
-            st.ecadPendingOps = ops; st.ecadOpsGo = true;
+            op["footprint"] = es.editFootprint[0] == '\0'
+                ? nlohmann::json(nullptr) : nlohmann::json(std::string(es.editFootprint));
+            st.ecadPendingOps = nlohmann::json::array({op});
+            st.ecadOpsGo = true;
+            es.editLoadedFor.clear();
+        }
+        if (ImGui::Checkbox("Do not populate", &es.editDnp)) {
+            st.ecadPendingOps = nlohmann::json::array(
+                {{{"op", "sch_edit_symbol"}, {"id", id}, {"dnp", es.editDnp}}});
+            st.ecadOpsGo = true;
             es.editLoadedFor.clear();
         }
 
-        // DNP (do-not-populate): a checkbox that commits immediately on toggle.
-        if (ImGui::Checkbox("DNP (do-not-populate)", &es.editDnp)) {
-            nlohmann::json ops = nlohmann::json::array();
-            ops.push_back({{"op", "sch_edit_symbol"}, {"id", id}, {"dnp", es.editDnp}});
-            st.ecadPendingOps = ops; st.ecadOpsGo = true;
-            es.editLoadedFor.clear();
-        }
-
-        // Sim-params: free-form JSON object edited as text, parsed on Apply. Blank -> null (clear).
-        ImGui::TextColored(v4(pal.textDim), "Sim params (JSON)");
-        ImGui::InputTextMultiline("##simParams", es.editSimParams, sizeof(es.editSimParams),
-                                  ImVec2(280 * sc, 48 * sc));
-        ImGui::SameLine();
-        if (ImGui::Button("Apply##sim")) {
+        ui::kit::dimText("Simulation parameters (JSON object)");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextMultiline("##ecadSimParams", es.editSimParams,
+                                  sizeof(es.editSimParams),
+                                  ImVec2(-1.0f, ui::metrics::U(12.0f)));
+        if (ui::kit::secondaryButton("Apply simulation parameters", true, nullptr,
+                                     ImVec2(-1.0f, 0.0f))) {
             const std::string txt(es.editSimParams);
-            // Trim leading/trailing whitespace to detect a truly empty field.
-            const auto first = txt.find_first_not_of(" \t\r\n");
-            const bool blank = (first == std::string::npos);
+            const bool blank = txt.find_first_not_of(" \t\r\n") == std::string::npos;
             nlohmann::json parsed;
-            bool ok = true;
+            bool valid = true;
             if (!blank) {
-                parsed = nlohmann::json::parse(txt, nullptr, /*allow_exceptions=*/false);
-                if (parsed.is_discarded() || !parsed.is_object()) ok = false;
+                parsed = nlohmann::json::parse(txt, nullptr, false);
+                valid = !parsed.is_discarded() && parsed.is_object();
             }
-            if (!ok) {
-                st.addLog("[ecad] sim params: invalid JSON object — not applied");
+            if (!valid) {
+                st.toast(ui::ToastLevel::Warn, "Simulation parameters must be a JSON object");
             } else {
-                nlohmann::json ops = nlohmann::json::array();
                 nlohmann::json op = {{"op", "sch_edit_symbol"}, {"id", id}};
-                op["sim_params"] = blank ? nlohmann::json(nullptr) : parsed;  // blank -> null (clear)
-                ops.push_back(op);
-                st.ecadPendingOps = ops; st.ecadOpsGo = true;
+                op["sim_params"] = blank ? nlohmann::json(nullptr) : parsed;
+                st.ecadPendingOps = nlohmann::json::array({op});
+                st.ecadOpsGo = true;
                 es.editLoadedFor.clear();
             }
         }
     }
     return true;
 }
+bool deleteSelected(AppState& st, EcadEditorState& es) {
+    const auto c = es.selected.find(':');
+    if (c == std::string::npos) return false;
+    const std::string kind = es.selected.substr(0, c), id = es.selected.substr(c + 1);
+    const char* opName = nullptr;
+    if (kind == "s") opName = "sch_delete_symbol";
+    else if (kind == "w") opName = "sch_delete_wire";
+    else if (kind == "fp") opName = "pcb_delete_footprint";
+    else if (kind == "t") opName = "pcb_delete_track";
+    else if (kind == "v") opName = "pcb_delete_via";
+    if (!opName) return false;
+    st.ecadPendingOps = nlohmann::json::array({{{"op", opName}, {"id", id}}});
+    st.ecadOpsGo = true;
+    es.selected.clear();
+    es.editLoadedFor.clear();
+    return true;
+}
+
+bool focusSelected(EcadEditorState& es) {
+    const auto c = es.selected.find(':');
+    if (c == std::string::npos) return false;
+    const std::string kind = es.selected.substr(0, c), id = es.selected.substr(c + 1);
+    EcadPt p;
+    bool found = false;
+    if (kind == "s") {
+        for (const auto& s : es.mirror.symbols())
+            if (s.id == id) { p = s.pos; found = true; break; }
+    } else if (kind == "fp") {
+        for (const auto& fp : es.mirror.footprints())
+            if (fp.id == id) { p = fp.pos; found = true; break; }
+    } else if (kind == "w") {
+        for (const auto& w : es.mirror.wires()) {
+            if (w.id != id || w.pts.empty()) continue;
+            p = {(w.pts.front().x + w.pts.back().x) * 0.5f,
+                 (w.pts.front().y + w.pts.back().y) * 0.5f};
+            found = true;
+            break;
+        }
+    } else if (kind == "t") {
+        for (const auto& t : es.mirror.tracks()) {
+            if (t.id != id) continue;
+            p = {(t.p1.x + t.p2.x) * 0.5f, (t.p1.y + t.p2.y) * 0.5f};
+            found = true;
+            break;
+        }
+    } else if (kind == "v") {
+        for (const auto& v : es.mirror.vias())
+            if (v.id == id) { p = v.at; found = true; break; }
+    }
+    if (!found) return false;
+    es.canvas.focusOn(p);
+    return true;
+}
+
 
 // Select-tool interaction: pick/highlight on click, Delete to remove, left-drag to move a
 // symbol/footprint (emits sch_edit_symbol / pcb_edit_footprint on release, grid-snapped). Sets
@@ -421,7 +518,7 @@ bool drawPropInspector(AppState& st, EcadEditorState& es, float sc) {
 // st.ecadPendingOps / st.ecadOpsGo, same mechanism as Place/Route.
 void handleSelectEdit(AppState& st, EcadEditorState& es, const EcadCanvasIO& io) {
     const bool sch = es.mirror.isSch();
-    const float g = sch ? 1.27f : 0.5f;
+    const float g = sch ? 1.27f : std::max(0.01f, es.snapGrid);
     const float pxTol = 9.0f;
     const float worldTol = pxTol / std::max(0.01f, es.canvas.zoom());
 
@@ -471,24 +568,16 @@ void handleSelectEdit(AppState& st, EcadEditorState& es, const EcadCanvasIO& io)
         if (ImGui::IsKeyPressed(ImGuiKey_F)) { rotateOrFlipSelected(st, es, /*rotate=*/false); return; }
     }
 
-    // ---- Delete the selected entity (only when the canvas is hovered, so the key doesn't fire
-    // while typing elsewhere) ----
     if (!es.selected.empty() && io.hovered && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
-        const auto c = es.selected.find(':');
-        const std::string kind = es.selected.substr(0, c), id = es.selected.substr(c + 1);
-        nlohmann::json ops = nlohmann::json::array();
-        if (kind == "s")       ops.push_back({{"op", "sch_delete_symbol"}, {"id", id}});
-        else if (kind == "w")  ops.push_back({{"op", "sch_delete_wire"}, {"id", id}});
-        else if (kind == "fp") ops.push_back({{"op", "pcb_delete_footprint"}, {"id", id}});
-        else if (kind == "t")  ops.push_back({{"op", "pcb_delete_track"}, {"id", id}});
-        if (!ops.empty()) { st.ecadPendingOps = ops; st.ecadOpsGo = true; }
-        es.selected.clear();
+        deleteSelected(st, es);
         return;
     }
 
-    // ---- pick on click (hit-test nearest entity; empty space clears) ----
-    if (io.clicked && io.hasWorldMouse)
-        es.selected = hitTest(es.mirror, io.worldMouse, worldTol);
+    // ---- pick on click (hit-test nearest eligible entity; empty space clears) ----
+    if (io.clicked && io.hasWorldMouse) {
+        es.selected = hitTest(es, io.worldMouse, worldTol);
+        es.editLoadedFor.clear();
+    }
 }
 
 // Wave Q — translate a canvas click into a place/route op for the active tool. Sets
@@ -502,349 +591,732 @@ void handleCanvasEdit(AppState& st, EcadEditorState& es, const EcadCanvasIO& io)
     if (!io.clicked || !io.hasWorldMouse) return;
 
     const bool sch = es.mirror.isSch();
-    const float g = sch ? 1.27f : 0.5f;
+    const float g = sch ? 1.27f : std::max(0.01f, es.snapGrid);
     const float gx = snapTo(io.worldMouse.x, g), gy = snapTo(io.worldMouse.y, g);
     nlohmann::json ops = nlohmann::json::array();
 
-    if (st.ecadTool == 1) {              // Place
-        if (sch) ops.push_back({{"op", "sch_add_symbol"}, {"libid", es.placeLib}, {"pos", {gx, gy}}});
-        else     ops.push_back({{"op", "pcb_add_footprint"}, {"fpid", es.placeFp}, {"pos", {gx, gy}}});
-    } else if (st.ecadTool == 2) {       // Route (click-to-click polyline)
-        if (es.routing) {
-            if (sch) ops.push_back({{"op", "sch_add_wire"}, {"pts", {{es.lastX, es.lastY}, {gx, gy}}}});
-            else     ops.push_back({{"op", "pcb_add_track"}, {"layer", "F.Cu"}, {"width", 0.25},
-                                    {"p1", {es.lastX, es.lastY}}, {"p2", {gx, gy}}});
+    if (st.ecadTool == 1) {
+        if (sch) {
+            static const char* kScopes[] = {"local", "global", "hier"};
+            if (es.schPlaceKind == 0) {
+                ops.push_back({{"op", "sch_add_symbol"}, {"libid", es.placeLib},
+                               {"pos", {gx, gy}}});
+            } else if (es.schPlaceKind == 1) {
+                if (es.placeLabel[0] == '\0') {
+                    st.toast(ui::ToastLevel::Warn, "Enter net label text before placing");
+                } else {
+                    ops.push_back({{"op", "sch_add_label"}, {"pos", {gx, gy}},
+                                   {"text", es.placeLabel},
+                                   {"scope", kScopes[es.placeLabelScope]}});
+                }
+            } else if (es.schPlaceKind == 2) {
+                if (es.placePowerNet[0] == '\0') {
+                    st.toast(ui::ToastLevel::Warn, "Enter a power net before placing");
+                } else {
+                    ops.push_back({{"op", "sch_add_power"}, {"pos", {gx, gy}},
+                                   {"net", es.placePowerNet},
+                                   {"symbol", es.placePowerSymbol}});
+                }
+            } else if (es.schPlaceKind == 3) {
+                ops.push_back({{"op", "sch_add_junction"}, {"pos", {gx, gy}}});
+            } else if (es.schPlaceKind == 4) {
+                ops.push_back({{"op", "sch_add_no_connect"}, {"pos", {gx, gy}}});
+            }
+        } else if (es.pcbPlaceKind == 0) {
+            ops.push_back({{"op", "pcb_add_footprint"}, {"fpid", es.placeFp},
+                           {"pos", {gx, gy}}});
+        } else {
+            nlohmann::json op = {{"op", "pcb_add_via"}, {"at", {gx, gy}},
+                                 {"drill", std::max(0.05f, es.viaDrill)},
+                                 {"diameter", std::max(es.viaDiameter, es.viaDrill + 0.10f)}};
+            if (!es.activeNet.empty()) op["net"] = es.activeNet;
+            if (es.mirror.layers().size() >= 2) {
+                op["layers"] = {es.mirror.layers().front().id,
+                                es.mirror.layers().back().id};
+            }
+            ops.push_back(op);
         }
-        es.routing = true; es.lastX = gx; es.lastY = gy;  // anchor for the next segment
+    } else if (st.ecadTool == 2) {
+        if (es.routing) {
+            if (sch) {
+                ops.push_back({{"op", "sch_add_wire"},
+                               {"pts", {{es.lastX, es.lastY}, {gx, gy}}}});
+            } else {
+                nlohmann::json op = {{"op", "pcb_add_track"}, {"layer", es.activeLayer},
+                                     {"width", std::max(0.01f, es.routeWidth)},
+                                     {"p1", {es.lastX, es.lastY}}, {"p2", {gx, gy}}};
+                if (!es.activeNet.empty()) op["net"] = es.activeNet;
+                ops.push_back(op);
+            }
+        }
+        es.routing = true;
+        es.lastX = gx;
+        es.lastY = gy;
     }
     if (!ops.empty()) { st.ecadPendingOps = ops; st.ecadOpsGo = true; }
 }
 
-// ---- ECAD manager body: PCB layers / sch nets+symbols, restyled to match Feature Manager ----
-// (moved OUT of the ECAD dock window and into the shared pinned left column — see ecad_panel.h and
-// layout.cpp's Electronics branch. Kept here, in the anonymous namespace, as the implementation the
-// exported ui::drawEcadManagerBody (bottom of file) delegates to, so it can still reach the file's
-// other anonymous-namespace helpers (state(), v4(), layerSwatch(), scanEcadHealth(), drawPropInspector()).
-void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU32 halo) {
-    EcadEditorState& es = state();
+// ---- ECAD manager: dense per-document Design / Inspect / Checks command center -----------------
+bool containsFolded(const std::string& text, const char* query) {
+    if (!query || *query == '\0') return true;
+    const std::string needle(query);
+    return std::search(text.begin(), text.end(), needle.begin(), needle.end(),
+        [](char a, char b) {
+            return std::tolower(static_cast<unsigned char>(a)) ==
+                   std::tolower(static_cast<unsigned char>(b));
+        }) != text.end();
+}
+
+std::string pointText(const EcadPt& p) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.2f, %.2f mm", p.x, p.y);
+    return buf;
+}
+
+std::string mmText(float value) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.3f mm", value);
+    return buf;
+}
+
+void ensurePcbContext(EcadEditorState& es) {
+    if (!es.mirror.isPcb()) return;
+    const auto& layers = es.mirror.layers();
+    const bool haveLayer = std::any_of(layers.begin(), layers.end(),
+        [&](const EcadLayer& layer) { return layer.id == es.activeLayer; });
+    if (!haveLayer && !layers.empty()) es.activeLayer = layers.front().id;
+    if (!es.activeNet.empty()) {
+        const auto& nets = es.mirror.nets();
+        const bool haveNet = std::any_of(nets.begin(), nets.end(),
+            [&](const EcadNet& net) { return net.name == es.activeNet; });
+        if (!haveNet) es.activeNet.clear();
+    }
+    es.routeWidth = std::max(0.01f, es.routeWidth);
+    es.viaDrill = std::max(0.05f, es.viaDrill);
+    es.viaDiameter = std::max(es.viaDiameter, es.viaDrill + 0.10f);
+    es.snapGrid = std::max(0.01f, es.snapGrid);
+}
+
+void drawManagerToolbar(AppState& st, EcadEditorState& es, bool pcb) {
+    const float size = ui::metrics::camBtnH();
+    const float gap = ui::kit::rowGap();
+    if (ui::kit::iconButton("ecad_save", "save", "Save (Shift-click: Save As)", true,
+                            ui::kit::Tone::Neutral, size))
+        st.ecadPanelCmd = "ecad_save";
+    ImGui::SameLine(0.0f, gap);
+    if (ui::kit::iconButton("ecad_open", "open", "Open ECAD or KiCad file", true,
+                            ui::kit::Tone::Neutral, size))
+        st.ecadPanelCmd = "ecad_open";
+    ImGui::SameLine(0.0f, gap);
+    if (ui::kit::iconButton("ecad_fit", "zoom_fit", "Zoom to fit", true,
+                            ui::kit::Tone::Neutral, size))
+        es.canvas.requestFit();
+    ImGui::SameLine(0.0f, gap);
+    if (ui::kit::iconButton("ecad_undo", "undo", "Undo", true,
+                            ui::kit::Tone::Neutral, size))
+        st.ecadUndoGo = true;
+    ImGui::SameLine(0.0f, gap);
+    if (ui::kit::iconButton("ecad_redo", "redo", "Redo", true,
+                            ui::kit::Tone::Neutral, size))
+        st.ecadRedoGo = true;
+    if (!pcb) {
+        ImGui::SameLine(0.0f, gap);
+        if (ui::kit::iconButton("ecad_annotate", "health_check",
+                                "Annotate reference designators", true,
+                                ui::kit::Tone::Neutral, size))
+            st.ecadPanelCmd = "sch_annotate";
+    }
+}
+
+void drawLayerHierarchyRow(EcadEditorState& es, const EcadLayer& layer) {
     EcadMirror& m = es.mirror;
-    const ui::Palette& pal = ui::palette;
-    const float sc = ui::uiScale;
-    (void)halo;
-
-    if (!m.hasDoc()) {
-        ImGui::TextColored(v4(pal.textDim), "No PCB/schematic document open.");
-        return;
+    ImGui::PushID(layer.id.c_str());
+    const std::string selId = "layer:" + layer.id;
+    const bool selected = es.mgrSel == selId;
+    bool visible = m.layerVisible(layer.id);
+    float overrideColor[3];
+    const ImVec4 color = m.layerColor(layer.id, overrideColor)
+        ? ImVec4(overrideColor[0], overrideColor[1], overrideColor[2], 1.0f)
+        : layerSwatch(layer.copperIndex);
+    const float tint[3] = {color.x, color.y, color.z};
+    ui::FmRowRect row = ui::fmRowPill(selected, tint);
+    ImGui::AlignTextToFramePadding();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui::metrics::U());
+    if (ImGui::Checkbox("##layerVisible", &visible)) m.setLayerVisible(layer.id, visible);
+    const bool overVisibility = ImGui::IsItemHovered();
+    if (overVisibility) ImGui::SetTooltip(visible ? "Hide layer" : "Show layer");
+    ImGui::SameLine(0.0f, ui::metrics::U());
+    const ImVec2 swatchSize(ImGui::GetFrameHeight(), ImGui::GetFrameHeight());
+    if (ImGui::ColorButton("##layerColor", color,
+                           ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
+                           swatchSize))
+        ImGui::OpenPopup("##layerColorPicker");
+    const bool overColor = ImGui::IsItemHovered();
+    ImGui::SameLine(0.0f, ui::metrics::U());
+    ImGui::TextColored(visible ? v4(ui::palette.text) : v4(ui::palette.textDisabled),
+                       "%s", layer.id.c_str());
+    ui::fmRowPillEnd(row, selected);
+    if (!overVisibility && !overColor && ImGui::IsMouseHoveringRect(row.mn, row.mx) &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        es.mgrSel = selId;
+        es.activeLayer = layer.id;
     }
-    const bool pcb = m.isPcb();
+    if (ImGui::BeginPopup("##layerColorPicker")) {
+        float colorEdit[3] = {color.x, color.y, color.z};
+        if (ImGui::ColorPicker3("##color", colorEdit,
+                                ImGuiColorEditFlags_NoSidePreview |
+                                ImGuiColorEditFlags_NoInputs))
+            m.setLayerColor(layer.id, colorEdit[0], colorEdit[1], colorEdit[2]);
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+}
 
-    // Compact vertical rhythm (the FeatureManager convention): tighten ItemSpacing.y only.
-    // RAII so it unwinds on any early return.
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 4.0f * sc));
-    struct SpacingPop { ~SpacingPop() { ImGui::PopStyleVar(); } } spacingPop;
-
-    // ---- header: the pane-header chip now lives UP in the Electronics rail row (drawn by layout.cpp
-    // beside the Explorer/PCB Manager tab buttons — round-5b: kills the dead band to the right of
-    // those buttons and pulls this tree up). The body therefore starts straight at the doc-name row. ----
-
-    // Doc name + revision row — carried on a glass fmRowPill (item: give "Board1 - rev N" a proper
-    // Feature-Manager-style background instead of bare dim text). fmRowStripeReset first so this is
-    // stripe 0 and the tree rows below alternate cleanly from it.
-    // A more DEFINED glass box (stronger fill + border) than a plain fmRowPill so the header, the
-    // Nets rows, etc. read clearly over the bright PCB grid bleeding through (Hunter round-4).
-    auto au = [](const float c[4], float a) {
-        return ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], c[3] * a));
-    };
-    auto defineBox = [&](const ui::FmRowRect& r) {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float s = sc, rr = 3.5f * s;
-        ImVec2 mn(r.mn.x + 2.0f * s, r.mn.y + 2.0f * s), mx(r.mx.x - 2.0f * s, r.mx.y - 2.0f * s);
-        dl->AddRectFilled(mn, mx, au(pal.glassBg, 0.55f), rr);
-        dl->AddRect(mn, mx, au(pal.glassBorder, 0.90f), rr, 0, std::max(1.0f, s));
-    };
-    // Left-inset, frame-centered text — the padding + vertical centering the Layers rows use, so
-    // every row's text sits consistently inside its pill (Hunter round-4).
-    auto rowInk = [&]() {
-        ImGui::AlignTextToFramePadding();
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6.0f * sc);
-    };
-
-    ui::fmRowStripeReset();
-    {
-        const std::string nm = m.name().empty() ? "(untitled)" : m.name();
-        ui::FmRowRect rr = ui::fmRowPill();
-        defineBox(rr);
-        rowInk();
-        ImGui::TextColored(v4(pal.text), "%s", nm.c_str());
+void drawNetHierarchyRow(EcadEditorState& es, const EcadNet& net, bool withPins) {
+    EcadMirror& m = es.mirror;
+    ImGui::PushID(net.name.c_str());
+    const std::string selId = "net:" + net.name;
+    const bool selected = es.mgrSel == selId;
+    bool visible = m.netVisible(net.name);
+    ui::FmRowRect row = ui::fmRowPill(selected);
+    ImGui::AlignTextToFramePadding();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui::metrics::U());
+    if (ImGui::Checkbox("##netVisible", &visible)) m.setNetVisible(net.name, visible);
+    const bool overVisibility = ImGui::IsItemHovered();
+    if (overVisibility) ImGui::SetTooltip(visible ? "Hide net" : "Show net");
+    ImGui::SameLine(0.0f, ui::metrics::U());
+    ImGui::TextColored(visible ? v4(ui::palette.text) : v4(ui::palette.textDisabled),
+                       "%s", net.name.c_str());
+    if (withPins) {
         ImGui::SameLine();
-        ImGui::TextColored(v4(pal.textDim), "rev %d", m.revision());
-        ui::fmRowPillEnd(rr);
+        ImGui::TextColored(v4(ui::palette.textDim), "%d pins", net.pinCount);
     }
-
-    // Workspace health: surfaced as a TOAST (posted once per change), not an inline strip — keeps
-    // the manager column clean (Hunter red-pen: the "! Board has no footprints…" line was rendering
-    // in the panel). scanEcadHealth only recomputes on a revision change, so healthMsg is stable
-    // frame-to-frame; gate the post on the message actually changing to avoid re-toasting every frame.
-    scanEcadHealth(es);
-    if (es.healthLevel >= 1 && es.healthMsg != es.healthToasted)
-        st.toast(es.healthLevel >= 2 ? ui::ToastLevel::Error : ui::ToastLevel::Warn, es.healthMsg);
-    es.healthToasted = es.healthMsg;
-    ImGui::Spacing();
-
-    // ---- icon toolbar row: Zoom Fit / Undo / Redo / Run DRC (pcb) or Annotate (sch) — same glass
-    // icon-button the Feature Manager toolbar uses (ui::fmToolbarIconBtn), instead of the old
-    // SmallButton row / the canvas-top checkButton. ----
-    {
-        const float bw = 24.0f * sc, gap = 4.0f * sc;
-        // Save / Open (the pair carried over from the Feature Manager toolbar) + view + history.
-        // PCB's Run DRC moved to the ribbon (Checks group); schematic keeps Annotate (no ribbon home).
-        const int nBtn = pcb ? 5 : 6;
-        const float toolW = nBtn * bw + (nBtn - 1) * gap;
-        ImVec2 rowMin = ImGui::GetCursorScreenPos();
-        const float availW = ImGui::GetContentRegionAvail().x;
-        // No wash behind the row — the FeatureManager toolbar floats on the pane glass; each
-        // 24px button carries its own resting pill (fmToolbarIconBtn).
-        float bx = rowMin.x + std::max(0.0f, (availW - toolW) * 0.5f);
-        ImGui::SetCursorScreenPos(ImVec2(bx, rowMin.y));
-        if (ui::fmToolbarIconBtn("ecad_save", "save", "Save  (Shift-click: Save As...)", true))
-            st.ecadPanelCmd = "ecad_save";
-        ImGui::SameLine(0, gap);
-        if (ui::fmToolbarIconBtn("ecad_open", "open", "Open ECAD / KiCad file...", true))
-            st.ecadPanelCmd = "ecad_open";
-        ImGui::SameLine(0, gap);
-        if (ui::fmToolbarIconBtn("ecad_fit", "view_selector", "Zoom Fit", true)) es.canvas.requestFit();
-        ImGui::SameLine(0, gap);
-        if (ui::fmToolbarIconBtn("ecad_undo", "undo", "Undo", true)) st.ecadUndoGo = true;
-        ImGui::SameLine(0, gap);
-        if (ui::fmToolbarIconBtn("ecad_redo", "redo", "Redo", true)) st.ecadRedoGo = true;
-        if (!pcb) {
-            ImGui::SameLine(0, gap);
-            if (ui::fmToolbarIconBtn("ecad_ann", "health_check",
-                                     "Annotate — auto-assign reference designators", true))
-                st.ecadPanelCmd = "sch_annotate";
-        }
-        ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMin.y + bw));
-        ImGui::Dummy(ImVec2(availW, 0));
-    }
-    ImGui::Spacing();
-
-    // ---- Select / Place / Route segmented control — the "Place/Route controls", full-width and
-    // prominent like Feature Manager's "Name & group features" CTA row (doesn't need to be blue —
-    // the selected segment just carries the accent tint). ----
-    {
-        static const char* kLabels[3] = {"Select", "Place", "Route"};
-        const float rowH = ImGui::GetFrameHeight();
-        const float availW = ImGui::GetContentRegionAvail().x;
-        const float segGap = 4.0f * sc;
-        const float segW = (availW - 2.0f * segGap) / 3.0f;
-        for (int i = 0; i < 3; ++i) {
-            if (i > 0) ImGui::SameLine(0, segGap);
-            const bool on = (st.ecadTool == i);
-            if (on) ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accentSoft));
-            ImGui::PushID(i);
-            if (ImGui::Button(kLabels[i], ImVec2(segW, rowH))) { st.ecadTool = i; es.routing = false; }
-            ImGui::PopID();
-            if (on) ImGui::PopStyleColor();
+    ui::fmRowPillEnd(row, selected);
+    if (!overVisibility && ImGui::IsMouseHoveringRect(row.mn, row.mx) &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (!m.isPcb() && selected) {
+            es.mgrSel.clear();
+            es.canvas.setHighlightedNet(std::string());
+        } else {
+            es.mgrSel = selId;
+            if (m.isPcb()) es.activeNet = net.name;
+            es.canvas.setHighlightedNet(net.name);
         }
     }
+    ImGui::PopID();
+}
 
-    // Contextual: Place tool's part/footprint picker; Route tool's hint. Select tool falls through
-    // to the property inspector below (drawPropInspector), which doubles as this column's live
-    // "PropertyManager" form when a symbol/footprint is selected — the ECAD analogue of the
-    // FeatureManager tab hosting the PM form inline.
-    if (st.ecadTool == 1) {
-        ImGui::Spacing();
-        if (m.isSch()) {
-            static const char* kLibs[] = {"Device:R", "Device:C", "Device:L", "Device:D",
-                "Simulation_SPICE:V_source", "power:GND", "power:VCC"};
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##ecadPlacePart", es.placeLib.c_str())) {
-                for (auto* l : kLibs)
-                    if (ImGui::Selectable(l, es.placeLib == l)) es.placeLib = l;
+void drawPcbEditingContext(EcadEditorState& es) {
+    EcadMirror& m = es.mirror;
+    ensurePcbContext(es);
+    ui::kit::sectionHeader("Routing context", "ecad_route", nullptr, -1, true);
+    ui::kit::dimText("Active copper layer");
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::BeginCombo("##activeCopper", es.activeLayer.c_str())) {
+        for (const auto& layer : m.layers()) {
+            if (ImGui::Selectable(layer.id.c_str(), es.activeLayer == layer.id)) {
+                es.activeLayer = layer.id;
+                es.mgrSel = "layer:" + layer.id;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ui::kit::dimText("Active net");
+    ImGui::SetNextItemWidth(-1.0f);
+    const char* netPreview = es.activeNet.empty() ? "No net" : es.activeNet.c_str();
+    if (ImGui::BeginCombo("##activeNet", netPreview)) {
+        if (ImGui::Selectable("No net", es.activeNet.empty())) {
+            es.activeNet.clear();
+            if (es.mgrSel.rfind("net:", 0) == 0) es.mgrSel.clear();
+            es.canvas.setHighlightedNet(std::string());
+        }
+        for (const auto& net : m.nets()) {
+            if (ImGui::Selectable(net.name.c_str(), es.activeNet == net.name)) {
+                es.activeNet = net.name;
+                es.mgrSel = "net:" + net.name;
+                es.canvas.setHighlightedNet(net.name);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ui::kit::dimText("Route width (mm)");
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputFloat("##routeWidth", &es.routeWidth, 0.0f, 0.0f, "%.3f"))
+        es.routeWidth = std::max(0.01f, es.routeWidth);
+    ui::kit::dimText("Snap grid (mm)");
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputFloat("##snapGrid", &es.snapGrid, 0.0f, 0.0f, "%.3f"))
+        es.snapGrid = std::max(0.01f, es.snapGrid);
+}
+
+void drawCanvasToolContext(AppState& st, EcadEditorState& es) {
+    const bool pcb = es.mirror.isPcb();
+    ui::kit::sectionHeader("Canvas tools", nullptr, nullptr, -1, !pcb);
+    static const char* kToolLabels[] = {"Select", "Place", "Route"};
+    static const char* kToolTips[] = {
+        "Pick, move, rotate, flip or delete entities",
+        "Place the configured schematic or PCB entity",
+        "Click points to route; Esc or right-click ends the chain"};
+    if (ui::kit::segmented("##ecadTool", kToolLabels, 3, &st.ecadTool,
+                           ImGui::GetContentRegionAvail().x, kToolTips))
+        es.routing = false;
+
+    if (st.ecadTool == 1 && pcb) {
+        static const char* kPlaceLabels[] = {"Footprint", "Via"};
+        if (ui::kit::segmented("##pcbPlaceKind", kPlaceLabels, 2, &es.pcbPlaceKind,
+                               ImGui::GetContentRegionAvail().x))
+            es.routing = false;
+        if (es.pcbPlaceKind == 0) {
+            static const char* kFps[] = {
+                "Resistor_SMD:R_0603", "Capacitor_SMD:C_0603",
+                "Package_SO:SOIC-8", "Package_TO_SOT_SMD:SOT-23"};
+            ui::kit::dimText("Footprint library");
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##placeFootprint", es.placeFp.c_str())) {
+                for (const char* fp : kFps)
+                    if (ImGui::Selectable(fp, es.placeFp == fp)) es.placeFp = fp;
                 ImGui::EndCombo();
             }
         } else {
-            static const char* kFps[] = {"Resistor_SMD:R_0603", "Capacitor_SMD:C_0603",
-                "Package_SO:SOIC-8", "Package_TO_SOT_SMD:SOT-23"};
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##ecadPlaceFp", es.placeFp.c_str())) {
-                for (auto* f : kFps)
-                    if (ImGui::Selectable(f, es.placeFp == f)) es.placeFp = f;
+            ui::kit::dimText("Via drill / diameter (mm)");
+            const float fieldW =
+                (ImGui::GetContentRegionAvail().x - ui::kit::rowGap()) * 0.5f;
+            ImGui::SetNextItemWidth(fieldW);
+            if (ImGui::InputFloat("##viaDrill", &es.viaDrill, 0.0f, 0.0f, "%.3f"))
+                es.viaDrill = std::max(0.05f, es.viaDrill);
+            ImGui::SameLine(0.0f, ui::kit::rowGap());
+            ImGui::SetNextItemWidth(fieldW);
+            if (ImGui::InputFloat("##viaDiameter", &es.viaDiameter, 0.0f, 0.0f, "%.3f"))
+                es.viaDiameter = std::max(es.viaDiameter, es.viaDrill + 0.10f);
+            ui::kit::dimText("Click the board to place a through via on the active net.");
+        }
+    } else if (st.ecadTool == 1) {
+        static const char* kKinds[] = {
+            "Symbol", "Net label", "Power port", "Junction", "No-connect"};
+        ui::kit::dimText("Placement type");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::Combo("##schPlaceKind", &es.schPlaceKind, kKinds, 5);
+        if (es.schPlaceKind == 0) {
+            static const char* kLibs[] = {
+                "Device:R", "Device:C", "Device:L", "Device:D",
+                "Simulation_SPICE:V_source", "power:GND", "power:VCC"};
+            ui::kit::dimText("Symbol library");
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##placeSymbol", es.placeLib.c_str())) {
+                for (const char* lib : kLibs)
+                    if (ImGui::Selectable(lib, es.placeLib == lib)) es.placeLib = lib;
                 ImGui::EndCombo();
             }
+        } else if (es.schPlaceKind == 1) {
+            ui::kit::dimText("Net label text");
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputText("##placeLabel", es.placeLabel, sizeof(es.placeLabel));
+            static const char* kScopes[] = {"Local", "Global", "Hierarchical"};
+            ui::kit::dimText("Label scope");
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::Combo("##labelScope", &es.placeLabelScope, kScopes, 3);
+        } else if (es.schPlaceKind == 2) {
+            ui::kit::dimText("Power net");
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputText("##powerNet", es.placePowerNet, sizeof(es.placePowerNet));
+            static const char* kPowerSymbols[] = {"GND", "VCC", "+5V", "+3V3"};
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##powerSymbol", es.placePowerSymbol.c_str())) {
+                for (const char* symbol : kPowerSymbols)
+                    if (ImGui::Selectable(symbol, es.placePowerSymbol == symbol))
+                        es.placePowerSymbol = symbol;
+                ImGui::EndCombo();
+            }
+        } else {
+            ui::kit::dimText(es.schPlaceKind == 3
+                ? "Click the sheet to place an electrical junction."
+                : "Click a pin endpoint to mark it intentionally unconnected.");
         }
     } else if (st.ecadTool == 2) {
-        ImGui::Spacing();
-        ImGui::TextColored(v4(pal.textDim), "Route: click points; Esc / right-click to finish");
-    } else if (st.ecadTool == 0) {
-        // Property inspector when something is selected; no idle "Select: click a part…" hint
-        // (Hunter red-pen — it read as out-of-place chrome in the manager column).
-        if (drawPropInspector(st, es, sc)) ImGui::Spacing();
+        ui::kit::dimText("Click points to add segments. Esc or right-click finishes the route.");
     }
+}
 
-    // FM chrome convention: Spacing alone separates the header stack from the tree — no
-    // orphaned Separator() hairline (the section rules inside the tree carry the structure).
-    ImGui::Spacing();
+void drawHierarchy(AppState& st, EcadEditorState& es) {
+    EcadMirror& m = es.mirror;
+    const bool pcb = m.isPcb();
+    ui::kit::sectionHeader(pcb ? "Board hierarchy" : "Schematic hierarchy",
+                           pcb ? "ecad_pcb" : "sch_new");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##ecadHierarchySearch", "Search hierarchy...",
+                             es.managerSearch, sizeof(es.managerSearch));
+    static const char* kPcbKinds[] = {"All", "Layers", "Nets", "Footprints"};
+    static const char* kSchKinds[] = {"All", "Nets", "Symbols"};
+    const int kindCount = pcb ? 4 : 3;
+    if (es.hierarchyKind >= kindCount) es.hierarchyKind = 0;
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::Combo("##ecadHierarchyKind", &es.hierarchyKind,
+                 pcb ? kPcbKinds : kSchKinds, kindCount);
 
-    // ---- Layers (pcb) / Nets + Symbols (sch) — Feature Manager tree-row styling: fmSectionDivider
-    // for the "Reference"/"Features"-style section labels, fmRowPill for the alternating-stripe,
-    // hoverable rows (mirrors the "Front Plane"/"Top Plane" convention). ----
-    ImGui::BeginChild("##ecadMgrTree", ImVec2(0, 0), ImGuiChildFlags_None);
+    int shown = 0;
     ui::fmRowStripeReset();
-    auto layerRow = [&](const EcadLayer& ly) {
-        ImGui::PushID(ly.id.c_str());
-        const std::string selId = "layer:" + ly.id;
-        const bool sel = (es.mgrSel == selId);
-        bool vis = m.layerVisible(ly.id);
-        // Effective layer color (per-layer override picked via the swatch wins over the
-        // copperIndex-derived default) — computed BEFORE the pill so it can dye the shared wash.
-        float ov[3];
-        const ImVec4 c = m.layerColor(ly.id, ov) ? ImVec4(ov[0], ov[1], ov[2], 1.0f)
-                                                  : layerSwatch(ly.copperIndex);
-        const float layerTint[3] = {c.x, c.y, c.z};
-        // The SHARED row pill, dyed the layer's own color: same seam-free frosted-glass base +
-        // colored wash + in-color selection glow as the Feature Manager rows (Hunter: Layers must
-        // match the rest of the app, not roll their own gradient). Passing the tint routes the glow
-        // through the layer color too, so there is no app-accent bleed and no hand-rolled fill.
-        ui::FmRowRect r = ui::fmRowPill(sel, layerTint);
-        auto dye = [&](float a) { return ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, a)); };
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float s = sc;
-        // Circular color swatch to the LEFT of the text: click it to change the layer color. Drawn
-        // vertically centered in the pill and padded off the left edge (Hunter round-5b).
-        const float swR = 5.5f * s, swPad = 8.0f * s;
-        ImVec2 swC(r.mn.x + swPad + swR, (r.mn.y + r.mx.y) * 0.5f);
-        dl->AddCircleFilled(swC, swR, dye(1.0f), 16);
-        // Ring that separates the swatch from the row: whatever contrasts with the layer's own
-        // color, so a near-black copper layer stops getting an invisible black outline.
-        ImVec4 swRing = ui::maxContrastTextOn(ImVec4(c.x, c.y, c.z, 1.0f));
-        swRing.w = 0.55f;
-        dl->AddCircle(swC, swR, ImGui::ColorConvertFloat4ToU32(swRing), 16,
-                      std::max(1.0f, 1.0f * s));
-        const float swRightX = swC.x + swR;
-        ImGui::AlignTextToFramePadding();
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (swRightX - r.mn.x) + 6.0f * sc);
-        ImGui::TextColored(vis ? v4(pal.text) : v4(pal.textDisabled), "%s", ly.id.c_str());
-        ui::fmRowPillEnd(r, false);
-        // Right-edge eye toggle (show/hide the layer) — the SAME glyph + placement the Feature
-        // Manager uses on its plane rows. Clicking elsewhere on the row selects it (fmRowPill glow).
-        const float eyeSz = 14.0f * sc, eyePad = 6.0f * sc;
-        ImVec2 eMin(r.mx.x - eyeSz - eyePad, r.mn.y + (r.mx.y - r.mn.y - eyeSz) * 0.5f);
-        ImVec2 eMax(eMin.x + eyeSz, eMin.y + eyeSz);
-        const bool overEye = ImGui::IsMouseHoveringRect(eMin, eMax);
-        ui::fmDrawEyeGlyph(eMin, eMax, vis, overEye);
-        // Swatch hit-test (generous square around the circle). Clicking opens the color picker.
-        ImVec2 swMin(swC.x - swR - 2.0f * s, swC.y - swR - 2.0f * s);
-        ImVec2 swMax(swC.x + swR + 2.0f * s, swC.y + swR + 2.0f * s);
-        const bool overSwatch = ImGui::IsMouseHoveringRect(swMin, swMax);
-        if (overSwatch) {
-            ImGui::SetTooltip("Change %s color", ly.id.c_str());
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) ImGui::OpenPopup("##layerColor");
-        }
-        if (ImGui::BeginPopup("##layerColor")) {
-            float col[3] = {c.x, c.y, c.z};
-            ImGui::TextUnformatted(ly.id.c_str());
-            if (ImGui::ColorPicker3("##pick", col,
-                                    ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoInputs))
-                m.setLayerColor(ly.id, col[0], col[1], col[2]);
-            ImGui::EndPopup();
-        }
-        if (!overSwatch && !overEye && ImGui::IsMouseHoveringRect(r.mn, r.mx) &&
-            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            es.mgrSel = sel ? std::string() : selId;   // toggle row selection
-        } else if (overEye) {
-            ImGui::SetTooltip(vis ? "Hide %s" : "Show %s", ly.id.c_str());
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) m.setLayerVisible(ly.id, !vis);
-        }
-        ImGui::PopID();
-    };
-    auto netRow = [&](const EcadNet& n, bool withPins) {
-        ImGui::PushID(n.name.c_str());
-        const std::string selId = "net:" + n.name;
-        const bool sel = (es.mgrSel == selId);
-        const bool nvis = m.netVisible(n.name);
-        ui::FmRowRect r = ui::fmRowPill(sel);
-        defineBox(r);   // stronger fill + border so nets read clearly over the PCB grid (round-4)
-        rowInk();       // left-inset + frame-centered text (matches the Layers rows)
-        ImGui::TextColored(nvis ? v4(pal.text) : v4(pal.textDisabled), "%s", n.name.c_str());
-        if (withPins) {
-            ImGui::SameLine();
-            ImGui::TextColored(v4(pal.textDim), "(%d pins)", n.pinCount);
-        }
-        ui::fmRowPillEnd(r, sel);
-        // Right-edge eye toggle — hide/show this net's tracks + ratsnest (round-4).
-        const float eyeSz = 14.0f * sc, eyePad = 6.0f * sc;
-        ImVec2 eMin(r.mx.x - eyeSz - eyePad, r.mn.y + (r.mx.y - r.mn.y - eyeSz) * 0.5f);
-        ImVec2 eMax(eMin.x + eyeSz, eMin.y + eyeSz);
-        const bool overEye = ImGui::IsMouseHoveringRect(eMin, eMax);
-        ui::fmDrawEyeGlyph(eMin, eMax, nvis, overEye);
-        if (overEye) {
-            ImGui::SetTooltip(nvis ? "Hide net %s" : "Show net %s", n.name.c_str());
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) m.setNetVisible(n.name, !nvis);
-        } else if (ImGui::IsMouseHoveringRect(r.mn, r.mx) &&
-                   ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            es.mgrSel = sel ? std::string() : selId;
-            es.canvas.setHighlightedNet(sel ? std::string() : n.name);
-        }
-        ImGui::PopID();
-    };
-    if (pcb) {
-        // "Layers" divider carries a "+" button that adds a copper layer. The engine models copper as
-        // a SYMMETRIC stackup count (1, then even: 2/4/6…, cap 32 — see engine/ecad/ops.py
-        // pcb_set_stackup), so "+" advances to the next valid count and adds an inner pair once past 2.
-        // A toast names the jump so the pair-add isn't a surprise (Hunter round-5c; per-layer DELETE is
-        // deferred until the engine supports true per-layer removal).
-        if (ui::fmSectionDividerAddButton("Layers", "ecad_add_layer", "Add copper layer")) {
-            const int cur = (int)m.layers().size();
-            const int next = cur < 2 ? 2 : cur + 2;
+    if (pcb && (es.hierarchyKind == 0 || es.hierarchyKind == 1)) {
+        if (ui::fmSectionDividerAddButton("Copper layers", "ecad_add_layer",
+                                          "Add a symmetric copper layer pair")) {
+            const int current = static_cast<int>(m.layers().size());
+            const int next = current < 2 ? 2 : current + 2;
             if (next > 32) {
-                st.toast(ToastLevel::Warn, "PCB stackup is capped at 32 copper layers");
+                st.toast(ui::ToastLevel::Warn, "PCB stackup is capped at 32 copper layers");
             } else {
                 st.ecadPendingOps = nlohmann::json::array(
                     {{{"op", "pcb_set_stackup"}, {"copper_layers", next}}});
                 st.ecadOpsGo = true;
-                char msg[96];
-                std::snprintf(msg, sizeof(msg), "Copper layers %d -> %d (symmetric stackup)", cur,
-                              next);
-                st.toast(ToastLevel::Info, msg);
             }
         }
-        for (const auto& ly : m.layers()) layerRow(ly);
-        char netsHdr[32]; std::snprintf(netsHdr, sizeof(netsHdr), "Nets (%d)", (int)m.nets().size());
-        ui::fmSectionDivider(netsHdr);
-        for (const auto& n : m.nets()) netRow(n, /*withPins=*/false);
-    } else {
-        char netsHdr[32]; std::snprintf(netsHdr, sizeof(netsHdr), "Nets (%d)", (int)m.nets().size());
-        ui::fmSectionDivider(netsHdr);
-        for (const auto& n : m.nets()) netRow(n, /*withPins=*/true);
-        ImGui::Spacing();
-        char symHdr[32]; std::snprintf(symHdr, sizeof(symHdr), "Symbols (%d)", (int)m.symbols().size());
-        ui::fmSectionDivider(symHdr);
-        for (const auto& s : m.symbols()) {
-            ui::FmRowRect r = ui::fmRowPill();
-            rowInk();
-            ImGui::TextColored(v4(pal.text), "%s", s.ref.empty() ? s.libid.c_str() : s.ref.c_str());
-            if (!s.value.empty()) {
-                ImGui::SameLine();
-                ImGui::TextColored(v4(pal.textDim), "%s", s.value.c_str());
-            }
-            ui::fmRowPillEnd(r);
+        for (const auto& layer : m.layers()) {
+            if (!containsFolded(layer.id, es.managerSearch)) continue;
+            drawLayerHierarchyRow(es, layer);
+            ++shown;
         }
     }
-    ImGui::EndChild();
+    if (es.hierarchyKind == 0 || es.hierarchyKind == (pcb ? 2 : 1)) {
+        ui::kit::sectionHeader("Nets", nullptr, nullptr, static_cast<int>(m.nets().size()));
+        for (const auto& net : m.nets()) {
+            if (!containsFolded(net.name, es.managerSearch)) continue;
+            drawNetHierarchyRow(es, net, !pcb);
+            ++shown;
+        }
+    }
+    if (pcb && (es.hierarchyKind == 0 || es.hierarchyKind == 3)) {
+        ui::kit::sectionHeader("Footprints", "ecad_footprint", nullptr,
+                               static_cast<int>(m.footprints().size()));
+        for (const auto& fp : m.footprints()) {
+            const std::string searchable = fp.ref + " " + fp.value + " " + fp.fpid;
+            if (!containsFolded(searchable, es.managerSearch)) continue;
+            ui::kit::RowStyle style;
+            const std::string secondary = fp.value.empty() ? fp.fpid : fp.value + " | " + fp.fpid;
+            style.secondary = secondary.c_str();
+            style.selected = es.selected == "fp:" + fp.id;
+            if (ui::kit::row(fp.id.c_str(), fp.ref.empty() ? fp.fpid.c_str() : fp.ref.c_str(),
+                             style)) {
+                es.selected = "fp:" + fp.id;
+                es.editLoadedFor.clear();
+                focusSelected(es);
+            }
+            ++shown;
+        }
+    } else if (!pcb && (es.hierarchyKind == 0 || es.hierarchyKind == 2)) {
+        ui::kit::sectionHeader("Symbols", "sch_symbol", nullptr,
+                               static_cast<int>(m.symbols().size()));
+        for (const auto& symbol : m.symbols()) {
+            const std::string searchable =
+                symbol.ref + " " + symbol.value + " " + symbol.libid;
+            if (!containsFolded(searchable, es.managerSearch)) continue;
+            ui::kit::RowStyle style;
+            const std::string secondary =
+                symbol.value.empty() ? symbol.libid : symbol.value + " | " + symbol.libid;
+            style.secondary = secondary.c_str();
+            style.selected = es.selected == "s:" + symbol.id;
+            if (ui::kit::row(symbol.id.c_str(),
+                             symbol.ref.empty() ? symbol.libid.c_str() : symbol.ref.c_str(),
+                             style)) {
+                es.selected = "s:" + symbol.id;
+                es.editLoadedFor.clear();
+                focusSelected(es);
+            }
+            ++shown;
+        }
+    }
+    if (shown == 0) {
+        ui::kit::emptyState("filter_funnel", "No hierarchy matches",
+                            "Change the search text or show a different entity type.");
+    }
+}
 
-    // ---- Simulation (schematic only): analysis picker + Simulate button, tucked at the bottom of
-    // the manager column instead of the removed canvas-top toolbar. ----
-    if (!pcb) {
-        ImGui::Separator();
+void drawDesignView(AppState& st, EcadEditorState& es) {
+    if (es.mirror.isPcb()) drawPcbEditingContext(es);
+    drawCanvasToolContext(st, es);
+    drawHierarchy(st, es);
+    if (es.mirror.isSch()) {
+        ui::kit::sectionHeader("Simulation", "sch_simulate");
         static const char* kAnalyses[] = {"Transient", "AC"};
-        int analysis = st.ecadSimAnalysis;
-        ImGui::SetNextItemWidth(-70.0f * sc);
-        if (ImGui::Combo("##ecadAnalysis", &analysis, kAnalyses, 2)) st.ecadSimAnalysis = analysis;
-        ImGui::SameLine();
-        if (ImGui::Button("Simulate", ImVec2(-1, 0))) st.ecadSimGo = true;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::Combo("##ecadAnalysis", &st.ecadSimAnalysis, kAnalyses, 2);
+        if (ui::kit::primaryButton("Simulate", true, nullptr, ImVec2(-1.0f, 0.0f)))
+            st.ecadSimGo = true;
     }
+}
+
+void drawInspectView(AppState& st, EcadEditorState& es) {
+    EcadMirror& m = es.mirror;
+    const bool pcb = m.isPcb();
+    ui::kit::sectionHeader("Document statistics", "health_check", nullptr, -1, true);
+    auto countRow = [](const char* label, size_t count) {
+        const std::string value = std::to_string(count);
+        ui::kit::keyValueRow(label, value.c_str());
+    };
+    if (pcb) {
+        countRow("Copper layers", m.layers().size());
+        countRow("Footprints", m.footprints().size());
+        countRow("Tracks", m.tracks().size());
+        countRow("Vias", m.vias().size());
+        countRow("Zones", m.zones().size());
+        countRow("Nets", m.nets().size());
+        ui::kit::keyValueRow("Unrouted", std::to_string(m.unroutedCount()).c_str(),
+                             m.unroutedCount() ? ui::kit::Tone::Warn : ui::kit::Tone::Ok);
+    } else {
+        countRow("Symbols", m.symbols().size());
+        countRow("Wires", m.wires().size());
+        countRow("Junctions", m.junctions().size());
+        countRow("Net labels", m.labels().size());
+        countRow("Power ports", m.powers().size());
+        countRow("Nets", m.nets().size());
+        int unassigned = 0;
+        for (const auto& symbol : m.symbols())
+            if (!symbol.dnp && symbol.footprint.empty()) ++unassigned;
+        ui::kit::keyValueRow("Missing footprints", std::to_string(unassigned).c_str(),
+                             unassigned ? ui::kit::Tone::Warn : ui::kit::Tone::Ok);
+    }
+
+    ui::kit::sectionHeader("Selection filters", "filter_funnel");
+    if (pcb) {
+        if (ui::kit::toggleChip("Footprints", &es.pickFootprints) &&
+            !es.pickFootprints && es.selected.rfind("fp:", 0) == 0)
+            es.selected.clear();
+        ImGui::SameLine(0.0f, ui::kit::rowGap());
+        if (ui::kit::toggleChip("Tracks", &es.pickTracks) &&
+            !es.pickTracks && es.selected.rfind("t:", 0) == 0)
+            es.selected.clear();
+        ImGui::SameLine(0.0f, ui::kit::rowGap());
+        if (ui::kit::toggleChip("Vias", &es.pickVias) &&
+            !es.pickVias && es.selected.rfind("v:", 0) == 0)
+            es.selected.clear();
+    } else {
+        if (ui::kit::toggleChip("Symbols", &es.pickSymbols) &&
+            !es.pickSymbols && es.selected.rfind("s:", 0) == 0)
+            es.selected.clear();
+        ImGui::SameLine(0.0f, ui::kit::rowGap());
+        if (ui::kit::toggleChip("Wires", &es.pickWires) &&
+            !es.pickWires && es.selected.rfind("w:", 0) == 0)
+            es.selected.clear();
+    }
+    if (es.selected.empty()) es.editLoadedFor.clear();
+
+    ui::kit::sectionHeader("Selected entity", nullptr);
+    if (es.selected.empty()) {
+        ui::kit::emptyState("zoom_fit", "Nothing selected",
+                            "Use Select on the canvas or choose an item in Design.");
+        return;
+    }
+
+    const auto colon = es.selected.find(':');
+    const std::string kind = es.selected.substr(0, colon);
+    const std::string id = es.selected.substr(colon + 1);
+    bool found = false;
+    if (kind == "s") {
+        for (const auto& symbol : m.symbols()) if (symbol.id == id) {
+            found = true;
+            ui::kit::keyValueRow("Entity", "Schematic symbol");
+            ui::kit::keyValueRow("Position", pointText(symbol.pos).c_str());
+            ui::kit::keyValueRow("Angle", (std::to_string(symbol.angle) + " deg").c_str());
+            ui::kit::keyValueRow("Mirror", symbol.mirror.c_str());
+            break;
+        }
+        if (found) drawPropInspector(st, es, ui::uiScale);
+    } else if (kind == "fp") {
+        for (const auto& fp : m.footprints()) if (fp.id == id) {
+            found = true;
+            ui::kit::keyValueRow("Entity", "PCB footprint");
+            ui::kit::keyValueRow("Position", pointText(fp.pos).c_str());
+            ui::kit::keyValueRow("Angle", (std::to_string(fp.angle) + " deg").c_str());
+            ui::kit::keyValueRow("Side", fp.side.c_str());
+            countRow("Pads", fp.pads.size());
+            break;
+        }
+        if (found) drawPropInspector(st, es, ui::uiScale);
+    } else if (kind == "w") {
+        for (const auto& wire : m.wires()) if (wire.id == id) {
+            found = true;
+            float length = 0.0f;
+            for (size_t i = 1; i < wire.pts.size(); ++i)
+                length += std::hypot(wire.pts[i].x - wire.pts[i - 1].x,
+                                     wire.pts[i].y - wire.pts[i - 1].y);
+            ui::kit::keyValueRow("Entity", wire.bus ? "Schematic bus" : "Schematic wire");
+            ui::kit::keyValueRow("Id", wire.id.c_str(), ui::kit::Tone::Neutral, true);
+            countRow("Points", wire.pts.size());
+            ui::kit::keyValueRow("Length", mmText(length).c_str());
+            if (!wire.pts.empty()) {
+                ui::kit::keyValueRow("Start", pointText(wire.pts.front()).c_str());
+                ui::kit::keyValueRow("End", pointText(wire.pts.back()).c_str());
+            }
+            break;
+        }
+    } else if (kind == "t") {
+        for (const auto& track : m.tracks()) if (track.id == id) {
+            found = true;
+            float length = std::hypot(track.p2.x - track.p1.x, track.p2.y - track.p1.y);
+            if (track.kind == "arc") {
+                const float radius = std::hypot(track.p1.x - track.center.x,
+                                                track.p1.y - track.center.y);
+                length = radius * std::fabs(track.a1 - track.a0) * 3.14159265f / 180.0f;
+            }
+            ui::kit::keyValueRow("Entity", "PCB track");
+            ui::kit::keyValueRow("Id", track.id.c_str(), ui::kit::Tone::Neutral, true);
+            ui::kit::keyValueRow("Net", track.net.empty() ? "No net" : track.net.c_str());
+            ui::kit::keyValueRow("Layer", track.layer.c_str());
+            ui::kit::keyValueRow("Width", mmText(track.width).c_str());
+            ui::kit::keyValueRow("Geometry", track.kind.c_str());
+            ui::kit::keyValueRow("Length", mmText(length).c_str());
+            ui::kit::keyValueRow("Start", pointText(track.p1).c_str());
+            ui::kit::keyValueRow("End", pointText(track.p2).c_str());
+            break;
+        }
+    } else if (kind == "v") {
+        for (const auto& via : m.vias()) if (via.id == id) {
+            found = true;
+            std::string layers;
+            for (const auto& layer : via.layers) {
+                if (!layers.empty()) layers += " to ";
+                layers += layer;
+            }
+            ui::kit::keyValueRow("Entity", "PCB via");
+            ui::kit::keyValueRow("Id", via.id.c_str(), ui::kit::Tone::Neutral, true);
+            ui::kit::keyValueRow("Net", via.net.empty() ? "No net" : via.net.c_str());
+            ui::kit::keyValueRow("Position", pointText(via.at).c_str());
+            ui::kit::keyValueRow("Drill", mmText(via.drill).c_str());
+            ui::kit::keyValueRow("Diameter", mmText(via.diameter).c_str());
+            ui::kit::keyValueRow("Span", layers.empty() ? "Default stack" : layers.c_str());
+            break;
+        }
+    }
+    if (!found) {
+        es.selected.clear();
+        ui::kit::emptyState("warning_badge", "Selection is stale",
+                            "The entity no longer exists in the current document revision.");
+        return;
+    }
+
+    const float actionW =
+        (ImGui::GetContentRegionAvail().x - ui::kit::rowGap()) * 0.5f;
+    if (ui::kit::secondaryButton("Focus", true, nullptr, ImVec2(actionW, 0.0f)))
+        focusSelected(es);
+    ImGui::SameLine(0.0f, ui::kit::rowGap());
+    if (ui::kit::dangerButton("Delete", true, nullptr, ImVec2(actionW, 0.0f)))
+        deleteSelected(st, es);
+}
+
+void drawChecksView(AppState& st, EcadEditorState& es) {
+    EcadMirror& m = es.mirror;
+    const bool pcb = m.isPcb();
+    const auto& checks = pcb ? m.drc() : m.erc();
+    int errors = 0;
+    int warnings = 0;
+    for (const auto& check : checks)
+        (check.severity == "error" ? errors : warnings)++;
+
+    ui::kit::sectionHeader(pcb ? "Design rule check" : "Electrical rule check",
+                           pcb ? "ecad_drc" : "sch_erc", nullptr,
+                           static_cast<int>(checks.size()), true);
+    const std::string errorText = std::to_string(errors);
+    const std::string warningText = std::to_string(warnings);
+    ui::kit::valueChip("Errors", errorText.c_str(),
+                       errors ? ui::kit::Tone::Err : ui::kit::Tone::Ok);
+    ImGui::SameLine(0.0f, ui::kit::rowGap());
+    ui::kit::valueChip("Warnings", warningText.c_str(),
+                       warnings ? ui::kit::Tone::Warn : ui::kit::Tone::Ok);
+    if (pcb) {
+        ImGui::SameLine(0.0f, ui::kit::rowGap());
+        const std::string unrouted = std::to_string(m.unroutedCount());
+        ui::kit::valueChip("Unrouted", unrouted.c_str(),
+                           m.unroutedCount() ? ui::kit::Tone::Warn : ui::kit::Tone::Ok);
+    }
+    if (ui::kit::primaryButton(pcb ? "Run DRC" : "Run ERC", true, nullptr,
+                               ImVec2(-1.0f, 0.0f)))
+        st.ecadPanelCmd = pcb ? "ecad_run_drc" : "ecad_run_erc";
+
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##ecadCheckSearch", "Search rule, message, net or layer...",
+                             es.checksSearch, sizeof(es.checksSearch));
+    static const char* kSeverity[] = {"All", "Errors", "Warnings"};
+    ui::kit::segmented("##ecadCheckSeverity", kSeverity, 3, &es.checksSeverity,
+                       ImGui::GetContentRegionAvail().x);
+
+    int shown = 0;
+    for (size_t i = 0; i < checks.size(); ++i) {
+        const EcadViolation& check = checks[i];
+        if (es.checksSeverity == 1 && check.severity != "error") continue;
+        if (es.checksSeverity == 2 && check.severity != "warning") continue;
+        const std::string searchable =
+            check.rule + " " + check.message + " " + check.net + " " + check.layer;
+        if (!containsFolded(searchable, es.checksSearch)) continue;
+        ui::kit::RowStyle style;
+        style.icon = check.severity == "error" ? "error_badge" : "warning_badge";
+        style.iconTone = check.severity == "error" ? ui::kit::Tone::Err : ui::kit::Tone::Warn;
+        std::string secondary = check.message;
+        if (!check.net.empty()) secondary += (secondary.empty() ? "" : " | ") + check.net;
+        if (!check.layer.empty()) secondary += (secondary.empty() ? "" : " | ") + check.layer;
+        style.secondary = secondary.empty() ? nullptr : secondary.c_str();
+        style.meta = check.severity.c_str();
+        ImGui::PushID(static_cast<int>(i));
+        const bool clicked = ui::kit::row("##check", check.rule.c_str(), style);
+        ImGui::PopID();
+        if (clicked) {
+            if (check.hasLoc) {
+                es.canvas.focusOn(check.loc);
+                st.addLog("[ecad] focus " + check.rule + " @ " + pointText(check.loc));
+            } else {
+                st.addLog("[ecad] " + check.rule + " has no reported location");
+            }
+        }
+        ++shown;
+    }
+    if (shown == 0) {
+        if (checks.empty()) {
+            ui::kit::emptyState("ok_badge", pcb ? "No DRC violations" : "No ERC violations",
+                                "Run the check again after editing to refresh this result.");
+        } else {
+            ui::kit::emptyState("filter_funnel", "No check rows match",
+                                "Change the search text or severity filter.");
+        }
+    }
+}
+
+void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU32 halo) {
+    (void)halo;
+    EcadEditorState& es = state();
+    EcadMirror& m = es.mirror;
+    ui::kit::pushDensity(ui::kit::Density::Compact);
+    struct DensityPop { ~DensityPop() { ui::kit::popDensity(); } } densityPop;
+
+    if (!m.hasDoc()) {
+        ui::kit::emptyState("ecad_pcb", "No ECAD document open",
+                            "Open a schematic or PCB to use the manager.");
+        return;
+    }
+    const bool pcb = m.isPcb();
+    ensurePcbContext(es);
+    scanEcadHealth(es);
+    if (es.healthLevel >= 1 && es.healthMsg != es.healthToasted)
+        st.toast(es.healthLevel >= 2 ? ui::ToastLevel::Error : ui::ToastLevel::Warn, es.healthMsg);
+    es.healthToasted = es.healthMsg;
+
+    const std::string name = m.name().empty() ? "(untitled)" : m.name();
+    char revision[32];
+    std::snprintf(revision, sizeof(revision), "rev %d", m.revision());
+    ui::kit::sectionHeader(name.c_str(), pcb ? "ecad_pcb" : "sch_new", revision, -1, true);
+    drawManagerToolbar(st, es, pcb);
+    ui::kit::gapRow();
+
+    static const char* kViews[] = {"Design", "Inspect", "Checks"};
+    static const char* kViewTips[] = {
+        "Hierarchy, canvas tools and editing context",
+        "Live statistics, pick filters and selected-entity properties",
+        "Search and focus individual ERC or DRC violations"};
+    ui::kit::segmented("##ecadManagerView", kViews, 3, &es.managerView,
+                       ImGui::GetContentRegionAvail().x, kViewTips);
+
+    ImGui::BeginChild("##ecadManagerScroll", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
+    if (es.managerView == 0) drawDesignView(st, es);
+    else if (es.managerView == 1) drawInspectView(st, es);
+    else drawChecksView(st, es);
+    ui::drawWindowPillScrollbarV(surf);
+    ImGui::EndChild();
 }
 
 // A distinct, theme-aware trace color per index (palette roles, like ecad_canvas::copperColor).

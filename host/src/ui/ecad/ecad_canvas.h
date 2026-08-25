@@ -1,5 +1,3 @@
-// AI-ECAD UI scaffold (Wave D) — NOT yet build-verified; see docs/ECAD_UI_INTEGRATION.md
-//
 // EcadCanvas — the 2D drawing surface for an ECAD document. Unlike host/src/ui/sketch_mode.cpp
 // (which projects a sketch onto a 3D plane via the Renderer's camera MVP), the ECAD canvas is a
 // PURE 2D editor: it owns its own pan/zoom camera and converts ECAD-world mm <-> screen pixels with
@@ -16,22 +14,16 @@
 // exactly as sketch_mode.cpp does. The canvas is stateless w.r.t. the document — it reads the mirror
 // each frame — but it persists its camera (pan/zoom) between frames.
 //
-// Assumptions (could not build-verify):
-//   * ImGui draw-list API (AddLine/AddRect/AddRectFilled/AddCircle/AddCircleFilled/AddText/
-//     AddTriangleFilled/AddConvexPolyFilled) matches the version used by sketch_mode.cpp.
-//   * ui::palette / ui::Palette::toU32 / ui::uiScale come from ../../ui_theme.h (confirmed).
 #pragma once
 
 #include <string>
 
 #include "imgui.h"
-
 #include "ecad_mirror.h"
 
 namespace ui {
 
-// Per-frame interaction result the panel can act on (kept tiny; the scaffold does not yet route
-// picks back to the worker — see ECAD_UI_INTEGRATION.md §(e)/(f)).
+// Per-frame interaction result the panel can act on.
 struct EcadCanvasIO {
     bool  hovered = false;        // mouse is over the canvas
     bool  clicked = false;        // left-click released without a drag this frame
@@ -58,7 +50,7 @@ public:
     float zoom() const { return pxPerMm_; }
 
     // Selection: the panel sets a "<kind>:<id>" token (e.g. "s:s1","fp:fp1","w:w1","t:t1")
-    // before draw(); the canvas halos/outlines that entity. Empty = nothing selected.
+    // before draw(); the canvas outlines that entity. Empty = nothing selected.
     void setSelection(const std::string& sel) { selected_ = sel; }
     void setHighlightedNet(const std::string& net) { highlightedNet_ = net; }
 

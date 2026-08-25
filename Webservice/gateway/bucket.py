@@ -309,10 +309,24 @@ async def bucket_rename(
     user, root = resolved.user, resolved.root
     api_writes.enforce(user.email, "writes")
     src = _resolve(root, str(body.get("src", "")))
+    # _resolve maps an empty/missing rel onto the scope root itself, which list
+    # and mkdir legitimately want. Rename does not: with src == root,
+    # ``src.parent / new_name`` lands one level ABOVE the jail -- in the shared
+    # users/ (or orgs/) parent, next to every other tenant's bucket -- and the
+    # rename then MOVES the caller's entire bucket there. A single
+    # ``{"src": ""}`` was enough. bucket_delete already refuses the root; this
+    # is the same guard for the same reason.
+    if src == root:
+        raise HTTPException(status_code=400, detail="cannot rename bucket root")
     new_name = Path(str(body.get("name", ""))).name
     if not new_name or new_name.startswith("."):
         raise HTTPException(status_code=400, detail="bad name")
     dst = src.parent / new_name
+    # Containment is re-checked on the destination rather than assumed from
+    # src: every write helper in this module clamps the path it is about to
+    # touch, and a rename touches two.
+    if root not in dst.parents:
+        raise HTTPException(status_code=400, detail="path escapes bucket")
     if dst.is_symlink():
         raise HTTPException(status_code=400, detail="symlink not allowed")
     if dst.exists():

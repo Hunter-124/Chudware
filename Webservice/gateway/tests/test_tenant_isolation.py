@@ -444,6 +444,22 @@ def test_bucket_rejects_dotdot_absolute_and_symlink(client):
     assert client.get("/api/bucket/download", params={"path": "evil"}, headers=A).status_code == 400
 
 
+def test_bucket_rename_cannot_move_the_bucket_root_out_of_its_jail(client):
+    # An empty/missing `src` resolves to the scope root (list and mkdir want
+    # that). Rename must refuse it: `src.parent / name` sits in the shared
+    # users/ parent, so renaming the root MOVED the caller's whole bucket next
+    # to every other tenant's. `{"src": ""}` was the entire exploit.
+    assert _upload_bucket(client, A).status_code == 200  # create A's root
+    root_a = _bucket_user_root("alice@crimson.ua.edu")
+    parent = root_a.parent
+    for body in ({"src": "", "name": "escaped"}, {"name": "escaped"}, {"src": ".", "name": "escaped"}):
+        r = client.post("/api/bucket/rename", headers=A, json=body)
+        assert r.status_code == 400, (body, r.text)
+    assert root_a.is_dir(), "the bucket root must still be where the tenant's scope points"
+    assert (root_a / "notes.txt").is_file(), "the tenant's own file must not have moved"
+    assert not (parent / "escaped").exists(), "nothing may be created beside other tenants' buckets"
+
+
 # ---------------------------------------------------------------------------
 # Admin escape hatch onto the legacy shared tree
 # ---------------------------------------------------------------------------

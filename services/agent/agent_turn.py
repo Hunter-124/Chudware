@@ -550,9 +550,10 @@ def _force_first_tool(
             emit_call(tool, args, result, ok)
         except Exception:  # noqa: BLE001 — event emission never blocks a turn
             pass
-    messages.append({"role": "user", "content": _parts(
-        f"Tool result ({tool}):\n{_as_text(result)}"
-    )})
+    messages.append({
+        "role": "user",
+        "content": _tool_result_parts(f"Tool result ({tool}):", result),
+    })
     return calls, tool_calls_made, True
 
 
@@ -3425,9 +3426,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         _kind, _payload, live=on_event, journal=_ev_journal)
                 except Exception:  # noqa: BLE001 — event emission never blocks
                     pass
-            messages.append({"role": "user", "content": _parts(
-                f"Result of {tool}:\n{_as_text(meta_result)}"
-            )})
+            messages.append({
+                "role": "user",
+                "content": _tool_result_parts(f"Result of {tool}:", meta_result),
+            })
             continue
 
         if restricted_tools and tool not in allow:
@@ -3758,6 +3760,8 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 _blocked = None
         if _blocked is None:
             _blocked = _pre_dispatch_guardrail(tool, args, ledger, actor)
+        if _blocked is None and tool == "export_drawing":
+            _blocked = _drawing_export_review_block(calls, args)
         # AI-VC v2: checkpoint BEFORE mutating tool call (kind=tool).
         # call.turn = msg_idx when provided, else internal tool-call ordinal.
         if _blocked is None:
@@ -3943,12 +3947,18 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                             })
                         except Exception:  # noqa: BLE001
                             pass
-                        messages.append({"role": "user", "content": _parts(
-                            f"Result of {tool}:\n{_as_text(result)}\n"
-                            f"[ECAD enablement] Wire failed on missing ref "
-                            f"{missing!r}. Re-deriving endpoints from live "
-                            f"placed/power refs and retrying once."
-                        )})
+                        messages.append({
+                            "role": "user",
+                            "content": _tool_result_parts(
+                                f"Result of {tool}:",
+                                result,
+                                suffix=(
+                                    "\n[ECAD enablement] Wire failed on missing ref "
+                                    f"{missing!r}. Re-deriving endpoints from live "
+                                    "placed/power refs and retrying once."
+                                ),
+                            ),
+                        })
                         tool_calls_made += 1
                         try:
                             result2 = _json_safe_result(dispatch(tool, new_args))
@@ -3974,9 +3984,11 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         _log(ledger, actor, {
                             "event": "tool_call", **call_rec2,
                         })
-                        messages.append({"role": "user", "content": _parts(
-                            f"Result of {tool} (ref-retry):\n{_as_text(result2)}"
-                        )})
+                        messages.append({
+                            "role": "user",
+                            "content": _tool_result_parts(
+                                f"Result of {tool} (ref-retry):", result2),
+                        })
                         # Prefer retry outcome for subsequent enablement logic.
                         result, ok, args = result2, ok2, new_args
                         call_rec = call_rec2
@@ -3995,8 +4007,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 _ae.emit_event(_kind, _payload, live=on_event, journal=_ev_journal)
             except Exception:  # noqa: BLE001 — event emission never blocks the turn
                 pass
-        messages.append({"role": "user", "content": _parts(
-            f"Result of {tool}:\n{_as_text(result)}")})
+        messages.append({
+            "role": "user",
+            "content": _tool_result_parts(f"Result of {tool}:", result),
+        })
 
         # Encourage is intentionally a single soft nudge after the run proves
         # multi-step. Require is enforced before dispatch above: a non-task-list
@@ -4404,8 +4418,11 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         dispatch, _vtool, args,
                         ledger=ledger, actor=actor, profile=_cap,
                     )
-                    messages.append({"role": "user", "content": _parts(
-                        f"[auto-verify] Result of {_vtool}:\n{_as_text(_vres)}")})
+                    messages.append({
+                        "role": "user",
+                        "content": _tool_result_parts(
+                            f"[auto-verify] Result of {_vtool}:", _vres),
+                    })
             except Exception:  # noqa: BLE001 — inject never breaks the turn
                 pass
 
@@ -6106,6 +6123,103 @@ def _as_text(result: Any, limit: int = _TOOL_RESULT_CHARS) -> str:
             f"\n... [TRUNCATED: {len(text) - limit} of {len(text)} chars withheld. "
             f"Narrow the call (a subdirectory, a filter, or offset/limit) - "
             f"repeating it unchanged returns the same truncated text.]")
+
+def _tool_result_parts(label: str, result: Any, *, suffix: str = "") -> list[dict]:
+    """Return model feedback containing both the result text and any result images.
+
+    Render tools return FastMCP ``Image`` objects. ``_json_safe_result`` preserves
+    their path for the worker/event wire, but feeding only ``_as_text(result)`` back
+    to the provider reduced the actual pixels to ``{"kind":"image","path":...}``.
+    A vision-capable model therefore had to guess at drawings and 3D renders it had
+    explicitly requested. Keep the compact text/caption and attach each readable
+    image as a real provider image part.
+    """
+    text = f"{label}\n{_as_text(result)}"
+    if suffix:
+        text += suffix
+    parts = _parts(text)
+    try:
+        from services.agent.providers.base import image_part  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — text feedback still reaches the model
+        return parts
+
+    seen: set[str] = set()
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 6 or len(seen) >= _ATTACH_MAX_IMAGES:
+            return
+        if isinstance(value, dict):
+            if str(value.get("kind") or "").strip().lower() == "image":
+                path = value.get("path")
+                if isinstance(path, str) and path and path not in seen:
+                    try:
+                        if (os.path.isfile(path) and os.access(path, os.R_OK)
+                                and os.path.getsize(path) <= _ATTACH_MAX_BYTES):
+                            mime = value.get("mime")
+                            mime = (mime.strip() if isinstance(mime, str) and mime.strip()
+                                    else "image/png")
+                            parts.append(image_part(path, mime))
+                            seen.add(path)
+                    except OSError:
+                        pass
+            for nested in value.values():
+                visit(nested, depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                visit(nested, depth + 1)
+
+    visit(result)
+    return parts
+
+_DRAWING_REVIEW_MUTATORS = frozenset({
+    "make_drawing", "add_drawing_view", "add_section_view", "add_detail_view",
+    "add_dimension", "add_gdt", "add_datum", "add_surface_finish",
+    "set_view", "set_titleblock", "edit_drawing_annotation",
+})
+
+
+def _drawing_export_review_block(calls: list, args: dict | None) -> str | None:
+    """Require a current pixel review before the built-in agent exports a sheet."""
+    target = str((args or {}).get("doc_id") or "").strip()
+    if not target:
+        for call in reversed(calls):
+            cargs = call.get("args") if isinstance(call, dict) else None
+            candidate = cargs.get("doc_id") if isinstance(cargs, dict) else None
+            if candidate and call.get("tool") in (_DRAWING_REVIEW_MUTATORS
+                                                   | {"review_drawing"}):
+                target = str(candidate)
+                break
+    if not target:
+        return (
+            "export_drawing requires doc_id and a current visual review. Pass the "
+            "drawing_doc_id, call review_drawing(doc_id=...), inspect the attached "
+            "sheet pixels and warnings, then export."
+        )
+
+    last_mutation = -1
+    last_review = -1
+    for index, call in enumerate(calls):
+        if not isinstance(call, dict) or not call.get("ok"):
+            continue
+        cargs = call.get("args")
+        cdoc = str(cargs.get("doc_id") or "") if isinstance(cargs, dict) else ""
+        if cdoc != target:
+            continue
+        ctool = call.get("tool")
+        if ctool in _DRAWING_REVIEW_MUTATORS:
+            last_mutation = index
+        elif ctool == "review_drawing":
+            last_review = index
+    if last_review <= last_mutation:
+        state = ("the drawing changed after its last review"
+                 if last_review >= 0 else "the drawing has not been visually reviewed")
+        return (
+            f"export_drawing blocked for {target}: {state}. Call "
+            f"review_drawing(doc_id={target!r}) now; inspect the attached pixels and "
+            "structured layout/material warnings, fix every defect, then export "
+            "without mutating the sheet again."
+        )
+    return None
 
 
 
@@ -8776,16 +8890,18 @@ def _ecad_dispatch_forced_step(
                         })
                     except Exception:  # noqa: BLE001
                         pass
-                    messages.append({"role": "user", "content": _parts(
-                        f"Result of {tool} (forced, ref-retry):\n"
-                        f"{_as_text(result2)}"
-                    )})
+                    messages.append({
+                        "role": "user",
+                        "content": _tool_result_parts(
+                            f"Result of {tool} (forced, ref-retry):", result2),
+                    })
                     return calls, tool_calls_made, call_rec2, ok2
         except Exception:  # noqa: BLE001
             pass
-    messages.append({"role": "user", "content": _parts(
-        f"Result of {tool} (forced):\n{_as_text(result)}"
-    )})
+    messages.append({
+        "role": "user",
+        "content": _tool_result_parts(f"Result of {tool} (forced):", result),
+    })
     return calls, tool_calls_made, call_rec, ok
 
 

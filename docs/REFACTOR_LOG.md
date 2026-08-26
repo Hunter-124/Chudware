@@ -8003,3 +8003,26 @@ now run once and report failures as partial delivery. Regression coverage spans
 actor forwarding, worker classification, token ceilings, retry disposition,
 guard ordering, persistence, canonical roles, and terminal honesty; generated
 tool-panel tables were refreshed.
+
+### 2026-08-26 — manufacturing drawing and model-delivery quality cutover
+
+Press-project forensics traced unusable shop output to four connected seams: render
+tools were reduced to image-path text before the model's next turn, feature-target
+diameter picks used ambiguous concentric centres, vector drawing export auto-cropped
+away the requested paper/title-block semantics, and `set_material` changed appearance
+while native documents silently retained default 6061. `services/agent/agent_turn.py`
+now feeds real result images back to vision providers and requires a current final
+drawing review before export. Drawing MCP tools now pair pixels with exact layout and
+material diagnostics, support free-text notes plus in-place annotation edit/delete,
+and select the requested concentric ring. Core drawing layout reserves a title-block
+band, compresses unused grid columns, renders/reviews the full sheet, and exports fixed
+ISO paper with a border and framed title block. Named material assignment now stores
+the engineering registry identity alongside appearance; role/playbook/tool guidance
+requires mission routing for multi-part shop work, explicit material, domain-specific
+verification, final reviewed drawings, native `.step+` plus neutral `.step` delivery.
+Regression coverage pins image feedback, export review freshness, concentric diameters,
+annotation repair, material consistency, occupied-grid layout, fixed A3 MediaBox, and
+title-block vector cells. A representative stepped-punch workflow produced clean
+9.8/20 mm diameter callouts, 95 mm OAL, zero review warnings, A3 PDF, native `.step+`,
+and neutral STEP. Existing `/home/hunter/Desktop/press` artifacts remain historical and
+must not be sent to a shop without regeneration through the corrected workflow.

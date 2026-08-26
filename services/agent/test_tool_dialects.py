@@ -380,3 +380,36 @@ class TestToolResultSerialization:
         from services.agent.agent_turn import _json_safe_result
         payload = {"ok": True, "doc_id": "d1", "n": [1, 2, 3], "s": None}
         assert _json_safe_result(payload) == payload
+
+    def test_image_tool_result_reaches_the_next_provider_message(self, tmp_path):
+        from services.agent.agent_turn import _tool_result_parts
+
+        png = tmp_path / "drawing.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n")
+        result = [{"kind": "image", "path": str(png), "mime": "image/png"},
+                  '{"views":[{"view_id":"v1"}]}']
+        parts = _tool_result_parts("Result of review_drawing:", result)
+        assert parts[0]["type"] == "text"
+        assert "view_id" in parts[0]["text"]
+        assert parts[1] == {
+            "type": "image", "path": str(png), "mime": "image/png"}
+
+    def test_drawing_export_requires_review_after_the_last_mutation(self):
+        from services.agent.agent_turn import _drawing_export_review_block
+
+        doc = "dwg-1"
+        calls = [
+            {"tool": "set_titleblock", "args": {"doc_id": doc}, "ok": True},
+            {"tool": "review_drawing", "args": {"doc_id": doc}, "ok": True},
+        ]
+        assert _drawing_export_review_block(calls, {"doc_id": doc}) is None
+        calls.append(
+            {"tool": "add_dimension", "args": {"doc_id": doc}, "ok": True})
+        blocked = _drawing_export_review_block(calls, {"doc_id": doc})
+        assert "changed after its last review" in blocked
+
+    def test_drawing_export_without_any_review_is_blocked(self):
+        from services.agent.agent_turn import _drawing_export_review_block
+
+        blocked = _drawing_export_review_block([], {"doc_id": "dwg-1"})
+        assert "not been visually reviewed" in blocked

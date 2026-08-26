@@ -5,10 +5,10 @@ stage: deliver
 steps:
   - id: read_brief
     goal: read the brief and acceptance criteria; measure every critical size from the part BEFORE placing anything
-    helper_tools: [ledger_get, describe_part, measure_part]
+    helper_tools: [measure_part]
     checklist:
-      - acceptance criteria named from the ledger, not from memory
-      - entity ids and critical sizes come from describe_part / measure_part
+      - acceptance criteria named from injected ledger context, not memory
+      - entity ids come from injected part description; critical sizes confirmed by measure_part
     output:
       type: object
       required: [criteria, critical_dims]
@@ -23,22 +23,33 @@ steps:
       type: object
       required: [drawing_id, views]
   - id: dimension_and_callouts
-    goal: dimension from measured values only; GD&T and finish callouts where the spec or process requires them
-    helper_tools: [add_dimension, add_gdt, add_surface_finish]
+    goal: dimension from measured values only; fix annotations in place; add GD&T and finish where required
+    helper_tools: [add_dimension, edit_drawing_annotation, add_gdt, add_datum, add_surface_finish, set_view]
     checklist:
       - every dimension traceable to a measurement, the ledger, or an explicit user answer
       - functional/manufacturing dims preferred over redundant chains
+      - wrong callouts patched/deleted by id, never left behind or worked around in prose
       - no decoration; incomplete geometry → blocked with the missing feature named
     output:
       type: object
       required: [annotations]
-  - id: titleblock_and_export
-    goal: fill the title block and export; if export cannot run, the handoff still lists every view and annotation
-    helper_tools: [set_titleblock, export_drawing, ledger_note]
+  - id: titleblock
+    goal: fill the manufacturing title block and resolve any source-material mismatch
+    helper_tools: [set_titleblock, review_drawing]
     checklist:
-      - title block carries title (part name), rev, material, scale — no units cell exists
-      - export artifact path ledger_noted, or the blocker recorded honestly
+      - title block carries title, part number, rev, material, scale and finish
+      - source model material and printed material agree
     output:
       type: object
-      required: [export_artifact]
-exit_gate: [views_cover_criteria, dims_from_measurements, export_or_summary]
+      required: [title_block]
+  - id: final_review_and_export
+    goal: review after the final mutation, clear every visual/structured warning, then export
+    helper_tools: [review_drawing, set_view, edit_drawing_annotation, set_titleblock, export_drawing]
+    checklist:
+      - attached pixels inspected after the last sheet mutation
+      - no overlap, off-sheet, missing-title-field or material warning remains
+      - export runs only after that clean current review
+    output:
+      type: object
+      required: [export_artifact, review_clean]
+exit_gate: [views_cover_criteria, dims_from_measurements, final_review_clean, export_or_summary]

@@ -4,7 +4,7 @@ goal: Plan and build the part's 3D feature tree, delegating every sketch profile
 stage_scope: [feature]
 playbook_default: feature_sequence
 tool_allowlist:
-  - tool: ledger_get
+  - tool: set_material
   - tool: ledger_note
   - tool: new_part
   - tool: add_features
@@ -89,9 +89,11 @@ system_prompt: |
      e. describe_part / measure_part the mutation; check_feature_overlap after
         boolean-heavy nodes.
   4. Fillets/chamfers last within their region. Standard catalog parts: part_search
-     rather than approximating geometry.
-  5. Before done: verify_battery on the part (pass doc_id when multi-doc); record
-     honest PASS/WARN/FAIL in checks_run.
+     rather than approximating geometry. Call set_material once the brief's material
+     is ratified; new parts default to 6061 aluminum, so prose cannot substitute.
+  5. Before done: confirm stored material and run verify_battery on the part (pass
+     doc_id when multi-doc). Record only checks present in scores; skipped checks
+     are unverified and do not cover fits, loads, drawings or manufacturability.
      regen_diagnose first on rebuild failure; undo/replan when the approach is wrong.
 
   RULES OF THE CRAFT

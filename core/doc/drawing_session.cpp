@@ -895,9 +895,10 @@ json drawing_add_section(const std::string& doc_id, const std::string& parent_vi
         if (smm.is_array() && smm.size() == 2 && smm[0].is_number() && smm[0].get<double>() > 0.0)
             ssz = {smm[0].get<double>(), smm[1].get<double>()};
         const double smarg = 20.0;
+        const double bottom_safe = std::min(ssz[1] - smarg, smarg + 55.0);
         if (def_x > ssz[0] - smarg) {  // overflows right edge -> place below the parent
             def_x = std::min(std::max(p_pos[0], smarg), ssz[0] - smarg);
-            def_y = std::max(smarg, p_pos[1] - 110.0);
+            def_y = std::max(bottom_safe, p_pos[1] - 110.0);
         }
     }
     json view = {
@@ -1882,16 +1883,22 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
             if (mm.is_array() && mm.size() == 2 && mm[0].is_number() && mm[0].get<double>() > 0.0)
                 sz = {mm[0].get<double>(), mm[1].get<double>()};
         }
-        const double margin = 20.0;          // paper border
+        const double margin = 20.0;          // paper border + dimension breathing room
+        const double title_h = std::min(55.0, std::max(0.0, sz[1] * 0.30));
+        const double draw_y0 = margin + title_h;  // reserve the lower band for the title block
         const double draw_w = std::max(40.0, sz[0] - 2 * margin);
-        const double draw_h = std::max(40.0, sz[1] - 2 * margin);
-        // Grid extent over the placed cells (so a single-view drawing uses the whole sheet, while
-        // the 2x2 standard set splits it). +1 because cells are 0-based indices.
-        int max_col = 0, max_row = 0;
+        const double draw_h = std::max(40.0, sz[1] - 2 * margin - title_h);
+        // Compress the standard-view lattice to the ACTUALLY occupied rows/columns. A
+        // front+top sheet uses standard column 1; treating max_col+1 as two columns left an
+        // entire blank half-sheet and shoved every view right.
+        int min_col = 99, min_row = 99, max_col = -1, max_row = -1;
         bool any_placed = !placed.empty();
-        for (const auto& p : placed) { max_col = std::max(max_col, p.col); max_row = std::max(max_row, p.row); }
-        const double cols = any_placed ? (double)(max_col + 1) : 1.0;
-        const double rows = any_placed ? (double)(max_row + 1) : 1.0;
+        for (const auto& p : placed) {
+            min_col = std::min(min_col, p.col); min_row = std::min(min_row, p.row);
+            max_col = std::max(max_col, p.col); max_row = std::max(max_row, p.row);
+        }
+        const double cols = any_placed ? (double)(max_col - min_col + 1) : 1.0;
+        const double rows = any_placed ? (double)(max_row - min_row + 1) : 1.0;
         const double gap = 12.0;             // gutter between view cells
         const double cell_w = std::max(20.0, (draw_w - (cols - 1) * gap) / cols);
         const double cell_h = std::max(20.0, (draw_h - (rows - 1) * gap) / rows);
@@ -1909,11 +1916,11 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
         const double grid_w = cols * cell_w + (cols - 1) * gap;
         const double grid_h = rows * cell_h + (rows - 1) * gap;
         const double x0 = margin + (draw_w - grid_w) / 2.0 + cell_w / 2.0;
-        const double y_top = margin + (draw_h - grid_h) / 2.0 + grid_h - cell_h / 2.0;
+        const double y_top = draw_y0 + (draw_h - grid_h) / 2.0 + grid_h - cell_h / 2.0;
         for (const auto& p : placed) {
             // Cell CENTRE on the sheet (mm).
-            double cx_cell = x0 + p.col * pitch_x;
-            double cy_cell = y_top - p.row * pitch_y;  // row 0 sits at the top
+            double cx_cell = x0 + (p.col - min_col) * pitch_x;
+            double cy_cell = y_top - (p.row - min_row) * pitch_y;  // top occupied row first
             // Centre the view's projected bbox in its cell: position offsets the geometry, and
             // geometry = model*chosen_scale + position, so to land the bbox centre on the cell
             // centre, position = cell_centre - centre_model*chosen_scale (R1/R2). Falls back to
@@ -1933,7 +1940,7 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
                     const double hw = hf->second[0] * chosen_scale;
                     const double hh = hf->second[1] * chosen_scale;
                     const double lo_x = margin + hw + 26.0, hi_x = sz[0] - margin - hw;
-                    const double lo_y = margin + hh,        hi_y = sz[1] - margin - hh;
+                    const double lo_y = draw_y0 + hh,       hi_y = sz[1] - margin - hh;
                     if (hi_x > lo_x) px = std::min(std::max(px, lo_x), hi_x);
                     if (hi_y > lo_y) py = std::min(std::max(py, lo_y), hi_y);
                 }

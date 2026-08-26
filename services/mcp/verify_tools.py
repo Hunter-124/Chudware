@@ -31,26 +31,20 @@ def register_verify_tools(mcp: FastMCP) -> None:
         power_profile_path: str = "",
         power_scenario: str = "",
     ) -> str:
-        """Run a subset of deterministic quality checks on the current part.
+        """Run deterministic checks on one explicit document.
 
-        Returns a stable {scores, findings} dict usable as an RL reward vector or CI gate.
-        checks: list of check names (see check_metadata for available checks + cost/platform).
-               Empty or omitted → run all subsecond/any-platform checks. Any unknown name
-               rejects the whole call with {ok:false, error}; no partial battery is run.
-        doc_id: target document (default = current part).
+        Returns stable scores/findings plus coverage and limitations. A PASS covers ONLY
+        checks named in scores. Names in skipped did not run and are not passes. In particular,
+        a battery on a 3D part does not verify a separate drawing, assembly interfaces/fits,
+        load capacity, material intent, tolerances, or manufacturability; invoke those domain
+        tools/documents separately before claiming the delivered design is verified.
 
-        power_budget check (T-FIN23, system energy budget): pass power_source
-        ({kind:"battery"|"supply", name, voltage_v, capacity_mah, i_max_a}),
-        power_converters (rail tree: [{name, input, output, voltage_out_v,
-        topology:"ldo|buck|boost", efficiency: eta|[[load_frac,eta]], i_out_max_a}]),
-        board_path (aicad.boardphys/1 sidecar from ecad_to_3d — loads + PDN + sequencing)
-        and power_profile_path (aicad.powerprofile/1 from fw_sim_run/fw_power_profile —
-        duty-cycle weighting; omit → degraded datasheet-typ mode, labelled).
-        Verdict includes battery life for the scenario, per-rail load vs converter
-        rating, worst-rail margin, PDN cross-check, sequencing sanity note.
+        checks: names from check_metadata. Empty/omitted runs applicable subsecond checks;
+                unknown names reject the whole call.
+        doc_id: the one document to check (default current part).
 
-        score per check: 0.0 (fail) .. 1.0 (pass). findings: list of failing details.
-        Use check_metadata() for the full check registry with cost/platform annotations.
+        power_budget accepts power_source, power_converters, board_path,
+        power_profile_path and power_scenario. See check_metadata for cost/platform.
         """
         import json
         from services.verify.battery import verify
@@ -82,6 +76,22 @@ def register_verify_tools(mcp: FastMCP) -> None:
             if power_scenario:
                 kwargs["power_scenario"] = power_scenario
             result = verify(doc_id=doc_id, checks=checks or [], **kwargs)
+            scores = result.get("scores") or {}
+            skipped = result.get("skipped") or []
+            result["verdict"] = (
+                "fail" if any(float(score) < 1.0 for score in scores.values())
+                else "pass" if scores else "no_checks_ran"
+            )
+            result["coverage"] = {
+                "doc_id": doc_id,
+                "ran": sorted(scores),
+                "skipped": sorted(skipped),
+            }
+            result["limitations"] = [
+                "PASS applies only to coverage.ran; coverage.skipped is unverified.",
+                "A part-document battery does not verify separate drawings, assembly fits, "
+                "loads, material intent, tolerances, or manufacturability.",
+            ]
             return json.dumps(result)
         except Exception as e:  # noqa: BLE001
             return json.dumps({"ok": False, "error": str(e)})

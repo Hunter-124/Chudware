@@ -1,9 +1,10 @@
 // 2D drawing + export RPCs — see export2d.h.
 
 #include "doc/export2d.h"
-
 #include <array>
 #include <functional>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <BRepAdaptor_Curve.hxx>
@@ -97,20 +98,102 @@ struct ExpLabel {
     double h = 3.5;
 };
 
-// Drawing annotations pooled for vector export: dimension/leader/GD&T strokes + placed
-// text labels + title-block lines. Consumes the shared `draw` primitives emitted per
-// annotation by drawing_get (annot_draw), so GD&T frames, surface-finish/weld symbols and
-// section hatch all export, not just basic dim leaders.
+// Drawing annotations pooled for vector export: dimension/leader/GD&T strokes, placed
+// text, and the actual paper border/title block. All coordinates stay in sheet mm.
 struct AnnExport {
-    std::vector<Polyline> segs;       // solid strokes (dim lines, GD&T frames, arrowheads, hatch)
+    std::vector<Polyline> segs;       // solid strokes (dims, frames, arrows, border/title block)
     std::vector<Polyline> dashed;     // dashed strokes (center lines)
-    std::vector<ExpLabel> labels;     // placed text
-    std::vector<std::string> title_lines;
+    std::vector<ExpLabel> labels;     // placed annotation + title-block text
     double minx = 1e30, miny = 1e30, maxx = -1e30, maxy = -1e30;  // geometry+ann bbox
+    double page_w = 0.0, page_h = 0.0;
+    bool fixed_page = false;
+    int annotation_count = 0;
     bool any() const {
-        return !segs.empty() || !dashed.empty() || !labels.empty() || !title_lines.empty();
+        return !segs.empty() || !dashed.empty() || !labels.empty();
     }
 };
+
+void add_line(AnnExport& ax, double x0, double y0, double x1, double y1) {
+    ax.segs.push_back(Polyline{{x0, y0}, {x1, y1}});
+}
+
+void add_rect(AnnExport& ax, double x0, double y0, double x1, double y1) {
+    ax.segs.push_back(Polyline{{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}, {x0, y0}});
+}
+
+std::string title_value(const json& tb, const char* first, const char* second = nullptr) {
+    for (const char* key : {first, second}) {
+        if (!key) continue;
+        auto it = tb.find(key);
+        if (it == tb.end()) continue;
+        if (it->is_string()) return ascii_label(it->get<std::string>());
+        if (it->is_number() || it->is_boolean()) return ascii_label(it->dump());
+    }
+    return "";
+}
+
+std::string clip_cell(std::string text, double width, double height) {
+    const int chars = std::max(1, static_cast<int>(std::floor((width - 4.0) / (height * 0.6))));
+    if (static_cast<int>(text.size()) <= chars) return text;
+    if (chars <= 2) return text.substr(0, static_cast<std::size_t>(chars));
+    return text.substr(0, static_cast<std::size_t>(chars - 2)) + "..";
+}
+
+void add_sheet_frame(const json& sheet, AnnExport& ax) {
+    const json& mm = sheet.value("size_mm", json(nullptr));
+    if (!mm.is_array() || mm.size() != 2 || !mm[0].is_number() || !mm[1].is_number())
+        return;
+    const double page_w = mm[0].get<double>(), page_h = mm[1].get<double>();
+    if (page_w <= 20.0 || page_h <= 20.0) return;
+    ax.page_w = page_w;
+    ax.page_h = page_h;
+    ax.fixed_page = true;
+
+    constexpr double margin = 10.0;
+    add_rect(ax, margin, margin, page_w - margin, page_h - margin);
+
+    // Compact ASME/ISO-style grid in the lower-right corner. Ten standard fields occupy
+    // five paired rows rather than the old unframed vertical text list below the geometry.
+    const double block_w = std::min(180.0, page_w - 2.0 * margin);
+    const double block_h = std::min(55.0, page_h - 2.0 * margin);
+    const double x0 = page_w - margin - block_w, x1 = page_w - margin;
+    const double y0 = margin, y1 = margin + block_h;
+    const double mid = x0 + block_w * 0.5;
+    constexpr int rows = 5;
+    const double row_h = block_h / rows;
+    add_rect(ax, x0, y0, x1, y1);
+    add_line(ax, mid, y0, mid, y1);
+    for (int row = 1; row < rows; ++row)
+        add_line(ax, x0, y0 + row * row_h, x1, y0 + row * row_h);
+
+    const json& tb = sheet.value("title_block", json::object());
+    struct Cell {
+        const char* label;
+        const char* first;
+        const char* second;
+    };
+    static const Cell cells[rows][2] = {
+        {{"TITLE", "title", nullptr}, {"PART NO", "part_number", "part_no"}},
+        {{"MATERIAL", "material", nullptr}, {"FINISH", "finish", nullptr}},
+        {{"DRAWN BY", "drawn_by", "drawn"}, {"DATE", "date", nullptr}},
+        {{"SCALE", "scale", nullptr}, {"REV", "rev", "revision"}},
+        {{"SHEET", "sheet", nullptr}, {"COMPANY", "company", nullptr}},
+    };
+    const double cell_w = block_w * 0.5;
+    for (int row = 0; row < rows; ++row) {
+        // Row 0 is the top row, matching conventional title-block reading order.
+        const double bottom = y1 - (row + 1) * row_h;
+        for (int col = 0; col < 2; ++col) {
+            const double left = x0 + col * cell_w;
+            ax.labels.push_back({{left + 2.0, bottom + row_h - 3.0}, cells[row][col].label, 2.0});
+            const std::string value = clip_cell(
+                title_value(tb, cells[row][col].first, cells[row][col].second),
+                cell_w, 3.0);
+            if (!value.empty())
+                ax.labels.push_back({{left + 2.0, bottom + 2.0}, value, 3.0});
+        }
+    }
+}
 
 // Tessellate one draw "arcs" entry into a polyline.
 void arc_to_polyline(const json& arc, std::vector<Polyline>& out) {
@@ -190,26 +273,23 @@ void pool_annotations(const json& full, AnnExport& ax) {
         for (const auto& view : sheet.value("views", json::array())) {
             for (const auto& an : view.value("annotations", json::array())) {
                 if (!an.is_object()) continue;
-                if (an.contains("draw")) pool_draw_block(an["draw"], ax, grow);
+                if (an.contains("draw")) {
+                    pool_draw_block(an["draw"], ax, grow);
+                    ++ax.annotation_count;
+                }
             }
-            // Section hatch (engine-computed) exports as thin solid strokes.
             if (view.contains("hatch") && view["hatch"].is_array())
                 for (const auto& sgmt : view["hatch"]) {
                     if (!sgmt.is_array() || sgmt.size() < 2) continue;
                     Polyline pl;
-                    for (const auto& p : sgmt) pl.push_back({p[0].get<double>(), p[1].get<double>()});
+                    for (const auto& p : sgmt)
+                        pl.push_back({p[0].get<double>(), p[1].get<double>()});
                     if (pl.size() >= 2) ax.segs.push_back(std::move(pl));
                 }
         }
-        const json& tb = sheet.value("title_block", json::object());
-        if (tb.is_object())
-            for (const char* key : {"title", "drawn_by", "date", "scale", "material",
-                                    "part_number", "revision", "sheet"}) {
-                auto it = tb.find(key);
-                if (it != tb.end() && it->is_string() && !it->get<std::string>().empty())
-                    ax.title_lines.push_back(
-                        ascii_label(std::string(key) + ": " + it->get<std::string>()));
-            }
+        // Stateful drawings are currently single-sheet exports. Use the first sheet's real
+        // dimensions as the PDF MediaBox and draw its border/title block at fixed coordinates.
+        if (!ax.fixed_page) add_sheet_frame(sheet, ax);
     }
 }
 
@@ -218,13 +298,7 @@ void pool_annotations(const json& full, AnnExport& ax) {
 std::string write_drawing_layers(const std::vector<Polyline>& visible,
                                  const std::vector<Polyline>& hidden, const std::string& path,
                                  const std::string& fmt, const AnnExport& ax = AnnExport{}) {
-    // Title-block lines stack below the geometry bottom-left so they fit the auto-page.
-    const double TH = 3.5;                       // title-block text height (mm)
     std::vector<ExpLabel> all_labels = ax.labels;
-    if (!ax.title_lines.empty() && ax.maxx > ax.minx) {
-        double tx = ax.minx, ty = ax.miny - 8.0;
-        for (const auto& s : ax.title_lines) { all_labels.push_back({{tx, ty}, s, TH}); ty -= 6.0; }
-    }
     if (fmt == "dxf") {
         DxfLayers layers;
         layers.add_layer("VISIBLE");  // insertion order VISIBLE then HIDDEN (Python dict order)
@@ -246,7 +320,7 @@ std::string write_drawing_layers(const std::vector<Polyline>& visible,
     for (const auto& s : ax.dashed) lines.push_back({s, true});
     std::vector<PdfText> texts;
     for (const auto& lb : all_labels) texts.push_back({lb.pos, lb.h, lb.text});
-    return write_pdf(path, lines, texts);
+    return write_pdf(path, lines, texts, !ax.fixed_page, ax.page_w, ax.page_h);
 }
 
 // Project every view def against `shapes`, returning the list of project_view JSON.
@@ -436,11 +510,14 @@ json export_drawing(const std::string& doc_id, const std::string& path, const st
         throw OpError("export_failed", std::string("export_drawing: ") + exc.what(),
                       {{"doc_id", doc_id}, {"path", path}, {"format", fmt}});
     }
-    return {{"path", out_path}, {"format", fmt},
-            {"visible", static_cast<int>(visible.size())},
-            {"hidden", static_cast<int>(hidden.size())},
-            {"annotations", static_cast<int>(ax.segs.size() + ax.labels.size())},
-            {"entities", n}};
+    json result = {{"path", out_path}, {"format", fmt},
+                   {"visible", static_cast<int>(visible.size())},
+                   {"hidden", static_cast<int>(hidden.size())},
+                   {"annotations", ax.annotation_count},
+                   {"entities", n}, {"fixed_page", ax.fixed_page}};
+    if (ax.fixed_page)
+        result["sheet_mm"] = json::array({ax.page_w, ax.page_h});
+    return result;
 }
 
 json export_flat_dxf(const std::string& doc_id, const std::string& path, const std::string& fmt) {

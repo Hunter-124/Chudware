@@ -622,7 +622,7 @@ def _views_of(full: dict) -> list:
 
 def _resolve_target_point(full: dict, view_id: str, radius: float, dtype: str,
                           slot: str, notes: list) -> tuple[Optional[list], Optional[dict]]:
-    """(the sheet-mm centre of this view's circle of model radius *radius*, a refusal)."""
+    """Return the circle centre for spacing dims, or a point on its ring for arc dims."""
     need_closed = dtype == "diameter_dim"          # engine: want_closed=1 only for diameter_dim
     view = next((v for v in _views_of(full)
                  if view_id in (v.get("view_id"), v.get("id"))), None)
@@ -668,7 +668,15 @@ def _resolve_target_point(full: dict, view_id: str, radius: float, dtype: str,
     else:
         notes.append(f"{slot}: matched the projected ⌀{round(2.0 * radius, 6)} mm circle at "
                      f"{[round(x, 3) for x in chosen['center']]} sheet mm in view {view_id}")
-    return list(chosen["center"]), None
+    if dtype not in _ARC_DETERMINED:
+        return list(chosen["center"]), None
+    scale = view.get("scale") or 1.0
+    if not isinstance(scale, (int, float)) or scale == 0:
+        scale = 1.0
+    # The engine selects the arc whose RING is nearest the pick. Passing the centre makes every
+    # concentric ring equally located and the smallest one wins (live: ⌀9.8 and ⌀20 both became
+    # ⌀8.8). Pick the matched ring itself, where its distance metric is exactly zero.
+    return [chosen["center"][0] + radius * float(scale), chosen["center"][1]], None
 
 
 # ---------------------------------------------------------------- drawing / view scale
@@ -922,6 +930,102 @@ def _layout_report(full: dict, view_id: str) -> tuple[dict, list]:
                         f"{h['overlap_mm'][0]}x{h['overlap_mm'][1]} mm" for h in hits)
             + " — move one with set_view(view_id, x=…, y=…)")
     return report, warnings
+
+def _source_material(full: dict) -> Optional[str]:
+    """The source part's stored material key, if the drawing still has a live source."""
+    source = full.get("source_doc_id") or full.get("source")
+    if not source:
+        return None
+    try:
+        tree = cb.call("doc_tree", {"doc_id": source})
+        material = (tree.get("tree") or {}).get("material")
+        if isinstance(material, dict):
+            value = material.get("key") or material.get("name")
+        else:
+            value = material
+        return str(value).strip() if value else None
+    except Exception:  # noqa: BLE001 — review still works after the source closes
+        return None
+
+
+def _material_matches(source: str, printed: str) -> bool:
+    source_tokens = [t for t in _re.split(r"[^a-z0-9]+", source.lower()) if t]
+    printed_norm = _re.sub(r"[^a-z0-9]+", "", printed.lower())
+    meaningful = [t for t in source_tokens if len(t) >= 3 and t not in {"material"}]
+    return bool(meaningful) and any(t in printed_norm for t in meaningful)
+
+
+def _drawing_review_summary(full: dict, render: dict) -> dict:
+    """Compact sheet-mm inspection payload paired with review_drawing's pixels."""
+    warnings: list[str] = []
+    views: list[dict] = []
+    seen_warnings: set[str] = set()
+    for view in _views_of(full):
+        vid = view.get("view_id") or view.get("id")
+        if not vid:
+            continue
+        report, view_warnings = _layout_report(full, vid)
+        for warning in view_warnings:
+            if warning not in seen_warnings:
+                warnings.append(warning)
+                seen_warnings.add(warning)
+        annotations = []
+        for ann in view.get("annotations") or []:
+            if not isinstance(ann, dict):
+                continue
+            annotations.append({
+                key: ann.get(key) for key in
+                ("id", "kind", "type", "text", "value", "pos", "auto")
+                if ann.get(key) is not None
+            })
+        circles = [{
+            "center": [round(x, 3) for x in circle["center"]],
+            "diameter_mm": round(2.0 * circle["model_radius"], 6),
+            "closed": circle["closed"],
+        } for circle in _view_circles(view)[:24]]
+        views.append({
+            "view_id": vid,
+            "orientation": view.get("orientation") or view.get("type"),
+            "type": view.get("type"),
+            "position": view.get("position"),
+            "scale": view.get("scale"),
+            **report,
+            "circles": circles,
+            "annotations": annotations,
+        })
+
+    sheet = (full.get("sheets") or [{}])[0]
+    title_block = sheet.get("title_block") if isinstance(sheet, dict) else {}
+    title_block = title_block if isinstance(title_block, dict) else {}
+    required = ("title", "part_number", "material", "scale", "rev")
+    missing = [field for field in required if not str(title_block.get(field) or "").strip()]
+    if missing:
+        warnings.append("title block missing manufacturing fields: " + ", ".join(missing))
+    source_material = _source_material(full)
+    printed_material = str(title_block.get("material") or "").strip()
+    if source_material and printed_material and not _material_matches(source_material,
+                                                                      printed_material):
+        warnings.append(
+            f"material mismatch: source model stores {source_material!r}, title block prints "
+            f"{printed_material!r}; set_material on the source or correct the title block")
+    return {
+        "ok": True,
+        "drawing_doc_id": full.get("doc_id"),
+        "source_doc_id": full.get("source_doc_id"),
+        "source_material": source_material,
+        "sheet_mm": _sheet_size(full),
+        "render": {k: render.get(k) for k in
+                   ("visible", "hidden", "annotations", "title_block") if k in render},
+        "views": views,
+        "title_block": title_block,
+        "warnings": warnings,
+        "manufacturing_ready": not warnings,
+        "next_actions": (
+            ["Fix every warning, then review_drawing again before export_drawing."]
+            if warnings else
+            ["Pixels and structured checks are clean; export without further sheet mutations."]
+        ),
+    }
 
 
 def _find_view(full: dict, handle: Any, *, derived: bool = True) -> Optional[dict]:
@@ -1480,15 +1584,14 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                        path: Optional[str] = None, filename: Optional[str] = None) -> str:
         """Export a 2D DRAWING document to a vector file so you can deliver it.
 
-        fmt    : "pdf" (a viewable sheet) or "dxf" (CAD interchange). Omitted, it is taken from
-                 the output extension, else pdf. Pass the drawing_doc_id from make_drawing as
-                 doc_id. To SEE a drawing inline use render_part(drawing_doc_id).
+        fmt    : "pdf" (a fixed-size engineering sheet) or "dxf" (CAD interchange). Omitted,
+                 it is taken from the output extension, else pdf. Pass the drawing_doc_id from
+                 make_drawing as doc_id. Call review_drawing after the final sheet mutation first.
         path   : the file to write (also accepted as filename= / out_path= / file_path=). An
-                 extension is appended when missing and never doubled: fmt="pdf" with "plate"
-                 writes plate.pdf, with "plate.pdf" writes plate.pdf. A path whose extension
+                 extension is appended when missing and never doubled. A path whose extension
                  contradicts fmt is refused rather than written.
-        Returns the written path + entity counts. (export_part is for 3D B-rep/mesh only — a
-        drawing is 2D, so it has its own export here.)
+        Returns path, entity/annotation counts and the fixed paper size. export_part is for
+        3D B-rep/mesh only; a drawing is 2D and uses this exporter.
         """
         try:
             # LIVE-DIALECT gap: filename= died as unknown_argument before the engine was
@@ -1522,7 +1625,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             out = {"ok": True, "doc_id": d, "format": fmt,
                    "path": r.get("path", out_path),
                    "visible": r.get("visible"), "hidden": r.get("hidden"),
-                   "entities": r.get("entities")}
+                   "annotations": r.get("annotations"), "entities": r.get("entities"),
+                   "fixed_page": r.get("fixed_page"), "sheet_mm": r.get("sheet_mm")}
             if notes:
                 out["interpreted"] = notes
             return _dumps(out)
@@ -1532,22 +1636,22 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def review_drawing(doc_id: Optional[str] = None) -> Image:
-        """Render a 2D DRAWING document to an image so you can SEE it and self-review.
+    def review_drawing(doc_id: Optional[str] = None) -> Any:
+        """Render and inspect a drawing as pixels plus exact sheet-mm metadata.
 
-        Pass the drawing_doc_id from make_drawing. The render shows the projected views, every
-        dimension / hole callout / GD&T frame / surface-finish symbol / section hatch and the
-        title block — exactly what the DXF/PDF export will contain. Use it to check for: missing
-        or overlapping dimensions, views colliding on the sheet, GD&T placed off the feature, an
-        empty title block. Then fix with the granular drawing tools (add_dimension, add_gdt,
-        set_view to move/scale a view, set_titleblock) and review again.
+        The image is the same projected geometry, annotations, title block and border that the
+        vector export contains. The paired JSON caption lists every view bbox, projected circle,
+        annotation id/text/position, title-block field, off-sheet/overlap warning, and any source
+        model versus title-block material mismatch. Fix every warning and review again; the
+        built-in agent will not export a sheet changed since its last review.
         """
         d = _doc(doc_id)
         png = _tmp(".png")
         rd = cb.call("drawing_render_png", {"doc_id": d, "out_path": png})
         if not rd.get("ok") or not os.path.exists(png):
             raise ValueError(f"Drawing render failed: {rd.get('reason', 'not a drawing doc?')}")
-        return Image(path=png)
+        full = cb.call("drawing_get", {"doc_id": d})
+        return [Image(path=png), _dumps(_drawing_review_summary(full, rd))]
 
 
 
@@ -1714,7 +1818,7 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def add_dimension(view_id: str, a: Any, b: Optional[Any] = None,
                       dtype: str = "linear_dim", pos: Optional[list] = None,
-                      doc_id: Optional[str] = None) -> str:
+                      doc_id: Optional[str] = None, text: Optional[str] = None) -> str:
         """Add a dimension to a view. doc_id = drawing_doc_id.
 
         a, b name WHAT to dimension, either way round:
@@ -1724,14 +1828,15 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             that feature's circle in this view's projection and dimensions it, so you never
             convert model geometry to sheet millimetres yourself. The reply says which circle
             it landed on, and how many identical ones were there.
-        pos is the optional text position (sheet mm).
+        pos is the optional text position (sheet mm). text is an optional verbatim display
+        override; for dtype="note" it is REQUIRED and creates a single-leader free-text note.
 
         dtype: linear_dim | aligned_dim | radial_dim | diameter_dim | angular_dim |
                center_mark | center_line | note. The plain drafting words are accepted too —
                "diameter"/"diam"/"dia"/"⌀" -> diameter_dim (the callout reads 2×r) and
                "radius"/"radial" -> radial_dim (it reads r). Those two are NOT synonyms.
                radial_dim / diameter_dim / center_mark are determined by the ARC alone: pass
-               only `a` (b is not needed, and is ignored if you pass it).
+               only `a`. A note also takes only `a`, plus text="...".
         To auto-dimension a whole view instead, use make_drawing's model_items.
 
         view_id accepts a numeric id (v1, v2, …) OR an orientation string ("front", "top", …)
@@ -1754,19 +1859,29 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             b_pt = b_target = None
             if dtype in _ARC_DETERMINED:
                 # The engine reads the nearest arc and never looks at b for these three
-                # (drawing_session.cpp:1034-1061), which is why b is optional here: the live
-                # call that omitted it died on this tool's signature, not on the engine.
+                # (drawing_session.cpp:1034-1061), which is why b is optional here.
                 if b is not None:
                     notes.append(f"{dtype} is determined by the picked circle alone — b was "
                                  f"not needed and was ignored")
+            elif dtype == "note":
+                if not isinstance(text, str) or not text.strip():
+                    return _dumps({
+                        "ok": False,
+                        "error": "add_dimension: dtype='note' needs non-empty text='...'. "
+                                 "Nothing was added."})
+                if b is not None:
+                    b_pt, b_target, bad = _point_or_target(b, "b")
+                    if bad:
+                        return _dumps(bad)
+                else:
+                    b_pt = list(a_pt) if a_pt else None
             elif b is None:
                 return _dumps({
                     "ok": False,
                     "error": f"add_dimension: {dtype} measures BETWEEN two picks, so it needs "
                              f"both a and b (sheet-mm points, or model targets like "
-                             f'a="F6356a7"). Only radial_dim / diameter_dim / center_mark are '
-                             f"determined by one picked circle and take a alone. Nothing was "
-                             f"added."})
+                             f'a="F6356a7"). Only radial_dim / diameter_dim / center_mark and '
+                             f"note take a alone. Nothing was added."})
             else:
                 b_pt, b_target, bad = _point_or_target(b, "b")
                 if bad:
@@ -1850,6 +1965,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 params["b"] = b_pt
             if pos:
                 params["pos"] = pos
+            if text is not None:
+                params["text"] = text
             r = cb.call("drawing_add_dim", params)
             ann = r.get("annotation") or {}
             # Report the resolved type and the measured value, so a caller can SEE which
@@ -2072,5 +2189,73 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             if notes:
                 out["interpreted"] = notes
             return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def edit_drawing_annotation(view_id: str, annotation_id: str,
+                                fields: Optional[dict] = None, delete: bool = False,
+                                doc_id: Optional[str] = None,
+                                **kwargs: Annotated[Any, Field(default=None)]) -> str:
+        """Edit or delete one existing drawing annotation without rebuilding the sheet.
+
+        view_id accepts a view id or orientation. annotation_id is listed by review_drawing.
+        delete=true removes it. Otherwise pass fields (or flattened kwargs) containing any of:
+        text, prefix, suffix, precision, critical, count, pos, value, tol_type, tol_upper,
+        tol_lower. Empty text clears a prior verbatim override and recomposes a numeric dim.
+        """
+        try:
+            d = _doc(doc_id)
+            view_id = _resolve_drawing_view_id(d, view_id)
+            nested = kwargs.pop("kwargs", None)
+            if isinstance(nested, dict):
+                for key, value in nested.items():
+                    kwargs.setdefault(key, value)
+            fields = require_mapping(fields, "fields",
+                                     "an annotation patch dict") if fields else {}
+            patch = {**fields, **{k: v for k, v in kwargs.items() if v is not None}}
+            allowed = {
+                "tol_type", "tol_upper", "tol_lower", "prefix", "suffix",
+                "precision", "critical", "count", "pos", "value", "text",
+            }
+            unknown = sorted(set(patch) - allowed)
+            if unknown:
+                return _dumps({
+                    "ok": False,
+                    "error": "edit_drawing_annotation: unsupported field(s) "
+                             + ", ".join(unknown) + "; valid fields are "
+                             + ", ".join(sorted(allowed))})
+            if delete and patch:
+                return _dumps({
+                    "ok": False,
+                    "error": "edit_drawing_annotation: delete=true conflicts with edit fields; "
+                             "choose delete or patch. Nothing changed."})
+            full = cb.call("drawing_get", {"doc_id": d})
+            view = _find_view(full, view_id)
+            annotations = view.get("annotations") if isinstance(view, dict) else []
+            ids = [str(ann.get("id")) for ann in (annotations or []) if ann.get("id")]
+            if annotation_id not in ids:
+                return _dumps({
+                    "ok": False,
+                    "error": f"edit_drawing_annotation: no annotation {annotation_id!r} on "
+                             f"view {view_id}; available ids are {ids}. Nothing changed."})
+            if delete:
+                result = cb.call("drawing_remove_annotation", {
+                    "doc_id": d, "view_id": view_id, "ann_id": annotation_id})
+                return _dumps({
+                    "ok": True, "deleted": annotation_id, "view_id": view_id,
+                    "removed": result.get("removed", True)})
+            if not patch:
+                return _dumps({
+                    "ok": False,
+                    "error": "edit_drawing_annotation needs fields={...} or delete=true. "
+                             "Nothing changed."})
+            result = cb.call("drawing_set_annotation", {
+                "doc_id": d, "view_id": view_id, "ann_id": annotation_id,
+                "patch": patch})
+            annotation = result.get("annotation") or {}
+            return _dumps({
+                "ok": True, "view_id": view_id, "annotation": annotation,
+                "fields_set": sorted(patch)})
         except Exception as e:  # noqa: BLE001
             return _err(e)

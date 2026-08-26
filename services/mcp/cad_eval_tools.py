@@ -1013,9 +1013,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         density_g_cm3 sets the material density used for mass (default 7.85 = steel). Also
         accepted as density= / density_g_cc= / material_density= / rho=, or as a NAME —
         material="aluminum" resolves against the same material table the solvers use and
-        the density it picked comes back in `interpreted`. NOTE: set_material is the
-        VISUAL material and does NOT change this density, so a part you coloured aluminium
-        still weighs steel here unless you say so. Also runs a geometry sanity check
+        the density it picked comes back in `interpreted`. set_material stores document
+        identity and appearance, but it deliberately does NOT choose this calculation's
+        density; pass material= or density_g_cm3= here. Also runs a geometry sanity check
         (closed/valid solid).
 
         Multi-body docs: the top-level volume/mass/com/inertia are the COMBINED total of ALL
@@ -1039,11 +1039,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                                  ("density", "density_g_cc", "density_gcm3", "material_density",
                                   "rho"), density_g_cm3, notes)
             # A material NAME is the spelling a model reaches for once it has decided the
-            # part is aluminium, and it used to be refused with "use set_material instead"
-            # — which is false: set_material is the VISUAL material and never touches the
-            # density this tool computes mass with, so following that advice returns a
-            # steel mass for an aluminium part with nothing to say it did. Resolve the name
-            # against the same material table the solvers use, and echo the density used.
+            # part is aluminium. set_material stores that document identity + appearance,
+            # while this calculation deliberately owns its density argument. Resolve the
+            # name against the solver table and echo the exact density used.
             named = extra.pop("material", None)
             named = _one_alias("measure_part", "material", extra,
                                ("material_name", "mat"), named, notes)
@@ -1056,8 +1054,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                         f"so mass cannot be computed. Pass density_g_cm3= directly.")
                 density = resolved
                 notes.append(f"material={named!r} resolved to density_g_cm3={resolved} — mass "
-                             f"is computed from density; set_material sets the VISUAL material "
-                             f"only and does not change it")
+                             f"is computed from this explicit density; stored document material "
+                             f"does not silently choose analysis inputs")
             elif named is not None:
                 notes.append(f"ignored material={named!r} — density_g_cm3={density} was given "
                              f"explicitly and wins")

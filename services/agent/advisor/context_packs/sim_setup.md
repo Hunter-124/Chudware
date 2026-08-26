@@ -4,7 +4,8 @@
 
 ## Before launch
 1. State one criterion/case/pass rule and all units. FEA properties enter through
-   `material=`; `set_material` is appearance only. Explicit FEA dicts always need
+   the solve's `material=` argument; `set_material` stores document identity and
+   appearance but does not silently choose solver properties. Explicit FEA dicts need
    E/nu; add yield for static/fatigue, density for modal/frequency/transient thermal,
    ultimate/endurance for fatigue, conductivity_w_mk/k_w_mk for steady thermal, and
    conductivity plus cp_j_kgk (or top-level specific_heat_j_kgk) for transient.

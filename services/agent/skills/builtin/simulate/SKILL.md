@@ -13,8 +13,9 @@ triggers:
 ## Execute
 
 1. State one criterion, case, pass rule, and units. Use each FEA tool's `material=`;
-   `set_material` changes appearance only. Confirm faces with `query_geometry`.
-   Every explicit FEA material dict needs `E_mpa` and `nu`; add `yield_mpa` for
+   `set_material` stores document identity/appearance but does not choose solver
+   properties. Confirm faces with `query_geometry`. Every explicit FEA material
+   dict needs `E_mpa` and `nu`; add `yield_mpa` for
    static/fatigue, density for modal/frequency/transient thermal,
    `ultimate_mpa`/`endurance_mpa` for fatigue, `conductivity_w_mk`/`k_w_mk` for
    steady thermal, and conductivity plus `cp_j_kgk` (or top-level

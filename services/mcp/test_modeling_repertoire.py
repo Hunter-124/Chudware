@@ -188,12 +188,12 @@ def test_a_bolt_circle_lands_its_holes_on_the_pitch_circle():
         assert math.hypot(cx, cy) == pytest.approx(30.0, abs=1e-2), m
 
 
-def test_mass_follows_the_material_you_name_not_the_one_you_coloured():
-    """set_material is the VISUAL material — it does NOT change what the part weighs.
+def test_mass_requires_explicit_analysis_material_even_when_document_has_one():
+    """Stored document material does not silently choose an analysis density.
 
-    measure_part used to refuse material= with "use set_material instead", which is a
-    round trip back to a tool that cannot answer: an aluminium-coloured bar still
-    reported a steel mass, silently.
+    set_material now records engineering identity for drawings/project metadata, but
+    measure_part remains explicit and deterministic: its material/density argument owns
+    the mass calculation and an explicit density wins over a name.
     """
     doc = _new("rep_material")
     _apply(doc, {"type": "box", "name": "Bar",

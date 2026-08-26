@@ -6,7 +6,7 @@ keywords: [FEA, stress, static, mesh, fixture, anchor]
 summary: Define one load case, anchor it, run two real meshes, and report a supported margin.
 steps:
   - tool: research_material_lookup
-    note: Choose a sourced registry material for the solver material= argument; set_material is appearance only.
+    note: Choose a sourced registry material for the solver material= argument; set_material stores document metadata/appearance but does not choose solver properties.
   - tool: query_geometry
     note: Resolve the mounted and loaded face queries before solving.
   - tool: research_eng_calc

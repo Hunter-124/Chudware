@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -237,9 +239,28 @@ TEST_CASE("GD&T annotations compile to draw primitives + export") {
     json ex = doc::export_drawing(did, tmp.string(), "dxf");
     CHECK(ex.value("entities", 0) > 0);
     CHECK(ex.value("annotations", 0) > 0);
+
+    // PDF keeps the requested A3 paper size and contains a framed, labelled title block.
+    doc::drawing_set_titleblock(
+        did, "s1",
+        json{{"title", "TEST DRAWING"}, {"part_number", "T-001"},
+             {"material", "STEEL"}, {"finish", "AS MACHINED"},
+             {"scale", "1:1"}, {"rev", "A"}});
+    auto pdf = std::filesystem::temp_directory_path() / "chudware_gdt_test.pdf";
+    json px = doc::export_drawing(did, pdf.string(), "pdf");
+    CHECK(px.value("fixed_page", false));
+    REQUIRE(px.contains("sheet_mm"));
+    CHECK(px["sheet_mm"] == json::array({420.0, 297.0}));
+    std::ifstream stream(pdf, std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(stream)),
+                      std::istreambuf_iterator<char>());
+    CHECK(bytes.find("/MediaBox [0 0 1190.551 841.890]") != std::string::npos);
+    CHECK(bytes.find("(TITLE)") != std::string::npos);
+    CHECK(bytes.find("(TEST DRAWING)") != std::string::npos);
+
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
-
+    std::filesystem::remove(pdf, ec);
     doc::drawing_close(did);
 }
 
@@ -761,6 +782,27 @@ TEST_CASE("make_drawing centers views in their cells + no overflow (R1/R2)") {
     REQUIRE(front_cy > 0.0);
     CHECK(front_cy > sh * 0.15);
     CHECK(front_cy < sh * 0.95);
+    doc::drawing_close(did);
+}
+
+TEST_CASE("make_drawing compresses unused standard-view grid columns") {
+    const std::string src = make_block();
+    json made = doc::drawing_make(
+        src, json{{"views", json::array({"front", "top"})}, {"model_items", false}});
+    const std::string did = made.at("doc_id").get<std::string>();
+    double front_x = -1.0, top_x = -1.0;
+    for (const json& view : made["drawing"]["sheets"][0].value("views", json::array())) {
+        const json& bb = view.value("bbox", json(nullptr));
+        REQUIRE(bb.is_array());
+        const double cx = (bb[0].get<double>() + bb[2].get<double>()) * 0.5;
+        if (view.value("orientation", std::string()) == "front") front_x = cx;
+        if (view.value("orientation", std::string()) == "top") top_x = cx;
+    }
+    REQUIRE(front_x > 0.0);
+    REQUIRE(top_x > 0.0);
+    CHECK(front_x == doctest::Approx(top_x).epsilon(1e-6));
+    CHECK(front_x > 420.0 * 0.35);
+    CHECK(front_x < 420.0 * 0.65);
     doc::drawing_close(did);
 }
 

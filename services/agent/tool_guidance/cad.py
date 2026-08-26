@@ -77,7 +77,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "add_dimension": {
         "prompt_note": (
             "For whole-view auto-dimensioning prefer make_drawing's model_items; use "
-            "this for one-offs, snapping a,b to vertices read from review_drawing."
+            "feature names/SIDs or exact circles/points from review_drawing for one-offs. "
+            "dtype='note' takes one anchor plus required text='...'."
         ),
     },
     "add_drawing_view": {
@@ -238,16 +239,24 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "of ingesting the whole report; source='phases' needs no start."
         ),
     },
+    "edit_drawing_annotation": {
+        "prompt_note": (
+            "Fix or delete an existing dimension/note by the view_id + annotation_id "
+            "listed in review_drawing — never rebuild a whole sheet to remove one callout."
+        ),
+    },
     "export_drawing": {
         "prompt_note": (
-            "2D drawings only (doc_id = the drawing_doc_id) — 3D parts go through "
-            "export_part; review_drawing first so you don't export a broken sheet."
+            "2D drawings only (doc_id = drawing_doc_id). The built-in agent must call "
+            "review_drawing AFTER its last sheet mutation and inspect the attached pixels "
+            "and warnings before export; 3D parts go through export_part."
         ),
     },
     "export_part": {
         "prompt_note": (
-            "Interchange/mesh only — no feature tree or studies survive; to deliver an "
-            "editable part use save_part (.step+). fmt='step+' routes to the native saver."
+            "Interchange/mesh only — no feature tree or studies survive. A machine shop "
+            "needs fmt='step' (.step/.stp); save_part's .step+ is Chudware's native ZIP "
+            "document and is NOT a standard STEP exchange file."
         ),
     },
     "get_job": {
@@ -504,14 +513,16 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "review_drawing": {
         "prompt_note": (
-            "SEE the sheet before refining or exporting — fix overlaps with set_view, "
-            "add add_dimension/add_gdt, then review again in a loop."
+            "SEE the attached sheet pixels AND read the paired sheet-mm JSON. Fix every "
+            "overlap/off-sheet/title/material warning with set_view, annotation tools, "
+            "set_titleblock or source set_material; review again after the last edit."
         ),
     },
     "save_part": {
         "prompt_note": (
-            "PREFER for delivery — the only format keeping the editable tree + studies; "
-            "save before close_part/session end (AI docs get no unsaved warning)."
+            "Native editable Chudware document only (.step+ ZIP); it is NOT ISO STEP and "
+            "a machine shop cannot treat it as .step. Save it for project history, and for "
+            "external manufacturing also call export_part(fmt='step', path='...step')."
         ),
     },
     "set_config_override": {
@@ -527,19 +538,13 @@ ENTRIES: dict[str, dict[str, Any]] = {
         ),
     },
     "set_material": {
-        # The old note named "run_cfd_flow's material=" — run_cfd_flow
-        # (cad_sim_tools.py:382) has NO material argument, so the guidance itself
-        # taught a call that always fails. It also omitted set_material's own
-        # accepted shape, which is what a live run probed for across FOUR retries
-        # ({material}, {ops:[{op:set_material,material}]}, {...params}, {...name})
-        # before one landed. State the real shape and the real solver entry point.
+        # Keep document metadata/appearance distinct from explicit solve properties.
         "prompt_note": (
-            "VISUAL appearance only — set_material(material='steel' | "
-            "{'color':[r,g,b],'metallic':...,'roughness':...}, body='b1'|None, "
-            "doc_id=None) sets render colour/finish and NOTHING else. There is no "
-            "ops=[...] form. Simulation density/stiffness goes to run_fea_static / "
-            "run_fea_modal's material= instead (a registry name or an E_mpa/nu dict); "
-            "run_cfd_flow takes fluid='air'|'water' and has no material argument."
+            "set_material(material='A36 steel'|'4140'|'6061-T6', body='b1'|None, "
+            "doc_id=...) stores the registry material key AND matching appearance. "
+            "An explicit {'color':[r,g,b],...} is appearance-only. There is no ops=[...] "
+            "form. Mass/FEA still take their own material=/density input so each analysis "
+            "case is explicit; run_cfd_flow takes fluid= and has no material argument."
         ),
     },
     "set_titleblock": {
@@ -683,8 +688,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "verify_battery": {
         "prompt_note": (
-            "The done-gate before declaring a design finished — omitted checks = all "
-            "subsecond ones; check_metadata lists names/costs. Narrated verdict → design_review."
+            "Geometry/check health for THIS doc only: PASS covers only keys present in "
+            "scores. Skipped checks are unverified, and a part-doc pass does NOT verify "
+            "drawings, assembly fits, loads, material intent, tolerances or manufacturability. "
+            "Run those domain checks separately before claiming the design is finished."
         ),
     },
     "wall_thickness": {

@@ -5,9 +5,9 @@ stage: feature
 steps:
   - id: read_node
     goal: read the build-graph node — which feature, why, which ledger DIMs drive it
-    helper_tools: [ledger_get, describe_part]
+    helper_tools: [describe_part]
     checklist:
-      - feature and its purpose stated
+      - feature and purpose stated from injected ledger/build-graph context
       - every driving value maps to a DIM id or an ADVISORY number (no improvised numbers)
     output:
       type: object
@@ -22,11 +22,12 @@ steps:
       type: object
       required: [preflight_verdict]
   - id: apply
-    goal: apply the feature, addressing faces in plain words
-    helper_tools: [add_features, query_geometry]
+    goal: apply the feature, addressing faces plainly and storing the ratified material
+    helper_tools: [add_features, query_geometry, set_material]
     checklist:
       - faces named in plain words, never invented face numbers
       - standard parts placed via part_search/part_place, never approximated
+      - source document material matches the ratified design material
     output:
       type: object
       required: [applied]

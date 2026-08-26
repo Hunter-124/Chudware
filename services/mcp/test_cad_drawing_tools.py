@@ -548,24 +548,19 @@ def _tb_drawing() -> str:
 
 
 def test_revision_lands_in_rev_and_survives_the_export(tmp_path):
-    """The on-screen renderer takes rev OR revision as ONE cell (session.cpp:7114), but the
-    EXPORTER reads only "revision" (export2d.cpp:205-207). Measured 2026-07-30:
-    set_titleblock(revision="B", material="6061-T6", drawn="hg") rendered fine and the
-    exported DXF carried the material and the drafter and NO revision at all — the one cell a
-    shop floor keys off, silently missing from every delivered file. Both spellings are now
-    written, so the canonical read-back AND the export must show it."""
+    """Revision aliases resolve to one canonical cell and export in the framed grid."""
     dwg = _tb_drawing()
     st = _agent_call("set_titleblock", {"doc_id": dwg, "revision": "A", "material": "6061-T6"})
     assert st["ok"], st
     tb = _title_block(dwg)
     assert tb.get("rev") == "A", tb
-    assert tb.get("revision") == "A", tb  # the spelling export2d.cpp is able to see
+    assert tb.get("revision") == "A", tb
     out = str(tmp_path / "rev.dxf")
     ex = _call("export_drawing", {"doc_id": dwg, "fmt": "dxf", "path": out})
     assert ex["ok"], ex
     text = Path(out).read_text(encoding="utf8", errors="replace")
-    assert "revision: A" in text, "the revision cell never reached the exported sheet"
-    assert "material: 6061-T6" in text, text[:400]
+    assert "\n1\nREV\n" in text and "\n1\nA\n" in text, text[-1200:]
+    assert "\n1\nMATERIAL\n" in text and "\n1\n6061-T6\n" in text, text[-1200:]
 
 
 @pytest.mark.parametrize("name,field", [("part_no", "part_number"), ("drawn", "drawn_by")])
@@ -660,9 +655,9 @@ def test_nested_fields_dict_and_flattened_kwargs_still_merge():
 #   a=["F6356a7","center"], b=["F6356a7","edge"]
 # The projected arcs carry no sid (HLR drops topological identity — core/doc/drawing.cpp:149-186),
 # so the resolution joins the sid's MODEL radius to this view's projected circle of the same
-# radius/scale and hands the engine that circle's own centre. Every test below therefore asserts
-# the measured VALUE, which is the only thing that can prove the dimension landed on the right
-# circle: a ⌀6 callout reading 10.0 is a wrong drawing that looks perfectly normal.
+# radius/scale and hands the engine a point ON that ring. The ring point matters for concentric
+# circles: picking their common centre makes the engine choose the smallest circle. Every test
+# below asserts the measured VALUE — a ⌀6 callout reading 10.0 is a wrong drawing that looks normal.
 
 BIG_D_MM, SMALL_D_MM = 10.0, 6.0
 
@@ -680,6 +675,20 @@ def _plate_with_two_bores() -> str:
         cb.feat("hole", "SmallBore", {"style": "simple", "end": "through_all",
                                       "diameter": cb.dim(SMALL_D_MM)},
                 {"face": {"of": "face", "side": "top"}, "points": [[20.0, 0.0]]})]})
+    assert r["ok"], r
+    return doc
+
+def _concentric_punch() -> str:
+    """The live press failure: ⌀9.8 shank and ⌀20 head share one projected centre."""
+    n = next(_PLATE_N)
+    doc = _call("new_part", {"name": f"ConcentricPunch{n}"})["doc_id"]
+    r = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("cylinder", "Shank", {
+            "radius": cb.dim(4.9), "height": cb.dim(80)}),
+        cb.feat("cylinder", "StrikeHead", {
+            "radius": cb.dim(10.0), "height": cb.dim(15),
+            "at": [0, 0, 80], "mode": "boss"}),
+    ]})
     assert r["ok"], r
     return doc
 
@@ -749,6 +758,22 @@ def test_dimension_a_bore_by_sid_reads_its_real_diameter():
     assert abs(ann["value"] - HOLE_D_MM) < 1e-6, ann
     # …and it is attached to that circle's own centre, not to some other sheet point.
     assert [round(x, 6) for x in ann["center"]] == _circle_center(dwg, top, HOLE_D_MM), ann
+
+def test_feature_dimensions_pick_the_requested_concentric_ring():
+    doc = _concentric_punch()
+    mk = _call("make_drawing", {
+        "doc_id": doc, "views": ["top"], "model_items": False,
+        "hole_callouts": False})
+    assert mk["ok"], mk
+    dwg = mk["drawing_doc_id"]
+    top = next(iter(mk["views"]))
+    shank = _call("add_dimension", {
+        "doc_id": dwg, "view_id": top, "dtype": "diameter_dim", "a": "Shank"})
+    head = _call("add_dimension", {
+        "doc_id": dwg, "view_id": top, "dtype": "diameter_dim", "a": "StrikeHead"})
+    assert shank["value"] == pytest.approx(9.8), shank
+    assert head["value"] == pytest.approx(20.0), head
+    assert shank["text"] != head["text"]
 
 
 def test_the_verbatim_live_call_now_lands():
@@ -1282,6 +1307,58 @@ def test_a_surface_finish_takes_an_orientation_word_like_its_siblings():
     r = _call("add_surface_finish", {"doc_id": dwg, "view_id": "top", "ra": "1.6",
                                      "a": [bb[0], bb[1]], "pos": [bb[0], bb[1] - 10.0]})
     assert r["ok"] and r["annotation"], r
+
+def test_free_text_note_takes_one_anchor_and_preserves_text():
+    dwg, _mk = _sheet_drawing()
+    bb = _view(dwg, "v2")["bbox"]
+    r = _call("add_dimension", {
+        "doc_id": dwg, "view_id": "top", "dtype": "note",
+        "a": [bb[0], bb[1]], "text": "BREAK SHARP EDGES 0.5"})
+    assert r["ok"], r
+    ann = _the_annotation(dwg, "v2", r["annotation"])
+    assert ann["text"] == "BREAK SHARP EDGES 0.5"
+
+
+def test_annotation_can_be_patched_and_deleted_without_rebuilding_sheet():
+    dwg, _mk = _sheet_drawing()
+    bb = _view(dwg, "v2")["bbox"]
+    made = _call("add_dimension", {
+        "doc_id": dwg, "view_id": "v2",
+        "a": [bb[0], bb[1]], "b": [bb[2], bb[1]]})
+    ann_id = made["annotation"]
+    patched = _call("edit_drawing_annotation", {
+        "doc_id": dwg, "view_id": "top", "annotation_id": ann_id,
+        "fields": {"suffix": " TYP", "precision": 1}})
+    assert patched["ok"], patched
+    assert _the_annotation(dwg, "v2", ann_id)["text"].endswith(" TYP")
+    removed = _call("edit_drawing_annotation", {
+        "doc_id": dwg, "view_id": "v2", "annotation_id": ann_id,
+        "delete": True})
+    assert removed["ok"] and removed["deleted"] == ann_id, removed
+    assert ann_id not in [ann.get("id") for ann in _stored_annotations(dwg, "v2")]
+
+def test_review_pairs_pixels_with_layout_and_material_warnings():
+    from services.mcp import server
+
+    dwg, _mk = _sheet_drawing()
+    tb = _call("set_titleblock", {
+        "doc_id": dwg,
+        "fields": {
+            "title": "STEEL PLATE", "part_number": "P-1", "material": "A36 STEEL",
+            "scale": "1:1", "rev": "A",
+        },
+    })
+    assert tb["ok"], tb
+    raw = asyncio.run(server.mcp.call_tool("review_drawing", {"doc_id": dwg}))
+    content = raw[0] if isinstance(raw, tuple) else raw
+    assert any(getattr(item, "type", "") == "image" for item in content), content
+    text_items = [item for item in content if getattr(item, "type", "") == "text"]
+    assert text_items, content
+    summary = json.loads(text_items[-1].text)
+    assert summary["views"] and summary["sheet_mm"] == [420.0, 297.0], summary
+    assert summary["source_material"] == "alu_6061", summary
+    assert any("material mismatch" in warning for warning in summary["warnings"]), summary
+    assert summary["manufacturing_ready"] is False
 
 
 def test_a_dimension_between_two_picks_that_touch_nothing_is_refused():

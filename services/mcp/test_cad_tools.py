@@ -309,20 +309,21 @@ def test_measure_part():
 
 
 def test_set_material_preset_and_explicit():
-    # Task 04: the copilot/MCP can set a body's appearance. A preset name resolves to a colour +
-    # finish; an explicit dict is honoured; the appearance is written to the doc and baked onto the
-    # tessellated body (so render_part reflects it).
+    # A named material stores both engineering identity and rendered appearance. An explicit
+    # appearance dict deliberately changes visuals only.
     doc = _new_plate_with_hole()
 
     r, _ = _call("set_material", {"material": "brass", "doc_id": doc})
     assert r["ok"], r
     assert r["bodies"] == ["b1"], r
     assert r["appearance"]["metallic"] > 0.5  # brass is metallic
+    assert r["engineering_material_set"] and r["material_key"], r
 
     # The op landed on the doc and the tessellated body carries the brass colour/material.
     tree = cb.call("doc_tree", {"doc_id": doc})
     ap = (tree.get("tree") or {}).get("appearances", {})
     assert "b1" in ap, ap
+    assert (tree.get("tree") or {})["material"]["key"] == r["material_key"], tree
     # The baked body colour/material is reported in the apply-ops tess metadata.
     info = cb.call("doc_apply_ops", {"doc_id": doc, "ops": []})
     b0 = info["tess"]["bodies"][0]
@@ -332,6 +333,7 @@ def test_set_material_preset_and_explicit():
     r2, _ = _call("set_material",
                   {"material": {"color": [0.1, 0.2, 0.3], "roughness": 0.2}, "doc_id": doc})
     assert r2["ok"], r2
+    assert r2["engineering_material_set"] is False and r2["material_key"] is None, r2
     info2 = cb.call("doc_apply_ops", {"doc_id": doc, "ops": []})
     assert info2["tess"]["bodies"][0]["color"][2] > 0.25  # ~0.3 blue channel
 

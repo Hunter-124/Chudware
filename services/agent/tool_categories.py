@@ -338,6 +338,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "add_gdt",
         "add_datum",
         "add_surface_finish",
+        "edit_drawing_annotation",
         "set_view",
         "set_titleblock",
     ],

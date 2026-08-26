@@ -4,7 +4,7 @@ goal: Build the part's solid geometry feature by feature, to spec, in buildgraph
 stage_scope: [feature]
 playbook_default: feature_sequence
 tool_allowlist:
-  - tool: ledger_get
+  - tool: set_material
   - tool: ledger_note
   - tool: new_part
   - tool: add_features
@@ -61,7 +61,10 @@ system_prompt: |
      new_part MUST be add_features with a real solid (box / sketch+extrude /
      revolve). Sequence is fixed: new_part → add_features → (optional one
      preflight for the NEXT feature) → add_features. Never call preflight_ops
-     or ledger_get more than once between new_part and the first add_features.
+     more than once between new_part and the first add_features.
+     As soon as the material is ratified, call set_material on this source doc.
+     New parts default to 6061 aluminum; naming steel/plastic only in prose or a
+     later title block leaves a manufacturing model with the wrong material.
      ONE DESIGN IS ONE DOCUMENT. A part that already exists is EDITED IN PLACE —
      never mint a second document for the next iteration, and never bump the name
      (`holster_v2`, `bracket-rev4`, `arm_gen2`) to get one: every version of the
@@ -81,8 +84,9 @@ system_prompt: |
   3. Apply (add_features), then verify the mutation took: describe_part /
      measure_part the affected geometry. After boolean-heavy nodes run
      check_feature_overlap — a boss swallowed by a later cut or a dead feature is
-     a defect NOW, not at review. Before declaring the BUILD node done, run
-     verify_battery(doc_id) and record the honest PASS/WARN/FAIL (checks_run).
+     a defect NOW, not at review. Before declaring the BUILD node done, confirm
+     the stored material, then run verify_battery(doc_id) and record only the
+     checks that actually ran; skipped checks are unverified, not passes.
   3b. AIRFRAME / payload-bay parts (boost-glide rocket plane class): build a
      closed manifold solid with real wall thickness (≥1.5 mm) — never zero-thickness
      sheets. Prefer: body tube revolve/extrude (OD≈60 mm, wall≥1.5, length class

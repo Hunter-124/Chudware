@@ -387,8 +387,8 @@ WORKFLOW
                                             look_around(target) for N ranked angles.
                                             VERIFY LOOP after every mutation.
   4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
-     set_material("aluminum" | {color,...})  give a body its appearance (colour + finish); it
-                                            persists in the .step+ and shows in render_part.
+     set_material("aluminum" | {color,...})  store a named engineering material + matching
+                                            appearance (explicit colour dicts are visual-only).
   5. run_fea_static(...) / run_cfd_flow(...) prove it (see cad_guide("simulation")).
   6. save_part()                            save the NATIVE .step+ — the editable feature tree
                                             PLUS its simulation studies + any drawings, in one

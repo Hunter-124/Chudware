@@ -36,6 +36,9 @@ from .cad_common import (
     _project_save,
     _resolve_alias,
     _resolve_appearance,
+    _material_candidates,
+    _material_norm,
+    _material_not_modelled,
     _sanitize_output_path,
     _sid_match,
     durable_job_snapshot,
@@ -7565,23 +7568,43 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     def set_material(material: Union[str, dict, list],
                      body: Optional[Union[str, int]] = None,
                      doc_id: Optional[str] = None) -> str:
-        """Set a body's MATERIAL APPEARANCE — colour + finish — so it renders like the real material.
+        """Set the document material and its rendered body appearance.
 
-        material: a preset name (aluminum, steel, stainless, brass, copper, gold, plastic, abs,
-        black) OR an explicit dict {"color": [r,g,b] 0..1, "metallic"?: 0..1, "roughness"?: 0..1},
-        OR a bare [r,g,b] list for a plain colour.
-        body: which body — "b1", "b2", ... (1-based) or an int ordinal. Default: ALL bodies.
+        A material NAME resolves through the engineering material registry, persists as the
+        document's authoritative material key, and also applies the matching visual finish to
+        the selected body/bodies. This keeps native .step+ metadata, drawing title-block checks
+        and rendered appearance aligned. An explicit appearance dict or RGB list has no
+        engineering identity and therefore changes appearance only.
 
-        Persists on the document (round-trips through the native .step+) and is picked up by
-        render_part. NOTE: this is the VISUAL material ONLY — it does not change what the
-        part WEIGHS or how it behaves. For mass, pass material= (or density_g_cm3=) to
-        measure_part; for stiffness/strength, pass material= to run_fea_static /
-        run_cfd_flow. Colouring a part aluminium and then asking for its mass reports a
-        STEEL mass unless you name the material there too.
+        material: registry name/designation (A36, 4140, 6061-T6, PETG, ...) or an explicit
+                  appearance {"color":[r,g,b], "metallic"?:0..1, "roughness"?:0..1}.
+        body: "b1", "b2", ... or ordinal; default all bodies.
+        Mass/FEA calls still take their own material/density input for the solve, but the stored
+        document key is now available for drawings and manufacturing metadata.
         """
         try:
             d = _doc(doc_id)
             ap = _resolve_appearance(material)
+            material_key = None
+            registry_material = False
+            unsupported_identity = None
+            if isinstance(material, str) and material.strip():
+                for candidate in _material_candidates(material):
+                    resolved = cb.call("material_resolve_key", {"name": candidate})
+                    material_key = resolved.get("result")
+                    if isinstance(material_key, dict):
+                        material_key = material_key.get("key")
+                    if material_key is not None:
+                        material_key = str(material_key).strip() or None
+                    if material_key:
+                        registry_material = True
+                        break
+                if not material_key and _material_not_modelled(material):
+                    # The registry lacks solve properties for this known designation (e.g.
+                    # 4140), but the document can and should still preserve the user's exact
+                    # engineering identity instead of silently retaining default 6061.
+                    material_key = _material_norm(material).replace(" ", "_")
+                    unsupported_identity = material_key
             # Resolve target body keys. None -> all bodies (an empty op batch returns the tess
             # body list without mutating the doc); int -> "b<n>"; str -> the key as given.
             if body is None:
@@ -7592,10 +7615,26 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 targets = [f"b{body}"]
             else:
                 targets = [str(body)]
-            ops = [{"op": "set_appearance", "id": k, **ap} for k in targets]
+            ops = []
+            if material_key:
+                ops.append({"op": "set_material", "key": material_key})
+            ops.extend({"op": "set_appearance", "id": key, **ap} for key in targets)
             r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
-            return _dumps({"ok": True, "doc_id": d, "bodies": targets,
-                           "appearance": ap, "revision": r.get("revision")})
+            out = {"ok": True, "doc_id": d, "bodies": targets,
+                   "appearance": ap, "material_key": material_key,
+                   "engineering_material_set": bool(material_key),
+                   "material_registry_resolved": registry_material,
+                   "revision": r.get("revision")}
+            if unsupported_identity:
+                out["warning"] = (
+                    f"stored engineering material identity {unsupported_identity!r}, but the "
+                    "registry has no solve-property row for it; analysis needs an explicit "
+                    "material property dict")
+            elif isinstance(material, str) and not material_key:
+                out["warning"] = (
+                    f"{material!r} has a visual preset but no engineering registry identity; "
+                    "appearance changed, document material metadata did not")
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

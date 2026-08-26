@@ -7484,6 +7484,7 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
         // Bug D-8 — title block as label/value cells (not one crammed "key: value" line),
         // so all standard fields fit a two-column grid without truncating or overlapping.
         std::vector<std::pair<std::string, std::string>> title_cells;  // (LABEL, value)
+        double page_w = 0.0, page_h = 0.0;
         auto poolDraw = [&](const json& d) {
             if (!d.is_object()) return;
             pool(d.value("segments", json::array()), annSolid);
@@ -7523,6 +7524,18 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
         };
         if (full.contains("sheets") && full["sheets"].is_array())
             for (const auto& sheet : full["sheets"]) {
+                if (page_w <= 0.0) {
+                    const json& mm = sheet.value("size_mm", json(nullptr));
+                    if (mm.is_array() && mm.size() == 2 && mm[0].is_number() &&
+                        mm[1].is_number()) {
+                        page_w = mm[0].get<double>();
+                        page_h = mm[1].get<double>();
+                        if (page_w > 20.0 && page_h > 20.0)
+                            annSolid.push_back({{10.0, 10.0}, {page_w - 10.0, 10.0},
+                                               {page_w - 10.0, page_h - 10.0},
+                                               {10.0, page_h - 10.0}, {10.0, 10.0}});
+                    }
+                }
                 if (sheet.contains("views") && sheet["views"].is_array())
                     for (const auto& view : sheet["views"]) {
                         pool(view.value("visible", json::array()), visible);
@@ -7601,21 +7614,19 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
                     maxx = std::max(maxx, p[0]); maxy = std::max(maxy, p[1]);
                 }
         };
-        // Bug D-1 — annotation rescale. The fit/content box MUST be computed from the
-        // projected GEOMETRY (the view polylines) ONLY. If we grew it to include annotation
-        // strokes or text positions, adding a single GD&T frame / datum / dimension placed
-        // just outside the part would re-scale and re-shift EVERY view into a corner of the
-        // sheet (the layout would chase the annotation). Annotations are drawn afterwards
-        // with the SAME sheet->pixel transform (to_pix) at their given sheet coords, so they
-        // land in the right place on top of a now-FIXED layout. Adding an annotation no
-        // longer changes view placement or scale. (A label far outside the geometry may run
-        // toward the paper margin, which is the correct, non-destructive behavior — the views
-        // stay put.) Do NOT acc(annSolid)/acc(annDash)/texts here.
+        // Stateful drawings have a real paper size. Render that whole sheet rather than
+        // auto-cropping to the projected geometry: auto-crop made off-sheet views invisible,
+        // detached the title block from the paper, and showed the model a different composition
+        // from the fixed-size PDF it was supposed to review.
         acc(visible); acc(hidden);
+        const bool fixed_sheet = page_w > 20.0 && page_h > 20.0;
+        if (fixed_sheet) {
+            minx = 0.0; miny = 0.0; maxx = page_w; maxy = page_h;
+        }
         if (!(maxx > minx) || !(maxy > miny))
             return json{{"ok", false}, {"reason", "degenerate drawing bounds"}};
 
-        const int W = 1100, H = 850, margin = 40;
+        const int W = 1100, H = 850, margin = 20;
         std::vector<unsigned char> img(static_cast<std::size_t>(W) * H * 3, 255);  // white paper
         const double sc = std::min(double(W - 2 * margin) / (maxx - minx),
                                    double(H - 2 * margin) / (maxy - miny));

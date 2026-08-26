@@ -25,6 +25,7 @@
 #include "core/engine_events.h"  // core::mirrorRecoveredDocs — Reopen a dismissed live agent doc
 #include "ui/ai/ai_prefs.h"      // ui::chatShowRenders — Artifacts render-thumbnail display pref
 #include "gl_compat.h"           // glDeleteTextures — LRU eviction of render thumbnails
+#include <string_view>
 
 namespace ui {
 
@@ -162,20 +163,27 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float gearW = measureBtn("Settings", "settings", false);
     bool lChat = true, lTasks = true, lArts = true, lSess = true;
     auto rowFits = [&]() -> bool {
-        const float w = measureBtn("Chat", "ai_panel", lChat) +
+        const float chatMeasured = measureBtn("Chat", "ai_panel", lChat);
+        const float sessMeasured = measureBtn("Sessions", "history", lSess);
+        const float chatSessionsW = std::max(chatMeasured, sessMeasured);
+        const float w = chatSessionsW * 2.0f +
                         measureBtn(tlLabel, "plan_board", lTasks) +
                         measureBtn("Artifacts", "artifacts", lArts) +
-                        measureBtn("Sessions", "history", lSess) + gearW + 4.0f * minGap;
+                        gearW + 4.0f * minGap;
         return w <= (colW - rightInset - contentLeftInset - markSz - markGap);
     };
     if (!rowFits()) { lArts = false;
     if (!rowFits()) { lSess = false;
     if (!rowFits()) { lTasks = false;
     if (!rowFits()) { lChat = false; } } } }
-    const float chatW = measureBtn("Chat", "ai_panel", lChat);
+    // Chat and Sessions are one visual pair: both use the larger of their current responsive
+    // measurements, so their submitted hit boxes and painted pills remain exactly equal.
+    const float chatSessionsW = std::max(measureBtn("Chat", "ai_panel", lChat),
+                                         measureBtn("Sessions", "history", lSess));
+    const float chatW = chatSessionsW;
     const float tlW   = measureBtn(tlLabel, "plan_board", lTasks);
     const float artW  = measureBtn("Artifacts", "artifacts", lArts);
-    const float sessW = measureBtn("Sessions", "history", lSess);
+    const float sessW = chatSessionsW;
 
     // ---- Collapse chip: drawn INSIDE this window at an absolute screen position
     // (SetCursorScreenPos), exactly like the FeatureManager's ##lp_collapse — NOT a
@@ -345,8 +353,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
 // In-flight marker for a session row: the brand tesseract spinner at the row's left edge,
 // animated by the same per-frame repaint that streams the run itself. Returns the extra
-// x-indent title/subtitle text must use to clear the icon. Shared by the current-doc
-// Sessions rows and the "Other sessions" rows so both read identically.
+// x-indent title/subtitle text must use to clear the icon in every project-scoped Sessions row.
 static float drawSessionRunningIcon(ImDrawList* dl, const ui::AdaptiveSurface& surf,
                                     const ImVec2& rowMin, float rowH, float padX, float sc) {
     const float sz = std::max(ui::kTesseractSpinnerMinPx, rowH - 14.0f * sc);
@@ -356,6 +363,72 @@ static float drawSessionRunningIcon(ImDrawList* dl, const ui::AdaptiveSurface& s
     ui::drawTesseractSpinner(dl, center, sz, ImGui::GetTime(),
                              ImGui::ColorConvertFloat4ToU32(accInk));
     return sz + 6.0f * sc;  // icon box + gap before the text
+}
+
+static std::filesystem::path lexicalPath(std::string_view raw) {
+    std::string path(raw);
+    std::replace(path.begin(), path.end(), '\\', '/');
+    return std::filesystem::path(path).lexically_normal();
+}
+
+static std::string comparablePath(const std::filesystem::path& path) {
+    std::string result = path.generic_string();
+    const std::string root = path.root_path().generic_string();
+    while (result.size() > root.size() && !result.empty() && result.back() == '/')
+        result.pop_back();
+#ifdef _WIN32
+    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+#endif
+    return result;
+}
+
+static bool artifactPathIsInProject(std::string_view rawPath,
+                                    const std::filesystem::path& projectRoot,
+                                    const std::string& projectKey) {
+    if (rawPath.empty() || projectKey.empty()) return false;
+    std::filesystem::path artifact = lexicalPath(rawPath);
+    if (!artifact.is_absolute()) artifact = (projectRoot / artifact).lexically_normal();
+    const std::string artifactKey = comparablePath(artifact);
+    if (artifactKey == projectKey) return true;
+    if (artifactKey.size() <= projectKey.size() ||
+        artifactKey.compare(0, projectKey.size(), projectKey) != 0)
+        return false;
+    return projectKey.back() == '/' || artifactKey[projectKey.size()] == '/';
+}
+
+static bool hasProjectArtifact(const std::vector<ChatMsg>& msgs,
+                               const std::filesystem::path& projectRoot,
+                               const std::string& projectKey) {
+    static constexpr std::string_view kMarker("\x1e" "ART\x1e");
+    for (const ChatMsg& msg : msgs) {
+        if (msg.fromUser) continue;
+        for (const auto& activity : msg.activity) {
+            const std::string_view detail(activity.detail);
+            const size_t marker = detail.find(kMarker);
+            if (marker == std::string_view::npos) continue;
+            std::string_view packed = detail.substr(marker + kMarker.size());
+            while (!packed.empty() && (packed.front() == '\r' || packed.front() == '\n'))
+                packed.remove_prefix(1);
+            while (!packed.empty()) {
+                const size_t newline = packed.find('\n');
+                std::string_view line = packed.substr(0, newline);
+                if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+                const size_t tab = line.find('\t');
+                if (tab != std::string_view::npos) {
+                    const std::string_view kind = line.substr(0, tab);
+                    const std::string_view path = line.substr(tab + 1);
+                    if ((kind == "file" || kind == "image" || kind == "mesh") &&
+                        artifactPathIsInProject(path, projectRoot, projectKey))
+                        return true;
+                }
+                if (newline == std::string_view::npos) break;
+                packed.remove_prefix(newline + 1);
+            }
+        }
+    }
+    return false;
 }
 
 // Sessions list — replaces the chat log while open so users can jump between sessions easily.
@@ -417,19 +490,23 @@ void drawSessionsPanel(AppState& st, bool busy) {
     const float subH  = fh * 0.92f;
     const float rowH  = padY * 2.0f + titleH + 2.0f * sc + subH;
     const float trashSz = ImGui::GetFrameHeight();
+    const std::filesystem::path projectRoot = lexicalPath(st.plmProjectPath());
+    const std::string projectKey = comparablePath(projectRoot);
     bool anyRowShown = false;
     // Newest sessions first: newConversation() appends, so the tail of st.conversations is the
     // most recent session — walk the vector back-to-front so it lands at the TOP of the list.
     for (int i = (int)st.conversations.size() - 1; i >= 0; --i) {
         Conversation& c = st.conversations[i];
-        // Sessions are document-independent: list ALL of them regardless of the document
-        // on screen. Each row can carry a doc badge linking back to its document.
         if (c.archived != s_showArchived) continue;
+        // A session belongs in this project-scoped list only when its own transcript has a
+        // produced file/image/mesh under the active project root. The active transcript lives
+        // in st.chat; parked conversations retain theirs in Conversation::msgs.
+        const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
+        if (!hasProjectArtifact(msgs, projectRoot, projectKey)) continue;
         anyRowShown = true;
         // Fallback number is the conversation's own slot, not the display row — with the
         // newest-first order a row position changes every session, a slot number does not.
         std::string title = c.title.empty() ? ("Chat " + std::to_string(i + 1)) : c.title;
-        const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
         // Truthful per-session state: this conversation's own run, not a global flag. The
         // trailing-message scan catches one-shot RPC turns (agent_ask_v2 …) that never get
         // a JobState in st.runs.
@@ -547,10 +624,10 @@ void drawSessionsPanel(AppState& st, bool busy) {
         ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
         dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, titleShown.c_str());
 
-        // Document badge: sessions are document-independent but optionally carry a docLink
-        // reference. Show the linked document's name on the sub line; clicking it jumps to
-        // that document's tab when the tab is open. file: links always render (basename);
-        // doc: links only resolve while the tab is open, otherwise the badge is hidden.
+        // Project-matching sessions can optionally carry a docLink reference. Show the linked
+        // document's name on the sub line; clicking it jumps to that document's tab when open.
+        // file: links always render (basename); doc: links only resolve while the tab is open,
+        // otherwise the badge is hidden.
         // Resolved BEFORE the subtitle so the sub's clip yields room for the badge. The badge
         // is skipped on hover/active rows: its right-aligned slot is exactly where the
         // Archive/Delete action buttons appear, and painting both stacked the two (plus the
@@ -658,8 +735,8 @@ void drawSessionsPanel(AppState& st, bool busy) {
     }
     if (!anyRowShown) {
         // Same tone and indent as every other "nothing here yet" line in the copilot menus.
-        ui::cpMenuHint(s_showArchived ? "No archived sessions."
-                                      : "No active sessions yet. Start one above.");
+        ui::cpMenuHint(s_showArchived ? "No archived sessions match this project."
+                                      : "No sessions with artifacts in this project.");
     }
 
 }
@@ -1610,9 +1687,9 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         st.focusSettingsTab = false;
     }
 
-    // Sessions are document-independent and all resident; this only loads history once, keeps
-    // st.chatDocKey (run-launch key) current, and guarantees at least one conversation. Must
-    // run BEFORE the header/composer touch st.conversations, so the seeded/persisted chat is
+    // Conversation history is resident; this loads it once, keeps st.chatDocKey (run-launch key)
+    // current, and guarantees at least one conversation. The Sessions view applies project scope.
+    // Must run BEFORE the header/composer touch st.conversations, so the seeded/persisted chat is
     // adopted rather than cleared.
     syncChatToDoc(st);
     maybePersistChatHistoryDebounced(st, /*force=*/false);

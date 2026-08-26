@@ -329,7 +329,7 @@ def test_fenced_directive_in_streamed_thinking_precedes_resample(monkeypatch):
     assert agent_turn._parse_directive(reply)["tool"] == "measure_part"
 
 
-def test_missing_final_response_without_content_retries_then_names_cause(monkeypatch):
+def test_missing_final_response_names_cause_without_python_resample(monkeypatch):
     calls = _fake_bridge(monkeypatch, [
         ([], omp_bridge.BridgeUnavailable("bridge process closed stdout")),
         ([], omp_bridge.BridgeUnavailable("bridge process closed stdout")),
@@ -339,14 +339,14 @@ def test_missing_final_response_without_content_retries_then_names_cause(monkeyp
     with pytest.raises(omp_bridge.BridgeUnavailable) as ei:
         prov.complete_ex("sys", [{"role": "user", "content": "finish"}])
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     message = str(ei.value)
     assert "stream ended before the final response line" in message
     assert "no usable text or fenced directive" in message
 
-# --- (f) kimi-code resample discards attempt 1's buffered fragments ------------
+# --- (f) OMP owns retries; Python preserves the sidecar's single result ----------
 
-def test_resample_discards_first_attempt_buffer(monkeypatch):
+def test_python_layer_does_not_discard_or_resample_streamed_thinking(monkeypatch):
     calls = _fake_bridge(monkeypatch, [
         ([("delta", {"thinking": "half "})],
          {"text": "", "thinking": "just reasoning, no fenced block",
@@ -359,35 +359,27 @@ def test_resample_discards_first_attempt_buffer(monkeypatch):
     pbase.set_provider_delta_sink(sink)
 
     prov = OmpBridgeProvider(provider="kimi-code", model="k3-256k")
-    reply, _ = prov.complete_ex("sys", [{"role": "user", "content": "hi"}])
+    reply, thinking = prov.complete_ex("sys", [{"role": "user", "content": "hi"}])
 
-    assert len(calls) == 2  # resample happened
-    assert sink.discards == 1  # attempt 1's buffered fragments dropped
-    assert sink.feeds == [("real answer", "text")]  # only attempt 2 survived
-    assert reply == "real answer"
-    # cache-buster nudge appended to wire copy on the retry
-    assert len(calls[1]["params"]["messages"]) == 2
+    assert len(calls) == 1
+    assert sink.discards == 0
+    assert sink.feeds == [("half ", "thinking")]
+    assert reply == ""
+    assert thinking == "just reasoning, no fenced block"
 
 
-# --- (f2) a wholly empty sample is resampled on EVERY provider ----------------
-# Live 2026-08-04 basic-modeling sweep: two of eight claude-sonnet-5 legs died
-# mid-build on a single completion that carried no text and no thinking. The
-# harness has nothing to parse, so the turn ended `provider_error` and every tool
-# call it had already made was thrown away — while an immediate replay of the same
-# history completed normally. Only kimi-code resampled; now everyone does.
+# --- (f2) empty-completion retries belong to vendored OMP ---------------------
 
-def test_an_empty_anthropic_sample_is_resampled_instead_of_killing_the_turn(monkeypatch):
+def test_empty_anthropic_result_is_not_resampled_in_python(monkeypatch):
     calls = _fake_bridge(monkeypatch, [
         ([], {"text": "", "thinking": "", "stopReason": "stop", "usage": {}}),
         ([], {"text": "the real reply", "thinking": "", "stopReason": "stop", "usage": {}}),
     ])
     prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-sonnet-5")
-    reply, _ = prov.complete_ex("sys", [{"role": "user", "content": "hi"}])
+    with pytest.raises(omp_bridge.BridgeUnavailable):
+        prov.complete_ex("sys", [{"role": "user", "content": "hi"}])
 
-    assert len(calls) == 2, "the empty sample was not resampled"
-    assert reply == "the real reply"
-    # The k3 cache-buster is dialect-specific and must NOT ride other providers.
-    assert len(calls[1]["params"]["messages"]) == 1
+    assert len(calls) == 1
 
 
 def test_reasoning_without_text_is_not_paid_for_twice(monkeypatch):
@@ -412,11 +404,11 @@ def test_two_empty_samples_still_surface_the_real_error(monkeypatch):
             omp_bridge.BridgeUnavailable,
             match="final response contained no text or thinking"):
         prov.complete_ex("sys", [{"role": "user", "content": "hi"}])
-    assert len(calls) == 2, "empty completion retry must stay bounded at one"
+    assert len(calls) == 1, "vendored OMP is the sole empty-completion retry owner"
 
 
 def test_a_length_stop_is_reported_as_truncation_not_a_missing_reply(monkeypatch):
-    """If effort degradation also returns empty, the residual error names both facts."""
+    """A truncation is surfaced directly; Python does not spend a second completion."""
     calls = _fake_bridge(monkeypatch, [
         ([], {"text": "", "thinking": "", "stopReason": "length", "usage": {}}),
         ([], {"text": "", "thinking": "", "stopReason": "length", "usage": {}}),
@@ -427,28 +419,24 @@ def test_a_length_stop_is_reported_as_truncation_not_a_missing_reply(monkeypatch
         prov.complete_ex("sys", [{"role": "user", "content": "hi"}], max_tokens=16)
     msg = str(ei.value)
     assert "TRUNCATED" in msg and "16" in msg and "high" in msg, msg
-    assert "retry without reasoning effort" in msg
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert calls[0]["params"]["reasoningEffort"] == "high"
-    assert "reasoningEffort" not in calls[1]["params"]
 
 
-def test_length_stop_degrades_effort_and_recovers(monkeypatch):
+def test_length_stop_does_not_retry_without_effort_in_python(monkeypatch):
     calls = _fake_bridge(monkeypatch, [
         ([], {"text": "", "thinking": "", "stopReason": "length", "usage": {}}),
-        ([], {"text": "recovered", "thinking": "", "stopReason": "stop",
-              "usage": {}}),
+        ([], {"text": "would be a duplicate paid request", "thinking": "",
+              "stopReason": "stop", "usage": {}}),
     ])
     prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-fable-5",
                              reasoning_effort="high")
 
-    reply, _ = prov.complete_ex(
-        "sys", [{"role": "user", "content": "hi"}], max_tokens=16)
+    with pytest.raises(omp_bridge.BridgeUnavailable):
+        prov.complete_ex("sys", [{"role": "user", "content": "hi"}], max_tokens=16)
 
-    assert reply == "recovered"
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert calls[0]["params"]["reasoningEffort"] == "high"
-    assert "reasoningEffort" not in calls[1]["params"]
 
 
 def test_a_length_stop_is_never_resampled(monkeypatch):
@@ -508,12 +496,12 @@ def test_unrecoverable_empty_completion_reaches_turn_error_detail(monkeypatch):
         on_event=lambda _kind, _payload: None,
     )
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert result.success is False
     assert result.stop_reason == "provider_error"
     detail = result.result["error_detail"]
     assert "final response contained no text or thinking" in detail
-    assert "2 bounded attempts" in detail
+    assert "OMP's bounded empty-completion retries" in detail
     assert result.result["retryable"] is True
 
 

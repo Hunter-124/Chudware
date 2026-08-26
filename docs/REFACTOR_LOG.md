@@ -7984,3 +7984,22 @@ nested-overlay `box`/`box.auth` — Python owns the ROTATING `access_token`/
 clobber revokes the grant). Tests: `services/agent/test_box_mirror.py` (fake
 transport, 16 tests). Verified live against a real Box account end-to-end
 (upload, version update, dot-dir exclusion, loopback OAuth connect).
+
+### 2026-08-26 — agent harness integrity and cost-control cutover
+
+The universal in-app agent lane now preserves an absent desktop billing actor as
+JSON null instead of manufacturing `{}`, classifies reached-worker failures as
+`worker_error`, hoists actionable terminal detail, and preserves partial/refine-cap
+outcomes. `agent_turn` now applies HARD finish guards to synthetic handoffs,
+requires fresh post-mutation verification evidence, fails closed on guard errors,
+keeps sketch-role products intentional, distinguishes attempted from completed
+delegate work, and enforces aggregate token grants. Vendored OMP is the sole
+empty-completion retry owner; failed OMP responses are metered, failed delegates
+accrue spend, provider tiers reach live schema rendering, and delegate schemas
+render once. Dead `adopt_role`/`request_role_change` prompt, config, dispatcher,
+and Settings surfaces were removed in favor of exact catalog role IDs through
+`delegate`; unknown roles fail before allocating a child. Terminal document saves
+now run once and report failures as partial delivery. Regression coverage spans
+actor forwarding, worker classification, token ceilings, retry disposition,
+guard ordering, persistence, canonical roles, and terminal honesty; generated
+tool-panel tables were refreshed.

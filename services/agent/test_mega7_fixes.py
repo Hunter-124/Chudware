@@ -197,6 +197,10 @@ def test_new_part_then_add_features_auto_completes(tmp_path, monkeypatch):
                     '```json\n{"tool":"add_features","args":{"ops":'
                     '[{"op":"box","w":10,"h":10,"d":10}]}}\n```'
                 )
+            if seq["n"] == 3:
+                return (
+                    '```json\n{"tool":"verify_battery","args":{"doc_id":"doc-ok"}}\n```'
+                )
             return "done thrashing"
 
     def _dispatch(tool, args):

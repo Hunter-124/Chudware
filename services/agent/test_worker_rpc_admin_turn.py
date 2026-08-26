@@ -134,6 +134,20 @@ def test_agent_admin_turn_honors_explicit_role(monkeypatch):
     assert out["turn"]["role"] == "project_organizer"
 
 
+
+def test_agent_admin_turn_rejects_unknown_role_before_provider_dispatch(monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        agent_config,
+        "get_provider",
+        lambda *args, **kwargs: called.append((args, kwargs)),
+    )
+    out = worker_rpc._agent_admin_turn(
+        {"request": "build it", "role": "general-agent"},
+        lambda data: None,
+    )
+    assert out == {"ok": False, "reason": "invalid_role"}
+    assert called == []
 def test_agent_admin_turn_forwards_configured_max_output_tokens(monkeypatch):
     from services.agent import mission_dispatch
 
@@ -154,6 +168,72 @@ def test_agent_admin_turn_forwards_configured_max_output_tokens(monkeypatch):
 
     assert out["ok"] is True
     assert captured["max_tokens"] == 3456
+
+def test_agent_admin_turn_derives_schema_tier_from_selected_provider(monkeypatch):
+    from services.agent import mission_dispatch
+
+    captured = {}
+
+    class _Provider:
+        context_window = 1_000_000
+        model = "frontier-test"
+
+    monkeypatch.setattr(agent_config, "load_config", lambda: {})
+    monkeypatch.setattr(agent_config, "get_provider", lambda *args, **kwargs: _Provider())
+
+    def _run(*args, **kwargs):
+        captured.update(kwargs)
+        return {"success": True, "stop_reason": "confirmed"}
+
+    monkeypatch.setattr(mission_dispatch, "run_linear_role_turn", _run)
+    out = worker_rpc._agent_admin_turn({"request": "inspect it"}, lambda data: None)
+
+    assert out["ok"] is True
+    assert captured["tier"] == "frontier"
+    assert captured["capability"] is not None
+
+def test_agent_admin_turn_does_not_repeat_normal_save_finalizer(monkeypatch):
+    from services.agent import mission_dispatch
+    from services.mcp import cad_common
+
+    monkeypatch.setattr(agent_config, "get_provider", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        mission_dispatch,
+        "run_linear_role_turn",
+        lambda *args, **kwargs: {"success": True, "stop_reason": "confirmed"},
+    )
+    sweeps = []
+    monkeypatch.setattr(
+        cad_common,
+        "save_touched_docs",
+        lambda: sweeps.append("save") or {"saved": [], "errors": []},
+    )
+
+    out = worker_rpc._agent_admin_turn({"request": "inspect it"}, lambda data: None)
+    assert out["ok"] is True
+    assert sweeps == []
+
+
+def test_agent_admin_turn_runs_crash_save_finalizer_once(monkeypatch):
+    from services.agent import mission_dispatch
+    from services.mcp import cad_common
+
+    monkeypatch.setattr(agent_config, "get_provider", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        mission_dispatch,
+        "run_linear_role_turn",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("turn crashed")),
+    )
+    sweeps = []
+    monkeypatch.setattr(
+        cad_common,
+        "save_touched_docs",
+        lambda: sweeps.append("save") or {"saved": [], "errors": []},
+    )
+
+    out = worker_rpc._agent_admin_turn({"request": "inspect it"}, lambda data: None)
+    assert out["ok"] is False
+    assert sweeps == ["save"]
 
 # ──── workspace_dir plumbing (project-folder awareness) ────
 # run.cpp's general lane resolves the user's project folder via

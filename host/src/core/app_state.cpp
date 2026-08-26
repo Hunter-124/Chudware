@@ -566,15 +566,6 @@ void loadSettings(Settings& s) {
                 s.directAgentFullTools = ag.value("direct_agent_full_tools", true);
             if (ag.contains("memory_enabled"))
                 s.memoryEnabled = ag.value("memory_enabled", true);
-                if (ag.contains("role_adoption")) {
-                    auto ra = ag["role_adoption"];
-                    if (ra.is_string()) {
-                        std::string sra = ra.get<std::string>();
-                        s.roleAdoption = (sra == "free" || sra == "free_reign") ? 1 : 0;
-                    } else if (ra.is_number_integer()) {
-                        s.roleAdoption = ra.get<int>() != 0 ? 1 : 0;
-                    }
-                }
             if (ag.contains("memory_token_budget")) {
                 int b = ag.value("memory_token_budget", 400);
                 s.memoryTokenBudget = (b < 50) ? 50 : (b > 4000 ? 4000 : b);
@@ -1035,11 +1026,11 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j["auto_mission_routing"] = s.autoMissionRouting;
         j["direct_agent_full_tools"] = s.directAgentFullTools;
         j["memory_enabled"] = s.memoryEnabled;
-        j["role_adoption"] = (s.roleAdoption != 0) ? "free" : "supervised";
         j["memory_token_budget"] = s.memoryTokenBudget;
         // Merge-overlay into agent{} so Python config helpers see the same values.
         nlohmann::json agent = nlohmann::json::object();
         if (j.contains("agent") && j["agent"].is_object()) agent = j["agent"];
+        agent.erase("role_adoption");
         agent["advisor"] = (s.advisorPreference != 0);
         agent["advisor_preference"] = prefName(s.advisorPreference);
         agent["proactive_advisor"] = s.proactiveAdvisor;
@@ -1049,9 +1040,9 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         agent["subagent_preference"] = prefName(s.subagentPreference);
         agent["task_list_preference"] = prefName(s.taskListPreference);
         agent["memory_enabled"] = s.memoryEnabled;
-        agent["role_adoption"] = (s.roleAdoption != 0) ? "free" : "supervised";
         agent["memory_token_budget"] = s.memoryTokenBudget;
         j["agent"] = std::move(agent);
+        j.erase("role_adoption");
     }
     {
         static const char* kModeNames[] = {"agent", "plan", "swarm", "edit", "ask", "eng_firm"};

@@ -1527,6 +1527,11 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     role = (params or {}).get("role") or "general_agent"
     if not isinstance(role, str) or not role.strip():
         role = "general_agent"
+    try:
+        from services.agent.roles import load_role as _load_role  # noqa: PLC0415
+        _load_role(role)
+    except Exception:
+        return {"ok": False, "reason": "invalid_role"}
 
     def _param_str(key: str) -> str:
         value = (params or {}).get(key)
@@ -1658,6 +1663,21 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": f"offline: {exc}"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"agent_admin_turn: no provider: {exc}"}
+    turn_tier = None
+    turn_capability = None
+    try:
+        from services.agent.tiers import detect_tier, detect_tier_from_env  # noqa: PLC0415
+        turn_tier = detect_tier_from_env()
+        if not turn_tier:
+            context_window = int(getattr(provider, "context_window", 0) or 0)
+            if context_window > 0:
+                turn_tier = detect_tier(context_window)
+        if turn_tier:
+            from services.agent.capability import resolve_capability  # noqa: PLC0415
+            turn_capability = resolve_capability(turn_tier)
+    except Exception:  # noqa: BLE001 — unknown metadata keeps conservative defaults
+        turn_tier = None
+        turn_capability = None
     try:
         configured_max_tokens = int(cfg.get("max_output_tokens") or 0)
     except (TypeError, ValueError):
@@ -1699,6 +1719,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
 
     history = _history()
     turn_max_tokens = configured_max_tokens or 8192
+    turn_total_token_budget = None
     if credit_actor is not None and credit_actor.key_source == "pool":
         prompt_text = request + "".join(
             str(item.get("text") or "") for item in (history or [])
@@ -1716,6 +1737,24 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         if not check.get("ok"):
             return {"ok": False, "reason": "insufficient_credits"}
         turn_max_tokens = max(0, int(check.get("max_output_tokens") or 0))
+        # The gateway reserved a bounded amount for this whole turn, not for
+        # every completion the loop might make. Convert that reservation into a
+        # conservative aggregate token ceiling using the more expensive rate.
+        max_rate = max(
+            credit_actor.prompt_usd_per_mtok or 0,
+            credit_actor.completion_usd_per_mtok or 0,
+        )
+        if max_rate > 0 and credit_actor.reservation_credits > 0:
+            turn_total_token_budget = max(
+                1,
+                int(
+                    (
+                        Decimal(credit_actor.reservation_credits)
+                        * Decimal(1000)
+                        / max_rate
+                    ).to_integral_value(rounding=ROUND_FLOOR)
+                ),
+            )
 
     from services.agent import agent_events as _agent_events  # noqa: PLC0415
     from services.agent.providers import token_usage as _token_usage  # noqa: PLC0415
@@ -1725,6 +1764,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         _on_event(kind, data)
 
     usage_sink_token = _token_usage.bind_usage_sink(_usage_event)
+    linear_finalized = False
 
     try:
         turn = run_linear_role_turn(
@@ -1734,25 +1774,28 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             # reads options project_dir/project_path/workspace_dir for its
             # project-memory lookup).
             options={"project_dir": project_root} if project_root else None,
+            tier=turn_tier,
+            capability=turn_capability,
             max_tokens=turn_max_tokens,
+            max_total_tokens=turn_total_token_budget,
             history=history,
             attachments=_attachments(),
             chudware_actor=credit_actor,
         )
+        linear_finalized = True
         return {"ok": True, "turn": turn}
     except Exception as exc:  # noqa: BLE001 — never raise across the worker seam
         return {"ok": False, "reason": f"agent_admin_turn failed: {type(exc).__name__}: {exc}"}
     finally:
         _token_usage.reset_usage_sink(usage_sink_token)
-        # A turn that CRASHED still built geometry, and the same "part potentially lost"
-        # recovery row is waiting for it. run_linear_role_turn sweeps on every normal
-        # outcome (it has no try/except of its own), so this covers exactly the escaping
-        # exception; the sweep is idempotent, skipping anything already saved and clean.
-        try:
-            from services.mcp.cad_common import save_touched_docs  # noqa: PLC0415
-            save_touched_docs()
-        except Exception:  # noqa: BLE001
-            pass
+        # run_linear_role_turn owns the normal terminal save. Only an exception
+        # that escaped before that finalizer needs the crash-path sweep here.
+        if not linear_finalized:
+            try:
+                from services.mcp.cad_common import save_touched_docs  # noqa: PLC0415
+                save_touched_docs()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 ADMIN_METHODS: dict[str, Callable] = {

@@ -316,6 +316,24 @@ def test_done_passes_with_battery_evidence():
                       skip={"check_interference", "orphan_sketch"})
     assert v.ok and v.outcome == "passed"
     assert any(e["payload"]["outcome"] == "passed" for e in _hg(ledger, "verify_battery"))
+
+def test_battery_evidence_before_last_mutation_is_stale():
+    calls = [
+        {"tool": "verify_battery", "ok": True,
+         "result": {"scores": {"is_manifold": 1.0}, "findings": []}},
+        {"tool": "add_features", "ok": True, "result": {"ok": True}},
+    ]
+    verdict = gr.check_verify_battery_before_done({}, calls=calls)
+    assert verdict.ok is False
+
+
+def test_missing_battery_result_is_not_pass_evidence():
+    calls = [
+        {"tool": "add_features", "ok": True, "result": {"ok": True}},
+        {"tool": "verify_battery", "ok": True, "result": None},
+    ]
+    verdict = gr.check_verify_battery_before_done({}, calls=calls)
+    assert verdict.ok is False
 def test_done_waives_battery_with_reason():
     ledger = ListLedger()
     calls = [{"tool": "add_features", "ok": True, "args": {}, "result": {}}]
@@ -378,6 +396,23 @@ def test_assembly_done_passes_with_interference_check():
         force_assembly=True, actor="t",
     )
     assert v.ok and v.outcome == "passed"
+
+def test_interference_evidence_before_last_mutation_is_stale():
+    calls = [
+        {"tool": "check_interference", "ok": True,
+         "result": {"ok": True, "pairs": []}},
+        {"tool": "add_features", "ok": True, "result": {"ok": True}},
+    ]
+    verdict = gr.check_interference_before_done(
+        {"doc_kind": "assembly"}, calls=calls, force_assembly=True)
+    assert verdict.ok is False
+
+
+def test_missing_interference_result_is_not_clean_evidence():
+    calls = [{"tool": "check_interference", "ok": True, "result": None}]
+    verdict = gr.check_interference_before_done(
+        {"doc_kind": "assembly"}, calls=calls, force_assembly=True)
+    assert verdict.ok is False
 
 
 def test_assembly_done_waives_interference():

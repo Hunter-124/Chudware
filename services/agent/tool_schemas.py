@@ -61,7 +61,7 @@ _SKIP_PARAMS = frozenset({"self", "ctx", "context"})
 
 # Hand-written schemas for agent pseudo-tools that have no live registry
 # callable outside a mission dispatcher (signatures mirror
-# mission_dispatch.MissionDispatch.delegate / .adopt_role).
+# mission_dispatch.MissionDispatch.delegate).
 _FALLBACK_SCHEMAS: dict[str, str] = {
     "enable_tools": (
         "- enable_tools(categories: list[str])\n"
@@ -80,11 +80,6 @@ _FALLBACK_SCHEMAS: dict[str, str] = {
         "- delegate(role: str = '', brief: str = '', budget_tokens: int = 0, "
         "kind: str = 'worker', parent_id: str | None = None, docs: list | None = None)\n"
         "    Spawn a sub-agent role with an isolated brief and token budget."
-    ),
-    "adopt_role": (
-        "- adopt_role(role: str = '')\n"
-        "    Switch this session to a specialist role "
-        "(main session only; supervised subagents are refused)."
     ),
 }
 

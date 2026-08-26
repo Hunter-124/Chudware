@@ -60,18 +60,11 @@ VERDICT_ESCALATE = "escalate"
 
 # stop_reason values that map to done
 _DONE_REASONS = frozenset(["confirmed", "stabilized"])
-# stop_reason values that map to retry.
-# provider_error: agent_turn rewrites a transient 429/5xx/timeout from "failed"
-#   to "provider_error" right before returning (so the GUI does not mislabel it
-#   as budget exhaustion) — which meant the mega-5 retryable rescue below, which
-#   matches on the literal "failed", could never fire and every transient hiccup
-#   hard-escalated on its FIRST occurrence with retry budget untouched.
-# phase_step_cap: a capability-tier step ceiling, same class as max_iters.
-# guardrail_blocked: the model tried to finish and a HARD guardrail refused —
-#   another turn can satisfy the guardrail, so this is a retry, not an escalate.
+# stop_reason values that map to retry without further disposition data.
+# Provider failures are excluded: their structured ``result.retryable`` flag is
+# authoritative, so malformed/replay-unsafe requests never re-enter the DAG.
 _RETRY_REASONS = frozenset([
-    "max_iters", "provider_error", "phase_step_cap", "guardrail_blocked",
-    "blocked",
+    "max_iters", "phase_step_cap", "guardrail_blocked", "blocked",
 ])
 # stop_reason values that map to escalate (failed build / no model output / auth)
 _ESCALATE_REASONS = frozenset([
@@ -1077,15 +1070,17 @@ def run(
     success: bool = bool(getattr(agent_result, "success", False))
 
     verdict = _map_verdict(stop_reason, success)
-    # mega-5: a single retryable provider read-timeout must not exhaust the
-    # node — honor agent_result.result["retryable"] when stop_reason=failed.
+    # Provider retryability is structured data, not a stop-reason guess.
+    # Both legacy "failed" and current "provider_error" shapes use the same rule.
     if (
-        verdict == VERDICT_ESCALATE
-        and not success
-        and stop_reason == "failed"
+        not success
+        and stop_reason in ("failed", "provider_error")
     ):
         agent_result_dict_probe = getattr(agent_result, "result", None) or {}
-        if isinstance(agent_result_dict_probe, dict) and agent_result_dict_probe.get("retryable") is True:
+        if (
+            isinstance(agent_result_dict_probe, dict)
+            and agent_result_dict_probe.get("retryable") is True
+        ):
             verdict = VERDICT_RETRY
             # Next attempt should prefer cheaper effort/provider band.
             try:

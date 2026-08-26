@@ -137,13 +137,14 @@ def test_ledger_only_turn_is_not_cam_product_success():
     """ledger_note is in _PRODUCTIVE_TOOLS (it IS the deliverable for PLAN
     nodes), so `wrote` was True and a CAM turn that only wrote a ledger row
     auto-completed as status=done with no toolpath in existence."""
-    why = at._bootstrap_incomplete([{"tool": "ledger_note", "ok": True}], _CAM_ALLOW)
+    why = at._bootstrap_incomplete(
+        [{"tool": "ledger_note", "ok": True}], _CAM_ALLOW, "cam_programmer")
     assert why is not None and "toolpath" in why
 
 
 def test_artifact_gate_clears_once_the_product_tool_ran():
     calls = [{"tool": "ledger_note", "ok": True}, {"tool": "cam_generate", "ok": True}]
-    assert at._bootstrap_incomplete(calls, _CAM_ALLOW) is None
+    assert at._bootstrap_incomplete(calls, _CAM_ALLOW, "cam_programmer") is None
 
 
 def test_artifact_gate_does_not_fire_for_roles_without_those_tools():
@@ -178,28 +179,30 @@ def test_artifact_gate_ignores_a_pack_the_build_pulled_in_mid_turn():
     built = [{"tool": "new_part", "ok": True},
              {"tool": "add_features", "ok": True},
              {"tool": "render_part", "ok": True}]
-    assert at._bootstrap_incomplete(built, allow) is None
+    assert at._bootstrap_incomplete(built, allow, "general_agent") is None
 
 
 def test_artifact_gate_still_fires_when_nothing_was_delivered():
     """The gate's real job survives: no product in ANY domain, so it holds."""
     allow = {"ledger_note", "ledger_get", "run_fea_static", "run_cfd_flow"}
-    why = at._bootstrap_incomplete([{"tool": "ledger_note", "ok": True}], allow)
+    why = at._bootstrap_incomplete(
+        [{"tool": "ledger_note", "ok": True}], allow, "sim_engineer")
     assert why is not None and "no study was run" in why
+
+def test_general_agent_may_inspect_existing_sim_without_running_new_study():
+    allow = {"describe_results", "run_fea_static", "run_cfd_flow"}
+    calls = [{"tool": "describe_results", "ok": True, "result": {"study": "existing"}}]
+    assert at._bootstrap_incomplete(calls, allow, "general_agent") is None
 
 
 # ---------------------------------------------------------------------------
 # 4. A transient provider hiccup must not burn the node
 # ---------------------------------------------------------------------------
 
-def test_transient_provider_error_retries_rather_than_escalating():
-    """agent_turn rewrites a 429/5xx from "failed" to "provider_error" so the
-    GUI does not mislabel it as budget exhaustion — which made the mega-5
-    retryable rescue (matching the literal "failed") unreachable, so every
-    transient hiccup escalated on its FIRST occurrence with retry budget
-    still untouched."""
+def test_provider_retry_requires_structured_retryable_disposition():
+    """A provider_error string alone cannot prove replay is safe."""
     from services.dag import node_runner as nr
-    assert "provider_error" in nr._RETRY_REASONS
+    assert "provider_error" not in nr._RETRY_REASONS
     assert "phase_step_cap" in nr._RETRY_REASONS
     # Genuinely terminal reasons must still escalate.
     assert "provider_auth" not in nr._RETRY_REASONS
@@ -313,11 +316,98 @@ def test_guardrail_blocked_finish_is_not_reported_as_no_code(monkeypatch):
     assert "no valid tool call" not in detail
     assert "verify_battery" in ((res.result or {}).get("guardrail_block") or "")
 
+def test_productive_work_cannot_bypass_a_hard_finish_guard(monkeypatch):
+    """A successful tool call must not turn a rejected finish into synthetic success."""
+    monkeypatch.setattr(
+        at, "_done_guardrail_block",
+        lambda handoff, ledger, actor, calls: "HARD guardrail: run verify_battery first.")
 
+    class _Prov:
+        name = model = "mock"
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, system, messages, max_tokens=8000):
+            self.calls += 1
+            if self.calls == 1:
+                return '```json\n{"tool":"ledger_note","args":{"section":"decisions"}}\n```'
+            return '```json\n{"done":true,"handoff":{"status":"done","summary":"x"}}\n```'
+
+    res = at.run_turn(
+        "do it",
+        _Prov(),
+        name="t",
+        allowed_tools=["ledger_note"],
+        max_tool_calls=2,
+        tool_dispatch=lambda tool, args: {"ok": True},
+    )
+    assert res.success is False
+    assert res.stop_reason == "guardrail_blocked", res.stop_reason
+    assert res.result.get("auto_complete") is not True
+    assert "verify_battery" in ((res.result or {}).get("guardrail_block") or "")
+
+
+
+def test_delegate_rejects_unknown_role_before_allocating_a_child():
+    dispatch = MissionDispatch(run_id="invalid-role-test")
+    out = dispatch.delegate(
+        role="general-agent",
+        brief="build a bracket",
+        budget_tokens=8000,
+    )
+    assert out["ok"] is False
+    assert out["executed"] is False
+    assert out["reason"] == "invalid_role"
+    assert "general_agent" in out["suggested_roles"]
 def test_guardrail_blocked_is_retryable_not_escalate():
     from services.dag import node_runner as nr
     assert "guardrail_blocked" in nr._RETRY_REASONS
 
+
+def test_done_guardrail_exception_fails_closed(monkeypatch):
+    from services.agent import guardrails
+    monkeypatch.setattr(
+        guardrails,
+        "check_done",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("broken guard")),
+    )
+    block = at._done_guardrail_block({}, None, "test", [])
+    assert "HARD guardrail failed" in block
+    assert "broken guard" in block
+
+
+def test_sketch_role_handoff_skips_only_orphan_product_guard(monkeypatch):
+    from services.agent import guardrails
+    captured = {}
+
+    class _Verdict:
+        ok = True
+
+    def _check(*args, **kwargs):
+        captured.update(kwargs)
+        return _Verdict()
+
+    monkeypatch.setattr(guardrails, "check_done", _check)
+    assert at._done_guardrail_block({}, None, "sketcher", []) is None
+    assert captured["skip"] == {"orphan_sketch"}
+
+
+def test_failed_delegate_with_successful_child_calls_counts_as_partial_work():
+    call = {
+        "tool": "delegate",
+        "ok": False,
+        "result": {
+            "executed": True,
+            "status": "failed",
+            "error": "provider stopped after tool work",
+            "result": {
+                "calls": [{"tool": "add_features", "ok": True}],
+                "stop_reason": "provider_error",
+            },
+        },
+    }
+    assert at._delegate_actually_ran(call) is True
 
 # ---------------------------------------------------------------------------
 # 8. The universal entry must always return a handoff
@@ -354,6 +444,35 @@ def test_linear_turn_keeps_a_real_handoff_untouched(monkeypatch):
     monkeypatch.setattr(at, "run_turn", lambda *a, **k: _Res())
     out = md.run_linear_role_turn("x", "general_agent", provider=object())
     assert (out.get("result") or {}).get("handoff") is real
+
+def test_linear_turn_reports_save_failure_as_partial(monkeypatch):
+    from services.agent import mission_dispatch as md
+    from services.mcp import cad_common
+
+    class _Res:
+        success = True
+        stop_reason = "confirmed"
+        result = {
+            "handoff": {"status": "done", "summary": "built", "outputs": {}},
+            "calls": [{"tool": "add_features", "ok": True}],
+        }
+
+    monkeypatch.setattr(at, "run_turn", lambda *args, **kwargs: _Res())
+    monkeypatch.setattr(
+        cad_common,
+        "save_touched_docs",
+        lambda: {"saved": [], "errors": ["doc_save failed for d1"]},
+    )
+    out = md.run_linear_role_turn(
+        "build it",
+        "general_agent",
+        provider=object(),
+        tool_dispatch=lambda tool, args: {"ok": True},
+    )
+    assert out["success"] is False
+    assert out["stop_reason"] == "persistence_failed"
+    assert out["result"]["handoff"]["status"] == "partial"
+    assert "doc_save failed" in out["result"]["error_detail"]
 
 
 # ---------------------------------------------------------------------------

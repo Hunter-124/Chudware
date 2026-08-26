@@ -43,6 +43,9 @@ void set_doc_publish_sink(DocPublishFn sink);
 
 // Pure filename/display-title normalization used by the mission naming lane.
 std::string sanitize_part_name(std::string name);
+// Extract the optional web billing actor without manufacturing one for trusted
+// desktop/BYOK turns. Missing must remain JSON null so the worker omits the field.
+json worker_actor_from_options(const json& options);
 
 // run_design — drive the orchestrator against a LIVE doc session.
 //
@@ -80,16 +83,15 @@ std::string sanitize_part_name(std::string name);
 json run_design(const std::string& request, const std::string& doc_id, const json& provider_cfg,
                 EmitFn emit = nullptr, const json& options = json::object());
 
-// classify_worker_stop — the honest terminal classification for a general-work turn
-// whose python worker never answered.
+// classify_worker_stop — the honest terminal classification when the Python
+// general-agent worker does not return a usable turn.
 //
-// "non_modeling_request" means the request had nothing that could run it. A worker that
-// DIED is not that, and neither is one that went SILENT: run-42508173312214 (2026-07-29)
-// built five real, auto-persisted features on a keychain part, stopped responding, and
-// was reported to the user as a non-modeling request that "changed nothing" — while the
-// geometry sat in the feature tree. `may_have_changed_the_model` carries that second
-// half: every op in the general-work branch commits through the engine as it goes, so
-// only the offline path (which never reaches the worker) can promise nothing happened.
+// "non_modeling_request" is reserved for the offline pre-flight that never reached
+// the worker. A worker that DIED, went SILENT, or rejected its request is Chudware
+// failing, not the user asking for something unrunnable: run-42508173312214 built
+// five real, auto-persisted features before its worker stopped responding, while
+// run-142525469607454 rejected an accidentally forwarded empty billing actor before
+// doing any work. Neither is a request-classification failure.
 //
 // reached_worker  false only for the offline pre-flight refusal.
 struct WorkerStop {

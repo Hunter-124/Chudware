@@ -1182,8 +1182,9 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // classify_worker_stop (run.h) so a test can LINK the shipped rule instead of
         // restating it in a lambda — the older stop_reason cases in test_agent.cpp are
         // mirrored copies, which is exactly how a rule and its test drift apart.
-        auto blocked_response = [&](const std::string& worker_err, bool worker_crashed = false,
-                                    bool worker_timed_out = false) -> json {
+        auto worker_failure_response =
+            [&](const std::string& worker_err, bool worker_crashed = false,
+                bool worker_timed_out = false) -> json {
             const std::string detail = worker_err.empty() ? why : worker_err;
             const WorkerStop cls =
                 classify_worker_stop(worker_crashed, worker_timed_out, !worker_err.empty());
@@ -1220,7 +1221,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         };
 
         // Offline runs never attempt the worker bridge — same refusal as before.
-        if (offline) return blocked_response(std::string());
+        if (offline) return worker_failure_response(std::string());
 
         // Execute instead of refuse: hand the request to a bounded general_agent
         // role turn (fs/plm/shell + on-demand modeling/sketch/sim/... tool packs
@@ -1243,8 +1244,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         const std::string sessions_dir = options.value("sessions_dir", std::string());
         const json history = options.value("history", json::array());
         const json attachments = options.value("attachments", json::array());
-        const json chudware_actor =
-            options.value("_chudware_actor", json::object());
+        // Missing means a trusted desktop/BYOK turn. worker_actor_from_options keeps
+        // it JSON null so the worker omits the field; manufacturing `{}` here made
+        // every local general-agent request fail Actor validation.
+        const json chudware_actor = worker_actor_from_options(options);
         if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, session_id,
                                     sessions_dir, history, attachments, chudware_actor,
                                     events, turn, worker_err, worker_crashed,
@@ -1262,25 +1265,38 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                               : worker_timed_out     ? "agent worker stopped responding mid-turn"
                                                      : "general-work worker turn unavailable"},
                              {"reason", worker_err}});
-            return blocked_response(worker_err, worker_crashed, worker_timed_out);
+            return worker_failure_response(worker_err, worker_crashed, worker_timed_out);
         }
 
         const bool turn_ok = turn.value("success", false);
         const std::string stop_reason = turn.value("stop_reason", std::string("unknown"));
-        // Terminal success status is "done" everywhere in the engine (machine/micro/mission)
-        // and the host keys converged on it — a successful turn reported as "completed"
-        // painted the red "stopped early" card over a clean finish (stop_reason confirmed).
-        const std::string status = turn_ok ? "done" : "failed";
+        const json turn_result = turn.value("result", json::object());
+        const json handoff = turn_result.is_object()
+                                 ? turn_result.value("handoff", json::object())
+                                 : json::object();
+        const std::string handoff_status =
+            handoff.is_object() ? handoff.value("status", std::string()) : std::string();
+        const std::string status =
+            turn_ok                         ? "done"
+            : handoff_status == "partial"   ? "partial"
+            : stop_reason == "guardrail_blocked" ? "blocked"
+                                             : "failed";
         const std::string role = turn.value("role", std::string("general_agent"));
-        events.emit("run_finished", json{{"status", status},
-                                         {"stop_reason", stop_reason},
-                                         {"role", role}});
+        const std::string error_detail =
+            turn_result.is_object()
+                ? turn_result.value("error_detail", std::string())
+                : std::string();
+        json finished{{"status", status},
+                      {"stop_reason", stop_reason},
+                      {"role", role}};
+        if (!error_detail.empty()) finished["error_detail"] = error_detail;
+        events.emit("run_finished", std::move(finished));
         // The general lane runs NO geometry pipeline: whatever happened, the
         // turn's own handoff is the only honest account of it. Hand it up so
         // the host can print it instead of the built-geometry boilerplate
         // (2026-07-27: a turn that created nothing still rendered "Done - I
         // built this as parametric features; see the FeatureManager tree").
-        const json turn_result = turn.value("result", json::object());
+        // Preserve the worker's terminal envelope verbatim below.
         std::string summary;
         if (turn_result.is_object()) {
             // Models write the finish text under several keys: the canonical
@@ -1290,7 +1306,6 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             static const char* kTextKeys[] = {"summary", "response", "text",
                                               "message", "answer", "reply",
                                               "verdict"};
-            const json handoff = turn_result.value("handoff", json::object());
             auto harvest = [&](const json& obj) {
                 if (!obj.is_object()) return;
                 for (const char* key : kTextKeys) {
@@ -1304,14 +1319,16 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             if (handoff.is_object()) harvest(handoff.value("outputs", json::object()));
             harvest(turn_result);
         }
-        return json{{"run_id", run_id},
-                    {"status", status},
-                    {"stop_reason", stop_reason},
-                    {"result", turn_result},
-                    {"role", role},
-                    {"lane", "general"},
-                    {"summary", summary},
-                    {"doc_id", doc_id}};
+        json out{{"run_id", run_id},
+                 {"status", status},
+                 {"stop_reason", stop_reason},
+                 {"result", turn_result},
+                 {"role", role},
+                 {"lane", "general"},
+                 {"summary", summary},
+                 {"doc_id", doc_id}};
+        if (!error_detail.empty()) out["error_detail"] = error_detail;
+        return out;
     }
 
     // Live provider_call debug events (endpoint/status/latency) land on the same

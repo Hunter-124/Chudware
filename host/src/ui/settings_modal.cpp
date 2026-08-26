@@ -4076,25 +4076,6 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                   "Off = no advisor. Option = only when the model asks. "
                   "Encourage = stronger guidance tone when proactive fires. "
                   "Require = more frequent checks when proactive is on.");
-        ImGui::TableNextColumn();
-        {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Role adoption");
-            ImGui::SameLine();
-            helpMarker(
-                "Supervised (default): only the main session may adopt_role "
-                "(switch tools+prompt). Subagents may still delegate() children "
-                "with other roles, but must request_role_change to adopt themselves. "
-                "Free: subagents may adopt_role too.");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1.0f);
-            int ra = (settings.roleAdoption != 0) ? 1 : 0;
-            const char* kAdopt[] = {"Supervised", "Free"};
-            if (settingsPopupRowCombo("##h_role_adopt", &ra, kAdopt, 2)) {
-                settings.roleAdoption = ra;
-                changed = true;
-            }
-        }
         ImGui::EndTable();
     }
 

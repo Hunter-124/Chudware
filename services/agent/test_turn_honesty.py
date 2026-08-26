@@ -200,7 +200,7 @@ def test_meta_calls_do_not_count_as_real_work():
     assert not at._did_real_work([{"tool": "enable_tools", "ok": True}])
     assert not at._did_real_work(
         [{"tool": "describe_project", "ok": True, "forced": True}])
-    assert at._did_real_work([{"tool": "add_features", "ok": False}])
+    assert not at._did_real_work([{"tool": "add_features", "ok": False}])
     assert at._did_real_work([{"tool": "fs_list", "ok": True}])
 
 
@@ -555,8 +555,9 @@ def test_publishing_a_task_list_is_not_doing_the_work():
     plan_only = [{"tool": "task_list", "ok": True} for _ in range(3)]
     assert not at._did_real_work(plan_only)
 
-    # Mixed with any genuine tool call it IS work, even a failed one.
-    assert at._did_real_work(plan_only + [{"tool": "fw_build", "ok": False}])
+    # A failed build call is an attempt, not completed work.
+    assert not at._did_real_work(plan_only + [{"tool": "fw_build", "ok": False}])
+    assert at._did_real_work(plan_only + [{"tool": "fw_build", "ok": True}])
 
     # And the finish gate must refuse a plan-only "done" against a work request.
     assert at._unearned_finish_block(
@@ -595,8 +596,9 @@ def test_reading_the_document_is_not_building_it():
         live, "The bracket is built.", empty_is_unearned=True,
         request=request, can_act=True) is not None
 
-    # One genuine modelling call and it IS work, even if that call failed.
-    assert at._did_real_work(live + [{"tool": "add_features", "ok": False}])
+    # A failed mutation did not build anything; a successful one did.
+    assert not at._did_real_work(live + [{"tool": "add_features", "ok": False}])
+    assert at._did_real_work(live + [{"tool": "add_features", "ok": True}])
 
 
 @pytest.mark.parametrize("tool", ["measure_part", "measure_between", "render_part",

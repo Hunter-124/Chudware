@@ -529,24 +529,6 @@ def get_task_list_preference(cfg: dict | None = None) -> str:
 
 
 
-DEFAULT_ROLE_ADOPTION = "supervised"  # supervised | free
-
-
-def get_role_adoption_mode(cfg: dict | None = None) -> str:
-    """Subagent role adoption: supervised (default) or free.
-
-    supervised — only the main/root agent may adopt_role; subagents request via advisor.
-    free — subagents may adopt_role themselves (still depth-capped for spawns).
-    """
-    try:
-        from services.agent.role_catalog import get_role_adoption_mode as _g
-        return _g(cfg)
-    except Exception:  # noqa: BLE001
-        c = cfg if cfg is not None else load_config()
-        agent = c.get("agent") if isinstance(c, dict) and isinstance(c.get("agent"), dict) else {}
-        raw = str((agent or {}).get("role_adoption") or c.get("role_adoption") or DEFAULT_ROLE_ADOPTION)
-        raw = raw.strip().lower()
-        return "free" if raw in ("free", "free_reign", "free-reign") else "supervised"
 
 
 def get_advisor_preference(cfg: dict | None = None) -> str:

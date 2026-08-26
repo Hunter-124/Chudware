@@ -497,7 +497,6 @@
    "struct_estimate"
   ],
   "workspace": [
-   "adopt_role",
    "delegate",
    "design_recipe",
    "enable_tools",
@@ -519,7 +518,6 @@
   "add_gdt": "Add an ASME Y14.5 feature control frame. doc_id = drawing_doc_id.",
   "add_section_view": "Add a SECTION view by cutting a parent view through its centre. doc_id = drawing_doc_id.",
   "add_surface_finish": "Add a surface-finish symbol. doc_id = drawing_doc_id. ra is the roughness value (\"1.6\"); machining: any|required|prohibited. a is the …",
-  "adopt_role": "Switch this session to a specialist role (main session only; supervised subagents are refused).",
   "advise": "Run the stage's read-only check battery over *doc_id* and return advisories.",
   "advisory_dispute": "Contest an advisory (contract §9.3). Logs the dispute to the ledger.",
   "apply_ascii_edits": "Apply cell-addressed / ref-targeted edits from an ASCII grid review.",
@@ -976,9 +974,6 @@
   },
   "add_surface_finish": {
    "prompt_note": "a/pos are sheet mm from review_drawing; ra is a string (\"1.6\"). One symbol per call — review_drawing again to check placement."
-  },
-  "adopt_role": {
-   "prompt_note": "Main session only — supervised subagents must request a role change via the advisor instead."
   },
   "advise": {
    "prompt_note": "Match stage to your workflow phase — the default 'assembly' only runs interference; pass run_id to log for dispute/replay."

@@ -787,8 +787,8 @@ class TestProviderTierResolution:
 
         # An "internal" node — e.g. a BUILD node, not the mission's entry node.
         agent_fn = nr.make_default_agent_fn(provider=local_provider)
-        res = agent_fn("build the bracket",
-                       {"node_name": "n_build_d1", "allowed_tools": []})
+        res = agent_fn("explain the bracket",
+                       {"node_name": "n_build_d1", "allowed_tools": ["ledger_note"]})
 
         assert res.success is True
         assert seen.get("provider") is local_provider
@@ -827,9 +827,9 @@ class TestProviderTierResolution:
 
         monkeypatch.setattr(at, "run_turn", _spy)
 
-        context_pack = {"node_name": "n_build_d1", "allowed_tools": [],
+        context_pack = {"node_name": "n_build_d1", "allowed_tools": ["ledger_note"],
                         "node_inputs": {"tier": "local-24k"}}
-        res = nr._default_agent_fn("build the bracket", context_pack)
+        res = nr._default_agent_fn("explain the bracket", context_pack)
 
         assert res.success is True
         assert seen_tier_calls == ["local-24k"]

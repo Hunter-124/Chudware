@@ -553,6 +553,9 @@ def test_wi10_a_rework_after_a_declared_finish_trips_the_cap():
     assert len(dial) == 1, dial
     assert dial[0]["payload"]["reason"] == "refine_cap"
     assert dial[0]["payload"]["limit"] == 1
+    assert res.success is True
+    assert res.result["handoff"]["status"] == "done"
+    assert res.result["handoff"]["outputs"]["refinement_capped"] is True
 
 
 def test_wi10_b_allows_one_rework_before_capping():
@@ -571,6 +574,8 @@ def test_wi10_b_allows_one_rework_before_capping():
     assert res.stop_reason == agent_turn._REFINE_CAP, res.stop_reason
     assert seen.count("add_features") == 3, seen
     assert _dials(led, "refine_passes")[0]["payload"]["limit"] == 2
+    assert res.success is True
+    assert res.result["handoff"]["status"] == "done"
 
 
 def test_wi10_c_rework_is_never_capped():

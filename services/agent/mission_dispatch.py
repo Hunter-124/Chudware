@@ -223,9 +223,8 @@ class MissionDispatch:
     #: Parts Library V2 sourcing surface — workstream 5) + coordination board
     #: + corporate org mode (aicad.corporate/1).
     TOOLS = ("ledger_get", "ledger_note", "dag_plan", "ask_user",
-             "delegate", "adopt_role", "request_role_change", "part_search",
-             "parts_taxonomy", "part_get", "part_source", "match_model",
-             "reverse_engineer_product", "vendors_health",
+             "delegate", "part_search", "parts_taxonomy", "part_get",
+             "part_source", "match_model", "reverse_engineer_product", "vendors_health",
              "scrape_enqueue", "scrape_queue_status", "import_artifact",
              "cam_tool_import",
              # Coordination board (shared claims / progress across sub-agents)
@@ -323,8 +322,6 @@ class MissionDispatch:
             "dag_plan": self.dag_plan,
             "ask_user": self.ask_user,
             "delegate": self.delegate,
-            "adopt_role": self.adopt_role,
-            "request_role_change": self.request_role_change,
             "part_search": self.part_search,
             "parts_taxonomy": self.parts_taxonomy,
             "part_get": self.part_get,
@@ -676,40 +673,6 @@ class MissionDispatch:
     _BRIEF_EXEC_MAX = 20000  # sanity bound on what the child actually executes
 
 
-    def adopt_role(self, role: str = "", **kwargs):
-        """Main-session role switch; supervised subagents are refused."""
-        from services.agent.role_adoption import adopt_role as _adopt
-        depth = int(getattr(self, "depth", 0) or kwargs.get("depth") or 0)
-        is_root = bool(getattr(self, "is_root", depth <= 0))
-        cfg = None
-        try:
-            from services.agent import config as agent_config
-            cfg = agent_config.load_config()
-        except Exception:
-            pass
-        apply = getattr(self, "_apply_role_adoption", None)
-        result = _adopt(role, is_root=is_root, depth=depth, cfg=cfg, apply=apply)
-        # Transparency (2026-07-27): emit agent.role only on a REAL role change —
-        # the default first-turn general_agent entry shows no Routing card.
-        try:
-            new_role = str(result.get("role") or "")
-            prev_role = getattr(self, "_current_role", None) or "general_agent"
-            if result.get("ok") and new_role and new_role != prev_role and self.on_event is not None:
-                from services.agent import agent_events as _ae  # noqa: PLC0415
-                _k, _p = _ae.role_event(
-                    f"run:{self.run_id}", role=new_role,
-                    goal=str(result.get("goal") or ""), from_role=prev_role)
-                _ae.emit_event(_k, _p, live=self.on_event, journal=None)
-            if result.get("ok") and new_role:
-                self._current_role = new_role
-        except Exception:  # noqa: BLE001 — telemetry must never break adoption
-            pass
-        return result
-
-    def request_role_change(self, role: str = "", reason: str = "", from_role: str = "", **kwargs):
-        from services.agent.role_adoption import request_role_change as _req
-        depth = int(getattr(self, "depth", 0) or kwargs.get("depth") or 0)
-        return _req(role, reason, from_role=from_role, depth=depth)
 
     def delegate(self, role: str = "", brief: str = "", budget_tokens: int = 0,
                  kind: str = "worker", parent_id: str | None = None,
@@ -737,6 +700,25 @@ class MissionDispatch:
         role_raw = str(role or "").strip()
         role_key = role_raw.lower()
         role_resolved = self._ROLE_ALIASES.get(role_key, role_raw)
+        try:
+            from services.agent.roles import load_all_roles  # noqa: PLC0415
+            known_roles = load_all_roles()
+        except Exception:  # noqa: BLE001
+            known_roles = {}
+        if not role_resolved or role_resolved not in known_roles:
+            from difflib import get_close_matches  # noqa: PLC0415
+            suggestions = get_close_matches(
+                role_resolved, sorted(known_roles), n=3, cutoff=0.55)
+            return {
+                "ok": False,
+                "executed": False,
+                "reason": "invalid_role",
+                "error": (
+                    f"Unknown delegate role {role_raw!r}. Use an exact role id "
+                    "from the advertised role catalog."
+                ),
+                "suggested_roles": suggestions,
+            }
         # A model cannot know its own dg_<hex> node id, and nothing injected it,
         # so every nested delegate() arrived with parent_id=None and
         # request_delegation fell back to the tree ROOT — pinning every spawn at
@@ -1096,13 +1078,6 @@ class MissionDispatch:
                         if t not in allowed:
                             allowed = list(allowed) + [t]
             tools_text = None
-            if allowed:
-                try:
-                    from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
-                    tools_text, _meta = render_tools_block(
-                        allowed, resolver=_at.resolver_for(self), tier=self.tier)
-                except Exception:  # noqa: BLE001 — schema render is best-effort
-                    tools_text = None
             granted = 0
             try:
                 granted = int((node.get("budget") or {}).get("tokens_granted", 0))
@@ -1390,18 +1365,6 @@ class MissionDispatch:
                         allowed = sorted(set(allowed) | bugreport_floor())
                     except Exception:  # noqa: BLE001 — floor union is best-effort
                         pass
-                    # Re-render tools_text against the narrowed set (+ category menu).
-                    if allowed:
-                        try:
-                            from services.agent.tool_schemas import (  # noqa: PLC0415
-                                render_tools_block,
-                            )
-                            tools_text, _meta = render_tools_block(
-                                allowed, resolver=_at.resolver_for(self),
-                                tier=self.tier,
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
             except Exception:  # noqa: BLE001 — mode gate is best-effort
                 pass
             # Restricted allowlists (mode or role card): ensure meta-tools so the
@@ -1446,6 +1409,7 @@ class MissionDispatch:
                     # falling through to agent_turn's 2048 default truncated
                     # feature_modeler twice before its first tool call.
                     max_tokens=LINEAR_ROLE_MAX_OUTPUT_TOKENS,
+                    max_total_tokens=granted or None,
                     on_event=self.on_event, run_id=self.run_id,
                     node_id=node_id, subagent_id=node_id,
                     capability=_cap, tier=self.tier, phase=_phase,
@@ -1515,6 +1479,11 @@ class MissionDispatch:
             if isinstance(node, dict):
                 role_model = node.get("role_model")
             if result.stop_reason == "terminated_by_user":
+                if tokens > 0:
+                    try:
+                        self.delegation_tree.accrue(node_id, tokens)
+                    except Exception:  # noqa: BLE001
+                        pass
                 try:
                     self.delegation_tree.fail(node_id, reason="terminated by user")
                 except Exception:  # noqa: BLE001
@@ -1548,6 +1517,11 @@ class MissionDispatch:
                 if role_model is not None:
                     out["role_model"] = role_model
                 return out
+            if tokens > 0:
+                try:
+                    self.delegation_tree.accrue(node_id, tokens)
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 self.delegation_tree.fail(node_id, reason=result.stop_reason)
             except Exception:  # noqa: BLE001
@@ -1568,6 +1542,14 @@ class MissionDispatch:
                 out["role_model"] = role_model
             return out
         except Exception as exc:  # noqa: BLE001 — execution error is data
+            try:
+                from services.agent.providers import token_usage as _token_usage  # noqa: PLC0415
+                failed_tokens = int(
+                    (_token_usage.get_turn_usage() or {}).get("total_tokens") or 0)
+                if failed_tokens > 0:
+                    self.delegation_tree.accrue(node_id, failed_tokens)
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 self.delegation_tree.fail(node_id, reason=str(exc))
             except Exception:  # noqa: BLE001
@@ -2395,7 +2377,9 @@ def run_linear_role_turn(
     ledger: Any | None = None,
     mission_dispatch: MissionDispatch | None = None,
     capability: Any | None = None,
+    tier: str | None = None,
     max_tokens: int | None = None,
+    max_total_tokens: int | None = None,
     tool_dispatch: Optional[Callable[[str, dict], Any]] = None,
     options: dict | None = None,
     history: list[dict] | None = None,
@@ -2445,7 +2429,8 @@ def run_linear_role_turn(
                 tree = None
             mission_dispatch = MissionDispatch(
                 run_id=_rid, ledger=ledger, provider=provider, on_event=on_event,
-                delegation_tree=tree, chudware_actor=chudware_actor)
+                delegation_tree=tree, chudware_actor=chudware_actor,
+                capability=capability, tier=tier)
         except Exception:  # noqa: BLE001 — dispatcher is best-effort
             mission_dispatch = None
 
@@ -2481,7 +2466,7 @@ def run_linear_role_turn(
         from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
         tools_text, _meta = render_tools_block(
             allowed, resolver=_at.resolver_for(mission_dispatch),
-            tier=getattr(mission_dispatch, "tier", None))
+            tier=tier or getattr(mission_dispatch, "tier", None))
     except Exception:  # noqa: BLE001 — schema render is best-effort
         tools_text = None
 
@@ -2493,12 +2478,14 @@ def run_linear_role_turn(
         tools_text=tools_text,
         max_tokens=(max_tokens if max_tokens is not None
                     else LINEAR_ROLE_MAX_OUTPUT_TOKENS),
+        max_total_tokens=max_total_tokens,
         ledger=ledger,
         mission_dispatch=mission_dispatch,
         tool_dispatch=tool_dispatch,
         on_event=on_event,
         run_id=run_id,
         capability=capability,
+        tier=tier or getattr(mission_dispatch, "tier", None),
         options=options,
         history=history,
         attachments=attachments,
@@ -2520,20 +2507,21 @@ def run_linear_role_turn(
     # the long GC floor. Saved + clean means hostd just closes them, leaving nothing to
     # recover. Scoped to docs this worker built (never origin_kind=gui), and a no-op
     # without CHUDWARE_PROJECT_SAVE_DIR. Best-effort — never raises into the turn path.
+    _swept: dict[str, Any] = {"saved": [], "errors": []}
     try:
         from services.mcp.cad_common import save_touched_docs  # noqa: PLC0415
         _swept = save_touched_docs()
-        if _swept.get("saved") and ledger is not None:
+        if (_swept.get("saved") or _swept.get("errors")) and ledger is not None:
             try:
                 ledger.append(role, "terminal_autosave", {
                     "run_id": run_id,
-                    "saved": _swept["saved"],
+                    "saved": _swept.get("saved") or [],
                     "errors": _swept.get("errors") or [],
                 })
             except Exception:  # noqa: BLE001
                 pass
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _swept = {"saved": [], "errors": [f"{type(exc).__name__}: {exc}"]}
     # OMP Auto-Learn capture-at-stop (agent.autolearn_*). Main-chat / linear
     # entry only — never raises into the turn path.
     try:
@@ -2581,9 +2569,39 @@ def run_linear_role_turn(
                     ),
                 },
             }
+    persistence_errors = list(_swept.get("errors") or [])
+    if persistence_errors:
+        # Saving is part of delivery, not best-effort decoration. Preserve the
+        # completed work and handoff, but never tell the user it is safely done.
+        res_dict = dict(res_dict)
+        current_handoff = res_dict.get("handoff")
+        partial_handoff = (
+            dict(current_handoff) if isinstance(current_handoff, dict) else {}
+        )
+        partial_handoff["status"] = "partial"
+        outputs = partial_handoff.get("outputs")
+        outputs = dict(outputs) if isinstance(outputs, dict) else {}
+        outputs["persistence"] = {
+            "saved": list(_swept.get("saved") or []),
+            "errors": persistence_errors,
+        }
+        partial_handoff["outputs"] = outputs
+        if not partial_handoff.get("summary"):
+            partial_handoff["summary"] = (
+                "Work completed, but touched documents were not saved."
+            )
+        res_dict["handoff"] = partial_handoff
+        res_dict["error_detail"] = (
+            "Document persistence failed: " + "; ".join(persistence_errors)
+        )[:300]
+        result_success = False
+        result_stop_reason = "persistence_failed"
+    else:
+        result_success = result.success
+        result_stop_reason = result.stop_reason
     return {
-        "success": result.success,
-        "stop_reason": result.stop_reason,
+        "success": result_success,
+        "stop_reason": result_stop_reason,
         "result": res_dict or result.result,
         "role": role,
         "allowed_tools": allowed,

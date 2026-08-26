@@ -421,6 +421,45 @@ def test_replay_grok45_specify_transcript_passes_gate():
     )
 
 
+
+def test_aggregate_token_budget_caps_repeated_completions():
+    from services.agent.providers import token_usage
+
+    class _UsageProvider:
+        name = model = "usage"
+
+        def __init__(self):
+            self.caps = []
+
+        def complete(self, system, messages, max_tokens=8000):
+            self.caps.append(max_tokens)
+            token_usage.record_usage(
+                provider=self.name,
+                model=self.model,
+                prompt_tokens=0,
+                completion_tokens=max_tokens,
+                total_tokens=max_tokens,
+            )
+            return "```json\n" + json.dumps({
+                "tool": "ledger_note",
+                "args": {"kind": "decision", "payload": {"n": len(self.caps)}},
+            }) + "\n```"
+
+    provider = _UsageProvider()
+    res = agent_turn.run_turn(
+        "record bounded decisions",
+        provider,
+        allowed_tools=["ledger_note"],
+        max_tokens=60,
+        max_total_tokens=100,
+        max_tool_calls=10,
+        tool_dispatch=lambda tool, args: {"ok": True},
+    )
+    assert provider.caps == [60, 40]
+    assert res.success is False
+    assert res.stop_reason == "token_budget"
+    assert res.result["usage"]["total_tokens"] == 100
+
 def test_context_refs_surfaced_in_user_message():
     """Wave 4: structured context_refs appear in the model's user turn."""
     seen = {"messages": None}

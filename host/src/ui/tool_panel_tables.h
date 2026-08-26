@@ -484,7 +484,6 @@ static const char* kTools_sim[] = {
     "struct_estimate",
 };
 static const char* kTools_workspace[] = {
-    "adopt_role",
     "delegate",
     "design_recipe",
     "enable_tools",
@@ -531,7 +530,6 @@ static const ToolDesc kToolDescs[] = {
     {"add_gdt", "Add an ASME Y14.5 feature control frame. doc_id = drawing_doc_id."},
     {"add_section_view", "Add a SECTION view by cutting a parent view through its centre. doc_id = drawing_doc_id."},
     {"add_surface_finish", "Add a surface-finish symbol. doc_id = drawing_doc_id. ra is the roughness value (\"1.6\"); machining: any|required|prohibited. a is the …"},
-    {"adopt_role", "Switch this session to a specialist role (main session only; supervised subagents are refused)."},
     {"advise", "Run the stage's read-only check battery over *doc_id* and return advisories."},
     {"advisory_dispute", "Contest an advisory (contract §9.3). Logs the dispute to the ledger."},
     {"apply_ascii_edits", "Apply cell-addressed / ref-targeted edits from an ASCII grid review."},
@@ -973,7 +971,6 @@ static const ToolGuidance kToolGuidance[] = {
     {"add_gdt", "Place from review_drawing sheet-mm coordinates; declare referenced datums with add_datum first, diameter=True adds the ⌀ zone.", 0, 0, ""},
     {"add_section_view", "Cuts the parent view through its centre only — no sheet math needed; a magnified local region is add_detail_view instead.", 0, 0, ""},
     {"add_surface_finish", "a/pos are sheet mm from review_drawing; ra is a string (\"1.6\"). One symbol per call — review_drawing again to check placement.", 0, 0, ""},
-    {"adopt_role", "Main session only — supervised subagents must request a role change via the advisor instead.", 0, 0, ""},
     {"advise", "Match stage to your workflow phase — the default 'assembly' only runs interference; pass run_id to log for dispute/replay.", 0, 0, ""},
     {"advisory_dispute", "Contest only with concrete evidence; kernel-sourced disputes return waiver_required=true — a human must confirm the waiver.", 0, 0, ""},
     {"analyze_stl_geometry", "Alias of check_geometry_health. Takes doc_id, not a file path — import_part the mesh first, then call this on the document.", 0, 0, ""},

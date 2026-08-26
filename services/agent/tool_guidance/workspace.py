@@ -1,8 +1,8 @@
 """tool_guidance.workspace — curated options for workspace tools + pseudo-tools.
 
 The pseudo-tools (enable_tools / list_tool_categories / design_recipe /
-delegate / adopt_role) have no live registry callable outside a mission
-dispatcher; their guidance lives here with the workspace family.
+delegate) have no live registry callable outside a mission dispatcher; their
+guidance lives here with the workspace family.
 """
 from __future__ import annotations
 
@@ -49,12 +49,6 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "The brief must be fully self-contained — the child sees no chat "
             "history. Give role + concrete task + acceptance criteria."
-        ),
-    },
-    "adopt_role": {
-        "prompt_note": (
-            "Main session only — supervised subagents must request a role "
-            "change via the advisor instead."
         ),
     },
 }

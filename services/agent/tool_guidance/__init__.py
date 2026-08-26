@@ -41,7 +41,7 @@ _FAMILIES = (
 # "tasklist" module_key.
 PSEUDO_TOOLS: frozenset[str] = frozenset({
     "enable_tools", "list_tool_categories", "design_recipe",
-    "delegate", "adopt_role", "task_list",
+    "delegate", "task_list",
 })
 
 # Option keys a guidance entry may set (config.TOOL_OPTION_KEYS minus the

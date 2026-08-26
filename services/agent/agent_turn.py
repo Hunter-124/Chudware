@@ -60,6 +60,7 @@ _GUARD_BLOCKED = "guardrail_blocked"
 # non-frontier tiers only). Not a budget exhaustion and not a failure: the product
 # exists. Reporting it as max_iters would blame a tool-call budget that never ran out.
 _REFINE_CAP = "refine_cap"
+_TOKEN_BUDGET = "token_budget"
 
 # Interactive main-chat turns have no work budget. This is only a runaway
 # billing backstop for a model that never converges; normal builds must never
@@ -212,6 +213,10 @@ def error_detail_for_stop(
         return format_error_detail(
             extra or "Refine budget for this capability tier exhausted — the verified "
                      "build is kept; further re-work needs a new request."
+        )
+    if stop_reason == _TOKEN_BUDGET:
+        return format_error_detail(
+            extra or "Aggregate turn token budget exhausted before the next completion."
         )
     if stop_reason == _NOCODE:
         return format_error_detail(
@@ -368,50 +373,6 @@ def _directive_parse_error(reply: str) -> str:
     return ""
 
 
-def _attach_typed_refusal_if_needed(handoff: dict, calls: list) -> dict:
-    """mega-24 a2: multi-domain gate needs typed_refusal OR delegate.
-
-    Attach a minimal valid envelope when the turn already ran tools but the
-    model omitted both. Does not fabricate hollow done (requires ≥1 tool).
-    """
-    if not isinstance(handoff, dict):
-        return handoff if isinstance(handoff, dict) else {}
-    had_delegate = any(
-        isinstance(c, dict)
-        and c.get("tool") == "delegate"
-        and c.get("ok") is not False
-        for c in (calls or [])
-    )
-    if had_delegate:
-        return handoff
-    outs = handoff.get("outputs")
-    if not isinstance(outs, dict):
-        outs = {}
-        handoff = dict(handoff)
-        handoff["outputs"] = outs
-    else:
-        outs = dict(outs)
-        handoff = dict(handoff)
-        handoff["outputs"] = outs
-    if isinstance(outs.get("typed_refusal"), dict):
-        return handoff
-    n_ok = sum(
-        1 for c in (calls or [])
-        if isinstance(c, dict) and c.get("ok") is not False and c.get("tool")
-    )
-    if n_ok < 1:
-        return handoff
-    outs["typed_refusal"] = {
-        "reason": "completed turn without delegate spawn; staying flat",
-        "domains_considered": [
-            "plan", "geometry", "assembly", "ecad", "firmware",
-        ],
-        "why_flat": (
-            "Productive tool work finished without multi-domain spawn; "
-            "synthesised typed_refusal for mega-24 gate (a2 residual)."
-        ),
-    }
-    return handoff
 
 
 def _tool_category_catalog_result() -> dict:
@@ -916,6 +877,18 @@ def _delegate_actually_ran(call: dict) -> bool:
     # is a refused delegate could still close `confirmed` on a fabricated summary —
     # exactly the hole the executed/not_run checks above were added to plug.
     if res.get("status") == "failed" or res.get("error"):
+        nested = res.get("result")
+        nested = nested if isinstance(nested, dict) else {}
+        nested_calls = nested.get("calls")
+        if isinstance(nested_calls, list) and any(
+            isinstance(c, dict)
+            and c.get("ok")
+            and c.get("tool") not in _META_TOOLS_NOT_WORK
+            for c in nested_calls
+        ):
+            return True
+        if res.get("docs") or nested.get("docs") or nested.get("artifacts"):
+            return True
         return False
     return True
 
@@ -923,7 +896,9 @@ def _delegate_actually_ran(call: dict) -> bool:
 def _did_real_work(calls: list) -> bool:
     """True when the model voluntarily called a non-meta tool that actually DID something."""
     return any(
-        not c.get("forced") and c.get("tool") not in _META_TOOLS_NOT_WORK
+        not c.get("forced")
+        and c.get("ok") is True
+        and c.get("tool") not in _META_TOOLS_NOT_WORK
         and _delegate_actually_ran(c)
         for c in calls
     )
@@ -1489,6 +1464,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              system_prompt: str | None = None,
              max_tool_calls: int | None = None,
              max_tokens: int | None = None,
+             max_total_tokens: int | None = None,
              ledger=None,
              actor: str | None = None,
              credit_actor: Any | None = None,
@@ -1530,7 +1506,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         return _run_turn_impl(
             request, provider, name=name, allowed_tools=allowed_tools,
             system_prompt=system_prompt, max_tool_calls=max_tool_calls,
-            max_tokens=max_tokens, ledger=ledger, actor=actor,
+            max_tokens=max_tokens, max_total_tokens=max_total_tokens,
+            ledger=ledger, actor=actor,
             credit_actor=credit_actor,
             tool_dispatch=tool_dispatch, mission_dispatch=mission_dispatch,
             tools_text=tools_text, on_event=on_event, run_id=run_id,
@@ -1573,7 +1550,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             return _run_turn_impl(
                 request, provider, name=name, allowed_tools=allowed_tools,
                 system_prompt=system_prompt, max_tool_calls=max_tool_calls,
-                max_tokens=max_tokens, ledger=ledger, actor=actor,
+                max_tokens=max_tokens, max_total_tokens=max_total_tokens,
+                ledger=ledger, actor=actor,
                 credit_actor=credit_actor,
                 tool_dispatch=tool_dispatch, mission_dispatch=mission_dispatch,
                 tools_text=tools_text, on_event=_ordered_event, run_id=run_id,
@@ -1596,6 +1574,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
              system_prompt: str | None = None,
              max_tool_calls: int | None = None,
              max_tokens: int | None = None,
+             max_total_tokens: int | None = None,
              ledger=None,
              actor: str | None = None,
              credit_actor: Any | None = None,
@@ -1698,6 +1677,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         else MAIN_CHAT_RUNAWAY_TOOL_CALL_BACKSTOP
     )
     completion_cap = int(max_tokens) if max_tokens is not None else 2048
+    try:
+        total_token_budget = max(0, int(max_total_tokens or 0))
+    except (TypeError, ValueError):
+        total_token_budget = 0
     _tool_call_counts: dict[str, int] = {}
     # WI-10 refine cap. A "refine round" is geometry re-worked AFTER the model itself
     # declared the build finished — it verified it (verify_battery) or delivered it
@@ -1817,6 +1800,15 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             allow |= _br_floor
             allowed_tools = sorted(set(allowed_tools) | _br_floor)
     except Exception:  # noqa: BLE001 — the floor never breaks a turn
+        pass
+    # Any restricted lane that can mutate geometry must also be able to satisfy
+    # the universal battery-before-done guard without relying on a waiver.
+    try:
+        from services.agent.guardrails import MUTATING_TOOLS  # noqa: PLC0415
+        if allowed_tools is not None and allow.intersection(MUTATING_TOOLS):
+            allow.add("verify_battery")
+            allowed_tools = sorted(set(allowed_tools) | {"verify_battery"})
+    except Exception:  # noqa: BLE001 — guard capability floor is best-effort
         pass
     actor = actor or name
     # mega-25: once-per-session key for the static catalog gate below (role
@@ -2544,6 +2536,16 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                                  "content": _parts(_trig_block)})
             for _fire in _trig_fired:
                 _emit_rule_fired(_fire)
+        call_completion_cap = completion_cap
+        if queued is None and total_token_budget > 0 and _tu is not None:
+            used_tokens = int((_tu.get_turn_usage() or {}).get("total_tokens") or 0)
+            remaining_tokens = max(0, total_token_budget - used_tokens)
+            if remaining_tokens <= 0:
+                last_reason = _TOKEN_BUDGET
+                break
+            # max_tokens is an output cap; using the aggregate remainder as its
+            # upper bound prevents repeated completions from ignoring the grant.
+            call_completion_cap = min(completion_cap, remaining_tokens)
         try:
             if queued is not None:
                 reply = ""          # drained directive: nothing was billed
@@ -2552,7 +2554,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 _provider_failed = False
                 try:
                     reply = provider.complete(
-                        system, messages, max_tokens=completion_cap)
+                        system, messages, max_tokens=call_completion_cap)
                 except BaseException:
                     _provider_failed = True
                     raise
@@ -2656,7 +2658,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     })
                     try:
                         reply = provider.complete(
-                            system, messages, max_tokens=completion_cap)
+                            system, messages, max_tokens=call_completion_cap)
                         recovered = True
                     except Exception as trim_exc:  # noqa: BLE001
                         exc = trim_exc
@@ -2710,7 +2712,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                                 try:
                                     reply = alt.complete(
                                         system, messages,
-                                        max_tokens=completion_cap,
+                                        max_tokens=call_completion_cap,
                                     )
                                 except BaseException:
                                     _provider_failed = True
@@ -2911,7 +2913,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             # No structured directive. If the model already ran tools, treat a bare
             # natural-language finish as done-with-handoff; otherwise it produced
             if tool_calls_made > 0:
-                boot_msg = _bootstrap_incomplete(calls, allow)
+                boot_msg = _bootstrap_incomplete(calls, allow, actor)
                 if boot_msg is not None:
                     messages.append({"role": "user", "content": _parts(
                         f"[BOOTSTRAP INCOMPLETE] {boot_msg}"
@@ -3039,9 +3041,6 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     _log(ledger, actor, {"event": "done_blocked",
                                          "guardrail": block[:300]})
                     continue
-                bare_handoff = _attach_typed_refusal_if_needed(
-                    bare_handoff, calls,
-                )
                 return TurnResult(
                     True,
                     _DONE,
@@ -3119,7 +3118,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     _with_usage({"handoff": handoff, "calls": calls}, _tu),
                 )
             if handoff_status in ("", "done"):
-                boot_msg = _bootstrap_incomplete(calls, allow)
+                boot_msg = _bootstrap_incomplete(calls, allow, actor)
                 if boot_msg is None and tool_calls_made == 0:
                     boot_msg = _empty_product_handoff_block(allow, actor)
                 if boot_msg is not None:
@@ -3144,7 +3143,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                                 reason="done_incomplete_force",
                             )
                             # Re-check: if chain complete, fall through to done.
-                            boot_msg2 = _bootstrap_incomplete(calls, allow)
+                            boot_msg2 = _bootstrap_incomplete(calls, allow, actor)
                             if boot_msg2 is None:
                                 pass  # allow subsequent done_guardrail/return
                             else:
@@ -3237,7 +3236,6 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 if _synth:
                     handoff = dict(handoff)
                     handoff["summary"] = _synth
-            handoff = _attach_typed_refusal_if_needed(handoff, calls)
             _log(ledger, actor, {"event": "turn", "kind": "done", "handoff": handoff})
             return TurnResult(True, _DONE,
                               _with_usage({"handoff": handoff, "calls": calls}, _tu))
@@ -3251,7 +3249,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             # ("status":"thinking") with the same zero-tool shape — apply the
             # same floor. After tools, prefer bare/auto-complete over no_code.
             if tool_calls_made > 0:
-                boot_msg = _bootstrap_incomplete(calls, allow)
+                boot_msg = _bootstrap_incomplete(calls, allow, actor)
                 if boot_msg is not None:
                     messages.append({"role": "user", "content": _parts(
                         f"[BOOTSTRAP INCOMPLETE] {boot_msg}"
@@ -3297,9 +3295,6 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     _log(ledger, actor, {"event": "done_blocked",
                                          "guardrail": block[:300]})
                     continue
-                bare_handoff = _attach_typed_refusal_if_needed(
-                    bare_handoff, calls,
-                )
                 return TurnResult(
                     True,
                     _DONE,
@@ -4464,7 +4459,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         "new_part", "ecad_new_schematic", "fw_new_project",
     })
     wrote = any(
-        c.get("ok") and c.get("tool") in _PRODUCTIVE_TOOLS for c in calls
+        not c.get("forced")
+        and c.get("ok")
+        and c.get("tool") in _PRODUCTIVE_TOOLS
+        for c in calls
     )
     # mega-24 rebind: PLAN layout skeleton spent 16× ledger_get (read-only thrash)
     # with zero ledger_note → max_iters fail. Diverse plan-read tools (≥3 calls,
@@ -4477,12 +4475,16 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     })
     n_plan_reads = sum(
         1 for c in calls
-        if c.get("ok") and c.get("tool") in _PLAN_READ_TOOLS
+        if not c.get("forced")
+        and c.get("ok")
+        and c.get("tool") in _PLAN_READ_TOOLS
     )
     if not wrote and n_plan_reads >= 3:
         diverse = {
             c.get("tool") for c in calls
-            if c.get("ok") and c.get("tool") in _PLAN_READ_TOOLS
+            if not c.get("forced")
+            and c.get("ok")
+            and c.get("tool") in _PLAN_READ_TOOLS
         }
         # ≥2 distinct plan-read tools, OR high-volume ledger_get thrash
         # (layout skeleton live: 16× successful ledger_get, zero writes).
@@ -4494,13 +4496,42 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             )
         ):
             wrote = True
-    boot_why = _bootstrap_incomplete(calls, allow)
+    boot_why = _bootstrap_incomplete(calls, allow, actor)
     bootstrapped_only = bool(boot_why) or (
         not wrote
         and any(c.get("ok") and c.get("tool") in _BOOTSTRAP_ONLY for c in calls)
     )
     if bootstrapped_only:
         wrote = False
+    if last_reason == _REFINE_CAP and wrote and not bootstrapped_only:
+        # The configured refinement ceiling stops further optional rework after
+        # a verified/saved product exists. Preserve the causal reason, but do not
+        # turn an already-built artifact into a failed run.
+        handoff = {
+            "status": "done",
+            "summary": (
+                f"Build retained after reaching the refinement limit "
+                f"({tool_calls_made} tool calls)."
+            ),
+            "outputs": {
+                "tool_calls": tool_calls_made,
+                "refinement_capped": True,
+                "stop_reason": _REFINE_CAP,
+            },
+        }
+        return TurnResult(
+            True,
+            _REFINE_CAP,
+            _with_usage(
+                {
+                    "handoff": handoff,
+                    "calls": calls,
+                    "tool_calls": tool_calls_made,
+                    "stop_reason": _REFINE_CAP,
+                },
+                _tu,
+            ),
+        )
     # mega-25 thrash rebind: BUILD DL3 hit budget after schematic+place+orphan
     # power with ZERO force-inject (find_part thrash burned the turn). Before
     # returning max_iters/no_code on an incomplete ECAD product chain, force-
@@ -4544,7 +4575,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         c.get("ok") and c.get("tool") in _PRODUCTIVE_TOOLS
                         for c in calls
                     )
-                    boot_why = _bootstrap_incomplete(calls, allow)
+                    boot_why = _bootstrap_incomplete(calls, allow, actor)
                     bootstrapped_only = bool(boot_why) or (
                         not wrote
                         and any(
@@ -4560,7 +4591,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         pass
     if (tool_calls_made > 0
             and _forced_tool_stop is None
-            and last_reason in (_RETRY, "phase_step_cap", _NOCODE, _GUARD_BLOCKED)
+            and last_reason in (_RETRY, "phase_step_cap", _NOCODE)
             and wrote):
         synth = {
             "status": "done",
@@ -4585,47 +4616,33 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 ),
             },
         }
-        # mega-24 rebind: multi-domain PLAN/BUILD soft gate requires delegate
-        # OR typed_refusal. Auto-complete after productive work without either
-        # was escalated as delegate_or_typed_refusal_required (n_plan thrash).
-        # Synthesise a minimal valid typed_refusal so the gate can pass when
-        # the model already did real plan/layout work but forgot the envelope.
-        had_delegate = any(
-            c.get("tool") == "delegate" and c.get("ok") is not False
-            for c in calls
-        )
-        if not had_delegate:
-            synth["outputs"]["typed_refusal"] = {
-                "reason": (
-                    "auto-complete after productive tool work without "
-                    "delegate spawn"
-                ),
-                "domains_considered": [
-                    "plan", "geometry", "assembly", "ecad", "firmware",
-                ],
-                "why_flat": (
-                    "Node ended after productive ledger/plan reads or product "
-                    "writes; staying flat for this attempt with synthesised "
-                    "typed refusal (mega-24)."
-                ),
-            }
-        _log(ledger, actor, {"event": "turn", "kind": "done",
-                             "handoff": synth, "auto": True})
-        return TurnResult(True, _DONE,
-                          _with_usage(
-                              {"handoff": synth, "calls": calls,
-                               "tool_calls": tool_calls_made,
-                               "auto_complete": True},
-                              _tu))
+        guard_block = _done_guardrail_block(
+            synth, ledger, actor or name, calls)
+        if guard_block:
+            # Synthetic handoffs are not privileged. They must satisfy the same
+            # product and HARD verification gates as model-authored finishes.
+            last_reason = _GUARD_BLOCKED
+            last_guard_block = guard_block
+        else:
+            _log(ledger, actor, {"event": "turn", "kind": "done",
+                                 "handoff": synth, "auto": True})
+            return TurnResult(True, _DONE,
+                              _with_usage(
+                                  {"handoff": synth, "calls": calls,
+                                   "tool_calls": tool_calls_made,
+                                   "auto_complete": True},
+                                  _tu))
     if tool_calls_made > 0 and last_reason in (_RETRY, "phase_step_cap"):
         # mega-6: still surface a structured handoff so parent join is not null.
         # Empty bootstrap (new_part / ecad_new_schematic / fw_new_project without
         # product mutators) is NOT product success — return non-success so the
         # node can retry instead of auto-done.
         status = (
-            "blocked" if bootstrapped_only or _forced_tool_stop else "done"
+            "blocked" if bootstrapped_only or _forced_tool_stop else "partial"
         )
-        ok_turn = not bootstrapped_only and _forced_tool_stop is None
+        # Successful calls are preserved as partial progress, not promoted to
+        # task completion merely because the loop hit a budget boundary.
+        ok_turn = False
         if not boot_why and bootstrapped_only:
             boot_why = (
                 "bootstrap opener without product mutator — not BUILD product "
@@ -10176,16 +10193,21 @@ def _ecad_sanitize_wire_args(args: dict, calls: list) -> dict:
 # ledger_note is in _PRODUCTIVE_TOOLS (it IS the deliverable for PLAN nodes),
 # so `wrote` was True and nothing corrected it. The harness reported a CAM
 # program / FEA study / drawing package that does not exist.
-_ARTIFACT_PRODUCT_GATES: tuple[tuple[frozenset, str], ...] = (
-    (frozenset({"cam_generate", "cam_post"}),
+_ARTIFACT_PRODUCT_GATES: tuple[
+    tuple[frozenset[str], frozenset[str], str], ...
+] = (
+    (frozenset({"cam_programmer"}),
+     frozenset({"cam_generate", "cam_post"}),
      "no toolpath exists — cam_generate/cam_post never ran. A CAM role cannot "
      "declare done off ledger/read calls alone: cam_generate, then cam_simulate "
      "and cam_post."),
-    (frozenset({"run_fea_static", "run_fea_adaptive", "run_fea_modal", "run_cfd_flow"}),
+    (frozenset({"sim_engineer"}),
+     frozenset({"run_fea_static", "run_fea_adaptive", "run_fea_modal", "run_cfd_flow"}),
      "no study was run — run_fea_static/run_fea_adaptive/run_fea_modal/run_cfd_flow "
      "never ran. A simulation role cannot declare done off ledger/read calls alone: "
      "run the study, then describe_results."),
-    (frozenset({"make_drawing", "export_drawing"}),
+    (frozenset({"drawing_detailer"}),
+     frozenset({"make_drawing", "export_drawing"}),
      "no drawing sheet exists — make_drawing/export_drawing never ran. A drawing "
      "role cannot declare done off ledger/read calls alone: make_drawing, place "
      "the views, then export_drawing."),
@@ -10261,6 +10283,7 @@ def _empty_product_handoff_block(
 def _bootstrap_incomplete(
     calls: list,
     allow: set[str] | None,
+    actor: str | None = None,
 ) -> str | None:
     """Return a human reason when tools only opened a doc without product.
 
@@ -10331,8 +10354,9 @@ def _bootstrap_incomplete(
     # produce an FEA study.
     if not any(c.get("ok") and c.get("tool") in _DELIVERED_PRODUCT_TOOLS
                for c in calls):
-        for product, remedy in _ARTIFACT_PRODUCT_GATES:
-            if (product & allow_set) and not (ok_tools & product):
+        actor_role = str(actor or "").strip().split(" ", 1)[0]
+        for roles, product, remedy in _ARTIFACT_PRODUCT_GATES:
+            if actor_role in roles and not (ok_tools & product):
                 return remedy
     return None
 
@@ -10342,18 +10366,21 @@ def _done_guardrail_block(handoff: dict, ledger, actor: str,
     """WI-11/13/14 done intercept. Return model-visible block message or None."""
     try:
         from services.agent import guardrails as _gr  # noqa: PLC0415
-    except Exception:  # noqa: BLE001 — ImportError-safe: treat as profile C no-op
-        return None
+    except Exception as exc:  # noqa: BLE001
+        return f"HARD guardrail unavailable: {type(exc).__name__}: {exc}"
     try:
+        actor_role = str(actor or "").strip().split(" ", 1)[0]
+        skip = {"orphan_sketch"} if actor_role in {"sketcher", "sketch2d"} else set()
         verdict = _gr.check_done(
             handoff if isinstance(handoff, dict) else {},
             ledger=ledger, calls=calls, actor=actor or "agent_turn",
+            skip=skip,
         )
         if verdict.ok:
             return None
         return verdict.message or verdict.reason or _gr.MSG_VERIFY_BATTERY
-    except Exception:  # noqa: BLE001 — never break the turn on guardrail bugs
-        return None
+    except Exception as exc:  # noqa: BLE001
+        return f"HARD guardrail failed: {type(exc).__name__}: {exc}"
 
 
 def _pre_dispatch_guardrail(tool: str, args: dict, ledger, actor: str) -> str | None:

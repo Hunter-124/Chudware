@@ -265,6 +265,7 @@ def test_closed_malformed_live_add_features_is_reemitted_and_runs():
         _CALL % "describe_project",
         _CLOSED_MALFORMED_ADD_FEATURES,
         _CLOSED_FIXED_ADD_FEATURES,
+        _CALL % "verify_battery",
         "Done - the snap gap is cut.",
     ])
     res = at.run_turn(
@@ -315,6 +316,7 @@ def test_stray_closer_directive_dispatches_without_a_nudge():
 
     p = _ScriptedProvider([
         _STRAY_BRACE_ADD_FEATURES,
+        _CALL % "verify_battery",
         "Done - the holster outline sketch is in.",
     ])
     res = at.run_turn(

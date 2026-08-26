@@ -661,6 +661,8 @@ def classification_event(
     return "agent.classification", payload
 
 
+
+
 def role_event(
     node_id: str, *,
     role: str,
@@ -671,13 +673,7 @@ def role_event(
     parent_id: str | None = None,
     actor: str | None = None,
 ) -> tuple[str, dict]:
-    """Emit a real role change (2026-07-27 additive).
-
-    Fired only when the agent actually ADOPTS a different role via
-    ``adopt_role`` — never for the default first-turn ``general_agent``
-    entry. The GUI reveals its Routing card on this event; the per-request
-    ``agent.classification`` telemetry alone keeps the card hidden.
-    """
+    """Build the frozen ``agent.role`` event for replay/import compatibility."""
     payload = _linkage(node_id, span_id=span_id or new_span_id(),
                        parent_id=parent_id, actor=actor)
     payload.update({

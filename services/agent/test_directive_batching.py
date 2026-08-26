@@ -37,7 +37,7 @@ class _ScriptedProvider:
 
 
 _ALLOW = ["ledger_get", "ledger_note", "describe_project", "workspace_status",
-          "new_part", "add_features", "render_part", "export_part"]
+          "new_part", "add_features", "render_part", "export_part", "verify_battery"]
 
 _DONE = ('```json\n{"done": true, "handoff": {"status": "done", '
          '"summary": "ok"}}\n```')
@@ -98,7 +98,8 @@ def test_a_batch_runs_every_call_on_one_completion():
     p = _ScriptedProvider([
         _batch(_fence("new_part", name="holster"),
                _fence("add_features", doc_id="d", ops=[{"op": "add_feature"}]),
-               _fence("render_part", doc_id="d")),
+               _fence("render_part", doc_id="d"),
+               _fence("verify_battery", doc_id="d")),
         _DONE,
     ])
 
@@ -111,9 +112,10 @@ def test_a_batch_runs_every_call_on_one_completion():
                       max_tool_calls=12, tool_dispatch=dispatch,
                       actor="general_agent")
     assert res.success is True, (res.stop_reason, res.result)
-    assert [t for t, _ in seen] == ["new_part", "add_features", "render_part"]
-    # All three rode the SAME completion. One-per-reply billed three.
-    assert [n for _, n in seen] == [1, 1, 1], seen
+    assert [t for t, _ in seen] == [
+        "new_part", "add_features", "render_part", "verify_battery"]
+    # All four rode the SAME completion.
+    assert [n for _, n in seen] == [1, 1, 1, 1], seen
 
 
 def test_a_drained_call_does_not_replay_the_models_words():
@@ -175,7 +177,8 @@ def test_a_finish_envelope_after_calls_still_finishes():
     seen = []
     p = _ScriptedProvider([
         _batch(_fence("new_part", name="p"),
-               _fence("add_features", doc_id="d", ops=[{"op": "add_feature"}]))
+               _fence("add_features", doc_id="d", ops=[{"op": "add_feature"}]),
+               _fence("verify_battery", doc_id="d"))
         + "\n\n" + _DONE,
         _DONE,
     ])
@@ -187,8 +190,8 @@ def test_a_finish_envelope_after_calls_still_finishes():
     res = at.run_turn("build a plate", p, allowed_tools=_ALLOW,
                       max_tool_calls=12, tool_dispatch=dispatch,
                       actor="general_agent")
-    assert [t for t, _ in seen] == ["new_part", "add_features"], seen
-    assert [n for _, n in seen] == [1, 1], seen
+    assert [t for t, _ in seen] == ["new_part", "add_features", "verify_battery"], seen
+    assert [n for _, n in seen] == [1, 1, 1], seen
     assert res.success is True, (res.stop_reason, res.result)
 
 

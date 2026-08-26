@@ -128,8 +128,8 @@ def tool_catalog() -> dict[str, Any]:
     ``{name, family, description, resolved, guidance}``:
 
       * family / name come from the live ``tool_registry`` (after warm_catalog),
-        plus the agent pseudo-tools (delegate, adopt_role) that have no registry
-        callable outside a mission;
+        plus agent pseudo-tools such as delegate that have no registry callable
+        outside a mission;
       * description is the live docstring's first paragraph collapsed to one
         line — exactly what the panel shows as "Live (no override)";
       * guidance is the built-in curated entry (tool_guidance) the panel shows

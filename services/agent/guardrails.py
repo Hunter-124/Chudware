@@ -50,8 +50,8 @@ DESTRUCTIVE_TOOLS: frozenset[str] = frozenset({
 
 # Tools that mutate geometry (battery-before-done only when one of these succeeded).
 MUTATING_TOOLS: frozenset[str] = frozenset({
-    "add_features", "doc_apply_ops", "new_part", "new_assembly",
-    "asm_add_component", "asm_mate", "part_place", "set_material",
+    "add_features", "doc_apply_ops", "edit_feature", "new_part", "new_assembly",
+    "asm_add_component", "asm_mate", "solve_mates", "part_place", "set_material",
     "delete_feature", "remove_feature", "regen_resolve",
     "sketch3d_add", "sketch3d_edit", "convert_face_to_sketch",
 }) | DESTRUCTIVE_TOOLS
@@ -364,17 +364,18 @@ def battery_evidence(ledger: Any, calls: list[dict] | None = None) -> Optional[d
       * criterion_result with check_tool=verify_battery and PASS
       * explicit battery_result events
     """
-    # Live call list first (same turn, may not be on ledger yet for in-flight)
+    # Live call list first (same turn, may not be on ledger yet for in-flight).
+    # Evidence is valid only when it occurs after the last mutation.
     if calls:
         for c in reversed(calls):
-            if str(c.get("tool") or "") != "verify_battery":
-                continue
-            if not c.get("ok", True):
+            tool = str(c.get("tool") or "")
+            if c.get("ok") and is_mutating_tool(tool):
+                return None
+            if tool != "verify_battery" or not c.get("ok", True):
                 continue
             res = c.get("result")
             if _battery_result_ok(res):
                 return {"source": "tool_call", "result": res}
-
     for ev in reversed(_iter_ledger_events(ledger)):
         kind = _event_kind(ev)
         p = _payload(ev)
@@ -400,6 +401,8 @@ def battery_evidence(ledger: Any, calls: list[dict] | None = None) -> Optional[d
             tool = str(p.get("tool") or p.get("name") or "")
             res = p.get("result")
             ok = bool(p.get("ok", True))
+        if is_mutating_tool(tool) and ok:
+            return None
         if tool == "verify_battery" and ok and _battery_result_ok(res):
             return {"source": "ledger_tool_call", "result": res}
     return None
@@ -413,28 +416,25 @@ def _battery_result_ok(res: Any) -> bool:
     that still look like success also pass (best-effort).
     """
     if res is None:
-        # Tool ran with no captured body — treat as ran (ok flag already checked).
-        return True
+        return False
     if isinstance(res, str):
         s = res.strip()
         if not s:
-            return True
+            return False
         if s.startswith("{") or s.startswith("["):
             try:
                 import json as _json  # noqa: PLC0415
                 res = _json.loads(s)
             except Exception:  # noqa: BLE001
-                # Truncated / non-JSON text: look for failure markers.
-                low = s.lower()
-                if '"ok": false' in low or '"ok":false' in low:
-                    return False
-                return True
+                return False
         else:
-            low = s.lower()
-            return "fail" not in low or "pass" in low
-    if not isinstance(res, dict):
-        return True
+            low = s.casefold()
+            return low in {"ok", "pass", "passed", "all checks passed"}
+    if not isinstance(res, dict) or not res:
+        return False
     if res.get("ok") is False:
+        return False
+    if not any(key in res for key in ("ok", "scores", "findings", "checks")):
         return False
     findings = res.get("findings")
     if isinstance(findings, list):
@@ -462,6 +462,8 @@ def interference_evidence(ledger: Any, calls: list[dict] | None = None) -> Optio
     if calls:
         for c in reversed(calls):
             tool = str(c.get("tool") or "")
+            if c.get("ok") and is_mutating_tool(tool):
+                return None
             if tool == "check_interference" and c.get("ok", True):
                 if _interference_result_clean(c.get("result")):
                     return {"source": "tool_call", "result": c.get("result")}
@@ -486,6 +488,8 @@ def interference_evidence(ledger: Any, calls: list[dict] | None = None) -> Optio
             tool = str(p.get("tool") or p.get("name") or "")
             res = p.get("result")
             ok = bool(p.get("ok", True))
+        if is_mutating_tool(tool) and ok:
+            return None
         if not ok:
             continue
         if tool == "check_interference" and _interference_result_clean(res):
@@ -497,19 +501,22 @@ def interference_evidence(ledger: Any, calls: list[dict] | None = None) -> Optio
 
 def _interference_result_clean(res: Any) -> bool:
     if res is None:
-        return True
+        return False
     if isinstance(res, str):
         try:
             import json as _json  # noqa: PLC0415
             if res.strip().startswith("{"):
                 res = _json.loads(res)
             else:
-                low = res.lower()
-                return "interference" not in low or "0" in low or "none" in low or "ok" in low
+                low = res.strip().casefold()
+                return low in {
+                    "ok", "pass", "passed", "clean", "no interference",
+                    "no interferences", "0 interferences",
+                }
         except Exception:  # noqa: BLE001
-            return "fail" not in res.lower()
-    if not isinstance(res, dict):
-        return True
+            return False
+    if not isinstance(res, dict) or not res:
+        return False
     if res.get("ok") is False:
         return False
     # Common shapes: pairs / interferences / clashes with volume > 0

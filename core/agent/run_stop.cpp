@@ -15,6 +15,11 @@
 
 namespace chudware {
 namespace agent {
+json worker_actor_from_options(const json& options) {
+    if (!options.is_object()) return json(nullptr);
+    return options.value("_chudware_actor", json(nullptr));
+}
+
 // Sanitize a model-chosen part name into a short filename-safe display title.
 // Illegal path chars stripped; whitespace collapsed; capped at 48 chars.
 std::string sanitize_part_name(std::string name) {
@@ -76,9 +81,12 @@ WorkerStop classify_worker_stop(bool crashed, bool timed_out, bool reached_worke
     // reports a signal, and the crash is the more specific fact.
     if (crashed) return {"worker_crash", "failed", true};
     if (timed_out) return {"worker_timeout", "failed", true};
-    // The offline pre-flight is the ONLY path that never reaches the worker, so it is
-    // the only one that can honestly promise the model is untouched.
-    return {"non_modeling_request", "blocked", reached_worker};
+    // Only a pre-flight refusal that never reached the worker is genuinely a
+    // non-modeling request. Any worker-side preflight/transport failure is a
+    // harness failure; preserving that distinction keeps auth, actor, provider,
+    // and serialization defects out of the user's request-classification bucket.
+    if (!reached_worker) return {"non_modeling_request", "blocked", false};
+    return {"worker_error", "failed", true};
 }
 
 }  // namespace agent

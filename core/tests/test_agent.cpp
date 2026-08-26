@@ -1979,6 +1979,23 @@ TEST_CASE("eng_firm selects cheapest in-scope token bid") {
 }
 
 
+TEST_CASE("desktop worker turns do not manufacture a billing actor") {
+    using chudware::agent::worker_actor_from_options;
+
+    CHECK(worker_actor_from_options(json::object()).is_null());
+    CHECK(worker_actor_from_options(json{{"mode", "agent"}}).is_null());
+
+    const json actor{{"email", "owner@example.com"},
+                     {"plan", "studio"},
+                     {"credits_remaining", 10},
+                     {"key_source", "byok"}};
+    CHECK(worker_actor_from_options(json{{"_chudware_actor", actor}}) == actor);
+    // An explicitly supplied malformed object must still reach worker validation;
+    // treating it as actor-free would cross the desktop/web trust boundary.
+    CHECK(worker_actor_from_options(json{{"_chudware_actor", json::object()}})
+          .is_object());
+}
+
 TEST_CASE("a silent worker is not a non-modeling request") {
     // run-42508173312214 (2026-07-29): a keychain modelling turn built five real,
     // auto-persisted features, then stopped responding. The host filed it as
@@ -2012,11 +2029,11 @@ TEST_CASE("a silent worker is not a non-modeling request") {
     CHECK(offline.status == "blocked");
     CHECK_FALSE(offline.may_have_changed_the_model);
 
-    // Reached the worker and it declined for a real reason: still not a crash, but it
-    // may already have changed the model, so it must not claim otherwise.
+    // A reached worker that rejects its request is a harness failure, not evidence
+    // that the user's request was non-modeling.
     const auto declined = classify_worker_stop(false, false, true);
-    CHECK(declined.stop_reason == "non_modeling_request");
-    CHECK(declined.status == "blocked");
+    CHECK(declined.stop_reason == "worker_error");
+    CHECK(declined.status == "failed");
     CHECK(declined.may_have_changed_the_model);
 }
 

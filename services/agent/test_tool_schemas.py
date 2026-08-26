@@ -169,8 +169,8 @@ class TestRenderToolsBlock:
 
     def test_pseudo_tools_have_fallback_schemas(self):
         # Advertised pseudo-tools must never render "# schema unavailable".
-        for pseudo in ("delegate", "adopt_role", "enable_tools",
-                       "list_tool_categories", "design_recipe"):
+        for pseudo in ("delegate", "enable_tools", "list_tool_categories",
+                       "design_recipe"):
             text, meta = render_tools_block(
                 [pseudo], resolver=lambda _t: None, include_category_menu=False)
             assert meta["unresolved"] == [], (pseudo, meta)

@@ -494,26 +494,10 @@ def test_force_first_tool_on_zero_tools():
     assert calls[0].get("forced") is True
 
 
-def test_attach_typed_refusal_on_done_with_tools():
-    from services.agent import agent_turn as at
-
-    ho = {"status": "done", "summary": "planned", "outputs": {}}
-    calls = [
-        {"tool": "dag_plan", "ok": True},
-        {"tool": "buildgraph_plan", "ok": True},
-    ]
-    out = at._attach_typed_refusal_if_needed(ho, calls)
-    assert isinstance(out["outputs"].get("typed_refusal"), dict)
-    tr = out["outputs"]["typed_refusal"]
-    assert tr.get("reason")
-    assert tr.get("domains_considered")
-    assert tr.get("why_flat")
-    # With delegate: leave alone
-    ho2 = {"status": "done", "outputs": {}}
-    out2 = at._attach_typed_refusal_if_needed(
-        ho2, [{"tool": "delegate", "ok": True}],
-    )
-    assert "typed_refusal" not in (out2.get("outputs") or {})
+def test_harness_does_not_fabricate_typed_refusal():
+    """Multi-domain refusal evidence must be model-authored or absent."""
+    handoff = {"status": "done", "summary": "planned", "outputs": {}}
+    assert "typed_refusal" not in handoff["outputs"]
 
 
 def test_plan_ruling_kind_alias():
@@ -573,8 +557,8 @@ def _dispatch_ok(tool, args):
     return {"ok": True}
 
 
-def test_a2_live_shape_zero_tool_prose_force_and_confirm():
-    """n_layout/n_spec: first reply ~18-29 tokens prose, zero tools → force → done."""
+def test_a2_live_shape_zero_tool_prose_never_fabricates_refusal():
+    """A forced opener may salvage the turn, but cannot invent routing evidence."""
     from services.agent import agent_turn as at
 
     p = _ScriptedProvider(["Understood. I will layout the skeleton."])
@@ -593,7 +577,7 @@ def test_a2_live_shape_zero_tool_prose_force_and_confirm():
     calls = (res.result or {}).get("calls") or []
     assert any(c.get("forced") for c in calls), calls
     ho = (res.result or {}).get("handoff") or {}
-    assert (ho.get("outputs") or {}).get("typed_refusal")
+    assert "typed_refusal" not in (ho.get("outputs") or {})
 
 
 def test_a2_live_shape_junk_json_zero_tool_force_and_confirm():
@@ -648,8 +632,8 @@ def test_a2_live_shape_force_then_junk_json_bare_completes():
     assert res.stop_reason == "confirmed"
 
 
-def test_a2_live_shape_n_plan_formal_done_gets_typed_refusal_gate():
-    """n_plan tools + formal done without typed_refusal must pass multi-domain gate."""
+def test_a2_live_shape_n_plan_formal_done_hits_typed_refusal_gate():
+    """Formal multi-domain done without delegate/refusal must retry honestly."""
     from services.agent import agent_turn as at
     from services.dag import node_runner as nr
 
@@ -674,7 +658,7 @@ def test_a2_live_shape_n_plan_formal_done_gets_typed_refusal_gate():
     )
     assert res.success is True
     tr = ((res.result or {}).get("handoff") or {}).get("outputs") or {}
-    assert isinstance(tr.get("typed_refusal"), dict), tr
+    assert "typed_refusal" not in tr
 
     class _R:
         success = True
@@ -704,5 +688,5 @@ def test_a2_live_shape_n_plan_formal_done_gets_typed_refusal_gate():
         "retry_remaining": 2,
     }
     verdict, out = nr.run(node, pack, agent_fn=lambda r, p: _R())
-    assert verdict == nr.VERDICT_DONE, (verdict, out)
-    assert out["data"].get("stop_reason") != "delegate_or_typed_refusal_required"
+    assert verdict == nr.VERDICT_RETRY, (verdict, out)
+    assert out["data"].get("stop_reason") == "delegate_or_typed_refusal_required"

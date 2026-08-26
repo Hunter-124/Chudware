@@ -130,8 +130,6 @@ struct Settings {
     // Main-chat general_agent gets the full tool catalog (default on).
     bool directAgentFullTools = true;
     bool memoryEnabled = true;   // project SQLite memory under .plm/memory.db
-    // 0=supervised (default): only main may adopt_role; 1=free: subagents may adopt too.
-    int roleAdoption = 0;
     int memoryTokenBudget = 400; // max tokens injected from project memory per turn
     // Copilot composer mode: Agent | Plan | Swarm | Edit | Ask. Persisted as "copilot_mode".
     // Values match AppState::aiInteraction / CopilotMode.

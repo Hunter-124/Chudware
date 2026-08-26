@@ -1,13 +1,6 @@
-"""Role catalog briefs + adoption policy for the main harness.
-
-The main (root) agent may freely adopt roles or spawn subagents with them.
-Subagents may spawn children with other roles, but may not *adopt* (switch their
-own card) unless ``agent.role_adoption`` is ``free`` — under ``supervised``
-(default) they must request adoption via the advisor / main session.
-"""
+"""Compact catalog of canonical roles available for delegation."""
 from __future__ import annotations
-
-from typing import Any, Iterable
+from typing import Iterable
 
 # Brief one-liners for the system prompt (id → when to use).
 # Keep short; full cards live in services/agent/roles/*.yaml.
@@ -47,34 +40,6 @@ ROLE_BRIEFS: dict[str, str] = {
 PRIMARY_BUILD_ROLES = ("model3d", "sketch2d", "feature_modeler", "sketcher", "reviewer", "advisor", "memory")
 
 
-def get_role_adoption_mode(cfg: dict | None = None) -> str:
-    """``supervised`` (default) | ``free``.
-
-    supervised — only root/main may adopt_role; subagents request via advisor.
-    free — any depth may adopt_role (still subject to max_subagent_depth for spawns).
-    """
-    try:
-        from services.agent import config as agent_config  # noqa: PLC0415
-        c = cfg if isinstance(cfg, dict) else agent_config.load_config()
-    except Exception:  # noqa: BLE001
-        c = cfg if isinstance(cfg, dict) else {}
-    agent = c.get("agent") if isinstance(c.get("agent"), dict) else {}
-    raw = ""
-    if isinstance(agent, dict) and "role_adoption" in agent:
-        raw = str(agent.get("role_adoption") or "")
-    elif isinstance(c, dict) and "role_adoption" in c:
-        raw = str(c.get("role_adoption") or "")
-    raw = raw.strip().lower()
-    if raw in ("free", "free_reign", "free-reign", "unrestricted"):
-        return "free"
-    return "supervised"
-
-
-def can_adopt_role(*, is_root: bool, depth: int = 0, cfg: dict | None = None) -> bool:
-    """True if this agent may switch its own role card mid-run."""
-    if is_root or depth <= 0:
-        return True
-    return get_role_adoption_mode(cfg) == "free"
 
 
 def format_role_catalog_block(
@@ -102,23 +67,12 @@ def format_role_catalog_block(
             )
     lines: list[str] = []
     if include_header:
-        lines.append("## Available roles (delegate or adopt)")
+        lines.append("## Available roles (delegate)")
         lines.append(
-            "Main session: you may adopt a role (tools+prompt) for yourself OR "
-            "delegate(role=..., brief=...) to a subagent. Prefer model3d for 3D parts "
-            "(it calls sketch2d for profiles); use sketch2d alone for pure 2D/ECAD drawings."
+            "Use delegate(role=..., brief=...) for an independent specialist. "
+            "Prefer model3d for 3D parts (it calls sketch2d for profiles); use "
+            "sketch2d alone for pure 2D/ECAD drawings."
         )
-        mode = get_role_adoption_mode()
-        if mode == "supervised":
-            lines.append(
-                "Subagents: may spawn children with other roles via delegate, but must NOT "
-                "adopt_role themselves — request a role change via the advisor / main session "
-                "(role_adoption=supervised)."
-            )
-        else:
-            lines.append(
-                "Subagents: may adopt_role freely and may spawn children (role_adoption=free)."
-            )
         lines.append("Catalog:")
     n = 0
     for rid in ids:
@@ -150,7 +104,6 @@ def harness_context_block() -> str:
 - Verify-before-done: after mutations run describe_part / measure / verify_battery / check_sketch as appropriate.
 - Project memory: durable notes under the PLM project `.plm/memory.db` (token-budgeted recall each turn).
 - Roles: specialized YAML cards (see the role catalog). `delegate(role, brief, budget_tokens)` spawns a subagent — nesting capped by agent.max_subagent_depth.
-- Adoption: main may switch its own role with `adopt_role`; subagents only if role_adoption=free, else ask advisor/main.
 - Ledger / mission: dimensions and decisions go to the ledger with provenance — never recall a number without a driver.
 - Docs: user/GUI-owned docs are sacred; agent-minted docs can be cleaned up. Prefer editing the active part.
 """

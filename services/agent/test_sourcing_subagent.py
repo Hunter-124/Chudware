@@ -213,7 +213,7 @@ class TestSourcingSubagent:
                                budget_tokens=granted)
             assert node["result"]["tool_calls"] == max(20, soft * 2), granted
 
-    def test_unknown_role_keeps_bare_behavior(self, env):
+    def test_unknown_role_is_rejected_before_child_execution(self, env):
         provider = _CapturingProvider([
             _fence({"done": True, "handoff": {"summary": "ok"}}),
         ])
@@ -221,12 +221,9 @@ class TestSourcingSubagent:
         md = _dispatch(env, provider, tree)
         node = md.delegate(role="mystery_role", brief="do a thing",
                            budget_tokens=4000)
-        assert node["ok"] is True and node["subagent_status"] == "done"
-        # No role card → no card prompt and no card tools. (Mode-unioned
-        # SHARED_DEFAULT_TOOLS may still render a [TOOLS] slot — that is the
-        # shipped copilot-mode behavior, not a role card.)
-        assert "SOURCING SPECIALIST" not in provider.systems[0]
-        assert "part_source(need: str" not in provider.systems[0]
+        assert node["ok"] is False
+        assert node["reason"] == "invalid_role"
+        assert provider.systems == []
 
     def test_role_card_loads_and_validates(self):
         from services.agent import roles

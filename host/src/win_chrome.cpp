@@ -111,14 +111,18 @@ void tick(GLFWwindow*, HitLayout*) {}
 }  // namespace chrome
 
 #else  // ---------------------------------------------------------------------
-       // Non-Windows (X11/XWayland): borderless window whose own ImGui title bar is the
-       // only chrome. The OS frame is removed (GLFW_DECORATED=false, set at create time);
-       // this code reimplements what the Windows WndProc gets for free — caption drag,
-       // edge/corner resize, and double-click-to-maximize — by polling the mouse each
-       // frame and moving/sizing the window via GLFW. Needs a backend that lets a client
-       // position itself: app.cpp forces GLFW_PLATFORM_X11 (Wayland forbids self-move).
+       // Non-Windows: keep the custom borderless chrome. On Linux/X11, hand title-bar
+       // and border grabs to the window manager so it owns snap, resize, and tear-off.
+       // Other backends retain the manual GLFW fallback below.
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+#define GLFW_EXPOSE_NATIVE_X11
+#include <GLFW/glfw3native.h>
+#ifdef None
+#undef None
+#endif
+#endif
 
 namespace chrome {
 namespace {
@@ -132,17 +136,22 @@ double g_startSx = 0, g_startSy = 0;  // cursor screen pos at grab
 int g_startX = 0, g_startY = 0, g_startW = 0, g_startH = 0;
 bool g_prevDown = false;
 double g_lastCaptionClick = -1.0;
-// Maximized/snapped tear-off: caption grabbed while maximized. We DON'T un-maximize on the grab —
-// only a deliberate downward pull (dy > kTearoff) restores the window and drops it under the cursor,
-// Windows-style. Sideways motion keeps it snapped.
+// Manual-fallback maximized tear-off state: keep the window maximized until a deliberate
+// downward pull (dy > kTearoff), then restore it under the cursor Windows-style.
 bool g_maxedPending = false;
 double g_grabRelX = 0.5;   // fractional x of the grab across the maximized width (0..1)
 double g_grabCy = 0.0;     // cursor y within the caption at grab
 
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+Display* g_xDisplay = nullptr;
+Window g_xWindow = 0;
+Atom g_moveResizeAtom = 0;
+#endif
+
 bool maximized(GLFWwindow* w) { return glfwGetWindowAttrib(w, GLFW_MAXIMIZED) != 0; }
 
-// Cursor position in SCREEN space = window position + window-relative cursor. Stable to use
-// across moves: as the window moves under a held-still cursor, the relative term compensates.
+// Screen-space cursor tracking used only by the manual fallback. The relative term
+// compensates as the window moves under a held-still cursor.
 void cursorScreen(GLFWwindow* w, double& sx, double& sy) {
     double cx, cy;
     glfwGetCursorPos(w, &cx, &cy);
@@ -152,13 +161,85 @@ void cursorScreen(GLFWwindow* w, double& sx, double& sy) {
     sy = wy + cy;
 }
 
+// Standard _NET_WM_MOVERESIZE directions from the EWMH specification.
+enum WmDirection {
+    kWmSizeTopLeft = 0,
+    kWmSizeTop = 1,
+    kWmSizeTopRight = 2,
+    kWmSizeRight = 3,
+    kWmSizeBottomRight = 4,
+    kWmSizeBottom = 5,
+    kWmSizeBottomLeft = 6,
+    kWmSizeLeft = 7,
+    kWmMove = 8,
+};
+
+int wmDirection(int edge) {
+    if ((edge & (kTop | kLeft)) == (kTop | kLeft)) return kWmSizeTopLeft;
+    if (edge == kTop) return kWmSizeTop;
+    if ((edge & (kTop | kRight)) == (kTop | kRight)) return kWmSizeTopRight;
+    if (edge == kRight) return kWmSizeRight;
+    if ((edge & (kBottom | kRight)) == (kBottom | kRight)) return kWmSizeBottomRight;
+    if (edge == kBottom) return kWmSizeBottom;
+    if ((edge & (kBottom | kLeft)) == (kBottom | kLeft)) return kWmSizeBottomLeft;
+    return kWmSizeLeft;
+}
+
+bool beginWmMoveResize(GLFWwindow* w, int direction, double cx, double cy) {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    if (!g_xDisplay || !g_xWindow || !g_moveResizeAtom) return false;
+
+    int wx = 0, wy = 0;
+    glfwGetWindowPos(w, &wx, &wy);
+
+    XEvent event{};
+    event.xclient.type = ClientMessage;
+    event.xclient.display = g_xDisplay;
+    event.xclient.window = g_xWindow;
+    event.xclient.message_type = g_moveResizeAtom;
+    event.xclient.format = 32;
+    event.xclient.data.l[0] = static_cast<long>(wx + cx);
+    event.xclient.data.l[1] = static_cast<long>(wy + cy);
+    event.xclient.data.l[2] = direction;
+    event.xclient.data.l[3] = 1;  // left mouse button
+    event.xclient.data.l[4] = 1;  // normal application source
+
+    XUngrabPointer(g_xDisplay, CurrentTime);
+    const bool sent =
+        XSendEvent(g_xDisplay, DefaultRootWindow(g_xDisplay), False,
+                   SubstructureRedirectMask | SubstructureNotifyMask, &event) != 0;
+    XFlush(g_xDisplay);
+    return sent;
+#else
+    (void)w;
+    (void)direction;
+    (void)cx;
+    (void)cy;
+    return false;
+#endif
+}
+
 }  // namespace
 
 void install(GLFWwindow* win, HitLayout* layout) {
     (void)layout;
-    // Belt-and-suspenders: app.cpp sets the GLFW_DECORATED=false hint before window creation
-    // (the reliable path); assert it here too in case a WM ignored the hint.
+    // The creation hint is the reliable path; keep this as a safeguard if a WM ignored it.
     glfwSetWindowAttrib(win, GLFW_DECORATED, GLFW_FALSE);
+
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    g_xDisplay = nullptr;
+    g_xWindow = 0;
+    g_moveResizeAtom = 0;
+    if (glfwGetPlatform() == GLFW_PLATFORM_X11) {
+        Display* display = glfwGetX11Display();
+        const Window window = display ? glfwGetX11Window(win) : 0;
+        if (display && window) {
+            g_xDisplay = display;
+            g_xWindow = window;
+            g_moveResizeAtom = XInternAtom(display, "_NET_WM_MOVERESIZE", False);
+        }
+    }
+#endif
 }
 
 void tick(GLFWwindow* win, HitLayout* layout) {
@@ -186,12 +267,16 @@ void tick(GLFWwindow* win, HitLayout* layout) {
             if (cy >= wh - B) edge |= kBottom;
         }
         if (edge) {
-            g_mode = Mode::Resize;
-            g_edge = edge;
-            cursorScreen(win, g_startSx, g_startSy);
-            glfwGetWindowPos(win, &g_startX, &g_startY);
-            g_startW = ww;
-            g_startH = wh;
+            // A successful EWMH request transfers this entire grab to the WM. Leave g_mode
+            // untouched so tick() never also runs the client-side resize loop.
+            if (!beginWmMoveResize(win, wmDirection(edge), cx, cy)) {
+                g_mode = Mode::Resize;
+                g_edge = edge;
+                cursorScreen(win, g_startSx, g_startSy);
+                glfwGetWindowPos(win, &g_startX, &g_startY);
+                g_startW = ww;
+                g_startH = wh;
+            }
         } else if (cy < H && !inMenu) {
             // Draggable caption. A second click within 400ms toggles maximize.
             const double now = glfwGetTime();
@@ -203,16 +288,20 @@ void tick(GLFWwindow* win, HitLayout* layout) {
                 g_lastCaptionClick = -1.0;
             } else {
                 g_lastCaptionClick = now;
-                g_mode = Mode::Drag;
-                cursorScreen(win, g_startSx, g_startSy);
-                glfwGetWindowPos(win, &g_startX, &g_startY);
-                if (maxed) {
-                    // Snapped/maximized: arm the tear-off but stay put until the user pulls DOWN.
-                    g_maxedPending = true;
-                    g_grabRelX = ww > 0 ? cx / (double)ww : 0.5;
-                    g_grabCy = cy;
-                } else {
-                    g_maxedPending = false;
+                // The WM handles normal movement, snap previews, and maximized tear-off.
+                // Only backends without usable X11 native handles enter the manual fallback.
+                if (!beginWmMoveResize(win, kWmMove, cx, cy)) {
+                    g_mode = Mode::Drag;
+                    cursorScreen(win, g_startSx, g_startSy);
+                    glfwGetWindowPos(win, &g_startX, &g_startY);
+                    if (maxed) {
+                        // Fallback tear-off stays put until the user pulls downward.
+                        g_maxedPending = true;
+                        g_grabRelX = ww > 0 ? cx / (double)ww : 0.5;
+                        g_grabCy = cy;
+                    } else {
+                        g_maxedPending = false;
+                    }
                 }
             }
         }

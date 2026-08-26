@@ -1732,10 +1732,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   if (!glfwInit())
     return 1;
 #elif !defined(_WIN32)
-  // The borderless custom chrome (chrome::tick drag/resize) needs a backend
-  // where a client can position itself; Wayland forbids that, so prefer X11
-  // (XWayland). Fall back to the default platform if X11 isn't available (the
-  // window stays borderless but can't self-move).
+  // Native snap/tear-off for the borderless custom chrome is delegated through
+  // X11's EWMH move/resize protocol. Prefer X11 (or XWayland) because Wayland
+  // intentionally exposes no client-side API for starting those compositor grabs;
+  // fall back to the default platform with the manual, non-snapping chrome path.
   glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
   if (!glfwInit()) {
     glfwInitHint(GLFW_PLATFORM, GLFW_ANY_PLATFORM);

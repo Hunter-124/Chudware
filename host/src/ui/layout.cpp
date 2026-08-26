@@ -29,6 +29,7 @@
 #include "icons.h"              // getIcon / IconUV
 #include "metrics.h"            // dockRightTarget (command-dialog default anchor)
 #include "panel_collapse.h"     // ui::PanelCollapseAnim — shared vertical-collapse animation (T-G21)
+#include "widgets/kit.h"         // ui::kit::elide
 
 #include <filesystem>
 #include <algorithm>
@@ -849,18 +850,29 @@ void drawLeftPane(AppState& st,
         } else {
             // Pane title INLINE with the square tab buttons (Hunter): right-aligned in the header
             // row, vertically centered on the button row, NO icon — the highlighted tab button
-            // already carries the glyph. Replaces the old centered header chip below the divider.
+            // already carries the glyph. Its owned band begins after the last tab and ends before
+            // the collapse chip; elide within that measured span rather than painting through
+            // either control when the pane is narrow.
             const char* paneTitle = "Feature Manager";
             if (st.leftPaneTab == kLeftPanePLM)                  paneTitle = "PLM";
             else if (st.leftPaneTab == kLeftPaneExplorer)        paneTitle = "Explorer";
             else if (st.leftPaneTab == kLeftPaneConfigurations) paneTitle = "Configurations";
             else if (st.leftPaneTab == kLeftPaneGraph)           paneTitle = "Graph";
-            ImDrawList* pdl = ImGui::GetWindowDrawList();
-            const ImVec2 tsz = ImGui::CalcTextSize(paneTitle);
-            const float rightX = lpPaneRect.Max.x - chevSz - 16.0f * S;   // clear of the collapse chevron
-            const float tx = rightX - tsz.x;
-            const float ty = paneOrigin.y + railRowH * 0.5f - tsz.y * 0.5f;
-            pdl->AddText(ImVec2(tx, ty), ui::Palette::toU32(pal.text), paneTitle);
+            const float titleLeftX = paneOrigin.x + railW + gap;
+            const float collapseLeftX = lpPaneRect.Max.x - chevSz - 8.0f * S;
+            const float titleRightX = collapseLeftX - 8.0f * S;
+            const float titleBandW = titleRightX - titleLeftX;
+            if (titleBandW > 0.0f) {
+                const std::string shownTitle = ui::kit::elide(paneTitle, titleBandW);
+                if (!shownTitle.empty()) {
+                    ImDrawList* pdl = ImGui::GetWindowDrawList();
+                    const ImVec2 tsz = ImGui::CalcTextSize(shownTitle.c_str());
+                    const float tx = titleRightX - tsz.x;
+                    const float ty = paneOrigin.y + railRowH * 0.5f - tsz.y * 0.5f;
+                    pdl->AddText(ImVec2(tx, ty), ui::Palette::toU32(pal.text),
+                                 shownTitle.c_str());
+                }
+            }
         }
 
         // Horizontal separator under the icon row, spanning the full pane width on the pane draw

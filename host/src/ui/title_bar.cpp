@@ -15,8 +15,6 @@
 #include <GLFW/glfw3.h>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
-#include <emscripten/html5.h>
-#include <GLFW/emscripten_glfw3.h>
 #endif
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -42,6 +40,7 @@
 #include <cstdio>          // snprintf
 #include <cstring>        // std::strcmp (workspace raster-tile gate)
 
+#ifndef __EMSCRIPTEN__
 // The Windows caption convention: the close button's hover fill is the platform red #E81123. It is
 // an OS affordance, not a theme role — it must read as "close" identically in dark and light.
 static const ImVec4 kCaptionCloseRed(232.0f / 255.0f, 17.0f / 255.0f, 35.0f / 255.0f, 1.0f);
@@ -120,6 +119,7 @@ bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
     }
     return clicked;
 }
+#endif
 
 // Wave 1C: buildDefaultLayout() moved to ui/layout.cpp.
 
@@ -919,22 +919,9 @@ struct FilMenuDrawer {
     }
 };
 
-// Toggle exclusive / browser fullscreen. Called from the caption-button click (user gesture —
-// required for the web Fullscreen API). Native: glfwSetWindowMonitor on the current/primary
-// monitor, restoring the saved windowed rect. Web: emscripten_request/exit_fullscreen on #canvas.
+#ifndef __EMSCRIPTEN__
+// Toggle native exclusive fullscreen. Called from the caption-button click.
 static void titleBar_toggleFullscreen(AppState& st) {
-#ifdef __EMSCRIPTEN__
-    // Use the contrib.glfw3 port's fullscreen so it stays integrated with
-    // emscripten_glfw_make_canvas_resizable (canvas + GLFW window + backing store stay synced).
-    // Must run inside this user-gesture click handler (browser Fullscreen API requirement).
-    if (st.isFullscreen || emscripten_glfw_is_window_fullscreen(st.win)) {
-        emscripten_exit_fullscreen();
-        st.isFullscreen = false;
-    } else {
-        emscripten_glfw_request_fullscreen(st.win, /*lockPointer=*/EM_FALSE, /*resizeCanvas=*/EM_TRUE);
-        st.isFullscreen = true;
-    }
-#else
     GLFWwindow* win = st.win;
     if (!win) return;
     // File-static restore rect — survives across frames while fullscreen is active.
@@ -953,8 +940,8 @@ static void titleBar_toggleFullscreen(AppState& st) {
         glfwSetWindowMonitor(win, mon, 0, 0, mode->width, mode->height, mode->refreshRate);
         st.isFullscreen = true;
     }
-#endif
 }
+#endif
 
 void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
     GLFWwindow* win = st.win;
@@ -973,11 +960,20 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
     if (ImGui::BeginMainMenuBar()) {
         const float winX = ImGui::GetWindowPos().x;  // window origin in screen space
         const float winW = ImGui::GetWindowWidth();
+#ifdef __EMSCRIPTEN__
+        // Browser chrome owns its window controls. Recover the full app-bar width and
+        // publish no native caption hit span.
+        const float rightGroupStartRelX = winW - 4.0f * s;
+        hitLayout.controlsLeft = 0;
+        hitLayout.controlsRight = 0;
+        (void)maximized;
+#else
         const float bw   = barH * (1.35f + 0.15f * (s - 1.0f));  // one caption button width
         const float captionZoneW = bw * 4.0f;  // min | max | fullscreen | close
 
         // Right boundary of the usable zone (= where caption buttons begin), window-relative.
         const float rightGroupStartRelX = winW - captionZoneW - 4.0f * s;
+#endif
 
         // ---- Brand lockup (left edge): vector mark + typed wordmark -----------------
         // This used to blit assets/logo_wordmark.png scaled to ~14 px tall. A 687x200 bitmap
@@ -1263,7 +1259,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             const char* tabText = tabLabel(i, iconOnly);
             const float chipW = chipMeasureW(tabText, tabPadX, boldFont, iconSz, iconGap);
 
-            // Clip tab if it would overlap the OS controls area (window-relative check).
+            // Clip the tab at the build-specific usable right boundary.
             if ((tx - winX) + chipW > rightGroupStartRelX - 2.0f * s) break;
 
             // Liquid-glass divider centered in the gap before this tab (only between two
@@ -1299,6 +1295,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             drewPrevTab = true;
         }
 
+#ifndef __EMSCRIPTEN__
         // ---- Window caption buttons (right-aligned): min | max | fullscreen | close ----
         const float bx = winW - captionZoneW;  // window-relative
         hitLayout.controlsLeft  = (int)bx;
@@ -1318,6 +1315,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         }
         ImGui::SetCursorPos(ImVec2(bx + bw * 3.0f, 0.0f));
         if (windowButton("##close", BTN_CLOSE, barH, false)) glfwSetWindowShouldClose(win, 1);
+#endif
 
         ImGui::EndMainMenuBar();
     }

@@ -25,7 +25,7 @@
 #include "property_manager.h"   // pmParseDim (Smart Dimension value parsing)
 #include "airfoil.h"            // NACA 4-/5-digit + .dat profile generator (SketchTool::Airfoil)
 #include "file_dialog.h"        // openFileDialog (.dat import)
-#include "widgets/kit.h"        // ui::kit::primaryButton (the one accent-button treatment)
+#include "widgets/kit.h"        // ui::kit primitives + bounded text elision
 
 namespace ui {
 
@@ -240,11 +240,39 @@ void glassHudPill(ImDrawList* dl, const char* id, ImVec2 p0, const char* text,
                   ImVec2(p0.x + 12.0f * s, p0.y + 5.0f * s), surf, text);
 }
 // Centered variant (top-center banners: plane pick, PM pickers, paste placement, tool hint).
+// Keep the whole pill inside its viewport ownership rectangle; short/narrow web layouts share
+// this path with desktop, so bounds are enforced here rather than by each caller.
 void glassHudBanner(ImDrawList* dl, const char* id, const ImVec2& imgMin, const ImVec2& imgMax,
                     float y, const char* text, ImU32 borderCol = 0) {
-    ImVec2 ts = ImGui::CalcTextSize(text);
-    float cx = (imgMin.x + imgMax.x) * 0.5f;
-    glassHudPill(dl, id, ImVec2(cx - ts.x * 0.5f - 12.0f * ui::uiScale, y), text, borderCol);
+    const float s = ui::uiScale;
+    const float edgeMargin = 8.0f * s;
+    const float padX = 12.0f * s;
+    const float viewW = imgMax.x - imgMin.x;
+    const float viewH = imgMax.y - imgMin.y;
+    const float maxTextW = viewW - 2.0f * (edgeMargin + padX);
+    if (maxTextW <= 0.0f || viewH <= 0.0f) return;
+
+    const std::string shown = ui::kit::elide(text, maxTextW);
+    if (shown.empty()) return;
+    const ImVec2 ts = ImGui::CalcTextSize(shown.c_str());
+    const float pillW = ts.x + 2.0f * padX;
+    const float pillH = ts.y + 10.0f * s;
+    if (pillW > viewW || pillH > viewH) return;
+
+
+    float minY = imgMin.y + edgeMargin;
+    float maxY = imgMax.y - edgeMargin - pillH;
+    if (maxY < minY) {
+        minY = imgMin.y;
+        maxY = imgMax.y - pillH;
+    }
+    y = std::clamp(y, minY, maxY);
+
+    const float cx = (imgMin.x + imgMax.x) * 0.5f;
+    const float x = std::clamp(cx - pillW * 0.5f,
+                               imgMin.x + edgeMargin,
+                               imgMax.x - edgeMargin - pillW);
+    glassHudPill(dl, id, ImVec2(x, y), shown.c_str(), borderCol);
 }
 
 // Circumcircle of three (u,v) points. Returns false when (near-)collinear.
@@ -6018,12 +6046,13 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 consumePlanePick(st, planeSel[hovered]);
             }
         }
-        // Top-center banner. Sits BELOW the heads-up view toolbar (centered pill at imgMin.y+8,
-        // ~34px tall) so the two don't overlap (the HUD stays visible during plane-pick).
+        // Top-center banner. Own the same inter-column span as the clip rect: centering against
+        // the full image and then clipping to skClipMin/skClipMax left only a text fragment
+        // peeking out from behind the collapsed Feature Manager on narrow web viewports.
         const char* banner = planeEditFid_.empty()
             ? "Select a plane or a planar face for the sketch \xE2\x80\x94 Esc to cancel"
             : "Select the new sketch plane or a planar face \xE2\x80\x94 Esc to cancel";
-        glassHudBanner(wdl, "sk_plane_pick_banner", imgMin, imgMax,
+        glassHudBanner(wdl, "sk_plane_pick_banner", skClipMin, skClipMax,
                        imgMin.y + 52.0f * ui::uiScale, banner);
         wdl->PopClipRect();
         // Esc cancels the whole thing (new-sketch pick OR an Edit-Sketch-Plane reparent).

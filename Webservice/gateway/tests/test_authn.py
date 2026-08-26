@@ -370,6 +370,10 @@ def test_login_sets_a_hardened_session_cookie(client):
     assert set_cookie.startswith(f"{authn.SESSION_COOKIE}=")
     assert "; Path=/" in set_cookie
     assert "; HttpOnly" in set_cookie
+    assert (
+        f"Max-Age={settings.session_ttl_days * 24 * 3600}"
+        in set_cookie.split("; ")
+    )
     # Lax, not Strict: Strict drops the cookie on the OAuth callback's
     # cross-site top-level navigation and sign-in silently fails.
     assert "; SameSite=Lax" in set_cookie

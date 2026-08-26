@@ -961,6 +961,14 @@ static const char* ribbon_iconFor(const char* cmd_id) {
     return nullptr;
 }
 
+static bool ribbon_tooltipsEnabled() {
+#ifdef __EMSCRIPTEN__
+    return ImGui::GetIO().DisplaySize.x > 900.0f;
+#else
+    return true;
+#endif
+}
+
 static void ribbon_tooltip(const char* title, const char* cmd_id, bool enabled) {
     auto col = [](const float f[4]) { return ImVec4(f[0], f[1], f[2], f[3]); };
     ui::pushGlassTooltipStyle();
@@ -1290,7 +1298,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         dl->PopClipRect();
     }
 
-    if (mainHovTip) ribbon_tooltip(label, cmd_id, enabled);
+    if (mainHovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, enabled);
 
     // C25: plain-click on split button fires last-used variant; if none chosen yet and the
     // parent itself has no functional action (hasDrop=true), open the flyout instead.
@@ -1433,7 +1441,7 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
         dl->PopClipRect();
     }
 
-    if (mainHovTip) ribbon_tooltip(label, cmd_id, enabled);
+    if (mainHovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, enabled);
 
     if (clicked && enabled) {
         if (hasDrop) {
@@ -1757,7 +1765,7 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
         dl->AddText(nullptr, 0.0f, ImVec2(tx, ty), tCol, label);
     }
 
-    if (hovTip) ribbon_tooltip(label, cmd_id, enabled);
+    if (hovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, enabled);
 
     if (clicked && enabled) ribbon_fire(cmd_id);
     ImGui::PopID();

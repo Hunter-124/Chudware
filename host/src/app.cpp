@@ -37,6 +37,15 @@ inline void wasmBootDom(const char *msg) {
       },
       msg);
 }
+// The DOM boot chip is diagnostic scaffolding, not application chrome. Once ImGui has
+// painted three healthy frames, retire it so it cannot sit over the native status bar.
+// shell.html re-shows the chip for any later fatal/runtime error.
+inline void wasmBootReady() {
+  EM_ASM({
+    var el = document.getElementById('status');
+    if (el) el.style.display = 'none';
+  });
+}
 #define WASM_BOOT_LOG(...)                                                     \
   do {                                                                         \
     std::fprintf(stderr, __VA_ARGS__);                                         \
@@ -1964,6 +1973,16 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
   // ---------- application state (bundles what were run_gui locals) ----------
   AppState st;
+#ifdef __EMSCRIPTEN__
+  // The browser can load this client only after the gateway has authenticated
+  // and plan-gated every /app asset request. That revocable, server-side
+  // 30-day HttpOnly session is the authoritative entitlement boundary for the
+  // web surface; WASM has no desktop token to expose or verify again.
+  st.entitlementReadOnly = false;
+  st.entitlementSignedIn = true;
+  st.entitlementMutationVerified = true;
+  st.entitlementAiVerified = true;
+#endif
   st.mfgMirror = std::make_shared<ui::MfgMirror>();
 #ifdef __EMSCRIPTEN__
   wasmInstallTouchTracker();
@@ -3731,8 +3750,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 #ifdef __EMSCRIPTEN__
     static int s_wasmFrames = 0;
     ++s_wasmFrames;
-    if (s_wasmFrames <= 3)
+    if (s_wasmFrames <= 3) {
       WASM_BOOT_LOG("[wasm-boot] frame %d\n", s_wasmFrames);
+      if (s_wasmFrames == 3)
+        wasmBootReady();
+    }
     // Self-healing canvas sync: the drawing buffer MUST equal the ACTUAL
     // displayed CSS size, or the canvas is stretched. In element-fullscreen the
     // UA `:fullscreen{width:100% !important}` rule (important user-agent —

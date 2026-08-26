@@ -142,14 +142,31 @@ void drawToasts(AppState& st) {
     // already anchor to; fall back to a modest fixed inset for the pre-publish first frame.
     ImGuiViewport* vp = ImGui::GetMainViewport();
     const float pad     = 12.0f * scale;
-    const float toastW  = 320.0f * scale;
+    float toastW        = 320.0f * scale;
     const float rowGap  = 8.0f * scale;
     const float rounding = 6.0f * scale;
     const ui::OverlayBand& band = ui::overlayBand();
     const float topInset = band.valid ? (band.minY - vp->Pos.y) + 8.0f * scale : 64.0f * scale;
-    // Anchor the toast column to the top-RIGHT: cards are fixed-width (toastW), so a single
-    // right-edge origin flips the whole stack over from the former top-left placement.
+    // Default remains the fixed-width top-right stack.
     float x = vp->Pos.x + vp->Size.x - toastW - pad;
+#if defined(__EMSCRIPTEN__)
+    // The short mobile web layout paints a horizontal DOM HUD across the rightmost ~360 ImGui
+    // pixels. Keep toasts in the left span instead; the HUD lane is already expressed in viewport
+    // coordinates, so unlike the card's dp metrics it must not be multiplied by uiScale.
+    if (vp->Size.x <= 900.0f && vp->Size.y <= 600.0f) {
+        constexpr float hudLaneW = 360.0f;
+        const float readableFloor = 120.0f * scale;
+        const float leftSpanW = vp->Size.x - hudLaneW - 2.0f * pad;
+
+        // Never let a minimum width push the card back into the HUD lane. The readable floor is
+        // relevant only when it fits; below that, honoring the actual span is the safer bound.
+        if (leftSpanW >= readableFloor)
+            toastW = leftSpanW < toastW ? leftSpanW : toastW;
+        else if (leftSpanW > 0.0f)
+            toastW = leftSpanW;
+        x = vp->Pos.x + pad;
+    }
+#endif
     float y = vp->Pos.y + topInset;
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();

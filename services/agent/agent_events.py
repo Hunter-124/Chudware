@@ -372,6 +372,8 @@ def tool_call_event(
     parent_id: str | None = None, actor: str | None = None,
     args_preview: str | None = None,
     artifacts: list[dict] | None = None,
+    outcome_kind: str | None = None,
+    executed: bool | None = None,
 ) -> tuple[str, dict]:
     payload = _linkage(node_id, span_id=span_id or new_span_id(),
                        parent_id=parent_id, actor=actor)
@@ -405,6 +407,16 @@ def tool_call_event(
         err = _error_text(result)
         if err:
             payload["error_preview"] = _cap(err, 2048)
+    # Additive (2026-08-26): STRUCTURED outcome class, so the GUI never has to
+    # parse error prose to tell a harness refusal from a tool crash. Values are
+    # agent_turn.TOOL_OUTCOME_KINDS; ``executed`` says whether the tool body
+    # actually ran (a refusal ran nothing; a timeout ran and is still running).
+    # Omitted when the caller does not classify, so an older consumer keeps
+    # exactly its current ok-only behavior.
+    if outcome_kind:
+        payload["outcome_kind"] = str(outcome_kind)
+    if executed is not None:
+        payload["executed"] = bool(executed)
     # Additive (2026-07-17): filesystem paths of render/export deliverables so the
     # GUI can expand a tool-call row inline. Cap 8; omit when none.
     arts = artifacts

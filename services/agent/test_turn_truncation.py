@@ -205,7 +205,11 @@ def test_truncated_directive_after_real_work_is_not_success():
 
     Before the guard this returned success with a `done` handoff and zero
     geometry. Now: one re-emit request, and a second truncation ends the turn
-    honestly.
+    honestly — as ``reply_truncated``, NOT ``no_code``. The provider cut the
+    reply off at its output cap; calling that "produced no valid tool call or
+    completion" blamed the model for inaction, hid a cap the user can raise,
+    and (because ``no_code`` is not a retryable reason) made the DAG lane
+    escalate instead of retrying with the headroom it now funds.
     """
     from services.agent import agent_turn as at
 
@@ -225,9 +229,15 @@ def test_truncated_directive_after_real_work_is_not_success():
         run_id="t-trunc-1",
     )
     assert res.success is False, (res.stop_reason, res.result)
-    assert res.stop_reason == "no_code", (res.stop_reason, res.result)
+    assert res.stop_reason == "reply_truncated", (res.stop_reason, res.result)
     ho = (res.result or {}).get("handoff") or {}
     assert ho.get("status") != "done", ho
+    # The detail must name the real cause so the user can act on it.
+    detail = str((res.result or {}).get("error_detail") or "")
+    assert "cut the reply off" in detail, detail
+    # A truncation is retryable in the compiled-DAG lane; no_code was not.
+    from services.dag import node_runner as _nr
+    assert "reply_truncated" in _nr._RETRY_REASONS
     # The re-emit request went out exactly once — a second truncation must not
     # loop the budget away.
     assert _nudges(p, _NUDGE) == 1, _flat(p)

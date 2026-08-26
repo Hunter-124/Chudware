@@ -24,6 +24,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+import copy
 from typing import Any, Iterable, Mapping, Optional
 from urllib.parse import urlparse
 
@@ -111,6 +112,29 @@ def clamp_subagent_effort(level: Any) -> str | None:
     if s == "med":
         s = "medium"
     return SUBAGENT_MAX_THINKING if s in _ABOVE_HIGH_THINKING else s
+
+
+def clamp_provider_effort(provider: Any) -> Any:
+    """Return a child-safe provider without mutating the ambient provider.
+
+    Provider instances carry the effective ``reasoning_effort`` that reaches
+    the wire.  Session-default child dispatch reuses an already-constructed
+    parent provider, so clamping only the copied config does nothing on that
+    path.  Rebind a shallow copy only when the provider's effective value
+    changes; callers that are already safe keep object identity.  This boundary
+    is deliberately fail-open to the input object so provider implementations
+    with unusual copy/setattr behavior can never make dispatch raise.
+    """
+    try:
+        raw = getattr(provider, "reasoning_effort", None)
+        clamped = clamp_subagent_effort(raw)
+        if clamped is None or clamped == raw:
+            return provider
+        rebound = copy.copy(provider)
+        setattr(rebound, "reasoning_effort", clamped)
+        return rebound
+    except Exception:  # noqa: BLE001 — provider selection must never raise here
+        return provider
 
 _RANKINGS_YAML = Path(__file__).resolve().parent / "model_rankings.yaml"
 _DEFAULT_LEADERBOARD = (

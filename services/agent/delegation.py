@@ -233,6 +233,7 @@ class DelegationNode:
     docs: list[DocLease] = field(default_factory=list)
     status: str = "pending"
     effort: Optional[str] = None  # low|medium|high when dispatcher assigns
+    budget_advisory: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         d = {
@@ -253,15 +254,122 @@ class DelegationNode:
             d["effort"] = self.effort
             d["thinking"] = self.effort
             d["reasoning_effort"] = self.effort
+        if self.budget_advisory:
+            d["budget_advisory"] = dict(self.budget_advisory)
         return d
 
 
 class DelegationError(ValueError):
     """A delegation request is invalid or cannot be granted."""
 
-    def __init__(self, message: str, *, reason: str = "delegation_refused") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "delegation_refused",
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.reason = reason
+        self.details = dict(details or {})
+
+
+def delegation_budget_requirements(
+    role: str,
+    brief: str,
+    *,
+    tier: str | None = None,
+) -> dict[str, Any]:
+    """Measure the hard one-round-trip floor and soft full-chain estimate.
+
+    The structural floor is arithmetic, not a prediction: one child completion
+    must carry the rendered role prompt, tier-trimmed tools slot, assignment,
+    and the tier's generation headroom. The full mandatory-chain estimate is
+    advisory because a child can finish early or emit fewer calls than the role
+    card's worst case. Neither measurement is a refusal gate; any positive grant
+    proceeds and the existing runtime token budget stops it honestly if needed.
+
+    ``tier=None`` deliberately consults ``CHUDWARE_TIER`` and otherwise uses
+    ``frontier``. Therefore callers that do not bind a tier get environment-
+    dependent advisory numbers; live mission paths pass their resolved tier so
+    the measurements are stable for that child.
+    """
+    try:
+        from services.agent import tool_budget as _tb  # noqa: PLC0415
+
+        role_s = str(role or "").strip().lower()
+        mandated_calls = int(_tb.ROLE_MIN_CALLS.get(role_s) or 0)
+        if mandated_calls <= 0:
+            return {
+                "required_tokens": 1,
+                "recommended_tokens": 1,
+                "mandated_calls": 0,
+                "tier": tier,
+            }
+
+        from services.agent.roles import load_role  # noqa: PLC0415
+        from services.agent.tiers import (  # noqa: PLC0415
+            _count_tokens,
+            detect_tier_from_env,
+            load_tier,
+        )
+        from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
+
+        tier_name = str(tier or "").strip() or detect_tier_from_env() or "frontier"
+        profile = load_tier(tier_name)
+        card = load_role(role_s)
+        tools = list(card.concrete_tools)
+        try:
+            from services.agent import reviewer_exec as _rx  # noqa: PLC0415
+
+            resolver = _rx._resolve_fn  # noqa: SLF001 — same global dispatch ladder
+        except Exception:  # noqa: BLE001 — fallback schemas are still measurable
+            def resolver(_name):
+                return None
+        tools_text, tools_meta = render_tools_block(
+            tools, resolver=resolver, tier=tier_name)
+        tools_tokens = int(tools_meta.get("tokens") or _count_tokens(tools_text))
+        prompt_tokens = _count_tokens(str(card.system_prompt or ""))
+        brief_tokens = _count_tokens(str(brief or ""))
+        static_tokens = prompt_tokens + tools_tokens + brief_tokens
+        completion_tokens = _tb.completion_cap_for_subagent(profile)
+
+        shortest_tool = min(tools, key=len) if tools else "done"
+        directive_tokens = _count_tokens(
+            f'```json\n{{"tool":"{shortest_tool}","args":{{}}}}\n```')
+        required_tokens = max(1, static_tokens + completion_tokens)
+        recommended_tokens = max(
+            required_tokens,
+            (static_tokens + directive_tokens) * mandated_calls,
+        )
+        return {
+            "required_tokens": required_tokens,
+            "recommended_tokens": recommended_tokens,
+            "mandated_calls": mandated_calls,
+            "tier": tier_name,
+            "prompt_tokens": prompt_tokens,
+            "tools_tokens": tools_tokens,
+            "brief_tokens": brief_tokens,
+            "completion_tokens": completion_tokens,
+        }
+    except Exception:  # noqa: BLE001 — basic positive-budget validation remains
+        return {
+            "required_tokens": 1,
+            "recommended_tokens": 1,
+            "mandated_calls": 0,
+            "tier": tier,
+        }
+
+
+def minimum_delegation_tokens(
+    role: str,
+    brief: str,
+    *,
+    tier: str | None = None,
+) -> tuple[int, int]:
+    """Compatibility view of the structural floor and mandatory call count."""
+    req = delegation_budget_requirements(role, brief, tier=tier)
+    return int(req["required_tokens"]), int(req["mandated_calls"])
 
 
 # ---------------------------------------------------------------------------
@@ -314,11 +422,13 @@ class DelegationTree:
         soft_depth_limit: int = DEFAULT_SOFT_DEPTH_LIMIT,
         max_agents: int = DEFAULT_MAX_AGENTS,
         max_subagent_depth: int | None = None,
+        tier: str | None = None,
         on_event: Any | None = None,
     ) -> None:
         self._run_id = run_id or f"r_{uuid.uuid4().hex[:8]}"
         self._ledger = ledger
         self._routing = routing
+        self._tier = str(tier or "").strip() or None
         self._nodes: dict[str, DelegationNode] = {}
         self._pending_events: list[dict] = []
         # M20: optional live event sink (GUI stream). When set, request_delegation
@@ -434,6 +544,39 @@ class DelegationTree:
                 f"budget_tokens must be positive, got {budget_tokens}",
                 reason="invalid_budget",
             )
+        budget_advisory: dict[str, Any] | None = None
+        if kind == "worker":
+            tier_name = self._tier
+            if tier_name is None:
+                try:
+                    from services.agent.tiers import (  # noqa: PLC0415
+                        detect_tier_from_env,
+                    )
+
+                    tier_name = detect_tier_from_env()
+                except Exception:  # noqa: BLE001
+                    tier_name = None
+            tier_name = tier_name or "frontier"
+            requirements = delegation_budget_requirements(
+                role, brief, tier=tier_name)
+            recommended_tokens = int(requirements["recommended_tokens"])
+            mandated_calls = int(requirements["mandated_calls"])
+            if mandated_calls > 0 and budget_tokens < recommended_tokens:
+                remedy = (
+                    "This grant is below the role's full-chain estimate. The "
+                    "spawn is proceeding; increase budget_tokens on a later "
+                    "delegation if the child stops on token_budget, or continue "
+                    "the remaining work directly with this turn's concrete tools."
+                )
+                budget_advisory = {
+                    "structural_floor_tokens": int(
+                        requirements["required_tokens"]),
+                    "recommended_tokens": recommended_tokens,
+                    "available_tokens": budget_tokens,
+                    "mandated_calls": mandated_calls,
+                    "tier": requirements.get("tier") or tier_name,
+                    "remedy": remedy,
+                }
         # The ≤500 cap is the RECORD shape (contract §12). Hard-rejecting the
         # whole spawn over it burned a turn and lost the spec; truncate the
         # stored row instead — the same soft-truncate precedent MissionDispatch
@@ -503,6 +646,21 @@ class DelegationTree:
                     f"({anc.budget.tokens_granted}) < requested child budget ({budget_tokens})",
                     reason="insufficient_budget",
                 )
+        if budget_advisory is not None:
+            self._emit_event(
+                actor=role,
+                kind="delegation_budget_warning",
+                payload={
+                    "schema": DELEGATION_SCHEMA,
+                    "role": role,
+                    **budget_advisory,
+                    "message": (
+                        "Delegation is below the role's full-chain estimate; "
+                        "spawn is proceeding because partial work is preferable "
+                        "to a pre-spawn refusal."
+                    ),
+                },
+            )
 
         # Resolve model via routing.
         res = None
@@ -538,6 +696,7 @@ class DelegationTree:
             docs=doc_leases,
             status="pending",
             effort=effort_s,
+            budget_advisory=budget_advisory,
         )
         self._nodes[node_id] = node
         self._emit_transition(node, "pending", "delegation requested")
@@ -877,13 +1036,24 @@ def delegate(
             availability=availability,
             effort=effort,
         )
-        return {"ok": True, **node.to_dict()}
+        # `tree` is duck-typed at several call sites (mission dispatchers and
+        # tests supply their own), and a node from any tree that predates the
+        # budget advisory has no such attribute. A bare attribute read turned
+        # that into `delegation_exception: '_Node' object has no attribute
+        # 'budget_advisory'` and lost a child that had already run.
+        advisory = dict(getattr(node, "budget_advisory", None) or {})
+        return {
+            "ok": True,
+            **node.to_dict(),
+            **advisory,
+        }
     except DelegationError as exc:
         return {
             "ok": False,
             "reason": exc.reason,
             "error": str(exc),
             "status": "failed",
+            **exc.details,
         }
 
 

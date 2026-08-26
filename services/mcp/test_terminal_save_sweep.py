@@ -192,9 +192,9 @@ def test_an_agent_origin_doc_this_process_never_touched_is_still_swept(sweep):
     assert [s[0] for s in fake.saves] == ["d-earlier"]
 
 
-def test_no_project_folder_means_no_op(sweep):
-    """With no project dir there is nowhere a human would find the file, so the recovery
-    tier stays the honest safety net rather than writing into a temp dir nobody opens."""
+def test_a_touched_dirty_doc_without_a_project_folder_is_a_persistence_failure(sweep):
+    """A mutation with no durable destination is not a successful no-op. The geometry
+    may still be live in hostd, but the caller must downgrade delivery until it is saved."""
     fake = sweep(
         [{"doc_id": "d1", "name": "holster", "kind": "part", "feature_count": 6,
           "dirty": True, "path": "", "origin_kind": "mcp"}],
@@ -204,7 +204,11 @@ def test_no_project_folder_means_no_op(sweep):
     out = C.save_touched_docs()
 
     assert fake.saves == []
-    assert out["skipped"] == [{"reason": "no_project_save_dir"}]
+    assert out["skipped"] == []
+    assert out["persistence_failure"] == {
+        "reason": "no_project_save_dir",
+        "docs": [{"doc_id": "d1", "name": "holster"}],
+    }
 
 
 def test_a_doc_list_failure_is_reported_not_raised(sweep):
@@ -231,3 +235,72 @@ def test_note_touched_doc_keeps_build_order_and_dedupes(monkeypatch):
     C.note_touched_doc("")
 
     assert C._TOUCHED_DOCS == ["d2", "d1"]
+
+
+def test_agent_admin_turn_rejects_explicit_invalid_workspace_before_provider(
+    monkeypatch, tmp_path,
+):
+    """Bad durable-delivery plumbing is rejected before a completion can spend tokens."""
+    from services.agent import config as agent_config
+    from services.agent import worker_rpc
+
+    provider_calls = []
+    monkeypatch.setattr(
+        agent_config,
+        "get_provider",
+        lambda *args, **kwargs: provider_calls.append((args, kwargs)),
+    )
+
+    out = worker_rpc._agent_admin_turn(
+        {
+            "request": "build a bracket",
+            "workspace_dir": str(tmp_path / "does-not-exist"),
+        },
+        lambda data: None,
+    )
+
+    assert out["ok"] is False
+    assert out["reason"].startswith("invalid_workspace:")
+    assert provider_calls == []
+
+
+def test_crash_save_runs_and_surfaces_all_finalization_faults(monkeypatch):
+    """A usage-sink reset fault must not jump over the crash-path save. The original
+    turn crash, reset fault, and persistence failure all remain visible to the caller."""
+    from services.agent import config as agent_config
+    from services.agent import mission_dispatch
+    from services.agent import worker_rpc
+    from services.agent.providers import token_usage
+
+    monkeypatch.setattr(agent_config, "get_provider", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        mission_dispatch,
+        "run_linear_role_turn",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("turn crashed")),
+    )
+    monkeypatch.setattr(
+        token_usage,
+        "reset_usage_sink",
+        lambda token: (_ for _ in ()).throw(RuntimeError("reset crashed")),
+    )
+    sweeps = []
+    persistence = {
+        "saved": [],
+        "skipped": [],
+        "errors": ["d1: doc_save wrote nothing"],
+        "persistence_failure": None,
+    }
+    monkeypatch.setattr(
+        C,
+        "save_touched_docs",
+        lambda: sweeps.append("save") or persistence,
+    )
+
+    out = worker_rpc._agent_admin_turn({"request": "build it"}, lambda data: None)
+
+    assert sweeps == ["save"]
+    assert out["ok"] is False
+    assert out["persistence"] == persistence
+    assert "turn crashed" in out["reason"]
+    assert "reset crashed" in out["reason"]
+    assert "doc_save wrote nothing" in out["reason"]

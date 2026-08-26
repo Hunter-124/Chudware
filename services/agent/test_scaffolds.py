@@ -6,6 +6,7 @@ Plus C-freedom snapshot: zero forced capability_dial events on a mock C turn.
 from __future__ import annotations
 
 from services.agent import agent_turn
+from services.agent import guardrails as gr
 from services.agent import scaffolds as sc
 from services.agent.capability import profile_for_letter
 
@@ -296,6 +297,42 @@ def test_wi6_a_checkpoint_on_fillet():
     assert ckpts  # checkpoint was taken
     assert _dials(ledger, "auto_checkpoint")
     assert _kinds(ledger, "auto_checkpoint")  # guardrails emit too
+
+
+def test_wi6_aggressive_checkpoint_failure_blocks_once_then_waives():
+    ledger = ListLedger()
+    cap = profile_for_letter("A")
+    gr.reset_checkpoint_failures()
+    args = {
+        "doc_id": "permanent-failure",
+        "ops": [{"op": "add_feature",
+                 "feature": {"type": "fillet", "params": {"radius": 1}}}],
+    }
+
+    def fail_checkpoint(*_args):
+        return {"ok": False, "error": "checkpoint backend unavailable"}
+
+    first = sc.pre_dispatch_aggressive_checkpoint(
+        "add_features", args, profile=cap, ledger=ledger,
+        actor="feature_modeler", checkpoint_fn=fail_checkpoint,
+    )
+    second = sc.pre_dispatch_aggressive_checkpoint(
+        "add_features", args, profile=cap, ledger=ledger,
+        actor="feature_modeler", checkpoint_fn=fail_checkpoint,
+    )
+
+    assert first is not None and "blocked" in first
+    assert "Retry the same call once" in first
+    assert second is None
+    waivers = [
+        event for event in _kinds(ledger, "hard_guardrail")
+        if event["payload"].get("name") == "auto_checkpoint"
+        and event["payload"].get("outcome") == "waived"
+    ]
+    assert waivers
+    assert "UNPROTECTED" in waivers[-1]["payload"]["reason"]
+    gr.reset_checkpoint_failures()
+
 def test_wi6_c_no_aggressive_on_fillet():
     ledger = ListLedger()
     cap = profile_for_letter("C")
@@ -346,6 +383,48 @@ def test_wi7_a_rejects_dimensioned_without_calc():
     first = res.result["calls"][0]
     assert first["ok"] is False
     assert "calc" in str(first["result"]).lower() or "calc" in str(first.get("error", "")).lower()
+
+
+def test_wi7_dimensioned_mutator_roles_never_hit_an_unsatisfiable_hard_gate():
+    from services.agent.roles import load_all_roles
+    from services.agent.tool_categories import CATEGORY_PACKS
+
+    dimensioned_mutators = {
+        "add_features", "doc_apply_ops", "hole", "counterbore",
+        "countersink", "bolt_circle",
+    }
+    research_pack = set(CATEGORY_PACKS["research"])
+    assert research_pack.intersection(sc.CALC_TOOLS) == {
+        "list_calcs", "research_eng_calc", "research_unit_convert",
+    }
+
+    checked = set()
+    args = {"ops": [{"op": "extrude", "params": {"depth": 12}}]}
+    for role_id, card in load_all_roles().items():
+        allowed = set(card.concrete_tools)
+        if not allowed.intersection(dimensioned_mutators):
+            continue
+        checked.add(role_id)
+        if allowed.intersection(sc.CALC_TOOLS):
+            continue
+        ledger = ListLedger()
+        message = sc.pre_dispatch_calc_gate(
+            "add_features", args, profile=profile_for_letter("A"),
+            ledger=ledger, actor=role_id, effective_allow_set=allowed,
+        )
+        assert message is None, f"{role_id} was hard-blocked without a calc remedy"
+        advisory = _dials(ledger, "math_scratchpad")
+        assert advisory
+        assert advisory[-1]["payload"]["forced"] is False
+        assert advisory[-1]["payload"]["reason"] == "no_callable_calc"
+        assert "enable_tools(categories=['research'])" in (
+            advisory[-1]["payload"]["remedy"]
+        )
+
+    assert checked == {
+        "feature_modeler", "fixer", "model3d",
+        "re_modeler", "sketch2d", "sketcher",
+    }
 
 def test_wi7_a_allows_after_calc():
     ledger = ListLedger()
@@ -536,7 +615,14 @@ def test_wi10_a_multi_feature_first_build_is_never_truncated():
 
 
 def test_wi10_a_rework_after_a_declared_finish_trips_the_cap():
-    """A (refine_passes=0): verify the build, then go back and re-cut it -> capped."""
+    """A (refine_passes=0): verify the build, then go back and re-cut it -> capped.
+
+    The cap is enforced BEFORE the re-work runs. It used to fire after the
+    mutator had already re-shaped the geometry and cleared the settled flag, so
+    the turn ended holding an unverified, possibly unsaved revision while the
+    stop detail claimed the verified build was kept — and a prior productive
+    call let the harness synthesise status:done on top of that dirty state.
+    """
     replies = [
         _fence("new_part", name="holster"),
         _fence("add_features", doc_id="d1", ops=[{"op": "add_feature"}]),
@@ -547,8 +633,11 @@ def test_wi10_a_rework_after_a_declared_finish_trips_the_cap():
     res, seen, led = _refine_turn("A", replies)
 
     assert res.stop_reason == agent_turn._REFINE_CAP, res.stop_reason
-    # The re-work that tripped it still ran; the one after it never did.
-    assert seen.count("add_features") == 2, seen
+    # The re-work that tripped it was REFUSED, so only the original build ran.
+    assert seen.count("add_features") == 1, seen
+    # What the turn keeps is genuinely settled: the last geometry mutation is
+    # followed by a settler (verify_battery), never left dirty.
+    assert seen[-1] in agent_turn._GEOMETRY_SETTLERS, seen
     dial = _dials(led, "refine_passes")
     assert len(dial) == 1, dial
     assert dial[0]["payload"]["reason"] == "refine_cap"
@@ -572,7 +661,10 @@ def test_wi10_b_allows_one_rework_before_capping():
     res, seen, led = _refine_turn("B", replies)
 
     assert res.stop_reason == agent_turn._REFINE_CAP, res.stop_reason
-    assert seen.count("add_features") == 3, seen
+    # One re-work is the budget: build, settle, re-work, settle. The SECOND
+    # re-work is refused before it can run.
+    assert seen.count("add_features") == 2, seen
+    assert seen[-1] in agent_turn._GEOMETRY_SETTLERS, seen
     assert _dials(led, "refine_passes")[0]["payload"]["limit"] == 2
     assert res.success is True
     assert res.result["handoff"]["status"] == "done"
@@ -596,7 +688,11 @@ def test_wi10_refine_cap_has_its_own_error_detail():
     """Reusing max_iters would blame a tool-call budget that never ran out."""
     detail = agent_turn.error_detail_for_stop(
         agent_turn._REFINE_CAP, tool_calls_made=4, budget=24).lower()
-    assert "refine budget" in detail
+    assert "refinement limit" in detail
+    # It must say the re-work did NOT run — the old wording ("the verified
+    # build is kept") was a lie while the cap fired post-mutation.
+    assert "not run" in detail
+    assert "retained" in detail
     assert "tool call" not in detail, "a refine cap is not a tool-call budget"
     assert "24" not in detail, "the tool-call budget was never reached"
 

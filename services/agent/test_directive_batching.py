@@ -158,7 +158,16 @@ def test_a_failure_drops_the_rest_of_the_batch():
     assert "render_part" in told and "export_part" in told
 
 
-def test_a_refusal_drops_the_rest_of_the_batch():
+def test_a_refusal_keeps_the_independent_rest_of_the_batch():
+    """An allowlist REFUSAL executed nothing, so it invalidates nothing.
+
+    This used to drop every queued call behind the refused one, on the same
+    reasoning as a real failure — but a failure changed state a queued call may
+    have depended on, while a refusal changed nothing at all. The dropped calls
+    then had to be re-sent, costing a whole completion for work that was never
+    wrong. Worse, on the per-turn call cap the dropped calls were usually the
+    exact remedy the refusal had just named.
+    """
     seen = []
     p = _ScriptedProvider([
         _batch(_fence("ledger_note", text="a"),
@@ -170,7 +179,32 @@ def test_a_refusal_drops_the_rest_of_the_batch():
                 max_tool_calls=12,
                 tool_dispatch=lambda t, a: seen.append(t) or {"ok": True},
                 actor="general_agent")
-    assert seen == ["ledger_note"], seen
+    # export_part is refused (not allowed) and never runs; both independent
+    # ledger_note calls still do.
+    assert seen == ["ledger_note", "ledger_note"], seen
+    told = "\n".join(m for msgs in p.seen_messages for m in msgs)
+    assert "[BATCH HALTED]" not in told
+
+
+def test_a_real_failure_still_drops_the_rest_of_the_batch():
+    """The contrast case: a call that RAN and failed does halt the batch."""
+    seen = []
+
+    def dispatch(tool, args):
+        seen.append(tool)
+        return {"ok": tool != "add_features"}
+
+    p = _ScriptedProvider([
+        _batch(_fence("new_part", name="p"),
+               _fence("add_features", doc_id="d", ops=[{"op": "add_feature"}]),
+               _fence("ledger_note", text="c")),
+        _DONE,
+    ])
+    at.run_turn("do these", p, allowed_tools=_ALLOW, max_tool_calls=12,
+                tool_dispatch=dispatch, actor="general_agent")
+    assert seen == ["new_part", "add_features"], seen
+    told = "\n".join(p.seen_messages[-1])
+    assert "[BATCH HALTED]" in told
 
 
 def test_a_finish_envelope_after_calls_still_finishes():

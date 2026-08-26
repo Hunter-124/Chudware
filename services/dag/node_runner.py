@@ -32,9 +32,13 @@ Event emission:
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import logging
 import os
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
+
+_LOG = logging.getLogger(__name__)
 
 # Advisory engine / foreman (T-W5, Pillar 20): after a node step, the foreman runs
 # the stage battery over the node's doc (if it carries one) and the advisory block
@@ -63,8 +67,17 @@ _DONE_REASONS = frozenset(["confirmed", "stabilized"])
 # stop_reason values that map to retry without further disposition data.
 # Provider failures are excluded: their structured ``result.retryable`` flag is
 # authoritative, so malformed/replay-unsafe requests never re-enter the DAG.
+# ``context_overflow`` is explicitly replay-safe: a fresh node attempt rebuilds
+# a trimmed transcript, which is the recovery agent_turn requests.
+# ``reply_truncated`` likewise: the provider cut the reply off at its output cap
+# after agent_turn already asked once for a compact re-emit, and a fresh attempt
+# (now funded with the shared completion headroom, see
+# tool_budget.completion_cap_for_subagent) can genuinely fit the directive. It
+# used to arrive as ``no_code`` and escalate immediately, attributing a provider
+# output cap to model inaction.
 _RETRY_REASONS = frozenset([
     "max_iters", "phase_step_cap", "guardrail_blocked", "blocked",
+    "context_overflow", "reply_truncated",
 ])
 # stop_reason values that map to escalate (failed build / no model output / auth)
 _ESCALATE_REASONS = frozenset([
@@ -196,19 +209,21 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
          ``services.agent.tiers.provider_for_tier``.
       4. Ambient ``config.get_provider()`` default.
     """
+    from services.agent.role_models import clamp_provider_effort  # noqa: PLC0415
+
     node_inputs = context_pack.get("node_inputs") or {}
 
     def _ambient():
         """The provider this node gets when no role-specific pick applies:
         caller-injected → node tier → ambient config default."""
         if provider is not None:
-            return provider
+            return clamp_provider_effort(provider)
         tier = node_inputs.get("tier") or context_pack.get("tier")
         if tier:
             from services.agent.tiers import provider_for_tier  # noqa: PLC0415
-            return provider_for_tier(tier)
+            return clamp_provider_effort(provider_for_tier(tier))
         from services.agent import config  # noqa: PLC0415
-        return config.get_provider()
+        return clamp_provider_effort(config.get_provider())
     # WS2/WS4 + mega-5: difficulty-aware pick first (even without ai_roles).
     try:
         from services.agent.role_models import (  # noqa: PLC0415
@@ -421,7 +436,9 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
                     (cfg_pick.get("openai") or {}).get("api_key") or "ollama",
                 )
             try:
-                return agent_config.get_provider(name=prov_name, cfg=cfg_pick)
+                return clamp_provider_effort(
+                    agent_config.get_provider(name=prov_name, cfg=cfg_pick)
+                )
             except Exception as exc:  # noqa: BLE001 — try degrade chain
                 # mega-6: local leaf may need pull / not running — never block.
                 # Prefer openrouter free when keyed, else fall through to injected.
@@ -474,7 +491,7 @@ def _resolve_provider(context_pack: dict[str, Any], provider=None):
                                     }
                                 except Exception:  # noqa: BLE001
                                     pass
-                                return prov
+                                return clamp_provider_effort(prov)
                             except Exception:  # noqa: BLE001
                                 continue
                 # fall through to injected / tier / ambient
@@ -567,6 +584,26 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
         )
     except Exception:  # noqa: BLE001 — policy assembly is best-effort
         pass
+    # SAME floor the delegate lane applies (copilot_mode_tools.apply_meta_tool_floor):
+    # a restricted node must SEE enable_tools / list_tool_categories, not merely
+    # be able to call them. agent_turn adds them to its dispatch gate either
+    # way, so skipping this did not make them uncallable — it made them
+    # invisible, and every compiled DAG node ran confined to its 14 card tools
+    # while the delegate path expanded freely. Must run BEFORE render_tools_block.
+    try:
+        from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+            apply_meta_tool_floor,
+        )
+        _floored = apply_meta_tool_floor(
+            allowed_tools,
+            advisor=(context_pack.get("advisor")
+                     if "advisor" in context_pack
+                     else getattr(mission_dispatch, "advisor", None)),
+        )
+        if _floored is not None:
+            allowed_tools = _floored
+    except Exception:  # noqa: BLE001 — the floor never blocks a node
+        pass
     # Per-node tool budget: context pack value, else an env cap (lets a bench cap the
     # turn length for a time-boxed real run), else the agent_turn default.
     max_tools = context_pack.get("max_tools_per_turn")
@@ -599,6 +636,10 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
     # mission-first resolver the dispatcher uses.  Measured cost is logged to the
     # ledger (one tools_slot event per node turn) — recorded, never invented.
     profile = _tier_profile(context_pack)
+    from services.agent.tool_budget import (  # noqa: PLC0415
+        completion_cap_for_subagent,
+    )
+    completion_cap = completion_cap_for_subagent(profile)
     tools_text = None
     if allowed_tools:
         try:
@@ -623,7 +664,7 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
         allowed_tools=allowed_tools,
         system_prompt=context_pack.get("role_system_prompt"),
         max_tool_calls=max_tools,
-        max_tokens=(int(profile.generation_headroom) if profile else None),
+        max_tokens=completion_cap,
         ledger=ledger, actor=node_name,
         mission_dispatch=mission_dispatch, tools_text=tools_text,
         # M20: thread the live event sink + span context so agent_turn emits
@@ -973,15 +1014,10 @@ def run(
     # with the default prompt / no extra tool scoping), matching the ledger seam
     # discipline elsewhere in this pipeline.
     role_card = _resolve_role_card(node)
-    restore_tool_policy = None
     if role_card is not None:
-        # T-W30: the registry policy is PROCESS-GLOBAL — scope it to THIS node's
-        # turn (snapshot now, restore after the agent returns). Leaving it set
-        # leaked one node's role allowlist into every later dispatch in the
-        # process (caught as ~78 cad_tools/gsl_tools refusals in the gate sweep
-        # once mission nodes started resolving their cards).
-        restore_tool_policy = _snapshot_tool_policy()
-        _apply_role_tool_policy(role_card)
+        # The registry policy is process-global. It is applied only around the
+        # agent call below and restored by _scoped_role_tool_policy; restoration
+        # failure is a node failure, never silent best-effort cleanup.
         context_pack = dict(context_pack)
         context_pack["role_id"] = role_card.id
         # WI-16: append per-capability SOFT phrasing (A mandatory / B suggestive /
@@ -1042,26 +1078,52 @@ def run(
     })
 
     t0 = time.monotonic()
+    agent_error: Exception | None = None
+    policy_error: _ToolPolicyScopeError | None = None
     try:
-        agent_result = _agent_fn(request, context_pack)
-    except Exception as exc:  # noqa: BLE001
+        with _scoped_role_tool_policy(role_card):
+            try:
+                agent_result = _agent_fn(request, context_pack)
+            except Exception as exc:  # noqa: BLE001
+                agent_error = exc
+    except _ToolPolicyScopeError as exc:
+        policy_error = exc
+
+    if policy_error is not None:
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        error = str(policy_error)
+        if agent_error is not None:
+            error = f"{error}; agent also raised: {agent_error}"
+        _emit(emit, "dag.node.failed", {
+            "node_id": node_id,
+            "error": error,
+        })
+        return VERDICT_ESCALATE, {
+            "status": "failed",
+            "summary": f"Tool policy scope failed: {error}",
+            "data": {
+                "stop_reason": "tool_policy_restore_failed",
+                "error": error,
+                "elapsed_ms": round(elapsed_ms, 1),
+            },
+            "retry_remaining": retry_remaining,
+            "doc_id": node_inputs.get("doc_id"),
+        }
+
+    if agent_error is not None:
         # Unrecoverable agent error → escalate immediately.
         _emit(emit, "dag.node.failed", {
             "node_id": node_id,
-            "error": str(exc),
+            "error": str(agent_error),
         })
         output_state = {
             "status": "failed",
-            "summary": f"Agent raised exception: {exc}",
-            "data": {"error": str(exc)},
+            "summary": f"Agent raised exception: {agent_error}",
+            "data": {"error": str(agent_error)},
             "retry_remaining": retry_remaining,
             "doc_id": node_inputs.get("doc_id"),
         }
         return VERDICT_ESCALATE, output_state
-    finally:
-        # Restore the pre-turn registry policy (role scoping is per-turn).
-        if restore_tool_policy is not None:
-            restore_tool_policy()
 
     elapsed_ms = (time.monotonic() - t0) * 1000.0
 
@@ -1120,13 +1182,12 @@ def run(
 
     # Consume retry budget when the verdict is retry.
     new_retry_remaining = retry_remaining
+    retry_budget_exhausted = False
     if verdict == VERDICT_RETRY:
-        new_retry_remaining = retry_remaining - 1
-        if new_retry_remaining < 0:
-            new_retry_remaining = 0
+        new_retry_remaining = max(0, retry_remaining - 1)
         if new_retry_remaining == 0:
             verdict = VERDICT_ESCALATE
-
+            retry_budget_exhausted = True
     # Build output_state.
     final_code: str | None = getattr(agent_result, "final_code", None)
     agent_result_dict: dict | None = getattr(agent_result, "result", None)
@@ -1190,9 +1251,12 @@ def run(
             "reason": f"retry (budget remaining: {new_retry_remaining})",
         })
     else:  # escalate
+        error = f"escalated: {stop_reason}"
+        if retry_budget_exhausted:
+            error += " (retry budget exhausted)"
         _emit(emit, "dag.node.failed", {
             "node_id": node_id,
-            "error": f"escalated: {stop_reason} (budget exhausted)",
+            "error": error,
         })
 
     return verdict, output_state
@@ -1234,31 +1298,55 @@ def _apply_role_tool_policy(role_card: Any) -> None:
         pass
 
 
-def _snapshot_tool_policy() -> "Optional[Callable[[], None]]":
-    """Capture the tool_registry's current policy; return a restore callable.
+class _ToolPolicyScopeError(RuntimeError):
+    """The process-global registry policy could not be safely scoped."""
 
-    T-W30: ``set_policy`` mutates module globals, so a role's allowlist applied
-    for one node turn would otherwise leak into the whole process (every later
-    dispatch, and every later test in a combined sweep). Reads the registry's
-    private fields deliberately — there is no public getter — with the same
-    best-effort discipline as ``_apply_role_tool_policy``."""
+
+@contextmanager
+def _scoped_role_tool_policy(role_card: Any) -> Iterator[None]:
+    """Apply one role policy and make restoration failure fatal and observable."""
+    if role_card is None:
+        yield
+        return
     try:
-        from services.mcp import tool_registry as reg  # noqa: PLC0415
-        prev_allow = set(reg._ACTIVE_ALLOW) if reg._ACTIVE_ALLOW is not None else None
-        prev_deny = set(reg._ACTIVE_DENY_RISK) if reg._ACTIVE_DENY_RISK is not None else None
-        prev_set = bool(reg._POLICY_SET)
+        restore = _snapshot_tool_policy()
+    except Exception as exc:  # noqa: BLE001
+        _LOG.exception("Failed to snapshot process-global tool policy")
+        raise _ToolPolicyScopeError(
+            f"tool policy snapshot failed: {exc}"
+        ) from exc
 
-        def _restore() -> None:
-            try:
-                if prev_set:
-                    reg.set_policy(allow=prev_allow, deny_risk=prev_deny)
-                else:
-                    reg.reset_policy()
-            except Exception:  # noqa: BLE001
-                pass
-        return _restore
-    except Exception:  # noqa: BLE001
-        return None
+    _apply_role_tool_policy(role_card)
+    try:
+        yield
+    finally:
+        try:
+            restore()
+        except Exception as exc:  # noqa: BLE001
+            _LOG.exception("Failed to restore process-global tool policy")
+            raise _ToolPolicyScopeError(
+                f"tool policy restoration failed: {exc}"
+            ) from exc
+
+
+def _snapshot_tool_policy() -> Callable[[], None]:
+    """Capture the process-global tool registry policy for exact restoration."""
+    from services.mcp import tool_registry as reg  # noqa: PLC0415
+    prev_allow = set(reg._ACTIVE_ALLOW) if reg._ACTIVE_ALLOW is not None else None
+    prev_deny = (
+        set(reg._ACTIVE_DENY_RISK)
+        if reg._ACTIVE_DENY_RISK is not None
+        else None
+    )
+    prev_set = bool(reg._POLICY_SET)
+
+    def _restore() -> None:
+        if prev_set:
+            reg.set_policy(allow=prev_allow, deny_risk=prev_deny)
+        else:
+            reg.reset_policy()
+
+    return _restore
 
 
 # ---------------------------------------------------------------------------

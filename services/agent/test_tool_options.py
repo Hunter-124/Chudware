@@ -233,6 +233,12 @@ class TestDispatchOptions(unittest.TestCase):
         self.assertEqual(seen, {"path": "bom.csv", "limit": 500})
 
     def test_max_calls_per_turn(self):
+        """The cap REFUSES as data, names the remedy, and is charged per call.
+
+        Live 2026-08-26: a research turn got a red "failed" card reading
+        ``tool 'research_web_search' exceeded max_calls_per_turn=3
+        (agent.tool_options)`` — a config key where a next action belonged.
+        """
         from services.agent import agent_turn as at
 
         cfg_opts = {
@@ -240,7 +246,7 @@ class TestDispatchOptions(unittest.TestCase):
             "timeout_s": None,
             "max_calls_per_turn": 1,
             "param_defaults": {},
-            "prompt_note": "",
+            "prompt_note": "Use research_fetch_page to read what this found.",
         }
         counts: dict = {}
         with mock.patch(
@@ -249,10 +255,126 @@ class TestDispatchOptions(unittest.TestCase):
             "services.agent.reviewer_exec._resolve_fn",
             return_value=lambda **k: {"ok": True},
         ):
-            at._dispatch_tool("t", {}, _call_counts=counts)
-            with self.assertRaises(RuntimeError) as cm:
+            first = at._dispatch_tool("t", {}, _call_counts=counts)
+            second = at._dispatch_tool("t", {}, _call_counts=counts)
+        # The call that spends the last unit warns BEFORE the cap bites.
+        self.assertIn("BUDGET", first.get("arg_interpretation", ""))
+        # The refusal is DATA, carries the remedy, and is flagged as policy.
+        self.assertIs(second["ok"], False)
+        self.assertEqual(second["status"], "call_cap_reached")
+        self.assertIs(second["policy_refusal"], True)
+        self.assertEqual(second["call_cap"], 1)
+        self.assertIn("research_fetch_page", second["error"])
+        self.assertTrue(at._is_policy_refusal(second))
+
+    def test_cap_is_not_charged_for_calls_that_never_ran(self):
+        """Argument-validation teaching errors must not retire the tool.
+
+        Charging the cap BEFORE dispatch meant N malformed calls permanently
+        capped a tool the model had never once used successfully — and the
+        refusal then blamed a limit it had not actually spent.
+        """
+        from services.agent import agent_turn as at
+
+        cfg_opts = {
+            "enabled": True,
+            "timeout_s": None,
+            "max_calls_per_turn": 2,
+            "param_defaults": {},
+            "prompt_note": "",
+        }
+        counts: dict = {}
+        bad = {"ok": False, "status": "bad_arguments", "error": "missing path"}
+        with mock.patch(
+            "services.agent.config.get_tool_options", return_value=cfg_opts
+        ), mock.patch(
+            "services.agent.reviewer_exec._resolve_fn",
+            return_value=lambda **k: bad,
+        ):
+            for _ in range(4):
                 at._dispatch_tool("t", {}, _call_counts=counts)
-        self.assertIn("max_calls_per_turn", str(cm.exception))
+        self.assertEqual(counts, {})
+        with mock.patch(
+            "services.agent.config.get_tool_options", return_value=cfg_opts
+        ), mock.patch(
+            "services.agent.reviewer_exec._resolve_fn",
+            return_value=lambda **k: {"ok": True},
+        ):
+            good = at._dispatch_tool("t", {}, _call_counts=counts)
+        self.assertIs(good["ok"], True)
+        self.assertEqual(counts, {"t": 1})
+
+    def test_disabled_tool_teaches_instead_of_raising(self):
+        """A Settings kill-switch is a user choice, not a crash."""
+        from services.agent import agent_turn as at
+
+        cfg_opts = {
+            "enabled": False,
+            "timeout_s": None,
+            "max_calls_per_turn": None,
+            "param_defaults": {},
+            "prompt_note": "",
+        }
+        with mock.patch(
+            "services.agent.config.get_tool_options", return_value=cfg_opts
+        ):
+            res = at._dispatch_tool("t", {}, _call_counts={})
+        self.assertIs(res["ok"], False)
+        self.assertEqual(res["status"], "tool_disabled")
+        self.assertIn("Settings", res["error"])
+        self.assertTrue(at._is_policy_refusal(res))
+
+    def test_disabled_tool_is_never_advertised(self):
+        """Dispatch can only refuse it, so the schema must not offer it."""
+        from services.agent import tool_schemas as ts
+
+        def dummy(path: str):
+            """Read a file."""
+            return {}
+
+        cfg_opts = {
+            "enabled": False,
+            "timeout_s": None,
+            "max_calls_per_turn": None,
+            "param_defaults": {},
+            "prompt_note": "",
+            "description_override": "",
+            "schema_trim": None,
+        }
+        with mock.patch(
+            "services.agent.config.get_tool_options", return_value=cfg_opts
+        ):
+            text, meta = ts.render_tools_block(
+                ["dummy"], resolver=lambda n: dummy,
+                include_category_menu=False)
+        self.assertEqual(text, "")
+        self.assertEqual(meta["disabled"], ["dummy"])
+        self.assertEqual(meta["rendered"], [])
+
+    def test_effective_cap_is_advertised_in_the_tools_slot(self):
+        """An undisclosed cap cannot be planned around."""
+        from services.agent import tool_schemas as ts
+
+        def dummy(query: str):
+            """FIND sources."""
+            return {}
+
+        cfg_opts = {
+            "enabled": True,
+            "timeout_s": None,
+            "max_calls_per_turn": 3,
+            "param_defaults": {},
+            "prompt_note": "",
+            "description_override": "",
+            "schema_trim": None,
+        }
+        with mock.patch(
+            "services.agent.config.get_tool_options", return_value=cfg_opts
+        ):
+            text, _meta = ts.render_tools_block(
+                ["dummy"], resolver=lambda n: dummy,
+                include_category_menu=False)
+        self.assertIn("Per-turn limit: at most 3", text)
 
     def test_error_hint_appended(self):
         from services.agent import agent_turn as at

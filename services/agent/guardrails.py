@@ -90,19 +90,22 @@ MSG_INTERFERENCE = (
     "verify_battery(doc_id, checks=['check_interference']), which covers it. "
     "(A plain verify_battery(doc_id) does NOT: the default battery runs only "
     "subsecond checks and check_interference is cost-class 'seconds'.) "
-    "Otherwise waive with check='check_interference' + reason."
+    "Otherwise emit terminal handoff JSON "
+    '{"done":true,"handoff":{"waivers":[{"check":"check_interference",'
+    '"reason":"<non-empty reason>"}]}}. The waiver is a handoff field, not a tool call.'
 )
 MSG_ORPHAN_SKETCH = (
     "HARD guardrail: orphan sketch(es) remain unconsumed. Extrude/revolve them, "
-    "delete them, or waive each with check='orphan_sketch:<id>' + reason. "
-    "Orphans: {ids}"
+    "delete them, or emit terminal handoff JSON "
+    '{{"done":true,"handoff":{{"waivers":[{{"check":"orphan_sketch:<id>",'
+    '"reason":"<non-empty reason>"}}]}}}} for each intentional orphan. '
+    "The waiver is a handoff field, not a tool call. Orphans: {ids}"
 )
 MSG_CHECKPOINT_FAIL = (
-    "HARD guardrail: auto-checkpoint before destructive tool {tool!r} failed "
-    "({reason}); the destructive call was blocked. The snapshot is a safety "
-    "net, not a correctness gate — if the engine still cannot checkpoint this "
-    "doc, repeat the call and it will proceed UNPROTECTED (recorded on the "
-    "ledger), or close the doc to escape it."
+    "HARD guardrail: auto-checkpoint before tool {tool!r} failed ({reason}); "
+    "this call was blocked. The snapshot is a safety net, not a correctness "
+    "gate. Retry the same call once; if checkpointing still fails, that retry "
+    "will proceed UNPROTECTED and the waiver will be recorded on the ledger."
 )
 MSG_REFS = (
     "HARD guardrail: dangling feature/face refs — cannot apply. "
@@ -1066,26 +1069,30 @@ def reset_checkpoint_failures() -> None:
     _checkpoint_failures.clear()
 
 
-def pre_dispatch_checkpoint(tool: str, args: dict | None, *,
-                            ledger: Any = None,
-                            actor: str = "guardrails",
-                            cfg: dict | None = None,
-                            checkpoint_fn: Callable[..., Any] | None = None,
-                            vault_bound: bool = False,
-                            ) -> Optional[GuardVerdict]:
-    """WI-12 pre-dispatch. Returns a blocking GuardVerdict or None to proceed."""
-    if not is_destructive_tool(tool, args):
-        return None
+def checkpoint_verdict(tool: str, args: dict | None, *,
+                       ledger: Any = None,
+                       actor: str = "guardrails",
+                       cfg: dict | None = None,
+                       checkpoint_fn: Callable[..., Any] | None = None,
+                       vault_bound: bool = False,
+                       ) -> Optional[GuardVerdict]:
+    """Shared checkpoint attempt, failure memo, and bounded escape policy.
+
+    Callers decide whether a tool needs protection; this helper is the sole
+    owner of checkpoint failure accounting. The first failure for a document
+    blocks. A still-failing retry proceeds unprotected with a ledger waiver.
+    """
     if not auto_checkpoint_enabled(cfg):
-        emit_hard_guardrail(ledger, "auto_checkpoint", "waived",
-                            reason="kill-switch hard_guardrails.auto_checkpoint=false",
-                            actor=actor)
-        return None  # kill-switch: do not block
+        emit_hard_guardrail(
+            ledger, "auto_checkpoint", "waived",
+            reason="kill-switch hard_guardrails.auto_checkpoint=false",
+            actor=actor,
+        )
+        return None
+
     doc_id = None
-    if isinstance(args, dict):
-        doc_id = args.get("doc_id")
-        if doc_id is not None:
-            doc_id = str(doc_id)
+    if isinstance(args, dict) and args.get("doc_id") is not None:
+        doc_id = str(args["doc_id"])
     ok, reason = take_auto_checkpoint(
         doc_id, tool, ledger=ledger, actor=actor,
         checkpoint_fn=checkpoint_fn, vault_bound=vault_bound,
@@ -1094,31 +1101,52 @@ def pre_dispatch_checkpoint(tool: str, args: dict | None, *,
     if ok:
         _checkpoint_failures.pop(key, None)
         return None
-    # Escape 1: never trap the session inside a doc it cannot snapshot.
+
+    # Never trap the session inside a document it cannot snapshot.
     if tool in _CHECKPOINT_ESCAPE_TOOLS:
         emit_hard_guardrail(
             ledger, "auto_checkpoint", "waived",
             reason=(f"checkpoint failed ({reason}) but {tool} is the escape "
                     "from an unsnapshottable doc — allowed unprotected"),
-            actor=actor)
+            actor=actor,
+        )
         return None
-    if len(_checkpoint_failures) > 256:  # bounded memo
+
+    if len(_checkpoint_failures) > 256:
         _checkpoint_failures.clear()
-    fails = _checkpoint_failures.get(key, 0) + 1
-    _checkpoint_failures[key] = fails
-    # Escape 2: warn once, then proceed unprotected rather than wedge the run.
-    if fails > 1:
+    failures = _checkpoint_failures.get(key, 0) + 1
+    _checkpoint_failures[key] = failures
+    if failures > 1:
         emit_hard_guardrail(
             ledger, "auto_checkpoint", "waived",
-            reason=(f"checkpoint still failing for doc {key!r} after {fails} "
+            reason=(f"checkpoint still failing for doc {key!r} after {failures} "
                     f"attempts ({reason}); proceeding UNPROTECTED so the doc is "
                     "not permanently locked"),
-            actor=actor)
+            actor=actor,
+        )
         return None
     return GuardVerdict(
-        ok=False, name="auto_checkpoint", outcome="blocked",
+        ok=False,
+        name="auto_checkpoint",
+        outcome="blocked",
         reason=reason,
         message=MSG_CHECKPOINT_FAIL.format(tool=tool, reason=reason),
+    )
+
+
+def pre_dispatch_checkpoint(tool: str, args: dict | None, *,
+                            ledger: Any = None,
+                            actor: str = "guardrails",
+                            cfg: dict | None = None,
+                            checkpoint_fn: Callable[..., Any] | None = None,
+                            vault_bound: bool = False,
+                            ) -> Optional[GuardVerdict]:
+    """WI-12 destructive classifier followed by the shared checkpoint verdict."""
+    if not is_destructive_tool(tool, args):
+        return None
+    return checkpoint_verdict(
+        tool, args, ledger=ledger, actor=actor, cfg=cfg,
+        checkpoint_fn=checkpoint_fn, vault_bound=vault_bound,
     )
 
 

@@ -7,6 +7,7 @@
 #include "copilot_internal.h"
 #include "agent_text.h"
 #include "stream_rows.h"              // ui::streamTextVisible — a blank prose box draws nothing
+#include "tool_outcome.h"
 #include "ui/copilot/tool_phrase.h"   // human phrasing + grouping for raw MCP tool symbols
 #include "ui/ai/ai_prefs.h"           // cached chat-display prefs (Settings -> AI -> Harness)
 #include "gl_compat.h"                // glDeleteTextures — bounded artifact texture cache
@@ -1223,6 +1224,9 @@ ToolRowDetail splitToolRowDetail(const std::string& detail) {
         } catch (...) { d.ts = 0.0; d.cacheRead = 0; }
         if (d.cacheRead < 0) d.cacheRead = 0;
     }
+    // OUT is a private ActivityItem trailer, not user-visible detail. Strip it before ERR/ART
+    // parsing so copy paths and drawers never expose marker bytes or taxonomy plumbing.
+    ui::copilot::stripToolOutcomeTrailer(d.args);
     const char* kArtMark = "\n\x1e" "ART\x1e\n";
     const char* kArtMarkBare = "\x1e" "ART\x1e\n";
     mark = d.args.find(kArtMark);
@@ -1284,31 +1288,96 @@ static bool artifactLine(const std::string& line, std::string* kindOut, std::str
     return true;
 }
 
-// True when a tool-call failure payload is the harness REFUSING a repeated (tool, args) pair
-// (services/agent/tool_loop_guard.py — ToolCallLoopGuard.message()) rather than a tool that ran
-// and broke. agent_events.tool_call_event ships no structured flag for it (the payload carries
-// only ok/error_preview), so the message marker IS the wire contract. Matched case-insensitively
-// anywhere in the HEAD of the text rather than as an exact prefix: the same message reaches the
-// GUI bare (dispatch raises RuntimeError(msg)), behind an exception-class prefix, or quoted
-// inside a {"ok": false, "error": …} dump depending on which dispatch path refused. Bounding the
-// search to the head keeps a genuine tool failure that merely quotes a guard message deeper in
-// its output from being recoloured as an intervention.
-static bool isLoopGuardRefusal(const std::string& err) {
-    static const char kMark[] = "loop guard:";
-    const size_t marklen = sizeof(kMark) - 1;
-    const size_t head = err.size() < 160 ? err.size() : 160;
-    if (head < marklen) return false;
-    for (size_t i = 0; i + marklen <= head; ++i) {
-        size_t k = 0;
-        while (k < marklen &&
-               (char)std::tolower((unsigned char)err[i + k]) == kMark[k]) ++k;
-        if (k == marklen) return true;
+// Rendering policy for the structured tool outcome. Legacy means the OUT trailer is absent,
+// malformed, or from a future daemon; every caller must then preserve the old status-based path.
+// `executed` is part of the wording, not decorative metadata: it prevents a timeout from claiming
+// nothing ran and keeps pre-execution refusals honest.
+struct ToolOutcomePresentation {
+    ui::copilot::ToolOutcomeInfo info;
+    bool structured = false;
+    bool succeeded  = false;
+    bool declined   = false;
+    bool timeout    = false;
+    bool failure    = false;
+    ui::kit::Tone tone = ui::kit::Tone::Neutral;
+    const char* chip = "";
+    std::string message;
+};
+
+static ToolOutcomePresentation toolOutcomePresentation(const ActivityItem& a) {
+    ToolOutcomePresentation p;
+    p.info = ui::copilot::toolOutcomeFromDetail(a.detail);
+    p.structured = p.info.kind != ui::copilot::ToolOutcomeKind::Legacy;
+    switch (p.info.kind) {
+        case ui::copilot::ToolOutcomeKind::Ok:
+            p.succeeded = true;
+            break;
+        case ui::copilot::ToolOutcomeKind::PolicyRefusal:
+            p.declined = true;
+            p.tone = ui::kit::Tone::Info;
+            p.chip = "declined";
+            p.message = p.info.executed
+                ? "Harness policy declined this call, although the event reports that execution "
+                  "started."
+                : "Harness policy declined this call. The tool did not run.";
+            break;
+        case ui::copilot::ToolOutcomeKind::GuardBlock:
+            p.declined = true;
+            p.tone = ui::kit::Tone::Info;
+            p.chip = "blocked";
+            p.message = p.info.executed
+                ? "The harness declined this call because a guard blocked it, although the event "
+                  "reports that execution started."
+                : "The harness declined this call because a guard blocked it before execution. "
+                  "The tool did not run.";
+            break;
+        case ui::copilot::ToolOutcomeKind::ValidationError:
+            p.failure = true;
+            p.tone = ui::kit::Tone::Err;
+            p.chip = "invalid call";
+            p.message = p.info.executed
+                ? "Call validation failed after execution was reported."
+                : "Call validation failed \xe2\x80\x94 the model's arguments did not bind. The tool "
+                  "did not run.";
+            break;
+        case ui::copilot::ToolOutcomeKind::TimeoutUnknown:
+            p.timeout = true;
+            p.tone = ui::kit::Tone::Warn;
+            p.chip = "UNKNOWN";
+            p.message = p.info.executed
+                ? "Outcome UNKNOWN \xe2\x80\x94 the tool started, timed out, and may still be running."
+                : "Outcome UNKNOWN \xe2\x80\x94 execution could not be confirmed and the call may "
+                  "still be running.";
+            break;
+        case ui::copilot::ToolOutcomeKind::InternalError:
+            p.failure = true;
+            p.tone = ui::kit::Tone::Err;
+            p.chip = "harness error";
+            p.message = p.info.executed
+                ? "Harness internal error after the tool started."
+                : "Harness internal error before tool execution could be confirmed.";
+            break;
+        case ui::copilot::ToolOutcomeKind::ToolError:
+            p.failure = true;
+            p.tone = ui::kit::Tone::Err;
+            p.chip = "tool failed";
+            p.message = p.info.executed
+                ? "The tool ran and failed."
+                : "The tool reported an error before its body ran.";
+            break;
+        case ui::copilot::ToolOutcomeKind::Legacy:
+        default:
+            p.failure = a.status == "fail" || a.status == "error";
+            p.succeeded = !p.failure && a.status != "running";
+            p.tone = rowToneOf(a.status, /*guardRefusal=*/false);
+            p.chip = p.failure ? "failed" : "";
+            break;
     }
-    return false;
+    return p;
 }
 
-static bool toolRowIsGuardRefusal(const ActivityItem& a) {
-    return a.status == "fail" && isLoopGuardRefusal(splitToolRowDetail(a.detail).err);
+static bool toolRowIsDeclined(const ActivityItem& a) {
+    return toolOutcomePresentation(a).declined;
 }
 
 // Compact wall-clock label for a tool row's META timestamp ("4:37 PM"), ""
@@ -1386,10 +1455,10 @@ static void drawToolDetailBox(const char* id, const std::string& text, ImFont* f
 // drawer shut instead of snapping when the next call starts).
 //
 // A call that FAILED gets a Tone::Err rail and prints its reason in full, wrapped, collapsed or
-// not. A loop-guard refusal is not a failure at all (the tool never ran), so it takes the
-// informational Tone::Info rail and says so in words. `failCount` > 1 collapses consecutive
-// identical tool+target fails into one row; a non-null `group` of >1 is a fold of consecutive
-// SIMILAR successful calls into one row (drawAgentTimeline computes both runs).
+// not. Harness refusals are informational skipped rows, and a timeout is amber/UNKNOWN because
+// execution may still be live. `failCount` > 1 collapses consecutive identical tool+target
+// failures of the SAME taxonomy class into one row; a non-null `group` of >1 is a fold of
+// consecutive SIMILAR successful calls (drawAgentTimeline computes both runs).
 static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& fonts,
                                 int failCount, bool liveFrontier, int callI = -1,
                                 const std::vector<ActivityItem*>* group = nullptr,
@@ -1401,33 +1470,31 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     const bool diag      = detailLvl >= 2;   // + the raw MCP symbol dim after the human title
     const bool showRenders = ui::chatShowRenders();
     const int  groupN    = (group && group->size() > 1) ? (int)group->size() : 1;
-    // Split the packed detail FIRST: whether this row is a genuine failure or the harness's own
-    // loop-guard refusal decides the glyph, chip, tone and border drawn below.
+    // Split the packed detail once and resolve the structured presentation once. Unknown/missing
+    // taxonomy stays on the legacy status path; no historical row receives an invented state.
     const ToolRowDetail parts = splitToolRowDetail(a.detail);
     const std::string& argsBody = parts.args;
     const std::string& errBody  = parts.err;
     const std::string& artsBlob = parts.arts;
-    const bool fail     = a.status == "fail";
-    const bool guard    = fail && isLoopGuardRefusal(errBody);
-    const bool hardFail = fail && !guard;   // a tool actually ran and broke
-    // One hue per meaning, and the same one the gutter mark uses: a genuine failure is Tone::Err
-    // (spineStatusOf maps it to Status::Failed, which resolves to exactly this), a refusal is the
-    // informational Tone::Info. The old amber-on-red split had the rail disagreeing with the mark
-    // beside it; "not catastrophic" is now carried by WEIGHT — a 2 dp rail, not a boxed border.
-    const ImVec4 failTone  = ui::kit::toneOn(ui::kit::Tone::Err, chatSurf());
-    const ImVec4 guardTone = ui::kit::toneOn(ui::kit::Tone::Info, chatSurf());
-    // The one-line cause, hoisted: the row prints it (never truncated) and the drawer only exists
-    // when the raw text says MORE than it does.
-    const std::string errShort = (hardFail && !errBody.empty()) ? errSummary(errBody)
-                                                                : std::string();
+    const ToolOutcomePresentation outcome = toolOutcomePresentation(a);
+    const bool hardFail = outcome.failure;
+    const bool declined = outcome.declined;
+    const bool timeout  = outcome.timeout;
+    const bool exceptional = hardFail || declined || timeout;
+    const ImVec4 outcomeTone = ui::kit::toneOn(outcome.tone, chatSurf());
+    // The one-line raw cause is hoisted: the row prints it (never truncated) and the drawer only
+    // exists when the payload says MORE than the summary.
+    const std::string errShort =
+        ((hardFail || timeout) && !errBody.empty()) ? errSummary(errBody) : std::string();
 
     // Drawer state is settled BEFORE anything is drawn: the header's click targets and the
     // animated body both need it, and a grouped card's drawer is its members' drawers stacked.
     const bool open = a.userToggled ? a.expanded : (a.expanded || liveFrontier);
-    // A hard failure whose raw text IS its summary has nothing extra to reveal, so it must not
-    // advertise "(details)" onto an empty drawer.
+    // A summarized exception whose raw text IS its summary has nothing extra to reveal, so it
+    // must not advertise "(details)" onto an empty drawer.
     bool hasDrawer = !argsBody.empty() || !artsBlob.empty() ||
-                     (guard && !errBody.empty()) || (hardFail && errShort != errBody);
+                     (declined && !errBody.empty()) ||
+                     ((hardFail || timeout) && errShort != errBody);
     if (groupN > 1) {
         hasDrawer = false;
         for (const ActivityItem* mi : *group) {
@@ -1445,8 +1512,8 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
 
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     // A completed call gets NO shell: it is a log line. Only an exceptional one earns a rail.
-    RowShell sh = beginRowShell("##toolrow", rowToneOf(a.status, guard), 0.0f,
-                                (hardFail || guard) ? kRailStrong : 0.0f);
+    RowShell sh = beginRowShell("##toolrow", outcome.tone, 0.0f,
+                                exceptional ? kRailStrong : 0.0f);
     const ui::AdaptiveSurface& surf = chatSurf();
 
     // One artifact blob -> inline images (or, with renders off, dim path lines) + file actions.
@@ -1499,31 +1566,24 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     }
     std::string metaS;
     if (!simple) {
-        char meta[96];
-        // A refusal has no latency worth showing (nothing was dispatched) and is not a failure:
-        // it is the harness skipping a call the model already made.
+        char meta[128];
         if (groupN > 1) {
             if (groupMs > 0) {
                 std::snprintf(meta, sizeof(meta), "%.1fs", groupMs / 1000.0);
                 metaS = meta;
             }
-        } else if (guard && failCount > 1) {
-            std::snprintf(meta, sizeof(meta), "skipped \xc3\x97%d", failCount);
-            metaS = meta;
-        } else if (guard) {
-            metaS = "skipped";
-        } else if (hardFail && failCount > 1 && a.durationMs > 0) {
-            std::snprintf(meta, sizeof(meta), "failed \xc3\x97%d \xc2\xb7 %.1fs",
-                          failCount, a.durationMs / 1000.0);
-            metaS = meta;
-        } else if (hardFail && failCount > 1) {
-            std::snprintf(meta, sizeof(meta), "failed \xc3\x97%d", failCount);
-            metaS = meta;
-        } else if (hardFail && a.durationMs > 0) {
-            std::snprintf(meta, sizeof(meta), "failed \xc2\xb7 %.1fs", a.durationMs / 1000.0);
-            metaS = meta;
-        } else if (hardFail) {
-            metaS = "failed";
+        } else if (exceptional) {
+            metaS = outcome.chip;
+            if (failCount > 1) {
+                std::snprintf(meta, sizeof(meta), " \xc3\x97%d", failCount);
+                metaS += meta;
+            }
+            // A pre-execution decline has no meaningful latency. Failures and UNKNOWN timeouts do:
+            // elapsed time helps distinguish an immediate bind error from work that ran.
+            if (!declined && a.durationMs > 0) {
+                std::snprintf(meta, sizeof(meta), " \xc2\xb7 %.1fs", a.durationMs / 1000.0);
+                metaS += meta;
+            }
         } else if (a.durationMs > 0) {
             std::snprintf(meta, sizeof(meta), "%.1fs", a.durationMs / 1000.0);
             metaS = meta;
@@ -1557,10 +1617,11 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     const float rewindW = hasRewind ? ImGui::GetTextLineHeight() * 1.15f + 8 * sc : 0.0f;
 
     // Same rule as drawActionCard: when the run spine owns this row's mark out in the gutter, the
-    // row must not paint a second one. The spine's own status resolution (spineStatusOf) applies
-    // the identical retry/skipped remap, so the gutter mark says exactly what this glyph would.
+    // row must not paint a second one. UNKNOWN uses the existing Retry ring; a declined call uses
+    // the Skipped dash, and every true failure uses the Failed cross.
     if (onSpine) ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
-    else         drawStatusGlyph(hardFail ? "fail" : guard ? "skipped" : a.status,
+    else         drawStatusGlyph(hardFail ? "fail" : declined ? "skipped" : timeout ? "retry"
+                                                                            : a.status,
                                  ImGui::GetTextLineHeight());
     ImGui::SameLine(0, 6 * sc);
     ui::IconUV iv = ui::getIcon("cat_tools", 20);
@@ -1574,16 +1635,16 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     auto lineRoom = [&]() {
         return ImGui::GetContentRegionMax().x - ImGui::GetCursorPosX() - metaW - rewindW;
     };
+    const bool phraseOk = outcome.structured ? outcome.succeeded : !hardFail;
     const std::string humanTitle = groupN > 1
         ? ui::toolGroupTitle(a.title, groupN)
-        : ui::toolPhrase(a.title, a.reason, !fail).title;
+        : ui::toolPhrase(a.title, a.reason, phraseOk).title;
     const char* disc  = hasDrawer ? (open ? "(hide)" : "(details)") : nullptr;
     const float discW = disc ? ImGui::CalcTextSize(disc).x + 6 * sc : 0.0f;
     ImGui::PushFont(fonts.medium);
     const std::string titleFit =
         chatEllipsize(humanTitle, ImMax(lineRoom() - discW, 24.0f * sc));
-    ImGui::TextColored(hardFail ? failTone : guard ? guardTone : surf.textPrimary,
-                       "%s", titleFit.c_str());
+    ImGui::TextColored(exceptional ? outcomeTone : surf.textPrimary, "%s", titleFit.c_str());
     ImGui::PopFont();
     // Click state is sampled BEFORE SetTooltip: that opens a window of its own and the
     // IsItem* queries afterwards would no longer refer to the title.
@@ -1665,8 +1726,8 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         const float chipW = ImGui::CalcTextSize(metaS.c_str()).x;
         const float rx = ImGui::GetContentRegionMax().x - inset - chipW;
         const float minGap = 8.0f * sc;
-        ImGui::PushStyleColor(ImGuiCol_Text, guard ? guardTone
-                                           : hardFail ? failTone : surf.textSecondary);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              exceptional ? outcomeTone : surf.textSecondary);
         if (rx > ImGui::GetCursorPosX() + minGap) {
             ImGui::SameLine(0, 0);
             ImGui::SetCursorPosX(rx);
@@ -1691,22 +1752,16 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
             dimText(("+" + std::to_string(tgts.size() - kMaxTargetLines) + " more").c_str());
     }
 
-    // ---- WHY it failed, wrapped and never ellipsized, collapsed or not. Behind the drawer it was
-    // reachable only by clicking a row that gave no hint it had anything to say; a truncated error
-    // with no way to read the rest is the single worst thing this surface can do.
-    if (!errShort.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, failTone);
-        ImGui::TextWrapped("%s", errShort.c_str());
+    // Structured state in the user's terms, always visible. The raw cause follows separately and
+    // remains wrapped/untruncated; taxonomy and provider prose serve different purposes.
+    if (!outcome.message.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, outcomeTone);
+        ImGui::TextWrapped("%s", outcome.message.c_str());
         ImGui::PopStyleColor();
     }
-
-    if (guard) {
-        // What happened, in the user's terms — collapsed AND expanded, because it is the row's
-        // label, not its payload. The model-facing guidance text appears only in the drawer, so
-        // the same sentence is never printed twice on one card.
-        ImGui::PushStyleColor(ImGuiCol_Text, guardTone);
-        ImGui::TextWrapped("Identical call repeated — the harness skipped it and asked the model "
-                           "to try another approach. The tool never ran.");
+    if (!errShort.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, outcomeTone);
+        ImGui::TextWrapped("%s", errShort.c_str());
         ImGui::PopStyleColor();
     }
     if (simple) {
@@ -1735,26 +1790,22 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
                 ImGui::PopID();
             }
         } else {
-            if (guard) {
-                // The guidance sent back to the model, in full, wrapped in place. NOT drawCodeBox:
-                // that is an InputTextMultiline, which does not wrap — it clipped this single long
-                // line mid-word — and its content would only repeat the summary above it.
+            if (declined) {
+                // Full policy/guard guidance sent back to the model. The stable user explanation
+                // remains above; this drawer is for the actionable, model-facing detail.
                 ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
                 ImGui::TextWrapped("%s", errBody.c_str());
                 ImGui::PopStyleColor();
-            } else if (hardFail && errShort != errBody) {
+            } else if ((hardFail || timeout) && errShort != errBody) {
                 // The summary is already on the row, wrapped and untruncated; the drawer only earns
-                // its space when there is MORE than the summary — a traceback behind a one-line
-                // cause. When the two are the same string, a box repeating it is pure noise.
+                // its space when there is MORE than the summary, such as a traceback.
                 drawToolDetailBox("##toolerr", errBody, fonts.mono,
                                   ui::metrics::px(200.0f), /*failure=*/true);
             }
-            // The guard's own text quotes the repeated arguments verbatim ("…with the same
-            // arguments ({})"), so a second box holding that same "{}" is noise — drop it in that
-            // case only. Longer args, which the guard summarizes and truncates, still get their
-            // box; either way right-click Copy on the row yields the whole raw detail.
+            // Decline guidance can quote arguments verbatim, so do not print an identical args box.
+            // Longer arguments still get their own box; right-click Copy retains the whole detail.
             if (!argsBody.empty() &&
-                !(guard && errBody.find(argsBody) != std::string::npos))
+                !(declined && errBody.find(argsBody) != std::string::npos))
                 drawToolDetailBox("##tooldetail", stripMdMarks(argsBody), nullptr,
                                   ui::metrics::copilotProseMaxH(), /*failure=*/false);
             drawArtifacts(artsBlob);
@@ -1806,7 +1857,7 @@ ImGuiID activityAnchorId(int activityIdx) {
 
 void timelineScrollTo(ImGuiID anchor) { g_pendingAnchor = anchor; }
 
-bool activityIsGuardRefusal(const ActivityItem& a) { return toolRowIsGuardRefusal(a); }
+bool activityIsGuardRefusal(const ActivityItem& a) { return toolRowIsDeclined(a); }
 
 // ---- the run receipt + cost attribution --------------------------------------------------------
 // A finished turn tells its story chronologically but cannot answer the three questions people
@@ -1826,19 +1877,20 @@ struct StageCost {
     int         in = 0, out = 0, ms = 0;
 };
 
-// A failure worth naming. `guard` separates the harness refusing a repeated call from a tool that
-// ran and broke: a turn that burned six calls on refusals must not read like six units of work.
+// Any exceptional call worth naming. `meta` keeps declined/blocked/UNKNOWN/invalid/harness/tool
+// outcomes distinct in the expanded receipt instead of flattening every row to \"retried\".
 struct ReceiptFail {
     ImGuiID     anchor = 0;
     std::string title;
     std::string why;
-    bool        guard = false;
+    std::string meta;
 };
 
 struct TurnReceipt {
     int toolCalls = 0;
-    int retried   = 0;   // hard tool failures — the error went back to the model for repair
-    int skipped   = 0;   // loop-guard refusals — nothing was ever dispatched
+    int retried   = 0;   // validation/internal/tool failures
+    int skipped   = 0;   // policy and guard declines — nothing was dispatched
+    int unknown   = 0;   // timeout outcome is unresolved and may still be live
     int ms        = 0;
     int tokensIn = 0, tokensOut = 0;
     std::vector<StageCost>   stages;
@@ -1873,16 +1925,22 @@ TurnReceipt buildReceipt(const ChatMsg& m) {
             // The synthesized "Session files" row is presentation, not a call the engine made.
             if (a.stage != "artifacts") ++r.toolCalls;
             const ToolRowDetail parts = splitToolRowDetail(a.detail);
-            if (a.status == "fail") {
-                const bool g = isLoopGuardRefusal(parts.err);
-                if (g) ++r.skipped;
-                else   ++r.retried;
+            const ToolOutcomePresentation outcome = toolOutcomePresentation(a);
+            if (outcome.failure || outcome.declined || outcome.timeout) {
+                if (outcome.declined) ++r.skipped;
+                else if (outcome.timeout) ++r.unknown;
+                else ++r.retried;
                 ReceiptFail f;
                 f.anchor = activityAnchorId((int)i);
                 f.title  = ui::toolPhrase(a.title, a.reason, /*ok=*/false).title;
-                f.guard  = g;
-                f.why    = g ? "Identical call repeated — the harness skipped it; the tool never ran."
-                             : errSummary(parts.err);
+                f.meta   = outcome.structured ? outcome.chip
+                                              : (outcome.failure ? "retried" : "");
+                f.why    = outcome.message;
+                const std::string rawWhy = errSummary(parts.err);
+                if (!rawWhy.empty() && rawWhy != f.why) {
+                    if (!f.why.empty()) f.why += "\n";
+                    f.why += rawWhy;
+                }
                 if (f.why.empty()) f.why = a.reason.empty() ? a.title : a.reason;
                 r.fails.push_back(std::move(f));
             }
@@ -1998,6 +2056,7 @@ void drawTurnReceipt(AppState& st, ChatMsg& m) {
         add(std::to_string(r.toolCalls) + (r.toolCalls == 1 ? " tool call" : " tool calls"));
     if (r.retried > 0) add(std::to_string(r.retried) + " retried");
     if (r.skipped > 0) add(std::to_string(r.skipped) + " skipped");
+    if (r.unknown > 0) add(std::to_string(r.unknown) + " UNKNOWN");
     if (!r.files.empty())
         add(std::to_string(r.files.size()) +
             (r.files.size() == 1 ? " file written" : " files written"));
@@ -2012,13 +2071,13 @@ void drawTurnReceipt(AppState& st, ChatMsg& m) {
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     if (ui::kit::cardBegin("##turn_receipt", head.c_str(), "activity", &openState)) {
         if (!r.fails.empty()) {
-            ui::kit::sectionHeader("What went wrong", nullptr, nullptr, (int)r.fails.size(),
-                                   /*first=*/true);
+            ui::kit::sectionHeader("Calls needing attention", nullptr, nullptr,
+                                   (int)r.fails.size(), /*first=*/true);
             for (size_t i = 0; i < r.fails.size(); ++i) {
                 const ReceiptFail& f = r.fails[i];
                 ui::kit::RowStyle rs;
                 rs.secondary = f.why.c_str();
-                rs.meta      = f.guard ? "skipped" : "retried";
+                rs.meta      = f.meta.c_str();
                 rs.tooltip   = "Jump to this step in the transcript.";
                 ImGui::PushID((int)i);
                 const bool hit = ui::kit::row("##fail", f.title.c_str(), rs);
@@ -2092,14 +2151,30 @@ private:
     bool               active_ = false;
 };
 
-// What this row's mark says. Deliberately the SAME remap the row's own glyph applies (a hard
-// repeated failure reads as retry, a loop-guard refusal as skipped rather than failed) so the
-// gutter can never disagree with the card beside it. `frontier` is the live row of a running turn:
-// its mark spins even when the event stream has not stamped a status yet, because something IS
-// happening — a hollow pending dot there would be a lie.
+// What this row's mark says. It uses the same structured taxonomy as the row's own glyph so the
+// gutter cannot disagree with the label beside it. Missing/future values deliberately fall through
+// to the legacy status mapping.
 ui::kit::Status spineStatusOf(const ActivityItem& a, bool turnRunning, bool frontier) {
-    if (a.status == "fail")
-        return toolRowIsGuardRefusal(a) ? ui::kit::Status::Skipped : ui::kit::Status::Failed;
+    switch (ui::copilot::toolOutcomeFromDetail(a.detail).kind) {
+        case ui::copilot::ToolOutcomeKind::Ok:
+            return ui::kit::Status::Done;
+        case ui::copilot::ToolOutcomeKind::PolicyRefusal:
+            return ui::kit::Status::Skipped;
+        case ui::copilot::ToolOutcomeKind::GuardBlock:
+            return ui::kit::Status::Skipped;
+        case ui::copilot::ToolOutcomeKind::ValidationError:
+            return ui::kit::Status::Failed;
+        case ui::copilot::ToolOutcomeKind::TimeoutUnknown:
+            return ui::kit::Status::Retry;
+        case ui::copilot::ToolOutcomeKind::InternalError:
+            return ui::kit::Status::Failed;
+        case ui::copilot::ToolOutcomeKind::ToolError:
+            return ui::kit::Status::Failed;
+        case ui::copilot::ToolOutcomeKind::Legacy:
+        default:
+            break;
+    }
+    if (a.status == "fail" || a.status == "error") return ui::kit::Status::Failed;
     if (a.status == "running" || (turnRunning && frontier)) return ui::kit::Status::Running;
     if (a.status == "done" || a.status == "ok" || a.status == "pass") return ui::kit::Status::Done;
     if (a.status == "skipped") return ui::kit::Status::Skipped;
@@ -2265,35 +2340,34 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         } else if (a.rowKind == 2) {
             drawThoughtBox(a, fonts, showThinking, liveFrontier);
         } else if (a.rowKind == 3) {
-            // TWO independent folds, and they can never collide: tool_phrase.h invariant 1 gives
-            // a FAILED call an empty groupKey, so the similarity fold below only ever sees
-            // successes while the identical-failure fold below only ever sees failures.
+            // TWO independent folds: true failures have an empty groupKey and taxonomy classes are
+            // never mixed, while only successful calls enter the similarity fold. Declined and
+            // UNKNOWN rows remain individually visible.
             //
-            // Collapse consecutive identical tool+target failures into one row with a count
-            // (stops five identical amber cards stacking during a repair loop). Show the
-            // last item in the run so the visible error_preview is the most recent.
+            // Collapse consecutive identical tool+target failures of the SAME class into one row
+            // with a count. Show the last item so the visible error_preview is the most recent.
             int failCount = 1;
             size_t drawIdx = i;
             size_t frontIdx = i;     // the run's LAST row decides live-frontier auto-expansion
             std::vector<ActivityItem*> group;
-            if (a.status == "fail") {
-                const bool aGuard = toolRowIsGuardRefusal(a);
+            const ToolOutcomePresentation aOutcome = toolOutcomePresentation(a);
+            if (aOutcome.failure) {
+                const ui::copilot::ToolOutcomeKind aKind = aOutcome.info.kind;
                 size_t j = i + 1;
                 while (j < m.activity.size()) {
                     const ActivityItem& n = m.activity[j];
-                    if (n.rowKind != 3 || n.status != "fail") break;
+                    const ToolOutcomePresentation nOutcome = toolOutcomePresentation(n);
+                    if (n.rowKind != 3 || !nOutcome.failure) break;
                     if (n.title != a.title || n.reason != a.reason) break;
-                    // Never fold a harness refusal in with a genuine failure of the same tool:
-                    // the merged row carries ONE label, which would then misdescribe the other.
-                    if (toolRowIsGuardRefusal(n) != aGuard) break;
+                    if (nOutcome.info.kind != aKind) break;
                     ++failCount;
                     ++j;
                 }
                 drawIdx = j - 1;
                 frontIdx = j - 1;
                 i = j - 1;  // loop ++i advances past the coalesced run
-            } else if (ui::chatGroupToolCalls() && a.status != "running" &&
-                       a.stage != "artifacts") {
+            } else if (ui::chatGroupToolCalls() && aOutcome.succeeded &&
+                       a.status != "running" && a.stage != "artifacts") {
                 // Fold a run of consecutive successful calls that phrase to the same groupKey
                 // into ONE card ("Rendering the part x 3") instead of N near-identical cards.
                 const std::string key = ui::toolPhrase(a.title, a.reason, true).groupKey;
@@ -2301,7 +2375,8 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
                     size_t j = i + 1;
                     while (j < m.activity.size()) {
                         const ActivityItem& n = m.activity[j];
-                        if (n.rowKind != 3 || n.status == "fail" || n.status == "running") break;
+                        const ToolOutcomePresentation nOutcome = toolOutcomePresentation(n);
+                        if (n.rowKind != 3 || !nOutcome.succeeded || n.status == "running") break;
                         if (n.stage == "artifacts") break;
                         if (ui::toolPhrase(n.title, n.reason, true).groupKey != key) break;
                         ++j;

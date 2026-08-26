@@ -40,11 +40,20 @@ from typing import Any
 DEFAULT_THRESHOLD = 3
 ARGUMENT_SUMMARY_LIMIT = 400
 
-# Tools that are legitimately polled with identical arguments while waiting on
-# something else to change server-side (job/status polling) — never flagged.
+# Tools whose result can legitimately change without another agent tool call:
+# background jobs, event streams, workspace state, external adapter readiness,
+# or concurrent GUI/worker activity.  There is no "changes over time" flag in
+# tool_registry metadata, so this list comes from a 2026-08-26 sweep of the warm
+# catalog for names containing status/queue/progress/job, followed by inspection
+# of each definition.  Re-run that sweep when poll tools are added.  req_status
+# is deliberately excluded: despite its name, it MUTATES a requirement and
+# takes a required new_status argument.
 DEFAULT_EXEMPT_TOOLS: frozenset[str] = frozenset({
-    "get_job", "dag_status", "workspace_status", "workspace_doc_events",
-    "ledger_get", "ledger_events", "buildgraph_status",
+    "box_status", "buildgraph_status", "dag_status", "ecad_status", "em_status",
+    "fw_status", "get_job", "intake_status", "ledger_events", "ledger_get",
+    "mission_status", "plm_status", "reveng_gate_status", "reveng_status",
+    "scrape_queue_status", "serving_status", "sim_jobs", "sim_status",
+    "vendor_status", "workspace_doc_events", "workspace_status",
 })
 
 # Extra consecutive identical calls tolerated when the immediately-preceding
@@ -79,13 +88,12 @@ class RepeatedToolCallDetection:
 
 
 def _canonicalize(value: Any) -> Any:
-    """Order-independent, content-only view of a tool-call args dict (drops key
-    order and any intent/scratch fields so semantically-identical calls hash equal)."""
+    """Order-independent view of tool args, dropping only the private scratch key."""
     if isinstance(value, list):
         return [_canonicalize(v) for v in value]
     if isinstance(value, dict):
         return {k: _canonicalize(value[k]) for k in sorted(value)
-                if k not in ("__intent", "intent")}
+                if k != "__intent"}
     return value
 
 
@@ -166,40 +174,36 @@ class ToolCallLoopGuard:
 
     @staticmethod
     def message(detection: RepeatedToolCallDetection) -> str:
-        # The escape hatches must never include the tool being refused. Live
-        # 2026-07-27: haiku called ask_user with {} four times and the guard
-        # answered "change approach (replan/ask_user)" — telling it to call the
-        # very tool just blocked, so the only advice on offer was the loop.
-        alternatives = [t for t in ("replan", "ask_user") if t != detection.tool]
-        escape = (f" or change approach ({'/'.join(alternatives)})"
-                  if alternatives else "")
-        # An empty-argument repeat is almost always a schema failure, not a
-        # genuine retry: the model does not know how to fill the call in, so
-        # "try different arguments" alone leaves it stuck.
+        # Empty arguments may be valid for some tools, so describe the observed
+        # shape without claiming that required fields are definitely missing.
         empty_args = detection.arguments_summary.strip() in ("{}", "")
-        hint = (" The arguments were EMPTY — you are missing the tool's required "
-                "fields, so re-read its schema and supply them, or drop this tool "
-                "and continue with what you already know."
-                if empty_args else "")
+        hint = (
+            " The arguments were EMPTY. If the tool requires fields, re-read its "
+            "schema and supply them; otherwise use the prior result or continue "
+            "with what you already know."
+            if empty_args else ""
+        )
+        remedies = (
+            "Use the prior result, change a real argument, call a different tool "
+            "from your available list, or finish with status='blocked' and explain "
+            "the obstacle."
+        )
         if detection.after_validation_failure:
             # Repeats following an argument-validation / tool-binding failure
-            # already got extra slack (threshold + validation_retry_allowance)
-            # to let the model react to the teaching error instead of having it
-            # swallowed by this guard — this message only fires once that
-            # slack itself runs out, i.e. the arguments are STILL wrong.
+            # already got threshold + validation_retry_allowance before this
+            # message fires. State only the immediately preceding outcome, which
+            # is what the guard actually records.
             return (
-                f"LOOP GUARD: '{detection.tool}' was called {detection.count}× in a "
-                f"row with the same arguments ({detection.arguments_summary}), and "
-                "every attempt failed argument validation before the tool ever ran — "
-                "you already got extra retries to react to that error, but the "
-                "arguments are still wrong. This call was refused; re-read the tool's "
-                f"real parameter list from its schema{escape} instead of repeating the "
-                f"same broken call.{hint}"
+                f"LOOP GUARD: '{detection.tool}' was attempted "
+                f"{detection.count}× in a row with identical arguments "
+                f"({detection.arguments_summary}). The immediately preceding "
+                "attempt failed argument validation before the tool body ran, so "
+                "extra retry slack was allowed; that slack is now exhausted. "
+                "This exact call was not run. Re-read the tool's real parameter "
+                f"list instead of repeating the same arguments. {remedies}{hint}"
             )
         return (
-            f"LOOP GUARD: '{detection.tool}' was just called {detection.count}× in a "
-            f"row with the same arguments ({detection.arguments_summary}) — this call "
-            "was refused rather than repeated. The result did not change last time and "
-            "will not change now; read the prior result again, try different "
-            f"arguments{escape} instead of repeating.{hint}"
+            f"LOOP GUARD: '{detection.tool}' was attempted {detection.count}× in "
+            f"a row with identical arguments ({detection.arguments_summary}). "
+            f"This exact call was not run. {remedies}{hint}"
         )

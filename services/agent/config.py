@@ -923,6 +923,35 @@ def tool_max_calls_default(cfg: dict | None = None) -> int:
         return 0
 
 
+def effective_tool_call_cap(tool: str, *, opts: dict | None = None,
+                            cfg: dict | None = None) -> int | None:
+    """The per-turn call cap that will ACTUALLY be enforced for *tool*.
+
+    Per-tool ``agent.tool_options.<tool>.max_calls_per_turn`` wins; an unset/0
+    per-tool value falls back to the global ``agent.tool_max_calls_default``.
+    ``None`` means uncapped.
+
+    ONE resolver so the ENFORCEMENT site (``agent_turn._dispatch_tool``) and the
+    ADVERTISEMENT site (``tool_schemas.render_tools_block``) can never disagree.
+    A cap the model was never shown is a guardrail it cannot plan around — that
+    is exactly how a live run spent its turn on a refused ``research_web_search``
+    it had no way to know was its last one.
+    """
+    if opts is None:
+        try:
+            opts = get_tool_options(cfg, tool) or {}
+        except Exception:  # noqa: BLE001
+            opts = {}
+    cap = opts.get("max_calls_per_turn")
+    if cap is None:
+        cap = tool_max_calls_default(cfg) or None
+    try:
+        cap = int(cap) if cap is not None else None
+    except (TypeError, ValueError):
+        return None
+    return cap if cap and cap > 0 else None
+
+
 def tool_loop_guard_enabled(cfg: dict | None = None) -> bool:
     """Repeated-identical-tool-call detector kill-switch (``agent.tool_loop_guard_enabled``).
 

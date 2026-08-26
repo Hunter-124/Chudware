@@ -27,6 +27,7 @@ import pytest
 from services.agent import agent_turn, omp_bridge
 from services.agent.providers import base as pbase
 from services.agent.providers.omp_bridge_provider import OmpBridgeProvider
+from services.agent.providers import token_usage
 
 
 class _RecordingSink:
@@ -407,36 +408,68 @@ def test_two_empty_samples_still_surface_the_real_error(monkeypatch):
     assert len(calls) == 1, "vendored OMP is the sole empty-completion retry owner"
 
 
-def test_a_length_stop_is_reported_as_truncation_not_a_missing_reply(monkeypatch):
-    """A truncation is surfaced directly; Python does not spend a second completion."""
+def test_length_stop_retries_once_without_effort_and_counts_both_usages(monkeypatch):
     calls = _fake_bridge(monkeypatch, [
-        ([], {"text": "", "thinking": "", "stopReason": "length", "usage": {}}),
-        ([], {"text": "", "thinking": "", "stopReason": "length", "usage": {}}),
+        ([], {
+            "text": "", "thinking": "", "stopReason": "length",
+            "usage": {"input": 10, "output": 16, "totalTokens": 26},
+        }),
+        ([("delta", {"text": "recovered"})], {
+            "text": "recovered", "thinking": "", "stopReason": "stop",
+            "usage": {"input": 11, "output": 4, "totalTokens": 15},
+        }),
     ])
-    prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-fable-5",
-                             reasoning_effort="high")
-    with pytest.raises(omp_bridge.BridgeUnavailable) as ei:
-        prov.complete_ex("sys", [{"role": "user", "content": "hi"}], max_tokens=16)
-    msg = str(ei.value)
-    assert "TRUNCATED" in msg and "16" in msg and "high" in msg, msg
-    assert len(calls) == 1
+    sink = _RecordingSink()
+    pbase.set_provider_delta_sink(sink)
+    token_usage.begin_turn_usage()
+    prov = OmpBridgeProvider(
+        provider="anthropic-sub", model="claude-fable-5",
+        reasoning_effort="high")
+
+    reply, thinking = prov.complete_ex(
+        "sys", [{"role": "user", "content": "hi"}], max_tokens=16)
+    usage = token_usage.get_turn_usage()
+
+    assert reply == "recovered" and thinking == ""
+    assert len(calls) == 2
     assert calls[0]["params"]["reasoningEffort"] == "high"
+    assert "reasoningEffort" not in calls[1]["params"]
+    assert calls[0]["params"]["maxTokens"] == calls[1]["params"]["maxTokens"] == 16
+    assert sink.feeds == [("recovered", "text")]
+    assert usage["calls"] == 2
+    assert usage["prompt_tokens"] == 21
+    assert usage["completion_tokens"] == 20
+    assert usage["total_tokens"] == 41
+    token_usage.begin_turn_usage()
 
 
-def test_length_stop_does_not_retry_without_effort_in_python(monkeypatch):
+def test_second_empty_length_stop_surfaces_after_exactly_one_retry(monkeypatch):
     calls = _fake_bridge(monkeypatch, [
-        ([], {"text": "", "thinking": "", "stopReason": "length", "usage": {}}),
-        ([], {"text": "would be a duplicate paid request", "thinking": "",
-              "stopReason": "stop", "usage": {}}),
+        ([], {
+            "text": "", "thinking": "", "stopReason": "length",
+            "usage": {"input": 3, "output": 8, "totalTokens": 11},
+        }),
+        ([], {
+            "text": "", "thinking": "", "stopReason": "length",
+            "usage": {"input": 4, "output": 8, "totalTokens": 12},
+        }),
     ])
-    prov = OmpBridgeProvider(provider="anthropic-sub", model="claude-fable-5",
-                             reasoning_effort="high")
+    token_usage.begin_turn_usage()
+    prov = OmpBridgeProvider(
+        provider="anthropic-sub", model="claude-fable-5",
+        reasoning_effort="high")
 
-    with pytest.raises(omp_bridge.BridgeUnavailable):
-        prov.complete_ex("sys", [{"role": "user", "content": "hi"}], max_tokens=16)
+    with pytest.raises(omp_bridge.BridgeUnavailable, match="TRUNCATED"):
+        prov.complete_ex(
+            "sys", [{"role": "user", "content": "hi"}], max_tokens=8)
+    usage = token_usage.get_turn_usage()
 
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0]["params"]["reasoningEffort"] == "high"
+    assert "reasoningEffort" not in calls[1]["params"]
+    assert usage["calls"] == 2
+    assert usage["total_tokens"] == 23
+    token_usage.begin_turn_usage()
 
 
 def test_a_length_stop_is_never_resampled(monkeypatch):

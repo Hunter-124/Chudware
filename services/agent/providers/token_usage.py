@@ -130,6 +130,11 @@ def record_usage(
     # this event to its WebSocket. A worker-supplied email would cross the trust
     # boundary in the wrong direction.
     _last_usage.set(dict(row))
+    # Count records, not sink deliveries.  ``agent_turn`` snapshots this around
+    # provider.complete() to distinguish a genuinely silent provider from one
+    # that recorded usage without a worker-RPC sink bound (the normal desktop
+    # path).
+    _usage_event_count.set(_usage_event_count.get() + 1)
     with _turn_lock:
         _turn_usage["prompt_tokens"] += row["prompt_tokens"]
         _turn_usage["completion_tokens"] += row["completion_tokens"]
@@ -156,7 +161,6 @@ def record_usage(
             "context_tokens": row["context_tokens"],
             "source": row["source"],
         })
-        _usage_event_count.set(_usage_event_count.get() + 1)
     return row
 
 

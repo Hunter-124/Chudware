@@ -99,8 +99,11 @@ class TestRouteRequestGeneralAgent:
         # fs/plm floor advertised, plus the escalation levers the model uses to
         # reach the build swarm on its own decision.
         allowed = turn["allowed_tools"]
-        for t in ("fs_write", "fs_edit", "run_shell", "plm_open", "plm_checkpoint"):
+        for t in ("fs_write", "fs_edit", "plm_open", "plm_checkpoint"):
             assert t in allowed, f"{t} missing from general_agent turn tools"
+        # Security hardening 3aaee658: the contract keeps shell behind explicit
+        # role/category enablement, never on the automatic main-chat floor.
+        assert "run_shell" not in allowed, "run_shell must not be in the main-chat floor"
         for t in ("fs_read", "fs_glob", "fs_grep"):  # SUBAGENT_DEFAULT_TOOLS floor
             assert t in allowed, f"{t} (subagent floor) missing"
         for t in ("delegate", "mission_start", "enable_tools"):

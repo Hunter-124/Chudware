@@ -200,6 +200,14 @@ ENTRIES: dict[str, dict[str, Any]] = {
         ),
         "timeout_s": 300,
     },
+    "run_fea_adaptive": {
+        "prompt_note": (
+            "Adaptive remesh-and-resolve for a decision-driving peak stress; use "
+            "run_fea_static for an initial screen, then this when the peak is "
+            "mesh-sensitive. Its relative indicator is not a stress-error bound; "
+            "background=True returns job_id for get_job."
+        ),
+    },
     "run_fea_buckling": {
         "prompt_note": (
             "CalculiX fixed-free BOX PROXY, not real CAD stress/buckling. Pass exactly "

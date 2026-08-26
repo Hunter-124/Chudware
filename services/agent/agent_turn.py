@@ -55,6 +55,32 @@ _CONTEXT_OVERFLOW = "context_overflow"
 # that hides which guardrail fired and sends retry/escalation down the wrong
 # branch — the fix is on the guardrail's terms, not the model's.
 _GUARD_BLOCKED = "guardrail_blocked"
+# The done-gate could not RUN (import failure / bug in a guard predicate). The
+# model's handoff was never judged, so attributing the stop to guardrail_blocked
+# blames it for our defect and sends retry policy down the guardrail branch,
+# where nothing the model can do will ever clear it.
+_GUARD_INTERNAL = "guardrail_internal_error"
+
+
+def _guard_stop_reason(block: str) -> str:
+    """Stop reason for a done-gate rejection: OUR fault vs the model's.
+
+    Matches on ``GUARD_INTERNAL_PREFIX``, a constant THIS module emits — never
+    on third-party error prose.
+    """
+    return (_GUARD_INTERNAL
+            if str(block or "").startswith(GUARD_INTERNAL_PREFIX)
+            else _GUARD_BLOCKED)
+
+
+# The PROVIDER cut the reply off (output cap / stopReason=length), twice, so no
+# directive could be parsed. Reporting this as _NOCODE ("produced no valid tool
+# call or completion") blames the model for inaction and hides a cap the user
+# can raise; it also blocked retry, because _NOCODE is not a retryable reason
+# while a truncation plainly is.
+_REPLY_TRUNCATED = "reply_truncated"
+
+
 # The build LANDED and was verified/saved, then the model went back to re-work the
 # geometry more times than its capability tier allows (scaffolds.refine_pass_limit,
 # non-frontier tiers only). Not a budget exhaustion and not a failure: the product
@@ -211,8 +237,10 @@ def error_detail_for_stop(
         )
     if stop_reason == _REFINE_CAP:
         return format_error_detail(
-            extra or "Refine budget for this capability tier exhausted — the verified "
-                     "build is kept; further re-work needs a new request."
+            extra or "Optional refinement limit for this capability tier "
+                     "reached: that re-work was NOT run, and the previously "
+                     "verified/saved revision was retained. Further re-work "
+                     "needs a new request."
         )
     if stop_reason == _TOKEN_BUDGET:
         return format_error_detail(
@@ -222,11 +250,19 @@ def error_detail_for_stop(
         return format_error_detail(
             extra or "Model produced no valid tool call or completion."
         )
+    if stop_reason == _REPLY_TRUNCATED:
+        return format_error_detail(
+            extra or "The provider cut the reply off before the tool call "
+                     "closed, twice — an OUTPUT-CAP problem, not model "
+                     "inaction. Raise the completion cap for this lane, or ask "
+                     "for smaller steps."
+        )
     if stop_reason == _FAILED:
         return format_error_detail(extra or "Agent turn failed.")
     if extra:
         return format_error_detail(extra)
     return format_error_detail(f"Stopped early ({stop_reason})." if stop_reason else "Stopped early (unknown reason).")
+
 
 # T-W32: match the fenced BODY (not a brace pair) — the old r"\{.*?\}" non-greedy
 # pattern truncated at the FIRST closing brace, so any tool call with nested args
@@ -979,30 +1015,57 @@ def _unearned_finish_block(
     return None
 
 
+#: What a trimmed tool result is replaced with. Short enough to free the context
+#: the overflow retry needs, explicit enough that the model knows the result
+#: existed and is gone rather than silently mis-remembering it.
+_TRIMMED_RESULT_PLACEHOLDER = (
+    "[TRIMMED] An earlier tool result was dropped to fit the context window. "
+    "If you still need it, call the tool again."
+)
+
+
 def _drop_oldest_tool_results(messages: list[dict], *, keep_recent: int = 6) -> int:
-    """Drop the oldest tool-result echoes in place → number of messages removed.
+    """Replace the oldest tool-result echoes in place → number trimmed.
 
     Context-overflow recovery. ``messages[0]`` (the original user request) and the
     last *keep_recent* entries always survive; the system prompt is a separate
     provider argument and is never touched. Only harness-generated tool result
     echoes are eligible — model output and steering/enablement nudges stay put.
+
+    They are REPLACED, not deleted. Deleting them left each result's preceding
+    assistant directive behind, so the retried transcript carried consecutive
+    assistant messages; providers that require strict role alternation answer
+    that with a 400, which ``classify_provider_error`` then reported as
+    ``provider_auth`` — telling the user to check credentials that were fine,
+    when the real cause was a context overflow the harness itself had just
+    tried to recover from.
     """
-    drop: list[int] = []
+    trimmed = 0
     for i in range(1, max(1, len(messages) - keep_recent)):
         m = messages[i]
         if not isinstance(m, dict) or m.get("role") != "user":
             continue
         content = m.get("content")
         text = ""
+        listed = False
         if isinstance(content, list) and content and isinstance(content[0], dict):
             text = str(content[0].get("text") or "")
+            listed = True
         elif isinstance(content, str):
             text = content
-        if text.startswith(("Result of ", "Tool result (")):
-            drop.append(i)
-    for i in reversed(drop):
-        del messages[i]
-    return len(drop)
+        if not text.startswith(("Result of ", "Tool result (")):
+            continue
+        if text.startswith(_TRIMMED_RESULT_PLACEHOLDER):
+            continue  # already trimmed by an earlier pass
+        # Keep the first line: which tool produced it is cheap and orienting.
+        head = text.split("\n", 1)[0][:120]
+        replacement = f"{_TRIMMED_RESULT_PLACEHOLDER} ({head})"
+        if listed:
+            m["content"] = [{"type": "text", "text": replacement}]
+        else:
+            m["content"] = replacement
+        trimmed += 1
+    return trimmed
 
 
 class _RawMirroredMessages(list):
@@ -1220,6 +1283,19 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
     )
     if any(m in text for m in response_gap_markers):
         return "provider_error", True
+    # A 404 "no endpoints" is the model/route being GONE, not a transient blip:
+    # OpenRouter answers it for a retired or unavailable model slug. Retrying it
+    # (the old default disposition, `(_FAILED, True)`) burned every DAG retry on
+    # a request that can never succeed and reported budget exhaustion at the end.
+    dead_endpoint_markers = (
+        "no endpoints found",
+        "no allowed providers",
+        "no available providers",
+        "model not found",
+        "does not exist or you do not have access",
+    )
+    if status_i == 404 or any(m in text for m in dead_endpoint_markers):
+        return "provider_error", False
     if status_i == 429 or "rate limit" in text or "too many requests" in text:
         return _FAILED, True
     if status_i is not None and status_i >= 500:
@@ -1563,6 +1639,17 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                 options=options, history=history, attachments=attachments,
                 auto_enable_packs=auto_enable_packs)
     finally:
+        # Flush the buffered tail on EVERY exit, including the provider-error
+        # path. `_ordered_event` flushes before each ordered event, but a
+        # provider exception can return (or raise past) a terminal TurnResult
+        # with no later ordered event, so a short text/thinking fragment stayed
+        # stuck in the coalescer and the last thing the model actually said
+        # before the error never reached the transcript. `discard()` remains
+        # reserved for a dead resample whose fragments must NOT display.
+        try:
+            coalescer.flush_all()
+        except Exception:  # noqa: BLE001 — a flush must never mask the real result
+            pass
         if _tl is not None and _tl_tok is not None:
             try:
                 _tl.clear_event_sink(_tl_tok)
@@ -1775,11 +1862,16 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         if narrowed is not None:
             allow = set(narrowed)
             allowed_tools = list(narrowed)
-            # Restricted floor: always expose category meta-tools so the model
-            # can pull more packs without the full catalog in the prompt.
-            allow.add("enable_tools")
-            allow.add("list_tool_categories")
-            allowed_tools = sorted(allow)
+            # Restricted floor: always expose the category meta-tools so the
+            # model can pull more packs without the full catalog in the prompt.
+            # Same helper both dispatchers use before rendering their slot.
+            from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+                apply_meta_tool_floor,
+            )
+            _floored = apply_meta_tool_floor(allowed_tools)
+            if _floored is not None:
+                allow = set(_floored)
+                allowed_tools = list(_floored)
     except Exception:  # noqa: BLE001 — mode gate never breaks a turn
         pass
     # Settings → AI → Tools "Send bug reports" (agent.bug_reports, default on):
@@ -2169,6 +2261,12 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     # does not stop dispatch; only the separate runaway ceiling can do that.
     _tool_budget_nudge = [0]
     _forced_tool_stop: str | None = None
+    # Pre-dispatch refusals (scaffold / guardrail / review gate) no longer spend
+    # the execution budget, so they need their own bound or a wedged guard could
+    # loop the turn indefinitely. Generous: a legitimate run corrects a guard in
+    # one or two attempts, and this only has to stop a genuine spin.
+    _refusals_made = 0
+    _refusal_ceiling = 12
     _tasklist_pref = "off"
     if auto_enable_packs:
         try:
@@ -2236,31 +2334,31 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
     # its own permissions for the whole turn.
     _autoenable_budget = [4]
 
-    def _apply_categories(cats: list[str]) -> list[str]:
+    def _apply_categories(cats: list[str]) -> list[str] | None:
         """Enable tool *cats* for the rest of this turn; return newly-added names.
 
         Shared by the explicit ``enable_tools`` call and by auto-enable-on-reach
         below, so both widen the allow-set, mirror the live registry policy and
         re-render the §9.1 tools block identically — the model must see real
         schemas for anything it can now call, however the pack got enabled.
+
+        TRANSACTIONAL: schemas are rendered and the registry policy applied
+        against a CANDIDATE set, and the turn's own ``allow`` is only widened
+        once both have succeeded. Committing first and swallowing those two
+        failures produced a green ``enable_tools`` card immediately followed by
+        "not allowed" from the registry, or a modeling call attempted with no
+        schema at all. Returns ``None`` when activation failed — distinct from
+        ``[]``, which means "succeeded, nothing new was added".
         """
         nonlocal system, tools_text
         from services.agent.tool_categories import resolve_categories  # noqa: PLC0415
         expanded = resolve_categories(cats)
         newly = sorted(expanded - allow)
-        # In-place: `allow |= expanded` would rebind the name and make `allow`
-        # a local of this closure (UnboundLocalError on the read above).
-        allow.update(expanded)
-        allow.add("enable_tools")
-        allow.add("list_tool_categories")
-        try:
-            from services.mcp import tool_registry as _tr  # noqa: PLC0415
-            cur = _tr._current_allow()
-            if cur is not None:
-                _tr.set_policy(allow=sorted(set(cur) | allow),
-                               deny_risk=_tr._current_deny_risk())
-        except Exception:  # noqa: BLE001
-            pass
+        candidate = set(allow) | set(expanded) | {
+            "enable_tools", "list_tool_categories"}
+        # 1. Render the schemas the model would get. A pack the model cannot see
+        #    the schema for is worse than one it cannot call.
+        new_text = None
         try:
             from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
             # The tier MUST ride along. This re-render replaces the whole tools
@@ -2274,19 +2372,41 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             # and it is the documented cause of the add_features failure cluster
             # (62 of 86 tool failures across 59 live user runs, 2026-08-04).
             new_text, _meta = render_tools_block(
-                sorted(allow), resolver=resolver_for(mission_dispatch), tier=tier)
-            if new_text:
-                if tools_text and tools_text in system:
-                    system = system.replace(tools_text, new_text, 1)
-                elif "\nAllowed tools: " in system and not tools_text:
-                    import re as _re  # noqa: PLC0415
-                    system = _re.sub(r"\nAllowed tools: [^\n]*",
-                                     "\n\n" + new_text, system, count=1)
-                else:
-                    system = system.rstrip() + "\n\n" + new_text
-                tools_text = new_text
-        except Exception:  # noqa: BLE001
-            pass
+                sorted(candidate), resolver=resolver_for(mission_dispatch),
+                tier=tier)
+        except Exception as exc:  # noqa: BLE001
+            _log_mod.exception("enable_tools schema render failed for %s", cats)
+            _log(ledger, actor, {"event": "enable_tools_render_failed",
+                                 "categories": list(cats),
+                                 "error": f"{type(exc).__name__}: {exc}"})
+            return None
+        # 2. Mirror the live registry policy. A widened prompt the registry then
+        #    denies is the exact "green card, next call refused" symptom.
+        try:
+            from services.mcp import tool_registry as _tr  # noqa: PLC0415
+            cur = _tr._current_allow()
+            if cur is not None:
+                _tr.set_policy(allow=sorted(set(cur) | candidate),
+                               deny_risk=_tr._current_deny_risk())
+        except Exception as exc:  # noqa: BLE001
+            _log_mod.exception("enable_tools registry policy failed for %s", cats)
+            _log(ledger, actor, {"event": "enable_tools_policy_failed",
+                                 "categories": list(cats),
+                                 "error": f"{type(exc).__name__}: {exc}"})
+            return None
+        # 3. Commit. In-place: `allow |= expanded` would rebind the name and make
+        #    `allow` a local of this closure (UnboundLocalError on the read above).
+        allow.update(candidate)
+        if new_text:
+            if tools_text and tools_text in system:
+                system = system.replace(tools_text, new_text, 1)
+            elif "\nAllowed tools: " in system and not tools_text:
+                import re as _re  # noqa: PLC0415
+                system = _re.sub(r"\nAllowed tools: [^\n]*",
+                                 "\n\n" + new_text, system, count=1)
+            else:
+                system = system.rstrip() + "\n\n" + new_text
+            tools_text = new_text
         return newly
 
     _subagent_base_completion_cap = completion_cap
@@ -2368,24 +2488,48 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         # controls never interrupt in-flight work; they land before the next
         # model completion. Best-effort: registry failure never breaks a turn.
         if subagent_id:
+            # Termination is read and ACTED ON in its own guarded block. It used
+            # to sit inside the same broad try as the status/transcript writes,
+            # so a registry write that threw after the flag was already True
+            # skipped the return entirely and the loop went on to call the
+            # provider and dispatch more tools — Stop looked accepted in the
+            # controller while cards and geometry kept arriving. Bookkeeping is
+            # now a best-effort SIDE EFFECT of a decision already made.
+            _terminate = False
+            _sreg = None
             try:
                 from services.agent import subagent_registry as _sreg  # noqa: PLC0415
-                # Termination remains first: every other hold/control yields to it.
-                if _sreg.terminate_requested(subagent_id):
-                    _sreg.set_status(subagent_id, "terminated",
-                                     note="terminated by user at turn boundary")
-                    _sreg.append_transcript(
+                _terminate = bool(_sreg.terminate_requested(subagent_id))
+            except Exception:  # noqa: BLE001 — an unreadable control plane is not a stop
+                _terminate = False
+            if _terminate:
+                for _side_effect in (
+                    lambda: _sreg.set_status(
+                        subagent_id, "terminated",
+                        note="terminated by user at turn boundary"),
+                    lambda: _sreg.append_transcript(
                         subagent_id, "system",
-                        "Sub-agent stopped: user termination honored at turn boundary.")
-                    _log(ledger, actor, {"event": "subagent_terminated",
-                                         "subagent_id": subagent_id,
-                                         "stop_reason": "terminated_by_user",
-                                         "error_detail": "Run cancelled by user."})
-                    return TurnResult(False, "terminated_by_user",
-                                      {"calls": calls,
-                                       "tool_calls": tool_calls_made,
-                                       "stop_reason": "terminated_by_user",
-                                       "error_detail": "Run cancelled by user."})
+                        "Sub-agent stopped: user termination honored at turn "
+                        "boundary."),
+                    lambda: _log(ledger, actor, {
+                        "event": "subagent_terminated",
+                        "subagent_id": subagent_id,
+                        "stop_reason": "terminated_by_user",
+                        "error_detail": "Run cancelled by user."}),
+                ):
+                    try:
+                        _side_effect()
+                    except Exception:  # noqa: BLE001 — never block the stop
+                        _log_mod.exception(
+                            "subagent %s termination bookkeeping failed",
+                            subagent_id)
+                return TurnResult(False, "terminated_by_user",
+                                  {"calls": calls,
+                                   "tool_calls": tool_calls_made,
+                                   "stop_reason": "terminated_by_user",
+                                   "error_detail": "Run cancelled by user."})
+            try:
+                from services.agent import subagent_registry as _sreg  # noqa: PLC0415
 
                 # A pause parks until a human resumes or terminates — no clock.
                 # The one automatic release is controller liveness: with nothing
@@ -2908,8 +3052,16 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 _log(ledger, actor, {
                     "event": "reply_truncated_fatal",
                     "tool_calls": tool_calls_made,
+                    "provider_stop": _stop,
+                    "parse_error": _complaint,
                 })
-                last_reason = _NOCODE
+                # NOT _NOCODE. The provider cut the reply off — most often at
+                # the completion cap — so "produced no valid tool call or
+                # completion" reads as model inaction and hides an output-cap
+                # problem the user can actually fix. It also sent the DAG lane
+                # down the generic escalate path, because no_code is not a
+                # retryable reason while a truncation demonstrably is.
+                last_reason = _REPLY_TRUNCATED
                 break
             # No structured directive. If the model already ran tools, treat a bare
             # natural-language finish as done-with-handoff; otherwise it produced
@@ -3037,7 +3189,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 block = _done_guardrail_block(bare_handoff, ledger, actor, calls)
                 if block is not None:
                     messages.append({"role": "user", "content": _parts(block)})
-                    last_reason = _GUARD_BLOCKED
+                    last_reason = _guard_stop_reason(block)
                     last_guard_block = block
                     _log(ledger, actor, {"event": "done_blocked",
                                          "guardrail": block[:300]})
@@ -3223,7 +3375,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             block = _done_guardrail_block(handoff, ledger, actor, calls)
             if block is not None:
                 messages.append({"role": "user", "content": _parts(block)})
-                last_reason = _GUARD_BLOCKED
+                last_reason = _guard_stop_reason(block)
                 last_guard_block = block
                 _log(ledger, actor, {"event": "done_blocked",
                                      "guardrail": block[:300]})
@@ -3291,7 +3443,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 )
                 if block is not None:
                     messages.append({"role": "user", "content": _parts(block)})
-                    last_reason = _GUARD_BLOCKED
+                    last_reason = _guard_stop_reason(block)
                     last_guard_block = block
                     _log(ledger, actor, {"event": "done_blocked",
                                          "guardrail": block[:300]})
@@ -3393,12 +3545,34 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         }
                     else:
                         newly = _apply_categories(cats)
-                        meta_result = {
-                            "ok": True,
-                            "enabled": newly,
-                            "categories": cats,
-                            "allow_size": len(allow),
-                        }
+                        if newly is None:
+                            # Activation could not be completed, so nothing was
+                            # widened. Saying ok:true here produced a green
+                            # card followed by "not allowed" or a schema-less
+                            # call on the very next dispatch.
+                            meta_result = {
+                                "ok": False,
+                                "status": "internal_error",
+                                "internal_error": True,
+                                "error": (
+                                    f"could not activate {cats!r}: the tool "
+                                    f"schemas or the registry policy could not "
+                                    f"be applied, so NOTHING was enabled and "
+                                    f"those tools are still unavailable. This "
+                                    f"is a harness fault, already reported "
+                                    f"internally — do not retry the same "
+                                    f"categories; continue with the tools you "
+                                    f"already hold."
+                                ),
+                                "categories": cats,
+                            }
+                        else:
+                            meta_result = {
+                                "ok": True,
+                                "enabled": newly,
+                                "categories": cats,
+                                "allow_size": len(allow),
+                            }
             except Exception as exc:  # noqa: BLE001 — meta tool never crashes turn
                 meta_result = {"ok": False, "error": str(exc)}
             call_rec = {
@@ -3481,8 +3655,16 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 # fall through and dispatch the call for real
             else:
                 note = {"tool": tool, "ok": False,
+                        "outcome_kind": OUTCOME_POLICY_REFUSAL,
+                        "executed": False,
                         "error": f"tool {tool!r} not in allowed list"}
-                note["result"] = {"ok": False, "error": note["error"]}
+                note["result"] = {
+                    "ok": False,
+                    "status": "tool_not_allowed",
+                    "policy_refusal": True,
+                    "executed": False,
+                    "error": note["error"],
+                }
                 calls.append(note)
                 _log(ledger, actor, {"event": "tool_denied",
                                      "tool": tool, "error": note["error"]})
@@ -3506,10 +3688,24 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                         messages.append({"role": "user", "content": _parts(_sk_body)})
                 except Exception:  # noqa: BLE001 — skill nudge never breaks turn
                     pass
-                # A refusal invalidates the rest of the batch for the same
-                # reason a failure does: the model has to answer for this call
-                # before the ones planned behind it mean anything.
-                pending_directives.clear()
+                # An allowlist refusal is INVISIBLE without this: the denial
+                # never reached tool_call_event, so the GUI feed simply skipped
+                # the call and the user watched the model stall with no card
+                # explaining why.
+                if _turn_span is not None:
+                    try:
+                        from services.agent import agent_events as _ae  # noqa: PLC0415
+                        _k, _p = _ae.tool_call_event(
+                            _ev_node, tool, args, note["result"], ok=False,
+                            latency_ms=0.0, parent_id=_turn_span, actor=actor,
+                            outcome_kind=OUTCOME_POLICY_REFUSAL, executed=False)
+                        _ae.emit_event(_k, _p, live=on_event, journal=_ev_journal)
+                    except Exception:  # noqa: BLE001 — event never blocks the turn
+                        pass
+                # The queued directives are NOT cleared: this refusal executed
+                # nothing, so it invalidated no state any queued call depends
+                # on. Dropping them cost the model a whole extra completion to
+                # re-send calls that were never wrong.
                 continue
 
         # mega-13/14: HARD block thrash tools that skip the ECAD product chain.
@@ -3744,7 +3940,29 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             last_reason = _RETRY
             continue
 
-        tool_calls_made += 1
+        # WI-10 refine cap, enforced BEFORE the rework runs so the last SETTLED
+        # (verified/saved) revision is what the turn actually keeps. Enforcing it
+        # after dispatch meant the mutator had already re-shaped the geometry and
+        # cleared the settled flag, so the run ended on an unverified revision
+        # while reporting that the verified build was kept.
+        if (
+            _geo_settled
+            and tool in _GEOMETRY_MUTATORS
+            and _sc is not None
+            and _cap is not None
+        ):
+            try:
+                if _sc.should_stop_refine(_cap, _refine_rounds + 1,
+                                          ledger=ledger, actor=actor or name):
+                    _log(ledger, actor, {
+                        "event": "refine_cap_refused_rework",
+                        "tool": tool,
+                        "refine_rounds": _refine_rounds,
+                    })
+                    last_reason = _REFINE_CAP
+                    break
+            except Exception:  # noqa: BLE001 — a cost dial never breaks the turn
+                pass
         import time as _time  # noqa: PLC0415
         _t0 = _time.monotonic()
         # Scaffold pre-dispatch (WI-7 calc gate, WI-6 A aggressive checkpoint).
@@ -3755,6 +3973,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 _blocked = _sc.pre_dispatch_scaffolds(
                     tool, args, profile=_cap, ledger=ledger,
                     calls=calls, actor=actor,
+                    # A gate that demands a tool the lane cannot call is
+                    # unsatisfiable. None = scope unknown/unrestricted, which
+                    # keeps the pre-existing behavior.
+                    effective_allow_set=(allow if restricted_tools else None),
                 )
             except Exception:  # noqa: BLE001
                 _blocked = None
@@ -3762,9 +3984,21 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             _blocked = _pre_dispatch_guardrail(tool, args, ledger, actor)
         if _blocked is None and tool == "export_drawing":
             _blocked = _drawing_export_review_block(calls, args)
+        if _blocked is not None:
+            # A pre-dispatch REFUSAL executed nothing, so it must not spend the
+            # turn's execution budget — a guard that fires four times used to
+            # burn four of the model's calls and then the turn died at the
+            # ceiling having built nothing. Refusals get their own bounded
+            # counter instead, so a wedged guard still cannot spin forever.
+            _refusals_made += 1
+            if _refusals_made >= _refusal_ceiling:
+                _forced_tool_stop = "refusal_ceiling"
+                last_reason = _RETRY
+                break
         # AI-VC v2: checkpoint BEFORE mutating tool call (kind=tool).
         # call.turn = msg_idx when provided, else internal tool-call ordinal.
         if _blocked is None:
+            tool_calls_made += 1
             try:
                 from services.plm import ai_vc as _ai_vc  # noqa: PLC0415
                 _call_turn = msg_idx if msg_idx is not None else tool_calls_made
@@ -3834,7 +4068,13 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         except Exception:  # noqa: BLE001 — skill nudge never breaks the turn
             pass
         if _blocked is not None:
-            result = {"ok": False, "error": _blocked}
+            result = {
+                "ok": False,
+                "status": "guardrail_blocked",
+                "policy_refusal": True,
+                "executed": False,
+                "error": _blocked,
+            }
             ok = False
         else:
             try:
@@ -3875,13 +4115,30 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         _latency_ms = (_time.monotonic() - _t0) * 1000.0
         # mega-19: keep full result in-process so place pin lists survive for
         # force wire/power derivation; ledger still gets a truncated digest.
-        call_rec = {"tool": tool, "args": args, "ok": ok, "result": result}
-        if not ok and pending_directives:
+        _outcome_kind, _executed = _classify_tool_outcome(
+            result, ok=ok, guard_block=_blocked is not None)
+        call_rec = {"tool": tool, "args": args, "ok": ok, "result": result,
+                    "outcome_kind": _outcome_kind, "executed": _executed}
+        # Anything the harness REFUSED (policy cap, Settings kill-switch, loop
+        # guard, pre-dispatch guard) ran nothing, so it invalidates no queued
+        # call and is no evidence of a defect.
+        _refused_by_policy = not _executed and _outcome_kind in (
+            OUTCOME_POLICY_REFUSAL, OUTCOME_GUARD_BLOCK)
+        if not ok and pending_directives and _executed:
             # Stop-on-first-failure. The queued calls were planned against a
             # state that no longer holds — a sketch that did not take means the
             # extrude referencing it is wrong too — and running them would bury
             # the real error under a cascade the model never asked for. Hand
             # back what happened and let it re-plan.
+            #
+            # Gated on ``_executed``: a call that never reached the tool body
+            # changed NO state, so it invalidated no queued call. That covers
+            # every harness refusal (per-turn cap, Settings kill-switch, loop
+            # guard, pre-dispatch guard) and every argument/binding teaching
+            # error. Halting on those deleted independent work and, worse,
+            # deleted the remedy itself — a capped research_web_search followed
+            # by the research_fetch_page reads the refusal had just told it to
+            # switch to.
             _log(ledger, actor, {
                 "event": "directive_batch_halted",
                 "failed": tool,
@@ -3899,6 +4156,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             _log(ledger, actor, {
                 "event": "tool_call",
                 "tool": tool, "args": args, "ok": ok,
+                "outcome_kind": _outcome_kind, "executed": _executed,
                 "result": _truncate(result),
                 **({"forced": call_rec["forced"]} if call_rec.get("forced") else {}),
             })
@@ -3907,8 +4165,10 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 k: call_rec[k] for k in ("tool", "args", "ok")
             }, "result": _truncate(result)})
         # Bug-report context: capture the failed call so submit_bug_report can
-        # embed it (Settings → AI → Tools). Best-effort, in-memory only.
-        if not ok:
+        # embed it (Settings → AI → Tools). Best-effort, in-memory only. A
+        # policy refusal is a configuration decision, not a defect — capturing
+        # it filed our own caps as bugs.
+        if not ok and not _refused_by_policy:
             try:
                 from services.agent import bugreport_context as _brc  # noqa: PLC0415
                 _brc.record_failure(tool, args, result, run_id=run_id, actor=actor)
@@ -4003,7 +4263,8 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                 from services.agent import agent_events as _ae  # noqa: PLC0415
                 _kind, _payload = _ae.tool_call_event(
                     _ev_node, tool, args, result, ok=ok, latency_ms=_latency_ms,
-                    parent_id=_turn_span, actor=actor)
+                    parent_id=_turn_span, actor=actor,
+                    outcome_kind=_outcome_kind, executed=_executed)
                 _ae.emit_event(_kind, _payload, live=on_event, journal=_ev_journal)
             except Exception:  # noqa: BLE001 — event emission never blocks the turn
                 pass
@@ -4426,8 +4687,14 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             except Exception:  # noqa: BLE001 — inject never breaks the turn
                 pass
 
-        # WI-10 refine cap (non-frontier tiers only; scaffolds.refine_pass_limit returns
-        # None for C and for every frontier profile, so this is a no-op there).
+        # WI-10 refine cap state (non-frontier tiers only; scaffolds.refine_pass_limit
+        # returns None for C and for every frontier profile, so this is a no-op there).
+        # The STOP is enforced pre-dispatch above, before the rework runs; this only
+        # tracks state. It used to break right here, AFTER the mutator had already
+        # re-shaped the geometry and cleared the settled flag — so the turn ended on
+        # an unverified, possibly unsaved revision while the stop detail claimed "the
+        # verified build is kept", and a prior productive call made the harness
+        # synthesise status:done on top of it.
         if ok:
             if tool in _GEOMETRY_MUTATORS:
                 if _geo_settled:
@@ -4436,14 +4703,6 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
                     _geo_settled = False
             elif tool in _GEOMETRY_SETTLERS:
                 _geo_settled = True
-        if _sc is not None and _cap is not None and _refine_rounds:
-            try:
-                if _sc.should_stop_refine(_cap, _refine_rounds,
-                                          ledger=ledger, actor=actor or name):
-                    last_reason = _REFINE_CAP
-                    break
-            except Exception:  # noqa: BLE001 — a cost dial never breaks the turn
-                pass
 
     # No clean finish. Historically this returned max_iters / no_code →
     # escalate (DEFAULT_RETRY_BUDGET=1), which killed every SPECIFY node that
@@ -4471,7 +4730,13 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         "ecad_wire", "ecad_add_power", "ecad_label",
         "fw_build",
         "verify_battery",
-    })
+    # A real deliverable in ANY domain is productive by definition. This set had
+    # drifted out of step with _DELIVERED_PRODUCT_TOOLS: cam_generate, cam_post,
+    # make_drawing, export_drawing and every run_fea_*/run_cfd_flow were missing,
+    # so a cam_programmer that successfully generated a toolpath and then ended
+    # on a non-formal finish counted as having written NOTHING and failed with
+    # the artifact sitting on disk. Union, never a second hand-maintained list.
+    }) | _DELIVERED_PRODUCT_TOOLS
     _BOOTSTRAP_ONLY = frozenset({
         "new_part", "ecad_new_schematic", "fw_new_project",
     })
@@ -4638,7 +4903,7 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         if guard_block:
             # Synthetic handoffs are not privileged. They must satisfy the same
             # product and HARD verification gates as model-authored finishes.
-            last_reason = _GUARD_BLOCKED
+            last_reason = _guard_stop_reason(guard_block)
             last_guard_block = guard_block
         else:
             _log(ledger, actor, {"event": "turn", "kind": "done",
@@ -4676,6 +4941,14 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
             detail = format_error_detail(
                 "Sub-agent hard runaway ceiling reached after "
                 f"{tool_calls_made} tool calls; the turn was forced to stop."
+            )
+        elif _forced_tool_stop == "refusal_ceiling":
+            detail = format_error_detail(
+                f"{_refusals_made} consecutive harness refusals (guardrail / "
+                f"scaffold / review gate) without a single accepted call; the "
+                f"turn was stopped rather than spin. This is a HARNESS "
+                f"condition, not model inaction — the last refusal text names "
+                f"what it demanded."
             )
         else:
             detail = error_detail_for_stop(
@@ -4727,6 +5000,13 @@ def _run_turn_impl(request: str, provider: Any, *, name: str = "dag_node",
         detail = format_error_detail(
             "Sub-agent hard runaway ceiling reached after "
             f"{tool_calls_made} tool calls; the turn was forced to stop."
+        )
+    elif _forced_tool_stop == "refusal_ceiling":
+        detail = format_error_detail(
+            f"{_refusals_made} consecutive harness refusals (guardrail / "
+            f"scaffold / review gate) without a single accepted call; the turn "
+            f"was stopped rather than spin. This is a HARNESS condition, not "
+            f"model inaction — the last refusal text names what it demanded."
         )
     else:
         detail = error_detail_for_stop(
@@ -5669,7 +5949,15 @@ def _reconcile_kwargs(tool: str, fn: Any, supplied: dict,
 
 def _attach_arg_notes(result: Any, notes: list[str]) -> Any:
     """Surface applied synonym mappings in the tool result so the model LEARNS
-    the canonical parameter name instead of re-guessing next call."""
+    the canonical parameter name instead of re-guessing next call.
+
+    A result that cannot carry metadata (a bare number, a plain string, a list)
+    used to be returned UNCHANGED, so the note was written to the log and never
+    reached the model at all — the opposite of this function's whole purpose,
+    and it silently swallowed the per-turn call-cap heads-up as well. Such a
+    result is wrapped in a minimal envelope instead, with the raw value under
+    ``result`` where the ok-payload readers already look for it.
+    """
     note = "; ".join(notes)
     _log_mod.info("tool arg reconciliation: %s", note)
     if isinstance(result, dict):
@@ -5680,14 +5968,165 @@ def _attach_arg_notes(result: Any, notes: list[str]) -> Any:
         try:
             obj = json.loads(result)
         except Exception:  # noqa: BLE001
-            return result
+            obj = None
         if isinstance(obj, dict):
             obj.setdefault("arg_interpretation", note)
             try:
                 return json.dumps(obj, default=str)
             except Exception:  # noqa: BLE001
                 return result
-    return result
+    if result is None:
+        return {"ok": True, "arg_interpretation": note}
+    return {"ok": True, "result": result, "arg_interpretation": note}
+
+
+def _disabled_tool_error(tool: str) -> dict:
+    """Teaching refusal for a tool switched off in Settings → AI → Tools.
+
+    Was a bare ``RuntimeError``, which the turn turned into a red "failed" card
+    indistinguishable from a crash. A kill-switch is a USER CHOICE: say so, and
+    say not to retry, or the model burns completions rephrasing a call that can
+    never run. ``tool_schemas.render_tools_block`` now also drops disabled tools
+    from the advertised schema, so reaching here means the model named the tool
+    from prose rather than from the tools slot.
+    """
+    return {
+        "ok": False,
+        "status": "tool_disabled",
+        "policy_refusal": True,
+        "executed": False,
+        "error": (
+            f"tool '{tool}' is switched OFF in Settings → AI → Tools, so the "
+            f"call was NOT made and nothing ran. This is a user configuration "
+            f"choice, not a fault in your call — retrying it in any form will "
+            f"be refused identically. Reach the goal with another tool, or "
+            f"state in your reply that '{tool}' has to be enabled first."
+        ),
+    }
+
+
+def _call_cap_error(tool: str, cap: int, prompt_note: str = "") -> dict:
+    """Teaching refusal for a tool that hit its per-turn call cap.
+
+    Was a bare ``RuntimeError`` reading ``tool 'X' exceeded
+    max_calls_per_turn=3 (agent.tool_options)`` — it named a CONFIG KEY instead
+    of a next action, so the model saw an unexplained hard failure on a tool it
+    had just been using successfully (live 2026-08-26: ``research_web_search``,
+    red "failed" card mid-research). A cap is a POLICY decision, so it comes
+    back as DATA with the remedy attached: the tool's own curated ``prompt_note``
+    already names the sibling to move to (``research_web_search`` → "returns
+    ranked sources to then READ with research_fetch_page").
+    """
+    remedy = " ".join((prompt_note or "").split())
+    return {
+        "ok": False,
+        "status": "call_cap_reached",
+        "policy_refusal": True,
+        "executed": False,
+        "call_cap": cap,
+        "error": (
+            f"'{tool}' has already done its {cap} allowed call(s) this turn, so "
+            f"this call was REFUSED and nothing ran. Rephrasing the arguments "
+            f"will be refused too — the limit is on the tool, not on the query. "
+            f"Work from what the earlier call(s) returned and take the next step "
+            f"with a DIFFERENT tool."
+            + (f" Guidance for '{tool}': {remedy}" if remedy else "")
+        ),
+    }
+
+
+def _call_cap_last_call_note(tool: str, used: int, cap: int) -> str:
+    """Heads-up appended to the result of the call that consumed the last unit
+    of a tool's per-turn cap.
+
+    Without it the cap is invisible until it fires: the model plans a fourth
+    search, spends a completion composing it, and gets a refusal it could have
+    planned around one call earlier.
+    """
+    return (
+        f"BUDGET: that was call {used} of {cap} allowed for '{tool}' this turn. "
+        f"Further calls to it will be REFUSED — finish with what you have."
+    )
+
+
+def _failed_before_tool_body(result: Any) -> bool:
+    """True when *result* is one of our own teaching errors for a call that
+    never reached the tool's real code (unresolved name, bad/unknown/missing
+    keyword arguments, ask_user's unparseable batch).
+
+    Two consumers, one definition: the loop guard's retry slack and the
+    per-turn call cap. Both must agree that such a call did NO work.
+    """
+    if not (isinstance(result, dict) and result.get("ok") is False):
+        return False
+    try:
+        from services.agent.tool_loop_guard import (  # noqa: PLC0415
+            VALIDATION_FAILURE_STATUSES,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return result.get("status") in VALIDATION_FAILURE_STATUSES
+
+
+def _is_policy_refusal(result: Any) -> bool:
+    """True when *result* is a harness POLICY refusal — the call was declined
+    before anything ran (per-turn cap, Settings kill-switch).
+
+    Distinct from a tool failure in three places that used to conflate them:
+    the queued-directive batch halt (nothing ran, so no queued call was
+    invalidated), the bug-report ring buffer (a config decision is not a bug),
+    and the GUI tool card.
+    """
+    return bool(isinstance(result, dict) and result.get("policy_refusal"))
+
+
+# Tool-call outcome taxonomy. ONE vocabulary for the ledger, the GUI card and
+# the bug-report ring buffer, so none of them has to parse error prose. Before
+# this, a Settings kill-switch, a HARD guard block, an abandoned timeout, a
+# malformed-argument teaching error and a KeyError in our own tool body were all
+# indistinguishable red "failed" cards — the GUI text-matched "loop guard:" to
+# recolor exactly one refusal and gave up on the rest.
+OUTCOME_OK = "ok"
+OUTCOME_POLICY_REFUSAL = "policy_refusal"
+OUTCOME_GUARD_BLOCK = "guard_block"
+OUTCOME_VALIDATION_ERROR = "validation_error"
+OUTCOME_TIMEOUT_UNKNOWN = "timeout_unknown"
+OUTCOME_INTERNAL_ERROR = "internal_error"
+OUTCOME_TOOL_ERROR = "tool_error"
+
+TOOL_OUTCOME_KINDS: frozenset[str] = frozenset({
+    OUTCOME_OK, OUTCOME_POLICY_REFUSAL, OUTCOME_GUARD_BLOCK,
+    OUTCOME_VALIDATION_ERROR, OUTCOME_TIMEOUT_UNKNOWN, OUTCOME_INTERNAL_ERROR,
+    OUTCOME_TOOL_ERROR,
+})
+
+
+def _classify_tool_outcome(result: Any, *, ok: bool,
+                           guard_block: bool = False) -> tuple[str, bool]:
+    """Classify one finished tool call as ``(outcome_kind, executed)``.
+
+    ``executed`` answers exactly one question: did the tool's own body run, so
+    could state have changed? A refusal never ran. A TIMEOUT did run and is
+    still running, which is why its kind says the outcome is UNKNOWN rather
+    than failed — the abandoned thread may still mutate the document.
+
+    *guard_block* marks a refusal decided BEFORE dispatch by a scaffold /
+    guardrail / review gate, which the caller knows and the payload does not.
+    """
+    if ok:
+        return OUTCOME_OK, True
+    if guard_block:
+        return OUTCOME_GUARD_BLOCK, False
+    if _is_policy_refusal(result):
+        return OUTCOME_POLICY_REFUSAL, False
+    if isinstance(result, dict):
+        if result.get("timed_out"):
+            return OUTCOME_TIMEOUT_UNKNOWN, True
+        if result.get("internal_error"):
+            return OUTCOME_INTERNAL_ERROR, True
+        if _failed_before_tool_body(result):
+            return OUTCOME_VALIDATION_ERROR, False
+    return OUTCOME_TOOL_ERROR, True
 
 
 _INTERNAL_FAULT_TYPES = (AttributeError, KeyError, IndexError, UnboundLocalError)
@@ -5770,11 +6209,23 @@ def _dispatch_tool(
     the real parameter set) instead of a bare KeyError/TypeError; a genuine
     tool-side failure still raises, and the caller feeds it back to the model
     (never a fabricated success).
+
+    POLICY REFUSALS — the per-turn call cap and the Settings kill-switch — also
+    return teaching payloads (``policy_refusal: True``, status
+    ``call_cap_reached`` / ``tool_disabled``) rather than raising: nothing ran,
+    so they are decisions to explain, not failures to report. Two consequences
+    the callers depend on: the cap is charged only for calls that actually
+    reached the tool body (``_failed_before_tool_body``), so malformed calls
+    cannot retire a tool the model never used; and the call that consumes the
+    last allowed unit carries a heads-up note, so the cap is visible one call
+    BEFORE it bites.
+
     If *_inner* is provided it is called instead of the default resolver (used when
     the turn supplied a custom tool_dispatch). If *_loop_guard* (a ToolCallLoopGuard,
     see tool_loop_guard.py) is provided and this exact (tool, args) pair repeats the
     immediately-prior successful call past its threshold, the call is refused
-    (RuntimeError with a corrective message) rather than dispatched again.
+    (a ``loop_guard_refused`` policy payload with a corrective message) rather
+    than dispatched again.
 
     _loop_guard also gets ``note_outcome`` fed after every dispatch it allowed
     through: a result shaped like one of our own teaching-error payloads
@@ -5792,7 +6243,17 @@ def _dispatch_tool(
         detection = _loop_guard.check(tool, args)
         if detection is not None:
             from services.agent.tool_loop_guard import ToolCallLoopGuard  # noqa: PLC0415
-            raise RuntimeError(ToolCallLoopGuard.message(detection))
+            # A refusal, not a crash: nothing ran, so it must not charge the
+            # execution budget, file a bug report, halt the queued batch, or
+            # render as a red "failed" card. The message itself is unchanged —
+            # ToolCallLoopGuard.message stays the single source of that wording.
+            return {
+                "ok": False,
+                "status": "loop_guard_refused",
+                "policy_refusal": True,
+                "executed": False,
+                "error": ToolCallLoopGuard.message(detection),
+            }
 
     # Per-tool options (Settings → AI → Tools).
     opts: dict = {}
@@ -5803,25 +6264,32 @@ def _dispatch_tool(
         opts = {}
 
     if opts.get("enabled") is False:
-        raise RuntimeError(f"tool '{tool}' disabled in Settings → AI → Tools")
+        return _disabled_tool_error(tool)
 
-    # Per-tool option always wins; fall back to the global default (Settings →
-    # AI → Tools "Advanced") only when the per-tool value is unset/0.
-    max_calls = opts.get("max_calls_per_turn")
-    if max_calls is None:
-        try:
-            from services.agent.config import tool_max_calls_default  # noqa: PLC0415
-            max_calls = tool_max_calls_default() or None
-        except Exception:  # noqa: BLE001
-            max_calls = None
+    # ONE resolver shared with the tools-slot renderer: per-tool option first,
+    # then the global default (Settings → AI → Tools "Advanced"). The cap the
+    # model was SHOWN is therefore the cap that is enforced.
+    max_calls = None
+    try:
+        from services.agent.config import effective_tool_call_cap  # noqa: PLC0415
+        max_calls = effective_tool_call_cap(tool, opts=opts)
+    except Exception:  # noqa: BLE001
+        max_calls = None
     if max_calls is not None and _call_counts is not None:
-        n = int(_call_counts.get(tool, 0))
-        if n >= int(max_calls):
-            raise RuntimeError(
-                f"tool '{tool}' exceeded max_calls_per_turn={max_calls} "
-                f"(agent.tool_options)"
-            )
-        _call_counts[tool] = n + 1
+        if int(_call_counts.get(tool, 0)) >= int(max_calls):
+            if _loop_guard is not None:
+                # The refusal is final — never hand the streak the extra
+                # validation-retry slack, which exists for arguments the model
+                # can still fix.
+                try:
+                    _loop_guard.note_outcome(tool, args, failed_before_body=False)
+                except Exception:  # noqa: BLE001
+                    pass
+            return _call_cap_error(tool, int(max_calls),
+                                   str(opts.get("prompt_note") or ""))
+    # NB: the counter is charged AFTER the call, in _charge_call below — a call
+    # refused by argument validation or tool binding never ran, and charging it
+    # let three malformed calls retire a tool the model had never once used.
 
     merged = dict(opts.get("param_defaults") or {})
     # Names the MODEL did not supply — a bad one here is a Settings bug, and the
@@ -5923,9 +6391,26 @@ def _dispatch_tool(
             # Never wait — handing control back to the turn is the whole point.
             ex.shutdown(wait=False)
 
+    def _charge_call(*, did_work: bool) -> int | None:
+        """Charge this call against the per-turn cap, returning the new count.
+
+        ``did_work`` is False only when the call never reached the tool body
+        (see ``_failed_before_tool_body``). A timeout DOES count: that call is
+        still running and may still mutate state.
+        """
+        if max_calls is None or _call_counts is None:
+            return None
+        if not did_work:
+            return int(_call_counts.get(tool, 0))
+        used = int(_call_counts.get(tool, 0)) + 1
+        _call_counts[tool] = used
+        return used
+
     try:
         result = _call_with_timeout() if timeout_f > 0 else _call()
     except Exception as exc:  # noqa: BLE001
+        # The tool body ran and threw: real work, real spend — it counts.
+        _charge_call(did_work=True)
         if _loop_guard is not None:
             # Raised out of fn(**kwargs) (or _inner) — the tool body ran and
             # threw; a genuine tool-side failure, not an arg-validation miss.
@@ -5942,18 +6427,17 @@ def _dispatch_tool(
         if hint:
             raise type(exc)(f"{exc} Hint: {hint}") from exc
         raise
+    failed_before_body = _failed_before_tool_body(result)
     if _loop_guard is not None:
         try:
-            from services.agent.tool_loop_guard import (  # noqa: PLC0415
-                VALIDATION_FAILURE_STATUSES,
-            )
-            failed_before_body = (
-                isinstance(result, dict) and result.get("ok") is False
-                and result.get("status") in VALIDATION_FAILURE_STATUSES
-            )
             _loop_guard.note_outcome(tool, args, failed_before_body=failed_before_body)
         except Exception:  # noqa: BLE001
             pass
+    used = _charge_call(did_work=not failed_before_body)
+    if used is not None and max_calls is not None and used >= int(max_calls):
+        # Warn ON the last allowed call, not one call too late.
+        result = _attach_arg_notes(
+            result, [_call_cap_last_call_note(tool, used, int(max_calls))])
     return result
 
 
@@ -10327,6 +10811,18 @@ _ARTIFACT_PRODUCT_GATES: tuple[
      "no drawing sheet exists — make_drawing/export_drawing never ran. A drawing "
      "role cannot declare done off ledger/read calls alone: make_drawing, place "
      "the views, then export_drawing."),
+    # A GEOMETRY producer that only verified or noted has not done the work it
+    # was asked to do. verify_battery and ledger_note are both in
+    # _PRODUCTIVE_TOOLS (each IS the deliverable for some other role), so `wrote`
+    # was True and a feature_modeler could be synthesised as status:done having
+    # inspected an existing part and changed nothing. These roles exist to
+    # mutate geometry; nothing else counts as their product.
+    (frozenset({"feature_modeler", "model3d", "re_modeler", "fixer"}),
+     frozenset({"add_features", "edit_feature"}),
+     "no geometry was created or changed — add_features/edit_feature never "
+     "succeeded. Verifying, measuring or noting an existing part is not this "
+     "role's product: make the geometry change you were asked for, then "
+     "verify_battery it."),
 )
 
 
@@ -10472,18 +10968,54 @@ def _bootstrap_incomplete(
                for c in calls):
         actor_role = str(actor or "").strip().split(" ", 1)[0]
         for roles, product, remedy in _ARTIFACT_PRODUCT_GATES:
-            if actor_role in roles and not (ok_tools & product):
-                return remedy
+            if actor_role not in roles or (ok_tools & product):
+                continue
+            # Never demand a product this lane cannot make. An allowlist without
+            # any of the product tools means the gate would be UNSATISFIABLE:
+            # the model is told to run a call it does not hold, every finish
+            # attempt is rejected, and the turn dies on a guardrail nothing
+            # could clear. `allow_set` empty means unrestricted, so the demand
+            # stands. This mirrors the fw_build gate just above, which has
+            # always checked its own grant.
+            if allow_set and not (product & allow_set):
+                continue
+            return remedy
     return None
+
+
+#: Prefix on a ``_done_guardrail_block`` message that is OUR fault, not a
+#: content rejection. The turn must not attribute the stop to the model.
+GUARD_INTERNAL_PREFIX = "[HARNESS FAULT]"
 
 
 def _done_guardrail_block(handoff: dict, ledger, actor: str,
                           calls: list) -> str | None:
-    """WI-11/13/14 done intercept. Return model-visible block message or None."""
+    """WI-11/13/14 done intercept. Return model-visible block message or None.
+
+    An internal fault (import failure, bug in a guard predicate) used to come
+    back as ``HARD guardrail unavailable: ImportError: …`` and was handed to the
+    model as if it were a gate it had failed. The model cannot repair our
+    ImportError, so every subsequent done attempt hit the same exception and
+    burned a completion each time until the turn died attributed to
+    ``guardrail_blocked`` — blaming the model for a harness defect. The message
+    now says whose fault it is and tells the model not to re-derive its handoff,
+    and the fault is logged server-side with a traceback where it belongs.
+    """
     try:
         from services.agent import guardrails as _gr  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001
-        return f"HARD guardrail unavailable: {type(exc).__name__}: {exc}"
+        _log_mod.error("done guardrails unavailable: %s: %s",
+                       type(exc).__name__, exc)
+        _log(ledger, actor or "agent_turn", {
+            "event": "done_guardrail_subsystem_unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+        return (
+            f"{GUARD_INTERNAL_PREFIX} the done-gate subsystem could not load "
+            f"({type(exc).__name__}). Your handoff was NOT rejected for its "
+            f"content and re-deriving it will not help — this is a bug on our "
+            f"side, already reported internally. Re-send the SAME handoff."
+        )
     try:
         actor_role = str(actor or "").strip().split(" ", 1)[0]
         skip = {"orphan_sketch"} if actor_role in {"sketcher", "sketch2d"} else set()
@@ -10496,14 +11028,43 @@ def _done_guardrail_block(handoff: dict, ledger, actor: str,
             return None
         return verdict.message or verdict.reason or _gr.MSG_VERIFY_BATTERY
     except Exception as exc:  # noqa: BLE001
-        return f"HARD guardrail failed: {type(exc).__name__}: {exc}"
+        _log_mod.exception("done guardrail raised for actor=%s", actor)
+        _log(ledger, actor or "agent_turn", {
+            "event": "done_guardrail_internal_error",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+        return (
+            f"{GUARD_INTERNAL_PREFIX} the done-gate raised "
+            f"{type(exc).__name__} while checking your handoff. Your handoff "
+            f"was NOT rejected for its content and re-deriving it will not "
+            f"help — this is a bug on our side, already reported internally. "
+            f"Re-send the SAME handoff."
+        )
 
 
 def _pre_dispatch_guardrail(tool: str, args: dict, ledger, actor: str) -> str | None:
-    """WI-12/15 pre-dispatch. Return error string to feed the model, or None."""
+    """WI-12/15 pre-dispatch. Return error string to feed the model, or None.
+
+    A fault here fails OPEN — deliberately, and now LOUDLY. Failing closed on a
+    broken guard subsystem would brick every modeling call in the app, and the
+    safety-critical case (auto-checkpoint before a destructive edit) already
+    owns its own block-once-then-proceed-unprotected policy inside guardrails.
+    What was wrong was the SILENCE: an ImportError or a bug in a guard predicate
+    returned ``None``, which is the exact value meaning "allowed", so a
+    completely dead guard subsystem was indistinguishable from a clean pass and
+    nothing anywhere said so.
+    """
     try:
         from services.agent import guardrails as _gr  # noqa: PLC0415
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _log_mod.error(
+            "guardrails unavailable — pre-dispatch guards are NOT running "
+            "(tool=%s): %s: %s", tool, type(exc).__name__, exc,
+        )
+        _log(ledger, actor or "agent_turn", {
+            "event": "guardrail_subsystem_unavailable",
+            "tool": tool, "error": f"{type(exc).__name__}: {exc}",
+        })
         return None
     try:
         verdict = _gr.pre_dispatch(
@@ -10512,8 +11073,17 @@ def _pre_dispatch_guardrail(tool: str, args: dict, ledger, actor: str) -> str | 
         if verdict is None or verdict.ok:
             return None
         return verdict.message or verdict.reason or "hard guardrail blocked tool"
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _log_mod.exception(
+            "pre-dispatch guardrail raised for tool=%s — the call was allowed "
+            "through UNGUARDED", tool,
+        )
+        _log(ledger, actor or "agent_turn", {
+            "event": "guardrail_internal_error",
+            "tool": tool, "error": f"{type(exc).__name__}: {exc}",
+        })
         return None
+
 
 def _mirror_c1_grading_evidence(tool: str, args: dict, result: Any,
                                 ledger, actor: str) -> None:

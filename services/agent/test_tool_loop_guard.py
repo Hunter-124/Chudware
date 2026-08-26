@@ -43,6 +43,27 @@ class TestToolCallLoopGuard:
         for _ in range(10):
             assert g.check("get_job", {"job_id": "j1"}) is None
 
+    def test_time_varying_status_pollers_never_flag(self):
+        for tool in ("sim_status", "fw_status", "scrape_queue_status"):
+            guard = ToolCallLoopGuard(threshold=3)
+            for _ in range(10):
+                assert guard.check(tool, {"job_id": "same"}) is None
+
+    def test_deterministic_describe_part_still_flags_third_call(self):
+        guard = ToolCallLoopGuard(threshold=3)
+        assert guard.check("describe_part", {"doc_id": "d1"}) is None
+        assert guard.check("describe_part", {"doc_id": "d1"}) is None
+        assert guard.check("describe_part", {"doc_id": "d1"}) is not None
+
+    def test_coordinate_claim_intent_is_a_semantic_argument(self):
+        guard = ToolCallLoopGuard(threshold=3)
+        base = {"agent": "a1", "scope": ["part"], "__intent": "scratch"}
+        for intent in ("inspect", "edit", "release"):
+            assert guard.check(
+                "coordinate_claim", {**base, "intent": intent}
+            ) is None
+
+
     def test_message_mentions_tool_and_count(self):
         g = ToolCallLoopGuard(threshold=2)
         g.check("describe_part", {"doc_id": "d1"})
@@ -51,22 +72,17 @@ class TestToolCallLoopGuard:
         assert "describe_part" in msg
         assert "2" in msg
 
-    def test_message_never_suggests_the_tool_it_just_blocked(self):
-        """Live 2026-07-27: haiku called ask_user with {} four times and the guard
-        answered "change approach (replan/ask_user)" — recommending the very tool
-        it had just refused, so the only advice on offer was the loop itself."""
+    def test_message_names_only_universal_escape_routes(self):
         g = ToolCallLoopGuard(threshold=2)
         g.check("ask_user", {})
         msg = ToolCallLoopGuard.message(g.check("ask_user", {}))
-        assert "replan" in msg
-        # The blocked tool must not appear as an escape hatch.
-        assert "/ask_user" not in msg and "ask_user)" not in msg
-
-    def test_other_tools_still_get_ask_user_as_an_escape_hatch(self):
-        g = ToolCallLoopGuard(threshold=2)
-        g.check("fs_list", {"path": "."})
-        msg = ToolCallLoopGuard.message(g.check("fs_list", {"path": "."}))
-        assert "replan" in msg and "ask_user" in msg
+        assert "prior result" in msg
+        assert "real argument" in msg
+        assert "different tool" in msg
+        assert "status='blocked'" in msg
+        assert "replan" not in msg
+        assert "will not change" not in msg
+        assert "did not change" not in msg
 
     def test_empty_arguments_get_a_schema_specific_hint(self):
         """Repeating a call with NO arguments is a schema failure, not a retry:
@@ -140,7 +156,8 @@ class TestValidationFailureGrace:
         assert detection is not None
         msg = ToolCallLoopGuard.message(detection)
         assert "argument validation" in msg
-        assert "extra retries" in msg
+        assert "extra retry slack" in msg
+        assert "immediately preceding" in msg
 
     def test_note_outcome_ignores_a_stale_key(self):
         """A call for a (tool, args) that is no longer the active streak (the
@@ -185,14 +202,17 @@ class TestExemptToolsMatchDocstring:
         assert "verify_battery" in (mod.__doc__ or "")
         assert "NOT" in (mod.__doc__ or "")
 
-    def test_no_undocumented_extra_tool_names_read_as_exempt(self):
-        """Every tool the docstring's own frozenset literal enumerates must be
-        exactly DEFAULT_EXEMPT_TOOLS — no manual re-listing to drift from."""
+    def test_swept_poller_set_is_pinned(self):
         import services.agent.tool_loop_guard as mod
         assert mod.DEFAULT_EXEMPT_TOOLS == frozenset({
-            "get_job", "dag_status", "workspace_status", "workspace_doc_events",
-            "ledger_get", "ledger_events", "buildgraph_status",
+            "box_status", "buildgraph_status", "dag_status", "ecad_status",
+            "em_status", "fw_status", "get_job", "intake_status",
+            "ledger_events", "ledger_get", "mission_status", "plm_status",
+            "reveng_gate_status", "reveng_status", "scrape_queue_status",
+            "serving_status", "sim_jobs", "sim_status", "vendor_status",
+            "workspace_doc_events", "workspace_status",
         })
+        assert "req_status" not in mod.DEFAULT_EXEMPT_TOOLS
 
 
 class TestAskUserEmptyArgs:
@@ -251,30 +271,50 @@ class TestDispatchToolLoopGuardWiring:
             r = _dispatch_tool("ask_user", {}, _call_counts=counts, _loop_guard=guard)
             assert r["ok"] is False and r["status"] == "bad_arguments"
             assert "do NOT retry" in r["error"]
-        try:
-            _dispatch_tool("ask_user", {}, _call_counts=counts, _loop_guard=guard)
-            raise AssertionError("5th identical ask_user({}) call must be refused")
-        except RuntimeError as exc:
-            assert "LOOP GUARD" in str(exc)
-            assert "argument validation" in str(exc)
+        refusal = _dispatch_tool(
+            "ask_user", {}, _call_counts=counts, _loop_guard=guard
+        )
+        assert refusal == {
+            "ok": False,
+            "status": "loop_guard_refused",
+            "policy_refusal": True,
+            "executed": False,
+            "error": refusal["error"],
+        }
+        assert "LOOP GUARD" in refusal["error"]
+        assert "argument validation" in refusal["error"]
+        assert "replan" not in refusal["error"]
 
-    def test_repeated_identical_success_still_trips_at_threshold(self):
+    def test_repeated_identical_success_still_trips_at_threshold(self, tmp_path,
+                                                                 monkeypatch):
         """A tool that succeeds identically N times in a row (nothing wrong
         with its arguments) gets NO grace — that is the real waste this guard
-        exists to stop."""
+        exists to stop.
+
+        fs_list needs a real workspace root, so the test provides one: without
+        it the tool returned ok:false/workspace_root_unavailable on any box
+        that had not exported CHUDWARE_FS_ROOT, and this gate failed for a
+        reason that had nothing to do with the loop guard.
+        """
         from services.agent.agent_turn import _dispatch_tool
         from services.agent.tool_loop_guard import ToolCallLoopGuard
 
+        monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
         guard = ToolCallLoopGuard(threshold=3)
         counts: dict = {}
         for _ in range(2):
             r = _dispatch_tool("fs_list", {"path": "."},
                                _call_counts=counts, _loop_guard=guard)
-            assert r.get("ok") is True and "status" not in r
-        try:
-            _dispatch_tool("fs_list", {"path": "."},
-                           _call_counts=counts, _loop_guard=guard)
-            raise AssertionError("3rd identical successful call must be refused")
-        except RuntimeError as exc:
-            assert "LOOP GUARD" in str(exc)
-            assert "argument validation" not in str(exc)
+            assert r.get("ok") is True and "status" not in r, r
+        refusal = _dispatch_tool(
+            "fs_list", {"path": "."},
+            _call_counts=counts, _loop_guard=guard,
+        )
+        assert refusal["ok"] is False
+        assert refusal["status"] == "loop_guard_refused"
+        assert refusal["policy_refusal"] is True
+        assert refusal["executed"] is False
+        assert "LOOP GUARD" in refusal["error"]
+        assert "argument validation" not in refusal["error"]
+        assert "will not change" not in refusal["error"]
+        assert "replan" not in refusal["error"]

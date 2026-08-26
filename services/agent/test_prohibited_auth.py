@@ -47,8 +47,9 @@ ALLOWLIST = {
 }
 SCAN_EXT = {".py", ".cpp", ".h", ".hpp", ".ps1", ".js", ".ts", ".json", ".toml", ".cfg"}
 
-# A path `git ls-files` MUST report. If it doesn't, the scan is not looking at this repo.
-SCAN_SENTINEL = "services/agent/providers/sub_auth.py"
+# A non-allowlisted path `git ls-files` MUST report. The sentinel test injects
+# prohibited content at this path to exercise the same scan pipeline end to end.
+SCAN_SENTINEL = "services/agent/agent_turn.py"
 
 
 def _require_plausible_scan(files: list[str]) -> list[str]:
@@ -83,23 +84,44 @@ def _tracked_files() -> list[str]:
         [f for f in out.splitlines() if Path(f).suffix in SCAN_EXT])
 
 
-def test_no_consumer_oauth_token_reuse():
+def _scan_files(
+    files: list[str], *, injected_text: dict[str, str] | None = None
+) -> list[str]:
     hits = []
-    for rel in _tracked_files():
+    for rel in files:
         if rel in ALLOWLIST:
             continue
-        try:
-            text = (REPO / rel).read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
+        if injected_text is not None and rel in injected_text:
+            text = injected_text[rel]
+        else:
+            try:
+                text = (REPO / rel).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
         for pat in PROHIBITED:
-            if pat.search(text):
-                hits.append(f"{rel}: matches {pat.pattern!r}")
+            match = pat.search(text)
+            if match is None:
+                continue
+            line_number = text.count("\n", 0, match.start()) + 1
+            source_line = text.splitlines()[line_number - 1].strip()
+            hits.append(
+                f"{rel}:{line_number}: {source_line} [matches {pat.pattern!r}]"
+            )
+    return hits
+
+
+def test_no_consumer_oauth_token_reuse():
+    hits = _scan_files(_tracked_files())
     assert not hits, (
         "Consumer Claude/Gemini subscription-OAuth endpoint detected in non-allowlisted "
-        "file (contract §4.2). If this is a new subscription-auth provider, add it to the "
-        "ALLOWLIST in this test (§4.4):\n  " + "\n  ".join(hits))
-
+        "source (contract §4.2).\n"
+        "Each finding names the exact source line and prohibited endpoint marker.\n"
+        "Acceptable remediations (choose one):\n"
+        "  1. Remove the consumer-OAuth flow and its references.\n"
+        "  2. Obtain an explicit owner-approved policy exception, record it in "
+        "contracts/providers.md, and only then add a narrowly scoped ALLOWLIST entry.\n"
+        "Findings:\n  " + "\n  ".join(hits)
+    )
 
 def test_scan_guard_refuses_to_pass_on_a_vacuous_file_list():
     """A scan that saw nothing must fail loudly, never silently pass.
@@ -116,10 +138,15 @@ def test_scan_guard_refuses_to_pass_on_a_vacuous_file_list():
 
 
 def test_scan_sentinel_is_actually_tracked():
-    """The sentinel is only a valid liveness check while git really tracks it."""
-    tracked = subprocess.run(["git", "-C", str(REPO), "ls-files", "--error-unmatch",
-                              SCAN_SENTINEL], capture_output=True, text=True)
-    assert tracked.returncode == 0, tracked.stderr
+    """The tracked-source scanner must detect a known violation end to end."""
+    files = _tracked_files()
+    assert SCAN_SENTINEL in files
+    violation = "https://claude." + "ai/oauth/authorize"
+    hits = _scan_files([SCAN_SENTINEL], injected_text={SCAN_SENTINEL: violation})
+    expected_pattern = r"claude\.ai/(?:oauth|api/auth)"
+    assert hits == [
+        f"{SCAN_SENTINEL}:1: {violation} [matches {expected_pattern!r}]"
+    ], "consumer-OAuth scanner is disabled or no longer examines tracked source text"
 
 
 def test_openrouter_pkce_is_present_as_the_blessed_path():

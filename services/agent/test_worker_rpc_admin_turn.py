@@ -241,7 +241,12 @@ def test_agent_admin_turn_runs_crash_save_finalizer_once(monkeypatch):
 # fresh fork per turn, so _agent_admin_turn sets CHUDWARE_FS_ROOT /
 # CHUDWARE_PROJECT_DIR / CHUDWARE_PROJECT_SAVE_DIR and chdirs into it — fs_* tools
 # jail on CHUDWARE_FS_ROOT and previously resolved against the CAD source repo
-# checkout (the worker's CWD). Absent/invalid param == behaviour exactly as before.
+# checkout (the worker's CWD). An ABSENT workspace_dir param behaves exactly as
+# before. An explicitly SUPPLIED workspace
+# that cannot be resolved is refused BEFORE the provider is constructed: it used
+# to be silently ignored, which left the turn with no CHUDWARE_PROJECT_SAVE_DIR,
+# so a successful model mutation became memory-only work that reported
+# `confirmed` and later surfaced as "Recover unsaved parts?".
 
 _WS_ENV_KEYS = ("CHUDWARE_FS_ROOT", "CHUDWARE_PROJECT_DIR", "CHUDWARE_PROJECT_SAVE_DIR")
 
@@ -293,24 +298,39 @@ def test_agent_admin_turn_workspace_dir_absent_mutates_nothing(monkeypatch):
     assert os.getcwd() == start_cwd
 
 
-def test_agent_admin_turn_workspace_dir_nonexistent_is_ignored(monkeypatch, tmp_path):
-    """A non-existent workspace_dir never fails the turn: it is ignored (no env
-    writes, no chdir) and the turn still completes."""
+def test_agent_admin_turn_workspace_dir_nonexistent_is_refused(monkeypatch, tmp_path):
+    """An explicitly supplied non-existent workspace_dir is refused up front.
+
+    Ignoring it (the old behaviour) meant no save root, so `save_touched_docs`
+    reported a benign `skipped` while the turn reported success — durable
+    delivery silently downgraded to memory-only. The refusal happens BEFORE the
+    provider is constructed, so a host that passes a stale folder costs zero
+    tokens instead of a whole billed turn whose output cannot be saved.
+    """
     import os
 
     _clear_ws_env(monkeypatch)
     start_cwd = os.getcwd()
     provider = _OneToolProvider(["Done anyway."])
-    monkeypatch.setattr(agent_config, "get_provider", lambda *a, **k: provider)
+    calls: list[str] = []
+
+    def _get_provider(*a, **k):
+        calls.append("provider")
+        return provider
+
+    monkeypatch.setattr(agent_config, "get_provider", _get_provider)
     out = worker_rpc._agent_admin_turn(
         {"request": "list my files",
          "workspace_dir": str(tmp_path / "does-not-exist")},
         lambda data: None,
     )
-    assert out["ok"] is True
+    assert out["ok"] is False
+    assert "invalid_workspace" in str(out.get("reason") or "")
+    assert calls == [], "the provider must not be constructed for a dead workspace"
     for key in _WS_ENV_KEYS:
         assert key not in os.environ
     assert os.getcwd() == start_cwd
+
 
 def test_workspace_dir_in_a_subfolder_jails_on_the_whole_project(monkeypatch, tmp_path):
     """The host passes the open DOCUMENT's folder as workspace_dir. The jail root must

@@ -6,6 +6,7 @@
 #include "copilot_internal.h"
 #include "agent_text.h"
 #include "stream_rows.h"
+#include "tool_outcome.h"
 
 // ============================ transparent activity timeline ============================
 // Map a raw orchestrator stage key to a plain-language heading the user can follow.
@@ -1837,12 +1838,48 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 ni.detail = data["args"].dump(2);
         }
         ni.durationMs = jint(data, "latency_ms");
-        const bool ok = !data.is_object() || data.value("ok", true);
-        ni.status     = ok ? "done" : "fail";
+        const bool legacyOk = !data.is_object() || data.value("ok", true);
+        const ui::copilot::ToolOutcomeKind outcome =
+            ui::copilot::parseToolOutcomeKind(jstr(data, "outcome_kind"));
+        const bool executed = data.is_object() && data.contains("executed") &&
+                              data["executed"].is_boolean() && data["executed"].get<bool>();
+        // The structured taxonomy is authoritative when present. Missing, malformed, and future
+        // values take the exact legacy ok -> done/fail path so replayed sessions never acquire a
+        // fabricated UNKNOWN state.
+        switch (outcome) {
+            case ui::copilot::ToolOutcomeKind::Ok:
+                ni.status = "done";
+                break;
+            case ui::copilot::ToolOutcomeKind::PolicyRefusal:
+                ni.status = "skipped";
+                break;
+            case ui::copilot::ToolOutcomeKind::GuardBlock:
+                ni.status = "skipped";
+                break;
+            case ui::copilot::ToolOutcomeKind::ValidationError:
+                ni.status = "fail";
+                break;
+            case ui::copilot::ToolOutcomeKind::TimeoutUnknown:
+                ni.status = "retry";
+                break;
+            case ui::copilot::ToolOutcomeKind::InternalError:
+                ni.status = "fail";
+                break;
+            case ui::copilot::ToolOutcomeKind::ToolError:
+                ni.status = "fail";
+                break;
+            case ui::copilot::ToolOutcomeKind::Legacy:
+            default:
+                ni.status = legacyOk ? "done" : "fail";
+                break;
+        }
+        // Preserve the taxonomy ahead of potentially long error/artifact payloads so ActivityItem
+        // persistence caps retain it. Unknown/missing values get no trailer and remain legacy.
+        ui::copilot::appendToolOutcomeTrailer(ni.detail, outcome, executed);
         // Optional error_preview (capped failure text) — packed after the args body with the
         // same delimiter convention as artifacts below so drawToolCallRow can split it back
         // out without a new ActivityItem field (app_state.h is integrator-owned).
-        if (!ok) {
+        if (ni.status != "done") {
             const std::string errText = jstr(data, "error_preview");
             if (!errText.empty()) {
                 if (!ni.detail.empty()) ni.detail += "\n\x1e" "ERR\x1e\n";

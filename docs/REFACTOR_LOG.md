@@ -8026,3 +8026,112 @@ title-block vector cells. A representative stepped-punch workflow produced clean
 9.8/20 mm diameter callouts, 95 mm OAL, zero review warnings, A3 PDF, native `.step+`,
 and neutral STEP. Existing `/home/hunter/Desktop/press` artifacts remain historical and
 must not be sent to a shop without regeneration through the corrected workflow.
+
+## 2026-08-26 — agent harness: refusals are data, not failures
+
+Triggered by a live card reading `tool 'research_web_search' exceeded
+max_calls_per_turn=3 (agent.tool_options)` — a red "failed" tool card that named a
+config key where a next action belonged. A four-slice read-only audit found the same
+shape everywhere: **the harness refuses a call, then reports the refusal as if the
+tool had crashed.** Clean-HEAD `services/agent` went 37 failures → 1 (the remaining
+one is a deliberate open decision, below).
+
+**One taxonomy, end to end.** `agent_turn._classify_tool_outcome` returns
+`(outcome_kind, executed)` over `TOOL_OUTCOME_KINDS` = ok / policy_refusal /
+guard_block / validation_error / timeout_unknown / internal_error / tool_error.
+`agent_events.tool_call_event` carries both (omitted when unclassified, so older
+consumers keep ok-only behaviour), and `host/src/ui/copilot/{feed,activity_timeline}.cpp`
+render each class distinctly via the new `tool_outcome.h` — deleting the `"loop guard:"`
+prose match that used to be the only way the GUI could tell a refusal from a crash.
+`executed` answers exactly one question: did the tool BODY run, so could state have
+changed? A timeout reports `executed=True` because the abandoned thread is still
+running.
+
+**Consequences the callers depend on.** A refusal no longer: spends the turn's
+execution budget (`tool_calls_made` is charged only inside the `_blocked is None`
+branch, with a separate bounded `_refusal_ceiling` so a wedged guard still cannot
+spin); files a bug report; or halts queued directives — that halt is now gated on
+`executed`, because a call that never reached the tool body invalidated no state, and
+halting used to delete the exact remedy the refusal had just named. Allowlist denials
+also now EMIT a tool event; they previously bypassed `tool_call_event` entirely, so
+the user watched the model stall with no card at all.
+
+**The per-tool cap specifically.** `config.effective_tool_call_cap` is now the single
+resolver shared by enforcement (`_dispatch_tool`) and ADVERTISEMENT
+(`tool_schemas.render_tools_block` renders `Per-turn limit: at most N call(s)`), so
+the model can plan around a cap it can finally see. The counter is charged AFTER the
+call and only when it reached the tool body, so malformed calls can no longer retire a
+tool the model never used once; the call that spends the last unit carries a heads-up
+note; and the refusal itself is a `call_cap_reached` payload carrying the tool's own
+curated `prompt_note` as the remedy. `research_web_search` stays at 3 — a sweep of
+every role card confirmed no role's prose mandates more than three searches.
+Settings-disabled tools are dropped from the rendered schema entirely rather than
+advertised and then refused.
+
+**Two dispatch paths, one policy.** `copilot_mode_tools.apply_meta_tool_floor` is now
+applied by `agent_turn`, `mission_dispatch` AND `node_runner` before schema rendering.
+Path B never applied it, so every compiled DAG node ran confined to its 14 card tools:
+`enable_tools` was callable but INVISIBLE. Same for budget —
+`tool_budget.completion_cap_for_subagent` gives both lanes the same 8192 headroom (B
+silently took `agent_turn`'s 2048 default when a node had no tier), and
+`tool_budget.ROLE_MIN_CALLS` raises the soft convergence floor to each role's audited
+mandated chain (ecad_engineer 35, model3d 24, feature_modeler/spec_writer 18 — all
+were being told to "converge now" at 16, before their own card's chain could finish).
+`role_models.clamp_provider_effort` is applied to the FINAL provider on every path out
+of selection in both lanes; the session-default branch discarded the clamped config and
+reused the ambient provider, leaking `max` effort past the `high` ceiling.
+
+**Honest terminals.** A twice-truncated reply is `reply_truncated` (retryable in
+`node_runner._RETRY_REASONS`), not `no_code` — it is a provider output cap, not model
+inaction, and `no_code` both blamed the model and blocked retry. A done-gate that
+cannot RUN returns `GUARD_INTERNAL_PREFIX` and routes to `guardrail_internal_error`
+instead of handing the model our ImportError forever as `guardrail_blocked`. The WI-10
+refine cap is enforced BEFORE the rework dispatches, so the revision the turn keeps is
+genuinely the last settled one; it used to fire after the mutator had already dirtied
+the geometry while reporting "the verified build is kept". `_PRODUCTIVE_TOOLS` now
+unions `_DELIVERED_PRODUCT_TOOLS` (a cam_programmer that generated a real toolpath
+counted as having written nothing), and a geometry-producer `_ARTIFACT_PRODUCT_GATES`
+entry stops a `feature_modeler` being synthesised as `done` after only verifying.
+Every artifact gate now also checks the lane can actually CALL the product tool it
+demands — that check is what keeps these gates satisfiable.
+
+**Recovered work.** `_drop_oldest_tool_results` REPLACES trimmed results with a
+placeholder instead of deleting them: deletion left orphaned assistant messages, and
+strict-alternation providers answered the overflow retry with a 400 that
+`classify_provider_error` reported as `provider_auth` — sending users to check
+credentials that were fine. A 404 "no endpoints" is now non-retryable (it burned every
+DAG retry). `_attach_arg_notes` wraps a non-envelope result instead of returning it
+unchanged and dropping the note. The delta coalescer is flushed in `run_turn`'s
+`finally`, so the last thing a model said before a provider error still reaches the
+transcript. `enable_tools` is transactional — schemas render and registry policy
+applies against a CANDIDATE set before `allow` is widened, so a green card can no
+longer be followed by "not allowed". Sub-agent termination is read and acted on in its
+own guarded block: a registry write that threw after the flag was set used to skip the
+return and keep dispatching tools while Stop looked accepted.
+
+**Also found and fixed, same session.** `providers/token_usage.record_usage`
+incremented `usage_event_count` only when a worker-RPC sink was bound, so on every
+normal desktop run `agent_turn` classified each completion as unreported, wrote a zero
+row, and the GUI's context/token gauges were SUPPRESSED ENTIRELY. `geometry_helpers`
+hard-required `libchudware.so` and raised, so all process gating and provenance died
+on an unprovisioned box — it now mirrors the six authoritative DfM profile rows
+(verified 6/6 equal to live `dfm_get_profile`) and the bundled material registry.
+`sim_engineer.yaml` carried 15 tools against the hard cap of 14, silently losing its
+trailing entry. `test_cheatsheet_examples` leaked open engine documents into every
+later test in the process. Loop-guard exemptions now cover every real status poller
+(the third identical `sim_status`/`fw_status`/`scrape_queue_status` was refused) and
+`_canonicalize` no longer strips `coordinate_claim`'s genuine `intent` argument.
+`guardrails.checkpoint_verdict` is shared by both checkpoint paths so the capability-A
+aggressive path can actually reach its retry escape. The manufacturing guidance family
+is authored (15 entries) and the Tools-panel tables regenerated; a new gate pins
+snapshot guidance CONTENT, not just tool names — seven entries had drifted into
+materially false advice.
+
+**Deferred, deliberately.** `Webservice/gateway/provider_accounts.py` genuinely
+violates `test_prohibited_auth.py::test_no_consumer_oauth_token_reuse`: it exposes
+`https://claude.ai/oauth/authorize` and posts grants to the consumer token endpoint for
+OTHER tenants' accounts. That gate is red at HEAD and stays red — removing the Claude
+Pro/Max subscription sign-in is a 212-line product and billing decision, not a harness
+fix, so it is surfaced rather than taken. The failure message now names both source
+lines and the two accepted remediations. Also unresolved and environmental: the
+`services/mcp` ECAD/FEA/CFD/hostd suites need a live engine and daemon.

@@ -161,7 +161,8 @@ class TestMissingArgumentErrors:
     def test_error_tells_the_model_not_to_retry_identically(self):
         assert "will not help" in _dispatch_tool("fs_glob", {})["error"]
 
-    def test_valid_call_is_unaffected(self):
+    def test_valid_call_is_unaffected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
         r = _dispatch_tool("fs_list", {"path": "."})
         assert (r if isinstance(r, dict) else {}).get("ok") is True
 

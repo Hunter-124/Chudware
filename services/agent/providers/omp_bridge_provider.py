@@ -21,6 +21,10 @@ Errors surface as :class:`~services.agent.omp_bridge.BridgeUnavailable` (a
 so ``agent_turn``'s taxonomy buckets a 401 as ``provider_auth`` rather than a generic
 retryable failure — same treatment the SDK providers get from their own exceptions.
 
+Ordinary empty/stop retries belong to OMP. Python retries only the narrow wholly-empty
+``stopReason=length`` result that carried ``reasoningEffort``, exactly once with that
+field removed; both attempts remain visible to usage accounting.
+
 Module scope is stdlib-only on purpose (the bridge client is imported lazily, like every
 other consumer of it): ``services/worker_main.py`` silently drops a whole RPC table when
 a module-level import raises.
@@ -267,114 +271,144 @@ class OmpBridgeProvider(Provider):
         if sink is not None:
             params["stream"] = True
 
-        # OMP owns provider retry policy. Its stream adapters already discard and
-        # retry genuinely empty completions with bounded backoff; resampling again
-        # here multiplied one empty answer into as many as six paid wire requests
-        # before DAG retry policy even ran. This layer performs one bridge call,
-        # salvages any streamed result, and reports the sidecar's final outcome.
-        result: dict[str, Any] = {}
+        # OMP owns ordinary empty/stop retry policy. Its stream adapters already
+        # retry genuinely empty completions with bounded backoff, so Python-side
+        # resampling would multiply paid requests. There is one narrow exception:
+        # a wholly empty length stop with reasoningEffort set means reasoning
+        # consumed the output allowance. Retry exactly once with that field
+        # removed; all other empty outcomes surface from the first bridge call.
+        call_params = params
+        retried_without_effort = False
 
-        def _salvage_stream() -> tuple[str, str]:
-            text = "".join(streamed_text)
-            thinking = "".join(streamed_thinking)
-            # Visible text is the intended answer. If it never reached the text
-            # channel, a complete fenced directive in reasoning is still safe
-            # to parse; arbitrary chain-of-thought is not.
-            if text.strip():
-                return text, thinking
-            directive = _directive_from_thinking(thinking)
-            return (directive, thinking) if directive else ("", thinking)
+        while True:
+            result: dict[str, Any] = {}
+            text_start = len(streamed_text)
+            thinking_start = len(streamed_thinking)
 
-        try:
-            if sink is not None:
-                result = bridge.call(
-                    "complete", params, timeout=self.timeout, on_event=on_event)
-            else:
-                # No sink: omit both `stream` and on_event so non-GUI lanes
-                # remain byte-identical.
-                result = bridge.call("complete", params, timeout=self.timeout)
-        except bridge.BridgeUnavailable as call_exc:
-            salvaged_text, salvaged_thinking = _salvage_stream()
-            if salvaged_text:
-                # No terminal line means the stream may be partial. Preserve it
-                # for parsing but mark it truncated so bare prose cannot
-                # masquerade as a completed turn; a complete fenced directive
-                # still parses and executes without another provider call.
-                result = {
-                    "text": salvaged_text,
-                    "thinking": salvaged_thinking,
-                    "stopReason": "length",
-                }
-            else:
+            def _salvage_stream() -> tuple[str, str]:
+                text = "".join(streamed_text[text_start:])
+                thinking = "".join(streamed_thinking[thinking_start:])
+                # Visible text is the intended answer. If it never reached the
+                # text channel, a complete fenced directive in reasoning is
+                # still safe to parse; arbitrary chain-of-thought is not.
+                if text.strip():
+                    return text, thinking
+                directive = _directive_from_thinking(thinking)
+                return (directive, thinking) if directive else ("", thinking)
+
+            try:
+                if sink is not None:
+                    result = bridge.call(
+                        "complete", call_params, timeout=self.timeout,
+                        on_event=on_event)
+                else:
+                    # No sink: omit both `stream` and on_event so non-GUI lanes
+                    # remain byte-identical.
+                    result = bridge.call(
+                        "complete", call_params, timeout=self.timeout)
+            except bridge.BridgeUnavailable as call_exc:
+                salvaged_text, salvaged_thinking = _salvage_stream()
+                if salvaged_text:
+                    # No terminal line means the stream may be partial. Preserve
+                    # it for parsing but mark it truncated so bare prose cannot
+                    # masquerade as a completed turn; a complete fenced directive
+                    # still parses and executes without another provider call.
+                    result = {
+                        "text": salvaged_text,
+                        "thinking": salvaged_thinking,
+                        "stopReason": "length",
+                    }
+                else:
+                    raise bridge.BridgeUnavailable(
+                        f"omp-bridge {self.name}: stream ended before the final "
+                        f"response line ({type(call_exc).__name__}: {call_exc}); "
+                        "no usable text or fenced directive arrived. OMP provider "
+                        "retries are already exhausted.",
+                        status=getattr(call_exc, "status", None),
+                    ) from call_exc
+
+            stop_reason = str(result.get("stopReason") or "")
+            if stop_reason == "error":
+                # Failed paid completions still count. Recording before raising
+                # keeps delegation and pooled-credit accounting honest.
+                self._record_usage(result.get("usage"))
+                text = str(result.get("errorMessage") or "provider error")
+                status = result.get("errorStatus")
                 raise bridge.BridgeUnavailable(
-                    f"omp-bridge {self.name}: stream ended before the final response "
-                    f"line ({type(call_exc).__name__}: {call_exc}); no usable text "
-                    "or fenced directive arrived. OMP provider retries are already "
-                    "exhausted.",
-                    status=getattr(call_exc, "status", None),
-                ) from call_exc
-
-        stop_reason = str(result.get("stopReason") or "")
-        if stop_reason == "error":
-            # Failed paid completions still count. Recording before raising keeps
-            # delegation and pooled-credit accounting honest.
-            self._record_usage(result.get("usage"))
-            text = str(result.get("errorMessage") or "provider error")
-            status = result.get("errorStatus")
-            raise bridge.BridgeUnavailable(
-                f"omp-bridge {self.name}: {text}",
-                status=status if isinstance(status, int) and not isinstance(status, bool) else None)
-
-        if not str(result.get("text") or ""):
-            # Prefer a complete directive from either the authoritative final
-            # thinking or the fragments. This is the zero-cost K3 recovery.
-            final_thinking = str(result.get("thinking") or "")
-            salvaged = _directive_from_thinking(final_thinking)
-            if not salvaged:
-                salvaged = _directive_from_thinking("".join(streamed_thinking))
-            if salvaged:
-                result["text"] = salvaged
-            else:
-                streamed_reply, streamed_reasoning = _salvage_stream()
-                if streamed_reply:
-                    # Do NOT send it to the sink again. The fragments were already
-                    # displayed; this copy exists only for the parser/final result.
-                    result["text"] = streamed_reply
-                    if not final_thinking and streamed_reasoning:
-                        result["thinking"] = streamed_reasoning
-                elif (
-                    self.wire_provider != "kimi-code"
-                    and (final_thinking or streamed_reasoning)
-                ):
-                    # Reasoning with no text is accepted outside the K3 text dialect.
-                    if not final_thinking:
-                        result["thinking"] = streamed_reasoning
-
-        reply = str(result.get("text") or "")
-        thinking = str(result.get("thinking") or "")
-        if not reply and not thinking:
-            # The sidecar may have spent tokens while exhausting its own bounded
-            # empty-completion retry. Account before surfacing the failure.
-            self._record_usage(result.get("usage"))
-            if stop_reason == "length":
-                effort = (
-                    f' at reasoningEffort="{self.reasoning_effort}"'
-                    if self.reasoning_effort else ""
+                    f"omp-bridge {self.name}: {text}",
+                    status=(
+                        status
+                        if isinstance(status, int) and not isinstance(status, bool)
+                        else None
+                    ),
                 )
+
+            if not str(result.get("text") or ""):
+                # Prefer a complete directive from either the authoritative final
+                # thinking or this attempt's fragments. This is zero-cost recovery.
+                final_thinking = str(result.get("thinking") or "")
+                salvaged = _directive_from_thinking(final_thinking)
+                if not salvaged:
+                    salvaged = _directive_from_thinking(
+                        "".join(streamed_thinking[thinking_start:]))
+                if salvaged:
+                    result["text"] = salvaged
+                else:
+                    streamed_reply, streamed_reasoning = _salvage_stream()
+                    if streamed_reply:
+                        # Do NOT send it to the sink again. The fragments were
+                        # already displayed; this copy is parser/final-result only.
+                        result["text"] = streamed_reply
+                        if not final_thinking and streamed_reasoning:
+                            result["thinking"] = streamed_reasoning
+                    elif (
+                        self.wire_provider != "kimi-code"
+                        and (final_thinking or streamed_reasoning)
+                    ):
+                        # Reasoning with no text is accepted outside the K3 text dialect.
+                        if not final_thinking:
+                            result["thinking"] = streamed_reasoning
+
+            reply = str(result.get("text") or "")
+            thinking = str(result.get("thinking") or "")
+            if not reply.strip() and not thinking.strip():
+                if (
+                    stop_reason == "length"
+                    and "reasoningEffort" in call_params
+                    and not retried_without_effort
+                ):
+                    # The first paid attempt still counts. The retry removes only
+                    # reasoningEffort and reuses the exact prompt/token allowance.
+                    self._record_usage(result.get("usage"))
+                    call_params = dict(call_params)
+                    call_params.pop("reasoningEffort", None)
+                    retried_without_effort = True
+                    continue
+
+                # The sidecar may have spent tokens while exhausting its own
+                # bounded retry. Account before surfacing the failure.
+                self._record_usage(result.get("usage"))
+                if stop_reason == "length":
+                    effort = (
+                        f' at reasoningEffort="{call_params["reasoningEffort"]}"'
+                        if call_params.get("reasoningEffort") else ""
+                    )
+                    raise bridge.BridgeUnavailable(
+                        f"omp-bridge {self.name}: {self.model} spent the whole "
+                        f"max_tokens budget ({max_tokens}) before writing anything"
+                        f"{effort} — the reply was TRUNCATED, not missing "
+                        "(stopReason=length). Raise max_tokens or lower the "
+                        "reasoning effort for this model.")
                 raise bridge.BridgeUnavailable(
-                    f"omp-bridge {self.name}: {self.model} spent the whole max_tokens "
-                    f"budget ({max_tokens}) before writing anything{effort} — the reply was "
-                    "TRUNCATED, not missing (stopReason=length). Raise max_tokens "
-                    "or lower the reasoning effort for this model.")
-            raise bridge.BridgeUnavailable(
-                f"omp-bridge {self.name}: final response contained no text or thinking; "
-                "OMP's bounded empty-completion retries produced no usable streamed "
-                "content. Retry the turn or lower reasoning effort.")
-        self._record_usage(result.get("usage"))
-        # A salvaged stream with no terminal line is marked "length" above so
-        # agent_turn's existing compact re-emit guard handles incomplete prose.
-        _base.set_last_stop_reason(result.get("stopReason"))
-        return reply, thinking
+                    f"omp-bridge {self.name}: final response contained no text or "
+                    "thinking; OMP's bounded empty-completion retries produced no "
+                    "usable streamed content. Retry the turn or lower reasoning effort.")
+
+            self._record_usage(result.get("usage"))
+            # A salvaged stream with no terminal line is marked "length" above so
+            # agent_turn's existing compact re-emit guard handles incomplete prose.
+            _base.set_last_stop_reason(result.get("stopReason"))
+            return reply, thinking
 
     def _record_usage(self, usage: Any) -> None:
         """Stash the sidecar's token counts (pi-catalog Usage) into the turn accumulator.

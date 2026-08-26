@@ -211,9 +211,6 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "never a FAIL to invent around; then fw_power_profile on the returned "
             "trace_path."
         ),
-        # renode/qemu cold start is 10-20 s before the ELF executes, then the
-        # scenario timeline plays out in real time.
-        "timeout_s": 300,
     },
     "fw_sources": {
         "prompt_note": (

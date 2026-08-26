@@ -769,6 +769,7 @@ class MissionDispatch:
                     self.delegation_tree = _DelegationTree(
                         run_id=str(getattr(self, "run_id", "") or ""),
                         ledger=self.ledger,
+                        tier=self.tier,
                         on_event=self.on_event,
                     )
                     self._delegation_tree_autobound = True
@@ -1094,17 +1095,13 @@ class MissionDispatch:
                 except Exception:  # noqa: BLE001
                     _cap = None
             _phase = self.phase or str(node.get("phase") or node.get("stage") or "") or None
-            # Producer roles need room for their whole mandated chain. The role
-            # list + floor live in tool_budget so this path and the DAG path
-            # (services/dag/node_runner.py) cannot drift apart again — that
-            # drift is what starved model3d, and it still starved
-            # cam_programmer / sim_engineer / drawing_detailer, whose cards
-            # mandate 11-16 calls against an absolute ceiling of 12.
+            # Producer roles need room for their whole mandated chain. Use the
+            # shared role/tool/phase-aware helper so this delegate path and the
+            # compiled-DAG path cannot drift on role-specific floors.
             from services.agent import tool_budget as _tb  # noqa: PLC0415
-            _BUILD_MIN_CALLS = _tb.PRODUCER_MIN_CALLS
             _is_build = _tb.is_producer_role(role, allowed, _phase)
-            if _is_build:
-                max_calls = max(max_calls, _BUILD_MIN_CALLS)
+            max_calls = _tb.floor_for(
+                role, allowed, _phase, base=max_calls)
             if _cap is not None:
                 try:
                     from services.agent import scaffolds as _sc  # noqa: PLC0415
@@ -1114,10 +1111,10 @@ class MissionDispatch:
                     )
                     if max_calls is None:
                         max_calls = max(4, min(12, derived))
-                    # Re-assert BUILD floor after phase cap so A/B caps don't
-                    # starve geometry mutators below enablement threshold.
+                    # Re-assert the shared role-specific floor after phase caps.
                     if _is_build:
-                        max_calls = max(int(max_calls or 0), _BUILD_MIN_CALLS)
+                        max_calls = _tb.floor_for(
+                            role, allowed, _phase, base=max_calls)
                 except Exception:  # noqa: BLE001
                     pass
             # Settings override is intentionally last: max_calls is now a SOFT
@@ -1343,6 +1340,17 @@ class MissionDispatch:
                         pass
             except Exception:  # noqa: BLE001 — never block subagent on role_models
                 provider = self.provider
+            # Clamp the FINAL provider, not only cfg_pick. Session-default roles
+            # and every provider-construction fallback reuse the ambient parent
+            # object, whose already-bound effort may exceed the child ceiling.
+            # The helper rebinds a shallow copy, leaving self.provider untouched.
+            try:
+                from services.agent.role_models import (  # noqa: PLC0415
+                    clamp_provider_effort,
+                )
+                provider = clamp_provider_effort(provider)
+            except Exception:  # noqa: BLE001 — helper itself is fail-safe
+                pass
             # Mode → tools: intersect role allowlist with copilot mode policy.
             # apply_mode_tools unions SHARED_DEFAULT_TOOLS (advise, ask_user,
             # doc lifecycle, enable_tools / list_tool_categories, …).
@@ -1367,18 +1375,19 @@ class MissionDispatch:
                         pass
             except Exception:  # noqa: BLE001 — mode gate is best-effort
                 pass
-            # Restricted allowlists (mode or role card): ensure meta-tools so the
-            # model can expand categories. advise folds into SHARED_DEFAULT_TOOLS
-            # for ask/plan/edit; for services/agent/swarm role cards inject when advisor on.
+            # Restricted allowlists (mode or role card): ensure the category
+            # escape hatches are VISIBLE, not merely callable. Shared helper —
+            # node_runner (the compiled-DAG lane) calls the same one, because
+            # this floor existing only here is what confined graph nodes to
+            # their 14 card tools.
             try:
-                if allowed is not None:
-                    for _meta in ("enable_tools", "list_tool_categories"):
-                        if _meta not in allowed:
-                            allowed = list(allowed) + [_meta]
-                    from services.agent.config import advisor_enabled  # noqa: PLC0415
-                    adv_on = bool(getattr(self, "advisor", True))
-                    if adv_on and advisor_enabled() and "advise" not in allowed:
-                        allowed = list(allowed) + ["advise"]
+                from services.agent.copilot_mode_tools import (  # noqa: PLC0415
+                    apply_meta_tool_floor,
+                )
+                _floored = apply_meta_tool_floor(
+                    allowed, advisor=bool(getattr(self, "advisor", True)))
+                if _floored is not None:
+                    allowed = _floored
             except Exception:  # noqa: BLE001
                 pass
             # Render once more after every policy/meta floor has settled. The
@@ -2424,7 +2433,8 @@ def run_linear_role_turn(
                 from services.agent.delegation import (  # noqa: PLC0415
                     DelegationTree as _DelegationTree,
                 )
-                tree = _DelegationTree(run_id=_rid, ledger=ledger, on_event=on_event)
+                tree = _DelegationTree(
+                    run_id=_rid, ledger=ledger, tier=tier, on_event=on_event)
             except Exception:  # noqa: BLE001 — degrade to the old no-delegation turn
                 tree = None
             mission_dispatch = MissionDispatch(
@@ -2505,18 +2515,24 @@ def run_linear_role_turn(
     # Saving, not closing: a close would fan out doc.closed and destroy the GUI mirror
     # tab the user browses after the run, which is the very reason agent-origin docs get
     # the long GC floor. Saved + clean means hostd just closes them, leaving nothing to
-    # recover. Scoped to docs this worker built (never origin_kind=gui), and a no-op
-    # without CHUDWARE_PROJECT_SAVE_DIR. Best-effort — never raises into the turn path.
+    # recover. Scoped to docs this worker built (never origin_kind=gui). With no
+    # project save dir it is a benign skip only when no authored docs are pending;
+    # otherwise save_touched_docs returns persistence_failure and delivery is partial.
     _swept: dict[str, Any] = {"saved": [], "errors": []}
     try:
         from services.mcp.cad_common import save_touched_docs  # noqa: PLC0415
         _swept = save_touched_docs()
-        if (_swept.get("saved") or _swept.get("errors")) and ledger is not None:
+        if (
+            _swept.get("saved")
+            or _swept.get("errors")
+            or _swept.get("persistence_failure")
+        ) and ledger is not None:
             try:
                 ledger.append(role, "terminal_autosave", {
                     "run_id": run_id,
                     "saved": _swept.get("saved") or [],
                     "errors": _swept.get("errors") or [],
+                    "persistence_failure": _swept.get("persistence_failure"),
                 })
             except Exception:  # noqa: BLE001
                 pass
@@ -2570,6 +2586,12 @@ def run_linear_role_turn(
                 },
             }
     persistence_errors = list(_swept.get("errors") or [])
+    persistence_failure = _swept.get("persistence_failure")
+    if isinstance(persistence_failure, dict):
+        failure_reason = str(
+            persistence_failure.get("reason") or "document_persistence_failed")
+        if failure_reason not in persistence_errors:
+            persistence_errors.append(failure_reason)
     if persistence_errors:
         # Saving is part of delivery, not best-effort decoration. Preserve the
         # completed work and handoff, but never tell the user it is safely done.

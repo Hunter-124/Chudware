@@ -198,11 +198,27 @@ def test_skills_block_is_opt_out_for_run_turn():
 
 def test_compose_uses_the_same_main_chat_floor_as_live_turn():
     from services.agent.copilot_mode_tools import MAIN_CHAT_DEFAULT_TOOLS
+    from services.agent.mission_dispatch import (
+        _apply_session_preferences,
+        effective_role_system_prompt,
+        linear_role_allowed_tools,
+    )
+    from services.agent.roles import load_role
 
+    card = load_role("general_agent")
+    live_allowed, _ = _apply_session_preferences(
+        "general_agent",
+        linear_role_allowed_tools(card),
+        effective_role_system_prompt(card),
+    )
     composed = pc.compose(include_tools=False)
+
+    assert set(composed.allowed) == set(live_allowed)
     assert MAIN_CHAT_DEFAULT_TOOLS <= set(composed.allowed)
-    assert "run_shell" in composed.allowed
-    assert "fs_read" in composed.allowed
+    # Security hardening 3aaee658: the contract keeps shell behind explicit
+    # role/category enablement, never on the automatic main-chat floor.
+    assert "run_shell" not in MAIN_CHAT_DEFAULT_TOOLS
+    assert "run_shell" not in composed.allowed
 
 # --------------------------------------------------------------------------- caching
 

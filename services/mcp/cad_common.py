@@ -1541,19 +1541,25 @@ def save_touched_docs() -> dict:
     `origin_kind` is `gui` is the USER's own and is never touched, however unsaved it
     looks — that is exactly the work the recovery prompt exists to protect.
 
-    No-op without `CHUDWARE_PROJECT_SAVE_DIR`: with no project folder there is nowhere
-    a human would find the file, and the recovery tier is then the honest safety net.
+    A missing `CHUDWARE_PROJECT_SAVE_DIR` is benign only when there is no authored
+    agent document waiting to be delivered. If a touched document needs a real user
+    file, `persistence_failure` identifies the affected documents so the turn cannot
+    honestly report durable success.
     """
-    out: dict = {"saved": [], "skipped": [], "errors": []}
-    if not os.environ.get("CHUDWARE_PROJECT_SAVE_DIR"):
-        out["skipped"].append({"reason": "no_project_save_dir"})
-        return out
+    out: dict = {
+        "saved": [],
+        "skipped": [],
+        "errors": [],
+        "persistence_failure": None,
+    }
     try:
         rows = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                 if isinstance(e, dict) and e.get("doc_id")]
     except Exception as exc:  # noqa: BLE001 — a terminal sweep never fails a turn
         out["errors"].append(f"doc_list: {type(exc).__name__}: {exc}")
         return out
+
+    pending: list[dict] = []
     for e in rows:
         did = e["doc_id"]
         origin = e.get("origin_kind")
@@ -1564,6 +1570,23 @@ def save_touched_docs() -> dict:
             out["skipped"].append({"doc_id": did, "name": e.get("name"),
                                    "reason": "already_saved"})
             continue
+        pending.append(e)
+
+    if not os.environ.get("CHUDWARE_PROJECT_SAVE_DIR"):
+        if pending:
+            out["persistence_failure"] = {
+                "reason": "no_project_save_dir",
+                "docs": [
+                    {"doc_id": e["doc_id"], "name": e.get("name")}
+                    for e in pending
+                ],
+            }
+        else:
+            out["skipped"].append({"reason": "no_project_save_dir"})
+        return out
+
+    for e in pending:
+        did = e["doc_id"]
         try:
             written = _project_save(did, e.get("name"))
         except Exception as exc:  # noqa: BLE001

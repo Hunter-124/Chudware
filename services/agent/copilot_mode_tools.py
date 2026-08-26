@@ -197,6 +197,49 @@ def apply_mode_tools(
     return sorted(allowed)
 
 
+# Escape hatches a restricted lane must be able to SEE, not merely call.
+META_TOOL_FLOOR: tuple[str, ...] = ("enable_tools", "list_tool_categories")
+
+
+def apply_meta_tool_floor(allowed: Iterable[str] | None, *,
+                          advisor: bool | None = None) -> Optional[list[str]]:
+    """Union the category escape hatches onto a RESTRICTED tool grant.
+
+    A restricted allowlist without ``enable_tools`` / ``list_tool_categories``
+    is a closed world: role cards cap at ``roles.MAX_TOOLS_PER_ROLE = 14``, so
+    every other tool in the catalog becomes unreachable with no way to ask for
+    it. ``advise`` rides along when the advisor is on, matching the delegate
+    lane.
+
+    ``allowed=None`` (unrestricted) passes straight through — the open-vs-
+    explicit tri-state must survive, or an open lane collapses into an
+    allowlist of three tools.
+
+    THE POINT IS THE CALL ORDER. Every caller must apply this BEFORE rendering
+    the tools slot: ``agent_turn.run_turn`` adds the meta tools to its dispatch
+    gate regardless, so omitting them here does not make them uncallable — it
+    makes them INVISIBLE, which is worse, because the model then has no way to
+    learn the hatch exists. That is exactly how compiled DAG nodes ran for
+    months confined to their 14 card tools while the delegate lane (which did
+    apply this floor, inline) could expand at will.
+    """
+    if allowed is None:
+        return None
+    out = {str(t) for t in allowed if t}
+    out.update(META_TOOL_FLOOR)
+    use_advisor = advisor
+    if use_advisor is None:
+        use_advisor = True
+    if use_advisor:
+        try:
+            from services.agent.config import advisor_enabled  # noqa: PLC0415
+            if advisor_enabled():
+                out.add("advise")
+        except Exception:  # noqa: BLE001 — advisor probe never narrows the floor
+            pass
+    return sorted(out)
+
+
 def is_tool_allowed(
     tool: str,
     mode: str | None,

@@ -434,6 +434,14 @@ def test_part_only_skips_interference():
     assert v.ok and "not assembly" in v.reason
 
 
+def test_interference_message_gives_terminal_handoff_waiver_shape():
+    assert (
+        '{"done":true,"handoff":{"waivers":[{"check":"check_interference",'
+        '"reason":"<non-empty reason>"}]}}'
+    ) in gr.MSG_INTERFERENCE
+    assert "handoff field, not a tool call" in gr.MSG_INTERFERENCE
+
+
 # ===========================================================================
 # WI-14 — no orphan sketch at done
 # ===========================================================================
@@ -476,6 +484,15 @@ def test_orphan_sketch_waived_per_id():
         handoff, ledger=ledger, orphan_ids=["s1"], actor="t",
     )
     assert v.ok and v.outcome == "waived"
+
+
+def test_orphan_message_gives_terminal_handoff_waiver_shape():
+    message = gr.MSG_ORPHAN_SKETCH.format(ids="s1")
+    assert (
+        '{"done":true,"handoff":{"waivers":[{"check":"orphan_sketch:<id>",'
+        '"reason":"<non-empty reason>"}]}}'
+    ) in message
+    assert "handoff field, not a tool call" in message
 
 
 def test_orphan_sketch_blanket_waiver():

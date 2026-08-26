@@ -13,6 +13,7 @@ Two standing rules this module locks in:
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
 from services.agent import role_models as rm
 
@@ -49,6 +50,17 @@ def test_ceiling_constant_is_high_and_role_levels_never_exceed_it():
     assert "max" not in rm.THINKING_LEVELS
     for level in rm.CONCRETE_THINKING:
         assert rm.clamp_subagent_effort(level) == level
+
+
+def test_provider_clamp_rebinds_child_without_mutating_parent():
+    parent = SimpleNamespace(reasoning_effort="max", model="ambient")
+
+    child = rm.clamp_provider_effort(parent)
+
+    assert child is not parent
+    assert child.reasoning_effort == "high"
+    assert parent.reasoning_effort == "max"
+    assert rm.clamp_provider_effort(child) is child
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +109,145 @@ def test_dag_node_never_inherits_global_max_effort(monkeypatch):
     row = context.get("role_model") or {}
     assert row.get("reasoning_effort") == "high", row
 
+
+def test_dag_session_default_clamps_final_ambient_provider(monkeypatch):
+    """Path B's session-default branch reuses ambient state unless clamped last."""
+    from services.dag import node_runner as nr
+
+    ambient = SimpleNamespace(
+        name="ambient", model="frontier", reasoning_effort="max")
+    assignment = rm.RoleModelAssignment(
+        role="task", provider="", model="", mode=rm.SESSION_DEFAULT)
+    monkeypatch.setattr(
+        "services.agent.config.load_config",
+        lambda: {"reasoning_effort": "max"},
+    )
+    monkeypatch.setattr(rm, "resolve_for_node", lambda *a, **k: assignment)
+    monkeypatch.setattr(rm, "resolve_role_thinking", lambda *a, **k: None)
+
+    child = nr._resolve_provider(
+        {
+            "role_id": "sketcher",
+            "task_class": "modification",
+            "depth": 1,
+            "node_inputs": {
+                "role": "sketcher",
+                "task_class": "modification",
+                "depth": 1,
+            },
+        },
+        provider=ambient,
+    )
+
+    assert child is not ambient
+    assert child.reasoning_effort == "high"
+    assert ambient.reasoning_effort == "max"
+
+
+@pytest.mark.parametrize(
+    "role_resolution_fails",
+    [False, True],
+    ids=["session-default", "resolution-exception-fallback"],
+)
+def test_delegate_session_default_clamps_final_ambient_provider(
+    monkeypatch, role_resolution_fails,
+):
+    """Path A must clamp the provider object reused by session-default roles."""
+    from services.agent import agent_turn
+    from services.agent.mission_dispatch import MissionDispatch
+
+    ambient = SimpleNamespace(
+        name="ambient", model="frontier", reasoning_effort="max")
+    assignment = rm.RoleModelAssignment(
+        role="task", provider="", model="", mode=rm.SESSION_DEFAULT)
+    captured = {}
+
+    monkeypatch.setattr(
+        "services.agent.roles.load_role",
+        lambda role: SimpleNamespace(system_prompt="", concrete_tools=[]),
+    )
+    monkeypatch.setattr(
+        "services.agent.config.load_config",
+        lambda: {"reasoning_effort": "max"},
+    )
+    if role_resolution_fails:
+        def resolve_for_node(*_args, **_kwargs):
+            raise RuntimeError("role resolution unavailable")
+    else:
+        def resolve_for_node(*_args, **_kwargs):
+            return assignment
+    monkeypatch.setattr(rm, "resolve_for_node", resolve_for_node)
+    monkeypatch.setattr(rm, "resolve_role_thinking", lambda *a, **k: None)
+
+    def fake_run_turn(request, provider, **kwargs):
+        captured["provider"] = provider
+        return SimpleNamespace(
+            success=True, stop_reason="confirmed", result={})
+
+    monkeypatch.setattr(agent_turn, "run_turn", fake_run_turn)
+    dispatch = MissionDispatch(run_id="", provider=ambient)
+    result = dispatch._run_subagent_turn(
+        {
+            "id": "dg_effort",
+            "role": "feature_modeler",
+            "depth": 1,
+            "budget": {"tokens_granted": 60_000},
+        },
+        "Build the assigned feature.",
+    )
+
+    child = captured["provider"]
+    assert result["ok"] is True
+    assert child is not ambient
+    assert child.reasoning_effort == "high"
+    assert ambient.reasoning_effort == "max"
+
+
+
+def _feature_modeler_budget_requirements():
+    from services.agent.delegation import delegation_budget_requirements
+
+    brief = "Build the ratified feature chain and verify the finished part."
+    req = delegation_budget_requirements(
+        "feature_modeler", brief, tier="local-24k")
+    return brief, req
+
+
+def _feature_modeler_tree(run_id):
+    from services.agent.delegation import DelegationTree
+
+    return DelegationTree(
+        run_id=run_id,
+        orchestrator_budget=2_000_000,
+        tier="local-24k",
+    )
+
+def test_absurd_positive_grant_spawns_with_budget_advisory():
+    from services.agent.delegation import delegate
+
+    brief, req = _feature_modeler_budget_requirements()
+    tree = _feature_modeler_tree("budget-advisory")
+    result = delegate(
+        "feature_modeler", brief, 50, tree=tree)
+
+    assert result["ok"] is True
+    assert result["status"] == "approved"
+    assert len(tree.all_nodes()) == 2
+    assert result["available_tokens"] == 50
+    assert result["recommended_tokens"] == req["recommended_tokens"]
+    assert result["mandated_calls"] == 18
+    assert "proceeding" in result["remedy"].lower()
+
+    warnings = [
+        event for event in tree._pending_events
+        if event.get("kind") == "delegation_budget_warning"
+    ]
+    assert len(warnings) == 1
+    payload = warnings[0]["payload"]
+    assert payload["available_tokens"] == 50
+    assert payload["recommended_tokens"] == req["recommended_tokens"]
+    assert payload["mandated_calls"] == 18
+    assert "proceeding" in payload["message"].lower()
 
 # ---------------------------------------------------------------------------
 # 3. Stronger-model-at-low-effort beats weaker-model-at-high-effort

@@ -29,8 +29,8 @@ from typing import Any
 # ecad.py, so each tool still has exactly one owner.
 _FAMILIES = (
     "advisor", "cad", "cam", "ecad", "em", "files", "firmware", "gsl",
-    "intake", "ledger", "mission", "office", "org", "parts", "plm", "recon",
-    "research", "reveng", "shell", "sim", "tasklist", "workspace",
+    "intake", "ledger", "manufacturing", "mission", "office", "org", "parts",
+    "plm", "recon", "research", "reveng", "shell", "sim", "tasklist", "workspace",
 )
 
 # Agent pseudo-tools with no live registry callable outside a mission

@@ -187,9 +187,11 @@ def render_tools_block(
 
     Returns:
         ``(text, meta)`` where meta = {tokens, budget_tokens, rendered, omitted,
-        unresolved, trimmed, expanded, categories} — tokens is the MEASURED count
-        of the returned text, and ``expanded`` names the tools that got their full
-        docstring.
+        unresolved, disabled, trimmed, expanded, categories} — tokens is the
+        MEASURED count of the returned text, ``expanded`` names the tools that
+        got their full docstring, and ``disabled`` names the tools dropped
+        because Settings → AI → Tools has them switched off (never advertise a
+        tool whose every call dispatch would refuse).
     """
     tier_budget, tier_trim = tier_tools_slot(tier)
     budget = int(budget_tokens) if budget_tokens else tier_budget
@@ -198,6 +200,7 @@ def render_tools_block(
     rendered: list[str] = []
     unresolved: list[str] = []
     omitted: list[str] = []
+    disabled: list[str] = []
     used = _count_tokens(lines[0])
 
     allow_list = list(allowed_tools or [])
@@ -228,9 +231,19 @@ def render_tools_block(
             use_trim = trim
             note = ""
             defaults: dict[str, Any] = {}
+            call_cap: int | None = None
             try:
-                from services.agent.config import get_tool_options  # noqa: PLC0415
+                from services.agent.config import (  # noqa: PLC0415
+                    effective_tool_call_cap,
+                    get_tool_options,
+                )
                 opts = get_tool_options(None, tool) or {}
+                if opts.get("enabled") is False:
+                    # A tool switched OFF in Settings → AI → Tools can only be
+                    # refused at dispatch, so advertising it spends a completion
+                    # on a call that cannot run. Drop it from the slot entirely.
+                    disabled.append(tool)
+                    continue
                 override = (opts.get("description_override") or "").strip()
                 if override:
                     schema = dict(schema)
@@ -240,6 +253,7 @@ def render_tools_block(
                     use_trim = bool(st)
                 note = (opts.get("prompt_note") or "").strip()
                 defaults = dict(opts.get("param_defaults") or {})
+                call_cap = effective_tool_call_cap(tool, opts=opts)
             except Exception:  # noqa: BLE001
                 pass
             desc = _description_line(schema["description"], trim=use_trim)
@@ -252,8 +266,17 @@ def render_tools_block(
                 default_note = (
                     f"\n    Effective defaults when omitted: {rendered_defaults}."
                 )
+            # An UNDISCLOSED cap is a guardrail the model cannot plan around: it
+            # budgets for the work it intends, then a mid-chain call is refused
+            # with no warning (live 2026-08-26: research_web_search, cap 3).
+            # Same resolver the dispatcher enforces with, so this number is true.
+            cap_note = (
+                f"\n    Per-turn limit: at most {call_cap} call(s) to this tool "
+                f"per turn — plan the calls you need."
+                if call_cap else ""
+            )
             prompt_note = f"\n    Note: {note}" if note else ""
-            tail = default_note + prompt_note
+            tail = default_note + cap_note + prompt_note
             entry = head + (f"\n    {desc}" if desc else "") + tail
             body = (schema["description"] or "").strip()
             block = _description_block(body) if body else ""
@@ -331,6 +354,7 @@ def render_tools_block(
         "rendered": rendered,
         "omitted": omitted,
         "unresolved": unresolved,
+        "disabled": disabled,
         "trimmed": bool(trim),
         "expanded": expanded,
         "categories": categories_listed,

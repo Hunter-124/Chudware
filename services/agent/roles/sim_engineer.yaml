@@ -21,7 +21,6 @@ tool_allowlist:
   - tool: sim_results
   - tool: sim_cancel
   - tool: enable_tools
-  - tool: list_tool_categories
 context_recipe:
   ledger_tokens: 800
   describers: [{tool: describe_part, budget: 1000}]

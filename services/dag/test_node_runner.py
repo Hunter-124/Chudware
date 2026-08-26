@@ -12,6 +12,7 @@ Or with real engine available:
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -208,6 +209,17 @@ class TestNodeRunnerVerdicts:
         assert verdict == nr.VERDICT_ESCALATE
         assert out["retry_remaining"] == 0
 
+    def test_retryable_context_overflow_retries_within_budget(self):
+        result = _fake_run("context_overflow", False)
+        result.result = {"retryable": True}
+        assert nr._map_verdict(result.stop_reason, result.success) == nr.VERDICT_RETRY
+
+        node = _minimal_node()
+        pack = cp.assemble(node, {"retry_remaining": 2})
+        verdict, out = nr.run(node, pack, agent_fn=lambda req, ctx: result)
+        assert verdict == nr.VERDICT_RETRY
+        assert out["retry_remaining"] == 1
+
     def test_failed_is_escalate(self):
         node = _minimal_node()
         pack = cp.assemble(node, {"retry_remaining": 3})
@@ -264,6 +276,37 @@ class TestNodeRunnerVerdicts:
 
         etypes = [e[0] for e in events]
         assert "dag.node.failed" in etypes
+
+    def test_non_retry_escalation_event_keeps_real_cause(self):
+        events = []
+        node = _minimal_node()
+        pack = cp.assemble(node, {"retry_remaining": 3})
+        nr.run(
+            node,
+            pack,
+            emit=lambda kind, payload: events.append((kind, payload)),
+            agent_fn=_agent_always("no_code", False),
+        )
+
+        failure = next(p for kind, p in events if kind == "dag.node.failed")
+        assert failure["error"] == "escalated: no_code"
+        assert "budget exhausted" not in failure["error"]
+
+    def test_retry_exhaustion_event_says_retry_budget_exhausted(self):
+        events = []
+        node = _minimal_node()
+        pack = cp.assemble(node, {"retry_remaining": 1})
+        nr.run(
+            node,
+            pack,
+            emit=lambda kind, payload: events.append((kind, payload)),
+            agent_fn=_agent_always("max_iters", False),
+        )
+
+        failure = next(p for kind, p in events if kind == "dag.node.failed")
+        assert failure["error"] == (
+            "escalated: max_iters (retry budget exhausted)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -687,10 +730,11 @@ class TestDefaultAgentFnSeams:
         nr._default_agent_fn("go", {"node_name": "n1"})
         assert seen.get("max_tokens") == load_tier("local-24k").generation_headroom
 
-    def test_default_agent_fn_no_tier_uses_default_cap(self, monkeypatch):
-        """No CHUDWARE_TIER → max_tokens None → agent_turn's shipped 2048 default."""
+    def test_default_agent_fn_no_tier_uses_shared_child_headroom(self, monkeypatch):
+        """Untiered DAG children get the delegate lane's completion headroom."""
         from services.agent import config as agent_config
         from services.agent import agent_turn as at
+        from services.agent.mission_dispatch import LINEAR_ROLE_MAX_OUTPUT_TOKENS
 
         monkeypatch.setattr(agent_config, "get_provider",
                             lambda name=None, cfg=None: _TurnScriptedProvider())
@@ -705,7 +749,7 @@ class TestDefaultAgentFnSeams:
 
         monkeypatch.setattr(at, "run_turn", _spy)
         nr._default_agent_fn("go", {"node_name": "n1"})
-        assert seen.get("max_tokens") is None
+        assert seen["max_tokens"] == LINEAR_ROLE_MAX_OUTPUT_TOKENS
 
     def test_node_context_tier_beats_environment_for_all_turn_policy(
         self, monkeypatch,
@@ -952,6 +996,38 @@ def test_role_policy_is_scoped_to_the_turn():
     assert reg.is_allowed("export_part"), "role tool policy leaked past the node turn"
 
 
+def test_role_policy_restore_failure_is_logged_and_surfaced(monkeypatch, caplog):
+    """A contaminated process cannot hide a failed global-policy restoration."""
+    import logging
+
+    def _broken_restore():
+        raise RuntimeError("registry restore exploded")
+
+    monkeypatch.setattr(nr, "_snapshot_tool_policy", lambda: _broken_restore)
+    monkeypatch.setattr(nr, "_apply_role_tool_policy", lambda role_card: None)
+    events = []
+    node = {
+        "id": "n1",
+        "type": "design",
+        "name": "BUILD DL1",
+        "inputs": {"role": "feature_modeler"},
+    }
+    with caplog.at_level(logging.ERROR, logger=nr.__name__):
+        verdict, out = nr.run(
+            node,
+            cp.assemble(node, {}),
+            emit=lambda kind, payload: events.append((kind, payload)),
+            agent_fn=lambda req, pack: _fake_run("confirmed", True),
+        )
+
+    assert verdict == nr.VERDICT_ESCALATE
+    assert out["data"]["stop_reason"] == "tool_policy_restore_failed"
+    assert "registry restore exploded" in out["data"]["error"]
+    assert "Failed to restore process-global tool policy" in caplog.text
+    failure = next(p for kind, p in events if kind == "dag.node.failed")
+    assert "registry restore exploded" in failure["error"]
+
+
 # ---------------------------------------------------------------------------
 # T-W32 — tool-schema injection + run-scoped dispatcher wiring
 # ---------------------------------------------------------------------------
@@ -1063,3 +1139,92 @@ class TestToolSchemaAndMissionDispatchWiring:
         monkeypatch.setattr(at, "run_turn", _spy)
         nr._default_agent_fn("go", {"node_name": "n1"})
         assert seen.get("tools_text") is None
+
+
+class TestCompiledDagPolicy:
+    @pytest.mark.parametrize(
+        ("role", "mandated_calls"),
+        [
+            # ECAD base chain is 32; antenna design/analyse/provision note add 3.
+            ("ecad_engineer", 1 + 1 + 7 + 7 + 6 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 3),
+            # Four sketch-backed nodes have five mandatory calls apiece.
+            ("model3d", 5 * 4 + 1 + 1 + 1 + 1),
+            ("feature_modeler", 18),
+            # Nine researched ledger/spec entries require compute + note.
+            ("spec_writer", 9 * 2),
+        ],
+    )
+    def test_role_soft_floor_covers_card_mandated_chain(
+        self, role, mandated_calls,
+    ):
+        from services.agent import tool_budget
+        from services.agent.roles import load_role
+
+        card = load_role(role)
+        actual = tool_budget.floor_for(
+            role,
+            card.concrete_tools,
+            phase=None,
+            base=1,
+        )
+        assert actual >= mandated_calls
+
+    def test_session_default_child_provider_is_clamped_without_parent_mutation(
+        self, monkeypatch,
+    ):
+        from services.agent import config as agent_config
+        from services.agent import role_models
+
+        assignment = SimpleNamespace(
+            mode="session_default",
+            provider="",
+            model="",
+            rank=5,
+            reason="follow composer",
+            is_session_default=True,
+            to_dict=lambda: {
+                "mode": "session_default",
+                "provider": "",
+                "model": "",
+                "rank": 5,
+                "reason": "follow composer",
+            },
+        )
+        monkeypatch.setattr(agent_config, "load_config",
+                            lambda: {"reasoning_effort": "max"})
+        monkeypatch.setattr(role_models, "resolve_for_node",
+                            lambda *args, **kwargs: assignment)
+        monkeypatch.setattr(role_models, "resolve_role_thinking",
+                            lambda *args, **kwargs: "max")
+
+        parent = SimpleNamespace(reasoning_effort="max", name="injected")
+        child = nr._resolve_provider(
+            {"role_id": "reviewer", "node_inputs": {}},
+            provider=parent,
+        )
+
+        assert child is not parent
+        assert child.reasoning_effort == "high"
+        assert parent.reasoning_effort == "max"
+
+    def test_provider_exception_fallback_is_also_child_clamped(
+        self, monkeypatch,
+    ):
+        from services.agent import role_models
+
+        monkeypatch.setattr(
+            role_models,
+            "resolve_for_node",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("assignment unavailable")
+            ),
+        )
+        parent = SimpleNamespace(reasoning_effort="max", name="injected")
+        child = nr._resolve_provider(
+            {"role_id": "reviewer", "node_inputs": {}},
+            provider=parent,
+        )
+
+        assert child is not parent
+        assert child.reasoning_effort == "high"
+        assert parent.reasoning_effort == "max"

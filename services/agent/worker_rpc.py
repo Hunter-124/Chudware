@@ -1545,35 +1545,57 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     # but WRONG as a jail root: with a document open under
     # <project>/CAD & Design Geometry/, a live run was refused a run_shell in the
     # sibling <project>/CDR/ folder ("outside_workspace_root"). So the two concepts are
-    # now resolved separately:
+    # resolved separately:
     #   * CHUDWARE_FS_ROOT / CHUDWARE_PROJECT_DIR — the PROJECT root (outermost folder
     #     carrying .plm/.aicadvault/.chudware), so the agent can work across the whole
     #     project the user opened, and project_context lists all of it, not one subtree.
     #   * CHUDWARE_PROJECT_SAVE_DIR — the folder the host actually asked us to save in,
     #     left exactly as passed so deliverables still land beside the open document.
-    # chdir targets the project root so shell/fs defaults start there. The worker is a
-    # fresh fork per turn (run.cpp call_admin_worker_turn), so no restore is needed —
-    # but every step is guarded so a bad path only no-ops and NEVER fails the turn.
-    # Absent/invalid param == behaviour exactly as before.
+    # chdir targets the project root. The worker is a fresh fork per turn
+    # (run.cpp call_admin_worker_turn), so no restore is needed. An ABSENT workspace
+    # retains the actor-free/no-project path; an explicitly supplied workspace must
+    # resolve completely before provider construction, because silently continuing
+    # without a save root turns a successful model mutation into memory-only work.
     project_root = ""
-    try:
-        raw_ws = (params or {}).get("workspace_dir")
-        if isinstance(raw_ws, str) and raw_ws.strip():
+    raw_params = params or {}
+    if "workspace_dir" in raw_params:
+        raw_ws = raw_params.get("workspace_dir")
+        if not isinstance(raw_ws, str) or not raw_ws.strip():
+            return {
+                "ok": False,
+                "reason": "invalid_workspace: workspace_dir must be a non-empty directory",
+            }
+        try:
             import os as _os  # noqa: PLC0415
             from pathlib import Path as _Path  # noqa: PLC0415
             cand = _Path(_os.path.abspath(_os.path.expanduser(raw_ws.strip())))
-            if cand.is_dir():
-                save_dir = str(cand)
-                from services.agent.project_context import (  # noqa: PLC0415
-                    resolve_project_root,
-                )
-                project_root = str(resolve_project_root(cand))
-                _os.environ["CHUDWARE_FS_ROOT"] = project_root
-                _os.environ["CHUDWARE_PROJECT_DIR"] = project_root
-                _os.environ["CHUDWARE_PROJECT_SAVE_DIR"] = save_dir
-                _os.chdir(project_root)
-    except Exception:  # noqa: BLE001 — a bad workspace path must never break a turn
-        project_root = ""
+            if not cand.is_dir():
+                return {
+                    "ok": False,
+                    "reason": f"invalid_workspace: not an existing directory: {cand}",
+                }
+            from services.agent.project_context import (  # noqa: PLC0415
+                resolve_project_root,
+            )
+            resolved_root = _Path(resolve_project_root(cand))
+            if not resolved_root.is_dir():
+                return {
+                    "ok": False,
+                    "reason": (
+                        "invalid_workspace: resolved project root is not a directory: "
+                        f"{resolved_root}"
+                    ),
+                }
+            _os.chdir(resolved_root)
+            project_root = str(resolved_root)
+            _os.environ["CHUDWARE_FS_ROOT"] = project_root
+            _os.environ["CHUDWARE_PROJECT_DIR"] = project_root
+            _os.environ["CHUDWARE_PROJECT_SAVE_DIR"] = str(cand)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "reason": f"invalid_workspace: {type(exc).__name__}: {exc}",
+            }
 
     # Sub-agent raw transcripts belong to the conversation that spawned them, so
     # they fork and prune with it instead of piling up in a global cache. The GUI
@@ -1765,6 +1787,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
 
     usage_sink_token = _token_usage.bind_usage_sink(_usage_event)
     linear_finalized = False
+    response: dict
 
     try:
         turn = run_linear_role_turn(
@@ -1783,19 +1806,66 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             chudware_actor=credit_actor,
         )
         linear_finalized = True
-        return {"ok": True, "turn": turn}
+        response = {"ok": True, "turn": turn}
     except Exception as exc:  # noqa: BLE001 — never raise across the worker seam
-        return {"ok": False, "reason": f"agent_admin_turn failed: {type(exc).__name__}: {exc}"}
+        response = {
+            "ok": False,
+            "reason": f"agent_admin_turn failed: {type(exc).__name__}: {exc}",
+        }
     finally:
-        _token_usage.reset_usage_sink(usage_sink_token)
+        finalization_errors: list[str] = []
+        try:
+            _token_usage.reset_usage_sink(usage_sink_token)
+        except Exception as exc:  # noqa: BLE001 — persistence must still run
+            finalization_errors.append(
+                f"usage_sink_reset: {type(exc).__name__}: {exc}"
+            )
+
         # run_linear_role_turn owns the normal terminal save. Only an exception
-        # that escaped before that finalizer needs the crash-path sweep here.
+        # that escaped before that finalizer needs the crash-path sweep here. The
+        # reset and sweep are independently guarded: a usage-context fault must
+        # never prevent already-built geometry from reaching durable storage.
         if not linear_finalized:
             try:
                 from services.mcp.cad_common import save_touched_docs  # noqa: PLC0415
-                save_touched_docs()
-            except Exception:  # noqa: BLE001
-                pass
+                persistence = save_touched_docs()
+                if not isinstance(persistence, dict):
+                    persistence = {
+                        "saved": [],
+                        "errors": ["save_touched_docs returned a non-dict status"],
+                        "persistence_failure": None,
+                    }
+            except Exception as exc:  # noqa: BLE001
+                persistence = {
+                    "saved": [],
+                    "errors": [f"{type(exc).__name__}: {exc}"],
+                    "persistence_failure": None,
+                }
+            response["persistence"] = persistence
+            finalization_errors.extend(
+                f"persistence: {item}" for item in (persistence.get("errors") or [])
+            )
+            persistence_failure = persistence.get("persistence_failure")
+            if persistence_failure:
+                if isinstance(persistence_failure, dict):
+                    failure_reason = str(
+                        persistence_failure.get("reason") or "unknown persistence failure"
+                    )
+                else:
+                    failure_reason = str(persistence_failure)
+                finalization_errors.append(f"persistence: {failure_reason}")
+
+        if finalization_errors:
+            response["finalization_errors"] = finalization_errors
+            joined = "; ".join(finalization_errors)
+            if response.get("ok"):
+                response["ok"] = False
+                response["reason"] = f"agent_admin_turn finalization failed: {joined}"
+            else:
+                prior_reason = response.get("reason", "agent_admin_turn failed")
+                response["reason"] = f"{prior_reason}; {joined}"
+
+    return response
 
 
 ADMIN_METHODS: dict[str, Callable] = {

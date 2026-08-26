@@ -59,20 +59,43 @@ def test_the_sketch_cheatsheet_has_runnable_examples():
         f"{len(SKETCH_EXAMPLES)} — the extractor or the doc format changed")
 
 
-@pytest.mark.parametrize("line,ops", SKETCH_EXAMPLES,
-                         ids=[f"sketch.md:L{n}" for n, _ in SKETCH_EXAMPLES])
-def test_sketch_cheatsheet_example_builds_a_solid(line, ops):
+@pytest.fixture
+def sketch_tools():
+    """Bind the live tools and discard every scratch document after its example."""
     new_part = at._bind_tool("new_part")
     add_features = at._bind_tool("add_features")
-    if new_part is None or add_features is None:
+    close_part = at._bind_tool("close_part")
+    if new_part is None or add_features is None or close_part is None:
         pytest.skip("engine unavailable")
+
+    doc_ids: list[str] = []
+
+    def new_scratch(name: str) -> str | None:
+        doc_id = json.loads(new_part(name=name, fresh=True)).get("doc_id")
+        if doc_id:
+            doc_ids.append(doc_id)
+        return doc_id
+
+    yield new_scratch, add_features
+
+    for doc_id in reversed(doc_ids):
+        result = json.loads(close_part(doc_id=doc_id, discard=True))
+        assert result.get("ok"), (
+            f"failed to discard cheatsheet scratch document {doc_id}: "
+            f"{result.get('error')}")
+
+
+@pytest.mark.parametrize("line,ops", SKETCH_EXAMPLES,
+                         ids=[f"sketch.md:L{n}" for n, _ in SKETCH_EXAMPLES])
+def test_sketch_cheatsheet_example_builds_a_solid(line, ops, sketch_tools):
+    new_scratch, add_features = sketch_tools
 
     # fresh=True is REQUIRED, not tidiness: new_part(name=...) resumes an
     # already-open part of that name by design, so on the second run against a
     # live daemon this example would build its cylinder inside the cylinder the
     # previous run left behind and die on "boss added no material" — a green
     # first run and a red every run after, blaming the doc for a test bug.
-    doc_id = json.loads(new_part(name=f"cheatsheet_L{line}", fresh=True)).get("doc_id")
+    doc_id = new_scratch(f"cheatsheet_L{line}")
     assert doc_id, "new_part did not return a doc_id"
 
     result = json.loads(add_features(doc_id=doc_id, ops=ops))

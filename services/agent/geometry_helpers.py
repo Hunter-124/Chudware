@@ -89,6 +89,61 @@ def _KNOWN_PROFILE_IDS() -> set[str]:
         pass
     return {"fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection"}
 
+# Offline mirror of the load-bearing DfM profile fields.  These are copied verbatim
+# from ``core/dfm/process_profiles.cpp::profiles`` so the agent-side helper remains
+# usable on an unprovisioned gate machine where ``libchudware`` is intentionally
+# absent.  The C++ RPC remains authoritative whenever it is available.
+_OFFLINE_PROFILE_PARAMS: dict[str, dict[str, Any]] = {
+    "fdm": {
+        "min_wall_mm": 1.0, "min_feature_mm": 0.8, "hole_comp_mm": 0.20,
+        "tolerance_band_mm": 0.40,
+        "fit_classes_mm": {"slip": 0.40, "location": 0.20, "press": 0.10, "free": 0.50},
+        "draft": {"required": False, "min_deg": 0.0},
+        "overhang": {"max_deg": 45, "max_bridge_mm": 5},
+        "thread": {"strategy": "heat_set_insert", "printed_ok_min": "M5"},
+    },
+    "cnc_mill": {
+        "min_wall_mm": 0.5, "min_feature_mm": 0.5, "hole_comp_mm": 0.0,
+        "tolerance_band_mm": 0.05,
+        "fit_classes_mm": {"slip": 0.05, "location": 0.02, "press": -0.02, "free": 0.10},
+        "draft": {"required": False, "min_deg": 0.0},
+        "overhang": {"max_deg": None, "max_bridge_mm": None},
+        "thread": {"strategy": "tapped", "printed_ok_min": None},
+    },
+    "lathe": {
+        "min_wall_mm": 0.5, "min_feature_mm": 0.5, "hole_comp_mm": 0.0,
+        "tolerance_band_mm": 0.05,
+        "fit_classes_mm": {"slip": 0.05, "location": 0.02, "press": -0.02, "free": 0.10},
+        "draft": {"required": False, "min_deg": 0.0},
+        "overhang": {"max_deg": None, "max_bridge_mm": None},
+        "thread": {"strategy": "single_point_or_tapped", "printed_ok_min": None},
+    },
+    "sheet_metal": {
+        "min_wall_mm": 1.0, "min_feature_mm": 1.0, "hole_comp_mm": 0.0,
+        "tolerance_band_mm": 0.10,
+        "fit_classes_mm": {"slip": None, "location": None, "press": None, "free": None},
+        "draft": {"required": False, "min_deg": 0.0},
+        "overhang": {"max_deg": None, "max_bridge_mm": None},
+        "thread": {"strategy": "clinch_or_weld_nut", "printed_ok_min": None},
+    },
+    "laser": {
+        "min_wall_mm": 1.0, "min_feature_mm": 0.5, "hole_comp_mm": 0.0,
+        "tolerance_band_mm": 0.10,
+        "fit_classes_mm": {"slip": None, "location": None, "press": None, "free": None},
+        "draft": {"required": False, "min_deg": 0.0},
+        "overhang": {"max_deg": None, "max_bridge_mm": None},
+        "thread": {"strategy": "none", "printed_ok_min": None},
+    },
+    "injection": {
+        "min_wall_mm": 1.0, "min_feature_mm": 0.5, "hole_comp_mm": 0.0,
+        "tolerance_band_mm": 0.10,
+        "fit_classes_mm": {"slip": 0.10, "location": 0.05, "press": 0.02, "free": 0.20},
+        "draft": {"required": True, "min_deg": 1.0},
+        "overhang": {"max_deg": None, "max_bridge_mm": None},
+        "thread": {"strategy": "molded", "printed_ok_min": None},
+    },
+}
+
 
 # --------------------------------------------------------------------------- registry entries
 
@@ -211,9 +266,13 @@ class HelperResult:
 
 
 def _profile(process: str) -> dict[str, Any]:
-    """The DfM process profile, from the C++ core (core/dfm, ``dfm_get_profile``)."""
-    from services.mcp import core_bridge as cb  # noqa: PLC0415
-    r = cb.call("dfm_get_profile", {"process": canonical_process(process)})
+    """Return the C++ DfM profile, with its exact table as an offline fallback."""
+    proc = canonical_process(process)
+    try:
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
+        r = cb.call("dfm_get_profile", {"process": proc})
+    except Exception:  # noqa: BLE001 - missing runtime core is a supported configuration
+        return {"process": proc, "params": _OFFLINE_PROFILE_PARAMS[proc]}
     if not r.get("ok"):
         raise ValueError(r.get("error") or "dfm_get_profile failed")
     return r.get("result") or {}
@@ -396,6 +455,56 @@ def resolve_draft(*, draw_depth_mm: Optional[float] = None, finish: str = "smoot
                         numbers, prov)
 
 
+def _bundled_material_lookup(material: str) -> Optional[dict[str, Any]]:
+    """Resolve an exact material alias from the registry when the C++ core is absent."""
+    import json  # noqa: PLC0415
+    import os  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    explicit = os.environ.get("CHUDWARE_MATERIALS_REGISTRY")
+    if explicit:
+        candidates = [Path(explicit)]
+    else:
+        candidates: list[Path] = []
+        if os.name == "nt":
+            if appdata := os.environ.get("APPDATA"):
+                candidates.append(Path(appdata) / "Chudware" / "materials" / "registry.json")
+        elif xdg := os.environ.get("XDG_DATA_HOME"):
+            candidates.append(Path(xdg) / "Chudware" / "materials" / "registry.json")
+        elif home := os.environ.get("HOME"):
+            candidates.append(Path(home) / ".local" / "share" / "Chudware"
+                              / "materials" / "registry.json")
+        candidates.append(Path(__file__).resolve().parents[2]
+                          / "core" / "data" / "materials" / "registry.json")
+
+    for path in candidates:
+        try:
+            materials = json.loads(path.read_text(encoding="utf-8")).get("materials", {})
+        except (OSError, ValueError, TypeError):
+            continue
+        query = material.strip().lower()
+        match: Optional[tuple[str, dict[str, Any]]] = None
+        for key, record in materials.items():
+            names = [key, record.get("name", ""), *(record.get("aliases") or [])]
+            if query in {str(name).strip().lower() for name in names}:
+                match = (key, record)
+        if match is None:
+            return None
+        key, record = match
+        properties = record.get("mechanical")
+        if not isinstance(properties, dict) or not properties:
+            return None
+        provenance = record.get("provenance") or {}
+        return {
+            "key": key,
+            "name": record.get("name") or key,
+            "properties": properties,
+            "citation": provenance.get("source"),
+            "registry_path": str(path),
+        }
+    return None
+
+
 def resolve_material(*, material: str = "", **_: Any) -> HelperResult:
     numbers: dict[str, Any] = {}
     prov = ""
@@ -403,17 +512,27 @@ def resolve_material(*, material: str = "", **_: Any) -> HelperResult:
         try:
             from services.research.material_lookup import material_lookup  # type: ignore
             ml = material_lookup(material)
-            if isinstance(ml, dict) and ml.get("ok"):
-                props = ml.get("properties") or {}
-                if props:
-                    numbers = dict(props)
+        except Exception:  # noqa: BLE001 - use the same bundled registry without the core
+            ml = None
+        if isinstance(ml, dict) and ml.get("ok"):
+            props = ml.get("properties") or {}
+            if props:
+                numbers = dict(props)
+                citation = ml.get("citation") or (ml.get("provenance") or {}).get("source")
                 prov = (f"research_material_lookup({material}) → {ml.get('answer')} "
-                        f"[materials.json]")
-        except Exception:  # noqa: BLE001
-            pass
+                        f"({citation or 'bundled registry provenance'})")
+        elif ml is None:
+            fallback = _bundled_material_lookup(material)
+            if fallback is not None:
+                numbers = dict(fallback["properties"])
+                prov = (
+                    f"research_material_lookup fallback via _bundled_material_lookup({material}) "
+                    f"→ {fallback['name']} ({fallback['citation']}) "
+                    f"[{fallback['registry_path']}]"
+                )
     if not prov:
         prov = ("research_material_lookup: call with the material name for "
-                "E / yield / density [materials.json]")
+                "E / yield / density [core/data/materials/registry.json]")
     return HelperResult("material_dims", "material_mention",
                         ["research_material_lookup"], numbers, prov, ok=bool(numbers))
 

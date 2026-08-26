@@ -373,8 +373,17 @@ def test_done_guardrail_exception_fails_closed(monkeypatch):
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("broken guard")),
     )
     block = at._done_guardrail_block({}, None, "test", [])
-    assert "HARD guardrail failed" in block
-    assert "broken guard" in block
+    # Still fails CLOSED — the handoff is blocked, never waved through. What
+    # changed is the ATTRIBUTION: the message now says the fault is OURS and
+    # tells the model to re-send the same handoff instead of re-deriving it
+    # (it cannot repair our exception), and the stop reason routes to
+    # guardrail_internal_error rather than blaming the model with
+    # guardrail_blocked and burning a completion per retry.
+    assert block
+    assert block.startswith(at.GUARD_INTERNAL_PREFIX)
+    assert "RuntimeError" in block
+    assert "NOT rejected for its content" in block
+    assert at._guard_stop_reason(block) == "guardrail_internal_error"
 
 
 def test_sketch_role_handoff_skips_only_orphan_product_guard(monkeypatch):
@@ -515,3 +524,152 @@ def test_nested_delegate_attaches_to_the_calling_node_not_the_root():
         assert seen["parent_id"] == "dg_explicit"
     finally:
         dlg.delegate = real
+
+
+# ---------------------------------------------------------------------------
+# Tool-outcome taxonomy: a harness REFUSAL is not a tool failure
+# ---------------------------------------------------------------------------
+#
+# Live 2026-08-26: a research turn hit `research_web_search`'s per-turn cap of 3
+# and the GUI drew a red "failed" card reading "tool 'research_web_search'
+# exceeded max_calls_per_turn=3 (agent.tool_options)" — a config key where a
+# next action belonged, visually identical to a crashed tool. Everything below
+# guards the structural half of that: refusals classify distinctly, cost no
+# execution budget, file no bug report, and delete no queued work.
+
+
+def test_every_outcome_kind_is_in_the_declared_taxonomy():
+    """The GUI switches on these strings; a stray value renders as unknown."""
+    cases = [
+        ({"ok": True}, True, False, at.OUTCOME_OK),
+        ({"ok": False, "policy_refusal": True}, False, False,
+         at.OUTCOME_POLICY_REFUSAL),
+        ({"ok": False, "error": "blocked"}, False, True, at.OUTCOME_GUARD_BLOCK),
+        ({"ok": False, "status": "bad_arguments"}, False, False,
+         at.OUTCOME_VALIDATION_ERROR),
+        ({"ok": False, "timed_out": True}, False, False,
+         at.OUTCOME_TIMEOUT_UNKNOWN),
+        ({"ok": False, "internal_error": True}, False, False,
+         at.OUTCOME_INTERNAL_ERROR),
+        ({"ok": False, "error": "kernel said no"}, False, False,
+         at.OUTCOME_TOOL_ERROR),
+    ]
+    for result, ok, guard_block, expected in cases:
+        kind, _executed = at._classify_tool_outcome(
+            result, ok=ok, guard_block=guard_block)
+        assert kind == expected, (result, kind)
+        assert kind in at.TOOL_OUTCOME_KINDS
+
+
+def test_only_refusals_and_validation_errors_report_not_executed():
+    """``executed`` drives the batch halt, so it must mean exactly one thing:
+    did the tool BODY run, and could state therefore have changed?"""
+    never_ran = [
+        ({"ok": False, "policy_refusal": True}, False),
+        ({"ok": False, "status": "unknown_tool"}, False),
+    ]
+    for result, guard_block in never_ran:
+        _kind, executed = at._classify_tool_outcome(
+            result, ok=False, guard_block=guard_block)
+        assert executed is False, result
+    # A guard block never ran either.
+    _kind, executed = at._classify_tool_outcome(
+        {"ok": False, "error": "x"}, ok=False, guard_block=True)
+    assert executed is False
+    # A TIMEOUT did run and is STILL running — never claim it did nothing.
+    kind, executed = at._classify_tool_outcome(
+        {"ok": False, "timed_out": True}, ok=False)
+    assert kind == at.OUTCOME_TIMEOUT_UNKNOWN
+    assert executed is True
+    # A tool that ran and failed did run.
+    _kind, executed = at._classify_tool_outcome(
+        {"ok": False, "error": "kernel said no"}, ok=False)
+    assert executed is True
+
+
+def test_tool_call_event_carries_the_structured_outcome():
+    """The GUI must never parse error prose to tell a refusal from a crash."""
+    from services.agent import agent_events as ae
+
+    _kind, payload = ae.tool_call_event(
+        "n1", "research_web_search", {"query": "q"},
+        {"ok": False, "status": "call_cap_reached", "policy_refusal": True},
+        ok=False, latency_ms=1.0,
+        outcome_kind=at.OUTCOME_POLICY_REFUSAL, executed=False)
+    assert payload["outcome_kind"] == at.OUTCOME_POLICY_REFUSAL
+    assert payload["executed"] is False
+    # Omitted when unclassified, so an older consumer keeps ok-only behaviour.
+    _kind, legacy = ae.tool_call_event(
+        "n1", "fs_read", {"path": "x"}, {"ok": True},
+        ok=True, latency_ms=1.0)
+    assert "outcome_kind" not in legacy
+    assert "executed" not in legacy
+
+
+def test_a_guard_refusal_does_not_spend_the_execution_budget():
+    """A guard that fires N times used to burn N of the model's calls and then
+    the turn died at the ceiling having built nothing."""
+    from services.agent import scaffolds as sc
+
+    calls: list[str] = []
+
+    def _always_block(tool, args, **_kw):
+        return "HARD guardrail: nope."
+
+    real = sc.pre_dispatch_scaffolds
+    sc.pre_dispatch_scaffolds = _always_block
+    try:
+        from services.agent.test_directive_batching import (  # noqa: PLC0415
+            _DONE,
+            _ScriptedProvider,
+            _fence,
+        )
+        p = _ScriptedProvider([_fence("ledger_note", text="a"), _DONE, _DONE])
+        res = at.run_turn(
+            "note something", p,
+            allowed_tools=["ledger_note", "ledger_get"],
+            max_tool_calls=3,
+            tool_dispatch=lambda t, a: calls.append(t) or {"ok": True},
+            actor="general_agent",
+            capability="A", phase="build",
+        )
+    finally:
+        sc.pre_dispatch_scaffolds = real
+    assert calls == [], "a blocked call must never reach dispatch"
+    # The refusal is recorded as a guard block that never executed, and it cost
+    # no execution budget — the whole point: a guard that fires N times used to
+    # consume N of the model's N-call budget.
+    recorded = (res.result or {}).get("calls") or []
+    assert recorded, res.result
+    blocked = recorded[0]
+    assert blocked["ok"] is False
+    assert blocked["outcome_kind"] == at.OUTCOME_GUARD_BLOCK, blocked
+    assert blocked["executed"] is False, blocked
+    assert (res.result or {}).get("tool_calls", 0) == 0, res.result
+
+def test_a_capped_tool_refusal_names_a_remedy_and_is_flagged_policy():
+    """The exact live shape, end to end through the real dispatcher."""
+    from unittest import mock
+
+    opts = {
+        "enabled": True, "timeout_s": None, "max_calls_per_turn": 1,
+        "param_defaults": {},
+        "prompt_note": "FIND step: then READ with research_fetch_page.",
+    }
+    counts: dict = {}
+    with mock.patch("services.agent.config.get_tool_options",
+                    return_value=opts), \
+         mock.patch("services.agent.reviewer_exec._resolve_fn",
+                    return_value=lambda **k: {"ok": True, "results": []}):
+        at._dispatch_tool("research_web_search", {"query": "a"},
+                          _call_counts=counts)
+        refused = at._dispatch_tool("research_web_search", {"query": "b"},
+                                    _call_counts=counts)
+    assert refused["status"] == "call_cap_reached"
+    assert refused["policy_refusal"] is True
+    assert refused["executed"] is False
+    # It must name what to do INSTEAD, not just the config key that stopped it.
+    assert "research_fetch_page" in refused["error"]
+    assert "max_calls_per_turn" not in refused["error"]
+    assert at._classify_tool_outcome(refused, ok=False) == (
+        at.OUTCOME_POLICY_REFUSAL, False)

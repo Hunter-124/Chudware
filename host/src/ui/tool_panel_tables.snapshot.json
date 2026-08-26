@@ -67,6 +67,7 @@
    "doc_diff_tool",
    "doc_sketch_contact_sheet",
    "draft_analysis",
+   "edit_drawing_annotation",
    "engine_profile",
    "engine_profile_tree",
    "export_drawing",
@@ -641,6 +642,7 @@
   "ecad_verify_thermal": "Verify the last (or a passed) ecad_thermal_handoff result against component temperature limits + a theta_ja hand calc.",
   "ecad_vibe_check": "Vibration reliability screen of the ACTIVE routed board — modal solve of the mounted board+components solid, excitation-band resonance …",
   "ecad_wire": "Auto-route an orthogonal wire from one pin to another (emits sch_connect) and return the RESULTING net plus the updated list of what is …",
+  "edit_drawing_annotation": "Edit or delete one existing drawing annotation without rebuilding the sheet.",
   "em_driven": "Driven S-parameter sweep of a uniform guide section (analytic-uniform default).",
   "em_eigenmode": "Waveguide eigenmode cutoffs (builtin-fdfd by default).",
   "em_status": "EM solver matrix — which backends are installed and the default per analysis.",
@@ -870,7 +872,7 @@
   "reveng_status": "Return the RE workspace readiness probe (contracts/reveng.md §8.1).",
   "reverse_engineer": "Rebuild an imported solid (STEP/IGES/BREP/STL/...) as an EDITABLE parametric feature tree, verified against the source by boolean …",
   "reverse_engineer_product": "Reverse-engineer hand-off (contracts/sourcing.md §2b): when match_model finds NO confident repo match (fallback.how == \"reverse_engineer\") …",
-  "review_drawing": "Render a 2D DRAWING document to an image so you can SEE it and self-review.",
+  "review_drawing": "Render and inspect a drawing as pixels plus exact sheet-mm metadata.",
   "run_cfd_accurate": "HIGH-FIDELITY external-aero CFD via OpenFOAM (steady RANS, k-omega SST + prism layers).",
   "run_cfd_flow": "Wind-tunnel CFD over the current part/assembly (LBM). Returns drag, lift, Cd, Reynolds.",
   "run_fea_adaptive": "Adaptive linear-static stress FEA for decision-driving peak stresses.",
@@ -892,7 +894,7 @@
   "serving_status": "Report the active adapter-routing table — WHICH BRAIN answers at each insertion point.",
   "set_config_override": "Override one feature parameter in a configuration (the parametric-variant edit).",
   "set_config_suppression": "Suppress (or un-suppress) a feature in a configuration — turn a feature ON/OFF per variant.",
-  "set_material": "Set a body's MATERIAL APPEARANCE — colour + finish — so it renders like the real material.",
+  "set_material": "Set the document material and its rendered body appearance.",
   "set_process": "Bind the manufacturing ProcessProfile to the part (persisted in the .step+).",
   "set_titleblock": "Fill the drawing's title block. doc_id = drawing_doc_id. fields is a dict of any of: title, drawn_by, date, material, finish, scale, rev …",
   "set_view": "Move and/or rescale a view. doc_id = drawing_doc_id. x,y reposition the view on the sheet (mm) — either one alone moves along that axis …",
@@ -939,7 +941,7 @@
   "vendor_part_register": "Register scraped price/availability for bom_price; import_artifact handles geometry.",
   "vendor_status": "Return the login status of all registered vendor source adapters.",
   "vendors_health": "Run a canary health check across the vendor source adapters.",
-  "verify_battery": "Run a subset of deterministic quality checks on the current part.",
+  "verify_battery": "Run deterministic checks on one explicit document.",
   "wall_thickness": "How THIN is the thinnest wall? Inward ray-cast wall-thickness over the whole part.",
   "workspace_doc_events": "Return per-doc event stream entries starting at *since_seq*.",
   "workspace_status": "Return the full workspace snapshot for *run_id*."
@@ -958,7 +960,7 @@
    "prompt_note": "cx,cy,radius are the PARENT view's sheet mm — read them from review_drawing; for a cut through the whole part use add_section_view."
   },
   "add_dimension": {
-   "prompt_note": "For whole-view auto-dimensioning prefer make_drawing's model_items; use this for one-offs, snapping a,b to vertices read from review_drawing."
+   "prompt_note": "For whole-view auto-dimensioning prefer make_drawing's model_items; use feature names/SIDs or exact circles/points from review_drawing for one-offs. dtype='note' takes one anchor plus required text='...'."
   },
   "add_drawing_view": {
    "prompt_note": "One view per call on an existing drawing_doc_id (from make_drawing); the first/anchor view should be view_type='base', x,y are sheet mm."
@@ -1379,6 +1381,9 @@
   "ecad_wire": {
    "prompt_note": "Pins accept numbers or names from ecad_place_symbol's pin list; confirm the join in the returned net_members. For rails prefer ecad_add_power."
   },
+  "edit_drawing_annotation": {
+   "prompt_note": "Fix or delete an existing dimension/note by the view_id + annotation_id listed in review_drawing — never rebuild a whole sheet to remove one callout."
+  },
   "em_driven": {
    "prompt_note": "Uniform-guide default is analytic-uniform: ideal matched S21 propagation, not evidence for a discontinuity or antenna. Frequencies are GHz, length is mm. Call em_status before solver='openems'; absent openEMS returns ok:false/skipped. detail=True returns full S-parameter arrays.",
    "timeout_s": 600
@@ -1404,10 +1409,10 @@
    "prompt_note": "Scoped profile read — start at depth=1/top=8, drill with path=... instead of ingesting the whole report; source='phases' needs no start."
   },
   "export_drawing": {
-   "prompt_note": "2D drawings only (doc_id = the drawing_doc_id) — 3D parts go through export_part; review_drawing first so you don't export a broken sheet."
+   "prompt_note": "2D drawings only (doc_id = drawing_doc_id). The built-in agent must call review_drawing AFTER its last sheet mutation and inspect the attached pixels and warnings before export; 3D parts go through export_part."
   },
   "export_part": {
-   "prompt_note": "Interchange/mesh only — no feature tree or studies survive; to deliver an editable part use save_part (.step+). fmt='step+' routes to the native saver."
+   "prompt_note": "Interchange/mesh only — no feature tree or studies survive. A machine shop needs fmt='step' (.step/.stp); save_part's .step+ is Chudware's native ZIP document and is NOT a standard STEP exchange file."
   },
   "export_reveng_bundle": {
    "prompt_note": "Archival/hand-off only — zips the whole session dir (images, mesh, fits); not part of the in-app flow. dest's parent dir is created."
@@ -1519,8 +1524,7 @@
    "prompt_note": "Write to a live serial handle — requires handle plus either data_hex (raw bytes) or text (console typing); data_hex wins when both are given. Read the reply with fw_serial_read."
   },
   "fw_sim_run": {
-   "prompt_note": "Emulate the built firmware and check assertions — requires project_id (plus elf_path/scenario/assertions; run_s is how long the TARGET runs, a floor not a cap, and a longer scenario timeline still extends it, while timeout_s is the wall-clock budget and wins outright; power_profile=True folds in fw_power_profile) and a successful fw_build first; scenarios and gpio assertions are Renode-only, ESP32 is build+flash. An absent emulator is an honest SKIP in uart_log, never a FAIL to invent around; then fw_power_profile on the returned trace_path.",
-   "timeout_s": 300
+   "prompt_note": "Emulate the built firmware and check assertions — requires project_id (plus elf_path/scenario/assertions; run_s is how long the TARGET runs, a floor not a cap, and a longer scenario timeline still extends it, while timeout_s is the wall-clock budget and wins outright; power_profile=True folds in fw_power_profile) and a successful fw_build first; scenarios and gpio assertions are Renode-only, ESP32 is build+flash. An absent emulator is an honest SKIP in uart_log, never a FAIL to invent around; then fw_power_profile on the returned trace_path."
   },
   "fw_sources": {
    "prompt_note": "The ONLY way to get firmware code on disk — requires project_id, and author with write={'src/main.c': '<code>'} (never fs_write: the project root is outside the fs jail and fs_write refuses it). write also appends compilable paths to the CMakeLists add_executable() so fw_build compiles them; bare add=['src/x.c'] only stubs an EMPTY file. Use PIN_<NET> constants from pinmap.h, never raw pin numbers. Then fw_build."
@@ -1703,6 +1707,42 @@
   },
   "measure_part": {
    "prompt_note": "Combined mass props over ALL bodies (per-body under mass.bodies[]); pass density_g_cm3 for non-steel; also sanity-checks the solid is closed/valid."
+  },
+  "mfg_approval_inspect": {
+   "prompt_note": "Pass exactly one approval_id or proposal_id. A frozen approval read adds active/burned/revoked status; a proposal remains unapproved, and this read cannot create or validate either one."
+  },
+  "mfg_approval_propose": {
+   "prompt_note": "Use only after the draft run has preflight evidence. The result is an UNAPPROVED proposal for a human seat, not authority; a human creates the binding and the arbiter alone validates it at start."
+  },
+  "mfg_artifact_register": {
+   "prompt_note": "For NC/G-code, run cam_post then cam_audit first. This call only hashes immutable content under the command lease; it performs no device I/O, run creation, or authorization."
+  },
+  "mfg_device_capability": {
+   "prompt_note": "Treat all nine capability truth levels literally; device presence never promotes transport to execute. Physical execute and safety_integration remain unadvertised before the qualified pilot."
+  },
+  "mfg_device_describe": {
+   "prompt_note": "Read identity/fingerprint, transport, allowlist, capability and policy together before planning a lane. connected=true is not execute authority, and physical execute/safety_integration remain unadvertised."
+  },
+  "mfg_device_list": {
+   "prompt_note": "Discovery before any manufacturing request: each candidate reports its allowlist decision, FreshValue lane state and capability ceiling. Physical endpoints are denied by default; a listed device grants no authority."
+  },
+  "mfg_gate_report": {
+   "prompt_note": "Read the gate_report_ref returned by preflight or a start refusal. The result is seq-stamped Tier-0/two-stage evidence, but remains advisory until the arbiter revalidates a current human approval."
+  },
+  "mfg_journal_query": {
+   "prompt_note": "Requires command-lane ownership and returns ordered records, head_seq and waiver_rates. Journal seq values are the sole durable ordering truth; never synthesize seq from telemetry time."
+  },
+  "mfg_preflight_run": {
+   "prompt_note": "Call after immutable artifact registration on a connected, identified device. It creates or refreshes a draft run and returns run_id plus Tier-0/two-stage gates; it cannot authorize start."
+  },
+  "mfg_run_describe": {
+   "prompt_note": "Use a run_id from preflight/history to read state, artifact, gate, approval and initiator history. A held or discontinuous run is not resumable; author a new run with fresh inspection, preflight and approval."
+  },
+  "mfg_run_list": {
+   "prompt_note": "Durable run history, optionally filtered by device/state; it is not current device telemetry. Use the returned run_id for a full run description rather than inferring approval or initiator from the state label."
+  },
+  "mfg_telemetry_snapshot": {
+   "prompt_note": "The snapshot is a FreshValue envelope (v/time/seq/age/ttl/src/state/why), with gaps left unknown and raw rows separate. Never infer physical execute or safety_integration from connected/probed telemetry."
   },
   "mission_start": {
    "prompt_note": "Compiles but does not execute — then dag_run(run_id=<its run_id>) starts it (bare dag_run() reuses the same graph). Needs a deliverable manifest; you may write it yourself. Call it without `manifest` and the refusal hands you a fill-in template."
@@ -1973,6 +2013,15 @@
   "req_verify_by_id": {
    "prompt_note": "Runs the requirement's verify_by verifiers and writes status+evidence back; confirm_dimensions/dfm_check/fit_report are skipped (unsupported in v1)."
   },
+  "request_mfg_abort": {
+   "prompt_note": "REQUEST only: the daemon lane asks the arbiter to validate state/initiator, then the device adapter performs a controlled abort; approval authority remains the arbiter's. This is not an E-stop or safety-rated stop."
+  },
+  "request_mfg_hold": {
+   "prompt_note": "REQUEST only: the daemon lane asks the arbiter first, then the device adapter performs feed_hold/controlled_stop/door_suspend; approval authority remains the arbiter's. This software hold is not an E-stop or safety function."
+  },
+  "request_mfg_run_start": {
+   "prompt_note": "REQUEST only: the arbiter alone revalidates the current human approval, binding, fingerprint and gates before the daemon device adapter may start. Physical execute/safety_integration remain unadvertised and are refused."
+  },
   "request_part_photos": {
    "prompt_note": "Only after standard-parts lookup fails to resolve the part; the user's files come back next turn via submit_part_photos."
   },
@@ -2081,7 +2130,7 @@
    "timeout_s": 300
   },
   "review_drawing": {
-   "prompt_note": "SEE the sheet before refining or exporting — fix overlaps with set_view, add add_dimension/add_gdt, then review again in a loop."
+   "prompt_note": "SEE the attached sheet pixels AND read the paired sheet-mm JSON. Fix every overlap/off-sheet/title/material warning with set_view, annotation tools, set_titleblock or source set_material; review again after the last edit."
   },
   "run_cfd_accurate": {
    "prompt_note": "OpenFOAM external-aero RANS; the tool capability-checks first and returns ok:false, skipped:true when unavailable. Always returns job_id when started; poll get_job. Inputs are velocity m/s, aoa degrees, fluid air|water. Start preset='coarse', then refine; only quote Cd/Cl when converged is true."
@@ -2089,6 +2138,9 @@
   "run_cfd_flow": {
    "prompt_note": "Built-in directional LBM: velocity is m/s, aoa degrees, fluid is air|water; freestream +X and lift +Z. Check V² force scaling/dynamic pressure, but absolute Cd is uncalibrated. Require converged=true and min_feature_voxels>=~8, then refine cells; use run_cfd_accurate for absolute coefficients. background=True for cells>=120.",
    "timeout_s": 300
+  },
+  "run_fea_adaptive": {
+   "prompt_note": "Adaptive remesh-and-resolve for a decision-driving peak stress; use run_fea_static for an initial screen, then this when the peak is mesh-sensitive. Its relative indicator is not a stress-error bound; background=True returns job_id for get_job."
   },
   "run_fea_buckling": {
    "prompt_note": "CalculiX fixed-free BOX PROXY, not real CAD stress/buckling. Pass exactly one fixture face and one inward axial force in N on one load face; pressure, shear, and tension are rejected. lambda*applied_load is Pcr; lambda<1 fails. The tool returns ok:false, skipped:true when ccx is unavailable; compare euler_reference_pcr_n.",
@@ -2122,7 +2174,7 @@
    "prompt_note": "Use for builds/tests/scripts; prefer fs_read/fs_grep/fs_glob/fs_write for plain file work. Stateless per call — pass cwd each time; pipe noisy output through head; check exit_code/timed_out."
   },
   "save_part": {
-   "prompt_note": "PREFER for delivery — the only format keeping the editable tree + studies; save before close_part/session end (AI docs get no unsaved warning)."
+   "prompt_note": "Native editable Chudware document only (.step+ ZIP); it is NOT ISO STEP and a machine shop cannot treat it as .step. Save it for project history, and for external manufacturing also call export_part(fmt='step', path='...step')."
   },
   "scrape_enqueue": {
    "prompt_note": "Returns immediately — the download runs in the background; poll scrape_queue_status, then import_artifact on done. Site must be logged in (vendor_login) first."
@@ -2152,7 +2204,7 @@
    "prompt_note": "Per-variant feature on/off without forking the tree; activate_configuration + render_part to confirm the variant looks right."
   },
   "set_material": {
-   "prompt_note": "VISUAL appearance only — set_material(material='steel' | {'color':[r,g,b],'metallic':...,'roughness':...}, body='b1'|None, doc_id=None) sets render colour/finish and NOTHING else. There is no ops=[...] form. Simulation density/stiffness goes to run_fea_static / run_fea_modal's material= instead (a registry name or an E_mpa/nu dict); run_cfd_flow takes fluid='air'|'water' and has no material argument."
+   "prompt_note": "set_material(material='A36 steel'|'4140'|'6061-T6', body='b1'|None, doc_id=...) stores the registry material key AND matching appearance. An explicit {'color':[r,g,b],...} is appearance-only. There is no ops=[...] form. Mass/FEA still take their own material=/density input so each analysis case is explicit; run_cfd_flow takes fluid= and has no material argument."
   },
   "set_process": {
    "prompt_note": "Call once the process is known (FDM default) — its clearance/wall/thread numbers drive later fit-budgeted dims and dfm_check."
@@ -2302,7 +2354,7 @@
    "timeout_s": 180
   },
   "verify_battery": {
-   "prompt_note": "The done-gate before declaring a design finished — omitted checks = all subsecond ones; check_metadata lists names/costs. Narrated verdict → design_review."
+   "prompt_note": "Geometry/check health for THIS doc only: PASS covers only keys present in scores. Skipped checks are unverified, and a part-doc pass does NOT verify drawings, assembly fits, loads, material intent, tolerances or manufacturability. Run those domain checks separately before claiming the design is finished."
   },
   "wall_thickness": {
    "prompt_note": "Headline is min_thickness_mm vs your process floor (~1 mm injection, ~0.8 mm FDM); null means an open/sheet body — confirm a solid with measure_part."

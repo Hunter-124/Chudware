@@ -146,19 +146,36 @@ class TestPromptPreview(unittest.TestCase):
         self.assertGreater(out["meta"].get("system_chars", 0), 100)
 
     def test_main_chat_preview_uses_effective_floors_and_global_override(self):
+        from services.agent.copilot_mode_tools import MAIN_CHAT_DEFAULT_TOOLS
+        from services.agent.mission_dispatch import (
+            _apply_session_preferences,
+            effective_role_system_prompt,
+            linear_role_allowed_tools,
+        )
         from services.agent.prompt_preview import preview_main_chat_system
+        from services.agent.roles import load_role
 
         with mock.patch(
             "services.agent.config.load_config",
             return_value={"system_prompt": "CUSTOM GLOBAL SYSTEM"},
         ):
+            card = load_role("general_agent")
+            live_allowed, _ = _apply_session_preferences(
+                "general_agent",
+                linear_role_allowed_tools(card),
+                effective_role_system_prompt(card),
+            )
             out = preview_main_chat_system(include_tools=True)
 
         self.assertTrue(out.get("ok"), out)
         self.assertTrue(out["system"].startswith("CUSTOM GLOBAL SYSTEM"))
         rendered = set((out["meta"].get("tools") or {}).get("rendered") or [])
-        for name in ("run_shell", "research_fetch_page", "fs_read", "fs_glob", "fs_grep"):
-            self.assertIn(name, rendered)
+        self.assertEqual(rendered, set(live_allowed))
+        self.assertLessEqual(MAIN_CHAT_DEFAULT_TOOLS, rendered)
+        # Security hardening 3aaee658: the contract keeps shell behind explicit
+        # role/category enablement, never on the automatic main-chat floor.
+        self.assertNotIn("run_shell", MAIN_CHAT_DEFAULT_TOOLS)
+        self.assertNotIn("run_shell", rendered)
         self.assertIn("[SKILLS", out["system"])
 
     def test_tool_entry_shows_effective_defaults(self):

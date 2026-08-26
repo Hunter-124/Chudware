@@ -21,14 +21,16 @@ called.
 """
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 __all__ = [
     "PRODUCER_TOOLS",
     "BUILD_ROLES",
     "BUILD_PHASES",
+    "ROLE_MIN_CALLS",
     "PRODUCER_MIN_CALLS",
     "DEFAULT_MAX_CALLS",
+    "completion_cap_for_subagent",
     "is_producer_role",
     "floor_for",
 ]
@@ -59,7 +61,7 @@ BUILD_ROLES: frozenset[str] = frozenset({
     "assembly_fit_engineer", "layout_engineer",
     "model3d", "sketch2d", "re_modeler", "fixer",
     "cam_programmer", "sim_engineer", "drawing_detailer", "ecad_engineer",
-    "firmware_engineer",
+    "firmware_engineer", "spec_writer",
 })
 
 BUILD_PHASES: frozenset[str] = frozenset({
@@ -67,20 +69,49 @@ BUILD_PHASES: frozenset[str] = frozenset({
     "cam", "sim", "simulation", "drawing", "ecad", "firmware",
 })
 
-# Floor sized to the LONGEST mandated chain among producer roles, counted from
-# the role cards themselves:
-#   cam_programmer  cam_new_job+setup+tool+feeds+op×2+generate+simulate+post
-#                   +audit+ledger_note                                  ≈ 11-16
-#   drawing_detailer ledger_get+describe+measure×2+make_drawing+view×3
-#                   +dimension×3+titleblock+export+ledger_note          ≈ 15
-#   ecad_engineer   schematic+place×N+wire+power+board+drc+erc (+1 fix cycle) ≈ 15-19
-#   model3d         ledger+new_part+add_features×2+measure+battery+done ≈ 7-10
-# The old ceiling was max(4, min(12, tokens_granted // 2000)) — an absolute 12
-# no matter how large the grant, i.e. structurally short for three of the four.
+# Role-specific SOFT convergence thresholds, counted from the mandatory calls in
+# each role card (optional retries excluded):
+#   ecad_engineer   ledger + schematic + find×7 + place×7 + wire×6 + power×2
+#                   + ERC + ERC note + simulate + board + DRC + DRC note
+#                   + artifact notes×2 = 32; antenna design + analysis + note = 35
+#   model3d         delegate + render + preflight + add + post-check for each of
+#                   four features, then new_part + material + battery + overlap = 24
+#   feature_modeler mandatory build/verification chain                         = 18
+#   spec_writer     research plus nine ledger/spec entries                     = 18
+# These are warnings to converge, not dispatch caps. The runaway hard ceiling
+# remains owned by agent_turn.
+ROLE_MIN_CALLS: dict[str, int] = {
+    "ecad_engineer": 35,
+    "model3d": 24,
+    "feature_modeler": 18,
+    "spec_writer": 18,
+}
+
+# Fallback for other producer roles whose shorter cards still exceed the bare
+# default. Keep this separate from the audited per-role thresholds above.
 PRODUCER_MIN_CALLS = 16
 
 # agent_turn.run_turn's bare default when max_tool_calls is None.
 DEFAULT_MAX_CALLS = 16
+
+
+def completion_cap_for_subagent(profile: Any | None) -> int:
+    """Return one child completion's generation headroom.
+
+    Tier profiles own their cap. Untiered child turns use the same linear-role
+    headroom as the delegate lane; importing that constant here prevents the two
+    dispatch paths from drifting to separate magic numbers again.
+    """
+    try:
+        headroom = getattr(profile, "generation_headroom", None)
+        if headroom is not None and int(headroom) > 0:
+            return int(headroom)
+    except Exception:  # noqa: BLE001 — malformed optional profile uses fallback
+        pass
+    from services.agent.mission_dispatch import (  # noqa: PLC0415
+        LINEAR_ROLE_MAX_OUTPUT_TOKENS,
+    )
+    return int(LINEAR_ROLE_MAX_OUTPUT_TOKENS)
 
 
 def is_producer_role(
@@ -116,6 +147,10 @@ def floor_for(
     omit it to get the plain default.
     """
     budget = int(base) if base else DEFAULT_MAX_CALLS
-    if is_producer_role(role, allowed, phase):
+    role_s = (role or "").strip().lower()
+    role_floor = ROLE_MIN_CALLS.get(role_s)
+    if role_floor is not None:
+        return max(budget, role_floor)
+    if is_producer_role(role_s, allowed, phase):
         return max(budget, PRODUCER_MIN_CALLS)
     return budget

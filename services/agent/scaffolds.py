@@ -4,9 +4,9 @@ HARD floors live in guardrails.py. This module implements A/B scaffolding
 that MUST no-op for capability letter C (frontier-freedom rule WI-18), except
 where a dial reuses HARD machinery already required for all tiers.
 
-Every scaffold fire emits:
-  * capability_dial {dial, value, forced: true}
-  * auto_verify_inject (WI-2 only, when a read is injected)
+Hard scaffold fires emit ``capability_dial`` with ``forced: true``; auditable
+soft advisories use ``forced: false``. WI-2 read injection additionally emits
+``auto_verify_inject``.
 
 Callers pass a resolved CapabilityProfile (or letter / tier string). C profiles
 return no-ops / None everywhere so ablation sees zero forced scaffold events.
@@ -591,8 +591,8 @@ def pre_dispatch_aggressive_checkpoint(
 ) -> Optional[str]:
     """WI-6 A: checkpoint before fillet/pattern/boolean/hole.
 
-    Reuses guardrails.take_auto_checkpoint / pre_dispatch_checkpoint machinery.
-    Returns model-visible error string to block, or None to proceed.
+    Reuses guardrails.checkpoint_verdict so HARD and aggressive scopes share
+    the same per-document retry escape. Returns an error string to block, or None.
     No-op for B/C (destructive-only path stays in guardrails.pre_dispatch).
     """
     if profile is None or is_frontier(profile):
@@ -607,22 +607,15 @@ def pre_dispatch_aggressive_checkpoint(
         from services.agent import guardrails as _gr  # noqa: PLC0415
         if _gr.is_destructive_tool(tool, args):
             return None  # HARD path owns this call
-        if not _gr.auto_checkpoint_enabled(cfg):
-            return None
-        doc_id = None
-        if isinstance(args, dict) and args.get("doc_id"):
-            doc_id = str(args["doc_id"])
-        ok, reason = _gr.take_auto_checkpoint(
-            doc_id, tool, ledger=ledger, actor=actor,
+        verdict = _gr.checkpoint_verdict(
+            tool, args, ledger=ledger, actor=actor, cfg=cfg,
             checkpoint_fn=checkpoint_fn, vault_bound=vault_bound,
         )
         emit_capability_dial(
             ledger, "auto_checkpoint", "aggressive", forced=True, actor=actor,
-            extra={"trigger_tool": tool, "ok": ok},
+            extra={"trigger_tool": tool, "blocked": verdict is not None},
         )
-        if ok:
-            return None
-        return _gr.MSG_CHECKPOINT_FAIL.format(tool=tool, reason=reason)
+        return verdict.message if verdict is not None else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -702,8 +695,9 @@ def pre_dispatch_calc_gate(
     ledger: Any = None,
     calls: list[dict] | None = None,
     actor: str = "scaffolds",
+    effective_allow_set: set[str] | frozenset[str] | None = None,
 ) -> Optional[str]:
-    """WI-7 A: reject dimensioned features without prior calc. B/C never reject."""
+    """WI-7 A calc gate; unavailable calc remedies downgrade to an advisory."""
     if profile is None or is_frontier(profile):
         return None
     mode = str(getattr(profile, "math_scratchpad", "off") or "off")
@@ -712,6 +706,25 @@ def pre_dispatch_calc_gate(
     if not is_dimensioned_feature_call(tool, args):
         return None
     if turn_had_successful_calc(ledger, calls):
+        return None
+    if (effective_allow_set is not None
+            and not CALC_TOOLS.intersection(effective_allow_set)):
+        # The role cannot satisfy the hard gate from its effective tool list.
+        # Downgrade to an auditable advisory instead of creating a permanent
+        # wall. tool_categories.CATEGORY_PACKS["research"] contains
+        # research_eng_calc, list_calcs, and research_unit_convert; record the
+        # real expansion route for operators without blocking this call.
+        emit_capability_dial(
+            ledger, "math_scratchpad", "advisory", forced=False, actor=actor,
+            extra={
+                "tool": tool,
+                "reason": "no_callable_calc",
+                "remedy": (
+                    "enable_tools(categories=['research']), then call a calc "
+                    "tool, then retry"
+                ),
+            },
+        )
         return None
     emit_capability_dial(
         ledger, "math_scratchpad", "hard", forced=True, actor=actor,
@@ -857,12 +870,14 @@ def pre_dispatch_scaffolds(
     cfg: dict | None = None,
     checkpoint_fn: Callable[..., Any] | None = None,
     vault_bound: bool = False,
+    effective_allow_set: set[str] | frozenset[str] | None = None,
 ) -> Optional[str]:
     """Run A/B scaffold pre-dispatch gates. First block wins. C → always None."""
     if profile is None or is_frontier(profile):
         return None
     msg = pre_dispatch_calc_gate(
         tool, args, profile=profile, ledger=ledger, calls=calls, actor=actor,
+        effective_allow_set=effective_allow_set,
     )
     if msg:
         return msg

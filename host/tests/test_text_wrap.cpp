@@ -1,6 +1,6 @@
-// test_text_wrap.cpp — ctest for the composer's hard-break bookkeeping
-// (ui::copilot::seedHardBreaks / noteEdit / isHardBreak). Links the REAL implementation
-// (src/ui/copilot/text_wrap.cpp), not a copy — no GL context, no ImGui, no AppState.
+// test_text_wrap.cpp — ctest for the composer's hard-break bookkeeping and copied-selection
+// normalization. Links the REAL implementation (src/ui/copilot/text_wrap.cpp), not a copy —
+// no GL context, no ImGui, no AppState.
 //
 // Regression under test, live 2026-07-28: "alt+enter in the prompt input box doesn't add a
 // new line". Two causes, one of them silent:
@@ -21,6 +21,7 @@
 //   ✓ an external rewrite (example chip, slash insert) re-seeds from the text
 //   ✓ offsets stay sorted and unique
 //   ✓ a first sighting seeds instead of shifting garbage
+//   ✓ copied composer selections flatten synthetic wraps while preserving hard breaks and UTF-8
 
 #include "ui/copilot/text_wrap.h"
 
@@ -30,6 +31,7 @@
 
 using ui::copilot::WrapState;
 using ui::copilot::isHardBreak;
+using ui::copilot::normalizeComposerSelection;
 using ui::copilot::noteEdit;
 using ui::copilot::seedHardBreaks;
 
@@ -184,6 +186,43 @@ int main() {
         CHECK(buf == "\nhello\n");
         CHECK_HARD(ws, 0, 6);
         for (size_t i = 1; i < ws.hard.size(); ++i) CHECK(ws.hard[i - 1] < ws.hard[i]);
+    }
+
+    // ---- whole selection removes every synthetic composer wrap ----
+    {
+        const std::string wrapped = "one\nline\nprompt";
+        CHECK(normalizeComposerSelection(wrapped, {}, 0, (int)wrapped.size()) ==
+              "one line prompt");
+    }
+
+    // ---- user-authored hard newlines survive beside synthetic wraps ----
+    {
+        const std::string wrapped = "first\nline\nsecond\npart";
+        CHECK(normalizeComposerSelection(wrapped, {10}, 0, (int)wrapped.size()) ==
+              "first line\nsecond part");
+    }
+
+    // ---- a partial byte range is normalized without expanding to logical lines ----
+    {
+        const std::string wrapped = "alpha\nbeta\ngamma";
+        CHECK(normalizeComposerSelection(wrapped, {}, 3, 12) == "ha beta g");
+    }
+
+    // ---- reversed and out-of-range bounds are ordered and clamped ----
+    {
+        const std::string wrapped = "alpha\nbeta";
+        CHECK(normalizeComposerSelection(wrapped, {}, 999, -999) == "alpha beta");
+        CHECK(normalizeComposerSelection(wrapped, {}, -20, 5) == "alpha");
+    }
+
+    // ---- UTF-8 bytes remain stable around replaced ASCII wrap bytes ----
+    {
+        const std::string wrapped = "café\ncrème\nbrûlée";
+        const std::string expected = "café crème brûlée";
+        const int end = (int)expected.find(" brûlée");
+        CHECK(normalizeComposerSelection(wrapped, {}, 0, end) ==
+              expected.substr(0, (size_t)end));
+        CHECK(normalizeComposerSelection(wrapped, {}, 0, (int)wrapped.size()) == expected);
     }
 
     if (g_failures == 0) std::printf("test_text_wrap: all checks passed\n");

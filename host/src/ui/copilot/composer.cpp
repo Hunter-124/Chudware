@@ -63,6 +63,7 @@ bool rewrapInPlace(char* buf, int len, float wrapW) {
 namespace {
 using ui::copilot::WrapState;
 using ui::copilot::seedHardBreaks;
+using ui::copilot::normalizeComposerSelection;
 using ui::copilot::noteEdit;
 struct ChatInputCb {
     float wrapW = 0.0f;
@@ -168,6 +169,25 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     ImGui::InputTextMultiline(id, buf.data(), buf.size(),
         ImVec2(rightReserve > 0.0f ? -rightReserve : -1.0f, h),
         flags, chatInputEditCallback, &cb);
+    // InputText has already handled Ctrl+C/Ctrl+Insert. Its buffer contains visual-wrap
+    // newlines, so replace the native clipboard payload with the same byte range normalized
+    // against the composer's hard-break provenance.
+    if (ImGui::IsItemActive() || ImGui::IsItemFocused()) {
+        const bool copyChord =
+            (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) ||
+            (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Insert, false));
+        if (copyChord) {
+            const ImGuiID itemId = ImGui::GetItemID();
+            ImGuiInputTextState* state = ImGui::GetInputTextState(itemId);
+            if (state && state->HasSelection() && state->TextA.Data) {
+                const std::string selected = normalizeComposerSelection(
+                    std::string_view(state->TextA.Data,
+                                     static_cast<std::size_t>(state->TextLen)),
+                    ws.hard, state->GetSelectionStart(), state->GetSelectionEnd());
+                ImGui::SetClipboardText(selected.c_str());
+            }
+        }
+    }
     s_activeLast[wid] = ImGui::IsItemActive();
     // A BARE Enter sends; so does Ctrl+Enter, which ImGui's multiline treats as "validate"
     // and never turns into a line break. Shift/Alt+Enter are newlines: the widget inserts one
@@ -3744,7 +3764,7 @@ static void requestStopRun(AppState& st) {
 // gates on this instead, and it doubles as the soft-break flattener on the way out — SOFT
 // only: a break the user typed with Alt/Shift+Enter is part of their message and survives
 // into the prompt, while emptiness is still judged on the text around those breaks.
-static std::string composerText(const AppState& st) {
+std::string composerText(const AppState& st) {
     if (st.prompt.empty()) return {};
     std::string out(st.prompt.data());
     const auto it = g_wrap.find(st.prompt.data());

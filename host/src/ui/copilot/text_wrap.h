@@ -11,6 +11,8 @@
 // each edit. GL-free and ImGui-free on purpose: this is the subtle part, so it is unit-tested
 // (host/tests/test_text_wrap.cpp).
 #pragma once
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace ui::copilot {
@@ -33,5 +35,12 @@ void noteEdit(WrapState& ws, const char* buf, int len, int cursor);
 
 // Is the '\n' at `off` one of the user's?
 bool isHardBreak(const std::vector<int>& hard, int off);
+
+// Return the selected byte range from the live composer buffer, restoring only wrapper-created
+// '\n' bytes to spaces. Offsets listed in `hardBreaks` are user-authored and remain newlines.
+// Bounds are clamped and may be reversed.
+std::string normalizeComposerSelection(std::string_view wrapped,
+                                       const std::vector<int>& hardBreaks,
+                                       int selectionStart, int selectionEnd);
 
 }  // namespace ui::copilot

@@ -199,8 +199,7 @@ static nlohmann::json serializePendingContextRefs(const AppState& st) {
 // Snapshot the composer (text + attachment paths + context refs) for prompt_drafts.json.
 static nlohmann::json promptDraftObject(const AppState& st) {
     nlohmann::json o = nlohmann::json::object();
-    const char* p = st.prompt.data() ? st.prompt.data() : "";
-    o["text"] = p;
+    o["text"] = composerText(st);
     o["attachments"] = st.pendingAttachments;
     o["context_refs"] = serializePendingContextRefs(st);
     return o;

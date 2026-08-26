@@ -431,6 +431,7 @@ void drawAISettingsBody(AppState& st, bool busy);
 void drawModelDropdown(AppState& st, bool busy);
 
 // ---- composer + send path (composer) ----
+std::string composerText(const AppState& st);
 void drawBtwPanel(AppState& st);
 void submitTurn(AppState& st, const std::string& text);
 void drawRuntimeBanner(AppState& st);

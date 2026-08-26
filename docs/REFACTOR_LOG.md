@@ -7946,3 +7946,19 @@ Touched `services/agent/{pipeline/phases.py,plm_bridge.py}`,
 `services/plm/{client.py,vault.py}`, their focused tests, and the additive
 design-pipeline/PLM contract notes. The bridge remains best-effort and managed
 mode only; a vault failure queues metadata without blocking mission progress.
+
+### 2026-08-26 — portable SolidWorks parts/assemblies into native FEA workflow
+
+Modern SolidWorks 2015+ `.SLDPRT`/`.SLDASM` import no longer requires a Windows
+SolidWorks installation: `core/doc/solidworks_tessellation.*` decodes saved-display
+streams, reconstructs the exact triangle-strip topology, composes nested assembly
+instance transforms, and shares distinct component meshes before `formats.cpp` sews
+them into baked native B-rep import bodies. `session.cpp` still prefers COM→STEP for
+exact analytic surfaces, persists flattened component paths plus explicit
+`saved_display_tessellation` fidelity in `.step+`, and the MCP surface falls through
+to this portable lane when feature-tree COM extraction is unavailable. The Python
+format oracle mirrors the codec. Focused synthetic tests cover source-independent
+STEP+ reopen, two-instance assembly placement, and Polyhedral-FEA meshing; the real
+Crimson Comet corpus parsed 35/35 native files (4 assemblies), real `Tread.SLDPRT`
+and `Wheel.SLDASM` imported through `libchudware`, and an imported
+`Axle Rod.SLDPRT` completed a 1 kN PolyMesh static solve.

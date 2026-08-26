@@ -258,3 +258,44 @@ def test_import_part_does_not_adopt_an_unrelated_open_doc(exchange_with_open_fil
     assert out["ok"] is True, out
     assert "reused" not in out
     assert out["doc_id"] == "doc-opened"
+
+def test_solidworks_without_com_falls_through_to_portable_native_import(
+        exchange, tmp_path, monkeypatch):
+    """Default resolve_features must not make modern SLDPRT unusable off Windows."""
+    tools, calls = exchange
+    source = tmp_path / "wheel.SLDPRT"
+    source.write_bytes(b"modern-solidworks-fixture")
+
+    from services.sw_import.sw_feature_import import SolidWorksUnavailable
+    from services.sw_import import sw_translate
+
+    def unavailable(_path):
+        raise SolidWorksUnavailable("SolidWorks COM automation is unavailable")
+
+    monkeypatch.setattr(sw_translate, "resolve", unavailable)
+
+    def portable_core(method, params):
+        calls.append((method, dict(params)))
+        if method == "doc_list":
+            return {"docs": []}
+        if method == "import_file":
+            return {
+                "doc_id": "doc-portable",
+                "import_fidelity": "saved_display_tessellation",
+                "feature_resolved": False,
+                "editable_as": "baked_brep",
+                "component_names": ["Wheel"],
+                "warning": "tessellation fidelity",
+            }
+        return {}
+
+    monkeypatch.setattr(M.cb, "call", portable_core)
+    out = json.loads(tools["import_part"](str(source)))
+    assert out["ok"] is True
+    assert out["doc_id"] == "doc-portable"
+    assert out["import_fidelity"] == "saved_display_tessellation"
+    assert out["feature_resolved"] is False
+    assert out["editable_as"] == "baked_brep"
+    assert out["component_names"] == ["Wheel"]
+    assert "SolidWorks COM automation is unavailable" in out["feature_fallback_reason"]
+    assert [method for method, _ in calls if method == "import_file"] == ["import_file"]

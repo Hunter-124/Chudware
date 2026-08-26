@@ -47,14 +47,17 @@ to them, and they are not part of the set listed below.
 This repo's actual format-interop surface — what's implemented, not just
 referenced — lives here:
 
-- **`services/formats/formats.py`** — the single source of truth for the format matrix
-  (`FORMAT_REGISTRY`) and the import entry point (`import_path`). Today: STEP
-  (AP214), IGES, BREP, STL, OBJ, PLY, glTF/GLB, 3MF, and Rhino `.3dm` at the mesh
-  level are fully wired; **DXF import** (via `services/formats/formats_dxf.py`, ezdxf
-  MIT) is the newest addition (2D vector drawings → planar B-rep, import-only);
-  SolidWorks `.sldprt`/`.sldasm` and Parasolid `.x_t`/`.x_b` are experimental,
-  import-only, non-export entries. **DWG import is not yet implemented** — see
-  below.
+- **`core/doc/formats.cpp`** — production format matrix and import/export surface. STEP,
+  IGES, BREP, STL, OBJ, PLY, glTF/GLB, 3MF, Rhino `.3dm`, DXF, and subprocess-isolated
+  DWG conversion are wired according to build capabilities; `services/formats/formats.py`
+  is the Python parity oracle.
+- **SolidWorks `.sldprt`/`.sldasm`** are import-only. On Windows, installed SolidWorks
+  COM is preferred for an exact STEP/B-rep conversion. On every platform, modern
+  SolidWorks 2015+ saved-display triangle strips import as explicitly labelled
+  tessellation-fidelity bodies; assemblies preserve component instance paths and composed
+  transforms. Imported bodies are baked into `.step+`, remain editable as native import
+  features, export normally, and feed the Netgen or Polyhedral-FEA mesher. Parasolid
+  `.x_t`/`.x_b` still needs SolidWorks/NX conversion because it has no saved-display lane.
 - **`work/backlog/T-BL02.md`** — the format-interop backlog task tracking what
   lands next (Parasolid payload extraction, CATIA V5, Inventor, Altium
   clean-room parsers, and the DWG/Revit ODA-membership decision). This directory

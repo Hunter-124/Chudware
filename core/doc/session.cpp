@@ -11277,16 +11277,33 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
     std::string f = fmt.empty() ? detect_format(path) : fmt;
     const std::string stem = std::filesystem::path(path).stem().string();
 
-    // SolidWorks / Parasolid have no free B-rep reader: drive SolidWorks via COM to export a
-    // neutral STEP, then import THAT through the normal B-rep lane (the part keeps the source
-    // file's stem as its name). Throws an actionable error if SolidWorks/COM is unavailable.
+    // Prefer SolidWorks COM -> exact STEP when it is available.  Modern SLDPRT/SLDASM files
+    // also carry a portable saved-display tessellation, so a missing/broken COM server falls
+    // back to that lane instead of making the file unusable on Linux. Parasolid still needs
+    // SolidWorks because it has no saved display stream.
     std::string import_path_ = path;
-    if (f == "sldprt" || f == "sldasm" || f == "x_t" || f == "x_b") {
+    bool solidworks_tessellation = false;
+    if (f == "sldprt" || f == "sldasm") {
+        if (solidworks_available()) {
+            try {
+                import_path_ = sw_export_step(path);
+                f = "step";
+            } catch (const OpError&) {
+                solidworks_tessellation = true;
+            }
+        } else {
+            solidworks_tessellation = true;
+        }
+    } else if (f == "x_t" || f == "x_b") {
         import_path_ = sw_export_step(path);
         f = "step";
     }
 
     json params = {{"source_path", import_path_}, {"format", f}, {"original_name", stem}};
+    if (solidworks_tessellation) {
+        params["import_fidelity"] = "saved_display_tessellation";
+        params["editable_as"] = "baked_brep";
+    }
     if (as_solid) params["as_solid"] = true;
     // BAKE the geometry into the feature at import time so a saved .step+ no longer
     // depends on the source file surviving on disk (Bug N-8). We read the source ONCE
@@ -11300,13 +11317,19 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
         BRep_Builder bb;
         bb.MakeCompound(comp);
         std::size_t n = 0;
-        for (auto& [bname, shp] : bodies)
-            if (!shp.IsNull()) { bb.Add(comp, shp); ++n; }
+        json embedded_names = json::array();
+        for (auto& [bname, shp] : bodies) {
+            if (shp.IsNull()) continue;
+            bb.Add(comp, shp);
+            ++n;
+            embedded_names.push_back(bname);
+        }
         if (n > 0) {
             std::string blob = shape_to_brep_b64(comp);
             if (!blob.empty()) {
                 params["embedded_brep"] = blob;
                 params["embedded_bodies"] = n;
+                params["embedded_body_names"] = std::move(embedded_names);
             }
         }
     } catch (...) {
@@ -11327,6 +11350,17 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
 
     json resp = apply_ops_locked(*s, -1, ops, /*coalesce=*/false);
     resp["doc_id"] = s->doc_id;
+    if (solidworks_tessellation) {
+        resp["import_fidelity"] = "saved_display_tessellation";
+        resp["feature_resolved"] = false;
+        resp["editable_as"] = "baked_brep";
+        resp["component_names"] = params.value("embedded_body_names", json::array());
+        resp["warning"] =
+            "Imported the SolidWorks saved display tessellation (not the original parametric "
+            "feature tree/B-rep). Geometry is baked into this native document and can be edited, "
+            "exported, and simulated; use SolidWorks feature resolution or STEP when exact "
+            "analytic surfaces are required.";
+    }
     return resp;
 }
 
@@ -11413,10 +11447,22 @@ json doc_vendor_part_insert(const std::string& into, const std::string& supplier
                                 : (rec.value("supplier", std::string()) + " " +
                                    rec.value("part_number", std::string()));
     std::string fmt = rec.value("cad_format", std::string());
-    // SolidWorks / Parasolid have no free B-rep reader: route through COM -> STEP first, exactly
-    // like doc_import_file.
+    // Prefer COM -> exact STEP, but keep modern SLDPRT/SLDASM on their native format when COM
+    // is absent or fails so the portable saved-display tessellation importer can recover them.
     std::string import_path_ = cad_path;
-    if (fmt == "sldprt" || fmt == "sldasm" || fmt == "x_t" || fmt == "x_b") {
+    bool solidworks_tessellation = false;
+    if (fmt == "sldprt" || fmt == "sldasm") {
+        if (solidworks_available()) {
+            try {
+                import_path_ = sw_export_step(cad_path);
+                fmt = "step";
+            } catch (const OpError&) {
+                solidworks_tessellation = true;
+            }
+        } else {
+            solidworks_tessellation = true;
+        }
+    } else if (fmt == "x_t" || fmt == "x_b") {
         import_path_ = sw_export_step(cad_path);
         fmt = "step";
     }
@@ -11429,6 +11475,10 @@ json doc_vendor_part_insert(const std::string& into, const std::string& supplier
                    {"vendor_supplier", rec.value("supplier", std::string())},
                    {"vendor_part_number", rec.value("part_number", std::string())},
                    {"vendor_product_url", rec.value("product_url", std::string())}};
+    if (solidworks_tessellation) {
+        params["import_fidelity"] = "saved_display_tessellation";
+        params["editable_as"] = "baked_brep";
+    }
     json ops = json::array({json{
         {"op", "add_feature"},
         {"feature",

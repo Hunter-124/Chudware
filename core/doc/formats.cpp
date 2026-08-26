@@ -71,6 +71,7 @@
 #endif
 
 #include "doc/formats.h"
+#include "doc/solidworks_tessellation.h"
 
 #include <algorithm>
 #include <cmath>
@@ -96,6 +97,7 @@
 #include <BRepBuilderAPI_MakeSolid.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
@@ -151,6 +153,7 @@
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
+#include <gp_Trsf.hxx>
 
 #include "doc/session.h"  // OpError
 
@@ -2018,6 +2021,27 @@ std::vector<std::pair<std::string, TopoDS_Shape>> name_bodies(
     return out;
 }
 
+TopoDS_Shape place_solidworks_body(const TopoDS_Shape& shape,
+                                   const std::array<double, 16>& m) {
+    static const std::array<double, 16> identity = {
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0};
+    if (m == identity) return shape;
+    // SolidWorks serializes row-vector transforms in metres. OCCT SetValues takes the
+    // equivalent column-vector 3x4 matrix, and Chudware's geometry unit is millimetres.
+    gp_Trsf trsf;
+    trsf.SetValues(
+        m[0], m[4], m[8], m[12] * 1000.0,
+        m[1], m[5], m[9], m[13] * 1000.0,
+        m[2], m[6], m[10], m[14] * 1000.0);
+    BRepBuilderAPI_Transform placed(shape, trsf, Standard_True);
+    if (!placed.IsDone() || placed.Shape().IsNull())
+        throw OpError("import_failed", "SolidWorks component transform failed");
+    return placed.Shape();
+}
+
 }  // namespace
 
 std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::string& path,
@@ -2080,6 +2104,43 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
             if (!BRepTools::Read(shape, path.c_str(), b) || shape.IsNull())
                 throw OpError("import_failed", "BREP reader returned failure", {{"path", path}});
             return name_bodies(split_solids(shape));
+        }
+        if (fmt == "sldprt" || fmt == "sldasm") {
+            // Portable modern-SolidWorks lane. Recover the saved display triangle strips, sew
+            // each distinct component once, then instance its OCCT shape with the assembly's
+            // composed transform. On Windows the session layer still prefers COM -> exact STEP;
+            // this path is the cross-platform fallback and intentionally reports tessellation
+            // fidelity to its caller.
+            const bool assembly = fmt == "sldasm";
+            const auto saved = read_solidworks_tessellation(path, assembly);
+            std::unordered_map<const MeshData*, TopoDS_Shape> sewn;
+            std::vector<std::pair<std::string, TopoDS_Shape>> out;
+            for (const SolidWorksTessellationBody& item : saved) {
+                if (!item.mesh || item.mesh->triangle_count() == 0) continue;
+                const MeshData* key = item.mesh.get();
+                auto cached = sewn.find(key);
+                if (cached == sewn.end()) {
+                    TopoDS_Shape base = mesh_to_shape(*item.mesh);
+                    if (base.IsNull())
+                        throw OpError("import_failed",
+                                      "SolidWorks saved tessellation for '" + item.name +
+                                          "' could not be sewn into a body",
+                                      {{"path", path}, {"format", fmt}, {"component", item.name}});
+                    cached = sewn.emplace(key, std::move(base)).first;
+                }
+                TopoDS_Shape placed = place_solidworks_body(cached->second, item.transform);
+                const auto solids = split_solids(placed);
+                for (std::size_t i = 0; i < solids.size(); ++i) {
+                    std::string name = item.name;
+                    if (solids.size() > 1) name += "/Body" + std::to_string(i + 1);
+                    out.emplace_back(std::move(name), solids[i]);
+                }
+            }
+            if (out.empty())
+                throw OpError("import_failed",
+                              "SolidWorks file contains no usable saved tessellation",
+                              {{"path", path}, {"format", fmt}});
+            return out;
         }
         if (fmt == "stl" || fmt == "obj" || fmt == "ply" || fmt == "gltf" || fmt == "glb") {
             // Mesh lane: read the triangle soup, sew it into a shell/solid (the C++
@@ -2177,7 +2238,7 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
     }
     throw OpError("import_failed",
                   "import format '" + fmt + "' is not supported by the C++ core "
-                  "(sldprt/sldasm/x_t/x_b need the COM/Parasolid lanes — deferred)",
+                  "(Parasolid x_t/x_b must be converted through SolidWorks COM -> STEP)",
                   {{"format", fmt}, {"reason", "unsupported format"}});
 }
 

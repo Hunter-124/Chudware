@@ -107,13 +107,15 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         faces) — reference/profile geometry to extrude or dimension, not a solid. DWG needs a
         DWG→DXF converter (LibreDWG `dwg2dxf`) on PATH; without one it errors with a hint.
 
-        SOLIDWORKS (.sldprt): with `resolve_features=True` (default) and no `into`, the part is
-        opened by RECONSTRUCTING its SolidWorks feature tree (sketches with relations, reference
-        planes, extrude/cut/revolve/loft, …) into a fully EDITABLE Chudware part — not a frozen
-        body. This needs SolidWorks installed locally (driven via its COM API). If any feature
-        can't be faithfully rebuilt the import is REFUSED with the exact list of what blocked it
-        (so the gap can be fixed) — it does NOT silently fall back to a dumb solid. Set
-        `resolve_features=False` to force the legacy COM→STEP single-body import instead.
+        SOLIDWORKS (.sldprt/.sldasm): with `resolve_features=True` (default), Chudware first
+        asks an installed SolidWorks COM server to reconstruct sketches/features into a fully
+        parametric native tree. If SolidWorks is unavailable, modern (2015+) files fall back to
+        their saved display tessellation: the watertight triangle strips are sewn into baked
+        native B-rep bodies, assembly hierarchy/transforms are preserved, and the result can be
+        edited, exported, saved as STEP+, and simulated. That portable path is approximate and
+        reports `import_fidelity="saved_display_tessellation"`; use feature resolution or STEP
+        when exact analytic surfaces are required. `resolve_features=False` skips feature-tree
+        extraction but still prefers exact COM→STEP when SolidWorks is installed.
 
         TIP: pair with the `transform` feature (in add_features) to POSITION each imported body
         into a shared coordinate frame — translate:[x,y,z] and/or angle:<deg> with rotate:[ax,ay,az].
@@ -170,20 +172,22 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                 f'into="{did}" to add this file as a BODY inside an existing '
                                 "part instead."})
             # SolidWorks feature-tree resolution (opening as a NEW editable part/assembly).
+            portable_fallback_reason: Optional[str] = None
             if resolve_features and not into and path_abs.lower().endswith((".sldprt", ".sldasm")):
                 from services.sw_import.sw_feature_import import SolidWorksUnavailable
                 from services.sw_import.sw_translate import resolve as _sw_resolve
                 try:
                     plan = _sw_resolve(path_abs)
                 except SolidWorksUnavailable as e:
-                    return _dumps({"ok": False, "error": str(e),
-                                   "hint": "Open the part in SolidWorks and Save As STEP, then "
-                                           "import that — or call import_part(resolve_features="
-                                           "False) for a single-body COM→STEP import."})
+                    # Portable modern-SolidWorks import lives in the C++ core. Keep going to the
+                    # normal import_file call; its response explicitly labels tessellation
+                    # fidelity, so this never masquerades as a resolved parametric tree.
+                    plan = None
+                    portable_fallback_reason = str(e)
                 except Exception as e:  # noqa: BLE001
                     return _dumps({"ok": False, "error":
                                    f"SolidWorks feature extraction failed: {e}"})
-                if plan["blocking"]:
+                if plan is not None and plan["blocking"]:
                     # Strict-fidelity contract: refuse rather than import a quietly-wrong model.
                     return _dumps({
                         "ok": False,
@@ -194,7 +198,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                         "hint": "These features need importer support before this part can be "
                                 "rebuilt faithfully. Use import_part(resolve_features=False) to "
                                 "fall back to a single-body COM→STEP import in the meantime."})
-                if plan.get("is_assembly"):
+                if plan is not None and plan.get("is_assembly"):
                     # Build each DISTINCT component part once -> save a .step+ (keeps its editable
                     # feature tree) -> place every instance in an ASSEMBLY doc via
                     # asm_insert_component with its 4x4 transform (the engine's native assembly model).
@@ -237,15 +241,16 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                         "feature_resolved": True, "is_assembly": True,
                         "component_count": len(comps), "distinct_parts": len(built),
                         "feature_count": plan["feature_count"], "degraded": plan["degraded"]})
-                d = cb.call("doc_new", {"name": plan["name"]}).get("doc_id")
-                r = cb.call("doc_apply_ops", {"doc_id": d, "ops": plan["ops"]})
-                _CUR["doc_id"] = d
-                _publish_current(d)
-                return _dumps({
-                    "ok": True, "doc_id": d, "imported_from": path, "format": "sldprt",
-                    "feature_resolved": True, "feature_count": plan["feature_count"],
-                    "degraded": plan["degraded"],
-                    **{k: r[k] for k in ("revision", "body_count", "volume_mm3") if k in r}})
+                if plan is not None:
+                    d = cb.call("doc_new", {"name": plan["name"]}).get("doc_id")
+                    r = cb.call("doc_apply_ops", {"doc_id": d, "ops": plan["ops"]})
+                    _CUR["doc_id"] = d
+                    _publish_current(d)
+                    return _dumps({
+                        "ok": True, "doc_id": d, "imported_from": path, "format": "sldprt",
+                        "feature_resolved": True, "feature_count": plan["feature_count"],
+                        "degraded": plan["degraded"],
+                        **{k: r[k] for k in ("revision", "body_count", "volume_mm3") if k in r}})
             # A3: .step+ is the engine's NATIVE format. With no `into`, route it through
             # doc_open (the same path used by recover_parts and the host's own file-open) to
             # open it as a fresh part. WITH `into`, the engine's import_file now extracts the
@@ -280,9 +285,14 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                 vol = r.get("volume")
                 if isinstance(vol, (int, float)):
                     _LAST_VOLUME[new_id] = vol
-            return _dumps({"ok": True, "doc_id": new_id, "imported_from": path,
-                           "into": into, **{k: r[k] for k in ("revision", "name", "body_count")
-                                            if k in r}})
+            payload = {"ok": True, "doc_id": new_id, "imported_from": path,
+                       "into": into,
+                       **{k: r[k] for k in (
+                           "revision", "name", "body_count", "import_fidelity",
+                           "feature_resolved", "editable_as", "component_names", "warning") if k in r}}
+            if portable_fallback_reason and r.get("import_fidelity") == "saved_display_tessellation":
+                payload["feature_fallback_reason"] = portable_fallback_reason
+            return _dumps(payload)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

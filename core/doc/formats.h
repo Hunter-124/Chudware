@@ -14,9 +14,9 @@
 //     so the C++ core has no separate MeshBody type: a mesh becomes a real B-rep body
 //     on import.
 //
-// Deferred (precise reasons — see formats.cpp): 3MF (lib3mf-only in the oracle; OCCT
-// 7.9.3 ships no 3MF read/write) and 3dm (OpenNURBS/rhino3dm-only). The proprietary
-// COM lanes (sldprt/sldasm/x_t/x_b) remain deferred as in P20.
+// Optional/proprietary lanes: 3MF and 3DM compile when their provisioned libraries are present.
+// Modern SolidWorks parts/assemblies import portably from saved display tessellations, with
+// Windows COM -> STEP preferred for exact analytic B-rep; Parasolid still requires COM.
 #pragma once
 
 #include <cstdint>
@@ -126,11 +126,11 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies,
                           const TessOptions& tess = TessOptions{});
 
 // Read solid bodies from `path`. Supported: step (multi-solid), iges (sewn+healed),
-// brep, and the mesh formats stl/obj/ply/gltf/glb (sewn into a shell/solid). Returns
-// (name, shape) pairs in file order (Body1..N when the file carries no names). Throws
-// OpError("import_failed") on an unsupported format or a read failure / empty result.
-// 3mf / 3dm and the COM lanes (sldprt/sldasm/x_t/x_b) are NOT supported and raise
-// import_failed with a precise reason.
+// brep, mesh formats stl/obj/ply/gltf/glb/3mf/3dm (sewn into a shell/solid), and
+// modern sldprt/sldasm saved-display tessellations. Returns (name, shape) pairs in file
+// order; SolidWorks assemblies retain flattened hierarchy/instance path names and world
+// transforms. Throws OpError("import_failed") on an unsupported format, malformed stream,
+// unavailable optional dependency, or empty result. x_t/x_b must route through COM -> STEP.
 std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::string& path,
                                                                 const std::string& fmt);
 

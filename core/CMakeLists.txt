@@ -1682,13 +1682,17 @@ if(CHUDWARE_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_import_roundtrip PRIVATE
-    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util chudware_mesh)
   target_sources(test_import_roundtrip PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_import_roundtrip PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  if(CHUDWARE_WITH_POLYMESH)
+    chudware_polymesh_stage_runtime(test_import_roundtrip)
+  endif()
   add_test(NAME import_roundtrip COMMAND test_import_roundtrip)
-  set_tests_properties(import_roundtrip PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+  set_tests_properties(import_roundtrip PROPERTIES RUN_SERIAL TRUE
+    ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- Assembly export: doc_export_file/step/estimate must world-place component bodies --
   # (regression for "file exports do nothing for assemblies" — exports compiled the
@@ -1754,6 +1758,7 @@ if(CHUDWARE_WITH_OCCT)
     doc/validate.cpp
     doc/op_registry.cpp
     doc/formats.cpp
+    doc/solidworks_tessellation.cpp
     doc/dxf.cpp
     doc/pdfvec.cpp
     doc/annot_draw.cpp

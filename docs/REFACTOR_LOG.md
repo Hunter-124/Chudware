@@ -7962,3 +7962,25 @@ STEP+ reopen, two-instance assembly placement, and Polyhedral-FEA meshing; the r
 Crimson Comet corpus parsed 35/35 native files (4 assemblies), real `Tread.SLDPRT`
 and `Wheel.SLDASM` imported through `libchudware`, and an imported
 `Axle Rod.SLDPRT` completed a 1 kN PolyMesh static solve.
+
+## 2026-08-26 — Box.com mirror integration (`aicad.box_mirror/1`)
+
+Optional cloud MIRROR of saved project files on Box.com; live edits stay local.
+New `services/plm/box_mirror.py` (stdlib-only Box REST client, durable per-project
+spool under appdata `box_mirror/`, sha1 change detection, version-preserving
+uploads, OAuth refresh-token rotation persisted under `config_lock`, loopback
+OAuth connect at `http://127.0.0.1:53682/box`). Hooks: post-`Vault.save` commit
+(`services/plm/vault.py`), verified `_project_save` + bounded terminal-sweep drain
+(`services/mcp/cad_common.py` — the fresh-per-turn agent worker must drain
+blocking; the spool survives kills). Tools `box_sync`/`box_status` registered in
+the plm family (`services/mcp/plm_tools.py`, pack in `tool_categories.py`,
+`box_sync` risk-overridden EXTERNAL in `tool_registry.py`). GUI: worker RPCs
+`box_status/box_sync/box_notify_save/box_oauth_login` (`services/plm/worker_rpc.py`),
+Settings → General → "Box.com mirror" section, `boxMirrorNotifySave()` beside every
+`plmAutoRecordSave` call plus the async `doSaveDoc` success callback (host/src).
+Contract: `contracts/box_mirror.md`. Config ownership gotcha: the GUI must
+nested-overlay `box`/`box.auth` — Python owns the ROTATING `access_token`/
+`refresh_token`/`access_token_expires_at` (Box refresh tokens are single-use; a
+clobber revokes the grant). Tests: `services/agent/test_box_mirror.py` (fake
+transport, 16 tests). Verified live against a real Box account end-to-end
+(upload, version update, dot-dir exclusion, loopback OAuth connect).

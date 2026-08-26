@@ -25,6 +25,9 @@ void drawPlmQuickChip(AppState& st);
 // save; a failure surfaces one Warn toast. *savedAbsPath* is the absolute path
 // that was just written.
 void plmAutoRecordSave(AppState& st, const std::string& savedAbsPath);
+// Spool a just-written file for the optional Box.com mirror. Gated by the persisted
+// Box enable flag and a non-empty path; asynchronous and never affects save success.
+void boxMirrorNotifySave(AppState& st, const std::string& savedAbsPath);
 
 // Active document's PLM state for the FeatureManager badge. Returns true and
 // fills rev/lifecycle/dirty when the active doc is a tracked item; false (and

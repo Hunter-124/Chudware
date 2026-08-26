@@ -1468,7 +1468,14 @@ def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional
         path = d / f"{_project_save_stem(name, doc_id)}.step+"
         r = cb.call("doc_save", {"doc_id": doc_id, "path": str(path)})
         written = r.get("path", str(path)) if isinstance(r, dict) else str(path)
-        return written if os.path.exists(written) else None
+        if not os.path.exists(written):
+            return None
+        try:  # optional Box cloud mirror — spools the project only; uploads drain later
+            from services.plm import box_mirror
+            box_mirror.notify_saved_path(written)
+        except Exception:  # noqa: BLE001 — a mirror must never fail a save
+            pass
+        return written
     except Exception:  # noqa: BLE001
         return None
 
@@ -1566,6 +1573,16 @@ def save_touched_docs() -> dict:
             out["saved"].append({"doc_id": did, "name": e.get("name"), "path": written})
         else:
             out["errors"].append(f"{did}: doc_save wrote nothing")
+    try:
+        # Optional Box cloud mirror: this agent worker is a fresh fork per turn, so
+        # a background drain thread would die with it — drain the spool HERE, with a
+        # bounded budget, before the process exits. Anything unfinished stays
+        # spooled for the GUI worker / the next turn.
+        from services.plm import box_mirror
+        if box_mirror.is_enabled() and (out["saved"] or box_mirror.status()["pending"]):
+            out["box"] = box_mirror.drain(block=True, budget_s=90.0)
+    except Exception:  # noqa: BLE001 — a terminal sweep never fails a turn
+        pass
     return out
 
 

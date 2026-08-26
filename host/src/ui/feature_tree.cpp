@@ -3227,6 +3227,7 @@ static void doSaveDoc(AppState& st, bool forceDialog) {
                     if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
                         st.docTabs[st.activeTab].path = pathCopy;
                     st.clearDrawingDirtyForSource(docId);
+                    ui::boxMirrorNotifySave(st, pathCopy);
                     st.addLog("[doc] saved: " + pathCopy);
                     st.toast(ui::ToastLevel::Info, "Saved " + pathBaseName(pathCopy));
                 }, 120000);
@@ -6152,6 +6153,7 @@ void featureTreeSaveDocToPath(AppState& st, const std::string& path, bool requir
                     st.clearDrawingDirtyForSource(docId);
                     st.pushRecentFile(pathCopy);
                     ui::plmAutoRecordSave(st, pathCopy);
+                    ui::boxMirrorNotifySave(st, pathCopy);
                     st.addLog("[doc] auto-saved: " + pathCopy);
                     st.toast(ui::ToastLevel::Info, "Saved " + pathBaseName(pathCopy));
 #ifdef __EMSCRIPTEN__

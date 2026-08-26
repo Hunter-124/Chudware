@@ -74,6 +74,10 @@ _RISK_OVERRIDES: dict[str, str] = {
     # Bug-Reports/) — the `submit_` prefix would auto-classify EXTERNAL
     # (network egress), which offline/local-only policies would refuse.
     "submit_bug_report": RISK_WRITE,
+    # box_sync uploads project files to Box.com — real network egress. The name
+    # matches no external prefix/suffix, so the WRITE default would let
+    # offline/local-only policies run it. box_status stays read via "_status".
+    "box_sync": RISK_EXTERNAL,
 }
 
 # Motion and safety classifications are explicit membership only. A newly added

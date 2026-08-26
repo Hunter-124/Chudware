@@ -481,6 +481,7 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
                 st.clearDrawingDirtyForSource(t.docId);   // the save embedded this part's drawings
                 st.pushRecentFile(t.path);
                 ui::plmAutoRecordSave(st, t.path);
+                ui::boxMirrorNotifySave(st, t.path);
                 return TabSaveResult::Saved;
             }
             st.addLog("[tabs] save failed for " + t.path + ": " + err);
@@ -493,6 +494,7 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
         if (!saved.empty()) {
             st.pushRecentFile(saved);
             ui::plmAutoRecordSave(st, saved);
+            ui::boxMirrorNotifySave(st, saved);
             return TabSaveResult::Saved;
         }
         return TabSaveResult::Cancelled;
@@ -526,6 +528,7 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
         st.addLog("[tabs] ecad saved -> " + saved);
         st.toast(ui::ToastLevel::Info, "Saved " + t.displayTitle());
         ui::plmAutoRecordSave(st, saved);
+        ui::boxMirrorNotifySave(st, saved);
         return TabSaveResult::Saved;
     }
 

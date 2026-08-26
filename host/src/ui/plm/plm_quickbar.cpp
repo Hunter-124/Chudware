@@ -281,6 +281,11 @@ void plmAutoRecordSave(AppState& st, const std::string& savedAbsPath) {
         st.toast(ui::ToastLevel::Warn, "Couldn't record history: " + h);
     });
 }
+void boxMirrorNotifySave(AppState& st, const std::string& savedAbsPath) {
+    if (!st.workerStarted || !st.settings.boxEnabled || savedAbsPath.empty()) return;
+    st.rpc.call("box_notify_save", nlohmann::json{{"path", savedAbsPath}},
+                [](const core::RpcResult&) {});
+}
 
 bool plmActiveDocPlmState(AppState& st, std::string& rev, std::string& lifecycle,
                           bool& dirty) {

@@ -802,6 +802,63 @@ def _plm_unlock(params: dict, _emit: Callable) -> dict:
     return remote_mod.plm_unlock(path, item_id, remote=remote)
 
 
+# ---- Box.com mirror (services/plm/box_mirror.py) ---------------------------
+
+_NO_BOX = {"ok": False, "reason": "no_box",
+           "hint": "the Box mirror is not available on this machine"}
+
+
+def _box_status(params: dict, _emit: Callable) -> dict:
+    """Box mirror status for the Settings → Integrations surface."""
+    try:
+        from services.plm import box_mirror
+    except ImportError:
+        return dict(_NO_BOX)
+    path = str((params or {}).get("path", "") or "") or None
+    try:
+        return box_mirror.status(path, live=bool((params or {}).get("live")))
+    except Exception as e:  # noqa: BLE001 — status must always answer
+        return {"ok": False, "reason": "internal", "hint": f"{type(e).__name__}: {e}"}
+
+
+def _box_sync(params: dict, _emit: Callable) -> dict:
+    """Mirror a project's saved files up to Box now (GUI 'Sync now')."""
+    try:
+        from services.plm import box_mirror
+    except ImportError:
+        return dict(_NO_BOX)
+    path = str((params or {}).get("path", "") or "")
+    if not path:
+        return {"ok": False, "reason": "bad_args",
+                "hint": "path (the project root) is required"}
+    try:
+        return box_mirror.sync_project(path)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": "internal", "hint": f"{type(e).__name__}: {e}"}
+
+
+def _box_notify_save(params: dict, _emit: Callable) -> dict:
+    """A document was saved from the GUI — spool its project, drain async."""
+    try:
+        from services.plm import box_mirror
+    except ImportError:
+        return dict(_NO_BOX)
+    box_mirror.notify_saved_path(str((params or {}).get("path", "") or ""))
+    return {"ok": True}
+
+
+def _box_oauth_login(params: dict, _emit: Callable) -> dict:
+    """Begin the loopback OAuth connect flow; returns ``{ok, authorize_url}``."""
+    try:
+        from services.plm import box_mirror
+    except ImportError:
+        return dict(_NO_BOX)
+    try:
+        return box_mirror.oauth_begin()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": "internal", "hint": f"{type(e).__name__}: {e}"}
+
+
 WORKER_METHODS = {
     "plm_open": _plm_open,
     "plm_status": _plm_status,
@@ -836,6 +893,11 @@ WORKER_METHODS = {
     "plm_sync": _plm_sync,
     "plm_lock": _plm_lock,
     "plm_unlock": _plm_unlock,
+    # Box.com mirror — Settings → Integrations + post-save notification
+    "box_status": _box_status,
+    "box_sync": _box_sync,
+    "box_notify_save": _box_notify_save,
+    "box_oauth_login": _box_oauth_login,
     # Git tab — real git / GitHub client
     "git_status": _git_status,
     "git_log": _git_log,

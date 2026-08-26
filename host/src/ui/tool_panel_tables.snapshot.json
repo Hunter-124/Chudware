@@ -9,6 +9,7 @@
   "gsl",
   "intake",
   "ledger",
+  "manufacture",
   "mission",
   "office",
   "org",
@@ -303,6 +304,23 @@
    "ledger_get",
    "ledger_note"
   ],
+  "manufacture": [
+   "mfg_approval_inspect",
+   "mfg_approval_propose",
+   "mfg_artifact_register",
+   "mfg_device_capability",
+   "mfg_device_describe",
+   "mfg_device_list",
+   "mfg_gate_report",
+   "mfg_journal_query",
+   "mfg_preflight_run",
+   "mfg_run_describe",
+   "mfg_run_list",
+   "mfg_telemetry_snapshot",
+   "request_mfg_abort",
+   "request_mfg_hold",
+   "request_mfg_run_start"
+  ],
   "mission": [
    "buildgraph_plan",
    "buildgraph_status",
@@ -362,6 +380,8 @@
    "vendors_health"
   ],
   "plm": [
+   "box_status",
+   "box_sync",
    "plm_add_remote",
    "plm_checkpoint",
    "plm_compare",
@@ -458,6 +478,7 @@
    "piping_verify_cfd",
    "run_cfd_accurate",
    "run_cfd_flow",
+   "run_fea_adaptive",
    "run_fea_buckling",
    "run_fea_contact",
    "run_fea_fatigue",
@@ -510,6 +531,8 @@
   "board_from_schematic": "ONE-CALL schematic -> preliminary PCB: sync footprints, place (connectivity-aware), autoroute, then (by default) optimize traces (arc …",
   "bom_price": "Roll up the BOM for `doc_path` AND resolve bought-line prices via the provider chain.",
   "bom_rollup": "Roll an assembly (+ any linked ECAD board) up into a unified made/bought BOM.",
+  "box_status": "Box.com mirror status: whether mirroring is enabled/connected, the connected account, pending spooled projects, and — when ``path`` (or the …",
+  "box_sync": "Mirror the project's saved files up to the configured Box.com folder now (uploads new/changed files; never downloads). Requires Box …",
   "buildgraph_plan": "Consume a BUILD PLAN, a dag/1 mission, or a plain description of the build, and return an aicad.buildgraph/1 graph.",
   "buildgraph_status": "Return the current node statuses of a buildgraph run.",
   "cad_graph": "Traverse the CAD project graph — dimensional links + assembly structure.",
@@ -717,9 +740,21 @@
   "measure_between": "Measure a face/edge — or the distance + angle BETWEEN two of them — in plain words.",
   "measure_from_photo": "Measure ONE in-plane dimension between two pixel points against a ChArUco fiducial.",
   "measure_part": "Mass properties of the current part: volume (mm^3), mass (g), centre of mass, inertia.",
+  "mfg_approval_inspect": "Inspect a frozen human approval or an unapproved proposal.",
+  "mfg_approval_propose": "Propose an UNAPPROVED binding for human review.",
+  "mfg_artifact_register": "Register and hash an immutable NC/G-code/print artifact.",
+  "mfg_device_capability": "Read all nine explicit capability truth levels for one device.",
+  "mfg_device_describe": "Describe one device identity, transport summary, and policy.",
+  "mfg_device_list": "List manufacturing devices and their truthful current lane state.",
+  "mfg_gate_report": "Read a seq-stamped Tier-0 and two-stage gate report by reference.",
+  "mfg_journal_query": "Query ordered manufacturing journal records and waiver rates.",
+  "mfg_preflight_run": "Build a draft run and its seq-stamped Tier-0/two-stage preflight.",
+  "mfg_run_describe": "Read one run's state, artifact, gate, approval, and initiator history.",
+  "mfg_run_list": "List durable run history, optionally filtered by device and state.",
+  "mfg_telemetry_snapshot": "Read one FreshValue-wrapped telemetry snapshot; gaps remain unknown.",
   "mission_start": "Plan a mission: validate the deliverable manifest and compile the role-assigned mission DAG (does NOT execute — call dag_run to run it).",
   "mission_status": "Render a mission's phase state from the ledger (pure read).",
-  "motion_fea_handoff": "Motion → static FEA handoff: \"is this link strong enough at the worst instant?\" in one call (aicad.simhandoff/1, coupling `motion_to_fea`).",
+  "motion_fea_handoff": "Motion → static FEA handoff for one isolated moving component.",
   "new_assembly": "Create a new, empty ASSEMBLY document and make it current. Returns its doc_id.",
   "new_part": "Create an editable part document named `name` and make it current.",
   "office_edit_csv": "Full-file rewrite (csv has no partial-edit primitive). Returns ``{ok, path, row_count}``.",
@@ -803,6 +838,9 @@
   "req_status": "Record a status transition on a requirement (e.g. verified/failed after a verifier runs).",
   "req_update": "Add or update content in a requirements document.",
   "req_verify_by_id": "Auto-verify a single requirement by running its named ``verify_by`` verifiers.",
+  "request_mfg_abort": "Request controlled run abort; it is not a safety-rated stop.",
+  "request_mfg_hold": "Request a software hold; it is not an E-stop or safety function.",
+  "request_mfg_run_start": "Request start; the arbiter alone revalidates and may refuse it.",
   "request_part_photos": "Ask the user for photos of a real part we have NO standard model for, so we can measure it.",
   "request_quote": "Request an on-demand manufacturing quote for a doc from an approved supplier API.",
   "request_raise": "Raise a worker request to the manager, orchestrator, or overseer.",
@@ -837,6 +875,7 @@
   "review_drawing": "Render a 2D DRAWING document to an image so you can SEE it and self-review.",
   "run_cfd_accurate": "HIGH-FIDELITY external-aero CFD via OpenFOAM (steady RANS, k-omega SST + prism layers).",
   "run_cfd_flow": "Wind-tunnel CFD over the current part/assembly (LBM). Returns drag, lift, Cd, Reynolds.",
+  "run_fea_adaptive": "Adaptive linear-static stress FEA for decision-driving peak stresses.",
   "run_fea_buckling": "Linear (eigenvalue) buckling via CalculiX (ccx subprocess) — critical load factor for slender members / thin panels.",
   "run_fea_contact": "Nonlinear (large-deflection) contact FEA via CalculiX (ccx subprocess) — for press-fits, snap-fits, stacked parts touching under load.",
   "run_fea_fatigue": "High-cycle fatigue life (S-N) on the current part — reuses the linear-static stress field, then applies mean-stress theory + Marin …",
@@ -862,7 +901,7 @@
   "show_in_app": "Push the current part to the OPEN Chudware desktop app's 3D viewport so the user can see it.",
   "sim_cancel": "Terminate a sim_run job's solver process (SIGTERM, then SIGKILL) and prove it died.",
   "sim_jobs": "List recent sim_run jobs (newest first) with their reconciled state and elapsed time. Jobs persist across agent turns, so this also shows …",
-  "sim_results": "Collect a sim_run job's results.",
+  "sim_results": "Collect a simulation job's results — from ANY tool that returned a job_id.",
   "sim_run": "Start an FEA solve in a SEPARATE PROCESS and return a job_id immediately.",
   "sim_status": "State of a sim_run job: queued|running|done|failed|cancelled, elapsed, progress.",
   "simulate_motion": "Kinematic motion study: DRIVE one mate over a range, re-solve the mechanism each step, return the trajectory (every body's pose per step) + …",
@@ -890,9 +929,9 @@
   "stage_set": "Override the inferred process stage (contract §1: ``stage_set``).",
   "start_capture_session": "Start a local photo-capture server. Returns QR code URL + upload instructions.",
   "stop_capture_session": "Stop the capture session and optionally run photogrammetry reconstruction.",
-  "struct_analyze": "Run member-force & deflection analysis on a structural document.",
-  "struct_check": "Demand/capacity ratio check for every member in a structural document.",
-  "struct_estimate": "Line-item cost estimate for a structural document (T-D5).",
+  "struct_analyze": "Run member-force and deflection analysis on a structural document.",
+  "struct_check": "Return preliminary strength and serviceability utilization by member.",
+  "struct_estimate": "Estimate structural material and installation costs from a dated rate table.",
   "submit_bug_report": "File a bug report for the user when something is broken on OUR side.",
   "submit_part_photos": "Register the user's real photo FILES and/or submit the measurements you read from them.",
   "suggest_dimension_scheme": "Propose which dimensions to drive in a sketch, with process-aware tolerances.",
@@ -981,6 +1020,12 @@
   },
   "bom_rollup": {
    "prompt_note": "Cheap local classification pass — run it before any pricing: made lines go to cam_cost_estimate, bought lines (with MPNs) to bom_price."
+  },
+  "box_status": {
+   "prompt_note": "Box.com mirror health: enabled/connected, the connected account, pending spooled projects, and the project's last sync/error. Call before box_sync to diagnose auth or backlog."
+  },
+  "box_sync": {
+   "prompt_note": "Uploads the project's saved files to the configured Box.com folder NOW (new/changed only, never downloads). Saves already mirror automatically when Box is enabled — reach for this only when the user asks to push or box_status shows pending/errors."
   },
   "buildgraph_plan": {
    "prompt_note": "Prefer this over dag_plan when the build steps are already known — deterministic, LLM-free; check advisories + interpreted first."
@@ -1213,7 +1258,7 @@
    "timeout_s": 600
   },
   "ecad_antenna_analyze": {
-   "prompt_note": "Default want_fullwave=True runs a real FDTD S11 sweep when openEMS is installed (minutes) — pass False for a fast analytic estimate; check em_status first.",
+   "prompt_note": "Always returns a closed-form resonance estimate. want_fullwave=True additionally uses openEMS only when installed; otherwise fullwave.skipped is evidence of no full-wave result, not PASS. Frequencies are Hz. Refine n_freq/max_timesteps and check the full-wave block before trusting S11.",
    "timeout_s": 600
   },
   "ecad_antenna_design": {
@@ -1340,18 +1385,18 @@
    "prompt_note": "Pins accept numbers or names from ecad_place_symbol's pin list; confirm the join in the returned net_members. For rails prefer ecad_add_power."
   },
   "em_driven": {
-   "prompt_note": "Analytic-uniform default is an ideal matched straight section — it shows no mismatch/discontinuities. solver='openems' for real full-wave (check em_status first); detail=True for full arrays.",
+   "prompt_note": "Uniform-guide default is analytic-uniform: ideal matched S21 propagation, not evidence for a discontinuity or antenna. Frequencies are GHz, length is mm. Call em_status before solver='openems'; absent openEMS returns ok:false/skipped. detail=True returns full S-parameter arrays.",
    "timeout_s": 600
   },
   "em_eigenmode": {
-   "prompt_note": "Needs standard='WR-90' or a waveguide JSON dict — empty cross-section errors. fdfd runtime grows with resolution (40..200 sane); follow with em_driven for S-params.",
+   "prompt_note": "Requires standard='WR-90' or waveguide JSON {shape,a_mm,b_mm,eps_r?}; default solver is builtin-fdfd. Frequencies are GHz in the result. Refine resolution and require TE10 error_vs_analytic_pct to settle before quoting cutoff; detail=True includes field data.",
    "timeout_s": 300
   },
   "em_status": {
-   "prompt_note": "EM preflight: call before planning a full-wave run — reports whether openEMS is installed and the default solver per analysis. Never fails."
+   "prompt_note": "Capability probe before requesting full-wave work. builtin-fdfd eigenmode and analytic-uniform driven/time-domain are expected built-ins; inspect solvers/defaults. openEMS installed=false means full-wave is unavailable, never a successful fallback."
   },
   "em_timedomain": {
-   "prompt_note": "For pulse delay/dispersion through a guide, not S-params (that's em_driven). f0_ghz/bw_ghz=0 auto-derives the band from cutoff; raw waveforms only with detail=True.",
+   "prompt_note": "Uniform-guide pulse delay/dispersion, not an S-parameter sweep. length is mm and f0_ghz/bw_ghz are GHz; zero values auto-derive a band. Default is analytic dispersive IFFT. Check em_status before openEMS; detail=True returns waveforms.",
    "timeout_s": 600
   },
   "enable_tools": {
@@ -1705,7 +1750,7 @@
    "param_defaults": {
     "limit": 500
    },
-   "prompt_note": "First row is always returned as header, never as data; default limit=0 reads ALL rows — pass a limit to peek at a large file."
+   "prompt_note": "First row is always returned as header, never as data; the effective default returns at most 500 data rows. Pass limit=0 explicitly only when you intend to read every row."
   },
   "office_read_doc": {
    "prompt_note": "Needs soffice/libreoffice on PATH (reason:converter_missing otherwise) — headless-converts to .docx in a tmp dir, then reads exactly like office_read_docx."
@@ -2044,38 +2089,38 @@
    "prompt_note": "SEE the sheet before refining or exporting — fix overlaps with set_view, add add_dimension/add_gdt, then review again in a loop."
   },
   "run_cfd_accurate": {
-   "prompt_note": "The trustworthy absolute Cd/Cl path — needs OpenFOAM and takes minutes. Always returns a job_id immediately; poll get_job. Start preset='coarse'."
+   "prompt_note": "OpenFOAM external-aero RANS; the tool capability-checks first and returns ok:false, skipped:true when unavailable. Always returns job_id when started; poll get_job. Inputs are velocity m/s, aoa degrees, fluid air|water. Start preset='coarse', then refine; only quote Cd/Cl when converged is true."
   },
   "run_cfd_flow": {
-   "prompt_note": "Directional LBM for A-vs-B trends, not certified Cd (use run_cfd_accurate). No material= argument — the medium is fluid='air'|'water'. Check min_feature_voxels >= ~8; background=True for cells>=120.",
+   "prompt_note": "Built-in directional LBM: velocity is m/s, aoa degrees, fluid is air|water; freestream +X and lift +Z. Check V² force scaling/dynamic pressure, but absolute Cd is uncalibrated. Require converged=true and min_feature_voxels>=~8, then refine cells; use run_cfd_accurate for absolute coefficients. background=True for cells>=120.",
    "timeout_s": 300
   },
   "run_fea_buckling": {
-   "prompt_note": "ccx box-proxy column, not the real geometry; lambda scales the applied load (lambda<1 means buckles). Needs CalculiX — absent ccx returns ok:false, skipped.",
+   "prompt_note": "CalculiX fixed-free BOX PROXY, not real CAD stress/buckling. Pass exactly one fixture face and one inward axial force in N on one load face; pressure, shear, and tension are rejected. lambda*applied_load is Pcr; lambda<1 fails. The tool returns ok:false, skipped:true when ccx is unavailable; compare euler_reference_pcr_n.",
    "timeout_s": 300
   },
   "run_fea_contact": {
-   "prompt_note": "ccx two-block proxy proving load transfer across an interface, not your actual contact pair; needs CalculiX. Use run_fea_static for real stresses.",
+   "prompt_note": "CalculiX TWO-BLOCK PROXY proving contact load transfer, not the document's actual contact pair. pressure_mpa must be finite and >0 MPa. Require base_reaction_n≈applied_load_n; ok:false or skipped:true means no verified contact result. Use run_fea_static for real-part stresses.",
    "timeout_s": 300
   },
   "run_fea_fatigue": {
-   "prompt_note": "Reuses the static stress field — pass the same fixtures/loads as run_fea_static. regime='infinite' means >1e6 cycles; compare the theories block.",
+   "prompt_note": "Runs real static FEA then S-N postprocessing. Needs the same mounted faces and non-zero N/MPa loads as run_fea_static plus material ultimate_mpa and endurance_mpa. State load_type/load_ratio, surface, reliability and theory; regime='infinite' means >1e6-cycle runout, not immortal. Refine the static mesh.",
    "timeout_s": 300
   },
   "run_fea_frequency_response": {
-   "prompt_note": "Modal-superposition vibration on the held part; without psd_breakpoints the random field degrades. Set vibration_spec for a pass/fail verdict.",
+   "prompt_note": "Base-excited modal superposition. fixtures must represent the mount; excitation_dir is a unit direction, base_accel_g is g, damping zeta is assumed, and material density drives Hz. Response peaks should align with returned modal Hz. PSD breakpoints are g²/Hz; no PSD means random.ok=false and no vibration_spec means verdict=null. Output is acceleration only, not stress/deflection.",
    "timeout_s": 300
   },
   "run_fea_modal": {
-   "prompt_note": "Fix the part like it is mounted — an unconstrained part returns rigid-body modes near 0 Hz. Density drives the frequencies, and it comes from material= (registry name or dict), not from set_material.",
+   "prompt_note": "Material density drives Hz. fixtures=[] is a legitimate free-free solve: expect six near-zero rigid-body modes before elastic modes; otherwise fix it exactly as mounted. Compare the first elastic mode to a justified beam/order anchor and across mesh_fineness presets; properties come from material=, never set_material.",
    "timeout_s": 300
   },
   "run_fea_static": {
-   "prompt_note": "Workhorse stress check; query_geometry first to confirm fixture/load faces resolve. Material properties enter HERE and only here: material='aluminum' (registry name) or material={'E_mpa':70000,'nu':0.33,'density_g_cm3':2.7,'yield_mpa':250}; set_material sets appearance only. min_fos>1 holds; background=True for fine meshes.",
+   "prompt_note": "Real-part linear static FEA. Confirm face queries first. fixtures must react a non-zero load: force vectors/magnitude are N, pressure is MPa; zero loads are refused and there is no gravity/self-weight term. An explicit material dict needs E_mpa, nu, and yield_mpa; named registry materials resolve them. set_material is appearance only. Repeat at a finer mesh and compare governing stress/deflection (<10% change) before PASS.",
    "timeout_s": 300
   },
   "run_fea_thermal": {
-   "prompt_note": "Steady state is a ccx box-proxy estimate; pass transient={t_end_s,...} for the real-mesh C++ solve with flux/convection schedules.",
+   "prompt_note": "Steady default is a CalculiX 1-D BOX PROXY: exactly one hot_faces and one cold_faces entry need {face,temperature °C}; temperatures must differ and loads are rejected. Compare mid_plane_T to the linear Fourier anchor; ccx absent returns SKIP. Steady needs conductivity_w_mk/k_w_mk in W/(m·K). transient={t_end_s,dt_s,...} uses the real tet mesh with flux_w_m2 or h_w_m2k/t_amb_c; flux-only heat-up is valid and needs conductivity, density_g_cm3, and cp_j_kgk/specific_heat_j_kgk in J/(kg·K).",
    "timeout_s": 300
   },
   "run_shell": {
@@ -2136,13 +2181,13 @@
    "prompt_note": "job_id from sim_run, after sim_status says done. partial=True returns whatever converged so far, clearly labelled — never quote a partial as a converged answer. partial=False on an unfinished job is refused rather than returning half a result."
   },
   "sim_run": {
-   "prompt_note": "Starts a CANCELLABLE background solve and returns a job_id immediately — use it instead of blocking when a solve may run minutes. analysis is 'fea_static' or 'fea_modal' ONLY; anything else is refused by name. Needs the same fixtures/loads as run_fea_static. Then: sim_status(job_id) until done, sim_results(job_id). Jobs persist, so a later turn can collect one."
+   "prompt_note": "Cancellable process job for analysis='fea_static' or 'fea_modal' ONLY. Static needs fixtures plus a non-zero loads list; modal takes the fixtures argument but fixtures=[] intentionally requests free-free modes and takes no loads. Poll sim_status, then sim_results; an unavailable/failed backend never becomes PASS."
   },
   "sim_status": {
    "prompt_note": "job_id from sim_run. Reports queued/running/done/failed/cancelled and is reconciled against the OS — it never says running for a dead worker. Poll this before sim_results; call sim_jobs() if you lost the id."
   },
   "simulate_motion": {
-   "prompt_note": "Drive an angle/distance mate (revolute/concentric have no value to sweep). Per-step interference dominates runtime — False for a fast pass.",
+   "prompt_note": "Kinematic sweep of one dimensional mate. stop is required; angle ranges are degrees, distance ranges mm, steps>=2. fixtures/loads do not apply. check_interference samples each step, so refine steps near first contact. dynamics={} adds inverse-dynamics reactions but not contact dynamics.",
    "timeout_s": 300
   },
   "sketch3d_add_constraints": {

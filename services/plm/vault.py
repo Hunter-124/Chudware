@@ -340,6 +340,11 @@ class Vault:
             except gitbind.ConcurrentUpdate:
                 continue  # HEAD advanced under us — rebuild against the new snapshot and retry
             _invalidate_dirty_cache(self.project_dir)
+            try:  # optional Box cloud mirror — spool-only, never blocks or fails a save
+                from services.plm import box_mirror
+                box_mirror.on_vault_saved(str(self.project_dir))
+            except Exception:  # noqa: BLE001
+                pass
             return {"commit": commit, "kind": kind,
                     "entry": self._entry_view(commit, self._bind.read_tree(commit), item_id)}
         raise VaultError("write_conflict",

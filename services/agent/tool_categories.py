@@ -473,6 +473,9 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "plm_graph_suggest",
         "plm_graph_watch",
         "plm_graph_configure",
+        # Box.com mirror — optional cloud copy of saved project files.
+        "box_sync",
+        "box_status",
     ],
     # Fluid power: hydraulic circuits + piping networks. Registry-tagged `sim`, which no
     # pack reaches by family and which the sim pack lists explicitly, so all 17 tools

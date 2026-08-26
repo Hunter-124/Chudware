@@ -693,6 +693,22 @@ void loadSettings(Settings& s) {
         if (auto it = j.find("recent_files"); it != j.end() && it->is_array())
             for (const auto& e : *it)
                 if (e.is_string()) s.recentFiles.push_back(e.get<std::string>());
+        // Box.com project mirror. Only GUI-owned fields are modeled here; OAuth tokens in
+        // box.auth stay on disk and are preserved by applyGuiOwnedSettings().
+        auto box = j.value("box", nlohmann::json::object());
+        if (box.is_object()) {
+            s.boxEnabled = box.value("enabled", false);
+            s.boxFolderId = box.value("folder_id", std::string("0"));
+            s.boxMaxFileMb = box.value("max_file_mb", 512);
+            auto auth = box.value("auth", nlohmann::json::object());
+            if (auth.is_object()) {
+                s.boxAuthMethod = auth.value("method", std::string("developer_token"));
+                s.boxDeveloperToken =
+                    auth.value("developer_token", std::string());
+                s.boxClientId = auth.value("client_id", std::string());
+                s.boxClientSecret = auth.value("client_secret", std::string());
+            }
+        }
 #ifdef __EMSCRIPTEN__
         // Web: prefer durable workspace recents when present (legacy path; IDBFS now holds config).
         {
@@ -877,13 +893,17 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     if (j.contains("keys") && j["keys"].is_object()) keysOut = j["keys"];
     nlohmann::json expOut = nlohmann::json::object();
     if (j.contains("experimental") && j["experimental"].is_object()) expOut = j["experimental"];
+    nlohmann::json boxOut = nlohmann::json::object();
+    if (j.contains("box") && j["box"].is_object()) boxOut = j["box"];
+    nlohmann::json boxAuthOut = nlohmann::json::object();
+    if (boxOut.contains("auth") && boxOut["auth"].is_object()) boxAuthOut = boxOut["auth"];
     // Erase GUI-owned keys that are conditionally emitted below, so stale values never linger
     // after the user clears them or switches provider. Unknown top-level keys survive untouched.
     // "keys" / "experimental" are re-emitted via merge-overlay (not a full replace).
     for (const char* k : {"provider", "model", "api_key", "openai", "llamacpp", "freellmapi",
                           "keys", "reasoning_effort", "max_output_tokens",
                           "context_window", "system_prompt", "appearance", "workspace_dir",
-                          "hidden_models", "disabled_providers", "experimental"})
+                          "hidden_models", "disabled_providers", "experimental", "box"})
         j.erase(k);
     if (s.provider == 4) {
         j["provider"] = "gemini";
@@ -1093,6 +1113,18 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     // Wave 3: File Explorer workspace + Recent files.
     if (!s.workspaceDir.empty()) j["workspace_dir"] = s.workspaceDir;
     j["recent_files"] = s.recentFiles;
+    // Box.com mirror. Merge-overlay both levels so Python-owned OAuth tokens and unknown
+    // future fields survive every GUI settings write.
+    boxOut["enabled"] = s.boxEnabled;
+    boxOut["folder_id"] = s.boxFolderId.empty() ? "0" : s.boxFolderId;
+    boxOut["max_file_mb"] = s.boxMaxFileMb;
+    boxAuthOut["method"] =
+        s.boxAuthMethod == "oauth" ? "oauth" : "developer_token";
+    boxAuthOut["developer_token"] = s.boxDeveloperToken;
+    boxAuthOut["client_id"] = s.boxClientId;
+    boxAuthOut["client_secret"] = s.boxClientSecret;
+    boxOut["auth"] = std::move(boxAuthOut);
+    j["box"] = std::move(boxOut);
     if (!s.hiddenModels.empty())
         j["hidden_models"] = std::vector<std::string>(s.hiddenModels.begin(), s.hiddenModels.end());
     if (!s.disabledProviders.empty())

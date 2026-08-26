@@ -658,3 +658,41 @@ def register_plm_tools(mcp: FastMCP) -> None:
                         str(out.get("hint") or ""))
         return _ok(item_id=item_id, remote_id=remote_id,
                    **{k: v for k, v in out.items() if k != "ok"})
+
+    # ------------------------------------------------------------------
+    # Box.com mirror (services/plm/box_mirror.py) — optional cloud copy of
+    # the project's saved files. Live edits stay local; Box is kept up to
+    # date by save-path hooks plus this manual surface.
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    @_with_project_path
+    def box_sync(path: str = "") -> str:
+        """Mirror the project's saved files up to the configured Box.com
+        folder now (uploads new/changed files; never downloads). Requires Box
+        mirroring to be enabled and connected in Settings → Integrations.
+        Returns ``{ok, projects:[{project, uploaded, updated, unchanged}]}``."""
+        try:
+            from services.plm import box_mirror
+        except ImportError:
+            return _err("no_box", "the Box mirror is not available on this machine")
+        out = box_mirror.sync_project(path)
+        if not out.get("ok"):
+            return _err(str(out.get("reason") or "internal"),
+                        str(out.get("hint") or "; ".join(out.get("errors") or [])))
+        return _ok(**{k: v for k, v in out.items() if k != "ok"})
+
+    @mcp.tool()
+    def box_status(path: str = "") -> str:
+        """Box.com mirror status: whether mirroring is enabled/connected, the
+        connected account, pending spooled projects, and — when ``path`` (or
+        the active project) resolves — that project's last sync/error.
+        Returns ``{ok, enabled, configured, connected?, account?, pending,
+        project?}``."""
+        try:
+            from services.plm import box_mirror
+        except ImportError:
+            return _err("no_box", "the Box mirror is not available on this machine")
+        resolved, _ = _resolve_project_path(path)
+        out = box_mirror.status(resolved, live=True)
+        return _ok(**{k: v for k, v in out.items() if k != "ok"})

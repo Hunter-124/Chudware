@@ -174,6 +174,183 @@ static void flushSystemPromptOverride(AppState& st, bool force) {
     if (!force && ImGui::GetTime() - s_spOverrideLastEdit < 1.0) return;
     commitSystemPromptOverride(st);
 }
+struct BoxMirrorUiState {
+    bool statusInFlight = false;
+    bool statusRefreshPending = false;
+    bool connectInFlight = false;
+    bool syncInFlight = false;
+    std::string accountStatus = "Status not checked";
+    std::string actionStatus;
+};
+static BoxMirrorUiState s_boxMirrorUi;
+
+static std::string boxJsonString(const nlohmann::json& j, const char* key) {
+    auto it = j.find(key);
+    return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
+}
+
+static long long boxJsonInteger(const nlohmann::json& j, const char* key) {
+    auto it = j.find(key);
+    if (it == j.end()) return 0;
+    if (it->is_number_unsigned()) return static_cast<long long>(it->get<unsigned long long>());
+    return it->is_number_integer() ? it->get<long long>() : 0;
+}
+
+static std::string boxFailureText(const nlohmann::json& result,
+                                  const std::string& fallback) {
+    for (const char* key : {"error", "reason", "hint"}) {
+        std::string text = boxJsonString(result, key);
+        if (!text.empty()) return text;
+    }
+    return fallback;
+}
+
+static void requestBoxStatus(AppState& st) {
+    if (s_boxMirrorUi.statusInFlight) {
+        s_boxMirrorUi.statusRefreshPending = true;
+        return;
+    }
+    if (!st.workerStarted) {
+        s_boxMirrorUi.accountStatus = "Not connected: worker unavailable";
+        return;
+    }
+    s_boxMirrorUi.statusInFlight = true;
+    st.rpc.call("box_status", nlohmann::json{{"live", true}},
+                [&st](const core::RpcResult& r) {
+        auto finish = [&st]() {
+            s_boxMirrorUi.statusInFlight = false;
+            if (s_boxMirrorUi.statusRefreshPending) {
+                s_boxMirrorUi.statusRefreshPending = false;
+                requestBoxStatus(st);
+            }
+        };
+        if (!r.ok) {
+            s_boxMirrorUi.accountStatus =
+                "Not connected: " + (r.err.empty() ? std::string("status unavailable") : r.err);
+            finish();
+            return;
+        }
+        const nlohmann::json& result = r.result;
+        if (!result.is_object() || !result.value("ok", true)) {
+            s_boxMirrorUi.accountStatus =
+                "Not connected: " + boxFailureText(result, "status unavailable");
+            finish();
+            return;
+        }
+        if (!result.value("enabled", false)) {
+            s_boxMirrorUi.accountStatus = "Disabled";
+            finish();
+            return;
+        }
+        if (!result.value("connected", false)) {
+            s_boxMirrorUi.accountStatus =
+                "Not connected: " + boxFailureText(result, "no Box account");
+            finish();
+            return;
+        }
+        std::string name;
+        std::string login;
+        auto account = result.find("account");
+        if (account != result.end() && account->is_object()) {
+            name = boxJsonString(*account, "name");
+            login = boxJsonString(*account, "login");
+        }
+        std::string who = !name.empty() ? name : (!login.empty() ? login : "Box account");
+        if (!name.empty() && !login.empty()) who += " (" + login + ")";
+        s_boxMirrorUi.accountStatus =
+            "Connected as " + who + " \xe2\x80\x94 " +
+            std::to_string(boxJsonInteger(result, "pending")) + " pending";
+        finish();
+    }, 20000);
+}
+
+static void beginBoxOAuthLogin(AppState& st) {
+    if (s_boxMirrorUi.connectInFlight || !st.workerStarted) return;
+    s_boxMirrorUi.connectInFlight = true;
+    s_boxMirrorUi.actionStatus = "Starting Box sign-in\xe2\x80\xa6";
+    st.rpc.call("box_oauth_login", nlohmann::json::object(),
+                [&st](const core::RpcResult& r) {
+        s_boxMirrorUi.connectInFlight = false;
+        if (!r.ok) {
+            s_boxMirrorUi.actionStatus =
+                "Box sign-in failed: " +
+                (r.err.empty() ? std::string("worker unavailable") : r.err);
+            requestBoxStatus(st);
+            return;
+        }
+        const nlohmann::json& result = r.result;
+        if (!result.is_object() || !result.value("ok", false)) {
+            s_boxMirrorUi.actionStatus =
+                "Box sign-in failed: " + boxFailureText(result, "unable to start OAuth");
+            requestBoxStatus(st);
+            return;
+        }
+        const std::string url = boxJsonString(result, "authorize_url");
+        const std::string hint = boxJsonString(result, "hint");
+        if (url.empty()) {
+            s_boxMirrorUi.actionStatus =
+                hint.empty() ? "Box sign-in did not return an authorization URL" : hint;
+        } else if (!ui::openExternalHttpUrl(url)) {
+            s_boxMirrorUi.actionStatus =
+                "Could not open the Box authorization URL in your browser";
+        } else {
+            s_boxMirrorUi.actionStatus =
+                hint.empty() ? "Browser opened; finish signing in to Box" : hint;
+        }
+        requestBoxStatus(st);
+    }, 20000);
+}
+
+static void beginBoxSync(AppState& st, const std::string& projectRoot) {
+    if (s_boxMirrorUi.syncInFlight || !st.workerStarted || projectRoot.empty()) return;
+    s_boxMirrorUi.syncInFlight = true;
+    s_boxMirrorUi.actionStatus = "Syncing project to Box\xe2\x80\xa6";
+    st.rpc.call("box_sync", nlohmann::json{{"path", projectRoot}},
+                [&st](const core::RpcResult& r) {
+        s_boxMirrorUi.syncInFlight = false;
+        if (!r.ok) {
+            s_boxMirrorUi.actionStatus =
+                "Box sync failed: " +
+                (r.err.empty() ? std::string("worker unavailable") : r.err);
+            requestBoxStatus(st);
+            return;
+        }
+        const nlohmann::json& result = r.result;
+        if (!result.is_object() || !result.value("ok", false)) {
+            s_boxMirrorUi.actionStatus =
+                "Box sync failed: " + boxFailureText(result, "sync failed");
+            requestBoxStatus(st);
+            return;
+        }
+        long long uploaded = 0;
+        long long updated = 0;
+        long long unchanged = 0;
+        long long skippedLarge = 0;
+        auto projects = result.find("projects");
+        if (projects != result.end() && projects->is_array()) {
+            for (const auto& project : *projects) {
+                if (!project.is_object()) continue;
+                uploaded += boxJsonInteger(project, "uploaded");
+                updated += boxJsonInteger(project, "updated");
+                unchanged += boxJsonInteger(project, "unchanged");
+                skippedLarge += boxJsonInteger(project, "skipped_large");
+            }
+        }
+        s_boxMirrorUi.actionStatus =
+            "Box sync complete: " + std::to_string(uploaded) + " uploaded, " +
+            std::to_string(updated) + " updated, " + std::to_string(unchanged) +
+            " unchanged, " + std::to_string(skippedLarge) + " skipped (large)";
+        auto errors = result.find("errors");
+        if (errors != result.end() && !errors->empty()) {
+            if (errors->is_string())
+                s_boxMirrorUi.actionStatus += " \xe2\x80\x94 " + errors->get<std::string>();
+            else if (errors->is_array())
+                s_boxMirrorUi.actionStatus +=
+                    " \xe2\x80\x94 " + std::to_string(errors->size()) + " error(s)";
+        }
+        requestBoxStatus(st);
+    }, 120000);
+}
 
 // A circled-"?" info chip that reveals a one-line explanation on hover — for discoverability
 // of the less-obvious settings (vision / plan mode / max iters / units). Drawn inline
@@ -5676,6 +5853,10 @@ const SettingsEntry kSettingsEntries[] = {
     { "IPS units",                "General",      1 },
     { "Workspace folder",         "General",      1 },
     { "Configurations",           "General",      1 },
+    { "Box.com mirror",           "General",      1 },
+    { "Mirror saved projects to Box", "General",  1 },
+    { "Box OAuth",                "General",      1 },
+    { "Sync now",                 "General",      1 },
     { "Engine routing",           "General",      1 },
     { "C++ core",                 "General",      1 },
     { "Performance profiler",     "General",      1 },
@@ -5827,10 +6008,28 @@ void drawSettingsModal(AppState& st, bool busy) {
     if (st.openSettingsTab >= 0 && !s_settingsOpen) { opening = true; s_settingsOpen = true; }
     // Workspace-folder edit buffer (General tab), reseeded from Settings on every open.
     static std::vector<char> s_wsBuf(512, 0);
+    // Box.com mirror edit buffers (General tab), also reseeded on every open so Cancel-less
+    // immediate persistence elsewhere can never leave stale secrets in the controls.
+    static std::vector<char> s_boxFolderBuf(256, 0);
+    static std::vector<char> s_boxDeveloperTokenBuf(1024, 0);
+    static std::vector<char> s_boxClientIdBuf(512, 0);
+    static std::vector<char> s_boxClientSecretBuf(1024, 0);
+    static int s_boxAuthMethod = 0;
     if (opening) {
         openOmpProviderModal();
         std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
         std::strncpy(s_wsBuf.data(), settings.workspaceDir.c_str(), s_wsBuf.size() - 1);
+        auto seedBoxBuffer = [](std::vector<char>& dst, const std::string& src) {
+            std::fill(dst.begin(), dst.end(), 0);
+            std::strncpy(dst.data(), src.c_str(), dst.size() - 1);
+        };
+        seedBoxBuffer(s_boxFolderBuf, settings.boxFolderId);
+        seedBoxBuffer(s_boxDeveloperTokenBuf, settings.boxDeveloperToken);
+        seedBoxBuffer(s_boxClientIdBuf, settings.boxClientId);
+        seedBoxBuffer(s_boxClientSecretBuf, settings.boxClientSecret);
+        s_boxAuthMethod = settings.boxAuthMethod == "oauth" ? 1 : 0;
+        s_boxMirrorUi.actionStatus.clear();
+        requestBoxStatus(st);
         // Make sure the glass engine reflects the persisted config before the Appearance
         // preview draws (idempotent — app startup wiring may already have pushed it).
         ui::setGlassConfig(settings.glassCfg);
@@ -6354,6 +6553,89 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
                 dimText("Root of the File Explorer and default save location (saved on Apply).");
 #endif
+                settingsSectionHeader("Box.com mirror");
+                if (ImGui::Checkbox("Mirror saved projects to Box", &settings.boxEnabled)) {
+                    saveSettings(settings);
+                    requestBoxStatus(st);
+                }
+                dimText("Saved project files are queued in the background; saves never wait for Box.");
+
+                ImGui::TextUnformatted("Folder ID");
+                ImGui::SetNextItemWidth(-1.0f);
+                ImGui::InputTextWithHint("##box_folder_id", "Box folder id (0 = All Files)",
+                                         s_boxFolderBuf.data(), s_boxFolderBuf.size());
+
+                ImGui::TextUnformatted("Auth method");
+                ImGui::SetNextItemWidth(-1.0f);
+                static const char* kBoxAuthMethods[] = {"developer_token", "oauth"};
+                ImGui::Combo("##box_auth_method", &s_boxAuthMethod, kBoxAuthMethods,
+                             (int)(sizeof(kBoxAuthMethods) / sizeof(kBoxAuthMethods[0])));
+
+                ImGui::TextUnformatted("Developer token");
+                ImGui::SetNextItemWidth(-1.0f);
+                ImGui::InputTextWithHint("##box_developer_token", "Box developer token",
+                                         s_boxDeveloperTokenBuf.data(),
+                                         s_boxDeveloperTokenBuf.size(),
+                                         ImGuiInputTextFlags_Password);
+
+                ImGui::TextUnformatted("Client ID");
+                ImGui::SetNextItemWidth(-1.0f);
+                ImGui::InputTextWithHint("##box_client_id", "Box OAuth client ID",
+                                         s_boxClientIdBuf.data(), s_boxClientIdBuf.size());
+
+                ImGui::TextUnformatted("Client secret");
+                ImGui::SetNextItemWidth(-1.0f);
+                ImGui::InputTextWithHint("##box_client_secret", "Box OAuth client secret",
+                                         s_boxClientSecretBuf.data(),
+                                         s_boxClientSecretBuf.size(),
+                                         ImGuiInputTextFlags_Password);
+
+                if (ImGui::Button("Apply##box", ImVec2(100.0f * sc, 0))) {
+                    settings.boxFolderId =
+                        s_boxFolderBuf[0] ? std::string(s_boxFolderBuf.data()) : std::string("0");
+                    settings.boxAuthMethod =
+                        s_boxAuthMethod == 1 ? "oauth" : "developer_token";
+                    settings.boxDeveloperToken = s_boxDeveloperTokenBuf.data();
+                    settings.boxClientId = s_boxClientIdBuf.data();
+                    settings.boxClientSecret = s_boxClientSecretBuf.data();
+                    saveSettings(settings);
+                    s_boxMirrorUi.actionStatus = "Box settings applied";
+                    requestBoxStatus(st);
+                }
+
+                const bool oauthLoginDisabled =
+                    settings.boxAuthMethod != "oauth" ||
+                    s_boxMirrorUi.connectInFlight || !st.workerStarted;
+                ImGui::BeginDisabled(oauthLoginDisabled);
+                if (ImGui::Button(s_boxMirrorUi.connectInFlight
+                                      ? "Connecting Box account\xe2\x80\xa6"
+                                      : "Connect Box account\xe2\x80\xa6"))
+                    beginBoxOAuthLogin(st);
+                ImGui::EndDisabled();
+                if (settings.boxAuthMethod != "oauth" &&
+                    ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Select the oauth auth method and Apply first");
+
+                ImGui::SameLine();
+                const bool syncDisabled =
+                    s_boxMirrorUi.syncInFlight || !st.workerStarted || !settings.boxEnabled;
+                ImGui::BeginDisabled(syncDisabled);
+                if (ImGui::Button(s_boxMirrorUi.syncInFlight ? "Syncing\xe2\x80\xa6" : "Sync now")) {
+                    const std::string projectRoot = st.plmProjectPath();
+                    if (projectRoot.empty())
+                        s_boxMirrorUi.actionStatus =
+                            "Box sync needs a current project or workspace folder";
+                    else
+                        beginBoxSync(st, projectRoot);
+                }
+                ImGui::EndDisabled();
+
+                std::string boxStatusLine = s_boxMirrorUi.accountStatus;
+                if (s_boxMirrorUi.statusInFlight) boxStatusLine = "Checking Box status\xe2\x80\xa6";
+                if (!s_boxMirrorUi.actionStatus.empty())
+                    boxStatusLine = s_boxMirrorUi.actionStatus + "  |  " + boxStatusLine;
+                dimText(boxStatusLine.c_str());
+
 
                 // Theme moved to the Appearance tab (the canonical control); engine routing +
                 // profiler are status/launchers, folded under one System section (audit P2).

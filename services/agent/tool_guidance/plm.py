@@ -164,6 +164,21 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "the edit is saved so teammates are not blocked."
         ),
     },
+    "box_sync": {
+        "prompt_note": (
+            "Uploads the project's saved files to the configured Box.com "
+            "folder NOW (new/changed only, never downloads). Saves already "
+            "mirror automatically when Box is enabled — reach for this only "
+            "when the user asks to push or box_status shows pending/errors."
+        ),
+    },
+    "box_status": {
+        "prompt_note": (
+            "Box.com mirror health: enabled/connected, the connected "
+            "account, pending spooled projects, and the project's last "
+            "sync/error. Call before box_sync to diagnose auth or backlog."
+        ),
+    },
     "plm_graph_brief": {
         "prompt_note": (
             "One-node dossier (identity, degree, edge kinds, neighbors) — "

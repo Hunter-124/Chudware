@@ -136,6 +136,15 @@ struct Settings {
     // Copilot composer mode: Agent | Plan | Swarm | Edit | Ask. Persisted as "copilot_mode".
     // Values match AppState::aiInteraction / CopilotMode.
     int copilotMode = 0;         // 0=Agent 1=Plan 2=Swarm 3=Edit 4=Ask 5=EngFirm
+    // Box.com project mirror. GUI-owned fields overlay config.json "box" / "box.auth";
+    // OAuth access/refresh tokens remain Python-owned and are never modeled here.
+    bool boxEnabled = false;
+    std::string boxFolderId = "0";
+    std::string boxAuthMethod = "developer_token";
+    std::string boxDeveloperToken;
+    std::string boxClientId;
+    std::string boxClientSecret;
+    int boxMaxFileMb = 512;
     int maxTokens = 0;           // max output tokens per model call; 0 = automatic (per-provider
                                  // default). Raise this if a reasoning model returns "no JSON ops"
                                  // / "budget exhausted" — it spent its output budget thinking.

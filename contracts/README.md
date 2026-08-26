@@ -29,6 +29,9 @@ freely but must not edit them. One owner per round per append-only file (see
   (quantity/tolerance/verdict) shapes; executable form `services/mcp/simhandoff.py`.
 - `cam.md` — CAM simulation frames, G-code audit, machine profiles, job diff
   (`aicad.cam_sim_frames/1`, `aicad.cam_audit/1`, `aicad.machines/1`, `aicad.cam_job_diff/1`).
+- `box_mirror.md` — optional Box.com cloud mirror of saved project files
+  (`aicad.box_mirror/1`): config ownership, spool/drain semantics, `box_*` tool
+  and worker-RPC envelopes.
 
 ## Agent-layer contracts (Pillar 20 / design pipeline)
 

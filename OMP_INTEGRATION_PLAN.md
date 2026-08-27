@@ -13,9 +13,10 @@ Detail + research live in `docs/omp-integration/` (`00-OPTIONS-AND-DECISIONS.md`
   seven runtime packages include `pi-agent-core`; prebuilt `pi-natives` comes from npm at the
   matching platform version.
 - **Bridge** `vendor/omp/bridge` — bun sidecar: `complete`, provider/model catalog,
-  `cost_summary`, `auth_*`, `memory_*`, `compact`, `shake`, and cache policy. Verified via
-  bun stdio against private OMP: 4,500 models and 78 providers, with pricing and
-  disabled-credential metadata complete.
+  `cost_summary`, `auth_*`, `memory_*`, `shake`, snap rendering, STT, and provider logos.
+  Verified via bun stdio against private OMP: 4,500 models and 78 providers, with pricing and
+  disabled-credential metadata complete. Speculative zero-caller compact/cache-warming RPCs
+  were deleted under YAGNI; platform APIs are added when a real consumer ships.
 - **First harness extraction** — private `pi-agent-core` owns shake selection/mutation and a
   product-neutral JSON adapter; CAD keeps only JSON-RPC and image-block conversion. The
   duplicated Python fenced/XML/tool-result algorithm and fake `artifact://shake` link are gone.

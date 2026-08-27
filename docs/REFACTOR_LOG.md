@@ -2754,6 +2754,12 @@ invented.
 saved ~9,734 tokens, and emitted no fake artifact URL. Existing CAD compaction/session-command
 tests pass unchanged apart from reversing the obsolete fake-link assertion: 25/25.
 
+**Bridge YAGNI sweep.** `warm_cache`, `cache_policy`, and the second `compact` engine had
+zero callers across services/core/host/scripts. Deleted both handler modules and the inline
+1-token warmer. The real `snap_render`, `shake`, memory, provider/auth/catalog, STT, and logo
+surfaces remain. A cache scheduler or second compaction contract returns only when a consumer
+and observable behavior ship with it.
+
 ---
 
 ## 2026-08-27 — OpenRouter transport is private-OMP-only

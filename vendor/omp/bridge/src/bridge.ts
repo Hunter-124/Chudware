@@ -29,15 +29,12 @@
  * auth_logout{provider,account?} | auth_begin_oauth{provider} | auth_oauth_poll{handle} |
  * auth_oauth_manual{handle,code} | auth_oauth_cancel{handle} | memory_remember{root,content,
  * kind?,source?,importance?} | memory_recall{root,query,limit?,tokenBudget?,kind?} |
- * memory_stats{root} | compact{messages,keepRecentTokens?,priorArchive?,mode?} |
- * shake{messages,aggressive?,keepBoundaryIndex?} |
+ * memory_stats{root} | shake{messages,aggressive?,keepBoundaryIndex?} |
  * snap_render{text,priorText?,modelId?,api?,maxFrames?,includeThinking?} |
- * stt_status | stt_start{model?,language?} | stt_stop | stt_cancel. Auth/model/
- * cost methods are implemented in the sibling json.ts/models.ts/auth-context.ts/oauth-flow.ts
- * modules; memory_* and compact live in memory.ts/compact.ts; shake is a thin JSON adapter
- * over private pi-agent-core's canonical compaction algorithm; snap_render lives in
- * snap-render.ts; stt_* reuses OMP's pi-natives AudioCapture + Whisper ASR approach under
- * ./stt/. All are wired in through dispatch() below.
+ * stt_status | stt_start{model?,language?} | stt_stop | stt_cancel. Auth/model/cost methods
+ * live in json.ts/models.ts/auth-context.ts/oauth-flow.ts; memory_* lives in memory.ts; shake
+ * is a thin JSON adapter over private pi-agent-core's canonical algorithm; snap_render lives
+ * in snap-render.ts; stt_* reuses OMP's pi-natives under ./stt/.
  *
  * NOTE: `stream().result()` resolves (does not throw) on provider HTTP errors — the error is
  * embedded in the returned AssistantMessage (stopReason:"error", errorStatus, errorMessage).
@@ -47,8 +44,8 @@
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
-import { stream, streamSimple } from "@oh-my-pi/pi-ai";
-import type { AssistantMessage, Context, Message, SimpleStreamOptions, StreamOptions } from "@oh-my-pi/pi-ai";
+import { streamSimple } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Context, Message, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import {
@@ -60,9 +57,7 @@ import {
 	handleAuthState,
 	handleAuthValidateKey,
 } from "./auth-context";
-import { handleCompact } from "./compact";
 import { handleSnapRender } from "./snap-render";
-import { handleCachePolicy } from "./cache";
 import { asObject, str, type Json } from "./json";
 import { handleMemoryRecall, handleMemoryRemember, handleMemoryStats } from "./memory";
 import { handleCostSummary, handleModelsList, invalidateLiveModelCache, modelInfo, resolveModel, type ProviderId } from "./models";
@@ -244,28 +239,6 @@ async function handleComplete(params: Json, notify: Notify): Promise<Json> {
 	return collapse(result);
 }
 
-async function handleWarmCache(params: Json): Promise<Json> {
-	const provider = str(params.provider);
-	const modelId = str(params.model);
-	if (!provider || !modelId) throw new Error("warm_cache requires provider and model");
-	const model = resolveModel(provider, modelId, params.baseUrl ? str(params.baseUrl) : undefined);
-	const context: Context = { messages: convertMessages(readMessages(params.messages)) };
-	const system = str(params.system);
-	if (system) context.systemPrompt = [system];
-	// 1-token completion: forces the provider to read (and thus refresh) the cached prefix at
-	// ~1/10 the cost of a full re-send. cacheHit reports whether the prefix was actually cached.
-	const options: StreamOptions = { maxTokens: 1 };
-	if (params.apiKey) options.apiKey = str(params.apiKey);
-	else {
-		const stored = await resolveAuthApiKey(provider);
-		if (stored) options.apiKey = stored;
-	}
-	const result = await stream(model, context, options).result();
-	const collapsed = collapse(result);
-	const usage = asObject(collapsed.usage);
-	const cacheRead = typeof usage.cacheRead === "number" ? usage.cacheRead : 0;
-	return { warmed: result.stopReason !== "error", cacheHit: cacheRead > 0, ...collapsed };
-}
 
 // Fetch a provider's brand icon (favicon) for the domain in `params.domain`, returned as
 // base64 so the C++ side can decode + upload a GL texture. Functional/nominative display of
@@ -312,10 +285,6 @@ async function dispatch(method: string, params: Json, notify: Notify): Promise<J
 		}
 		case "complete":
 			return handleComplete(params, notify);
-		case "warm_cache":
-			return handleWarmCache(params);
-		case "cache_policy":
-			return handleCachePolicy(params);
 		case "provider_logo":
 			return handleProviderLogo(params);
 		case "models_list":
@@ -376,8 +345,6 @@ async function dispatch(method: string, params: Json, notify: Notify): Promise<J
 			return handleMemoryRecall(params);
 		case "memory_stats":
 			return handleMemoryStats(params);
-		case "compact":
-			return handleCompact(params);
 		case "shake":
 			return handleShake(params);
 		case "snap_render":

@@ -152,9 +152,13 @@ judgment).
   not a termination guarantee. `start_idle_watchdog` is armed BEFORE `initialize()` and
   `_Exit(0)`s after `idle_secs` of no activity. Every `last = now` in that loop must go
   through `mark_activity()` or a live fetch looks idle. Spawning is single-flight
-  (`services/browser/cef_client.py` flock + re-probe): the worker forks per turn, so without
-  it every turn that found nothing listening minted another daemon — 193 were found alive at
-  once, 34 h old.
+  (`services/browser/cef_client.py`): an flock alone is not enough because the spawns are
+  SEQUENTIAL, minutes apart, each re-probing a socket a wedged daemon will never create — so
+  the lock file also records the spawned pid (`_daemon_alive` verifies it via
+  `/proc/<pid>/cmdline`) and a spawn is refused while that process lives. Without this, every
+  turn that found nothing listening minted another daemon: 193 were found alive at once, 34 h
+  old. Probe shape: 8 concurrent and 6 sequential spawners against a never-listening binary
+  must both yield exactly ONE process, and killing the incumbent must allow a replacement.
 - **GUI reconnect:** status bar shows a sticky unreachable chip; `engine_events` reconnects
   with backoff and re-bootstraps doc tabs on `reconnectGeneration` bump
   (`CHUDWARE_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.

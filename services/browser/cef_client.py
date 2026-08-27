@@ -81,21 +81,37 @@ def socket_path(cef_bin: Optional[Path]) -> Optional[str]:
     return str(Path(runtime) / "chudware" / f"cefd-{key}.sock")
 
 
+def _daemon_alive(pid: int, sock: str) -> bool:
+    """True if `pid` is a live `--cef-daemon` for THIS socket. Reads /proc rather than
+    trusting the number, so a recycled pid can never block a legitimate spawn."""
+    if pid <= 1:
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except OSError:
+        return False
+    return b"--cef-daemon" in argv and sock.encode() in argv
+
+
 def _spawn_daemon_detached(cef_bin: Path, sock: str, idle_s: int) -> None:
     """Launch the daemon so it outlives this client and self-manages via idle-exit.
     POSIX: start_new_session detaches; an orphaned child reparents to init.
 
-    SINGLE-FLIGHT. The agent worker is a fresh process per turn, so every turn that found
-    nothing listening used to spawn its own daemon — and if the previous one came up wedged
-    (Chromium's ProcessSingleton stalling CEF init is the measured cause), every later turn
-    spawned another on top. 193 of them were found alive at once. The flock makes at most one
-    spawn in flight per socket key, and the re-probe under the lock means the loser of the
-    race adopts the winner's daemon instead of minting a second one. The daemon's own
-    watchdog (cef_daemon.cpp) bounds how long a wedged instance survives.
-    """
+    AT MOST ONE LIVE DAEMON PER SOCKET KEY. The agent worker is a fresh process per turn, so
+    every turn that found nothing listening used to spawn its own daemon — and if the
+    previous one came up wedged (Chromium's ProcessSingleton stalling CEF init is the
+    measured cause) it never listened, so every later turn spawned another on top. 193 were
+    found alive at once, 34 h old.
+
+    An flock alone does not fix that: the spawns are SEQUENTIAL, minutes apart, and each one
+    re-probes a socket that will never exist. So the lock file also records the pid we
+    spawned, and a spawn is refused while that process is still alive — coming up slowly
+    (callers wait, correct) or wedged (its own watchdog force-exits it after idle_s, then
+    the next caller gets a fresh one). Self-healing and bounded either way."""
     lock_path = Path(sock).with_suffix(".spawn.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a+b") as lock:
+    with open(lock_path, "a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -109,13 +125,24 @@ def _spawn_daemon_detached(cef_bin: Path, sock: str, idle_s: int) -> None:
                 pass
             finally:
                 probe.close()
-            subprocess.Popen(
+            lock.seek(0)
+            try:
+                prior = int((lock.read() or "0").strip() or 0)
+            except ValueError:
+                prior = 0
+            if _daemon_alive(prior, sock):
+                return  # one is already up (starting, or wedged and about to self-exit)
+            proc = subprocess.Popen(
                 [str(cef_bin), "--cef-daemon", sock, str(idle_s)],
                 start_new_session=True,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            lock.seek(0)
+            lock.truncate()
+            lock.write(str(proc.pid))
+            lock.flush()
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 

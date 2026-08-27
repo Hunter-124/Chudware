@@ -180,13 +180,16 @@ def _cap(s: str | None, n: int) -> str | None:
 
 
 def _closest_recipe(request: str) -> dict:
-    """Deterministic recipe fallback (the safety net). TRANSITIONAL (T-RF20): the C++
-    ecad_closest_recipe RPC ports only 4 of the 5 recipes (core/ecad/recipes.cpp lacks
-    led_driver), and a wrong fallback recipe fails the VERIFY stage — so this stays on the
-    Python module until the port is complete. Needs-port gap tracked in docs/REFACTOR_LOG.md.
-    """
-    from services.ecad_design import recipes as recipes_mod  # STAYS: C++ port missing led_driver
-    return recipes_mod.closest_recipe(request)
+    """Return the native deterministic recipe, with a local last-resort safety net."""
+    try:
+        design = _rpc("ecad_closest_recipe", {"request": request})
+        required = ("name", "components", "nets", "study")
+        if not isinstance(design, dict) or not all(key in design for key in required):
+            raise TypeError("ecad_closest_recipe returned an invalid design")
+        return design
+    except Exception:  # noqa: BLE001 - an unavailable core must not break fallback planning
+        from services.ecad_design import recipes as recipes_mod
+        return recipes_mod.closest_recipe(request)
 
 def _catalog_lines() -> list[str]:
     """A COMPACT catalog of the simulatable starter parts (libid + pin numbers + a sim hint).

@@ -226,6 +226,7 @@
    "ecad_junction",
    "ecad_label",
    "ecad_lint_schematic",
+   "ecad_load_symbol_library",
    "ecad_make_board",
    "ecad_make_part",
    "ecad_netlist",
@@ -236,6 +237,7 @@
    "ecad_optimize_traces",
    "ecad_place_symbol",
    "ecad_plot",
+   "ecad_route_diff_pair",
    "ecad_route_pad_to_pad",
    "ecad_run_dfm",
    "ecad_run_drc",
@@ -673,6 +675,7 @@
   "ecad_junction": "Add an electrical junction at exact world ``(x, y)``.",
   "ecad_label": "Place a net label ``text`` at ``(x, y)``. Two labels of the same text+scope on a sheet merge their nets; ``scope='global'`` merges across …",
   "ecad_lint_schematic": "GEOMETRIC self-check of the active schematic — run this BEFORE ecad_run_erc.",
+  "ecad_load_symbol_library": "Load every symbol from a KiCad ``.kicad_sym`` library into the native catalog.",
   "ecad_make_board": "ONE-SHOT board flow: from the active schematic, run sync -> autoroute -> fill zones -> DRC and report every step's outcome, remaining …",
   "ecad_make_part": "CREATE a real library part — symbol + footprint — from a pinout YOU supply.",
   "ecad_netlist": "Read the compiled schematic netlist.",
@@ -683,6 +686,7 @@
   "ecad_optimize_traces": "Post-route polish on the active board (E2): round ~90° corners to arcs, add teardrops at pad/via junctions, and retune track widths toward …",
   "ecad_place_symbol": "Place a symbol on the active schematic and return its assigned REF plus its full PIN LIST (name/number/type/world-xy) and the count of pins …",
   "ecad_plot": "Plot the schematic to vector SVG or PDF and return confirmed artifact path(s).",
+  "ecad_route_diff_pair": "Route ONE differential pair without disturbing the rest of an already-routed board.",
   "ecad_route_pad_to_pad": "Route ONE copper trace between two pads by hand — the surgical complement to ecad_autoroute, and the tool autoroute's \"failed net\" report …",
   "ecad_run_dfm": "Run the Design-For-Manufacturing (DFM) check suite on the active board and return a readable summary grouped by rule (counts + worst …",
   "ecad_run_drc": "Run the Design Rule Check on the active board and return a summary with the worst offenders (clearance, track width, via size, annular …",
@@ -1429,6 +1433,9 @@
   "ecad_lint_schematic": {
    "prompt_note": "Drawing/bus self-check BEFORE ecad_run_erc, which catches electrical faults: symbol overlap, dangling ends, wires through bodies, floating labels, unresolved bus entries, bus labels without member wires, and unnamed buses. Names exact ids/xy/text; next action is fix each finding and rerun lint."
   },
+  "ecad_load_symbol_library": {
+   "prompt_note": "Escape hatch when the native catalog genuinely lacks a part and you were handed a vendor .kicad_sym file. Exact dialect: ecad_load_symbol_library(path). It registers every symbol in the file and reports the added libids. Do NOT reach for this to invent a part you have no file for — use ecad_make_part with a real pinout instead. Next: ecad_symbols to confirm the exact imported libid, then ecad_place_symbol."
+  },
   "ecad_make_board": {
    "prompt_note": "One-shot sync->route->fill->DRC from the active schematic (pass doc_id when several are open); hostcheck=True folds in the MCU rule pack.",
    "timeout_s": 300
@@ -1460,6 +1467,9 @@
   },
   "ecad_plot": {
    "prompt_note": "Produce the deliverable vector drawing. Exact dialect: ecad_plot(doc_id='', fmt='svg'|'pdf', path=None, sheet=None, title_block=True). It always writes confirmed artifact path(s); sheet=None plots all sheets. Next: include returned paths/bytes in the handoff."
+  },
+  "ecad_route_diff_pair": {
+   "prompt_note": "Routes ONE coupled pair on an already-routed board — use this instead of ecad_autoroute when you only need to add or redo a pair, since autoroute rips up every other net. Exact dialect: ecad_route_diff_pair(net_p, net_n, opts=None), opts keys diff_gap/length_tol/pitch/max_grid_cells/via_cost/bend_cost/min_clearance. Width comes from the net class — there is no width or layer option here. Never assume matching succeeded: read routed, then compare skew_mm against your length_tol and check coupled_pct. Next: ecad_run_drc."
   },
   "ecad_route_pad_to_pad": {
    "prompt_note": "Hand-routes the nets ecad_autoroute reported as failed. Needs from_ref/from_pad/to_ref/to_pad. The net is READ off the pads — pads on different nets are refused, never shorted. Width comes from the ecad_stackup_solve net class unless you pass width. Set to_layer to change layer and it inserts a via. Real tracks, so ecad_run_drc sees them."

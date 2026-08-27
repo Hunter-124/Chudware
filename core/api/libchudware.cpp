@@ -2765,11 +2765,29 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                         out_json, 0);
         }
         if (m == "sim_spice") {
-            // Native MNA circuit sim (engine/sim/circuit.py parity probe; linear DC for
-            // now). Params: {circuit:{...}, study:{...}}. Returns the sim.md result shape.
+            // Native MNA circuit sim. Params: {circuit:{...}, study:{...}, job_id?}.
+            // Returns the sim.md result shape.
+            //
+            // job_id makes the run cancellable: the solver polls the shared token at every
+            // unbounded loop head, so `sim_cancel {job_id}` stops it. This matters because the
+            // work is genuinely unbounded — a large transient reaches millions of timesteps and
+            // a Monte-Carlo study tens of thousands of full re-analyses — and the solve runs
+            // in-process, so an abandoned caller otherwise leaves it burning a core to
+            // completion. Omitting job_id still works and costs nothing; the run is then
+            // simply uncancellable. ecad_simulate registers its own scope, so only this raw
+            // doc-less path needs the guard here.
             const json& circ = params.contains("circuit") ? params["circuit"] : json::object();
             const json& study = params.contains("study") ? params["study"] : json::object();
-            return emit(chudware::sim::spice_simulate(circ, study), out_json, 0);
+            const std::string job_id = params.value("job_id", std::string());
+            chudware::sim::SimCancelToken token = chudware::sim::sim_job_register(job_id);
+            // Unregister on EVERY exit path, including the throwing one — a leaked
+            // registration would make a later run reusing the id cancel itself.
+            struct Unregister {
+                const std::string& id;
+                const chudware::sim::SimCancelToken& tok;
+                ~Unregister() { chudware::sim::sim_job_unregister(id, tok); }
+            } unregister{job_id, token};
+            return emit(chudware::sim::spice_simulate(circ, study, token), out_json, 0);
         }
         if (m == "sim_numpy_normal") {
             // DIAGNOSTIC: bit-exact-parity probe for the numpy RNG that drives the Monte-Carlo
@@ -4153,10 +4171,13 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                             out_json, 0);
             }
             if (m == "ecad_simulate") {
+                // job_id (optional) makes the solve cancellable via `sim_cancel {job_id}` —
+                // ecad_simulate owns the register/unregister scope internally. The GUI always
+                // passes one so a heavy study can be stopped instead of pinning a core.
                 json study = params.contains("study") ? params["study"] : json(nullptr);
                 json sim_params = params.contains("sim_params") ? params["sim_params"] : json(nullptr);
                 return emit(chudware::ecad::ecad_simulate(params.value("doc_id", std::string()), study,
-                                                       sim_params),
+                                                       sim_params, params.value("job_id", std::string())),
                             out_json, 0);
             }
             if (m == "ecad_to_3d") {
@@ -4177,9 +4198,41 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                                      json{{"reason", "wrong doc kind"}})
                                     .envelope(),
                                 out_json, 3);
-                return emit(chudware::ecad::board_to_3d_step(board, opts,
-                                                          params.value("path", std::string())),
-                            out_json, 0);
+                json to3d = chudware::ecad::board_to_3d_step(board, opts,
+                                                          params.value("path", std::string()));
+                // Mint (or append to `into_doc_id`) the CAD part document that carries the
+                // board as an `import` feature, and return its id. fab_outputs.md §5 always
+                // promised this; until now the RPC only wrote the STEP and every caller had
+                // to re-do the mint+import client-side, which meant a re-export spawned a
+                // second anonymous tab instead of updating the first.
+                //
+                // doc_import_file already IS the "mint-or-append, return doc_id" primitive
+                // (`into` empty -> new part session; otherwise append to that session), so
+                // this is a call, not a new capability. No publish sink is needed: ecad_to_3d
+                // is a top-level method, so DocRegistry::postCall's generic response-doc_id
+                // sniff registers the new doc exactly as it does for parts_make.
+                const std::string step_path = to3d.value("step_path", std::string());
+                if (!step_path.empty()) {
+                    try {
+                        json imported = chudware::doc::doc_import_file(
+                            step_path, params.value("into_doc_id", std::string()),
+                            /*as_solid=*/false, "step");
+                        const std::string part_doc_id = imported.value("doc_id", std::string());
+                        to3d["part_doc_id"] = part_doc_id;
+                        to3d["doc_id"] = part_doc_id;  // DocRegistry mint sniff
+                    } catch (const std::exception& ie) {
+                        // The STEP is already on disk and valid — a bad/closed `into_doc_id`
+                        // must degrade to "exported but not opened", never erase a successful
+                        // export. doc_import_file throws chudware::doc::OpError, a different
+                        // type than the chudware::ecad::OpError this branch's enclosing catch
+                        // handles, so it must be caught locally or it would surface as a flat
+                        // rc=1 "threw" envelope.
+                        to3d["part_doc_id"] = nullptr;
+                        to3d["warnings"].push_back(std::string("board exported to ") + step_path +
+                                                   " but opening it as a part failed: " + ie.what());
+                    }
+                }
+                return emit(std::move(to3d), out_json, 0);
             }
             if (m == "ecad_impedance")
                 return emit(chudware::ecad::ecad_impedance(params), out_json, 0);
@@ -4219,8 +4272,6 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("name", std::string()),
                                 params.contains("params") ? params["params"] : json::object()),
                             out_json, 0);
-            if (m == "ecad_recipes_all")
-                return emit(chudware::ecad::recipes::all_recipes(), out_json, 0);
             if (m == "ecad_closest_recipe")
                 return emit(chudware::ecad::recipes::closest_recipe(params.value("request", std::string())),
                             out_json, 0);

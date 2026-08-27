@@ -587,6 +587,118 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         return _dumps(payload)
 
 
+    # ------------------------------------------- surgical differential-pair routing
+
+    @mcp.tool()
+    def ecad_route_diff_pair(net_p: str, net_n: str,
+                             opts: Optional[Union[dict, str]] = None,
+                             doc_id: str = "") -> str:
+        """Route ONE differential pair without disturbing the rest of an already-routed board.
+
+        Use this instead of ``ecad_autoroute`` when adding or re-routing one pair on an
+        already-routed board, without ripping up other nets. ``net_p`` and ``net_n`` are the
+        exact board net names (for example ``USB_D+`` and ``USB_D-``).
+
+        Confirmed ``opts`` keys from the C++ router are: ``diff_gap`` (edge-to-edge pair gap,
+        mm), ``length_tol`` (maximum desired length skew, mm), ``pitch`` (routing-grid pitch,
+        mm), ``max_grid_cells``, ``via_cost``, ``bend_cost``, and ``min_clearance`` or
+        ``min_clearance_mm`` (clearance floor, mm). Track widths come from each net's class;
+        this entry point has no width or layer option. ``opts`` may be a mapping or a JSON
+        object string.
+
+        The response reports ``routed``, ``length_p``, ``length_n``, ``skew_mm``, and
+        ``coupled_pct``. Do not infer length matching merely from a successful RPC: inspect
+        ``routed`` and compare ``skew_mm`` with the requested ``length_tol``; ``coupled_pct``
+        states how much of the result remained parallel-coupled.
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Differential-pair routing needs an open board.",
+                        next_actions=["ecad_new_pcb('myboard')"])
+
+        pair = (str(net_p or "").strip(), str(net_n or "").strip())
+        if not pair[0] or not pair[1]:
+            return _err("net_p and net_n are both required",
+                        hint="Pass the exact two board net names, e.g. "
+                             "ecad_route_diff_pair('USB_D+', 'USB_D-').",
+                        next_actions=["ecad_status()  # inspect board nets"],
+                        board_changed=False)
+        if pair[0] == pair[1]:
+            return _err("net_p and net_n must name two different nets",
+                        hint="A differential pair needs distinct positive and negative nets.",
+                        next_actions=["ecad_status()  # inspect board nets"],
+                        board_changed=False)
+
+        raw_opts = opts
+        if isinstance(raw_opts, str):
+            try:
+                raw_opts = coerce_json_or_repr(raw_opts)
+            except (TypeError, ValueError, SyntaxError) as e:
+                return _err(f"opts must be a JSON object: {e}",
+                            hint='Use opts=\'{"diff_gap": 0.2, "length_tol": 0.1}\'.',
+                            board_changed=False)
+        if raw_opts is None:
+            route_opts = {}
+        elif isinstance(raw_opts, dict):
+            route_opts = raw_opts
+        else:
+            return _err(f"opts must be an object, got {type(raw_opts).__name__}",
+                        hint='Use opts={"diff_gap": 0.2, "length_tol": 0.1}.',
+                        board_changed=False)
+
+        try:
+            resp = _rpc("ecad_route_diff_pair",
+                        {"doc_id": session.doc_id, "net_p": pair[0], "net_n": pair[1],
+                         "opts": route_opts or {}})
+        except OpError as e:
+            return _err(f"differential-pair route failed: {e.message}",
+                        hint="Check that both names exactly match board nets with unrouted "
+                             "airwires, then retry with more room or a finer pitch.",
+                        next_actions=["ecad_status()  # inspect board nets and ratsnest",
+                                      f"ecad_route_diff_pair({pair[0]!r}, {pair[1]!r}, "
+                                      "opts={'pitch': 0.15})"],
+                        detail=getattr(e, "detail", {}), board_changed=False)
+
+        report = resp.get("report") or {}
+        routed = bool(report.get("routed", False))
+        skew = report.get("skew_mm")
+        coupled = report.get("coupled_pct")
+        reading = f"Pair {pair[0]}/{pair[1]}: status={'ok' if routed else 'failed'}"
+        if skew is not None:
+            reading += f", skew={float(skew):.3f}mm"
+        if coupled is not None:
+            reading += f", coupled={float(coupled):.0f}%"
+        if not routed:
+            reading += (". No pair was routed: verify both exact net names have unrouted "
+                        "airwires and that the board has enough free space.")
+
+        payload = {
+            "ok": routed,
+            "doc_id": session.doc_id,
+            "revision": resp.get("revision"),
+            "net_p": pair[0],
+            "net_n": pair[1],
+            "routed": routed,
+            "length_p": report.get("length_p", 0.0),
+            "length_n": report.get("length_n", 0.0),
+            "skew_mm": skew,
+            "coupled_pct": coupled,
+            "warnings": list(resp.get("warnings", [])),
+            "error": (None if routed else
+                      f"could not route differential pair {pair[0]}/{pair[1]}"),
+            "hint": reading,
+            "next_actions": (["ecad_run_drc()  # verify pair clearance",
+                              "render_board_ascii()  # inspect the routed pair"]
+                             if routed else
+                             ["ecad_status()  # verify exact net names and unrouted airwires",
+                              f"ecad_route_diff_pair({pair[0]!r}, {pair[1]!r}, "
+                              "opts={'pitch': 0.15})  # retry on a finer grid"]),
+        }
+        _attach_board_ascii_readback(payload, doc_id=session.doc_id)
+        return _dumps(payload)
+
+
     # ------------------------------------------------- manual (pad-to-pad) routing
 
     @mcp.tool()

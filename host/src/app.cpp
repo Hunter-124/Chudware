@@ -680,52 +680,188 @@ void ecadImportKiCadSchematic(AppState &st) {
     ecadOpenPath(st, path);
 }
 
-// The headline integration: export the current board to STEP, then IMPORT it
-// into a live CAD part document shown in the 3D viewport — the starting point
-// for designing an enclosure/housing around the board with the existing
-// modeling + interference tools.
+struct Ecad3dLinks {
+  std::map<std::string, std::string> partByBoard;
+};
+
+Ecad3dLinks &ecad3dLinks() {
+  static Ecad3dLinks links;
+  return links;
+}
+
+std::string ecadSafeStem(const std::string &value, const char *fallback) {
+  std::string stem;
+  stem.reserve(value.size());
+  for (unsigned char c : value) {
+    if (c == ' ')
+      stem.push_back('_');
+    else if (std::isalnum(c) || c == '_' || c == '-')
+      stem.push_back(static_cast<char>(c));
+  }
+  return stem.empty() ? std::string(fallback) : stem;
+}
+
+int cadTabForDoc(const AppState &st, const std::string &docId) {
+  for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+    const auto &tab = st.docTabs[i];
+    if ((tab.kind == AppState::DocTab::TabKind::Part ||
+         tab.kind == AppState::DocTab::TabKind::Assembly) &&
+        tab.docId == docId)
+      return i;
+  }
+  return -1;
+}
+
+bool ecadBoardTabOpen(const AppState &st, const std::string &docId) {
+  return std::any_of(st.docTabs.begin(), st.docTabs.end(),
+                     [&](const AppState::DocTab &tab) {
+                       return tab.kind == AppState::DocTab::TabKind::PCB &&
+                              tab.ecadDocId == docId;
+                     });
+}
+
+std::string ecadBoardPartStem(const AppState &st,
+                              const std::string &boardDocId) {
+  std::string title = ui::ecadEditorMirror().name();
+  for (const auto &tab : st.docTabs) {
+    if (tab.kind == AppState::DocTab::TabKind::PCB &&
+        tab.ecadDocId == boardDocId) {
+      title = tab.displayTitle();
+      break;
+    }
+  }
+  std::string tag = ecadSafeStem(boardDocId, "board");
+  if (tag.size() > 10)
+    tag.erase(0, tag.size() - 10);
+  return ecadSafeStem(title, "Board") + "_PCB_" + tag;
+}
+
+// The headline integration: export the current board to a board-specific STEP,
+// then activate the CAD part document minted (or updated) by ecad_to_3d.
 void ecadTo3d(AppState &st) {
   if (!ecadRequireKind(st, "pcb", "Board to 3D"))
     return;
+
+  const std::string boardDocId = st.ecadDocId;
+  auto &links = ecad3dLinks().partByBoard;
+  for (auto it = links.begin(); it != links.end();) {
+    if (!ecadBoardTabOpen(st, it->first))
+      it = links.erase(it);
+    else
+      ++it;
+  }
+
+  std::string intoDocId;
+  int partTab = -1;
+  auto linked = links.find(boardDocId);
+  if (linked != links.end()) {
+    partTab = cadTabForDoc(st, linked->second);
+    if (partTab >= 0)
+      intoDocId = linked->second;
+    else
+      links.erase(linked); // the user closed the 3D tab: mint afresh
+  }
+
   std::error_code ec;
   const std::string dir = appdataAppDir() + "/ecad_out";
   std::filesystem::create_directories(dir, ec);
-  const std::string step = dir + "/board.step";
+  const std::string partName = ecadBoardPartStem(st, boardDocId);
+  const std::string step = dir + "/" + partName + ".step";
   nlohmann::json res;
-  if (!ecadCall(st, "ecad_to_3d", {{"doc_id", st.ecadDocId}, {"path", step}},
+  if (!ecadCall(st, "ecad_to_3d",
+                {{"doc_id", boardDocId},
+                 {"path", step},
+                 {"into_doc_id", intoDocId}},
                 res))
     return;
+
   std::string stepPath = jstr(res, "step_path");
   if (stepPath.empty())
     stepPath = step;
-
-  // Bring the board into the CAD viewport as an `import` feature on a fresh
-  // part doc.
-  std::string err;
-  if (!st.docMirror.newPart(st.worker, err)) {
-    st.toast(ui::ToastLevel::Error, "ECAD 3D: new CAD part failed: " + err);
+  std::string partDocId = jstr(res, "part_doc_id");
+  if (partDocId.empty() && !intoDocId.empty()) {
+    // A daemon restart can retire the mapped worker document before the GUI
+    // receives its close event. Retry once without the stale target so a
+    // re-export mints a fresh tab instead of getting stuck on that id forever.
+    st.addLog("[ecad] linked 3D part " + intoDocId +
+              " unavailable; retrying with a fresh part");
+    nlohmann::json fresh;
+    if (ecadCall(st, "ecad_to_3d",
+                 {{"doc_id", boardDocId},
+                  {"path", step},
+                  {"into_doc_id", std::string()}},
+                 fresh)) {
+      res = std::move(fresh);
+      stepPath = jstr(res, "step_path");
+      if (stepPath.empty())
+        stepPath = step;
+      partDocId = jstr(res, "part_doc_id");
+    }
+  }
+  if (partDocId.empty()) {
+    links.erase(boardDocId);
+    ecadReportWarnings(st, res, "Board to 3D");
+    if (!res.contains("warnings") || res["warnings"].empty())
+      st.toast(ui::ToastLevel::Warn,
+               "Board STEP written to " + stepPath +
+                   ", but opening it as a CAD part failed");
+    st.addLog("[warn] [ecad] board STEP written but CAD import failed: " +
+              stepPath);
     return;
   }
-  st.clearViewportForNewDoc();
-  nlohmann::json ops = nlohmann::json::array();
-  ops.push_back(
-      {{"op", "add_feature"},
-       {"feature",
-        {{"type", "import"},
-         {"name", "PCB"},
-         {"params", {{"source_path", stepPath}, {"format", "step"}}}}}});
-  auto r = st.docMirror.applyOps(st.worker, ops);
-  if (r.ok && !r.aicm_path.empty()) {
-    std::string le;
-    st.loadDocMesh(r.aicm_path, le);
+
+  links[boardDocId] = partDocId;
+  partTab = cadTabForDoc(st, partDocId);
+  if (partTab >= 0)
+    st.switchToTab(partTab);
+  else
+    st.clearViewportForNewDoc();
+
+  std::string aicmPath;
+  std::string err;
+  const bool wasSuppressing = st.suppressTabDirty;
+  st.suppressTabDirty = true;
+  const bool activated =
+      st.docMirror.activate(st.worker, partDocId, aicmPath, err);
+  st.suppressTabDirty = wasSuppressing;
+  if (!activated) {
+    links.erase(boardDocId);
+    st.toast(ui::ToastLevel::Warn,
+             "Board STEP written to " + stepPath +
+                 ", but the imported CAD part could not be activated: " + err);
+    st.addLog("[warn] [ecad] board part activation failed: " + err);
+    return;
   }
+
+  if (partTab < 0) {
+    st.addDocTab(/*isAssembly=*/false);
+    partTab = st.activeTab;
+  }
+  if (partTab >= 0 && partTab < (int)st.docTabs.size())
+    st.docTabs[partTab].title = partName;
+
+  std::string loadError;
+  if (aicmPath.empty() || !st.loadDocMesh(aicmPath, loadError)) {
+    const std::string reason =
+        aicmPath.empty() ? std::string("the part returned no mesh")
+                         : loadError;
+    st.toast(ui::ToastLevel::Warn,
+             "Board imported, but its 3D preview could not be loaded: " +
+                 reason);
+    st.addLog("[warn] [ecad] board part mesh load failed: " + reason);
+    return;
+  }
+
+  ecadReportWarnings(st, res, "Board to 3D");
   st.wantFocusViewport =
       6; // surface the 3D view (force for a few frames so it sticks)
   st.toast(ui::ToastLevel::Info,
-           r.ok ? "Board imported into 3D - design the housing around it"
-                : "Board exported to STEP (CAD import failed)");
-  st.addLog("[ecad] board -> 3D part: " + stepPath);
+           "Board imported into " + partName +
+               " - design the housing around it");
+  st.addLog("[ecad] board " + boardDocId + " -> 3D part " + partDocId +
+            ": " + stepPath);
 }
+
 
 // AI-design an ECAD schematic from a natural-language request (the launchpad /
 // "AI Design" command): run the orchestrator (ecad_design) on the worker, then
@@ -874,12 +1010,59 @@ void ecadAiBoard(AppState &st, const std::string &request) {
 }
 
 // Native circuit simulation (ecad_simulate): build an analysis study from
-// st.ecadSimAnalysis (0=Transient, 1=AC), run it on the worker, and stash the
-// results payload so the ECAD plot panel renders the waveforms. Only schematic
-// docs simulate.
+// st.ecadSimAnalysis (0=Transient, 1=AC), run it away from the render thread,
+// and stash the results payload so the ECAD plot panel renders the waveforms.
+// Only schematic docs simulate.
+struct EcadSimRunState {
+  bool running = false;
+  bool cancelRequested = false;
+  std::string jobId;
+  std::string docId;
+  int analysis = 0;
+};
+
+EcadSimRunState &ecadSimRunState() {
+  static EcadSimRunState state;
+  return state;
+}
+
+std::string nextEcadSimJobId() {
+  static unsigned long long sequence = 0;
+  const auto tick = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+  return "ecad_sim_" + std::to_string(tick) + "_" +
+         std::to_string(++sequence);
+}
+
+bool ecadSimSourceStillActive(const AppState &st,
+                              const std::string &docId) {
+  const bool tabOpen =
+      std::any_of(st.docTabs.begin(), st.docTabs.end(),
+                  [&](const AppState::DocTab &tab) {
+                    return tab.kind == AppState::DocTab::TabKind::Schematic &&
+                           tab.ecadDocId == docId;
+                  });
+  const bool active = st.ecadDocId == docId &&
+                      ui::ecadEditorMirror().docId() == docId;
+  // The ECAD screenshot fixture intentionally adopts an un-tabbed document.
+  return active && (tabOpen || st.wantEcad);
+}
+
+bool ecadSimShotActive(const AppState &st) {
+  const char *kind = std::getenv("CHUDWARE_ECAD_KIND");
+  return st.wantEcad && kind && std::strcmp(kind, "sim") == 0;
+}
+
 void ecadSimulate(AppState &st) {
   if (!ecadRequireKind(st, "sch", "Simulation"))
     return;
+  auto &run = ecadSimRunState();
+  if (run.running) {
+    st.toast(ui::ToastLevel::Info, "A circuit simulation is already running");
+    return;
+  }
+
   nlohmann::json study;
   if (st.ecadSimAnalysis == 1) {
     study = {{"analyses",
@@ -892,41 +1075,146 @@ void ecadSimulate(AppState &st) {
     study = {
         {"analyses", {{{"type", "tran"}, {"tstep", 5e-5}, {"tstop", 5e-3}}}}};
   }
+
+  run.running = true;
+  run.cancelRequested = false;
+  run.jobId = nextEcadSimJobId();
+  run.docId = st.ecadDocId;
+  run.analysis = st.ecadSimAnalysis;
+  const std::string docId = run.docId;
+  const std::string jobId = run.jobId;
+  const int analysis = run.analysis;
+  st.status = analysis == 1 ? "Running circuit AC simulation..."
+                            : "Running circuit transient simulation...";
+  st.statusKind = 0;
+  st.addLog("[ecad] simulate " +
+            std::string(analysis == 1 ? "ac" : "tran") + " started (" +
+            jobId + ")");
+
+  st.rpc.call(
+      "ecad_simulate",
+      {{"doc_id", docId}, {"study", study}, {"job_id", jobId}},
+      [&st, docId, jobId, analysis](const core::RpcResult &r) {
+        auto &finished = ecadSimRunState();
+        if (!finished.running || finished.jobId != jobId)
+          return;
+        finished.running = false;
+        finished.cancelRequested = false;
+
+        const bool sourceActive = ecadSimSourceStillActive(st, docId);
+        const bool cancelled =
+            r.ok && r.result.is_object() &&
+            r.result.value("cancelled", false);
+        if (cancelled) {
+          st.addLog("[ecad] simulation cancelled (" + jobId + ")");
+          if (sourceActive) {
+            st.status = "Circuit simulation cancelled";
+            st.statusKind = 1;
+            st.toast(ui::ToastLevel::Info, "Circuit simulation cancelled");
+          }
+          return;
+        }
+
+        if (!r.ok || !r.result.is_object() ||
+            r.result.contains("code") ||
+            !r.result.value("ok", true)) {
+          const std::string error =
+              r.ok && r.result.is_object()
+                  ? r.result.value(
+                        "error",
+                        r.result.value(
+                            "message",
+                            r.result.value("hint",
+                                           std::string("simulation failed"))))
+                  : (r.err.empty() ? std::string("simulation returned no result")
+                                   : r.err);
+          st.addLog("[err] [ecad] simulate " + jobId + ": " + error);
+          if (sourceActive) {
+            st.status = "Circuit simulation failed";
+            st.statusKind = 2;
+            st.toast(ui::ToastLevel::Error, "Simulate: " + error);
+          }
+          return;
+        }
+
+        if (!sourceActive) {
+          st.addLog("[ecad] simulation result ignored because source document " +
+                    docId + " is no longer active");
+          return;
+        }
+
+        st.ecadSimResults =
+            r.result.contains("results") ? r.result["results"]
+                                         : nlohmann::json::object();
+        const bool converged = jbool(r.result, "converged");
+        if (converged) {
+          st.status = "Circuit simulation complete";
+          st.statusKind = 0;
+          st.toast(ui::ToastLevel::Info,
+                   analysis == 1 ? "Simulated (AC)"
+                                 : "Simulated (transient)");
+        } else {
+          st.status = "Circuit simulation needs review";
+          st.statusKind = 1;
+          st.toast(ui::ToastLevel::Warn,
+                   "Simulation ran, but convergence warnings need review");
+        }
+        std::string line =
+            "[ecad] simulate " +
+            std::string(analysis == 1 ? "ac" : "tran") +
+            (converged ? " converged" : " not converged");
+        if (r.result.contains("convergence"))
+          line += " " + r.result["convergence"].dump();
+        if (r.result.contains("ms") && !r.result["ms"].is_null())
+          line += " " + r.result["ms"].dump() + "ms";
+        st.addLog(line);
+        if (!converged && r.result.contains("log") &&
+            r.result["log"].is_array() && !r.result["log"].empty())
+          st.addLog("[ecad] sim log: " + r.result["log"].back().dump());
+        if (ecadSimShotActive(st)) {
+          std::printf("[ecad-shot] sim results present=%d\n",
+                      (int)(st.ecadSimResults.is_object() &&
+                            !st.ecadSimResults.empty()));
+          std::fflush(stdout);
+        }
+      },
+      24 * 60 * 60 * 1000);
+}
+
+void ecadCancelSimulation(AppState &st) {
+  auto &run = ecadSimRunState();
+  if (!run.running || run.cancelRequested || run.jobId.empty())
+    return;
+  run.cancelRequested = true;
+  st.status = "Stopping circuit simulation...";
+  st.statusKind = 1;
+
   nlohmann::json res;
   std::string err;
-  if (!st.worker.call("ecad_simulate",
-                      {{"doc_id", st.ecadDocId}, {"study", study}}, res, err)) {
-    st.toast(ui::ToastLevel::Error, std::string("Simulate failed: ") + err);
+  // WorkerClient intentionally lets C++ sim_cancel bypass the mutex held by
+  // the long ecad_simulate call, so this control RPC cannot queue behind the
+  // work it is meant to stop.
+  const bool called =
+      st.worker.call("sim_cancel", {{"job_id", run.jobId}}, res, err, 10000);
+  const bool accepted =
+      called && res.is_object() && !res.contains("code") &&
+      res.value("ok", false) && res.value("cancelled", false);
+  if (accepted) {
+    st.addLog("[ecad] cancellation requested (" + run.jobId + ")");
     return;
   }
-  if (!jbool(res, "ok")) {
-    st.toast(ui::ToastLevel::Error, "Simulate: " + jstr(res, "error"));
-    return;
-  }
-  st.ecadSimResults =
-      res.contains("results") ? res["results"] : nlohmann::json::object();
-  const bool converged = jbool(res, "converged");
-  if (converged) {
-    st.toast(ui::ToastLevel::Info, st.ecadSimAnalysis == 1
-                                       ? "Simulated (AC)"
-                                       : "Simulated (transient)");
-  } else {
-    st.toast(ui::ToastLevel::Warn,
-             "Simulation ran, but convergence warnings need review");
-  }
-  std::string line = "[ecad] simulate " +
-                     std::string(st.ecadSimAnalysis == 1 ? "ac" : "tran") +
-                     (converged ? " converged" : " not converged");
-  if (res.contains("convergence"))
-    line += " " + res["convergence"].dump();
-  if (res.contains("ms") && !res["ms"].is_null())
-    line += " " + res["ms"].dump() + "ms";
-  st.addLog(line);
-  if (!converged && res.contains("log") && res["log"].is_array() &&
-      !res["log"].empty()) {
-    st.addLog("[ecad] sim log: " + res["log"].back().dump());
-  }
+
+  run.cancelRequested = false;
+  const std::string reason =
+      !called ? (err.empty() ? std::string("cancel request failed") : err)
+              : res.value("message",
+                          std::string("solver is still starting; try again"));
+  st.status = "Circuit simulation still running";
+  st.statusKind = 1;
+  st.toast(ui::ToastLevel::Warn, "Could not cancel simulation: " + reason);
+  st.addLog("[warn] [ecad] sim_cancel " + run.jobId + ": " + reason);
 }
+
 
 struct EcadCommandDialogs {
   bool aiPromptRequested = false;
@@ -1112,6 +1400,34 @@ void ecadDrawCommandDialogs(AppState &st) {
       ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
   }
+  auto &sim = ecadSimRunState();
+  if (sim.running && !ecadSimShotActive(st)) {
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(390.0f), 0.0f),
+                             ImGuiCond_Always);
+    if (ImGui::Begin("Circuit Simulation##ecad_sim_progress", nullptr,
+                     ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoCollapse |
+                         ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoMove)) {
+      ImGui::TextUnformatted(sim.cancelRequested
+                                 ? "Stopping the circuit solver..."
+                                 : "Circuit simulation is running...");
+      ImGui::TextDisabled("The editor remains responsive while it solves.");
+      ImGui::Spacing();
+      if (sim.cancelRequested)
+        ImGui::BeginDisabled();
+      if (ImGui::Button(sim.cancelRequested ? "Stopping..."
+                                            : "Cancel simulation",
+                        ImVec2(ui::metrics::px(150.0f), 0.0f)))
+        ecadCancelSimulation(st);
+      if (sim.cancelRequested)
+        ImGui::EndDisabled();
+    }
+    ImGui::End();
+  }
+
 }
 
 // Route every ECAD ribbon command. Entity-placement commands arm the shared
@@ -2645,11 +2961,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   std::strncpy(st.spBuf.data(), st.settings.systemPrompt.c_str(),
                st.spBuf.size() - 1);
 
-  // Wave 3 (GUI rework): seed the File Explorer's live state from persisted
-  // settings and ensure the workspace directory exists (default
-  // <Documents>/Chudware). recentFiles/workspaceDir are the live copies the
-  // Explorer + File menu read; pushRecentFile() mirrors changes back into
-  // settings.
+  // Seed live Explorer/Project Hub state from persisted Settings. Recents are
+  // mirrored here once, then pushRecentFile/pushRecentProject keep both copies
+  // synchronized.
   st.recentFiles = st.settings.recentFiles;
   st.recentProjects = st.settings.recentProjects;
   st.workspaceDir = st.settings.workspaceDir;
@@ -6217,14 +6531,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                       after, st.ecadRevision);
         }
         if (wantSim) {
-          // Run the sim now (blocking) so the screenshot captures the plotted
-          // curve. The panel pops the Simulation tab forward the frame
-          // ecadSimResults first appears.
+          // Queue the simulation off the render thread. The ECAD shot capture
+          // gate below waits explicitly for ecadSimRunState().running to clear,
+          // so the plotted curve is fully settled before the PNG is written.
           ecadSimulate(st);
-          std::printf("[ecad-shot] sim results present=%d\n",
-                      (int)(st.ecadSimResults.is_object() &&
-                            !st.ecadSimResults.empty()));
+          std::printf("[ecad-shot] sim queued\n");
         }
+
         std::fflush(stdout);
       }
     }
@@ -6462,13 +6775,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           std::string ext = std::filesystem::path(path).extension().string();
           std::transform(ext.begin(), ext.end(), ext.begin(),
                          [](unsigned char c) { return (char)std::tolower(c); });
-          const bool isDrawing = (ext == ".draw+");
           const bool isEcad = (ext == ".ecad+" || ext == ".ecad" ||
                                ext == ".kicad_sch" || ext == ".kicad_pcb");
           if (isEcad) {
             ecadOpenPath(st, path); // records Recent itself
           } else if (ui::featureTreeOpenPath(st, path)) {
-            st.pushRecentFile(path);
             // ITEM 13: queue Zoom-to-Fit for THIS doc's first real display,
             // even if the viewport isn't drawn this frame (e.g. Parts Library
             // workspace focused).
@@ -7868,6 +8179,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if (st.wantEcad) {
       if (!st.ecadShotDone)
         shotFrame = 150; // worker + design
+      else if (ecadSimShotActive(st) && ecadSimRunState().running)
+        shotFrame = 99999; // deterministic sim shot: wait for async completion
       else if (st.wantFocusViewport > 0 || st.wantFocusEcad > 0)
         shotFrame = 99999; // let focus settle
       else

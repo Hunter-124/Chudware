@@ -113,6 +113,17 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "in the handoff."
         ),
     },
+    "ecad_load_symbol_library": {
+        "prompt_note": (
+            "Escape hatch when the native catalog genuinely lacks a part and "
+            "you were handed a vendor .kicad_sym file. Exact dialect: "
+            "ecad_load_symbol_library(path). It registers every symbol in the "
+            "file and reports the added libids. Do NOT reach for this to "
+            "invent a part you have no file for — use ecad_make_part with a "
+            "real pinout instead. Next: ecad_symbols to confirm the exact "
+            "imported libid, then ecad_place_symbol."
+        ),
+    },
     "ecad_symbols": {
         "prompt_note": (
             "Native catalog discovery; use this instead of guessing libids. "
@@ -141,6 +152,19 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "no pins means refusal. Pin type must be the exact KiCad enum — "
             "'power'/'vcc'/'gnd' are refused as ambiguous, use power_in or "
             "power_out. Then ecad_place_symbol by the returned libid."
+        ),
+    },
+    "ecad_route_diff_pair": {
+        "prompt_note": (
+            "Routes ONE coupled pair on an already-routed board — use this "
+            "instead of ecad_autoroute when you only need to add or redo a "
+            "pair, since autoroute rips up every other net. Exact dialect: "
+            "ecad_route_diff_pair(net_p, net_n, opts=None), opts keys "
+            "diff_gap/length_tol/pitch/max_grid_cells/via_cost/bend_cost/"
+            "min_clearance. Width comes from the net class — there is no "
+            "width or layer option here. Never assume matching succeeded: "
+            "read routed, then compare skew_mm against your length_tol and "
+            "check coupled_pct. Next: ecad_run_drc."
         ),
     },
     "ecad_route_pad_to_pad": {

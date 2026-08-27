@@ -1,6 +1,6 @@
-// DRC + ratsnest implementation — see drc.h. Mirrors engine/ecad/drc.py exactly:
-// geometry utilities, shape abstraction, the rule catalog, ratsnest MST, and the
-// final deterministic violation ordering. OCCT-free; pure JSON/geometry.
+// DRC + ratsnest implementation — see drc.h. OCCT-free, pure JSON/geometry:
+// normalized copper shapes (including conservative arc capsules), filled-zone
+// polygon checks, the rule catalog, ratsnest MST, and deterministic ordering.
 
 #include "ecad/drc.h"
 
@@ -51,6 +51,10 @@ double clamp01(double t) { return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t); }
 
 double dist(const Point& a, const Point& b) {
     return std::hypot(a.first - b.first, a.second - b.second);
+}
+
+int arc_segment_count(double a0, double a1) {
+    return std::max(8, static_cast<int>(std::abs(a1 - a0) / (kPi / 18.0)));
 }
 
 double point_seg_dist(const Point& p, const Point& a, const Point& b) {
@@ -243,14 +247,65 @@ bool track_shape(const json& t, Shape& out) {
     out.kind = "seg";
     out.net = t.contains("net") ? t["net"] : json(nullptr);
     out.layers.clear();
-    if (t.contains("layer") && t["layer"].is_string()) out.layers.insert(t["layer"].get<std::string>());
-    else if (t.contains("layer") && t["layer"].is_null()) out.layers.insert(std::string());  // {None}
+    if (t.contains("layer") && t["layer"].is_string())
+        out.layers.insert(t["layer"].get<std::string>());
+    else if (t.contains("layer") && t["layer"].is_null())
+        out.layers.insert(std::string());  // {None}
     out.item_id = t.value("id", std::string());
     out.p1 = p1;
     out.p2 = p2;
     out.margin = width / 2.0;
     out.loc = {(p1.first + p2.first) / 2.0, (p1.second + p2.second) / 2.0};
     return true;
+}
+
+void emit_track_shapes(const json& t, std::vector<Shape>& out) {
+    const std::string kind = t.value("kind", std::string("segment"));
+    if (kind == "segment") {
+        Shape shape;
+        if (track_shape(t, shape)) out.push_back(std::move(shape));
+        return;
+    }
+    if (kind != "arc") return;
+
+    Point center{0, 0};
+    Point p1{0, 0};
+    if (t.contains("center") && t["center"].is_array())
+        center = {getf(t["center"][0]), getf(t["center"][1])};
+    if (t.contains("p1") && t["p1"].is_array())
+        p1 = {getf(t["p1"][0]), getf(t["p1"][1])};
+    double radius = dist(center, p1);
+    if (radius <= kEps && t.contains("radius")) radius = std::abs(getf(t["radius"]));
+    const double a0 = getf(t.contains("a0") ? t["a0"] : json(0.0)) * kPi / 180.0;
+    const double a1 = getf(t.contains("a1") ? t["a1"] : json(0.0)) * kPi / 180.0;
+    const int count = arc_segment_count(a0, a1);
+    const double step = (a1 - a0) / count;
+    const double sagitta = radius * (1.0 - std::cos(std::abs(step) / 2.0));
+    const double margin =
+        getf(t.contains("width") ? t["width"] : json(0.0)) / 2.0 + sagitta;
+
+    Point previous{center.first + radius * std::cos(a0),
+                   center.second + radius * std::sin(a0)};
+    for (int i = 1; i <= count; ++i) {
+        const double angle = a0 + step * i;
+        Point current{center.first + radius * std::cos(angle),
+                      center.second + radius * std::sin(angle)};
+        Shape shape;
+        shape.kind = "seg";
+        shape.net = t.contains("net") ? t["net"] : json(nullptr);
+        if (t.contains("layer") && t["layer"].is_string())
+            shape.layers.insert(t["layer"].get<std::string>());
+        else if (t.contains("layer") && t["layer"].is_null())
+            shape.layers.insert(std::string());
+        shape.item_id = t.value("id", std::string());
+        shape.p1 = previous;
+        shape.p2 = current;
+        shape.margin = margin;
+        shape.loc = {(previous.first + current.first) / 2.0,
+                     (previous.second + current.second) / 2.0};
+        out.push_back(std::move(shape));
+        previous = current;
+    }
 }
 
 void via_shape(const json& v, Shape& out) {
@@ -289,10 +344,7 @@ std::vector<Shape> copper_shapes(const json& board) {
         }
     }
     if (board.contains("tracks") && board["tracks"].is_array()) {
-        for (const auto& t : board["tracks"]) {
-            Shape s;
-            if (track_shape(t, s)) shapes.push_back(std::move(s));
-        }
+        for (const auto& t : board["tracks"]) emit_track_shapes(t, shapes);
     }
     if (board.contains("vias") && board["vias"].is_array()) {
         for (const auto& v : board["vias"]) {
@@ -340,6 +392,175 @@ double clearance_for(const json& board, const Shape& a, const Shape& b) {
             return std::max(getf(nc["clearance"]), 0.0);
     }
     return g;
+}
+
+double net_class_minimum(const json& board, const json& net, const char* key,
+                         double global_minimum) {
+    const json cls = net_class_of(board, net);
+    if (!cls.is_string() || !board.contains("net_classes") ||
+        !board["net_classes"].is_object() ||
+        !board["net_classes"].contains(cls.get<std::string>()))
+        return global_minimum;
+    const json& nc = board["net_classes"][cls.get<std::string>()];
+    if (!nc.is_object() || !nc.contains(key)) return global_minimum;
+    return std::max(global_minimum, std::max(getf(nc[key]), 0.0));
+}
+
+using PolygonEdge = std::pair<Point, Point>;
+
+std::vector<PolygonEdge> effective_polygon_edges(const std::vector<Point>& points) {
+    std::map<PolygonEdge, size_t> counts;
+    for (size_t i = 0; i < points.size(); ++i) {
+        Point a = points[i];
+        Point b = points[(i + 1) % points.size()];
+        if (b < a) std::swap(a, b);
+        ++counts[{a, b}];
+    }
+    std::vector<PolygonEdge> edges;
+    edges.reserve(counts.size());
+    for (const auto& [edge, count] : counts)
+        if (count % 2 == 1) edges.push_back(edge);
+    return edges;
+}
+
+struct FilledZonePolygon {
+    std::string zone_id;
+    size_t polygon_index = 0;
+    json net;
+    std::string layer;
+    std::vector<Point> points;
+    std::vector<PolygonEdge> edges;
+    Point loc{0, 0};
+    double clearance = 0.0;
+};
+
+std::vector<FilledZonePolygon> filled_zone_polygons(const json& board) {
+    std::vector<FilledZonePolygon> polygons;
+    if (!board.contains("zones") || !board["zones"].is_array()) return polygons;
+    for (const auto& zone : board["zones"]) {
+        if (!zone.contains("filled_polys") || !zone["filled_polys"].is_array()) continue;
+        size_t polygon_index = 0;
+        for (const auto& encoded : zone["filled_polys"]) {
+            if (!encoded.is_array()) {
+                ++polygon_index;
+                continue;
+            }
+            FilledZonePolygon polygon;
+            polygon.zone_id = zone.value("id", std::string());
+            polygon.polygon_index = polygon_index++;
+            polygon.net = zone.contains("net") ? zone["net"] : json(nullptr);
+            polygon.layer = zone.value("layer", std::string());
+            polygon.clearance =
+                std::max(getf(zone.contains("clearance") ? zone["clearance"] : json(0.0)), 0.0);
+            for (const auto& encoded_point : encoded) {
+                if (!encoded_point.is_array() || encoded_point.size() < 2 ||
+                    !encoded_point[0].is_number() || !encoded_point[1].is_number())
+                    continue;
+                Point point{encoded_point[0].get<double>(), encoded_point[1].get<double>()};
+                polygon.points.push_back(point);
+                polygon.loc.first += point.first;
+                polygon.loc.second += point.second;
+            }
+            if (polygon.points.size() < 3) continue;
+            polygon.edges = effective_polygon_edges(polygon.points);
+            polygon.loc.first /= polygon.points.size();
+            polygon.loc.second /= polygon.points.size();
+            polygons.push_back(std::move(polygon));
+        }
+    }
+    return polygons;
+}
+
+bool point_in_polygon(const Point& point, const FilledZonePolygon& polygon) {
+    for (const PolygonEdge& edge : polygon.edges)
+        if (point_seg_dist(point, edge.first, edge.second) <= kEps) return true;
+
+    bool inside = false;
+    size_t previous = polygon.points.size() - 1;
+    for (size_t i = 0; i < polygon.points.size(); ++i) {
+        const Point& a = polygon.points[previous];
+        const Point& b = polygon.points[i];
+        const bool crosses = (a.second > point.second) != (b.second > point.second);
+        if (crosses) {
+            const double x =
+                (b.first - a.first) * (point.second - a.second) / (b.second - a.second) +
+                a.first;
+            if (point.first < x) inside = !inside;
+        }
+        previous = i;
+    }
+    return inside;
+}
+
+bool point_in_shape(const Point& point, const Shape& shape) {
+    if (shape.kind == "circle")
+        return dist(point, shape.center) <= shape.margin + kEps;
+    if (shape.kind == "seg")
+        return point_seg_dist(point, shape.p1, shape.p2) <= shape.margin + kEps;
+    return std::abs(point.first - shape.center.first) <= shape.half.first + kEps &&
+           std::abs(point.second - shape.center.second) <= shape.half.second + kEps;
+}
+
+double polygon_shape_distance(const FilledZonePolygon& polygon, const Shape& shape) {
+    double best = std::numeric_limits<double>::infinity();
+    for (const PolygonEdge& edge : polygon.edges) {
+        const Point& a = edge.first;
+        const Point& b = edge.second;
+        double d = 0.0;
+        if (shape.kind == "seg")
+            d = seg_seg_dist(a, b, shape.p1, shape.p2) - shape.margin;
+        else if (shape.kind == "circle")
+            d = point_seg_dist(shape.center, a, b) - shape.margin;
+        else
+            d = seg_box_dist(a, b, shape.center.first, shape.center.second,
+                             shape.half.first, shape.half.second);
+        best = std::min(best, d);
+    }
+
+    bool interior_overlap = false;
+    for (const Point& point : polygon.points)
+        if (point_in_shape(point, shape)) {
+            interior_overlap = true;
+            break;
+        }
+    if (shape.kind == "circle") {
+        interior_overlap = interior_overlap || point_in_polygon(shape.center, polygon);
+    } else if (shape.kind == "seg") {
+        interior_overlap = interior_overlap || point_in_polygon(shape.p1, polygon) ||
+                           point_in_polygon(shape.p2, polygon);
+    } else {
+        const double x0 = shape.center.first - shape.half.first;
+        const double x1 = shape.center.first + shape.half.first;
+        const double y0 = shape.center.second - shape.half.second;
+        const double y1 = shape.center.second + shape.half.second;
+        const Point corners[4] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}};
+        for (const Point& corner : corners)
+            interior_overlap = interior_overlap || point_in_polygon(corner, polygon);
+    }
+    return interior_overlap && best >= 0.0 ? -2.0 * kEps : best;
+}
+
+double polygon_polygon_distance(const FilledZonePolygon& a, const FilledZonePolygon& b) {
+    if (point_in_polygon(a.points.front(), b) || point_in_polygon(b.points.front(), a))
+        return -2.0 * kEps;
+    double best = std::numeric_limits<double>::infinity();
+    for (const PolygonEdge& edge_a : a.edges)
+        for (const PolygonEdge& edge_b : b.edges) {
+            const double d =
+                seg_seg_dist(edge_a.first, edge_a.second, edge_b.first, edge_b.second);
+            if (d <= kEps) return -2.0 * kEps;
+            best = std::min(best, d);
+        }
+    return best;
+}
+
+Shape zone_metadata_shape(const FilledZonePolygon& polygon) {
+    Shape shape;
+    shape.net = polygon.net;
+    shape.layers.insert(polygon.layer);
+    shape.item_id = polygon.zone_id;
+    shape.loc = polygon.loc;
+    return shape;
 }
 
 // Drilled holes (drc.py::_drilled_holes): {id, at, drill}. Sorted by id.
@@ -409,7 +630,7 @@ std::vector<std::pair<Point, Point>> outline_segments(const json& board) {
             double r = getf(shp.contains("radius") ? shp["radius"] : json(0.0));
             double a0 = getf(shp.contains("a0") ? shp["a0"] : json(0.0)) * kPi / 180.0;
             double a1 = getf(shp.contains("a1") ? shp["a1"] : json(0.0)) * kPi / 180.0;
-            int n = std::max(8, (int)(std::abs(a1 - a0) / (kPi / 18.0)));
+            int n = arc_segment_count(a0, a1);
             bool have_prev = false;
             Point prev{0, 0};
             for (int i = 0; i <= n; ++i) {
@@ -498,16 +719,20 @@ json ratsnest(const json& board) {
         std::stable_sort(terms.begin(), terms.end(),
                          [](const Terminal& a, const Terminal& b) { return a.id < b.id; });
 
-    // tracks grouped by net (segment tracks only).
+    // Tracks grouped by net. An arc is electrically continuous between its declared
+    // endpoints; its tessellation is needed for geometry, not for endpoint connectivity.
     std::map<std::string, std::vector<std::pair<Point, Point>>> tracks_by_net;
     if (board.contains("tracks") && board["tracks"].is_array()) {
         for (const auto& t : board["tracks"]) {
-            if (t.value("kind", std::string("segment")) != "segment") continue;
+            const std::string kind = t.value("kind", std::string("segment"));
+            if (kind != "segment" && kind != "arc") continue;
             json net = t.contains("net") ? t["net"] : json(nullptr);
             if (!net_ok(net)) continue;
             Point p1{0, 0}, p2{0, 0};
-            if (t.contains("p1") && t["p1"].is_array()) p1 = {getf(t["p1"][0]), getf(t["p1"][1])};
-            if (t.contains("p2") && t["p2"].is_array()) p2 = {getf(t["p2"][0]), getf(t["p2"][1])};
+            if (t.contains("p1") && t["p1"].is_array())
+                p1 = {getf(t["p1"][0]), getf(t["p1"][1])};
+            if (t.contains("p2") && t["p2"].is_array())
+                p2 = {getf(t["p2"][0]), getf(t["p2"][1])};
             tracks_by_net[net.get<std::string>()].push_back({p1, p2});
         }
     }
@@ -653,6 +878,7 @@ json run_drc(const json& board) {
     std::vector<Shape> shapes = copper_shapes(board);
 
     // clearance
+    std::set<std::tuple<std::string, std::string, std::string>> reported_clearance_pairs;
     for (size_t i = 0; i < shapes.size(); ++i) {
         for (size_t k = i + 1; k < shapes.size(); ++k) {
             const Shape& a = shapes[i];
@@ -666,6 +892,10 @@ json run_drc(const json& board) {
                 for (const auto& l : a.layers)
                     if (b.layers.count(l)) common.insert(l);
                 std::string layer = *common.begin();
+                const std::string first_id = std::min(a.item_id, b.item_id);
+                const std::string second_id = std::max(a.item_id, b.item_id);
+                if (!reported_clearance_pairs.insert({first_id, second_id, layer}).second)
+                    continue;
                 std::string msg = "clearance " + fmt4g(d) + "mm < required " + fmt4g(req) +
                                   "mm between " + a.item_id + " (net " + repr_net(a.net) + ") and " +
                                   b.item_id + " (net " + repr_net(b.net) + ")";
@@ -677,22 +907,121 @@ json run_drc(const json& board) {
         }
     }
 
+    const std::vector<FilledZonePolygon> zone_polygons = filled_zone_polygons(board);
+
+    // zone_clearance: filled copper is authoritative stale state and must be checked
+    // against every different-net copper item, independent of the zone-fill operation.
+    for (const FilledZonePolygon& polygon : zone_polygons) {
+        const Shape zone_shape = zone_metadata_shape(polygon);
+        std::set<std::string> reported_items;
+        for (const Shape& shape : shapes) {
+            if (same_net(polygon.net, shape.net) || !shape.layers.count(polygon.layer))
+                continue;
+            const double required =
+                std::max(polygon.clearance, clearance_for(board, zone_shape, shape));
+            const double distance = polygon_shape_distance(polygon, shape);
+            if (distance >= required - kEps || reported_items.count(shape.item_id)) continue;
+            reported_items.insert(shape.item_id);
+            const std::string message =
+                "zone " + polygon.zone_id + " polygon " +
+                std::to_string(polygon.polygon_index) + " clearance " + fmt4g(distance) +
+                "mm < required " + fmt4g(required) + "mm to " + shape.item_id + " (net " +
+                repr_net(shape.net) + ")";
+            out.push_back(make_violation(
+                "zone_clearance", "error",
+                {{polygon.loc.first, polygon.loc.second, polygon.layer},
+                 {shape.loc.first, shape.loc.second, polygon.layer}},
+                {polygon.zone_id, shape.item_id}, message));
+        }
+    }
+    for (size_t i = 0; i < zone_polygons.size(); ++i) {
+        for (size_t k = i + 1; k < zone_polygons.size(); ++k) {
+            const FilledZonePolygon& a = zone_polygons[i];
+            const FilledZonePolygon& b = zone_polygons[k];
+            if (same_net(a.net, b.net) || a.layer != b.layer) continue;
+            const Shape a_shape = zone_metadata_shape(a);
+            const Shape b_shape = zone_metadata_shape(b);
+            const double required =
+                std::max(std::max(a.clearance, b.clearance),
+                         clearance_for(board, a_shape, b_shape));
+            const double distance = polygon_polygon_distance(a, b);
+            if (distance >= required - kEps) continue;
+            const std::string message =
+                "zone " + a.zone_id + " polygon " + std::to_string(a.polygon_index) +
+                " clearance " + fmt4g(distance) + "mm < required " + fmt4g(required) +
+                "mm to zone " + b.zone_id + " polygon " +
+                std::to_string(b.polygon_index);
+            out.push_back(make_violation(
+                "zone_clearance", "error",
+                {{a.loc.first, a.loc.second, a.layer}, {b.loc.first, b.loc.second, b.layer}},
+                {a.zone_id, b.zone_id}, message));
+        }
+    }
+
+    // zone_island: a polygon is connected when it touches own-net copper directly or
+    // through a same-net filled polygon on the same layer.
+    std::vector<bool> zone_connected(zone_polygons.size(), false);
+    for (size_t i = 0; i < zone_polygons.size(); ++i) {
+        const FilledZonePolygon& polygon = zone_polygons[i];
+        for (const Shape& shape : shapes) {
+            if (!same_net(polygon.net, shape.net) || !shape.layers.count(polygon.layer))
+                continue;
+            if (polygon_shape_distance(polygon, shape) <= kTouch) {
+                zone_connected[i] = true;
+                break;
+            }
+        }
+    }
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t i = 0; i < zone_polygons.size(); ++i) {
+            for (size_t k = i + 1; k < zone_polygons.size(); ++k) {
+                if (zone_connected[i] == zone_connected[k]) continue;
+                const FilledZonePolygon& a = zone_polygons[i];
+                const FilledZonePolygon& b = zone_polygons[k];
+                if (!same_net(a.net, b.net) || a.layer != b.layer ||
+                    polygon_polygon_distance(a, b) > kTouch)
+                    continue;
+                zone_connected[i] = true;
+                zone_connected[k] = true;
+                changed = true;
+            }
+        }
+    }
+    for (size_t i = 0; i < zone_polygons.size(); ++i) {
+        if (zone_connected[i]) continue;
+        const FilledZonePolygon& polygon = zone_polygons[i];
+        const std::string message =
+            "zone " + polygon.zone_id + " polygon " +
+            std::to_string(polygon.polygon_index) +
+            " is floating copper with no connection to net " + repr_net(polygon.net);
+        out.push_back(make_violation(
+            "zone_island", "warning",
+            {{polygon.loc.first, polygon.loc.second, polygon.layer}}, {polygon.zone_id},
+            message));
+    }
+
     // track_width
     double tw_min = getf(rules.contains("track_width_min") ? rules["track_width_min"] : json(0.0));
     if (board.contains("tracks") && board["tracks"].is_array()) {
         for (const auto& t : board["tracks"]) {
             double w = getf(t.contains("width") ? t["width"] : json(0.0));
-            if (w < tw_min - kEps) {
+            const json net = t.contains("net") ? t["net"] : json(nullptr);
+            const double effective_min = net_class_minimum(board, net, "track_width", tw_min);
+            if (w < effective_min - kEps) {
                 Point p1{0, 0}, p2{0, 0};
-                if (t.contains("p1") && t["p1"].is_array()) p1 = {getf(t["p1"][0]), getf(t["p1"][1])};
-                if (t.contains("p2") && t["p2"].is_array()) p2 = {getf(t["p2"][0]), getf(t["p2"][1])};
+                if (t.contains("p1") && t["p1"].is_array())
+                    p1 = {getf(t["p1"][0]), getf(t["p1"][1])};
+                if (t.contains("p2") && t["p2"].is_array())
+                    p2 = {getf(t["p2"][0]), getf(t["p2"][1])};
                 Point mid{(p1.first + p2.first) / 2.0, (p1.second + p2.second) / 2.0};
                 std::string layer = t.value("layer", std::string("F.Cu"));
                 std::string tid = t.value("id", std::string());
                 std::string msg = "track " + tid + " width " + fmt4g(w) + "mm < minimum " +
-                                  fmt4g(tw_min) + "mm";
-                out.push_back(make_violation("track_width", "error", {{mid.first, mid.second, layer}},
-                                             {tid}, msg));
+                                  fmt4g(effective_min) + "mm";
+                out.push_back(make_violation("track_width", "error",
+                                             {{mid.first, mid.second, layer}}, {tid}, msg));
             }
         }
     }
@@ -703,19 +1032,27 @@ json run_drc(const json& board) {
     if (board.contains("vias") && board["vias"].is_array()) {
         for (const auto& v : board["vias"]) {
             Point at{0, 0};
-            if (v.contains("at") && v["at"].is_array()) at = {getf(v["at"][0]), getf(v["at"][1])};
+            if (v.contains("at") && v["at"].is_array())
+                at = {getf(v["at"][0]), getf(v["at"][1])};
             double dia = getf(v.contains("diameter") ? v["diameter"] : json(0.0));
             double drill = getf(v.contains("drill") ? v["drill"] : json(0.0));
             std::string vid = v.value("id", std::string());
-            if (dia < dia_min - kEps) {
+            const json net = v.contains("net") ? v["net"] : json(nullptr);
+            const double effective_dia_min =
+                net_class_minimum(board, net, "via_diameter", dia_min);
+            const double effective_drill_min =
+                net_class_minimum(board, net, "via_drill", drill_min);
+            if (dia < effective_dia_min - kEps) {
                 out.push_back(make_violation(
                     "via_size", "error", {{at.first, at.second, "F.Cu"}}, {vid},
-                    "via " + vid + " diameter " + fmt4g(dia) + "mm < minimum " + fmt4g(dia_min) + "mm"));
+                    "via " + vid + " diameter " + fmt4g(dia) + "mm < minimum " +
+                        fmt4g(effective_dia_min) + "mm"));
             }
-            if (drill < drill_min - kEps) {
+            if (drill < effective_drill_min - kEps) {
                 out.push_back(make_violation(
                     "via_size", "error", {{at.first, at.second, "F.Cu"}}, {vid},
-                    "via " + vid + " drill " + fmt4g(drill) + "mm < minimum " + fmt4g(drill_min) + "mm"));
+                    "via " + vid + " drill " + fmt4g(drill) + "mm < minimum " +
+                        fmt4g(effective_drill_min) + "mm"));
             }
         }
     }
@@ -797,15 +1134,16 @@ json run_drc(const json& board) {
     double edge_min = getf(rules.contains("edge_clearance") ? rules["edge_clearance"] : json(0.0));
     auto edges = outline_segments(board);
     if (!edges.empty()) {
+        std::set<std::string> reported_edge_items;
         for (const auto& s : shapes) {
             double best = std::numeric_limits<double>::infinity();
             for (const auto& e : edges) best = std::min(best, shape_edge_dist(s, e));
-            if (best < edge_min - kEps) {
+            if (best < edge_min - kEps && reported_edge_items.insert(s.item_id).second) {
                 std::string lyr = s.layers.empty() ? "F.Cu" : *s.layers.begin();
                 out.push_back(make_violation(
                     "edge_clearance", "error", {{s.loc.first, s.loc.second, lyr}}, {s.item_id},
-                    "copper " + s.item_id + " is " + fmt4g(best) + "mm from the board edge (< " +
-                        fmt4g(edge_min) + "mm)"));
+                    "copper " + s.item_id + " is " + fmt4g(best) +
+                        "mm from the board edge (< " + fmt4g(edge_min) + "mm)"));
             }
         }
     }

@@ -148,16 +148,20 @@ nlohmann::json ecad_route_diff_pair(const std::string& doc_id, const std::string
 nlohmann::json ecad_fill_zones(const std::string& doc_id, const nlohmann::json& resolution,
                                long base_revision);
 
-// ecad_simulate {doc_id, study?, sim_params?} -> the solver envelope
-// {ok, converged, results, warnings, log, convergence, ms}. Builds the schematic
-// netlist, maps it to a SPICE circuit (netlist_to_spice_circuit) and runs the
-// requested study (spice_simulate). Mirrors engine/ecad/rpc.py::_ecad_simulate.
-// Components without an inline "sim" mapping resolve from the starter SYMBOL
-// sim table (core/sim/netlist.cpp::symbol_sim_table), same as the Python oracle.
-// Only libids absent from that table yield "no sim model — skipped" warnings and
+// ecad_simulate {doc_id, study?, sim_params?, job_id?} -> the solver envelope
+// {ok, converged, cancelled?, results, warnings, log, convergence, ms}. Builds the
+// schematic netlist, maps it to a SPICE circuit (netlist_to_spice_circuit), and
+// runs the requested study (spice_simulate). A non-empty job_id registers the run
+// with sim_cancel and is unregistered on every exit; cancellation returns
+// ok:false and cancelled:true while retaining meaningful partial solver results.
+// Mirrors engine/ecad/rpc.py::_ecad_simulate. Components without an inline "sim"
+// mapping resolve from the starter SYMBOL sim table
+// (core/sim/netlist.cpp::symbol_sim_table), same as the Python oracle. Unsupported
+// components are warnings (not hard errors) and a fully unsupported schematic
 // may produce {ok:false, "no simulatable devices ..."} when nothing simulates.
 nlohmann::json ecad_simulate(const std::string& doc_id, const nlohmann::json& study,
-                             const nlohmann::json& sim_params);
+                             const nlohmann::json& sim_params,
+                             const std::string& job_id = {});
 
 // Return a deep COPY of an open session's document (for cross-target callers like
 // libchudware's OCCT-linked ecad_to_3d doc-id form, which lives outside chudware_ecad).

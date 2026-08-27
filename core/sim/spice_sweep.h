@@ -8,6 +8,7 @@
 #pragma once
 
 #include <nlohmann/json.hpp>
+#include "sim/sim_cancel.h"
 
 #include <string>
 #include <vector>
@@ -32,13 +33,15 @@ std::vector<nlohmann::json> spice_sweep(const nlohmann::json& circuit,
                                         const std::string& param,
                                         const std::vector<double>& values,
                                         const nlohmann::json& analysis,
-                                        SpiceSweepStats* stats = nullptr);
+                                        SpiceSweepStats* stats = nullptr,
+                                        const SimCancelToken& cancel_token = {});
 
 // Serial baseline with identical semantics (for parity / wall-time comparison).
 std::vector<nlohmann::json> spice_sweep_serial(const nlohmann::json& circuit,
                                                const std::string& param,
                                                const std::vector<double>& values,
                                                const nlohmann::json& analysis,
-                                               SpiceSweepStats* stats = nullptr);
+                                               SpiceSweepStats* stats = nullptr,
+                                               const SimCancelToken& cancel_token = {});
 
 }  // namespace chudware::sim

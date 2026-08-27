@@ -9,11 +9,15 @@
 #pragma once
 
 #include <nlohmann/json.hpp>
+#include "sim/sim_cancel.h"
 
 namespace chudware::sim {
 
 // Run the requested analyses of `study` on `circuit`. Never throws — a malformed
 // device / singular matrix sets convergence.<type>=false with a log diagnostic.
-nlohmann::json spice_simulate(const nlohmann::json& circuit, const nlohmann::json& study);
+// When `cancel_token` is set, long-running analyses poll it cooperatively and
+// return partial data with ok:false and cancelled:true when cancellation wins.
+nlohmann::json spice_simulate(const nlohmann::json& circuit, const nlohmann::json& study,
+                              const SimCancelToken& cancel_token = {});
 
 }  // namespace chudware::sim

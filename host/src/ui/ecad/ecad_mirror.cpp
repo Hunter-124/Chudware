@@ -598,19 +598,24 @@ void EcadMirror::parseCompileShared(const nlohmann::json& compile) {
         erc_.push_back(std::move(ev));
     }
 
-    // DRC (pcb): [{rule, severity, locs:[[x,y,layer]], items, message}].
+    // DRC (pcb): [{rule, severity, locs:[[x,y,layer]], items, message}]. Keep EVERY located
+    // point (a clearance violation reports one per offending shape); loc/layer stay the first
+    // entry for "zoom to violation".
     for (const auto& v : jarr(compile, "drc")) {
         EcadViolation ev;
         ev.rule     = jstr(v, "rule");
         ev.severity = jstr(v, "severity", "warning");
         ev.message  = jstr(v, "message");
-        const nlohmann::json& locs = jarr(v, "locs");
-        if (!locs.empty() && locs[0].is_array() && locs[0].size() >= 2) {
-            ev.loc.x = (float)locs[0][0].get<double>();
-            ev.loc.y = (float)locs[0][1].get<double>();
-            ev.hasLoc = true;
-            if (locs[0].size() >= 3 && locs[0][2].is_string())
-                ev.layer = locs[0][2].get<std::string>();
+        for (const auto& l : jarr(v, "locs")) {
+            if (!l.is_array() || l.size() < 2) continue;
+            EcadPt pt{(float)l[0].get<double>(), (float)l[1].get<double>()};
+            if (!ev.hasLoc) {
+                ev.loc = pt;
+                ev.hasLoc = true;
+                if (l.size() >= 3 && l[2].is_string())
+                    ev.layer = l[2].get<std::string>();
+            }
+            ev.locs.push_back(pt);
         }
         drc_.push_back(std::move(ev));
     }

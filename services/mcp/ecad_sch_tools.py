@@ -2051,6 +2051,72 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
                               "ecad_symbols('resistor')"]),
         })
 
+    @mcp.tool()
+    def ecad_load_symbol_library(path: str) -> str:
+        """Load every symbol from a KiCad ``.kicad_sym`` library into the native catalog.
+
+        Reach for this when you were given a vendor .kicad_sym and need a symbol the native
+        catalog lacks. After loading it, use ecad_symbols to discover the exact imported libid
+        before placing the symbol.
+        """
+        requested = str(path or "").strip()
+        if not requested:
+            return _err("path is required", reason="missing_path",
+                        hint="Pass the existing vendor .kicad_sym file you were given.",
+                        next_actions=[
+                            "ecad_load_symbol_library('/absolute/path/vendor.kicad_sym')"])
+        source = _artifact_path(requested)
+        if os.path.splitext(source)[1].lower() != ".kicad_sym":
+            return _err(f"not a KiCad symbol-library path: {source}",
+                        reason="invalid_file_type",
+                        hint="Pass a file ending in .kicad_sym; schematic files use "
+                             "ecad_import_kicad instead.",
+                        next_actions=[
+                            "ecad_load_symbol_library('/absolute/path/vendor.kicad_sym')"])
+        if not os.path.isfile(source):
+            return _err(f"KiCad symbol library does not exist: {source}",
+                        reason="file_not_found",
+                        hint="Pass an existing .kicad_sym path.",
+                        next_actions=[
+                            "ecad_load_symbol_library('/absolute/path/vendor.kicad_sym')"])
+        try:
+            resp = _rpc("ecad_load_symbol_library", {"path": source})
+        except OpError as e:
+            return _err(f"KiCad symbol-library import failed: {e.message}",
+                        reason=e.code, detail=e.detail,
+                        hint="Confirm this is a readable KiCad .kicad_sym library.",
+                        next_actions=["ecad_symbols()"])
+        except Exception as e:  # noqa: BLE001
+            return _err(f"symbol-library RPC unavailable: {type(e).__name__}: {e}",
+                        reason="rpc_failed",
+                        hint="The native symbol-library RPC must be available.",
+                        next_actions=["ecad_symbols()"])
+        if not isinstance(resp, dict):
+            return _err("symbol-library import returned an invalid payload",
+                        reason="invalid_rpc_response",
+                        hint="Retry the import, then inspect the native catalog.",
+                        next_actions=["ecad_symbols()"])
+        if resp.get("ok") is False:
+            return _err(str(resp.get("error") or "KiCad symbol-library import failed"),
+                        reason=str(resp.get("reason") or "import_failed"),
+                        hint="Confirm this is a readable KiCad .kicad_sym library.",
+                        warnings=list(resp.get("warnings") or []),
+                        next_actions=["ecad_symbols()"])
+        added = resp.get("added") or []
+        if not isinstance(added, list):
+            return _err("symbol-library import returned an invalid added-symbol list",
+                        reason="invalid_rpc_response",
+                        hint="Retry the import, then inspect the native catalog.",
+                        next_actions=["ecad_symbols()"])
+        warnings = list(resp.get("warnings") or [])
+        return _dumps({
+            "ok": True, "path": source, "added_count": len(added), "added": added,
+            "warnings": warnings,
+            "hint": (f"Loaded {len(added)} symbol(s) from {source}. "
+                     "Use ecad_symbols to discover an exact imported libid."),
+            "next_actions": ["ecad_symbols()"],
+        })
+
 
     # ---------------------------------------------------------------- status (THE context tool)
 
@@ -2188,13 +2254,20 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         tracks = doc.get("tracks", [])
         vias = doc.get("vias", [])
         violations: list[dict] = []
+        drc_available = True
+        status_warnings: list[str] = []
         try:
             res = _compile_of(session).get("drc", [])  # C++ compile runs engine.ecad.drc
             violations = res if isinstance(res, list) else res.get("violations", [])
-        except Exception:  # noqa: BLE001
-            violations = []
+        except Exception as e:  # noqa: BLE001 — status survives, but its verdict is unavailable
+            drc_available = False
+            status_warnings.append(
+                f"DRC unavailable: {type(e).__name__}: {e}")
         erc = _erc_summary(violations)  # same grouping shape works for DRC
         next_actions: list[str] = []
+        if not drc_available:
+            next_actions.append(
+                "DRC unavailable — retry ecad_run_drc(); do not treat this status as clean.")
         for g in erc["groups"]:
             if g["severity"] == "error":
                 next_actions.append(f"FIX DRC {g['rule']} ({g['count']}x): "
@@ -2207,8 +2280,10 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         fp_engs = [_component_eng(libid=f.get("libid") or "", fpid=f.get("fpid") or "",
                                   overrides=_fp_overrides(f)) for f in fps]
         power = _power_totals(fp_engs)
+        drc_head = (f"{erc['errors']} DRC error(s), {erc['warnings']} warning(s)"
+                    if drc_available else "DRC unavailable")
         head = (f"{len(fps)} footprint(s), {len(nets)} net(s), {len(tracks)} track(s), "
-                f"{len(vias)} via(s), {erc['errors']} DRC error(s), {erc['warnings']} warning(s).")
+                f"{len(vias)} via(s), {drc_head}.")
         if power and power.get("power_w_typ") is not None:
             head += f" Board power ~{power['power_w_typ'] * 1000:.1f} mW typ."
         full = {
@@ -2226,9 +2301,11 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
                      if isinstance(n, dict) else {"name": n}
                      for n in nets],
             "track_count": len(tracks), "via_count": len(vias),
+            "drc_available": drc_available,
             "drc": erc,
-            "warnings": [],
-            "hint": head + " Fix DRC errors first.",
+            "warnings": status_warnings,
+            "hint": (head + (" Fix DRC errors first." if drc_available else
+                             " DRC DID NOT RUN; retry ecad_run_drc before any clean claim.")),
             "next_actions": next_actions or ["ecad_run_drc()", "ecad_export('gerber')"],
         }
         o = opts or _rs.ServeOpts(detail="summary", budget_tokens=800)

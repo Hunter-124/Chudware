@@ -36,6 +36,7 @@ namespace fs = std::filesystem;
 #include "ecad/sync.h"
 #include "ecad/zonefill.h"
 #include "sim/netlist.h"
+#include "sim/sim_cancel.h"
 #include "sim/spice.h"
 
 namespace chudware::ecad {
@@ -80,6 +81,21 @@ public:
     }
     EcadLock(const EcadLock&) = delete;
     EcadLock& operator=(const EcadLock&) = delete;
+};
+
+class EcadSimJobScope {
+public:
+    explicit EcadSimJobScope(const std::string& job_id)
+        : job_id_(job_id), token_(chudware::sim::sim_job_register(job_id_)) {}
+    ~EcadSimJobScope() { chudware::sim::sim_job_unregister(job_id_, token_); }
+    const chudware::sim::SimCancelToken& token() const { return token_; }
+
+    EcadSimJobScope(const EcadSimJobScope&) = delete;
+    EcadSimJobScope& operator=(const EcadSimJobScope&) = delete;
+
+private:
+    std::string job_id_;
+    chudware::sim::SimCancelToken token_;
 };
 
 std::map<std::string, Session> g_sessions;
@@ -1064,7 +1080,9 @@ json ecad_fill_zones(const std::string& doc_id, const json& resolution, long bas
     return resp;
 }
 
-json ecad_simulate(const std::string& doc_id, const json& study_in, const json& sim_params) {
+json ecad_simulate(const std::string& doc_id, const json& study_in, const json& sim_params,
+                   const std::string& job_id) {
+    EcadSimJobScope sim_job(job_id);
     json nl, doc;
     {
         EcadLock lk;
@@ -1152,18 +1170,20 @@ json ecad_simulate(const std::string& doc_id, const json& study_in, const json& 
         }
     }
 
-    json results = chudware::sim::spice_simulate(circuit, study);
+    json results = chudware::sim::spice_simulate(circuit, study, sim_job.token());
     json conv_field = results.is_object() && results.contains("convergence")
                           ? results["convergence"]
                           : json::object();
-    bool converged = conv_field.is_object() && !conv_field.empty();
+    const bool cancelled =
+        results.is_object() && results.value("cancelled", false);
+    bool converged = !cancelled && conv_field.is_object() && !conv_field.empty();
     if (converged)
         for (auto it = conv_field.begin(); it != conv_field.end(); ++it)
             if (!(it.value().is_boolean() ? it.value().get<bool>() : (bool)it.value()))
                 converged = false;
 
-    return json{
-        {"ok", true},
+    json response = {
+        {"ok", !cancelled},
         {"converged", converged},
         {"results", results},
         {"warnings", warns},
@@ -1171,6 +1191,13 @@ json ecad_simulate(const std::string& doc_id, const json& study_in, const json& 
         {"convergence", conv_field.is_object() ? conv_field : json::object()},
         {"ms", results.is_object() && results.contains("ms") ? results["ms"] : json(nullptr)},
     };
+    if (cancelled) {
+        response["cancelled"] = true;
+        response["error"] = results.value("error", std::string("simulation cancelled"));
+        response["message"] =
+            results.value("message", std::string("SPICE simulation cancelled"));
+    }
+    return response;
 }
 
 json ecad_session_doc(const std::string& doc_id) {

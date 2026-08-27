@@ -37,6 +37,18 @@ json sweep_error(double value, const std::string& message) {
                 {"cache_reason", "invalid_input"}};
 }
 
+json sweep_cancelled(double value) {
+    return json{{"value", std::isfinite(value) ? json(value) : json(nullptr)},
+                {"ok", false},
+                {"cancelled", true},
+                {"error", "simulation cancelled"},
+                {"message", "SPICE sweep cancelled"},
+                {"log", json::array({"sweep: simulation cancelled"})},
+                {"convergence", json{{"sweep", false}}},
+                {"cache_hit", false},
+                {"cache_reason", "cancelled"}};
+}
+
 bool parameter_exists(const json& circuit, const std::string& param) {
     if (param.empty() || !circuit.is_object()) return false;
     if (circuit.contains("devices") && circuit["devices"].is_array())
@@ -108,13 +120,19 @@ uint64_t estimate_sweep_bytes(const json& circuit, int n_points) {
     return per * static_cast<uint64_t>(std::max(n_points, 1));
 }
 
-json run_one(const json& circuit, const std::string& param, double value, const json& study) {
+template <bool Cancellable>
+json run_one(const json& circuit, const std::string& param, double value, const json& study,
+             const SimCancelToken& cancel_token) {
+    if constexpr (Cancellable) {
+        if (cancel_token->load(std::memory_order_relaxed))
+            return sweep_cancelled(value);
+    }
     if (!std::isfinite(value)) return sweep_error(value, "sweep values must be finite");
     if (!parameter_exists(circuit, param))
         return sweep_error(value, "parameter '" + param + "' does not name a device or circuit param");
     json c = circuit;  // deep copy
     apply_step_param(c, param, value);
-    json res = spice_simulate(c, study);
+    json res = spice_simulate(c, study, cancel_token);
     res["value"] = value;
     return res;
 }
@@ -123,15 +141,27 @@ json run_one(const json& circuit, const std::string& param, double value, const 
 
 std::vector<json> spice_sweep_serial(const json& circuit, const std::string& param,
                                      const std::vector<double>& values, const json& analysis,
-                                     SpiceSweepStats* stats) {
+                                     SpiceSweepStats* stats,
+                                     const SimCancelToken& cancel_token) {
     const auto t0 = clock::now();
     const json study = make_study(analysis);
     std::vector<json> out;
     out.reserve(values.size());
-    for (double v : values) out.push_back(run_one(circuit, param, v, study));
+    if (cancel_token) {
+        for (double v : values) {
+            if (cancel_token->load(std::memory_order_relaxed)) {
+                out.push_back(sweep_cancelled(v));
+                break;
+            }
+            out.push_back(run_one<true>(circuit, param, v, study, cancel_token));
+        }
+    } else {
+        for (double v : values)
+            out.push_back(run_one<false>(circuit, param, v, study, {}));
+    }
     if (stats) {
         stats->workers = 1;
-        stats->n_points = static_cast<int>(values.size());
+        stats->n_points = static_cast<int>(out.size());
         stats->wall_ms =
             std::chrono::duration<double, std::milli>(clock::now() - t0).count();
         stats->plan_report = "serial";
@@ -141,7 +171,7 @@ std::vector<json> spice_sweep_serial(const json& circuit, const std::string& par
 
 std::vector<json> spice_sweep(const json& circuit, const std::string& param,
                               const std::vector<double>& values, const json& analysis,
-                              SpiceSweepStats* stats) {
+                              SpiceSweepStats* stats, const SimCancelToken& cancel_token) {
     const auto t0 = clock::now();
     const int n = static_cast<int>(values.size());
     if (n <= 0) {
@@ -156,7 +186,7 @@ std::vector<json> spice_sweep(const json& circuit, const std::string& param,
 
     // 1-point: no pool overhead — same path as serial.
     if (n == 1) {
-        auto out = spice_sweep_serial(circuit, param, values, analysis, stats);
+        auto out = spice_sweep_serial(circuit, param, values, analysis, stats, cancel_token);
         if (stats) stats->plan_report = "single-point";
         return out;
     }
@@ -170,10 +200,19 @@ std::vector<json> spice_sweep(const json& circuit, const std::string& param,
     chudware::pool::shared().set_max_workers(workers);
 
     std::vector<json> out(static_cast<std::size_t>(n));
-    chudware::pool::shared().parallel_for(n, [&](int i) {
-        out[static_cast<std::size_t>(i)] =
-            run_one(circuit, param, values[static_cast<std::size_t>(i)], study);
-    });
+    if (cancel_token) {
+        chudware::pool::shared().parallel_for(n, [&](int i) {
+            out[static_cast<std::size_t>(i)] =
+                run_one<true>(circuit, param, values[static_cast<std::size_t>(i)],
+                              study, cancel_token);
+        });
+    } else {
+        chudware::pool::shared().parallel_for(n, [&](int i) {
+            out[static_cast<std::size_t>(i)] =
+                run_one<false>(circuit, param, values[static_cast<std::size_t>(i)],
+                               study, {});
+        });
+    }
 
     if (stats) {
         stats->workers = workers;

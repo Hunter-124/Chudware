@@ -1,9 +1,13 @@
 # Contract: Circuit Simulation — v1
 
-> Native Modified-Nodal-Analysis simulator (`core/sim/spice.cpp` + `devices.py`), GPL-clean
-> (numpy/scipy, BSD). Runs in the sim worker. Inputs: an internal `Circuit` (from a netlist or a
-> SPICE deck) + a `study`. The mandate is to be **better-coupled and more transparent than KiCad's
-> ngspice integration**, not to out-feature SPICE on device count.
+> Native Modified-Nodal-Analysis simulator (`core/sim/spice.cpp`), GPL-clean. Inputs: an internal
+> `Circuit` (from a netlist or a SPICE deck) + a `study`. The mandate is to be **better-coupled and
+> more transparent than KiCad's ngspice integration**, not to out-feature SPICE on device count.
+>
+> It runs **in-process in the doc worker**, not in an isolated sim worker — a solver crash takes the
+> worker with it, so the crash-isolation guarantee that holds for gmsh/FEA does not hold here.
+> Long runs are stopped cooperatively: pass a `job_id` and call `sim_cancel {job_id}`
+> (see `ecad_rpc.md §2`).
 
 ## 1. Internal Circuit (output of `netlist_to_spice_circuit` / `parse_spice`)
 

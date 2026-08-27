@@ -34,6 +34,26 @@ void drawDashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c, float th, float
                     ImVec2(a.x + dx * (e / L), a.y + dy * (e / L)), c, th);
     }
 }
+
+// One ERC/DRC violation glyph in screen px — shared by the schematic and board marker
+// overlays so both modes read as one product. Error = stroked diamond with a centre dot;
+// warning = stroked triangle. Constant SCREEN-space size (r in px) and stroke-only, so a
+// marker stays legible at any zoom without occluding the geometry it flags.
+void drawViolationGlyph(ImDrawList* dl, const ImVec2& q, bool isError, ImU32 c, float r) {
+    if (isError) {
+        const ImVec2 diamond[4] = {
+            ImVec2(q.x, q.y - r), ImVec2(q.x + r, q.y),
+            ImVec2(q.x, q.y + r), ImVec2(q.x - r, q.y)};
+        dl->AddPolyline(diamond, 4, c, ImDrawFlags_Closed,
+                        ui::metrics::stroke(2.0f));
+        dl->AddCircleFilled(q, ui::metrics::px(1.0f), c, 8);
+    } else {
+        dl->AddTriangle(ImVec2(q.x, q.y - r),
+                        ImVec2(q.x + r, q.y + r),
+                        ImVec2(q.x - r, q.y + r), c,
+                        ui::metrics::stroke(2.0f));
+    }
+}
 void drawRotatedText(ImDrawList* dl, ImVec2 origin, ImU32 color, const char* text,
                      float fontSize, float worldAngleDeg) {
     const int firstVertex = dl->VtxBuffer.Size;
@@ -206,6 +226,7 @@ void EcadCanvas::setDragOffset(float dx, float dy) {
     dragDy_ = dy;
 }
 void EcadCanvas::setShowErcMarkers(bool on) { showErcMarkers_ = on; }
+void EcadCanvas::setShowDrcMarkers(bool on) { showDrcMarkers_ = on; }
 void EcadCanvas::setShowSheetFrame(bool on) {
     if (showSheetFrame_ != on) wantFit_ = true;
     showSheetFrame_ = on;
@@ -1263,23 +1284,69 @@ void EcadCanvas::drawOverlays(const EcadMirror& doc) {
     if (showErcMarkers_ && doc.isSch()) {
         for (const auto& violation : doc.erc()) {
             if (!violation.hasLoc) continue;
-            const ImVec2 q = toScreen(violation.loc);
             const bool isError = violation.severity == "error";
             const ImU32 c = isError ? col(p.statusErr, 0.95f)
                                     : col(p.statusWarn, 0.95f);
-            const float r = ui::metrics::U(2.2f);
-            if (isError) {
-                const ImVec2 diamond[4] = {
-                    ImVec2(q.x, q.y - r), ImVec2(q.x + r, q.y),
-                    ImVec2(q.x, q.y + r), ImVec2(q.x - r, q.y)};
-                dl_->AddPolyline(diamond, 4, c, ImDrawFlags_Closed,
-                                 ui::metrics::stroke(2.0f));
-                dl_->AddCircleFilled(q, ui::metrics::px(1.0f), c, 8);
-            } else {
-                dl_->AddTriangle(ImVec2(q.x, q.y - r),
-                                 ImVec2(q.x + r, q.y + r),
-                                 ImVec2(q.x - r, q.y + r), c,
-                                 ui::metrics::stroke(2.0f));
+            drawViolationGlyph(dl_, toScreen(violation.loc), isError, c,
+                               ui::metrics::U(2.2f));
+        }
+    }
+
+    if (showDrcMarkers_ && doc.isPcb()) {
+        // Persistent DRC markers — the board-side twin of the schematic ERC markers above:
+        // same severity glyphs, same palette roles, same constant screen-space size, drawn
+        // at the same overlay z (above copper, below the focus flash). Violations on a
+        // hidden copper layer hide with it, exactly like the tracks they flag.
+        //
+        // A pair violation (clearance is BETWEEN two shapes) reports one location per
+        // offender: a glyph marks EVERY location and a thin hairline joins the first two.
+        // Marking only the midpoint would often land on bare substrate and point at
+        // neither offending shape.
+        //
+        // Density: a real board can carry hundreds of violations. Errors paint first, and
+        // a glyph landing within one glyph-radius of one already painted this frame is
+        // skipped — stacked identical glyphs add overdraw, not information, and errors
+        // must never be buried under warnings. The dedupe scratch is a reused member, so
+        // the steady state allocates nothing; the quadratic scan only walks glyphs that
+        // actually painted, which the dedupe itself keeps small when zoomed out.
+        drcMarkerPts_.clear();
+        const float r = ui::metrics::U(2.2f);
+        const float minSepSq = r * r;
+        const float cullMinX = imgMin_.x - r, cullMinY = imgMin_.y - r;
+        const float cullMaxX = imgMin_.x + imgSize_.x + r;
+        const float cullMaxY = imgMin_.y + imgSize_.y + r;
+        for (int pass = 0; pass < 2; ++pass) {
+            const bool wantError = pass == 0;
+            for (const auto& violation : doc.drc()) {
+                if (!violation.hasLoc) continue;
+                const bool isError = violation.severity == "error";
+                if (isError != wantError) continue;
+                if (!violation.layer.empty() && !doc.layerVisible(violation.layer))
+                    continue;
+                const float* role = isError ? p.statusErr : p.statusWarn;
+                if (violation.locs.size() >= 2) {
+                    dl_->AddLine(toScreen(violation.locs[0]),
+                                 toScreen(violation.locs[1]), col(role, 0.55f),
+                                 ui::metrics::stroke(1.0f));
+                }
+                const ImU32 c = col(role, 0.95f);
+                const EcadPt* pts = violation.locs.empty() ? &violation.loc
+                                                           : violation.locs.data();
+                const size_t n = violation.locs.empty() ? 1 : violation.locs.size();
+                for (size_t i = 0; i < n; ++i) {
+                    const ImVec2 q = toScreen(pts[i]);
+                    if (q.x < cullMinX || q.x > cullMaxX ||
+                        q.y < cullMinY || q.y > cullMaxY)
+                        continue;
+                    bool crowded = false;
+                    for (const ImVec2& drawn : drcMarkerPts_) {
+                        const float dx = q.x - drawn.x, dy = q.y - drawn.y;
+                        if (dx * dx + dy * dy < minSepSq) { crowded = true; break; }
+                    }
+                    if (crowded) continue;
+                    drcMarkerPts_.push_back(q);
+                    drawViolationGlyph(dl_, q, isError, c, r);
+                }
             }
         }
     }

@@ -1,10 +1,9 @@
-// Design Rule Check (DRC) + ratsnest — C++ port of engine/ecad/drc.py.
+// Design Rule Check (DRC) + ratsnest over a board document (aicad.pcb/1).
 //
-// Pure, advisory geometry audit over a board document (aicad.pcb/1). run_drc()
-// returns a deterministic, sorted list of violation dicts; ratsnest() returns the
-// still-needed airwires. Mirrors the Python oracle exactly: shape abstraction
-// (thick segment / circle / box), net-aware clearance, rule catalog + ordering,
-// and the violation record shape {rule, severity, locs, items, message}.
+// run_drc() returns a deterministic, sorted list of violation dicts; ratsnest()
+// returns the still-needed airwires. Geometry uses thick segments, circles, boxes,
+// and filled-zone polygons internally, with net-aware clearance and the violation
+// record shape {rule, severity, locs, items, message}.
 // OCCT-free; pure JSON/geometry.
 #pragma once
 
@@ -31,7 +30,8 @@ struct Shape {
     std::pair<double, double> loc{0, 0};     // representative location for the violation
 };
 
-// All clearance-bearing copper shapes (pads, tracks, vias), sorted by item_id.
+// All clearance-bearing pad/track/via shapes, with arcs emitted as conservative
+// capsule chains, sorted by item_id.
 std::vector<Shape> copper_shapes(const nlohmann::json& board);
 
 // net helpers

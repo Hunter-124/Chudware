@@ -509,6 +509,22 @@ set_target_properties(test_sch_engine PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sch_engine COMMAND test_sch_engine)
 
+# PCB DRC geometry — the copper model's input coverage, not its rule ordering.
+# Arc-kind tracks were dropped by track_shape(), so they were invisible to DRC,
+# to the autorouter's obstacle map and to zone-fill's keepout carve (all three
+# read copper_shapes()) — the router could lay a track across an arc of another
+# net and a pour could flood it, creating a short DRC then could not see. Zone
+# copper was absent from the DRC model entirely, so a pour left stale by a moved
+# footprint went unreported. Net classes were honored for clearance but not for
+# track width or via size, so a track thinner than its own class's minimum
+# passed. Each case here fails against the pre-fix engine.
+add_executable(test_drc_geometry tests/test_drc_geometry.cpp)
+target_include_directories(test_drc_geometry PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_drc_geometry PRIVATE chudware_ecad)
+set_target_properties(test_drc_geometry PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME drc_geometry COMMAND test_drc_geometry)
+
 # T-RF19 (leaf 5): structural engine surface — aicad.structure/1 document model,
 # the direct-stiffness 3D frame solver (PyNite-equivalent subset: global-
 # direction point/distributed member loads, fully-fixed supports, ASCE 7

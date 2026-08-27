@@ -254,7 +254,9 @@ std::complex<double> ac_phasor(const json& d) {
 }
 
 // AC/noise frequency sweep grid (dec/oct/lin) — circuit.py::_freq_grid.
-std::vector<double> freq_grid(const json& an) {
+template <bool Cancellable>
+std::vector<double> freq_grid(const json& an, const SimCancelToken& cancel_token,
+                              bool& was_cancelled) {
     std::string sweep = an.value("sweep", std::string("dec"));
     int points = (int)as_num(an.value("points", json(10)), 10);
     double fstart = as_num(an.value("fstart", json(1.0)), 1.0);
@@ -263,6 +265,13 @@ std::vector<double> freq_grid(const json& an) {
     std::vector<double> out;
     auto logspace = [&](double a, double b, int n) {
         for (int i = 0; i < n; ++i) {
+            if constexpr (Cancellable) {
+                if ((i & 1023) == 0 &&
+                    cancel_token->load(std::memory_order_relaxed)) {
+                    was_cancelled = true;
+                    break;
+                }
+            }
             double t = n > 1 ? (double)i / (n - 1) : 0.0;
             out.push_back(std::pow(10.0, a + (b - a) * t));
         }
@@ -277,7 +286,16 @@ std::vector<double> freq_grid(const json& an) {
         logspace(std::log10(fstart), std::log10(fstop), nf);
     } else {
         int n = std::max(2, points);
-        for (int i = 0; i < n; ++i) out.push_back(fstart + (fstop - fstart) * (double)i / (n - 1));
+        for (int i = 0; i < n; ++i) {
+            if constexpr (Cancellable) {
+                if ((i & 1023) == 0 &&
+                    cancel_token->load(std::memory_order_relaxed)) {
+                    was_cancelled = true;
+                    break;
+                }
+            }
+            out.push_back(fstart + (fstop - fstart) * (double)i / (n - 1));
+        }
     }
     return out;
 }
@@ -1727,7 +1745,24 @@ std::string validate_spice_inputs(const json& circuit, const json& study) {
 
 }  // namespace
 
-json spice_simulate(const json& circuit, const json& study) {
+template <bool Cancellable>
+json spice_simulate_impl(const json& circuit, const json& study,
+                         const SimCancelToken& cancel_token) {
+    auto cancelled_without_result = [] {
+        return json{{"ok", false},
+                    {"cancelled", true},
+                    {"error", "simulation cancelled"},
+                    {"message", "SPICE simulation cancelled"},
+                    {"log", json::array({"simulation cancelled"})},
+                    {"convergence", json::object()},
+                    {"cache_hit", false},
+                    {"cache_reason", "cancelled"},
+                    {"input_hash", nullptr}};
+    };
+    if constexpr (Cancellable) {
+        if (cancel_token->load(std::memory_order_relaxed))
+            return cancelled_without_result();
+    }
     std::string setup_error;
     try {
         setup_error = validate_spice_inputs(circuit, study);
@@ -1747,6 +1782,13 @@ json spice_simulate(const json& circuit, const json& study) {
     json cache_study = study;
     cache_study["_solver_revision"] = 5;
     const std::string input_hash = chudware::sim::cache::hash_spice(circuit, cache_study);
+    if constexpr (Cancellable) {
+        if (cancel_token->load(std::memory_order_relaxed)) {
+            json out = cancelled_without_result();
+            out["input_hash"] = input_hash;
+            return out;
+        }
+    }
     {
         auto hit = chudware::sim::cache::lookup(chudware::sim::cache::Kind::Spice, input_hash);
         if (hit.hit) {
@@ -1754,6 +1796,13 @@ json spice_simulate(const json& circuit, const json& study) {
             out["cache_hit"] = true;
             out["cache_reason"] = "hit";
             out["input_hash"] = input_hash;
+            if constexpr (Cancellable) {
+                if (cancel_token->load(std::memory_order_relaxed)) {
+                    json cancelled = cancelled_without_result();
+                    cancelled["input_hash"] = input_hash;
+                    return cancelled;
+                }
+            }
             return out;
         }
     }
@@ -1776,6 +1825,27 @@ json spice_simulate(const json& circuit, const json& study) {
     };
     json result = {{"log", json::array()}, {"convergence", json::object()}};
     auto log = [&](const std::string& m) { result["log"].push_back(m); };
+    bool was_cancelled = false;
+    auto cancellation_requested = [&]() noexcept {
+        if constexpr (Cancellable) {
+            if (cancel_token->load(std::memory_order_relaxed)) {
+                was_cancelled = true;
+                return true;
+            }
+        }
+        return false;
+    };
+    auto cancelled_result = [&]() -> json {
+        result["ok"] = false;
+        result["cancelled"] = true;
+        result["error"] = "simulation cancelled";
+        result["message"] = "SPICE simulation cancelled";
+        result["log"].push_back("simulation cancelled; partial results retained");
+        result["cache_hit"] = false;
+        result["cache_reason"] = "cancelled";
+        result["input_hash"] = input_hash;
+        return std::move(result);
+    };
 
     static const json empty_arr = json::array();
     static const json empty_obj = json::object();
@@ -1911,6 +1981,7 @@ json spice_simulate(const json& circuit, const json& study) {
         if (gmin_floor > 0)
             for (int i = 0; i < s.n_nodes; ++i) mna.G(i, i, gmin_floor);
         for (const json& d : devices) {
+            if (cancellation_requested()) return "simulation cancelled";
             std::string kind = d.value("kind", std::string());
             if (kind == "C") continue;  // open at DC
             if (kind == "K") continue;  // relational coupling — stamps nothing itself
@@ -1954,6 +2025,11 @@ json spice_simulate(const json& circuit, const json& study) {
                          std::vector<double>& out, std::string& err) -> bool {
         std::vector<double> x = x0;
         for (int it = 1; it <= s.maxiter; ++it) {
+            if (cancellation_requested()) {
+                err = "simulation cancelled";
+                out = x;
+                return false;
+            }
             err = stamp_all_dc(mna, x, src_scale, src_override, gmin_floor);
             if (!err.empty()) return false;
             std::vector<double> xnew;
@@ -1996,6 +2072,7 @@ json spice_simulate(const json& circuit, const json& study) {
             log("op: converged");
             return true;
         }
+        if (was_cancelled) return false;
         if (!has_nonlinear) { log("op: linear solve failed — " + err); return false; }
 
         // 2. gmin stepping: ramp the node-to-ground floor from 1e-2 down to the option gmin,
@@ -2005,6 +2082,7 @@ json spice_simulate(const json& circuit, const json& study) {
         std::vector<double> x = x0;
         bool gok = false;
         while (gstep >= gmin / 10.0) {
+            if (cancellation_requested()) return false;
             std::vector<double> xs;
             std::string e;
             if (newton_dc(mna, x, gstep, base_scale, src_override, xs, e) && e.empty()) {
@@ -2015,6 +2093,7 @@ json spice_simulate(const json& circuit, const json& study) {
                 gstep *= 1.5;
                 if (gstep > 1.0) break;
             }
+            if (was_cancelled) return false;
         }
         if (gok) {
             std::vector<double> xs;
@@ -2024,6 +2103,7 @@ json spice_simulate(const json& circuit, const json& study) {
                 out = xs;
                 return true;
             }
+            if (was_cancelled) return false;
         }
 
         // 3. Source stepping.
@@ -2037,11 +2117,13 @@ json spice_simulate(const json& circuit, const json& study) {
         std::vector<double> xss(dim, 0.0);
         bool all_ok = true;
         for (double alpha : steps) {
+            if (cancellation_requested()) return false;
             std::map<std::string, double> scale;
             for (const std::string& nm : src_names) scale[nm] = alpha;
             std::vector<double> xs;
             std::string e;
             if (!newton_dc(mna, xss, gmin, scale, src_override, xs, e) || !e.empty()) { all_ok = false; break; }
+            if (was_cancelled) return false;
             xss = xs;
         }
         if (all_ok) { log("op: source stepping converged"); out = xss; return true; }
@@ -2073,6 +2155,7 @@ json spice_simulate(const json& circuit, const json& study) {
         // a node-to-ground gmin conductance — only the DC/transient real-MNA paths do. Matching
         // that here keeps the linear .tf/.ac results bit-tight to the oracle.
         for (const json& d : devices) {
+            if (cancellation_requested()) return;
             std::string kind = d.value("kind", std::string());
             std::string name = d.value("name", std::string());
             int a0 = N(d, 0), b0 = N(d, 1);
@@ -2277,12 +2360,15 @@ json spice_simulate(const json& circuit, const json& study) {
     // These mirror circuit.py::simulate's top-level routing: a `step` spec wraps the remaining
     // analyses; `mc`/`temp` entries are additive. Each re-invokes spice_simulate on a modified
     // circuit JSON (matching the oracle's deep-copy-and-resimulate semantics exactly).
-
     // Resolve the swept values from a step spec (circuit.py::_step_values).
-    auto step_values = [](const json& spec) -> std::vector<double> {
+    auto step_values = [&](const json& spec) -> std::vector<double> {
         std::vector<double> out;
         if (spec.contains("values") && spec["values"].is_array()) {
-            for (const auto& v : spec["values"]) out.push_back(v.get<double>());
+            std::size_t i = 0;
+            for (const auto& v : spec["values"]) {
+                if ((i++ & 1023u) == 0u && cancellation_requested()) break;
+                out.push_back(v.get<double>());
+            }
             return out;
         }
         double start = as_num(spec.value("start", json(0.0)), 0.0);
@@ -2292,8 +2378,10 @@ json spice_simulate(const json& circuit, const json& study) {
         if (start == stop) return out;
         for (double value = start + step;
              (step > 0.0 ? value <= stop : value >= stop) && out.size() <= 1'000'000;
-             value = start + step * static_cast<double>(out.size()))
+             value = start + step * static_cast<double>(out.size())) {
+            if ((out.size() & 1023u) == 0u && cancellation_requested()) break;
             out.push_back(value);
+        }
         return out;
     };
     // Apply a stepped parameter to a circuit JSON in place (circuit.py::_apply_step_param).
@@ -2330,15 +2418,14 @@ json spice_simulate(const json& circuit, const json& study) {
         std::vector<double> values = step_values(step_spec);
         json runs = json::array();
         bool all_ok = true;
-        json vlog = json::array();
-        for (double v : values) vlog.push_back(v);
         log("step: sweeping '" + param + "' over " + std::to_string(values.size()) + " values");
         for (double v : values) {
+            if (cancellation_requested()) break;
             json c = circuit;
             apply_step_param(c, param, v);
             json sub_study = {{"analyses", inner_analyses}, {"probes", probes}};
             if (study.contains("options")) sub_study["options"] = study["options"];
-            json sub = spice_simulate(c, sub_study);
+            json sub = spice_simulate_impl<Cancellable>(c, sub_study, cancel_token);
             json run = {{"value", v}, {"convergence", sub.value("convergence", json::object())},
                         {"log", sub.value("log", json::array())}};
             for (const char* k : {"op", "dc", "tran", "ac", "tf", "four", "noise"})
@@ -2346,9 +2433,11 @@ json spice_simulate(const json& circuit, const json& study) {
             for (auto& kv : run["convergence"].items())
                 if (!kv.value().get<bool>()) all_ok = false;
             runs.push_back(run);
+            if (cancellation_requested()) break;
         }
         result["step"] = {{"param", param}, {"values", values}, {"runs", runs}};
-        result["convergence"]["step"] = all_ok;
+        result["convergence"]["step"] = !was_cancelled && all_ok;
+        if (was_cancelled) return cancelled_result();
         return finish(std::move(result));
     }
 
@@ -2364,7 +2453,11 @@ json spice_simulate(const json& circuit, const json& study) {
         // Temperature sweep (analysis_ext.py::run_temp_sweep): rebuild + re-run per TEMP value.
         std::vector<double> temps;
         if (temp_spec.contains("values") && temp_spec["values"].is_array()) {
-            for (const auto& v : temp_spec["values"]) temps.push_back(v.get<double>());
+            std::size_t i = 0;
+            for (const auto& v : temp_spec["values"]) {
+                if ((i++ & 1023u) == 0u && cancellation_requested()) break;
+                temps.push_back(v.get<double>());
+            }
         } else {
             double start = as_num(temp_spec.value("start", json(27.0)), 27.0);
             double stop = as_num(temp_spec.value("stop", json(27.0)), 27.0);
@@ -2374,15 +2467,19 @@ json spice_simulate(const json& circuit, const json& study) {
                 for (double value = start + step;
                      (step > 0.0 ? value <= stop : value >= stop) &&
                      temps.size() <= 1'000'000;
-                     value = start + step * static_cast<double>(temps.size()))
+                     value = start + step * static_cast<double>(temps.size())) {
+                    if ((temps.size() & 1023u) == 0u && cancellation_requested()) break;
                     temps.push_back(value);
+                }
             }
         }
         json inner = temp_spec.contains("analysis") && temp_spec["analysis"].is_object()
                          ? temp_spec["analysis"] : json{{"type", "op"}};
         json points = json::array();
         bool temp_ok = !temps.empty();
+        std::vector<double> completed_temps;
         for (double tc : temps) {
+            if (cancellation_requested()) break;
             json c = circuit;
             if (!c["params"].is_object()) c["params"] = json::object();
             c["params"]["TEMP"] = tc;
@@ -2391,7 +2488,7 @@ json spice_simulate(const json& circuit, const json& study) {
             opt["temp"] = tc;
             json sub_study = {{"analyses", json::array({inner})}, {"probes", probes},
                              {"options", opt}};
-            json res = spice_simulate(c, sub_study);
+            json res = spice_simulate_impl<Cancellable>(c, sub_study, cancel_token);
             json entry = {{"temp", tc}};
             for (const char* k : {"op", "dc", "tran", "ac", "convergence"})
                 if (res.contains(k)) entry[k] = res[k];
@@ -2401,10 +2498,13 @@ json spice_simulate(const json& circuit, const json& study) {
                 if (!convergence.value().is_boolean() || !convergence.value().get<bool>())
                     temp_ok = false;
             points.push_back(entry);
+            completed_temps.push_back(tc);
+            if (cancellation_requested()) break;
         }
-        log("temp: swept " + std::to_string(temps.size()) + " points");
-        result["temp"] = {{"values", temps}, {"points", points}};
-        result["convergence"]["temp"] = temp_ok;
+        log("temp: swept " + std::to_string(completed_temps.size()) + " points");
+        result["temp"] = {{"values", completed_temps}, {"points", points}};
+        result["convergence"]["temp"] = !was_cancelled && temp_ok;
+        if (was_cancelled) return cancelled_result();
         // Run any remaining (non-temp) analyses on the nominal circuit too.
         json rest = json::array();
         for (const json& a : inner_analyses)
@@ -2412,13 +2512,15 @@ json spice_simulate(const json& circuit, const json& study) {
         if (!rest.empty()) {
             json sub_study = {{"analyses", rest}, {"probes", probes}};
             if (study.contains("options")) sub_study["options"] = study["options"];
-            json sub = spice_simulate(circuit, sub_study);
+            json sub =
+                spice_simulate_impl<Cancellable>(circuit, sub_study, cancel_token);
             for (const char* k : {"op", "dc", "tran", "ac", "tf", "four", "noise"})
                 if (sub.contains(k)) result[k] = sub[k];
             const json convergence_map =
                 sub.value("convergence", json::object());
             for (const auto& kv : convergence_map.items())
                 result["convergence"][kv.key()] = kv.value();
+            if (cancellation_requested()) return cancelled_result();
         }
         return finish(std::move(result));
     }
@@ -2524,10 +2626,13 @@ json spice_simulate(const json& circuit, const json& study) {
         NumpyGenerator rng(seed);
         std::vector<double> values;
         int n_ok = 0;
+        int attempted_runs = 0;
         int failure_diagnostics = 0;
         constexpr int kMaxFailureDiagnostics = 8;
         json inner_probes = json::array({probe});
         for (int run = 0; run < runs; ++run) {
+            if (cancellation_requested()) break;
+            ++attempted_runs;
             json c = circuit;
             if (c.contains("devices") && c["devices"].is_array()) {
                 for (json& d : c["devices"]) {
@@ -2550,7 +2655,8 @@ json spice_simulate(const json& circuit, const json& study) {
             }
             json sub_study = {{"analyses", json::array({inner})}, {"probes", inner_probes}};
             if (study.contains("options")) sub_study["options"] = study["options"];
-            json res = spice_simulate(c, sub_study);
+            json res = spice_simulate_impl<Cancellable>(c, sub_study, cancel_token);
+            if (cancellation_requested()) break;
             auto [sc, got] = scalar_from_result(res);
             if (got && std::isfinite(sc)) {
                 values.push_back(sc);
@@ -2564,38 +2670,52 @@ json spice_simulate(const json& circuit, const json& study) {
                 ++failure_diagnostics;
             }
         }
-        if (runs - n_ok > failure_diagnostics)
-            log("mc: " + std::to_string(runs - n_ok - failure_diagnostics) +
+        if (attempted_runs - n_ok > failure_diagnostics)
+            log("mc: " + std::to_string(attempted_runs - n_ok - failure_diagnostics) +
                 " additional failed-run diagnostics omitted");
 
         if (values.empty()) {
-            log("mc: " + std::to_string(runs) + " runs produced no converged finite samples for " + probe);
+            log("mc: " + std::to_string(attempted_runs) +
+                " attempted runs produced no converged finite samples for " + probe);
             result["mc"] = {{"values", json::array()}, {"mean", nullptr},
                             {"std", nullptr}, {"min", nullptr},
                             {"max", nullptr}, {"runs", 0}, {"requested_runs", runs},
-                            {"attempted_runs", runs}, {"failed_runs", runs},
+                            {"attempted_runs", attempted_runs},
+                            {"failed_runs", attempted_runs},
                             {"probe", probe}, {"seed", seed}};
             result["convergence"]["mc"] = false;
         } else {
             // numpy mean / std(ddof=1) / min / max.
             double sum = 0.0, vmin = values[0], vmax = values[0];
-            for (double v : values) { sum += v; vmin = std::min(vmin, v); vmax = std::max(vmax, v); }
+            std::size_t summary_i = 0;
+            for (double v : values) {
+                if ((summary_i++ & 1023u) == 0u && cancellation_requested()) break;
+                sum += v;
+                vmin = std::min(vmin, v);
+                vmax = std::max(vmax, v);
+            }
             double mean = sum / (double)values.size();
             double stddev = 0.0;
             if (values.size() > 1) {
                 double ss = 0.0;
-                for (double v : values) { double d = v - mean; ss += d * d; }
+                summary_i = 0;
+                for (double v : values) {
+                    if ((summary_i++ & 1023u) == 0u && cancellation_requested()) break;
+                    double d = v - mean;
+                    ss += d * d;
+                }
                 stddev = std::sqrt(ss / (double)(values.size() - 1));  // ddof=1
             }
             json tol_out = json::object();
             for (auto& kv : tol) tol_out[kv.first] = kv.second;
             result["mc"] = {{"probe", probe}, {"seed", seed}, {"runs", n_ok},
-                            {"requested_runs", runs}, {"attempted_runs", runs},
-                            {"failed_runs", runs - n_ok}, {"values", values},
+                            {"requested_runs", runs}, {"attempted_runs", attempted_runs},
+                            {"failed_runs", attempted_runs - n_ok}, {"values", values},
                             {"mean", mean}, {"std", stddev},
                             {"min", vmin}, {"max", vmax}, {"tol", tol_out}};
-            result["convergence"]["mc"] = n_ok == runs;
+            result["convergence"]["mc"] = !was_cancelled && n_ok == runs;
         }
+        if (was_cancelled) return cancelled_result();
 
         // Run any remaining (non-mc) analyses on the nominal circuit too.
         json rest = json::array();
@@ -2604,23 +2724,30 @@ json spice_simulate(const json& circuit, const json& study) {
         if (!rest.empty()) {
             json sub_study = {{"analyses", rest}, {"probes", probes}};
             if (study.contains("options")) sub_study["options"] = study["options"];
-            json sub = spice_simulate(circuit, sub_study);
+            json sub =
+                spice_simulate_impl<Cancellable>(circuit, sub_study, cancel_token);
             for (const char* k : {"op", "dc", "tran", "ac", "tf", "four", "noise"})
                 if (sub.contains(k)) result[k] = sub[k];
             const json convergence_map =
                 sub.value("convergence", json::object());
             for (const auto& kv : convergence_map.items())
                 result["convergence"][kv.key()] = kv.value();
+            if (cancellation_requested()) return cancelled_result();
         }
         return finish(std::move(result));
     }
 
     for (const json& a : inner_analyses) {
+        if (cancellation_requested()) return cancelled_result();
         std::string atype = lower(a.value("type", std::string()));
         if (atype == "step" || atype == "mc" || atype == "temp") continue;
         if (atype == "op") {
             std::vector<double> x;
             bool ok = solve_dc_op(x);
+            if (was_cancelled) {
+                result["convergence"]["op"] = false;
+                return cancelled_result();
+            }
             if (!ok && dim == 0) { ok = true; x.assign(dim, 0.0); }
             result["convergence"]["op"] = ok;
             if (ok) {
@@ -2645,8 +2772,10 @@ json spice_simulate(const json& circuit, const json& study) {
                 for (double value = start + step;
                      (step > 0.0 ? value <= stop : value >= stop) &&
                      xs.size() <= 1'000'000;
-                     value = start + step * static_cast<double>(xs.size()))
+                     value = start + step * static_cast<double>(xs.size())) {
+                    if (cancellation_requested()) break;
                     xs.push_back(value);
+                }
             }
             bool found = false;
             for (const json& d : devices) {
@@ -2658,26 +2787,38 @@ json spice_simulate(const json& circuit, const json& study) {
             bool converged = found;
             if (!found) log("dc: source '" + src + "' not found (V/I sweep only)");
             std::vector<double> guess;
+            std::size_t completed_points = 0;
             if (found) {
                 for (double xv : xs) {
+                    if (cancellation_requested()) break;
                     std::map<std::string, double> ov{{src, xv}};
                     std::vector<double> x;
                     if (!solve_dc_op_full(x, guess, ov)) {
                         converged = false;
-                        for (const json& pr : probes) traces[pr.get<std::string>()].push_back(nullptr);
+                        if (was_cancelled) break;
+                        for (const json& pr : probes)
+                            traces[pr.get<std::string>()].push_back(nullptr);
+                        ++completed_points;
                         continue;
                     }
                     guess = x;
                     for (const json& pr : probes) {
                         json v = eval_probe(s, x, pr.get<std::string>());
-                        traces[pr.get<std::string>()].push_back(v.is_number() ? v : json(nullptr));
+                        traces[pr.get<std::string>()].push_back(
+                            v.is_number() ? v : json(nullptr));
                     }
+                    ++completed_points;
                 }
+            }
+            if (was_cancelled) {
+                converged = false;
+                xs.resize(completed_points);
             }
             json dcj = {{"sweep", src}, {"x", xs}, {"traces", json::object()}};
             for (const json& pr : probes) dcj["traces"][pr.get<std::string>()] = traces[pr.get<std::string>()];
             result["dc"] = dcj;
             result["convergence"]["dc"] = converged;
+            if (was_cancelled) return cancelled_result();
         } else if (atype == "tran") {
             // ---- transient (trapezoidal + BE bootstrap), inner Newton for nonlinear ----
             double tstep = as_num(a.value("tstep", json(1e-6)), 1e-6);
@@ -2690,6 +2831,7 @@ json spice_simulate(const json& circuit, const json& study) {
             std::vector<double> x(dim, 0.0);
             if (uic) {
                 for (const json& d : devices) {
+                    if (cancellation_requested()) break;
                     const json& p = params_of(d);
                     if (!p.contains("ic")) continue;
                     double ic = as_num(p["ic"], 0.0);
@@ -2699,6 +2841,10 @@ json spice_simulate(const json& circuit, const json& study) {
                 }
             } else {
                 if (!solve_dc_op(x)) {
+                    if (was_cancelled) {
+                        result["convergence"]["tran"] = false;
+                        return cancelled_result();
+                    }
                     if (dim != 0) {
                         log("tran: initial DC op failed");
                         result["convergence"]["tran"] = false;
@@ -2712,8 +2858,13 @@ json spice_simulate(const json& circuit, const json& study) {
             std::set<double> bpset;
             if (tstart > 0.0) bpset.insert(tstart);
             for (const json& d : devices) {
+                if (cancellation_requested()) break;
                 std::string kind = d.value("kind", std::string());
                 if (kind == "V" || kind == "I") source_breakpoints(d, tstop, bpset);
+            }
+            if (was_cancelled) {
+                result["convergence"]["tran"] = false;
+                return cancelled_result();
             }
             std::vector<double> breakpoints;
             for (double b : bpset)
@@ -2727,6 +2878,7 @@ json spice_simulate(const json& circuit, const json& study) {
                     for (int i = 0; i < s.n_nodes; ++i) mna.G(i, i, gmin);
                 std::map<std::string, double> no_scale;
                 for (const json& d : devices) {
+                    if (cancellation_requested()) return;
                     std::string kind = d.value("kind", std::string());
                     std::string name = d.value("name", std::string());
                     if (kind == "C") {
@@ -2834,6 +2986,7 @@ json spice_simulate(const json& circuit, const json& study) {
             auto update_state = [&](const std::vector<double>& xn, double dt, bool trap,
                                     double t_now) {
                 for (const json& d : devices) {
+                    if (cancellation_requested()) return;
                     std::string kind = d.value("kind", std::string());
                     std::string name = d.value("name", std::string());
                     if (kind == "C") {
@@ -2915,7 +3068,15 @@ json spice_simulate(const json& circuit, const json& study) {
                                    double t, std::vector<double>& out) -> bool {
                 std::vector<double> xx = x0;
                 for (int it = 1; it <= s.maxiter; ++it) {
+                    if (cancellation_requested()) {
+                        out = xx;
+                        return false;
+                    }
                     stamp_tran(mna, xx, dt, trap, t);
+                    if (was_cancelled) {
+                        out = xx;
+                        return false;
+                    }
                     std::vector<double> xnew;
                     if (!solve_dense(mna, xnew)) return false;
                     if (!has_nonlinear) { out = xnew; return true; }
@@ -2955,6 +3116,10 @@ json spice_simulate(const json& circuit, const json& study) {
             long max_steps = static_cast<long>(tstop / tstep * 4) + 1000;
             long n_steps = 0;
             while (t < tstop - 1e-15 && n_steps < max_steps) {
+                if (cancellation_requested()) {
+                    converged = false;
+                    break;
+                }
                 ++n_steps;
                 double dt = step;
                 bool trap = !first;  // BE bootstrap on the first step
@@ -2969,11 +3134,19 @@ json spice_simulate(const json& circuit, const json& study) {
                 dt = tnew - t;
                 std::vector<double> xn;
                 if (!newton_tran(mna, x, dt, trap, tnew, xn)) {
+                    if (was_cancelled) {
+                        converged = false;
+                        break;
+                    }
                     log("tran: non-convergence at t=" + std::to_string(tnew));
                     converged = false;
                     break;
                 }
                 update_state(xn, dt, trap, tnew);
+                if (was_cancelled) {
+                    converged = false;
+                    break;
+                }
                 x = xn;
                 t = tnew;
                 if (t + 1e-18 >= tstart) {
@@ -2998,16 +3171,22 @@ json spice_simulate(const json& circuit, const json& study) {
             for (const json& pr : probes) tr["traces"][pr.get<std::string>()] = traces[pr.get<std::string>()];
             result["tran"] = tr;
             result["convergence"]["tran"] = converged;
+            if (was_cancelled) return cancelled_result();
         } else if (atype == "ac") {
             // ---- AC sweep: complex MNA (G + jwC) per frequency, linearized about DC op ----
             std::vector<double> x_op(dim, 0.0);
             bool ac_ok = true;
             if (has_nonlinear && !solve_dc_op(x_op)) {
+                if (was_cancelled) {
+                    result["convergence"]["ac"] = false;
+                    return cancelled_result();
+                }
                 x_op.assign(dim, 0.0);
                 ac_ok = false;
                 log("ac: DC op for linearization failed");
             }
-            std::vector<double> freqs = freq_grid(a);
+            std::vector<double> freqs =
+                freq_grid<Cancellable>(a, cancel_token, was_cancelled);
             std::map<std::string, json> mag, phase;
             for (const json& pr : probes) {
                 mag[pr.get<std::string>()] = json::array();
@@ -3015,9 +3194,18 @@ json spice_simulate(const json& circuit, const json& study) {
             }
             Eigen::MatrixXcd A(dim, dim);
             Eigen::VectorXcd z(dim);
+            std::size_t completed_freqs = 0;
             for (double f : freqs) {
+                if (cancellation_requested()) {
+                    ac_ok = false;
+                    break;
+                }
                 double omega = 2.0 * kPi * f;
                 stamp_ac_complex(A, z, omega, x_op, /*null_sources=*/false);
+                if (was_cancelled) {
+                    ac_ok = false;
+                    break;
+                }
                 Eigen::VectorXcd xv;
                 const bool finite_solution = ac_ok && solve_dense_complex(A, z, xv);
                 if (!finite_solution) ac_ok = false;
@@ -3035,7 +3223,9 @@ json spice_simulate(const json& circuit, const json& study) {
                         phase[pr.get<std::string>()].push_back(nullptr);
                     }
                 }
+                ++completed_freqs;
             }
+            if (was_cancelled) freqs.resize(completed_freqs);
             json acj = {{"x_f", freqs}, {"mag", json::object()}, {"phase_deg", json::object()}};
             for (const json& pr : probes) {
                 acj["mag"][pr.get<std::string>()] = mag[pr.get<std::string>()];
@@ -3043,6 +3233,7 @@ json spice_simulate(const json& circuit, const json& study) {
             }
             result["ac"] = acj;
             result["convergence"]["ac"] = ac_ok;
+            if (was_cancelled) return cancelled_result();
         } else if (atype == "tf") {
             // ---- small-signal transfer function (.tf): gain, rin, rout (circuit.py::run_tf) ----
             std::string output = a.contains("output") && a["output"].is_string()
@@ -3056,6 +3247,11 @@ json spice_simulate(const json& circuit, const json& study) {
             bool tf_ok = true;
             std::vector<double> x_op(dim, 0.0);
             if (has_nonlinear && !solve_dc_op(x_op)) {
+                if (was_cancelled) {
+                    failed_tf();
+                    result["convergence"]["tf"] = false;
+                    return cancelled_result();
+                }
                 x_op.assign(dim, 0.0);
                 tf_ok = false;
                 log("tf: DC op for linearization failed");
@@ -3115,6 +3311,11 @@ json spice_simulate(const json& circuit, const json& study) {
 
             // --- gain + rin: unit drive of the chosen source, all others nulled ---
             stamp_ac_complex(A, z, 0.0, x_op, /*null_sources=*/true);
+            if (was_cancelled) {
+                failed_tf();
+                result["convergence"]["tf"] = false;
+                return cancelled_result();
+            }
             if (src_kind == "V") {
                 z(s.branch_of.at(source)) += cd(1.0, 0.0);  // unit voltage on its branch RHS
             } else {  // I: inject 1 A into the from-node, out of the to-node
@@ -3146,6 +3347,11 @@ json spice_simulate(const json& circuit, const json& study) {
 
             // --- rout: all independent sources nulled, 1 A test current across the output nodes ---
             stamp_ac_complex(A, z, 0.0, x_op, /*null_sources=*/true);
+            if (was_cancelled) {
+                failed_tf();
+                result["convergence"]["tf"] = false;
+                return cancelled_result();
+            }
             if (oi >= 0) z(oi) += cd(1.0, 0.0);
             if (oj >= 0) z(oj) += cd(-1.0, 0.0);
             {
@@ -3179,7 +3385,8 @@ json spice_simulate(const json& circuit, const json& study) {
             // ---- resistor-thermal output noise (analysis_ext.py::run_noise) ----
             std::string output = a.contains("output") && a["output"].is_string()
                                      ? a["output"].get<std::string>() : "V(OUT)";
-            std::vector<double> freqs = freq_grid(a);
+            std::vector<double> freqs =
+                freq_grid<Cancellable>(a, cancel_token, was_cancelled);
             double tkelvin = s.temp_c + 273.15;
             double four_kt = 4.0 * kBoltz * tkelvin;
 
@@ -3187,7 +3394,8 @@ json spice_simulate(const json& circuit, const json& study) {
             // unless tc1/tc2 are present — match the device value path).
             struct ResNode { std::string name; int a, b; double r; };
             std::vector<ResNode> resnodes;
-            for (const json& d : devices)
+            for (const json& d : devices) {
+                if (cancellation_requested()) break;
                 if (d.value("kind", std::string()) == "R") {
                     int a0 = s.n(d["nodes"][0].get<std::string>());
                     int b0 = s.n(d["nodes"][1].get<std::string>());
@@ -3195,21 +3403,38 @@ json spice_simulate(const json& circuit, const json& study) {
                     if (std::abs(r) < 1e-12) r = 1e-9;
                     resnodes.push_back({d.value("name", std::string()), a0, b0, r});
                 }
+            }
+            if (was_cancelled) {
+                result["convergence"]["noise"] = false;
+                return cancelled_result();
+            }
 
             if (resnodes.empty()) {
                 json zeros = json::array();
-                for (std::size_t i = 0; i < freqs.size(); ++i) zeros.push_back(0.0);
+                for (std::size_t i = 0; i < freqs.size(); ++i) {
+                    if (cancellation_requested()) break;
+                    zeros.push_back(0.0);
+                }
+                if (was_cancelled) freqs.resize(zeros.size());
                 result["noise"] = {{"x_f", freqs}, {"output", output},
                                    {"onoise_spectrum", zeros}, {"total_noise_rms", 0.0},
                                    {"per_resistor", json::object()}};
                 result["convergence"]["noise"] = true;
                 log("noise: no resistors -> no thermal-noise sources modeled");
+                if (was_cancelled) {
+                    result["convergence"]["noise"] = false;
+                    return cancelled_result();
+                }
                 continue;
             }
 
             std::vector<double> x_op(dim, 0.0);
             bool noise_ok = true;
             if (has_nonlinear && !solve_dc_op(x_op)) {
+                if (was_cancelled) {
+                    result["convergence"]["noise"] = false;
+                    return cancelled_result();
+                }
                 x_op.assign(dim, 0.0);
                 noise_ok = false;
                 log("noise: DC op for linearization failed");
@@ -3221,13 +3446,26 @@ json spice_simulate(const json& circuit, const json& study) {
             // noise_ok may already be false when nonlinear bias failed.
             Eigen::MatrixXcd A(dim, dim);
             Eigen::VectorXcd z(dim);
+            std::size_t completed_noise_freqs = 0;
             for (std::size_t fi = 0; fi < freqs.size(); ++fi) {
+                if (cancellation_requested()) {
+                    noise_ok = false;
+                    break;
+                }
                 double omega = 2.0 * kPi * freqs[fi];
                 for (const auto& rn : resnodes) {
+                    if (cancellation_requested()) {
+                        noise_ok = false;
+                        break;
+                    }
                     if (rn.r <= 0.0) continue;
                     // Noise transfer functions are computed with every independent
                     // source nulled, then a unit test current is injected across R_k.
                     stamp_ac_complex(A, z, omega, x_op, /*null_sources=*/true);
+                    if (was_cancelled) {
+                        noise_ok = false;
+                        break;
+                    }
                     if (rn.a >= 0) z(rn.a) += cd(1.0, 0.0);
                     if (rn.b >= 0) z(rn.b) += cd(-1.0, 0.0);
                     Eigen::VectorXcd xv;
@@ -3244,31 +3482,67 @@ json spice_simulate(const json& circuit, const json& study) {
                     per_spec[rn.name][fi] = contrib;
                     onoise_psd[fi] += contrib;
                 }
+                if (was_cancelled) break;
+                ++completed_noise_freqs;
+            }
+            if (was_cancelled) {
+                freqs.resize(completed_noise_freqs);
+                onoise_psd.resize(completed_noise_freqs);
+                for (auto& [name, spectrum] : per_spec)
+                    spectrum.resize(completed_noise_freqs);
+                result["noise"] = {{"x_f", freqs},
+                                   {"output", output},
+                                   {"onoise_psd", onoise_psd},
+                                   {"onoise_spectrum", json::array()},
+                                   {"total_noise_rms", nullptr},
+                                   {"per_resistor", json::object()},
+                                   {"temp_c", s.temp_c}};
+                result["convergence"]["noise"] = false;
+                return cancelled_result();
             }
 
             // Integrated RMS over the band: sqrt(trapezoid integral of PSD over f).
             auto trapz = [&](const std::vector<double>& y) -> double {
                 double acc = 0.0;
-                for (std::size_t i = 0; i + 1 < freqs.size(); ++i)
+                for (std::size_t i = 0; i + 1 < freqs.size(); ++i) {
+                    if ((i & 1023u) == 0u && cancellation_requested()) break;
                     acc += 0.5 * (y[i] + y[i + 1]) * (freqs[i + 1] - freqs[i]);
+                }
                 return acc;
             };
             double total_var = freqs.size() >= 2 ? trapz(onoise_psd) : 0.0;
+            if (was_cancelled) {
+                result["noise"] = {{"x_f", freqs}, {"output", output},
+                                   {"onoise_psd", onoise_psd},
+                                   {"onoise_spectrum", json::array()},
+                                   {"total_noise_rms", nullptr},
+                                   {"per_resistor", json::object()},
+                                   {"temp_c", s.temp_c}};
+                result["convergence"]["noise"] = false;
+                return cancelled_result();
+            }
             double total_rms = std::sqrt(std::max(total_var, 0.0));
             json per_res = json::object();
             for (const auto& rn : resnodes) {
+                if (cancellation_requested()) break;
                 double var = freqs.size() >= 2 ? trapz(per_spec[rn.name]) : 0.0;
                 per_res[rn.name] = std::sqrt(std::max(var, 0.0));
             }
             std::vector<double> onoise_density(freqs.size());
-            for (std::size_t i = 0; i < freqs.size(); ++i)
+            for (std::size_t i = 0; i < freqs.size(); ++i) {
+                if ((i & 1023u) == 0u && cancellation_requested()) break;
                 onoise_density[i] = std::sqrt(std::max(onoise_psd[i], 0.0));
+            }
 
             result["noise"] = {{"x_f", freqs}, {"output", output},
                                {"onoise_spectrum", onoise_density}, {"onoise_psd", onoise_psd},
                                {"total_noise_rms", total_rms}, {"per_resistor", per_res},
                                {"temp_c", s.temp_c}};
             result["convergence"]["noise"] = noise_ok;
+            if (was_cancelled) {
+                result["convergence"]["noise"] = false;
+                return cancelled_result();
+            }
         } else if (atype == "four") {
             // ---- Fourier / THD on a transient trace (analysis_ext.py::run_fourier) ----
             // Use a preceding tran result if present; else run a tran from this spec's own
@@ -3297,7 +3571,8 @@ json spice_simulate(const json& circuit, const json& study) {
                 json tan = a; tan["type"] = "tran";
                 json sub_study = {{"analyses", json::array({tan})}, {"probes", tprobes}};
                 if (study.contains("options")) sub_study["options"] = study["options"];
-                json sub = spice_simulate(circuit, sub_study);
+                json sub =
+                    spice_simulate_impl<Cancellable>(circuit, sub_study, cancel_token);
                 tran_res = sub.value("tran", json::object());
                 tran_converged = has_converged_tran(sub);
                 if (!tran_converged) {
@@ -3307,6 +3582,10 @@ json spice_simulate(const json& circuit, const json& study) {
                 }
                 result["tran"] = tran_res;
                 result["convergence"]["tran"] = tran_converged;
+                if (cancellation_requested()) {
+                    result["convergence"]["four"] = false;
+                    return cancelled_result();
+                }
             }
 
             // -- run_fourier --
@@ -3332,8 +3611,17 @@ json spice_simulate(const json& circuit, const json& study) {
                 nharm = std::max(1, std::min(nharm, 64));
 
                 std::vector<double> t, y;
-                for (const auto& v : tran_res.value("x_t", json::array())) t.push_back(v.get<double>());
-                for (const auto& v : traces[probe]) y.push_back(v.get<double>());
+                std::size_t copied = 0;
+                for (const auto& v : tran_res.value("x_t", json::array())) {
+                    if ((copied++ & 1023u) == 0u && cancellation_requested()) break;
+                    t.push_back(v.get<double>());
+                }
+                copied = 0;
+                for (const auto& v : traces[probe]) {
+                    if ((copied++ & 1023u) == 0u && cancellation_requested()) break;
+                    y.push_back(v.get<double>());
+                }
+                if (was_cancelled) break;
                 if (t.size() < 4 || y.size() != t.size()) { log("four: transient trace too short for Fourier"); break; }
 
                 double period = 1.0 / f0;
@@ -3348,11 +3636,13 @@ json spice_simulate(const json& circuit, const json& study) {
                 int samples_per_period = 1, target = 4 * (nharm + 1);
                 while (samples_per_period < target) samples_per_period *= 2;
                 int nfft = samples_per_period * periods;
+                if (cancellation_requested()) break;
 
                 // Uniform grid over exactly `periods` periods (exclude duplicate endpoint), then
                 // linear interpolation (numpy.interp) onto it.
                 std::vector<double> yg(nfft);
                 for (int k = 0; k < nfft; ++k) {
+                    if ((k & 1023) == 0 && cancellation_requested()) break;
                     double tk = t_start + (t_end - t_start) * (double)k / (double)nfft;
                     // np.interp: clamp outside, linear inside.
                     double val;
@@ -3366,18 +3656,25 @@ json spice_simulate(const json& circuit, const json& study) {
                     }
                     yg[k] = val;
                 }
+                if (was_cancelled) break;
 
                 // Direct DFT (rfft): bins 0..nfft/2. mags = |spec| * 2/nfft (DC halved).
                 int nbins = nfft / 2 + 1;
                 std::vector<double> mags(nbins), phases(nbins);
                 double scale = 2.0 / nfft;
                 for (int kk = 0; kk < nbins; ++kk) {
+                    if (cancellation_requested()) break;
                     cd acc(0, 0);
                     double w = -2.0 * kPi * kk / nfft;
-                    for (int nn = 0; nn < nfft; ++nn) acc += yg[nn] * std::polar(1.0, w * nn);
+                    for (int nn = 0; nn < nfft; ++nn) {
+                        if ((nn & 1023) == 0 && cancellation_requested()) break;
+                        acc += yg[nn] * std::polar(1.0, w * nn);
+                    }
+                    if (was_cancelled) break;
                     mags[kk] = std::abs(acc) * scale;
                     phases[kk] = std::atan2(acc.imag(), acc.real()) * 180.0 / kPi;
                 }
+                if (was_cancelled) break;
                 if (!mags.empty()) mags[0] *= 0.5;
 
                 double dc = mags.empty() ? 0.0 : mags[0];
@@ -3400,12 +3697,21 @@ json spice_simulate(const json& circuit, const json& study) {
                 four_ok = true;
             } while (false);
             result["convergence"]["four"] = four_ok;
+            if (was_cancelled) return cancelled_result();
         } else {
             result["convergence"][atype] = false;
             log(atype + ": analysis not yet ported to the C++ core");
         }
     }
+    if (cancellation_requested()) return cancelled_result();
     return finish(std::move(result));
+}
+
+json spice_simulate(const json& circuit, const json& study,
+                    const SimCancelToken& cancel_token) {
+    if (cancel_token)
+        return spice_simulate_impl<true>(circuit, study, cancel_token);
+    return spice_simulate_impl<false>(circuit, study, {});
 }
 
 }  // namespace chudware::sim

@@ -34,6 +34,7 @@ All values are honest closed-form designs:
   * voltage_divider(vin, vout): R_top/R_bot picked from vout = vin * Rb/(Rt+Rb).
   * rc_lowpass(fc):             R fixed, C = 1/(2*pi*fc*R); expect -3 dB at fc.
   * inverting_amp(gain):        Rf = |gain| * Rin; expect Vout = -gain * Vin (op-amp subckt).
+  * led_driver(vsupply, vf, current): R = (Vsupply - Vf) / I, rounded to a sane value.
   * rc_555_astable(freq):       standard 555 astable Ra/Rb/C for ~freq (50% approx).
 """
 
@@ -294,9 +295,6 @@ RECIPES: list[tuple[str, "callable", tuple[str, ...]]] = [
 ]
 
 
-def all_recipes() -> list[dict]:
-    """Materialize every recipe at its default parameters (used as planner few-shots)."""
-    return [build(name) for name, _b, _k in RECIPES]
 
 
 def build(name: str, **params) -> dict:

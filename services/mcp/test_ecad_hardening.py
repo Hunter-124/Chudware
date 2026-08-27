@@ -17,6 +17,7 @@ import tempfile
 import time
 
 import services.mcp.ecad_common as et  # T-RF8: budget/session internals moved
+import services.mcp.ecad_sch_tools as sch_tools
 from services.ecad import autosave as eauto
 from services.mcp.ecad_common import ecad_session as esess
 from services.mcp.ecad_tools import register_ecad_tools
@@ -626,3 +627,94 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
     if got is not None and exp is not None:
         err = abs(float(got) - float(exp)) / max(abs(float(exp)), 1e-12)
         assert err <= 0.001, f"divider sim err {err:.4%} > 0.1% (got={got}, expect={exp})"
+
+
+# --------------------------------------------------------------------------- ECAD status honesty
+
+
+def _stub_pcb_status(monkeypatch, compile_payload) -> tuple[dict, str]:
+    """Register real MCP closures around a deterministic PCB compile result."""
+    session = esess.EcadSession(
+        "pcb-status-hardening",
+        {
+            "schema": "aicad.pcb/1",
+            "name": "Status hardening board",
+            "footprints": [],
+            "nets": [{"name": "GND", "pads": []}],
+            "tracks": [],
+            "vias": [],
+            "outline": {"shapes": []},
+        },
+        revision=4,
+    )
+    monkeypatch.setattr(et.ecad_session, "get_session", lambda _doc_id: session)
+    monkeypatch.setattr(sch_tools, "_compile_of", compile_payload)
+    return _tools(), session.doc_id
+
+
+def test_pcb_status_compile_failure_cannot_report_clean(monkeypatch) -> None:
+    def compile_failed(_session):
+        raise RuntimeError("DRC compiler crashed")
+
+    tools, doc_id = _stub_pcb_status(monkeypatch, compile_failed)
+    text = tools["ecad_status"](doc_id=doc_id)
+    payload = json.loads(text)
+    lowered = text.lower()
+
+    assert payload["drc_available"] is False
+    assert "drc unavailable" in lowered
+    assert "do not treat this status as clean" in lowered
+    assert "0 drc error" not in lowered
+    assert "clean board" not in lowered
+    assert "design is clean" not in lowered
+
+
+def test_pcb_status_still_reports_real_drc_violation(monkeypatch) -> None:
+    violation = {
+        "severity": "error",
+        "rule": "clearance",
+        "message": "track T1 is shorted to track T2",
+        "net": "VCC",
+    }
+    tools, doc_id = _stub_pcb_status(
+        monkeypatch, lambda _session: {"drc": [violation]})
+    text = tools["ecad_status"](doc_id=doc_id)
+    payload = json.loads(text)
+
+    assert payload["drc_available"] is True
+    assert payload["drc"]["errors"] == 1
+    assert "1 DRC error(s)" in payload["summary"]
+    assert "FIX DRC clearance (1x)" in text
+    assert "track T1 is shorted to track T2" in text
+
+
+def test_load_symbol_library_missing_path_is_helpful(tmp_path) -> None:
+    missing = tmp_path / "vendor.kicad_sym"
+    tools = _tools()
+    payload = _call(tools, "ecad_load_symbol_library", path=str(missing))
+
+    assert payload["ok"] is False
+    assert payload["reason"] == "file_not_found"
+    assert str(missing) in payload["error"]
+    assert ".kicad_sym" in payload["hint"]
+
+
+def test_load_symbol_library_calls_native_importer(monkeypatch, tmp_path) -> None:
+    source = tmp_path / "vendor.kicad_sym"
+    source.write_text("(kicad_symbol_lib (version 20231120))", encoding="utf-8")
+    called = {}
+
+    def rpc(method, params):
+        called.update(method=method, params=params)
+        return {"ok": True, "added": ["Vendor:Controller"], "warnings": []}
+
+    monkeypatch.setattr(sch_tools, "_rpc", rpc)
+    payload = _call(_tools(), "ecad_load_symbol_library", path=str(source))
+
+    assert called == {
+        "method": "ecad_load_symbol_library",
+        "params": {"path": str(source)},
+    }
+    assert payload["ok"] is True
+    assert payload["added"] == ["Vendor:Controller"]
+    assert payload["added_count"] == 1

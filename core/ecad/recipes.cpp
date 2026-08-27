@@ -1,5 +1,5 @@
 // Parameterized known-good ECAD designs — see recipes.h. Faithful port of
-// engine/ecad/recipes.py (value formatting + the four recipes + closest_recipe).
+// services/ecad_design/recipes.py (value formatting + five recipes + closest_recipe).
 
 #include "ecad/recipes.h"
 
@@ -20,8 +20,18 @@ using nlohmann::json;
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kLedModelVf = 2.0;
 
-// engine/ecad/recipes.py::_trim — compact numeric string via f"{x:.4g}".
+// Python round() uses round-half-to-even; keep LED resistor sizing identical at ties.
+double round_half_even(double x) {
+    const double lo = std::floor(x);
+    const double fraction = x - lo;
+    if (fraction < 0.5) return lo;
+    if (fraction > 0.5) return lo + 1.0;
+    return std::fmod(std::abs(lo), 2.0) == 0.0 ? lo : lo + 1.0;
+}
+
+// services/ecad_design/recipes.py::_trim — compact numeric string via f"{x:.4g}".
 // Python's format mini-language 'g' == C printf %.4g (C99), so %g matches.
 std::string trim(double x) {
     char buf[64];
@@ -29,14 +39,14 @@ std::string trim(double x) {
     return std::string(buf);
 }
 
-// engine/ecad/recipes.py::_fmt_ohms
+// services/ecad_design/recipes.py::_fmt_ohms
 std::string fmt_ohms(double r) {
     if (r >= 1e6) return trim(r / 1e6) + "Meg";
     if (r >= 1e3) return trim(r / 1e3) + "k";
     return trim(r);
 }
 
-// engine/ecad/recipes.py::_fmt_farads
+// services/ecad_design/recipes.py::_fmt_farads
 std::string fmt_farads(double c) {
     if (c >= 1e-3) return trim(c / 1e-3) + "m";
     if (c >= 1e-6) return trim(c / 1e-6) + "u";
@@ -145,6 +155,36 @@ json inverting_amp(double gain) {
     };
 }
 
+json led_driver(double vsupply, double vf, double current) {
+    vf = std::max(std::min(vf, vsupply * 0.95), 0.0);
+    current = current > 0.0 ? current : 0.01;
+    double r = (vsupply - vf) / current;
+    r = std::max(round_half_even(r / 10.0) * 10.0, 10.0);
+    return json{
+        {"name", "led_driver"},
+        {"request", "a " + trim(vsupply) + "V LED driver (series current-limit resistor)"},
+        {"components", json::array({
+            json{{"ref", "V1"}, {"libid", "Simulation_SPICE:V_source"}, {"value", trim(vsupply)}},
+            json{{"ref", "R1"}, {"libid", "Device:R"}, {"value", fmt_ohms(r)}},
+            json{{"ref", "D1"}, {"libid", "Device:LED"}, {"value", "LED"}},
+        })},
+        {"nets", json{
+            {"VCC", json::array({json{{"ref", "V1"}, {"pin", "+"}}, json{{"ref", "R1"}, {"pin", "1"}}})},
+            {"LED_A", json::array({json{{"ref", "R1"}, {"pin", "2"}}, json{{"ref", "D1"}, {"pin", "A"}}})},
+            {"GND", json::array({json{{"ref", "D1"}, {"pin", "K"}}, json{{"ref", "V1"}, {"pin", "-"}}})},
+        }},
+        {"study", json{
+            {"analysis", "op"},
+            {"params", json::object()},
+            {"expect", json{{"probe", "V(LED_A)"}, {"value", kLedModelVf}, {"tol", 0.05}}},
+        }},
+        {"notes", "R1=" + fmt_ohms(r) + " = (Vsupply-Vf)/I = (" + trim(vsupply) + "-" +
+                      trim(vf) + ")/" + trim(current) + " ; LED current ~= " +
+                      trim(current * 1000.0) + " mA. V1=" + trim(vsupply) +
+                      "V -> R1 -> LED -> GND."},
+    };
+}
+
 json rc_555_astable(double freq) {
     double c = 1e-6;
     double r = (freq > 0.0) ? 1.44 / (3.0 * freq * c) : 1e5;
@@ -188,6 +228,8 @@ struct RecipeMeta {
 };
 const std::vector<RecipeMeta>& recipe_metas() {
     static const std::vector<RecipeMeta> kMetas = {
+        {"led_driver", {"led", "led driver", "drive an led", "indicator", "current limit",
+                        "current-limit", "current limiting"}},
         {"inverting_amp", {"inverting", "invert", "amplifier", "amp", "op-amp", "opamp", "gain"}},
         {"rc_555_astable", {"555", "astable", "oscillator", "timer", "blink", "square wave", "monostable"}},
         {"rc_lowpass", {"low-pass", "lowpass", "low pass", "filter", "rc", "cutoff", "corner"}},
@@ -206,20 +248,18 @@ double get_param(const json& params, const char* key, double dflt) {
 json build(const std::string& name, const json& params) {
     json p = params.is_object() ? params : json::object();
     if (name == "inverting_amp") return inverting_amp(get_param(p, "gain", 10.0));
+    if (name == "led_driver")
+        return led_driver(get_param(p, "vsupply", 3.3), get_param(p, "vf", kLedModelVf),
+                          get_param(p, "current", 0.01));
     if (name == "rc_555_astable") return rc_555_astable(get_param(p, "freq", 1.0));
     if (name == "rc_lowpass") return rc_lowpass(get_param(p, "fc", 1000.0));
     if (name == "voltage_divider") return voltage_divider(get_param(p, "vin", 5.0), get_param(p, "vout", 2.5));
     throw OpError("invalid_op", "no recipe named '" + name + "'", {{"reason", "unknown recipe"}});
 }
 
-json all_recipes() {
-    json out = json::array();
-    for (const auto& m : recipe_metas()) out.push_back(build(m.name, json::object()));
-    return out;
-}
 
 namespace {
-// engine/ecad/recipes.py::_extract_number
+// services/ecad_design/recipes.py::_extract_number
 bool extract_number(const std::string& request, double& out) {
     std::string low = lower(request);
     static const std::vector<std::string> pats = {
@@ -251,7 +291,7 @@ bool extract_number(const std::string& request, double& out) {
 json closest_recipe(const std::string& request) {
     std::string low = lower(request);
     std::string best_name = "voltage_divider";
-    int best_score = -1;
+    int best_score = 0;
     for (const auto& m : recipe_metas()) {
         int score = 0;
         for (const auto& kw : m.keywords)
@@ -274,6 +314,11 @@ json closest_recipe(const std::string& request) {
         if (vs.size() >= 2) return voltage_divider(vs[0], vs[1]);
         if (vs.size() == 1) return voltage_divider(vs[0], vs[0] / 2.0);
         return voltage_divider();
+    }
+    if (best_name == "led_driver") {
+        std::smatch m;
+        std::regex re(R"(([0-9]*\.?[0-9]+)\s*v\b)");
+        return std::regex_search(low, m, re) ? led_driver(std::stod(m[1].str())) : led_driver();
     }
     if (best_name == "inverting_amp") return has_num ? inverting_amp(num) : inverting_amp();
     if (best_name == "rc_lowpass") return has_num ? rc_lowpass(num) : rc_lowpass();

@@ -23,14 +23,37 @@
 | `ecad_export` | `{doc_id, kind:"gerber|drill|bom|cpl|spice|netlist|kicad", path, opts?}` → `{paths:[...]}` |
 | `ecad_to_3d` | `{doc_id, into_doc_id?, opts?}` → `{step_path, part_doc_id}` (the 3D bridge; see `fab_outputs.md §5`) |
 
-## 2. Simulation methods (sim worker, `sim_*` — isolated process)
+## 2. Simulation methods
 
 | method | params → result |
 |---|---|
-| `sim_run` | `{doc_id|spice_path|circuit, study}` → `{ok, results, log, ms}` or streamed progress events |
-| `sim_cancel` | `{run_id}` → `{cancelled}` |
+| `ecad_simulate` | `{doc_id, study, sim_params?, job_id?}` → `{ok, results, log, ms, cancelled?}` |
+| `sim_spice` | `{circuit, study, job_id?}` → same result shape, no document session |
+| `sim_cancel` | `{job_id}` → `{ok, cancelled, job_id}` |
 
-`study` schema and `results` shape are in `sim.md`. `sim_run` emits `{event:"sim_progress", data:{phase, frac, msg}}` for long transients (same event envelope as FEA/CFD). A crash in the sim worker (`kill -9`) must leave the doc worker healthy — verified by test, same as gmsh.
+`study` schema and `results` shape are in `sim.md`.
+
+The solver is the native MNA engine in `core/sim/spice.cpp`, and it runs **in-process, synchronously,
+inside the doc worker** — there is no isolated sim process. A `kill -9` crash-isolation guarantee
+therefore does NOT hold for circuit simulation, unlike gmsh/FEA. Do not write a test asserting it.
+
+Cancellation is cooperative, not preemptive. Pass a caller-chosen `job_id`; the solver polls the
+shared token at every unbounded loop head (transient timesteps, Newton iterations, AC/DC/temperature
+sweeps, Monte-Carlo runs), so `sim_cancel {job_id}` stops a run within well under a second. A
+cancelled run returns `ok:false, cancelled:true`, carrying whatever partial results were already
+computed — partial data is never presented as a completed run. Omitting `job_id` is allowed and
+costs nothing, but the run is then uncancellable: a large transient can legitimately reach millions
+of iterations and a Monte-Carlo study tens of thousands of full re-analyses, so any caller that can
+be asked to stop MUST pass one.
+
+There are no progress events. A caller that needs responsiveness runs the call off its UI thread and
+cancels by `job_id`; that is what the GUI's Simulate command does.
+
+> Superseded declaration: this section previously described an isolated `sim_run {…, study}` worker
+> emitting `{event:"sim_progress"}` and a `sim_cancel {run_id}`. No such method was ever dispatched
+> — `run_id` appears nowhere in the sim path, and the only `sim_run` in the tree is the unrelated
+> FEA job family in `services/mcp/cad_sim_tools.py`, which is genuinely process-isolated and
+> PID-killable but explicitly refuses circuit analyses. The rows above are what actually ships.
 
 ## 3. Compile-on-apply
 
@@ -74,8 +97,14 @@ for external/agent callers. Both share the same `engine/ecad` core, so behavior 
   user's KiCad file with ZIP bytes.
 - `ecad_open {path}` — a foreign import now returns a warning naming the native save target.
 
-### 5.2 Still declared, still unserved
+### 5.2 Closed divergences
 
-`sim_run` / `sim_cancel {run_id}` (§2) describe an isolated circuit-sim worker. The shipped path is
-the synchronous `ecad_simulate` plus the mechanical `sim_cancel {job_id}`. This divergence is
-recorded here rather than papered over; closing it is a separate work item.
+`sim_run` / `sim_cancel {run_id}` are **gone**. They declared an isolated circuit-sim worker with
+streamed progress events that was never built. §2 now declares what ships: in-process
+`ecad_simulate` / `sim_spice`, cooperatively cancellable via `sim_cancel {job_id}`.
+
+`ecad_to_3d` now honors `into_doc_id` and returns `part_doc_id` as §1 always promised. It mints (or
+appends to) the part document server-side, so a re-export updates the existing 3D tab instead of
+spawning another anonymous one. If the STEP writes but the import fails, `part_doc_id` is `null`
+and the reason is in `warnings` — the export is never reported as a failure it wasn't, and never as
+a success that produced no document.

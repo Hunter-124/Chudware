@@ -24,6 +24,7 @@ import math
 from services.mcp.ecad_common import ecad_session
 from services.mcp.ecad_tools import _ECAD, register_ecad_tools
 from services.ecad import schema
+from services.mcp import ecad_pcb_tools
 
 
 class _StubMCP:
@@ -321,6 +322,83 @@ def test_tool_declares_real_parameters_not_kwargs() -> None:
     for need in ("from_ref", "from_pad", "to_ref", "to_pad", "layer", "width", "doc_id"):
         assert need in sig.parameters, f"missing declared parameter {need}"
     print("  [tool_declares_real_parameters_not_kwargs] PASS")
+
+
+def test_route_diff_pair_is_registered_and_forwards_rpc(monkeypatch) -> None:
+    """The surgical pair tool is callable and forwards the resolved doc plus exact pair."""
+    tools = _tools()
+    assert "ecad_route_diff_pair" in tools
+    pcb = _divider_board(tools)
+    seen = {}
+
+    def fake_rpc(method, params):
+        seen.update(method=method, params=params)
+        return {
+            "revision": pcb.revision + 1,
+            "report": {
+                "routed": True, "length_p": 12.4, "length_n": 12.35,
+                "skew_mm": 0.05, "coupled_pct": 96.0,
+            },
+        }
+
+    monkeypatch.setattr(ecad_pcb_tools, "_rpc", fake_rpc)
+    r = _call(tools, "ecad_route_diff_pair", net_p="USB_D+", net_n="USB_D-",
+              opts={"diff_gap": 0.18, "length_tol": 0.1})
+
+    assert seen == {
+        "method": "ecad_route_diff_pair",
+        "params": {
+            "doc_id": pcb.doc_id, "net_p": "USB_D+", "net_n": "USB_D-",
+            "opts": {"diff_gap": 0.18, "length_tol": 0.1},
+        },
+    }
+    assert r["ok"] and r["routed"]
+    assert r["skew_mm"] == 0.05 and r["coupled_pct"] == 96.0
+    assert "skew=0.050mm" in r["hint"] and "coupled=96%" in r["hint"]
+
+
+def test_route_diff_pair_coerces_json_string_opts(monkeypatch) -> None:
+    """Stringified objects from tolerant model calls reach the RPC as real mappings."""
+    tools = _tools()
+    pcb = _divider_board(tools)
+    seen = {}
+
+    def fake_rpc(method, params):
+        seen.update(method=method, params=params)
+        return {"revision": pcb.revision + 1,
+                "report": {"routed": True, "skew_mm": 0.08, "coupled_pct": 90.0}}
+
+    monkeypatch.setattr(ecad_pcb_tools, "_rpc", fake_rpc)
+    r = _call(tools, "ecad_route_diff_pair", net_p="CLK_P", net_n="CLK_N",
+              opts='{"pitch": 0.15, "diff_gap": 0.2}')
+
+    assert r["ok"]
+    assert seen["params"]["opts"] == {"pitch": 0.15, "diff_gap": 0.2}
+
+
+def test_route_diff_pair_missing_or_unknown_net_teaches(monkeypatch) -> None:
+    """Missing names are rejected locally; an engine unknown-net error becomes guidance."""
+    tools = _tools()
+    _divider_board(tools)
+    called = False
+
+    def fake_rpc(method, params):
+        nonlocal called
+        called = True
+        raise ecad_pcb_tools.OpError(
+            "not_found", "unknown net 'NO_SUCH_NET'", {"net": "NO_SUCH_NET"})
+
+    monkeypatch.setattr(ecad_pcb_tools, "_rpc", fake_rpc)
+    missing = _call(tools, "ecad_route_diff_pair", net_p="", net_n="USB_D-")
+    assert not missing["ok"] and "required" in missing["error"].lower()
+    assert not called, "a missing required net must not reach the RPC"
+
+    unknown = _call(tools, "ecad_route_diff_pair",
+                    net_p="NO_SUCH_NET", net_n="USB_D-")
+    assert called and not unknown["ok"]
+    assert "unknown net" in unknown["error"].lower()
+    assert "exact" in unknown["hint"].lower()
+    assert unknown["next_actions"]
 
 
 def main() -> None:

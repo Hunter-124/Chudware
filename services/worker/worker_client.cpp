@@ -413,26 +413,19 @@ bool routeSimToCpp(const std::string &method, const json & /*params*/) {
   }
   return true;
 }
-// --- C++ ECAD routing (opt-in, default OFF) ---------------------------------
-// Route the host's ECAD RPCs (ecad_*) to the pure-C++ core (libchudware) instead
-// of the Python worker. MIRRORS the doc_* seam exactly, but is DEFAULT OFF:
-// unless CHUDWARE_CPP_ECAD is set (and != "0") every ecad_* call goes to the
-// Python worker exactly as today. An ECAD doc CREATED in the C++ core mints an
-// "ecadcpp..." id (core/ecad/session.cpp new_doc_id()), so every subsequent
-// ecad_* call carrying that doc_id routes to the C++ core too — the id prefix
-// IS the commit-at-mint marker, an all-or-nothing-per-document cutover (the
-// ECAD analogue of "doc-cpp").
+// --- C++ ECAD routing -------------------------------------------------------
+// ECAD document sessions live in the C++ core and mint "ecadcpp..." ids
+// (core/ecad/session.cpp new_doc_id()). The id prefix binds implemented,
+// document-scoped RPCs to that core session for the document's lifetime.
 //
-// Coverage (updated 2026-08-26): the C++ core handles the stateful doc-id ecad
-// methods in libchudware.cpp AND the doc-id forms of ecad_autoroute /
-// ecad_to_3d / ecad_route_diff_pair, plus ecad_fill_zones, ecad_simulate, and
-// KiCad import (ecad_open dispatches .kicad_sch/.kicad_pcb to core/ecad/kicad.cpp).
-// There is no Python ECAD worker left to fall back to, so every method must be
-// claimed here. Methods that carry NO doc_id are listed in kDocless below:
-// ecad_design used to be excluded as "an LLM state machine deferred to the agent
-// seam" — nothing served it, so the GUI's AI Design button hit `unknown method`
-// on every click. It is now a native recipe compiler (core/ecad/session.cpp
-// ecad_design) that mints a real schematic, so it routes like ecad_new.
+// The deleted Python ECAD worker and the live Python MCP tool surface are
+// different backends. libchudware must claim only the ecad_* methods in its
+// dispatch table; every other name must fall through to the generic hostd/MCP
+// bridge. Previously the doc-id branch treated an "ecadcpp" prefix alone as
+// sufficient and over-claimed every ecad_* method. That sent MCP-only tools such
+// as ecad_thermal_handoff to libchudware's unknown-method fallthrough before the
+// MCP bridge could serve them. Keep both the document-bound and documentless
+// allowlists synchronized with the libchudware ECAD dispatch region.
 bool cppEcadFlag() {
   // R5a (T-RF21): the CHUDWARE_CPP_ECAD escape hatch is removed — the C++ core is
   // the only ECAD backend on every platform (the Python ECAD worker is deleted
@@ -443,14 +436,31 @@ bool cppEcadFlag() {
 bool routeEcadToCpp(const std::string &method, const json &params) {
   if (method.rfind("ecad_", 0) != 0)
     return false; // only ecad_* methods
-  // A C++-backed ECAD doc carries an "ecadcpp" doc_id -> EVERY ecad_* call
-  // operating on it routes to the C++ core for that doc's whole lifetime (even
-  // if the flag was since toggled off). An unported method then fails loud in
-  // the core (no Python doc to fall back to), surfacing the gap rather than
-  // misrouting.
-  if (params.is_object()) {
-    // doc_id (most ecad_*) or board_doc_id (ecad_update_from_sch) carrying an
-    // ecadcpp prefix binds the call to the C++-backed ECAD document.
+
+  static const char *const kDocBound[] = {
+      "ecad_apply_ops",       "ecad_undo",          "ecad_redo",
+      "ecad_tree",            "ecad_rebuild",       "ecad_swap_doc",
+      "ecad_close",           "ecad_describe",      "ecad_resolve_pick",
+      "ecad_dfm",             "ecad_autoroute",     "ecad_route_diff_pair",
+      "ecad_fill_zones",      "ecad_simulate",      "ecad_to_3d",
+      "ecad_export",          "ecad_save",          "ecad_update_from_sch"};
+  static const char *const kDocless[] = {
+      "ecad_new",             "ecad_open",          "ecad_design",
+      "ecad_symbols",         "ecad_load_symbol_library",
+      "ecad_schema",          "ecad_list_ops",      "ecad_recipe",
+      "ecad_closest_recipe",  "ecad_impedance"};
+
+  // An ecadcpp id binds a call to the core only when libchudware implements
+  // that document-scoped method. MCP-only ecad_* tools also carry doc_id; the
+  // old prefix-only predicate swallowed them before the generic MCP bridge.
+  bool docBound = false;
+  for (const char *m : kDocBound)
+    if (method == m) {
+      docBound = true;
+      break;
+    }
+  if (docBound && params.is_object()) {
+    // board_doc_id/sch_doc_id are used by ecad_update_from_sch.
     for (const char *key : {"doc_id", "board_doc_id", "sch_doc_id"}) {
       auto it = params.find(key);
       if (it != params.end() && it->is_string() &&
@@ -458,20 +468,18 @@ bool routeEcadToCpp(const std::string &method, const json &params) {
         return true;
     }
   }
-  // Methods that MINT a document (ecad_new / ecad_open / ecad_design) or carry no
-  // document at all (library, schema and recipe queries) have no ecadcpp doc_id to
-  // bind on, so they are claimed by name. Leaving one out does not degrade to
-  // Python — there is no Python ECAD worker — it surfaces as `unknown method`.
+
+  // Minting and documentless methods have no ecadcpp id to bind on, so claim
+  // only the names present in libchudware. All other names deliberately fall
+  // through to the live Python MCP tool surface.
   if (!cppEcadFlag())
     return false;
-  static const char *kDocless[] = {
-      "ecad_new",       "ecad_open",           "ecad_design",
-      "ecad_symbols",   "ecad_load_symbol_library", "ecad_schema",
-      "ecad_list_ops",  "ecad_recipe",         "ecad_recipes_all",
-      "ecad_closest_recipe", "ecad_impedance"};
   bool claimed = false;
   for (const char *m : kDocless)
-    if (method == m) { claimed = true; break; }
+    if (method == m) {
+      claimed = true;
+      break;
+    }
   if (!claimed)
     return false;
   if (!engine::available()) {
@@ -1523,18 +1531,16 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     // do NOT hard-break sim — fall through to the Python sim worker path below so
     // analysis keeps working.
   }
-  // C++ ECAD routing (opt-in via CHUDWARE_CPP_ECAD, default OFF). MIRRORS the
-  // doc_* seam below: an ecad_new/ecad_open mints an "ecadcpp" doc and binds
-  // the whole doc lifetime to C++; any later ecad_* carrying that ecadcpp
-  // doc_id routes here. Default OFF => routeEcadToCpp() returns false (and no
-  // ecadcpp doc exists) so this block is skipped entirely — byte-for-byte
-  // today's Python ECAD path. No params translation: the host's ecad_*
-  // send-shape IS the libchudware contract (kind/name, doc_id, base_revision,
-  // ops...).
+  // C++ ECAD routing is always enabled for the methods allowlisted above.
+  // ecad_new/ecad_open mint "ecadcpp" documents; later document-bound calls
+  // route here only when both that id prefix and an implemented method match.
+  // MCP-only ecad_* methods deliberately skip this block and reach the generic
+  // hostd/worker bridge below. No params translation is needed for claimed
+  // calls: the host send-shape is the libchudware contract.
   if (routeEcadToCpp(method, params)) {
-    // ecad_new / ecad_open MINT a new ECAD doc; everything else operates on an
-    // existing ecadcpp doc (no Python doc to fall back to => fail loud on hard
-    // error).
+    // ecad_new / ecad_open are the minting calls eligible for fallback if the
+    // core cannot create a session. Every other call was explicitly claimed by
+    // the libchudware method allowlists.
     const bool minting = (method == "ecad_new" || method == "ecad_open");
     std::string cerr;
     if (engine::call(method, params, result, cerr, timeoutMs))
@@ -1552,9 +1558,8 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       }
       // else: fall through to the Python worker path below
     } else if (!minting) {
-      // Hard failure (DLL throw, or an unported ecad_* like ecad_fill_zones /
-      // ecad_simulate / doc-id ecad_autoroute) on a call bound to an EXISTING
-      // ecadcpp doc — there is no Python doc to fall back to, so fail loudly.
+      // Hard failure on an allowlisted non-mint core RPC: surface the core
+      // failure rather than masking it behind a different backend.
       err = "cpp-ecad (" + method + "): " + cerr;
       if (errorSink_)
         errorSink_(method, err);

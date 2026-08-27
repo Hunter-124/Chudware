@@ -259,7 +259,7 @@ struct EcadLayer {
 
 struct EcadAirwire { std::string net; EcadPt p1, p2; };  // unrouted ratsnest segment
 
-// ERC / DRC violation (unified; ERC carries a single xy, DRC carries locs[] — we keep the first loc).
+// ERC / DRC violation (unified; ERC carries a single xy, DRC carries locs[]).
 struct EcadViolation {
     std::string rule;          // "pin_not_connected" / "clearance" / …
     std::string severity;      // "error" | "warning"
@@ -267,6 +267,10 @@ struct EcadViolation {
     std::string message;
     bool hasLoc = false;
     EcadPt loc;                // first reported location (world); for "zoom to violation"
+    // ALL reported DRC locations (world); locs[0] duplicates loc. A clearance-style
+    // violation is BETWEEN two shapes, so it reports two — the canvas marks both and
+    // joins them with a hairline. Empty for ERC (single-xy) violations.
+    std::vector<EcadPt> locs;
     std::string layer;         // DRC loc layer; "" for ERC
 };
 

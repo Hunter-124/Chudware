@@ -41,6 +41,7 @@ public:
     void setSnapTarget(bool active, const EcadPt& w, const std::string& label);
     void setDragOffset(float dx, float dy);
     void setShowErcMarkers(bool on);
+    void setShowDrcMarkers(bool on);
     void setShowSheetFrame(bool on);
 
 private:
@@ -78,6 +79,10 @@ private:
     EcadPt snapTarget_{0, 0};
     std::string snapTargetLabel_;
     bool showErcMarkers_ = true;
+    bool showDrcMarkers_ = true;
+    // Screen positions of DRC glyphs already painted this frame (declutter dedupe).
+    // Member so the steady state reuses its capacity instead of allocating per frame.
+    std::vector<ImVec2> drcMarkerPts_;
     bool showSheetFrame_ = false;
 
     EcadPt focusLoc_{0, 0};

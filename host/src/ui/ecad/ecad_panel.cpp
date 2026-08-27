@@ -2644,6 +2644,7 @@ void drawEcadEditor(AppState& st) {
     es.canvas.setDragOffset(es.dragDx, es.dragDy);
     es.canvas.setMarquee(es.marquee, es.dragStart, es.marqueeEnd);
     es.canvas.setShowErcMarkers(es.mirror.isSch());
+    es.canvas.setShowDrcMarkers(es.mirror.isPcb());
     // Sheet border + title block: the affordance that makes a schematic look like a
     // drawing and previews what ecad_export(kind="svg"|"pdf") will plot. It was briefly
     // disabled because the frame painted beneath the translucent pinned rail; the canvas

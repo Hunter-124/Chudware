@@ -8302,6 +8302,65 @@ Gotcha for the next pass: `test_inprocess_internal_agent_docs_are_registered_but
 fails on HEAD too — it is the concurrent ECAD session's in-progress `core/api/libchudware.cpp`,
 not this work.
 
-## 2026-08-27 — PLM Project Hub completion (T-R6)
+## 2026-08-27 — ECAD: the gaps the schematic pass left open
 
-Completed the full-screen Project Hub in `host/src/ui/plm/`: a reachable three-lane release board, item/person/AI activity filters, cached direct where-used explorer, thumbnailed grid activation with PLM identity/lifecycle metadata, honest Project/History/Release onboarding, guided tour, recent-project persistence, project-open landing, and release/tour/grid headless selectors. `host/src/core/app_state.{h,cpp}` owns the bounded recent-project list and landing transition; `host/src/app.cpp` only seeds the persisted list and dispatches the two new shot pages. Existing `plm_*` contracts and async cache paths were reused unchanged. Verified with isolated compilation of all changed TUs, scoped GUI lints, a successful integrated host build, and three real `CHUDWARE_SHOT=git` captures. The concurrent ECAD/public-site/hostd work was excluded from the commit.
+Four scouts re-audited the ECAD surface after the schematic overhaul and found the
+remaining defects were mostly *reachability*, not missing capability — working engine
+code that nothing could call, and one predicate that swallowed calls it had no
+implementation for.
+
+The worst was in `services/worker/worker_client.cpp`. `routeEcadToCpp` claimed a call
+for the C++ core whenever the method began with `ecad_` and the doc id began with
+`ecadcpp`, with **no check that the core implements that method** — unlike the sibling
+`kDocless[]` branch, which is properly allowlisted. Since `cppEcadFlag()` now
+unconditionally returns true, every board is C++-backed, so every MCP-only `ecad_*`
+tool carrying a doc id was captured and died on the core's `unknown method`
+fallthrough. That envelope carries `error`, not `code`, so the caller's
+`result.contains("code")` test missed it and the call hard-failed *before* reaching the
+generic Python/MCP bridge. The GUI's "Send board to thermal FEA" button therefore
+failed 100% of the time on every board on every platform, with the real implementation
+sitting in `services/mcp/ecad_thermal.py` the whole time. 40 doc-bound MCP tools were
+in that blast radius. The comment justifying the over-claim ("there is no Python ECAD
+worker left to fall back to") confused the deleted Python ECAD *worker* with the very
+much alive Python MCP *tool surface*. Both lists are now explicit and their disjoint
+union is exactly the 28-method dispatch table.
+
+`core/ecad/drc.cpp` had the same shape of bug the schematic ERC had: checks that pass
+because their input never arrives. `track_shape()` returned false for any track whose
+`kind` was not `"segment"`, so every arc track vanished from `copper_shapes()` — and
+because `copper_shapes()` is also the autorouter's obstacle source and zone-fill's
+keepout source, the router would happily lay a track across an arc of another net and a
+pour would flood over it. DRC could not merely miss a short; the tools could *create*
+one it then could not see. Arcs now tessellate into capsule chains with a sagitta
+margin so the swept copper can never be under-approximated. Filled zone copper was
+absent from the DRC model entirely (fill-time clearance goes stale the moment a
+footprint moves), and net classes were honored for clearance but not for `track_width`
+or via sizing, so a track thinner than its own class minimum passed clean. Nine of the
+eleven new `test_drc_geometry` cases fail against the old engine; the two that pass are
+the deliberate false-positive guards.
+
+`services/mcp/ecad_sch_tools.py`'s `_pcb_status` swallowed a DRC compile exception and
+reported `0 DRC error(s)` — the exact defect fixed for schematic ERC one commit
+earlier, still live in the PCB twin, on the call agents are told is "THE situational-
+awareness call".
+
+The SPICE engine turned out to be real and substantial, and completely uncancellable:
+`sim_cancel {job_id}` was a working registry whose only consumer was the LBM wind
+tunnel, so cancelling a circuit sim was a guaranteed no-op returning
+`cancelled:false`. The work is genuinely unbounded (transients reach ~4M iterations;
+Monte-Carlo allows 100k full re-analyses) and the GUI called it synchronously from the
+frame loop, so a heavy study froze the whole application. The solver now polls a token
+at every unbounded loop head and the GUI runs it off-thread with a Cancel button. A
+300-run Monte-Carlo study that would have taken ~9 minutes now stops **35 ms** after
+the cancel, returning `ok:false, cancelled:true` with its partial run count.
+
+Also closed: `ecad_to_3d` honors `into_doc_id` and returns `part_doc_id` (it mints the
+part doc via the already-shipped `doc_import_file`, so a re-export updates the existing
+3D tab instead of spawning another anonymous one, and a bad id degrades to a warning
+without erasing a successful STEP); `led_driver` is ported to `core/ecad/recipes.cpp`,
+so native `ecad_design` can finally build one and the orchestrator stops bypassing the
+RPC; `ecad_route_diff_pair` and `ecad_load_symbol_library` — both working, both with
+zero callers — are now exposed as MCP tools; the PCB canvas paints persistent DRC
+markers like the schematic already did; and the fictional `sim_run`/`sim_cancel{run_id}`
+declaration is deleted from the contract in favour of what ships. `all_recipes()` was
+dead in both languages and is gone.

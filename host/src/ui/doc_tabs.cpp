@@ -503,17 +503,30 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
     // ---- Schematic / PCB → ecad_save .ecad+ ----
     if (t.kind == K::Schematic || t.kind == K::PCB) {
         if (t.ecadDocId.empty()) return TabSaveResult::Nothing;
-        std::string path = t.path;
-        if (forceDialog || path.empty()) {
+        // A tab opened FROM a KiCad file carries that file as its path. Saving a .ecad+
+        // container over it would destroy the user's source, so never offer it as the
+        // target: send no path and let the engine use the native sibling it chose at
+        // import time (core/ecad/session.cpp, ecad_open).
+        auto is_foreign = [](const std::string& p) {
+            const std::size_t dot = p.find_last_of('.');
+            if (dot == std::string::npos) return false;
+            std::string ext = p.substr(dot);
+            for (char &c : ext) c = (char)std::tolower((unsigned char)c);
+            return ext == ".kicad_sch" || ext == ".kicad_pcb";
+        };
+        std::string path = is_foreign(t.path) ? std::string() : t.path;
+        if (forceDialog || (path.empty() && !is_foreign(t.path))) {
             std::string suggest = t.displayTitle();
             path = ui::saveFileDialog(
                 "AI-ECAD design (*.ecad+)\0*.ecad+\0All files (*.*)\0*.*\0", "ecad+",
                 suggest.empty() ? "design" : suggest.c_str());
             if (path.empty()) return TabSaveResult::Cancelled;
         }
+        nlohmann::json params = {{"doc_id", t.ecadDocId}};
+        if (!path.empty()) params["path"] = path;
         nlohmann::json res;
         std::string err;
-        if (!st.worker.call("ecad_save", {{"doc_id", t.ecadDocId}, {"path", path}}, res, err) ||
+        if (!st.worker.call("ecad_save", params, res, err) ||
             (res.is_object() && res.contains("code"))) {
             const std::string msg = err.empty() && res.is_object()
                                         ? res.value("message", std::string("engine error")) : err;
@@ -521,28 +534,69 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
             st.toast(ui::ToastLevel::Error, "Save failed: " + msg);
             return TabSaveResult::Failed;
         }
+        // The ENGINE decides the final path (it redirects an imported source to a native
+        // sibling); trust its answer over the one we asked for.
         const std::string saved = res.is_object() ? res.value("path", path) : path;
+        const std::string src = res.is_object() ? res.value("source_path", std::string()) : "";
+        const std::string fmt = res.is_object() ? res.value("format", std::string("ecad+")) : "ecad+";
         t.path = saved;
         t.dirty = false;
         st.pushRecentFile(saved);
-        st.addLog("[tabs] ecad saved -> " + saved);
-        st.toast(ui::ToastLevel::Info, "Saved " + t.displayTitle());
+        st.addLog("[tabs] ecad saved -> " + saved + " (" + fmt + ")" +
+                  (src.empty() ? std::string() : "; imported source kept: " + src));
+        if (src.empty())
+            st.toast(ui::ToastLevel::Info, "Saved " + t.displayTitle());
+        else
+            st.toast(ui::ToastLevel::Info,
+                     "Saved " + t.displayTitle() + " as " + fmt +
+                         " - the imported file was left untouched");
         ui::plmAutoRecordSave(st, saved);
         ui::boxMirrorNotifySave(st, saved);
         return TabSaveResult::Saved;
     }
 
-    // ---- Drawing → save its SOURCE part (the drawing embeds in that part's .step+) ----
+    // ---- Drawing → standalone .draw+ when opened from one; otherwise save source .step+ ----
     if (t.kind == K::Drawing) {
+        if (!t.path.empty()) {
+            std::string path = t.path;
+            if (forceDialog) {
+                std::string suggest = t.displayTitle();
+                path = ui::saveFileDialog(
+                    "Chudware drawing (*.draw+)\0*.draw+\0All files (*.*)\0*.*\0",
+                    "draw+", suggest.empty() ? "drawing" : suggest.c_str());
+                if (path.empty()) return TabSaveResult::Cancelled;
+            }
+            nlohmann::json res;
+            std::string err;
+            if (!st.worker.call("drawing_save_standalone",
+                                {{"drawing_id", t.drawingDocId}, {"path", path}},
+                                res, err) ||
+                (res.is_object() && res.contains("code"))) {
+                const std::string msg = err.empty() && res.is_object()
+                                            ? res.value("message", std::string("engine error"))
+                                            : err;
+                st.addLog("[tabs] drawing_save_standalone failed for " +
+                          t.drawingDocId + ": " + msg);
+                st.toast(ui::ToastLevel::Error, "Save failed: " + msg);
+                return TabSaveResult::Failed;
+            }
+            t.path = res.is_object() ? res.value("path", path) : path;
+            t.dirty = false;
+            st.pushRecentFile(t.path);
+            st.addLog("[tabs] drawing saved -> " + t.path);
+            st.toast(ui::ToastLevel::Info, "Saved " + t.displayTitle());
+            ui::plmAutoRecordSave(st, t.path);
+            ui::boxMirrorNotifySave(st, t.path);
+            return TabSaveResult::Saved;
+        }
         const int src = partTabIndexForDoc(st, t.sourceDocId);
         if (src < 0) {
-            // Source part is no longer open — it can't be embed-saved. Don't block the close.
+            // An embedded drawing without its source cannot be persisted independently.
             st.addLog("[tabs] drawing '" + t.displayTitle() +
-                      "' has no open source part — cannot persist independently");
+                      "' has no open source part — cannot save embedded drawing");
             return TabSaveResult::Nothing;
         }
-        TabSaveResult r = saveDocTab(st, src, forceDialog);   // saving the part clears this drawing
-        return r;
+        return saveDocTab(st, src, forceDialog);
     }
 
     return TabSaveResult::Nothing;

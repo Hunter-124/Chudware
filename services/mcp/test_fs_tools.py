@@ -341,6 +341,17 @@ def test_fs_read_step_plus_redirects_to_import_part():
             assert "describe_part" in r["hint"] and "measure_part" in r["hint"]
 
 
+def test_fs_read_draw_plus_redirects_to_drawing_import():
+    t = _tools()
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "x.draw+")
+        with open(p, "wb") as fh:
+            fh.write(b"PK\x03\x04" + b"\x00" * 64)
+        r = t["fs_read"](p)
+        assert not r["ok"] and r["reason"] == "use_import_part"
+        assert f'import_part(path="{p}")' in r["hint"]
+
+
 def test_fs_read_text_step_redirects_but_raw_true_escapes():
     """Plain-text B-rep exchange formats still redirect by default (the geometry reader
     is the right tool), but an explicit raw=True proceeds with the normal text read."""

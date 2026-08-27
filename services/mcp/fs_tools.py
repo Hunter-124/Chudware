@@ -297,7 +297,8 @@ DOC_EXTS = {
 # inspect_part. Binary containers ALWAYS redirect; plain-text exchange formats redirect
 # by default but honour an explicit raw=True escape (the text is genuinely readable).
 CAD_BINARY_EXTS = {
-    "step+",   # Chudware native part container (ZIP) — the exact file fs_read choked on
+    "step+",   # Chudware native part container (ZIP)
+    "draw+",   # Chudware standalone editable drawing container (ZIP)
     "cam+",    # Chudware native CAM container (ZIP)
     "stl", "3mf", "glb", "3dm", "sldprt", "sldasm", "f3d", "ipt", "iam", "dwg",
 }
@@ -620,9 +621,9 @@ def register_fs_tools(mcp) -> None:
                  entries. A document (.pdf/.docx/.doc/.odt/.pptx/.ppt/.odp/.xlsx/.xlsm/
                  .xls/.ods/.csv) is extracted to text (via office_extract) and paginated
                  the same way. A CAD/geometry
-                 file (.step+/.step/.stp/.iges/.stl/.3mf/.obj/…) is NOT dumped — you get a
-                 use_import_part redirect: open it with import_part(path=...) and read the
-                 model via describe_part / measure_part / inspect_part (plain-text exchange
+                 file (.draw+/.step+/.step/.stp/.iges/.stl/.3mf/.obj/…) is NOT dumped —
+                 you get a use_import_part redirect: open it with import_part(path=...) and
+                 read the model via describe_part / measure_part / inspect_part (plain-text
                  formats honour raw=True as an explicit escape).
         offset : 1-indexed start line when no selector is given (default: from the top).
         limit  : max lines to return (default 400, hard cap 4000).

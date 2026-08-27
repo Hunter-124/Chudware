@@ -1761,6 +1761,7 @@ if(CHUDWARE_WITH_OCCT)
     doc/solidworks_tessellation.cpp
     doc/dxf.cpp
     doc/pdfvec.cpp
+    doc/svgvec.cpp
     doc/annot_draw.cpp
     doc/export2d.cpp
     doc/drawing_session.cpp

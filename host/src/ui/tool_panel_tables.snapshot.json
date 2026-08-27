@@ -676,7 +676,7 @@
   "enable_tools": "Request more tool categories mid-turn (see [TOOL CATEGORIES] menu).",
   "engine_profile": "Profile THIS engine process (the one your modeling RPCs run in) at runtime.",
   "engine_profile_tree": "Nested profile tree (file-tree style) — root + hot children, path drill-down.",
-  "export_drawing": "Export a 2D DRAWING document to a vector file so you can deliver it.",
+  "export_drawing": "Export a 2D DRAWING document to editable vector deliverables.",
   "export_part": "Export the current part to an interchange/mesh file; returns the written path.",
   "export_reveng_bundle": "Export the full RE session directory as a zip bundle to *dest*.",
   "feeds_speeds": "Compute table-driven rpm / feed / stepdown / stepover envelope for a material + tool type + operation (aicad.calc/1, contracts/advisor.md …",
@@ -731,7 +731,7 @@
   "hydraulic_verify_fea": "Verify step for the hydraulic→FEA coupling: recompute the mount forces independently (area × max pressure from the envelope's recorded …",
   "hydraulic_verify_piping": "Verify step for the hydraulic→piping coupling: per-hose Darcy estimate vs piping 1-D solve, per line, plus the pump-margin feedback.",
   "import_artifact": "Import acquired STEP/IGES geometry and stamp its vendor provenance on the doc.",
-  "import_part": "Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3DM/DXF/DWG/STEP+/…) as a body.",
+  "import_part": "Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3DM/DXF/DWG/ STEP+/DRAW+/…) as a body, or open a native standalone drawing. …",
   "import_scan_mesh": "Import an externally-produced scan mesh (.ply / .obj) into *session_id*.",
   "inspect_feature": "One-call feature inspection: a multi-panel EMPHASIS sheet + describe excerpt + dims.",
   "inspect_part": "CLOSE-UP inspection of a face/edge/feature — the camera flies to it and frames it.",
@@ -1471,7 +1471,7 @@
    "prompt_note": "Scoped profile read — start at depth=1/top=8, drill with path=... instead of ingesting the whole report; source='phases' needs no start."
   },
   "export_drawing": {
-   "prompt_note": "Final drawing artifact only: make_drawing → current review_drawing → audit_drawing(verdict=release_ready) → export. Use sheet='all' for the controlled multi-sheet package; 3D exchange files use export_part."
+   "prompt_note": "Final drawing artifact only: make_drawing → current review_drawing → audit_drawing(verdict=release_ready) → export. Release PDFs with editable siblings in one call via fmt='pdf', companions=['dxf','svg']; use fmt='svg' alone when only an editable illustration is needed. Use sheet='all' for the controlled multi-sheet package; 3D exchange files use export_part."
   },
   "export_part": {
    "prompt_note": "Interchange/mesh only — no feature tree or studies survive. A machine shop needs fmt='step' (.step/.stp); save_part's .step+ is Chudware's native ZIP document and is NOT a standard STEP exchange file."

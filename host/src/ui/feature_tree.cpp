@@ -3135,7 +3135,8 @@ static const char* kStepPlusFilter = "Chudware part (*.step+)\0*.step+\0All file
 // Win32 common-dialog layout: NUL-separated "label\0patterns\0"... pairs, double-NUL terminated
 // (the C string literal's own trailing NUL supplies the final one).
 static const char* kImportFilter =
-    "All CAD & mesh files\0*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.stl;*.3mf;*.obj;*.ply;*.gltf;*.glb;*.3dm;*.sldprt;*.sldasm;*.x_t;*.x_b\0"
+    "All CAD, drawing & mesh files\0*.draw+;*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.stl;*.3mf;*.obj;*.ply;*.gltf;*.glb;*.3dm;*.sldprt;*.sldasm;*.x_t;*.x_b\0"
+    "Chudware drawing (*.draw+)\0*.draw+\0"
     "Chudware part (*.step+)\0*.step+\0"
     "STEP (*.step;*.stp)\0*.step;*.stp\0"
     "IGES (*.iges;*.igs)\0*.iges;*.igs\0"
@@ -3388,6 +3389,12 @@ static void doOpenDoc(AppState& st) {
     }
     std::string path = openFileDialog(kImportFilter);
     if (path.empty()) return;  // canceled
+    std::string openExt = std::filesystem::path(path).extension().string();
+    for (char& ch : openExt) ch = (char)std::tolower((unsigned char)ch);
+    if (openExt == ".draw+") {
+        featureTreeOpenDrawingPath(st, path);
+        return;
+    }
     // Mesh files: ask whether to import as a solid (vs. graphics mesh). Non-mesh formats never prompt.
     bool asSolid = false;
     if (isMeshImportFormat(path)) {
@@ -5736,8 +5743,75 @@ void drawFeatureTreeBody(AppState& st,
 // Open a file by absolute path (no dialog). Used by the File Explorer double-click and the
 // Recent-files menu. Returns true when the open was started (or an existing tab was focused);
 // toasts + logs on failure (never throws). Async doc_open on all platforms — matches doOpenDoc.
+bool featureTreeOpenDrawingPath(AppState& st, const std::string& path) {
+    if (path.empty()) return false;
+    namespace fs = std::filesystem;
+    std::error_code wantedEc;
+    fs::path wanted = fs::weakly_canonical(fs::path(path), wantedEc);
+    if (wantedEc) wanted = fs::path(path).lexically_normal();
+    for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i) {
+        const AppState::DocTab& tab = st.docTabs[i];
+        if (tab.kind != AppState::DocTab::TabKind::Drawing || tab.path.empty())
+            continue;
+        std::error_code haveEc;
+        fs::path have = fs::weakly_canonical(fs::path(tab.path), haveEc);
+        if (haveEc) have = fs::path(tab.path).lexically_normal();
+        if (have == wanted) {
+            st.switchToTab(i);
+            return true;
+        }
+    }
+    if (!st.workerStarted) {
+        st.toast(ui::ToastLevel::Error, "Open failed: worker not started");
+        return false;
+    }
+    st.toast(ui::ToastLevel::Info, "Opening " + pathBaseName(path) + "\xe2\x80\xa6");
+    ++st.rebuildsInFlight;
+    st.rpc.call("drawing_open_standalone", {{"path", path}},
+                [&st, path](const core::RpcResult& r) {
+                    --st.rebuildsInFlight;
+                    if (!r.ok || (r.result.is_object() && r.result.contains("code"))) {
+                        const std::string msg = !r.ok ? r.err
+                            : r.result.value("message", std::string("engine error"));
+                        st.addLog("[err] drawing open: " + msg);
+                        st.toast(ui::ToastLevel::Error,
+                                 "Open failed: " + pathBaseName(path) + " — " + msg);
+                        return;
+                    }
+                    const std::string drawingId =
+                        r.result.value("drawing_id",
+                                       r.result.value("doc_id", std::string()));
+                    const std::string name =
+                        r.result.value("name", std::string("Drawing"));
+                    const std::string sourceId =
+                        r.result.contains("source_doc_id") &&
+                                r.result["source_doc_id"].is_string()
+                            ? r.result["source_doc_id"].get<std::string>()
+                            : std::string();
+                    if (drawingId.empty()) {
+                        st.toast(ui::ToastLevel::Error,
+                                 "Open failed: engine returned no drawing id");
+                        return;
+                    }
+                    st.adoptStandaloneDrawingTab(drawingId, name, sourceId, path);
+                    const std::string state =
+                        r.result.value("source_state", std::string("missing"));
+                    if (state == "missing")
+                        st.toast(ui::ToastLevel::Warn,
+                                 "Source missing — views frozen from last projection");
+                    else
+                        st.toast(ui::ToastLevel::Info,
+                                 "Opened " + pathBaseName(path));
+                }, 120000);
+    return true;
+}
+
 bool featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid) {
     if (path.empty()) return false;
+    std::string requestedExt = std::filesystem::path(path).extension().string();
+    for (char& ch : requestedExt) ch = (char)std::tolower((unsigned char)ch);
+    if (requestedExt == ".draw+")
+        return featureTreeOpenDrawingPath(st, path);
 
     // Dedup: if a non-handoff tab already has this path, switch to it (mirrors openComponentPart).
     // Path compare is lexical (web has no real std::filesystem canonical for server abs paths).

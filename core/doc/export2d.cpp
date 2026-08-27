@@ -36,6 +36,7 @@
 #include "doc/drawing_session.h"  // drawing_get (stateful export_drawing)
 #include "doc/dxf.h"
 #include "doc/pdfvec.h"
+#include "doc/svgvec.h"
 #include "doc/session.h"  // OpError, doc_live_source
 
 using nlohmann::json;
@@ -95,7 +96,7 @@ std::string ascii_label(const std::string& in) {
     return out;
 }
 
-// A placed export label (pos, ascii text, height mm).
+// A placed export label (pos, UTF-8 text, height mm).
 struct ExpLabel {
     std::array<double, 2> pos;
     std::string text;
@@ -130,17 +131,30 @@ std::string title_value(const json& tb, const char* first, const char* second = 
         if (!key) continue;
         auto it = tb.find(key);
         if (it == tb.end()) continue;
-        if (it->is_string()) return ascii_label(it->get<std::string>());
-        if (it->is_number() || it->is_boolean()) return ascii_label(it->dump());
+        if (it->is_string()) return it->get<std::string>();
+        if (it->is_number() || it->is_boolean()) return it->dump();
     }
     return "";
 }
 
+std::size_t utf8_prefix_bytes(const std::string& text, std::size_t chars) {
+    std::size_t offset = 0;
+    for (std::size_t count = 0; count < chars && offset < text.size(); ++count) {
+        const unsigned char lead = static_cast<unsigned char>(text[offset]);
+        std::size_t width = lead < 0x80 ? 1 : (lead < 0xE0 ? 2 : (lead < 0xF0 ? 3 : 4));
+        if (offset + width > text.size()) width = 1;
+        offset += width;
+    }
+    return offset;
+}
+
 std::string clip_cell(std::string text, double width, double height) {
-    const int chars = std::max(1, static_cast<int>(std::floor((width - 4.0) / (height * 0.6))));
-    if (static_cast<int>(text.size()) <= chars) return text;
-    if (chars <= 2) return text.substr(0, static_cast<std::size_t>(chars));
-    return text.substr(0, static_cast<std::size_t>(chars - 2)) + "..";
+    const std::size_t chars = static_cast<std::size_t>(
+        std::max(1, static_cast<int>(std::floor((width - 4.0) / (height * 0.6)))));
+    const std::size_t full = utf8_prefix_bytes(text, chars);
+    if (full == text.size()) return text;
+    if (chars <= 2) return text.substr(0, full);
+    return text.substr(0, utf8_prefix_bytes(text, chars - 2)) + "..";
 }
 
 void add_sheet_frame(const json& sheet, AnnExport& ax) {
@@ -250,7 +264,7 @@ void pool_draw_block(const json& draw, AnnExport& ax,
     if (draw.contains("texts") && draw["texts"].is_array())
         for (const auto& t : draw["texts"]) {
             if (!t.is_object() || !t.contains("pos")) continue;
-            std::string txt = ascii_label(t.value("text", std::string()));
+            std::string txt = t.value("text", std::string());
             if (txt.empty()) continue;
             double h = t.value("h", 3.5);
             std::array<double, 2> pos{t["pos"][0].get<double>(), t["pos"][1].get<double>()};
@@ -267,17 +281,21 @@ void pool_draw_block(const json& draw, AnnExport& ax,
 }
 
 // Pool one sheet's annotations, table overlays, section hatch, border, and title block.
-void pool_sheet_annotations(const json& sheet, AnnExport& ax) {
-    auto grow = [&](const std::array<double, 2>& p) {
-        ax.minx = std::min(ax.minx, p[0]); ax.miny = std::min(ax.miny, p[1]);
-        ax.maxx = std::max(ax.maxx, p[0]); ax.maxy = std::max(ax.maxy, p[1]);
-    };
+void pool_sheet_annotations(const json& sheet, AnnExport& ax, AnnExport& tables) {
     for (const auto& view : sheet.value("views", json::array())) {
+        AnnExport& target =
+            view.value("type", std::string()) == "table_overlay" ? tables : ax;
+        auto grow = [&](const std::array<double, 2>& p) {
+            target.minx = std::min(target.minx, p[0]);
+            target.miny = std::min(target.miny, p[1]);
+            target.maxx = std::max(target.maxx, p[0]);
+            target.maxy = std::max(target.maxy, p[1]);
+        };
         for (const auto& an : view.value("annotations", json::array())) {
             if (!an.is_object()) continue;
             if (an.contains("draw")) {
-                pool_draw_block(an["draw"], ax, grow);
-                ++ax.annotation_count;
+                pool_draw_block(an["draw"], target, grow);
+                ++target.annotation_count;
             }
         }
         if (view.contains("hatch") && view["hatch"].is_array())
@@ -292,12 +310,12 @@ void pool_sheet_annotations(const json& sheet, AnnExport& ax) {
     add_sheet_frame(sheet, ax);
 }
 
-// Write {VISIBLE, HIDDEN} polyline pools (+ optional annotations) to a DXF/PDF file.
+// Write {VISIBLE, HIDDEN} polyline pools (+ optional annotations/tables) to DXF/PDF/SVG.
 // Shared writer for the stateless + stateful drawing exports. Returns the written path.
 std::string write_drawing_layers(const std::vector<Polyline>& visible,
                                  const std::vector<Polyline>& hidden, const std::string& path,
-                                 const std::string& fmt, const AnnExport& ax = AnnExport{}) {
-    std::vector<ExpLabel> all_labels = ax.labels;
+                                 const std::string& fmt, const AnnExport& ax = AnnExport{},
+                                 const AnnExport& tables = AnnExport{}) {
     if (fmt == "dxf") {
         DxfLayers layers;
         layers.add_layer("VISIBLE");  // insertion order VISIBLE then HIDDEN (Python dict order)
@@ -308,17 +326,44 @@ std::string write_drawing_layers(const std::vector<Polyline>& visible,
             layers.add_layer("DIMENSIONS");
             for (const auto& s : ax.segs) layers.add_polyline("DIMENSIONS", s);
             for (const auto& s : ax.dashed) layers.add_polyline("DIMENSIONS", s);
-            for (const auto& lb : all_labels) layers.add_text("DIMENSIONS", lb.pos, lb.h, lb.text);
+            for (const auto& lb : ax.labels)
+                layers.add_text("DIMENSIONS", lb.pos, lb.h, ascii_label(lb.text));
+        }
+        if (tables.any()) {
+            layers.add_layer("TABLES");
+            for (const auto& s : tables.segs) layers.add_polyline("TABLES", s);
+            for (const auto& s : tables.dashed) layers.add_polyline("TABLES", s);
+            for (const auto& lb : tables.labels)
+                layers.add_text("TABLES", lb.pos, lb.h, ascii_label(lb.text));
         }
         return write_dxf(path, layers);
+    }
+    if (fmt == "svg") {
+        SvgSheet sheet;
+        for (const auto& pl : visible) sheet.visible.push_back({pl, false});
+        for (const auto& pl : hidden) sheet.hidden.push_back({pl, true});
+        for (const auto& line : ax.segs) sheet.annotations.push_back({line, false});
+        for (const auto& line : ax.dashed) sheet.annotations.push_back({line, true});
+        for (const auto& line : tables.segs) sheet.tables.push_back({line, false});
+        for (const auto& line : tables.dashed) sheet.tables.push_back({line, true});
+        for (const auto& label : ax.labels)
+            sheet.annotation_text.push_back({label.pos, label.h, label.text});
+        for (const auto& label : tables.labels)
+            sheet.table_text.push_back({label.pos, label.h, label.text});
+        return write_svg(path, sheet, !ax.fixed_page, ax.page_w, ax.page_h);
     }
     std::vector<PdfLine> lines;
     for (const auto& pl : visible) lines.push_back({pl, false});
     for (const auto& pl : hidden) lines.push_back({pl, true});
     for (const auto& s : ax.segs) lines.push_back({s, false});
     for (const auto& s : ax.dashed) lines.push_back({s, true});
+    for (const auto& s : tables.segs) lines.push_back({s, false});
+    for (const auto& s : tables.dashed) lines.push_back({s, true});
     std::vector<PdfText> texts;
-    for (const auto& lb : all_labels) texts.push_back({lb.pos, lb.h, lb.text});
+    for (const auto& lb : ax.labels)
+        texts.push_back({lb.pos, lb.h, ascii_label(lb.text)});
+    for (const auto& lb : tables.labels)
+        texts.push_back({lb.pos, lb.h, ascii_label(lb.text)});
     return write_pdf(path, lines, texts, !ax.fixed_page, ax.page_w, ax.page_h);
 }
 
@@ -554,8 +599,9 @@ json export2d_drawing(const json& doc, const json& env, const json& views,
                       const std::string& path, const std::string& fmt) {
     if (!views.is_array())
         throw OpError("invalid_op", "export2d_drawing: 'views' must be an array");
-    if (fmt != "dxf" && fmt != "pdf")
-        throw OpError("invalid_op", "format must be 'dxf' or 'pdf'", {{"format", fmt}});
+    if (fmt != "dxf" && fmt != "pdf" && fmt != "svg")
+        throw OpError("invalid_op", "format must be 'dxf', 'pdf', or 'svg'",
+                      {{"format", fmt}});
     CompileResult res = compile_document(doc, env.is_null() ? json::object() : env);
     json projected = project_all(res.shapes, views);
 
@@ -589,8 +635,9 @@ json export2d_drawing(const json& doc, const json& env, const json& views,
 
 json export_drawing_selected(const std::string& doc_id, const std::string& path,
                              const std::string& fmt, const json& sheet_selector) {
-    if (fmt != "dxf" && fmt != "pdf")
-        throw OpError("invalid_op", "format must be 'dxf' or 'pdf'", {{"format", fmt}});
+    if (fmt != "dxf" && fmt != "pdf" && fmt != "svg")
+        throw OpError("invalid_op", "format must be 'dxf', 'pdf', or 'svg'",
+                      {{"format", fmt}});
     if (!sheet_selector.is_string())
         throw OpError("invalid_op",
                       "drawing_export sheet must be 'all' or an exact sheet id such as 's2'",
@@ -620,6 +667,7 @@ json export_drawing_selected(const std::string& doc_id, const std::string& path,
         std::vector<Polyline> visible;
         std::vector<Polyline> hidden;
         AnnExport annotations;
+        AnnExport tables;
     };
     std::vector<SheetPage> pages;
     pages.reserve(selected.size());
@@ -640,10 +688,11 @@ json export_drawing_selected(const std::string& doc_id, const std::string& path,
                 page.annotations.maxx = std::max(page.annotations.maxx, p[0]);
                 page.annotations.maxy = std::max(page.annotations.maxy, p[1]);
             }
-        pool_sheet_annotations(*sheet, page.annotations);
+        pool_sheet_annotations(*sheet, page.annotations, page.tables);
         visible_count += static_cast<int>(page.visible.size());
         hidden_count += static_cast<int>(page.hidden.size());
-        annotation_count += page.annotations.annotation_count;
+        annotation_count +=
+            page.annotations.annotation_count + page.tables.annotation_count;
         sheet_ids.push_back(page.id);
         sheet_sizes.push_back(
             json::array({page.annotations.page_w, page.annotations.page_h}));
@@ -651,6 +700,7 @@ json export_drawing_selected(const std::string& doc_id, const std::string& path,
     }
 
     std::string out_path;
+    json out_paths = json::array();
     try {
         if (fmt == "pdf") {
             std::vector<PdfPageData> pdf_pages;
@@ -663,41 +713,70 @@ json export_drawing_selected(const std::string& doc_id, const std::string& path,
                 for (const auto& line : page.hidden) pdf.lines.push_back({line, true});
                 for (const auto& line : page.annotations.segs) pdf.lines.push_back({line, false});
                 for (const auto& line : page.annotations.dashed) pdf.lines.push_back({line, true});
+                for (const auto& line : page.tables.segs) pdf.lines.push_back({line, false});
+                for (const auto& line : page.tables.dashed) pdf.lines.push_back({line, true});
                 for (const auto& label : page.annotations.labels)
-                    pdf.texts.push_back({label.pos, label.h, label.text});
+                    pdf.texts.push_back({label.pos, label.h, ascii_label(label.text)});
+                for (const auto& label : page.tables.labels)
+                    pdf.texts.push_back({label.pos, label.h, ascii_label(label.text)});
                 pdf_pages.push_back(std::move(pdf));
             }
             out_path = write_multipage_pdf(path, pdf_pages);
+        } else if (fmt == "svg") {
+            const std::filesystem::path requested(path);
+            for (std::size_t i = 0; i < pages.size(); ++i) {
+                const SheetPage& page = pages[i];
+                std::filesystem::path target = requested;
+                if (pages.size() > 1) {
+                    std::string stem =
+                        requested.extension() == ".svg" ? requested.stem().string()
+                                                         : requested.filename().string();
+                    std::string sheet_id =
+                        page.id.empty() ? "s" + std::to_string(i + 1) : page.id;
+                    target = requested.parent_path() / (stem + "_" + sheet_id + ".svg");
+                }
+                std::string written =
+                    write_drawing_layers(page.visible, page.hidden, target.string(), fmt,
+                                         page.annotations, page.tables);
+                out_paths.push_back(written);
+            }
+            out_path = out_paths.front().get<std::string>();
         } else {
             // DXF has no page concept. Lay selected sheets left-to-right with a 20 mm
             // gutter, preserving each complete border/title/table instead of overlapping
             // every sheet at the origin.
             std::vector<Polyline> visible, hidden;
-            AnnExport combined;
+            AnnExport combined, combined_tables;
             double offset_x = 0.0;
             auto shifted = [](const Polyline& input, double dx) {
                 Polyline out = input;
                 for (auto& p : out) p[0] += dx;
                 return out;
             };
+            auto append_shifted = [&](const AnnExport& source, AnnExport& destination,
+                                      double dx) {
+                for (const auto& line : source.segs)
+                    destination.segs.push_back(shifted(line, dx));
+                for (const auto& line : source.dashed)
+                    destination.dashed.push_back(shifted(line, dx));
+                for (const auto& label : source.labels) {
+                    ExpLabel copy = label;
+                    copy.pos[0] += dx;
+                    destination.labels.push_back(std::move(copy));
+                }
+                destination.annotation_count += source.annotation_count;
+            };
             for (const SheetPage& page : pages) {
                 for (const auto& line : page.visible)
                     visible.push_back(shifted(line, offset_x));
                 for (const auto& line : page.hidden)
                     hidden.push_back(shifted(line, offset_x));
-                for (const auto& line : page.annotations.segs)
-                    combined.segs.push_back(shifted(line, offset_x));
-                for (const auto& line : page.annotations.dashed)
-                    combined.dashed.push_back(shifted(line, offset_x));
-                for (const auto& label : page.annotations.labels) {
-                    ExpLabel copy = label;
-                    copy.pos[0] += offset_x;
-                    combined.labels.push_back(std::move(copy));
-                }
-                combined.annotation_count += page.annotations.annotation_count;
+                append_shifted(page.annotations, combined, offset_x);
+                append_shifted(page.tables, combined_tables, offset_x);
                 offset_x += page.annotations.page_w + 20.0;
             }
-            out_path = write_drawing_layers(visible, hidden, path, fmt, combined);
+            out_path =
+                write_drawing_layers(visible, hidden, path, fmt, combined, combined_tables);
         }
     } catch (const OpError&) {
         throw;
@@ -705,8 +784,9 @@ json export_drawing_selected(const std::string& doc_id, const std::string& path,
         throw OpError("export_failed", std::string("export_drawing: ") + exc.what(),
                       {{"doc_id", doc_id}, {"path", path}, {"format", fmt}});
     }
+    if (out_paths.empty()) out_paths.push_back(out_path);
 
-    json result = {{"path", out_path}, {"format", fmt},
+    json result = {{"path", out_path}, {"paths", out_paths}, {"format", fmt},
                    {"visible", visible_count}, {"hidden", hidden_count},
                    {"annotations", annotation_count},
                    {"entities", visible_count + hidden_count},

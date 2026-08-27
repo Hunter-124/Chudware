@@ -55,6 +55,15 @@ def exchange(monkeypatch):
             return {"docs": [{"doc_id": "doc-live", "revision": 3}]}
         if method == "doc_open":
             return {"doc_id": "doc-opened"}
+        if method == "drawing_open_standalone":
+            return {"drawing_id": "dwg-opened", "name": "Drawing",
+                    "source_state": "embedded_opened"}
+        if method == "drawing_save_standalone":
+            destination = Path(params["path"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"PK\x03\x04 fake drawing container")
+            return {"drawing_id": params["drawing_id"], "path": str(destination),
+                    "source_state": "live"}
         if method == "import_file":
             return {"doc_id": "doc-imported"}
         return {}
@@ -85,6 +94,21 @@ def test_import_part_relative_stepplus_goes_absolute(exchange, tmp_path, monkeyp
     assert os.path.isabs(doc_open[0]["path"])
     # The run record keeps the caller's original string, not the resolved abs path.
     assert out["imported_from"] == _REL_STEPPLUS
+
+def test_import_part_relative_drawplus_uses_drawing_open(exchange, tmp_path, monkeypatch):
+    tools_fn, calls = exchange
+    drawing = tmp_path / "x.draw+"
+    drawing.write_bytes(b"PK\x03\x04 fake drawing container")
+    monkeypatch.chdir(tmp_path)
+
+    out = json.loads(tools_fn["import_part"](path="x.draw+"))
+
+    assert out["ok"] is True, out
+    assert out["doc_id"] == out["drawing_id"] == "dwg-opened"
+    assert out["source_state"] == "embedded_opened"
+    opens = [p for m, p in calls if m == "drawing_open_standalone"]
+    assert opens == [{"path": str(drawing)}]
+    assert not [p for m, p in calls if m == "import_file"]
 
 
 def test_import_part_relative_interchange_goes_absolute(exchange, tmp_path, monkeypatch):
@@ -133,6 +157,19 @@ def test_export_part_stepplus_alias_goes_absolute(exchange, tmp_path, monkeypatc
     assert len(saves) == 1, calls
     assert saves[0]["path"] == str(tmp_path / "deliverable.step+")
 
+
+def test_export_part_drawplus_uses_standalone_saver(exchange, tmp_path, monkeypatch):
+    tools_fn, calls = exchange
+    monkeypatch.chdir(tmp_path)
+
+    out = json.loads(tools_fn["export_part"](fmt="draw+", path="drawing",
+                                             doc_id="dwg-cpp00000001"))
+
+    assert out["ok"] is True, out
+    assert out["drawing_id"] == "dwg-cpp00000001"
+    saves = [p for m, p in calls if m == "drawing_save_standalone"]
+    assert saves == [{"drawing_id": "dwg-cpp00000001",
+                      "path": str(tmp_path / "drawing.draw+")}]
 
 def test_export_part_tilde_destination_expands(exchange, tmp_path, monkeypatch):
     """'~/x.step' must expand to $HOME — abspath alone would yield '<cwd>/~/x.step'."""

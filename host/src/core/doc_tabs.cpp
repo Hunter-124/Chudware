@@ -230,7 +230,9 @@ void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_
     ecadRevision = ecadRevision_;
     animActive = false;
     showRibbon = true;
-    ribbonTab = RT_PCB;
+    ribbonTab = docTabs[activeTab].kind == DocTab::TabKind::Schematic
+                    ? RT_Schematic
+                    : RT_PCB;
     wantFocusEcad = 6;
     // An ECAD tab does not use the CAD subsystems — point st.propertyManager / sketchMode /
     // evaluateDialogs back at the fallback singletons so nothing acts on the parked part behind it.
@@ -296,8 +298,10 @@ void AppState::switchToTab(int idx) {
         activeWorkspace = Workspace::Drawing;   // the sheet renders in the Drawing workspace
         animActive = false;
         reseatActiveSubsystems(nullptr);   // drawing tab: CAD subsystems fall back to the singletons
-        // A drawing has no Assembly/PCB context; otherwise it keeps whatever ribbon was forward.
-        if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB) ribbonTab = RT_Features;
+        // A drawing has no Assembly/ECAD context; otherwise it keeps whatever ribbon was forward.
+        if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB ||
+            ribbonTab == RT_Schematic)
+            ribbonTab = RT_Features;
         refreshDrawingTab(idx);
         addLog("[tabs] switched to drawing '" + dst0.title + "' (" + dst0.drawingDocId + ")");
         return;
@@ -307,7 +311,7 @@ void AppState::switchToTab(int idx) {
     //     worker's separate ecad_* registry, and the central area shows the ECAD editor canvas (the
     //     active part/asm stays loaded behind it). Point the editor at this tab's doc + revision and
     //     refresh its mirror (ecad_tree) so the canvas reflects any out-of-band edits, then surface
-    //     the ECAD dock with the PCB ribbon forward. activeTab is set BEFORE the mirror load so the
+    //     the ECAD dock with the document-kind ribbon forward. activeTab is set BEFORE the mirror
     //     ecad_panel state() resolver targets this tab's per-document EcadEditorState.
     if (dst0.kind == DocTab::TabKind::Schematic || dst0.kind == DocTab::TabKind::PCB) {
         activeTab = idx;
@@ -331,7 +335,7 @@ void AppState::switchToTab(int idx) {
             }
         }
         showRibbon = true;
-        ribbonTab = RT_PCB;
+        ribbonTab = dst0.kind == DocTab::TabKind::Schematic ? RT_Schematic : RT_PCB;
         wantFocusEcad = 6;                 // surface the ECAD editor dock (focus settles over frames)
         addLog("[tabs] switched to ECAD '" + dst0.title + "' (" + dst0.ecadDocId + ")");
         return;
@@ -553,7 +557,8 @@ void AppState::switchToTab(int idx) {
     //    Assembly). A Part has no Assembly/PCB context, so coming from either (e.g. switching from a
     //    Schematic/PCB tab, or an assembly) snaps the ribbon back to Features.
     if (dst.isAssembly) { showRibbon = true; ribbonTab = RT_Features; }
-    else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB) ribbonTab = RT_Features;
+    else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB ||
+             ribbonTab == RT_Schematic) ribbonTab = RT_Features;
 
     // SimManager is per-document and retains its known studies. Do not synchronously refresh here:
     // even a read-only RPC shares the worker queue with agent jobs and used to turn a GPU-cache bind
@@ -684,7 +689,8 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                          pan[0] = d.pan[0]; pan[1] = d.pan[1]; pan[2] = d.pan[2];
                      }
                      if (d.isAssembly) { showRibbon = true; ribbonTab = RT_Features; }
-                     else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB)
+                     else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB ||
+                              ribbonTab == RT_Schematic)
                          ribbonTab = RT_Features;
                  } else {
                     // Park mesh path on the session so the next switch can use the fast path.
@@ -1093,4 +1099,22 @@ void AppState::adoptDrawingTab(const std::string& drawingDocId, const std::strin
     // drawing tabs sit alongside it for the user to click into.
     addLog("[draw] restored drawing tab '" + title + "' (" + drawingDocId + ") from " +
            sourceDocId);
+}
+
+void AppState::adoptStandaloneDrawingTab(const std::string& drawingDocId,
+                                         const std::string& name,
+                                         const std::string& sourceDocId,
+                                         const std::string& path) {
+    adoptDrawingTab(drawingDocId, name, sourceDocId);
+    for (int i = 0; i < static_cast<int>(docTabs.size()); ++i) {
+        DocTab& tab = docTabs[i];
+        if (tab.kind != DocTab::TabKind::Drawing ||
+            tab.drawingDocId != drawingDocId)
+            continue;
+        tab.path = path;
+        tab.dirty = false;
+        switchToTab(i);
+        addLog("[draw] opened standalone drawing '" + tab.title + "' from " + path);
+        return;
+    }
 }

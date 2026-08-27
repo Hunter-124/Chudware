@@ -314,7 +314,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "export_drawing": {
         "prompt_note": (
             "Final drawing artifact only: make_drawing → current review_drawing → "
-            "audit_drawing(verdict=release_ready) → export. Use sheet='all' for the "
+            "audit_drawing(verdict=release_ready) → export. Release PDFs with editable "
+            "siblings in one call via fmt='pdf', companions=['dxf','svg']; use fmt='svg' "
+            "alone when only an editable illustration is needed. Use sheet='all' for the "
             "controlled multi-sheet package; 3D exchange files use export_part."
         ),
     },

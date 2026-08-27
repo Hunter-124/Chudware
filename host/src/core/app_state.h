@@ -1284,6 +1284,12 @@ struct AppState {
     // tab focus (the reopened part stays active). No-op + log on a failed fetch.
     void adoptDrawingTab(const std::string& drawingDocId, const std::string& name,
                          const std::string& sourceDocId);
+    // Adopt a drawing opened from its own .draw+ container, remember that path for
+    // direct standalone saves, and activate the Drawing tab.
+    void adoptStandaloneDrawingTab(const std::string& drawingDocId,
+                                   const std::string& name,
+                                   const std::string& sourceDocId,
+                                   const std::string& path);
     // True when the active tab is a Drawing (the central area shows the 2D sheet, not the 3D view).
     bool activeTabIsDrawing() const {
         return activeTab >= 0 && activeTab < (int)docTabs.size() &&
@@ -1669,6 +1675,11 @@ struct AppState {
         RT_Appearance = 11,
         // Manufacture workspace — CAM toolpaths / post / material-removal sim (3D docs).
         RT_Manufacture = 12,
+        // ECAD split: kRibbonTabs[] index 7 is "PCB Design" and index 20 is "Schematic"
+        // (appended there to keep the sim per-type tab indices 13..19 stable). A Schematic
+        // doc tab MUST select RT_Schematic — selecting RT_PCB for both kinds was why a new
+        // schematic surfaced board commands.
+        RT_Schematic = 20,
     };
     bool showRibbon = true;        // View > Ribbon visibility toggle
     bool profilerRunning = false;  // Evaluate > Profiler: sampling profiler active (libchudware prof_*)

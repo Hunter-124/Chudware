@@ -3688,7 +3688,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("relative", false)),
                             out_json, 0);
             // 2D exports (engine/doc/export2d.py). Format = explicit param else the path's
-            // .dxf/.pdf extension (mirrors export2d.py::_resolve_format).
+            // .dxf/.pdf/.svg extension (mirrors export2d.py::_resolve_format).
             if (m == "export_drawing" || m == "drawing_export" || m == "export_flat_dxf") {
                 const std::string path = params.value("path", std::string());
                 std::string fmt = params.value("format", std::string());
@@ -3696,7 +3696,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     auto dot = path.find_last_of('.');
                     std::string ext = dot == std::string::npos ? "" : path.substr(dot + 1);
                     for (char& c : ext) c = (char)std::tolower((unsigned char)c);
-                    if (ext == "dxf" || ext == "pdf") fmt = ext;
+                    if (ext == "dxf" || ext == "pdf" || ext == "svg") fmt = ext;
                 }
                 const std::string doc_id = params.value("doc_id", std::string());
                 if (m == "export_drawing" || m == "drawing_export")
@@ -3975,6 +3975,16 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     if (params.contains(k)) spec[k] = params[k];
                 return emit(chudware::doc::drawing_make(src, spec), out_json, 0);
             }
+            if (m == "drawing_save_standalone")
+                return emit(chudware::doc::drawing_save_standalone(
+                                params.value("drawing_id",
+                                             params.value("doc_id", std::string())),
+                                params.value("path", std::string())),
+                            out_json, 0);
+            if (m == "drawing_open_standalone")
+                return emit(chudware::doc::drawing_open_standalone(
+                                params.value("path", std::string())),
+                            out_json, 0);
             if (m == "drawing_get")
                 return emit(chudware::doc::drawing_get(params.value("doc_id", std::string())),
                             out_json, 0);

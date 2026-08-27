@@ -31,11 +31,11 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                     doc_id: Optional[str] = None) -> str:
         """Export the current part to an interchange/mesh file; returns the written path.
 
-        fmt: "step+" (native) | "step" | "stl" | "3mf" | "iges" | "brep" | "obj" | "ply" |
-             "gltf" | "glb" | "3dm". If `path` is omitted, the file is named from the document
-             in CHUDWARE_PROJECT_SAVE_DIR; only clients with no configured project folder fall
-             back to a temp file. STEP/IGES/BREP are exact B-rep; STL/OBJ/PLY/glTF are
-             tessellated meshes.
+        fmt: "draw+" (standalone native drawing) | "step+" (native part) | "step" | "stl" |
+             "3mf" | "iges" | "brep" | "obj" | "ply" | "gltf" | "glb" | "3dm". If `path`
+             is omitted, the file is named from the document in CHUDWARE_PROJECT_SAVE_DIR;
+             only clients with no configured project folder fall back to a temp file.
+             STEP/IGES/BREP are exact B-rep; STL/OBJ/PLY/glTF are tessellated meshes.
 
         NOTE: plain STEP/STL/etc. carry geometry only — NO editable feature tree or simulation
         studies. To hand the user a part they can keep editing, use save_part() (native .step+).
@@ -44,6 +44,18 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         try:
             d = _doc(doc_id)
             fmt = fmt.lower().lstrip(".")
+            if fmt in ("draw+", "drawplus"):
+                out = (_sanitize_output_path(os.path.expanduser(path)) if path
+                       else _default_deliverable_path(d, ".draw+"))
+                if not out.lower().endswith(".draw+"):
+                    out += ".draw+"
+                r = cb.call("drawing_save_standalone",
+                            {"drawing_id": d, "path": out})
+                written = r.get("path", out)
+                return _dumps({"ok": os.path.exists(written), "format": "draw+",
+                               "native": True, "drawing_id": d, "doc_id": d,
+                               "path": written, "exists": os.path.exists(written),
+                               **{k: r[k] for k in ("source_state",) if k in r}})
             # The native editable container is written by doc_save, not the interchange writer.
             if fmt in ("step+", "stepplus", "stp+", "native"):
                 # K3: canonicalise caller-supplied path before passing to the engine — expanduser
@@ -90,8 +102,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def import_part(path: str, into: Optional[str] = None, as_solid: bool = False,
                     resolve_features: bool = True) -> str:
-        """Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3DM/DXF/DWG/STEP+/…) as a body.
-
+        """Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3DM/DXF/DWG/
+        STEP+/DRAW+/…) as a body, or open a native standalone drawing.
         Lets you assemble components built or exported separately, or recover geometry from a file
         after a session reset. `into` = an existing doc_id to add the body to the CURRENT part
         (for assembly); omit it to open the file as a NEW part (made current). `as_solid` sews a
@@ -251,6 +263,18 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                         "feature_resolved": True, "feature_count": plan["feature_count"],
                         "degraded": plan["degraded"],
                         **{k: r[k] for k in ("revision", "body_count", "volume_mm3") if k in r}})
+            # A standalone drawing is its own native registry/session. It must never fall
+            # through import_file (which would treat the ZIP as 3D geometry).
+            if path_abs.lower().endswith(".draw+"):
+                if into:
+                    raise ValueError("a .draw+ opens as its own drawing; 'into' is not supported")
+                r = cb.call("drawing_open_standalone", {"path": path_abs})
+                drawing_id = r.get("drawing_id") or r.get("doc_id")
+                return _dumps({"ok": True, "doc_id": drawing_id,
+                               "drawing_id": drawing_id, "imported_from": path,
+                               "format": "draw+", "native": True,
+                               **{k: r[k] for k in ("name", "source_doc_id", "source_state")
+                                  if k in r}})
             # A3: .step+ is the engine's NATIVE format. With no `into`, route it through
             # doc_open (the same path used by recover_parts and the host's own file-open) to
             # open it as a fresh part. WITH `into`, the engine's import_file now extracts the

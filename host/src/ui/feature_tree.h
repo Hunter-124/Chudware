@@ -136,6 +136,7 @@ bool featureSelectAll(AppState& st);
 //   - featureTreeActivePath: the active doc's on-disk path ("" if never saved).
 bool        featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid = false);
 std::string featureTreeOpenDialog(AppState& st);
+bool        featureTreeOpenDrawingPath(AppState& st, const std::string& path);
 std::string featureTreeSaveDoc(AppState& st, bool saveAs);
 std::string featureTreeActivePath();
 // Silent save of the active DocMirror doc to an absolute .step+ path (no dialog). Used by the

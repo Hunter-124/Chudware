@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -22,6 +23,7 @@
 #include "doc/document.h"
 #include "doc/drawing.h"
 #include "doc/session.h"  // OpError
+#include "doc/stepplus.h"
 
 using nlohmann::json;
 
@@ -97,6 +99,12 @@ struct DrawingSession {
     json source_env;      // equation env for the source compile
     long revision = 0;
     long source_revision = 0;
+    std::string standalone_path;
+    std::map<std::string, std::string> standalone_extra;
+    std::string source_state = "live";
+    bool source_missing = false;
+    bool owns_source = false;
+    json cached_views;
 };
 
 std::mutex g_mtx;
@@ -1082,6 +1090,63 @@ json compile_title_extension_draw(const json& sheet) {
 // doc + every view's re-projected geometry (drawing.py::get_drawing_full).
 json drawing_get_locked_unsafe(const std::string& doc_id) {
     DrawingSession& s = require_session(doc_id);
+    if (s.source_missing) {
+        json frozen = s.cached_views.is_object() ? s.cached_views : json::object();
+        frozen["doc_id"] = doc_id;
+        frozen["revision"] = s.revision;
+        frozen["source_doc_id"] = json(nullptr);
+        frozen["source_revision"] = s.source_revision;
+        frozen["tree"] = s.doc;
+        frozen["active_sheet_id"] =
+            s.doc.value("active_sheet", std::string("s1"));
+        frozen["source_state"] = "missing";
+        frozen["source_missing"] = true;
+        frozen["views_stale"] = true;
+        frozen["warning"] =
+            "source missing — views frozen from last projection";
+        if (!frozen.contains("sheets") || !frozen["sheets"].is_array())
+            frozen["sheets"] = json::array();
+        // Geometry stays frozen, but non-geometric drawing data remains editable:
+        // overlay current title blocks and annotations onto the cached projection.
+        const std::string units = doc_units(s.doc);
+        for (json& cached_sheet : frozen["sheets"]) {
+            const std::string sheet_id =
+                cached_sheet.value("id", std::string());
+            const json* stored_sheet = nullptr;
+            if (s.doc.contains("sheets") && s.doc["sheets"].is_array())
+                for (const json& candidate : s.doc["sheets"])
+                    if (candidate.value("id", std::string()) == sheet_id) {
+                        stored_sheet = &candidate;
+                        break;
+                    }
+            if (!stored_sheet) continue;
+            cached_sheet["name"] = stored_sheet->value("name", json(nullptr));
+            cached_sheet["size"] = stored_sheet->value("size", json(nullptr));
+            cached_sheet["title_block"] =
+                stored_sheet->value("title_block", json::object());
+            if (!cached_sheet.contains("views") || !cached_sheet["views"].is_array())
+                continue;
+            for (json& cached_view : cached_sheet["views"]) {
+                const std::string view_id =
+                    cached_view.value("view_id", std::string());
+                const json* stored_view = nullptr;
+                if (stored_sheet->contains("views") &&
+                    (*stored_sheet)["views"].is_array())
+                    for (const json& candidate : (*stored_sheet)["views"])
+                        if (candidate.value("id", std::string()) == view_id) {
+                            stored_view = &candidate;
+                            break;
+                        }
+                if (!stored_view) continue;
+                cached_view["annotations"] =
+                    stored_view->value("annotations", json::array());
+                for (json& annotation : cached_view["annotations"])
+                    if (annotation.is_object())
+                        annotation["draw"] = compile_annotation(annotation, units);
+            }
+        }
+        return frozen;
+    }
     auto shapes = source_shapes(s);
     json sheets_out = json::array();
     double total_ms = 0.0;
@@ -1162,6 +1227,9 @@ json drawing_get_locked_unsafe(const std::string& doc_id) {
         {"source_doc_id", s.source_ref_id.empty() ? s.doc_id : s.source_ref_id},
         {"source_revision", s.source_revision}, {"tree", s.doc}, {"sheets", sheets_out},
         {"active_sheet_id", s.doc.value("active_sheet", std::string("s1"))},
+        {"source_state", s.source_state},
+        {"source_missing", false},
+        {"views_stale", false},
         {"total_hlr_ms", round6(total_ms)},
     };
 }
@@ -1797,7 +1865,8 @@ json register_restored_drawing(const json& drawing_doc, const std::string& sourc
     s.doc_id = doc_id;
     s.source_ref_id = source_doc_id;  // re-point the live source to the reopened part
     s.doc = drawing_doc;
-    s.doc["source"] = source_doc_id;  // keep the doc's own source ref in sync
+    if (!s.doc.contains("source") || !s.doc["source"].is_object())
+        s.doc["source"] = source_doc_id;  // legacy embedded drawings store a string ref
     if (!s.doc.contains("active_sheet") || !s.doc["active_sheet"].is_string()) {
         const json& sheets = s.doc.value("sheets", json::array());
         s.doc["active_sheet"] = !sheets.empty() ? sheets[0].value("id", std::string("s1"))
@@ -1818,6 +1887,144 @@ json register_restored_drawing(const json& drawing_doc, const std::string& sourc
     return json{{"doc_id", doc_id},
                 {"name", g_drawings[doc_id].doc.value("name", std::string("Drawing"))},
                 {"source_doc_id", source_doc_id}};
+}
+
+json drawing_save_standalone(const std::string& drawing_id, const std::string& path) {
+    if (path.empty())
+        throw OpError("io_error", "drawing_save_standalone: path is required",
+                      {{"reason", "missing path"}});
+
+    DrawingLock lk;
+    DrawingSession& s = require_session(drawing_id);
+    std::map<std::string, std::string> extra = s.standalone_extra;
+
+    if (!s.source_missing) {
+        json source = s.source_doc;
+        json live;
+        if (!s.source_ref_id.empty()) {
+            live = doc_live_source(s.source_ref_id);
+            if (live.is_object() && live.contains("tree")) source = live["tree"];
+        }
+        const std::string schema =
+            source.is_object() ? source.value("schema", std::string()) : std::string();
+        if (schema != "aicad.part/1" && schema != "aicad.asm/1")
+            throw OpError("invalid_op",
+                          "drawing_save_standalone: drawing has no serializable part/assembly source",
+                          {{"drawing_id", drawing_id}, {"source_schema", schema}});
+
+        json source_ref = {{"kind", "embedded"}, {"source_doc_schema", schema}};
+        if (live.is_object() && live.contains("path") && live["path"].is_string()) {
+            const std::string source_path = live["path"].get<std::string>();
+            if (!source_path.empty()) {
+                namespace fs = std::filesystem;
+                std::error_code ec;
+                fs::path rel = fs::relative(fs::path(source_path),
+                                            fs::path(path).parent_path(), ec);
+                source_ref["step_plus_rel_path"] =
+                    (!ec && !rel.empty()) ? rel.generic_string() : source_path;
+            }
+        }
+        s.doc["source"] = std::move(source_ref);
+        s.source_doc = source;
+        s.source_env = live.is_object() ? live.value("env", json::object()) : s.source_env;
+        extra["source/document.json"] = editable_document_json(source);
+    } else {
+        extra.erase("source/document.json");
+    }
+
+    // Cache the complete assembled sheets, not just the stored view definitions. It is
+    // display-only and explicitly marked stale if the source cannot be restored later.
+    extra["cache/views.json"] = drawing_get_locked_unsafe(drawing_id).dump(2);
+    const std::string written =
+        editable_container_save(s.doc, path, extra, "aicad.draw+/1", "drawing", ".draw+");
+    s.standalone_path = written;
+    s.standalone_extra = std::move(extra);
+    return json{{"drawing_id", drawing_id},
+                {"doc_id", drawing_id},
+                {"path", written},
+                {"source_state", s.source_state}};
+}
+
+json drawing_open_standalone(const std::string& path) {
+    StepPlusDoc loaded =
+        editable_container_open(path, "aicad.draw+/", ".draw+");
+    if (!loaded.doc.is_object() ||
+        loaded.doc.value("schema", std::string()) != kSchemaDrawing)
+        throw OpError("unsupported",
+                      "drawing_open_standalone: expected an aicad.drawing/1 document",
+                      {{"schema", loaded.doc.is_object()
+                                      ? loaded.doc.value("schema", std::string())
+                                      : std::string()},
+                       {"reason", "unsupported document kind"}});
+
+    const json source_ref =
+        loaded.doc.contains("source") && loaded.doc["source"].is_object()
+            ? loaded.doc["source"] : json::object();
+    std::string source_path;
+    if (source_ref.contains("step_plus_rel_path") &&
+        source_ref["step_plus_rel_path"].is_string()) {
+        namespace fs = std::filesystem;
+        fs::path p(source_ref["step_plus_rel_path"].get<std::string>());
+        if (p.is_relative()) p = fs::path(path).parent_path() / p;
+        source_path = p.lexically_normal().string();
+    }
+
+    std::string source_doc_id;
+    std::string source_state = "missing";
+    if (!source_path.empty())
+        source_doc_id = doc_find_open_by_path(source_path);
+    if (!source_doc_id.empty()) {
+        source_state = "live";
+    } else {
+        auto embedded = loaded.extra.find("source/document.json");
+        if (embedded != loaded.extra.end()) {
+            try {
+                json source_doc = json::parse(embedded->second);
+                json opened = doc_open_embedded(source_doc);
+                source_doc_id = opened.value("doc_id", std::string());
+                if (!source_doc_id.empty()) source_state = "embedded_opened";
+            } catch (const std::exception&) {
+                source_doc_id.clear();
+            }
+        }
+        if (source_doc_id.empty() && !source_path.empty() &&
+            std::filesystem::exists(source_path)) {
+            try {
+                json opened = doc_open(source_path, false);
+                source_doc_id = opened.value("doc_id", std::string());
+                if (!source_doc_id.empty()) source_state = "live";
+            } catch (const std::exception&) {
+                source_doc_id.clear();
+            }
+        }
+    }
+
+    json restored = register_restored_drawing(loaded.doc, source_doc_id);
+    const std::string drawing_id = restored.value("doc_id", std::string());
+    {
+        DrawingLock lk;
+        DrawingSession& s = require_session(drawing_id);
+        s.standalone_path = path;
+        s.standalone_extra = std::move(loaded.extra);
+        s.source_state = source_state;
+        s.source_missing = source_doc_id.empty();
+        auto cached = s.standalone_extra.find("cache/views.json");
+        if (cached != s.standalone_extra.end()) {
+            try {
+                s.cached_views = json::parse(cached->second);
+            } catch (const std::exception&) {
+                s.cached_views = json::object();
+            }
+        }
+        s.owns_source = source_state == "embedded_opened";
+    }
+    return json{{"drawing_id", drawing_id},
+                {"doc_id", drawing_id},
+                {"name", restored.value("name", std::string("Drawing"))},
+                {"source_doc_id", source_doc_id.empty() ? json(nullptr)
+                                                         : json(source_doc_id)},
+                {"source_state", source_state},
+                {"path", path}};
 }
 
 // ----------------------------------------------------------- detailing (W17 overhaul)
@@ -2685,8 +2892,22 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
 }
 
 bool drawing_close(const std::string& doc_id) {
-    DrawingLock lk;
-    return g_drawings.erase(doc_id) > 0;
+    std::string owned_source;
+    {
+        DrawingLock lk;
+        auto it = g_drawings.find(doc_id);
+        if (it == g_drawings.end()) return false;
+        if (it->second.owns_source) owned_source = it->second.source_ref_id;
+        g_drawings.erase(it);
+    }
+    if (!owned_source.empty()) {
+        try {
+            (void)doc_close(owned_source);
+        } catch (const std::exception&) {
+            // The drawing is already closed; a busy source remains a normal live session.
+        }
+    }
+    return true;
 }
 
 // ----------------------------------------------------------------- crash recovery

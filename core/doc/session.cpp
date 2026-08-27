@@ -5227,7 +5227,62 @@ json doc_live_source(const std::string& doc_id) {
     DocLock lk;
     if (!pin_session(doc_id)) return json(nullptr);
     Session& s = lk.acquire(doc_id);
-    return json{{"tree", s.doc}, {"env", env_from_doc(s.doc)}, {"revision", s.revision}};
+    return json{{"tree", s.doc}, {"env", env_from_doc(s.doc)}, {"revision", s.revision},
+                {"path", s.path.empty() ? json(nullptr) : json(s.path)},
+                {"schema", s.doc.is_object()
+                               ? s.doc.value("schema", std::string())
+                               : std::string()}};
+}
+
+std::string doc_find_open_by_path(const std::string& path) {
+    if (path.empty()) return {};
+    namespace fs = std::filesystem;
+    std::error_code wanted_ec;
+    fs::path wanted = fs::weakly_canonical(fs::path(path), wanted_ec);
+    if (wanted_ec) wanted = fs::path(path).lexically_normal();
+
+    std::vector<std::pair<std::string, std::shared_ptr<Session>>> pins;
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        pins.reserve(g_sessions.size());
+        for (const auto& entry : g_sessions) pins.push_back(entry);
+    }
+    for (const auto& [id, sp] : pins) {
+        std::lock_guard<std::mutex> doc(sp->mtx);
+        if (sp->path.empty()) continue;
+        std::error_code have_ec;
+        fs::path have = fs::weakly_canonical(fs::path(sp->path), have_ec);
+        if (have_ec) have = fs::path(sp->path).lexically_normal();
+        if (have == wanted) return id;
+    }
+    return {};
+}
+
+json doc_open_embedded(const json& document) {
+    const std::string schema =
+        document.is_object() ? document.value("schema", std::string()) : std::string();
+    if (schema != "aicad.part/1" && schema != "aicad.asm/1")
+        throw OpError("unsupported",
+                      "doc_open_embedded: expected a part/assembly document (got schema '" +
+                          schema + "')",
+                      {{"schema", schema}, {"reason", "unsupported document kind"}});
+
+    auto sp = std::make_shared<Session>();
+    sp->doc_id = new_doc_id();
+    sp->doc = document;
+    sp->doc["id"] = sp->doc_id;
+    sp->revision = 0;
+    sp->dirty = false;
+    const std::string sid = sp->doc_id;
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        sp->owns_journal = true;
+        g_sessions[sid] = sp;
+    }
+    return json{{"doc_id", sid},
+                {"name", sp->doc.value("name", std::string())},
+                {"schema", schema},
+                {"embedded", true}};
 }
 // Viewport tab-switch activation: identical response shape to doc_rebuild, but served from
 // the session's read-cache compile whenever it is valid (`compiled_rev == revision` — every

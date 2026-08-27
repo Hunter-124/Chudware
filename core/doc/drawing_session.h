@@ -42,6 +42,14 @@ std::map<std::string, std::string> drawings_for_source(const std::string& source
 // engine/doc/drawing.py::register_restored_drawing.
 nlohmann::json register_restored_drawing(const nlohmann::json& drawing_doc,
                                          const std::string& source_doc_id);
+// Standalone editable drawing container (.draw+ / aicad.draw+/1). Save embeds the
+// source document by default plus a stale-safe cache of the last projected sheets.
+// Open returns {drawing_id, source_doc_id, source_state:live|embedded_opened|missing,
+// name, path}; a missing source remains viewable from cache/views.json.
+nlohmann::json drawing_save_standalone(const std::string& drawing_id,
+                                       const std::string& path);
+nlohmann::json drawing_open_standalone(const std::string& path);
+
 
 // drawing_new: create a drawing referencing a source part. Two source models:
 //   - LIVE (host path): pass `source_doc_id` = an OPEN C++ DocSession id ("doc-cpp...").

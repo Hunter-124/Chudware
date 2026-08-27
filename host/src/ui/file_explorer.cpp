@@ -126,11 +126,12 @@ static void itemPathTooltip(const std::string& name, const std::string& fullPath
 
 
 // ---- known extensions ----------------------------------------------------
-// .step+ is our native part container; the rest are import/interop formats. ECAD/KiCad files open
-// through the ECAD path. Lower-cased compare.
+// .step+ is our native part container and .draw+ is a standalone editable drawing;
+// the rest are import/interop formats. ECAD/KiCad files open through the ECAD path.
+// Lower-cased compare.
 static bool isCadExt(const std::string& e) {
-    return e == ".step+" || e == ".step" || e == ".stp" || e == ".iges" || e == ".igs" ||
-           e == ".stl"   || e == ".3mf";
+    return e == ".draw+" || e == ".step+" || e == ".step" || e == ".stp" ||
+           e == ".iges" || e == ".igs" || e == ".stl" || e == ".3mf";
 }
 static bool isEcadExt(const std::string& e) {
     return e == ".ecad+" || e == ".ecad" || e == ".kicad_sch" || e == ".kicad_pcb";

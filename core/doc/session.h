@@ -110,6 +110,11 @@ bool doc_close(const std::string& doc_id);
 // "revision":<long>}; returns a null json when `doc_id` is not an open session, so the
 // caller can fall back to its last good snapshot instead of crashing.
 nlohmann::json doc_live_source(const std::string& doc_id);
+// Standalone .draw+ source restoration: find an already-open source by durable
+// path, or register an embedded part/assembly document as a live source session.
+std::string doc_find_open_by_path(const std::string& path);
+nlohmann::json doc_open_embedded(const nlohmann::json& document);
+
 
 // C20 assembly RPCs (port of engine/doc/session.py solve_mates / set_explode_state /
 // asm_world_bodies). doc_solve_mates re-solves the mates (optional drag {component,

@@ -1150,12 +1150,12 @@ static std::string chatLowerExt(const std::string& p) {
     return e;
 }
 
-// Extensions the app itself opens in the viewport (mirrors file_explorer.cpp isKnownExt: native
-// .step+ container, CAD import formats, ECAD/KiCad).
+// Extensions the app itself opens (mirrors file_explorer.cpp isKnownExt: native
+// .draw+/.step+ containers, CAD import formats, ECAD/KiCad).
 static bool chatAppOpenableExt(const std::string& e) {
-    return e == ".step+" || e == ".step" || e == ".stp" || e == ".iges" || e == ".igs" ||
-           e == ".stl"   || e == ".3mf"  || e == ".ecad+" || e == ".ecad" ||
-           e == ".kicad_sch" || e == ".kicad_pcb";
+    return e == ".draw+" || e == ".step+" || e == ".step" || e == ".stp" ||
+           e == ".iges" || e == ".igs" || e == ".stl" || e == ".3mf" ||
+           e == ".ecad+" || e == ".ecad" || e == ".kicad_sch" || e == ".kicad_pcb";
 }
 
 // Smart "open": CAD/ECAD files open IN THE APP's viewport via st.requestOpenPath (the same

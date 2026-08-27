@@ -25,6 +25,7 @@
 #include "doc/annot_draw.h"
 #include "doc/export2d.h"
 #include "doc/session.h"
+#include "doc/stepplus.h"
 
 using json = nlohmann::json;
 namespace doc = chudware::doc;
@@ -1056,8 +1057,12 @@ TEST_CASE("Multi-sheet drawing tables and extended title data survive and export
     json added = doc::drawing_add_sheet(did, "A4", "Manufacturing Details");
     CHECK(added["sheet_id"] == "s2");
     CHECK(added["active_sheet_id"] == "s2");
-    doc::drawing_add_view(did, "base", "top", "", json(1.0),
-                          json::array({145.0, 135.0}), json(false));
+    json top_view = doc::drawing_add_view(did, "base", "top", "", json(1.0),
+                                          json::array({145.0, 135.0}), json(false));
+    doc::drawing_add_dim(did, top_view.at("view_id").get<std::string>(), "linear_dim",
+                         json::array({120.0, 125.0}), json::array({170.0, 125.0}),
+                         json(nullptr), json(nullptr), json::array({145.0, 115.0}),
+                         json("50.00"));
 
     json bom = doc::drawing_add_table(
         did, "s2", "bom",
@@ -1133,8 +1138,42 @@ TEST_CASE("Multi-sheet drawing tables and extended title data survive and export
     CHECK(bytes.find("(GENERAL TOL: ISO 2768-m)") != std::string::npos);
     CHECK(bytes.find("(MASS: 2.5 kg)") != std::string::npos);
 
+    auto svg_path = std::filesystem::temp_directory_path() / "chudware_multisheet_test.svg";
+    json svg_exported = doc::export_drawing(did, svg_path.string(), "svg");
+    REQUIRE(svg_exported["paths"].size() == 2);
+    CHECK(svg_exported["page_count"] == 2);
+    const std::string svg_s1 = svg_exported["paths"][0].get<std::string>();
+    const std::string svg_s2 = svg_exported["paths"][1].get<std::string>();
+    const bool has_s1_suffix =
+        svg_s1.size() >= 7 && svg_s1.compare(svg_s1.size() - 7, 7, "_s1.svg") == 0;
+    const bool has_s2_suffix =
+        svg_s2.size() >= 7 && svg_s2.compare(svg_s2.size() - 7, 7, "_s2.svg") == 0;
+    CHECK(has_s1_suffix);
+    CHECK(has_s2_suffix);
+    for (const json& output : svg_exported["paths"]) {
+        std::ifstream svg_stream(output.get<std::string>(), std::ios::binary);
+        std::string svg_bytes((std::istreambuf_iterator<char>(svg_stream)),
+                              std::istreambuf_iterator<char>());
+        CHECK_FALSE(svg_bytes.empty());
+    }
+    std::ifstream svg_stream(svg_exported["paths"][1].get<std::string>(), std::ios::binary);
+    std::string svg_bytes((std::istreambuf_iterator<char>(svg_stream)),
+                          std::istreambuf_iterator<char>());
+    CHECK(svg_bytes.find("<svg") != std::string::npos);
+    CHECK(svg_bytes.find("<g id=\"visible\"") != std::string::npos);
+    CHECK(svg_bytes.find("<g id=\"hidden\"") != std::string::npos);
+    CHECK(svg_bytes.find("<g id=\"annotations\"") != std::string::npos);
+    CHECK(svg_bytes.find("<g id=\"tables\"") != std::string::npos);
+    CHECK(svg_bytes.find("<text") != std::string::npos);
+    CHECK(svg_bytes.find("font-family=\"Helvetica, Arial, sans-serif\"") !=
+          std::string::npos);
+    CHECK(svg_bytes.find(">50.00</text>") != std::string::npos);
+    CHECK(svg_bytes.find(">BOM-PART-ALPHA</text>") != std::string::npos);
+
     std::error_code ec;
     std::filesystem::remove(pdf, ec);
+    for (const json& output : svg_exported["paths"])
+        std::filesystem::remove(output.get<std::string>(), ec);
     doc::drawing_close(restored.at("doc_id").get<std::string>());
     doc::drawing_close(did);
 }
@@ -1161,4 +1200,107 @@ TEST_CASE("Jogged multi-plane section cut is refused instead of approximated") {
     }
     CHECK(doc::drawing_get(did)["sheets"][0]["views"].size() == 1);
     doc::drawing_close(did);
+}
+
+TEST_CASE("Standalone draw+ embeds its source and falls back to stale cached views") {
+    namespace fs = std::filesystem;
+    const fs::path full_path =
+        fs::temp_directory_path() / "chudware_standalone_drawing.draw+";
+    const fs::path stripped_path =
+        fs::temp_directory_path() / "chudware_standalone_drawing_missing.draw+";
+    const fs::path source_path =
+        fs::temp_directory_path() / "chudware_standalone_source.step+";
+    std::error_code ec;
+    fs::remove(full_path, ec);
+    fs::remove(stripped_path, ec);
+    fs::remove(source_path, ec);
+
+    const std::string source_id = make_block();
+    doc::doc_save(source_id, source_path.string());
+    json created =
+        doc::drawing_new(json::object(), json::object(), "Portable Controlled Drawing",
+                         source_id);
+    const std::string drawing_id = created.at("doc_id").get<std::string>();
+    const std::string view_id =
+        doc::drawing_add_view(drawing_id, "base", "front", "s1", json(1.0),
+                              json::array({180.0, 160.0}), json(false))
+            .at("view_id").get<std::string>();
+    doc::drawing_add_dim(drawing_id, view_id, "linear_dim",
+                         json::array({160.0, 150.0}),
+                         json::array({200.0, 150.0}), json(nullptr), json(nullptr),
+                         json::array({180.0, 140.0}), json(nullptr));
+    doc::drawing_set_titleblock(
+        drawing_id, "s1",
+        json{{"title", "PORTABLE BLOCK"}, {"part_number", "PB-001"},
+             {"rev", "C"}, {"drawn_by", "TEST"}});
+
+    json saved = doc::drawing_save_standalone(drawing_id, full_path.string());
+    CHECK(saved["path"] == full_path.string());
+    REQUIRE(fs::exists(full_path));
+    doc::StepPlusDoc archive =
+        doc::editable_container_open(full_path.string(), "aicad.draw+/", ".draw+");
+    CHECK(archive.doc["schema"] == "aicad.drawing/1");
+    CHECK(archive.doc["source"]["kind"] == "embedded");
+    CHECK(archive.doc["source"]["source_doc_schema"] == "aicad.part/1");
+    CHECK(archive.extra.count("source/document.json") == 1);
+    CHECK(archive.extra.count("cache/views.json") == 1);
+    REQUIRE(archive.doc["source"]["step_plus_rel_path"].is_string());
+    json associated = doc::drawing_open_standalone(full_path.string());
+    CHECK(associated["source_state"] == "live");
+    CHECK(associated["source_doc_id"] == source_id);
+    doc::drawing_close(associated.at("drawing_id").get<std::string>());
+
+    doc::drawing_close(drawing_id);
+    doc::doc_close(source_id);
+    json reopened = doc::drawing_open_standalone(full_path.string());
+    CHECK(reopened["source_state"] == "embedded_opened");
+    REQUIRE(reopened["source_doc_id"].is_string());
+    const std::string reopened_drawing =
+        reopened.at("drawing_id").get<std::string>();
+    const std::string reopened_source =
+        reopened.at("source_doc_id").get<std::string>();
+    json live = doc::drawing_get(reopened_drawing);
+    CHECK(live["source_state"] == "embedded_opened");
+    CHECK_FALSE(live["views_stale"].get<bool>());
+    REQUIRE(live["sheets"].size() == 1);
+    REQUIRE(live["sheets"][0]["views"].size() == 1);
+    CHECK_FALSE(live["sheets"][0]["views"][0]["visible"].empty());
+    REQUIRE(live["tree"]["sheets"][0]["views"][0]["annotations"].size() == 1);
+    CHECK(live["tree"]["sheets"][0]["title_block"]["title"] ==
+          "PORTABLE BLOCK");
+    CHECK(live["tree"]["sheets"][0]["title_block"]["part_number"] == "PB-001");
+
+    doc::drawing_close(reopened_drawing);
+    doc::doc_close(reopened_source);
+    fs::remove(source_path, ec);
+
+    archive.extra.erase("source/document.json");
+    archive.extra["geometry.step"] = "opaque future drawing entry";
+    doc::editable_container_save(archive.doc, stripped_path.string(), archive.extra,
+                                 "aicad.draw+/1", "drawing", ".draw+");
+    doc::StepPlusDoc stripped_archive =
+        doc::editable_container_open(stripped_path.string(), "aicad.draw+/", ".draw+");
+    CHECK(stripped_archive.extra["geometry.step"] ==
+          "opaque future drawing entry");
+    json missing = doc::drawing_open_standalone(stripped_path.string());
+    CHECK(missing["source_state"] == "missing");
+    CHECK(missing["source_doc_id"].is_null());
+    const std::string missing_drawing =
+        missing.at("drawing_id").get<std::string>();
+    json frozen = doc::drawing_get(missing_drawing);
+    CHECK(frozen["source_missing"].get<bool>());
+    CHECK(frozen["views_stale"].get<bool>());
+    CHECK(frozen["warning"] ==
+          "source missing — views frozen from last projection");
+    REQUIRE(frozen["sheets"].size() == 1);
+    REQUIRE(frozen["sheets"][0]["views"].size() == 1);
+    CHECK_FALSE(frozen["sheets"][0]["views"][0]["visible"].empty());
+    REQUIRE(frozen["tree"]["sheets"][0]["views"][0]["annotations"].size() == 1);
+    CHECK(frozen["tree"]["sheets"][0]["title_block"]["title"] ==
+          "PORTABLE BLOCK");
+
+    doc::drawing_close(missing_drawing);
+    fs::remove(full_path, ec);
+    fs::remove(stripped_path, ec);
+    fs::remove(source_path, ec);
 }

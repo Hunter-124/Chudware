@@ -1319,6 +1319,18 @@ def _drawing_rpc(tool: str, method: str, params: dict) -> tuple[Optional[dict], 
         return cb.call(method, params), None
     except Exception as exc:  # noqa: BLE001 — classify only missing-RPC errors
         unsupported = _engine_unsupported(tool, method, exc)
+        folded = str(exc).lower()
+        # Older cores know drawing_export but reject the newly added SVG token. That is the
+        # same capability mismatch as a missing RPC, not a malformed current-client request.
+        if (not unsupported and params.get("fmt") == "svg" and "format" in folded
+                and "pdf" in folded and "dxf" in folded):
+            unsupported = {
+                "ok": False,
+                "reason": "engine_unsupported",
+                "tool": tool,
+                "rpc": method,
+                "error": str(exc),
+            }
         if unsupported:
             return None, unsupported
         raise
@@ -1932,24 +1944,16 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
     # call wrote — does not: it is neither a prefix nor a suffix of "path".
 
     def _drawing_out_path(path: str, fmt: str) -> tuple[Optional[str], Optional[dict]]:
-        """(the absolute file to write, None) or (None, a refusal).
-
-        `filename="90x50x12_plate_drawing"` carries no extension, so the format's extension is
-        appended — but appending unconditionally is how save_part shipped "x.pdf.pdf", so an
-        extension that already MATCHES fmt is left exactly as it is. A path ending in the OTHER
-        drawing extension is a contradiction we must not resolve by guessing: writing PDF bytes
-        into a .dxf file produces a file no viewer can open, and the reverse loses the drawing.
-        """
+        """Return an absolute matching output path, or an honest extension refusal."""
         out = os.path.abspath(os.path.expanduser(path))
         ext = os.path.splitext(out)[1].lower().lstrip(".")
         if ext == fmt:
             return out, None
-        other = "dxf" if fmt == "pdf" else "pdf"
-        if ext == other:
+        if ext in {"pdf", "dxf", "svg"}:
             return None, {
                 "ok": False,
-                "error": f"export_drawing: fmt={fmt!r} contradicts the {other!r} extension on "
-                         f"{os.path.basename(out)!r}. Writing {fmt.upper()} bytes to a .{other} "
+                "error": f"export_drawing: fmt={fmt!r} contradicts the {ext!r} extension on "
+                         f"{os.path.basename(out)!r}. Writing {fmt.upper()} bytes to a .{ext} "
                          f"file produces a file nothing can open, so nothing was written — "
                          f"re-issue with a matching pair, e.g. fmt={fmt!r} with "
                          f"{os.path.splitext(os.path.basename(out))[0]}.{fmt}, or drop fmt and "
@@ -1960,23 +1964,25 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def export_drawing(fmt: Optional[str] = None, doc_id: Optional[str] = None,
                        path: Optional[str] = None, filename: Optional[str] = None,
-                       sheet: Optional[str] = None) -> str:
-        """Export a 2D DRAWING document to a vector file so you can deliver it.
+                       sheet: Optional[str] = None,
+                       companions: Optional[list] = None) -> str:
+        """Export a 2D DRAWING document to editable vector deliverables.
 
-        fmt    : "pdf" (a fixed-size engineering sheet) or "dxf" (CAD interchange). Omitted,
-                 it is taken from the output extension, else pdf. Pass the drawing_doc_id from
-                 make_drawing as doc_id. Call review_drawing after the final sheet mutation first.
+        fmt    : "pdf" (fixed-size engineering sheet), "dxf" (CAD interchange), or "svg"
+                 (editable paths and real text). Omitted, it is taken from the output extension,
+                 else pdf. Pass the drawing_doc_id from make_drawing as doc_id. Call
+                 review_drawing after the final sheet mutation first.
         path   : the file to write (also accepted as filename= / out_path= / file_path=). An
                  extension is appended when missing and never doubled. A path whose extension
                  contradicts fmt is refused rather than written.
         sheet  : omitted uses the active sheet; "all" exports every sheet; otherwise pass an
                  exact stable sheet id such as "s2". Numeric indices are refused as ambiguous.
-        Returns path, entity/annotation counts and the fixed paper size. export_part is for
-        3D B-rep/mesh only; a drawing is 2D and uses this exporter.
+        companions: only with fmt="pdf", pass ["dxf", "svg"] (or either one) to write editable
+                 siblings beside the PDF in the same call. The result's paths lists every file.
+        Returns every output path, entity/annotation counts and the fixed paper size. export_part
+        is for 3D B-rep/mesh only; a drawing is 2D and uses this exporter.
         """
         try:
-            # LIVE-DIALECT gap: filename= died as unknown_argument before the engine was
-            # reached — see the argument-name dialect block above.
             notes: list = []
             path, note, bad = _fold_alias_param("path", path, "filename", filename)
             if bad:
@@ -1987,23 +1993,54 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             if fmt is None:
                 # No format given: the extension the caller wrote IS the format they meant.
                 ext = os.path.splitext(str(path or ""))[1].lower().lstrip(".")
-                fmt = ext if ext in ("pdf", "dxf") else "pdf"
-                if ext in ("pdf", "dxf"):
+                fmt = ext if ext in ("pdf", "dxf", "svg") else "pdf"
+                if ext in ("pdf", "dxf", "svg"):
                     notes.append(f"read the format {fmt!r} from the output extension")
             fmt = str(fmt).lower().lstrip(".")
-            if fmt not in ("pdf", "dxf"):
-                return _dumps({"ok": False, "error": f"fmt must be 'pdf' or 'dxf', got {fmt!r}"})
-            # A caller-supplied relative path resolves against the DAEMON's cwd, not
-            # the worker's project root, so the file silently lands somewhere the user
-            # will never find. Resolve before the payload crosses the process boundary.
+            if fmt not in ("pdf", "dxf", "svg"):
+                return _dumps({
+                    "ok": False,
+                    "error": f"fmt must be 'pdf', 'dxf', or 'svg', got {fmt!r}",
+                })
+
+            if companions is None:
+                companion_formats: list[str] = []
+            elif not isinstance(companions, list):
+                return _dumps({
+                    "ok": False,
+                    "error": "export_drawing: companions must be a list containing 'dxf' "
+                             "and/or 'svg'. Nothing was exported.",
+                })
+            else:
+                companion_formats = []
+                for item in companions:
+                    token = str(item).lower().lstrip(".")
+                    if token not in ("dxf", "svg"):
+                        return _dumps({
+                            "ok": False,
+                            "error": "export_drawing: companions entries must be 'dxf' or "
+                                     f"'svg', got {item!r}. Nothing was exported.",
+                        })
+                    if token not in companion_formats:
+                        companion_formats.append(token)
+            if companion_formats and fmt != "pdf":
+                return _dumps({
+                    "ok": False,
+                    "error": "export_drawing: companions are editable siblings of a PDF export; "
+                             "set fmt='pdf'. Nothing was exported.",
+                })
+
+            # A caller-supplied relative path resolves against the daemon's cwd, so resolve it
+            # before the payload crosses the process boundary.
             if path:
                 out_path, bad = _drawing_out_path(path, fmt)
                 if bad:
                     return _dumps(bad)
             else:
                 out_path = _tmp("." + fmt)
-            params = {"doc_id": d, "path": out_path, "fmt": fmt}
+
             method = "export_drawing"
+            sheet_value = None
             if sheet is not None:
                 if not isinstance(sheet, str) or not (
                         sheet.strip().lower() == "all"
@@ -2011,19 +2048,50 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                     return _dumps({"ok": False, "error": "export_drawing: sheet must be "
                                    "\"all\" or an exact sheet id like \"s2\"; numeric indices "
                                    "are ambiguous. Nothing was exported."})
-                params["sheet"] = sheet.strip().lower()
+                sheet_value = sheet.strip().lower()
                 method = "drawing_export"
-            r, unsupported = _drawing_rpc("export_drawing", method, params)
+
+            def run_export(export_fmt: str, export_path: str) -> tuple[dict, Optional[dict]]:
+                params = {"doc_id": d, "path": export_path, "fmt": export_fmt}
+                if sheet_value is not None:
+                    params["sheet"] = sheet_value
+                result, unsupported = _drawing_rpc("export_drawing", method, params)
+                return result or {}, unsupported
+
+            def result_paths(result: dict, fallback: str) -> list[str]:
+                values = result.get("paths")
+                if isinstance(values, list) and values:
+                    return [str(value) for value in values]
+                return [str(result.get("path") or fallback)]
+
+            primary, unsupported = run_export(fmt, out_path)
             if unsupported:
                 return _dumps(unsupported)
-            r = r or {}
+            paths = result_paths(primary, out_path)
+
+            stem = os.path.splitext(out_path)[0]
+            for companion_fmt in companion_formats:
+                companion_path = stem + "." + companion_fmt
+                companion, unsupported = run_export(companion_fmt, companion_path)
+                if unsupported:
+                    unsupported["paths"] = paths
+                    unsupported["partial"] = bool(paths)
+                    return _dumps(unsupported)
+                paths.extend(result_paths(companion, companion_path))
+
             out = {"ok": True, "doc_id": d, "format": fmt,
-                   "path": r.get("path", out_path),
-                   "visible": r.get("visible"), "hidden": r.get("hidden"),
-                   "annotations": r.get("annotations"), "entities": r.get("entities"),
-                   "fixed_page": r.get("fixed_page"), "sheet_mm": r.get("sheet_mm"),
-                   "sheet": r.get("sheet", sheet),
-                   "exported_sheets": r.get("exported_sheets")}
+                   "path": paths[0], "paths": paths,
+                   "companions": companion_formats,
+                   "visible": primary.get("visible"), "hidden": primary.get("hidden"),
+                   "annotations": primary.get("annotations"),
+                   "entities": primary.get("entities"),
+                   "fixed_page": primary.get("fixed_page"),
+                   "sheet_mm": primary.get("sheet_mm"),
+                   "sheet_mm_all": primary.get("sheet_mm_all"),
+                   "page_count": primary.get("page_count"),
+                   "sheet": primary.get("sheet", sheet),
+                   "exported_sheets": primary.get("sheets",
+                                                   primary.get("exported_sheets"))}
             if notes:
                 out["interpreted"] = notes
             return _dumps(out)

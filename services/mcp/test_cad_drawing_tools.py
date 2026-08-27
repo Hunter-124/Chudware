@@ -536,11 +536,51 @@ def test_the_extension_chooses_the_format_when_none_was_given(tmp_path):
     assert r["path"] == want and os.path.exists(want), r
 
 
-def test_export_drawing_default_is_still_pdf_and_still_refuses_a_bad_format(tmp_path):
+def test_export_drawing_default_is_still_pdf_and_svg_is_a_supported_final(tmp_path):
     r = _exported(tmp_path)
     assert r["ok"] and r["format"] == "pdf" and r["path"].endswith(".pdf"), r
-    bad = _exported(tmp_path, fmt="svg", filename=str(tmp_path / "x"))
-    assert bad["ok"] is False and "pdf" in bad["error"], bad
+    svg = _exported(tmp_path, fmt="svg", filename=str(tmp_path / "editable"))
+    assert svg["ok"] and svg["format"] == "svg", svg
+    assert svg["path"] == str(tmp_path / "editable.svg"), svg
+    assert svg["paths"] == [svg["path"]], svg
+    assert Path(svg["path"]).stat().st_size > 0
+    bad = _exported(tmp_path, fmt="png", filename=str(tmp_path / "not-a-drawing"))
+    assert bad["ok"] is False and "pdf" in bad["error"] and "svg" in bad["error"], bad
+
+
+def test_pdf_companions_write_editable_siblings_and_list_every_path(tmp_path):
+    stem = tmp_path / "released"
+    result = _exported(
+        tmp_path,
+        fmt="pdf",
+        filename=str(stem),
+        companions=["dxf", "svg"],
+    )
+    expected = [str(stem.with_suffix(ext)) for ext in (".pdf", ".dxf", ".svg")]
+    assert result["ok"] and result["path"] == expected[0], result
+    assert result["paths"] == expected, result
+    assert all(Path(path).stat().st_size > 0 for path in expected), result
+
+
+def test_svg_rejection_from_an_older_engine_degrades_honestly(monkeypatch, tmp_path):
+    made = _a_drawing(_plain_plate())
+    real_call = cb.call
+
+    def engine_without_svg(method, params=None):
+        if method in {"export_drawing", "drawing_export"} and params.get("fmt") == "svg":
+            raise cb.CoreError("format must be 'dxf' or 'pdf'")
+        return real_call(method, params)
+
+    monkeypatch.setattr(cb, "call", engine_without_svg)
+    result = _call("export_drawing", {
+        "doc_id": made["drawing_doc_id"],
+        "fmt": "svg",
+        "path": str(tmp_path / "legacy.svg"),
+    })
+    assert result["ok"] is False, result
+    assert result["reason"] == "engine_unsupported", result
+    assert result["tool"] == "export_drawing", result
+    assert result["rpc"] == "export_drawing", result
 
 
 def test_export_drawing_still_refuses_a_genuinely_unknown_argument(tmp_path):

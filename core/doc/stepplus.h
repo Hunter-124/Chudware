@@ -40,6 +40,20 @@ std::string stepplus_save(const nlohmann::json& doc, const std::string& path,
 // Read a .step+ container at `path`. Validates the container version (major == 1).
 // Throws OpError("io_error", ...) if the file is missing/corrupt or not a .step+ .
 StepPlusDoc stepplus_open(const std::string& path);
+// Shared editable-container machinery used by .step+ and standalone .draw+.
+// `container` is the exact meta.json identity (for example "aicad.draw+/1");
+// `kind` is the meta.json document kind. `expected_prefix` includes the trailing
+// slash (for example "aicad.draw+/"). Unknown entries are preserved verbatim.
+std::string editable_container_save(const nlohmann::json& doc, const std::string& path,
+                                    const std::map<std::string, std::string>& extra,
+                                    const std::string& container, const std::string& kind,
+                                    const std::string& format_name);
+StepPlusDoc editable_container_open(const std::string& path,
+                                    const std::string& expected_prefix,
+                                    const std::string& format_name);
+// Canonical document.json bytes used by every editable container and nested source.
+std::string editable_document_json(const nlohmann::json& doc);
+
 
 // --- persisted-geometry cache keys (fast cold-open) --------------------------------
 // doc_save may embed the compiled tessellation + ops-response as extra `cache.aicm` /

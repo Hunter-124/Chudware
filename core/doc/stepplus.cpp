@@ -52,15 +52,17 @@ constexpr mz_uint64 kMaxEntryExpandedBytes = 64ull * 1024ull * 1024ull;
 constexpr mz_uint64 kMaxArchiveExpandedBytes = 256ull * 1024ull * 1024ull;
 constexpr mz_uint64 kMaxCompressionRatio = 200;
 
-[[noreturn]] void archive_limit_error(const char* limit) {
-    throw OpError("io_error", std::string("doc_open: .step+ archive exceeds ") + limit,
+[[noreturn]] void archive_limit_error(const char* limit, const std::string& format_name) {
+    throw OpError("io_error", "doc_open: " + format_name + " archive exceeds " + limit,
                   {{"limit", limit}});
 }
 
-// Entries this module owns + rewrites on every save; everything else is preserved.
-bool is_known_entry(const std::string& name) {
+// Entries every editable container owns + rewrites. geometry.step is owned only
+// by .step+; in .draw+ it is an unknown forward-compatible entry and survives.
+bool is_known_entry(const std::string& name, bool owns_geometry_step) {
     return name == "thumbnail.png" || name == "meta.json" ||
-           name == "document.json" || name == "geometry.step";
+           name == "document.json" ||
+           (owns_geometry_step && name == "geometry.step");
 }
 
 // ------------------------------------------------------------------ thumbnail PNG
@@ -176,21 +178,25 @@ std::string canonical_doc_json(const json& doc) {
 }
 
 }  // namespace
+std::string editable_document_json(const json& doc) {
+    return canonical_doc_json(doc);
+}
 
-// ------------------------------------------------------------------------- save
-std::string stepplus_save(const json& doc, const std::string& path,
-                          const std::map<std::string, std::string>& extra) {
+
+// ---------------------------------------------------------------- shared editable-container save
+std::string editable_container_save(const json& doc, const std::string& path,
+                                    const std::map<std::string, std::string>& extra,
+                                    const std::string& container, const std::string& kind,
+                                    const std::string& format_name) {
+    const bool owns_geometry_step = container.rfind("aicad.step+/", 0) == 0;
     namespace fs = std::filesystem;
     fs::path out_path(path);
     fs::path tmp_path = out_path;
     tmp_path += ".tmp";
 
     const std::string now = iso_utc_now();
-    const std::string schema = doc.value("schema", std::string());
-    const std::string kind = (schema == "aicad.asm/1") ? "assembly" : "part";
-
     json meta = {
-        {"container", kContainer},
+        {"container", container},
         {"app_version", kAppVersion},
         {"kind", kind},
         {"created", now},
@@ -200,7 +206,7 @@ std::string stepplus_save(const json& doc, const std::string& path,
     };
 
     // Canonical dump: sorted keys (std::map) + float rounding (6 dp = µm grade).
-    const std::string document = canonical_doc_json(doc);
+    const std::string document = editable_document_json(doc);
     const std::string meta_json = meta.dump(2);  // meta.json timestamps exempt from stability DoD
 
     // thumbnail: reuse a carried one if present, else the flat-grey placeholder.
@@ -215,8 +221,12 @@ std::string stepplus_save(const json& doc, const std::string& path,
 
     mz_zip_archive zip;
     std::memset(&zip, 0, sizeof(zip));
-    if (!mz_zip_writer_init_file(&zip, tmp_path.string().c_str(), 0))
-        io_error("doc_save: cannot create archive: " + tmp_path.string());
+    if (!mz_zip_writer_init_file(&zip, tmp_path.string().c_str(), 0)) {
+        if (format_name == ".step+")
+            io_error("doc_save: cannot create archive: " + tmp_path.string());
+        io_error("doc_save: cannot create " + format_name + " archive: " +
+                 tmp_path.string());
+    }
 
     auto add = [&](const std::string& name, const std::string& data, bool stored) {
         mz_uint level = stored ? (mz_uint)MZ_NO_COMPRESSION : (mz_uint)MZ_DEFAULT_LEVEL;
@@ -240,7 +250,7 @@ std::string stepplus_save(const json& doc, const std::string& path,
     // reader still reads a STORED entry transparently, so this stays fully back/forward
     // compatible; the cache is display-only + hash-gated, so the skipped zip CRC is fine.
     for (const auto& [name, data] : extra) {
-        if (is_known_entry(name)) continue;
+        if (is_known_entry(name, owns_geometry_step)) continue;
         // cache.aicm + studies/*/results.npz are large binary blobs — STORED (no deflate).
         const bool stored = (name == "cache.aicm") ||
                             (name.rfind("studies/", 0) == 0 && name.find("/results.") != std::string::npos);
@@ -264,19 +274,29 @@ std::string stepplus_save(const json& doc, const std::string& path,
     return out_path.string();
 }
 
-// ------------------------------------------------------------------------- open
-StepPlusDoc stepplus_open(const std::string& path) {
+std::string stepplus_save(const json& doc, const std::string& path,
+                          const std::map<std::string, std::string>& extra) {
+    const std::string schema = doc.value("schema", std::string());
+    const std::string kind = (schema == "aicad.asm/1") ? "assembly" : "part";
+    return editable_container_save(doc, path, extra, kContainer, kind, ".step+");
+}
+
+// ---------------------------------------------------------------- shared editable-container open
+StepPlusDoc editable_container_open(const std::string& path,
+                                    const std::string& expected_prefix,
+                                    const std::string& format_name) {
     if (!std::filesystem::exists(path)) io_error("doc_open: no such file: " + path);
+    const bool owns_geometry_step = expected_prefix == "aicad.step+/";
 
     mz_zip_archive zip;
     std::memset(&zip, 0, sizeof(zip));
     if (!mz_zip_reader_init_file(&zip, path.c_str(), 0))
-        io_error("doc_open: not a valid .step+ (zip) container: " + path);
+        io_error("doc_open: not a valid " + format_name + " (zip) container: " + path);
 
     const mz_uint count = mz_zip_reader_get_num_files(&zip);
     if (count > kMaxArchiveEntries) {
         mz_zip_reader_end(&zip);
-        archive_limit_error("entry count limit");
+        archive_limit_error("entry count limit", format_name);
     }
     mz_uint64 aggregate_expanded = 0;
     for (mz_uint i = 0; i < count; ++i) {
@@ -288,18 +308,18 @@ StepPlusDoc stepplus_open(const std::string& path) {
         if (st.m_is_directory) continue;
         if (st.m_uncomp_size > kMaxEntryExpandedBytes) {
             mz_zip_reader_end(&zip);
-            archive_limit_error("per-entry expanded byte limit");
+            archive_limit_error("per-entry expanded byte limit", format_name);
         }
         if (st.m_uncomp_size > kMaxArchiveExpandedBytes ||
             aggregate_expanded > kMaxArchiveExpandedBytes - st.m_uncomp_size) {
             mz_zip_reader_end(&zip);
-            archive_limit_error("aggregate expanded byte limit");
+            archive_limit_error("aggregate expanded byte limit", format_name);
         }
         aggregate_expanded += st.m_uncomp_size;
         if (st.m_uncomp_size != 0 &&
             (st.m_comp_size == 0 || st.m_uncomp_size / st.m_comp_size > kMaxCompressionRatio)) {
             mz_zip_reader_end(&zip);
-            archive_limit_error("compression ratio limit");
+            archive_limit_error("compression ratio limit", format_name);
         }
     }
 
@@ -319,7 +339,7 @@ StepPlusDoc stepplus_open(const std::string& path) {
     std::string meta_bytes;
     if (!read_entry("meta.json", meta_bytes)) {
         mz_zip_reader_end(&zip);
-        io_error("not a .step+ container: meta.json missing");
+        io_error("not a " + format_name + " container: meta.json missing");
     }
     json meta;
     try {
@@ -329,7 +349,7 @@ StepPlusDoc stepplus_open(const std::string& path) {
         io_error(std::string("doc_open: bad meta.json: ") + e.what());
     }
     const std::string container = meta.value("container", std::string());
-    if (container.rfind("aicad.step+/", 0) != 0) {
+    if (container.rfind(expected_prefix, 0) != 0) {
         mz_zip_reader_end(&zip);
         io_error("unknown container '" + container + "'");
     }
@@ -337,13 +357,13 @@ StepPlusDoc stepplus_open(const std::string& path) {
         (container.find('/') != std::string::npos) ? container.substr(container.rfind('/') + 1) : "";
     if (!major.empty() && major != "1") {
         mz_zip_reader_end(&zip);
-        io_error("unsupported .step+ major version '" + major + "'");
+        io_error("unsupported " + format_name + " major version '" + major + "'");
     }
 
     std::string doc_bytes;
     if (!read_entry("document.json", doc_bytes)) {
         mz_zip_reader_end(&zip);
-        io_error("not a .step+ container: document.json missing");
+        io_error("not a " + format_name + " container: document.json missing");
     }
     try {
         result.doc = json::parse(doc_bytes);
@@ -357,7 +377,7 @@ StepPlusDoc stepplus_open(const std::string& path) {
         mz_zip_archive_file_stat st;
         if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
         const std::string name = st.m_filename;
-        if (is_known_entry(name) || st.m_is_directory) continue;
+        if (is_known_entry(name, owns_geometry_step) || st.m_is_directory) continue;
         // STORED entries (method 0 — e.g. cache.aicm) carry the persisted-geometry mesh. Extract
         // them raw with MZ_ZIP_FLAG_COMPRESSED_DATA so miniz skips BOTH inflate and CRC; for a
         // STORED entry the compressed bytes are the data. Allocate the destination exactly once.
@@ -370,6 +390,10 @@ StepPlusDoc stepplus_open(const std::string& path) {
 
     mz_zip_reader_end(&zip);
     return result;
+}
+
+StepPlusDoc stepplus_open(const std::string& path) {
+    return editable_container_open(path, "aicad.step+/", ".step+");
 }
 
 // --- persisted-geometry cache keys ------------------------------------------------

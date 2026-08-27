@@ -28,6 +28,7 @@ All public functions return the flat ``{ok:…}`` envelope (contract §0 / §7).
 from __future__ import annotations
 
 import getpass
+import ipaddress
 import io
 import json
 import logging
@@ -36,6 +37,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from dulwich import porcelain
 from dulwich.objects import Blob, Commit, Tree
@@ -684,6 +686,49 @@ def _remote_identity(
     }
 
 
+def _normalize_live_url(value: str) -> str:
+    """Return a credential-free ws/wss endpoint for a live remote."""
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("a PLM server remote needs a WebSocket URL")
+    if "://" not in raw:
+        authority = raw.split("/", 1)[0].lower()
+        local = (
+            authority == "localhost"
+            or authority.startswith("localhost:")
+            or authority.startswith("127.")
+            or authority.startswith("[::1]")
+        )
+        raw = ("ws://" if local else "wss://") + raw
+    parsed = urlsplit(raw)
+    scheme = parsed.scheme.lower()
+    if scheme == "http":
+        scheme = "ws"
+    elif scheme == "https":
+        scheme = "wss"
+    if scheme not in ("ws", "wss"):
+        raise ValueError("a PLM server location must use ws:// or wss://")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("credentials must not be stored in a PLM server URL")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("a PLM server URL needs a host")
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = host.lower() == "localhost"
+    if scheme == "ws" and not is_loopback:
+        raise ValueError("ws:// is only allowed for a local PLM server; use wss://")
+    sensitive = {"token", "access_token", "bearer", "authorization"}
+    if any(key.lower() in sensitive for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
+        raise ValueError("authentication tokens must not be stored in a PLM server URL")
+    lowered_host = host.lower()
+    authority = f"[{lowered_host}]" if ":" in lowered_host else lowered_host
+    if parsed.port is not None:
+        authority += f":{parsed.port}"
+    return urlunsplit((scheme, authority, parsed.path or "", parsed.query, ""))
+
+
 def add_remote(
     project_dir: str | os.PathLike,
     name: str,
@@ -696,8 +741,8 @@ def add_remote(
 ) -> dict[str, Any]:
     """Register a remote profile in the project manifest (contract §6.1 / §7).
 
-    ``chudware-cloud`` remains parseable but reserved. Every profile records
-    the local identity and the capabilities this profile shape can support.
+    ``chudware-cloud`` remains parseable but reserved. Live-server profiles use
+    the frozen WebSocket mode and keep bearer tokens outside the manifest.
     """
     try:
         kind = (kind or "folder").strip()
@@ -712,6 +757,13 @@ def add_remote(
             if not remote_url:
                 return _err("invalid_mode", "a folder remote needs a path")
             remote_url = str(Path(remote_url))
+        elif kind == "plm-server":
+            if not remote_url:
+                return _err("invalid_mode", "a PLM server remote needs a WebSocket URL")
+            try:
+                remote_url = _normalize_live_url(str(remote_url))
+            except ValueError as exc:
+                return _err("invalid_mode", str(exc))
         else:
             # ssh/https: sync/lock route through the same dulwich transport
             # layer as folder remotes (kind is a UI label; dulwich dispatches
@@ -729,18 +781,37 @@ def add_remote(
                 if r.get("name") == name:
                     existing = r
                     break
+            identity = (existing or {}).get("identity")
+            if isinstance(identity, dict):
+                identity = dict(identity)
+                if display_name is not None:
+                    identity["display"] = str(display_name).strip()
+                if account_id is not None:
+                    identity["account_id"] = str(account_id).strip() or None
+            else:
+                identity = _remote_identity(display_name, account_id)
             entry = {
                 "id": (existing or {}).get("id") or ("r" + uuid.uuid4().hex[:8]),
                 "kind": kind,
                 "url": remote_url,
                 "name": name,
-                "identity": _remote_identity(display_name, account_id),
-                "capabilities": list(manifest.REMOTE_CAPABILITIES),
+                "identity": identity,
+                "capabilities": list(
+                    manifest.LIVE_REMOTE_CAPABILITIES
+                    if kind == "plm-server"
+                    else manifest.REMOTE_CAPABILITIES
+                ),
             }
             if kind == "chudware-cloud":
                 entry["reserved"] = True
             if existing is not None:
                 existing.update(entry)
+                for secret_key in (
+                    "token", "access_token", "bearer", "authorization", "password"
+                ):
+                    existing.pop(secret_key, None)
+                if kind != "chudware-cloud":
+                    existing.pop("reserved", None)
                 entry = existing
             else:
                 remotes.append(entry)
@@ -794,6 +865,11 @@ def sync(project_dir: str | os.PathLike, remote: str = "origin") -> dict[str, An
         remote_kind = entry.get("kind")
         if remote_kind == "chudware-cloud":
             return _err("reserved_remote", "Chudware Cloud is not available yet")
+        if manifest.remote_mode(entry) == "live":
+            return _err(
+                "live_join_required",
+                "This remote uses live editing; join the item with plm_live_join instead.",
+            )
         if remote_kind not in ("folder", "ssh", "https"):
             return _err("invalid_mode", f"unknown remote kind: {remote_kind}")
         remote_url = entry.get("url")
@@ -1131,6 +1207,11 @@ def list_locks(
         kind = entry.get("kind")
         if kind == "chudware-cloud":
             return _err("reserved_remote", "Chudware Cloud is not available yet")
+        if manifest.remote_mode(entry) == "live":
+            return _err(
+                "live_join_required",
+                "This remote uses live editing; join the item with plm_live_join instead.",
+            )
         if kind not in ("folder", "ssh", "https"):
             return _err("invalid_mode", "This remote type cannot provide shared locks.")
         remote_url = entry.get("url")
@@ -1205,6 +1286,11 @@ def _lock_mutate(
             remote_kind = entry.get("kind")
             if remote_kind == "chudware-cloud":
                 return _err("reserved_remote", "Chudware Cloud is not available yet")
+            if manifest.remote_mode(entry) == "live":
+                return _err(
+                    "live_join_required",
+                    "This remote uses live editing; join the item with plm_live_join instead.",
+                )
             if remote_kind not in ("folder", "ssh", "https"):
                 return _err("invalid_mode", "This remote type cannot provide shared locks.")
             remote_url = entry.get("url")

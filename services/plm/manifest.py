@@ -26,8 +26,21 @@ ITEM_KINDS = {
     "part", "assembly", "drawing", "ecad", "cam", "requirements", "deliverable",
 }
 AI_MODES = {"manual", "assisted", "managed"}
-REMOTE_KINDS = {"folder", "ssh", "https", "chudware-cloud"}
+REMOTE_KINDS = {"folder", "ssh", "https", "plm-server", "chudware-cloud"}
 REMOTE_CAPABILITIES = ("snapshot_sync", "advisory_locks")
+LIVE_REMOTE_CAPABILITIES = ("snapshot_sync", "live_coedit", "presence")
+
+
+def remote_mode(profile: dict[str, Any]) -> str:
+    """Select the frozen remote behavior without inferring from its URL."""
+    capabilities = profile.get("capabilities")
+    if (
+        profile.get("kind") == "plm-server"
+        and isinstance(capabilities, list)
+        and "live_coedit" in capabilities
+    ):
+        return "live"
+    return "snapshot"
 
 
 def new_item_id() -> str:

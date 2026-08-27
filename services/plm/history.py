@@ -41,6 +41,7 @@ def make_meta(
     rev: str | None,
     lifecycle: str,
     ai: dict[str, Any] | None = None,
+    participants: list[dict[str, Any]] | None = None,
 ) -> bytes:
     """Build the per-item ``meta.json`` blob (contract §3.4).
 
@@ -58,6 +59,8 @@ def make_meta(
         "rev": rev,
         "lifecycle": lifecycle,
     }
+    if participants is not None:
+        meta["participants"] = participants
     return json.dumps(meta, indent=2, sort_keys=True).encode("utf-8")
 
 

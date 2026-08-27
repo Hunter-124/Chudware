@@ -14,8 +14,8 @@ users as-is.
 Registration: ``register_plm_tools(mcp)`` → adds plm_init, plm_open, plm_save,
 plm_checkpoint, plm_release, plm_history, plm_restore, plm_status, plm_compare,
 plm_set_ai_mode (T-R3), plm_item_set + plm_where_used (T-R4),
-plm_timeline + plm_rollback + plm_rollback_check (AI-VC), and T-R7 remotes/locks:
-plm_add_remote, plm_sync, plm_lock, plm_unlock.
+plm_timeline + plm_rollback + plm_rollback_check (AI-VC), T-R7 remotes/locks,
+and the authoritative live seam: plm_live_join/propose/poll/presence/leave.
 
 plm_where_used note: §7 reserves this name for T-R6's Hub; the T-R4 task card
 ships the thin envelope early ({ok, consumers} over the derived index in
@@ -599,8 +599,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
                        account_id: str = "") -> str:
         """Register a team-sync profile with optional account identity.
 
-        ``kind`` is ``folder`` | ``ssh`` | ``https`` | ``chudware-cloud``.
-        The cloud kind is stored for forward compatibility but cannot activate.
+        ``kind`` is ``folder`` | ``ssh`` | ``https`` | ``plm-server`` |
+        ``chudware-cloud``. Tokens for live servers are supplied only at join.
         """
         try:
             from services.plm import remote as remote_mod
@@ -673,6 +673,123 @@ def register_plm_tools(mcp: FastMCP) -> None:
                         str(out.get("hint") or ""))
         return _ok(item_id=item_id, remote_id=remote_id,
                    **{k: v for k, v in out.items() if k != "ok"})
+
+    # ------------------------------------------------------------------
+    # Authoritative live co-editing (aicad.plm-live/1)
+    # ------------------------------------------------------------------
+
+    def _live_worker(method: str, payload: dict[str, Any]) -> str:
+        from services.plm import worker_rpc
+
+        result = worker_rpc.WORKER_METHODS[method](payload, lambda *_args: None)
+        return json.dumps(result, indent=2, sort_keys=True)
+
+    @mcp.tool()
+    @_with_project_path
+    def plm_live_join(
+        path: str = "",
+        remote_id: str = "origin",
+        item_id: str = "",
+        participant: dict[str, Any] | None = None,
+        token: str = "",
+        local_doc_id: str = "",
+    ) -> str:
+        """Join an authoritative live item session.
+
+        ``participant`` is ``{id, display, account_id}``. ``token`` is used for
+        this connection only and is never saved in the project profile. An
+        optional ``local_doc_id`` attaches the already-open editor document.
+        Returns the session id, authoritative sequence, and attached/replacement
+        local document id.
+        """
+        return _live_worker("plm_live_join", {
+            "path": path,
+            "remote_id": remote_id,
+            "item_id": item_id,
+            "participant": participant,
+            "token": token or None,
+            "local_doc_id": local_doc_id or None,
+        })
+
+    @mcp.tool()
+    @_with_project_path
+    def plm_live_propose(
+        path: str = "",
+        remote_id: str = "origin",
+        item_id: str = "",
+        participant: dict[str, Any] | None = None,
+        ops: list[dict[str, Any]] | None = None,
+        client_op_id: str = "",
+    ) -> str:
+        """Propose one atomic operation batch and wait for its ordered commit.
+
+        Returns the normal engine ``ops_response`` for DocMirror ingestion.
+        Reusing ``client_op_id`` retries the same proposal idempotently.
+        """
+        return _live_worker("plm_live_propose", {
+            "path": path,
+            "remote_id": remote_id,
+            "item_id": item_id,
+            "participant": participant,
+            "ops": ops,
+            "client_op_id": client_op_id or None,
+        })
+
+    @mcp.tool()
+    @_with_project_path
+    def plm_live_poll(
+        path: str = "",
+        remote_id: str = "origin",
+        item_id: str = "",
+        participant: dict[str, Any] | None = None,
+        limit: int = 100,
+    ) -> str:
+        """Drain complete, atomically applied live commit/snapshot events."""
+        return _live_worker("plm_live_poll", {
+            "path": path,
+            "remote_id": remote_id,
+            "item_id": item_id,
+            "participant": participant,
+            "limit": limit,
+        })
+
+    @mcp.tool()
+    @_with_project_path
+    def plm_live_presence(
+        path: str = "",
+        remote_id: str = "origin",
+        item_id: str = "",
+        participant: dict[str, Any] | None = None,
+        cursor: dict[str, Any] | None = None,
+        selection: dict[str, Any] | None = None,
+        viewport: dict[str, Any] | None = None,
+    ) -> str:
+        """Publish bounded ephemeral cursor, selection, and viewport presence."""
+        return _live_worker("plm_live_presence", {
+            "path": path,
+            "remote_id": remote_id,
+            "item_id": item_id,
+            "participant": participant,
+            "cursor": cursor,
+            "selection": selection,
+            "viewport": viewport,
+        })
+
+    @mcp.tool()
+    @_with_project_path
+    def plm_live_leave(
+        path: str = "",
+        remote_id: str = "origin",
+        item_id: str = "",
+        participant: dict[str, Any] | None = None,
+    ) -> str:
+        """Leave a live item session and release its ephemeral presence."""
+        return _live_worker("plm_live_leave", {
+            "path": path,
+            "remote_id": remote_id,
+            "item_id": item_id,
+            "participant": participant,
+        })
 
     # ------------------------------------------------------------------
     # Box.com mirror (services/plm/box_mirror.py) — optional cloud copy of

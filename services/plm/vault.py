@@ -321,7 +321,8 @@ class Vault:
     def save(self, kind: str = hist.KIND_AUTO, *, message: str = "",
              author: dict[str, Any] | None = None, ai: dict[str, Any] | None = None,
              ai_by_item: dict[str, dict[str, Any]] | None = None,
-             item_id: str | None = None) -> dict[str, Any]:
+             item_id: str | None = None,
+             participants: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Cut a history entry over the whole shadow tree (contract §3.1).
 
         ``kind`` ∈ auto | checkpoint | restore. ``release`` goes through
@@ -347,7 +348,7 @@ class Vault:
             # can always go back).
             files = self._explode_project_into_shadow(
                 m, kind=kind, message=message, author=author, ai=ai,
-                ai_by_item=ai_by_item,
+                ai_by_item=ai_by_item, participants=participants,
                 enforce_released_lock=(kind != hist.KIND_RESTORE))
             try:
                 commit = self._bind.commit_tree(files, emeta)
@@ -367,7 +368,8 @@ class Vault:
     def checkpoint(self, message: str = "", *, author: dict[str, Any] | None = None,
                    ai: dict[str, Any] | None = None,
                    ai_by_item: dict[str, dict[str, Any]] | None = None,
-                   item_id: str | None = None) -> dict[str, Any]:
+                   item_id: str | None = None,
+                   participants: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Cut a named checkpoint entry (contract §3.2).
 
         When *message* is empty and the project's assist tier allows drafting
@@ -385,6 +387,7 @@ class Vault:
             ai=ai,
             ai_by_item=ai_by_item,
             item_id=item_id,
+            participants=participants,
         )
 
     # -- assist tier (T-R3, contract §4 ai_mode) ----------------------------
@@ -1049,6 +1052,7 @@ class Vault:
         self, m: dict[str, Any], *, kind: str, message: str,
         author: dict[str, Any] | None = None, ai: dict[str, Any] | None = None,
         ai_by_item: dict[str, dict[str, Any]] | None = None,
+        participants: list[dict[str, Any]] | None = None,
         geometry_for: dict[str, bytes] | None = None,
         enforce_released_lock: bool = False,
         inject: dict[str, dict[str, bytes]] | None = None,
@@ -1131,6 +1135,7 @@ class Vault:
                 author_display=author["display"], message=message,
                 doc_uuid=doc_uuid, rev=item.get("rev"), lifecycle=item["lifecycle"],
                 ai=(item_ai_blocks or {}).get(iid, ai_block),
+                participants=participants,
             )
             # plain-language change summary per entry (T-R3, contract §2
             # summary.txt): deterministic, numerals copied from doc_diff.
@@ -1181,6 +1186,7 @@ class Vault:
                 doc_uuid=it.get("doc_uuid", ""), rev=it.get("rev"),
                 lifecycle=it["lifecycle"],
                 ai=(item_ai_blocks or {}).get(iid, ai_block),
+                participants=participants,
             )
             p = snapshot.item_prefix(iid)
             files.update(content)
@@ -1370,6 +1376,7 @@ class Vault:
             "account_id": None,
         }
         ai = None
+        participants = None
         thumb_ref = None
         summary = ""
         # Prefer an item_id recorded in a trailer-free scan: read the live
@@ -1386,6 +1393,7 @@ class Vault:
                     author = dict(md.get("author") or author)
                     author.setdefault("account_id", None)
                     ai = md.get("ai")
+                    participants = md.get("participants")
                 except Exception:
                     pass
             if self._bind.read_blob_at(commit, prefix + "thumbnail.png") is not None:
@@ -1398,6 +1406,7 @@ class Vault:
             "authored_at": _iso(cmeta["authored_at"]),
             "author": author, "ai": ai, "message": msg,
             "thumbnail_ref": thumb_ref, "summary": summary,
+            **({"participants": participants} if participants is not None else {}),
         }
 
     def _first_item_id_at(self, commit: str) -> str | None:
@@ -1437,6 +1446,7 @@ class Vault:
             "account_id": None,
         }
         ai = None
+        participants = None
         thumb_ref = None
         summary = ""
         pick_iid = item_id
@@ -1453,6 +1463,7 @@ class Vault:
                 author = dict(md.get("author") or author)
                 author.setdefault("account_id", None)
                 ai = md.get("ai")
+                participants = md.get("participants")
             if snapshot.item_prefix(pick_iid) + "thumbnail.png" in tree:
                 thumb_ref = snapshot.item_prefix(pick_iid) + "thumbnail.png"
             summary = (tree.get(snapshot.item_prefix(pick_iid) + "summary.txt") or b"").decode("utf-8")
@@ -1461,6 +1472,7 @@ class Vault:
             "authored_at": _iso(cmeta["authored_at"]),
             "author": author, "ai": ai, "message": msg,
             "thumbnail_ref": thumb_ref, "summary": summary,
+            **({"participants": participants} if participants is not None else {}),
         }
 
 

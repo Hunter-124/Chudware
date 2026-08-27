@@ -776,6 +776,127 @@ def _plm_add_remote(params: dict, _emit: Callable) -> dict:
     )
 
 
+def _live_participant(params: dict) -> dict[str, Any] | None:
+    value = (params or {}).get("participant")
+    if value is not None:
+        return value if isinstance(value, dict) else {"id": "", "display": "", "account_id": None}
+    participant_id = str((params or {}).get("participant_id") or "").strip()
+    display = str(
+        (params or {}).get("participant_display")
+        or (params or {}).get("display_name")
+        or ""
+    ).strip()
+    if not participant_id and not display:
+        return None
+    return {
+        "id": participant_id,
+        "display": display,
+        "account_id": (params or {}).get("account_id") or None,
+    }
+
+
+def _live_call(fn: Callable[[], dict]) -> dict:
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001 — worker RPCs are plain envelopes
+        try:
+            from services.plm.live_client import LiveClientError
+
+            if isinstance(exc, LiveClientError):
+                return exc.envelope()
+        except ImportError:
+            pass
+        return {
+            "ok": False,
+            "reason": "internal",
+            "hint": "The live-session request could not be completed.",
+        }
+
+
+def _live_route(params: dict) -> tuple[Any, str, str, str, dict[str, Any] | None]:
+    from services.plm.live_client import get_live_manager
+
+    p = params or {}
+    return (
+        get_live_manager(),
+        str(p.get("path") or p.get("project_dir") or ""),
+        str(p.get("remote_id") or p.get("remote") or "origin"),
+        str(p.get("item_id") or p.get("item") or ""),
+        _live_participant(p),
+    )
+
+
+def _plm_live_join(params: dict, _emit: Callable) -> dict:
+    def run() -> dict:
+        manager, path, remote_id, item_id, participant = _live_route(params)
+        p = params or {}
+        return manager.join(
+            path,
+            remote_id,
+            item_id,
+            participant,
+            token=p.get("token"),
+            local_doc_id=p.get("local_doc_id") or None,
+        )
+
+    return _live_call(run)
+
+
+def _plm_live_propose(params: dict, _emit: Callable) -> dict:
+    def run() -> dict:
+        manager, path, remote_id, item_id, participant = _live_route(params)
+        p = params or {}
+        return manager.propose(
+            path,
+            remote_id,
+            item_id,
+            participant,
+            p.get("ops"),
+            p.get("client_op_id") or None,
+        )
+
+    return _live_call(run)
+
+
+def _plm_live_poll(params: dict, _emit: Callable) -> dict:
+    def run() -> dict:
+        manager, path, remote_id, item_id, participant = _live_route(params)
+        return manager.poll(
+            path,
+            remote_id,
+            item_id,
+            participant,
+            int((params or {}).get("limit") or 100),
+        )
+
+    return _live_call(run)
+
+
+def _plm_live_presence(params: dict, _emit: Callable) -> dict:
+    def run() -> dict:
+        manager, path, remote_id, item_id, participant = _live_route(params)
+        p = params or {}
+        return manager.presence(
+            path,
+            remote_id,
+            item_id,
+            participant,
+            cursor=p.get("cursor"),
+            selection=p.get("selection"),
+            viewport=p.get("viewport"),
+        )
+
+    return _live_call(run)
+
+
+def _plm_live_leave(params: dict, _emit: Callable) -> dict:
+    def run() -> dict:
+        manager, path, remote_id, item_id, participant = _live_route(params)
+        return manager.leave(path, remote_id, item_id, participant)
+
+    return _live_call(run)
+
+
 def _plm_sync(params: dict, _emit: Callable) -> dict:
     """One-button sync against a folder remote (fetch + FF / CAS push)."""
     try:
@@ -913,6 +1034,11 @@ WORKER_METHODS = {
     "plm_sync": _plm_sync,
     "plm_lock": _plm_lock,
     "plm_unlock": _plm_unlock,
+    "plm_live_join": _plm_live_join,
+    "plm_live_propose": _plm_live_propose,
+    "plm_live_poll": _plm_live_poll,
+    "plm_live_presence": _plm_live_presence,
+    "plm_live_leave": _plm_live_leave,
     # Box.com mirror — Settings → Integrations + post-save notification
     "box_status": _box_status,
     "box_sync": _box_sync,

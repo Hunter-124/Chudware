@@ -106,6 +106,11 @@ def test_all_methods_envelope_on_missing_path(tmp_path, monkeypatch):
             # a path or enabled mirror (box_mirror.notify_saved_path contract).
             assert out == {"ok": True}
             continue
+        if name == "plm_live_leave":
+            # Leave is intentionally idempotent. With no joined session (and
+            # therefore no project path), it is a successful no-op.
+            assert out == {"ok": True, "left": True}
+            continue
         if name in ("cad_graph_get", "cad_graph_assembly_tree"):
             # cad_graph_get {project_dir?|doc_id?} — both optional per
             # contracts/cad_graph.md: empty params are the open-docs view (ok True);

@@ -524,13 +524,33 @@ def test_deb_and_rpm_version_fields_sort_the_prerelease_first() -> None:
     assert artifact_names.rpm_version_release("0.1.1") == ("0.1.1", "1")
 
 
-@pytest.mark.parametrize("platform", ["windows", "macos"])
 @pytest.mark.parametrize("fmt", ["deb", "rpm", "tar"])
-def test_only_linux_publishes_a_package_format(platform: str, fmt: str) -> None:
+def test_windows_rejects_linux_package_formats(fmt: str) -> None:
     with pytest.raises(Exception) as error:
-        releases._canonical_artifact("0.1.1", platform, "x86_64", fmt)
+        releases._canonical_artifact("0.1.1", "windows", "x86_64", fmt)
+    assert getattr(error.value, "status_code", None) == 422
+    assert "only default and msi formats" in error.value.detail
+
+
+@pytest.mark.parametrize("fmt", ["deb", "rpm", "tar", "msi"])
+def test_macos_rejects_every_nondefault_format(fmt: str) -> None:
+    with pytest.raises(Exception) as error:
+        releases._canonical_artifact("0.1.1", "macos", "x86_64", fmt)
     assert getattr(error.value, "status_code", None) == 422
     assert "only the default format" in error.value.detail
+
+
+def test_canonical_windows_msi_and_unsupported_architecture() -> None:
+    assert releases._canonical_artifact(
+        "0.1.0-beta.21", "windows", "x86_64", "msi"
+    ) == "Chudware-0.1.0-beta.21-x86_64.msi"
+    assert artifact_names.canonical_artifact(
+        "1.2.0", "windows", "x86_64", "msi"
+    ) == "Chudware-1.2.0-x86_64.msi"
+    with pytest.raises(Exception) as error:
+        releases._canonical_artifact("1.2.0", "windows", "arm64", "msi")
+    assert getattr(error.value, "status_code", None) == 422
+    assert "unsupported platform and architecture" in error.value.detail
 
 
 def test_canonical_artifact_keeps_its_pre_format_names_untouched() -> None:
@@ -629,6 +649,11 @@ _AVAILABLE_ROWS = [
     {
         "platform": "windows", "arch": "x86_64", "format": "default",
         "version": "0.1.1", "size": 239491858, "sha256": "2" * 64,
+        "notes_url": "https://chudware.com/releases/0.1.1",
+    },
+    {
+        "platform": "windows", "arch": "x86_64", "format": "msi",
+        "version": "0.1.1", "size": 251658240, "sha256": "5" * 64,
         "notes_url": "https://chudware.com/releases/0.1.1",
     },
     {
@@ -773,19 +798,19 @@ def test_no_other_release_or_portal_route_is_opened_cross_origin(
     )
 
 
-def test_available_orders_platform_then_arch_then_declared_format(
+def test_available_orders_windows_then_linux_then_macos_and_msi_first(
     available_client: TestClient,
 ) -> None:
-    """'default' leads each tuple so a consumer can feature builds[0]; the rest
-    follow the declared order, NOT the alphabetical one Postgres would give."""
+    """Presentation order is Windows, Linux, macOS; MSI leads Windows."""
     builds = available_client.get("/api/releases/available?channel=stable").json()[
         "builds"
     ]
     assert [(b["platform"], b["arch"], b["format"]) for b in builds] == [
+        ("windows", "x86_64", "msi"),
+        ("windows", "x86_64", "default"),
         ("linux", "x86_64", "default"),
         ("linux", "x86_64", "deb"),
         ("linux", "x86_64", "rpm"),
-        ("windows", "x86_64", "default"),
     ]
 
 

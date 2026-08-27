@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <!--
+    PayloadComponents is generated from the FINALIZED signed payload manifest.
+    Windows-owned metadata (ARP, shortcuts and registry keypaths) is authored
+    here and never written into INSTALLFOLDER by a packaging helper.
+  -->
+  <Package
+      Name="Chudware"
+      Manufacturer="Chudware"
+      Version="$(var.ProductVersion)"
+      ProductCode="$(var.ProductCode)"
+      UpgradeCode="{F408B3F7-9CBE-50D6-BE21-52D0C3CA48F5}"
+      Scope="perMachine">
+    <!--
+      MSI compares only the numeric ProductVersion. Prerelease suffixes that
+      share a numeric triple therefore need same-version major upgrades, while
+      lower numeric triples remain blocked by this explicit downgrade message.
+      afterInstallInitialize keeps removal inside the rollback transaction.
+    -->
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of Chudware is already installed."
+        Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Chudware">
+        <Component Id="ShortcutComponent" Guid="{22551A9F-A23F-54A2-BACF-153D6347041C}">
+          <Shortcut
+              Id="StartMenuShortcut"
+              Directory="ProgramMenuFolder"
+              Subdirectory="Chudware"
+              Name="Chudware"
+              Description="Chudware"
+              Target="[INSTALLFOLDER]chudware.exe"
+              WorkingDirectory="INSTALLFOLDER" />
+          <Shortcut
+              Id="DesktopShortcut"
+              Directory="DesktopFolder"
+              Name="Chudware"
+              Description="Chudware"
+              Target="[INSTALLFOLDER]chudware.exe"
+              WorkingDirectory="INSTALLFOLDER" />
+          <RemoveFolder
+              Id="RemoveStartMenuFolder"
+              Directory="ProgramMenuFolder"
+              Subdirectory="Chudware"
+              On="uninstall" />
+          <RegistryValue
+              Root="HKLM"
+              Key="Software\Chudware\Installer"
+              Name="Shortcuts"
+              Type="integer"
+              Value="1"
+              KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="DesktopFolder" />
+
+    <Feature Id="ChudwareFeature" Title="Chudware" Level="1">
+      <ComponentGroupRef Id="PayloadComponents" />
+      <ComponentRef Id="ShortcutComponent" />
+    </Feature>
+  </Package>
+</Wix>

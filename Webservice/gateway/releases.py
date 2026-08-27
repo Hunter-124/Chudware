@@ -51,7 +51,7 @@ Architecture = Literal["x86_64", "arm64"]
 # Mirrors artifact_names.FORMATS, which is the runtime source of truth; a
 # Literal cannot be built from a tuple in a way FastAPI can introspect, so the
 # two are pinned together by a test rather than by construction.
-Format = Literal["default", "deb", "rpm", "tar"]
+Format = Literal["default", "deb", "rpm", "tar", "msi"]
 DEFAULT_FORMAT = "default"
 
 _SEMVER_RE = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
@@ -477,13 +477,22 @@ def _fetch_available(channel: str) -> list[dict[str, Any]]:
             (channel,),
         )
         rows = [dict(row) for row in cur.fetchall()]
-    # Postgres sorted `format` as text; re-key it onto the declared order so
-    # "default" leads each tuple and the UI can feature builds[0].
+    # Presentation order is deliberate rather than lexical: Windows and Linux
+    # lead the catalogue, and Windows offers its MSI before the legacy .exe.
+    # ``default`` remains the API/query default even though it is second there.
+    platform_order = {"windows": 0, "linux": 1, "macos": 2}
+    format_order = {
+        "windows": {"msi": 0, "default": 1},
+        "linux": {"default": 0, "deb": 1, "rpm": 2, "tar": 3},
+        "macos": {"default": 0},
+    }
     rows.sort(
         key=lambda row: (
-            str(row["platform"]),
+            platform_order.get(str(row["platform"]), len(platform_order)),
             str(row["arch"]),
-            FORMATS.index(str(row["format"])) if str(row["format"]) in FORMATS else len(FORMATS),
+            format_order.get(str(row["platform"]), {}).get(
+                str(row["format"]), len(FORMATS)
+            ),
         )
     )
     return rows

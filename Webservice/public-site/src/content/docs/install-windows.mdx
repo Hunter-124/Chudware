@@ -1,14 +1,27 @@
 ---
 title: Install on Windows
-description: Download and install the signed Chudware desktop app on Windows.
+description: Download and install the signed Chudware desktop app on Windows, interactively or silently with msiexec.
 section: Installation
 order: 10
 ---
-## Download the installer
+## Download an installer
 
-Sign in at [app.chudware.com](https://app.chudware.com/#downloads) and open the download page. It issues the signed Windows installer (`.exe`) for your account, with the version and SHA-256 digest shown next to the link.
+Sign in at [app.chudware.com](https://app.chudware.com/#downloads) and open the download page. It issues two signed Windows builds for your account, with the version and SHA-256 digest shown next to each link:
 
-Run the installer and launch Chudware from the Start menu. Updates are verified against the same signed release manifests, so keeping the app current needs no manual downloads.
+- **Installer (`.msi`)** — for managed and scripted deployment through Group Policy, Intune, or `msiexec`. Installs per machine into Program Files and requires administrator rights.
+- **Setup (`.exe`)** — for an ordinary interactive install; run it and launch Chudware from the Start menu.
+
+Both formats install the same application, and it verifies every update against the same signed release manifests.
+
+## Silent install with msiexec
+
+The `.msi` installs with no interaction, which is what deployment tooling runs. From an elevated prompt, with the version shown on the download page substituted in:
+
+```
+msiexec /i Chudware-<version>-x86_64.msi /qn /l*v install.log
+```
+
+`/l*v` keeps a verbose log worth having when a rollout needs verification or support. Use `msiexec /x` with the same package to remove it silently.
 
 The build is 64-bit and needs a graphics driver capable of a modern hardware-accelerated 3D context; without one the application does not start.
 

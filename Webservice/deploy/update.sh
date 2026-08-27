@@ -76,6 +76,11 @@ case "$ENVIRONMENT" in
     RETENTION_TIMER="chudware-security-retention.timer"
     RELEASE_RETENTION_UNIT="chudware-release-retention.service"
     RELEASE_RETENTION_TIMER="chudware-release-retention.timer"
+    # Host-side, not gateway-side, but it belongs to this host's disk safety:
+    # the CEF metrics spool leaks ~650 MB/day and the disk it fills is the one
+    # carrying PostgreSQL, the release store and the tunnel.
+    CEF_SPOOL_UNIT="chudware-cef-spool.service"
+    CEF_SPOOL_TIMER="chudware-cef-spool.timer"
     EXPECTED_DB="chudware_prod"
     DO_HOST=1
     DO_ENGINE=1
@@ -90,6 +95,11 @@ case "$ENVIRONMENT" in
     RETENTION_TIMER="chudware-security-retention-staging.timer"
     RELEASE_RETENTION_UNIT="chudware-release-retention-staging.service"
     RELEASE_RETENTION_TIMER="chudware-release-retention-staging.timer"
+    # Same unit both environments: it bounds a per-user cache path, not a
+    # per-environment one, so a staging deploy must not install a second copy
+    # under a different name that would reap the same directories twice.
+    CEF_SPOOL_UNIT="chudware-cef-spool.service"
+    CEF_SPOOL_TIMER="chudware-cef-spool.timer"
     # assert_database_target, backup_database and run_migrations all reference
     # EXPECTED_DB unconditionally whenever the gateway is deployed, so leaving
     # it out of this arm would abort every staging run on an unbound variable.
@@ -356,6 +366,8 @@ install_current_units() {
   install -m 644 "$REPO/Webservice/deploy/$RETENTION_TIMER" "$unit_dir/$RETENTION_TIMER"
   install -m 644 "$REPO/Webservice/deploy/$RELEASE_RETENTION_UNIT" "$unit_dir/$RELEASE_RETENTION_UNIT"
   install -m 644 "$REPO/Webservice/deploy/$RELEASE_RETENTION_TIMER" "$unit_dir/$RELEASE_RETENTION_TIMER"
+  install -m 644 "$REPO/Webservice/deploy/$CEF_SPOOL_UNIT" "$unit_dir/$CEF_SPOOL_UNIT"
+  install -m 644 "$REPO/Webservice/deploy/$CEF_SPOOL_TIMER" "$unit_dir/$CEF_SPOOL_TIMER"
   systemctl --user daemon-reload \
     || { echo "ERROR: systemd user daemon-reload failed" >&2; exit 1; }
 }
@@ -381,6 +393,21 @@ enable_release_retention() {
   systemctl --user disable --now chudware-release-retention.timer chudware-release-retention-staging.timer >/dev/null 2>&1 || true
   if ! systemctl --user enable --now "$RELEASE_RETENTION_UNIT" "$RELEASE_RETENTION_TIMER"; then
     echo "WARN: failed to enable release retention for $ENVIRONMENT; superseded beta artifacts will accumulate until the disk fills" >&2
+  fi
+}
+enable_cef_spool_reaper() {
+  # Bounds the Chromium persistent-histogram spool the CEF host leaks into
+  # ~/.local/share/chudware/cef_cache_*/{BrowserMetrics,DeferredBrowserMetrics}.
+  # Measured 2026-08-27 on this host: 2,790 files / 10.5 GB in 16 days, about
+  # 650 MB/day, on the same 119 GB SSD as PostgreSQL and the tunnel.
+  #
+  # The host binary reaps this at CEF startup, which is necessary but not
+  # sufficient here: this daemon can run for weeks without a restart, so the
+  # startup reaper may never get a turn, and the host is only redeployed when
+  # somebody rebuilds it. Same unit for both environments — it bounds a
+  # per-user cache path, not a per-environment one.
+  if ! systemctl --user enable --now "$CEF_SPOOL_UNIT" "$CEF_SPOOL_TIMER"; then
+    echo "WARN: failed to enable the CEF metrics spool reaper; the browser cache roots will grow at roughly 650 MB/day until the disk fills" >&2
   fi
 }
 assert_entitlement_credential() {
@@ -587,6 +614,7 @@ if [[ "$DO_GATEWAY" = 1 ]]; then
   install_current_units
   enable_security_retention
   enable_release_retention
+  enable_cef_spool_reaper
   echo "=== [$(date -Iseconds)] restart $GATEWAY_UNIT ==="
   systemctl --user cat "$GATEWAY_UNIT" >/dev/null 2>&1 \
     || { echo "ERROR: $GATEWAY_UNIT is not installed" >&2; exit 1; }

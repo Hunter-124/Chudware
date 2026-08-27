@@ -35,10 +35,10 @@ import argparse
 import re
 import sys
 
-# Declared order, not alphabetical: "default" first because it is the primary
-# download every surface offers, and /api/releases/available sorts builds by
-# this sequence so builds[0] of a tuple is the one to feature.
-FORMATS: tuple[str, ...] = ("default", "deb", "rpm", "tar")
+# Declared API vocabulary. ``default`` stays first because it is the backwards-
+# compatible query default; catalogue presentation has a platform-specific
+# order (Windows puts MSI first) in releases._fetch_available.
+FORMATS: tuple[str, ...] = ("default", "deb", "rpm", "tar", "msi")
 
 # The same shape releases._PRERELEASE_SEMVER_RE accepts, duplicated here rather
 # than imported because this module must not depend on the gateway. A filename
@@ -86,13 +86,15 @@ def canonical_artifact(
     """The one filename a (version, platform, arch, format) may be published as.
 
     Raises ``ValueError`` — the gateway wrapper converts it to a 422 — for an
-    unknown format, a malformed version, an unsupported platform/architecture
-    pair, or a Linux-only package format requested for another platform.
+    unknown format, malformed version, unsupported platform/architecture pair,
+    or package format requested for the wrong platform.
     """
     if fmt not in FORMATS:
         raise ValueError(f"format must be one of {', '.join(FORMATS)}")
     _split_version(version)
     if platform == "linux" and arch == "x86_64":
+        if fmt == "msi":
+            raise ValueError("msi is a Windows package format")
         if fmt == "deb":
             return f"chudware_{deb_version(version)}_amd64.deb"
         if fmt == "rpm":
@@ -102,7 +104,12 @@ def canonical_artifact(
             return f"Chudware-{version}-linux-x86_64.tar.zst"
         return f"Chudware-{version}-linux-x86_64.AppImage"
     if platform == "windows" and arch == "x86_64":
-        _require_default(platform, fmt)
+        if fmt == "msi":
+            return f"Chudware-{version}-x86_64.msi"
+        if fmt != "default":
+            raise ValueError(
+                f"windows publishes only default and msi formats; {fmt} is not supported"
+            )
         return f"Chudware-Setup-{version}-x86_64.exe"
     if platform == "macos" and arch in {"x86_64", "arm64"}:
         _require_default(platform, fmt)
@@ -113,8 +120,7 @@ def canonical_artifact(
 def _require_default(platform: str, fmt: str) -> None:
     if fmt != "default":
         raise ValueError(
-            f"{platform} publishes only the default format; "
-            f"{fmt} is a Linux package format"
+            f"{platform} publishes only the default format; {fmt} is not supported"
         )
 
 

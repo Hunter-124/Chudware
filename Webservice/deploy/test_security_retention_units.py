@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 DEPLOY = Path(__file__).resolve().parent
@@ -75,13 +76,29 @@ def test_update_selects_staging_units_and_fails_closed_before_service_changes():
 
 def test_unit_installation_is_idempotent_copy_not_append():
     update = (DEPLOY / "update.sh").read_text(encoding="utf-8")
-    function = update[update.index("install_current_units()") : update.index("enable_security_retention()")]
-    # gateway + security retention (service, timer) + release retention
-    # (service, timer). Release retention was added when one nightly went from
-    # publishing one Linux artifact to four and the disk became the binding
-    # constraint; see Webservice/deploy/chudware-release-retention.timer.
-    assert function.count("install -m 644") == 5
-    assert 'install -m 644 "$REPO/Webservice/deploy/$RELEASE_RETENTION_UNIT"' in function
-    assert 'install -m 644 "$REPO/Webservice/deploy/$RELEASE_RETENTION_TIMER"' in function
+    function = update[
+        update.index("install_current_units()") : update.index("enable_security_retention()")
+    ]
+
+    # The bug this guards is declaring a unit variable and forgetting to install
+    # it, which produces a deploy that reports success while a timer silently
+    # does not exist — exactly what happened on 2026-08-27 with release
+    # retention. Derive the expectation from the declarations rather than
+    # hardcoding a count: a literal number here has already needed bumping
+    # twice (3 -> 5 -> 7) and each bump is a chance to paper over a real miss.
+    declared = set(re.findall(r"^\s*([A-Z_]+(?:UNIT|TIMER))=", update, re.MULTILINE))
+    assert declared, "update.sh declares no unit variables"
+    installed = set(
+        re.findall(r'install -m 644 "\$REPO/Webservice/deploy/\$([A-Z_]+)"', function)
+    )
+    assert declared == installed, (
+        "every declared unit/timer variable must be installed by "
+        f"install_current_units; declared-but-not-installed={sorted(declared - installed)}, "
+        f"installed-but-not-declared={sorted(installed - declared)}"
+    )
+    assert function.count("install -m 644") == len(declared)
+
+    # Copy, never append or skip-if-present: a stale unit that survives a deploy
+    # is indistinguishable from a deployed one.
     assert ">>" not in function
     assert "cp -n" not in function

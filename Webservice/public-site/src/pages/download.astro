@@ -5,12 +5,12 @@ import '../styles/download.css';
 
 const DOWNLOADS = 'https://app.chudware.com/#downloads';
 ---
-<BaseLayout title="Download Chudware" description="Download the signed Chudware desktop app for Windows, macOS, and Linux — installer, AppImage, .deb, .rpm, .tar.zst, or a one-line terminal install — or open the browser workspace with no installation.">
+<BaseLayout title="Download Chudware" description="Download the signed Chudware desktop app for Windows, Linux, and macOS — native installers, distro packages, or a one-line terminal install — or open the browser workspace with no installation.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Native desktop</p>
       <h1>Download Chudware.</h1>
-      <p class="lede">Signed builds for Windows, macOS, and Linux. Every download is issued to an account, so the buttons here open the download page in your workspace — signing in is the only extra step.</p>
+      <p class="lede">Signed builds for Windows, Linux, and macOS. Every download is issued to an account, so the buttons here open the download page in your workspace — signing in is the only extra step.</p>
     </div>
   </header>
 
@@ -26,21 +26,35 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
         <div class="dl-primary-body">
           <p class="eyebrow" id="dl-primary-eyebrow">Signed release</p>
           <h2 id="dl-primary-title">Chudware desktop</h2>
-          <p class="dl-note" id="dl-primary-note">Builds for Windows, macOS, and Linux, published from the download page in your workspace.</p>
+          <p class="dl-note" id="dl-primary-note">Builds for Windows, Linux, and macOS, published from the download page in your workspace.</p>
           <p class="release-meta" id="dl-primary-meta"></p>
         </div>
         <a class="button" id="dl-primary-action" href={DOWNLOADS}>Go to the download page</a>
       </article>
 
+      {/* Platform priority set by Hunter (2026-08-27): Windows and Linux are the
+          shipping targets and the macOS CI runner is intermittently offline, so
+          the cards render Windows, Linux, macOS. macOS stays fully offered — it
+          is simply last, never greyed out. The script's PLATFORM_RANK mirrors
+          this order for every rendered enumeration. */}
       <div class="dl-grid">
         <article class="panel dl-card">
           <header class="dl-card-head">
             <span class="dl-mark" aria-hidden="true"><span data-os="windows"><Icon name="windows" /></span></span>
             <h3>Windows</h3>
           </header>
-          <p>Signed installer. Installs per user and updates itself from the same signed release manifests.</p>
+          <p>Signed builds that update themselves from the same signed release manifests.</p>
           <ul class="dl-builds" data-dl-platform="windows"></ul>
           <a class="text-link" href={DOWNLOADS}>Download for Windows <Icon name="arrow-right" /></a>
+        </article>
+        <article class="panel dl-card">
+          <header class="dl-card-head">
+            <span class="dl-mark" aria-hidden="true"><span data-os="linux"><Icon name="linux" /></span></span>
+            <h3>Linux</h3>
+          </header>
+          <p>Chudware ships as a distro package where one is available, or use the one-line terminal install below.</p>
+          <ul class="dl-builds" data-dl-platform="linux"></ul>
+          <a class="text-link" href={DOWNLOADS}>Download for Linux <Icon name="arrow-right" /></a>
         </article>
         <article class="panel dl-card">
           <header class="dl-card-head">
@@ -50,15 +64,6 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
           <p>Zip archive: unpack and drag Chudware to Applications. On Apple silicon the Intel build runs through Rosetta 2.</p>
           <ul class="dl-builds" data-dl-platform="macos"></ul>
           <a class="text-link" href={DOWNLOADS}>Download for macOS <Icon name="arrow-right" /></a>
-        </article>
-        <article class="panel dl-card">
-          <header class="dl-card-head">
-            <span class="dl-mark" aria-hidden="true"><span data-os="linux"><Icon name="linux" /></span></span>
-            <h3>Linux</h3>
-          </header>
-          <p>AppImage, .deb, .rpm, .tar.zst, or the one-line terminal install below.</p>
-          <ul class="dl-builds" data-dl-platform="linux"></ul>
-          <a class="text-link" href={DOWNLOADS}>Download for Linux <Icon name="arrow-right" /></a>
         </article>
       </div>
       <p class="supporting-copy dl-sysnote">All native builds are 64-bit and need a graphics driver capable of a modern hardware-accelerated 3D context; without one the application does not start.</p>
@@ -70,7 +75,7 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
       <header class="section-heading">
         <p class="eyebrow">Linux</p>
         <h2 id="dl-terminal-title">Install from a terminal.</h2>
-        <p class="lede">One command detects your package manager, installs the signed package, and registers the desktop entry.</p>
+        <p class="lede">One command installs Chudware on any distribution: it detects your package manager, installs the signed distro package where one is available, falls back to the portable build otherwise, and registers the desktop entry.</p>
       </header>
       <div class="dl-command-row">
         <code class="dl-command" id="dl-install-command">curl -fsSL https://app.chudware.com/install.sh | sh -s -- --token &lt;token from your account&gt;</code>
@@ -82,11 +87,15 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
       </div>
       <p class="supporting-copy dl-token-note">The token is personal and expires after 15 minutes. Sign in at app.chudware.com, open the download page, and it issues one alongside this same command, ready to paste.</p>
       <p class="dl-copy-status" id="dl-copy-status" role="status"></p>
-      <dl class="dl-formats">
-        <div><dt><Icon name="package" /> .deb</dt><dd>For Debian and Ubuntu; installs with apt and removes cleanly.</dd></div>
-        <div><dt><Icon name="package" /> .rpm</dt><dd>For Fedora, RHEL, and openSUSE; installs with dnf or zypper.</dd></div>
-        <div><dt><Icon name="download" /> AppImage</dt><dd>One portable file with nothing to install; make it executable and run it.</dd></div>
-        <div><dt><Icon name="archive" /> .tar.zst</dt><dd>Plain archive for any distribution; unpack and run from anywhere.</dd></div>
+      {/* Every row is hidden until the release API confirms that format exists
+          for linux/x86_64 (hard-never #10: never name a build that is not
+          published). The one-line install above stays unconditional — it works
+          regardless of which formats are out. */}
+      <dl class="dl-formats" id="dl-format-list" hidden>
+        <div data-dl-format="deb" hidden><dt><Icon name="package" /> .deb</dt><dd>For Debian and Ubuntu; installs with apt and removes cleanly.</dd></div>
+        <div data-dl-format="rpm" hidden><dt><Icon name="package" /> .rpm</dt><dd>For Fedora, RHEL, and openSUSE; installs with dnf or zypper.</dd></div>
+        <div data-dl-format="default" hidden><dt><Icon name="download" /> AppImage</dt><dd>One portable file with nothing to install; make it executable and run it.</dd></div>
+        <div data-dl-format="tar" hidden><dt><Icon name="archive" /> .tar.zst</dt><dd>Plain archive for any distribution; unpack and run from anywhere.</dd></div>
       </dl>
     </div>
   </section>
@@ -120,10 +129,29 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
   const API = 'https://app.chudware.com/api/releases/available?channel=stable';
   const SIGNUP = 'https://app.chudware.com/signup';
   const PLATFORM_LABELS: Record<string, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
+  // Platform priority set by Hunter (2026-08-27): Windows and Linux are the
+  // shipping targets and the macOS CI runner is intermittently offline, so
+  // every enumeration sorts Windows, Linux, macOS — macOS stays fully
+  // offered, just last.
+  const PLATFORM_RANK: Record<string, number> = { windows: 0, linux: 1, macos: 2 };
   const FORMAT_LABELS: Record<string, Record<string, string>> = {
-    windows: { default: 'Installer (.exe)' },
-    macos: { default: 'Zip archive (.zip)' },
-    linux: { default: 'AppImage', deb: '.deb package', rpm: '.rpm package', tar: '.tar.zst archive' },
+    windows: { msi: 'Installer (.msi)', default: 'Setup (.exe)' },
+    macos: { default: '.zip' },
+    linux: { default: 'AppImage', deb: '.deb', rpm: '.rpm', tar: '.tar.zst' },
+  };
+  // Format order within a platform mirrors the portal: Installer (.msi)
+  // before Setup (.exe) on Windows; .deb, .rpm, AppImage, .tar.zst on Linux.
+  const FORMAT_RANK: Record<string, Record<string, number>> = {
+    windows: { msi: 0, default: 1 },
+    linux: { deb: 0, rpm: 1, default: 2, tar: 3 },
+  };
+  // One plain line per Windows format. Rendered only for formats the API
+  // actually returned — never as static copy for an unpublished build.
+  const FORMAT_NOTES: Record<string, Record<string, string>> = {
+    windows: {
+      msi: 'For managed and scripted deployment — Group Policy, Intune, msiexec.',
+      default: 'For an ordinary interactive install.',
+    },
   };
 
   interface Build { platform: string; arch: string; format: string; version: string; size: number }
@@ -131,6 +159,14 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
 
   const formatLabel = (platform: string, format: string): string =>
     FORMAT_LABELS[platform]?.[format] ?? format;
+
+  const formatRank = (b: Build): number => FORMAT_RANK[b.platform]?.[b.format] ?? 9;
+
+  const sortBuilds = (list: Build[]): Build[] =>
+    list.slice().sort((a, b) =>
+      (PLATFORM_RANK[a.platform] ?? 9) - (PLATFORM_RANK[b.platform] ?? 9)
+      || formatRank(a) - formatRank(b)
+      || a.arch.localeCompare(b.arch));
 
   const archLabel = (platform: string, arch: string): string =>
     platform === 'macos' ? (arch === 'arm64' ? 'Apple silicon' : 'Intel') : arch;
@@ -232,14 +268,13 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
       title.textContent = `Download for ${platformName}`;
       meta.textContent = `Version ${build.version} · ${formatBytes(build.size)}`;
       setMark(detected.platform);
-      if (detected.platform === 'linux') {
-        const extras = exact.filter((b) => b.format !== 'default').map((b) => formatLabel('linux', b.format).replace(' package', '').replace(' archive', ''));
-        note.textContent = extras.length > 0
-          ? `${formatLabel('linux', build.format)}, or choose ${extras.join(', ')} on the download page.`
-          : 'The download page issues the link once you are signed in.';
-      } else {
-        note.textContent = 'The download page issues the link once you are signed in.';
-      }
+      const extras = exact
+        .filter((b) => b.format !== build.format)
+        .sort((a, b) => formatRank(a) - formatRank(b))
+        .map((b) => formatLabel(detected.platform, b.format));
+      note.textContent = extras.length > 0
+        ? `${formatLabel(detected.platform, build.format)}, or choose ${extras.join(', ')} on the download page.`
+        : 'The download page issues the link once you are signed in.';
       return;
     }
 
@@ -279,9 +314,34 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
         const detail = document.createElement('span');
         detail.textContent = `${build.version} · ${formatBytes(build.size)}`;
         li.append(what, detail);
+        const noteText = FORMAT_NOTES[platform]?.[build.format];
+        if (noteText) {
+          const noteLine = document.createElement('span');
+          noteLine.className = 'dl-build-note';
+          noteLine.textContent = noteText;
+          li.append(noteLine);
+        }
         list.append(li);
       }
     });
+  }
+
+  // The format explainers are static markup for the icons' sake, but each row
+  // stays hidden until the API confirms that format is actually published for
+  // linux/x86_64. Fetch failed → the whole list stays hidden and the section
+  // names no formats at all.
+  function renderFormats(builds: Build[]): void {
+    const list = document.getElementById('dl-format-list')!;
+    const present = new Set(
+      builds.filter((b) => b.platform === 'linux' && b.arch === 'x86_64').map((b) => b.format),
+    );
+    let any = false;
+    list.querySelectorAll<HTMLElement>('[data-dl-format]').forEach((el) => {
+      const show = present.has(el.dataset.dlFormat!);
+      el.hidden = !show;
+      if (show) any = true;
+    });
+    list.hidden = !any;
   }
 
   function wireCopy(): void {
@@ -330,11 +390,14 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
       const res = await fetch(API);
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data?.builds)) builds = data.builds;
+        if (Array.isArray(data?.builds)) builds = sortBuilds(data.builds);
       }
     } catch { /* static card already reads correctly without release data */ }
     renderPrimary(detected, builds);
-    if (builds) renderGrid(builds);
+    if (builds) {
+      renderGrid(builds);
+      renderFormats(builds);
+    }
   }
 
   main();

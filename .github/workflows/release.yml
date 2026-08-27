@@ -159,7 +159,14 @@ jobs:
                 --uninstall-helper-bin "${{ matrix.host_build_dir }}/bin/chudware-uninstall-helper.exe"
               ;;
           esac
-          request="$(find "$out" -type f -name '*payload-signing-request.bin' -print -quit)"
+          # Windows build_release emits payload-manifest.v1.preimage; the shell
+          # packagers emit *.payload-signing-request.bin. This distinction was
+          # accidentally lost when the Windows path was added in dbea21d0.
+          if [ "${{ matrix.platform }}" = windows ]; then
+            request="$out/payload-manifest.v1.preimage"
+          else
+            request="$(find "$out" -type f -name '*payload-signing-request.bin' -print -quit)"
+          fi
           test -s "$request" || { echo '::error::payload signing request missing'; exit 1; }
           cp "$request" "$RUNNER_TEMP/release-request/payload-signing-request.bin"
           manifest="$(find "$out" -type f -name 'payload-manifest.v1.json' -print -quit)"
@@ -249,12 +256,14 @@ jobs:
               --command 'ctest host' --out FINAL
 
           Linux emits FINAL/publish-bundle.v1.json and exact artifact/SBOM/provenance/
-          platform-test signing requests. Windows and macOS emit an executable host-native
-          finalize script and exit platform-host-required; run that script on the named
-          platform, then generate the same publish bundle there. Sign every request with
-          packaging/sign_release.py using kind artifact, sbom, provenance, or platform-test.
-          Upload the artifact, payload sidecars, evidence JSON, and all detached signatures
-          with packaging/publish.py, then register with --commit COMMIT. Stable registration
-          and min_supported changes remain impossible in CI: this workflow stops here and
-          never receives the age-encrypted release private key or its identity.
+          platform-test signing requests. macOS emits an executable host-native finalize
+          script and exits platform-host-required; run it on the named platform. Windows
+          emits the host-native script too; it hard-requires WiX, finalizes the identical
+          signed payload into both the Inno .exe and per-machine MSI, and emits
+          publish-bundle.v1.json plus publish-bundle-msi.v1.json (format msi). Sign every
+          request with packaging/sign_release.py using kind artifact, sbom, provenance,
+          or platform-test. Upload each artifact, the shared payload sidecars, its own
+          evidence JSON, and all detached signatures; register the MSI with gateway format
+          msi. Stable registration and min_supported changes remain impossible in CI: this
+          workflow stops here and never receives the age-encrypted release private key.
           EOF

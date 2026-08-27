@@ -15,6 +15,7 @@
 #include "include/wrapper/cef_helpers.h"
 
 #include "cef_platform.h"
+#include "cef_spool_reaper.h"
 #include "cef_stealth.h"
 
 namespace ui::cef {
@@ -262,6 +263,22 @@ bool initialize() {
     settings.external_message_pump = 1;               // pair with OnScheduleMessagePump
     settings.multi_threaded_message_loop = 0;
     const std::string dir = cef_platform::executable_dir();
+    // initialize() is guarded by g_init_attempted, so this is the one startup
+    // hook reached exactly once by both GUI and --cef-daemon, before Chromium
+    // can map a new metrics file. cache_root() itself has other call sites and
+    // is intentionally kept side-effect free.
+    const std::string cache_root = cef_platform::cache_root();
+    const CefSpoolReapResult spool_reap =
+        reap_cef_metrics_spools(cache_root, kCefMetricsSpoolMaxAge,
+                                kCefMetricsSpoolMaxFilesPerDirectory);
+    if (spool_reap.matched || spool_reap.removal_failures) {
+        std::fprintf(stderr,
+                     "[cef] metrics spool: matched=%zu removed_age=%zu "
+                     "removed_count=%zu retained=%zu failures=%zu\n",
+                     spool_reap.matched, spool_reap.removed_by_age,
+                     spool_reap.removed_by_count, spool_reap.retained,
+                     spool_reap.removal_failures);
+    }
     CefString(&settings.browser_subprocess_path) = cef_platform::helper_path();
     // Point CEF at the runtime staged next to the binary (icudtl.dat, *.pak,
     // v8 snapshot, locales/) — otherwise Chromium fails with "Invalid file
@@ -273,7 +290,7 @@ bool initialize() {
     // vendor in its own per-site context = cache_root()/<slug> so cookie jars stay
     // separate. This tree is CEF's own (NOT the Playwright profiles) until the
     // cookie-interop pass — see cef_platform::cache_root().
-    CefString(&settings.root_cache_path) = cef_platform::cache_root();
+    CefString(&settings.root_cache_path) = cache_root;
     // Keep CEF's DEFAULT user agent (a genuine "Chrome/149… Safari/537.36" string
     // with no Headless/CEF token) — a hand-rolled UA that doesn't match the native
     // Sec-CH-UA client hints is a WORSE tell than the default. Only pin the
@@ -300,8 +317,7 @@ bool initialize() {
                  cef_platform::helper_path().c_str());
     g_initialized = CefInitialize(args, settings, g_app.get(), nullptr);
     std::fprintf(stderr, "[cef] CefInitialize %s (cache=%s)\n",
-                 g_initialized ? "OK" : "FAILED",
-                 cef_platform::cache_root().c_str());
+                 g_initialized ? "OK" : "FAILED", cache_root.c_str());
     return g_initialized;
 }
 

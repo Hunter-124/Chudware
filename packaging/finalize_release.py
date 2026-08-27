@@ -156,7 +156,7 @@ def _copy_portable_inputs(args: argparse.Namespace, staging: Path) -> tuple[Path
     else:
         public_key.write_text(args.release_public_key + "\n", encoding="ascii")
     snapshot = args.out / "builder"
-    for relative in ("packaging/finalize_release.py", "packaging/generate_release_evidence.py", "packaging/release_json.py", "packaging/macos/build_app.sh", "packaging/macos/Chudware.icns", "packaging/macos/RELEASE_NOTES.md", "packaging/windows/chudware.iss", "services/installer/build_release.py", "services/installer/payload_manifest.py", "LICENSE-EULA.txt"):
+    for relative in ("packaging/finalize_release.py", "packaging/generate_release_evidence.py", "packaging/release_json.py", "packaging/macos/build_app.sh", "packaging/macos/Chudware.icns", "packaging/macos/RELEASE_NOTES.md", "packaging/windows/chudware.iss", "packaging/windows/chudware.wxs", "services/installer/build_release.py", "services/installer/build_msi.py", "services/installer/payload_manifest.py", "LICENSE-EULA.txt"):
         source = REPO / relative
         destination = snapshot / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -174,15 +174,25 @@ def host_script(args: argparse.Namespace, handoff_dir: Path) -> Path:
             "Set-Location $builder\n"
             "python -m services.installer.build_release --out $handoff --finalize-signing $signature "
             "--release-public-key $publicKey\n"
+            "python -m services.installer.build_msi --payload (Join-Path $handoff 'Chudware') "
+            "--out $handoff --version " + repr(args.version) + " --release-public-key $publicKey\n"
             "$evidence = Join-Path $root 'platform-signing.v1.json'\n"
+            "$msiEvidence = Join-Path $root 'platform-signing-msi.v1.json'\n"
             "if ($env:CHUDWARE_RELEASE_CHANNEL -eq 'stable') {\n"
             "  if (-not $env:CHUDWARE_SIGN_IDENTITY) { throw 'stable Windows requires CHUDWARE_SIGN_IDENTITY' }\n"
             "  & signtool.exe verify /pa /v $artifact\n"
+            "  & signtool.exe verify /pa /v $msi\n"
             "  python packaging/finalize_release.py platform-evidence $artifact --platform windows --kind authenticode --out $evidence\n"
+            "  python packaging/finalize_release.py platform-evidence $msi --platform windows --kind authenticode --out $msiEvidence\n"
             "  python packaging/finalize_release.py complete $artifact --bundle-root $root --platform-signing-evidence $evidence\n"
-            "} else { python packaging/finalize_release.py complete $artifact --bundle-root $root }"
+            "  python packaging/finalize_release.py windows-msi-complete $msi --bundle-root $root --platform-signing-evidence $msiEvidence\n"
+            "} else {\n"
+            "  python packaging/finalize_release.py complete $artifact --bundle-root $root\n"
+            "  python packaging/finalize_release.py windows-msi-complete $msi --bundle-root $root\n"
+            "}\n"
+            "Write-Host \"MSI finalized at $msi; publish-bundle-msi.v1.json carries its signing requests and format msi.\""
         )
-        text = "$ErrorActionPreference = 'Stop'\n$root = Split-Path -Parent $MyInvocation.MyCommand.Path\n$builder = Join-Path $root 'builder'\n$handoff = Join-Path $root 'handoff'\n$signature = Join-Path $root 'portable-inputs/payload-manifest.v1.sig'\n$publicKey = Join-Path $root 'portable-inputs/release-public-key'\n$artifact = Join-Path $handoff ('Chudware-Setup-' + " + repr(args.version) + " + '-x86_64.exe')\n$env:CHUDWARE_RELEASE_CHANNEL = " + repr(channel) + "\n" + command + "\n"
+        text = "$ErrorActionPreference = 'Stop'\n$root = Split-Path -Parent $MyInvocation.MyCommand.Path\n$builder = Join-Path $root 'builder'\n$handoff = Join-Path $root 'handoff'\n$signature = Join-Path $root 'portable-inputs/payload-manifest.v1.sig'\n$publicKey = Join-Path $root 'portable-inputs/release-public-key'\n$artifact = Join-Path $handoff ('Chudware-Setup-' + " + repr(args.version) + " + '-x86_64.exe')\n$msi = Join-Path $handoff ('Chudware-' + " + repr(args.version) + " + '-x86_64.msi')\n$env:CHUDWARE_RELEASE_CHANNEL = " + repr(channel) + "\n" + command + "\n"
     else:
         stable = ""
         if channel == "stable":
@@ -274,6 +284,51 @@ def complete(args: argparse.Namespace) -> int:
     return 0
 
 
+def complete_windows_msi(args: argparse.Namespace) -> int:
+    """Generate isolated evidence/signing requests for the tagged MSI."""
+    root = args.bundle_root.resolve()
+    handoff = root / "handoff"
+    metadata, manifest_path, key_id = load_handoff(args, handoff)
+    if args.platform != "windows" or args.arch != "x86_64":
+        raise FinalizeError("windows-msi-complete requires a windows/x86_64 handoff")
+    args.artifact = args.artifact.resolve()
+    args.out = root / "msi"
+    args.out.mkdir(exist_ok=True)
+    _stable_platform_evidence(args)
+    locks = [handoff / item["path"] for item in metadata["locked_inputs"]]
+    requests = evidence_requests(args, args.artifact, locks)
+    artifact_request = args.artifact.with_name(
+        args.artifact.name + ".artifact-signing-request.bin"
+    )
+    artifact_request.write_bytes(b"\0".join((
+        b"chudware-artifact-v1", key_id.encode("ascii"), args.version.encode("ascii"),
+        b"windows", b"x86_64", digest(args.artifact).encode("ascii"),
+    )))
+    manifest = {
+        "schema": "publish-bundle.v1",
+        "format": "msi",
+        "artifact": _relative(args.artifact, root, "artifact"),
+        "artifact_sha256": digest(args.artifact),
+        "artifact_signing_request": _relative(
+            artifact_request, root, "artifact request"
+        ),
+        "evidence_signing_requests": [
+            _relative(path, root, "evidence request") for path in requests
+        ],
+        "payload_manifest": _relative(manifest_path, root, "payload manifest"),
+        "key_id": key_id,
+        "platform": "windows",
+        "arch": "x86_64",
+        "version": args.version,
+        "commit": args.commit,
+        "channel": args.channel,
+    }
+    path = root / "publish-bundle-msi.v1.json"
+    path.write_bytes(canonical_json_bytes(manifest))
+    print(json.dumps(manifest, sort_keys=True))
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("handoff", type=Path)
@@ -320,6 +375,41 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return write_platform_evidence(platform_evidence_parser().parse_args(raw[1:]))
         except (OSError, FinalizeError) as exc:
+            print(f"finalize_release: error: {exc}", file=sys.stderr)
+            return 2
+    if raw and raw[0] == "windows-msi-complete":
+        try:
+            partial = complete_parser().parse_args(raw[1:])
+            handoff = parse_canonical_json_bytes(
+                (partial.bundle_root / "handoff" / "handoff.json").read_bytes(),
+                "prepared handoff",
+                FinalizeError,
+            )
+            commands_path = partial.bundle_root / "handoff" / "test-commands.txt"
+            commands = [
+                line for line in commands_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            args = argparse.Namespace(
+                artifact=partial.artifact,
+                bundle_root=partial.bundle_root,
+                platform_signing_evidence=partial.platform_signing_evidence,
+                handoff_metadata=None,
+                payload_signature=(
+                    partial.bundle_root / "portable-inputs" / "payload-manifest.v1.sig"
+                ),
+                release_public_key=str(
+                    partial.bundle_root / "portable-inputs" / "release-public-key"
+                ),
+                locked_input=[],
+                command=commands,
+                **{
+                    key: handoff[key]
+                    for key in ("platform", "arch", "version", "commit", "channel")
+                },
+            )
+            return complete_windows_msi(args)
+        except (OSError, KeyError, FinalizeError, subprocess.CalledProcessError) as exc:
             print(f"finalize_release: error: {exc}", file=sys.stderr)
             return 2
     if raw and raw[0] == "complete":

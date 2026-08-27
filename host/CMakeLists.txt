@@ -737,6 +737,20 @@ add_test(NAME test_conv_ids
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end session-id allocation ---
 
+# --- CEF metrics spool bound: links the REAL GL/CEF-free filesystem cleanup.
+# Exercises both exact Chromium spool directories without loading libcef or a GL context.
+add_executable(test_cef_spool_reaper
+  src/ui/widgets/cef/cef_spool_reaper.cpp
+  tests/test_cef_spool_reaper.cpp)
+target_include_directories(test_cef_spool_reaper PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_cef_spool_reaper PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_cef_spool_reaper
+  COMMAND test_cef_spool_reaper
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end CEF metrics spool bound ---
+
 # --- copilot agent-authored text sanitizers: links the REAL agent_text.cpp (no GL / imgui /
 # AppState). Guards two live chat defects: tool-call cards printing the opaque engine doc id
 # ("doc-cpp00000039") where the part's name belongs, and U+2192 arrows from the Python harness

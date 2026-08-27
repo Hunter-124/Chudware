@@ -615,26 +615,32 @@
   var PLATFORM_LABELS = { windows: "Windows", macos: "macOS", linux: "Linux" };
   var ARCH_LABELS = { x86_64: "64-bit", arm64: "ARM64" };
   var MACOS_ARCH_LABELS = { x86_64: "Intel", arm64: "Apple silicon" };
-  // Chip order for the primary card only (design contract): deb, rpm,
-  // AppImage, tar.zst on Linux. The all-platforms list keeps the API's own
-  // order, which puts `default` first inside each tuple.
+  // Platform priority is Hunter's call, not alphabetical: Windows and Linux
+  // are the shipping targets and the macOS CI runner is intermittently
+  // offline, so macOS lists last. The API sorts platforms alphabetically —
+  // every platform enumeration in this file re-ranks through PLATFORM_RANK.
+  var PLATFORM_RANK = { windows: 0, linux: 1, macos: 2 };
+  // Format order within a platform (design contract), for the primary card's
+  // chips and the all-platforms list alike: msi then the .exe on Windows;
+  // deb, rpm, AppImage, tar.zst on Linux.
   var CHIP_ORDER = {
+    windows: ["msi", "default", "deb", "rpm", "tar"],
     linux: ["deb", "rpm", "default", "tar"],
-    windows: ["default", "deb", "rpm", "tar"],
     macos: ["default", "deb", "rpm", "tar"]
   };
-  var GENERIC_CHIP_ORDER = ["default", "deb", "rpm", "tar"];
-  var FORMAT_CHIPS = { deb: "deb", rpm: "rpm", tar: "tar.zst" };
-  var DEFAULT_FORMAT_CHIPS = { windows: "Installer", macos: "Zip archive", linux: "AppImage" };
-  var FORMAT_NOUNS = { deb: "deb package", rpm: "rpm package", tar: "tar.zst archive" };
+  var GENERIC_CHIP_ORDER = ["msi", "default", "deb", "rpm", "tar"];
+  var FORMAT_CHIPS = { msi: "Installer (.msi)", deb: ".deb", rpm: ".rpm", tar: ".tar.zst" };
+  var DEFAULT_FORMAT_CHIPS = { windows: "Setup (.exe)", macos: ".zip", linux: "AppImage" };
+  var FORMAT_NOUNS = { msi: "MSI installer", deb: "deb package", rpm: "rpm package", tar: "tar.zst archive" };
   var DEFAULT_FORMAT_NOUNS = { windows: "installer", macos: "zip archive", linux: "AppImage" };
   var FORMAT_NOTES = {
+    msi: "MSI package for managed and scripted deployment — Group Policy, Intune, and msiexec.",
     deb: "Debian package for Debian, Ubuntu, Mint, and other apt systems.",
     rpm: "RPM package for Fedora, RHEL, and openSUSE.",
     tar: "Portable archive — unpack it anywhere, no package manager needed."
   };
   var DEFAULT_FORMAT_NOTES = {
-    windows: "Signed installer for Windows.",
+    windows: "Interactive installer for Windows — run it and follow the prompts.",
     macos: "Zipped application bundle — unzip it into Applications.",
     linux: "Single-file AppImage — make it executable and run it."
   };
@@ -752,9 +758,20 @@
     });
   }
 
+  function platformRank(platform) {
+    var rank = PLATFORM_RANK[platform];
+    return rank === undefined ? Object.keys(PLATFORM_RANK).length : rank;
+  }
+
+  function formatRank(platform, format) {
+    var index = chipOrder(platform).indexOf(format);
+    return index < 0 ? chipOrder(platform).length : index;
+  }
+
   function groupBuilds(builds) {
-    // Response order is preserved: the API sorts platform → arch → format with
-    // `default` first inside each tuple.
+    // The API sorts platform → arch → format alphabetically; the list ranks
+    // platforms through PLATFORM_RANK (Windows, Linux, macOS — see the note
+    // there) and formats through CHIP_ORDER. Arch keeps the API's order.
     var groups = [];
     var byTarget = new Map();
     builds.forEach(function (build) {
@@ -766,6 +783,12 @@
         groups.push(group);
       }
       group.builds.push(build);
+    });
+    groups.sort(function (a, b) { return platformRank(a.platform) - platformRank(b.platform); });
+    groups.forEach(function (group) {
+      group.builds.sort(function (a, b) {
+        return formatRank(group.platform, a.format) - formatRank(group.platform, b.format);
+      });
     });
     return groups;
   }
@@ -781,13 +804,24 @@
   function renderFormatChips(builds, target) {
     var host = el("primary-formats");
     clear(host);
-    availableFormats(builds, target.platform, target.arch).forEach(function (format) {
+    var formats = availableFormats(builds, target.platform, target.arch);
+    // A single format is no choice — hide the row rather than render one
+    // pressed chip with no alternative (macOS today).
+    host.hidden = formats.length < 2;
+    if (host.hidden) return;
+    formats.forEach(function (format) {
       var chip = text("button", formatChipLabel(target.platform, format), "format-chip");
       chip.type = "button";
       chip.dataset.format = format;
       chip.setAttribute("aria-pressed", format === target.format ? "true" : "false");
       host.appendChild(chip);
     });
+  }
+
+  function clearFormatChips() {
+    var host = el("primary-formats");
+    clear(host);
+    host.hidden = true;
   }
 
   function cloudFallbackLink() {
@@ -831,7 +865,7 @@
     mark.appendChild(icon(PLATFORM_MARKS[detected.platform] || "package"));
     el("primary-title").textContent = "Chudware desktop";
     el("primary-meta").textContent = "";
-    clear(el("primary-formats"));
+    clearFormatChips();
     action.hidden = true;
     action.disabled = true;
     if (detected.platform) {
@@ -863,7 +897,7 @@
       section.appendChild(head);
       group.builds.forEach(function (build) {
         var row = text("div", "", "download-row");
-        row.appendChild(text("span", formatNoun(group.platform, build.format), "download-row-name"));
+        row.appendChild(text("span", formatChipLabel(group.platform, build.format), "download-row-name"));
         row.appendChild(text("span", "Version " + build.version + " · " + formatBytes(build.size), "download-row-meta"));
         var button = text("button", "Download", "secondary small download-row-action");
         button.type = "button";
@@ -988,7 +1022,7 @@
     el("primary-eyebrow").textContent = "Detecting your computer…";
     el("primary-note").textContent = "";
     el("primary-meta").textContent = "";
-    clear(el("primary-formats"));
+    clearFormatChips();
     var action = el("primary-action");
     action.hidden = false;
     action.disabled = true;
@@ -1006,7 +1040,7 @@
     el("primary-title").textContent = "Chudware desktop";
     el("primary-note").textContent = "The list of published builds could not be loaded: " + error.message;
     el("primary-meta").textContent = "";
-    clear(el("primary-formats"));
+    clearFormatChips();
     var action = el("primary-action");
     action.hidden = true;
     action.disabled = true;

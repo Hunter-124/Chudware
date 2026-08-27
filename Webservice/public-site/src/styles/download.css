@@ -25,6 +25,11 @@
   .dl-builds li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--s1) var(--s4); padding-block: var(--s3); border-bottom: var(--border) solid var(--line); font-size: var(--step--1); }
   .dl-builds li span:first-child { color: var(--text); font-weight: 620; }
   .dl-builds li span + span { color: var(--technical); font: var(--step--1)/1.5 var(--mono); }
+  /* Full-width plain line under a Windows build row: what the format is for. */
+  .dl-builds li .dl-build-note { flex-basis: 100%; color: var(--muted); font: 400 var(--step--1)/1.55 var(--sans); }
+  /* The grid displays above would defeat the hidden attribute the format
+     gating relies on; a row hidden by the script must actually disappear. */
+  .dl-formats[hidden], .dl-formats > div[hidden] { display: none; }
   .dl-card .text-link { margin-top: auto; font-size: var(--step--1); }
   .dl-sysnote { margin-top: var(--s5); font-size: var(--step--1); }
 

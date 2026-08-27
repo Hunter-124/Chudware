@@ -67,6 +67,7 @@ target_sources(Chudware PRIVATE
   src/ui/widgets/cef/cef_stealth.cpp           # shared UA/hints + JS hardening
   src/ui/widgets/cef/cef_headless.cpp          # headless fetch/download (--cef-fetch/--cef-download)
   src/ui/widgets/cef/cef_daemon.cpp            # CEF host daemon over chudware_ipc (--cef-daemon)
+  src/ui/widgets/cef/cef_spool_reaper.cpp       # GL/CEF-free startup cleanup for metrics PMAs
   src/ui/widgets/cef/cef_app.cpp)
 if(WIN32)
   target_sources(Chudware PRIVATE src/ui/widgets/cef/cef_platform_windows.cpp)
@@ -111,6 +112,7 @@ set_source_files_properties(
 add_executable(chudware_cef_helper
   src/ui/widgets/cef/cef_helper_main.cpp
   src/ui/widgets/cef/cef_app.cpp
+  src/ui/widgets/cef/cef_spool_reaper.cpp
   src/ui/widgets/cef/cef_stealth.cpp   # render-process OnContextCreated injects this
   ../core/util/platform_paths.cpp)     # executable_dir() in the platform seam
 if(WIN32)

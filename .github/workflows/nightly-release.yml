@@ -981,6 +981,32 @@ jobs:
           "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "iscc=$iscc"
 
+          # MSI is additive to the required Inno installer. Probe WiX with the
+          # same explicit candidates, but record an unavailable format as a
+          # warning rather than failing the good .exe leg: ci_builds has no
+          # format dimension and a red job would misreport that installer.
+          $wix = $env:WIX
+          if (-not $wix) {
+            $candidates = @(
+              (Join-Path $tools 'wix\wix.exe'),
+              (Join-Path $env:USERPROFILE '.dotnet\tools\wix.exe')
+            )
+            $wix = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $wix) {
+              $onPath = Get-Command 'wix.exe' -ErrorAction SilentlyContinue
+              if (-not $onPath) { $onPath = Get-Command 'wix' -ErrorAction SilentlyContinue }
+              if ($onPath) { $wix = $onPath.Source }
+            }
+          }
+          if (-not $wix -or -not (Test-Path $wix)) {
+            Write-Host "::warning::wix (modern WiX Toolset) is not installed on $env:RUNNER_NAME; format msi will be skipped, format default remains publishable. Install the WiX .NET tool or set WIX."
+            "WIX_AVAILABLE=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            "WIX=$wix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "WIX_AVAILABLE=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "wix=$wix"
+          }
+
           $vsPath = $null
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
           if (Test-Path $vswhere) {
@@ -1248,6 +1274,34 @@ jobs:
           "PAYLOAD_DIR=$out\Chudware" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "installer=$installer ($((Get-Item $installer).Length) bytes)"
 
+          # The MSI harvests THIS finalized directory. It never stages or
+          # rewrites payload bytes; the builder snapshots the complete tree
+          # before and after WiX and deletes the MSI on any mutation.
+          $msiBuilt = $false
+          if ($env:WIX_AVAILABLE -eq '1') {
+            $msiOut = Join-Path $env:RUNNER_TEMP 'msi'
+            if (Test-Path $msiOut) { Remove-Item -Recurse -Force $msiOut }
+            & python -m services.installer.build_msi `
+              --payload (Join-Path $out 'Chudware') --out $msiOut `
+              --version $env:RELEASE_VERSION --release-public-key $publicKeyB64 `
+              --wix $env:WIX
+            if ($LASTEXITCODE -eq 0) {
+              $msiName = "Chudware-$env:RELEASE_VERSION-x86_64.msi"
+              $msi = Join-Path $msiOut $msiName
+              if (Test-Path $msi) {
+                $msiBuilt = $true
+                "MSI_ARTIFACT=$msi" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+                "MSI_ARTIFACT_NAME=$msiName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+                Write-Host "msi=$msi ($((Get-Item $msi).Length) bytes)"
+              }
+            }
+            if (-not $msiBuilt) {
+              Write-Host "::warning::building format msi failed; format default remains publishable"
+            }
+          }
+          "MSI_BUILT=$(if ($msiBuilt) { '1' } else { '0' })" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Sign the artifact pair and generate evidence
         env:
           CHUDWARE_RELEASE_CI_KEY: ${{ secrets.CHUDWARE_RELEASE_CI_KEY }}
@@ -1285,34 +1339,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $ok = $false }
 
           if ($ok) {
-            # A request is the evidence domain plus the exact canonical bytes. The
-            # domain table lives in packaging/sign_release.py and is imported, never
-            # retyped here. The same script also proves the platform-test document
-            # names the suites this job actually ran.
-            $builder = Join-Path $env:RUNNER_TEMP 'evidence_requests.py'
-            $builderBody = @'
-          import json
-          import os
-          import pathlib
-          import sys
-
-          sys.path.insert(0, os.getcwd())
-          from packaging.sign_release import DOMAINS
-
-          directory = pathlib.Path(os.environ["EVIDENCE_DIR"])
-          for name, kind in (("sbom.cdx.json", "sbom"),
-                             ("provenance.slsa.json", "provenance"),
-                             ("platform-test.v1.json", "platform-test")):
-              body = (directory / name).read_bytes()
-              (directory / (name + ".signing-request.bin")).write_bytes(DOMAINS[kind] + body)
-
-          document = json.loads((directory / "platform-test.v1.json").read_text(encoding="utf-8"))
-          missing = {"ctest core", "ctest host"} - set(document.get("commands", []))
-          if missing or document.get("passed") is not True:
-              raise SystemExit("platform-test evidence does not record the executed suites: %s" % sorted(missing))
-          '@
-            [IO.File]::WriteAllText($builder, ($builderBody -replace "`r`n", "`n"), (New-Object Text.ASCIIEncoding))
-            & python $builder
+            # Shared by default and msi evidence; the helper imports the one
+            # authoritative signing-domain table instead of retyping domains.
+            & python packaging\windows\prepare_evidence_requests.py $evidence
             if ($LASTEXITCODE -ne 0) { $ok = $false }
           }
           if ($ok) {
@@ -1328,170 +1357,123 @@ jobs:
           }
           "HAS_EVIDENCE=$(if ($ok) { '1' } else { '0' })" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Upload the installer and publish over the gateway API
+          # MSI is an additive format. Its Ed25519 identities and evidence bind
+          # the MSI's own bytes; reusing the .exe evidence would make a false
+          # provenance claim even though the installed payload is identical.
+          $msiReady = $false
+          $msiEvidenceOk = $false
+          if ($env:MSI_BUILT -eq '1') {
+            $msiSig = Join-Path $env:RUNNER_TEMP 'artifact-msi.sig'
+            $msiStableSig = Join-Path $env:RUNNER_TEMP 'artifact-msi-stable.sig'
+            & python packaging\ci_sign.py --expect-public-key $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY `
+              --output $msiSig artifact --key-id $env:CHUDWARE_RELEASE_KEY_ID `
+              --version $env:RELEASE_VERSION --platform windows --arch x86_64 `
+              --artifact $env:MSI_ARTIFACT | Out-Null
+            $betaSigned = $LASTEXITCODE -eq 0
+            if ($betaSigned) {
+              & python packaging\ci_sign.py --expect-public-key $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY `
+                --output $msiStableSig artifact --key-id $env:CHUDWARE_RELEASE_KEY_ID `
+                --version $env:RELEASE_STABLE_VERSION --platform windows --arch x86_64 `
+                --artifact $env:MSI_ARTIFACT | Out-Null
+              $msiReady = $LASTEXITCODE -eq 0
+            }
+            if (-not $msiReady) {
+              Write-Host '::warning::signing format msi failed; format default remains publishable'
+            } else {
+              $msiEvidence = Join-Path $env:RUNNER_TEMP 'evidence-msi'
+              $msiSha = (Get-FileHash -LiteralPath $env:MSI_ARTIFACT -Algorithm SHA256).Hash.ToLower()
+              & python packaging\generate_release_evidence.py $env:MSI_ARTIFACT `
+                --artifact-sha256 $msiSha --version $env:RELEASE_VERSION `
+                --platform windows --arch x86_64 --commit $env:RELEASE_COMMIT `
+                --locked-input CMakePresets.json `
+                --locked-input packaging/requirements-release.txt `
+                --locked-input vendor/omp/bun.lock `
+                --command 'ctest core' --command 'ctest host' --passed --out $msiEvidence
+              $msiEvidenceOk = $LASTEXITCODE -eq 0
+              if ($msiEvidenceOk) {
+                & python packaging\windows\prepare_evidence_requests.py $msiEvidence
+                $msiEvidenceOk = $LASTEXITCODE -eq 0
+              }
+              if ($msiEvidenceOk) {
+                foreach ($pair in @(@('sbom.cdx.json', 'sbom'), @('provenance.slsa.json', 'provenance'), @('platform-test.v1.json', 'platform-test'))) {
+                  & python packaging\ci_sign.py --expect-public-key $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY `
+                    --output (Join-Path $msiEvidence ($pair[0] + '.sig')) `
+                    sign $pair[1] (Join-Path $msiEvidence ($pair[0] + '.signing-request.bin')) | Out-Null
+                  if ($LASTEXITCODE -ne 0) { $msiEvidenceOk = $false; break }
+                }
+              }
+              if (-not $msiEvidenceOk) {
+                Write-Host '::warning::format msi evidence generation or signing failed; publishing this beta WITHOUT an evidence bundle, so it cannot be promoted to stable'
+              }
+            }
+          }
+          "MSI_READY=$(if ($msiReady) { '1' } else { '0' })" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MSI_HAS_EVIDENCE=$(if ($msiEvidenceOk) { '1' } else { '0' })" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Stage and publish the Windows release formats
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $name = $env:ARTIFACT_NAME
-          $evidence = Join-Path $env:RUNNER_TEMP 'evidence'
-          $base = $env:CHUDWARE_GATEWAY_PUBLIC_BASE
-          $retry = $env:CHUDWARE_GATEWAY_CURL_RETRY -split ' '
+          & (Join-Path $env:RUNNER_TEMP 'ci_status.ps1') -Status 'publishing' `
+            -Detail 'posting ci/publish for Windows formats'
 
-          # Sidecars carry the artifact's own name plus a suffix; the payload
-          # signature REPLACES the .json (payload-manifest.v1.sig), while evidence
-          # signatures append .sig to the full evidence file name.
-          $uploads = @(
-            @{ Local = $env:ARTIFACT; Remote = $name },
-            @{ Local = "$env:PAYLOAD_DIR\payload-manifest.v1.json"; Remote = "$name.payload-manifest.v1.json" },
-            @{ Local = "$env:PAYLOAD_DIR\payload-manifest.v1.sig"; Remote = "$name.payload-manifest.v1.sig" }
-          )
+          $default = @{
+            Artifact = $env:ARTIFACT
+            Format = 'default'
+            Signature = (Join-Path $env:RUNNER_TEMP 'artifact.sig')
+            StableSignature = (Join-Path $env:RUNNER_TEMP 'artifact-stable.sig')
+            PayloadDir = $env:PAYLOAD_DIR
+          }
           if ($env:HAS_EVIDENCE -eq '1') {
-            foreach ($doc in @('sbom.cdx.json', 'provenance.slsa.json', 'platform-test.v1.json')) {
-              $uploads += @{ Local = (Join-Path $evidence $doc); Remote = "$name.$doc" }
-              $uploads += @{ Local = (Join-Path $evidence "$doc.sig"); Remote = "$name.$doc.sig" }
+            $default.EvidenceDir = Join-Path $env:RUNNER_TEMP 'evidence'
+          }
+          $defaultName = & packaging\windows\publish_release.ps1 @default
+          $publishedFormats = @('default')
+          $failedFormats = @()
+
+          # Independently stage+publish the additive MSI. A 422 deletes only
+          # this staged artifact; retrying this helper uploads it again without
+          # touching or misreporting the already-published .exe.
+          if ($env:MSI_READY -eq '1') {
+            $msi = @{
+              Artifact = $env:MSI_ARTIFACT
+              Format = 'msi'
+              Signature = (Join-Path $env:RUNNER_TEMP 'artifact-msi.sig')
+              StableSignature = (Join-Path $env:RUNNER_TEMP 'artifact-msi-stable.sig')
+              PayloadDir = $env:PAYLOAD_DIR
+            }
+            if ($env:MSI_HAS_EVIDENCE -eq '1') {
+              $msi.EvidenceDir = Join-Path $env:RUNNER_TEMP 'evidence-msi'
+            }
+            try {
+              $msiName = & packaging\windows\publish_release.ps1 @msi
+              $publishedFormats += 'msi'
+            } catch {
+              Write-Host ('::warning::format msi stage/publish failed; format default is already published: ' + $_.Exception.Message)
+              $failedFormats += 'msi'
             }
           }
-          foreach ($item in $uploads) {
-            if (-not (Test-Path $item.Local)) { Write-Host "::error::missing upload $($item.Local)"; exit 1 }
-            $expected = (Get-FileHash -Path $item.Local -Algorithm SHA256).Hash.ToLower()
-            # --upload-file streams from disk; --data-binary would read a ~500 MB
-            # installer into memory first, and the handler wants a raw body either
-            # way. The gateway writes to <name>.part and renames, so ci/publish
-            # never sees a torn upload.
-            # No 2>&1: under $ErrorActionPreference = 'Stop', PowerShell 5.1 turns
-            # a native command's redirected stderr into a terminating
-            # NativeCommandError, which would abort before the check below and
-            # report the wrong cause. --fail-with-body puts the gateway's reply on
-            # stdout; its diagnostics stay in the step log where they belong.
-            #
-            # Anything over the edge's 100 MB body cap goes up in chunks: the
-            # installer is ~300 MB and a single PUT is answered 413 by the proxy
-            # in front of the public origin. Each chunk names the offset it
-            # continues, and the last one finalizes and returns the digest.
-            $size = (Get-Item $item.Local).Length
-            if ($size -gt 67108864) {
-              $chunkFile = Join-Path $env:RUNNER_TEMP 'upload.chunk'
-              $chunkSize = 67108864
-              $stream = [IO.File]::OpenRead($item.Local)
-              $buffer = New-Object byte[] $chunkSize
-              $offset = 0
-              $response = ''
-              try {
-                while ($offset -lt $size) {
-                  $read = $stream.Read($buffer, 0, $chunkSize)
-                  if ($read -le 0) { break }
-                  $out = [IO.File]::Open($chunkFile, 'Create', 'Write')
-                  $out.Write($buffer, 0, $read)
-                  $out.Close()
-                  $query = "offset=$offset"
-                  if (($offset + $read) -ge $size) { $query = "offset=$offset&complete=1" }
-                  $response = & curl.exe --config $env:GATEWAY_CURLRC --fail-with-body -sS `
-                    --max-time 3600 @retry --upload-file $chunkFile `
-                    "$base/api/releases/ci/upload/$($item.Remote)?$query"
-                  if ($LASTEXITCODE -ne 0) {
-                    Write-Host "::error::chunk upload failed for $($item.Remote) at offset $offset : $response"
-                    exit 1
-                  }
-                  $offset += $read
-                }
-              } finally {
-                $stream.Close()
-                Remove-Item -Force -ErrorAction SilentlyContinue $chunkFile
-              }
-            } else {
-              $response = & curl.exe --config $env:GATEWAY_CURLRC --fail-with-body -sS `
-                --max-time 3600 @retry --upload-file $item.Local `
-                "$base/api/releases/ci/upload/$($item.Remote)"
-            }
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "::error::upload failed for $($item.Remote): $response"
-              exit 1
-            }
-            # The gateway re-digests these bytes again at publish time; comparing
-            # here names transport corruption at the file that caused it instead
-            # of as a 422 an hour later. A chunked upload reports its digest only
-            # on the finalizing call, which is the response still in $response.
-            $reported = ''
-            try { $reported = (($response -join '') | ConvertFrom-Json).sha256 } catch { $reported = '' }
-            if ($reported -ne $expected) {
-              Write-Host "::error::the gateway stored a different digest for $($item.Remote): expected $expected, got '$reported'"
-              exit 1
-            }
-            Write-Host "uploaded $($item.Remote) sha256=$reported"
-          }
-          Write-Host "uploaded $($uploads.Count) files into the gateway staging directory"
+          if ($env:MSI_READY -ne '1') { $failedFormats += 'msi' }
 
-          & (Join-Path $env:RUNNER_TEMP 'ci_status.ps1') -Status 'publishing' -Detail "posting ci/publish for $name"
-
-          $body = Join-Path $env:RUNNER_TEMP 'publish.json'
-          $env:PUBLISH_BODY = $body
-          $env:EVIDENCE_DIR = $evidence
-          # The gateway recomputes every digest from the staged files and rejects a
-          # mismatch, so the body is built from the exact bytes that were uploaded.
-          $builder = Join-Path $env:RUNNER_TEMP 'publish_body.py'
-          $builderBody = @'
-          import hashlib
-          import json
-          import os
-          import pathlib
-
-
-          def digest(path):
-              value = hashlib.sha256()
-              with path.open("rb") as stream:
-                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                      value.update(chunk)
-              return value.hexdigest()
-
-
-          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
-          artifact = pathlib.Path(os.environ["ARTIFACT"])
-          body = {
-              "version": os.environ["RELEASE_VERSION"],
-              "stable_version": os.environ["RELEASE_STABLE_VERSION"],
-              "platform": "windows",
-              "arch": "x86_64",
-              "channel": "beta",
-              "key_id": os.environ["CHUDWARE_RELEASE_KEY_ID"],
-              "min_supported": os.environ["CHUDWARE_RELEASE_MIN_SUPPORTED"],
-              "sha256": os.environ["ARTIFACT_SHA256"],
-              "size": artifact.stat().st_size,
-              "signature": (temp / "artifact.sig").read_text(encoding="ascii").strip(),
-              "stable_signature": (temp / "artifact-stable.sig").read_text(encoding="ascii").strip(),
-              "notes_url": os.environ["CHUDWARE_RELEASE_NOTES_URL"],
-              "commit_sha": os.environ["RELEASE_COMMIT"],
-          }
-          if os.environ.get("HAS_EVIDENCE") == "1":
-              directory = pathlib.Path(os.environ["EVIDENCE_DIR"])
-              evidence = {}
-              for field, name in (("sbom", "sbom.cdx.json"),
-                                  ("provenance", "provenance.slsa.json"),
-                                  ("platform_test", "platform-test.v1.json")):
-                  evidence[field + "_sha256"] = digest(directory / name)
-                  evidence[field + "_signature_sha256"] = digest(directory / (name + ".sig"))
-              body["evidence"] = evidence
-          pathlib.Path(os.environ["PUBLISH_BODY"]).write_text(json.dumps(body), encoding="ascii")
-          '@
-          [IO.File]::WriteAllText($builder, ($builderBody -replace "`r`n", "`n"), (New-Object Text.ASCIIEncoding))
-          & python $builder
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          $response = & curl.exe --config $env:GATEWAY_CURLRC --fail-with-body -sS `
-            --max-time 300 @retry -H 'Content-Type: application/json' `
-            --data-binary "@$body" "$base/api/releases/ci/publish"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::ci/publish rejected the Windows installer: $response"
-            exit 1
-          }
-          Write-Host ($response -join '')
-
-          & (Join-Path $env:RUNNER_TEMP 'ci_status.ps1') -Status 'published' -Detail "$name published to beta"
+          $namedFormats = (@('msi', 'default') | Where-Object { $publishedFormats -contains $_ }) -join ' '
+          $namedFailures = $failedFormats -join ' '
+          $detail = "Windows formats published: $namedFormats"
+          if ($namedFailures) { $detail += "; NOT published: $namedFailures" }
+          Write-Host $detail
+          & (Join-Path $env:RUNNER_TEMP 'ci_status.ps1') -Status 'published' `
+            -Detail $detail
           @(
             '## Windows beta published',
             '',
-            "* artifact: ``$name``",
+            "* formats: ``$namedFormats``",
+            $(if ($namedFailures) { "* formats NOT published: ``$namedFailures``" } else { "* formats NOT published: ``none``" }),
+            "* setup artifact: ``$($defaultName | Select-Object -Last 1)``",
+            "* MSI requested: ``$env:MSI_BUILT``",
             "* stable pair signed for: ``$env:RELEASE_STABLE_VERSION``",
-            "* evidence bundle: ``$env:HAS_EVIDENCE``"
+            "* setup evidence bundle: ``$env:HAS_EVIDENCE``",
+            "* MSI evidence bundle: ``$env:MSI_HAS_EVIDENCE``"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
       - name: Report failure to the gateway

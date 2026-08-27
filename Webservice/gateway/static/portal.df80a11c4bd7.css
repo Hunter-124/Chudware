@@ -1784,6 +1784,12 @@ td:first-child {
   justify-content: flex-end;
 }
 
+/* display:flex above beats the UA [hidden] rule — restore it for the
+   single-format case, where the chip row is hidden entirely. */
+.format-row[hidden] {
+  display: none;
+}
+
 .format-chip {
   min-height: 32px;
   padding: 6px 13px;

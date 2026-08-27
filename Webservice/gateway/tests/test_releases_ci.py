@@ -994,6 +994,54 @@ def test_a_format_round_trips_through_publish_latest_and_promote(
     assert stable_manifest.json()["format"] == fmt
 
 
+def test_windows_msi_round_trips_publish_latest_and_promote(
+    pg, ci: TestClient, admin: TestClient, ci_key
+) -> None:
+    published = _publish(
+        ci, ci_key, platform="windows", arch="x86_64", fmt="msi"
+    )
+    assert published.status_code == 200, published.text
+    assert published.json()["format"] == "msi"
+    assert published.json()["artifact_key"] == (
+        f"beta/{BETA}/Chudware-{BETA}-x86_64.msi"
+    )
+
+    manifest = ci.get(
+        "/api/releases/latest",
+        params={
+            "channel": "beta", "platform": "windows", "arch": "x86_64",
+            "format": "msi",
+        },
+    )
+    assert manifest.status_code == 200, manifest.text
+    assert manifest.json()["format"] == "msi"
+
+    promoted = admin.post(
+        "/api/admin/releases/promote",
+        json={
+            "channel": "beta", "version": BETA, "platform": "windows",
+            "arch": "x86_64", "format": "msi",
+        },
+    )
+    assert promoted.status_code == 200, promoted.text
+    assert promoted.json()["format"] == "msi"
+    assert promoted.json()["artifact_key"] == (
+        f"stable/{STABLE}/Chudware-{STABLE}-x86_64.msi"
+    )
+    assert promoted.json()["sha256"] == manifest.json()["sha256"]
+
+    stable = ci.get(
+        "/api/releases/latest",
+        params={
+            "channel": "stable", "platform": "windows", "arch": "x86_64",
+            "format": "msi",
+        },
+    )
+    assert stable.status_code == 200, stable.text
+    assert stable.json()["version"] == STABLE
+    assert stable.json()["format"] == "msi"
+
+
 def test_four_formats_of_one_version_coexist_and_latest_picks_the_right_one(
     pg, ci: TestClient, ci_key
 ) -> None:
@@ -1024,6 +1072,46 @@ def test_four_formats_of_one_version_coexist_and_latest_picks_the_right_one(
     assert len(set(digests.values())) == 4
 
 
+def test_0019_widens_populated_format_check_and_is_retry_safe(pg) -> None:
+    migration = (
+        Path(releases.__file__).parent
+        / "migrations"
+        / "0019_release_format_msi.sql"
+    ).read_text(encoding="utf-8")
+    with db.tx() as cur:
+        cur.execute(
+            "ALTER TABLE releases DROP CONSTRAINT IF EXISTS releases_format_check"
+        )
+        cur.execute(
+            "ALTER TABLE releases ADD CONSTRAINT releases_format_check "
+            "CHECK (format IN ('default', 'deb', 'rpm', 'tar'))"
+        )
+    _insert_stable("9.9.0", platform="windows")
+
+    # Operator retries against a populated pre-0019 schema are harmless.
+    with db.tx() as cur:
+        cur.execute(migration)
+        cur.execute(migration)
+    with db.tx() as cur:
+        cur.execute(
+            "UPDATE releases SET format='msi' "
+            "WHERE channel='stable' AND version='9.9.0' AND platform='windows'"
+        )
+        cur.execute(
+            "SELECT format FROM releases "
+            "WHERE channel='stable' AND version='9.9.0' AND platform='windows'"
+        )
+        assert cur.fetchone()["format"] == "msi"
+
+    with pytest.raises(Exception) as error:
+        with db.tx() as cur:
+            cur.execute(
+                "UPDATE releases SET format='junk' "
+                "WHERE channel='stable' AND version='9.9.0' AND platform='windows'"
+            )
+    assert "releases_format_check" in str(error.value)
+
+
 def test_latest_without_a_format_serves_the_appimage_beside_three_packages(
     pg, ci: TestClient, ci_key
 ) -> None:
@@ -1051,7 +1139,7 @@ def test_ci_publish_refuses_a_package_format_for_windows(
         | {"platform": "windows", "format": "deb"},
     )
     assert response.status_code == 422
-    assert "only the default format" in response.json()["detail"]
+    assert "only default and msi formats" in response.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

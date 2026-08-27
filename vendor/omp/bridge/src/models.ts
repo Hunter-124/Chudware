@@ -127,6 +127,12 @@ const LIVE_FAIL_TTL_MS = 30_000;
  *  `models: undefined` records a failure — a failed fetch is never cached as a success. */
 const liveCache = new Map<string, { expires: number; models?: LiveModel[] }>();
 
+/** Credential mutations must bypass a cached signed-out miss or live response immediately. */
+export function invalidateLiveModelCache(provider?: string): void {
+	if (provider) liveCache.delete(provider);
+	else liveCache.clear();
+}
+
 /** Narrow one `{type,id,display_name,created_at}` entry off the wire; unusable rows are dropped. */
 function readLiveModel(v: unknown): LiveModel | undefined {
 	if (!v || typeof v !== "object") return undefined;
@@ -213,14 +219,29 @@ async function liveModels(provider: string): Promise<LiveModel[] | undefined> {
 	}
 }
 
-/** Bundled + CAD-extra rows for one provider, keyed by id (insertion order = today's row order). */
-function bundledRows(provider: string): Map<string, Json> {
-	const rows = new Map<string, Json>();
+/**
+ * Bundled + CAD-extra rows for one provider, in catalog order.
+ *
+ * The bundled catalog and `catalog-extra.ts` are immutable for the life of this process. Building
+ * each display row walks and enriches the whole ~3.9k-model catalog, so retain those rows after
+ * their first construction. `handleModelsList` never mutates a cached row: live overlays clone the
+ * matching row, while bundled-only responses can safely share the objects with JSON.stringify.
+ * No invalidation is needed; a re-vendor or bridge-extra change starts a new bridge process.
+ */
+const bundledRowCache = new Map<string, readonly Json[]>();
+
+function bundledRows(provider: string): readonly Json[] {
+	const cached = bundledRowCache.get(provider);
+	if (cached) return cached;
+	const byId = new Map<string, Json>();
 	for (const m of getBundledModels(provider as ProviderId)) {
 		if (DEPRECATED_CATALOG[provider]?.[m.id] === true) continue;
-		rows.set(m.id, modelInfo(m));
+		byId.set(m.id, modelInfo(m));
 	}
-	for (const m of extraModels(provider)) rows.set(m.id, modelInfo(m));
+	for (const m of extraModels(provider)) byId.set(m.id, modelInfo(m));
+	const rows = Array.from(byId.values());
+	for (const row of rows) row.source = "bundled";
+	bundledRowCache.set(provider, rows);
 	return rows;
 }
 
@@ -247,29 +268,29 @@ export async function handleModelsList(params: Json): Promise<Json> {
 	for (const p of providers) {
 		const bundled = bundledRows(p);
 		const live = await liveModels(p);
-		if (live) {
-			anyLive = true;
-			for (const m of live) {
-				const known = bundled.get(m.id);
-				if (known) {
-					known.source = "live";
-					models.push(known);
-					bundled.delete(m.id);
-				} else {
-					try {
-						const row = liveOnlyRow(p, m);
-						row.source = "live";
-						models.push(row);
-					} catch {
-						// No bundled template for this provider at all — nothing truthful to report.
-					}
+		if (!live) {
+			models.push(...bundled);
+			continue;
+		}
+		anyLive = true;
+		const remaining = new Map<string, Json>();
+		for (const row of bundled) remaining.set(str(row.id), row);
+		for (const m of live) {
+			const known = remaining.get(m.id);
+			if (known) {
+				models.push({ ...known, source: "live" });
+				remaining.delete(m.id);
+			} else {
+				try {
+					const row = liveOnlyRow(p, m);
+					row.source = "live";
+					models.push(row);
+				} catch {
+					// No bundled template for this provider at all — nothing truthful to report.
 				}
 			}
 		}
-		for (const row of bundled.values()) {
-			row.source = "bundled";
-			models.push(row);
-		}
+		models.push(...remaining.values());
 	}
 	return { models, source: anyLive ? "live" : "bundled" };
 }

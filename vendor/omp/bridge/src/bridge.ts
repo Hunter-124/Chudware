@@ -64,7 +64,7 @@ import { handleSnapRender } from "./snap-render";
 import { handleCachePolicy } from "./cache";
 import { asObject, str, type Json } from "./json";
 import { handleMemoryRecall, handleMemoryRemember, handleMemoryStats } from "./memory";
-import { handleCostSummary, handleModelsList, modelInfo, resolveModel, type ProviderId } from "./models";
+import { handleCostSummary, handleModelsList, invalidateLiveModelCache, modelInfo, resolveModel, type ProviderId } from "./models";
 import { handleAuthBeginOAuth, handleAuthOAuthCancel, handleAuthOAuthManual, handleAuthOAuthPoll } from "./oauth-flow";
 import { handleSttCancel, handleSttStart, handleSttStatus, handleSttStop } from "./stt";
 
@@ -327,19 +327,47 @@ async function dispatch(method: string, params: Json, notify: Notify): Promise<J
 		case "auth_validate_key":
 			return handleAuthValidateKey(params);
 		case "auth_set_key":
-			return handleAuthSetKey(params);
+			try {
+				return await handleAuthSetKey(params);
+			} finally {
+				invalidateLiveModelCache(str(params.provider));
+			}
 		case "auth_remove_key":
-			return handleAuthRemoveKey(params);
+			try {
+				return await handleAuthRemoveKey(params);
+			} finally {
+				invalidateLiveModelCache(str(params.provider));
+			}
 		case "auth_logout":
-			return handleAuthLogout(params);
+			try {
+				return await handleAuthLogout(params);
+			} finally {
+				invalidateLiveModelCache(str(params.provider));
+			}
 		case "auth_begin_oauth":
-			return handleAuthBeginOAuth(params);
+			try {
+				return await handleAuthBeginOAuth(params);
+			} finally {
+				invalidateLiveModelCache(str(params.provider));
+			}
 		case "auth_oauth_poll":
-			return handleAuthOAuthPoll(params);
+			try {
+				return await handleAuthOAuthPoll(params);
+			} finally {
+				invalidateLiveModelCache();
+			}
 		case "auth_oauth_manual":
-			return handleAuthOAuthManual(params);
+			try {
+				return await handleAuthOAuthManual(params);
+			} finally {
+				invalidateLiveModelCache();
+			}
 		case "auth_oauth_cancel":
-			return handleAuthOAuthCancel(params);
+			try {
+				return await handleAuthOAuthCancel(params);
+			} finally {
+				invalidateLiveModelCache();
+			}
 		case "memory_remember":
 			return handleMemoryRemember(params);
 		case "memory_recall":

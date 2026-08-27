@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import sys
 import time
+import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -51,8 +52,10 @@ _REFUND_REASONS = {"duplicate", "fraudulent", "requested_by_customer"}
 
 
 class RefundBody(BaseModel):
-    payment_intent: str
+    payment_intent: str = ""
+    order_id: str = ""
     amount_cents: int | None = None
+    amount_credits: int | None = None
     reason: str
     confirm: str
 
@@ -821,21 +824,56 @@ async def connect(request: Request, cursor: str = "") -> dict[str, Any]:
 async def refund(request: Request, body: RefundBody) -> dict[str, Any]:
     user = require_admin(request)
     api_writes.enforce(user.email, "billing writes")
-    if body.confirm != body.payment_intent:
-        raise HTTPException(400, "confirm must exactly match payment_intent")
     payment_intent = body.payment_intent.strip()
-    if not payment_intent:
-        raise HTTPException(400, "payment_intent is required")
+    order_id = body.order_id.strip()
+    if bool(payment_intent) == bool(order_id):
+        raise HTTPException(
+            400, "provide exactly one of payment_intent or order_id"
+        )
+    target = order_id or payment_intent
+    if body.confirm != target:
+        raise HTTPException(
+            400, "confirm must exactly match the refund target"
+        )
+    if order_id:
+        try:
+            order_uuid = str(uuid.UUID(order_id))
+        except ValueError as exc:
+            raise HTTPException(400, "order_id must be a UUID") from exc
+    else:
+        order_uuid = ""
+    if (
+        body.amount_cents is not None
+        and body.amount_credits is not None
+    ):
+        raise HTTPException(
+            400, "provide only one refund amount"
+        )
     if body.amount_cents is not None and body.amount_cents <= 0:
         raise HTTPException(400, "amount_cents must be positive")
+    if body.amount_credits is not None and body.amount_credits <= 0:
+        raise HTTPException(400, "amount_credits must be positive")
     reason = body.reason.strip()
     if reason not in _REFUND_REASONS:
-        raise HTTPException(400, "reason must be duplicate, fraudulent, or requested_by_customer")
-    with db.tx() as cur:
-        cur.execute(
-            "SELECT id FROM mk_orders WHERE stripe_payment_intent = %s ORDER BY created_at DESC LIMIT 1",
-            (payment_intent,),
+        raise HTTPException(
+            400,
+            "reason must be duplicate, fraudulent, or requested_by_customer",
         )
+    with db.tx() as cur:
+        if order_id:
+            cur.execute(
+                "SELECT id FROM mk_orders WHERE id = %s",
+                (order_uuid,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id FROM mk_orders
+                WHERE stripe_payment_intent = %s
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (payment_intent,),
+            )
         order = cur.fetchone()
     if order is not None:
         try:
@@ -844,21 +882,46 @@ async def refund(request: Request, body: RefundBody) -> dict[str, Any]:
             except ImportError:
                 from marketplace_commerce import refund_order
         except ImportError as exc:
-            raise HTTPException(503, "marketplace commerce is unavailable") from exc
+            raise HTTPException(
+                503, "marketplace commerce is unavailable"
+            ) from exc
         return {
             "kind": "marketplace",
-            "refund": refund_order(str(order["id"]), user.email, body.amount_cents),
+            "refund": refund_order(
+                str(order["id"]),
+                user.email,
+                amount_cents=body.amount_cents,
+                amount_credits=body.amount_credits,
+                reason=reason,
+            ),
         }
+    if order_id:
+        raise HTTPException(404, "marketplace order not found")
+    if body.amount_credits is not None:
+        raise HTTPException(
+            400, "amount_credits requires a marketplace order_id"
+        )
+
     stripe, stripe_reason = _stripe_module()
     if stripe is None:
         raise HTTPException(503, stripe_reason)
-    key_material = f"{payment_intent}:{body.amount_cents or 'full'}:{reason}".encode("utf-8")
-    idempotency_key = "chud-admin-refund-" + hashlib.sha256(key_material).hexdigest()
-    params: dict[str, Any] = {"payment_intent": payment_intent, "reason": reason}
+    key_material = (
+        f"{payment_intent}:{body.amount_cents or 'full'}:{reason}"
+    ).encode("utf-8")
+    idempotency_key = (
+        "chud-admin-refund-" + hashlib.sha256(key_material).hexdigest()
+    )
+    params: dict[str, Any] = {
+        "payment_intent": payment_intent,
+        "reason": reason,
+    }
     if body.amount_cents is not None:
         params["amount"] = body.amount_cents
     result, stripe_error = _stripe_call(
-        "refund", lambda: stripe.Refund.create(**params, idempotency_key=idempotency_key)
+        "refund",
+        lambda: stripe.Refund.create(
+            **params, idempotency_key=idempotency_key
+        ),
     )
     if stripe_error:
         raise HTTPException(502, stripe_error)
@@ -869,6 +932,9 @@ async def refund(request: Request, body: RefundBody) -> dict[str, Any]:
             "status": str(_field(result, "status", "") or ""),
             "amount": int(_field(result, "amount", 0) or 0),
             "currency": str(_field(result, "currency", "") or ""),
-            "payment_intent": str(_field(result, "payment_intent", payment_intent) or payment_intent),
+            "payment_intent": str(
+                _field(result, "payment_intent", payment_intent)
+                or payment_intent
+            ),
         },
     }

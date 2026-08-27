@@ -1,10 +1,16 @@
-"""Marketplace orders, Stripe Connect settlement, and seller payouts."""
+"""Marketplace orders, Stripe Connect settlement, and seller payouts.
+
+Consumes these signed Stripe event types for marketplace resources:
+``checkout.session.completed``, ``checkout.session.async_payment_succeeded``,
+``checkout.session.async_payment_failed``, ``checkout.session.expired``,
+``payment_intent.payment_failed``, ``charge.refunded``, and
+``account.updated``.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
 from collections.abc import Mapping
 from datetime import date, datetime
@@ -658,6 +664,8 @@ def _order_payload(row: Mapping[str, Any]) -> dict[str, Any]:
         "fee_credits": int(row["fee_credits"]),
         "net_cents": int(row["net_cents"]),
         "net_credits": int(row["net_credits"]),
+        "refunded_cents": int(row["refunded_cents"]),
+        "refunded_credits": int(row["refunded_credits"]),
         "status": row["status"],
         "created_at": _iso(row["created_at"]),
         "paid_at": _iso(row["paid_at"]),
@@ -796,6 +804,10 @@ async def onboard_connect(request: Request) -> dict[str, str]:
                         "connect_changed",
                         "Connect account changed; retry",
                     )
+    # Account Links are single-use. A time bucket can return an already-consumed
+    # link to a later onboarding request, while a fresh attempt id still lets
+    # retries inside this request use one Stripe idempotency key.
+    link_attempt_id = uuid.uuid4()
     link = _v2_request(
         "account_links",
         {
@@ -809,10 +821,7 @@ async def onboard_connect(request: Request) -> dict[str, str]:
                 },
             },
         },
-        (
-            f"marketplace-connect-link-{account_id}-"
-            f"{int(time.time() // 300)}"
-        ),
+        f"marketplace-connect-link-{account_id}-{link_attempt_id}",
     )
     url = str(_field(link, "url", "") or "")
     if not url:
@@ -1325,13 +1334,171 @@ def deny_payout(
     )
 
 
+def _apply_refund_total(
+    cur: Any,
+    order: Mapping[str, Any],
+    *,
+    refunded_cents: int | None = None,
+    refunded_credits: int | None = None,
+    actor_email: str = "",
+    reason: str = "",
+) -> Mapping[str, Any]:
+    currency = str(order["currency"])
+    if currency == "usd":
+        total = int(order["amount_cents"])
+        previous = int(order["refunded_cents"])
+        target = previous if refunded_cents is None else int(refunded_cents)
+    elif currency == "credits":
+        total = int(order["amount_credits"])
+        previous = int(order["refunded_credits"])
+        target = previous if refunded_credits is None else int(refunded_credits)
+    else:
+        raise MarketplaceError(409, "not_refundable", "order currency is not refundable")
+
+    if target < previous:
+        return order
+    if target > total:
+        raise MarketplaceError(
+            400,
+            "refund_exceeds_remaining",
+            "refund exceeds the remaining refundable amount",
+        )
+    if target == previous:
+        return order
+
+    if currency == "credits":
+        buyer_email = str(order["buyer_email"]).strip().lower()
+        seller_email = str(order["seller_email"]).strip().lower()
+        cur.execute(
+            """
+            SELECT email, credit_balance FROM accounts
+            WHERE email = ANY(%s) ORDER BY email FOR UPDATE
+            """,
+            (sorted((buyer_email, seller_email)),),
+        )
+        balances = {
+            str(row["email"]): int(row["credit_balance"])
+            for row in cur.fetchall()
+        }
+        if buyer_email not in balances or seller_email not in balances:
+            raise MarketplaceError(
+                409, "account_unavailable", "an account is unavailable"
+            )
+
+        buyer_return = target - previous
+        net_credits = int(order["net_credits"])
+        seller_reversed_before = net_credits * previous // total
+        seller_reversed_after = net_credits * target // total
+        seller_debit = seller_reversed_after - seller_reversed_before
+        seller_balance = max(0, balances[seller_email])
+        seller_debit_applied = min(seller_debit, seller_balance)
+        seller_shortfall = seller_debit - seller_debit_applied
+        note = _ledger_note(
+            order_id=str(order["id"]),
+            listing_id=str(order["listing_id"]),
+            refund_credits=buyer_return,
+            refunded_credits=target,
+            reason=reason or "refund",
+            actor=actor_email,
+        )
+        # Reversals retain the original movement's semantic kind and invert its
+        # sign: the buyer gets a positive market_buy, never a market_earn.
+        cur.execute(
+            """
+            INSERT INTO credit_ledger (
+                id, email, kind, credits_delta, note
+            ) VALUES (%s, %s, 'market_buy', %s, %s)
+            """,
+            (_uuid(), buyer_email, buyer_return, note),
+        )
+        if seller_debit:
+            cur.execute(
+                """
+                INSERT INTO credit_ledger (
+                    id, email, kind, credits_delta, note
+                ) VALUES (%s, %s, 'market_earn', %s, %s)
+                """,
+                (_uuid(), seller_email, -seller_debit, note),
+            )
+        if seller_shortfall:
+            # Match record_spend: preserve the full economic reversal in the
+            # ledger, then absorb only the unavailable balance so it stays zero.
+            cur.execute(
+                """
+                INSERT INTO credit_ledger (
+                    id, email, kind, credits_delta, note
+                ) VALUES (%s, %s, 'adjust', %s, %s)
+                """,
+                (
+                    _uuid(),
+                    seller_email,
+                    seller_shortfall,
+                    _ledger_note(
+                        order_id=str(order["id"]),
+                        reason="absorbed_refund_shortfall",
+                        actor=actor_email,
+                    ),
+                ),
+            )
+        cur.execute(
+            """
+            UPDATE accounts SET credit_balance = credit_balance + %s
+            WHERE email = %s
+            """,
+            (buyer_return, buyer_email),
+        )
+        cur.execute(
+            """
+            UPDATE accounts SET credit_balance = credit_balance - %s
+            WHERE email = %s
+            """,
+            (seller_debit_applied, seller_email),
+        )
+
+    status = "refunded" if target == total else "paid"
+    new_refunded_cents = (
+        target if currency == "usd" else int(order["refunded_cents"])
+    )
+    new_refunded_credits = (
+        target if currency == "credits" else int(order["refunded_credits"])
+    )
+    cur.execute(
+        """
+        UPDATE mk_orders
+        SET refunded_cents = %s,
+            refunded_credits = %s,
+            status = %s,
+            refunded_at = COALESCE(refunded_at, now()),
+            failure_reason = ''
+        WHERE id = %s
+        RETURNING *
+        """,
+        (
+            new_refunded_cents,
+            new_refunded_credits,
+            status,
+            order["id"],
+        ),
+    )
+    updated = cur.fetchone()
+    if status == "refunded":
+        cur.execute(
+            "DELETE FROM mk_entitlements WHERE order_id = %s",
+            (order["id"],),
+        )
+    return updated
+
+
 def refund_order(
     order_id: str,
     actor_email: str,
     amount_cents: int | None = None,
+    *,
+    amount_credits: int | None = None,
+    reason: str = "requested_by_customer",
 ) -> dict[str, Any]:
     actor_email = actor_email.strip().lower()
-    stripe = _stripe()
+    reason = reason.strip()
     with tx() as cur:
         _require_admin_actor(cur, actor_email)
         cur.execute(
@@ -1343,32 +1510,72 @@ def refund_order(
             raise MarketplaceError(
                 404, "order_not_found", "order not found"
             )
-        if (
-            order["currency"] != "usd"
-            or not order["stripe_payment_intent"]
-        ):
-            raise MarketplaceError(
-                409,
-                "not_refundable",
-                "only settled cash orders are refundable",
-            )
         if order["status"] == "refunded":
+            if amount_cents is not None or amount_credits is not None:
+                raise MarketplaceError(
+                    400,
+                    "refund_exceeds_remaining",
+                    "the order has no refundable amount remaining",
+                )
             return _order_payload(order)
         if order["status"] != "paid":
             raise MarketplaceError(
                 409, "not_refundable", "order is not paid"
             )
-        full_amount = int(order["amount_cents"])
-        if amount_cents is not None:
-            amount_cents = int(amount_cents)
-            if amount_cents <= 0 or amount_cents > full_amount:
+
+        if order["currency"] == "credits":
+            if amount_cents is not None:
                 raise MarketplaceError(
                     400,
                     "invalid_refund",
-                    "refund amount is out of range",
+                    "amount_cents cannot refund a credits order",
                 )
+            full_amount = int(order["amount_credits"])
+            refunded_before = int(order["refunded_credits"])
+            remaining = full_amount - refunded_before
+            requested = remaining if amount_credits is None else int(amount_credits)
+            if requested <= 0 or requested > remaining:
+                raise MarketplaceError(
+                    400,
+                    "refund_exceeds_remaining",
+                    "refund amount is out of the remaining refundable range",
+                )
+            updated = _apply_refund_total(
+                cur,
+                order,
+                refunded_credits=refunded_before + requested,
+                actor_email=actor_email,
+                reason=reason,
+            )
+            return _order_payload(updated) | {
+                "refunded_amount_credits": requested
+            }
+
+        if (
+            order["currency"] != "usd"
+            or not order["stripe_payment_intent"]
+            or amount_credits is not None
+        ):
+            raise MarketplaceError(
+                409,
+                "not_refundable",
+                "only settled cash or credit orders are refundable",
+            )
+        full_amount = int(order["amount_cents"])
+        refunded_before = int(order["refunded_cents"])
+        remaining = full_amount - refunded_before
+        requested = remaining if amount_cents is None else int(amount_cents)
+        if requested <= 0 or requested > remaining:
+            raise MarketplaceError(
+                400,
+                "refund_exceeds_remaining",
+                "refund amount is out of the remaining refundable range",
+            )
+
+        stripe = _stripe()
         refund_kwargs: dict[str, Any] = {
             "payment_intent": order["stripe_payment_intent"],
+            "amount": requested,
             "reverse_transfer": True,
             "refund_application_fee": True,
             "metadata": {
@@ -1378,11 +1585,11 @@ def refund_order(
             },
             "idempotency_key": (
                 f"marketplace-refund-{order['id']}-"
-                f"{amount_cents or 'full'}"
+                f"to-{refunded_before + requested}"
             ),
         }
-        if amount_cents is not None:
-            refund_kwargs["amount"] = amount_cents
+        if reason:
+            refund_kwargs["reason"] = reason
         try:
             refund = stripe.Refund.create(**refund_kwargs)
         except Exception as exc:
@@ -1395,29 +1602,16 @@ def refund_order(
                 502, "stripe_error", "refund failed"
             ) from exc
         refund_id = _text_id(refund)
-        cur.execute(
-            """
-            UPDATE mk_orders
-            SET status = 'refunded',
-                refunded_at = now(),
-                failure_reason = ''
-            WHERE id = %s
-            RETURNING *
-            """,
-            (order_id,),
-        )
-        updated = cur.fetchone()
-        cur.execute(
-            "DELETE FROM mk_entitlements WHERE order_id = %s",
-            (order_id,),
+        updated = _apply_refund_total(
+            cur,
+            order,
+            refunded_cents=refunded_before + requested,
+            actor_email=actor_email,
+            reason=reason,
         )
     return _order_payload(updated) | {
         "stripe_refund_id": refund_id,
-        "refunded_amount_cents": (
-            amount_cents
-            if amount_cents is not None
-            else full_amount
-        ),
+        "refunded_amount_cents": requested,
     }
 
 
@@ -1474,9 +1668,43 @@ def _settle_checkout(
                 return
             if order["status"] != "pending":
                 return
+            if str(_field(obj, "payment_status", "") or "") != "paid":
+                log.info(
+                    "marketplace order %s is waiting on an async payment "
+                    "after Stripe event %s (payment_status=%s)",
+                    order["id"],
+                    event_id,
+                    _field(obj, "payment_status", ""),
+                )
+                return
+            try:
+                amount_total = int(_field(obj, "amount_total"))
+            except (TypeError, ValueError):
+                amount_total = -1
+            currency = str(_field(obj, "currency", "") or "")
+            if (
+                amount_total != int(order["amount_cents"])
+                or currency != "usd"
+            ):
+                log.error(
+                    "marketplace checkout event %s amount/currency mismatch "
+                    "for order %s: session=%s %s order=%s usd",
+                    event_id,
+                    order["id"],
+                    amount_total,
+                    currency,
+                    order["amount_cents"],
+                )
+                return
             payment_intent = _text_id(
                 _field(obj, "payment_intent")
             )
+            if not payment_intent:
+                log.error(
+                    "paid marketplace checkout event %s has no payment intent",
+                    event_id,
+                )
+                return
             cur.execute(
                 """
                 UPDATE mk_orders
@@ -1556,30 +1784,70 @@ def _fail_payment(
             )
 
 
-def _record_charge_refund(
-    obj: Any, metadata: Mapping[str, Any]
+def _fail_async_checkout(
+    event_id: str,
+    obj: Any,
+    metadata: Mapping[str, Any],
 ) -> None:
+    reason = "asynchronous payment failed"
     with tx() as cur:
         order = _event_order(cur, obj, metadata)
-        if (
-            order is None
-            or order["status"] not in ("paid", "refunded")
-        ):
+        if order is None:
+            log.error(
+                "marketplace async failure event %s has no matching order",
+                event_id,
+            )
             return
-        if order["status"] == "paid":
+        if order["status"] in ("pending", "paid"):
             cur.execute(
                 """
                 UPDATE mk_orders
-                SET status = 'refunded',
-                    refunded_at = now(),
-                    failure_reason = ''
+                SET status = 'failed',
+                    paid_at = NULL,
+                    stripe_event_id = NULL,
+                    failure_reason = %s
                 WHERE id = %s
                 """,
-                (order["id"],),
+                (reason, order["id"]),
             )
         cur.execute(
             "DELETE FROM mk_entitlements WHERE order_id = %s",
             (order["id"],),
+        )
+
+
+def _record_charge_refund(
+    obj: Any, metadata: Mapping[str, Any]
+) -> None:
+    try:
+        amount_refunded = int(_field(obj, "amount_refunded", 0) or 0)
+    except (TypeError, ValueError):
+        log.error("marketplace charge refund has invalid amount_refunded")
+        return
+    with tx() as cur:
+        order = _event_order(cur, obj, metadata)
+        if (
+            order is None
+            or order["currency"] != "usd"
+            or order["status"] not in ("paid", "refunded")
+        ):
+            return
+        refunded_before = int(order["refunded_cents"])
+        if amount_refunded <= refunded_before:
+            return
+        if amount_refunded > int(order["amount_cents"]):
+            log.error(
+                "marketplace charge refund exceeds order %s amount: %s > %s",
+                order["id"],
+                amount_refunded,
+                order["amount_cents"],
+            )
+            return
+        _apply_refund_total(
+            cur,
+            order,
+            refunded_cents=amount_refunded,
+            reason="stripe_webhook",
         )
 
 
@@ -1647,8 +1915,13 @@ def handle_marketplace_event(
     ):
         return False
     event_id = str(_field(event, "id", "") or "")
-    if event_type == "checkout.session.completed":
+    if event_type in (
+        "checkout.session.completed",
+        "checkout.session.async_payment_succeeded",
+    ):
         _settle_checkout(event_id, obj, metadata)
+    elif event_type == "checkout.session.async_payment_failed":
+        _fail_async_checkout(event_id, obj, metadata)
     elif event_type == "checkout.session.expired":
         _cancel_checkout(obj, metadata)
     elif event_type == "payment_intent.payment_failed":

@@ -49,9 +49,17 @@ MARKETPLACE_EVENTS = [
     # A buyer abandoned a marketplace checkout; the pending order must not sit
     # forever holding the one-purchase-per-buyer unique index.
     "checkout.session.expired",
+    # Delayed payment methods (ACH and friends) complete the SESSION while the
+    # payment is still unpaid. Settlement refuses to grant on an unpaid session,
+    # so without these two a legitimate delayed purchase would never be granted
+    # and a failed one would never be recorded. Omitting them turns the
+    # payment_status guard from a safety check into a silent black hole.
+    "checkout.session.async_payment_succeeded",
+    "checkout.session.async_payment_failed",
     # A destination charge that failed after the session completed.
     "payment_intent.payment_failed",
-    # A refund revokes the buyer's entitlement. Without this the money goes back
+    # A refund revokes the buyer's entitlement, and a PARTIAL refund adjusts the
+    # order's refunded totals without revoking. Without this the money goes back
     # and the download does not.
     "charge.refunded",
     # A seller's Connect account changed capability. The cached

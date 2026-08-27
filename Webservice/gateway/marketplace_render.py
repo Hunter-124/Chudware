@@ -8,12 +8,16 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
+import stat
 import struct
 import threading
+import time
 import uuid
+import zlib
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from fastapi import APIRouter, Request
 
@@ -31,7 +35,13 @@ router = APIRouter(prefix="/api/studio", tags=["marketplace-studio"])
 RENDER_BUDGET_SECONDS = 45.0
 RPC_TIMEOUT_SECONDS = 12.0
 CLOSE_RESERVE_SECONDS = 2.0
+# A 2048-square RGBA PNG is about 16 MiB uncompressed; twice that leaves ample
+# encoder overhead without allowing daemon output to monopolize the worker.
+MAX_RENDER_FILE_BYTES = 32 * 1024 * 1024
+MIN_RENDER_DIMENSION = 64
+MAX_RENDER_DIMENSION = 2048
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_DOC_ID_RE = re.compile(rb'"doc_id"\s*:\s*("(?:[^"\\]|\\.)*")')
 _DIMS_RE = re.compile(
     r"^\s*([0-9]+(?:\.[0-9]+)?)\s+X\s+"
     r"([0-9]+(?:\.[0-9]+)?)\s+X\s+"
@@ -138,31 +148,160 @@ def _rel_path(listing_root: Path, path: Path) -> str:
         raise _RenderFailure("unsafe_asset_path", "render path escapes listing storage") from exc
 
 
-def _png_dimensions(path: Path) -> tuple[int, int]:
+def _check_render_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _RenderFailure("render_budget_exceeded", "preview rendering exceeded its time budget")
+
+
+def _open_render_file(listing_root: Path, path: Path) -> tuple[BinaryIO, os.stat_result]:
     try:
-        with path.open("rb") as handle:
-            header = handle.read(24)
+        relative = path.relative_to(listing_root)
+    except ValueError as exc:
+        raise _RenderFailure("unsafe_asset_path", "render path escapes listing storage") from exc
+
+    current = listing_root
+    metadata: os.stat_result | None = None
+    try:
+        for part in relative.parts:
+            current = current / part
+            metadata = current.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise _RenderFailure("invalid_render_output", "symlinked engine output is refused")
     except OSError as exc:
         raise _RenderFailure("render_output_missing", "engine did not write the preview") from exc
-    if len(header) != 24 or header[:8] != _PNG_SIGNATURE or header[12:16] != b"IHDR":
+
+    if metadata is None or not stat.S_ISREG(metadata.st_mode):
+        raise _RenderFailure("invalid_render_output", "engine output is not a regular file")
+    if metadata.st_size > MAX_RENDER_FILE_BYTES:
+        raise _RenderFailure("render_output_too_large", "engine preview exceeds the render size limit")
+
+    resolved = _assert_contained(listing_root, path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(resolved, flags)
+    except OSError as exc:
+        raise _RenderFailure("render_output_missing", "engine preview could not be opened") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise _RenderFailure("invalid_render_output", "engine output is not a regular file")
+        if opened.st_size > MAX_RENDER_FILE_BYTES:
+            raise _RenderFailure("render_output_too_large", "engine preview exceeds the render size limit")
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise _RenderFailure("invalid_render_output", "engine output changed before it could be read")
+        return os.fdopen(fd, "rb"), opened
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_png_bytes(
+    handle: BinaryIO,
+    count: int,
+    *,
+    deadline: float | None,
+    digest: Any,
+) -> bytes:
+    _check_render_deadline(deadline)
+    try:
+        data = handle.read(count)
+    except OSError as exc:
+        raise _RenderFailure("render_output_missing", "engine preview could not be read") from exc
+    _check_render_deadline(deadline)
+    if len(data) != count:
+        raise _RenderFailure("invalid_png", "engine output contains a truncated PNG chunk")
+    digest.update(data)
+    return data
+
+
+def _inspect_png(
+    handle: BinaryIO,
+    file_size: int,
+    *,
+    deadline: float | None,
+) -> tuple[int, int, str]:
+    digest = hashlib.sha256()
+    signature = _read_png_bytes(handle, len(_PNG_SIGNATURE), deadline=deadline, digest=digest)
+    if signature != _PNG_SIGNATURE:
         raise _RenderFailure("invalid_png", "engine output is not a PNG")
-    width, height = struct.unpack(">II", header[16:24])
-    if width < 1 or height < 1:
-        raise _RenderFailure("invalid_png", "engine output has invalid PNG dimensions")
+
+    width = height = 0
+    seen_idat = False
+    chunk_index = 0
+    while handle.tell() < file_size:
+        header = _read_png_bytes(handle, 8, deadline=deadline, digest=digest)
+        chunk_length, chunk_type = struct.unpack(">I4s", header)
+        if chunk_length + 4 > file_size - handle.tell():
+            raise _RenderFailure("invalid_png", "engine output contains a truncated PNG chunk")
+        if chunk_index == 0:
+            if chunk_type != b"IHDR" or chunk_length != 13:
+                raise _RenderFailure("invalid_png", "engine output has an invalid IHDR chunk")
+        elif chunk_type == b"IHDR":
+            raise _RenderFailure("invalid_png", "engine output contains more than one IHDR chunk")
+
+        chunk_crc = zlib.crc32(chunk_type)
+        ihdr_data = bytearray() if chunk_index == 0 else None
+        remaining = chunk_length
+        while remaining:
+            data = _read_png_bytes(
+                handle,
+                min(1024 * 1024, remaining),
+                deadline=deadline,
+                digest=digest,
+            )
+            chunk_crc = zlib.crc32(data, chunk_crc)
+            if ihdr_data is not None:
+                ihdr_data.extend(data)
+            remaining -= len(data)
+        encoded_crc = _read_png_bytes(handle, 4, deadline=deadline, digest=digest)
+        if struct.unpack(">I", encoded_crc)[0] != chunk_crc & 0xFFFFFFFF:
+            raise _RenderFailure("invalid_png", "engine output has a corrupt PNG chunk")
+
+        if chunk_index == 0:
+            assert ihdr_data is not None
+            width, height = struct.unpack(">II", ihdr_data[:8])
+            if not (
+                MIN_RENDER_DIMENSION <= width <= MAX_RENDER_DIMENSION
+                and MIN_RENDER_DIMENSION <= height <= MAX_RENDER_DIMENSION
+            ):
+                raise _RenderFailure("invalid_png", "engine output has invalid PNG dimensions")
+        elif chunk_type == b"IDAT":
+            seen_idat = True
+        elif chunk_type == b"IEND":
+            if chunk_length != 0 or not seen_idat or handle.tell() != file_size:
+                raise _RenderFailure("invalid_png", "engine output has an invalid IEND chunk")
+            return width, height, digest.hexdigest()
+        chunk_index += 1
+
+    raise _RenderFailure("invalid_png", "engine output has no IEND chunk")
+
+
+def _png_dimensions(path: Path) -> tuple[int, int]:
+    unresolved = path.absolute()
+    listing_root = unresolved.parent.resolve()
+    candidate = listing_root / unresolved.name
+    handle, metadata = _open_render_file(listing_root, candidate)
+    with handle:
+        width, height, _ = _inspect_png(handle, metadata.st_size, deadline=None)
     return width, height
 
 
-def _file_record(listing_root: Path, path: Path, *, role: str, sort_order: int) -> dict:
-    width, height = _png_dimensions(path)
-    digest = hashlib.sha256()
-    size = 0
-    try:
-        with path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-                size += len(chunk)
-    except OSError as exc:
-        raise _RenderFailure("render_output_missing", "engine preview could not be read") from exc
+def _file_record(
+    listing_root: Path,
+    path: Path,
+    *,
+    role: str,
+    sort_order: int,
+    deadline: float | None = None,
+) -> dict:
+    _check_render_deadline(deadline)
+    handle, metadata = _open_render_file(listing_root, path)
+    with handle:
+        width, height, digest = _inspect_png(handle, metadata.st_size, deadline=deadline)
+        final_metadata = os.fstat(handle.fileno())
+    if final_metadata.st_size != metadata.st_size:
+        raise _RenderFailure("invalid_render_output", "engine output changed while it was read")
     return {
         "id": str(uuid.uuid4()),
         "path": path,
@@ -170,8 +309,8 @@ def _file_record(listing_root: Path, path: Path, *, role: str, sort_order: int) 
         "filename": path.name,
         "role": role,
         "sort_order": sort_order,
-        "bytes": size,
-        "sha256": digest.hexdigest(),
+        "bytes": metadata.st_size,
+        "sha256": digest,
         "width": width,
         "height": height,
     }
@@ -269,10 +408,46 @@ class _DaemonSession:
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
         self.doc_id = ""
+        self.open_attempted = False
+        self._open_method = ""
+        self._open_source = ""
+        self._open_uncertain_reason = ""
         self._request_id = 0
 
+    def begin_open(self, method: str, source_path: Path) -> None:
+        self.open_attempted = True
+        self._open_method = method
+        self._open_source = str(source_path)
+
+    def mark_open_uncertain(self, reason: str) -> None:
+        self._open_uncertain_reason = reason
+
+    def _remember_open_doc_id(self, raw: bytes, envelope: object = None) -> None:
+        if not self.open_attempted or self.doc_id:
+            return
+        candidates: list[object] = []
+        if isinstance(envelope, dict):
+            candidates.append(envelope.get("doc_id"))
+            for key in ("result", "error"):
+                nested = envelope.get(key)
+                if isinstance(nested, dict):
+                    candidates.append(nested.get("doc_id"))
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate and len(candidate) <= 1024:
+                self.doc_id = candidate
+                return
+        match = _DOC_ID_RE.search(raw)
+        if match is None:
+            return
+        try:
+            candidate = json.loads(match.group(1))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if isinstance(candidate, str) and candidate and len(candidate) <= 1024:
+            self.doc_id = candidate
+
     def _timeout(self, *, reserve_close: bool) -> float:
-        remaining = self.deadline - asyncio.get_running_loop().time()
+        remaining = self.deadline - time.monotonic()
         if reserve_close:
             remaining -= CLOSE_RESERVE_SECONDS
         if remaining <= 0:
@@ -295,6 +470,7 @@ class _DaemonSession:
         params: dict[str, Any],
         *,
         reserve_close: bool = True,
+        capture_partial: bool = False,
     ) -> dict:
         if self.reader is None or self.writer is None:
             raise _RenderFailure("engine_unavailable", "preview engine is unavailable")
@@ -307,23 +483,43 @@ class _DaemonSession:
             ).encode("utf-8")
             + b"\n"
         )
+        partial = bytearray()
         try:
             async with asyncio.timeout(self._timeout(reserve_close=reserve_close)):
                 self.writer.write(encoded)
                 await self.writer.drain()
-                raw = await self.reader.readline()
+                if capture_partial:
+                    while len(partial) <= settings.ws_max_message_bytes:
+                        byte = await self.reader.read(1)
+                        if not byte:
+                            break
+                        partial.extend(byte)
+                        if byte == b"\n":
+                            break
+                    if len(partial) > settings.ws_max_message_bytes:
+                        raise ValueError("preview engine reply exceeded its limit")
+                    raw = bytes(partial)
+                else:
+                    raw = await self.reader.readline()
         except asyncio.TimeoutError as exc:
+            self._remember_open_doc_id(bytes(partial))
             raise _RenderFailure("rpc_timeout", f"preview engine timed out during {method}") from exc
         except OSError as exc:
+            self._remember_open_doc_id(bytes(partial))
             raise _RenderFailure("engine_unavailable", "preview engine connection failed") from exc
         except ValueError as exc:
+            self._remember_open_doc_id(bytes(partial))
             raise _RenderFailure("malformed_reply", "preview engine reply exceeded its limit") from exc
-        if not raw or not raw.endswith(b"\n"):
+        if not raw:
             raise _RenderFailure("malformed_reply", "preview engine returned an incomplete reply")
         try:
             envelope = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._remember_open_doc_id(raw)
             raise _RenderFailure("malformed_reply", "preview engine returned invalid JSON") from exc
+        self._remember_open_doc_id(raw, envelope)
+        if not raw.endswith(b"\n"):
+            raise _RenderFailure("malformed_reply", "preview engine returned an incomplete reply")
         if not isinstance(envelope, dict) or envelope.get("id") != request_id:
             raise _RenderFailure("malformed_reply", "preview engine returned a mismatched reply")
         if "error" in envelope:
@@ -347,7 +543,7 @@ class _DaemonSession:
             return
         try:
             if self.doc_id:
-                remaining = self.deadline - asyncio.get_running_loop().time()
+                remaining = self.deadline - time.monotonic()
                 if remaining > 0:
                     try:
                         await self.call("doc_close", {"doc_id": self.doc_id}, reserve_close=False)
@@ -366,6 +562,14 @@ class _DaemonSession:
                         ).encode("utf-8")
                         + b"\n"
                     )
+            elif self.open_attempted and self._open_uncertain_reason:
+                log.warning(
+                    "marketplace render may have leaked a document after %s for %s: "
+                    "%s; no document id could be recovered",
+                    self._open_method,
+                    self._open_source,
+                    self._open_uncertain_reason,
+                )
         finally:
             writer.close()
             try:
@@ -376,20 +580,27 @@ class _DaemonSession:
 
 async def _open_document(session: _DaemonSession, source_path: Path, extension: str) -> dict:
     if extension == ".step+":
-        opened = await session.call("doc_open", {"path": str(source_path)})
+        method = "doc_open"
+        params = {"path": str(source_path)}
     else:
         # The C++ symbol is doc_import_file, but its verified daemon wire name is import_file.
-        opened = await session.call(
-            "import_file",
-            {
-                "path": str(source_path),
-                "into": "",
-                "as_solid": False,
-                "format": extension.lstrip("."),
-            },
-        )
+        method = "import_file"
+        params = {
+            "path": str(source_path),
+            "into": "",
+            "as_solid": False,
+            "format": extension.lstrip("."),
+        }
+    session.begin_open(method, source_path)
+    try:
+        opened = await session.call(method, params, capture_partial=True)
+    except _RenderFailure as exc:
+        if exc.reason in {"rpc_timeout", "malformed_reply", "engine_unavailable"}:
+            session.mark_open_uncertain(exc.reason)
+        raise
     doc_id = opened.get("doc_id")
     if not isinstance(doc_id, str) or not doc_id:
+        session.mark_open_uncertain("malformed_reply")
         raise _RenderFailure("malformed_reply", "preview engine did not return a document id")
     session.doc_id = doc_id
     return opened
@@ -421,7 +632,15 @@ async def _render_files(
             },
         )
         replies.append(reply)
-        records.append(_file_record(listing_root, path, role=role, sort_order=sort_order))
+        records.append(
+            _file_record(
+                listing_root,
+                path,
+                role=role,
+                sort_order=sort_order,
+                deadline=session.deadline,
+            )
+        )
 
     contact_path = _output_path(listing_root, run_id, "contact-sheet.png")
     contact_reply = await session.call(
@@ -433,11 +652,21 @@ async def _render_files(
         },
     )
     replies.append(contact_reply)
-    records.append(_file_record(listing_root, contact_path, role="gallery", sort_order=40))
+    records.append(
+        _file_record(
+            listing_root,
+            contact_path,
+            role="gallery",
+            sort_order=40,
+            deadline=session.deadline,
+        )
+    )
     return records, replies
 
 
 def _replace_assets(listing_id: str, records: list[dict], geometry: dict) -> None:
+    listing_root = _listing_root(listing_id)
+    new_paths = {record["path"].resolve() for record in records}
     old_rel_paths: list[str] = []
     with tx() as cur:
         cur.execute(
@@ -492,17 +721,18 @@ def _replace_assets(listing_id: str, records: list[dict], geometry: dict) -> Non
             tuple(params),
         )
 
-        listing_root = _listing_root(listing_id)
-        new_paths = {record["path"].resolve() for record in records}
-        for rel_path in old_rel_paths:
-            try:
-                old_path = _stored_asset_path(
-                    listing_id, listing_root, rel_path, must_exist=False
-                )
-                if old_path not in new_paths:
-                    old_path.unlink(missing_ok=True)
-            except (_RenderFailure, OSError):
-                log.warning("marketplace render refused or failed to unlink an old asset")
+    for rel_path in old_rel_paths:
+        try:
+            old_path = _stored_asset_path(
+                listing_id, listing_root, rel_path, must_exist=False
+            )
+            if old_path not in new_paths:
+                old_path.unlink(missing_ok=True)
+        except (_RenderFailure, OSError):
+            log.warning(
+                "marketplace render refused or failed to unlink old asset %s",
+                rel_path,
+            )
 
 
 def _load_primary_source(listing_id: str) -> dict | None:
@@ -527,8 +757,7 @@ def _load_primary_source(listing_id: str) -> dict | None:
 
 
 async def _render_once(listing_id: str) -> dict:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + RENDER_BUDGET_SECONDS
+    deadline = time.monotonic() + RENDER_BUDGET_SECONDS
     row = _load_primary_source(listing_id)
     if row is None:
         return _report(listing_id, ok=False, reason="listing_not_found", detail="listing not found")
@@ -618,15 +847,14 @@ class _RenderWorker:
 
     def _start(self) -> None:
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
-            self._ready.clear()
-            self._thread = threading.Thread(
-                target=self._run_loop,
-                name="marketplace-render",
-                daemon=True,
-            )
-            self._thread.start()
+            if self._thread is None or not self._thread.is_alive():
+                self._ready.clear()
+                self._thread = threading.Thread(
+                    target=self._run_loop,
+                    name="marketplace-render",
+                    daemon=True,
+                )
+                self._thread.start()
         if not self._ready.wait(timeout=2.0):
             raise RuntimeError("marketplace render worker did not start")
 

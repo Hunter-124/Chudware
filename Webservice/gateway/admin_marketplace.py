@@ -11,7 +11,16 @@ from fastapi.responses import FileResponse
 from db import tx
 from limits import api_writes
 from marketplace_authz import MarketplaceError, marketplace_enabled_or_404, require_admin
-from marketplace_schema import ATTESTATION_REVIEW_STATUSES, LISTING_STATUSES, clamp_limit, decode_cursor, encode_cursor, to_tsquery_text
+from marketplace_schema import (
+    ATTESTATION_REVIEW_STATUSES,
+    LISTING_STATUSES,
+    clamp_limit,
+    content_disposition,
+    decode_cursor,
+    encode_cursor,
+    safe_media_type,
+    to_tsquery_text,
+)
 
 router = APIRouter(prefix="/api/admin/marketplace", tags=["admin-marketplace"])
 log = logging.getLogger("chudware.gateway.admin_marketplace")
@@ -88,7 +97,7 @@ async def overview(request: Request) -> dict[str, Any]:
         listing_totals = {row["status"]: int(row["total"]) for row in cur.fetchall()}
         cur.execute("""SELECT count(*) AS total, count(*) FILTER (WHERE verified) AS verified, count(*) FILTER (WHERE publishing_blocked) AS blocked FROM mk_sellers""")
         seller_totals = cur.fetchone()
-        cur.execute("""SELECT currency, count(*) AS unit_sales, sum(amount_cents) AS gmv_cents, sum(amount_credits) AS gmv_credits, sum(fee_cents) AS fee_cents, sum(fee_credits) AS fee_credits FROM mk_orders WHERE status = 'paid' GROUP BY currency ORDER BY currency""")
+        cur.execute("""SELECT currency, count(*) AS unit_sales, sum(amount_cents - refunded_cents) AS gmv_cents, sum(amount_credits - refunded_credits) AS gmv_credits, sum(CASE WHEN amount_cents > 0 THEN floor(fee_cents::numeric * (amount_cents - refunded_cents) / amount_cents) ELSE 0 END) AS fee_cents, sum(CASE WHEN amount_credits > 0 THEN floor(fee_credits::numeric * (amount_credits - refunded_credits) / amount_credits) ELSE 0 END) AS fee_credits FROM mk_orders WHERE paid_at IS NOT NULL GROUP BY currency ORDER BY currency""")
         money = cur.fetchall()
     report_stat = _queue_stat(report_queue)
     report_stat["report_count"] = int(report_queue.get("report_count") or 0)
@@ -139,10 +148,24 @@ async def moderate_listing(listing_id: str, request: Request, body: dict[str, An
     note = _body_text(body, "note", required=action in ("reject", "remove"))
     should_render = False
     with tx() as cur:
-        cur.execute("SELECT id FROM mk_listings WHERE id = %s FOR UPDATE", (listing_id,))
-        if cur.fetchone() is None:
+        cur.execute(
+            "SELECT id, origin, attestation_status"
+            " FROM mk_listings WHERE id = %s FOR UPDATE",
+            (listing_id,),
+        )
+        listing = cur.fetchone()
+        if listing is None:
             raise MarketplaceError(404, "listing_not_found", "listing not found")
         if action in ("approve", "restore"):
+            if (
+                listing["origin"] == "human"
+                and listing["attestation_status"] != "verified"
+            ):
+                raise MarketplaceError(
+                    409,
+                    "attestation_not_verified",
+                    "decide and verify the human-made attestation before publishing",
+                )
             cur.execute("""UPDATE mk_listings SET status = 'published', published_at = now(), review_note = %s, reviewed_by = %s, updated_at = now() WHERE id = %s RETURNING *""", (note, admin.email, listing_id))
             should_render = action == "approve"
         elif action in ("reject", "remove"):
@@ -180,10 +203,11 @@ async def attestations(request: Request, status: str | None = None, cursor: str 
     predicate = " AND ".join(where) if where else "TRUE"
     params.append(page_limit + 1)
     with tx() as cur:
-        cur.execute(f"""SELECT at.id, at.listing_id, at.email, at.process_note, at.tools, at.hours, at.ai_tools_note, at.status, at.submitted_at, at.reviewed_at, at.reviewed_by, at.review_note, jsonb_build_object('id', l.id, 'slug', l.slug, 'title', l.title, 'summary', l.summary, 'origin', l.origin, 'attestation_status', l.attestation_status, 'status', l.status) AS listing, jsonb_build_object('email', s.email, 'handle', s.handle, 'display_name', s.display_name, 'verified', s.verified, 'publishing_blocked', s.publishing_blocked) AS seller, coalesce((SELECT jsonb_agg(jsonb_build_object('id', a.id, 'filename', a.filename, 'content_type', a.content_type, 'width', a.width, 'height', a.height, 'role', a.role) ORDER BY a.sort_order, a.created_at) FROM mk_assets a WHERE a.listing_id = l.id AND a.kind = 'evidence'), '[]'::jsonb) AS evidence_assets, coalesce((SELECT jsonb_agg(jsonb_build_object('id', r.id, 'filename', r.filename, 'content_type', r.content_type, 'width', r.width, 'height', r.height, 'role', r.role) ORDER BY r.sort_order, r.created_at) FROM mk_assets r WHERE r.listing_id = l.id AND r.kind IN ('render', 'image')), '[]'::jsonb) AS listing_previews FROM mk_attestations at JOIN mk_listings l ON l.id = at.listing_id JOIN mk_sellers s ON s.email = l.seller_email WHERE {predicate} ORDER BY at.submitted_at ASC, at.id ASC LIMIT %s""", tuple(params))
+        cur.execute(f"""SELECT at.id, at.listing_id, at.email, at.process_note, at.tools, at.hours, at.ai_tools_note, at.status, at.submitted_at, at.reviewed_at, at.reviewed_by, at.review_note, jsonb_build_object('id', l.id, 'slug', l.slug, 'title', l.title, 'summary', l.summary, 'origin', l.origin, 'attestation_status', l.attestation_status, 'status', l.status) AS listing, jsonb_build_object('email', s.email, 'handle', s.handle, 'display_name', s.display_name, 'verified', s.verified, 'publishing_blocked', s.publishing_blocked) AS seller, coalesce((SELECT jsonb_agg(jsonb_build_object('id', a.id, 'filename', a.filename, 'content_type', a.content_type, 'width', a.width, 'height', a.height, 'role', a.role) ORDER BY a.sort_order, a.created_at) FROM mk_assets a WHERE a.attestation_id = at.id AND a.listing_id = l.id AND a.kind = 'evidence'), '[]'::jsonb) AS evidence_assets, coalesce((SELECT jsonb_agg(jsonb_build_object('id', r.id, 'filename', r.filename, 'content_type', r.content_type, 'width', r.width, 'height', r.height, 'role', r.role) ORDER BY r.sort_order, r.created_at) FROM mk_assets r WHERE r.listing_id = l.id AND r.kind IN ('render', 'image')), '[]'::jsonb) AS listing_previews FROM mk_attestations at JOIN mk_listings l ON l.id = at.listing_id JOIN mk_sellers s ON s.email = l.seller_email WHERE {predicate} ORDER BY at.submitted_at ASC, at.id ASC LIMIT %s""", tuple(params))
         rows = cur.fetchall()
     for row in rows:
         for asset in row["evidence_assets"]:
+            asset["content_type"] = safe_media_type(asset["filename"])
             asset["url"] = (
                 f"/api/admin/marketplace/attestations/{row['id']}/evidence/{asset['id']}"
             )
@@ -200,11 +224,12 @@ async def attestation_evidence(
         cur.execute(
             """
             SELECT l.*, a.id AS evidence_asset_id, a.rel_path AS evidence_rel_path,
-                   a.kind AS evidence_kind, a.content_type AS evidence_content_type,
-                   a.filename AS evidence_filename, a.gated AS evidence_gated
+                   a.kind AS evidence_kind, a.filename AS evidence_filename,
+                   a.gated AS evidence_gated
             FROM mk_attestations at
             JOIN mk_listings l ON l.id = at.listing_id
-            JOIN mk_assets a ON a.listing_id = l.id
+            JOIN mk_assets a
+              ON a.attestation_id = at.id AND a.listing_id = l.id
             WHERE at.id = %s AND a.id = %s AND a.kind = 'evidence'
             """,
             (attestation_id, asset_id),
@@ -228,10 +253,17 @@ async def attestation_evidence(
         raise MarketplaceError(404, "evidence_not_found", "evidence not found") from exc
     if not path.is_file():
         raise MarketplaceError(404, "evidence_not_found", "evidence not found")
+    media_type = safe_media_type(row["evidence_filename"])
     return FileResponse(
         path,
-        media_type=row["evidence_content_type"],
-        headers={"Cache-Control": "no-store"},
+        media_type=media_type,
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": content_disposition(
+                row["evidence_filename"], "application/octet-stream"
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -255,8 +287,37 @@ async def decide_attestation(attestation_id: str, request: Request, body: dict[s
         cur.execute("""UPDATE mk_attestations SET status = %s, reviewed_at = now(), reviewed_by = %s, review_note = %s WHERE id = %s RETURNING *""", (decision, admin.email, note, attestation_id))
         updated = dict(cur.fetchone())
         # mk_listings_attestation_needs_human forbids carrying a stale decision after origin changes.
-        listing_status = decision if claim["origin"] == "human" and decision != "rejected" else "none"
-        cur.execute("""UPDATE mk_listings SET attestation_status = %s, review_note = %s, reviewed_by = %s, updated_at = now() WHERE id = %s RETURNING attestation_status""", (listing_status, note, admin.email, claim["listing_id"]))
+        listing_attestation_status = (
+            decision
+            if claim["origin"] == "human" and decision != "rejected"
+            else "none"
+        )
+        moved_to_review = (
+            claim["origin"] == "human"
+            and claim["status"] == "published"
+            and decision in ("rejected", "revoked")
+        )
+        cur.execute(
+            """
+            UPDATE mk_listings
+            SET attestation_status = %s,
+                status = CASE WHEN %s THEN 'in_review' ELSE status END,
+                published_at = CASE WHEN %s THEN NULL ELSE published_at END,
+                review_note = %s,
+                reviewed_by = %s,
+                updated_at = now()
+            WHERE id = %s
+            RETURNING attestation_status, status
+            """,
+            (
+                listing_attestation_status,
+                moved_to_review,
+                moved_to_review,
+                note,
+                admin.email,
+                claim["listing_id"],
+            ),
+        )
         listing = cur.fetchone()
         # Verifying provenance has to RELEASE the listing, not just relabel it.
         #
@@ -287,6 +348,8 @@ async def decide_attestation(attestation_id: str, request: Request, body: dict[s
                 released = cur.rowcount == 1
     updated["listing_attestation_status"] = listing["attestation_status"]
     updated["listing_published"] = released
+    updated["listing_status"] = listing["status"]
+    updated["listing_moved_to_review"] = moved_to_review
     if released:
         try:
             from marketplace_render import queue_render
@@ -431,7 +494,7 @@ async def revenue(request: Request, days: int = 90) -> dict[str, Any]:
     _admin(request)
     window = max(1, min(int(days), 365))
     with tx() as cur:
-        cur.execute("""WITH dates AS (SELECT generate_series(current_date - (%s::integer - 1), current_date, interval '1 day')::date AS day), orders_daily AS (SELECT paid_at::date AS day, coalesce(sum(amount_cents) FILTER (WHERE currency = 'usd'), 0) AS cash_gmv_cents, coalesce(sum(amount_credits) FILTER (WHERE currency = 'credits'), 0) AS credit_gmv, coalesce(sum(fee_cents), 0) AS fee_cents, coalesce(sum(fee_credits), 0) AS fee_credits, count(*) AS unit_sales FROM mk_orders WHERE status = 'paid' AND paid_at >= current_date - (%s::integer - 1) GROUP BY paid_at::date), listings_daily AS (SELECT created_at::date AS day, count(*) AS new_listings FROM mk_listings WHERE created_at >= current_date - (%s::integer - 1) GROUP BY created_at::date), sellers_daily AS (SELECT created_at::date AS day, count(*) AS new_sellers FROM mk_sellers WHERE created_at >= current_date - (%s::integer - 1) GROUP BY created_at::date) SELECT d.day, coalesce(o.cash_gmv_cents, 0) AS cash_gmv_cents, coalesce(o.credit_gmv, 0) AS credit_gmv, coalesce(o.fee_cents, 0) AS fee_cents, coalesce(o.fee_credits, 0) AS fee_credits, coalesce(o.unit_sales, 0) AS unit_sales, coalesce(l.new_listings, 0) AS new_listings, coalesce(s.new_sellers, 0) AS new_sellers FROM dates d LEFT JOIN orders_daily o ON o.day = d.day LEFT JOIN listings_daily l ON l.day = d.day LEFT JOIN sellers_daily s ON s.day = d.day ORDER BY d.day""", (window, window, window, window))
+        cur.execute("""WITH dates AS (SELECT generate_series(current_date - (%s::integer - 1), current_date, interval '1 day')::date AS day), orders_daily AS (SELECT paid_at::date AS day, coalesce(sum(amount_cents - refunded_cents) FILTER (WHERE currency = 'usd'), 0) AS cash_gmv_cents, coalesce(sum(amount_credits - refunded_credits) FILTER (WHERE currency = 'credits'), 0) AS credit_gmv, coalesce(sum(CASE WHEN amount_cents > 0 THEN floor(fee_cents::numeric * (amount_cents - refunded_cents) / amount_cents) ELSE 0 END), 0) AS fee_cents, coalesce(sum(CASE WHEN amount_credits > 0 THEN floor(fee_credits::numeric * (amount_credits - refunded_credits) / amount_credits) ELSE 0 END), 0) AS fee_credits, count(*) AS unit_sales FROM mk_orders WHERE paid_at IS NOT NULL AND paid_at >= current_date - (%s::integer - 1) GROUP BY paid_at::date), listings_daily AS (SELECT created_at::date AS day, count(*) AS new_listings FROM mk_listings WHERE created_at >= current_date - (%s::integer - 1) GROUP BY created_at::date), sellers_daily AS (SELECT created_at::date AS day, count(*) AS new_sellers FROM mk_sellers WHERE created_at >= current_date - (%s::integer - 1) GROUP BY created_at::date) SELECT d.day, coalesce(o.cash_gmv_cents, 0) AS cash_gmv_cents, coalesce(o.credit_gmv, 0) AS credit_gmv, coalesce(o.fee_cents, 0) AS fee_cents, coalesce(o.fee_credits, 0) AS fee_credits, coalesce(o.unit_sales, 0) AS unit_sales, coalesce(l.new_listings, 0) AS new_listings, coalesce(s.new_sellers, 0) AS new_sellers FROM dates d LEFT JOIN orders_daily o ON o.day = d.day LEFT JOIN listings_daily l ON l.day = d.day LEFT JOIN sellers_daily s ON s.day = d.day ORDER BY d.day""", (window, window, window, window))
         series = cur.fetchall()
     totals = {key: sum(int(row[key] or 0) for row in series) for key in ("cash_gmv_cents", "credit_gmv", "fee_cents", "fee_credits", "unit_sales", "new_listings", "new_sellers")}
     return {"days": window, "series": series, "totals": totals}

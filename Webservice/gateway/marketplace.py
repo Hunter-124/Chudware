@@ -1,13 +1,17 @@
 """Public marketplace, buyer library, and seller listing studio."""
 from __future__ import annotations
 
+from collections.abc import Iterator
 import hashlib
 import logging
-import mimetypes
+import math
+import re
 import shutil
 import uuid
 from pathlib import Path
 from typing import Any
+
+import psycopg
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -56,6 +60,8 @@ from marketplace_schema import (
     normalize_tags,
     slugify,
     to_tsquery_text,
+    content_disposition,
+    safe_media_type,
 )
 
 log = logging.getLogger("chudware.gateway.marketplace")
@@ -1194,10 +1200,15 @@ async def public_asset(request: Request, asset_id: str) -> FileResponse:
     target = asset_path(str(asset["listing_id"]), asset["rel_path"])
     if not target.is_file():
         raise HTTPException(status_code=404, detail="not found")
+    media_type = safe_media_type(asset["filename"])
     return FileResponse(
         str(target),
-        media_type=asset["content_type"],
-        headers={"Cache-Control": "public, max-age=3600"},
+        media_type=media_type,
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "Content-Disposition": content_disposition(asset["filename"], media_type),
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -1277,15 +1288,22 @@ async def write_review(
     marketplace_enabled_or_404()
     user = require_user(request)
     api_writes.enforce(user.email, "marketplace writes")
-    listing = _published_listing(listing_id)
     email = user.email.lower()
-    if email == listing["seller_email"].lower():
-        raise MarketplaceError(
-            400, "self_review", "sellers cannot review their own listings"
-        )
     rating = _int(body.get("rating"), "rating", 1, 5)
     review_body = _text(body.get("body", ""), "body", 4000)
     with tx() as cur:
+        cur.execute(
+            "SELECT id,seller_email,status FROM mk_listings"
+            " WHERE id::text=%s OR lower(slug)=lower(%s) FOR UPDATE",
+            (listing_id, listing_id),
+        )
+        listing = cur.fetchone()
+        if listing is None or listing["status"] != "published":
+            raise HTTPException(status_code=404, detail="not found")
+        if email == listing["seller_email"].lower():
+            raise MarketplaceError(
+                400, "self_review", "sellers cannot review their own listings"
+            )
         cur.execute(
             "SELECT EXISTS(SELECT 1 FROM mk_entitlements"
             " WHERE listing_id=%s AND email=%s) verified",
@@ -1359,8 +1377,9 @@ async def report_listing(
 @router.get("/download/{asset_id}")
 async def download_asset(request: Request, asset_id: str) -> FileResponse:
     marketplace_enabled_or_404()
-    user = require_user(request)
-    viewer = user.email.lower()
+    user = optional_user(request)
+    viewer = user.email.lower() if user else None
+    is_admin = bool(user and user.role == "admin")
     with tx() as cur:
         cur.execute(
             "SELECT a.*,l.status,l.seller_email,l.pricing_kind,l.open_source"
@@ -1373,27 +1392,32 @@ async def download_asset(request: Request, asset_id: str) -> FileResponse:
             raise HTTPException(status_code=404, detail="not found")
         listing = dict(asset)
         listing["id"] = asset["listing_id"]
-        if not _visible(listing, viewer, user.role == "admin") or not asset_visible(
-            asset, listing, viewer, user.role == "admin"
+        if not _visible(listing, viewer, is_admin) or not asset_visible(
+            asset, listing, viewer, is_admin
         ):
             raise HTTPException(status_code=404, detail="not found")
-        cur.execute(
-            "INSERT INTO mk_downloads(listing_id,email,day)"
-            " VALUES(%s,%s,CURRENT_DATE)"
-            " ON CONFLICT(listing_id,email,day) DO UPDATE"
-            " SET count=mk_downloads.count+1 RETURNING count",
-            (asset["listing_id"], viewer),
-        )
-        if int(cur.fetchone()["count"]) == 1:
-            bump_counter(str(asset["listing_id"]), "downloads", 1)
+        if viewer:
+            cur.execute(
+                "INSERT INTO mk_downloads(listing_id,email,day)"
+                " VALUES(%s,%s,CURRENT_DATE)"
+                " ON CONFLICT(listing_id,email,day) DO UPDATE"
+                " SET count=mk_downloads.count+1 RETURNING count",
+                (asset["listing_id"], viewer),
+            )
+            if int(cur.fetchone()["count"]) == 1:
+                bump_counter(str(asset["listing_id"]), "downloads", 1)
     target = asset_path(str(asset["listing_id"]), asset["rel_path"])
     if not target.is_file():
         raise HTTPException(status_code=404, detail="not found")
+    media_type = safe_media_type(asset["filename"])
     return FileResponse(
         str(target),
-        media_type=asset["content_type"],
-        filename=asset["filename"],
-        headers={"Cache-Control": "private, no-store"},
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": content_disposition(asset["filename"], media_type),
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -1475,22 +1499,29 @@ async def create_collection(
     api_writes.enforce(user.email, "marketplace writes")
     email = user.email.lower()
     name = _text(body.get("name"), "name", 80, 1)
-    with tx() as cur:
-        slug = _collection_slug(cur, email, name)
-        cur.execute(
-            "INSERT INTO mk_collections"
-            " (id,email,name,slug,blurb,is_public)"
-            " VALUES(%s,%s,%s,%s,%s,%s) RETURNING *",
-            (
-                str(uuid.uuid4()),
-                email,
-                name,
-                slug,
-                _text(body.get("blurb", ""), "blurb", 1000),
-                _bool(body.get("is_public")),
-            ),
-        )
-        row = cur.fetchone()
+    try:
+        with tx() as cur:
+            slug = _collection_slug(cur, email, name)
+            cur.execute(
+                "INSERT INTO mk_collections"
+                " (id,email,name,slug,blurb,is_public)"
+                " VALUES(%s,%s,%s,%s,%s,%s) RETURNING *",
+                (
+                    str(uuid.uuid4()),
+                    email,
+                    name,
+                    slug,
+                    _text(body.get("blurb", ""), "blurb", 1000),
+                    _bool(body.get("is_public")),
+                ),
+            )
+            row = cur.fetchone()
+    except psycopg.errors.UniqueViolation as exc:
+        if exc.diag.constraint_name != "mk_collections_slug_unique":
+            raise
+        raise MarketplaceError(
+            409, "collection_name_taken", "choose a different collection name"
+        ) from exc
     value = _collection_json(row)
     value["items"] = []
     return {"collection": value}
@@ -1504,33 +1535,40 @@ async def patch_collection(
     user = require_user(request)
     api_writes.enforce(user.email, "marketplace writes")
     email = user.email.lower()
-    with tx() as cur:
-        cur.execute(
-            "SELECT * FROM mk_collections"
-            " WHERE id::text=%s AND email=%s FOR UPDATE",
-            (collection_id, email),
-        )
-        current = cur.fetchone()
-        if current is None:
-            raise HTTPException(status_code=404, detail="not found")
-        name = _text(body.get("name", current["name"]), "name", 80, 1)
-        slug = (
-            _collection_slug(cur, email, name, str(current["id"]))
-            if name != current["name"]
-            else current["slug"]
-        )
-        cur.execute(
-            "UPDATE mk_collections SET name=%s,slug=%s,blurb=%s,is_public=%s"
-            " WHERE id=%s RETURNING *",
-            (
-                name,
-                slug,
-                _text(body.get("blurb", current["blurb"]), "blurb", 1000),
-                _bool(body.get("is_public"), bool(current["is_public"])),
-                current["id"],
-            ),
-        )
-        row = cur.fetchone()
+    try:
+        with tx() as cur:
+            cur.execute(
+                "SELECT * FROM mk_collections"
+                " WHERE id::text=%s AND email=%s FOR UPDATE",
+                (collection_id, email),
+            )
+            current = cur.fetchone()
+            if current is None:
+                raise HTTPException(status_code=404, detail="not found")
+            name = _text(body.get("name", current["name"]), "name", 80, 1)
+            slug = (
+                _collection_slug(cur, email, name, str(current["id"]))
+                if name != current["name"]
+                else current["slug"]
+            )
+            cur.execute(
+                "UPDATE mk_collections SET name=%s,slug=%s,blurb=%s,is_public=%s"
+                " WHERE id=%s RETURNING *",
+                (
+                    name,
+                    slug,
+                    _text(body.get("blurb", current["blurb"]), "blurb", 1000),
+                    _bool(body.get("is_public"), bool(current["is_public"])),
+                    current["id"],
+                ),
+            )
+            row = cur.fetchone()
+    except psycopg.errors.UniqueViolation as exc:
+        if exc.diag.constraint_name != "mk_collections_slug_unique":
+            raise
+        raise MarketplaceError(
+            409, "collection_name_taken", "choose a different collection name"
+        ) from exc
     return {"collection": _collection_json(row)}
 
 
@@ -1632,20 +1670,42 @@ async def marketplace_me(request: Request) -> dict[str, Any]:
 
 
 def _owned_listing(
-    listing_id: str, email: str, *, lock: bool = False
+    listing_id: str,
+    email: str,
+    *,
+    lock: bool = False,
+    cur: Any | None = None,
 ) -> dict[str, Any]:
+    if cur is None:
+        with tx() as owned_cur:
+            return _owned_listing(
+                listing_id, email, lock=lock, cur=owned_cur
+            )
     suffix = " FOR UPDATE OF l" if lock else ""
-    with tx() as cur:
-        cur.execute(
-            _listing_select()
-            + " WHERE l.id::text=%s AND l.seller_email=%s"
-            + suffix,
-            (listing_id, email.lower()),
-        )
-        row = cur.fetchone()
+    cur.execute(
+        _listing_select()
+        + " WHERE l.id::text=%s AND l.seller_email=%s"
+        + suffix,
+        (listing_id, email.lower()),
+    )
+    row = cur.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="not found")
     return dict(row)
+
+
+def _ensure_evidence_mutable(cur: Any, listing_id: object) -> None:
+    cur.execute(
+        "SELECT 1 FROM mk_attestations"
+        " WHERE listing_id=%s AND status<>'revoked' LIMIT 1",
+        (listing_id,),
+    )
+    if cur.fetchone():
+        raise MarketplaceError(
+            409,
+            "evidence_locked",
+            "evidence cannot change while an attestation is live",
+        )
 
 
 def _studio_asset(asset: Any) -> dict[str, Any]:
@@ -1790,40 +1850,51 @@ async def studio_create_seller(
             "use an unreserved 2-39 character seller handle",
         )
     email = user.email.lower()
-    with tx() as cur:
-        cur.execute("SELECT 1 FROM mk_sellers WHERE email=%s", (email,))
-        if cur.fetchone():
-            raise MarketplaceError(
-                409, "seller_exists", "seller account already exists"
+    try:
+        with tx() as cur:
+            cur.execute("SELECT 1 FROM mk_sellers WHERE email=%s", (email,))
+            if cur.fetchone():
+                raise MarketplaceError(
+                    409, "seller_exists", "seller account already exists"
+                )
+            cur.execute(
+                "SELECT 1 FROM mk_sellers WHERE lower(handle)=lower(%s)", (handle,)
             )
-        cur.execute(
-            "SELECT 1 FROM mk_sellers WHERE lower(handle)=lower(%s)", (handle,)
-        )
-        if cur.fetchone():
+            if cur.fetchone():
+                raise MarketplaceError(
+                    409, "handle_taken", "that seller handle is already in use"
+                )
+            org_id = _validate_org(cur, email, body.get("org_id"))
+            cur.execute(
+                "INSERT INTO mk_sellers"
+                " (email,handle,display_name,bio,website,country,org_id)"
+                " VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING *",
+                (
+                    email,
+                    handle,
+                    _text(
+                        body.get("display_name") or user.display,
+                        "display_name",
+                        120,
+                        1,
+                    ),
+                    _text(body.get("bio", ""), "bio", 8000),
+                    _text(body.get("website", ""), "website", 1000),
+                    _text(body.get("country", ""), "country", 100),
+                    org_id,
+                ),
+            )
+            seller = cur.fetchone()
+    except psycopg.errors.UniqueViolation as exc:
+        if exc.diag.constraint_name == "mk_sellers_handle_unique":
             raise MarketplaceError(
                 409, "handle_taken", "that seller handle is already in use"
-            )
-        org_id = _validate_org(cur, email, body.get("org_id"))
-        cur.execute(
-            "INSERT INTO mk_sellers"
-            " (email,handle,display_name,bio,website,country,org_id)"
-            " VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING *",
-            (
-                email,
-                handle,
-                _text(
-                    body.get("display_name") or user.display,
-                    "display_name",
-                    120,
-                    1,
-                ),
-                _text(body.get("bio", ""), "bio", 8000),
-                _text(body.get("website", ""), "website", 1000),
-                _text(body.get("country", ""), "country", 100),
-                org_id,
-            ),
-        )
-        seller = cur.fetchone()
+            ) from exc
+        if exc.diag.constraint_name == "mk_sellers_pkey":
+            raise MarketplaceError(
+                409, "seller_exists", "seller account already exists"
+            ) from exc
+        raise
     return {"seller": _seller_json(seller)}
 
 
@@ -1835,61 +1906,69 @@ async def studio_patch_seller(
     user, _ = _seller_for(request)
     api_writes.enforce(user.email, "marketplace writes")
     email = user.email.lower()
-    with tx() as cur:
-        cur.execute(
-            "SELECT * FROM mk_sellers WHERE email=%s FOR UPDATE", (email,)
-        )
-        current = cur.fetchone()
-        handle = str(body.get("handle", current["handle"])).strip().lower()
-        if handle != current["handle"]:
+    try:
+        with tx() as cur:
             cur.execute(
-                "SELECT 1 FROM mk_listings WHERE seller_email=%s LIMIT 1", (email,)
+                "SELECT * FROM mk_sellers WHERE email=%s FOR UPDATE", (email,)
             )
-            if cur.fetchone():
-                raise MarketplaceError(
-                    409,
-                    "handle_immutable",
-                    "the handle cannot change after a listing exists",
+            current = cur.fetchone()
+            handle = str(body.get("handle", current["handle"])).strip().lower()
+            if handle != current["handle"]:
+                cur.execute(
+                    "SELECT 1 FROM mk_listings WHERE seller_email=%s LIMIT 1",
+                    (email,),
                 )
-            if handleify(handle) != handle or handle in _RESERVED_HANDLES:
-                raise MarketplaceError(
-                    400, "invalid_handle", "use a valid seller handle"
+                if cur.fetchone():
+                    raise MarketplaceError(
+                        409,
+                        "handle_immutable",
+                        "the handle cannot change after a listing exists",
+                    )
+                if handleify(handle) != handle or handle in _RESERVED_HANDLES:
+                    raise MarketplaceError(
+                        400, "invalid_handle", "use a valid seller handle"
+                    )
+                cur.execute(
+                    "SELECT 1 FROM mk_sellers"
+                    " WHERE lower(handle)=lower(%s) AND email<>%s",
+                    (handle, email),
                 )
+                if cur.fetchone():
+                    raise MarketplaceError(
+                        409, "handle_taken", "that seller handle is already in use"
+                    )
+            org_id = _validate_org(
+                cur, email, body.get("org_id", current["org_id"])
+            )
             cur.execute(
-                "SELECT 1 FROM mk_sellers"
-                " WHERE lower(handle)=lower(%s) AND email<>%s",
-                (handle, email),
+                "UPDATE mk_sellers SET handle=%s,display_name=%s,bio=%s,"
+                " website=%s,country=%s,org_id=%s WHERE email=%s RETURNING *",
+                (
+                    handle,
+                    _text(
+                        body.get("display_name", current["display_name"]),
+                        "display_name",
+                        120,
+                        1,
+                    ),
+                    _text(body.get("bio", current["bio"]), "bio", 8000),
+                    _text(
+                        body.get("website", current["website"]), "website", 1000
+                    ),
+                    _text(
+                        body.get("country", current["country"]), "country", 100
+                    ),
+                    org_id,
+                    email,
+                ),
             )
-            if cur.fetchone():
-                raise MarketplaceError(
-                    409, "handle_taken", "that seller handle is already in use"
-                )
-        org_id = _validate_org(
-            cur, email, body.get("org_id", current["org_id"])
-        )
-        cur.execute(
-            "UPDATE mk_sellers SET handle=%s,display_name=%s,bio=%s,"
-            " website=%s,country=%s,org_id=%s WHERE email=%s RETURNING *",
-            (
-                handle,
-                _text(
-                    body.get("display_name", current["display_name"]),
-                    "display_name",
-                    120,
-                    1,
-                ),
-                _text(body.get("bio", current["bio"]), "bio", 8000),
-                _text(
-                    body.get("website", current["website"]), "website", 1000
-                ),
-                _text(
-                    body.get("country", current["country"]), "country", 100
-                ),
-                org_id,
-                email,
-            ),
-        )
-        updated = cur.fetchone()
+            updated = cur.fetchone()
+    except psycopg.errors.UniqueViolation as exc:
+        if exc.diag.constraint_name != "mk_sellers_handle_unique":
+            raise
+        raise MarketplaceError(
+            409, "handle_taken", "that seller handle is already in use"
+        ) from exc
     return {"seller": _seller_json(updated)}
 
 
@@ -1933,20 +2012,13 @@ def _merged_listing_payload(row: Any, body: dict[str, Any]) -> dict[str, Any]:
     return {key: body[key] if key in body else row.get(key) for key in keys}
 
 
-def _unique_listing_slug(cur: Any, title: str, listing_id: str) -> str:
+def _listing_slug_candidates(title: str, listing_id: str) -> Iterator[str]:
     base = slugify(title) or f"model-{listing_id[:8]}"
-    candidate = base
+    yield base
     for number in range(2, 1000):
-        cur.execute(
-            "SELECT 1 FROM mk_listings"
-            " WHERE lower(slug)=lower(%s) AND id<>%s",
-            (candidate, listing_id),
-        )
-        if cur.fetchone() is None:
-            return candidate
         suffix = f"-{number}"
-        candidate = base[: 79 - len(suffix)].rstrip("-") + suffix
-    return f"{base[:68].rstrip('-')}-{listing_id[:8]}"
+        yield base[: 79 - len(suffix)].rstrip("-") + suffix
+    yield f"model-{listing_id}"
 
 
 @studio_router.get("/listings")
@@ -2002,25 +2074,34 @@ async def studio_create_listing(
     api_writes.enforce(user.email, "marketplace writes")
     data = normalize_listing_input(body)
     listing_id = str(uuid.uuid4())
-    with tx() as cur:
-        slug = _unique_listing_slug(cur, data["title"], listing_id)
-        cur.execute(
-            "INSERT INTO mk_listings"
-            " (id,slug,seller_email,title,summary,description,category_id,"
-            " license_id,status,pricing_kind,price_cents,price_credits,"
-            " tips_enabled,origin,origin_note,attestation_status,open_source,"
-            " forked_from,source_id,source_url,source_author,tags,units)"
-            " VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'draft',%s,%s,%s,%s,%s,%s,"
-            " 'none',%s,%s,%s,%s,%s,%s,%s)",
-            (
-                listing_id, slug, user.email.lower(), data["title"],
-                data["summary"], data["description"], data["category_id"],
-                data["license_id"], data["pricing_kind"], data["price_cents"],
-                data["price_credits"], data["tips_enabled"], data["origin"],
-                data["origin_note"], data["open_source"], data["forked_from"],
-                data["source_id"], data["source_url"], data["source_author"],
-                data["tags"], data["units"],
-            ),
+    for slug in _listing_slug_candidates(data["title"], listing_id):
+        try:
+            with tx() as cur:
+                cur.execute(
+                    "INSERT INTO mk_listings"
+                    " (id,slug,seller_email,title,summary,description,category_id,"
+                    " license_id,status,pricing_kind,price_cents,price_credits,"
+                    " tips_enabled,origin,origin_note,attestation_status,open_source,"
+                    " forked_from,source_id,source_url,source_author,tags,units)"
+                    " VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'draft',%s,%s,%s,%s,%s,%s,"
+                    " 'none',%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        listing_id, slug, user.email.lower(), data["title"],
+                        data["summary"], data["description"], data["category_id"],
+                        data["license_id"], data["pricing_kind"], data["price_cents"],
+                        data["price_credits"], data["tips_enabled"], data["origin"],
+                        data["origin_note"], data["open_source"], data["forked_from"],
+                        data["source_id"], data["source_url"], data["source_author"],
+                        data["tags"], data["units"],
+                    ),
+                )
+            break
+        except psycopg.errors.UniqueViolation as exc:
+            if exc.diag.constraint_name != "mk_listings_slug_unique":
+                raise
+    else:
+        raise MarketplaceError(
+            409, "listing_slug_taken", "could not allocate a unique listing slug"
         )
     return {
         "listing": _studio_listing(
@@ -2047,56 +2128,80 @@ async def studio_patch_listing(
     marketplace_enabled_or_404()
     user, _ = _seller_for(request)
     api_writes.enforce(user.email, "marketplace writes")
-    current = _owned_listing(listing_id, user.email, lock=True)
-    if current["status"] in {"in_review", "removed"}:
-        raise MarketplaceError(
-            409,
-            "listing_locked",
-            "this listing cannot be edited in its current state",
-        )
-    data = normalize_listing_input(_merged_listing_payload(current, body))
-    if current["status"] == "published":
-        if (
-            current["pricing_kind"] == "free"
-            and data["pricing_kind"] != "free"
-        ):
-            raise MarketplaceError(
-                409,
-                "resubmit_required",
-                "unlist and submit again before converting a free listing to paid",
-            )
-        if current["origin"] != "human" and data["origin"] == "human":
-            raise MarketplaceError(
-                409,
-                "resubmit_required",
-                "unlist, attest, and submit again before claiming human-made origin",
-            )
     with tx() as cur:
-        slug = (
-            _unique_listing_slug(cur, data["title"], str(current["id"]))
-            if data["title"] != current["title"]
-            else current["slug"]
+        current = _owned_listing(
+            listing_id, user.email, lock=True, cur=cur
         )
+        if current["status"] in {"in_review", "removed"}:
+            raise MarketplaceError(
+                409,
+                "listing_locked",
+                "this listing cannot be edited in its current state",
+            )
+        data = normalize_listing_input(_merged_listing_payload(current, body))
+        if data["forked_from"] == str(current["id"]):
+            raise MarketplaceError(
+                400, "invalid_fork", "a listing cannot be forked from itself"
+            )
+        if current["status"] == "published":
+            if (
+                current["pricing_kind"] == "free"
+                and data["pricing_kind"] != "free"
+            ):
+                raise MarketplaceError(
+                    409,
+                    "resubmit_required",
+                    "unlist and submit again before converting a free listing to paid",
+                )
+            if current["origin"] != "human" and data["origin"] == "human":
+                raise MarketplaceError(
+                    409,
+                    "resubmit_required",
+                    "unlist, attest, and submit again before claiming human-made origin",
+                )
         attestation_status = (
             current["attestation_status"] if data["origin"] == "human" else "none"
         )
-        cur.execute(
-            "UPDATE mk_listings SET slug=%s,title=%s,summary=%s,"
-            " description=%s,category_id=%s,license_id=%s,pricing_kind=%s,"
-            " price_cents=%s,price_credits=%s,tips_enabled=%s,origin=%s,"
-            " origin_note=%s,attestation_status=%s,open_source=%s,"
-            " forked_from=%s,source_id=%s,source_url=%s,source_author=%s,"
-            " tags=%s,units=%s,updated_at=now() WHERE id=%s",
-            (
-                slug, data["title"], data["summary"], data["description"],
-                data["category_id"], data["license_id"], data["pricing_kind"],
-                data["price_cents"], data["price_credits"],
-                data["tips_enabled"], data["origin"], data["origin_note"],
-                attestation_status, data["open_source"], data["forked_from"],
-                data["source_id"], data["source_url"], data["source_author"],
-                data["tags"], data["units"], current["id"],
-            ),
-        )
+        slugs: Iterator[str]
+        if data["title"] != current["title"]:
+            slugs = _listing_slug_candidates(data["title"], str(current["id"]))
+        else:
+            slugs = iter((current["slug"],))
+        for slug in slugs:
+            try:
+                with cur.connection.transaction():
+                    cur.execute(
+                        "UPDATE mk_listings SET slug=%s,title=%s,summary=%s,"
+                        " description=%s,category_id=%s,license_id=%s,pricing_kind=%s,"
+                        " price_cents=%s,price_credits=%s,tips_enabled=%s,origin=%s,"
+                        " origin_note=%s,attestation_status=%s,open_source=%s,"
+                        " forked_from=%s,source_id=%s,source_url=%s,source_author=%s,"
+                        " tags=%s,units=%s,updated_at=now() WHERE id=%s",
+                        (
+                            slug, data["title"], data["summary"], data["description"],
+                            data["category_id"], data["license_id"],
+                            data["pricing_kind"], data["price_cents"],
+                            data["price_credits"], data["tips_enabled"],
+                            data["origin"], data["origin_note"], attestation_status,
+                            data["open_source"], data["forked_from"], data["source_id"],
+                            data["source_url"], data["source_author"], data["tags"],
+                            data["units"], current["id"],
+                        ),
+                    )
+                break
+            except psycopg.errors.UniqueViolation as exc:
+                if exc.diag.constraint_name != "mk_listings_slug_unique":
+                    raise
+            except psycopg.errors.CheckViolation as exc:
+                if exc.diag.constraint_name != "mk_listings_no_self_fork":
+                    raise
+                raise MarketplaceError(
+                    400, "invalid_fork", "a listing cannot be forked from itself"
+                ) from exc
+        else:
+            raise MarketplaceError(
+                409, "listing_slug_taken", "could not allocate a unique listing slug"
+            )
     return {
         "listing": _studio_listing(_owned_listing(listing_id, user.email))
     }
@@ -2109,12 +2214,14 @@ async def studio_delete_listing(
     marketplace_enabled_or_404()
     user, _ = _seller_for(request)
     api_writes.enforce(user.email, "marketplace writes")
-    listing = _owned_listing(listing_id, user.email, lock=True)
-    if listing["status"] != "draft":
-        raise MarketplaceError(
-            409, "draft_only", "only draft listings can be deleted"
-        )
     with tx() as cur:
+        listing = _owned_listing(
+            listing_id, user.email, lock=True, cur=cur
+        )
+        if listing["status"] != "draft":
+            raise MarketplaceError(
+                409, "draft_only", "only draft listings can be deleted"
+            )
         cur.execute("DELETE FROM mk_listings WHERE id=%s", (listing["id"],))
     root = settings.listing_asset_root(str(listing["id"]))
     try:
@@ -2138,6 +2245,41 @@ def _allowed_extensions(kind: str) -> tuple[str, ...]:
     return ()
 
 
+def _normalized_filename(raw: object) -> str:
+    filename = Path(str(raw or "").replace("\\", "/")).name
+    if any(ord(char) < 32 or ord(char) == 127 for char in filename):
+        raise MarketplaceError(
+            400, "invalid_filename", "file names cannot contain control characters"
+        )
+    filename = re.sub(r"\.{2,}", ".", filename)
+    if not filename or filename.startswith("."):
+        raise MarketplaceError(
+            400, "unsupported_format", "choose a named file"
+        )
+    try:
+        encoded = filename.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise MarketplaceError(
+            400, "invalid_filename", "file name is not valid UTF-8"
+        ) from exc
+    if len(encoded) > 255:
+        raise MarketplaceError(
+            400, "invalid_filename", "file name is too long"
+        )
+    return filename
+
+
+def _cleanup_upload(target: Path) -> None:
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
+        log.warning("could not remove failed upload %s", target, exc_info=True)
+    try:
+        target.parent.rmdir()
+    except OSError:
+        pass
+
+
 @studio_router.post("/listings/{listing_id}/assets")
 async def studio_upload_asset(
     request: Request,
@@ -2152,7 +2294,6 @@ async def studio_upload_asset(
     user, _ = _seller_for(request)
     api_writes.enforce(user.email, "marketplace writes")
     uploads.enforce(user.email, "marketplace asset uploads")
-    listing = _owned_listing(listing_id, user.email)
     kind = kind.strip().lower()
     role = role.strip().lower()
     if kind not in ASSET_KINDS or kind == "render":
@@ -2161,11 +2302,7 @@ async def studio_upload_asset(
         )
     if role not in ASSET_ROLES:
         raise MarketplaceError(400, "invalid_role", "unknown asset role")
-    filename = Path(file.filename or "").name
-    if not filename or filename.startswith("."):
-        raise MarketplaceError(
-            400, "unsupported_format", "choose a named file"
-        )
+    filename = _normalized_filename(file.filename)
     lower_name = filename.lower()
     extension = next(
         (value for value in _allowed_extensions(kind) if lower_name.endswith(value)),
@@ -2178,35 +2315,46 @@ async def studio_upload_asset(
             "the file extension does not match its asset kind",
         )
     version = _uuid(version_id, "version_id") if version_id else None
-    if version:
-        with tx() as cur:
-            cur.execute(
-                "SELECT 1 FROM mk_versions WHERE id=%s AND listing_id=%s",
-                (version, listing["id"]),
-            )
-            if cur.fetchone() is None:
-                raise MarketplaceError(
-                    400,
-                    "invalid_version",
-                    "version does not belong to this listing",
-                )
     asset_id = str(uuid.uuid4())
     rel_path = f"uploads/{asset_id}/{filename}"
-    target = asset_path(str(listing["id"]), rel_path)
-    target.parent.mkdir(parents=True, exist_ok=False)
-    digest = hashlib.sha256()
-    size = 0
+    actual_gated = (
+        True if kind in ALWAYS_GATED_KINDS
+        else False if kind in ALWAYS_UNGATED_KINDS
+        else bool(gated)
+    )
+    content_type = safe_media_type(filename)
+    target: Path | None = None
     try:
-        with target.open("xb") as output:
-            while chunk := await file.read(1 << 20):
-                size += len(chunk)
-                if size > settings.marketplace_max_asset_bytes:
-                    raise MarketplaceError(
-                        413, "asset_too_large", "asset exceeds the upload limit"
-                    )
-                digest.update(chunk)
-                output.write(chunk)
         with tx() as cur:
+            listing = _owned_listing(
+                listing_id, user.email, lock=True, cur=cur
+            )
+            if kind == "evidence":
+                _ensure_evidence_mutable(cur, listing["id"])
+            if version:
+                cur.execute(
+                    "SELECT 1 FROM mk_versions WHERE id=%s AND listing_id=%s",
+                    (version, listing["id"]),
+                )
+                if cur.fetchone() is None:
+                    raise MarketplaceError(
+                        400,
+                        "invalid_version",
+                        "version does not belong to this listing",
+                    )
+            target = asset_path(str(listing["id"]), rel_path)
+            target.parent.mkdir(parents=True, exist_ok=False)
+            digest = hashlib.sha256()
+            size = 0
+            with target.open("xb") as output:
+                while chunk := await file.read(1 << 20):
+                    size += len(chunk)
+                    if size > settings.marketplace_max_asset_bytes:
+                        raise MarketplaceError(
+                            413, "asset_too_large", "asset exceeds the upload limit"
+                        )
+                    digest.update(chunk)
+                    output.write(chunk)
             cur.execute(
                 "SELECT email FROM mk_sellers WHERE email=%s FOR UPDATE",
                 (user.email.lower(),),
@@ -2223,38 +2371,6 @@ async def studio_upload_asset(
                 )
             sha256 = digest.hexdigest()
             cur.execute(
-                "SELECT 1 FROM mk_assets WHERE listing_id=%s AND sha256=%s",
-                (listing["id"], sha256),
-            )
-            if cur.fetchone():
-                raise MarketplaceError(
-                    409,
-                    "duplicate_asset",
-                    "this listing already contains the same file",
-                )
-            if role == "thumbnail":
-                cur.execute(
-                    "SELECT 1 FROM mk_assets"
-                    " WHERE listing_id=%s AND role='thumbnail'",
-                    (listing["id"],),
-                )
-                if cur.fetchone():
-                    raise MarketplaceError(
-                        409,
-                        "thumbnail_exists",
-                        "this listing already has a thumbnail",
-                    )
-            actual_gated = (
-                True if kind in ALWAYS_GATED_KINDS
-                else False if kind in ALWAYS_UNGATED_KINDS
-                else bool(gated)
-            )
-            content_type = (
-                file.content_type
-                or mimetypes.guess_type(filename)[0]
-                or "application/octet-stream"
-            )
-            cur.execute(
                 "INSERT INTO mk_assets"
                 " (id,listing_id,version_id,kind,role,filename,rel_path,"
                 " content_type,format,bytes,sha256,gated)"
@@ -2266,12 +2382,33 @@ async def studio_upload_asset(
                 ),
             )
             asset = cur.fetchone()
+    except psycopg.errors.UniqueViolation as exc:
+        if target is not None:
+            _cleanup_upload(target)
+        if exc.diag.constraint_name == "mk_assets_sha_unique":
+            raise MarketplaceError(
+                409,
+                "duplicate_asset",
+                "this listing already contains the same file",
+            ) from exc
+        if exc.diag.constraint_name == "mk_assets_one_thumbnail":
+            raise MarketplaceError(
+                409,
+                "thumbnail_exists",
+                "this listing already has a thumbnail",
+            ) from exc
+        raise
+    except psycopg.errors.CheckViolation as exc:
+        if target is not None:
+            _cleanup_upload(target)
+        if exc.diag.constraint_name == "mk_assets_rel_path_relative":
+            raise MarketplaceError(
+                400, "invalid_filename", "file name cannot be stored safely"
+            ) from exc
+        raise
     except BaseException:
-        target.unlink(missing_ok=True)
-        try:
-            target.parent.rmdir()
-        except OSError:
-            pass
+        if target is not None:
+            _cleanup_upload(target)
         raise
     return {"asset": _studio_asset(asset)}
 
@@ -2283,18 +2420,26 @@ async def studio_delete_asset(
     marketplace_enabled_or_404()
     user, _ = _seller_for(request)
     api_writes.enforce(user.email, "marketplace writes")
-    listing = _owned_listing(listing_id, user.email)
     with tx() as cur:
+        listing = _owned_listing(
+            listing_id, user.email, lock=True, cur=cur
+        )
         cur.execute(
-            "DELETE FROM mk_assets WHERE id::text=%s AND listing_id=%s"
-            " RETURNING *",
+            "SELECT * FROM mk_assets WHERE id::text=%s AND listing_id=%s"
+            " FOR UPDATE",
             (asset_id, listing["id"]),
         )
         asset = cur.fetchone()
         if asset is None:
             raise HTTPException(status_code=404, detail="not found")
+        if asset["kind"] == "evidence":
+            _ensure_evidence_mutable(cur, listing["id"])
+        cur.execute("DELETE FROM mk_assets WHERE id=%s", (asset["id"],))
     target = asset_path(str(listing["id"]), asset["rel_path"])
-    target.unlink(missing_ok=True)
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
+        log.warning("could not remove asset file %s", target, exc_info=True)
     try:
         target.parent.rmdir()
     except OSError:
@@ -2312,35 +2457,48 @@ async def studio_patch_asset(
     marketplace_enabled_or_404()
     user, _ = _seller_for(request)
     api_writes.enforce(user.email, "marketplace writes")
-    listing = _owned_listing(listing_id, user.email)
-    with tx() as cur:
-        cur.execute(
-            "SELECT * FROM mk_assets WHERE id::text=%s AND listing_id=%s"
-            " FOR UPDATE",
-            (asset_id, listing["id"]),
-        )
-        asset = cur.fetchone()
-        if asset is None:
-            raise HTTPException(status_code=404, detail="not found")
-        role = str(body.get("role", asset["role"])).strip().lower()
-        if role not in ASSET_ROLES:
-            raise MarketplaceError(400, "invalid_role", "unknown asset role")
-        sort_order = _int(
-            body.get("sort_order", asset["sort_order"]),
-            "sort_order",
-            maximum=1_000_000,
-        )
-        gated = _bool(body.get("gated"), bool(asset["gated"]))
-        if asset["kind"] in ALWAYS_GATED_KINDS:
-            gated = True
-        elif asset["kind"] in ALWAYS_UNGATED_KINDS:
-            gated = False
-        cur.execute(
-            "UPDATE mk_assets SET role=%s,sort_order=%s,gated=%s"
-            " WHERE id=%s RETURNING *",
-            (role, sort_order, gated, asset["id"]),
-        )
-        updated = cur.fetchone()
+    try:
+        with tx() as cur:
+            listing = _owned_listing(
+                listing_id, user.email, lock=True, cur=cur
+            )
+            cur.execute(
+                "SELECT * FROM mk_assets WHERE id::text=%s AND listing_id=%s"
+                " FOR UPDATE",
+                (asset_id, listing["id"]),
+            )
+            asset = cur.fetchone()
+            if asset is None:
+                raise HTTPException(status_code=404, detail="not found")
+            if asset["kind"] == "evidence":
+                _ensure_evidence_mutable(cur, listing["id"])
+            role = str(body.get("role", asset["role"])).strip().lower()
+            if role not in ASSET_ROLES:
+                raise MarketplaceError(400, "invalid_role", "unknown asset role")
+            sort_order = _int(
+                body.get("sort_order", asset["sort_order"]),
+                "sort_order",
+                maximum=1_000_000,
+            )
+            gated = _bool(body.get("gated"), bool(asset["gated"]))
+            if asset["kind"] in ALWAYS_GATED_KINDS:
+                gated = True
+            elif asset["kind"] in ALWAYS_UNGATED_KINDS:
+                gated = False
+            cur.execute(
+                "UPDATE mk_assets SET role=%s,sort_order=%s,gated=%s"
+                " WHERE id=%s RETURNING *",
+                (role, sort_order, gated, asset["id"]),
+            )
+            updated = cur.fetchone()
+    except psycopg.errors.UniqueViolation as exc:
+        if exc.diag.constraint_name != "mk_assets_one_thumbnail":
+            raise
+        raise MarketplaceError(
+            409,
+            "thumbnail_exists",
+            "this listing already has a thumbnail",
+        ) from exc
     return {"asset": _studio_asset(updated)}
 
 
@@ -2394,12 +2552,14 @@ async def studio_submit_listing(
     marketplace_enabled_or_404()
     user, _ = _seller_for(request)
     api_writes.enforce(user.email, "marketplace writes")
-    listing = _owned_listing(listing_id, user.email, lock=True)
-    if listing["status"] not in {"draft", "rejected", "unlisted"}:
-        raise MarketplaceError(
-            409, "invalid_status", "this listing cannot be submitted"
-        )
     with tx() as cur:
+        listing = _owned_listing(
+            listing_id, user.email, lock=True, cur=cur
+        )
+        if listing["status"] not in {"draft", "rejected", "unlisted"}:
+            raise MarketplaceError(
+                409, "invalid_status", "this listing cannot be submitted"
+            )
         cur.execute(
             "SELECT sellable FROM mk_licenses WHERE id=%s",
             (listing["license_id"],),
@@ -2436,8 +2596,10 @@ async def studio_submit_listing(
         cur.execute(
             "UPDATE mk_listings SET status=%s,"
             " published_at=CASE WHEN %s='published' THEN now() ELSE NULL END,"
+            " attestation_status=CASE WHEN %s THEN 'verified'"
+            " ELSE attestation_status END,"
             " updated_at=now(),review_note='' WHERE id=%s",
-            (new_status, new_status, listing["id"]),
+            (new_status, new_status, verified_attestation, listing["id"]),
         )
     if publish:
         try:
@@ -2461,12 +2623,14 @@ async def studio_unlist_listing(
     marketplace_enabled_or_404()
     user, _ = _seller_for(request)
     api_writes.enforce(user.email, "marketplace writes")
-    listing = _owned_listing(listing_id, user.email, lock=True)
-    if listing["status"] not in {"published", "in_review"}:
-        raise MarketplaceError(
-            409, "invalid_status", "this listing is not live or under review"
-        )
     with tx() as cur:
+        listing = _owned_listing(
+            listing_id, user.email, lock=True, cur=cur
+        )
+        if listing["status"] not in {"published", "in_review"}:
+            raise MarketplaceError(
+                409, "invalid_status", "this listing is not live or under review"
+            )
         cur.execute(
             "UPDATE mk_listings SET status='unlisted',published_at=NULL,"
             " updated_at=now() WHERE id=%s",
@@ -2484,44 +2648,50 @@ async def studio_submit_attestation(
     marketplace_enabled_or_404()
     user, _ = _seller_for(request)
     api_writes.enforce(user.email, "marketplace writes")
-    listing = _owned_listing(listing_id, user.email, lock=True)
-    if listing["origin"] != "human":
-        raise MarketplaceError(
-            400,
-            "attestation_not_applicable",
-            "attestations are only for human-made listings",
-        )
-    process_note = _text(
-        body.get("process_note"),
-        "process_note",
-        ATTESTATION_NOTE_MAX,
-        ATTESTATION_NOTE_MIN,
-    )
-    tools_raw = body.get("tools", [])
-    if not isinstance(tools_raw, list):
-        raise MarketplaceError(400, "invalid_input", "tools must be a list")
-    tools: list[str] = []
-    for raw_tool in tools_raw[:64]:
-        tool = _text(raw_tool, "tool", 120, 1)
-        if tool not in tools:
-            tools.append(tool)
-    hours_raw = body.get("hours")
-    hours = None
-    if hours_raw not in (None, ""):
-        try:
-            hours = float(hours_raw)
-        except (TypeError, ValueError) as exc:
-            raise MarketplaceError(
-                400, "invalid_input", "hours must be a positive number"
-            ) from exc
-        if hours <= 0 or hours > 99999.99:
-            raise MarketplaceError(
-                400, "invalid_input", "hours must be a positive number"
-            )
-    ai_tools_note = _text(
-        body.get("ai_tools_note", ""), "ai_tools_note", 8000
-    )
     with tx() as cur:
+        listing = _owned_listing(
+            listing_id, user.email, lock=True, cur=cur
+        )
+        if listing["origin"] != "human":
+            raise MarketplaceError(
+                400,
+                "attestation_not_applicable",
+                "attestations are only for human-made listings",
+            )
+        process_note = _text(
+            body.get("process_note"),
+            "process_note",
+            ATTESTATION_NOTE_MAX,
+            ATTESTATION_NOTE_MIN,
+        )
+        tools_raw = body.get("tools", [])
+        if not isinstance(tools_raw, list):
+            raise MarketplaceError(400, "invalid_input", "tools must be a list")
+        tools: list[str] = []
+        for raw_tool in tools_raw[:64]:
+            tool = _text(raw_tool, "tool", 120, 1)
+            if tool not in tools:
+                tools.append(tool)
+        hours_raw = body.get("hours")
+        hours = None
+        if hours_raw not in (None, ""):
+            try:
+                hours = float(hours_raw)
+            except (TypeError, ValueError) as exc:
+                raise MarketplaceError(
+                    400, "invalid_input", "hours must be a positive number"
+                ) from exc
+            if (
+                not math.isfinite(hours)
+                or hours <= 0
+                or hours > 99999.99
+            ):
+                raise MarketplaceError(
+                    400, "invalid_input", "hours must be a positive number"
+                )
+        ai_tools_note = _text(
+            body.get("ai_tools_note", ""), "ai_tools_note", 8000
+        )
         cur.execute(
             "SELECT id FROM mk_attestations"
             " WHERE listing_id=%s AND status<>'revoked' FOR UPDATE",
@@ -2549,6 +2719,11 @@ async def studio_submit_attestation(
                 ),
             )
         attestation = cur.fetchone()
+        cur.execute(
+            "UPDATE mk_assets SET attestation_id=%s"
+            " WHERE listing_id=%s AND kind='evidence' AND attestation_id IS NULL",
+            (attestation["id"], listing["id"]),
+        )
         cur.execute(
             "UPDATE mk_listings SET attestation_status='pending',"
             " updated_at=now() WHERE id=%s",

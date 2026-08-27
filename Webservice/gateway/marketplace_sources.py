@@ -8,7 +8,6 @@ import hashlib
 import hmac
 import ipaddress
 import json
-import mimetypes
 import os
 import re
 import secrets
@@ -39,7 +38,13 @@ from marketplace_authz import (
     require_seller,
     require_user,
 )
-from marketplace_schema import IMAGE_EXTENSIONS, SOURCE_EXTENSIONS, normalize_tags, slugify
+from marketplace_schema import (
+    IMAGE_EXTENSIONS,
+    SOURCE_EXTENSIONS,
+    normalize_tags,
+    safe_media_type,
+    slugify,
+)
 from provider_keys import _key_bytes
 
 router = APIRouter(prefix="/api/studio", tags=["marketplace-sources"])
@@ -49,6 +54,7 @@ _HTML_LIMIT = 2 * 1024 * 1024
 _JSON_LIMIT = 2 * 1024 * 1024
 _REDIRECT_LIMIT = 4
 _TIMEOUT = httpx.Timeout(12.0, connect=5.0, read=8.0, write=8.0, pool=5.0)
+_TOTAL_FETCH_SECONDS = 12.0
 _SOURCE_ACCOUNT_VERSION = 1
 _NONCE_BYTES = 12
 _ONSHAPE_STATE_TTL = 10 * 60
@@ -83,6 +89,13 @@ class Adapter:
     credential_setting: str | None
     match: MatchFn
     fetch: FetchFn
+
+
+@dataclass(frozen=True)
+class _PinnedUrl:
+    url: str
+    connect_url: str
+    host: str
 
 
 class _MetadataParser(HTMLParser):
@@ -226,75 +239,247 @@ def _json_ld_fields(parser: _MetadataParser) -> dict[str, Any]:
     }
 
 
-async def _validated_url(url: str, expected_domains: tuple[str, ...]) -> str:
+async def _pin_url(
+    url: str, expected_domains: tuple[str, ...]
+) -> _PinnedUrl:
     try:
         parts = urlsplit(url)
         port = parts.port
     except ValueError as exc:
-        raise MarketplaceError(400, "invalid_source_url", "the source URL is malformed") from exc
-    if parts.scheme.lower() != "https" or not parts.hostname or parts.username or parts.password:
-        raise MarketplaceError(400, "invalid_source_url", "source URLs must use public HTTPS hosts")
+        raise MarketplaceError(
+            400, "invalid_source_url", "the source URL is malformed"
+        ) from exc
+    if (
+        parts.scheme.lower() != "https"
+        or not parts.hostname
+        or parts.username
+        or parts.password
+    ):
+        raise MarketplaceError(
+            400,
+            "invalid_source_url",
+            "source URLs must use public HTTPS hosts",
+        )
     if port not in (None, 443):
-        raise MarketplaceError(400, "invalid_source_url", "source URLs must use the standard HTTPS port")
+        raise MarketplaceError(
+            400,
+            "invalid_source_url",
+            "source URLs must use the standard HTTPS port",
+        )
     try:
         host = parts.hostname.encode("idna").decode("ascii").lower().rstrip(".")
     except UnicodeError as exc:
-        raise MarketplaceError(400, "invalid_source_url", "the source host is invalid") from exc
-    if expected_domains and not any(host == suffix or host.endswith("." + suffix) for suffix in expected_domains):
-        raise MarketplaceError(400, "invalid_source_url", "the URL does not belong to that source")
+        raise MarketplaceError(
+            400, "invalid_source_url", "the source host is invalid"
+        ) from exc
+    if expected_domains and not any(
+        host == suffix or host.endswith("." + suffix)
+        for suffix in expected_domains
+    ):
+        raise MarketplaceError(
+            400,
+            "invalid_source_url",
+            "the URL does not belong to that source",
+        )
     try:
-        infos = await asyncio.get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host,
+            443,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
     except socket.gaierror as exc:
-        raise MarketplaceError(400, "invalid_source_url", "the source host could not be resolved") from exc
+        raise MarketplaceError(
+            400,
+            "invalid_source_url",
+            "the source host could not be resolved",
+        ) from exc
     if not infos:
-        raise MarketplaceError(400, "invalid_source_url", "the source host could not be resolved")
+        raise MarketplaceError(
+            400,
+            "invalid_source_url",
+            "the source host could not be resolved",
+        )
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
     for info in infos:
         address = ipaddress.ip_address(info[4][0].split("%", 1)[0])
-        if not address.is_global or address.is_loopback or address.is_link_local or address.is_private or address.is_reserved or address.is_multicast or address.is_unspecified:
-            raise MarketplaceError(400, "invalid_source_url", "the source host resolves to a non-public address")
-    return urlunsplit(("https", host, parts.path or "/", parts.query, ""))
+        if (
+            not address.is_global
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_private
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            raise MarketplaceError(
+                400,
+                "invalid_source_url",
+                "the source host resolves to a non-public address",
+            )
+        if address not in addresses:
+            addresses.append(address)
+    normalized = urlunsplit(
+        ("https", host, parts.path or "/", parts.query, "")
+    )
+    address = addresses[0]
+    connect_host = (
+        f"[{address.compressed}]"
+        if isinstance(address, ipaddress.IPv6Address)
+        else address.compressed
+    )
+    connect_url = urlunsplit(
+        ("https", connect_host, parts.path or "/", parts.query, "")
+    )
+    return _PinnedUrl(normalized, connect_url, host)
+
+
+async def _validated_url(url: str, expected_domains: tuple[str, ...]) -> str:
+    try:
+        async with asyncio.timeout(_TOTAL_FETCH_SECONDS):
+            return (await _pin_url(url, expected_domains)).url
+    except TimeoutError as exc:
+        raise MarketplaceError(
+            400,
+            "invalid_source_url",
+            "the source host could not be resolved in time",
+        ) from exc
+
+
+def _pinned_request(
+    client: httpx.AsyncClient,
+    method: str,
+    pinned: _PinnedUrl,
+    headers: dict[str, str],
+    content: bytes | str | None,
+) -> httpx.Request:
+    hop_headers = {
+        name: value for name, value in headers.items() if name.lower() != "host"
+    }
+    hop_headers["Host"] = pinned.host
+    request = client.build_request(
+        method,
+        pinned.connect_url,
+        headers=hop_headers,
+        content=content,
+    )
+    # httpcore 1.x consumes this extension when starting TLS, so certificate
+    # verification remains bound to the source hostname rather than its IP.
+    request.extensions["sni_hostname"] = pinned.host
+    return request
 
 
 async def _read_response(
-    method: str, url: str, *, expected_domains: tuple[str, ...], headers: dict[str, str] | None = None,
-    content: bytes | str | None = None, max_bytes: int, acceptable: tuple[int, ...] = (200,),
+    method: str,
+    url: str,
+    *,
+    expected_domains: tuple[str, ...],
+    headers: dict[str, str] | None = None,
+    content: bytes | str | None = None,
+    max_bytes: int,
+    acceptable: tuple[int, ...] = (200,),
 ) -> tuple[bytes, str, httpx.Headers]:
-    request_headers = {"User-Agent": _USER_AGENT, "Accept": "*/*", **(headers or {})}
+    request_headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": "*/*",
+        **(headers or {}),
+    }
     current = url
-    async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False) as client:
-        for redirect_count in range(_REDIRECT_LIMIT + 1):
-            current = await _validated_url(current, expected_domains)
-            try:
-                response = await client.send(client.build_request(method, current, headers=request_headers, content=content), stream=True)
-            except httpx.HTTPError as exc:
-                raise MarketplaceError(502, "source_fetch_failed", "the source did not respond") from exc
-            try:
-                if response.status_code in (301, 302, 303, 307, 308):
-                    if redirect_count >= _REDIRECT_LIMIT or not response.headers.get("location"):
-                        raise MarketplaceError(502, "source_fetch_failed", "the source redirected too many times")
-                    current = urljoin(current, response.headers["location"])
-                    if response.status_code == 303:
-                        method, content = "GET", None
-                    continue
-                if response.status_code not in acceptable:
-                    raise MarketplaceError(502, "source_fetch_failed", f"the source returned HTTP {response.status_code}")
-                declared = response.headers.get("content-length")
-                if declared:
-                    try:
-                        too_large = int(declared) > max_bytes
-                    except ValueError:
-                        too_large = False
-                    if too_large:
-                        raise MarketplaceError(502, "source_fetch_failed", "the source response was too large")
-                body = bytearray()
-                async for chunk in response.aiter_bytes():
-                    body.extend(chunk)
-                    if len(body) > max_bytes:
-                        raise MarketplaceError(502, "source_fetch_failed", "the source response was too large")
-                return bytes(body), str(response.url), response.headers
-            finally:
-                await response.aclose()
-    raise MarketplaceError(502, "source_fetch_failed", "the source redirected too many times")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TOTAL_FETCH_SECONDS
+    try:
+        async with asyncio.timeout_at(deadline):
+            for redirect_count in range(_REDIRECT_LIMIT + 1):
+                pinned = await _pin_url(current, expected_domains)
+                try:
+                    # One client per hop prevents an IP-keyed TLS connection
+                    # from being reused for a different redirect hostname.
+                    async with httpx.AsyncClient(
+                        timeout=_TIMEOUT,
+                        follow_redirects=False,
+                        trust_env=False,
+                    ) as client:
+                        response = await client.send(
+                            _pinned_request(
+                                client,
+                                method,
+                                pinned,
+                                request_headers,
+                                content,
+                            ),
+                            stream=True,
+                        )
+                        try:
+                            if response.status_code in (
+                                301,
+                                302,
+                                303,
+                                307,
+                                308,
+                            ):
+                                location = response.headers.get("location", "")
+                                if (
+                                    redirect_count >= _REDIRECT_LIMIT
+                                    or not location
+                                ):
+                                    raise MarketplaceError(
+                                        502,
+                                        "source_fetch_failed",
+                                        "the source redirected too many times",
+                                    )
+                                current = urljoin(pinned.url, location)
+                                if response.status_code == 303:
+                                    method, content = "GET", None
+                                continue
+                            if response.status_code not in acceptable:
+                                raise MarketplaceError(
+                                    502,
+                                    "source_fetch_failed",
+                                    f"the source returned HTTP {response.status_code}",
+                                )
+                            declared = response.headers.get("content-length")
+                            if declared:
+                                try:
+                                    too_large = int(declared) > max_bytes
+                                except ValueError:
+                                    too_large = False
+                                if too_large:
+                                    raise MarketplaceError(
+                                        502,
+                                        "source_fetch_failed",
+                                        "the source response was too large",
+                                    )
+                            body = bytearray()
+                            async for chunk in response.aiter_bytes():
+                                if loop.time() >= deadline:
+                                    raise TimeoutError
+                                body.extend(chunk)
+                                if len(body) > max_bytes:
+                                    raise MarketplaceError(
+                                        502,
+                                        "source_fetch_failed",
+                                        "the source response was too large",
+                                    )
+                            return bytes(body), pinned.url, response.headers
+                        finally:
+                            await response.aclose()
+                except httpx.HTTPError as exc:
+                    raise MarketplaceError(
+                        502,
+                        "source_fetch_failed",
+                        "the source did not respond",
+                    ) from exc
+    except TimeoutError as exc:
+        raise MarketplaceError(
+            502,
+            "source_fetch_failed",
+            "the source exceeded the total fetch deadline",
+        ) from exc
+    raise MarketplaceError(
+        502,
+        "source_fetch_failed",
+        "the source redirected too many times",
+    )
 
 
 async def _json_request(url: str, *, expected_domains: tuple[str, ...], headers: dict[str, str] | None = None) -> tuple[Any, str]:
@@ -1130,6 +1315,18 @@ def _import_view(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _deduplicated_import_view(row: dict[str, Any]) -> dict[str, Any]:
+    public_listing_id = row.get("public_listing_id")
+    return {
+        "source_id": str(row["source_id"]),
+        "source_ref": str(row.get("source_ref") or ""),
+        "status": str(row["status"]),
+        "listing_id": (
+            str(public_listing_id) if public_listing_id is not None else None
+        ),
+    }
+
+
 @router.get("/sources")
 async def list_sources(request: Request) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -1203,6 +1400,7 @@ async def create_import(
             "the URL does not match the selected source",
         )
     import_id = str(uuid.uuid4())
+    requester = user.email.lower()
     with tx() as cur:
         cur.execute(
             """
@@ -1217,26 +1415,55 @@ async def create_import(
                 source_id,
                 source_ref,
                 normalized_url,
-                user.email.lower(),
+                requester,
             ),
         )
         if cur.rowcount == 0:
             cur.execute(
                 """
-                SELECT *
-                  FROM mk_imports
-                 WHERE source_id = %s AND source_ref = %s
+                SELECT i.*,
+                       CASE WHEN l.status = 'published'
+                            THEN l.id END AS public_listing_id
+                  FROM mk_imports AS i
+                  LEFT JOIN mk_listings AS l ON l.id = i.listing_id
+                 WHERE i.source_id = %s AND i.source_ref = %s
+                   FOR UPDATE OF i
                 """,
                 (source_id, source_ref),
             )
-            existing = cur.fetchone()
-            if existing is None:
+            existing_row = cur.fetchone()
+            if existing_row is None:
                 raise MarketplaceError(
                     409,
                     "import_conflict",
                     "that source model is already being imported",
                 )
-            return {"import": _import_view(dict(existing)), "existing": True}
+            existing = dict(existing_row)
+            if existing["status"] == "published":
+                if str(existing["requested_by"]).lower() == requester:
+                    return {
+                        "import": _import_view(existing),
+                        "existing": True,
+                    }
+                return {
+                    "import": _deduplicated_import_view(existing),
+                    "existing": True,
+                }
+            # The global source-ref row is a retryable lease until publication.
+            # Reusing and transferring it avoids both a new index and disclosure
+            # of the prior requester's account-specific probe payload.
+            import_id = str(existing["id"])
+            cur.execute(
+                """
+                UPDATE mk_imports
+                   SET source_url = %s, requested_by = %s,
+                       status = 'pending', payload = '{}'::jsonb,
+                       error = '', listing_id = NULL,
+                       created_at = now(), completed_at = NULL
+                 WHERE id = %s
+                """,
+                (normalized_url, requester, import_id),
+            )
     token = (
         await _onshape_token(user.email)
         if source_id == "onshape" and _onshape_configured()
@@ -1251,12 +1478,35 @@ async def create_import(
                 UPDATE mk_imports
                    SET payload = %s::jsonb, status = %s,
                        completed_at = now(), error = ''
-                 WHERE id = %s
+                 WHERE id = %s AND requested_by = %s
                 RETURNING *
                 """,
-                (json.dumps(payload), status, import_id),
+                (json.dumps(payload), status, import_id, requester),
             )
             row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    """
+                    SELECT i.source_id, i.source_ref, i.status,
+                           CASE WHEN l.status = 'published'
+                                THEN l.id END AS public_listing_id
+                      FROM mk_imports AS i
+                      LEFT JOIN mk_listings AS l ON l.id = i.listing_id
+                     WHERE i.id = %s
+                    """,
+                    (import_id,),
+                )
+                displaced = cur.fetchone()
+                if displaced is None:
+                    raise MarketplaceError(
+                        409,
+                        "import_conflict",
+                        "that source import is no longer available",
+                    )
+                return {
+                    "import": _deduplicated_import_view(dict(displaced)),
+                    "existing": True,
+                }
     except Exception as exc:
         detail = (
             exc.detail.get("detail", "source import failed")
@@ -1268,9 +1518,9 @@ async def create_import(
                 """
                 UPDATE mk_imports
                    SET status = 'failed', error = %s, completed_at = now()
-                 WHERE id = %s
+                 WHERE id = %s AND requested_by = %s
                 """,
-                (str(detail)[:2000], import_id),
+                (str(detail)[:2000], import_id, requester),
             )
         raise
     return {"import": _import_view(dict(row)), "existing": False}
@@ -1318,78 +1568,123 @@ async def _download_to_path(
         "Accept": "*/*",
         **(headers or {}),
     }
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TOTAL_FETCH_SECONDS
     try:
-        async with httpx.AsyncClient(
-            timeout=_TIMEOUT, follow_redirects=False
-        ) as client:
+        async with asyncio.timeout_at(deadline):
             for redirect_count in range(_REDIRECT_LIMIT + 1):
-                current = await _validated_url(current, expected_domains)
+                pinned = await _pin_url(current, expected_domains)
                 try:
-                    response = await client.send(
-                        client.build_request(
-                            "GET", current, headers=request_headers
-                        ),
-                        stream=True,
-                    )
+                    async with httpx.AsyncClient(
+                        timeout=_TIMEOUT,
+                        follow_redirects=False,
+                        trust_env=False,
+                    ) as client:
+                        response = await client.send(
+                            _pinned_request(
+                                client,
+                                "GET",
+                                pinned,
+                                request_headers,
+                                None,
+                            ),
+                            stream=True,
+                        )
+                        try:
+                            if response.status_code in (
+                                301,
+                                302,
+                                303,
+                                307,
+                                308,
+                            ):
+                                location = response.headers.get("location", "")
+                                if (
+                                    redirect_count >= _REDIRECT_LIMIT
+                                    or not location
+                                ):
+                                    raise MarketplaceError(
+                                        502,
+                                        "source_fetch_failed",
+                                        "the asset redirected too many times",
+                                    )
+                                current = urljoin(pinned.url, location)
+                                continue
+                            if response.status_code != 200:
+                                raise MarketplaceError(
+                                    502,
+                                    "source_fetch_failed",
+                                    f"the source asset returned HTTP {response.status_code}",
+                                )
+                            declared = response.headers.get("content-length")
+                            if declared:
+                                try:
+                                    too_large = int(declared) > max_bytes
+                                except ValueError:
+                                    too_large = False
+                                if too_large:
+                                    raise MarketplaceError(
+                                        400,
+                                        "asset_too_large",
+                                        "the imported asset exceeds the marketplace limit",
+                                    )
+                            declared_type = (
+                                response.headers.get(
+                                    "content-type",
+                                    "application/octet-stream",
+                                )
+                                .split(";", 1)[0]
+                                .strip()
+                                .lower()
+                            )
+                            content_type = safe_media_type(target.name)
+                            if declared_type in {
+                                "text/html",
+                                "application/xhtml+xml",
+                            }:
+                                raise MarketplaceError(
+                                    502,
+                                    "source_fetch_failed",
+                                    "the source asset returned a web page",
+                                )
+                            if content_type.startswith(
+                                "image/"
+                            ) and not declared_type.startswith("image/"):
+                                raise MarketplaceError(
+                                    502,
+                                    "source_fetch_failed",
+                                    "the source gallery URL did not return an image",
+                                )
+                            written = 0
+                            with temp.open("wb") as handle:
+                                async for chunk in response.aiter_bytes():
+                                    if loop.time() >= deadline:
+                                        raise TimeoutError
+                                    written += len(chunk)
+                                    if written > max_bytes:
+                                        raise MarketplaceError(
+                                            400,
+                                            "asset_too_large",
+                                            "the imported asset exceeds the marketplace limit",
+                                        )
+                                    digest.update(chunk)
+                                    handle.write(chunk)
+                            temp.replace(target)
+                            return written, digest.hexdigest(), content_type
+                        finally:
+                            await response.aclose()
                 except httpx.HTTPError as exc:
                     raise MarketplaceError(
                         502,
                         "source_fetch_failed",
                         "the source asset could not be downloaded",
                     ) from exc
-                try:
-                    if response.status_code in (301, 302, 303, 307, 308):
-                        location = response.headers.get("location", "")
-                        if redirect_count >= _REDIRECT_LIMIT or not location:
-                            raise MarketplaceError(
-                                502,
-                                "source_fetch_failed",
-                                "the asset redirected too many times",
-                            )
-                        current = urljoin(current, location)
-                        continue
-                    if response.status_code != 200:
-                        raise MarketplaceError(
-                            502,
-                            "source_fetch_failed",
-                            f"the source asset returned HTTP {response.status_code}",
-                        )
-                    declared = response.headers.get("content-length")
-                    if declared:
-                        try:
-                            too_large = int(declared) > max_bytes
-                        except ValueError:
-                            too_large = False
-                        if too_large:
-                            raise MarketplaceError(
-                                400,
-                                "asset_too_large",
-                                "the imported asset exceeds the marketplace limit",
-                            )
-                    written = 0
-                    content_type = (
-                        response.headers.get(
-                            "content-type", "application/octet-stream"
-                        )
-                        .split(";", 1)[0]
-                        .strip()
-                        .lower()
-                    )
-                    with temp.open("wb") as handle:
-                        async for chunk in response.aiter_bytes():
-                            written += len(chunk)
-                            if written > max_bytes:
-                                raise MarketplaceError(
-                                    400,
-                                    "asset_too_large",
-                                    "the imported asset exceeds the marketplace limit",
-                                )
-                            digest.update(chunk)
-                            handle.write(chunk)
-                    temp.replace(target)
-                    return written, digest.hexdigest(), content_type
-                finally:
-                    await response.aclose()
+    except TimeoutError as exc:
+        raise MarketplaceError(
+            502,
+            "source_fetch_failed",
+            "the source asset exceeded the total fetch deadline",
+        ) from exc
     except OSError as exc:
         raise MarketplaceError(
             502,
@@ -1646,13 +1941,6 @@ async def accept_import(
                     headers={},
                     max_bytes=settings.marketplace_max_asset_bytes,
                 )
-                if not content_type.startswith("image/"):
-                    target.unlink(missing_ok=True)
-                    raise MarketplaceError(
-                        502,
-                        "source_fetch_failed",
-                        "the source gallery URL did not return an image",
-                    )
                 imported_assets.append(
                     {
                         "id": str(uuid.uuid4()),
@@ -1660,9 +1948,7 @@ async def accept_import(
                         "role": "gallery",
                         "filename": filename,
                         "rel_path": rel_path,
-                        "content_type": content_type
-                        or mimetypes.guess_type(filename)[0]
-                        or "application/octet-stream",
+                        "content_type": content_type,
                         "format": Path(filename).suffix.lower().lstrip("."),
                         "bytes": size,
                         "sha256": sha256,
@@ -1691,13 +1977,6 @@ async def accept_import(
                 headers=_download_headers(source_id, token),
                 max_bytes=settings.marketplace_max_asset_bytes,
             )
-            if content_type in {"text/html", "application/xhtml+xml"}:
-                target.unlink(missing_ok=True)
-                raise MarketplaceError(
-                    502,
-                    "source_fetch_failed",
-                    "the source download returned a web page instead of a model file",
-                )
             imported_assets.append(
                 {
                     "id": str(uuid.uuid4()),
@@ -1705,9 +1984,7 @@ async def accept_import(
                     "role": "primary",
                     "filename": filename,
                     "rel_path": rel_path,
-                    "content_type": content_type
-                    or mimetypes.guess_type(filename)[0]
-                    or "application/octet-stream",
+                    "content_type": content_type,
                     "format": Path(filename).suffix.lower().lstrip("."),
                     "bytes": size,
                     "sha256": sha256,

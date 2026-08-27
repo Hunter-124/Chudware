@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 import unicodedata
 from collections.abc import Sequence
@@ -425,6 +426,60 @@ class CursorError(ValueError):
     """A cursor that did not decode. Callers map this to HTTP 400."""
 
 
+# Per-sort key types, mirroring each entry in SORT_ORDERS. Admin list routes mint
+# their own sort names, so anything absent from this table is refused outright
+# rather than defaulted -- a new sort must declare its key shape to be usable.
+_CURSOR_KEY_TYPES: Final[dict[str, tuple[str, ...]]] = {
+    "newest": ("ts", "uuid"),
+    "oldest": ("ts", "uuid"),
+    "downloads": ("int", "uuid"),
+    "popular": ("int", "uuid"),
+    "rating": ("num", "int", "uuid"),
+    "price_low": ("int", "int", "uuid"),
+    "price_high": ("int", "int", "uuid"),
+    "relevance": ("num", "ts", "uuid"),
+    # Admin queues, keyed (timestamp, id).
+    "admin_listings": ("ts", "uuid"),
+    "admin_attestations": ("ts", "uuid"),
+    "admin_reports": ("ts", "uuid"),
+    "admin_sellers": ("ts", "str"),
+    "admin_payouts": ("ts", "uuid"),
+    "admin_imports": ("ts", "uuid"),
+    "admin_subscriptions": ("ts", "str"),
+    "studio_listings": ("ts", "uuid"),
+    "orders": ("ts", "uuid"),
+    "reviews": ("ts", "uuid"),
+}
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+# Enough to accept anything PostgreSQL emitted for a timestamptz, and nothing
+# resembling an injection or an unbounded string.
+_TS_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9:.+\-]{4,20}(Z)?$")
+
+
+def _cursor_key_ok(value: object, kind: str) -> bool:
+    if kind == "uuid":
+        return isinstance(value, str) and bool(_UUID_RE.match(value))
+    if kind == "ts":
+        # NULL is legitimate: 'newest' sorts published_at DESC NULLS LAST, and a
+        # seller's own draft list legitimately pages past unpublished rows.
+        return value is None or (isinstance(value, str) and bool(_TS_RE.match(value)))
+    if kind == "int":
+        return isinstance(value, int) and not isinstance(value, bool) and -(2**63) < value < 2**63
+    if kind == "num":
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        )
+    if kind == "str":
+        return isinstance(value, str) and 0 < len(value) <= 320
+    return False
+
+
 def encode_cursor(sort: str, keys: Sequence[object]) -> str:
     """Opaque cursor for the last row of a page.
 
@@ -458,11 +513,18 @@ def decode_cursor(cursor: str, *, expect_sort: str) -> list[object]:
     keys = payload.get("k")
     if not isinstance(keys, list) or not keys:
         raise CursorError("malformed cursor")
-    # A cursor is spliced into a WHERE clause as bound parameters, never as
-    # text, but bounding the arity keeps a hostile cursor from making the query
-    # builder emit a comparison tuple it has no placeholders for.
-    if len(keys) > 4:
+    # A cursor is spliced into a WHERE clause as bound parameters, never as text,
+    # but binding is not validation. The keys are compared against typed columns
+    # -- bigint counters, numeric ratings, timestamptz, uuid -- so a forged
+    # cursor like `["not-a-bigint", "not-a-uuid"]` for the `downloads` sort is
+    # accepted by the checks above, reaches PostgreSQL, fails the cast, and
+    # returns 500 where the documented answer is a 400. Type-check here so a
+    # hostile cursor cannot reach the planner at all.
+    if len(keys) != len(_CURSOR_KEY_TYPES.get(expect_sort, ())):
         raise CursorError("malformed cursor")
+    for value, kind in zip(keys, _CURSOR_KEY_TYPES[expect_sort]):
+        if not _cursor_key_ok(value, kind):
+            raise CursorError("malformed cursor")
     return keys
 
 
@@ -478,3 +540,86 @@ def clamp_limit(raw: object, *, default: int = PAGE_SIZE_DEFAULT) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, min(value, PAGE_SIZE_MAX))
+
+
+# --- Safe content types for user-supplied files ------------------------------
+
+# Extension -> the ONLY media type we will ever serve that extension as.
+#
+# The multipart Content-Type a client sends is advisory and attacker-controlled;
+# it is never stored or served. Persisting it produced a stored same-origin XSS:
+# a seller could upload two ungated `.txt` assets, one declared
+# `application/javascript` and one `text/html` that script-src'd the first, and
+# `script-src 'self'` happily executed it against the victim's session -- an
+# admin's session, if the file was attestation evidence.
+#
+# Anything not in this map is served as `application/octet-stream`, which no
+# browser will render. Note there is deliberately no `text/html`, no
+# `image/svg+xml` (SVG is a script container) and no `application/javascript`
+# anywhere in the values.
+SAFE_MEDIA_TYPES: Final = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".md": "text/plain",
+    ".csv": "text/plain",
+    ".zip": "application/zip",
+    ".stl": "model/stl",
+    ".3mf": "model/3mf",
+    ".obj": "text/plain",
+    ".ply": "text/plain",
+    ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json",
+    ".step": "model/step",
+    ".stp": "model/step",
+    ".iges": "model/iges",
+    ".igs": "model/iges",
+}
+
+# Only these render inline in a browser tab. Everything else -- every CAD file,
+# archive, document and text format -- is served as an attachment, because
+# inline rendering of attacker-supplied bytes on the app's own origin is the
+# whole vulnerability. Images are the exception because the storefront must
+# display them in an <img>, and an image media type cannot execute.
+INLINE_MEDIA_TYPES: Final = (
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+)
+
+
+def safe_media_type(filename: str) -> str:
+    """The media type to serve ``filename`` as, derived only from its extension.
+
+    Never consult a client-supplied Content-Type. Unknown extensions get
+    ``application/octet-stream`` rather than a guess, because ``mimetypes.guess_type``
+    will happily return ``text/html`` for a ``.html`` a seller renamed into an
+    allowed slot.
+    """
+    lowered = filename.lower()
+    for extension, media_type in SAFE_MEDIA_TYPES.items():
+        if lowered.endswith(extension):
+            return media_type
+    return "application/octet-stream"
+
+
+def serves_inline(media_type: str) -> bool:
+    """Whether this media type may be served without forcing a download."""
+    return media_type in INLINE_MEDIA_TYPES
+
+
+def content_disposition(filename: str, media_type: str) -> str:
+    """A ``Content-Disposition`` value that cannot be header-injected.
+
+    The filename is reduced to a conservative ASCII set before it reaches a
+    response header: a stored filename containing CR, LF or a quote would
+    otherwise let a seller inject headers into a response the browser trusts.
+    """
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", _ascii_fold(filename))[:120] or "download"
+    kind = "inline" if serves_inline(media_type) else "attachment"
+    return f'{kind}; filename="{stem}"'

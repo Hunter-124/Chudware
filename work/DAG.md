@@ -50,7 +50,7 @@ graph TD
     T_DP11["T-DP11: GUI transparency panel — helpers / advisories / councils / delegation / tool calls"]:::done
     T_DP12["T-DP12: GUI sub-agent model-preference settings + effort auto/advanced mode UI"]:::done
     T_DP13["T-DP13: Multi-file agent view — watch N agents build N parts simultaneously"]:::done
-    T_DP14["T-DP14: Design-pipeline ↔ PLM wiring (stage checkpoints + rationale narrative)"]:::todo
+    T_DP14["T-DP14: Design-pipeline ↔ PLM wiring (stage checkpoints + rationale narrative)"]:::done
     T_DP15["T-DP15: Workspace-switching architecture — full-viewport workspaces + overlay-hosting workspaces"]:::done
     T_DP16["T-DP16: AI-Agent workspace — full-screen comprehensive copilot (DAG + worker steering + session mgmt)"]:::done
     T_DP17["T-DP17: Interactive agent DAG / flowchart widget — clickable nodes to sub-agent detail"]:::done
@@ -316,7 +316,7 @@ graph TD
     T_WIN1["T-WIN1: Windows 10 full-app bring-up (OCCT core + imgui GUI) under MSVC"]:::blocked
   end
   subgraph WS_X["workstream X"]
-    T_WIN2["T-WIN2: Windows CI runner — build + smoke the host/ GUI on Hunter's Windows box"]:::todo
+    T_WIN2["T-WIN2: Windows CI runner — build + smoke the host/ GUI on Hunter's Windows box"]:::doing
     T_X1["T-X1: Browser session service - persistent per-site login profiles + headless fetch"]:::done
     T_X2["T-X2: Source adapter framework + GrabCAD/TraceParts adapters"]:::done
     T_X3["T-X3: part_search federation seam - browser adapters as providers"]:::done
@@ -386,7 +386,7 @@ graph TD
     T_BL58["T-BL58: 3D sketcher P3 — feature integration (sweep path, loft guide-curves)"]:::backlog
     T_BL59["T-BL59: 3D sketcher P4 — GUI viewport mode (3D dragging) + GSL describe"]:::backlog
     T_BL60["T-BL60: 3D sketcher P5 — advanced constraints + solver robustness"]:::backlog
-    T_BL61["T-BL61: Fillet on a compiled document SIGSEGVs hostd — OCCT PerformFilletOnVertex kills the daemon"]:::todo
+    T_BL61["T-BL61: Fillet on a compiled document SIGSEGVs hostd — OCCT PerformFilletOnVertex kills the daemon"]:::review
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog

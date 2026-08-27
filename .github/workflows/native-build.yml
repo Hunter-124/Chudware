@@ -465,3 +465,59 @@ jobs:
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
           exit $status
+
+      - name: Headless host GUI smoke (Windows)
+        if: matrix.build_host && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          # Force the managed worker to fail immediately, then point the
+          # cross-platform C++ fallback at the DLL built by this same matrix
+          # row. This exercises AppState::tryStartWorker's Windows fallback,
+          # not a pre-provisioned runtime left behind on the persistent runner.
+          $env:CHUDWARE_WORKER_BIN = Join-Path $env:RUNNER_TEMP 'missing-chudware-worker.exe'
+          $env:CHUDWARE_LIBCHUDWARE = (Resolve-Path 'build\${{ matrix.preset }}\bin\libchudware.dll').Path
+          $env:CHUDWARE_ENGINE_DAEMON = '0'
+          $env:CHUDWARE_SHOT = 'chat'
+
+          $shot = Join-Path $env:RUNNER_TEMP 'chudware-native-smoke.png'
+          $log = Join-Path $env:RUNNER_TEMP 'chudware-native-smoke.log'
+          Remove-Item -Force -ErrorAction SilentlyContinue $shot, $log
+
+          & '.\${{ matrix.host_build_dir }}\bin\chudware.exe' --ui-screenshot $shot 2>&1 |
+            Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          if ($status -ne 0) {
+            Write-Host "::error::headless host capture exited with status $status"
+            exit $status
+          }
+          if (-not (Test-Path $shot -PathType Leaf)) {
+            Write-Host "::error::headless host capture wrote no PNG"
+            exit 1
+          }
+
+          $bytes = [IO.File]::ReadAllBytes($shot)
+          $png = @(137, 80, 78, 71, 13, 10, 26, 10)
+          if ($bytes.Length -lt 8) {
+            Write-Host "::error::headless host capture is only $($bytes.Length) bytes"
+            exit 1
+          }
+          for ($i = 0; $i -lt $png.Count; $i++) {
+            if ($bytes[$i] -ne $png[$i]) {
+              Write-Host "::error::headless host capture does not have a PNG signature"
+              exit 1
+            }
+          }
+          if (-not (Select-String -Path $log -SimpleMatch '[cpp_core] loaded libchudware' -Quiet)) {
+            Write-Host "::error::Windows headless capture did not exercise the in-process C++ fallback"
+            exit 1
+          }
+
+          @(
+            '## Headless GUI smoke -- Windows x86_64'
+            ''
+            "PNG: $($bytes.Length) bytes"
+            "Core: $env:CHUDWARE_LIBCHUDWARE"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+

@@ -3,7 +3,7 @@ id: T-WIN2
 title: Windows CI runner — build + smoke the host/ GUI on Hunter's Windows box
 workstream: X
 owner: unassigned
-status: todo
+status: doing
 branch: task/T-WIN2-windows-ci-runner
 depends_on: []
 lane: platform-infra
@@ -32,3 +32,9 @@ on that box.
 - [ ] T-WIN1 unblocked or explicitly re-scoped
 
 ## Progress log
+- 2026-08-27: Existing `ryzen-7900x3d` CAD runner and
+  `cc-win-package` routing confirmed. Added a per-push Windows GUI smoke that
+  forces the managed worker failure, loads the just-built `libchudware.dll`
+  through `cpp_core`, and validates a real PNG. Removed the obsolete
+  Windows-only fallback exclusion in `AppState::tryStartWorker()`. Awaiting the
+  first native-build result before marking done and unblocking T-WIN1.

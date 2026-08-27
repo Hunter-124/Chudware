@@ -91,12 +91,15 @@ correctness proof on Windows is `ctest` on the `windows-core` / `windows-occt` c
 
 ## GUI app (`host/`) — Windows build
 
-The single cross-platform GUI is `host/` (target `Chudware`, output binary `chudware.exe`). It builds
-from its own CMakeLists with the MSVC toolchain after the core (`libchudware.dll` from the
-`windows-occt` preset). **Windows re-verification of the restored `host/` build is an open item**
-(`docs/plans/GUI_OVERHAUL_SPEC.md`) — the notes below record the `ui/imgui`-era bring-up seams,
-which largely carry over to `host/`'s CMake (same `/FI fix_math.h` shim, same engine-resolution
-fallback):
+The single cross-platform GUI is `host/` (target `Chudware`, output binary
+`chudware.exe`). The self-hosted Windows runner now builds the OCCT-free core
+and restored `host/` tree on every push through
+`.github/workflows/native-build.yml`, runs both CTest trees, then launches the
+GUI in `CHUDWARE_SHOT=chat` mode and verifies a real PNG capture. That smoke
+forces the managed worker to fail and points `CHUDWARE_LIBCHUDWARE` at the DLL
+built by the same job, so it also proves the Windows in-process C++ fallback
+rather than inheriting a pre-provisioned Python runtime from the persistent
+runner. Full release packaging still uses the `windows-occt` preset.
 
 - **`/FI fix_math.h` quoting (fatal C1083).** Under the **Ninja + MSVC** generator a repo path
   containing a space leaks literal quote chars into the force-include filename. Fix: drop the
@@ -107,6 +110,11 @@ fallback):
   puts that directory on the process search path so the ~100 sibling OCCT/Netgen `TK*.dll`
   **transitive** deps also load — no manual DLL staging needed. To use a different build, set
   `CHUDWARE_LIBCHUDWARE=<absolute path to libchudware.dll>`.
+- **Worker fallback.** `AppState::tryStartWorker()` tries the managed worker
+  first on every desktop platform. If that is unavailable, Windows now follows
+  the same `cpp_core().ensureLoaded()` fallback as Linux/macOS; failed runtime
+  provisioning no longer prevents a headless capture or a core-backed desktop
+  session.
 - **glad** lives at `extern/glad` (`GLAD_DIR`).
 
 `freecad_parity` (windows-occt 48/49) remains the one pre-existing MSVC-vs-GCC solver-convergence

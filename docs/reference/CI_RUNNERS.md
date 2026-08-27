@@ -103,9 +103,12 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
 - **`native-build.yml` deliberately configures every host GUI build with
   `CHUDWARE_ENABLE_CEF=OFF`.** The per-push compile-and-test gate therefore uses
   `NullWebView` and does not compile the CEF backend; a CEF-only break surfaces
-  at release time. Tagged releases remain CEF-enabled, so `cc-linux-build` and
-  `cc-win-package` need the platform CEF SDK provisioned before the first tagged
-  release.
+  at release time. Its Windows row additionally launches the built GUI with a
+  deliberately missing managed worker, loads the same row's
+  `build/windows-core/bin/libchudware.dll` through the in-process fallback, and
+  validates a real PNG headless capture. Tagged releases remain CEF-enabled, so
+  `cc-linux-build` and `cc-win-package` need the platform CEF SDK provisioned
+  before the first tagged release.
 
 ### Provisioning: `runner-smoke.yml`'s dispatch-only `provision` job
 

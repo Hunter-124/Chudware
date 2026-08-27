@@ -1524,16 +1524,17 @@ void AppState::tryStartWorker() {
         return;
     }
     addLog("[err] worker: " + werr);
-#ifndef _WIN32
-    // No managed Python runtime on this platform — the in-process C++ core (libchudware) is the
-    // backend (doc/agent/sim ops route through cpp_core). If it loads, the app is ready; do NOT
-    // dead-end into Python provisioning. On Windows the Python worker stays the production path.
+    // If the managed worker is unavailable, the in-process C++ core is the
+    // cross-platform fallback (doc/agent/sim ops route through cpp_core). This
+    // is also what makes a clean Windows CI checkout able to run headless shots
+    // without provisioning the Python runtime first.
     //
-    // NOTE: when CHUDWARE_ENGINE_DAEMON is unset/1 (default), engine::call goes to chudware-hostd,
-    // which dlopens its OWN libchudware. The path logged here is the GUI process's in-proc load
-    // (fallback / parity); hostd's path is in its stderr "[cpp_core] loaded ..." line and in
-    // daemon hello engine_build_id. Stale hostd holding an old .so is the classic trap —
-    // `chudware-hostd --stop` after a core rebuild, or wait for hostd's mtime self-drain.
+    // NOTE: when CHUDWARE_ENGINE_DAEMON is unset/1 (default), engine::call goes
+    // to chudware-hostd, which dlopens its OWN libchudware. The path logged here
+    // is the GUI process's in-proc load (fallback / parity); hostd's path is in
+    // its stderr "[cpp_core] loaded ..." line and in daemon hello
+    // engine_build_id. Stale hostd holding an old library is the classic trap:
+    // stop it after a core rebuild, or wait for hostd's mtime self-drain.
     {
         std::string lerr;
         if (core::cpp_core().ensureLoaded(lerr)) {
@@ -1554,7 +1555,6 @@ void AppState::tryStartWorker() {
         }
         addLog("[..] libchudware not loaded: " + lerr);
     }
-#endif
     if (!autoSetupTried && !setupRunning.load()) {
         autoSetupTried = true;
         addLog("[..] attempting automatic runtime setup...");

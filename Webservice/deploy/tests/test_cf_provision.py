@@ -104,6 +104,12 @@ def test_units_fail_closed_on_dev_mode_and_do_not_receive_tunnel_token():
         assert "ProtectSystem=strict" in unit
         assert "PrivateDevices=yes" in unit
 
+    prod = (deploy / "chudware-gateway.service").read_text()
+    assert "%h/chudware-releases" in prod, (
+        "release upload/publish runs inside the hardened gateway unit; without this "
+        "ReadWritePaths entry ProtectHome=read-only turns a valid incoming/ write into EROFS"
+    )
+
 
 def test_deploy_scripts_never_put_password_dsn_in_postgres_client_argv():
     deploy = SCRIPT.parent

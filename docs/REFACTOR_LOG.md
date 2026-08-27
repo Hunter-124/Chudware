@@ -2791,3 +2791,16 @@ Result: 61 bridge routes, adding `aiand`, `alibaba-token-plan`, `bedrock-mantle`
 `gmi-cloud`, `meta`, and `yolo-auto`. Resolution remains static — no runtime catalog file read
 and no Bun spawn. Vendor tests pin generation, native exclusion, deterministic order, missing/
 changed drift, and malformed catalog failure.
+
+---
+
+## 2026-08-27 — Release uploads are writable inside the hardened gateway
+
+Production journal showed `/api/releases/ci/upload/*` failing with `EROFS`: Unix ownership was
+correct, but `ProtectSystem=strict` + `ProtectHome=read-only` omitted
+`~/chudware-releases` from `ReadWritePaths`. A multi-hour nightly could build successfully and
+still never stage or publish its installer.
+
+The tracked production unit now grants only that explicit release root alongside the existing
+data/bucket roots. A deployment-unit regression test pins it. 158 deploy/release tests pass on
+the production-matching gateway venv.

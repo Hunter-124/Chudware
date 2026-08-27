@@ -33,13 +33,15 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# %h/ME489 is config.py's default bucket_root (CHUDWARE_WEB_BUCKET_ROOT), which
-# every /api/bucket/* write lands under: user_bucket_root() is
-# <bucket_root>/users/<slug> and team_bucket_root() is <bucket_root>/orgs/...
-# Without it ProtectHome=read-only made the whole tree read-only inside the
-# sandbox, so listing a bucket worked while mkdir/upload/rename/delete all
-# failed with EROFS ("[Errno 30] Read-only file system") and surfaced as a 500.
-ReadWritePaths=%h/chudware-web-data %h/chudware-web %h/ME489
+# The gateway has four explicit writable roots under ProtectHome=read-only:
+# - chudware-web-data: database/config/runtime data
+# - chudware-web: staged web daemon data
+# - ME489: per-identity bucket roots
+# - chudware-releases: signed release staging (`incoming/`) and published installers
+#
+# Omitting the release root made `/api/releases/ci/upload/*` fail with EROFS even though
+# Unix ownership/mode were correct, so a multi-hour nightly build could never publish.
+ReadWritePaths=%h/chudware-web-data %h/chudware-web %h/ME489 %h/chudware-releases
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

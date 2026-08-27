@@ -197,7 +197,23 @@ def test_diverged_copy_as_variant(tmp_path):
     _write_part(b, "Bracket.step+", wall=22.0)
     vb = Vault.open(b)
     vb.save(message="bob 22")
+    queued_head = vb.status()["head"]
+    queued_history = [entry["commit"] for entry in vb.history()]
     vb.close()
+
+    # Local history is the durable offline queue: an unreachable share must not
+    # consume or rewrite Bob's saved work.
+    offline = tmp_path / "team-offline.git"
+    bare.rename(offline)
+    failed = remote.sync(b, remote="origin")
+    assert failed["ok"] is False
+    bare = offline.rename(bare)
+    vb = Vault.open(b)
+    try:
+        assert vb.status()["head"] == queued_head
+        assert [entry["commit"] for entry in vb.history()] == queued_history
+    finally:
+        vb.close()
 
     # Alice publishes first
     out = remote.sync(a, remote="origin")
@@ -306,42 +322,42 @@ def test_lock_cas_contention(tmp_path):
 # author env injection
 # ---------------------------------------------------------------------------
 
-def test_author_env_injection_in_history(tmp_path):
+def test_author_env_injection_in_history(tmp_path, monkeypatch):
     project = tmp_path / "proj"
     project.mkdir()
     _write_part(project, "Bracket.step+")
 
-    os.environ["CHUDWARE_USER_ID"] = "sarah@ua.edu"
-    os.environ["CHUDWARE_USER_DISPLAY"] = "Sarah"
+    monkeypatch.setenv("CHUDWARE_USER_ID", "sarah@ua.edu")
+    monkeypatch.setenv("CHUDWARE_USER_DISPLAY", "Sarah")
+    monkeypatch.delenv("CHUDWARE_ACCOUNT_ID", raising=False)
+    assert _user_author() == {
+        "kind": "user",
+        "id": "sarah@ua.edu",
+        "display": "Sarah",
+        "account_id": None,
+    }
+    v = Vault.open(project)
     try:
-        assert _user_author() == {
-            "kind": "user",
-            "id": "sarah@ua.edu",
-            "display": "Sarah",
-        }
-        v = Vault.open(project)
-        try:
-            # re-save so a user-authored entry lands (seed uses System)
-            _write_part(project, "Bracket.step+", wall=4.0)
-            res = v.save(message="sarah edit")
-            entries = v.history()
-            # newest first
-            authored = [e for e in entries if e["author"].get("id") == "sarah@ua.edu"]
-            assert authored, entries
-            assert authored[0]["author"]["display"] == "Sarah"
-            assert authored[0]["author"]["kind"] == "user"
-            # document.json must not carry author (byte-stability)
-            head = v.status()["head"]
-            tree = v._bind.read_tree(head)
-            for path, data in tree.items():
-                if path.endswith("/document.json"):
-                    doc = json.loads(data.decode("utf-8"))
-                    assert "author" not in doc
-        finally:
-            v.close()
+        # re-save so a user-authored entry lands (seed uses System)
+        _write_part(project, "Bracket.step+", wall=4.0)
+        v.save(message="sarah edit")
+        entries = v.history()
+        authored = [
+            e for e in entries if e["author"].get("id") == "sarah@ua.edu"
+        ]
+        assert authored, entries
+        assert authored[0]["author"]["display"] == "Sarah"
+        assert authored[0]["author"]["kind"] == "user"
+        assert authored[0]["author"]["account_id"] is None
+        # document.json must not carry author (byte-stability)
+        head = v.status()["head"]
+        tree = v._bind.read_tree(head)
+        for path, data in tree.items():
+            if path.endswith("/document.json"):
+                doc = json.loads(data.decode("utf-8"))
+                assert "author" not in doc
     finally:
-        os.environ.pop("CHUDWARE_USER_ID", None)
-        os.environ.pop("CHUDWARE_USER_DISPLAY", None)
+        v.close()
 
 
 def test_reserved_aicad_cloud_remote(tmp_path):
@@ -360,3 +376,178 @@ def test_reserved_aicad_cloud_remote(tmp_path):
     out = remote.sync(project, remote="Cloud")
     assert out["ok"] is False
     assert out["reason"] == "reserved_remote"
+
+
+def test_remote_identity_capabilities_and_account_reservation(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    _write_part(project, "Bracket.step+")
+    v = Vault.open(project)
+    v.save()
+    v.close()
+    share = tmp_path / "share.git"
+    assert remote.seed_remote(project, share)["ok"]
+
+    explicit = remote.add_remote(
+        project,
+        "origin",
+        str(share),
+        kind="folder",
+        display_name="Sarah",
+        account_id="acct-42",
+    )
+    assert explicit["ok"], explicit
+    profile = explicit["remote"]
+    assert profile["identity"] == {
+        "user_id": _user_author()["id"],
+        "display": "Sarah",
+        "account_id": "acct-42",
+    }
+    assert profile["capabilities"] == ["snapshot_sync", "advisory_locks"]
+
+    monkeypatch.delenv("CHUDWARE_USER_ID", raising=False)
+    monkeypatch.delenv("CHUDWARE_USER_DISPLAY", raising=False)
+    monkeypatch.delenv("CHUDWARE_ACCOUNT_ID", raising=False)
+    monkeypatch.setattr(remote.getpass, "getuser", lambda: "os-user")
+    fallback = remote.add_remote(project, "backup", str(share), kind="folder")
+    assert fallback["remote"]["identity"] == {
+        "user_id": "os-user",
+        "display": "os-user",
+        "account_id": None,
+    }
+
+
+def test_status_lists_live_locks_and_offline_remote_is_best_effort(
+    tmp_path, monkeypatch
+):
+    src = tmp_path / "seed"
+    src.mkdir()
+    _write_part(src, "Bracket.step+")
+    v = Vault.open(src)
+    v.save()
+    item_id = v.status()["items"][0]["item_id"]
+    v.close()
+    share = tmp_path / "team.git"
+    assert remote.seed_remote(src, share)["ok"]
+
+    monkeypatch.setenv("CHUDWARE_USER_ID", "alice")
+    monkeypatch.setenv("CHUDWARE_USER_DISPLAY", "Alice")
+    monkeypatch.setenv("CHUDWARE_ACCOUNT_ID", "acct-alice")
+    acquired = remote.plm_lock(src, item_id)
+    assert acquired["ok"], acquired
+
+    v = Vault.open(src)
+    try:
+        locks = v.status()["locks"]
+        assert locks == [{
+            "item_id": item_id,
+            "user_id": "alice",
+            "display": "Alice",
+            "account_id": "acct-alice",
+            "acquired_at": acquired["lock"]["acquired_at"],
+            "expires_at": acquired["lock"]["expires_at"],
+        }]
+    finally:
+        v.close()
+
+    offline = tmp_path / "team-offline.git"
+    share.rename(offline)
+    v = Vault.open(src)
+    try:
+        status = v.status()
+        assert status["project_id"]
+        assert status["locks"] == []
+    finally:
+        v.close()
+
+
+def test_stale_lock_expires_and_can_be_reacquired(tmp_path, monkeypatch):
+    src = tmp_path / "seed"
+    src.mkdir()
+    _write_part(src, "Bracket.step+")
+    v = Vault.open(src)
+    v.save()
+    item_id = v.status()["items"][0]["item_id"]
+    v.close()
+    share = tmp_path / "team.git"
+    assert remote.seed_remote(src, share)["ok"]
+
+    repo = remote.Repo(str(share))
+    try:
+        stale = {
+            "item_id": item_id,
+            "holder": "alice",
+            "display": "Alice",
+            "acquired_at": "2000-01-01T00:00:00Z",
+            "expires_at": "2000-01-01T01:00:00Z",
+        }
+        sha = remote._write_lock_blob(
+            repo, {"schema": remote._LOCK_SCHEMA, "locks": [stale]}
+        )
+        repo.refs[remote._LOCK_REF] = sha
+    finally:
+        repo.close()
+
+    monkeypatch.setenv("CHUDWARE_USER_ID", "bob")
+    monkeypatch.setenv("CHUDWARE_USER_DISPLAY", "Bob")
+    out = remote.plm_lock(src, item_id)
+    assert out["ok"], out
+    assert out["lock"]["user_id"] == "bob"
+    assert "overrode" not in out
+
+
+def test_force_lock_override_returns_prior_holder(tmp_path, monkeypatch):
+    src = tmp_path / "seed"
+    src.mkdir()
+    _write_part(src, "Bracket.step+")
+    v = Vault.open(src)
+    v.save()
+    item_id = v.status()["items"][0]["item_id"]
+    v.close()
+    share = tmp_path / "team.git"
+    assert remote.seed_remote(src, share)["ok"]
+
+    monkeypatch.setenv("CHUDWARE_USER_ID", "alice")
+    monkeypatch.setenv("CHUDWARE_USER_DISPLAY", "Alice")
+    assert remote.plm_lock(src, item_id)["ok"]
+
+    monkeypatch.setenv("CHUDWARE_USER_ID", "bob")
+    monkeypatch.setenv("CHUDWARE_USER_DISPLAY", "Bob")
+    refused = remote.plm_lock(src, item_id)
+    assert refused["ok"] is False
+    assert refused["reason"] == "locked"
+
+    forced = remote.plm_lock(src, item_id, force=True)
+    assert forced["ok"], forced
+    assert forced["lock"]["user_id"] == "bob"
+    assert forced["overrode"]["user_id"] == "alice"
+    assert forced["overrode"]["display"] == "Alice"
+    assert "account_id" in forced["overrode"]
+
+
+def test_lock_cas_retry_recovers_from_deterministic_race(
+    tmp_path, monkeypatch
+):
+    src = tmp_path / "seed"
+    src.mkdir()
+    _write_part(src, "Bracket.step+")
+    v = Vault.open(src)
+    v.save()
+    item_id = v.status()["items"][0]["item_id"]
+    v.close()
+    share = tmp_path / "team.git"
+    assert remote.seed_remote(src, share)["ok"]
+
+    real_cas_push = remote._cas_push
+    calls = {"count": 0}
+
+    def race_once(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return False
+        return real_cas_push(*args, **kwargs)
+
+    monkeypatch.setattr(remote, "_cas_push", race_once)
+    out = remote.plm_lock(src, item_id)
+    assert out["ok"], out
+    assert calls["count"] == 2

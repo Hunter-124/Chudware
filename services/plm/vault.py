@@ -17,6 +17,7 @@ Every public method returns plain Python; the ``plm_*`` MCP tools + the §7.1
 """
 from __future__ import annotations
 
+import getpass
 import os
 import time
 from pathlib import Path
@@ -196,9 +197,22 @@ class Vault:
         return manifest.loads(raw)
 
     def status(self) -> dict[str, Any]:
-        """Project state for the Hub/badges (contract §7 plm_status shape)."""
+        """Project state for the Hub/badges (contract §7 plm_status shape).
+
+        Shared locks are live remote state. They are best-effort so an offline
+        remote never turns otherwise valid local project status into a failure.
+        """
         m = self.manifest()
         head = self._bind.head_commit()
+        locks: list[dict[str, Any]] = []
+        if m.get("remotes"):
+            try:
+                from services.plm import remote as remote_mod
+                lock_result = remote_mod.list_locks(self.project_dir)
+                if lock_result.get("ok"):
+                    locks = list(lock_result.get("locks") or [])
+            except Exception:
+                locks = []
         return {
             "project_id": m["project"]["id"],
             "head": head,
@@ -207,7 +221,7 @@ class Vault:
             "auto_commit": self.auto_commit(),
             "items": [self._item_view(it) for it in m["items"]],
             "remotes": m.get("remotes", []),
-            "locks": [],  # lock manifest lives on refs/aicad/locks (T-R7)
+            "locks": locks,
         }
 
     def history(self, item_id: str | None = None, limit: int | None = None,
@@ -1351,7 +1365,10 @@ class Vault:
         kind = hist.kind_from_commit_message(cmeta["message"])
         scope = hist.scope_from_commit_message(cmeta["message"])
         msg = hist.user_message_from_commit(cmeta["message"])
-        author = {"kind": "user", "id": "user", "display": "User"}
+        author = {
+            "kind": "user", "id": "user", "display": "User",
+            "account_id": None,
+        }
         ai = None
         thumb_ref = None
         summary = ""
@@ -1366,7 +1383,8 @@ class Vault:
                 import json as _json
                 try:
                     md = _json.loads(mraw.decode("utf-8"))
-                    author = md.get("author", author)
+                    author = dict(md.get("author") or author)
+                    author.setdefault("account_id", None)
                     ai = md.get("ai")
                 except Exception:
                     pass
@@ -1414,7 +1432,10 @@ class Vault:
         scope = hist.scope_from_commit_message(cmeta["message"])
         msg = hist.user_message_from_commit(cmeta["message"])
         # pull author + ai from a representative item meta.json
-        author = {"kind": "user", "id": "user", "display": "User"}
+        author = {
+            "kind": "user", "id": "user", "display": "User",
+            "account_id": None,
+        }
         ai = None
         thumb_ref = None
         summary = ""
@@ -1429,7 +1450,8 @@ class Vault:
             if mraw:
                 import json as _json
                 md = _json.loads(mraw.decode("utf-8"))
-                author = md.get("author", author)
+                author = dict(md.get("author") or author)
+                author.setdefault("account_id", None)
                 ai = md.get("ai")
             if snapshot.item_prefix(pick_iid) + "thumbnail.png" in tree:
                 thumb_ref = snapshot.item_prefix(pick_iid) + "thumbnail.png"
@@ -1455,12 +1477,18 @@ def _iso(epoch: int) -> str:
 
 
 def _user_author() -> dict[str, Any]:
-    """Session-aware user author (chudware-web injects CHUDWARE_USER_* env).
+    """Session-aware user author with an OS identity fallback.
 
     Author lives ONLY in meta/commit (byte-stability law §0) — never document.json.
+    ``account_id`` is reserved now so later account-backed sharing does not need
+    a shape change.
     """
-    uid = os.environ.get("CHUDWARE_USER_ID") or "user"
-    display = os.environ.get("CHUDWARE_USER_DISPLAY") or None
-    if not display:
-        display = "User" if uid == "user" else uid
-    return {"kind": "user", "id": uid, "display": display}
+    uid = os.environ.get("CHUDWARE_USER_ID") or getpass.getuser() or "user"
+    display = os.environ.get("CHUDWARE_USER_DISPLAY") or uid
+    account_id = os.environ.get("CHUDWARE_ACCOUNT_ID") or None
+    return {
+        "kind": "user",
+        "id": uid,
+        "display": display,
+        "account_id": account_id,
+    }

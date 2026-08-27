@@ -27,6 +27,7 @@ ITEM_KINDS = {
 }
 AI_MODES = {"manual", "assisted", "managed"}
 REMOTE_KINDS = {"folder", "ssh", "https", "chudware-cloud"}
+REMOTE_CAPABILITIES = ("snapshot_sync", "advisory_locks")
 
 
 def new_item_id() -> str:

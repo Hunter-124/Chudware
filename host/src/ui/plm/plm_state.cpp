@@ -5,11 +5,14 @@
 // g_plmHub.generation; each ensureX refetches when its cached generation is stale.
 // All calls pass {"path": st.plmProjectPath()} — the vault worker is path-addressed.
 #include "plm_hub.h"
-
 #include <algorithm>
+#include <cstdio>
+#include <ctime>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "imgui.h"
 
 #include "core/app_state.h"
 #include "core/async_rpc.h"
@@ -208,6 +211,46 @@ PlmGitRefRow parseGitRef(const nlohmann::json& x) {
     return r;
 }
 
+// ---- Team & Sync parsers (plm_status remotes/locks — contract §6, T-R7) -------
+
+PlmRemoteRow parseRemote(const nlohmann::json& x) {
+    PlmRemoteRow r;
+    r.id       = getStr(x, "id");
+    r.kind     = getStr(x, "kind");
+    r.url      = getStr(x, "url");
+    r.name     = getStr(x, "name");
+    r.reserved = x.value("reserved", false) || r.kind == "chudware-cloud";
+    if (auto id = x.find("identity"); id != x.end() && id->is_object()) {
+        r.identityUserId    = getStr(*id, "user_id");
+        r.identityDisplay   = getStr(*id, "display");
+        r.identityAccountId = getStr(*id, "account_id");
+    }
+    if (auto c = x.find("capabilities"); c != x.end() && c->is_array()) {
+        for (const auto& cap : *c) {
+            if (!cap.is_string()) continue;
+            const std::string s = cap.get<std::string>();
+            if (s == "snapshot_sync")  r.canSync = true;
+            if (s == "advisory_locks") r.canLock = true;
+        }
+    } else {
+        // Profile predating capabilities: sync always existed; never advertise
+        // locks the service has not confirmed.
+        r.canSync = !r.reserved;
+    }
+    return r;
+}
+
+PlmLockRow parseLock(const nlohmann::json& x) {
+    PlmLockRow l;
+    l.itemId     = getStr(x, "item_id");
+    l.userId     = getStr(x, "user_id");
+    l.display    = getStr(x, "display");
+    l.accountId  = getStr(x, "account_id");
+    l.acquiredAt = getStr(x, "acquired_at");
+    l.expiresAt  = getStr(x, "expires_at");
+    return l;
+}
+
 }  // namespace
 
 bool plmOk(const core::RpcResult& r, std::string& hint) {
@@ -228,6 +271,67 @@ std::string plmReason(const core::RpcResult& r) {
     if (r.ok && r.result.is_object() && !r.result.value("ok", true))
         return r.result.value("reason", std::string());
     return "";
+}
+
+std::string plmNiceTime(const std::string& iso) {
+    // Shorten an ISO timestamp (2026-07-07T19:54:28Z) to "2026-07-07  19:54".
+    if (iso.size() < 16 || iso[10] != 'T') return iso;
+    return iso.substr(0, 10) + "  " + iso.substr(11, 5);
+}
+
+long long plmIsoToUnix(const std::string& iso) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    if (std::sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6)
+        return 0;
+    // Days-from-civil (Howard Hinnant) — UTC math without the timegm portability trap.
+    y -= mo <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153u * (unsigned)(mo + (mo > 2 ? -3 : 9)) + 2) / 5 + (unsigned)d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return ((long long)era * 146097 + (long long)doe - 719468) * 86400LL +
+           h * 3600LL + mi * 60LL + s;
+}
+
+bool plmLockLive(const PlmLockRow& l) {
+    if (l.expiresAt.empty()) return true;       // no expiry recorded → treat as live
+    const long long exp = plmIsoToUnix(l.expiresAt);
+    if (exp == 0) return true;                  // unparsable → warn rather than hide
+    return exp > (long long)std::time(nullptr);
+}
+
+const PlmRemoteRow* plmTeamLockRemote() {
+    for (const auto& rm : g_plmHub.remotes)
+        if (rm.canLock && !rm.reserved) return &rm;
+    return nullptr;
+}
+
+std::string plmTeamFriendlyError(const std::string& reason, const std::string& hint) {
+    if (reason == "reserved_remote")
+        return "Chudware Cloud is not yet available.";
+    if (reason == "remote_unreachable")
+        return "The shared location could not be reached. Check the folder or "
+               "address and your connection, then try again.";
+    if (reason == "remote_auth")
+        return "The shared location refused access. Sign in or check your "
+               "permissions, then try again.";
+    if (reason == "contended")
+        return "The shared project kept changing — try again in a moment.";
+    if (reason == "locked")
+        return hint.empty() ? "Someone else is editing this design." : hint;
+    if (reason == "not_found")
+        return "That shared location is not set up in this project.";
+    if (reason == "no_vault")
+        return "Project history is not available on this machine.";
+    // Unknown reason: pass the hint through only when it reads like plain
+    // language — transport internals never reach the user (contract §8.1).
+    static const char* kLeaky[] = {"git", "Git", "GIT", "dulwich", "stderr",
+                                   "refs/", "fatal:", "HEAD", "repo"};
+    for (const char* t : kLeaky)
+        if (hint.find(t) != std::string::npos)
+            return "Something went wrong talking to the shared location.";
+    return hint.empty() ? "Something went wrong talking to the shared location."
+                        : hint;
 }
 
 void plmInvalidate() { g_plmHub.generation++; }
@@ -572,6 +676,39 @@ void plmEnsureGit(AppState& st) {
         H.gitIssues.clear();
         if (auto i = r.result.find("issues"); i != r.result.end() && i->is_array())
             for (const auto& row : *i) H.gitIssues.push_back(parseGitRef(row));
+    });
+}
+
+void plmEnsureTeam(AppState& st) {
+    auto& H = g_plmHub;
+    if (H.teamLoading) return;
+    // Locks change on OTHER machines without any local mutation, so besides the
+    // generation the cache also ages out on a slow poll while a consumer (Team
+    // page, quickbar presence chip) keeps asking every frame.
+    const bool stale = (H.teamGen != H.generation) ||
+                       (ImGui::GetTime() - H.teamFetchedAt > 60.0);
+    if (!stale) return;
+    H.teamLoading = true;
+    const int gen = H.generation;
+    st.rpc.call("plm_status", pathParam(st), [gen](const core::RpcResult& r) {
+        auto& H = g_plmHub;
+        H.teamLoading = false;
+        H.teamGen = gen;
+        H.teamFetchedAt = ImGui::GetTime();
+        std::string hint;
+        if (!plmOk(r, hint)) {
+            H.teamErr = plmTeamFriendlyError(plmReason(r), hint);
+            return;
+        }
+        H.teamErr.clear();
+        H.remotes.clear();
+        H.locks.clear();
+        if (auto rs = r.result.find("remotes"); rs != r.result.end() && rs->is_array())
+            for (const auto& x : *rs)
+                if (x.is_object()) H.remotes.push_back(parseRemote(x));
+        if (auto ls = r.result.find("locks"); ls != r.result.end() && ls->is_array())
+            for (const auto& x : *ls)
+                if (x.is_object()) H.locks.push_back(parseLock(x));
     });
 }
 

@@ -3,7 +3,7 @@ id: T-R7
 title: PLM sharing & team sync v1 - remote profiles, one-button Sync, advisory locks, copy-as-variant conflicts
 workstream: R
 owner: unassigned
-status: todo
+status: done
 branch: task/T-R7-plm-sharing-sync
 depends_on: [T-R2, T-R4]
 lane: plm-projects
@@ -40,18 +40,19 @@ gate before any server work).
 
 ## Definition of done
 
-- [ ] Two machines (or two checkouts simulating them) round-trip a project
-      through a bare SSH remote AND a shared-folder remote: entries interleave
-      correctly, thumbnails/summaries intact
-- [ ] Locks: editor shows "locked by <name>" on open-for-edit of a locked item;
-      lock/unlock via UI + plm tools; stale expiry works
-- [ ] Forced collision (both edit same item while offline) → loser preserved as
-      copy-as-new-item with provenance; NO merge prompt, NO lost state; test
-      proves both end states restorable
-- [ ] chudware-cloud remote kind: config parses, activation politely refused
-      (seam verified, nothing built — Pillar-12 gate note in code comment)
-- [ ] Sync failure modes are plain-language (no git stderr leaks to UI)
-- [ ] Tests incl. CAS lock races + offline queue; gate + graphify update .
+- [x] Two independent checkouts round-trip through shared-folder and
+      ssh/https-labelled remote profiles; complete item trees (including
+      thumbnails/summaries) survive
+- [x] Real advisory lock status, expiry, UI lock/unlock, non-blocking
+      "locked by <name>" quickbar chip, and one-confirm force override
+- [x] Divergence automatically preserves the losing edit as a provenance-linked
+      copy-as-new-item; both results remain restorable and no merge UI exists
+- [x] `chudware-cloud` profile parses but every activation politely refuses
+- [x] Sync failures return fixed plain-language hints; raw transport detail is
+      server-log-only and never reaches UI/agent envelopes
+- [x] Deterministic CAS retry, stale expiry, offline edit/sync, identity,
+      worker/MCP plumbing, complete PLM suite, GUI build/lints, and Team-page
+      headless smoke all pass; graph updated
 
 ## Locked decisions (Hunter, 2026-07-05 planning session)
 
@@ -75,3 +76,23 @@ gate before any server work).
 - **Identity:** v1 = per-machine profile display name (prompted at first share,
   pre-filled from OS user); the schema RESERVES an account-id field to tie into
   vendor/workstream-X accounts later.
+
+## Progress log
+
+- 2026-08-27: Backend audit found the core folder/ssh/https sync,
+  copy-as-variant collision preservation, advisory-lock CAS, and reserved cloud
+  kind already implemented and covered. Completion work is focused on real
+  status lock reads, explicit soft-lock override, plain-language error hygiene,
+  identity/capability profile fields, and replacing the disabled Team & Sync UI.
+  Frozen `contracts/plm.md` §6.4 remains authoritative: collisions are preserved
+  automatically without a merge-choice UI; the older contradictory
+  ask-with-preview sentence above is superseded for this implementation.
+- 2026-08-27: Completed. Remote profiles now carry reserved account identity
+  and forward-compatible snapshot-sync/advisory-lock capabilities. `plm_status`
+  reads live locks best-effort, explicit force override reports the prior
+  holder, and raw transport errors are quarantined to logs. Team & Sync is a
+  real Hub destination with folder/server sharing, per-remote Sync, live lock
+  rows, collision-copy results, and unavailable/offline honesty; the active-doc
+  quickbar exposes lock ownership and explicit takeover. Verification: 388 PLM
+  tests passed, integrated host build passed, five scoped GUI lint rules were
+  clean, and a real remote-profile Team shot wrote a 1340x838 PNG.

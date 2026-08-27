@@ -315,6 +315,10 @@ def test_ssh_labeled_remote_unreachable_end_to_end(tmp_path):
     assert out["ok"] is False
     assert out["reason"] == "remote_unreachable"
     assert out.get("hint")
+    lowered = out["hint"].lower()
+    assert "fatal" not in lowered
+    assert "repository" not in lowered
+    assert "does/not/exist.git" not in lowered
 
 
 # ---------------------------------------------------------------------------
@@ -344,9 +348,26 @@ def test_classify_transport_error_ssh_permission_denied_is_remote_auth():
     )
     err = remote._classify_transport_error(e, "ssh://git@example.invalid/repo.git")
     assert err.reason == "remote_auth"
+    assert err.hint == (
+        "Authentication for the shared project failed. Sign in and try again."
+    )
+    lowered = err.hint.lower()
+    assert "fatal" not in lowered
+    assert "repository" not in lowered
+    assert "permission denied" not in lowered
+    assert str(e) not in err.hint
 
 
 def test_classify_transport_error_generic_failure_is_remote_unreachable():
     e = ConnectionRefusedError("Connection refused")
     err = remote._classify_transport_error(e, "ssh://example.invalid/repo.git")
     assert err.reason == "remote_unreachable"
+    assert err.hint == (
+        "The shared project could not be reached. "
+        "Check its location and connection, then try again."
+    )
+    lowered = err.hint.lower()
+    assert "fatal" not in lowered
+    assert "repository" not in lowered
+    assert "connection refused" not in lowered
+    assert str(e) not in err.hint

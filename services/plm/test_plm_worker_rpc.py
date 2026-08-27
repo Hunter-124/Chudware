@@ -409,3 +409,56 @@ def test_repack_after_many_saves(project):
         assert r["ok"], r
     packs = list((project / ".aicadvault").rglob("*.pack"))
     assert packs, "expected a packfile after >= 25 auto-commits"
+
+
+def test_remote_identity_and_force_parameters_reach_worker_backend(monkeypatch):
+    from services.plm import remote
+
+    seen = {}
+
+    def fake_add(project_dir, name, **kwargs):
+        seen["add"] = (project_dir, name, kwargs)
+        return {"ok": True, "remote": {"id": "r1"}}
+
+    def fake_lock(project_dir, item_id, **kwargs):
+        seen["lock"] = (project_dir, item_id, kwargs)
+        return {"ok": True, "lock": {"item_id": item_id}}
+
+    monkeypatch.setattr(remote, "add_remote", fake_add)
+    monkeypatch.setattr(remote, "plm_lock", fake_lock)
+
+    added = _call(
+        "plm_add_remote",
+        path="/project",
+        kind="https",
+        name="team",
+        url="https://example.invalid/team",
+        display_name="Sarah",
+        account_id="acct-42",
+    )
+    assert added["ok"]
+    assert seen["add"] == (
+        "/project",
+        "team",
+        {
+            "path": "https://example.invalid/team",
+            "kind": "https",
+            "url": "https://example.invalid/team",
+            "display_name": "Sarah",
+            "account_id": "acct-42",
+        },
+    )
+
+    locked = _call(
+        "plm_lock",
+        path="/project",
+        item_id="i123",
+        remote_id="r123",
+        force=True,
+    )
+    assert locked["ok"]
+    assert seen["lock"] == (
+        "/project",
+        "i123",
+        {"remote": "r123", "force": True},
+    )

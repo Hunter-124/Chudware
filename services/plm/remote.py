@@ -27,8 +27,10 @@ All public functions return the flat ``{ok:…}`` envelope (contract §0 / §7).
 """
 from __future__ import annotations
 
+import getpass
 import io
 import json
+import logging
 import os
 import time
 import uuid
@@ -41,6 +43,8 @@ from dulwich.repo import Repo
 
 from services.plm import gitbind, history as hist, manifest, snapshot
 from services.plm.vault import Vault, VaultError, _user_author
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # constants
@@ -317,23 +321,18 @@ def _ensure_dulwich_remote(repo: Repo, name: str, url: str) -> None:
 
 
 def _classify_transport_error(e: Exception, remote_url: str) -> VaultError:
-    """Map a dulwich transport failure to a typed reason (contract §6 remotes).
-
-    https gives an unambiguous signal: dulwich raises its own typed
-    ``HTTPUnauthorized``/``HTTPProxyUnauthorized`` straight from a 401/407
-    response. ssh has no equivalent typed exception — the default
-    ``SubprocessSSHVendor`` shells out to the system ``ssh`` binary, so a
-    rejected or missing key surfaces only as a ``HangupException``/
-    ``GitProtocolError`` whose message embeds the ssh client's stderr (e.g.
-    "Permission denied (publickey)."). We pattern-match that text; anything
-    else (host down, DNS failure, bad path, ...) stays a generic
-    ``remote_unreachable``.
-    """
+    """Map a transport failure to a typed, user-safe reason."""
     from dulwich.client import HTTPProxyUnauthorized, HTTPUnauthorized
 
+    # Keep transport/vendor details on the service side. Locations may contain
+    # credentials, so log the exception without echoing the remote URL.
+    _LOG.warning(
+        "PLM remote transport failure (%s): %s", type(e).__name__, e
+    )
     if isinstance(e, (HTTPUnauthorized, HTTPProxyUnauthorized)):
         return VaultError(
-            "remote_auth", f"authentication failed for the shared project: {e}"
+            "remote_auth",
+            "Authentication for the shared project failed. Sign in and try again.",
         )
     msg = str(e).lower()
     if any(
@@ -349,9 +348,13 @@ def _classify_transport_error(e: Exception, remote_url: str) -> VaultError:
         )
     ):
         return VaultError(
-            "remote_auth", f"authentication failed for the shared project: {e}"
+            "remote_auth",
+            "Authentication for the shared project failed. Sign in and try again.",
         )
-    return VaultError("remote_unreachable", f"could not reach the shared project: {e}")
+    return VaultError(
+        "remote_unreachable",
+        "The shared project could not be reached. Check its location and connection, then try again.",
+    )
 
 
 def _fetch_folder(repo: Repo, remote_url: str, remote_name: str = "origin") -> dict[bytes, bytes]:
@@ -558,8 +561,12 @@ def seed_remote(project_dir: str | os.PathLike, remote_path: str | os.PathLike) 
                             errstream=io.BytesIO(),
                             outstream=io.BytesIO(),
                         )
-                    except Exception as e:
-                        return _err("remote_unreachable", f"could not seed the shared project: {e}")
+                    except Exception:  # noqa: BLE001
+                        _LOG.exception("Could not seed PLM remote")
+                        return _err(
+                            "remote_unreachable",
+                            "The shared project could not be created at that location.",
+                        )
                 rr = Repo(str(remote_path))
                 try:
                     rtip = _branch_tip(rr) or tip
@@ -585,8 +592,9 @@ def seed_remote(project_dir: str | os.PathLike, remote_path: str | os.PathLike) 
         return _ok(remote_path=str(remote_path), seeded=True)
     except VaultError as e:
         return _err(e.reason, e.hint)
-    except Exception as e:  # noqa: BLE001
-        return _err("internal", f"{type(e).__name__}: {e}")
+    except Exception:  # noqa: BLE001
+        _LOG.exception("Could not seed PLM remote")
+        return _err("internal", "Team sharing could not create the shared project.")
 
 
 def clone_from_remote(
@@ -609,8 +617,12 @@ def clone_from_remote(
 
         try:
             porcelain.clone(str(remote_path), str(vdir), bare=True)
-        except Exception as e:
-            return _err("remote_unreachable", f"could not copy the shared project: {e}")
+        except Exception:  # noqa: BLE001
+            _LOG.exception("Could not clone PLM remote")
+            return _err(
+                "remote_unreachable",
+                "The shared project could not be copied to this device.",
+            )
 
         repo = Repo(str(vdir))
         try:
@@ -641,13 +653,36 @@ def clone_from_remote(
         return _ok(project_dir=str(dest), project_id=project_id, remote_path=str(remote_path))
     except VaultError as e:
         return _err(e.reason, e.hint)
-    except Exception as e:  # noqa: BLE001
-        return _err("internal", f"{type(e).__name__}: {e}")
+    except Exception:  # noqa: BLE001
+        _LOG.exception("Could not clone PLM remote")
+        return _err("internal", "Team sharing could not copy the shared project.")
 
 
 # ---------------------------------------------------------------------------
 # add_remote
 # ---------------------------------------------------------------------------
+
+def _remote_identity(
+    display_name: str | None = None,
+    account_id: str | None = None,
+) -> dict[str, Any]:
+    """Identity stored with a local remote profile, with an OS-user fallback."""
+    author = _user_author()
+    user_id = str(author.get("id") or "").strip()
+    display = str(display_name or author.get("display") or "").strip()
+    if not user_id or user_id == "user":
+        user_id = getpass.getuser() or "user"
+    if not display or display == "User":
+        display = user_id
+    resolved_account = account_id
+    if resolved_account is None:
+        resolved_account = author.get("account_id")
+    return {
+        "user_id": user_id,
+        "display": display,
+        "account_id": str(resolved_account).strip() if resolved_account else None,
+    }
+
 
 def add_remote(
     project_dir: str | os.PathLike,
@@ -656,11 +691,13 @@ def add_remote(
     *,
     kind: str = "folder",
     url: str | None = None,
+    display_name: str | None = None,
+    account_id: str | None = None,
 ) -> dict[str, Any]:
     """Register a remote profile in the project manifest (contract §6.1 / §7).
 
-    ``chudware-cloud`` is accepted config-only (reserved). Folder remotes also get
-    a dulwich ``remote.<name>.url`` entry for fetch/push.
+    ``chudware-cloud`` remains parseable but reserved. Every profile records
+    the local identity and the capabilities this profile shape can support.
     """
     try:
         kind = (kind or "folder").strip()
@@ -697,6 +734,8 @@ def add_remote(
                 "kind": kind,
                 "url": remote_url,
                 "name": name,
+                "identity": _remote_identity(display_name, account_id),
+                "capabilities": list(manifest.REMOTE_CAPABILITIES),
             }
             if kind == "chudware-cloud":
                 entry["reserved"] = True
@@ -723,7 +762,8 @@ def add_remote(
     except VaultError as e:
         return _err(e.reason, e.hint)
     except Exception as e:  # noqa: BLE001
-        return _err("internal", f"{type(e).__name__}: {e}")
+        _LOG.exception("Could not register PLM remote")
+        return _err("internal", "Team sharing could not save this remote.")
 
 
 # ---------------------------------------------------------------------------
@@ -768,8 +808,9 @@ def sync(project_dir: str | os.PathLike, remote: str = "origin") -> dict[str, An
         return _err("contended", "the shared project kept changing; try sync again")
     except VaultError as e:
         return _err(e.reason, e.hint)
-    except Exception as e:  # noqa: BLE001
-        return _err("internal", f"{type(e).__name__}: {e}")
+    except Exception:  # noqa: BLE001
+        _LOG.exception("Could not sync PLM remote")
+        return _err("internal", "The shared project could not be synchronized.")
 
 
 def _sync_once(project_dir: Path, remote_url: str, remote_name: str) -> dict[str, Any]:
@@ -944,6 +985,7 @@ def _replay_divergent(
                                 "kind": author.get("kind", "user"),
                                 "id": author.get("id", "user"),
                                 "display": display,
+                                "account_id": author.get("account_id"),
                             }
                             new_data = json.dumps(md, indent=2, sort_keys=True).encode("utf-8")
                         except Exception:
@@ -1028,9 +1070,13 @@ def _write_lock_blob(repo: Repo, doc: dict[str, Any]) -> bytes:
     return blob.id
 
 
-def _lock_holder() -> tuple[str, str]:
+def _lock_holder() -> tuple[str, str, str | None]:
     author = _user_author()
-    return str(author.get("id") or "user"), str(author.get("display") or "User")
+    return (
+        str(author.get("id") or "user"),
+        str(author.get("display") or "User"),
+        str(author["account_id"]) if author.get("account_id") else None,
+    )
 
 
 def _live_lock(entry: dict[str, Any], now: float | None = None) -> bool:
@@ -1045,15 +1091,83 @@ def _live_lock(entry: dict[str, Any], now: float | None = None) -> bool:
     except Exception:
         return True
 
+def _lock_user_id(entry: dict[str, Any]) -> str:
+    return str(entry.get("user_id") or entry.get("holder") or "user")
+
+
+def _public_lock(entry: dict[str, Any]) -> dict[str, Any]:
+    """Stable status/override shape, tolerant of pre-account lock blobs."""
+    return {
+        "item_id": str(entry.get("item_id") or ""),
+        "user_id": _lock_user_id(entry),
+        "display": str(entry.get("display") or _lock_user_id(entry)),
+        "account_id": entry.get("account_id"),
+        "acquired_at": str(entry.get("acquired_at") or ""),
+        "expires_at": str(entry.get("expires_at") or ""),
+    }
+
+
+def list_locks(
+    project_dir: str | os.PathLike,
+    remote: str = "origin",
+) -> dict[str, Any]:
+    """Read the configured remote lock ref without mutating it."""
+    project_dir = Path(project_dir)
+    try:
+        v = Vault.open(project_dir)
+        try:
+            m = v.manifest()
+        finally:
+            v.close()
+        entry = _remote_entry_by_name(m, remote)
+        if entry is None and remote == "origin":
+            entry = next(
+                (r for r in m.get("remotes", []) or []
+                 if r.get("kind") in ("folder", "ssh", "https")),
+                None,
+            )
+        if entry is None:
+            return _ok(locks=[])
+        kind = entry.get("kind")
+        if kind == "chudware-cloud":
+            return _err("reserved_remote", "Chudware Cloud is not available yet")
+        if kind not in ("folder", "ssh", "https"):
+            return _err("invalid_mode", "This remote type cannot provide shared locks.")
+        remote_url = entry.get("url")
+        if not remote_url:
+            return _err("remote_unreachable", "This remote has no shared location.")
+        lock_ref = str(m.get("lock_ref") or "refs/aicad/locks").encode("utf-8")
+        repo = _open_vault_repo(project_dir)
+        try:
+            _fetch_folder(repo, str(remote_url), str(entry.get("name") or "origin"))
+            lock_sha = _ls_remote(str(remote_url)).get(lock_ref)
+            doc = _read_lock_blob(repo, lock_sha)
+            now = time.time()
+            locks = [
+                _public_lock(lock)
+                for lock in doc.get("locks", []) or []
+                if isinstance(lock, dict) and _live_lock(lock, now)
+            ]
+            return _ok(locks=locks)
+        finally:
+            repo.close()
+    except VaultError as e:
+        return _err(e.reason, e.hint)
+    except Exception:  # noqa: BLE001
+        _LOG.exception("Could not read PLM remote locks")
+        return _err("internal", "Shared editing status is temporarily unavailable.")
 
 def plm_lock(
     project_dir: str | os.PathLike,
     item_id: str,
     remote: str = "origin",
+    *,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Advisory lock via CAS on ``refs/aicad/locks`` (contract §6.3)."""
-    return _lock_mutate(project_dir, item_id, remote, acquire=True)
-
+    """Acquire an advisory lock, optionally replacing another live holder."""
+    return _lock_mutate(
+        project_dir, item_id, remote, acquire=True, force=bool(force)
+    )
 
 def plm_unlock(
     project_dir: str | os.PathLike,
@@ -1070,6 +1184,7 @@ def _lock_mutate(
     remote: str,
     *,
     acquire: bool,
+    force: bool = False,
 ) -> dict[str, Any]:
     project_dir = Path(project_dir)
     if not item_id:
@@ -1078,112 +1193,119 @@ def _lock_mutate(
         v = Vault.open(project_dir)
         try:
             m = v.manifest()
-            if manifest.find_item(m, item_id) is None and acquire:
-                # still allow lock of known remote items; soft check only
-                pass
             entry = _remote_entry_by_name(m, remote)
             if entry is None and remote == "origin":
-                for r in m.get("remotes") or []:
-                    if r.get("kind") == "folder":
-                        entry = r
-                        break
+                entry = next(
+                    (r for r in m.get("remotes", []) or []
+                     if r.get("kind") in ("folder", "ssh", "https")),
+                    None,
+                )
             if entry is None:
                 return _err("not_found", f"no remote named {remote!r}")
             remote_kind = entry.get("kind")
             if remote_kind == "chudware-cloud":
                 return _err("reserved_remote", "Chudware Cloud is not available yet")
             if remote_kind not in ("folder", "ssh", "https"):
-                return _err("invalid_mode", f"unknown remote kind: {remote_kind}")
+                return _err("invalid_mode", "This remote type cannot provide shared locks.")
             remote_url = entry.get("url")
             if not remote_url:
-                return _err("remote_unreachable", "this remote has no location")
-            remote_name = entry.get("name") or "origin"
+                return _err("remote_unreachable", "This remote has no shared location.")
+            lock_ref = str(m.get("lock_ref") or "refs/aicad/locks").encode("utf-8")
+            remote_name = str(entry.get("name") or "origin")
         finally:
             v.close()
 
-        holder_id, holder_display = _lock_holder()
-
+        holder_id, holder_display, holder_account_id = _lock_holder()
         for _attempt in range(_CAS_RETRIES):
             repo = _open_vault_repo(project_dir)
             try:
-                # fetch so we see the latest lock ref (objects + remote tip)
                 try:
-                    remote_refs = _fetch_folder(repo, remote_url, remote_name)
+                    _fetch_folder(repo, str(remote_url), remote_name)
+                    remote_lock = _ls_remote(str(remote_url)).get(lock_ref)
                 except VaultError as e:
                     return _err(e.reason, e.hint)
-                # prefer remote lock tip from ls/fetch; fall back to local
-                remote_all = _ls_remote(remote_url)
-                remote_lock = remote_all.get(_LOCK_REF)
                 if remote_lock is not None:
-                    # make sure we have the object
-                    if remote_lock not in repo.object_store:
-                        # re-fetch; folder fetch should have imported objects
-                        try:
-                            porcelain.fetch(
-                                repo, remote_url,
-                                errstream=io.BytesIO(), outstream=io.StringIO(),
-                            )
-                        except Exception:
-                            pass
                     expected_old = remote_lock
                     doc = _read_lock_blob(repo, remote_lock)
                 else:
                     expected_old = None
                     doc = _empty_lock_manifest()
 
-                locks = list(doc.get("locks") or [])
                 now = time.time()
-                # drop soft-expired
-                locks = [lk for lk in locks if _live_lock(lk, now)]
-
-                existing = next((lk for lk in locks if lk.get("item_id") == item_id), None)
+                locks = [
+                    lk for lk in list(doc.get("locks") or [])
+                    if isinstance(lk, dict) and _live_lock(lk, now)
+                ]
+                existing = next(
+                    (lk for lk in locks if lk.get("item_id") == item_id),
+                    None,
+                )
                 if acquire:
-                    if existing is not None and existing.get("holder") != holder_id:
-                        who = existing.get("display") or existing.get("holder") or "someone"
-                        return _err("locked", f"{who} is editing this part")
-                    acquired_at = _now_iso()
-                    expires_at = time.strftime(
-                        "%Y-%m-%dT%H:%M:%SZ",
-                        time.gmtime(now + _LOCK_TTL_SEC),
+                    another_holder = (
+                        existing is not None
+                        and _lock_user_id(existing) != holder_id
                     )
+                    if another_holder and not force:
+                        who = existing.get("display") or _lock_user_id(existing)
+                        return _err("locked", f"{who} is editing this part")
+                    overrode = _public_lock(existing) if another_holder else None
                     new_lock = {
                         "item_id": item_id,
                         "holder": holder_id,
+                        "user_id": holder_id,
                         "display": holder_display,
-                        "acquired_at": acquired_at,
-                        "expires_at": expires_at,
+                        "account_id": holder_account_id,
+                        "acquired_at": _now_iso(),
+                        "expires_at": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ",
+                            time.gmtime(now + _LOCK_TTL_SEC),
+                        ),
                     }
-                    if existing is not None:
-                        locks = [new_lock if lk.get("item_id") == item_id else lk for lk in locks]
-                    else:
-                        locks.append(new_lock)
-                    doc = {"schema": _LOCK_SCHEMA, "locks": locks}
-                    new_sha = _write_lock_blob(repo, doc)
-                    ok = _cas_push(repo, remote_url, new_sha, expected_old=expected_old, ref=_LOCK_REF)
-                    if not ok:
-                        continue  # contended retry
-                    return _ok(lock=new_lock)
-                else:
-                    # unlock: only holder (or expired) may remove
                     if existing is None:
-                        return _ok()  # already free
-                    if existing.get("holder") != holder_id:
-                        who = existing.get("display") or existing.get("holder") or "someone"
-                        return _err("locked", f"{who} holds this lock")
-                    locks = [lk for lk in locks if lk.get("item_id") != item_id]
-                    doc = {"schema": _LOCK_SCHEMA, "locks": locks}
-                    new_sha = _write_lock_blob(repo, doc)
-                    ok = _cas_push(repo, remote_url, new_sha, expected_old=expected_old, ref=_LOCK_REF)
-                    if not ok:
+                        locks.append(new_lock)
+                    else:
+                        locks = [
+                            new_lock if lk.get("item_id") == item_id else lk
+                            for lk in locks
+                        ]
+                    new_sha = _write_lock_blob(
+                        repo, {"schema": _LOCK_SCHEMA, "locks": locks}
+                    )
+                    if not _cas_push(
+                        repo, str(remote_url), new_sha,
+                        expected_old=expected_old, ref=lock_ref,
+                    ):
                         continue
+                    fields: dict[str, Any] = {"lock": new_lock}
+                    if overrode is not None:
+                        fields["overrode"] = overrode
+                    return _ok(**fields)
+
+                if existing is None:
                     return _ok()
+                if _lock_user_id(existing) != holder_id:
+                    who = existing.get("display") or _lock_user_id(existing)
+                    return _err("locked", f"{who} holds this lock")
+                locks = [
+                    lk for lk in locks if lk.get("item_id") != item_id
+                ]
+                new_sha = _write_lock_blob(
+                    repo, {"schema": _LOCK_SCHEMA, "locks": locks}
+                )
+                if not _cas_push(
+                    repo, str(remote_url), new_sha,
+                    expected_old=expected_old, ref=lock_ref,
+                ):
+                    continue
+                return _ok()
             finally:
                 repo.close()
-        return _err("contended", "the lock kept changing; try again")
+        return _err("contended", "The shared lock kept changing. Try again.")
     except VaultError as e:
         return _err(e.reason, e.hint)
-    except Exception as e:  # noqa: BLE001
-        return _err("internal", f"{type(e).__name__}: {e}")
+    except Exception:  # noqa: BLE001
+        _LOG.exception("Could not update PLM remote lock")
+        return _err("internal", "The shared lock could not be updated.")
 
 
 # ---------------------------------------------------------------------------
@@ -1195,8 +1317,18 @@ def plm_add_remote(
     kind: str,
     name: str,
     url: str | None = None,
+    display_name: str | None = None,
+    account_id: str | None = None,
 ) -> dict[str, Any]:
-    return add_remote(project_dir, name, path=url, kind=kind, url=url)
+    return add_remote(
+        project_dir,
+        name,
+        path=url,
+        kind=kind,
+        url=url,
+        display_name=display_name,
+        account_id=account_id,
+    )
 
 
 def plm_sync(project_dir: str | os.PathLike, remote_id: str = "origin") -> dict[str, Any]:

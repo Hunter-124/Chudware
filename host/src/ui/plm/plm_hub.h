@@ -54,6 +54,24 @@ struct PlmWhereUsedRow {
     int count = 1;                                     // reference multiplicity
 };
 
+// ---- Team & Sync row shapes (parsed from plm_status — contract §6, T-R7) -------
+
+// One shared location the project can sync with (manifest.remotes[] §6.1). The
+// optional identity is how THIS machine appears to the team on that location;
+// capabilities say what the service can actually do against it.
+struct PlmRemoteRow {
+    std::string id, kind, url, name;   // kind: folder | ssh | https | chudware-cloud
+    bool reserved = false;             // chudware-cloud config-only seam (§6.1)
+    std::string identityUserId, identityDisplay, identityAccountId;
+    bool canSync = false;              // capabilities: "snapshot_sync"
+    bool canLock = false;              // capabilities: "advisory_locks"
+};
+
+// One advisory lock (§6.2) — a courtesy presence signal, never a hard block.
+struct PlmLockRow {
+    std::string itemId, userId, display, accountId, acquiredAt, expiresAt;
+};
+
 // ---- Git tab row shapes (parsed from the git_* envelopes) ---------------------
 
 struct PlmGitFileRow {
@@ -211,6 +229,21 @@ struct PlmHubState {
     char        gitCommitMsg[512] = {};
     char        gitNewBranch[128] = {};
 
+    // team & sync (Team page; the quickbar reads the same cache for presence)
+    int         teamGen = -1; bool teamLoading = false; std::string teamErr;
+    double      teamFetchedAt = -1.0e9;   // ImGui time of the last fill (locks age out)
+    std::vector<PlmRemoteRow> remotes;
+    std::vector<PlmLockRow>   locks;
+    std::string syncingRemote;            // remote id with a sync in flight ("" = none)
+    std::string lastSyncRemote;           // remote id of the last finished sync
+    std::string lastSyncMsg;              // plain-language outcome of that sync
+    bool        lastSyncOk = false;
+    std::vector<std::string> lastSyncCopies;  // names preserved as copies (§6.4)
+    char        shareLocation[512] = {};  // Share-this-project dialog buffers
+    char        shareName[128] = {};
+    char        shareDisplay[128] = {};
+    int         shareKind = 0;            // 0 folder | 1 ssh | 2 https (cloud disabled)
+
     // transient action state / input buffers
     char        checkpointMsg[256] = {};
     bool        busy = false;             // a mutation is in flight
@@ -270,6 +303,17 @@ void        plmEnsureVersionGraph(AppState& st);
 void        plmEnsurePlanning(AppState& st);
 void        plmEnsureSettings(AppState& st);
 void        plmEnsureGit(AppState& st);
+void        plmEnsureTeam(AppState& st);     // remotes + advisory locks (plm_status)
+// The shared location that lock/presence actions run against: the first
+// non-reserved remote advertising advisory locks (nullptr = none configured).
+const PlmRemoteRow* plmTeamLockRemote();
+long long   plmIsoToUnix(const std::string& iso);  // "…T…Z" -> unix seconds (0 = unparsable)
+bool        plmLockLive(const PlmLockRow& l);      // not yet soft-expired (§6.2)
+std::string plmNiceTime(const std::string& iso);   // "2026-07-07T19:54:28Z" -> "2026-07-07  19:54"
+// Reason-first plain-language error for sync/lock/share envelopes. Transport or
+// tool vocabulary never reaches the user (contract §8.1): unknown reasons whose
+// hint reads technical degrade to a generic message.
+std::string plmTeamFriendlyError(const std::string& reason, const std::string& hint);
 // convenience: build the {"path": …} param object for the current project.
 
 // ---- page bodies (defined in plm_pages.cpp) -----------------------------------

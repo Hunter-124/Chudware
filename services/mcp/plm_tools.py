@@ -595,16 +595,26 @@ def register_plm_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     @_with_project_path
     def plm_add_remote(path: str = "", kind: str = "folder", name: str = "origin",
-                       url: str = "") -> str:
-        """Register a remote profile for team sync. ``kind`` ∈ ``folder`` |
-        ``ssh`` | ``https`` | ``chudware-cloud`` (config-only). Folder remotes use
-        a bare repo path. Returns ``{ok, remote}``."""
+                       url: str = "", display_name: str = "",
+                       account_id: str = "") -> str:
+        """Register a team-sync profile with optional account identity.
+
+        ``kind`` is ``folder`` | ``ssh`` | ``https`` | ``chudware-cloud``.
+        The cloud kind is stored for forward compatibility but cannot activate.
+        """
         try:
             from services.plm import remote as remote_mod
         except ImportError:
             return _err("no_vault", "version history is not available on this machine")
-        out = remote_mod.add_remote(path, name, path=url or None, kind=kind,
-                                    url=url or None)
+        out = remote_mod.add_remote(
+            path,
+            name,
+            path=url or None,
+            kind=kind,
+            url=url or None,
+            display_name=display_name or None,
+            account_id=account_id or None,
+        )
         if not out.get("ok"):
             return _err(str(out.get("reason") or "internal"),
                         str(out.get("hint") or ""))
@@ -629,14 +639,19 @@ def register_plm_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     @_with_project_path
     def plm_lock(path: str = "", item_id: str = "",
-                 remote_id: str = "origin") -> str:
-        """Advisory lock on an item via the shared project (compare-and-swap).
-        Returns ``{ok, lock}`` or ``{ok:false, reason:"locked"}`` when held."""
+                 remote_id: str = "origin", force: bool = False) -> str:
+        """Acquire an advisory item lock.
+
+        By default another live holder is refused. ``force=True`` explicitly
+        replaces that holder and returns the prior identity under ``overrode``.
+        """
         try:
             from services.plm import remote as remote_mod
         except ImportError:
             return _err("no_vault", "version history is not available on this machine")
-        out = remote_mod.plm_lock(path, item_id, remote=remote_id)
+        out = remote_mod.plm_lock(
+            path, item_id, remote=remote_id, force=bool(force)
+        )
         if not out.get("ok"):
             return _err(str(out.get("reason") or "internal"),
                         str(out.get("hint") or ""))

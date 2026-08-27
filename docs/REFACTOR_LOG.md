@@ -8364,3 +8364,7 @@ zero callers — are now exposed as MCP tools; the PCB canvas paints persistent 
 markers like the schematic already did; and the fictional `sim_run`/`sim_cancel{run_id}`
 declaration is deleted from the contract in favour of what ships. `all_recipes()` was
 dead in both languages and is gone.
+
+## 2026-08-27 — PLM team sharing and advisory-lock completion (T-R7)
+
+Completed the existing contract-first remote stack in `services/plm/remote.py`, `vault.py`, worker RPC, and MCP tools: fixed plain-language transport failures with raw detail restricted to logs, best-effort live lock status, expiry, explicit one-confirm force override, reserved account identity, and forward-compatible snapshot-sync/advisory-lock capabilities. The Project Hub now has a real Team & Sync destination, folder/server share dialog, per-remote sync results, live lock rows, and an active-document lock chip/action path. Frozen `contracts/plm.md` §6.4 remains authoritative: divergent edits are automatically preserved as copy-as-new-item with no merge-choice UI; Box mirror remains separate. Verified with 388 PLM tests, isolated/UI compilation, scoped GUI lints, an integrated host build, and a real remote-profile Team headless capture. Concurrent ECAD/public-site/hostd/browser work was excluded.

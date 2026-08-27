@@ -155,7 +155,7 @@ namespace {
 struct RailItem { PlmPage page; const char* label; const char* icon; };
 // The rail's destinations. Files still folds in History + Releases side panels,
 // but Releases is ALSO reachable directly — the lifecycle board deserves the full
-// pane. Planning folds in Milestones, Issues and Team & Sync (see plm_pages.cpp).
+// pane. Planning folds in Milestones and Issues; Team & Sync has its own tab.
 static const RailItem kRail[] = {
     {PlmPage::Overview, "Overview", "app"},
     {PlmPage::Files,    "Files",    "body_folder"},
@@ -163,6 +163,7 @@ static const RailItem kRail[] = {
     {PlmPage::Compare,  "Compare",  "split"},
     {PlmPage::Releases, "Releases", "ok_badge"},
     {PlmPage::Planning, "Planning", "plan_board"},
+    {PlmPage::Team,     "Team",     "team"},
     {PlmPage::Graph,    "Graph",    "mesh"},
     {PlmPage::Git,      "Git",      "git"},
     {PlmPage::Settings, "Settings", "settings"},
@@ -431,6 +432,7 @@ static void drawOnboarding(AppState& st) {
 
 void plmSelectGitPage() { g_plmHub.page = PlmPage::Git; }
 void plmSelectPlanningPage() { g_plmHub.page = PlmPage::Planning; }
+void plmSelectTeamPage() { g_plmHub.page = PlmPage::Team; }
 void plmSelectOverviewPage() { g_plmHub.page = PlmPage::Overview; }
 void plmSelectFilesPage() { g_plmHub.page = PlmPage::Files; }
 void plmSelectGraphPage() { g_plmHub.page = PlmPage::Graph; }
@@ -454,6 +456,7 @@ bool plmBusy() {
         case PlmPage::Issues:   return H.planLoading;
         case PlmPage::Releases: return H.gitLoading;
         case PlmPage::Git:      return H.gitLoading;
+        case PlmPage::Team:     return H.teamLoading;
         case PlmPage::Compare:  return plmCompareBusy();
         case PlmPage::Versions: return H.versionsGraph.loading;
         default:                return false;

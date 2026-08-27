@@ -758,13 +758,22 @@ def _plm_add_remote(params: dict, _emit: Callable) -> dict:
         from services.plm import remote as remote_mod
     except ImportError:
         return dict(_NO_VAULT)
-    path = str((params or {}).get("path", "") or "")
-    kind = str((params or {}).get("kind", "folder") or "folder")
-    name = str((params or {}).get("name", "origin") or "origin")
-    url = (params or {}).get("url")
+    p = params or {}
+    path = str(p.get("path", "") or "")
+    kind = str(p.get("kind", "folder") or "folder")
+    name = str(p.get("name", "origin") or "origin")
+    url = p.get("url")
     if url is None:
-        url = (params or {}).get("remote_path") or (params or {}).get("remote_url")
-    return remote_mod.add_remote(path, name, path=url, kind=kind, url=url)
+        url = p.get("remote_path") or p.get("remote_url")
+    return remote_mod.add_remote(
+        path,
+        name,
+        path=url,
+        kind=kind,
+        url=url,
+        display_name=p.get("display_name"),
+        account_id=p.get("account_id"),
+    )
 
 
 def _plm_sync(params: dict, _emit: Callable) -> dict:
@@ -788,14 +797,13 @@ def _plm_lock(params: dict, _emit: Callable) -> dict:
         from services.plm import remote as remote_mod
     except ImportError:
         return dict(_NO_VAULT)
-    path = str((params or {}).get("path", "") or "")
-    item_id = str((params or {}).get("item_id", "") or "")
-    remote = str(
-        (params or {}).get("remote_id")
-        or (params or {}).get("remote")
-        or "origin"
+    p = params or {}
+    path = str(p.get("path", "") or "")
+    item_id = str(p.get("item_id", "") or "")
+    remote = str(p.get("remote_id") or p.get("remote") or "origin")
+    return remote_mod.plm_lock(
+        path, item_id, remote=remote, force=bool(p.get("force", False))
     )
-    return remote_mod.plm_lock(path, item_id, remote=remote)
 
 
 def _plm_unlock(params: dict, _emit: Callable) -> dict:

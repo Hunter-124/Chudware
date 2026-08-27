@@ -14,6 +14,7 @@ void drawPlmWorkspace(AppState& st);
 // Select a hub page (used by the CHUDWARE_SHOT=git headless capture).
 void plmSelectGitPage();
 void plmSelectPlanningPage();
+void plmSelectTeamPage();
 void plmSelectOverviewPage();
 void plmSelectFilesPage();
 void plmSelectVersionsPage();

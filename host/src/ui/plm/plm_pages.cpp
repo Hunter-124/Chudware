@@ -1,15 +1,16 @@
 // PLM Project Hub — page bodies.
 //
-// Overview (dashboard + quick checkpoint) and Files (items grid + track/link) are
-// implemented here; History/Releases/Planning/Issues/Team/Settings are staged as
-// honest placeholders filled in later phases. Every page reads only the cached
-// rows on g_plmHub (filled by plm_state.cpp) and mutates via async st.rpc; on a
-// successful mutation it bumps the generation so caches refetch.
+// Overview (dashboard + quick checkpoint), Files (items grid + track/link) and
+// Team & Sync (remotes, one-button sync, advisory locks — T-R7) are implemented
+// here. Every page reads only the cached rows on g_plmHub (filled by
+// plm_state.cpp) and mutates via async st.rpc; on a successful mutation it bumps
+// the generation so caches refetch.
 #include "plm_hub.h"
 
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -154,11 +155,8 @@ void statCard(const char* label, int n, const float* col, float w = 0.0f) {
     ImGui::Dummy(sz);
 }
 
-// Shorten an ISO timestamp (2026-07-07T19:54:28Z) to a readable "2026-07-07  19:54".
-std::string plmNiceTime(const std::string& iso) {
-    if (iso.size() < 16 || iso[10] != 'T') return iso;
-    return iso.substr(0, 10) + "  " + iso.substr(11, 5);
-}
+// (ISO timestamp shortening lives in plm_state.cpp as ui::plmNiceTime — the
+// quickbar's presence tooltip spells lock expiry the same way this TU does.)
 
 // Read-only text the user can select and copy (Ctrl-C / right-click). Styled to
 // look like a plain label — transparent frame, no padding, full-width — but it's
@@ -1398,25 +1396,390 @@ void plmDrawReleasesPage(AppState& st) {
 
 // ---- Team & Sync --------------------------------------------------------------
 
+namespace {
+
+// Kind → user-facing label. SSH/HTTPS name the protocol the user picked in the
+// share dialog — that is a deliberate choice, not leaked tool vocabulary.
+const char* teamKindLabel(const std::string& kind) {
+    if (kind == "folder")         return "Shared folder";
+    if (kind == "ssh")            return "Server (SSH)";
+    if (kind == "https")          return "Server (HTTPS)";
+    if (kind == "chudware-cloud") return "Chudware Cloud";
+    return "Shared location";
+}
+
+const char* teamKindIcon(const std::string& kind) {
+    if (kind == "folder")         return "body_folder";
+    if (kind == "chudware-cloud") return "app";
+    return "vendor_globe";
+}
+
+// Share-this-project dialog lifetime. Opening prefills the display name from the
+// OS user; closing from the async add-remote callback is deferred one frame
+// because CloseCurrentPopup only works inside the popup's own scope.
+bool s_shareOpen  = false;
+bool s_shareClose = false;
+
+void openShareDialog() {
+    auto& H = g_plmHub;
+    H.actionErr.clear();
+    if (!H.shareDisplay[0]) {
+        const char* u = std::getenv("USER");
+        if (!u || !u[0]) u = std::getenv("USERNAME");
+        if (u && u[0]) std::snprintf(H.shareDisplay, sizeof(H.shareDisplay), "%s", u);
+    }
+    s_shareOpen = true;
+}
+
+// One-button sync against one shared location (contract §6.3–§6.4). The outcome
+// is stored per remote and reported in plain language. A same-design collision
+// never raises a prompt: the service already preserved BOTH versions as a copy
+// (§6.4) and the UI only reports that it happened.
+void doTeamSync(AppState& st, const std::string& remoteId) {
+    auto& H = g_plmHub;
+    if (!H.syncingRemote.empty()) return;
+    H.syncingRemote = remoteId;
+    if (H.lastSyncRemote == remoteId) { H.lastSyncMsg.clear(); H.lastSyncCopies.clear(); }
+    nlohmann::json p = pathParam(st);
+    p["remote_id"] = remoteId;
+    st.rpc.call("plm_sync", p, [&st, remoteId](const core::RpcResult& r) {
+        auto& H = g_plmHub;
+        H.syncingRemote.clear();
+        H.lastSyncRemote = remoteId;
+        H.lastSyncCopies.clear();
+        std::string hint;
+        if (!plmOk(r, hint)) {
+            H.lastSyncOk = false;
+            H.lastSyncMsg = plmTeamFriendlyError(plmReason(r), hint);
+            st.toast(ui::ToastLevel::Error, H.lastSyncMsg);
+            return;
+        }
+        const bool pulled = r.result.value("pulled", false);
+        const bool pushed = r.result.value("pushed", false);
+        if (auto c = r.result.find("conflicts_copied"); c != r.result.end() && c->is_array())
+            for (const auto& e : *c) {
+                if (!e.is_object()) continue;
+                std::string n = e.value("name", std::string());
+                if (n.empty()) n = e.value("path", std::string());
+                if (n.empty()) n = e.value("new_item_id", std::string());
+                if (!n.empty()) H.lastSyncCopies.push_back(std::move(n));
+            }
+        H.lastSyncOk = true;
+        if (pulled && pushed)
+            H.lastSyncMsg = "Brought in the team's changes and published yours.";
+        else if (pulled) H.lastSyncMsg = "Brought in the team's changes.";
+        else if (pushed) H.lastSyncMsg = "Published your changes.";
+        else             H.lastSyncMsg = "Already up to date.";
+        if (!H.lastSyncCopies.empty()) {
+            char extra[96];
+            std::snprintf(extra, sizeof(extra),
+                          " %d design%s edited on both sides — both versions were kept.",
+                          (int)H.lastSyncCopies.size(),
+                          H.lastSyncCopies.size() == 1 ? " was" : "s were");
+            H.lastSyncMsg += extra;
+        }
+        st.toast(ui::ToastLevel::Success, H.lastSyncMsg);
+        plmInvalidate();   // a pull may have rewritten items/history — refetch all
+    });
+}
+
+void doAddRemote(AppState& st) {
+    auto& H = g_plmHub;
+    if (H.busy || !H.shareLocation[0]) return;
+    H.busy = true; H.actionErr.clear();
+    static const char* kKinds[] = {"folder", "ssh", "https"};
+    const int k = std::clamp(H.shareKind, 0, 2);
+    nlohmann::json p = pathParam(st);
+    p["kind"] = kKinds[k];
+    p["url"]  = H.shareLocation;
+    p["name"] = H.shareName[0] ? H.shareName
+                               : (k == 0 ? "Team folder" : "Team server");
+    if (H.shareDisplay[0]) p["display_name"] = H.shareDisplay;
+    st.rpc.call("plm_add_remote", p, [&st](const core::RpcResult& r) {
+        auto& H = g_plmHub;
+        H.busy = false;
+        std::string hint;
+        if (!plmOk(r, hint)) {
+            H.actionErr = plmTeamFriendlyError(plmReason(r), hint);
+            return;
+        }
+        H.actionErr.clear();
+        H.shareLocation[0] = '\0';
+        H.shareName[0] = '\0';
+        s_shareClose = true;
+        st.toast(ui::ToastLevel::Success,
+                 "Connected — press Sync now to share and receive changes");
+        plmInvalidate();
+    });
+}
+
+// Release one of MY advisory locks from the Team page (the quickbar owns
+// acquire/override for the active document).
+void doTeamUnlock(AppState& st, const std::string& itemId) {
+    auto& H = g_plmHub;
+    const PlmRemoteRow* rm = plmTeamLockRemote();
+    if (H.busy || !rm) return;
+    H.busy = true;
+    nlohmann::json p = pathParam(st);
+    p["item_id"] = itemId;
+    p["remote_id"] = rm->id;
+    st.rpc.call("plm_unlock", p, [&st](const core::RpcResult& r) {
+        g_plmHub.busy = false;
+        std::string hint;
+        if (!plmOk(r, hint)) {
+            st.toast(ui::ToastLevel::Error, plmTeamFriendlyError(plmReason(r), hint));
+            return;
+        }
+        st.toast(ui::ToastLevel::Info, "Editing lock released");
+        plmInvalidate();
+    });
+}
+
+void drawShareProjectDialog(AppState& st) {
+    auto& H = g_plmHub;
+    const float S = ui::uiScale;
+    if (s_shareOpen) {
+        ImGui::OpenPopup("Share this project##plm_share");
+        s_shareOpen = false;   // consume: the popup now owns its lifetime
+    }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Share this project##plm_share", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 420 * S);
+    dimText("Pick where the team meets: a folder everyone can reach, or a server "
+            "you control. Everyone keeps a full private copy of the project and "
+            "Sync brings changes together.");
+    ImGui::PopTextWrapPos();
+    ImGui::Dummy(ImVec2(0, 4 * S));
+
+    struct KindOpt { const char* label; const char* hint; };
+    static const KindOpt kOpts[] = {
+        {"Shared folder",  "A folder everyone can reach — a network drive or shared disk."},
+        {"Server (SSH)",   "Your own server, reached over SSH."},
+        {"Server (HTTPS)", "A server you control, reached over HTTPS."},
+    };
+    for (int i = 0; i < 3; ++i) {
+        if (i) ImGui::SameLine();
+        const bool sel = (H.shareKind == i);
+        ImGui::PushStyleColor(ImGuiCol_Button, sel
+            ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.30f)
+            : ImVec4(palette.button[0], palette.button[1], palette.button[2], 0.5f));
+        if (ImGui::Button(kOpts[i].label)) H.shareKind = i;
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kOpts[i].hint);
+    }
+    ImGui::SameLine();
+    (void)ui::kit::secondaryButton("Chudware Cloud", false, "Not yet available");
+
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    if (H.shareKind == 0) {
+        dimText("The folder everyone can reach:");
+        ImGui::SetNextItemWidth(-(84 * S));
+        ImGui::InputTextWithHint("##share_loc", "e.g. a network drive or shared disk",
+                                 H.shareLocation, sizeof(H.shareLocation));
+        ImGui::SameLine();
+        if (ImGui::Button("Browse\xe2\x80\xa6", ImVec2(76 * S, 0))) {
+            std::string abs = ui::openFolderDialog();
+            if (!abs.empty())
+                std::snprintf(H.shareLocation, sizeof(H.shareLocation), "%s",
+                              abs.c_str());
+        }
+    } else {
+        dimText("The server address for this project:");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##share_loc",
+            H.shareKind == 1 ? "e.g. user@host:projects/gearbox"
+                             : "e.g. https://host/projects/gearbox",
+            H.shareLocation, sizeof(H.shareLocation));
+    }
+
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    dimText("You'll appear to the team as:");
+    ImGui::SetNextItemWidth(240 * S);
+    ImGui::InputTextWithHint("##share_disp", "your name",
+                             H.shareDisplay, sizeof(H.shareDisplay));
+    dimText("Name this location (optional):");
+    ImGui::SetNextItemWidth(240 * S);
+    ImGui::InputTextWithHint("##share_name",
+                             H.shareKind == 0 ? "Team folder" : "Team server",
+                             H.shareName, sizeof(H.shareName));
+
+    ui::kit::inlineStatus(H.actionErr.c_str(), ui::kit::Tone::Err);
+    ImGui::Dummy(ImVec2(0, 6 * S));
+    if (H.busy) {
+        plmSpinner("Connecting");
+    } else {
+        if (ui::kit::primaryButton("Connect", H.shareLocation[0] != '\0',
+                                   "Pick a folder or enter an address first"))
+            doAddRemote(st);
+        ImGui::SameLine();
+        if (ui::kit::secondaryButton("Cancel")) {
+            H.actionErr.clear();
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    if (s_shareClose) { s_shareClose = false; ImGui::CloseCurrentPopup(); }
+    ImGui::EndPopup();
+}
+
+// One shared-location card: kind + capabilities, where it lives, how you appear
+// to the team there, the Sync button and the last sync's plain-language result.
+void drawRemoteCard(AppState& st, const PlmRemoteRow& rm) {
+    auto& H = g_plmHub;
+    ImGui::PushID(rm.id.c_str());
+    (void)ui::kit::cardBegin("##remote", rm.name.c_str(), teamKindIcon(rm.kind));
+    ui::kit::chip(teamKindLabel(rm.kind),
+                  rm.reserved ? ui::kit::Tone::Warn : ui::kit::Tone::Accent);
+    if (rm.reserved) {
+        ImGui::SameLine();
+        ui::kit::chip("Not yet available", ui::kit::Tone::Warn, /*dot=*/true);
+    }
+    if (rm.canLock) {
+        ImGui::SameLine();
+        ui::kit::chip("Editing locks", ui::kit::Tone::Ok, /*dot=*/true,
+                      "This location shares who is editing what.");
+    }
+    if (!rm.url.empty())
+        ui::kit::keyValueRow("Location", rm.url.c_str(), ui::kit::Tone::Neutral,
+                             /*copyable=*/true);
+    if (!rm.identityDisplay.empty())
+        ui::kit::keyValueRow("You appear as", rm.identityDisplay.c_str());
+
+    const bool syncing = (H.syncingRemote == rm.id);
+    if (syncing) {
+        ui::kit::spinner("Syncing");
+    } else if (rm.reserved) {
+        (void)ui::kit::primaryButton("Sync now", false,
+                                     "Chudware Cloud is not yet available");
+    } else {
+        const bool idle = H.syncingRemote.empty();
+        if (ui::kit::primaryButton("Sync now", rm.canSync && idle,
+                                   !rm.canSync ? "This location does not support sync"
+                                               : "Another sync is still running"))
+            doTeamSync(st, rm.id);
+    }
+    if (!syncing && H.lastSyncRemote == rm.id && !H.lastSyncMsg.empty()) {
+        ui::kit::inlineStatus(H.lastSyncMsg.c_str(),
+                              H.lastSyncOk ? ui::kit::Tone::Ok : ui::kit::Tone::Err);
+        for (const auto& n : H.lastSyncCopies) {
+            const std::string line = "Both versions kept: " + n;
+            ui::kit::inlineStatus(line.c_str(), ui::kit::Tone::Warn);
+        }
+    }
+    ui::kit::cardEnd();
+    ImGui::PopID();
+}
+
+// The "who's editing what" list — every advisory lock on the shared location.
+// Locks warn, they never block (contract §6.2); expired ones stay visible but
+// read as history, not presence.
+void drawTeamLocks(AppState& st) {
+    auto& H = g_plmHub;
+    if (H.remotes.empty()) {
+        dimText("Editing locks appear here once the project is shared.");
+        return;
+    }
+    const PlmRemoteRow* me = plmTeamLockRemote();
+    if (!me) {
+        dimText("This shared location does not support editing locks.");
+        return;
+    }
+    if (H.locks.empty()) {
+        dimText("No one is holding an editing lock right now. Take one from the "
+                "PLM chip on an open document.");
+        return;
+    }
+    for (const auto& l : H.locks) {
+        const bool live = plmLockLive(l);
+        const bool mine = !me->identityUserId.empty() &&
+                          l.userId == me->identityUserId;
+        ImGui::PushID(l.itemId.c_str());
+        plmCardBegin("##lock", false, 8.0f, 4.0f,
+                     live ? (mine ? palette.accent : palette.statusWarn)
+                          : palette.textDim, 0.12f);
+        std::string itemName = l.itemId;
+        for (const auto& it : H.items)
+            if (it.itemId == l.itemId) {
+                if (!it.path.empty()) itemName = it.path;
+                break;
+            }
+        plmItemTitle(itemName);
+        ui::kit::chip(live ? (mine ? "You are editing" : "Editing") : "Expired",
+                      live ? (mine ? ui::kit::Tone::Ok : ui::kit::Tone::Warn)
+                           : ui::kit::Tone::Neutral, /*dot=*/true);
+        const std::string who = mine ? std::string("You")
+                                     : (l.display.empty() ? l.userId : l.display);
+        std::string sub = who + "  \xc2\xb7  since " + plmNiceTime(l.acquiredAt);
+        if (!l.expiresAt.empty()) sub += "  \xc2\xb7  until " + plmNiceTime(l.expiresAt);
+        dimText("%s", sub.c_str());
+        if (mine && live) {
+            plmActionRowBegin();
+            if (ImGui::SmallButton("Release") && !H.busy) doTeamUnlock(st, l.itemId);
+            plmActionRowEnd();
+        }
+        plmCardEnd();
+        ImGui::PopID();
+    }
+}
+
+}  // namespace
+
 void plmDrawTeamPage(AppState& st) {
-    (void)st;
+    auto& H = g_plmHub;
+    const float S = ui::uiScale;
+    plmEnsureTeam(st);
+    plmEnsureItems(st);   // lock rows name items by path, not raw ids
+
     plmSectionHeader("Team & Sync", "team");
     dimText("Share a project through a shared folder or your own server. Everyone "
             "keeps working; Sync brings changes together without ever merging or "
-            "losing work — if two people change the same design, both versions are "
-            "kept.");
-    ImGui::Spacing();
-    plmSectionHeader("Shared locations", "vendor_globe");
-    dimText("No shared location connected yet.");
-    ImGui::Spacing();
-    ImGui::BeginDisabled(true);
-    ImGui::Button("Connect a shared folder\xe2\x80\xa6");
-    ImGui::SameLine();
-    ImGui::Button("Sync now");
-    ImGui::EndDisabled();
-    ImGui::Spacing();
-    dimText("Sharing and Sync arrive in a later update — the project is fully "
-            "usable on this machine today.");
+            "losing work — if two people change the same design, both versions "
+            "are kept.");
+    ImGui::Dummy(ImVec2(0, 6 * S));
+
+    if (H.teamLoading && H.remotes.empty() && H.teamErr.empty()) {
+        plmSpinner("Checking shared locations");
+        return;
+    }
+    if (!H.teamErr.empty()) {
+        plmError(H.teamErr);
+        if (ui::kit::secondaryButton("Try again")) {
+            H.teamErr.clear();
+            H.teamFetchedAt = -1.0e9;   // force the next plmEnsureTeam to refetch
+        }
+        return;
+    }
+
+    const float pgGap = 12 * S;
+    const float colW  = std::floor((ImGui::GetContentRegionAvail().x - pgGap) / 2.0f);
+
+    plmPanelBegin("##team_remotes", "Shared locations", "vendor_globe", colW);
+    if (H.remotes.empty()) {
+        if (ui::kit::emptyState("vendor_globe", "Not shared yet",
+                "Connect a shared folder or a server you control, and everyone "
+                "on the team can open, edit and sync this project.",
+                "Share this project\xe2\x80\xa6"))
+            openShareDialog();
+    } else {
+        for (const auto& rm : H.remotes) drawRemoteCard(st, rm);
+        ImGui::Dummy(ImVec2(0, 2 * S));
+        if (ui::kit::secondaryButton("Share another location\xe2\x80\xa6"))
+            openShareDialog();
+    }
+    plmPanelEnd();
+
+    ImGui::SameLine(0, pgGap);
+    plmPanelBegin("##team_locks", "Who's editing what", "team", colW);
+    dimText("Editing locks are a courtesy signal — they warn, they never block. "
+            "Take or release one from the PLM chip on an open document.");
+    ImGui::Dummy(ImVec2(0, 2 * S));
+    drawTeamLocks(st);
+    if (H.teamLoading && !H.remotes.empty()) plmSpinner("Refreshing");
+    plmPanelEnd();
+
+    drawShareProjectDialog(st);
 }
 
 // ---- Settings -----------------------------------------------------------------
@@ -1561,25 +1924,22 @@ void plmDrawSettingsPage(AppState& st) {
             "enabled; nothing here changes single-machine use.");
     plmPanelEnd();
 
-    // Row 2 · right: Team & Sync (moved here from the Planning page)
+    // Row 2 · right: Team & Sync summary — the real controls live on the Team tab.
     ImGui::SameLine(0, pgGap);
     plmPanelBegin("##set_team", "Team & Sync", "team", colW);
-    dimText("Share a project through a shared folder or your own server. Everyone "
-            "keeps working; Sync brings changes together without ever merging or "
-            "losing work — if two people change the same design, both versions are "
-            "kept.");
-    ImGui::Dummy(ImVec2(0, 6 * S));
-    ImGui::TextUnformatted("Shared locations");
-    dimText("No shared location connected yet.");
+    plmEnsureTeam(st);
+    if (H.remotes.empty()) {
+        dimText("Not shared yet. Connect a shared folder or your own server from "
+                "the Team & Sync page — everyone keeps working and Sync brings "
+                "changes together without ever merging or losing work.");
+    } else {
+        dimText("%d shared location%s connected.", (int)H.remotes.size(),
+                H.remotes.size() == 1 ? "" : "s");
+        for (const auto& rm : H.remotes)
+            ui::kit::keyValueRow(rm.name.c_str(), teamKindLabel(rm.kind));
+    }
     ImGui::Dummy(ImVec2(0, 4 * S));
-    ImGui::BeginDisabled(true);
-    ImGui::Button("Connect a shared folder\xe2\x80\xa6");
-    ImGui::SameLine();
-    ImGui::Button("Sync now");
-    ImGui::EndDisabled();
-    ImGui::Dummy(ImVec2(0, 2 * S));
-    dimText("Sharing and Sync arrive in a later update — the project is fully "
-            "usable on this machine today.");
+    if (ui::kit::secondaryButton("Open Team & Sync")) H.page = PlmPage::Team;
     plmPanelEnd();
 }
 
@@ -2002,7 +2362,7 @@ void plmDrawPlanningPage(AppState& st) {
     ImGui::PopStyleColor();
     plmPanelEnd();
 
-    // (Team & Sync moved to Settings → gives the boards below more vertical room.)
+    // (Team & Sync lives on its own Team tab now.)
     ImGui::Dummy(ImVec2(0, 8 * S));
 
     // ---- Task board (full-width glass columns; no header — the columns label

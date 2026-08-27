@@ -129,6 +129,10 @@ def test_vault_backed_plm_family_exposes_optional_project_path():
         assert schemas[name]["properties"]["path"]["default"] == ""
         assert "path" not in schemas[name].get("required", [])
 
+    assert schemas["plm_lock"]["properties"]["force"]["default"] is False
+    assert schemas["plm_add_remote"]["properties"]["display_name"]["default"] == ""
+    assert schemas["plm_add_remote"]["properties"]["account_id"]["default"] == ""
+
 def test_plm_item_add_file_as_project_root_teaches_complete_call(tmp_path, tools):
     target = tmp_path / "spec.md"
     target.write_text("# Requirements\n")
@@ -451,3 +455,58 @@ def test_plm_lock_unlock_via_tool_confirms_scope(tmp_path, tools):
         os.environ.pop("CHUDWARE_USER_DISPLAY", None)
     assert relock["ok"] is True
     assert relock["lock"]["holder"] == "bob"
+
+
+def test_remote_identity_and_force_parameters_reach_mcp_backend(
+    tools, monkeypatch
+):
+    from services.plm import remote
+
+    seen = {}
+
+    def fake_add(project_dir, name, **kwargs):
+        seen["add"] = (project_dir, name, kwargs)
+        return {"ok": True, "remote": {"id": "r1"}}
+
+    def fake_lock(project_dir, item_id, **kwargs):
+        seen["lock"] = (project_dir, item_id, kwargs)
+        return {
+            "ok": True,
+            "lock": {"item_id": item_id},
+            "overrode": {"user_id": "alice"},
+        }
+
+    monkeypatch.setattr(remote, "add_remote", fake_add)
+    monkeypatch.setattr(remote, "plm_lock", fake_lock)
+
+    added = _j(tools["plm_add_remote"](
+        "/project",
+        "https",
+        "team",
+        "https://example.invalid/team",
+        "Sarah",
+        "acct-42",
+    ))
+    assert added["ok"]
+    assert seen["add"] == (
+        "/project",
+        "team",
+        {
+            "path": "https://example.invalid/team",
+            "kind": "https",
+            "url": "https://example.invalid/team",
+            "display_name": "Sarah",
+            "account_id": "acct-42",
+        },
+    )
+
+    locked = _j(tools["plm_lock"](
+        "/project", "i123", "r123", True
+    ))
+    assert locked["ok"]
+    assert locked["overrode"]["user_id"] == "alice"
+    assert seen["lock"] == (
+        "/project",
+        "i123",
+        {"remote": "r123", "force": True},
+    )

@@ -4007,6 +4007,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     const char *pg = plmShotPage;
     if (pg && std::strcmp(pg, "planning") == 0)
       ui::plmSelectPlanningPage();
+    else if (pg && std::strcmp(pg, "team") == 0)
+      ui::plmSelectTeamPage();
     else if (pg && std::strcmp(pg, "overview") == 0)
       ui::plmSelectOverviewPage();
     else if (pg && std::strcmp(pg, "files") == 0)

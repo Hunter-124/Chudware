@@ -9,6 +9,7 @@
 
 #include "core/app_state.h"
 #include "core/async_rpc.h"
+#include "ui/widgets/kit.h"
 #include "ui_theme.h"
 
 namespace ui {
@@ -26,6 +27,10 @@ struct QuickState {
     char        msg[256] = {};
     char        relNote[256] = {};
     bool        showRelease = false;
+    // advisory-lock actions (contract §6.2/§6.3) — presence itself is read from
+    // the g_plmHub team cache, not stored here
+    bool        lockBusy = false;        // a lock/unlock is in flight
+    bool        confirmOverride = false; // "Take over…" armed, awaiting confirmation
 };
 static QuickState q;
 
@@ -157,12 +162,68 @@ void doRelease(AppState& st) {
     });
 }
 
+// Advisory-lock actions (contract §6.2/§6.3). These run against the SHARED
+// LOCATION and are a courtesy signal to teammates — completely unrelated to the
+// property manager's local engine-daemon document hold. `force` overrides another
+// live holder (plm_lock force=true) and is only reachable through an explicit
+// confirmation step in the popup.
+void doLockAction(AppState& st, bool acquire, bool force) {
+    if (q.lockBusy || !q.haveItem || q.itemId.empty()) return;
+    const PlmRemoteRow* rm = plmTeamLockRemote();
+    if (!rm) return;
+    q.lockBusy = true;
+    nlohmann::json p = pathParam(st);
+    p["item_id"] = q.itemId;
+    p["remote_id"] = rm->id;
+    if (force) p["force"] = true;
+    st.rpc.call(acquire ? "plm_lock" : "plm_unlock", p,
+                [&st, acquire, force](const core::RpcResult& r) {
+        q.lockBusy = false;
+        q.confirmOverride = false;
+        std::string h;
+        if (!plmOk(r, h)) {
+            st.toast(ui::ToastLevel::Error, plmTeamFriendlyError(plmReason(r), h));
+            return;
+        }
+        if (!acquire) {
+            st.toast(ui::ToastLevel::Info, "Editing lock released");
+        } else if (force) {
+            std::string prior;
+            if (auto o = r.result.find("overrode"); o != r.result.end() && o->is_object()) {
+                prior = jstr(*o, "display");
+                if (prior.empty()) prior = jstr(*o, "user_id");
+            }
+            st.toast(ui::ToastLevel::Info,
+                     prior.empty()
+                         ? std::string("You now hold the editing lock")
+                         : "You now hold the editing lock — " + prior +
+                               "'s lock was released");
+        } else {
+            st.toast(ui::ToastLevel::Success,
+                     "You're editing this design — the team can see it");
+        }
+        plmInvalidate();   // locks changed → Team page + presence caches refetch
+    });
+}
+
 }  // namespace
 
 void drawPlmQuickChip(AppState& st) {
     if (st.activeWorkspace == AppState::Workspace::PLM) return;  // hub already showing
     if (!st.workerStarted || st.plmProjectPath().empty()) return;
     resolve(st);
+
+    // Team presence: once the item resolves, keep the shared advisory-lock cache
+    // warm (g_plmHub team cache — refetches at most once a minute) and find a
+    // LIVE lock on this document. Advisory locks warn, they never block.
+    if (q.haveItem) plmEnsureTeam(st);
+    const PlmRemoteRow* lockRemote = plmTeamLockRemote();
+    const PlmLockRow* lock = nullptr;
+    if (lockRemote && q.haveItem)
+        for (const auto& l : g_plmHub.locks)
+            if (l.itemId == q.itemId && plmLockLive(l)) { lock = &l; break; }
+    const bool lockMine = lock && !lockRemote->identityUserId.empty() &&
+                          lock->userId == lockRemote->identityUserId;
 
     const auto& pal = ui::palette;
     // Chip label + hover copy. A naked "PLM" reads as a stray button, so the label always
@@ -213,6 +274,21 @@ void drawPlmQuickChip(AppState& st) {
         ImGui::SetTooltip("%s", tip.c_str());
     }
 
+    // Presence chip: obvious, never blocking — a teammate holds the advisory
+    // lock for THIS document (contract §6.2 "Sarah is editing this part").
+    if (lock && !lockMine) {
+        const std::string who = lock->display.empty() ? lock->userId : lock->display;
+        std::string chipLabel = who + " is editing";
+        std::string chipTip = who + " holds the editing lock for this design.\n";
+        if (!lock->acquiredAt.empty())
+            chipTip += "Since " + plmNiceTime(lock->acquiredAt);
+        if (!lock->expiresAt.empty())
+            chipTip += "  \xc2\xb7  until " + plmNiceTime(lock->expiresAt);
+        chipTip += "\nYou can keep working — if you both edit, Sync keeps both versions.";
+        ImGui::SameLine();
+        kit::chip(chipLabel.c_str(), kit::Tone::Warn, /*dot=*/true, chipTip.c_str());
+    }
+
     if (ImGui::BeginPopup("##plm_quick")) {
         const float S = ui::uiScale;
         if (q.haveItem) {
@@ -253,6 +329,62 @@ void drawPlmQuickChip(AppState& st) {
             }
         }
 
+        // Team presence + the advisory lock for this document. Only shown when a
+        // lock-capable shared location is configured; this is the teammate
+        // courtesy signal, not the local engine document hold.
+        if (q.haveItem && lockRemote) {
+            ImGui::Separator();
+            if (lock && !lockMine) {
+                const std::string who =
+                    lock->display.empty() ? lock->userId : lock->display;
+                std::string line = who + " is editing this design";
+                if (!lock->expiresAt.empty())
+                    line += " (until " + plmNiceTime(lock->expiresAt) + ")";
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 1));
+                ImGui::TextUnformatted(line.c_str());
+                ImGui::PopStyleColor();
+                if (!q.confirmOverride) {
+                    if (ImGui::SmallButton("Take over\xe2\x80\xa6") && !q.lockBusy)
+                        q.confirmOverride = true;
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Releases their lock so yours takes its "
+                                          "place. Asks you to confirm first.");
+                } else {
+                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 300 * S);
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
+                    ImGui::TextWrapped("This releases %s's editing lock. Nobody "
+                                       "loses work — if you both edit, Sync keeps "
+                                       "both versions.", who.c_str());
+                    ImGui::PopStyleColor();
+                    ImGui::PopTextWrapPos();
+                    if (kit::dangerButton("Take over anyway", !q.lockBusy))
+                        doLockAction(st, /*acquire=*/true, /*force=*/true);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Never mind")) q.confirmOverride = false;
+                }
+            } else if (lock && lockMine) {
+                std::string line = "You hold the editing lock";
+                if (!lock->expiresAt.empty())
+                    line += " (until " + plmNiceTime(lock->expiresAt) + ")";
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
+                ImGui::TextUnformatted(line.c_str());
+                ImGui::PopStyleColor();
+                if (ImGui::SmallButton("Release editing lock") && !q.lockBusy)
+                    doLockAction(st, /*acquire=*/false, /*force=*/false);
+            } else {
+                if (ImGui::SmallButton("Take the editing lock") && !q.lockBusy)
+                    doLockAction(st, /*acquire=*/true, /*force=*/false);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Shows teammates you're working on this "
+                                      "design.\nA courtesy signal — it never "
+                                      "blocks anyone.");
+            }
+            if (q.lockBusy) plmSpinner("Updating lock");
+        }
+
         ImGui::Separator();
         if (ImGui::SmallButton("Open Project Hub")) {
             st.activeWorkspace = AppState::Workspace::PLM;
@@ -260,6 +392,8 @@ void drawPlmQuickChip(AppState& st) {
         }
         if (q.busy) plmSpinner("Working");
         ImGui::EndPopup();
+    } else {
+        q.confirmOverride = false;   // closing the popup disarms take-over
     }
 }
 

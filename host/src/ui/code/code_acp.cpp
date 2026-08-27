@@ -165,9 +165,16 @@ ssize_t writeWithoutSigpipe(int fd, const void* data, std::size_t size) {
     const ssize_t result = ::write(fd, data, size);
     const int savedErrno = errno;
     if (result < 0 && savedErrno == EPIPE && !wasPending) {
-        timespec timeout{};
-        while (sigtimedwait(&set, nullptr, &timeout) < 0 && errno == EINTR) {
-        }
+        // POSIX guarantees the blocked SIGPIPE is pending on this thread after
+        // write() reports EPIPE. `sigwait` consumes it without changing the
+        // process-wide disposition and is available on both Linux and macOS;
+        // Linux-only `sigtimedwait` made the ACP workspace fail to compile on
+        // both macOS release runners.
+        int consumedSignal = 0;
+        int waitError = 0;
+        do {
+            waitError = sigwait(&set, &consumedSignal);
+        } while (waitError == EINTR);
     }
     pthread_sigmask(SIG_SETMASK, &oldMask, nullptr);
     errno = savedErrno;

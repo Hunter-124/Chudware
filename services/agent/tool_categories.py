@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Iterable
 
 # Soft cap on tools expanded from a single enable_tools call (and overall expansion).
-CATEGORY_EXPAND_CAP = 40
+CATEGORY_EXPAND_CAP = 64
 
 # Meta-tools the model uses to request more surface area. Always allowed.
 META_TOOLS: frozenset[str] = frozenset({
@@ -42,7 +42,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "make_standard_part",
         "preflight_ops",
         # Explicit, not left to `family:cad`: that expansion is 118 tools trimmed to
-        # whatever room the 40-cap leaves, and `get_part` sorts too late to survive.
+        # whatever room the category cap leaves, and `get_part` sorts too late to survive.
         # It is the single most-named tool in the harness's own prose — every
         # _CONCEPT_REDIRECTS reply ends "get_part() or describe_part() first to see the
         # feature ids" — so an unreachable get_part makes the teaching errors unusable.
@@ -145,6 +145,29 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "list_calcs",
         "list_standard_parts",
         "cad_guide",
+        # Machining reference (2026-08-26): curated cited handbook-class tables
+        # plus the user-supplied-PDF page index.
+        "machining_ref_search",
+        "machining_ref_get",
+        "machining_ref_index_pdf",
+        "machining_ref_search_pdf",
+    ],
+    # Manufacturing planning (2026-08-26): the typed plan scratchpad every
+    # machined/fabricated deliverable is planned in before modeling. Kept as
+    # its own requestable pack so any lane can enable_tools(['mfgplan']).
+    "mfgplan": [
+        "mfg_plan_upsert",
+        "mfg_plan_get",
+        "mfg_plan_check",
+        "mfg_plan_render",
+        "resolve_process",
+        "set_process",
+        "dfm_check",
+        "fit_calc",
+        "recommend_fit",
+        "machining_ref_search",
+        "tap_drill",
+        "feeds_speeds",
     ],
     "sim": [
         "run_fea_static",
@@ -198,38 +221,49 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "describe_toolpaths",
         "cam_cost_estimate",  # named by the parts/quoting playbook; was in no pack
     ],
-    # ECAD, fully curated: no `family:ecad` token. That expansion is 67 tools trimmed
-    # ALPHABETICALLY to whatever the 40-cap leaves after explicit entries, so which half
-    # of the board flow reached the model depended on where the cut happened to land —
-    # and every explicit name added (the thermal/reliability trio below) evicted another
-    # advertised tool off the tail. Two rounds of that cascade were watched live
-    # (ecad_to_3d/ecad_update_from_sch, then ecad_sweep/ecad_thermal_handoff, then
-    # ecad_set_net_class/ecad_stackup_solve) before the token came out. These 40 are
-    # exactly the ecad-family tools the harness NAMES to the model somewhere in
-    # services/**; the remaining 27 are internal/rarely-advertised and stay behind a
-    # deliberate future entry rather than an alphabetical accident.
-    # advertised_tool_audit, 2026-07-30.
+    # ECAD is fully curated: no `family:ecad` token. The explicit pack is deliberately
+    # comprehensive because this discipline spans schematic authoring/readback/export,
+    # board layout, SI/PI, thermal, power, and antennas. Keep it under the 64-tool category
+    # cap so no promised tool is silently trimmed.
     "ecad": [
+        "apply_ascii_edits",
         "board_from_schematic",
         "describe_board",
         "ecad_add_power",
         "ecad_add_zone",
         "ecad_airflow_handoff",
+        "ecad_annotate",
+        "ecad_antenna_analyze",
+        "ecad_antenna_design",
         "ecad_autoplace",
         "ecad_autoroute",
+        "ecad_bom",
+        "ecad_bus",
+        "ecad_bus_entry",
+        "ecad_check_diff_impedance",
         "ecad_check_impedance",
+        "ecad_delete",
         "ecad_design",
+        "ecad_edit_symbol",
         "ecad_export",
+        "ecad_export_kicad",
         "ecad_fill_zones",
         "ecad_find_part",
         "ecad_fpga_check",
+        "ecad_import_kicad",
+        "ecad_junction",
+        "ecad_label",
         "ecad_lint_schematic",
         "ecad_make_board",
         "ecad_make_part",
+        "ecad_netlist",
         "ecad_new_pcb",
         "ecad_new_schematic",
+        "ecad_no_connect",
+        "ecad_note",
         "ecad_optimize_traces",
         "ecad_place_symbol",
+        "ecad_plot",
         "ecad_route_pad_to_pad",
         "ecad_run_dfm",
         "ecad_run_drc",
@@ -242,6 +276,8 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "ecad_stackup_solve",
         "ecad_status",
         "ecad_sweep",
+        "ecad_symbols",
+        "ecad_tf",
         "ecad_thermal_handoff",
         "ecad_to_3d",
         "ecad_update_from_sch",
@@ -250,6 +286,8 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "ecad_vibe_check",
         "ecad_wire",
         "heatsink_select",
+        "power_budget",
+        "render_schematic_ascii",
     ],
     "firmware": [
         "fw_status",
@@ -526,8 +564,8 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     # cad_guide's HYDRAULIC and PIPING playbooks name were unreachable — a numbered
     # procedure ("hydraulic_new, then size_pump/size_cylinder, then verify_piping") whose
     # every step was refused. Its own pack rather than more entries on `sim`: the sim
-    # pack is already 22 explicit names under a 40-cap ceiling, and a model asking for
-    # fluid power does not need the FEA/CFD job surface. advertised_tool_audit, 2026-07-30.
+    # pack already carries a broad FEA/CFD job surface, and a model asking for fluid
+    # power does not need it. advertised_tool_audit, 2026-07-30.
     "fluid": [
         "hydraulic_new",
         "hydraulic_add_component",
@@ -596,6 +634,8 @@ _CATEGORY_DESCS: dict[str, str] = {
     "intake": "Photo intake of real parts: measure, confirm dims, prove first-try fit",
     "sourcing": "Parts catalog search/place, BOM, vendors, scrape import",
     "drawing": "2D drawings, GD&T, export PDF/DXF",
+    "docs": "Reports, work instructions, weld travelers, office conversion",
+    "mfgplan": "Manufacturing plan scratchpad: process, datums, critical dims, DfM, references",
     "reveng": "Reverse engineering: scan/photo/datasheet intake, reconstruct, verify deviation",
     "advisor": "Stage advisory checks and dispute",
     "delegate": "Subagents, ask_user, ledger/dag/buildgraph, mission + org coordination",

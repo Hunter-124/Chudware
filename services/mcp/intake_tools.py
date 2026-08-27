@@ -15,6 +15,7 @@ elicitation is naturally multi-turn over MCP: a tool returns the ask, the user a
 from __future__ import annotations
 
 import json as _json
+import math as _math
 import os as _os
 import tempfile as _tempfile
 from typing import Optional
@@ -359,6 +360,234 @@ def _record_photo_measure(doc_id: str, rec, feature: str, dim: str, res, fit, pr
     return mp, ledger, demands
 
 
+def _dfm_number(value):
+    """Return one finite scalar from feature-param or plain-number storage."""
+    if isinstance(value, dict):
+        value = value.get("value")
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if _math.isfinite(number) else None
+
+
+def _dfm_features(tree_result: dict) -> list[dict]:
+    """Flatten the feature rows exposed by doc_tree without interpreting geometry."""
+    root = tree_result.get("tree", tree_result) if isinstance(tree_result, dict) else {}
+    found: list[dict] = []
+    seen: set[int] = set()
+
+    def visit(node) -> None:
+        if isinstance(node, list):
+            for child in node:
+                visit(child)
+            return
+        if not isinstance(node, dict):
+            return
+        marker = id(node)
+        if marker in seen:
+            return
+        seen.add(marker)
+        if node.get("type") and isinstance(node.get("params"), dict):
+            found.append(node)
+        for key in ("features", "children"):
+            visit(node.get(key))
+
+    visit(root)
+    return found
+
+
+_DFM_FEATURE_SIZE_KEYS = (
+    "diameter", "dia", "width", "thickness", "wall_thickness", "rib_thickness",
+    "radius", "fillet_radius", "chamfer", "size", "height", "length",
+)
+_MACHINING_PROCESSES = frozenset({"cnc_mill", "lathe"})
+_MACHINING_HOLE_ASPECT_WARNING = 5.0
+
+
+def _dfm_min_feature(features: list[dict], limit) -> dict:
+    threshold = _dfm_number(limit)
+    if threshold is None:
+        return {
+            "check": "min_feature", "status": "not_evaluated", "ok": None,
+            "error": "ProcessProfile has no numeric min_feature_mm threshold.",
+        }
+    candidates = []
+    for feature in features:
+        params = feature.get("params") or {}
+        for key in _DFM_FEATURE_SIZE_KEYS:
+            value = _dfm_number(params.get(key))
+            if value is not None and value > 0:
+                candidates.append({
+                    "feature_id": feature.get("id") or feature.get("name"),
+                    "parameter": key, "value_mm": value,
+                })
+    if not candidates:
+        return {
+            "check": "min_feature", "status": "not_evaluated", "ok": None,
+            "limit_mm": threshold,
+            "error": "doc_tree exposed no numeric feature-size parameters to evaluate.",
+        }
+    smallest = min(candidates, key=lambda row: row["value_mm"])
+    passed = smallest["value_mm"] >= threshold
+    return {
+        "check": "min_feature", "status": "pass" if passed else "fail",
+        "ok": passed, "value_mm": round(smallest["value_mm"], 4),
+        "limit_mm": threshold, "feature_id": smallest["feature_id"],
+        "parameter": smallest["parameter"],
+        "note": f"smallest declared feature is {smallest['value_mm']:.3g}mm "
+                f"vs process minimum {threshold:g}mm",
+    }
+
+
+def _dfm_hole_aspect(features: list[dict], process: str) -> dict:
+    if process not in _MACHINING_PROCESSES:
+        return {
+            "check": "hole_depth_diameter", "status": "pass", "ok": True,
+            "note": "machining-only blind-hole aspect warning is not applicable",
+        }
+    holes = []
+    unevaluated = []
+    for feature in features:
+        if str(feature.get("type") or "").strip().casefold() != "hole":
+            continue
+        params = feature.get("params") or {}
+        diameter = _dfm_number(params.get("diameter", params.get("dia")))
+        depth = _dfm_number(params.get("depth"))
+        feature_id = feature.get("id") or feature.get("name")
+        if diameter is None or diameter <= 0 or depth is None or depth <= 0:
+            unevaluated.append(feature_id)
+            continue
+        ratio = depth / diameter
+        holes.append({
+            "feature_id": feature_id, "diameter_mm": diameter, "depth_mm": depth,
+            "ratio": round(ratio, 3), "warning": ratio > _MACHINING_HOLE_ASPECT_WARNING,
+        })
+    if unevaluated:
+        return {
+            "check": "hole_depth_diameter", "status": "not_evaluated", "ok": None,
+            "limit_ratio": _MACHINING_HOLE_ASPECT_WARNING, "holes": holes,
+            "error": "Machining hole(s) lack numeric diameter/depth for aspect evaluation: "
+                     + ", ".join(str(value) for value in unevaluated),
+        }
+    warnings = [hole for hole in holes if hole["warning"]]
+    if warnings:
+        return {
+            "check": "hole_depth_diameter", "status": "fail", "ok": False,
+            "severity": "warning", "limit_ratio": _MACHINING_HOLE_ASPECT_WARNING,
+            "holes": warnings,
+            "note": "hole depth/diameter exceeds the 5:1 machining review threshold; "
+                    "review drill reach, pecking, coolant and runout",
+        }
+    return {
+        "check": "hole_depth_diameter", "status": "pass", "ok": True,
+        "limit_ratio": _MACHINING_HOLE_ASPECT_WARNING, "holes": holes,
+        "note": "all evaluable blind machining holes are at or below 5:1 depth/diameter",
+    }
+
+
+def _dfm_strategy_word(value) -> Optional[str]:
+    word = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "tap": "tapped", "tapping": "tapped",
+        "single_pointed": "single_point", "thread_milled": "thread_mill",
+        "heatset_insert": "heat_set_insert", "insert": "heat_set_insert",
+        "print": "printed", "3d_printed": "printed",
+        "clinch": "clinch_nut", "weld": "weld_nut", "moulded": "molded",
+    }
+    return aliases.get(word, word) or None
+
+
+def _dfm_thread_strategy(features: list[dict], process: str, profile_thread: dict) -> dict:
+    threads = []
+    unknown = []
+    for feature in features:
+        kind = str(feature.get("type") or "").strip().casefold()
+        params = feature.get("params") or {}
+        designation = next((params.get(key) for key in
+                            ("thread", "standard", "tap", "thread_size")
+                            if params.get(key)), None)
+        explicit = next((params.get(key) for key in
+                         ("thread_strategy", "manufacturing_strategy",
+                          "manufacturing_method", "strategy")
+                         if params.get(key) is not None), None)
+        strategy = _dfm_strategy_word(explicit)
+        family = _dfm_strategy_word(params.get("family"))
+        style = _dfm_strategy_word(params.get("style"))
+        if kind == "standard_part" and family == "heat_set_insert":
+            strategy = "heat_set_insert"
+            designation = designation or params.get("size")
+        elif kind == "hole" and style == "tapped":
+            strategy = strategy or "tapped"
+        elif params.get("printed") is True:
+            strategy = "printed"
+        is_thread = bool(designation or strategy or kind == "thread")
+        if not is_thread:
+            continue
+        row = {
+            "feature_id": feature.get("id") or feature.get("name"),
+            "designation": designation,
+            "observed_strategy": strategy,
+        }
+        if strategy is None:
+            unknown.append(row)
+        else:
+            threads.append(row)
+    if unknown:
+        return {
+            "check": "thread_strategy", "status": "not_evaluated", "ok": None,
+            "expected_strategy": profile_thread.get("strategy"), "threads": threads + unknown,
+            "error": "Thread-bearing feature(s) do not state a manufacturing strategy: "
+                     + ", ".join(str(row["feature_id"]) for row in unknown),
+        }
+    if not threads:
+        return {
+            "check": "thread_strategy", "status": "pass", "ok": True,
+            "expected_strategy": profile_thread.get("strategy"), "threads": [],
+            "note": "no thread-bearing features require a process-strategy check",
+        }
+    allowed = {
+        "fdm": {"heat_set_insert", "printed"},
+        "cnc_mill": {"tapped", "thread_mill"},
+        "lathe": {"tapped", "single_point", "thread_mill"},
+        "sheet_metal": {"clinch_nut", "weld_nut"},
+        "laser": set(),
+        "injection": {"molded"},
+    }.get(process, {_dfm_strategy_word(profile_thread.get("strategy"))})
+    allowed.discard(None)
+    incompatible = [row for row in threads if row["observed_strategy"] not in allowed]
+    # Printed FDM threads are only supported at or above the profile's stated minimum.
+    printed_min = str(profile_thread.get("printed_ok_min") or "").strip().upper()
+    if process == "fdm" and printed_min.startswith("M"):
+        minimum = _dfm_number(printed_min[1:])
+        for row in threads:
+            designation = str(row.get("designation") or "").strip().upper()
+            if row["observed_strategy"] != "printed" or not designation.startswith("M"):
+                continue
+            major = _dfm_number(designation[1:].split("X", 1)[0])
+            if minimum is not None and (major is None or major < minimum):
+                incompatible.append(row)
+    passed = not incompatible
+    return {
+        "check": "thread_strategy", "status": "pass" if passed else "fail",
+        "ok": passed, "expected_strategy": profile_thread.get("strategy"),
+        "allowed_strategies": sorted(allowed), "threads": threads,
+        "incompatible": incompatible,
+        "note": "thread strategies match the selected process" if passed else
+                "thread strategy conflicts with the selected process profile",
+    }
+
+
+def _dfm_verdict(checks: list[dict]) -> tuple[str, Optional[bool]]:
+    if any(check.get("status") == "fail" for check in checks):
+        return "fail", False
+    if not checks or any(check.get("status") == "not_evaluated" for check in checks):
+        return "not_evaluated", None
+    return "pass", True
+
+
 def register_intake_tools(mcp: FastMCP) -> None:
 
     # ----------------------------------------------------------------- manufacturing process
@@ -441,40 +670,99 @@ def register_intake_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def dfm_check(process: Optional[str] = None, doc_id: Optional[str] = None) -> str:
-        """Design-for-manufacturing punch list against the part's ProcessProfile thresholds.
+        """Evaluate DfM as pass, fail, or not_evaluated against the ProcessProfile.
 
-        Checks the thinnest wall against the process minimum and (for molding) draft, and returns a
-        pass/fail list with the offending values. Uses the bound process (set_process) unless you
-        override `process`. Run before export so a part that can't be made the chosen way is caught.
+        Checks wall and declared minimum feature size, molding draft, machining blind-hole
+        depth/diameter, and thread strategy.  ``dfm_pass`` is true only when every applicable
+        check ran and passed; evaluation gaps/errors are returned as ``not_evaluated`` with
+        ``dfm_pass:null`` and the original error.
         """
         try:
             d = _doc(doc_id)
             proc = _canon_process(process) or _process_id(d)
             prof = _dfm("dfm_get_profile", {"process": proc})
             params = prof.get("params", {})
-            issues = []
+            checks = []
+
+            minwall = _dfm_number(params.get("min_wall_mm"))
             try:
-                th = cb.call("eval_thickness", {"doc_id": d})
-                mn = th.get("min_thickness_mm")
-                minwall = params.get("min_wall_mm")
-                if isinstance(mn, (int, float)) and isinstance(minwall, (int, float)):
-                    issues.append({"check": "min_wall", "value_mm": round(mn, 3),
-                                   "limit_mm": minwall, "ok": mn >= minwall,
-                                   "note": f"thinnest wall {mn:.2f}mm vs {proc} minimum {minwall}mm"})
-            except Exception:  # noqa: BLE001
-                pass
-            if params.get("draft", {}).get("required"):
+                thickness = cb.call("eval_thickness", {"doc_id": d})
+                measured = _dfm_number((thickness or {}).get("min_thickness_mm"))
+                if measured is None or minwall is None:
+                    checks.append({
+                        "check": "min_wall", "status": "not_evaluated", "ok": None,
+                        "limit_mm": minwall,
+                        "error": "eval_thickness returned no numeric min_thickness_mm"
+                                 if measured is None else
+                                 "ProcessProfile has no numeric min_wall_mm threshold",
+                    })
+                else:
+                    passed = measured >= minwall
+                    checks.append({
+                        "check": "min_wall", "status": "pass" if passed else "fail",
+                        "value_mm": round(measured, 3), "limit_mm": minwall, "ok": passed,
+                        "note": f"thinnest wall {measured:.2f}mm vs "
+                                f"{proc} minimum {minwall:g}mm",
+                    })
+            except Exception as exc:  # noqa: BLE001
+                checks.append({
+                    "check": "min_wall", "status": "not_evaluated", "ok": None,
+                    "limit_mm": minwall, "error": str(exc),
+                })
+
+            features = None
+            tree_error = None
+            try:
+                features = _dfm_features(cb.call("doc_tree", {"doc_id": d}))
+            except Exception as exc:  # noqa: BLE001
+                tree_error = str(exc)
+            if features is None:
+                for check_name in ("min_feature", "hole_depth_diameter", "thread_strategy"):
+                    checks.append({
+                        "check": check_name, "status": "not_evaluated", "ok": None,
+                        "error": tree_error,
+                    })
+            else:
+                checks.append(_dfm_min_feature(features, params.get("min_feature_mm")))
+                checks.append(_dfm_hole_aspect(features, proc))
+                checks.append(_dfm_thread_strategy(
+                    features, proc,
+                    params.get("thread") if isinstance(params.get("thread"), dict) else {},
+                ))
+
+            draft = params.get("draft") if isinstance(params.get("draft"), dict) else {}
+            if draft.get("required"):
+                minimum_draft = _dfm_number(draft.get("min_deg"))
                 try:
-                    dr = cb.call("eval_draft", {"doc_id": d, "pull_dir": [0, 0, 1],
-                                                "min_draft_deg": params["draft"].get("min_deg", 1.0)})
-                    nbelow = dr.get("n_faces_below_threshold", 0)
-                    issues.append({"check": "draft", "faces_below": nbelow,
-                                   "ok": nbelow == 0,
-                                   "note": f"{proc} needs >= {params['draft'].get('min_deg')}deg draft"})
-                except Exception:  # noqa: BLE001
-                    pass
-            ok = all(i.get("ok", True) for i in issues)
-            return _dumps({"ok": True, "process": proc, "dfm_pass": ok, "checks": issues})
+                    result = cb.call("eval_draft", {
+                        "doc_id": d, "pull": [0, 0, 1],
+                        "angle_deg": minimum_draft if minimum_draft is not None else 1.0,
+                    })
+                    below = result.get("n_faces_below_threshold")
+                    if not isinstance(below, int):
+                        checks.append({
+                            "check": "draft", "status": "not_evaluated", "ok": None,
+                            "limit_deg": minimum_draft,
+                            "error": "eval_draft returned no integer n_faces_below_threshold",
+                        })
+                    else:
+                        passed = below == 0
+                        checks.append({
+                            "check": "draft", "status": "pass" if passed else "fail",
+                            "faces_below": below, "limit_deg": minimum_draft, "ok": passed,
+                            "note": f"{proc} needs >= {minimum_draft:g}deg draft",
+                        })
+                except Exception as exc:  # noqa: BLE001
+                    checks.append({
+                        "check": "draft", "status": "not_evaluated", "ok": None,
+                        "limit_deg": minimum_draft, "error": str(exc),
+                    })
+
+            status, dfm_pass = _dfm_verdict(checks)
+            return _dumps({
+                "ok": True, "process": proc, "status": status,
+                "dfm_pass": dfm_pass, "checks": checks,
+            })
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

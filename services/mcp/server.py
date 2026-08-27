@@ -407,6 +407,11 @@ register_req_tools(_reg.view(mcp, "cad"))
 from services.mcp.layout_plan_tools import register_layout_plan_tools
 register_layout_plan_tools(_reg.view(mcp, "cad"))
 
+# Typed, run-ledger manufacturing plan (design-only; physical device tools remain
+# isolated in the default-off manufacture family).
+from services.mcp.mfg_plan_tools import register_mfg_plan_tools
+register_mfg_plan_tools(_reg.view(mcp, "cad"))
+
 # Verify battery (T-H4) — deterministic check dispatcher for RL reward + CI gate.
 from services.mcp.verify_tools import register_verify_tools
 register_verify_tools(_reg.view(mcp, "cad"))

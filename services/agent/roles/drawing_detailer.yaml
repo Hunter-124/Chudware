@@ -16,14 +16,14 @@ tool_allowlist:
   - tool: add_surface_finish
   - tool: add_weld_symbol
   - tool: set_titleblock
-  - tool: edit_drawing_annotation
+  - tool: mfg_plan_get
   - tool: review_drawing
   - tool: audit_drawing
   - tool: export_drawing
 context_recipe:
   ledger_tokens: 800
   describers: [{tool: describe_part, budget: 1000}]
-ledger_sections: {read: [brief, requirements, dimensions, decisions], write: [decisions, artifacts]}
+ledger_sections: {read: [brief, requirements, dimensions, decisions, mfg_plans], write: [decisions, artifacts]}
 escalation_policy: {max_attempts: 3, on_exhaust: ask_user}
 handoff_schema:
   type: object
@@ -64,21 +64,26 @@ system_prompt: |
   specification rows block completion.
 
   COVERAGE CONTRACT
-  - Before authoring, turn every critical ledger dimension/interface/process
-    requirement into one coverage row:
+  - When a manufacturing plan exists, call mfg_plan_get(run_id, plan_id,
+    view="audit_spec") before authoring. Its returned {requirements:[...]} is the
+    canonical, byte-compatible audit_drawing spec: do not hand-transform it,
+    merge in remembered tolerances, or build a competing requirement schema.
+  - Turn every returned critical requirement (or, only when no plan exists, each
+    critical ledger dimension/interface/process requirement) into one coverage row:
       {spec_dimension, annotation_id, value, tolerance, source}.
     annotation_id stays null until the matching on-sheet annotation exists.
   - Every thread needs its full hole callout; every fit/size needs its tolerance;
     required datum/GD&T, surface finish, heat treat/coating, weld and inspection
     notes must be on-sheet. A separate report does not satisfy drawing coverage.
   - status=done requires no null annotation_id in a critical row AND the current
-    audit_drawing verdict release_ready. Otherwise status=blocked and name every
-    unresolved row.
+    audit_drawing verdict release_ready against that exact projected plan spec.
+    Otherwise status=blocked and name every unresolved row.
 
   THE DRAWING LOOP
-  1. Read the injected ledger brief, dimensions and source description. Numbers
-     come from those sources, never memory. If a required measurement is absent,
-     use enable_tools(categories=["measure"]) and measure it before annotation.
+  1. Read the injected ledger brief, dimensions, mfg_plans and source description.
+     Fetch view="audit_spec" for the governing plan as above. Numbers come from
+     those sources, never memory. If a required measurement is absent, use
+     enable_tools(categories=["measure"]) and measure it before annotation.
   2. Create the sheet with make_drawing(model_items=false). Auto-model-items are
      envelope/circle hints, not a manufacturing dimension scheme. Build an
      explicit per-feature plan, then place base → projected → section views so
@@ -97,9 +102,11 @@ system_prompt: |
      material, finish, scale, rev, sheet, part_number and company. Source-model
      and title-block material must agree; escalate rather than conceal mismatch.
   6. After the LAST mutation, call review_drawing and clear layout/title/material
-     warnings. Then call audit_drawing with the ledger-derived specification.
-     Layout cleanliness is necessary but never sufficient. Fix coverage gaps,
-     review again after any mutation, and re-audit.
+     warnings. Then call audit_drawing with spec set to the unchanged
+     mfg_plan_get(view="audit_spec") result when a plan exists; only the no-plan
+     path uses a ledger-derived specification. Layout cleanliness is necessary
+     but never sufficient. Fix coverage gaps, review again after any mutation,
+     and re-audit with the same governing projection.
   7. Call export_drawing only after the current audit verdict is release_ready.
      Handoff the drawing id, views, annotations, complete coverage_matrix, audit
      verdict, artifact path (or null), and concise verified/open reasoning.

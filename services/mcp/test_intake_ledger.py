@@ -15,6 +15,8 @@ Run:  CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so \
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
 
 import pytest
@@ -154,3 +156,114 @@ def test_confirm_dimensions_persists_through_reopen(tmp_path):
         "confirm_dimensions answer missing after reopen — scope=doc routing broken"
     )
     assert replay["canonical"] == {"value": 8.2, "unit": "mm"}
+
+
+def _call_dfm(monkeypatch, *, process: str, profile_params: dict, engine_call) -> dict:
+    from mcp.server.fastmcp import FastMCP
+    from services.mcp import intake_tools
+
+    monkeypatch.setattr(intake_tools, "_doc", lambda _doc_id: "dfm-doc")
+    monkeypatch.setattr(intake_tools, "_dfm", lambda method, params: {
+        "process": process, "params": profile_params,
+    })
+    monkeypatch.setattr(intake_tools.cb, "call", engine_call)
+    mcp = FastMCP("dfm-test")
+    intake_tools.register_intake_tools(mcp)
+    _content, structured = asyncio.run(mcp.call_tool(
+        "dfm_check", {"process": process, "doc_id": "dfm-doc"}))
+    return json.loads(structured["result"])
+
+
+def _cnc_profile() -> dict:
+    return {
+        "min_wall_mm": 0.5,
+        "min_feature_mm": 0.5,
+        "draft": {"required": False, "min_deg": 0.0},
+        "thread": {"strategy": "tapped", "printed_ok_min": None},
+    }
+
+
+def test_dfm_empty_evaluation_is_not_evaluated_never_a_pass(monkeypatch):
+    def empty_engine(method, params=None):
+        if method == "eval_thickness":
+            return {}
+        if method == "doc_tree":
+            return {"tree": {"features": []}}
+        raise AssertionError((method, params))
+
+    result = _call_dfm(
+        monkeypatch, process="cnc_mill", profile_params=_cnc_profile(),
+        engine_call=empty_engine,
+    )
+
+    assert result["status"] == "not_evaluated", result
+    assert result["dfm_pass"] is None, result
+    assert result["checks"], result
+    assert any(check["status"] == "not_evaluated" for check in result["checks"]), result
+
+
+def test_dfm_checks_min_feature_and_deep_machined_hole(monkeypatch):
+    def small_deep_hole(method, params=None):
+        if method == "eval_thickness":
+            return {"min_thickness_mm": 2.0}
+        if method == "doc_tree":
+            return {"tree": {"features": [{
+                "id": "h1", "type": "hole",
+                "params": {
+                    "style": "tap", "diameter": {"value": 0.3},
+                    "depth": {"value": 3.0}, "end": "blind", "thread": "M1x0.25",
+                },
+            }]}}
+        raise AssertionError((method, params))
+
+    result = _call_dfm(
+        monkeypatch, process="cnc_mill", profile_params=_cnc_profile(),
+        engine_call=small_deep_hole,
+    )
+
+    checks = {check["check"]: check for check in result["checks"]}
+    assert checks["min_feature"]["status"] == "fail", result
+    assert checks["hole_depth_diameter"]["status"] == "fail", result
+    assert checks["hole_depth_diameter"]["holes"][0]["ratio"] == 10.0, result
+    assert result["status"] == "fail" and result["dfm_pass"] is False, result
+
+
+def test_dfm_rejects_printed_thread_strategy_for_machining(monkeypatch):
+    def printed_thread(method, params=None):
+        if method == "eval_thickness":
+            return {"min_thickness_mm": 2.0}
+        if method == "doc_tree":
+            return {"tree": {"features": [
+                {"id": "base", "type": "box",
+                 "params": {"length": 20, "width": 20, "height": 5}},
+                {"id": "thread1", "type": "thread",
+                 "params": {"thread": "M6x1.0", "thread_strategy": "printed"}},
+            ]}}
+        raise AssertionError((method, params))
+
+    result = _call_dfm(
+        monkeypatch, process="cnc_mill", profile_params=_cnc_profile(),
+        engine_call=printed_thread,
+    )
+
+    thread_check = next(check for check in result["checks"]
+                        if check["check"] == "thread_strategy")
+    assert thread_check["status"] == "fail", result
+    assert thread_check["threads"][0]["observed_strategy"] == "printed", result
+    assert result["dfm_pass"] is False, result
+
+
+def test_dfm_evaluation_exceptions_are_reported_not_swallowed(monkeypatch):
+    def broken_engine(method, params=None):
+        raise RuntimeError(f"{method} exploded")
+
+    result = _call_dfm(
+        monkeypatch, process="cnc_mill", profile_params=_cnc_profile(),
+        engine_call=broken_engine,
+    )
+
+    assert result["status"] == "not_evaluated" and result["dfm_pass"] is None, result
+    errors = [check.get("error", "") for check in result["checks"]
+              if check["status"] == "not_evaluated"]
+    assert any("eval_thickness exploded" in error for error in errors), result
+    assert any("doc_tree exploded" in error for error in errors), result

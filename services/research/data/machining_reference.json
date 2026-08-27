@@ -1,0 +1,300 @@
+{
+  "_schema": "chudware.machining_reference/1",
+  "_license_note": "Original selection and paraphrase of standards-derived dimensional facts. No handbook prose is included.",
+  "records": [
+    {
+      "id": "general-tolerance-linear-f",
+      "topic": "general tolerance linear dimensions class f fine",
+      "conditions": "Nominal linear dimensions without individually indicated tolerances; dimensions in mm",
+      "table": {"columns": ["over_mm", "up_to_mm", "plus_minus_mm"], "rows": [[0.5, 3, 0.05], [3, 6, 0.05], [6, 30, 0.1], [30, 120, 0.15], [120, 400, 0.2], [400, 1000, 0.3], [1000, 2000, 0.5]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 2768-1:1989", "section": "Table 1, tolerance class f"},
+      "notes": "Applies only where the drawing invokes ISO 2768-1 and no individual tolerance is shown."
+    },
+    {
+      "id": "general-tolerance-linear-m",
+      "topic": "general tolerance linear dimensions class m medium",
+      "conditions": "Nominal linear dimensions without individually indicated tolerances; dimensions in mm",
+      "table": {"columns": ["over_mm", "up_to_mm", "plus_minus_mm"], "rows": [[0.5, 3, 0.1], [3, 6, 0.1], [6, 30, 0.2], [30, 120, 0.3], [120, 400, 0.5], [400, 1000, 0.8], [1000, 2000, 1.2], [2000, 4000, 2.0]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 2768-1:1989", "section": "Table 1, tolerance class m"},
+      "notes": "Default general machining class only when explicitly specified in the title block."
+    },
+    {
+      "id": "general-tolerance-linear-c",
+      "topic": "general tolerance linear dimensions class c coarse",
+      "conditions": "Nominal linear dimensions without individually indicated tolerances; dimensions in mm",
+      "table": {"columns": ["over_mm", "up_to_mm", "plus_minus_mm"], "rows": [[0.5, 3, 0.2], [3, 6, 0.3], [6, 30, 0.5], [30, 120, 0.8], [120, 400, 1.2], [400, 1000, 2.0], [1000, 2000, 3.0], [2000, 4000, 4.0]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 2768-1:1989", "section": "Table 1, tolerance class c"},
+      "notes": "Not a substitute for a function-derived tolerance."
+    },
+    {
+      "id": "general-tolerance-linear-v",
+      "topic": "general tolerance linear dimensions class v very coarse",
+      "conditions": "Nominal linear dimensions without individually indicated tolerances; dimensions in mm",
+      "table": {"columns": ["over_mm", "up_to_mm", "plus_minus_mm"], "rows": [[0.5, 3, null], [3, 6, 0.5], [6, 30, 1.0], [30, 120, 1.5], [120, 400, 2.5], [400, 1000, 4.0], [1000, 2000, 6.0], [2000, 4000, 8.0]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 2768-1:1989", "section": "Table 1, tolerance class v"},
+      "notes": "Null means the standard gives no class-v value for that interval."
+    },
+    {
+      "id": "general-tolerance-angular",
+      "topic": "general tolerance angular dimensions classes f m c v",
+      "conditions": "Angular dimensions without individually indicated tolerances, classified by shorter leg length in mm",
+      "table": {"columns": ["shorter_leg_over_mm", "shorter_leg_up_to_mm", "f_m_plus_minus_deg", "c_plus_minus_deg", "v_plus_minus_deg"], "rows": [[0, 10, 1.0, 1.5, 3.0], [10, 50, 0.5, 1.0, 2.0], [50, 120, 0.333333, 0.5, 1.0], [120, 400, 0.166667, 0.25, 0.5], [400, null, 0.083333, 0.166667, 0.333333]]},
+      "unit": "degree",
+      "source": {"standard": "ISO 2768-1:1989", "section": "Table 3"},
+      "notes": "Decimal degrees represent 1 degree, 30, 20, 15, 10, or 5 arc-minute values from the table."
+    },
+    {
+      "id": "general-tolerance-broken-edges",
+      "topic": "general tolerance external radius chamfer height broken edges classes f m c v",
+      "conditions": "Radii and chamfer heights without individual tolerance; nominal dimensions in mm",
+      "table": {"columns": ["over_mm", "up_to_mm", "f_m_plus_minus_mm", "c_v_plus_minus_mm"], "rows": [[0.5, 3, 0.2, 0.4], [3, 6, 0.5, 1.0], [6, null, 1.0, 2.0]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 2768-1:1989", "section": "Table 2"},
+      "notes": "Do not use for a controlled sealing edge or function-critical corner."
+    },
+    {
+      "id": "general-geometrical-tolerance-classes",
+      "topic": "general geometrical tolerances straightness flatness perpendicularity symmetry runout classes H K L",
+      "conditions": "Features without individual geometrical tolerance; drawing must invoke ISO 2768-2",
+      "table": {"columns": ["characteristic", "nominal_range_mm", "H_mm", "K_mm", "L_mm"], "rows": [["straightness_flatness", "<=10", 0.02, 0.05, 0.1], ["straightness_flatness", ">10-30", 0.05, 0.1, 0.2], ["straightness_flatness", ">30-100", 0.1, 0.2, 0.4], ["straightness_flatness", ">100-300", 0.2, 0.4, 0.8], ["straightness_flatness", ">300-1000", 0.3, 0.6, 1.2], ["straightness_flatness", ">1000-3000", 0.4, 0.8, 1.6], ["perpendicularity", "<=100", 0.2, 0.4, 0.6], ["perpendicularity", ">100-300", 0.3, 0.6, 1.0], ["perpendicularity", ">300-1000", 0.4, 0.8, 1.5], ["perpendicularity", ">1000-3000", 0.5, 1.0, 2.0], ["symmetry", "<=100", 0.5, 0.6, 0.6], ["symmetry", ">100-300", 0.5, 0.6, 1.0], ["symmetry", ">300-1000", 0.5, 0.8, 1.5], ["symmetry", ">1000-3000", 0.5, 1.0, 2.0], ["circular_runout", "all", 0.1, 0.2, 0.5]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 2768-2:1989", "section": "Tables 1-4"},
+      "notes": "ISO 2768-2 was withdrawn; use only when contractually invoked, otherwise specify controls under current ISO GPS standards. General parallelism is limited by the larger applicable size or straightness/flatness tolerance; coaxiality is not covered."
+    },
+    {
+      "id": "capability-drilling-it",
+      "topic": "process tolerance capability achievable IT grade drilling",
+      "process": "drilling",
+      "range": [10, 13],
+      "unit": "IT grade",
+      "source": {"standard": "ISO 286-1:2010", "section": "§4.4 and Annex B IT-grade framework"},
+      "notes": "Planning capability for stable production, not a guaranteed tolerance. Verify machine, tool, depth, material, and inspection."
+    },
+    {
+      "id": "capability-reaming-it",
+      "topic": "process tolerance capability achievable IT grade reaming tolerance",
+      "process": "reaming",
+      "range": [6, 9],
+      "unit": "IT grade",
+      "source": {"standard": "ISO 286-1:2010", "section": "§4.4 and Annex B IT-grade framework"},
+      "notes": "Classic planning capability for reaming after a controlled pilot. Tool condition, allowance, runout, and depth can widen results."
+    },
+    {
+      "id": "capability-boring-it",
+      "topic": "process tolerance capability achievable IT grade precision boring",
+      "process": "boring",
+      "range": [6, 9],
+      "unit": "IT grade",
+      "source": {"standard": "ISO 286-1:2010", "section": "§4.4 and Annex B IT-grade framework"},
+      "notes": "Planning capability for rigid precision boring; validate overhang and thermal stability."
+    },
+    {
+      "id": "capability-milling-it",
+      "topic": "process tolerance capability achievable IT grade milling",
+      "process": "milling",
+      "range": [8, 11],
+      "unit": "IT grade",
+      "source": {"standard": "ISO 286-1:2010", "section": "§4.4 and Annex B IT-grade framework"},
+      "notes": "Feature size and setup geometry determine whether this range is realistic."
+    },
+    {
+      "id": "capability-turning-it",
+      "topic": "process tolerance capability achievable IT grade turning",
+      "process": "turning",
+      "range": [6, 10],
+      "unit": "IT grade",
+      "source": {"standard": "ISO 286-1:2010", "section": "§4.4 and Annex B IT-grade framework"},
+      "notes": "Fine turning can reach the low end on rigid, thermally controlled equipment."
+    },
+    {
+      "id": "capability-grinding-it",
+      "topic": "process tolerance capability achievable IT grade grinding",
+      "process": "grinding",
+      "range": [5, 8],
+      "unit": "IT grade",
+      "source": {"standard": "ISO 286-1:2010", "section": "§4.4 and Annex B IT-grade framework"},
+      "notes": "Grinding allowance and burn control remain separate planning constraints."
+    },
+    {
+      "id": "capability-honing-it",
+      "topic": "process tolerance capability achievable IT grade honing",
+      "process": "honing",
+      "range": [4, 7],
+      "unit": "IT grade",
+      "source": {"standard": "ISO 286-1:2010", "section": "§4.4 and Annex B IT-grade framework"},
+      "notes": "Primarily a bore finishing capability; form and surface controls require separate callouts."
+    },
+    {
+      "id": "capability-lapping-it",
+      "topic": "process tolerance capability achievable IT grade lapping",
+      "process": "lapping",
+      "range": [3, 6],
+      "unit": "IT grade",
+      "source": {"standard": "ISO 286-1:2010", "section": "§4.4 and Annex B IT-grade framework"},
+      "notes": "Low-end grades require specialized metrology and controlled environment."
+    },
+    {
+      "id": "drilled-hole-depth-capability",
+      "topic": "drilled hole diameter positional tolerance capability versus depth aspect ratio",
+      "process": "drilling",
+      "conditions": "Conventional twist drilling with rigid workholding; L/D is drilled depth divided by diameter",
+      "table": {"columns": ["depth_ratio_max", "diameter_plus_minus_mm", "position_diametral_mm", "planning_action"], "rows": [[3, 0.1, 0.25, "spot or center drill as needed"], [5, 0.15, 0.4, "pilot and peck where chip evacuation requires"], [10, 0.25, 0.75, "deep-hole tooling or secondary sizing"], [20, 0.4, 1.5, "gun drill process and dedicated inspection"]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 2768-1:1989 / ISO 5458:2018 / ISO 2692:2021", "section": "ISO 2768-1 Table 1 size framework; ISO 5458 position specification; ISO 2692 maximum-material requirement"},
+      "notes": "Planning limits are conservative process guidance, not values granted by the standards. Specify functional diameter and position independently; apply MMC only when the bonus-tolerance and virtual-condition requirement is functionally justified."
+    },
+    {
+      "id": "reaming-stock-allowance",
+      "topic": "ream reaming stock allowance pilot hole before reamer",
+      "process": "reaming",
+      "conditions": "Diametral stock before finish reaming; adjust for material, tool style, runout, and interrupted cuts",
+      "table": {"columns": ["finished_diameter_over_mm", "finished_diameter_up_to_mm", "diametral_allowance_mm"], "rows": [[0, 6, [0.1, 0.2]], [6, 12, [0.15, 0.3]], [12, 25, [0.2, 0.4]], [25, 50, [0.3, 0.5]], [50, 100, [0.4, 0.8]]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 286-1:2010", "section": "§4.4 size-tolerance framework; allowance is process-planning guidance"},
+      "notes": "Too little stock rubs; too much can chatter or bell-mouth. Confirm with the reamer manufacturer's application data."
+    },
+    {
+      "id": "boring-stock-allowance",
+      "topic": "finish boring stock allowance rough bore",
+      "process": "boring",
+      "conditions": "Radial stock per side before a finish boring pass",
+      "table": {"columns": ["finished_diameter_up_to_mm", "radial_allowance_mm"], "rows": [[12, [0.1, 0.25]], [50, [0.2, 0.5]], [100, [0.3, 0.75]], [250, [0.5, 1.0]]]},
+      "unit": "mm per side",
+      "source": {"standard": "ISO 286-1:2010", "section": "§4.4 size-tolerance framework; allowance is process-planning guidance"},
+      "notes": "Leave enough material to remove roughing deflection and scale without forcing an oversized finish cut."
+    },
+    {
+      "id": "surface-finish-by-operation",
+      "topic": "surface finish roughness capability Ra by machining operation",
+      "conditions": "Typical stable-process planning ranges; specify Ra only where function requires it",
+      "table": {"columns": ["operation", "Ra_um_range"], "rows": [["sawing", [6.3, 25]], ["drilling", [1.6, 6.3]], ["milling", [0.8, 6.3]], ["turning", [0.4, 6.3]], ["reaming", [0.4, 1.6]], ["boring", [0.4, 3.2]], ["grinding", [0.1, 1.6]], ["honing", [0.05, 0.8]], ["lapping", [0.012, 0.2]]]},
+      "unit": "um Ra",
+      "source": {"standard": "ISO 21920-2:2021 / ISO 1302:2002", "section": "ISO 21920-2 profile parameter definitions; ISO 1302 indication rules"},
+      "notes": "The standards define and communicate texture parameters; operation ranges are planning capability, not standard guarantees."
+    },
+    {
+      "id": "internal-corner-radius-cutter",
+      "topic": "internal fillet corner radius guidance versus end mill cutter radius",
+      "process": "milling",
+      "conditions": "Internal milled pocket corner; cutter diameter is D",
+      "table": {"columns": ["condition", "minimum_internal_radius"], "rows": [["absolute geometric minimum", "D/2"], ["recommended finish clearance", "0.55D to 0.75D"], ["deep pocket or high engagement", ">=0.75D"]]},
+      "unit": "ratio to cutter diameter",
+      "source": {"standard": "ISO 13715:2017", "section": "§4 edge indication framework; radius ratios are DfM planning guidance"},
+      "notes": "A radius equal to the cutter radius forces full-width corner engagement; oversize the corner or use relief where function permits."
+    },
+    {
+      "id": "metric-preferred-drill-series",
+      "topic": "standard preferred metric twist drill size series",
+      "process": "drilling",
+      "table": {"columns": ["range_mm", "preferred_increment_mm"], "rows": [["0.2-1.0", 0.05], ["1.0-3.0", 0.1], ["3.0-14.0", 0.1], ["14.0-25.0", 0.25], ["25.0-40.0", 0.5]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 235:2016", "section": "Tables 1-3, preferred diameters"},
+      "notes": "Verify the stocked series and drill-shank standard before freezing a non-preferred diameter."
+    },
+    {
+      "id": "letter-drill-series-common",
+      "topic": "letter drill size series A through Z common inch drills",
+      "process": "drilling",
+      "table": {"columns": ["letter", "diameter_in"], "rows": [["A", 0.234], ["B", 0.238], ["C", 0.242], ["D", 0.246], ["E", 0.25], ["F", 0.257], ["G", 0.261], ["H", 0.266], ["I", 0.272], ["J", 0.277], ["K", 0.281], ["L", 0.29], ["M", 0.295], ["N", 0.302], ["O", 0.316], ["P", 0.323], ["Q", 0.332], ["R", 0.339], ["S", 0.348], ["T", 0.358], ["U", 0.368], ["V", 0.377], ["W", 0.386], ["X", 0.397], ["Y", 0.404], ["Z", 0.413]]},
+      "unit": "inch",
+      "source": {"standard": "ASME B94.11M-1993 (R2018)", "section": "Table 1, letter-size drills"},
+      "notes": "Use tap_drill for thread pilot selection; this row is only a physical drill-size lookup."
+    },
+    {
+      "id": "number-drill-series-common",
+      "topic": "number drill size series common number drills 80 through 1",
+      "process": "drilling",
+      "table": {"columns": ["number", "diameter_in"], "rows": [[80, 0.0135], [79, 0.0145], [78, 0.016], [77, 0.018], [76, 0.02], [75, 0.021], [74, 0.0225], [73, 0.024], [72, 0.025], [71, 0.026], [70, 0.028], [69, 0.0292], [68, 0.031], [67, 0.032], [66, 0.033], [65, 0.035], [64, 0.036], [63, 0.037], [62, 0.038], [61, 0.039], [60, 0.04], [59, 0.041], [58, 0.042], [57, 0.043], [56, 0.0465], [55, 0.052], [54, 0.055], [53, 0.0595], [52, 0.0635], [51, 0.067], [50, 0.07], [49, 0.073], [48, 0.076], [47, 0.0785], [46, 0.081], [45, 0.082], [44, 0.086], [43, 0.089], [42, 0.0935], [41, 0.096], [40, 0.098], [39, 0.0995], [38, 0.1015], [37, 0.104], [36, 0.1065], [35, 0.11], [34, 0.111], [33, 0.113], [32, 0.116], [31, 0.12], [30, 0.1285], [29, 0.136], [28, 0.1405], [27, 0.144], [26, 0.147], [25, 0.1495], [24, 0.152], [23, 0.154], [22, 0.157], [21, 0.159], [20, 0.161], [19, 0.166], [18, 0.1695], [17, 0.173], [16, 0.177], [15, 0.18], [14, 0.182], [13, 0.185], [12, 0.189], [11, 0.191], [10, 0.1935], [9, 0.196], [8, 0.199], [7, 0.201], [6, 0.204], [5, 0.2055], [4, 0.209], [3, 0.213], [2, 0.221], [1, 0.228]]},
+      "unit": "inch",
+      "source": {"standard": "ASME B94.11M-1993 (R2018)", "section": "Table 1, number-size drills"},
+      "notes": "Complete number-size series; use tap_drill for threaded-hole pilot selection."
+    },
+    {
+      "id": "metric-shcs-counterbore",
+      "topic": "counterbore dimensions metric socket head cap screw SHCS ISO 4762",
+      "process": "drilling",
+      "conditions": "Normal clearance counterbore; verify required head clearance and actual fastener",
+      "table": {"columns": ["thread", "clearance_hole_mm", "counterbore_diameter_mm", "counterbore_depth_mm"], "rows": [["M3", 3.4, 6.5, 3.3], ["M4", 4.5, 8.0, 4.4], ["M5", 5.5, 10.0, 5.4], ["M6", 6.6, 11.0, 6.5], ["M8", 9.0, 15.0, 8.6], ["M10", 11.0, 18.0, 10.6], ["M12", 13.5, 20.0, 12.6], ["M16", 17.5, 26.0, 16.6]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 4762:2004 / ISO 273:1979", "section": "ISO 4762 head dimensions; ISO 273 normal clearance series"},
+      "notes": "Counterbore values include practical diametral and depth clearance over the standard maximum head envelope."
+    },
+    {
+      "id": "inch-shcs-counterbore",
+      "topic": "counterbore dimensions inch socket head cap screw SHCS",
+      "process": "drilling",
+      "table": {"columns": ["thread", "clearance_hole_in", "counterbore_diameter_in", "counterbore_depth_in"], "rows": [["#4", 0.125, 0.219, 0.12], ["#6", 0.1495, 0.25, 0.15], ["#8", 0.177, 0.281, 0.17], ["#10", 0.201, 0.312, 0.19], ["1/4", 0.266, 0.406, 0.26], ["5/16", 0.332, 0.484, 0.32], ["3/8", 0.397, 0.562, 0.385], ["1/2", 0.531, 0.75, 0.51]]},
+      "unit": "inch",
+      "source": {"standard": "ASME B18.3-2012 (R2021)", "section": "Table 1 socket head cap screw head envelopes"},
+      "notes": "Planning clearances; confirm the selected screw series and shop counterbore tooling."
+    },
+    {
+      "id": "flat-head-countersink",
+      "topic": "countersink dimensions flat head cap screw FHCS metric inch",
+      "process": "drilling",
+      "table": {"columns": ["series", "included_angle_deg", "design_rule"], "rows": [["ISO metric countersunk socket screw", 90, "countersink major diameter to the selected screw head maximum plus assembly clearance"], ["ASME inch flat countersunk head socket screw", 82, "countersink to seat the selected head flush; do not substitute a 90 degree cutter"]]},
+      "unit": "degree",
+      "source": {"standard": "ISO 10642:2019 / ASME B18.3-2012 (R2021)", "section": "Countersunk socket-head dimensional tables"},
+      "notes": "Drive recess and head height differ by series; use the exact purchased fastener geometry for flushness-critical work."
+    },
+    {
+      "id": "thread-engagement-material-class",
+      "topic": "minimum thread engagement length guidance by internal material class",
+      "conditions": "Steel fastener into fully formed internal threads; L is engagement and d is nominal diameter",
+      "table": {"columns": ["internal_material_class", "engagement_ratio_L_over_d"], "rows": [["hardened steel or steel nut", [0.8, 1.0]], ["mild steel or cast iron", [1.0, 1.25]], ["aluminum or magnesium alloy", [1.5, 2.0]], ["engineering thermoplastic", [2.0, 2.5]]]},
+      "unit": "L/d",
+      "source": {"standard": "ISO 965-1:2013 / ISO 898-1:2013", "section": "ISO 965-1 §6 engagement groups; ISO 898-1 mechanical-property classes"},
+      "notes": "Planning screen only. Use research_eng_calc(thread_engagement) with actual material allowables, pitch, class, and load for strength."
+    },
+    {
+      "id": "metric-keyway-keyseat",
+      "topic": "metric parallel key keyway keyseat dimensions common shaft sizes",
+      "process": "milling",
+      "table": {"columns": ["shaft_over_mm", "shaft_up_to_mm", "key_width_mm", "key_height_mm", "shaft_keyseat_depth_mm"], "rows": [[6, 8, 2, 2, 1.2], [8, 10, 3, 3, 1.8], [10, 12, 4, 4, 2.5], [12, 17, 5, 5, 3.0], [17, 22, 6, 6, 3.5], [22, 30, 8, 7, 4.0], [30, 38, 10, 8, 5.0], [38, 44, 12, 8, 5.0], [44, 50, 14, 9, 5.5], [50, 58, 16, 10, 6.0], [58, 65, 18, 11, 7.0], [65, 75, 20, 12, 7.5], [75, 85, 22, 14, 9.0], [85, 95, 25, 14, 9.0], [95, 110, 28, 16, 10.0]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 773:1969", "section": "Tables for rectangular and square parallel keys and keyways"},
+      "notes": "Check current contractual standard and hub keyway depth; this row gives the shaft-side keyseat planning dimension."
+    },
+    {
+      "id": "inch-keyway-keyseat",
+      "topic": "inch square key keyway keyseat dimensions common shaft sizes",
+      "process": "milling",
+      "table": {"columns": ["shaft_over_in", "shaft_up_to_in", "key_width_in", "key_height_in", "nominal_shaft_keyseat_depth_in"], "rows": [[0.3125, 0.4375, 0.09375, 0.09375, 0.0469], [0.4375, 0.5625, 0.125, 0.125, 0.0625], [0.5625, 0.875, 0.1875, 0.1875, 0.0938], [0.875, 1.25, 0.25, 0.25, 0.125], [1.25, 1.375, 0.3125, 0.3125, 0.1563], [1.375, 1.75, 0.375, 0.375, 0.1875], [1.75, 2.25, 0.5, 0.5, 0.25], [2.25, 2.75, 0.625, 0.625, 0.3125], [2.75, 3.25, 0.75, 0.75, 0.375]]},
+      "unit": "inch",
+      "source": {"standard": "ANSI B17.1-1967 (R2008)", "section": "Tables 1 and 2, square and rectangular keys and keyseats"},
+      "notes": "Tolerances and hub keyway dimensions depend on fit class and must come from the governing table."
+    },
+    {
+      "id": "center-drill-sizes",
+      "topic": "standard center drill sizes center holes type A B",
+      "process": "drilling",
+      "table": {"columns": ["size", "pilot_diameter_mm", "body_diameter_mm"], "rows": [["1", 1.25, 3.15], ["2", 2.0, 5.0], ["3", 2.5, 6.3], ["4", 3.15, 8.0], ["5", 4.0, 10.0], ["6", 5.0, 12.5], ["7", 6.3, 16.0]]},
+      "unit": "mm",
+      "source": {"standard": "ISO 2540:2016 / ISO 6411:1982", "section": "ISO 2540 centre-drill dimensions; ISO 6411 representation"},
+      "notes": "Select center-hole form from loading and protection needs, not drill number alone."
+    },
+    {
+      "id": "edge-break-chamfer-norm",
+      "topic": "edge break deburr chamfer unspecified edge norm",
+      "conditions": "Non-functional sharp edges after machining",
+      "range": [0.1, 0.5],
+      "unit": "mm",
+      "source": {"standard": "ISO 13715:2017", "section": "§4 and §5, indication and interpretation of edges of undefined shape"},
+      "notes": "A blanket edge-break note must not alter sealing edges, datum targets, thread starts, or function-critical corners. State direction and permissible material excess/removal under ISO 13715 when needed."
+    },
+    {
+      "id": "heat-treat-grind-stock",
+      "topic": "stock allowance before heat treatment finish grinding distortion cleanup",
+      "process": "grinding",
+      "conditions": "Hardened steel feature intentionally left oversize before heat treatment; radial allowance per side",
+      "table": {"columns": ["finished_dimension_up_to_mm", "radial_allowance_mm"], "rows": [[25, [0.1, 0.2]], [50, [0.15, 0.3]], [100, [0.2, 0.4]], [250, [0.3, 0.6]], [500, [0.5, 1.0]]]},
+      "unit": "mm per side",
+      "source": {"standard": "ISO 286-1:2010 / ISO 21920-2:2021", "section": "ISO 286-1 §4 size limits; ISO 21920-2 profile-finish parameters; allowance is process-planning guidance"},
+      "notes": "Distortion depends strongly on alloy, section change, prior stress relief, furnace support, and hardness. Qualify allowance with the heat treater and grinder."
+    }
+  ]
+}

@@ -95,9 +95,8 @@ def _coerce_ledger_payload(payload: Any) -> dict:
     return {"value": payload}
 
 
-# T-DP1: kinds that require a `provenance` field on write (the "never recall a
-# number" rule) — dimension (contract §2) + geometry_spec (contract §3.2/§4).
-_PROVENANCE_REQUIRED_KINDS = {"dimension", "geometry_spec"}
+# Provenance validation lives in services.agent.ledger.validate_ledger_payload so
+# this mission shadow and the standalone MCP writer cannot drift.
 
 
 def _delegation_execution_verdict(node: dict) -> dict:
@@ -363,8 +362,8 @@ class MissionDispatch:
 
         section filters to one of brief | requirements | decisions | dimensions |
         questions | stage_log | artifacts | criterion_results | features |
-        geometry_specs | linkages | build_nodes | manifest; omit (or
-        section="all"/"*") for the full rendered ledger.
+        geometry_specs | linkages | build_nodes | mfg_plans | manifest; omit
+        (or section="all"/"*") for the full rendered ledger.
         """
         led = self._ledger(run_id)
         if led is None:
@@ -413,9 +412,10 @@ class MissionDispatch:
         """Append a structured event to this run's design ledger.
 
         kind: brief | decision | dimension | question | requirement | stage |
-        artifact | note | criterion_result (+ aliases: verdict→decision, …).
-        Dimension events MUST carry a provenance field (tool result / calc /
-        table / user answer) — contract rule.
+        artifact | note | criterion_result | feature | geometry_spec | linkage |
+        build_node | mfg_plan (+ aliases: verdict→decision, …).
+        Numeric dimensions, geometry specs, and numeric manufacturing-plan
+        critical rows MUST carry provenance.
 
         mega-2: models often omit ``id`` and only send ``name``/``value`` for
         decision/dimension. Synthesize a stable id from name so the write does
@@ -442,11 +442,11 @@ class MissionDispatch:
         # Promote common aliases so kind=decision/dimension always has id.
         if kind in ("decision", "dimension", "question", "artifact",
                     "feature", "geometry_spec", "linkage", "build_node",
-                    "criterion_result"):
+                    "mfg_plan", "criterion_result"):
             if not body.get("id"):
                 for alt in ("name", "decision_id", "dim_id", "req_id",
                             "artifact_id", "feature_id", "spec_id", "node_id",
-                            "deliverable", "criterion_id"):
+                            "plan_id", "deliverable", "criterion_id"):
                     if body.get(alt):
                         body["id"] = str(body[alt])
                         break
@@ -457,7 +457,10 @@ class MissionDispatch:
                 ).strip("_")
                 body["id"] = slug or f"{kind}_{len(getattr(led, 'events', []) or [])}"
             if not body.get("id"):
-                body["id"] = f"{kind}_{len(getattr(led, 'events', []) or [])}"
+                body["id"] = (
+                    "main" if kind == "mfg_plan"
+                    else f"{kind}_{len(getattr(led, 'events', []) or [])}"
+                )
         if kind == "artifact" and raw_kind != kind:
             body.setdefault("kind", raw_kind)
         # decision alias from verdict often lacks stage/text/rationale
@@ -471,10 +474,11 @@ class MissionDispatch:
                     or str(body.get("id") or "decision")
                 )
             body.setdefault("rationale", body.get("evidence") or body.get("driver") or "")
-        if kind in _PROVENANCE_REQUIRED_KINDS and not body.get("provenance"):
-            return {"ok": False,
-                    "error": (f"{kind} events require a 'provenance' field "
-                              "(tool result / calc / table / user answer)")}
+        try:
+            from services.agent.ledger import validate_ledger_payload
+            validate_ledger_payload(kind, body)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         try:
             event = led.append(actor, kind, body)
             # Best-effort project memory: durable decisions/notes for later turns.

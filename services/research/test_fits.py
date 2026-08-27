@@ -18,6 +18,7 @@ from ..research.fits import (
     tolerance_band,
     recommend_fit,
     _find_range,
+    _fit_recs,
 )
 
 
@@ -226,6 +227,12 @@ class TestFitCalc:
         ans = result["answer"]
         assert ans["fit_character"] == "transition"
 
+    def test_H7_m6_recommended_transition_fit(self):
+        result = fit_calc(20.0, "H7/m6")
+        assert result["ok"] is True
+        assert result["answer"]["shaft"] == pytest.approx([0.008, 0.021])
+        assert result["answer"]["fit_character"] == "transition"
+
     def test_shaft_only_input(self):
         result = fit_calc(20.0, "g6")
         assert result["ok"] is True
@@ -324,6 +331,15 @@ class TestRecommendFit:
         # Should recommend p6 or n6
         all_classes = [c for r in result["answer"] for c in r["recommended_classes"]]
         assert any("p6" in c or "n6" in c for c in all_classes)
+
+    def test_every_recommended_class_is_computable(self):
+        failures = []
+        for row in _fit_recs():
+            for fit_class in row["recommended_classes"]:
+                result = fit_calc(20.0, fit_class)
+                if not result.get("ok"):
+                    failures.append((row["id"], fit_class, result.get("reason")))
+        assert failures == []
 
 
 # ──────────────────────────────────────────────────── envelope conformance ────

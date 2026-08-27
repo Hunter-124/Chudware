@@ -110,6 +110,10 @@
    "measure",
    "measure_between",
    "measure_part",
+   "mfg_plan_check",
+   "mfg_plan_get",
+   "mfg_plan_render",
+   "mfg_plan_upsert",
    "new_assembly",
    "new_part",
    "plm_graph_brief",
@@ -433,6 +437,10 @@
   "research": [
    "fit_calc",
    "list_calcs",
+   "machining_ref_get",
+   "machining_ref_index_pdf",
+   "machining_ref_search",
+   "machining_ref_search_pdf",
    "recommend_fit",
    "research_datasheet_fetch",
    "research_eng_calc",
@@ -550,7 +558,7 @@
   "asm_add_component": "Insert a saved part file into the current assembly as a component.",
   "asm_mate": "Add a MATE between two components of the current assembly (and solve it).",
   "assembly_plan_review": "Best-practice review of an assembly's structure BEFORE a large build.",
-  "audit_drawing": "Audit on-sheet manufacturing coverage against the governing spec/ledger.",
+  "audit_drawing": "Audit manufacturing coverage and deterministic drawing-standard compliance.",
   "bearing_life": "ISO 281 rolling-element bearing L10 fatigue life estimate.",
   "board_from_schematic": "ONE-CALL schematic -> preliminary PCB: sync footprints, place (connectivity-aware), autoroute, then (by default) optimize traces (arc …",
   "bom_price": "Roll up the BOM for `doc_path` AND resolve bought-line prices via the provider chain.",
@@ -621,7 +629,7 @@
   "describe_toolpaths": "Compact narrative of a CAM job's toolpaths and simulation results — use INSTEAD of dumping the raw cam_job_tree JSON. Returns per-op …",
   "design_recipe": "Map a natural-language intent to an ordered tool recipe (or list the catalog).",
   "design_review": "Run a comprehensive design review battery and return a narrated verdict card.",
-  "dfm_check": "Design-for-manufacturing punch list against the part's ProcessProfile thresholds.",
+  "dfm_check": "Evaluate DfM as pass, fail, or not_evaluated against the ProcessProfile.",
   "doc_diff_tool": "Compute a semantic feature-level diff between two document JSON revisions.",
   "doc_sketch_contact_sheet": "Multi-view contact sheet of the whole doc INCLUDING all sketches-in-progress.",
   "draft_analysis": "Moldability check: which faces lack enough DRAFT to release from the mold?",
@@ -755,6 +763,10 @@
   "list_tool_categories": "List requestable tool category packs (name + one line).",
   "list_world_bodies": "List a doc's bodies with their WORLD-placed bounding boxes.",
   "look_around": "Multi-angle close-ups of ONE target, tiled — 'walk around' the feature.",
+  "machining_ref_get": "Return one bundled machining-reference row by its stable record id.",
+  "machining_ref_index_pdf": "Index a user-owned PDF by page in the project's local `.plm/references` FTS5.",
+  "machining_ref_search": "Search the bundled, standards-cited machining reference.",
+  "machining_ref_search_pdf": "Search project-local user-PDF indexes and return bounded page-cited snippets.",
   "make_drawing": "Create a 2D engineering drawing of the current part in ONE shot, then refine it.",
   "make_fit_coupon": "Build a small printable FIT-TEST COUPON of one critical interface (bore / bolt-pattern / connector cutout) so the user can verify the real …",
   "make_presentation": "Build a slide deck (.pptx) from a JSON spec and return its artifact record.",
@@ -777,6 +789,10 @@
   "mfg_device_list": "List manufacturing devices and their truthful current lane state.",
   "mfg_gate_report": "Read a seq-stamped Tier-0 and two-stage gate report by reference.",
   "mfg_journal_query": "Query ordered manufacturing journal records and waiver rates.",
+  "mfg_plan_check": "Check structure, references, DfM facts, and blocking unknowns.",
+  "mfg_plan_get": "Read a plan or its deterministic drawing/work-instruction projection.",
+  "mfg_plan_render": "Render JSON or Markdown and record a manufacturing_plan artifact.",
+  "mfg_plan_upsert": "Normalize, validate, and upsert one typed manufacturing plan.",
   "mfg_preflight_run": "Build a draft run and its seq-stamped Tier-0/two-stage preflight.",
   "mfg_run_describe": "Read one run's state, artifact, gate, approval, and initiator history.",
   "mfg_run_list": "List durable run history, optionally filtered by device and state.",
@@ -1061,7 +1077,7 @@
    "prompt_note": "Alias of check_geometry_health. We are a B-rep kernel, so this reports SOLID topology health, not triangle quality."
   },
   "audit_drawing": {
-   "prompt_note": "Required release gate after current review_drawing: doc_id is the SOURCE part/assembly, drawing_id is its DRAWING doc, and spec comes from the ledger. Export needs verdict=release_ready with missing_critical empty."
+   "prompt_note": "Required release gate after current review_drawing: doc_id is the SOURCE part/assembly and drawing_id its DRAWING doc. When a manufacturing plan exists, pass the unchanged mfg_plan_get(view='audit_spec') result as spec. Export needs verdict=release_ready with missing_critical empty."
   },
   "bearing_life": {
    "prompt_note": "Standalone hand-calc — no document needed. Set X/Y when Fa matters (defaults zero the axial term); C must come from a datasheet."
@@ -1736,6 +1752,19 @@
   "look_around": {
    "prompt_note": "Orbiting close-ups of one feature when a single angle is ambiguous; for dims + describe excerpt in the same call use inspect_feature."
   },
+  "machining_ref_get": {
+   "prompt_note": "Fetch one curated record by stable record_id for its full conditions, units and source citation. Lookup facts are advisory; a delegate_tool record points to the canonical calculator/tool instead of duplicating its values."
+  },
+  "machining_ref_index_pdf": {
+   "prompt_note": "Index a user-owned local PDF into the project-local page FTS store; content is never bundled or uploaded. Set project_root when no project is active; scanned pages without extractable text are reported honestly, not OCR-guessed.",
+   "timeout_s": 300
+  },
+  "machining_ref_search": {
+   "prompt_note": "Search the curated cited machining dataset with optional topic/material/process filters. When a hit returns delegate_tool, call that named canonical tool for the value instead of quoting or copying the reference row."
+  },
+  "machining_ref_search_pdf": {
+   "prompt_note": "Search only locally indexed user PDFs and retain each hit's source_id, hash and exact pdf_page/page_index citation. Snippets are bounded evidence; fetch or inspect the cited page before turning one into a controlled plan value."
+  },
   "make_drawing": {
    "prompt_note": "Build geometry first, then start shop drawings with model_items=False and an explicit ledger-driven annotation plan. Returns drawing_doc_id + view map; refine, review_drawing, audit_drawing, then export_drawing.",
    "timeout_s": 300
@@ -1802,6 +1831,18 @@
   },
   "mfg_journal_query": {
    "prompt_note": "Requires command-lane ownership and returns ordered records, head_seq and waiver_rates. Journal seq values are the sole durable ordering truth; never synthesize seq from telemetry time."
+  },
+  "mfg_plan_check": {
+   "prompt_note": "Run only after mfg_plan_upsert, and again after geometry/manufacturing fixes; pass doc_id when geometry exists. not_evaluated is honest missing evidence, not a pass. Drawing release still requires audit_drawing separately."
+  },
+  "mfg_plan_get": {
+   "prompt_note": "Read the stable ledger plan by run_id/plan_id. view='audit_spec' returns the exact {requirements:[...]} object to pass unchanged to audit_drawing; view='work_instructions' projects the same controlled route for the shop."
+  },
+  "mfg_plan_render": {
+   "prompt_note": "Render an already-upserted plan as controlled json or md; validate first with mfg_plan_check and never treat the rendered artifact as a second editable source of manufacturing truth."
+  },
+  "mfg_plan_upsert": {
+   "prompt_note": "Persist one stable plan id before modeling; update it with a monotonic revision instead of plan_v2 siblings. Numeric critical rows need provenance (and derived_from/derivation when derived), then mfg_plan_check must run."
   },
   "mfg_preflight_run": {
    "prompt_note": "Call after immutable artifact registration on a connected, identified device. It creates or refreshes a draft run and returns run_id plus Tier-0/two-stage gates; it cannot authorize start."

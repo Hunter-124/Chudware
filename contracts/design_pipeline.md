@@ -387,3 +387,24 @@ Multi-part runs pass `item_artifacts` (`item_id` → participant buildgraph node
 through the link. The vault stores the mapped node in each item's own
 `meta.json.ai.artifact_id`; a project-wide history point therefore preserves
 per-participant attribution when each item's timeline is viewed independently.
+
+## §4 additive: `mfg_plan` (2026-08-26)
+
+Fifth typed ledger event kind, same recipe as the original four:
+
+| kind | written by | state section | upsert key | provenance |
+|---|---|---|---|---|
+| `mfg_plan` | manufacturing_planner (and any role revising the governing plan) | `mfg_plans` | `id` | REQUIRED on every numeric critical row |
+
+One plan per source document/deliverable (id normally `main`); revisions
+upsert the same id, never siblings. The plan's `critical_dimensions[]` rows
+are AUDIT-NATIVE — the exact row schema `audit_drawing(spec=...)` consumes
+(requirement_id, type, value, tolerance{type,upper,lower}, critical,
+provenance, derived_from) — so `mfg_plan_get(view="audit_spec")` projects
+`{requirements:[...]}` byte-compatibly. `view="work_instructions"` projects
+into `make_work_instruction`'s operation schema. MCP surface:
+`mfg_plan_upsert / mfg_plan_get / mfg_plan_check / mfg_plan_render`
+(family `cad`; get/check are read-class). `ledger_note` accepts the new kind
+and `ledger_get` the new section on BOTH write paths (mission shadow and
+standalone ledger_tools) — the §4 "both paths" rule applies. Consumers MUST
+tolerate the new kind/section per the existing conformance rules.

@@ -185,7 +185,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "audit_drawing": {
         "prompt_note": (
             "Required release gate after current review_drawing: doc_id is the SOURCE "
-            "part/assembly, drawing_id is its DRAWING doc, and spec comes from the ledger. "
+            "part/assembly and drawing_id its DRAWING doc. When a manufacturing plan "
+            "exists, pass the unchanged mfg_plan_get(view='audit_spec') result as spec. "
             "Export needs verdict=release_ready with missing_critical empty."
         ),
     },
@@ -486,6 +487,34 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Combined mass props over ALL bodies (per-body under mass.bodies[]); pass "
             "density_g_cm3 for non-steel; also sanity-checks the solid is closed/valid."
+        ),
+    },
+    "mfg_plan_check": {
+        "prompt_note": (
+            "Run only after mfg_plan_upsert, and again after geometry/manufacturing fixes; "
+            "pass doc_id when geometry exists. not_evaluated is honest missing evidence, "
+            "not a pass. Drawing release still requires audit_drawing separately."
+        ),
+    },
+    "mfg_plan_get": {
+        "prompt_note": (
+            "Read the stable ledger plan by run_id/plan_id. view='audit_spec' returns the "
+            "exact {requirements:[...]} object to pass unchanged to audit_drawing; "
+            "view='work_instructions' projects the same controlled route for the shop."
+        ),
+    },
+    "mfg_plan_render": {
+        "prompt_note": (
+            "Render an already-upserted plan as controlled json or md; validate first "
+            "with mfg_plan_check and never treat the rendered artifact as a second "
+            "editable source of manufacturing truth."
+        ),
+    },
+    "mfg_plan_upsert": {
+        "prompt_note": (
+            "Persist one stable plan id before modeling; update it with a monotonic "
+            "revision instead of plan_v2 siblings. Numeric critical rows need provenance "
+            "(and derived_from/derivation when derived), then mfg_plan_check must run."
         ),
     },
     "new_assembly": {

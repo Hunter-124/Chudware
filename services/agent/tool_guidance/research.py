@@ -18,6 +18,35 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "formula names."
         ),
     },
+    "machining_ref_get": {
+        "prompt_note": (
+            "Fetch one curated record by stable record_id for its full conditions, units "
+            "and source citation. Lookup facts are advisory; a delegate_tool record points "
+            "to the canonical calculator/tool instead of duplicating its values."
+        ),
+    },
+    "machining_ref_index_pdf": {
+        "prompt_note": (
+            "Index a user-owned local PDF into the project-local page FTS store; content "
+            "is never bundled or uploaded. Set project_root when no project is active; "
+            "scanned pages without extractable text are reported honestly, not OCR-guessed."
+        ),
+        "timeout_s": 300,
+    },
+    "machining_ref_search": {
+        "prompt_note": (
+            "Search the curated cited machining dataset with optional topic/material/"
+            "process filters. When a hit returns delegate_tool, call that named canonical "
+            "tool for the value instead of quoting or copying the reference row."
+        ),
+    },
+    "machining_ref_search_pdf": {
+        "prompt_note": (
+            "Search only locally indexed user PDFs and retain each hit's source_id, hash "
+            "and exact pdf_page/page_index citation. Snippets are bounded evidence; fetch "
+            "or inspect the cited page before turning one into a controlled plan value."
+        ),
+    },
     "recommend_fit": {
         "prompt_note": (
             "Function-to-fit-class step before fit_calc; pass the diameter in "

@@ -966,6 +966,10 @@ def _drawing_review_summary(full: dict, render: dict,
     views: list[dict] = []
     seen_warnings: set[str] = set()
     for view in _views_of(full):
+        # Extended title/revision/standards tables are emitted as a synthetic overlay view.
+        # It deliberately has no projected model geometry and must not be diagnosed as blank.
+        if _canon_word(view.get("type")) == "table_overlay":
+            continue
         vid = view.get("view_id") or view.get("id")
         if not vid:
             continue
@@ -1036,20 +1040,27 @@ def _drawing_review_summary(full: dict, render: dict,
         ready_reason = (f"audit_result does not match drawing {drawing_id!r} at revision "
                         f"{drawing_revision!r}; rerun audit_drawing after the latest mutation")
     elif audit.get("verdict") != "release_ready":
-        ready_reason = ("audit_drawing did not release this sheet: "
-                        f"{audit.get('missing_critical') or audit.get('verdict')}")
+        blockers = (
+            audit.get("missing_critical")
+            or (audit.get("standards") or {}).get("failures")
+            or audit.get("verdict")
+        )
+        ready_reason = f"audit_drawing did not release this sheet: {blockers}"
     elif warnings:
         ready_reason = "manufacturing audit passed, but layout/title warnings remain"
     else:
-        ready_reason = "layout review and manufacturing coverage audit both passed"
+        ready_reason = "layout, manufacturing coverage, and standards audit all passed"
     next_actions = []
     if warnings:
         next_actions.append("Fix every layout/title warning, then review_drawing again.")
     if not audit_passed:
         next_actions.append(
-            "Run audit_drawing(doc_id, drawing_id, spec) and resolve every missing critical row.")
+            "Run audit_drawing(doc_id, drawing_id, spec), resolve every missing critical row, "
+            "and apply every standards failure remedy.")
     if manufacturing_ready:
-        next_actions.append("Layout and audited spec coverage are clean; export without mutations.")
+        next_actions.append(
+            "Layout, audited spec coverage, and drawing standards are clean; "
+            "export without mutations.")
     return {
         "ok": True,
         "drawing_doc_id": drawing_id,
@@ -1064,6 +1075,7 @@ def _drawing_review_summary(full: dict, render: dict,
         "layout_clean": layout_clean,
         "manufacturing_ready": manufacturing_ready,
         "manufacturing_ready_reason": ready_reason,
+        "audit_standards": audit.get("standards") if isinstance(audit, dict) else None,
         "next_actions": next_actions,
     }
 
@@ -1440,7 +1452,11 @@ def _all_annotations(full: dict) -> list[dict]:
         view_id = view.get("view_id") or view.get("id")
         for annotation in view.get("annotations") or []:
             if isinstance(annotation, dict):
-                out.append({**annotation, "view_id": view_id})
+                out.append({
+                    **annotation,
+                    "_declared_view_id": annotation.get("view_id"),
+                    "view_id": view_id,
+                })
     return out
 
 
@@ -1628,6 +1644,295 @@ def _audit_coverage(full: dict, rows: list[dict]) -> list[dict]:
             "evidence": evidence,
         })
     return coverage
+
+
+_AUDIT_TITLE_FIELDS = (
+    "title", "part_number", "material", "scale", "revision", "drawn_by", "date",
+    "projection", "drawing_standard", "general_tolerance",
+)
+_AUDIT_TITLE_ALIASES = {
+    "revision": ("revision", "rev"),
+    "drawn_by": ("drawn_by", "drawn"),
+    "drawing_standard": ("drawing_standard", "standard"),
+    "general_tolerance": ("general_tolerance", "general_tolerances"),
+}
+_THREAD_DESIGNATION = _re.compile(
+    r"(?:\bM\d+(?:\.\d+)?\s*[x\u00d7]\s*\d+(?:\.\d+)?"
+    r"(?:\s*-?\s*(?:6H|6g))?\b|"
+    r"(?:#?\d+|\d+/\d+)\s*-\s*\d+\s+(?:UNC|UNF)"
+    r"(?:\s*-?\s*(?:2A|2B))?\b)",
+    _re.IGNORECASE,
+)
+_UNITS_STATEMENT = _re.compile(
+    r"(?:\bunits?\b|\bmm\b|\bmillimet(?:er|re)s?\b|\binches?\b|\bIPS\b|\bMMGS\b)",
+    _re.IGNORECASE,
+)
+_FINISH_NOTE = _re.compile(
+    r"(?:\bsurface\s+finish\b|\bfinish(?:es)?\b|\broughness\b|\bRa\s*[0-9])",
+    _re.IGNORECASE,
+)
+_AUDIT_STANDARD_CHECKS = (
+    "title_block", "units_statement", "gdt", "thread_callout",
+    "annotation_anchor", "surface_finish_note",
+)
+
+
+def _audit_title_value(title: dict, field: str) -> Any:
+    for key in _AUDIT_TITLE_ALIASES.get(field, (field,)):
+        value = title.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def _audit_datum_ref(value: Any) -> str:
+    label = str(value or "").strip().upper()
+    match = _re.match(r"[A-Z]+", label)
+    return match.group(0) if match else label
+
+
+def _audit_gdt_refs(annotation: dict) -> list[str]:
+    refs = []
+    for row in (annotation, annotation.get("row2")):
+        if not isinstance(row, dict):
+            continue
+        for datum in row.get("datums") or []:
+            ref = datum.get("ref") if isinstance(datum, dict) else datum
+            normalized = _audit_datum_ref(ref)
+            if normalized:
+                refs.append(normalized)
+    return refs
+
+
+def _audit_thread_text(record: dict) -> str:
+    return " ".join(str(record.get(key) or "") for key in
+                    ("thread", "designation", "text")).strip()
+
+
+def _audit_thread_depth_stated(record: dict) -> bool:
+    depth = record.get("depth")
+    try:
+        if depth is not None and float(depth) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    if record.get("thru") is True:
+        return True
+    return bool(_re.search(r"(?:\bTHRU\b|\bTHROUGH\b|\bDEPTH\b|\u21a7)",
+                           str(record.get("text") or ""), _re.IGNORECASE))
+
+
+def _audit_standards(full: dict, rows: list[dict]) -> dict:
+    """Deterministic drawing-standard checks independent of requirement coverage."""
+    failures: list[dict] = []
+
+    def fail(check: str, code: str, message: str, remedy: str, **details) -> None:
+        failures.append({
+            "category": "standards", "check": check, "code": code,
+            "message": message, "remedy": remedy, **details,
+        })
+
+    sheet = (full.get("sheets") or [{}])[0]
+    title = sheet.get("title_block") if isinstance(sheet, dict) else {}
+    title = title if isinstance(title, dict) else {}
+    for field in _AUDIT_TITLE_FIELDS:
+        if _audit_title_value(title, field) is None:
+            fail(
+                "title_block", "title_field_missing",
+                f"title block field {field!r} is missing or empty",
+                f"set_titleblock(fields={{\"{field}\": \"<controlled value>\"}})",
+                field=field,
+            )
+
+    annotations = _all_annotations(full)
+    notes = [str(annotation.get("text") or "") for annotation in annotations
+             if _canon_word(annotation.get("kind") or annotation.get("type")) == "note"]
+    tolerance_text = str(_audit_title_value(title, "general_tolerance") or "")
+    if not _UNITS_STATEMENT.search(" ".join([tolerance_text, *notes])):
+        fail(
+            "units_statement", "units_statement_missing",
+            "no units statement appears in general_tolerance or a drawing note",
+            "set_titleblock(fields={\"general_tolerance\": "
+            "\"UNLESS OTHERWISE SPECIFIED: DIMENSIONS ARE IN MM; ...\"})",
+            field="general_tolerance",
+        )
+
+    datum_positions: dict[str, int] = {}
+    for index, annotation in enumerate(annotations):
+        kind = _canon_word(annotation.get("kind") or annotation.get("type"))
+        if kind in {"datum_feature", "datum_target"}:
+            label = _audit_datum_ref(annotation.get("label"))
+            if label and label not in datum_positions:
+                datum_positions[label] = index
+    for index, annotation in enumerate(annotations):
+        if _canon_word(annotation.get("kind") or annotation.get("type")) != "gdt_frame":
+            continue
+        annotation_id = annotation.get("id")
+        view_id = annotation.get("view_id")
+        row2_present = "row2" in annotation
+        row2 = annotation.get("row2")
+        top_shaped = bool(
+            str(annotation.get("symbol") or "").strip()
+            and str(annotation.get("tol_value") or "").strip()
+            and isinstance(annotation.get("datums", []), list)
+            and all(isinstance(datum, dict) and str(datum.get("ref") or "").strip()
+                    for datum in annotation.get("datums", []))
+        )
+        second_shaped = bool(
+            isinstance(row2, dict)
+            and str(row2.get("tol_value") or "").strip()
+            and isinstance(row2.get("datums", []), list)
+            and all(isinstance(datum, dict) and str(datum.get("ref") or "").strip()
+                    for datum in row2.get("datums", []))
+        )
+        if row2_present and not (top_shaped and second_shaped):
+            fail(
+                "gdt", "gdt_composite_malformed",
+                f"composite GD&T frame {annotation_id!r} does not contain two shaped rows",
+                f"edit_drawing_annotation(view_id={view_id!r}, "
+                f"annotation_id={annotation_id!r}, delete=true), then "
+                "add_gdt(..., row2={\"tolerance\":...,\"datums\":[...]})",
+                annotation_id=annotation_id, view_id=view_id,
+            )
+        for datum in sorted(set(_audit_gdt_refs(annotation))):
+            if datum not in datum_positions:
+                fail(
+                    "gdt", "gdt_datum_unresolved",
+                    f"GD&T frame {annotation_id!r} cites datum {datum!r}, "
+                    "but no such datum annotation exists",
+                    f"add_datum(view_id={view_id!r}, label={datum!r}, a=[...], pos=[...]) "
+                    "before the feature-control frame",
+                    annotation_id=annotation_id, view_id=view_id, datum=datum,
+                )
+            elif datum_positions[datum] >= index:
+                fail(
+                    "gdt", "gdt_datum_order",
+                    f"GD&T frame {annotation_id!r} cites datum {datum!r} before its annotation",
+                    f"edit_drawing_annotation(view_id={view_id!r}, "
+                    f"annotation_id={annotation_id!r}, delete=true), then recreate it with "
+                    "add_gdt(...) after add_datum(...)",
+                    annotation_id=annotation_id, view_id=view_id, datum=datum,
+                )
+
+    by_id = {str(annotation.get("id")): annotation for annotation in annotations
+             if annotation.get("id") is not None}
+    thread_records: list[tuple[str, dict]] = [
+        ("spec", row) for row in rows if row.get("type") == "thread"
+    ]
+    included_annotations: set[str] = set()
+    for row in rows:
+        if row.get("type") != "thread" or row.get("annotation_id") is None:
+            continue
+        annotation = by_id.get(str(row["annotation_id"]))
+        if annotation is not None:
+            thread_records.append(("annotation", annotation))
+            included_annotations.add(str(annotation.get("id")))
+    for annotation in annotations:
+        kind = _canon_word(annotation.get("kind") or annotation.get("type"))
+        tapped = _canon_word(annotation.get("hole_type")) == "tapped"
+        if kind == "hole_callout" and (
+                tapped or annotation.get("thread") or
+                _THREAD_DESIGNATION.search(str(annotation.get("text") or ""))):
+            annotation_id = str(annotation.get("id"))
+            if annotation_id not in included_annotations:
+                thread_records.append(("annotation", annotation))
+                included_annotations.add(annotation_id)
+    seen_thread_findings: set[tuple[str, str, str]] = set()
+    for source_kind, record in thread_records:
+        annotation_id = record.get("id") if source_kind == "annotation" else None
+        requirement_id = record.get("requirement_id") if source_kind == "spec" else None
+        identity = str(annotation_id or requirement_id or "")
+        designation = _audit_thread_text(record)
+        if not _THREAD_DESIGNATION.search(designation):
+            key = (source_kind, identity, "thread_designation_invalid")
+            if key not in seen_thread_findings:
+                seen_thread_findings.add(key)
+                remedy = (
+                    f"edit_drawing_annotation(view_id={record.get('view_id')!r}, "
+                    f"annotation_id={annotation_id!r}, delete=true), then "
+                    "add_hole_callout(..., thread='M6x1.0' or '1/4-20 UNC-2B', "
+                    "depth=... or thru=true)"
+                    if source_kind == "annotation" else
+                    "mfg_plan_upsert(..., plan=<correct this thread row to a full "
+                    "M<d>x<pitch> or <size>-<TPI> UNC/UNF designation>)"
+                )
+                fail(
+                    "thread_callout", "thread_designation_invalid",
+                    f"{source_kind} thread row {identity!r} has no valid Metric/Unified "
+                    f"designation: {designation!r}",
+                    remedy, source=source_kind, annotation_id=annotation_id,
+                    requirement_id=requirement_id,
+                )
+        if not _audit_thread_depth_stated(record):
+            key = (source_kind, identity, "thread_extent_missing")
+            if key not in seen_thread_findings:
+                seen_thread_findings.add(key)
+                fail(
+                    "thread_callout", "thread_extent_missing",
+                    f"{source_kind} thread row {identity!r} states neither depth nor THRU",
+                    (f"edit_drawing_annotation(view_id={record.get('view_id')!r}, "
+                     f"annotation_id={annotation_id!r}, delete=true), then "
+                     "add_hole_callout(..., depth=... or thru=true)"
+                     if source_kind == "annotation" else
+                     "mfg_plan_upsert(..., plan=<set depth or thru=true on this thread row>)"),
+                    source=source_kind, annotation_id=annotation_id,
+                    requirement_id=requirement_id,
+                )
+
+    view_ids = {str(view.get("view_id") or view.get("id")) for view in _views_of(full)
+                if view.get("view_id") or view.get("id")}
+    for annotation in annotations:
+        refs = []
+        for key in ("_declared_view_id", "anchor_view_id", "view_ref", "source_view_id"):
+            if annotation.get(key):
+                refs.append(str(annotation[key]))
+        anchor = annotation.get("anchor")
+        if isinstance(anchor, dict):
+            for key in ("view_id", "view_ref", "source_view_id"):
+                if anchor.get(key):
+                    refs.append(str(anchor[key]))
+        missing_refs = sorted({ref for ref in refs if ref not in view_ids})
+        if missing_refs:
+            fail(
+                "annotation_anchor", "annotation_dangling",
+                f"annotation {annotation.get('id')!r} refers to missing view(s) "
+                + ", ".join(missing_refs),
+                f"edit_drawing_annotation(view_id={annotation.get('view_id')!r}, "
+                f"annotation_id={annotation.get('id')!r}, delete=true), then recreate it "
+                "on an existing view",
+                annotation_id=annotation.get("id"), view_id=annotation.get("view_id"),
+                missing_view_ids=missing_refs,
+            )
+
+    finish_symbols = [annotation for annotation in annotations
+                      if _canon_word(annotation.get("kind") or annotation.get("type"))
+                      == "surface_finish"]
+    finish_text = " ".join([
+        str(title.get("finish") or ""),
+        str(_audit_title_value(title, "general_tolerance") or ""),
+        *notes,
+    ])
+    if finish_symbols and not _FINISH_NOTE.search(finish_text):
+        fail(
+            "surface_finish_note", "finish_note_missing",
+            "surface-finish symbols exist, but title block/notes state no general or "
+            "specific finish requirement",
+            "set_titleblock(fields={\"finish\":\"RA ...\"}) or "
+            "add_note(..., text=\"SURFACE FINISH ...\")",
+            annotation_ids=[annotation.get("id") for annotation in finish_symbols],
+        )
+
+    checks = []
+    for check_name in _AUDIT_STANDARD_CHECKS:
+        count = sum(1 for finding in failures if finding["check"] == check_name)
+        checks.append({
+            "check": check_name, "status": "fail" if count else "pass",
+            "failure_count": count,
+        })
+    return {
+        "status": "fail" if failures else "pass",
+        "failure_count": len(failures), "checks": checks, "failures": failures,
+    }
 
 
 def register_cad_drawing_tools(mcp: FastMCP) -> None:
@@ -2107,9 +2412,9 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
 
         This is a LAYOUT review, not a manufacturing-completeness gate.  The JSON caption
         reports ``layout_clean``.  ``manufacturing_ready`` remains for compatibility but is
-        false unless a successful result from audit_drawing for this drawing is supplied as
-        ``audit_result`` and layout is also clean.  Never release a nominal-only sheet from
-        review_drawing alone.
+        false unless the supplied current audit_drawing result has complete requirement
+        coverage, zero standards failures, and the layout is clean.  Never release a
+        nominal-only sheet from review_drawing alone.
         """
         d = _doc(doc_id)
         png = _tmp(".png")
@@ -2121,14 +2426,16 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def audit_drawing(doc_id: str, drawing_id: str, spec: Any) -> str:
-        """Audit on-sheet manufacturing coverage against the governing spec/ledger.
+        """Audit manufacturing coverage and deterministic drawing-standard compliance.
 
         ``spec`` is REQUIRED and contains requirement rows (a list, or
         ``{"requirements":[...]}``).  Each row names type=dimension_tolerance|thread|finish|
         note|gdt|datum|weld|title_field, an optional annotation_id, and critical=true by
-        default.  A row resolves to a real annotation id (or ``title_block.<field>``) or is
-        reported missing.  The verdict is release_ready only when every critical row is
-        covered and the existing exact layout/title checks are clean.
+        default.  ``coverage_matrix`` resolves those rows; ``standards`` independently checks
+        the controlled title block/units, GD&T datum order and composite shape, thread grammar
+        and extent, dangling annotation anchors, and inverse surface-finish-note consistency.
+        release_ready requires complete critical coverage, clean layout, and zero standards
+        failures.
         """
         try:
             drawing_doc_id = _doc(drawing_id)
@@ -2147,15 +2454,23 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             coverage = _audit_coverage(full, rows)
             missing = [row for row in coverage if row["status"] == "missing"]
             missing_critical = [row for row in missing if row["critical"]]
+            standards = _audit_standards(full, rows)
+            standards_failures = standards["failures"]
             layout = _drawing_review_summary(full, {}, None)
             layout_warnings = layout["warnings"]
-            release_ready = not missing_critical and not layout_warnings
+            release_ready = (
+                not missing_critical
+                and not standards_failures
+                and not layout_warnings
+            )
             return _dumps({
                 "ok": True,
                 "doc_id": doc_id,
                 "drawing_id": drawing_doc_id,
                 "drawing_revision": full.get("revision"),
                 "coverage_matrix": coverage,
+                "standards": standards,
+                "standards_failures": standards_failures,
                 "covered": len(coverage) - len(missing),
                 "total": len(coverage),
                 "missing": missing,

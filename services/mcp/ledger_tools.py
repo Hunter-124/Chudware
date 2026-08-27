@@ -26,8 +26,8 @@ def register_ledger_tools(mcp) -> None:
 
         ``section`` filters to a single section (brief | requirements | decisions |
         dimensions | questions | stage_log | artifacts | criterion_results |
-        features | geometry_specs | linkages | build_nodes | manifest); omit or
-        pass ``all``/``*`` for the full ledger render. ``budget_tokens`` controls
+        features | geometry_specs | linkages | build_nodes | mfg_plans | manifest);
+        omit or pass ``all``/``*`` for the full ledger render. ``budget_tokens`` controls
         the rendering budget (default 800).
         """
         from services.agent.ledger import Ledger, ledger_render
@@ -136,19 +136,15 @@ def register_ledger_tools(mcp) -> None:
     ) -> dict:
         """Append a structured event to the design ledger for *run_id*.
 
-        ``kind`` selects the event type:
-          - ``brief``       — {title, summary, success_criteria}
-          - ``decision``    — {id, stage, text, rationale}
-          - ``dimension``   — {id, name, value, unit, driver, provenance, tolerance?, status?, refs?}
-          - ``question``    — {id, text, blocking?}
-          - ``requirement`` — {req_id, text, source?, status?}
-          - ``stage``       — {stage, entered?, exited?, exit_gate?}
-          - ``artifact``    — {kind, id, path, stage, note?}
+        ``kind`` selects any shared ledger event kind, including typed
+        ``feature``, ``geometry_spec``, ``linkage``, ``build_node``, and
+        ``mfg_plan`` records in addition to the core brief/decision/dimension/
+        question/requirement/stage/artifact kinds.
 
         ``actor`` identifies the writing role (role id, "human", or "foreman").
-
-        Dimension events MUST include a ``provenance`` field (tool result / calc /
-        table / user answer) — contract rule.
+        Dimension and geometry-spec events require top-level provenance. Numeric
+        manufacturing-plan critical rows require row-level provenance. The same
+        validator is used by the mission-scoped shadow.
         """
         from services.agent.ledger import Ledger
         from services.agent.ledger_vocab import (
@@ -185,14 +181,26 @@ def register_ledger_tools(mcp) -> None:
             ))
             payload.setdefault("kind", raw_kind)
 
-        if kind == "dimension" and not payload.get("provenance"):
-            return {
-                "ok": False,
-                "error": (
-                    "dimension events require a 'provenance' field "
-                    "(tool result / calc / table / user answer)"
-                ),
-            }
+        if kind in {
+            "decision", "dimension", "question", "artifact", "feature",
+            "geometry_spec", "linkage", "build_node", "mfg_plan",
+            "criterion_result",
+        } and not payload.get("id"):
+            for alt in (
+                "name", "decision_id", "dim_id", "req_id", "artifact_id",
+                "feature_id", "spec_id", "node_id", "plan_id", "deliverable",
+                "criterion_id",
+            ):
+                if payload.get(alt):
+                    payload["id"] = str(payload[alt])
+                    break
+            if not payload.get("id") and kind == "mfg_plan":
+                payload["id"] = "main"
+        try:
+            from services.agent.ledger import validate_ledger_payload
+            validate_ledger_payload(kind, payload)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
 
         try:
             ledger = Ledger.load(run_id)

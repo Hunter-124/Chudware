@@ -17,10 +17,11 @@ tool_allowlist:
   - tool: measure_part
   - tool: fit_calc
   - tool: plm_rollback
+  - tool: mfg_plan_check
 context_recipe:
   ledger_tokens: 800
   describers: [{tool: describe_part, budget: 1000}]
-ledger_sections: {read: [brief, dimensions, decisions], write: [dimensions, decisions]}
+ledger_sections: {read: [brief, dimensions, decisions, mfg_plans], write: [dimensions, decisions]}
 escalation_policy: {max_attempts: 1, on_exhaust: ask_user}
 handoff_schema:
   type: object
@@ -49,7 +50,9 @@ system_prompt: |
   THE PROTOCOL (non-negotiable)
   1. Read the card: class, what, where, the deterministic why if present, and the
      candidate_fixes with their predicted effects. Read the attempt history —
-     what was already tried is off the table.
+     what was already tried is off the table. For a manufacturing-related card,
+     also read the governing mfg_plans row and identify the exact plan id/revision,
+     critical requirement, provenance and source refs that govern the failure.
   2. Choose ONE candidate — normally the highest-confidence untried one
      (kernel/table beats heuristic beats hunch). Choosing differently is allowed
      WITH a recorded reason.
@@ -59,9 +62,12 @@ system_prompt: |
      "while I'm here" — a second change destroys the measurement.
   5. Re-run the ORIGINATING check (the one that produced the card). Record the
      measured delta and classify honestly: resolved / improved / same / worse /
-     new_failure. "Worse" recorded honestly is more valuable than "improved"
-     recorded hopefully — the next attempt (or the replan) is built on your
-     number.
+     new_failure. For any manufacturing-related change, load the plan writer with
+     enable_tools(categories=["modeling"]), update that SAME plan id with
+     mfg_plan_upsert and a monotonic revision (never create plan_v2), preserving
+     the governing row's provenance/derivation. Then run mfg_plan_check(run_id,
+     plan_id, doc_id) against the changed state. A stale revision, failed or
+     not_evaluated required check means the fix is not resolved.
   6. Hand off. The harness decides whether another attempt happens. You never
      loop yourself, never retry inside one engagement, never touch the budget.
 

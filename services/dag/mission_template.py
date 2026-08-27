@@ -153,6 +153,62 @@ def _deliverable_blob(d: dict[str, Any]) -> str:
     return " ".join(parts).lower()
 
 
+_MANUFACTURING_PLAN_PROCESS_IDS = frozenset({
+    "cnc",
+    "cnc_mill",
+    "cnc_milling",
+    "fabricated",
+    "fabrication",
+    "laser",
+    "laser_cut",
+    "lathe",
+    "machined",
+    "machining",
+    "milled",
+    "sheet_metal",
+    "turned",
+    "turning",
+    "waterjet",
+    "welded",
+    "weldment",
+})
+
+
+def _needs_manufacturing_plan(d: dict[str, Any]) -> bool:
+    """Whether this part/assembly needs the shop-planning BUILD pre-node."""
+    if d.get("kind") not in {"part", "assembly"}:
+        return False
+    raw_process = (
+        d.get("process")
+        or d.get("manufacturing_process")
+        or d.get("process_id")
+        or ""
+    )
+    if isinstance(raw_process, dict):
+        raw_process = (
+            raw_process.get("id")
+            or raw_process.get("process")
+            or raw_process.get("profile_id")
+            or raw_process.get("name")
+            or ""
+        )
+    process = str(raw_process).strip().lower().replace("-", "_").replace(" ", "_")
+    if process in _MANUFACTURING_PLAN_PROCESS_IDS:
+        return True
+    blob = _deliverable_blob(d)
+    return any(cue in blob for cue in (
+        "cnc", "fabricate", "fabricated", "fabrication", "laser cut",
+        "laser-cut", "machined", "machining", "milled", "milling",
+        "sheet metal", "turning", "turned", "waterjet", "welded", "weldment",
+    ))
+
+
+def _ledger_context_for(d: dict[str, Any]) -> list[str] | None:
+    if d.get("kind") in {"drawing", "work_instruction"}:
+        return ["mfg_plans"]
+    return None
+
+
 _PACKAGE_PHRASES = (
     "manufacturing package",
     "manufacturing-package",
@@ -476,11 +532,13 @@ def _build_job_for(d: dict[str, Any], role: str) -> str:
     if role == "drawing_detailer":
         return (
             "AUTHOR the controlled drawing artifact, not geometry or a prose "
-            "summary. Start make_drawing with model_items=false, then place an "
-            "explicit per-feature view/dimension/callout plan from the ledger. "
+            "summary. Start by calling mfg_plan_get(view=\"audit_spec\") when a "
+            "manufacturing plan exists; that returned object is the canonical "
+            "audit_drawing spec. Then make_drawing with model_items=false and place "
+            "an explicit per-feature view/dimension/callout plan from the ledger. "
             "Cover threads, fits/tolerances, finishes, datums/GD&T, welds and "
             "notes as applicable. Run review_drawing for layout, then "
-            "audit_drawing against the specification; export_drawing is allowed "
+            "audit_drawing with the projected plan spec; export_drawing is allowed "
             "only when the current audit verdict is release_ready."
         )
     if kind == "report":
@@ -492,11 +550,11 @@ def _build_job_for(d: dict[str, Any], role: str) -> str:
         )
     if kind == "work_instruction":
         return (
-            "Call enable_tools(categories=[\"docs\"]), then BUILD the controlled "
-            "shop document with make_work_instruction. Include operation routing, "
-            "stock/setup/fixturing, process parameters with provenance, inspection "
-            "hold points, finishing and assembly steps. Return the artifact path; "
-            "prose alone is not done."
+            "Call enable_tools(categories=[\"docs\", \"cad\"]), read the governing "
+            "mfg_plans route, then BUILD the controlled shop document with "
+            "make_work_instruction. Include operation routing, stock/setup/fixturing, "
+            "process parameters with provenance, inspection hold points, finishing "
+            "and assembly steps. Return the artifact path; prose alone is not done."
         )
     if kind == "weldment_traveler":
         return (
@@ -773,13 +831,44 @@ def build_mission_graph(
             "request": _deliverable_request(
                 manifest, d, _build_job_for(d, role)),
         }
+        ledger_context = _ledger_context_for(d)
+        if ledger_context:
+            build_inputs["ledger_sections"] = ledger_context
         if domain_tags:
             build_inputs["domain_tags"] = domain_tags
+        needs_mfg_plan = _needs_manufacturing_plan(d)
+        if needs_mfg_plan:
+            mfg_plan_id = f"n_mfg_plan_{did}"
+            nodes.append(_node(
+                mfg_plan_id,
+                _TYPE_PLAN,
+                f"BUILD PLAN {did}: manufacturing route",
+                "manufacturing_planner",
+                inputs={
+                    "deliverable": did,
+                    "task_class": tc,
+                    "kind": d.get("kind"),
+                    "request": _deliverable_request(
+                        manifest,
+                        d,
+                        "derive and persist the shop-ready manufacturing plan before "
+                        "any modeling: process rationale, stock, datum/setup strategy, "
+                        "operation sequence, function-derived critical dimensions, "
+                        "inspection plan, and open risks.",
+                    ),
+                },
+                on_fail="pause",
+                autonomy=default_autonomy,
+            ))
+            edges.append({"from": plan_id, "to": mfg_plan_id})
         nodes.append(_node(bid, _TYPE_BUILD, f"BUILD {did}: {d.get('name', '')}",
                            role,
                            inputs=build_inputs,
                            on_fail="pause", autonomy=default_autonomy))
-        edges.append({"from": plan_id, "to": bid})
+        edges.append({
+            "from": mfg_plan_id if needs_mfg_plan else plan_id,
+            "to": bid,
+        })
 
     # Preserve declared artifact dependencies inside the BUILD fan-out. PLAN still
     # precedes every build, while independent parts retain no peer edge.
@@ -801,6 +890,7 @@ def build_mission_graph(
                            inputs={"deliverable": did,
                                    "task_class": _LEAF_TASK_CLASS,
                                    "risk": "low",
+                                   "ledger_sections": _ledger_context_for(d),
                                    "request": _deliverable_request(
                                        manifest, d, _verify_job_for(d))},
                            on_fail="pause", autonomy=default_autonomy))
@@ -819,6 +909,7 @@ def build_mission_graph(
                            inputs={"deliverable": did,
                                    "task_class": _REPORT_TASK_CLASS,
                                    "risk": "low",
+                                   "ledger_sections": _ledger_context_for(d),
                                    "request": _deliverable_request(
                                        manifest, d,
                                        "summarise what was built and verified for "

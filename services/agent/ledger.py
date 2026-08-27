@@ -41,7 +41,53 @@ _DP_KIND_SECTION: dict[str, str] = {
     "geometry_spec": "geometry_specs",
     "linkage": "linkages",
     "build_node": "build_nodes",
+    "mfg_plan": "mfg_plans",
 }
+
+_PROVENANCE_REQUIRED_KINDS = frozenset({"dimension", "geometry_spec"})
+
+
+def _has_numeric_engineering_value(row: dict) -> bool:
+    """Whether an audit-native requirement carries a numeric engineering value."""
+    ignored = {"critical"}
+
+    def visit(value: Any, key: str = "") -> bool:
+        if key in ignored or isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            return True
+        if isinstance(value, dict):
+            return any(visit(child, str(name)) for name, child in value.items())
+        if isinstance(value, (list, tuple)):
+            return any(visit(child) for child in value)
+        return False
+
+    return visit(row)
+
+
+def validate_ledger_payload(kind: str, payload: dict) -> None:
+    """Enforce provenance invariants shared by every ledger write path."""
+    if kind in _PROVENANCE_REQUIRED_KINDS and not payload.get("provenance"):
+        raise ValueError(
+            f"{kind} events require a 'provenance' field "
+            "(tool result / calc / table / user answer)"
+        )
+    if kind != "mfg_plan":
+        return
+    for section in ("critical_dimensions", "other_callouts"):
+        rows = payload.get(section) or []
+        if not isinstance(rows, list):
+            raise ValueError(f"mfg_plan {section!r} must be a list")
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise ValueError(f"mfg_plan {section}[{index}] must be an object")
+            is_critical = section == "critical_dimensions" or row.get("critical", True)
+            if is_critical and _has_numeric_engineering_value(row) and not row.get("provenance"):
+                label = row.get("requirement_id") or row.get("id") or index
+                raise ValueError(
+                    f"mfg_plan numeric critical row {label!r} requires provenance "
+                    "(tool result / calc / table / user answer)"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +147,7 @@ def _empty_state(run_id: str) -> dict:
         "geometry_specs": [],    # Stage 2 geometry_spec[] (geometry_designer, T-DP3)
         "linkages": [],          # Stage 3 linkage[] (linkage_planner, T-DP4)
         "build_nodes": [],       # Stage 4 build_node[] (build_strategist)
+        "mfg_plans": [],         # Typed manufacturing-plan scratchpad
     }
 
 
@@ -212,12 +259,10 @@ def _apply(state: dict, event: dict) -> dict:
         else:
             state["artifacts"].append(dict(payload))
 
-    elif kind in ("feature", "geometry_spec", "linkage", "build_node"):
-        # T-DP1: design-pipeline stage artifacts. All four materialize the same way
-        # — upsert by id into the matching state section (last-write-wins field
-        # merge, matching the dimension / criterion_result pattern). provenance (on
-        # geometry_spec) stays in the event payload for audit AND in state (the gate
-        # reads state.geometry_specs[].provenance).
+    elif kind in _DP_KIND_SECTION:
+        # Typed design/manufacturing artifacts share stable-id last-write-wins
+        # materialization. Keeping this keyed from the map prevents additive kinds
+        # from silently drifting out of replay.
         section = _DP_KIND_SECTION[kind]
         item_id = payload.get("id")
         existing = next((x for x in state[section] if x.get("id") == item_id), None)
@@ -510,6 +555,14 @@ class Ledger:
             "detail": detail, "evidence": evidence or {},
         })
 
+
+    def upsert_mfg_plan(self, actor: str, plan: dict) -> dict:
+        """Append a validated typed manufacturing-plan event."""
+        body = dict(plan or {})
+        if not body.get("id"):
+            raise ValueError("mfg_plan requires a stable 'id'")
+        validate_ledger_payload("mfg_plan", body)
+        return self.append(actor, "mfg_plan", body)
     # ------------------------------------------------------------------
     # T-DP1: design-pipeline stage-artifact writers
     # (contract design_pipeline.md §3/§4 — extends aicad.ledger/1)
@@ -615,6 +668,10 @@ class Ledger:
     def build_nodes(self) -> list[dict]:
         """Stage-4 build_node[] — compiled into the buildgraph at PLAN."""
         return list(self.state.get("build_nodes", []))
+
+    def mfg_plans(self) -> list[dict]:
+        """Typed manufacturing plans, upserted by stable plan id."""
+        return list(self.state.get("mfg_plans", []))
 
     def slice_for_stage(self, stage: str) -> dict:
         """The minimal typed inputs a design-pipeline stage needs (§22 fresh-context

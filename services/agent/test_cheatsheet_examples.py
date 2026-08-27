@@ -122,3 +122,54 @@ def test_examples_use_the_spelling_the_cheatsheet_mandates():
                 f"example uses {plane!r} while the prose calls "
                 f"'plane.top'/'plane.front'/'plane.right' canonical")
     assert "plane.top" in text
+
+
+DRAWING_MD = CHEATSHEETS / "drawing.md"
+MANUFACTURING_PLANNING_MD = CHEATSHEETS / "manufacturing_planning.md"
+_BACKTICKED_TOOL = re.compile(r"`([a-z][a-z0-9_]+)`")
+_REQUIRED_MANUFACTURING_TOOLS = frozenset({
+    "audit_drawing",
+    "dfm_check",
+    "feeds_speeds",
+    "fit_calc",
+    "machining_ref_get",
+    "machining_ref_index_pdf",
+    "machining_ref_search",
+    "machining_ref_search_pdf",
+    "make_work_instruction",
+    "mfg_plan_check",
+    "mfg_plan_get",
+    "mfg_plan_render",
+    "mfg_plan_upsert",
+    "recommend_fit",
+    "research_material_lookup",
+    "research_thread_spec",
+    "resolve_process",
+    "set_process",
+    "tap_drill",
+})
+
+
+@pytest.mark.parametrize(
+    "topic,path",
+    [
+        ("drawing", DRAWING_MD),
+        ("manufacturing_planning", MANUFACTURING_PLANNING_MD),
+    ],
+)
+def test_named_cheatsheet_loads_through_cad_guide(topic, path):
+    """New sheets must use the same filename-based cad_guide path as drawing."""
+    from services.mcp.cad_guide import cad_guide_text
+
+    assert path.is_file()
+    assert cad_guide_text(topic) == path.read_text(encoding="utf-8")
+
+
+def test_manufacturing_planning_cheatsheet_names_only_bindable_tools():
+    """Every code-formatted tool in the planning workflow must dispatch live."""
+    text = MANUFACTURING_PLANNING_MD.read_text(encoding="utf-8")
+    tool_names = frozenset(_BACKTICKED_TOOL.findall(text))
+    assert tool_names == _REQUIRED_MANUFACTURING_TOOLS
+
+    unresolved = sorted(name for name in tool_names if at._bind_tool(name) is None)
+    assert not unresolved, f"manufacturing planning names unbound tools: {unresolved}"

@@ -62,7 +62,7 @@ class TestLedgerSchema(unittest.TestCase):
         self.assertEqual(ledger.state["run_id"], run_id)
         self.assertIsInstance(ledger.state["brief"], dict)
         for section in ("requirements", "decisions", "dimensions",
-                        "questions", "stage_log", "artifacts"):
+                        "questions", "stage_log", "artifacts", "mfg_plans"):
             self.assertIsInstance(ledger.state[section], list)
 
     def test_events_start_empty(self):
@@ -408,6 +408,24 @@ class TestUpsertHelpers(unittest.TestCase):
         self.assertEqual(len(ledger.state["dimensions"]), 1)
         self.assertEqual(ledger.state["dimensions"][0]["value"], 20.02)
 
+    def test_upsert_mfg_plan_updates_revision_in_place(self):
+        run_id, path = _fresh("upsert_mfg")
+        ledger = Ledger(run_id, path)
+        base = {
+            "id": "main",
+            "revision": "A",
+            "critical_dimensions": [{
+                "requirement_id": "D1", "type": "dimension_tolerance",
+                "value": 10.0, "provenance": "fit_calc",
+            }],
+        }
+        ledger.upsert_mfg_plan("planner", base)
+        ledger.upsert_mfg_plan("planner", {**base, "revision": "B"})
+        self.assertEqual(len(ledger.mfg_plans()), 1)
+        self.assertEqual(ledger.mfg_plans()[0]["revision"], "B")
+        replayed = _materialize(ledger.events, run_id)
+        self.assertEqual(replayed["mfg_plans"], ledger.state["mfg_plans"])
+
     def test_string_tolerance_does_not_crash_ledger_render(self):
         """A bare fit class ("g6") is the natural way to tolerance a dimension.
 
@@ -576,6 +594,34 @@ class TestMCPTools(unittest.TestCase):
                      "provenance": "ISO 286 H7 table"},
         )
         self.assertTrue(result.get("ok"), result)
+
+    def test_ledger_note_geometry_spec_requires_provenance(self):
+        result = self._tools["ledger_note"](
+            run_id=_fresh("mcp_geo_noprov")[0],
+            kind="geometry_spec",
+            payload={"id": "G1", "realizes": ["FT1"], "shapes": []},
+        )
+        self.assertFalse(result.get("ok"), result)
+        self.assertIn("provenance", result.get("error", ""))
+
+    def test_both_write_paths_reject_unprovenanced_mfg_critical_row(self):
+        payload = {
+            "id": "main", "revision": "A",
+            "critical_dimensions": [{
+                "requirement_id": "D1", "type": "dimension_tolerance",
+                "value": 12.0,
+            }],
+        }
+        standalone = self._tools["ledger_note"](
+            run_id=_fresh("mcp_mfg_noprov")[0], kind="mfg_plan", payload=payload,
+        )
+        self.assertFalse(standalone.get("ok"), standalone)
+        from services.agent.mission_dispatch import MissionDispatch
+        run_id, path = _fresh("mission_mfg_noprov")
+        mission = MissionDispatch(run_id=run_id, ledger=Ledger(run_id, path))
+        shadow = mission.ledger_note(kind="mfg_plan", payload=payload)
+        self.assertFalse(shadow.get("ok"), shadow)
+        self.assertEqual(standalone["error"], shadow["error"])
 
     def test_ledger_note_invalid_kind(self):
         run_id, path = _fresh("mcp_note_bad_kind")

@@ -170,12 +170,12 @@ def _shaft_es_um(letter: str, nominal_mm: float, row: dict) -> tuple[float, str]
         es = round(formulas[letter](D))
         return float(es), "closed_form"
 
-    # Tabulated shafts (k, n, p, r, s)
+    # Tabulated shafts (k, m, n, p, r, s)
     shaft_data = _iso286()["shaft_deviations"].get(letter)
     if shaft_data is None:
         raise FitError(
             "unsupported_deviation",
-            f"shaft letter {letter!r} not in data; supported: d, e, f, g, h, js, k, n, p, r, s.",
+            f"shaft letter {letter!r} not in data; supported: d, e, f, g, h, js, k, m, n, p, r, s.",
         )
     if "_todo" in shaft_data:
         raise FitError(

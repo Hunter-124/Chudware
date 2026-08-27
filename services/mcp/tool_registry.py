@@ -46,8 +46,15 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               # "ledger_" not "get_", so the prefix classifier misses it — explicit entry needed.
               # T-DP11: ledger_events returns raw events for the GUI transparency stream.
               "ledger_get", "ledger_events",
+              # Typed manufacturing planning and cited-reference reads.
+              "mfg_plan_get", "mfg_plan_check",
+              "machining_ref_search", "machining_ref_get", "machining_ref_search_pdf",
               # Workspace (T-W16): status/events are read-only poll tools.
               "workspace_status", "workspace_doc_events",
+              # ECAD symbol discovery is a pure library query — no document is touched. It
+              # starts with "ecad_" so no prefix rule catches it. (ecad_netlist / ecad_bom /
+              # ecad_plot stay unclassified -> RISK_WRITE: they can write artifacts to disk.)
+              "ecad_symbols",
               # Office read tools (T-office): office_extract is the frozen worker-RPC-shared
               # extraction contract; the rest are read-only per-format structured reads. None
               # match the get_/describe_/etc prefix classifier (all start with "office_"), so

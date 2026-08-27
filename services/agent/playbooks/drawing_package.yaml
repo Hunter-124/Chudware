@@ -4,10 +4,11 @@ stage: deliver
 # Owning role: drawing_detailer. Helper tools ⊆ drawing_detailer.tool_allowlist.
 steps:
   - id: coverage_plan
-    goal: map every critical ledger specification row to a planned on-sheet annotation before drafting
-    helper_tools: []
+    goal: project the manufacturing plan into the canonical audit spec, then map every critical row to a planned on-sheet annotation
+    helper_tools: [mfg_plan_get]
     checklist:
-      - each critical row records spec_dimension, value, tolerance and source
+      - when a plan exists, mfg_plan_get(view="audit_spec") supplies the unchanged audit_drawing specification
+      - without a plan, each critical ledger row records spec_dimension, value, tolerance and source
       - annotation_id starts null and must resolve before release
       - absent source value or geometry is blocking, never guessed
     output:
@@ -26,13 +27,13 @@ steps:
       required: [drawing_id, views]
   - id: dimensions_and_callouts
     goal: resolve every coverage row with a semantic, toleranced on-sheet annotation
-    helper_tools: [add_dimension, add_hole_callout, edit_drawing_annotation, add_gdt, add_datum, add_surface_finish, add_weld_symbol]
+    helper_tools: [add_dimension, add_hole_callout, add_gdt, add_datum, add_surface_finish, add_weld_symbol]
     checklist:
       - every size dimension carries the ledger tolerance at creation
       - threads and blind/counterbored/countersunk holes use semantic hole callouts
       - datum and GD&T references are valid; finishes and welds match process requirements
       - heat treat, coating, deburr and inspection notes are represented on-sheet
-      - wrong callouts patched/deleted by annotation id, never overridden in side prose
+      - wrong callouts patched/deleted by annotation id after loading edit_drawing_annotation through enable_tools(categories=["drawing"])
       - no critical coverage row retains annotation_id null
     output:
       type: object
@@ -48,11 +49,12 @@ steps:
       required: [title_block]
   - id: review_audit_export
     goal: clear current layout warnings, pass the specification coverage audit, then export
-    helper_tools: [review_drawing, edit_drawing_annotation, set_titleblock, audit_drawing, export_drawing]
+    helper_tools: [review_drawing, set_titleblock, mfg_plan_get, audit_drawing, export_drawing]
     checklist:
       - review_drawing performed after the final sheet mutation and attached pixels inspected
       - no overlap, off-sheet, missing-title-field or material warning remains
-      - audit_drawing run against the ledger specification after the current review
+      - when a plan exists, audit_drawing spec is the unchanged mfg_plan_get(view="audit_spec") projection
+      - without a plan, audit_drawing uses the ledger-derived specification after the current review
       - audit verdict is release_ready and missing_critical is empty
       - export runs only after that current release_ready verdict
     output:

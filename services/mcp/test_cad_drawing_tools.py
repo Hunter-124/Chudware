@@ -1508,10 +1508,22 @@ def _complete_titleblock(dwg: str) -> None:
         "doc_id": dwg,
         "fields": {
             "title": "TEST PLATE", "part_number": "TP-1", "material": "6061-T6 ALUMINUM",
-            "scale": "1:1", "rev": "A", "finish": "AS SPECIFIED",
+            "scale": "1:1", "rev": "A", "finish": "RA 3.2 MAX",
+            "drawn_by": "TEST", "date": "2026-08-26",
         },
     })
     assert result["ok"], result
+
+
+def _standards_full(dwg: str) -> dict:
+    """One readback enriched with the extended controlled-title fields audit consumes."""
+    full = cb.call("drawing_get", {"doc_id": dwg})
+    full["sheets"][0]["title_block"].update({
+        "projection": "THIRD ANGLE",
+        "drawing_standard": "ASME Y14.5-2018",
+        "general_tolerance": "UNLESS OTHERWISE SPECIFIED: DIMENSIONS ARE IN MM; ISO 2768-m",
+    })
+    return full
 
 
 def _review_summary(dwg: str, audit_result=None) -> dict:
@@ -1559,12 +1571,12 @@ def test_review_never_releases_a_bare_nominal_sheet_without_audit():
     dwg, _mk = _sheet_drawing()
     _complete_titleblock(dwg)
     summary = _review_summary(dwg)
-    assert summary["layout_clean"] is True, summary
+    assert summary["layout_clean"] is True, summary["warnings"]
     assert summary["manufacturing_ready"] is False, summary
     assert "audit_drawing" in summary["manufacturing_ready_reason"], summary
 
 
-def test_audit_flags_missing_row_and_passes_when_exact_annotation_is_covered():
+def test_audit_flags_missing_row_and_passes_when_exact_annotation_is_covered(monkeypatch):
     dwg, made = _sheet_drawing()
     _complete_titleblock(dwg)
     bbox = _view(dwg, "v2")["bbox"]
@@ -1574,26 +1586,148 @@ def test_audit_flags_missing_row_and_passes_when_exact_annotation_is_covered():
         "tol_type": "symmetric", "tol_upper": 0.1, "precision": 1,
     })
     assert dimension["ok"], dimension
-    missing = _call("audit_drawing", {
-        "doc_id": made["source_doc_id"], "drawing_id": dwg,
-        "spec": {"requirements": [{
+    full = _standards_full(dwg)
+    missing = _audit_with_full(
+        monkeypatch, dwg, made["source_doc_id"], full,
+        {"requirements": [{
             "requirement_id": "D1", "type": "dimension_tolerance",
             "annotation_id": "missing-ann", "critical": True,
         }]},
-    })
+    )
     assert missing["verdict"] == "not_release_ready", missing
     assert missing["coverage_matrix"][0]["status"] == "missing", missing
-    covered = _call("audit_drawing", {
-        "doc_id": made["source_doc_id"], "drawing_id": dwg,
-        "spec": {"requirements": [{
+    covered = _audit_with_full(
+        monkeypatch, dwg, made["source_doc_id"], full,
+        {"requirements": [{
             "requirement_id": "D1", "type": "dimension_tolerance",
             "annotation_id": dimension["annotation"], "critical": True,
         }]},
-    })
+    )
     assert covered["verdict"] == "release_ready", covered
+    assert covered["standards"]["failure_count"] == 0, covered
     assert covered["coverage_matrix"][0]["annotation_id"] == dimension["annotation"]
     review = _review_summary(dwg, covered)
     assert review["manufacturing_ready"] is True, review
+
+
+def _audit_with_full(monkeypatch, dwg: str, source: str, full: dict, spec: dict) -> dict:
+    real_call = cb.call
+
+    def drawing_payload(method, params=None):
+        if method == "drawing_get" and params.get("doc_id") == dwg:
+            return full
+        return real_call(method, params)
+
+    monkeypatch.setattr(cb, "call", drawing_payload)
+    return _call("audit_drawing", {
+        "doc_id": source, "drawing_id": dwg, "spec": spec,
+    })
+
+
+def test_audit_standards_requires_projection_and_general_tolerance(monkeypatch):
+    dwg, made = _sheet_drawing()
+    _complete_titleblock(dwg)
+    full = _standards_full(dwg)
+    full["sheets"][0]["title_block"]["projection"] = ""
+    full["sheets"][0]["title_block"].pop("general_tolerance")
+
+    result = _audit_with_full(
+        monkeypatch, dwg, made["source_doc_id"], full,
+        {"requirements": [{"type": "title_field", "field": "title"}]},
+    )
+
+    assert result["verdict"] == "not_release_ready", result
+    codes = {finding["code"] for finding in result["standards"]["failures"]}
+    assert {"title_field_missing", "units_statement_missing"} <= codes, result
+    fields = {finding.get("field") for finding in result["standards"]["failures"]}
+    assert {"projection", "general_tolerance"} <= fields, result
+    assert all("set_titleblock" in finding["remedy"]
+               for finding in result["standards"]["failures"]
+               if finding["check"] in {"title_block", "units_statement"}), result
+
+
+def test_audit_standards_rejects_gdt_reference_without_existing_datum(monkeypatch):
+    dwg, made = _sheet_drawing()
+    _complete_titleblock(dwg)
+    full = _standards_full(dwg)
+    full["sheets"][0]["views"][0]["annotations"] = [{
+        "id": "gdt-b", "kind": "gdt_frame", "symbol": "position",
+        "tol_value": "0.1", "tol_modifier": "none",
+        "datums": [{"ref": "B", "modifier": "none"}],
+        "a": [10, 10], "pos": [20, 20],
+    }]
+
+    result = _audit_with_full(
+        monkeypatch, dwg, made["source_doc_id"], full,
+        {"requirements": [{"type": "title_field", "field": "title"}]},
+    )
+
+    failures = result["standards"]["failures"]
+    assert any(finding["code"] == "gdt_datum_unresolved"
+               and finding["datum"] == "B" for finding in failures), result
+    assert "add_datum" in next(finding["remedy"] for finding in failures
+                              if finding["code"] == "gdt_datum_unresolved")
+    assert result["verdict"] == "not_release_ready", result
+
+
+def test_audit_standards_rejects_bare_diameter_for_thread_requirement(monkeypatch):
+    dwg, made = _sheet_drawing()
+    _complete_titleblock(dwg)
+    full = _standards_full(dwg)
+    full["sheets"][0]["views"][0]["annotations"] = [{
+        "id": "bare-dia", "kind": "hole_callout", "hole_type": "tapped",
+        "text": "DIA 5 THRU", "diameter": 5.0, "thru": True,
+        "a": [10, 10], "pos": [20, 20],
+    }]
+
+    result = _audit_with_full(
+        monkeypatch, dwg, made["source_doc_id"], full,
+        {"requirements": [{
+            "requirement_id": "THREAD-1", "type": "thread", "thread": "M6x1.0",
+            "thru": True, "annotation_id": "bare-dia",
+        }]},
+    )
+
+    failures = result["standards"]["failures"]
+    assert any(finding["code"] == "thread_designation_invalid"
+               and finding["annotation_id"] == "bare-dia" for finding in failures), result
+    remedy = next(finding["remedy"] for finding in failures
+                  if finding["code"] == "thread_designation_invalid")
+    assert "edit_drawing_annotation" in remedy and "add_hole_callout" in remedy
+    assert result["coverage_matrix"][0]["status"] == "missing", result
+    assert result["verdict"] == "not_release_ready", result
+
+
+def test_audit_standards_finds_malformed_composite_dangling_anchor_and_finish_note(monkeypatch):
+    dwg, made = _sheet_drawing()
+    _complete_titleblock(dwg)
+    full = _standards_full(dwg)
+    full["sheets"][0]["title_block"]["finish"] = ""
+    full["sheets"][0]["views"][0]["annotations"] = [
+        {
+            "id": "bad-composite", "kind": "gdt_frame", "symbol": "position",
+            "tol_value": "0.1", "datums": [], "row2": {"datums": []},
+            "a": [10, 10], "pos": [20, 20],
+        },
+        {
+            "id": "dangling", "kind": "note", "text": "INSPECT",
+            "view_id": "deleted-view", "a": [10, 10], "pos": [20, 20],
+        },
+        {
+            "id": "finish-symbol", "kind": "surface_finish", "value": "1.6",
+            "a": [10, 10], "pos": [20, 20],
+        },
+    ]
+
+    result = _audit_with_full(
+        monkeypatch, dwg, made["source_doc_id"], full,
+        {"requirements": [{"type": "title_field", "field": "title"}]},
+    )
+
+    codes = {finding["code"] for finding in result["standards"]["failures"]}
+    assert {"gdt_composite_malformed", "annotation_dangling",
+            "finish_note_missing"} <= codes, result
+    assert all(finding["remedy"] for finding in result["standards"]["failures"]), result
 
 
 def test_missing_new_annotation_rpc_returns_engine_unsupported(monkeypatch):

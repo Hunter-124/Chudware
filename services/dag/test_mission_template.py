@@ -1,11 +1,7 @@
-"""Tests for services/dag/mission_template.py's ``tier`` plumbing.
+"""Focused tests for mission graph compilation.
 
-Regression coverage for the node_runner provider-leak fix: a mission compiled
-with ``tier=`` must record that tier on EVERY node's ``inputs`` (not just the
-entry node) so ``services.dag.node_runner`` can resolve the matching provider
-for internal nodes via ``services.agent.tiers.provider_for_tier`` instead of
-silently falling through to the ambient config.json / ``CHUDWARE_PROVIDER``
-cloud default.
+Pins tier propagation, specialist routing, manufacturing-package expansion, and
+the manufacturing-plan pre-BUILD node/context seams.
 
 Run: pytest services/dag/test_mission_template.py -q
 """
@@ -174,3 +170,47 @@ def test_multi_part_manufacturing_package_expands_artifacts_and_complexity():
         "n_build_manufacturing_bom",
         "n_build_manufacturing_work_instructions",
     ) in edges
+
+
+def test_machined_part_inserts_manufacturing_planner_before_build():
+    manifest = _minimal_manifest()
+    manifest["deliverables"][0]["description"] = (
+        "CNC-machined 6061 mounting bracket."
+    )
+
+    graph = build_mission_graph(manifest)
+    by_id = {node["id"]: node for node in graph["nodes"]}
+    edges = {(edge["from"], edge["to"]) for edge in graph["edges"]}
+
+    planner_id = "n_mfg_plan_d1"
+    assert by_id[planner_id]["inputs"]["role"] == "manufacturing_planner"
+    assert (planner_id, "n_build_d1") in edges
+    assert ("n_plan", planner_id) in edges
+    assert ("n_plan", "n_build_d1") not in edges
+
+
+def test_drawing_and_work_instruction_nodes_request_mfg_plan_context():
+    graph = build_mission_graph({
+        "request_verbatim": "Produce shop documents.",
+        "ambiguities": [],
+        "deliverables": [
+            {
+                "id": "drawing",
+                "name": "Machining drawing",
+                "kind": "drawing",
+                "description": "Controlled drawing for the machined bracket.",
+                "acceptance_criteria": [],
+            },
+            {
+                "id": "instructions",
+                "name": "Machining work instructions",
+                "kind": "work_instruction",
+                "description": "Controlled setup and inspection instructions.",
+                "acceptance_criteria": [],
+            },
+        ],
+    })
+    by_id = {node["id"]: node for node in graph["nodes"]}
+
+    assert "mfg_plans" in by_id["n_build_drawing"]["inputs"]["ledger_sections"]
+    assert "mfg_plans" in by_id["n_build_instructions"]["inputs"]["ledger_sections"]

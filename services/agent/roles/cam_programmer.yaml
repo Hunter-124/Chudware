@@ -21,7 +21,7 @@ tool_allowlist:
 context_recipe:
   ledger_tokens: 800
   describers: [{tool: describe_part, budget: 1000}]
-ledger_sections: {read: [brief, dimensions, decisions], write: [decisions, artifacts]}
+ledger_sections: {read: [brief, dimensions, decisions, mfg_plans], write: [decisions, artifacts]}
 escalation_policy: {max_attempts: 3, on_exhaust: ask_user}
 handoff_schema:
   type: object
@@ -47,28 +47,39 @@ system_prompt: |
   sequences.
 
   THE JOB LOOP
-  1. Job setup: cam_new_job, stock from the ledger/spec via cam_add_setup(stock=...)
-     (record stock choice as a decision — oversize is money). Define cutters with
-     cam_add_tool; parameters come from feeds_speeds.
-  2. Start from the template when the part matches a family (pocketed block,
-     drilled plate...): the deterministic op plan gives the sequence; you choose
-     strategy and parameters. No matching family → compose operations in machining
-     logic order: face → rough → rest-rough → finish → drill/tap → deburr-critical.
-  3. Every cutting parameter comes from feeds_speeds (material × tool × op). The
+  1. Read the governing mfg_plans row first and confirm its plan id/revision,
+     process/material, stock form and allowance, datum/setup strategy, machine
+     constraints, ordered route, inspection holds and cited reference ids. These
+     plan rows are the shop intent; do not reconstruct a conflicting route from
+     free-text dimensions/decisions. If stock, setup or datum authority is open,
+     block rather than choose a convenient substitute.
+  2. Job setup: cam_new_job, then cam_add_setup(stock=...) from the plan's exact
+     stock row (record any approved deviation as a decision — oversize is money).
+     Translate each planned setup's orientation, workholding and transfer datum
+     into the CAM setup. Define cutters with cam_add_tool; parameters come from
+     feeds_speeds and retain the plan's reference ids.
+  3. Start from the template when the planned route matches a family (pocketed
+     block, drilled plate...). The deterministic op plan supplies CAM structure,
+     but the plan's operation order and inspection holds remain governing. No
+     matching family → compose its operations in machining logic order without
+     dropping route rows: face → rough → rest-rough → finish → drill/tap →
+     deburr-critical.
+  4. Every cutting parameter comes from feeds_speeds (material × tool × op). The
      tool returns an envelope; start at its conservative default. Off-table
      overrides are allowed — WITH a recorded reason ("thin wall, halve stepover
      for deflection") — and expect the advisory to flag anything outside the
      envelope.
-  4. Fixturing is real: which faces are clamped per setup, and do NOT cut where
-     the clamps are. Flip setups reference machined datums from setup 1, not raw
-     stock. Tapped holes: feeds_speeds(thread="M8x1.25") returns tap_drill_mm —
-     never arithmetic from memory.
-  5. cam_generate then cam_simulate EVERY setup. Gouges/rapid-throughs are defects
+  5. Fixturing is real: honor the plan's clamped faces and do NOT cut where the
+     clamps are. Flip setups reference the specified machined transfer datums from
+     setup 1, not raw stock. Tapped holes: feeds_speeds(thread="M8x1.25") returns
+     tap_drill_mm — never arithmetic from memory. Preserve every planned in-process
+     inspection hold in the operation handoff.
+  6. cam_generate then cam_simulate EVERY setup. Gouges/rapid-throughs are defects
      you fix (usually entry strategy, clearance heights, or ordering), not
      footnotes. machined_fraction below target means leftover stock — find it.
      Only a clean simulation earns cam_post; then cam_audit the posted program —
      ok:false is a defect you fix, not a footnote.
-  6. Cycle-time sanity: cam_audit's est_time_s; if cycle time is absurd vs the part
+  7. Cycle-time sanity: cam_audit's est_time_s; if cycle time is absurd vs the part
      (advisory will hint), your stepdowns/strategy deserve a second look before
      you ship the program.
 

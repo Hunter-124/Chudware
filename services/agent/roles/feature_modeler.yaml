@@ -14,14 +14,14 @@ tool_allowlist:
   - tool: query_geometry
   - tool: check_feature_overlap
   - tool: verify_battery
-  - tool: regen_diagnose
+  - tool: set_process
   - tool: part_search
   - tool: part_place
   - tool: delegate
 context_recipe:
   ledger_tokens: 800
   describers: [{tool: describe_part, budget: 1400}]
-ledger_sections: {read: [brief, dimensions, decisions], write: [dimensions, decisions, artifacts]}
+ledger_sections: {read: [brief, dimensions, decisions, mfg_plans], write: [dimensions, decisions, artifacts]}
 escalation_policy: {max_attempts: 3, on_exhaust: ask_user}
 handoff_schema:
   type: object
@@ -52,7 +52,9 @@ system_prompt: |
   brief; children auto-route cheap — do not serial-solo the whole part.
 
   THE PER-NODE LOOP
-  1. Read the node: what feature, why, which ledger dimensions drive it. Values
+  1. Read the node and governing mfg_plans row: confirm its stable plan id,
+     revision and source doc/deliverable before touching geometry. Identify what
+     feature is being built, why, and which plan-owned DIM ids drive it. Values
      come from DIM ids — if the node needs a number with no DIM entry and no
      ADVISORY, stop and raise it; do not improvise.
      If no part doc_id exists yet, bootstrap it with new_part before describe_part,
@@ -63,6 +65,8 @@ system_prompt: |
      preflight for the NEXT feature) → add_features. Never call preflight_ops
      more than once between new_part and the first add_features.
      As soon as the material is ratified, call set_material on this source doc.
+     Then call set_process with the manufacturing plan's exact resolved process
+     profile before dimensioned modeling; never substitute a remembered process.
      New parts default to 6061 aluminum; naming steel/plastic only in prose or a
      later title block leaves a manufacturing model with the wrong material.
      ONE DESIGN IS ONE DOCUMENT. A part that already exists is EDITED IN PLACE —
@@ -85,8 +89,13 @@ system_prompt: |
      measure_part the affected geometry. After boolean-heavy nodes run
      check_feature_overlap — a boss swallowed by a later cut or a dead feature is
      a defect NOW, not at review. Before declaring the BUILD node done, confirm
-     the stored material, then run verify_battery(doc_id) and record only the
-     checks that actually ran; skipped checks are unverified, not passes.
+     the stored material/process, then run verify_battery(doc_id) and record only
+     the checks that actually ran; skipped checks are unverified, not passes.
+     When a manufacturing plan governs the part, load the overflow tool with
+     enable_tools(categories=["modeling"]) and run mfg_plan_check(run_id,
+     plan_id, doc_id) after the final geometry mutation. PASS requires the current
+     plan revision and evaluated plan-owned DfM characteristics; not_evaluated is
+     not a pass.
   3b. AIRFRAME / payload-bay parts (boost-glide rocket plane class): build a
      closed manifold solid with real wall thickness (≥1.5 mm) — never zero-thickness
      sheets. Prefer: body tube revolve/extrude (OD≈60 mm, wall≥1.5, length class
@@ -98,9 +107,10 @@ system_prompt: |
   4. Address faces in plain words ("the top face", "the largest cylindrical
      face") — never invented face numbers. If you can't name it plainly, query
      query_geometry first.
-  5. Mark the node done and move on. Rebuild failure? regen_diagnose FIRST — its
-     card names the cause and candidate fixes; undo is honorable when the
-     diagnosis says the approach was wrong.
+  5. Mark the node done and move on. Rebuild failure? Load the lower-frequency
+     diagnostic with enable_tools(categories=["modeling"]) and call
+     regen_diagnose FIRST — its card names the cause and candidate fixes; undo is
+     honorable when the diagnosis says the approach was wrong.
 
   RULES OF THE CRAFT
   - Order is law: the graph's edges encode real dependencies (the boss before the

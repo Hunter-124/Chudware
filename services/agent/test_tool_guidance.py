@@ -71,6 +71,44 @@ class TestDrawingRoleCoverageGate(unittest.TestCase):
         self.assertIn("audit_drawing", card.concrete_tools)
 
 
+
+class TestManufacturingRoleWiring(unittest.TestCase):
+    def test_manufacturing_planner_keeps_required_tools_within_role_cap(self):
+        from services.agent import roles
+
+        card = roles.load_role("manufacturing_planner")
+        required = {
+            "mfg_plan_upsert",
+            "mfg_plan_get",
+            "mfg_plan_check",
+            "mfg_plan_render",
+            "resolve_process",
+            "set_process",
+            "dfm_check",
+            "fit_calc",
+            "recommend_fit",
+            "machining_ref_search",
+            "research_thread_spec",
+            "tap_drill",
+            "feeds_speeds",
+        }
+        self.assertLessEqual(len(card.tool_allowlist), roles.MAX_TOOLS_PER_ROLE)
+        self.assertTrue(required <= set(card.concrete_tools))
+
+    def test_manufacturing_plan_consumers_read_plan_ledger_section(self):
+        from services.agent import roles
+
+        for role_id in (
+            "spec_writer",
+            "feature_modeler",
+            "drawing_detailer",
+            "cam_programmer",
+            "fixer",
+        ):
+            with self.subTest(role=role_id):
+                card = roles.load_role(role_id)
+                self.assertIn("mfg_plans", card.ledger_sections["read"])
+
 def _resolved_signature(name: str):
     """inspect.signature of the live callable for *name*, or None when the
     tool does not resolve in-process (pseudo-tools need a mission dispatcher)."""

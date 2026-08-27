@@ -46,6 +46,7 @@ from services.mcp.cad_tools import _dumps, _err
 from services import research
 import services.research.calcs as _calcs  # registers all T-W4 calculators
 from services.research import fits as _fits
+from services.research import machining_reference as _machining_ref
 from services.research.material_lookup import _PROP_ALIASES, _PROP_UNITS
 from services.research.calcs.registry import calc_envelope as _calc_envelope
 # Read-only introspection of the brain this module adapts; neither has a public
@@ -1496,6 +1497,130 @@ def register_research_tools(mcp: FastMCP) -> None:
                              f"recommendation (answer[].band) — no second fit_calc "
                              f"call needed")
             if notes:
+                out["interpreted"] = _interpreted_notes(notes)
+            return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def machining_ref_search(query: Optional[str] = None, topic: Optional[str] = None,
+                             material: Optional[str] = None, process: Optional[str] = None,
+                             limit: int = 10, **kwargs: _Extra) -> str:
+        """Search the bundled, standards-cited machining reference.
+
+        Filters may be supplied as `topic`/`category`, `material`/`alloy`, and
+        `process`/`operation`. Canonical facts are not duplicated: fits, basic threads,
+        materials, tap drills, and cutting data return `delegate_tool` pointers.
+        """
+        try:
+            kwargs.pop("kwargs", None)
+            args = _extras(kwargs)
+            notes: list[str] = []
+            qkey, qvalue = _pick(args, ("query", "q", "text", "search", "term"))
+            if query is None and qvalue is not None:
+                query = str(qvalue)
+                notes.append(f"interpreted {qkey!r} as 'query'")
+            for canonical, aliases, current in (
+                ("topic", ("topic", "category", "subject"), topic),
+                ("material", ("material", "alloy", "grade"), material),
+                ("process", ("process", "operation", "method"), process),
+            ):
+                key, value = _pick(args, aliases)
+                if current is None and value is not None:
+                    if canonical == "topic":
+                        topic = str(value)
+                    elif canonical == "material":
+                        material = str(value)
+                    else:
+                        process = str(value)
+                    notes.append(f"interpreted {key!r} as {canonical!r}")
+            lkey, lvalue = _pick(args, ("limit", "max_results", "max", "count"))
+            if lvalue is not None:
+                limit = lvalue
+                notes.append(f"interpreted {lkey!r} as 'limit'")
+            out = _machining_ref.machining_ref_search(
+                str(query or ""), topic=topic, material=material, process=process, limit=limit
+            )
+            if notes and isinstance(out, dict):
+                out["interpreted"] = _interpreted_notes(notes)
+            return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def machining_ref_get(record_id: Optional[str] = None, **kwargs: _Extra) -> str:
+        """Return one bundled machining-reference row by its stable record id."""
+        try:
+            kwargs.pop("kwargs", None)
+            args = _extras(kwargs)
+            key, value = _pick(args, ("record_id", "id", "record", "reference_id", "ref_id"))
+            notes: list[str] = []
+            if record_id is None and value is not None:
+                record_id = str(value)
+                notes.append(f"interpreted {key!r} as 'record_id'")
+            out = _machining_ref.machining_ref_get(str(record_id or ""))
+            if notes and isinstance(out, dict):
+                out["interpreted"] = _interpreted_notes(notes)
+            return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def machining_ref_index_pdf(path: Optional[str] = None,
+                                project_root: Optional[str] = None,
+                                **kwargs: _Extra) -> str:
+        """Index a user-owned PDF by page in the project's local `.plm/references` FTS5.
+
+        The SHA-256-keyed index never leaves the project and reports scanned/no-text pages
+        without pretending OCR occurred.
+        """
+        try:
+            kwargs.pop("kwargs", None)
+            args = _extras(kwargs)
+            notes: list[str] = []
+            pkey, pvalue = _pick(args, ("path", "file", "pdf", "source", "pdf_path"))
+            if path is None and pvalue is not None:
+                path = str(pvalue)
+                notes.append(f"interpreted {pkey!r} as 'path'")
+            rkey, rvalue = _pick(args, ("project_root", "project", "root", "workspace"))
+            if project_root is None and rvalue is not None:
+                project_root = str(rvalue)
+                notes.append(f"interpreted {rkey!r} as 'project_root'")
+            if path is None or not str(path).strip():
+                return _dumps({"ok": False, "reason": "bad_query",
+                               "hint": "Provide path to a user-owned PDF."})
+            out = _machining_ref.machining_ref_index_pdf(str(path), project_root=project_root)
+            if notes and isinstance(out, dict):
+                out["interpreted"] = _interpreted_notes(notes)
+            return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def machining_ref_search_pdf(query: Optional[str] = None,
+                                 source_id: Optional[str] = None,
+                                 limit: int = 8, **kwargs: _Extra) -> str:
+        """Search project-local user-PDF indexes and return bounded page-cited snippets."""
+        try:
+            kwargs.pop("kwargs", None)
+            args = _extras(kwargs)
+            notes: list[str] = []
+            qkey, qvalue = _pick(args, ("query", "q", "text", "search", "term"))
+            if query is None and qvalue is not None:
+                query = str(qvalue)
+                notes.append(f"interpreted {qkey!r} as 'query'")
+            skey, svalue = _pick(args, ("source_id", "source", "pdf_id", "reference_id"))
+            if source_id is None and svalue is not None:
+                source_id = str(svalue)
+                notes.append(f"interpreted {skey!r} as 'source_id'")
+            lkey, lvalue = _pick(args, ("limit", "max_results", "max", "count"))
+            if lvalue is not None:
+                limit = lvalue
+                notes.append(f"interpreted {lkey!r} as 'limit'")
+            out = _machining_ref.machining_ref_search_pdf(
+                str(query or ""), source_id=source_id, limit=limit
+            )
+            if notes and isinstance(out, dict):
                 out["interpreted"] = _interpreted_notes(notes)
             return _dumps(out)
         except Exception as e:  # noqa: BLE001

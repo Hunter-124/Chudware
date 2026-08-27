@@ -42,8 +42,7 @@ from typing import Any, Iterable
 LEDGER_SECTIONS: frozenset[str] = frozenset({
     "brief", "requirements", "decisions", "dimensions", "questions",
     "stage_log", "artifacts", "criterion_results",
-    # T-DP1 design-pipeline sections (contract design_pipeline.md §4/§9)
-    "features", "geometry_specs", "linkages", "build_nodes",
+    "features", "geometry_specs", "linkages", "build_nodes", "mfg_plans",
     # mega-2: intake manifest surface (also lives under artifacts)
     "manifest", "events",
 })
@@ -194,6 +193,12 @@ SECTION_ALIASES: dict[str, str] = {
     "nodes": "build_nodes",
     "steps": "build_nodes",
     "operations": "build_nodes",
+    # -- mfg_plans --------------------------------------------------------
+    "manufacturing_plan": "mfg_plans",
+    "manufacturing_plans": "mfg_plans",
+    "mfg_plan": "mfg_plans",
+    "process_plan": "mfg_plans",
+    "route_plan": "mfg_plans",
     # -- manifest ---------------------------------------------------------
     "deliverables_manifest": "manifest",
     "intake_manifest": "manifest",
@@ -211,7 +216,7 @@ SECTION_ALIASES: dict[str, str] = {
 LEDGER_NOTE_KINDS: frozenset[str] = frozenset({
     "brief", "decision", "dimension", "question", "requirement", "stage",
     "artifact", "note", "feature", "geometry_spec", "linkage", "build_node",
-    "criterion_result",
+    "mfg_plan", "criterion_result",
 })
 
 #: Model-facing spellings → canonical kind.  Values MUST be in
@@ -341,6 +346,11 @@ KIND_ALIASES: dict[str, str] = {
     "plan_node": "build_node",
     "operation": "build_node",
     "node": "build_node",
+    # -- manufacturing plan -----------------------------------------------
+    "manufacturing_plan": "mfg_plan",
+    "manufacturing_route": "mfg_plan",
+    "process_plan": "mfg_plan",
+    "route_plan": "mfg_plan",
 }
 
 # -------------------------------------------------------------- normalising

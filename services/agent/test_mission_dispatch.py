@@ -58,6 +58,58 @@ class TestLedgerTools:
         assert got["ok"] is True
         assert any(d.get("id") == "D1" for d in got["data"])
 
+    def test_memory_learn_off_keeps_ledger_but_skips_project_memory(
+            self, md, monkeypatch, tmp_path):
+        """The learning switch governs every implicit memory write, not only autolearn."""
+        remembered = []
+        monkeypatch.setattr("services.agent.config.memory_enabled", lambda: True)
+        monkeypatch.setattr("services.agent.config.memory_learn_enabled", lambda: False)
+        monkeypatch.setattr(
+            "services.agent.project_memory.resolve_project_root",
+            lambda _root: tmp_path,
+        )
+        monkeypatch.setattr(
+            "services.agent.project_memory.remember",
+            lambda *args, **kwargs: remembered.append((args, kwargs)),
+        )
+
+        out = md.ledger_note(kind="decision", payload={
+            "id": "D_NO_LEARN",
+            "stage": "verify",
+            "text": "do not retain this implicit note",
+            "rationale": "learning is disabled",
+        })
+
+        assert out["ok"] is True, "memory gating must never block the design ledger"
+        assert remembered == [], "memory_learn=false promised that no new fact is written"
+        assert any(
+            d.get("id") == "D_NO_LEARN"
+            for d in md.ledger_get(section="decisions")["data"]
+        ), "the source design ledger remains authoritative and must still receive the note"
+
+    def test_memory_learn_on_mirrors_durable_note(self, md, monkeypatch, tmp_path):
+        """Positive control: both memory gates on retains the existing mirror behavior."""
+        remembered = []
+        monkeypatch.setattr("services.agent.config.memory_enabled", lambda: True)
+        monkeypatch.setattr("services.agent.config.memory_learn_enabled", lambda: True)
+        monkeypatch.setattr(
+            "services.agent.project_memory.resolve_project_root",
+            lambda _root: tmp_path,
+        )
+        monkeypatch.setattr(
+            "services.agent.project_memory.remember",
+            lambda *args, **kwargs: remembered.append((args, kwargs)),
+        )
+
+        out = md.ledger_note(kind="note", payload={"text": "retain this note"})
+
+        assert out["ok"] is True
+        assert len(remembered) == 1
+        args, kwargs = remembered[0]
+        assert args == (tmp_path, "retain this note")
+        assert kwargs["kind"] == "note"
+        assert kwargs["source"] == "ledger:agent"
+
     def test_get_full_render_within_budget(self, md):
         md.ledger_note(kind="decision", payload={"id": "D1", "stage": "s",
                                                  "text": "t", "rationale": "r"})

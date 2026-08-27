@@ -4718,7 +4718,6 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     static int s_verbosity = 2;       // ui::aiUiVerbosity (0 quiet | 1 normal | 2 full)
     static bool s_follow = true;      // ui::aiFollowActiveSession
     static bool s_previews = true;    // ui::aiActiveWorkPreviews
-    static bool s_cacheWarm = false;  // agent.cache_warming
     if (!s_loaded) {
         s_loaded = true;
         s_memBackend = (loadAgentConfigString("memory_backend", "sqlite") == "mnemopi") ? 1 : 0;
@@ -4746,7 +4745,6 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         s_verbosity = ui::aiUiVerbosity();
         s_follow = ui::aiFollowActiveSession();
         s_previews = ui::aiActiveWorkPreviews();
-        s_cacheWarm = loadAgentConfigBool("cache_warming", false);
     }
 
 
@@ -4918,13 +4916,8 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
             ui::setAiActiveWorkPreviews(s_previews);
         helpMarker("Render iso preview thumbnails for agent-touched documents in the "
                    "Active Work view. Off = lightweight placeholder only.");
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Provider cache-warming", &s_cacheWarm))
-            saveAgentConfigValue("cache_warming", s_cacheWarm);
         ImGui::EndTable();
     }
-    dimText("Cache-warming keeps provider prompt caches warm between runs "
-            "(agent.cache_warming, default off).");
 }
 
 }  // anonymous namespace

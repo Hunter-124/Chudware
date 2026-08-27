@@ -547,9 +547,13 @@ class MissionDispatch:
             # Best-effort project memory: durable decisions/notes for later turns.
             if kind in ("decision", "note", "requirement", "dimension", "brief"):
                 try:
-                    from services.agent.config import memory_enabled, workspace_dir  # noqa: PLC0415
+                    from services.agent.config import (  # noqa: PLC0415
+                        memory_enabled,
+                        memory_learn_enabled,
+                        workspace_dir,
+                    )
                     from services.agent import project_memory as _pm  # noqa: PLC0415
-                    if memory_enabled():
+                    if memory_enabled() and memory_learn_enabled():
                         _root = getattr(self, "project_dir", None) or getattr(self, "workspace_dir", None)
                         _path = _pm.resolve_project_root(_root) or workspace_dir()
                         _text = (

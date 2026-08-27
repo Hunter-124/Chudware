@@ -1090,7 +1090,6 @@ def get_memory_token_budget(cfg: dict | None = None) -> int:
 # GUI Settings → AI → Memory & Learning writes these under ``agent`` (omp port):
 #   agent.memory_backend      "sqlite" | "mnemopi"   (default "sqlite")
 #   agent.compaction_backend  "builtin" | "omp"      (default "builtin")
-#   agent.cache_warming       bool                   (default False)
 #   agent.memory_learn        bool                   (default True)
 #   agent.autolearn_enabled / autolearn_auto_continue / autolearn_min_tool_calls
 #     — OMP Auto-Learn sidecar (Settings → AI → Harness → Memory & Learning)
@@ -1100,7 +1099,6 @@ def get_memory_token_budget(cfg: dict | None = None) -> int:
 
 MEMORY_BACKEND_KEY = "memory_backend"
 COMPACTION_BACKEND_KEY = "compaction_backend"
-CACHE_WARMING_KEY = "cache_warming"
 MEMORY_LEARN_KEY = "memory_learn"
 AUTOLEARN_ENABLED_KEY = "autolearn_enabled"
 AUTOLEARN_AUTO_CONTINUE_KEY = "autolearn_auto_continue"
@@ -1108,7 +1106,6 @@ AUTOLEARN_MIN_TOOL_CALLS_KEY = "autolearn_min_tool_calls"
 
 DEFAULT_MEMORY_BACKEND: str = "sqlite"
 DEFAULT_COMPACTION_BACKEND: str = "builtin"
-DEFAULT_CACHE_WARMING: bool = False
 DEFAULT_MEMORY_LEARN: bool = True
 DEFAULT_AUTOLEARN_ENABLED: bool = False
 DEFAULT_AUTOLEARN_AUTO_CONTINUE: bool = False
@@ -1188,16 +1185,6 @@ def compaction_snap_max_frames(cfg: dict | None = None) -> int:
         return max(1, int(v)) if v is not None else 80
     except (TypeError, ValueError):
         return 80
-
-
-def cache_warming_enabled(cfg: dict | None = None) -> bool:
-    """Return ``agent.cache_warming`` (bool, default False).
-
-    When on, provider prompt caches are kept warm between runs.
-    """
-    agent = _agent_block(cfg)
-    return bool(agent.get(CACHE_WARMING_KEY, DEFAULT_CACHE_WARMING))
-
 
 def memory_learn_enabled(cfg: dict | None = None) -> bool:
     """Return ``agent.memory_learn`` (bool, default True).

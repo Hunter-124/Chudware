@@ -2722,3 +2722,34 @@ Providers pixel-captured at 1340×838 through rebuilt `libchudware.so`.
 CAD retains geometry/document/daemon tools, product roles/prompts/policy, and the native C++
 fast path where measured latency warrants it. A concurrent OMP session owns the standalone
 platform UI, so CAD exposes and consumes stable contracts rather than duplicating that work.
+
+---
+
+## 2026-08-27 — First harness extraction: shake now lives once in private OMP
+
+**Duplicate removed.** `services/agent/compaction.py` carried a 319-line Python port of
+OMP's shake algorithm: recent-token protection, tool-call pairing, skill-read protection,
+fenced/XML scanning, min-savings gating, mutation ordering, and placeholder accounting.
+Private `pi-agent-core` already owned the canonical selector/mutator and tests. Keeping both
+guaranteed drift — the two had already diverged on aggressive-tail and artifact-read policy.
+
+**Platform contribution.** Private OMP commit `3a81ac1f7e` adds
+`shakeWireMessages`: a product-neutral JSON/OpenAI-style adapter inside `pi-agent-core`.
+It deep-copies input, preserves unknown fields/content blocks, pairs top-level OpenAI tool
+calls, calls the existing `collectShakeRegions` and `applyShakeRegions`, and returns
+JSON-safe original regions. Ten focused private-platform tests and package typecheck pass.
+No standalone OMP UI file was touched.
+
+**CAD cutover.** CAD now vendors `pi-agent-core` as its seventh private OMP package.
+The bridge's `shake` RPC performs runtime JSON validation and maps the platform result to
+CAD's snake-case wire shape. Python retains only two product adapters: RPC lifecycle and
+image-block stripping (OMP shake deliberately selects textual context regions only).
+
+**Honesty improvement.** The old port emitted `artifact://shake` even though no artifact
+store had written that ID. The universal contract now emits `[shaken ~N tokens]` and returns
+the original region to a caller that genuinely wants to persist it. A recovery link is never
+invented.
+
+**Proof.** Real bridge RPC aggressively shook a 9,750-token tool result to one placeholder,
+saved ~9,734 tokens, and emitted no fake artifact URL. Existing CAD compaction/session-command
+tests pass unchanged apart from reversing the obsolete fake-link assertion: 25/25.

@@ -39,13 +39,6 @@ MIDDLE_OMIT_MARKER = (
     "\n-------------- middle history omitted ({n} chars) --------------\n"
 )
 
-DEFAULT_PROTECT_TOKENS = 16_000
-DEFAULT_MIN_SAVINGS = 4_000
-FENCE_MIN_TOKENS = 400
-PLACEHOLDER_TOKEN_ESTIMATE = 16
-
-SKILL_URL_PREFIX = "skill://"
-PROTECTED_TOOL_NAMES = frozenset({"skill"})
 
 # Static reading guide (omp snapcompact-summary.md text-phase subset; no frames).
 STATIC_READING_GUIDE = """\
@@ -64,8 +57,6 @@ HISTORY
 ===================
 """
 
-_OPENING_XML = re.compile(r"^<([a-z_-]+)(?:\s+[^>]*)?>$")
-_CLOSING_XML = re.compile(r"^</([a-z_-]+)>$")
 _INTENT_FIELDS = frozenset({"intent", "i"})
 
 
@@ -998,92 +989,57 @@ def reinject_archive(archive: dict, *, provider: dict | None = None) -> list[dic
     return [{"role": "user", "content": content}]
 
 
-# --------------------------------------------------------------------------- shake
+# --------------------------------------------------------------------------- shake adapter
 
-def _is_protected_tool_result(msg: dict, tool_calls_by_id: dict[str, dict]) -> bool:
-    name = _tool_name(msg)
-    tid = _tool_call_id(msg)
-    tc = tool_calls_by_id.get(tid)
-    if tc and tc.get("name"):
-        name = tc["name"]
-    if name in PROTECTED_TOOL_NAMES:
-        return True
-    if name == "read" and tc:
-        path = _read_path_from_args(tc.get("arguments") or {})
-        if path and path.startswith(SKILL_URL_PREFIX):
-            return True
-    # Also protect skill:// in content for harness-only results without paired call
-    if name == "read":
-        blob = _text_from_content(msg.get("content"))
-        # no path — not protected
-        _ = blob
-    return False
+def _shake_images(messages: list[dict]) -> dict[str, Any]:
+    """CAD content-shape adapter for `/shake images`.
 
-
-def _scan_text_for_block_ranges(text: str) -> list[tuple[int, int]]:
-    """Fenced code + top-level lowercase XML spans; ranges are [start, end)."""
-    ranges: list[tuple[int, int]] = []
-    in_fence = False
-    fence_start = -1
-    tag_stack: list[str] = []
-    xml_start = -1
-    line_start = 0
-    n = len(text)
-    i = 0
-    while i <= n:
-        if i != n and text[i] != "\n":
-            i += 1
+    Image stripping is product-side because OMP's universal shake intentionally
+    selects textual context regions only. No token-selection or text-mutation
+    algorithm lives here.
+    """
+    msgs = copy.deepcopy(list(messages or []))
+    saved = 0
+    regions: list[dict] = []
+    for message_index, message in enumerate(msgs):
+        content = message.get("content")
+        if not isinstance(content, list):
             continue
-        line = text[line_start:i]
-        line_end = i  # excludes newline
-        trimmed = line.lstrip()
-        is_fence = trimmed.startswith("```") or trimmed.startswith("~~~")
-        if is_fence:
-            if not in_fence:
-                in_fence = True
-                fence_start = line_start
+        kept = []
+        dropped_tokens = 0
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in (
+                    "image", "image_url", "input_image"):
+                blob = str(
+                    block.get("path")
+                    or block.get("url")
+                    or block.get("data")
+                    or ""
+                )
+                dropped_tokens += max(count_tokens(blob), 85)
             else:
-                in_fence = False
-                ranges.append((fence_start, line_end))
-                fence_start = -1
-            line_start = i + 1
-            i += 1
-            continue
-        if not in_fence:
-            if line and len(line) == len(trimmed) and _OPENING_XML.match(trimmed):
-                m = _OPENING_XML.match(trimmed)
-                if m:
-                    if not tag_stack:
-                        xml_start = line_start
-                    tag_stack.append(m.group(1))
-            else:
-                cm = _CLOSING_XML.match(trimmed) if trimmed else None
-                if cm and tag_stack and tag_stack[-1] == cm.group(1):
-                    tag_stack.pop()
-                    if not tag_stack and xml_start >= 0:
-                        ranges.append((xml_start, line_end))
-                        xml_start = -1
-        line_start = i + 1
-        i += 1
-
-    # Merge overlaps (outermost wins)
-    if len(ranges) <= 1:
-        return ranges
-    ranges.sort(key=lambda r: r[0])
-    kept: list[tuple[int, int]] = []
-    last_end = -1
-    for start, end in ranges:
-        if start < last_end:
-            continue
-        kept.append((start, end))
-        last_end = end
-    return kept
-
-
-def _placeholder(tokens: int, artifact_id: str | None, region_index: int) -> str:
-    if artifact_id:
-        return f"[shaken ~{tokens} tokens — recover: artifact://{artifact_id} (region {region_index})]"
-    return f"[shaken ~{tokens} tokens]"
+                kept.append(block)
+        if dropped_tokens:
+            message["content"] = kept
+            saved += dropped_tokens
+            regions.append({
+                "kind": "images",
+                "message_index": message_index,
+                "tokens": dropped_tokens,
+                "original_text": "",
+                "label": "images",
+            })
+    placeholders = len(regions)
+    return {
+        "messages": msgs,
+        "saved_tokens": saved,
+        "regions": regions,
+        "placeholders": placeholders,
+        "notice": (
+            f"shook {placeholders} image region(s), ~{saved} tokens"
+            if placeholders else "no images to drop"
+        ),
+    }
 
 
 def shake_messages(
@@ -1092,230 +1048,36 @@ def shake_messages(
     mode: str = "elide",
     aggressive: bool = False,
     keep_boundary_index: int | None = None,
-    artifact_id: str | None = None,
 ) -> dict[str, Any]:
-    """Mechanical in-place elision of heavy tool results / large fences / XML.
+    """Shake a deep-copied transcript through private OMP's canonical algorithm.
 
-    *mode*:
-      - ``"elide"`` (default): tool results + large fenced code / lowercase XML.
-      - ``"images"``: drop image content blocks only.
-
-    *aggressive* (manual /shake): protectTokens=0, minSavings=0.
-    Default auto: protectTokens=16000, minSavings=4000.
-
-    Never splits messages; never touches toolCall argument blocks.
-    Useless non-error tool results are eligible even inside the protect window.
+    CAD owns only JSON/OpenAI message conversion and the image-only product mode.
+    Region selection, protection, token thresholds, mutation ordering, and
+    placeholders are owned and tested once by ``pi-agent-core``.
     """
-    msgs = copy.deepcopy(list(messages or []))
-    if not msgs:
-        return {
-            "messages": msgs,
-            "saved_tokens": 0,
-            "regions": [],
-            "placeholders": 0,
-            "notice": "nothing to shake",
-        }
-
     if mode == "images":
-        saved = 0
-        placeholders = 0
-        regions: list[dict] = []
-        for mi, msg in enumerate(msgs):
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            new_parts = []
-            dropped_here = 0
-            for block in content:
-                if isinstance(block, dict) and block.get("type") in (
-                    "image",
-                    "image_url",
-                    "input_image",
-                ):
-                    # estimate ~tokens for image as path/data length or fixed
-                    blob = str(
-                        block.get("path")
-                        or block.get("url")
-                        or block.get("data")
-                        or ""
-                    )
-                    tok = max(count_tokens(blob), 85)
-                    saved += tok
-                    dropped_here += tok
-                    continue
-                new_parts.append(block)
-            if dropped_here:
-                msg["content"] = new_parts
-                regions.append({
-                    "kind": "images",
-                    "message_index": mi,
-                    "tokens": dropped_here,
-                    "original_text": "",
-                    "label": "images",
-                })
-                placeholders += 1
-        return {
-            "messages": msgs,
-            "saved_tokens": saved,
-            "regions": regions,
-            "placeholders": placeholders,
-            "notice": (
-                f"shook {placeholders} image region(s), ~{saved} tokens"
-                if placeholders
-                else "no images to drop"
-            ),
-        }
+        return _shake_images(messages)
+    from services.agent import omp_bridge  # noqa: PLC0415
 
-    protect_tokens = 0 if aggressive else DEFAULT_PROTECT_TOKENS
-    min_savings = 0 if aggressive else DEFAULT_MIN_SAVINGS
-    boundary = 0 if keep_boundary_index is None else max(0, int(keep_boundary_index))
-
-    n = len(msgs)
-    # tokens strictly after index i
-    accumulated_after = [0] * n
-    acc = 0
-    for i in range(n - 1, -1, -1):
-        accumulated_after[i] = acc
-        acc += estimate_message_tokens(msgs[i])
-
-    tool_calls_by_id = _collect_tool_calls_by_id(msgs)
-    regions = []
-
-    for i in range(n):
-        if i < boundary:
-            continue
-        msg = msgs[i]
-        useless_result = _is_tool_result(msg) and _is_useless_result(msg)
-        if not useless_result and accumulated_after[i] < protect_tokens:
-            continue
-
-        if _is_tool_result(msg):
-            if _is_pruned(msg):
-                continue
-            if _is_protected_tool_result(msg, tool_calls_by_id):
-                continue
-            text = _text_from_content(msg.get("content"))
-            if not text:
-                continue
-            tokens = estimate_message_tokens(msg)
-            regions.append({
-                "kind": "toolResult",
-                "message_index": i,
-                "tokens": tokens,
-                "original_text": text,
-                "label": _tool_name(msg) or "tool",
-            })
-            continue
-
-        # Text blocks in user/assistant/developer/system — never toolCall parts
-        content = msg.get("content")
-        if isinstance(content, str):
-            for start, end in _scan_text_for_block_ranges(content):
-                slice_ = content[start:end]
-                tokens = count_tokens(slice_)
-                if tokens < FENCE_MIN_TOKENS:
-                    continue
-                regions.append({
-                    "kind": "block",
-                    "message_index": i,
-                    "block_index": -1,
-                    "start": start,
-                    "end": end,
-                    "tokens": tokens,
-                    "original_text": slice_,
-                    "label": _role(msg) or "message",
-                })
-        elif isinstance(content, list):
-            for bi, block in enumerate(content):
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") != "text":
-                    continue  # never touch toolCall / thinking for fences? omp does assistant text only
-                text = str(block.get("text") or "")
-                for start, end in _scan_text_for_block_ranges(text):
-                    slice_ = text[start:end]
-                    tokens = count_tokens(slice_)
-                    if tokens < FENCE_MIN_TOKENS:
-                        continue
-                    regions.append({
-                        "kind": "block",
-                        "message_index": i,
-                        "block_index": bi,
-                        "start": start,
-                        "end": end,
-                        "tokens": tokens,
-                        "original_text": slice_,
-                        "label": _role(msg) or "message",
-                    })
-
-    savings = sum(max(0, r["tokens"] - PLACEHOLDER_TOKEN_ESTIMATE) for r in regions)
-    if savings < min_savings:
-        return {
-            "messages": msgs,
-            "saved_tokens": 0,
-            "regions": [],
-            "placeholders": 0,
-            "notice": f"minSavings not met ({savings} < {min_savings})",
-        }
-
-    art = artifact_id or "shake"
-    # Apply block regions high-start-first per message; tool results independent.
-    # Group by (message_index, block_index) for block splices.
-    tool_regions = [r for r in regions if r["kind"] == "toolResult"]
-    block_regions = [r for r in regions if r["kind"] == "block"]
-    block_regions.sort(key=lambda r: (r["message_index"], r.get("block_index", -1), -r["start"]))
-
-    placeholders = 0
-    saved_tokens = 0
-    region_counter = 0
-
-    for r in tool_regions:
-        region_counter += 1
-        ph = _placeholder(r["tokens"], art, region_counter)
-        mi = r["message_index"]
-        m = msgs[mi]
-        m["content"] = ph
-        m["pruned_at"] = True
-        placeholders += 1
-        saved_tokens += max(0, r["tokens"] - PLACEHOLDER_TOKEN_ESTIMATE)
-        r["region_index"] = region_counter
-        r["placeholder"] = ph
-
-    for r in block_regions:
-        region_counter += 1
-        ph = _placeholder(r["tokens"], art, region_counter)
-        mi = r["message_index"]
-        bi = r.get("block_index", -1)
-        m = msgs[mi]
-        if bi == -1 and isinstance(m.get("content"), str):
-            text = m["content"]
-            m["content"] = text[: r["start"]] + ph + text[r["end"] :]
-        elif isinstance(m.get("content"), list) and 0 <= bi < len(m["content"]):
-            block = m["content"][bi]
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = str(block.get("text") or "")
-                block["text"] = text[: r["start"]] + ph + text[r["end"] :]
-        placeholders += 1
-        saved_tokens += max(0, r["tokens"] - PLACEHOLDER_TOKEN_ESTIMATE)
-        r["region_index"] = region_counter
-        r["placeholder"] = ph
-
-    # Document-order regions for artifact writers
-    ordered = sorted(
-        regions,
-        key=lambda r: (
-            r["message_index"],
-            0 if r["kind"] == "toolResult" else 1,
-            r.get("start", 0),
-        ),
-    )
-
+    params: dict[str, Any] = {
+        "messages": copy.deepcopy(list(messages or [])),
+        "aggressive": bool(aggressive),
+    }
+    if keep_boundary_index is not None:
+        params["keepBoundaryIndex"] = int(keep_boundary_index)
+    response = omp_bridge.call("shake", params)
+    if not isinstance(response, dict):
+        raise omp_bridge.BridgeUnavailable("OMP shake returned a non-object result")
+    shaken = response.get("messages")
+    regions = response.get("regions")
+    if not isinstance(shaken, list) or not isinstance(regions, list):
+        raise omp_bridge.BridgeUnavailable("OMP shake result is missing messages/regions")
     return {
-        "messages": msgs,
-        "saved_tokens": saved_tokens,
-        "regions": ordered,
-        "placeholders": placeholders,
-        "notice": f"shook {placeholders} region(s), ~{saved_tokens} tokens",
+        "messages": shaken,
+        "saved_tokens": int(response.get("saved_tokens") or 0),
+        "regions": regions,
+        "placeholders": int(response.get("placeholders") or 0),
+        "notice": str(response.get("notice") or ""),
     }
 
 

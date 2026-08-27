@@ -47,6 +47,8 @@ from pathlib import Path
 # Packages we recycle from OMP, plus their transitive workspace deps. Keep this list tight
 # (YAGNI): it is the whole point of the vendoring — only pull the parts we actually reuse.
 #   pi-ai        -> pi-catalog, pi-utils, pi-wire         (providers + streaming)
+#   pi-agent-core -> pi-ai, pi-catalog, pi-utils, pi-wire, snapcompact
+#                   (universal agent loop/context/compaction algorithms)
 #   pi-catalog   -> pi-utils                              (model metadata)
 #   pi-utils     -> pi-natives (npm)                      (shared utils)
 #   pi-wire                                               (leaf)
@@ -60,6 +62,7 @@ from pathlib import Path
 # no Rust toolchain, clean cross-platform parity (the catalog pins the version in package.json).
 DEFAULT_PACKAGES = [
     "ai",
+    "agent",
     "catalog",
     "utils",
     "wire",

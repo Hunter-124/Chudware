@@ -30,13 +30,14 @@
  * auth_oauth_manual{handle,code} | auth_oauth_cancel{handle} | memory_remember{root,content,
  * kind?,source?,importance?} | memory_recall{root,query,limit?,tokenBudget?,kind?} |
  * memory_stats{root} | compact{messages,keepRecentTokens?,priorArchive?,mode?} |
+ * shake{messages,aggressive?,keepBoundaryIndex?} |
  * snap_render{text,priorText?,modelId?,api?,maxFrames?,includeThinking?} |
  * stt_status | stt_start{model?,language?} | stt_stop | stt_cancel. Auth/model/
  * cost methods are implemented in the sibling json.ts/models.ts/auth-context.ts/oauth-flow.ts
- * modules; memory_* and compact live in memory.ts/compact.ts; snap_render lives in
- * snap-render.ts; stt_* reuses OMP's pi-natives
- * AudioCapture + Whisper ASR approach under ./stt/. All are wired in through dispatch()
- * below; see those files for the OMP surface each one reuses.
+ * modules; memory_* and compact live in memory.ts/compact.ts; shake is a thin JSON adapter
+ * over private pi-agent-core's canonical compaction algorithm; snap_render lives in
+ * snap-render.ts; stt_* reuses OMP's pi-natives AudioCapture + Whisper ASR approach under
+ * ./stt/. All are wired in through dispatch() below.
  *
  * NOTE: `stream().result()` resolves (does not throw) on provider HTTP errors — the error is
  * embedded in the returned AssistantMessage (stopReason:"error", errorStatus, errorMessage).
@@ -66,6 +67,7 @@ import { asObject, str, type Json } from "./json";
 import { handleMemoryRecall, handleMemoryRemember, handleMemoryStats } from "./memory";
 import { handleCostSummary, handleModelsList, invalidateLiveModelCache, modelInfo, resolveModel, type ProviderId } from "./models";
 import { handleAuthBeginOAuth, handleAuthOAuthCancel, handleAuthOAuthManual, handleAuthOAuthPoll } from "./oauth-flow";
+import { handleShake } from "./shake";
 import { handleSttCancel, handleSttStart, handleSttStatus, handleSttStop } from "./stt";
 
 function log(...args: unknown[]): void {
@@ -376,6 +378,8 @@ async function dispatch(method: string, params: Json, notify: Notify): Promise<J
 			return handleMemoryStats(params);
 		case "compact":
 			return handleCompact(params);
+		case "shake":
+			return handleShake(params);
 		case "snap_render":
 			return handleSnapRender(params);
 		case "stt_status":

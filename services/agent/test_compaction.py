@@ -190,7 +190,9 @@ def test_shake_eligibility_and_placeholder() -> None:
     assert auto["saved_tokens"] >= 4_000
     assert any("shaken" in str(m.get("content")) for m in auto["messages"])
     assert auto["regions"]
-    assert "artifact://" in auto["regions"][0].get("placeholder", "")
+    region = auto["regions"][0]
+    assert "artifact://" not in region.get("placeholder", "")
+    assert region["original_text"] == "M" * 20_000
 
     # skill:// read protected even aggressive
     skill_chat = [

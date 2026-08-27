@@ -10,11 +10,15 @@ Detail + research live in `docs/omp-integration/` (`00-OPTIONS-AND-DECISIONS.md`
 - **Private-backbone pin** `vendor/omp/OMP_VENDOR.lock` — clean commit from
   `https://github.com/Hunter-124/omp.git`, deterministic and zero local patches.
 - **Vendoring** `scripts/vendor_omp.py` + `vendor/omp/` — private OMP is the default source;
-  prebuilt `pi-natives` comes from npm at the matching platform version.
+  seven runtime packages include `pi-agent-core`; prebuilt `pi-natives` comes from npm at the
+  matching platform version.
 - **Bridge** `vendor/omp/bridge` — bun sidecar: `complete`, provider/model catalog,
-  `cost_summary`, `auth_*`, `memory_*`, `compact` (sha256 frames + recoverable text fallback),
-  and `warm_cache`/`cache_policy`. Verified via bun stdio against private OMP: 4,500 models
-  and 78 providers, with pricing and disabled-credential metadata complete.
+  `cost_summary`, `auth_*`, `memory_*`, `compact`, `shake`, and cache policy. Verified via
+  bun stdio against private OMP: 4,500 models and 78 providers, with pricing and
+  disabled-credential metadata complete.
+- **First harness extraction** — private `pi-agent-core` owns shake selection/mutation and a
+  product-neutral JSON adapter; CAD keeps only JSON-RPC and image-block conversion. The
+  duplicated Python fenced/XML/tool-result algorithm and fake `artifact://shake` link are gone.
 - **C++ core** `core/agent/omp_bridge_client.{h,cpp}` + `providers.cpp` (52 OMP ids routed) +
   `config.cpp` + 12 `libchudware` C-ABI methods + `CompleteResult.usage`. `chudware_agent`/`chudware` build clean.
 - **Provider UI** `settings_modal.cpp` (Settings→Providers: key+OAuth sign-in) + `copilot/settings.cpp`

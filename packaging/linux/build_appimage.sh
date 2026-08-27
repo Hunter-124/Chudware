@@ -463,6 +463,35 @@ if [ "$WITH_LIBCHUDWARE" = "1" ]; then
             for e in "${EXCL[@]}"; do case "$base" in "$e"*) return 0 ;; esac; done
             return 1
         }
+        # HOST-PROVIDED BY US, on top of the upstream excludelist.
+        #
+        # `ldd` reports only link-time deps. A library that finds its real implementation by
+        # dlopen()ing a plugin at runtime therefore gets bundled WITHOUT the plugins it needs,
+        # which is strictly worse than not bundling it: the host copy would have worked.
+        #
+        # libflexiblas is exactly that, and shipping it naked was a hard crash. FlexiBLAS is a
+        # BLAS *dispatcher*: at init it reads the host's /etc/flexiblasrc (e.g.
+        # "default = openblas-openmp") and dlopens the matching backend from the host's plugin
+        # directory. None of those backends are link-time deps, so none were bundled, and the
+        # bundled dispatcher could not even load its fallback:
+        #
+        #   flexiblas  Failed to load the BLAS fallback library.  Abort!
+        #
+        # abort() inside a dlopen() has no recoverable failure path, so it killed the whole
+        # process. chudware-hostd dlopens libchudware.so from its loader thread AFTER binding
+        # the IPC socket, so the daemon accepted a connection, the GUI announced "Engine daemon
+        # reconnected", and then the process died — restarting every ~15s indefinitely, with
+        # every RPC failing "Connection refused" (observed 2026-08-27: 27 crashes in 7 minutes,
+        # 27 coredumps, all SIGABRT in flexiblas_init under core::CppCore::ensureLoaded).
+        #
+        # Leaving it host-provided is correct, not a workaround: locating the host's BLAS is
+        # the dispatcher's entire job, and any distro whose packages link it ships it.
+        LOCAL_EXCL=(libflexiblas)
+        is_locally_excluded() {
+            local base="$1" e
+            for e in "${LOCAL_EXCL[@]}"; do case "$base" in "$e"*) return 0 ;; esac; done
+            return 1
+        }
         SEEDS=("$LIBCHUDWARE")
         for s in "$APPDIR/usr/lib/libnglib.so" "$APPDIR/usr/lib/libngcore.so" \
                  "$APPDIR/usr/lib/lib3mf.so" "$APPDIR/usr/bin/chudware-hostd"; do
@@ -473,6 +502,7 @@ if [ "$WITH_LIBCHUDWARE" = "1" ]; then
             [ -f "$dep" ] || continue
             base="$(basename "$dep")"
             is_excluded "$base" && continue
+            is_locally_excluded "$base" && continue
             [ -e "$APPDIR/usr/lib/$base" ] && continue
             cp -L "$dep" "$APPDIR/usr/lib/$base"
         done < <(ldd "${SEEDS[@]}" 2>/dev/null | awk '/=> \//{print $3}' | sort -u)
@@ -480,6 +510,39 @@ if [ "$WITH_LIBCHUDWARE" = "1" ]; then
         nlib=$(find "$APPDIR/usr/lib" -maxdepth 1 -name '*.so*' | wc -l)
         echo "==> usr/lib now has $nlib shared objects ($ntk OCCT libTK*)"
         [ "$ntk" -ge 30 ] || echo "WARNING: only $ntk OCCT libs bundled (expected ~34) — engine may not load on a clean machine" >&2
+
+        # GATE: the bundled engine must actually LOAD from the staged tree.
+        #
+        # Everything above only proves files were copied. It cannot catch a bundled library
+        # that aborts in its own initializer, which is precisely how the flexiblas crash
+        # shipped: the AppImage built clean, passed its lib counts, and then killed hostd on
+        # every start. This reproduces exactly what chudware-hostd does — dlopen the engine
+        # with usr/lib on the search path, the same thing AppRun sets up — so any dep that
+        # aborts, is missing, or is unresolvable fails the BUILD instead of the user's machine.
+        if command -v python3 >/dev/null 2>&1; then
+            echo "==> verifying the bundled engine dlopens from the staged AppDir"
+            if LD_LIBRARY_PATH="$APPDIR/usr/lib" python3 -c "
+import ctypes, sys
+try:
+    ctypes.CDLL('$APPDIR/usr/lib/libchudware.so')
+except BaseException as e:
+    print('dlopen failed: %s' % e, file=sys.stderr)
+    sys.exit(1)
+" 2>&1; then
+                echo "==> engine dlopen OK"
+            else
+                echo "error: the bundled libchudware.so does not load from the staged AppDir." >&2
+                echo "       A dependency is missing, unresolvable, or aborts during init." >&2
+                echo "       This is a SHIP BLOCKER: hostd dlopens this on every start, and an" >&2
+                echo "       abort inside dlopen kills the daemon with no recovery path." >&2
+                echo "       If a bundled dispatcher-style library resolves its real backend by" >&2
+                echo "       dlopen (BLAS, GL, codecs), add it to LOCAL_EXCL and leave it" >&2
+                echo "       host-provided rather than shipping it without its plugins." >&2
+                exit 1
+            fi
+        else
+            echo "WARNING: python3 unavailable — skipping the engine dlopen gate" >&2
+        fi
 fi
 
 # Protected Python and TypeScript are compiled into adjacent production sidecars. Packaged

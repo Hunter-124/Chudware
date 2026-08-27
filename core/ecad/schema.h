@@ -24,6 +24,7 @@ inline constexpr int kCopperLayersMax = 32;
 const std::set<std::string>& sym_mirror();
 const std::set<std::string>& label_scopes();
 const std::set<std::string>& sheet_pin_shapes();
+const std::set<std::string>& graphic_kinds();
 const std::set<std::string>& pin_types();
 const std::set<std::string>& tech_layers();
 const std::set<std::string>& pad_shapes();

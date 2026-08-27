@@ -679,6 +679,26 @@ static const RibbonCmd kCmds[] = {
     { "reveng_export",       "Export",         "save",            "Reverse Eng", "Deliver",     true,  nullptr, false, CommandCapability::Export },
     { "reveng_to_parts",     "Add to Parts",   "insert_component","Reverse Eng", "Deliver",     false, nullptr, false },
     { "reveng_print_mat",    "Print Scale Mat","file_doc",        "Reverse Eng", "Deliver",     false, nullptr, false },
+
+    // ECAD schematic editor expansion. Appended (rather than reordering the established rows)
+    // because RibbonCmd is an append-only command contract.
+    { "sch_add_bus",          "Bus",             "sch_wire",       "Schematic", "Schematic", false, nullptr,     false },
+    { "sch_add_no_connect",   "No Connect",      "ok_check",       "Schematic", "Schematic", false, nullptr,     false },
+    { "sch_add_junction",     "Junction",        "sch_label",      "Schematic", "Schematic", false, nullptr,     false },
+    { "sch_add_text",         "Text",            "file_doc",       "Schematic", "Schematic", false, nullptr,     false },
+
+    { "sch_sheet",            "Sheet",           "sch_new",        "Schematic", "Sheet",     true,  nullptr,     false },
+    { "sch_new_sheet",        "New Sheet",       "sch_new",        "Schematic", "Sheet",     false, "sch_sheet", false },
+    { "sch_sheet_properties", "Properties",      "settings",       "Schematic", "Sheet",     false, "sch_sheet", false },
+
+    { "sch_import_kicad",     "Import KiCad",    "open",           "Schematic", "Outputs",   false, nullptr,     false },
+    { "sch_export_netlist",   "Netlist",         "file_doc",       "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
+    { "sch_export_bom",       "BOM",             "bom",            "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
+    { "sch_export_spice",     "SPICE",           "sch_simulate",   "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
+    { "sch_export_kicad",     "Export KiCad",    "save",           "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
+    { "sch_export_svg",       "SVG",             "file_image",     "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
+    { "sch_export_pdf",       "PDF",             "file_doc",       "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
+    { "sch_plot",             "Plot / Print",    "file_doc",       "Schematic", "Outputs",   true,  nullptr,     false, CommandCapability::Export },
 };
 // clang-format on
 

@@ -1,16 +1,16 @@
-// Electrical Rules Check (ERC) — C++ port of engine/ecad/erc.py.
+// Electrical Rules Check (ERC).
 //
 // run_erc(sch, netlist) returns a deterministic, sorted list of violation dicts.
-// Pure + advisory: never raises on a bad design, never mutates inputs. Violation
-// shape: {rule, severity, net|null, pins:[pinref], xy:[x,y]|null, message}.
-// Ordering mirrors the oracle (final sort by rule, net, pins, xy). OCCT-free.
+// Pure + advisory: malformed designs are reported rather than thrown and inputs are
+// never mutated. Shape: {rule, severity, net|null, pins:[pinref], xy:[x,y]|null,
+// message}.
 #pragma once
 
 #include <nlohmann/json.hpp>
 
 namespace chudware::ecad {
 
-// run_erc(sch, netlist) -> array of violation dicts (deterministic order).
+// run_erc(sch, netlist) -> array of advisory violation dicts (deterministic order).
 nlohmann::json run_erc(const nlohmann::json& sch, const nlohmann::json& netlist);
 
 }  // namespace chudware::ecad

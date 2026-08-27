@@ -423,15 +423,16 @@ bool routeSimToCpp(const std::string &method, const json & /*params*/) {
 // IS the commit-at-mint marker, an all-or-nothing-per-document cutover (the
 // ECAD analogue of "doc-cpp").
 //
-// Coverage gaps (updated 2026-07-22, T-RF17): the C++ core handles the stateful
-// doc-id ecad methods in libchudware.cpp AND the doc-id forms of ecad_autoroute /
-// ecad_to_3d / ecad_route_diff_pair (libchudware.cpp:3557-3616), plus
-// ecad_fill_zones, ecad_simulate, and KiCad import (ecad_open dispatches
-// .kicad_sch/.kicad_pcb to core/ecad/kicad.cpp). The only remaining Python
-// method is ecad_design (an LLM state machine — deferred to the agent seam; its
-// deterministic recipe fallback is already C++). A call bound to an ecadcpp doc
-// that hits ecad_design fails loud (no Python doc to fall back to) — exactly
-// the doc-cpp seam's behavior.
+// Coverage (updated 2026-08-26): the C++ core handles the stateful doc-id ecad
+// methods in libchudware.cpp AND the doc-id forms of ecad_autoroute /
+// ecad_to_3d / ecad_route_diff_pair, plus ecad_fill_zones, ecad_simulate, and
+// KiCad import (ecad_open dispatches .kicad_sch/.kicad_pcb to core/ecad/kicad.cpp).
+// There is no Python ECAD worker left to fall back to, so every method must be
+// claimed here. Methods that carry NO doc_id are listed in kDocless below:
+// ecad_design used to be excluded as "an LLM state machine deferred to the agent
+// seam" — nothing served it, so the GUI's AI Design button hit `unknown method`
+// on every click. It is now a native recipe compiler (core/ecad/session.cpp
+// ecad_design) that mints a real schematic, so it routes like ecad_new.
 bool cppEcadFlag() {
   // R5a (T-RF21): the CHUDWARE_CPP_ECAD escape hatch is removed — the C++ core is
   // the only ECAD backend on every platform (the Python ECAD worker is deleted
@@ -457,14 +458,22 @@ bool routeEcadToCpp(const std::string &method, const json &params) {
         return true;
     }
   }
-  // ecad_new / ecad_open MINT a fresh ECAD doc -> route to C++ when the flag is
-  // on and the core DLL is loadable. The core mints an "ecadcpp" doc; if it
-  // declines (structured "unsupported") or the DLL is unavailable, the host
-  // falls back to the Python worker so document creation never hard-breaks.
+  // Methods that MINT a document (ecad_new / ecad_open / ecad_design) or carry no
+  // document at all (library, schema and recipe queries) have no ecadcpp doc_id to
+  // bind on, so they are claimed by name. Leaving one out does not degrade to
+  // Python — there is no Python ECAD worker — it surfaces as `unknown method`.
   if (!cppEcadFlag())
     return false;
-  if (method != "ecad_new" && method != "ecad_open")
-    return false; // minting only
+  static const char *kDocless[] = {
+      "ecad_new",       "ecad_open",           "ecad_design",
+      "ecad_symbols",   "ecad_load_symbol_library", "ecad_schema",
+      "ecad_list_ops",  "ecad_recipe",         "ecad_recipes_all",
+      "ecad_closest_recipe", "ecad_impedance"};
+  bool claimed = false;
+  for (const char *m : kDocless)
+    if (method == m) { claimed = true; break; }
+  if (!claimed)
+    return false;
   if (!engine::available()) {
     std::string lerr;
     if (!engine::ensureLoaded(lerr))

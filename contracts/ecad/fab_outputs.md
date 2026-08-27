@@ -65,3 +65,31 @@ the produced part doc opens via the CAD `import` feature and yields a non-empty 
 - `kicad`: write `.kicad_pcb` (board) and a flat netlist — best-effort, lossy-documented.
 - `spice`: write the simulation deck (from the netlist + sim params) — round-trips with `parse_spice`.
 - `netlist`: a generic KiCad-style `(export (components ...) (nets ...))` s-expr for external tools.
+
+## 7. Schematic outputs — `core/ecad/schexport.{h,cpp}` + `core/ecad/schplot.{h,cpp}`  (v1.1)
+
+§1–§6 are all **board** outputs. A schematic could export nothing at all: `ecad_export` rejected
+every kind that was not `gerber|drill|bom|cpl` and each of those required a pcb document. These are
+the schematic's deliverables, reachable through the same `ecad_export {doc_id, kind, path?, opts?}`.
+
+| kind | writer | output |
+|---|---|---|
+| `netlist` | `fab::write_sch_netlist(sch, netlist)` | KiCad-style `(export (components …) (nets …))` s-expr for external tools. Nets sorted by name, nodes by natural ref order, `code` a 1-based index. DNP parts included — a netlist is electrical, not assembly |
+| `bom` | `fab::write_sch_bom(netlist, fmt, exclude_dnp)` | CSV (RFC4180) or JSON. Grouped by (value, footprint, sorted user fields); `Refs,Qty,Value,Footprint,Datasheet,MPN,<user fields>`. `in_bom == false` is ALWAYS dropped; `dnp` is dropped when `exclude_dnp` |
+| `spice` | `fab::write_spice_deck(sch, netlist)` | ngspice deck; nodes ordered by the sim mapping's `pin_order`, `GND`/`0`/`GNDA`/`VSS` forced to node 0, unmapped parts skipped with a named comment. Round-trips through `parse_spice` |
+| `kicad` | `kicad::export_kicad_sch(sch)` | `.kicad_sch` S-expression (KiCad 7). +y-up document coords are negated into KiCad sheet space. Best-effort and documented-lossy in the same way the importer is |
+| `svg` | `plot::schematic_svg_pages(sch, opts)` | One true-size SVG per sheet (`width`/`height` in mm with a matching `viewBox`), keyed by sheet id |
+| `pdf` | `plot::schematic_pdf(sch, opts)` | One self-contained multi-page vector PDF, one page per sheet, Helvetica text, no raster and no external tool |
+
+`opts` for `svg`/`pdf`: `{sheet?, frame?, title_block?, pin_numbers?, pin_names?, paper?, margin_mm?}`.
+Both plot formats render through **one shared `Painter` abstraction** so the SVG and the PDF cannot
+drift, and both draw the same entity set the canvas does: sheet frame + zone ruler, title block,
+graphics, buses and bus entries, wires, junctions, no-connects, symbol bodies with pin
+decorations/numbers/names, reference and value, power-port glyphs, scope-specific label outlines,
+sheet symbols with their pins, and free text.
+
+**`path` semantics (all kinds).** A directory-looking `path` receives one conventionally-named file
+per logical key (`<stem>.GTL`, `<stem>-PTH.drl`, `<stem>-bom.csv`, `<stem>.net`, `<stem>.cir`,
+`<stem>.kicad_sch`, `<stem>-<sheet>.svg`, `<stem>.pdf`); a file-looking `path` receives a single
+output directly. The response's `paths` lists exactly what was written and is **empty when `path`
+was omitted** — callers report from `paths`, never from the absence of an error.

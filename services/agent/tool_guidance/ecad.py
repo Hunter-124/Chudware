@@ -4,13 +4,130 @@ from __future__ import annotations
 from typing import Any
 
 ENTRIES: dict[str, dict[str, Any]] = {
+    "ecad_annotate": {
+        "prompt_note": (
+            "Use after placement or before BOM/export. Exact dialect: "
+            "ecad_annotate(scope='all'|'sheet', mode='keep'|'reset', "
+            "sheet='<sheet-id>'|None, doc_id=''). 'keep' fills unresolved "
+            "refs; 'reset' renumbers the selected scope. Next: ecad_status "
+            "to read the assigned refs."
+        ),
+    },
+    "ecad_bom": {
+        "prompt_note": (
+            "Schematic BOM writer, not the PCB fabrication ecad_export. Exact "
+            "dialect: ecad_bom(doc_id='', fmt='csv'|'json', "
+            "exclude_dnp=True, path=None). path writes the full returned text "
+            "client-side. Next: ecad_plot for the drawing deliverable."
+        ),
+    },
+    "ecad_bus": {
+        "prompt_note": (
+            "Create the named bus polyline. Exact dialect: "
+            "ecad_bus(name='D[0..7]', points=[[x,y],[x,y],...], doc_id=''); "
+            "coordinates are schematic mm. Next: ecad_bus_entry for each used "
+            "member, then ecad_lint_schematic."
+        ),
+    },
+    "ecad_bus_entry": {
+        "prompt_note": (
+            "Connect one wire to one expanded bus member. Exact dialect: "
+            "ecad_bus_entry(x, y, bus='D[0..7]', member='D0', doc_id=''); "
+            "(x,y) is the bus-side endpoint. Next: ecad_netlist to confirm "
+            "the member binding; lint catches unresolved entries."
+        ),
+    },
+    "ecad_delete": {
+        "prompt_note": (
+            "Delete a schematic entity by internal id, or a symbol by ref. "
+            "Exact dialect: ecad_delete(id_or_ref='w3'|'R1', doc_id=''). "
+            "Use render_schematic_ascii's index rather than guessing ids. "
+            "Next: read the returned net/ERC delta and re-render."
+        ),
+    },
+    "ecad_edit_symbol": {
+        "prompt_note": (
+            "Edit in place by ref or symbol id; omitted slots stay unchanged. "
+            "Exact dialect: ecad_edit_symbol(ref_or_id, value=None, ref=None, "
+            "footprint=None, dnp=None, in_bom=None, on_board=None, "
+            "datasheet=None, unit=None, angle=None, mirror=None, x=None, "
+            "y=None, fields=None, doc_id=''). Next: ecad_status and read the "
+            "returned pin/net/ERC readback."
+        ),
+    },
+    "ecad_export_kicad": {
+        "prompt_note": (
+            "Write a KiCad 7 .kicad_sch artifact. Exact dialect: "
+            "ecad_export_kicad(path='design.kicad_sch', doc_id=''). The "
+            "write is client-side and returns confirmed bytes/path. Next: "
+            "ecad_plot(fmt='pdf') for a human-readable deliverable."
+        ),
+    },
+    "ecad_import_kicad": {
+        "prompt_note": (
+            "Import an existing .kicad_sch into the active schematic. Exact "
+            "dialect: ecad_import_kicad(path, mode='merge'|'replace', "
+            "doc_id=''). The source path must exist. Next: ecad_annotate, "
+            "ecad_status, then ecad_lint_schematic."
+        ),
+    },
+    "ecad_junction": {
+        "prompt_note": (
+            "Electrically join crossing/T wires at exact world coordinates. "
+            "Exact dialect: ecad_junction(x, y, doc_id=''). Do not use it "
+            "for a visual crossing that should remain separate. Next: "
+            "ecad_netlist to confirm membership."
+        ),
+    },
+    "ecad_netlist": {
+        "prompt_note": (
+            "Compiled connectivity readback. Exact dialect: "
+            "ecad_netlist(doc_id='', fmt='summary'|'json'|'kicad', "
+            "path=None). summary is bounded names/counts; json is the full "
+            "structured netlist; kicad uses the native writer and path writes "
+            "the full text. Next: ecad_bom and ecad_plot."
+        ),
+    },
+    "ecad_no_connect": {
+        "prompt_note": (
+            "Mark one intentionally open pin at its exact world xy from the "
+            "placed pin list. Exact dialect: ecad_no_connect(x, y, doc_id=''). "
+            "Never use it to hide an unknown connection. Next: ecad_status "
+            "and confirm that specific pin clears honestly."
+        ),
+    },
+    "ecad_note": {
+        "prompt_note": (
+            "Add non-electrical sheet text. Exact dialect: "
+            "ecad_note(x, y, text, size=1.27, doc_id=''). It does not name or "
+            "connect a net; use ecad_label for that. Next: ecad_plot to verify "
+            "the note in the deliverable."
+        ),
+    },
+    "ecad_plot": {
+        "prompt_note": (
+            "Produce the deliverable vector drawing. Exact dialect: "
+            "ecad_plot(doc_id='', fmt='svg'|'pdf', path=None, sheet=None, "
+            "title_block=True). It always writes confirmed artifact path(s); "
+            "sheet=None plots all sheets. Next: include returned paths/bytes "
+            "in the handoff."
+        ),
+    },
+    "ecad_symbols": {
+        "prompt_note": (
+            "Native catalog discovery; use this instead of guessing libids. "
+            "Exact dialect: ecad_symbols(query='', limit=20), limit 1..100. "
+            "Results carry exact libid/pin metadata. Next: feed an exact libid "
+            "to ecad_place_symbol."
+        ),
+    },
     "ecad_lint_schematic": {
         "prompt_note": (
-            "Geometry self-check BEFORE ecad_run_erc, which only catches "
-            "electrical faults: symbol-body overlap, dangling wire ends, "
-            "wires crossing a body, labels attached to nothing. Names the "
-            "offending refdes/coordinates/label text. Power rails with no "
-            "drawn body are skipped and listed, not guessed."
+            "Drawing/bus self-check BEFORE ecad_run_erc, which catches "
+            "electrical faults: symbol overlap, dangling ends, wires through "
+            "bodies, floating labels, unresolved bus entries, bus labels "
+            "without member wires, and unnamed buses. Names exact ids/xy/text; "
+            "next action is fix each finding and rerun lint."
         ),
     },
     "ecad_make_part": {
@@ -167,9 +284,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "ecad_place_symbol": {
         "prompt_note": (
-            "libid must come from ecad_find_part. Set value now ('1k', '5') "
-            "for simulation, and keep the returned pin xy list — ecad_wire "
-            "needs it."
+            "libid must come from ecad_symbols or ecad_find_part. Set value "
+            "now ('1k', '5') for simulation, and keep the returned pin xy "
+            "list — ecad_wire needs it."
         ),
     },
     "ecad_run_dfm": {
@@ -240,7 +357,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "ecad_status": {
         "prompt_note": (
             "First call when unsure — compact counts plus prioritized "
-            "next_actions. Drill down with detail='list'/'full' + "
+            "next_actions. erc_available=false means ERC failed and is NEVER "
+            "a clean result. Drill down with detail='list'/'full' + "
             "include='pins,members' only when wiring."
         ),
     },

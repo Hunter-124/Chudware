@@ -56,7 +56,10 @@ struct EcadSymGraphic {
 struct EcadPin {
     std::string number;        // "1", "A1", …
     std::string name;          // "OUT", "~"
-    std::string type;          // "passive" | "power_in" | … (drives ERC; cosmetic here)
+    std::string type;          // "passive" | "power_in" | … (drives ERC)
+    std::string shape;         // "line" | "inverted" | "clock" | "inverted_clock" | …
+    int  unit = 1;             // owning unit of a multi-unit symbol
+    bool hidden = false;       // hidden pins (power rails on many ICs) — drawn dimmed
     EcadPt root;               // world position where the pin meets the body
     EcadPt tip;                // world connection endpoint (what wires/netlist snap to)
     std::string net;           // resolved net name (from compile.netlist.by_pin), "" if floating
@@ -68,27 +71,111 @@ struct EcadSymbol {
     std::string libid;         // "Device:R"
     std::string ref;           // "R1" / "R?"
     std::string value;         // "10k"
-    EcadPt pos;                // placement origin (world == sheet-local in flat v1)
+    std::string sheet = "sh1"; // owning sheet id
+    EcadPt pos;                // placement origin
     float angle = 0.0f;        // deg CCW
     std::string mirror = "none";  // "none" | "x" | "y"
     bool power = false;        // lib_cache SymbolDef.power (VCC/GND etc.)
+    bool generated = false;    // def was fabricated because the libid is unknown — draw a warn badge
+    int  unit = 1;             // which unit of a multi-unit part this instance is
+    int  unitCount = 1;        // total units in the definition
     std::string footprint;     // assigned footprint id ("Resistor_SMD:R_0603"); "" if unassigned
-    bool dnp = false;          // do-not-populate flag (excluded from BOM/assembly)
+    std::string datasheet;     // first-class Datasheet property
+    bool dnp = false;          // do-not-populate (excluded from BOM/assembly)
+    bool inBom = true;
+    bool onBoard = true;
+    nlohmann::json fields;     // user fields (MPN, Tolerance, …); object, may be empty
     nlohmann::json simParams;  // free-form sim_params dict (raw JSON; null/absent if none)
     std::vector<EcadSymGraphic> body;  // local-frame body graphics (transform at draw time)
-    std::vector<EcadPin> pins;         // world-space pins
+    std::vector<EcadPin> pins;         // world-space pins (already filtered to this unit)
 };
 
-// Orthogonal wire polyline (world == sheet-local).
+// Orthogonal wire polyline.
 struct EcadWire {
     std::string id;            // "w1"
+    std::string sheet = "sh1";
     std::vector<EcadPt> pts;   // >= 2 points
-    bool bus = false;
+    bool bus = false;          // legacy per-wire bus flag (distinct from EcadBus)
+    std::string net;           // resolved net (compile.netlist.by_object), "" if unresolved
 };
 
-struct EcadJunction { std::string id; EcadPt pos; };
-struct EcadLabel    { std::string id; std::string text; std::string scope = "local"; EcadPt pos; float angle = 0.0f; };
-struct EcadPower    { std::string id; std::string net;  std::string symbol; EcadPt pos; };
+// A first-class bus polyline (doc `buses[]`), separate from the legacy wire.bus flag.
+struct EcadBus {
+    std::string id;            // "b1"
+    std::string sheet = "sh1";
+    std::string name;          // "D[0..7]"
+    std::vector<EcadPt> pts;
+    std::vector<std::string> members;  // expanded members from the compile ("D0","D1",…)
+};
+
+// A bus entry: the short diagonal that taps one member out of a bus.
+struct EcadBusEntry {
+    std::string id;            // "be1"
+    std::string sheet = "sh1";
+    EcadPt pos;                // wire-side endpoint
+    EcadPt size{2.54f, 2.54f}; // delta to the bus-side endpoint
+    std::string bus;           // owning bus id ("" = resolve geometrically)
+    std::string member;        // explicit member name ("" = resolve from the attached label)
+    std::string net;           // resolved member net
+};
+
+struct EcadJunction  { std::string id; std::string sheet = "sh1"; EcadPt pos; std::string net; };
+struct EcadLabel     { std::string id; std::string sheet = "sh1"; std::string text;
+                       std::string scope = "local"; EcadPt pos; float angle = 0.0f;
+                       std::string net; };
+struct EcadPower     { std::string id; std::string sheet = "sh1"; std::string net;
+                       std::string symbol; EcadPt pos; float angle = 0.0f; };
+// An explicit no-connect flag placed on a pin — the AUTHORITATIVE X mark. Never infer
+// this from an ERC violation: a correct no-connect suppresses `pin_not_connected`, so
+// deriving the glyph from ERC draws it in exactly the wrong places.
+struct EcadNoConnect { std::string id; std::string sheet = "sh1"; EcadPt pos; };
+struct EcadText      { std::string id; std::string sheet = "sh1"; std::string text; EcadPt pos;
+                       float size = 1.27f; float angle = 0.0f; };
+
+// A free graphic on the sheet (notes, boxes, dividers) — doc `graphics[]`.
+struct EcadGraphic {
+    enum Kind { Line, Rect, Circle, Arc, Polyline } kind = Line;
+    std::string id;            // "g1"
+    std::string sheet = "sh1";
+    std::vector<EcadPt> pts;   // rect/line: [p1,p2]; circle/arc: [center]; polyline: all
+    float radius = 0.0f;
+    float a0 = 0.0f, a1 = 0.0f;
+    float width = 0.15f;
+    bool  filled = false;
+};
+
+// One named connection point on a sheet symbol (the parent-side port of a child sheet).
+struct EcadSheetPin {
+    std::string name;
+    EcadPt pos;                // world
+    std::string shape = "bidirectional";
+    std::string net;
+};
+
+// The parent-side instantiation of a child sheet — drawn as a named box with its pins.
+struct EcadSheetSymbol {
+    std::string id;            // "ss1"
+    std::string sheet = "sh1"; // the PARENT sheet this box sits on
+    std::string child;         // the child sheet id it instantiates
+    std::string name;          // display name (child sheet's name)
+    EcadPt pos;                // top-left
+    EcadPt size{25.4f, 25.4f};
+    std::vector<EcadSheetPin> pins;
+};
+
+// One sheet (page) of a schematic. A document always has at least one.
+struct EcadSheet {
+    std::string id;            // "sh1"
+    std::string name;          // "Root"
+    float w = 297.0f, h = 210.0f;  // page size in mm (A4 landscape default)
+};
+
+// Sheet-frame metadata rendered into the title block and carried into plots.
+struct EcadTitleBlock {
+    std::string title, company, rev, date;
+    std::string comment1, comment2, comment3, comment4;
+    std::string paper = "A4";
+};
 
 // =====================================================================================
 // Board (aicad.pcb/1) parsed entities
@@ -183,10 +270,13 @@ struct EcadViolation {
     std::string layer;         // DRC loc layer; "" for ERC
 };
 
-// A net summary derived from compile.netlist.nets (sch) or doc.nets (pcb).
+// A net summary derived from compile.netlist (sch) or doc.nets (pcb).
 struct EcadNet {
     std::string name;
-    int pinCount = 0;          // sch: number of pins on this net
+    int pinCount = 0;                  // sch: number of pins on this net
+    std::vector<std::string> sheets;   // sheets this net appears on
+    std::string bus;                   // owning bus name when this net is a bus member
+    bool driven = false;               // compile said the net has a driver / power source
 };
 
 // =====================================================================================
@@ -214,11 +304,37 @@ public:
     const std::string& name() const { return name_; }
 
     // ---- schematic accessors ----
-    const std::vector<EcadSymbol>&   symbols()   const { return symbols_; }
-    const std::vector<EcadWire>&     wires()      const { return wires_; }
-    const std::vector<EcadJunction>& junctions()  const { return junctions_; }
-    const std::vector<EcadLabel>&    labels()     const { return labels_; }
-    const std::vector<EcadPower>&    powers()     const { return powers_; }
+    const std::vector<EcadSheet>&       sheets()       const { return sheets_; }
+    const std::vector<EcadSymbol>&      symbols()      const { return symbols_; }
+    const std::vector<EcadWire>&        wires()        const { return wires_; }
+    const std::vector<EcadBus>&         buses()        const { return buses_; }
+    const std::vector<EcadBusEntry>&    busEntries()   const { return busEntries_; }
+    const std::vector<EcadJunction>&    junctions()    const { return junctions_; }
+    const std::vector<EcadLabel>&       labels()       const { return labels_; }
+    const std::vector<EcadPower>&       powers()       const { return powers_; }
+    const std::vector<EcadNoConnect>&   noConnects()   const { return noConnects_; }
+    const std::vector<EcadText>&        texts()        const { return texts_; }
+    const std::vector<EcadGraphic>&     graphics()     const { return graphics_; }
+    const std::vector<EcadSheetSymbol>& sheetSymbols() const { return sheetSymbols_; }
+    const EcadTitleBlock&               titleBlock()   const { return titleBlock_; }
+
+    // Document edit grid in mm (schema `units.grid`, default 2.54). Every placement and
+    // move MUST snap to this, not to a hard-coded constant.
+    float grid() const { return grid_; }
+
+    // The sheet the canvas is currently showing. Entities carry a `sheet` id and MUST be
+    // filtered by it — a hierarchical document otherwise draws every page on top of
+    // itself. Defaults to the first sheet; setting an unknown id is ignored.
+    const std::string& activeSheet() const { return activeSheet_; }
+    void setActiveSheet(const std::string& id);
+    // Convenience: is this entity on the sheet currently being shown?
+    bool onActiveSheet(const std::string& sheetId) const {
+        return activeSheet_.empty() || sheetId.empty() || sheetId == activeSheet_;
+    }
+
+    // Resolved net for one document entity id (wire/bus/bus entry/junction/label/power),
+    // from compile.netlist.by_object. Empty when the compile did not resolve it.
+    const std::string& netOfObject(const std::string& objId) const;
 
     // ---- board accessors ----
     const std::vector<EcadFootprint>& footprints() const { return footprints_; }
@@ -255,7 +371,10 @@ public:
     const std::vector<EcadNet>&       nets()      const { return nets_; }
     int  unroutedCount() const { return (int)ratsnest_.size(); }
 
-    // ---- world bbox of everything drawn (for "zoom to fit"); returns false when empty ----
+    // ---- world bbox of everything drawn on the ACTIVE sheet (for "zoom to fit").
+    // Covers symbol bodies and pin tips, wires, buses, bus entries, junctions, labels,
+    // power ports, no-connects, texts, graphics, sheet symbols and located ERC markers.
+    // Returns false when the sheet is empty.
     bool worldBounds(EcadPt& outMin, EcadPt& outMax) const;
 
     // ---- transform helpers (PORT of engine/ecad/schema.py — public so tests/picking can reuse) ----
@@ -274,11 +393,22 @@ private:
     std::string name_;
 
     // sch
-    std::vector<EcadSymbol>   symbols_;
-    std::vector<EcadWire>     wires_;
-    std::vector<EcadJunction> junctions_;
-    std::vector<EcadLabel>    labels_;
-    std::vector<EcadPower>    powers_;
+    std::vector<EcadSheet>       sheets_;
+    std::vector<EcadSymbol>      symbols_;
+    std::vector<EcadWire>        wires_;
+    std::vector<EcadBus>         buses_;
+    std::vector<EcadBusEntry>    busEntries_;
+    std::vector<EcadJunction>    junctions_;
+    std::vector<EcadLabel>       labels_;
+    std::vector<EcadPower>       powers_;
+    std::vector<EcadNoConnect>   noConnects_;
+    std::vector<EcadText>        texts_;
+    std::vector<EcadGraphic>     graphics_;
+    std::vector<EcadSheetSymbol> sheetSymbols_;
+    EcadTitleBlock               titleBlock_;
+    float                        grid_ = 2.54f;
+    std::string                  activeSheet_;
+    std::unordered_map<std::string, std::string> objectNet_;  // entity id -> net name
 
     // pcb
     std::vector<EcadFootprint>  footprints_;

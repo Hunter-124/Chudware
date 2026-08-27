@@ -206,23 +206,36 @@
    "ecad_add_power",
    "ecad_add_zone",
    "ecad_airflow_handoff",
+   "ecad_annotate",
    "ecad_autoplace",
    "ecad_autoroute",
+   "ecad_bom",
+   "ecad_bus",
+   "ecad_bus_entry",
    "ecad_check_diff_impedance",
    "ecad_check_impedance",
+   "ecad_delete",
    "ecad_design",
+   "ecad_edit_symbol",
    "ecad_export",
+   "ecad_export_kicad",
    "ecad_fill_zones",
    "ecad_find_part",
    "ecad_fpga_check",
+   "ecad_import_kicad",
+   "ecad_junction",
    "ecad_label",
    "ecad_lint_schematic",
    "ecad_make_board",
    "ecad_make_part",
+   "ecad_netlist",
    "ecad_new_pcb",
    "ecad_new_schematic",
+   "ecad_no_connect",
+   "ecad_note",
    "ecad_optimize_traces",
    "ecad_place_symbol",
+   "ecad_plot",
    "ecad_route_pad_to_pad",
    "ecad_run_dfm",
    "ecad_run_drc",
@@ -235,6 +248,7 @@
    "ecad_stackup_solve",
    "ecad_status",
    "ecad_sweep",
+   "ecad_symbols",
    "ecad_tf",
    "ecad_thermal_handoff",
    "ecad_to_3d",
@@ -637,25 +651,38 @@
   "ecad_add_power": "Drop a power/ground port (e.g. net='GND', 'VCC', '+5V') at ``(x, y)``.",
   "ecad_add_zone": "Add a copper pour (zone) bound to ``net`` on ``layer`` — usually a ground/power plane.",
   "ecad_airflow_handoff": "Hand the active board's thermal problem to OpenFOAM conjugate heat transfer (CHT) — the check for when convection PRESETS aren't enough …",
+  "ecad_annotate": "Assign reference designators with ``sch_annotate``.",
   "ecad_antenna_analyze": "Antenna resonance / return-loss analysis.",
   "ecad_antenna_design": "Parametric PCB antenna design (patch / monopole / ifa / pifa).",
   "ecad_autoplace": "Connectivity-aware placement on the active board (E1 placer).",
   "ecad_autoroute": "Auto-route the active board's ratsnest with a basic 2-layer grid (Lee/A*) router.",
+  "ecad_bom": "Generate a schematic BOM as ``csv`` or ``json``; optionally write it to ``path``.",
+  "ecad_bus": "Add a named bus polyline. ``points`` is ``[[x,y], ...]`` with at least two points.",
+  "ecad_bus_entry": "Add a bus entry at ``(x,y)``; ``bus`` names its bus and ``member`` one expanded net.",
   "ecad_check_diff_impedance": "Compute the differential impedance (Z_diff) of an edge-coupled differential pair on the active board and compare it to a target (default …",
   "ecad_check_impedance": "Compute the characteristic impedance (Z0) and one-way propagation delay for a routed trace on the active board, and compare it to a target …",
+  "ecad_delete": "Delete any schematic entity by id, or delete a symbol by reference designator.",
   "ecad_design": "Autonomous ECAD design: natural-language request -> verified schematic + simulation.",
+  "ecad_edit_symbol": "Edit a placed symbol by reference designator (``R1``) or internal id (``s1``).",
   "ecad_export": "Export a fabrication output from the active board.",
+  "ecad_export_kicad": "Export the active schematic as a KiCad 7 ``.kicad_sch`` file.",
   "ecad_fill_zones": "Fill every copper pour on the active board at FULL resolution and report the result.",
   "ecad_find_part": "Search the component library and return RANKED real parts so you place an actual part instead of inventing a libid.",
   "ecad_fpga_check": "Bank-aware FPGA design checks on the active schematic (T-FIN11).",
+  "ecad_import_kicad": "Import a KiCad ``.kicad_sch`` file into the active schematic.",
+  "ecad_junction": "Add an electrical junction at exact world ``(x, y)``.",
   "ecad_label": "Place a net label ``text`` at ``(x, y)``. Two labels of the same text+scope on a sheet merge their nets; ``scope='global'`` merges across …",
   "ecad_lint_schematic": "GEOMETRIC self-check of the active schematic — run this BEFORE ecad_run_erc.",
   "ecad_make_board": "ONE-SHOT board flow: from the active schematic, run sync -> autoroute -> fill zones -> DRC and report every step's outcome, remaining …",
   "ecad_make_part": "CREATE a real library part — symbol + footprint — from a pinout YOU supply.",
+  "ecad_netlist": "Read the compiled schematic netlist.",
   "ecad_new_pcb": "Start a NEW PCB (board) document and make it the active one.",
   "ecad_new_schematic": "Start a NEW schematic document and make it the active one.",
+  "ecad_no_connect": "Mark the pin at exact world ``(x, y)`` intentionally unconnected.",
+  "ecad_note": "Add non-electrical schematic text at ``(x,y)`` in mm.",
   "ecad_optimize_traces": "Post-route polish on the active board (E2): round ~90° corners to arcs, add teardrops at pad/via junctions, and retune track widths toward …",
   "ecad_place_symbol": "Place a symbol on the active schematic and return its assigned REF plus its full PIN LIST (name/number/type/world-xy) and the count of pins …",
+  "ecad_plot": "Plot the schematic to vector SVG or PDF and return confirmed artifact path(s).",
   "ecad_route_pad_to_pad": "Route ONE copper trace between two pads by hand — the surgical complement to ecad_autoroute, and the tool autoroute's \"failed net\" report …",
   "ecad_run_dfm": "Run the Design-For-Manufacturing (DFM) check suite on the active board and return a readable summary grouped by rule (counts + worst …",
   "ecad_run_drc": "Run the Design Rule Check on the active board and return a summary with the worst offenders (clearance, track width, via size, annular …",
@@ -668,6 +695,7 @@
   "ecad_stackup_solve": "Solve a controlled-impedance layer stackup + the trace geometries that hit each impedance target, from a fab-capability profile — then wire …",
   "ecad_status": "THE situational-awareness call — summary-first, token-bounded.",
   "ecad_sweep": "Parameter sweep: re-simulate the active schematic once per value of ``param`` and report how the output moves (a SPICE ``.step``).",
+  "ecad_symbols": "Discover native schematic symbols instead of guessing libids.",
   "ecad_tf": "Run a DC small-signal transfer function (.tf) on the active schematic's circuit.",
   "ecad_thermal_handoff": "One call from the active routed board to a solved thermal FEA study.",
   "ecad_to_3d": "Export a 3D model (STEP) of the active board + the aicad.boardphys/1 sidecar.",
@@ -1332,6 +1360,9 @@
    "prompt_note": "Minutes-long OpenFOAM CHT — only when convection presets look wrong (enclosure/fan). dry_run=True inspects the case; verify after with ecad_verify_airflow.",
    "timeout_s": 600
   },
+  "ecad_annotate": {
+   "prompt_note": "Use after placement or before BOM/export. Exact dialect: ecad_annotate(scope='all'|'sheet', mode='keep'|'reset', sheet='<sheet-id>'|None, doc_id=''). 'keep' fills unresolved refs; 'reset' renumbers the selected scope. Next: ecad_status to read the assigned refs."
+  },
   "ecad_antenna_analyze": {
    "prompt_note": "Always returns a closed-form resonance estimate. want_fullwave=True additionally uses openEMS only when installed; otherwise fullwave.skipped is evidence of no full-wave result, not PASS. Frequencies are Hz. Refine n_freq/max_timesteps and check the full-wave block before trusting S11.",
    "timeout_s": 600
@@ -1346,18 +1377,36 @@
    "prompt_note": "Needs a ratsnest — ecad_update_from_sch first. Failed nets are named; give them room or route by hand. ecad_optimize_traces polishes after.",
    "timeout_s": 180
   },
+  "ecad_bom": {
+   "prompt_note": "Schematic BOM writer, not the PCB fabrication ecad_export. Exact dialect: ecad_bom(doc_id='', fmt='csv'|'json', exclude_dnp=True, path=None). path writes the full returned text client-side. Next: ecad_plot for the drawing deliverable."
+  },
+  "ecad_bus": {
+   "prompt_note": "Create the named bus polyline. Exact dialect: ecad_bus(name='D[0..7]', points=[[x,y],[x,y],...], doc_id=''); coordinates are schematic mm. Next: ecad_bus_entry for each used member, then ecad_lint_schematic."
+  },
+  "ecad_bus_entry": {
+   "prompt_note": "Connect one wire to one expanded bus member. Exact dialect: ecad_bus_entry(x, y, bus='D[0..7]', member='D0', doc_id=''); (x,y) is the bus-side endpoint. Next: ecad_netlist to confirm the member binding; lint catches unresolved entries."
+  },
   "ecad_check_diff_impedance": {
    "prompt_note": "Both nets must already be routed. To CHANGE geometry toward a target, solve first with ecad_stackup_solve — this only measures."
   },
   "ecad_check_impedance": {
    "prompt_note": "Omit net_or_ref to scan all routed nets for controlled-impedance candidates. Same IPC-2141A models ecad_stackup_solve inverts, so solved traces read back on-target."
   },
+  "ecad_delete": {
+   "prompt_note": "Delete a schematic entity by internal id, or a symbol by ref. Exact dialect: ecad_delete(id_or_ref='w3'|'R1', doc_id=''). Use render_schematic_ascii's index rather than guessing ids. Next: read the returned net/ERC delta and re-render."
+  },
   "ecad_design": {
    "prompt_note": "Front door for a new circuit: plain-English request -> verified schematic + sim, offline via recipes. It becomes the active doc; board_from_schematic is next.",
    "timeout_s": 300
   },
+  "ecad_edit_symbol": {
+   "prompt_note": "Edit in place by ref or symbol id; omitted slots stay unchanged. Exact dialect: ecad_edit_symbol(ref_or_id, value=None, ref=None, footprint=None, dnp=None, in_bom=None, on_board=None, datasheet=None, unit=None, angle=None, mirror=None, x=None, y=None, fields=None, doc_id=''). Next: ecad_status and read the returned pin/net/ERC readback."
+  },
   "ecad_export": {
    "prompt_note": "Run ecad_fill_zones first so Gerbers carry the true pour. kind='constraints' emits FPGA XDC/LPF — pair with ecad_fpga_check."
+  },
+  "ecad_export_kicad": {
+   "prompt_note": "Write a KiCad 7 .kicad_sch artifact. Exact dialect: ecad_export_kicad(path='design.kicad_sch', doc_id=''). The write is client-side and returns confirmed bytes/path. Next: ecad_plot(fmt='pdf') for a human-readable deliverable."
   },
   "ecad_fill_zones": {
    "prompt_note": "Required before Gerber export — the post-edit preview fill is coarse and not what ships. Re-run after any copper edit."
@@ -1368,11 +1417,17 @@
   "ecad_fpga_check": {
    "prompt_note": "Schematic-side (not board) bank/pin checks; pass io= to declare IOSTANDARDs or VCCIO inference is a guess. Export constraints after via ecad_export."
   },
+  "ecad_import_kicad": {
+   "prompt_note": "Import an existing .kicad_sch into the active schematic. Exact dialect: ecad_import_kicad(path, mode='merge'|'replace', doc_id=''). The source path must exist. Next: ecad_annotate, ecad_status, then ecad_lint_schematic."
+  },
+  "ecad_junction": {
+   "prompt_note": "Electrically join crossing/T wires at exact world coordinates. Exact dialect: ecad_junction(x, y, doc_id=''). Do not use it for a visual crossing that should remain separate. Next: ecad_netlist to confirm membership."
+  },
   "ecad_label": {
    "prompt_note": "Same text+scope merges nets — the clean wire-free connect across a sheet (scope='global' crosses sheets). Names feed ERC, netlist, and SPICE probes."
   },
   "ecad_lint_schematic": {
-   "prompt_note": "Geometry self-check BEFORE ecad_run_erc, which only catches electrical faults: symbol-body overlap, dangling wire ends, wires crossing a body, labels attached to nothing. Names the offending refdes/coordinates/label text. Power rails with no drawn body are skipped and listed, not guessed."
+   "prompt_note": "Drawing/bus self-check BEFORE ecad_run_erc, which catches electrical faults: symbol overlap, dangling ends, wires through bodies, floating labels, unresolved bus entries, bus labels without member wires, and unnamed buses. Names exact ids/xy/text; next action is fix each finding and rerun lint."
   },
   "ecad_make_board": {
    "prompt_note": "One-shot sync->route->fill->DRC from the active schematic (pass doc_id when several are open); hostcheck=True folds in the MCU rule pack.",
@@ -1381,18 +1436,30 @@
   "ecad_make_part": {
    "prompt_note": "Creates a real symbol+footprint from a pinout YOU supply — this is what ecad_find_part routes to when it refuses to substitute a >3-pin part. Requires name + pins (each {number,name,type,side}) + package (chip/soic/qfn/qfp/sot/dip/header/module_castellated) with its pitch/body dims. It will NOT invent a pinout from a part name: no pins means refusal. Pin type must be the exact KiCad enum — 'power'/'vcc'/'gnd' are refused as ambiguous, use power_in or power_out. Then ecad_place_symbol by the returned libid."
   },
+  "ecad_netlist": {
+   "prompt_note": "Compiled connectivity readback. Exact dialect: ecad_netlist(doc_id='', fmt='summary'|'json'|'kicad', path=None). summary is bounded names/counts; json is the full structured netlist; kicad uses the native writer and path writes the full text. Next: ecad_bom and ecad_plot."
+  },
   "ecad_new_pcb": {
    "prompt_note": "Manual board path: new PCB -> footprints (fpids via ecad_find_part) -> route -> ecad_run_drc. For a schematic-driven board use board_from_schematic instead."
   },
   "ecad_new_schematic": {
    "prompt_note": "Becomes the active doc — omit doc_id afterwards. Next moves: ecad_find_part, then ecad_place_symbol with value set."
   },
+  "ecad_no_connect": {
+   "prompt_note": "Mark one intentionally open pin at its exact world xy from the placed pin list. Exact dialect: ecad_no_connect(x, y, doc_id=''). Never use it to hide an unknown connection. Next: ecad_status and confirm that specific pin clears honestly."
+  },
+  "ecad_note": {
+   "prompt_note": "Add non-electrical sheet text. Exact dialect: ecad_note(x, y, text, size=1.27, doc_id=''). It does not name or connect a net; use ecad_label for that. Next: ecad_plot to verify the note in the deliverable."
+  },
   "ecad_optimize_traces": {
    "prompt_note": "Post-route polish: run after autoroute, before fill/DRC. Pass targets={net: ohms} to retune widths; idempotent and DRC-guarded, safe to re-run.",
    "timeout_s": 180
   },
   "ecad_place_symbol": {
-   "prompt_note": "libid must come from ecad_find_part. Set value now ('1k', '5') for simulation, and keep the returned pin xy list — ecad_wire needs it."
+   "prompt_note": "libid must come from ecad_symbols or ecad_find_part. Set value now ('1k', '5') for simulation, and keep the returned pin xy list — ecad_wire needs it."
+  },
+  "ecad_plot": {
+   "prompt_note": "Produce the deliverable vector drawing. Exact dialect: ecad_plot(doc_id='', fmt='svg'|'pdf', path=None, sheet=None, title_block=True). It always writes confirmed artifact path(s); sheet=None plots all sheets. Next: include returned paths/bytes in the handoff."
   },
   "ecad_route_pad_to_pad": {
    "prompt_note": "Hand-routes the nets ecad_autoroute reported as failed. Needs from_ref/from_pad/to_ref/to_pad. The net is READ off the pads — pads on different nets are refused, never shorted. Width comes from the ecad_stackup_solve net class unless you pass width. Set to_layer to change layer and it inserts a via. Real tracks, so ecad_run_drc sees them."
@@ -1427,11 +1494,14 @@
    "prompt_note": "Solve BEFORE routing so autoroute/DRC inherit solved widths/gaps via net classes; net_map binds existing nets. Works boardless for design-ahead."
   },
   "ecad_status": {
-   "prompt_note": "First call when unsure — compact counts plus prioritized next_actions. Drill down with detail='list'/'full' + include='pins,members' only when wiring."
+   "prompt_note": "First call when unsure — compact counts plus prioritized next_actions. erc_available=false means ERC failed and is NEVER a clean result. Drill down with detail='list'/'full' + include='pins,members' only when wiring."
   },
   "ecad_sweep": {
    "prompt_note": "One parameter, explicit values list (no start/stop/step); re-runs the analysis per value — keep the list short on transient runs.",
    "timeout_s": 180
+  },
+  "ecad_symbols": {
+   "prompt_note": "Native catalog discovery; use this instead of guessing libids. Exact dialect: ecad_symbols(query='', limit=20), limit 1..100. Results carry exact libid/pin metadata. Next: feed an exact libid to ecad_place_symbol."
   },
   "ecad_tf": {
    "prompt_note": "DC gain + Rin + Rout in one shot — the amp gain/loading check. backend='ngspice' only matters for vendor .SUBCKT parts."

@@ -196,12 +196,11 @@ static void parkActiveCadSession(AppState& st) {
     if (DocSession* s = st.activeSession()) st.captureDocState(*s);
 }
 
-// Wave 2 (GUI rework): open an already-created worker ECAD doc as a new Schematic/PCB tab + make it
-// active. The caller (the New-Document chooser / ribbon New Schematic|PCB) has already run ecad_new
-// and adopted the result into the editor mirror (st.ecadDocId/ecadRevision are set). This appends a
-// matching tab carrying that ecad id/revision and points the editor at it. The Drawing-tab discipline
-// applies: no DocMirror touch. The leaving CAD tab's edit/display state is PARKED (not cancelled) so
-// the part behind the ECAD canvas keeps its in-progress PM form / sketch / measure.
+// Open an already-created worker ECAD doc as a new Schematic/PCB tab and make it active. Callers
+// append the tab BEFORE feeding the RPC response into ecad_panel so its per-document state resolver
+// targets this tab rather than the previously-active document. The Drawing-tab discipline applies:
+// no DocMirror touch. The leaving CAD tab's edit/display state is PARKED (not cancelled) so the part
+// behind the ECAD canvas keeps its in-progress PM form / sketch / measure.
 void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_,
                           int ecadRevision_, const std::string& title) {
     if (ecadDocId_.empty()) return;

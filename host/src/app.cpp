@@ -130,6 +130,7 @@ inline void wasmBootReady() {
 #include "ui/drawing_panel.h" // W17: drawing ribbon command dispatch (drawingHandleCommand)
 #include "ui/ecad/ecad_mirror.h" // Wave N: complete type for EcadMirror::setDocId
 #include "ui/ecad/ecad_panel.h" // Wave N: AI-ECAD 2D editor
+#include "ui/metrics.h" // ECAD command modals use the shared DPI-scaled size tokens
 #include "ui/feature_tree.h"
 #include "ui/file_dialog.h" // Wave Y: native Save As / Open dialogs for .ecad+
 #include "ui/file_dialog.h" // W14: native Save-As for 2D export (flat-pattern DXF)
@@ -202,13 +203,11 @@ void setContextWindowSource(const std::string &src);
 }
 
 // =====================================================================================
-// Wave N: AI-ECAD GUI command wiring. Creates/routes ECAD documents through the
-// worker ecad_* RPCs (engine/ecad/rpc.py) and feeds the
-// {revision,kind,tree,compile} responses into the editor mirror — the same
-// discipline core/doc_mirror.cpp uses for the CAD doc_* methods. See
-// docs/ECAD_UI_INTEGRATION.md §(e). New docs + doc-scoped analysis/exports are
-// live; geometry-placing ops (sch_add_symbol, pcb_add_track, ...) still need
-// canvas-click placement.
+// ECAD GUI command wiring. Creates/routes native ECAD documents through ecad_*
+// RPCs and feeds full ops-responses into the editor mirror. Every created or
+// loaded document is tabbed before adoption so the response lands in that
+// tab's per-document editor state; interactive entity commands arm the canvas
+// through ecad_panel's placement seam.
 // =====================================================================================
 namespace {
 
@@ -254,8 +253,17 @@ void ecadAdopt(AppState &st, const nlohmann::json &res) {
   if (!id.empty())
     st.ecadDocId = id;
   st.ecadRevision = jint(res, "revision");
-  if (!st.ecadDocId.empty())
+  if (!st.ecadDocId.empty()) {
     ui::ecadEditorMirror().setDocId(st.ecadDocId);
+    for (auto &tab : st.docTabs) {
+      if ((tab.kind == AppState::DocTab::TabKind::Schematic ||
+           tab.kind == AppState::DocTab::TabKind::PCB) &&
+          tab.ecadDocId == st.ecadDocId) {
+        tab.ecadRevision = st.ecadRevision;
+        break;
+      }
+    }
+  }
   ui::ecadEditorLoadResponse(res);
 }
 
@@ -272,6 +280,109 @@ bool ecadCall(AppState &st, const char *method, const nlohmann::json &params,
     st.toast(ui::ToastLevel::Error, "ECAD: " + jstr(res, "message"));
     return false;
   }
+  return true;
+}
+
+std::string ecadResponseKind(const nlohmann::json &res) {
+  const std::string kind = jstr(res, "kind");
+  if (kind == "pcb" || kind == "sch")
+    return kind;
+  return {};
+}
+
+std::string ecadResponseTitle(const nlohmann::json &res) {
+  const std::string name = jstr(res, "name");
+  if (!name.empty())
+    return name;
+  auto tree = res.find("tree");
+  return tree != res.end() && tree->is_object() ? jstr(*tree, "name")
+                                                : std::string();
+}
+
+void ecadReportWarnings(AppState &st, const nlohmann::json &res,
+                        const std::string &context) {
+  auto it = res.find("warnings");
+  if (it == res.end() || it->is_null())
+    return;
+  std::vector<std::string> warnings;
+  if (it->is_array()) {
+    for (const auto &warning : *it) {
+      if (warning.is_string())
+        warnings.push_back(warning.get<std::string>());
+      else if (!warning.is_null())
+        warnings.push_back(warning.dump());
+    }
+  } else if (it->is_string()) {
+    warnings.push_back(it->get<std::string>());
+  } else {
+    warnings.push_back(it->dump());
+  }
+  for (const std::string &warning : warnings) {
+    st.toast(ui::ToastLevel::Warn, context + ": " + warning);
+    st.addLog("[warn] [ecad] " + context + ": " + warning);
+  }
+}
+
+bool ecadResponseSucceeded(AppState &st, const nlohmann::json &res,
+                           const std::string &context) {
+  if (!res.contains("ok") || (res["ok"].is_boolean() && res["ok"].get<bool>()))
+    return true;
+  std::string reason = jstr(res, "message");
+  if (reason.empty())
+    reason = jstr(res, "error");
+  if (reason.empty() && res.contains("erc_errors") &&
+      res["erc_errors"].is_number_integer())
+    reason = "design has " + std::to_string(res["erc_errors"].get<int>()) +
+             " ERC error(s)";
+  if (reason.empty())
+    reason = "request failed";
+  st.toast(ui::ToastLevel::Warn, context + ": " + reason);
+  st.addLog("[warn] [ecad] " + context + ": " + reason);
+  return false;
+}
+
+std::string ecadActiveKind(const AppState &st) {
+  if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+    const auto kind = st.docTabs[st.activeTab].kind;
+    if (kind == AppState::DocTab::TabKind::Schematic)
+      return "sch";
+    if (kind == AppState::DocTab::TabKind::PCB)
+      return "pcb";
+    return {};
+  }
+  if (ui::ecadEditorMirror().isSch())
+    return "sch";
+  if (ui::ecadEditorMirror().isPcb())
+    return "pcb";
+  return {};
+}
+
+bool ecadRequireKind(AppState &st, const char *kind, const char *action) {
+  if (st.ecadDocId.empty() || ecadActiveKind(st) != kind) {
+    st.toast(ui::ToastLevel::Warn,
+             std::string(action) + (std::string(kind) == "sch"
+                                        ? " requires an active schematic"
+                                        : " requires an active board"));
+    return false;
+  }
+  return true;
+}
+
+bool ecadAddResponseTab(AppState &st, const nlohmann::json &res,
+                        const std::string &fallbackTitle = {}) {
+  const std::string id = jstr(res, "doc_id");
+  const std::string kind = ecadResponseKind(res);
+  if (id.empty() || kind.empty()) {
+    st.toast(ui::ToastLevel::Warn,
+             id.empty() ? "ECAD response produced no document"
+                        : "ECAD response did not identify its document kind");
+    return false;
+  }
+  std::string title = ecadResponseTitle(res);
+  if (title.empty())
+    title = fallbackTitle;
+  st.addEcadTab(kind, id, jint(res, "revision"), title);
+  ecadAdopt(st, res);
   return true;
 }
 
@@ -418,21 +529,55 @@ void ecadRedo(AppState &st) {
   st.toast(ui::ToastLevel::Info, "Redo");
 }
 
-void ecadExport(AppState &st, const char *kind) {
-  if (st.ecadDocId.empty()) {
-    st.toast(ui::ToastLevel::Warn, "Open an ECAD document first");
+void ecadExport(AppState &st, const char *kind, const char *requiredDocKind) {
+  if (!ecadRequireKind(st, requiredDocKind, "Export")) {
     return;
   }
   std::error_code ec;
   const std::string dir = appdataAppDir() + "/ecad_out";
   std::filesystem::create_directories(dir, ec);
+  if (ec) {
+    st.toast(ui::ToastLevel::Error,
+             "Export directory could not be created: " + ec.message());
+    st.addLog("[err] [ecad] export directory " + dir + ": " + ec.message());
+    return;
+  }
   nlohmann::json res;
   if (!ecadCall(st, "ecad_export",
                 {{"doc_id", st.ecadDocId}, {"kind", kind}, {"path", dir}}, res))
     return;
+  ecadReportWarnings(st, res, std::string("Export ") + kind);
+
+  std::vector<std::string> paths;
+  auto written = res.find("paths");
+  if (written != res.end() && written->is_array()) {
+    for (const auto &path : *written)
+      if (path.is_string() && !path.get_ref<const std::string &>().empty())
+        paths.push_back(path.get<std::string>());
+  }
+  if (paths.empty()) {
+    const auto files = res.find("files");
+    const bool inMemoryOnly =
+        files != res.end() && files->is_object() && !files->empty();
+    const std::string reason =
+        inMemoryOnly ? "the exporter returned in-memory content only"
+                     : "the exporter produced no files";
+    st.toast(ui::ToastLevel::Warn,
+             std::string("No ") + kind + " files were written: " + reason);
+    st.addLog("[warn] [ecad] export " + std::string(kind) +
+              " wrote no paths (" + reason + ")");
+    return;
+  }
+
+  std::string list;
+  for (const std::string &path : paths) {
+    if (!list.empty())
+      list += ", ";
+    list += path;
+    st.addLog("[ecad] export " + std::string(kind) + " wrote " + path);
+  }
   st.toast(ui::ToastLevel::Info,
-           std::string("Exported ") + kind + " -> ecad_out");
-  st.addLog("[ecad] export " + std::string(kind) + " -> " + dir);
+           std::string("Exported ") + kind + ": " + list);
 }
 
 // Save the open ECAD document to a native `.ecad+` container (ZIP) via a Save
@@ -455,8 +600,8 @@ void ecadSaveDoc(AppState &st) {
       return;
     }
   }
-  // Fallback: a tab-less ECAD doc (e.g. an AI-designed schematic that never got
-  // a tab).
+  // Defensive fallback for any externally-created ECAD document that has not
+  // yet acquired a tab.
   const std::string name = ui::ecadEditorMirror().name();
   const std::string path = ui::saveFileDialog(
       "AI-ECAD design (*.ecad+)\0*.ecad+\0All files (*.*)\0*.*\0", "ecad+",
@@ -467,9 +612,17 @@ void ecadSaveDoc(AppState &st) {
   if (!ecadCall(st, "ecad_save", {{"doc_id", st.ecadDocId}, {"path", path}},
                 res))
     return;
-  const std::string saved = jstr(res, "path");
-  st.toast(ui::ToastLevel::Info, "Saved " + (saved.empty() ? path : saved));
-  st.addLog("[ecad] saved -> " + (saved.empty() ? path : saved));
+  const std::string returnedPath = jstr(res, "path");
+  const std::string saved = returnedPath.empty() ? path : returnedPath;
+  const std::string format = jstr(res, "format");
+  const std::string source = jstr(res, "source_path");
+  std::string notice = "Saved " + saved;
+  if (!format.empty())
+    notice += " (" + format + ")";
+  if (!source.empty())
+    notice += "; imported source preserved: " + source;
+  st.toast(ui::ToastLevel::Info, notice);
+  st.addLog("[ecad] " + notice);
 }
 
 // Open an ECAD document by absolute path (Wave 3: the File Explorer / Recent
@@ -481,11 +634,29 @@ void ecadOpenPath(AppState &st, const std::string &path) {
   nlohmann::json res;
   if (!ecadCall(st, "ecad_open", {{"path", path}}, res))
     return;
-  ecadAdopt(st, res);   // sets ecadDocId/revision + loads the editor mirror
-  st.wantFocusEcad = 6; // surface the editor with the freshly opened doc
+  ecadReportWarnings(st, res, "Open");
+  if (!ecadResponseSucceeded(st, res, "Open"))
+    return;
+  const std::string title = std::filesystem::path(path).stem().string();
+  if (!ecadAddResponseTab(st, res, title))
+    return;
+  // The tab's save identity follows the engine's import rule: native documents
+  // save back to themselves; KiCad imports save to a sibling native container
+  // and never overwrite the source.
+  if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+    std::filesystem::path savePath(path);
+    std::string ext = savePath.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    if (ext == ".kicad_sch" || ext == ".kicad_pcb")
+      savePath.replace_extension(".ecad+");
+    st.docTabs[st.activeTab].path = savePath.string();
+  }
+  st.wantFocusEcad = 6;
   st.toast(ui::ToastLevel::Info, "Opened " + path);
-  st.addLog("[ecad] opened " + path);
-  st.pushRecentFile(path); // Wave 3: record in Recent (persists to config.json)
+  st.addLog("[ecad] opened " + path + " as " + st.ecadDocId);
+  st.pushRecentFile(path);
 }
 
 // Open an ECAD document (native .ecad+ / .ecad / .json, or a KiCad
@@ -502,15 +673,20 @@ void ecadOpenDoc(AppState &st) {
   ecadOpenPath(st, path);
 }
 
+void ecadImportKiCadSchematic(AppState &st) {
+  const std::string path = ui::openFileDialog(
+      "KiCad schematic (*.kicad_sch)\0*.kicad_sch\0All files (*.*)\0*.*\0");
+  if (!path.empty())
+    ecadOpenPath(st, path);
+}
+
 // The headline integration: export the current board to STEP, then IMPORT it
 // into a live CAD part document shown in the 3D viewport — the starting point
 // for designing an enclosure/housing around the board with the existing
 // modeling + interference tools.
 void ecadTo3d(AppState &st) {
-  if (st.ecadDocId.empty()) {
-    st.toast(ui::ToastLevel::Warn, "Open an ECAD board first");
+  if (!ecadRequireKind(st, "pcb", "Board to 3D"))
     return;
-  }
   std::error_code ec;
   const std::string dir = appdataAppDir() + "/ecad_out";
   std::filesystem::create_directories(dir, ec);
@@ -562,18 +738,22 @@ void ecadAiDesign(AppState &st, const std::string &request) {
   nlohmann::json res;
   if (!ecadCall(st, "ecad_design", {{"request", request}}, res))
     return;
-  const std::string id = jstr(res, "doc_id");
-  if (id.empty()) {
-    st.toast(ui::ToastLevel::Warn, "AI design produced no document");
+  ecadReportWarnings(st, res, "AI design");
+  if (!ecadAddResponseTab(st, res, "AI Schematic"))
+    return;
+  st.markEcadTabDirty(st.ecadDocId);
+  const std::string recipe = jstr(res, "recipe_used");
+  if (!ecadResponseSucceeded(st, res, "AI design")) {
+    if (!recipe.empty())
+      st.addLog("[ecad] incomplete AI design used recipe=" + recipe);
     return;
   }
-  nlohmann::json tree;
-  if (ecadCall(st, "ecad_tree", {{"doc_id", id}}, tree))
-    ecadAdopt(st, tree);
-  const std::string recipe = jstr(res, "recipe_used");
+  st.wantFocusEcad = 6;
   st.toast(ui::ToastLevel::Info,
            recipe.empty() ? "AI design ready"
                           : ("AI design ready (recipe: " + recipe + ")"));
+  st.addLog("[ecad] AI design ready: " + st.ecadDocId +
+            (recipe.empty() ? std::string() : " recipe=" + recipe));
 }
 
 // One-click "AI Board": NL request -> AI designs a schematic -> a board is
@@ -589,37 +769,43 @@ void ecadAiBoard(AppState &st, const std::string &request) {
   st.toast(ui::ToastLevel::Info, "AI Board: designing \"" + request + "\" ...");
   st.addLog("[ecad] AI board: " + request);
 
-  // a. Design the schematic.
+  // a. Design and directly adopt the full schematic ops-response. The
+  // schematic remains available as its own real tab after the board is built.
   nlohmann::json res;
   if (!ecadCall(st, "ecad_design", {{"request", request}}, res))
     return;
-  const std::string schId = jstr(res, "doc_id");
-  if (schId.empty()) {
-    st.toast(ui::ToastLevel::Warn, "AI board: design produced no schematic");
+  ecadReportWarnings(st, res, "AI board schematic");
+  if (!ecadAddResponseTab(st, res, "AI Board Schematic"))
+    return;
+  st.markEcadTabDirty(st.ecadDocId);
+  if (!ecadResponseSucceeded(st, res, "AI board schematic")) {
+    const std::string recipe = jstr(res, "recipe_used");
+    if (!recipe.empty())
+      st.addLog("[ecad] incomplete AI board schematic used recipe=" + recipe);
     return;
   }
+  const std::string schId = st.ecadDocId;
   st.addLog("[ecad] AI board: schematic " + schId);
 
-  // b. New empty PCB doc (ecadAdopt tracks st.ecadDocId = pcbId + revision).
+  // b. Create and tab the empty board before adopting it, so the panel's
+  // per-document state resolver loads the response into the board tab.
   nlohmann::json pcbRes;
-  if (!ecadCall(st, "ecad_new", {{"kind", "pcb"}}, pcbRes))
+  if (!ecadCall(st, "ecad_new", {{"kind", "pcb"}}, pcbRes) ||
+      !ecadAddResponseTab(st, pcbRes, "AI Board"))
     return;
-  ecadAdopt(st, pcbRes);
   const std::string pcbId = st.ecadDocId;
-  if (pcbId.empty()) {
-    st.toast(ui::ToastLevel::Warn, "AI board: new board failed");
-    return;
-  }
 
-  // c. Populate the board from the schematic netlist (places footprints with
-  // bound nets). The
-  //    response carries the populated board tree -> adopt so the mirror has the
-  //    footprints.
+  // c. Populate the board from the schematic netlist and adopt that returned
+  // board response directly.
   nlohmann::json upd;
   if (!ecadCall(st, "ecad_update_from_sch",
                 {{"board_doc_id", pcbId}, {"sch_doc_id", schId}}, upd))
     return;
+  ecadReportWarnings(st, upd, "Update board");
+  if (!ecadResponseSucceeded(st, upd, "Update board"))
+    return;
   ecadAdopt(st, upd);
+  st.markEcadTabDirty(pcbId);
 
   // d. Auto-outline: axis-aligned bbox over every footprint pad's world
   // position (inflated by the
@@ -661,7 +847,8 @@ void ecadAiBoard(AppState &st, const std::string &request) {
       nlohmann::json ops = nlohmann::json::array();
       ops.push_back(
           {{"op", "pcb_set_outline"}, {"closed", true}, {"shapes", shapes}});
-      ecadApplyOps(st, ops); // adopts the result (tracks revision)
+      if (!ecadApplyOps(st, ops))
+        return;
       st.addLog("[ecad] AI board: outline " +
                 std::to_string((int)(maxX - minX)) + "x" +
                 std::to_string((int)(maxY - minY)) + "mm");
@@ -670,15 +857,15 @@ void ecadAiBoard(AppState &st, const std::string &request) {
     }
   }
 
-  // e. Autoroute the ratsnest.
+  // e. Autoroute the ratsnest and adopt the returned board response directly.
   nlohmann::json route;
-  if (ecadCall(st, "ecad_autoroute", {{"doc_id", pcbId}}, route))
-    ecadAdopt(st, route);
-
-  // f. Final tree refresh -> ensure the editor shows the finished board.
-  nlohmann::json tree;
-  if (ecadCall(st, "ecad_tree", {{"doc_id", pcbId}}, tree))
-    ecadAdopt(st, tree);
+  if (!ecadCall(st, "ecad_autoroute", {{"doc_id", pcbId}}, route))
+    return;
+  ecadReportWarnings(st, route, "Autoroute");
+  if (!ecadResponseSucceeded(st, route, "Autoroute"))
+    return;
+  ecadAdopt(st, route);
+  st.markEcadTabDirty(pcbId);
 
   st.wantFocusEcad = 6; // surface the ECAD tab so the routed board is visible
   st.toast(ui::ToastLevel::Info,
@@ -691,10 +878,8 @@ void ecadAiBoard(AppState &st, const std::string &request) {
 // results payload so the ECAD plot panel renders the waveforms. Only schematic
 // docs simulate.
 void ecadSimulate(AppState &st) {
-  if (st.ecadDocId.empty()) {
-    st.toast(ui::ToastLevel::Warn, "Open a schematic to simulate");
+  if (!ecadRequireKind(st, "sch", "Simulation"))
     return;
-  }
   nlohmann::json study;
   if (st.ecadSimAnalysis == 1) {
     study = {{"analyses",
@@ -743,14 +928,199 @@ void ecadSimulate(AppState &st) {
   }
 }
 
-// Route a PCB-tab ribbon command. New docs + doc-scoped analysis/exports run
-// now; geometry-placing ops need canvas-click placement / a PM form (logged so
-// they stay observable).
+struct EcadCommandDialogs {
+  bool aiPromptRequested = false;
+  bool sheetPropertiesRequested = false;
+  char aiRequest[1024]{};
+  char sheetName[256]{};
+  std::string sheetId;
+  float sheetW = 297.0f;
+  float sheetH = 210.0f;
+};
+
+EcadCommandDialogs &ecadCommandDialogs() {
+  static EcadCommandDialogs dialogs;
+  return dialogs;
+}
+
+void ecadRequestAiPrompt(AppState &st) {
+  auto &dialogs = ecadCommandDialogs();
+  std::snprintf(dialogs.aiRequest, sizeof(dialogs.aiRequest), "%s",
+                st.ecadAiRequest.c_str());
+  dialogs.aiPromptRequested = true;
+  st.wantFocusEcad = 6;
+}
+
+void ecadRequestSheetProperties(AppState &st) {
+  if (!ecadRequireKind(st, "sch", "Sheet properties"))
+    return;
+  const auto &mirror = ui::ecadEditorMirror();
+  const std::string active = mirror.activeSheet();
+  for (const auto &sheet : mirror.sheets()) {
+    if (sheet.id == active) {
+      auto &dialogs = ecadCommandDialogs();
+      dialogs.sheetId = sheet.id;
+      dialogs.sheetW = sheet.w;
+      dialogs.sheetH = sheet.h;
+      std::snprintf(dialogs.sheetName, sizeof(dialogs.sheetName), "%s",
+                    sheet.name.c_str());
+      dialogs.sheetPropertiesRequested = true;
+      return;
+    }
+  }
+  st.toast(ui::ToastLevel::Warn, "The active schematic has no editable sheet");
+}
+
+void ecadNewSheet(AppState &st) {
+  if (!ecadRequireKind(st, "sch", "New sheet"))
+    return;
+  const std::string name =
+      "Sheet " + std::to_string(ui::ecadEditorMirror().sheets().size() + 1);
+  if (!ecadApplyOps(
+          st, nlohmann::json::array(
+                  {{{"op", "sch_add_sheet"}, {"name", name}}})))
+    return;
+  auto &mirror = ui::ecadEditorMirror();
+  if (!mirror.sheets().empty())
+    mirror.setActiveSheet(mirror.sheets().back().id);
+  st.toast(ui::ToastLevel::Info, "Created " + name);
+  st.wantFocusEcad = 4;
+}
+
+void ecadUpdateBoardFromSchematic(AppState &st) {
+  int schTab = -1;
+  int boardTab = -1;
+  for (int i = (int)st.docTabs.size() - 1; i >= 0; --i) {
+    if (schTab < 0 &&
+        st.docTabs[i].kind == AppState::DocTab::TabKind::Schematic)
+      schTab = i;
+    if (boardTab < 0 && st.docTabs[i].kind == AppState::DocTab::TabKind::PCB)
+      boardTab = i;
+  }
+  if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+    if (st.docTabs[st.activeTab].kind ==
+        AppState::DocTab::TabKind::Schematic)
+      schTab = st.activeTab;
+    else if (st.docTabs[st.activeTab].kind ==
+             AppState::DocTab::TabKind::PCB)
+      boardTab = st.activeTab;
+  }
+  if (schTab < 0 || boardTab < 0) {
+    st.toast(ui::ToastLevel::Warn,
+             "Update Board requires an open schematic and board tab");
+    return;
+  }
+  const std::string schId = st.docTabs[schTab].ecadDocId;
+  const std::string boardId = st.docTabs[boardTab].ecadDocId;
+  if (st.activeTab != boardTab)
+    st.switchToTab(boardTab);
+  nlohmann::json res;
+  if (!ecadCall(st, "ecad_update_from_sch",
+                {{"sch_doc_id", schId}, {"board_doc_id", boardId}}, res))
+    return;
+  ecadReportWarnings(st, res, "Update board");
+  if (!ecadResponseSucceeded(st, res, "Update board"))
+    return;
+  ecadAdopt(st, res);
+  st.markEcadTabDirty(boardId);
+  st.toast(ui::ToastLevel::Info, "Board updated from schematic");
+  st.addLog("[ecad] updated board " + boardId + " from schematic " + schId);
+}
+
+void ecadArmPlacement(AppState &st, const char *kind, const char *docKind,
+                      const char *message) {
+  if (!ecadRequireKind(st, docKind, "Placement"))
+    return;
+  st.ecadTool = 1;
+  ui::ecadArmPlacement(kind);
+  st.wantFocusEcad = 4;
+  st.toast(ui::ToastLevel::Info, message);
+}
+
+void ecadDrawCommandDialogs(AppState &st) {
+  auto &dialogs = ecadCommandDialogs();
+  ImGuiViewport *vp = ImGui::GetMainViewport();
+  const ImVec2 center(vp->Pos.x + vp->Size.x * 0.5f,
+                      vp->Pos.y + vp->Size.y * 0.5f);
+
+  if (dialogs.aiPromptRequested) {
+    ImGui::OpenPopup("AI Schematic Design##ecad_ai_design");
+    dialogs.aiPromptRequested = false;
+  }
+  ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+  bool aiOpen = true;
+  if (ImGui::BeginPopupModal("AI Schematic Design##ecad_ai_design", &aiOpen,
+                             ImGuiWindowFlags_AlwaysAutoResize |
+                                 ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::TextUnformatted(
+        "Describe the circuit to create as a new schematic document.");
+    ImGui::InputTextMultiline(
+        "##ecad_ai_request", dialogs.aiRequest, sizeof(dialogs.aiRequest),
+        ImVec2(ui::metrics::px(520.0f), ui::metrics::px(120.0f)));
+    const bool empty = dialogs.aiRequest[0] == '\0';
+    if (empty)
+      ImGui::BeginDisabled();
+    if (ImGui::Button("Design schematic",
+                      ImVec2(ui::metrics::px(160.0f), 0.0f))) {
+      st.ecadAiRequest = dialogs.aiRequest;
+      st.ecadAiGo = true;
+      ImGui::CloseCurrentPopup();
+    }
+    if (empty)
+      ImGui::EndDisabled();
+    ImGui::SameLine(0.0f, ui::metrics::cpMenuRowGap());
+    if (ImGui::Button("Cancel", ImVec2(ui::metrics::px(88.0f), 0.0f)))
+      ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
+
+  if (dialogs.sheetPropertiesRequested) {
+    ImGui::OpenPopup("Sheet Properties##ecad_sheet_properties");
+    dialogs.sheetPropertiesRequested = false;
+  }
+  ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+  bool sheetOpen = true;
+  if (ImGui::BeginPopupModal("Sheet Properties##ecad_sheet_properties",
+                             &sheetOpen,
+                             ImGuiWindowFlags_AlwaysAutoResize |
+                                 ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::SetNextItemWidth(ui::metrics::px(320.0f));
+    ImGui::InputText("Name", dialogs.sheetName, sizeof(dialogs.sheetName));
+    ImGui::SetNextItemWidth(ui::metrics::px(160.0f));
+    ImGui::InputFloat("Width (mm)", &dialogs.sheetW, 0.0f, 0.0f, "%.2f");
+    ImGui::SetNextItemWidth(ui::metrics::px(160.0f));
+    ImGui::InputFloat("Height (mm)", &dialogs.sheetH, 0.0f, 0.0f, "%.2f");
+    const bool valid = dialogs.sheetName[0] != '\0' && dialogs.sheetW > 0.0f &&
+                       dialogs.sheetH > 0.0f;
+    if (!valid)
+      ImGui::BeginDisabled();
+    if (ImGui::Button("Apply", ImVec2(ui::metrics::px(96.0f), 0.0f))) {
+      const nlohmann::json ops = nlohmann::json::array(
+          {{{"op", "sch_edit_sheet"},
+            {"id", dialogs.sheetId},
+            {"name", dialogs.sheetName},
+            {"size", {dialogs.sheetW, dialogs.sheetH}}}});
+      if (ecadApplyOps(st, ops)) {
+        st.toast(ui::ToastLevel::Info, "Sheet properties updated");
+        ImGui::CloseCurrentPopup();
+      }
+    }
+    if (!valid)
+      ImGui::EndDisabled();
+    ImGui::SameLine(0.0f, ui::metrics::cpMenuRowGap());
+    if (ImGui::Button("Cancel", ImVec2(ui::metrics::px(88.0f), 0.0f)))
+      ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
+}
+
+// Route every ECAD ribbon command. Entity-placement commands arm the shared
+// canvas seam; document commands execute immediately.
 void ecadDispatch(AppState &st, const std::string &cmd) {
   if (cmd == "ecad_ai_design") {
-    st.wantFocusEcad = 6;
+    ecadRequestAiPrompt(st);
     return;
-  } // surface the AI launchpad
+  }
   if (cmd == "ecad_new_sch") {
     ecadNewDoc(st, "sch");
     return;
@@ -762,80 +1132,168 @@ void ecadDispatch(AppState &st, const std::string &cmd) {
   if (cmd == "ecad_open") {
     ecadOpenDoc(st);
     return;
-  } // Wave Y: open .ecad+/KiCad
+  }
   if (cmd == "ecad_save") {
     ecadSaveDoc(st);
     return;
-  } // Wave Y: save .ecad+
+  }
+  if (cmd == "sch_import_kicad") {
+    ecadImportKiCadSchematic(st);
+    return;
+  }
   if (cmd == "ecad_run_erc") {
-    ecadDocRpc(st, "ecad_rebuild", "ERC updated");
+    if (ecadRequireKind(st, "sch", "ERC"))
+      ecadDocRpc(st, "ecad_rebuild", "ERC updated");
     return;
   }
   if (cmd == "ecad_run_drc") {
-    ecadDocRpc(st, "ecad_rebuild", "DRC updated");
+    if (ecadRequireKind(st, "pcb", "DRC"))
+      ecadDocRpc(st, "ecad_rebuild", "DRC updated");
     return;
   }
   if (cmd == "ecad_simulate") {
-    st.ecadSimGo = true;
-    st.wantFocusEcad = 4;
+    if (ecadRequireKind(st, "sch", "Simulation")) {
+      st.ecadSimGo = true;
+      st.wantFocusEcad = 4;
+    }
     return;
   }
   if (cmd == "ecad_autoroute") {
-    ecadDocRpc(st, "ecad_autoroute", "Autoroute complete");
+    if (ecadRequireKind(st, "pcb", "Autoroute"))
+      ecadDocRpc(st, "ecad_autoroute", "Autoroute complete");
     return;
   }
   if (cmd == "ecad_fill_zones") {
-    ecadDocRpc(st, "ecad_fill_zones", "Copper zones filled");
+    if (ecadRequireKind(st, "pcb", "Fill zones"))
+      ecadDocRpc(st, "ecad_fill_zones", "Copper zones filled");
     return;
   }
   if (cmd == "ecad_to_3d") {
     ecadTo3d(st);
     return;
   }
+  if (cmd == "pcb_update_from_sch") {
+    ecadUpdateBoardFromSchematic(st);
+    return;
+  }
   if (cmd == "ecad_export_gerber") {
-    ecadExport(st, "gerber");
+    ecadExport(st, "gerber", "pcb");
     return;
   }
   if (cmd == "ecad_export_drill") {
-    ecadExport(st, "drill");
+    ecadExport(st, "drill", "pcb");
     return;
   }
   if (cmd == "ecad_export_bom") {
-    ecadExport(st, "bom");
+    ecadExport(st, "bom", "pcb");
+    return;
+  }
+  if (cmd == "sch_export_netlist") {
+    ecadExport(st, "netlist", "sch");
+    return;
+  }
+  if (cmd == "sch_export_bom") {
+    ecadExport(st, "bom", "sch");
+    return;
+  }
+  if (cmd == "sch_export_spice") {
+    ecadExport(st, "spice", "sch");
+    return;
+  }
+  if (cmd == "sch_export_kicad") {
+    ecadExport(st, "kicad", "sch");
+    return;
+  }
+  if (cmd == "sch_export_svg") {
+    ecadExport(st, "svg", "sch");
+    return;
+  }
+  if (cmd == "sch_export_pdf" || cmd == "sch_plot") {
+    ecadExport(st, "pdf", "sch");
     return;
   }
   if (cmd == "sch_annotate") {
-    if (st.ecadDocId.empty()) {
-      st.toast(ui::ToastLevel::Warn, "Open a schematic to annotate");
+    if (!ecadRequireKind(st, "sch", "Annotate"))
       return;
-    }
-    bool ok = ecadApplyOps(st, nlohmann::json::array({{{"op", "sch_annotate"},
-                                                       {"scope", "all"},
-                                                       {"mode", "reset"}}}));
+    const bool ok = ecadApplyOps(
+        st, nlohmann::json::array({{{"op", "sch_annotate"},
+                                    {"scope", "all"},
+                                    {"mode", "reset"}}}));
     if (ok) {
       st.toast(ui::ToastLevel::Info, "Schematic annotated");
       st.wantFocusEcad = 4;
     }
     return;
   }
-  // Canvas tool modes (Wave Q): place a part / route on click.
-  if (cmd == "sch_add_symbol" || cmd == "pcb_add_footprint") {
-    st.ecadTool = 1;
-    st.wantFocusEcad = 4;
-    st.toast(ui::ToastLevel::Info,
-             "Place tool: click the canvas to drop the part");
+  if (cmd == "sch_new_sheet") {
+    ecadNewSheet(st);
+    return;
+  }
+  if (cmd == "sch_sheet" || cmd == "sch_sheet_properties") {
+    ecadRequestSheetProperties(st);
+    return;
+  }
+  if (cmd == "sch_add_symbol") {
+    ecadArmPlacement(st, "symbol", "sch",
+                     "Place symbol: choose a part, then click the canvas");
+    return;
+  }
+  if (cmd == "sch_add_label") {
+    ecadArmPlacement(st, "label", "sch",
+                     "Place net label: click the canvas");
+    return;
+  }
+  if (cmd == "sch_add_power") {
+    ecadArmPlacement(st, "power", "sch",
+                     "Place power port: click the canvas");
+    return;
+  }
+  if (cmd == "sch_add_junction") {
+    ecadArmPlacement(st, "junction", "sch",
+                     "Place junction: click the canvas");
+    return;
+  }
+  if (cmd == "sch_add_no_connect") {
+    ecadArmPlacement(st, "no_connect", "sch",
+                     "Place no-connect: click a pin");
+    return;
+  }
+  if (cmd == "sch_add_text") {
+    ecadArmPlacement(st, "text", "sch",
+                     "Place schematic text: click the canvas");
+    return;
+  }
+  if (cmd == "sch_add_bus") {
+    ecadArmPlacement(st, "bus", "sch",
+                     "Place bus: click points; right-click to finish");
+    return;
+  }
+  if (cmd == "pcb_add_footprint") {
+    ecadArmPlacement(st, "footprint", "pcb",
+                     "Place footprint: click the canvas");
+    return;
+  }
+  if (cmd == "pcb_add_via") {
+    ecadArmPlacement(st, "via", "pcb", "Place via: click a routed net");
+    return;
+  }
+  if (cmd == "pcb_add_zone") {
+    ecadArmPlacement(st, "zone", "pcb",
+                     "Place copper zone: click polygon points");
     return;
   }
   if (cmd == "sch_add_wire" || cmd == "pcb_add_track") {
+    const char *kind = cmd == "sch_add_wire" ? "sch" : "pcb";
+    if (!ecadRequireKind(st, kind, "Route"))
+      return;
     st.ecadTool = 2;
     st.wantFocusEcad = 4;
     st.toast(ui::ToastLevel::Info,
              "Route tool: click points; Esc or right-click to finish");
     return;
   }
-  st.addLog("[ecad] " + cmd + " (interactive placement pending)");
-  st.toast(ui::ToastLevel::Info,
-           "ECAD: place/edit on the canvas (interactive tools coming)");
+  st.addLog("[warn] [ecad] unhandled command id: " + cmd);
+  st.toast(ui::ToastLevel::Warn, "Unhandled ECAD command: " + cmd);
 }
 
 } // namespace
@@ -5719,10 +6177,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           // loaded mirror (the 2nd symbol when present); for rotate this is s2
           // — the resistor we turned 90 deg.
           const auto &syms = ui::ecadEditorMirror().symbols();
+          // Selection tokens are "<kind>:<id>" with the frozen kind prefixes
+          // (sym/pin/wire/bus/…): the old short "s:" no longer matches.
           const std::string sel =
-              "s:" + (syms.size() >= 2
-                          ? syms[1].id
-                          : (syms.empty() ? std::string("s1") : syms[0].id));
+              "sym:" + (syms.size() >= 2
+                            ? syms[1].id
+                            : (syms.empty() ? std::string("s1") : syms[0].id));
           ui::ecadEditorSelect(sel);
           std::printf("[ecad-shot] selected %s (%d symbols)\n", sel.c_str(),
                       (int)syms.size());
@@ -6744,6 +7204,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // one body owner = no focus/z fights.
     if (webActive)
       ui::drawWebBrowserPanel(st);
+
+    // App-owned ECAD command dialogs remain reachable regardless of whether
+    // the editor is empty or already showing a document.
+    ecadDrawCommandDialogs(st);
 
     if (st.ecadAiGo) {
       st.ecadAiGo = false;

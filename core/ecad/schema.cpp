@@ -23,6 +23,10 @@ const std::set<std::string>& sheet_pin_shapes() {
     static const std::set<std::string> s{"input", "output", "bidirectional", "tri_state", "passive"};
     return s;
 }
+const std::set<std::string>& graphic_kinds() {
+    static const std::set<std::string> s{"line", "rect", "circle", "arc", "polyline"};
+    return s;
+}
 const std::set<std::string>& pin_types() {
     static const std::set<std::string> s{"input", "output", "bidirectional", "tri_state", "passive",
                                          "power_in", "power_out", "open_collector", "open_emitter",
@@ -64,9 +68,10 @@ const std::set<std::string>& zone_fills() {
 namespace {
 const std::map<std::string, std::string>& sch_prefixes() {
     static const std::map<std::string, std::string> m{
-        {"s", "symbols"}, {"w", "wires"}, {"j", "junctions"}, {"l", "labels"},
-        {"bus", "buses"}, {"pw", "power"}, {"nc", "no_connect"}, {"sh", "sheets"},
-        {"g", "graphics"}, {"hs", "sheet_symbols"}};
+        {"s", "symbols"},       {"w", "wires"},        {"j", "junctions"},
+        {"l", "labels"},        {"b", "buses"},        {"be", "bus_entries"},
+        {"p", "power"},         {"nc", "no_connect"},  {"sh", "sheets"},
+        {"tx", "texts"},        {"g", "graphics"},     {"ss", "sheet_symbols"}};
     return m;
 }
 const std::map<std::string, std::string>& pcb_prefixes() {
@@ -84,9 +89,13 @@ json new_schematic(const std::string& name) {
         {"sheets", json::array({json{{"id", "sh1"}, {"name", "root"}, {"parent", nullptr},
                                      {"size", json::array({297, 210})}, {"ports", json::array()}}})},
         {"symbols", json::array()}, {"wires", json::array()}, {"junctions", json::array()},
-        {"labels", json::array()}, {"buses", json::array()}, {"power", json::array()},
-        {"no_connect", json::array()}, {"graphics", json::array()}, {"sheet_symbols", json::array()},
+        {"labels", json::array()}, {"buses", json::array()}, {"bus_entries", json::array()},
+        {"power", json::array()}, {"no_connect", json::array()}, {"texts", json::array()},
+        {"graphics", json::array()}, {"sheet_symbols", json::array()},
         {"lib_cache", json::object()}, {"annotations", json::object()},
+        {"title_block", {{"title", ""}, {"company", ""}, {"rev", ""}, {"date", ""},
+                         {"comment1", ""}, {"comment2", ""}, {"comment3", ""},
+                         {"comment4", ""}, {"paper", "A4"}}},
     };
 }
 
@@ -208,6 +217,13 @@ bool is_xy(const json& v) {
     return v.is_array() && v.size() == 2 && v[0].is_number() && v[1].is_number();
 }
 
+std::string string_value(const json& object, const char* key,
+                         const std::string& fallback = std::string()) {
+    return object.is_object() && object.contains(key) && object[key].is_string()
+               ? object[key].get<std::string>()
+               : fallback;
+}
+
 void check_ids(const json& items, const std::string& prefix, const std::string& loc,
                std::vector<std::string>& errs) {
     std::set<std::string> seen;
@@ -221,7 +237,7 @@ void check_ids(const json& items, const std::string& prefix, const std::string& 
             ++i;
             continue;
         }
-        std::string oid = it.value("id", std::string());
+        const std::string oid = string_value(it, "id");
         bool has_id = it.contains("id") && it["id"].is_string();
         if (!has_id || !std::regex_match(oid, pat)) {
             errs.push_back(li + ".id: missing or bad prefix (want " + prefix + "<n>) got '" + oid + "'");
@@ -241,38 +257,165 @@ std::vector<std::string> validate_schematic(const json& doc) {
         return {std::string("schema: expected '") + kSchemaSch + "' got '" +
                 doc.value("schema", std::string()) + "'"};
     if (!(doc.contains("id") && doc["id"].is_string())) errs.push_back("id: missing");
+
     json cache = doc.contains("lib_cache") ? doc["lib_cache"] : json::object();
     if (!cache.is_object()) {
         errs.push_back("lib_cache: must be an object");
         cache = json::object();
     }
-
     auto get = [&](const char* k) { return doc.contains(k) ? doc[k] : json::array(); };
+    const std::vector<std::string> array_keys{
+        "sheets",       "symbols",       "wires",       "junctions",
+        "labels",       "buses",         "bus_entries", "power",
+        "no_connect",   "texts",         "graphics",    "sheet_symbols"};
+    for (const std::string& key : array_keys)
+        if (doc.contains(key) && !doc[key].is_array())
+            errs.push_back(key + ": must be a list");
+    if (!doc.contains("sheets") || !doc["sheets"].is_array() || doc["sheets"].empty())
+        errs.push_back("sheets: must contain at least one sheet");
+    if (doc.contains("annotations") && !doc["annotations"].is_object())
+        errs.push_back("annotations: must be an object");
+    if (doc.contains("annotations") && doc["annotations"].is_object() &&
+        doc["annotations"].contains("next_ref") &&
+        !doc["annotations"]["next_ref"].is_object())
+        errs.push_back("annotations.next_ref: must be an object");
+
     check_ids(get("symbols"), "s", "symbols", errs);
     check_ids(get("wires"), "w", "wires", errs);
     check_ids(get("junctions"), "j", "junctions", errs);
     check_ids(get("labels"), "l", "labels", errs);
-    check_ids(get("power"), "pw", "power", errs);
+    check_ids(get("buses"), "b", "buses", errs);
+    check_ids(get("bus_entries"), "be", "bus_entries", errs);
+    check_ids(get("power"), "p", "power", errs);
     check_ids(get("no_connect"), "nc", "no_connect", errs);
-    check_ids(get("sheet_symbols"), "hs", "sheet_symbols", errs);
+    check_ids(get("texts"), "tx", "texts", errs);
+    check_ids(get("graphics"), "g", "graphics", errs);
+    check_ids(get("sheets"), "sh", "sheets", errs);
+    check_ids(get("sheet_symbols"), "ss", "sheet_symbols", errs);
 
-    std::map<std::string, std::string> refs_seen;
+    std::set<std::string> sheet_ids;
+    if (get("sheets").is_array()) {
+        int i = 0;
+        for (const json& sheet : get("sheets")) {
+            const std::string loc = "sheets[" + std::to_string(i) + "]";
+            if (!sheet.is_object()) {
+                ++i;
+                continue;
+            }
+            const std::string id = string_value(sheet, "id");
+            if (!id.empty()) sheet_ids.insert(id);
+            if (!(sheet.contains("name") && sheet["name"].is_string()) ||
+                string_value(sheet, "name").empty())
+                errs.push_back(loc + ".name: required non-empty string");
+            if (!is_xy(sheet.contains("size") ? sheet["size"] : json()) ||
+                (is_xy(sheet.contains("size") ? sheet["size"] : json()) &&
+                 (sheet["size"][0].get<double>() <= 0.0 || sheet["size"][1].get<double>() <= 0.0)))
+                errs.push_back(loc + ".size: must be positive [width,height]");
+            if (sheet.contains("ports")) {
+                if (!sheet["ports"].is_array()) {
+                    errs.push_back(loc + ".ports: must be a list");
+                } else {
+                    int port_index = 0;
+                    for (const json& port : sheet["ports"]) {
+                        const std::string ploc =
+                            loc + ".ports[" + std::to_string(port_index) + "]";
+                        if (!port.is_object()) {
+                            errs.push_back(ploc + ": not an object");
+                            ++port_index;
+                            continue;
+                        }
+                        if (!(port.contains("name") && port["name"].is_string()) ||
+                            string_value(port, "name").empty())
+                            errs.push_back(ploc + ".name: required non-empty string");
+                        const std::string type = string_value(port, "type", "passive");
+                        if (!sheet_pin_shapes().count(type))
+                            errs.push_back(ploc + ".type: bad value '" + type + "'");
+                        if (!is_xy(port.contains("pos") ? port["pos"] : json()))
+                            errs.push_back(ploc + ".pos: must be [x,y]");
+                        ++port_index;
+                    }
+                }
+            }
+            ++i;
+        }
+    }
+    if (get("sheets").is_array()) {
+        std::map<std::string, std::string> parents;
+        int i = 0;
+        for (const json& sheet : get("sheets")) {
+            if (!sheet.is_object()) {
+                ++i;
+                continue;
+            }
+            const std::string id = string_value(sheet, "id");
+            if (sheet.contains("parent") && !sheet["parent"].is_null()) {
+                if (!sheet["parent"].is_string()) {
+                    errs.push_back("sheets[" + std::to_string(i) + "].parent: must be a sheet id or null");
+                } else {
+                    const std::string parent = sheet["parent"].get<std::string>();
+                    if (!sheet_ids.count(parent))
+                        errs.push_back("sheets[" + std::to_string(i) + "].parent: '" + parent +
+                                       "' not a known sheet id");
+                    parents[id] = parent;
+                }
+            }
+            ++i;
+        }
+        for (const auto& [id, parent] : parents) {
+            std::set<std::string> seen{id};
+            std::string cur = parent;
+            while (!cur.empty() && parents.count(cur)) {
+                if (!seen.insert(cur).second) {
+                    errs.push_back("sheets: parent cycle involving '" + id + "'");
+                    break;
+                }
+                cur = parents[cur];
+            }
+            if (!cur.empty() && !seen.insert(cur).second)
+                errs.push_back("sheets: parent cycle involving '" + id + "'");
+        }
+    }
+
+    auto check_sheet = [&](const json& item, const std::string& loc) {
+        const std::string sheet = string_value(item, "sheet");
+        if (!(item.contains("sheet") && item["sheet"].is_string()) || !sheet_ids.count(sheet))
+            errs.push_back(loc + ".sheet: '" + sheet + "' not a known sheet id");
+    };
+
+    struct RefUse {
+        int unit;
+        std::string libid;
+        std::string loc;
+    };
+    std::map<std::string, std::vector<RefUse>> refs_seen;
     if (get("symbols").is_array()) {
         int i = 0;
         for (const json& s : get("symbols")) {
-            std::string loc = "symbols[" + std::to_string(i) + "]";
-            std::string libid = s.value("libid", std::string());
+            const std::string loc = "symbols[" + std::to_string(i) + "]";
+            if (!s.is_object()) {
+                ++i;
+                continue;
+            }
+            const std::string libid = string_value(s, "libid");
             if (!cache.contains(libid))
                 errs.push_back(loc + ".libid: '" + libid + "' not in lib_cache");
             if (!is_xy(s.contains("pos") ? s["pos"] : json()))
                 errs.push_back(loc + ".pos: must be [x,y]");
-            std::string mir = s.value("mirror", std::string("none"));
+            check_sheet(s, loc);
+            const std::string mir = string_value(s, "mirror", "none");
             if (!sym_mirror().count(mir)) errs.push_back(loc + ".mirror: bad value '" + mir + "'");
-            std::string ref = s.value("ref", std::string());
+            const int unit = s.contains("unit") && s["unit"].is_number_integer()
+                                 ? s["unit"].get<int>()
+                                 : 1;
+            if (unit < 1) errs.push_back(loc + ".unit: must be >=1");
+            const std::string ref = string_value(s, "ref");
             if (!ref.empty() && ref.back() != '?') {
-                if (refs_seen.count(ref))
-                    errs.push_back(loc + ".ref: duplicate '" + ref + "' (also " + refs_seen[ref] + ")");
-                refs_seen[ref] = loc;
+                for (const RefUse& prior : refs_seen[ref])
+                    if (prior.unit == unit || prior.libid != libid) {
+                        errs.push_back(loc + ".ref: duplicate '" + ref + "' (also " + prior.loc + ")");
+                        break;
+                    }
+                refs_seen[ref].push_back({unit, libid, loc});
             }
             ++i;
         }
@@ -281,10 +424,31 @@ std::vector<std::string> validate_schematic(const json& doc) {
     if (get("wires").is_array()) {
         int i = 0;
         for (const json& w : get("wires")) {
+            const std::string loc = "wires[" + std::to_string(i) + "]";
+            if (!w.is_object()) {
+                ++i;
+                continue;
+            }
             const json& pts = w.contains("pts") ? w["pts"] : json();
             bool ok = pts.is_array() && pts.size() >= 2;
             if (ok) for (const json& p : pts) ok = ok && is_xy(p);
-            if (!ok) errs.push_back("wires[" + std::to_string(i) + "].pts: need >=2 [x,y] points");
+            if (!ok) errs.push_back(loc + ".pts: need >=2 [x,y] points");
+            if (w.contains("bus") && !w["bus"].is_boolean())
+                errs.push_back(loc + ".bus: must be boolean");
+            check_sheet(w, loc);
+            ++i;
+        }
+    }
+
+    if (get("junctions").is_array()) {
+        int i = 0;
+        for (const json& junction : get("junctions")) {
+            const std::string loc = "junctions[" + std::to_string(i) + "]";
+            if (junction.is_object()) {
+                if (!is_xy(junction.contains("pos") ? junction["pos"] : json()))
+                    errs.push_back(loc + ".pos: must be [x,y]");
+                check_sheet(junction, loc);
+            }
             ++i;
         }
     }
@@ -292,12 +456,76 @@ std::vector<std::string> validate_schematic(const json& doc) {
     if (get("labels").is_array()) {
         int i = 0;
         for (const json& lb : get("labels")) {
-            std::string scope = lb.value("scope", std::string("local"));
+            const std::string loc = "labels[" + std::to_string(i) + "]";
+            if (!lb.is_object()) {
+                ++i;
+                continue;
+            }
+            const std::string scope = string_value(lb, "scope", "local");
             if (!label_scopes().count(scope))
-                errs.push_back("labels[" + std::to_string(i) + "].scope: bad value '" + scope + "'");
-            std::string text = lb.value("text", std::string());
+                errs.push_back(loc + ".scope: bad value '" + scope + "'");
+            const std::string text = string_value(lb, "text");
             if (!(lb.contains("text") && lb["text"].is_string()) || text.empty())
-                errs.push_back("labels[" + std::to_string(i) + "].text: required non-empty string");
+                errs.push_back(loc + ".text: required non-empty string");
+            if (!is_xy(lb.contains("pos") ? lb["pos"] : json()))
+                errs.push_back(loc + ".pos: must be [x,y]");
+            check_sheet(lb, loc);
+            ++i;
+        }
+    }
+
+    std::set<std::string> bus_names;
+    if (get("buses").is_array()) {
+        int i = 0;
+        for (const json& bus : get("buses")) {
+            const std::string loc = "buses[" + std::to_string(i) + "]";
+            if (!bus.is_object()) {
+                ++i;
+                continue;
+            }
+            const std::string name = string_value(bus, "name");
+            if (!(bus.contains("name") && bus["name"].is_string()) || name.empty())
+                errs.push_back(loc + ".name: required non-empty string");
+            else if (!bus_names.insert(name).second)
+                errs.push_back(loc + ".name: duplicate '" + name + "'");
+            const json& pts = bus.contains("pts") ? bus["pts"] : json();
+            bool ok = pts.is_array() && pts.size() >= 2;
+            if (ok) for (const json& p : pts) ok = ok && is_xy(p);
+            if (!ok) errs.push_back(loc + ".pts: need >=2 [x,y] points");
+            if (bus.contains("members")) {
+                if (!bus["members"].is_array()) {
+                    errs.push_back(loc + ".members: must be a list");
+                } else {
+                    for (const json& member : bus["members"])
+                        if (!member.is_string()) {
+                            errs.push_back(loc + ".members: values must be strings");
+                            break;
+                        }
+                }
+            }
+            check_sheet(bus, loc);
+            ++i;
+        }
+    }
+    if (get("bus_entries").is_array()) {
+        int i = 0;
+        for (const json& entry : get("bus_entries")) {
+            const std::string loc = "bus_entries[" + std::to_string(i) + "]";
+            if (entry.is_object()) {
+                if (!is_xy(entry.contains("pos") ? entry["pos"] : json()))
+                    errs.push_back(loc + ".pos: must be [x,y]");
+                if (!is_xy(entry.contains("size") ? entry["size"] : json()))
+                    errs.push_back(loc + ".size: must be [x,y]");
+                if (entry.contains("bus") && !entry["bus"].is_null()) {
+                    if (!entry["bus"].is_string() ||
+                        !bus_names.count(entry.value("bus", std::string())))
+                        errs.push_back(loc + ".bus: must name an existing bus");
+                }
+                if (entry.contains("member") && !entry["member"].is_null() &&
+                    !entry["member"].is_string())
+                    errs.push_back(loc + ".member: must be a string");
+                check_sheet(entry, loc);
+            }
             ++i;
         }
     }
@@ -305,52 +533,118 @@ std::vector<std::string> validate_schematic(const json& doc) {
     if (get("power").is_array()) {
         int i = 0;
         for (const json& p : get("power")) {
-            std::string net = p.value("net", std::string());
-            if (net.empty()) errs.push_back("power[" + std::to_string(i) + "].net: required non-empty");
+            const std::string loc = "power[" + std::to_string(i) + "]";
+            if (p.is_object()) {
+                const std::string net = string_value(p, "net");
+                if (net.empty()) errs.push_back(loc + ".net: required non-empty");
+                if (!is_xy(p.contains("pos") ? p["pos"] : json()))
+                    errs.push_back(loc + ".pos: must be [x,y]");
+                check_sheet(p, loc);
+            }
+            ++i;
+        }
+    }
+    if (get("no_connect").is_array()) {
+        int i = 0;
+        for (const json& nc : get("no_connect")) {
+            const std::string loc = "no_connect[" + std::to_string(i) + "]";
+            if (nc.is_object()) {
+                if (!is_xy(nc.contains("pos") ? nc["pos"] : json()))
+                    errs.push_back(loc + ".pos: must be [x,y]");
+                check_sheet(nc, loc);
+            }
+            ++i;
+        }
+    }
+    if (get("texts").is_array()) {
+        int i = 0;
+        for (const json& text : get("texts")) {
+            const std::string loc = "texts[" + std::to_string(i) + "]";
+            if (text.is_object()) {
+                if (!(text.contains("text") && text["text"].is_string()))
+                    errs.push_back(loc + ".text: must be a string");
+                if (!is_xy(text.contains("pos") ? text["pos"] : json()))
+                    errs.push_back(loc + ".pos: must be [x,y]");
+                if (!text.contains("size") || !text["size"].is_number() ||
+                    text["size"].get<double>() <= 0.0)
+                    errs.push_back(loc + ".size: must be positive");
+                if (text.contains("angle") && !text["angle"].is_number())
+                    errs.push_back(loc + ".angle: must be numeric");
+                check_sheet(text, loc);
+            }
+            ++i;
+        }
+    }
+    if (get("graphics").is_array()) {
+        int i = 0;
+        for (const json& graphic : get("graphics")) {
+            const std::string loc = "graphics[" + std::to_string(i) + "]";
+            if (!graphic.is_object()) {
+                ++i;
+                continue;
+            }
+            const std::string kind = graphic.value("kind", std::string());
+            if (!graphic_kinds().count(kind))
+                errs.push_back(loc + ".kind: bad value '" + kind + "'");
+            const json& pts = graphic.contains("pts") ? graphic["pts"] : json();
+            const std::size_t min_pts = kind == "line" || kind == "rect" || kind == "polyline" ? 2 : 1;
+            bool ok = pts.is_array() && pts.size() >= min_pts;
+            if (ok) for (const json& p : pts) ok = ok && is_xy(p);
+            if (!ok) errs.push_back(loc + ".pts: insufficient [x,y] points for " + kind);
+            if ((kind == "circle" || kind == "arc") &&
+                (!graphic.contains("radius") || !graphic["radius"].is_number() ||
+                 graphic["radius"].get<double>() <= 0.0))
+                errs.push_back(loc + ".radius: required positive number for " + kind);
+            if (graphic.contains("width") &&
+                (!graphic["width"].is_number() || graphic["width"].get<double>() < 0.0))
+                errs.push_back(loc + ".width: must be non-negative");
+            if (graphic.contains("filled") && !graphic["filled"].is_boolean())
+                errs.push_back(loc + ".filled: must be boolean");
+            check_sheet(graphic, loc);
             ++i;
         }
     }
 
-    // hierarchical sheet symbols
-    std::set<std::string> sheet_ids;
-    if (get("sheets").is_array())
-        for (const json& s : get("sheets"))
-            if (s.is_object()) sheet_ids.insert(s.value("id", std::string()));
     if (get("sheet_symbols").is_array()) {
         int i = 0;
-        for (const json& hs : get("sheet_symbols")) {
-            std::string loc = "sheet_symbols[" + std::to_string(i) + "]";
-            std::string child = hs.value("child", std::string());
-            if (!(hs.contains("child") && hs["child"].is_string()) || child.empty())
+        for (const json& ss : get("sheet_symbols")) {
+            const std::string loc = "sheet_symbols[" + std::to_string(i) + "]";
+            if (!ss.is_object()) {
+                ++i;
+                continue;
+            }
+            const std::string child = string_value(ss, "child");
+            if (!(ss.contains("child") && ss["child"].is_string()) || child.empty())
                 errs.push_back(loc + ".child: required (id of the instantiated child sheet)");
-            else if (!sheet_ids.empty() && !sheet_ids.count(child))
+            else if (!sheet_ids.count(child))
                 errs.push_back(loc + ".child: '" + child + "' not a known sheet id");
-            if (!is_xy(hs.contains("pos") ? hs["pos"] : json()))
+            if (!is_xy(ss.contains("pos") ? ss["pos"] : json()))
                 errs.push_back(loc + ".pos: must be [x,y]");
+            if (ss.contains("size") && !is_xy(ss["size"]))
+                errs.push_back(loc + ".size: must be [x,y]");
+            check_sheet(ss, loc);
             std::set<std::string> pin_names;
-            json pins = hs.contains("pins") ? hs["pins"] : json::array();
+            json pins = ss.contains("pins") ? ss["pins"] : json::array();
             if (!pins.is_array()) {
                 errs.push_back(loc + ".pins: must be a list");
                 pins = json::array();
             }
             int j = 0;
             for (const json& pn : pins) {
-                std::string ploc = loc + ".pins[" + std::to_string(j) + "]";
+                const std::string ploc = loc + ".pins[" + std::to_string(j) + "]";
                 if (!pn.is_object()) {
                     errs.push_back(ploc + ": not an object");
                     ++j;
                     continue;
                 }
-                std::string nm = pn.value("name", std::string());
+                const std::string nm = string_value(pn, "name");
                 if (!(pn.contains("name") && pn["name"].is_string()) || nm.empty())
                     errs.push_back(ploc + ".name: required non-empty string");
-                else if (pin_names.count(nm))
+                else if (!pin_names.insert(nm).second)
                     errs.push_back(ploc + ".name: duplicate '" + nm + "' on this sheet symbol");
-                else
-                    pin_names.insert(nm);
                 if (!is_xy(pn.contains("pos") ? pn["pos"] : json()))
                     errs.push_back(ploc + ".pos: must be [x,y]");
-                std::string shape = pn.value("shape", std::string("passive"));
+                const std::string shape = string_value(pn, "shape", "passive");
                 if (!sheet_pin_shapes().count(shape))
                     errs.push_back(ploc + ".shape: bad value '" + shape + "'");
                 ++j;
@@ -359,7 +653,17 @@ std::vector<std::string> validate_schematic(const json& doc) {
         }
     }
 
-    // embedded symbol defs (pins)
+    if (doc.contains("title_block")) {
+        if (!doc["title_block"].is_object()) {
+            errs.push_back("title_block: must be an object");
+        } else {
+            for (const char* key : {"title", "company", "rev", "date", "comment1",
+                                    "comment2", "comment3", "comment4", "paper"})
+                if (doc["title_block"].contains(key) && !doc["title_block"][key].is_string())
+                    errs.push_back(std::string("title_block.") + key + ": must be a string");
+        }
+    }
+
     for (auto it = cache.begin(); it != cache.end(); ++it) {
         const std::string& libid = it.key();
         const json& sdef = it.value();
@@ -370,9 +674,11 @@ std::vector<std::string> validate_schematic(const json& doc) {
         if (sdef.contains("pins") && sdef["pins"].is_array()) {
             int j = 0;
             for (const json& pin : sdef["pins"]) {
-                std::string ploc = "lib_cache[" + libid + "].pins[" + std::to_string(j) + "]";
-                std::string type = pin.value("type", std::string("passive"));
-                if (!pin_types().count(type)) errs.push_back(ploc + ".type: bad value '" + type + "'");
+                const std::string ploc =
+                    "lib_cache[" + libid + "].pins[" + std::to_string(j) + "]";
+                const std::string type = string_value(pin, "type", "passive");
+                if (!pin_types().count(type))
+                    errs.push_back(ploc + ".type: bad value '" + type + "'");
                 if (!is_xy(pin.contains("pos") ? pin["pos"] : json()))
                     errs.push_back(ploc + ".pos: must be [x,y]");
                 if (pin.contains("number") && !pin["number"].is_string())

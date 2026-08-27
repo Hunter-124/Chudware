@@ -37,14 +37,34 @@ bool ecad_close(const std::string& doc_id);
 nlohmann::json ecad_swap_doc(const std::string& doc_id, const nlohmann::json& new_doc,
                              long base_revision, const nlohmann::json& warnings);
 
-// ecad_describe {doc_id} -> minimal summary (the fallback the Python rpc builds
-// when engine.ecad.describe is absent).
-nlohmann::json ecad_describe(const std::string& doc_id);
+// ecad_describe {doc_id, budget?} -> a compact but honest design summary for the AI:
+// counts per entity kind, sheet list, net table (bounded by `budget` characters,
+// default 4000), ERC/DRC severity tallies and the top violations. Never claims a
+// clean design when the compile could not run.
+nlohmann::json ecad_describe(const std::string& doc_id, long budget);
 
-// ecad_save {doc_id, path?} -> {"path": <final path>}. Writes the open session's
-// document as a .ecad+ ZIP container (engine/ecad/rpc.py::_ecad_save +
-// engine/ecad/formats.save). Uses the session's current path when `path` is empty;
-// throws OpError("io_error") if neither is available.
+// ecad_resolve_pick {doc_id, xy, kinds?, tol?, layer?} -> {"selector": {...}} naming the
+// topmost entity under a canvas point (schematic: pin > symbol > junction > label >
+// power > no_connect > bus_entry > wire > bus > text > graphic > sheet_symbol;
+// board: pad > via > track > zone > footprint). `selector` is null when nothing hits.
+nlohmann::json ecad_resolve_pick(const std::string& doc_id, const nlohmann::json& xy,
+                                 const nlohmann::json& kinds, double tol,
+                                 const std::string& layer);
+
+// ecad_design {request, name?} -> ops-response + "doc_id" + "recipe_used" + "design".
+// Picks the closest deterministic recipe (ecad/recipes.h), then COMPILES it into a real
+// schematic document: symbols placed on a 2.54 mm grid from the native symbol library,
+// pin stubs, net labels, and power ports for supply nets. The produced document is a
+// normal session (undoable, netlist-compiled, ERC-checked) — not an abstract dict.
+nlohmann::json ecad_design(const std::string& request, const std::string& name);
+
+// ecad_save {doc_id, path?} -> {"path", "format":"ecad+", "source_path"?}. Writes the
+// open session's document as a .ecad+ ZIP container. Uses the session's NATIVE path
+// when `path` is empty; throws OpError("io_error") if neither is available.
+// FOREIGN-SOURCE SAFETY: a session opened from a .kicad_sch/.kicad_pcb keeps that file
+// in `source_path` and never uses it as the native save target — a pathless Save writes
+// the sibling "<stem>.ecad+" instead, so imported KiCad bytes can never be overwritten
+// with a ZIP container. Use ecad_export(kind="kicad") to write KiCad text back out.
 nlohmann::json ecad_save(const std::string& doc_id, const std::string& path);
 
 // ecad_open {path} -> ops-response + "doc_id" + "warnings". Opens a .ecad+ container
@@ -81,13 +101,19 @@ nlohmann::json ecad_dfm(const std::string& doc_id, const nlohmann::json& rules);
 // Stateless variant: run DFM over an inline board doc (parity harness path).
 nlohmann::json ecad_dfm_board(const nlohmann::json& board, const nlohmann::json& rules);
 
-// ecad_export {kind, board|doc_id, opts?} -> fabrication output.
-//   kind: "gerber" | "drill" | "bom" | "cpl"  (pcb only)
-// Returns {"files": {<logical-key>: <file-text>}} where the logical key is the
-// gerber layer_id ("F.Cu", ...), "pth"/"npth" for drill, or "bom"/"cpl" for the
-// single-file CSV/JSON outputs. A stateless `board` (parity-harness path) takes
-// precedence over `doc_id`. Throws OpError("invalid_op") for non-pcb docs or
-// unknown kinds. The file CONTENT is byte-identical to engine/ecad/fab/*.
+// ecad_export {kind, board|doc_id, path?, opts?} -> exported files.
+//   pcb kinds: "gerber" | "drill" | "cpl" | "bom"
+//   sch kinds: "netlist" | "bom" | "spice" | "kicad" | "svg" | "pdf"
+// Returns {"files": {<logical-key>: <file-text>}, "paths": [<written path>, ...]}.
+// `files` keeps the in-memory text so a remote/MCP caller can write it itself; when
+// `path` is given the files are ALSO written here: a directory path (or one that does
+// not look like a file) receives one conventionally-named file per key, a file path
+// receives the single output directly. The logical key is the gerber layer_id
+// ("F.Cu", ...), "pth"/"npth" for drill, "bom"/"cpl"/"netlist"/"spice"/"kicad" for the
+// single-file outputs, or "<sheet-id>" for the per-sheet svg pages. A stateless `board`
+// (parity-harness path) takes precedence over `doc_id`. Throws OpError("invalid_op")
+// when the kind does not match the document kind, or for an unknown kind. PCB file
+// CONTENT stays byte-identical to engine/ecad/fab/*.
 nlohmann::json ecad_export(const nlohmann::json& params);
 
 // ecad_impedance {mode, ...geom} -> the impedance.cpp calculator result.

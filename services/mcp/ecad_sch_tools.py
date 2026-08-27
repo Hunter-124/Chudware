@@ -1,5 +1,9 @@
-"""ECAD schematic MCP tools (T-RF8 split of ecad_tools.py): ecad_new_schematic, find_part, place_symbol, wire, add_power, label, status, run_erc, update_from_sch."""
+"""ECAD schematic authoring, edit, bus, readback, plot, and interchange MCP tools."""
 from __future__ import annotations
+
+import json
+import os
+from typing import Any, Union
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 
@@ -11,6 +15,7 @@ from .ecad_common import (
     _attach_schematic_ascii_readback,
     _compile_of,
     _component_eng,
+    _default_out_dir,
     _dumps,
     _erc_lines,
     _erc_summary,
@@ -29,9 +34,8 @@ from .ecad_common import (
     lib_search,
     netlist_mod,
 )
-from typing import Any, Union
 
-from .cad_common import coerce_json_or_repr, require_list
+from .cad_common import coerce_json_or_repr, require_list, require_mapping
 
 # ------------------------------------------------------- model-dialect normalizers (boundary)
 # ecad_place_symbol/ecad_wire used to accept exactly ONE rigid argument shape while their
@@ -407,8 +411,159 @@ def _place_specs(libid: Any, x: Any, y: Any, ref: Any, value: Any, angle: Any,
 #     is actionable rather than a dead end.
 _SUBSTITUTABLE_MAX_PINS = 3
 
+_INLINE_TEXT_LIMIT = 65536
+
+
+def _net_signature(netlist: dict) -> dict[str, tuple[str, ...]]:
+    """Stable net membership signature used for compact mutation deltas."""
+    out: dict[str, tuple[str, ...]] = {}
+    for name, members in (netlist.get("nets") or {}).items():
+        pins = sorted(f"{m.get('ref', '?')}.{m.get('pin', '?')}"
+                      for m in members if isinstance(m, dict))
+        out[str(name)] = tuple(pins)
+    return out
+
+
+def _erc_violations(compile_field: Any) -> list[dict] | None:
+    """ERC list from an ecad compile field, or None when the field is unavailable."""
+    if not isinstance(compile_field, dict) or "erc" not in compile_field:
+        return None
+    value = compile_field.get("erc")
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict) and isinstance(value.get("violations"), list):
+        return value["violations"]
+    return []
+
+
+def _apply_schematic_tool(session, op: dict, *, action: str,
+                          focus: list[float] | None = None,
+                          extra: dict | None = None,
+                          next_actions: list[str] | None = None) -> dict:
+    """Apply one schematic op and attach deterministic net/ERC deltas plus ASCII readback."""
+    readback_warnings: list[str] = []
+    try:
+        before_nl = netlist_mod.build_netlist(session.doc)
+        before_sig = _net_signature(before_nl)
+    except Exception as e:  # noqa: BLE001 — readback must never block the requested mutation
+        before_sig = {}
+        readback_warnings.append(
+            f"pre-mutation net readback unavailable: {type(e).__name__}: {e}")
+    before_erc = _erc_violations(session.last_compile)
+    resp = _apply(session, [op])
+    readback_warnings.extend(resp.get("warnings") or [])
+    try:
+        after_nl = netlist_mod.build_netlist(session.doc)
+        after_sig = _net_signature(after_nl)
+        unconnected = _unconnected_pins(session.doc, after_nl)
+    except Exception as e:  # noqa: BLE001 — mutation succeeded; surface degraded readback
+        after_nl = {}
+        after_sig = {}
+        unconnected = []
+        readback_warnings.append(
+            f"post-mutation net readback unavailable: {type(e).__name__}: {e}")
+    after_erc = _erc_violations(session.last_compile)
+    erc_error = ""
+    if after_erc is None:
+        try:
+            after_erc = _erc_violations(_compile_of(session))
+        except Exception as e:  # noqa: BLE001 — mutation succeeded; readback is best-effort
+            erc_error = f"ERC readback unavailable: {type(e).__name__}: {e}"
+            readback_warnings.append(erc_error)
+
+    added = sorted(set(after_sig) - set(before_sig))
+    removed = sorted(set(before_sig) - set(after_sig))
+    changed = sorted(name for name in set(before_sig) & set(after_sig)
+                     if before_sig[name] != after_sig[name])
+    before_erc_summary = _erc_summary(before_erc or [])
+    after_erc_summary = _erc_summary(after_erc or [])
+    payload: dict = {
+        "ok": True,
+        "doc_id": session.doc_id,
+        "revision": session.revision,
+        "action": action,
+        "net_readback": {
+            "net_count": len(after_sig),
+            "unconnected_count": len(unconnected),
+            "unconnected_pins": [_pretty_pin(p) for p in unconnected[:12]],
+            "delta": {
+                "added": added[:20],
+                "removed": removed[:20],
+                "changed": changed[:20],
+                "truncated": any(len(v) > 20 for v in (added, removed, changed)),
+            },
+        },
+        "erc_available": after_erc is not None,
+        "erc": after_erc_summary,
+        "erc_delta": {
+            "errors": (after_erc_summary["errors"] - before_erc_summary["errors"]
+                       if after_erc is not None else None),
+            "warnings": (after_erc_summary["warnings"] - before_erc_summary["warnings"]
+                         if after_erc is not None else None),
+        },
+        "warnings": readback_warnings,
+        "hint": (f"{action} applied. Read net_readback and erc_delta before the next edit."
+                 + (f" {erc_error}" if erc_error else "")),
+        "next_actions": next_actions or [
+            "render_schematic_ascii()  # inspect the changed sheet",
+            "ecad_lint_schematic()  # check drawing geometry",
+            "ecad_run_erc()  # check electrical rules",
+        ],
+    }
+    created_id = (resp.get("id_map") or {}).get("$0")
+    if created_id:
+        payload["id"] = created_id
+    if extra:
+        payload.update(extra)
+    _attach_schematic_ascii_readback(payload, doc_id=session.doc_id, focus=focus)
+    return payload
+
+
+def _export_text(session, kind: str, *, key: str | None = None,
+                 opts: dict | None = None) -> str:
+    """Fetch one text artifact from the C++ ecad_export ``files`` envelope."""
+    request: dict = {"kind": kind, "doc_id": session.doc_id}
+    if opts:
+        request["opts"] = opts
+    resp = _rpc("ecad_export", request)
+    files = resp.get("files") or {}
+    if not isinstance(files, dict):
+        raise ValueError(f"ecad_export({kind!r}) returned a non-object files field")
+    if key and isinstance(files.get(key), str):
+        return files[key]
+    strings = [(str(k), v) for k, v in sorted(files.items()) if isinstance(v, str)]
+    if len(strings) == 1:
+        return strings[0][1]
+    raise ValueError(
+        f"ecad_export({kind!r}) returned no {key or 'single text'} artifact "
+        f"(keys: {', '.join(str(k) for k in sorted(files)) or '(none)'})")
+
+
+def _artifact_path(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _write_artifact(path: str, content: str, *, binary: bool = False) -> tuple[str, int]:
+    """Write returned C++ text client-side and confirm the bytes landed."""
+    target = _artifact_path(path)
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    if binary:
+        data = content.encode("latin-1")
+        with open(target, "wb") as fh:
+            fh.write(data)
+    else:
+        with open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+    return target, os.path.getsize(target) if os.path.exists(target) else 0
+
+
+def _inline_text(text: str) -> tuple[str, bool]:
+    if len(text) <= _INLINE_TEXT_LIMIT:
+        return text, False
+    return text[:_INLINE_TEXT_LIMIT], True
+
 def register_ecad_sch_tools(mcp: FastMCP) -> None:
-    """ECAD schematic MCP tools (T-RF8 split of ecad_tools.py): ecad_new_schematic, find_part, place_symbol, wire, add_power, label, status, run_erc, update_from_sch."""
+    """Register the complete schematic authoring/readback/export surface."""
 
     # Make parts created by ecad_make_part in EARLIER sessions resolvable. store_part
     # registers the native dir as a side effect of writing, which only covers the process
@@ -823,29 +978,46 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
     def _place_one(session, spec: dict, attach_readback: bool) -> dict:
         """Place ONE normalized spec and build its payload dict (ok or teaching error)."""
         libid = spec["libid"]
-        # E7: Validate libid resolves BEFORE dispatching the op. An unresolvable libid would
-        # silently produce a 2-pin stub with ok:true, which then corrupts the netlist. Fail fast
-        # with a clear error and direct the user to ecad_find_part.
-        from services.ecad import library as _lib  # STAYS (T-RF20): no ecad_library RPC
-        _resolved_def = _lib.resolve(libid)
-        if _resolved_def is None:
+        # Agent placement is strict even though document import/paste is resilient: accept a
+        # Python-library definition (the richer source) or an exact native-catalog libid, and
+        # refuse a model guess before the core's visible generic-body recovery path can run.
+        from services.ecad import library as _lib  # Python project/vendor libraries remain valid
+        resolved_def = _lib.resolve(libid)
+        native_match = None
+        if resolved_def is None:
+            try:
+                catalog = _rpc("ecad_symbols", {"query": libid, "limit": 100})
+                native_match = next(
+                    (row for row in (catalog.get("symbols") or [])
+                     if isinstance(row, dict) and row.get("libid") == libid),
+                    None,
+                )
+            except Exception as e:  # noqa: BLE001
+                return _rs.err_envelope(
+                    f"native symbol catalog unavailable: {type(e).__name__}: {e}",
+                    reason="symbol_catalog_unavailable",
+                    hint="Do not place a guessed symbol while the native catalog is unavailable.",
+                    next_actions=[f"ecad_symbols(query='{libid.split(':')[-1]}')"],
+                    libid=libid,
+                )
+        if resolved_def is None and native_match is None:
             keyword = libid.split(":")[-1] if ":" in libid else libid
             return _rs.err_envelope(
-                f"unknown library part {libid!r} — use ecad_find_part to find a real libid",
-                hint=(f"'{libid}' is not in the component library. "
-                      f"Run ecad_find_part('{keyword}') to discover the correct libid."),
+                f"unknown library symbol {libid!r}",
+                reason="unknown_libid",
+                hint=(f"'{libid}' is in neither the project/Python library nor the native "
+                      f"catalog. Run ecad_symbols(query='{keyword}') and use an exact hit."),
                 next_actions=[
-                    f"ecad_find_part('{keyword}')  # search for the correct libid",
-                    "ecad_find_part('resistor')  # browse common parts",
+                    f"ecad_symbols(query='{keyword}')",
+                    f"ecad_find_part('{keyword}')",
                 ],
                 libid=libid,
             )
-        # The C++ core has no symbol library server-side (core/ecad/ops.cpp ensure_lib_def
-        # stubs when no def rides the op) — pass the resolved def inline so lib_cache,
-        # ref-prefix annotation (R1, not U1) and pin geometry are identical to the old path.
         op: dict = {"op": "sch_add_symbol", "libid": libid,
                     "pos": [float(spec["x"]), float(spec["y"])],
-                    "angle": float(spec["angle"]), "def": _resolved_def}
+                    "angle": float(spec["angle"])}
+        if resolved_def is not None:
+            op["def"] = resolved_def
         ref_warnings: list[str] = []
         if spec["ref"]:
             want_ref = str(spec["ref"])
@@ -1266,6 +1438,620 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
 
 
 
+    # ---------------------------------------------------------------- edit / annotate / primitives
+
+    @mcp.tool()
+    def ecad_edit_symbol(ref_or_id: str, value: str | None = None,
+                         ref: str | None = None, footprint: str | None = None,
+                         dnp: bool | None = None, in_bom: bool | None = None,
+                         on_board: bool | None = None, datasheet: str | None = None,
+                         unit: int | None = None, angle: float | None = None,
+                         mirror: str | None = None, x: float | None = None,
+                         y: float | None = None, fields: Any = None,
+                         doc_id: str = "") -> str:
+        """Edit a placed symbol by reference designator (``R1``) or internal id (``s1``).
+
+        Omitted fields are preserved. ``x``/``y`` may be supplied independently; ``fields`` is
+        the complete user-fields object. Returns the edited symbol plus net/ERC and ASCII readback.
+        """
+        try:
+            session = _get_sch(doc_id or None)
+        except OpError as e:
+            return _err(e.message, reason=e.code, hint="Open a schematic first.",
+                        next_actions=["ecad_new_schematic('mydesign')"])
+        sym = _resolve_ref_or_id(session.doc, str(ref_or_id))
+        if sym is None:
+            refs = sorted(str(s.get("ref")) for s in session.doc.get("symbols", [])
+                          if s.get("ref"))
+            return _err(f"no symbol {ref_or_id!r} on the schematic",
+                        reason="symbol_not_found",
+                        hint=f"Placed refs are: {', '.join(refs) or '(none)'}.",
+                        next_actions=["ecad_status(detail='list', include='pins')"],
+                        placed_refs=refs[:100])
+        op: dict = {"op": "sch_edit_symbol", "id": sym.get("id")}
+        for key, supplied in (
+            ("value", value), ("ref", ref), ("footprint", footprint),
+            ("dnp", dnp), ("in_bom", in_bom), ("on_board", on_board),
+            ("datasheet", datasheet), ("unit", unit), ("angle", angle),
+            ("mirror", mirror),
+        ):
+            if supplied is not None:
+                op[key] = supplied
+        if x is not None or y is not None:
+            old = sym.get("pos") or [0.0, 0.0]
+            try:
+                op["pos"] = [float(old[0] if x is None else x),
+                             float(old[1] if y is None else y)]
+            except (TypeError, ValueError) as e:
+                return _err(f"invalid symbol coordinates: {e}", reason="invalid_coordinates",
+                            hint="x and y are finite schematic millimetres.",
+                            next_actions=[f"ecad_edit_symbol('{ref_or_id}', x=0, y=0)"])
+        if fields is not None:
+            try:
+                op["fields"] = require_mapping(fields, "fields", "a JSON object of user fields")
+            except ValueError as e:
+                return _err(str(e), reason="invalid_fields",
+                            hint="Pass fields={'Manufacturer': '...', 'MPN': '...'} or omit it.",
+                            next_actions=[f"ecad_edit_symbol('{ref_or_id}', value='new value')"])
+        if len(op) == 2:
+            return _err("no symbol edits were supplied", reason="no_changes",
+                        hint="Set at least one of value/ref/footprint/dnp/in_bom/on_board/"
+                             "datasheet/unit/angle/mirror/x/y/fields.",
+                        next_actions=[f"ecad_edit_symbol('{ref_or_id}', value='new value')"])
+        try:
+            payload = _apply_schematic_tool(
+                session, op, action=f"edited symbol {sym.get('ref') or sym.get('id')}",
+                focus=op.get("pos") or list(sym.get("pos") or []),
+                extra={"id": sym.get("id")},
+            )
+        except OpError as e:
+            return _err(f"could not edit symbol {ref_or_id!r}: {e.message}",
+                        reason=e.code, hint=e.message, detail=e.detail,
+                        next_actions=["ecad_status(detail='list', include='pins')"])
+        edited = _resolve_ref_or_id(session.doc, str(sym.get("id")))
+        if edited:
+            payload.update({
+                "ref": edited.get("ref"),
+                "value": edited.get("value"),
+                "footprint": edited.get("footprint") or "",
+                "pos": edited.get("pos"),
+                "angle": edited.get("angle", 0.0),
+                "mirror": edited.get("mirror", "none"),
+                "pins": _placed_pins(session.doc, edited),
+            })
+        return _dumps(payload)
+
+    @mcp.tool()
+    def ecad_delete(id_or_ref: str, doc_id: str = "") -> str:
+        """Delete any schematic entity by id, or delete a symbol by reference designator."""
+        try:
+            session = _get_sch(doc_id or None)
+        except OpError as e:
+            return _err(e.message, reason=e.code, hint="Open a schematic first.",
+                        next_actions=["ecad_new_schematic('mydesign')"])
+        token = str(id_or_ref or "").strip()
+        if not token:
+            return _err("id_or_ref is required", reason="missing_entity",
+                        hint="Pass an id from render_schematic_ascii's index or a symbol ref.",
+                        next_actions=["render_schematic_ascii()"])
+        collections = (
+            ("symbols", "symbol", "sch_delete_symbol"),
+            ("wires", "wire", "sch_delete_wire"),
+            ("buses", "bus", "sch_delete_bus"),
+            ("bus_entries", "bus_entry", "sch_delete_bus_entry"),
+            ("junctions", "junction", "sch_delete_junction"),
+            ("labels", "label", "sch_delete_label"),
+            ("power", "power", "sch_delete_power"),
+            ("no_connect", "no_connect", "sch_delete_no_connect"),
+            ("texts", "text", "sch_delete_text"),
+            ("graphics", "graphic", "sch_delete_graphic"),
+            ("sheet_symbols", "sheet_symbol", "sch_delete_sheet_symbol"),
+            ("sheets", "sheet", "sch_delete_sheet"),
+        )
+        found: dict | None = _resolve_ref_or_id(session.doc, token)
+        found_kind = "symbol" if found is not None else ""
+        delete_op = "sch_delete_symbol" if found is not None else ""
+        if found is None:
+            for key, kind, opname in collections[1:]:
+                entity = next((v for v in session.doc.get(key, []) or []
+                               if isinstance(v, dict) and str(v.get("id")) == token), None)
+                if entity is not None:
+                    found, found_kind, delete_op = entity, kind, opname
+                    break
+        if found is None:
+            for sheet_symbol in session.doc.get("sheet_symbols", []) or []:
+                for pin in sheet_symbol.get("pins", []) or []:
+                    if isinstance(pin, dict) and str(pin.get("id")) == token:
+                        found, found_kind, delete_op = pin, "sheet_pin", "sch_delete_sheet_pin"
+                        break
+                if found is not None:
+                    break
+        if found is None:
+            known = sorted(
+                str(entity.get("id"))
+                for key, _, _ in collections
+                for entity in (session.doc.get(key, []) or [])
+                if isinstance(entity, dict) and entity.get("id")
+            )
+            return _err(f"no schematic entity {token!r}", reason="entity_not_found",
+                        hint="Use render_schematic_ascii() for the bounded entity index.",
+                        next_actions=["render_schematic_ascii()", "ecad_status(detail='list')"],
+                        known_ids=known[:100], known_ids_truncated=len(known) > 100)
+        try:
+            payload = _apply_schematic_tool(
+                session, {"op": delete_op, "id": found.get("id")},
+                action=f"deleted {found_kind} {found.get('ref') or found.get('id')}",
+                focus=list(found.get("pos") or []),
+                extra={"deleted_id": found.get("id"), "deleted_kind": found_kind,
+                       "deleted_ref": found.get("ref")},
+            )
+        except OpError as e:
+            return _err(f"could not delete {found_kind} {token!r}: {e.message}",
+                        reason=e.code, hint=e.message, detail=e.detail,
+                        next_actions=["render_schematic_ascii()"])
+        return _dumps(payload)
+
+    @mcp.tool()
+    def ecad_annotate(scope: str = "all", mode: str = "keep",
+                      sheet: str | None = None, doc_id: str = "") -> str:
+        """Assign reference designators with ``sch_annotate``.
+
+        ``scope`` is ``'all'`` or ``'sheet'``; ``mode='keep'`` preserves existing refs while
+        ``mode='reset'`` renumbers the selected scope. Supply ``sheet`` for sheet scope.
+        """
+        scope = str(scope or "all").lower()
+        mode = str(mode or "keep").lower()
+        if scope not in ("all", "sheet") or mode not in ("keep", "reset"):
+            return _err("invalid annotation scope or mode", reason="invalid_annotation",
+                        hint="Use scope='all'|'sheet' and mode='keep'|'reset'.",
+                        next_actions=["ecad_annotate(scope='all', mode='keep')"])
+        if scope == "sheet" and not sheet:
+            return _err("sheet scope requires sheet=<sheet id>", reason="missing_sheet",
+                        hint="Use the sheet id shown by ecad_status/render_schematic_ascii.",
+                        next_actions=["ecad_annotate(scope='all', mode='keep')"])
+        try:
+            session = _get_sch(doc_id or None)
+            op: dict = {"op": "sch_annotate", "scope": scope, "mode": mode}
+            if sheet:
+                op["sheet"] = str(sheet)
+            payload = _apply_schematic_tool(
+                session, op, action=f"annotated {scope} ({mode})",
+                extra={"scope": scope, "mode": mode, "sheet": sheet},
+            )
+            refs = sorted(str(s.get("ref")) for s in session.doc.get("symbols", [])
+                          if s.get("ref"))
+            payload.update({"refs": refs[:200], "refs_truncated": len(refs) > 200})
+        except OpError as e:
+            return _err(f"could not annotate schematic: {e.message}",
+                        reason=e.code, hint=e.message, detail=e.detail,
+                        next_actions=["ecad_status(detail='list')"])
+        return _dumps(payload)
+
+    def _point_mutation(opname: str, noun: str, x: float, y: float,
+                        doc_id: str) -> str:
+        try:
+            session = _get_sch(doc_id or None)
+            pos = [float(x), float(y)]
+            payload = _apply_schematic_tool(
+                session, {"op": opname, "pos": pos}, action=f"added {noun}",
+                focus=pos, extra={"pos": pos},
+            )
+        except OpError as e:
+            return _err(f"could not add {noun}: {e.message}", reason=e.code,
+                        hint=e.message, detail=e.detail,
+                        next_actions=["render_schematic_ascii()"])
+        except (TypeError, ValueError) as e:
+            return _err(f"invalid {noun} coordinates: {e}", reason="invalid_coordinates",
+                        hint="x and y are finite schematic millimetres.",
+                        next_actions=["render_schematic_ascii()"])
+        return _dumps(payload)
+
+    @mcp.tool()
+    def ecad_no_connect(x: float, y: float, doc_id: str = "") -> str:
+        """Mark the pin at exact world ``(x, y)`` intentionally unconnected."""
+        return _point_mutation("sch_add_no_connect", "no-connect marker", x, y, doc_id)
+
+    @mcp.tool()
+    def ecad_junction(x: float, y: float, doc_id: str = "") -> str:
+        """Add an electrical junction at exact world ``(x, y)``."""
+        return _point_mutation("sch_add_junction", "junction", x, y, doc_id)
+
+    @mcp.tool()
+    def ecad_bus(name: str, points: Any, doc_id: str = "") -> str:
+        """Add a named bus polyline. ``points`` is ``[[x,y], ...]`` with at least two points."""
+        try:
+            pts_in = require_list(points, "points", "an array of at least two [x,y] points")
+            pts = [[float(p[0]), float(p[1])] for p in pts_in
+                   if isinstance(p, (list, tuple)) and len(p) == 2]
+        except (ValueError, TypeError, IndexError) as e:
+            return _err(f"invalid bus points: {e}", reason="invalid_points",
+                        hint="Pass points=[[0,0],[25.4,0]] in schematic mm.",
+                        next_actions=["ecad_bus('D[0..7]', [[0,0],[25.4,0]])"])
+        if len(pts) != len(pts_in) or len(pts) < 2 or not str(name or "").strip():
+            return _err("bus needs a non-empty name and at least two valid [x,y] points",
+                        reason="invalid_bus",
+                        hint="Example: ecad_bus('D[0..7]', [[0,0],[25.4,0]]).",
+                        next_actions=["ecad_bus('D[0..7]', [[0,0],[25.4,0]])"])
+        try:
+            session = _get_sch(doc_id or None)
+            op = {"op": "sch_add_bus", "name": str(name).strip(), "pts": pts}
+            payload = _apply_schematic_tool(
+                session, op, action=f"added bus {str(name).strip()}",
+                focus=pts[0], extra={"name": str(name).strip(), "points": pts},
+            )
+        except OpError as e:
+            return _err(f"could not add bus {name!r}: {e.message}", reason=e.code,
+                        hint=e.message, detail=e.detail,
+                        next_actions=["ecad_lint_schematic()"])
+        return _dumps(payload)
+
+    @mcp.tool()
+    def ecad_bus_entry(x: float, y: float, bus: str | None = None,
+                       member: str | None = None, doc_id: str = "") -> str:
+        """Add a bus entry at ``(x,y)``; ``bus`` names its bus and ``member`` one expanded net."""
+        try:
+            session = _get_sch(doc_id or None)
+            pos = [float(x), float(y)]
+            op: dict = {"op": "sch_add_bus_entry", "pos": pos}
+            if bus is not None:
+                op["bus"] = str(bus)
+            if member is not None:
+                op["member"] = str(member)
+            payload = _apply_schematic_tool(
+                session, op, action="added bus entry", focus=pos,
+                extra={"pos": pos, "bus": bus, "member": member},
+                next_actions=["ecad_lint_schematic()  # catches unresolved entries",
+                              "ecad_netlist()  # confirm member net binding",
+                              "render_schematic_ascii()"],
+            )
+        except OpError as e:
+            return _err(f"could not add bus entry: {e.message}", reason=e.code,
+                        hint=e.message, detail=e.detail,
+                        next_actions=["ecad_lint_schematic()"])
+        except (TypeError, ValueError) as e:
+            return _err(f"invalid bus entry coordinates: {e}", reason="invalid_coordinates",
+                        hint="x and y are finite schematic millimetres.",
+                        next_actions=["render_schematic_ascii()"])
+        return _dumps(payload)
+
+    @mcp.tool()
+    def ecad_note(x: float, y: float, text: str, size: float = 1.27,
+                  doc_id: str = "") -> str:
+        """Add non-electrical schematic text at ``(x,y)`` in mm."""
+        if not str(text or ""):
+            return _err("note text is required", reason="missing_text",
+                        hint="Pass text='Decoupling: place close to U1'.",
+                        next_actions=["ecad_note(0, 0, 'Design note')"])
+        try:
+            session = _get_sch(doc_id or None)
+            pos = [float(x), float(y)]
+            payload = _apply_schematic_tool(
+                session, {"op": "sch_add_text", "pos": pos,
+                          "text": str(text), "size": float(size)},
+                action="added schematic note", focus=pos,
+                extra={"pos": pos, "text": str(text), "size": float(size)},
+            )
+        except OpError as e:
+            return _err(f"could not add schematic note: {e.message}", reason=e.code,
+                        hint=e.message, detail=e.detail,
+                        next_actions=["render_schematic_ascii()"])
+        except (TypeError, ValueError) as e:
+            return _err(f"invalid note position or size: {e}", reason="invalid_coordinates",
+                        hint="x, y, and size are numeric schematic millimetres.",
+                        next_actions=["ecad_note(0, 0, 'Design note')"])
+        return _dumps(payload)
+
+    # ---------------------------------------------------------------- compiled outputs / interchange
+
+    @mcp.tool()
+    def ecad_netlist(doc_id: str = "", fmt: str = "summary",
+                     path: str | None = None) -> str:
+        """Read the compiled schematic netlist.
+
+        ``fmt='summary'`` returns bounded net names and pin counts. ``fmt='json'`` returns the
+        full compiled JSON netlist (and writes it when ``path`` is supplied). ``fmt='kicad'``
+        requests the KiCad-style netlist writer and optionally writes its returned text to
+        ``path`` client-side.
+        """
+        try:
+            session = _get_sch(doc_id or None)
+        except OpError as e:
+            return _err(e.message, reason=e.code, hint="Open a schematic first.",
+                        next_actions=["ecad_new_schematic('mydesign')"])
+        dialect = str(fmt or "summary").lower()
+        nl: dict | None = None
+        if dialect in ("summary", "json", "full"):
+            try:
+                nl = netlist_mod.build_netlist(session.doc)
+            except Exception as e:  # noqa: BLE001
+                return _err(f"netlist compile failed: {type(e).__name__}: {e}",
+                            reason="netlist_compile_failed",
+                            hint="Run ecad_status() and fix the reported document/compile error.",
+                            next_actions=["ecad_status()", "ecad_run_erc()"])
+        if dialect == "summary":
+            assert nl is not None
+            rows = [{"name": str(name), "pin_count": len(members)}
+                    for name, members in sorted((nl.get("nets") or {}).items())]
+            cap = 100
+            all_buses = sorted((nl.get("buses") or {}).items())
+            buses = {str(name): list(members)[:100] for name, members in all_buses[:50]}
+            buses_truncated = (len(all_buses) > 50
+                               or any(len(members) > 100 for _, members in all_buses[:50]))
+            return _dumps({
+                "ok": True, "doc_id": session.doc_id, "revision": session.revision,
+                "fmt": "summary", "component_count": len(nl.get("components") or []),
+                "net_count": len(rows), "nets": rows[:cap],
+                "truncated": len(rows) > cap or buses_truncated,
+                "omitted_nets": max(0, len(rows) - cap),
+                "buses": buses, "buses_truncated": buses_truncated,
+                "warnings": list(nl.get("warnings") or []),
+                "hint": (f"Compiled {len(rows)} net(s). Use fmt='json' for full pin/component "
+                         "records or fmt='kicad' for an interchange netlist."),
+                "next_actions": ["ecad_run_erc()", "ecad_bom()", "ecad_plot(fmt='pdf')"],
+            })
+        if dialect in ("json", "full"):
+            assert nl is not None
+            try:
+                text = _dumps(nl)
+                artifact = None
+                size = len(text.encode("utf-8"))
+                spilled = False
+                if path:
+                    artifact, size = _write_artifact(str(path), text)
+                elif len(text) > _INLINE_TEXT_LIMIT:
+                    out_dir = str(_default_out_dir(session.doc.get("name", "schematic")))
+                    artifact, size = _write_artifact(
+                        os.path.join(out_dir, "netlist.json"), text)
+                    spilled = True
+            except Exception as e:  # noqa: BLE001
+                return _err(f"netlist output failed: {type(e).__name__}: {e}",
+                            reason="netlist_output_failed",
+                            hint="Check the output path or omit path to return JSON inline.",
+                            next_actions=["ecad_netlist(fmt='summary')"])
+            return _dumps({
+                "ok": True, "doc_id": session.doc_id, "revision": session.revision,
+                "fmt": "json", "netlist": nl if artifact is None else None,
+                "path": artifact, "bytes": size, "auto_spilled": spilled,
+                "warnings": (list(nl.get("warnings") or [])
+                             + (["full netlist exceeded the inline bound and was written to path"]
+                                if spilled else [])),
+                "hint": (f"Full compiled netlist {'written to ' + artifact if artifact else 'returned'} "
+                         f"({len(nl.get('nets') or {})} nets, {len(nl.get('components') or [])} "
+                         "components)."),
+                "next_actions": ["ecad_run_erc()", "ecad_bom()", "ecad_plot(fmt='pdf')"],
+            })
+        if dialect != "kicad":
+            return _err(f"unknown netlist format {fmt!r}", reason="invalid_format",
+                        hint="Use fmt='summary', 'json', or 'kicad'.",
+                        next_actions=["ecad_netlist(fmt='summary')"])
+        try:
+            text = _export_text(session, "netlist", key="netlist")
+            artifact = None
+            size = len(text.encode("utf-8"))
+            if path:
+                artifact, size = _write_artifact(str(path), text)
+            inline, truncated = _inline_text(text)
+        except Exception as e:  # noqa: BLE001
+            return _err(f"schematic netlist export failed: {type(e).__name__}: {e}",
+                        reason="export_failed",
+                        hint="Run ecad_status() and ecad_run_erc(), then retry.",
+                        next_actions=["ecad_status()", "ecad_run_erc()"])
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "fmt": "kicad",
+            "path": artifact, "text": None if artifact else inline,
+            "text_truncated": False if artifact else truncated, "bytes": size,
+            "warnings": (["inline netlist truncated; pass path= to write the full artifact"]
+                         if truncated and not artifact else []),
+            "hint": (f"KiCad-style netlist {'written to ' + artifact if artifact else 'returned'} "
+                     f"({size} byte(s))."),
+            "next_actions": ["ecad_bom()", "ecad_export_kicad('design.kicad_sch')"],
+        })
+
+    @mcp.tool()
+    def ecad_bom(doc_id: str = "", fmt: str = "csv", exclude_dnp: bool = True,
+                 path: str | None = None) -> str:
+        """Generate a schematic BOM as ``csv`` or ``json``; optionally write it to ``path``."""
+        dialect = str(fmt or "csv").lower()
+        if dialect not in ("csv", "json"):
+            return _err(f"unknown BOM format {fmt!r}", reason="invalid_format",
+                        hint="Use fmt='csv' or fmt='json'.",
+                        next_actions=["ecad_bom(fmt='csv')"])
+        try:
+            session = _get_sch(doc_id or None)
+            text = _export_text(session, "bom", key="bom",
+                                opts={"fmt": dialect, "exclude_dnp": bool(exclude_dnp)})
+            artifact = None
+            size = len(text.encode("utf-8"))
+            if path:
+                artifact, size = _write_artifact(str(path), text)
+            inline, truncated = _inline_text(text)
+        except OpError as e:
+            return _err(e.message, reason=e.code, hint="Open a schematic first.",
+                        next_actions=["ecad_new_schematic('mydesign')"])
+        except Exception as e:  # noqa: BLE001
+            return _err(f"schematic BOM export failed: {type(e).__name__}: {e}",
+                        reason="export_failed",
+                        hint="Confirm the schematic has annotated components, then retry.",
+                        next_actions=["ecad_annotate()", "ecad_status()"])
+        if dialect == "csv":
+            rows = max(0, text.count("\n") - 1)
+        else:
+            try:
+                parsed_bom = json.loads(text)
+                if isinstance(parsed_bom, list):
+                    rows = len(parsed_bom)
+                elif isinstance(parsed_bom, dict):
+                    groups = parsed_bom.get("groups", parsed_bom.get("items", []))
+                    rows = len(groups) if isinstance(groups, list) else 0
+                else:
+                    rows = 0
+            except (TypeError, ValueError):
+                rows = 0
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "fmt": dialect,
+            "exclude_dnp": bool(exclude_dnp), "path": artifact,
+            "text": None if artifact else inline,
+            "text_truncated": False if artifact else truncated,
+            "rows": rows, "bytes": size,
+            "warnings": (["inline BOM truncated; pass path= to write the full artifact"]
+                         if truncated and not artifact else []),
+            "hint": (f"Schematic BOM {'written to ' + artifact if artifact else 'returned'} "
+                     f"({rows} row/group(s), {size} byte(s))."),
+            "next_actions": ["ecad_plot(fmt='pdf')", "ecad_export_kicad('design.kicad_sch')"],
+        })
+
+    @mcp.tool()
+    def ecad_plot(doc_id: str = "", fmt: str = "svg", path: str | None = None,
+                  sheet: str | None = None, title_block: bool = True) -> str:
+        """Plot the schematic to vector SVG or PDF and return confirmed artifact path(s)."""
+        dialect = str(fmt or "svg").lower()
+        if dialect not in ("svg", "pdf"):
+            return _err(f"unknown plot format {fmt!r}", reason="invalid_format",
+                        hint="Use fmt='svg' or fmt='pdf'.",
+                        next_actions=["ecad_plot(fmt='pdf')"])
+        try:
+            session = _get_sch(doc_id or None)
+            resp = _rpc("ecad_export", {
+                "kind": dialect, "doc_id": session.doc_id,
+                "opts": {"sheet": str(sheet or ""), "title_block": bool(title_block)},
+            })
+            files = resp.get("files") or {}
+            items = [(str(k), value) for k, value in sorted(files.items())
+                     if isinstance(value, str)]
+            if not items:
+                raise ValueError(f"ecad_export({dialect!r}) returned no text artifacts")
+            default_dir = str(_default_out_dir(session.doc.get("name", "schematic")))
+            name = "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                           for ch in str(session.doc.get("name") or "schematic"))
+            requested = _artifact_path(str(path)) if path else ""
+            written: list[str] = []
+            sizes: dict[str, int] = {}
+            for index, (key, content) in enumerate(items):
+                if len(items) == 1:
+                    target = requested or os.path.join(default_dir, f"{name}.{dialect}")
+                    if (target.endswith(os.sep) or os.path.isdir(target)
+                            or (requested and not os.path.splitext(target)[1])):
+                        target = os.path.join(target, f"{name}.{dialect}")
+                elif requested and os.path.splitext(requested)[1].lower() == f".{dialect}":
+                    stem, ext = os.path.splitext(requested)
+                    target = requested if index == 0 else f"{stem}-{key}{ext}"
+                else:
+                    out_dir = requested or default_dir
+                    target = os.path.join(out_dir, f"{name}-{key}.{dialect}")
+                written_path, byte_count = _write_artifact(
+                    target, content, binary=dialect == "pdf")
+                written.append(written_path)
+                sizes[written_path] = byte_count
+            _ECAD["out_dir"] = os.path.dirname(written[0])
+        except OpError as e:
+            return _err(e.message, reason=e.code, hint="Open a schematic first.",
+                        next_actions=["ecad_new_schematic('mydesign')"])
+        except Exception as e:  # noqa: BLE001
+            return _err(f"schematic plot failed: {type(e).__name__}: {e}",
+                        reason="export_failed",
+                        hint="Run ecad_lint_schematic() and confirm the selected sheet id.",
+                        next_actions=["ecad_lint_schematic()", "render_schematic_ascii()"])
+        total = sum(sizes.values())
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "fmt": dialect,
+            "sheet": sheet, "title_block": bool(title_block),
+            "path": written[0], "paths": written, "page_count": len(written),
+            "bytes": total, "file_bytes": sizes, "exists": all(n > 0 for n in sizes.values()),
+            "warnings": [],
+            "hint": (f"Wrote {len(written)} vector {dialect.upper()} page(s) to "
+                     f"{written[0]} ({total} byte(s) total), confirmed on disk."),
+            "next_actions": ["ecad_bom()", "ecad_export_kicad('design.kicad_sch')"],
+        })
+
+    @mcp.tool()
+    def ecad_import_kicad(path: str, mode: str = "merge", doc_id: str = "") -> str:
+        """Import a KiCad ``.kicad_sch`` file into the active schematic."""
+        import_mode = str(mode or "merge").lower()
+        if import_mode not in ("merge", "replace"):
+            return _err(f"unknown import mode {mode!r}", reason="invalid_mode",
+                        hint="Use mode='merge' or mode='replace'.",
+                        next_actions=["ecad_import_kicad('design.kicad_sch', mode='merge')"])
+        source = _artifact_path(str(path))
+        if not os.path.isfile(source):
+            return _err(f"KiCad schematic does not exist: {source}",
+                        reason="file_not_found", hint="Pass an existing .kicad_sch path.",
+                        next_actions=["ecad_import_kicad('/absolute/path/design.kicad_sch')"])
+        try:
+            session = _get_sch(doc_id or None)
+            payload = _apply_schematic_tool(
+                session, {"op": "sch_import_kicad", "path": source, "mode": import_mode},
+                action=f"imported KiCad schematic ({import_mode})",
+                extra={"source_path": source, "mode": import_mode},
+            )
+        except OpError as e:
+            return _err(f"KiCad schematic import failed: {e.message}", reason=e.code,
+                        hint=e.message, detail=e.detail,
+                        next_actions=["ecad_status()", "ecad_import_kicad(path, mode='replace')"])
+        return _dumps(payload)
+
+    @mcp.tool()
+    def ecad_export_kicad(path: str, doc_id: str = "") -> str:
+        """Export the active schematic as a KiCad 7 ``.kicad_sch`` file."""
+        if not str(path or "").strip():
+            return _err("path is required", reason="missing_path",
+                        hint="Pass a .kicad_sch output path.",
+                        next_actions=["ecad_export_kicad('design.kicad_sch')"])
+        try:
+            session = _get_sch(doc_id or None)
+            text = _export_text(session, "kicad", key="kicad")
+            artifact, size = _write_artifact(str(path), text)
+        except OpError as e:
+            return _err(e.message, reason=e.code, hint="Open a schematic first.",
+                        next_actions=["ecad_new_schematic('mydesign')"])
+        except Exception as e:  # noqa: BLE001
+            return _err(f"KiCad schematic export failed: {type(e).__name__}: {e}",
+                        reason="export_failed",
+                        hint="Run ecad_status() and ecad_annotate(), then retry.",
+                        next_actions=["ecad_status()", "ecad_annotate()"])
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "kind": "kicad",
+            "path": artifact, "bytes": size, "exists": size > 0, "warnings": [],
+            "hint": f"Wrote KiCad schematic to {artifact} ({size} byte(s)), confirmed on disk.",
+            "next_actions": ["ecad_plot(fmt='pdf')", "ecad_bom()"],
+        })
+
+    @mcp.tool()
+    def ecad_symbols(query: str = "", limit: int = 20) -> str:
+        """Discover native schematic symbols instead of guessing libids."""
+        try:
+            bounded_limit = max(1, min(100, int(limit)))
+        except (TypeError, ValueError):
+            return _err(f"invalid symbol limit {limit!r}", reason="invalid_limit",
+                        hint="Pass an integer from 1 to 100.",
+                        next_actions=["ecad_symbols('resistor', limit=20)"])
+        try:
+            resp = _rpc("ecad_symbols", {"query": str(query or ""),
+                                         "limit": bounded_limit})
+        except Exception as e:  # noqa: BLE001
+            return _err(f"symbol catalog unavailable: {type(e).__name__}: {e}",
+                        reason="rpc_failed",
+                        hint="The native symbol-library RPC must be available.",
+                        next_actions=["ecad_find_part('resistor')"])
+        symbols = resp.get("symbols") or []
+        if not isinstance(symbols, list):
+            return _err("symbol catalog returned an invalid payload",
+                        reason="invalid_rpc_response",
+                        hint="Retry ecad_symbols or use ecad_find_part.",
+                        next_actions=["ecad_find_part('resistor')"])
+        symbols = symbols[:bounded_limit]
+        return _dumps({
+            "ok": True, "query": str(query or ""), "limit": bounded_limit,
+            "count": len(symbols), "symbols": symbols,
+            "warnings": list(resp.get("warnings") or []),
+            "hint": (f"Found {len(symbols)} native symbol(s). Feed an exact libid to "
+                     "ecad_place_symbol; never guess one."),
+            "next_actions": ([f"ecad_place_symbol('{symbols[0].get('libid')}', x=0, y=0)"
+                              if symbols and isinstance(symbols[0], dict)
+                              and symbols[0].get("libid") else
+                              "ecad_symbols('resistor')"]),
+        })
+
+
     # ---------------------------------------------------------------- status (THE context tool)
 
     @mcp.tool()
@@ -1332,17 +2118,24 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         for name, members in sorted(nl.get("nets", {}).items()):
             nets.append({"name": name, "size": len(members),
                          "members": [f"{m.get('ref')}.{m.get('pin')}" for m in members]})
-        # ERC (from the C++ session compile — engine.ecad.erc runs inside compile_field)
+        # ERC (from the C++ session compile — failure is visible and can never mean "clean")
         violations: list[dict] = []
+        erc_available = True
+        status_warnings = list(nl.get("warnings", []))
         try:
             violations = _compile_of(session).get("erc", []) or []
-        except Exception:  # noqa: BLE001 — ERC is advisory; never break status
-            violations = []
+        except Exception as e:  # noqa: BLE001 — status survives, but its verdict is unavailable
+            erc_available = False
+            status_warnings.append(
+                f"ERC unavailable: {type(e).__name__}: {e}")
         erc = _erc_summary(violations)
         unconnected = _unconnected_pins(doc, nl)
 
         # Build a prioritized next_actions list — errors first, then unconnected pins.
         next_actions: list[str] = []
+        if not erc_available:
+            next_actions.append(
+                "ERC unavailable — retry ecad_run_erc(); do not treat this status as clean.")
         for g in erc["groups"]:
             if g["severity"] == "error":
                 tgt = (g["pins"][:3] or g["nets"][:3])
@@ -1357,13 +2150,14 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
                 "(ecad_wire) or mark no-connect.")
         if not components:
             next_actions.append("Empty schematic — ecad_find_part then ecad_place_symbol.")
-        elif not violations and not unconnected:
+        elif erc_available and not violations and not unconnected:
             next_actions.append("Design is clean — ecad_simulate('op') or ecad_run_drc on a board.")
 
         # one-line headline
+        erc_head = (f"{erc['errors']} ERC error(s), {erc['warnings']} warning(s)"
+                    if erc_available else "ERC unavailable")
         head = (f"{len(components)} component(s), {len(nets)} net(s), "
-                f"{erc['errors']} ERC error(s), {erc['warnings']} warning(s), "
-                f"{len(unconnected)} unconnected pin(s).")
+                f"{erc_head}, {len(unconnected)} unconnected pin(s).")
         if power and power.get("power_w_typ") is not None:
             head += f" Board power ~{power['power_w_typ'] * 1000:.1f} mW typ."
         full = {
@@ -1373,11 +2167,14 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
             "component_count": len(components), "components": components,
             "power": power,
             "net_count": len(nets), "nets": nets,
+            "erc_available": erc_available,
             "erc": erc,
             "unconnected_count": len(unconnected),
             "unconnected_pins": [_pretty_pin(p) for p in unconnected],
-            "warnings": nl.get("warnings", []),
-            "hint": head + " Fix ERC errors first, then connect floating pins, then simulate.",
+            "warnings": status_warnings,
+            "hint": (head + (" Fix ERC errors first, then connect floating pins, then simulate."
+                             if erc_available else
+                             " ERC DID NOT RUN; retry ecad_run_erc before any clean claim.")),
             "next_actions": next_actions or ["ecad_simulate('op')"],
         }
         return _rs.serve(full, opts, projector=_rs.project_ecad_status)

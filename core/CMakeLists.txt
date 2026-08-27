@@ -400,6 +400,9 @@ add_library(chudware_ecad STATIC
   ecad/fabformats.cpp
   ecad/library.cpp
   ecad/recipes.cpp
+  ecad/symlib.cpp
+  ecad/schexport.cpp
+  ecad/schplot.cpp
   ecad/sync.cpp
   ecad/container.cpp
   ecad/kicad.cpp
@@ -492,6 +495,19 @@ target_link_libraries(test_kicad_import PRIVATE chudware_ecad)
 set_target_properties(test_kicad_import PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME kicad_import COMMAND test_kicad_import)
+
+# Schematic engine contract tests — sheet-scoped connectivity, segment attachment,
+# label scoping, buses, multi-unit grouping, the corrected ERC drive/power/no-connect
+# semantics, the native symbol library, the completed op vocabulary, the schematic
+# export kinds (netlist/bom/spice/kicad/svg/pdf), foreign-source save safety,
+# ecad_design's recipe compiler, resolve_pick and describe. Each case pins a defect
+# that shipped before the 2026-08 overhaul; see the header of the file.
+add_executable(test_sch_engine tests/test_sch_engine.cpp)
+target_include_directories(test_sch_engine PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_sch_engine PRIVATE chudware_ecad)
+set_target_properties(test_sch_engine PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME sch_engine COMMAND test_sch_engine)
 
 # T-RF19 (leaf 5): structural engine surface — aicad.structure/1 document model,
 # the direct-stiffness 3D frame solver (PyNite-equivalent subset: global-

@@ -83,3 +83,69 @@ blocks ops; it surfaces in the RPC response and to the AI as a feedback block.
 `sim.model` to a device, using `sim.pin_order` to order nodes. Net `"GND"` (or any port named
 `GND`/`0`) is forced to **node 0** (ground). Components without a sim model (connectors, mounting
 holes) are skipped with a warning. This is the only path schematic→simulation.
+
+## 5. v1.1 corrections (behavior fixes — the v1 text above described the intent, not the code)
+
+### 5.1 Connectivity
+
+1. **The union-find key is `(sheet, snapped point)`, not a bare point.** v1 keyed on `Point{x,y}`
+   alone and inserted every wire vertex and pin into one global point space, so two sheets with
+   coincident geometry were electrically shorted. Only global labels, power ports and matched
+   sheet-pin↔hier-label pairs cross a sheet boundary.
+2. **Endpoints attach to segment interiors.** A pin tip, or a wire endpoint, landing on another
+   wire's interior is connected (KiCad's implicit T). A crossing where neither wire has an
+   endpoint still requires an explicit `Junction`. v1 unioned only coincident vertices, so a pin
+   touching the middle of a wire silently floated.
+3. **Buses carry connectivity.** §2.6's "parse + expand only" is closed: `buses[]` polylines,
+   `bus_entries[]` and bus labels now resolve member nets. `net_info[member].bus` names the owner.
+
+### 5.2 Naming
+
+Every connectivity class gets a stable internal id (`net_info[name].id`). The DISPLAY name still
+follows §1's priority, but two DISTINCT classes may no longer collapse because their names
+collide: the lower-priority one is disambiguated as `<name>@<sheet>`. v1 keyed the emitted `nets`
+map on the bare label text and warned that distinct roots were "shorted-by-name" — that warning is
+gone because the condition cannot occur.
+
+### 5.3 Output additions
+
+```json
+{ "nets": {"GND": [{"sym","pin","ref","type","xy","sheet"}, …]},
+  "by_pin": {…},
+  "by_object": {"w3":"GND","l2":"GND","p1":"GND","b1":"D[0..7]"},
+  "components": [{…,"syms":["s1","s3"],"units":2,"in_bom":true,"on_board":true,"datasheet":""}],
+  "net_info": {"GND": {"id":"n4","sheets":["sh1"],"labels":[…],"bus":null,"members":6,
+                       "drivers":["power_out"],"has_power_source":true}},
+  "buses": {"D[0..7]": ["D0","D1", …]},
+  "warnings": [ … ] }
+```
+`by_object` maps a document entity id to its net — the GUI's only way to highlight or dim a net
+without re-deriving connectivity. `components` groups **multi-unit** instances: one entry per
+physical reference with merged pins (v1 emitted one component per symbol instance, so two units of
+U1 became two BOM lines and two footprints). `in_bom`/`on_board` now reach `sync`, which
+previously dropped every DNP part and then reported its footprint as removable.
+
+## 6. v1.1 ERC corrections and additions
+
+**Drive levels** replace the v1 boolean: `power_out`=4, `output`=3,
+`bidirectional`/`tri_state`/`open_collector`/`open_emitter`=2, `passive`/`free`/`unspecified`=1,
+`input`/`power_in`=0. v1 classified `passive` as a driver, so an input-plus-resistor net never
+raised `no_driver`.
+
+**Power sources are real sources.** `has_power_source` is true only for a `power_out` pin or a
+`PWR_FLAG` port. v1 treated *any* power port as a source, so a plain `GND` symbol silently
+satisfied `power_not_driven`. The new `power_flag_needed` warning names the remedy.
+
+**`no_connect_connected`** fires on ANY conductive attachment to the flagged pin. v1 required the
+net to have >1 pin, so an NC pin wired to a dangling stub was missed. `no_connect_dangling` covers
+a marker that touches no pin.
+
+**`duplicate_ref`** permits two symbols sharing a ref when their `libid` matches and their `unit`
+differs; a genuine collision is `unit_ref_conflict`.
+
+Added rules: `conflicting_labels`, `similar_labels`, `missing_value`, `bus_member_mismatch`,
+`sheet_pin_not_connected`, `unit_ref_conflict`, `symbol_off_grid`, `power_flag_needed`,
+`pin_type_unspecified`, and `not_a_schematic` (so an empty result on a non-schematic cannot be
+read as "clean"). The pin-type matrix is the full symmetric KiCad table over all twelve pin types,
+not v1's four pairs. Every violation carries an `xy` when one is derivable — the canvas draws a
+marker there.

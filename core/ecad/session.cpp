@@ -12,6 +12,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,7 +28,11 @@ namespace fs = std::filesystem;
 #include "ecad/impedance.h"
 #include "ecad/kicad.h"
 #include "ecad/netlist.h"
+#include "ecad/recipes.h"
 #include "ecad/schema.h"
+#include "ecad/schexport.h"
+#include "ecad/schplot.h"
+#include "ecad/symlib.h"
 #include "ecad/sync.h"
 #include "ecad/zonefill.h"
 #include "sim/netlist.h"
@@ -45,7 +50,9 @@ struct Session {
     std::string doc_id;
     json doc;
     long revision = 0;
-    std::string path;
+    std::string path;          // native .ecad+ save target ("" until first save)
+    std::string source_path;   // foreign file this doc was imported from ("" if native)
+    std::string source_format;  // "kicad_sch" | "kicad_pcb" | "" (native)
     bool dirty = false;
     std::vector<std::string> undo_stack;  // canonical JSON snapshots (doc only)
     std::vector<std::string> redo_stack;
@@ -278,37 +285,147 @@ bool ecad_close(const std::string& doc_id) {
     return g_sessions.erase(doc_id) > 0;
 }
 
-json ecad_describe(const std::string& doc_id) {
+json ecad_describe(const std::string& doc_id, long budget) {
     EcadLock lk;
     Session& s = require_session(doc_id);
     const json& doc = s.doc;
-    json compile_info = s.last_compile.is_null() ? json::object() : s.last_compile;
-    int nets = 0;
-    if (compile_info.is_object() && compile_info.contains("stats") &&
-        compile_info["stats"].contains("nets"))
-        nets = compile_info["stats"]["nets"].get<int>();
-    int erc_violations = 0;
-    if (compile_info.is_object() && compile_info.contains("erc") && compile_info["erc"].is_array())
-        erc_violations = (int)compile_info["erc"].size();
-    int drc_violations = 0;
-    if (compile_info.is_object() && compile_info.contains("drc") && compile_info["drc"].is_array())
-        drc_violations = (int)compile_info["drc"].size();
-    int unrouted = 0;
-    if (compile_info.is_object() && compile_info.contains("stats") &&
-        compile_info["stats"].contains("unrouted"))
-        unrouted = compile_info["stats"]["unrouted"].get<int>();
-    auto len = [&](const char* k) -> int {
-        return doc.contains(k) && doc[k].is_array() ? (int)doc[k].size() : 0;
+    if (budget <= 0) budget = 4000;
+
+    // The compile is authoritative. A session that has never compiled (or whose last
+    // compile threw) must say so instead of reporting zero violations — a silent 0 is
+    // indistinguishable from a clean design.
+    const bool compiled = s.last_compile.is_object();
+    json compile_info = compiled ? s.last_compile : json::object();
+
+    auto arr = [&](const char* k) -> const json* {
+        auto it = doc.find(k);
+        return (it != doc.end() && it->is_array()) ? &*it : nullptr;
     };
+    auto len = [&](const char* k) -> int {
+        const json* a = arr(k);
+        return a ? (int)a->size() : 0;
+    };
+    auto tally = [&](const char* key, int& errors, int& warnings) {
+        auto it = compile_info.find(key);
+        if (it == compile_info.end() || !it->is_array()) return;
+        for (const auto& v : *it) {
+            if (v.value("severity", std::string()) == "error")
+                ++errors;
+            else
+                ++warnings;
+        }
+    };
+    // The worst violations first, bounded — an unbounded dump blows the AI's context.
+    auto top_violations = [&](const char* key, std::size_t cap) {
+        json out = json::array();
+        auto it = compile_info.find(key);
+        if (it == compile_info.end() || !it->is_array()) return out;
+        std::vector<const json*> sorted;
+        sorted.reserve(it->size());
+        for (const auto& v : *it) sorted.push_back(&v);
+        std::stable_sort(sorted.begin(), sorted.end(), [](const json* a, const json* b) {
+            bool ae = a->value("severity", std::string()) != "error";
+            bool be = b->value("severity", std::string()) != "error";
+            if (ae != be) return !ae;
+            return a->value("rule", std::string()) < b->value("rule", std::string());
+        });
+        for (const json* v : sorted) {
+            if (out.size() >= cap) break;
+            out.push_back(json{{"rule", v->value("rule", std::string())},
+                               {"severity", v->value("severity", std::string())},
+                               {"net", v->value("net", std::string())},
+                               {"message", v->value("message", std::string())}});
+        }
+        return out;
+    };
+
+    json out{{"kind", schema::doc_kind(doc)},
+             {"name", doc.value("name", std::string())},
+             {"revision", s.revision},
+             {"compiled", compiled},
+             {"path", s.path},
+             {"source_path", s.source_path}};
+
     if (schema::is_schematic(doc)) {
-        return json{{"kind", "sch"}, {"name", doc.value("name", std::string())},
-                    {"revision", s.revision}, {"symbols", len("symbols")}, {"wires", len("wires")},
-                    {"nets", nets}, {"erc_violations", erc_violations}};
+        int erc_err = 0, erc_warn = 0;
+        tally("erc", erc_err, erc_warn);
+        out["counts"] = json{{"sheets", std::max(len("sheets"), 1)},
+                             {"symbols", len("symbols")},
+                             {"wires", len("wires")},
+                             {"buses", len("buses")},
+                             {"bus_entries", len("bus_entries")},
+                             {"junctions", len("junctions")},
+                             {"labels", len("labels")},
+                             {"power", len("power")},
+                             {"no_connect", len("no_connect")},
+                             {"texts", len("texts")},
+                             {"graphics", len("graphics")},
+                             {"sheet_symbols", len("sheet_symbols")}};
+        json sheets = json::array();
+        if (const json* sh = arr("sheets"))
+            for (const auto& e : *sh)
+                sheets.push_back(json{{"id", e.value("id", std::string())},
+                                      {"name", e.value("name", std::string())}});
+        out["sheets"] = sheets;
+
+        // Net table, largest nets first, trimmed to the character budget.
+        json nets = json::array();
+        int net_count = 0;
+        auto ni = compile_info.find("netlist");
+        if (ni != compile_info.end() && ni->is_object()) {
+            auto nn = ni->find("nets");
+            if (nn != ni->end() && nn->is_object()) {
+                net_count = (int)nn->size();
+                std::vector<std::pair<std::string, int>> by_size;
+                by_size.reserve(nn->size());
+                for (auto it2 = nn->begin(); it2 != nn->end(); ++it2)
+                    by_size.emplace_back(it2.key(),
+                                         it2.value().is_array() ? (int)it2.value().size() : 0);
+                std::stable_sort(by_size.begin(), by_size.end(),
+                                 [](const std::pair<std::string, int>& a,
+                                    const std::pair<std::string, int>& b) {
+                                     if (a.second != b.second) return a.second > b.second;
+                                     return a.first < b.first;
+                                 });
+                long spent = 0;
+                for (const auto& kv : by_size) {
+                    spent += (long)kv.first.size() + 12;
+                    if (spent > budget) break;
+                    nets.push_back(json{{"net", kv.first}, {"pins", kv.second}});
+                }
+            }
+        }
+        out["nets"] = net_count;
+        out["net_table"] = nets;
+        out["net_table_truncated"] = (int)nets.size() < net_count;
+        out["erc"] = json{{"available", compiled}, {"errors", erc_err}, {"warnings", erc_warn},
+                          {"top", top_violations("erc", 12)}};
+        // Kept for callers written against the pre-budget shape.
+        out["symbols"] = len("symbols");
+        out["wires"] = len("wires");
+        out["erc_violations"] = erc_err + erc_warn;
+        return out;
     }
-    return json{{"kind", "pcb"}, {"name", doc.value("name", std::string())},
-                {"revision", s.revision}, {"footprints", len("footprints")},
-                {"tracks", len("tracks")}, {"vias", len("vias")}, {"nets", nets},
-                {"unrouted", unrouted}, {"drc_violations", drc_violations}};
+
+    int drc_err = 0, drc_warn = 0;
+    tally("drc", drc_err, drc_warn);
+    int unrouted = 0;
+    auto st = compile_info.find("stats");
+    if (st != compile_info.end() && st->is_object() && st->contains("unrouted") &&
+        (*st)["unrouted"].is_number())
+        unrouted = (*st)["unrouted"].get<int>();
+    out["counts"] = json{{"footprints", len("footprints")}, {"tracks", len("tracks")},
+                         {"vias", len("vias")}, {"zones", len("zones")},
+                         {"nets", len("nets")}};
+    out["nets"] = len("nets");
+    out["unrouted"] = unrouted;
+    out["drc"] = json{{"available", compiled}, {"errors", drc_err}, {"warnings", drc_warn},
+                      {"top", top_violations("drc", 12)}};
+    out["footprints"] = len("footprints");
+    out["tracks"] = len("tracks");
+    out["vias"] = len("vias");
+    out["drc_violations"] = drc_err + drc_warn;
+    return out;
 }
 
 json ecad_schema(const std::string& kind) {
@@ -379,51 +496,204 @@ json ecad_dfm_board(const json& board, const json& rules) {
     return dfm_response(board, rules);
 }
 
-json ecad_export(const json& params) {
-    std::string kind = params.value("kind", std::string());
-    json opts = params.contains("opts") && params["opts"].is_object() ? params["opts"]
-                                                                       : json::object();
+namespace {
 
-    // resolve the board doc: stateless inline `board` wins (parity-harness path),
-    // else the session document.
-    json board;
+// Conventional on-disk filename for one exported logical key. Gerber keys are layer
+// ids and map to the RS-274X extensions fabricators expect; everything else is a
+// single well-known artifact.
+std::string export_filename(const std::string& kind, const std::string& key,
+                            const std::string& stem, const json& opts) {
+    auto plain = [&](const char* ext) { return stem + ext; };
+    if (kind == "gerber") {
+        static const std::map<std::string, std::string> kExt = {
+            {"F.Cu", ".GTL"},     {"B.Cu", ".GBL"},    {"F.SilkS", ".GTO"},
+            {"B.SilkS", ".GBO"},  {"F.Mask", ".GTS"},  {"B.Mask", ".GBS"},
+            {"F.Paste", ".GTP"},  {"B.Paste", ".GBP"}, {"Edge.Cuts", ".GKO"},
+            {"F.Fab", ".GM2"},    {"B.Fab", ".GM3"},   {"F.CrtYd", ".GM4"},
+            {"B.CrtYd", ".GM5"}};
+        auto it = kExt.find(key);
+        if (it != kExt.end()) return stem + it->second;
+        // Inner copper: In1.Cu -> .G2, In2.Cu -> .G3, ...
+        if (key.rfind("In", 0) == 0) {
+            const std::size_t dot = key.find('.');
+            const std::string n = key.substr(2, dot == std::string::npos ? dot : dot - 2);
+            if (!n.empty() && n.find_first_not_of("0123456789") == std::string::npos)
+                return stem + ".G" + std::to_string(std::stoi(n) + 1);
+        }
+        std::string safe = key;
+        for (char& c : safe)
+            if (c == '.' || c == '/' || c == '\\') c = '_';
+        return stem + "-" + safe + ".gbr";
+    }
+    if (kind == "drill") return stem + (key == "npth" ? "-NPTH.drl" : "-PTH.drl");
+    if (kind == "cpl") return plain("-cpl.csv");
+    if (kind == "bom")
+        return plain(opts.value("fmt", std::string("csv")) == "json" ? "-bom.json" : "-bom.csv");
+    if (kind == "netlist") return plain(".net");
+    if (kind == "spice") return plain(".cir");
+    if (kind == "kicad") return plain(".kicad_sch");
+    if (kind == "pdf") return plain(".pdf");
+    if (kind == "svg") return key.empty() ? plain(".svg") : stem + "-" + key + ".svg";
+    return stem + "-" + key;
+}
+
+// True when `p` should be treated as a DIRECTORY to drop files into rather than the
+// literal output file: it exists as a directory, ends in a separator, or has no
+// extension on its final component.
+bool looks_like_directory(const std::string& p) {
+    if (p.empty()) return false;
+    std::error_code ec;
+    if (fs::is_directory(fs::path(p), ec)) return true;
+    const char last = p.back();
+    if (last == '/' || last == '\\') return true;
+    const std::string leaf = fs::path(p).filename().string();
+    return leaf.find('.') == std::string::npos;
+}
+
+// Write every produced file. `path` empty -> nothing is written and `paths` is empty
+// (the caller keeps the in-memory text). Never reports a write it did not do.
+json write_export_files(const json& files, const std::string& kind, const std::string& path,
+                        const std::string& stem, const json& opts) {
+    json paths = json::array();
+    if (path.empty() || !files.is_object() || files.empty()) return paths;
+
+    const bool as_dir = files.size() > 1 || looks_like_directory(path);
+    std::error_code ec;
+    if (as_dir) fs::create_directories(fs::path(path), ec);
+    else if (fs::path(path).has_parent_path())
+        fs::create_directories(fs::path(path).parent_path(), ec);
+
+    for (auto it = files.begin(); it != files.end(); ++it) {
+        if (!it.value().is_string()) continue;
+        const fs::path target =
+            as_dir ? fs::path(path) / export_filename(kind, it.key(), stem, opts) : fs::path(path);
+        std::ofstream fh(target, std::ios::binary | std::ios::trunc);
+        if (!fh)
+            throw OpError("io_error", "ecad_export: cannot write '" + target.string() + "'",
+                          {{"path", target.string()}, {"kind", kind}});
+        const std::string& text = it.value().get_ref<const std::string&>();
+        fh.write(text.data(), (std::streamsize)text.size());
+        if (!fh)
+            throw OpError("io_error", "ecad_export: write failed for '" + target.string() + "'",
+                          {{"path", target.string()}, {"kind", kind}});
+        paths.push_back(target.string());
+    }
+    return paths;
+}
+
+plot::PlotOpts plot_opts_from(const json& opts) {
+    plot::PlotOpts po;
+    po.sheet = opts.value("sheet", std::string());
+    if (opts.contains("frame") && opts["frame"].is_boolean()) po.frame = opts["frame"].get<bool>();
+    if (opts.contains("title_block") && opts["title_block"].is_boolean())
+        po.title_block = opts["title_block"].get<bool>();
+    if (opts.contains("pin_numbers") && opts["pin_numbers"].is_boolean())
+        po.pin_numbers = opts["pin_numbers"].get<bool>();
+    if (opts.contains("pin_names") && opts["pin_names"].is_boolean())
+        po.pin_names = opts["pin_names"].get<bool>();
+    po.paper = opts.value("paper", std::string("A4"));
+    if (opts.contains("margin_mm") && opts["margin_mm"].is_number())
+        po.margin_mm = opts["margin_mm"].get<double>();
+    return po;
+}
+
+// A filesystem-safe stem for the exported artifacts, from the document name.
+std::string export_stem(const json& doc) {
+    std::string stem = doc.is_object() ? doc.value("name", std::string()) : std::string();
+    if (stem.empty()) stem = schema::is_board(doc) ? "board" : "schematic";
+    for (char& c : stem)
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
+            c == '>' || c == '|')
+            c = '_';
+    return stem;
+}
+
+}  // namespace
+
+json ecad_export(const json& params) {
+    const std::string kind = params.value("kind", std::string());
+    const json opts = params.contains("opts") && params["opts"].is_object() ? params["opts"]
+                                                                            : json::object();
+    const std::string path = params.value("path", std::string());
+
+    // Resolve the document: a stateless inline `board`/`doc` wins (parity-harness path),
+    // else the open session.
+    json doc;
     if (params.contains("board") && params["board"].is_object()) {
-        board = params["board"];
+        doc = params["board"];
+    } else if (params.contains("doc") && params["doc"].is_object()) {
+        doc = params["doc"];
     } else {
         EcadLock lk;
         Session& s = require_session(params.value("doc_id", std::string()));
-        board = s.doc;
+        doc = s.doc;
     }
 
-    if (kind == "gerber" || kind == "drill" || kind == "bom" || kind == "cpl") {
-        if (!schema::is_board(board))
+    static const std::set<std::string> kPcbKinds = {"gerber", "drill", "cpl"};
+    static const std::set<std::string> kSchKinds = {"netlist", "spice", "kicad", "svg", "pdf"};
+    const bool is_pcb = schema::is_board(doc);
+    const bool is_sch = schema::is_schematic(doc);
+
+    if (kPcbKinds.count(kind)) {
+        if (!is_pcb)
             throw OpError("invalid_op", kind + " export requires a pcb document",
-                          {{"reason", "wrong doc kind"}});
+                          {{"reason", "wrong doc kind"}, {"kind", kind}});
+    } else if (kSchKinds.count(kind)) {
+        if (!is_sch)
+            throw OpError("invalid_op", kind + " export requires a sch document",
+                          {{"reason", "wrong doc kind"}, {"kind", kind}});
+    } else if (kind == "bom") {
+        // BOM is meaningful from EITHER side: the board knows placements, the schematic
+        // knows the netlist's components. Both are supported.
+        if (!is_pcb && !is_sch)
+            throw OpError("invalid_op", "bom export requires an ECAD document",
+                          {{"reason", "wrong doc kind"}, {"kind", kind}});
     } else {
         throw OpError("invalid_op", "ecad_export: unknown kind '" + kind + "'", {{"kind", kind}});
     }
 
     json files = json::object();
+    json warnings = json::array();
     if (kind == "gerber") {
-        for (auto& kv : fab::write_gerbers(board)) files[kv.first] = kv.second;
+        for (auto& kv : fab::write_gerbers(doc)) files[kv.first] = kv.second;
     } else if (kind == "drill") {
-        for (auto& kv : fab::write_drill(board)) files[kv.first] = kv.second;
-    } else if (kind == "bom") {
-        std::string fmt = opts.value("fmt", std::string("csv"));
-        bool excl = opts.contains("exclude_dnp") && opts["exclude_dnp"].is_boolean()
-                        ? opts["exclude_dnp"].get<bool>()
-                        : true;
-        files["bom"] = fab::write_bom(board, fmt, excl);
+        for (auto& kv : fab::write_drill(doc)) files[kv.first] = kv.second;
     } else if (kind == "cpl") {
-        bool excl_tht = opts.contains("exclude_tht") && opts["exclude_tht"].is_boolean()
-                            ? opts["exclude_tht"].get<bool>()
-                            : true;
-        bool excl_virt = opts.contains("exclude_virtual") && opts["exclude_virtual"].is_boolean()
-                             ? opts["exclude_virtual"].get<bool>()
-                             : true;
-        files["cpl"] = fab::write_placement(board, excl_tht, excl_virt);
+        const bool excl_tht = opts.contains("exclude_tht") && opts["exclude_tht"].is_boolean()
+                                  ? opts["exclude_tht"].get<bool>()
+                                  : true;
+        const bool excl_virt = opts.contains("exclude_virtual") && opts["exclude_virtual"].is_boolean()
+                                   ? opts["exclude_virtual"].get<bool>()
+                                   : true;
+        files["cpl"] = fab::write_placement(doc, excl_tht, excl_virt);
+    } else if (kind == "bom") {
+        const std::string fmt = opts.value("fmt", std::string("csv"));
+        const bool excl = opts.contains("exclude_dnp") && opts["exclude_dnp"].is_boolean()
+                              ? opts["exclude_dnp"].get<bool>()
+                              : true;
+        files["bom"] = is_pcb ? fab::write_bom(doc, fmt, excl)
+                              : fab::write_sch_bom(build_netlist(doc), fmt, excl);
+    } else if (kind == "netlist") {
+        files["netlist"] = fab::write_sch_netlist(doc, build_netlist(doc));
+    } else if (kind == "spice") {
+        files["spice"] = fab::write_spice_deck(doc, build_netlist(doc));
+    } else if (kind == "kicad") {
+        files["kicad"] = kicad::export_kicad_sch(doc);
+        warnings.push_back(
+            "kicad export is best-effort: chudware-only fields are written as properties");
+    } else if (kind == "svg") {
+        for (const auto& page : plot::schematic_svg_pages(doc, plot_opts_from(opts)))
+            files[page.first] = page.second;
+    } else if (kind == "pdf") {
+        files["pdf"] = plot::schematic_pdf(doc, plot_opts_from(opts));
     }
-    return json{{"files", files}};
+
+    const std::string stem = export_stem(doc);
+    json out{{"files", files},
+             {"paths", write_export_files(files, kind, path, stem, opts)},
+             {"kind", kind}};
+    if (!warnings.empty()) out["warnings"] = warnings;
+    return out;
 }
 
 // ------------------------------------------------------------------- save / open
@@ -436,10 +706,20 @@ json ecad_save(const std::string& doc_id, const std::string& path) {
         throw OpError("io_error",
                       "ecad_save: no path given and document has no current path",
                       {{"reason", "missing path"}});
+    // Refuse to write a ZIP container over a foreign source file even if the caller
+    // asks explicitly — that silently destroys the user's .kicad_sch.
+    if (!s.source_path.empty() && fs::path(target) == fs::path(s.source_path))
+        throw OpError("io_error",
+                      "ecad_save: refusing to overwrite the imported source '" + s.source_path +
+                          "' with a .ecad+ container — save elsewhere, or use "
+                          "ecad_export(kind=\"kicad\") to write KiCad text back",
+                      {{"reason", "foreign source"}, {"source_path", s.source_path}});
     std::string out = ecad_container_save(s.doc, target, s.extra_entries);
     s.path = out;
     s.dirty = false;
-    return json{{"path", out}};
+    json resp{{"path", out}, {"format", "ecad+"}};
+    if (!s.source_path.empty()) resp["source_path"] = s.source_path;
+    return resp;
 }
 
 json ecad_open(const std::string& path) {
@@ -486,7 +766,17 @@ json ecad_open(const std::string& path) {
     s.doc = doc;                   // open_session deep-copies the doc
     s.doc["id"] = s.doc_id;        // Python uses uuid4; the session id is faithful here
     s.revision = 0;
-    s.path = path;
+    if (suffix == ".kicad_sch" || suffix == ".kicad_pcb") {
+        // Imported foreign file: remember where it came from, and point the NATIVE save
+        // target at a sibling .ecad+ so a pathless Save can never clobber the source.
+        s.source_path = path;
+        s.source_format = suffix == ".kicad_sch" ? "kicad_sch" : "kicad_pcb";
+        s.path = fs::path(path).replace_extension(".ecad+").string();
+        load_warnings.push_back("imported " + s.source_format + " — Save writes the native '" +
+                                s.path + "'; the source file is left untouched");
+    } else {
+        s.path = path;
+    }
     s.extra_entries = std::move(extra_entries);
     Session& stored = g_sessions[s.doc_id] = std::move(s);
 
@@ -887,6 +1177,446 @@ json ecad_session_doc(const std::string& doc_id) {
     EcadLock lk;
     Session& s = require_session(doc_id);
     return s.doc;  // value semantics -> deep copy
+}
+
+// ------------------------------------------------------------------ resolve_pick
+
+namespace {
+
+// Squared distance from p to segment ab.
+double seg_dist2(double px, double py, double ax, double ay, double bx, double by) {
+    const double vx = bx - ax, vy = by - ay;
+    const double len2 = vx * vx + vy * vy;
+    double t = 0.0;
+    if (len2 > 1e-18) t = std::max(0.0, std::min(1.0, ((px - ax) * vx + (py - ay) * vy) / len2));
+    const double dx = px - (ax + t * vx), dy = py - (ay + t * vy);
+    return dx * dx + dy * dy;
+}
+
+bool xy_of(const json& j, const char* key, double& x, double& y) {
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_array() || it->size() < 2) return false;
+    if (!(*it)[0].is_number() || !(*it)[1].is_number()) return false;
+    x = (*it)[0].get<double>();
+    y = (*it)[1].get<double>();
+    return true;
+}
+
+bool polyline_hit(const json& obj, const char* key, double px, double py, double tol2,
+                  double& best2) {
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_array() || it->size() < 2) return false;
+    bool hit = false;
+    for (std::size_t i = 0; i + 1 < it->size(); ++i) {
+        const json& a = (*it)[i];
+        const json& b = (*it)[i + 1];
+        if (!a.is_array() || a.size() < 2 || !b.is_array() || b.size() < 2) continue;
+        const double d2 = seg_dist2(px, py, a[0].get<double>(), a[1].get<double>(),
+                                    b[0].get<double>(), b[1].get<double>());
+        if (d2 <= tol2 && d2 < best2) {
+            best2 = d2;
+            hit = true;
+        }
+    }
+    return hit;
+}
+
+}  // namespace
+
+json ecad_resolve_pick(const std::string& doc_id, const json& xy, const json& kinds, double tol,
+                       const std::string& layer) {
+    EcadLock lk;
+    Session& s = require_session(doc_id);
+    const json& doc = s.doc;
+    if (!xy.is_array() || xy.size() < 2 || !xy[0].is_number() || !xy[1].is_number())
+        throw OpError("invalid_op", "ecad_resolve_pick: xy must be [x, y] in mm",
+                      {{"reason", "bad xy"}});
+    const double px = xy[0].get<double>(), py = xy[1].get<double>();
+    if (!(tol > 0.0)) tol = 1.27;  // half a 2.54 mm grid step
+    const double tol2 = tol * tol;
+
+    std::set<std::string> want;
+    if (kinds.is_array())
+        for (const auto& k : kinds)
+            if (k.is_string()) want.insert(k.get<std::string>());
+    auto wanted = [&](const char* kind) { return want.empty() || want.count(kind) > 0; };
+
+    // Best hit wins within a kind; kinds are tried most-specific first so a pin beats the
+    // symbol it belongs to and a pad beats its footprint.
+    json best = nullptr;
+    double best2 = tol2 * 4.0 + 1.0;
+    auto take = [&](json sel, double d2) {
+        if (d2 < best2) {
+            best2 = d2;
+            best = std::move(sel);
+        }
+    };
+    auto point_hit = [&](const json& obj, const char* key, double& d2) {
+        double x = 0, y = 0;
+        if (!xy_of(obj, key, x, y)) return false;
+        d2 = (px - x) * (px - x) + (py - y) * (py - y);
+        return d2 <= tol2;
+    };
+
+    if (schema::is_schematic(doc)) {
+        // 1. pins (highest priority — this is what a wire must snap to)
+        if (wanted("pin") && doc.contains("symbols") && doc["symbols"].is_array()) {
+            const json lib = doc.value("lib_cache", json::object());
+            for (const auto& sym : doc["symbols"]) {
+                const json def = lib.value(sym.value("libid", std::string()), json::object());
+                if (!def.contains("pins") || !def["pins"].is_array()) continue;
+                const int unit = sym.contains("unit") && sym["unit"].is_number()
+                                     ? sym["unit"].get<int>()
+                                     : 1;
+                for (const auto& pin : def["pins"]) {
+                    const int pu = pin.contains("unit") && pin["unit"].is_number()
+                                       ? pin["unit"].get<int>()
+                                       : 1;
+                    if (pu != unit && pu != 0) continue;
+                    const std::pair<double, double> w = schema::pin_world(sym, pin);
+                    const double d2 = (px - w.first) * (px - w.first) +
+                                      (py - w.second) * (py - w.second);
+                    if (d2 <= tol2)
+                        take(json{{"kind", "pin"},
+                                  {"id", sym.value("id", std::string())},
+                                  {"sym", sym.value("id", std::string())},
+                                  {"ref", sym.value("ref", std::string())},
+                                  {"pin", pin.value("number", std::string())},
+                                  {"sheet", sym.value("sheet", std::string("sh1"))},
+                                  {"xy", json::array({w.first, w.second})}},
+                             d2);
+                }
+            }
+        }
+        // 2. point entities
+        struct PointKind { const char* arr; const char* kind; };
+        static const PointKind kPointKinds[] = {{"junctions", "junction"},
+                                                {"no_connect", "no_connect"},
+                                                {"power", "power"},
+                                                {"labels", "label"},
+                                                {"bus_entries", "bus_entry"},
+                                                {"texts", "text"},
+                                                {"sheet_symbols", "sheet_symbol"}};
+        for (const PointKind& pk : kPointKinds) {
+            if (!wanted(pk.kind) || !doc.contains(pk.arr) || !doc[pk.arr].is_array()) continue;
+            for (const auto& e : doc[pk.arr]) {
+                double d2 = 0;
+                if (!point_hit(e, "pos", d2)) continue;
+                json sel{{"kind", pk.kind}, {"id", e.value("id", std::string())},
+                         {"sheet", e.value("sheet", std::string("sh1"))}};
+                if (e.contains("text")) sel["text"] = e["text"];
+                if (e.contains("net")) sel["net"] = e["net"];
+                take(std::move(sel), d2);
+            }
+        }
+        // 3. symbol bodies (a click inside the body, not on a pin)
+        if (wanted("symbol") && doc.contains("symbols") && doc["symbols"].is_array()) {
+            for (const auto& sym : doc["symbols"]) {
+                double d2 = 0;
+                if (!point_hit(sym, "pos", d2)) continue;
+                take(json{{"kind", "symbol"}, {"id", sym.value("id", std::string())},
+                          {"ref", sym.value("ref", std::string())},
+                          {"libid", sym.value("libid", std::string())},
+                          {"sheet", sym.value("sheet", std::string("sh1"))}},
+                     d2);
+            }
+        }
+        // 4. polylines
+        struct LineKind { const char* arr; const char* kind; };
+        static const LineKind kLineKinds[] = {{"wires", "wire"}, {"buses", "bus"},
+                                              {"graphics", "graphic"}};
+        for (const LineKind& lk2 : kLineKinds) {
+            if (!wanted(lk2.kind) || !doc.contains(lk2.arr) || !doc[lk2.arr].is_array()) continue;
+            for (const auto& e : doc[lk2.arr]) {
+                double d2 = best2;
+                if (!polyline_hit(e, "pts", px, py, tol2, d2)) continue;
+                json sel{{"kind", lk2.kind}, {"id", e.value("id", std::string())},
+                         {"sheet", e.value("sheet", std::string("sh1"))}};
+                if (e.contains("name")) sel["name"] = e["name"];
+                take(std::move(sel), d2);
+            }
+        }
+        // Attach the resolved net when the compile knows one.
+        if (best.is_object() && s.last_compile.is_object()) {
+            const json nl = s.last_compile.value("netlist", json::object());
+            const json by_pin = nl.is_object() ? nl.value("by_pin", json::object()) : json::object();
+            if (best.value("kind", std::string()) == "pin") {
+                const std::string key = best.value("sym", std::string()) + "." +
+                                        best.value("pin", std::string());
+                if (by_pin.contains(key)) best["net"] = by_pin[key];
+            }
+        }
+        return json{{"selector", best}};
+    }
+
+    // Board picking: pad > via > track > zone > footprint, honoring an optional layer filter.
+    auto on_layer = [&](const json& e) {
+        if (layer.empty()) return true;
+        if (e.contains("layer") && e["layer"].is_string()) return e["layer"] == layer;
+        if (e.contains("layers") && e["layers"].is_array())
+            for (const auto& l : e["layers"])
+                if (l.is_string() && l.get<std::string>() == layer) return true;
+        return !e.contains("layer") && !e.contains("layers");
+    };
+    if (wanted("pad") && doc.contains("footprints") && doc["footprints"].is_array()) {
+        for (const auto& fp : doc["footprints"]) {
+            if (!fp.contains("pads") || !fp["pads"].is_array()) continue;
+            for (const auto& pad : fp["pads"]) {
+                if (!on_layer(pad)) continue;
+                const std::pair<double, double> w = schema::pad_world(fp, pad);
+                const double d2 = (px - w.first) * (px - w.first) + (py - w.second) * (py - w.second);
+                if (d2 <= tol2)
+                    take(json{{"kind", "pad"}, {"id", fp.value("id", std::string())},
+                              {"fp", fp.value("id", std::string())},
+                              {"ref", fp.value("ref", std::string())},
+                              {"pad", pad.value("number", std::string())},
+                              {"net", pad.value("net", std::string())},
+                              {"xy", json::array({w.first, w.second})}},
+                         d2);
+            }
+        }
+    }
+    if (wanted("via") && doc.contains("vias") && doc["vias"].is_array())
+        for (const auto& v : doc["vias"]) {
+            double d2 = 0;
+            if (point_hit(v, "at", d2))
+                take(json{{"kind", "via"}, {"id", v.value("id", std::string())},
+                          {"net", v.value("net", std::string())}},
+                     d2);
+        }
+    if (wanted("track") && doc.contains("tracks") && doc["tracks"].is_array())
+        for (const auto& t : doc["tracks"]) {
+            if (!on_layer(t)) continue;
+            double ax = 0, ay = 0, bx = 0, by = 0;
+            if (!xy_of(t, "p1", ax, ay) || !xy_of(t, "p2", bx, by)) continue;
+            const double half = t.contains("width") && t["width"].is_number()
+                                    ? t["width"].get<double>() * 0.5
+                                    : 0.0;
+            const double reach = tol + half;
+            const double d2 = seg_dist2(px, py, ax, ay, bx, by);
+            if (d2 <= reach * reach)
+                take(json{{"kind", "track"}, {"id", t.value("id", std::string())},
+                          {"net", t.value("net", std::string())},
+                          {"layer", t.value("layer", std::string())}},
+                     d2);
+        }
+    if (wanted("zone") && doc.contains("zones") && doc["zones"].is_array())
+        for (const auto& z : doc["zones"]) {
+            if (!on_layer(z)) continue;
+            double d2 = best2;
+            if (polyline_hit(z, "polygon", px, py, tol2, d2))
+                take(json{{"kind", "zone"}, {"id", z.value("id", std::string())},
+                          {"net", z.value("net", std::string())},
+                          {"layer", z.value("layer", std::string())}},
+                     d2);
+        }
+    if (wanted("footprint") && doc.contains("footprints") && doc["footprints"].is_array())
+        for (const auto& fp : doc["footprints"]) {
+            double d2 = 0;
+            if (point_hit(fp, "pos", d2))
+                take(json{{"kind", "footprint"}, {"id", fp.value("id", std::string())},
+                          {"ref", fp.value("ref", std::string())},
+                          {"side", fp.value("side", std::string("top"))}},
+                     d2);
+        }
+    return json{{"selector", best}};
+}
+
+// --------------------------------------------------------------------- ecad_design
+
+namespace {
+
+// Supply-net heuristic: these get a power PORT (which merges globally and reads like a
+// real schematic) instead of a plain net label.
+bool is_supply_net(const std::string& net) {
+    static const std::set<std::string> kExact = {"GND",  "GNDA", "GNDD", "AGND", "DGND",
+                                                 "VCC",  "VDD",  "VSS",  "VEE",  "VBUS",
+                                                 "VIN",  "VOUT_RAIL"};
+    if (kExact.count(net)) return true;
+    // +5V, +3V3, -12V, 3V3 …
+    if (net.size() >= 2 && (net[0] == '+' || net[0] == '-')) return true;
+    return false;
+}
+
+// The power symbol libid for a supply net name.
+std::string power_symbol_for(const std::string& net) {
+    if (net.rfind("GND", 0) == 0 || net == "AGND" || net == "DGND" || net == "VSS")
+        return "power:GND";
+    return "power:" + net;
+}
+
+// Root (body-side) world position of a pin — pin_world with the stub length removed.
+std::pair<double, double> pin_root_world(const json& sym, const json& pin) {
+    json p = pin;
+    p["length"] = 0.0;
+    return schema::pin_world(sym, p);
+}
+
+// Locate a pin definition by NUMBER, falling back to NAME (the recipe vocabulary uses
+// "+"/"-" for sources but "1"/"2" for passives).
+const json* find_pin(const json& def, const std::string& want) {
+    auto pins = def.find("pins");
+    if (pins == def.end() || !pins->is_array()) return nullptr;
+    for (const auto& p : *pins)
+        if (p.value("number", std::string()) == want) return &p;
+    for (const auto& p : *pins)
+        if (p.value("name", std::string()) == want) return &p;
+    return nullptr;
+}
+
+}  // namespace
+
+json ecad_design(const std::string& request, const std::string& name) {
+    if (request.empty())
+        throw OpError("invalid_op", "ecad_design: request must not be empty",
+                      {{"reason", "empty request"}});
+
+    // 1. Pick + parameterize the closest deterministic recipe.
+    const json design = recipes::closest_recipe(request);
+    const std::string recipe_used = design.value("name", std::string("unknown"));
+
+    // 2. Fresh schematic session (takes and releases the store lock itself).
+    const std::string doc_name = name.empty() ? recipe_used : name;
+    json created = ecad_new("sch", doc_name);
+    const std::string doc_id = created.value("doc_id", std::string());
+    long revision = created.value("revision", 0L);
+
+    json warnings = json::array();
+
+    // 3. Place every component on a 2.54 mm grid, four per row.
+    std::vector<json> comps;
+    if (design.contains("components") && design["components"].is_array())
+        for (const auto& c : design["components"]) comps.push_back(c);
+    std::stable_sort(comps.begin(), comps.end(), [](const json& a, const json& b) {
+        return a.value("ref", std::string()) < b.value("ref", std::string());
+    });
+
+    constexpr double kColStep = 38.1;   // 15 grid steps
+    constexpr double kRowStep = 38.1;
+    constexpr int kPerRow = 4;
+    json place_ops = json::array();
+    for (std::size_t i = 0; i < comps.size(); ++i) {
+        const json& c = comps[i];
+        const double x = (double)(i % kPerRow) * kColStep;
+        const double y = -(double)(i / kPerRow) * kRowStep;
+        json op{{"op", "sch_add_symbol"},
+                {"libid", c.value("libid", std::string("Device:R"))},
+                {"pos", json::array({x, y})},
+                {"ref", c.value("ref", std::string())},
+                {"value", c.value("value", std::string())}};
+        // Everything the recipe knows that is not a placement key becomes a user field, so
+        // ac_mag / model hints survive into the document and reach the simulator.
+        json fields = json::object();
+        for (auto it = c.begin(); it != c.end(); ++it) {
+            const std::string& k = it.key();
+            if (k == "ref" || k == "libid" || k == "value" || k == "sim") continue;
+            fields[k] = it.value();
+        }
+        if (!fields.empty()) op["fields"] = fields;
+        if (c.contains("sim")) op["sim_params"] = c["sim"];
+        place_ops.push_back(std::move(op));
+    }
+    if (!place_ops.empty()) {
+        json resp = ecad_apply_ops(doc_id, revision, place_ops);
+        revision = resp.value("revision", revision);
+    }
+
+    // 4. Read the placed document back so pin geometry comes from the REAL resolved
+    //    symbol defs, never from an assumption about what the library contains.
+    json doc = ecad_session_doc(doc_id);
+    const json lib = doc.value("lib_cache", json::object());
+    std::map<std::string, json> by_ref;
+    if (doc.contains("symbols") && doc["symbols"].is_array())
+        for (const auto& s : doc["symbols"]) by_ref[s.value("ref", std::string())] = s;
+
+    // 5. Stub + name every net. A pin gets a short wire out of its tip; the far end
+    //    carries a power port (supply nets) or a net label (signal nets). Equal names
+    //    merge in the netlist, so this is real connectivity, not decoration.
+    json wire_ops = json::array();
+    std::vector<std::string> net_names;
+    if (design.contains("nets") && design["nets"].is_object())
+        for (auto it = design["nets"].begin(); it != design["nets"].end(); ++it)
+            net_names.push_back(it.key());
+    std::sort(net_names.begin(), net_names.end());
+
+    constexpr double kStub = 5.08;  // two grid steps
+    for (const std::string& net : net_names) {
+        const json& members = design["nets"][net];
+        if (!members.is_array()) continue;
+        for (const auto& m : members) {
+            const std::string ref = m.value("ref", std::string());
+            const std::string pin_key = m.value("pin", std::string());
+            auto sit = by_ref.find(ref);
+            if (sit == by_ref.end()) {
+                warnings.push_back("net " + net + ": no placed symbol for ref '" + ref + "'");
+                continue;
+            }
+            const json& sym = sit->second;
+            const json def = lib.value(sym.value("libid", std::string()), json::object());
+            const json* pin = find_pin(def, pin_key);
+            if (!pin) {
+                warnings.push_back("net " + net + ": " + ref + " has no pin '" + pin_key + "'");
+                continue;
+            }
+            const std::pair<double, double> tip = schema::pin_world(sym, *pin);
+            const std::pair<double, double> root = pin_root_world(sym, *pin);
+            double dx = tip.first - root.first, dy = tip.second - root.second;
+            const double mag = std::sqrt(dx * dx + dy * dy);
+            if (mag < 1e-9) { dx = 1.0; dy = 0.0; } else { dx /= mag; dy /= mag; }
+            const double ex = tip.first + dx * kStub, ey = tip.second + dy * kStub;
+
+            wire_ops.push_back(json{{"op", "sch_add_wire"},
+                                    {"pts", json::array({json::array({tip.first, tip.second}),
+                                                         json::array({ex, ey})})}});
+            if (is_supply_net(net))
+                wire_ops.push_back(json{{"op", "sch_add_power"},
+                                        {"pos", json::array({ex, ey})},
+                                        {"net", net},
+                                        {"symbol", power_symbol_for(net)}});
+            else
+                wire_ops.push_back(json{{"op", "sch_add_label"},
+                                        {"pos", json::array({ex, ey})},
+                                        {"text", net},
+                                        {"scope", "global"}});
+        }
+    }
+    if (!wire_ops.empty()) {
+        json resp = ecad_apply_ops(doc_id, revision, wire_ops);
+        revision = resp.value("revision", revision);
+    }
+
+    // 6. Title block from the recipe so a plotted sheet is self-describing.
+    json meta_ops = json::array();
+    meta_ops.push_back(json{{"op", "sch_set_title_block"},
+                            {"title", doc_name},
+                            {"company", "Chudware"},
+                            {"rev", "A"},
+                            {"comment1", design.value("request", request)},
+                            {"comment2", design.value("notes", std::string())}});
+    json final_resp = ecad_apply_ops(doc_id, revision, meta_ops);
+
+    final_resp["doc_id"] = doc_id;
+    final_resp["recipe_used"] = recipe_used;
+    final_resp["design"] = design;
+    final_resp["request"] = request;
+    if (design.contains("study")) final_resp["study"] = design["study"];
+    if (design.contains("notes")) final_resp["notes"] = design["notes"];
+
+    // Honesty: report the placement/naming problems AND whatever ERC says about the
+    // produced sheet. A design that did not fully wire up must not read as a success.
+    json existing = final_resp.contains("warnings") && final_resp["warnings"].is_array()
+                        ? final_resp["warnings"]
+                        : json::array();
+    for (const auto& w : warnings) existing.push_back(w);
+    int erc_errors = 0;
+    if (final_resp.contains("compile") && final_resp["compile"].is_object() &&
+        final_resp["compile"].contains("erc") && final_resp["compile"]["erc"].is_array())
+        for (const auto& v : final_resp["compile"]["erc"])
+            if (v.value("severity", std::string()) == "error") ++erc_errors;
+    final_resp["ok"] = warnings.empty() && erc_errors == 0;
+    final_resp["erc_errors"] = erc_errors;
+    if (!existing.empty()) final_resp["warnings"] = existing;
+    return final_resp;
 }
 
 // ----------------------------------------------------------------- crash recovery

@@ -8202,3 +8202,55 @@ redistributed) — drop a PDF in and cite it by page. Fixing the reference
 layer also fixed a real defect: the fit catalog's own H7/m6 bearing-seat
 recommendation was uncomputable because ISO 286 shaft `m` was missing; every
 recommendation row is now pinned computable.
+
+## 2026-08-26 — electrical schematic subsystem: connectivity truth, deliverables, editor
+
+A four-scout audit of the ECAD schematic stack found the engine computing the
+wrong answer and the surfaces around it unable to reach it. Connectivity keyed the
+union-find on a bare `Point{x,y}`, so two hierarchical sheets whose geometry happened
+to coincide were electrically shorted; a pin landing on a wire's *interior* floated
+(only exact vertex coincidence united); local labels were emitted under their bare
+text, merging same-named nets across sheets (the code warned they were
+"shorted-by-name"); buses were parse-only; and multi-unit parts emitted one component
+per unit, so U1A/U1B became two BOM lines and two footprints. ERC compounded it:
+`passive` counted as a driver so `no_driver` almost never fired, ANY power port
+counted as a power source so a plain GND symbol silently satisfied
+`power_not_driven`, and `no_connect_connected` required a second pin so an NC flag on
+a wired stub went unreported. All of that is fixed: the key is `(sheet, snapped
+point)`, endpoints attach to segment interiors (explicit junctions still required for
+true crossings), classes carry stable ids with `@sheet` disambiguation, buses/bus
+entries carry real member connectivity, units group into one component, and ERC uses
+KiCad drive levels with `PWR_FLAG` as the only power source. `netlist.cpp` now emits
+`net_info`, `buses` and `by_object` (entity id → net) — the last is what finally lets
+the canvas highlight a net without re-deriving connectivity.
+
+The subsystem could also produce **nothing**: `ecad_export` rejected every kind that
+was not `gerber|drill|bom|cpl` and each required a pcb doc, so a schematic had no
+netlist, no BOM, no SPICE deck, no KiCad output and no printable sheet. New
+`core/ecad/schexport.cpp` (netlist s-expr / BOM / SPICE) and `core/ecad/schplot.cpp`
+(SVG + a self-contained vector PDF sharing ONE `Painter` so the two can never drift)
+close that, and `ecad_export` now honors `path` and returns `paths` — it previously
+ignored `path`, wrote nothing, and the GUI toasted "Exported" unconditionally.
+`core/ecad/symlib.cpp` adds the native symbol library the C++ core never had (78
+symbols); before it, `sch_add_symbol` fabricated a generic 2-pin body for every libid.
+The op vocabulary went 42 → 62 names so every entity the schema can hold can also be
+edited and deleted, `sch_import_kicad` stopped being a registered no-op, and
+`ecad_design` — which the GUI called on every AI Design click and which **nothing
+served** — is now a native compiler from `recipes.h` to a real, wired, ERC-checked
+schematic.
+
+Two defects only showed up under verification, and both are worth remembering.
+`sch_connect` routed pin-to-pin straight through the source symbol's body; with the
+old netlist that was invisible, but once pins attach to wire interiors it became a
+genuine short (wiring U1.3 to C1.1 across a QFP48 also caught pin 34 at the same y).
+The router now escapes each pin along its own direction and rejects any candidate path
+that touches a pin it was not asked to connect. And the new on-canvas sheet frame was
+anchored at the origin extending into −y while content lives in +y, so zoom-to-fit
+unioned two disjoint regions and crushed the schematic into an unreadable clump — the
+page is now anchored around the content bbox exactly as the plotter does it.
+
+Deferred, deliberately: `sim_run`/`sim_cancel{run_id}` in `contracts/ecad/ecad_rpc.md`
+still describe an isolated circuit-sim worker that does not exist (the shipped path is
+synchronous `ecad_simulate` + mechanical `sim_cancel{job_id}`); that divergence is now
+recorded in the contract rather than papered over. `ecad_to_3d` still ignores
+`into_doc_id` and returns no `part_doc_id` — board→3D, out of scope for this pass.

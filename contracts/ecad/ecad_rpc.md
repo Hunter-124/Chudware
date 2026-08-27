@@ -44,3 +44,38 @@ compiler: keyed on `(revision, op-touched object set)` so a single-symbol edit r
 `services/mcp/ecad_tools.py` calls the kernel/engine **directly** (not via the worker socket) — same
 pattern as the existing `services/mcp/server.py` `run_model`. Worker RPC is for the C++ host; MCP is
 for external/agent callers. Both share the same `engine/ecad` core, so behavior is identical.
+
+## 5. v1.1 additions (additive — no v1 method changed shape incompatibly)
+
+| method | params → result |
+|---|---|
+| `ecad_resolve_pick` | **now served.** `{doc_id, xy, kinds?, tol?, layer?}` → `{selector}` or `{selector: null}`. Schematic priority: pin > point entities (junction/no_connect/power/label/bus_entry/text/sheet_symbol) > symbol body > polylines (wire/bus/graphic). Board priority: pad > via > track > zone > footprint. `tol` defaults 1.27 mm; a pin selector carries the resolved `net` |
+| `ecad_design` | **now served natively.** `{request, name?}` → ops-response + `doc_id` + `recipe_used` + `design` + `study?` + `ok` + `erc_errors` + `warnings`. Picks the closest deterministic recipe (`ecad/recipes.h`) and **compiles it into a real schematic document**: symbols placed on a 2.54 mm grid from `symlib`, a pin stub per connection, power ports for supply nets and global labels for signal nets, plus a title block. `ok` is false when any component/pin failed to resolve or ERC reports an error — a partially wired sheet never reports success. This replaces the Python-only orchestrator RPC the GUI used to call and which nothing served |
+| `ecad_symbols` | `{query?, limit?}` → `{ok, symbols, count[, total]}` (see `library.md §6`) |
+| `ecad_load_symbol_library` | `{path}` → `{ok, added, warnings}` (`.kicad_sym`) |
+
+### 5.1 Changed v1 methods (backward compatible)
+
+- `ecad_describe {doc_id, budget?}` — `budget` is now **honored** (default 4000 chars). The result
+  gains `compiled`, `counts` (every entity kind), `sheets`, `net_table` + `net_table_truncated`,
+  and `erc`/`drc` objects carrying `{available, errors, warnings, top[]}`. The v1 scalar keys
+  (`symbols`, `wires`, `nets`, `erc_violations`, …) are still emitted. **`available:false` means
+  the check could not run — a caller must never read it as "clean".**
+- `ecad_export {doc_id|board|doc, kind, path?, opts?}` — `path` is now **honored** and the result
+  gains `paths: [written…]` and `kind`. `files` is unchanged so remote/MCP callers can keep
+  writing the text themselves. **`paths` is empty when nothing was written**; a caller must report
+  from `paths`, never from the mere absence of an error. New schematic kinds `netlist`, `bom`,
+  `spice`, `kicad`, `svg`, `pdf` join the pcb kinds `gerber`, `drill`, `cpl`, `bom`
+  (see `fab_outputs.md §7`).
+- `ecad_save {doc_id, path?}` → `{path, format:"ecad+", source_path?}`. A session opened from a
+  `.kicad_sch`/`.kicad_pcb` records that file as `source_path` and targets the sibling
+  `<stem>.ecad+` for a pathless Save; an explicit attempt to write the container **over** the
+  imported source is refused with `io_error`. Previously a pathless Save silently replaced the
+  user's KiCad file with ZIP bytes.
+- `ecad_open {path}` — a foreign import now returns a warning naming the native save target.
+
+### 5.2 Still declared, still unserved
+
+`sim_run` / `sim_cancel {run_id}` (§2) describe an isolated circuit-sim worker. The shipped path is
+the synchronous `ecad_simulate` plus the mechanical `sim_cancel {job_id}`. This divergence is
+recorded here rather than papered over; closing it is a separate work item.

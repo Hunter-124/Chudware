@@ -153,3 +153,40 @@ and the per-sheet `ports` list remain reserved.
 - Numeric values stored as plain floats (mm). No expressions in v1 (CAD's equation engine is not
   wired into ECAD yet — reserved).
 - Forward-compat: unknown top-level/object keys preserved verbatim on load→save round-trip.
+## 8. v1.1 additions (additive; a v1 document validates unchanged)
+
+Three top-level arrays and one object join §1. Every one of them either already appeared in a
+KiCad import or was implied by §5 without ever being creatable or validated.
+
+```json
+{
+  "bus_entries": [BusEntry, ...],   // the short diagonal tapping one member out of a bus
+  "texts":       [Text, ...],       // schematic notes (was previously conflated with `graphics`)
+  "title_block": {"title":"","company":"","rev":"","date":"",
+                  "comment1":"","comment2":"","comment3":"","comment4":"","paper":"A4"}
+}
+```
+
+```json
+BusEntry { "id":"be1", "sheet":"sh1", "pos":[x,y], "size":[2.54,2.54],
+           "bus":"b1"|null, "member":"D3"|null }
+Text     { "id":"tx1", "sheet":"sh1", "pos":[x,y], "text":"...", "size":1.27, "angle":0 }
+Graphic  { "id":"g1", "sheet":"sh1", "kind":"line|rect|circle|arc|polyline",
+           "pts":[[x,y],...], "radius":0, "a0":0, "a1":0, "width":0.15, "filled":false }
+Bus      { "id":"b1", "sheet":"sh1", "name":"D[0..7]", "pts":[[x,y],...] }
+```
+
+`validate_schematic` now checks id uniqueness/prefix for `buses` (`b`), `bus_entries` (`be`),
+`texts` (`tx`), `graphics` (`g`) and `sheets` (`sh`) — v1 validated only symbols/wires/junctions/
+labels/power/no-connect/sheet-symbols, so a malformed bus or graphic passed silently. Graphic
+`kind` is checked against `schema::graphic_kinds()`; a `BusEntry.bus` must name an existing bus;
+a sheet symbol's `child` must name an existing sheet.
+
+**Multi-unit references.** Two symbols may share a non-`?` `ref` when their `libid` matches and
+their `unit` differs — that is one physical part drawn as several units, and the netlist emits it
+as ONE component. v1's validator rejected any shared ref outright, which made multi-unit parts
+unrepresentable. A shared ref with equal units is still an error (`unit_ref_conflict` in ERC).
+
+**Symbol assembly flags.** `in_bom` and `on_board` are first-class and settable (v1 hard-coded
+both to `true` at creation and offered no edit path), and `datasheet` is promoted out of `fields`
+into its own slot so the KiCad importer stops discarding it.

@@ -83,6 +83,7 @@
 #include "ecad/recipes.h"
 #include "ecad/schema.h"
 #include "ecad/session.h"
+#include "ecad/symlib.h"
 #include "cam/session.h"
 #include "cam/extract.h"
 #include "geom/aicm.h"
@@ -4064,7 +4065,45 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(json{{"closed", chudware::ecad::ecad_close(params.value("doc_id", std::string()))}},
                             out_json, 0);
             if (m == "ecad_describe")
-                return emit(chudware::ecad::ecad_describe(params.value("doc_id", std::string())),
+                return emit(chudware::ecad::ecad_describe(
+                                params.value("doc_id", std::string()),
+                                params.contains("budget") && params["budget"].is_number()
+                                    ? params["budget"].get<long>()
+                                    : 0L),
+                            out_json, 0);
+            if (m == "ecad_resolve_pick")
+                return emit(chudware::ecad::ecad_resolve_pick(
+                                params.value("doc_id", std::string()),
+                                params.contains("xy") ? params["xy"] : json(nullptr),
+                                params.contains("kinds") ? params["kinds"] : json(nullptr),
+                                params.contains("tol") && params["tol"].is_number()
+                                    ? params["tol"].get<double>()
+                                    : 0.0,
+                                params.value("layer", std::string())),
+                            out_json, 0);
+            if (m == "ecad_design")
+                return emit(chudware::ecad::ecad_design(params.value("request", std::string()),
+                                                        params.value("name", std::string())),
+                            out_json, 0);
+            if (m == "ecad_symbols") {
+                const std::string q = params.value("query", std::string());
+                const int limit = params.contains("limit") && params["limit"].is_number()
+                                      ? params["limit"].get<int>()
+                                      : 20;
+                if (q.empty()) {
+                    json cat = chudware::ecad::symlib::symbol_catalog();
+                    if (limit > 0 && cat.is_array() && (int)cat.size() > limit)
+                        cat.erase(cat.begin() + limit, cat.end());
+                    return emit(json{{"ok", true}, {"symbols", cat},
+                                    {"count", (int)cat.size()},
+                                    {"total", (int)chudware::ecad::symlib::symbol_libids().size()}},
+                                out_json, 0);
+                }
+                return emit(chudware::ecad::symlib::search_symbols(q, limit), out_json, 0);
+            }
+            if (m == "ecad_load_symbol_library")
+                return emit(chudware::ecad::symlib::load_kicad_sym_file(
+                                params.value("path", std::string())),
                             out_json, 0);
             if (m == "ecad_schema")
                 return emit(chudware::ecad::ecad_schema(params.value("kind", std::string("sch"))),

@@ -1202,9 +1202,16 @@ def _describe_board_text(doc_id: str) -> str:
     3. engine.ecad.erc.run_erc → ERC/DRC violation summary
     """
     # T-RF20: the session/netlist facades route to the C++ core via core_bridge RPCs.
-    from services.mcp.ecad_common import _compile_of, ecad_session, netlist_mod  # noqa: PLC0415
+    from services.mcp.ecad_common import (  # noqa: PLC0415
+        _ECAD, _compile_of, _unconnected_pins, ecad_session, netlist_mod,
+    )
 
-    did = doc_id or ""
+    did = (doc_id or _ECAD["current"] or _ECAD["current_sch"]
+           or _ECAD["current_pcb"])
+    if not did:
+        return _dumps({"ok": False,
+                       "error": "No active ECAD document — open one with "
+                                "ecad_new_schematic or ecad_new_pcb first."})
     try:
         session = ecad_session.get_session(did)
     except Exception as e:  # noqa: BLE001
@@ -1334,17 +1341,10 @@ def _describe_board_text(doc_id: str) -> str:
     except Exception:  # noqa: BLE001
         lines.append("\nERC: not available")
 
-    # Unconnected pins (pins with no net connection)
-    try:
-        all_pins = {(c.get("ref"), str(p))
-                    for c in components
-                    for p in (c.get("pins") or [])}
-        wired = {(m.get("ref"), str(m.get("pin")))
-                 for _, members in nets_dict.items()
-                 for m in members}
-        unconnected = sorted(f"{r}.{p}" for r, p in all_pins - wired)
-    except Exception:  # noqa: BLE001
-        unconnected = []
+    # A single-pin net is still unconnected: reuse the ECAD family's sole definition.
+    unconnected_records = _unconnected_pins(doc, nl)
+    unconnected = [f"{p.get('ref') or '?'}.{p.get('pin') or '?'}"
+                   for p in unconnected_records]
 
     if unconnected:
         sample = ", ".join(unconnected[:6])

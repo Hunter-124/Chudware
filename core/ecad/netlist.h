@@ -1,19 +1,18 @@
-// Netlist builder — C++ port of engine/ecad/netlist.py.
+// Deterministic schematic connectivity and netlist builder.
 //
-// Pure function of a schematic document (aicad.sch/1): walks wires / junctions /
-// pins / labels / power ports, computes connectivity by a union-find over points
-// snapped to a 1e-6 mm grid, names each net by priority (power > global label >
-// local/hier label/sheet pin > auto N$<n>), and emits {nets, by_pin, components,
-// warnings}. Deterministic / byte-stable — every set/map iteration is sorted by id
-// or coordinate so json.dumps is identical to the Python oracle. OCCT-free.
+// Connectivity is sheet-local at a 1e-6 mm grid except for global labels,
+// power ports, and explicit hierarchy bridges. Scalar wires and buses use
+// independent geometric connectivity spaces. The result includes pin and
+// object readback maps, grouped components, net metadata, expanded buses, and
+// warnings. OCCT-free and pure: the input document is never mutated.
 #pragma once
 
 #include <nlohmann/json.hpp>
 
 namespace chudware::ecad {
 
-// build_netlist(sch) -> {"nets", "by_pin", "components", "warnings"}.
-// Pure: does not mutate `sch`. Mirrors engine/ecad/netlist.py::build_netlist.
+// build_netlist(sch) -> {"nets", "by_pin", "by_object", "components",
+//                        "net_info", "buses", "warnings"}.
 nlohmann::json build_netlist(const nlohmann::json& sch);
 
 }  // namespace chudware::ecad

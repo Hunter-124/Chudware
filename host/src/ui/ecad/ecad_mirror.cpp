@@ -74,15 +74,25 @@ EcadPt EcadMirror::localToWorld(const EcadPt& p, const EcadPt& pos, float angleD
 }
 
 void EcadMirror::loadFromTree(const nlohmann::json& resp) {
-    // Clear parsed geometry but keep layerVis_/docId_ across rebuilds (see reset() note).
+    // Clear parsed geometry but keep caller-owned visibility/color state and the active schematic
+    // sheet candidate across rebuilds. parseSch() keeps that sheet only when it still exists.
     revision_ = -1;
     name_.clear();
-    symbols_.clear(); wires_.clear(); junctions_.clear(); labels_.clear(); powers_.clear();
+    sheets_.clear(); symbols_.clear(); wires_.clear(); buses_.clear(); busEntries_.clear();
+    junctions_.clear(); labels_.clear(); powers_.clear(); noConnects_.clear(); texts_.clear();
+    graphics_.clear(); sheetSymbols_.clear();
+    titleBlock_ = {};
+    grid_ = 2.54f;
+    objectNet_.clear();
     footprints_.clear(); tracks_.clear(); vias_.clear(); zones_.clear(); outline_.clear();
     layers_.clear();
     ratsnest_.clear(); erc_.clear(); drc_.clear(); nets_.clear();
 
-    if (!resp.is_object()) { kind_ = Kind::None; return; }
+    if (!resp.is_object()) {
+        kind_ = Kind::None;
+        activeSheet_.clear();
+        return;
+    }
 
     revision_ = (int)jnum(resp, "revision", -1);
     const std::string kindStr = jstr(resp, "kind");
@@ -97,9 +107,11 @@ void EcadMirror::loadFromTree(const nlohmann::json& resp) {
         parseSch(tree, compile);
     } else if (kindStr == "pcb" || schemaTag == "aicad.pcb/1") {
         kind_ = Kind::Pcb;
+        activeSheet_.clear();
         parsePcb(tree, compile);
     } else {
         kind_ = Kind::None;
+        activeSheet_.clear();
     }
     parseCompileShared(compile);
 }
@@ -108,85 +120,148 @@ void EcadMirror::loadFromTree(const nlohmann::json& resp) {
 
 void EcadMirror::parseSch(const nlohmann::json& tree, const nlohmann::json& compile) {
     const nlohmann::json& libCache = jobj(tree, "lib_cache");
-
-    // by_pin map: "<symId>.<pinNumber>" -> net name (compile.netlist.by_pin). Tolerant of absence.
     const nlohmann::json& netlist = jobj(compile, "netlist");
-    const nlohmann::json& byPin   = jobj(netlist, "by_pin");
+    const nlohmann::json& byPin = jobj(netlist, "by_pin");
+    const nlohmann::json& byObject = jobj(netlist, "by_object");
+    const nlohmann::json& compiledBuses = jobj(netlist, "buses");
+    const nlohmann::json& netInfo = jobj(netlist, "net_info");
+
+    for (auto it = byObject.begin(); it != byObject.end(); ++it)
+        if (it.value().is_string()) objectNet_[it.key()] = it.value().get<std::string>();
+
+    const nlohmann::json& units = jobj(tree, "units");
+    grid_ = (float)jnum(units, "grid", 2.54);
+
+    for (const auto& s : jarr(tree, "sheets")) {
+        if (!s.is_object()) continue;
+        EcadSheet sheet;
+        sheet.id = jstr(s, "id");
+        sheet.name = jstr(s, "name");
+        auto sizeIt = s.find("size");
+        if (sizeIt != s.end() && sizeIt->is_array() && sizeIt->size() >= 2 &&
+            (*sizeIt)[0].is_number() && (*sizeIt)[1].is_number()) {
+            const EcadPt size = jpt(*sizeIt);
+            sheet.w = size.x;
+            sheet.h = size.y;
+        }
+        sheets_.push_back(std::move(sheet));
+    }
+    if (sheets_.empty()) sheets_.push_back({"sh1", "Root", 297.0f, 210.0f});
+
+    const bool activeStillExists =
+        std::any_of(sheets_.begin(), sheets_.end(), [&](const EcadSheet& sheet) {
+            return sheet.id == activeSheet_;
+        });
+    if (!activeStillExists) activeSheet_ = sheets_.front().id;
+
+    const nlohmann::json& title = jobj(tree, "title_block");
+    titleBlock_.title = jstr(title, "title");
+    titleBlock_.company = jstr(title, "company");
+    titleBlock_.rev = jstr(title, "rev");
+    titleBlock_.date = jstr(title, "date");
+    titleBlock_.comment1 = jstr(title, "comment1");
+    titleBlock_.comment2 = jstr(title, "comment2");
+    titleBlock_.comment3 = jstr(title, "comment3");
+    titleBlock_.comment4 = jstr(title, "comment4");
+    titleBlock_.paper = jstr(title, "paper", "A4");
+
+    auto objectNet = [&](const std::string& id) -> std::string {
+        const auto it = objectNet_.find(id);
+        return it == objectNet_.end() ? std::string() : it->second;
+    };
 
     auto parseGraphic = [](const nlohmann::json& g) -> EcadSymGraphic {
         EcadSymGraphic out;
-        const std::string t = jstr(g, "type", "line");
+        std::string t = jstr(g, "kind");
+        if (t.empty()) t = jstr(g, "type", "line");
         if (t == "rect") {
             out.kind = EcadSymGraphic::Rect;
-            out.pts = {jptKey(g, "p1"), jptKey(g, "p2")};
+            const nlohmann::json& pts = jarr(g, "pts");
+            out.pts = pts.size() >= 2 ? std::vector<EcadPt>{jpt(pts[0]), jpt(pts[1])}
+                                      : std::vector<EcadPt>{jptKey(g, "p1"), jptKey(g, "p2")};
         } else if (t == "circle") {
             out.kind = EcadSymGraphic::Circle;
-            out.pts = {jptKey(g, "center")};
+            const nlohmann::json& pts = jarr(g, "pts");
+            out.pts = {pts.empty() ? jptKey(g, "center") : jpt(pts[0])};
             out.radius = (float)jnum(g, "radius");
         } else if (t == "arc") {
             out.kind = EcadSymGraphic::Arc;
-            out.pts = {jptKey(g, "center")};
+            const nlohmann::json& pts = jarr(g, "pts");
+            out.pts = {pts.empty() ? jptKey(g, "center") : jpt(pts[0])};
             out.radius = (float)jnum(g, "radius");
             out.a0 = (float)jnum(g, "a0");
             out.a1 = (float)jnum(g, "a1");
         } else if (t == "polyline") {
             out.kind = EcadSymGraphic::Polyline;
             for (const auto& p : jarr(g, "pts")) out.pts.push_back(jpt(p));
-        } else {  // "line" and anything unknown -> a 2-point segment
+        } else {
             out.kind = EcadSymGraphic::Line;
-            out.pts = {jptKey(g, "p1"), jptKey(g, "p2")};
+            const nlohmann::json& pts = jarr(g, "pts");
+            out.pts = pts.size() >= 2 ? std::vector<EcadPt>{jpt(pts[0]), jpt(pts[1])}
+                                      : std::vector<EcadPt>{jptKey(g, "p1"), jptKey(g, "p2")};
         }
         return out;
     };
 
     for (const auto& s : jarr(tree, "symbols")) {
+        if (!s.is_object()) continue;
         EcadSymbol sym;
-        sym.id     = jstr(s, "id");
-        sym.libid  = jstr(s, "libid");
-        sym.ref    = jstr(s, "ref");
-        sym.value  = jstr(s, "value");
-        sym.pos    = jptKey(s, "pos");
-        sym.angle  = (float)jnum(s, "angle");
+        sym.id = jstr(s, "id");
+        sym.libid = jstr(s, "libid");
+        sym.ref = jstr(s, "ref");
+        sym.value = jstr(s, "value");
+        sym.sheet = jstr(s, "sheet", "sh1");
+        sym.pos = jptKey(s, "pos");
+        sym.angle = (float)jnum(s, "angle");
         sym.mirror = jstr(s, "mirror", "none");
-        sym.footprint = jstr(s, "footprint");  // "" if unassigned
-        sym.dnp    = jbool(s, "dnp");
-        {  // sim_params: keep the raw dict (free-form); leave as null if missing/non-object.
-            auto spIt = s.find("sim_params");
-            if (spIt != s.end() && spIt->is_object()) sym.simParams = *spIt;
-        }
-        const int unit = (int)jnum(s, "unit", 1);
+        sym.unit = (int)jnum(s, "unit", 1);
+        sym.footprint = jstr(s, "footprint");
+        sym.datasheet = jstr(s, "datasheet");
+        sym.dnp = jbool(s, "dnp");
+        sym.inBom = jbool(s, "in_bom", true);
+        sym.onBoard = jbool(s, "on_board", true);
+        sym.fields = nlohmann::json::object();
+        auto fieldsIt = s.find("fields");
+        if (fieldsIt != s.end() && fieldsIt->is_object()) sym.fields = *fieldsIt;
+        auto simIt = s.find("sim_params");
+        if (simIt != s.end() && simIt->is_object()) sym.simParams = *simIt;
 
-        // Resolve the lib_cache SymbolDef for body graphics + pins.
         auto defIt = libCache.find(sym.libid);
         if (defIt != libCache.end() && defIt->is_object()) {
             const nlohmann::json& sdef = *defIt;
             sym.power = jbool(sdef, "power");
-            for (const auto& g : jarr(sdef, "graphics"))
+            sym.generated = jbool(sdef, "generated");
+            sym.unitCount = std::max(1, (int)jnum(sdef, "units_count", 1));
+            for (const auto& g : jarr(sdef, "graphics")) {
+                const int graphicUnit = (int)jnum(g, "unit", 0);
+                if (graphicUnit != 0 && graphicUnit != sym.unit) continue;
                 sym.body.push_back(parseGraphic(g));
+            }
 
             for (const auto& pin : jarr(sdef, "pins")) {
                 const int pinUnit = (int)jnum(pin, "unit", 1);
-                if (pinUnit != unit && pinUnit != 0) continue;  // multi-unit filter (schema.py)
+                if (pinUnit != sym.unit && pinUnit != 0) continue;
                 EcadPin ep;
                 ep.number = jstr(pin, "number");
-                ep.name   = jstr(pin, "name");
-                ep.type   = jstr(pin, "type", "passive");
+                ep.name = jstr(pin, "name");
+                ep.type = jstr(pin, "type", "passive");
+                ep.shape = jstr(pin, "shape", "line");
+                ep.unit = pinUnit;
+                ep.hidden = jbool(pin, "hidden");
 
-                // pin root in symbol-local frame, then placed by the symbol transform.
                 const EcadPt rootLocal = jptKey(pin, "pos");
-                const float pinLen   = (float)jnum(pin, "length", 2.54);
+                const float pinLen = (float)jnum(pin, "length", 2.54);
                 const float pinAngle = (float)jnum(pin, "angle");
                 const float pa = pinAngle * kPi / 180.0f;
-                // tip = root + length*dir(angle) in local frame (schema.py::pin_world).
                 const EcadPt tipLocal{rootLocal.x + pinLen * std::cos(pa),
                                       rootLocal.y + pinLen * std::sin(pa)};
                 ep.root = localToWorld(rootLocal, sym.pos, sym.angle, sym.mirror);
-                ep.tip  = localToWorld(tipLocal,  sym.pos, sym.angle, sym.mirror);
+                ep.tip = localToWorld(tipLocal, sym.pos, sym.angle, sym.mirror);
 
-                // net from compile.netlist.by_pin keyed "<symId>.<pinNumber>".
                 const std::string key = sym.id + "." + ep.number;
                 auto netIt = byPin.find(key);
-                if (netIt != byPin.end() && netIt->is_string()) ep.net = netIt->get<std::string>();
+                if (netIt != byPin.end() && netIt->is_string())
+                    ep.net = netIt->get<std::string>();
                 sym.pins.push_back(std::move(ep));
             }
         }
@@ -194,27 +269,161 @@ void EcadMirror::parseSch(const nlohmann::json& tree, const nlohmann::json& comp
     }
 
     for (const auto& w : jarr(tree, "wires")) {
-        EcadWire ew;
-        ew.id = jstr(w, "id");
-        ew.bus = jbool(w, "bus");
-        for (const auto& p : jarr(w, "pts")) ew.pts.push_back(jpt(p));
-        if (ew.pts.size() >= 2) wires_.push_back(std::move(ew));
+        if (!w.is_object()) continue;
+        EcadWire wire;
+        wire.id = jstr(w, "id");
+        wire.sheet = jstr(w, "sheet", "sh1");
+        wire.bus = jbool(w, "bus");
+        wire.net = objectNet(wire.id);
+        for (const auto& p : jarr(w, "pts")) wire.pts.push_back(jpt(p));
+        if (wire.pts.size() >= 2) wires_.push_back(std::move(wire));
     }
-    for (const auto& j : jarr(tree, "junctions"))
-        junctions_.push_back({jstr(j, "id"), jptKey(j, "pos")});
-    for (const auto& l : jarr(tree, "labels"))
-        labels_.push_back({jstr(l, "id"), jstr(l, "text"), jstr(l, "scope", "local"),
-                           jptKey(l, "pos"), (float)jnum(l, "angle")});
-    for (const auto& p : jarr(tree, "power"))
-        powers_.push_back({jstr(p, "id"), jstr(p, "net"), jstr(p, "symbol"), jptKey(p, "pos")});
 
-    // Net summaries from compile.netlist.nets ({name: [members…]}).
+    for (const auto& b : jarr(tree, "buses")) {
+        if (!b.is_object()) continue;
+        EcadBus bus;
+        bus.id = jstr(b, "id");
+        bus.sheet = jstr(b, "sheet", "sh1");
+        bus.name = jstr(b, "name");
+        for (const auto& p : jarr(b, "pts")) bus.pts.push_back(jpt(p));
+        const auto compiledIt = compiledBuses.find(bus.name);
+        if (compiledIt != compiledBuses.end()) {
+            bus.members = jstrList(*compiledIt);
+            if (bus.members.empty() && compiledIt->is_object())
+                bus.members = jstrList(jarr(*compiledIt, "members"));
+        }
+        buses_.push_back(std::move(bus));
+    }
+
+    for (const auto& be : jarr(tree, "bus_entries")) {
+        if (!be.is_object()) continue;
+        EcadBusEntry entry;
+        entry.id = jstr(be, "id");
+        entry.sheet = jstr(be, "sheet", "sh1");
+        entry.pos = jptKey(be, "pos");
+        auto sizeIt = be.find("size");
+        if (sizeIt != be.end()) entry.size = jpt(*sizeIt);
+        entry.bus = jstr(be, "bus");
+        entry.member = jstr(be, "member");
+        entry.net = objectNet(entry.id);
+        busEntries_.push_back(std::move(entry));
+    }
+
+    for (const auto& j : jarr(tree, "junctions")) {
+        if (!j.is_object()) continue;
+        EcadJunction junction;
+        junction.id = jstr(j, "id");
+        junction.sheet = jstr(j, "sheet", "sh1");
+        junction.pos = jptKey(j, "pos");
+        junction.net = objectNet(junction.id);
+        junctions_.push_back(std::move(junction));
+    }
+    for (const auto& l : jarr(tree, "labels")) {
+        if (!l.is_object()) continue;
+        EcadLabel label;
+        label.id = jstr(l, "id");
+        label.sheet = jstr(l, "sheet", "sh1");
+        label.text = jstr(l, "text");
+        label.scope = jstr(l, "scope", "local");
+        label.pos = jptKey(l, "pos");
+        label.angle = (float)jnum(l, "angle");
+        label.net = objectNet(label.id);
+        labels_.push_back(std::move(label));
+    }
+    for (const auto& p : jarr(tree, "power")) {
+        if (!p.is_object()) continue;
+        EcadPower power;
+        power.id = jstr(p, "id");
+        power.sheet = jstr(p, "sheet", "sh1");
+        power.net = jstr(p, "net");
+        power.symbol = jstr(p, "symbol");
+        power.pos = jptKey(p, "pos");
+        power.angle = (float)jnum(p, "angle");
+        powers_.push_back(std::move(power));
+    }
+    for (const auto& nc : jarr(tree, "no_connect")) {
+        if (!nc.is_object()) continue;
+        EcadNoConnect noConnect;
+        noConnect.id = jstr(nc, "id");
+        noConnect.sheet = jstr(nc, "sheet", "sh1");
+        noConnect.pos = jptKey(nc, "pos");
+        noConnects_.push_back(std::move(noConnect));
+    }
+    for (const auto& t : jarr(tree, "texts")) {
+        if (!t.is_object()) continue;
+        EcadText text;
+        text.id = jstr(t, "id");
+        text.sheet = jstr(t, "sheet", "sh1");
+        text.text = jstr(t, "text");
+        text.pos = jptKey(t, "pos");
+        text.size = (float)jnum(t, "size", 1.27);
+        text.angle = (float)jnum(t, "angle");
+        texts_.push_back(std::move(text));
+    }
+
+    for (const auto& g : jarr(tree, "graphics")) {
+        if (!g.is_object()) continue;
+        EcadGraphic graphic;
+        graphic.id = jstr(g, "id");
+        graphic.sheet = jstr(g, "sheet", "sh1");
+        const std::string kind = jstr(g, "kind", "line");
+        if (kind == "rect") graphic.kind = EcadGraphic::Rect;
+        else if (kind == "circle") graphic.kind = EcadGraphic::Circle;
+        else if (kind == "arc") graphic.kind = EcadGraphic::Arc;
+        else if (kind == "polyline") graphic.kind = EcadGraphic::Polyline;
+        else graphic.kind = EcadGraphic::Line;
+        for (const auto& p : jarr(g, "pts")) graphic.pts.push_back(jpt(p));
+        graphic.radius = (float)jnum(g, "radius");
+        graphic.a0 = (float)jnum(g, "a0");
+        graphic.a1 = (float)jnum(g, "a1");
+        graphic.width = (float)jnum(g, "width", 0.15);
+        graphic.filled = jbool(g, "filled");
+        graphics_.push_back(std::move(graphic));
+    }
+
+    std::unordered_map<std::string, std::string> sheetNames;
+    for (const auto& sheet : sheets_) sheetNames[sheet.id] = sheet.name;
+    for (const auto& ss : jarr(tree, "sheet_symbols")) {
+        if (!ss.is_object()) continue;
+        EcadSheetSymbol sheetSymbol;
+        sheetSymbol.id = jstr(ss, "id");
+        sheetSymbol.sheet = jstr(ss, "sheet", "sh1");
+        sheetSymbol.child = jstr(ss, "child");
+        sheetSymbol.name = jstr(ss, "name");
+        if (sheetSymbol.name.empty()) {
+            const auto nameIt = sheetNames.find(sheetSymbol.child);
+            if (nameIt != sheetNames.end()) sheetSymbol.name = nameIt->second;
+        }
+        sheetSymbol.pos = jptKey(ss, "pos");
+        auto sizeIt = ss.find("size");
+        if (sizeIt != ss.end()) sheetSymbol.size = jpt(*sizeIt);
+        for (const auto& p : jarr(ss, "pins")) {
+            if (!p.is_object()) continue;
+            EcadSheetPin pin;
+            pin.name = jstr(p, "name");
+            pin.pos = jptKey(p, "pos");
+            pin.shape = jstr(p, "shape", "bidirectional");
+            pin.net = objectNet(sheetSymbol.id + "." + pin.name);
+            sheetSymbol.pins.push_back(std::move(pin));
+        }
+        sheetSymbols_.push_back(std::move(sheetSymbol));
+    }
+
     const nlohmann::json& nets = jobj(netlist, "nets");
     for (auto it = nets.begin(); it != nets.end(); ++it) {
-        EcadNet n;
-        n.name = it.key();
-        n.pinCount = it.value().is_array() ? (int)it.value().size() : 0;
-        nets_.push_back(std::move(n));
+        EcadNet net;
+        net.name = it.key();
+        net.pinCount = it.value().is_array() ? (int)it.value().size() : 0;
+        const auto infoIt = netInfo.find(net.name);
+        if (infoIt != netInfo.end() && infoIt->is_object()) {
+            net.sheets = jstrList(jarr(*infoIt, "sheets"));
+            net.bus = jstr(*infoIt, "bus");
+            net.driven = jbool(*infoIt, "has_power_source");
+            const auto driversIt = infoIt->find("drivers");
+            if (driversIt != infoIt->end() && driversIt->is_array() && !driversIt->empty())
+                net.driven = true;
+        }
+        nets_.push_back(std::move(net));
     }
     std::sort(nets_.begin(), nets_.end(),
               [](const EcadNet& a, const EcadNet& b) { return a.name < b.name; });
@@ -418,6 +627,18 @@ void EcadMirror::parseCompileShared(const nlohmann::json& compile) {
 
 // ---- queries ----------------------------------------------------------------------------------
 
+void EcadMirror::setActiveSheet(const std::string& id) {
+    const auto it = std::find_if(sheets_.begin(), sheets_.end(),
+                                 [&](const EcadSheet& sheet) { return sheet.id == id; });
+    if (it != sheets_.end()) activeSheet_ = id;
+}
+
+const std::string& EcadMirror::netOfObject(const std::string& objId) const {
+    static const std::string kEmpty;
+    const auto it = objectNet_.find(objId);
+    return it == objectNet_.end() ? kEmpty : it->second;
+}
+
 std::vector<const EcadTrack*> EcadMirror::tracksOnLayer(const std::string& layerId) const {
     std::vector<const EcadTrack*> out;
     for (const auto& t : tracks_)
@@ -462,27 +683,116 @@ void EcadMirror::setLayerColor(const std::string& layerId, float r, float g, flo
 bool EcadMirror::worldBounds(EcadPt& outMin, EcadPt& outMax) const {
     bool have = false;
     auto grow = [&](EcadPt p) {
-        if (!have) { outMin = outMax = p; have = true; return; }
-        outMin.x = std::min(outMin.x, p.x); outMin.y = std::min(outMin.y, p.y);
-        outMax.x = std::max(outMax.x, p.x); outMax.y = std::max(outMax.y, p.y);
+        if (!have) {
+            outMin = outMax = p;
+            have = true;
+            return;
+        }
+        outMin.x = std::min(outMin.x, p.x);
+        outMin.y = std::min(outMin.y, p.y);
+        outMax.x = std::max(outMax.x, p.x);
+        outMax.y = std::max(outMax.y, p.y);
     };
-    // sch
-    for (const auto& s : symbols_) {
-        grow(s.pos);
-        for (const auto& p : s.pins) { grow(p.root); grow(p.tip); }
+    auto growCircle = [&](EcadPt center, float radius) {
+        const float r = std::fabs(radius);
+        grow({center.x - r, center.y - r});
+        grow({center.x + r, center.y + r});
+    };
+
+    // Schematic geometry is sheet-local. Only the currently displayed sheet contributes.
+    for (const auto& symbol : symbols_) {
+        if (!onActiveSheet(symbol.sheet)) continue;
+        grow(symbol.pos);
+        for (const auto& graphic : symbol.body) {
+            switch (graphic.kind) {
+                case EcadSymGraphic::Rect:
+                    if (graphic.pts.size() >= 2) {
+                        const EcadPt a = graphic.pts[0];
+                        const EcadPt b = graphic.pts[1];
+                        grow(localToWorld(a, symbol.pos, symbol.angle, symbol.mirror));
+                        grow(localToWorld({a.x, b.y}, symbol.pos, symbol.angle, symbol.mirror));
+                        grow(localToWorld(b, symbol.pos, symbol.angle, symbol.mirror));
+                        grow(localToWorld({b.x, a.y}, symbol.pos, symbol.angle, symbol.mirror));
+                    }
+                    break;
+                case EcadSymGraphic::Circle:
+                case EcadSymGraphic::Arc:
+                    if (!graphic.pts.empty()) {
+                        const EcadPt center =
+                            localToWorld(graphic.pts[0], symbol.pos, symbol.angle, symbol.mirror);
+                        growCircle(center, graphic.radius);
+                    }
+                    break;
+                case EcadSymGraphic::Line:
+                case EcadSymGraphic::Polyline:
+                    for (const EcadPt& p : graphic.pts)
+                        grow(localToWorld(p, symbol.pos, symbol.angle, symbol.mirror));
+                    break;
+            }
+        }
+        for (const auto& pin : symbol.pins) {
+            grow(pin.root);
+            grow(pin.tip);
+        }
     }
-    for (const auto& w : wires_) for (const auto& p : w.pts) grow(p);
-    for (const auto& l : labels_) grow(l.pos);
-    for (const auto& p : powers_) grow(p.pos);
-    // pcb
-    for (const auto& o : outline_) { grow(o.p1); grow(o.p2); }
-    for (const auto& f : footprints_) {
-        grow(f.pos);
-        for (const auto& pad : f.pads) grow(pad.pos);
+    for (const auto& wire : wires_)
+        if (onActiveSheet(wire.sheet))
+            for (const EcadPt& p : wire.pts) grow(p);
+    for (const auto& bus : buses_)
+        if (onActiveSheet(bus.sheet))
+            for (const EcadPt& p : bus.pts) grow(p);
+    for (const auto& entry : busEntries_) {
+        if (!onActiveSheet(entry.sheet)) continue;
+        grow(entry.pos);
+        grow({entry.pos.x + entry.size.x, entry.pos.y + entry.size.y});
     }
-    for (const auto& t : tracks_) { grow(t.p1); grow(t.p2); }
-    for (const auto& v : vias_) grow(v.at);
-    for (const auto& z : zones_) for (const auto& p : z.polygon) grow(p);
+    for (const auto& junction : junctions_)
+        if (onActiveSheet(junction.sheet)) grow(junction.pos);
+    for (const auto& label : labels_)
+        if (onActiveSheet(label.sheet)) grow(label.pos);
+    for (const auto& power : powers_)
+        if (onActiveSheet(power.sheet)) grow(power.pos);
+    for (const auto& noConnect : noConnects_)
+        if (onActiveSheet(noConnect.sheet)) grow(noConnect.pos);
+    for (const auto& text : texts_)
+        if (onActiveSheet(text.sheet)) grow(text.pos);
+    for (const auto& graphic : graphics_) {
+        if (!onActiveSheet(graphic.sheet)) continue;
+        if ((graphic.kind == EcadGraphic::Circle || graphic.kind == EcadGraphic::Arc) &&
+            !graphic.pts.empty()) {
+            growCircle(graphic.pts.front(), graphic.radius);
+        } else {
+            for (const EcadPt& p : graphic.pts) grow(p);
+        }
+    }
+    for (const auto& sheetSymbol : sheetSymbols_) {
+        if (!onActiveSheet(sheetSymbol.sheet)) continue;
+        grow(sheetSymbol.pos);
+        grow({sheetSymbol.pos.x + sheetSymbol.size.x, sheetSymbol.pos.y});
+        grow({sheetSymbol.pos.x + sheetSymbol.size.x,
+              sheetSymbol.pos.y - sheetSymbol.size.y});
+        grow({sheetSymbol.pos.x, sheetSymbol.pos.y - sheetSymbol.size.y});
+        for (const auto& pin : sheetSymbol.pins) grow(pin.pos);
+    }
+    for (const auto& violation : erc_)
+        if (violation.hasLoc) grow(violation.loc);
+
+    // Preserve the PCB fit behavior.
+    for (const auto& o : outline_) {
+        grow(o.p1);
+        grow(o.p2);
+    }
+    for (const auto& footprint : footprints_) {
+        grow(footprint.pos);
+        for (const auto& pad : footprint.pads) grow(pad.pos);
+    }
+    for (const auto& track : tracks_) {
+        grow(track.p1);
+        grow(track.p2);
+    }
+    for (const auto& via : vias_) grow(via.at);
+    for (const auto& zone : zones_)
+        for (const EcadPt& p : zone.polygon) grow(p);
     return have;
 }
 

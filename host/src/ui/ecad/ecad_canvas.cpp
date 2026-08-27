@@ -1,6 +1,7 @@
 #include "ecad_canvas.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <vector>
 
@@ -33,6 +34,19 @@ void drawDashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 c, float th, float
                     ImVec2(a.x + dx * (e / L), a.y + dy * (e / L)), c, th);
     }
 }
+void drawRotatedText(ImDrawList* dl, ImVec2 origin, ImU32 color, const char* text,
+                     float fontSize, float worldAngleDeg) {
+    const int firstVertex = dl->VtxBuffer.Size;
+    dl->AddText(nullptr, fontSize, origin, color, text);
+    const float angle = -worldAngleDeg * kPi / 180.0f;
+    const float c = std::cos(angle), s = std::sin(angle);
+    for (int i = firstVertex; i < dl->VtxBuffer.Size; ++i) {
+        ImVec2& q = dl->VtxBuffer[i].pos;
+        const float x = q.x - origin.x, y = q.y - origin.y;
+        q.x = origin.x + x * c - y * s;
+        q.y = origin.y + x * s + y * c;
+    }
+}
 
 
 // Copper-layer colors reuse palette axis/accent/status roles so they follow the active theme.
@@ -59,23 +73,21 @@ ImU32 copperColorFor(const EcadMirror& doc, const std::string& layerId, int copp
     return copperColor(copperIndex, a);
 }
 
-// Split a "<kind>:<id>" selection token into its parts. Returns false on an empty/malformed token.
-bool splitSel(const std::string& sel, std::string& kind, std::string& id) {
-    const auto c = sel.find(':');
-    if (sel.empty() || c == std::string::npos) return false;
-    kind = sel.substr(0, c);
-    id   = sel.substr(c + 1);
-    return !id.empty();
+bool equalNoCase(char a, char b) {
+    return std::tolower(static_cast<unsigned char>(a)) ==
+           std::tolower(static_cast<unsigned char>(b));
 }
 
-float niceGridStep(float pxPerMm, float targetPx) {
-    const float raw = targetPx / std::max(pxPerMm, 1e-6f);
-    const float decade = std::pow(10.0f, std::floor(std::log10(raw)));
-    const float normalized = raw / decade;
-    const float multiple = normalized <= 1.0f ? 1.0f :
-                           normalized <= 2.0f ? 2.0f :
-                           normalized <= 5.0f ? 5.0f : 10.0f;
-    return multiple * decade;
+bool equalsNoCase(const std::string& value, const char* expected) {
+    const size_t length = std::char_traits<char>::length(expected);
+    return value.size() == length &&
+           std::equal(value.begin(), value.end(), expected, equalNoCase);
+}
+
+bool containsNoCase(const std::string& value, const char* needle) {
+    const size_t length = std::char_traits<char>::length(needle);
+    return std::search(value.begin(), value.end(), needle, needle + length,
+                       equalNoCase) != value.end();
 }
 
 float zoomStroke(float pxPerMm, float worldMm, float minLogical, float maxLogical) {
@@ -101,10 +113,58 @@ EcadPt EcadCanvas::toWorld(const ImVec2& s) const {
                   pan_.y - (s.y - cy) / pxPerMm_};
 }
 
+bool EcadCanvas::sheetFrameGeometry(const EcadMirror& doc, const EcadSheet*& page,
+                                    EcadPt& outMin, EcadPt& outMax,
+                                    float& pageScale) const {
+    page = nullptr;
+    for (const auto& sheet : doc.sheets())
+        if (sheet.id == doc.activeSheet()) {
+            page = &sheet;
+            break;
+        }
+    if (!page && !doc.sheets().empty()) page = &doc.sheets().front();
+    if (!page) return false;
+
+    EcadPt contentMin, contentMax;
+    if (!doc.worldBounds(contentMin, contentMax)) {
+        outMin = {0.0f, 0.0f};
+        outMax = {page->w, page->h};
+        pageScale = 1.0f;
+        return true;
+    }
+
+    constexpr float margin = 5.0f;
+    constexpr float pad = 3.0f;
+    const float availableW = std::max(1.0f, page->w - 2.0f * (margin + pad));
+    const float availableH = std::max(1.0f, page->h - 2.0f * (margin + pad));
+    pageScale = 1.0f;
+    const float contentW = contentMax.x - contentMin.x;
+    const float contentH = contentMax.y - contentMin.y;
+    if (contentW > 0.0f) pageScale = std::min(pageScale, availableW / contentW);
+    if (contentH > 0.0f) pageScale = std::min(pageScale, availableH / contentH);
+    pageScale = std::max(pageScale, 0.0001f);
+
+    const EcadPt center{(contentMin.x + contentMax.x) * 0.5f,
+                        (contentMin.y + contentMax.y) * 0.5f};
+    const float halfW = page->w * 0.5f / pageScale;
+    const float halfH = page->h * 0.5f / pageScale;
+    outMin = {center.x - halfW, center.y - halfH};
+    outMax = {center.x + halfW, center.y + halfH};
+    return true;
+}
+
+
 void EcadCanvas::zoomToFit(const EcadMirror& doc, const ImVec2& avail) {
     EcadPt mn, mx;
-    if (!doc.worldBounds(mn, mx)) {
-        // Empty doc: center origin at a sane default zoom.
+    bool haveBounds = doc.worldBounds(mn, mx);
+    // Fit actual design content by default. The page is a drafting overlay and may extend beyond
+    // the viewport; using it as the camera authority makes a small circuit unreadably tiny.
+    if (!haveBounds && showSheetFrame_ && doc.isSch()) {
+        const EcadSheet* page = nullptr;
+        float pageScale = 1.0f;
+        haveBounds = sheetFrameGeometry(doc, page, mn, mx, pageScale);
+    }
+    if (!haveBounds) {
         pan_ = {0, 0};
         pxPerMm_ = 8.0f;
         inited_ = true;
@@ -113,27 +173,85 @@ void EcadCanvas::zoomToFit(const EcadMirror& doc, const ImVec2& avail) {
     const float w = std::max(1.0f, mx.x - mn.x);
     const float h = std::max(1.0f, mx.y - mn.y);
     pan_ = {(mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f};
-    const float pad = 1.10f;  // ~5% margin each side (fill the canvas)
-    const float zx = avail.x / (w * pad);
-    const float zy = avail.y / (h * pad);
-    pxPerMm_ = std::max(0.25f, std::min(zx, zy));
+    const float margin = 1.15f;
+    const float zx = avail.x / (w * margin);
+    const float zy = avail.y / (h * margin);
+    const float maxFitZoom = ui::metrics::U(16.0f);
+    pxPerMm_ = std::clamp(std::min(zx, zy), 0.25f, maxFitZoom);
     inited_ = true;
 }
 
-void EcadCanvas::focusOn(const EcadPt& w) {
-    pan_ = w;                                  // pan so the point sits at the canvas centre
-    if (pxPerMm_ < 14.0f) pxPerMm_ = 14.0f;    // zoom in to a readable level if currently far out
-    wantFit_ = false;                          // don't let a pending fit clobber the pan
+void EcadCanvas::requestFit() { wantFit_ = true; }
+
+float EcadCanvas::zoom() const { return pxPerMm_; }
+
+void EcadCanvas::setSelection(const std::vector<std::string>& tokens) { selected_ = tokens; }
+void EcadCanvas::setHighlightedNet(const std::string& net) { highlightedNet_ = net; }
+void EcadCanvas::setMarquee(bool active, const EcadPt& a, const EcadPt& b) {
+    marqueeActive_ = active;
+    marqueeA_ = a;
+    marqueeB_ = b;
+}
+void EcadCanvas::setRoutePreview(const std::vector<EcadPt>& pts, bool bus) {
+    routePreview_ = pts;
+    routePreviewBus_ = bus;
+}
+void EcadCanvas::setSnapTarget(bool active, const EcadPt& w, const std::string& label) {
+    snapTargetActive_ = active;
+    snapTarget_ = w;
+    snapTargetLabel_ = label;
+}
+void EcadCanvas::setDragOffset(float dx, float dy) {
+    dragDx_ = dx;
+    dragDy_ = dy;
+}
+void EcadCanvas::setShowErcMarkers(bool on) { showErcMarkers_ = on; }
+void EcadCanvas::setShowSheetFrame(bool on) {
+    if (showSheetFrame_ != on) wantFit_ = true;
+    showSheetFrame_ = on;
+}
+
+bool EcadCanvas::selected(const char* kind, const std::string& id) const {
+    const size_t kindLength = std::char_traits<char>::length(kind);
+    for (const std::string& token : selected_) {
+        if (token.size() != kindLength + 1 + id.size()) continue;
+        if (token.compare(0, kindLength, kind) != 0 || token[kindLength] != ':') continue;
+        if (token.compare(kindLength + 1, id.size(), id) == 0) return true;
+    }
+    return false;
+}
+
+bool EcadCanvas::selected(const char* kind, const std::string& first,
+                          const std::string& second) const {
+    const size_t kindLength = std::char_traits<char>::length(kind);
+    const size_t firstOffset = kindLength + 1;
+    const size_t secondOffset = firstOffset + first.size() + 1;
+    for (const std::string& token : selected_) {
+        if (token.size() != secondOffset + second.size()) continue;
+        if (token.compare(0, kindLength, kind) != 0 || token[kindLength] != ':') continue;
+        if (token.compare(firstOffset, first.size(), first) != 0 ||
+            token[firstOffset + first.size()] != '.')
+            continue;
+        if (token.compare(secondOffset, second.size(), second) == 0) return true;
+    }
+    return false;
+}
+
+void EcadCanvas::focusOn(const EcadPt& w) { focusOn(w, true); }
+
+void EcadCanvas::focusOn(const EcadPt& w, bool isError) {
+    pan_ = w;
+    if (pxPerMm_ < 14.0f) pxPerMm_ = 14.0f;
+    wantFit_ = false;
     inited_ = true;
     focusLoc_ = w;
-    focusFrames_ = 180;                         // flash the marker for ~3s of frames
+    focusIsError_ = isError;
+    focusFrames_ = 180;
 }
 
 void EcadCanvas::handleNavigation(const EcadCanvasIO& io, const ImVec2& avail) {
     if (!io.hovered) return;
     ImGuiIO& gio = ImGui::GetIO();
-
-    // Zoom about the cursor (sketch_mode keeps the world point under the cursor fixed across zoom).
     const float wheel = gio.MouseWheel;
     if (wheel != 0.0f && io.hasWorldMouse) {
         const ImVec2 sBefore = toScreen(io.worldMouse);
@@ -144,104 +262,98 @@ void EcadCanvas::handleNavigation(const EcadCanvasIO& io, const ImVec2& avail) {
         pan_.y += io.worldMouse.y - wAfter.y;
     }
 
-    // Middle-drag or space+left to pan (sketch_mode-style). Right-drag also pans.
-    const bool panDrag = ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
-                         ImGui::IsMouseDragging(ImGuiMouseButton_Right);
-    if (panDrag) {
-        const ImVec2 d = ImGui::GetIO().MouseDelta;
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
+        ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+        const ImVec2 d = gio.MouseDelta;
         pan_.x -= d.x / pxPerMm_;
-        pan_.y += d.y / pxPerMm_;  // screen down -> world down
+        pan_.y += d.y / pxPerMm_;
     }
     (void)avail;
 }
 
-// ---- grid ----------------------------------------------------------------------------------
-
-void EcadCanvas::drawGrid(const ImVec2& avail) {
+// The document grid remains the source cadence. Camera zoom may skip whole grid points for
+// legibility, but it never substitutes an unrelated 1/2/5 world spacing.
+void EcadCanvas::drawGrid(const EcadMirror& doc, const ImVec2& avail) {
     const ui::Palette& p = ui::palette;
+    const float baseMm = std::max(doc.grid(), 1e-4f);
+    const float targetPx = ui::metrics::U(5.0f);
+    const float rawSkip = targetPx / std::max(baseMm * pxPerMm_, 1e-6f);
+    int skip = 1;
+    if (rawSkip > 1.0f) {
+        const float decade = std::pow(10.0f, std::floor(std::log10(rawSkip)));
+        const float normalized = rawSkip / decade;
+        const float multiple = normalized <= 1.0f ? 1.0f :
+                               normalized <= 2.0f ? 2.0f :
+                               normalized <= 5.0f ? 5.0f : 10.0f;
+        skip = std::max(1, static_cast<int>(std::ceil(decade * multiple)));
+    }
+    float stepMm = baseMm * static_cast<float>(skip);
 
-    // A 1/2/5 adaptive cadence keeps the dot field legible without exploding the draw count at
-    // either camera extreme. Major divisions are landmarks only at their intersections: no rails.
-    float targetStepPx = ui::metrics::U(5.0f);
-    float stepMm = 0.0f;
     const EcadPt wTL = toWorld(imgMin_);
     const EcadPt wBR = toWorld(ImVec2(imgMin_.x + avail.x, imgMin_.y + avail.y));
     const float minX = std::min(wTL.x, wBR.x);
     const float maxX = std::max(wTL.x, wBR.x);
     const float minY = std::min(wTL.y, wBR.y);
     const float maxY = std::max(wTL.y, wBR.y);
+    int ix0 = static_cast<int>(std::floor(minX / stepMm));
+    int ix1 = static_cast<int>(std::ceil(maxX / stepMm));
+    int iy0 = static_cast<int>(std::floor(minY / stepMm));
+    int iy1 = static_cast<int>(std::ceil(maxY / stepMm));
 
     constexpr long long kMaxDotCount = 32000;
-    int ix0 = 0, ix1 = 0, iy0 = 0, iy1 = 0;
-    for (;;) {
-        stepMm = niceGridStep(pxPerMm_, targetStepPx);
+    while (static_cast<long long>(ix1 - ix0 + 1) *
+               static_cast<long long>(iy1 - iy0 + 1) > kMaxDotCount) {
+        skip *= 2;
+        stepMm = baseMm * static_cast<float>(skip);
         ix0 = static_cast<int>(std::floor(minX / stepMm));
         ix1 = static_cast<int>(std::ceil(maxX / stepMm));
         iy0 = static_cast<int>(std::floor(minY / stepMm));
         iy1 = static_cast<int>(std::ceil(maxY / stepMm));
-        const long long dotCount =
-            static_cast<long long>(ix1 - ix0 + 1) * static_cast<long long>(iy1 - iy0 + 1);
-        if (dotCount <= kMaxDotCount) break;
-        targetStepPx *= 2.0f;
     }
 
-    // The manager and Copilot are glass laid over this canvas. Leave their backing field calm while
-    // keeping the true canvas bounds unchanged for geometry projection and interaction.
     const ImVec2 imgMax(imgMin_.x + avail.x, imgMin_.y + avail.y);
     float gridMinX = imgMin_.x;
     float gridMaxX = imgMax.x;
     const float managerEdge = ui::overlayColumnEdge(0);
     const float copilotEdge = ui::overlayColumnEdge(1);
-    if (managerEdge >= 0.0f)
-        gridMinX = std::clamp(managerEdge, imgMin_.x, imgMax.x);
-    if (copilotEdge >= 0.0f)
-        gridMaxX = std::clamp(copilotEdge, imgMin_.x, imgMax.x);
+    if (managerEdge >= 0.0f) gridMinX = std::clamp(managerEdge, imgMin_.x, imgMax.x);
+    if (copilotEdge >= 0.0f) gridMaxX = std::clamp(copilotEdge, imgMin_.x, imgMax.x);
     if (gridMaxX <= gridMinX) return;
 
     dl_->PushClipRect(ImVec2(gridMinX, imgMin_.y), ImVec2(gridMaxX, imgMax.y), true);
-
-    constexpr int kMajorEvery = 5;
-    constexpr int kDotSegments = 6;
-    constexpr int kOriginSegments = 12;
     const float minorRadius = ui::metrics::px(0.65f);
     const float majorRadius = ui::metrics::px(1.05f);
     const float stepPx = stepMm * pxPerMm_;
     const float fadeSpan = std::max(stepPx * 2.0f, ui::metrics::U(2.0f));
     const ImVec2 first = toScreen(
         {static_cast<float>(ix0) * stepMm, static_cast<float>(iy0) * stepMm});
-
-    // Color conversion is per column, not per dot; y positions are affine increments rather than
-    // repeated camera transforms. The grid remains cheap even at the bounded maximum density.
     for (int ix = ix0; ix <= ix1; ++ix) {
         const float sx = first.x + static_cast<float>(ix - ix0) * stepPx;
         if (sx <= gridMinX || sx >= gridMaxX) continue;
         const float edgeDistance = std::min(sx - gridMinX, gridMaxX - sx);
         const float edgeFade = std::clamp(edgeDistance / fadeSpan, 0.0f, 1.0f);
         const ImU32 minorCol = col(p.sketchGrid, 0.55f * edgeFade);
-        const ImU32 majorCol = col(p.sketchGrid, 1.00f * edgeFade);
-        const bool majorX = ix % kMajorEvery == 0;
-
+        const ImU32 majorCol = col(p.sketchGrid, edgeFade);
+        const long long baseIx = static_cast<long long>(ix) * skip;
         for (int iy = iy0; iy <= iy1; ++iy) {
-            if (ix == 0 && iy == 0) continue;  // the restrained origin cue owns this point
+            const long long baseIy = static_cast<long long>(iy) * skip;
+            if (baseIx == 0 && baseIy == 0) continue;
             const float sy = first.y - static_cast<float>(iy - iy0) * stepPx;
-            const bool major = majorX && iy % kMajorEvery == 0;
+            const bool major = baseIx % 5 == 0 && baseIy % 5 == 0;
             dl_->AddCircleFilled(ImVec2(sx, sy), major ? majorRadius : minorRadius,
-                                 major ? majorCol : minorCol, kDotSegments);
+                                 major ? majorCol : minorCol, 6);
         }
     }
 
-    // Neutral, non-interactive origin cue. It is absent when off-canvas or occluded by glass and
-    // stays well below wire, ratsnest, outline, and copper contrast.
     if (minX <= 0.0f && maxX >= 0.0f && minY <= 0.0f && maxY >= 0.0f) {
         const ImVec2 origin = toScreen({0.0f, 0.0f});
         if (origin.x >= gridMinX && origin.x <= gridMaxX) {
             const ImU32 originCol = col(p.sketchInk, 0.20f);
-            dl_->AddCircle(origin, ui::metrics::px(2.25f), originCol, kOriginSegments,
+            dl_->AddCircle(origin, ui::metrics::px(2.25f), originCol, 12,
                            ui::metrics::stroke(1.0f));
-            dl_->AddCircleFilled(origin, ui::metrics::px(0.65f), originCol, kDotSegments);
+            dl_->AddCircleFilled(origin, ui::metrics::px(0.65f), originCol, 6);
         }
     }
-
     dl_->PopClipRect();
 }
 
@@ -249,215 +361,566 @@ void EcadCanvas::drawGrid(const ImVec2& avail) {
 
 void EcadCanvas::drawSch(const EcadMirror& doc) {
     const ui::Palette& p = ui::palette;
-    const ImU32 inkCol   = col(p.sketchInk);
-    const ImU32 wireCol  = col(p.sketchInk, 0.86f);
-    const ImU32 busCol   = col(p.sketchUnder);
-    const ImU32 pinCol   = col(p.sketchUnder);
-    const ImU32 netCol   = col(p.accentDim);
-    const ImU32 pwrCol   = col(p.statusWarn);
-    const ImU32 refCol   = col(p.accentDim);
-
     const float bodyStroke = zoomStroke(pxPerMm_, 0.12f, 1.35f, 2.6f);
-    const float pinStroke  = zoomStroke(pxPerMm_, 0.10f, 1.2f, 2.3f);
+    const float pinStroke = zoomStroke(pxPerMm_, 0.10f, 1.2f, 2.3f);
     const float wireStroke = zoomStroke(pxPerMm_, 0.10f, 1.25f, 2.5f);
-    const float busStroke  = zoomStroke(pxPerMm_, 0.22f, 2.4f, 4.4f);
+    const float busStroke = zoomStroke(pxPerMm_, 0.45f, 2.8f, 5.5f);
+    const ImU32 selectionOuter = col(p.selectionHighlight, 0.58f);
+    const ImU32 selectionInner = col(p.selectionHighlight);
 
-    std::string selectedKind, selectedId;
-    const bool hasSelection = splitSel(selected_, selectedKind, selectedId);
+    auto netOf = [&doc](const std::string& id,
+                        const std::string& direct) -> const std::string& {
+        return direct.empty() ? doc.netOfObject(id) : direct;
+    };
+    auto netVisible = [&doc](const std::string& net) {
+        return net.empty() || doc.netVisible(net);
+    };
+    auto netMatched = [this](const std::string& net) {
+        return !highlightedNet_.empty() && net == highlightedNet_;
+    };
+    auto themedNetColor = [&](const float role[4], const std::string& net, float normalAlpha) {
+        if (netMatched(net)) return selectionInner;
+        return col(role, highlightedNet_.empty() ? normalAlpha : normalAlpha * 0.17f);
+    };
+    auto staticColor = [&](const float role[4], float normalAlpha = 1.0f) {
+        return col(role, highlightedNet_.empty() ? normalAlpha : normalAlpha * 0.25f);
+    };
+    auto selectedPoint = [&](const char* kind, const std::string& id, const EcadPt& point) {
+        if (!selected(kind, id)) return;
+        const ImVec2 q = toScreen(point);
+        dl_->AddCircle(q, ui::metrics::px(6.0f), selectionOuter, 20,
+                       ui::metrics::stroke(4.0f));
+        dl_->AddCircle(q, ui::metrics::px(6.0f), selectionInner, 20,
+                       ui::metrics::stroke(1.5f));
+    };
 
-    auto drawSymbolGeometry =
-        [this](const EcadSymbol& s, const EcadPt& offset, ImU32 bodyColor, ImU32 pinColor,
-               float bodyTh, float pinTh, bool drawPinEnds) {
-            constexpr int kCircleSegments = 40;
-            constexpr int kPinSegments = 10;
-            const EcadPt placed{s.pos.x + offset.x, s.pos.y + offset.y};
-            for (const auto& g : s.body) {
-                switch (g.kind) {
-                    case EcadSymGraphic::Rect: {
-                        if (g.pts.size() < 2) break;
+    auto drawPolyline = [&](const std::vector<EcadPt>& pts, ImU32 color, float thickness,
+                            bool closed = false) {
+        if (pts.size() < 2) return;
+        for (size_t i = 1; i < pts.size(); ++i)
+            dl_->AddLine(toScreen(pts[i - 1]), toScreen(pts[i]), color, thickness);
+        if (closed && pts.size() > 2)
+            dl_->AddLine(toScreen(pts.back()), toScreen(pts.front()), color, thickness);
+    };
+
+    auto drawArc = [&](const EcadPt& center, float radius, float a0, float a1, ImU32 color,
+                       float thickness, bool filled) {
+        const float sweep = a1 - a0;
+        const int segments = std::clamp(
+            static_cast<int>(std::ceil(std::fabs(sweep) * kPi / 180.0f *
+                                       std::max(radius * pxPerMm_, 1.0f) /
+                                       ui::metrics::U(1.0f))),
+            12, 192);
+        std::vector<ImVec2> points;
+        points.reserve(static_cast<size_t>(segments) + (filled ? 2u : 1u));
+        if (filled) points.push_back(toScreen(center));
+        for (int i = 0; i <= segments; ++i) {
+            const float a = (a0 + sweep * static_cast<float>(i) / segments) * kPi / 180.0f;
+            points.push_back(toScreen(
+                {center.x + radius * std::cos(a), center.y + radius * std::sin(a)}));
+        }
+        if (filled && points.size() >= 3)
+            dl_->AddConvexPolyFilled(points.data(), static_cast<int>(points.size()), color);
+        for (size_t i = filled ? 2u : 1u; i < points.size(); ++i)
+            dl_->AddLine(points[i - 1], points[i], color, thickness);
+    };
+
+    auto drawGraphic = [&](const EcadGraphic& g, ImU32 color, float extraStroke, bool fill) {
+        const float th = std::max(ui::metrics::stroke(1.0f), g.width * pxPerMm_) + extraStroke;
+        switch (g.kind) {
+            case EcadGraphic::Line:
+                if (g.pts.size() >= 2)
+                    dl_->AddLine(toScreen(g.pts[0]), toScreen(g.pts[1]), color, th);
+                break;
+            case EcadGraphic::Rect:
+                if (g.pts.size() >= 2) {
+                    ImVec2 a = toScreen(g.pts[0]), b = toScreen(g.pts[1]);
+                    ImVec2 mn(std::min(a.x, b.x), std::min(a.y, b.y));
+                    ImVec2 mx(std::max(a.x, b.x), std::max(a.y, b.y));
+                    if (fill && g.filled) dl_->AddRectFilled(mn, mx, color);
+                    dl_->AddRect(mn, mx, color, 0.0f, 0, th);
+                }
+                break;
+            case EcadGraphic::Circle:
+                if (!g.pts.empty()) {
+                    const ImVec2 c = toScreen(g.pts[0]);
+                    const float r = std::fabs(g.radius) * pxPerMm_;
+                    if (fill && g.filled) dl_->AddCircleFilled(c, r, color, 48);
+                    dl_->AddCircle(c, r, color, 48, th);
+                }
+                break;
+            case EcadGraphic::Arc:
+                if (!g.pts.empty())
+                    drawArc(g.pts[0], std::fabs(g.radius), g.a0, g.a1, color, th,
+                            fill && g.filled);
+                break;
+            case EcadGraphic::Polyline:
+                if (fill && g.filled && g.pts.size() >= 3) {
+                    std::vector<ImVec2> points;
+                    points.reserve(g.pts.size());
+                    for (const EcadPt& q : g.pts) points.push_back(toScreen(q));
+                    dl_->AddConvexPolyFilled(points.data(), static_cast<int>(points.size()), color);
+                }
+                drawPolyline(g.pts, color, th, g.filled);
+                break;
+        }
+    };
+
+    if (showSheetFrame_) {
+        const EcadSheet* page = nullptr;
+        EcadPt pageMin, pageMax;
+        float pageScale = 1.0f;
+        if (sheetFrameGeometry(doc, page, pageMin, pageMax, pageScale)) {
+            const ImU32 frame = staticColor(p.textDim, 0.75f);
+            const ImVec2 frameTL = toScreen({pageMin.x, pageMax.y});
+            const ImVec2 frameBR = toScreen({pageMax.x, pageMin.y});
+            dl_->AddRect(frameTL, frameBR, frame, 0.0f, 0,
+                         ui::metrics::stroke(1.5f));
+            const float inset = 5.0f / pageScale;
+            dl_->AddRect(toScreen({pageMin.x + inset, pageMax.y - inset}),
+                         toScreen({pageMax.x - inset, pageMin.y + inset}), frame, 0.0f, 0,
+                         ui::metrics::stroke(1.0f));
+
+            const float paperBlockW =
+                std::min(96.0f, std::max(55.0f, page->w - 10.0f));
+            const float blockW = paperBlockW / pageScale;
+            const float blockH = 31.0f / pageScale;
+            const float blockBottom = pageMin.y + inset;
+            const EcadPt blockTL{pageMax.x - inset - blockW, blockBottom + blockH};
+            const EcadPt blockBR{pageMax.x - inset, blockBottom};
+            const ImVec2 bt = toScreen(blockTL), bb = toScreen(blockBR);
+            dl_->AddRectFilled(bt, bb, col(p.windowBg, 0.86f));
+            dl_->AddRect(bt, bb, frame, 0.0f, 0, ui::metrics::stroke(1.0f));
+            const EcadTitleBlock& tb = doc.titleBlock();
+            const float x = bt.x + ui::metrics::U(1.0f);
+            float y = bt.y + ui::metrics::U(0.6f);
+            const float fontSize =
+                std::clamp(1.8f / pageScale * pxPerMm_,
+                           ui::metrics::px(7.0f), ImGui::GetFontSize());
+            const float lineHeight = fontSize + ui::metrics::px(1.0f);
+            auto blockText = [&](ImVec2 pos, ImU32 color, const std::string& value) {
+                dl_->AddText(nullptr, fontSize, pos, color, value.c_str());
+            };
+            const std::string& title = tb.title.empty() ? doc.name() : tb.title;
+            if (!title.empty()) {
+                blockText(ImVec2(x, y), staticColor(p.text), title);
+                y += lineHeight;
+            }
+            if (!tb.company.empty()) {
+                blockText(ImVec2(x, y), staticColor(p.textDim), tb.company);
+                y += lineHeight;
+            }
+            blockText(ImVec2(x, y), staticColor(p.textDim), tb.paper);
+            blockText(ImVec2(x + blockW * pxPerMm_ * 0.28f, y),
+                      staticColor(p.textDim), tb.rev);
+            blockText(ImVec2(x + blockW * pxPerMm_ * 0.50f, y),
+                      staticColor(p.textDim), tb.date);
+            y += lineHeight;
+            const std::string* comments[] = {
+                &tb.comment1, &tb.comment2, &tb.comment3, &tb.comment4};
+            for (const std::string* comment : comments) {
+                if (comment->empty()) continue;
+                blockText(ImVec2(x, y), staticColor(p.textDim), *comment);
+                y += lineHeight;
+            }
+        }
+    }
+
+    for (const auto& g : doc.graphics()) {
+        if (!doc.onActiveSheet(g.sheet)) continue;
+        drawGraphic(g, staticColor(p.sketchUnder, 0.72f), 0.0f, true);
+        if (selected("graphic", g.id)) {
+            drawGraphic(g, selectionOuter, ui::metrics::px(4.0f), false);
+            drawGraphic(g, selectionInner, ui::metrics::px(1.0f), false);
+        }
+    }
+
+    for (const auto& text : doc.texts()) {
+        if (!doc.onActiveSheet(text.sheet)) continue;
+        const ImVec2 q = toScreen(text.pos);
+        const ImU32 c = staticColor(p.text, 0.88f);
+        const float fontSize =
+            std::clamp(text.size * pxPerMm_, ImGui::GetFontSize() * 0.65f,
+                       ImGui::GetFontSize() * 4.0f);
+        drawRotatedText(dl_, q, c, text.text.c_str(), fontSize, text.angle);
+        if (selected("text", text.id)) {
+            ImVec2 size = ImGui::CalcTextSize(text.text.c_str());
+            const float scale = fontSize / std::max(ImGui::GetFontSize(), 1.0f);
+            size.x *= scale;
+            size.y *= scale;
+            const float halo = ui::metrics::px(2.0f);
+            dl_->AddRect(ImVec2(q.x - halo, q.y - halo),
+                         ImVec2(q.x + size.x + halo, q.y + size.y + halo),
+                         selectionInner, 0.0f, 0, ui::metrics::stroke(1.5f));
+        }
+    }
+
+    for (const auto& bus : doc.buses()) {
+        if (!doc.onActiveSheet(bus.sheet)) continue;
+        const std::string& resolved = doc.netOfObject(bus.id);
+        const std::string& net = resolved.empty() ? bus.name : resolved;
+        bool memberMatched = false;
+        bool memberVisible = false;
+        for (const std::string& member : bus.members) {
+            memberMatched = memberMatched || netMatched(member);
+            memberVisible = memberVisible || doc.netVisible(member);
+        }
+        if (!netVisible(net) && !memberVisible) continue;
+        const ImU32 c = memberMatched ? selectionInner
+                                      : themedNetColor(p.sketchUnder, net, 0.95f);
+        drawPolyline(bus.pts, c, busStroke);
+        if (!bus.name.empty() && !bus.pts.empty())
+            dl_->AddText(toScreen({bus.pts.front().x + 1.0f, bus.pts.front().y + 2.0f}),
+                         c, bus.name.c_str());
+        if (selected("bus", bus.id)) {
+            drawPolyline(bus.pts, selectionOuter, busStroke + ui::metrics::px(4.0f));
+            drawPolyline(bus.pts, selectionInner, busStroke + ui::metrics::px(1.0f));
+        }
+    }
+
+    for (const auto& entry : doc.busEntries()) {
+        if (!doc.onActiveSheet(entry.sheet)) continue;
+        const std::string& net = netOf(entry.id, entry.net);
+        if (!netVisible(net)) continue;
+        const EcadPt end{entry.pos.x + entry.size.x, entry.pos.y + entry.size.y};
+        const ImU32 c = themedNetColor(p.sketchUnder, net, 0.95f);
+        dl_->AddLine(toScreen(entry.pos), toScreen(end), c,
+                     std::max(busStroke * 0.65f, ui::metrics::stroke(1.5f)));
+        if (selected("busentry", entry.id)) {
+            dl_->AddLine(toScreen(entry.pos), toScreen(end), selectionOuter,
+                         busStroke + ui::metrics::px(4.0f));
+            dl_->AddLine(toScreen(entry.pos), toScreen(end), selectionInner,
+                         busStroke + ui::metrics::px(1.0f));
+        }
+    }
+
+    for (const auto& wire : doc.wires()) {
+        if (!doc.onActiveSheet(wire.sheet)) continue;
+        const std::string& net = netOf(wire.id, wire.net);
+        if (!netVisible(net)) continue;
+        const float th = wire.bus ? busStroke : wireStroke;
+        const ImU32 c = themedNetColor(wire.bus ? p.sketchUnder : p.sketchInk, net, 0.90f);
+        drawPolyline(wire.pts, c, th);
+        if (selected("wire", wire.id)) {
+            drawPolyline(wire.pts, selectionOuter, th + ui::metrics::px(4.0f));
+            drawPolyline(wire.pts, selectionInner, th + ui::metrics::px(1.0f));
+        }
+    }
+
+    const float junctionRadius =
+        std::clamp(0.22f * pxPerMm_, ui::metrics::px(2.5f), ui::metrics::px(4.4f));
+    for (const auto& junction : doc.junctions()) {
+        if (!doc.onActiveSheet(junction.sheet)) continue;
+        const std::string& net = netOf(junction.id, junction.net);
+        if (!netVisible(net)) continue;
+        dl_->AddCircleFilled(toScreen(junction.pos), junctionRadius,
+                             themedNetColor(p.sketchInk, net, 0.92f), 16);
+        selectedPoint("junction", junction.id, junction.pos);
+    }
+
+    for (const auto& sheetSymbol : doc.sheetSymbols()) {
+        if (!doc.onActiveSheet(sheetSymbol.sheet)) continue;
+        const ImVec2 a = toScreen(sheetSymbol.pos);
+        const ImVec2 b = toScreen({sheetSymbol.pos.x + sheetSymbol.size.x,
+                                   sheetSymbol.pos.y - sheetSymbol.size.y});
+        const ImVec2 mn(std::min(a.x, b.x), std::min(a.y, b.y));
+        const ImVec2 mx(std::max(a.x, b.x), std::max(a.y, b.y));
+        const ImU32 c = staticColor(p.accentDim, 0.88f);
+        dl_->AddRectFilled(mn, mx, col(p.windowBg, highlightedNet_.empty() ? 0.45f : 0.15f));
+        dl_->AddRect(mn, mx, c, 0.0f, 0, bodyStroke);
+        dl_->AddText(ImVec2(mn.x + ui::metrics::U(1.0f), mn.y + ui::metrics::U(0.5f)),
+                     c, sheetSymbol.name.c_str());
+        for (const auto& pin : sheetSymbol.pins) {
+            if (!netVisible(pin.net)) continue;
+            const ImVec2 q = toScreen(pin.pos);
+            const ImU32 pc = themedNetColor(p.accentDim, pin.net, 0.95f);
+            dl_->AddCircleFilled(q, ui::metrics::px(2.0f), pc, 10);
+            dl_->AddText(ImVec2(q.x + ui::metrics::U(0.7f),
+                                q.y - ImGui::GetTextLineHeight() * 0.5f),
+                         pc, pin.name.c_str());
+        }
+        if (selected("sheetsym", sheetSymbol.id)) {
+            dl_->AddRect(mn, mx, selectionOuter, 0.0f, 0,
+                         ui::metrics::stroke(5.0f));
+            dl_->AddRect(mn, mx, selectionInner, 0.0f, 0,
+                         ui::metrics::stroke(1.5f));
+        }
+    }
+
+    auto drawSymbolBody = [&](const EcadSymbol& symbol, const EcadPt& offset, ImU32 color,
+                              float extraStroke) {
+        const EcadPt placed{symbol.pos.x + offset.x, symbol.pos.y + offset.y};
+        const float th = bodyStroke + extraStroke;
+        for (const auto& g : symbol.body) {
+            auto world = [&](const EcadPt& local) {
+                return EcadMirror::localToWorld(local, placed, symbol.angle, symbol.mirror);
+            };
+            switch (g.kind) {
+                case EcadSymGraphic::Rect:
+                    if (g.pts.size() >= 2) {
                         const EcadPt c0 = g.pts[0], c1 = g.pts[1];
                         const EcadPt corners[4] = {
                             {c0.x, c0.y}, {c1.x, c0.y}, {c1.x, c1.y}, {c0.x, c1.y}};
-                        ImVec2 screen[4];
                         for (int i = 0; i < 4; ++i)
-                            screen[i] = toScreen(
-                                EcadMirror::localToWorld(corners[i], placed, s.angle, s.mirror));
-                        for (int i = 0; i < 4; ++i)
-                            dl_->AddLine(screen[i], screen[(i + 1) % 4], bodyColor, bodyTh);
-                        break;
+                            dl_->AddLine(toScreen(world(corners[i])),
+                                         toScreen(world(corners[(i + 1) % 4])), color, th);
                     }
-                    case EcadSymGraphic::Line: {
-                        if (g.pts.size() < 2) break;
-                        dl_->AddLine(
-                            toScreen(EcadMirror::localToWorld(g.pts[0], placed, s.angle, s.mirror)),
-                            toScreen(EcadMirror::localToWorld(g.pts[1], placed, s.angle, s.mirror)),
-                            bodyColor, bodyTh);
-                        break;
-                    }
-                    case EcadSymGraphic::Circle: {
-                        if (g.pts.empty()) break;
-                        const EcadPt center =
-                            EcadMirror::localToWorld(g.pts[0], placed, s.angle, s.mirror);
-                        dl_->AddCircle(toScreen(center), g.radius * pxPerMm_, bodyColor,
-                                       kCircleSegments, bodyTh);
-                        break;
-                    }
-                    case EcadSymGraphic::Arc: {
-                        if (g.pts.empty()) break;
+                    break;
+                case EcadSymGraphic::Line:
+                    if (g.pts.size() >= 2)
+                        dl_->AddLine(toScreen(world(g.pts[0])), toScreen(world(g.pts[1])),
+                                     color, th);
+                    break;
+                case EcadSymGraphic::Circle:
+                    if (!g.pts.empty())
+                        dl_->AddCircle(toScreen(world(g.pts[0])), std::fabs(g.radius) * pxPerMm_,
+                                       color, 40, th);
+                    break;
+                case EcadSymGraphic::Arc:
+                    if (!g.pts.empty()) {
                         const float sweep = g.a1 - g.a0;
-                        const int segments = std::clamp(
+                        const int count = std::clamp(
                             static_cast<int>(std::ceil(std::fabs(sweep) * kPi / 180.0f *
-                                                       g.radius * pxPerMm_ /
+                                                       std::fabs(g.radius) * pxPerMm_ /
                                                        ui::metrics::U(1.0f))),
                             12, 96);
                         ImVec2 prev;
-                        for (int i = 0; i <= segments; ++i) {
+                        for (int i = 0; i <= count; ++i) {
                             const float a =
-                                (g.a0 + sweep * static_cast<float>(i) / segments) * kPi / 180.0f;
-                            const EcadPt local{g.pts[0].x + g.radius * std::cos(a),
-                                              g.pts[0].y + g.radius * std::sin(a)};
-                            const ImVec2 q = toScreen(
-                                EcadMirror::localToWorld(local, placed, s.angle, s.mirror));
-                            if (i > 0) dl_->AddLine(prev, q, bodyColor, bodyTh);
+                                (g.a0 + sweep * static_cast<float>(i) / count) * kPi / 180.0f;
+                            const ImVec2 q = toScreen(world(
+                                {g.pts[0].x + g.radius * std::cos(a),
+                                 g.pts[0].y + g.radius * std::sin(a)}));
+                            if (i) dl_->AddLine(prev, q, color, th);
                             prev = q;
                         }
-                        break;
                     }
-                    case EcadSymGraphic::Polyline: {
-                        for (size_t i = 1; i < g.pts.size(); ++i)
-                            dl_->AddLine(
-                                toScreen(EcadMirror::localToWorld(g.pts[i - 1], placed, s.angle,
-                                                                  s.mirror)),
-                                toScreen(EcadMirror::localToWorld(g.pts[i], placed, s.angle,
-                                                                  s.mirror)),
-                                bodyColor, bodyTh);
-                        break;
-                    }
-                }
+                    break;
+                case EcadSymGraphic::Polyline:
+                    for (size_t i = 1; i < g.pts.size(); ++i)
+                        dl_->AddLine(toScreen(world(g.pts[i - 1])),
+                                     toScreen(world(g.pts[i])), color, th);
+                    break;
+            }
+        }
+    };
+
+    for (const auto& symbol : doc.symbols()) {
+        if (!doc.onActiveSheet(symbol.sheet)) continue;
+        const bool moving = selected("sym", symbol.id);
+        const EcadPt offset = moving ? EcadPt{dragDx_, dragDy_} : EcadPt{0.0f, 0.0f};
+        bool symbolMatched = false;
+        for (const auto& pin : symbol.pins)
+            symbolMatched = symbolMatched || (netVisible(pin.net) && netMatched(pin.net));
+        ImU32 bodyColor = symbol.power ? col(p.statusWarn) : col(p.sketchInk);
+        if (symbol.dnp) bodyColor = col(p.textDim, 0.62f);
+        else if (!highlightedNet_.empty() && !symbolMatched) bodyColor = col(p.sketchInk, 0.22f);
+        else if (symbolMatched) bodyColor = selectionInner;
+        drawSymbolBody(symbol, offset, bodyColor, 0.0f);
+
+        for (const auto& pin : symbol.pins) {
+            if (!netVisible(pin.net)) continue;
+            const EcadPt root{pin.root.x + offset.x, pin.root.y + offset.y};
+            const EcadPt tip{pin.tip.x + offset.x, pin.tip.y + offset.y};
+            const ImVec2 r = toScreen(root), t = toScreen(tip);
+            float dx = t.x - r.x, dy = t.y - r.y;
+            const float len = std::max(std::hypot(dx, dy), 1.0f);
+            dx /= len;
+            dy /= len;
+            const float alpha = pin.hidden ? 0.28f : 0.92f;
+            const ImU32 pc = netMatched(pin.net)
+                                 ? col(p.selectionHighlight, pin.hidden ? 0.35f : 1.0f)
+                                 : col(p.sketchUnder,
+                                       highlightedNet_.empty() ? alpha : alpha * 0.17f);
+            dl_->AddLine(r, t, pc, pinStroke);
+
+            const bool inverted = containsNoCase(pin.shape, "inverted");
+            if (inverted) {
+                dl_->AddCircle(t, ui::metrics::px(2.6f), pc, 16, pinStroke);
+            } else if (pin.net.empty()) {
+                dl_->AddCircle(t, ui::metrics::px(2.2f), pc, 12,
+                               ui::metrics::stroke(1.0f));
+            } else {
+                dl_->AddCircleFilled(t, ui::metrics::px(1.8f), pc, 10);
+            }
+            if (containsNoCase(pin.shape, "clock")) {
+                const float h = ui::metrics::U(1.1f);
+                const ImVec2 base(r.x - dx * h * 2.0f, r.y - dy * h * 2.0f);
+                const ImVec2 normal(-dy * h, dx * h);
+                dl_->AddTriangle(r, ImVec2(base.x + normal.x, base.y + normal.y),
+                                 ImVec2(base.x - normal.x, base.y - normal.y), pc, pinStroke);
             }
 
-            for (const auto& pin : s.pins) {
-                const EcadPt root{pin.root.x + offset.x, pin.root.y + offset.y};
-                const EcadPt tip{pin.tip.x + offset.x, pin.tip.y + offset.y};
-                const ImVec2 r = toScreen(root), t = toScreen(tip);
-                dl_->AddLine(r, t, pinColor, pinTh);
-                if (!drawPinEnds) continue;
-                const float radius = ui::metrics::px(pin.net.empty() ? 2.4f : 2.0f);
-                if (pin.net.empty())
-                    dl_->AddCircle(t, radius, pinColor, kPinSegments,
-                                   ui::metrics::stroke(1.0f));
-                else
-                    dl_->AddCircleFilled(t, radius, pinColor, kPinSegments);
+            if (!pin.name.empty() && pin.name != "~") {
+                const ImVec2 size = ImGui::CalcTextSize(pin.name.c_str());
+                ImVec2 pos = r;
+                pos.y -= size.y * 0.5f;
+                pos.x += dx >= 0.0f ? -size.x - ui::metrics::U(0.8f)
+                                    : ui::metrics::U(0.8f);
+                dl_->AddText(pos, pc, pin.name.c_str());
             }
-        };
+            if (!pin.number.empty()) {
+                const ImVec2 size = ImGui::CalcTextSize(pin.number.c_str());
+                ImVec2 pos(t.x + dx * ui::metrics::U(0.8f),
+                           t.y + dy * ui::metrics::U(0.8f) - size.y * 0.5f);
+                if (dx < 0.0f) pos.x -= size.x;
+                dl_->AddText(pos, pc, pin.number.c_str());
+            }
 
-    // Wires sit below symbols, matching schematic-editor convention.
-    for (const auto& w : doc.wires()) {
-        const ImU32 c = w.bus ? busCol : wireCol;
-        const float th = w.bus ? busStroke : wireStroke;
-        for (size_t i = 1; i < w.pts.size(); ++i)
-            dl_->AddLine(toScreen(w.pts[i - 1]), toScreen(w.pts[i]), c, th);
+            if (selected("pin", symbol.id, pin.number) || selected("pin", symbol.id)) {
+                dl_->AddLine(r, t, selectionOuter, pinStroke + ui::metrics::px(5.0f));
+                dl_->AddLine(r, t, selectionInner, pinStroke + ui::metrics::px(1.5f));
+                dl_->AddCircle(t, ui::metrics::px(5.0f), selectionInner, 16,
+                               ui::metrics::stroke(1.5f));
+            }
+        }
+
+        const ImVec2 origin = toScreen({symbol.pos.x + offset.x, symbol.pos.y + offset.y});
+        const std::string* displayRef = &symbol.ref;
+        std::string unitRef;
+        if (symbol.unitCount > 1) {
+            unitRef = symbol.ref;
+            if (symbol.unit >= 1 && symbol.unit <= 26)
+                unitRef.push_back(static_cast<char>('A' + symbol.unit - 1));
+            else
+                unitRef += "." + std::to_string(symbol.unit);
+            displayRef = &unitRef;
+        }
+        if (!displayRef->empty())
+            dl_->AddText(ImVec2(origin.x + ui::metrics::U(2.0f),
+                                origin.y - ui::metrics::U(4.5f)),
+                         symbol.dnp ? col(p.textDim) : staticColor(p.accentDim),
+                         displayRef->c_str());
+        if (!symbol.value.empty())
+            dl_->AddText(ImVec2(origin.x + ui::metrics::U(2.0f),
+                                origin.y + ui::metrics::U(1.5f)),
+                         symbol.dnp ? col(p.textDim) : bodyColor, symbol.value.c_str());
+
+        if (symbol.dnp) {
+            const float r = ui::metrics::U(4.0f);
+            dl_->AddLine(ImVec2(origin.x - r, origin.y - r),
+                         ImVec2(origin.x + r, origin.y + r), col(p.textDim),
+                         ui::metrics::stroke(2.0f));
+            dl_->AddLine(ImVec2(origin.x - r, origin.y + r),
+                         ImVec2(origin.x + r, origin.y - r), col(p.textDim),
+                         ui::metrics::stroke(2.0f));
+        }
+        if (symbol.generated) {
+            const float r = ui::metrics::U(2.2f);
+            const ImVec2 badge(origin.x - ui::metrics::U(3.2f),
+                               origin.y - ui::metrics::U(4.0f));
+            dl_->AddCircleFilled(badge, r, col(p.statusWarn), 18);
+            const ImVec2 bang = ImGui::CalcTextSize("!");
+            dl_->AddText(ImVec2(badge.x - bang.x * 0.5f, badge.y - bang.y * 0.5f),
+                         col(p.windowBg), "!");
+        }
+        if (moving) {
+            drawSymbolBody(symbol, offset, selectionOuter, ui::metrics::px(4.0f));
+            drawSymbolBody(symbol, offset, selectionInner, ui::metrics::px(1.0f));
+        }
     }
 
-    // Junctions scale with the drawing until their screen-space cap, so they stay distinct from pins.
-    const float junctionRadius =
-        std::clamp(0.22f * pxPerMm_, ui::metrics::px(2.5f), ui::metrics::px(4.4f));
-    for (const auto& j : doc.junctions())
-        dl_->AddCircleFilled(toScreen(j.pos), junctionRadius, wireCol, 16);
-
-    for (const auto& s : doc.symbols()) {
-        const bool selectedSymbol =
-            hasSelection && selectedKind == "s" && selectedId == s.id;
-        const EcadPt offset =
-            selectedSymbol ? EcadPt{dragDx_, dragDy_} : EcadPt{0.0f, 0.0f};
-        drawSymbolGeometry(s, offset, s.power ? pwrCol : inkCol, pinCol, bodyStroke, pinStroke,
-                           true);
-
-        const ImVec2 sp = toScreen({s.pos.x + offset.x, s.pos.y + offset.y});
-        if (!s.ref.empty())
-            dl_->AddText(ImVec2(sp.x + ui::metrics::U(2.0f),
-                                sp.y - ui::metrics::U(4.5f)),
-                         refCol, s.ref.c_str());
-        if (!s.value.empty())
-            dl_->AddText(ImVec2(sp.x + ui::metrics::U(2.0f),
-                                sp.y + ui::metrics::U(1.5f)),
-                         inkCol, s.value.c_str());
-    }
-
-    // Net labels use an angle-aware flag leader instead of an ambiguous standalone dot.
     for (const auto& label : doc.labels()) {
-        const ImVec2 sp = toScreen(label.pos);
+        if (!doc.onActiveSheet(label.sheet)) continue;
+        const std::string& net = netOf(label.id, label.net);
+        if (!netVisible(net)) continue;
+        const ImU32 c = themedNetColor(p.accentDim, net, 0.95f);
+        const ImVec2 q = toScreen(label.pos);
         const float a = label.angle * kPi / 180.0f;
         const ImVec2 dir(std::cos(a), -std::sin(a));
         const ImVec2 normal(-dir.y, dir.x);
-        const float flagLen = ui::metrics::U(1.5f);
-        const ImVec2 end(sp.x + dir.x * flagLen, sp.y + dir.y * flagLen);
-        dl_->AddLine(sp, end, netCol, ui::metrics::stroke(1.5f));
-        dl_->AddLine(end, ImVec2(end.x + normal.x * ui::metrics::U(0.75f),
-                                end.y + normal.y * ui::metrics::U(0.75f)),
-                     netCol, ui::metrics::stroke(1.2f));
-        dl_->AddCircleFilled(sp, ui::metrics::px(1.8f), netCol, 8);
-        dl_->AddText(ImVec2(end.x + ui::metrics::U(0.75f),
-                            end.y - ui::metrics::U(2.0f)),
-                     netCol, label.text.c_str());
+        const float leader = ui::metrics::U(1.6f);
+        const ImVec2 end(q.x + dir.x * leader, q.y + dir.y * leader);
+        dl_->AddLine(q, end, c, ui::metrics::stroke(1.5f));
+        if (equalsNoCase(label.scope, "global")) {
+            const float d = ui::metrics::U(1.4f);
+            const ImVec2 points[4] = {
+                end,
+                ImVec2(end.x + dir.x * d + normal.x * d, end.y + dir.y * d + normal.y * d),
+                ImVec2(end.x + dir.x * d * 2.6f, end.y + dir.y * d * 2.6f),
+                ImVec2(end.x + dir.x * d - normal.x * d, end.y + dir.y * d - normal.y * d)};
+            dl_->AddPolyline(points, 4, c, ImDrawFlags_Closed, ui::metrics::stroke(1.2f));
+        } else if (equalsNoCase(label.scope, "hier") ||
+                   equalsNoCase(label.scope, "hierarchical")) {
+            const float d = ui::metrics::U(1.2f);
+            const ImVec2 points[5] = {
+                end,
+                ImVec2(end.x + dir.x * d + normal.x * d, end.y + dir.y * d + normal.y * d),
+                ImVec2(end.x + dir.x * d * 3.0f + normal.x * d,
+                       end.y + dir.y * d * 3.0f + normal.y * d),
+                ImVec2(end.x + dir.x * d * 3.0f - normal.x * d,
+                       end.y + dir.y * d * 3.0f - normal.y * d),
+                ImVec2(end.x + dir.x * d - normal.x * d, end.y + dir.y * d - normal.y * d)};
+            dl_->AddPolyline(points, 5, c, ImDrawFlags_Closed, ui::metrics::stroke(1.2f));
+        } else {
+            dl_->AddCircleFilled(q, ui::metrics::px(1.6f), c, 8);
+        }
+        const ImVec2 textPos(end.x + dir.x * ui::metrics::U(0.8f),
+                             end.y + dir.y * ui::metrics::U(0.8f) -
+                                 ImGui::GetTextLineHeight() * 0.5f);
+        dl_->AddText(textPos, c, label.text.c_str());
+        if (selected("label", label.id)) {
+            const ImVec2 size = ImGui::CalcTextSize(label.text.c_str());
+            const float halo = ui::metrics::px(2.0f);
+            dl_->AddRect(ImVec2(textPos.x - halo, textPos.y - halo),
+                         ImVec2(textPos.x + size.x + halo, textPos.y + size.y + halo),
+                         selectionInner, 0.0f, 0, ui::metrics::stroke(1.5f));
+        }
     }
 
     for (const auto& power : doc.powers()) {
-        const ImVec2 sp = toScreen(power.pos);
-        const float r = ui::metrics::U(1.75f);
-        dl_->AddLine(sp, ImVec2(sp.x, sp.y - r * 1.6f), pwrCol, bodyStroke);
-        dl_->AddLine(ImVec2(sp.x - r, sp.y - r * 1.6f),
-                     ImVec2(sp.x + r, sp.y - r * 1.6f), pwrCol, bodyStroke);
-        if (!power.net.empty())
-            dl_->AddText(ImVec2(sp.x + r + ui::metrics::U(0.5f),
-                                sp.y - r * 1.6f - ui::metrics::U(2.0f)),
-                         pwrCol, power.net.c_str());
-    }
-
-    // The mirror does not expose a separate no-connect primitive, but ERC locations do. Mark only
-    // reported no-connects, avoiding the false implication that every intentionally floating pin is
-    // an error.
-    for (const auto& violation : doc.erc()) {
-        if (!violation.hasLoc ||
-            (violation.rule.find("not_connected") == std::string::npos &&
-             violation.rule.find("no_connect") == std::string::npos))
-            continue;
-        const ImVec2 q = toScreen(violation.loc);
-        const float r = ui::metrics::U(0.9f);
-        const ImU32 cue =
-            violation.severity == "error" ? col(p.statusErr) : col(p.statusWarn);
-        dl_->AddLine(ImVec2(q.x - r, q.y - r), ImVec2(q.x + r, q.y + r), cue,
-                     ui::metrics::stroke(1.5f));
-        dl_->AddLine(ImVec2(q.x - r, q.y + r), ImVec2(q.x + r, q.y - r), cue,
-                     ui::metrics::stroke(1.5f));
-    }
-
-    if (!hasSelection) return;
-    const ImU32 selectionOuter = col(p.selectionHighlight, 0.62f);
-    const ImU32 selectionInner = col(p.selectionHighlight, 1.8f);
-    if (selectedKind == "s") {
-        for (const auto& s : doc.symbols()) {
-            if (s.id != selectedId) continue;
-            const EcadPt offset{dragDx_, dragDy_};
-            drawSymbolGeometry(s, offset, selectionOuter, selectionOuter,
-                               bodyStroke + ui::metrics::px(4.0f),
-                               pinStroke + ui::metrics::px(4.0f), false);
-            drawSymbolGeometry(s, offset, selectionInner, selectionInner,
-                               bodyStroke + ui::metrics::px(1.0f),
-                               pinStroke + ui::metrics::px(1.0f), false);
-            break;
-        }
-    } else if (selectedKind == "w") {
-        for (const auto& w : doc.wires()) {
-            if (w.id != selectedId) continue;
-            const float base = w.bus ? busStroke : wireStroke;
-            for (size_t i = 1; i < w.pts.size(); ++i) {
-                const ImVec2 a = toScreen(w.pts[i - 1]), b = toScreen(w.pts[i]);
-                dl_->AddLine(a, b, selectionOuter, base + ui::metrics::px(4.0f));
-                dl_->AddLine(a, b, selectionInner, base + ui::metrics::px(1.0f));
+        if (!doc.onActiveSheet(power.sheet)) continue;
+        const std::string& net = netOf(power.id, power.net);
+        if (!netVisible(net)) continue;
+        const ImVec2 q = toScreen(power.pos);
+        const ImU32 c = themedNetColor(p.statusWarn, net, 0.95f);
+        const float r = ui::metrics::U(1.8f);
+        const bool ground = containsNoCase(power.symbol, "gnd") ||
+                            containsNoCase(net, "gnd") ||
+                            containsNoCase(power.symbol, "ground") ||
+                            containsNoCase(net, "ground") ||
+                            containsNoCase(power.symbol, "vss") || containsNoCase(net, "vss");
+        const bool specialGround = containsNoCase(power.symbol, "agnd") ||
+                                   containsNoCase(net, "agnd") ||
+                                   containsNoCase(power.symbol, "dgnd") ||
+                                   containsNoCase(net, "dgnd") ||
+                                   containsNoCase(power.symbol, "analog") ||
+                                   containsNoCase(net, "analog") ||
+                                   containsNoCase(power.symbol, "digital") ||
+                                   containsNoCase(net, "digital");
+        dl_->AddLine(q, ImVec2(q.x, q.y + r), c, bodyStroke);
+        if (ground && specialGround) {
+            dl_->AddTriangle(ImVec2(q.x - r, q.y + r),
+                             ImVec2(q.x + r, q.y + r),
+                             ImVec2(q.x, q.y + r * 2.7f), c, bodyStroke);
+        } else if (ground) {
+            for (int i = 0; i < 3; ++i) {
+                const float y = q.y + r * (1.0f + i * 0.55f);
+                const float half = r * (1.0f - i * 0.30f);
+                dl_->AddLine(ImVec2(q.x - half, y), ImVec2(q.x + half, y), c, bodyStroke);
             }
-            break;
+        } else {
+            dl_->AddTriangle(ImVec2(q.x, q.y - r * 1.5f),
+                             ImVec2(q.x - r, q.y + r * 0.2f),
+                             ImVec2(q.x + r, q.y + r * 0.2f), c, bodyStroke);
         }
+        if (!net.empty())
+            dl_->AddText(ImVec2(q.x + r + ui::metrics::U(0.5f),
+                                q.y - ImGui::GetTextLineHeight() * 0.5f),
+                         c, net.c_str());
+        selectedPoint("power", power.id, power.pos);
+    }
+
+    for (const auto& nc : doc.noConnects()) {
+        if (!doc.onActiveSheet(nc.sheet)) continue;
+        const ImVec2 q = toScreen(nc.pos);
+        const float r = ui::metrics::U(1.0f);
+        const ImU32 c = staticColor(p.statusWarn);
+        dl_->AddLine(ImVec2(q.x - r, q.y - r), ImVec2(q.x + r, q.y + r), c,
+                     ui::metrics::stroke(1.6f));
+        dl_->AddLine(ImVec2(q.x - r, q.y + r), ImVec2(q.x + r, q.y - r), c,
+                     ui::metrics::stroke(1.6f));
+        selectedPoint("nc", nc.id, nc.pos);
     }
 }
 
@@ -470,8 +933,6 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
     const ImU32 drillCol   = col(p.windowBg);
     const ImU32 refCol     = col(p.text, 0.85f);
 
-    std::string selectedKind, selectedId;
-    const bool hasSelection = splitSel(selected_, selectedKind, selectedId);
 
     auto trackStroke = [this](const EcadTrack& track, float extra) {
         return std::max(ui::metrics::stroke(1.0f), track.width * pxPerMm_) + extra;
@@ -504,8 +965,7 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
     };
 
     auto footprintOffset = [&](const EcadFootprint& fp) {
-        if (hasSelection && selectedKind == "fp" && selectedId == fp.id)
-            return EcadPt{dragDx_, dragDy_};
+        if (selected("fp", fp.id)) return EcadPt{dragDx_, dragDy_};
         return EcadPt{0.0f, 0.0f};
     };
 
@@ -612,6 +1072,12 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
         for (size_t i = 0; i < poly.size(); ++i)
             dl_->AddLine(poly[i], poly[(i + 1) % poly.size()], edge,
                          ui::metrics::stroke(1.2f));
+        if (selected("zone", zone.id)) {
+            for (size_t i = 0; i < poly.size(); ++i) {
+                dl_->AddLine(poly[i], poly[(i + 1) % poly.size()],
+                             col(p.selectionHighlight), ui::metrics::stroke(2.5f));
+            }
+        }
     }
 
     auto layers = doc.layers();
@@ -630,6 +1096,12 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
             drawTrack(*track,
                       copperColorFor(doc, layer.id, layer.copperIndex, alpha),
                       trackStroke(*track, 0.0f));
+            if (selected("track", track->id)) {
+                drawTrack(*track, col(p.selectionHighlight, 0.58f),
+                          trackStroke(*track, ui::metrics::px(5.0f)));
+                drawTrack(*track, col(p.selectionHighlight),
+                          trackStroke(*track, ui::metrics::px(2.0f)));
+            }
         }
     }
 
@@ -671,6 +1143,9 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
             const EcadPt center{pad.pos.x + offset.x, pad.pos.y + offset.y};
             drawPadShape(pad, center, fill, edge,
                          throughHole ? ui::metrics::stroke(1.0f) : 0.0f);
+            if (selected("pad", fp.id, pad.number) || selected("pad", fp.id))
+                drawPadShape(pad, center, col(p.selectionHighlight, 0.40f),
+                             col(p.selectionHighlight), ui::metrics::stroke(2.0f));
 
             if (pad.hasDrill && pad.drillDia > 0.0f) {
                 const ImVec2 drill = toScreen(center);
@@ -707,6 +1182,12 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
         dl_->AddCircleFilled(
             center, std::max(ui::metrics::px(1.0f), via.drill * 0.5f * pxPerMm_),
             highlightedNet_.empty() || matched ? drillCol : col(p.windowBg, 0.38f), 20);
+        if (selected("via", via.id)) {
+            dl_->AddCircle(center,
+                           std::max(ui::metrics::px(5.0f),
+                                    via.diameter * 0.5f * pxPerMm_ + ui::metrics::px(2.0f)),
+                           col(p.selectionHighlight), 28, ui::metrics::stroke(2.0f));
+        }
     }
 
     for (const auto& airwire : doc.ratsnest()) {
@@ -732,64 +1213,141 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
         }
     }
 
-    if (!hasSelection) return;
     const ImU32 selectionOuter = col(p.selectionHighlight, 0.62f);
-    const ImU32 selectionInner = col(p.selectionHighlight, 1.8f);
-    if (selectedKind == "fp") {
-        for (const auto& fp : doc.footprints()) {
-            if (fp.id != selectedId) continue;
-            const EcadPt offset{dragDx_, dragDy_};
-            EcadPt mn, mx;
-            bool haveBounds = false;
-            if (fp.hasCourtyard) {
-                mn = {fp.courtyardMin.x + offset.x, fp.courtyardMin.y + offset.y};
-                mx = {fp.courtyardMax.x + offset.x, fp.courtyardMax.y + offset.y};
-                haveBounds = true;
-            } else {
-                for (const auto& pad : fp.pads) {
-                    const float angle = pad.angle * kPi / 180.0f;
-                    const float halfW = pad.w * 0.5f, halfH = pad.h * 0.5f;
-                    const float ex = std::fabs(std::cos(angle)) * halfW +
-                                     std::fabs(std::sin(angle)) * halfH;
-                    const float ey = std::fabs(std::sin(angle)) * halfW +
-                                     std::fabs(std::cos(angle)) * halfH;
-                    const EcadPt center{pad.pos.x + offset.x, pad.pos.y + offset.y};
-                    if (!haveBounds) {
-                        mn = {center.x - ex, center.y - ey};
-                        mx = {center.x + ex, center.y + ey};
-                        haveBounds = true;
-                    } else {
-                        mn.x = std::min(mn.x, center.x - ex);
-                        mn.y = std::min(mn.y, center.y - ey);
-                        mx.x = std::max(mx.x, center.x + ex);
-                        mx.y = std::max(mx.y, center.y + ey);
-                    }
+    const ImU32 selectionInner = col(p.selectionHighlight);
+    for (const auto& fp : doc.footprints()) {
+        if (!selected("fp", fp.id)) continue;
+        const EcadPt offset{dragDx_, dragDy_};
+        EcadPt mn, mx;
+        bool haveBounds = false;
+        if (fp.hasCourtyard) {
+            mn = {fp.courtyardMin.x + offset.x, fp.courtyardMin.y + offset.y};
+            mx = {fp.courtyardMax.x + offset.x, fp.courtyardMax.y + offset.y};
+            haveBounds = true;
+        } else {
+            for (const auto& pad : fp.pads) {
+                const float angle = pad.angle * kPi / 180.0f;
+                const float halfW = pad.w * 0.5f, halfH = pad.h * 0.5f;
+                const float ex = std::fabs(std::cos(angle)) * halfW +
+                                 std::fabs(std::sin(angle)) * halfH;
+                const float ey = std::fabs(std::sin(angle)) * halfW +
+                                 std::fabs(std::cos(angle)) * halfH;
+                const EcadPt center{pad.pos.x + offset.x, pad.pos.y + offset.y};
+                if (!haveBounds) {
+                    mn = {center.x - ex, center.y - ey};
+                    mx = {center.x + ex, center.y + ey};
+                    haveBounds = true;
+                } else {
+                    mn.x = std::min(mn.x, center.x - ex);
+                    mn.y = std::min(mn.y, center.y - ey);
+                    mx.x = std::max(mx.x, center.x + ex);
+                    mx.y = std::max(mx.y, center.y + ey);
                 }
             }
-            if (haveBounds) {
-                ImVec2 a = toScreen({mn.x, mx.y});
-                ImVec2 b = toScreen({mx.x, mn.y});
-                const float pad = ui::metrics::px(2.0f);
-                a.x -= pad;
-                a.y -= pad;
-                b.x += pad;
-                b.y += pad;
-                dl_->AddRect(a, b, selectionOuter, 0.0f, 0,
-                             ui::metrics::stroke(4.0f));
-                dl_->AddRect(a, b, selectionInner, 0.0f, 0,
-                             ui::metrics::stroke(1.5f));
+        }
+        if (!haveBounds) continue;
+        ImVec2 a = toScreen({mn.x, mx.y});
+        ImVec2 b = toScreen({mx.x, mn.y});
+        const float pad = ui::metrics::px(2.0f);
+        a.x -= pad;
+        a.y -= pad;
+        b.x += pad;
+        b.y += pad;
+        dl_->AddRect(a, b, selectionOuter, 0.0f, 0, ui::metrics::stroke(4.0f));
+        dl_->AddRect(a, b, selectionInner, 0.0f, 0, ui::metrics::stroke(1.5f));
+    }
+}
+
+void EcadCanvas::drawOverlays(const EcadMirror& doc) {
+    const ui::Palette& p = ui::palette;
+    if (showErcMarkers_ && doc.isSch()) {
+        for (const auto& violation : doc.erc()) {
+            if (!violation.hasLoc) continue;
+            const ImVec2 q = toScreen(violation.loc);
+            const bool isError = violation.severity == "error";
+            const ImU32 c = isError ? col(p.statusErr, 0.95f)
+                                    : col(p.statusWarn, 0.95f);
+            const float r = ui::metrics::U(2.2f);
+            if (isError) {
+                const ImVec2 diamond[4] = {
+                    ImVec2(q.x, q.y - r), ImVec2(q.x + r, q.y),
+                    ImVec2(q.x, q.y + r), ImVec2(q.x - r, q.y)};
+                dl_->AddPolyline(diamond, 4, c, ImDrawFlags_Closed,
+                                 ui::metrics::stroke(2.0f));
+                dl_->AddCircleFilled(q, ui::metrics::px(1.0f), c, 8);
+            } else {
+                dl_->AddTriangle(ImVec2(q.x, q.y - r),
+                                 ImVec2(q.x + r, q.y + r),
+                                 ImVec2(q.x - r, q.y + r), c,
+                                 ui::metrics::stroke(2.0f));
             }
-            break;
         }
-    } else if (selectedKind == "t") {
-        for (const auto& track : doc.tracks()) {
-            if (track.id != selectedId) continue;
-            drawTrack(track, selectionOuter,
-                      trackStroke(track, ui::metrics::px(5.0f)));
-            drawTrack(track, selectionInner,
-                      trackStroke(track, ui::metrics::px(2.0f)));
-            break;
+    }
+
+    if (marqueeActive_) {
+        const ImVec2 a = toScreen(marqueeA_), b = toScreen(marqueeB_);
+        const ImVec2 mn(std::min(a.x, b.x), std::min(a.y, b.y));
+        const ImVec2 mx(std::max(a.x, b.x), std::max(a.y, b.y));
+        const ImU32 c = col(p.selectionHighlight, 0.95f);
+        const float th = ui::metrics::stroke(1.5f);
+        const float dash = ui::metrics::U(1.2f);
+        const float gap = ui::metrics::U(0.8f);
+        drawDashedLine(dl_, mn, ImVec2(mx.x, mn.y), c, th, dash, gap);
+        drawDashedLine(dl_, ImVec2(mx.x, mn.y), mx, c, th, dash, gap);
+        drawDashedLine(dl_, mx, ImVec2(mn.x, mx.y), c, th, dash, gap);
+        drawDashedLine(dl_, ImVec2(mn.x, mx.y), mn, c, th, dash, gap);
+    }
+
+    if (routePreview_.size() >= 2) {
+        const ImU32 c = col(routePreviewBus_ ? p.sketchUnder : p.selectionHighlight, 0.95f);
+        const float th = routePreviewBus_ ? ui::metrics::stroke(3.2f)
+                                          : ui::metrics::stroke(1.8f);
+        const float dash = ui::metrics::U(1.4f);
+        const float gap = ui::metrics::U(0.8f);
+        for (size_t i = 1; i < routePreview_.size(); ++i) {
+            const EcadPt a = routePreview_[i - 1];
+            const EcadPt b = routePreview_[i];
+            if (std::fabs(a.x - b.x) < 1e-5f || std::fabs(a.y - b.y) < 1e-5f) {
+                drawDashedLine(dl_, toScreen(a), toScreen(b), c, th, dash, gap);
+            } else {
+                const EcadPt elbow{b.x, a.y};
+                drawDashedLine(dl_, toScreen(a), toScreen(elbow), c, th, dash, gap);
+                drawDashedLine(dl_, toScreen(elbow), toScreen(b), c, th, dash, gap);
+            }
         }
+    }
+
+    if (snapTargetActive_) {
+        const ImVec2 q = toScreen(snapTarget_);
+        const ImU32 c = col(p.selectionHighlight);
+        dl_->AddCircle(q, ui::metrics::px(6.0f), c, 24, ui::metrics::stroke(2.0f));
+        dl_->AddCircleFilled(q, ui::metrics::px(1.8f), c, 10);
+        if (!snapTargetLabel_.empty()) {
+            const ImVec2 size = ImGui::CalcTextSize(snapTargetLabel_.c_str());
+            const ImVec2 pos(q.x + ui::metrics::U(1.5f), q.y - size.y - ui::metrics::U(1.0f));
+            const float xPad = ui::metrics::px(2.0f);
+            const float yPad = ui::metrics::px(1.0f);
+            dl_->AddRectFilled(ImVec2(pos.x - xPad, pos.y - yPad),
+                               ImVec2(pos.x + size.x + xPad, pos.y + size.y + yPad),
+                               col(p.windowBg, 0.88f), ui::metrics::px(2.0f));
+            dl_->AddText(pos, c, snapTargetLabel_.c_str());
+        }
+    }
+
+    if (focusFrames_ > 0) {
+        const ImVec2 q = toScreen(focusLoc_);
+        const float phase = static_cast<float>(180 - focusFrames_);
+        const float r = ui::metrics::px(11.0f + 5.0f * std::sin(phase * 0.18f));
+        const ImU32 c = focusIsError_ ? col(p.statusErr, 0.95f)
+                                      : col(p.statusWarn, 0.95f);
+        dl_->AddCircle(q, r, c, 28, ui::metrics::stroke(2.5f));
+        dl_->AddLine(ImVec2(q.x - r - ui::metrics::U(1.0f), q.y),
+                     ImVec2(q.x + r + ui::metrics::U(1.0f), q.y), c,
+                     ui::metrics::stroke(1.5f));
+        dl_->AddLine(ImVec2(q.x, q.y - r - ui::metrics::U(1.0f)),
+                     ImVec2(q.x, q.y + r + ui::metrics::U(1.0f)), c,
+                     ui::metrics::stroke(1.5f));
+        --focusFrames_;
     }
 }
 
@@ -823,38 +1381,59 @@ EcadCanvasIO EcadCanvas::draw(const EcadMirror& doc, const ImVec2& avail) {
     // Background fill (the light "studio" canvas, same idea as the 3D viewport in both themes).
     dl_->AddRectFilled(imgMin_, ImVec2(imgMin_.x + avail.x, imgMin_.y + avail.y),
                        col(ui::palette.viewportBottom));
-    dl_->PushClipRect(imgMin_, ImVec2(imgMin_.x + avail.x, imgMin_.y + avail.y), true);
 
-    // An invisible button captures hover + drag without stealing the draw list.
     ImGui::InvisibleButton("##ecadCanvas", avail,
                            ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight |
                            ImGuiButtonFlags_MouseButtonMiddle);
+    ImGuiIO& gio = ImGui::GetIO();
     io.hovered = ImGui::IsItemHovered();
-    const ImVec2 m = ImGui::GetIO().MousePos;
+    io.ctrl = gio.KeyCtrl;
+    io.shift = gio.KeyShift;
+    io.alt = gio.KeyAlt;
     if (io.hovered) {
-        io.worldMouse = toWorld(m);
+        io.worldMouse = toWorld(gio.MousePos);
         io.hasWorldMouse = true;
-        io.clicked = ImGui::IsItemDeactivated() && !ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+        io.leftDoubleClicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+        io.rightClicked = ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+        io.middleClicked = ImGui::IsMouseClicked(ImGuiMouseButton_Middle);
+    }
+
+    if (io.hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        leftGestureActive_ = true;
+        leftGestureDragged_ = false;
+        leftDragStartWorld_ = toWorld(gio.MousePos);
+    }
+    if (leftGestureActive_) {
+        io.dragStartWorld = leftDragStartWorld_;
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            if (!leftGestureDragged_) {
+                leftGestureDragged_ = true;
+                io.leftDragStarted = true;
+            }
+            io.leftDragging = true;
+        }
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            if (leftGestureDragged_) io.leftDragEnded = true;
+            else if (io.hovered) io.leftClicked = true;
+            leftGestureActive_ = false;
+            leftGestureDragged_ = false;
+        }
     }
 
     handleNavigation(io, avail);
-
-    drawGrid(avail);
-    if (doc.isSch())      drawSch(doc);
+    ImVec2 drawClipMin = imgMin_;
+    ImVec2 drawClipMax(imgMin_.x + avail.x, imgMin_.y + avail.y);
+    const float managerEdge = ui::overlayColumnEdge(0);
+    const float copilotEdge = ui::overlayColumnEdge(1);
+    if (managerEdge >= imgMin_.x && managerEdge <= drawClipMax.x)
+        drawClipMin.x = managerEdge;
+    if (copilotEdge >= drawClipMin.x && copilotEdge <= drawClipMax.x)
+        drawClipMax.x = copilotEdge;
+    dl_->PushClipRect(drawClipMin, drawClipMax, true);
+    drawGrid(doc, avail);
+    if (doc.isSch()) drawSch(doc);
     else if (doc.isPcb()) drawPcb(doc);
-
-    // "Zoom to violation" marker: a pulsing crosshair-ring at focusLoc_ for a few seconds after a
-    // violation row is clicked, so the eye lands on the exact reported location.
-    if (focusFrames_ > 0) {
-        const ImVec2 s = toScreen(focusLoc_);
-        const float phase = static_cast<float>(180 - focusFrames_);
-        const float r = 11.0f + 5.0f * std::sin(phase * 0.18f);  // px, gentle pulse
-        const ImU32 c = col(ui::palette.statusErr, 0.95f);
-        dl_->AddCircle(s, r, c, 28, 2.5f);
-        dl_->AddLine(ImVec2(s.x - r - 5, s.y), ImVec2(s.x + r + 5, s.y), c, 1.5f);
-        dl_->AddLine(ImVec2(s.x, s.y - r - 5), ImVec2(s.x, s.y + r + 5), c, 1.5f);
-        focusFrames_--;
-    }
+    drawOverlays(doc);
 
     dl_->PopClipRect();
     dl_ = nullptr;

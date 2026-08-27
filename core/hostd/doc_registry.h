@@ -155,12 +155,10 @@ public:
     // closeFn MUST NOT call back into DocRegistry — mtx_ is non-recursive.
     bool reapUnderLock(const std::string& docId, const std::function<void()>& closeFn);
 
-    // How many docs are still counting DOWN their GC grace (orphaned, deadline not yet
-    // reached). Read-only; Server::idleExpired refuses the idle-exit path while this is
-    // non-zero — see the invariant spelled out there. Docs already PAST their deadline are
-    // deliberately excluded: tick() retires + closes those, and a retire that keeps failing
-    // must never pin the daemon forever.
-    int pendingGcCount();
+    // True while `clientId` still holds at least one attachment. A connection with no
+    // attachments, no in-flight call and no recent traffic is a PARKED connection, not
+    // work: Server::idleExpired refuses to let one pin the daemon forever.
+    bool hasAttachments(int clientId);
     // Shared fail-closed classification used by daemon containment. Methods not
     // listed here are treated as protected even when the engine does not know them.
     static bool isReadOnlyMethod(const std::string& method);

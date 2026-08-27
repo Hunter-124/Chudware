@@ -376,20 +376,6 @@ class TestAutosaveRetention:
                 assert len(set(flags)) == 1, \
                     f"cap={cap}: session {k} partially pruned ({flags})"
 
-    def test_opt_in_cleanup_is_dry_run_by_default(self, monkeypatch, tmp_path):
-        """prune_autosave_debris() reports what it WOULD delete and touches nothing."""
-        d = self._sessions(tmp_path, monkeypatch, n_sessions=5, per=2)
-        before = sorted(p.name for p in d.glob("*.step+"))
-        r = cad_tools.prune_autosave_debris(keep_sessions=2)
-        assert r["applied"] is False and r["deleted"] == 0
-        assert r["sessions"] == 5 and r["snapshots"] == 10
-        assert r["would_delete"] == 6, r          # 3 oldest sessions x 2 snapshots
-        assert sorted(p.name for p in d.glob("*.step+")) == before, "dry run deleted files"
-
-        r2 = cad_tools.prune_autosave_debris(keep_sessions=2, apply=True)
-        assert r2["deleted"] == 6 and r2["applied"] is True
-        assert len(list(d.glob("*.step+"))) == 4
-
 
 
 # ---------------------------------------------------------------------------

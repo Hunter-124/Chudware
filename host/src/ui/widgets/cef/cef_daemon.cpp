@@ -3,11 +3,13 @@
 // idle-exits. Compiled only with CHUDWARE_ENABLE_CEF.
 #include "cef_daemon.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -201,9 +203,51 @@ json fetch_failure(int id, const std::string& out) {
     return fetch_response(id, FetchResult{}, out);
 }
 
+// Monotonic ms of the last thing this daemon actually did. Written by the serve loop,
+// read by the watchdog thread.
+std::atomic<long long> g_last_activity_ms{0};
+
+long long steady_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               steady::now().time_since_epoch())
+        .count();
+}
+
+// Force-exit this process after `idle_secs` with nothing to do, from a thread that
+// does NOTHING else.
+//
+// WHY a separate thread: the serve loop below is single-threaded and also drives the
+// native CEF pump (CefDoMessageLoopWork, which may only run on that one thread), and
+// initialize() itself can block indefinitely on Chromium's ProcessSingleton when
+// another daemon already holds the shared profile lock. In both cases the loop's own
+// idle check never runs again, and the daemon's ONLY self-termination mechanism is
+// gone. Measured consequence: 193 of these processes alive 34 h after every spawner
+// had died, their socket files long since unlinked — each one spawned because the
+// previous one never came up. This thread is the guarantee the loop cannot give.
+//
+// _Exit, not exit/return: a wedged process must not run CEF teardown or atexit
+// handlers, both of which can block on the same thing that wedged it.
+void start_idle_watchdog(int idle_secs) {
+    if (idle_secs <= 0) return;  // 0 = run until killed (dev/debug)
+    g_last_activity_ms = steady_ms();
+    std::thread([idle_secs] {
+        const long long limitMs = (long long)idle_secs * 1000;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (steady_ms() - g_last_activity_ms.load() < limitMs) continue;
+            std::fprintf(stderr, "[cef-daemon] idle %ds — exiting (watchdog)\n", idle_secs);
+            std::fflush(stderr);
+            std::_Exit(0);
+        }
+    }).detach();
+}
+
 }  // namespace
 
 int run_cef_daemon(const std::string& sock_path, int idle_secs) {
+    // Armed BEFORE initialize(): a ProcessSingleton stall inside CEF init is one of the two
+    // ways this process wedges, and it happens before the serve loop ever runs.
+    start_idle_watchdog(idle_secs);
     // GUI and daemon must not share Chromium ProcessSingleton (same root_cache_path).
     // Mark this process before initialize() so cache_root() → cef_cache_daemon.
     cef_platform::set_daemon_process(true);
@@ -224,7 +268,13 @@ int run_cef_daemon(const std::string& sock_path, int idle_secs) {
     std::vector<Queued>   queued;
     std::vector<InFlight> inflight;
 
+    // One clock for both idle checks: the loop's cooperative one (below) and the watchdog's
+    // hard one. mark_activity() must be called wherever `last` is updated.
     auto last = steady::now();
+    const auto mark_activity = [&last](steady::time_point t) {
+        last = t;
+        g_last_activity_ms = steady_ms();
+    };
     bool stop = false;
     // Keep servicing until a shutdown/idle-exit AND every in-flight or queued
     // request has been answered — a connection is never dropped unanswered.
@@ -238,7 +288,7 @@ int run_cef_daemon(const std::string& sock_path, int idle_secs) {
             const int accept_ms = !inflight.empty() ? 0 : (busy ? 25 : 250);
             chudware_ipc::IpcConn c = listener.accept(accept_ms);
             if (c.valid()) {
-                last = now;
+                mark_activity(now);
                 waiting.push_back(Waiting{std::move(c), now});
             }
         }
@@ -249,7 +299,7 @@ int run_cef_daemon(const std::string& sock_path, int idle_secs) {
             std::string line;
             bool drop = false;
             if (waiting[i].conn.readLine(line, /*timeoutMs=*/0)) {
-                last = now;
+                mark_activity(now);
                 json req = json::parse(line, nullptr, /*allow_exceptions=*/false);
                 const std::string method = req.is_discarded() ? std::string{}
                                                               : req.value("method", "");
@@ -305,12 +355,15 @@ int run_cef_daemon(const std::string& sock_path, int idle_secs) {
                                         now + std::chrono::milliseconds(q.settle_ms +
                                                                         kFetchSlackMs)});
             queued.erase(queued.begin());
-            last = now;
+            mark_activity(now);
         }
 
         // 4. One shared pump advances EVERY live browser, then each job is stepped
         //    and completions answer their OWN connection.
         if (!inflight.empty()) {
+            // A live fetch IS activity: stamp before the pump so a long navigation can never
+            // look idle to the watchdog thread.
+            mark_activity(now);
             headless_pump(kPumpSliceMs);
             const steady::time_point tick = steady::now();
             for (size_t i = 0; i < inflight.size();) {
@@ -327,7 +380,7 @@ int run_cef_daemon(const std::string& sock_path, int idle_secs) {
                     inflight[i].conn.writeLine(
                         fetch_response(inflight[i].id, r, inflight[i].out).dump());
                     inflight.erase(inflight.begin() + static_cast<long>(i));
-                    last = steady::now();
+                    mark_activity(steady::now());
                 } else {
                     ++i;
                 }

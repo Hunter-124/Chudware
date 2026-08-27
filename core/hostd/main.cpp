@@ -116,7 +116,8 @@ static void trayQuitThunk(void*) {
     }
 #endif
     if (g_server) {
-        g_server->status().draining = true;  // refuse new accepts while we wind down
+        // Bounded: refuse new accepts, give current work a moment, then go regardless.
+        g_server->beginDrain(/*deadlineSecs=*/5);
         g_server->stop();
     }
 }
@@ -139,8 +140,10 @@ static void trayStatusTick(hostd::Server* server) {
         std::snprintf(tip, sizeof tip, "Chudware hostd — engine failed");
     } else if (draining) {
         ts = TrayStatus::Busy;
-        std::snprintf(tip, sizeof tip, "Chudware hostd — draining (%d client%s)",
-                      clients, clients == 1 ? "" : "s");
+        // Bounded by CHUDWARE_HOSTD_DRAIN_GRACE_S for an explicit stop, and by the clients
+        // actually working for the stale-binary self-drain — never open-ended.
+        std::snprintf(tip, sizeof tip, "Chudware hostd — shutting down (%d client%s)", clients,
+                      clients == 1 ? "" : "s");
     } else if (eng == 0) {
         ts = TrayStatus::Busy;
         std::snprintf(tip, sizeof tip, "Chudware hostd — loading engine…");
@@ -615,9 +618,9 @@ int main(int argc, char** argv) {
     if (trayTicker.joinable()) trayTicker.join();
     hostd::trayStop();
 
-    // Clean shutdown (idle-exit, --stop drain, SIGTERM): save dirty docs so the
-    // next daemon recovers them; loss bound on a hard kill = autosave interval.
-    autosave.stop(/*finalSave=*/true);
+    // Clean shutdown (idle-exit, --stop drain, SIGTERM) discards this session's autosave dir;
+    // recovery is crash-only. A hard kill skips this and leaves the dir as the crash signal.
+    autosave.stop();
     loader.join();
     // Deterministic sidecar reap on an explicit drain/--stop (or ordinary idle-exit), instead
     // of relying on static-destructor order at process exit:

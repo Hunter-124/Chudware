@@ -126,6 +126,35 @@ judgment).
   docs use floor `CHUDWARE_DOC_GC_AGENT_GRACE_S` (default 1800 s) so mission-built parts stay
   openable from the GUI after the agent detaches; `CHUDWARE_DOC_GC=0` disables
   (`core/hostd/doc_registry.*`).
+- **What keeps hostd alive is WORK, not sockets** (2026-08-27). `Server::idleExpired` and the
+  drain both gate on `pinningClients()`, never `status_.clients`: a `gui` client always pins
+  (the app being open IS the reason the daemon exists), any other client pins only while it
+  has an engine call in flight, an attached doc, or an RPC inside the idle window. Before
+  this, one connected-but-silent socket vetoed every exit path — a daemon sat "draining
+  (1 client)" in the tray for 5.5 h with an undismissable icon. Pinned by
+  `test_hostd_registry.py::test_parked_client_does_not_pin_the_daemon` plus its control
+  `…_attached_client_still_pins_the_daemon`. Do NOT re-add a raw client-count gate.
+- **A drain is bounded.** `Server::beginDrain(deadlineSecs)`: `daemon_drain` / `--stop` /
+  tray Quit / SIGTERM are HARD stops and carry a deadline (`CHUDWARE_HOSTD_DRAIN_GRACE_S`,
+  default 20 s; tray Quit uses 5 s) after which remaining connections are `shutdown()` and
+  the daemon exits regardless. The stale-binary self-drain passes `0` — soft, cooperative,
+  refuse new connects only, so a rebuild never kicks a live session.
+- **The doc-GC grace does NOT pin the daemon.** It used to, and with the 1800 s agent floor
+  that kept hostd (and its tray icon) alive for half an hour after the user closed the app —
+  while protecting a doc nobody could open, since the check is only reached when nothing is
+  attached. The floor's job is app-runtime: keep a just-finished mission's part openable
+  *while the GUI exists*. A grace that expires while the daemon serves is still retired by
+  `tick()`; a clean exit still discards (crash-only recovery,
+  `test_hostd_registry.py::test_clean_shutdown_discards_docs`).
+- **The CEF fetch daemon has a watchdog thread** (`host/src/ui/widgets/cef/cef_daemon.cpp`).
+  Its serve loop is single-threaded and also drives `CefDoMessageLoopWork`, and
+  `initialize()` can block on Chromium's ProcessSingleton — so the loop's own idle check is
+  not a termination guarantee. `start_idle_watchdog` is armed BEFORE `initialize()` and
+  `_Exit(0)`s after `idle_secs` of no activity. Every `last = now` in that loop must go
+  through `mark_activity()` or a live fetch looks idle. Spawning is single-flight
+  (`services/browser/cef_client.py` flock + re-probe): the worker forks per turn, so without
+  it every turn that found nothing listening minted another daemon — 193 were found alive at
+  once, 34 h old.
 - **GUI reconnect:** status bar shows a sticky unreachable chip; `engine_events` reconnects
   with backoff and re-bootstraps doc tabs on `reconnectGeneration` bump
   (`CHUDWARE_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.
@@ -144,6 +173,15 @@ judgment).
   touches `origin_kind=gui` and never writes a file for an empty doc. Only `new_part` and
   `add_features` project-save on their own — every assembly and every `edit_feature` /
   `set_material` / `asm_*` mutation depends on this sweep.
+- **In daemon mode hostd is the ONLY autosave authority** (2026-08-27). The daemon-mode
+  early-return lives in `cad_common._autosave()` — the single write — not at its callers.
+  It used to sit on the two aggregate entry points (`_autosave_all_open`,
+  `start_periodic_autosave`) while the ~7 per-tool call sites had none, and each ungated
+  write repointed the live doc's `path` outside hostd's recovery tier and cleared `dirty`,
+  which silently defeats `gcCloseDoc`'s retire-if-unsaved gate (`isAutosavePath` only
+  recognizes hostd's own dir) — an abandoned, never-delivered agent doc got closed without
+  ever reaching the orphan tier. Keep the guard at the write; the standalone (non-daemon)
+  MCP server still needs the snapshots.
 - **Refine cap (WI-10) is live** for non-frontier tiers: `scaffolds.should_stop_refine` is
   called at the tail of `agent_turn.run_turn`'s loop and stops with the `refine_cap`
   stop_reason. A "round" is geometry re-worked AFTER the model itself declared the build

@@ -71,12 +71,11 @@ public:
     // wait for ready.
     void start(const std::string& baseDir, const std::atomic<int>* engineState);
 
-    // Stop the loop (join) and DISCARD: remove this session's dir so the next
-    // start does NOT crash-recover a cleanly shut down session. Clean shutdown is
-    // not a crash — unsaved work is dropped (the GUI's quit warning is the guard),
-    // recovery is reserved for crashes. finalSave is retained for ABI/callers but
-    // no longer preserves anything.
-    void stop(bool finalSave);
+    // Stop the loop (join) and DISCARD: remove this session's dir so the next start does NOT
+    // crash-recover a cleanly shut down session. Clean shutdown is not a crash — unsaved work
+    // is dropped (the GUI's quit warning is the front-line guard), recovery is reserved for
+    // crashes, and a surviving session dir IS the crash signal.
+    void stop();
 
     // {old_doc_id: new_doc_id} from crash recovery; empty until recoveryDone().
     nlohmann::json idRemap();

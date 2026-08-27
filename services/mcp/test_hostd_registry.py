@@ -785,6 +785,52 @@ def _wait_daemon_gone(pid: int, timeout: float = 20.0) -> bool:
     return False
 
 
+def test_parked_client_does_not_pin_the_daemon(scratch_daemon):
+    """A connected-but-silent non-GUI client must NOT keep the daemon alive forever.
+
+    Regression: idle-exit gated on `status_.clients > 0`, so ONE socket that said hello and
+    then went quiet (a crashed tool, an editor's MCP server parked all day) vetoed every exit
+    path. Measured on a real machine: a daemon alive 5.5 h in the draining state with a tray
+    icon the user could not dismiss. A client now counts only while it is WORKING — an engine
+    call in flight, an attached doc, or traffic inside the idle window."""
+    parked = DaemonClient()
+    parked.connect()
+    pid = _pid(parked)
+    scratch_daemon.append(pid)
+    # Never closed, never used again — exactly the shape that used to pin the daemon.
+    assert _wait_daemon_gone(pid, timeout=25), "a parked client still pins the daemon"
+
+
+def test_attached_client_still_pins_the_daemon(scratch_daemon):
+    """The control for the test above: a client HOLDING a doc is real work, not parked, so
+    the daemon must stay up for it even with no traffic at all."""
+    a = DaemonClient()
+    a.connect()
+    pid = _pid(a)
+    scratch_daemon.append(pid)
+    a.call("doc_new", {"name": "held-open"})  # implicit rw attach
+    time.sleep(8)  # >2x the fixture's 3s linger
+    assert not _wait_daemon_gone(pid, timeout=0.1), "daemon dropped a client holding a doc"
+    assert a.call("daemon_status").get("pid") == pid
+
+
+def test_drain_exits_on_its_deadline_despite_a_stuck_client(scratch_daemon, monkeypatch):
+    """`daemon_drain` is a STOP request and must terminate. A client that never disconnects
+    used to veto it forever (the same 5.5 h tray icon); the drain now carries a deadline
+    (CHUDWARE_HOSTD_DRAIN_GRACE_S) after which stragglers are dropped and the daemon exits."""
+    monkeypatch.setenv("CHUDWARE_HOSTD_DRAIN_GRACE_S", "4")
+    # Long linger + a doc attachment so ONLY the drain deadline can end this daemon.
+    monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "600")
+    stuck = DaemonClient()
+    stuck.connect()
+    pid = _pid(stuck)
+    scratch_daemon.append(pid)
+    stuck.call("doc_new", {"name": "stuck-writer"})  # attached: pins until the deadline
+    r = stuck.call("daemon_drain", {})
+    assert r.get("ok") is True and r.get("deadline_secs") == 4, r
+    assert _wait_daemon_gone(pid, timeout=25), "drain never reached its deadline"
+
+
 def test_clean_shutdown_discards_docs(scratch_daemon):
     """A CLEAN shutdown discards unsaved work — recovery is crash-only. The doc
     must not auto-open AND must not land in the recovery tier on the next start

@@ -1359,8 +1359,18 @@ _RECOVER_SKIPPED = 0
 def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
     """Persist a doc to a recoverable .step+ (plus a sidecar tagging the session) so a
     server restart — e.g. after a client timeout killed it — can reload THIS session's
-    work instead of dropping every open document. Best-effort; never raises."""
-    if not doc_id:
+    work instead of dropping every open document. Best-effort; never raises.
+
+    NO-OP IN DAEMON MODE, and this is the ONE place that decision is made. chudware-hostd is
+    the single autosave authority there (core/hostd/autosave.cpp): writing a second snapshot
+    from here repoints the daemon doc's `path` OUTSIDE the daemon's recovery tier AND clears
+    its dirty flag, which defeats hostd's retire-if-unsaved GC gate (server.cpp gcCloseDoc
+    only recognizes its own dir via isAutosavePath) — an abandoned, never-delivered agent doc
+    then gets closed without ever reaching the orphan tier. The two aggregate entry points
+    (_autosave_all_open, start_periodic_autosave) each carried their own copy of this guard
+    while the ~7 direct per-tool call sites carried none; the guard belongs here, at the
+    single write, so a new call site cannot reintroduce the hole."""
+    if not doc_id or cb._daemon_mode():
         return
     try:
         # Resolve the doc's real name from the engine when the caller didn't pass one, so
@@ -1618,15 +1628,11 @@ def _autosave_all_open() -> None:
     """Autosave every open document THAT CHANGED since its last autosave (the engine's
     monotonic per-doc revision is the change signal; docs without one are always saved).
     Called on the periodic timer and before a heavy solve so a transport timeout that
-    kills the server can never lose an unrelated open part (Bug R-1)."""
+    kills the server can never lose an unrelated open part (Bug R-1).
+
+    No-op in daemon mode — see _autosave, which owns that decision. Returning early here as
+    well only skips a doc_list the sweep would waste."""
     if cb._daemon_mode():
-        # Daemon mode: chudware-hostd is THE single autosave authority (start_periodic_autosave
-        # is gated off here too). A per-doc doc_save to the MCP autosave dir would repoint the
-        # daemon doc's `path` OUTSIDE the daemon's recovery tier AND clear its dirty flag —
-        # which DEFEATS the daemon's retire-if-unsaved GC gate (server.cpp gcCloseDoc:
-        # isAutosavePath only recognizes the daemon's own dir) and could silently drop an
-        # abandoned, never-delivered agent doc when its mirror auto-closes. The daemon holds
-        # the doc across an MCP-server death anyway, so this pre-solve guard is redundant here.
         return
     try:
         docs = (cb.call("doc_list", {}) or {}).get("docs", [])
@@ -1867,39 +1873,6 @@ def _prune_autosaves(max_age_days: float = _AUTOSAVE_MAX_AGE_DAYS,
     except Exception:  # noqa: BLE001
         pass
     return n
-
-
-def prune_autosave_debris(keep_sessions: int = _AUTOSAVE_KEEP_SESSIONS,
-                          apply: bool = False) -> dict:
-    """OPT-IN maintenance sweep of the autosave directory — never called by any tool.
-
-    Collapses the snapshot pile to the newest *keep_sessions* sessions using the same
-    whole-session rule as the count cap, so a retained session stays fully recoverable.
-    DRY RUN by default: returns what it WOULD delete and touches nothing. Pass apply=True
-    to actually unlink. Reports {sessions, snapshots, keep_sessions, would_delete,
-    deleted, applied}."""
-    d = _autosave_dir()
-    entries: list[tuple[float, Path]] = []
-    for p in d.glob("*.step+"):
-        try:
-            entries.append((p.stat().st_mtime, p))
-        except OSError:
-            continue
-    sessions = {_autosave_session_key(p) for _mt, p in entries}
-    # cap=0 -> every session outside the keep window is prunable.
-    doomed = _autosave_prune_plan(entries, 0, keep_sessions, _SESSION_ID)
-    deleted = 0
-    if apply:
-        for p in doomed:
-            try:
-                p.unlink(missing_ok=True)
-                p.with_suffix(".json").unlink(missing_ok=True)
-                deleted += 1
-            except OSError:
-                continue
-    return {"dir": str(d), "sessions": len(sessions), "snapshots": len(entries),
-            "keep_sessions": keep_sessions, "would_delete": len(doomed),
-            "deleted": deleted, "applied": bool(apply)}
 
 
 def _autosave_session_of(step_path: Path) -> tuple[Optional[str], float, str, str]:

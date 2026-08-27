@@ -92,17 +92,15 @@ void Autosave::start(const std::string& baseDir, const std::atomic<int>* engineS
     thread_ = std::thread([this] { loop(); });
 }
 
-void Autosave::stop(bool finalSave) {
+void Autosave::stop() {
     stopping_ = true;
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
     // Clean shutdown DISCARDS unsaved work — it is not a crash, so nothing is
     // preserved for recovery (the front-line guard is the GUI's "unsaved changes
-    // on quit" warning; the daemon only reaches a clean stop once every client
-    // has disconnected). Removing this session's dir is the discard: the next
+    // on quit" warning). Removing this session's dir is the discard: the next
     // start finds no prior session and offers no recovery. A hard kill skips this
     // whole path — a surviving session dir IS the crash-recovery signal.
-    (void)finalSave;
     std::error_code ec;
     if (!sessionDir_.empty()) fs::remove_all(sessionDir_, ec);
     if (!recoverDir_.empty()) fs::remove_all(recoverDir_, ec);

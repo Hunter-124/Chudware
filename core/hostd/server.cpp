@@ -263,41 +263,68 @@ void Server::staleBinaryTick() {
             log().line("binary changed on disk (%s) — draining so clients respawn the "
                        "new build",
                        p.c_str());
-            status_.draining = true;
+            beginDrain(/*deadlineSecs=*/0);  // soft: a live client finishes its session
         }
     }
 }
 
+void Server::beginDrain(int deadlineSecs) {
+    status_.draining = true;
+    drainDeadlineMs_ = deadlineSecs > 0 ? monoMs() + (long long)deadlineSecs * 1000 : 0;
+}
+
+int Server::pinningClients(int idleWindowSecs) {
+    std::vector<std::shared_ptr<ClientConn>> live;
+    {
+        std::lock_guard<std::mutex> lk(clientsMtx_);
+        for (auto& [id, c] : clients_) live.push_back(c);
+    }
+    const long long now = monoMs();
+    const long long windowMs = (long long)std::max(1, idleWindowSecs) * 1000;
+    int n = 0;
+    for (const auto& c : live) {
+        // The app being open is itself the reason this process exists.
+        if (c->kind == "gui") { ++n; continue; }
+        if (now - c->lastRpcMs.load() <= windowMs) { ++n; continue; }
+        {
+            std::lock_guard<std::mutex> lk(inflightMtx_);
+            if (inflight_.count(c->id)) { ++n; continue; }
+        }
+        if (registry_.hasAttachments(c->id)) ++n;
+    }
+    return n;
+}
+
+void Server::disconnectAllClients() {
+    std::vector<std::shared_ptr<ClientConn>> live;
+    {
+        std::lock_guard<std::mutex> lk(clientsMtx_);
+        for (auto& [id, c] : clients_) live.push_back(c);
+    }
+    // shutdown() (not close()) so a thread parked in readLine()'s poll() gets POLLHUP and
+    // returns at once; clientLoop's disconnect tail then reclaims the fd and the slot.
+    for (const auto& c : live) c->conn.shutdown();
+}
+
+// The doc-GC grace no longer pins the daemon. It used to: idleExpired() refused to exit while
+// any doc was still counting down, so that a clean exit's autosave purge could not destroy work
+// the grace was protecting. But that check is only ever REACHED when nothing is attached and no
+// client is pinning — i.e. exactly when nobody can open the doc the grace is holding open — and
+// with the agent floor at 30 min it kept the daemon (and its tray icon) alive for half an hour
+// after the user closed the app. The floor's real job is app-runtime: keep a just-finished
+// mission's part openable from the GUI while the GUI exists. A doc whose grace expires while
+// the daemon is serving is still retired by tick() exactly as before; a clean exit still
+// discards, which is the documented crash-only-recovery rule
+// (autosave.h, test_hostd_registry.py::test_clean_shutdown_discards_docs).
+
 bool Server::idleExpired(int lingerSecs) {
-    if (status_.clients > 0 || status_.inflight > 0) return false;
+    // After the last GUI detached, only an ACTIVE non-GUI client or in-flight work justifies
+    // staying up, so use the short grace rather than the full linger.
+    const int idleLimitSecs = guiDetached_ ? guiExitGraceSecs_ : lingerSecs;
+    if (pinningClients(idleLimitSecs) > 0 || status_.inflight > 0) return false;
     // Never idle-exit under a running mission: children are the daemon's work
     // even with zero clients (GUI-close continuity).
     if (children_.aliveCount() > 0) return false;
-    // Nor while a doc is still inside its GC grace. Idle-exit takes the CLEAN exit path, and a
-    // clean exit purges the entire autosave session dir (Autosave::stop) on the assumption that
-    // the final save covered everything. It does not cover this: a doc whose grace has NOT
-    // elapsed was deliberately kept openable (agent/mcp-origin docs get 30 min — gcAgentGraceMs,
-    // doc_registry.cpp) and has not been retired to the orphan tier yet, so exiting first would
-    // delete exactly the mission work the grace exists to protect, leaving the next start's
-    // recoverPriorSession() nothing to find. Docs already PAST their deadline are excluded on
-    // purpose: the accept loop retires + closes those, and a retire that keeps failing must
-    // never pin the daemon forever.
-    const int gcPending = registry_.pendingGcCount();
-    // Transition only — this runs every 500 ms and the state can last the whole 30-min grace;
-    // "why is the daemon still up?" deserves exactly one answer in the log. run() is the sole
-    // caller (accept-loop thread), so the static needs no synchronisation.
-    static int loggedGcPending = 0;
-    if (gcPending != loggedGcPending) {
-        if (gcPending > 0)
-            log().line("idle, but %d doc(s) are still inside their GC grace — staying up so the "
-                       "clean-exit autosave purge cannot discard them", gcPending);
-        loggedGcPending = gcPending;
-    }
-    if (gcPending > 0) return false;
-    // After the last GUI detached, only a connected MCP client or in-flight
-    // agent work justifies staying up — both are already guarded above — so use
-    // the short grace rather than the full linger.
-    const int idleLimitSecs = guiDetached_ ? guiExitGraceSecs_ : lingerSecs;
     return monoMs() - status_.lastActivityMs > (long long)idleLimitSecs * 1000;
 }
 
@@ -319,6 +346,7 @@ void Server::run(int lingerSecs) {
                 std::lock_guard<std::mutex> lk(clientsMtx_);
                 c->id = nextClientId_++;
                 c->conn = std::move(conn);
+                c->lastRpcMs = monoMs();
                 clients_[c->id] = c;
             }
             ++status_.clients;
@@ -330,9 +358,24 @@ void Server::run(int lingerSecs) {
         // sessions can never pile zombie docs into the shared engine.
         for (const std::string& id : registry_.tick()) gcCloseDoc(id);
         staleBinaryTick();  // mtime watch on hostd binary + libchudware (self-drain)
-        if (status_.draining && status_.clients == 0 && status_.inflight == 0) break;
-        if (idleExpired(lingerSecs)) {
-            log().line("idle for %ds with no clients — exiting",
+        if (status_.draining) {
+            // A drain ends when the work ends — not when the last SOCKET goes away. Parked
+            // connections do not count (pinningClients), and a HARD drain (--stop, tray Quit,
+            // SIGTERM) additionally has a deadline after which stragglers are dropped: the
+            // daemon this replaces sat "draining (1 client)" in the tray for 5.5 h because one
+            // silent socket was allowed to veto its own shutdown forever.
+            const long long deadline = drainDeadlineMs_.load();
+            const bool expired = deadline > 0 && monoMs() >= deadline;
+            if ((pinningClients(guiExitGraceSecs_) == 0 && status_.inflight == 0) || expired) {
+                if (expired && status_.clients > 0) {
+                    log().line("drain deadline reached with %d client(s) still connected — "
+                               "dropping them and exiting", status_.clients.load());
+                    disconnectAllClients();
+                }
+                break;
+            }
+        } else if (idleExpired(lingerSecs)) {
+            log().line("idle for %ds with nothing to serve — exiting",
                        guiDetached_ ? guiExitGraceSecs_ : lingerSecs);
             break;
         }
@@ -477,6 +520,7 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c) {
                            "request", c->id, method.c_str());
             }
             touch();
+            c->lastRpcMs = monoMs();  // this connection is doing work — see pinningClients
             json resp = {{"id", id}};
             resp[isError ? "error" : "result"] = std::move(payload);
             // dump() is this loop's other throw site: it rejects invalid UTF-8 (type_error.316),
@@ -638,9 +682,14 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
             }
             children_.stopAll();  // TERM -> grace -> KILL, reaped before we drain
         }
-        status_.draining = true;
-        log().line("drain requested by client #%d", c.id);
-        return json{{"ok", true}};
+        // An explicit drain is a STOP request: it gets a deadline, so a client that never
+        // disconnects cannot veto it. Env CHUDWARE_HOSTD_DRAIN_GRACE_S (default 20 s, floor 1).
+        int graceSecs = 20;
+        if (const char* g = std::getenv("CHUDWARE_HOSTD_DRAIN_GRACE_S"); g && *g)
+            graceSecs = std::max(1, std::atoi(g));
+        beginDrain(graceSecs);
+        log().line("drain requested by client #%d (deadline %ds)", c.id, graceSecs);
+        return json{{"ok", true}, {"deadline_secs", graceSecs}};
     }
 
     // Lock-free doc read for spectators. Returns the last revision payload the registry

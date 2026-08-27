@@ -220,18 +220,14 @@ std::vector<std::string> DocRegistry::tick() {
     return expired;
 }
 
-// Deliberately NOT a variant of tick(): tick() mutates (expires holds, fans out events) and is
-// the accept loop's alone. This is a pure count under the same lock, cheap enough to run on
-// every 500 ms idle check.
-int DocRegistry::pendingGcCount() {
+// A pure read under the same lock as tick(), cheap enough to run on every 500 ms idle check.
+bool DocRegistry::hasAttachments(int clientId) {
     std::lock_guard<std::mutex> lk(mtx_);
-    const long long now = monoMs();
-    int n = 0;
     for (const auto& [id, d] : docs_) {
         (void)id;
-        if (d.orphanDeadlineMs > 0 && now < d.orphanDeadlineMs) ++n;
+        if (d.attach.count(clientId)) return true;
     }
-    return n;
+    return false;
 }
 
 bool DocRegistry::isReapable(const std::string& docId) {

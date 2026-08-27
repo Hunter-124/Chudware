@@ -36,6 +36,10 @@ struct ClientConn {
     std::string userDisplay;
     long pid = 0;
     chudware_ipc::IpcConn conn;
+    // Monotonic ms of this connection's last request. A socket that has been silent
+    // longer than the idle window, holds no attachment and has nothing in flight is a
+    // PARKED connection — see Server::pinningClients().
+    std::atomic<long long> lastRpcMs{0};
     std::mutex writeMtx;  // response writes and (Phase 3) event pushes interleave
     std::thread thread;
 };
@@ -78,16 +82,23 @@ public:
     // daemon to draining so the next client respawns the new build.
     void setSelfBinary(std::string path) { selfBinary_ = std::move(path); }
 
-    // Accept/dispatch until drained-and-idle (or stop()). lingerSecs: how long
-    // the daemon must be idle (no clients, no inflight) before self-exit.
+    // Accept/dispatch until the daemon has nothing left to do (or stop()). lingerSecs: how
+    // long it must stay unpinned (see pinningClients) before self-exit.
     void run(int lingerSecs);
     void stop() { stopping_ = true; }
 
+    // Begin a wind-down. `deadlineSecs > 0` makes it a HARD stop: new connects are refused
+    // and, once the deadline passes, whatever is still connected is disconnected and the
+    // daemon exits regardless. That deadline is what makes `--stop` / the tray's Quit /
+    // SIGTERM terminal; a soft drain (deadlineSecs == 0, used by the stale-binary watch)
+    // only refuses new connects and waits for the current work to finish on its own.
+    void beginDrain(int deadlineSecs);
+
     // Short idle grace used instead of lingerSecs once the last GUI client has
     // detached (CHUDWARE_HOSTD_GUI_EXIT_GRACE_S). The daemon exists to serve
-    // the GUI, a connected MCP client (clients>0 pins it anyway), or in-flight
-    // agent work the user chose to continue in the background (inflight>0) —
-    // none of those needs the full linger after the GUI is gone.
+    // the GUI, an ACTIVE non-GUI client, or in-flight agent work the user chose to
+    // continue in the background — none of those needs the full linger after the
+    // GUI is gone.
     void setGuiExitGrace(int secs) { guiExitGraceSecs_ = std::max(1, secs); }
 
     Status& status() { return status_; }
@@ -108,6 +119,21 @@ private:
     void touch();
     bool idleExpired(int lingerSecs);
     void staleBinaryTick();
+    // How many connected clients are a REASON to stay up, as opposed to merely connected.
+    //
+    // WHY this is not `status_.clients`: a client that connected, said hello and then went
+    // silent (a crashed-but-not-closed tool, an editor's MCP server parked all day) held
+    // `clients > 0` forever, and every exit path — idle-exit AND drain — waits on that
+    // counter. One parked socket kept a daemon alive for 5.5 h in the "draining" state with
+    // a tray icon the user could not get rid of. A GUI client always counts (the app being
+    // open IS the reason the daemon exists); any other client counts only while it is
+    // actually working: an engine call in flight, an attached document, or traffic within
+    // the idle window. Anything else is parked, and parked sockets get disconnected on the
+    // way out — clients respawn the daemon on their next call, which is the normal contract.
+    int pinningClients(int idleWindowSecs);
+    // shutdown() every live client connection so their reader threads unblock. Used by the
+    // hard-drain deadline: a client that will not leave on its own is dropped.
+    void disconnectAllClients();
     // Engine-call watchdog: track the in-flight engine RPC per client thread (one at a time —
     // clientLoop is sequential) so a background thread can detect a wedged interactive rebuild
     // and self-heal via restart. See engine_watchdog.h for the policy.
@@ -143,6 +169,9 @@ private:
     // while set, so the daemon does not outlive the GUI without a reason.
     std::atomic<bool> guiDetached_{false};
     int guiExitGraceSecs_ = 10;
+    // Monotonic ms after which a HARD drain stops waiting and drops whatever is still
+    // connected. 0 = no deadline (soft drain, or not draining at all).
+    std::atomic<long long> drainDeadlineMs_{0};
     std::mutex clientsMtx_;
     std::map<int, std::shared_ptr<ClientConn>> clients_;
     int nextClientId_ = 1;

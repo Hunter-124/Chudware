@@ -28,6 +28,9 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+if sys.platform != "win32":  # POSIX-only client (see module docstring)
+    import fcntl
+
 #: How long (seconds) the daemon stays up with no request before idle-exiting.
 DEFAULT_IDLE_S = 120
 #: Budget for a cold daemon spawn (CEF/Chromium bootstrap).
@@ -80,15 +83,41 @@ def socket_path(cef_bin: Optional[Path]) -> Optional[str]:
 
 def _spawn_daemon_detached(cef_bin: Path, sock: str, idle_s: int) -> None:
     """Launch the daemon so it outlives this client and self-manages via idle-exit.
-    POSIX: start_new_session detaches; an orphaned child reparents to init."""
-    Path(sock).parent.mkdir(parents=True, exist_ok=True)
-    subprocess.Popen(
-        [str(cef_bin), "--cef-daemon", sock, str(idle_s)],
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    POSIX: start_new_session detaches; an orphaned child reparents to init.
+
+    SINGLE-FLIGHT. The agent worker is a fresh process per turn, so every turn that found
+    nothing listening used to spawn its own daemon — and if the previous one came up wedged
+    (Chromium's ProcessSingleton stalling CEF init is the measured cause), every later turn
+    spawned another on top. 193 of them were found alive at once. The flock makes at most one
+    spawn in flight per socket key, and the re-probe under the lock means the loser of the
+    race adopts the winner's daemon instead of minting a second one. The daemon's own
+    watchdog (cef_daemon.cpp) bounds how long a wedged instance survives.
+    """
+    lock_path = Path(sock).with_suffix(".spawn.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return  # another process is mid-spawn; the connect retry loop will reach it
+        try:
+            probe = socket.socket(socket.AF_UNIX)
+            try:
+                probe.connect(sock)
+                return  # somebody already brought one up while we waited
+            except OSError:
+                pass
+            finally:
+                probe.close()
+            subprocess.Popen(
+                [str(cef_bin), "--cef-daemon", sock, str(idle_s)],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 class CefDaemon:

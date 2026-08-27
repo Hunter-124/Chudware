@@ -138,7 +138,6 @@ from .cad_common import (  # noqa: F401 — re-export compat facade
     _write_handoff_control,
     autosave_p95_ms,
     cb,
-    prune_autosave_debris,
     recover_autosaved,
     recover_skipped,
     sh,

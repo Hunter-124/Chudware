@@ -8254,3 +8254,50 @@ still describe an isolated circuit-sim worker that does not exist (the shipped p
 synchronous `ecad_simulate` + mechanical `sim_cancel{job_id}`); that divergence is now
 recorded in the contract rather than papered over. `ecad_to_3d` still ignores
 `into_doc_id` and returns no `part_doc_id` — board→3D, out of scope for this pass.
+
+## 2026-08-27 — hostd exits when the app does; one autosave authority
+Symptom: a tray icon reading `Chudware hostd — draining (1 client)` that never went away.
+Root cause: every exit path (idle-exit AND drain) waited on `status_.clients`, so ONE
+connected-but-silent socket vetoed shutdown forever — measured live at 5.5 h, the "client"
+being a parked tooling connection with no attachments and no traffic. `Server::idleExpired`
+and the drain now gate on `Server::pinningClients(idleWindowSecs)`: a `gui` client always
+pins, any other client pins only while it has an engine call in flight, an attached doc, or
+an RPC inside the idle window (`ClientConn::lastRpcMs`, `DocRegistry::hasAttachments`).
+`Server::beginDrain(deadlineSecs)` replaces the bare `status_.draining = true`: explicit
+stops (`daemon_drain`, `--stop`, tray Quit, SIGTERM) are HARD and carry a deadline
+(`CHUDWARE_HOSTD_DRAIN_GRACE_S`, default 20 s; tray Quit 5 s) after which stragglers are
+`shutdown()` and the daemon exits; the stale-binary self-drain stays soft (deadline 0). The
+doc-GC grace no longer pins idle-exit at all — with the 1800 s agent floor it kept hostd and
+its tray icon alive for half an hour after the GUI closed, protecting a doc nothing could
+open (the check is only reached when nothing is attached). Clean exit still discards; a
+grace expiring while the daemon serves is still retired by `tick()`. Files:
+`core/hostd/{server.h,server.cpp,doc_registry.h,doc_registry.cpp,main.cpp}`. Also removed
+`Autosave::stop`'s dead `finalSave` parameter (its body already `(void)`-ed it).
+
+CEF fetch daemon: 193 orphaned `chudware --cef-daemon` processes were alive 34 h after
+every spawner died, sockets already unlinked. Its only self-termination was an idle check
+inside the single thread that also drives `CefDoMessageLoopWork` — and `initialize()` can
+block on Chromium's ProcessSingleton before that loop is ever reached, so a wedged instance
+lived forever while each later turn spawned another. `cef_daemon.cpp` now arms
+`start_idle_watchdog()` BEFORE `initialize()` (own thread, `_Exit(0)` after `idle_secs` of
+no `mark_activity()`), and `services/browser/cef_client.py::_spawn_daemon_detached` is
+single-flight (flock + re-probe under the lock) so a fresh per-turn worker adopts an
+existing daemon instead of minting a rival.
+
+Autosave de-duplication: `cad_common._autosave()` was writing an MCP-side snapshot on ~7
+per-tool call sites with no daemon-mode guard, while its two aggregate callers each carried
+their own copy of that guard. In daemon mode that write repoints the live doc's `path`
+outside hostd's recovery tier and clears `dirty`, defeating `gcCloseDoc`'s
+retire-if-unsaved gate — an abandoned agent doc could be closed without ever reaching the
+orphan tier. The guard now sits at the single write; the duplicate in `_autosave_all_open`
+is reduced to a cheap `doc_list` skip. Deleted `prune_autosave_debris` (an opt-in
+maintenance sweep with no tool entry point — its own docstring said "never called by any
+tool"), its `cad_tools` re-export and its test.
+
+Tests: `services/mcp/test_hostd_registry.py` gains `test_parked_client_does_not_pin_the_daemon`,
+its control `test_attached_client_still_pins_the_daemon`, and
+`test_drain_exits_on_its_deadline_despite_a_stuck_client`. The two bug-defending ones were
+A/B'd against a HEAD-pinned hostd built out-of-tree (`/tmp/headhostd`) and fail there.
+Gotcha for the next pass: `test_inprocess_internal_agent_docs_are_registered_but_silent`
+fails on HEAD too — it is the concurrent ECAD session's in-progress `core/api/libchudware.cpp`,
+not this work.

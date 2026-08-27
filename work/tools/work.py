@@ -168,8 +168,21 @@ def parse_front_matter(path):
 
 
 def load_tasks():
+    """Load every task, including archived ones.
+
+    `tasks/` and `backlog/` hold the LIVE board. Completed tasks are moved into a `done/`
+    subdirectory of either so the board directories stay readable — 238 of 251 task files
+    were `status: done`, which buried the 11 that still needed attention.
+
+    Archived tasks are still loaded, and that is load-bearing rather than tidiness: live
+    tasks depend on completed ones (T-BL52 -> T-BL21, T-W11 -> T-W2/W5/W7/W8,
+    T-X5 -> T-X1), and the readiness test below reads `tasks.get(dep, {}).get("status")`,
+    so an unresolvable dependency is indistinguishable from an unfinished one and would
+    silently drop the dependent task out of `ready`. Lane ship-readiness counts done work
+    too. Archiving therefore changes directory layout only, never command output.
+    """
     tasks, errors = {}, []
-    for sub in ("tasks", "backlog"):
+    for sub in ("tasks", "backlog", "tasks/done", "backlog/done"):
         d = ROOT / sub
         if not d.is_dir():
             continue

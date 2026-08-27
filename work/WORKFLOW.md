@@ -21,6 +21,22 @@ step, no foreman, no team-coordination MCP. Pick a task, do it, mark it done.
 Steering: `python3 work/tools/work.py set T-XX [--priority N] [--lane L]
 [--kind K] [--deferred yes|no] [--reason "..."]`.
 
+## 1b. Completed-task archive
+
+Terminal tasks (`status: done` or `dropped`) live in `work/tasks/done/` and
+`work/backlog/done/`. The live board directories hold only work that still needs
+attention — before this split, 238 of 251 task files were already `done`, which
+buried the 11 that did not.
+
+`work.py` still LOADS the archive, which is required, not cosmetic: live tasks
+depend on completed ones (`T-BL52` → `T-BL21`, `T-W11` → `T-W2/W5/W7/W8`), and the
+readiness test cannot tell an unresolvable dependency from an unfinished one, so
+hiding a completed task would silently drop its dependents out of `ready`. Lane
+ship-readiness counts completed work too.
+
+So: moving a file between `tasks/` and `tasks/done/` changes layout only, never
+command output. When you finish a task, set `status: done` and move it down.
+
 ## 2. Deferred plans registry (current)
 
 | Plan | What's parked | Seam that stays |

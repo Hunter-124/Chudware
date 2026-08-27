@@ -717,3 +717,16 @@ byte-stability law.
 This is the T-DP14 multi-part rule: a shared design-pipeline boundary may produce
 one Project History point while each changed item's timeline still joins to the
 participant buildgraph node that produced it.
+
+## Appendix E — self-hosted live collaboration (additive, 2026-08)
+
+Remote profiles gain one OPTIONAL kind, `plm-server`, with capabilities
+`snapshot_sync`, `live_coedit`, and `presence`. Its WebSocket live-session
+behavior is frozen separately as `aicad.plm-live/1` in
+[`contracts/plm_live.md`](plm_live.md).
+
+This extension does not alter §6 dumb-remote sync or locks. Folder, SSH, and
+HTTPS profiles still use advisory locks and automatic copy-as-new-item
+collision preservation. A `plm-server` profile suppresses that advisory lock
+only while an item is joined to an authenticated live session. Tokens are
+external secrets and MUST NOT enter `manifest.json` or vault history.

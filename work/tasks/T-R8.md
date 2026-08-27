@@ -3,7 +3,7 @@ id: T-R8
 title: Self-hosted PLM server + live co-editing — two people in the same part, no locks
 workstream: R
 owner: unassigned
-status: todo
+status: doing
 branch: task/T-R8-plm-live-server
 depends_on: [T-R7]
 lane: plm-projects
@@ -62,3 +62,14 @@ process (single binary or `python -m services.plm.server`), NOT a SaaS dependenc
 - [ ] Dumb-remote projects are untouched (T-R7 lock mode keeps working); mode is
       chosen by remote-profile type, zero user config
 - [ ] scripts/gate.sh PASS; graphify update
+
+## Progress log
+
+- 2026-08-27: OSS survey completed in
+  `docs/review/PLM_LIVE_COLLAB_SURVEY.md`. Yjs and Automerge are permissive but
+  deliberately not imported: their order-independent generic merge models do
+  not preserve the existing engine's semantic, revisioned CAD operation
+  invariants. Chosen architecture is one authoritative WebSocket relay that
+  orders whole `doc_apply_ops` batches and publishes one canonical snapshot
+  between frames. `contracts/plm_live.md` freezes `aicad.plm-live/1`; BSD-3
+  `websockets` is pinned and recorded, with no license debt.

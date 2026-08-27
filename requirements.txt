@@ -74,6 +74,7 @@ PyNiteFEA==1.0.1
 # parity; a system `git` binary, when present, is an OPTIONAL subprocess accelerator only
 # (gc/repack) and is NEVER bundled. See docs/PLM_OSS_SURVEY.md + contracts/plm.md §7.
 dulwich==1.2.7
+websockets==16.1          # BSD-3-Clause — aicad.plm-live/1 self-hosted relay/client
 
 # Undeclared-but-installed transitive dependencies (T-V2 audit, T-V3 fix).
 # These were installed in mcp-venv but absent from requirements.txt; missing declaration

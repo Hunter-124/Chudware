@@ -157,6 +157,8 @@ row in the same change" rule.
 |---|---|---|---|
 | **dulwich** (`services/plm/gitbind.py`) | **Apache-2.0 OR GPL-2.0-or-later** (dual; SPDX `Apache-2.0 OR GPL-2.0-or-later`) | pure-Python git implementation — the object store + commit/tree writer behind the hidden `.aicadvault/` version-control vault | ok — **in-process, take the Apache-2.0 arm** (permissive, GPL-clean, commercial-safe under the guardrails). A hard `requirements.txt` dep of `services/plm/`. Chosen for zero-provisioning cross-platform parity (no compiled wheel assumption, no binary-on-PATH); `pip install`-only, identical on Fedora + Windows. pygit2 was declined (GPL-linking-exception ambiguity + per-platform native wheel). |
 | **git** (optional accelerator for `services/plm/`) | GPL-2.0+ | system `git` binary, used ONLY for `gc`/`repack` acceleration when present on PATH | ok — **subprocess-only, PATH-discovered, never bundled, feature-detected**; its absence degrades transparently to the guaranteed pure-dulwich path (`GitBinding.repack()`). Same mere-aggregation isolation as ngspice/QEMU/pandoc/esptool. No `requirements.txt` line (never imported in-process — spawned as a subprocess). |
+| **websockets** (`services/plm/server.py`, `services/plm/live_client.py`) | **BSD-3-Clause** | `aicad.plm-live/1` self-hosted authoritative WebSocket relay + Python client seam | ok — in-process, permissive, commercial-safe. Hard-pinned in `requirements.txt`; no SaaS dependency and no CRDT/OT code vendored. The same library is already used by the Webservice gateway. |
+
 ## Browser session service (T-X1, workstream X)
 
 | package | license | role | posture |

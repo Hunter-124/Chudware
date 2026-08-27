@@ -4715,7 +4715,6 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     static bool s_learn = true;       // agent.memory_learn
     static bool s_autolearn = false;  // agent.autolearn_enabled
     static bool s_autoContinue = false; // agent.autolearn_auto_continue
-    static int s_memModel = 0;        // 0 online | 1 local  (agent.memory_model)
     static int s_verbosity = 2;       // ui::aiUiVerbosity (0 quiet | 1 normal | 2 full)
     static bool s_follow = true;      // ui::aiFollowActiveSession
     static bool s_previews = true;    // ui::aiActiveWorkPreviews
@@ -4744,7 +4743,6 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         s_learn = loadAgentConfigBool("memory_learn", true);
         s_autolearn = loadAgentConfigBool("autolearn_enabled", false);
         s_autoContinue = loadAgentConfigBool("autolearn_auto_continue", false);
-        s_memModel = (loadAgentConfigString("memory_model", "online") == "local") ? 1 : 0;
         s_verbosity = ui::aiUiVerbosity();
         s_follow = ui::aiFollowActiveSession();
         s_previews = ui::aiActiveWorkPreviews();
@@ -4779,7 +4777,6 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         "Shake",
         "Summary",
     };
-    static const char* kMemModels[] = {"Online", "Local"};
     static const char* kVerbosity[] = {"Quiet", "Normal", "Full"};
 
     auto saveCompMode = [&](int mode) {
@@ -4887,22 +4884,6 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                    "extra work. When off, only standing Auto-Learn guidance remains.");
         if (!s_autolearn) ImGui::EndDisabled();
 
-        ImGui::TableNextColumn();
-        {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Memory model");
-            ImGui::SameLine();
-            helpMarker("Mnemopi LLM path for fact extraction when the OMP bridge "
-                       "enables it: Online (default) or Local on-device. Persisted as "
-                       "agent.memory_model. Bridge currently runs keyword/FTS-degraded "
-                       "when LLM/embeddings are off.");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1.0f);
-            if (s_memBackend != 1) ImGui::BeginDisabled();
-            if (settingsPopupRowCombo("##mem_model", &s_memModel, kMemModels, 2))
-                saveAgentConfigValue("memory_model", s_memModel == 1 ? "local" : "online");
-            if (s_memBackend != 1) ImGui::EndDisabled();
-        }
         ImGui::TableNextColumn();
         ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
         ImGui::EndTable();

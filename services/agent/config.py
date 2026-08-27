@@ -1092,7 +1092,6 @@ def get_memory_token_budget(cfg: dict | None = None) -> int:
 #   agent.compaction_backend  "builtin" | "omp"      (default "builtin")
 #   agent.cache_warming       bool                   (default False)
 #   agent.memory_learn        bool                   (default True)
-#   agent.memory_model        "online" | "local"     (default "online"; mnemopi LLM)
 #   agent.autolearn_enabled / autolearn_auto_continue / autolearn_min_tool_calls
 #     — OMP Auto-Learn sidecar (Settings → AI → Harness → Memory & Learning)
 # Precedence is ENV > config.json > default: CHUDWARE_MEMORY_BACKEND /
@@ -1103,7 +1102,6 @@ MEMORY_BACKEND_KEY = "memory_backend"
 COMPACTION_BACKEND_KEY = "compaction_backend"
 CACHE_WARMING_KEY = "cache_warming"
 MEMORY_LEARN_KEY = "memory_learn"
-MEMORY_MODEL_KEY = "memory_model"
 AUTOLEARN_ENABLED_KEY = "autolearn_enabled"
 AUTOLEARN_AUTO_CONTINUE_KEY = "autolearn_auto_continue"
 AUTOLEARN_MIN_TOOL_CALLS_KEY = "autolearn_min_tool_calls"
@@ -1112,11 +1110,9 @@ DEFAULT_MEMORY_BACKEND: str = "sqlite"
 DEFAULT_COMPACTION_BACKEND: str = "builtin"
 DEFAULT_CACHE_WARMING: bool = False
 DEFAULT_MEMORY_LEARN: bool = True
-DEFAULT_MEMORY_MODEL: str = "online"
 DEFAULT_AUTOLEARN_ENABLED: bool = False
 DEFAULT_AUTOLEARN_AUTO_CONTINUE: bool = False
 DEFAULT_AUTOLEARN_MIN_TOOL_CALLS: int = 5
-VALID_MEMORY_MODELS = frozenset({"online", "local"})
 
 _MEMORY_BACKEND_MNEMOPI = frozenset({"mnemopi", "omp", "bridge"})
 _COMPACTION_BACKEND_OMP = frozenset({"omp", "bridge", "mnemopi"})
@@ -1210,20 +1206,6 @@ def memory_learn_enabled(cfg: dict | None = None) -> bool:
     """
     agent = _agent_block(cfg)
     return bool(agent.get(MEMORY_LEARN_KEY, DEFAULT_MEMORY_LEARN))
-
-
-def memory_model(cfg: dict | None = None) -> str:
-    """Return ``agent.memory_model`` (``online`` | ``local``, default online).
-
-    OMP ``providers.memoryModel`` port — which tiny/LLM path mnemopi uses for
-    fact extraction when the bridge enables LLM (today the bridge runs
-    embeddings/llm off and degrades to FTS; the knob is still persisted so the
-    UI matches OMP and future bridge options honor it).
-    """
-    agent = _agent_block(cfg)
-    raw = agent.get(MEMORY_MODEL_KEY, DEFAULT_MEMORY_MODEL)
-    s = str(raw or DEFAULT_MEMORY_MODEL).strip().lower()
-    return s if s in VALID_MEMORY_MODELS else DEFAULT_MEMORY_MODEL
 
 
 def autolearn_enabled(cfg: dict | None = None) -> bool:

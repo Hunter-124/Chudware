@@ -14,7 +14,6 @@ class TestAutolearnConfig(unittest.TestCase):
         self.assertFalse(cfg.autolearn_enabled({}))
         self.assertFalse(cfg.autolearn_auto_continue({}))
         self.assertEqual(cfg.autolearn_min_tool_calls({}), 5)
-        self.assertEqual(cfg.memory_model({}), "online")
 
     def test_reads_agent_block(self):
         from services.agent import config as cfg
@@ -24,19 +23,11 @@ class TestAutolearnConfig(unittest.TestCase):
                 "autolearn_enabled": True,
                 "autolearn_auto_continue": True,
                 "autolearn_min_tool_calls": 3,
-                "memory_model": "local",
             }
         }
         self.assertTrue(cfg.autolearn_enabled(c))
         self.assertTrue(cfg.autolearn_auto_continue(c))
         self.assertEqual(cfg.autolearn_min_tool_calls(c), 3)
-        self.assertEqual(cfg.memory_model(c), "local")
-
-    def test_memory_model_invalid_falls_back(self):
-        from services.agent import config as cfg
-
-        self.assertEqual(cfg.memory_model({"agent": {"memory_model": "nope"}}), "online")
-
 
 class TestStandingGuidance(unittest.TestCase):
     def test_empty_when_disabled(self):
